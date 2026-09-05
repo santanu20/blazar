@@ -38,6 +38,8 @@ pub struct ProfileInput<'a> {
     /// Capability manifest flag set of the ACTIVE engine.
     pub supported_flags: &'a BTreeSet<String>,
     pub endpoint: Endpoint,
+    /// Pallama data dir (base for speccache/ + sessions/ paths).
+    pub data_dir: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -60,6 +62,9 @@ pub struct TuningOverrides {
     pub fa: Option<bool>,
     /// Physical batch size (-b) for prompt processing.
     pub batch: Option<u32>,
+    /// Physical ubatch size (-ub): micro-batch ceiling for prefill.
+    /// Not a tune --search axis (argmax objective is tg; ubatch moves pp).
+    pub ubatch: Option<u32>,
 }
 
 /// Compile the launch argv (plan rules D.1–12).
@@ -115,6 +120,10 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         argv.push("-b".into());
         argv.push(b.to_string());
     }
+    if let Some(ub) = tuning.ubatch {
+        argv.push("--ubatch-size".into());
+        argv.push(ub.to_string());
+    }
 
     // --- 4. gpu layers: auto everywhere; upstream --fit on (default) shrinks
     argv.push("--gpu-layers".into());
@@ -126,17 +135,29 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         argv.push(config.cache_reuse.to_string());
     }
 
-    // --- 6. KV quant when GPU-resident and KV would push past 0.9x VRAM
+    // --- 6. KV cache quantization. Bench-adopted tuning wins, then an
+    // explicit config/overlay type ("f16"-class = force off), then the
+    // capacity ladder: none -> q8_0 (KV/2) -> q4_0 (KV/4).
     let vram_bytes = Hardware::bytes(input.hardware.total_vram_mib());
-    let kv_quant = tuning
-        .kv_quant
-        .unwrap_or_else(|| kv_quant_eligible(input, vram_bytes, ctx, &mut warnings));
-    if kv_quant {
+    let kv_type: Option<String> = if let Some(on) = tuning.kv_quant {
+        on.then(|| "q8_0".to_string())
+    } else {
+        let explicit = config.effective_cache_type(input.model_name);
+        if explicit.is_empty() {
+            kv_quant_ladder(input, vram_bytes, ctx, &mut warnings).map(str::to_string)
+        } else {
+            match explicit {
+                "f32" | "f16" | "bf16" => None,
+                t => Some(t.to_string()),
+            }
+        }
+    };
+    if let Some(t) = kv_type {
         argv.extend([
             "--cache-type-k".into(),
-            "q8_0".into(),
+            t.clone(),
             "--cache-type-v".into(),
-            "q8_0".into(),
+            t,
         ]);
     }
 
@@ -183,16 +204,146 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     let spec_mode = overlay.spec.as_deref().unwrap_or(config.spec.as_str());
     if spec_mode == "auto" {
         push_spec_args(input, &mut argv, &mut warnings)?;
+    } else if spec_mode == "ngram" {
+        // Self-drafting n-gram speculation: no draft model to pull; drafts
+        // from the context's own n-grams. Bench before adopting at scale —
+        // verification overhead can regress non-repetitive workloads.
+        argv.push("--spec-type".into());
+        argv.push("ngram-simple".into());
     }
 
     // --- 12. prompt-cache budget + vision projector
     if config.cache_ram_mb > 0 {
+        // The prompt cache shares physical RAM with everything else on the
+        // machine; the upstream-style 8 GiB default starves small-RAM boxes
+        // into swap death. Cap at 30% of physical RAM (measured live: 13 GiB
+        // box + 8192 budget -> 8.3 GiB child RSS plateau, system-wide thrash).
+        // Escape hatches: cache_ram_mb = 0 (unlimited), or a per-model
+        // `extra_args = ["--cache-ram", "<MiB>"]` override (appended later,
+        // last flag wins upstream).
+        let budget = if input.hardware.total_ram_mib > 0 {
+            let cap = input.hardware.total_ram_mib * 30 / 100;
+            match u64::try_from(config.cache_ram_mb) {
+                Ok(requested) if requested > cap => {
+                    warnings.push(format!(
+                        "cache_ram_mb {} clamped to {} (30% of {} MiB RAM); override via model_overrides extra_args --cache-ram or set 0 = unlimited",
+                        config.cache_ram_mb, cap, input.hardware.total_ram_mib
+                    ));
+                    i64::try_from(cap).unwrap_or(i64::MAX)
+                }
+                _ => config.cache_ram_mb,
+            }
+        } else {
+            config.cache_ram_mb
+        };
         argv.push("--cache-ram".into());
-        argv.push(config.cache_ram_mb.to_string());
+        argv.push(budget.to_string());
+    }
+
+    // --- 13. latency/affinity passthrough (config-validated, manifest-gated)
+    // Semantics verified against upstream arg.cpp b10816: --cpu-range pins
+    // child threads to a "lo-hi" CPU set (P/E hybrid boxes: pin to P-cores);
+    // --poll 1..100 busy-polls waiting for work (CPU for TTFT); 
+    // --reasoning-format selects thought-tag extraction in responses.
+    if !config.cpu_range.is_empty() {
+        argv.push("--cpu-range".into());
+        argv.push(config.cpu_range.clone());
+    }
+    if config.poll > 0 {
+        argv.push("--poll".into());
+        argv.push(config.poll.to_string());
+    }
+    if !config.reasoning_format.is_empty() {
+        argv.push("--reasoning-format".into());
+        argv.push(config.reasoning_format.clone());
     }
     if let Some(mmproj) = overlay.extra_args.as_deref().and_then(find_mmproj_arg) {
         argv.push("-mm".into());
         argv.push(mmproj.to_string());
+    }
+
+    // --- 14. persistent n-gram speculative cache: the lookup table
+    // survives restarts, so speculation is warm from the first request
+    // after a respawn (default-on convenience: warn-skip on old engines).
+    if spec_mode == "ngram" && config.spec_cache {
+        if input.supported_flags.contains("--lookup-cache-dynamic") {
+            argv.push("--lookup-cache-dynamic".into());
+            argv.push(format!(
+                "{}/speccache/{}.lcache",
+                input.data_dir,
+                path_safe(input.model_name)
+            ));
+        } else {
+            warnings.push(
+                "spec_cache skipped: engine lacks --lookup-cache-dynamic (engine update recommended)".into(),
+            );
+        }
+    }
+
+    // --- 15. session checkpoints (`pallama session save/restore`).
+    // Default-on convenience: warn-skip on engines without the flag.
+    // Per-model subdirectory: upstream appends the bare filename, so the
+    // model qualifier must live in the directory, not the name.
+    if config.sessions {
+        if input.supported_flags.contains("--slot-save-path") {
+            argv.push("--slot-save-path".into());
+            argv.push(format!(
+                "{}/sessions/{}/",
+                input.data_dir,
+                path_safe(input.model_name)
+            ));
+        } else {
+            warnings.push(
+                "sessions skipped: engine lacks --slot-save-path (engine update recommended)".into(),
+            );
+        }
+    }
+
+    // --- 16. YaRN context extension (explicitly configured; emit-then-gate
+    // so an ancient engine names the missing flag instead of silently
+    // running at base ctx).
+    let ctx_extend = config.effective_ctx_extend(input.model_name);
+    if ctx_extend > 1.0 {
+        argv.extend([
+            "--rope-scaling".into(),
+            "yarn".into(),
+            "--rope-scale".into(),
+            format_trimmed(ctx_extend),
+        ]);
+        warnings.push(format!(
+            "ctx_extend {ctx_extend}: YaRN stretches beyond the trained window; long-context quality may degrade"
+        ));
+    }
+
+    // --- 17. fine-grained MoE expert offload (count beats the boolean
+    // rule-7 heuristic when the user knows their split).
+    let cpu_moe_n = config.effective_cpu_moe_n(input.model_name);
+    if cpu_moe_n > 0 {
+        argv.push("--n-cpu-moe".into());
+        argv.push(cpu_moe_n.to_string());
+    }
+
+    // --- 18. per-tensor device overrides (expert patterns to CPU etc.)
+    for ot in config.effective_override_tensor(input.model_name) {
+        argv.push("--override-tensor".into());
+        argv.push(ot.clone());
+    }
+
+    // --- 19. agent mode: built-in tools + MCP CORS proxy. Opt-in only —
+    // tools include exec_shell_command; the warning keeps it visible.
+    if config.agent {
+        argv.push("--agent".into());
+        warnings.push(
+            "agent mode ON: child exposes built-in tools (incl. exec_shell_command) and the MCP CORS proxy".into(),
+        );
+    }
+
+    // --- 20. slot prompt affinity (`-sps`): how closely a request's prompt
+    // must match a slot's cached prompt to reuse it. Upstream default is
+    // 0.1 (enabled); 0 here emits nothing = upstream default.
+    if config.slot_prompt_similarity > 0.0 {
+        argv.push("--slot-prompt-similarity".into());
+        argv.push(format!("{}", config.slot_prompt_similarity));
     }
 
     // --- overlay extra args (validated like everything else)
@@ -248,18 +399,20 @@ fn resolve_ctx(
     }
 }
 
-/// Rule 6: KV quant when the model is GPU-resident and estimated KV
-/// (`2*blocks*kv_heads*head_dim*ctx*2` bytes f16) + weights would pass
-/// 0.9x VRAM. Missing GGUF fields skip the rule with a named warning.
-fn kv_quant_eligible(
+/// Rule 6 ladder: KV cache quantization by capacity math, not stacked
+/// thresholds. Estimated f16 KV is `2*blocks*kv_heads*head_dim*ctx*2`
+/// bytes; `q8_0` halves it, `q4_0` quarters it. The cheapest grade that keeps
+/// weights+KV within 0.9x VRAM wins. Missing GGUF fields skip with a named
+/// warning — never guessed.
+fn kv_quant_ladder(
     input: &ProfileInput<'_>,
     vram_bytes: u64,
     ctx: u32,
     warnings: &mut Vec<String>,
-) -> bool {
+) -> Option<&'static str> {
     let gpu_resident = input.hardware.has_gpu() && input.model_bytes <= vram_bytes;
     if !gpu_resident {
-        return false;
+        return None;
     }
     match (
         input.gguf.block_count,
@@ -273,19 +426,31 @@ fn kv_quant_eligible(
                 .saturating_mul(head_dim)
                 .saturating_mul(u64::from(ctx))
                 .saturating_mul(2);
-            kv.saturating_add(input.model_bytes) > vram_bytes / 10 * 9
+            let budget = vram_bytes / 10 * 9;
+            if input.model_bytes.saturating_add(kv) <= budget {
+                None
+            } else if input.model_bytes.saturating_add(kv / 2) <= budget {
+                Some("q8_0")
+            } else {
+                if input.model_bytes.saturating_add(kv / 4) > budget {
+                    warnings.push(
+                        "KV q4_0 engaged but weights+KV still exceed 90% VRAM; --fit will shrink ctx or the engine may OOM — consider a smaller quant".into(),
+                    );
+                }
+                Some("q4_0")
+            }
         }
         (None, _, _) => {
             warnings.push("KV-quant rule skipped: GGUF lacks block_count".into());
-            false
+            None
         }
         (_, None, _) => {
             warnings.push("KV-quant rule skipped: GGUF lacks head_count_kv".into());
-            false
+            None
         }
         (_, _, None) => {
             warnings.push("KV-quant rule skipped: head_dim not derivable".into());
-            false
+            None
         }
     }
 }
@@ -320,6 +485,151 @@ fn push_spec_args(
     Ok(())
 }
 
+/// Router-preset INI generation. Upstream router mode (llama-server with
+/// `--models-preset`, no `-m`) reads one INI: a `[*]` section of
+/// server-global options plus one `[<model>]` section per model, keys =
+/// long-flag names without dashes, booleans as bare `true`. Pallama
+/// compiles each model's normal profile (same rules, same manifest gate)
+/// and translates: model-scoped flags land in the model section, the rest
+/// in the global section. Host/port/alias are reserved (the router
+/// assigns them per model child).
+///
+/// Keys that live WITH a model child (verified against upstream arg.cpp:
+/// every flag below is read per-context when a model loads).
+const ROUTER_MODEL_KEYS: &[&str] = &[
+    "model",
+    "ctx-size",
+    "threads",
+    "gpu-layers",
+    "flash-attn",
+    "cache-reuse",
+    "cache-type-k",
+    "cache-type-v",
+    "cpu-moe",
+    "n-cpu-moe",
+    "override-tensor",
+    "rope-scaling",
+    "rope-scale",
+    "batch-size",
+    "ubatch-size",
+    "parallel",
+    "rpc",
+    "lora",
+    "lora-scaled",
+    "spec-type",
+    "spec-draft-model",
+    "spec-draft-n-max",
+    "lookup-cache-dynamic",
+    "reasoning-format",
+    "mmproj",
+    // Per-model paths (each model's profile bakes its own dir):
+    "slot-save-path",
+];
+
+/// Reserved keys the router assigns itself; never emitted.
+const ROUTER_RESERVED_KEYS: &[&str] = &["host", "port", "alias"];
+
+/// Serialize one `flag value` pair as an INI line (`flag = value`, dashes
+/// stripped from the flag name).
+fn ini_line(flag: &str, value: &str) -> String {
+    format!("{} = {}", flag.trim_start_matches('-'), value)
+}
+
+/// Generate the router preset INI from compiled per-model profiles.
+/// `models` = (model name, compiled profile argv) pairs; `global` = one
+/// compiled profile whose model-scoped flags are ignored (only its
+/// server-level flags seed the `[*]` section).
+#[must_use]
+pub fn generate_router_preset(models: &[(String, Vec<String>)], global: &[String]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+
+    // Global section: server-level knobs only.
+    out.push_str("[*]\n");
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut i = 0;
+    while i < global.len() {
+        let flag = global[i].as_str();
+        let bare_g = flag.trim_start_matches('-');
+        if flag.starts_with("--")
+            && !ROUTER_MODEL_KEYS.contains(&bare_g)
+            && !ROUTER_RESERVED_KEYS.contains(&bare_g)
+        {
+            let value = global.get(i + 1).filter(|v| !v.starts_with("--"));
+            let key = bare_g.to_string();
+            if seen.insert(key.clone()) {
+                match value {
+                    Some(v) => {
+                        out.push_str(&ini_line(&key, v));
+                        out.push('\n');
+                        i += 2;
+                        continue;
+                    }
+                    None => {
+                        let _ = writeln!(out, "{key} = true");
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // Per-model sections.
+    for (name, argv) in models {
+        out.push('\n');
+        let _ = writeln!(out, "[{name}]");
+        let mut i = 0;
+        while i < argv.len() {
+            let flag = argv[i].as_str();
+            let bare = flag.trim_start_matches('-');
+            let is_long = flag.starts_with("--");
+            // -m/-np/-b/-mm short flags translate to their long names.
+            let (key, short_value) = match flag {
+                "-m" => ("model", true),
+                "-np" => ("parallel", true),
+                "-b" => ("batch-size", true),
+                "-mm" => ("mmproj", true),
+                _ => (bare, false),
+            };
+            if (is_long || short_value) && ROUTER_MODEL_KEYS.contains(&key) {
+                let value = argv.get(i + 1).filter(|v| !v.starts_with("--") || short_value);
+                if let Some(v) = value {
+                    out.push_str(&ini_line(key, v));
+                    out.push('\n');
+                    i += 2;
+                    continue;
+                }
+                if is_long {
+                    let _ = writeln!(out, "{key} = true");
+                }
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Filesystem-safe form of a model name for cache files (HF repo names
+/// may contain `/` and `:`).
+#[must_use]
+pub fn path_safe(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Rust's f64 Display already prints the minimal form (2.0 -> "2",
+/// 1.5 -> "1.5"), which is exactly the flag format upstream parses.
+fn format_trimmed(v: f64) -> String {
+    format!("{v}")
+}
+
 /// Extract the value following a `-mm`/`--mmproj` token in `extra_args` so
 /// the projector rides along when users configure it per-model.
 fn find_mmproj_arg(extra: &[String]) -> Option<&str> {
@@ -345,13 +655,14 @@ mod tests {
             "--ctx-size", "--threads", "--gpu-layers", "--cache-reuse", "--cache-type-k",
             "--cache-type-v", "--cpu-moe", "--sleep-idle-seconds", "-np", "--rpc", "--lora",
             "--lora-scaled", "--spec-type", "--spec-draft-model", "--spec-draft-n-max",
-            "--cache-ram", "-mm", "--mmproj",
+            "--cache-ram", "-mm", "--mmproj", "--ubatch-size", "--cpu-range", "--poll", "--reasoning-format",
+            "--lookup-cache-dynamic", "--slot-save-path", "--rope-scaling", "--rope-scale",
+            "--n-cpu-moe", "--override-tensor", "--agent", "--slot-prompt-similarity",
         ]
         .iter()
         .map(|f| (*f).to_string())
         .collect()
     }
-
     fn gpu_hw(vram_mib: u64, ram_mib: u64, cores: u32) -> Hardware {
         Hardware {
             physical_cores: cores,
@@ -376,6 +687,7 @@ mod tests {
             head_count_kv: Some(8),
             embedding_length: Some(1024),
             head_dim: Some(64),
+            chat_template: None,
         }
     }
 
@@ -398,6 +710,7 @@ mod tests {
             engine_tag: "b-test",
             supported_flags: flags,
             endpoint: Endpoint::Tcp { host: "127.0.0.1".into(), port: 12345 },
+            data_dir: "/tmp/pallama-test-data",
         }
     }
 
@@ -407,6 +720,10 @@ mod tests {
         spec: None,
         loras: None,
         extra_args: None,
+        cache_type: None,
+        ctx_extend: None,
+        cpu_moe_n: None,
+        override_tensor: None,
     };
 
     #[test]
@@ -440,8 +757,77 @@ mod tests {
         assert!(p.argv.windows(2).any(|w| w[0] == "-np" && w[1] == "1"));
         // Rule 12: cache-ram default 8192
         assert!(p.argv.windows(2).any(|w| w[0] == "--cache-ram" && w[1] == "8192"));
+        // Rule 15: sessions dir default-on when the engine supports it
+        assert!(p.argv.windows(2).any(|w| w[0] == "--slot-save-path"));
         assert_eq!(p.ctx, 16384);
         assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+    }
+
+    #[test]
+    fn unit__cache_ram_clamped_to_30pct_of_ram_on_small_boxes() {
+        // Live case: 13 GiB laptop, default 8192 -> cap 4007 (30% of 13359).
+        // Unclamped, the child RSS plateaus at 8.3 GiB and the box swap-thrashes.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 13_359, 8);
+        let g = meta();
+        let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &TuningOverrides::default()).unwrap();
+        assert!(p.argv.windows(2).any(|w| w[0] == "--cache-ram" && w[1] == "4007"));
+        assert!(p.warnings.iter().any(|w| w.contains("cache_ram_mb 8192 clamped to 4007")));
+    }
+
+    #[test]
+    fn unit__cache_ram_zero_disables_flag_entirely() {
+        let cfg = Config { cache_ram_mb: 0, ..Config::default() };
+        let hw = gpu_hw(12_000, 13_359, 8);
+        let g = meta();
+        let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.contains(&"--cache-ram".to_string()));
+    }
+
+    #[test]
+    fn unit__latency_affinity_knobs__emitted_when_set_absent_by_default() {
+        let g = meta();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let p = compile(&input(&g, &hw, &Config::default(), &ALL_FLAGS), &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.contains(&"--cpu-range".to_string()));
+        assert!(!p.argv.contains(&"--poll".to_string()));
+        assert!(!p.argv.contains(&"--reasoning-format".to_string()));
+
+        let cfg = Config {
+            cpu_range: "0-15".into(),
+            poll: 50,
+            reasoning_format: "deepseek".into(),
+            ..Config::default()
+        };
+        let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &TuningOverrides::default()).unwrap();
+        assert!(p.argv.windows(2).any(|w| w[0] == "--cpu-range" && w[1] == "0-15"));
+        assert!(p.argv.windows(2).any(|w| w[0] == "--poll" && w[1] == "50"));
+        assert!(p.argv.windows(2).any(|w| w[0] == "--reasoning-format" && w[1] == "deepseek"));
+    }
+
+    #[test]
+    fn unit__spec_ngram__emits_self_drafting_no_draft_model() {
+        let cfg = Config { spec: "ngram".into(), ..Config::default() };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &TuningOverrides::default()).unwrap();
+        assert!(p.argv.windows(2).any(|w| w[0] == "--spec-type" && w[1] == "ngram-simple"));
+        assert!(!p.argv.contains(&"--spec-draft-model".to_string()));
+        // Rule 14: persistent lookup cache rides along with ngram mode
+        assert!(p.argv.windows(2).any(|w| w[0] == "--lookup-cache-dynamic"
+            && w[1] == "/tmp/pallama-test-data/speccache/qwen3-8b.lcache"));
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+    }
+
+    #[test]
+    fn unit__ubatch_override__emitted_only_when_set() {
+        let g = meta();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let t = TuningOverrides { ubatch: Some(2048), ..TuningOverrides::default() };
+        let p = compile(&input(&g, &hw, &Config::default(), &ALL_FLAGS), &t).unwrap();
+        assert!(p.argv.windows(2).any(|w| w[0] == "--ubatch-size" && w[1] == "2048"));
+        let p2 = compile(&input(&g, &hw, &Config::default(), &ALL_FLAGS), &TuningOverrides::default()).unwrap();
+        assert!(!p2.argv.contains(&"--ubatch-size".to_string()));
     }
 
     #[test]
@@ -470,14 +856,204 @@ mod tests {
     }
 
     #[test]
-    fn unit__kv_quant__engages_when_tight_vram() {
-        // 5 GiB model on 5.5 GiB VRAM: KV 469MB pushes past 0.9x -> q8_0.
+    fn unit__kv_quant__q8_when_halving_fits() {
+        // 5 GiB model + 896 MiB f16 KV (2*28*8*64*16384*2 bytes) on
+        // 6.1 GiB VRAM: budget 5.36 GiB. f16 total 5.75 GiB > budget ->
+        // engage; KV/2 total 5.32 GiB <= budget -> q8_0 (the cheapest grade
+        // that fits; the old fixed threshold picked q8_0 even when it did
+        // not fit).
         let cfg = Config::default();
-        let hw = gpu_hw(5_500, 32_000, 8);
+        let hw = gpu_hw(6_100, 32_000, 8);
         let g = meta();
         let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &TuningOverrides::default()).unwrap();
         assert!(p.argv.windows(2).any(|w| w[0] == "--cache-type-k" && w[1] == "q8_0"));
         assert!(p.argv.windows(2).any(|w| w[0] == "--cache-type-v" && w[1] == "q8_0"));
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+    }
+
+    #[test]
+    fn unit__kv_quant__q4_when_only_quarter_fits() {
+        // Same model on 5.5 GiB VRAM: budget 4.95 GiB. f16 5.469 and
+        // q8_0 5.234 both overflow; KV/4 = 5.117 GiB still overflows ->
+        // q4_0 engaged WITH the still-overflow warning.
+        let cfg = Config::default();
+        let hw = gpu_hw(5_500, 32_000, 8);
+        let g = meta();
+        let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &TuningOverrides::default()).unwrap();
+        assert!(p.argv.windows(2).any(|w| w[0] == "--cache-type-k" && w[1] == "q4_0"));
+        assert!(p.argv.windows(2).any(|w| w[0] == "--cache-type-v" && w[1] == "q4_0"));
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.contains("still exceed 90% VRAM")));
+    }
+
+    #[test]
+    fn unit__kv_quant__explicit_config_beats_ladder() {
+        let cfg = Config {
+            cache_type: "q5_0".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(24_000, 32_000, 8); // plenty of VRAM: ladder says none
+        let g = meta();
+        let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &TuningOverrides::default()).unwrap();
+        assert!(p.argv.windows(2).any(|w| w[0] == "--cache-type-k" && w[1] == "q5_0"));
+        assert!(p.argv.windows(2).any(|w| w[0] == "--cache-type-v" && w[1] == "q5_0"));
+    }
+
+    #[test]
+    fn unit__kv_quant__explicit_f16_forces_off() {
+        let cfg = Config {
+            cache_type: "f16".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(5_500, 32_000, 8); // ladder would engage q4_0
+        let g = meta();
+        let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.contains(&"--cache-type-k".to_string()));
+    }
+
+    #[test]
+    fn unit__ctx_extend__yarn_emitted_with_warning() {
+        let cfg = Config {
+            ctx_extend: 2.0,
+            ..Config::default()
+        };
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let g = meta();
+        let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &TuningOverrides::default()).unwrap();
+        assert!(p.argv.windows(2).any(|w| w[0] == "--rope-scaling" && w[1] == "yarn"));
+        assert!(p.argv.windows(2).any(|w| w[0] == "--rope-scale" && w[1] == "2"));
+        assert!(p.warnings.iter().any(|w| w.contains("YaRN")));
+    }
+
+    #[test]
+    fn unit__moe_and_tensor_overrides__emitted() {
+        let cfg = Config {
+            cpu_moe_n: 12,
+            override_tensor: vec![".ffn_.*_exps.=CPU".into()],
+            ..Config::default()
+        };
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let g = meta();
+        let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &TuningOverrides::default()).unwrap();
+        assert!(p.argv.windows(2).any(|w| w[0] == "--n-cpu-moe" && w[1] == "12"));
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--override-tensor" && w[1] == ".ffn_.*_exps.=CPU"));
+    }
+
+    #[test]
+    fn unit__agent__opt_in_with_loud_warning() {
+        let cfg = Config::default();
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let g = meta();
+        let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.contains(&"--agent".to_string()));
+        let cfg2 = Config {
+            agent: true,
+            ..Config::default()
+        };
+        let p2 = compile(&input(&g, &hw, &cfg2, &ALL_FLAGS), &TuningOverrides::default()).unwrap();
+        assert!(p2.argv.contains(&"--agent".to_string()));
+        assert!(p2.warnings.iter().any(|w| w.contains("exec_shell_command")));
+    }
+
+    #[test]
+    fn unit__spec_cache_and_sessions__disabled_by_config() {
+        let cfg = Config {
+            spec: "ngram".into(),
+            spec_cache: false,
+            sessions: false,
+            ..Config::default()
+        };
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let g = meta();
+        let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.contains(&"--lookup-cache-dynamic".to_string()));
+        assert!(!p.argv.contains(&"--slot-save-path".to_string()));
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+    }
+
+    #[test]
+    fn unit__router_preset__sections_keys_and_bools() {
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let g = meta();
+        let cfg = Config::default();
+        let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &TuningOverrides::default()).unwrap();
+        // second model with an overlay knob
+        let o = ModelOverride {
+            ctx: Some(8192),
+            ..ModelOverride::default()
+        };
+        let cfg2 = Config::default();
+        let p2 = compile(&input(&g, &hw, &cfg2, &ALL_FLAGS), &TuningOverrides::default()).unwrap();
+        let _ = o;
+        let ini = generate_router_preset(
+            &[
+                ("m1".to_string(), p.argv.clone()),
+                ("m2".to_string(), p2.argv.clone()),
+            ],
+            &p.argv,
+        );
+        // global section: server-level only
+        assert!(ini.starts_with("[*]\n"));
+        assert!(ini.contains("jinja = true"));
+        assert!(ini.contains("metrics = true"));
+        assert!(ini.contains("sleep-idle-seconds = 300"));
+        assert!(ini.contains("cache-ram = 8192"));
+        assert!(ini.contains("slot-save-path = "));
+        // reserved/global-excluded keys never appear
+        assert!(!ini.contains("host ="));
+        assert!(!ini.contains("port ="));
+        assert!(!ini.contains("alias ="));
+        // per-model sections carry model-scoped flags
+        assert!(ini.contains("[m1]\n"));
+        assert!(ini.contains("[m2]\n"));
+        assert!(ini.contains("model = /models/qwen3-8b.gguf"));
+        assert!(ini.contains("ctx-size = 16384"));
+        assert!(ini.contains("gpu-layers = auto"));
+        assert!(ini.contains("parallel = 1"));
+        assert!(ini.contains("cache-reuse = 256"));
+    }
+
+    #[test]
+    fn unit__slot_prompt_similarity__emitted_only_when_set() {
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let g = meta();
+        let cfg = Config::default();
+        let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.contains(&"--slot-prompt-similarity".to_string()));
+        let cfg2 = Config {
+            slot_prompt_similarity: 0.3,
+            ..Config::default()
+        };
+        let p2 = compile(&input(&g, &hw, &cfg2, &ALL_FLAGS), &TuningOverrides::default()).unwrap();
+        assert!(p2
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--slot-prompt-similarity" && w[1] == "0.3"));
+    }
+
+    #[test]
+    fn unit__new_rules__warn_skip_on_old_engine() {
+        // Engine without the default-on conveniences: named warnings, no
+        // emission, no hard error.
+        let mut flags = ALL_FLAGS.clone();
+        flags.remove("--slot-save-path");
+        flags.remove("--lookup-cache-dynamic");
+        let cfg = Config {
+            spec: "ngram".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let g = meta();
+        let p = compile(&input(&g, &hw, &cfg, &flags), &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.contains(&"--slot-save-path".to_string()));
+        assert!(!p.argv.contains(&"--lookup-cache-dynamic".to_string()));
+        assert!(p.warnings.iter().any(|w| w.contains("--slot-save-path")));
+        assert!(p.warnings.iter().any(|w| w.contains("--lookup-cache-dynamic")));
     }
 
     #[test]

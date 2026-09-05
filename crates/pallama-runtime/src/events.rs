@@ -16,6 +16,11 @@ pub enum PallamaEvent {
     },
     ModelPulled {
         name: String,
+        /// Post-download GGUF health check: set when the header did not
+        /// parse (engine will likely refuse to load; carries quant
+        /// alternatives from the same repo).
+        #[serde(default)]
+        warning: Option<String>,
     },
     ModelRemoved {
         name: String,
@@ -106,9 +111,9 @@ mod tests {
     async fn unit__bus__publish_reaches_subscriber() {
         let bus = EventBus::default();
         let mut rx = bus.subscribe();
-        bus.publish(PallamaEvent::ModelPulled { name: "m".into() });
+        bus.publish(PallamaEvent::ModelPulled { name: "m".into(), warning: None });
         let got = rx.recv().await.unwrap();
-        assert_eq!(got, PallamaEvent::ModelPulled { name: "m".into() });
+        assert_eq!(got, PallamaEvent::ModelPulled { name: "m".into(), warning: None });
     }
 
     #[tokio::test]

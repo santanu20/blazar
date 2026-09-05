@@ -18,6 +18,7 @@
 use axum::extract::State;
 use axum::response::IntoResponse;
 
+#[allow(clippy::too_many_lines)] // test fixture: argv parsing + setup in one place
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -71,6 +72,21 @@ fn main() {
         println!("  --spec-draft-model FNAME");
         println!("  --spec-draft-n-max N");
         println!("  --slots               slots endpoint");
+        println!("  --cpu-range lo-hi     pin threads");
+        println!("  --poll N              busy poll");
+        println!("  --ubatch-size N       micro batch");
+        println!("  --reasoning-format F");
+        println!("  --lookup-cache-dynamic FNAME");
+        println!("  --slot-save-path PATH");
+        println!("  --rope-scaling NONE|LINEAR|YARN");
+        println!("  --rope-scale N");
+        println!("  --n-cpu-moe N");
+        println!("  --override-tensor PATTERN=DEV");
+        println!("  --agent               tools + mcp proxy");
+        println!("  --models-dir PATH     router server models dir");
+        println!("  --models-preset PATH  router server model presets (INI)");
+        println!("  --models-max N        router max simultaneously loaded");
+        println!("  --slot-prompt-similarity SIM");
         return;
     }
 
@@ -97,6 +113,36 @@ fn main() {
     let host = flag("--host").unwrap_or_else(|| "127.0.0.1".into());
     let port: u16 = flag("--port").unwrap_or_else(|| "8080".into()).parse().expect("--port must be numeric");
     let alias = flag("--alias").unwrap_or_else(|| "stub-model".into());
+    if let Some(dir) = flag("--slot-save-path") {
+        let _ = std::fs::create_dir_all(&dir);
+        SLOT_SAVE_PATH.set(dir).expect("slot path once");
+    }
+    // Router mode: --models-preset INI instead of -m. Parse section names;
+    // requests route by body `model`, mirroring upstream proxy_post.
+    if let Some(ini_path) = flag("--models-preset") {
+        let raw = std::fs::read_to_string(&ini_path).unwrap_or_default();
+        let mut names: Vec<String> = Vec::new();
+        let mut slot_dirs: Vec<(String, String)> = Vec::new();
+        let mut section: Option<String> = None;
+        for line in raw.lines() {
+            let t = line.trim();
+            if t.starts_with('[') && t.ends_with(']') {
+                let name = t[1..t.len() - 1].to_string();
+                if name != "*" {
+                    names.push(name.clone());
+                }
+                section = Some(name);
+            } else if let Some((k, v)) = t.split_once('=') {
+                if k.trim() == "slot-save-path" && section.as_deref() != Some("*") {
+                    if let Some(s) = &section {
+                        slot_dirs.push((s.clone(), v.trim().to_string()));
+                    }
+                }
+            }
+        }
+        ROUTER_MODELS.set(names).expect("router models once");
+        ROUTER_SLOT_DIRS.set(slot_dirs).expect("router slot dirs once");
+    }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -144,6 +190,17 @@ async fn serve(host: String, port: u16, alias: String) {
         .route("/lora-adapters", get(lora_adapters))
         .route("/metrics", get(metrics))
         .route("/slots", get(slots))
+        // New-wave surfaces: Responses API, audio transcriptions, FIM
+        // infill, control vectors, tokenize, and slot save/restore/erase
+        // (session checkpoints round-trip against --slot-save-path).
+        .route("/v1/responses", post(responses_api))
+        .route("/v1/audio/transcriptions", post(transcriptions))
+        .route("/infill", post(infill))
+        .route("/v1/chat/completions/control", post(control_vectors))
+        .route("/tokenize", post(tokenize))
+        .route("/slots/{id_slot}", post(slots_action))
+        .route("/models", get(router_models))
+        .route("/models/unload", post(models_unload))
         .with_state(alias.clone());
 
     let addr = format!("{host}:{port}");
@@ -213,8 +270,24 @@ async fn chat_completions(
     if delay_ms > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
     }
-    let text = reply_text(&state, &req.messages);
     let model = req.model.clone().unwrap_or_else(|| state.clone());
+    // Router mode: unknown body model -> upstream's error shape.
+    if let Some(false) = router_model_ok(&model) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("model '{model}' not found"),
+        )
+            .into_response();
+    }
+    // Sentinel test knobs: shape the response semantics, never the route.
+    let text = if env_flag("STUB_EMPTY") {
+        String::new()
+    } else if env_flag("STUB_SCHEMA_VIOLATION") {
+        "not json at all".to_string()
+    } else {
+        reply_text(&state, &req.messages)
+    };
+    let finish = std::env::var("STUB_FINISH").unwrap_or_else(|_| "stop".into());
     let prompt_tokens = count_tokens(
         &req.messages.iter().map(|m| content_text(&m.content)).collect::<Vec<_>>().join(" "),
     );
@@ -228,8 +301,14 @@ async fn chat_completions(
             "model": model,
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
+                "message": if env_flag("STUB_BAD_TOOL_ARGS") {
+                    serde_json::json!({"role": "assistant", "content": "", "tool_calls": [
+                        {"id": "t1", "type": "function", "function": {"name": "echo", "arguments": "{\"broken"}}
+                    ]})
+                } else {
+                    serde_json::json!({"role": "assistant", "content": text})
+                },
+                "finish_reason": finish,
             }],
             "usage": {
                 "prompt_tokens": prompt_tokens,
@@ -246,11 +325,23 @@ async fn chat_completions(
         .and_then(|o| o.get("include_usage"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let stream = futures::stream::iter(
-        sse_events(&text, &model, include_usage, prompt_tokens)
-            .into_iter()
-            .map(Ok::<bytes::Bytes, std::io::Error>),
-    );
+    let chunk_delay_ms: u64 = std::env::var("STUB_DELAY_CHUNK_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let events = sse_events(&text, &model, include_usage, prompt_tokens, &finish);
+    let base_iter = futures::stream::iter(events.into_iter().map(Ok::<bytes::Bytes, std::io::Error>));
+    let stream: std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>,
+    > = if chunk_delay_ms > 0 {
+        use futures::StreamExt as _;
+        Box::pin(base_iter.then(move |b| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(chunk_delay_ms)).await;
+            b
+        }))
+    } else {
+        Box::pin(base_iter)
+    };
     axum::response::Response::builder()
         .status(200)
         .header("content-type", "text/event-stream")
@@ -259,7 +350,11 @@ async fn chat_completions(
         .unwrap()
 }
 
-fn sse_events(text: &str, model: &str, include_usage: bool, prompt_tokens: i64) -> Vec<bytes::Bytes> {
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).as_deref() == Ok("1")
+}
+
+fn sse_events(text: &str, model: &str, include_usage: bool, prompt_tokens: i64, finish: &str) -> Vec<bytes::Bytes> {
     let (first, second) = split_in_half(text);
     let completion_tokens = count_tokens(text);
     let mut events: Vec<String> = Vec::new();
@@ -276,6 +371,10 @@ fn sse_events(text: &str, model: &str, include_usage: bool, prompt_tokens: i64) 
     events.push(chunk(serde_json::json!({"role": "assistant"})));
     events.push(chunk(serde_json::json!({"content": first})));
     events.push(chunk(serde_json::json!({"content": second})));
+    if env_flag("STUB_BAD_TOOL_ARGS") {
+        events.push(chunk(serde_json::json!({"tool_calls": [{"index": 0, "function": {"name": "echo", "arguments": "{\"bro"}}]})));
+        events.push(chunk(serde_json::json!({"tool_calls": [{"index": 0, "function": {"arguments": "ken\""}}]})));
+    }
     events.push(format!(
         "data: {}\n\n",
         serde_json::json!({
@@ -283,7 +382,7 @@ fn sse_events(text: &str, model: &str, include_usage: bool, prompt_tokens: i64) 
             "object": "chat.completion.chunk",
             "created": 0_u64,
             "model": model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
         })
     ));
     if include_usage {
@@ -391,6 +490,273 @@ async fn metrics() -> axum::response::Response {
         body,
     )
         .into_response()
+}
+
+static SLOT_SAVE_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static ROUTER_MODELS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+static ROUTER_SLOT_DIRS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+
+/// Router-mode membership check: Some(name) when routing and the model is
+/// known; None when not in router mode; Err-ish empty when unknown.
+fn router_model_ok(model: &str) -> Option<bool> {
+    ROUTER_MODELS.get().map(|m| m.iter().any(|n| n == model))
+}
+
+async fn responses_api(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+    let model: String = parsed["model"]
+        .as_str()
+        .map_or_else(|| state.clone(), str::to_string);
+    let stream = parsed["stream"].as_bool().unwrap_or(false);
+    // Sentinel test knobs (same semantics as the chat route).
+    let incomplete = std::env::var("STUB_FINISH").as_deref() == Ok("length");
+    let empty = env_flag("STUB_EMPTY");
+    let bad_tool = env_flag("STUB_BAD_TOOL_ARGS");
+    let status = if incomplete { "incomplete" } else { "completed" };
+    let output: Vec<serde_json::Value> = if empty {
+        Vec::new()
+    } else if bad_tool {
+        vec![serde_json::json!({
+            "type": "function_call", "call_id": "c1",
+            "name": "echo", "arguments": "{\"broken"
+        })]
+    } else {
+        vec![serde_json::json!({"type": "message", "content": "stub response"})]
+    };
+    let usage = serde_json::json!({"input_tokens": 3, "output_tokens": 2});
+    let mut resp_obj = serde_json::json!({
+        "id": "resp_stub",
+        "object": "response",
+        "status": status,
+        "model": model,
+        "output": output,
+        "usage": usage,
+    });
+    if incomplete {
+        resp_obj["incomplete_details"] =
+            serde_json::json!({"reason": "max_output_tokens"});
+    }
+    if !stream {
+        return axum::Json(resp_obj).into_response();
+    }
+    let mut events: Vec<String> = Vec::new();
+    events.push(format!(
+        "data: {}\n\n",
+        serde_json::json!({"type": "response.created", "response": {"id": "resp_stub"}})
+    ));
+    if bad_tool {
+        events.push(format!(
+            "data: {}\n\n",
+            serde_json::json!({"type": "response.output_item.added", "output_index": 0,
+                "item": {"type": "function_call", "call_id": "c1", "name": "echo", "arguments": ""}})
+        ));
+        events.push(format!(
+            "data: {}\n\n",
+            serde_json::json!({"type": "response.function_call_arguments.delta", "delta": "{\"bro"})
+        ));
+        events.push(format!(
+            "data: {}\n\n",
+            serde_json::json!({"type": "response.function_call_arguments.delta", "delta": "ken\""})
+        ));
+    } else if !empty {
+        events.push(format!(
+            "data: {}\n\n",
+            serde_json::json!({"type": "response.output_item.added", "output_index": 0,
+                "item": {"type": "message"}})
+        ));
+        events.push(format!(
+            "data: {}\n\n",
+            serde_json::json!({"type": "response.output_text.delta", "delta": "stub response"})
+        ));
+    }
+    events.push(format!(
+        "data: {}\n\n",
+        serde_json::json!({
+            "type": if incomplete { "response.incomplete" } else { "response.completed" },
+            "response": resp_obj,
+        })
+    ));
+    events.push("data: [DONE]\n\n".into());
+    let stream = futures::stream::iter(events.into_iter().map(|s| {
+        Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(s))
+    }));
+    axum::response::Response::builder()
+        .status(200)
+        .header("content-type", "text/event-stream")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap()
+}
+
+async fn transcriptions(
+    State(state): State<AppState>,
+    _body: axum::body::Bytes,
+) -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "text": format!("stub transcription for {state}"),
+    }))
+}
+
+async fn infill(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> axum::Json<serde_json::Value> {
+    let model: String = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v["model"].as_str().map(str::to_string))
+        .unwrap_or_else(|| state.clone());
+    axum::Json(serde_json::json!({
+        "model": model,
+        "content": "stub infill",
+    }))
+}
+
+async fn control_vectors(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> axum::Json<serde_json::Value> {
+    let n = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v["control_vectors"].as_array().map(Vec::len))
+        .unwrap_or(0);
+    axum::Json(serde_json::json!({
+        "model": state,
+        "control_vectors_applied": n,
+    }))
+}
+
+async fn tokenize(
+    body: axum::body::Bytes,
+) -> axum::Json<serde_json::Value> {
+    let text = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v["content"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    let tokens: Vec<u64> = text
+        .split_whitespace()
+        .map(|w| w.len() as u64 + 1)
+        .collect();
+    axum::Json(serde_json::json!({ "tokens": tokens }))
+}
+
+async fn slots_action(
+    axum::extract::Path(id): axum::extract::Path<u32>,
+    axum::extract::RawQuery(q): axum::extract::RawQuery,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let query = q.unwrap_or_default();
+    let action = query
+        .split('&')
+        .find_map(|p| p.strip_prefix("action="))
+        .unwrap_or_default()
+        .to_string();
+    let parsed: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+    let filename: String = parsed
+        .as_ref()
+        .and_then(|v| v["filename"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    // Router mode: per-model subdirectory (mirrors upstream per-model
+    // children each with their own --slot-save-path).
+    let model_subdir: Option<String> = parsed
+        .as_ref()
+        .and_then(|v| v["model"].as_str().map(str::to_string));
+    if filename
+        .chars()
+        .any(|c| !(c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'))
+        || filename.is_empty()
+    {
+        return (axum::http::StatusCode::BAD_REQUEST, "invalid filename").into_response();
+    }
+    // Dir resolution mirrors the real engine: router mode reads the
+    // per-model slot-save-path from the preset INI; classic mode uses the
+    // child's own --slot-save-path (already per-model).
+    let base: std::path::PathBuf = if let (Some(m), Some(dirs)) = (&model_subdir, ROUTER_SLOT_DIRS.get()) {
+        match dirs.iter().find(|(n, _)| n == m) {
+            Some((_, dir)) => dir.clone().into(),
+            None => {
+                return (
+                    axum::http::StatusCode::NOT_IMPLEMENTED,
+                    format!("router model '{m}' has no slot-save-path preset"),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        match SLOT_SAVE_PATH.get() {
+            Some(dir) => dir.clone().into(),
+            None => {
+                return (
+                    axum::http::StatusCode::NOT_IMPLEMENTED,
+                    "stub started without --slot-save-path",
+                )
+                    .into_response();
+            }
+        }
+    };
+    let _ = std::fs::create_dir_all(&base);
+    let path = base.join(&filename);
+    match action.as_str() {
+        "save" => {
+            let blob = format!("stub-kv:{filename}");
+            std::fs::write(&path, blob).expect("stub slot save");
+            axum::Json(serde_json::json!({"status": "ok", "filename": filename, "slot": id})).into_response()
+        }
+        "restore" => match std::fs::read(&path) {
+            Ok(bytes) => axum::Json(serde_json::json!({
+                "status": "ok", "filename": filename,
+                "restored_bytes": bytes.len(),
+            }))
+            .into_response(),
+            Err(_) => (
+                axum::http::StatusCode::NOT_FOUND,
+                format!("no such checkpoint: {filename}"),
+            )
+                .into_response(),
+        },
+        "erase" => {
+            let _ = std::fs::remove_file(&path);
+            axum::Json(serde_json::json!({"status": "ok"})).into_response()
+        }
+        _ => (axum::http::StatusCode::BAD_REQUEST, "invalid action").into_response(),
+    }
+}
+
+async fn router_models() -> axum::Json<serde_json::Value> {
+    let data: Vec<serde_json::Value> = ROUTER_MODELS
+        .get()
+        .map(|names| {
+            names
+                .iter()
+                .map(|n| {
+                    serde_json::json!({
+                        "id": n,
+                        "object": "model",
+                        "status": {"value": "loaded"},
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    axum::Json(serde_json::json!({"data": data, "object": "list"}))
+}
+
+async fn models_unload(body: axum::body::Bytes) -> axum::response::Response {
+    let model: Option<String> = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v["model"].as_str().map(str::to_string));
+    match model {
+        Some(m) if router_model_ok(&m) == Some(true) => {
+            axum::Json(serde_json::json!({"success": true})).into_response()
+        }
+        Some(m) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("model '{m}' not found"),
+        )
+            .into_response(),
+        None => (axum::http::StatusCode::BAD_REQUEST, "missing model").into_response(),
+    }
 }
 
 async fn slots() -> axum::Json<serde_json::Value> {

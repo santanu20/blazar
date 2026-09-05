@@ -33,9 +33,30 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Run the daemon in the foreground (both APIs on one port).
+    #[command(alias = "start")]
     Serve,
-    /// Stop the daemon
-    Stop,
+    /// Copy a model under a new name (zero-byte hardlink alias)
+    Cp { source: String, destination: String },
+    /// Create a model alias with parameters from a Modelfile (no blob copy:
+    /// `FROM` + `PARAMETER num_ctx` + `ADAPTER` map to a config overlay)
+    Create {
+        model: String,
+        /// Modelfile path (default "Modelfile")
+        #[arg(short = 'f', long)]
+        file: Option<PathBuf>,
+    },
+    /// Push a model to a registry — refused: pallama is local-only by design
+    Push { model: String },
+    /// ollama.com account sign-in — refused: no cloud accounts by design
+    Signin,
+    /// ollama.com account login — refused: no cloud accounts by design
+    Login,
+    /// ollama.com account sign-out — refused: no cloud accounts by design
+    Signout,
+    /// ollama.com account logout — refused: no cloud accounts by design
+    Logout,
+    /// Stop the daemon; with a model name, unload that model now
+    Stop { model: Option<String> },
     /// Pull a model (owner/repo[:QUANT] or catalog name)
     Pull { target: String },
     /// Import an existing GGUF file (hardlinks by default; --copy for a copy)
@@ -48,9 +69,10 @@ enum Cmd {
         #[arg(long)]
         copy: bool,
     },
-    /// Remove a model (refuses while running)
-    Rm { model: String },
+    /// Remove models (refuses while running)
+    Rm { models: Vec<String> },
     /// List pulled models
+    #[command(alias = "ls")]
     List,
     /// Show model details, active profile, last benchmark
     Show { model: String },
@@ -60,8 +82,16 @@ enum Cmd {
         #[arg(long)]
         reset: bool,
     },
-    /// Chat REPL against a model (streams; /exit /clear /model /sysinfo /profile)
-    Run { model: String },
+    /// Chat REPL against a model (streams; /exit /clear /model /sysinfo /profile);
+    /// with an inline PROMPT: single-shot generation, prints and exits
+    Run {
+        model: String,
+        #[arg(trailing_var_arg = true)]
+        prompt: Vec<String>,
+        /// Print eval counts (tokens, t/s) after generation
+        #[arg(long, short = 'v')]
+        verbose: bool,
+    },
     /// Benchmark a model (pp/tg table)
     Bench { model: String },
     /// Tune a model's launch profile (--search = measured grid argmax)
@@ -95,6 +125,42 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+    /// Self-update the pallama binary from GitHub Releases (sha256-verified)
+    Upgrade {
+        /// Pin a release tag (e.g. v0.1.1); default = latest
+        #[arg(long)]
+        version: Option<String>,
+        /// Resolve + download + verify, but do not replace the binary
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Slot KV-cache checkpoints: save/restore a loaded model's context
+    /// state (upstream --slot-save-path; survives unload and restart)
+    Session {
+        #[command(subcommand)]
+        cmd: SessionCmd,
+    },
+    /// Diagnose the local setup: config, engine, hardware, disk, models
+    Doctor,
+    /// Ask why a request misbehaved: sentinel detections for a trace id
+    /// (or the most recent observations) with fix hints
+    Why {
+        /// Trace id from the x-pallama-trace-id response header
+        trace: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionCmd {
+    /// Checkpoint the current slot state of a loaded model
+    Save { model: String, name: String },
+    /// Load a checkpoint back into the model's slot
+    Restore { model: String, name: String },
+    /// Delete a checkpoint file
+    Rm { model: String, name: String },
+    /// List checkpoints for a model
+    #[command(alias = "ls")]
+    List { model: String },
 }
 
 #[derive(Subcommand)]
@@ -209,14 +275,14 @@ fn tokio_deadline(d: Duration) -> std::time::Instant {
 async fn run(cmd: Cmd) -> Result<()> {
     match cmd {
         Cmd::Serve => serve().await,
-        Cmd::Stop => stop(),
+        Cmd::Stop { model } => stop_cmd(model).await,
         Cmd::Pull { target } => pull(&target).await,
         Cmd::Import { path, name, quant, copy } => import(&path, name, quant, copy),
-        Cmd::Rm { model } => rm(&model),
+        Cmd::Rm { models } => rm_multi(&models),
         Cmd::List => list(),
         Cmd::Show { model } => show(&model),
         Cmd::Ps { reset } => ps(reset).await,
-        Cmd::Run { model } => run_repl(&model).await,
+        Cmd::Run { model, prompt, verbose } => run_dispatch(&model, &prompt, verbose).await,
         Cmd::Bench { model } => bench(&model),
         Cmd::Tune { model, search, ctx, spec } => tune(&model, search, ctx, spec),
         Cmd::Engine { cmd } => engine_cmd(cmd).await,
@@ -224,6 +290,370 @@ async fn run(cmd: Cmd) -> Result<()> {
         Cmd::Search { query } => search(&query).await,
         Cmd::Fit { target } => fit(&target).await,
         Cmd::Config { cmd } => config_cmd(cmd),
+        Cmd::Upgrade { version, dry_run } => upgrade(version, dry_run).await,
+        Cmd::Cp { source, destination } => cp_cmd(&source, &destination),
+        Cmd::Create { model, file } => create_cmd(&model, file.as_deref()),
+        Cmd::Push { model } => cloud_refusal("push", &model),
+        Cmd::Signin => cloud_refusal("signin", ""),
+        Cmd::Login => cloud_refusal("login", ""),
+        Cmd::Signout => cloud_refusal("signout", ""),
+        Cmd::Logout => cloud_refusal("logout", ""),
+        Cmd::Session { cmd } => session_cmd(cmd).await,
+        Cmd::Doctor => doctor().await,
+        Cmd::Why { trace } => why(trace.as_deref()).await,
+    }
+}
+
+async fn session_cmd(cmd: SessionCmd) -> Result<()> {
+    let base = ensure_daemon().await?;
+    let client = reqwest::Client::new();
+    match cmd {
+        SessionCmd::Save { model, name } => {
+            let resp = client
+                .post(format!("{base}/api/session"))
+                .json(&serde_json::json!({
+                    "model": model, "action": "save", "filename": name
+                }))
+                .send()
+                .await?;
+            print_session_result(resp, "saved", &model, &name).await?;
+        }
+        SessionCmd::Restore { model, name } => {
+            let resp = client
+                .post(format!("{base}/api/session"))
+                .json(&serde_json::json!({
+                    "model": model, "action": "restore", "filename": name
+                }))
+                .send()
+                .await?;
+            print_session_result(resp, "restored", &model, &name).await?;
+        }
+        SessionCmd::Rm { model, name } => {
+            let resp = client
+                .post(format!("{base}/api/session"))
+                .json(&serde_json::json!({
+                    "model": model, "action": "erase", "filename": name
+                }))
+                .send()
+                .await?;
+            print_session_result(resp, "deleted", &model, &name).await?;
+        }
+        SessionCmd::List { model } => {
+            let resp = client
+                .get(format!("{base}/api/session?model={model}"))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("{text}"));
+            }
+            let v: serde_json::Value = resp.json().await?;
+            let sessions = v["sessions"].as_array().cloned().unwrap_or_default();
+            if sessions.is_empty() {
+                println!("no checkpoints for {model}");
+            } else {
+                println!("{:<6} CHECKPOINT", "BYTES");
+                for s in sessions {
+                    println!(
+                        "{:<6} {}",
+                        humansize(s["bytes"].as_i64().unwrap_or(0)),
+                        s["filename"].as_str().unwrap_or("?")
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One doctor check row: name, status word, detail line.
+struct Check {
+    name: &'static str,
+    ok: bool,
+    warn: bool,
+    detail: String,
+}
+
+impl Check {
+    fn ok(name: &'static str, detail: impl Into<String>) -> Self {
+        Self { name, ok: true, warn: false, detail: detail.into() }
+    }
+    fn warn(name: &'static str, detail: impl Into<String>) -> Self {
+        Self { name, ok: true, warn: true, detail: detail.into() }
+    }
+    fn fail(name: &'static str, detail: impl Into<String>) -> Self {
+        Self { name, ok: false, warn: false, detail: detail.into() }
+    }
+    fn status_word(&self) -> &'static str {
+        if !self.ok {
+            "FAIL"
+        } else if self.warn {
+            "WARN"
+        } else {
+            "ok"
+        }
+    }
+}
+
+/// `pallama doctor` — offline diagnostics for the local setup. Reads only
+/// (config, store, engine manifest, hardware probe); never starts or stops
+/// anything. Failures print the fix hint inline.
+async fn doctor() -> Result<()> {
+    let d = dirs();
+    let mut checks: Vec<Check> = Vec::new();
+
+    // 1. config parses + validates
+    match config() {
+        Ok(cfg) => {
+            checks.push(Check::ok(
+                "config",
+                format!(
+                    "{} validates; host {}:{}",
+                    d.config_file().display(),
+                    cfg.host,
+                    cfg.port
+                ),
+            ));
+            if cfg.agent {
+                checks.push(Check::warn(
+                    "agent mode",
+                    "enabled: children expose built-in tools (exec_shell_command) + MCP CORS proxy",
+                ));
+            }
+            if !cfg.cpu_range.is_empty() {
+                checks.push(Check::ok("cpu_range", format!("pinned to {}", cfg.cpu_range)));
+            }
+        }
+        Err(e) => {
+            checks.push(Check::fail(
+                "config",
+                format!("{} — fix or delete {} to regenerate defaults", e, d.config_file().display()),
+            ));
+        }
+    }
+
+    checks.extend(doctor_engine(&d));
+    checks.extend(doctor_port().await);
+    #[cfg(unix)]
+    checks.extend(doctor_disk(&d));
+    checks.extend(doctor_models(&d));
+    checks.extend(doctor_sentinel(&d));
+
+    // render
+    println!("{:<26} {:<5} DETAIL", "CHECK", "ST");
+    for c in &checks {
+        println!("{:<26} {:<5} {}", c.name, c.status_word(), c.detail);
+    }
+    let fails = checks.iter().filter(|c| !c.ok).count();
+    let warns = checks.iter().filter(|c| c.warn).count();
+    if fails > 0 {
+        println!("\n{fails} failing check(s) — fix the FAIL rows above");
+    } else if warns > 0 {
+        println!("\nall checks pass; {warns} warning(s)");
+    } else {
+        println!("\nall checks pass");
+    }
+    Ok(())
+}
+
+fn doctor_engine(d: &PallamaDirs) -> Vec<Check> {
+    let mut checks = Vec::new();
+    match local_engine_manager(d) {
+        Ok(mgr) => match mgr.active_manifest() {
+            Ok(Some(m)) => {
+                checks.push(Check::ok(
+                    "engine",
+                    format!(
+                        "{} active ({} device{}, {} flags) at {}",
+                        m.tag,
+                        m.devices.len(),
+                        if m.devices.len() == 1 { "" } else { "s" },
+                        m.flags.len(),
+                        m.server_path
+                    ),
+                ));
+                let hw = pallama_runtime::probe_hardware(Some(&m));
+                let note = format!(
+                    "RAM {} GiB, VRAM {} MiB across {} GPU{}",
+                    hw.total_ram_mib / 1024,
+                    hw.total_vram_mib(),
+                    hw.gpus.len(),
+                    if hw.gpus.len() == 1 { "" } else { "s" },
+                );
+                if hw.total_vram_mib() == 0 {
+                    checks.push(Check::warn(
+                        "hardware",
+                        format!("{note} — CPU-only inference; expect token/s in the single digits"),
+                    ));
+                } else {
+                    checks.push(Check::ok("hardware", note));
+                }
+            }
+            Ok(None) => checks.push(Check::fail(
+                "engine",
+                "none installed — run: pallama engine update",
+            )),
+            Err(e) => checks.push(Check::fail(
+                "engine",
+                format!("{e} — run: pallama engine update"),
+            )),
+        },
+        Err(e) => checks.push(Check::fail("engine", format!("{e}"))),
+    }
+    checks
+}
+
+async fn doctor_port() -> Vec<Check> {
+    let Ok(cfg) = config() else {
+        return Vec::new();
+    };
+    let addr = (cfg.host.as_str(), cfg.port);
+    if tokio::net::TcpListener::bind(addr).await.is_ok() {
+        return vec![Check::ok(
+            "port",
+            format!("{}:{} free (daemon not running)", cfg.host, cfg.port),
+        )];
+    }
+    let is_pallama = reqwest::Client::new()
+        .get(format!("http://{}:{}/healthz", cfg.host, cfg.port))
+        .send()
+        .await
+        .is_ok_and(|r| r.status().is_success());
+    if is_pallama {
+        vec![Check::ok(
+            "port",
+            format!("{}:{} — pallama daemon already answering", cfg.host, cfg.port),
+        )]
+    } else {
+        vec![Check::warn(
+            "port",
+            format!(
+                "{}:{} occupied by another process (ollama lives on 11434; pick another port in config.toml if this blocks startup)",
+                cfg.host,
+                cfg.port
+            ),
+        )]
+    }
+}
+
+#[cfg(unix)]
+fn doctor_disk(d: &PallamaDirs) -> Vec<Check> {
+    let Some(g) = free_gib(&d.data_dir) else {
+        return Vec::new();
+    };
+    if g < 10.0 {
+        vec![Check::warn(
+            "disk",
+            format!("{g:.1} GiB free under {} — model pulls need headroom", d.data_dir.display()),
+        )]
+    } else {
+        vec![Check::ok("disk", format!("{g:.1} GiB free under {}", d.data_dir.display()))]
+    }
+}
+
+/// Offline sentinel summary: read run/sentinel.jsonl (no daemon),
+/// count detections in the last 24h, name the top codes. One row.
+fn doctor_sentinel(d: &PallamaDirs) -> Vec<Check> {
+    let path = d.run_dir().join("sentinel.jsonl");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return vec![Check::ok(
+            "sentinel",
+            "no observations yet (records land after the first chat request)",
+        )];
+    };
+    let day_ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |t| t.as_secs().saturating_sub(86_400));
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut records = 0_usize;
+    for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v["ts"].as_u64().unwrap_or(0) < day_ago {
+            continue;
+        }
+        records += 1;
+        if let Some(dets) = v["detections"].as_array() {
+            for det in dets {
+                if let Some(code) = det["code"].as_str() {
+                    *counts.entry(code.to_string()).or_default() += 1;
+                }
+            }
+        }
+    }
+    if counts.is_empty() {
+        return vec![Check::ok(
+            "sentinel",
+            format!("{records} requests observed in 24h, all clean"),
+        )];
+    }
+    let top: Vec<String> = counts.iter().map(|(c, n)| format!("{c} x{n}")).collect();
+    vec![Check::warn(
+        "sentinel",
+        format!(
+            "{records} requests in 24h flagged: {} — `pallama why` for details + retry hints",
+            top.join(", ")
+        ),
+    )]
+}
+
+fn doctor_models(d: &PallamaDirs) -> Vec<Check> {
+    let Ok(store) = pallama_core::store::Store::open(d) else {
+        return vec![Check::fail("models", "store open failed")];
+    };
+    let Ok(models) = store.list_models() else {
+        return vec![Check::fail("models", "store list failed")];
+    };
+    let bad: Vec<String> = models
+        .iter()
+        .filter(|m| pallama_core::read_metadata_file(std::path::Path::new(&m.path)).is_err())
+        .map(|m| m.name.clone())
+        .collect();
+    if bad.is_empty() {
+        vec![Check::ok("models", format!("{} pulled, all parse", models.len()))]
+    } else {
+        vec![Check::warn(
+            "models",
+            format!(
+                "{} pulled; metadata unreadable: {} (re-pull or rm)",
+                models.len(),
+                bad.join(", ")
+            ),
+        )]
+    }
+}
+
+/// One audited libc call (mirrors the runtime's signal-0 precedent):
+/// statvfs on the data dir for the disk-headroom check. Read-only.
+#[cfg(unix)]
+#[allow(unsafe_code)] // single statvfs read; no pointers escape
+fn free_gib(path: &std::path::Path) -> Option<f64> {
+    let c = std::ffi::CString::new(path.to_string_lossy().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c.as_ptr(), std::ptr::from_mut(&mut stat)) };
+    if rc != 0 {
+        return None;
+    }
+    #[allow(clippy::useless_conversion)] // field types vary across libcs
+    let free: u64 = stat.f_bfree.try_into().ok()?;
+    let bsize: u64 = stat.f_bsize;
+    #[allow(clippy::cast_precision_loss)] // byte counts -> GiB display only
+    Some(free as f64 * bsize as f64 / 1_073_741_824.0)
+}
+
+async fn print_session_result(
+    resp: reqwest::Response,
+    verb: &str,
+    model: &str,
+    name: &str,
+) -> Result<()> {
+    if resp.status().is_success() {
+        println!("{verb} checkpoint {name} for {model}");
+        Ok(())
+    } else {
+        let text = resp.text().await.unwrap_or_default();
+        Err(anyhow!("{text}"))
     }
 }
 
@@ -319,7 +749,9 @@ async fn pull(target: &str) -> Result<()> {
     d.ensure().ok();
     let token = std::env::var("HF_TOKEN").ok();
     let client = pallama_runtime::hf::HfClient::new(token)?;
-    let puller = pallama_runtime::Puller { dirs: d.clone(), client, bus: EventBus::default() };
+    let bus = EventBus::default();
+    let mut events = bus.subscribe();
+    let puller = pallama_runtime::Puller { dirs: d.clone(), client, bus };
     let row = puller.pull(target).await?;
     println!(
         "pulled {}: {} ({}, {} shards) -> {}",
@@ -329,6 +761,14 @@ async fn pull(target: &str) -> Result<()> {
         row.shards,
         row.path
     );
+    // The runtime warned via log + event; surface it in the terminal too
+    // (tracing is muted at the default level). The event is the REAL
+    // signal — HF metadata fallbacks can still fill `arch`.
+    while let Ok(ev) = events.try_recv() {
+        if let pallama_runtime::PallamaEvent::ModelPulled { warning: Some(w), .. } = ev {
+            println!("WARNING: {w}");
+        }
+    }
     Ok(())
 }
 
@@ -429,12 +869,6 @@ fn import(path: &PathBuf, name: Option<String>, quant: Option<String>, copy: boo
     Ok(())
 }
 
-fn rm(model: &str) -> Result<()> {
-    let d = dirs();
-    pallama_runtime::remove_model(&d, model).map_err(|e| anyhow!("{e:#}"))?;
-    println!("removed {model}");
-    Ok(())
-}
 
 fn list() -> Result<()> {
     let store = Store::open(&dirs())?;
@@ -533,6 +967,243 @@ async fn ps(reset: bool) -> Result<()> {
     Ok(())
 }
 
+
+/// `pallama run` dispatch: inline prompt = single-shot, none = REPL.
+async fn run_dispatch(model: &str, prompt: &[String], verbose: bool) -> Result<()> {
+    if prompt.is_empty() {
+        return run_repl(model).await;
+    }
+    let base = ensure_daemon().await?;
+    let text = prompt.join(" ");
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": text}],
+        "stream": true,
+    });
+    let final_chunk = stream_chat(&base, &body).await?;
+    if verbose {
+        if let Some(v) = final_chunk {
+            let ec = v["eval_count"].as_i64().unwrap_or(0);
+            let ed = v["eval_duration"].as_i64().unwrap_or(0);
+            let pc = v["prompt_eval_count"].as_i64().unwrap_or(0);
+            #[allow(clippy::cast_precision_loss, reason = "token counts fit f64 exactly")]
+            let rate = if ed > 0 { f64::from(ec as f32) * 1e9 / f64::from(ed as f32) } else { 0.0 };
+            println!("\n\ntotal duration: answer {ec} tokens at {rate:.1} t/s; prompt {pc} tokens");
+        }
+    }
+    Ok(())
+}
+
+/// ollama cloud commands are refused, loudly: pallama is local-only by
+/// design and silently no-op-ing would hide the difference.
+fn cloud_refusal(cmd: &str, model: &str) -> Result<()> {
+    let what = if model.is_empty() { cmd.to_string() } else { format!("{cmd} {model}") };
+    Err(anyhow!(
+        "pallama {what}: refused — pallama is local-only by design (no registry, no cloud accounts). \
+Pull models straight from Hugging Face: pallama pull <owner/repo:QUANT>"
+    ))
+}
+
+/// `pallama why [trace]` — sentinel ring dump: what the model returned,
+/// what was wrong with it, which knob fixes it. Auto-starts the daemon
+/// like every other serving command.
+async fn why(trace: Option<&str>) -> Result<()> {
+    let base = ensure_daemon().await?;
+    let url = match trace {
+        Some(t) => format!("{base}/api/why?trace={t}"),
+        None => format!("{base}/api/why"),
+    };
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("daemon: {text}"));
+    }
+    let v: serde_json::Value = resp.json().await?;
+    if !v["sentinel"].as_bool().unwrap_or(false) {
+        println!("sentinel is disabled (config: sentinel = false) — no observations recorded");
+        return Ok(());
+    }
+    let records = v["records"].as_array().cloned().unwrap_or_default();
+    if records.is_empty() {
+        println!("no observations recorded yet (sentinel records chat-family requests)");
+        return Ok(());
+    }
+    let num = |v: &serde_json::Value| -> String {
+        v.as_u64().map_or_else(|| "?".into(), |n| n.to_string())
+    };
+    for r in &records {
+        let detections = r["detections"].as_array().cloned().unwrap_or_default();
+        let flag = if detections.is_empty() { "ok" } else { "FLAGGED" };
+        println!(
+            "{flag}  {}  {}  model={} status={} ctx={} prompt={} completion={} degraded={} {}ms",
+            r["trace"].as_str().unwrap_or("?"),
+            r["route"].as_str().unwrap_or("?"),
+            r["model"].as_str().unwrap_or("?"),
+            num(&r["status"]),
+            num(&r["ctx"]),
+            num(&r["prompt_tokens"]),
+            num(&r["completion_tokens"]),
+            r["degraded"].as_bool().unwrap_or(false),
+            num(&r["ms"]),
+        );
+        for d in &detections {
+            println!(
+                "  [{}] {} — {}",
+                d["code"].as_str().unwrap_or("?"),
+                d["detail"].as_str().unwrap_or(""),
+                d["hint"].as_str().unwrap_or(""),
+            );
+            println!("    {}", d["retry"].as_str().unwrap_or(""));
+        }
+    }
+    Ok(())
+}
+
+/// `pallama cp SOURCE DEST` — zero-byte hardlink alias.
+fn cp_cmd(source: &str, destination: &str) -> Result<()> {
+    let d = dirs();
+    pallama_runtime::models::copy_model(&d, source, destination)?;
+    println!("copied {source} -> {destination} (hardlink, no bytes duplicated)");
+    Ok(())
+}
+
+/// `pallama rm A B C` — continue past failures, report all, exit non-zero.
+fn rm_multi(models: &[String]) -> Result<()> {
+    let d = dirs();
+    let mut failed = Vec::new();
+    for m in models {
+        if let Err(e) = pallama_runtime::models::remove_model(&d, m) {
+            eprintln!("rm {m}: {e:#}");
+            failed.push(m.clone());
+        } else {
+            println!("removed {m}");
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!("failed to remove: {}", failed.join(", ")))
+    }
+}
+
+/// Modelfile subset pallama understands. Everything else is collected and
+/// rejected by name — no silent drops.
+struct CreateSpec {
+    base: String,
+    ctx: Option<u32>,
+    loras: Vec<String>,
+    unsupported: Vec<String>,
+}
+
+fn parse_modelfile(raw: &str) -> Result<CreateSpec> {
+    let mut spec = CreateSpec { base: String::new(), ctx: None, loras: Vec::new(), unsupported: Vec::new() };
+    for (n, raw_line) in raw.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        match parts.next().unwrap_or_default().to_ascii_uppercase().as_str() {
+            "FROM" => {
+                let arg = parts.next().unwrap_or_default().to_string();
+                if arg.is_empty() {
+                    return Err(anyhow!("Modelfile line {}: FROM needs a model name", n + 1));
+                }
+                spec.base = arg;
+            }
+            "ADAPTER" => {
+                let arg = parts.next().unwrap_or_default().to_string();
+                if arg.is_empty() {
+                    return Err(anyhow!("Modelfile line {}: ADAPTER needs a path", n + 1));
+                }
+                spec.loras.push(arg);
+            }
+            "PARAMETER" => {
+                let key = parts.next().unwrap_or_default().to_ascii_lowercase();
+                let val: String = parts.collect::<Vec<_>>().join(" ");
+                if key == "num_ctx" {
+                    spec.ctx = Some(val.parse().map_err(|_| anyhow!("bad num_ctx {val:?}"))?);
+                } else {
+                    spec.unsupported.push(format!("PARAMETER {key}"));
+                }
+            }
+            other => spec.unsupported.push(format!("{other} (line {})", n + 1)),
+        }
+    }
+    if spec.base.is_empty() {
+        return Err(anyhow!("Modelfile needs a FROM line"));
+    }
+    Ok(spec)
+}
+
+/// `pallama create MODEL -f Modelfile` — the anti-ollama version: no blob
+/// copy, no template overrides. `FROM` maps to a hardlink alias; `num_ctx` and
+/// ADAPTER to a config overlay; everything else is a named rejection.
+fn create_cmd(model: &str, file: Option<&std::path::Path>) -> Result<()> {
+    let path = file.unwrap_or_else(|| std::path::Path::new("Modelfile"));
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("read {}", path.display()))?;
+    let spec = parse_modelfile(&raw)?;
+    if !spec.unsupported.is_empty() {
+        return Err(anyhow!(
+            "Modelfile keys pallama refuses to fake: {}\n\
+pallama has no Modelfile layer: GGUF is truth (templates embedded, served via --jinja) and \
+parameters are per-request or per-model config overlays. Supported subset: FROM, PARAMETER num_ctx, ADAPTER. \
+Alternatives: model_overrides in ~/.config/pallama/config.toml, or per-request options.",
+            spec.unsupported.join(", ")
+        ));
+    }
+    let d = dirs();
+    pallama_runtime::models::copy_model(&d, &spec.base, model)?;
+    // Overlay: ctx + loras for the new alias.
+    let cfg_path = d.config_file();
+    let cfg = if cfg_path.exists() {
+        let raw = std::fs::read_to_string(&cfg_path)?;
+        pallama_core::Config::from_toml(&raw).map_err(|e| anyhow!("{e}"))?
+    } else {
+        pallama_core::Config::default()
+    };
+    let mut cfg = cfg;
+    let mut o = cfg.model_overrides.remove(model).unwrap_or_default();
+    if let Some(ctx) = spec.ctx {
+        o.ctx = Some(ctx);
+    }
+    if !spec.loras.is_empty() {
+        o.loras = Some(spec.loras.clone());
+    }
+    cfg.model_overrides.insert(model.to_string(), o);
+    std::fs::write(&cfg_path, cfg.to_toml().map_err(|e| anyhow!("{e}"))?)?;
+    println!(
+        "created {model} from {} (hardlink + overlay: ctx={:?}, loras={})",
+        spec.base, spec.ctx, spec.loras.len()
+    );
+    Ok(())
+}
+
+/// `pallama stop` (daemon) vs `pallama stop MODEL` (unload now).
+async fn stop_cmd(model: Option<String>) -> Result<()> {
+    let Some(model) = model else {
+        return stop();
+    };
+    let base = ensure_daemon().await?;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/evict"))
+        .json(&serde_json::json!({"model": model}))
+        .send()
+        .await?;
+    if resp.status().is_success() {
+        println!("unloaded {model}");
+        Ok(())
+    } else {
+        let text = resp.text().await.unwrap_or_default();
+        Err(anyhow!("{text}"))
+    }
+}
+
 async fn run_repl(model: &str) -> Result<()> {
     let base = ensure_daemon().await?;
     let mut rl = rustyline::DefaultEditor::new()?;
@@ -591,9 +1262,10 @@ async fn sysinfo_cmd(base: &str) -> Result<()> {
     Ok(())
 }
 
-/// Stream an /api/chat NDJSON response to stdout.
+/// Stream an /api/chat NDJSON response to stdout; returns the final
+/// (usage-carrying) chunk for --verbose stats.
 #[allow(clippy::duration_suboptimal_units)] // 10-minute generation ceiling
-async fn stream_chat(base: &str, body: &serde_json::Value) -> Result<()> {
+async fn stream_chat(base: &str, body: &serde_json::Value) -> Result<Option<serde_json::Value>> {
     let resp = reqwest::Client::new()
         .post(format!("{base}/api/chat"))
         .json(body)
@@ -606,6 +1278,7 @@ async fn stream_chat(base: &str, body: &serde_json::Value) -> Result<()> {
     }
     let mut resp = resp;
     let mut buf = String::new();
+    let mut final_chunk: Option<serde_json::Value> = None;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     while let Some(chunk) = futures_lite_next(&mut resp).await? {
@@ -620,12 +1293,15 @@ async fn stream_chat(base: &str, body: &serde_json::Value) -> Result<()> {
                 if let Some(content) = v["message"]["content"].as_str() {
                     write!(out, "{content}").ok();
                 }
+                if v["done"].as_bool().unwrap_or(false) {
+                    final_chunk = Some(v);
+                }
             }
         }
         out.flush().ok();
     }
     writeln!(out).ok();
-    Ok(())
+    Ok(final_chunk)
 }
 
 /// Minimal chunked-body reader without importing a stream crate in main.
@@ -678,6 +1354,7 @@ fn tune(model: &str, search: bool, ctx: Option<u32>, spec: Option<String>) -> Re
         .into_iter()
         .map(|l| (l.path, l.scale))
         .collect();
+    let data_dir = d.data_dir.to_string_lossy();
     let input = pallama_runtime::bench::build_input(
         model,
         &row.path,
@@ -691,6 +1368,7 @@ fn tune(model: &str, search: bool, ctx: Option<u32>, spec: Option<String>) -> Re
         &engine_row.tag,
         &manifest.flags,
         pallama_core::Endpoint::Tcp { host: "127.0.0.1".into(), port: 0 },
+        &data_dir,
     );
     let store2 = Store::open(&d)?;
     let tuner = pallama_runtime::Tuner { dirs: &d, bench_bin };
@@ -946,14 +1624,18 @@ async fn fit(target: &str) -> Result<()> {
         parsed.repo,
         humansize(i64::try_from(vram_bytes).unwrap_or(i64::MAX))
     );
-    println!("{:<10} {:>10} {:>8} {:>12}  FILE", "QUANT", "SIZE", "FITS", "REC_CTX");
+    println!(
+        "{:<10} {:>10} {:>8} {:>12} {:>12}  FILE",
+        "QUANT", "SIZE", "FITS", "REC_CTX", "CTX@KV_Q8"
+    );
     for r in rows {
         println!(
-            "{:<10} {:>10} {:>8} {:>12}  {}",
+            "{:<10} {:>10} {:>8} {:>12} {:>12}  {}",
             r.quant,
             humansize(i64::try_from(r.bytes).unwrap_or(i64::MAX)),
             if r.fits_vram { "yes" } else { "no" },
             r.recommended_ctx,
+            r.recommended_ctx_q8,
             r.file
         );
     }
@@ -982,28 +1664,96 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
         }
         ConfigCmd::Set { key, value } => {
             let path = dirs().config_file();
-            let raw = std::fs::read_to_string(&path).unwrap_or_default();
+            let raw = std::fs::read_to_string(&path)?;
+            // Values that are not already TOML scalars (numbers, bools,
+            // quoted strings, arrays) are written as double-quoted strings:
+            // `config set child_transport tcp` must not produce
+            // `child_transport = tcp` (invalid TOML). A one-line parse probe
+            // decides; the full candidate is validated below either way.
+            let scalar = toml::from_str::<toml::Table>(&format!("v = {value}\n")).is_ok();
+            let stored = if scalar { value.clone() } else { format!("{value:?}") };
             let mut out: Vec<String> = Vec::new();
             let mut replaced = false;
             for line in raw.lines() {
                 if line.starts_with(&format!("{key} =")) {
-                    out.push(format!("{key} = {value}"));
+                    out.push(format!("{key} = {stored}"));
                     replaced = true;
                 } else {
                     out.push(line.to_string());
                 }
             }
             if !replaced {
-                out.push(format!("{key} = {value}"));
+                // A NEW top-level key must go ABOVE the first table header
+                // (`[engine_env]`, `[model_overrides.x]`…); appending at the
+                // end would nest it inside that table.
+                let insert_at = out
+                    .iter()
+                    .position(|l| l.starts_with('['))
+                    .unwrap_or(out.len());
+                out.insert(insert_at, format!("{key} = {stored}"));
             }
             let candidate = out.join("\n") + "\n";
             // Validate BEFORE persisting: a bad value/unknown key must
             // never leave the file broken.
-            Config::from_toml(&candidate).map_err(|e| anyhow!("rejected, file unchanged: {e}"))?;
+            Config::from_toml(&candidate)
+                .map_err(|e| anyhow!("rejected, file unchanged: {e}"))?;
             std::fs::write(&path, &candidate)?;
-            println!("{key} = {value}");
+            println!("{key} = {stored}");
             Ok(())
         }
     }
 }
 
+/// `pallama upgrade [--version vN] [--dry-run]`: self-update from GitHub
+/// Releases with the same digest verification as `pallama engine update`.
+async fn upgrade(version: Option<String>, dry_run: bool) -> Result<()> {
+    let repo = std::env::var("PALLAMA_REPO")
+        .ok()
+        .filter(|r| !r.is_empty())
+        .ok_or_else(|| {
+            anyhow!("PALLAMA_REPO is not set; export PALLAMA_REPO=owner/pallama (the repo hosting pallama releases)")
+        })?;
+    let base = std::env::var("PALLAMA_INSTALL_BASE_URL")
+        .unwrap_or_else(|_| "https://api.github.com".to_string());
+    let token = std::env::var("GH_TOKEN")
+        .or_else(|_| std::env::var("GITHUB_TOKEN"))
+        .ok();
+    let client = pallama_runtime::GhClient::with_base(&base, token)
+        .map_err(|e| anyhow!("{e}"))?;
+    let summary =
+        pallama_runtime::upgrade::run(&client, &repo, version.as_deref(), dry_run).await;
+    println!("{summary}");
+    if summary.starts_with("upgrade failed") {
+        return Err(anyhow!("upgrade failed"));
+    }
+    Ok(())
+}
+
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unit__parse_modelfile__supported_subset() {
+        let spec = parse_modelfile("# comment\nFROM qwen3.5-9b\nPARAMETER num_ctx 32768\nADAPTER /tmp/a.gguf\n").unwrap();
+        assert_eq!(spec.base, "qwen3.5-9b");
+        assert_eq!(spec.ctx, Some(32768));
+        assert_eq!(spec.loras, vec!["/tmp/a.gguf"]);
+        assert!(spec.unsupported.is_empty());
+    }
+
+    #[test]
+    fn unit__parse_modelfile__unsupported_keys_collected_not_dropped() {
+        let spec = parse_modelfile("FROM m\nPARAMETER temperature 0.7\nSYSTEM you are a pirate\nTEMPLATE {{x}}\n").unwrap();
+        assert!(spec.unsupported.contains(&"PARAMETER temperature".to_string()));
+        assert!(spec.unsupported.iter().any(|u| u.starts_with("SYSTEM")));
+        assert!(spec.unsupported.iter().any(|u| u.starts_with("TEMPLATE")));
+    }
+
+    #[test]
+    fn unit__parse_modelfile__missing_from_is_error() {
+        assert!(parse_modelfile("PARAMETER num_ctx 8\n").is_err());
+    }
+}

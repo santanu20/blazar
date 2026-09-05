@@ -62,7 +62,7 @@ fn pstr(s: &str) -> Vec<u8> {
 struct TestServer {
     base: String,
     _tmp: tempfile::TempDir,
-    _dirs: PallamaDirs,
+    pub dirs: PallamaDirs,
     state: Arc<AppState>,
     _sup_reaper: tokio::task::JoinHandle<()>,
 }
@@ -84,6 +84,25 @@ async fn start_with(config: Config, child_env: Vec<(String, String)>) -> TestSer
             repo: "o/m1".into(),
             quant: "Q4_K_M".into(),
             path: gguf.display().to_string(),
+            bytes: 500_000_000,
+            sha256: None,
+            mmproj_path: None,
+            shards: 1,
+            arch: Some("qwen3".into()),
+            params: Some(0.5),
+            ctx_train: Some(40_960),
+            pulled_at: 1,
+        })
+        .unwrap();
+    // Second model for router-mode tests (unused by single-model tests).
+    let gguf2 = dirs.models_dir().join("m2-q4_k_m.gguf");
+    write_gguf(&gguf2);
+    store
+        .upsert_model(&pallama_core::ModelRow {
+            name: "m2".into(),
+            repo: "o/m2".into(),
+            quant: "Q4_K_M".into(),
+            path: gguf2.display().to_string(),
             bytes: 500_000_000,
             sha256: None,
             mmproj_path: None,
@@ -125,7 +144,7 @@ async fn start_with(config: Config, child_env: Vec<(String, String)>) -> TestSer
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    TestServer { base: format!("http://127.0.0.1:{port}"), _tmp: tmp, _dirs: dirs, state, _sup_reaper: reaper }
+    TestServer { base: format!("http://127.0.0.1:{port}"), _tmp: tmp, dirs, state, _sup_reaper: reaper }
 }
 
 fn client() -> reqwest::Client {
@@ -394,6 +413,303 @@ async fn e2e__ps_and_show() {
     let s: serde_json::Value = c.post(format!("{}/api/show", ts.base)).json(&show_body).send().await.unwrap().json().await.unwrap();
     assert_eq!(s["details"]["quantization_level"], "Q4_K_M");
     assert_eq!(s["model_info"]["general.architecture"], "qwen3");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__responses_api_proxied_byte_faithful() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let body = serde_json::json!({
+        "model": "m1",
+        "input": "hello responses",
+        "stream": false,
+    });
+    let r: serde_json::Value = c
+        .post(format!("{}/v1/responses", ts.base))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["object"], "response");
+    assert_eq!(r["model"], "m1");
+    // missing model -> 400 naming the requirement
+    let resp = c
+        .post(format!("{}/v1/responses", ts.base))
+        .json(&serde_json::json!({"input": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__audio_transcriptions_multipart_model_routing() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    // OpenAI-style multipart: file part (with filename) + model field.
+    let boundary = "pallama-test-boundary";
+    let mp = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\nRIFF-binary-bytes-here\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nm1\r\n--{boundary}--\r\n"
+    );
+    let r: serde_json::Value = c
+        .post(format!("{}/v1/audio/transcriptions", ts.base))
+        .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+        .body(mp)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(r["text"].as_str().unwrap().contains("stub transcription"), "{r}");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__infill_control_tokenize_proxied() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let infill: serde_json::Value = c
+        .post(format!("{}/infill", ts.base))
+        .json(&serde_json::json!({"model": "m1", "input": "prefix"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(infill["content"], "stub infill");
+
+    let ctrl: serde_json::Value = c
+        .post(format!("{}/v1/chat/completions/control", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "control_vectors": [{"id": 1}, {"id": 2}],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ctrl["control_vectors_applied"], 2);
+
+    let tok: serde_json::Value = c
+        .post(format!("{}/tokenize", ts.base))
+        .json(&serde_json::json!({"model": "m1", "content": "a b c"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(tok["tokens"].as_array().unwrap().len(), 3);
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__session_save_restore_erase_roundtrip() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    // warm the instance (save needs live slot state upstream; ours just
+    // needs the child reachable).
+    let _: serde_json::Value = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({"model": "m1", "stream": false, "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let save: serde_json::Value = c
+        .post(format!("{}/api/session", ts.base))
+        .json(&serde_json::json!({"model": "m1", "action": "save", "filename": "ckpt1"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(save["status"], "ok", "{save}");
+
+    // file landed in the per-model sessions dir
+    let sess_dir = ts.dirs.sessions_dir().join("m1");
+    assert!(sess_dir.join("ckpt1").exists(), "checkpoint file missing");
+
+    let restore: serde_json::Value = c
+        .post(format!("{}/api/session", ts.base))
+        .json(&serde_json::json!({"model": "m1", "action": "restore", "filename": "ckpt1"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(restore["status"], "ok", "{restore}");
+
+    // listing sees it
+    let list: serde_json::Value = c
+        .get(format!("{}/api/session?model=m1", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(list["sessions"][0]["filename"], "ckpt1");
+
+    // path traversal rejected
+    let bad = c
+        .post(format!("{}/api/session", ts.base))
+        .json(&serde_json::json!({"model": "m1", "action": "save", "filename": "../escape"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+
+    // restore of missing checkpoint -> 404 from the child
+    let missing = c
+        .post(format!("{}/api/session", ts.base))
+        .json(&serde_json::json!({"model": "m1", "action": "restore", "filename": "nope"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+
+    let erase: serde_json::Value = c
+        .post(format!("{}/api/session", ts.base))
+        .json(&serde_json::json!({"model": "m1", "action": "erase", "filename": "ckpt1"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(erase["status"], "ok");
+    assert!(!sess_dir.join("ckpt1").exists());
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__router_mode_one_child_serves_both_models() {
+    let cfg = Config { router: true, router_max_models: 2, ..Config::default() };
+    let ts = start(cfg).await;
+    let c = client();
+
+    // Both models route through the single router child.
+    for m in ["m1", "m2"] {
+        let body = serde_json::json!({
+            "model": m,
+            "stream": false,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let r: serde_json::Value = c
+            .post(format!("{}/v1/chat/completions", ts.base))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(r["model"], m, "router routed {m}: {r}");
+    }
+
+    // ONE engine child process (the router), not one per model.
+    assert_eq!(ts.state.sup.ps().len(), 1, "router must be a single instance");
+    assert_eq!(ts.state.sup.ps()[0].name, "_router");
+
+    // ps translates the child's /models listing.
+    let ps: serde_json::Value = c.get(format!("{}/api/ps", ts.base)).send().await.unwrap().json().await.unwrap();
+    let names: Vec<&str> = ps["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["name"].as_str())
+        .collect();
+    assert!(names.contains(&"m1") && names.contains(&"m2"), "ps rows: {ps}");
+
+    // Unknown model fails fast against the store (never spawns).
+    let resp = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({"model": "nope", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // evict forwards the engine unload (model stays preset-listed).
+    let ev: serde_json::Value = c
+        .post(format!("{}/api/evict", ts.base))
+        .json(&serde_json::json!({"model": "m1"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ev["status"], "ok");
+    assert_eq!(ts.state.sup.ps().len(), 1, "unload must not kill the router");
+
+    // num_ctx in router mode: explicit 400 with the overlay hint.
+    let nc = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "messages": [{"role": "user", "content": "x"}],
+            "options": {"num_ctx": 8192},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(nc.status(), 400);
+    let nb: serde_json::Value = nc.json().await.unwrap();
+    assert!(nb["error"].as_str().unwrap().contains("model_overrides"));
+
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__router_mode_sessions_route_by_model() {
+    let cfg = Config { router: true, ..Config::default() };
+    let ts = start(cfg).await;
+    let c = client();
+    // warm the router
+    let _: serde_json::Value = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({"model": "m1", "stream": false, "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let save: serde_json::Value = c
+        .post(format!("{}/api/session", ts.base))
+        .json(&serde_json::json!({"model": "m1", "action": "save", "filename": "r1"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(save["status"], "ok", "{save}");
+    assert!(ts.dirs.sessions_dir().join("m1").join("r1").exists());
     ts.state.sup.shutdown_all().await.unwrap();
 }
 

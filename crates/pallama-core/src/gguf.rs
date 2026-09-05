@@ -27,6 +27,10 @@ pub struct GgufMeta {
     /// Explicit `{arch}.head_dim` when present; else derived by
     /// `derived_head_dim()`.
     pub head_dim: Option<u64>,
+    /// Embedded chat-template text (`tokenizer.chat_template` and/or the
+    /// raw-jinja `chat_template.jinja` key; array variants concatenated).
+    /// Consumed only by capability heuristics (sentinel tool precheck).
+    pub chat_template: Option<String>,
 }
 
 impl GgufMeta {
@@ -268,9 +272,35 @@ pub fn parse_metadata(buf: &[u8]) -> CoreResult<(GgufMeta, usize)> {
         head_count_kv: get(format!("{arch}.head_count_kv")),
         embedding_length: get(format!("{arch}.embedding_length")),
         head_dim: get(format!("{arch}.head_dim")),
+        chat_template: extract_chat_template(&kvs),
         architecture: arch,
     };
     Ok((meta, meta_end))
+}
+
+/// Concatenate template text from every known template KV. String and
+/// array-of-string shapes both occur in the wild (multi-template files);
+/// only marker-substring heuristics consume the result, so concatenation
+/// is safe.
+fn extract_chat_template(kvs: &[(String, GgufValue)]) -> Option<String> {
+    let mut out = String::new();
+    for (key, value) in kvs {
+        if key != "tokenizer.chat_template" && key != "chat_template.jinja" {
+            continue;
+        }
+        match value {
+            GgufValue::String(s) => out.push_str(s),
+            GgufValue::Array(items) => {
+                for item in items {
+                    if let GgufValue::String(s) = item {
+                        out.push_str(s);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// Read metadata from a GGUF file on disk. Only a bounded prefix is read

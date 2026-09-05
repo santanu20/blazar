@@ -8,11 +8,12 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+libc = "0.2.189"
 pallama-core = { path = "crates/pallama-core" }
 pallama-runtime = { path = "crates/pallama-runtime" }
 pallama-gateway = { path = "crates/pallama-gateway" }

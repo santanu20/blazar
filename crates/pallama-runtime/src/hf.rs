@@ -568,6 +568,9 @@ pub struct FitRow {
     pub fits_vram: bool,
     pub kv_bytes_at_default_ctx: u64,
     pub recommended_ctx: u32,
+    /// ctx that fits when the KV cache runs `q8_0` (halved): shows the
+    /// headroom the profile ladder's `q8_0` grade buys on this GPU.
+    pub recommended_ctx_q8: u32,
 }
 
 /// Pre-download compatibility preview (complaint #14): given a repo's
@@ -605,6 +608,11 @@ pub fn fit_rows(
             }
             ctx
         };
+        // Same shrink loop with halved KV: what q8_0 KV buys (rule-6 grade).
+        let mut ctx_q8 = default_ctx;
+        while ctx_q8 > 1024 && bytes + kv_estimate_f16(ctx_q8) / 2 > vram_bytes {
+            ctx_q8 /= 2;
+        }
         rows.push(FitRow {
             quant,
             file: s.rfilename.clone(),
@@ -612,6 +620,7 @@ pub fn fit_rows(
             fits_vram: fits,
             kv_bytes_at_default_ctx: kv_f16,
             recommended_ctx: recommended,
+            recommended_ctx_q8: ctx_q8,
         });
     }
     rows.sort_by_key(|r| std::cmp::Reverse(r.bytes));
@@ -748,6 +757,13 @@ impl Puller {
         bar.finish_and_clear();
 
         // Metadata: prefer real GGUF header; fall back to HF-provided info.
+        // A header that does not parse is a LOUD warning, never silence:
+        // the engine will most likely refuse to load the file (the
+        // qwen3.5-9b quantizer-metadata class of failure).
+        let pull_warning = gguf_health_warning(&shard_paths[0], &target.repo, &info.siblings);
+        if let Some(w) = &pull_warning {
+            tracing::warn!(model = %name, "{w}");
+        }
         let gguf_meta = gguf::read_metadata_file(&shard_paths[0]).ok();
         let arch = gguf_meta
             .as_ref()
@@ -776,6 +792,10 @@ impl Puller {
         };
         let store = Store::open(&self.dirs)?;
         store.upsert_model(&row)?;
+        self.bus.publish(PallamaEvent::ModelPulled {
+            name: name.to_string(),
+            warning: pull_warning.clone(),
+        });
         if selected.quant_fallback {
             tracing::warn!(
                 "quant {} not found in {}; pulled {} instead",
@@ -784,9 +804,40 @@ impl Puller {
                 selected.quant
             );
         }
-        self.bus.publish(PallamaEvent::ModelPulled { name: name.to_string() });
         Ok(row)
     }
+}
+
+/// Post-download GGUF health check: `None` when the header parses;
+/// otherwise a warning naming the failure and the other quants of the
+/// same repo (precheck for the load-refusal class of breakage).
+#[must_use]
+pub fn gguf_health_warning(path: &Path, repo: &str, siblings: &[HfSibling]) -> Option<String> {
+    if gguf::read_metadata_file(path).is_ok() {
+        return None;
+    }
+    let mut alts: Vec<String> = siblings
+        .iter()
+        .filter(|s| {
+            let lower = s.rfilename.to_lowercase();
+            let is_gguf = std::path::Path::new(&s.rfilename)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
+            is_gguf && !lower.contains("-of-")
+        })
+        .filter_map(|s| {
+            let lower = s.rfilename.to_lowercase();
+            let stem = lower.strip_suffix(".gguf")?;
+            stem.rsplit('-').next().map(str::to_uppercase)
+        })
+        .collect();
+    alts.sort();
+    alts.dedup();
+    Some(format!(
+        "GGUF metadata unreadable in {} — the engine will likely refuse to load it; `pallama rm` and try another quant of {repo}: {}",
+        path.display(),
+        alts.join(", ")
+    ))
 }
 
 fn unique_dest(dir: &Path, filename: &str) -> PathBuf {
@@ -814,6 +865,45 @@ mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn unit__gguf_health_warning__bad_header_names_alternatives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad = tmp.path().join("bad.gguf");
+        std::fs::write(&bad, b"not a gguf at all").unwrap();
+        let sibs = vec![
+            sib("m-Q4_K_M.gguf", 1, None),
+            sib("m-Q8_0.gguf", 1, None),
+            sib("m-00001-of-00002.gguf", 1, None), // shard: excluded
+            sib("README.md", 1, None),              // not gguf: excluded
+        ];
+        let w = gguf_health_warning(&bad, "o/m", &sibs).expect("warning");
+        assert!(w.contains("refuse to load"), "{w}");
+        assert!(w.contains("o/m"), "{w}");
+        assert!(w.contains("Q4_K_M") && w.contains("Q8_0"), "{w}");
+        assert!(!w.contains("README"), "{w}");
+    }
+
+    #[test]
+    fn unit__gguf_health_warning__valid_header_is_none() {
+        // Minimal valid GGUF v3 header with one kv (architecture string).
+        let tmp = tempfile::tempdir().unwrap();
+        let good = tmp.path().join("good.gguf");
+        let mut b: Vec<u8> = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes());
+        let k = "general.architecture";
+        b.extend_from_slice(&(k.len() as u64).to_le_bytes());
+        b.extend_from_slice(k.as_bytes());
+        b.extend_from_slice(&8u32.to_le_bytes());
+        let v = "qwen3";
+        b.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        b.extend_from_slice(v.as_bytes());
+        std::fs::write(&good, b).unwrap();
+        assert_eq!(gguf_health_warning(&good, "o/m", &[]), None);
+    }
 
     fn sib(name: &str, size: u64, sha: Option<&str>) -> HfSibling {
         HfSibling {

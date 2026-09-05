@@ -10,6 +10,7 @@ pub mod models;
 pub mod probe;
 pub mod supervisor;
 pub mod hf;
+pub mod upgrade;
 
 pub use engine::gh::GhClient;
 pub use engine::manifest::{probe as probe_manifest, Manifest, Vendor};
@@ -21,4 +22,4 @@ pub use daemon::{process_alive_by_pid, wait_for_shutdown_signal, DaemonLock};
 pub use engine_impl::{ChildHandle, Engine, LlamaCppEngine};
 pub use probe::probe_hardware;
 pub use models::{instance_running, remove_model};
-pub use supervisor::{EngineRef, PsRow, SupervisionError, Supervisor};
+pub use supervisor::{EngineRef, PsRow, SupervisionError, Supervisor, ROUTER_KEY};

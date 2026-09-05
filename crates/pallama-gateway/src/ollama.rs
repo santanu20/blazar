@@ -9,9 +9,11 @@
 
 use std::sync::Arc;
 
+use std::fmt::Write as _;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::Extension;
 use axum::response::{IntoResponse, Response};
 use tokio_stream::StreamExt as TsExt;
 use serde_json::{json, Value};
@@ -20,8 +22,10 @@ use pallama_core::store::Store;
 
 use crate::proxy::{child_base, ensure_with_admission, resolve_model, with_accounting};
 use crate::queue::Priority;
+use crate::sentinel;
 use crate::state::AppState;
 use crate::translate as tr;
+use crate::TraceId;
 
 fn api_error(status: u16, message: &str) -> Response {
     (
@@ -34,6 +38,22 @@ fn api_error(status: u16, message: &str) -> Response {
 /// GET /api/version
 pub async fn version() -> Response {
     axum::Json(json!({"version": env!("CARGO_PKG_VERSION")})).into_response()
+}
+
+/// GET /api/why[?trace=...] — the sentinel ring: what the model returned,
+/// what was wrong with it, which knob fixes it. Powers `pallama why`.
+/// `sentinel: false` reports the kill-switch state instead of an error:
+/// silent-empty is the exact failure mode this exists to expose.
+pub async fn why(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
+    let trace = uri
+        .query()
+        .and_then(|q| q.split('&').find_map(|p| p.strip_prefix("trace=")));
+    let records = state.sentinel.why(trace, 10);
+    axum::Json(json!({
+        "sentinel": state.config.sentinel,
+        "records": records.iter().map(sentinel::SentinelRecord::to_json).collect::<Vec<_>>(),
+    }))
+    .into_response()
 }
 
 /// GET /api/tags
@@ -155,7 +175,12 @@ pub async fn delete(State(state): State<Arc<AppState>>, body: Bytes) -> Response
 }
 
 /// GET /api/ps — live slots: name, state, ctx, idle countdown, endpoint.
+/// Router mode: translate the child's GET /models (per-model load state
+/// from the engine's own supervisor) instead of pallama instance rows.
 pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
+    if state.config.router {
+        return ps_router(&state).await;
+    }
     let rows: Vec<Value> = state
         .sup
         .ps()
@@ -175,6 +200,61 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
                 "pallama_endpoint": p.endpoint,
                 "expires_at": chrono_like_now().saturating_add(i64::try_from(idle_remaining * 1_000_000_000).unwrap_or(i64::MAX)),
             })
+        })
+        .collect();
+    axum::Json(json!({"models": rows})).into_response()
+}
+
+/// Router-mode ps: one process, N engine-managed models. The child's
+/// GET /models reports per-model status (downloading/downloaded/unloaded/
+/// loading/loaded/sleeping); `loaded_info` merges child fields when running.
+async fn ps_router(state: &Arc<AppState>) -> Response {
+    let engine = match state.sup.ensure(pallama_runtime::ROUTER_KEY).await {
+        Ok(e) => e,
+        Err(e) => return api_error(503, &e.to_string()),
+    };
+    let url = format!("{}/models", child_base(&engine.endpoint));
+    let resp = state.http.get(&url).send().await;
+    let Ok(resp) = resp else {
+        return api_error(502, "router /models unreachable");
+    };
+    if !resp.status().is_success() {
+        return api_error(502, "router /models non-success");
+    }
+    let v: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => return api_error(502, &format!("router /models parse: {e}")),
+    };
+    let idle_remaining = state.config.idle_timeout_secs;
+    let rows: Vec<Value> = v["data"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| {
+            let name = m["id"].as_str()?.to_string();
+            let status = m["status"]["value"].as_str().unwrap_or("unknown");
+            // Only engine-managed load states surface as rows; unloaded
+            // presets are store rows, not live ones.
+            if matches!(status, "unloaded" | "downloaded" | "downloading") {
+                return None;
+            }
+            let pallama_state = match status {
+                "loading" => "loading",
+                "sleeping" => "sleeping",
+                _ => "ready",
+            };
+            Some(json!({
+                "name": name,
+                "model": name,
+                "size": 0,
+                "pallama_state": pallama_state,
+                "pallama_ctx": 0,
+                "pallama_in_flight": 0,
+                "pallama_endpoint": "router",
+                "expires_at": chrono_like_now()
+                    .saturating_add(i64::try_from(idle_remaining * 1_000_000_000).unwrap_or(i64::MAX)),
+            }))
         })
         .collect();
     axum::Json(json!({"models": rows})).into_response()
@@ -260,10 +340,15 @@ fn pull_event_line(name: &str, e: &pallama_runtime::PallamaEvent) -> (String, bo
             format!("{}\n", json!({"status": "pulling", "total": total, "completed": downloaded})),
             false,
         ),
-        ModelPulled { name: n } if n == name => (
-            format!("{}\n", json!({"status": "success"})),
-            true,
-        ),
+        ModelPulled { name: n, warning } if n == name => {
+            // ollama NDJSON parity + the health warning when the GGUF
+            // header did not parse (quant alternatives included).
+            let mut payload = json!({"status": "success"});
+            if let Some(w) = warning {
+                payload["warning"] = json!(w);
+            }
+            (format!("{payload}\n"), true)
+        }
         PullFailed { name: n, error } if n == name => (
             format!("{}\n", json!({"error": error})),
             true,
@@ -310,6 +395,7 @@ fn event_kind(e: &pallama_runtime::PallamaEvent) -> &'static str {
 /// POST /api/chat — full translation incl. `num_ctx` + `keep_alive`.
 pub async fn chat(
     State(state): State<Arc<AppState>>,
+    trace_ext: Option<Extension<TraceId>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -339,8 +425,19 @@ pub async fn chat(
     );
 
     // Complaint #13: honor num_ctx — restart instance once at requested
-    // size when idle (no in-flight requests).
+    // size when idle (no in-flight requests). Router mode has one shared
+    // child: per-request restarts are impossible — fail fast with the
+    // overlay fix instead of silently ignoring (H1).
     if let Some(want) = num_ctx {
+        if state.config.router {
+            return api_error(
+                400,
+                &format!(
+                    "router mode serves all models from one child; per-request num_ctx is not available — set [model_overrides.{}] ctx = {} in config.toml and restart the daemon",
+                    row.name, want
+                ),
+            );
+        }
         if let Err(resp) = apply_num_ctx(&state, &row.name, want).await {
             return resp;
         }
@@ -360,7 +457,9 @@ pub async fn chat(
     let accounting_name = model_name.clone();
 
     let out = with_accounting(&state, &accounting_name, async move {
-        let resp = proxy_core_chat(&state2, &engine2, &model_name, openai_bytes, stream, load_ms).await;
+        let enforce = state2.config.sentinel
+            && sentinel::enforce_enabled(&state2.config, &headers);
+        let resp = proxy_core_chat(&state2, &engine2, &model_name, openai_bytes, stream, load_ms, trace_ext.map(|Extension(t)| t.0), enforce).await;
         // keep_alive=0: evict right after this response (complaint #12).
         if keep_alive == Some(0) {
             let _ = state2.sup.evict(&model_name).await;
@@ -376,7 +475,7 @@ fn parse_keep_alive(v: Option<&Value>) -> Option<i64> {
     v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
-async fn apply_num_ctx(state: &Arc<AppState>, model: &str, want: i64) -> Result<(), Response> {
+pub(crate) async fn apply_num_ctx(state: &Arc<AppState>, model: &str, want: i64) -> Result<(), Response> {
     if want <= 0 {
         return Err(api_error(400, "options.num_ctx must be positive"));
     }
@@ -395,7 +494,7 @@ async fn apply_num_ctx(state: &Arc<AppState>, model: &str, want: i64) -> Result<
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)] // stream translation is one cohesive path
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // one cohesive translation path
 async fn proxy_core_chat(
     state: &Arc<AppState>,
     engine: &pallama_runtime::EngineRef,
@@ -403,14 +502,20 @@ async fn proxy_core_chat(
     openai_body: Vec<u8>,
     stream: bool,
     load_ms: u128,
+    trace: Option<String>,
+    enforce: bool,
 ) -> Response {
     let base = child_base(&engine.endpoint);
     let url = format!("{base}/v1/chat/completions");
     let req = state.http.post(&url).header("content-type", "application/json");
     if !stream {
         // We translate the non-stream response into ollama shape.
+        let t0 = std::time::Instant::now();
         let resp = match req.body(openai_body.clone()).send().await {
-            Ok(r) => r,
+            Ok(r) => {
+                state.ttft.observe_secs(t0.elapsed().as_secs_f64());
+                r
+            }
             Err(e) => {
                 tracing::warn!(model, "nonstream upstream failed: {e:#}");
                 return api_error(502, &format!("engine request failed: {e:#}"));
@@ -425,6 +530,42 @@ async fn proxy_core_chat(
             Ok(v) => v,
             Err(e) => return api_error(502, &format!("bad engine response: {e}")),
         };
+        // Non-stream + enforce: judge before translation (streaming stays
+        // warn-only — bytes are already on the wire).
+        if enforce {
+            let (ctx, _) = sentinel::request_ctx(
+                state,
+                "ollama-chat",
+                model,
+                &openai_body,
+                trace,
+                false,
+            );
+            let hard = state
+                .sentinel
+                .judge(&ctx, &serde_json::to_vec(&openai).unwrap_or_default(), 200);
+            if !hard.is_empty() {
+                let detail = hard
+                    .iter()
+                    .map(|d| format!("[{}] {}", d.code.as_str(), d.detail))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return api_error(422, &format!("sentinel enforce: {detail}"));
+            }
+        } else {
+            let (feed, _) = sentinel::begin_chat_observation(
+                state,
+                "ollama-chat",
+                model,
+                &openai_body,
+                trace,
+                200,
+                false,
+            );
+            feed.value(openai.clone());
+            // Drop fires End: the analyzer finalizes off the response path.
+            drop(feed);
+        }
         return axum::Json(tr::openai_chat_to_ollama(model, &openai)).into_response();
     }
     // Stream: child SSE -> ollama NDJSON with final counts. Force the
@@ -455,7 +596,34 @@ async fn proxy_core_chat(
     let upstream = resp.bytes_stream();
     let model_c = model.to_string();
     let load_hdr = load_ms > 100;
-    let stream = futures::StreamExt::map(upstream, |chunk| {
+    // Sentinel: same side-channel tap as the OpenAI path — bytes cloned
+    // in the observation closure, analyzer parses off the hot path.
+    let (sentinel_feed, _) = sentinel::begin_chat_observation(
+        state,
+        "ollama-chat",
+        model,
+        &openai_body,
+        trace,
+        200,
+        true,
+    );
+    // Evidence loop: TTFT on first upstream byte, inter-chunk cadence after.
+    let t0 = std::time::Instant::now();
+    let mut first = true;
+    let mut last = t0;
+    let hist_state = std::sync::Arc::clone(state);
+    let stream = futures::StreamExt::map(upstream, move |chunk| {
+        let now = std::time::Instant::now();
+        if first {
+            hist_state.ttft.observe_secs((now - t0).as_secs_f64());
+            first = false;
+        } else {
+            hist_state.tpot.observe_secs((now - last).as_secs_f64());
+        }
+        last = now;
+        if let Ok(bytes) = chunk.as_ref() {
+            sentinel_feed.bytes(bytes.as_ref());
+        }
         chunk.map_err(|e| std::io::Error::other(e.to_string()))
     });
     // Translate SSE -> NDJSON incrementally.
@@ -567,6 +735,7 @@ pub async fn embeddings(State(state): State<Arc<AppState>>, body: Bytes) -> Resp
 #[allow(clippy::too_many_lines)] // one cohesive translation path
 pub async fn generate(
     State(state): State<Arc<AppState>>,
+    trace_ext: Option<Extension<TraceId>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -605,9 +774,181 @@ pub async fn generate(
             Ok(v) => v,
             Err(e) => return api_error(502, &format!("bad engine response: {e}")),
         };
+        let (feed, _) = sentinel::begin_chat_observation(
+            &state,
+            "ollama-generate",
+            &model,
+            &serde_json::to_vec(&openai_req).unwrap_or_default(),
+            trace_ext.map(|Extension(t)| t.0),
+            200,
+            false,
+        );
+        feed.value(openai.clone());
+        drop(feed);
         axum::Json(tr::openai_completion_to_ollama(&model, &openai)).into_response()
     })
     .await
+}
+
+/// POST /api/evict {"model": name} — pallama-internal (ollama has no REST
+/// equivalent): unload a model now. Powers `pallama stop <model>`.
+pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let v: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return api_error(400, &e.to_string()),
+    };
+    let Some(model) = v["model"].as_str() else {
+        return api_error(400, "missing 'model'");
+    };
+    // Router mode: the engine owns per-model lifecycle — forward the
+    // unload to the router child (models stay preset-listed, just unloaded).
+    if state.config.router {
+        let engine = match state.sup.ensure(pallama_runtime::ROUTER_KEY).await {
+            Ok(e) => e,
+            Err(e) => return api_error(503, &e.to_string()),
+        };
+        let url = format!("{}/models/unload", child_base(&engine.endpoint));
+        return match state.http.post(&url).json(&json!({"model": model})).send().await {
+            Ok(r) if r.status().is_success() => {
+                axum::Json(json!({"status": "ok"})).into_response()
+            }
+            Ok(r) => {
+                let code = r.status().as_u16();
+                let text = r.text().await.unwrap_or_default();
+                api_error(code, &text)
+            }
+            Err(e) => api_error(502, &format!("router unload: {e}")),
+        };
+    }
+    match state.sup.evict(model).await {
+        Ok(()) => axum::Json(json!({"status": "ok"})).into_response(),
+        Err(e) => api_error(404, &e.to_string()),
+    }
+}
+
+/// A session checkpoint filename: alphanumerics, dot, underscore, dash.
+/// Mirrors upstream `fs_validate_filename` — no path separators, ever.
+fn valid_session_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+        && !name.starts_with('.')
+}
+
+/// POST /api/session {"model", "action": "save|restore|erase",
+/// "filename", "slot": 0} — pallama-internal: slot KV-cache
+/// checkpoints via upstream `--slot-save-path` + `POST /slots/{id}`.
+/// Ensures the model is loaded first (save needs live slot state).
+pub async fn session(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Response {
+    let v: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
+    };
+    let Some(model) = v["model"].as_str() else {
+        return api_error(400, "missing 'model'");
+    };
+    let Some(action) = v["action"].as_str() else {
+        return api_error(400, "missing 'action' (save | restore | erase)");
+    };
+    if !matches!(action, "save" | "restore" | "erase") {
+        return api_error(400, "action must be save, restore or erase");
+    }
+    let Some(filename) = v["filename"].as_str() else {
+        return api_error(400, "missing 'filename'");
+    };
+    if !valid_session_name(filename) {
+        return api_error(
+            400,
+            "filename must be [A-Za-z0-9._-], not start with '.', max 128 chars",
+        );
+    }
+    let slot = v["slot"].as_u64().unwrap_or(0);
+    let slot = u32::try_from(slot).unwrap_or(0);
+
+    // Erase is a FILE deletion, owned by the daemon (it owns the sessions
+    // dir). Upstream's slot-erase action clears live KV state, not the
+    // checkpoint file — forwarding would report success and delete nothing.
+    if action == "erase" {
+        let path = state
+            .dirs
+            .sessions_dir()
+            .join(pallama_core::profile::path_safe(model))
+            .join(filename);
+        return match std::fs::remove_file(&path) {
+            Ok(()) => axum::Json(json!({"status": "ok", "filename": filename})).into_response(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                api_error(404, &format!("no such checkpoint: {filename}"))
+            }
+            Err(e) => api_error(500, &format!("delete {filename}: {e}")),
+        };
+    }
+
+    let (engine, _load_ms) = match ensure_with_admission(&state, model, Priority::Normal).await {
+        Ok(ok) => ok,
+        Err(resp) => return resp,
+    };
+    with_accounting(&state, &engine.name.clone(), async {
+        let url = format!(
+            "{}/slots/{}?action={action}&filename={filename}",
+            child_base(&engine.endpoint),
+            slot
+        );
+        // `model` rides along for router mode (upstream proxy_post routes
+        // by body model); classic children already run per-model dirs and
+        // never see the extra key.
+        let body_json = if state.config.router {
+            json!({"filename": filename, "model": model})
+        } else {
+            json!({"filename": filename})
+        };
+        let resp = state
+            .http
+            .post(&url)
+            .json(&body_json)
+            .send()
+            .await;
+        match resp {
+            Ok(r) => {
+                let status = StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                let body = r.text().await.unwrap_or_default();
+                (status, body).into_response()
+            }
+            Err(e) => api_error(502, &format!("child slot action failed: {e}")),
+        }
+    })
+    .await
+}
+
+/// GET /api/session?model=NAME — list checkpoint files for a model from
+/// the sessions dir the daemon owns (no child required).
+pub async fn session_list(
+    State(state): State<Arc<AppState>>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> Response {
+    let model = query
+        .as_deref()
+        .and_then(|q| q.split('&').find_map(|p| p.strip_prefix("model=")))
+        .unwrap_or_default()
+        .to_string();
+    if model.is_empty() {
+        return api_error(400, "missing ?model=");
+    }
+    let dir = state.dirs.sessions_dir().join(pallama_core::profile::path_safe(&model));
+    let mut files: Vec<Value> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let size = entry.metadata().map_or(0, |m| m.len());
+            files.push(json!({"filename": name, "bytes": size}));
+        }
+    }
+    files.sort_by(|a, b| a["filename"].as_str().cmp(&b["filename"].as_str()));
+    axum::Json(json!({"model": model, "sessions": files})).into_response()
 }
 
 /// GET /metrics — merged children prometheus text + pallama_* gauges.
@@ -624,25 +965,31 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
             }
         }
     }
-    merged.push_str(&format!(
+    let _ = write!(
+        merged,
         "# HELP pallama_models_loaded Models currently loaded\n# TYPE pallama_models_loaded gauge\npallama_models_loaded {}\n",
         state.sup.ps().len()
-    ));
-    merged.push_str(&format!(
+    );
+    let _ = write!(
+        merged,
         "# HELP pallama_queue_depth Waiting requests\n# TYPE pallama_queue_depth gauge\npallama_queue_depth {}\n",
         state.queue.depth()
-    ));
-    merged.push_str(&format!(
+    );
+    let _ = write!(
+        merged,
         "# HELP pallama_evictions_total Total instance evictions\n# TYPE pallama_evictions_total counter\npallama_evictions_total {}\n",
         state.sup.evictions.load(std::sync::atomic::Ordering::Relaxed)
-    ));
+    );
+    state.ttft.render(&mut merged);
+    state.tpot.render(&mut merged);
     if let Ok(store) = Store::open(&state.dirs) {
         if let Ok(Some(engine)) = store.active_engine() {
             if let Ok(m) = serde_json::from_str::<pallama_runtime::Manifest>(&engine.manifest) {
-                merged.push_str(&format!(
+                let _ = write!(
+                    merged,
                     "# HELP pallama_engine_build Active engine build number\n# TYPE pallama_engine_build gauge\npallama_engine_build {}\n",
                     m.build_number
-                ));
+                );
             }
         }
     }
@@ -651,4 +998,38 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         merged,
     )
         .into_response()
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod tests {
+    use super::*;
+    use pallama_runtime::PallamaEvent;
+
+    #[test]
+    fn unit__pull_event_line__warning_rides_success_ndjson() {
+        let (line, done) = pull_event_line(
+            "m1",
+            &PallamaEvent::ModelPulled {
+                name: "m1".into(),
+                warning: Some("GGUF metadata unreadable: try Q8_0".into()),
+            },
+        );
+        assert!(done);
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["status"], "success");
+        assert_eq!(v["warning"], "GGUF metadata unreadable: try Q8_0");
+    }
+
+    #[test]
+    fn unit__pull_event_line__clean_pull_has_no_warning_field() {
+        let (line, done) = pull_event_line(
+            "m1",
+            &PallamaEvent::ModelPulled { name: "m1".into(), warning: None },
+        );
+        assert!(done);
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["status"], "success");
+        assert!(v.get("warning").is_none());
+    }
 }

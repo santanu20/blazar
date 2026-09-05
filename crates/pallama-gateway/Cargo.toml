@@ -27,6 +27,8 @@ bytes = { workspace = true }
 http-body-util = { workspace = true }
 tokio-stream = { workspace = true }
 tempfile = "3"
+jsonschema = { version = "0.53.0", default-features = false }
+parking_lot = "0.12.5"
 
 [dev-dependencies]
 pallama-runtime = { workspace = true, features = ["test-util"] }

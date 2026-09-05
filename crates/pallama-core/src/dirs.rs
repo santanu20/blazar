@@ -50,12 +50,27 @@ impl PallamaDirs {
         self.data_dir.join("run")
     }
 
+    /// Persistent n-gram speculative caches (`--lookup-cache-dynamic`),
+    /// one file per model; survives restarts.
+    #[must_use]
+    pub fn speccache_dir(&self) -> PathBuf {
+        self.data_dir.join("speccache")
+    }
+
+    /// Slot KV-cache checkpoints (`--slot-save-path`) for `pallama session`.
+    #[must_use]
+    pub fn sessions_dir(&self) -> PathBuf {
+        self.data_dir.join("sessions")
+    }
+
     /// Ensure all data subdirectories exist (config dir included).
     pub fn ensure(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.config_dir)?;
         std::fs::create_dir_all(self.models_dir())?;
         std::fs::create_dir_all(self.engines_dir())?;
         std::fs::create_dir_all(self.run_dir())?;
+        std::fs::create_dir_all(self.speccache_dir())?;
+        std::fs::create_dir_all(self.sessions_dir())?;
         Ok(())
     }
 }

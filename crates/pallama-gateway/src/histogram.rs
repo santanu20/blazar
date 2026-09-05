@@ -1,0 +1,162 @@
+//! Lock-free latency histograms for the gateway evidence loop.
+//!
+//! vLLM/SGLang ship TTFT/TPOT histograms as their most-used observability;
+//! pallama measures the same things at the proxy — it is the only component
+//! that sees every byte of every stream. Hand-rolled on `AtomicU64`
+//! (nanoseconds internally): no metrics crate, no locks on the streaming
+//! hot path, no label cardinality (global histograms — per-model split when
+//! someone asks with a reason).
+
+use std::fmt::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Cumulative-bucket histogram rendering in Prometheus text format.
+pub struct Histogram {
+    name: &'static str,
+    help: &'static str,
+    /// Upper bounds in seconds per bucket, ascending, exclusive of +Inf.
+    bounds: &'static [f64],
+    buckets: Vec<AtomicU64>,
+    sum_ns: AtomicU64,
+    count: AtomicU64,
+}
+
+impl Histogram {
+    #[must_use]
+    pub fn new(name: &'static str, help: &'static str, bounds: &'static [f64]) -> Self {
+        assert!(!bounds.is_empty(), "histogram needs at least one bound");
+        assert!(
+            bounds.windows(2).all(|w| w[0] < w[1]),
+            "histogram bounds must be ascending"
+        );
+        Self {
+            name,
+            help,
+            bounds,
+            buckets: bounds.iter().map(|_| AtomicU64::new(0)).collect(),
+            sum_ns: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one observation in seconds. Infallible by construction:
+    /// saturating atomics only, never panics on the stream hot path.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "ns conversion is clamp-guarded; 52-bit mantissa covers centuries of latency sums"
+    )]
+    pub fn observe_secs(&self, secs: f64) {
+        if !(secs.is_finite() && secs >= 0.0) {
+            return;
+        }
+        let ns = (secs * 1e9).clamp(0.0, u64::MAX as f64) as u64;
+        if let Some(i) = self.bounds.iter().position(|b| secs <= *b) {
+            self.buckets[i].fetch_add(1, Ordering::Relaxed);
+        }
+        // Above every bound: counted in _sum/_count (and therefore +Inf)
+        // only — finite buckets must stay true upper bounds.
+        self.sum_ns.fetch_add(ns, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Append `# HELP/# TYPE`, cumulative `_bucket{le=…}` lines, `_sum`,
+    /// `_count` in Prometheus exposition format.
+    #[allow(clippy::cast_precision_loss, reason = "ns -> s display rounding is irrelevant")]
+    pub fn render(&self, out: &mut String) {
+        let count = self.count.load(Ordering::Relaxed);
+        let _ = writeln!(out, "# HELP {} {}\n# TYPE {} histogram", self.name, self.help, self.name);
+        let mut cumulative = 0u64;
+        for (b, c) in self.bounds.iter().zip(&self.buckets) {
+            cumulative += c.load(Ordering::Relaxed);
+            let _ = writeln!(out, "{}_bucket{{le=\"{}\"}} {}", self.name, format_f64(*b), cumulative);
+        }
+        let _ = writeln!(out, "{}_bucket{{le=\"+Inf\"}} {}", self.name, count);
+        let _ = writeln!(
+            out,
+            "{}_sum {}",
+            self.name,
+            format_f64(self.sum_ns.load(Ordering::Relaxed) as f64 / 1e9)
+        );
+        let _ = writeln!(out, "{}_count {}", self.name, count);
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "guarded by the integral check above"
+)]
+fn format_f64(v: f64) -> String {
+    // Prometheus accepts plain decimal; render compactly without trailing
+    // zeros for values like 0.005 or 3.
+    if (v - v.trunc()).abs() < f64::EPSILON {
+        format!("{}", v as u64)
+    } else {
+        format!("{v}")
+    }
+}
+
+/// Time-to-first-token of the response stream (time to first body byte).
+#[must_use]
+pub fn ttft() -> Histogram {
+    Histogram::new(
+        "pallama_ttft_seconds",
+        "Gateway time-to-first-token: request start to first body byte of a generation (vLLM-style evidence loop)",
+        &[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+    )
+}
+
+/// Inter-chunk cadence of streamed generations. NOTE: SSE chunks may carry
+/// more than one token per flush — this is chunk cadence, an approximation
+/// of time-per-output-token, not an exact TPOT.
+#[must_use]
+pub fn tpot() -> Histogram {
+    Histogram::new(
+        "pallama_tpot_seconds",
+        "Gateway inter-chunk cadence for streamed generations (approximate time-per-output-token; chunks may batch tokens)",
+        &[0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0],
+    )
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unit__histogram__buckets_are_cumulative_and_sorted() {
+        let h = Histogram::new("t", "test", &[0.1, 1.0]);
+        for v in [0.05, 0.2, 0.9, 1.0, 7.0] {
+            h.observe_secs(v);
+        }
+        let mut out = String::new();
+        h.render(&mut out);
+        assert!(out.contains("t_bucket{le=\"0.1\"} 1"), "{out}");
+        assert!(out.contains("t_bucket{le=\"1\"} 4"), "{out}"); // 0.05,0.2,0.9,1.0
+        assert!(out.contains("t_bucket{le=\"+Inf\"} 5"), "{out}");
+        assert!(out.contains("t_count 5"), "{out}");
+        assert!(out.contains("t_sum 9.15"), "{out}"); // 0.05+0.2+0.9+1.0+7.0
+    }
+
+    #[test]
+    fn unit__histogram__rejects_nonfinite_and_negative() {
+        let h = Histogram::new("t", "test", &[1.0]);
+        h.observe_secs(f64::NAN);
+        h.observe_secs(f64::NEG_INFINITY);
+        h.observe_secs(-1.0);
+        let mut out = String::new();
+        h.render(&mut out);
+        assert!(out.contains("t_count 0"), "{out}");
+    }
+
+    #[test]
+    fn unit__histogram__bound_edges_inclusive() {
+        let h = Histogram::new("t", "test", &[0.1]);
+        h.observe_secs(0.1); // exactly on the bound -> first bucket
+        let mut out = String::new();
+        h.render(&mut out);
+        assert!(out.contains("t_bucket{le=\"0.1\"} 1"), "{out}");
+    }
+}

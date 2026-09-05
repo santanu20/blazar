@@ -20,6 +20,10 @@ use pallama_core::{Config, Hardware, ModelRow, PallamaDirs};
 
 use crate::events::{EventBus, InstanceState, PallamaEvent};
 
+/// Instance key for the single router-mode child (never a model name:
+/// underscore prefix is invalid in HF repo names).
+pub const ROUTER_KEY: &str = "_router";
+
 use crate::engine_impl::{ChildHandle, Engine};
 
 /// Typed failures the gateway maps onto HTTP statuses.
@@ -146,6 +150,19 @@ impl Supervisor {
     /// Ensure a model is loaded and ready; returns its endpoint. Waits on
     /// a concurrent load instead of double-spawning.
     pub async fn ensure(&self, name: &str) -> Result<EngineRef, SupervisionError> {
+        // Router mode: every model name resolves to the ONE router child
+        // (upstream autoloads the model on request, LRU-evicts at
+        // models-max). Unknown names still fail fast against the store.
+        if self.config.router && name != ROUTER_KEY {
+            let store = Store::open(&self.dirs)
+                .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
+            store
+                .get_model(name)
+                .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?
+                .ok_or_else(|| SupervisionError::ModelNotFound(name.to_string()))?;
+            return Box::pin(self.ensure(ROUTER_KEY)).await;
+        }
+
         // Fast path: running (or sleeping — the child wakes on traffic).
         if let Some(inst) = self.instances.get(name) {
             let snapshot = (*inst.state.read().expect("state lock"), inst.last_used.read().expect("idle lock").elapsed());
@@ -203,7 +220,11 @@ impl Supervisor {
         // We are the loader.
         let notify = Arc::new(Notify::new());
         self.loading.insert(name.to_string(), notify.clone());
-        let result = self.spawn_instance(name).await;
+        let result = if self.config.router && name == ROUTER_KEY {
+            self.spawn_router_instance().await
+        } else {
+            self.spawn_instance(name).await
+        };
         // Waiters get a cloneable copy; the loader returns the typed error
         // itself (callers match on ModelLoadTimeout / CircuitOpen / ...).
         self.load_results
@@ -222,6 +243,180 @@ impl Supervisor {
             name: inst.name.clone(),
             endpoint: inst.endpoint.clone(),
         }
+    }
+
+    /// Router-mode spawn: ONE child, no `-m`, `--models-preset` INI
+    /// generated from every loadable store model. Models whose GGUF
+    /// metadata or manifest-gated profile fail to compile are SKIPPED
+    /// with a warning — one bad model must not take the router down.
+    #[allow(clippy::too_many_lines)]
+    async fn spawn_router_instance(&self) -> Result<EngineRef, SupervisionError> {
+        let store = Store::open(&self.dirs).map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
+        let models = store
+            .list_models()
+            .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
+        let manifest = self.engine.capabilities();
+        if !manifest.flags.contains("--models-preset") {
+            return Err(SupervisionError::Internal(anyhow!(
+                "router mode: engine {} lacks --models-preset; run: pallama engine update",
+                manifest.tag
+            )));
+        }
+        let _ = self.dirs.ensure();
+        let data_dir_str = self.dirs.data_dir.to_string_lossy().into_owned();
+
+        let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+        let mut global: Vec<String> = Vec::new();
+        for m in &models {
+            let gguf = match pallama_core::read_metadata_file(std::path::Path::new(&m.path)) {
+                Ok(g) => g,
+                Err(e) => {
+                    tracing::warn!(model = %m.name, "router preset skips model (gguf metadata): {e}");
+                    continue;
+                }
+            };
+            let overlay = self.config.overlay_for(&m.name);
+            let loras: Vec<(String, f64)> = store
+                .list_loras(Some(&m.name))
+                .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?
+                .into_iter()
+                .map(|l| (l.path, l.scale))
+                .collect();
+            let input = ProfileInput {
+                model_name: &m.name,
+                model_path: &m.path,
+                model_bytes: u64::try_from(m.bytes.max(0)).unwrap_or(u64::MAX),
+                gguf: &gguf,
+                hardware: &self.hardware,
+                config: &self.config,
+                overlay: &overlay,
+                loras: &loras,
+                draft_path: None,
+                engine_tag: &manifest.tag,
+                supported_flags: &manifest.flags,
+                endpoint: Endpoint::Tcp { host: "127.0.0.1".into(), port: 0 },
+                data_dir: &data_dir_str,
+            };
+            match profile::compile(&input, &pallama_core::TuningOverrides::default()) {
+                Ok(p) => {
+                    if global.is_empty() {
+                        global.clone_from(&p.argv);
+                    }
+                    sections.push((m.name.clone(), p.argv));
+                }
+                Err(e) => {
+                    tracing::warn!(model = %m.name, "router preset skips model (profile): {e}");
+                }
+            }
+        }
+        if sections.is_empty() {
+            return Err(SupervisionError::Internal(anyhow!(
+                "router mode: no loadable models (metadata or manifest failures for all pulled models)"
+            )));
+        }
+        let ini = pallama_core::profile::generate_router_preset(&sections, &global);
+        let ini_path = self.dirs.run_dir().join("router-preset.ini");
+        std::fs::write(&ini_path, &ini)
+            .map_err(|e| SupervisionError::Internal(anyhow!("write {}: {e}", ini_path.display())))?;
+        tracing::info!(
+            ini = %ini_path.display(),
+            models = sections.len(),
+            "router preset generated"
+        );
+
+        let synthetic_model = pallama_core::ModelRow {
+            name: ROUTER_KEY.to_string(),
+            repo: String::new(),
+            quant: String::new(),
+            path: ini_path.display().to_string(),
+            bytes: 0,
+            sha256: None,
+            mmproj_path: None,
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+        };
+
+        for _attempt in 0..2 {
+            let endpoint = self.pick_endpoint(ROUTER_KEY);
+            let mut argv: Vec<String> = Vec::new();
+            match &endpoint {
+                Endpoint::Tcp { host, port } => {
+                    argv.extend(["--host".into(), host.clone(), "--port".into(), port.to_string()]);
+                }
+                Endpoint::Unix { socket } => {
+                    argv.extend(["--host".into(), socket.clone()]);
+                }
+            }
+            argv.extend(["--models-preset".into(), ini_path.display().to_string()]);
+            // NOTE: no front-level --slot-save-path — a CLI value cascades
+            // to model children and would OVERRIDE their per-model INI
+            // paths (verified live). Sessions stay per-model via the INI.
+            if self.config.router_max_models > 0 {
+                argv.extend([
+                    "--models-max".into(),
+                    self.config.router_max_models.to_string(),
+                ]);
+            }
+            let mut child = self
+                .engine
+                .spawn(&argv, &endpoint)
+                .await
+                .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
+            if let Ok(Some(status)) = child.try_status() {
+                tracing::warn!(router = ROUTER_KEY, "router died at spawn ({status}); retrying");
+                let _ = child.kill().await;
+                let _ = child.reap().await;
+                continue;
+            }
+            match self.engine.health_check(&endpoint, self.load_timeout).await {
+                Ok(()) => {
+                    let pid = child.id().ok_or_else(|| {
+                        SupervisionError::Internal(anyhow!(
+                            "router child has no pid; refusing to track instance"
+                        ))
+                    })?;
+                    if pid <= 1 {
+                        return Err(SupervisionError::Internal(anyhow!(
+                            "router child pid {pid} is not a safe process-group id"
+                        )));
+                    }
+                    let inst = Arc::new(Instance {
+                        name: ROUTER_KEY.to_string(),
+                        endpoint,
+                        state: std::sync::RwLock::new(InstanceState::Ready),
+                        last_used: std::sync::RwLock::new(Instant::now()),
+                        in_flight: AtomicI64::new(0),
+                        started_at: Instant::now(),
+                        argv,
+                        model: synthetic_model.clone(),
+                        profile_ctx: 0,
+                        child: tokio::sync::Mutex::new(child),
+                        pid,
+                    });
+                    let _ = std::fs::write(
+                        self.dirs.run_dir().join(format!("{ROUTER_KEY}.pid")),
+                        pid.to_string(),
+                    );
+                    self.instances.insert(ROUTER_KEY.to_string(), inst);
+                    self.record_restart(ROUTER_KEY);
+                    self.bus.publish(PallamaEvent::InstanceStateChanged {
+                        name: ROUTER_KEY.to_string(),
+                        state: InstanceState::Ready,
+                    });
+                    let inst = self.instances.get(ROUTER_KEY).expect("just inserted");
+                    return Ok(self.engine_ref(inst.value()));
+                }
+                Err(e) => {
+                    let _ = child.kill().await;
+                    let _ = child.reap().await;
+                    tracing::warn!(router = ROUTER_KEY, "router health check failed: {e:#}");
+                }
+            }
+        }
+        Err(SupervisionError::ModelLoadTimeout(ROUTER_KEY.to_string()))
     }
 
     /// One cohesive spawn path (model load → profile → capacity → spawn →
@@ -266,6 +461,15 @@ impl Supervisor {
         }
 
         let manifest = self.engine.capabilities();
+        // Cache-file dirs (speccache/, sessions/) must exist before the
+        // child opens them; profile emission names these paths. Upstream
+        // validates --slot-save-path IS a directory, so the per-model
+        // subdir must pre-exist.
+        let _ = self.dirs.ensure();
+        let _ = std::fs::create_dir_all(
+            self.dirs.sessions_dir().join(pallama_core::profile::path_safe(name)),
+        );
+        let data_dir_str = self.dirs.data_dir.to_string_lossy().into_owned();
         // Retry once on immediate port-race death (bind fail).
         for _attempt in 0..2 {
             let endpoint = self.pick_endpoint(name);
@@ -282,6 +486,7 @@ impl Supervisor {
                 engine_tag: &manifest.tag,
                 supported_flags: &manifest.flags,
                 endpoint: endpoint.clone(),
+                data_dir: &data_dir_str,
             };
             let tuning = self
                 .pending_ctx

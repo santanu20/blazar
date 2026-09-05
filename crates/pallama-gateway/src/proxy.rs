@@ -18,11 +18,12 @@ use pallama_core::store::Store;
 use pallama_core::ModelRow;
 
 use crate::queue::Priority;
+use crate::sentinel;
 use crate::state::AppState;
 use pallama_runtime::{EngineRef, SupervisionError};
 
 /// Headers never forwarded client->child (hop-by-hop / pallama-internal).
-const STRIP_REQUEST: &[&str] = &["host", "authorization", "connection", "content-length", "transfer-encoding", "x-pallama-priority", "accept-encoding"];
+const STRIP_REQUEST: &[&str] = &["host", "authorization", "connection", "content-length", "transfer-encoding", "x-pallama-priority", "x-pallama-num-ctx", "x-pallama-enforce", "accept-encoding"];
 const STRIP_RESPONSE: &[&str] = &["connection", "content-length", "transfer-encoding", "content-encoding", "keep-alive"];
 
 #[must_use] 
@@ -98,7 +99,7 @@ pub async fn ensure_with_admission(
             });
             state
                 .queue
-                .wait(&row.name, priority, std::time::Duration::from_secs(2 * 60))
+                .wait(&row.name, priority, std::time::Duration::from_mins(2))
                 .await
                 .map_err(|e| openai_error(503, &e))?;
             state
@@ -144,7 +145,7 @@ pub fn openai_error(status: u16, message: &str) -> Response {
 /// Forward one request to the child. Eight distinct request components
 /// (engine, model, method, path, headers, body, load timing) — a struct
 /// here would only shuffle the same data.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // one cohesive forwarding path: headers -> sentinel/enforce -> stream
 pub async fn proxy_request(
     state: &Arc<AppState>,
     engine: &EngineRef,
@@ -154,6 +155,7 @@ pub async fn proxy_request(
     headers: &HeaderMap,
     body: axum::body::Bytes,
     load_ms: u128,
+    trace: Option<String>,
     body_guard: Option<InFlightGuard>,
 ) -> Response {
     let base = child_base(&engine.endpoint);
@@ -168,6 +170,9 @@ pub async fn proxy_request(
             req = req.header(name, value);
         }
     }
+    // Bytes clone = refcount bump: the sentinel request-side parse reads
+    // this snapshot after `body` moved into the upstream stream.
+    let body_snapshot = body.clone();
     let upstream = req
         .body(reqwest::Body::wrap_stream(futures::stream::once(async move {
             Ok::<_, std::io::Error>(body)
@@ -197,9 +202,119 @@ pub async fn proxy_request(
     if load_ms > 100 {
         builder = builder.header("x-pallama-status", "loading");
     }
-    let stream = resp.bytes_stream().map(|r| {
-        r.map_err(|e| std::io::Error::other(e.to_string()))
-    });
+    // Sentinel (semantic reliability layer): warn-only observation of
+    // response semantics. Bytes are cloned onto a bounded side-channel;
+    // parsing and detection run off the hot path, and an overloaded or
+    // failed analyzer only degrades the diagnostic record. `Drop` on the
+    // feed (owned by the stream closure below) signals completion for
+    // clean drain AND client aborts.
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let sse = content_type.contains("text/event-stream");
+    // Enforce (opt-in): non-stream chat requests get judged BEFORE any
+    // byte is released — the client waits for the full JSON anyway, so
+    // buffering is bounded (ENFORCE_BODY_CAP) and costs no extra round
+    // trip. Streaming stays warn-only (bytes already on the wire).
+    if state.config.sentinel
+        && !sse
+        && status.is_success()
+        && is_chat_route(path_query)
+        && sentinel::enforce_enabled(&state.config, headers)
+    {
+        let (ctx, warnings) = sentinel::request_ctx(
+            state,
+            route_name(path_query),
+            model,
+            &body_snapshot,
+            trace,
+            sse,
+        );
+        if !warnings.is_empty() {
+            builder = builder.header("x-pallama-warnings", warnings.join(","));
+        }
+        match resp.bytes().await {
+            Err(e) => return openai_error(502, &format!("engine body: {e}")),
+            Ok(buf) => {
+                if buf.len() > sentinel::ENFORCE_BODY_CAP {
+                    tracing::warn!(
+                        target: "pallama::sentinel",
+                        trace = %ctx.trace,
+                        "enforce skipped: body {} bytes exceeds cap",
+                        buf.len()
+                    );
+                } else {
+                    let hard = state.sentinel.judge(&ctx, &buf, status.as_u16());
+                    if !hard.is_empty() {
+                        let detail = hard
+                            .iter()
+                            .map(|d| format!("[{}] {}", d.code.as_str(), d.detail))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        return openai_error(422, &format!("sentinel enforce: {detail}"));
+                    }
+                }
+                // Pass (or oversize passthrough): re-emit the buffered body
+                // with the original headers; the guard chain keeps
+                // in-flight accounting for the send.
+                let stream = futures::stream::once(async move {
+                    Ok::<_, std::io::Error>(buf)
+                })
+                .chain(futures::stream::unfold(body_guard, |g| async {
+                    drop(g);
+                    None
+                }));
+                return builder
+                    .body(Body::from_stream(stream))
+                    .unwrap_or_else(|e| openai_error(500, &format!("proxy body: {e}")));
+            }
+        }
+    }
+    let (sentinel_feed, sentinel_warnings) = if is_chat_route(path_query) {
+        sentinel::begin_chat_observation(
+            state,
+            route_name(path_query),
+            model,
+            &body_snapshot,
+            trace,
+            status.as_u16(),
+            sse,
+        )
+    } else {
+        (sentinel::SentinelFeed::inert(), Vec::new())
+    };
+    if !sentinel_warnings.is_empty() {
+        builder = builder.header("x-pallama-warnings", sentinel_warnings.join(","));
+    }
+    // Evidence loop: measure TTFT (first body byte) and inter-chunk cadence
+    // for this generation. Observing is infallible (atomics only); the
+    // stream's data/errors pass through untouched. The in-flight guard
+    // chain below still owns the body lifetime.
+    let start = std::time::Instant::now();
+    let mut first_chunk = true;
+    let mut last_chunk = start;
+    let hist_state = std::sync::Arc::clone(state);
+    let stream = resp
+        .bytes_stream()
+        .map(move |r| {
+            if r.is_ok() {
+                let now = std::time::Instant::now();
+                if first_chunk {
+                    hist_state.ttft.observe_secs((now - start).as_secs_f64());
+                    first_chunk = false;
+                } else {
+                    hist_state.tpot.observe_secs((now - last_chunk).as_secs_f64());
+                }
+                last_chunk = now;
+                if let Ok(bytes) = r.as_ref() {
+                    sentinel_feed.bytes(bytes.as_ref());
+                }
+            }
+            r.map_err(|e| std::io::Error::other(e.to_string()))
+        });
     // Hold in-flight accounting for the body's lifetime: the guard drops
     // when the client drains (or aborts) the stream.
     let stream = stream.chain(futures::stream::unfold(body_guard, |g| async {
@@ -209,6 +324,26 @@ pub async fn proxy_request(
     builder
         .body(Body::from_stream(stream))
         .unwrap_or_else(|e| openai_error(500, &format!("proxy body: {e}")))
+}
+
+/// Chat-family routes the sentinel observes (the only ones whose
+/// semantics the current detection set understands).
+fn is_chat_route(path_query: &str) -> bool {
+    let p = path_query.split('?').next().unwrap_or(path_query);
+    p.ends_with("/chat/completions")
+        || p.ends_with("/completions")
+        || p.ends_with("/responses")
+}
+
+fn route_name(path_query: &str) -> &'static str {
+    let p = path_query.split('?').next().unwrap_or(path_query);
+    if p.ends_with("/chat/completions") {
+        "openai-chat"
+    } else if p.ends_with("/responses") {
+        "openai-responses"
+    } else {
+        "openai-completions"
+    }
 }
 
 /// Holds in-flight accounting until dropped. The gateway wraps every
@@ -252,7 +387,7 @@ pub async fn admission_gate(
         }
         state
             .queue
-            .wait(model, priority, std::time::Duration::from_secs(2 * 60))
+            .wait(model, priority, std::time::Duration::from_mins(2))
             .await
             .map_err(|e| openai_error(503, &e))?;
     }

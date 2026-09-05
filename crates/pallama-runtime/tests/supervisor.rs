@@ -151,9 +151,14 @@ async fn integration__ensure_ready__health_and_argv_flags() {
     let argv: Vec<String> =
         serde_json::from_str(&std::fs::read_to_string(dirs.run_dir().join("argv.json")).unwrap())
             .unwrap();
-    for flag in ["--jinja", "--metrics", "--flash-attn", "--cache-reuse", "--sleep-idle-seconds", "--cache-ram", "-np"] {
+    for flag in ["--jinja", "--metrics", "--flash-attn", "--cache-reuse", "--sleep-idle-seconds", "--cache-ram", "-np", "--slot-save-path"] {
         assert!(argv.contains(&flag.to_string()), "missing {flag} in {argv:?}");
     }
+    // sessions dir is per-model under the data dir
+    assert!(argv
+        .windows(2)
+        .any(|w| w[0] == "--slot-save-path" && w[1].ends_with("sessions/m1/")),
+    "slot-save-path per-model dir: {argv:?}");
     assert!(argv.windows(2).any(|w| w[0] == "--alias" && w[1] == "m1"));
     assert!(argv.windows(2).any(|w| w[0] == "--ctx-size" && w[1] == "16384"));
 

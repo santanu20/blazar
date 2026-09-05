@@ -64,6 +64,48 @@ pub fn remove_model(dirs: &PallamaDirs, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Alias a model under a new name (`pallama cp`): zero-byte hardlink of the
+/// GGUF (both files live in the same models dir, so linking always works)
+/// plus a new store row. No blob ceremony, no byte copies.
+pub fn copy_model(dirs: &PallamaDirs, src: &str, dst: &str) -> Result<()> {
+    if instance_running(dirs, src) {
+        return Err(anyhow!("model {src} is currently running; copy after it unloads"));
+    }
+    let store = Store::open(dirs)?;
+    let row = store
+        .get_model(src)?
+        .ok_or_else(|| anyhow!("no such model: {src}"))?;
+    if store.get_model(dst)?.is_some() {
+        return Err(anyhow!("model {dst} already exists"));
+    }
+    let src_path = PathBuf::from(&row.path);
+    let leaf = src_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let dst_path = dirs.models_dir().join(&leaf);
+    if !dst_path.exists() {
+        std::fs::hard_link(&src_path, &dst_path)
+            .map_err(|e| anyhow!("hardlink {} -> {}: {e}", dst_path.display(), src_path.display()))?;
+    }
+    store.upsert_model(&pallama_core::ModelRow {
+        name: dst.to_string(),
+        repo: row.repo.clone(),
+        quant: row.quant.clone(),
+        path: dst_path.display().to_string(),
+        bytes: row.bytes,
+        sha256: row.sha256.clone(),
+        mmproj_path: row.mmproj_path.clone(),
+        shards: row.shards,
+        arch: row.arch.clone(),
+        params: row.params,
+        ctx_train: row.ctx_train,
+        pulled_at: row.pulled_at,
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
@@ -124,5 +166,39 @@ mod tests {
         let (_t, dirs) = setup();
         let err = remove_model(&dirs, "nope").unwrap_err();
         assert!(err.to_string().contains("no such model"), "{err}");
+    }
+
+    #[test]
+    fn unit__copy_model__hardlink_alias_zero_byte_copy() {
+        let (_t, dirs) = setup();
+        let gguf = dirs.models_dir().join("m-q4_k_m.gguf");
+        std::fs::write(&gguf, b"gguf-bytes").unwrap();
+        let s = pallama_core::Store::open(&dirs).unwrap();
+        s.upsert_model(&pallama_core::ModelRow {
+            name: "m".into(),
+            repo: "r".into(),
+            quant: "Q4_K_M".into(),
+            path: gguf.display().to_string(),
+            bytes: 10,
+            sha256: None,
+            mmproj_path: None,
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 1,
+        })
+        .unwrap();
+        copy_model(&dirs, "m", "m-alias").unwrap();
+        let alias = s.get_model("m-alias").unwrap().unwrap();
+        assert_eq!(alias.path, gguf.display().to_string());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let i1 = std::fs::metadata(&gguf).unwrap().ino();
+            let i2 = std::fs::metadata(&alias.path).unwrap().ino();
+            assert_eq!(i1, i2, "alias must be a hardlink, not a copy");
+        }
+        assert!(copy_model(&dirs, "m", "m-alias").is_err(), "duplicate alias refused");
     }
 }

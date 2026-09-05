@@ -1,0 +1,147 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # .cargo/config.toml caps jobs at 2 for the 13 GiB dev box; CI runners have 4 cores.
+  CARGO_BUILD_JOBS: "4"
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc 2.35 floor (ubuntu-22.04). Older glibc / Alpine -> musl assets.
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04, smoke: true }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-22.04, apt: musl-tools, smoke: true }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04, apt: "gcc-aarch64-linux-gnu", smoke: false }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-22.04, cross: true, smoke: false }
+          - { target: x86_64-apple-darwin, os: macos-14, smoke: false }
+          - { target: aarch64-apple-darwin, os: macos-14, smoke: true }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, smoke: true }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install apt packages
+        if: matrix.apt != ''
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ matrix.apt }}
+
+      - name: Install cross
+        if: matrix.cross == true
+        run: cargo install cross --locked
+
+      - name: Add Rust target
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup target add ${{ matrix.target }}
+
+      - name: Configure linkers
+        if: runner.os == 'Linux' && matrix.cross != true
+        shell: bash
+        run: |
+          case "${{ matrix.target }}" in
+            aarch64-unknown-linux-gnu)
+              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+              echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+              echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar" >> "$GITHUB_ENV"
+              ;;
+            x86_64-unknown-linux-musl)
+              echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> "$GITHUB_ENV"
+              ;;
+          esac
+
+      - name: Build
+        shell: bash
+        run: |
+          target="${{ matrix.target }}"
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --locked --target "$target"
+          else
+            cargo build --release --locked --target "$target"
+          fi
+
+      - name: Smoke
+        if: matrix.smoke == true
+        shell: bash
+        run: |
+          exe="target/${{ matrix.target }}/release/pallama"
+          if [ "${{ runner.os }}" = "Windows" ]; then exe="$exe.exe"; fi
+          "$exe" --version
+          "$exe" --help > /dev/null
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          tag="$GITHUB_REF_NAME"
+          target="${{ matrix.target }}"
+          stage="$(mktemp -d)/stage"
+          mkdir -p "$stage"
+          cp "target/$target/release/pallama" "$stage/"
+          cp LICENSE-MIT LICENSE-APACHE "$stage/"
+          # Flat root: pallama + LICENSE-* directly inside the archive.
+          tar -czf "pallama-$tag-$target.tar.gz" -C "$stage" .
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $target = "${{ matrix.target }}"
+          $stage = Join-Path $env:RUNNER_TEMP "pallama-stage"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/$target/release/pallama.exe" $stage
+          Copy-Item LICENSE-MIT, LICENSE-APACHE $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath "pallama-$tag-$target.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pallama-${{ matrix.target }}
+          path: pallama-*.*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<EOF
+          ## Install
+
+          Linux / macOS (WSL included):
+
+              curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/scripts/install.sh | sh
+
+          Windows (PowerShell):
+
+              irm https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/scripts/install.ps1 | iex
+
+          Installers verify each asset's sha256 against the GitHub release metadata
+          before installing (the same mechanism as \`pallama engine update\`).
+
+          ## What's inside
+
+          One static-or-gnu \`pallama\` binary per target plus license texts. The
+          inference engine (\`llama-server\`) is NOT bundled: run
+          \`pallama engine update\` after install to fetch the official upstream
+          build for your GPU.
+          EOF
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            --generate-notes

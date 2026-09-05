@@ -73,20 +73,18 @@ pub struct Tuner<'a> {
     pub bench_bin: PathBuf,
 }
 
-/// Locate a llama-bench: prefer the active engine's directory, else any
-/// installed engine (a `local` engine may not ship a bench binary).
+/// Locate a llama-bench in an installed engine directory (upstream
+/// release tarballs ship llama-bench alongside llama-server; a manually
+/// registered `local` engine may not). No external fallback paths: pallama
+/// is self-contained — if nothing ships a bench binary, the error says so.
 pub fn find_bench_bin(dirs: &PallamaDirs) -> Result<PathBuf> {
     let store = Store::open(dirs)?;
     let engines = store.list_engines()?;
-    let mut candidates: Vec<PathBuf> = engines
+    engines
         .iter()
         .filter(|e| e.active)
         .chain(engines.iter().filter(|e| !e.active))
         .map(|e| dirs.engines_dir().join(&e.tag).join(format!("llama-{}", e.tag)).join("llama-bench"))
-        .collect();
-    candidates.push(PathBuf::from("/usr/local/lib/ollama/llama-bench"));
-    candidates
-        .into_iter()
         .find(|p| p.exists())
         .ok_or_else(|| anyhow!("no llama-bench found in any installed engine; run `pallama engine update`"))
 }
@@ -190,7 +188,7 @@ impl Tuner<'_> {
                     let idx: Vec<usize> = g
                         .iter()
                         .enumerate()
-                        .filter(|(i, _)| i % 2 == 0 && g.get(*i + 1).map_or(false, |v| v == "f16,q8_0"))
+                        .filter(|(i, _)| i % 2 == 0 && g.get(*i + 1).is_some_and(|v| v == "f16,q8_0"))
                         .map(|(i, _)| i)
                         .collect();
                     for i in idx.iter().rev() {
@@ -243,6 +241,7 @@ impl Tuner<'_> {
             kv_quant: Some(win.kv_q8),
             fa: Some(win.fa_on),
             batch: Some(u32::try_from(win.batch).context("batch overflow")?),
+            ubatch: None,
         };
         let profile = profile::compile(input, &winning)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -398,6 +397,7 @@ pub fn build_input<'a>(
     engine_tag: &'a str,
     supported_flags: &'a BTreeSet<String>,
     endpoint: Endpoint,
+    data_dir: &'a str,
 ) -> ProfileInput<'a> {
     ProfileInput {
         model_name,
@@ -412,6 +412,7 @@ pub fn build_input<'a>(
         engine_tag,
         supported_flags,
         endpoint,
+        data_dir,
     }
 }
 

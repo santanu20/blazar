@@ -100,6 +100,30 @@ impl GhClient {
         Ok(releases)
     }
 
+    /// Single release for an arbitrary repo: `releases/latest` or
+    /// `releases/tags/{version}`. Used by `pallama upgrade` (self-update).
+    pub async fn release_by(&self, repo: &str, version: Option<&str>) -> Result<GhRelease> {
+        let path = match version {
+            Some(v) => format!("repos/{repo}/releases/tags/{v}"),
+            None => format!("repos/{repo}/releases/latest"),
+        };
+        let url = self.base.join(&path).unwrap();
+        let resp = self
+            .auth(self.http.get(url))
+            .send()
+            .await
+            .context("GitHub release request failed")?;
+        match resp.status() {
+            reqwest::StatusCode::OK => {}
+            reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                return Err(anyhow!("GitHub API rate limited ({}). Set GH_TOKEN", resp.status()));
+            }
+            other => return Err(anyhow!("GitHub release API {other} for {path}")),
+        }
+        let release: GhRelease = resp.json().await.context("decode release JSON")?;
+        Ok(release)
+    }
+
     /// Newest `bNNNNN` release by build number.
     pub async fn latest_b_release(&self) -> Result<GhRelease> {
         let releases = self.list_releases().await?;
