@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::oneshot;
 

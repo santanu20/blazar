@@ -51,9 +51,8 @@ pub async fn openai_proxy(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let model = match extract_model(&body) {
-        Some(m) => m,
-        None => return openai_error(400, "missing `model` field in request body"),
+    let Some(model) = extract_model(&body) else {
+        return openai_error(400, "missing `model` field in request body");
     };
     let priority = Priority::from_header(
         headers
@@ -72,7 +71,7 @@ pub async fn openai_proxy(
             &state,
             &engine,
             &model_name,
-            method,
+            &method,
             &path_and_query(&uri),
             &headers,
             body,
@@ -112,9 +111,13 @@ pub async fn lora_adapters(
         Ok(ok) => ok,
         Err(resp) => return resp,
     };
-    let url = format!("/lora-adapters{}", path_and_query(&uri).trim_start_matches("/v1/adapters"));
-    with_accounting(&state, &engine.name.clone(), async {
-        proxy_request(&state, &engine, &engine.name, method, &url, &headers, body, load_ms).await
+    let url = format!(
+        "/lora-adapters{}",
+        path_and_query(&uri).trim_start_matches("/v1/adapters")
+    );
+    let name = engine.name.clone();
+    with_accounting(&state, &name, async {
+        proxy_request(&state, &engine, &name, &method, &url, &headers, body, load_ms).await
     })
     .await
 }

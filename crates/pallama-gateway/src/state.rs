@@ -19,6 +19,7 @@ pub struct AppState {
 
 impl AppState {
     #[must_use] 
+    #[allow(clippy::duration_suboptimal_units)] // 10-minute ceiling mirrors long generations
     pub fn new(
         dirs: PallamaDirs,
         config: Config,
@@ -26,7 +27,7 @@ impl AppState {
         bus: EventBus,
     ) -> Self {
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
+            .timeout(std::time::Duration::from_secs(10 * 60))
             .build()
             .expect("gateway http client");
         Self {

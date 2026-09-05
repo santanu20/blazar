@@ -98,6 +98,7 @@ pub struct EngineRef {
 }
 
 impl Supervisor {
+    #[allow(clippy::duration_suboptimal_units)] // plain second counts
     pub fn new(
         dirs: PallamaDirs,
         config: Config,

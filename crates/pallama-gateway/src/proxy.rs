@@ -73,6 +73,7 @@ pub struct ProxyOutcome {
 
 /// Ensure the model is running (priority-aware admission) and hand back
 /// the engine reference. Errors map to typed HTTP statuses.
+#[allow(clippy::duration_suboptimal_units)] // 120s admission bound per plan
 pub async fn ensure_with_admission(
     state: &Arc<AppState>,
     model: &str,
@@ -140,11 +141,15 @@ pub fn openai_error(status: u16, message: &str) -> Response {
 
 /// Forward a request to the child byte-for-byte and stream the response
 /// back. `path_query` includes the leading `/`.
+/// Forward one request to the child. Eight distinct request components
+/// (engine, model, method, path, headers, body, load timing) — a struct
+/// here would only shuffle the same data.
+#[allow(clippy::too_many_arguments)]
 pub async fn proxy_request(
     state: &Arc<AppState>,
     engine: &EngineRef,
     model: &str,
-    method: axum::http::Method,
+    method: &axum::http::Method,
     path_query: &str,
     headers: &HeaderMap,
     body: axum::body::Bytes,
@@ -163,7 +168,9 @@ pub async fn proxy_request(
         }
     }
     let upstream = req
-        .body(reqwest::Body::wrap_stream(futures::stream::once(async move { Ok::<_, std::io::Error>(body) })))
+        .body(reqwest::Body::wrap_stream(futures::stream::once(async move {
+            Ok::<_, std::io::Error>(body)
+        })))
         .send()
         .await;
     let resp = match upstream {

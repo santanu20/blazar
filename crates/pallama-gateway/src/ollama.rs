@@ -192,6 +192,7 @@ fn chrono_like_now() -> i64 {
 
 /// POST /api/pull — NDJSON progress straight from the event bus; a
 /// duplicate pull errors and closes the stream (ollama semantics).
+#[allow(clippy::similar_names)] // pull_request vs target distinguish intent
 pub async fn pull(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let req: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -221,24 +222,24 @@ pub async fn pull(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let stream = futures::StreamExt::map(taken, |(item, _)| item);
 
     // Drive the pull on a task; stream events until ModelPulled/PullFailed.
-    let requested = target.clone();
+    let pull_request = target.clone();
     tokio::spawn(async move {
         let token = std::env::var("HF_TOKEN").ok();
         let client = match pallama_runtime::hf::HfClient::new(token) {
             Ok(c) => c,
             Err(e) => {
                 bus.publish(pallama_runtime::PallamaEvent::PullFailed {
-                    name: requested.clone(),
+                    name: pull_request.clone(),
                     error: format!("{e:#}"),
                 });
                 return;
             }
         };
         let puller = pallama_runtime::Puller { dirs, client, bus: bus.clone() };
-        if let Err(e) = puller.pull(&requested).await {
-            tracing::warn!("pull {requested}: {e:#}");
+        if let Err(e) = puller.pull(&pull_request).await {
+            tracing::warn!("pull {pull_request}: {e:#}");
             bus.publish(pallama_runtime::PallamaEvent::PullFailed {
-                name: requested.clone(),
+                name: pull_request.clone(),
                 error: format!("{e:#}"),
             });
         }
@@ -394,6 +395,7 @@ async fn apply_num_ctx(state: &Arc<AppState>, model: &str, want: i64) -> Result<
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // stream translation is one cohesive path
 async fn proxy_core_chat(
     state: &Arc<AppState>,
     engine: &pallama_runtime::EngineRef,
@@ -559,6 +561,7 @@ pub async fn embeddings(State(state): State<Arc<AppState>>, body: Bytes) -> Resp
 }
 
 /// POST /api/generate — raw prompts only (templated -> 400 + pointer).
+#[allow(clippy::too_many_lines)] // one cohesive translation path
 pub async fn generate(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -568,14 +571,11 @@ pub async fn generate(
         Ok(v) => v,
         Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
     };
-    let openai_req = match tr::generate_to_openai(&req) {
-        Some(v) => v,
-        None => {
-            return api_error(
-                400,
-                "templated /api/generate is not supported; use /api/chat (the model's own template is applied by the engine)",
-            );
-        }
+    let Some(openai_req) = tr::generate_to_openai(&req) else {
+        return api_error(
+            400,
+            "templated /api/generate is not supported; use /api/chat (the model's own template is applied by the engine)",
+        );
     };
     let model = openai_req["model"].as_str().unwrap_or_default().to_string();
     let priority = Priority::from_header(
