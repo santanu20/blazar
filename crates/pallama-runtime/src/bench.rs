@@ -177,7 +177,54 @@ impl Tuner<'_> {
             "2048,1024".into(),
         ];
         grid.extend(default_bench_args());
-        let grid_rows = self.run(Path::new(input.model_path), &grid)?;
+        // Some engine/device combos reject specific configurations (e.g.
+        // q8_0 KV-cache on some Vulkan drivers fails context creation and
+        // llama-bench aborts the WHOLE run). Degrade the grid instead of
+        // dying: drop KV-quant, then fa, then batch axes until it runs.
+        let mut grid_rows = None;
+        for reduction in 0..=3 {
+            let mut g = grid.clone();
+            match reduction {
+                1 => {
+                    // KV-quant axis off
+                    let idx: Vec<usize> = g
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| i % 2 == 0 && g.get(*i + 1).map_or(false, |v| v == "f16,q8_0"))
+                        .map(|(i, _)| i)
+                        .collect();
+                    for i in idx.iter().rev() {
+                        g[*i + 1] = "f16".into();
+                    }
+                    tracing::warn!("tune: retrying grid without KV-quant axis");
+                }
+                2 => {
+                    let pos = g.iter().position(|v| v == "on,off");
+                    if let Some(p) = pos {
+                        g[p] = "on".into();
+                    }
+                    tracing::warn!("tune: retrying grid with fa=on only");
+                }
+                3 => {
+                    let pos = g.iter().position(|v| v == "2048,1024");
+                    if let Some(p) = pos {
+                        g[p] = "2048".into();
+                    }
+                    tracing::warn!("tune: retrying grid with default batch only");
+                }
+                _ => {}
+            }
+            match self.run(Path::new(input.model_path), &g) {
+                Ok(rows) => {
+                    grid_rows = Some(rows);
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!("tune: grid run failed: {e:#}");
+                }
+            }
+        }
+        let grid_rows = grid_rows.ok_or_else(|| anyhow!("llama-bench rejected every grid reduction"))?;
 
         // Argmax by mean tg t/s across (threads, quant, fa, batch) combos.
         let mut best: Option<(f64, Combo)> = None;
