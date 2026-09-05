@@ -7,6 +7,8 @@ pub mod config;
 pub mod dirs;
 pub mod error;
 pub mod gguf;
+pub mod hardware;
+pub mod profile;
 pub mod store;
 pub mod telemetry;
 
@@ -15,4 +17,6 @@ pub use config::{Config, ModelOverride};
 pub use dirs::PallamaDirs;
 pub use error::{CoreError, CoreResult};
 pub use gguf::{read_metadata_file, GgufMeta, GgufValue};
+pub use hardware::{GpuInfo, Hardware};
+pub use profile::{compile as compile_profile, Endpoint, Profile, ProfileInput, TuningOverrides};
 pub use store::{EngineRow, LoraRow, ModelRow, ProfileRow, Store};
