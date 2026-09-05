@@ -69,6 +69,12 @@ enum Cmd {
         model: String,
         #[arg(long)]
         search: bool,
+        /// Fix the context size in the adopted profile
+        #[arg(long)]
+        ctx: Option<u32>,
+        /// Set the model's spec mode persistently ("off" | "auto")
+        #[arg(long)]
+        spec: Option<String>,
     },
     /// Engine (llama-server) management
     Engine {
@@ -212,7 +218,7 @@ async fn run(cmd: Cmd) -> Result<()> {
         Cmd::Ps { reset } => ps(reset).await,
         Cmd::Run { model } => run_repl(&model).await,
         Cmd::Bench { model } => bench(&model),
-        Cmd::Tune { model, search } => tune(&model, search),
+        Cmd::Tune { model, search, ctx, spec } => tune(&model, search, ctx, spec),
         Cmd::Engine { cmd } => engine_cmd(cmd).await,
         Cmd::Lora { cmd } => lora_cmd(cmd),
         Cmd::Search { query } => search(&query).await,
@@ -228,7 +234,18 @@ async fn serve() -> Result<()> {
     let cfg = config()?;
     let _lock = pallama_runtime::DaemonLock::acquire(&d)
         .map_err(|e| anyhow!("{e}"))?;
+    rotate_daemon_log(&d);
     let store = Store::open(&d)?;
+    // PALLAMA_ENGINE_PATH: register/refresh the local build and prefer it
+    // for this run (plan C: pseudo-tag "local", never pruned).
+    let local_override = std::env::var("PALLAMA_ENGINE_PATH").ok();
+    if let Some(path) = &local_override {
+        let p = std::path::PathBuf::from(path);
+        let mgr = local_engine_manager(&d)?;
+        let row = mgr.register_local(&p, &cfg.engine_env)?;
+        mgr.use_tag(&row.tag)?;
+        println!("PALLAMA_ENGINE_PATH: engine local active ({})", p.display());
+    }
     let engine_row = store.active_engine()?
         .ok_or_else(|| anyhow!("no engine installed; run: pallama engine update"))?;
     let manifest: pallama_runtime::Manifest =
@@ -643,7 +660,7 @@ fn bench(model: &str) -> Result<()> {
     Ok(())
 }
 
-fn tune(model: &str, search: bool) -> Result<()> {
+fn tune(model: &str, search: bool, ctx: Option<u32>, spec: Option<String>) -> Result<()> {
     let d = dirs();
     let store = Store::open(&d)?;
     let row = store.get_model(model)?
@@ -677,20 +694,82 @@ fn tune(model: &str, search: bool) -> Result<()> {
     );
     let store2 = Store::open(&d)?;
     let tuner = pallama_runtime::Tuner { dirs: &d, bench_bin };
-    if search {
-        let (profile, _winning, rows) = tuner.tune_search(&store2, &input)?;
-        println!("tuned {} — {} configs measured, winner:", model, rows.len());
-        println!("  argv: {}", profile.argv.join(" "));
-        println!("  ctx:   {}", profile.ctx);
-        if !profile.warnings.is_empty() {
-            for w in &profile.warnings {
-                println!("  note:  {w}");
-            }
+    if let Some(mode) = spec {
+        if mode != "off" && mode != "auto" {
+            return Err(anyhow!("--spec must be \"off\" or \"auto\""));
         }
+        set_model_override(model, "spec", &format!("\"{mode}\""))?;
+        println!("model_overrides.{model}.spec = {mode}");
+    }
+    if search {
+        let (profile, mut winning, rows) = tuner.tune_search(&store2, &input)?;
+        if let Some(n) = ctx {
+            winning.ctx = Some(n);
+            let fixed = tuner.adopt(&store2, &input, &winning)?;
+            println!("tuned {model} — {} configs measured; ctx pinned to {n}:", rows.len());
+            println!("  argv: {}", fixed.argv.join(" "));
+        } else {
+            println!("tuned {} — {} configs measured, winner:", model, rows.len());
+            println!("  argv: {}", profile.argv.join(" "));
+            println!("  ctx:   {}", profile.ctx);
+        }
+    } else if let Some(n) = ctx {
+        let winning = pallama_core::TuningOverrides { ctx: Some(n), ..Default::default() };
+        let fixed = tuner.adopt(&store2, &input, &winning)?;
+        println!("profile adopted at ctx {n}: {}", fixed.argv.join(" "));
     } else {
         let rows = tuner.bench_default(std::path::Path::new(&row.path))?;
-        println!("{:.0} rows; run with --search to adopt the argmax profile", rows.len());
+        println!("{} rows measured; use --search (argmax) and/or --ctx/--spec to adopt", rows.len());
     }
+    Ok(())
+}
+
+/// Persist a per-model overlay key (validated immediately).
+fn set_model_override(model: &str, key: &str, value: &str) -> Result<()> {
+    let d = dirs();
+    let path = d.config_file();
+    let raw = std::fs::read_to_string(&path).unwrap_or_default();
+    let header = format!("[model_overrides.\"{model}\"]");
+    let mut out: Vec<String> = Vec::new();
+    let mut in_section = false;
+    let mut replaced = false;
+    for line in raw.lines() {
+        if line.trim() == header {
+            in_section = true;
+        } else if line.starts_with('[') && in_section {
+            in_section = false; // next section started
+        }
+        if in_section && line.starts_with(&format!("{key} =")) {
+            out.push(format!("{key} = {value}"));
+            replaced = true;
+            continue;
+        }
+        out.push(line.to_string());
+        if line.trim() == header && !replaced && key == "spec" {
+            // insert right below header
+        }
+    }
+    // Append key inside the section if never replaced
+    if !replaced {
+        if let Some(pos) = out.iter().position(|l| l.trim() == header) {
+            // find end of section
+            let mut end = out.len();
+            for (i, l) in out.iter().enumerate().skip(pos + 1) {
+                if l.starts_with('[') {
+                    end = i;
+                    break;
+                }
+            }
+            out.insert(end, format!("{key} = {value}"));
+        } else {
+            out.push(String::new());
+            out.push(header);
+            out.push(format!("{key} = {value}"));
+        }
+    }
+    let candidate = out.join("\n") + "\n";
+    Config::from_toml(&candidate).map_err(|e| anyhow!("rejected, file unchanged: {e}"))?;
+    std::fs::write(&path, &candidate)?;
     Ok(())
 }
 
@@ -774,6 +853,19 @@ async fn upstream_update_hint(dirs: &PallamaDirs) {
                 "update available: {} (active: {}) — run: pallama engine update",
                 rel.tag_name, active.tag
             );
+        }
+    }
+}
+
+/// Rotate daemon.log when it exceeds ~10 MiB (best-effort, at start).
+fn rotate_daemon_log(d: &PallamaDirs) {
+    const MAX: u64 = 10 * 1024 * 1024;
+    let log = d.run_dir().join("daemon.log");
+    if let Ok(meta) = std::fs::metadata(&log) {
+        if meta.len() > MAX {
+            let old = d.run_dir().join("daemon.log.1");
+            let _ = std::fs::remove_file(&old);
+            let _ = std::fs::rename(&log, &old);
         }
     }
 }

@@ -226,6 +226,39 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// Slots-aware admission: when the instance already has `slots` requests
+/// in flight (1 by default), WAIT at the caller's priority instead of
+/// colliding with the engine's single slot (instant rejects). Bounded by
+/// the queue timeout -> 503.
+pub async fn admission_gate(
+    state: &Arc<AppState>,
+    model: &str,
+    priority: Priority,
+) -> Result<InFlightGuard, Response> {
+    let max_inflight: i64 = if state.config.slots == 0 {
+        4 // auto multi-slot: allow modest concurrency
+    } else {
+        i64::from(state.config.slots)
+    };
+    loop {
+        let busy = state
+            .sup
+            .ps()
+            .into_iter()
+            .find(|p| p.name == model)
+            .map_or(0, |p| p.in_flight);
+        if busy < max_inflight {
+            return Ok(begin_accounting(state, model));
+        }
+        state
+            .queue
+            .wait(model, priority, std::time::Duration::from_secs(2 * 60))
+            .await
+            .map_err(|e| openai_error(503, &e))?;
+    }
+}
+
+
 /// Begin accounting and return the guard; the response path holds it for
 /// the body's lifetime.
 #[must_use]

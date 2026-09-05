@@ -45,6 +45,53 @@ async fn auth(State(state): State<Arc<AppState>>, req: Request<Body>, next: Next
     next.run(req).await
 }
 
+/// Per-request structured log + trace id (debuggability complaint):
+/// method, path, status, duration, priority, trace id — echoed back as
+/// `x-pallama-trace-id` so clients can correlate.
+async fn request_log(
+    State(state): State<Arc<AppState>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    let trace = format!(
+        "plm-{:x}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let priority = req
+        .headers()
+        .get("x-pallama-priority")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("normal")
+        .to_string();
+    let started = std::time::Instant::now();
+    let mut resp = next.run(req).await;
+    let ms = started.elapsed().as_millis();
+    let status = resp.status().as_u16();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&trace) {
+        resp.headers_mut().insert("x-pallama-trace-id", v);
+    }
+    tracing::info!(
+        target: "pallama::access",
+        trace = %trace,
+        method = %method,
+        path = %path,
+        status,
+        ms,
+        priority = %priority,
+        queue_depth = state.queue.depth(),
+        "request"
+    );
+    resp
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     let openai_any = Router::new()
         .route(
@@ -75,6 +122,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/adapters", get(openai::lora_adapters).post(openai::lora_adapters))
         .merge(openai_any)
         .merge(api)
+        .layer(middleware::from_fn_with_state(state.clone(), request_log))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state)
 }

@@ -133,6 +133,19 @@ impl Tuner<'_> {
         self.run(model, &default_bench_args())
     }
 
+    /// Compile + persist a profile with explicit overrides (tune --ctx).
+    pub fn adopt(
+        &self,
+        store: &Store,
+        input: &ProfileInput<'_>,
+        overrides: &TuningOverrides,
+    ) -> Result<pallama_core::Profile> {
+        let profile = profile::compile(input, overrides)
+            .map_err(|e| anyhow::anyhow!("profile: {e}"))?;
+        persist_profile(store, input, overrides, &profile, &[], 0.0)?;
+        Ok(profile)
+    }
+
     /// Grid axis names (`ctx`/`nthreads`/`threads`) mirror each other on
     /// purpose: one is the loop variable, the other the winning knob.
     #[allow(clippy::similar_names)]

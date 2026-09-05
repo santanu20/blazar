@@ -411,7 +411,10 @@ async fn proxy_core_chat(
         // We translate the non-stream response into ollama shape.
         let resp = match req.body(openai_body.clone()).send().await {
             Ok(r) => r,
-            Err(e) => return api_error(502, &format!("engine request failed: {e:#}")),
+            Err(e) => {
+                tracing::warn!(model, "nonstream upstream failed: {e:#}");
+                return api_error(502, &format!("engine request failed: {e:#}"));
+            }
         };
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -628,6 +631,10 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     merged.push_str(&format!(
         "# HELP pallama_queue_depth Waiting requests\n# TYPE pallama_queue_depth gauge\npallama_queue_depth {}\n",
         state.queue.depth()
+    ));
+    merged.push_str(&format!(
+        "# HELP pallama_evictions_total Total instance evictions\n# TYPE pallama_evictions_total counter\npallama_evictions_total {}\n",
+        state.sup.evictions.load(std::sync::atomic::Ordering::Relaxed)
     ));
     if let Ok(store) = Store::open(&state.dirs) {
         if let Ok(Some(engine)) = store.active_engine() {

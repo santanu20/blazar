@@ -69,6 +69,8 @@ pub struct PsRow {
 
 pub struct Supervisor {
     pub dirs: PallamaDirs,
+    /// Total evictions (ladder + capacity) for the metrics gauge.
+    pub evictions: std::sync::atomic::AtomicU64,
     pub config: Config,
     pub bus: EventBus,
     pub hardware: Hardware,
@@ -107,6 +109,7 @@ impl Supervisor {
         engine: Arc<dyn Engine>,
     ) -> Self {
         Self {
+            evictions: std::sync::atomic::AtomicU64::new(0),
             load_timeout: Duration::from_secs(3 * 60),
             shutdown_grace: Duration::from_secs(10),
             reaper_interval: Duration::from_secs(10),
@@ -385,6 +388,7 @@ impl Supervisor {
             return Ok(());
         };
         *inst.state.write().expect("state lock") = InstanceState::Evicted;
+        self.evictions.fetch_add(1, Ordering::Relaxed);
         self.bus.publish(PallamaEvent::InstanceStateChanged {
             name: name.to_string(),
             state: InstanceState::Evicted,
