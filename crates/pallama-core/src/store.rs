@@ -10,7 +10,7 @@ use crate::error::{CoreError, CoreResult};
 /// - engines:  installed llama-server builds + capability manifest JSON
 /// - models:   pulled GGUFs (plain files, no blob store)
 /// - profiles: per-(model, engine) launch argv + benchmark results
-/// - loras:    LoRA adapters per model
+/// - loras:    `LoRA` adapters per model
 #[derive(Debug)]
 pub struct Store {
     conn: Connection,
@@ -229,7 +229,7 @@ impl Store {
         )?;
         let mut rows = stmt.query(params![name])?;
         if let Some(r) = rows.next()? {
-            return Ok(Some(model_from_row(&r)?));
+            return Ok(Some(model_from_row(r)?));
         }
         Ok(None)
     }
@@ -240,7 +240,7 @@ impl Store {
                     ctx_train, pulled_at
              FROM models ORDER BY name",
         )?;
-        let rows = stmt.query_map([], |r| model_from_row(r))?;
+        let rows = stmt.query_map([], model_from_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 

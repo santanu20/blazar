@@ -8,7 +8,7 @@ use crate::error::{CoreError, CoreResult};
 
 /// Tunables exposed in config.toml. One file, one surface: every Pallama
 /// knob lives here or in a per-model overlay; the documented `PALLAMA_*`
-/// env vars override file values. Secrets (HF_TOKEN / GH_TOKEN) are env-only
+/// env vars override file values. Secrets (`HF_TOKEN` / `GH_TOKEN`) are env-only
 /// and never persisted.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -109,18 +109,21 @@ impl Config {
     }
 
     /// Overlay for a model: exact name match only. Overlays are validated at
-    /// parse time (deny_unknown_fields), so no re-validation here.
+    /// parse time (`deny_unknown_fields`), so no re-validation here.
+    #[must_use] 
     pub fn overlay_for(&self, model: &str) -> ModelOverride {
         self.model_overrides.get(model).cloned().unwrap_or_default()
     }
 
     /// Effective ctx for a model: overlay wins over global default.
+    #[must_use] 
     pub fn effective_ctx(&self, model: &str) -> u32 {
         let o = self.overlay_for(model);
         o.ctx.unwrap_or(self.default_ctx)
     }
 
     /// Effective spec mode for a model: overlay wins over global default.
+    #[must_use] 
     pub fn effective_spec(&self, model: &str) -> &str {
         match self
             .model_overrides
@@ -304,17 +307,21 @@ mod tests {
 
     #[test]
     fn unit__validation__eviction_before_sleep_rejected() {
-        let mut cfg = Config::default();
-        cfg.idle_sleep_secs = 600;
-        cfg.idle_timeout_secs = 300;
+        let cfg = Config {
+            idle_sleep_secs: 600,
+            idle_timeout_secs: 300,
+            ..Config::default()
+        };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("idle_timeout_secs"));
     }
 
     #[test]
     fn unit__validation__bad_spec_mode_rejected() {
-        let mut cfg = Config::default();
-        cfg.spec = "maybe".into();
+        let cfg = Config {
+            spec: "maybe".into(),
+            ..Config::default()
+        };
         assert!(cfg.validate().is_err());
     }
 
@@ -332,8 +339,10 @@ mod tests {
     fn unit__env_override__file_plus_env() {
         // Scoped env mutation: serial test, restored unconditionally.
         let _g = env_lock();
-        let mut cfg = Config::default();
-        cfg.port = 1;
+        let cfg = Config {
+            port: 1,
+            ..Config::default()
+        };
         std::env::set_var("PALLAMA_PORT", "12345");
         std::env::set_var("PALLAMA_DEFAULT_CTX", "4096");
         let merged = cfg.with_env_overrides().unwrap();
@@ -393,6 +402,6 @@ mod tests {
     /// test threads never race on the same variable.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+        ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }

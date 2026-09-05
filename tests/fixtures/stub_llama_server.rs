@@ -3,17 +3,17 @@
 //! Mirrors the observable surface Pallama depends on (verified against
 //! upstream master `references/llama.cpp-master`):
 //!   - `--list-devices` prints PLAIN TEXT (not JSON):
-//!       "Available devices:\n  NAME: DESC (TOTAL MiB, FREE MiB free)\n"
+//!     "Available devices:\n  NAME: DESC (TOTAL MiB, FREE MiB free)\n"
 //!   - `--version` prints "version: NNNN (commit)" style lines
 //!   - `/health` returns {"status":"ok"}
 //!   - `/v1/models`, `/v1/chat/completions` (stream + non-stream), `/metrics`,
 //!     `/slots` (slot activity for cancellation tests)
 //!
 //! Env knobs (so one binary covers many test shapes):
-//!   STUB_ARGV_FILE   write the full argv as a JSON array before anything else
-//!   STUB_DEVICES     device lines to print for --list-devices (default: 1 GPU)
-//!   STUB_BUILD       build number for --version (default 9999)
-//!   STUB_DELAY_MS    extra latency before answering each request (default 0)
+//!   `STUB_ARGV_FILE`   write the full argv as a JSON array before anything else
+//!   `STUB_DEVICES`     device lines to print for --list-devices (default: 1 GPU)
+//!   `STUB_BUILD`       build number for --version (default 9999)
+//!   `STUB_DELAY_MS`    extra latency before answering each request (default 0)
 
 use axum::extract::State;
 use axum::response::IntoResponse;
@@ -143,7 +143,11 @@ fn reply_text(state: &AppState, messages: &[ChatMessage]) -> String {
 }
 
 fn count_tokens(s: &str) -> i64 {
-    s.split_whitespace().count().max(1) as i64
+    // Token counts are tiny; wrap is unreachable in practice.
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        s.split_whitespace().count().max(1) as i64
+    }
 }
 
 async fn chat_completions(
@@ -185,10 +189,13 @@ async fn chat_completions(
         .stream_options
         .as_ref()
         .and_then(|o| o.get("include_usage"))
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let model_stream = model.clone();
-    let stream = async_stream_sse(text, model_stream, include_usage, prompt_tokens);
+    let stream = futures::stream::iter(
+        sse_events(&text, &model, include_usage, prompt_tokens)
+            .into_iter()
+            .map(Ok::<bytes::Bytes, std::io::Error>),
+    );
     axum::response::Response::builder()
         .status(200)
         .header("content-type", "text/event-stream")
@@ -197,17 +204,11 @@ async fn chat_completions(
         .unwrap()
 }
 
-fn async_stream_sse(
-    text: String,
-    model: String,
-    include_usage: bool,
-    prompt_tokens: i64,
-) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
-    use futures::stream::iter;
-    let (first, second) = split_in_half(&text);
-    let completion_tokens = count_tokens(&text);
+fn sse_events(text: &str, model: &str, include_usage: bool, prompt_tokens: i64) -> Vec<bytes::Bytes> {
+    let (first, second) = split_in_half(text);
+    let completion_tokens = count_tokens(text);
     let mut events: Vec<String> = Vec::new();
-    let mut chunk = |delta: serde_json::Value| {
+    let chunk = |delta: serde_json::Value| {
         let payload = serde_json::json!({
             "id": format!("chatcmpl-stub-{}", std::process::id()),
             "object": "chat.completion.chunk",
@@ -248,7 +249,7 @@ fn async_stream_sse(
         ));
     }
     events.push("data: [DONE]\n\n".to_string());
-    iter(events.into_iter().map(|e| Ok(bytes::Bytes::from(e))))
+    events.into_iter().map(bytes::Bytes::from).collect()
 }
 
 fn split_in_half(s: &str) -> (String, String) {

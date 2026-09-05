@@ -36,6 +36,7 @@ pub struct Catalog {
 }
 
 pub const CATALOG_JSON: &str = include_str!("catalog.json");
+#[must_use] 
 pub fn catalog() -> &'static Catalog {
     static CAT: LazyLock<Catalog> = LazyLock::new(|| {
         serde_json::from_str(CATALOG_JSON)
@@ -79,6 +80,7 @@ pub fn resolve(name: &str) -> CoreResult<&'static CatalogEntry> {
     }
 }
 /// Spec-draft pair for a resolved model name, if the catalog has one.
+#[must_use] 
 pub fn spec_pair_for(model: &str) -> Option<&'static SpecPair> {
     catalog()
         .spec_pairs
@@ -87,6 +89,7 @@ pub fn spec_pair_for(model: &str) -> Option<&'static SpecPair> {
 }
 
 /// Classic DP edit distance; catalog sizes are tiny, O(nm) is fine.
+#[must_use] 
 pub fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
@@ -123,7 +126,7 @@ mod tests {
     fn unit__catalog_repos__well_formed() {
         for e in &catalog().entries {
             assert!(
-                e.repo.contains('/') && !e.repo.ends_with("/"),
+                e.repo.contains('/') && !e.repo.ends_with('/'),
                 "repo must be owner/name: {}",
                 e.repo
             );
