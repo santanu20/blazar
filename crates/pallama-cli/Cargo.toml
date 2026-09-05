@@ -1,0 +1,36 @@
+[package]
+name = "pallama-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "pallama binary: llama.cpp orchestration platform CLI and daemon"
+
+[[bin]]
+name = "pallama"
+path = "src/main.rs"
+
+[features]
+default = []
+test-util = []
+
+[dependencies]
+pallama-core = { workspace = true }
+pallama-runtime = { workspace = true }
+pallama-gateway = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+dirs = { workspace = true }
+rustyline = { workspace = true }
+indicatif = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = "2"
+tempfile = "3"
+
+[lints]
+workspace = true
