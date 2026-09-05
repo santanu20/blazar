@@ -13,9 +13,13 @@ Prebuilt binaries for Linux (x86_64/aarch64, glibc ≥ 2.35 or static musl), mac
 **Linux / macOS (WSL included):**
 
 ```sh
-# from a source checkout (zero arguments: the script auto-detects the local
-# build and installs it system-wide with a systemd service):
+# from a source checkout (zero arguments: the script ALWAYS builds the
+# checkout fresh with cargo, then installs system-wide with a systemd
+# service - nothing is downloaded):
 sh scripts/install.sh
+
+# force the source path as a user-local install (no release contact):
+sh scripts/install.sh --build
 
 # from a published repo (set PALLAMA_REPO to the owner/name that hosts releases):
 export PALLAMA_REPO=owner/pallama
@@ -25,7 +29,7 @@ curl --proto '=https' --tlsv1.2 -fsSL \
 
 `--system` installs system-wide like ollama: binary in `/usr/local/bin` plus a `systemctl` unit (`Restart=always`, GPU groups, auto-start). Omit it for the sudo-free `~/.local/bin` install.
 
-Installs to `~/.local/bin/pallama` (add it to PATH if needed). Older glibc than 2.35, or Alpine? The script automatically falls back to the static musl build. Pin a version with `PALLAMA_VERSION=v0.1.0`, or point at a fork/mirror with `PALLAMA_REPO=owner/pallama`. If no release asset can be fetched (offline, rate-limited, exotic target) the installer falls back to building the local checkout with `cargo` when a toolchain exists — point it at one with `PALLAMA_CHECKOUT=<repo>`. Add `--with-systemd-unit` (download the script and run `sh install.sh --with-systemd-unit`) to install a `systemctl --user` service instead of the default on-demand auto-start.
+Installs to `~/.local/bin/pallama` (add it to PATH if needed). Older glibc than 2.35, or Alpine? The script automatically falls back to the static musl build. Pin a version with `PALLAMA_VERSION=v0.1.0`, or point at a fork/mirror with `PALLAMA_REPO=owner/pallama`. Default behavior is BUILD-FIRST: from a checkout the installer compiles with `cargo` and installs that (zero downloads); a checkout-less `curl | sh` run uses the verified release channel instead. Set `PALLAMA_CHECKOUT=<repo>` to make a remote run build. Add `--with-systemd-unit` (download the script and run `sh install.sh --with-systemd-unit`) to install a `systemctl --user` service instead of the default on-demand auto-start.
 
 **Windows (PowerShell):**
 

@@ -83,31 +83,6 @@ done
 SUDO="${PALLAMA_SUDO-sudo}"
 [ "$(id -u)" -eq 0 ] && SUDO=
 
-# Zero-argument auto mode: no repo configured but a local build exists
-# next to this script -> bootstrap it system-wide (binary + systemd unit),
-# everything handled here. Explicit flags always win.
-if [ -z "$FROM_BIN" ] && [ "$SYSTEM" = 0 ] &&
-   [ -z "${PALLAMA_REPO:-}" ] && [ -z "${PALLAMA_INSTALL_BASE_URL:-}" ]; then
-    SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-    if [ -x "$(dirname "$SCRIPT_DIR")/target/release/pallama" ]; then
-        FROM_BIN="$(dirname "$SCRIPT_DIR")/target/release/pallama"
-        SYSTEM=1
-        status "auto: local build found, installing system-wide (binary + systemd service)"
-    fi
-fi
-
-if [ -n "$FROM_BIN" ]; then
-    # Bootstrap mode: install a locally built binary (no release needed).
-    [ -f "$FROM_BIN" ] || error "--from: no such file: $FROM_BIN"
-    [ -x "$FROM_BIN" ] || error "--from: not executable: $FROM_BIN"
-    "$FROM_BIN" --version >/dev/null 2>&1 || error "--from: binary does not run: $FROM_BIN"
-    status "Bootstrap install from $FROM_BIN (skipping release download)"
-fi
-
-# ---- source-build fallback --------------------------------------------
-# Used when no prebuilt asset can be fetched (offline, rate-limited, exotic
-# target): build the checkout with cargo and install that. Requires a
-# toolchain — the installer never hides a build behind a download.
 
 install_local() {
     # install_local <binary> <channel-label>
@@ -133,25 +108,49 @@ find_checkout() {
 }
 
 build_from_checkout() {
-    REASON="$1"
-    status "fallback: building from source (${REASON})"
-    command -v cargo >/dev/null 2>&1 ||
-        error "${REASON}, and no cargo toolchain found. Install Rust (https://rustup.rs), or download a release asset manually."
-    CK=$(find_checkout) ||
-        error "${REASON}, and no pallama source checkout found near this script (set PALLAMA_CHECKOUT=<repo> to point at one)."
-    status "cargo build --release -p pallama-cli (in ${CK})"
+    # Prints the built binary path on success; returns non-zero when a
+    # source build is impossible (caller decides: fatal vs fallback).
+    command -v cargo >/dev/null 2>&1 || return 1
+    CK=$(find_checkout) || return 1
+    status "building from source: cargo build --release -p pallama-cli (in ${CK})"
     (cd "$CK" && cargo build --release -p pallama-cli) ||
         error "source build failed (cargo output above)"
     [ -f "$CK/target/release/pallama" ] || error "build produced no target/release/pallama"
-    install_local "$CK/target/release/pallama" "source build in ${CK}"
-    status "All inference is upstream llama.cpp — ggml, ggerganov and contributors did the hard parts."
-    exit 0
+    echo "$CK/target/release/pallama"
 }
 
-# --build: force the source path — audited/offline installs that never
-# touch the release channel. Falls through to the same install tail.
-if [ "$FORCE_BUILD" = 1 ]; then
-    build_from_checkout "--build requested"
+# Zero-argument auto mode (user directive: the installer ALWAYS builds):
+# no explicit channel + a checkout present -> compile FRESH (never a
+# stale target/release), then install system-wide (binary + systemd unit).
+# Checkout-less runs (curl | sh) fall through to the release channel.
+if [ -z "$FROM_BIN" ] && [ "$SYSTEM" = 0 ] && [ "$FORCE_BUILD" = 0 ] &&
+   [ -z "${PALLAMA_REPO:-}" ] && [ -z "${PALLAMA_INSTALL_BASE_URL:-}" ]; then
+    if command -v cargo >/dev/null 2>&1 && find_checkout >/dev/null 2>&1; then
+        status "auto: checkout found - building fresh before install"
+        if FROM_BIN=$(build_from_checkout); then
+            SYSTEM=1
+            status "auto: installing the fresh build system-wide (binary + systemd service)"
+        fi
+    fi
+fi
+
+if [ -n "$FROM_BIN" ]; then
+    # Bootstrap mode: install a locally built binary (no release needed).
+    [ -f "$FROM_BIN" ] || error "--from: no such file: $FROM_BIN"
+    [ -x "$FROM_BIN" ] || error "--from: not executable: $FROM_BIN"
+    "$FROM_BIN" --version >/dev/null 2>&1 || error "--from: binary does not run: $FROM_BIN"
+    status "Bootstrap install from $FROM_BIN (skipping release download)"
+fi
+
+
+# --build: force the source path (audited/offline installs; never touches
+# the release channel). Default (no flags): the auto block above already
+# built when possible; a checkout-less run falls through to the release
+# channel below.
+if [ "$FORCE_BUILD" = 1 ] && [ -z "${FROM_BIN:-}" ]; then
+    FROM_BIN=$(build_from_checkout) ||
+        error "--build: need cargo + a pallama checkout (set PALLAMA_CHECKOUT=<repo>; Rust from https://rustup.rs)"
+    status "--build: source path forced (no release channel contact)"
 fi
 
 # Repo guard is release-channel only: --from bootstrap and mirror/test
@@ -230,7 +229,7 @@ RELEASE_PATH="releases/latest"
 [ -n "${PALLAMA_VERSION:-}" ] && RELEASE_PATH="releases/tags/${PALLAMA_VERSION}"
 status "Fetching release metadata from ${API_BASE}/${RELEASE_PATH}"
 JSON=$(fetch "${API_BASE}/${RELEASE_PATH}") ||
-    build_from_checkout "could not fetch release metadata from ${API_BASE} (offline or rate limited)"
+    error "could not fetch release metadata from ${API_BASE} (offline or rate limited?) and no local checkout to build — export GITHUB_TOKEN, retry later, or clone the repo and re-run its scripts/install.sh to build from source"
 
 TAG=$(printf '%s' "$JSON" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
 [ -n "$TAG" ] || error "could not parse tag_name from release metadata"
@@ -258,7 +257,7 @@ asset_names() {
 
 URL=$(asset_field browser_download_url)
 [ -n "$URL" ] ||
-    build_from_checkout "no prebuilt asset ${ASSET} in release ${TAG} (available: $(asset_names | tr '\n' ' '))"
+    error "asset ${ASSET} not found in release ${TAG}. Available: $(asset_names | tr '\n' ' ') — or build from a checkout: sh scripts/install.sh --build"
 
 DIGEST=$(asset_field digest)
 case "${DIGEST:-}" in
