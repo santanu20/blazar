@@ -476,6 +476,9 @@ fn show(model: &str) -> Result<()> {
 }
 
 async fn ps(reset: bool) -> Result<()> {
+    if !reset {
+        upstream_update_hint(&dirs()).await;
+    }
     if reset {
         let base = ensure_daemon().await?;
         let _: serde_json::Value = reqwest::Client::new()
@@ -622,13 +625,7 @@ fn bench(model: &str) -> Result<()> {
     let store = Store::open(&d)?;
     let row = store.get_model(model)?
         .ok_or_else(|| anyhow!("no such model: {model}"))?;
-    let engine_row = store.active_engine()?
-        .ok_or_else(|| anyhow!("no engine installed; run: pallama engine update"))?;
-    let manifest: pallama_runtime::Manifest = serde_json::from_str(&engine_row.manifest)?;
-    let bench_bin = std::path::Path::new(&manifest.server_path)
-        .parent()
-        .map(|p| p.join("llama-bench"))
-        .ok_or_else(|| anyhow!("engine dir missing"))?;
+    let bench_bin = pallama_runtime::bench::find_bench_bin(&d)?;
     let tuner = pallama_runtime::Tuner { dirs: &d, bench_bin };
     let rows = tuner.bench_default(std::path::Path::new(&row.path))?;
     println!("{:<10} {:>8} {:>8} {:>6} {:<6} {:<6}", "TEST", "T/S", "CTX", "THREADS", "CTK", "CTV");
@@ -652,12 +649,9 @@ fn tune(model: &str, search: bool) -> Result<()> {
     let row = store.get_model(model)?
         .ok_or_else(|| anyhow!("no such model: {model}"))?;
     let engine_row = store.active_engine()?
-        .ok_or_else(|| anyhow!("no engine installed"))?;
+        .ok_or_else(|| anyhow!("no engine installed; run: pallama engine update"))?;
     let manifest: pallama_runtime::Manifest = serde_json::from_str(&engine_row.manifest)?;
-    let bench_bin = std::path::Path::new(&manifest.server_path)
-        .parent()
-        .map(|p| p.join("llama-bench"))
-        .ok_or_else(|| anyhow!("engine dir missing"))?;
+    let bench_bin = pallama_runtime::bench::find_bench_bin(&d)?;
     let cfg = config()?;
     let hw = pallama_runtime::probe_hardware(Some(&manifest));
     let gguf = pallama_core::read_metadata_file(std::path::Path::new(&row.path))?;
@@ -723,6 +717,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             );
         }
         EngineCmd::List => {
+            upstream_update_hint(&d).await;
             let store = Store::open(&d)?;
             for e in store.list_engines()? {
                 println!(
@@ -758,6 +753,29 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Best-effort upstream check (user-invoked only, ~4s budget, silent on
+/// failure): prints an update hint when a newer b-tag exists.
+async fn upstream_update_hint(dirs: &PallamaDirs) {
+    let Ok(store) = Store::open(dirs) else { return };
+    let Ok(Some(active)) = store.active_engine() else { return };
+    if active.tag == "local" {
+        return; // local build: upstream currency is the user's concern
+    }
+    let token = std::env::var("GH_TOKEN").ok();
+    let Ok(gh) = GhClient::new(token) else { return };
+    let latest = tokio::time::timeout(std::time::Duration::from_secs(4), gh.latest_b_release()).await;
+    if let Ok(Ok(rel)) = latest {
+        if rel.tag_name == active.tag {
+            println!("engine up to date: {}", active.tag);
+        } else {
+            println!(
+                "update available: {} (active: {}) — run: pallama engine update",
+                rel.tag_name, active.tag
+            );
+        }
+    }
 }
 
 fn local_engine_manager(d: &PallamaDirs) -> Result<EngineManager> {

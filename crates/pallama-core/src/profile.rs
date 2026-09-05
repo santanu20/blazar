@@ -56,6 +56,10 @@ pub struct TuningOverrides {
     pub ctx: Option<u32>,
     pub kv_quant: Option<bool>,
     pub threads: Option<u32>,
+    /// Flash attention on/off (default heuristic: auto).
+    pub fa: Option<bool>,
+    /// Physical batch size (-b) for prompt processing.
+    pub batch: Option<u32>,
 }
 
 /// Compile the launch argv (plan rules D.1–12).
@@ -92,7 +96,12 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     let ctx = tuning
         .ctx
         .unwrap_or_else(|| resolve_ctx(input, overlay, &mut warnings));
-    argv.extend(["--jinja".into(), "--metrics".into(), "--flash-attn".into(), "auto".into()]);
+    let fa = match tuning.fa {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "auto",
+    };
+    argv.extend(["--jinja".into(), "--metrics".into(), "--flash-attn".into(), fa.into()]);
     argv.push("--ctx-size".into());
     argv.push(ctx.to_string());
 
@@ -102,6 +111,10 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         .unwrap_or_else(|| input.hardware.physical_cores.max(1));
     argv.push("--threads".into());
     argv.push(threads.to_string());
+    if let Some(b) = tuning.batch {
+        argv.push("-b".into());
+        argv.push(b.to_string());
+    }
 
     // --- 4. gpu layers: auto everywhere; upstream --fit on (default) shrinks
     argv.push("--gpu-layers".into());
@@ -613,11 +626,22 @@ mod tests {
     }
 
     #[test]
+    fn unit__tuning_overrides__fa_and_batch_emitted() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let t = TuningOverrides { fa: Some(false), batch: Some(1024), ..Default::default() };
+        let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &t).unwrap();
+        assert!(p.argv.windows(2).any(|w| w[0] == "--flash-attn" && w[1] == "off"));
+        assert!(p.argv.windows(2).any(|w| w[0] == "-b" && w[1] == "1024"));
+    }
+
+    #[test]
     fn unit__tuning_overrides__win_over_heuristics() {
         let cfg = Config::default();
         let hw = gpu_hw(12_000, 32_000, 8);
         let g = meta();
-        let t = TuningOverrides { ctx: Some(8192), threads: Some(6), kv_quant: Some(true) };
+        let t = TuningOverrides { ctx: Some(8192), threads: Some(6), kv_quant: Some(true), ..Default::default() };
         let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &t).unwrap();
         assert!(p.argv.windows(2).any(|w| w[0] == "--ctx-size" && w[1] == "8192"));
         assert!(p.argv.windows(2).any(|w| w[0] == "--threads" && w[1] == "6"));

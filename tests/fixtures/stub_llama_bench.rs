@@ -50,6 +50,8 @@ fn main() {
     let ts = or_default(flag_values("-t"), &["1"]);
     let ctks = or_default(flag_values("-ctk"), &["f16"]);
     let ctvs = or_default(flag_values("-ctv"), &["f16"]);
+    let fas = or_default(flag_values("-fa"), &["on"]);
+    let bs = or_default(flag_values("-b"), &["2048"]);
 
     let mut rows: Vec<serde_json::Value> = Vec::new();
     let default_ctx = std::env::var("STUB_BASE_CTX").ok().and_then(|v| v.parse::<u64>().ok());
@@ -60,38 +62,52 @@ fn main() {
             for ctk in &ctks {
                 for ctv in &ctvs {
                     let quant = ctk == "q8_0" && ctv == "q8_0";
-                    for n in &ns {
-                        let ctx_bonus = match default_ctx {
-                            Some(base) if ctx == base => 0,
-                            Some(_) => 3,
-                            None => 0,
-                        };
-                        #[allow(clippy::cast_precision_loss)] // synthetic fixture values
-                        let tg =
-                            100.0 + threads as f64 + f64::from(ctx_bonus) + f64::from(u8::from(quant)) * 50.0;
-                        for p in &ps {
-                            let _ = p;
-                            rows.push(serde_json::json!({
-                                "model": "stub",
-                                "backend": "stub",
-                                "n_ctx": ctx,
-                                "n_threads": threads,
-                                "type_k": ctk,
-                                "type_v": ctv,
-                                "test": format!("pp{n}"),
-                                "t/s": tg * 10.0,
-                            }));
+                    for fa in &fas {
+                        for b in &bs {
+                            let batch: u64 = b.parse().unwrap_or(2048);
+                            for n in &ns {
+                                let ctx_bonus = match default_ctx {
+                                    Some(base) if ctx == base => 0,
+                                    Some(_) => 3,
+                                    None => 0,
+                                };
+                                // Deterministic scoring: quant +50, fa-on
+                                // +15, batch 1024 +8, +threads.
+                                let fa_bonus = if fa == "on" { 15.0 } else { 0.0 };
+                                let b_bonus = if batch == 1024 { 8.0 } else { 0.0 };
+                                #[allow(clippy::cast_precision_loss)]
+                                let tg = 100.0 + threads as f64 + f64::from(ctx_bonus)
+                                    + f64::from(u8::from(quant)) * 50.0 + fa_bonus + b_bonus;
+                                let fa_code: i64 = i64::from(fa == "on");
+                                for p in &ps {
+                                    let _ = p;
+                                    rows.push(serde_json::json!({
+                                        "model": "stub",
+                                        "backend": "stub",
+                                        "n_ctx": ctx,
+                                        "n_threads": threads,
+                                        "type_k": ctk,
+                                        "type_v": ctv,
+                                        "flash_attn": fa_code,
+                                        "n_batch": batch,
+                                        "test": format!("pp{n}"),
+                                        "t/s": tg * 10.0,
+                                    }));
+                                }
+                                rows.push(serde_json::json!({
+                                    "model": "stub",
+                                    "backend": "stub",
+                                    "n_ctx": ctx,
+                                    "n_threads": threads,
+                                    "type_k": ctk,
+                                    "type_v": ctv,
+                                    "flash_attn": fa_code,
+                                    "n_batch": batch,
+                                    "test": format!("tg{n}"),
+                                    "t/s": tg,
+                                }));
+                            }
                         }
-                        rows.push(serde_json::json!({
-                            "model": "stub",
-                            "backend": "stub",
-                            "n_ctx": ctx,
-                            "n_threads": threads,
-                            "type_k": ctk,
-                            "type_v": ctv,
-                            "test": format!("tg{n}"),
-                            "t/s": tg,
-                        }));
                     }
                 }
             }

@@ -121,9 +121,13 @@ fn integration__tune_search__adopts_argmax_and_persists() {
     assert!(!rows.is_empty());
     assert!(winning.kv_quant.unwrap(), "stub rewards q8_0 by +50 t/s");
     assert_eq!(winning.threads.unwrap(), 8);
+    assert_eq!(winning.fa, Some(true), "stub rewards fa-on by +15 t/s");
+    assert_eq!(winning.batch, Some(1024), "stub rewards batch 1024 by +8 t/s");
     assert!(winning.ctx.is_none(), "ctx is not a bench axis");
     assert!(profile.argv.windows(2).any(|w| w[0] == "--cache-type-k" && w[1] == "q8_0"));
     assert!(profile.argv.windows(2).any(|w| w[0] == "--threads" && w[1] == "8"));
+    assert!(profile.argv.windows(2).any(|w| w[0] == "--flash-attn" && w[1] == "on"));
+    assert!(profile.argv.windows(2).any(|w| w[0] == "-b" && w[1] == "1024"));
 
     let stored = store.get_profile("qwen3-8b", "b-stub").unwrap().unwrap();
     let argv: Vec<String> = serde_json::from_str(&stored.args_json).unwrap();

@@ -42,6 +42,11 @@ pub struct BenchRow {
     pub n_prompt: Option<u64>,
     #[serde(default)]
     pub n_gen: Option<u64>,
+    /// llama-bench encodes fa as -1 auto / 0 off / 1 on.
+    #[serde(default)]
+    pub flash_attn: Option<i64>,
+    #[serde(default)]
+    pub n_batch: Option<u64>,
 }
 
 impl BenchRow {
@@ -66,6 +71,24 @@ pub struct Tuner<'a> {
     /// Path to llama-bench binary (usually next to llama-server in the
     /// engine dir).
     pub bench_bin: PathBuf,
+}
+
+/// Locate a llama-bench: prefer the active engine's directory, else any
+/// installed engine (a `local` engine may not ship a bench binary).
+pub fn find_bench_bin(dirs: &PallamaDirs) -> Result<PathBuf> {
+    let store = Store::open(dirs)?;
+    let engines = store.list_engines()?;
+    let mut candidates: Vec<PathBuf> = engines
+        .iter()
+        .filter(|e| e.active)
+        .chain(engines.iter().filter(|e| !e.active))
+        .map(|e| dirs.engines_dir().join(&e.tag).join(format!("llama-{}", e.tag)).join("llama-bench"))
+        .collect();
+    candidates.push(PathBuf::from("/usr/local/lib/ollama/llama-bench"));
+    candidates
+        .into_iter()
+        .find(|p| p.exists())
+        .ok_or_else(|| anyhow!("no llama-bench found in any installed engine; run `pallama engine update`"))
 }
 
 /// Default bench grid: prompt processing + generation, 2 reps.
@@ -126,7 +149,8 @@ impl Tuner<'_> {
         let _ = base;
         let threads = input.hardware.physical_cores.max(1);
         // Grid axes llama-bench actually supports (verified b10816):
-        // threads x KV-quant. (No -c axis: ctx is a server-launch knob.)
+        // threads x KV-quant x flash-attn x batch. (No -c axis: ctx is a
+        // server-launch knob.)
         let mut grid = vec![
             "-t".into(),
             format!("{},{}", threads, threads.saturating_sub(2).max(1)),
@@ -134,25 +158,31 @@ impl Tuner<'_> {
             "f16,q8_0".into(),
             "-ctv".into(),
             "f16,q8_0".into(),
+            "-fa".into(),
+            "on,off".into(),
+            "-b".into(),
+            "2048,1024".into(),
         ];
         grid.extend(default_bench_args());
         let grid_rows = self.run(Path::new(input.model_path), &grid)?;
 
-        // Argmax by mean tg t/s across (threads, quant) combos.
-        let mut best: Option<(f64, u64, bool)> = None; // (score, threads, quant)
-        for (nthreads, quant) in combos(&grid_rows) {
-            let score = mean_tg(&grid_rows, nthreads, quant);
+        // Argmax by mean tg t/s across (threads, quant, fa, batch) combos.
+        let mut best: Option<(f64, Combo)> = None;
+        for combo in combos(&grid_rows) {
+            let score = mean_tg(&grid_rows, &combo);
             if best.as_ref().is_none_or(|(b, ..)| score > *b) {
-                best = Some((score, nthreads, quant));
+                best = Some((score, combo));
             }
         }
-        let Some((score, best_threads, best_quant)) = best else {
+        let Some((score, win)) = best else {
             return Err(anyhow!("llama-bench produced no tg rows"));
         };
         let winning = TuningOverrides {
             ctx: None,
-            threads: Some(u32::try_from(best_threads).context("thread count overflow")?),
-            kv_quant: Some(best_quant),
+            threads: Some(u32::try_from(win.threads).context("thread count overflow")?),
+            kv_quant: Some(win.kv_q8),
+            fa: Some(win.fa_on),
+            batch: Some(u32::try_from(win.batch).context("batch overflow")?),
         };
         let profile = profile::compile(input, &winning)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -161,28 +191,42 @@ impl Tuner<'_> {
     }
 }
 
-fn combos(rows: &[BenchRow]) -> Vec<(u64, bool)> {
+/// One measured combo: (threads, kv-q8?, fa-on?, batch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Combo {
+    pub threads: u64,
+    pub kv_q8: bool,
+    pub fa_on: bool,
+    pub batch: u64,
+}
+
+fn combos(rows: &[BenchRow]) -> Vec<Combo> {
     let mut seen = BTreeSet::new();
     for r in rows {
         if !r.test_name().starts_with("tg") {
             continue;
         }
-        seen.insert((
-            r.n_threads.unwrap_or(0),
-            r.type_k.as_deref() == Some("q8_0") && r.type_v.as_deref() == Some("q8_0"),
-        ));
+        seen.insert(Combo {
+            threads: r.n_threads.unwrap_or(0),
+            kv_q8: r.type_k.as_deref() == Some("q8_0") && r.type_v.as_deref() == Some("q8_0"),
+            fa_on: r.flash_attn.unwrap_or(-1) == 1,
+            batch: r.n_batch.unwrap_or(0),
+        });
     }
     seen.into_iter().collect()
 }
 
-fn mean_tg(rows: &[BenchRow], threads: u64, quant: bool) -> f64 {
+fn mean_tg(rows: &[BenchRow], want: &Combo) -> f64 {
     let hits: Vec<f64> = rows
         .iter()
         .filter(|r| {
-            r.test_name().starts_with("tg")
-                && r.n_threads.unwrap_or(0) == threads
-                && (r.type_k.as_deref() == Some("q8_0") && r.type_v.as_deref() == Some("q8_0"))
-                    == quant
+            let cur = Combo {
+                threads: r.n_threads.unwrap_or(0),
+                kv_q8: r.type_k.as_deref() == Some("q8_0") && r.type_v.as_deref() == Some("q8_0"),
+                fa_on: r.flash_attn.unwrap_or(-1) == 1,
+                batch: r.n_batch.unwrap_or(0),
+            };
+            r.test_name().starts_with("tg") && &cur == want
         })
         .map(|r| r.ts)
         .collect();
@@ -326,6 +370,8 @@ mod tests {
             type_v: Some(v.into()),
             n_prompt: None,
             n_gen: None,
+            flash_attn: None,
+            n_batch: None,
         }
     }
 
@@ -352,11 +398,13 @@ mod tests {
             row("tg128", 110.0, 4096, 6, "q8_0", "q8_0"),
             row("pp512", 900.0, 8192, 8, "f16", "f16"),
         ];
-        assert!((mean_tg(&rows, 8, true) - 140.0).abs() < 1e-9);
-        assert!((mean_tg(&rows, 8, false) - 100.0).abs() < 1e-9);
-        assert!((mean_tg(&rows, 6, true) - 110.0).abs() < 1e-9);
-        assert!((mean_tg(&rows, 1, false) - 0.0).abs() < 1e-9);
-        let c = combos(&rows);
-        assert_eq!(c.len(), 3);
+        let find = |t, q| {
+            combos(&rows).into_iter().find(|c| c.threads == t && c.kv_q8 == q).unwrap()
+        };
+        assert!((mean_tg(&rows, &find(8, true)) - 140.0).abs() < 1e-9);
+        assert!((mean_tg(&rows, &find(8, false)) - 100.0).abs() < 1e-9);
+        assert!((mean_tg(&rows, &find(6, true)) - 110.0).abs() < 1e-9);
+        assert!((mean_tg(&rows, &Combo { threads: 1, kv_q8: false, fa_on: false, batch: 0 }) - 0.0).abs() < 1e-9);
+        assert_eq!(combos(&rows).len(), 3);
     }
 }
