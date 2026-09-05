@@ -1290,6 +1290,7 @@ dependencies = [
 name = "pallama-gateway"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
  "bytes",
  "futures",

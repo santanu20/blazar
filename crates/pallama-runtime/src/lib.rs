@@ -20,4 +20,5 @@ pub use bench::{parse_bench_json, BenchRow, Tuner};
 pub use daemon::{wait_for_shutdown_signal, DaemonLock};
 pub use engine_impl::{ChildHandle, Engine, LlamaCppEngine};
 pub use probe::probe_hardware;
-pub use supervisor::{PsRow, SupervisionError, Supervisor};
+pub use models::{instance_running, remove_model};
+pub use supervisor::{EngineRef, PsRow, SupervisionError, Supervisor};

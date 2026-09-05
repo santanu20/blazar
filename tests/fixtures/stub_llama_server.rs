@@ -137,6 +137,11 @@ async fn serve(host: String, port: u16, alias: String) {
             }
         }))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/completions", post(completions))
+        .route("/completions", post(completions))
+        .route("/v1/embeddings", post(embeddings))
+        .route("/embeddings", post(embeddings))
+        .route("/lora-adapters", get(lora_adapters))
         .route("/metrics", get(metrics))
         .route("/slots", get(slots))
         .with_state(alias.clone());
@@ -313,6 +318,67 @@ fn split_in_half(s: &str) -> (String, String) {
         cut += 1;
     }
     (s[..cut].to_string(), s[cut..].to_string())
+}
+
+#[derive(serde::Deserialize)]
+struct CompletionRequest {
+    #[serde(default)]
+    pub prompt: serde_json::Value,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+async fn completions(
+    State(state): State<AppState>,
+    axum::Json(req): axum::Json<CompletionRequest>,
+) -> axum::Json<serde_json::Value> {
+    let prompt = match &req.prompt {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let text = format!("stub:{state}:{prompt}");
+    let tokens = i64::try_from(text.split_whitespace().count().max(1)).unwrap_or(1);
+    axum::Json(serde_json::json!({
+        "id": format!("cmpl-stub-{}", std::process::id()),
+        "object": "text_completion",
+        "created": 0_u64,
+        "model": req.model.unwrap_or_else(|| state.clone()),
+        "choices": [{"index": 0, "text": text, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": tokens,
+            "completion_tokens": tokens,
+            "total_tokens": tokens * 2,
+        },
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct EmbeddingsRequest {
+    #[serde(default)]
+    pub input: serde_json::Value,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+async fn embeddings(
+    State(state): State<AppState>,
+    axum::Json(req): axum::Json<EmbeddingsRequest>,
+) -> axum::Json<serde_json::Value> {
+    let text = match &req.input {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    // Deterministic pseudo-embedding from char codes.
+    let vec: Vec<f64> = text.bytes().take(8).map(|b| f64::from(b) / 255.0).collect();
+    axum::Json(serde_json::json!({
+        "object": "list",
+        "data": [{"object": "embedding", "index": 0, "embedding": vec}],
+        "model": req.model.unwrap_or_else(|| state.clone()),
+    }))
+}
+
+async fn lora_adapters() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({"adapters": []}))
 }
 
 async fn metrics() -> axum::response::Response {

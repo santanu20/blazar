@@ -80,6 +80,9 @@ pub struct Supervisor {
     load_results: DashMap<String, Result<EngineRef, String>>,
     /// Crash-restart timestamps per model (circuit breaker).
     restarts: DashMap<String, Vec<Instant>>,
+    /// One-shot ctx override for the NEXT spawn of a model (per-request
+    /// `options.num_ctx` — complaint #13). Consumed on use.
+    pending_ctx: DashMap<String, u32>,
     // Test knobs (prod defaults from config).
     pub load_timeout: Duration,
     pub shutdown_grace: Duration,
@@ -103,10 +106,10 @@ impl Supervisor {
         engine: Arc<dyn Engine>,
     ) -> Self {
         Self {
-            load_timeout: Duration::from_mins(3),
+            load_timeout: Duration::from_secs(3 * 60),
             shutdown_grace: Duration::from_secs(10),
             reaper_interval: Duration::from_secs(10),
-            circuit_window: Duration::from_mins(1),
+            circuit_window: Duration::from_secs(60),
             max_restarts: 3,
             dirs,
             config,
@@ -117,6 +120,7 @@ impl Supervisor {
             loading: DashMap::new(),
             load_results: DashMap::new(),
             restarts: DashMap::new(),
+            pending_ctx: DashMap::new(),
         }
     }
 
@@ -275,7 +279,12 @@ impl Supervisor {
                 supported_flags: &manifest.flags,
                 endpoint: endpoint.clone(),
             };
-            let profile = profile::compile(&input, &pallama_core::TuningOverrides::default())
+            let tuning = self
+                .pending_ctx
+                .remove(name)
+                .map(|(_, ctx)| pallama_core::TuningOverrides { ctx: Some(ctx), ..Default::default() })
+                .unwrap_or_default();
+            let profile = profile::compile(&input, &tuning)
                 .map_err(|e| SupervisionError::Internal(anyhow!("profile: {e}")))?;
             for w in &profile.warnings {
                 tracing::warn!(model = name, "profile: {w}");
@@ -481,6 +490,13 @@ impl Supervisor {
                 }
             })
             .collect()
+    }
+
+    /// Queue a ctx override for the model's next spawn (per-request
+    /// `options.num_ctx`). Consumed once; clamped by the profile compiler
+    /// against the model's trained context.
+    pub fn set_next_ctx(&self, model: &str, ctx: u32) {
+        self.pending_ctx.insert(model.to_string(), ctx);
     }
 
     /// Circuit reset (`pallama ps --reset`).
