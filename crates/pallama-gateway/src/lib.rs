@@ -143,7 +143,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/generate", post(ollama::generate))
         .route("/api/evict", post(ollama::evict))
         .route("/api/session", post(ollama::session).get(ollama::session_list))
-        .route("/api/why", get(ollama::why));
+        .route("/api/why", get(ollama::why))
+        .route("/api/watch", get(ollama::watch));
 
     Router::new()
         .route("/healthz", get(openai::healthz))

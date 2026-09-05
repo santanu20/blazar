@@ -519,6 +519,58 @@ async fn integration__sentinel__enforce_config_global_and_ollama_path() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn integration__watch_sse_streams_live_detections() {
+    let ts = start(Config::default(), &[("STUB_FINISH", "length")], false).await;
+    let c = client();
+    // Open the live tail BEFORE triggering the request.
+    let stream = c
+        .get(format!("{}/api/watch", ts.base))
+        .timeout(Duration::from_mins(1))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), 200);
+    assert!(stream
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/event-stream")));
+    let reader = stream;
+    let (tx_lines, rx_lines) = tokio::sync::oneshot::channel::<String>();
+    let handle = tokio::spawn(async move {
+        let mut collected = String::new();
+        let mut s = reader;
+        while let Some(chunk) = s.chunk().await.unwrap_or(None) {
+            collected.push_str(&String::from_utf8_lossy(&chunk));
+            if collected.contains("ctx_truncated") {
+                break;
+            }
+        }
+        let _ = tx_lines.send(collected);
+    });
+    // Trigger a truncation-detected request.
+    let _: serde_json::Value = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({"model": "m1", "stream": false,
+            "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let collected = tokio::time::timeout(Duration::from_secs(20), rx_lines)
+        .await
+        .expect("watch stream delivered the record")
+        .expect("reader task alive");
+    assert!(collected.contains("data: "), "{collected}");
+    assert!(collected.contains("ctx_truncated"), "{collected}");
+    handle.abort();
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn integration__openai_num_ctx_header__restarts_at_requested_size() {
     // Gap-analysis row 15 closure: the OpenAI protocol has no ctx field;
     // the X-Pallama-Num-Ctx extension header fills it with the same

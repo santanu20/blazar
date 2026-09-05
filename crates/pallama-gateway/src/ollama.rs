@@ -40,6 +40,38 @@ pub async fn version() -> Response {
     axum::Json(json!({"version": env!("CARGO_PKG_VERSION")})).into_response()
 }
 
+/// GET /api/watch — live SSE tail of sentinel records (`pallama watch`).
+/// Each committed record arrives as `data: {record json}`; a lagged
+/// consumer gets a resync note and keeps streaming. History is `why`'s
+/// job; this is strictly live.
+pub async fn watch(State(state): State<Arc<AppState>>) -> Response {
+    let rx = state.sentinel.watch();
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        match rx.recv().await {
+            Ok(record) => Some((
+                Ok::<Bytes, std::io::Error>(Bytes::from(format!(
+                    "data: {}\n\n",
+                    record.to_json()
+                ))),
+                rx,
+            )),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => Some((
+                Ok(Bytes::from(format!(
+                    "data: {{\"note\":\"watch lagged, {n} records skipped\"}}\n\n"
+                ))),
+                rx,
+            )),
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+        }
+    });
+    Response::builder()
+        .status(200)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|e| api_error(500, &format!("watch body: {e}")))
+}
+
 /// GET /api/why[?trace=...] — the sentinel ring: what the model returned,
 /// what was wrong with it, which knob fixes it. Powers `pallama why`.
 /// `sentinel: false` reports the kill-switch state instead of an error:

@@ -351,6 +351,10 @@ pub struct Sentinel {
     /// (no run dir, or open failed — IO problems never take the daemon).
     persist: Option<Mutex<PersistState>>,
     persist_path: Option<std::path::PathBuf>,
+    /// Live tail for `pallama watch` / `GET /api/watch`: every committed
+    /// record is broadcast; slow consumers lag (resync note), history
+    /// stays in the ring for `why`.
+    watch_tx: tokio::sync::broadcast::Sender<SentinelRecord>,
 }
 
 impl Sentinel {
@@ -388,6 +392,7 @@ impl Sentinel {
                 persist_path = Some(path);
             }
         }
+        let (watch_tx, _) = tokio::sync::broadcast::channel(128);
         Arc::new(Self {
             enabled,
             stall: Duration::from_secs(stall_secs),
@@ -396,6 +401,7 @@ impl Sentinel {
             templates: Mutex::new(HashMap::new()),
             persist,
             persist_path,
+            watch_tx,
         })
     }
 
@@ -568,7 +574,15 @@ impl Sentinel {
             }
             ring.push_back(record.clone());
         }
+        // No receivers = no error worth hearing about.
+        let _ = self.watch_tx.send(record.clone());
         self.persist_record(record);
+    }
+
+    /// Subscribe to the live record stream (`pallama watch`).
+    #[must_use]
+    pub fn watch(&self) -> tokio::sync::broadcast::Receiver<SentinelRecord> {
+        self.watch_tx.subscribe()
     }
 
     /// Append one JSON line; rotate (rewrite with the newest rows) when
@@ -1120,6 +1134,25 @@ mod tests {
             tool_schemas: schemas,
             ..RequestCtx::default()
         }
+    }
+
+    #[tokio::test]
+    async fn integration__commit_broadcasts_to_watch_subscribers() {
+        let s = Sentinel::new(true, 0, None);
+        let mut rx = s.watch();
+        let ctx = RequestCtx {
+            trace: "plm-watch-1".into(),
+            route: "openai-chat".into(),
+            model: "m".into(),
+            ..Default::default()
+        };
+        let body = serde_json::to_vec(&serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+        }))
+        .unwrap();
+        let _ = s.judge(&ctx, &body, 200);
+        let got = rx.recv().await.expect("record broadcast");
+        assert_eq!(got.trace, "plm-watch-1");
     }
 
     #[test]

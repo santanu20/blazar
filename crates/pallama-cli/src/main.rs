@@ -148,6 +148,8 @@ enum Cmd {
         /// Trace id from the x-pallama-trace-id response header
         trace: Option<String>,
     },
+    /// Live tail of sentinel detections as they happen (Ctrl-C to stop)
+    Watch,
 }
 
 #[derive(Subcommand)]
@@ -301,6 +303,7 @@ async fn run(cmd: Cmd) -> Result<()> {
         Cmd::Session { cmd } => session_cmd(cmd).await,
         Cmd::Doctor => doctor().await,
         Cmd::Why { trace } => why(trace.as_deref()).await,
+        Cmd::Watch => watch().await,
     }
 }
 
@@ -1032,33 +1035,71 @@ async fn why(trace: Option<&str>) -> Result<()> {
         println!("no observations recorded yet (sentinel records chat-family requests)");
         return Ok(());
     }
+    for r in &records {
+        print_record(r);
+    }
+    Ok(())
+}
+
+/// One compact observation line + detection/retry lines (why + watch).
+fn print_record(r: &serde_json::Value) {
     let num = |v: &serde_json::Value| -> String {
         v.as_u64().map_or_else(|| "?".into(), |n| n.to_string())
     };
-    for r in &records {
-        let detections = r["detections"].as_array().cloned().unwrap_or_default();
-        let flag = if detections.is_empty() { "ok" } else { "FLAGGED" };
+    let detections = r["detections"].as_array().cloned().unwrap_or_default();
+    let flag = if detections.is_empty() { "ok" } else { "FLAGGED" };
+    println!(
+        "{flag}  {}  {}  model={} status={} ctx={} prompt={} completion={} degraded={} {}ms",
+        r["trace"].as_str().unwrap_or("?"),
+        r["route"].as_str().unwrap_or("?"),
+        r["model"].as_str().unwrap_or("?"),
+        num(&r["status"]),
+        num(&r["ctx"]),
+        num(&r["prompt_tokens"]),
+        num(&r["completion_tokens"]),
+        r["degraded"].as_bool().unwrap_or(false),
+        num(&r["ms"]),
+    );
+    for d in &detections {
         println!(
-            "{flag}  {}  {}  model={} status={} ctx={} prompt={} completion={} degraded={} {}ms",
-            r["trace"].as_str().unwrap_or("?"),
-            r["route"].as_str().unwrap_or("?"),
-            r["model"].as_str().unwrap_or("?"),
-            num(&r["status"]),
-            num(&r["ctx"]),
-            num(&r["prompt_tokens"]),
-            num(&r["completion_tokens"]),
-            r["degraded"].as_bool().unwrap_or(false),
-            num(&r["ms"]),
+            "  [{}] {} — {}",
+            d["code"].as_str().unwrap_or("?"),
+            d["detail"].as_str().unwrap_or(""),
+            d["hint"].as_str().unwrap_or(""),
         );
-        for d in &detections {
-            println!(
-                "  [{}] {} — {}",
-                d["code"].as_str().unwrap_or("?"),
-                d["detail"].as_str().unwrap_or(""),
-                d["hint"].as_str().unwrap_or(""),
-            );
-            println!("    {}", d["retry"].as_str().unwrap_or(""));
+        println!("    {}", d["retry"].as_str().unwrap_or(""));
+    }
+}
+
+/// `pallama watch` — live SSE tail of sentinel records. One line per
+/// observation, detections + retry hints underneath. Ctrl-C stops.
+async fn watch() -> Result<()> {
+    let base = ensure_daemon().await?;
+    // Default reqwest client carries no total-request timeout — exactly
+    // what a long-lived tail needs; Ctrl-C is the off switch.
+    let mut resp = reqwest::Client::new()
+        .get(format!("{base}/api/watch"))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("daemon: {text}"));
+    }
+    println!("watching sentinel — Ctrl-C to stop");
+    let mut buf = String::new();
+    while let Some(chunk) = futures_lite_next(&mut resp).await? {
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(pos) = buf.find("\n\n") {
+            let frame: String = buf.drain(..pos + 2).collect();
+            for line in frame.lines() {
+                if let Some(payload) = line.strip_prefix("data: ") {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+                        print_record(&v);
+                    }
+                }
+            }
         }
+        std::io::Write::flush(&mut std::io::stdout()).ok();
     }
     Ok(())
 }

@@ -23,6 +23,15 @@ parity-tested byte-for-byte):
   chat template cannot render them (`x-pallama-warnings` header before the
   first token — the root cause of plain-text-instead-of-tool-calls)
 
+## `pallama watch`
+
+`pallama watch` (or `GET /api/watch`, SSE) tails sentinel records LIVE: one
+compact line per request as it completes, detections + retry hints
+underneath — truncation, malformed tool calls, schema violations and stalls
+appear on your terminal the moment they happen, not in a post-mortem. The
+live stream is a bounded broadcast (slow consumers get a resync note);
+history stays `why`'s job.
+
 ## `pallama why [trace]`
 
 Every request's trace id (response header `x-pallama-trace-id`) is now

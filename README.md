@@ -48,7 +48,7 @@ pallama run qwen3-0.6b                    # streaming REPL
 OLLAMA_HOST=http://127.0.0.1:11434 ollama list   # existing ollama clients just work
 ```
 
-OpenAI-compatible: `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/rerank`, `/v1/messages` (Anthropic), `/v1/responses` (Responses API), `/v1/audio/transcriptions` (multipart, audio-capable models), `/infill` (FIM), `/v1/chat/completions/control` (steering vectors), `/v1/chat/completions/input_tokens`, `/v1/responses/input_tokens`, `/v1/messages/count_tokens`, `/tokenize`, `/detokenize`, `/apply-template`, `/v1/adapters` (LoRA). Ollama-compatible: `/api/chat`, `/api/generate`, `/api/tags`, `/api/pull`, `/api/ps`, `/api/show`, `/api/embeddings`, `/api/events`. Pallama-native: `/api/evict`, `/api/session` (slot KV checkpoints), `/api/why` (sentinel record ring), `X-Pallama-Num-Ctx` request header (per-request ctx on the OpenAI path — the protocol has no such field; same restart-once semantics as `options.num_ctx`), `X-Pallama-Enforce` header (agent loops: 422 on malformed tool calls / schema violations for non-stream requests). Sentinel observes chat-completions, legacy completions, and `/v1/responses` (both stream and non-stream) on both APIs.
+OpenAI-compatible: `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/rerank`, `/v1/messages` (Anthropic), `/v1/responses` (Responses API), `/v1/audio/transcriptions` (multipart, audio-capable models), `/infill` (FIM), `/v1/chat/completions/control` (steering vectors), `/v1/chat/completions/input_tokens`, `/v1/responses/input_tokens`, `/v1/messages/count_tokens`, `/tokenize`, `/detokenize`, `/apply-template`, `/v1/adapters` (LoRA). Ollama-compatible: `/api/chat`, `/api/generate`, `/api/tags`, `/api/pull`, `/api/ps`, `/api/show`, `/api/embeddings`, `/api/events`. Pallama-native: `/api/evict`, `/api/session` (slot KV checkpoints), `/api/why` (sentinel record ring), `/api/watch` (live SSE sentinel tail), `X-Pallama-Num-Ctx` request header (per-request ctx on the OpenAI path — the protocol has no such field; same restart-once semantics as `options.num_ctx`), `X-Pallama-Enforce` header (agent loops: 422 on malformed tool calls / schema violations for non-stream requests). Sentinel observes chat-completions, legacy completions, and `/v1/responses` (both stream and non-stream) on both APIs.
 
 ## Why (ollama complaints → pallama resolutions)
 
@@ -92,6 +92,7 @@ OpenAI-compatible: `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddin
 | `session save/restore/rm/list` | slot KV-cache checkpoints: pause a model's context, resume later (survives unload + restart) |
 | `doctor` | one-command diagnostics: config, port conflicts, engine, hardware, disk, model health |
 | `why [trace]` | sentinel: what the model returned, what was wrong with it (truncation, invalid tool args, schema violations, empty replies, stalls), which knob fixes it |
+| `watch` | live tail of sentinel detections as they happen (SSE; Ctrl-C to stop) |
 | `router = true` (config) | one child serves ALL models: preset INI auto-generated per model, engine-native autoload + LRU; `pallama stop <model>` becomes an engine unload |
 | `upgrade [--version] [--dry-run]` | Self-update from GitHub Releases (sha256-verified, atomic) |
 
@@ -162,7 +163,7 @@ Load-bearing ideas:
 
 ## Verification
 
-219 tests: pure compiler tables, wiremock network suites (resume, sha, allowlist, token isolation), engine install cycles with a real stub engine binary, supervisor lifecycle integration (ladder, capacity, crash-circuit, shutdown), and full gateway round-trips over both APIs — including the sentinel suites (9 detection codes, responses grammar, persistence reload, enforce 422s, parity-under-observation). `cargo clippy --workspace --all-targets -- -D warnings` clean.
+222 tests: pure compiler tables, wiremock network suites (resume, sha, allowlist, token isolation), engine install cycles with a real stub engine binary, supervisor lifecycle integration (ladder, capacity, crash-circuit, shutdown), and full gateway round-trips over both APIs — including the sentinel suites (9 detection codes, responses grammar, persistence reload, enforce 422s, live watch SSE, parity-under-observation). `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 ## Credit
 
