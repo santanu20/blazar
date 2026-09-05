@@ -199,11 +199,27 @@ impl EngineManager {
 
     /// Register a locally built llama-server (`PALLAMA_ENGINE_PATH`) under the
     /// pseudo-tag `local`. Never pruned; activation follows `use_tag`.
-    pub fn register_local(&self, server: &Path) -> Result<EngineRow> {
+    pub fn register_local(&self, server: &Path, extra_env: &std::collections::BTreeMap<String, String>) -> Result<EngineRow> {
         if !server.exists() {
             return Err(anyhow!("PALLAMA_ENGINE_PATH {} does not exist", server.display()));
         }
-        let m = manifest::probe(server, LOCAL_TAG)?;
+        // Probe under the configured engine env (e.g. GGML_BACKEND_PATH so
+        // a CUDA build actually discovers its GPU).
+        let m = {
+            let prev: Vec<(String, String)> = extra_env
+                .iter()
+                .filter(|(k, _)| std::env::var_os(k).is_none())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            for (k, v) in &prev {
+                std::env::set_var(k, v);
+            }
+            let r = manifest::probe(server, LOCAL_TAG);
+            for (k, _) in &prev {
+                std::env::remove_var(k);
+            }
+            r?
+        };
         let row = EngineRow {
             tag: LOCAL_TAG.to_string(),
             asset: "local".into(),

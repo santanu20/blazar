@@ -327,13 +327,13 @@ async fn integration__register_local_engine() {
     let (_t, dirs) = tmp_dirs();
     let api = MockServer::start().await;
     let mgr = manager(&dirs, &api.uri());
-    let row = mgr.register_local(&stub_server_bin()).unwrap();
+    let row = mgr.register_local(&stub_server_bin(), &std::collections::BTreeMap::new()).unwrap();
     assert_eq!(row.tag, LOCAL_TAG);
     let m: Manifest = serde_json::from_str(&row.manifest).unwrap();
     assert!(m.has_flag("--jinja"));
     // Missing path -> named error.
     let err = mgr
-        .register_local(Path::new("/nonexistent/llama-server"))
+        .register_local(Path::new("/nonexistent/llama-server"), &std::collections::BTreeMap::new())
         .unwrap_err();
     assert!(err.to_string().contains("does not exist"), "{err}");
 }

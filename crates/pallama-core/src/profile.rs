@@ -142,9 +142,14 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         argv.push(config.idle_sleep_secs.to_string());
     }
 
-    // --- 9. multi-slot continuous batching (-1 = auto per upstream).
+    // --- 9. slots: 1 = full-speed single client (default, ollama-parity
+    // UX); config 0 = upstream auto multi-slot for concurrent clients.
     argv.push("-np".into());
-    argv.push("-1".into());
+    if input.config.slots == 0 {
+        argv.push("-1".into());
+    } else {
+        argv.push(input.config.slots.to_string());
+    }
 
     // --- 10. rpc + loras
     if !config.rpc_servers.trim().is_empty() {
@@ -418,8 +423,8 @@ mod tests {
         assert!(!p.argv.contains(&"--cache-type-k".to_string()));
         // Rule 8: sleep (GPU present)
         assert!(p.argv.windows(2).any(|w| w[0] == "--sleep-idle-seconds" && w[1] == "300"));
-        // Rule 9: -np -1 (upstream auto encoding)
-        assert!(p.argv.windows(2).any(|w| w[0] == "-np" && w[1] == "-1"));
+        // Rule 9: default single slot (full-speed single client).
+        assert!(p.argv.windows(2).any(|w| w[0] == "-np" && w[1] == "1"));
         // Rule 12: cache-ram default 8192
         assert!(p.argv.windows(2).any(|w| w[0] == "--cache-ram" && w[1] == "8192"));
         assert_eq!(p.ctx, 16384);

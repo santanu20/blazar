@@ -84,13 +84,22 @@ pub struct LlamaCppEngine {
 }
 
 impl LlamaCppEngine {
-    #[must_use] 
+    #[must_use]
     pub fn new(manifest: crate::engine::manifest::Manifest) -> Self {
+        Self::with_env(manifest, Vec::new())
+    }
+
+    /// `env` pairs apply to every spawned child (config `engine_env`).
+    #[must_use]
+    pub fn with_env(
+        manifest: crate::engine::manifest::Manifest,
+        env: Vec<(String, String)>,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(2))
             .build()
             .expect("health client");
-        Self { manifest, http, child_env: Vec::new() }
+        Self { manifest, http, child_env: env }
     }
 
     fn base_url(endpoint: &Endpoint) -> String {

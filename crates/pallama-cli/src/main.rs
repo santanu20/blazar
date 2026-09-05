@@ -38,6 +38,16 @@ enum Cmd {
     Stop,
     /// Pull a model (owner/repo[:QUANT] or catalog name)
     Pull { target: String },
+    /// Import an existing GGUF file (hardlinks by default; --copy for a copy)
+    Import {
+        path: PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        quant: Option<String>,
+        #[arg(long)]
+        copy: bool,
+    },
     /// Remove a model (refuses while running)
     Rm { model: String },
     /// List pulled models
@@ -91,6 +101,8 @@ enum EngineCmd {
     Use { tag: String },
     /// Step back to the previous engine
     Rollback,
+    /// Register a locally built llama-server (pseudo-tag "local")
+    Local { path: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -193,6 +205,7 @@ async fn run(cmd: Cmd) -> Result<()> {
         Cmd::Serve => serve().await,
         Cmd::Stop => stop(),
         Cmd::Pull { target } => pull(&target).await,
+        Cmd::Import { path, name, quant, copy } => import(&path, name, quant, copy),
         Cmd::Rm { model } => rm(&model),
         Cmd::List => list(),
         Cmd::Show { model } => show(&model),
@@ -232,7 +245,12 @@ async fn serve() -> Result<()> {
     );
     println!("config: {}", d.config_file().display());
     println!("data:   {}", d.data_dir.display());
-    let engine = Arc::new(LlamaCppEngine::new(manifest));
+    let engine_env: Vec<(String, String)> = cfg
+        .engine_env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let engine = Arc::new(LlamaCppEngine::with_env(manifest, engine_env));
     let bus = EventBus::default();
     let sup = Arc::new(Supervisor::new(d.clone(), cfg.clone(), bus.clone(), hw, engine));
     for orphan in sup.sweep_orphans() {
@@ -310,6 +328,88 @@ fn humansize(bytes: i64) -> String {
     } else {
         format!("{b:.0} B")
     }
+}
+
+fn import(path: &PathBuf, name: Option<String>, quant: Option<String>, copy: bool) -> Result<()> {
+        let d = dirs();
+    d.ensure().ok();
+    let meta = pallama_core::read_metadata_file(path.as_path())
+        .map_err(|e| anyhow!("not a readable GGUF ({}): {e}", path.display()))?;
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    // Derive: name from GGUF general.name or explicit; quant from filename token.
+    let derived_quant = quant.unwrap_or_else(|| {
+        file_name
+            .to_lowercase()
+            .trim_end_matches(".gguf")
+            .rsplit('-')
+            .next()
+            .unwrap_or("imported")
+            .to_uppercase()
+    });
+    let size = std::fs::metadata(path).map_err(|e| anyhow!("{e}"))?.len();
+    let fsize = size;
+    // Ollama blobs are content-addressed names without quant hints.
+    let model_name = name.unwrap_or_else(|| {
+        meta.name
+            .clone()
+            .unwrap_or_else(|| file_name.trim_end_matches(".gguf").to_string())
+            .to_lowercase()
+            .replace([' ', '.'], "-")
+    });
+    let dest = d.models_dir().join(format!("{model_name}-{}.gguf", derived_quant.to_lowercase()));
+    if !dest.exists() {
+        if copy {
+            std::fs::copy(path, &dest).with_context(|| format!("copy to {}", dest.display()))?;
+        } else {
+            #[cfg(unix)]
+            {
+                // Prefer a hardlink (zero bytes, survives either store being
+                // wiped); the kernel's protected_hardlinks blocks linking
+                // files we do not own (e.g. ollama's system blobs), so fall
+                // back to a symlink in that case.
+                if std::fs::hard_link(path, dest.as_path()).is_err() {
+                    std::os::unix::fs::symlink(path, dest.as_path())
+                        .with_context(|| format!("symlink {}", dest.display()))?;
+                    println!("note: used symlink (hardlink blocked); if the source store deletes the blob, re-import");
+                }
+            }
+        }
+    }
+    let bytes = i64::try_from(fsize).unwrap_or(i64::MAX);
+    let _ = size;
+    let row = pallama_core::ModelRow {
+        name: model_name.clone(),
+        repo: format!("imported:{}", path.display()),
+        quant: derived_quant.clone(),
+        path: dest.display().to_string(),
+        bytes,
+        sha256: None,
+        mmproj_path: None,
+        shards: 1,
+        arch: Some(meta.architecture.clone()),
+        params: Some(pallama_runtime::hf::est_params(fsize, &derived_quant)),
+        ctx_train: meta.context_length.and_then(|c| i64::try_from(c).ok()),
+        pulled_at: i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            )
+            .unwrap_or(i64::MAX),
+    };
+    let store = Store::open(&d)?;
+    store.upsert_model(&row)?;
+    println!(
+        "imported {} ({} {}, arch {}, ctx_train {:?}) -> {}",
+        row.name,
+        humansize(bytes),
+        row.quant,
+        meta.architecture,
+        meta.context_length,
+        dest.display()
+    );
+    println!("zero extra disk used (link, not copy)");
+    Ok(())
 }
 
 fn rm(model: &str) -> Result<()> {
@@ -644,6 +744,18 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             let row = mgr.rollback()?;
             println!("rolled back to: {}", row.tag);
         }
+        EngineCmd::Local { path } => {
+            let mgr = local_engine_manager(&d)?;
+            let row = mgr.register_local(&path, &config()?.engine_env)?;
+            let m: pallama_runtime::Manifest = serde_json::from_str(&row.manifest)?;
+            mgr.use_tag(&row.tag)?;
+            println!(
+                "engine local active (build {}, {} devices, {} flags)",
+                m.build_number,
+                m.devices.len(),
+                m.flags.len()
+            );
+        }
     }
     Ok(())
 }
@@ -739,7 +851,6 @@ async fn fit(target: &str) -> Result<()> {
 }
 
 fn config_cmd(cmd: ConfigCmd) -> Result<()> {
-    let d = dirs();
     match cmd {
         ConfigCmd::List => {
             let cfg = config()?;
@@ -748,22 +859,24 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
         }
         ConfigCmd::Get { key } => {
             let cfg = config()?;
-            let raw = cfg.to_toml()?;
-            for line in raw.lines() {
-                if line.starts_with(&format!("{key} ")) {
-                    println!("{line}");
-                    break;
-                }
+            let raw = cfg.to_toml().map_err(|e| anyhow!("{e}"))?;
+            if let Some(line) = raw
+                .lines()
+                .find(|l| l.starts_with(&format!("{key} =")))
+            {
+                println!("{line}");
+                Ok(())
+            } else {
+                Err(anyhow!("unknown config key: {key}"))
             }
-            Err(anyhow!("unknown config key: {key}"))
         }
         ConfigCmd::Set { key, value } => {
-            let path = d.config_file();
+            let path = dirs().config_file();
             let raw = std::fs::read_to_string(&path).unwrap_or_default();
             let mut out: Vec<String> = Vec::new();
             let mut replaced = false;
             for line in raw.lines() {
-                if line.starts_with(&format!("{key} =")) || line.starts_with(&format!("{key} ")) {
+                if line.starts_with(&format!("{key} =")) {
                     out.push(format!("{key} = {value}"));
                     replaced = true;
                 } else {
@@ -773,11 +886,14 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
             if !replaced {
                 out.push(format!("{key} = {value}"));
             }
-            std::fs::write(&path, out.join("\n") + "\n")?;
-            // Validate immediately: a bad value must fail NOW, not at serve.
-            Config::load(&d).map_err(|e| anyhow!("new config rejected: {e}"))?;
+            let candidate = out.join("\n") + "\n";
+            // Validate BEFORE persisting: a bad value/unknown key must
+            // never leave the file broken.
+            Config::from_toml(&candidate).map_err(|e| anyhow!("rejected, file unchanged: {e}"))?;
+            std::fs::write(&path, &candidate)?;
             println!("{key} = {value}");
             Ok(())
         }
     }
 }
+

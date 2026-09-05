@@ -121,12 +121,21 @@ pub fn openai_chunk_to_ollama(model: &str, chunk: &Value) -> Vec<Value> {
     if let Some(choices) = chunk["choices"].as_array() {
         for choice in choices {
             let delta = &choice["delta"];
-            if delta.get("content").is_some_and(|c| c.as_str().is_some_and(|s| !s.is_empty()))
-                || delta.get("tool_calls").is_some()
-            {
+            let has_content = delta
+                .get("content")
+                .is_some_and(|c| c.as_str().is_some_and(|s| !s.is_empty()));
+            let has_thinking = delta
+                .get("reasoning_content")
+                .is_some_and(|c| c.as_str().is_some_and(|s| !s.is_empty()));
+            if has_content || has_thinking || delta.get("tool_calls").is_some() {
                 let mut msg = json!({"role": "assistant"});
                 if let Some(c) = delta.get("content") {
-                    msg["content"] = c.clone();
+                    if c.as_str().is_some_and(|s| !s.is_empty()) {
+                        msg["content"] = c.clone();
+                    }
+                }
+                if let Some(rc) = delta.get("reasoning_content") {
+                    msg["thinking"] = rc.clone();
                 }
                 if let Some(tc) = delta.get("tool_calls") {
                     msg["tool_calls"] = tc.clone();
@@ -339,6 +348,11 @@ mod tests {
         let o2 = openai_chunk_to_ollama("m", &c2);
         assert_eq!(o2.len(), 1);
         assert!(o2[0]["message"]["tool_calls"].is_array());
+        // Thinking deltas (reasoning_content) map to message.thinking.
+        let c4 = json!({"choices": [{"delta": {"reasoning_content": "hmm"}}]});
+        let o4 = openai_chunk_to_ollama("m", &c4);
+        assert_eq!(o4.len(), 1);
+        assert_eq!(o4[0]["message"]["thinking"], "hmm");
         assert!(openai_chunk_to_ollama("m", &c3).is_empty());
     }
 

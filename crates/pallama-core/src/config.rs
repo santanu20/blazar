@@ -36,6 +36,14 @@ pub struct Config {
     pub rpc_servers: String,
     /// Child prompt-cache budget in MiB; 0 = unlimited.
     pub cache_ram_mb: i64,
+    /// Server slots (`-np`). 1 = full-speed single client (default);
+    /// larger = concurrent clients sharing ctx. 0 = auto.
+    #[serde(default = "default_slots")]
+    pub slots: u32,
+    /// Extra env for engine children + probes (e.g. `GGML_BACKEND_PATH` for
+    /// a local CUDA build).
+    #[serde(default)]
+    pub engine_env: BTreeMap<String, String>,
     pub model_overrides: BTreeMap<String, ModelOverride>,
 }
 
@@ -69,6 +77,8 @@ impl Default for Config {
             api_keys: Vec::new(),
             rpc_servers: String::new(),
             cache_ram_mb: 8192,
+            slots: 1,
+            engine_env: BTreeMap::new(),
             model_overrides: BTreeMap::new(),
         }
     }
@@ -253,6 +263,10 @@ fn parse_u64(key: &str, raw: &str) -> CoreResult<u64> {
 fn parse_i64(key: &str, raw: &str) -> CoreResult<i64> {
     raw.parse::<i64>()
         .map_err(|e| CoreError::Config(format!("invalid {key} {raw:?}: {e}")))
+}
+
+fn default_slots() -> u32 {
+    1
 }
 
 #[cfg(test)]

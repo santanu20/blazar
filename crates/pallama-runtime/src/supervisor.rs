@@ -18,7 +18,6 @@ use pallama_core::profile::{self, Endpoint, ProfileInput};
 use pallama_core::store::Store;
 use pallama_core::{Config, Hardware, ModelRow, PallamaDirs};
 
-use crate::daemon::process_alive_by_pid;
 use crate::events::{EventBus, InstanceState, PallamaEvent};
 
 use crate::engine_impl::{ChildHandle, Engine};
@@ -495,10 +494,10 @@ impl Supervisor {
             .collect()
     }
 
-    /// Startup sweep: a daemon that was SIGKILL'd leaves engine children
-    /// behind (they are in their own process groups). Any `<run>/*.pid`
-    /// marker whose process is still alive belongs to a dead daemon —
-    /// terminate it (single-pid TERM) and clear the marker.
+    /// Startup sweep: a SIGKILL'd daemon leaves engine children behind
+    /// (own process groups). `<run>/<model>.pid` markers whose recorded
+    /// process is still alive get a single-pid TERM; markers are cleared.
+    /// The daemon's own `pallama.pid` and pull locks are NOT engines.
     pub fn sweep_orphans(&self) -> Vec<String> {
         let mut swept = Vec::new();
         let Ok(entries) = std::fs::read_dir(self.dirs.run_dir()) else {
@@ -506,18 +505,17 @@ impl Supervisor {
         };
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            let Some(pid) = name.strip_suffix(".pid").and_then(|p| p.split('-').next_back().map(str::to_string).or_else(|| p.parse::<u32>().ok().map(|_| p.to_string()))) else {
+            #[allow(clippy::case_sensitive_file_extension_comparisons)] // our own marker names
+            if name == "pallama.pid" || name.starts_with("pull-") || !name.ends_with(".pid") {
                 continue;
-            };
-            let _ = pid;
-            // marker file is "<model>.pid" -> pid is the CONTENT
+            }
             let Ok(content) = std::fs::read_to_string(e.path()) else { continue };
             let Ok(pid) = content.trim().parse::<u32>() else { continue };
-            if pid > 1 && process_alive_by_pid(pid) {
+            if pid > 1 && crate::daemon::process_alive_by_pid(pid) {
                 tracing::warn!("orphan engine pid {pid} ({name}) from a dead daemon; terminating");
                 #[cfg(unix)]
                 #[allow(unsafe_code)]
-                // SAFETY: single positive pid read from our own marker file.
+                // SAFETY: single positive pid from our own marker file.
                 unsafe {
                     libc::kill(i32::try_from(pid).unwrap_or(-1), libc::SIGTERM);
                 }
