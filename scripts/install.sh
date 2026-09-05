@@ -88,10 +88,28 @@ install_local() {
     # install_local <binary> <channel-label>
     INSTALL_DIR="${PALLAMA_INSTALL_DIR:-$HOME/.local/bin}"
     mkdir -p "$INSTALL_DIR" || error "cannot create ${INSTALL_DIR}"
-    install -m 0755 "$1" "$INSTALL_DIR/pallama" || error "install to ${INSTALL_DIR} failed"
+    atomic_install "$1" "$INSTALL_DIR/pallama" || error "install to ${INSTALL_DIR} failed"
     VER=$("$INSTALL_DIR/pallama" --version 2>/dev/null || echo "(version check failed)")
     status "Installed pallama ${VER} to ${INSTALL_DIR}/pallama ($2)"
+    notice_running_daemon
     status "Next: pallama engine update && pallama pull <model> && pallama run <model>"
+}
+
+# Replace a possibly-running binary without ETXTBSY: write a temp file,
+# rename over the destination (the running process keeps its inode; new
+# execs get the new binary).
+atomic_install() {
+    # atomic_install <src> <dst>
+    TMP_BIN="${2}.new.$$"
+    install -m 0755 "$1" "$TMP_BIN" || return 1
+    mv -f "$TMP_BIN" "$2"
+}
+
+notice_running_daemon() {
+    PIDFILE="$HOME/.local/share/pallama/run/pallama.pid"
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+        status "NOTE: the pallama daemon is still running the OLD binary; run 'pallama stop' and any command to restart on the new one"
+    fi
 }
 
 find_checkout() {
@@ -164,7 +182,9 @@ if [ -n "$FROM_BIN" ]; then
     if [ "$SYSTEM" = 1 ]; then
         BIN_DIR="${PALLAMA_SYSTEM_BIN_DIR:-/usr/local/bin}"
         $SUDO mkdir -p "$BIN_DIR" || error "cannot create ${BIN_DIR} (need sudo?)"
-        $SUDO install -m 0755 "$FROM_BIN" "$BIN_DIR/pallama" || error "install to ${BIN_DIR} failed"
+        $SUDO install -m 0755 "$FROM_BIN" "$BIN_DIR/pallama.new.$$" &&
+    $SUDO mv -f "$BIN_DIR/pallama.new.$$" "$BIN_DIR/pallama" ||
+    error "install to ${BIN_DIR} failed"
         SVC_USER="${PALLAMA_SERVICE_USER:-$(id -un)}"
         UNIT_PATH="${PALLAMA_UNIT_PATH:-/etc/systemd/system/pallama.service}"
         SYSTEMCTL="${PALLAMA_SYSTEMCTL:-systemctl}"
@@ -295,10 +315,7 @@ NEW="$INSTALL_DIR/pallama.new.$$"
 install -m 0755 "$EXDIR/pallama" "$NEW" || error "cannot write into ${INSTALL_DIR}"
 mv -f "$NEW" "$INSTALL_DIR/pallama"
 
-PIDFILE="$HOME/.local/share/pallama/run/pallama.pid"
-if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
-    status "the pallama daemon is still running the old binary; run 'pallama stop' and any command to restart on ${TAG}"
-fi
+notice_running_daemon
 
 case ":$PATH:" in
     *":$INSTALL_DIR:"*) ;;
