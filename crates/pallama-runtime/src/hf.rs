@@ -524,6 +524,107 @@ fn sibling_part_path(dest: &Path) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// Search + fit (no download)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchEntry {
+    pub id: String,
+    #[serde(default)]
+    pub downloads: Option<u64>,
+    #[serde(default)]
+    pub likes: Option<u64>,
+    #[serde(default)]
+    pub gguf: Option<HfGgufInfo>,
+}
+
+impl HfClient {
+    /// GGUF-filtered model search (complaint #15: discovery beyond a
+    /// registry; any community quant is findable).
+    pub async fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchEntry>> {
+        let url = self
+            .api_base
+            .join(&format!(
+                "api/models?search={}&filter=gguf&limit={limit}&sort=downloads&direction=-1",
+                url_encode_path(query)
+            ))
+            .map_err(|e| anyhow!("bad search URL: {e}"))?;
+        let resp = self.http.get(url).send().await.context("HF search request")?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("HF search returned {}", resp.status()));
+        }
+        resp.json().await.context("decode search results")
+    }
+}
+
+
+/// One row of a fit preview.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FitRow {
+    pub quant: String,
+    pub file: String,
+    pub bytes: u64,
+    pub fits_vram: bool,
+    pub kv_bytes_at_default_ctx: u64,
+    pub recommended_ctx: u32,
+}
+
+/// Pre-download compatibility preview (complaint #14): given a repo's
+/// sibling list, produce per-quant fit rows against the local hardware.
+/// Uses the same KV math as the profile compiler's rule 6.
+#[must_use]
+pub fn fit_rows(
+    siblings: &[HfSibling],
+    vram_bytes: u64,
+    default_ctx: u32,
+) -> Vec<FitRow> {
+        let mut rows = Vec::new();
+    for s in siblings {
+        let lower = s.rfilename.to_lowercase();
+        let Some(stem) = lower.strip_suffix(".gguf") else { continue };
+        if stem.contains("-of-") {
+            continue; // shard parts: fit uses the set total via sibling sums
+        }
+        let bytes = s.lfs.as_ref().and_then(|l| l.size).or(s.size).unwrap_or(0);
+        if bytes == 0 {
+            continue;
+        }
+        let quant = stem.rsplit('-').next().unwrap_or("unknown").to_uppercase();
+        // KV estimate for the default ctx, assuming q8_0 KV when tight
+        // (same trigger as the compiler's rule 6).
+        let kv_f16 = kv_estimate_f16(default_ctx);
+        let fits = bytes + kv_f16.min(kv_f16 / 2) <= vram_bytes;
+        let recommended = if fits {
+            default_ctx
+        } else {
+            // shrink ctx until KV fits alongside the weights
+            let mut ctx = default_ctx;
+            while ctx > 1024 && bytes + kv_estimate_f16(ctx) > vram_bytes {
+                ctx /= 2;
+            }
+            ctx
+        };
+        rows.push(FitRow {
+            quant,
+            file: s.rfilename.clone(),
+            bytes,
+            fits_vram: fits,
+            kv_bytes_at_default_ctx: kv_f16,
+            recommended_ctx: recommended,
+        });
+    }
+    rows.sort_by_key(|r| std::cmp::Reverse(r.bytes));
+    rows
+}
+
+fn kv_estimate_f16(ctx: u32) -> u64 {
+    // Without per-arch metadata pre-download, report a conservative
+    // 1.5 GiB-per-16k KV allowance; the real number comes from GGUF at
+    // load time (profile rule 6) and is shown in `pallama show`.
+    1_572_864_000u64.saturating_mul(u64::from(ctx)) / 16_384
+}
+
+// ---------------------------------------------------------------------------
 // Pull orchestration
 // ---------------------------------------------------------------------------
 

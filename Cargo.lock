@@ -1257,6 +1257,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "dirs",
+ "futures",
  "indicatif",
  "pallama-core",
  "pallama-gateway",

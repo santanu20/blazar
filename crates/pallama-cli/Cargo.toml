@@ -26,6 +26,7 @@ reqwest = { workspace = true }
 dirs = { workspace = true }
 rustyline = { workspace = true }
 indicatif = { workspace = true }
+futures = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
