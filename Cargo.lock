@@ -1324,6 +1324,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "indicatif",
+ "libc",
  "pallama-core",
  "reqwest",
  "serde",

@@ -109,7 +109,19 @@ async fn serve(host: String, port: u16, alias: String) {
     use axum::routing::{get, post};
     let alias_for_routes = alias.clone();
     let app = axum::Router::new()
-        .route("/health", get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }))
+        .route(
+            "/health",
+            get(|| async {
+                if std::env::var("STUB_HEALTH_NEVER").as_deref() == Ok("1") {
+                    return (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(serde_json::json!({"status": "loading"})),
+                    )
+                        .into_response();
+                }
+                axum::Json(serde_json::json!({"status": "ok"})).into_response()
+            }),
+        )
         .route("/v1/models", get(move || {
             let alias = alias_for_routes.clone();
             async move {

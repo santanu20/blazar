@@ -33,6 +33,7 @@ http-body-util = { workspace = true }
 tokio-stream = { workspace = true }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 sysinfo.workspace = true
+libc = "0.2.189"
 
 [dev-dependencies]
 wiremock = "0.6"

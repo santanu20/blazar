@@ -2,10 +2,13 @@
 //! supervision, event bus, bench runner.
 
 pub mod bench;
+pub mod daemon;
+pub mod engine_impl;
 pub mod engine;
 pub mod events;
 pub mod models;
 pub mod probe;
+pub mod supervisor;
 pub mod hf;
 
 pub use engine::gh::GhClient;
@@ -14,4 +17,7 @@ pub use engine::{system_vendor_hint, EngineManager, LOCAL_TAG};
 pub use events::{EventBus, InstanceState, PallamaEvent};
 pub use hf::{parse_pull_target, registry_name, Puller, PullTarget};
 pub use bench::{parse_bench_json, BenchRow, Tuner};
+pub use daemon::{wait_for_shutdown_signal, DaemonLock};
+pub use engine_impl::{ChildHandle, Engine, LlamaCppEngine};
 pub use probe::probe_hardware;
+pub use supervisor::{PsRow, SupervisionError, Supervisor};
