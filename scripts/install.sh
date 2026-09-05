@@ -66,13 +66,15 @@ pick_libc() {
 WITH_UNIT=0
 SYSTEM=0
 FROM_BIN=
+FORCE_BUILD=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --with-systemd-unit) WITH_UNIT=1 ;;
         --system) SYSTEM=1 ;;
+        --build) FORCE_BUILD=1 ;;
         --from) shift; [ $# -gt 0 ] || error "--from needs a binary path"; FROM_BIN=$1 ;;
         --from=*) FROM_BIN=${1#--from=} ;;
-        *) error "unknown option: $1 (supported: --with-systemd-unit, --system, --from <binary>)" ;;
+        *) error "unknown option: $1 (supported: --with-systemd-unit, --system, --from <binary>, --build)" ;;
     esac
     shift
 done
@@ -100,6 +102,56 @@ if [ -n "$FROM_BIN" ]; then
     [ -x "$FROM_BIN" ] || error "--from: not executable: $FROM_BIN"
     "$FROM_BIN" --version >/dev/null 2>&1 || error "--from: binary does not run: $FROM_BIN"
     status "Bootstrap install from $FROM_BIN (skipping release download)"
+fi
+
+# ---- source-build fallback --------------------------------------------
+# Used when no prebuilt asset can be fetched (offline, rate-limited, exotic
+# target): build the checkout with cargo and install that. Requires a
+# toolchain — the installer never hides a build behind a download.
+
+install_local() {
+    # install_local <binary> <channel-label>
+    INSTALL_DIR="${PALLAMA_INSTALL_DIR:-$HOME/.local/bin}"
+    mkdir -p "$INSTALL_DIR" || error "cannot create ${INSTALL_DIR}"
+    install -m 0755 "$1" "$INSTALL_DIR/pallama" || error "install to ${INSTALL_DIR} failed"
+    VER=$("$INSTALL_DIR/pallama" --version 2>/dev/null || echo "(version check failed)")
+    status "Installed pallama ${VER} to ${INSTALL_DIR}/pallama ($2)"
+    status "Next: pallama engine update && pallama pull <model> && pallama run <model>"
+}
+
+find_checkout() {
+    if [ -n "${PALLAMA_CHECKOUT:-}" ]; then
+        [ -f "$PALLAMA_CHECKOUT/crates/pallama-cli/Cargo.toml" ] && { echo "$PALLAMA_CHECKOUT"; return 0; }
+        return 1
+    fi
+    d=$(cd "$(dirname "$0")" && pwd -P)
+    while [ "$d" != "/" ]; do
+        [ -f "$d/crates/pallama-cli/Cargo.toml" ] && { echo "$d"; return 0; }
+        d=$(dirname "$d")
+    done
+    return 1
+}
+
+build_from_checkout() {
+    REASON="$1"
+    status "fallback: building from source (${REASON})"
+    command -v cargo >/dev/null 2>&1 ||
+        error "${REASON}, and no cargo toolchain found. Install Rust (https://rustup.rs), or download a release asset manually."
+    CK=$(find_checkout) ||
+        error "${REASON}, and no pallama source checkout found near this script (set PALLAMA_CHECKOUT=<repo> to point at one)."
+    status "cargo build --release -p pallama-cli (in ${CK})"
+    (cd "$CK" && cargo build --release -p pallama-cli) ||
+        error "source build failed (cargo output above)"
+    [ -f "$CK/target/release/pallama" ] || error "build produced no target/release/pallama"
+    install_local "$CK/target/release/pallama" "source build in ${CK}"
+    status "All inference is upstream llama.cpp — ggml, ggerganov and contributors did the hard parts."
+    exit 0
+}
+
+# --build: force the source path — audited/offline installs that never
+# touch the release channel. Falls through to the same install tail.
+if [ "$FORCE_BUILD" = 1 ]; then
+    build_from_checkout "--build requested"
 fi
 
 # Repo guard is release-channel only: --from bootstrap and mirror/test
@@ -157,12 +209,7 @@ EOF
         exit 0
     fi
     # --from without --system: plain user-local install of the local build.
-    INSTALL_DIR="${PALLAMA_INSTALL_DIR:-$HOME/.local/bin}"
-    mkdir -p "$INSTALL_DIR" || error "cannot create ${INSTALL_DIR}"
-    install -m 0755 "$FROM_BIN" "$INSTALL_DIR/pallama" || error "install to ${INSTALL_DIR} failed"
-    VER=$("$INSTALL_DIR/pallama" --version 2>/dev/null || echo "(version check failed)")
-    status "Installed pallama ${VER} to ${INSTALL_DIR}/pallama (bootstrap, unverified channel)"
-    status "Next: pallama engine update && pallama pull <model> && pallama run <model>"
+    install_local "$FROM_BIN" "bootstrap, unverified channel"
     exit 0
 fi
 
@@ -183,7 +230,7 @@ RELEASE_PATH="releases/latest"
 [ -n "${PALLAMA_VERSION:-}" ] && RELEASE_PATH="releases/tags/${PALLAMA_VERSION}"
 status "Fetching release metadata from ${API_BASE}/${RELEASE_PATH}"
 JSON=$(fetch "${API_BASE}/${RELEASE_PATH}") ||
-    error "could not fetch release metadata from ${API_BASE} (rate limited? export GITHUB_TOKEN)"
+    build_from_checkout "could not fetch release metadata from ${API_BASE} (offline or rate limited)"
 
 TAG=$(printf '%s' "$JSON" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
 [ -n "$TAG" ] || error "could not parse tag_name from release metadata"
@@ -210,7 +257,8 @@ asset_names() {
 }
 
 URL=$(asset_field browser_download_url)
-[ -n "$URL" ] || error "asset ${ASSET} not found in release ${TAG}. Available: $(asset_names | tr '\n' ' ')"
+[ -n "$URL" ] ||
+    build_from_checkout "no prebuilt asset ${ASSET} in release ${TAG} (available: $(asset_names | tr '\n' ' '))"
 
 DIGEST=$(asset_field digest)
 case "${DIGEST:-}" in

@@ -25,7 +25,7 @@ curl --proto '=https' --tlsv1.2 -fsSL \
 
 `--system` installs system-wide like ollama: binary in `/usr/local/bin` plus a `systemctl` unit (`Restart=always`, GPU groups, auto-start). Omit it for the sudo-free `~/.local/bin` install.
 
-Installs to `~/.local/bin/pallama` (add it to PATH if needed). Older glibc than 2.35, or Alpine? The script automatically falls back to the static musl build. Pin a version with `PALLAMA_VERSION=v0.1.0`, or point at a fork/mirror with `PALLAMA_REPO=owner/pallama`. Add `--with-systemd-unit` (download the script and run `sh install.sh --with-systemd-unit`) to install a `systemctl --user` service instead of the default on-demand auto-start.
+Installs to `~/.local/bin/pallama` (add it to PATH if needed). Older glibc than 2.35, or Alpine? The script automatically falls back to the static musl build. Pin a version with `PALLAMA_VERSION=v0.1.0`, or point at a fork/mirror with `PALLAMA_REPO=owner/pallama`. If no release asset can be fetched (offline, rate-limited, exotic target) the installer falls back to building the local checkout with `cargo` when a toolchain exists — point it at one with `PALLAMA_CHECKOUT=<repo>`. Add `--with-systemd-unit` (download the script and run `sh install.sh --with-systemd-unit`) to install a `systemctl --user` service instead of the default on-demand auto-start.
 
 **Windows (PowerShell):**
 
