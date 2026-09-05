@@ -84,7 +84,13 @@ pub fn copy_model(dirs: &PallamaDirs, src: &str, dst: &str) -> Result<()> {
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let dst_path = dirs.models_dir().join(&leaf);
+    // The alias hardlink MUST live at its own path. Reusing the source's
+    // leaf name made the alias row point at the ORIGINAL file — rm on the
+    // alias then deleted the source (live data-loss incident 2026-09-05).
+    let dst_path = dirs.models_dir().join(format!("{dst}__alias__{leaf}"));
+    if dst_path == src_path {
+        return Err(anyhow!("alias path collides with the source file; refusing"));
+    }
     if !dst_path.exists() {
         std::fs::hard_link(&src_path, &dst_path)
             .map_err(|e| anyhow!("hardlink {} -> {}: {e}", dst_path.display(), src_path.display()))?;
@@ -191,7 +197,10 @@ mod tests {
         .unwrap();
         copy_model(&dirs, "m", "m-alias").unwrap();
         let alias = s.get_model("m-alias").unwrap().unwrap();
-        assert_eq!(alias.path, gguf.display().to_string());
+        // The alias row must point at its OWN path (same-leaf naming made
+        // rm-on-alias delete the source — live incident 2026-09-05).
+        assert_ne!(alias.path, gguf.display().to_string());
+        assert!(alias.path.contains("m-alias__alias__"), "{}", alias.path);
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt as _;

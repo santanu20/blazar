@@ -418,6 +418,29 @@ async fn e2e__ps_and_show() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn e2e__pull_failure_emits_error_line_not_silence() {
+    // Regression (found by scripts/validate.py): take_while dropped the
+    // terminal line, so failed pulls were silent empty 200s (H1). An
+    // invalid target fails before any network — deterministic, offline.
+    let ts = start(Config::default()).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/api/pull", ts.base))
+        .json(&serde_json::json!({"model": "definitely-not-a-real-owner-zzz/nope:Q4_0", "stream": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("\"error\"") || text.contains("error"),
+        "pull failure must reach the client, got: {text:?}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn e2e__responses_api_proxied_byte_faithful() {
     let ts = start(Config::default()).await;
     let c = client();

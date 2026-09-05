@@ -320,18 +320,33 @@ pub async fn pull(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let rx2 = bus.subscribe();
     let name_for_stream = target.clone();
     let events = tokio_stream::wrappers::BroadcastStream::new(rx2);
-    let paired = TsExt::filter_map(events, move |ev| {
-        let name = name_for_stream.clone();
-        match ev {
-            Ok(e) => {
-                let (line, terminal) = pull_event_line(&name, &e);
-                Some((Ok::<_, std::io::Error>(Bytes::from(line)), terminal))
+    // Emit-then-STOP: the terminal line (success/error) must reach the
+    // client AND the stream must end right after it. `take_while` drops
+    // the item that trips the predicate (silencing bogus-repo failures
+    // into empty 200s); a bare filter_map never ends the body. The
+    // unfold state machine gives both guarantees.
+    let stream = futures::stream::unfold(
+        (events, false, name_for_stream),
+        |(mut events, done, name)| async move {
+            if done {
+                return None;
             }
-            Err(_) => None,
-        }
-    });
-    let taken = TsExt::take_while(paired, |(_, terminal)| !*terminal);
-    let stream = futures::StreamExt::map(taken, |(item, _)| item);
+            loop {
+                match events.next().await {
+                    Some(Ok(e)) => {
+                        let (line, terminal) = pull_event_line(&name, &e);
+                        return Some((
+                            Ok::<_, std::io::Error>(Bytes::from(line)),
+                            (events, terminal, name),
+                        ));
+                    }
+                    // Broadcast lag yields Err: skip it, keep streaming.
+                    Some(Err(_)) => {}
+                    None => return None,
+                }
+            }
+        },
+    );
 
     // Drive the pull on a task; stream events until ModelPulled/PullFailed.
     let pull_request = target.clone();
@@ -550,6 +565,9 @@ async fn proxy_core_chat(
             }
             Err(e) => {
                 tracing::warn!(model, "nonstream upstream failed: {e:#}");
+                // Reap now so the NEXT request respawns instead of
+                // 502-looping until the periodic reaper notices (~10s).
+                state.sup.reap_dead_children().await;
                 return api_error(502, &format!("engine request failed: {e:#}"));
             }
         };
@@ -616,7 +634,11 @@ async fn proxy_core_chat(
         .await
     {
         Ok(r) => r,
-        Err(e) => return api_error(502, &format!("engine request failed: {e:#}")),
+        Err(e) => {
+            // Same crash-recovery contract as the OpenAI proxy path.
+            state.sup.reap_dead_children().await;
+            return api_error(502, &format!("engine request failed: {e:#}"));
+        }
     };
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
