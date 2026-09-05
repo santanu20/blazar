@@ -1,0 +1,319 @@
+//! Capability manifest: probe an installed llama-server binary once and
+//! store what it actually supports. The profile compiler emits ONLY flags
+//! present in `flags`; a needed-but-missing flag is a hard error naming
+//! the flag and suggesting `pallama engine use <tag>` — never a guess.
+//! `--list-devices` output is PLAIN TEXT (verified against upstream
+//! common/arg.cpp): `  NAME: DESC (TOTAL MiB, FREE MiB free)`.
+
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::process::Command;
+
+use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceDesc {
+    pub name: String,
+    pub description: String,
+    pub total_mib: u64,
+    pub free_mib: u64,
+}
+
+impl DeviceDesc {
+    /// GPU vendor inferred from the device description substring (upstream
+    /// descriptions: "NVIDIA CUDA", "AMD `ROCm`", "Intel SYCL", "Vulkan ...").
+    #[must_use] 
+    pub fn vendor(&self) -> Vendor {
+        // Vulkan-backend descriptions are often generic ("Vulkan"); the
+        // device name carries the vendor instead.
+        let d = format!("{} {}", self.name, self.description).to_lowercase();
+        if d.contains("nvidia") || d.contains("cuda") {
+            Vendor::Nvidia
+        } else if d.contains("amd") || d.contains("rocm") {
+            Vendor::Amd
+        } else if d.contains("intel") || d.contains("sycl") {
+            Vendor::Intel
+        } else {
+            Vendor::Other
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Vendor {
+    Nvidia,
+    Amd,
+    Intel,
+    Other,
+}
+
+/// Everything Pallama knows about one installed engine build.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Manifest {
+    pub tag: String,
+    pub build_number: u64,
+    pub version_raw: String,
+    pub devices: Vec<DeviceDesc>,
+    /// Every long flag (`--ctx-size`) accepted by this binary, from `--help`.
+    pub flags: BTreeSet<String>,
+    /// Speculative-decoding types accepted by `--spec-type`, when advertised.
+    pub spec_types: Vec<String>,
+    /// Absolute path to the llama-server binary.
+    pub server_path: String,
+}
+
+impl Manifest {
+    #[must_use] 
+    pub fn has_flag(&self, flag: &str) -> bool {
+        self.flags.contains(flag)
+    }
+
+    /// Assert every flag in `needed` exists; error names the first missing
+    /// one plus remediation.
+    pub fn require_flags(&self, needed: &[&str]) -> Result<()> {
+        for f in needed {
+            if !self.has_flag(f) {
+                return Err(anyhow!(
+                    "engine {tag} does not support {f} (from its --help); \
+                     try `pallama engine update` for a newer build or \
+                     `pallama engine use <tag>` for an older one",
+                    tag = self.tag,
+                    f = f
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Probe a llama-server binary: version, devices, flags.
+pub fn probe(server_path: &Path, tag: &str) -> Result<Manifest> {
+    let server = server_path
+        .to_str()
+        .ok_or_else(|| anyhow!("non-UTF-8 engine path {}", server_path.display()))?;
+
+    let out = Command::new(server)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("run {server} --version"))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "{server} --version exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let version_text = String::from_utf8_lossy(&out.stdout).to_string();
+    let (build_number, version_raw) = parse_version(&version_text)?;
+
+    let out = Command::new(server)
+        .arg("--list-devices")
+        .output()
+        .with_context(|| format!("run {server} --list-devices"))?;
+    // Upstream exits 0 here even when listing; tolerate non-zero but parse stdout.
+    let devices = parse_devices(&String::from_utf8_lossy(&out.stdout));
+
+    let out = Command::new(server)
+        .arg("--help")
+        .output()
+        .with_context(|| format!("run {server} --help"))?;
+    let help = String::from_utf8_lossy(&out.stdout).to_string();
+    let (flags, spec_types) = parse_help(&help);
+
+    Ok(Manifest {
+        tag: tag.to_string(),
+        build_number,
+        version_raw,
+        devices,
+        flags,
+        spec_types,
+        server_path: server.to_string(),
+    })
+}
+
+/// Parse `version: 5900 (commit)` style output; the first integer after
+/// "version:" is the build number.
+fn parse_version(text: &str) -> Result<(u64, String)> {
+    let line = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("version:"))
+        .ok_or_else(|| anyhow!("no `version:` line in --version output: {text:?}"))?;
+    let num = line
+        .split(':')
+        .nth(1)
+        .and_then(|rest| {
+            rest.split_whitespace()
+                .next()
+                .and_then(|tok| tok.parse::<u64>().ok())
+        })
+        .ok_or_else(|| anyhow!("cannot parse build number from {line:?}"))?;
+    Ok((num, line.trim().to_string()))
+}
+
+/// Parse `  NAME: DESC (TOTAL MiB, FREE MiB free)` device lines.
+fn parse_devices(text: &str) -> Vec<DeviceDesc> {
+    let mut out = Vec::new();
+    for line in text.lines().skip_while(|l| !l.contains("Available devices:")) {
+        let line = line.trim();
+        if line.is_empty() || line.contains("Available devices") || line == "(none)" {
+            continue;
+        }
+        // NAME: DESC (TOTAL MiB, FREE MiB free)
+        let Some((name, rest)) = line.split_once(':') else { continue };
+        let Some(open) = rest.rfind('(') else { continue };
+        let Some(close) = rest[open..].find(')') else { continue };
+        let desc = rest[..open].trim().to_string();
+        let mem = &rest[open + 1..open + close];
+        // "8192 MiB, 7000 MiB free"
+        let nums: Vec<u64> = mem
+            .split([',', ' '])
+            .filter_map(|t| t.parse::<u64>().ok())
+            .collect();
+        if nums.len() < 2 {
+            continue;
+        }
+        out.push(DeviceDesc {
+            name: name.trim().to_string(),
+            description: desc,
+            total_mib: nums[0],
+            free_mib: nums[1],
+        });
+    }
+    out
+}
+
+/// Extract every long flag from `--help` text plus the `--spec-type`
+/// value list when present.
+fn parse_help(help: &str) -> (BTreeSet<String>, Vec<String>) {
+    let mut flags = BTreeSet::new();
+    let mut spec_types = Vec::new();
+    for line in help.lines() {
+        let trimmed = line.trim_start();
+        // Option-table rows start with tokens like `-c, --ctx-size N` or
+        // `--spec-type none,draft-simple,...`. Scan every whitespace token.
+        for tok in trimmed.split_whitespace() {
+            if let Some(long) = tok.strip_prefix("--") {
+                let clean = long
+                    .trim_end_matches(',')
+                    .split('=')
+                    .next()
+                    .unwrap_or(long)
+                    .to_string();
+                // Reject value placeholders attached with spaces? Values are
+                // separate tokens; keep alphabetic-dash names only.
+                if clean
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                    && !clean.is_empty()
+                    && clean.len() > 1
+                {
+                    flags.insert(format!("--{clean}"));
+                }
+            }
+        }
+        if trimmed.contains("--spec-type") {
+            // e.g. `--spec-type none,draft-simple,draft-eagle3,...`
+            let list = trimmed
+                .split_whitespace()
+                .find(|t| t.starts_with("none,") || t.contains(",draft-") || t.contains(",ngram-"))
+                .unwrap_or("");
+            let values: Vec<String> = list
+                .split(',')
+                .map(|v| v.trim().to_string())
+                .filter(|v| {
+                    !v.is_empty()
+                        && v.chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                })
+                .collect();
+            if values.len() > 1 {
+                spec_types = values;
+            }
+        }
+    }
+    (flags, spec_types)
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unit__parse_version__upstream_shape() {
+        let (n, raw) = parse_version("version: 10816 (deadbeef)\nbuilt with cc").unwrap();
+        assert_eq!(n, 10816);
+        assert!(raw.contains("10816"));
+    }
+
+    #[test]
+    fn unit__parse_version__missing__error() {
+        assert!(parse_version("llama.server\n").is_err());
+    }
+
+    #[test]
+    fn unit__parse_devices__upstream_shape() {
+        let text = "Available devices:\n  NVIDIA GeForce RTX 4070: NVIDIA CUDA (8188 MiB, 7000 MiB free)\n  Intel iGPU: Vulkan (32768 MiB, 24000 MiB free)\n";
+        let d = parse_devices(text);
+        assert_eq!(d.len(), 2);
+        assert_eq!(d[0].name, "NVIDIA GeForce RTX 4070");
+        assert_eq!(d[0].description, "NVIDIA CUDA");
+        assert_eq!((d[0].total_mib, d[0].free_mib), (8188, 7000));
+        assert_eq!(d[0].vendor(), Vendor::Nvidia);
+        assert_eq!(d[1].vendor(), Vendor::Intel);
+    }
+
+    #[test]
+    fn unit__parse_devices__none_case() {
+        let d = parse_devices("Available devices:\n  (none)\n");
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn unit__parse_help__flags_and_spec_types() {
+        let help = "\
+usage: llama-server [options]
+
+options:
+  -h, --help            show this help message and exit
+  -v, --version         show version information and exit
+  --mlock               force system to keep model in RAM etc.
+  -c, --ctx-size N      size of the prompt context (default: 0)
+  -ngl, --gpu-layers N  max. number of layers (default: auto)
+  --spec-type none,draft-simple,draft-eagle3,ngram-simple  types of speculative decoding
+  -fa, --flash-attn [on|off|auto]
+";
+        let (flags, spec) = parse_help(help);
+        for expected in ["--help", "--version", "--mlock", "--ctx-size", "--gpu-layers", "--flash-attn", "--spec-type"] {
+            assert!(flags.contains(expected), "missing {expected} in {flags:?}");
+        }
+        assert_eq!(
+            spec,
+            vec![
+                "none".to_string(),
+                "draft-simple".to_string(),
+                "draft-eagle3".to_string(),
+                "ngram-simple".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn unit__manifest_require_flags__names_missing_flag_and_remediation() {
+        let m = Manifest {
+            tag: "b100".into(),
+            build_number: 100,
+            version_raw: "version: 100 (x)".into(),
+            devices: vec![],
+            flags: BTreeSet::from(["--jinja".to_string()]),
+            spec_types: vec![],
+            server_path: "/x".into(),
+        };
+        assert!(m.require_flags(&["--jinja"]).is_ok());
+        let err = m.require_flags(&["--jinja", "--spec-draft-model"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--spec-draft-model") && msg.contains("engine use"), "{msg}");
+    }
+}

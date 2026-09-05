@@ -36,6 +36,44 @@ fn main() {
         return;
     }
 
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        // llama-server-like option table: exercises the manifest parser.
+        println!("usage: llama-server [options]");
+        println!();
+        println!("options:");
+        println!("  -h, --help            show this help message and exit");
+        println!("  -v, --version         show version information and exit");
+        println!("  --list-devices        print list of available devices and exit");
+        println!("  -m, --model FNAME     model path to load");
+        println!("  -a, --alias STRING    set model name aliases");
+        println!("  --host HOST           ip to listen");
+        println!("  --port PORT           port to listen");
+        println!("  -c, --ctx-size N      size of the prompt context");
+        println!("  -t, --threads N       number of CPU threads");
+        println!("  -ngl, --gpu-layers N  layers in VRAM (auto)");
+        println!("  -fa, --flash-attn [on|off|auto]");
+        println!("  --jinja               use jinja templates");
+        println!("  --metrics             prometheus metrics endpoint");
+        println!("  --cache-reuse N       KV-shift chunk reuse");
+        println!("  -ctk, --cache-type-k TYPE");
+        println!("  -ctv, --cache-type-v TYPE");
+        println!("  -cmoe, --cpu-moe      keep MoE on CPU");
+        println!("  --sleep-idle-seconds SECONDS");
+        println!("  -np, --parallel N     server slots");
+        println!("  -cb, --cont-batching  continuous batching");
+        println!("  --rpc SERVERS         rpc servers");
+        println!("  --lora FNAME          lora adapter");
+        println!("  --lora-scaled FNAME:SCALE");
+        println!("  -cram, --cache-ram N  cache size in MiB");
+        println!("  -mm, --mmproj FILE    multimodal projector");
+        println!("  -fit, --fit [on|off]  adjust args to fit device memory");
+        println!("  --spec-type none,draft-simple,draft-eagle3,draft-mtp,ngram-simple types of speculative decoding");
+        println!("  --spec-draft-model FNAME");
+        println!("  --spec-draft-n-max N");
+        println!("  --slots               slots endpoint");
+        return;
+    }
+
     if args.iter().any(|a| a == "--list-devices") {
         let devices = std::env::var("STUB_DEVICES")
             .unwrap_or_else(|_| "STUB0: stub-gpu (8192 MiB, 8192 MiB free)".into());
