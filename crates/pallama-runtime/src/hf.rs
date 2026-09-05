@@ -344,8 +344,9 @@ impl HfClient {
         });
         let http = reqwest::Client::builder()
             .redirect(policy)
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(10))
+            // Downloads are multi-hundred-MB: no total cap, bounded stalls.
+            .connect_timeout(Duration::from_secs(30))
+            .read_timeout(Duration::from_mins(2))
             .build()
             .context("build HF http client")?;
         Ok(Self {

@@ -62,6 +62,21 @@ impl Drop for DaemonLock {
     }
 }
 
+/// Shared with the supervisor's orphan sweep.
+#[cfg(unix)]
+#[allow(unsafe_code)] // existence probe via signal 0 to one exact pid
+#[must_use]
+pub fn process_alive_by_pid(pid: u32) -> bool {
+    // SAFETY: signal 0 performs no action; single positive pid, no group.
+    unsafe { libc::kill(i32::try_from(pid).unwrap_or(-1), 0) == 0 }
+}
+
+#[cfg(not(unix))]
+#[must_use]
+pub fn process_alive_by_pid(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
 #[cfg(unix)]
 #[allow(unsafe_code)] // existence probe via signal 0 to one exact pid
 fn process_alive(pid: u32) -> bool {

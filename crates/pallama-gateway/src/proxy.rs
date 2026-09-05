@@ -154,6 +154,7 @@ pub async fn proxy_request(
     headers: &HeaderMap,
     body: axum::body::Bytes,
     load_ms: u128,
+    body_guard: Option<InFlightGuard>,
 ) -> Response {
     let base = child_base(&engine.endpoint);
     if base.is_empty() {
@@ -177,6 +178,9 @@ pub async fn proxy_request(
         Ok(r) => r,
         Err(e) => {
             tracing::error!(model, "proxy {path_query}: {e:#}");
+            // The child may have crashed: reap it now so the NEXT request
+            // respawns instead of 502-looping on a stale entry.
+            state.sup.reap_dead_children().await;
             return openai_error(502, &format!("engine request failed: {e:#}"));
         }
     };
@@ -196,13 +200,41 @@ pub async fn proxy_request(
     let stream = resp.bytes_stream().map(|r| {
         r.map_err(|e| std::io::Error::other(e.to_string()))
     });
+    // Hold in-flight accounting for the body's lifetime: the guard drops
+    // when the client drains (or aborts) the stream.
+    let stream = stream.chain(futures::stream::unfold(body_guard, |g| async {
+        drop(g);
+        None
+    }));
     builder
         .body(Body::from_stream(stream))
         .unwrap_or_else(|e| openai_error(500, &format!("proxy body: {e}")))
 }
 
-/// Bracket a proxied request with supervisor accounting; signal the
-/// admission queue when a slot frees.
+/// Holds in-flight accounting until dropped. The gateway wraps every
+/// streamed response body in one, so a 30-minute generation still counts
+/// as in-flight (the reaper never evicts under load).
+pub struct InFlightGuard {
+    state: Arc<AppState>,
+    model: String,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.state.sup.end_request(&self.model);
+        self.state.queue.signal_free();
+    }
+}
+
+/// Begin accounting and return the guard; the response path holds it for
+/// the body's lifetime.
+#[must_use]
+pub fn begin_accounting(state: &Arc<AppState>, model: &str) -> InFlightGuard {
+    state.sup.begin_request(model);
+    InFlightGuard { state: state.clone(), model: model.to_string() }
+}
+
+/// Bracket a NON-streaming request (accounting ends with the future).
 pub async fn with_accounting<T>(
     state: &Arc<AppState>,
     model: &str,

@@ -56,7 +56,9 @@ impl GhClient {
         }
         let http = reqwest::Client::builder()
             .default_headers(headers)
-            .timeout(std::time::Duration::from_secs(30))
+            // Release assets are 30-400 MB: connect/read timeouts, no total cap.
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .read_timeout(std::time::Duration::from_mins(2))
             .build()
             .context("build GitHub client")?;
         Ok(Self {

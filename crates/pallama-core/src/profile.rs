@@ -142,9 +142,9 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         argv.push(config.idle_sleep_secs.to_string());
     }
 
-    // --- 9. multi-slot continuous batching
+    // --- 9. multi-slot continuous batching (-1 = auto per upstream).
     argv.push("-np".into());
-    argv.push("auto".into());
+    argv.push("-1".into());
 
     // --- 10. rpc + loras
     if !config.rpc_servers.trim().is_empty() {
@@ -245,7 +245,7 @@ fn kv_quant_eligible(
     }
     match (
         input.gguf.block_count,
-        input.gguf.head_count_kv,
+        input.gguf.head_count_kv.or(input.gguf.head_count),
         input.gguf.derived_head_dim(),
     ) {
         (Some(blocks), Some(kv_heads), Some(head_dim)) => {
@@ -418,8 +418,8 @@ mod tests {
         assert!(!p.argv.contains(&"--cache-type-k".to_string()));
         // Rule 8: sleep (GPU present)
         assert!(p.argv.windows(2).any(|w| w[0] == "--sleep-idle-seconds" && w[1] == "300"));
-        // Rule 9: -np auto
-        assert!(p.argv.windows(2).any(|w| w[0] == "-np" && w[1] == "auto"));
+        // Rule 9: -np -1 (upstream auto encoding)
+        assert!(p.argv.windows(2).any(|w| w[0] == "-np" && w[1] == "-1"));
         // Rule 12: cache-ram default 8192
         assert!(p.argv.windows(2).any(|w| w[0] == "--cache-ram" && w[1] == "8192"));
         assert_eq!(p.ctx, 16384);
@@ -463,14 +463,18 @@ mod tests {
     }
 
     #[test]
-    fn unit__kv_quant__missing_field_skips_with_named_warning() {
+    fn unit__kv_quant__head_count_kv_missing_falls_back_to_head_count() {
+        // Upstream llama.cpp defaults head_count_kv = head_count when the
+        // GGUF omits it (no-GQA models like qwen2.5-0.5b) — same rule here.
         let mut g = meta();
-        g.head_count_kv = None;
+        g.head_count_kv = None; // falls back to head_count 16
         let cfg = Config::default();
         let hw = gpu_hw(5_500, 32_000, 8);
         let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &TuningOverrides::default()).unwrap();
-        assert!(!p.argv.contains(&"--cache-type-k".to_string()));
-        assert!(p.warnings.iter().any(|w| w.contains("head_count_kv")));
+        // KV with 16 heads vs 8 is bigger; 5GiB model + KV on 5.4GiB VRAM
+        // crosses the 0.9x threshold either way -> q8_0 engaged, no warning.
+        assert!(p.argv.contains(&"--cache-type-k".to_string()));
+        assert!(!p.warnings.iter().any(|w| w.contains("head_count_kv")));
     }
 
     #[test]

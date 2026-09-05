@@ -13,7 +13,7 @@ pub fn probe_hardware(manifest: Option<&Manifest>) -> Hardware {
         .physical_core_count()
         .map_or(1, |c| u32::try_from(c).unwrap_or(1))
         .max(1);
-    let total_ram_mib = sys.total_memory() / 1024;
+    let total_ram_mib = sys.total_memory() / (1024 * 1024); // sysinfo returns bytes
     let gpus = manifest
         .map(|m| {
             m.devices

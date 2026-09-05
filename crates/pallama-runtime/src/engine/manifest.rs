@@ -105,7 +105,12 @@ pub fn probe(server_path: &Path, tag: &str) -> Result<Manifest> {
             String::from_utf8_lossy(&out.stderr)
         ));
     }
-    let version_text = String::from_utf8_lossy(&out.stdout).to_string();
+    // Upstream prints the version banner to STDERR (verified b10816);
+    // tolerate either stream.
+    let mut version_text = String::from_utf8_lossy(&out.stderr).to_string();
+    if !version_text.contains("version") {
+        version_text = String::from_utf8_lossy(&out.stdout).to_string();
+    }
     let (build_number, version_raw) = parse_version(&version_text)?;
 
     let out = Command::new(server)
@@ -133,23 +138,31 @@ pub fn probe(server_path: &Path, tag: &str) -> Result<Manifest> {
     })
 }
 
-/// Parse `version: 5900 (commit)` style output; the first integer after
-/// "version:" is the build number.
+/// Parse the version banner. Upstream shape (b10816, stderr):
+/// `version: 0.4.0-dev (build 10816, commit 427291b5b)`.
+/// The `build NNNN` token is authoritative; fall back to the first
+/// integer after `version:`.
 fn parse_version(text: &str) -> Result<(u64, String)> {
     let line = text
         .lines()
         .find(|l| l.trim_start().starts_with("version:"))
         .ok_or_else(|| anyhow!("no `version:` line in --version output: {text:?}"))?;
-    let num = line
-        .split(':')
+    let build = line
+        .split("build")
         .nth(1)
         .and_then(|rest| {
-            rest.split_whitespace()
-                .next()
+            rest.split(|c: char| !c.is_ascii_digit())
+                .find(|tok| !tok.is_empty())
+                .and_then(|tok| tok.parse::<u64>().ok())
+        })
+        .or_else(|| {
+            line.split(':')
+                .nth(1)
+                .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).find(|t| !t.is_empty()))
                 .and_then(|tok| tok.parse::<u64>().ok())
         })
         .ok_or_else(|| anyhow!("cannot parse build number from {line:?}"))?;
-    Ok((num, line.trim().to_string()))
+    Ok((build, line.trim().to_string()))
 }
 
 /// Parse `  NAME: DESC (TOTAL MiB, FREE MiB free)` device lines.
@@ -246,6 +259,15 @@ mod tests {
         let (n, raw) = parse_version("version: 10816 (deadbeef)\nbuilt with cc").unwrap();
         assert_eq!(n, 10816);
         assert!(raw.contains("10816"));
+    }
+
+    #[test]
+    fn unit__parse_version__real_b10816_banner() {
+        // Verified live: stderr, "build NNNN, commit X" inside parens.
+        let text = "version: 0.4.0-dev (build 10816, commit 427291b5)\nbuilt with GNU 11.4.0 for Linux x86_64\n";
+        let (n, raw) = parse_version(text).unwrap();
+        assert_eq!(n, 10816);
+        assert!(raw.starts_with("version: 0.4.0-dev"));
     }
 
     #[test]

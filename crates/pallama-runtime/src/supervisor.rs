@@ -18,6 +18,7 @@ use pallama_core::profile::{self, Endpoint, ProfileInput};
 use pallama_core::store::Store;
 use pallama_core::{Config, Hardware, ModelRow, PallamaDirs};
 
+use crate::daemon::process_alive_by_pid;
 use crate::events::{EventBus, InstanceState, PallamaEvent};
 
 use crate::engine_impl::{ChildHandle, Engine};
@@ -417,6 +418,7 @@ impl Supervisor {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
+                mgr.reap_dead_children().await;
                 mgr.reap_once().await;
             }
         })
@@ -491,6 +493,39 @@ impl Supervisor {
                 }
             })
             .collect()
+    }
+
+    /// Startup sweep: a daemon that was SIGKILL'd leaves engine children
+    /// behind (they are in their own process groups). Any `<run>/*.pid`
+    /// marker whose process is still alive belongs to a dead daemon —
+    /// terminate it (single-pid TERM) and clear the marker.
+    pub fn sweep_orphans(&self) -> Vec<String> {
+        let mut swept = Vec::new();
+        let Ok(entries) = std::fs::read_dir(self.dirs.run_dir()) else {
+            return swept;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Some(pid) = name.strip_suffix(".pid").and_then(|p| p.split('-').next_back().map(str::to_string).or_else(|| p.parse::<u32>().ok().map(|_| p.to_string()))) else {
+                continue;
+            };
+            let _ = pid;
+            // marker file is "<model>.pid" -> pid is the CONTENT
+            let Ok(content) = std::fs::read_to_string(e.path()) else { continue };
+            let Ok(pid) = content.trim().parse::<u32>() else { continue };
+            if pid > 1 && process_alive_by_pid(pid) {
+                tracing::warn!("orphan engine pid {pid} ({name}) from a dead daemon; terminating");
+                #[cfg(unix)]
+                #[allow(unsafe_code)]
+                // SAFETY: single positive pid read from our own marker file.
+                unsafe {
+                    libc::kill(i32::try_from(pid).unwrap_or(-1), libc::SIGTERM);
+                }
+                swept.push(format!("{name}={pid}"));
+            }
+            let _ = std::fs::remove_file(e.path());
+        }
+        swept
     }
 
     /// Queue a ctx override for the model's next spawn (per-request

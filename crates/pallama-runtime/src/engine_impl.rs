@@ -124,7 +124,10 @@ impl Engine for LlamaCppEngine {
         cmd.args(argv)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            // If the owning process dies without teardown, the child must
+            // not linger (test leakage, daemon crash).
+            .kill_on_drop(true);
         #[cfg(unix)]
         {
             // Own process group: SIGTERM to the group takes down the whole

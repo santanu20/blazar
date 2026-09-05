@@ -21,9 +21,12 @@ use pallama_core::profile::{self, Endpoint, Profile, ProfileInput, TuningOverrid
 use pallama_core::store::{ProfileRow, Store};
 use pallama_core::{ModelOverride, PallamaDirs};
 
+/// One `llama-bench` result row. Accepts both dialects:
+/// - real `-o json` (verified b10816): `avg_ts`, `n_prompt`/`n_gen`
+/// - stub / older: `t/s`, `test`
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct BenchRow {
-    #[serde(rename = "t/s")]
+    #[serde(rename = "t/s", alias = "avg_ts", default)]
     pub ts: f64,
     #[serde(default)]
     pub test: String,
@@ -35,6 +38,26 @@ pub struct BenchRow {
     pub type_k: Option<String>,
     #[serde(default, rename = "type_v")]
     pub type_v: Option<String>,
+    #[serde(default)]
+    pub n_prompt: Option<u64>,
+    #[serde(default)]
+    pub n_gen: Option<u64>,
+}
+
+impl BenchRow {
+    /// Test name: explicit, or derived (`n_gen == 0` -> `pp`, else `tg`).
+    #[must_use]
+    pub fn test_name(&self) -> String {
+        if !self.test.is_empty() {
+            return self.test.clone();
+        }
+        match (self.n_prompt, self.n_gen) {
+            (Some(p), Some(0)) => format!("pp{p}"),
+            (Some(0), Some(g)) => format!("tg{g}"),
+            (Some(p), Some(_)) => format!("pp{p} @ tg"),
+            _ => String::new(),
+        }
+    }
 }
 
 /// Everything `tune` needs to compile+benchmark+persist a profile.
@@ -100,13 +123,11 @@ impl Tuner<'_> {
     ) -> Result<(Profile, TuningOverrides, Vec<BenchRow>)> {
         let base = profile::compile(input, &TuningOverrides::default())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let base_ctx = base.ctx;
+        let _ = base;
         let threads = input.hardware.physical_cores.max(1);
-        // KV-quant eligibility: only meaningful when the heuristic could
-        // have engaged (GPU-resident); still bench both for data.
+        // Grid axes llama-bench actually supports (verified b10816):
+        // threads x KV-quant. (No -c axis: ctx is a server-launch knob.)
         let mut grid = vec![
-            "-c".into(),
-            format!("{},{}", base_ctx, base_ctx / 2),
             "-t".into(),
             format!("{},{}", threads, threads.saturating_sub(2).max(1)),
             "-ctk".into(),
@@ -117,19 +138,19 @@ impl Tuner<'_> {
         grid.extend(default_bench_args());
         let grid_rows = self.run(Path::new(input.model_path), &grid)?;
 
-        // Argmax by mean tg t/s across (ctx, threads, quant) combos.
-        let mut best: Option<(f64, u64, u64, bool)> = None; // (score, ctx, threads, quant)
-        for (ctx, nthreads, quant) in combos(&grid_rows) {
-            let score = mean_tg(&grid_rows, ctx, nthreads, quant);
+        // Argmax by mean tg t/s across (threads, quant) combos.
+        let mut best: Option<(f64, u64, bool)> = None; // (score, threads, quant)
+        for (nthreads, quant) in combos(&grid_rows) {
+            let score = mean_tg(&grid_rows, nthreads, quant);
             if best.as_ref().is_none_or(|(b, ..)| score > *b) {
-                best = Some((score, ctx, nthreads, quant));
+                best = Some((score, nthreads, quant));
             }
         }
-        let Some((score, best_ctx, best_threads, best_quant)) = best else {
+        let Some((score, best_threads, best_quant)) = best else {
             return Err(anyhow!("llama-bench produced no tg rows"));
         };
         let winning = TuningOverrides {
-            ctx: Some(u32::try_from(best_ctx).context("ctx overflow")?),
+            ctx: None,
             threads: Some(u32::try_from(best_threads).context("thread count overflow")?),
             kv_quant: Some(best_quant),
         };
@@ -140,28 +161,25 @@ impl Tuner<'_> {
     }
 }
 
-fn combos(rows: &[BenchRow]) -> Vec<(u64, u64, bool)> {
+fn combos(rows: &[BenchRow]) -> Vec<(u64, bool)> {
     let mut seen = BTreeSet::new();
     for r in rows {
-        if !r.test.starts_with("tg") {
+        if !r.test_name().starts_with("tg") {
             continue;
         }
-        let key = (
-            r.n_ctx.unwrap_or(0),
+        seen.insert((
             r.n_threads.unwrap_or(0),
             r.type_k.as_deref() == Some("q8_0") && r.type_v.as_deref() == Some("q8_0"),
-        );
-        seen.insert(key);
+        ));
     }
     seen.into_iter().collect()
 }
 
-fn mean_tg(rows: &[BenchRow], ctx: u64, threads: u64, quant: bool) -> f64 {
+fn mean_tg(rows: &[BenchRow], threads: u64, quant: bool) -> f64 {
     let hits: Vec<f64> = rows
         .iter()
         .filter(|r| {
-            r.test.starts_with("tg")
-                && r.n_ctx.unwrap_or(0) == ctx
+            r.test_name().starts_with("tg")
                 && r.n_threads.unwrap_or(0) == threads
                 && (r.type_k.as_deref() == Some("q8_0") && r.type_v.as_deref() == Some("q8_0"))
                     == quant
@@ -306,6 +324,8 @@ mod tests {
             n_threads: Some(threads),
             type_k: Some(k.into()),
             type_v: Some(v.into()),
+            n_prompt: None,
+            n_gen: None,
         }
     }
 
@@ -332,10 +352,10 @@ mod tests {
             row("tg128", 110.0, 4096, 6, "q8_0", "q8_0"),
             row("pp512", 900.0, 8192, 8, "f16", "f16"),
         ];
-        assert!((mean_tg(&rows, 8192, 8, true) - 140.0).abs() < 1e-9);
-        assert!((mean_tg(&rows, 8192, 8, false) - 100.0).abs() < 1e-9);
-        assert!((mean_tg(&rows, 4096, 6, true) - 110.0).abs() < 1e-9);
-        assert!((mean_tg(&rows, 1, 1, false) - 0.0).abs() < 1e-9);
+        assert!((mean_tg(&rows, 8, true) - 140.0).abs() < 1e-9);
+        assert!((mean_tg(&rows, 8, false) - 100.0).abs() < 1e-9);
+        assert!((mean_tg(&rows, 6, true) - 110.0).abs() < 1e-9);
+        assert!((mean_tg(&rows, 1, false) - 0.0).abs() < 1e-9);
         let c = combos(&rows);
         assert_eq!(c.len(), 3);
     }

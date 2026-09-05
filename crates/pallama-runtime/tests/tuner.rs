@@ -86,9 +86,6 @@ fn all_flags() -> BTreeSet<String> {
     .collect()
 }
 
-/// Env vars are process-global; serialize tests that touch them.
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[test]
 #[allow(non_snake_case)]
 fn integration__bench_default__parses_stub_rows() {
@@ -115,22 +112,18 @@ fn integration__tune_search__adopts_argmax_and_persists() {
     let overlay = ModelOverride::default();
     let inp = test_input(&model_str, &hw, &cfg, &flags, &overlay);
 
-    // STUB_BASE_CTX makes the stub score any non-base ctx +3 t/s; with the
-    // +50 q8_0 bonus and +threads, the deterministic winner is
-    // (ctx/2, threads 8, q8_0). See stub_llama_bench.rs.
-    let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    std::env::set_var("STUB_BASE_CTX", "16384");
+    // Grid axes: threads x kv-quant (llama-bench b10816 has no -c axis).
+    // Stub scoring: +threads, +50 for q8_0 -> winner (threads 8, q8_0).
     let tuner = Tuner { dirs: &dirs, bench_bin: bench_bin() };
     let store = Store::open(&dirs).unwrap();
     let (profile, winning, rows) = tuner.tune_search(&store, &inp).unwrap();
-    std::env::remove_var("STUB_BASE_CTX");
 
     assert!(!rows.is_empty());
     assert!(winning.kv_quant.unwrap(), "stub rewards q8_0 by +50 t/s");
     assert_eq!(winning.threads.unwrap(), 8);
-    assert_eq!(winning.ctx.unwrap(), 8192, "half-ctx +3 bonus wins over base");
+    assert!(winning.ctx.is_none(), "ctx is not a bench axis");
     assert!(profile.argv.windows(2).any(|w| w[0] == "--cache-type-k" && w[1] == "q8_0"));
-    assert!(profile.argv.windows(2).any(|w| w[0] == "--ctx-size" && w[1] == "8192"));
+    assert!(profile.argv.windows(2).any(|w| w[0] == "--threads" && w[1] == "8"));
 
     let stored = store.get_profile("qwen3-8b", "b-stub").unwrap().unwrap();
     let argv: Vec<String> = serde_json::from_str(&stored.args_json).unwrap();

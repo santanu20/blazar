@@ -235,6 +235,9 @@ async fn serve() -> Result<()> {
     let engine = Arc::new(LlamaCppEngine::new(manifest));
     let bus = EventBus::default();
     let sup = Arc::new(Supervisor::new(d.clone(), cfg.clone(), bus.clone(), hw, engine));
+    for orphan in sup.sweep_orphans() {
+        println!("swept orphan engine: {orphan}");
+    }
     let _reaper = sup.spawn_reaper();
     let state = Arc::new(pallama_gateway::state::AppState::new(
         d.clone(), cfg.clone(), sup.clone(), bus,
@@ -294,13 +297,16 @@ async fn pull(target: &str) -> Result<()> {
     Ok(())
 }
 
+const MIB_F64: f64 = 1_048_576.0;
+const GIB_F64: f64 = 1_073_741_824.0;
+
 #[allow(clippy::cast_precision_loss)] // display rounding only
 fn humansize(bytes: i64) -> String {
-    let b = f64::from(i32::try_from(bytes.clamp(0, i64::from(i32::MAX))).unwrap_or(0));
-    if b >= 1e9 {
-        format!("{b:.1} GiB")
-    } else if b >= 1e6 {
-        format!("{b:.0} MiB")
+    let b = bytes.max(0) as f64;
+    if b >= GIB_F64 {
+        format!("{:.1} GiB", b / GIB_F64)
+    } else if b >= MIB_F64 {
+        format!("{:.0} MiB", b / MIB_F64)
     } else {
         format!("{b:.0} B")
     }
@@ -529,7 +535,7 @@ fn bench(model: &str) -> Result<()> {
     for r in rows {
         println!(
             "{:<10} {:>8.2} {:>8} {:>6} {:<6} {:<6}",
-            r.test,
+            r.test_name(),
             r.ts,
             r.n_ctx.unwrap_or(0),
             r.n_threads.unwrap_or(0),
@@ -685,15 +691,13 @@ async fn search(query: &str) -> Result<()> {
         println!("no GGUF repos matched {query:?}");
         return Ok(());
     }
-    println!("{:<48} {:>10} {:>6} {:>10}", "REPO", "DOWNLOADS", "LIKES", "GGUF");
+    println!("{:<48} {:>10} {:>6}", "REPO", "DOWNLOADS", "LIKES");
     for r in results {
-        let total = r.gguf.as_ref().and_then(|g| g.total).unwrap_or(0);
         println!(
-            "{:<48} {:>10} {:>6} {:>10}",
+            "{:<48} {:>10} {:>6}",
             r.id,
             r.downloads.unwrap_or(0),
-            r.likes.unwrap_or(0),
-            humansize(i64::try_from(total).unwrap_or(i64::MAX))
+            r.likes.unwrap_or(0)
         );
     }
     Ok(())

@@ -13,7 +13,7 @@ use serde_json::json;
 
 use pallama_core::store::Store;
 
-use crate::proxy::{ensure_with_admission, openai_error, path_and_query, proxy_request, with_accounting};
+use crate::proxy::{begin_accounting, ensure_with_admission, openai_error, path_and_query, proxy_request};
 use crate::queue::Priority;
 use crate::state::AppState;
 
@@ -66,19 +66,18 @@ pub async fn openai_proxy(
     };
     let model_name = engine.name.clone();
 
-    with_accounting(&state, &model_name, async {
-        proxy_request(
-            &state,
-            &engine,
-            &model_name,
-            &method,
-            &path_and_query(&uri),
-            &headers,
-            body,
-            load_ms,
-        )
-        .await
-    })
+    let guard = begin_accounting(&state, &model_name);
+    proxy_request(
+        &state,
+        &engine,
+        &model_name,
+        &method,
+        &path_and_query(&uri),
+        &headers,
+        body,
+        load_ms,
+        Some(guard),
+    )
     .await
 }
 
@@ -116,10 +115,8 @@ pub async fn lora_adapters(
         path_and_query(&uri).trim_start_matches("/v1/adapters")
     );
     let name = engine.name.clone();
-    with_accounting(&state, &name, async {
-        proxy_request(&state, &engine, &name, &method, &url, &headers, body, load_ms).await
-    })
-    .await
+    let guard = begin_accounting(&state, &name);
+    proxy_request(&state, &engine, &name, &method, &url, &headers, body, load_ms, Some(guard)).await
 }
 
 /// GET /healthz — liveness of the gateway itself (children not required).
