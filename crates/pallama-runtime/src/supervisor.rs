@@ -69,6 +69,9 @@ pub struct PsRow {
     pub in_flight: i64,
     pub ctx: u32,
     pub pid: u32,
+    /// Model bytes on disk (0 in router mode — the front child serves
+    /// many models and owns no single size).
+    pub bytes: i64,
 }
 
 pub struct Supervisor {
@@ -292,6 +295,7 @@ impl Supervisor {
                 overlay: &overlay,
                 loras: &loras,
                 draft_path: None,
+                mmproj_path: m.mmproj_path.as_deref(),
                 engine_tag: &manifest.tag,
                 supported_flags: &manifest.flags,
                 endpoint: Endpoint::Tcp { host: "127.0.0.1".into(), port: 0 },
@@ -483,6 +487,7 @@ impl Supervisor {
                 overlay: &overlay,
                 loras: &loras,
                 draft_path: draft_path.as_deref(),
+                mmproj_path: model.mmproj_path.as_deref(),
                 engine_tag: &manifest.tag,
                 supported_flags: &manifest.flags,
                 endpoint: endpoint.clone(),
@@ -698,6 +703,7 @@ impl Supervisor {
                     in_flight: i.in_flight.load(Ordering::SeqCst),
                     ctx: i.profile_ctx,
                     pid: i.pid,
+                    bytes: i.model.bytes,
                 }
             })
             .collect()

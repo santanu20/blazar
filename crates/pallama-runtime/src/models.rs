@@ -54,6 +54,28 @@ pub fn remove_model(dirs: &PallamaDirs, name: &str) -> Result<()> {
         files.push(PathBuf::from(mm));
     }
 
+    // Shared-asset guard: aliases reference the SAME mmproj (and are
+    // hardlinks of the same weights). Deleting this row must never
+    // destroy a file another row still points at — the incident class
+    // that ate the real 875 MiB projector via `rm <alias>`, twice.
+    let other_paths: Vec<String> = store
+        .list_models()?
+        .into_iter()
+        .filter(|m| m.name != row.name)
+        .flat_map(|m| {
+            let mut v = vec![m.path];
+            if let Some(mm) = m.mmproj_path {
+                v.push(mm);
+            }
+            v
+        })
+        .collect();
+    files.retain(|f| {
+        !other_paths
+            .iter()
+            .any(|p| std::path::Path::new(p.as_str()) == f.as_path())
+    });
+
     for f in files {
         if f.exists() {
             std::fs::remove_file(&f)

@@ -101,11 +101,23 @@ pub async fn tags(State(state): State<Arc<AppState>>) -> Response {
     let rows: Vec<Value> = models
         .iter()
         .map(|m| {
+            // One logical model = LLM + projector: the reported size is the
+            // full on-disk footprint (multimodal models ship both).
+            let mm_bytes = m
+                .mmproj_path
+                .as_ref()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map_or(0, |md| i64::try_from(md.len()).unwrap_or(i64::MAX));
+            let details_vision = m.mmproj_path.as_ref().map(|p| json!({
+                "mmproj": p,
+                "mmproj_bytes": mm_bytes,
+            }));
             json!({
                 "name": format!("{}:{}", m.name, m.quant.to_lowercase()),
                 "model": format!("{}:{}", m.name, m.quant.to_lowercase()),
                 "modified_at": iso(m.pulled_at),
-                "size": m.bytes,
+                "size": m.bytes.saturating_add(mm_bytes),
+                "vision": details_vision,
                 "digest": m.sha256.clone().unwrap_or_default(),
                 "details": {
                     "family": m.arch.clone().unwrap_or_default(),
@@ -225,7 +237,7 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
             json!({
                 "name": p.name,
                 "model": p.name,
-                "size": 0,
+                "size": p.bytes,
                 "pallama_state": p.state,
                 "pallama_ctx": p.ctx,
                 "pallama_in_flight": p.in_flight,

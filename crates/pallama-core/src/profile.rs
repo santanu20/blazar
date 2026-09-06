@@ -34,6 +34,10 @@ pub struct ProfileInput<'a> {
     pub loras: &'a [(String, f64)],
     /// Local path of the pulled draft model when spec=auto resolved one.
     pub draft_path: Option<&'a str>,
+    /// Multimodal projector pulled alongside the model (vision/audio-in).
+    /// Emitted as `-mm` when the engine supports it; the store's
+    /// `mmproj_path` feeds this (rule 19).
+    pub mmproj_path: Option<&'a str>,
     pub engine_tag: &'a str,
     /// Capability manifest flag set of the ACTIVE engine.
     pub supported_flags: &'a BTreeSet<String>,
@@ -257,9 +261,23 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         argv.push("--reasoning-format".into());
         argv.push(config.reasoning_format.clone());
     }
+    // --- 19. multimodal projector: the pulled mmproj wires vision/
+    // audio-in into the engine. Explicit `extra_args` -mm wins; a pulled
+    // projector on an engine without the flag warns (model still loads,
+    // vision off) — never silently, never fatally.
     if let Some(mmproj) = overlay.extra_args.as_deref().and_then(find_mmproj_arg) {
         argv.push("-mm".into());
         argv.push(mmproj.to_string());
+    } else if let Some(mmproj) = input.mmproj_path {
+        if input.supported_flags.contains("--mmproj") || input.supported_flags.contains("-mm") {
+            argv.push("-mm".into());
+            argv.push(mmproj.to_string());
+        } else {
+            eprintln!(
+                "pallama profile: model {} has a multimodal projector but engine {} lacks -mm/--mmproj; vision disabled (engine update)",
+                input.model_name, input.engine_tag
+            );
+        }
     }
 
     // --- 14. persistent n-gram speculative cache: the lookup table
@@ -410,7 +428,14 @@ fn kv_quant_ladder(
     ctx: u32,
     warnings: &mut Vec<String>,
 ) -> Option<&'static str> {
-    let gpu_resident = input.hardware.has_gpu() && input.model_bytes <= vram_bytes;
+    // The multimodal projector is GPU-resident too — capacity math that
+    // ignores it OOMs at load on vision models (live incident).
+    let mmproj_bytes = input
+        .mmproj_path
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map_or(0, |m| m.len());
+    let resident = input.model_bytes.saturating_add(mmproj_bytes);
+    let gpu_resident = input.hardware.has_gpu() && resident <= vram_bytes;
     if !gpu_resident {
         return None;
     }
@@ -427,12 +452,12 @@ fn kv_quant_ladder(
                 .saturating_mul(u64::from(ctx))
                 .saturating_mul(2);
             let budget = vram_bytes / 10 * 9;
-            if input.model_bytes.saturating_add(kv) <= budget {
+            if resident.saturating_add(kv) <= budget {
                 None
-            } else if input.model_bytes.saturating_add(kv / 2) <= budget {
+            } else if resident.saturating_add(kv / 2) <= budget {
                 Some("q8_0")
             } else {
-                if input.model_bytes.saturating_add(kv / 4) > budget {
+                if resident.saturating_add(kv / 4) > budget {
                     warnings.push(
                         "KV q4_0 engaged but weights+KV still exceed 90% VRAM; --fit will shrink ctx or the engine may OOM — consider a smaller quant".into(),
                     );
@@ -707,6 +732,7 @@ mod tests {
             overlay: &DEFAULT_OVERLAY,
             loras: &[],
             draft_path: None,
+            mmproj_path: None,
             engine_tag: "b-test",
             supported_flags: flags,
             endpoint: Endpoint::Tcp { host: "127.0.0.1".into(), port: 12345 },
@@ -1240,6 +1266,53 @@ mod tests {
         assert!(p.argv.windows(2).any(|w| w[0] == "-mm" && w[1] == "/models/mmproj.gguf"));
         // The raw --mmproj passthrough also remains (harmless duplicate of
         // intent; llama-server takes the last one).
+    }
+
+    #[test]
+    fn unit__mmproj_from_store__emitted_when_engine_supports() {
+        // Rule 19: a pulled mmproj wires vision automatically (the gap
+        // that left downloaded projectors dead on disk).
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        inp.mmproj_path = Some("/models/mmproj-F16.gguf");
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv.windows(2).any(|w| w[0] == "-mm" && w[1] == "/models/mmproj-F16.gguf"),
+            "pulled projector must reach the engine: {:?}",
+            p.argv
+        );
+    }
+
+    #[test]
+    fn unit__mmproj_store__extra_args_override_wins() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        inp.mmproj_path = Some("/models/pulled.gguf");
+        let overlay = ModelOverride {
+            extra_args: Some(vec!["--mmproj".into(), "/models/custom.gguf".into()]),
+            ..Default::default()
+        };
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p.argv.windows(2).any(|w| w[0] == "-mm" && w[1] == "/models/custom.gguf"));
+        assert!(!p.argv.windows(2).any(|w| w[0] == "-mm" && w[1] == "/models/pulled.gguf"));
+    }
+
+    #[test]
+    fn unit__mmproj_store__unsupported_engine_skips_with_warning() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let mut flags = ALL_FLAGS.clone();
+        flags.retain(|f| f != "--mmproj" && f != "-mm");
+        let mut inp = input(&g, &hw, &cfg, &flags);
+        inp.mmproj_path = Some("/models/mmproj-F16.gguf");
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.iter().any(|a| a == "-mm"), "no -mm without manifest support");
     }
 
 }

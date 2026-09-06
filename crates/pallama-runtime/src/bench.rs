@@ -409,6 +409,7 @@ pub fn build_input<'a>(
         overlay,
         loras,
         draft_path,
+        mmproj_path: None, // vision is irrelevant to llama-bench scoring
         engine_tag,
         supported_flags,
         endpoint,

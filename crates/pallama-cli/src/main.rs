@@ -880,13 +880,26 @@ fn list() -> Result<()> {
         println!("no models pulled; try `pallama pull qwen3-0.6b` or `pallama search <query>`");
         return Ok(());
     }
-    println!("{:<28} {:<8} {:>10}  {:<8} {:>8}  PATH", "NAME", "QUANT", "SIZE", "ARCH", "CTX");
+    println!(
+        "{:<28} {:<8} {:>10}  {:<8} {:>8}  PATH",
+        "NAME", "QUANT", "SIZE", "ARCH", "CTX"
+    );
     for m in models {
+        // Multimodal visibility: the projector is a real on-disk cost the
+        // user otherwise cannot see anywhere (list was LLM-bytes only).
+        let size = match &m.mmproj_path {
+            Some(p) => {
+                let mm = std::fs::metadata(p)
+                    .map_or(0, |md| i64::try_from(md.len()).unwrap_or(i64::MAX));
+                format!("{} +{} vision", humansize(m.bytes), humansize(mm))
+            }
+            None => humansize(m.bytes),
+        };
         println!(
             "{:<28} {:<8} {:>10}  {:<8} {:>8}  {}",
             m.name,
             m.quant,
-            humansize(m.bytes),
+            size,
             m.arch.as_deref().unwrap_or("?"),
             m.ctx_train.map_or_else(String::new, |c| c.to_string()),
             m.path

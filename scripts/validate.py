@@ -87,6 +87,20 @@ def mem_available_mib() -> int:
     return 0
 
 
+def model_bytes_mib() -> int:
+    try:
+        db = sqlite3.connect(os.path.join(REAL_DATA, "pallama.db"))
+        row = db.execute(
+            "SELECT bytes FROM models WHERE name = ?", (MODEL,)
+        ).fetchone()
+        db.close()
+        if row and row[0]:
+            return int(row[0]) // (1024 * 1024)
+    except Exception:
+        pass
+    return 5500  # conservative default for a ~9B Q4 model
+
+
 def total_mem_mib() -> int:
     with open("/proc/meminfo") as f:
         for line in f:
@@ -188,9 +202,15 @@ class Daemon:
         else:
             cfg = dict(cfg)
             cfg.setdefault("port", PORT)
-        if mem_available_mib() < MEM_FLOOR_MIB:
+        # Dynamic floor: the model + working headroom. A co-resident
+        # engine (the user's own daemon) eats the same budget — fail
+        # LOUD instead of thrashing swap for minutes.
+        need = int(model_bytes_mib() * 1.25) + 1024
+        if mem_available_mib() < max(MEM_FLOOR_MIB, need):
             raise RuntimeError(
-                f"MemAvailable {mem_available_mib()} MiB < floor {MEM_FLOOR_MIB}; refusing to load"
+                f"MemAvailable {mem_available_mib()} MiB < needed ~{need} MiB "
+                f"(model {model_bytes_mib()} MiB + headroom). A co-resident pallama/ollama "
+                f"engine is likely holding memory: stop it for the validation window."
             )
         self.sb.write_config(cfg)
         log = open(self.log_path, "ab")
@@ -987,6 +1007,8 @@ def main() -> int:
     SANDBOX = Sandbox()
     DAEMON = Daemon(SANDBOX)
 
+    failed = any(not c["ok"] for c in CHECKS)
+
     def _cleanup() -> None:
         if DAEMON:
             try:
@@ -994,7 +1016,10 @@ def main() -> int:
             except Exception:
                 pass
         if SANDBOX:
-            SANDBOX.destroy()
+            if failed:
+                print(f"post-mortem sandbox kept: {SANDBOX.root} (daemon log: {DAEMON.log_path})")
+            else:
+                SANDBOX.destroy()
     atexit.register(_cleanup)
 
     phases = [

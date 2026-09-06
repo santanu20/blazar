@@ -59,6 +59,7 @@ fn test_input<'a>(
     overlay: &'a ModelOverride,
 ) -> ProfileInput<'a> {
     ProfileInput {
+        mmproj_path: None,
         model_name: "qwen3-8b",
         model_path,
         model_bytes: 5_000 * 1024 * 1024,

@@ -56,3 +56,11 @@ pedantic = { level = "warn", priority = -1 }
 # failure modes; per-fn "# Errors" doc sections are noise here.
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+
+[profile.dev]
+# Full DWARF was eating 12G of target/; line tables keep backtraces
+# line-accurate at a fraction of the size (disk hit 92%).
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"

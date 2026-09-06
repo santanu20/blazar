@@ -68,6 +68,32 @@ fn unit__copy_then_rm_alias__source_file_survives() {
 }
 
 #[test]
+fn unit__rm_alias__shared_mmproj_survives() {
+    // The twice-lived incident: alias rows share the source's mmproj;
+    // rm on the alias must not delete a file the source still needs.
+    let (_tmp, dirs) = setup("m4");
+    let store = Store::open(&dirs).unwrap();
+    let mm = dirs.models_dir().join("mmproj-F16.gguf");
+    std::fs::write(&mm, b"projector-bytes").unwrap();
+    let mut src = store.get_model("m4").unwrap().unwrap();
+    src.mmproj_path = Some(mm.display().to_string());
+    store.upsert_model(&src).unwrap();
+
+    copy_model(&dirs, "m4", "alias4").unwrap();
+    let alias_mm = store.get_model("alias4").unwrap().unwrap().mmproj_path;
+    assert_eq!(alias_mm.as_deref(), Some(mm.display().to_string().as_str()),
+               "alias shares the source projector");
+
+    remove_model(&dirs, "alias4").unwrap();
+    assert!(mm.exists(), "shared mmproj must survive rm of the alias");
+    assert!(store.get_model("m4").unwrap().is_some());
+
+    // Deleting the SOURCE (last referencer) may reclaim the projector.
+    remove_model(&dirs, "m4").unwrap();
+    assert!(!mm.exists(), "last reference gone -> projector reclaimed");
+}
+
+#[test]
 fn unit__copy_alias__distinct_path_named_after_destination() {
     let (_tmp, dirs) = setup("m2");
     copy_model(&dirs, "m2", "my-alias").unwrap();
