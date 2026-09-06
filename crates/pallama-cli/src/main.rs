@@ -881,25 +881,30 @@ fn list() -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<28} {:<8} {:>10}  {:<8} {:>8}  PATH",
-        "NAME", "QUANT", "SIZE", "ARCH", "CTX"
+        "{:<26} {:<8} {:>9}  {:<10} {:<8} {:>7}  PATH",
+        "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX"
     );
     for m in models {
         // Multimodal visibility: the projector is a real on-disk cost the
         // user otherwise cannot see anywhere (list was LLM-bytes only).
-        let size = match &m.mmproj_path {
-            Some(p) => {
+        let vision = m.mmproj_path.as_ref().map_or_else(
+            || "-".to_string(),
+            |p| {
                 let mm = std::fs::metadata(p)
                     .map_or(0, |md| i64::try_from(md.len()).unwrap_or(i64::MAX));
-                format!("{} +{} vision", humansize(m.bytes), humansize(mm))
-            }
-            None => humansize(m.bytes),
-        };
+                if mm > 0 {
+                    format!("+{}", humansize(mm))
+                } else {
+                    "missing!".to_string()
+                }
+            },
+        );
         println!(
-            "{:<28} {:<8} {:>10}  {:<8} {:>8}  {}",
+            "{:<26} {:<8} {:>9}  {:<10} {:<8} {:>7}  {}",
             m.name,
             m.quant,
-            size,
+            humansize(m.bytes),
+            vision,
             m.arch.as_deref().unwrap_or("?"),
             m.ctx_train.map_or_else(String::new, |c| c.to_string()),
             m.path
