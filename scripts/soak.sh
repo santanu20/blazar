@@ -53,7 +53,7 @@ total=$(tail -n +2 "$CSV" | wc -l)
 echo "================ SOAK SUMMARY ================"
 echo "requests: $total   failures: $fail   duration: ${MINUTES}m"
 echo "p99 ms by kind:"
-tail -n +2 "$CSV" | awk -F, '$6==1 {k[$3]=k[$3]" "$5} END {for (x in k) {n=split(k[x],a," "); asort(a); printf "  %-14s p50=%.0f p99=%.0f\n", x, a[int(n/2)*1], a[n]}'}
+tail -n +2 "$CSV" | awk -F, '$6==1 {k[$3]=k[$3]" "$5} END {for (x in k) {n=split(k[x],a," "); asort(a); printf "  %-14s p50=%.0f p99=%.0f\n", x, a[int(n/2)*1], a[n]}}'
 awk -F, '$6==0 {print "FAILED: iter",$2,$3,"status",$4}' "$CSV" | head -10
 [ "$fail" -eq 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL ($fail failures)"
-exit $([ "$fail" -eq 0 ] && echo 0 || echo 1)
+exit "$([ "$fail" -eq 0 ] && echo 0 || echo 1)"

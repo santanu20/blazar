@@ -1,0 +1,23 @@
+# winget manifest template for pallama.
+# Publishing: winget-pkgs PR (or your own repo). Replace OWNER + Version
+# + InstallerSha256 per release; the asset is the same Windows zip the
+# install.ps1 channel uses.
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.singleton.1.6.0.schema.json
+PackageIdentifier: OWNER.pallama
+PackageVersion: VERSION
+PackageName: pallama
+Publisher: OWNER
+License: MIT OR Apache-2.0
+ShortDescription: Local-first llama.cpp orchestrator (OpenAI + ollama APIs)
+PackageUrl: https://github.com/OWNER/pallama
+Installers:
+  - Architecture: x64
+    InstallerType: zip
+    InstallerUrl: https://github.com/OWNER/pallama/releases/download/VERSION/pallama-VERSION-x86_64-pc-windows-msvc.zip
+    InstallerSha256: FILL_PER_RELEASE
+    NestedInstallerType: portable
+    NestedInstallerFiles:
+      - RelativeFilePath: pallama.exe
+        PortableCommandAlias: pallama
+ManifestType: singleton
+ManifestVersion: 1.6.0

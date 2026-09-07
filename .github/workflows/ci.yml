@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    name: fmt + clippy + workspace tests
+    runs-on: ubuntu-22.04 # the glibc floor the release binaries target
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace -- --test-threads=1
+
+  scripts:
+    name: shellcheck + installer e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: shellcheck -S warning scripts/*.sh tests/install_e2e.sh
+      - run: sh tests/install_e2e.sh

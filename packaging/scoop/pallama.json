@@ -1,0 +1,24 @@
+{
+  "version": "0.3.0",
+  "description": "Local-first llama.cpp orchestrator: OpenAI + ollama APIs, zero-fork engine management",
+  "homepage": "https://github.com/OWNER/pallama",
+  "license": "MIT OR Apache-2.0",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/OWNER/pallama/releases/download/v0.3.0/pallama-v0.3.0-x86_64-pc-windows-msvc.zip",
+      "hash": "FILL_PER_RELEASE"
+    }
+  },
+  "bin": "pallama.exe",
+  "checkver": {
+    "github": "https://github.com/OWNER/pallama"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/OWNER/pallama/releases/download/$version/pallama-$version-x86_64-pc-windows-msvc.zip"
+      }
+    }
+  },
+  "notes": "Run 'pallama doctor' after install to verify config, engine, and hardware."
+}

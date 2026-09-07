@@ -79,7 +79,11 @@ fn e2e__config_set_numeric_value_stays_numeric() {
         .success();
 
     let raw = std::fs::read_to_string(cfg_root.join("pallama/config.toml")).unwrap();
-    assert_eq!(raw.matches("poll =").count(), 1, "exactly one poll line:\n{raw}");
+    assert_eq!(
+        raw.matches("poll =").count(),
+        1,
+        "exactly one poll line:\n{raw}"
+    );
     assert!(raw.contains("poll = 0"));
     assert!(raw.contains("[engine_env]"));
 }

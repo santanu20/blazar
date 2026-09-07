@@ -16,7 +16,9 @@ fn make_tarball(payload: &[u8]) -> Vec<u8> {
     header.set_size(payload.len() as u64);
     header.set_mode(0o755);
     header.set_cksum();
-    tar_builder.append_data(&mut header, "pallama", payload).unwrap();
+    tar_builder
+        .append_data(&mut header, "pallama", payload)
+        .unwrap();
     let raw = tar_builder.into_inner().unwrap();
     let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     gz.write_all(&raw).unwrap();

@@ -13,23 +13,21 @@ Prebuilt binaries for Linux (x86_64/aarch64, glibc ≥ 2.35 or static musl), mac
 **Linux / macOS (WSL included):**
 
 ```sh
-# from a source checkout (zero arguments: the script ALWAYS builds the
-# checkout fresh with cargo, then installs system-wide with a systemd
-# service - nothing is downloaded):
-sh scripts/install.sh
-
-# force the source path as a user-local install (no release contact):
-sh scripts/install.sh --build
-
 # from a published repo (set PALLAMA_REPO to the owner/name that hosts releases):
 export PALLAMA_REPO=owner/pallama
 curl --proto '=https' --tlsv1.2 -fsSL \
   "https://raw.githubusercontent.com/${PALLAMA_REPO%%/*}/pallama/main/scripts/install.sh" | sh
+
+# from a source checkout (zero arguments: builds the checkout fresh with
+sudo sh scripts/install.sh
+
+# or force the source path explicitly (no release channel contact):
+sudo sh scripts/install.sh --build
 ```
 
-`--system` installs system-wide like ollama: binary in `/usr/local/bin` plus a `systemctl` unit (`Restart=always`, GPU groups, auto-start). Omit it for the sudo-free `~/.local/bin` install.
+Like ollama's installer: **system-wide only** — root-owned binary in `/usr/local/bin` plus a systemd unit (`Restart=always`, GPU groups, auto-start, restart-on-upgrade). There is deliberately no user-path (`~/.local/bin`) install mode: a second copy there is how stale-binary daemon races happen (`pallama doctor` flags any that already exist, and the installer removes one it finds). Root or sudo is required.
 
-Installs to `~/.local/bin/pallama` (add it to PATH if needed). Older glibc than 2.35, or Alpine? The script automatically falls back to the static musl build. Pin a version with `PALLAMA_VERSION=v0.1.0`, or point at a fork/mirror with `PALLAMA_REPO=owner/pallama`. Default behavior is BUILD-FIRST: from a checkout the installer compiles with `cargo` and installs that (zero downloads); a checkout-less `curl | sh` run uses the verified release channel instead. Set `PALLAMA_CHECKOUT=<repo>` to make a remote run build. Add `--with-systemd-unit` (download the script and run `sh install.sh --with-systemd-unit`) to install a `systemctl --user` service instead of the default on-demand auto-start.
+From a checkout the installer compiles fresh with `cargo` first (never a stale `target/release`); a checkout-less `curl | sh` uses the sha256-verified release channel. Older glibc than 2.35, or Alpine? Automatic fallback to the static musl build. Pin a version with `PALLAMA_VERSION=v0.3.0`, a mirror with `PALLAMA_INSTALL_BASE_URL`, or a build repo with `PALLAMA_CHECKOUT`.
 
 **Windows (PowerShell):**
 
@@ -39,20 +37,21 @@ $env:PALLAMA_REPO = 'owner/pallama'; irm https://raw.githubusercontent.com/owner
 
 Installs to `%LOCALAPPDATA%\Programs\pallama` and adds it to the user PATH.
 
-**From source:** `cargo install --path crates/pallama-cli` (recent stable Rust).
+**From source:** `sudo cargo install --path crates/pallama-cli` (recent stable Rust) — or just run the installer from the checkout.
 
-**Uninstall:** `pallama stop; rm -f ~/.local/bin/pallama; rm -rf ~/.local/share/pallama ~/.config/pallama ~/.cache/pallama` (Windows: stop pallama in Task Manager, delete `%LOCALAPPDATA%\Programs\pallama`, remove the data dirs under `%LOCALAPPDATA%`/`%USERPROFILE%`).
+**Uninstall:** `sudo sh scripts/install.sh --uninstall` (removes binary + units; your models and config under `~/.local/share/pallama` / `~/.config/pallama` are user data and stay until you delete them).
 
 ## Quickstart
 
 ```sh
-pallama engine update                     # install + activate upstream llama-server (sha256-verified)
+pallama engine update                     # install + activate upstream llama-server (sha256-verified;
+                                           #   regression-gated: >10% decode drop auto-rolls-back; --no-gate skips)
 pallama pull qwen3-0.6b                   # or any owner/repo:QUANT from Hugging Face
 pallama run qwen3-0.6b                    # streaming REPL
 OLLAMA_HOST=http://127.0.0.1:11434 ollama list   # existing ollama clients just work
 ```
 
-OpenAI-compatible: `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/rerank`, `/v1/messages` (Anthropic), `/v1/responses` (Responses API), `/v1/audio/transcriptions` (multipart, audio-capable models), `/infill` (FIM), `/v1/chat/completions/control` (steering vectors), `/v1/chat/completions/input_tokens`, `/v1/responses/input_tokens`, `/v1/messages/count_tokens`, `/tokenize`, `/detokenize`, `/apply-template`, `/v1/adapters` (LoRA). Ollama-compatible: `/api/chat`, `/api/generate`, `/api/tags`, `/api/pull`, `/api/ps`, `/api/show`, `/api/embeddings`, `/api/events`. Pallama-native: `/api/evict`, `/api/session` (slot KV checkpoints), `/api/why` (sentinel record ring), `/api/watch` (live SSE sentinel tail), `X-Pallama-Num-Ctx` request header (per-request ctx on the OpenAI path — the protocol has no such field; same restart-once semantics as `options.num_ctx`), `X-Pallama-Enforce` header (agent loops: 422 on malformed tool calls / schema violations for non-stream requests). Sentinel observes chat-completions, legacy completions, and `/v1/responses` (both stream and non-stream) on both APIs.
+Capability discovery: `GET /.well-known/pallama` (routes, headers, features, engine identity). OpenAI-compatible: `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/rerank`, `/v1/messages` (Anthropic), `/v1/responses` (Responses API), `/v1/audio/transcriptions` (multipart, audio-capable models), `/infill` (FIM), `/v1/chat/completions/control` (steering vectors), `/v1/chat/completions/input_tokens`, `/v1/responses/input_tokens`, `/v1/messages/count_tokens`, `/tokenize`, `/detokenize`, `/apply-template`, `/v1/adapters` (LoRA). Ollama-compatible: `/api/chat`, `/api/generate`, `/api/tags`, `/api/pull`, `/api/ps`, `/api/show`, `/api/embeddings`, `/api/events`. Pallama-native: `/api/evict`, `/api/session` (slot KV checkpoints + `_auto` session bank: KV survives eviction, restored on respawn), `/api/keys` (virtual-key CRUD), `GET /v1/responses/{id}` (stored-response retrieval), `/api/why` (sentinel record ring), `/api/watch` (live SSE sentinel tail), `X-Pallama-Num-Ctx` request header (per-request ctx on the OpenAI path — the protocol has no such field; same restart-once semantics as `options.num_ctx`), `X-Pallama-Enforce` header (agent loops: 422 on malformed tool calls / schema violations for non-stream requests), `X-Pallama-Deadline-Ms` header (SLO: EDF queue ordering; prefill-heavy requests auto-demote one class). Identical non-stream requests single-flight (duplicate waits, then rides the leader's warm prefix). Sentinel observes chat-completions, legacy completions, and `/v1/responses` (both stream and non-stream) on both APIs.
 
 ## Why (ollama complaints → pallama resolutions)
 
@@ -85,7 +84,7 @@ OpenAI-compatible: `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddin
 | `serve` / `stop` | Daemon lifecycle (pidfile-guarded, graceful shutdown) |
 | `pull` / `rm` / `list` / `show` | Model store (plain GGUF files; rm refuses while running) |
 | `run <model>` | Streaming REPL (`/exit /clear /model /sysinfo /profile`) |
-| `ps [--reset]` | Live instances: state, ctx, in-flight, endpoint |
+| `ps [--reset]` | Live instances: state, ctx, **GPU offload** (`full`/`partial`/`cpu`/`auto` — silent CPU fallback is never silent), in-flight, endpoint |
 | `bench` / `tune --search` | `llama-bench` tables; measured argmax profile adoption |
 | `engine list/update/use/rollback` | Upstream engine management with capability manifests |
 | `config list/get/set` | One knob surface (validates on set) |
@@ -99,6 +98,18 @@ OpenAI-compatible: `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddin
 | `watch` | live tail of sentinel detections as they happen (SSE; Ctrl-C to stop) |
 | `router = true` (config) | one child serves ALL models: preset INI auto-generated per model, engine-native autoload + LRU; `pallama stop <model>` becomes an engine unload |
 | `upgrade [--version] [--dry-run]` | Self-update from GitHub Releases (sha256-verified, atomic) |
+| `keys [list]/add/rm/rotate NAME [--models a,b] [--rpm N] [--tpm N] [--daily-tokens N] [--max-concurrent N]` | Virtual API keys: model scoping (wildcards: `qwen3*`, `vllm:*`), rate limits, daily token budgets, per-key concurrency cap (leased at auth, held while the response streams), live usage, secret rotation (`[[keys]]` in config; `x-api-key` works for Anthropic clients; SIGHUP hot-reloads the key set) |
+| `quantize <model> -t Q4_K_M [--imatrix calib.txt] [--name N]` | Derive a new quant with the engine's own llama-quantize; `--imatrix` calibrates an importance matrix first (F16 sources; better Q4 accuracy) |
+| `launch [--warm MODEL] [--key K] <cli> [args...]` | Point any OpenAI/Anthropic/ollama-speaking CLI at pallama (env wired, optional pre-warm) |
+| `whisper [--install] [--pull SIZE] [--list] [<file>]` | Managed STT lane: installs whisper.cpp server from its releases, pulls ggml models (`tiny`…`large-v3-turbo`), transcribes via the lazy local server on `/v1/audio/transcriptions`; `<remote>:model` still forwards |
+| `mmproj <model> <path>` | Attach a vision projector GGUF to an existing model (refuses while running; next spawn gets vision); `import --mmproj <path>` attaches at import time |
+| `tune <model> --slots C` / `--ngram` / `--load` / `--replicas` | Live-concurrency `-np` search (adopts on a >5% win, records the engine-update regression baseline); n-gram grid; warmup A/B (adopts `warmup = false` only if cold load + first token is >5% faster); replica scaling probe (8 clients x 3 gens against 1 vs 2 identical children, adopts `replicas = 2` only if >1.3x aggregate) |
+| `replicas = N` (overlay) | Parallel instances of one model (1..=8): distinct conversation prefixes each get their own warm-cache child (prefix-hash sticky routing); `ps` shows `model#N` |
+| `coreside` | VRAM co-residency plan: which local models fit together (weights + f16 KV @ ctx, hot-first greedy) |
+| `drafts <model>` | Speculative-decoding draft candidates (EAGLE3/MTP heads + small same-family) from live HF search |
+| `completions <bash\|zsh\|fish\|powershell>` | Shell completions to stdout |
+| `snapshot` | Backup config + store to `<data>/snapshots/<ts>/` (models/engines stay: bulk) |
+| `[[remotes]]` (config) | Remote OpenAI-compatible engines (vLLM / MLX / another pallama): `model = "name:model"` routes there; `ps` probes health |
 
 Daemon-dependent commands auto-start `pallama serve` (detached, logs at `~/.local/share/pallama/run/daemon.log`).
 
@@ -113,7 +124,7 @@ idle_sleep_secs = 300     # child-native GPU sleep (frees VRAM, warm wake)
 idle_timeout_secs = 1800  # process eviction after idle
 max_loaded_models = 0     # 0 = auto from VRAM / model size
 child_transport = "tcp"   # "tcp" (curl-debuggable) | "unix"
-engine_asset = "auto"     # or explicit: "ubuntu-vulkan-x64", "win-cuda-13.3-x64", ...
+engine_asset = "auto"     # auto picks by OS/GPU (versioned cuda/rocm = newest); or explicit: "ubuntu-vulkan-x64", ...
 engine_pin = ""           # "" = newest b-tag; else e.g. "b10816"
 spec = "off"              # "auto" = draft-pair speculation when pulled; "ngram" = self-drafting (no draft model)
 cache_reuse = 256         # prefix-cache chunk reuse (0 disables)
@@ -127,22 +138,149 @@ router = false            # ONE llama-server serves every model (upstream router
 router_max_models = 0    # router mode: max concurrently loaded models (0 = upstream default 4)
 slot_prompt_similarity = 0.0  # >0 tunes prefix-affinity slot reuse at slots > 1 (upstream default 0.1; 0 = emit nothing)
 cache_type = ""           # "" auto ladder (q8_0 -> q4_0 by capacity math) | explicit: f16, q8_0, q4_0, ...
+# kv_unified = true       # unset = auto (emits --kv-unified when slots > 1):
+                          #   one shared KV buffer = prefix reuse across sequences
+                          #   (the cheap radix). false = --no-kv-unified. Per-model
+                          #   [model_overrides] kv_unified exists too.
+kv_unified_per_slot = 0   # per-slot token budget inside the unified buffer (0 = off)
+swa_full = false          # keep FULL KV for sliding-window layers (quality at memory cost)
+ctx_checkpoints = 0       # rolling context checkpoints for SWA models
+no_kv_offload = false     # keep all KV on GPU; fail instead of spilling to CPU
+load_mode = ""            # "" | mmap | mlock | direct-io
+spawn_mem_guard = true    # refuse loads when MemAvailable < model/2 + 512 MiB
+                          #   (swap-death prevention; set false to load anyway)
+session_bank = true       # KV checkpoints (_auto) survive eviction; restored on respawn
+prompt_preflight = true   # refuse prompts that cannot fit ctx (exact /tokenize over
+                          #   the 90% estimate threshold) — the engine would silently
+                          #   truncate; set false to allow truncation (sentinel still warns)
+singleflight = true       # identical non-stream chat requests coalesce (5s bound);
+                          #   duplicates ride the leader's warm prefix
 spec_cache = true         # persist n-gram speculation cache across restarts (spec = "ngram")
 sessions = true           # slot KV checkpoints: `pallama session save/restore` (engine-gated)
 ctx_extend = 0.0          # YaRN context extension factor; 0 = off. >1.0..=32.0; quality tradeoff
 cpu_moe_n = 0             # keep N MoE experts on CPU (finer than the auto heuristic)
 override_tensor = []      # upstream --override-tensor entries, e.g. [".ffn_.*_exps.=CPU"]
+devices = []              # explicit --device selection for multi-GPU boxes (names from `pallama doctor`); empty = engine auto
+engine_check_secs = 86400 # background llama.cpp release check (0 = off); result in `doctor`/`ps` — never auto-installs
 agent = false             # child --agent: built-in tools + MCP proxy. WARNING: exec_shell_command
 sentinel = true           # warn-only response-semantics observation: truncation, tool-call validity,
                          #   schema violations, empty replies, stalls -> `pallama why` (never alters bytes)
 sentinel_stall_secs = 30 # stalled-stream threshold (0 = off; 5..=600)
 sentinel_enforce = false  # opt-in hard mode: invalid tool args / unknown tools / schema violations
-                         #   -> 422 on NON-STREAM chat requests (per-request X-Pallama-Enforce: 1|0 overrides;
-                         #   streaming stays warn-only — bytes are already on the wire). Records persist
-                         #   across restarts (run/sentinel.jsonl, bounded)
+                          #   -> 422 on NON-STREAM chat requests (per-request X-Pallama-Enforce: 1|0 overrides;
+                          #   streaming stays warn-only — bytes are already on the wire). Records persist
+                          #   across restarts (run/sentinel.jsonl, bounded)
+tls_cert = ""             # PEM chain + key pair enables HTTPS at the gateway (both-or-neither;
+tls_key = ""              #   validated). Empty = plain HTTP (loopback default)
+cors_origins = []         # e.g. ["https://chat.example"] or ["*"]; empty = no CORS headers
+otlp_endpoint = ""        # OTLP collector URL (e.g. "http://127.0.0.1:4318"): one span per
+                          #   request, batched, bounded. Empty = off
+otlp_service = "pallama"  # service.name on exported spans
+
+[[keys]]                  # virtual API keys (empty set = authless loopback)
+name = "ci"
+key = "plm_..."           # `pallama keys add` generates + shows once
+models = ["qwen3.5-9b"]   # empty = all models (admin: manages keys via /api/keys)
+rpm = 0                   # requests/minute (0 = unlimited)
+tpm = 0                   # tokens/minute, counted from response usage
+daily_tokens = 0          # total tokens per UTC day
+max_concurrent = 0        # parallel in-flight requests (0 = unlimited); leased at
+                          #   auth, held until the response body drains — a held
+                          #   SSE stream occupies a slot, 429 + Retry-After beyond
+
+[[remotes]]               # external OpenAI-compatible engines (vLLM, MLX, another pallama)
+name = "vllm"             # requests with model = "vllm:<id>" route there
+url = "http://10.0.0.4:8000"
+key = ""                  # optional bearer for the remote
 
 [model_overrides."qwen3-coder-30b"]   # per-model overlay; unknown keys are errors
 ctx = 32768
+# Overlay keys: ctx, spec, loras, extra_args, cache_type, kv_unified,
+# ctx_extend, cpu_moe_n, override_tensor, devices, warmup,
+# reasoning_budget, reasoning_effort, replicas
+
+# ---- wire-everything knobs (all default = engine defaults; unset emits nothing)
+
+# spec-draft placement (spec = "auto" with a pulled draft)
+# spec_draft_cpu_range = ""       # "lo-hi" CPU set for the draft model
+# spec_draft_cpu_strict = false   # strict placement
+# spec_draft_device = ""          # dedicated GPU for the draft
+# spec_draft_ngl = ""             # draft VRAM layers: N | "auto" | "all"
+# spec_draft_threads = 0          # draft thread count
+# spec_draft_p_min = 0.0          # min draft probability (greedy accept)
+# spec_draft_p_split = 0.10       # split probability
+# spec_draft_poll = 0             # draft poll level 0..=100
+# spec_draft_prio = 0             # draft priority -1..=3
+# spec_draft_prio_batch = 0       # draft batch priority -1..=3
+# spec_draft_poll_batch = true    # poll for draft batch work
+# spec_draft_cpu_strict_batch = false
+# spec_draft_threads_batch = 0
+# spec_draft_type_k = ""          # draft KV cache type
+# spec_draft_type_v = ""          # draft vocab cache type
+# spec_draft_override_tensor = [] # e.g. "exps=CPU"
+# spec_draft_n_cpu_moe = 0        # draft MoE experts on CPU
+# spec_draft_cpu_moe = false      # all draft experts on CPU
+# spec_draft_backend_sampling = true # false = --no-spec-draft-backend-sampling
+
+# n-gram tuning (spec = "ngram"); grid-search with `pallama tune <model> --ngram`
+# ngram_size_m = 0                # lookup table size (0 = engine default)
+# ngram_size_n = 0                # n-gram length
+# ngram_min_hits = 0              # min hits before trusting a draft
+# ngram_adaptive_decay = 0        # adaptive spec decay step (spec = "adaptive")
+# ngram_adaptive_target = 0.0     # target acceptance rate 0..=1
+
+# reasoning control (cuts wasted thinking tokens on agent traffic)
+# reasoning_budget = -1           # -1 unrestricted | 0 end now | N token budget
+# reasoning_budget_message = ""   # injected when the budget runs out
+# reasoning_effort = ""           # "" | minimal|low|medium|high|xhigh|max
+# reasoning_preserve = true       # keep reasoning content in responses
+
+# vision / multimodal (models with an mmproj)
+# image_max_tokens = 0            # per-image token ceiling (0 = model)
+# image_min_tokens = 0
+# mtmd_batch_max_tokens = 0       # image tokens per encode batch
+# mmproj_offload = true           # false = keep projector on CPU
+# mmproj_auto = true              # false = no projector auto-discovery
+# mmproj_device = ""              # dedicated projector device
+# embd_normalize = 0              # 1 = L2-normalize embeddings
+
+# YaRN fine-tuning (beyond ctx_extend)
+# yarn_orig_ctx = 0
+# yarn_ext_factor = -1.0          # >= 0 to set
+# yarn_attn_factor = 0.0
+# yarn_beta_fast = 0.0
+# yarn_beta_slow = 0.0
+
+# scheduling extras
+# cpu_strict = false              # strict CPU placement (--cpu-strict 1)
+# prio = 0                        # process priority -1..=3
+# prio_batch = 0                  # batch-thread priority
+# poll_batch = true               # poll for batch work (follows `poll` by default)
+# threads_http = 0                # HTTP server threads
+# numa = ""                       # "" | distribute | isolate
+# check_tensors = false           # verify tensor data on load
+
+# engine behavior toggles (defaults mirror upstream; knobs exist to disable)
+# warmup = true                   # false = --no-warmup (faster cold load)
+# repack = true                   # weight repacking
+# no_host = false                 # bypass host buffer (tight VRAM)
+# op_offload = true               # host tensor ops to device
+# keep_tokens = 0                 # tokens kept on ctx shift (-1 = all)
+# context_shift = false           # opt-in: upstream default is DISABLED
+# samplers = ""                   # "temp;top_k;..." ordering + selection
+
+# video input (vision models with ffmpeg support)
+# video_ffmpeg_dir = ""           # "" = system ffmpeg
+# video_fps = 0.0                 # sampling rate
+# video_timestamp_interval = 0.0  # timestamp cadence
+
+# power-user escapes
+# override_kv = []                # "KEY=TYPE:VALUE" GGUF metadata repairs
+# control_vectors = []            # control vector files
+# control_vectors_scaled = []     # "FNAME:SCALE"
+# control_vector_layer_range = ""
+# tensor_preset = ""              # "" | "moe-cpu-offload" (experts -> CPU)
+# pii_scrub = false               # redact emails/secrets/IPs from why/watch
 ```
 
 ## Architecture
@@ -168,6 +306,11 @@ Load-bearing ideas:
 ## Verification
 
 222 tests: pure compiler tables, wiremock network suites (resume, sha, allowlist, token isolation), engine install cycles with a real stub engine binary, supervisor lifecycle integration (ladder, capacity, crash-circuit, shutdown), and full gateway round-trips over both APIs — including the sentinel suites (9 detection codes, responses grammar, persistence reload, enforce 422s, live watch SSE, parity-under-observation). `cargo clippy --workspace --all-targets -- -D warnings` clean.
+
+Live harnesses (real engine, real model, no mocks):
+
+- `scripts/validate.py` — exhaustive E2E validation: every config knob traced from `config.toml` through the profile compiler to the engine child's actual `/proc` argv, both API surfaces, sentinel, lifecycle behaviors (crash-respawn, eviction, cancellation), CLI, auth — in an isolated XDG sandbox (`--fast` smoke mode, `--phase` filters).
+- `scripts/bench_compare.py` — head-to-head benchmark vs **direct llama-server** (launched with the argv cloned from pallama's own child, so the only delta is orchestration) and **ollama** (live service, API-only), plus `llama-bench` as the engine ceiling. Measures cold load, TTFT, decode/prefill tok/s, RSS/VRAM, and times **every feature** (tool calls, structured output, vision, embeddings, sessions, queue behavior, watch/why, config variants incl. router mode) with a route-capability matrix across all three servers. Same isolation contract: never touches port 11434.
 
 ## Credit
 

@@ -1,20 +1,30 @@
 #!/bin/sh
-# pallama bootstrap installer — Linux and macOS.
+# pallama installer — Linux and macOS. System-wide, like ollama:
+# root-owned binary in /usr/local/bin + systemd unit (Restart=always).
+# There is NO user-path install mode; a second copy in ~/.local/bin is how
+# stale-binary daemon races happen (doctor flags them).
 #
 #   curl --proto '=https' --tlsv1.2 -fsSL <raw-url-of-this-file> | sh
 #
-# Verifies the asset sha256 from the GitHub release API (the same source of
-# truth as `pallama engine update`) before installing anything. No root:
-# pallama is user-local (~/.local/share/pallama).
+# From a checkout: builds fresh with cargo first (zero-arg runs never
+# install a stale target/release), then installs system-wide.
+#
+# Verifies the asset sha256 from the GitHub release API (the same source
+# of truth as `pallama engine update`) before installing anything.
+#
+# Flags:
+#   --build           force the source path (no release channel contact)
+#   --from <binary>   install a locally built binary (bootstrap/offline)
+#   --uninstall       remove binary + units (models/config are user data,
+#                     kept: ~/.local/share/pallama, ~/.config/pallama)
 #
 # Environment overrides:
-#   PALLAMA_VERSION            pin a release tag (e.g. v0.1.0)
+#   PALLAMA_VERSION            pin a release tag (e.g. v0.3.0)
 #   PALLAMA_REPO               GitHub owner/name hosting releases
-#   PALLAMA_INSTALL_DIR        binary destination (default ~/.local/bin)
 #   PALLAMA_INSTALL_BASE_URL   replace the GitHub API base (mirrors, tests)
+#   PALLAMA_SYSTEM_BIN_DIR     binary destination (default /usr/local/bin)
+#   PALLAMA_SERVICE_USER/GROUP unit user/group (default: invoking user)
 #   GITHUB_TOKEN               optional API token (rate limits, private repos)
-#
-# Flag: --with-systemd-unit   also install a `systemctl --user` service.
 
 # Wrap everything in main() so a truncated partial download cannot execute
 # half a script (same guard technique as the ollama installer).
@@ -63,54 +73,55 @@ pick_libc() {
     fi
 }
 
-WITH_UNIT=0
-SYSTEM=0
+UNINSTALL=0
 FROM_BIN=
 FORCE_BUILD=0
 while [ $# -gt 0 ]; do
     case "$1" in
-        --with-systemd-unit) WITH_UNIT=1 ;;
-        --system) SYSTEM=1 ;;
+        --uninstall) UNINSTALL=1 ;;
         --build) FORCE_BUILD=1 ;;
         --from) shift; [ $# -gt 0 ] || error "--from needs a binary path"; FROM_BIN=$1 ;;
         --from=*) FROM_BIN=${1#--from=} ;;
-        *) error "unknown option: $1 (supported: --with-systemd-unit, --system, --from <binary>, --build)" ;;
+        *) error "unknown option: $1 (supported: --build, --from <binary>, --uninstall)" ;;
     esac
     shift
 done
 
-# ollama-style sudo handling: empty when root, overridable for tests.
+# ollama-style privilege: root runs plain, everyone else needs sudo.
+# There is no user-local fallback — a second pallama in ~/.local/bin is
+# precisely how stale-binary daemon races happen.
+# PALLAMA_SUDO is a test/mirror knob: a pass-through wrapper, or empty to
+# run everything unprivileged (unset-only default — sudo).
 SUDO="${PALLAMA_SUDO-sudo}"
 [ "$(id -u)" -eq 0 ] && SUDO=
 
+# Privilege is enforced where it's needed: the privileged install command
+# itself fails with "cannot create /usr/local/bin (need sudo?)" when root
+# is genuinely unavailable — no fragile tty/sudo probing up front.
 
-install_local() {
-    # install_local <binary> <channel-label>
-    INSTALL_DIR="${PALLAMA_INSTALL_DIR:-$HOME/.local/bin}"
-    mkdir -p "$INSTALL_DIR" || error "cannot create ${INSTALL_DIR}"
-    atomic_install "$1" "$INSTALL_DIR/pallama" || error "install to ${INSTALL_DIR} failed"
-    VER=$("$INSTALL_DIR/pallama" --version 2>/dev/null || echo "(version check failed)")
-    status "Installed pallama ${VER} to ${INSTALL_DIR}/pallama ($2)"
-    notice_running_daemon
-    status "Next: pallama engine update && pallama pull <model> && pallama run <model>"
-}
-
-# Replace a possibly-running binary without ETXTBSY: write a temp file,
-# rename over the destination (the running process keeps its inode; new
-# execs get the new binary).
-atomic_install() {
-    # atomic_install <src> <dst>
-    TMP_BIN="${2}.new.$$"
-    install -m 0755 "$1" "$TMP_BIN" || return 1
-    mv -f "$TMP_BIN" "$2"
-}
-
-notice_running_daemon() {
-    PIDFILE="$HOME/.local/share/pallama/run/pallama.pid"
-    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
-        status "NOTE: the pallama daemon is still running the OLD binary; run 'pallama stop' and any command to restart on the new one"
+# --uninstall: remove what install.sh put here (binary + units).
+# NEVER touches models or config — those are user data.
+if [ "$UNINSTALL" = 1 ]; then
+    if command -v pallama >/dev/null 2>&1; then pallama stop >/dev/null 2>&1 || true; fi
+    for BIN in "${PALLAMA_SYSTEM_BIN_DIR:-/usr/local/bin}/pallama" "$HOME/.local/bin/pallama"; do
+        if [ -e "$BIN" ]; then
+            ([ -w "$(dirname "$BIN")" ] && rm -f "$BIN") || $SUDO rm -f "$BIN"
+            status "removed $BIN"
+        fi
+    done
+    if [ -f /etc/systemd/system/pallama.service ]; then
+        $SUDO systemctl disable --now pallama 2>/dev/null || true
+        $SUDO rm -f /etc/systemd/system/pallama.service && status "removed system unit"
+        $SUDO systemctl daemon-reload 2>/dev/null || true
     fi
-}
+    if [ -f "$HOME/.config/systemd/user/pallama.service" ]; then
+        systemctl --user disable --now pallama 2>/dev/null || true
+        rm -f "$HOME/.config/systemd/user/pallama.service" && status "removed legacy user unit"
+        systemctl --user daemon-reload 2>/dev/null || true
+    fi
+    status "uninstalled. models/config kept at ~/.local/share/pallama and ~/.config/pallama (delete manually if desired)"
+    exit 0
+fi
 
 find_checkout() {
     if [ -n "${PALLAMA_CHECKOUT:-}" ]; then
@@ -137,16 +148,14 @@ build_from_checkout() {
     echo "$CK/target/release/pallama"
 }
 
-# Zero-argument auto mode (user directive: the installer ALWAYS builds):
-# no explicit channel + a checkout present -> compile FRESH (never a
-# stale target/release), then install system-wide (binary + systemd unit).
-# Checkout-less runs (curl | sh) fall through to the release channel.
-if [ -z "$FROM_BIN" ] && [ "$SYSTEM" = 0 ] && [ "$FORCE_BUILD" = 0 ] &&
+# Zero-argument auto mode: a checkout present -> compile FRESH (never a
+# stale target/release), then install system-wide. Checkout-less runs
+# (curl | sh) fall through to the release channel.
+if [ -z "$FROM_BIN" ] && [ "$FORCE_BUILD" = 0 ] &&
    [ -z "${PALLAMA_REPO:-}" ] && [ -z "${PALLAMA_INSTALL_BASE_URL:-}" ]; then
     if command -v cargo >/dev/null 2>&1 && find_checkout >/dev/null 2>&1; then
         status "auto: checkout found - building fresh before install"
         if FROM_BIN=$(build_from_checkout); then
-            SYSTEM=1
             status "auto: installing the fresh build system-wide (binary + systemd service)"
         fi
     fi
@@ -160,11 +169,8 @@ if [ -n "$FROM_BIN" ]; then
     status "Bootstrap install from $FROM_BIN (skipping release download)"
 fi
 
-
 # --build: force the source path (audited/offline installs; never touches
-# the release channel). Default (no flags): the auto block above already
-# built when possible; a checkout-less run falls through to the release
-# channel below.
+# the release channel).
 if [ "$FORCE_BUILD" = 1 ] && [ -z "${FROM_BIN:-}" ]; then
     FROM_BIN=$(build_from_checkout) ||
         error "--build: need cargo + a pallama checkout (set PALLAMA_CHECKOUT=<repo>; Rust from https://rustup.rs)"
@@ -174,20 +180,39 @@ fi
 # Repo guard is release-channel only: --from bootstrap and mirror/test
 # base URLs never touch the GitHub release API.
 if [ -z "${PALLAMA_INSTALL_BASE_URL:-}" ] && [ -z "${FROM_BIN:-}" ] && [ -z "$REPO" ]; then
-    error "PALLAMA_REPO is not set. Export PALLAMA_REPO=owner/pallama (the GitHub repo hosting pallama releases) and re-run, or bootstrap a local build: sh scripts/install.sh --from target/release/pallama"
+    error "PALLAMA_REPO is not set. Export PALLAMA_REPO=owner/pallama (the GitHub repo hosting pallama releases) and re-run, or bootstrap a local build: sudo sh scripts/install.sh --from target/release/pallama"
 fi
 
-# ---- bootstrap branch: --from needs no release, no OS/arch detection ----
-if [ -n "$FROM_BIN" ]; then
-    if [ "$SYSTEM" = 1 ]; then
-        BIN_DIR="${PALLAMA_SYSTEM_BIN_DIR:-/usr/local/bin}"
-        $SUDO mkdir -p "$BIN_DIR" || error "cannot create ${BIN_DIR} (need sudo?)"
-        $SUDO install -m 0755 "$FROM_BIN" "$BIN_DIR/pallama.new.$$" &&
-    $SUDO mv -f "$BIN_DIR/pallama.new.$$" "$BIN_DIR/pallama" ||
+# ---- system-wide install: root-owned binary + systemd unit ----
+# One implementation for every channel (build/auto/from/release). Like
+# ollama: enable the unit and RESTART it on upgrade so the new binary is
+# live immediately; stop any user-started daemon first so the unit never
+# fights it for the port.
+install_system() {
+    # install_system <binary>
+    BIN_DIR="${PALLAMA_SYSTEM_BIN_DIR:-/usr/local/bin}"
+    $SUDO mkdir -p "$BIN_DIR" || error "cannot create ${BIN_DIR} (need sudo?)"
+    # Replace a possibly-running binary without ETXTBSY: temp file + rename
+    # (the running process keeps its inode; new execs get the new binary).
+    # Root-owned like ollama when we have root; plain install otherwise
+    # (mirrors/tests run through a pass-through "sudo").
+    $SUDO install -o0 -g0 -m0755 "$1" "$BIN_DIR/pallama.new.$$" 2>/dev/null ||
+    $SUDO install -m0755 "$1" "$BIN_DIR/pallama.new.$$" ||
     error "install to ${BIN_DIR} failed"
-        SVC_USER="${PALLAMA_SERVICE_USER:-$(id -un)}"
-        UNIT_PATH="${PALLAMA_UNIT_PATH:-/etc/systemd/system/pallama.service}"
-        SYSTEMCTL="${PALLAMA_SYSTEMCTL:-systemctl}"
+    $SUDO mv -f "$BIN_DIR/pallama.new.$$" "$BIN_DIR/pallama"
+    # A user-started daemon owns the port; the unit would crash-loop.
+    PIDFILE="$HOME/.local/share/pallama/run/pallama.pid"
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+        kill -TERM "$(cat "$PIDFILE")" 2>/dev/null || true
+        i=0
+        while kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null && [ "$i" -lt 20 ]; do
+            i=$((i + 1)); sleep 0.5
+        done
+    fi
+    SVC_USER="${PALLAMA_SERVICE_USER:-$(id -un)}"
+    UNIT_PATH="${PALLAMA_UNIT_PATH:-/etc/systemd/system/pallama.service}"
+    SYSTEMCTL="${PALLAMA_SYSTEMCTL:-systemctl}"
+    if command -v "$SYSTEMCTL" >/dev/null 2>&1; then
         $SUDO mkdir -p "$(dirname "$UNIT_PATH")"
         UNIT=$(cat <<EOF
 [Unit]
@@ -209,26 +234,61 @@ EOF
 )
         printf '%s\n' "$UNIT" | $SUDO tee "$UNIT_PATH" >/dev/null || error "writing $UNIT_PATH failed"
         $SUDO "$SYSTEMCTL" daemon-reload || error "systemctl daemon-reload failed"
-        $SUDO "$SYSTEMCTL" enable --now pallama || error "enabling pallama.service failed"
+        # Upgrade-in-place: restart an already-active unit (like ollama),
+        # enable+start otherwise.
+        if $SUDO "$SYSTEMCTL" is-active --quiet pallama 2>/dev/null; then
+            $SUDO "$SYSTEMCTL" restart pallama || error "restarting pallama.service failed"
+        else
+            $SUDO "$SYSTEMCTL" enable --now pallama || error "enabling pallama.service failed"
+        fi
+        # Poll the configured host (quoted or bare TOML), not a hardcoded
+        # loopback — a config bound to a specific interface answers there.
+        HOST=$(sed -n 's/^host[[:space:]]*=[[:space:]]*//p' "$HOME/.config/pallama/config.toml" 2>/dev/null | head -1 | tr -d '"')
         PORT=$(sed -n 's/^port[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$HOME/.config/pallama/config.toml" 2>/dev/null | head -1)
+        HOST=${HOST:-127.0.0.1}
         PORT=${PORT:-11434}
         i=0
-        while ! curl -s --max-time 2 "http://127.0.0.1:${PORT}/healthz" 2>/dev/null | grep -q ok; do
+        while ! curl -s --max-time 2 "http://${HOST}:${PORT}/healthz" 2>/dev/null | grep -q ok; do
             i=$((i + 1)); [ "$i" -gt 30 ] && break
             sleep 1
         done
-        if curl -s --max-time 2 "http://127.0.0.1:${PORT}/healthz" 2>/dev/null | grep -q ok; then
+        if curl -s --max-time 2 "http://${HOST}:${PORT}/healthz" 2>/dev/null | grep -q ok; then
             status "systemd service active; pallama healthy on :${PORT} (logs: journalctl -u pallama)"
         else
             status "service enabled; healthz not answering on :${PORT} yet — check: journalctl -u pallama -n 30"
         fi
-        VER=$("$BIN_DIR/pallama" --version 2>/dev/null || echo "(version check failed)")
-        status "Installed pallama ${VER} system-wide (${BIN_DIR}/pallama + ${UNIT_PATH})"
-        status "All inference is upstream llama.cpp — ggml, ggerganov and contributors did the hard parts."
-        exit 0
+    else
+        status "systemd not found — binary installed at ${BIN_DIR}/pallama; start it manually: pallama serve"
     fi
-    # --from without --system: plain user-local install of the local build.
-    install_local "$FROM_BIN" "bootstrap, unverified channel"
+    VER=$("$BIN_DIR/pallama" --version 2>/dev/null || echo "(version check failed)")
+    status "Installed pallama ${VER} system-wide (${BIN_DIR}/pallama + ${UNIT_PATH:-no unit})"
+    # The stale-copy race: a leftover user-path copy gets resurrected by
+    # services with their own PATH. Remove it as part of every install.
+    # -ef (same inode, symlinks followed) works where `readlink -f` does
+    # not (old macOS): skip removal only when the copy IS the system file.
+    # shellcheck disable=SC3013 # XSI extension; dash/busybox/bash/BSD sh
+    # all implement it, and the degraded path removes a copy policy wants
+    # gone anyway.
+    if [ -e "$HOME/.local/bin/pallama" ] &&
+       ! [ "$HOME/.local/bin/pallama" -ef "$BIN_DIR/pallama" ]; then
+        rm -f "$HOME/.local/bin/pallama" && status "removed stale user-path copy ~/.local/bin/pallama"
+    fi
+    # One-click readiness: persist config migrations (legacy api_keys ->
+    # [[keys]] etc.) so the first `pallama` invocation never FAILs on an
+    # old config. Best-effort: a missing config or an offline box must
+    # not fail the install.
+    if "$BIN_DIR/pallama" migrate >/dev/null 2>&1; then
+        status "config migrated/verified (canonical form)"
+    else
+        status "config migration skipped (no config or parse issue — run: pallama migrate)"
+    fi
+    status "All inference is upstream llama.cpp — ggml, ggerganov and contributors did the hard parts."
+}
+
+
+# Bootstrap/--from/auto-build channels install directly.
+if [ -n "$FROM_BIN" ]; then
+    install_system "$FROM_BIN"
     exit 0
 fi
 
@@ -239,60 +299,72 @@ case "$ARCH" in
     aarch64 | arm64) RUST_ARCH=aarch64 ;;
     *) error "unsupported architecture: $ARCH (supported: x86_64/amd64, aarch64/arm64)" ;;
 esac
+
 case "$OS" in
-    Linux) TARGET="${RUST_ARCH}-unknown-linux-$(pick_libc)" ;;
-    Darwin) TARGET="${RUST_ARCH}-apple-darwin" ;;
-    *) error "unsupported OS: $OS (this installer covers Linux/macOS; Windows uses install.ps1)" ;;
+    Linux)
+        LIBC=$(pick_libc)
+        STATUS_OS="linux"
+        ASSET_TRIPLE_SUFFIX="unknown-linux-${LIBC}"
+        ;;
+    Darwin)
+        LIBC="osx"
+        STATUS_OS="macOS"
+        ASSET_TRIPLE_SUFFIX="apple-darwin"
+        ;;
+    *) error "unsupported OS: $OS (this installer covers Linux and macOS)" ;;
 esac
 
-RELEASE_PATH="releases/latest"
-[ -n "${PALLAMA_VERSION:-}" ] && RELEASE_PATH="releases/tags/${PALLAMA_VERSION}"
-status "Fetching release metadata from ${API_BASE}/${RELEASE_PATH}"
-JSON=$(fetch "${API_BASE}/${RELEASE_PATH}") ||
-    error "could not fetch release metadata from ${API_BASE} (offline or rate limited?) and no local checkout to build — export GITHUB_TOKEN, retry later, or clone the repo and re-run its scripts/install.sh to build from source"
+STATUS_OS_ARCH="${STATUS_OS} ${RUST_ARCH} (${LIBC})"
+status "Looking for release ${PALLAMA_VERSION:-latest} for ${STATUS_OS_ARCH}..."
 
-TAG=$(printf '%s' "$JSON" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-[ -n "$TAG" ] || error "could not parse tag_name from release metadata"
+# Latest-or-pinned release metadata from the GitHub API.
+if [ -n "${PALLAMA_VERSION:-}" ]; then
+    RELEASE_PATH="releases/tags/${PALLAMA_VERSION}"
+else
+    RELEASE_PATH="releases/latest"
+fi
+RELEASE_JSON=$(fetch "${API_BASE}/${RELEASE_PATH}") ||
+    error "failed to look up release ${PALLAMA_VERSION:-latest} in ${API_BASE} (PALLAMA_REPO set? network up?)"
 
-ASSET="pallama-${TAG}-${TARGET}.tar.gz"
+TAG=$(printf '%s' "$RELEASE_JSON" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
+[ -n "$TAG" ] || error "could not parse tag_name from the release API response"
 
-# Extract one field of the exact asset record. The assets array is flattened
-# one field per line; matching starts at the asset's own "name" line and ends
-# at the next "name" line, so a sibling asset's digest can never leak in.
-asset_field() {
-    printf '%s' "$JSON" | tr ',' '\n' | awk -v field="$1" -v want="\"$ASSET\"" '
-        /"name":/ {
-            if (in_asset) exit
-            if (index($0, "\"name\":" want) > 0 || index($0, "\"name\": " want) > 0) in_asset = 1
-            next
-        }
-        in_asset && index($0, "\"" field "\":") > 0 { print }
-    ' | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | sed -n '1p'
-}
+# Asset lines: pick the one matching this OS/arch (release-workflow naming
+# contract: pallama-<tag>-<rust-triple>.tar.gz). Each sibling asset line
+# carries its own digest, so a name/digest mix-up is impossible.
+# Quoted variable = literal case match; a raw expansion in a case pattern
+# would act as a glob (a hostile tag_name like "*" must not match).
+WANTED="pallama-${TAG}-${RUST_ARCH}-${ASSET_TRIPLE_SUFFIX}.tar.gz"
+printf '%s' "$RELEASE_JSON" | tr ',' '\n' | grep -E '"(name|digest)": *"' | \
+    sed -e 's/.*"name": *"\([^"]*\)".*/name \1/' -e 's/.*"digest": *"\([^"]*\)".*/digest \1/' | \
+    while read -r KIND VAL; do
+        if [ "$KIND" = "name" ]; then
+            case "$VAL" in
+                "$WANTED") ASSET="$VAL" ;;
+            esac
+        elif [ "$KIND" = "digest" ] && [ -n "${ASSET:-}" ]; then
+            printf '%s %s\n' "$ASSET" "$VAL"
+            # Reset: a later asset's digest must never pair with this name
+            # (only the pair emitted right after the matching name counts).
+            ASSET=
+        fi
+    done > "${TMPDIR:-/tmp}/pallama-asset.$$"
+read -r ASSET EXPECT < "${TMPDIR:-/tmp}/pallama-asset.$$" || true
+[ -n "$ASSET" ] || error "release ${TAG} has no asset matching pallama-${TAG}-${RUST_ARCH}-${ASSET_TRIPLE_SUFFIX}.tar.gz (available: $(printf '%s' "$RELEASE_JSON" | tr ',' '\n' | grep -o '"name": *"[^"]*"' | cut -d'"' -f4 | tr '\n' ' '))"
+[ -n "$EXPECT" ] || error "release ${TAG} asset ${ASSET} carries no sha256 digest — refusing to install unverified"
+EXPECT=${EXPECT#sha256:}
 
-asset_names() {
-    printf '%s' "$JSON" | tr ',' '\n' |
-        sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\(pallama-[^"]*\)".*/\1/p'
-}
-
-URL=$(asset_field browser_download_url)
-[ -n "$URL" ] ||
-    error "asset ${ASSET} not found in release ${TAG}. Available: $(asset_names | tr '\n' ' ') — or build from a checkout: sh scripts/install.sh --build"
-
-DIGEST=$(asset_field digest)
-case "${DIGEST:-}" in
-    sha256:*) EXPECT=${DIGEST#sha256:} ;;
-    *) error "release metadata has no sha256 digest for ${ASSET} yet — GitHub computes it shortly after upload; retry in a minute. Refusing unverified install." ;;
-esac
-
-TMP=$(mktemp -d) || error "mktemp failed"
-cleanup() { rm -rf "$TMP"; }
-trap cleanup EXIT INT TERM
-
+ASSET_URL=$(printf '%s' "$RELEASE_JSON" | tr ',' '\n' | grep -o '"browser_download_url": *"[^"]*"' |
+    sed -e 's/.*"browser_download_url": *"\([^"]*\)".*/\1/' | grep -F "/$ASSET" | head -1)
+ASSET_URL=${ASSET_URL:-${API_BASE}/releases/download/${TAG}/${ASSET}}
 status "Downloading ${ASSET} (${TAG})..."
-TARBALL="$TMP/pallama.tar.gz"
-fetch "$URL" -o "$TARBALL" || error "download failed: $URL"
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+TARBALL="$TMP/${ASSET}"
+fetch "$ASSET_URL" -o "$TARBALL" ||
+    error "download failed: ${ASSET}"
 
+status "Verifying sha256..."
 if command -v sha256sum >/dev/null 2>&1; then
     GOT=$(sha256sum "$TARBALL" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then
@@ -309,46 +381,7 @@ mkdir -p "$EXDIR"
 tar -xzf "$TARBALL" -C "$EXDIR" || error "failed to extract tarball"
 [ -f "$EXDIR/pallama" ] || error "tarball did not contain a 'pallama' binary at its root"
 
-INSTALL_DIR="${PALLAMA_INSTALL_DIR:-$HOME/.local/bin}"
-mkdir -p "$INSTALL_DIR" || error "cannot create ${INSTALL_DIR}"
-NEW="$INSTALL_DIR/pallama.new.$$"
-install -m 0755 "$EXDIR/pallama" "$NEW" || error "cannot write into ${INSTALL_DIR}"
-mv -f "$NEW" "$INSTALL_DIR/pallama"
-
-notice_running_daemon
-
-case ":$PATH:" in
-    *":$INSTALL_DIR:"*) ;;
-    *) status "NOTE: ${INSTALL_DIR} is not on your PATH — add it: export PATH=\"${INSTALL_DIR}:\$PATH\"" ;;
-esac
-
-if [ "$WITH_UNIT" = 1 ]; then
-    command -v systemctl >/dev/null 2>&1 || error "--with-systemd-unit requires systemctl"
-    ABS_INSTALL_DIR=$(cd "$INSTALL_DIR" && pwd -P)
-    UNIT_DIR="$HOME/.config/systemd/user"
-    mkdir -p "$UNIT_DIR"
-    cat > "$UNIT_DIR/pallama.service" <<EOF
-[Unit]
-Description=Pallama daemon (llama.cpp orchestration)
-
-[Service]
-ExecStart=${ABS_INSTALL_DIR}/pallama serve
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=default.target
-EOF
-    systemctl --user daemon-reload
-    systemctl --user enable --now pallama.service ||
-        error "failed to enable the user unit (no systemd user session? try: loginctl enable-linger \$USER)"
-    status "systemd user service installed and started (logs: journalctl --user -u pallama)"
-fi
-
-VER=$("$INSTALL_DIR/pallama" --version 2>/dev/null || echo "(version check failed)")
-status "Installed pallama ${VER} to ${INSTALL_DIR}/pallama"
-status "Next: pallama engine update && pallama pull <model> && pallama run <model>"
-status "All inference is upstream llama.cpp — ggml, ggerganov and contributors did the hard parts."
+install_system "$EXDIR/pallama"
 
 }
 

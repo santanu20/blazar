@@ -30,17 +30,25 @@ notes (2026), SGLang docs + 2026-Q1 roadmap, chatforest SGLang review
 - **A5 DONE**: `poll = N` config (1..=100) → `--poll`.
 - **A6 VERIFIED NO-OP**: `--cache-idle-slots` default enabled (with
   --cache-ram); `--defrag-thold` is DEPRECATED upstream — never emit.
-- **A7 VERIFIED NO-OP**: `--context-shift` default enabled upstream.
+- **A7 DONE (corrected)**: `context_shift = true` overlay knob (opt-in).
+  VERIFIED b10833+: `--context-shift` is DEFAULT DISABLED upstream (the
+  earlier "default enabled" note was b10819-era and stale); we only emit
+  the flag when explicitly enabled.
 - **A8 DONE**: `reasoning_format` config → `--reasoning-format`
   (none|deepseek|deepseek-legacy).
-- **B1 DEFERRED (verified reasoning)**: the child's unified KV pool with
-  `--cache-reuse` already dedupes prefixes WITHIN an instance regardless of
-  slot; router-level prefix routing only adds value with multiple instances
-  of the SAME model — non-default locally. Build when multi-instance routing
-  exists, not before.
+- **B1 SHIPPED 2026-09-07** (multi-instance prefix routing): per-model
+  `replicas = N` overlay (1..=8) spawns parallel instances keyed `model#N`;
+  the gateway hashes each chat's stable prefix (system + first user turn,
+  1 KiB head) and sticky-routes per prefix — new prefixes GROW a fresh
+  warm-cache replica, known prefixes reuse theirs (SGLang-radix-lite at
+  the router, per-instance `--cache-reuse` pools). Live-validated on
+  qwen2.5-0.5b replicas=2: distinct prefixes → 2 children, repeat turns
+  172/120 ms (warm), clamp held at capacity. Original deferral note: the
+  child's unified KV pool with `--cache-reuse` already dedupes prefixes
+  WITHIN an instance; router-level routing needed multi-instance first.
 - **B2 DEFERRED**: draft auto-pairing needs a curated (model ↔ EAGLE3/MTP
   head) dataset; inventing pairs would violate the no-fabrication rule.
-- **B3 DEFERRED**: SLO tiers = queue rework; the existing priority queue
+- **B3 SHIPPED 2026-09-06** (SLO classes High=2s/Normal=30s/Low=120s + EDF queue + deadline overrides; `pallama_slo_deadline_exceeded_total` burn counter added 2026-09-07). Original note: SLO tiers = queue rework; the existing priority queue
   covers the local lane.
 - **B4 DONE**: `pallama upgrade [--version] [--dry-run]` — same asset
   naming + API-digest verification as engine updates; atomic self-replace
@@ -56,7 +64,7 @@ notes (2026), SGLang docs + 2026-Q1 roadmap, chatforest SGLang review
 
 | # | Feature | Inspired by | Design | Effort |
 |---|---|---|---|---|
-| B1 | **Prefix-aware slot routing** ("RadixAttention-lite at the router") | SGLang radix cache | gateway hashes the first N tokens (system prompt), sticky-routes to the slot/instance whose `--cache-reuse 256` pool already holds it; falls back to least-loaded. Agent traffic (resend-same-system-prompt) gets warm-prefix TTFT every call | medium — routing table in gateway, no child changes |
+| B1 | **Prefix-aware slot routing** ("RadixAttention-lite at the router") — SHIPPED 2026-09-07 (`replicas` overlay + prefix-hash sticky affinity; see note above) | SGLang radix cache | gateway hashes the first N tokens (system prompt), sticky-routes to the slot/instance whose `--cache-reuse 256` pool already holds it; falls back to least-loaded. Agent traffic (resend-same-system-prompt) gets warm-prefix TTFT every call | shipped |
 | B2 | **Draft auto-pairing** | vLLM/SGLang spec artillery | catalog pairs models with HF EAGLE3/MTP heads (qwen3-0.6B ↔ 8B class); `pull` suggests `--draft`, `spec=auto` adopts after bench proves net-positive | medium |
 | B3 | **SLO admission tiers** | production schedulers | priority queue already exists; add TTFT-SLO classes (interactive vs batch) that reorder the queue by deadline not just priority | medium |
 | B4 | **`pallama upgrade`** | — | self-update via release-asset digest verifier (installer machinery exists) | small |

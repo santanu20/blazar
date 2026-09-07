@@ -1,3 +1,7 @@
 /target
 /references
 __pycache__/
+
+# machine-local agent tool state
+.codegraph/
+.serena/
