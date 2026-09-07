@@ -23,7 +23,7 @@ pub struct DeviceDesc {
 impl DeviceDesc {
     /// GPU vendor inferred from the device description substring (upstream
     /// descriptions: "NVIDIA CUDA", "AMD `ROCm`", "Intel SYCL", "Vulkan ...").
-    #[must_use] 
+    #[must_use]
     pub fn vendor(&self) -> Vendor {
         // Vulkan-backend descriptions are often generic ("Vulkan"); the
         // device name carries the vendor instead.
@@ -65,7 +65,7 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    #[must_use] 
+    #[must_use]
     pub fn has_flag(&self, flag: &str) -> bool {
         self.flags.contains(flag)
     }
@@ -158,7 +158,10 @@ fn parse_version(text: &str) -> Result<(u64, String)> {
         .or_else(|| {
             line.split(':')
                 .nth(1)
-                .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).find(|t| !t.is_empty()))
+                .and_then(|rest| {
+                    rest.split(|c: char| !c.is_ascii_digit())
+                        .find(|t| !t.is_empty())
+                })
                 .and_then(|tok| tok.parse::<u64>().ok())
         })
         .ok_or_else(|| anyhow!("cannot parse build number from {line:?}"))?;
@@ -168,15 +171,24 @@ fn parse_version(text: &str) -> Result<(u64, String)> {
 /// Parse `  NAME: DESC (TOTAL MiB, FREE MiB free)` device lines.
 fn parse_devices(text: &str) -> Vec<DeviceDesc> {
     let mut out = Vec::new();
-    for line in text.lines().skip_while(|l| !l.contains("Available devices:")) {
+    for line in text
+        .lines()
+        .skip_while(|l| !l.contains("Available devices:"))
+    {
         let line = line.trim();
         if line.is_empty() || line.contains("Available devices") || line == "(none)" {
             continue;
         }
         // NAME: DESC (TOTAL MiB, FREE MiB free)
-        let Some((name, rest)) = line.split_once(':') else { continue };
-        let Some(open) = rest.rfind('(') else { continue };
-        let Some(close) = rest[open..].find(')') else { continue };
+        let Some((name, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Some(open) = rest.rfind('(') else {
+            continue;
+        };
+        let Some(close) = rest[open..].find(')') else {
+            continue;
+        };
         let desc = rest[..open].trim().to_string();
         let mem = &rest[open + 1..open + close];
         // "8192 MiB, 7000 MiB free"
@@ -308,7 +320,15 @@ options:
   -fa, --flash-attn [on|off|auto]
 ";
         let (flags, spec) = parse_help(help);
-        for expected in ["--help", "--version", "--mlock", "--ctx-size", "--gpu-layers", "--flash-attn", "--spec-type"] {
+        for expected in [
+            "--help",
+            "--version",
+            "--mlock",
+            "--ctx-size",
+            "--gpu-layers",
+            "--flash-attn",
+            "--spec-type",
+        ] {
             assert!(flags.contains(expected), "missing {expected} in {flags:?}");
         }
         assert_eq!(
@@ -334,8 +354,13 @@ options:
             server_path: "/x".into(),
         };
         assert!(m.require_flags(&["--jinja"]).is_ok());
-        let err = m.require_flags(&["--jinja", "--spec-draft-model"]).unwrap_err();
+        let err = m
+            .require_flags(&["--jinja", "--spec-draft-model"])
+            .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("--spec-draft-model") && msg.contains("engine use"), "{msg}");
+        assert!(
+            msg.contains("--spec-draft-model") && msg.contains("engine use"),
+            "{msg}"
+        );
     }
 }

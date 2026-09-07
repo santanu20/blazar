@@ -17,7 +17,11 @@ impl DaemonLock {
         std::fs::create_dir_all(dirs.run_dir())?;
         let path = dirs.run_dir().join("pallama.pid");
         let pid = std::process::id();
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
             Ok(mut f) => {
                 use std::io::Write as _;
                 writeln!(f, "{pid}").ok();
@@ -36,7 +40,8 @@ impl DaemonLock {
                 }
                 // Stale lock from a dead daemon: take over.
                 tracing::warn!("removing stale pidfile for dead pid {existing}");
-                std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("remove {}", path.display()))?;
                 std::fs::write(&path, format!("{pid}\n"))?;
                 Ok(Self { path, pid })
             }
@@ -44,7 +49,7 @@ impl DaemonLock {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn pid(&self) -> u32 {
         self.pid
     }
@@ -98,9 +103,27 @@ pub async fn wait_for_shutdown_signal() {
             .expect("install SIGTERM handler");
         let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
             .expect("install SIGINT handler");
-        tokio::select! {
-            _ = term.recv() => tracing::info!("SIGTERM: draining"),
-            _ = int.recv() => tracing::info!("SIGINT: draining"),
+        let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .expect("install SIGHUP handler");
+        // SIGHUP = hot-reload hint: live registries (keys) re-read
+        // config.toml without dropping children. Shutdown still drains.
+        loop {
+            tokio::select! {
+                _ = term.recv() => {
+                    tracing::info!("SIGTERM: draining");
+                    break;
+                }
+                _ = int.recv() => {
+                    tracing::info!("SIGINT: draining");
+                    break;
+                }
+                _ = hup.recv() => {
+                    if let Some(hook) = SIGHUP_HOOK.lock().expect("hook").as_ref() {
+                        hook();
+                        tracing::info!("SIGHUP: live registries reloaded");
+                    }
+                }
+            }
         }
     }
     #[cfg(not(unix))]
@@ -110,6 +133,12 @@ pub async fn wait_for_shutdown_signal() {
     }
 }
 
+/// J4: the daemon installs this in `serve` wiring — SIGHUP re-reads
+/// config.toml into the live keys registry (single writer discipline:
+/// file -> registry, never the reverse).
+pub static SIGHUP_HOOK: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
@@ -117,7 +146,10 @@ mod tests {
 
     fn dirs() -> (tempfile::TempDir, PallamaDirs) {
         let tmp = tempfile::tempdir().unwrap();
-        let d = PallamaDirs { config_dir: tmp.path().join("c"), data_dir: tmp.path().join("d") };
+        let d = PallamaDirs {
+            config_dir: tmp.path().join("c"),
+            data_dir: tmp.path().join("d"),
+        };
         d.ensure().unwrap();
         (tmp, d)
     }

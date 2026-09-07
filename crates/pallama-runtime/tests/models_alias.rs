@@ -30,12 +30,17 @@ fn row(name: &str, path: &str) -> ModelRow {
 
 fn setup(tag: &str) -> (tempfile::TempDir, PallamaDirs) {
     let tmp = tempfile::tempdir().unwrap();
-    let dirs = PallamaDirs { config_dir: tmp.path().join("c"), data_dir: tmp.path().join("d") };
+    let dirs = PallamaDirs {
+        config_dir: tmp.path().join("c"),
+        data_dir: tmp.path().join("d"),
+    };
     dirs.ensure().unwrap();
     let gguf = dirs.models_dir().join(format!("{tag}-Q4_K_M.gguf"));
     std::fs::write(&gguf, b"gguf-bytes-for-alias-safety").unwrap();
     let store = Store::open(&dirs).unwrap();
-    store.upsert_model(&row(tag, &gguf.display().to_string())).unwrap();
+    store
+        .upsert_model(&row(tag, &gguf.display().to_string()))
+        .unwrap();
     (tmp, dirs)
 }
 
@@ -63,8 +68,14 @@ fn unit__copy_then_rm_alias__source_file_survives() {
         std::path::Path::new(&src_path).exists(),
         "rm on the alias MUST NOT delete the source file"
     );
-    assert!(store.get_model("m1").unwrap().is_some(), "source row survives");
-    assert!(store.get_model("alias1").unwrap().is_none(), "alias row removed");
+    assert!(
+        store.get_model("m1").unwrap().is_some(),
+        "source row survives"
+    );
+    assert!(
+        store.get_model("alias1").unwrap().is_none(),
+        "alias row removed"
+    );
 }
 
 #[test]
@@ -81,8 +92,11 @@ fn unit__rm_alias__shared_mmproj_survives() {
 
     copy_model(&dirs, "m4", "alias4").unwrap();
     let alias_mm = store.get_model("alias4").unwrap().unwrap().mmproj_path;
-    assert_eq!(alias_mm.as_deref(), Some(mm.display().to_string().as_str()),
-               "alias shares the source projector");
+    assert_eq!(
+        alias_mm.as_deref(),
+        Some(mm.display().to_string().as_str()),
+        "alias shares the source projector"
+    );
 
     remove_model(&dirs, "alias4").unwrap();
     assert!(mm.exists(), "shared mmproj must survive rm of the alias");
@@ -97,7 +111,12 @@ fn unit__rm_alias__shared_mmproj_survives() {
 fn unit__copy_alias__distinct_path_named_after_destination() {
     let (_tmp, dirs) = setup("m2");
     copy_model(&dirs, "m2", "my-alias").unwrap();
-    let alias_path = Store::open(&dirs).unwrap().get_model("my-alias").unwrap().unwrap().path;
+    let alias_path = Store::open(&dirs)
+        .unwrap()
+        .get_model("my-alias")
+        .unwrap()
+        .unwrap()
+        .path;
     assert!(
         alias_path.contains("my-alias__alias__"),
         "alias file name should derive from the destination: {alias_path}"

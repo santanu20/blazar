@@ -23,7 +23,12 @@ pub async fn run(client: &GhClient, repo: &str, version: Option<&str>, dry_run: 
     }
 }
 
-async fn run_inner(client: &GhClient, repo: &str, version: Option<&str>, dry_run: bool) -> Result<String> {
+async fn run_inner(
+    client: &GhClient,
+    repo: &str,
+    version: Option<&str>,
+    dry_run: bool,
+) -> Result<String> {
     let plan = resolve(client, repo, version).await?;
     let bytes = client.download_asset_bytes(&plan.asset).await?;
     let binary = extract_binary(&plan.asset.name, &bytes)?;
@@ -70,7 +75,10 @@ pub async fn resolve(client: &GhClient, repo: &str, version: Option<&str>) -> Re
         bail!("unsupported platform for self-update");
     }
     if let Some(asset) = release.assets.iter().find(|a| candidates.contains(&a.name)) {
-        return Ok(UpgradePlan { tag: release.tag_name, asset: asset.clone() });
+        return Ok(UpgradePlan {
+            tag: release.tag_name,
+            asset: asset.clone(),
+        });
     }
     Err(anyhow!(
         "no pallama asset for this platform in {} (wanted one of {candidates:?}; available: {:?})",
@@ -94,7 +102,9 @@ pub fn extract_binary(asset_name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
                 .unwrap_or(false);
             if is_binary {
                 let mut out = Vec::new();
-                entry.read_to_end(&mut out).context("read binary from tar")?;
+                entry
+                    .read_to_end(&mut out)
+                    .context("read binary from tar")?;
                 return Ok(out);
             }
         }
@@ -126,8 +136,7 @@ pub fn replace_current_exe(binary: &[u8]) -> Result<std::path::PathBuf> {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
             .context("chmod 755 staged binary")?;
-        std::fs::rename(&staged, &exe)
-            .with_context(|| format!("replace {}", exe.display()))?;
+        std::fs::rename(&staged, &exe).with_context(|| format!("replace {}", exe.display()))?;
         Ok(exe)
     }
 

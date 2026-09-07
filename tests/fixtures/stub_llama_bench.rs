@@ -54,7 +54,9 @@ fn main() {
     let bs = or_default(flag_values("-b"), &["2048"]);
 
     let mut rows: Vec<serde_json::Value> = Vec::new();
-    let default_ctx = std::env::var("STUB_BASE_CTX").ok().and_then(|v| v.parse::<u64>().ok());
+    let default_ctx = std::env::var("STUB_BASE_CTX")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
     for c in &cs {
         let ctx: u64 = c.parse().unwrap_or(0);
         for t in &ts {
@@ -76,8 +78,12 @@ fn main() {
                                 let fa_bonus = if fa == "on" { 15.0 } else { 0.0 };
                                 let b_bonus = if batch == 1024 { 8.0 } else { 0.0 };
                                 #[allow(clippy::cast_precision_loss)]
-                                let tg = 100.0 + threads as f64 + f64::from(ctx_bonus)
-                                    + f64::from(u8::from(quant)) * 50.0 + fa_bonus + b_bonus;
+                                let tg = 100.0
+                                    + threads as f64
+                                    + f64::from(ctx_bonus)
+                                    + f64::from(u8::from(quant)) * 50.0
+                                    + fa_bonus
+                                    + b_bonus;
                                 let fa_code: i64 = i64::from(fa == "on");
                                 for p in &ps {
                                     let _ = p;

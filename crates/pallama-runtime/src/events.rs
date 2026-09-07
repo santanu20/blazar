@@ -59,7 +59,7 @@ pub enum InstanceState {
 }
 
 impl InstanceState {
-    #[must_use] 
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Loading => "loading",
@@ -83,7 +83,7 @@ impl Default for EventBus {
 }
 
 impl EventBus {
-    #[must_use] 
+    #[must_use]
     pub fn new(capacity: usize) -> Self {
         let (tx, _) = broadcast::channel(capacity);
         Self { tx }
@@ -96,7 +96,7 @@ impl EventBus {
         self.tx.send(event).unwrap_or(0)
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<PallamaEvent> {
         self.tx.subscribe()
     }
@@ -111,9 +111,18 @@ mod tests {
     async fn unit__bus__publish_reaches_subscriber() {
         let bus = EventBus::default();
         let mut rx = bus.subscribe();
-        bus.publish(PallamaEvent::ModelPulled { name: "m".into(), warning: None });
+        bus.publish(PallamaEvent::ModelPulled {
+            name: "m".into(),
+            warning: None,
+        });
         let got = rx.recv().await.unwrap();
-        assert_eq!(got, PallamaEvent::ModelPulled { name: "m".into(), warning: None });
+        assert_eq!(
+            got,
+            PallamaEvent::ModelPulled {
+                name: "m".into(),
+                warning: None
+            }
+        );
     }
 
     #[tokio::test]

@@ -12,9 +12,22 @@ use pallama_core::PallamaDirs;
 
 /// True when an instance marker exists for `name` (process may be loading
 /// or serving; the supervisor owns the marker's lifecycle).
-#[must_use] 
+#[must_use]
 pub fn instance_running(dirs: &PallamaDirs, name: &str) -> bool {
-    dirs.run_dir().join(format!("{name}.pid")).exists()
+    // Replicas spawn per-key pidfiles (`model#N.pid`); any live pidfile —
+    // plain or replica — counts as running.
+    let run = dirs.run_dir();
+    if run.join(format!("{name}.pid")).exists() {
+        return true;
+    }
+    let Ok(entries) = std::fs::read_dir(&run) else {
+        return false;
+    };
+    let prefix = format!("{name}#");
+    entries.filter_map(std::result::Result::ok).any(|e| {
+        let f = e.file_name().to_string_lossy().into_owned();
+        f.starts_with(&prefix) && f.to_lowercase().ends_with(".pid")
+    })
 }
 
 /// Delete a model: all shard files (by gguf-split naming convention), the
@@ -35,16 +48,19 @@ pub fn remove_model(dirs: &PallamaDirs, name: &str) -> Result<()> {
     let mut files: Vec<PathBuf> = vec![PathBuf::from(&row.path)];
     // Shards share the stored first-shard filename convention
     // (`base-NNNNN-of-MMMMM.gguf`); collect every part of the set.
-    if let (Some(dir), Some(leaf)) = (PathBuf::from(&row.path).parent(), PathBuf::from(&row.path).file_name()) {
+    if let (Some(dir), Some(leaf)) = (
+        PathBuf::from(&row.path).parent(),
+        PathBuf::from(&row.path).file_name(),
+    ) {
         let leaf = leaf.to_string_lossy().to_string();
-        let base = crate::hf::parse_shard_marker_pub(&leaf).map_or_else(|| leaf.trim_end_matches(".gguf").to_string(), |(_, _, base)| base);
+        let base = crate::hf::parse_shard_marker_pub(&leaf).map_or_else(
+            || leaf.trim_end_matches(".gguf").to_string(),
+            |(_, _, base)| base,
+        );
         if let Ok(entries) = std::fs::read_dir(dir) {
             for e in entries.flatten() {
                 let fname = e.file_name().to_string_lossy().to_string();
-                if fname.starts_with(&base)
-                    && fname.contains("-of-")
-                    && fname.ends_with(".gguf")
-                {
+                if fname.starts_with(&base) && fname.contains("-of-") && fname.ends_with(".gguf") {
                     files.push(e.path());
                 }
             }
@@ -78,8 +94,7 @@ pub fn remove_model(dirs: &PallamaDirs, name: &str) -> Result<()> {
 
     for f in files {
         if f.exists() {
-            std::fs::remove_file(&f)
-                .map_err(|e| anyhow!("delete {}: {e}", f.display()))?;
+            std::fs::remove_file(&f).map_err(|e| anyhow!("delete {}: {e}", f.display()))?;
         }
     }
     store.delete_model(name)?;
@@ -91,7 +106,9 @@ pub fn remove_model(dirs: &PallamaDirs, name: &str) -> Result<()> {
 /// plus a new store row. No blob ceremony, no byte copies.
 pub fn copy_model(dirs: &PallamaDirs, src: &str, dst: &str) -> Result<()> {
     if instance_running(dirs, src) {
-        return Err(anyhow!("model {src} is currently running; copy after it unloads"));
+        return Err(anyhow!(
+            "model {src} is currently running; copy after it unloads"
+        ));
     }
     let store = Store::open(dirs)?;
     let row = store
@@ -111,11 +128,18 @@ pub fn copy_model(dirs: &PallamaDirs, src: &str, dst: &str) -> Result<()> {
     // alias then deleted the source (live data-loss incident 2026-09-05).
     let dst_path = dirs.models_dir().join(format!("{dst}__alias__{leaf}"));
     if dst_path == src_path {
-        return Err(anyhow!("alias path collides with the source file; refusing"));
+        return Err(anyhow!(
+            "alias path collides with the source file; refusing"
+        ));
     }
     if !dst_path.exists() {
-        std::fs::hard_link(&src_path, &dst_path)
-            .map_err(|e| anyhow!("hardlink {} -> {}: {e}", dst_path.display(), src_path.display()))?;
+        std::fs::hard_link(&src_path, &dst_path).map_err(|e| {
+            anyhow!(
+                "hardlink {} -> {}: {e}",
+                dst_path.display(),
+                src_path.display()
+            )
+        })?;
     }
     store.upsert_model(&pallama_core::ModelRow {
         name: dst.to_string(),
@@ -147,6 +171,20 @@ mod tests {
         };
         dirs.ensure().unwrap();
         (tmp, dirs)
+    }
+
+    #[test]
+    fn unit__instance_running__detects_replica_pidfiles() {
+        let (_t, dirs) = setup();
+        let run = dirs.run_dir();
+        assert!(!instance_running(&dirs, "m"));
+        std::fs::write(run.join("other.pid"), b"1").unwrap();
+        assert!(!instance_running(&dirs, "m"));
+        std::fs::write(run.join("m#2.pid"), b"99").unwrap();
+        assert!(instance_running(&dirs, "m"));
+        std::fs::remove_file(run.join("m#2.pid")).unwrap();
+        std::fs::write(run.join("m.pid"), b"1").unwrap();
+        assert!(instance_running(&dirs, "m"));
     }
 
     #[test]
@@ -230,6 +268,9 @@ mod tests {
             let i2 = std::fs::metadata(&alias.path).unwrap().ino();
             assert_eq!(i1, i2, "alias must be a hardlink, not a copy");
         }
-        assert!(copy_model(&dirs, "m", "m-alias").is_err(), "duplicate alias refused");
+        assert!(
+            copy_model(&dirs, "m", "m-alias").is_err(),
+            "duplicate alias refused"
+        );
     }
 }

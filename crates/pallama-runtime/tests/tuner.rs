@@ -48,6 +48,7 @@ static META: std::sync::LazyLock<GgufMeta> = std::sync::LazyLock::new(|| GgufMet
     head_count_kv: Some(8),
     embedding_length: Some(1024),
     head_dim: Some(64),
+    pooling_type: None,
     chat_template: Some("{%- if tools %}{{ tool_calls }}{%- endif %}".into()),
 });
 
@@ -61,6 +62,7 @@ fn test_input<'a>(
     ProfileInput {
         mmproj_path: None,
         model_name: "qwen3-8b",
+        instance_key: "qwen3-8b",
         model_path,
         model_bytes: 5_000 * 1024 * 1024,
         gguf: &META,
@@ -71,18 +73,49 @@ fn test_input<'a>(
         draft_path: None,
         engine_tag: "b-stub",
         supported_flags: flags,
-        endpoint: Endpoint::Tcp { host: "127.0.0.1".into(), port: 1 },
+        endpoint: Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port: 1,
+        },
         data_dir: "/tmp/pallama-test-data",
+        cache_hit_rate: None,
     }
 }
 
 fn all_flags() -> BTreeSet<String> {
     [
-        "-m", "--host", "--port", "--alias", "--jinja", "--metrics", "--flash-attn",
-        "--ctx-size", "--threads", "--gpu-layers", "--cache-reuse", "--cache-type-k",
-        "--cache-type-v", "--cpu-moe", "--sleep-idle-seconds", "-np", "--rpc", "--lora",
-        "--lora-scaled", "--spec-type", "--spec-draft-model", "--spec-draft-n-max",
-        "--cache-ram", "-mm", "--mmproj", "-p", "-n", "-r", "-c", "-t", "-ctk", "-ctv",
+        "-m",
+        "--host",
+        "--port",
+        "--alias",
+        "--jinja",
+        "--metrics",
+        "--flash-attn",
+        "--ctx-size",
+        "--threads",
+        "--gpu-layers",
+        "--cache-reuse",
+        "--cache-type-k",
+        "--cache-type-v",
+        "--cpu-moe",
+        "--sleep-idle-seconds",
+        "-np",
+        "--rpc",
+        "--lora",
+        "--lora-scaled",
+        "--spec-type",
+        "--spec-draft-model",
+        "--spec-draft-n-max",
+        "--cache-ram",
+        "-mm",
+        "--mmproj",
+        "-p",
+        "-n",
+        "-r",
+        "-c",
+        "-t",
+        "-ctk",
+        "-ctv",
     ]
     .iter()
     .map(|f| (*f).into())
@@ -95,7 +128,10 @@ fn integration__bench_default__parses_stub_rows() {
     let (tmp, dirs) = dirs_setup();
     let model = tmp.path().join("m.gguf");
     std::fs::write(&model, b"x").unwrap();
-    let tuner = Tuner { dirs: &dirs, bench_bin: bench_bin() };
+    let tuner = Tuner {
+        dirs: &dirs,
+        bench_bin: bench_bin(),
+    };
     let rows = tuner.bench_default(&model).unwrap();
     assert!(rows.iter().any(|r| r.test == "tg128"), "{rows:?}");
     assert!(rows.iter().any(|r| r.test.starts_with("pp")));
@@ -117,7 +153,10 @@ fn integration__tune_search__adopts_argmax_and_persists() {
 
     // Grid axes: threads x kv-quant (llama-bench b10816 has no -c axis).
     // Stub scoring: +threads, +50 for q8_0 -> winner (threads 8, q8_0).
-    let tuner = Tuner { dirs: &dirs, bench_bin: bench_bin() };
+    let tuner = Tuner {
+        dirs: &dirs,
+        bench_bin: bench_bin(),
+    };
     let store = Store::open(&dirs).unwrap();
     let (profile, winning, rows) = tuner.tune_search(&store, &inp).unwrap();
 
@@ -125,12 +164,28 @@ fn integration__tune_search__adopts_argmax_and_persists() {
     assert!(winning.kv_quant.unwrap(), "stub rewards q8_0 by +50 t/s");
     assert_eq!(winning.threads.unwrap(), 8);
     assert_eq!(winning.fa, Some(true), "stub rewards fa-on by +15 t/s");
-    assert_eq!(winning.batch, Some(1024), "stub rewards batch 1024 by +8 t/s");
+    assert_eq!(
+        winning.batch,
+        Some(1024),
+        "stub rewards batch 1024 by +8 t/s"
+    );
     assert!(winning.ctx.is_none(), "ctx is not a bench axis");
-    assert!(profile.argv.windows(2).any(|w| w[0] == "--cache-type-k" && w[1] == "q8_0"));
-    assert!(profile.argv.windows(2).any(|w| w[0] == "--threads" && w[1] == "8"));
-    assert!(profile.argv.windows(2).any(|w| w[0] == "--flash-attn" && w[1] == "on"));
-    assert!(profile.argv.windows(2).any(|w| w[0] == "-b" && w[1] == "1024"));
+    assert!(profile
+        .argv
+        .windows(2)
+        .any(|w| w[0] == "--cache-type-k" && w[1] == "q8_0"));
+    assert!(profile
+        .argv
+        .windows(2)
+        .any(|w| w[0] == "--threads" && w[1] == "8"));
+    assert!(profile
+        .argv
+        .windows(2)
+        .any(|w| w[0] == "--flash-attn" && w[1] == "on"));
+    assert!(profile
+        .argv
+        .windows(2)
+        .any(|w| w[0] == "-b" && w[1] == "1024"));
 
     let stored = store.get_profile("qwen3-8b", "b-stub").unwrap().unwrap();
     let argv: Vec<String> = serde_json::from_str(&stored.args_json).unwrap();

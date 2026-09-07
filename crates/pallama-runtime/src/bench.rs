@@ -73,6 +73,41 @@ pub struct Tuner<'a> {
     pub bench_bin: PathBuf,
 }
 
+/// One `tune --load` A/B measurement: wall seconds (spawn→ready +
+/// first-chat) for the warmup and no-warmup variants of the same argv.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LoadProbe {
+    pub warmup_secs: f64,
+    pub no_warmup_secs: f64,
+}
+
+/// Aggregate generation tok/s with one vs two identical children
+/// (`tune --replicas`). Adoption is the caller's policy (>1.3x).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReplicaSearch {
+    pub r1_tps: f64,
+    pub r2_tps: f64,
+}
+
+/// Base argv for the warmup A/B: drop endpoint/session/persisted-state
+/// PAIRS and any explicit warmup flags so the two variants differ ONLY
+/// in the warmup axis.
+#[must_use]
+pub fn strip_for_load(base_argv: &[String]) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::new();
+    let mut it = base_argv.iter().peekable();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--host" | "--port" | "--slot-save-path" | "--lookup-cache-dynamic" => {
+                let _ = it.next(); // consume the value
+            }
+            "--no-warmup" | "--warmup" => {}
+            _ => argv.push(a.clone()),
+        }
+    }
+    argv
+}
+
 /// Locate a llama-bench in an installed engine directory (upstream
 /// release tarballs ship llama-bench alongside llama-server; a manually
 /// registered `local` engine may not). No external fallback paths: pallama
@@ -84,13 +119,20 @@ pub fn find_bench_bin(dirs: &PallamaDirs) -> Result<PathBuf> {
         .iter()
         .filter(|e| e.active)
         .chain(engines.iter().filter(|e| !e.active))
-        .map(|e| dirs.engines_dir().join(&e.tag).join(format!("llama-{}", e.tag)).join("llama-bench"))
+        .map(|e| {
+            dirs.engines_dir()
+                .join(&e.tag)
+                .join(format!("llama-{}", e.tag))
+                .join("llama-bench")
+        })
         .find(|p| p.exists())
-        .ok_or_else(|| anyhow!("no llama-bench found in any installed engine; run `pallama engine update`"))
+        .ok_or_else(|| {
+            anyhow!("no llama-bench found in any installed engine; run `pallama engine update`")
+        })
 }
 
 /// Default bench grid: prompt processing + generation, 2 reps.
-#[must_use] 
+#[must_use]
 pub fn default_bench_args() -> Vec<String> {
     vec![
         "-p".into(),
@@ -126,6 +168,295 @@ impl Tuner<'_> {
         parse_bench_json(&stdout)
     }
 
+    /// Live-serving slots search: for each `-np` candidate, spawn the
+    /// real llama-server (argv cloned from the compiled profile, ports
+    /// ephemeral), drive `clients` concurrent non-stream chats, and
+    /// measure aggregate wall tokens/s. llama-bench cannot see slot
+    /// concurrency — this is the only honest axis for `-np`.
+    pub fn slots_search(
+        &self,
+        base_argv: &[String],
+        clients: u32,
+        candidates: &[u32],
+        idle_secs: u64,
+    ) -> Result<Vec<(u32, f64)>> {
+        let server_bin = self
+            .bench_bin
+            .parent()
+            .map(|p| p.join("llama-server"))
+            .filter(|p| p.exists())
+            .ok_or_else(|| anyhow!("llama-server not found next to llama-bench"))?;
+        let mut out = Vec::new();
+        for np in candidates {
+            if *np > clients.max(1) {
+                continue; // more slots than clients measures nothing
+            }
+            let port = ephemeral_port()?;
+            // Strip endpoint/slot PAIRS (flag + value), then set ours.
+            let mut argv: Vec<String> = Vec::new();
+            let mut it = base_argv.iter().peekable();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--host" | "--port" | "-np" | "--slot-save-path" => {
+                        let _ = it.next(); // consume the value
+                    }
+                    _ => argv.push(a.clone()),
+                }
+            }
+            argv.extend([
+                "--host".to_string(),
+                "127.0.0.1".to_string(),
+                "--port".to_string(),
+                port.to_string(),
+                "-np".to_string(),
+                np.to_string(),
+            ]);
+            let mut child = std::process::Command::new(&server_bin)
+                .args(&argv)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .with_context(|| format!("spawn {}", server_bin.display()))?;
+            let ok = wait_ready(port, 120.0);
+            let tps = if ok {
+                drive_concurrent(port, clients).ok()
+            } else {
+                None
+            };
+            // Single pid we spawned; never a group.
+            let _ = child.kill();
+            let _ = child.wait();
+            match tps {
+                Some(t) => out.push((*np, t)),
+                None => {
+                    anyhow::bail!("slots search: server at -np {np} never became ready or served")
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(idle_secs.max(1)));
+        }
+        if out.is_empty() {
+            return Err(anyhow!(
+                "no -np candidates ran (clients={clients}, candidates={candidates:?})"
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Live n-gram tuning search: for each (`size_m`, `min_hits`) candidate,
+    /// spawn the real llama-server with `--spec-type ngram-simple` and the
+    /// candidate's typed tuning flags, drive ONE non-stream chat (spec
+    /// decoding is a single-stream win; concurrency would mask it), and
+    /// measure wall tokens/s. llama-bench has no spec axis — this is the
+    /// only honest measurement lane for ngram knobs.
+    pub fn ngram_search(
+        &self,
+        base_argv: &[String],
+        candidates: &[(u32, u32)],
+        idle_secs: u64,
+    ) -> Result<Vec<((u32, u32), f64)>> {
+        let server_bin = self
+            .bench_bin
+            .parent()
+            .map(|p| p.join("llama-server"))
+            .filter(|p| p.exists())
+            .ok_or_else(|| anyhow!("llama-server not found next to llama-bench"))?;
+        let mut out = Vec::new();
+        for &(m, h) in candidates {
+            let port = ephemeral_port()?;
+            // Strip endpoint/session/persisted-spec PAIRS: the lookup
+            // cache would leak drafts between candidates and contaminate
+            // the comparison.
+            let mut argv: Vec<String> = Vec::new();
+            let mut it = base_argv.iter().peekable();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--host"
+                    | "--port"
+                    | "--slot-save-path"
+                    | "--lookup-cache-dynamic"
+                    | "--spec-type"
+                    | "--spec-ngram-simple-size-m"
+                    | "--spec-ngram-simple-size-n"
+                    | "--spec-ngram-simple-min-hits" => {
+                        let _ = it.next(); // consume the value
+                    }
+                    _ => argv.push(a.clone()),
+                }
+            }
+            argv.extend([
+                "--host".to_string(),
+                "127.0.0.1".to_string(),
+                "--port".to_string(),
+                port.to_string(),
+                "--spec-type".to_string(),
+                "ngram-simple".to_string(),
+                "--spec-ngram-simple-size-m".to_string(),
+                m.to_string(),
+                "--spec-ngram-simple-size-n".to_string(),
+                "8".to_string(),
+                "--spec-ngram-simple-min-hits".to_string(),
+                h.to_string(),
+            ]);
+            let mut child = std::process::Command::new(&server_bin)
+                .args(&argv)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .with_context(|| format!("spawn {}", server_bin.display()))?;
+            let ok = wait_ready(port, 120.0);
+            let tps = if ok {
+                drive_concurrent(port, 1).ok()
+            } else {
+                None
+            };
+            // Single pid we spawned; never a group.
+            let _ = child.kill();
+            let _ = child.wait();
+            match tps {
+                Some(t) => {
+                    println!("  ngram size_m={m} min_hits={h}: {t:.1} tok/s");
+                    out.push(((m, h), t));
+                }
+                None => anyhow::bail!(
+                    "ngram search: server at size_m={m} min_hits={h} never became ready or served"
+                ),
+            }
+            std::thread::sleep(std::time::Duration::from_secs(idle_secs.max(1)));
+        }
+        if out.is_empty() {
+            anyhow::bail!("no ngram candidates ran ({candidates:?})");
+        }
+        Ok(out)
+    }
+
+    /// Warmup-axis A/B probe (`tune --load`): spawn the real llama-server
+    /// twice, differing ONLY in `--no-warmup`, and measure spawn→ready
+    /// plus the first chat round-trip. Warmup trades startup seconds for
+    /// first-token latency; the metric prices both into one number. The
+    /// no-warmup variant runs FIRST so the second (warmup) spawn enjoys
+    /// the warm page cache — biasing AGAINST adoption, which is the safe
+    /// direction for a knob that disables an engine default.
+    pub fn load_search(&self, base_argv: &[String], idle_secs: u64) -> Result<LoadProbe> {
+        let server_bin = self
+            .bench_bin
+            .parent()
+            .map(|p| p.join("llama-server"))
+            .filter(|p| p.exists())
+            .ok_or_else(|| anyhow!("llama-server not found next to llama-bench"))?;
+        let base = strip_for_load(base_argv);
+        let mut probe = LoadProbe {
+            warmup_secs: 0.0,
+            no_warmup_secs: 0.0,
+        };
+        for warmup in [false, true] {
+            let port = ephemeral_port()?;
+            let mut argv = base.clone();
+            argv.extend([
+                "--host".to_string(),
+                "127.0.0.1".to_string(),
+                "--port".to_string(),
+                port.to_string(),
+            ]);
+            if !warmup {
+                argv.push("--no-warmup".to_string());
+            }
+            let t0 = std::time::Instant::now();
+            let mut child = std::process::Command::new(&server_bin)
+                .args(&argv)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .with_context(|| format!("spawn {}", server_bin.display()))?;
+            let total = if let (true, Ok(first)) = (wait_ready(port, 180.0), first_chat_secs(port))
+            {
+                t0.elapsed().as_secs_f64() + first
+            } else {
+                // Single pid we spawned; never a group.
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("load search: server (warmup={warmup}) never became ready or served");
+            };
+            // Single pid we spawned; never a group.
+            let _ = child.kill();
+            let _ = child.wait();
+            if warmup {
+                probe.warmup_secs = total;
+            } else {
+                probe.no_warmup_secs = total;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(idle_secs.max(1)));
+        }
+        Ok(probe)
+    }
+
+    /// `tune --replicas`: measure aggregate generation throughput with one
+    /// vs two identical children; the caller decides adoption (>1.3x).
+    pub fn replica_search(&self, base_argv: &[String], idle_secs: u64) -> Result<ReplicaSearch> {
+        let server_bin = self
+            .bench_bin
+            .parent()
+            .map(|p| p.join("llama-server"))
+            .filter(|p| p.exists())
+            .ok_or_else(|| anyhow!("llama-server not found next to llama-bench"))?;
+        let base = strip_for_load(base_argv);
+        let spawn_on = |port: u16| -> Result<std::process::Child> {
+            let mut argv = base.clone();
+            argv.extend([
+                "--host".to_string(),
+                "127.0.0.1".to_string(),
+                "--port".to_string(),
+                port.to_string(),
+            ]);
+            std::process::Command::new(&server_bin)
+                .args(&argv)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .with_context(|| format!("spawn {}", server_bin.display()))
+        };
+
+        // Run A: single child.
+        let p1 = ephemeral_port()?;
+        let mut a = spawn_on(p1)?;
+        if !wait_ready(p1, 180.0) {
+            let _ = a.kill();
+            let _ = a.wait();
+            anyhow::bail!("replica search: baseline child never became ready");
+        }
+        let r1_tps = drive_concurrent_multi(&[p1], 8, 3);
+        // Single pid we spawned; never a group.
+        let _ = a.kill();
+        let _ = a.wait();
+        let r1_tps = r1_tps?;
+        std::thread::sleep(std::time::Duration::from_secs(idle_secs.max(1)));
+
+        // Run B: two identical children (same argv, distinct ports).
+        let p2 = ephemeral_port()?;
+        let p3 = ephemeral_port()?;
+        let mut b1 = spawn_on(p2)?;
+        let mut b2 = spawn_on(p3)?;
+        let ready2 = wait_ready(p2, 180.0);
+        let ready3 = wait_ready(p3, 180.0);
+        if !(ready2 && ready3) {
+            let _ = b1.kill();
+            let _ = b1.wait();
+            let _ = b2.kill();
+            let _ = b2.wait();
+            anyhow::bail!(
+                "replica search: second child never became ready — the card likely \
+                 cannot hold two copies (VRAM/ RAM); keep replicas = 1"
+            );
+        }
+        let r2_tps = drive_concurrent_multi(&[p2, p3], 8, 3);
+        // Single pids we spawned; never a group.
+        let _ = b1.kill();
+        let _ = b1.wait();
+        let _ = b2.kill();
+        let _ = b2.wait();
+        let r2_tps = r2_tps?;
+        Ok(ReplicaSearch { r1_tps, r2_tps })
+    }
+
     /// Plain `pallama bench <model>`: one deterministic profile, no grid.
     pub fn bench_default(&self, model: &Path) -> Result<Vec<BenchRow>> {
         self.run(model, &default_bench_args())
@@ -138,8 +469,8 @@ impl Tuner<'_> {
         input: &ProfileInput<'_>,
         overrides: &TuningOverrides,
     ) -> Result<pallama_core::Profile> {
-        let profile = profile::compile(input, overrides)
-            .map_err(|e| anyhow::anyhow!("profile: {e}"))?;
+        let profile =
+            profile::compile(input, overrides).map_err(|e| anyhow::anyhow!("profile: {e}"))?;
         persist_profile(store, input, overrides, &profile, &[], 0.0)?;
         Ok(profile)
     }
@@ -188,7 +519,9 @@ impl Tuner<'_> {
                     let idx: Vec<usize> = g
                         .iter()
                         .enumerate()
-                        .filter(|(i, _)| i % 2 == 0 && g.get(*i + 1).is_some_and(|v| v == "f16,q8_0"))
+                        .filter(|(i, _)| {
+                            i % 2 == 0 && g.get(*i + 1).is_some_and(|v| v == "f16,q8_0")
+                        })
                         .map(|(i, _)| i)
                         .collect();
                     for i in idx.iter().rev() {
@@ -222,7 +555,8 @@ impl Tuner<'_> {
                 }
             }
         }
-        let grid_rows = grid_rows.ok_or_else(|| anyhow!("llama-bench rejected every grid reduction"))?;
+        let grid_rows =
+            grid_rows.ok_or_else(|| anyhow!("llama-bench rejected every grid reduction"))?;
 
         // Argmax by mean tg t/s across (threads, quant, fa, batch) combos.
         let mut best: Option<(f64, Combo)> = None;
@@ -243,8 +577,7 @@ impl Tuner<'_> {
             batch: Some(u32::try_from(win.batch).context("batch overflow")?),
             ubatch: None,
         };
-        let profile = profile::compile(input, &winning)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let profile = profile::compile(input, &winning).map_err(|e| anyhow::anyhow!("{e}"))?;
         persist_profile(store, input, &winning, &profile, &grid_rows, score)?;
         Ok((profile, winning, grid_rows))
     }
@@ -348,7 +681,7 @@ pub struct BenchmarkPayload {
 
 /// sha256 over (`engine_tag` + overlay + config-relevant fields + model
 /// mtime) — recompile when any input drifts.
-#[must_use] 
+#[must_use]
 pub fn args_hash(input: &ProfileInput<'_>, profile: &Profile) -> String {
     let mtime = std::fs::metadata(input.model_path)
         .and_then(|m| m.modified())
@@ -376,14 +709,19 @@ pub fn args_hash(input: &ProfileInput<'_>, profile: &Profile) -> String {
 }
 
 fn now_secs() -> i64 {
-    i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
-        .unwrap_or(i64::MAX)
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+    .unwrap_or(i64::MAX)
 }
 
 /// Convenience: build a `ProfileInput` from stored state (used by CLI and
 /// supervisor). `draft_path` resolution stays with the caller.
 #[allow(clippy::too_many_arguments)]
-#[must_use] 
+#[must_use]
 pub fn build_input<'a>(
     model_name: &'a str,
     model_path: &'a str,
@@ -401,6 +739,7 @@ pub fn build_input<'a>(
 ) -> ProfileInput<'a> {
     ProfileInput {
         model_name,
+        instance_key: model_name,
         model_path,
         model_bytes,
         gguf,
@@ -414,7 +753,146 @@ pub fn build_input<'a>(
         supported_flags,
         endpoint,
         data_dir,
+        cache_hit_rate: None, // CLI bench: static clamp, no live hint
     }
+}
+
+/// Grab a free TCP port the OS assigns (bind to :0, read it, close).
+fn ephemeral_port() -> Result<u16> {
+    use std::net::TcpListener;
+    let l = TcpListener::bind(("127.0.0.1", 0)).context("bind ephemeral")?;
+    Ok(l.local_addr().context("local addr")?.port())
+}
+
+/// Poll GET /health until 200 or timeout.
+#[allow(clippy::items_after_statements)] // io trait imports sit near their single use
+fn wait_ready(port: u16, timeout_secs: f64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_secs);
+    while std::time::Instant::now() < deadline {
+        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+            use std::io::{Read, Write};
+            let _ = s.write_all(b"GET /health HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+            let mut buf = [0u8; 256];
+            if let Ok(n) = s.read(&mut buf) {
+                if String::from_utf8_lossy(&buf[..n]).contains("200") {
+                    return true;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    false
+}
+
+/// Wall seconds for ONE tiny non-stream chat round-trip. `tune --load`
+/// adds this to spawn→ready so the no-warmup variant's first-request
+/// lazy-init penalty is priced into its metric instead of silently
+/// vanishing into the user's first prompt.
+#[allow(clippy::items_after_statements)] // io trait imports sit near their single use
+fn first_chat_secs(port: u16) -> Result<f64> {
+    let t0 = std::time::Instant::now();
+    let body = serde_json::json!({
+        "model": "load-probe", "max_tokens": 8, "stream": false,
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+    let payload = serde_json::to_vec(&body)?;
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port))
+        .with_context(|| format!("connect :{port}"))?;
+    use std::io::{Read, Write};
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        payload.len()
+    );
+    s.write_all(req.as_bytes())?;
+    s.write_all(&payload)?;
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf);
+    if !text.contains("200") {
+        anyhow::bail!(
+            "load probe: first chat failed: {}",
+            &text[..text.len().min(120)]
+        );
+    }
+    Ok(t0.elapsed().as_secs_f64())
+}
+
+/// `clients` concurrent non-stream chats; aggregate tokens/s across all
+/// walls (blocking threads — this runs in a CLI, not the runtime).
+#[allow(clippy::items_after_statements)] // io trait imports sit near their single use
+#[allow(clippy::cast_precision_loss)] // throughput display only
+fn drive_concurrent(port: u16, clients: u32) -> Result<f64> {
+    drive_concurrent_multi(&[port], clients, 1)
+}
+
+/// One blocking non-stream chat; returns completion tokens from usage.
+#[allow(clippy::items_after_statements)] // io trait imports sit near their single use
+fn chat_completion_tokens(port: u16, content: &str) -> Result<u64> {
+    let body = serde_json::json!({
+        "model": "replica-search", "max_tokens": 64, "stream": false,
+        "messages": [{"role": "user", "content": content}],
+    });
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port))
+        .with_context(|| format!("connect :{port}"))?;
+    let payload = serde_json::to_vec(&body)?;
+    use std::io::{Read, Write};
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        payload.len()
+    );
+    s.write_all(req.as_bytes())?;
+    s.write_all(&payload)?;
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf);
+    if !text.contains("200") {
+        anyhow::bail!(
+            "replica search: chat failed on :{port}: {}",
+            &text[..text.len().min(120)]
+        );
+    }
+    Ok(text
+        .split("\"completion_tokens\":")
+        .nth(1)
+        .and_then(|rest| {
+            rest.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse::<u64>()
+                .ok()
+        })
+        .unwrap_or(0))
+}
+
+/// Aggregate tok/s of `clients` blocking threads round-robin across `ports`,
+/// `gens` sequential requests each. The wall clock spans ALL clients, so a
+/// saturated single child and a parallel pair are directly comparable.
+#[allow(clippy::cast_precision_loss)] // throughput display only
+fn drive_concurrent_multi(ports: &[u16], clients: u32, gens: u32) -> Result<f64> {
+    if ports.is_empty() {
+        anyhow::bail!("replica search: no ports to drive");
+    }
+    let mut handles = Vec::new();
+    let start = std::time::Instant::now();
+    for i in 0..clients {
+        let port = ports[(i as usize) % ports.len()];
+        handles.push(std::thread::spawn(move || -> Result<u64> {
+            let mut total = 0u64;
+            for g in 0..gens {
+                total += chat_completion_tokens(
+                    port,
+                    &format!("count slowly: {g} one two three four five"),
+                )?;
+            }
+            Ok(total)
+        }));
+    }
+    let mut total = 0u64;
+    for h in handles {
+        total += h.join().map_err(|_| anyhow!("client thread panicked"))??;
+    }
+    let secs = start.elapsed().as_secs_f64();
+    Ok(total as f64 / secs.max(1e-6))
 }
 
 #[cfg(test)]
@@ -435,6 +913,35 @@ mod tests {
             flash_attn: None,
             n_batch: None,
         }
+    }
+
+    #[test]
+    fn unit__strip_for_load_drops_warmup_and_state_pairs() {
+        let base = [
+            "--model",
+            "/m.gguf",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "1",
+            "--slot-save-path",
+            "/s",
+            "--lookup-cache-dynamic",
+            "/c",
+            "--no-warmup",
+            "--threads",
+            "4",
+        ]
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>();
+        let out = strip_for_load(&base);
+        assert_eq!(out, ["--model", "/m.gguf", "--threads", "4"]);
+    }
+
+    #[test]
+    fn unit__drive_concurrent_multi__rejects_empty_ports() {
+        assert!(drive_concurrent_multi(&[], 4, 1).is_err());
     }
 
     #[test]
@@ -461,12 +968,27 @@ mod tests {
             row("pp512", 900.0, 8192, 8, "f16", "f16"),
         ];
         let find = |t, q| {
-            combos(&rows).into_iter().find(|c| c.threads == t && c.kv_q8 == q).unwrap()
+            combos(&rows)
+                .into_iter()
+                .find(|c| c.threads == t && c.kv_q8 == q)
+                .unwrap()
         };
         assert!((mean_tg(&rows, &find(8, true)) - 140.0).abs() < 1e-9);
         assert!((mean_tg(&rows, &find(8, false)) - 100.0).abs() < 1e-9);
         assert!((mean_tg(&rows, &find(6, true)) - 110.0).abs() < 1e-9);
-        assert!((mean_tg(&rows, &Combo { threads: 1, kv_q8: false, fa_on: false, batch: 0 }) - 0.0).abs() < 1e-9);
+        assert!(
+            (mean_tg(
+                &rows,
+                &Combo {
+                    threads: 1,
+                    kv_q8: false,
+                    fa_on: false,
+                    batch: 0
+                }
+            ) - 0.0)
+                .abs()
+                < 1e-9
+        );
         assert_eq!(combos(&rows).len(), 3);
     }
 }

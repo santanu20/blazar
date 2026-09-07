@@ -18,9 +18,43 @@
 use axum::extract::State;
 use axum::response::IntoResponse;
 
+/// Serving ctx from our argv (`-c`/`--ctx-size`): lets a truncating stub
+/// report realistic usage (see `trunc_usage`).
+static SERVING_CTX: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+
+/// A REAL ctx-ceiling hit reports prompt+completion at the window edge;
+/// tiny counts would mean a client `max_tokens` cap instead — the exact
+/// distinction the sentinel's truncation gate checks. Counted usage that
+/// already sits at the edge is kept as-is (it IS the real story).
+fn trunc_usage(prompt_tokens: i64, completion_tokens: i64) -> (i64, i64) {
+    let c = SERVING_CTX.get().copied().unwrap_or(4096);
+    if (prompt_tokens + completion_tokens) * 10 >= c * 9 {
+        (prompt_tokens, completion_tokens)
+    } else {
+        (c - 4, 4)
+    }
+}
+
 #[allow(clippy::too_many_lines)] // test fixture: argv parsing + setup in one place
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let serving = {
+        let mut ctx: i64 = 4096;
+        let mut it = args.iter().peekable();
+        while let Some(a) = it.next() {
+            if a == "-c" || a == "--ctx-size" {
+                if let Some(v) = it.peek().and_then(|s| s.parse::<i64>().ok()) {
+                    ctx = v;
+                }
+            } else if let Some(v) = a.strip_prefix("--ctx-size=") {
+                if let Ok(v) = v.parse::<i64>() {
+                    ctx = v;
+                }
+            }
+        }
+        ctx
+    };
+    let _ = SERVING_CTX.set(serving);
 
     if let Ok(path) = std::env::var("STUB_ARGV_FILE") {
         let json = serde_json::to_string_pretty(&args).expect("argv is serializable");
@@ -111,7 +145,10 @@ fn main() {
             .cloned()
     };
     let host = flag("--host").unwrap_or_else(|| "127.0.0.1".into());
-    let port: u16 = flag("--port").unwrap_or_else(|| "8080".into()).parse().expect("--port must be numeric");
+    let port: u16 = flag("--port")
+        .unwrap_or_else(|| "8080".into())
+        .parse()
+        .expect("--port must be numeric");
     let alias = flag("--alias").unwrap_or_else(|| "stub-model".into());
     if let Some(dir) = flag("--slot-save-path") {
         let _ = std::fs::create_dir_all(&dir);
@@ -141,7 +178,9 @@ fn main() {
             }
         }
         ROUTER_MODELS.set(names).expect("router models once");
-        ROUTER_SLOT_DIRS.set(slot_dirs).expect("router slot dirs once");
+        ROUTER_SLOT_DIRS
+            .set(slot_dirs)
+            .expect("router slot dirs once");
     }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -168,20 +207,23 @@ async fn serve(host: String, port: u16, alias: String) {
                 axum::Json(serde_json::json!({"status": "ok"})).into_response()
             }),
         )
-        .route("/v1/models", get(move || {
-            let alias = alias_for_routes.clone();
-            async move {
-                axum::Json(serde_json::json!({
-                    "object": "list",
-                    "data": [{
-                        "id": alias,
-                        "object": "model",
-                        "owned_by": "pallama-stub",
-                        "created": 0_u64,
-                    }],
-                }))
-            }
-        }))
+        .route(
+            "/v1/models",
+            get(move || {
+                let alias = alias_for_routes.clone();
+                async move {
+                    axum::Json(serde_json::json!({
+                        "object": "list",
+                        "data": [{
+                            "id": alias,
+                            "object": "model",
+                            "owned_by": "pallama-stub",
+                            "created": 0_u64,
+                        }],
+                    }))
+                }
+            }),
+        )
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/completions", post(completions))
@@ -194,6 +236,8 @@ async fn serve(host: String, port: u16, alias: String) {
         // infill, control vectors, tokenize, and slot save/restore/erase
         // (session checkpoints round-trip against --slot-save-path).
         .route("/v1/responses", post(responses_api))
+        .route("/v1/messages", post(anthropic_messages))
+        .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
         .route("/v1/audio/transcriptions", post(transcriptions))
         .route("/infill", post(infill))
         .route("/v1/chat/completions/control", post(control_vectors))
@@ -208,9 +252,7 @@ async fn serve(host: String, port: u16, alias: String) {
         .await
         .unwrap_or_else(|e| panic!("stub-llama-server: bind {addr}: {e}"));
     eprintln!("stub-llama-server: listening on {addr} (alias {alias})");
-    axum::serve(listener, app)
-        .await
-        .expect("stub server error");
+    axum::serve(listener, app).await.expect("stub server error");
 }
 
 type AppState = String;
@@ -266,7 +308,10 @@ async fn chat_completions(
     State(state): State<AppState>,
     axum::Json(req): axum::Json<ChatRequest>,
 ) -> axum::response::Response {
-    let delay_ms: u64 = std::env::var("STUB_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let delay_ms: u64 = std::env::var("STUB_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     if delay_ms > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
     }
@@ -289,9 +334,18 @@ async fn chat_completions(
     };
     let finish = std::env::var("STUB_FINISH").unwrap_or_else(|_| "stop".into());
     let prompt_tokens = count_tokens(
-        &req.messages.iter().map(|m| content_text(&m.content)).collect::<Vec<_>>().join(" "),
+        &req.messages
+            .iter()
+            .map(|m| content_text(&m.content))
+            .collect::<Vec<_>>()
+            .join(" "),
     );
     let completion_tokens = count_tokens(&text);
+    let (prompt_tokens, completion_tokens) = if finish == "length" {
+        trunc_usage(prompt_tokens, completion_tokens)
+    } else {
+        (prompt_tokens, completion_tokens)
+    };
 
     if !req.stream {
         let body = serde_json::json!({
@@ -330,7 +384,8 @@ async fn chat_completions(
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let events = sse_events(&text, &model, include_usage, prompt_tokens, &finish);
-    let base_iter = futures::stream::iter(events.into_iter().map(Ok::<bytes::Bytes, std::io::Error>));
+    let base_iter =
+        futures::stream::iter(events.into_iter().map(Ok::<bytes::Bytes, std::io::Error>));
     let stream: std::pin::Pin<
         Box<dyn futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>,
     > = if chunk_delay_ms > 0 {
@@ -354,9 +409,19 @@ fn env_flag(name: &str) -> bool {
     std::env::var(name).as_deref() == Ok("1")
 }
 
-fn sse_events(text: &str, model: &str, include_usage: bool, prompt_tokens: i64, finish: &str) -> Vec<bytes::Bytes> {
+fn sse_events(
+    text: &str,
+    model: &str,
+    include_usage: bool,
+    prompt_tokens: i64,
+    finish: &str,
+) -> Vec<bytes::Bytes> {
     let (first, second) = split_in_half(text);
-    let completion_tokens = count_tokens(text);
+    let completion_tokens = if finish == "length" {
+        trunc_usage(prompt_tokens, count_tokens(text)).1
+    } else {
+        count_tokens(text)
+    };
     let mut events: Vec<String> = Vec::new();
     let chunk = |delta: serde_json::Value| {
         let payload = serde_json::json!({
@@ -373,7 +438,9 @@ fn sse_events(text: &str, model: &str, include_usage: bool, prompt_tokens: i64, 
     events.push(chunk(serde_json::json!({"content": second})));
     if env_flag("STUB_BAD_TOOL_ARGS") {
         events.push(chunk(serde_json::json!({"tool_calls": [{"index": 0, "function": {"name": "echo", "arguments": "{\"bro"}}]})));
-        events.push(chunk(serde_json::json!({"tool_calls": [{"index": 0, "function": {"arguments": "ken\""}}]})));
+        events.push(chunk(
+            serde_json::json!({"tool_calls": [{"index": 0, "function": {"arguments": "ken\""}}]}),
+        ));
     }
     events.push(format!(
         "data: {}\n\n",
@@ -486,7 +553,10 @@ async fn metrics() -> axum::response::Response {
         std::env::var("STUB_BUILD").unwrap_or_else(|_| "9999".into())
     );
     (
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
         body,
     )
         .into_response()
@@ -502,6 +572,44 @@ fn router_model_ok(model: &str) -> Option<bool> {
     ROUTER_MODELS.get().map(|m| m.iter().any(|n| n == model))
 }
 
+/// Anthropic messages shape (upstream llama-server serves /v1/messages
+/// natively; the stub mirrors it for client-compat tests).
+async fn anthropic_messages(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+    let model: String = parsed["model"]
+        .as_str()
+        .map_or_else(|| state.clone(), str::to_string);
+    let stream = parsed["stream"].as_bool().unwrap_or(false);
+    if stream {
+        // SSE: message_start -> content_block_delta -> message_stop.
+        let sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stub\"}}\n\n\
+                   event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"stub\"}}\n\n\
+                   event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        return axum::response::Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .body(axum::body::Body::from(sse))
+            .unwrap_or_else(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+    axum::Json(serde_json::json!({
+        "id": "msg_stub",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": "stub anthropic reply"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 4, "output_tokens": 3},
+    }))
+    .into_response()
+}
+
+async fn anthropic_count_tokens() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({"input_tokens": 4}))
+}
+
 async fn responses_api(
     State(state): State<AppState>,
     body: axum::body::Bytes,
@@ -515,7 +623,11 @@ async fn responses_api(
     let incomplete = std::env::var("STUB_FINISH").as_deref() == Ok("length");
     let empty = env_flag("STUB_EMPTY");
     let bad_tool = env_flag("STUB_BAD_TOOL_ARGS");
-    let status = if incomplete { "incomplete" } else { "completed" };
+    let status = if incomplete {
+        "incomplete"
+    } else {
+        "completed"
+    };
     let output: Vec<serde_json::Value> = if empty {
         Vec::new()
     } else if bad_tool {
@@ -526,7 +638,12 @@ async fn responses_api(
     } else {
         vec![serde_json::json!({"type": "message", "content": "stub response"})]
     };
-    let usage = serde_json::json!({"input_tokens": 3, "output_tokens": 2});
+    let usage = if incomplete {
+        let (p, c) = trunc_usage(3, 2);
+        serde_json::json!({"input_tokens": p, "output_tokens": c})
+    } else {
+        serde_json::json!({"input_tokens": 3, "output_tokens": 2})
+    };
     let mut resp_obj = serde_json::json!({
         "id": "resp_stub",
         "object": "response",
@@ -534,10 +651,12 @@ async fn responses_api(
         "model": model,
         "output": output,
         "usage": usage,
+        // Test observability: the gateway's chained reconstruction is
+        // verified through this echo (never read by real clients).
+        "debug_input_items": parsed["input"].clone(),
     });
     if incomplete {
-        resp_obj["incomplete_details"] =
-            serde_json::json!({"reason": "max_output_tokens"});
+        resp_obj["incomplete_details"] = serde_json::json!({"reason": "max_output_tokens"});
     }
     if !stream {
         return axum::Json(resp_obj).into_response();
@@ -580,9 +699,11 @@ async fn responses_api(
         })
     ));
     events.push("data: [DONE]\n\n".into());
-    let stream = futures::stream::iter(events.into_iter().map(|s| {
-        Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(s))
-    }));
+    let stream = futures::stream::iter(
+        events
+            .into_iter()
+            .map(|s| Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(s))),
+    );
     axum::response::Response::builder()
         .status(200)
         .header("content-type", "text/event-stream")
@@ -627,9 +748,7 @@ async fn control_vectors(
     }))
 }
 
-async fn tokenize(
-    body: axum::body::Bytes,
-) -> axum::Json<serde_json::Value> {
+async fn tokenize(body: axum::body::Bytes) -> axum::Json<serde_json::Value> {
     let text = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
         .and_then(|v| v["content"].as_str().map(str::to_string))
@@ -672,36 +791,38 @@ async fn slots_action(
     // Dir resolution mirrors the real engine: router mode reads the
     // per-model slot-save-path from the preset INI; classic mode uses the
     // child's own --slot-save-path (already per-model).
-    let base: std::path::PathBuf = if let (Some(m), Some(dirs)) = (&model_subdir, ROUTER_SLOT_DIRS.get()) {
-        match dirs.iter().find(|(n, _)| n == m) {
-            Some((_, dir)) => dir.clone().into(),
-            None => {
-                return (
-                    axum::http::StatusCode::NOT_IMPLEMENTED,
-                    format!("router model '{m}' has no slot-save-path preset"),
-                )
-                    .into_response();
+    let base: std::path::PathBuf =
+        if let (Some(m), Some(dirs)) = (&model_subdir, ROUTER_SLOT_DIRS.get()) {
+            match dirs.iter().find(|(n, _)| n == m) {
+                Some((_, dir)) => dir.clone().into(),
+                None => {
+                    return (
+                        axum::http::StatusCode::NOT_IMPLEMENTED,
+                        format!("router model '{m}' has no slot-save-path preset"),
+                    )
+                        .into_response();
+                }
             }
-        }
-    } else {
-        match SLOT_SAVE_PATH.get() {
-            Some(dir) => dir.clone().into(),
-            None => {
-                return (
-                    axum::http::StatusCode::NOT_IMPLEMENTED,
-                    "stub started without --slot-save-path",
-                )
-                    .into_response();
+        } else {
+            match SLOT_SAVE_PATH.get() {
+                Some(dir) => dir.clone().into(),
+                None => {
+                    return (
+                        axum::http::StatusCode::NOT_IMPLEMENTED,
+                        "stub started without --slot-save-path",
+                    )
+                        .into_response();
+                }
             }
-        }
-    };
+        };
     let _ = std::fs::create_dir_all(&base);
     let path = base.join(&filename);
     match action.as_str() {
         "save" => {
             let blob = format!("stub-kv:{filename}");
             std::fs::write(&path, blob).expect("stub slot save");
-            axum::Json(serde_json::json!({"status": "ok", "filename": filename, "slot": id})).into_response()
+            axum::Json(serde_json::json!({"status": "ok", "filename": filename, "slot": id}))
+                .into_response()
         }
         "restore" => match std::fs::read(&path) {
             Ok(bytes) => axum::Json(serde_json::json!({
@@ -766,4 +887,3 @@ async fn slots() -> axum::Json<serde_json::Value> {
         ],
     }))
 }
-

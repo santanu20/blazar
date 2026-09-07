@@ -16,7 +16,7 @@ pub struct ChildHandle {
 }
 
 impl ChildHandle {
-    #[must_use] 
+    #[must_use]
     pub fn new(endpoint: Endpoint, child: tokio::process::Child) -> Self {
         Self { endpoint, child }
     }
@@ -40,7 +40,7 @@ impl ChildHandle {
         self.child.wait().await
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn id(&self) -> Option<u32> {
         self.child.id()
     }
@@ -99,7 +99,11 @@ impl LlamaCppEngine {
             .timeout(std::time::Duration::from_secs(2))
             .build()
             .expect("health client");
-        Self { manifest, http, child_env: env }
+        Self {
+            manifest,
+            http,
+            child_env: env,
+        }
     }
 
     fn base_url(endpoint: &Endpoint) -> String {
@@ -168,12 +172,7 @@ impl Engine for LlamaCppEngine {
         let deadline = tokio::time::Instant::now() + timeout;
         let started = std::time::Instant::now();
         loop {
-            match self
-                .http
-                .get(format!("{url}/health"))
-                .send()
-                .await
-            {
+            match self.http.get(format!("{url}/health")).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     let body: serde_json::Value = resp.json().await.unwrap_or_default();
                     if body["status"] == "ok" {

@@ -32,7 +32,7 @@ pub const DEFAULT_QUANT: &str = "Q4_K_M";
 /// Redirect-host allowlist. Anything else is refused mid-redirect.
 const EXTRA_DOWNLOAD_HOSTS: &[&str] = &["cdn-lfs.huggingface.co", "cas-bridge.xethub.hf.co"];
 
-#[must_use] 
+#[must_use]
 pub fn is_allowed_download_host(host: &str) -> bool {
     host == "huggingface.co"
         || host.ends_with(".huggingface.co")
@@ -46,7 +46,7 @@ pub fn is_allowed_download_host(host: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// `Qwen/Qwen2.5-0.5B-Instruct-GGUF` -> `qwen2.5-0.5b-instruct`.
-#[must_use] 
+#[must_use]
 pub fn registry_name(repo: &str) -> String {
     let tail = repo.rsplit('/').next().unwrap_or(repo);
     let lowered = tail.to_lowercase();
@@ -72,12 +72,20 @@ pub fn parse_pull_target(input: &str) -> Result<PullTarget> {
             None => (input, DEFAULT_QUANT.to_string()),
         };
         if repo.is_empty() || quant.is_empty() {
-            return Err(anyhow!("invalid pull target {input:?}: empty repo or quant"));
+            return Err(anyhow!(
+                "invalid pull target {input:?}: empty repo or quant"
+            ));
         }
-        return Ok(PullTarget { repo: repo.to_string(), quant });
+        return Ok(PullTarget {
+            repo: repo.to_string(),
+            quant,
+        });
     }
     let entry = pallama_core::resolve(input).map_err(|e| anyhow!("{e}"))?;
-    Ok(PullTarget { repo: entry.repo.clone(), quant: DEFAULT_QUANT.to_string() })
+    Ok(PullTarget {
+        repo: entry.repo.clone(),
+        quant: DEFAULT_QUANT.to_string(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -178,8 +186,13 @@ pub fn select_files(siblings: &[HfSibling], wanted_quant: &str) -> Result<Select
         let token = stem.rsplit('-').next()?;
         // Recognized quant shapes: q4_k_m, q8_0, iq4_xs, fp16, bf16, f16, q2_k...
         let t = token.trim_start_matches('.');
-        if t.starts_with('q') || t.starts_with("iq") || t.starts_with("bx") || t == "fp16"
-            || t == "bf16" || t == "f16" || t == "f32"
+        if t.starts_with('q')
+            || t.starts_with("iq")
+            || t.starts_with("bx")
+            || t == "fp16"
+            || t == "bf16"
+            || t == "f16"
+            || t == "f32"
         {
             Some(t.to_string())
         } else {
@@ -190,7 +203,12 @@ pub fn select_files(siblings: &[HfSibling], wanted_quant: &str) -> Result<Select
     // Try requested quant among singles first, then shard sets.
     for s in &singles {
         if quant_of(&s.rfilename).as_deref() == Some(wanted.as_str()) {
-            return Ok(finish(vec![plan(s)], wanted_quant.to_string(), false, siblings));
+            return Ok(finish(
+                vec![plan(s)],
+                wanted_quant.to_string(),
+                false,
+                siblings,
+            ));
         }
     }
     for ((base, _count), group) in &sharded {
@@ -205,7 +223,12 @@ pub fn select_files(siblings: &[HfSibling], wanted_quant: &str) -> Result<Select
     // Fallback: smallest single GGUF (deterministic, most likely to run).
     if let Some(smallest) = singles.iter().min_by_key(|s| plan(s).bytes) {
         let q = quant_of(&smallest.rfilename).unwrap_or_else(|| "unknown".into());
-        return Ok(finish(vec![plan(smallest)], q.to_uppercase(), true, siblings));
+        return Ok(finish(
+            vec![plan(smallest)],
+            q.to_uppercase(),
+            true,
+            siblings,
+        ));
     }
     // No singles at all: pick the smallest shard set by total size.
     let (_, group) = sharded
@@ -226,7 +249,7 @@ fn parse_shard_marker(fname: &str) -> Option<(u32, u32, String)> {
 }
 
 /// Public wrapper (shard-set file enumeration is shared with model removal).
-#[must_use] 
+#[must_use]
 pub fn parse_shard_marker_pub(fname: &str) -> Option<(u32, u32, String)> {
     let lower = fname.to_lowercase();
     let stem = lower.strip_suffix(".gguf")?;
@@ -265,7 +288,12 @@ fn finish(
         })
         .min_by_key(|s| plan(s).bytes)
         .map(plan);
-    SelectedFiles { shards, quant, quant_fallback, mmproj }
+    SelectedFiles {
+        shards,
+        quant,
+        quant_fallback,
+        mmproj,
+    }
 }
 
 /// Rough bits-per-weight for a quant label; display-only param estimation.
@@ -328,6 +356,9 @@ impl HfClient {
         token: Option<String>,
         extra_hosts: Vec<String>,
     ) -> Result<Self> {
+        // Empty env token degrades to anonymous (an empty Bearer is an
+        // invalid credential, not a missing one).
+        let token = token.filter(|t| !t.trim().is_empty());
         let extra = extra_hosts.clone();
         let policy = reqwest::redirect::Policy::custom(move |attempt| {
             let host = attempt.url().host_str().unwrap_or_default().to_string();
@@ -362,8 +393,7 @@ impl HfClient {
     /// stand-ins included); CDN hops never see it.
     fn token_for(&self, url: &reqwest::Url) -> Option<String> {
         let host = url.host_str()?;
-        let first_party =
-            host == "huggingface.co" || host.ends_with(".huggingface.co");
+        let first_party = host == "huggingface.co" || host.ends_with(".huggingface.co");
         (first_party || self.extra_hosts.iter().any(|h| h == host))
             .then(|| self.token.clone())
             .flatten()
@@ -419,14 +449,19 @@ impl HfClient {
     ) -> Result<u64> {
         let url = self
             .dl_base
-            .join(&format!("{repo}/resolve/main/{}", url_encode_path(&plan.filename)))
+            .join(&format!(
+                "{repo}/resolve/main/{}",
+                url_encode_path(&plan.filename)
+            ))
             .map_err(|e| anyhow!("bad download URL for {}: {e}", plan.filename))?;
         let part = sibling_part_path(dest);
         let mut have: u64 = 0;
         let mut hasher = Sha256::new();
 
         if part.exists() {
-            let len = std::fs::metadata(&part).map_err(|e| anyhow!("stat {}: {e}", part.display()))?.len();
+            let len = std::fs::metadata(&part)
+                .map_err(|e| anyhow!("stat {}: {e}", part.display()))?
+                .len();
             // Seed the hasher with existing bytes.
             let existing = tokio::fs::File::open(&part).await?;
             let mut reader = tokio::io::BufReader::new(existing);
@@ -470,7 +505,10 @@ impl HfClient {
         };
 
         let mut file = if status.as_u16() == 206 {
-            tokio::fs::OpenOptions::new().append(true).open(&part).await?
+            tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&part)
+                .await?
         } else {
             tokio::fs::File::create(&part).await?
         };
@@ -550,14 +588,18 @@ impl HfClient {
                 url_encode_path(query)
             ))
             .map_err(|e| anyhow!("bad search URL: {e}"))?;
-        let resp = self.http.get(url).send().await.context("HF search request")?;
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .context("HF search request")?;
         if !resp.status().is_success() {
             return Err(anyhow!("HF search returned {}", resp.status()));
         }
         resp.json().await.context("decode search results")
     }
 }
-
 
 /// One row of a fit preview.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -577,15 +619,13 @@ pub struct FitRow {
 /// sibling list, produce per-quant fit rows against the local hardware.
 /// Uses the same KV math as the profile compiler's rule 6.
 #[must_use]
-pub fn fit_rows(
-    siblings: &[HfSibling],
-    vram_bytes: u64,
-    default_ctx: u32,
-) -> Vec<FitRow> {
-        let mut rows = Vec::new();
+pub fn fit_rows(siblings: &[HfSibling], vram_bytes: u64, default_ctx: u32) -> Vec<FitRow> {
+    let mut rows = Vec::new();
     for s in siblings {
         let lower = s.rfilename.to_lowercase();
-        let Some(stem) = lower.strip_suffix(".gguf") else { continue };
+        let Some(stem) = lower.strip_suffix(".gguf") else {
+            continue;
+        };
         if stem.contains("-of-") {
             continue; // shard parts: fit uses the set total via sibling sums
         }
@@ -654,7 +694,11 @@ impl PullLock {
     fn acquire(dirs: &PallamaDirs, name: &str) -> Result<Self> {
         std::fs::create_dir_all(dirs.run_dir())?;
         let path = dirs.run_dir().join(format!("pull-{name}.lock"));
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
             Ok(mut f) => {
                 use std::io::Write;
                 let _ = writeln!(f, "{}", std::process::id());
@@ -752,7 +796,9 @@ impl Puller {
             .as_ref()
             .map(|mm| unique_dest(&models_dir, &mm.filename));
         if let (Some(mm), Some(dest)) = (&selected.mmproj, &mmproj_dest) {
-            self.client.download_file(&target.repo, mm, dest, &mut progress).await?;
+            self.client
+                .download_file(&target.repo, mm, dest, &mut progress)
+                .await?;
         }
         bar.finish_and_clear();
 
@@ -850,9 +896,7 @@ fn unique_dest(dir: &Path, filename: &str) -> PathBuf {
     // Collision: prefix with the parent path from the repo (slugified).
     if let Some(parent) = flat.parent() {
         if !parent.as_os_str().is_empty() {
-            let slug: String = parent
-                .to_string_lossy()
-                .replace(['/', '\\'], "--");
+            let slug: String = parent.to_string_lossy().replace(['/', '\\'], "--");
             return dir.join(format!("{slug}--{}", leaf.to_string_lossy()));
         }
     }
@@ -875,7 +919,7 @@ mod tests {
             sib("m-Q4_K_M.gguf", 1, None),
             sib("m-Q8_0.gguf", 1, None),
             sib("m-00001-of-00002.gguf", 1, None), // shard: excluded
-            sib("README.md", 1, None),              // not gguf: excluded
+            sib("README.md", 1, None),             // not gguf: excluded
         ];
         let w = gguf_health_warning(&bad, "o/m", &sibs).expect("warning");
         assert!(w.contains("refuse to load"), "{w}");
@@ -909,7 +953,10 @@ mod tests {
         HfSibling {
             rfilename: name.to_string(),
             size: Some(size),
-            lfs: sha.map(|s| HfLfs { sha256: s.to_string(), size: Some(size) }),
+            lfs: sha.map(|s| HfLfs {
+                sha256: s.to_string(),
+                size: Some(size),
+            }),
         }
     }
 
@@ -923,7 +970,10 @@ mod tests {
 
     #[test]
     fn unit__registry_name__strips_gguf_and_lowercases() {
-        assert_eq!(registry_name("Qwen/Qwen2.5-0.5B-Instruct-GGUF"), "qwen2.5-0.5b-instruct");
+        assert_eq!(
+            registry_name("Qwen/Qwen2.5-0.5B-Instruct-GGUF"),
+            "qwen2.5-0.5b-instruct"
+        );
         assert_eq!(registry_name("ggml-org/Qwen3-0.6B-GGUF"), "qwen3-0.6b");
         assert_eq!(registry_name("a/b"), "b");
     }
@@ -981,7 +1031,10 @@ mod tests {
             sib("mmproj-model-q8_0.gguf", 30, None),
         ];
         let sel = select_files(&sibs, "Q4_K_M").unwrap();
-        assert_eq!(sel.mmproj.as_ref().unwrap().filename, "mmproj-model-q8_0.gguf");
+        assert_eq!(
+            sel.mmproj.as_ref().unwrap().filename,
+            "mmproj-model-q8_0.gguf"
+        );
     }
 
     #[test]
@@ -1024,7 +1077,9 @@ mod tests {
     // wiremock integration
     // ------------------------------------------------------------------
 
-    fn payload(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
+    fn payload(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
 
     #[tokio::test]
     async fn integration__pull_single_file__downloads_verifies_stores() {
@@ -1057,10 +1112,17 @@ mod tests {
             &api.uri(),
             &dl.uri(),
             None,
-            vec![api.uri().trim_start_matches("http://").to_string(), dl.uri().trim_start_matches("http://").to_string()],
+            vec![
+                api.uri().trim_start_matches("http://").to_string(),
+                dl.uri().trim_start_matches("http://").to_string(),
+            ],
         )
         .unwrap();
-        let puller = Puller { dirs: dirs.clone(), client, bus: EventBus::default() };
+        let puller = Puller {
+            dirs: dirs.clone(),
+            client,
+            bus: EventBus::default(),
+        };
         let row = puller.pull("owner/m-repo:Q4_K_M").await.unwrap();
 
         assert_eq!(row.name, "m-repo");
@@ -1077,7 +1139,10 @@ mod tests {
     #[tokio::test]
     async fn integration__pull_sha_mismatch__partial_deleted_and_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let dirs = PallamaDirs { config_dir: tmp.path().join("cfg"), data_dir: tmp.path().join("data") };
+        let dirs = PallamaDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
         dirs.ensure().unwrap();
         let content = b"corrupt-me".to_vec();
         let wrong_sha = payload(b"something-else");
@@ -1102,17 +1167,31 @@ mod tests {
             vec![host_of(&api.uri()), host_of(&dl.uri())],
         )
         .unwrap();
-        let puller = Puller { dirs: dirs.clone(), client, bus: EventBus::default() };
+        let puller = Puller {
+            dirs: dirs.clone(),
+            client,
+            bus: EventBus::default(),
+        };
         let err = puller.pull("o/r").await.unwrap_err();
         assert!(err.to_string().contains("sha256 mismatch"), "{err}");
-        assert!(dirs.models_dir().read_dir().unwrap().count() == 0, "no partial left behind");
-        assert!(Store::open(&dirs).unwrap().list_models().unwrap().is_empty());
+        assert!(
+            dirs.models_dir().read_dir().unwrap().count() == 0,
+            "no partial left behind"
+        );
+        assert!(Store::open(&dirs)
+            .unwrap()
+            .list_models()
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
     async fn integration__resume_from_part_file__range_and_append() {
         let tmp = tempfile::tempdir().unwrap();
-        let dirs = PallamaDirs { config_dir: tmp.path().join("cfg"), data_dir: tmp.path().join("data") };
+        let dirs = PallamaDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
         dirs.ensure().unwrap();
         let full = b"0123456789abcdef".to_vec();
         let sha = payload(&full);
@@ -1148,7 +1227,11 @@ mod tests {
             vec![host_of(&api.uri()), host_of(&dl.uri())],
         )
         .unwrap();
-        let puller = Puller { dirs, client, bus: EventBus::default() };
+        let puller = Puller {
+            dirs,
+            client,
+            bus: EventBus::default(),
+        };
         let row = puller.pull("o/r").await.unwrap();
         let got = std::fs::read(&row.path).unwrap();
         assert_eq!(got, full, "resumed file must equal full content");
@@ -1174,9 +1257,18 @@ mod tests {
             .mount(&dl)
             .await;
 
-        let client =
-            HfClient::with_bases(&api.uri(), &dl.uri(), None, vec![host_of(&api.uri()), host_of(&dl.uri())]).unwrap();
-        let plan = FilePlan { filename: "r.gguf".into(), bytes: 4, sha256: None };
+        let client = HfClient::with_bases(
+            &api.uri(),
+            &dl.uri(),
+            None,
+            vec![host_of(&api.uri()), host_of(&dl.uri())],
+        )
+        .unwrap();
+        let plan = FilePlan {
+            filename: "r.gguf".into(),
+            bytes: 4,
+            sha256: None,
+        };
         let err = client
             .download_file("o/r", &plan, Path::new("/tmp/never-r.gguf"), |_, _| {})
             .await
@@ -1203,7 +1295,8 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/o/r/resolve/main/r.gguf"))
             .respond_with(
-                ResponseTemplate::new(302).insert_header("Location", format!("{}/lfs/r.gguf", cdn.uri())),
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/lfs/r.gguf", cdn.uri())),
             )
             .expect(1)
             .mount(&first)
@@ -1224,12 +1317,22 @@ mod tests {
         .unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("r.gguf");
-        let plan = FilePlan { filename: "r.gguf".into(), bytes: 3, sha256: Some(payload(&body.clone())) };
-        client.download_file("o/r", &plan, &dest, |_, _| {}).await.unwrap();
+        let plan = FilePlan {
+            filename: "r.gguf".into(),
+            bytes: 3,
+            sha256: Some(payload(&body.clone())),
+        };
+        client
+            .download_file("o/r", &plan, &dest, |_, _| {})
+            .await
+            .unwrap();
 
         // Inspect what the CDN actually received.
         let requests = cdn.received_requests().await.unwrap();
-        let cdn_req = requests.iter().find(|r| r.url.path() == "/lfs/r.gguf").expect("cdn hit");
+        let cdn_req = requests
+            .iter()
+            .find(|r| r.url.path() == "/lfs/r.gguf")
+            .expect("cdn hit");
         assert!(
             cdn_req.headers.get("authorization").is_none(),
             "token must NEVER reach a CDN host"
@@ -1247,25 +1350,37 @@ mod tests {
         let client =
             HfClient::with_bases(&api.uri(), &api.uri(), None, vec![host_of(&api.uri())]).unwrap();
         let err = client.model_info("o/gated").await.unwrap_err();
-        assert!(err.to_string().contains("gated") && err.to_string().contains("HF_TOKEN"), "{err}");
+        assert!(
+            err.to_string().contains("gated") && err.to_string().contains("HF_TOKEN"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
     async fn integration__lock_contention__second_pull_errors() {
         let tmp = tempfile::tempdir().unwrap();
-        let dirs = PallamaDirs { config_dir: tmp.path().join("cfg"), data_dir: tmp.path().join("data") };
+        let dirs = PallamaDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
         dirs.ensure().unwrap();
         let held = PullLock::acquire(&dirs, "m").unwrap();
         let err = PullLock::acquire(&dirs, "m").unwrap_err();
         assert!(err.to_string().contains("already in progress"), "{err}");
         drop(held);
-        assert!(PullLock::acquire(&dirs, "m").is_ok(), "lock released on drop");
+        assert!(
+            PullLock::acquire(&dirs, "m").is_ok(),
+            "lock released on drop"
+        );
     }
 
     #[tokio::test]
     async fn integration__pull_shard_set__both_parts_and_count_recorded() {
         let tmp = tempfile::tempdir().unwrap();
-        let dirs = PallamaDirs { config_dir: tmp.path().join("cfg"), data_dir: tmp.path().join("data") };
+        let dirs = PallamaDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
         dirs.ensure().unwrap();
         let p1 = b"part-one--".to_vec();
         let p2 = b"part-two".to_vec();
@@ -1299,10 +1414,17 @@ mod tests {
             vec![host_of(&api.uri()), host_of(&dl.uri())],
         )
         .unwrap();
-        let puller = Puller { dirs: dirs.clone(), client, bus: EventBus::default() };
+        let puller = Puller {
+            dirs: dirs.clone(),
+            client,
+            bus: EventBus::default(),
+        };
         let row = puller.pull("o/big:Q4_K_M").await.unwrap();
         assert_eq!(row.shards, 2);
-        assert!(row.path.ends_with("-00001-of-00002.gguf"), "first shard is the launch path");
+        assert!(
+            row.path.ends_with("-00001-of-00002.gguf"),
+            "first shard is the launch path"
+        );
         assert!(Path::new(&row.path).exists());
         let second = dirs.models_dir().join("big-q4_k_m-00002-of-00002.gguf");
         assert!(second.exists(), "second shard stored alongside");

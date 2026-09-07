@@ -1,10 +1,21 @@
 //! Hardware assembly: sysinfo (CPU/RAM) + engine manifest devices.
 
+/// Live `MemAvailable` (MiB). The spawn-time memory guard: below a hard
+/// floor the mmap streaming engine will thrash swap for minutes — fail
+/// the load with a named error instead (the validate.py heuristic,
+/// tightened to a zero-false-positive floor).
+#[must_use]
+pub fn mem_available_mib() -> u64 {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    sys.available_memory() / (1024 * 1024)
+}
+
 use pallama_core::{GpuInfo, Hardware};
 
 use crate::engine::manifest::Manifest;
 
-#[must_use] 
+#[must_use]
 pub fn probe_hardware(manifest: Option<&Manifest>) -> Hardware {
     let mut sys = sysinfo::System::new();
     sys.refresh_cpu_usage();
@@ -27,7 +38,11 @@ pub fn probe_hardware(manifest: Option<&Manifest>) -> Hardware {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    Hardware { physical_cores, total_ram_mib, gpus }
+    Hardware {
+        physical_cores,
+        total_ram_mib,
+        gpus,
+    }
 }
 
 #[cfg(test)]

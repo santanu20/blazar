@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use pallama_core::hardware::{GpuInfo, Hardware};
 use pallama_core::store::Store;
 use pallama_core::{Config, PallamaDirs};
-use pallama_runtime::EventBus;
 use pallama_runtime::engine::manifest::{probe as probe_manifest, Manifest};
+use pallama_runtime::EventBus;
 use pallama_runtime::{LlamaCppEngine, SupervisionError, Supervisor};
 
 fn stub_bin() -> PathBuf {
@@ -104,7 +104,11 @@ fn supervisor(dirs: &PallamaDirs, config: Config, gpu: bool) -> Arc<Supervisor> 
             }],
         }
     } else {
-        Hardware { physical_cores: 4, total_ram_mib: 16_000, gpus: vec![] }
+        Hardware {
+            physical_cores: 4,
+            total_ram_mib: 16_000,
+            gpus: vec![],
+        }
     };
     let mut s = Supervisor::new(
         dirs.clone(),
@@ -151,16 +155,31 @@ async fn integration__ensure_ready__health_and_argv_flags() {
     let argv: Vec<String> =
         serde_json::from_str(&std::fs::read_to_string(dirs.run_dir().join("argv.json")).unwrap())
             .unwrap();
-    for flag in ["--jinja", "--metrics", "--flash-attn", "--cache-reuse", "--sleep-idle-seconds", "--cache-ram", "-np", "--slot-save-path"] {
-        assert!(argv.contains(&flag.to_string()), "missing {flag} in {argv:?}");
+    for flag in [
+        "--jinja",
+        "--metrics",
+        "--flash-attn",
+        "--cache-reuse",
+        "--sleep-idle-seconds",
+        "--cache-ram",
+        "-np",
+        "--slot-save-path",
+    ] {
+        assert!(
+            argv.contains(&flag.to_string()),
+            "missing {flag} in {argv:?}"
+        );
     }
     // sessions dir is per-model under the data dir
+    assert!(
+        argv.windows(2)
+            .any(|w| w[0] == "--slot-save-path" && w[1].ends_with("sessions/m1/")),
+        "slot-save-path per-model dir: {argv:?}"
+    );
+    assert!(argv.windows(2).any(|w| w[0] == "--alias" && w[1] == "m1"));
     assert!(argv
         .windows(2)
-        .any(|w| w[0] == "--slot-save-path" && w[1].ends_with("sessions/m1/")),
-    "slot-save-path per-model dir: {argv:?}");
-    assert!(argv.windows(2).any(|w| w[0] == "--alias" && w[1] == "m1"));
-    assert!(argv.windows(2).any(|w| w[0] == "--ctx-size" && w[1] == "16384"));
+        .any(|w| w[0] == "--ctx-size" && w[1] == "16384"));
 
     // ps shows ready with ctx.
     let ps = sup.ps();
@@ -182,6 +201,55 @@ async fn integration__ensure_unknown_model__named_error() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn integration__capacity_two__hot_cache_survives_cold_eviction() {
+    // Prefix heat biases capacity eviction: with m1 hot (agent traffic)
+    // and m2 cold, admitting m3 must evict m2 — NOT the hot m1 — even
+    // though both are idle. Recency weighting: heat = hits/2 + 1.
+    let (_t, dirs) = setup(&[("m1", 500), ("m2", 500), ("m3", 500)]);
+    let mut cfg = base_config();
+    cfg.max_loaded_models = 2;
+    let sup = supervisor(&dirs, cfg, false);
+    sup.ensure("m1").await.unwrap();
+    sup.ensure("m2").await.unwrap();
+    // m1 gets the traffic (three hits — decisively above cold 0).
+    sup.note_prefix_hit("m1");
+    sup.note_prefix_hit("m1");
+    sup.note_prefix_hit("m1");
+    assert!(sup.heat_of("m1") >= 2);
+    assert_eq!(sup.heat_of("m2"), 0);
+    sup.ensure("m3").await.unwrap();
+    let names: Vec<String> = sup.ps().iter().map(|p| p.name.clone()).collect();
+    assert!(
+        names.contains(&"m1".to_string()),
+        "hot m1 survived: {names:?}"
+    );
+    assert!(
+        !names.contains(&"m2".to_string()),
+        "cold m2 evicted: {names:?}"
+    );
+    sup.shutdown_all().await.unwrap();
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn unit__prefix_heat__saturating_add_and_decay_semantics() {
+    let (_t, dirs) = setup(&[]);
+    let sup = supervisor(&dirs, base_config(), false);
+    for _ in 0..10 {
+        sup.note_prefix_hit("m");
+    }
+    // Saturating add: monotonically hot within a half-life window.
+    assert_eq!(sup.heat_of("m"), 10);
+    assert_eq!(sup.heat_of("never-seen"), 0);
+    // Cap exists (bounded counters).
+    for _ in 0..2000 {
+        sup.note_prefix_hit("m");
+    }
+    assert!(sup.heat_of("m") <= 1000);
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn integration__capacity_one__second_ensure_evicts_idle_first() {
     let (_t, dirs) = setup(&[("m1", 500), ("m2", 500)]);
     let mut cfg = base_config();
@@ -194,7 +262,13 @@ async fn integration__capacity_one__second_ensure_evicts_idle_first() {
     assert_eq!(ps[0].name, "m2", "idle m1 evicted for m2");
     // First model respawns on demand.
     let ep = sup.ensure("m1").await.unwrap();
-    assert_ne!(ep.endpoint, pallama_core::Endpoint::Tcp { host: "127.0.0.1".into(), port: 0 });
+    assert_ne!(
+        ep.endpoint,
+        pallama_core::Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port: 0
+        }
+    );
     sup.shutdown_all().await.unwrap();
 }
 
@@ -212,7 +286,12 @@ async fn integration__ladder__sleep_then_evict() {
         Hardware {
             physical_cores: 4,
             total_ram_mib: 16_000,
-            gpus: vec![GpuInfo { name: "g".into(), description: "S".into(), total_mib: 24_000, free_mib: 24_000 }],
+            gpus: vec![GpuInfo {
+                name: "g".into(),
+                description: "S".into(),
+                total_mib: 24_000,
+                free_mib: 24_000,
+            }],
         },
         Arc::new(LlamaCppEngine::new(stub_manifest())),
     );
@@ -237,7 +316,10 @@ async fn integration__ladder__sleep_then_evict() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     assert!(sup.ps().is_empty(), "ladder: Sleeping -> Evicted");
-    assert!(!dirs.run_dir().join("m1.pid").exists(), "pid marker removed");
+    assert!(
+        !dirs.run_dir().join("m1.pid").exists(),
+        "pid marker removed"
+    );
 }
 
 #[tokio::test]
@@ -325,7 +407,11 @@ async fn integration__load_timeout__never_healthy_stub() {
         dirs.clone(),
         base_config(),
         EventBus::default(),
-        Hardware { physical_cores: 4, total_ram_mib: 16_000, gpus: vec![] },
+        Hardware {
+            physical_cores: 4,
+            total_ram_mib: 16_000,
+            gpus: vec![],
+        },
         Arc::new(engine),
     );
     let mut s = s;
@@ -349,17 +435,29 @@ fn unit__capacity_auto__cpu_one_gpu_vram_ratio() {
         dirs,
         base_config(),
         EventBus::default(),
-        Hardware { physical_cores: 4, total_ram_mib: 16_000, gpus: vec![] },
+        Hardware {
+            physical_cores: 4,
+            total_ram_mib: 16_000,
+            gpus: vec![],
+        },
         Arc::new(LlamaCppEngine::new(stub_manifest())),
     );
     assert_eq!(s.capacity_for(1_000_000_000), 1, "CPU-only -> 1");
     let gpu_hw = Hardware {
         physical_cores: 4,
         total_ram_mib: 16_000,
-        gpus: vec![GpuInfo { name: "g".into(), description: "S".into(), total_mib: 24_576, free_mib: 24_576 }],
+        gpus: vec![GpuInfo {
+            name: "g".into(),
+            description: "S".into(),
+            total_mib: 24_576,
+            free_mib: 24_576,
+        }],
     };
     let s2 = Supervisor::new(
-        PallamaDirs { config_dir: std::path::PathBuf::from("/tmp/p-cfg"), data_dir: std::path::PathBuf::from("/tmp/p-data") },
+        PallamaDirs {
+            config_dir: std::path::PathBuf::from("/tmp/p-cfg"),
+            data_dir: std::path::PathBuf::from("/tmp/p-data"),
+        },
         base_config(),
         EventBus::default(),
         gpu_hw,
@@ -371,10 +469,18 @@ fn unit__capacity_auto__cpu_one_gpu_vram_ratio() {
     let hw_234 = Hardware {
         physical_cores: 4,
         total_ram_mib: 16_000,
-        gpus: vec![GpuInfo { name: "g".into(), description: "S".into(), total_mib: 24_000, free_mib: 24_000 }],
+        gpus: vec![GpuInfo {
+            name: "g".into(),
+            description: "S".into(),
+            total_mib: 24_000,
+            free_mib: 24_000,
+        }],
     };
     let s3 = Supervisor::new(
-        PallamaDirs { config_dir: std::path::PathBuf::from("/tmp/p-cfg"), data_dir: std::path::PathBuf::from("/tmp/p-data") },
+        PallamaDirs {
+            config_dir: std::path::PathBuf::from("/tmp/p-cfg"),
+            data_dir: std::path::PathBuf::from("/tmp/p-data"),
+        },
         base_config(),
         EventBus::default(),
         hw_234,
