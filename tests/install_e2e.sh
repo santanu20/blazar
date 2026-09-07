@@ -13,7 +13,7 @@
 
 set -eu
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 INSTALL_SH="$ROOT/scripts/install.sh"
 BIN="$ROOT/target/release/pallama"
 
@@ -40,12 +40,25 @@ DECOY="pallama-${TAG}-aarch64-unknown-linux-gnu.tar.gz"
 TMP=$(mktemp -d)
 SRV="$TMP/srv"
 mkdir -p "$SRV" "$TMP/home"
+
+# Fake privileged environment: "sudo" executes plainly, "systemctl" says
+# the unit is inactive (so the enable path runs) and accepts everything.
+cat > "$TMP/fakesudo" <<'EOF'
+#!/bin/sh
+exec "$@"
+EOF
+chmod +x "$TMP/fakesudo"
+cat > "$TMP/fakesystemctl" <<'EOF'
+#!/bin/sh
+case "$1" in
+    is-active) exit 3 ;;
+    *) exit 0 ;;
+esac
+EOF
+chmod +x "$TMP/fakesystemctl"
+UNIT_OUT="$TMP/pallama.service"
+SYSTEM_BIN="$TMP/system-bin"
 SERVER_PID=
-cleanup() {
-    if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; fi
-    rm -rf "$TMP"
-}
-trap cleanup EXIT INT TERM
 
 # Package the host binary exactly like the release workflow: flat root.
 STAGE="$TMP/stage"
@@ -56,6 +69,11 @@ tar -czf "$SRV/$ASSET" -C "$STAGE" .
 SHA=$(sha256sum "$SRV/$ASSET" | cut -d' ' -f1)
 echo "DECOY-BYTES-NOT-A-REAL-ASSET" > "$SRV/$DECOY"
 
+cleanup() {
+    [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
+    rm -rf "$TMP"
+}
+trap cleanup EXIT INT TERM
 PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
 
 cat > "$TMP/serve.py" <<EOF
@@ -95,6 +113,8 @@ SERVER_PID=$!
 
 BASE="http://127.0.0.1:${PORT}"
 
+INSTALL_ENV="HOME=$TMP/home PALLAMA_INSTALL_BASE_URL=$BASE PALLAMA_SUDO=$TMP/fakesudo PALLAMA_SYSTEMCTL=$TMP/fakesystemctl PALLAMA_SYSTEM_BIN_DIR=$SYSTEM_BIN PALLAMA_UNIT_PATH=$UNIT_OUT"
+
 # Readiness probe: the decoy asset exists before the server starts; release
 # metadata is written per test case below.
 i=0
@@ -112,23 +132,24 @@ bad()  { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
 printf '{"tag_name":"%s","assets":[{"name":"%s","digest":"sha256:0000","browser_download_url":"%s/download/%s"},{"name":"%s","digest":"sha256:%s","browser_download_url":"%s/download/%s"}]}' \
     "$TAG" "$DECOY" "$BASE" "$DECOY" "$ASSET" "$SHA" "$BASE" "$ASSET" > "$SRV/release.json"
 
-OUT=$(HOME="$TMP/home" PALLAMA_INSTALL_BASE_URL="$BASE" \
-    PALLAMA_INSTALL_DIR="$TMP/bin" sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
-if [ "$RC" = 0 ] && [ -x "$TMP/bin/pallama" ] && "$TMP/bin/pallama" --version >/dev/null 2>&1; then
-    ok "install succeeded, binary runs ($TARGET)"
+OUT=$(env $INSTALL_ENV sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
+if [ "$RC" = 0 ] && [ -x "$SYSTEM_BIN/pallama" ] && "$SYSTEM_BIN/pallama" --version >/dev/null 2>&1; then
+    ok "system install succeeded, binary runs ($TARGET)"
 else
     bad "install failed (rc=$RC)"; echo "$OUT" | sed 's/^/    /'
 fi
+[ -f "$UNIT_OUT" ] && ok "systemd unit written" || bad "no unit at $UNIT_OUT"
+grep -q "Restart=always" "$UNIT_OUT" 2>/dev/null && ok "unit Restart=always" || bad "unit lacks Restart=always"
+grep -q "ExecStart=$SYSTEM_BIN/pallama serve" "$UNIT_OUT" 2>/dev/null &&
+    ok "unit ExecStart points at the installed binary" || bad "unit ExecStart wrong"
 echo "$OUT" | grep -q "sha256 verified" && ok "digest verified message" || bad "no 'sha256 verified' in output"
-
 # --- 2. tampered digest ------------------------------------------------------
 printf '{"tag_name":"%s","assets":[{"name":"%s","digest":"sha256:%s","browser_download_url":"%s/download/%s"}]}' \
     "$TAG" "$ASSET" "0${SHA#?}" "$BASE" "$ASSET" > "$SRV/release.json"
 
-rm -rf "$TMP/bin2"
-OUT=$(HOME="$TMP/home" PALLAMA_INSTALL_BASE_URL="$BASE" \
-    PALLAMA_INSTALL_DIR="$TMP/bin2" sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
-if [ "$RC" != 0 ] && [ ! -e "$TMP/bin2/pallama" ]; then
+rm -rf "$SYSTEM_BIN" "$UNIT_OUT"
+OUT=$(env $INSTALL_ENV sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
+if [ "$RC" != 0 ] && [ ! -e "$SYSTEM_BIN/pallama" ]; then
     ok "tampered digest rejected, nothing installed"
 else
     bad "tampered digest NOT rejected (rc=$RC)"
@@ -139,10 +160,9 @@ echo "$OUT" | grep -q "sha256 mismatch" && ok "mismatch error names the cause" |
 printf '{"tag_name":"%s","assets":[{"name":"%s","digest":"sha256:0000","browser_download_url":"%s/download/%s"}]}' \
     "$TAG" "$DECOY" "$BASE" "$DECOY" > "$SRV/release.json"
 
-rm -rf "$TMP/bin3"
-OUT=$(HOME="$TMP/home" PALLAMA_INSTALL_BASE_URL="$BASE" \
-    PALLAMA_INSTALL_DIR="$TMP/bin3" sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
-if [ "$RC" != 0 ] && [ ! -e "$TMP/bin3/pallama" ]; then
+rm -rf "$SYSTEM_BIN" "$UNIT_OUT"
+OUT=$(env $INSTALL_ENV sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
+if [ "$RC" != 0 ] && [ ! -e "$SYSTEM_BIN/pallama" ]; then
     ok "missing-asset release rejected, nothing installed"
 else
     bad "missing asset NOT rejected (rc=$RC)"
