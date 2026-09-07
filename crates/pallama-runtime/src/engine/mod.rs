@@ -19,6 +19,18 @@ use manifest::Manifest;
 
 pub const KEEP_TAGS: usize = 3;
 pub const LOCAL_TAG: &str = "local";
+/// Wait between asset-list re-fetches while a fresh release finishes
+/// uploading (observed: full asset matrix lands ~75-120 s after publish).
+pub const ASSET_UPLOAD_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(20);
+pub const ASSET_UPLOAD_RETRY_ATTEMPTS: usize = 6;
+/// A release younger than this is considered "still uploading".
+pub const FRESH_RELEASE_SECS: i64 = 600;
+
+fn release_is_fresh(release: &GhRelease) -> bool {
+    release
+        .published_epoch()
+        .is_some_and(|t| now_secs().saturating_sub(t) < FRESH_RELEASE_SECS)
+}
 
 pub struct EngineManager {
     pub dirs: PallamaDirs,
@@ -30,7 +42,7 @@ pub struct EngineManager {
 /// System-level GPU vendor hint used to pick the first engine asset
 /// (before any engine exists to probe). Filesystem checks — no GPU libs
 /// loaded, works on every distro.
-#[must_use] 
+#[must_use]
 pub fn system_vendor_hint() -> manifest::Vendor {
     let nvidia = Path::new("/proc/driver/nvidia").exists() || which_first(&["nvidia-smi"]);
     if nvidia {
@@ -49,63 +61,142 @@ pub fn system_vendor_hint() -> manifest::Vendor {
 fn which_first(names: &[&str]) -> bool {
     names.iter().any(|n| {
         std::env::var_os("PATH")
-            .is_some_and(|paths| {
-                std::env::split_paths(&paths).any(|dir| dir.join(n).exists())
-            })
+            .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(n).exists()))
     })
 }
 
 impl EngineManager {
     /// Install the requested (or newest) b-tag build and activate it.
     pub async fn update(&self, tag: Option<&str>) -> Result<EngineRow> {
-        let release = match tag {
+        self.update_with_retry_delay(tag, ASSET_UPLOAD_RETRY_DELAY)
+            .await
+    }
+
+    /// `update` with an injectable inter-attempt delay (tests pin the
+    /// fresh-release wait without sleeping 20 s).
+    pub async fn update_with_retry_delay(
+        &self,
+        tag: Option<&str>,
+        retry_delay: std::time::Duration,
+    ) -> Result<EngineRow> {
+        let mut release = match tag {
             Some(t) => self.gh.resolve_tag(t).await?,
             None => self.gh.latest_b_release().await?,
         };
         let tag_name = release.tag_name.clone();
-        let suffix = self.pick_suffix(&release)?;
-        self.install(&release, &suffix).await
-            .with_context(|| format!("install {tag_name} asset {suffix}"))
+        for attempt in 0..=ASSET_UPLOAD_RETRY_ATTEMPTS {
+            match self.pick(&release)? {
+                Some(pick) => {
+                    let last = attempt == ASSET_UPLOAD_RETRY_ATTEMPTS;
+                    if pick.cpu_fallback && release_is_fresh(&release) && !last {
+                        // Fresh release: the GPU asset is probably still
+                        // uploading. Wait for it instead of degrading now.
+                        tracing::warn!(
+                            "release {} is fresh and its GPU asset is not up yet; \
+                             waiting {:?} for the upload (attempt {}/{})",
+                            tag_name,
+                            retry_delay,
+                            attempt + 1,
+                            ASSET_UPLOAD_RETRY_ATTEMPTS + 1
+                        );
+                        tokio::time::sleep(retry_delay).await;
+                        release = self.gh.release_by_tag(&tag_name).await?;
+                        continue;
+                    }
+                    if pick.cpu_fallback {
+                        tracing::warn!(
+                            "no GPU asset for this machine in release {}; installed the \
+                             CPU build ({}) instead — re-run `pallama engine update` \
+                             later to pick up the GPU build",
+                            tag_name,
+                            pick.label
+                        );
+                    }
+                    return self
+                        .install_picked(&release, &pick)
+                        .await
+                        .with_context(|| format!("install {tag_name} asset {}", pick.label));
+                }
+                None if release_is_fresh(&release) && attempt < ASSET_UPLOAD_RETRY_ATTEMPTS => {
+                    tracing::warn!(
+                        "release {} published moments ago and its assets are still \
+                         uploading; waiting {:?} (attempt {}/{})",
+                        tag_name,
+                        retry_delay,
+                        attempt + 1,
+                        ASSET_UPLOAD_RETRY_ATTEMPTS + 1
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                    release = self.gh.release_by_tag(&tag_name).await?;
+                }
+                None => {
+                    return Err(anyhow!(
+                        "no usable asset for {}/{} in release {} (assets may still be \
+                         uploading; retry in a minute). available: {}",
+                        std::env::consts::OS,
+                        std::env::consts::ARCH,
+                        tag_name,
+                        release
+                            .assets
+                            .iter()
+                            .map(|a| a.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+            }
+        }
+        unreachable!("retry loop always returns or errors")
     }
 
-    /// Preference-ordered asset suffix for this machine, honoring
-    /// `engine_asset` override ("auto" = detect).
-    fn pick_suffix(&self, release: &GhRelease) -> Result<String> {
+    /// Resolve the asset for this machine: explicit `engine_asset`
+    /// override first (exact name, teaching error on miss), then the
+    /// auto matrix against the release's actual assets.
+    fn pick(&self, release: &GhRelease) -> Result<Option<gh::AssetPick>> {
         if self.asset_override != "auto" && !self.asset_override.is_empty() {
             let name = gh::asset_filename(&release.tag_name, &self.asset_override);
             if release.assets.iter().any(|a| a.name == name) {
-                return Ok(self.asset_override.clone());
+                return Ok(Some(gh::AssetPick {
+                    name,
+                    label: self.asset_override.clone(),
+                    cpu_fallback: false,
+                }));
             }
             return Err(anyhow!(
                 "asset {} not present in release {}; available: {}",
                 name,
                 release.tag_name,
-                release.assets.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
+                release
+                    .assets
+                    .iter()
+                    .map(|a| a.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
         let os = std::env::consts::OS;
         let arch = std::env::consts::ARCH;
         let vendor = system_vendor_hint();
-        for suffix in gh::pick_asset(os, arch, Some(vendor)) {
-            let name = gh::asset_filename(&release.tag_name, suffix);
-            if release.assets.iter().any(|a| a.name == name) {
-                return Ok(suffix.to_string());
-            }
-        }
-        Err(anyhow!(
-            "no usable asset for {os}/{arch} in release {}",
-            release.tag_name
-        ))
+        Ok(gh::resolve_asset(release, os, arch, Some(vendor)))
     }
 
     /// Download, verify, extract, probe, store, activate, prune.
-    pub async fn install(&self, release: &GhRelease, suffix: &str) -> Result<EngineRow> {
-        let name = gh::asset_filename(&release.tag_name, suffix);
+    pub async fn install_picked(
+        &self,
+        release: &GhRelease,
+        pick: &gh::AssetPick,
+    ) -> Result<EngineRow> {
         let asset = release
             .assets
             .iter()
-            .find(|a| a.name == name)
-            .ok_or_else(|| anyhow!("asset {name} missing from release {}", release.tag_name))?;
+            .find(|a| a.name == pick.name)
+            .ok_or_else(|| {
+                anyhow!(
+                    "asset {} missing from release {}",
+                    pick.name,
+                    release.tag_name
+                )
+            })?;
         let bytes = self.gh.download_asset_bytes(asset).await?;
         let digest = asset
             .digest
@@ -118,20 +209,21 @@ impl EngineManager {
             std::fs::remove_dir_all(&dir).context("replace existing engine dir")?;
         }
         std::fs::create_dir_all(&dir)?;
-        extract_archive(&bytes, &dir, &name)?;
+        extract_archive(&bytes, &dir, &pick.name)?;
         let server = find_server(&dir)?;
         make_executable(&server);
 
         let m = manifest::probe(&server, &release.tag_name)?;
-        if m.devices.is_empty() && suffix.contains("vulkan") || m.devices.is_empty() && suffix.contains("cuda") {
+        if m.devices.is_empty() && (pick.label.contains("vulkan") || pick.label.contains("cuda")) {
             tracing::warn!(
-                "engine {} ({suffix}) reports 0 GPUs; a CPU asset may serve you better",
-                release.tag_name
+                "engine {} ({}) reports 0 GPUs; a CPU asset may serve you better",
+                release.tag_name,
+                pick.label
             );
         }
         let row = EngineRow {
             tag: release.tag_name.clone(),
-            asset: suffix.to_string(),
+            asset: pick.label.clone(),
             sha256: digest,
             installed_at: now_secs(),
             active: false,
@@ -140,7 +232,9 @@ impl EngineManager {
         let store = Store::open(&self.dirs)?;
         store.upsert_engine(&row)?;
         store.set_active_engine(&release.tag_name)?;
-        self.bus.publish(PallamaEvent::EngineUpdated { tag: release.tag_name.clone() });
+        self.bus.publish(PallamaEvent::EngineUpdated {
+            tag: release.tag_name.clone(),
+        });
         self.prune(&store)?;
         Ok(row)
     }
@@ -149,7 +243,9 @@ impl EngineManager {
     pub fn use_tag(&self, tag: &str) -> Result<EngineRow> {
         let store = Store::open(&self.dirs)?;
         store.set_active_engine(tag)?;
-        self.bus.publish(PallamaEvent::EngineUpdated { tag: tag.to_string() });
+        self.bus.publish(PallamaEvent::EngineUpdated {
+            tag: tag.to_string(),
+        });
         store
             .list_engines()?
             .into_iter()
@@ -192,16 +288,24 @@ impl EngineManager {
             }
             store.delete_engine(&e.tag)?;
             tracing::info!("pruned old engine {}", e.tag);
-            self.bus.publish(PallamaEvent::EngineRemoved { tag: e.tag.clone() });
+            self.bus
+                .publish(PallamaEvent::EngineRemoved { tag: e.tag.clone() });
         }
         Ok(())
     }
 
     /// Register a locally built llama-server (`PALLAMA_ENGINE_PATH`) under the
     /// pseudo-tag `local`. Never pruned; activation follows `use_tag`.
-    pub fn register_local(&self, server: &Path, extra_env: &std::collections::BTreeMap<String, String>) -> Result<EngineRow> {
+    pub fn register_local(
+        &self,
+        server: &Path,
+        extra_env: &std::collections::BTreeMap<String, String>,
+    ) -> Result<EngineRow> {
         if !server.exists() {
-            return Err(anyhow!("PALLAMA_ENGINE_PATH {} does not exist", server.display()));
+            return Err(anyhow!(
+                "PALLAMA_ENGINE_PATH {} does not exist",
+                server.display()
+            ));
         }
         // Probe under the configured engine env (e.g. GGML_BACKEND_PATH so
         // a CUDA build actually discovers its GPU).
@@ -236,7 +340,9 @@ impl EngineManager {
     /// Active engine's manifest (probed capabilities).
     pub fn active_manifest(&self) -> Result<Option<Manifest>> {
         let store = Store::open(&self.dirs)?;
-        let Some(row) = store.active_engine()? else { return Ok(None) };
+        let Some(row) = store.active_engine()? else {
+            return Ok(None);
+        };
         let m: Manifest = serde_json::from_str(&row.manifest)
             .with_context(|| format!("decode manifest for {}", row.tag))?;
         Ok(Some(m))
@@ -244,13 +350,18 @@ impl EngineManager {
 }
 
 fn now_secs() -> i64 {
-    i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
-        .unwrap_or(i64::MAX)
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+    .unwrap_or(i64::MAX)
 }
 
 /// Extract tar.gz or zip into `dir` (strip nothing; roots are discovered).
 #[allow(clippy::case_sensitive_file_extension_comparisons)] // exact upstream asset names
-fn extract_archive(bytes: &[u8], dir: &Path, asset_name: &str) -> Result<()> {
+pub(crate) fn extract_archive(bytes: &[u8], dir: &Path, asset_name: &str) -> Result<()> {
     if asset_name.ends_with(".zip") {
         let reader = std::io::Cursor::new(bytes);
         let mut zip = zip::ZipArchive::new(reader).context("open zip")?;
@@ -268,14 +379,17 @@ fn extract_archive(bytes: &[u8], dir: &Path, asset_name: &str) -> Result<()> {
 /// (release archives use `llama-<tag>/llama-server` roots).
 fn find_server(dir: &Path) -> Result<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
         for e in entries.flatten() {
             let p = e.path();
             if p.is_dir() {
                 walk(&p, out);
-            } else if p.file_name().is_some_and(|n| {
-                n == "llama-server" || n == "llama-server.exe"
-            }) {
+            } else if p
+                .file_name()
+                .is_some_and(|n| n == "llama-server" || n == "llama-server.exe")
+            {
                 out.push(p);
             }
         }

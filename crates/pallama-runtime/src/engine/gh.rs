@@ -29,6 +29,42 @@ pub struct GhRelease {
     pub prerelease: bool,
     #[serde(default)]
     pub assets: Vec<GhAsset>,
+    /// ISO-8601 publish time, e.g. "2026-09-07T06:49:18Z". GitHub serves
+    /// release metadata before assets finish uploading (~2 min stagger);
+    /// freshness decides whether a missing asset is worth waiting for.
+    #[serde(default)]
+    pub published_at: Option<String>,
+}
+
+impl GhRelease {
+    /// Publish time as unix seconds, if present and well-formed.
+    #[must_use]
+    pub fn published_epoch(&self) -> Option<i64> {
+        iso_to_epoch(self.published_at.as_deref()?)
+    }
+}
+
+/// Parse GitHub's Zulu ISO-8601 ("YYYY-MM-DDTHH:MM:SS[.fff]Z") to unix
+/// seconds. No datetime dependency: days-from-civil (Howard Hinnant).
+/// Names mirror the published algorithm.
+#[allow(clippy::many_single_char_names, clippy::unreadable_literal)]
+fn iso_to_epoch(iso: &str) -> Option<i64> {
+    let (date, rest) = iso.split_once('T')?;
+    let time = rest.trim_end_matches('Z');
+    let time = time.split('.').next().unwrap_or(time);
+    let mut d_parts = date.split('-');
+    let (y, m, d) = (d_parts.next()?, d_parts.next()?, d_parts.next()?);
+    let mut t_parts = time.split(':');
+    let (h, mi, s) = (t_parts.next()?, t_parts.next()?, t_parts.next()?);
+    let (y, m, d): (i64, i64, i64) = (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);
+    let (h, mi, s): (i64, i64, i64) = (h.parse().ok()?, mi.parse().ok()?, s.parse().ok()?);
+    let (y_adj, m_adj) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = if y_adj >= 0 { y_adj } else { y_adj - 399 } / 400;
+    let yoe = y_adj - era * 400;
+    let doy = (153 * m_adj + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86_400 + h * 3_600 + mi * 60 + s)
 }
 
 pub struct GhClient {
@@ -47,6 +83,10 @@ impl GhClient {
     }
 
     pub fn with_base(base: &str, token: Option<String>) -> Result<Self> {
+        // An empty env var (GH_TOKEN="") must degrade to anonymous —
+        // "Bearer " is an invalid credential and 401s where no-token
+        // would succeed.
+        let token = token.filter(|t| !t.trim().is_empty());
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("accept", "application/vnd.github+json".parse()?);
         headers.insert("user-agent", "pallama (llama.cpp orchestrator)".parse()?);
@@ -116,7 +156,10 @@ impl GhClient {
         match resp.status() {
             reqwest::StatusCode::OK => {}
             reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS => {
-                return Err(anyhow!("GitHub API rate limited ({}). Set GH_TOKEN", resp.status()));
+                return Err(anyhow!(
+                    "GitHub API rate limited ({}). Set GH_TOKEN",
+                    resp.status()
+                ));
             }
             other => return Err(anyhow!("GitHub release API {other} for {path}")),
         }
@@ -194,7 +237,11 @@ impl GhClient {
         }
         let resp = req.send().await.context("asset download failed")?;
         if !resp.status().is_success() {
-            return Err(anyhow!("asset download {} returned {}", asset.name, resp.status()));
+            return Err(anyhow!(
+                "asset download {} returned {}",
+                asset.name,
+                resp.status()
+            ));
         }
         let bytes = resp.bytes().await.context("read asset body")?;
         if let Some(digest) = &asset.digest {
@@ -210,47 +257,164 @@ impl GhClient {
                 ));
             }
         } else {
-            tracing::warn!("asset {} has no digest in release metadata; skipping sha verify", asset.name);
+            tracing::warn!(
+                "asset {} has no digest in release metadata; skipping sha verify",
+                asset.name
+            );
         }
         Ok(bytes.to_vec())
     }
 }
 
-/// Pick the right asset suffix for this machine, given the GPU vendor
-/// detected on the engine (or None for CPU-only). Matrix verified against
-/// the b10816 asset list.
-#[must_use] 
-pub fn pick_asset(os: &str, arch: &str, vendor: Option<crate::engine::manifest::Vendor>) -> Vec<&'static str> {
-    // Preference order; first existing asset wins.
+/// One asset preference entry. `Versioned` matches any
+/// `llama-{tag}-bin-{prefix}{X.Y}{suffix}.{ext}` and picks the highest
+/// version, so upstream bumps (cuda-13.3 -> 13.4, rocm-10.0 -> 11.0)
+/// keep working without a pallama release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Candidate {
+    Exact(&'static str),
+    Versioned {
+        prefix: &'static str,
+        suffix: &'static str,
+    },
+    Cpu(&'static str),
+}
+
+/// Ordered asset preference for this machine. `Cpu` entries are
+/// last-resort: they resolve only when every GPU variant is absent and
+/// the caller warns loudly (never a silent CPU fallback).
+#[must_use]
+pub fn pick_asset(
+    os: &str,
+    arch: &str,
+    vendor: Option<crate::engine::manifest::Vendor>,
+) -> Vec<Candidate> {
+    use crate::engine::manifest::Vendor;
+    use Candidate::{Cpu, Exact, Versioned};
     match (os, arch) {
         ("linux", "x86_64" | "x64" | "amd64") => match vendor {
-            Some(crate::engine::manifest::Vendor::Nvidia) => vec!["ubuntu-vulkan-x64"],
-            Some(crate::engine::manifest::Vendor::Amd) => {
-                vec!["ubuntu-rocm-10.0-x64", "ubuntu-vulkan-x64"]
-            }
-            Some(crate::engine::manifest::Vendor::Intel) => {
-                vec!["ubuntu-sycl-fp16-x64", "ubuntu-vulkan-x64"]
-            }
-            _ => vec!["ubuntu-x64"],
+            Some(Vendor::Nvidia) => vec![Exact("ubuntu-vulkan-x64"), Cpu("ubuntu-x64")],
+            Some(Vendor::Amd) => vec![
+                Versioned {
+                    prefix: "ubuntu-rocm-",
+                    suffix: "-x64",
+                },
+                Exact("ubuntu-vulkan-x64"),
+                Cpu("ubuntu-x64"),
+            ],
+            Some(Vendor::Intel) => vec![
+                Exact("ubuntu-sycl-fp16-x64"),
+                Exact("ubuntu-vulkan-x64"),
+                Cpu("ubuntu-x64"),
+            ],
+            _ => vec![Cpu("ubuntu-x64")],
         },
-        ("linux", "aarch64" | "arm64") => vec!["ubuntu-vulkan-arm64", "ubuntu-arm64"],
-        ("macos", _) => vec!["macos-arm64", "macos-x64"],
+        ("linux", "aarch64" | "arm64") => vec![Exact("ubuntu-vulkan-arm64"), Cpu("ubuntu-arm64")],
+        ("macos", _) => vec![Exact("macos-arm64"), Exact("macos-x64")],
         ("windows", "x86_64" | "x64" | "amd64") => match vendor {
-            Some(crate::engine::manifest::Vendor::Nvidia) => {
-                vec!["win-cuda-13.3-x64", "win-vulkan-x64"]
-            }
-            Some(crate::engine::manifest::Vendor::Amd) => vec!["win-rocm-10.0-x64", "win-vulkan-x64"],
-            _ => vec!["win-vulkan-x64"],
+            Some(Vendor::Nvidia) => vec![
+                Versioned {
+                    prefix: "win-cuda-",
+                    suffix: "-x64",
+                },
+                Exact("win-vulkan-x64"),
+                Cpu("win-cpu-x64"),
+            ],
+            Some(Vendor::Amd) => vec![
+                Versioned {
+                    prefix: "win-rocm-",
+                    suffix: "-x64",
+                },
+                Exact("win-vulkan-x64"),
+                Cpu("win-cpu-x64"),
+            ],
+            _ => vec![Exact("win-vulkan-x64"), Cpu("win-cpu-x64")],
         },
-        ("windows", "aarch64" | "arm64") => vec!["win-cpu-arm64"],
-        _ => vec!["ubuntu-x64"],
+        ("windows", "aarch64" | "arm64") => vec![Cpu("win-cpu-arm64")],
+        _ => vec![Cpu("ubuntu-x64")],
     }
 }
 
+/// A resolved asset: exact release-asset file name, the label stored in
+/// the engine row, and whether this is a CPU fallback behind missing
+/// GPU variants (caller must warn).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetPick {
+    pub name: String,
+    pub label: String,
+    pub cpu_fallback: bool,
+}
+
+/// Walk the candidate list against the release's actual assets and
+/// return the first match. `None` = nothing usable (not even CPU).
+#[must_use]
+pub fn resolve_asset(
+    release: &GhRelease,
+    os: &str,
+    arch: &str,
+    vendor: Option<crate::engine::manifest::Vendor>,
+) -> Option<AssetPick> {
+    let candidates = pick_asset(os, arch, vendor);
+    let wants_gpu = candidates.iter().any(|c| !matches!(c, Candidate::Cpu(_)));
+    let tag = &release.tag_name;
+    for candidate in &candidates {
+        match candidate {
+            Candidate::Exact(s) | Candidate::Cpu(s) => {
+                let name = asset_filename(tag, s);
+                if release.assets.iter().any(|a| a.name == name) {
+                    let cpu = matches!(candidate, Candidate::Cpu(_)) && wants_gpu;
+                    return Some(AssetPick {
+                        name,
+                        label: (*s).to_string(),
+                        cpu_fallback: cpu,
+                    });
+                }
+            }
+            Candidate::Versioned { prefix, suffix } => {
+                let ext = if prefix.starts_with("win-") {
+                    "zip"
+                } else {
+                    "tar.gz"
+                };
+                let head = format!("llama-{tag}-bin-{prefix}");
+                let tail = format!("{suffix}.{ext}");
+                let mut best: Option<(Vec<u32>, String)> = None;
+                for a in &release.assets {
+                    let Some(middle) = a.name.strip_prefix(&head) else {
+                        continue;
+                    };
+                    let Some(version) = middle.strip_suffix(&tail) else {
+                        continue;
+                    };
+                    let parts: Option<Vec<u32>> =
+                        version.split('.').map(|p| p.parse().ok()).collect();
+                    let Some(parts) = parts else { continue };
+                    if best.as_ref().is_none_or(|(b, _)| parts > *b) {
+                        best = Some((parts, version.to_string()));
+                    }
+                }
+                if let Some((_, version)) = best {
+                    let label = format!("{prefix}{version}{suffix}");
+                    return Some(AssetPick {
+                        name: format!("llama-{tag}-bin-{label}.{ext}"),
+                        label,
+                        cpu_fallback: false,
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Asset file name for a release tag: `llama-{tag}-bin-{suffix}.tar.gz|zip`.
-#[must_use] 
+#[must_use]
 pub fn asset_filename(tag: &str, suffix: &str) -> String {
-    let ext = if suffix.starts_with("win-") { "zip" } else { "tar.gz" };
+    let ext = if suffix.starts_with("win-") {
+        "zip"
+    } else {
+        "tar.gz"
+    };
     format!("llama-{tag}-bin-{suffix}.{ext}")
 }
 
@@ -258,61 +422,221 @@ pub fn asset_filename(tag: &str, suffix: &str) -> String {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+    use crate::engine::manifest::Vendor;
+    use Candidate::{Cpu, Exact, Versioned};
 
-    #[test]
-    fn unit__asset_matrix__linux_nvidia__vulkan_only() {
-        assert_eq!(pick_asset("linux", "x86_64", Some(crate::engine::manifest::Vendor::Nvidia)), vec!["ubuntu-vulkan-x64"]);
+    fn rel(tag: &str, assets: &[&str]) -> GhRelease {
+        GhRelease {
+            tag_name: tag.to_string(),
+            prerelease: true,
+            assets: assets
+                .iter()
+                .map(|n| GhAsset {
+                    name: (*n).to_string(),
+                    digest: None,
+                    size: None,
+                    browser_download_url: String::new(),
+                })
+                .collect(),
+            published_at: None,
+        }
     }
 
     #[test]
-    fn unit__asset_matrix__linux_amd__rocm_then_vulkan() {
+    fn unit__asset_matrix__linux_nvidia__vulkan_then_cpu_resort() {
         assert_eq!(
-            pick_asset("linux", "x86_64", Some(crate::engine::manifest::Vendor::Amd)),
-            vec!["ubuntu-rocm-10.0-x64", "ubuntu-vulkan-x64"]
+            pick_asset("linux", "x86_64", Some(Vendor::Nvidia)),
+            vec![Exact("ubuntu-vulkan-x64"), Cpu("ubuntu-x64")]
         );
     }
 
     #[test]
-    fn unit__asset_matrix__linux_intel__sycl_then_vulkan() {
+    fn unit__asset_matrix__linux_amd__rocm_glob_then_vulkan_then_cpu() {
         assert_eq!(
-            pick_asset("linux", "x86_64", Some(crate::engine::manifest::Vendor::Intel)),
-            vec!["ubuntu-sycl-fp16-x64", "ubuntu-vulkan-x64"]
+            pick_asset("linux", "x86_64", Some(Vendor::Amd)),
+            vec![
+                Versioned {
+                    prefix: "ubuntu-rocm-",
+                    suffix: "-x64"
+                },
+                Exact("ubuntu-vulkan-x64"),
+                Cpu("ubuntu-x64"),
+            ]
+        );
+    }
+
+    #[test]
+    fn unit__asset_matrix__linux_intel__sycl_then_vulkan_then_cpu() {
+        assert_eq!(
+            pick_asset("linux", "x86_64", Some(Vendor::Intel)),
+            vec![
+                Exact("ubuntu-sycl-fp16-x64"),
+                Exact("ubuntu-vulkan-x64"),
+                Cpu("ubuntu-x64"),
+            ]
         );
     }
 
     #[test]
     fn unit__asset_matrix__linux_cpu__plain() {
-        assert_eq!(pick_asset("linux", "x86_64", None), vec!["ubuntu-x64"]);
-        assert_eq!(pick_asset("linux", "x86_64", Some(crate::engine::manifest::Vendor::Other)), vec!["ubuntu-x64"]);
+        assert_eq!(pick_asset("linux", "x86_64", None), vec![Cpu("ubuntu-x64")]);
+        assert_eq!(
+            pick_asset("linux", "x86_64", Some(Vendor::Other)),
+            vec![Cpu("ubuntu-x64")]
+        );
     }
 
     #[test]
     fn unit__asset_matrix__linux_arm__vulkan_then_cpu() {
-        assert_eq!(pick_asset("linux", "aarch64", None), vec!["ubuntu-vulkan-arm64", "ubuntu-arm64"]);
+        assert_eq!(
+            pick_asset("linux", "aarch64", None),
+            vec![Exact("ubuntu-vulkan-arm64"), Cpu("ubuntu-arm64")]
+        );
     }
 
     #[test]
     fn unit__asset_matrix__macos_arm_first() {
-        assert_eq!(pick_asset("macos", "arm64", None), vec!["macos-arm64", "macos-x64"]);
+        assert_eq!(
+            pick_asset("macos", "arm64", None),
+            vec![Exact("macos-arm64"), Exact("macos-x64")]
+        );
     }
 
     #[test]
     fn unit__asset_matrix__windows_variants() {
         assert_eq!(
-            pick_asset("windows", "x64", Some(crate::engine::manifest::Vendor::Nvidia)),
-            vec!["win-cuda-13.3-x64", "win-vulkan-x64"]
+            pick_asset("windows", "x64", Some(Vendor::Nvidia)),
+            vec![
+                Versioned {
+                    prefix: "win-cuda-",
+                    suffix: "-x64"
+                },
+                Exact("win-vulkan-x64"),
+                Cpu("win-cpu-x64"),
+            ]
         );
         assert_eq!(
-            pick_asset("windows", "x64", Some(crate::engine::manifest::Vendor::Amd)),
-            vec!["win-rocm-10.0-x64", "win-vulkan-x64"]
+            pick_asset("windows", "x64", Some(Vendor::Amd)),
+            vec![
+                Versioned {
+                    prefix: "win-rocm-",
+                    suffix: "-x64"
+                },
+                Exact("win-vulkan-x64"),
+                Cpu("win-cpu-x64"),
+            ]
         );
-        assert_eq!(pick_asset("windows", "x64", None), vec!["win-vulkan-x64"]);
-        assert_eq!(pick_asset("windows", "arm64", None), vec!["win-cpu-arm64"]);
+        assert_eq!(
+            pick_asset("windows", "x64", None),
+            vec![Exact("win-vulkan-x64"), Cpu("win-cpu-x64")]
+        );
+        assert_eq!(
+            pick_asset("windows", "arm64", None),
+            vec![Cpu("win-cpu-arm64")]
+        );
     }
 
     #[test]
     fn unit__asset_filename__extension_by_platform() {
-        assert_eq!(asset_filename("b10816", "ubuntu-vulkan-x64"), "llama-b10816-bin-ubuntu-vulkan-x64.tar.gz");
-        assert_eq!(asset_filename("b10816", "win-cuda-13.3-x64"), "llama-b10816-bin-win-cuda-13.3-x64.zip");
+        assert_eq!(
+            asset_filename("b10816", "ubuntu-vulkan-x64"),
+            "llama-b10816-bin-ubuntu-vulkan-x64.tar.gz"
+        );
+        assert_eq!(
+            asset_filename("b10816", "win-cuda-13.3-x64"),
+            "llama-b10816-bin-win-cuda-13.3-x64.zip"
+        );
+    }
+
+    #[test]
+    fn unit__resolve__version_bump__max_version_wins() {
+        let r = rel(
+            "b10833",
+            &[
+                "llama-b10833-bin-ubuntu-rocm-10.0-x64.tar.gz",
+                "llama-b10833-bin-ubuntu-rocm-11.2-x64.tar.gz",
+            ],
+        );
+        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Amd)).unwrap();
+        assert_eq!(p.name, "llama-b10833-bin-ubuntu-rocm-11.2-x64.tar.gz");
+        assert_eq!(p.label, "ubuntu-rocm-11.2-x64");
+        assert!(!p.cpu_fallback);
+    }
+
+    #[test]
+    fn unit__resolve__cuda_major_minor__numeric_order_not_lexical() {
+        // 9.1 vs 10.0: lexical compare would call "9.1" bigger.
+        let r = rel(
+            "b1",
+            &[
+                "llama-b1-bin-win-cuda-9.1-x64.zip",
+                "llama-b1-bin-win-cuda-10.0-x64.zip",
+            ],
+        );
+        let p = resolve_asset(&r, "windows", "x86_64", Some(Vendor::Nvidia)).unwrap();
+        assert_eq!(p.label, "win-cuda-10.0-x64");
+    }
+
+    #[test]
+    fn unit__resolve__upload_race__vulkan_missing_cpu_present__fallback_flagged() {
+        // The exact live b10833 scenario: nvidia box, vulkan asset not
+        // uploaded yet, CPU asset visible.
+        let r = rel("b10833", &["llama-b10833-bin-ubuntu-x64.tar.gz"]);
+        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Nvidia)).unwrap();
+        assert_eq!(p.label, "ubuntu-x64");
+        assert!(p.cpu_fallback, "must be flagged, never silent");
+    }
+
+    #[test]
+    fn unit__resolve__no_assets__none() {
+        let r = rel("b10833", &[]);
+        assert!(resolve_asset(&r, "linux", "x86_64", Some(Vendor::Nvidia)).is_none());
+    }
+
+    #[test]
+    fn unit__resolve__vendor_falls_through_to_vulkan() {
+        let r = rel(
+            "b1",
+            &[
+                "llama-b1-bin-ubuntu-sycl-fp32-x64.tar.gz",
+                "llama-b1-bin-ubuntu-vulkan-x64.tar.gz",
+            ],
+        );
+        // Intel: fp16 exact miss -> vulkan (sycl-fp32 is not a candidate).
+        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Intel)).unwrap();
+        assert_eq!(p.label, "ubuntu-vulkan-x64");
+        assert!(!p.cpu_fallback);
+    }
+
+    #[test]
+    fn unit__resolve__non_numeric_version_ignored() {
+        let r = rel(
+            "b1",
+            &[
+                "llama-b1-bin-win-cuda-hipx-x64.zip",
+                "llama-b1-bin-win-vulkan-x64.zip",
+            ],
+        );
+        let p = resolve_asset(&r, "windows", "x86_64", Some(Vendor::Nvidia)).unwrap();
+        assert_eq!(p.label, "win-vulkan-x64");
+    }
+
+    #[test]
+    fn unit__iso_epoch__github_formats() {
+        // Pinned to the live b10833 publish time observed via the API.
+        assert_eq!(iso_to_epoch("2026-09-07T06:49:18Z"), Some(1_788_763_758));
+        assert_eq!(
+            iso_to_epoch("2026-09-07T06:49:18.123Z"),
+            Some(1_788_763_758)
+        );
+        assert_eq!(iso_to_epoch("bogus"), None);
+    }
+
+    #[test]
+    fn unit__published_epoch__field_routing() {
+        let mut r = rel("b1", &[]);
+        assert_eq!(r.published_epoch(), None);
+        r.published_at = Some("2026-09-07T06:49:18Z".into());
+        assert_eq!(r.published_epoch(), Some(1_788_763_758));
     }
 }
