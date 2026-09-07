@@ -8,7 +8,9 @@ use serde_json::{json, Value};
 /// #15's sibling: never silently drop what the user asked for).
 pub fn apply_ollama_options(openai_req: &mut Value, options: &Value) -> Vec<String> {
     let mut unknown = Vec::new();
-    let Some(map) = options.as_object() else { return unknown };
+    let Some(map) = options.as_object() else {
+        return unknown;
+    };
     for (k, v) in map {
         match k.as_str() {
             "temperature" => openai_req["temperature"] = v.clone(),
@@ -32,7 +34,9 @@ pub fn apply_ollama_options(openai_req: &mut Value, options: &Value) -> Vec<Stri
                 // only for num_ctx's siblings — explicitly listed, not
                 // silently swallowed.
                 if k != "num_ctx" {
-                    unknown.push(format!("{k} (not settable per-request in pallama; use config)"));
+                    unknown.push(format!(
+                        "{k} (not settable per-request in pallama; use config)"
+                    ));
                 }
             }
             _ => unknown.push(k.clone()),
@@ -42,7 +46,7 @@ pub fn apply_ollama_options(openai_req: &mut Value, options: &Value) -> Vec<Stri
 }
 
 /// ollama `format` -> `OpenAI` `response_format`.
-#[must_use] 
+#[must_use]
 pub fn translate_format(format: &Value) -> Option<Value> {
     match format {
         Value::String(s) if s == "json" => Some(json!({"type": "json_object"})),
@@ -70,7 +74,10 @@ pub fn chat_to_openai(req: &Value) -> Result<(Value, Option<i64>), String> {
     if let Some(stream) = req["stream"].as_bool() {
         out["stream"] = json!(stream);
     }
-    if let Some(tools) = req.get("tools").filter(|t| t.is_array() && !t.as_array().unwrap().is_empty()) {
+    if let Some(tools) = req
+        .get("tools")
+        .filter(|t| t.is_array() && !t.as_array().unwrap().is_empty())
+    {
         out["tools"] = tools.clone();
     }
     if let Some(rf) = translate_format(&req["format"]) {
@@ -91,7 +98,7 @@ pub fn chat_to_openai(req: &Value) -> Result<(Value, Option<i64>), String> {
 
 /// `OpenAI` non-stream chat response -> ollama `ChatResponse` (done:true with
 /// counts from usage).
-#[must_use] 
+#[must_use]
 pub fn openai_chat_to_ollama(model: &str, openai: &Value) -> Value {
     let choice = &openai["choices"][0];
     let message = &choice["message"];
@@ -115,7 +122,7 @@ pub fn openai_chat_to_ollama(model: &str, openai: &Value) -> Value {
 }
 
 /// One `OpenAI` SSE chunk -> zero or more ollama NDJSON lines.
-#[must_use] 
+#[must_use]
 pub fn openai_chunk_to_ollama(model: &str, chunk: &Value) -> Vec<Value> {
     let mut out = Vec::new();
     if let Some(choices) = chunk["choices"].as_array() {
@@ -153,7 +160,7 @@ pub fn openai_chunk_to_ollama(model: &str, chunk: &Value) -> Vec<Value> {
 }
 
 /// Final ollama chunk from the usage/finish information.
-#[must_use] 
+#[must_use]
 pub fn ollama_final_chunk(model: &str, usage: Option<&Value>, finish: Option<&str>) -> Value {
     json!({
         "model": model,
@@ -169,7 +176,7 @@ pub fn ollama_final_chunk(model: &str, usage: Option<&Value>, finish: Option<&st
 
 /// Parse `data: {...}` SSE lines from a byte buffer; returns (events, rest).
 /// Handles events split across chunk boundaries and the [DONE] sentinel.
-#[must_use] 
+#[must_use]
 pub fn parse_sse(buf: &str) -> (Vec<Value>, bool /*done*/, usize /*consumed*/) {
     let mut events = Vec::new();
     let mut done = false;
@@ -208,7 +215,7 @@ pub fn embeddings_to_openai(req: &Value) -> Result<Value, String> {
 }
 
 /// `OpenAI` /v1/embeddings response -> ollama embeddings response.
-#[must_use] 
+#[must_use]
 pub fn openai_embeddings_to_ollama(model: &str, openai: &Value) -> Value {
     json!({
         "model": model,
@@ -219,7 +226,7 @@ pub fn openai_embeddings_to_ollama(model: &str, openai: &Value) -> Value {
 /// /api/generate raw prompt -> /v1/completions body. Returns None when
 /// the request uses templated features (documented divergence: use
 /// /api/chat, which passes the model's own template through --jinja).
-#[must_use] 
+#[must_use]
 pub fn generate_to_openai(req: &Value) -> Option<Value> {
     let templated = ["system", "template", "suffix", "images"]
         .iter()
@@ -240,7 +247,7 @@ pub fn generate_to_openai(req: &Value) -> Option<Value> {
 }
 
 /// `OpenAI` completion response -> ollama `GenerateResponse`.
-#[must_use] 
+#[must_use]
 pub fn openai_completion_to_ollama(model: &str, openai: &Value) -> Value {
     json!({
         "model": model,
@@ -296,7 +303,10 @@ mod tests {
         });
         let (out, num_ctx) = chat_to_openai(&req).unwrap();
         assert_eq!(num_ctx, Some(32768));
-        assert!(out.get("num_ctx").is_none(), "num_ctx never forwarded per-request");
+        assert!(
+            out.get("num_ctx").is_none(),
+            "num_ctx never forwarded per-request"
+        );
     }
 
     #[test]
@@ -307,7 +317,10 @@ mod tests {
             "options": {"temperature": 1, "vram_magic": true, "num_gpu": 5},
         });
         let err = chat_to_openai(&req).unwrap_err();
-        assert!(err.contains("vram_magic") && err.contains("num_gpu"), "{err}");
+        assert!(
+            err.contains("vram_magic") && err.contains("num_gpu"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -407,9 +420,9 @@ mod tests {
         // keep_alive parsing: number (secs), "-1" (forever), "0" (evict).
         for (raw, expect) in [("-1", -1i64), ("0", 0), ("300", 300)] {
             let v: Value = serde_json::from_str(raw).unwrap();
-            let parsed = v.as_i64().or_else(|| {
-                v.as_str().and_then(|s| s.parse::<i64>().ok())
-            });
+            let parsed = v
+                .as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()));
             assert_eq!(parsed, Some(expect));
         }
     }

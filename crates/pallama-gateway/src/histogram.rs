@@ -63,14 +63,27 @@ impl Histogram {
 
     /// Append `# HELP/# TYPE`, cumulative `_bucket{le=…}` lines, `_sum`,
     /// `_count` in Prometheus exposition format.
-    #[allow(clippy::cast_precision_loss, reason = "ns -> s display rounding is irrelevant")]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "ns -> s display rounding is irrelevant"
+    )]
     pub fn render(&self, out: &mut String) {
         let count = self.count.load(Ordering::Relaxed);
-        let _ = writeln!(out, "# HELP {} {}\n# TYPE {} histogram", self.name, self.help, self.name);
+        let _ = writeln!(
+            out,
+            "# HELP {} {}\n# TYPE {} histogram",
+            self.name, self.help, self.name
+        );
         let mut cumulative = 0u64;
         for (b, c) in self.bounds.iter().zip(&self.buckets) {
             cumulative += c.load(Ordering::Relaxed);
-            let _ = writeln!(out, "{}_bucket{{le=\"{}\"}} {}", self.name, format_f64(*b), cumulative);
+            let _ = writeln!(
+                out,
+                "{}_bucket{{le=\"{}\"}} {}",
+                self.name,
+                format_f64(*b),
+                cumulative
+            );
         }
         let _ = writeln!(out, "{}_bucket{{le=\"+Inf\"}} {}", self.name, count);
         let _ = writeln!(
@@ -80,6 +93,61 @@ impl Histogram {
             format_f64(self.sum_ns.load(Ordering::Relaxed) as f64 / 1e9)
         );
         let _ = writeln!(out, "{}_count {}", self.name, count);
+        // Quantile gauges (p50/p99/p999) so `doctor` and dashboards read
+        // directly without a PromQL histogram_quantile. Linear
+        // interpolation inside the containing bucket — approximate by
+        // construction (documented in the HELP line above).
+        for (label, q) in [("p50", 0.5), ("p99", 0.99), ("p999", 0.999)] {
+            let _ = writeln!(
+                out,
+                "{}_{}_seconds {}",
+                self.name,
+                label,
+                format_f64(self.quantile(q))
+            );
+        }
+    }
+
+    /// Approximate quantile from cumulative buckets (linear
+    /// interpolation within the containing bucket). 0 observations = 0.
+    #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "target rank is ceil()'d and count-clamped; bucket math is integer after the rank cast"
+    )]
+    pub fn quantile(&self, q: f64) -> f64 {
+        let count = self.count.load(Ordering::Relaxed);
+        if count == 0 {
+            return 0.0;
+        }
+        let target = (f64::from(u32::try_from(count).unwrap_or(u32::MAX)) * q).ceil();
+        let target = target.max(1.0) as u64;
+        let mut cumulative = 0u64;
+        let mut prev_bound = 0.0f64;
+        for (b, c) in self.bounds.iter().zip(&self.buckets) {
+            let bucket = c.load(Ordering::Relaxed);
+            // Buckets above a zero-count run don't move the cumulative.
+            if bucket == 0 {
+                prev_bound = *b;
+                continue;
+            }
+            let prev_cum = cumulative;
+            cumulative += bucket;
+            if cumulative >= target {
+                let frac = if cumulative > prev_cum {
+                    (target - prev_cum) as f64 / bucket as f64
+                } else {
+                    1.0
+                };
+                return prev_bound + (*b - prev_bound) * frac.clamp(0.0, 1.0);
+            }
+            prev_bound = *b;
+        }
+        // Above every finite bound: report the top bound (a floor, not an
+        // extrapolation — never invent latency beyond what was measured).
+        *self.bounds.last().unwrap_or(&0.0)
     }
 }
 
@@ -158,5 +226,25 @@ mod tests {
         let mut out = String::new();
         h.render(&mut out);
         assert!(out.contains("t_bucket{le=\"0.1\"} 1"), "{out}");
+    }
+
+    #[test]
+    fn unit__histogram__quantiles_and_render_gauges() {
+        let h = Histogram::new("t", "test", &[0.1, 0.5, 1.0, 5.0]);
+        for v in [0.05, 0.05, 0.05, 0.4, 0.9, 4.0] {
+            h.observe_secs(v);
+        }
+        let mut out = String::new();
+        h.render(&mut out);
+        assert!(out.contains("t_p50_seconds"), "{out}");
+        assert!(out.contains("t_p99_seconds"), "{out}");
+        assert!(out.contains("t_p999_seconds"), "{out}");
+        // p50 lands in the first bucket (3 of 6 obs <= 0.1).
+        assert!(h.quantile(0.5) <= 0.1, "{}", h.quantile(0.5));
+        // p99 is inside the top finite bucket (4.0 obs).
+        assert!(h.quantile(0.99) <= 5.0 && h.quantile(0.99) > 1.0);
+        // Empty histogram: zero, not NaN.
+        let empty = Histogram::new("e", "test", &[1.0]);
+        assert!((empty.quantile(0.999) - 0.0).abs() < f64::EPSILON);
     }
 }

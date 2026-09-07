@@ -35,8 +35,11 @@ pub const ENFORCE_BODY_CAP: usize = 4 << 20;
 /// Violations `sentinel_enforce` may hard-fail (422). Deliberately
 /// excludes the empty-response class: a weird-but-valid completion is
 /// not a protocol violation.
-const HARD_CODES: &[Code] =
-    &[Code::ToolArgsInvalidJson, Code::ToolNameUnknown, Code::SchemaViolation];
+const HARD_CODES: &[Code] = &[
+    Code::ToolArgsInvalidJson,
+    Code::ToolNameUnknown,
+    Code::SchemaViolation,
+];
 /// Persistence: JSONL cap; on crossing, rewrite keeping the newest rows.
 const PERSIST_CAP_BYTES: u64 = 1 << 20;
 const PERSIST_KEEP: usize = 128;
@@ -207,6 +210,77 @@ pub fn parse_request_ctx(
     (names, schemas, rf, stream)
 }
 
+/// Strict tool-definition lint (`OpenAI` strict subset): a `strict: true`
+/// function def must be an object schema with `additionalProperties:
+/// false` and EVERY property listed in `required` — and every declared
+/// schema (strict or not) must compile. Returns the first teaching
+/// error; None = clean or no tools. This is request-side: catch a broken
+/// def BEFORE the model wastes a turn producing calls nothing accepts.
+#[must_use]
+pub fn strict_tool_def_error(body: &Value) -> Option<String> {
+    let tools = body.get("tools").and_then(Value::as_array)?;
+    for (i, t) in tools.iter().enumerate() {
+        let f = t.get("function").unwrap_or(t);
+        let Some(name) = f.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let params = f.get("parameters").cloned().unwrap_or(Value::Null);
+        if !params.is_object() {
+            if f.get("strict").and_then(Value::as_bool) == Some(true) {
+                return Some(format!(
+                    "tools[{i}] {name:?}: strict:true requires a parameters object schema"
+                ));
+            }
+            continue;
+        }
+        // Any declared schema must compile.
+        if let Err(e) = jsonschema::validator_for(&params) {
+            return Some(format!(
+                "tools[{i}] {name:?}: parameters is not a valid JSON Schema: {e}"
+            ));
+        }
+        if f.get("strict").and_then(Value::as_bool) == Some(true) {
+            let ap_false =
+                params.get("additionalProperties").and_then(Value::as_bool) == Some(false);
+            if !ap_false {
+                return Some(format!(
+                    "tools[{i}] {name:?}: strict:true requires additionalProperties = false"
+                ));
+            }
+            let props = params.get("properties").and_then(Value::as_object);
+            let required = params.get("required").and_then(Value::as_array);
+            if let Some(props) = props {
+                for key in props.keys() {
+                    let listed = required
+                        .is_some_and(|r| r.iter().any(|v| v.as_str() == Some(key.as_str())));
+                    if !listed {
+                        return Some(format!(
+                            "tools[{i}] {name:?}: strict:true requires every property in required (missing {key:?})"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Single-flight hash: FNV-1a over model + non-stream body. Stream
+/// flag is stripped first so stream/non-stream twins do not collide.
+#[must_use]
+pub fn singleflight_key(model: &str, body: &[u8], stream: bool) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    // Hash model + body, then fold the stream bit apart.
+    for b in model.as_bytes().iter().chain(body) {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    if stream {
+        h ^= 0xffff;
+    }
+    h
+}
+
 /// Marker-scan heuristic for tool support in a chat template.
 /// Lowercase substring: catches `{%- if tools %}`, `<tool_call>`, hermes
 /// and qwen styles. False negatives merely suppress the precheck (safe
@@ -259,7 +333,10 @@ impl SentinelFeed {
     /// A feed that observes nothing (sentinel off / unobserved route).
     #[must_use]
     pub fn inert() -> Self {
-        Self { tx: None, degraded: Arc::new(AtomicBool::new(false)) }
+        Self {
+            tx: None,
+            degraded: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     #[must_use]
@@ -295,10 +372,17 @@ pub fn request_ctx(
         pallama_core::store::Store::open(&state.dirs)
             .ok()
             .and_then(|s| s.get_model(model).ok().flatten())
-            .and_then(|row| state.sentinel.template_support(model, std::path::Path::new(&row.path)))
+            .and_then(|row| {
+                state
+                    .sentinel
+                    .template_support(model, std::path::Path::new(&row.path))
+            })
     };
     let mut warnings = Vec::new();
-    if matches!(template, Some(TemplateSupport::NoTools | TemplateSupport::Missing)) {
+    if matches!(
+        template,
+        Some(TemplateSupport::NoTools | TemplateSupport::Missing)
+    ) {
         warnings.push(Code::TemplateNoTools.as_str());
     }
     let ctx = RequestCtx {
@@ -309,7 +393,12 @@ pub fn request_ctx(
         tool_schemas,
         response_format,
         stream: stream || sse,
-        ctx: state.sup.ps().into_iter().find(|p| p.name == model).map(|p| p.ctx),
+        ctx: state
+            .sup
+            .ps()
+            .into_iter()
+            .find(|p| p.name == model)
+            .map(|p| p.ctx),
         template,
     };
     (ctx, warnings)
@@ -355,10 +444,22 @@ pub struct Sentinel {
     /// record is broadcast; slow consumers lag (resync note), history
     /// stays in the ring for `why`.
     watch_tx: tokio::sync::broadcast::Sender<SentinelRecord>,
+    /// J5: stall-triggered evictions (None until the owner wires it).
+    evict_hook: Mutex<Option<EvictHook>>,
 }
 
+/// Wrapper so the struct stays Clone-cheap and Debug-clean.
+#[derive(Clone)]
+struct EvictHook(tokio::sync::mpsc::UnboundedSender<String>);
+
 impl Sentinel {
-    #[must_use]
+    /// J5 hook: where stalled-model evictions are requested. The owner
+    /// (`AppState::new`) installs a channel consumed by a task calling the
+    /// supervisor; the analyzer never awaits evicts itself.
+    pub fn set_evict_channel(&self, tx: tokio::sync::mpsc::UnboundedSender<String>) {
+        *self.evict_hook.lock() = Some(EvictHook(tx));
+    }
+
     pub fn new(enabled: bool, stall_secs: u64, run_dir: Option<&std::path::Path>) -> Arc<Self> {
         let mut ring = VecDeque::with_capacity(RING_CAP);
         let mut persist = None;
@@ -402,6 +503,7 @@ impl Sentinel {
             persist,
             persist_path,
             watch_tx,
+            evict_hook: Mutex::new(None),
         })
     }
 
@@ -426,7 +528,10 @@ impl Sentinel {
         tokio::spawn(async move {
             sentinel.analyze(ctx, status, sse, feed_degraded, rx).await;
         });
-        SentinelFeed { tx: Some(tx), degraded }
+        SentinelFeed {
+            tx: Some(tx),
+            degraded,
+        }
     }
 
     /// Capability precheck: does this model's embedded template render
@@ -456,7 +561,12 @@ impl Sentinel {
     pub fn why(&self, trace: Option<&str>, limit: usize) -> Vec<SentinelRecord> {
         let ring = self.ring.lock();
         match trace {
-            Some(t) => ring.iter().rev().filter(|r| r.trace == t).cloned().collect(),
+            Some(t) => ring
+                .iter()
+                .rev()
+                .filter(|r| r.trace == t)
+                .cloned()
+                .collect(),
             None => ring.iter().rev().take(limit).cloned().collect(),
         }
     }
@@ -518,7 +628,13 @@ impl Sentinel {
                         acc.degraded = true;
                     }
                 }
-                Some(FeedEvent::Value(v)) => acc.apply(&v),
+                Some(FeedEvent::Value(v)) => {
+                    if responses {
+                        acc.apply_responses(&v);
+                    } else {
+                        acc.apply(&v);
+                    }
+                }
                 Some(FeedEvent::End) | None => break,
             }
         }
@@ -566,6 +682,16 @@ impl Sentinel {
                 detail = %d.detail,
                 "{}", d.code.hint()
             );
+            // J5: a stalled stream means the child is wedged (swap
+            // thrash / driver hang) — ask the supervisor to reap it so
+            // the next request respawns clean instead of queueing
+            // behind a zombie. Best-effort: the evict itself is async.
+            if d.code == Code::StalledStream {
+                if let Some(hook) = self.evict_hook.lock().clone() {
+                    let _ = hook.0.send(record.model.clone());
+                    tracing::info!(target: "pallama::sentinel", model = %record.model, "stalled child — eviction requested");
+                }
+            }
         }
         {
             let mut ring = self.ring.lock();
@@ -614,7 +740,8 @@ impl Sentinel {
                 let mut written = 0_u64;
                 for l in keep {
                     let _ = writeln!(f, "{l}");
-                    written = written.saturating_add(u64::try_from(l.len()).unwrap_or(u64::MAX) + 1);
+                    written =
+                        written.saturating_add(u64::try_from(l.len()).unwrap_or(u64::MAX) + 1);
                 }
                 p.file = f;
                 p.written = written;
@@ -635,7 +762,10 @@ impl Sentinel {
             match ctx.template {
                 Some(TemplateSupport::Missing) => out.push(Detection {
                     code: Code::TemplateNoTools,
-                    detail: format!("{} has no embedded chat template; tools cannot be rendered", ctx.model),
+                    detail: format!(
+                        "{} has no embedded chat template; tools cannot be rendered",
+                        ctx.model
+                    ),
                 }),
                 Some(TemplateSupport::NoTools) => out.push(Detection {
                     code: Code::TemplateNoTools,
@@ -646,15 +776,29 @@ impl Sentinel {
         }
 
         if acc.finish.as_deref() == Some("length") {
-            out.push(Detection {
-                code: Code::CtxTruncated,
-                detail: format!(
-                    "prompt {:?} + completion {:?} tokens hit the ctx ceiling{}",
-                    acc.usage_prompt,
-                    acc.usage_completion,
-                    ctx.ctx.map(|c| format!(" ({c})")).unwrap_or_default()
-                ),
-            });
+            // `length` covers BOTH a real ctx-ceiling hit and a client-set
+            // max_tokens budget cap. Only call it ctx truncation when the
+            // token counts prove the ceiling was approached; a small budget
+            // capping generation is the client's own request, not a fault
+            // (ReasoningNoAnswer still catches the pathological pairing).
+            // Unverifiable (usage or ctx unknown) keeps the legacy flag.
+            let ctx_exhausted = match (acc.usage_prompt, acc.usage_completion, ctx.ctx) {
+                (Some(p), Some(c), Some(window)) => {
+                    (p + c) * 10 >= u64::from(window) * NEAR_LIMIT_TENTHS
+                }
+                _ => true,
+            };
+            if ctx_exhausted {
+                out.push(Detection {
+                    code: Code::CtxTruncated,
+                    detail: format!(
+                        "prompt {:?} + completion {:?} tokens hit the ctx ceiling{}",
+                        acc.usage_prompt,
+                        acc.usage_completion,
+                        ctx.ctx.map(|c| format!(" ({c})")).unwrap_or_default()
+                    ),
+                });
+            }
         }
         if let (Some(p), Some(c)) = (acc.usage_prompt, ctx.ctx) {
             if p * 10 > u64::from(c) * NEAR_LIMIT_TENTHS {
@@ -676,7 +820,10 @@ impl Sentinel {
                 if has_reasoning {
                     out.push(Detection {
                         code: Code::ReasoningNoAnswer,
-                        detail: format!("{} reasoning chars, zero answer content", acc.reasoning.len()),
+                        detail: format!(
+                            "{} reasoning chars, zero answer content",
+                            acc.reasoning.len()
+                        ),
                     });
                 } else {
                     out.push(Detection {
@@ -704,7 +851,11 @@ impl Sentinel {
             if !ctx.tool_names.is_empty() && !ctx.tool_names.contains(&frag.name) {
                 out.push(Detection {
                     code: Code::ToolNameUnknown,
-                    detail: format!("`{}` not in request tools [{}]", frag.name, ctx.tool_names.join(", ")),
+                    detail: format!(
+                        "`{}` not in request tools [{}]",
+                        frag.name,
+                        ctx.tool_names.join(", ")
+                    ),
                 });
             }
             // Empty arguments string: lenient reading as "no arguments"
@@ -715,7 +866,11 @@ impl Sentinel {
             match serde_json::from_str::<Value>(&frag.args) {
                 Err(e) => out.push(Detection {
                     code: Code::ToolArgsInvalidJson,
-                    detail: format!("tool `{}` args not valid JSON: {e}: {}", frag.name, preview(&frag.args, 120)),
+                    detail: format!(
+                        "tool `{}` args not valid JSON: {e}: {}",
+                        frag.name,
+                        preview(&frag.args, 120)
+                    ),
                 }),
                 Ok(v) => {
                     if let Some(schema) = ctx.tool_schemas.get(&frag.name) {
@@ -741,7 +896,11 @@ impl Sentinel {
         if ty != "json_object" && ty != "json_schema" {
             return;
         }
-        let content = if acc.content.is_empty() { &acc.text } else { &acc.content };
+        let content = if acc.content.is_empty() {
+            &acc.text
+        } else {
+            &acc.content
+        };
         match serde_json::from_str::<Value>(content) {
             Err(e) => out.push(Detection {
                 code: Code::SchemaViolation,
@@ -1051,8 +1210,14 @@ impl Accum {
                         .pointer("/incomplete_details/reason")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    self.finish =
-                        Some(if reason == "max_output_tokens" { "length" } else { "stop" }.into());
+                    self.finish = Some(
+                        if reason == "max_output_tokens" {
+                            "length"
+                        } else {
+                            "stop"
+                        }
+                        .into(),
+                    );
                 }
                 "failed" => self.finish = Some("stop".into()),
                 _ => {}
@@ -1081,7 +1246,11 @@ impl Accum {
                             } else if let Some(parts) = c.as_array() {
                                 for p in parts {
                                     if let Some(t) = p.get("text").and_then(Value::as_str) {
-                                        Self::push_bounded(&mut self.content, &mut self.degraded, t);
+                                        Self::push_bounded(
+                                            &mut self.content,
+                                            &mut self.degraded,
+                                            t,
+                                        );
                                     }
                                 }
                             }
@@ -1165,7 +1334,10 @@ mod tests {
         // Old trace: roughly the age.
         let old = format!("plm-{:x}-1", now_ms - 60_000);
         let v = request_ms(&old, std::time::Instant::now());
-        assert!((59_000..=61_500).contains(&v), "aged trace decoded to {v}ms");
+        assert!(
+            (59_000..=61_500).contains(&v),
+            "aged trace decoded to {v}ms"
+        );
         // Garbage / absent trace: falls back to the analyzer span.
         assert_eq!(request_ms("garbage", std::time::Instant::now()), 0);
     }
@@ -1194,19 +1366,95 @@ mod tests {
             model: "m".into(),
             status: 200,
             stream: false,
-            detections: vec![Detection { code: Code::CtxTruncated, detail: "d".into() }],
+            detections: vec![Detection {
+                code: Code::CtxTruncated,
+                detail: "d".into(),
+            }],
             prompt_tokens: None,
             completion_tokens: None,
             ctx: None,
             degraded: false,
             ms: 1,
         };
-        assert!(rec.to_json()["detections"][0]["retry"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(rec.to_json()["detections"][0]["retry"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()));
+    }
+
+    #[test]
+    fn unit__strict_tool_def__openai_strict_subset() {
+        // Clean strict def (OpenAI chat + Responses internal-tag shapes).
+        let ok = serde_json::json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "strict": true,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                        "additionalProperties": false
+                    }
+                }
+            }]
+        });
+        assert!(strict_tool_def_error(&ok).is_none());
+        let responses_shape = serde_json::json!({
+            "tools": [{
+                "type": "function", "name": "f", "strict": true,
+                "parameters": {
+                    "type": "object", "properties": {"x": {"type": "integer"}},
+                    "required": ["x"], "additionalProperties": false
+                }
+            }]
+        });
+        assert!(strict_tool_def_error(&responses_shape).is_none());
+
+        // additionalProperties missing.
+        let ap = serde_json::json!({
+            "tools": [{"function": {"name": "f", "strict": true,
+                "parameters": {"type": "object", "properties": {"x": {}}, "required": ["x"]}}}]
+        });
+        assert!(strict_tool_def_error(&ap)
+            .unwrap()
+            .contains("additionalProperties"));
+        // Property not in required.
+        let req_missing = serde_json::json!({
+            "tools": [{"function": {"name": "f", "strict": true,
+                "parameters": {"type": "object", "properties": {"x": {}, "y": {}},
+                    "required": ["x"], "additionalProperties": false}}}]
+        });
+        assert!(strict_tool_def_error(&req_missing).unwrap().contains('y'));
+        // Non-compiling schema (any tool).
+        let bad_schema = serde_json::json!({
+            "tools": [{"function": {"name": "f",
+                "parameters": {"type": "not-a-type"}}}]
+        });
+        assert!(strict_tool_def_error(&bad_schema)
+            .unwrap()
+            .contains("JSON Schema"));
+        // No tools / no strict = None.
+        assert!(strict_tool_def_error(&serde_json::json!({"model": "m"})).is_none());
+    }
+
+    #[test]
+    fn unit__singleflight_key__stream_bit_folds_apart() {
+        let body = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        let a = singleflight_key("m1", body, false);
+        let b = singleflight_key("m1", body, true);
+        assert_ne!(a, b, "stream twins never share a slot");
+        let other = singleflight_key("m2", body, false);
+        assert_ne!(a, other, "model is part of the key");
+        let same = singleflight_key("m1", body, false);
+        assert_eq!(a, same);
     }
 
     #[test]
     fn unit__template_has_tools__markers() {
-        assert!(template_has_tools("{%- if tools %}{{ tool_calls }}{%- endif %}"));
+        assert!(template_has_tools(
+            "{%- if tools %}{{ tool_calls }}{%- endif %}"
+        ));
         assert!(template_has_tools("Hermes: <tool_call>"));
         assert!(!template_has_tools("You are a helpful assistant."));
     }
@@ -1242,7 +1490,10 @@ mod tests {
             content: "partial".into(),
             ..Accum::default()
         };
-        let ctx = RequestCtx { ctx: Some(128), ..RequestCtx::default() };
+        let ctx = RequestCtx {
+            ctx: Some(128),
+            ..RequestCtx::default()
+        };
         let d = s.finalize(&ctx, &acc, 200);
         assert!(d.iter().any(|x| x.code == Code::CtxTruncated), "{d:?}");
         assert!(d.iter().any(|x| x.code == Code::CtxNearLimit), "{d:?}");
@@ -1251,12 +1502,30 @@ mod tests {
     #[test]
     fn unit__finalize__tool_fragment_checks() {
         let s = Sentinel::new(true, 0, None);
-        let mut acc = Accum { saw_any_choice: true, ..Accum::default() };
-        acc.tools.insert(0, ToolFrag { name: "get_weather".into(), args: "{\"city\"".into() });
-        acc.tools.insert(1, ToolFrag { name: "hallucinated".into(), args: "{}".into() });
+        let mut acc = Accum {
+            saw_any_choice: true,
+            ..Accum::default()
+        };
+        acc.tools.insert(
+            0,
+            ToolFrag {
+                name: "get_weather".into(),
+                args: "{\"city\"".into(),
+            },
+        );
+        acc.tools.insert(
+            1,
+            ToolFrag {
+                name: "hallucinated".into(),
+                args: "{}".into(),
+            },
+        );
         let ctx = ctx_with(&["get_weather"]);
         let d = s.finalize(&ctx, &acc, 200);
-        assert!(d.iter().any(|x| x.code == Code::ToolArgsInvalidJson), "{d:?}");
+        assert!(
+            d.iter().any(|x| x.code == Code::ToolArgsInvalidJson),
+            "{d:?}"
+        );
         assert!(d.iter().any(|x| x.code == Code::ToolNameUnknown), "{d:?}");
     }
 
@@ -1269,7 +1538,9 @@ mod tests {
             ..Accum::default()
         };
         let ctx = RequestCtx {
-            response_format: Some(json!({"type": "json_schema", "schema": {"type": "object", "properties": {"answer": {"type": "string"}}}})),
+            response_format: Some(
+                json!({"type": "json_schema", "schema": {"type": "object", "properties": {"answer": {"type": "string"}}}}),
+            ),
             ..RequestCtx::default()
         };
         let d = s.finalize(&ctx, &acc, 200);
@@ -1287,7 +1558,10 @@ mod tests {
     #[test]
     fn unit__finalize__empty_vs_reasoning_no_answer() {
         let s = Sentinel::new(true, 0, None);
-        let mut acc = Accum { saw_any_choice: true, ..Accum::default() };
+        let mut acc = Accum {
+            saw_any_choice: true,
+            ..Accum::default()
+        };
         let d = s.finalize(&RequestCtx::default(), &acc, 200);
         assert!(d.iter().any(|x| x.code == Code::EmptyResponse), "{d:?}");
 
@@ -1394,5 +1668,65 @@ mod tests {
         let codes: Vec<&str> = recs[0].detections.iter().map(|d| d.code.as_str()).collect();
         assert!(codes.contains(&"ctx_truncated"), "{codes:?}");
         assert!(codes.contains(&"ctx_near_limit"), "{codes:?}");
+    }
+
+    #[tokio::test]
+    async fn integration__analyze_sse_stream__budget_cap_not_ctx_truncated() {
+        // Live incident shape (2026-09-06): finish_reason=length from a
+        // client max_tokens=64 cap, 83 tokens against a 16384 ctx — the
+        // budget is the client's own request, not a ctx-ceiling hit.
+        let s = Sentinel::new(true, 0, None);
+        let ctx = RequestCtx {
+            trace: "plm-budget-1".into(),
+            model: "m".into(),
+            route: "openai-chat".into(),
+            ctx: Some(16_384),
+            ..RequestCtx::default()
+        };
+        let feed = s.begin(ctx, 200, true);
+        feed.bytes(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking hard about the answer\"}}]}\n\n");
+        feed.bytes(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":19,\"completion_tokens\":64}}\n\n");
+        feed.bytes(b"data: [DONE]\n\n");
+        feed.end();
+        for _ in 0..50 {
+            if !s.why(None, 10).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let recs = s.why(None, 10);
+        assert_eq!(recs.len(), 1, "{recs:?}");
+        let codes: Vec<&str> = recs[0].detections.iter().map(|d| d.code.as_str()).collect();
+        assert!(!codes.contains(&"ctx_truncated"), "{codes:?}");
+        assert!(!codes.contains(&"ctx_near_limit"), "{codes:?}");
+        assert!(codes.contains(&"reasoning_no_answer"), "{codes:?}");
+    }
+
+    #[tokio::test]
+    async fn integration__analyze_sse_stream__usageless_length_still_flagged() {
+        // Streaming without a usage chunk cannot prove either way — the
+        // legacy conservative flag stands.
+        let s = Sentinel::new(true, 0, None);
+        let ctx = RequestCtx {
+            trace: "plm-nousage-1".into(),
+            model: "m".into(),
+            route: "openai-chat".into(),
+            ctx: Some(16_384),
+            ..RequestCtx::default()
+        };
+        let feed = s.begin(ctx, 200, true);
+        feed.bytes(b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n");
+        feed.bytes(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n");
+        feed.bytes(b"data: [DONE]\n\n");
+        feed.end();
+        for _ in 0..50 {
+            if !s.why(None, 10).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let recs = s.why(None, 10);
+        let codes: Vec<&str> = recs[0].detections.iter().map(|d| d.code.as_str()).collect();
+        assert!(codes.contains(&"ctx_truncated"), "{codes:?}");
     }
 }

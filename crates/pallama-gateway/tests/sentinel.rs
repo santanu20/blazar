@@ -11,9 +11,9 @@ use std::time::Duration;
 use pallama_core::hardware::{GpuInfo, Hardware};
 use pallama_core::store::Store;
 use pallama_core::{Config, PallamaDirs};
-use pallama_runtime::{EventBus, LlamaCppEngine, Supervisor};
-use pallama_gateway::state::AppState;
 use pallama_gateway::router;
+use pallama_gateway::state::AppState;
+use pallama_runtime::{EventBus, LlamaCppEngine, Supervisor};
 
 fn stub_bin() -> PathBuf {
     let exe = std::env::current_exe().expect("test exe path");
@@ -73,7 +73,10 @@ struct TestServer {
 
 async fn start(config: Config, stub_env: &[(&str, &str)], bare_template: bool) -> TestServer {
     let tmp = tempfile::tempdir().unwrap();
-    let dirs = PallamaDirs { config_dir: tmp.path().join("c"), data_dir: tmp.path().join("d") };
+    let dirs = PallamaDirs {
+        config_dir: tmp.path().join("c"),
+        data_dir: tmp.path().join("d"),
+    };
     dirs.ensure().unwrap();
     let gguf = dirs.models_dir().join("m1-q4_k_m.gguf");
     write_gguf(&gguf, bare_template);
@@ -95,9 +98,8 @@ async fn start(config: Config, stub_env: &[(&str, &str)], bare_template: bool) -
         })
         .unwrap();
 
-    let mut engine = LlamaCppEngine::new(
-        pallama_runtime::probe_manifest(&stub_bin(), "stub").unwrap(),
-    );
+    let mut engine =
+        LlamaCppEngine::new(pallama_runtime::probe_manifest(&stub_bin(), "stub").unwrap());
     engine.child_env = stub_env
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -121,14 +123,26 @@ async fn start(config: Config, stub_env: &[(&str, &str)], bare_template: bool) -
     s.reaper_interval = Duration::from_hours(1);
     let sup = Arc::new(s);
     let reaper = sup.spawn_reaper();
-    let state = Arc::new(AppState::new(dirs.clone(), config, sup.clone(), EventBus::default()));
+    let state = Arc::new(AppState::new(
+        dirs.clone(),
+        config,
+        sup.clone(),
+        EventBus::default(),
+    ));
     let app = router(state.clone());
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    TestServer { base: format!("http://127.0.0.1:{port}"), _tmp: tmp, state, _sup_reaper: reaper }
+    TestServer {
+        base: format!("http://127.0.0.1:{port}"),
+        _tmp: tmp,
+        state,
+        _sup_reaper: reaper,
+    }
 }
 
 fn client() -> reqwest::Client {
@@ -148,7 +162,10 @@ async fn await_record(ts: &TestServer, route: &str) -> pallama_gateway::sentinel
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("no sentinel record for route {route}: {:?}", ts.state.sentinel.why(None, 5));
+    panic!(
+        "no sentinel record for route {route}: {:?}",
+        ts.state.sentinel.why(None, 5)
+    );
 }
 
 fn codes(rec: &pallama_gateway::sentinel::SentinelRecord) -> Vec<&'static str> {
@@ -158,10 +175,44 @@ fn codes(rec: &pallama_gateway::sentinel::SentinelRecord) -> Vec<&'static str> {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn integration__sentinel__truncation_and_near_limit() {
-    let cfg = Config { default_ctx: 8, ..Config::default() }; // tiny ceiling: near-limit + length both fire
+    // Contract 1 (default): prompt_preflight refuses the over-ctx prompt
+    // pre-hoc with a teaching 400 — the engine never truncates silently.
+    let cfg = Config {
+        default_ctx: 8,
+        ..Config::default()
+    };
     let ts = start(cfg, &[("STUB_FINISH", "length")], false).await;
     let c = client();
     let long: String = "word ".repeat(50);
+    let refused = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "messages": [{"role": "user", "content": long}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+    let body: serde_json::Value = refused.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("truncat"),
+        "teaching error: {body}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+
+    // Contract 2 (preflight off): the sentinel catches the engine's
+    // silent truncation post-hoc — the safety net stays pinned.
+    let cfg = Config {
+        default_ctx: 8,
+        prompt_preflight: false,
+        ..Config::default()
+    };
+    let ts = start(cfg, &[("STUB_FINISH", "length")], false).await;
     let r: serde_json::Value = c
         .post(format!("{}/v1/chat/completions", ts.base))
         .json(&serde_json::json!({
@@ -243,7 +294,9 @@ async fn integration__sentinel__precheck_header_on_bare_template() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(
-        resp.headers().get("x-pallama-warnings").and_then(|v| v.to_str().ok()),
+        resp.headers()
+            .get("x-pallama-warnings")
+            .and_then(|v| v.to_str().ok()),
         Some("template_no_tools")
     );
     let rec = await_record(&ts, "openai-chat").await;
@@ -285,14 +338,21 @@ async fn integration__sentinel__empty_and_schema_violation() {
         .await
         .unwrap();
     let rec = await_record(&ts, "openai-chat").await;
-    assert!(codes(&rec).contains(&"schema_violation"), "{:?}", codes(&rec));
+    assert!(
+        codes(&rec).contains(&"schema_violation"),
+        "{:?}",
+        codes(&rec)
+    );
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn integration__sentinel__stalled_stream_detected_and_stream_survives() {
-    let cfg = Config { sentinel_stall_secs: 5, ..Config::default() }; // validation floor
+    let cfg = Config {
+        sentinel_stall_secs: 5,
+        ..Config::default()
+    }; // validation floor
     let ts = start(cfg, &[("STUB_DELAY_CHUNK_MS", "5500")], false).await;
     let c = client();
     let text = c
@@ -382,7 +442,11 @@ async fn integration__sentinel__responses_api_stream_and_nonstream() {
     assert_eq!(r["status"], "incomplete");
     let rec = await_record(&ts, "openai-responses").await;
     assert!(codes(&rec).contains(&"ctx_truncated"), "{:?}", codes(&rec));
-    assert_eq!(rec.prompt_tokens, Some(3), "usage mapped input_tokens->prompt");
+    assert_eq!(
+        rec.prompt_tokens,
+        Some(u64::from(Config::default().default_ctx) - 4),
+        "usage mapped input_tokens->prompt"
+    );
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
@@ -466,7 +530,11 @@ async fn integration__sentinel__enforce_422_on_nonstream_only() {
         .send()
         .await
         .unwrap();
-    assert_eq!(stream_enforced.status(), 200, "streaming is never hard-failed");
+    assert_eq!(
+        stream_enforced.status(),
+        200,
+        "streaming is never hard-failed"
+    );
     let stext = stream_enforced.text().await.unwrap();
     assert!(stext.contains("[DONE]"));
     ts.state.sup.shutdown_all().await.unwrap();
@@ -475,7 +543,10 @@ async fn integration__sentinel__enforce_422_on_nonstream_only() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn integration__sentinel__enforce_config_global_and_ollama_path() {
-    let cfg = Config { sentinel_enforce: true, ..Config::default() };
+    let cfg = Config {
+        sentinel_enforce: true,
+        ..Config::default()
+    };
     let ts = start(cfg, &[("STUB_BAD_TOOL_ARGS", "1")], false).await;
     let c = client();
     // OpenAI path, no header: config enforces.
@@ -510,10 +581,17 @@ async fn integration__sentinel__enforce_config_global_and_ollama_path() {
         .unwrap();
     assert_eq!(o.status(), 422);
     let obody: serde_json::Value = o.json().await.unwrap();
-    assert!(obody["error"].as_str().unwrap_or_default().contains("sentinel enforce"));
+    assert!(obody["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("sentinel enforce"));
     // Enforce decisions land in the ring (answerable via why).
     let rec = await_record(&ts, "ollama-chat").await;
-    assert!(codes(&rec).contains(&"tool_args_invalid_json"), "{:?}", codes(&rec));
+    assert!(
+        codes(&rec).contains(&"tool_args_invalid_json"),
+        "{:?}",
+        codes(&rec)
+    );
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
@@ -622,7 +700,10 @@ async fn integration__openai_num_ctx_header__restarts_at_requested_size() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn integration__sentinel__disabled_is_a_full_kill_switch() {
-    let cfg = Config { sentinel: false, ..Config::default() };
+    let cfg = Config {
+        sentinel: false,
+        ..Config::default()
+    };
     let ts = start(cfg, &[("STUB_FINISH", "length")], true).await;
     let c = client();
     let resp = c
@@ -636,7 +717,10 @@ async fn integration__sentinel__disabled_is_a_full_kill_switch() {
     assert_eq!(resp.status(), 200);
     assert!(resp.headers().get("x-pallama-warnings").is_none());
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(ts.state.sentinel.why(None, 10).is_empty(), "kill switch must disable every hook");
+    assert!(
+        ts.state.sentinel.why(None, 10).is_empty(),
+        "kill switch must disable every hook"
+    );
     let why: serde_json::Value = c
         .get(format!("{}/api/why", ts.base))
         .send()

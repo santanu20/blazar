@@ -9,18 +9,20 @@
 
 use std::sync::Arc;
 
-use std::fmt::Write as _;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
-use axum::Extension;
 use axum::response::{IntoResponse, Response};
-use tokio_stream::StreamExt as TsExt;
+use axum::Extension;
 use serde_json::{json, Value};
+use std::fmt::Write as _;
+use tokio_stream::StreamExt as TsExt;
 
 use pallama_core::store::Store;
 
-use crate::proxy::{child_base, ensure_with_admission, resolve_model, with_accounting};
+use crate::proxy::{
+    affinity_hash, child_base, ensure_with_admission, resolve_model, with_accounting,
+};
 use crate::queue::Priority;
 use crate::sentinel;
 use crate::state::AppState;
@@ -45,21 +47,25 @@ pub async fn version() -> Response {
 /// consumer gets a resync note and keeps streaming. History is `why`'s
 /// job; this is strictly live.
 pub async fn watch(State(state): State<Arc<AppState>>) -> Response {
+    let scrub = state.config.pii_scrub;
     let rx = state.sentinel.watch();
-    let stream = futures::stream::unfold(rx, |mut rx| async move {
+    let stream = futures::stream::unfold((rx, scrub), |(mut rx, scrub)| async move {
         match rx.recv().await {
-            Ok(record) => Some((
-                Ok::<Bytes, std::io::Error>(Bytes::from(format!(
-                    "data: {}\n\n",
-                    record.to_json()
-                ))),
-                rx,
-            )),
+            Ok(record) => {
+                let mut j = record.to_json();
+                if scrub {
+                    j = crate::scrub::scrub_value(&j);
+                }
+                Some((
+                    Ok::<Bytes, std::io::Error>(Bytes::from(format!("data: {j}\n\n"))),
+                    (rx, scrub),
+                ))
+            }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => Some((
                 Ok(Bytes::from(format!(
                     "data: {{\"note\":\"watch lagged, {n} records skipped\"}}\n\n"
                 ))),
-                rx,
+                (rx, scrub),
             )),
             Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
         }
@@ -77,13 +83,45 @@ pub async fn watch(State(state): State<Arc<AppState>>) -> Response {
 /// `sentinel: false` reports the kill-switch state instead of an error:
 /// silent-empty is the exact failure mode this exists to expose.
 pub async fn why(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
-    let trace = uri
-        .query()
-        .and_then(|q| q.split('&').find_map(|p| p.strip_prefix("trace=")));
-    let records = state.sentinel.why(trace, 10);
+    let q = uri.query().unwrap_or_default();
+    let mut trace = None;
+    let mut model = None;
+    let mut code = None;
+    for pair in q.split('&') {
+        if let Some(v) = pair.strip_prefix("trace=") {
+            trace = Some(v.to_string());
+        } else if let Some(v) = pair.strip_prefix("model=") {
+            model = Some(v.to_string());
+        } else if let Some(v) = pair.strip_prefix("code=") {
+            code = Some(v.to_string());
+        }
+    }
+    let records: Vec<_> = state
+        .sentinel
+        .why(trace.as_deref(), 100)
+        .into_iter()
+        .filter(|r| model.as_ref().is_none_or(|m| r.model.contains(m.as_str())))
+        .filter(|r| {
+            code.as_ref().is_none_or(|c| {
+                r.detections
+                    .iter()
+                    .any(|d| d.code.as_str().contains(c.as_str()))
+            })
+        })
+        .take(10)
+        .collect();
+    let records_json: Vec<_> = records
+        .iter()
+        .map(sentinel::SentinelRecord::to_json)
+        .collect::<Vec<_>>();
+    let records_json = if state.config.pii_scrub {
+        records_json.iter().map(crate::scrub::scrub_value).collect()
+    } else {
+        records_json
+    };
     axum::Json(json!({
         "sentinel": state.config.sentinel,
-        "records": records.iter().map(sentinel::SentinelRecord::to_json).collect::<Vec<_>>(),
+        "records": records_json,
     }))
     .into_response()
 }
@@ -108,10 +146,12 @@ pub async fn tags(State(state): State<Arc<AppState>>) -> Response {
                 .as_ref()
                 .and_then(|p| std::fs::metadata(p).ok())
                 .map_or(0, |md| i64::try_from(md.len()).unwrap_or(i64::MAX));
-            let details_vision = m.mmproj_path.as_ref().map(|p| json!({
-                "mmproj": p,
-                "mmproj_bytes": mm_bytes,
-            }));
+            let details_vision = m.mmproj_path.as_ref().map(|p| {
+                json!({
+                    "mmproj": p,
+                    "mmproj_bytes": mm_bytes,
+                })
+            });
             json!({
                 "name": format!("{}:{}", m.name, m.quant.to_lowercase()),
                 "model": format!("{}:{}", m.name, m.quant.to_lowercase()),
@@ -202,7 +242,10 @@ pub async fn delete(State(state): State<Arc<AppState>>, body: Bytes) -> Response
         Ok(v) => v,
         Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
     };
-    let name = req["model"].as_str().or(req["name"].as_str()).unwrap_or_default();
+    let name = req["model"]
+        .as_str()
+        .or(req["name"].as_str())
+        .unwrap_or_default();
     match pallama_runtime::remove_model(&state.dirs, name) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => {
@@ -238,15 +281,40 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
                 "name": p.name,
                 "model": p.name,
                 "size": p.bytes,
+                "pallama_replica": p.replica,
                 "pallama_state": p.state,
                 "pallama_ctx": p.ctx,
+                "pallama_gpu": p.gpu,
                 "pallama_in_flight": p.in_flight,
                 "pallama_endpoint": p.endpoint,
+                "pallama_heat": p.heat,
                 "expires_at": chrono_like_now().saturating_add(i64::try_from(idle_remaining * 1_000_000_000).unwrap_or(i64::MAX)),
             })
         })
         .collect();
-    axum::Json(json!({"models": rows})).into_response()
+    // Remotes: probed concurrently (3s cap each) so `ps` stays fast
+    // even with a dead remote on the list.
+    let remotes: Vec<Value> = if state.config.remotes.is_empty() {
+        Vec::new()
+    } else {
+        let state_for_probe = Arc::clone(&state);
+        let futs: Vec<_> = state
+            .config
+            .remotes
+            .iter()
+            .map(|r| {
+                let s = &state_for_probe;
+                async move { (r.name.clone(), crate::remotes::probe(s, r).await) }
+            })
+            .collect();
+        let mut out = Vec::new();
+        for f in futs {
+            let (name, (ok, note)) = f.await;
+            out.push(json!({"name": name, "ok": ok, "note": note}));
+        }
+        out
+    };
+    axum::Json(json!({"models": rows, "remotes": remotes})).into_response()
 }
 
 /// Router-mode ps: one process, N engine-managed models. The child's
@@ -322,7 +390,11 @@ pub async fn pull(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
         Ok(v) => v,
         Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
     };
-    let target = req["model"].as_str().or(req["name"].as_str()).unwrap_or_default().to_string();
+    let target = req["model"]
+        .as_str()
+        .or(req["name"].as_str())
+        .unwrap_or_default()
+        .to_string();
     if target.is_empty() {
         return api_error(400, "missing field: model");
     }
@@ -374,7 +446,11 @@ pub async fn pull(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
                 return;
             }
         };
-        let puller = pallama_runtime::Puller { dirs, client, bus: bus.clone() };
+        let puller = pallama_runtime::Puller {
+            dirs,
+            client,
+            bus: bus.clone(),
+        };
         if let Err(e) = puller.pull(&pull_request).await {
             tracing::warn!("pull {pull_request}: {e:#}");
             bus.publish(pallama_runtime::PallamaEvent::PullFailed {
@@ -393,10 +469,17 @@ pub async fn pull(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
 
 /// One NDJSON line per pull event; terminal=true ends the stream.
 fn pull_event_line(name: &str, e: &pallama_runtime::PallamaEvent) -> (String, bool) {
-    use pallama_runtime::PallamaEvent::{PullProgress, ModelPulled, PullFailed};
+    use pallama_runtime::PallamaEvent::{ModelPulled, PullFailed, PullProgress};
     match e {
-        PullProgress { name: n, downloaded, total } if n == name => (
-            format!("{}\n", json!({"status": "pulling", "total": total, "completed": downloaded})),
+        PullProgress {
+            name: n,
+            downloaded,
+            total,
+        } if n == name => (
+            format!(
+                "{}\n",
+                json!({"status": "pulling", "total": total, "completed": downloaded})
+            ),
             false,
         ),
         ModelPulled { name: n, warning } if n == name => {
@@ -408,10 +491,9 @@ fn pull_event_line(name: &str, e: &pallama_runtime::PallamaEvent) -> (String, bo
             }
             (format!("{payload}\n"), true)
         }
-        PullFailed { name: n, error } if n == name => (
-            format!("{}\n", json!({"error": error})),
-            true,
-        ),
+        PullFailed { name: n, error } if n == name => {
+            (format!("{}\n", json!({"error": error})), true)
+        }
         _ => (String::new(), false),
     }
 }
@@ -428,7 +510,10 @@ pub async fn events(State(state): State<Arc<AppState>>) -> Response {
         )))),
         Err(_) => None,
     });
-    let stream = TsExt::chain(mapped, futures::stream::iter(Vec::<Result<Bytes, std::io::Error>>::new()));
+    let stream = TsExt::chain(
+        mapped,
+        futures::stream::iter(Vec::<Result<Bytes, std::io::Error>>::new()),
+    );
     Response::builder()
         .status(200)
         .header("content-type", "text/event-stream")
@@ -437,7 +522,10 @@ pub async fn events(State(state): State<Arc<AppState>>) -> Response {
 }
 
 fn event_kind(e: &pallama_runtime::PallamaEvent) -> &'static str {
-    use pallama_runtime::PallamaEvent::{EngineUpdated, EngineRemoved, ModelPulled, ModelRemoved, PullProgress, PullFailed, InstanceStateChanged, BenchmarkDone, QueueDepth};
+    use pallama_runtime::PallamaEvent::{
+        BenchmarkDone, EngineRemoved, EngineUpdated, InstanceStateChanged, ModelPulled,
+        ModelRemoved, PullFailed, PullProgress, QueueDepth,
+    };
     match e {
         EngineUpdated { .. } => "engine_updated",
         EngineRemoved { .. } => "engine_removed",
@@ -452,9 +540,11 @@ fn event_kind(e: &pallama_runtime::PallamaEvent) -> &'static str {
 }
 
 /// POST /api/chat — full translation incl. `num_ctx` + `keep_alive`.
+#[allow(clippy::too_many_lines)] // one cohesive translation + admission path
 pub async fn chat(
     State(state): State<Arc<AppState>>,
     trace_ext: Option<Extension<TraceId>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -463,6 +553,12 @@ pub async fn chat(
         Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
     };
     let model_field = req["model"].as_str().unwrap_or_default().to_string();
+    // Remote routing: `<remote>:<model>` on the ollama API too.
+    if let Some((remote, remote_model)) = crate::remotes::split_remote(&model_field, &state.config)
+    {
+        let remote = remote.clone();
+        return crate::remotes::ollama_chat_remote(&state, &remote, remote_model, &req).await;
+    }
     let (openai_req, num_ctx) = match tr::chat_to_openai(&req) {
         Ok(r) => r,
         Err(e) => return api_error(400, &e),
@@ -476,6 +572,43 @@ pub async fn chat(
         Ok(r) => r,
         Err(e) => return api_error(404, &e),
     };
+
+    // Per-key admission (scope + rate + request count), then token
+    // accounting on the outgoing NDJSON (final line carries eval counts).
+    let key_entry = key_ext
+        .as_ref()
+        .map(|Extension(k)| k.name.clone())
+        .and_then(|name| state.keys.entry(&name).map(|e| (name, e)));
+    if let Some((name, entry)) = &key_entry {
+        if let Err(rej) = state.keys.check(entry, &row.name) {
+            return rej.to_response();
+        }
+        state.keys.charge_request(name);
+    }
+    // Strict tool-def lint (tools arrive in OpenAI shape after translate).
+    if let Some(err) = crate::sentinel::strict_tool_def_error(&req) {
+        return api_error(400, &format!("invalid tools: {err}"));
+    }
+    // Prompt-fit preflight (num_ctx request override counts).
+    {
+        let eff = match req
+            .pointer("/options/num_ctx")
+            .and_then(serde_json::Value::as_u64)
+        {
+            Some(v) => v,
+            None => u64::from(state.config.effective_ctx(&row.name)),
+        };
+        if let Err(resp) = crate::preflight::enforce_prompt_fits(
+            &state,
+            &row.name,
+            &req,
+            u32::try_from(eff).unwrap_or(u32::MAX),
+        )
+        .await
+        {
+            return resp;
+        }
+    }
 
     let priority = Priority::from_header(
         headers
@@ -502,10 +635,14 @@ pub async fn chat(
         }
     }
 
-    let (engine, load_ms) = match ensure_with_admission(&state, &row.name, priority).await {
-        Ok(ok) => ok,
-        Err(resp) => return resp,
-    };
+    let (engine, load_ms) =
+        match ensure_with_admission(&state, &row.name, priority, affinity_hash(&req)).await {
+            Ok(ok) => ok,
+            Err(resp) => return resp,
+        };
+    // Heat under the INSTANCE key (model or model#N): replica victim
+    // choice and idle tracking are key-scoped (B1).
+    state.sup.note_prefix_hit(&engine.name);
 
     let stream = req["stream"].as_bool().unwrap_or(true);
     let keep_alive = parse_keep_alive(req.get("keep_alive"));
@@ -513,30 +650,85 @@ pub async fn chat(
     let openai_bytes = serde_json::to_vec(&openai_req).unwrap_or_default();
     let state2 = state.clone();
     let engine2 = engine.clone();
-    let accounting_name = model_name.clone();
+    let accounting_name = engine.name.clone();
 
-    let out = with_accounting(&state, &accounting_name, async move {
-        let enforce = state2.config.sentinel
-            && sentinel::enforce_enabled(&state2.config, &headers);
-        let resp = proxy_core_chat(&state2, &engine2, &model_name, openai_bytes, stream, load_ms, trace_ext.map(|Extension(t)| t.0), enforce).await;
-        // keep_alive=0: evict right after this response (complaint #12).
+    let mut out = with_accounting(&state, &accounting_name, async move {
+        let enforce = state2.config.sentinel && sentinel::enforce_enabled(&state2.config, &headers);
+        let resp = proxy_core_chat(
+            &state2,
+            &engine2,
+            &model_name,
+            openai_bytes,
+            stream,
+            load_ms,
+            trace_ext.map(|Extension(t)| t.0),
+            enforce,
+        )
+        .await;
+        // keep_alive=0: evict right after this response (complaint #12),
+        // banking the KV checkpoint first.
         if keep_alive == Some(0) {
-            let _ = state2.sup.evict(&model_name).await;
+            let _ = state2.sup.evict_model(&model_name).await;
         }
         resp
     })
     .await;
+    // Token accounting rides the outgoing ollama body (the final NDJSON
+    // line / JSON carries eval counts); constructed only for keys with
+    // token budgets.
+    if let Some((name, _entry)) = key_entry.filter(|(_, e)| e.tpm > 0 || e.daily_tokens > 0) {
+        out = crate::keys::charge_outgoing(out, &name, Arc::clone(&state.keys));
+    }
     out
 }
 
 fn parse_keep_alive(v: Option<&Value>) -> Option<i64> {
     let v = v?;
-    v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    v.as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
-pub(crate) async fn apply_num_ctx(state: &Arc<AppState>, model: &str, want: i64) -> Result<(), Response> {
+pub(crate) async fn apply_num_ctx(
+    state: &Arc<AppState>,
+    model: &str,
+    want: i64,
+) -> Result<(), Response> {
     if want <= 0 {
         return Err(api_error(400, "options.num_ctx must be positive"));
+    }
+    // VRAM preflight (I5): refuse a ctx that cannot fit even on an EMPTY
+    // GPU — weights + f16 KV at the target ctx. Conservative by design
+    // (no live-free query exists across backends), zero false positives:
+    // anything that passes here still gets the engine's own fit juggling.
+    {
+        let store = pallama_core::Store::open(&state.dirs).ok();
+        let row = store
+            .as_ref()
+            .and_then(|s| s.get_model(model).ok().flatten());
+        if let Some(row) = row {
+            if let Ok(meta) = pallama_core::read_metadata_file(std::path::Path::new(&row.path)) {
+                let total_vram = state.sup.hardware.total_vram_mib();
+                if total_vram > 0 {
+                    let weights =
+                        u64::try_from(row.bytes.max(0)).unwrap_or(u64::MAX) / (1024 * 1024);
+                    // KV (MiB, f16): 2 (K+V) * layers * kv_heads * head_dim * ctx * 2B
+                    let kv = crate::preflight::kv_f16_mib(
+                        &meta,
+                        u64::try_from(want).unwrap_or(u64::MAX),
+                    );
+                    if weights.saturating_add(kv) > total_vram {
+                        return Err(api_error(
+                            400,
+                            &format!(
+                            "num_ctx {want} needs ~{kv} MiB KV on top of {weights} MiB weights — \
+                             over the {total_vram} MiB GPU. Lower num_ctx, pull a smaller quant, \
+                             or set cache_type = \"q8_0\""
+                        ),
+                        ));
+                    }
+                }
+            }
+        }
     }
     // If an instance exists at a smaller ctx and is idle: recycle it; the
     // next ensure recompiles with the config/overlay ctx. To honor the
@@ -544,11 +736,15 @@ pub(crate) async fn apply_num_ctx(state: &Arc<AppState>, model: &str, want: i64)
     let running = state.sup.ps().into_iter().find(|p| p.name == model);
     if let Some(p) = running {
         if i64::from(p.ctx) < want && p.in_flight == 0 {
-            let _ = state.sup.evict(model).await;
-            state.sup.set_next_ctx(model, u32::try_from(want).unwrap_or(u32::MAX));
+            let _ = state.sup.evict_model(model).await;
+            state
+                .sup
+                .set_next_ctx(model, u32::try_from(want).unwrap_or(u32::MAX));
         }
     } else {
-        state.sup.set_next_ctx(model, u32::try_from(want).unwrap_or(u32::MAX));
+        state
+            .sup
+            .set_next_ctx(model, u32::try_from(want).unwrap_or(u32::MAX));
     }
     Ok(())
 }
@@ -566,7 +762,10 @@ async fn proxy_core_chat(
 ) -> Response {
     let base = child_base(&engine.endpoint);
     let url = format!("{base}/v1/chat/completions");
-    let req = state.http.post(&url).header("content-type", "application/json");
+    let req = state
+        .http
+        .post(&url)
+        .header("content-type", "application/json");
     if !stream {
         // We translate the non-stream response into ollama shape.
         let t0 = std::time::Instant::now();
@@ -595,17 +794,12 @@ async fn proxy_core_chat(
         // Non-stream + enforce: judge before translation (streaming stays
         // warn-only — bytes are already on the wire).
         if enforce {
-            let (ctx, _) = sentinel::request_ctx(
-                state,
-                "ollama-chat",
-                model,
-                &openai_body,
-                trace,
-                false,
-            );
-            let hard = state
-                .sentinel
-                .judge(&ctx, &serde_json::to_vec(&openai).unwrap_or_default(), 200);
+            let (ctx, _) =
+                sentinel::request_ctx(state, "ollama-chat", model, &openai_body, trace, false);
+            let hard =
+                state
+                    .sentinel
+                    .judge(&ctx, &serde_json::to_vec(&openai).unwrap_or_default(), 200);
             if !hard.is_empty() {
                 let detail = hard
                     .iter()
@@ -696,13 +890,25 @@ async fn proxy_core_chat(
     let buf = String::new();
     let model_owned = model_c.clone();
     let ndjson = futures::stream::unfold(
-        (stream, buf, model_owned, false, None::<Value>, None::<String>, false),
+        (
+            stream,
+            buf,
+            model_owned,
+            false,
+            None::<Value>,
+            None::<String>,
+            false,
+        ),
         |(mut stream, mut buf, model, mut done, mut usage, mut finish, mut usage_sent)| async move {
             loop {
                 if done && !usage_sent {
-                    let final_chunk = tr::ollama_final_chunk(&model, usage.as_ref(), finish.as_deref());
+                    let final_chunk =
+                        tr::ollama_final_chunk(&model, usage.as_ref(), finish.as_deref());
                     usage_sent = true;
-                    return Some((Ok(Bytes::from(format!("{final_chunk}\n"))), (stream, buf, model, done, usage, finish, usage_sent)));
+                    return Some((
+                        Ok(Bytes::from(format!("{final_chunk}\n"))),
+                        (stream, buf, model, done, usage, finish, usage_sent),
+                    ));
                 }
                 match futures::StreamExt::next(&mut stream).await {
                     Some(Ok(bytes)) => {
@@ -731,10 +937,16 @@ async fn proxy_core_chat(
                             continue; // need more data
                         }
                         let body = lines.join("");
-                        return Some((Ok(Bytes::from(body)), (stream, buf, model, done, usage, finish, usage_sent)));
+                        return Some((
+                            Ok(Bytes::from(body)),
+                            (stream, buf, model, done, usage, finish, usage_sent),
+                        ));
                     }
                     Some(Err(e)) => {
-                        return Some((Err(std::io::Error::other(e.to_string())), (stream, buf, model, done, usage, finish, usage_sent)));
+                        return Some((
+                            Err(std::io::Error::other(e.to_string())),
+                            (stream, buf, model, done, usage, finish, usage_sent),
+                        ));
                     }
                     None => {
                         if !done {
@@ -753,11 +965,17 @@ async fn proxy_core_chat(
     if load_hdr {
         builder = builder.header("x-pallama-status", "loading");
     }
-    builder.body(Body::from_stream(ndjson)).unwrap_or_else(|e| api_error(500, &e.to_string()))
+    builder
+        .body(Body::from_stream(ndjson))
+        .unwrap_or_else(|e| api_error(500, &e.to_string()))
 }
 
 /// POST /api/embeddings (legacy ollama shape).
-pub async fn embeddings(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+pub async fn embeddings(
+    State(state): State<Arc<AppState>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
+    body: Bytes,
+) -> Response {
     let req: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
@@ -767,19 +985,23 @@ pub async fn embeddings(State(state): State<Arc<AppState>>, body: Bytes) -> Resp
         Err(e) => return api_error(400, &e),
     };
     let model = openai_req["model"].as_str().unwrap_or_default().to_string();
-    let (engine, _) = match ensure_with_admission(&state, &model, Priority::Normal).await {
+    // Scope + request count (embeddings carry no token usage; budgets
+    // apply on request counts only for this route).
+    if let Some(Extension(k)) = &key_ext {
+        if let Some(entry) = state.keys.entry(&k.name) {
+            if let Err(rej) = state.keys.check(&entry, &model) {
+                return rej.to_response();
+            }
+            state.keys.charge_request(&k.name);
+        }
+    }
+    let (engine, _) = match ensure_with_admission(&state, &model, Priority::Normal, None).await {
         Ok(ok) => ok,
         Err(resp) => return resp,
     };
     with_accounting(&state, &engine.name.clone(), async {
         let url = format!("{}/v1/embeddings", child_base(&engine.endpoint));
-        let resp = match state
-            .http
-            .post(&url)
-            .json(&openai_req)
-            .send()
-            .await
-        {
+        let resp = match state.http.post(&url).json(&openai_req).send().await {
             Ok(r) => r,
             Err(e) => return api_error(502, &format!("engine request failed: {e:#}")),
         };
@@ -797,11 +1019,152 @@ pub async fn embeddings(State(state): State<Arc<AppState>>, body: Bytes) -> Resp
     .await
 }
 
+/// POST /api/embed — ollama new-style embeddings (input: str | [str]);
+/// same engine lane as /api/embeddings, array-friendly shape.
+pub async fn embed(
+    State(state): State<Arc<AppState>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
+    body: Bytes,
+) -> Response {
+    let req: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
+    };
+    let model = req["model"].as_str().unwrap_or_default().to_string();
+    if model.is_empty() {
+        return api_error(400, "missing \"model\"");
+    }
+    // Normalize input to the OpenAI array shape (str -> [str]).
+    let inputs: Vec<Value> = match &req["input"] {
+        Value::String(s) => vec![Value::String(s.clone())],
+        Value::Array(a) if !a.is_empty() => a.clone(),
+        _ => {
+            return api_error(
+                400,
+                "\"input\" must be a string or a non-empty array of strings",
+            )
+        }
+    };
+    if let Some(Extension(k)) = &key_ext {
+        if let Some(entry) = state.keys.entry(&k.name) {
+            if let Err(rej) = state.keys.check(&entry, &model) {
+                return rej.to_response();
+            }
+            state.keys.charge_request(&k.name);
+        }
+    }
+    let (engine, _) = match ensure_with_admission(&state, &model, Priority::Normal, None).await {
+        Ok(ok) => ok,
+        Err(resp) => return resp,
+    };
+    with_accounting(&state, &engine.name.clone(), async {
+        let url = format!("{}/v1/embeddings", child_base(&engine.endpoint));
+        let openai_req = json!({"model": model, "input": inputs});
+        let resp = match state.http.post(&url).json(&openai_req).send().await {
+            Ok(r) => r,
+            Err(e) => return api_error(502, &format!("engine request failed: {e:#}")),
+        };
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap_or_default();
+            return api_error(status, &text);
+        }
+        let openai: Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => return api_error(502, &format!("bad engine response: {e}")),
+        };
+        // ollama /api/embed shape: {model, embeddings: [[f32]]}
+        let embeddings: Vec<Value> = openai["data"]
+            .as_array()
+            .map(|d| d.iter().map(|e| e["embedding"].clone()).collect())
+            .unwrap_or_default();
+        axum::Json(json!({"model": model, "embeddings": embeddings})).into_response()
+    })
+    .await
+}
+
+/// POST /api/rerank — ollama-lane rerank: forwards to the child's
+/// /v1/rerank. Accepts `documents` as strings or {text} objects
+/// (normalizes to the `OpenAI` string shape); response passes through
+/// verbatim (results + usage).
+pub async fn rerank(
+    State(state): State<Arc<AppState>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
+    body: Bytes,
+) -> Response {
+    let req: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
+    };
+    let model = req["model"].as_str().unwrap_or_default().to_string();
+    if model.is_empty() {
+        return api_error(400, "missing \"model\"");
+    }
+    if req
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .is_empty()
+    {
+        return api_error(400, "missing \"query\"");
+    }
+    let Some(docs) = req.get("documents").and_then(Value::as_array) else {
+        return api_error(400, "\"documents\" must be an array");
+    };
+    // {text: "..."} objects -> plain strings.
+    let normalized: Vec<Value> = docs
+        .iter()
+        .map(|d| match d {
+            Value::String(s) => Value::String(s.clone()),
+            Value::Object(_) => Value::String(d["text"].as_str().unwrap_or_default().to_string()),
+            other => other.clone(),
+        })
+        .collect();
+    let forward = json!({
+        "model": model,
+        "query": req["query"],
+        "documents": normalized,
+        "top_n": req.get("top_n").cloned().unwrap_or(json!(docs.len())),
+    });
+    if let Some(Extension(k)) = &key_ext {
+        if let Some(entry) = state.keys.entry(&k.name) {
+            if let Err(rej) = state.keys.check(&entry, &model) {
+                return rej.to_response();
+            }
+            state.keys.charge_request(&k.name);
+        }
+    }
+    let (engine, _) = match ensure_with_admission(&state, &model, Priority::Normal, None).await {
+        Ok(ok) => ok,
+        Err(resp) => return resp,
+    };
+    with_accounting(&state, &engine.name.clone(), async {
+        let url = format!("{}/v1/rerank", child_base(&engine.endpoint));
+        let resp = match state.http.post(&url).json(&forward).send().await {
+            Ok(r) => r,
+            Err(e) => return api_error(502, &format!("engine request failed: {e:#}")),
+        };
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        // Engine error text (e.g. non-rerank model) passes through with
+        // its status — teaching, not masking.
+        if status == 200 {
+            match serde_json::from_str::<Value>(&text) {
+                Ok(v) => return axum::Json(v).into_response(),
+                Err(e) => return api_error(502, &format!("bad engine response: {e}")),
+            }
+        }
+        api_error(status, &text)
+    })
+    .await
+}
+
 /// POST /api/generate — raw prompts only (templated -> 400 + pointer).
 #[allow(clippy::too_many_lines)] // one cohesive translation path
 pub async fn generate(
     State(state): State<Arc<AppState>>,
     trace_ext: Option<Extension<TraceId>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -816,16 +1179,27 @@ pub async fn generate(
         );
     };
     let model = openai_req["model"].as_str().unwrap_or_default().to_string();
+    let key_entry = key_ext
+        .as_ref()
+        .map(|Extension(k)| k.name.clone())
+        .and_then(|name| state.keys.entry(&name).map(|e| (name, e)));
+    if let Some((name, entry)) = &key_entry {
+        if let Err(rej) = state.keys.check(entry, &model) {
+            return rej.to_response();
+        }
+        state.keys.charge_request(name);
+    }
     let priority = Priority::from_header(
         headers
             .get("x-pallama-priority")
             .and_then(|v| v.to_str().ok()),
     );
-    let (engine, _) = match ensure_with_admission(&state, &model, priority).await {
-        Ok(ok) => ok,
-        Err(resp) => return resp,
-    };
-    with_accounting(&state, &engine.name.clone(), async {
+    let (engine, _) =
+        match ensure_with_admission(&state, &model, priority, affinity_hash(&req)).await {
+            Ok(ok) => ok,
+            Err(resp) => return resp,
+        };
+    let mut out = with_accounting(&state, &engine.name.clone(), async {
         let url = format!("{}/v1/completions", child_base(&engine.endpoint));
         let resp = match state.http.post(&url).json(&openai_req).send().await {
             Ok(r) => r,
@@ -853,7 +1227,12 @@ pub async fn generate(
         drop(feed);
         axum::Json(tr::openai_completion_to_ollama(&model, &openai)).into_response()
     })
-    .await
+    .await;
+    // /api/generate responses are always whole JSON with usage inside.
+    if let Some((name, _entry)) = key_entry.filter(|(_, e)| e.tpm > 0 || e.daily_tokens > 0) {
+        out = crate::keys::charge_outgoing(out, &name, Arc::clone(&state.keys));
+    }
+    out
 }
 
 /// POST /api/evict {"model": name} — pallama-internal (ollama has no REST
@@ -874,10 +1253,14 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
             Err(e) => return api_error(503, &e.to_string()),
         };
         let url = format!("{}/models/unload", child_base(&engine.endpoint));
-        return match state.http.post(&url).json(&json!({"model": model})).send().await {
-            Ok(r) if r.status().is_success() => {
-                axum::Json(json!({"status": "ok"})).into_response()
-            }
+        return match state
+            .http
+            .post(&url)
+            .json(&json!({"model": model}))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => axum::Json(json!({"status": "ok"})).into_response(),
             Ok(r) => {
                 let code = r.status().as_u16();
                 let text = r.text().await.unwrap_or_default();
@@ -886,7 +1269,7 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
             Err(e) => api_error(502, &format!("router unload: {e}")),
         };
     }
-    match state.sup.evict(model).await {
+    match state.sup.evict_model(model).await {
         Ok(()) => axum::Json(json!({"status": "ok"})).into_response(),
         Err(e) => api_error(404, &e.to_string()),
     }
@@ -907,10 +1290,7 @@ fn valid_session_name(name: &str) -> bool {
 /// "filename", "slot": 0} — pallama-internal: slot KV-cache
 /// checkpoints via upstream `--slot-save-path` + `POST /slots/{id}`.
 /// Ensures the model is loaded first (save needs live slot state).
-pub async fn session(
-    State(state): State<Arc<AppState>>,
-    body: Bytes,
-) -> Response {
+pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let v: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
@@ -954,10 +1334,11 @@ pub async fn session(
         };
     }
 
-    let (engine, _load_ms) = match ensure_with_admission(&state, model, Priority::Normal).await {
-        Ok(ok) => ok,
-        Err(resp) => return resp,
-    };
+    let (engine, _load_ms) =
+        match ensure_with_admission(&state, model, Priority::Normal, None).await {
+            Ok(ok) => ok,
+            Err(resp) => return resp,
+        };
     with_accounting(&state, &engine.name.clone(), async {
         let url = format!(
             "{}/slots/{}?action={action}&filename={filename}",
@@ -972,15 +1353,11 @@ pub async fn session(
         } else {
             json!({"filename": filename})
         };
-        let resp = state
-            .http
-            .post(&url)
-            .json(&body_json)
-            .send()
-            .await;
+        let resp = state.http.post(&url).json(&body_json).send().await;
         match resp {
             Ok(r) => {
-                let status = StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                let status =
+                    StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
                 let body = r.text().await.unwrap_or_default();
                 (status, body).into_response()
             }
@@ -1004,7 +1381,10 @@ pub async fn session_list(
     if model.is_empty() {
         return api_error(400, "missing ?model=");
     }
-    let dir = state.dirs.sessions_dir().join(pallama_core::profile::path_safe(&model));
+    let dir = state
+        .dirs
+        .sessions_dir()
+        .join(pallama_core::profile::path_safe(&model));
     let mut files: Vec<Value> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for entry in rd.flatten() {
@@ -1046,8 +1426,61 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         "# HELP pallama_evictions_total Total instance evictions\n# TYPE pallama_evictions_total counter\npallama_evictions_total {}\n",
         state.sup.evictions.load(std::sync::atomic::Ordering::Relaxed)
     );
+    // Per-key usage today (the [[keys]] tier's live accounting).
+    let _ = write!(
+        merged,
+        "# HELP pallama_key_usage_requests Requests today per key\n# TYPE pallama_key_usage_requests counter\n"
+    );
+    for (name, _, req, _) in state.keys.usage_snapshot() {
+        let _ = writeln!(merged, "pallama_key_usage_requests{{key=\"{name}\"}} {req}");
+    }
+    let _ = write!(
+        merged,
+        "# HELP pallama_key_usage_tokens Tokens today per key\n# TYPE pallama_key_usage_tokens counter\n"
+    );
+    for (name, _, _, tok) in state.keys.usage_snapshot() {
+        let _ = writeln!(merged, "pallama_key_usage_tokens{{key=\"{name}\"}} {tok}");
+    }
+    // Spec-under-saturation: speculative drafting costs compute the
+    // batch needs; flag it so operators flip spec=off under load.
+    {
+        let spec_on = !state.config.spec.is_empty() && state.config.spec != "off";
+        let saturated = state.queue.depth() > 0;
+        let _ = write!(
+            merged,
+            "# HELP pallama_spec_saturation 1 = spec decoding active while requests are queued (drafting competes with the batch)\n# TYPE pallama_spec_saturation gauge\npallama_spec_saturation {}\n",
+            u8::from(spec_on && saturated)
+        );
+    }
+    // Prefix heat per loaded model (why a capacity eviction chose its
+    // victim — hot caches survive).
+    let _ = write!(
+        merged,
+        "# HELP pallama_model_prefix_heat Recency-weighted prefix heat (capacity-eviction bias)\n# TYPE pallama_model_prefix_heat gauge\n"
+    );
+    for p in state.sup.ps() {
+        let _ = writeln!(
+            merged,
+            "pallama_model_prefix_heat{{model=\"{}\"}} {}",
+            p.name, p.heat
+        );
+    }
     state.ttft.render(&mut merged);
     state.tpot.render(&mut merged);
+    // SLO burn (F4): waiters admitted past their deadline class.
+    let _ = write!(
+        merged,
+        "# HELP pallama_slo_deadline_exceeded_total Requests admitted AFTER their SLO deadline expired (served late: queue burn)\n# TYPE pallama_slo_deadline_exceeded_total counter\npallama_slo_deadline_exceeded_total {}\n",
+        state.queue.slo_deadline_exceeded()
+    );
+    // Measured prompt-cache hit rate (A16): drives the adaptive
+    // --cache-ram clamp. Absent until the poller has a full window.
+    if let Some(rate) = state.sup.cache_hint.get() {
+        let _ = write!(
+            merged,
+            "# HELP pallama_prefix_cache_hit_rate Windowed prompt-cache hit rate (cache_n / (cache_n + prompt_n))\n# TYPE pallama_prefix_cache_hit_rate gauge\npallama_prefix_cache_hit_rate {rate}\n"
+        );
+    }
     if let Ok(store) = Store::open(&state.dirs) {
         if let Ok(Some(engine)) = store.active_engine() {
             if let Ok(m) = serde_json::from_str::<pallama_runtime::Manifest>(&engine.manifest) {
@@ -1060,7 +1493,10 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         }
     }
     (
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
         merged,
     )
         .into_response()
@@ -1091,7 +1527,10 @@ mod tests {
     fn unit__pull_event_line__clean_pull_has_no_warning_field() {
         let (line, done) = pull_event_line(
             "m1",
-            &PallamaEvent::ModelPulled { name: "m1".into(), warning: None },
+            &PallamaEvent::ModelPulled {
+                name: "m1".into(),
+                warning: None,
+            },
         );
         assert!(done);
         let v: Value = serde_json::from_str(line.trim()).unwrap();
