@@ -14,7 +14,7 @@ pub struct PallamaDirs {
 
 impl PallamaDirs {
     /// Real user directories via the `dirs` crate (XDG on Linux).
-    #[must_use] 
+    #[must_use]
     pub fn from_env() -> Self {
         let config_dir = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -22,30 +22,33 @@ impl PallamaDirs {
         let data_dir = dirs::data_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("pallama");
-        Self { config_dir, data_dir }
+        Self {
+            config_dir,
+            data_dir,
+        }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn config_file(&self) -> PathBuf {
         self.config_dir.join("config.toml")
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn db_file(&self) -> PathBuf {
         self.data_dir.join("pallama.db")
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn models_dir(&self) -> PathBuf {
         self.data_dir.join("models")
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn engines_dir(&self) -> PathBuf {
         self.data_dir.join("engines")
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn run_dir(&self) -> PathBuf {
         self.data_dir.join("run")
     }

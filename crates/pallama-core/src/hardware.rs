@@ -17,22 +17,22 @@ pub struct Hardware {
 }
 
 impl Hardware {
-    #[must_use] 
+    #[must_use]
     pub fn total_vram_mib(&self) -> u64 {
         self.gpus.iter().map(|g| g.total_mib).sum()
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn has_gpu(&self) -> bool {
         !self.gpus.is_empty()
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn mib(bytes: u64) -> u64 {
         bytes / (1024 * 1024)
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn bytes(mib: u64) -> u64 {
         mib.saturating_mul(1024 * 1024)
     }
@@ -49,8 +49,18 @@ mod tests {
             physical_cores: 8,
             total_ram_mib: 32_000,
             gpus: vec![
-                GpuInfo { name: "a".into(), description: "NVIDIA CUDA".into(), total_mib: 8_188, free_mib: 7_000 },
-                GpuInfo { name: "b".into(), description: "Vulkan".into(), total_mib: 4_000, free_mib: 4_000 },
+                GpuInfo {
+                    name: "a".into(),
+                    description: "NVIDIA CUDA".into(),
+                    total_mib: 8_188,
+                    free_mib: 7_000,
+                },
+                GpuInfo {
+                    name: "b".into(),
+                    description: "Vulkan".into(),
+                    total_mib: 4_000,
+                    free_mib: 4_000,
+                },
             ],
         };
         assert_eq!(hw.total_vram_mib(), 12_188);

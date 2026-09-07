@@ -51,3 +51,8 @@ required-features = ["test-util"]
 name = "stub-llama-bench"
 path = "../../tests/fixtures/stub_llama_bench.rs"
 required-features = ["test-util"]
+
+[[bin]]
+name = "stub-llama-quantize"
+path = "../../tests/fixtures/stub_llama_quantize.rs"
+required-features = ["test-util"]

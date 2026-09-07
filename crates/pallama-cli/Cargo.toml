@@ -19,6 +19,7 @@ pallama-runtime = { workspace = true }
 pallama-gateway = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
+clap_complete = "4"
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

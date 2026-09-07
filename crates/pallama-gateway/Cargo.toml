@@ -14,17 +14,23 @@ pallama-core = { workspace = true }
 pallama-runtime = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
+axum-server = { workspace = true }
+tower-http = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+getrandom = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
+http-body = { workspace = true }
 tokio-stream = { workspace = true }
 tempfile = "3"
 jsonschema = { version = "0.53.0", default-features = false }

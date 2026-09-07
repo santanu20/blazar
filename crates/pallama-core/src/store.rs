@@ -16,7 +16,7 @@ pub struct Store {
     conn: Connection,
 }
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 3;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -55,6 +55,22 @@ CREATE TABLE IF NOT EXISTS loras (
     model_name TEXT NOT NULL,
     path       TEXT NOT NULL,
     scale      REAL NOT NULL DEFAULT 1.0
+);
+CREATE TABLE IF NOT EXISTS key_usage (
+    day      TEXT NOT NULL, -- UTC YYYY-MM-DD
+    name     TEXT NOT NULL, -- [[keys]] name
+    requests INTEGER NOT NULL DEFAULT 0,
+    tokens   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, name)
+);
+CREATE TABLE IF NOT EXISTS bench_history (
+    id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts    INTEGER NOT NULL,          -- unix secs
+    engine_tag TEXT NOT NULL,
+    model TEXT NOT NULL,
+    tg_tokens_per_sec REAL NOT NULL, -- llama-bench tg128 median
+    pp_tokens_per_sec REAL NOT NULL DEFAULT 0,
+    ctx   INTEGER NOT NULL DEFAULT 0
 );
 ";
 
@@ -129,10 +145,13 @@ impl Store {
     }
 
     fn migrate(&self) -> CoreResult<()> {
-        let version: i32 = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let version: i32 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version < SCHEMA_VERSION {
             self.conn.execute_batch(SCHEMA_SQL)?;
-            self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            self.conn
+                .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         Ok(())
     }
@@ -148,7 +167,14 @@ impl Store {
              ON CONFLICT(tag) DO UPDATE SET
                asset = excluded.asset, sha256 = excluded.sha256,
                installed_at = excluded.installed_at, manifest = excluded.manifest",
-            params![e.tag, e.asset, e.sha256, e.installed_at, i64::from(e.active), e.manifest],
+            params![
+                e.tag,
+                e.asset,
+                e.sha256,
+                e.installed_at,
+                i64::from(e.active),
+                e.manifest
+            ],
         )?;
         Ok(())
     }
@@ -158,9 +184,11 @@ impl Store {
     pub fn set_active_engine(&self, tag: &str) -> CoreResult<()> {
         let exists: bool = self
             .conn
-            .query_row("SELECT COUNT(*) FROM engines WHERE tag = ?1", params![tag], |r| {
-                r.get::<_, i64>(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM engines WHERE tag = ?1",
+                params![tag],
+                |r| r.get::<_, i64>(0),
+            )
             .map(|n| n > 0)?;
         if !exists {
             return Err(CoreError::Store(rusqlite::Error::QueryReturnedNoRows));
@@ -191,18 +219,28 @@ impl Store {
 
     pub fn list_engines(&self) -> CoreResult<Vec<EngineRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT tag, asset, sha256, installed_at, active, manifest FROM engines ORDER BY installed_at DESC",
+            "SELECT tag, asset, sha256, installed_at, active, manifest FROM engines ORDER BY installed_at DESC, rowid DESC",
         )?;
         let rows = stmt.query_map([], engine_from_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn delete_engine(&self, tag: &str) -> CoreResult<()> {
-        self.conn.execute("DELETE FROM engines WHERE tag = ?1", params![tag])?;
+        self.conn
+            .execute("DELETE FROM engines WHERE tag = ?1", params![tag])?;
         Ok(())
     }
 
     pub fn upsert_model(&self, m: &ModelRow) -> CoreResult<()> {
+        // `#N` is the internal replica-key separator (supervisor B1):
+        // a model literally named `x#2` would collide with replica keys.
+        if m.name.contains('#') {
+            return Err(CoreError::Catalog(format!(
+                "model name {:?} contains '#', which is reserved for replica keys \
+                 (supervisor `model#N`); rename the model",
+                m.name
+            )));
+        }
         self.conn.execute(
             "INSERT INTO models (name, repo, quant, path, bytes, sha256, mmproj_path, shards,
                                  arch, params, ctx_train, pulled_at)
@@ -214,8 +252,18 @@ impl Store {
                arch = excluded.arch, params = excluded.params,
                ctx_train = excluded.ctx_train, pulled_at = excluded.pulled_at",
             params![
-                m.name, m.repo, m.quant, m.path, m.bytes, m.sha256, m.mmproj_path, m.shards,
-                m.arch, m.params, m.ctx_train, m.pulled_at
+                m.name,
+                m.repo,
+                m.quant,
+                m.path,
+                m.bytes,
+                m.sha256,
+                m.mmproj_path,
+                m.shards,
+                m.arch,
+                m.params,
+                m.ctx_train,
+                m.pulled_at
             ],
         )?;
         Ok(())
@@ -245,7 +293,10 @@ impl Store {
     }
 
     pub fn delete_model(&self, name: &str) -> CoreResult<bool> {
-        Ok(self.conn.execute("DELETE FROM models WHERE name = ?1", params![name])? == 1)
+        Ok(self
+            .conn
+            .execute("DELETE FROM models WHERE name = ?1", params![name])?
+            == 1)
     }
 
     pub fn upsert_profile(&self, p: &ProfileRow) -> CoreResult<()> {
@@ -288,7 +339,10 @@ impl Store {
     }
 
     pub fn delete_lora(&self, id: i64) -> CoreResult<bool> {
-        Ok(self.conn.execute("DELETE FROM loras WHERE id = ?1", params![id])? == 1)
+        Ok(self
+            .conn
+            .execute("DELETE FROM loras WHERE id = ?1", params![id])?
+            == 1)
     }
 
     pub fn list_loras(&self, model_name: Option<&str>) -> CoreResult<Vec<LoraRow>> {
@@ -297,7 +351,10 @@ impl Store {
                 "SELECT id, model_name, path, scale FROM loras WHERE model_name = ?1 ORDER BY id",
                 vec![m],
             ),
-            None => ("SELECT id, model_name, path, scale FROM loras ORDER BY id", vec![]),
+            None => (
+                "SELECT id, model_name, path, scale FROM loras ORDER BY id",
+                vec![],
+            ),
         };
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
@@ -310,6 +367,111 @@ impl Store {
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+
+    /// Add to a key's daily counters (upsert). Bumped by the gateway's
+    /// write-behind flusher, never on the hot path.
+    pub fn bump_key_usage(
+        &self,
+        day: &str,
+        name: &str,
+        delta_requests: i64,
+        delta_tokens: i64,
+    ) -> CoreResult<()> {
+        self.conn.execute(
+            "INSERT INTO key_usage (day, name, requests, tokens) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(day, name) DO UPDATE SET
+               requests = requests + excluded.requests,
+               tokens   = tokens   + excluded.tokens",
+            rusqlite::params![day, name, delta_requests, delta_tokens],
+        )?;
+        Ok(())
+    }
+
+    /// Today's (or any day's) per-key counters, for `/api/keys` + budgets.
+    pub fn key_usage(&self, day: &str) -> CoreResult<Vec<KeyUsageRow>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT day, name, requests, tokens FROM key_usage WHERE day = ?1")?;
+        let rows = stmt.query_map(rusqlite::params![day], |r| {
+            Ok(KeyUsageRow {
+                day: r.get(0)?,
+                name: r.get(1)?,
+                requests: r.get(2)?,
+                tokens: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Append a bench measurement (tune --search winner, engine gates).
+    pub fn record_bench(
+        &self,
+        engine_tag: &str,
+        model: &str,
+        tg: f64,
+        pp: f64,
+        ctx: i64,
+    ) -> CoreResult<()> {
+        self.conn.execute(
+            "INSERT INTO bench_history (ts, engine_tag, model, tg_tokens_per_sec, pp_tokens_per_sec, ctx) \
+             VALUES (unixepoch(), ?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![engine_tag, model, tg, pp, ctx],
+        )?;
+        Ok(())
+    }
+
+    /// The single most recent bench row overall (engine gate baseline).
+    pub fn latest_bench_by_time(&self) -> CoreResult<Option<(String, f64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT engine_tag, tg_tokens_per_sec, model FROM bench_history ORDER BY id DESC LIMIT 1")?;
+        let mut rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// Most recent bench row per model: `engine_tag`, `tg` t/s, `model`.
+    pub fn latest_benches(&self) -> CoreResult<Vec<(String, f64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT engine_tag, tg_tokens_per_sec, model FROM bench_history b \
+             WHERE id = (SELECT MAX(id) FROM bench_history b2 WHERE b2.model = b.model) \
+             ORDER BY model",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Overwrite one day's counters for a batch of keys (absolute values,
+    /// not deltas — the gateway holds the live counters and writes the
+    /// whole day-state behind). One transaction per batch.
+    pub fn set_key_usage_day(&self, day: &str, rows: &[(String, u64, u64)]) -> CoreResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (name, requests, tokens) in rows {
+            tx.execute(
+                "DELETE FROM key_usage WHERE day = ?1 AND name = ?2",
+                rusqlite::params![day, name],
+            )?;
+            tx.execute(
+                "INSERT INTO key_usage (day, name, requests, tokens) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    day,
+                    name,
+                    i64::try_from(*requests).unwrap_or(i64::MAX),
+                    i64::try_from(*tokens).unwrap_or(i64::MAX)
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+/// Daily usage counters for one key.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct KeyUsageRow {
+    pub day: String,
+    pub name: String,
+    pub requests: i64,
+    pub tokens: i64,
 }
 
 fn engine_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<EngineRow> {
@@ -363,6 +525,38 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('engines','models','profiles','loras')", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 4);
+    }
+
+    fn base_model(name: &str) -> ModelRow {
+        ModelRow {
+            name: name.into(),
+            repo: "o/x".into(),
+            quant: "Q4_K_M".into(),
+            path: "/tmp/x.gguf".into(),
+            bytes: 1,
+            sha256: None,
+            mmproj_path: None,
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+        }
+    }
+
+    #[test]
+    fn unit__upsert_model__rejects_hash_in_name() {
+        let (_t, s) = tmp_store();
+        let err = s.upsert_model(&base_model("x#2")).unwrap_err();
+        assert!(
+            err.to_string().contains("reserved for replica keys"),
+            "teaching error, got: {err}"
+        );
+        // The rejected row never lands.
+        assert!(s.get_model("x#2").unwrap().is_none());
+        // Normal names still work.
+        s.upsert_model(&base_model("x")).unwrap();
+        assert!(s.get_model("x").unwrap().is_some());
     }
 
     #[test]
@@ -481,7 +675,10 @@ mod tests {
         // Second open must not lose or duplicate data.
         let s2 = Store::open(&dirs).unwrap();
         assert_eq!(s2.list_models().unwrap().len(), 1);
-        let v: i32 = s2.conn().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let v: i32 = s2
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
     }
 }

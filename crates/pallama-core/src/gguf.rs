@@ -27,6 +27,10 @@ pub struct GgufMeta {
     /// Explicit `{arch}.head_dim` when present; else derived by
     /// `derived_head_dim()`.
     pub head_dim: Option<u64>,
+    /// `{arch}.pooling_type` — present only on embedding-class models
+    /// (bert/nomic-bert/...). Drives the `--embeddings` profile rule so
+    /// `/v1/embeddings` works without manual flags.
+    pub pooling_type: Option<u64>,
     /// Embedded chat-template text (`tokenizer.chat_template` and/or the
     /// raw-jinja `chat_template.jinja` key; array variants concatenated).
     /// Consumed only by capability heuristics (sentinel tool precheck).
@@ -36,7 +40,7 @@ pub struct GgufMeta {
 impl GgufMeta {
     /// `head_dim`: metadata value, else `embedding_length` / `head_count` when
     /// both present and divisible.
-    #[must_use] 
+    #[must_use]
     pub fn derived_head_dim(&self) -> Option<u64> {
         if let Some(dim) = self.head_dim {
             return Some(dim);
@@ -91,7 +95,7 @@ impl GgufValue {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Self::String(s) => Some(s),
@@ -111,7 +115,10 @@ impl<'a> Cursor<'a> {
     }
 
     fn take(&mut self, n: usize) -> CoreResult<&'a [u8]> {
-        let end = self.pos.checked_add(n).ok_or_else(|| bad("offset overflow"))?;
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or_else(|| bad("offset overflow"))?;
         if end > self.buf.len() {
             return Err(bad("unexpected end of GGUF metadata section"));
         }
@@ -269,9 +276,11 @@ pub fn parse_metadata(buf: &[u8]) -> CoreResult<(GgufMeta, usize)> {
         context_length: get(format!("{arch}.context_length")),
         expert_count: get(format!("{arch}.expert_count")),
         head_count: get(format!("{arch}.head_count")),
+        head_dim: get(format!("{arch}.head_dim")),
+        pooling_type: get(format!("{arch}.pooling_type"))
+            .or_else(|| get("*.pooling_type".to_string())),
         head_count_kv: get(format!("{arch}.head_count_kv")),
         embedding_length: get(format!("{arch}.embedding_length")),
-        head_dim: get(format!("{arch}.head_dim")),
         chat_template: extract_chat_template(&kvs),
         architecture: arch,
     };

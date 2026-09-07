@@ -36,7 +36,7 @@ pub struct Catalog {
 }
 
 pub const CATALOG_JSON: &str = include_str!("catalog.json");
-#[must_use] 
+#[must_use]
 pub fn catalog() -> &'static Catalog {
     static CAT: LazyLock<Catalog> = LazyLock::new(|| {
         serde_json::from_str(CATALOG_JSON)
@@ -70,17 +70,24 @@ pub fn resolve(name: &str) -> CoreResult<&'static CatalogEntry> {
             Err(CoreError::Catalog(if suggestions.is_empty() {
                 format!("no catalog model matching {name:?}; try `pallama search <query>` or pull an explicit owner/repo:quant")
             } else {
-                format!("no catalog model matching {name:?}; did you mean: {}?", suggestions.join(", "))
+                format!(
+                    "no catalog model matching {name:?}; did you mean: {}?",
+                    suggestions.join(", ")
+                )
             }))
         }
         _ => Err(CoreError::Catalog(format!(
             "ambiguous name {name:?} matches multiple models: {}",
-            prefixed.iter().map(|e| e.short_name.as_str()).collect::<Vec<_>>().join(", ")
+            prefixed
+                .iter()
+                .map(|e| e.short_name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         ))),
     }
 }
 /// Spec-draft pair for a resolved model name, if the catalog has one.
-#[must_use] 
+#[must_use]
 pub fn spec_pair_for(model: &str) -> Option<&'static SpecPair> {
     catalog()
         .spec_pairs
@@ -89,7 +96,7 @@ pub fn spec_pair_for(model: &str) -> Option<&'static SpecPair> {
 }
 
 /// Classic DP edit distance; catalog sizes are tiny, O(nm) is fine.
-#[must_use] 
+#[must_use]
 pub fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
@@ -114,7 +121,10 @@ mod tests {
     #[test]
     fn unit__catalog_embedded__parses_and_unique() {
         let cat = catalog();
-        assert!(cat.entries.len() >= 6, "catalog should carry a useful default set");
+        assert!(
+            cat.entries.len() >= 6,
+            "catalog should carry a useful default set"
+        );
         let mut names: Vec<&str> = cat.entries.iter().map(|e| e.short_name.as_str()).collect();
         names.sort_unstable();
         let n = names.len();
@@ -135,7 +145,10 @@ mod tests {
 
     #[test]
     fn unit__resolve_exact_and_case() {
-        assert_eq!(resolve("qwen3-0.6b").unwrap().repo, "ggml-org/Qwen3-0.6B-GGUF");
+        assert_eq!(
+            resolve("qwen3-0.6b").unwrap().repo,
+            "ggml-org/Qwen3-0.6B-GGUF"
+        );
         assert_eq!(resolve("QWEN3-0.6B").unwrap().short_name, "qwen3-0.6b");
     }
 
@@ -149,7 +162,10 @@ mod tests {
     #[test]
     fn unit__resolve_missing__levenshtein_suggestion() {
         let err = resolve("qwen3-0.5b").unwrap_err().to_string();
-        assert!(err.contains("qwen3-0.6b"), "near-miss should suggest: {err}");
+        assert!(
+            err.contains("qwen3-0.6b"),
+            "near-miss should suggest: {err}"
+        );
     }
 
     #[test]
