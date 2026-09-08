@@ -131,6 +131,10 @@ enum Cmd {
         /// Print eval counts (tokens, t/s) after generation
         #[arg(long, short = 'v')]
         verbose: bool,
+        /// Cap single-shot generation (tokens); REPL mode is unaffected.
+        /// Without it a reasoning model can ramble to the context limit.
+        #[arg(long)]
+        max_tokens: Option<u64>,
     },
     /// Benchmark a model (pp/tg table)
     Bench { model: String },
@@ -165,6 +169,11 @@ enum Cmd {
         /// `model_overrides.<model>.replicas = 2` only if >1.3x
         #[arg(long)]
         replicas: bool,
+        /// Live `--cache-reuse N` grid {0, 256, 512}: warm second-chat wall
+        /// seconds on a long repeated prompt; adopts the winner only if it
+        /// beats the current default (256) by >5%
+        #[arg(long)]
+        cache_reuse: bool,
     },
     /// Persist config migrations (legacy `api_keys` -> [[keys]]), with a
     /// timestamped backup; idempotent
@@ -401,7 +410,8 @@ async fn run(cmd: Cmd) -> Result<()> {
             model,
             prompt,
             verbose,
-        } => run_dispatch(&model, &prompt, verbose).await,
+            max_tokens,
+        } => run_dispatch(&model, &prompt, verbose, max_tokens).await,
         Cmd::Bench { model } => bench(&model),
         Cmd::Tune {
             model,
@@ -412,7 +422,18 @@ async fn run(cmd: Cmd) -> Result<()> {
             ngram,
             load,
             replicas,
-        } => tune_full(&model, search, ctx, spec, slots, ngram, load, replicas),
+            cache_reuse,
+        } => tune_full(
+            &model,
+            search,
+            ctx,
+            spec,
+            slots,
+            ngram,
+            load,
+            replicas,
+            cache_reuse,
+        ),
         Cmd::Engine { cmd } => engine_cmd(cmd).await,
         Cmd::Lora { cmd } => lora_cmd(cmd),
         Cmd::Search { query } => search(&query).await,
@@ -1261,6 +1282,12 @@ async fn pull(target: &str) -> Result<()> {
             println!("WARNING: {w}");
         }
     }
+    // Structural GGUF lint (H4): warn-only, explains degraded sizing.
+    if let Ok(m) = pallama_core::read_metadata_file(std::path::Path::new(&row.path)) {
+        for w in m.lint() {
+            println!("WARNING: {w}");
+        }
+    }
     Ok(())
 }
 
@@ -1335,6 +1362,10 @@ fn import(
     d.ensure().ok();
     let meta = pallama_core::read_metadata_file(path.as_path())
         .map_err(|e| anyhow!("not a readable GGUF ({}): {e}", path.display()))?;
+    // Structural GGUF lint (H4): warn-only, explains degraded sizing.
+    for w in meta.lint() {
+        println!("WARNING: {w}");
+    }
     let file_name = path
         .file_name()
         .unwrap_or_default()
@@ -1474,6 +1505,16 @@ fn show(model: &str) -> Result<()> {
         println!("blocks:  {:?}", m.block_count);
         println!("ctx_train: {:?}", m.context_length);
         println!("experts: {:?}", m.expert_count);
+        if let Some(q) = &m.quantized_by {
+            println!("quantized_by: {q}");
+        }
+        if let Some(v) = &m.general_version {
+            println!("version: {v}");
+        }
+        // Structural GGUF lint (H4): warn-only, explains degraded sizing.
+        for w in m.lint() {
+            println!("WARNING: {w}");
+        }
     }
     if let Some(engine) = store.active_engine()? {
         if let Some(p) = store.get_profile(&row.name, &engine.tag)? {
@@ -1545,17 +1586,28 @@ async fn ps(reset: bool) -> Result<()> {
 }
 
 /// `pallama run` dispatch: inline prompt = single-shot, none = REPL.
-async fn run_dispatch(model: &str, prompt: &[String], verbose: bool) -> Result<()> {
+async fn run_dispatch(
+    model: &str,
+    prompt: &[String],
+    verbose: bool,
+    max_tokens: Option<u64>,
+) -> Result<()> {
     if prompt.is_empty() {
         return run_repl(model).await;
     }
     let base = ensure_daemon().await?;
     let text = prompt.join(" ");
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "messages": [{"role": "user", "content": text}],
         "stream": true,
     });
+    if let Some(n) = max_tokens {
+        // /api/chat is the ollama dialect: the generation cap lives in
+        // options.num_predict (translated to max_tokens for the engine),
+        // a top-level max_tokens key would be silently ignored.
+        body["options"] = serde_json::json!({ "num_predict": n });
+    }
     let final_chunk = stream_chat(&base, &body).await?;
     if verbose {
         if let Some(v) = final_chunk {
@@ -2613,6 +2665,7 @@ fn tune_full(
     ngram: bool,
     load: bool,
     replicas: bool,
+    cache_reuse: bool,
 ) -> Result<()> {
     let d = dirs();
     let store = Store::open(&d)?;
@@ -2819,7 +2872,7 @@ fn tune_full(
             println!("no clear winner (best {best_tps:.1} vs {second:.1}) — engine defaults stay");
         }
     }
-    if load || replicas {
+    if load || replicas || cache_reuse {
         // Shared base profile for the spawn-your-own-children lanes: both
         // searches strip endpoint/session/warmup flags themselves, so the
         // children differ only in the axis under test.
@@ -2879,6 +2932,44 @@ fn tune_full(
                 );
             } else {
                 println!("keep replicas = 1 (2 children not >1.3x aggregate)");
+            }
+        }
+        if cache_reuse {
+            // Prompt-cache reuse axis: warm second-chat wall seconds on a
+            // long repeated prompt across {0, 256, 512}. 256 is Pallama's
+            // shipped default, so it is the bar to beat.
+            println!(
+                "cache-reuse search: grid {{0, 256, 512}} — 3 spawns, long repeated prompt x2 each ..."
+            );
+            let probe = tuner.cache_reuse_search(&base.argv, 1)?;
+            for (n, secs) in &probe.grid {
+                let mark = if *n == probe.best { "<- best" } else { "" };
+                println!("  N={n:<4}: warm chat {secs:.2}s {mark}");
+            }
+            let default_secs = probe.grid.iter().find(|(n, _)| *n == 256).map(|(_, s)| *s);
+            let adopt = probe.best != 256
+                && default_secs.is_some_and(|d| {
+                    let b = probe
+                        .grid
+                        .iter()
+                        .find(|(n, _)| *n == probe.best)
+                        .map_or(f64::MAX, |(_, s)| *s);
+                    // Relative bar AND an absolute floor: sub-50 ms deltas on
+                    // tiny models are timer noise, not cache effects.
+                    b < d * 0.95 && (d - b) > 0.05
+                });
+            if adopt {
+                // cache_reuse is a global knob (no overlay field): adopt via
+                // the same config-rewrite path as the ngram lane.
+                let mut cfg2 = config()?;
+                cfg2.cache_reuse = probe.best;
+                std::fs::write(d.config_file(), cfg2.to_toml()?)?;
+                println!(
+                    "adopted cache_reuse = {} — restart the daemon to apply",
+                    probe.best
+                );
+            } else {
+                println!("keep cache_reuse = 256 (no candidate >5% faster and >50 ms >5% faster)");
             }
         }
     }

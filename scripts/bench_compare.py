@@ -1791,6 +1791,69 @@ def native_timings(ctx: dict, daemon) -> dict:
         "note": "",
     }
 
+    # poller gauges (informational): cache-hit + spec-accept EWMA after the
+    # traffic above; published only once a 60s poller tick saw traffic.
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{PAL_PORT}/metrics", timeout=30
+        ) as resp:
+            mtext = resp.read().decode(errors="replace")
+
+        def gauge(gname):
+            for ln in mtext.splitlines():
+                if ln.startswith(gname + " "):
+                    return ln.split()[-1]
+            return None
+
+        out["poller gauges"] = {
+            "ms": None,
+            "ok": True,
+            "status": 200,
+            "note": (
+                f"prefix_cache_hit_rate={gauge('pallama_prefix_cache_hit_rate')} "
+                f"spec_accept_rate={gauge('pallama_spec_accept_rate')} "
+                "(blank = no poller tick with traffic yet)"
+            ),
+        }
+    except Exception as e:
+        out["poller gauges"] = {"ms": None, "ok": False, "status": 0, "note": str(e)}
+
+    # singleflight dedup (informational): two IDENTICAL concurrent non-stream
+    # chats vs one — coalesced execution should cost ~1x wall, not 2x.
+    def _one_chat():
+        t = time.perf_counter()
+        req(
+            PAL_PORT,
+            "POST",
+            "/v1/chat/completions",
+            {
+                "model": model,
+                "max_tokens": 24,
+                "stream": False,
+                "messages": [{"role": "user", "content": "Count from 1 to 8."}],
+            },
+            timeout=120,
+        )
+        return time.perf_counter() - t
+
+    single = _one_chat()
+    t0 = time.perf_counter()
+    _ths = [threading.Thread(target=_one_chat) for _ in range(2)]
+    for _t in _ths:
+        _t.start()
+    for _t in _ths:
+        _t.join(timeout=130)
+    pair = time.perf_counter() - t0
+    out["singleflight pair-vs-single"] = {
+        "ms": pair * 1000,
+        "ok": True,
+        "status": 200,
+        "note": (
+            f"single={single * 1000:.0f}ms pair={pair * 1000:.0f}ms "
+            f"ratio={(pair / single):.2f}x (singleflight serializes the twin behind the leader, then re-serves from warm prefix cache — ~2x is two decodes; far above 2x would mean queue pathology)"
+        ),
+    }
+
     # CLI timings (daemon paths)
     for cmd in ("list", "ps", f"show {model}", "config list"):
 

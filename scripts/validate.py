@@ -47,8 +47,19 @@ import urllib.request
 PORT = 11499
 MODEL = os.environ.get("PALLAMA_VALIDATE_MODEL", "qwen3.5-9b")
 FAST = os.environ.get("PALLAMA_VALIDATE_FAST", "") == "1"
-PAL = os.path.expanduser("~/.local/bin/pallama")
-if not os.path.exists(PAL):
+# Optional device pin for MODEL on mixed iGPU/dGPU boxes (e.g. "Vulkan1").
+VALIDATE_DEVICES = os.environ.get("PALLAMA_VALIDATE_DEVICES", "") or None
+# Prefer the checkout's release binary when present: the harness validates the
+# code under test, not whatever system copy happens to be installed.
+_REPO_BIN = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "target",
+    "release",
+    "pallama",
+)
+if os.path.exists(_REPO_BIN):
+    PAL = _REPO_BIN
+else:
     PAL = shutil.which("pallama") or "pallama"
 REAL_DATA = os.path.expanduser("~/.local/share/pallama")
 REAL_CONFIG = os.path.expanduser("~/.config/pallama/config.toml")
@@ -186,6 +197,8 @@ class Sandbox:
                     body += f"{k} = {'true' if v else 'false'}\n"
                 elif isinstance(v, (int, float)):
                     body += f"{k} = {v}\n"
+                elif isinstance(v, list):
+                    body += f"{k} = " + json.dumps(v) + "\n"
                 else:
                     body += f'{k} = "{v}"\n'
         with open(path, "w") as f:
@@ -212,6 +225,14 @@ class Daemon:
         else:
             cfg = dict(cfg)
             cfg.setdefault("port", PORT)
+        # Mixed iGPU/dGPU boxes: the auto GPU pick maximizes free VRAM,
+        # which strands big models on a slow integrated GPU (documented
+        # product caveat). PALLAMA_VALIDATE_DEVICES pins MODEL to one
+        # explicit device for harness runs on such boxes.
+        if VALIDATE_DEVICES:
+            mo = cfg.setdefault("model_overrides", {})
+            ov = mo.setdefault(MODEL, {})
+            ov.setdefault("devices", [VALIDATE_DEVICES])
         # Dynamic floor: the model + working headroom. A co-resident
         # engine (the user's own daemon) eats the same budget — fail
         # LOUD instead of thrashing swap for minutes.
@@ -439,6 +460,82 @@ def wait_loaded(model: str = MODEL, budget: float = 300.0) -> dict | None:
 def child_argv(pid: int) -> list[str]:
     with open(f"/proc/{pid}/cmdline", "rb") as f:
         return [a for a in f.read().decode(errors="replace").split("\0") if a]
+
+
+def replica_pid(model: str, n: int) -> int | None:
+    # Replicas write run/{model}#N.pid (supervisor keys the pidfile by the
+    # full instance key, not the bare model name).
+    pidfile = os.path.join(SANDBOX.data_dir, "run", f"{model}#{n}.pid")
+    try:
+        with open(pidfile) as f:
+            pid = int(f.read().strip())
+        if pid > 1 and os.path.exists(f"/proc/{pid}"):
+            return pid
+    except Exception:
+        pass
+    return None
+
+
+def daemon_log_contains(needle: str) -> bool:
+    try:
+        with open(DAEMON.log_path, "rb") as f:
+            return needle.encode() in f.read()
+    except Exception:
+        return False
+
+
+def http_multipart(
+    path: str,
+    fields: dict,
+    file_field: str,
+    file_bytes: bytes,
+    filename: str,
+    content_type: str = "application/octet-stream",
+    timeout: int = 60,
+) -> tuple[int, bytes]:
+    """Hand-rolled multipart POST (the harness has no requests dep)."""
+    boundary = "pallamaValidate7dF3k"
+    parts = []
+    for name, value in fields.items():
+        parts.append(
+            f'--{boundary}\r\ncontent-disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+        )
+    parts.append(
+        (
+            f'--{boundary}\r\ncontent-disposition: form-data; name="{file_field}"; '
+            f'filename="{filename}"\r\ncontent-type: {content_type}\r\n\r\n'
+        ).encode()
+        + file_bytes
+        + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode())
+    body = b"".join(parts)
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{PORT}{path}", data=body, method="POST"
+    )
+    req.add_header("content-type", f"multipart/form-data; boundary={boundary}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+def tiny_wav(seconds: float = 0.5) -> bytes:
+    """Minimal canonical RIFF/WAVE (silence) — enough for multipart routing."""
+    import struct
+
+    rate, n = 8000, int(8000 * seconds)
+    data = b"\x00\x00" * n
+    hdr = (
+        b"RIFF"
+        + struct.pack("<I", 36 + len(data))
+        + b"WAVEfmt "
+        + struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16)
+        + b"data"
+        + struct.pack("<I", len(data))
+    )
+    return hdr + data
 
 
 def child_environ(pid: int) -> dict:
@@ -1535,7 +1632,7 @@ def phase_cli() -> None:
         p.returncode == 0 and "b108" in p.stdout,
         p.stdout.strip().splitlines()[-1][:120] if p.stdout else "",
     )
-    p = cli("run", MODEL, "--verbose", "Say: inline")
+    p = cli("run", MODEL, "--verbose", "--max-tokens", "64", "Say: inline")
     low = p.stdout.lower()
     check(
         "cli",
@@ -1582,6 +1679,308 @@ def phase_auth() -> None:
     check("auth", "correct bearer -> 200", st == 200, f"status={st}")
     st, _, _ = http_json("GET", "/healthz")
     check("auth", "/healthz stays open", st == 200, f"status={st}")
+
+
+# ------------------------------------------------------------------- wave
+# Batteries for the kernels + loading-core waves (2026-09-07/08): replicas,
+# predictive preload, key concurrency surface, whisper teaching, lookup-cache
+# validation, poller gauges. Heavy lanes (9B loads) skip under FAST.
+
+
+def wave_chat(model: str, system: str, max_tokens: int = 5) -> tuple[int, object]:
+    body = {
+        "model": model,
+        "stream": False,
+        "max_tokens": max_tokens,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": "Say OK."},
+        ],
+    }
+    st, _, v = http_json("POST", "/v1/chat/completions", body)
+    return st, v
+
+
+def wave_replica_rows(model: str) -> list[dict]:
+    return [r for r in ps_rows() if str(ps_field(r, "name", "model") or "") == model]
+
+
+def phase_wave() -> None:
+    print("\n== phase 8: wave battery (replicas/preload/keys/whisper/gauges) ==")
+    d = DAEMON
+    small = "qwen2.5-0.5b-instruct"
+    big = MODEL  # qwen3.5-9b by default
+
+    # -- battery A: replicas + slots/pin/cache_idle_slots overlays ----------
+    d.start(
+        {
+            "port": PORT,
+            "cache_idle_slots": False,
+            "model_overrides": {
+                small: {"replicas": 2, "slots": 2, "pin": True},
+            },
+        }
+    )
+    st, _ = wave_chat(small, "You are a pirate who loves the sky.")
+    a_loaded = wait_loaded(small, budget=180)
+    check(
+        "wave",
+        "battery A: first chat loads model",
+        st == 200 and a_loaded is not None,
+        f"status={st} loaded={a_loaded is not None}",
+    )
+
+    # Second DISTINCT prefix must grow to a second replica (sticky routing).
+    st, _ = wave_chat(small, "You are a scientist who studies gold.")
+    got_two = False
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        rows = wave_replica_rows(small)
+        reps = sorted(
+            r.get("pallama_replica") for r in rows if r.get("pallama_replica")
+        )
+        if len(rows) >= 2 and reps[:2] == [1, 2]:
+            got_two = True
+            break
+        time.sleep(1)
+    check(
+        "wave",
+        "replicas: distinct prefixes -> two children (replica 1+2)",
+        got_two,
+        f"rows={[(r.get('pallama_replica')) for r in wave_replica_rows(small)]}",
+    )
+
+    p1, p2 = replica_pid(small, 1), replica_pid(small, 2)
+    argv = child_argv(p1) if p1 else []
+    np_pair = any(argv[i] == "-np" and argv[i + 1] == "2" for i in range(len(argv) - 1))
+    check(
+        "wave",
+        "slots overlay shadows global (-np 2)",
+        np_pair,
+        f"pid1={p1} np={'-np 2' if np_pair else 'MISSING'}",
+    )
+    check(
+        "wave",
+        "cache_idle_slots=false emits --no-cache-idle-slots",
+        "--no-cache-idle-slots" in argv,
+        f"present={'--no-cache-idle-slots' in argv}",
+    )
+    picked = daemon_log_contains("auto GPU pick")
+    check(
+        "wave",
+        "--device emission matches auto-pick decision",
+        picked == ("--device" in argv),
+        f"log_auto_pick={picked} argv_device={'--device' in argv}",
+    )
+
+    # Same prefix again: sticky (must NOT grow a third child).
+    wave_chat(small, "You are a pirate who loves the sky.")
+    time.sleep(3)
+    rows = wave_replica_rows(small)
+    check(
+        "wave",
+        "replicas: same prefix sticky (no third child)",
+        len(rows) == 2,
+        f"rows={len(rows)}",
+    )
+
+    # Model-level evict kills BOTH replicas.
+    st, _, _ = http_json("POST", "/api/evict", {"model": small})
+    gone = False
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if (
+            not wave_replica_rows(small)
+            and replica_pid(small, 1) is None
+            and replica_pid(small, 2) is None
+        ):
+            gone = True
+            break
+        time.sleep(1)
+    check(
+        "wave",
+        "evict_model kills both replicas",
+        st == 200 and gone,
+        f"status={st} children_gone={gone}",
+    )
+    cov(
+        "replicas+pin+slots overlay",
+        "2 prefixes -> 2 children, sticky, evict_model kills both",
+        "phase 8 battery A",
+        got_two and gone and np_pair,
+    )
+    cov(
+        "cache_idle_slots",
+        "false -> --no-cache-idle-slots in child argv",
+        "phase 8 battery A",
+        "--no-cache-idle-slots" in argv,
+    )
+
+    # -- battery B: predictive preload (heavy: two 9B loads) ----------------
+    if FAST:
+        print("  (FAST: skipping predictive-preload battery — needs 9B loads)")
+        cov(
+            "predictive_preload",
+            "A->B transitions >=3 -> B pre-spawned while only A live",
+            "skipped under FAST",
+            None,
+        )
+    else:
+        d.start({"port": PORT, "predictive_preload": True})
+        seq_ok = True
+        for _ in range(3):
+            st_a, _ = wave_chat(small, "Answer briefly.")
+            st_b, _ = wave_chat(big, "Answer briefly.")
+            st_e, _, _ = http_json("POST", "/api/evict", {"model": big})
+            st_a2, _ = wave_chat(small, "Answer briefly.")
+            seq_ok = (
+                seq_ok and st_a == 200 and st_b == 200 and st_e == 200 and st_a2 == 200
+            )
+        check(
+            "wave",
+            "battery B: A/B transition sequencing all 200",
+            seq_ok,
+            f"seq_ok={seq_ok}",
+        )
+        # Only A is live now with three accrued A->B edges: the reaper tick
+        # (10s) should pre-spawn B within the poll budget.
+        preloaded = False
+        deadline = time.time() + 180
+        while time.time() < deadline:
+            if wave_replica_rows(big) and wave_replica_rows(small):
+                preloaded = True
+                break
+            time.sleep(2)
+        check(
+            "wave",
+            "predictive preload: B spawned while only A live",
+            preloaded,
+            f"preloaded={preloaded} log_has_edge={daemon_log_contains('predictive preload')}",
+        )
+        cov(
+            "predictive_preload",
+            "A->B transitions >=3 -> B pre-spawned while only A live",
+            "phase 8 battery B",
+            preloaded,
+        )
+        http_json("POST", "/api/evict", {"model": big})
+        http_json("POST", "/api/evict", {"model": small})
+
+    # -- battery C: default config surface ----------------------------------
+    d.start({"port": PORT})
+    st, _, v = http_json("GET", "/api/keys")
+    body_txt = json.dumps(v) if not isinstance(v, str) else v
+    check(
+        "wave",
+        "keys mgmt keyless -> 403 teaching",
+        st == 403 and "no keys configured" in body_txt,
+        f"status={st}",
+    )
+
+    st, raw = http_multipart(
+        "/v1/audio/transcriptions", {"model": "whisper-1"}, "file", tiny_wav(), "t.wav"
+    )
+    check(
+        "wave",
+        "whisper uninstalled -> 501 teaching (install/pull hints)",
+        st == 501 and b"whisper install" in raw,
+        f"status={st}",
+    )
+
+    st, _, v = http_json("POST", "/api/embed", {"model": small, "input": "hi"})
+    txt = json.dumps(v) if not isinstance(v, str) else v
+    check(
+        "wave",
+        "/api/embed reachable (engine 501 passthrough w/o --embeddings)",
+        st in (200, 501),
+        f"status={st} body={txt[:80]}",
+    )
+    st, _, v = http_json(
+        "POST", "/api/rerank", {"model": small, "query": "hi", "documents": ["a"]}
+    )
+    check("wave", "/api/rerank reachable", st in (200, 501), f"status={st}")
+
+    # Poller gauge: identical chats prime the prompt cache, then one 60s
+    # tick must publish pallama_prefix_cache_hit_rate.
+    for _ in range(2):
+        wave_chat(small, "You echo single words. Say OK.")
+    time.sleep(68)
+    st, hdr, raw = http("GET", "/metrics")
+    check(
+        "wave",
+        "poller gauge pallama_prefix_cache_hit_rate published",
+        st == 200 and b"pallama_prefix_cache_hit_rate" in raw,
+        f"status={st} found={b'pallama_prefix_cache_hit_rate' in raw}",
+    )
+    cov(
+        "prefix-cache-hit gauge",
+        "chat traffic -> /metrics carries pallama_prefix_cache_hit_rate",
+        "phase 8 battery C",
+        b"pallama_prefix_cache_hit_rate" in raw,
+    )
+
+    # -- battery D: admin-key round-trip incl. max_concurrent ---------------
+    d.start({"port": PORT, "keys": [{"name": "admin", "key": "admin-key-1"}]})
+    auth = {"Authorization": "Bearer admin-key-1"}
+    st, _, v = http_json(
+        "POST",
+        "/api/keys",
+        {"name": "limited", "rpm": 60, "max_concurrent": 1},
+        headers=auth,
+    )
+    created = (
+        st == 201 and isinstance(v, dict) and str(v.get("key", "")).startswith("plm_")
+    )
+    check(
+        "wave",
+        "keys add via admin -> 201 + plm_ secret shown once",
+        created,
+        f"status={st}",
+    )
+
+    st, _, v = http_json("GET", "/api/keys", headers=auth)
+    rows = v.get("keys", []) if isinstance(v, dict) else []
+    row = next((r for r in rows if r.get("name") == "limited"), None)
+    check(
+        "wave",
+        "keys list shows limited w/ max_concurrent=1",
+        row is not None and row.get("max_concurrent") == 1,
+        f"row={row is not None} max_concurrent={row.get('max_concurrent') if row else None}",
+    )
+    cov(
+        "keys max_concurrent",
+        "add/list round-trip carries max_concurrent",
+        "phase 8 battery D",
+        row is not None and row.get("max_concurrent") == 1,
+    )
+
+    st, _, v = http_json("POST", "/api/keys", {"name": "limited"}, headers=auth)
+    check("wave", "keys add duplicate -> 409", st == 409, f"status={st}")
+    st, _, v = http_json("DELETE", "/api/keys?name=limited", headers=auth)
+    check("wave", "keys remove -> 200", st == 200, f"status={st}")
+
+    # -- lookup-cache bogus path: config validation refuses to start --------
+    refused = False
+    log_snip = ""
+    try:
+        d.start(
+            {"port": PORT, "lookup_cache_static": "/nonexistent/really-missing.bin"}
+        )
+    except RuntimeError as e:
+        refused = "exited early" in str(e)
+        log_snip = d.tail_log(5)
+    check(
+        "wave",
+        "lookup_cache_static bogus path -> daemon refuses to start",
+        refused and "lookup_cache_static" in log_snip,
+        f"refused={refused} log_has_field={'lookup_cache_static' in log_snip}",
+    )
+    cov(
+        "lookup_cache_static",
+        "missing file path fails validation at startup",
+        "phase 8 refusal lane",
+        refused,
+    )
 
 
 # ------------------------------------------------------------------ main
@@ -1659,6 +2058,7 @@ def main() -> int:
         ("behavior", phase_behavior),
         ("cli", phase_cli),
         ("auth", phase_auth),
+        ("wave", phase_wave),
     ]
     for name, fn in phases:
         if self_test or (wanted and name not in wanted):
