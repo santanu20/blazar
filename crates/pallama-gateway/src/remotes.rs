@@ -174,30 +174,60 @@ pub async fn ollama_chat_remote(
     }
     // SSE -> ollama NDJSON (same incremental translate as the local path).
     use futures::StreamExt as _;
-    let upstream = resp.bytes_stream();
+    // Shared clock: stamp first/last-byte offsets like the local lane so the
+    // final NDJSON line carries gateway-measured timings (remotes report
+    // none of their own).
+    let t0 = std::time::Instant::now();
+    let clock = std::sync::Arc::new(std::sync::Mutex::new((None::<u64>, 0u64)));
+    let clock_map = std::sync::Arc::clone(&clock);
+    let upstream = resp
+        .bytes_stream()
+        .map(move |chunk| {
+            let elapsed = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            {
+                let mut c = clock_map.lock().unwrap();
+                if c.0.is_none() {
+                    c.0 = Some(elapsed);
+                }
+                c.1 = elapsed;
+            }
+            chunk
+        })
+        .boxed();
     let model_c = remote_model.to_string();
     let ndjson = futures::stream::unfold(
         (
-            upstream.boxed(),
+            upstream,
             String::new(),
             model_c,
             false,
             None::<serde_json::Value>,
             None::<String>,
             false,
+            std::sync::Arc::clone(&clock),
         ),
-        |(mut stream, mut buf, model, mut done, mut usage, mut finish, mut usage_sent)| async move {
+        |(mut stream, mut buf, model, mut done, mut usage, mut finish, mut usage_sent, clock)| async move {
             loop {
                 if done && !usage_sent {
+                    // Decode window = last - first byte; total = full wall.
+                    let (eval_ns, total_ns) = {
+                        let c = clock.lock().unwrap();
+                        match c.0 {
+                            Some(f) => (Some(c.1.saturating_sub(f)), Some(c.1)),
+                            None => (None, (c.1 > 0).then_some(c.1)),
+                        }
+                    };
                     let final_chunk = crate::translate::ollama_final_chunk(
                         &model,
                         usage.as_ref(),
                         finish.as_deref(),
+                        eval_ns,
+                        total_ns,
                     );
                     usage_sent = true;
                     return Some((
                         Ok(axum::body::Bytes::from(format!("{final_chunk}\n"))),
-                        (stream, buf, model, done, usage, finish, usage_sent),
+                        (stream, buf, model, done, usage, finish, usage_sent, clock),
                     ));
                 }
                 match stream.next().await {
@@ -226,13 +256,13 @@ pub async fn ollama_chat_remote(
                         }
                         return Some((
                             Ok(axum::body::Bytes::from(lines.join(""))),
-                            (stream, buf, model, done, usage, finish, usage_sent),
+                            (stream, buf, model, done, usage, finish, usage_sent, clock),
                         ));
                     }
                     Some(Err(e)) => {
                         return Some((
                             Err(std::io::Error::other(e.to_string())),
-                            (stream, buf, model, done, usage, finish, usage_sent),
+                            (stream, buf, model, done, usage, finish, usage_sent, clock),
                         ));
                     }
                     None => {

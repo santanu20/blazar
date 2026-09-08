@@ -840,6 +840,75 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         argv.push(format_trimmed(config.video_timestamp_interval));
     }
 
+    // --- 21c. per-model chat-template override and sampling defaults.
+    // Both are warn-skip when this engine predates the flag; `extra_args`
+    // remains the full escape hatch and is appended after (wins upstream).
+    if let Some(tpl) = overlay.chat_template.as_deref().filter(|t| !t.is_empty()) {
+        if input.supported_flags.contains("--chat-template") {
+            argv.push("--chat-template".into());
+            argv.push(tpl.to_string());
+        } else {
+            warnings.push("chat_template skipped: engine lacks --chat-template".into());
+        }
+    }
+    if let Some(f) = overlay
+        .chat_template_file
+        .as_deref()
+        .filter(|f| !f.is_empty())
+    {
+        if input.supported_flags.contains("--chat-template-file") {
+            argv.push("--chat-template-file".into());
+            argv.push(f.to_string());
+        } else {
+            warnings.push("chat_template_file skipped: engine lacks --chat-template-file".into());
+        }
+    }
+    if let Some(sd) = &overlay.sampler_defaults {
+        // (flag, value) pairs in upstream argv order; None fields emit
+        // nothing so per-request body params keep upstream defaults.
+        let pairs: Vec<(&str, String)> = [
+            sd.temperature.map(|v| ("--temp", format_trimmed(v))),
+            sd.top_k.map(|v| ("--top-k", v.to_string())),
+            sd.top_p.map(|v| ("--top-p", format_trimmed(v))),
+            sd.min_p.map(|v| ("--min-p", format_trimmed(v))),
+            sd.top_n_sigma.map(|v| ("--top-n-sigma", format_trimmed(v))),
+            sd.typical_p.map(|v| ("--typical-p", format_trimmed(v))),
+            sd.repeat_penalty
+                .map(|v| ("--repeat-penalty", format_trimmed(v))),
+            sd.repeat_last_n.map(|v| ("--repeat-last-n", v.to_string())),
+            sd.presence_penalty
+                .map(|v| ("--presence-penalty", format_trimmed(v))),
+            sd.frequency_penalty
+                .map(|v| ("--frequency-penalty", format_trimmed(v))),
+            sd.dry_multiplier
+                .map(|v| ("--dry-multiplier", format_trimmed(v))),
+            sd.dry_base.map(|v| ("--dry-base", format_trimmed(v))),
+            sd.dry_allowed_length
+                .map(|v| ("--dry-allowed-length", v.to_string())),
+            sd.dry_penalty_last_n
+                .map(|v| ("--dry-penalty-last-n", v.to_string())),
+            sd.xtc_probability
+                .map(|v| ("--xtc-probability", format_trimmed(v))),
+            sd.xtc_threshold
+                .map(|v| ("--xtc-threshold", format_trimmed(v))),
+            sd.mirostat.map(|v| ("--mirostat", v.to_string())),
+            sd.seed.map(|v| ("--seed", v.to_string())),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        for (flag, value) in pairs {
+            if input.supported_flags.contains(flag) {
+                argv.push(flag.into());
+                argv.push(value);
+            } else {
+                warnings.push(format!(
+                    "sampler_defaults {flag} skipped: engine lacks {flag}"
+                ));
+            }
+        }
+    }
+
     // --- overlay extra args (validated like everything else)
     if let Some(extra) = &overlay.extra_args {
         argv.extend(extra.iter().cloned());
@@ -1237,6 +1306,7 @@ mod tests {
     use std::sync::LazyLock;
     const MIB: u64 = 1024 * 1024;
     use super::*;
+    use crate::config::SamplerDefaults;
     use crate::gguf::GgufMeta;
     use crate::hardware::GpuInfo;
 
@@ -1291,6 +1361,26 @@ mod tests {
             "--override-tensor",
             "--agent",
             "--slot-prompt-similarity",
+            "--chat-template",
+            "--chat-template-file",
+            "--temp",
+            "--top-k",
+            "--top-p",
+            "--min-p",
+            "--top-n-sigma",
+            "--typical-p",
+            "--repeat-penalty",
+            "--repeat-last-n",
+            "--presence-penalty",
+            "--frequency-penalty",
+            "--dry-multiplier",
+            "--dry-base",
+            "--dry-allowed-length",
+            "--dry-penalty-last-n",
+            "--xtc-probability",
+            "--xtc-threshold",
+            "--mirostat",
+            "--seed",
         ]
         .iter()
         .map(|f| (*f).to_string())
@@ -1380,6 +1470,9 @@ mod tests {
         reasoning_effort: None,
         replicas: None,
         pin: None,
+        chat_template: None,
+        chat_template_file: None,
+        sampler_defaults: None,
     };
 
     #[test]
@@ -2323,6 +2416,128 @@ mod tests {
         inp.overlay = &bad;
         let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
         assert!(err.contains("--no-such-flag"), "{err}");
+    }
+
+    #[test]
+    fn unit__overlay_chat_template__emitted_and_engine_gated() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        let o_tpl = ModelOverride {
+            chat_template: Some("{{ custom }}".into()),
+            ..Default::default()
+        };
+        inp.overlay = &o_tpl;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--chat-template" && w[1] == "{{ custom }}"));
+
+        // Engine without the flag: warn-skip, argv clean, compile still OK.
+        let sparse: BTreeSet<String> = ALL_FLAGS
+            .iter()
+            .filter(|f| !f.starts_with("--chat-template"))
+            .cloned()
+            .collect();
+        let mut inp2 = input(&g, &hw, &cfg, &sparse);
+        let o_file = ModelOverride {
+            chat_template_file: Some("/x.tpl".into()),
+            ..Default::default()
+        };
+        inp2.overlay = &o_file;
+        let p2 = compile(&inp2, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p2.argv.iter().any(|a| a.starts_with("--chat-template")),
+            "must not emit on a flagless engine"
+        );
+        assert!(
+            p2.warnings.iter().any(|w| w.contains("chat_template")),
+            "warn: {:?}",
+            p2.warnings
+        );
+    }
+
+    #[test]
+    fn unit__overlay_sampler_defaults__argv_flags_and_gating() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let sd = SamplerDefaults {
+            temperature: Some(0.7),
+            top_k: Some(40),
+            min_p: Some(0.05),
+            repeat_penalty: Some(1.1),
+            mirostat: Some(2),
+            seed: Some(-1),
+            ..Default::default()
+        };
+        let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        let o_sd = ModelOverride {
+            sampler_defaults: Some(sd),
+            ..Default::default()
+        };
+        inp.overlay = &o_sd;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        for (flag, val) in [
+            ("--temp", "0.7"),
+            ("--top-k", "40"),
+            ("--min-p", "0.05"),
+            ("--repeat-penalty", "1.1"),
+            ("--mirostat", "2"),
+            ("--seed", "-1"),
+        ] {
+            assert!(
+                p.argv.windows(2).any(|w| w[0] == flag && w[1] == val),
+                "missing {flag} {val} in {:?}",
+                p.argv
+            );
+        }
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+
+        // Flagless engine: every sampler flag warn-skips.
+        let sampler_flags = [
+            "--temp",
+            "--top-k",
+            "--top-p",
+            "--min-p",
+            "--top-n-sigma",
+            "--typical-p",
+            "--repeat-penalty",
+            "--repeat-last-n",
+            "--presence-penalty",
+            "--frequency-penalty",
+            "--dry-multiplier",
+            "--dry-base",
+            "--dry-allowed-length",
+            "--dry-penalty-last-n",
+            "--xtc-probability",
+            "--xtc-threshold",
+            "--mirostat",
+            "--seed",
+        ];
+        let sparse: BTreeSet<String> = ALL_FLAGS
+            .iter()
+            .filter(|f| !sampler_flags.contains(&f.as_str()))
+            .cloned()
+            .collect();
+        let mut inp2 = input(&g, &hw, &cfg, &sparse);
+        let o_sd2 = ModelOverride {
+            sampler_defaults: Some(SamplerDefaults {
+                temperature: Some(0.7),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        inp2.overlay = &o_sd2;
+        let p2 = compile(&inp2, &TuningOverrides::default()).unwrap();
+        assert!(!p2.argv.contains(&"--temp".to_string()));
+        assert!(
+            p2.warnings.iter().any(|w| w.contains("--temp")),
+            "{:?}",
+            p2.warnings
+        );
     }
 
     #[test]

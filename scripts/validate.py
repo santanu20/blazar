@@ -102,10 +102,10 @@ def mem_available_mib() -> int:
     return 0
 
 
-def model_bytes_mib() -> int:
+def model_bytes_mib(name: str = MODEL) -> int:
     try:
         db = sqlite3.connect(os.path.join(REAL_DATA, "pallama.db"))
-        row = db.execute("SELECT bytes FROM models WHERE name = ?", (MODEL,)).fetchone()
+        row = db.execute("SELECT bytes FROM models WHERE name = ?", (name,)).fetchone()
         db.close()
         if row and row[0]:
             return int(row[0]) // (1024 * 1024)
@@ -123,6 +123,19 @@ def total_mem_mib() -> int:
 
 
 # ---------------------------------------------------------------- sandbox
+
+
+def _toml_inline(v: object) -> str:
+    """Scalar -> TOML literal; dict -> inline table (one level)."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, list):
+        return "[" + ", ".join(_toml_inline(x) for x in v) + "]"
+    if isinstance(v, dict):
+        return "{ " + ", ".join(f"{k} = {_toml_inline(x)}" for k, x in v.items()) + " }"
+    return json.dumps(str(v))
 
 
 class Sandbox:
@@ -199,6 +212,9 @@ class Sandbox:
                     body += f"{k} = {v}\n"
                 elif isinstance(v, list):
                     body += f"{k} = " + json.dumps(v) + "\n"
+                elif isinstance(v, dict):
+                    # Nested struct (e.g. sampler_defaults): inline table.
+                    body += f"{k} = " + _toml_inline(v) + "\n"
                 else:
                     body += f'{k} = "{v}"\n'
         with open(path, "w") as f:
@@ -218,7 +234,12 @@ class Daemon:
         self.proc: subprocess.Popen | None = None
         self.log_path = os.path.join(sb.data_dir, "run", "daemon.log")
 
-    def start(self, cfg: dict | None = None, env_extra: dict | None = None) -> None:
+    def start(
+        self,
+        cfg: dict | None = None,
+        env_extra: dict | None = None,
+        floor_model: str = MODEL,
+    ) -> None:
         self.stop()
         if cfg is None:
             cfg = {"port": PORT}
@@ -236,7 +257,7 @@ class Daemon:
         # Dynamic floor: the model + working headroom. A co-resident
         # engine (the user's own daemon) eats the same budget — fail
         # LOUD instead of thrashing swap for minutes.
-        need = int(model_bytes_mib() * 1.25) + 1024
+        need = int(model_bytes_mib(floor_model) * 1.25) + 1024
         if mem_available_mib() < max(MEM_FLOOR_MIB, need):
             raise RuntimeError(
                 f"MemAvailable {mem_available_mib()} MiB < needed ~{need} MiB "
@@ -1983,6 +2004,229 @@ def phase_wave() -> None:
     )
 
 
+# ----------------------------------------------------------------- parity
+# Battery for the 2026-09-08 parity wave: per-model chat_template +
+# sampler_defaults argv flow, model-scoped upstream surfaces (/props,
+# /slots, /v1/stream*, /v1/streams/lookup), Jina rerank alias, and the
+# generate-lane unknown-option fail-fast.
+
+
+def phase_parity() -> None:
+    print("\n== phase 9: parity battery (templates/samplers/scoped surfaces) ==")
+    d = DAEMON
+    small = "qwen2.5-0.5b-instruct"
+
+    # -- battery A: overlay sampler_defaults + chat_template reach argv -----
+    d.start(
+        {
+            "port": PORT,
+            "model_overrides": {
+                small: {
+                    "sampler_defaults": {
+                        "temperature": 0.123,
+                        "top_k": 7,
+                        "seed": 424242,
+                        "dry_multiplier": 0.8,
+                    },
+                    "chat_template": "chatml",
+                },
+            },
+        },
+        floor_model=small,
+    )
+    st, _ = wave_chat(small, "Answer briefly.")
+    a_loaded = wait_loaded(small, budget=180)
+    check(
+        "parity",
+        "battery A: chat loads model with new overlays",
+        st == 200 and a_loaded is not None,
+        f"status={st} loaded={a_loaded is not None}",
+    )
+    pid = child_pid(small)
+    argv = child_argv(pid) if pid else []
+
+    def has(flag: str, val: str | None = None) -> bool:
+        if val is None:
+            return flag in argv
+        return any(
+            argv[i] == flag and i + 1 < len(argv) and argv[i + 1] == val
+            for i in range(len(argv))
+        )
+
+    check(
+        "parity",
+        "sampler_defaults -> --temp 0.123 --top-k 7 --seed 424242",
+        has("--temp", "0.123")
+        and has("--top-k", "7")
+        and has("--seed", "424242")
+        and has("--dry-multiplier", "0.8"),
+        f"pid={pid} sampler_flags={[a for a in argv if a in ('--temp', '--top-k', '--seed', '--dry-multiplier', '--chat-template')]}",
+    )
+    check(
+        "parity",
+        "chat_template overlay -> --chat-template chatml",
+        has("--chat-template", "chatml"),
+        f"pid={pid}",
+    )
+    cov(
+        "model_overrides.sampler_defaults",
+        "per-model sampler defaults compile to child argv",
+        "phase 9 battery A argv",
+        has("--temp", "0.123") and has("--top-k", "7"),
+    )
+    cov(
+        "model_overrides.chat_template",
+        "per-model template override compiles to child argv",
+        "phase 9 battery A argv",
+        has("--chat-template", "chatml"),
+    )
+
+    # -- battery B: model-scoped upstream surfaces ---------------------------
+    # Restart clean so the single-hot-child shortcut is deterministic.
+    d.stop()
+    d.start({"port": PORT}, floor_model=small)
+    st, _, v = http_json("GET", "/props")
+    check(
+        "parity",
+        "/props with zero hot children -> 400 teaching error",
+        st == 400 and "X-Pallama-Model" in json.dumps(v),
+        f"status={st} body={json.dumps(v)[:200]}",
+    )
+
+    st, _ = wave_chat(small, "Answer briefly.")
+    b_loaded = wait_loaded(small, budget=180)
+    check(
+        "parity",
+        "battery B: warm single child",
+        st == 200 and b_loaded is not None,
+        f"status={st} loaded={b_loaded is not None}",
+    )
+    st, _, v = http_json("GET", "/props")
+    check(
+        "parity",
+        "/props single hot child -> 200 props object",
+        st == 200 and isinstance(v, dict) and len(v) > 0,
+        f"status={st} body={json.dumps(v)[:200]}",
+    )
+    st, _, v = http_json("GET", "/slots")
+    check(
+        "parity",
+        "/slots -> 200 bare-array slot listing",
+        st == 200 and isinstance(v, list) and len(v) > 0,
+        f"status={st} body={json.dumps(v)[:200]}",
+    )
+    cov(
+        "scoped surfaces",
+        "/props + /slots forwarded to the resolved child",
+        "phase 9 battery B",
+        st == 200,
+    )
+    st, _, raw = http("GET", "/v1/stream")
+    txt = raw.decode(errors="replace")
+    check(
+        "parity",
+        "/v1/stream GET forwarded (2xx/4xx from child, not gateway 404)",
+        st in (200, 400, 404, 501) and "not found" not in txt.lower(),
+        f"status={st} body[:120]={txt[:120]!r}",
+    )
+    st, _, v = http_json(
+        "POST", "/v1/streams/lookup", {"model": small, "prompt": "Answer briefly."}
+    )
+    lookup_routed = st in (200, 400, 404, 501)
+    check(
+        "parity",
+        "/v1/streams/lookup body-model routing reaches child",
+        lookup_routed,
+        f"status={st} body={json.dumps(v)[:200]}",
+    )
+
+    # Header disambiguation lane (X-Pallama-Model).
+    st, _, v = http_json("GET", "/props", headers={"X-Pallama-Model": small})
+    check(
+        "parity",
+        "/props X-Pallama-Model header resolves target",
+        st == 200,
+        f"status={st} body={json.dumps(v)[:200]}",
+    )
+    st, _, v = http_json("GET", f"/slots?model={small}")
+    check(
+        "parity",
+        "/slots ?model= query resolves target",
+        st == 200,
+        f"status={st}",
+    )
+
+    # -- battery C: Jina rerank alias + generate fail-fast -------------------
+    st, _, v = http_json(
+        "POST",
+        "/v1/reranking",
+        {"model": small, "query": "sky", "documents": ["clouds", "the sky is blue"]},
+    )
+    # Gen models teach 501 on rerank lanes; rerank models answer 200.
+    # A gateway 404 would mean the route never landed.
+    check(
+        "parity",
+        "/v1/reranking alias routed (200/501, never gateway-404)",
+        st in (200, 501),
+        f"status={st} body={json.dumps(v)[:200]}",
+    )
+    cov(
+        "/v1/reranking",
+        "Jina-style alias shares the /v1/rerank lane",
+        "phase 9 battery C",
+        st in (200, 501),
+    )
+
+    st, _, v = http_json(
+        "POST",
+        "/api/generate",
+        {
+            "model": small,
+            "prompt": "hi",
+            "stream": False,
+            "options": {"num_batch": 512},
+        },
+    )
+    check(
+        "parity",
+        "/api/generate unknown option -> 400 naming the option",
+        st == 400 and "num_batch" in json.dumps(v),
+        f"status={st} body={json.dumps(v)[:200]}",
+    )
+
+    # -- refusal lane: chat_template xor chat_template_file enforced ---------
+    refused = False
+    log_snip = ""
+    try:
+        d.start(
+            {
+                "port": PORT,
+                "model_overrides": {
+                    small: {
+                        "chat_template": "chatml",
+                        "chat_template_file": "/etc/hostname",
+                    },
+                },
+            },
+            floor_model=small,
+        )
+    except RuntimeError as e:
+        refused = "exited early" in str(e)
+        log_snip = d.tail_log(5)
+    check(
+        "parity",
+        "chat_template + chat_template_file -> daemon refuses to start",
+        refused and "chat_template" in log_snip,
+        f"refused={refused} log_has_field={'chat_template' in log_snip}",
+    )
+    cov(
+        "model_overrides.chat_template xor",
+        "both set fails validation at startup",
+        "phase 9 refusal lane",
+        refused,
+    )
+
+
 # ------------------------------------------------------------------ main
 
 
@@ -2059,6 +2303,7 @@ def main() -> int:
         ("cli", phase_cli),
         ("auth", phase_auth),
         ("wave", phase_wave),
+        ("parity", phase_parity),
     ]
     for name, fn in phases:
         if self_test or (wanted and name not in wanted):

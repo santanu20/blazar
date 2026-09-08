@@ -243,6 +243,13 @@ async fn serve(host: String, port: u16, alias: String) {
         .route("/v1/chat/completions/control", post(control_vectors))
         .route("/tokenize", post(tokenize))
         .route("/slots/{id_slot}", post(slots_action))
+        // Model-scoped upstream surfaces forwarded by the gateway's
+        // scoped_proxy: props settings, slot-save streams, stream lookup,
+        // and the Jina reranking alias.
+        .route("/props", get(props).post(props))
+        .route("/v1/stream", get(stream_list).delete(stream_delete))
+        .route("/v1/streams/lookup", post(streams_lookup))
+        .route("/v1/reranking", post(reranking))
         .route("/models", get(router_models))
         .route("/models/unload", post(models_unload))
         .with_state(alias.clone());
@@ -881,9 +888,105 @@ async fn models_unload(body: axum::body::Bytes) -> axum::response::Response {
 }
 
 async fn slots() -> axum::Json<serde_json::Value> {
+    // Upstream GET /slots answers a bare array (not wrapped in an object).
+    axum::Json(serde_json::json!([
+        {"id": 0, "is_processing": false, "prompt": "", "n_ctx": 4096},
+    ]))
+}
+
+/// GET/POST /props — echoes the alias so the e2e can prove per-child
+/// routing, and merges any settings from a `POST` back into the response.
+async fn props(
+    State(state): State<AppState>,
+    method: axum::http::Method,
+    body: axum::body::Bytes,
+) -> axum::Json<serde_json::Value> {
+    let mut props = serde_json::json!({
+        "model_alias": state,
+        "default_props": {"temperature": 0.8, "top_k": 40},
+    });
+    if method == axum::http::Method::POST {
+        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body) {
+            props["user_props"] = parsed;
+        }
+    }
+    axum::Json(props)
+}
+
+/// GET /v1/stream — slot-save stream listing; `DELETE /v1/stream?stream_id=`
+/// removes it (upstream novel streaming surface).
+async fn stream_list(
+    axum::extract::RawQuery(q): axum::extract::RawQuery,
+) -> axum::Json<serde_json::Value> {
+    let id = q
+        .and_then(|q| {
+            q.split('&')
+                .find_map(|p| p.strip_prefix("stream_id=").map(str::to_string))
+        })
+        .unwrap_or_else(|| "s0".into());
+    axum::Json(serde_json::json!({"streams": [{"stream_id": id, "slot_id": 0}]}))
+}
+
+async fn stream_delete(
+    axum::extract::RawQuery(q): axum::extract::RawQuery,
+) -> axum::response::Response {
+    match q.and_then(|q| {
+        q.split('&')
+            .find_map(|p| p.strip_prefix("stream_id=").map(str::to_string))
+    }) {
+        Some(id) => (axum::http::StatusCode::OK, format!("deleted {id}")).into_response(),
+        None => (axum::http::StatusCode::BAD_REQUEST, "missing stream_id").into_response(),
+    }
+}
+
+/// POST /v1/streams/lookup — chat-shaped body; finds a stream by prompt
+/// prefix. Stub answers deterministically so the e2e can pin the shape.
+async fn streams_lookup(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let parsed: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (axum::http::StatusCode::BAD_REQUEST, "bad json").into_response();
+        }
+    };
+    let Some(prompt) = parsed["prompt"].as_str() else {
+        return (axum::http::StatusCode::BAD_REQUEST, "missing prompt").into_response();
+    };
     axum::Json(serde_json::json!({
-        "slots": [
-            {"id": 0, "is_processing": false, "prompt": "", "n_ctx": 4096},
-        ],
+        "stream_id": "s0",
+        "matched_prompt": prompt,
+        "model_alias": state,
     }))
+    .into_response()
+}
+
+/// POST /v1/reranking — Jina-style alias; ranks by naive doc length so
+/// the e2e can verify pass-through ordering.
+#[allow(clippy::cast_precision_loss)] // doc length -> score is a stub heuristic
+async fn reranking(body: axum::body::Bytes) -> axum::response::Response {
+    let parsed: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (axum::http::StatusCode::BAD_REQUEST, "bad json").into_response();
+        }
+    };
+    let Some(docs) = parsed["documents"].as_array() else {
+        return (axum::http::StatusCode::BAD_REQUEST, "missing documents").into_response();
+    };
+    let mut results: Vec<(usize, f64)> = docs
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let len = d.as_str().map_or(0, str::len) as f64;
+            (i, len / 100.0)
+        })
+        .collect();
+    results.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let results: Vec<serde_json::Value> = results
+        .into_iter()
+        .map(|(i, s)| serde_json::json!({"index": i, "relevance_score": s}))
+        .collect();
+    axum::Json(serde_json::json!({"results": results})).into_response()
 }

@@ -527,6 +527,171 @@ pub struct ModelOverride {
     /// pressure falls on unpinned models instead.
     #[serde(default)]
     pub pin: Option<bool>,
+    /// Per-model chat template override (`--chat-template`): a Jinja
+    /// template string. Mutually exclusive with `chat_template_file`.
+    #[serde(default)]
+    pub chat_template: Option<String>,
+    /// Per-model chat template file (`--chat-template-file`). Mutually
+    /// exclusive with `chat_template`. Must exist at config load.
+    #[serde(default)]
+    pub chat_template_file: Option<String>,
+    /// Per-model sampling defaults, emitted as argv so they apply to
+    /// every request that does not override the param in its body.
+    #[serde(default)]
+    pub sampler_defaults: Option<SamplerDefaults>,
+}
+
+/// Model-level sampling defaults, compiled to `--temp`, `--top-k`, ...
+/// argv flags. Body params still win per request: these are defaults,
+/// not caps. Field names follow the OpenAI/ollama spelling users know.
+/// `mirostat` accepts 0 (off), 1, or 2. No mirostat tau/eta: the engine
+/// server manifest does not expose those flags.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SamplerDefaults {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_n_sigma: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typical_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_penalty: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_last_n: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_multiplier: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_base: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_allowed_length: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_penalty_last_n: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xtc_probability: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xtc_threshold: Option<f64>,
+    /// 0 = off, 1 = Mirostat, 2 = Mirostat 2.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirostat: Option<i32>,
+    /// -1 = random seed each request (upstream default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
+}
+
+impl SamplerDefaults {
+    /// Range checks mirroring upstream sampler semantics: probabilities
+    /// within [0,1], temperatures/multipliers finite and non-negative,
+    /// 1|1|1
+    /// frequency penalties accept negative values (they reward rather
+    /// than penalize), so only finiteness is checked there.
+    pub fn validate(&self, ctx: &str) -> CoreResult<()> {
+        let prob = |field: &str, v: f64| -> CoreResult<()> {
+            if v.is_nan() || !(0.0..=1.0).contains(&v) {
+                Err(CoreError::Config(format!(
+                    "{ctx}.{field} must be within [0.0, 1.0], got {v}"
+                )))
+            } else {
+                Ok(())
+            }
+        };
+        let nonneg = |field: &str, v: f64| -> CoreResult<()> {
+            if v.is_nan() || v < 0.0 {
+                Err(CoreError::Config(format!(
+                    "{ctx}.{field} must be >= 0.0, got {v}"
+                )))
+            } else {
+                Ok(())
+            }
+        };
+        let count = |field: &str, v: i32| -> CoreResult<()> {
+            if v < 0 {
+                Err(CoreError::Config(format!(
+                    "{ctx}.{field} must be >= 0, got {v}"
+                )))
+            } else {
+                Ok(())
+            }
+        };
+        if let Some(v) = self.temperature {
+            nonneg("temperature", v)?;
+        }
+        if let Some(v) = self.top_k {
+            count("top_k", v)?;
+        }
+        if let Some(v) = self.top_p {
+            prob("top_p", v)?;
+        }
+        if let Some(v) = self.min_p {
+            prob("min_p", v)?;
+        }
+        if let Some(v) = self.top_n_sigma {
+            nonneg("top_n_sigma", v)?;
+        }
+        if let Some(v) = self.typical_p {
+            prob("typical_p", v)?;
+        }
+        if let Some(v) = self.repeat_penalty {
+            nonneg("repeat_penalty", v)?;
+        }
+        if let Some(v) = self.repeat_last_n {
+            count("repeat_last_n", v)?;
+        }
+        for field in ["presence_penalty", "frequency_penalty"] {
+            let v = if field == "presence_penalty" {
+                self.presence_penalty
+            } else {
+                self.frequency_penalty
+            };
+            if let Some(v) = v {
+                if !v.is_finite() {
+                    return Err(CoreError::Config(format!(
+                        "{ctx}.{field} must be finite, got {v}"
+                    )));
+                }
+            }
+        }
+        if let Some(v) = self.dry_multiplier {
+            nonneg("dry_multiplier", v)?;
+        }
+        if let Some(v) = self.dry_base {
+            if v.is_nan() || v <= 1.0 {
+                return Err(CoreError::Config(format!(
+                    "{ctx}.dry_base must be > 1.0, got {v}"
+                )));
+            }
+        }
+        if let Some(v) = self.dry_allowed_length {
+            count("dry_allowed_length", v)?;
+        }
+        if let Some(v) = self.dry_penalty_last_n {
+            count("dry_penalty_last_n", v)?;
+        }
+        if let Some(v) = self.xtc_probability {
+            prob("xtc_probability", v)?;
+        }
+        if let Some(v) = self.xtc_threshold {
+            nonneg("xtc_threshold", v)?;
+        }
+        if let Some(v) = self.mirostat {
+            if !(0..=2).contains(&v) {
+                return Err(CoreError::Config(format!(
+                    "{ctx}.mirostat must be 0 (off), 1 or 2, got {v}"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One external OpenAI-compatible server (another pallama, vLLM, MLX
@@ -1076,6 +1241,21 @@ impl Config {
                         )));
                     }
                 }
+            }
+            if o.chat_template.is_some() && o.chat_template_file.is_some() {
+                return Err(CoreError::Config(format!(
+                    "model_overrides.{name}: set only one of chat_template or chat_template_file"
+                )));
+            }
+            if let Some(f) = &o.chat_template_file {
+                if !std::path::Path::new(f).exists() {
+                    return Err(CoreError::Config(format!(
+                        "model_overrides.{name}.chat_template_file not found: {f:?}"
+                    )));
+                }
+            }
+            if let Some(sd) = &o.sampler_defaults {
+                sd.validate(&format!("model_overrides.{name}.sampler_defaults"))?;
             }
         }
         Ok(())
@@ -2122,6 +2302,196 @@ key = "plm_admin"
         std::fs::write(dirs.config_file(), "port = 9999\ndefault_ctx = 8192\n").unwrap();
         let cfg = Config::load(&dirs).unwrap();
         assert_eq!((cfg.port, cfg.default_ctx), (9999, 8192));
+    }
+
+    #[test]
+    fn unit__overlay_chat_template__xor_and_missing_file_rejected() {
+        let base = || Config {
+            model_overrides: BTreeMap::from([("m".to_string(), ModelOverride::default())]),
+            ..Config::default()
+        };
+        let with = |o: ModelOverride| {
+            let mut c = base();
+            c.model_overrides.insert("m".to_string(), o);
+            c
+        };
+        let both = ModelOverride {
+            chat_template: Some("{{}}".into()),
+            chat_template_file: Some("/x.tpl".into()),
+            ..Default::default()
+        };
+        let err = with(both).validate().unwrap_err();
+        assert!(
+            err.to_string().contains("only one of chat_template"),
+            "{err}"
+        );
+
+        let missing = ModelOverride {
+            chat_template_file: Some("/definitely/not/present.tpl".into()),
+            ..Default::default()
+        };
+        let err = with(missing).validate().unwrap_err();
+        assert!(
+            err.to_string().contains("/definitely/not/present.tpl"),
+            "{err}"
+        );
+
+        let tpl = std::env::temp_dir().join("pallama-tpl-test.j2");
+        std::fs::write(&tpl, "{{ message }}").unwrap();
+        let good = ModelOverride {
+            chat_template_file: Some(tpl.display().to_string()),
+            ..Default::default()
+        };
+        with(good).validate().unwrap();
+        let _ = std::fs::remove_file(&tpl);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // one assertion per sampler field, flat table
+    fn unit__sampler_defaults__range_validation() {
+        let cfg = |sd: SamplerDefaults| {
+            let mut c = Config::default();
+            c.model_overrides.insert(
+                "m".to_string(),
+                ModelOverride {
+                    sampler_defaults: Some(sd),
+                    ..Default::default()
+                },
+            );
+            c.validate()
+        };
+        // Valid extremes pass: bounded probabilities, off-values, any seed.
+        cfg(SamplerDefaults {
+            temperature: Some(0.0),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+            typical_p: Some(1.0),
+            presence_penalty: Some(-2.0),
+            frequency_penalty: Some(2.0),
+            mirostat: Some(2),
+            seed: Some(-1),
+            ..Default::default()
+        })
+        .unwrap();
+
+        for (field, sd) in [
+            (
+                "top_p",
+                SamplerDefaults {
+                    top_p: Some(1.5),
+                    ..Default::default()
+                },
+            ),
+            (
+                "min_p",
+                SamplerDefaults {
+                    min_p: Some(-0.1),
+                    ..Default::default()
+                },
+            ),
+            (
+                "typical_p",
+                SamplerDefaults {
+                    typical_p: Some(2.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "temperature",
+                SamplerDefaults {
+                    temperature: Some(-1.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "top_k",
+                SamplerDefaults {
+                    top_k: Some(-5),
+                    ..Default::default()
+                },
+            ),
+            (
+                "repeat_penalty",
+                SamplerDefaults {
+                    repeat_penalty: Some(-0.5),
+                    ..Default::default()
+                },
+            ),
+            (
+                "repeat_last_n",
+                SamplerDefaults {
+                    repeat_last_n: Some(-1),
+                    ..Default::default()
+                },
+            ),
+            (
+                "dry_multiplier",
+                SamplerDefaults {
+                    dry_multiplier: Some(-1.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "dry_base",
+                SamplerDefaults {
+                    dry_base: Some(1.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "dry_allowed_length",
+                SamplerDefaults {
+                    dry_allowed_length: Some(-2),
+                    ..Default::default()
+                },
+            ),
+            (
+                "dry_penalty_last_n",
+                SamplerDefaults {
+                    dry_penalty_last_n: Some(-1),
+                    ..Default::default()
+                },
+            ),
+            (
+                "xtc_probability",
+                SamplerDefaults {
+                    xtc_probability: Some(1.2),
+                    ..Default::default()
+                },
+            ),
+            (
+                "xtc_threshold",
+                SamplerDefaults {
+                    xtc_threshold: Some(-0.5),
+                    ..Default::default()
+                },
+            ),
+            (
+                "mirostat",
+                SamplerDefaults {
+                    mirostat: Some(3),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let err = cfg(sd).unwrap_err();
+            assert!(
+                err.to_string().contains(field),
+                "error must name {field}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unit__sampler_defaults__unknown_field_rejected_by_serde() {
+        let err = serde_json::from_str::<SamplerDefaults>("{\"temp\": 0.5}");
+        assert!(err.is_err(), "typo'd field must hard-error, not ignore");
+        let sd: SamplerDefaults = serde_json::from_str(
+            "{\"temperature\": 0.7, \"top_k\": 40, \"mirostat\": 1, \"seed\": -1}",
+        )
+        .unwrap();
+        assert_eq!(sd.temperature, Some(0.7));
+        assert_eq!(sd.mirostat, Some(1));
     }
 
     /// Tests mutate process env; serialize with a global lock so parallel

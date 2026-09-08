@@ -826,7 +826,13 @@ async fn proxy_core_chat(
             // Drop fires End: the analyzer finalizes off the response path.
             drop(feed);
         }
-        return axum::Json(tr::openai_chat_to_ollama(model, &openai)).into_response();
+        let mut ollama = tr::openai_chat_to_ollama(model, &openai);
+        // Cold-load wall (only when a spawn actually happened) for ollama
+        // parity: clients read load_duration after first requests.
+        if load_ms > 100 {
+            ollama["load_duration"] = json!(u64::try_from(load_ms).unwrap_or(u64::MAX) * 1_000_000);
+        }
+        return axum::Json(ollama).into_response();
     }
     // Stream: child SSE -> ollama NDJSON with final counts. Force the
     // usage chunk so the final ollama line carries eval counts.
@@ -876,6 +882,11 @@ async fn proxy_core_chat(
     let mut first = true;
     let mut last = t0;
     let hist_state = std::sync::Arc::clone(state);
+    // Shared clock: the map closure stamps first/last-byte offsets, the
+    // unfold closure reads them for the final NDJSON line (streaming
+    // children report no timings — durations are gateway-measured).
+    let clock = std::sync::Arc::new(std::sync::Mutex::new((None::<u64>, 0u64)));
+    let clock_map = std::sync::Arc::clone(&clock);
     let stream = futures::StreamExt::map(upstream, move |chunk| {
         let now = std::time::Instant::now();
         if first {
@@ -885,6 +896,14 @@ async fn proxy_core_chat(
             hist_state.tpot.observe_secs((now - last).as_secs_f64());
         }
         last = now;
+        {
+            let mut c = clock_map.lock().unwrap();
+            let elapsed = u64::try_from((now - t0).as_nanos()).unwrap_or(u64::MAX);
+            if c.0.is_none() {
+                c.0 = Some(elapsed);
+            }
+            c.1 = elapsed;
+        }
         if let Ok(bytes) = chunk.as_ref() {
             sentinel_feed.bytes(bytes.as_ref());
         }
@@ -902,16 +921,30 @@ async fn proxy_core_chat(
             None::<Value>,
             None::<String>,
             false,
+            std::sync::Arc::clone(&clock),
         ),
-        |(mut stream, mut buf, model, mut done, mut usage, mut finish, mut usage_sent)| async move {
+        |(mut stream, mut buf, model, mut done, mut usage, mut finish, mut usage_sent, clock)| async move {
             loop {
                 if done && !usage_sent {
-                    let final_chunk =
-                        tr::ollama_final_chunk(&model, usage.as_ref(), finish.as_deref());
+                    // Decode window = last - first byte; total = full wall.
+                    let (eval_ns, total_ns) = {
+                        let c = clock.lock().unwrap();
+                        match c.0 {
+                            Some(f) => (Some(c.1.saturating_sub(f)), Some(c.1)),
+                            None => (None, (c.1 > 0).then_some(c.1)),
+                        }
+                    };
+                    let final_chunk = tr::ollama_final_chunk(
+                        &model,
+                        usage.as_ref(),
+                        finish.as_deref(),
+                        eval_ns,
+                        total_ns,
+                    );
                     usage_sent = true;
                     return Some((
                         Ok(Bytes::from(format!("{final_chunk}\n"))),
-                        (stream, buf, model, done, usage, finish, usage_sent),
+                        (stream, buf, model, done, usage, finish, usage_sent, clock),
                     ));
                 }
                 match futures::StreamExt::next(&mut stream).await {
@@ -943,13 +976,13 @@ async fn proxy_core_chat(
                         let body = lines.join("");
                         return Some((
                             Ok(Bytes::from(body)),
-                            (stream, buf, model, done, usage, finish, usage_sent),
+                            (stream, buf, model, done, usage, finish, usage_sent, clock),
                         ));
                     }
                     Some(Err(e)) => {
                         return Some((
                             Err(std::io::Error::other(e.to_string())),
-                            (stream, buf, model, done, usage, finish, usage_sent),
+                            (stream, buf, model, done, usage, finish, usage_sent, clock),
                         ));
                     }
                     None => {
@@ -1176,11 +1209,15 @@ pub async fn generate(
         Ok(v) => v,
         Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
     };
-    let Some(openai_req) = tr::generate_to_openai(&req) else {
-        return api_error(
-            400,
-            "templated /api/generate is not supported; use /api/chat (the model's own template is applied by the engine)",
-        );
+    let openai_req = match tr::generate_to_openai(&req) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return api_error(
+                400,
+                "templated /api/generate is not supported; use /api/chat (the model's own template is applied by the engine)",
+            );
+        }
+        Err(msg) => return api_error(400, &msg),
     };
     let model = openai_req["model"].as_str().unwrap_or_default().to_string();
     let key_entry = key_ext
@@ -1198,7 +1235,7 @@ pub async fn generate(
             .get("x-pallama-priority")
             .and_then(|v| v.to_str().ok()),
     );
-    let (engine, _) =
+    let (engine, load_ms) =
         match ensure_with_admission(&state, &model, priority, affinity_hash(&req)).await {
             Ok(ok) => ok,
             Err(resp) => return resp,
@@ -1229,7 +1266,11 @@ pub async fn generate(
         );
         feed.value(openai.clone());
         drop(feed);
-        axum::Json(tr::openai_completion_to_ollama(&model, &openai)).into_response()
+        let mut ollama = tr::openai_completion_to_ollama(&model, &openai);
+        if load_ms > 100 {
+            ollama["load_duration"] = json!(u64::try_from(load_ms).unwrap_or(u64::MAX) * 1_000_000);
+        }
+        axum::Json(ollama).into_response()
     })
     .await;
     // /api/generate responses are always whole JSON with usage inside.

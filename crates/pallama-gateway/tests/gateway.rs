@@ -1322,3 +1322,176 @@ fn unit__translation_module_reachable() {
     assert_eq!(ctx, Some(123));
     assert_eq!(req["model"], "m");
 }
+
+/// Scoped surfaces (/props, /slots, /v1/stream*, /v1/streams/lookup)
+/// forward to the single hot child without any explicit target.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__scoped_routes_single_child_passthrough() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    // Warm m1 so exactly one child is hot.
+    let _: serde_json::Value = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({"model": "m1", "stream": false,
+            "messages": [{"role": "user", "content": "warm"}]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let props: serde_json::Value = c
+        .get(format!("{}/props", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        props["model_alias"], "m1",
+        "single hot child resolved: {props}"
+    );
+
+    // POST /props carries settings through (stub echoes them back).
+    let posted: serde_json::Value = c
+        .post(format!("{}/props", ts.base))
+        .json(&serde_json::json!({"temperature": 0.1}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(posted["user_props"]["temperature"], 0.1);
+
+    let slots: serde_json::Value = c
+        .get(format!("{}/slots", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(slots[0]["id"].as_u64().is_some(), "upstream bare-array shape: {slots}");
+
+    let streams: serde_json::Value = c
+        .get(format!("{}/v1/stream", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(streams["streams"][0]["stream_id"], "s0", "{streams}");
+
+    let del = c
+        .delete(format!("{}/v1/stream?stream_id=s0", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), 200);
+
+    // /v1/streams/lookup carries model in its body (chat-shaped).
+    let lookup: serde_json::Value = c
+        .post(format!("{}/v1/streams/lookup", ts.base))
+        .json(&serde_json::json!({"model": "m1", "prompt": "warm"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(lookup["matched_prompt"], "warm", "{lookup}");
+    assert_eq!(lookup["model_alias"], "m1");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// With zero hot children or an ambiguous multi-child state the scoped
+/// surfaces demand an explicit target (400 teaching error); the
+/// X-Pallama-Model header disambiguates.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__scoped_routes_require_target() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    // No child loaded yet: no implicit resolution possible.
+    let none = c.get(format!("{}/props", ts.base)).send().await.unwrap();
+    assert_eq!(none.status(), 400);
+    let none_body: serde_json::Value = none.json().await.unwrap();
+    let msg = none_body["error"]["message"]
+        .as_str()
+        .or_else(|| none_body["error"].as_str())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("X-Pallama-Model"),
+        "teaching error: {none_body}"
+    );
+
+    // Warm two children: single-child shortcut no longer applies.
+    for m in ["m1", "m2"] {
+        let _: serde_json::Value = c
+            .post(format!("{}/v1/chat/completions", ts.base))
+            .json(&serde_json::json!({"model": m, "stream": false,
+                "messages": [{"role": "user", "content": "warm"}]}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    }
+    let amb = c.get(format!("{}/props", ts.base)).send().await.unwrap();
+    assert_eq!(amb.status(), 400, "ambiguous without target");
+
+    // Header resolves; query param resolves too.
+    let hdr: serde_json::Value = c
+        .get(format!("{}/props", ts.base))
+        .header("x-pallama-model", "m2")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(hdr["model_alias"], "m2", "{hdr}");
+    let q: serde_json::Value = c
+        .get(format!("{}/slots?model=m1", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(q.as_array().is_some_and(|a| !a.is_empty()), "{q}");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// /v1/reranking is the Jina-style alias of /v1/rerank: body carries the
+/// model, response passes through untouched.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__v1_reranking_alias() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let r: serde_json::Value = c
+        .post(format!("{}/v1/reranking", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "query": "q",
+            "documents": ["short", "a much longer document"],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let results = r["results"].as_array().expect("results array");
+    assert!(!results.is_empty(), "{r}");
+    // Stub ranks by length: longer doc first.
+    assert_eq!(results[0]["index"], 1, "{r}");
+    ts.state.sup.shutdown_all().await.unwrap();
+}

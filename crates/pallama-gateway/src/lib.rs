@@ -192,7 +192,23 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/messages/count_tokens", post(openai::openai_proxy))
         .route("/tokenize", post(openai::openai_proxy))
         .route("/detokenize", post(openai::openai_proxy))
-        .route("/apply-template", post(openai::openai_proxy));
+        .route("/apply-template", post(openai::openai_proxy))
+        // Jina-style rerank alias (upstream serves both spellings).
+        .route("/v1/reranking", post(openai::openai_proxy))
+        // Engine-scoped upstream surfaces (no `model` in the body): slot
+        // inspection/control, props, and the disconnected-stream family.
+        // Model comes from X-Pallama-Model > ?model= > single hot child.
+        .route(
+            "/props",
+            get(openai::scoped_proxy).post(openai::scoped_proxy),
+        )
+        .route("/slots", get(openai::scoped_proxy))
+        .route("/slots/{id}", post(openai::scoped_proxy))
+        .route(
+            "/v1/stream",
+            get(openai::scoped_proxy).delete(openai::scoped_proxy),
+        )
+        .route("/v1/streams/lookup", post(openai::scoped_proxy));
 
     let api = Router::new()
         .route("/api/version", get(ollama::version))

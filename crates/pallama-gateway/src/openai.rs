@@ -232,6 +232,109 @@ fn extract_model(body: &[u8]) -> Option<String> {
     v.get("model")?.as_str().map(str::to_string)
 }
 
+/// Engine-scoped upstream surfaces whose body carries no `model` field:
+/// `/props`, `/slots`, `/slots/{id}`, `/v1/stream`, `/v1/streams/lookup`.
+/// Model resolution order: `X-Pallama-Model` header > `?model=` query >
+/// the single hot child (only when exactly one is loaded). Ambiguity is
+/// a teaching 400 — never a silent guess across children. POST bodies on
+/// `/v1/streams/lookup` may carry `model` themselves (chat-shaped) and
+/// are honored first. Everything else mirrors `openai_proxy`: same key
+/// admission, remote forwarding, queue admission, byte-faithful proxy.
+#[allow(clippy::too_many_lines)] // one cohesive resolution + forwarding path
+pub async fn scoped_proxy(
+    State(state): State<Arc<AppState>>,
+    trace_ext: Option<Extension<TraceId>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
+    uri: Uri,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let body_model = if uri.path() == "/v1/streams/lookup" {
+        extract_model(&body)
+    } else {
+        None
+    };
+    let header_model = headers
+        .get("x-pallama-model")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let query_model = uri.query().and_then(|q| {
+        q.split('&').find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            (k == "model").then(|| v.to_string())
+        })
+    });
+    let hot = state.sup.ps();
+    let single = if hot.len() == 1 {
+        hot.first().map(|p| p.name.clone())
+    } else {
+        None
+    };
+    let model = body_model.or(header_model).or(query_model).or(single);
+    let Some(model) = model else {
+        return openai_error(
+            400,
+            "model-scoped surface needs a target: set X-Pallama-Model, ?model=, or have exactly one loaded model (GET /api/ps lists candidates)",
+        );
+    };
+    // Per-key admission (same contract as openai_proxy).
+    if let Some(key) = key_ext.as_ref().map(|Extension(k)| k) {
+        if let Some(entry) = state.keys.entry(&key.name) {
+            if let Err(rej) = state.keys.check(&entry, &model) {
+                return rej.to_response();
+            }
+            state.keys.charge_request(&key.name);
+        }
+    }
+    if let Some((remote, remote_model)) = crate::remotes::split_remote(&model, &state.config) {
+        let remote = remote.clone();
+        return crate::remotes::forward_openai(
+            &state,
+            &remote,
+            remote_model,
+            &method,
+            &path_and_query(&uri),
+            &headers,
+            body,
+        )
+        .await;
+    }
+    let priority = Priority::from_header(
+        headers
+            .get("x-pallama-priority")
+            .and_then(|v| v.to_str().ok()),
+    );
+    let (engine, load_ms) = match ensure_with_admission(&state, &model, priority, None).await {
+        Ok(ok) => ok,
+        Err(resp) => return resp,
+    };
+    let model_name = engine.name.clone();
+    let deadline_ms = headers
+        .get("x-pallama-deadline-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let guard =
+        match admission_gate_slo(&state, &model_name, priority, deadline_ms, body.len()).await {
+            Ok(g) => g,
+            Err(resp) => return resp,
+        };
+    proxy_request(
+        &state,
+        &engine,
+        &model_name,
+        &method,
+        &path_and_query(&uri),
+        &headers,
+        body,
+        load_ms,
+        trace_ext.map(|Extension(t)| t.0),
+        Some(guard),
+        key_ext.map(|Extension(k)| k),
+    )
+    .await
+}
+
 /// POST /v1/responses — proxied WITH gateway conversation state:
 /// `previous_response_id` chaining and `store` semantics that upstream
 /// llama-server does not implement (no storage server-side, verified).

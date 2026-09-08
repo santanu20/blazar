@@ -96,6 +96,36 @@ pub fn chat_to_openai(req: &Value) -> Result<(Value, Option<i64>), String> {
     Ok((out, num_ctx))
 }
 
+/// Child `timings` (llama-server non-stream shape, milliseconds) ->
+/// ollama nanosecond duration. Returns `None` when the child omitted
+/// the field so callers skip the key instead of emitting a lie.
+// Durations are non-negative by construction; ns precision past the u64
+// range (~584 years) cannot occur with real requests.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn timing_ns(openai: &Value, key: &str) -> Option<u64> {
+    openai
+        .pointer(&format!("/timings/{key}"))
+        .and_then(Value::as_f64)
+        .map(|ms| (ms * 1e6).max(0.0) as u64)
+}
+
+/// Merge child `timings` into an ollama response object: prompt/eval
+/// durations plus an honest `total_duration` (prompt+eval, queue time
+/// excluded — the child never saw it).
+fn merge_timing_fields(v: &mut Value, openai: &Value) {
+    let prompt_ns = timing_ns(openai, "prompt_ms");
+    let eval_ns = timing_ns(openai, "predicted_ms");
+    if let Some(p) = prompt_ns {
+        v["prompt_eval_duration"] = json!(p);
+    }
+    if let Some(e) = eval_ns {
+        v["eval_duration"] = json!(e);
+    }
+    if let (Some(p), Some(e)) = (prompt_ns, eval_ns) {
+        v["total_duration"] = json!(p.saturating_add(e));
+    }
+}
+
 /// `OpenAI` non-stream chat response -> ollama `ChatResponse` (done:true with
 /// counts from usage).
 #[must_use]
@@ -109,7 +139,7 @@ pub fn openai_chat_to_ollama(model: &str, openai: &Value) -> Value {
     if let Some(reasoning) = message.get("reasoning_content") {
         msg["thinking"] = reasoning.clone();
     }
-    json!({
+    let mut v = json!({
         "model": model,
         "created_at": iso_now(),
         "message": msg,
@@ -118,7 +148,9 @@ pub fn openai_chat_to_ollama(model: &str, openai: &Value) -> Value {
         "total_duration": 0,
         "prompt_eval_count": openai["usage"]["prompt_tokens"].clone(),
         "eval_count": openai["usage"]["completion_tokens"].clone(),
-    })
+    });
+    merge_timing_fields(&mut v, openai);
+    v
 }
 
 /// One `OpenAI` SSE chunk -> zero or more ollama NDJSON lines.
@@ -159,10 +191,19 @@ pub fn openai_chunk_to_ollama(model: &str, chunk: &Value) -> Vec<Value> {
     out
 }
 
-/// Final ollama chunk from the usage/finish information.
+/// Final ollama chunk from the usage/finish information. `eval_ns` /
+/// `total_ns` are the gateway-measured decode window and full wall
+/// (streaming children do not report timings); prompt duration is
+/// omitted there rather than inflated with queue wait.
 #[must_use]
-pub fn ollama_final_chunk(model: &str, usage: Option<&Value>, finish: Option<&str>) -> Value {
-    json!({
+pub fn ollama_final_chunk(
+    model: &str,
+    usage: Option<&Value>,
+    finish: Option<&str>,
+    eval_ns: Option<u64>,
+    total_ns: Option<u64>,
+) -> Value {
+    let mut v = json!({
         "model": model,
         "created_at": iso_now(),
         "message": {"role": "assistant", "content": ""},
@@ -171,7 +212,14 @@ pub fn ollama_final_chunk(model: &str, usage: Option<&Value>, finish: Option<&st
         "total_duration": 0,
         "prompt_eval_count": usage.and_then(|u| u["prompt_tokens"].as_i64()).unwrap_or(0),
         "eval_count": usage.and_then(|u| u["completion_tokens"].as_i64()).unwrap_or(0),
-    })
+    });
+    if let Some(e) = eval_ns {
+        v["eval_duration"] = json!(e);
+    }
+    if let Some(t) = total_ns {
+        v["total_duration"] = json!(t);
+    }
+    v
 }
 
 /// Parse `data: {...}` SSE lines from a byte buffer; returns (events, rest).
@@ -223,33 +271,37 @@ pub fn openai_embeddings_to_ollama(model: &str, openai: &Value) -> Value {
     })
 }
 
-/// /api/generate raw prompt -> /v1/completions body. Returns None when
-/// the request uses templated features (documented divergence: use
-/// /api/chat, which passes the model's own template through --jinja).
-#[must_use]
-pub fn generate_to_openai(req: &Value) -> Option<Value> {
+/// /api/generate raw prompt -> /v1/completions body. `Ok(None)` when the
+/// request uses templated features (documented divergence: use /api/chat,
+/// which passes the model's own template through --jinja). Unknown
+/// sampling options are an `Err` — the generate lane must fail fast
+/// exactly like the chat lane, never silently drop what was asked for.
+pub fn generate_to_openai(req: &Value) -> Result<Option<Value>, String> {
     let templated = ["system", "template", "suffix", "images"]
         .iter()
         .any(|k| req.get(*k).is_some_and(|v| !v.is_null()));
     if templated {
-        return None;
+        return Ok(None);
     }
-    let model = req["model"].as_str()?;
-    let prompt = req["prompt"].as_str()?;
+    let model = req["model"].as_str().ok_or("missing field: model")?;
+    let prompt = req["prompt"].as_str().ok_or("missing field: prompt")?;
     let mut out = json!({"model": model, "prompt": prompt});
     if let Some(stream) = req["stream"].as_bool() {
         out["stream"] = json!(stream);
     }
     if let Some(opts) = req.get("options").filter(|o| o.is_object()) {
-        let _ = apply_ollama_options(&mut out, opts);
+        let unknown = apply_ollama_options(&mut out, opts);
+        if !unknown.is_empty() {
+            return Err(format!("unsupported options: {}", unknown.join(", ")));
+        }
     }
-    Some(out)
+    Ok(Some(out))
 }
 
 /// `OpenAI` completion response -> ollama `GenerateResponse`.
 #[must_use]
 pub fn openai_completion_to_ollama(model: &str, openai: &Value) -> Value {
-    json!({
+    let mut v = json!({
         "model": model,
         "created_at": iso_now(),
         "response": openai["choices"][0]["text"].clone(),
@@ -257,7 +309,9 @@ pub fn openai_completion_to_ollama(model: &str, openai: &Value) -> Value {
         "done_reason": openai["choices"][0]["finish_reason"].clone(),
         "prompt_eval_count": openai["usage"]["prompt_tokens"].clone(),
         "eval_count": openai["usage"]["completion_tokens"].clone(),
-    })
+    });
+    merge_timing_fields(&mut v, openai);
+    v
 }
 
 fn iso_now() -> String {
@@ -399,20 +453,68 @@ mod tests {
     #[test]
     fn unit__generate_raw_and_templated() {
         let raw = json!({"model": "m", "prompt": "say x", "stream": false});
-        let oai = generate_to_openai(&raw).unwrap();
+        let oai = generate_to_openai(&raw).unwrap().unwrap();
         assert_eq!(oai["prompt"], "say x");
         let templated = json!({"model": "m", "prompt": "x", "system": "you are y"});
-        assert!(generate_to_openai(&templated).is_none());
+        assert!(generate_to_openai(&templated).unwrap().is_none());
         let with_images = json!({"model": "m", "prompt": "x", "images": [""]});
-        assert!(generate_to_openai(&with_images).is_none());
+        assert!(generate_to_openai(&with_images).unwrap().is_none());
+    }
+
+    #[test]
+    fn unit__generate_unknown_option__fails_fast() {
+        let bad = json!({"model": "m", "prompt": "x", "options": {"num_batch": 512}});
+        let err = generate_to_openai(&bad).unwrap_err();
+        assert!(
+            err.contains("num_batch"),
+            "error names the unknown option: {err}"
+        );
+        // Supported options still pass through untouched.
+        let ok = json!({"model": "m", "prompt": "x", "options": {"temperature": 0.7, "seed": 42}});
+        let oai = generate_to_openai(&ok).unwrap().unwrap();
+        assert_eq!(oai["temperature"], 0.7);
+        assert_eq!(oai["seed"], 42);
     }
 
     #[test]
     fn unit__ollama_final_chunk__usage_optional() {
-        let c = ollama_final_chunk("m", None, Some("length"));
+        let c = ollama_final_chunk("m", None, Some("length"), None, None);
         assert_eq!(c["done"], true);
         assert_eq!(c["done_reason"], "length");
         assert_eq!(c["eval_count"], 0);
+        assert_eq!(c["total_duration"], 0);
+        // Measured stream timings ride the final line.
+        let timed = ollama_final_chunk("m", None, None, Some(1_500_000), Some(2_500_000));
+        assert_eq!(timed["eval_duration"], 1_500_000);
+        assert_eq!(timed["total_duration"], 2_500_000);
+    }
+
+    #[test]
+    fn unit__durations_from_child_timings() {
+        // ollama parity: t/s displays read eval_duration/prompt_eval_duration.
+        let openai = json!({
+            "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+            "timings": {"prompt_ms": 100.5, "predicted_ms": 200.25}
+        });
+        let c = openai_chat_to_ollama("m", &openai);
+        assert_eq!(c["eval_count"], 2);
+        assert_eq!(c["prompt_eval_duration"], 100_500_000);
+        assert_eq!(c["eval_duration"], 200_250_000);
+        assert_eq!(c["total_duration"], 300_750_000);
+        let g = openai_completion_to_ollama("m", &openai);
+        assert_eq!(g["eval_duration"], 200_250_000);
+        assert_eq!(g["total_duration"], 300_750_000);
+        // No timings: keys stay absent, total stays the legacy 0.
+        let bare = openai_chat_to_ollama(
+            "m",
+            &json!({
+                "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            }),
+        );
+        assert!(bare.get("eval_duration").is_none());
+        assert_eq!(bare["total_duration"], 0);
     }
 
     #[test]
