@@ -523,12 +523,16 @@ pub async fn events(State(state): State<Arc<AppState>>) -> Response {
 
 fn event_kind(e: &pallama_runtime::PallamaEvent) -> &'static str {
     use pallama_runtime::PallamaEvent::{
-        BenchmarkDone, EngineRemoved, EngineUpdated, InstanceStateChanged, ModelPulled,
-        ModelRemoved, PullFailed, PullProgress, QueueDepth,
+        BenchmarkDone, EngineRemoved, EngineRolledBack, EngineUpdated, InstanceStateChanged,
+        ModelPreloaded, ModelPulled, ModelRemoved, PullFailed, PullProgress, QueueDepth,
+        SlotsAutoAdopted,
     };
     match e {
         EngineUpdated { .. } => "engine_updated",
         EngineRemoved { .. } => "engine_removed",
+        EngineRolledBack { .. } => "engine_rolled_back",
+        ModelPreloaded { .. } => "model_preloaded",
+        SlotsAutoAdopted { .. } => "slots_auto_adopted",
         ModelPulled { .. } => "model_pulled",
         ModelRemoved { .. } => "model_removed",
         PullProgress { .. } => "pull_progress",
@@ -1398,6 +1402,31 @@ pub async fn session_list(
 }
 
 /// GET /metrics — merged children prometheus text + pallama_* gauges.
+/// Emit a poller-fed gauge iff it has been measured at least once.
+fn hint_gauge(out: &mut String, rate: Option<f64>, name: &str, help: &str) {
+    if let Some(rate) = rate {
+        let _ = write!(
+            out,
+            "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {rate}\n"
+        );
+    }
+}
+
+/// Active engine build gauge; absent when the store is not readable.
+fn engine_build_gauge(state: &AppState, out: &mut String) {
+    if let Ok(store) = Store::open(&state.dirs) {
+        if let Ok(Some(engine)) = store.active_engine() {
+            if let Ok(m) = serde_json::from_str::<pallama_runtime::Manifest>(&engine.manifest) {
+                let _ = write!(
+                    out,
+                    "# HELP pallama_engine_build Active engine build number\n# TYPE pallama_engine_build gauge\npallama_engine_build {}\n",
+                    m.build_number
+                );
+            }
+        }
+    }
+}
+
 pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     let mut merged = String::new();
     for p in state.sup.ps() {
@@ -1475,23 +1504,21 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     );
     // Measured prompt-cache hit rate (A16): drives the adaptive
     // --cache-ram clamp. Absent until the poller has a full window.
-    if let Some(rate) = state.sup.cache_hint.get() {
-        let _ = write!(
-            merged,
-            "# HELP pallama_prefix_cache_hit_rate Windowed prompt-cache hit rate (cache_n / (cache_n + prompt_n))\n# TYPE pallama_prefix_cache_hit_rate gauge\npallama_prefix_cache_hit_rate {rate}\n"
-        );
-    }
-    if let Ok(store) = Store::open(&state.dirs) {
-        if let Ok(Some(engine)) = store.active_engine() {
-            if let Ok(m) = serde_json::from_str::<pallama_runtime::Manifest>(&engine.manifest) {
-                let _ = write!(
-                    merged,
-                    "# HELP pallama_engine_build Active engine build number\n# TYPE pallama_engine_build gauge\npallama_engine_build {}\n",
-                    m.build_number
-                );
-            }
-        }
-    }
+    hint_gauge(
+        &mut merged,
+        state.sup.cache_hint.get(),
+        "pallama_prefix_cache_hit_rate",
+        "Windowed prompt-cache hit rate (cache_n / (cache_n + prompt_n))",
+    );
+    // Speculative-decoding acceptance (G3): accepted / drafted tokens,
+    // EWMA'd. Absent while no spec-decoding child is live.
+    hint_gauge(
+        &mut merged,
+        state.sup.spec_accept.get(),
+        "pallama_spec_accept_rate",
+        "Windowed speculative-decoding acceptance rate (accepted / drafted tokens)",
+    );
+    engine_build_gauge(&state, &mut merged);
     (
         [(
             axum::http::header::CONTENT_TYPE,

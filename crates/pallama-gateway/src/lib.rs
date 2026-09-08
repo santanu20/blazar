@@ -610,6 +610,17 @@ fn rand_secret() -> String {
     out
 }
 
+/// Last value of a bare Prometheus counter (`name<space>value`) in a
+/// /metrics text body. Labeled lines (`name{...} value`) fail the value
+/// parse and are skipped; `None` when absent (e.g. spec counters on a
+/// dense child).
+fn counter(text: &str, name: &str) -> Option<u64> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix(name).map(str::trim))
+        .filter_map(|v| v.parse::<u64>().ok())
+        .next_back()
+}
+
 /// Serve the gateway until `shutdown` resolves (SIGTERM/SIGINT), then
 /// drain: stop accepting, stop children, exit clean. TLS when
 /// `tls_cert`/`tls_key` are configured, plain HTTP otherwise.
@@ -622,20 +633,24 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     let app = router(state.clone());
     let addr = format!("{host}:{port}");
-    // Prompt-cache hit-rate poller (A16): every 60 s, sum the children's
-    // per-slot `cache_n`/`prompt_n`, compute the window delta rate and
-    // EWMA it into the supervisor's CacheHint — the adaptive --cache-ram
-    // clamp's input. Bounded (2 s) fetches; failures just skip a window.
+    // Prompt-cache hit-rate + spec-accept poller (A16/G3): every 60 s,
+    // sum the children's Prometheus counters, compute the window delta
+    // rate and EWMA it into the supervisor's CacheHints — the adaptive
+    // --cache-ram clamp's input and the spec gauge's source. Bounded
+    // (2 s) fetches; failures just skip a window.
     let hint_task = {
         let state = Arc::clone(&state);
         tokio::spawn(async move {
             let mut prev: (u64, u64) = (0, 0); // (Σ cache_n, Σ prompt_n)
+            let mut prev_spec: (u64, u64) = (0, 0); // (Σ accepted, Σ drafted)
             let mut ewma: Option<f64> = None;
+            let mut ewma_spec: Option<f64> = None;
             let mut interval = tokio::time::interval(std::time::Duration::from_mins(1));
             interval.tick().await; // immediate first tick: skip (empty)
             loop {
                 interval.tick().await;
                 let mut totals = (0u64, 0u64);
+                let mut spec_totals = (0u64, 0u64);
                 for (_, endpoint) in state.sup.live_http_endpoints() {
                     let pallama_core::profile::Endpoint::Tcp { host, port } = endpoint else {
                         continue;
@@ -656,37 +671,53 @@ pub async fn serve(
                     let Ok(text) = resp.text().await else {
                         continue;
                     };
-                    let mut cached: Option<u64> = None;
-                    let mut processed: Option<u64> = None;
-                    for line in text.lines() {
-                        if let Some(v) = line.strip_prefix("llamacpp:prompt_tokens_cached_total") {
-                            cached = v.trim().parse().ok();
-                        } else if let Some(v) = line.strip_prefix("llamacpp:prompt_tokens_total") {
-                            processed = v.trim().parse().ok();
-                        }
-                    }
-                    if let (Some(c), Some(p)) = (cached, processed) {
+                    if let (Some(c), Some(p)) = (
+                        counter(&text, "llamacpp:prompt_tokens_cached_total"),
+                        counter(&text, "llamacpp:prompt_tokens_total"),
+                    ) {
                         totals.0 += c;
                         totals.1 += p;
+                    }
+                    // G3: spec-decoding acceptance (only present when a
+                    // spec pair is live on that child).
+                    if let (Some(a), Some(d)) = (
+                        counter(&text, "llamacpp:spec_decode_num_accepted_tokens_total"),
+                        counter(&text, "llamacpp:spec_decode_num_draft_tokens_total"),
+                    ) {
+                        spec_totals.0 += a;
+                        spec_totals.1 += d;
                     }
                 }
                 let d_cache = totals.0.saturating_sub(prev.0);
                 let d_prompt = totals.1.saturating_sub(prev.1);
                 prev = totals;
                 let denom = d_cache + d_prompt;
-                if denom == 0 {
-                    continue; // idle window: keep the last estimate
+                if denom > 0 {
+                    // Token counts far below 2^52: the precision cast is
+                    // exact for any realistic window.
+                    #[allow(clippy::cast_precision_loss)]
+                    let rate = d_cache as f64 / denom as f64;
+                    ewma = Some(match ewma {
+                        Some(e) => e * 0.7 + rate * 0.3,
+                        None => rate,
+                    });
+                    if let Some(e) = ewma {
+                        state.sup.cache_hint.set(e);
+                    }
                 }
-                // Token counts far below 2^52: the precision cast is
-                // exact for any realistic window.
-                #[allow(clippy::cast_precision_loss)]
-                let rate = d_cache as f64 / denom as f64;
-                ewma = Some(match ewma {
-                    Some(e) => e * 0.7 + rate * 0.3,
-                    None => rate,
-                });
-                if let Some(e) = ewma {
-                    state.sup.cache_hint.set(e);
+                let d_acc = spec_totals.0.saturating_sub(prev_spec.0);
+                let d_draft = spec_totals.1.saturating_sub(prev_spec.1);
+                prev_spec = spec_totals;
+                if d_draft > 0 {
+                    #[allow(clippy::cast_precision_loss)]
+                    let rate = d_acc.min(d_draft) as f64 / d_draft as f64;
+                    ewma_spec = Some(match ewma_spec {
+                        Some(e) => e * 0.7 + rate * 0.3,
+                        None => rate,
+                    });
+                    if let Some(e) = ewma_spec {
+                        state.sup.spec_accept.set(e);
+                    }
                 }
             }
         })
@@ -760,4 +791,28 @@ fn rustls_server_config(
     Ok(rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::counter;
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__counter__last_bare_value_and_labeled_skipped() {
+        let body = "# HELP x y\n# TYPE x counter\n\
+            llamacpp:prompt_tokens_total 10\n\
+            llamacpp:spec_decode_num_accepted_tokens_per_pos_total{position=\"0\"} 1 2\n\
+            llamacpp:prompt_tokens_total 42\n";
+        assert_eq!(counter(body, "llamacpp:prompt_tokens_total"), Some(42));
+        // Labeled histogram lines never match the bare-name lookup.
+        assert_eq!(
+            counter(
+                body,
+                "llamacpp:spec_decode_num_accepted_tokens_per_pos_total"
+            ),
+            None
+        );
+        assert_eq!(counter(body, "llamacpp:missing_total"), None);
+    }
 }
