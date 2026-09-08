@@ -54,6 +54,13 @@ pub struct ProfileInput<'a> {
     /// prefix-heavy traffic earns a bigger cache budget, cache-cold
     /// traffic releases RAM back. None = static 30% clamp.
     pub cache_hit_rate: Option<f64>,
+    /// Auto-picked GPU id (e.g. "Vulkan1") from `--list-devices` free
+    /// memory at spawn time. Only consulted when neither overlay nor
+    /// config set `devices` — manual selection always wins. The same
+    /// pick scopes `hardware` to that single GPU so every downstream
+    /// VRAM estimate (ngl ladder, KV, cache-ram) sizes against the card
+    /// the child will actually land on.
+    pub device_hint: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -212,12 +219,15 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     }
 
     // --- 9. slots: 1 = full-speed single client (default, ollama-parity
-    // UX); config 0 = upstream auto multi-slot for concurrent clients.
+    // UX); 0 = upstream auto multi-slot for concurrent clients. Overlay
+    // slots shadow the global for this model; the supervisor's LC4
+    // adaptive adoption fills in ONLY where the user set nothing.
+    let slots = overlay.slots.unwrap_or(input.config.slots);
     argv.push("-np".into());
-    if input.config.slots == 0 {
+    if slots == 0 {
         argv.push("-1".into());
     } else {
-        argv.push(input.config.slots.to_string());
+        argv.push(slots.to_string());
     }
 
     // --- 10. rpc + loras
@@ -239,10 +249,15 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // lands wrong). Per-model `devices` overlay replaces the global list.
     // Manifest-gated: an old engine without --device is a named error,
     // not a silent drop.
-    let devices = overlay
+    let mut devices = overlay
         .devices
         .clone()
         .unwrap_or_else(|| config.effective_devices(input.model_name).to_vec());
+    if devices.is_empty() {
+        if let Some(hint) = input.device_hint {
+            devices.push(hint.to_string());
+        }
+    }
     if !devices.is_empty() {
         if !input.supported_flags.contains("--device") {
             return Err(format!(
@@ -754,6 +769,17 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     if !config.repack {
         argv.push("--no-repack".into());
     }
+    if !config.cache_idle_slots {
+        argv.push("--no-cache-idle-slots".into());
+    }
+    if let Some(path) = &config.lookup_cache_static {
+        argv.push("--lookup-cache-static".into());
+        argv.push(path.clone());
+    }
+    if let Some(path) = &config.lookup_cache_dynamic {
+        argv.push("--lookup-cache-dynamic".into());
+        argv.push(path.clone());
+    }
     if config.no_host {
         argv.push("--no-host".into());
     }
@@ -925,22 +951,11 @@ fn kv_quant_ladder(
 
 /// f16 KV-cache bytes at `ctx` for this model, when the GGUF carries
 /// enough geometry (shared by the KV ladder and the offload resolver).
+/// Formula lives on `GgufMeta::kv_f16_bytes` (MLA/SWA-aware) so every
+/// caller — ladder, offload resolver, gateway preflight — shares one math.
 #[must_use]
 fn kv_f16_bytes(input: &ProfileInput<'_>, ctx: u32) -> Option<u64> {
-    match (
-        input.gguf.block_count,
-        input.gguf.head_count_kv.or(input.gguf.head_count),
-        input.gguf.derived_head_dim(),
-    ) {
-        (Some(blocks), Some(kv_heads), Some(head_dim)) => Some(
-            2u64.saturating_mul(blocks)
-                .saturating_mul(kv_heads)
-                .saturating_mul(head_dim)
-                .saturating_mul(u64::from(ctx))
-                .saturating_mul(2),
-        ),
-        _ => None,
-    }
+    input.gguf.kv_f16_bytes(u64::from(ctx))
 }
 
 /// Public KV estimate for callers outside the compiler (the supervisor's
@@ -999,18 +1014,24 @@ fn push_spec_args(
 ) -> Result<(), String> {
     match crate::catalog::spec_pair_for(input.model_name) {
         Some(pair) => {
-            let draft = input.draft_path.ok_or_else(|| {
-                format!(
+            if let Some(draft) = input.draft_path {
+                argv.push("--spec-type".into());
+                argv.push(pair.spec_type.clone());
+                argv.push("--spec-draft-model".into());
+                argv.push(draft.to_string());
+                argv.push("--spec-draft-n-max".into());
+                argv.push("3".into());
+            } else {
+                // Always hard-error on an unpulled draft. The engine's
+                // `--spec-draft-hf` auto-download flag exists in b10840+ but
+                // resolves the repo to an empty path and the child exits
+                // fatally (verified live 2026-09-07) — revisit once upstream
+                // fixes draft-side HF resolution.
+                return Err(format!(
                     "spec=auto for {} but the draft model is not pulled; run: pallama pull {}",
                     input.model_name, pair.draft_repo
-                )
-            })?;
-            argv.push("--spec-type".into());
-            argv.push(pair.spec_type.clone());
-            argv.push("--spec-draft-model".into());
-            argv.push(draft.to_string());
-            argv.push("--spec-draft-n-max".into());
-            argv.push("3".into());
+                ));
+            }
         }
         None => warnings.push(format!(
             "spec=auto but no draft pair for {} in the catalog; running dense",
@@ -1226,12 +1247,17 @@ mod tests {
             "--port",
             "--alias",
             "--jinja",
+            "--device",
+            "--lookup-cache-static",
+            "--lookup-cache-dynamic",
             "--metrics",
             "--flash-attn",
             "--ctx-size",
             "--threads",
             "--gpu-layers",
             "--cache-reuse",
+            "--cache-idle-slots",
+            "--no-cache-idle-slots",
             "--kv-unified",
             "--no-kv-unified",
             "--kv-unified-per-slot",
@@ -1294,6 +1320,13 @@ mod tests {
             head_count_kv: Some(8),
             embedding_length: Some(1024),
             head_dim: Some(64),
+            key_length: None,
+            value_length: None,
+            sliding_window: None,
+            sliding_window_per_layer: None,
+            full_attention_interval: None,
+            quantized_by: None,
+            general_version: None,
             pooling_type: None,
             chat_template: None,
         }
@@ -1325,12 +1358,14 @@ mod tests {
             },
             data_dir: "/tmp/pallama-test-data",
             cache_hit_rate: None,
+            device_hint: None,
         }
     }
 
     static ALL_FLAGS: LazyLock<BTreeSet<String>> = LazyLock::new(full_flags);
     static DEFAULT_OVERLAY: ModelOverride = ModelOverride {
         ctx: None,
+        slots: None,
         spec: None,
         loras: None,
         extra_args: None,
@@ -1344,6 +1379,7 @@ mod tests {
         reasoning_budget: None,
         reasoning_effort: None,
         replicas: None,
+        pin: None,
     };
 
     #[test]
@@ -2117,6 +2153,123 @@ mod tests {
     }
 
     #[test]
+    fn unit__cache_idle_slots__opt_out_only() {
+        // Default (true, upstream default): nothing emitted. The knob
+        // exists to disable.
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let p = compile(
+            &input(&g, &hw, &Config::default(), &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(!p.argv.contains(&"--no-cache-idle-slots".to_string()));
+
+        let cfg = Config {
+            cache_idle_slots: false,
+            ..Config::default()
+        };
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p.argv.contains(&"--no-cache-idle-slots".to_string()));
+    }
+
+    #[test]
+    fn unit__device_hint__auto_pick_and_manual_wins() {
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        // Auto pick lands on the hinted card.
+        let cfg0 = Config::default();
+        let mut i = input(&g, &hw, &cfg0, &ALL_FLAGS);
+        i.device_hint = Some("Vulkan1");
+        let p = compile(&i, &TuningOverrides::default()).unwrap();
+        let idx = p.argv.iter().position(|a| a == "--device").unwrap();
+        assert_eq!(p.argv[idx + 1], "Vulkan1");
+
+        // Manual `devices` always beats the hint.
+        let cfg = Config {
+            devices: vec!["ManualGPU".to_string()],
+            ..Config::default()
+        };
+        let mut i = input(&g, &hw, &cfg, &ALL_FLAGS);
+        i.device_hint = Some("Vulkan1");
+        let p = compile(&i, &TuningOverrides::default()).unwrap();
+        assert!(p.argv.windows(2).any(|w| w == ["--device", "ManualGPU"]));
+        assert!(!p.argv.windows(2).any(|w| w == ["--device", "Vulkan1"]));
+    }
+
+    #[test]
+    fn unit__slots__overlay_shadows_global() {
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let ov = ModelOverride {
+            slots: Some(3),
+            ..Default::default()
+        };
+        let cfg0 = Config::default();
+        let mut i = input(&g, &hw, &cfg0, &ALL_FLAGS);
+        i.overlay = &ov;
+        let p = compile(&i, &TuningOverrides::default()).unwrap();
+        assert!(p.argv.windows(2).any(|w| w == ["-np", "3"]));
+        // No hint, no overlay: global default (1) still rules.
+        let p = compile(
+            &input(&g, &hw, &Config::default(), &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p.argv.windows(2).any(|w| w == ["-np", "1"]));
+    }
+
+    #[test]
+    fn unit__lookup_cache__emits_both_paths() {
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let cfg = Config {
+            lookup_cache_static: Some("/tmp/lc-static.bin".to_string()),
+            lookup_cache_dynamic: Some("/tmp/lc-dynamic.bin".to_string()),
+            ..Config::default()
+        };
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w == ["--lookup-cache-static", "/tmp/lc-static.bin"]));
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w == ["--lookup-cache-dynamic", "/tmp/lc-dynamic.bin"]));
+    }
+
+    #[test]
+    fn unit__spec_auto__draft_missing__hard_error_even_on_new_engines() {
+        // Live evidence (b10840): `--spec-draft-hf` resolves the repo to an
+        // empty draft path and the child exits fatally, so an unpulled draft
+        // must hard-error with the pull hint regardless of manifest flags.
+        let cfg = Config {
+            spec: "auto".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let mut flags = ALL_FLAGS.clone();
+        flags.insert("--spec-draft-hf".to_string());
+        let mut inp = input(&g, &hw, &cfg, &flags);
+        inp.model_name = "qwen3-8b"; // catalog pair, draft NOT pulled
+        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+        assert!(
+            err.contains("pallama pull ggml-org/Qwen3-0.6B-GGUF:Q4_0"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn unit__spec_auto__no_pair_for_model__dense_with_warning() {
         let cfg = Config {
             spec: "auto".into(),
@@ -2333,6 +2486,7 @@ mod tests {
             "--threads-http",
             "--no-warmup",
             "--no-repack",
+            "--no-cache-idle-slots",
             "--no-host",
             "--op-offload",
             "--no-op-offload",
@@ -2363,6 +2517,7 @@ mod tests {
             "--spec-draft-ngl",
             "--no-warmup",
             "--no-repack",
+            "--no-cache-idle-slots",
             "--yarn-orig-ctx",
             "--override-kv",
             "--control-vector",

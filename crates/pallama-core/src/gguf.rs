@@ -27,6 +27,30 @@ pub struct GgufMeta {
     /// Explicit `{arch}.head_dim` when present; else derived by
     /// `derived_head_dim()`.
     pub head_dim: Option<u64>,
+    /// Per-head K width (`{arch}.attention.key_length`). MLA-class models
+    /// (`DeepSeek`, `Qwen3.5`) carry a latent width that differs from
+    /// `head_dim`; the loader allocates from THIS, so KV math uses it as
+    /// the K width (upper bound — absorbed/FA paths allocate less).
+    pub key_length: Option<u64>,
+    /// Per-head V width (`{arch}.attention.value_length`); see `key_length`.
+    pub value_length: Option<u64>,
+    /// Scalar `{arch}.attention.sliding_window` — uniform SWA window in
+    /// tokens. Alone it proves nothing about WHICH layers are windowed
+    /// (gemma-2 alternates windowed/full layers with no metadata trace),
+    /// so it only shrinks the KV estimate when paired with
+    /// `full_attention_interval` or a per-layer array.
+    pub sliding_window: Option<u64>,
+    /// Per-layer `{arch}.attention.sliding_window` array (0 = that layer is
+    /// full attention). Fully explicit, so it alone is provable.
+    pub sliding_window_per_layer: Option<Vec<u64>>,
+    /// `{arch}.full_attention_interval` — every Nth layer attends over the
+    /// full context, the rest over the sliding window (Qwen3.5-9B ships 4).
+    pub full_attention_interval: Option<u64>,
+    /// `general.quantized_by` — quantizer identity (e.g. "Unsloth");
+    /// consumed by the known-bad-quantizer lint.
+    pub quantized_by: Option<String>,
+    /// `general.version` — upstream version string.
+    pub general_version: Option<String>,
     /// `{arch}.pooling_type` — present only on embedding-class models
     /// (bert/nomic-bert/...). Drives the `--embeddings` profile rule so
     /// `/v1/embeddings` works without manual flags.
@@ -49,6 +73,86 @@ impl GgufMeta {
             (Some(len), Some(head)) if head > 0 && len % head == 0 => Some(len / head),
             _ => None,
         }
+    }
+
+    /// Sum over layers of each layer's KV token capacity for a serving
+    /// context of `ctx` tokens. `None` = geometry ambiguous — the caller
+    /// must fall back to whole-context math for EVERY layer. Never guesses
+    /// LOW: an underestimated cache OOMs at runtime, an overestimated one
+    /// only costs headroom.
+    ///
+    /// Provable shapes only: a per-layer array covering every block, or a
+    /// scalar window paired with `full_attention_interval`. A scalar window
+    /// alone is NOT enough — gemma-2 alternates windowed/full layers with
+    /// no metadata trace — and an interval without a window (Qwen3.5 GGUFs
+    /// omit the size) leaves the windowed width unknown.
+    #[must_use]
+    pub fn swa_token_sum(&self, ctx: u64) -> Option<u64> {
+        let blocks = self.block_count?;
+        let layer_tokens = |window: u64| {
+            if window == 0 {
+                ctx
+            } else {
+                window.min(ctx)
+            }
+        };
+        if let Some(per_layer) = &self.sliding_window_per_layer {
+            if per_layer.len() as u64 == blocks {
+                return Some(per_layer.iter().map(|w| layer_tokens(*w)).sum());
+            }
+            // Array shorter/longer than the layer count: ambiguous.
+            return None;
+        }
+        match (self.sliding_window, self.full_attention_interval) {
+            (Some(window), Some(interval)) if interval > 0 => {
+                let full_layers = blocks.div_ceil(interval);
+                Some(full_layers * ctx + (blocks - full_layers) * layer_tokens(window))
+            }
+            _ => None,
+        }
+    }
+
+    /// f16 KV-cache bytes at `ctx`: per-head widths from explicit
+    /// `key_length`/`value_length` (MLA latents — the loader allocates from
+    /// these; upper bound, since absorbed/FA paths allocate less), else the
+    /// classic `head_dim`. Layer token capacity from `swa_token_sum` when
+    /// the SWA shape is provable, else whole-context for every layer.
+    /// `None` when the GGUF lacks the geometry — callers skip-with-warning,
+    /// never estimate.
+    #[must_use]
+    pub fn kv_f16_bytes(&self, ctx: u64) -> Option<u64> {
+        let blocks = self.block_count?;
+        let kv_heads = self.head_count_kv.or(self.head_count)?;
+        let head_dim = self.derived_head_dim()?;
+        let k_len = self.key_length.unwrap_or(head_dim);
+        let v_len = self.value_length.unwrap_or(head_dim);
+        let per_token = kv_heads * (k_len + v_len) * 2; // K + V, f16 = 2 B/elem
+        let tokens = self.swa_token_sum(ctx).unwrap_or(blocks * ctx);
+        Some(per_token.saturating_mul(tokens))
+    }
+
+    /// Structural metadata lint (H4): verifiable completeness warnings only.
+    /// These explain WHY downstream sizing (pallama fit, cache-ram math,
+    /// coresidency) degrades — they never guess at producer quality, which
+    /// cannot be verified from the file alone. Warn-level by contract;
+    /// callers must never block on a finding.
+    #[must_use]
+    pub fn lint(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.context_length.is_none() {
+            out.push("context_length missing — context sizing falls back to engine defaults");
+        }
+        if self.kv_f16_bytes(4096).is_none() {
+            out.push(
+                "attention geometry incomplete — KV/VRAM estimates are disabled (fit, cache-ram, coresidency run blind)",
+            );
+        }
+        if let (Some(blocks), Some(windows)) = (self.block_count, &self.sliding_window_per_layer) {
+            if windows.len() != usize::try_from(blocks).unwrap_or(usize::MAX) {
+                out.push("sliding_window array length != block_count — SWA KV savings ignored");
+            }
+        }
+        out
     }
 }
 
@@ -265,6 +369,26 @@ pub fn parse_metadata(buf: &[u8]) -> CoreResult<(GgufMeta, usize)> {
             .find(|(k, _)| *k == field)
             .and_then(|(_, v)| v.as_u64())
     };
+    // Real GGUFs ship attention geometry under `{arch}.attention.*`
+    // (verified against Qwen2.5 + Qwen3.5 files); the bare `{arch}.*`
+    // spellings stay as legacy fallback so old fixtures keep parsing.
+    let att = |field: &str| -> Option<u64> {
+        get(format!("{arch}.attention.{field}")).or_else(|| get(format!("{arch}.{field}")))
+    };
+    let find = |field: String| -> Option<&GgufValue> {
+        kvs.iter().find(|(k, _)| *k == field).map(|(_, v)| v)
+    };
+    let sliding_window_per_layer = find(format!("{arch}.attention.sliding_window"))
+        .and_then(|v| match v {
+            GgufValue::Array(items) => Some(
+                items
+                    .iter()
+                    .filter_map(GgufValue::as_u64)
+                    .collect::<Vec<u64>>(),
+            ),
+            _ => None,
+        })
+        .filter(|items| !items.is_empty());
 
     let meta = GgufMeta {
         name: kvs
@@ -272,15 +396,34 @@ pub fn parse_metadata(buf: &[u8]) -> CoreResult<(GgufMeta, usize)> {
             .find(|(k, _)| k == "general.name")
             .and_then(|(_, v)| v.as_str())
             .map(str::to_string),
+        quantized_by: kvs
+            .iter()
+            .find(|(k, _)| k == "general.quantized_by")
+            .and_then(|(_, v)| v.as_str())
+            .map(str::to_string),
+        general_version: kvs
+            .iter()
+            .find(|(k, _)| k == "general.version")
+            .and_then(|(_, v)| v.as_str())
+            .map(str::to_string),
         block_count: get(format!("{arch}.block_count")),
         context_length: get(format!("{arch}.context_length")),
         expert_count: get(format!("{arch}.expert_count")),
-        head_count: get(format!("{arch}.head_count")),
-        head_dim: get(format!("{arch}.head_dim")),
+        head_count: att("head_count"),
+        head_dim: att("head_dim"),
         pooling_type: get(format!("{arch}.pooling_type"))
             .or_else(|| get("*.pooling_type".to_string())),
-        head_count_kv: get(format!("{arch}.head_count_kv")),
+        head_count_kv: att("head_count_kv"),
         embedding_length: get(format!("{arch}.embedding_length")),
+        key_length: att("key_length"),
+        value_length: att("value_length"),
+        sliding_window: if sliding_window_per_layer.is_some() {
+            None
+        } else {
+            att("sliding_window")
+        },
+        sliding_window_per_layer,
+        full_attention_interval: get(format!("{arch}.full_attention_interval")),
         chat_template: extract_chat_template(&kvs),
         architecture: arch,
     };
@@ -442,6 +585,8 @@ mod tests {
         }
     }
 
+    /// Real-shape fixture: attention geometry under `{arch}.attention.*`,
+    /// mirroring actual Qwen2.5/Qwen3.5 GGUF files on disk.
     fn qwen_like() -> Vec<(&'static str, GgufValue)> {
         vec![
             ("general.architecture", GgufValue::String("qwen3".into())),
@@ -449,9 +594,27 @@ mod tests {
             ("qwen3.block_count", GgufValue::U32(28)),
             ("qwen3.context_length", GgufValue::U32(40960)),
             ("qwen3.expert_count", GgufValue::U32(128)),
-            ("qwen3.head_count", GgufValue::U32(16)),
-            ("qwen3.head_count_kv", GgufValue::U32(8)),
+            ("qwen3.attention.head_count", GgufValue::U32(16)),
+            ("qwen3.attention.head_count_kv", GgufValue::U32(8)),
             ("qwen3.embedding_length", GgufValue::U32(1024)),
+        ]
+    }
+
+    /// Qwen3.5-9B geometry (read from the real file): MLA latents + a
+    /// full-attention interval with NO sliding-window size in metadata.
+    fn qwen35_mla() -> Vec<(&'static str, GgufValue)> {
+        vec![
+            ("general.architecture", GgufValue::String("qwen35".into())),
+            ("general.name", GgufValue::String("Qwen3.5-9B".into())),
+            ("general.quantized_by", GgufValue::String("Unsloth".into())),
+            ("qwen35.block_count", GgufValue::U32(32)),
+            ("qwen35.context_length", GgufValue::U32(262_144)),
+            ("qwen35.embedding_length", GgufValue::U32(4096)),
+            ("qwen35.attention.head_count", GgufValue::U32(16)),
+            ("qwen35.attention.head_count_kv", GgufValue::U32(4)),
+            ("qwen35.attention.key_length", GgufValue::U32(256)),
+            ("qwen35.attention.value_length", GgufValue::U32(256)),
+            ("qwen35.full_attention_interval", GgufValue::U32(4)),
         ]
     }
 
@@ -475,6 +638,198 @@ mod tests {
         let (meta, _) = parse_metadata(&build_gguf(&qwen_like())).unwrap();
         assert_eq!(meta.head_dim, None);
         assert_eq!(meta.derived_head_dim(), Some(64)); // 1024 / 16
+    }
+
+    #[test]
+    fn unit__gguf_legacy_bare_attention_keys__still_parsed() {
+        // Old-fixture spelling: bare `{arch}.head_count[_kv]` keeps parsing.
+        let kvs = vec![
+            ("general.architecture", GgufValue::String("llama".into())),
+            ("llama.block_count", GgufValue::U32(32)),
+            ("llama.head_count", GgufValue::U32(32)),
+            ("llama.head_count_kv", GgufValue::U32(8)),
+        ];
+        let (meta, _) = parse_metadata(&build_gguf(&kvs)).unwrap();
+        assert_eq!(meta.head_count, Some(32));
+        assert_eq!(meta.head_count_kv, Some(8));
+    }
+
+    #[test]
+    fn unit__gguf_mla_geometry__parsed_real_qwen35_shape() {
+        let (meta, _) = parse_metadata(&build_gguf(&qwen35_mla())).unwrap();
+        assert_eq!(meta.head_count, Some(16));
+        assert_eq!(meta.head_count_kv, Some(4));
+        assert_eq!(meta.key_length, Some(256));
+        assert_eq!(meta.value_length, Some(256));
+        assert_eq!(meta.full_attention_interval, Some(4));
+        assert_eq!(meta.quantized_by.as_deref(), Some("Unsloth"));
+        assert_eq!(meta.sliding_window, None);
+        assert_eq!(meta.sliding_window_per_layer, None);
+        // Interval present but window size absent (real Qwen3.5 files):
+        // ambiguous → caller falls back to whole-context math.
+        assert_eq!(meta.swa_token_sum(4096), None);
+    }
+
+    #[test]
+    fn unit__gguf_swa_token_sum__scalar_window_needs_interval() {
+        let mut meta = GgufMeta {
+            block_count: Some(32),
+            sliding_window: Some(512),
+            ..GgufMeta::default()
+        };
+        // Scalar window alone proves nothing (gemma-2 alternates without
+        // metadata): whole-context fallback.
+        assert_eq!(meta.swa_token_sum(4096), None);
+        meta.full_attention_interval = Some(4);
+        // 8 full layers × 4096 + 24 windowed × 512.
+        assert_eq!(meta.swa_token_sum(4096), Some(8 * 4096 + 24 * 512));
+        // Window larger than ctx clamps to ctx.
+        meta.sliding_window = Some(8192);
+        assert_eq!(meta.swa_token_sum(4096), Some(32 * 4096));
+    }
+
+    #[test]
+    fn unit__gguf_swa_token_sum__per_layer_array_elementwise() {
+        let meta = GgufMeta {
+            block_count: Some(4),
+            sliding_window_per_layer: Some(vec![0, 512, 0, 512]),
+            ..GgufMeta::default()
+        };
+        // 0 = full-attention layer; 512 windowed; elementwise sum.
+        assert_eq!(meta.swa_token_sum(4096), Some(2 * 4096 + 2 * 512));
+    }
+
+    #[test]
+    fn unit__gguf_swa_token_sum__array_length_mismatch_is_ambiguous() {
+        let meta = GgufMeta {
+            block_count: Some(8),
+            sliding_window_per_layer: Some(vec![512; 4]),
+            ..GgufMeta::default()
+        };
+        assert_eq!(meta.swa_token_sum(4096), None);
+    }
+
+    #[test]
+    fn unit__gguf_swa_token_sum__per_layer_array_parsed_from_file() {
+        let kvs = vec![
+            ("general.architecture", GgufValue::String("gemma2".into())),
+            ("gemma2.block_count", GgufValue::U32(3)),
+            (
+                "gemma2.attention.sliding_window",
+                GgufValue::Array(vec![
+                    GgufValue::U32(512),
+                    GgufValue::U32(0),
+                    GgufValue::U32(512),
+                ]),
+            ),
+        ];
+        let (meta, _) = parse_metadata(&build_gguf(&kvs)).unwrap();
+        assert_eq!(
+            meta.sliding_window, None,
+            "array shape must not fake scalar"
+        );
+        assert_eq!(meta.sliding_window_per_layer, Some(vec![512, 0, 512]));
+        assert_eq!(meta.swa_token_sum(4096), Some(2 * 512 + 4096));
+    }
+
+    #[test]
+    fn unit__kv_f16_bytes__classic_shape_matches_legacy_formula() {
+        // No MLA widths, no SWA: 2 * blocks * kv_heads * head_dim * ctx * 2.
+        let meta = GgufMeta {
+            block_count: Some(32),
+            head_count: Some(32),
+            head_count_kv: Some(8),
+            embedding_length: Some(4096),
+            ..GgufMeta::default()
+        };
+        assert_eq!(
+            meta.kv_f16_bytes(32_768),
+            Some(2 * 32 * 8 * 128 * 32_768 * 2)
+        );
+    }
+
+    #[test]
+    fn unit__kv_f16_bytes__mla_latent_widths_override_head_dim() {
+        // DeepSeek2-flavored: kv_heads=1, explicit K/V latents wider and
+        // narrower than the derived head_dim — both are loader truth.
+        let meta = GgufMeta {
+            block_count: Some(2),
+            head_count: Some(16),
+            head_count_kv: Some(1),
+            embedding_length: Some(4096), // derived head_dim = 256
+            key_length: Some(576),
+            value_length: Some(512),
+            ..GgufMeta::default()
+        };
+        // per-token = 1 * (576 + 512) * 2 = 2176; tokens = 2 * 1024.
+        assert_eq!(meta.kv_f16_bytes(1024), Some(2176 * 2048));
+    }
+
+    #[test]
+    fn unit__kv_f16_bytes__hybrid_swa_shrinks_cache_provably() {
+        let meta = GgufMeta {
+            block_count: Some(32),
+            head_count: Some(16),
+            head_count_kv: Some(4),
+            embedding_length: Some(4096), // derived head_dim = 256
+            sliding_window: Some(512),
+            full_attention_interval: Some(4),
+            ..GgufMeta::default()
+        };
+        // tokens = 8*4096 + 24*512 = 45056; per-token = 4*(256+256)*2 = 4096.
+        assert_eq!(meta.kv_f16_bytes(4096), Some(4096 * 45_056));
+        // Sanity vs whole-ctx: strictly smaller.
+        assert!(meta.kv_f16_bytes(4096).unwrap() < 4096 * 32 * 4096);
+    }
+
+    #[test]
+    fn unit__kv_f16_bytes__missing_geometry_is_none() {
+        assert_eq!(GgufMeta::default().kv_f16_bytes(4096), None);
+        let no_dim = GgufMeta {
+            block_count: Some(32),
+            head_count_kv: Some(8),
+            ..GgufMeta::default()
+        };
+        assert_eq!(no_dim.kv_f16_bytes(4096), None);
+    }
+
+    #[test]
+    fn unit__lint__complete_geometry_is_silent() {
+        let meta = GgufMeta {
+            block_count: Some(32),
+            context_length: Some(32_768),
+            head_count: Some(32),
+            head_count_kv: Some(8),
+            embedding_length: Some(4096),
+            ..GgufMeta::default()
+        };
+        assert!(meta.lint().is_empty());
+    }
+
+    #[test]
+    fn unit__lint__missing_ctx_and_geometry_each_warn_once() {
+        let empty = GgufMeta::default();
+        let findings = empty.lint();
+        assert_eq!(findings.len(), 2);
+        assert!(findings[0].contains("context_length missing"));
+        assert!(findings[1].contains("KV/VRAM estimates are disabled"));
+    }
+
+    #[test]
+    fn unit__lint__swa_array_length_mismatch_warns() {
+        let meta = GgufMeta {
+            block_count: Some(4),
+            context_length: Some(4096),
+            head_count: Some(16),
+            head_count_kv: Some(4),
+            embedding_length: Some(4096),
+            // 3 windows for 4 blocks: malformed — provable warning.
+            sliding_window_per_layer: Some(vec![512, 0, 512]),
+            ..GgufMeta::default()
+        };
+        let findings = meta.lint();
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].contains("SWA KV savings ignored"));
     }
 
     #[test]

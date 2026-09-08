@@ -21,7 +21,7 @@ pub struct CatalogEntry {
 /// match on registry name) use `draft_repo` via `--spec-type draft-simple`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SpecPair {
-    /// Prefix matched against the resolved model name, e.g. "qwen3".
+    /// Prefix matched against the resolved model name, e.g. "qwen3-".
     pub model_prefix: String,
     /// llama-server spec type from the manifest's supported set.
     pub spec_type: String,

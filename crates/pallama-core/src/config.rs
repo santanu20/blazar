@@ -374,6 +374,31 @@ pub struct Config {
     /// Weight repacking for CPU/GPU layout (upstream default true).
     #[serde(default = "default_true")]
     pub repack: bool,
+    /// Save idle slots to the prompt cache on new tasks (upstream
+    /// default true; requires --cache-ram, which Pallama sets). Disable
+    /// to keep idle slots from consuming prompt-cache budget.
+    #[serde(default = "default_true")]
+    pub cache_idle_slots: bool,
+    /// Read-only static prompt-cache file for --lookup-cache-static
+    /// (e.g. a system prompt pre-baked with `llama-lookup-save/merge`).
+    /// The engine loads it but never updates it.
+    #[serde(default)]
+    pub lookup_cache_static: Option<String>,
+    /// Writable prompt-cache file for --lookup-cache-dynamic; the
+    /// engine updates it as generation runs. Both must exist on disk.
+    #[serde(default)]
+    pub lookup_cache_dynamic: Option<String>,
+    /// Predictive pre-loading (LC1): track which model tends to follow
+    /// which and pre-spawn the likely next model while the current one
+    /// idles, so the switch is warm instead of a cold start. Off by
+    /// default — it deliberately spends RAM/VRAM ahead of demand.
+    #[serde(default)]
+    pub predictive_preload: bool,
+    /// Adaptive slots (LC4): when a single-slot model sustains
+    /// concurrent load for ~60s, adopt slots+1 (in-memory, capped at 4;
+    /// `tune --slots` remains the permanent path). Off by default.
+    #[serde(default)]
+    pub adaptive_slots: bool,
     /// Bypass host buffer for extra VRAM (upstream default false).
     #[serde(default)]
     pub no_host: bool,
@@ -459,6 +484,9 @@ const REASONING_EFFORT_LEVELS: &[&str] = &["minimal", "low", "medium", "high", "
 #[serde(deny_unknown_fields)]
 pub struct ModelOverride {
     pub ctx: Option<u32>,
+    /// Per-model parallel slots (`-np`); overrides the global `slots`
+    /// for this model only. 0 keeps upstream auto.
+    pub slots: Option<u32>,
     pub spec: Option<String>,
     pub loras: Option<Vec<String>>,
     /// Extra llama-server args, validated against the engine capability
@@ -493,6 +521,12 @@ pub struct ModelOverride {
     /// routing across identical children of the same model.
     #[serde(default)]
     pub replicas: Option<u32>,
+    /// Pin this model's instances against capacity eviction (A13): the
+    /// supervisor's victim filter skips pinned instances entirely. Use
+    /// for always-hot models that must not pay a cold reload; capacity
+    /// pressure falls on unpinned models instead.
+    #[serde(default)]
+    pub pin: Option<bool>,
 }
 
 /// One external OpenAI-compatible server (another pallama, vLLM, MLX
@@ -645,6 +679,11 @@ impl Default for Config {
             threads_http: 0,
             warmup: true,
             repack: true,
+            cache_idle_slots: true,
+            lookup_cache_static: None,
+            lookup_cache_dynamic: None,
+            predictive_preload: false,
+            adaptive_slots: false,
             no_host: false,
             op_offload: None,
             keep_tokens: 0,
@@ -1105,6 +1144,18 @@ impl Config {
     /// One flat check per knob, fail-fast on contradiction.
     #[allow(clippy::too_many_lines)] // flat one-check-per-knob by design
     fn validate_wire_knobs(&self) -> CoreResult<()> {
+        for (field, path) in [
+            ("lookup_cache_static", &self.lookup_cache_static),
+            ("lookup_cache_dynamic", &self.lookup_cache_dynamic),
+        ] {
+            if let Some(p) = path {
+                if !std::path::Path::new(p).is_file() {
+                    return Err(CoreError::Config(format!(
+                        "{field} must point at an existing cache file, got {p:?}"
+                    )));
+                }
+            }
+        }
         if !self.spec_draft_cpu_range.is_empty() && !valid_cpu_range(&self.spec_draft_cpu_range) {
             return Err(CoreError::Config(format!(
                 "spec_draft_cpu_range must be \"lo-hi\" with lo <= hi, got {:?}",
@@ -1522,6 +1573,36 @@ fn valid_override_tensor(s: &str) -> bool {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__lookup_cache__validation_requires_existing_file() {
+        let good = std::env::temp_dir().join("pallama-lc-test.bin");
+        std::fs::write(&good, b"ggml").unwrap();
+        let cfg = Config {
+            lookup_cache_static: Some(good.display().to_string()),
+            lookup_cache_dynamic: Some("/definitely/not/present/lc.bin".to_string()),
+            ..Config::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("lookup_cache_dynamic") && msg.contains("/definitely/not/present/lc.bin"),
+            "error names the field and path: {msg}"
+        );
+        let _ = std::fs::remove_file(&good);
+
+        // Both existing -> validation passes.
+        let d = std::env::temp_dir().join("pallama-lc-test-dyn.bin");
+        std::fs::write(&d, b"ggml").unwrap();
+        let cfg = Config {
+            lookup_cache_static: Some(good.display().to_string()),
+            lookup_cache_dynamic: Some(d.display().to_string()),
+            ..Config::default()
+        };
+        let _ = std::fs::write(&good, b"ggml");
+        assert!(cfg.validate().is_ok());
+        let _ = std::fs::remove_file(&d);
+    }
 
     #[test]
     fn unit__wire_validation__enum_and_range_rejects() {

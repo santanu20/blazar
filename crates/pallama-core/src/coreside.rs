@@ -4,10 +4,15 @@
 //! smallest — a plan, not a scheduler; the supervisor still owns eviction.
 
 /// f16 KV (MiB) for a GGUF at a ctx — shared by the planner and the
-/// gateway's `num_ctx` preflight (2 * K+V * layers * `kv_heads` * `head_dim`
-/// * ctx * 2B, `head_dim` derived from emb/heads when absent).
+/// gateway's `num_ctx` preflight. Geometry-strict when the GGUF carries
+/// attention fields (`GgufMeta::kv_f16_bytes`, MLA/SWA-aware); lossy
+/// defaults (1 layer/head, 128 dim) only for metadata-poor files, keeping
+/// this a coarse co-residency heuristic rather than a hard gate.
 #[must_use]
 pub fn kv_f16_mib(meta: &crate::GgufMeta, ctx: u64) -> u64 {
+    if let Some(bytes) = meta.kv_f16_bytes(ctx) {
+        return bytes / (1024 * 1024);
+    }
     let layers = meta.block_count.unwrap_or(0).max(1);
     let kv_heads = meta
         .head_count_kv
