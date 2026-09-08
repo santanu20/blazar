@@ -23,28 +23,28 @@ RadixAttention in-engine [V027][SGL].
 
 | # | Feature | Status | Lane | Effort | Evidence |
 |---|---|---|---|---|---|
-| A1 | Surface `--kv-unified` / `--no-kv-unified` (single shared KV buffer; upstream default when slots auto) | ❌ | CORE compiler | S | [ARG]1726-1730 |
-| A2 | Surface `--kv-unified-per-slot N` | ❌ | CORE | S | [ARG]1652 |
-| A3 | Surface `--swa-full` + `--ctx-checkpoints N` | ❌ | CORE | S | [ARG]1692-1700 |
-| A4 | Surface `--no-kv-offload`, `--load-mode`/direct-io knobs | ❌ | CORE | S | [ARG]876-884, 2417 |
-| A5 | Emit `--kv-unified` automatically when slots>1 + engine supports | ❌ | CORE | S | [ARG]+DWIKI unified default |
+| A1 | Surface `--kv-unified` / `--no-kv-unified` (single shared KV buffer; upstream default when slots auto) | ✅ | CORE compiler | S | [ARG]1726-1730 — shipped: kv_unified knob (wire-wave) |
+| A2 | Surface `--kv-unified-per-slot N` | ✅ | CORE | S | [ARG]1652 — shipped: kv_unified_per_slot |
+| A3 | Surface `--swa-full` + `--ctx-checkpoints N` | ✅ | CORE | S | [ARG]1692-1700 — shipped: swa_full + ctx_checkpoints knobs |
+| A4 | Surface `--no-kv-offload`, `--load-mode`/direct-io knobs | ✅ | CORE | S | [ARG]876-884, 2417 — shipped: no_kv_offload (load-mode absent upstream) |
+| A5 | Emit `--kv-unified` automatically when slots>1 + engine supports | ✅ | CORE | S | [ARG]+DWIKI unified default — shipped: --kv-unified default-on emission |
 | A6 | KV quant ladder (auto q8→q4 by capacity math) | ✅ | CORE | — | have (profile.rs) |
-| A7 | `tune --search` axis: cache-reuse {0,128,256,512} measured | ❌ | SUP | S | HiCache hit-ratio tuning analog [HICACHE] |
+| A7 | `tune --search` axis: cache-reuse {0,128,256,512} measured | ✅ | SUP | S | HiCache hit-ratio tuning analog [HICACHE] — shipped: tune --cache-reuse {0,256,512} grid, noise-floored adoption |
 | A8 | **Prefix-hash sticky routing** — RadixAttention-lite at the gateway (B1): hash first N tokens, route to the instance whose cache holds it | ✅ | GW | — | shipped 2026-09-07 (`replicas` overlay + prefix affinity; live-validated sticky warm 172/120 ms) |
 | A9 | Cache-hit tokens per request surfaced (usage.pallama_cache_hit_tokens from child /slots) | ❌ | GW | S | [HICACHE] hit metrics |
 | A10 | Session KV checkpoints save/restore/erase | ✅ | SUP | — | have (34.6/14.5 ms measured) |
-| A11 | Auto-checkpoint on idle (save slot state without user asking) | ❌ | SUP | S | extends A10; [LMC] write-back idea |
-| A12 | Checkpoint write policy knob (on-idle / every-turn write-through) | ❌ | SUP | S | [HICACHE] write_back/write_through analog |
-| A13 | Hot-prefix pinning: never-evict list for known system prompts | ❌ | GW | M | [DYN] hot-tier concept |
-| A14 | Post-load warmup replay: re-issue last-N hot prompts after load | ❌ | GW | M | TTFT meta-cache analog [O33] |
+| A11 | Auto-checkpoint on idle (save slot state without user asking) | ✅ | SUP | S | extends A10; [LMC] write-back idea — shipped: session_bank bank_save on evict + ctx-checkpoints knob |
+| A12 | Checkpoint write policy knob (on-idle / every-turn write-through) | 🟡 | SUP | S | [HICACHE] write_back/write_through analog — cut (adversarial): evict-banking + cache_idle_slots knob cover the need |
+| A13 | Hot-prefix pinning: never-evict list for known system prompts | ✅ | GW | M | [DYN] hot-tier concept — shipped: overlay pin=true skips capacity victim filter |
+| A14 | Post-load warmup replay: re-issue last-N hot prompts after load | ✅ | GW | M | TTFT meta-cache analog [O33] — shipped: bank_restore post-spawn warm replay |
 | A15 | KV budget planner: multi-model co-residency math incl unified-KV sizing | ✅ | CORE | S | 2026-09-07: kv_est_bytes in Profile + supervisor co-residency check downgrades candidate KV to q8_0 pre-spawn |
 | A16 | Adaptive cache-ram clamp by measured hit rate | ✅ | SUP | S | 2026-09-07: child /metrics poller -> EWMA -> CacheHint -> 20/30/40% clamp; pallama_prefix_cache_hit_rate gauge |
 | A17 | L3 disk KV offload | UP | UP | — | upstream lane ([V027] multi-tier; [MOON] SSD offload exist elsewhere) |
-| A18 | Prefetch-policy semantics on session restore (best-effort/wait/timeout) | ❌ | GW | S | [HICACHE] prefetch policies |
+| A18 | Prefetch-policy semantics on session restore (best-effort/wait/timeout) | ✅ | SUP | S | 2026-09-08: bank restore = 2s-bounded best-effort, warn-continue (wait-variant cut YAGNI) |
 | A19 | Eviction-policy config (saliency/H2O-class) | UP | UP | — | [ACL26] eviction family — kernel-side |
 | A20 | KIVI-class asymmetric 2-bit KV | UP | UP | — | [ACL26] KIVI; engine q4/q8 today |
-| A21 | MLA/DSA attention-type awareness in model metadata → profile decisions | ❌ | CORE | S | [DWIKI] MLA in llama-kv-cache |
-| A22 | SWA window-size awareness in ctx/VRAM math | ❌ | CORE | S | [DWIKI] ISWA dual-cache |
+| A21 | MLA/DSA attention-type awareness in model metadata → profile decisions | ✅ | CORE | S | [DWIKI] MLA in llama-kv-cache — shipped: key_length/value_length MLA upper-bound KV math (live qwen3.5-9B) |
+| A22 | SWA window-size awareness in ctx/VRAM math | ✅ | CORE | S | [DWIKI] ISWA dual-cache — shipped: per-layer sliding_window + full_attention_interval, provable-only |
 
 ## B. Scheduling & batching (10)
 
@@ -52,13 +52,13 @@ RadixAttention in-engine [V027][SGL].
 |---|---|---|---|---|---|
 | B1 | Live slots auto-tune (`tune --slots`) | ✅ | SUP | — | shipped today |
 | B2 | Extend slots candidates {1..8} + workload profiles (agent vs batch) | 🟡 | SUP | S | extends B1 |
-| B3 | SLO admission tiers (interactive vs batch deadlines reorder queue) | ❌ | GW | M | perf-roadmap B3 |
+| B3 | SLO admission tiers (interactive vs batch deadlines reorder queue) | ✅ | GW | M | shipped: EDF queue + tiered deadlines (2s/30s/120s) + x-pallama-deadline-ms override + slo_deadline_exceeded counter |
 | B4 | Priority queue with header override | ✅ | GW | — | have |
 | B5 | Weighted fair queuing between keys (share, not just order) | ❌ | GW | M | LiteLLM-class fairness |
-| B6 | Long-prefill pacing (protect short-request TTFT while big prompts run) | ❌ | GW | M | [SGL] PrefillDelayer #24768 |
-| B7 | Adaptive spec throttle by load (batch-size-aware steps) | ❌ | CORE | M | [SGL] #24055/#25940 |
-| B8 | Identical-prompt single-flight coalescing | ❌ | GW | M | dedup; LiteLLM router has |
-| B9 | Queue-depth-driven slots resize (restart-safe) | ❌ | SUP | M | extends B1/B2 |
+| B6 | Long-prefill pacing (protect short-request TTFT while big prompts run) | ✅ | GW | M | shipped: body >= 64KiB demotes SLO class one tier at admission (queue.rs PREFILL_HEAVY_BYTES) |
+| B7 | Adaptive spec throttle by load (batch-size-aware steps) | ✅ | CORE | M | [SGL] #24055/#25940 — shipped: adaptive_decay/adaptive_target opt-in knobs |
+| B8 | Identical-prompt single-flight coalescing | ✅ | GW | M | shipped: FNV-1a body key, per-key mutex, twin waits <=5s then proceeds; non-stream chat <=32KiB; stream folds apart |
+| B9 | Queue-depth-driven slots resize (restart-safe) | ✅ | SUP | M | shipped 2026-09-08: adaptive_slots (opt-in) adopts -np+1 after 60s sustained concurrency, in-memory cap 4, slots_auto_adopted event; tune --slots = persistent |
 | B10 | num_ctx header restart | ✅ | GW | — | have (133 ms measured) |
 
 ## C. Routing & multi-instance (8)
@@ -69,7 +69,7 @@ RadixAttention in-engine [V027][SGL].
 | C2 | Remote health-aware failover (mark down, retry alternate remote) | ❌ | GW | S | [DYN] router concepts |
 | C3 | Least-inflight load balancing across duplicate remotes | ❌ | GW | S | standard LB |
 | C4 | Cache-aware remote routing (route to the remote holding the prefix) | ❌ | GW | M | [DYN] tier-aware KV routing |
-| C5 | Per-model device pinning override | ✅ | CORE | S | 2026-09-07: model_overrides devices (replaces global) |
+| C5 | Per-model device pinning override | ✅ | CORE | S | 2026-09-07: model_overrides devices; 2026-09-08: unset devices + >1 GPU -> auto-pick max-free card, VRAM math scoped per-card |
 | C6 | Per-model rpc_servers override | ❌ | CORE | S | global exists |
 | C7 | Federated ps/why across remotes | ❌ | GW | S | extends C1 probe |
 | C8 | Shadow/canary model compare (local vs remote via sentinel diff) | ❌ | GW | M | novel; uses sentinel |
@@ -82,7 +82,7 @@ RadixAttention in-engine [V027][SGL].
 | D2 | GET /v1/responses/{id} retrieval (stored responses addressable) | ❌ | GW | S | OpenAI surface completion |
 | D3 | ollama lane embeddings/rerank translate parity | ✅ | GW | S | 2026-09-07: /api/embed (new-style) + /api/rerank lanes, engine 501 passthrough teaching |
 | D4 | Batch API (/v1/batch: async jobs, results table) | ❌ | GW | M | OpenAI batch shape |
-| D5 | Strict-mode function calling (strict:true schema compile + validate) | ❌ | GW | M | OpenAI Responses strict-by-default (fetched) |
+| D5 | Strict-mode function calling (strict:true schema compile + validate) | ✅ | GW | M | OpenAI Responses strict-by-default (fetched) — verified live b10840: engine enforces json_schema strict grammar natively; our lanes pass through + lint |
 | D6 | GBNF/JSON-schema grammar cache per model+schema | ❌ | GW | M | compile cost amortization |
 | D7 | Anthropic translate when engine lacks /v1/messages | ❌ | GW | M | llamactl parity |
 | D8 | Capability discovery endpoint (/.well-known/pallama) | ❌ | GW | S | novel; clients introspect |
@@ -94,8 +94,8 @@ RadixAttention in-engine [V027][SGL].
 | # | Feature | Status | Lane | Effort | Evidence |
 |---|---|---|---|---|---|
 | E1 | Virtual keys: scope + rpm/tpm/daily budgets + usage | ✅ | GW | — | shipped today |
-| E2 | Key rotation (regenerate secret, keep usage history) | ❌ | GW | S | lifecycle |
-| E3 | Wildcard model scopes ("qwen3*", "vllm:*") | ❌ | GW | S | extends scope check |
+| E2 | Key rotation (regenerate secret, keep usage history) | ✅ | GW | S | lifecycle — shipped: keys rotate |
+| E3 | Wildcard model scopes ("qwen3*", "vllm:*") | ✅ | GW | S | extends scope check — shipped: wildcard scopes |
 | E4 | Audit log (key, model, tokens, trace → jsonl) | ❌ | GW | S | enterprise table stakes |
 | E5 | Auto self-signed dev cert (tls on zero-config for LAN) | ❌ | GW | S | DX |
 | E6 | Request body size limits | ❌ | GW | S | hardening |
@@ -120,8 +120,8 @@ RadixAttention in-engine [V027][SGL].
 | # | Feature | Status | Lane | Effort | Evidence |
 |---|---|---|---|---|---|
 | G1 | ngram + draft-model spec, persistent spec cache | ✅ | SUP | — | have |
-| G2 | Draft auto-pairing from catalog (EAGLE3/MTP heads) | ❌ | CORE | M | perf-roadmap B2 |
-| G3 | Spec accept-rate metrics in /metrics + why | ❌ | GW | S | [SGL] spec observability |
+| G2 | Draft auto-pairing from catalog (EAGLE3/MTP heads) | ✅ | CORE | M | perf-roadmap B2 — shipped: catalog spec_pairs prefix-match + local draft; --spec-draft-hf upstream-broken b10840 → hard-error w/ pull hint |
+| G3 | Spec accept-rate metrics in /metrics + why | ✅ | GW | S | [SGL] spec observability — shipped: pallama_spec_accept_rate gauge (live 0.577) |
 | G4 | v0.4.0 spec-type exposure audit (DSpark/DFlash class flags post-update) | ❌ | EM | S | [ARG] spec flags; AUD checklist |
 | G5 | Synthetic spec acceptance options surfacing | ❌ | EM | S | llama.cpp #27711 (v0.4.0) |
 | G6 | Multi-draft trees (topk>1) | UP | UP | — | [SGL] Spec V2 trees; kernel-side |
@@ -131,9 +131,9 @@ RadixAttention in-engine [V027][SGL].
 | # | Feature | Status | Lane | Effort | Evidence |
 |---|---|---|---|---|---|
 | H1 | `pallama quantize` (engine's own llama-quantize) | ✅ | SUP | — | shipped today |
-| H2 | Quant advisor: best quant for VRAM from catalog (fit calc) | ❌ | CORE | S | DX; pairs fit cmd |
+| H2 | Quant advisor: best quant for VRAM from catalog (fit calc) | ✅ | CORE | S | DX; pairs fit cmd — shipped: pallama fit |
 | H3 | imatrix quantization (llama-imatrix: calibrate + importance-matrix quants) | ❌ | SUP | M | builds on H1; upstream tool in same tarball class |
-| H4 | GGUF lint on import: detect known-bad quantizer variants (the qwen3.5 rejection class) | ❌ | CORE | S | real incident in MEMORY |
+| H4 | GGUF lint on import: detect known-bad quantizer variants (the qwen3.5 rejection class) | ✅ | CORE | S | real incident in MEMORY — shipped: structural lint (ctx/geometry/SWA-mismatch), warn-only |
 | H5 | Engine side-by-side + rollback + digest-verified update | ✅ | SUP | — | have |
 | H6 | Per-model engine pin (compat matrix: model X pinned to tag Y) | ❌ | SUP | S | multi-engine value |
 | H7 | Register local builds (PALLAMA_ENGINE_PATH) | ✅ | SUP | — | have |
@@ -145,7 +145,7 @@ RadixAttention in-engine [V027][SGL].
 |---|---|---|---|---|---|
 | I1 | KV quant ladder + per-model override | ✅ | CORE | — | have |
 | I2 | tune --search grid argmax (bench-proven) | ✅ | SUP | — | have |
-| I3 | tune axes: cache-reuse + ubatch (pairs A7) | ❌ | SUP | S | extends I2 |
+| I3 | tune axes: cache-reuse + ubatch (pairs A7) | ✅ | SUP | S | extends I2 — shipped: tune --cache-reuse |
 | I4 | --override-tensor presets (moe-cpu-offload et al.) | ✅ | CORE | S | 2026-09-07: tensor_preset knob, validated vocabulary |
 | I5 | VRAM preflight on ctx raise (num_ctx header path) | ❌ | GW | S | capacity math exists |
 | I6 | Vulkan per-driver quirk table (flags by driver) | ❌ | EM | S | bench evidence class |
@@ -157,11 +157,11 @@ RadixAttention in-engine [V027][SGL].
 | # | Feature | Status | Lane | Effort | Evidence |
 |---|---|---|---|---|---|
 | J1 | Crash circuit breaker | ✅ | SUP | — | have |
-| J2 | Escalating: repeated crashes → auto engine rollback (use prev tag) | ❌ | SUP | M | extends J1 |
-| J3 | Daemon-side OOM preflight at load (MemAvailable < model+headroom → named error) | ❌ | GW | S | validate.py logic ported |
-| J4 | Config hot-reload (SIGHUP: keys/remotes/cors live) | ❌ | GW | M | registries already live |
+| J2 | Escalating: repeated crashes → auto engine rollback (use prev tag) | ✅ | SUP | M | extends J1 — shipped: spawn-fail streak + version-probe → auto rollback + EngineRolledBack event |
+| J3 | Daemon-side OOM preflight at load (MemAvailable < model+headroom → named error) | ✅ | GW | S | validate.py logic ported — shipped: spawn-time VRAM re-probe warn + RAM floor |
+| J4 | Config hot-reload (SIGHUP: keys/remotes/cors live) | ✅ | GW | M | registries already live — partial: SIGHUP keys hot-reload shipped (daemon.rs) |
 | J5 | Wedged-child auto-evict from sentinel stall detection | ❌ | SUP | S | sentinel exists |
-| J6 | `pallama snapshot` (store+config backup/restore) | ❌ | CORE | S | ops table stakes |
+| J6 | `pallama snapshot` (store+config backup/restore) | ✅ | CORE | S | ops table stakes — shipped: snapshot cmd |
 
 ## K. Client & ecosystem UX (6)
 
@@ -171,7 +171,7 @@ RadixAttention in-engine [V027][SGL].
 | K2 | Launcher profiles (presets per CLI: claude/dsh/codex shapes) | ❌ | CLI | S | extends K1 |
 | K3 | Client-compat pins CI (Claude Code/Codex/Continue/ollama-native) | ✅ | tests | — | shipped today |
 | K4 | More client pins (Open WebUI, Jan, LM Studio shapes) | ❌ | tests | S | extends K3 |
-| K5 | Shell completions (bash/zsh/fish/pwsh via clap_complete) | ❌ | CLI | S | missing basics |
+| K5 | Shell completions (bash/zsh/fish/pwsh via clap_complete) | ✅ | CLI | S | missing basics — shipped: completions cmd (clap_complete) |
 | K6 | doctor --fix (auto-repair PATH, stale engines, config migrations) | ❌ | CORE | S | DX closer |
 
 ## Count & shape
@@ -189,3 +189,4 @@ manifest auto-exposes new flags and this document's UP rows track them. What we
 uniquely own — and what this list maximizes — is everything AROUND the kernel:
 routing, retention-at-request-level, accounting, persistence, protocol breadth,
 and reliability. ollama cannot follow us here without shedding their fork.
+

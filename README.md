@@ -103,8 +103,16 @@ Capability discovery: `GET /.well-known/pallama` (routes, headers, features, eng
 | `launch [--warm MODEL] [--key K] <cli> [args...]` | Point any OpenAI/Anthropic/ollama-speaking CLI at pallama (env wired, optional pre-warm) |
 | `whisper [--install] [--pull SIZE] [--list] [<file>]` | Managed STT lane: installs whisper.cpp server from its releases, pulls ggml models (`tiny`…`large-v3-turbo`), transcribes via the lazy local server on `/v1/audio/transcriptions`; `<remote>:model` still forwards |
 | `mmproj <model> <path>` | Attach a vision projector GGUF to an existing model (refuses while running; next spawn gets vision); `import --mmproj <path>` attaches at import time |
-| `tune <model> --slots C` / `--ngram` / `--load` / `--replicas` | Live-concurrency `-np` search (adopts on a >5% win, records the engine-update regression baseline); n-gram grid; warmup A/B (adopts `warmup = false` only if cold load + first token is >5% faster); replica scaling probe (8 clients x 3 gens against 1 vs 2 identical children, adopts `replicas = 2` only if >1.3x aggregate) |
+| `tune <model> --slots C` / `--ngram` / `--load` / `--replicas` / `--cache-reuse` | Live-concurrency `-np` search (adopts on a >5% win, records the engine-update regression baseline); n-gram grid; warmup A/B (adopts `warmup = false` only if cold load + first token is >5% faster); replica scaling probe (8 clients x 3 gens against 1 vs 2 identical children, adopts `replicas = 2` only if >1.3x aggregate); `--cache-reuse` grid {0,256,512} on a long repeated prefix (adopts only if >5% faster and >50 ms — noise-floored) |
 | `replicas = N` (overlay) | Parallel instances of one model (1..=8): distinct conversation prefixes each get their own warm-cache child (prefix-hash sticky routing); `ps` shows `model#N` |
+| `pin = true` (overlay) | Never pick this instance as a capacity-eviction victim (hot-prefix pinning; pressure falls on unpinned instances) |
+| Spec draft pairing | `spec = "auto"` pairs via catalog prefix match; the draft must be **pre-pulled** (`pallama pull ggml-org/Qwen3-0.6B-GGUF:Q4_0`) — a missing draft is a hard error naming the pull command. Accept-rate gauge: `pallama_spec_accept_rate` |
+| Engine auto-rollback | Spawn failures across >=2 models (or a failing `--version` probe) auto-rollback to the previous engine tag + `engine_rolled_back` event; restore with `pallama engine use` |
+| GGUF metadata lint | `pull`/`import`/`show` warn when context length, attention geometry, or SWA layout is incomplete (KV/VRAM estimates run blind) — warn-only, never blocks |
+| `predictive_preload = true` | Reaper learns model transitions (A→B counts >= 3) and pre-spawns the next likely model while the current one idles — kills the cold-start on alternating workloads; emits `model_preloaded` event; 5-min failure backoff |
+| `adaptive_slots = true` | Sustained >1 concurrent request on a 1-slot model (6 reaper ticks = 60 s) auto-adopts `-np +1` in memory (cap 4, `slots_auto_adopted` event); `tune --slots` remains the persistent path; per-model `slots` overlay wins |
+| `lookup_cache_static` / `lookup_cache_dynamic` | Path to a llama.cpp lookup cache file (validated to exist); `static` is read-only, `dynamic` is refreshed by generation — verbatim passthrough of `-lcs`/`-lcd` |
+| Auto GPU pick (multi-GPU) | With `devices` unset and >1 GPU, each spawn probes `--list-devices` and picks the card with the most free VRAM; all VRAM math (ngl, KV, cache-ram) is scoped to that card, not the summed pool. On mixed iGPU+dGPU laptops the iGPU carveout can look "freest" — set `devices = ["Vulkan1"]` explicitly there |
 | `coreside` | VRAM co-residency plan: which local models fit together (weights + f16 KV @ ctx, hot-first greedy) |
 | `drafts <model>` | Speculative-decoding draft candidates (EAGLE3/MTP heads + small same-family) from live HF search |
 | `completions <bash\|zsh\|fish\|powershell>` | Shell completions to stdout |
@@ -127,7 +135,12 @@ child_transport = "tcp"   # "tcp" (curl-debuggable) | "unix"
 engine_asset = "auto"     # auto picks by OS/GPU (versioned cuda/rocm = newest); or explicit: "ubuntu-vulkan-x64", ...
 engine_pin = ""           # "" = newest b-tag; else e.g. "b10816"
 spec = "off"              # "auto" = draft-pair speculation when pulled; "ngram" = self-drafting (no draft model)
-cache_reuse = 256         # prefix-cache chunk reuse (0 disables)
+cache_reuse = 256         # prefix-cache chunk reuse (0 disables; grid-search via `tune --cache-reuse`)
+cache_idle_slots = true   # false emits --no-cache-idle-slots (skip saving idle slots to prompt cache)
+predictive_preload = false # reaper pre-spawns the next likely model (>=3 A->B transitions) while the current idles
+adaptive_slots = false    # sustained concurrency on a 1-slot model auto-adopts -np +1 in memory (cap 4)
+# lookup_cache_static = "/path/to/cache.bin"   # -lcs: read-only lookup cache (must exist)
+# lookup_cache_dynamic = "/path/to/cache.bin"  # -lcd: lookup cache refreshed by generation
 api_keys = []             # non-empty = Bearer auth at the gateway (children stay loopback)
 rpc_servers = ""          # e.g. "box1:50052,box2:50052" -> --rpc
 cache_ram_mb = 8192       # child prompt-cache budget; auto-capped at 30% of RAM (0 = unlimited)
