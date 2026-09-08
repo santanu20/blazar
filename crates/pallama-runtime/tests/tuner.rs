@@ -48,6 +48,13 @@ static META: std::sync::LazyLock<GgufMeta> = std::sync::LazyLock::new(|| GgufMet
     head_count_kv: Some(8),
     embedding_length: Some(1024),
     head_dim: Some(64),
+    key_length: None,
+    value_length: None,
+    sliding_window: None,
+    sliding_window_per_layer: None,
+    full_attention_interval: None,
+    quantized_by: None,
+    general_version: None,
     pooling_type: None,
     chat_template: Some("{%- if tools %}{{ tool_calls }}{%- endif %}".into()),
 });
@@ -79,6 +86,7 @@ fn test_input<'a>(
         },
         data_dir: "/tmp/pallama-test-data",
         cache_hit_rate: None,
+        device_hint: None,
     }
 }
 

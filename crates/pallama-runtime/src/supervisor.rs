@@ -31,6 +31,18 @@ pub const MAX_REPLICAS: u32 = 8;
 /// Bound on the prefix→replica affinity table (B1): one entry per
 /// distinct prompt prefix; eviction keeps it from growing unbounded.
 const PREFIX_AFFINITY_CAP: usize = 512;
+/// LC1: minimum A→B transitions before B is considered a confident
+/// preload target.
+const PRELOAD_MIN_TRANSITIONS: u64 = 3;
+/// LC1: cap on the transition table (arbitrary-evict on overflow).
+const TRANSITIONS_CAP: usize = 1024;
+/// LC1: cooldown after a failed speculative spawn of a model.
+const PRELOAD_BACKOFF: Duration = Duration::from_mins(5);
+/// LC4: reaper ticks (10s each) of sustained concurrent load before a
+/// slots bump is adopted.
+const SLOTS_STREAK_TICKS: u32 = 6;
+/// LC4: max in-memory slots bump (`tune --slots` for higher).
+const SLOTS_ADOPT_CAP: u32 = 4;
 
 /// Model name behind an instance key: `"qwen#2"` → `"qwen"`. Plain keys
 /// (no `#`) pass through unchanged, so `replicas = 1` stays
@@ -165,6 +177,16 @@ pub struct Supervisor {
     /// Measured prompt-cache hit rate (gateway poller writes, profile
     /// compiles read — drives the adaptive `--cache-ram` clamp, A16).
     pub cache_hint: std::sync::Arc<CacheHint>,
+    /// Speculative-decoding acceptance rate (accepted / drafted tokens,
+    /// 0.0..=1.0, EWMA'd by the gateway poller). `None` until a
+    /// spec-decoding child has reported counters — drives the
+    /// `pallama_spec_accept_rate` gauge (G3).
+    pub spec_accept: std::sync::Arc<CacheHint>,
+    /// J2 self-healing: distinct models whose spawn ULTIMATELY failed
+    /// since the last successful spawn. Cleared on every success; drives
+    /// the crash-loop engine rollback (probe-gated, see
+    /// `note_engine_failure`).
+    engine_failures: std::sync::Mutex<std::collections::HashSet<String>>,
     pub config: Config,
     pub bus: EventBus,
     pub hardware: Hardware,
@@ -185,6 +207,19 @@ pub struct Supervisor {
     /// (system + first user turn) pin a conversation to one warm-cache
     /// replica. Bounded, best-effort — a miss just re-routes.
     prefix_affinity: DashMap<u64, String>,
+    /// Model→model transition counts (LC1 predictive pre-loading):
+    /// increments when a successful request for B follows one for A.
+    transitions: DashMap<(String, String), u64>,
+    /// Most recently served model (LC1 transition edge source).
+    last_requested: std::sync::Mutex<Option<String>>,
+    /// Models whose speculative preload failed recently (LC1 backoff).
+    preload_failures: DashMap<String, Instant>,
+    /// Consecutive reaper ticks with concurrent in-flight load on a
+    /// single-slot model (LC4 adaptive slots).
+    busy_streak: DashMap<String, u32>,
+    /// In-memory slots bumps adopted by LC4 (restart resets; `tune
+    /// --slots` is the permanent path).
+    adopted_slots: DashMap<String, u32>,
     // Test knobs (prod defaults from config).
     pub load_timeout: Duration,
     pub shutdown_grace: Duration,
@@ -211,6 +246,8 @@ impl Supervisor {
         Self {
             evictions: std::sync::atomic::AtomicU64::new(0),
             cache_hint: std::sync::Arc::new(CacheHint::default()),
+            spec_accept: std::sync::Arc::new(CacheHint::default()),
+            engine_failures: std::sync::Mutex::new(std::collections::HashSet::new()),
             load_timeout: Duration::from_secs(3 * 60),
             shutdown_grace: Duration::from_secs(10),
             reaper_interval: Duration::from_secs(10),
@@ -228,6 +265,11 @@ impl Supervisor {
             pending_ctx: DashMap::new(),
             heat: std::sync::Mutex::new(std::collections::HashMap::new()),
             prefix_affinity: DashMap::new(),
+            transitions: DashMap::new(),
+            last_requested: std::sync::Mutex::new(None),
+            preload_failures: DashMap::new(),
+            busy_streak: DashMap::new(),
+            adopted_slots: DashMap::new(),
         }
     }
 
@@ -244,6 +286,31 @@ impl Supervisor {
         let vram = pallama_core::Hardware::bytes(self.hardware.total_vram_mib());
         let model = u64::try_from(model_bytes).unwrap_or(u64::MAX);
         (usize::try_from(vram / model).unwrap_or(1)).max(1)
+    }
+
+    /// Capacity-eviction victim: the coldest evictable instance — zero
+    /// in-flight, not the incoming key, and not pinned (overlay
+    /// `pin = true`, A13). Ordering: prefix heat first, then longest
+    /// idle. `None` = nothing evictable (caller surfaces `AllSlotsBusy`).
+    fn victim_key(&self, key: &str) -> Option<String> {
+        self.instances
+            .iter()
+            .filter(|e| {
+                e.in_flight.load(Ordering::SeqCst) <= 0
+                    && e.key() != key
+                    && !self
+                        .config
+                        .overlay_for(model_of_key(e.key()))
+                        .pin
+                        .unwrap_or(false)
+            })
+            .min_by_key(|e| {
+                (
+                    self.heat_of(e.key()),
+                    *e.last_used.read().expect("idle lock"),
+                )
+            })
+            .map(|e| e.key().clone())
     }
 
     /// Co-residency check (A15): would the candidate (weights + f16 KV)
@@ -322,7 +389,36 @@ impl Supervisor {
                 self.prefix_affinity.insert(h, key);
             }
         }
+        // LC1 predictive pre-loading: record the A→B edge on every
+        // successful serve (router pseudo-model excluded — it has no
+        // model identity of its own).
+        if name != ROUTER_KEY && result.is_ok() {
+            self.note_transition(name);
+        }
         result
+    }
+
+    /// LC1: bump the (prev, current) transition count. Bounded table;
+    /// overflow arbitrarily evicts one entry (a dropped edge just means
+    /// a missed preload opportunity, never a wrong spawn).
+    fn note_transition(&self, name: &str) {
+        let prev = {
+            let mut last = self.last_requested.lock().unwrap();
+            let prev = last.clone();
+            *last = Some(name.to_string());
+            prev
+        };
+        let Some(prev) = prev else { return };
+        if prev == name {
+            return;
+        }
+        let edge = (prev, name.to_string());
+        if !self.transitions.contains_key(&edge) && self.transitions.len() >= TRANSITIONS_CAP {
+            if let Some(k) = self.transitions.iter().next().map(|e| e.key().clone()) {
+                self.transitions.remove(&k);
+            }
+        }
+        *self.transitions.entry(edge).or_insert(0) += 1;
     }
 
     /// Pick the instance key for a request: `"model"` when
@@ -569,6 +665,7 @@ impl Supervisor {
                 },
                 data_dir: &data_dir_str,
                 cache_hit_rate: self.cache_hint.get(),
+                device_hint: None, // router preset: no per-GPU scoping
             };
             match profile::compile(&input, &pallama_core::TuningOverrides::default()) {
                 Ok(p) => {
@@ -720,7 +817,15 @@ impl Supervisor {
             .ok_or_else(|| SupervisionError::ModelNotFound(name.to_string()))?;
         let gguf = pallama_core::read_metadata_file(std::path::Path::new(&model.path))
             .map_err(|e| SupervisionError::Internal(anyhow!("gguf metadata: {e}")))?;
-        let overlay = self.config.overlay_for(name);
+        let mut overlay = self.config.overlay_for(name);
+        // LC4: in-memory adaptive slots fill in ONLY where the user left
+        // slots unset (manual overlay always wins; `tune --slots` writes
+        // the overlay, which then shadows any adoption).
+        if overlay.slots.is_none() {
+            if let Some(adopted) = self.adopted_slots.get(name) {
+                overlay.slots = Some(*adopted);
+            }
+        }
         let loras: Vec<(String, f64)> = store
             .list_loras(Some(name))
             .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?
@@ -737,20 +842,12 @@ impl Supervisor {
         // Capacity: evict the COLDEST instance first — recency-weighted
         // prefix heat (hot models keep their warm cache across capacity
         // pressure; the radix-lite lane), ties broken by longest-idle.
+        // Pinned models (overlay `pin = true`, A13) are never victims:
+        // capacity pressure falls on unpinned instances instead, and
+        // when everything live is pinned+busy the spawn fails loudly.
         let cap = self.capacity_for(model.bytes);
         while self.instances.len() >= cap {
-            let victim = self
-                .instances
-                .iter()
-                .filter(|e| e.in_flight.load(Ordering::SeqCst) <= 0 && e.key() != key)
-                .min_by_key(|e| {
-                    (
-                        self.heat_of(e.key()),
-                        *e.last_used.read().expect("idle lock"),
-                    )
-                })
-                .map(|e| e.key().clone());
-            match victim {
+            match self.victim_key(key) {
                 Some(v) => {
                     self.evict(&v)
                         .await
@@ -782,6 +879,61 @@ impl Supervisor {
 
         let manifest = self.engine.capabilities();
         let model_bytes = u64::try_from(model.bytes.max(0)).unwrap_or(u64::MAX);
+        // One fresh hardware probe serves both spawn-time decisions: the
+        // J3 VRAM preflight and the LC2 auto GPU pick. The boot-time
+        // snapshot can be stale (other engines came and went).
+        let wants_pick = self.config.effective_devices(name).is_empty()
+            && self.hardware.gpus.len() > 1
+            && manifest.flags.contains("--device");
+        let fresh = if self.config.spawn_mem_guard && self.hardware.has_gpu() || wants_pick {
+            Some(crate::probe::probe_hardware(Some(manifest)))
+        } else {
+            None
+        };
+        // Spawn-time VRAM preflight (J3): warn when even the weights
+        // alone exceed free VRAM — the child will either spill layers to
+        // CPU (slow) or die mid-load. Teaching warn only: partial offload
+        // is legitimate, probe failure is skipped, never blocks a spawn.
+        if let Some(f) = &fresh {
+            if self.config.spawn_mem_guard && self.hardware.has_gpu() {
+                let free_vram: u64 = f.gpus.iter().map(|g| g.free_mib).sum();
+                let weights_mib = model_bytes / (1024 * 1024);
+                if free_vram > 0 && weights_mib > free_vram * 95 / 100 {
+                    tracing::warn!(
+                        model = name,
+                        weights_mib,
+                        free_vram_mib = free_vram,
+                        "model weights exceed free VRAM at spawn time — the engine will spill \
+                         layers to CPU (slow) or fail mid-load; consider a smaller quant \
+                         (pallama fit), freeing GPU memory (pallama ps), or kv quantization"
+                    );
+                }
+            }
+        }
+        // Auto GPU bin-packing (LC2): with several cards and no manual
+        // `devices` choice, place the child on the card with the most
+        // free VRAM and scope every downstream VRAM estimate (ngl ladder,
+        // KV, cache-ram, coresidency) to THAT card instead of the summed
+        // pool — a child lands on one card, not the sum. Manual overlay
+        // or global `devices` always wins; fail-open (no pick on probe
+        // weirdness).
+        let mut scoped_hw: Option<Hardware> = None;
+        let mut picked_device: Option<String> = None;
+        if wants_pick {
+            let hw = fresh.as_ref().unwrap_or(&self.hardware);
+            if let Some(best) = hw.gpus.iter().max_by_key(|g| g.free_mib) {
+                let mut scoped = hw.clone();
+                scoped.gpus = vec![best.clone()];
+                picked_device = Some(best.name.clone());
+                scoped_hw = Some(scoped);
+                tracing::info!(
+                    model = name,
+                    device = %best.name,
+                    free_mib = best.free_mib,
+                    "auto GPU pick: most free VRAM (manual `devices` unset)"
+                );
+            }
+        }
         // Cache-file dirs (speccache/, sessions/) must exist before the
         // child opens them; profile emission names these paths. Upstream
         // validates --slot-save-path IS a directory, so the per-model
@@ -804,7 +956,7 @@ impl Supervisor {
                 model_path: &model.path,
                 model_bytes: u64::try_from(model.bytes.max(0)).unwrap_or(u64::MAX),
                 gguf: &gguf,
-                hardware: &self.hardware,
+                hardware: scoped_hw.as_ref().unwrap_or(&self.hardware),
                 config: &self.config,
                 overlay: &overlay,
                 loras: &loras,
@@ -815,6 +967,7 @@ impl Supervisor {
                 endpoint: endpoint.clone(),
                 data_dir: &data_dir_str,
                 cache_hit_rate: self.cache_hint.get(),
+                device_hint: picked_device.as_deref(),
             };
             let mut tuning = self
                 .pending_ctx
@@ -900,6 +1053,8 @@ impl Supervisor {
                         state: InstanceState::Ready,
                     });
                     let inst = self.instances.get(key).expect("just inserted");
+                    // Engine proven healthy: clear the J2 crash-loop tracker.
+                    self.engine_failures.lock().unwrap().clear();
                     return Ok(self.engine_ref(inst.value()));
                 }
                 Err(e) => {
@@ -911,7 +1066,100 @@ impl Supervisor {
                 }
             }
         }
+        // Ultimate spawn failure (all in-spawn retries exhausted): feed the
+        // J2 crash-loop detector before surfacing the timeout.
+        self.note_engine_failure(name);
         Err(SupervisionError::ModelLoadTimeout(key.to_string()))
+    }
+
+    /// J2 crash-loop detection: record that `model` failed to spawn and
+    /// roll the active engine back to the previous install when the
+    /// evidence points at the ENGINE (not the model):
+    ///
+    /// - `llama-server --version` fails on the active binary → immediate
+    ///   rollback (direct evidence; one model is enough), or
+    /// - the binary probes fine but ≥2 DISTINCT models keep failing to
+    ///   spawn → circumstantial engine evidence (e.g. a serving-path
+    ///   regression that `--version` does not exercise).
+    ///
+    /// Single-model failures with a healthy probe stay model-level
+    /// (VRAM, bad GGUF, ctx) — no rollback, no misattribution. Affects
+    /// future spawns only; loud (`EngineRolledBack` event + warn) and
+    /// reversible (`pallama engine use <tag>`).
+    fn note_engine_failure(&self, model: &str) {
+        let trigger = {
+            let mut fails = self.engine_failures.lock().unwrap();
+            fails.insert(model.to_string());
+            if !self.probe_active_engine() {
+                Some("active engine binary failed its --version probe".to_string())
+            } else if fails.len() >= 2 {
+                Some(format!(
+                    "spawn failures across {} distinct models with a healthy binary probe",
+                    fails.len()
+                ))
+            } else {
+                None
+            }
+        };
+        if let Some(reason) = trigger {
+            if let Err(e) = self.rollback_active_engine(&reason) {
+                tracing::warn!("engine rollback skipped: {e:#}");
+            }
+        }
+    }
+
+    /// Exec the active engine's `llama-server --version` (5 s budget).
+    /// Any clean exit = healthy; timeout/crash/non-zero = broken.
+    fn probe_active_engine(&self) -> bool {
+        let Ok(store) = Store::open(&self.dirs) else {
+            return true; // cannot probe: assume innocent (H1: no false rollbacks)
+        };
+        let Ok(Some(row)) = store.active_engine() else {
+            return true;
+        };
+        let dir = self.dirs.engines_dir().join(&row.tag);
+        let Ok(bin) = crate::engine::find_server(&dir) else {
+            return false; // active engine dir has no server binary: broken
+        };
+        let ok = std::process::Command::new(&bin)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        ok
+    }
+
+    /// Switch the active engine to the previous install (same ordering as
+    /// `EngineManager::rollback`: next entry after active = older). Leaves
+    /// the tracker armed for a fresh verdict on the new engine.
+    fn rollback_active_engine(&self, reason: &str) -> Result<(String, String)> {
+        let store = Store::open(&self.dirs)?;
+        let engines = store.list_engines()?;
+        let active = engines
+            .iter()
+            .find(|e| e.active)
+            .ok_or_else(|| anyhow!("no active engine to roll back from"))?;
+        let from = active.tag.clone();
+        let target = engines
+            .iter()
+            .position(|e| e.active)
+            .and_then(|idx| engines.get(idx + 1))
+            .map(|e| e.tag.clone())
+            .ok_or_else(|| anyhow!("no older engine to roll back to (active: {from})"))?;
+        drop(store);
+        Store::open(&self.dirs)?.set_active_engine(&target)?;
+        self.engine_failures.lock().unwrap().clear();
+        tracing::warn!(
+            "engine {from} rolled back to {target}: {reason} — new spawns use {target}; \
+             `pallama engine use {from}` restores it"
+        );
+        self.bus.publish(PallamaEvent::EngineRolledBack {
+            from: from.clone(),
+            to: target.clone(),
+            reason: reason.to_string(),
+        });
+        Ok((from, target))
     }
 
     /// Free TCP port (bind 0, read, drop) or a unix socket path.
@@ -1131,6 +1379,154 @@ impl Supervisor {
                 tracing::error!(model = %name, "evict: {e:#}");
             }
         }
+        // LC1/LC4 ride the 10s reaper tick.
+        self.maybe_preload().await;
+        self.adaptive_slots_tick();
+    }
+
+    /// LC1 predictive pre-loading: when exactly one model is resident
+    /// and idle, and history says B reliably follows A, spawn B NOW so
+    /// the user's next switch is warm instead of a cold start. Every
+    /// guard is fail-open: any miss (no history, no capacity, no VRAM,
+    /// backoff) simply skips this tick.
+    async fn maybe_preload(&self) {
+        if !self.config.predictive_preload {
+            return;
+        }
+        // Exactly one live non-router instance, idle.
+        let mut live: Vec<(String, u64)> = Vec::new(); // (key, model bytes)
+        for e in &self.instances {
+            let i = e.value();
+            if model_of_key(&i.name) == ROUTER_KEY {
+                continue;
+            }
+            let state = *i.state.read().expect("state lock");
+            if matches!(state, InstanceState::Ready | InstanceState::Sleeping)
+                && i.in_flight.load(Ordering::SeqCst) == 0
+            {
+                live.push((
+                    i.name.clone(),
+                    u64::try_from(i.model.bytes.max(0)).unwrap_or(u64::MAX),
+                ));
+            }
+        }
+        if live.len() != 1 || !self.loading.is_empty() {
+            return;
+        }
+        let (key, a_bytes) = live[0].clone();
+        let current = model_of_key(&key).to_string();
+        // Confident transition target.
+        let Some(target) = self
+            .transitions
+            .iter()
+            .filter(|e| e.key().0 == current && e.key().1 != current)
+            .filter(|e| {
+                // Not already live and not the router pseudo-model.
+                e.key().1 != ROUTER_KEY
+                    && !self
+                        .instances
+                        .iter()
+                        .any(|i| model_of_key(i.key()) == e.key().1)
+            })
+            .max_by_key(|e| *e.value())
+            .map(|e| (e.key().1.clone(), *e.value()))
+        else {
+            return;
+        };
+        let (next, count) = target;
+        if count < PRELOAD_MIN_TRANSITIONS {
+            return;
+        }
+        // Recent-failure backoff.
+        if let Some(t) = self.preload_failures.get(&next) {
+            if t.elapsed() < PRELOAD_BACKOFF {
+                return;
+            }
+        }
+        // Known model + capacity headroom.
+        let Ok(store) = Store::open(&self.dirs) else {
+            return;
+        };
+        let Ok(Some(row)) = store.get_model(&next) else {
+            return;
+        };
+        let b_bytes = u64::try_from(row.bytes.max(0)).unwrap_or(u64::MAX);
+        if self.capacity_for(row.bytes) <= self.instances.len() {
+            return;
+        }
+        // Fresh VRAM check: both weights must fit on the GPU pool.
+        let manifest = self.engine.capabilities();
+        let fresh = crate::probe::probe_hardware(Some(manifest));
+        let free_vram: u64 = fresh.gpus.iter().map(|g| g.free_mib).sum();
+        let need_mib = (a_bytes + b_bytes) / (1024 * 1024);
+        if fresh.has_gpu() && free_vram > 0 && need_mib > free_vram * 95 / 100 {
+            tracing::debug!(model = %next, need_mib, free_vram, "preload skipped: VRAM");
+            return;
+        }
+        tracing::info!(model = %next, from = %current, count, "predictive preload");
+        match self.spawn_instance(&next).await {
+            Ok(_) => {
+                let _ = self.bus.publish(PallamaEvent::ModelPreloaded {
+                    model: next,
+                    from: current,
+                });
+            }
+            Err(e) => {
+                tracing::warn!("predictive preload of {next} failed: {e:#}");
+                self.preload_failures.insert(next, Instant::now());
+            }
+        }
+    }
+
+    /// LC4 adaptive slots: a single-slot model under sustained
+    /// concurrent load (queueing visible as `in_flight > 1` across ticks)
+    /// earns an in-memory slots bump. Explicit overlay slots, replicas,
+    /// and already-adopted caps are respected; opt-in via config.
+    fn adaptive_slots_tick(&self) {
+        if !self.config.adaptive_slots {
+            return;
+        }
+        for e in &self.instances {
+            let key = e.key().clone();
+            let model = model_of_key(&key).to_string();
+            let i = e.value();
+            let state = *i.state.read().expect("state lock");
+            if !matches!(state, InstanceState::Ready) {
+                self.busy_streak.remove(&key);
+                continue;
+            }
+            let overlay = self.config.overlay_for(&model);
+            // Manual slots or replicas exclude the model entirely.
+            if overlay.slots.is_some() || overlay.replicas.unwrap_or(1) > 1 {
+                self.busy_streak.remove(&key);
+                continue;
+            }
+            let effective = self
+                .adopted_slots
+                .get(&model)
+                .map_or(self.config.slots, |v| *v.value());
+            let in_flight = i.in_flight.load(Ordering::SeqCst);
+            if in_flight > 1 && effective == 1 {
+                // Scope the entry guard: it must drop BEFORE the remove
+                // below, or the DashMap shard self-deadlocks.
+                let hit_threshold = {
+                    let mut streak = self.busy_streak.entry(key.clone()).or_insert(0);
+                    *streak += 1;
+                    *streak >= SLOTS_STREAK_TICKS
+                };
+                if hit_threshold {
+                    let from = effective;
+                    let to = (from + 1).min(SLOTS_ADOPT_CAP);
+                    self.adopted_slots.insert(model.clone(), to);
+                    self.busy_streak.remove(&key);
+                    tracing::info!(model = %model, from, to, "adaptive slots adopted");
+                    self.bus
+                        .publish(PallamaEvent::SlotsAutoAdopted { model, from, to });
+                }
+            } else {
+                self.busy_streak.remove(&key);
+            }
+        }
     }
 
     /// Request accounting: gateway brackets proxied calls with these.
@@ -1261,9 +1657,18 @@ impl Supervisor {
     /// Detect a dead child (crash) and drop it from the map so the next
     /// `ensure()` respawns. Called by the reaper.
     pub async fn reap_dead_children(&self) {
+        // Snapshot FIRST, then await: iterating a DashMap holds a read
+        // guard on the current shard, and `child.lock().await` below
+        // would park that guard across an await — every write to the
+        // shard (spawn `insert`, evict `remove`) then blocks its worker
+        // thread in a sync futex. A tick coinciding with an evict that
+        // holds the child mutex through a slow terminate was observed
+        // stalling the whole runtime (accept, /health, SIGTERM drain);
+        // this snapshot removes the map guard from the await path.
+        let snapshot: Vec<std::sync::Arc<Instance>> =
+            self.instances.iter().map(|e| e.value().clone()).collect();
         let mut crashed: Vec<String> = Vec::new();
-        for entry in &self.instances {
-            let inst = entry.value();
+        for inst in &snapshot {
             let mut child = inst.child.lock().await;
             match child.try_status() {
                 Ok(Some(status)) => {
@@ -1426,6 +1831,114 @@ mod routing_tests {
         )
     }
 
+    /// J2 harness: real temp dirs + store rows + a script posing as
+    /// llama-server under engines/{tag}/llama-{tag}/.
+    fn j2_sup(exit_code: i32) -> (Supervisor, tempfile::TempDir, EventBus) {
+        use std::os::unix::fs::PermissionsExt;
+        let bus = EventBus::default();
+        let root = tempfile::TempDir::new().unwrap();
+        let dirs = PallamaDirs {
+            config_dir: root.path().join("cfg"),
+            data_dir: root.path().join("data"),
+        };
+        std::fs::create_dir_all(&dirs.config_dir).unwrap();
+        std::fs::create_dir_all(dirs.engines_dir().join("b_bad/llama-b_bad")).unwrap();
+        std::fs::create_dir_all(dirs.engines_dir().join("b_good/llama-b_good")).unwrap();
+        for tag in ["b_bad", "b_good"] {
+            let bin = dirs
+                .engines_dir()
+                .join(tag)
+                .join(format!("llama-{tag}"))
+                .join("llama-server");
+            std::fs::write(&bin, format!("#!/bin/sh\nexit {exit_code}\n")).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let store = Store::open(&dirs).unwrap();
+        let now = 1_000_000;
+        store
+            .upsert_engine(&pallama_core::store::EngineRow {
+                tag: "b_bad".into(),
+                asset: "a".into(),
+                sha256: String::new(),
+                installed_at: now + 1,
+                active: true,
+                manifest: String::new(),
+            })
+            .unwrap();
+        store
+            .upsert_engine(&pallama_core::store::EngineRow {
+                tag: "b_good".into(),
+                asset: "a".into(),
+                sha256: String::new(),
+                installed_at: now,
+                active: false,
+                manifest: String::new(),
+            })
+            .unwrap();
+        let sup = Supervisor::new(
+            dirs,
+            Config::default(),
+            bus.clone(),
+            Hardware {
+                physical_cores: 1,
+                total_ram_mib: 1024,
+                gpus: vec![],
+            },
+            Arc::new(FakeEngine(Manifest {
+                tag: "fake".into(),
+                build_number: 1,
+                version_raw: "b1".into(),
+                devices: vec![],
+                flags: std::collections::BTreeSet::new(),
+                spec_types: vec![],
+                server_path: String::new(),
+            })),
+        );
+        (sup, root, bus)
+    }
+
+    #[test]
+    fn unit__j2__broken_binary_probe_rolls_back_immediately() {
+        let (sup, _root, bus) = j2_sup(1); // --version exits 1: broken
+        let mut events = bus.subscribe();
+        sup.note_engine_failure("model-a");
+        let active = Store::open(&sup.dirs)
+            .unwrap()
+            .active_engine()
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.tag, "b_good");
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            PallamaEvent::EngineRolledBack { from, .. } if from == "b_bad"
+        ));
+    }
+
+    #[test]
+    fn unit__j2__healthy_binary_single_model_failure_no_rollback() {
+        let (sup, _root, _bus) = j2_sup(0); // healthy probe
+        sup.note_engine_failure("model-a");
+        let active = Store::open(&sup.dirs)
+            .unwrap()
+            .active_engine()
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.tag, "b_bad"); // untouched: model-level failure
+    }
+
+    #[test]
+    fn unit__j2__healthy_binary_two_distinct_models_rolls_back() {
+        let (sup, _root, _bus) = j2_sup(0);
+        sup.note_engine_failure("model-a");
+        sup.note_engine_failure("model-b");
+        let active = Store::open(&sup.dirs)
+            .unwrap()
+            .active_engine()
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.tag, "b_good");
+    }
+
     /// Fabricated map entry: real child (so teardown paths stay honest),
     /// throwaway argv/profile. Caller owns the pid for cleanup.
     fn fake_instance(key: &str, state: InstanceState, load: i64) -> (Arc<Instance>, u32) {
@@ -1557,6 +2070,165 @@ mod routing_tests {
         sup.instances.insert("m#1".into(), a);
         assert_eq!(sup.replica_key("m", None), "m#2");
         kill_all(&[pa]);
+    }
+
+    #[tokio::test]
+    async fn unit__victim_key__pinned_never_chosen() {
+        // "hot" is pinned (overlay), "cold" is not: pressure falls on
+        // "cold" even though it is the hotter cache.
+        let mut sup = routing_sup(1);
+        sup.config.model_overrides.insert(
+            "hot".into(),
+            ModelOverride {
+                pin: Some(true),
+                ..Default::default()
+            },
+        );
+        let (hot, ph) = fake_instance("hot", InstanceState::Ready, 0);
+        let (cold, pc) = fake_instance("cold", InstanceState::Ready, 0);
+        sup.instances.insert("hot".into(), hot);
+        sup.instances.insert("cold".into(), cold);
+        sup.note_prefix_hit("hot");
+        sup.note_prefix_hit("hot");
+        assert_eq!(sup.victim_key("incoming"), Some("cold".into()));
+        kill_all(&[ph, pc]);
+    }
+
+    #[tokio::test]
+    async fn unit__victim_key__all_pinned__none() {
+        let mut sup = routing_sup(1);
+        sup.config.model_overrides.insert(
+            "hot".into(),
+            ModelOverride {
+                pin: Some(true),
+                ..Default::default()
+            },
+        );
+        let (hot, ph) = fake_instance("hot", InstanceState::Ready, 0);
+        sup.instances.insert("hot".into(), hot);
+        assert_eq!(sup.victim_key("incoming"), None);
+        kill_all(&[ph]);
+    }
+
+    #[test]
+    fn unit__note_transition__edges_and_self_loops() {
+        let sup = routing_sup(1);
+        sup.note_transition("a");
+        assert!(sup.transitions.is_empty(), "first request has no edge");
+        sup.note_transition("b");
+        sup.note_transition("b");
+        let edge0 = ("a".to_string(), "b".to_string());
+        assert_eq!(sup.transitions.get(&edge0).map(|v| *v), Some(1));
+        sup.note_transition("a"); // b -> a
+        sup.note_transition("b"); // a -> b again
+        let edge = ("a".to_string(), "b".to_string());
+        assert_eq!(sup.transitions.get(&edge).map(|v| *v), Some(2));
+        // Self-loops never create edges.
+        sup.note_transition("b");
+        sup.note_transition("b");
+        assert!(!sup.transitions.contains_key(&("b".into(), "b".into())));
+    }
+
+    #[tokio::test]
+    async fn unit__adaptive_slots__adopts_after_streak_and_respects_manual() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        let (inst, ph) = fake_instance("m", InstanceState::Ready, 2);
+        sup.instances.insert("m".into(), inst);
+        for _ in 0..(SLOTS_STREAK_TICKS - 1) {
+            sup.adaptive_slots_tick();
+        }
+        assert!(
+            sup.adopted_slots.get("m").is_none(),
+            "one tick short of the threshold"
+        );
+        sup.adaptive_slots_tick();
+        assert_eq!(sup.adopted_slots.get("m").map(|v| *v), Some(2));
+        kill_all(&[ph]);
+
+        // Manual overlay slots exclude the model entirely.
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        sup.config.model_overrides.insert(
+            "m".into(),
+            ModelOverride {
+                slots: Some(1),
+                ..Default::default()
+            },
+        );
+        let (inst, ph) = fake_instance("m", InstanceState::Ready, 2);
+        sup.instances.insert("m".into(), inst);
+        for _ in 0..(SLOTS_STREAK_TICKS * 2) {
+            sup.adaptive_slots_tick();
+        }
+        assert!(sup.adopted_slots.get("m").is_none());
+        kill_all(&[ph]);
+    }
+
+    #[tokio::test]
+    async fn unit__adaptive_slots__off_by_default_is_noop() {
+        let sup = routing_sup(1); // adaptive_slots defaults false
+        let (inst, ph) = fake_instance("m", InstanceState::Ready, 2);
+        sup.instances.insert("m".into(), inst);
+        for _ in 0..(SLOTS_STREAK_TICKS * 2) {
+            sup.adaptive_slots_tick();
+        }
+        assert!(sup.adopted_slots.is_empty());
+        kill_all(&[ph]);
+    }
+
+    /// The 2026-09-08 runtime-freeze pin: `reap_dead_children` must not
+    /// hold a `DashMap` iteration across `child.lock().await`. The old
+    /// loop parked a shard read-guard on the child mutex; with the mutex
+    /// held by a concurrent evict (slow terminate), every write to that
+    /// shard parked its worker thread in a sync futex — accept, /health
+    /// and the SIGTERM drain all starved. Regression shape: while the
+    /// reaper awaits a held child lock, instance-map writes must still
+    /// go through.
+    #[tokio::test]
+    async fn unit__reap_dead_children__does_not_park_shard_guard_across_child_lock() {
+        let sup = std::sync::Arc::new(routing_sup(1));
+        let (inst, pid) = fake_instance("guard-probe", InstanceState::Ready, 0);
+        sup.instances
+            .insert("guard-probe".to_string(), inst.clone());
+
+        // Simulate an evict inside terminate_group: hold the child mutex
+        // for a while.
+        let holder = tokio::spawn({
+            let inst = inst.clone();
+            async move {
+                let _guard = inst.child.lock().await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await; // holder has the lock
+
+        let reaper = tokio::spawn({
+            let sup = std::sync::Arc::clone(&sup);
+            async move { sup.reap_dead_children().await }
+        });
+        // Parked on the child lock by now; instance-map writes (spawn
+        // inserts) must NOT block on a snapshot-based reap.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let inserts = tokio::task::spawn_blocking({
+            let sup = std::sync::Arc::clone(&sup);
+            let inst = inst.clone();
+            move || {
+                // 256 keys blanket every shard of the map.
+                for i in 0..256 {
+                    sup.instances.insert(format!("k{i}"), inst.clone());
+                }
+            }
+        });
+        let inserted = tokio::time::timeout(Duration::from_secs(1), inserts).await;
+        assert!(
+            inserted.is_ok(),
+            "instance-map writes stalled while reap awaited the child lock"
+        );
+
+        let _ = tokio::time::timeout(Duration::from_secs(4), reaper).await;
+        let _ = tokio::time::timeout(Duration::from_secs(4), holder).await;
+        kill_all(&[pid]);
     }
 
     #[tokio::test]

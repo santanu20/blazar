@@ -377,7 +377,7 @@ pub(crate) fn extract_archive(bytes: &[u8], dir: &Path, asset_name: &str) -> Res
 
 /// Find the llama-server binary anywhere under the extracted dir
 /// (release archives use `llama-<tag>/llama-server` roots).
-fn find_server(dir: &Path) -> Result<PathBuf> {
+pub(crate) fn find_server(dir: &Path) -> Result<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;

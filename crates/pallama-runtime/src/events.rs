@@ -14,6 +14,28 @@ pub enum PallamaEvent {
     EngineRemoved {
         tag: String,
     },
+    /// J2 self-healing: the supervisor rolled the active engine back to
+    /// the previous install after spawn failures. Loud + reversible
+    /// (`pallama engine use <tag>` switches back).
+    EngineRolledBack {
+        from: String,
+        to: String,
+        reason: String,
+    },
+    /// LC1 predictive pre-loading: the supervisor pre-spawned `model`
+    /// because it historically follows `from` — the switch will be warm.
+    ModelPreloaded {
+        model: String,
+        from: String,
+    },
+    /// LC4 adaptive capacity: sustained concurrent load bumped the
+    /// model's effective slots (in-memory; restart resets, `tune --slots`
+    /// persists).
+    SlotsAutoAdopted {
+        model: String,
+        from: u32,
+        to: u32,
+    },
     ModelPulled {
         name: String,
         /// Post-download GGUF health check: set when the header did not

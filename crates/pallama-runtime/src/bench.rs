@@ -89,6 +89,17 @@ pub struct ReplicaSearch {
     pub r2_tps: f64,
 }
 
+/// `--cache-reuse` grid result (`tune --cache-reuse`): measured warm
+/// second-chat wall seconds per N value, plus the grid's best N.
+/// Adoption is the caller's policy (best < 0.95x the current default).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CacheReuseSearch {
+    /// ((`cache_reuse` N, warm chat wall secs)) per grid point, in grid order.
+    pub grid: Vec<(u32, f64)>,
+    /// N with the lowest warm-chat wall time.
+    pub best: u32,
+}
+
 /// Base argv for the warmup A/B: drop endpoint/session/persisted-state
 /// PAIRS and any explicit warmup flags so the two variants differ ONLY
 /// in the warmup axis.
@@ -327,6 +338,87 @@ impl Tuner<'_> {
             anyhow::bail!("no ngram candidates ran ({candidates:?})");
         }
         Ok(out)
+    }
+
+    /// `--cache-reuse N` grid search (`tune --cache-reuse`): for each N in
+    /// {0, 256, 512} spawn the real llama-server, send the SAME long prompt
+    /// twice, and measure the WALL seconds of the SECOND (warm, cache-hit)
+    /// chat. The prompt is built from one repeated sentence so the engine's
+    /// chunked-prompt cache can reuse it. N=0 omits the flag (upstream
+    /// default: cache reuse disabled); Pallama's shipped default is 256, so
+    /// adoption must beat 256 by >5% — printing the whole grid keeps the
+    /// verdict honest even when nothing wins.
+    pub fn cache_reuse_search(
+        &self,
+        base_argv: &[String],
+        idle_secs: u64,
+    ) -> Result<CacheReuseSearch> {
+        let server_bin = self
+            .bench_bin
+            .parent()
+            .map(|p| p.join("llama-server"))
+            .filter(|p| p.exists())
+            .ok_or_else(|| anyhow!("llama-server not found next to llama-bench"))?;
+        // ~800+ tokens of deterministic filler: one sentence repeated far
+        // past the 256-token chunk watermark so partial-chunk reuse cannot
+        // fake a hit.
+        let long_prompt =
+            "The lighthouse keeper logged the tide twice a day and mailed the ledger monthly. "
+                .repeat(64);
+        let mut grid = Vec::new();
+        for n in [0u32, 256, 512] {
+            let port = ephemeral_port()?;
+            // Strip endpoint/session/persisted-cache PAIRS plus any prior
+            // --cache-reuse so candidates differ ONLY in the reuse axis.
+            let mut argv: Vec<String> = Vec::new();
+            let mut it = base_argv.iter().peekable();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--host" | "--port" | "--slot-save-path" | "--cache-reuse" => {
+                        let _ = it.next(); // consume the value
+                    }
+                    _ => argv.push(a.clone()),
+                }
+            }
+            argv.extend([
+                "--host".to_string(),
+                "127.0.0.1".to_string(),
+                "--port".to_string(),
+                port.to_string(),
+            ]);
+            if n > 0 {
+                argv.extend(["--cache-reuse".to_string(), n.to_string()]);
+            }
+            let mut child = std::process::Command::new(&server_bin)
+                .args(&argv)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .with_context(|| format!("spawn {}", server_bin.display()))?;
+            let warm_secs = if wait_ready(port, 180.0) {
+                // Prime, then measure the warm pass (the cache-hit lane).
+                chat_secs(port, &long_prompt)
+                    .ok()
+                    .and_then(|_| chat_secs(port, &long_prompt).ok())
+            } else {
+                None
+            };
+            // Single pid we spawned; never a group.
+            let _ = child.kill();
+            let _ = child.wait();
+            let Some(secs) = warm_secs else {
+                anyhow::bail!("cache-reuse search: server at N={n} never became ready or served");
+            };
+            println!("  cache-reuse {n}: warm chat {secs:.2}s");
+            grid.push((n, secs));
+            std::thread::sleep(std::time::Duration::from_secs(idle_secs.max(1)));
+        }
+        let best = grid
+            .iter()
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(n, _)| *n)
+            .ok_or_else(|| anyhow!("cache-reuse grid ran empty"))?;
+        Ok(CacheReuseSearch { grid, best })
     }
 
     /// Warmup-axis A/B probe (`tune --load`): spawn the real llama-server
@@ -754,6 +846,7 @@ pub fn build_input<'a>(
         endpoint,
         data_dir,
         cache_hit_rate: None, // CLI bench: static clamp, no live hint
+        device_hint: None,
     }
 }
 
@@ -788,12 +881,19 @@ fn wait_ready(port: u16, timeout_secs: f64) -> bool {
 /// adds this to spawn→ready so the no-warmup variant's first-request
 /// lazy-init penalty is priced into its metric instead of silently
 /// vanishing into the user's first prompt.
-#[allow(clippy::items_after_statements)] // io trait imports sit near their single use
 fn first_chat_secs(port: u16) -> Result<f64> {
+    chat_secs(port, "hi")
+}
+
+/// Wall seconds for one non-stream chat with the given user content.
+/// Shared by the load probe (tiny "hi") and the cache-reuse probe
+/// (long repeated prefix — see `cache_reuse_search`).
+#[allow(clippy::items_after_statements)] // io trait imports sit near their single use
+fn chat_secs(port: u16, content: &str) -> Result<f64> {
     let t0 = std::time::Instant::now();
     let body = serde_json::json!({
         "model": "load-probe", "max_tokens": 8, "stream": false,
-        "messages": [{"role": "user", "content": "hi"}],
+        "messages": [{"role": "user", "content": content}],
     });
     let payload = serde_json::to_vec(&body)?;
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port))
