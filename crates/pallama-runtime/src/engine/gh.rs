@@ -79,7 +79,12 @@ fn btag_number(tag: &str) -> Option<u64> {
 
 impl GhClient {
     pub fn new(token: Option<String>) -> Result<Self> {
-        Self::with_base("https://api.github.com", token)
+        // PALLAMA_GH_BASE: mirrors/tests override the GitHub API base for
+        // the llama.cpp engine lane (same knob class as the installer's
+        // PALLAMA_INSTALL_BASE_URL). Unset = the real API.
+        let base =
+            std::env::var("PALLAMA_GH_BASE").unwrap_or_else(|_| "https://api.github.com".into());
+        Self::with_base(&base, token)
     }
 
     pub fn with_base(base: &str, token: Option<String>) -> Result<Self> {

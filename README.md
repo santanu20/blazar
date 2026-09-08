@@ -25,6 +25,8 @@ sudo sh scripts/install.sh
 sudo sh scripts/install.sh --build
 ```
 
+**One-click readiness:** after the binary lands, the installer bootstraps the llama.cpp engine (idempotent — skips when an engine is already active) so a fresh install can serve inference immediately; failures are loud warnings, never silent. Opt out with `PALLAMA_INSTALL_ENGINE=0`, pre-pull a model with `PALLAMA_INSTALL_MODEL=<name>`, or point engine downloads at a mirror with `PALLAMA_GH_BASE` (e.g. a GitHub API proxy). `sudo sh scripts/install.sh` and the PowerShell installer behave the same.
+
 Like ollama's installer: **system-wide only** — root-owned binary in `/usr/local/bin` plus a systemd unit (`Restart=always`, GPU groups, auto-start, restart-on-upgrade). There is deliberately no user-path (`~/.local/bin`) install mode: a second copy there is how stale-binary daemon races happen (`pallama doctor` flags any that already exist, and the installer removes one it finds). Root or sudo is required.
 
 From a checkout the installer compiles fresh with `cargo` first (never a stale `target/release`); a checkout-less `curl | sh` uses the sha256-verified release channel. Older glibc than 2.35, or Alpine? Automatic fallback to the static musl build. Pin a version with `PALLAMA_VERSION=v0.3.0`, a mirror with `PALLAMA_INSTALL_BASE_URL`, or a build repo with `PALLAMA_CHECKOUT`.

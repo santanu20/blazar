@@ -141,8 +141,32 @@ try {
         if ($LASTEXITCODE -eq 0) { Write-Host '>>> config migrated/verified (canonical form)' }
         else { Write-Host '>>> config migration skipped (run: pallama migrate)' }
     } catch { Write-Host '>>> config migration skipped (run: pallama migrate)' }
+    # One-click readiness: bootstrap the llama.cpp engine so the box is
+    # infer-ready (opt out: PALLAMA_INSTALL_ENGINE=0). Idempotent: an
+    # already-active engine skips the download. Optional first model via
+    # PALLAMA_INSTALL_MODEL (opt-in).
+    $engineOk = $false
+    try { $engineOk = -not [string]::IsNullOrEmpty((& $installedExe engine list 2>$null | Select-String '\[active\]')) } catch { }
+    if ($env:PALLAMA_INSTALL_ENGINE -ne '0' -and -not $engineOk) {
+        Write-Host ">>> bootstrapping llama.cpp engine (pallama engine update - largest download of this install)..."
+        try {
+            & $installedExe engine update --no-gate
+            if ($LASTEXITCODE -eq 0) { Write-Host '>>> engine bootstrap complete' }
+            else { Write-Host ">>> WARN: engine bootstrap failed - inference NOT ready. Run: pallama engine update" }
+        } catch { Write-Host ">>> WARN: engine bootstrap failed - inference NOT ready. Run: pallama engine update" }
+    } else {
+        Write-Host '>>> engine already active (or bootstrap disabled) - skipping engine download'
+    }
+    if ($env:PALLAMA_INSTALL_MODEL) {
+        Write-Host ">>> pulling first model: $env:PALLAMA_INSTALL_MODEL..."
+        try {
+            & $installedExe pull $env:PALLAMA_INSTALL_MODEL
+            if ($LASTEXITCODE -eq 0) { Write-Host ">>> model ready: $env:PALLAMA_INSTALL_MODEL" }
+            else { Write-Host ">>> WARN: model pull failed - run: pallama pull $env:PALLAMA_INSTALL_MODEL" }
+        } catch { Write-Host ">>> WARN: model pull failed - run: pallama pull $env:PALLAMA_INSTALL_MODEL" }
+    }
     if ($WithService) { Register-PallamaTask $installedExe }
-    Write-Host '>>> Next: pallama engine update && pallama pull <model> && pallama run <model>'
+    Write-Host '>>> system ready - check health: pallama doctor'
     Write-Host '>>> All inference is upstream llama.cpp - ggml, ggerganov and contributors did the hard parts.'
 } finally {
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue

@@ -5,11 +5,16 @@
 #   1. happy path  — asset selected per-arch, digest verified, binary installed and runs
 #   2. tamper      — corrupted digest in metadata -> hard failure, nothing installed
 #   3. wrong arch  — release without a matching asset -> clear error naming the asset
+#   4. one-click   — engine bootstrap: install.sh pulls the llama.cpp engine
+#                   from the (faked) engine lane and leaves it ACTIVE — the
+#                   box is infer-ready with zero manual steps
 #
 # The fake release JSON puts a decoy asset with a WRONG digest first, so a
 # parser bug that grabs a sibling asset's digest fails this test.
 #
-# Requires: python3, curl, sha256sum, and target/release/pallama (host build).
+# Requires: python3, curl, sha256sum, target/release/pallama (host build),
+# and target/release/stub-llama-server (cargo build --release --features
+# test-util --bin stub-llama-server) for case 4.
 
 set -eu
 
@@ -87,6 +92,14 @@ class H(http.server.BaseHTTPRequestHandler):
                 self._send(open(meta, 'rb').read(), 'application/json')
             else:
                 self.send_error(404)
+        elif self.path.startswith('/repos/ggml-org/llama.cpp/releases'):
+            # Engine lane (PALLAMA_GH_BASE points GhClient here): the
+            # releases list is all latest_b_release needs.
+            meta = os.path.join(srv_dir, 'llama-releases.json')
+            if os.path.exists(meta):
+                self._send(open(meta, 'rb').read(), 'application/json')
+            else:
+                self.send_error(404)
         elif self.path.startswith('/download/'):
             name = self.path[len('/download/'):]
             if '/' in name or '..' in name:
@@ -113,7 +126,7 @@ SERVER_PID=$!
 
 BASE="http://127.0.0.1:${PORT}"
 
-INSTALL_ENV="HOME=$TMP/home PALLAMA_INSTALL_BASE_URL=$BASE PALLAMA_SUDO=$TMP/fakesudo PALLAMA_SYSTEMCTL=$TMP/fakesystemctl PALLAMA_SYSTEM_BIN_DIR=$SYSTEM_BIN PALLAMA_UNIT_PATH=$UNIT_OUT"
+INSTALL_ENV="HOME=$TMP/home PALLAMA_INSTALL_BASE_URL=$BASE PALLAMA_SUDO=$TMP/fakesudo PALLAMA_SYSTEMCTL=$TMP/fakesystemctl PALLAMA_SYSTEM_BIN_DIR=$SYSTEM_BIN PALLAMA_UNIT_PATH=$UNIT_OUT PALLAMA_INSTALL_ENGINE=0"
 
 # Readiness probe: the decoy asset exists before the server starts; release
 # metadata is written per test case below.
@@ -169,6 +182,48 @@ else
 fi
 echo "$OUT" | grep -q "$ASSET" && echo "$OUT" | grep -q "$DECOY" &&
     ok "error names wanted asset and lists available" || bad "error does not name wanted/available assets"
+
+# --- 4. one-click engine bootstrap (fake llama.cpp release lane) --------------
+# The install itself comes from the happy-path metadata (case 1 shape);
+# the ENGINE comes from a faked llama.cpp releases list served by the same
+# python server. The engine tarball carries the stub llama-server, so the
+# whole download -> sha verify -> extract -> probe -> activate lane runs
+# for real, offline. x86_64 host only (asset suffix is deterministic there).
+STUB="$ROOT/target/release/stub-llama-server"
+if [ "$(uname -m)" = x86_64 ] && [ -x "$STUB" ]; then
+    rm -rf "$SYSTEM_BIN" "$UNIT_OUT" "${TMP:?}/home"
+    printf '{"tag_name":"%s","assets":[{"name":"%s","digest":"sha256:0000","browser_download_url":"%s/download/%s"},{"name":"%s","digest":"sha256:%s","browser_download_url":"%s/download/%s"}]}' \
+        "$TAG" "$DECOY" "$BASE" "$DECOY" "$ASSET" "$SHA" "$BASE" "$ASSET" > "$SRV/release.json"
+
+    ETAG=b999
+    EASSET="llama-${ETAG}-bin-ubuntu-x86_64.tar.gz"
+    ESTAGE="$TMP/estage"
+    mkdir -p "$ESTAGE/bin"
+    cp "$STUB" "$ESTAGE/bin/llama-server"
+    tar -czf "$SRV/$EASSET" -C "$ESTAGE" .
+    ESA=$(sha256sum "$SRV/$EASSET" | cut -d' ' -f1)
+    printf '[{"tag_name":"%s","prerelease":true,"published_at":"2026-09-08T00:00:00Z","assets":[{"name":"%s","digest":"sha256:%s","size":1,"browser_download_url":"%s/download/%s"}]}]' \
+        "$ETAG" "$EASSET" "$ESA" "$BASE" "$EASSET" > "$SRV/llama-releases.json"
+    # Pin the asset pick (config engine_asset = Exact candidate) and a
+    # port that cannot clash with any real daemon.
+    mkdir -p "$TMP/home/.config/pallama"
+    printf 'engine_asset = "ubuntu-x86_64"\nport = 11499\n' > "$TMP/home/.config/pallama/config.toml"
+
+    ENGINE_ENV="HOME=$TMP/home PALLAMA_INSTALL_BASE_URL=$BASE PALLAMA_GH_BASE=$BASE PALLAMA_SUDO=$TMP/fakesudo PALLAMA_SYSTEMCTL=$TMP/fakesystemctl PALLAMA_SYSTEM_BIN_DIR=$SYSTEM_BIN PALLAMA_UNIT_PATH=$UNIT_OUT"
+    OUT=$(env $ENGINE_ENV sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
+    if [ "$RC" = 0 ] && echo "$OUT" | grep -q "engine bootstrap complete"; then
+        ok "one-click: engine bootstrapped during install"
+    else
+        bad "engine bootstrap did not complete (rc=$RC)"; echo "$OUT" | sed 's/^/    /'
+    fi
+    LIST=$(env HOME=$TMP/home PALLAMA_GH_BASE= "$SYSTEM_BIN/pallama" engine list 2>/dev/null) || LIST=
+    echo "$LIST" | grep -q "$ETAG.*\[active\]" &&
+        ok "engine ${ETAG} installed and ACTIVE (persisted in store)" ||
+        bad "engine not active after install: $LIST"
+    echo "$OUT" | grep -q "system ready" && ok "final readiness status printed" || bad "no readiness status"
+else
+    echo "SKIP: case 4 needs x86_64 host + $STUB"
+fi
 
 echo
 echo "install e2e: $PASS passed, $FAIL failed"

@@ -22,6 +22,10 @@
 #   PALLAMA_VERSION            pin a release tag (e.g. v0.3.0)
 #   PALLAMA_REPO               GitHub owner/name hosting releases
 #   PALLAMA_INSTALL_BASE_URL   replace the GitHub API base (mirrors, tests)
+#   PALLAMA_INSTALL_ENGINE     0 = skip the engine bootstrap (default: install
+#                              the llama.cpp engine so the box is infer-ready)
+#   PALLAMA_INSTALL_MODEL      optional first model to pull (e.g.
+#                              qwen2.5:0.5b) — opt-in, never defaulted
 #   PALLAMA_SYSTEM_BIN_DIR     binary destination (default /usr/local/bin)
 #   PALLAMA_SERVICE_USER/GROUP unit user/group (default: invoking user)
 #   GITHUB_TOKEN               optional API token (rate limits, private repos)
@@ -282,6 +286,32 @@ EOF
     else
         status "config migration skipped (no config or parse issue — run: pallama migrate)"
     fi
+    # One-click readiness: a pallama install without a llama.cpp engine
+    # has ZERO inference capability. Bootstrap the engine now (the user
+    # ran the installer — the download is sanctioned, never hidden).
+    # Opt out: PALLAMA_INSTALL_ENGINE=0. Optional first model:
+    # PALLAMA_INSTALL_MODEL=<repo> (pull lane, opt-in — model choice is
+    # the user's call, not the installer's).
+    if [ "${PALLAMA_INSTALL_ENGINE:-1}" != 0 ] &&
+       ! "$BIN_DIR/pallama" engine list 2>/dev/null | grep -q '\[active\]'; then
+        status "bootstrapping llama.cpp engine (pallama engine update — largest download of this install)..."
+        if "$BIN_DIR/pallama" engine update --no-gate; then
+            status "engine bootstrap complete"
+        else
+            status "WARN: engine bootstrap failed (offline?) — inference NOT ready. Run: pallama engine update"
+        fi
+    else
+        status "engine already active (or bootstrap disabled) — skipping engine download"
+    fi
+    if [ -n "${PALLAMA_INSTALL_MODEL:-}" ]; then
+        status "pulling first model: ${PALLAMA_INSTALL_MODEL}..."
+        if "$BIN_DIR/pallama" pull "${PALLAMA_INSTALL_MODEL}"; then
+            status "model ready: ${PALLAMA_INSTALL_MODEL}"
+        else
+            status "WARN: model pull failed — run: pallama pull ${PALLAMA_INSTALL_MODEL}"
+        fi
+    fi
+    status "system ready — check health: pallama doctor"
     status "All inference is upstream llama.cpp — ggml, ggerganov and contributors did the hard parts."
 }
 
