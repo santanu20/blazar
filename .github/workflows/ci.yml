@@ -20,10 +20,25 @@ jobs:
       - run: cargo test --workspace -- --test-threads=1
 
   scripts:
-    name: shellcheck + installer e2e
-    runs-on: ubuntu-latest
+    name: shellcheck + installer e2e (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # x86_64 runs everything; arm64 proves the aarch64 asset lane
+        # (e2e cases 4+7 are x86_64-gated and skip there by design).
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y shellcheck
       - run: shellcheck -S warning scripts/*.sh tests/install_e2e.sh
+      # e2e installs real artifacts: host pallama binary + the stub engine
+      # (stub only needed where case 4 runs — x86_64).
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p pallama-cli
+      - run: |
+          if [ "$(uname -m)" = x86_64 ]; then
+            cargo build --release -p pallama-runtime --features test-util --bin stub-llama-server
+          fi
       - run: sh tests/install_e2e.sh

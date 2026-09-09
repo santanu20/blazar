@@ -8,6 +8,11 @@
 #   4. one-click   — engine bootstrap: install.sh pulls the llama.cpp engine
 #                   from the (faked) engine lane and leaves it ACTIVE — the
 #                   box is infer-ready with zero manual steps
+#   5. --build     — a failing toolchain bootstrap is LOUD and FATAL (the
+#                   bootstrap really ran, with --minimal, nothing installed)
+#   6. unit groups — SupplementaryGroups lists only render/video groups that
+#                   exist on the box (systemd rejects units naming ghosts)
+#   7. armv7 host  — fake uname armv7l maps to the static musleabihf asset
 #
 # The fake release JSON puts a decoy asset with a WRONG digest first, so a
 # parser bug that grabs a sibling asset's digest fails this test.
@@ -223,6 +228,90 @@ if [ "$(uname -m)" = x86_64 ] && [ -x "$STUB" ]; then
     echo "$OUT" | grep -q "system ready" && ok "final readiness status printed" || bad "no readiness status"
 else
     echo "SKIP: case 4 needs x86_64 host + $STUB"
+fi
+
+# --- 5. --build with a failing bootstrap: loud + fatal ------------------------
+# FORCE_BOOTSTRAP runs our fake bootstrap even though this box has cargo;
+# the fake records its argv and fails, proving the --build lane (a) really
+# calls the bootstrap, (b) invokes it with --minimal, (c) reports the
+# failure loudly, (d) refuses to continue (explicit intent, no fallback).
+rm -rf "$SYSTEM_BIN" "$UNIT_OUT"
+MARKER="$TMP/bootstrap-called"
+cat > "$TMP/fake-bootstrap" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" > "$MARKER"
+exit 1
+EOF
+chmod +x "$TMP/fake-bootstrap"
+BUILD_ENV="HOME=$TMP/home PALLAMA_SUDO=$TMP/fakesudo PALLAMA_SYSTEMCTL=$TMP/fakesystemctl PALLAMA_SYSTEM_BIN_DIR=$SYSTEM_BIN PALLAMA_UNIT_PATH=$UNIT_OUT PALLAMA_INSTALL_ENGINE=0 PALLAMA_CHECKOUT=$ROOT PALLAMA_BOOTSTRAP=$TMP/fake-bootstrap PALLAMA_FORCE_BOOTSTRAP=1"
+OUT=$(env $BUILD_ENV sh "$INSTALL_SH" --build 2>&1) && RC=0 || RC=$?
+if [ "$RC" != 0 ] && [ "$(cat "$MARKER" 2>/dev/null)" = "--minimal" ]; then
+    ok "--build ran the bootstrap (--minimal) and failed hard"
+else
+    bad "--build bootstrap not run/not fatal (rc=$RC, argv=$(cat "$MARKER" 2>/dev/null))"
+fi
+echo "$OUT" | grep -q "toolchain bootstrap failed" && ok "bootstrap failure reported loudly" || bad "no bootstrap-failure warning"
+[ ! -e "$SYSTEM_BIN/pallama" ] && ok "nothing installed after failed --build" || bad "binary installed despite failed --build"
+
+# --- 6. unit SupplementaryGroups only for groups that exist ------------------
+# install.sh filters render/video through /etc/group; the generated unit
+# must match the box (oracle duplication of the existence predicate is
+# intentional, same as the TARGET derivation at the top of this file).
+rm -rf "$SYSTEM_BIN" "$UNIT_OUT" "${TMP:?}/home"
+mkdir -p "$TMP/home"
+printf '{"tag_name":"%s","assets":[{"name":"%s","digest":"sha256:%s","browser_download_url":"%s/download/%s"}]}' \
+    "$TAG" "$ASSET" "$SHA" "$BASE" "$ASSET" > "$SRV/release.json"
+OUT=$(env $INSTALL_ENV sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
+WANT_SG=
+for g in render video; do
+    if getent group "$g" >/dev/null 2>&1 || grep -q "^${g}:" /etc/group 2>/dev/null; then
+        WANT_SG="${WANT_SG}${WANT_SG:+ }$g"
+    fi
+done
+if [ -z "$WANT_SG" ]; then
+    if ! grep -q "^SupplementaryGroups=" "$UNIT_OUT" 2>/dev/null; then
+        ok "no SupplementaryGroups line when render/video groups are absent"
+    else
+        bad "unit lists SupplementaryGroups but no render/video group exists"
+    fi
+else
+    grep -q "^SupplementaryGroups=${WANT_SG}$" "$UNIT_OUT" 2>/dev/null &&
+        ok "SupplementaryGroups=${WANT_SG} matches existing groups" ||
+        bad "unit SupplementaryGroups mismatch (want '${WANT_SG}': $(grep '^SupplementaryGroups' "$UNIT_OUT" 2>/dev/null))"
+fi
+
+# --- 7. armv7 host mapping: picks the static musleabihf asset -----------------
+# A fake uname (first on PATH) reports armv7l/Linux; the release lane must
+# derive pallama-<tag>-armv7-unknown-linux-musleabihf.tar.gz. The staged
+# tarball carries the host binary so the install completes; the point is
+# the asset-name mapping. x86_64 host only (binary must still run).
+if [ "$(uname -m)" = x86_64 ]; then
+    rm -rf "$SYSTEM_BIN" "$UNIT_OUT" "${TMP:?}/home"
+    mkdir -p "$TMP/home" "$TMP/fakebin"
+    cat > "$TMP/fakebin/uname" <<'EOF'
+#!/bin/sh
+case "$1" in
+    -m) echo armv7l ;;
+    *) echo Linux ;;
+esac
+EOF
+    chmod +x "$TMP/fakebin/uname"
+    ARM_ASSET="pallama-${TAG}-armv7-unknown-linux-musleabihf.tar.gz"
+    tar -czf "$SRV/$ARM_ASSET" -C "$STAGE" .
+    ARM_SHA=$(sha256sum "$SRV/$ARM_ASSET" | cut -d' ' -f1)
+    printf '{"tag_name":"%s","assets":[{"name":"%s","digest":"sha256:%s","browser_download_url":"%s/download/%s"}]}' \
+        "$TAG" "$ARM_ASSET" "$ARM_SHA" "$BASE" "$ARM_ASSET" > "$SRV/release.json"
+    OUT=$(env PATH="$TMP/fakebin:$PATH" $INSTALL_ENV sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
+    if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Downloading ${ARM_ASSET}"; then
+        ok "armv7l host mapped to ${ARM_ASSET}"
+    else
+        bad "armv7l mapping failed (rc=$RC)"; echo "$OUT" | sed 's/^/    /'
+    fi
+    echo "$OUT" | grep -q "linux armv7 (musleabihf)" &&
+        ok "status line reports the armv7 + musleabihf pick" ||
+        bad "status line missing armv7 musleabihf"
+else
+    echo "SKIP: case 7 needs x86_64 host (fake-armv7 tarball carries the host binary)"
 fi
 
 echo

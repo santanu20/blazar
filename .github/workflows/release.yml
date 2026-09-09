@@ -24,9 +24,14 @@ jobs:
           - { target: x86_64-unknown-linux-musl, os: ubuntu-22.04, apt: musl-tools, smoke: true }
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04, apt: "gcc-aarch64-linux-gnu", smoke: false }
           - { target: aarch64-unknown-linux-musl, os: ubuntu-22.04, cross: true, smoke: false }
+          # 32-bit ARM boards (Pi 3/4 on 32-bit OS etc.): musl for old-libc freedom.
+          - { target: armv7-unknown-linux-musleabihf, os: ubuntu-22.04, cross: true, smoke: false }
           - { target: x86_64-apple-darwin, os: macos-14, smoke: false }
           - { target: aarch64-apple-darwin, os: macos-14, smoke: true }
           - { target: x86_64-pc-windows-msvc, os: windows-latest, smoke: true }
+          # Windows on ARM: MSVC ARM64 build tools ship on GH runners; exe not
+          # runnable on the x64 host, so no smoke.
+          - { target: aarch64-pc-windows-msvc, os: windows-latest, smoke: false }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -125,7 +130,9 @@ jobs:
 
           Linux / macOS (WSL included):
 
-              curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/scripts/install.sh | sh
+              curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/scripts/install.sh | PALLAMA_REPO=${GITHUB_REPOSITORY} sh
+
+          (or clone and run \`sh scripts/install.sh --build\` to compile from source)
 
           Windows (PowerShell):
 
@@ -145,3 +152,52 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --notes-file notes.md \
             --generate-notes
+
+  # Real-OS validation of the just-published installers: download via the
+  # GitHub API, sha256-verify, extract, PATH, service lane. Engine
+  # bootstrap stays off (PALLAMA_INSTALL_ENGINE=0): the engine vendor
+  # matrix has its own coverage; this job proves the INSTALLER lanes.
+  installer-smoke:
+    name: installer smoke (${{ matrix.os }})
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # GitHub computes asset digests a short while after upload; the
+      # installers refuse unverified downloads, so retry through the race.
+      - name: Install (sh)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          PALLAMA_REPO: ${{ github.repository }}
+          PALLAMA_INSTALL_ENGINE: '0'
+        run: |
+          for i in 1 2 3 4; do
+            if sh scripts/install.sh; then break; fi
+            if [ "$i" = 4 ]; then exit 1; fi
+            echo "retry $i/3 (asset digests may still be computing)"
+            sleep 30
+          done
+          export PATH="$HOME/.local/bin:$PATH"
+          command -v pallama
+          pallama --version
+      - name: Install (ps1)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          PALLAMA_INSTALL_ENGINE: '0'
+        run: |
+          for ($i = 1; $i -le 4; $i++) {
+            # Child pwsh: the installer's Fail() exits its session, a
+            # plain call would take this step down with it.
+            pwsh -NoProfile -File scripts/install.ps1 -Repo $env:GITHUB_REPOSITORY
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($i -eq 4) { exit 1 }
+            Write-Host "retry $i/3 (asset digests may still be computing)"
+            Start-Sleep -Seconds 30
+          }
+          & "$env:LOCALAPPDATA\Programs\pallama\pallama.exe" --version

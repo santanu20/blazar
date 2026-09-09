@@ -1,26 +1,37 @@
 #!/bin/sh
 # pallama installer — Linux and macOS. System-wide, like ollama:
-# root-owned binary in /usr/local/bin + systemd unit (Restart=always).
-# There is NO user-path install mode; a second copy in ~/.local/bin is how
-# stale-binary daemon races happen (doctor flags them).
+# root-owned binary in /usr/local/bin + systemd unit (Linux) or launchd
+# service (macOS). There is NO user-path install mode; a second copy in
+# ~/.local/bin is how stale-binary daemon races happen (doctor flags them).
 #
 #   curl --proto '=https' --tlsv1.2 -fsSL <raw-url-of-this-file> | sh
 #
 # From a checkout: builds fresh with cargo first (zero-arg runs never
-# install a stale target/release), then installs system-wide.
+# install a stale target/release), then installs system-wide. Missing
+# compile toolchain (cc/rust)? scripts/bootstrap.sh --minimal provisions
+# it automatically — announce-then-act, never silently.
 #
 # Verifies the asset sha256 from the GitHub release API (the same source
 # of truth as `pallama engine update`) before installing anything.
 #
 # Flags:
-#   --build           force the source path (no release channel contact)
+#   --build           force the source path (no release channel contact;
+#                     bootstraps the toolchain when missing)
 #   --from <binary>   install a locally built binary (bootstrap/offline)
 #   --uninstall       remove binary + units (models/config are user data,
 #                     kept: ~/.local/share/pallama, ~/.config/pallama)
 #
 # Environment overrides:
 #   PALLAMA_VERSION            pin a release tag (e.g. v0.3.0)
-#   PALLAMA_REPO               GitHub owner/name hosting releases
+#   PALLAMA_REPO               GitHub owner/name hosting releases (unset:
+#                              derived from the enclosing checkout's git
+#                              origin when available)
+#   PALLAMA_BOOTSTRAP          override the bootstrap script path (default:
+#                              <checkout>/scripts/bootstrap.sh)
+#   PALLAMA_AUTO_BOOTSTRAP     0 = never auto-install a toolchain; auto
+#                              mode falls back to the release channel
+#   PALLAMA_FORCE_BOOTSTRAP    1 = run the bootstrap even when a toolchain
+#                              exists (test knob, like PALLAMA_SUDO)
 #   PALLAMA_INSTALL_BASE_URL   replace the GitHub API base (mirrors, tests)
 #   PALLAMA_INSTALL_ENGINE     0 = skip the engine bootstrap (default: install
 #                              the llama.cpp engine so the box is infer-ready)
@@ -77,6 +88,56 @@ pick_libc() {
     fi
 }
 
+# PALLAMA_REPO unset: derive owner/name from the enclosing checkout's
+# git origin so a one-liner run inside a clone (or from the README of a
+# fork) needs no exports. A git remote is the only trustworthy source —
+# there is no hardcoded canonical home, so forks keep installing from
+# their own releases.
+derive_repo() {
+    command -v git >/dev/null 2>&1 || return 1
+    _url=$(cd "$(dirname "$0")" 2>/dev/null && git remote get-url origin 2>/dev/null) || return 1
+    case "$_url" in
+        git@*) _url=${_url#git@*} _url=${_url#*:} ;;
+        https://*) _url=${_url#https://*/} ;;
+        http://*) _url=${_url#http://*/} ;;
+        ssh://git@*) _url=${_url#ssh://git@*} _url=${_url#*/} ;;
+        ssh://*) _url=${_url#ssh://*/} ;;
+        *) return 1 ;;
+    esac
+    _url=${_url%.git}
+    case "$_url" in
+        */*/*) return 1 ;; # extra path segments — not owner/name
+        */*) printf '%s\n' "$_url" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Provision a missing compile toolchain (cc + rust) via bootstrap.sh
+# --minimal, announce-then-act. Returns 0 when a source build is
+# possible (already present, or bootstrapped now); 1 when declined
+# (PALLAMA_AUTO_BOOTSTRAP=0), impossible (no bootstrap script) or the
+# bootstrap itself failed — NEVER a silent path: the caller reports.
+ensure_toolchain() {
+    if [ "${PALLAMA_FORCE_BOOTSTRAP:-0}" != 1 ]; then
+        command -v cargo >/dev/null 2>&1 && command -v cc >/dev/null 2>&1 && return 0
+    fi
+    [ "${PALLAMA_AUTO_BOOTSTRAP:-1}" = 1 ] || return 1
+    _bs="${PALLAMA_BOOTSTRAP:-}"
+    if [ -z "$_bs" ]; then
+        _ck=$(find_checkout 2>/dev/null) && [ -f "$_ck/scripts/bootstrap.sh" ] && _bs="$_ck/scripts/bootstrap.sh"
+    fi
+    [ -n "$_bs" ] || return 1
+    status "toolchain missing — bootstrapping cc/make/rust via: sh $_bs --minimal"
+    if ! sh "$_bs" --minimal; then
+        status "WARN: toolchain bootstrap failed (output above) — source build unavailable on this box"
+        return 1
+    fi
+    # rustup ran in a child process; its ~/.cargo/env can't reach us, so
+    # refresh PATH manually.
+    PATH="$HOME/.cargo/bin:$PATH"
+    command -v cargo >/dev/null 2>&1 && command -v cc >/dev/null 2>&1
+}
+
 UNINSTALL=0
 FROM_BIN=
 FORCE_BUILD=0
@@ -123,6 +184,18 @@ if [ "$UNINSTALL" = 1 ]; then
         rm -f "$HOME/.config/systemd/user/pallama.service" && status "removed legacy user unit"
         systemctl --user daemon-reload 2>/dev/null || true
     fi
+    if [ "$(uname -s)" = Darwin ]; then
+        launchctl bootout "gui/$(id -u)/dev.pallama" 2>/dev/null ||
+            launchctl unload "$HOME/Library/LaunchAgents/dev.pallama.plist" 2>/dev/null || true
+        if [ -f "$HOME/Library/LaunchAgents/dev.pallama.plist" ]; then
+            rm -f "$HOME/Library/LaunchAgents/dev.pallama.plist" && status "removed launch agent"
+        fi
+        if [ -f /Library/LaunchDaemons/dev.pallama.plist ]; then
+            $SUDO launchctl bootout system/dev.pallama 2>/dev/null ||
+                $SUDO launchctl unload /Library/LaunchDaemons/dev.pallama.plist 2>/dev/null || true
+            $SUDO rm -f /Library/LaunchDaemons/dev.pallama.plist && status "removed launch daemon"
+        fi
+    fi
     status "uninstalled. models/config kept at ~/.local/share/pallama and ~/.config/pallama (delete manually if desired)"
     exit 0
 fi
@@ -142,25 +215,35 @@ find_checkout() {
 
 build_from_checkout() {
     # Prints the built binary path on success; returns non-zero when a
-    # source build is impossible (caller decides: fatal vs fallback).
+    # source build is impossible or fails (caller decides: fatal vs
+    # loud fallback). NEVER exits from here — when called via $(...) an
+    # exit only kills the subshell and the caller would silently degrade
+    # to the release channel.
     command -v cargo >/dev/null 2>&1 || return 1
     CK=$(find_checkout) || return 1
     status "building from source: cargo build --release -p pallama-cli (in ${CK})"
-    (cd "$CK" && cargo build --release -p pallama-cli) ||
-        error "source build failed (cargo output above)"
-    [ -f "$CK/target/release/pallama" ] || error "build produced no target/release/pallama"
+    if ! (cd "$CK" && cargo build --release -p pallama-cli); then
+        echo "ERROR: source build failed (cargo output above)" >&2
+        return 1
+    fi
+    [ -f "$CK/target/release/pallama" ] || { echo "ERROR: build produced no target/release/pallama" >&2; return 1; }
     echo "$CK/target/release/pallama"
 }
 
 # Zero-argument auto mode: a checkout present -> compile FRESH (never a
 # stale target/release), then install system-wide. Checkout-less runs
-# (curl | sh) fall through to the release channel.
+# (curl | sh) fall through to the release channel. A missing toolchain
+# is bootstrapped first (announce-then-act); every failure falls back to
+# the release channel LOUD — never silently.
 if [ -z "$FROM_BIN" ] && [ "$FORCE_BUILD" = 0 ] &&
    [ -z "${PALLAMA_REPO:-}" ] && [ -z "${PALLAMA_INSTALL_BASE_URL:-}" ]; then
-    if command -v cargo >/dev/null 2>&1 && find_checkout >/dev/null 2>&1; then
-        status "auto: checkout found - building fresh before install"
-        if FROM_BIN=$(build_from_checkout); then
-            status "auto: installing the fresh build system-wide (binary + systemd service)"
+    if find_checkout >/dev/null 2>&1; then
+        if ! ensure_toolchain; then
+            status "auto: toolchain unavailable (bootstrap failed or PALLAMA_AUTO_BOOTSTRAP=0) — falling back to the release channel"
+        elif FROM_BIN=$(build_from_checkout); then
+            status "auto: installing the fresh build system-wide (binary + service)"
+        else
+            status "auto: source build failed — falling back to the release channel (errors above)"
         fi
     fi
 fi
@@ -174,18 +257,105 @@ if [ -n "$FROM_BIN" ]; then
 fi
 
 # --build: force the source path (audited/offline installs; never touches
-# the release channel).
+# the release channel). Toolchain bootstrapping is part of the deal —
+# the user asked for a source build, so a missing cc/rust is provisioned,
+# and a failed bootstrap is FATAL (explicit intent, no fallback).
 if [ "$FORCE_BUILD" = 1 ] && [ -z "${FROM_BIN:-}" ]; then
+    ensure_toolchain ||
+        error "--build: no compile toolchain and bootstrap failed — install Rust (https://rustup.rs) + a C compiler, or set PALLAMA_BOOTSTRAP=<path to scripts/bootstrap.sh>"
     FROM_BIN=$(build_from_checkout) ||
-        error "--build: need cargo + a pallama checkout (set PALLAMA_CHECKOUT=<repo>; Rust from https://rustup.rs)"
+        error "--build: source build failed (cargo output above)"
     status "--build: source path forced (no release channel contact)"
 fi
 
 # Repo guard is release-channel only: --from bootstrap and mirror/test
-# base URLs never touch the GitHub release API.
+# base URLs never touch the GitHub release API. PALLAMA_REPO unset:
+# derive owner/name from the checkout's git origin (README one-liners
+# work inside a clone with zero exports).
 if [ -z "${PALLAMA_INSTALL_BASE_URL:-}" ] && [ -z "${FROM_BIN:-}" ] && [ -z "$REPO" ]; then
-    error "PALLAMA_REPO is not set. Export PALLAMA_REPO=owner/pallama (the GitHub repo hosting pallama releases) and re-run, or bootstrap a local build: sudo sh scripts/install.sh --from target/release/pallama"
+    REPO=$(derive_repo) || REPO=
+    [ -n "$REPO" ] && status "PALLAMA_REPO unset — derived from git origin: ${REPO}"
+    API_BASE="${PALLAMA_INSTALL_BASE_URL:-https://api.github.com/repos/${REPO}}"
 fi
+if [ -z "${PALLAMA_INSTALL_BASE_URL:-}" ] && [ -z "${FROM_BIN:-}" ] && [ -z "$REPO" ]; then
+    error "PALLAMA_REPO is not set and no git origin to derive it from. Either export PALLAMA_REPO=owner/pallama (the GitHub repo hosting releases) and re-run, or clone the repo and run scripts/install.sh from inside it (compiles from source, no release needed)"
+fi
+
+# macOS service via launchd (called from install_system when systemctl
+# is absent but launchctl exists). Non-root: LaunchAgent at login. Root:
+# LaunchDaemon at boot with UserName= so the daemon still runs
+# unprivileged — mirroring the systemd unit's User=. KeepAlive is the
+# launchd spelling of Restart=always.
+install_launchd() {
+    LABEL=dev.pallama
+    if [ "$(id -u)" -eq 0 ]; then
+        PLIST_DIR=/Library/LaunchDaemons
+        USER_KEY="
+    <key>UserName</key>
+    <string>${SVC_USER}</string>"
+    else
+        PLIST_DIR="$HOME/Library/LaunchAgents"
+        USER_KEY=
+    fi
+    PLIST_PATH="$PLIST_DIR/$LABEL.plist"
+    PLIST_BODY=$(cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${BIN_DIR}/pallama</string>
+        <string>serve</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>${USER_KEY}
+</dict>
+</plist>
+EOF
+)
+    if [ "$(id -u)" -eq 0 ]; then
+        launchctl bootout "system/$LABEL" 2>/dev/null || true
+        printf '%s\n' "$PLIST_BODY" > "$PLIST_PATH"
+        launchctl bootstrap system "$PLIST_PATH" 2>/dev/null || launchctl load "$PLIST_PATH"
+    else
+        UID_N=$(id -u)
+        launchctl bootout "gui/${UID_N}/$LABEL" 2>/dev/null ||
+            launchctl unload "$PLIST_PATH" 2>/dev/null || true
+        mkdir -p "$PLIST_DIR"
+        printf '%s\n' "$PLIST_BODY" > "$PLIST_PATH"
+        launchctl bootstrap "gui/$UID_N" "$PLIST_PATH" 2>/dev/null ||
+            launchctl load "$PLIST_PATH" || error "loading $PLIST_PATH failed"
+    fi
+    poll_healthz "logs: log show --predicate 'process == \"pallama\"' --last 5m"
+}
+
+# Poll the configured host (quoted or bare TOML), not a hardcoded
+# loopback — a config bound to a specific interface answers there.
+# Shared by the systemd and launchd install paths.
+poll_healthz() {
+    # poll_healthz <log-hint>
+    HOST=$(sed -n 's/^host[[:space:]]*=[[:space:]]*//p' "$HOME/.config/pallama/config.toml" 2>/dev/null | head -1 | tr -d '"')
+    PORT=$(sed -n 's/^port[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$HOME/.config/pallama/config.toml" 2>/dev/null | head -1)
+    HOST=${HOST:-127.0.0.1}
+    PORT=${PORT:-11434}
+    i=0
+    while ! curl -s --max-time 2 "http://${HOST}:${PORT}/healthz" 2>/dev/null | grep -q ok; do
+        i=$((i + 1)); [ "$i" -gt 30 ] && break
+        sleep 1
+    done
+    if curl -s --max-time 2 "http://${HOST}:${PORT}/healthz" 2>/dev/null | grep -q ok; then
+        status "service active; pallama healthy on :${PORT} ($1)"
+    else
+        status "service enabled; healthz not answering on :${PORT} yet — check: $1"
+    fi
+}
 
 # ---- system-wide install: root-owned binary + systemd unit ----
 # One implementation for every channel (build/auto/from/release). Like
@@ -209,14 +379,26 @@ install_system() {
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
         kill -TERM "$(cat "$PIDFILE")" 2>/dev/null || true
         i=0
-        while kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null && [ "$i" -lt 20 ]; do
-            i=$((i + 1)); sleep 0.5
+        while kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null && [ "$i" -lt 10 ]; do
+            i=$((i + 1)); sleep 1
         done
     fi
     SVC_USER="${PALLAMA_SERVICE_USER:-$(id -un)}"
     UNIT_PATH="${PALLAMA_UNIT_PATH:-/etc/systemd/system/pallama.service}"
     SYSTEMCTL="${PALLAMA_SYSTEMCTL:-systemctl}"
     if command -v "$SYSTEMCTL" >/dev/null 2>&1; then
+        # SupplementaryGroups only for groups that exist on this box —
+        # systemd rejects the whole unit when a listed group is missing
+        # (containers, WSL, minimal images ship without render/video).
+        SG=
+        for g in render video; do
+            if getent group "$g" >/dev/null 2>&1 ||
+               grep -q "^${g}:" /etc/group 2>/dev/null; then
+                SG="${SG}${SG:+ }$g"
+            fi
+        done
+        SG_LINE=
+        [ -n "$SG" ] && SG_LINE="SupplementaryGroups=$SG"
         $SUDO mkdir -p "$(dirname "$UNIT_PATH")"
         UNIT=$(cat <<EOF
 [Unit]
@@ -228,7 +410,7 @@ Wants=network-online.target
 ExecStart=${BIN_DIR}/pallama serve
 User=${SVC_USER}
 Group=${PALLAMA_SERVICE_GROUP:-$(id -gn)}
-SupplementaryGroups=render video
+${SG_LINE}
 Restart=always
 RestartSec=3
 
@@ -245,27 +427,16 @@ EOF
         else
             $SUDO "$SYSTEMCTL" enable --now pallama || error "enabling pallama.service failed"
         fi
-        # Poll the configured host (quoted or bare TOML), not a hardcoded
-        # loopback — a config bound to a specific interface answers there.
-        HOST=$(sed -n 's/^host[[:space:]]*=[[:space:]]*//p' "$HOME/.config/pallama/config.toml" 2>/dev/null | head -1 | tr -d '"')
-        PORT=$(sed -n 's/^port[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$HOME/.config/pallama/config.toml" 2>/dev/null | head -1)
-        HOST=${HOST:-127.0.0.1}
-        PORT=${PORT:-11434}
-        i=0
-        while ! curl -s --max-time 2 "http://${HOST}:${PORT}/healthz" 2>/dev/null | grep -q ok; do
-            i=$((i + 1)); [ "$i" -gt 30 ] && break
-            sleep 1
-        done
-        if curl -s --max-time 2 "http://${HOST}:${PORT}/healthz" 2>/dev/null | grep -q ok; then
-            status "systemd service active; pallama healthy on :${PORT} (logs: journalctl -u pallama)"
-        else
-            status "service enabled; healthz not answering on :${PORT} yet — check: journalctl -u pallama -n 30"
-        fi
+        poll_healthz "logs: journalctl -u pallama"
+        SERVICE_DESC=" + systemd unit ${UNIT_PATH}"
+    elif [ "$(uname -s)" = Darwin ] && command -v launchctl >/dev/null 2>&1; then
+        install_launchd
+        SERVICE_DESC=" + launchd service ${PLIST_PATH}"
     else
-        status "systemd not found — binary installed at ${BIN_DIR}/pallama; start it manually: pallama serve"
+        status "no service manager found — binary installed at ${BIN_DIR}/pallama; start it manually: pallama serve"
     fi
     VER=$("$BIN_DIR/pallama" --version 2>/dev/null || echo "(version check failed)")
-    status "Installed pallama ${VER} system-wide (${BIN_DIR}/pallama + ${UNIT_PATH:-no unit})"
+    status "Installed pallama ${VER} system-wide (${BIN_DIR}/pallama${SERVICE_DESC:-})"
     # The stale-copy race: a leftover user-path copy gets resurrected by
     # services with their own PATH. Remove it as part of every install.
     # -ef (same inode, symlinks followed) works where `readlink -f` does
@@ -311,7 +482,13 @@ EOF
             status "WARN: model pull failed — run: pallama pull ${PALLAMA_INSTALL_MODEL}"
         fi
     fi
-    status "system ready — check health: pallama doctor"
+    status "system ready — next steps:"
+    if [ -n "${PALLAMA_INSTALL_MODEL:-}" ]; then
+        status "  pallama run ${PALLAMA_INSTALL_MODEL}   # chat REPL (model pulled above)"
+    else
+        status "  pallama pull <model>    # e.g. pallama pull Qwen3-0.6B (find one: pallama search qwen3)"
+    fi
+    status "  pallama doctor          # health check with per-row hints"
     status "All inference is upstream llama.cpp — ggml, ggerganov and contributors did the hard parts."
 }
 
@@ -327,12 +504,20 @@ ARCH=$(uname -m)
 case "$ARCH" in
     x86_64) RUST_ARCH=x86_64 ;;
     aarch64 | arm64) RUST_ARCH=aarch64 ;;
-    *) error "unsupported architecture: $ARCH (supported: x86_64/amd64, aarch64/arm64)" ;;
+    # 32-bit ARM (armv8l = aarch64 kernel with 32-bit userland): the only
+    # published build is the static musl hard-float one — no gnu variant
+    # exists, so libc detection is skipped entirely.
+    armv7l | armv7hl | armv8l) RUST_ARCH=armv7 ;;
+    *) error "unsupported architecture: $ARCH (supported: x86_64/amd64, aarch64/arm64, armv7)" ;;
 esac
 
 case "$OS" in
     Linux)
-        LIBC=$(pick_libc)
+        if [ "$RUST_ARCH" = armv7 ]; then
+            LIBC=musleabihf
+        else
+            LIBC=$(pick_libc)
+        fi
         STATUS_OS="linux"
         ASSET_TRIPLE_SUFFIX="unknown-linux-${LIBC}"
         ;;
@@ -380,6 +565,7 @@ printf '%s' "$RELEASE_JSON" | tr ',' '\n' | grep -E '"(name|digest)": *"' | \
         fi
     done > "${TMPDIR:-/tmp}/pallama-asset.$$"
 read -r ASSET EXPECT < "${TMPDIR:-/tmp}/pallama-asset.$$" || true
+rm -f "${TMPDIR:-/tmp}/pallama-asset.$$"
 [ -n "$ASSET" ] || error "release ${TAG} has no asset matching pallama-${TAG}-${RUST_ARCH}-${ASSET_TRIPLE_SUFFIX}.tar.gz (available: $(printf '%s' "$RELEASE_JSON" | tr ',' '\n' | grep -o '"name": *"[^"]*"' | cut -d'"' -f4 | tr '\n' ' '))"
 [ -n "$EXPECT" ] || error "release ${TAG} asset ${ASSET} carries no sha256 digest — refusing to install unverified"
 EXPECT=${EXPECT#sha256:}

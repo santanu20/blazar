@@ -1,15 +1,22 @@
 #!/bin/sh
-# pallama DEVELOPER-environment bootstrap: every dependency a contributor
-# needs to build, test and lint from source. The SHIPPED binary has no
-# runtime dependencies (bundled SQLite, rustls) — end users never need
-# this; scripts/install.sh stays dep-free on purpose.
+# pallama environment bootstrap. Two consumers:
+#   1. CONTRIBUTORS (default mode): every dependency needed to build,
+#      test and lint from source.
+#   2. scripts/install.sh (--minimal): just the compile toolchain (cc,
+#      make, rust) when a user asked to build from source on a box that
+#      lacks it.
+# The SHIPPED binary has no runtime dependencies (bundled SQLite, rustls)
+# — end users on the release-binary lane never need this script.
 #
 # Idempotent: installs only what is missing. Linux (apt/dnf/pacman/zypper)
-# + macOS (brew). Windows contributors: install Rust from https://rustup.rs,
-# then `cargo test --workspace` (binary install: scripts/install.ps1).
+# + macOS (brew / Xcode CLT). Windows contributors: install Rust from
+# https://rustup.rs, then `cargo test --workspace` (binary install:
+# scripts/install.ps1).
 #
 # Flags:
 #   --check   report status, change nothing
+#   --minimal only cc + make + rust (the from-source install lane;
+#             skips git/python3/shellcheck/xz dev extras)
 #
 # Environment: PALLAMA_SUDO — pass-through wrapper, or empty to run
 # unprivileged (unset-only default — sudo), same knob as install.sh.
@@ -20,12 +27,19 @@ main() {
 
 set -eu
 
-CHECK=0
-[ "${1:-}" = "--check" ] && CHECK=1
-
 status() { echo ">>> $*" >&2; }
 error() { echo "ERROR: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+CHECK=0
+MINIMAL=0
+for arg in "$@"; do
+    case "$arg" in
+        --check) CHECK=1 ;;
+        --minimal) MINIMAL=1 ;;
+        *) error "unknown flag: $arg (supported: --check, --minimal)" ;;
+    esac
+done
 
 SUDO="${PALLAMA_SUDO-sudo}"
 [ "$(id -u)" -eq 0 ] && SUDO=
@@ -57,8 +71,14 @@ pkg_for() { # pkg_for <pm> <tool>; prints package name or returns 1 (skip)
     esac
 }
 
+if [ "$MINIMAL" = 1 ]; then
+    TOOLS="cc make"
+else
+    TOOLS="cc curl xz git python3 shellcheck"
+fi
+
 MISSING_TOOLS=
-for t in cc curl xz git python3 shellcheck; do
+for t in $TOOLS; do
     if have "$t"; then
         if [ "$CHECK" = 1 ]; then status "ok      $t"; fi
     else
@@ -85,6 +105,9 @@ if [ -n "$MISSING_TOOLS" ]; then
     if [ "$OS" = Darwin ]; then
         case "$MISSING_TOOLS" in
             *cc*)
+                if [ "$MINIMAL" = 1 ]; then
+                    error "cc missing: run 'xcode-select --install' for the Command Line Tools, then re-run the installer"
+                fi
                 status "cc missing: run 'xcode-select --install' for the Command Line Tools, then re-run this script"
                 ;;
         esac
@@ -117,6 +140,7 @@ fi
 
 # --- rust toolchain (opt-in flow, minimal profile) ---------------------
 if [ "$RUST_OK" = 1 ]; then
+    have curl || error "curl missing — needed to fetch rustup; install curl and re-run"
     status "installing rust via rustup (minimal profile)"
     curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
     . "$HOME/.cargo/env"
@@ -124,11 +148,15 @@ if [ "$RUST_OK" = 1 ]; then
     status "rust installed (persists in ~/.cargo/bin; source ~/.cargo/env in your profile)"
 fi
 
-status "dev environment ready. Next:"
-status "  cargo test --workspace -- --test-threads=1"
-status "  cargo clippy --workspace --all-targets -- -D warnings"
-status "  sh tests/install_e2e.sh"
-status "  sh scripts/install.sh --build   # system-wide install from this checkout"
+if [ "$MINIMAL" = 1 ]; then
+    status "compile toolchain ready (installer will continue the source build)"
+else
+    status "dev environment ready. Next:"
+    status "  cargo test --workspace -- --test-threads=1"
+    status "  cargo clippy --workspace --all-targets -- -D warnings"
+    status "  sh tests/install_e2e.sh"
+    status "  sh scripts/install.sh --build   # system-wide install from this checkout"
+fi
 
 }
 
