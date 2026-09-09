@@ -30,8 +30,8 @@ RadixAttention in-engine [V027][SGL].
 | A5 | Emit `--kv-unified` automatically when slots>1 + engine supports | ✅ | CORE | S | [ARG]+DWIKI unified default — shipped: --kv-unified default-on emission |
 | A6 | KV quant ladder (auto q8→q4 by capacity math) | ✅ | CORE | — | have (profile.rs) |
 | A7 | `tune --search` axis: cache-reuse {0,128,256,512} measured | ✅ | SUP | S | HiCache hit-ratio tuning analog [HICACHE] — shipped: tune --cache-reuse {0,256,512} grid, noise-floored adoption |
-| A8 | **Prefix-hash sticky routing** — RadixAttention-lite at the gateway (B1): hash first N tokens, route to the instance whose cache holds it | ✅ | GW | — | shipped 2026-09-07 (`replicas` overlay + prefix affinity; live-validated sticky warm 172/120 ms) |
-| A9 | Cache-hit tokens per request surfaced (usage.pallama_cache_hit_tokens from child /slots) | ❌ | GW | S | [HICACHE] hit metrics |
+| A8 | **Prefix-hash sticky routing** — RadixAttention-lite at the gateway (B1): hash first N tokens, route to the instance whose cache holds it | ✅ | GW | — | shipped 2026-09-07 (`replicas` overlay + prefix affinity; live-validated sticky warm 172/120 ms); 2026-09-08 routing 2.0: two-level `PrefixKey` (system-prompt class + conversation identity) — new conversations under a seen system prompt coalesce onto the warm replica's system-KV instead of growing a cold child |
+| A9 | Cache-hit tokens per request surfaced (usage.pallama_cache_hit_tokens from child /slots) | ✅ | GW | S | [HICACHE] shipped 2026-09-09 as `prompt_eval_cached_count` (upstream's own `cached_tokens` shape) in /api/chat usage + gateway CacheObs counters on /metrics |
 | A10 | Session KV checkpoints save/restore/erase | ✅ | SUP | — | have (34.6/14.5 ms measured) |
 | A11 | Auto-checkpoint on idle (save slot state without user asking) | ✅ | SUP | S | extends A10; [LMC] write-back idea — shipped: session_bank bank_save on evict + ctx-checkpoints knob |
 | A12 | Checkpoint write policy knob (on-idle / every-turn write-through) | 🟡 | SUP | S | [HICACHE] write_back/write_through analog — cut (adversarial): evict-banking + cache_idle_slots knob cover the need |
@@ -66,8 +66,8 @@ RadixAttention in-engine [V027][SGL].
 | # | Feature | Status | Lane | Effort | Evidence |
 |---|---|---|---|---|---|
 | C1 | `[[remotes]]` prefix routing (vLLM/MLX/another pallama) | ✅ | GW | — | shipped today |
-| C2 | Remote health-aware failover (mark down, retry alternate remote) | ❌ | GW | S | [DYN] router concepts |
-| C3 | Least-inflight load balancing across duplicate remotes | ❌ | GW | S | standard LB |
+| C2 | Remote health-aware failover (mark down, retry alternate remote) | ✅ | GW | S | SHIPPED 2026-09-08: per-remote circuit (3 consecutive fails -> 30 s mark-down, half-open probe after), 503 teaching when pool all-down |
+| C3 | Least-inflight load balancing across duplicate remotes | ✅ | GW | S | SHIPPED 2026-09-08: same-name [[remotes]] pool, header-time in-flight lease (RAII), min-in-flight selection |
 | C4 | Cache-aware remote routing (route to the remote holding the prefix) | ❌ | GW | M | [DYN] tier-aware KV routing |
 | C5 | Per-model device pinning override | ✅ | CORE | S | 2026-09-07: model_overrides devices; 2026-09-08: unset devices + >1 GPU -> auto-pick max-free card, VRAM math scoped per-card |
 | C6 | Per-model rpc_servers override | ❌ | CORE | S | global exists |
@@ -79,14 +79,14 @@ RadixAttention in-engine [V027][SGL].
 | # | Feature | Status | Lane | Effort | Evidence |
 |---|---|---|---|---|---|
 | D1 | Responses registry: previous_response_id chaining + store | ✅ | GW | — | shipped today |
-| D2 | GET /v1/responses/{id} retrieval (stored responses addressable) | ❌ | GW | S | OpenAI surface completion |
+| D2 | GET /v1/responses/{id} retrieval (stored responses addressable) | ✅ | GW | S | shipped earlier: responses registry (24h/256-LRU) + GET route |
 | D3 | ollama lane embeddings/rerank translate parity | ✅ | GW | S | 2026-09-07: /api/embed (new-style) + /api/rerank lanes, engine 501 passthrough teaching |
-| D4 | Batch API (/v1/batch: async jobs, results table) | ❌ | GW | M | OpenAI batch shape |
+| D4 | Batch API (/v1/batch: async jobs, results table) | ✅ | GW | M | Shipped 2026-09-08: `POST /v1/files` (multipart JSONL) + `POST /v1/batches` + GET/list/cancel + output file; per-line replay through full auth/quota lane. Honest: starts immediately (no 24h window), sequential worker, restart leaves in_progress (re-submit to rerun) |
 | D5 | Strict-mode function calling (strict:true schema compile + validate) | ✅ | GW | M | OpenAI Responses strict-by-default (fetched) — verified live b10840: engine enforces json_schema strict grammar natively; our lanes pass through + lint |
 | D6 | GBNF/JSON-schema grammar cache per model+schema | ❌ | GW | M | compile cost amortization |
-| D7 | Anthropic translate when engine lacks /v1/messages | ❌ | GW | M | llamactl parity |
-| D8 | Capability discovery endpoint (/.well-known/pallama) | ❌ | GW | S | novel; clients introspect |
-| D9 | Cache-hit tokens in response usage (pallama_cache_hit_tokens) | ❌ | GW | S | pairs A9 |
+| D7 | Anthropic translate when engine lacks /v1/messages | ✅ | GW | M | shipped 2026-09-08: native `/v1/messages` translate lane (tools/tool_use/tool_result, SSE event family, count_tokens); thinking/document blocks skipped, images→text marker |
+| D8 | Capability discovery endpoint (/.well-known/pallama) | ✅ | GW | S | shipped earlier (lib.rs:238): routes, limits, engine identity |
+| D9 | Cache-hit tokens in response usage (pallama_cache_hit_tokens) | ✅ | GW | S | shipped 2026-09-09: `prompt_eval_cached_count` on non-stream + stream final chunk; /v1 streams get include_usage injected so cached_tokens reaches clients |
 | D10 | Byte-faithful proxy for all OpenAI-family routes | ✅ | GW | — | have (zero-tax) |
 
 ## E. Security & multi-tenancy (8)
@@ -111,8 +111,8 @@ RadixAttention in-engine [V027][SGL].
 | F3 | why/watch with filters (key/model/code) | 🟡 | GW | S | watch exists |
 | F4 | p999 TTFT/TPOT + SLO burn alerts | ✅ | GW | S | 2026-09-07: p50/p99/p999 gauges in /metrics + pallama_slo_deadline_exceeded_total burn counter |
 | F5 | Slot-level cache-hit scrape (child /slots → hit tokens) | ❌ | GW | S | pairs A9 |
-| F6 | Bench history store + regression detection on engine update | ❌ | SUP | M | [V027] CI-class rigor |
-| F7 | Engine-update bench gate (auto-rollback on t/s regression) | ❌ | SUP | M | builds on F6 |
+| F6 | Bench history store + regression detection on engine update | ✅ | SUP | M | shipped 2026-09-08: bench_history table, tune winners recorded, latest_benches per model |
+| F7 | Engine-update bench gate (auto-rollback on t/s regression) | ✅ | SUP | M | shipped 2026-09-08: default-config tg128 both engines, >10% drop → rollback + loud error; --no-gate / PALLAMA_ENGINE_GATE=0 |
 | F8 | doctor: remotes + keys + quota health checks | ❌ | CORE | S | extends doctor |
 
 ## G. Speculative decoding (6)
@@ -149,7 +149,7 @@ RadixAttention in-engine [V027][SGL].
 | I4 | --override-tensor presets (moe-cpu-offload et al.) | ✅ | CORE | S | 2026-09-07: tensor_preset knob, validated vocabulary |
 | I5 | VRAM preflight on ctx raise (num_ctx header path) | ❌ | GW | S | capacity math exists |
 | I6 | Vulkan per-driver quirk table (flags by driver) | ❌ | EM | S | bench evidence class |
-| I7 | llama-bench regression CI on every engine update | ❌ | SUP | M | pairs F6/F7 |
+| I7 | llama-bench regression CI on every engine update | ✅ | SUP | M | shipped via F7 gate (quick_tg = llama-bench tg128 lane on every `engine update`) |
 | I8 | FP8/weight-quant lanes | UP | UP | — | GGUF lane has none; kernel-side |
 
 ## J. Reliability & ops (6)

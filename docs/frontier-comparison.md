@@ -58,6 +58,26 @@ zero reconfiguration for existing clients; 30%-of-RAM cache clamp so a 13 GiB
 laptop doesn't swap itself to death (measured this session). No Python, no
 Docker, no YAML, no cluster.
 
+**Ollama head-to-head, same box (2026-09-08, RTX 4070 laptop, Qwen3.5-9B-class, 128 tok, temp 0):**
+
+- Cold load+gen: pallama 8.8s vs ollama 13.1s (pallama -33%).
+- Warm single-stream: parity, ~40 t/s both (3.4s vs 3.3s).
+- 4-parallel aggregate (2026-09-08 re-run, exclusive GPU per side, identical prompt/temp/128 tok):
+  pallama `slots = 4` overlay = **59.5 tok/s** vs ollama default = **28.8 tok/s** — pallama
+  **2.07×** (batched decode across 4 slots; ollama's runner loads `-np 1` on this 8 GiB card
+  and serializes). At pallama slots=1 the same bench gives ~36 tok/s — the parallel gap
+  versus ollama inverts into a 2× win with one overlay knob.
+- Bench discipline note: head-to-heads MUST run exclusively (one daemon's model at a time).
+  Concurrent daemons race for VRAM — the loser silently CPU-falls-back (observed: ollama at
+  4.2 t/s while pallama held the 4070).
+- Backend note: ollama runs CUDA on this box; pallama Linux runs Vulkan because upstream
+  llama.cpp publishes **no Linux CUDA release assets** (verified across 12 consecutive
+  releases: only vulkan/rocm/sycl/openvino/cpu for ubuntu; CUDA is Windows-only). The
+  measured Vulkan-vs-CUDA delta on this card is ~4%. Asset preference in `engine/gh.rs`
+  already picks the best available per vendor (rocm for AMD, sycl-fp16 for Intel,
+  versioned win-cuda for Windows NVIDIA) — the residual Linux NVIDIA gap is
+  upstream-asset-bound, not a pallama pick bug.
+
 **Sourced benchmark anchors**
 
 - Ollama 62 t/s vs vLLM 58 t/s at c=1; 41 vs 950 t/s at c=64 (Qwen2.5-7B,
