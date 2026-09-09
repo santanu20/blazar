@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pallama_core::{Config, PallamaDirs, Store};
-use pallama_runtime::engine::gh::GhClient;
+use pallama_runtime::engine::gh::{btag_number, GhClient};
 use pallama_runtime::engine::EngineManager;
 use pallama_runtime::EventBus;
 use pallama_runtime::{LlamaCppEngine, Supervisor};
@@ -23,7 +23,7 @@ use pallama_runtime::{LlamaCppEngine, Supervisor};
     name = "pallama",
     version,
     about = "llama.cpp orchestration: ollama-grade UX, zero engine fork",
-    after_help = "Local-only: no telemetry, no cloud endpoints. Powered by llama.cpp / ggml / ggerganov."
+    after_help = "Quickstart: pallama pull <model> · pallama run <model> · pallama doctor\n\nLocal-only: no telemetry, no cloud endpoints. Powered by llama.cpp / ggml / ggerganov."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -66,6 +66,18 @@ enum Cmd {
         /// llama-imatrix (better Q4 accuracy than plain k-quants)
         #[arg(long)]
         imatrix: Option<PathBuf>,
+        /// Allow quantizing a source that is already quantized (upstream
+        /// llama-quantize flag; quality risk — pair with --verify)
+        #[arg(long)]
+        allow_requantize: bool,
+        /// Verify the output with llama-perplexity before registering:
+        /// reject (and delete) it when perplexity degrades beyond the gate
+        #[arg(long)]
+        verify: bool,
+        /// Maximum tolerated relative perplexity degradation for --verify,
+        /// in percent (default 10.0; improvements always pass)
+        #[arg(long, default_value_t = 10.0)]
+        max_degradation: f64,
     },
     /// Run an agent CLI against the daemon: sets OpenAI/Anthropic/ollama
     /// base-URL env, ensures the daemon is up, then execs COMMAND
@@ -200,12 +212,24 @@ enum Cmd {
         /// Install the whisper.cpp server binary from its GitHub release
         #[arg(long)]
         install: bool,
+        /// Install this specific release tag and pin the runtime to it
+        /// (plain --install tracks the latest release)
+        #[arg(long, requires = "install")]
+        tag: Option<String>,
         /// Download a ggml model by size (base, small.en, large-v3-turbo, ...)
         #[arg(long)]
         pull: Option<String>,
         /// List installed whisper server tag + local models
         #[arg(long)]
         list: bool,
+        /// Pin the whisper server to an installed tag ("none" unpins —
+        /// tracks the newest installed tag). No download involved.
+        #[arg(
+            long,
+            value_name = "TAG|none",
+            conflicts_with_all = ["install", "tag", "pull", "list", "file"]
+        )]
+        pin: Option<String>,
     },
     /// Engine (llama-server) management
     Engine {
@@ -217,8 +241,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: LoraCmd,
     },
-    /// Search Hugging Face for GGUF repos
-    Search { query: String },
+    /// Search Hugging Face for GGUF repos (multiple words are joined)
+    Search {
+        #[arg(trailing_var_arg = true, num_args = 1..)]
+        query: Vec<String>,
+    },
     /// Pre-download fit preview: VRAM/RAM split + quant alternatives
     Fit { target: String },
     /// Config inspection and editing (one knob surface)
@@ -310,7 +337,13 @@ enum ConfigCmd {
 
 fn main() {
     let cli = Cli::parse();
-    pallama_core::telemetry::init_tracing(0);
+    // Peek log_level from the config file WITHOUT creating it
+    // (Config::load writes a fresh file when absent; a plain read must not).
+    let log_level = std::fs::read_to_string(dirs().config_file())
+        .ok()
+        .and_then(|raw| Config::from_toml(&raw).ok())
+        .and_then(|c| c.log_level);
+    pallama_core::telemetry::init_tracing(0, log_level.as_deref());
     if let Err(e) = run(cli.cmd) {
         eprintln!("pallama: {e:#}");
         std::process::exit(1);
@@ -389,6 +422,9 @@ fn tokio_deadline(d: Duration) -> std::time::Instant {
 }
 
 #[tokio::main]
+// Pure one-call-per-arm dispatch over 30+ commands; splitting arms into
+// helpers would add indirection without lowering complexity.
+#[allow(clippy::too_many_lines)]
 async fn run(cmd: Cmd) -> Result<()> {
     match cmd {
         Cmd::Serve => serve().await,
@@ -436,7 +472,7 @@ async fn run(cmd: Cmd) -> Result<()> {
         ),
         Cmd::Engine { cmd } => engine_cmd(cmd).await,
         Cmd::Lora { cmd } => lora_cmd(cmd),
-        Cmd::Search { query } => search(&query).await,
+        Cmd::Search { query } => search(&query.join(" ")).await,
         Cmd::Fit { target } => fit(&target).await,
         Cmd::Config { cmd } => config_cmd(cmd),
         Cmd::Upgrade { version, dry_run } => upgrade(version, dry_run).await,
@@ -452,15 +488,30 @@ async fn run(cmd: Cmd) -> Result<()> {
             qtype,
             name,
             imatrix,
-        } => quantize_cmd(&model, &qtype, name.as_deref(), imatrix.as_deref()),
+            allow_requantize,
+            verify,
+            max_degradation,
+        } => {
+            let gate = verify.then_some(max_degradation);
+            quantize_cmd(
+                &model,
+                &qtype,
+                name.as_deref(),
+                imatrix.as_deref(),
+                allow_requantize,
+                gate,
+            )
+        }
         Cmd::Launch { command, warm, key } => launch_cmd(command, warm, key).await,
         Cmd::Whisper {
             file,
             model,
             install,
+            tag,
             pull,
             list,
-        } => whisper_cmd(file.as_ref(), model, install, pull, list).await,
+            pin,
+        } => whisper_cmd(file.as_ref(), model, install, tag, pull, list, pin).await,
         Cmd::Coreside => coreside_cmd(),
         Cmd::Drafts { model } => drafts_cmd(&model).await,
         Cmd::Migrate => migrate_cmd(),
@@ -589,9 +640,11 @@ impl Check {
     }
 }
 
-/// `pallama doctor` — offline diagnostics for the local setup. Reads only
-/// (config, store, engine manifest, hardware probe); never starts or stops
-/// anything. Failures print the fix hint inline.
+/// `pallama doctor` — local-state diagnostics: config, store, engine
+/// manifest, hardware probe, plus 4s-capped upstream currency probes
+/// (engine/whisper/app). Warn-only — never installs or starts anything
+/// (the engine row executes the engine binary with `--version`, nothing
+/// more).
 async fn doctor() -> Result<()> {
     let d = dirs();
     let mut checks: Vec<Check> = Vec::new();
@@ -642,13 +695,18 @@ async fn doctor() -> Result<()> {
         }
     }
 
-    checks.extend(doctor_engine(&d));
+    checks.extend(doctor_engine(&d).await);
+    checks.extend(doctor_whisper_currency(&d).await);
     checks.extend(doctor_binary_shadow());
+    checks.extend(doctor_app_currency().await);
     checks.extend(doctor_port().await);
+    checks.extend(doctor_service());
     #[cfg(unix)]
     checks.extend(doctor_disk(&d));
+    checks.extend(doctor_store(&d));
     checks.extend(doctor_models(&d));
     checks.extend(doctor_sentinel(&d));
+    checks.extend(doctor_exposure(&d));
     checks.extend(doctor_keys(&d));
     checks.extend(doctor_remotes().await);
 
@@ -661,12 +719,40 @@ async fn doctor() -> Result<()> {
     let warns = checks.iter().filter(|c| c.warn).count();
     if fails > 0 {
         println!("\n{fails} failing check(s) — fix the FAIL rows above");
-    } else if warns > 0 {
-        println!("\nall checks pass; {warns} warning(s)");
     } else {
-        println!("\nall checks pass");
+        if warns > 0 {
+            println!("\nall checks pass; {warns} warning(s)");
+        } else {
+            println!("\nall checks pass");
+        }
+        for step in doctor_next_steps(&checks) {
+            println!("next: {step}");
+        }
     }
     Ok(())
+}
+
+/// Adaptive "what to do next" footer for `pallama doctor`. Reuses the
+/// computed checks instead of re-querying state: the port row encodes
+/// daemon liveness, the models row encodes the pull count ("0 pulled").
+/// Empty when the failing-checks branch already told the user what to do.
+fn doctor_next_steps(checks: &[Check]) -> Vec<String> {
+    let port_up = checks.iter().any(|c| c.name == "port" && c.ok);
+    let no_models = checks
+        .iter()
+        .any(|c| c.name == "models" && c.ok && c.detail.starts_with("0 pulled"));
+    let mut steps = Vec::new();
+    if !port_up {
+        steps.push("start the daemon: pallama serve (or: systemctl start pallama)".to_string());
+    }
+    if no_models {
+        steps
+            .push("pull a model: pallama pull <name> (find one: pallama search qwen3)".to_string());
+    }
+    if steps.is_empty() {
+        steps.push("chat: pallama run <model>".to_string());
+    }
+    steps
 }
 
 /// F8: keys health — parse, uniqueness, admin existence, gateway
@@ -752,13 +838,227 @@ async fn doctor_remotes() -> Vec<Check> {
     out
 }
 
-fn doctor_engine(d: &PallamaDirs) -> Vec<Check> {
+/// Engine binary smoke: execute the active engine's server binary with
+/// `--version`. The manifest can say "installed" while the binary is
+/// corrupted or linked against a glibc the box no longer has — this is
+/// the row that catches it. Read-only probe: `--version` prints and
+/// exits without touching the GPU.
+fn engine_smoke_check(server_path: &str) -> Check {
+    match std::process::Command::new(server_path)
+        .arg("--version")
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+            let line = text
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .map_or_else(|| "?".to_string(), |l| l.trim().to_string());
+            Check::ok("engine binary", format!("executes ({line})"))
+        }
+        Ok(out) => Check::warn(
+            "engine binary",
+            format!(
+                "exited {status} — reinstall: pallama engine update",
+                status = out.status
+            ),
+        ),
+        Err(e) => Check::warn(
+            "engine binary",
+            format!("cannot execute {server_path}: {e} — reinstall: pallama engine update"),
+        ),
+    }
+}
+
+/// Exposure: join the bind host with auth state — the security fact the
+/// config and keys rows separately can't say. Authless loopback is the
+/// default and fine; anything off-loopback without keys is an open
+/// inference endpoint for the whole network.
+fn doctor_exposure(d: &PallamaDirs) -> Vec<Check> {
+    let Ok(cfg) = Config::load(d).map_err(|e| anyhow!("{e}")) else {
+        return Vec::new(); // config row already failed loudly
+    };
+    vec![exposure_verdict(&cfg.host, cfg.port, cfg.keys.len())]
+}
+
+/// Pure verdict over (host, port, `n_keys`): loopback needs no auth;
+/// wildcard/LAN without keys is exposed to the network. Non-loopback
+/// rows also note pallama speaks plain HTTP — TLS belongs in a reverse
+/// proxy in front.
+fn exposure_verdict(host: &str, port: u16, n_keys: usize) -> Check {
+    let h = host.trim();
+    if matches!(h, "localhost" | "127.0.0.1" | "::1") {
+        return if n_keys == 0 {
+            Check::ok("exposure", "loopback bind, no auth needed".to_string())
+        } else {
+            Check::ok(
+                "exposure",
+                format!("loopback bind + {n_keys} key(s) (belt and braces)"),
+            )
+        };
+    }
+    let binding = if h.is_empty() || h == "0.0.0.0" || h == "::" {
+        "all interfaces"
+    } else {
+        h
+    };
+    if n_keys == 0 {
+        Check::warn(
+            "exposure",
+            format!(
+                "{binding}:{port} reachable off-box with NO auth — anyone on the network can \
+                 use this box; set host=127.0.0.1 or add keys (`pallama keys add`); pallama \
+                 is HTTP-only, put TLS in front (reverse proxy) if you stay exposed"
+            ),
+        )
+    } else {
+        Check::ok(
+            "exposure",
+            format!(
+                "{binding}:{port} exposed with {n_keys} key(s) enforcing auth (HTTP — front \
+                 it with a TLS proxy for secrets in transit)"
+            ),
+        )
+    }
+}
+
+/// Store health: sqlite `quick_check` on pallama.db. Absent = fresh
+/// install (ok row); unreadable or failing = warn with the regenerate
+/// hint — usage history is the only casualty.
+fn doctor_store(d: &PallamaDirs) -> Vec<Check> {
+    let db = d.db_file();
+    if !db.is_file() {
+        return vec![Check::ok(
+            "store",
+            "no pallama.db yet (fresh install)".to_string(),
+        )];
+    }
+    let size_kib = std::fs::metadata(&db).map_or(0, |m| m.len() / 1024);
+    match Store::open(d) {
+        Ok(store) => {
+            let verdict = store
+                .conn()
+                .query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))
+                .unwrap_or_else(|e| format!("quick_check query failed: {e}"));
+            if verdict == "ok" {
+                vec![Check::ok(
+                    "store",
+                    format!("pallama.db ok ({size_kib} KiB, quick_check passed)"),
+                )]
+            } else {
+                vec![Check::warn(
+                    "store",
+                    format!("quick_check: {verdict} — back up, then delete {} to regenerate (usage history lost)", db.display()),
+                )]
+            }
+        }
+        Err(e) => vec![Check::warn(
+            "store",
+            format!(
+                "pallama.db unreadable ({e:#}) — back up, then delete {} to regenerate (usage history lost)",
+                db.display()
+            ),
+        )],
+    }
+}
+
+/// Service-manager state: the systemd/launchd unit the installer lanes
+/// create. `PALLAMA_SYSTEMCTL` overrides the systemctl binary (test
+/// seam, mirrors install.sh). No manager found (windows/dev) → no row;
+/// no unit is an informational ok, not a warning — running manually is
+/// a legitimate lane.
+fn doctor_service() -> Vec<Check> {
+    let systemctl = std::env::var("PALLAMA_SYSTEMCTL").unwrap_or_else(|_| "systemctl".into());
+    if std::process::Command::new(&systemctl)
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        let enabled = std::process::Command::new(&systemctl)
+            .args(["is-enabled", "pallama"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "enabled");
+        let active = std::process::Command::new(&systemctl)
+            .args(["is-active", "pallama"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active");
+        return service_verdict(enabled, active, "systemd")
+            .into_iter()
+            .collect();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        let Some(uid) = uid else {
+            return Vec::new();
+        };
+        // Installer label: LaunchAgent (user) or LaunchDaemon (root).
+        let label = if uid == "0" {
+            format!("system/dev.pallama")
+        } else {
+            format!("gui/{uid}/dev.pallama")
+        };
+        let loaded = std::process::Command::new("launchctl")
+            .args(["print", &label])
+            .output()
+            .ok()
+            .map(|o| o.status.success());
+        return service_verdict(Some(true), loaded, "launchd")
+            .into_iter()
+            .collect();
+    }
+    #[cfg(not(target_os = "macos"))]
+    Vec::new()
+}
+
+/// Pure verdict over manager probe results: both set = managed, both
+/// unset-but-probed = manual lane, `None` = probe inconclusive → no row.
+fn service_verdict(enabled: Option<bool>, active: Option<bool>, manager: &str) -> Option<Check> {
+    match (enabled, active) {
+        (Some(true), Some(true)) => Some(Check::ok(
+            "service",
+            format!("{manager} unit active + enabled (starts on boot, restarts on crash)"),
+        )),
+        (Some(true), Some(false)) => Some(Check::warn(
+            "service",
+            format!("{manager} unit enabled but not running — logs: journalctl -u pallama"),
+        )),
+        (Some(false), Some(true)) => Some(Check::warn(
+            "service",
+            "daemon running but unit not enabled — may not survive reboot; run: sh \
+             scripts/install.sh (or systemctl enable pallama)",
+        )),
+        (Some(false), Some(false)) => Some(Check::ok(
+            "service",
+            format!("no {manager} unit (manual/dev lane — start with `pallama serve`)"),
+        )),
+        _ => None,
+    }
+}
+
+async fn doctor_engine(d: &PallamaDirs) -> Vec<Check> {
     let mut checks = Vec::new();
     let mut active_tag: Option<String> = None;
+    // Install-time (manifest) GPU names — what auto-pick derives from.
+    let mut frozen_gpu_names: Vec<String> = Vec::new();
     match local_engine_manager(d) {
         Ok(mgr) => match mgr.active_manifest() {
             Ok(Some(m)) => {
                 active_tag = Some(m.tag.clone());
+                frozen_gpu_names = m.devices.iter().map(|dev| dev.name.clone()).collect();
                 checks.push(Check::ok(
                     "engine",
                     format!(
@@ -786,6 +1086,7 @@ fn doctor_engine(d: &PallamaDirs) -> Vec<Check> {
                 } else {
                     checks.push(Check::ok("hardware", note));
                 }
+                checks.push(engine_smoke_check(&m.server_path));
             }
             Ok(None) => checks.push(Check::fail(
                 "engine",
@@ -798,21 +1099,154 @@ fn doctor_engine(d: &PallamaDirs) -> Vec<Check> {
         },
         Err(e) => checks.push(Check::fail("engine", format!("{e}"))),
     }
-    // Engine currency: reconcile the daemon's last upstream survey against
-    // the CURRENT active engine — the marker's own verdict went stale the
-    // moment `engine update`/`use`/`rollback` flipped the store between
-    // daily ticks.
+    // Engine currency: prefer reconciling the daemon's last upstream
+    // survey against the CURRENT active engine — the marker's own
+    // verdict went stale the moment `engine update`/`use`/`rollback`
+    // flipped the store between daily ticks. Marker missing or >48h
+    // old (daemon never surveyed / long offline): probe upstream live,
+    // same 4s-capped warn-only shape as the whisper/app currency rows.
+    let mut currency: Option<Check> = None;
+    let mut marker_usable = false;
+    // A marker is only trustworthy for the CURRENT channel: one written by a
+    // pre-channel daemon (no "channel" key) or under a different channel
+    // reports the other channel's target — reconciling it after a switch
+    // nags about builds the user deliberately left behind.
+    let cfg_channel = pallama_core::Config::load(d)
+        .map(|c| c.update_channel)
+        .unwrap_or_default();
     if let Ok(raw) = std::fs::read_to_string(d.run_dir().join("engine-check.json")) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |n| n.as_secs());
-            if let Some(c) = currency_verdict(active_tag.as_deref(), &v, now) {
-                checks.push(c);
+            marker_usable = now.saturating_sub(v["checked_at"].as_u64().unwrap_or(0)) <= 2 * 86_400
+                && marker_channel_matches(&v, cfg_channel);
+            if marker_usable {
+                currency = currency_verdict(active_tag.as_deref(), &v, now);
+                // Enumeration drift: install-time probe names the serving
+                // child can no longer see (the daemon's spawn context is
+                // the authority — spawns auto-remap, but the user should
+                // know the probe view is stale).
+                if let Some(live) = census_names(&v) {
+                    let drift = device_drift(&frozen_gpu_names, &live);
+                    if !drift.is_empty() {
+                        checks.push(Check::warn(
+                            "engine devices",
+                            format!(
+                                "enumeration drift: {} known to the install-time probe but \
+                                 invisible to the serving child — spawns auto-remap, \
+                                 `pallama engine update` refreshes the probe",
+                                drift.join(", ")
+                            ),
+                        ));
+                    }
+                }
             }
         }
     }
+    if currency.is_none() && !marker_usable {
+        if let Some(active) = active_tag.as_deref() {
+            if active == pallama_runtime::LOCAL_TAG {
+                currency = Some(Check::ok(
+                    "engine currency",
+                    "local build — upstream currency not tracked",
+                ));
+            } else {
+                currency = Some(live_engine_currency(active).await);
+            }
+        }
+    }
+    if let Some(c) = currency {
+        checks.push(c);
+    }
     checks
+}
+
+/// Frozen (install-time) names missing from the serving child's census.
+/// Superset child views and CPU-only empties are healthy — only names the
+/// child CANNOT see get flagged.
+fn device_drift(frozen: &[String], live: &[String]) -> Vec<String> {
+    frozen
+        .iter()
+        .filter(|name| !live.iter().any(|l| l == *name))
+        .cloned()
+        .collect()
+}
+
+/// Device names from the engine-check marker's census, `None` when the
+/// census is unknown (key absent or null: pre-census daemon or failed
+/// probe). Unknown must NOT be reported as drift — only a census that
+/// actually ran can say a device is invisible.
+fn census_names(marker: &serde_json::Value) -> Option<Vec<String>> {
+    marker["devices"].as_array().map(|a| {
+        a.iter()
+            .filter_map(|dev| dev["name"].as_str().map(str::to_string))
+            .collect()
+    })
+}
+
+/// True when the marker was written for the channel the user is on.
+/// Absent key = the pre-channel default ("latest"), matching the
+/// reconcile path's own `unwrap_or("latest")` read.
+fn marker_channel_matches(
+    marker: &serde_json::Value,
+    cfg: pallama_core::config::UpdateChannel,
+) -> bool {
+    marker["channel"].as_str().unwrap_or("latest") == cfg.to_string()
+}
+
+/// Direction word for update messaging: llama b-tags compare by build
+/// number (upgrade/downgrade); anything else stays neutral ("update").
+fn channel_word(active: &str, target: &str) -> &'static str {
+    match (btag_number(active), btag_number(target)) {
+        (Some(a), Some(t)) if t > a => "upgrade",
+        (Some(a), Some(t)) if t < a => "downgrade",
+        _ => "update",
+    }
+}
+
+/// Live engine-currency probe (marker missing or >48h stale): 4s cap,
+/// warn-only — `pallama engine update` stays a human action.
+async fn live_engine_currency(active: &str) -> Check {
+    let token = std::env::var("GH_TOKEN")
+        .or_else(|_| std::env::var("GITHUB_TOKEN"))
+        .ok();
+    let Ok(gh) = GhClient::new(token) else {
+        return Check::warn("engine currency", "cannot build GitHub client");
+    };
+    let channel = config().map(|c| c.update_channel).unwrap_or_default();
+    let fetched = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        gh.channel_b_release(channel),
+    )
+    .await;
+    match fetched {
+        Ok(Ok(rel)) => {
+            // Engine tags are b-tags: no semver path, equality decides.
+            if rel.tag_name == active {
+                Check::ok(
+                    "engine currency",
+                    format!("up to date ({active}, channel: {channel})"),
+                )
+            } else {
+                Check::warn(
+                    "engine currency",
+                    format!(
+                        "{} available: {} (active: {}, channel: {}) — run: pallama engine update",
+                        channel_word(active, &rel.tag_name),
+                        rel.tag_name,
+                        active,
+                        channel
+                    ),
+                )
+            }
+        }
+        Ok(Err(e)) => Check::warn(
+            "engine currency",
+            format!("check failed ({e:#}) — offline? set GH_TOKEN if rate limited"),
+        ),
+        Err(_) => Check::warn("engine currency", "GitHub check timed out after 4s"),
+    }
 }
 
 /// Doctor engine-currency verdict. The marker's `latest`/`checked_at` are
@@ -835,10 +1269,16 @@ fn currency_verdict(
     }
     let checked_at = marker["checked_at"].as_u64().unwrap_or(0);
     let stale = now_secs.saturating_sub(checked_at) > 2 * 86_400;
+    // The marker's `channel` is what `latest` was resolved against at
+    // write time (old markers predate the knob: default latest).
+    let channel = marker["channel"].as_str().unwrap_or("latest");
     if active != latest {
         Some(Check::warn(
             "engine currency",
-            format!("update available: {latest} (active: {active}) — run: pallama engine update"),
+            format!(
+                "{} available: {latest} (active: {active}, channel: {channel}) — run: pallama engine update",
+                channel_word(active, latest)
+            ),
         ))
     } else if stale {
         Some(Check::warn(
@@ -851,6 +1291,164 @@ fn currency_verdict(
             format!("up to date ({active})"),
         ))
     }
+}
+
+/// App currency: the newest pallama release on the same repo/URL the
+/// `pallama upgrade` lane installs from. Warn-only — never installs
+/// (`pallama upgrade` stays a human action, exactly like engine updates).
+/// `PALLAMA_REPO` unset → informational row (self-upgrade lane not
+/// configured; dev checkouts and manual installs live here).
+async fn doctor_app_currency() -> Vec<Check> {
+    let Some(repo) = std::env::var("PALLAMA_REPO").ok().filter(|r| !r.is_empty()) else {
+        return vec![Check::ok(
+            "app currency",
+            "PALLAMA_REPO unset — self-upgrade lane not configured",
+        )];
+    };
+    let base = std::env::var("PALLAMA_INSTALL_BASE_URL")
+        .unwrap_or_else(|_| "https://api.github.com".to_string());
+    let token = std::env::var("GH_TOKEN")
+        .or_else(|_| std::env::var("GITHUB_TOKEN"))
+        .ok();
+    let Ok(gh) = pallama_runtime::GhClient::with_base(&base, token) else {
+        return vec![Check::warn("app currency", "cannot build GitHub client")];
+    };
+    let channel = config().map(|c| c.update_channel).unwrap_or_default();
+    let fetched = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        gh.channel_repo_release(&repo, channel),
+    )
+    .await;
+    match fetched {
+        Ok(Ok(rel)) => vec![version_currency_verdict(
+            "app currency",
+            env!("CARGO_PKG_VERSION"),
+            &rel.tag_name,
+            "pallama upgrade",
+        )],
+        Ok(Err(e)) => vec![Check::warn(
+            "app currency",
+            format!("check failed ({e:#}) — offline? set GH_TOKEN if rate limited"),
+        )],
+        Err(_) => vec![Check::warn(
+            "app currency",
+            "GitHub check timed out after 4s",
+        )],
+    }
+}
+
+/// Whisper.cpp currency: installs are versioned by tag dir under
+/// `data/whisper/bin/<tag>/`; compare the newest against the latest
+/// upstream release (`WHISPER_REPO`). Optional component — not installed
+/// means no row (same policy as remotes). Warn-only; `pallama whisper
+/// --install` stays a human action.
+async fn doctor_whisper_currency(d: &PallamaDirs) -> Vec<Check> {
+    let Some((_, tag_dir)) = pallama_runtime::whisper::server_bin(d) else {
+        return Vec::new();
+    };
+    let installed = tag_dir
+        .file_name()
+        .map_or_else(|| "?".into(), |t| t.to_string_lossy().into_owned());
+    let token = std::env::var("GH_TOKEN")
+        .or_else(|_| std::env::var("GITHUB_TOKEN"))
+        .ok();
+    let Ok(gh) = pallama_runtime::GhClient::new(token) else {
+        return vec![Check::warn(
+            "whisper currency",
+            "cannot build GitHub client",
+        )];
+    };
+    let channel = config().map(|c| c.update_channel).unwrap_or_default();
+    let fetched = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        gh.channel_repo_release(pallama_runtime::whisper::WHISPER_REPO, channel),
+    )
+    .await;
+    match fetched {
+        Ok(Ok(rel)) => vec![match pallama_runtime::whisper::pinned_tag(d) {
+            // Deliberate pin: name it, and point updates at the
+            // pin-preserving command — plain --install silently unpins.
+            Some(pin) if pin == rel.tag_name => {
+                Check::ok("whisper currency", format!("pinned to {pin} (up to date)"))
+            }
+            Some(pin) => {
+                let ahead = matches!(
+                    (ver_triple(&pin), ver_triple(&rel.tag_name)),
+                    (Some(a), Some(b)) if a > b
+                );
+                if ahead {
+                    Check::ok(
+                        "whisper currency",
+                        format!("pinned to {pin} (ahead of latest release {})", rel.tag_name),
+                    )
+                } else {
+                    Check::warn(
+                        "whisper currency",
+                        format!(
+                            "update available: {} (pinned: {pin}) — run: pallama whisper --install --tag {}",
+                            rel.tag_name, rel.tag_name
+                        ),
+                    )
+                }
+            }
+            None => version_currency_verdict(
+                "whisper currency",
+                &installed,
+                &rel.tag_name,
+                "pallama whisper --install",
+            ),
+        }],
+        Ok(Err(e)) => vec![Check::warn(
+            "whisper currency",
+            format!("check failed ({e:#}) — offline? set GH_TOKEN if rate limited"),
+        )],
+        Err(_) => vec![Check::warn(
+            "whisper currency",
+            "GitHub check timed out after 4s",
+        )],
+    }
+}
+
+/// Generic currency verdict (pure): semver-compare when both tags parse;
+/// otherwise fall back to tag inequality (whisper.cpp alternates `vX.Y.Z`
+/// and `bNNNN` tag shapes — a differing latest tag IS an update). Equal
+/// tags are always up to date; the verdict is never silently skipped.
+fn version_currency_verdict(
+    name: &'static str,
+    running: &str,
+    latest: &str,
+    action: &str,
+) -> Check {
+    match (ver_triple(running), ver_triple(latest)) {
+        (Some(r), Some(l)) if l > r => warn_update(name, running, latest, action),
+        (Some(r), Some(l)) if r > l => Check::ok(
+            name,
+            format!("running ahead of latest release ({running} > {latest}; dev build?)"),
+        ),
+        (Some(_), Some(_)) => Check::ok(name, format!("up to date ({running})")),
+        _ if running == latest => Check::ok(name, format!("up to date ({running})")),
+        _ => warn_update(name, running, latest, action),
+    }
+}
+
+fn warn_update(name: &'static str, running: &str, latest: &str, action: &str) -> Check {
+    Check::warn(
+        name,
+        format!("update available: {latest} (running: {running}) — run: {action}"),
+    )
+}
+
+/// `vX.Y.Z` / `X.Y.Z` → `(X, Y, Z)`. Strict: exactly three numeric parts —
+/// anything else (suffixes, partial tags) is None so callers warn.
+fn ver_triple(v: &str) -> Option<(u64, u64, u64)> {
+    let v = v.trim().strip_prefix('v').unwrap_or(v.trim());
+    let mut it = v.split('.');
+    let triple = (
+        it.next()?.parse().ok()?,
+        it.next()?.parse().ok()?,
+        it.next()?.parse().ok()?,
+    );
+    it.next().is_none().then_some(triple)
 }
 
 /// Multiple pallama binaries on one box: your shell resolves one order,
@@ -1145,7 +1743,7 @@ async fn serve() -> Result<()> {
         cfg.clone(),
         bus.clone(),
         hw,
-        engine,
+        engine.clone(),
     ));
     for orphan in sup.sweep_orphans() {
         println!("swept orphan engine: {orphan}");
@@ -1153,7 +1751,7 @@ async fn serve() -> Result<()> {
     let _reaper = sup.spawn_reaper();
 
     if cfg.engine_check_secs > 0 {
-        spawn_engine_check_task(&d, cfg.engine_check_secs);
+        spawn_engine_check_task(&d, cfg.engine_check_secs, engine.clone());
     }
     let state = Arc::new(pallama_gateway::state::AppState::new(
         d.clone(),
@@ -1341,8 +1939,17 @@ fn mmproj_cmd(model: &str, path: &std::path::Path) -> Result<()> {
     let mut row = store
         .get_model(model)?
         .ok_or_else(|| anyhow!("no such model: {model} (see `pallama list`)"))?;
-    pallama_core::read_metadata_file(path)
+    let mmproj_meta = pallama_core::read_metadata_file(path)
         .map_err(|e| anyhow!("not a readable GGUF projector ({}): {e}", path.display()))?;
+    // Vision projectors are CLIP-based GGUFs; anything else (e.g. a language
+    // model file) attaches fine but hangs the engine at spawn — reject loudly.
+    if mmproj_meta.architecture != "clip" {
+        return Err(anyhow!(
+            "not a vision projector: {} has architecture `{}`, expected `clip`; use the mmproj GGUF shipped by the model publisher",
+            path.display(),
+            mmproj_meta.architecture
+        ));
+    }
     let dest = d.models_dir().join(format!("{model}-mmproj.gguf"));
     install_model_file(path, &dest, false)?;
     row.mmproj_path = Some(dest.display().to_string());
@@ -1400,8 +2007,15 @@ fn import(
     let mmproj_dest = mmproj
         .as_ref()
         .map(|p| {
-            pallama_core::read_metadata_file(p.as_path())
+            let proj_meta = pallama_core::read_metadata_file(p.as_path())
                 .map_err(|e| anyhow!("--mmproj not a readable GGUF ({}): {e}", p.display()))?;
+            if proj_meta.architecture != "clip" {
+                return Err(anyhow!(
+                    "--mmproj not a vision projector: {} has architecture `{}`, expected `clip`",
+                    p.display(),
+                    proj_meta.architecture
+                ));
+            }
             let mdest = d.models_dir().join(format!("{model_name}-mmproj.gguf"));
             install_model_file(p.as_path(), &mdest, copy)?;
             Ok::<_, anyhow::Error>(mdest)
@@ -1451,9 +2065,24 @@ fn list() -> Result<()> {
         println!("no models pulled");
         return Ok(());
     }
+    // Adaptive name width (capped) keeps columns aligned for long names;
+    // oversize names truncate with an ellipsis instead of shifting the row.
+    let name_cap = 26usize;
+    let name_w = models
+        .iter()
+        .map(|m| m.name.len().min(name_cap))
+        .max()
+        .unwrap_or(0)
+        .max("NAME".len());
     println!(
-        "{:<26} {:<8} {:>9}  {:<10} {:<8} {:>7}  PATH",
-        "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX"
+        "{:<name_w$}  {:<8}  {:<9}  {:<10}  {:<8}  {:>7}  PATH",
+        "NAME",
+        "QUANT",
+        "SIZE",
+        "VISION",
+        "ARCH",
+        "CTX",
+        name_w = name_w
     );
     for m in models {
         // Multimodal visibility: the projector is a real on-disk cost the
@@ -1470,15 +2099,21 @@ fn list() -> Result<()> {
                 }
             },
         );
+        let name = if m.name.len() > name_cap {
+            format!("{}…", &m.name[..name_cap - 1])
+        } else {
+            m.name.clone()
+        };
         println!(
-            "{:<26} {:<8} {:>9}  {:<10} {:<8} {:>7}  {}",
-            m.name,
+            "{:<name_w$}  {:<8}  {:<9}  {:<10}  {:<8}  {:>7}  {}",
+            name,
             m.quant,
             humansize(m.bytes),
             vision,
             m.arch.as_deref().unwrap_or("?"),
             m.ctx_train.map_or_else(String::new, |c| c.to_string()),
-            m.path
+            m.path,
+            name_w = name_w
         );
     }
     Ok(())
@@ -1685,17 +2320,29 @@ fn print_record(r: &serde_json::Value) {
     } else {
         "FLAGGED"
     };
+    // Response confidence (R2): mean/min token logprob when requested.
+    let conf = match (
+        r["logprob_mean"].as_f64(),
+        r["logprob_min"].as_f64(),
+        r["logprob_tokens"].as_u64(),
+    ) {
+        (Some(mean), Some(min), Some(n)) => {
+            format!(" conf={mean:.2}/{min:.2}({n}tok)")
+        }
+        _ => String::new(),
+    };
     println!(
-        "{flag}  {}  {}  model={} status={} ctx={} prompt={} completion={} degraded={} {}ms",
+        "{flag}  {}  {}  model={} status={} finish={} ctx={} prompt={} completion={} degraded={} {ms}{conf}",
         r["trace"].as_str().unwrap_or("?"),
         r["route"].as_str().unwrap_or("?"),
         r["model"].as_str().unwrap_or("?"),
         num(&r["status"]),
+        r["finish"].as_str().unwrap_or("-"),
         num(&r["ctx"]),
         num(&r["prompt_tokens"]),
         num(&r["completion_tokens"]),
         r["degraded"].as_bool().unwrap_or(false),
-        num(&r["ms"]),
+        ms = num(&r["ms"]),
     );
     for d in &detections {
         println!(
@@ -1905,12 +2552,40 @@ enum KeysAction {
 }
 
 #[allow(clippy::too_many_lines)] // one match arm per subcommand, flat by design
+/// Admin bearer for CLI-to-gateway calls that key-gate once [[keys]] exist:
+/// first non-empty `name:key` from `PALLAMA_KEYS`, else the first unscoped
+/// (admin) [[keys]] entry from config.toml.
+fn admin_bearer() -> Option<String> {
+    if let Ok(v) = std::env::var("PALLAMA_KEYS") {
+        return v
+            .split(',')
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .map(|f| f.split_once(':').unwrap_or((f, f)).1.to_string());
+    }
+    config().ok().and_then(|c| {
+        c.keys
+            .iter()
+            .find(|k| k.models.is_empty())
+            .map(|k| k.key.clone())
+    })
+}
+
+#[allow(clippy::too_many_lines)]
 async fn keys_cmd(action: Option<KeysAction>) -> Result<()> {
     let base = ensure_daemon().await?;
     let client = reqwest::Client::new();
+    // `/api/keys` demands an unscoped (admin) bearer once keys exist.
+    // PALLAMA_KEYS entries are admin by construction; otherwise the
+    // first unscoped [[keys]] entry from config.toml.
+    let bearer = admin_bearer();
     match action.unwrap_or(KeysAction::List) {
         KeysAction::List => {
-            let resp = client.get(format!("{base}/api/keys")).send().await?;
+            let mut req = client.get(format!("{base}/api/keys"));
+            if let Some(b) = &bearer {
+                req = req.bearer_auth(b);
+            }
+            let resp = req.send().await?;
             let status = resp.status();
             let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
             if !status.is_success() {
@@ -1990,11 +2665,11 @@ async fn keys_cmd(action: Option<KeysAction>) -> Result<()> {
             if let Some(v) = max_concurrent {
                 body["max_concurrent"] = v.into();
             }
-            let resp = client
-                .post(format!("{base}/api/keys"))
-                .json(&body)
-                .send()
-                .await?;
+            let mut req = client.post(format!("{base}/api/keys")).json(&body);
+            if let Some(b) = &bearer {
+                req = req.bearer_auth(b);
+            }
+            let resp = req.send().await?;
             let status = resp.status();
             let out: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
             if !status.is_success() {
@@ -2011,10 +2686,11 @@ async fn keys_cmd(action: Option<KeysAction>) -> Result<()> {
             Ok(())
         }
         KeysAction::Rotate { name } => {
-            let resp = client
-                .post(format!("{base}/api/keys/rotate?name={name}"))
-                .send()
-                .await?;
+            let mut req = client.post(format!("{base}/api/keys/rotate?name={name}"));
+            if let Some(b) = &bearer {
+                req = req.bearer_auth(b);
+            }
+            let resp = req.send().await?;
             let status = resp.status();
             let out: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
             if !status.is_success() {
@@ -2031,10 +2707,11 @@ async fn keys_cmd(action: Option<KeysAction>) -> Result<()> {
             Ok(())
         }
         KeysAction::Rm { name } => {
-            let resp = client
-                .delete(format!("{base}/api/keys?name={name}"))
-                .send()
-                .await?;
+            let mut req = client.delete(format!("{base}/api/keys?name={name}"));
+            if let Some(b) = &bearer {
+                req = req.bearer_auth(b);
+            }
+            let resp = req.send().await?;
             let status = resp.status();
             let out: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
             if !status.is_success() {
@@ -2057,6 +2734,8 @@ fn quantize_cmd(
     qtype: &str,
     name: Option<&str>,
     imatrix: Option<&std::path::Path>,
+    allow_requantize: bool,
+    verify_gate_pct: Option<f64>,
 ) -> Result<()> {
     if !pallama_runtime::quantize::plausible_quant_type(qtype) {
         return Err(anyhow!(
@@ -2083,7 +2762,7 @@ fn quantize_cmd(
     // Optional importance matrix: calibrate first, then quantize with it
     // (verified upstream CLI: llama-imatrix -m -f -o --output-format gguf;
     // llama-quantize --imatrix file).
-    let imatrix_args: Vec<String> = match &imatrix {
+    let mut imatrix_args: Vec<String> = match &imatrix {
         Some(calib) => {
             let ibin = pallama_runtime::quantize::find_imatrix_bin(&d)?;
             let ipath = d.data_dir.join(format!(
@@ -2108,6 +2787,9 @@ fn quantize_cmd(
         }
         None => Vec::new(),
     };
+    if allow_requantize {
+        imatrix_args.insert(0, "--allow-requantize".to_string());
+    }
     let out = pallama_runtime::quantize::quantize_im(
         &bin,
         std::path::Path::new(&row.path),
@@ -2118,6 +2800,36 @@ fn quantize_cmd(
             println!("  {line}");
         },
     )?;
+    // R5: perplexity gate — measure base + output on a fixed probe corpus;
+    // a failing output is deleted and never registered.
+    if let Some(max_degradation_pct) = verify_gate_pct {
+        let pbin = pallama_runtime::quantize::find_perplexity_bin(&d)?;
+        let probe = pallama_runtime::quantize::write_verify_probe(&d)?;
+        println!("verify: perplexity pass 1/2 (base) — full forward passes, this takes a while...");
+        let base_ppl = pallama_runtime::quantize::perplexity(
+            &pbin,
+            std::path::Path::new(&row.path),
+            &probe,
+            |line| {
+                println!("  {line}");
+            },
+        )?;
+        println!("verify: perplexity pass 2/2 (output)...");
+        let out_ppl = pallama_runtime::quantize::perplexity(&pbin, &out, &probe, |line| {
+            println!("  {line}");
+        })?;
+        if let Err(e) =
+            pallama_runtime::quantize::verify_gate(base_ppl, out_ppl, max_degradation_pct / 100.0)
+        {
+            let _ = std::fs::remove_file(&out);
+            return Err(e.context(format!("quantized output removed ({})", dst.display())));
+        }
+        #[allow(clippy::cast_precision_loss)] // display only
+        let delta_pct = 100.0 * (out_ppl - base_ppl) / base_ppl;
+        println!(
+            "verify: PPL {base_ppl:.4} -> {out_ppl:.4} ({delta_pct:+.1}% vs gate {max_degradation_pct:.1}%) — pass"
+        );
+    }
     // Read the result's own metadata (fails loud on truncated output).
     let meta = pallama_core::read_metadata_file(&out)
         .map_err(|e| anyhow!("output not a readable GGUF ({e}): {}", out.display()))?;
@@ -2400,14 +3112,28 @@ fn coreside_cmd() -> Result<()> {
 /// `pallama whisper file.mp3` — STT via the `whisper` [[remotes]] entry.
 /// The gateway already forwards `/v1/audio/transcriptions`; this is the
 /// local CLI convenience for it (no separate engine lane to manage).
+#[allow(clippy::too_many_lines)]
 async fn whisper_cmd(
     file: Option<&PathBuf>,
     model: Option<String>,
     install: bool,
+    tag: Option<String>,
     pull: Option<String>,
     list: bool,
+    pin: Option<String>,
 ) -> Result<()> {
     let d = dirs();
+    if let Some(value) = pin {
+        let unpin = value.trim().eq_ignore_ascii_case("none");
+        let target = if unpin { None } else { Some(value.as_str()) };
+        pallama_runtime::whisper::set_pin(&d, target)?;
+        if unpin {
+            println!("whisper pin removed — tracking the newest installed tag");
+        } else {
+            println!("whisper server pinned to {}", value.trim());
+        }
+        return Ok(());
+    }
     if list {
         match pallama_runtime::whisper::server_bin(&d) {
             Some((bin, _)) => {
@@ -2416,9 +3142,18 @@ async fn whisper_cmd(
                     .and_then(|p| p.parent())
                     .and_then(|p| p.file_name())
                     .map_or_else(|| "?".into(), |t| t.to_string_lossy().into_owned());
-                println!("server: {tag} ({})", bin.display());
+                let pin = if pallama_runtime::whisper::pinned_tag(&d).is_some() {
+                    " (pinned)"
+                } else {
+                    ""
+                };
+                println!("server: {tag}{pin} ({})", bin.display());
             }
             None => println!("server: not installed (pallama whisper --install)"),
+        }
+        let installed = pallama_runtime::whisper::installed_tags(&d);
+        if installed.len() > 1 {
+            println!("installed: {}", installed.join(", "));
         }
         let models = pallama_runtime::whisper::list_models(&d);
         if models.is_empty() {
@@ -2432,10 +3167,27 @@ async fn whisper_cmd(
         return Ok(());
     }
     if install {
+        let pinned = tag.is_some();
         let token = std::env::var("GH_TOKEN").ok();
         let gh = GhClient::new(token)?;
-        let tag = pallama_runtime::whisper::install(&gh, &d).await?;
-        println!("whisper.cpp server installed: {tag}");
+        // Channel semantics for whisper mirror the engine lane: explicit
+        // --tag pins the install; otherwise the configured channel
+        // (latest = newest incl. prereleases, stable = GitHub's
+        // releases/latest) resolves the target without pinning.
+        let target = match tag.as_deref() {
+            Some(t) => Some(t.to_string()),
+            None => Some(
+                gh.channel_repo_release(
+                    pallama_runtime::whisper::WHISPER_REPO,
+                    config()?.update_channel,
+                )
+                .await?
+                .tag_name,
+            ),
+        };
+        let tag = pallama_runtime::whisper::install(&gh, &d, target.as_deref(), pinned).await?;
+        let pin = if pinned { " (pinned)" } else { "" };
+        println!("whisper.cpp server installed{pin}: {tag}");
         return Ok(());
     }
     if let Some(size) = pull {
@@ -2454,6 +3206,9 @@ async fn whisper_cmd(
         .ok_or_else(|| anyhow!("no audio file given — pass one, or use --install/--pull/--list"))?;
     let bytes = std::fs::read(file).with_context(|| format!("read {}", file.display()))?;
     let base = ensure_daemon().await?;
+    // `/v1/audio/transcriptions` is key-gated once [[keys]] exist; pick the
+    // same admin bearer the keys CLI uses so the local lane keeps working.
+    let bearer = admin_bearer();
     // Local-first default: use the installed whisper lane when present,
     // else the historical whisper: remote prefix.
     let local_ready = pallama_runtime::whisper::server_bin(&d).is_some()
@@ -2470,11 +3225,13 @@ async fn whisper_cmd(
     let form = reqwest::multipart::Form::new()
         .text("model", model)
         .part("file", part);
-    let resp = reqwest::Client::new()
+    let mut req = reqwest::Client::new()
         .post(format!("{base}/v1/audio/transcriptions"))
-        .multipart(form)
-        .send()
-        .await?;
+        .multipart(form);
+    if let Some(b) = &bearer {
+        req = req.bearer_auth(b);
+    }
+    let resp = req.send().await?;
     let status = resp.status();
     let v: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
     if !status.is_success() {
@@ -3053,57 +3810,114 @@ fn quick_tg(d: &PallamaDirs, row: &pallama_core::EngineRow, model_path: &str) ->
     }
 }
 
+/// F7 regression gate: DEFAULT-config tg128 on the freshly installed
+/// engine vs the recorded baseline engine. Skips silently when no tune
+/// baseline exists (nothing to compare). On a >10% decode drop it rolls
+/// the previous engine back to active and errors.
+fn engine_regression_gate(
+    mgr: &EngineManager,
+    d: &PallamaDirs,
+    row: &pallama_core::EngineRow,
+) -> Result<()> {
+    let store = Store::open(d)?;
+    if let Some((prev_tag, _recorded_tg, model)) = gate_baseline(&store)? {
+        let mrow = store
+            .get_model(&model)?
+            .ok_or_else(|| anyhow!("gate baseline model {model:?} no longer pulled"))?;
+        let prev_row = store
+            .list_engines()?
+            .into_iter()
+            .find(|e| e.tag == prev_tag)
+            .ok_or_else(|| anyhow!("gate: baseline engine {prev_tag} pruned"))?;
+        let prev_tg = quick_tg(d, &prev_row, &mrow.path)?;
+        let new_tg = quick_tg(d, row, &mrow.path)?;
+        println!(
+            "gate: {model} tg128 (default cfg) {prev_tg:.1} -> {new_tg:.1} t/s ({prev_tag} -> {})",
+            row.tag
+        );
+        if new_tg < prev_tg * 0.9 {
+            mgr.use_tag(&prev_tag)?;
+            anyhow::bail!(
+                "REGRESSION GATE TRIPPED: {:.0}% decode drop on {model} — \
+                 rolled back to {prev_tag} (now active). {row_tag} stays \
+                 installed for `pallama engine use {row_tag}` to force.",
+                (1.0 - new_tg / prev_tg) * 100.0,
+                row_tag = row.tag,
+            );
+        }
+        let _ = store.record_bench(&row.tag, &model, new_tg, 0.0, 0);
+    }
+    Ok(())
+}
+
 async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
     let d = dirs();
     match cmd {
         EngineCmd::Update { tag, no_gate } => {
             let token = std::env::var("GH_TOKEN").ok();
             let gh = GhClient::new(token)?;
+            let cfg = config()?;
+            // Explicit --tag bypasses the configured channel (power-user
+            // override); otherwise the channel resolves the target. The
+            // resolved release is passed through to the manager so the
+            // whole flow is a single upstream fetch.
+            let from_channel = tag.is_none();
+            let resolved = match &tag {
+                Some(_) => None,
+                None => Some(gh.channel_b_release(cfg.update_channel).await?),
+            };
+            let target_tag = match (&tag, &resolved) {
+                (Some(t), _) => t.clone(),
+                (None, Some(rel)) => rel.tag_name.clone(),
+                (None, None) => unreachable!("channel lane always resolves"),
+            };
+            // Channels are pins, not floors: switching latest -> stable
+            // re-targets downward by design. The F7 gate compares perf
+            // and would trip on any intentional downgrade, so it is
+            // skipped when the target is older than the active engine.
+            let active_tag = Store::open(&d)?.active_engine()?.map(|e| e.tag);
+            let downgrade = match &active_tag {
+                Some(a) => matches!(
+                    (btag_number(a), btag_number(&target_tag)),
+                    (Some(x), Some(y)) if y < x
+                ),
+                None => false,
+            };
             let mgr = EngineManager {
                 dirs: d.clone(),
                 gh,
                 bus: EventBus::default(),
-                asset_override: config()?.engine_asset,
+                asset_override: cfg.engine_asset,
             };
-            let row = mgr.update(tag.as_deref()).await?;
+            let row = match resolved {
+                Some(rel) => mgr.update_resolved(rel).await?,
+                None => mgr.update(tag.as_deref(), cfg.update_channel).await?,
+            };
             // F7 gate (FIX5): DEFAULT-config tg128 on BOTH engines —
             // comparing new-default vs baseline-argmax was apples-to-
             // oranges, biased to trip. Baseline = most recent tune row.
-            // Skip: --no-gate or PALLAMA_ENGINE_GATE=0.
-            let gate_on = !no_gate && std::env::var("PALLAMA_ENGINE_GATE").as_deref() != Ok("0");
+            // Skip: --no-gate, PALLAMA_ENGINE_GATE=0, or channel
+            // downgrade (an older build losing to a newer one is the
+            // point of the switch, not a regression).
+            let gate_on = !no_gate
+                && std::env::var("PALLAMA_ENGINE_GATE").as_deref() != Ok("0")
+                && !downgrade;
             if gate_on {
-                let store = Store::open(&d)?;
-                if let Some((prev_tag, _recorded_tg, model)) = gate_baseline(&store)? {
-                    let mrow = store
-                        .get_model(&model)?
-                        .ok_or_else(|| anyhow!("gate baseline model {model:?} no longer pulled"))?;
-                    let prev_row = store
-                        .list_engines()?
-                        .into_iter()
-                        .find(|e| e.tag == prev_tag)
-                        .ok_or_else(|| anyhow!("gate: baseline engine {prev_tag} pruned"))?;
-                    let prev_tg = quick_tg(&d, &prev_row, &mrow.path)?;
-                    let new_tg = quick_tg(&d, &row, &mrow.path)?;
+                engine_regression_gate(&mgr, &d, &row)?;
+            } else if downgrade {
+                println!("channel switch: downgrade to {target_tag} — regression gate skipped");
+                if let Some(prev) = &active_tag {
                     println!(
-                        "gate: {model} tg128 (default cfg) {prev_tg:.1} -> {new_tg:.1} t/s ({prev_tag} -> {})",
-                        row.tag
+                        "previous {prev} stays installed — `pallama engine use {prev}` restores it"
                     );
-                    if new_tg < prev_tg * 0.9 {
-                        mgr.use_tag(&prev_tag)?;
-                        anyhow::bail!(
-                            "REGRESSION GATE TRIPPED: {:.0}% decode drop on {model} — \
-                             rolled back to {prev_tag} (now active). {row_tag} stays \
-                             installed for `pallama engine use {row_tag}` to force.",
-                            (1.0 - new_tg / prev_tg) * 100.0,
-                            row_tag = row.tag,
-                        );
-                    }
-                    let _ = store.record_bench(&row.tag, &model, new_tg, 0.0, 0);
                 }
             } else {
                 println!("engine {} installed; regression gate skipped", row.tag);
             }
             let m: pallama_runtime::Manifest = serde_json::from_str(&row.manifest)?;
+            if from_channel {
+                println!("update channel: {}", cfg.update_channel);
+            }
             println!(
                 "engine {} active (build {}, {} devices, {} flags)",
                 row.tag,
@@ -3161,17 +3975,27 @@ async fn upstream_update_hint(dirs: &PallamaDirs) {
     if active.tag == "local" {
         return; // local build: upstream currency is the user's concern
     }
+    let Ok(cfg) = Config::load(dirs) else { return };
     let token = std::env::var("GH_TOKEN").ok();
     let Ok(gh) = GhClient::new(token) else { return };
-    let latest =
-        tokio::time::timeout(std::time::Duration::from_secs(4), gh.latest_b_release()).await;
+    let latest = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        gh.channel_b_release(cfg.update_channel),
+    )
+    .await;
     if let Ok(Ok(rel)) = latest {
         if rel.tag_name == active.tag {
-            println!("engine up to date: {}", active.tag);
+            println!(
+                "engine up to date: {} (channel: {})",
+                active.tag, cfg.update_channel
+            );
         } else {
             println!(
-                "update available: {} (active: {}) — run: pallama engine update",
-                rel.tag_name, active.tag
+                "{} available: {} (active: {}, channel: {}) — run: pallama engine update",
+                channel_word(&active.tag, &rel.tag_name),
+                rel.tag_name,
+                active.tag,
+                cfg.update_channel
             );
         }
     }
@@ -3181,52 +4005,100 @@ async fn upstream_update_hint(dirs: &PallamaDirs) {
 /// asks GitHub for the newest llama.cpp b-release and writes a marker the
 /// doctor/ps surfaces read. Never auto-installs — `pallama engine update`
 /// stays a human action; failures log at debug and retry next tick.
-fn spawn_engine_check_task(dirs: &PallamaDirs, every_secs: u64) {
+fn spawn_engine_check_task(
+    dirs: &PallamaDirs,
+    every_secs: u64,
+    engine: Arc<dyn pallama_runtime::Engine>,
+) {
     let dirs = dirs.clone();
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval_at(
-            tokio::time::Instant::now(),
-            std::time::Duration::from_secs(every_secs),
-        );
+        // First check fires immediately; a successful check repeats every
+        // `every_secs`, a FAILED one retries in 10 minutes instead of
+        // waiting a full day (a cold-start timeout must not blind the
+        // daemon's currency marker until tomorrow).
+        let retry_delay = std::time::Duration::from_mins(10).min(Duration::from_secs(every_secs));
+        let full_delay = Duration::from_secs(every_secs);
+        let mut delay = Duration::ZERO;
         loop {
-            tick.tick().await;
+            tokio::time::sleep(delay).await;
             let Ok(store) = Store::open(&dirs) else {
+                delay = retry_delay;
                 continue;
             };
             let Ok(Some(active)) = store.active_engine() else {
+                delay = retry_delay;
                 continue;
             };
             if active.tag == pallama_runtime::LOCAL_TAG {
+                delay = full_delay;
                 continue; // local build: currency is the user's concern
             }
-            let token = std::env::var("GH_TOKEN").ok();
-            let Ok(gh) = GhClient::new(token) else {
+            let Ok(cfg) = Config::load(&dirs) else {
+                delay = retry_delay;
                 continue;
             };
-            let latest =
-                tokio::time::timeout(std::time::Duration::from_secs(4), gh.latest_b_release())
-                    .await;
+            let token = std::env::var("GH_TOKEN").ok();
+            let Ok(gh) = GhClient::new(token) else {
+                delay = retry_delay;
+                continue;
+            };
+            // Fresh config every tick: switching channels in config.toml
+            // takes effect on the next check without a daemon restart.
+            // Budget covers the full stable-channel resolve chain
+            // (latest -> v-tag -> nightly-tag.txt -> concrete b-tag).
+            let latest = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                gh.channel_b_release(cfg.update_channel),
+            )
+            .await;
             let Ok(Ok(rel)) = latest else {
-                tracing::debug!(target: "pallama::engine", "engine check failed (will retry)");
+                let reason = match latest.as_ref() {
+                    Ok(Err(e)) => format!("{e:#}"),
+                    Err(_) => "timed out after 15s".to_string(),
+                    Ok(Ok(_)) => unreachable!("guarded by the let-else"),
+                };
+                tracing::warn!(
+                    target: "pallama::engine",
+                    "engine check failed ({reason}) — retrying in 10 min"
+                );
+                delay = retry_delay;
                 continue;
             };
             let newer = rel.tag_name != active.tag;
             if newer {
                 tracing::info!(
                     target: "pallama::engine",
-                    "update available: {} (active: {}) — run: pallama engine update",
-                    rel.tag_name, active.tag
+                    "{} available: {} (active: {}, channel: {}) — run: pallama engine update",
+                    channel_word(&active.tag, &rel.tag_name),
+                    rel.tag_name,
+                    active.tag,
+                    cfg.update_channel
                 );
             }
+            // Child-context device census: the serving child's own view of
+            // the GPU world. Doctor compares these against the install-time
+            // (manifest) names to flag enumeration drift. A failed census
+            // writes null — drift detection simply waits for the next tick.
+            let devices: Option<Vec<serde_json::Value>> =
+                engine.enumerate_devices().await.ok().flatten().map(|ds| {
+                    ds.iter()
+                        .map(
+                            |dev| serde_json::json!({"name": dev.name, "total_mib": dev.total_mib}),
+                        )
+                        .collect()
+                });
             let marker = serde_json::json!({
                 "checked_at": std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs()),
                 "latest": rel.tag_name,
                 "active": active.tag,
+                "channel": cfg.update_channel.to_string(),
                 "update_available": newer,
+                "devices": devices,
             });
             let _ = std::fs::write(dirs.run_dir().join("engine-check.json"), marker.to_string());
+            delay = full_delay;
         }
     });
 }
@@ -3290,15 +4162,73 @@ async fn search(query: &str) -> Result<()> {
         println!("no GGUF repos matched {query:?}");
         return Ok(());
     }
-    println!("{:<48} {:>10} {:>6}", "REPO", "DOWNLOADS", "LIKES");
+    // Column width adapts to the longest repo id (capped) so numbers never
+    // drift out of alignment; oversize ids truncate with an ellipsis.
+    let cap = 48usize;
+    let width = results
+        .iter()
+        .map(|r| r.id.len().min(cap))
+        .max()
+        .unwrap_or(0)
+        .max("REPO".len());
+    let human = |n: u64| {
+        if n >= 1_000_000 {
+            let t = n / 100_000; // e.g. 2_414_570 -> 24 -> "2.4M"
+            format!("{}.{}M", t / 10, t % 10)
+        } else if n >= 1_000 {
+            let t = n / 100; // e.g. 414_570 -> 4145 -> "414.5k"
+            format!("{}.{}k", t / 10, t % 10)
+        } else {
+            n.to_string()
+        }
+    };
+    let human_ctx = |c: u64| {
+        if c >= 1024 * 1024 {
+            format!("{}M", c / (1024 * 1024))
+        } else if c >= 1024 {
+            format!("{}k", c / 1024)
+        } else {
+            c.to_string()
+        }
+    };
+    println!(
+        "{:<width$}  {:>10}  {:>6}  {:<10}  {:<7}  {:>5}",
+        "REPO",
+        "DOWNLOADS",
+        "LIKES",
+        "SIZE",
+        "ARCH",
+        "CTX",
+        width = width
+    );
     for r in results {
+        let id = if r.id.len() > cap {
+            format!("{}…", &r.id[..cap - 1])
+        } else {
+            r.id.clone()
+        };
+        let (size, arch, ctx) = r.gguf.map_or_else(
+            || ("-".to_string(), "?".to_string(), "-".to_string()),
+            |g| {
+                (
+                    humansize(i64::try_from(g.total.unwrap_or(0)).unwrap_or(i64::MAX)),
+                    g.architecture.unwrap_or_else(|| "?".to_string()),
+                    g.context_length.map_or_else(|| "-".to_string(), &human_ctx),
+                )
+            },
+        );
         println!(
-            "{:<48} {:>10} {:>6}",
-            r.id,
-            r.downloads.unwrap_or(0),
-            r.likes.unwrap_or(0)
+            "{:<width$}  {:>10}  {:>6}  {:<10}  {:<7}  {:>5}",
+            id,
+            human(r.downloads.unwrap_or(0)),
+            r.likes.unwrap_or(0),
+            size,
+            arch,
+            ctx,
+            width = width
         );
     }
+    println!("\n# pull one: pallama pull <REPO>[:quant]   (size = all quants in repo)");
     Ok(())
 }
 
@@ -3420,7 +4350,9 @@ async fn upgrade(version: Option<String>, dry_run: bool) -> Result<()> {
         .or_else(|_| std::env::var("GITHUB_TOKEN"))
         .ok();
     let client = pallama_runtime::GhClient::with_base(&base, token).map_err(|e| anyhow!("{e}"))?;
-    let summary = pallama_runtime::upgrade::run(&client, &repo, version.as_deref(), dry_run).await;
+    let channel = config()?.update_channel;
+    let summary =
+        pallama_runtime::upgrade::run(&client, &repo, version.as_deref(), channel, dry_run).await;
     println!("{summary}");
     if summary.starts_with("upgrade failed") {
         return Err(anyhow!("upgrade failed"));
@@ -3491,7 +4423,7 @@ mod tests {
         assert!(c.warn);
         assert_eq!(
             c.detail,
-            "update available: b10831 (active: b10819) — run: pallama engine update"
+            "upgrade available: b10831 (active: b10819, channel: latest) — run: pallama engine update"
         );
     }
 
@@ -3539,5 +4471,339 @@ mod tests {
         let marker = serde_json::json!({"checked_at": 1_u64, "active": "b1"});
         assert!(currency_verdict(None, &marker, 2).is_none());
         assert!(currency_verdict(Some("b1"), &marker, 2).is_none()); // no latest
+    }
+
+    #[test]
+    fn unit__ver_triple__strict_three_numeric_parts() {
+        assert_eq!(ver_triple("0.3.0"), Some((0, 3, 0)));
+        assert_eq!(ver_triple("v1.2.3"), Some((1, 2, 3)));
+        assert_eq!(ver_triple(" v2.0.1 "), Some((2, 0, 1)));
+        assert_eq!(ver_triple("1.2"), None);
+        assert_eq!(ver_triple("1.2.3.4"), None);
+        assert_eq!(ver_triple("1.2.x"), None);
+        assert_eq!(ver_triple("0.3.0-beta"), None);
+        assert_eq!(ver_triple("nightly"), None);
+    }
+
+    #[test]
+    fn unit__version_currency_verdict__update_available_warns_with_run_hint() {
+        let c = version_currency_verdict("app currency", "0.3.0", "v0.4.0", "pallama upgrade");
+        assert!(c.warn);
+        assert_eq!(
+            c.detail,
+            "update available: v0.4.0 (running: 0.3.0) — run: pallama upgrade"
+        );
+        let w = version_currency_verdict(
+            "whisper currency",
+            "v1.7.5",
+            "v1.7.6",
+            "pallama whisper --install",
+        );
+        assert!(w.warn);
+        assert_eq!(
+            w.detail,
+            "update available: v1.7.6 (running: v1.7.5) — run: pallama whisper --install"
+        );
+    }
+
+    #[test]
+    fn unit__version_currency_verdict__equal_versions_ok_with_v_prefix() {
+        let c = version_currency_verdict("app currency", "0.3.0", "v0.3.0", "pallama upgrade");
+        assert!(c.ok && !c.warn);
+        assert_eq!(c.detail, "up to date (0.3.0)");
+    }
+
+    #[test]
+    fn unit__version_currency_verdict__running_ahead_is_ok() {
+        let c = version_currency_verdict("app currency", "0.5.1", "v0.4.0", "pallama upgrade");
+        assert!(c.ok && !c.warn);
+        assert!(c.detail.contains("ahead"), "{}", c.detail);
+    }
+
+    #[test]
+    fn unit__version_currency_verdict__mixed_tag_shapes_fall_back_to_inequality() {
+        // whisper.cpp reality: installed v-tag vs latest b-tag.
+        let c = version_currency_verdict(
+            "whisper currency",
+            "v1.7.5",
+            "b4938",
+            "pallama whisper --install",
+        );
+        assert!(c.warn);
+        assert_eq!(
+            c.detail,
+            "update available: b4938 (running: v1.7.5) — run: pallama whisper --install"
+        );
+        // Same unparseable tag on both sides = up to date, not a warn.
+        let c = version_currency_verdict("app currency", "nightly", "nightly", "pallama upgrade");
+        assert!(c.ok && !c.warn);
+        assert_eq!(c.detail, "up to date (nightly)");
+    }
+
+    #[test]
+    fn unit__exposure_verdict__loopback_authless_ok() {
+        let c = exposure_verdict("127.0.0.1", 11434, 0);
+        assert!(c.ok && !c.warn);
+        assert_eq!(c.detail, "loopback bind, no auth needed");
+    }
+
+    #[test]
+    fn unit__exposure_verdict__wildcard_authless_warns() {
+        let c = exposure_verdict("0.0.0.0", 11434, 0);
+        assert!(c.warn, "{}", c.detail);
+        assert!(c.detail.contains("all interfaces"), "{}", c.detail);
+        assert!(c.detail.to_lowercase().contains("no auth"), "{}", c.detail);
+        // Empty host means wildcard too.
+        let c = exposure_verdict("", 11434, 0);
+        assert!(c.warn, "{}", c.detail);
+    }
+
+    #[test]
+    fn unit__exposure_verdict__lan_with_keys_ok() {
+        let c = exposure_verdict("192.168.1.10", 11434, 2);
+        assert!(c.ok && !c.warn, "{}", c.detail);
+        assert!(c.detail.contains("2 key(s)"), "{}", c.detail);
+        assert!(c.detail.contains("TLS"), "{}", c.detail);
+    }
+
+    #[test]
+    fn unit__device_drift__flags_only_missing() {
+        let f = vec!["Vulkan0".to_string(), "Vulkan1".to_string()];
+        let l = vec!["Vulkan0".to_string()];
+        assert_eq!(device_drift(&f, &l), vec!["Vulkan1".to_string()]);
+        // child sees a superset: nothing flagged
+        assert!(device_drift(&f, &f).is_empty());
+        assert!(device_drift(&f, &["Vulkan0".into(), "Vulkan1".into(), "CUDA0".into()]).is_empty());
+        // both empty (CPU-only): healthy
+        assert!(device_drift(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn unit__doctor_next_steps__daemon_models_ready() {
+        let port_ok = vec![
+            Check::ok("port", "127.0.0.1:11435 — pallama daemon already answering"),
+            Check::ok("models", "2 pulled, all parse"),
+        ];
+        // daemon up + models present -> the ready line
+        assert_eq!(
+            doctor_next_steps(&port_ok),
+            vec!["chat: pallama run <model>"]
+        );
+        // daemon down -> serve hint first, model hint second
+        let down = vec![
+            Check::fail("port", "nothing answering"),
+            Check::ok("models", "0 pulled, all parse"),
+        ];
+        assert_eq!(
+            doctor_next_steps(&down)[0],
+            "start the daemon: pallama serve (or: systemctl start pallama)"
+        );
+        assert_eq!(
+            doctor_next_steps(&down)[1],
+            "pull a model: pallama pull <name> (find one: pallama search qwen3)"
+        );
+        // "10 pulled" must NOT match the zero-models wording
+        let ten = vec![
+            Check::ok("port", "pallama daemon already answering"),
+            Check::ok("models", "10 pulled, all parse"),
+        ];
+        assert_eq!(doctor_next_steps(&ten), vec!["chat: pallama run <model>"]);
+    }
+
+    #[test]
+    fn unit__census_names__absent_null_array_empty() {
+        // Legacy marker (pre-census daemon): unknown, never drift.
+        assert!(census_names(&serde_json::json!({})).is_none());
+        // Probe failed at census time (writer emits null): unknown.
+        assert!(census_names(&serde_json::json!({"devices": null})).is_none());
+        // Census ran: names extracted.
+        let m = serde_json::json!({
+            "devices": [{"name": "Vulkan0", "total_mib": 8188}],
+            "checked_at": 1_788_886_202,
+        });
+        assert_eq!(census_names(&m), Some(vec!["Vulkan0".to_string()]));
+        // Census ran and found nothing: known-empty, not unknown.
+        assert_eq!(
+            census_names(&serde_json::json!({"devices": []})),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn unit__marker_channel_matches__absent_match_mismatch() {
+        use pallama_core::config::UpdateChannel;
+        // Legacy marker (pre-channel daemon) defaults to "latest".
+        assert!(marker_channel_matches(
+            &serde_json::json!({}),
+            UpdateChannel::Latest
+        ));
+        assert!(!marker_channel_matches(
+            &serde_json::json!({}),
+            UpdateChannel::Stable
+        ));
+        // Explicit channel key.
+        let m = serde_json::json!({"channel": "stable"});
+        assert!(marker_channel_matches(&m, UpdateChannel::Stable));
+        assert!(!marker_channel_matches(&m, UpdateChannel::Latest));
+    }
+
+    #[test]
+    fn unit__service_verdict__shapes() {
+        // Managed and healthy.
+        let c = service_verdict(Some(true), Some(true), "systemd").unwrap();
+        assert!(c.ok && !c.warn);
+        assert!(c.detail.contains("active + enabled"), "{}", c.detail);
+        // Enabled but dead: warn.
+        let c = service_verdict(Some(true), Some(false), "systemd").unwrap();
+        assert!(c.warn);
+        assert!(c.detail.contains("not running"), "{}", c.detail);
+        // Running unenabled: warn.
+        let c = service_verdict(Some(false), Some(true), "systemd").unwrap();
+        assert!(c.warn);
+        assert!(c.detail.contains("not enabled"), "{}", c.detail);
+        // Manual lane: informational ok, not a warning.
+        let c = service_verdict(Some(false), Some(false), "systemd").unwrap();
+        assert!(c.ok && !c.warn, "{}", c.detail);
+        // Inconclusive probes: no row at all.
+        assert!(service_verdict(None, Some(true), "systemd").is_none());
+        assert!(service_verdict(Some(true), None, "systemd").is_none());
+    }
+
+    #[test]
+    fn unit__doctor_store__absent_fresh_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = PallamaDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let checks = doctor_store(&d);
+        assert_eq!(checks.len(), 1);
+        assert!(checks[0].ok && !checks[0].warn, "{}", checks[0].detail);
+        assert!(
+            checks[0].detail.contains("fresh install"),
+            "{}",
+            checks[0].detail
+        );
+    }
+
+    #[test]
+    fn unit__doctor_store__healthy_quick_check_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = PallamaDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(&d.data_dir).unwrap();
+        drop(Store::open(&d).unwrap()); // creates + migrates pallama.db
+        let checks = doctor_store(&d);
+        assert_eq!(checks.len(), 1);
+        assert!(checks[0].ok && !checks[0].warn, "{}", checks[0].detail);
+        assert!(
+            checks[0].detail.contains("quick_check passed"),
+            "{}",
+            checks[0].detail
+        );
+    }
+
+    #[test]
+    fn unit__doctor_store__corrupt_db_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = PallamaDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(&d.data_dir).unwrap();
+        std::fs::write(d.db_file(), b"this is not a sqlite file").unwrap();
+        let checks = doctor_store(&d);
+        assert_eq!(checks.len(), 1);
+        assert!(checks[0].warn, "{}", checks[0].detail);
+        assert!(
+            checks[0].detail.contains("regenerate"),
+            "{}",
+            checks[0].detail
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unit__engine_smoke_check__executes_warns_and_misses() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Healthy: a script that prints a version banner.
+        let good = tmp.path().join("server-good");
+        std::fs::write(&good, "#!/bin/sh\necho 'llama-server b10857'\n").unwrap();
+        make_executable(&good);
+        let c = engine_smoke_check(good.to_str().unwrap());
+        assert!(c.ok && !c.warn, "{}", c.detail);
+        assert!(c.detail.contains("executes"), "{}", c.detail);
+        assert!(c.detail.contains("b10857"), "{}", c.detail);
+        // Broken: exits non-zero.
+        let bad = tmp.path().join("server-bad");
+        std::fs::write(&bad, "#!/bin/sh\nexit 3\n").unwrap();
+        make_executable(&bad);
+        let c = engine_smoke_check(bad.to_str().unwrap());
+        assert!(c.warn, "{}", c.detail);
+        assert!(c.detail.contains("exited"), "{}", c.detail);
+        // Missing path entirely.
+        let c = engine_smoke_check(tmp.path().join("nope").to_str().unwrap());
+        assert!(c.warn, "{}", c.detail);
+        assert!(c.detail.contains("cannot execute"), "{}", c.detail);
+    }
+
+    #[cfg(unix)]
+    fn make_executable(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(path).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(path, perm).unwrap();
+    }
+
+    #[test]
+    fn unit__channel_word__btag_direction() {
+        assert_eq!(channel_word("b10857", "b10865"), "upgrade");
+        assert_eq!(channel_word("b10857", "b10780"), "downgrade");
+        assert_eq!(channel_word("b10857", "b10857"), "update");
+        // Non-b tags have no ordering: neutral word.
+        assert_eq!(channel_word("v1.8.0", "v1.9.0"), "update");
+        assert_eq!(channel_word("b10857", "v1.36.0"), "update");
+    }
+
+    #[test]
+    fn unit__currency_verdict__direction_and_channel() {
+        let now = 1_000_000u64;
+        // Marker older than active, stable channel: a downgrade hint with
+        // the channel named — switching is the point, not a regression.
+        let marker = serde_json::json!({
+            "checked_at": now - 60,
+            "latest": "b10780",
+            "active": "b10857",
+            "channel": "stable",
+            "update_available": true,
+        });
+        let c = currency_verdict(Some("b10857"), &marker, now).unwrap();
+        assert!(c.warn, "{}", c.detail);
+        assert!(c.detail.contains("downgrade available"), "{}", c.detail);
+        assert!(c.detail.contains("channel: stable"), "{}", c.detail);
+        // Old marker without the channel key: defaults to latest, still
+        // carries a direction word.
+        let legacy = serde_json::json!({
+            "checked_at": now - 60,
+            "latest": "b10865",
+            "active": "b10857",
+            "update_available": true,
+        });
+        let c = currency_verdict(Some("b10857"), &legacy, now).unwrap();
+        assert!(c.warn, "{}", c.detail);
+        assert!(c.detail.contains("upgrade available"), "{}", c.detail);
+        assert!(c.detail.contains("channel: latest"), "{}", c.detail);
+        // Up to date: ok row regardless of channel.
+        let fresh = serde_json::json!({
+            "checked_at": now - 60,
+            "latest": "b10857",
+            "active": "b10857",
+            "channel": "latest",
+            "update_available": false,
+        });
+        let c = currency_verdict(Some("b10857"), &fresh, now).unwrap();
+        assert!(c.ok && !c.warn, "{}", c.detail);
     }
 }
