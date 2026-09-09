@@ -1,0 +1,1 @@
+pallama: pallama signout: refused — pallama is local-only by design (no registry, no cloud accounts). Pull models straight from Hugging Face: pallama pull <owner/repo:QUANT>

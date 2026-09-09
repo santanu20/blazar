@@ -1223,6 +1223,44 @@ def probe_routes(port: int, model: str, ollama: bool = False) -> dict:
             "/api/embed",
             {"model": model, "input": "hello", **({"keep_alive": 0} if ollama else {})},
         ),
+        # Model-scoped surfaces (parity wave): query lane carries the
+        # pallama target; raw llama-server routes them natively; ollama
+        # answers 404 — exactly the capability delta the probe measures.
+        ("GET /props", "GET", f"/props?model={model}", None),
+        ("GET /slots", "GET", f"/slots?model={model}", None),
+        ("GET /v1/stream", "GET", f"/v1/stream?model={model}", None),
+        (
+            "POST /v1/streams/lookup",
+            "POST",
+            "/v1/streams/lookup",
+            {"model": model, "prompt": "hi"},
+        ),
+        (
+            "POST /v1/reranking",
+            "POST",
+            "/v1/reranking",
+            {"model": model, "query": "hi", "documents": ["a", "b"]},
+        ),
+        (
+            "POST /v1/chat/completions/input_tokens",
+            "POST",
+            "/v1/chat/completions/input_tokens",
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        ),
+        (
+            "POST /audio/transcriptions",
+            "POST",
+            "/audio/transcriptions",
+            # JSON probe against a multipart route: 4xx = route exists
+            # (probe-body rejection), the probe's explicit "route" class.
+            {"model": model},
+        ),
+        ("GET /api/keys", "GET", "/api/keys", None),
+        ("GET /.well-known/pallama", "GET", "/.well-known/pallama", None),
+        ("GET /healthz", "GET", "/healthz", None),
     ]
     out: dict[str, str] = {}
     for label, method, path, body in probes:
