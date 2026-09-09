@@ -10,6 +10,7 @@ use pallama_core::hardware::{GpuInfo, Hardware};
 use pallama_core::store::Store;
 use pallama_core::{Config, ModelOverride, PallamaDirs};
 use pallama_runtime::engine::manifest::{probe as probe_manifest, Manifest};
+use pallama_runtime::supervisor::PrefixKey;
 use pallama_runtime::{EventBus, LlamaCppEngine, Supervisor};
 
 fn stub_bin() -> PathBuf {
@@ -124,8 +125,14 @@ async fn integration__replicas2_distinct_prefixes__two_children() {
     let (_t, dirs) = setup("m");
     let sup = supervisor(&dirs, Some(2));
 
-    let a = sup.ensure_routed("m", Some(1)).await.expect("replica 1");
-    let b = sup.ensure_routed("m", Some(2)).await.expect("replica 2");
+    let a = sup
+        .ensure_routed("m", Some(PrefixKey { sys: 1, convo: 1 }))
+        .await
+        .expect("replica 1");
+    let b = sup
+        .ensure_routed("m", Some(PrefixKey { sys: 2, convo: 2 }))
+        .await
+        .expect("replica 2");
     assert_eq!(a.name, "m#1", "first distinct prefix grows #1");
     assert_eq!(b.name, "m#2", "second distinct prefix grows #2");
     assert_ne!(a.endpoint, b.endpoint, "replicas own separate children");
@@ -152,8 +159,14 @@ async fn integration__same_prefix__sticky_replica() {
     let (_t, dirs) = setup("m");
     let sup = supervisor(&dirs, Some(2));
 
-    let first = sup.ensure_routed("m", Some(42)).await.expect("first");
-    let second = sup.ensure_routed("m", Some(42)).await.expect("second");
+    let first = sup
+        .ensure_routed("m", Some(PrefixKey { sys: 42, convo: 42 }))
+        .await
+        .expect("first");
+    let second = sup
+        .ensure_routed("m", Some(PrefixKey { sys: 42, convo: 42 }))
+        .await
+        .expect("second");
     assert_eq!(
         first.name, second.name,
         "same conversation prefix sticks to its warm replica"
@@ -185,8 +198,14 @@ async fn integration__evict_model__kills_all_replicas() {
     let (_t, dirs) = setup("m");
     let sup = supervisor(&dirs, Some(2));
 
-    let a = sup.ensure_routed("m", Some(1)).await.expect("replica 1");
-    let b = sup.ensure_routed("m", Some(2)).await.expect("replica 2");
+    let a = sup
+        .ensure_routed("m", Some(PrefixKey { sys: 1, convo: 1 }))
+        .await
+        .expect("replica 1");
+    let b = sup
+        .ensure_routed("m", Some(PrefixKey { sys: 2, convo: 2 }))
+        .await
+        .expect("replica 2");
     let pid_a = pid_of_replica(&sup, &a.name);
     let pid_b = pid_of_replica(&sup, &b.name);
 

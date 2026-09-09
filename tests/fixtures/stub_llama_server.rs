@@ -121,6 +121,8 @@ fn main() {
         println!("  --models-preset PATH  router server model presets (INI)");
         println!("  --models-max N        router max simultaneously loaded");
         println!("  --slot-prompt-similarity SIM");
+        println!("  --api-key KEY          endpoint api key (bearer auth)");
+        println!("  --api-key-file FNAME   file containing the api key");
         return;
     }
 
@@ -150,6 +152,13 @@ fn main() {
         .parse()
         .expect("--port must be numeric");
     let alias = flag("--alias").unwrap_or_else(|| "stub-model".into());
+    // Child-auth hardening: --api-key wins, else --api-key-file content
+    // (trimmed) — mirrors upstream's two intake paths.
+    let api_key = flag("--api-key").or_else(|| {
+        flag("--api-key-file")
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|s| s.trim().to_string())
+    });
     if let Some(dir) = flag("--slot-save-path") {
         let _ = std::fs::create_dir_all(&dir);
         SLOT_SAVE_PATH.set(dir).expect("slot path once");
@@ -183,14 +192,26 @@ fn main() {
             .expect("router slot dirs once");
     }
 
+    // Test knob: die N ms after startup (fail-fast/liveness-race tests).
+    if let Some(ms) = std::env::var("STUB_DIE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        eprintln!("stub: simulated crash in {ms}ms");
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            std::process::exit(3);
+        });
+    }
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
-    rt.block_on(serve(host, port, alias));
+    rt.block_on(serve(host, port, alias, api_key));
 }
 
-async fn serve(host: String, port: u16, alias: String) {
+async fn serve(host: String, port: u16, alias: String, api_key: Option<String>) {
     use axum::routing::{get, post};
     let alias_for_routes = alias.clone();
     let app = axum::Router::new()
@@ -242,6 +263,7 @@ async fn serve(host: String, port: u16, alias: String) {
         .route("/infill", post(infill))
         .route("/v1/chat/completions/control", post(control_vectors))
         .route("/tokenize", post(tokenize))
+        .route("/embedding", post(embedding_legacy))
         .route("/slots/{id_slot}", post(slots_action))
         // Model-scoped upstream surfaces forwarded by the gateway's
         // scoped_proxy: props settings, slot-save streams, stream lookup,
@@ -252,7 +274,41 @@ async fn serve(host: String, port: u16, alias: String) {
         .route("/v1/reranking", post(reranking))
         .route("/models", get(router_models))
         .route("/models/unload", post(models_unload))
-        .with_state(alias.clone());
+        .with_state(alias.clone())
+        // Child-auth middleware (upstream server-http.cpp contract):
+        // every route requires the secret EXCEPT the public set
+        // (/health). Authorization: Bearer or X-Api-Key both accepted.
+        .layer(axum::middleware::from_fn(
+            move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
+                let secret = api_key.clone();
+                async move {
+                    if let Some(sec) = secret {
+                        let path = req.uri().path();
+                        if path != "/health" && path != "/v1/health" {
+                            let ok = req
+                                .headers()
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|v| v.strip_prefix("Bearer "))
+                                .is_some_and(|v| v == sec)
+                                || req
+                                    .headers()
+                                    .get("x-api-key")
+                                    .and_then(|v| v.to_str().ok())
+                                    .is_some_and(|v| v == sec);
+                            if !ok {
+                                return (
+                                    axum::http::StatusCode::UNAUTHORIZED,
+                                    "invalid or missing API key",
+                                )
+                                    .into_response();
+                            }
+                        }
+                    }
+                    next.run(req).await
+                }
+            },
+        ));
 
     let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -765,6 +821,34 @@ async fn tokenize(body: axum::body::Bytes) -> axum::Json<serde_json::Value> {
         .map(|w| w.len() as u64 + 1)
         .collect();
     axum::Json(serde_json::json!({ "tokens": tokens }))
+}
+
+/// Legacy single-doc embedding route (upstream shape): accepts
+/// `{"content": [token ids]}` or a plain string, returns a per-token
+/// matrix `[{index, embedding: [[f64]]}]`. Deterministic 16-dim
+/// multiplicative-hash vectors per id — identical prompts embed
+/// identically, different id sets land in quasi-random directions.
+async fn embedding_legacy(body: axum::body::Bytes) -> axum::Json<serde_json::Value> {
+    let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+    let ids: Vec<u64> = match &req["content"] {
+        serde_json::Value::Array(a) => a.iter().filter_map(serde_json::Value::as_u64).collect(),
+        serde_json::Value::String(s) => s.split_whitespace().map(|w| w.len() as u64 + 1).collect(),
+        _ => Vec::new(),
+    };
+    let matrix: Vec<Vec<f64>> = ids
+        .iter()
+        .map(|id| {
+            (0..16u32)
+                .map(|d| {
+                    let h = id
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        .wrapping_add(u64::from(d).wrapping_mul(0xD1B5_4A32_D192_ED03));
+                    f64::from((h >> 33) as u32 % 1009) / 1009.0
+                })
+                .collect()
+        })
+        .collect();
+    axum::Json(serde_json::json!([{ "index": 0, "embedding": matrix }]))
 }
 
 async fn slots_action(

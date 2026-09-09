@@ -88,10 +88,17 @@ fn payload_str(s: &str) -> Vec<u8> {
 
 fn supervisor(dirs: &PallamaDirs, config: Config, gpu: bool) -> Arc<Supervisor> {
     let mut engine = LlamaCppEngine::new(stub_manifest());
-    engine.child_env = vec![(
-        "STUB_ARGV_FILE".into(),
-        dirs.run_dir().join("argv.json").display().to_string(),
-    )];
+    engine.child_env = vec![
+        (
+            "STUB_ARGV_FILE".into(),
+            dirs.run_dir().join("argv.json").display().to_string(),
+        ),
+        // Match the harness GpuInfo name so device mapping keeps it.
+        (
+            "STUB_DEVICES".into(),
+            "stub-gpu: STUB GPU (24000 MiB, 24000 MiB free)".into(),
+        ),
+    ];
     let hw = if gpu {
         Hardware {
             physical_cores: 4,
@@ -424,6 +431,49 @@ async fn integration__load_timeout__never_healthy_stub() {
     );
     assert!(sup.ps().is_empty());
     // No zombie stub left bound to a port.
+    sup.shutdown_all().await.unwrap();
+}
+
+/// Fail-fast contract: a child that DIES mid-load must surface as
+/// `EngineCrashed` in seconds — never wait out the full `model_load_timeout`
+/// polling a corpse (live bug: 0.5B model "timing out" for 180s while the
+/// child had rejected `--device` and exited at 2s).
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__ensure_fail_fast__child_death_beats_load_timeout() {
+    let (_t, dirs) = setup(&[("m1", 500)]);
+    let mut engine = LlamaCppEngine::new(stub_manifest());
+    engine.child_env = vec![
+        ("STUB_HEALTH_NEVER".into(), "1".into()),
+        ("STUB_DIE_MS".into(), "300".into()),
+    ];
+    let s = Supervisor::new(
+        dirs.clone(),
+        base_config(),
+        EventBus::default(),
+        Hardware {
+            physical_cores: 4,
+            total_ram_mib: 16_000,
+            gpus: vec![],
+        },
+        Arc::new(engine),
+    );
+    let mut s = s;
+    s.load_timeout = Duration::from_secs(30); // 2 attempts = 60s without the race
+    s.shutdown_grace = Duration::from_secs(2);
+    let sup = Arc::new(s);
+    let t0 = Instant::now();
+    let err = sup.ensure("m1").await.unwrap_err();
+    assert!(
+        t0.elapsed() < Duration::from_secs(10),
+        "fail-fast violated: took {:?}",
+        t0.elapsed()
+    );
+    assert!(
+        matches!(err, SupervisionError::EngineCrashed(_)),
+        "expected EngineCrashed, got {err}"
+    );
+    assert!(sup.ps().is_empty());
     sup.shutdown_all().await.unwrap();
 }
 

@@ -9,6 +9,7 @@
 //! exercise against a fake release server.
 
 use anyhow::{anyhow, bail, Context, Result};
+use pallama_core::config::UpdateChannel;
 
 use crate::engine::gh::{GhAsset, GhClient};
 
@@ -16,8 +17,14 @@ use crate::engine::gh::{GhAsset, GhClient};
 ///
 /// `dry_run` resolves and downloads (verifying the digest) but replaces
 /// nothing — it proves the whole chain except the final rename.
-pub async fn run(client: &GhClient, repo: &str, version: Option<&str>, dry_run: bool) -> String {
-    match run_inner(client, repo, version, dry_run).await {
+pub async fn run(
+    client: &GhClient,
+    repo: &str,
+    version: Option<&str>,
+    channel: UpdateChannel,
+    dry_run: bool,
+) -> String {
+    match run_inner(client, repo, version, channel, dry_run).await {
         Ok(summary) => summary,
         Err(e) => format!("upgrade failed: {e:#}"),
     }
@@ -27,9 +34,10 @@ async fn run_inner(
     client: &GhClient,
     repo: &str,
     version: Option<&str>,
+    channel: UpdateChannel,
     dry_run: bool,
 ) -> Result<String> {
-    let plan = resolve(client, repo, version).await?;
+    let plan = resolve(client, repo, version, channel).await?;
     let bytes = client.download_asset_bytes(&plan.asset).await?;
     let binary = extract_binary(&plan.asset.name, &bytes)?;
     if dry_run {
@@ -68,8 +76,19 @@ pub fn preferred_assets(tag: &str) -> Vec<String> {
     }
 }
 
-pub async fn resolve(client: &GhClient, repo: &str, version: Option<&str>) -> Result<UpgradePlan> {
-    let release = client.release_by(repo, version).await?;
+pub async fn resolve(
+    client: &GhClient,
+    repo: &str,
+    version: Option<&str>,
+    channel: UpdateChannel,
+) -> Result<UpgradePlan> {
+    // Explicit --version overrides the channel; otherwise the channel
+    // picks the target (stable = GitHub's releases/latest, latest =
+    // newest release including prereleases).
+    let release = match version {
+        Some(v) => client.release_by(repo, Some(v)).await?,
+        None => client.channel_repo_release(repo, channel).await?,
+    };
     let candidates = preferred_assets(&release.tag_name);
     if candidates.is_empty() {
         bail!("unsupported platform for self-update");

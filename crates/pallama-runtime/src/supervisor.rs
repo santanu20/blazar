@@ -28,6 +28,21 @@ pub const ROUTER_KEY: &str = "_router";
 /// the point of replication; users wanting more can raise
 /// `max_loaded_models` and stack models.
 pub const MAX_REPLICAS: u32 = 8;
+
+/// Prompt-prefix identity for cache-aware replica routing (B1/F8):
+/// `sys` = shared-prefix class (head of the system prompt), `convo` =
+/// conversation identity (system + first user turn head). Identical
+/// `convo` sticks to its warm replica; a *new* conversation whose `sys`
+/// class matches a live replica coalesces onto it (shared system-prompt
+/// KV reuse) instead of growing a cold child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefixKey {
+    pub sys: u64,
+    pub convo: u64,
+}
+
+/// Recent `sys` classes remembered per replica key (F8 overlap routing).
+const SYS_RING_CAP: usize = 8;
 /// Bound on the prefix→replica affinity table (B1): one entry per
 /// distinct prompt prefix; eviction keeps it from growing unbounded.
 const PREFIX_AFFINITY_CAP: usize = 512;
@@ -100,6 +115,10 @@ pub struct Instance {
     /// Post-quantization KV-cache estimate from the compiled profile —
     /// feeds the co-residency planner (A15).
     pub kv_est_bytes: Option<u64>,
+    /// Per-child bearer secret (child `--api-key` hardening). Lifecycle
+    /// = child lifecycle; `None` on UDS children (filesystem perms
+    /// already gate the socket) and on engines lacking `--api-key`.
+    pub auth: Option<String>,
     child: tokio::sync::Mutex<ChildHandle>,
     pid: u32,
 }
@@ -207,6 +226,8 @@ pub struct Supervisor {
     /// (system + first user turn) pin a conversation to one warm-cache
     /// replica. Bounded, best-effort — a miss just re-routes.
     prefix_affinity: DashMap<u64, String>,
+    /// Per-replica ring of recently served `sys` prefix classes (F8).
+    sys_rings: DashMap<String, std::collections::VecDeque<u64>>,
     /// Model→model transition counts (LC1 predictive pre-loading):
     /// increments when a successful request for B follows one for A.
     transitions: DashMap<(String, String), u64>,
@@ -220,6 +241,10 @@ pub struct Supervisor {
     /// In-memory slots bumps adopted by LC4 (restart resets; `tune
     /// --slots` is the permanent path).
     adopted_slots: DashMap<String, u32>,
+    /// Session pins (R3): sessions that recently carried
+    /// `x-pallama-session` per model. The idle ladder and capacity
+    /// pressure consult this before evicting; force stop releases.
+    pub sessions: crate::sessionreg::SessionRegistry,
     // Test knobs (prod defaults from config).
     pub load_timeout: Duration,
     pub shutdown_grace: Duration,
@@ -232,6 +257,20 @@ pub struct Supervisor {
 pub struct EngineRef {
     pub name: String,
     pub endpoint: Endpoint,
+    /// Per-child bearer secret, stamped on every gateway call to this
+    /// child (`proxy::child_auth` is the single choke point). Never
+    /// serialized into `ps`/API output.
+    pub auth: Option<String>,
+}
+
+/// Minted child-auth bundle from [`Supervisor::mint_child_auth`].
+struct ChildAuth {
+    /// argv fragment appended to the spawn command.
+    argv: Vec<String>,
+    /// The secret itself (Instance/EngineRef cargo).
+    secret: String,
+    /// Keyfile removed at teardown (None when argv carries the secret).
+    keyfile: Option<std::path::PathBuf>,
 }
 
 impl Supervisor {
@@ -265,11 +304,13 @@ impl Supervisor {
             pending_ctx: DashMap::new(),
             heat: std::sync::Mutex::new(std::collections::HashMap::new()),
             prefix_affinity: DashMap::new(),
+            sys_rings: DashMap::new(),
             transitions: DashMap::new(),
             last_requested: std::sync::Mutex::new(None),
             preload_failures: DashMap::new(),
             busy_streak: DashMap::new(),
             adopted_slots: DashMap::new(),
+            sessions: crate::sessionreg::SessionRegistry::new(),
         }
     }
 
@@ -290,9 +331,12 @@ impl Supervisor {
 
     /// Capacity-eviction victim: the coldest evictable instance — zero
     /// in-flight, not the incoming key, and not pinned (overlay
-    /// `pin = true`, A13). Ordering: prefix heat first, then longest
-    /// idle. `None` = nothing evictable (caller surfaces `AllSlotsBusy`).
+    /// `pin = true`, A13). Ordering: session-pinned models LAST (R3 —
+    /// demoted, never excluded, so pressure can still land on them when
+    /// nothing else is free), then prefix heat, then longest idle.
+    /// `None` = nothing evictable (caller surfaces `AllSlotsBusy`).
     fn victim_key(&self, key: &str) -> Option<String> {
+        let ttl = self.session_ttl();
         self.instances
             .iter()
             .filter(|e| {
@@ -306,11 +350,17 @@ impl Supervisor {
             })
             .min_by_key(|e| {
                 (
+                    self.sessions.pins(model_of_key(e.key()), ttl).live,
                     self.heat_of(e.key()),
                     *e.last_used.read().expect("idle lock"),
                 )
             })
             .map(|e| e.key().clone())
+    }
+
+    /// Session-pin window (R3); zero = feature off.
+    fn session_ttl(&self) -> Duration {
+        Duration::from_secs(self.config.session_keep_secs)
     }
 
     /// Co-residency check (A15): would the candidate (weights + f16 KV)
@@ -337,14 +387,15 @@ impl Supervisor {
         resident > vram / 100 * 95
     }
 
-    /// TCP endpoints of live (non-evicted) children — the cache-hint
-    /// poller's fetch list. UDS children are skipped (no HTTP lane).
+    /// Live (non-evicted) TCP children as [`EngineRef`]s (endpoint +
+    /// child auth) — the cache-hint poller's and metrics merger's fetch
+    /// list. UDS children are skipped (no HTTP lane).
     #[must_use]
-    pub fn live_http_endpoints(&self) -> Vec<(String, Endpoint)> {
+    pub fn live_http_endpoints(&self) -> Vec<EngineRef> {
         self.instances
             .iter()
             .filter(|i| matches!(i.endpoint, Endpoint::Tcp { .. }))
-            .map(|i| (i.name.clone(), i.endpoint.clone()))
+            .map(|i| self.engine_ref(i.value()))
             .collect()
     }
 
@@ -361,7 +412,7 @@ impl Supervisor {
     pub async fn ensure_routed(
         &self,
         name: &str,
-        prefix: Option<u64>,
+        prefix: Option<PrefixKey>,
     ) -> Result<EngineRef, SupervisionError> {
         // Router mode: every model name resolves to the ONE router child
         // (upstream autoloads the model on request, LRU-evicts at
@@ -379,14 +430,24 @@ impl Supervisor {
         let result = self.ensure_key(&key).await;
         // Best-effort affinity record: pin this prefix to the replica
         // that served it, so the next turn hits its warm cache.
-        if let Some(h) = prefix {
-            if result.is_ok() && !self.prefix_affinity.contains_key(&h) {
-                if self.prefix_affinity.len() >= PREFIX_AFFINITY_CAP {
-                    if let Some(oldest) = self.prefix_affinity.iter().next().map(|e| *e.key()) {
-                        self.prefix_affinity.remove(&oldest);
+        if let Some(pk) = prefix {
+            if result.is_ok() {
+                if !self.prefix_affinity.contains_key(&pk.convo) {
+                    if self.prefix_affinity.len() >= PREFIX_AFFINITY_CAP {
+                        if let Some(oldest) = self.prefix_affinity.iter().next().map(|e| *e.key()) {
+                            self.prefix_affinity.remove(&oldest);
+                        }
                     }
+                    self.prefix_affinity.insert(pk.convo, key.clone());
                 }
-                self.prefix_affinity.insert(h, key);
+                // F8: remember the sys class this replica has warm.
+                let mut ring = self.sys_rings.entry(key).or_default();
+                if ring.len() >= SYS_RING_CAP {
+                    ring.pop_front();
+                }
+                if !ring.contains(&pk.sys) {
+                    ring.push_back(pk.sys);
+                }
             }
         }
         // LC1 predictive pre-loading: record the A→B edge on every
@@ -427,7 +488,7 @@ impl Supervisor {
     /// (own KV cache) → anonymous traffic reuses an idle live replica,
     /// else grows while all live are busy → least-loaded existing anyway
     /// (join its queue).
-    fn replica_key(&self, name: &str, prefix: Option<u64>) -> String {
+    fn replica_key(&self, name: &str, prefix: Option<PrefixKey>) -> String {
         if name == ROUTER_KEY {
             return name.to_string();
         }
@@ -441,8 +502,8 @@ impl Supervisor {
             return name.to_string();
         }
         // (a) Sticky prefix: same conversation → same warm cache.
-        if let Some(h) = prefix {
-            if let Some(hit) = self.prefix_affinity.get(&h) {
+        if let Some(pk) = prefix {
+            if let Some(hit) = self.prefix_affinity.get(&pk.convo) {
                 let key = hit.value().clone();
                 drop(hit);
                 if let Some(inst) = self.instances.get(&key) {
@@ -454,7 +515,11 @@ impl Supervisor {
             }
         }
         // (b) Scan live replicas: least-loaded + highest replica index.
+        // F8: while scanning, also score replicas that recently served the
+        // same `sys` prefix class — a new conversation sharing the system
+        // prompt coalesces onto the replica that already holds that KV.
         let mut best: Option<(String, i64)> = None;
+        let mut scored: Option<(String, i64)> = None;
         let mut max_idx: u32 = 0;
         for e in &self.instances {
             let Some((model, idx)) = split_replica(e.key()) else {
@@ -472,6 +537,22 @@ impl Supervisor {
             if best.as_ref().is_none_or(|b| load < b.1) {
                 best = Some((e.key().clone(), load));
             }
+            if let Some(pk) = prefix {
+                if self
+                    .sys_rings
+                    .get(e.key())
+                    .is_some_and(|ring| ring.contains(&pk.sys))
+                    && scored.as_ref().is_none_or(|sc| load < sc.1)
+                {
+                    scored = Some((e.key().clone(), load));
+                }
+            }
+        }
+        // (a2) Cache-aware coalesce: same system-prompt class, new
+        // conversation → the replica holding that prefix absorbs it
+        // instead of growing a cold child.
+        if let Some((key, _)) = scored {
+            return key;
         }
         match (best, prefix.is_some()) {
             // A NEW conversation (prefix present, unpinned): give it its
@@ -604,6 +685,77 @@ impl Supervisor {
         EngineRef {
             name: inst.name.clone(),
             endpoint: inst.endpoint.clone(),
+            auth: inst.auth.clone(),
+        }
+    }
+
+    /// Mint a per-child auth secret (child `--api-key` hardening).
+    /// `--api-key-file` is preferred when the engine has it: the secret
+    /// then lives in a 0600 file, not on the child's `/proc` cmdline.
+    /// The argv fallback (`--api-key <secret>`) still closes the open
+    /// child, just less privately. Engines with neither flag warn-skip
+    /// (same contract as every other manifest-gated emission) instead
+    /// of breaking the spawn.
+    fn mint_child_auth(
+        &self,
+        key: &str,
+        endpoint: &Endpoint,
+        manifest: &crate::engine::manifest::Manifest,
+    ) -> Result<Option<ChildAuth>, SupervisionError> {
+        let enabled = match self.config.child_auth {
+            Some(v) => v,
+            // Auto: TCP children are reachable by any local process;
+            // UDS sockets already enforce filesystem permissions.
+            None => matches!(endpoint, Endpoint::Tcp { .. }),
+        };
+        if !enabled {
+            return Ok(None);
+        }
+        if !manifest.flags.contains("--api-key-file") && !manifest.flags.contains("--api-key") {
+            tracing::warn!(
+                model = key,
+                "child_auth: engine {} lacks --api-key/--api-key-file; child stays \
+                 unauthenticated (run: pallama engine update)",
+                manifest.tag
+            );
+            return Ok(None);
+        }
+        // Entropy failure is a hard error, never a silently weaker key.
+        let mut raw = [0u8; 24];
+        getrandom::fill(&mut raw)
+            .map_err(|e| SupervisionError::Internal(anyhow!("child_auth entropy: {e}")))?;
+        let mut secret = String::with_capacity(4 + raw.len() * 2);
+        secret.push_str("plm_");
+        for b in &raw {
+            use std::fmt::Write as _;
+            let _ = write!(secret, "{b:02x}");
+        }
+        if manifest.flags.contains("--api-key-file") {
+            let path = self.dirs.run_dir().join(format!("{key}.apikey"));
+            std::fs::write(&path, &secret).map_err(|e| {
+                SupervisionError::Internal(anyhow!("write {}: {e}", path.display()))
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+            Ok(Some(ChildAuth {
+                argv: vec!["--api-key-file".into(), path.display().to_string()],
+                secret,
+                keyfile: Some(path),
+            }))
+        } else {
+            tracing::warn!(
+                model = key,
+                "child_auth: engine lacks --api-key-file; falling back to --api-key \
+                 (secret visible in /proc/<pid>/cmdline)"
+            );
+            Ok(Some(ChildAuth {
+                argv: vec!["--api-key".into(), secret.clone()],
+                secret,
+                keyfile: None,
+            }))
         }
     }
 
@@ -710,8 +862,25 @@ impl Supervisor {
             pulled_at: 0,
         };
 
+        let mut auth_keyfile: Option<std::path::PathBuf> = None;
+        let mut child_died_during_load = false;
         for _attempt in 0..2 {
             let endpoint = self.pick_endpoint(ROUTER_KEY);
+            // Child auth dies with the child: minted per attempt (same
+            // keyfile path, so retries overwrite), removed when this
+            // attempt or the whole spawn fails.
+            let auth = match self.mint_child_auth(ROUTER_KEY, &endpoint, manifest) {
+                Ok(a) => a,
+                Err(e) => {
+                    if let Some(p) = &auth_keyfile {
+                        let _ = std::fs::remove_file(p);
+                    }
+                    return Err(e);
+                }
+            };
+            if let Some(p) = auth.as_ref().and_then(|a| a.keyfile.clone()) {
+                auth_keyfile = Some(p);
+            }
             let mut argv: Vec<String> = Vec::new();
             match &endpoint {
                 Endpoint::Tcp { host, port } => {
@@ -736,11 +905,32 @@ impl Supervisor {
                     self.config.router_max_models.to_string(),
                 ]);
             }
-            let mut child = self
-                .engine
-                .spawn(&argv, &endpoint)
-                .await
-                .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
+            // Router LRU autoload: None keeps the upstream default (off).
+            match self.config.models_autoload {
+                Some(true) if manifest.flags.contains("--models-autoload") => {
+                    argv.push("--models-autoload".into());
+                }
+                Some(true) => {
+                    tracing::warn!(
+                        "models_autoload set but engine {} lacks --models-autoload; run: pallama engine update",
+                        manifest.tag
+                    );
+                }
+                Some(false) if manifest.flags.contains("--no-models-autoload") => {
+                    argv.push("--no-models-autoload".into());
+                }
+                Some(false) | None => {}
+            }
+            if let Some(a) = &auth {
+                argv.extend(a.argv.iter().cloned());
+            }
+            self.remap_device_argv(&mut argv, ROUTER_KEY).await;
+            let mut child = self.engine.spawn(&argv, &endpoint).await.map_err(|e| {
+                if let Some(p) = &auth_keyfile {
+                    let _ = std::fs::remove_file(p);
+                }
+                SupervisionError::Internal(anyhow!("{e}"))
+            })?;
             if let Ok(Some(status)) = child.try_status() {
                 tracing::warn!(
                     router = ROUTER_KEY,
@@ -750,7 +940,8 @@ impl Supervisor {
                 let _ = child.reap().await;
                 continue;
             }
-            match self.engine.health_check(&endpoint, self.load_timeout).await {
+            let (health, child_died) = self.wait_healthy(&endpoint, &mut child).await;
+            match health {
                 Ok(()) => {
                     let pid = child.id().ok_or_else(|| {
                         SupervisionError::Internal(anyhow!(
@@ -758,6 +949,9 @@ impl Supervisor {
                         ))
                     })?;
                     if pid <= 1 {
+                        if let Some(p) = &auth_keyfile {
+                            let _ = std::fs::remove_file(p);
+                        }
                         return Err(SupervisionError::Internal(anyhow!(
                             "router child pid {pid} is not a safe process-group id"
                         )));
@@ -774,6 +968,7 @@ impl Supervisor {
                         profile_ctx: 0,
                         gpu: "router".to_string(),
                         kv_est_bytes: None,
+                        auth: auth.as_ref().map(|a| a.secret.clone()),
                         child: tokio::sync::Mutex::new(child),
                         pid,
                     });
@@ -791,13 +986,144 @@ impl Supervisor {
                     return Ok(self.engine_ref(inst.value()));
                 }
                 Err(e) => {
+                    child_died_during_load |= child_died;
+                    if child_died {
+                        tracing::error!(router = ROUTER_KEY, "router died during load: {e:#}");
+                    } else {
+                        tracing::warn!(router = ROUTER_KEY, "router health check failed: {e:#}");
+                    }
                     let _ = child.kill().await;
                     let _ = child.reap().await;
-                    tracing::warn!(router = ROUTER_KEY, "router health check failed: {e:#}");
                 }
             }
         }
-        Err(SupervisionError::ModelLoadTimeout(ROUTER_KEY.to_string()))
+        if let Some(p) = &auth_keyfile {
+            let _ = std::fs::remove_file(p);
+        }
+        Err(if child_died_during_load {
+            SupervisionError::EngineCrashed(ROUTER_KEY.to_string())
+        } else {
+            SupervisionError::ModelLoadTimeout(ROUTER_KEY.to_string())
+        })
+    }
+
+    /// Race the health poll against child liveness: a child that dies
+    /// mid-load must fail the spawn IMMEDIATELY, carrying its last output
+    /// lines — never keep polling a corpse for the full `model_load_timeout`
+    /// (mislabeling an instant crash as a slow model load).
+    /// Returns the health result plus `true` when the failure is child death.
+    async fn wait_healthy(
+        &self,
+        endpoint: &Endpoint,
+        child: &mut ChildHandle,
+    ) -> (anyhow::Result<()>, bool) {
+        let mut health = Box::pin(self.engine.health_check(endpoint, self.load_timeout));
+        let mut liveness = Box::pin(async {
+            loop {
+                if let Ok(Some(status)) = child.try_status() {
+                    return status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        });
+        let outcome = tokio::select! {
+            res = &mut health => return (res, false),
+            status = &mut liveness => status,
+        };
+        // Release the liveness coroutine's unique child borrow before
+        // reading the tail.
+        drop(health);
+        drop(liveness);
+        let tail = child.tail_joined();
+        (
+            Err(anyhow::anyhow!(
+                "engine exited during load ({outcome}); last output: {tail}"
+            )),
+            true,
+        )
+    }
+
+    /// Map `--device` names in argv from manifest-era (install-context)
+    /// names to the names the SERVING child context enumerates. The two
+    /// enumerations can differ (install ran from a shell; serving spawns
+    /// from the daemon) and the child is the authority — a name it does
+    /// not accept is fatal to it. Name still enumerated: keep. Same
+    /// device re-enumerated under a different name: rewrite (identity =
+    /// vendor/description overlap + `total_mib` proximity). No live
+    /// counterpart: drop the pair (llama.cpp auto-picks) and warn.
+    fn map_devices(
+        argv: &[String],
+        frozen: &[crate::engine::manifest::DeviceDesc],
+        live: &[crate::engine::manifest::DeviceDesc],
+    ) -> (Vec<String>, Vec<String>) {
+        use crate::engine::manifest::DeviceDesc;
+        fn same_device(a: &DeviceDesc, b: &DeviceDesc) -> bool {
+            use crate::engine::manifest::Vendor;
+            let mem_close = a.total_mib.abs_diff(b.total_mib) <= 64;
+            let vendor_match = a.vendor() == b.vendor() && a.vendor() != Vendor::Other;
+            let desc_overlap = !a.description.is_empty()
+                && (a.description.contains(&b.description)
+                    || b.description.contains(&a.description));
+            (vendor_match || desc_overlap) && mem_close
+        }
+        let mut out = Vec::with_capacity(argv.len());
+        let mut warnings = Vec::new();
+        let mut i = 0;
+        while i < argv.len() {
+            if argv[i] == "--device" {
+                if let Some(name) = argv.get(i + 1) {
+                    if live.iter().any(|d| &d.name == name) {
+                        out.push(argv[i].clone());
+                        out.push(name.clone());
+                    } else {
+                        let mapped = frozen
+                            .iter()
+                            .find(|d| &d.name == name)
+                            .and_then(|old| live.iter().find(|l| same_device(old, l)));
+                        if let Some(l) = mapped {
+                            out.push(argv[i].clone());
+                            out.push(l.name.clone());
+                            warnings.push(format!(
+                            "device {name} re-enumerated as {} in the serving child context; using it",
+                            l.name
+                        ));
+                        } else {
+                            let sees = live
+                                .iter()
+                                .map(|d| d.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            warnings.push(format!(
+                            "device {name} not visible to the serving child (sees: {sees}); dropping --device, llama.cpp will auto-pick"
+                        ));
+                        }
+                    }
+                    i += 2;
+                    continue;
+                }
+            }
+            out.push(argv[i].clone());
+            i += 1;
+        }
+        (out, warnings)
+    }
+
+    /// Validate/rewrite `--device` entries in argv against the serving
+    /// child's own enumeration. No-ops when the argv has no devices or
+    /// the engine cannot enumerate (old builds, listing failure).
+    async fn remap_device_argv(&self, argv: &mut Vec<String>, who: &str) {
+        if !argv.iter().any(|a| a == "--device") {
+            return;
+        }
+        let Ok(Some(live)) = self.engine.enumerate_devices().await else {
+            return;
+        };
+        let (mapped, warnings) =
+            Self::map_devices(argv, &self.engine.capabilities().devices, &live);
+        for w in &warnings {
+            tracing::warn!(ctx = who, "device-map: {w}");
+        }
+        *argv = mapped;
     }
 
     /// One cohesive spawn path (model load → profile → capacity → spawn →
@@ -946,8 +1272,25 @@ impl Supervisor {
         );
         let data_dir_str = self.dirs.data_dir.to_string_lossy().into_owned();
         // Retry once on immediate port-race death (bind fail).
+        let mut auth_keyfile: Option<std::path::PathBuf> = None;
+        let mut child_died_during_load = false;
         for _attempt in 0..2 {
             let endpoint = self.pick_endpoint(key);
+            // Child auth dies with the child: minted per attempt (same
+            // keyfile path, so retries overwrite), removed when this
+            // attempt or the whole spawn fails.
+            let auth = match self.mint_child_auth(key, &endpoint, manifest) {
+                Ok(a) => a,
+                Err(e) => {
+                    if let Some(p) = &auth_keyfile {
+                        let _ = std::fs::remove_file(p);
+                    }
+                    return Err(e);
+                }
+            };
+            if let Some(p) = auth.as_ref().and_then(|a| a.keyfile.clone()) {
+                auth_keyfile = Some(p);
+            }
             let input = ProfileInput {
                 model_name: name,
                 // Per-replica paths: the argv's sessions/speccache dirs
@@ -994,12 +1337,17 @@ impl Supervisor {
             for w in &profile.warnings {
                 tracing::warn!(model = name, "profile: {w}");
             }
-            let argv = self.engine.build_argv(&model, &profile, &endpoint);
-            let mut child = self
-                .engine
-                .spawn(&argv, &endpoint)
-                .await
-                .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
+            let mut argv = self.engine.build_argv(&model, &profile, &endpoint);
+            if let Some(a) = &auth {
+                argv.extend(a.argv.iter().cloned());
+            }
+            self.remap_device_argv(&mut argv, name).await;
+            let mut child = self.engine.spawn(&argv, &endpoint).await.map_err(|e| {
+                if let Some(p) = &auth_keyfile {
+                    let _ = std::fs::remove_file(p);
+                }
+                SupervisionError::Internal(anyhow!("{e}"))
+            })?;
 
             // Child died instantly (port race)? Retry with a fresh port.
             if let Ok(Some(status)) = child.try_status() {
@@ -1009,7 +1357,8 @@ impl Supervisor {
                 continue;
             }
 
-            match self.engine.health_check(&endpoint, self.load_timeout).await {
+            let (health, child_died) = self.wait_healthy(&endpoint, &mut child).await;
+            match health {
                 Ok(()) => {
                     // NEVER default the pid: a 0 here would later target
                     // process group 0 (the whole session) on teardown.
@@ -1019,6 +1368,9 @@ impl Supervisor {
                         ))
                     })?;
                     if pid <= 1 {
+                        if let Some(p) = &auth_keyfile {
+                            let _ = std::fs::remove_file(p);
+                        }
                         return Err(SupervisionError::Internal(anyhow!(
                             "engine child pid {pid} is not a safe process-group id"
                         )));
@@ -1035,13 +1387,20 @@ impl Supervisor {
                         profile_ctx: profile.ctx,
                         gpu: profile.gpu.to_string(),
                         kv_est_bytes: profile.kv_est_bytes,
+                        auth: auth.as_ref().map(|a| a.secret.clone()),
                         child: tokio::sync::Mutex::new(child),
                         pid,
                     });
                     // Bank restore, choke point #2: warm KV before the
                     // first request prefills (ctx-matched only). Banks
                     // are per-replica (key-scoped files).
-                    self.bank_restore(key, &endpoint, profile.ctx).await;
+                    self.bank_restore(
+                        key,
+                        &endpoint,
+                        profile.ctx,
+                        auth.as_ref().map(|a| a.secret.as_str()),
+                    )
+                    .await;
                     let _ = std::fs::write(
                         self.dirs.run_dir().join(format!("{key}.pid")),
                         pid.to_string(),
@@ -1058,18 +1417,31 @@ impl Supervisor {
                     return Ok(self.engine_ref(inst.value()));
                 }
                 Err(e) => {
-                    // Health never came up: kill and retry once (port race),
-                    // then surface a load-timeout failure.
+                    // Health never came up: kill and retry once (port
+                    // race), then surface the failure — classified by
+                    // WHAT failed, not a blanket timeout label.
+                    child_died_during_load |= child_died;
+                    if child_died {
+                        tracing::error!(model = name, "engine died during load: {e:#}");
+                    } else {
+                        tracing::warn!(model = name, "health check failed: {e:#}");
+                    }
                     let _ = child.kill().await;
                     let _ = child.reap().await;
-                    tracing::warn!(model = name, "health check failed: {e:#}");
                 }
             }
         }
         // Ultimate spawn failure (all in-spawn retries exhausted): feed the
-        // J2 crash-loop detector before surfacing the timeout.
+        // J2 crash-loop detector before surfacing the failure.
+        if let Some(p) = &auth_keyfile {
+            let _ = std::fs::remove_file(p);
+        }
         self.note_engine_failure(name);
-        Err(SupervisionError::ModelLoadTimeout(key.to_string()))
+        Err(if child_died_during_load {
+            SupervisionError::EngineCrashed(key.to_string())
+        } else {
+            SupervisionError::ModelLoadTimeout(key.to_string())
+        })
     }
 
     /// J2 crash-loop detection: record that `model` failed to spawn and
@@ -1212,6 +1584,8 @@ impl Supervisor {
             terminate_group(inst.pid, self.shutdown_grace, &mut child).await?;
         }
         let _ = std::fs::remove_file(self.dirs.run_dir().join(format!("{name}.pid")));
+        // Child-auth keyfile dies with the child (its secret too).
+        let _ = std::fs::remove_file(self.dirs.run_dir().join(format!("{name}.apikey")));
         self.instances.remove(name);
         Ok(())
     }
@@ -1219,8 +1593,13 @@ impl Supervisor {
     /// Model-level evict (B1): stop the model AND all its replicas
     /// (`qwen`, `qwen#1`, `qwen#2`, …). This is the user-facing stop
     /// (gateway /api/stop, CLI); internal paths (reaper, capacity)
-    /// call [`Supervisor::evict`] with one exact key.
+    /// call [`Supervisor::evict`] with one exact key. Force wins over
+    /// session pins: they die with the model (R3).
     pub async fn evict_model(&self, model: &str) -> Result<()> {
+        let released = self.sessions.release_model(model);
+        if released > 0 {
+            tracing::info!(target: "pallama::sessions", model = %model, released, "force stop released session pins");
+        }
         let keys: Vec<String> = self
             .instances
             .iter()
@@ -1263,13 +1642,14 @@ impl Supervisor {
         } else {
             serde_json::json!({"filename": format!("_auto-{}", inst.profile_ctx)})
         };
-        let ok = reqwest::Client::new()
+        let mut req = reqwest::Client::new()
             .post(&url)
             .json(&body)
-            .timeout(std::time::Duration::from_secs(2))
-            .send()
-            .await
-            .is_ok_and(|r| r.status().is_success());
+            .timeout(std::time::Duration::from_secs(2));
+        if let Some(secret) = &inst.auth {
+            req = req.bearer_auth(secret);
+        }
+        let ok = req.send().await.is_ok_and(|r| r.status().is_success());
         if ok {
             // Hoard guard: a per-model bank over 512 MiB is storage
             // abuse, not a cache — drop it and say so once.
@@ -1285,7 +1665,7 @@ impl Supervisor {
     /// Bank restore, choke point #2: after a fresh spawn reaches
     /// readiness, a matching `_auto-<ctx>` is restored so the first
     /// request rides warm KV. Warn-continue on any failure.
-    async fn bank_restore(&self, name: &str, endpoint: &Endpoint, ctx: u32) {
+    async fn bank_restore(&self, name: &str, endpoint: &Endpoint, ctx: u32, auth: Option<&str>) {
         if !self.config.session_bank {
             return;
         }
@@ -1304,13 +1684,14 @@ impl Supervisor {
         } else {
             serde_json::json!({"filename": format!("_auto-{ctx}")})
         };
-        match reqwest::Client::new()
+        let mut req = reqwest::Client::new()
             .post(&url)
             .json(&body)
-            .timeout(std::time::Duration::from_secs(2))
-            .send()
-            .await
-        {
+            .timeout(std::time::Duration::from_secs(2));
+        if let Some(secret) = auth {
+            req = req.bearer_auth(secret);
+        }
+        match req.send().await {
             Ok(r) if r.status().is_success() => {
                 tracing::info!(target: "pallama::bank", model = name, "restored banked session _auto-{ctx}");
             }
@@ -1350,6 +1731,14 @@ impl Supervisor {
 
     async fn reap_once(&self) {
         let now = Instant::now();
+        // R3 session pins: drop expired windows first, then honor the
+        // rest — a model with a live session skips the idle-eviction
+        // branch (sleep-marking still applies: the process + RAM cache
+        // survive a sleep, wake is cheap).
+        let session_ttl = self.session_ttl();
+        for expired in self.sessions.sweep(session_ttl) {
+            tracing::debug!(target: "pallama::sessions", session = %expired, "session pin expired");
+        }
         let mut evictions: Vec<String> = Vec::new();
         for entry in &self.instances {
             let inst = entry.value();
@@ -1358,7 +1747,11 @@ impl Supervisor {
             }
             let idle = now.duration_since(*inst.last_used.read().expect("idle lock"));
             let state = *inst.state.read().expect("state lock");
-            if idle >= Duration::from_secs(self.config.idle_timeout_secs) {
+            let session_pinned = self
+                .sessions
+                .pins(model_of_key(&inst.name), session_ttl)
+                .live;
+            if idle >= Duration::from_secs(self.config.idle_timeout_secs) && !session_pinned {
                 evictions.push(inst.name.clone());
             } else if idle >= Duration::from_secs(self.config.idle_sleep_secs)
                 && state == InstanceState::Ready
@@ -1898,6 +2291,48 @@ mod routing_tests {
     }
 
     #[test]
+    fn unit__map_devices__keeps_live_rewrites_reenumerated_drops_invisible() {
+        fn dev(name: &str, desc: &str, mib: u64) -> crate::engine::manifest::DeviceDesc {
+            crate::engine::manifest::DeviceDesc {
+                name: name.into(),
+                description: desc.into(),
+                total_mib: mib,
+                free_mib: mib,
+            }
+        }
+        let argv = |d: &str| {
+            vec![
+                "-m".to_string(),
+                "x".to_string(),
+                "--device".to_string(),
+                d.to_string(),
+                "-t".to_string(),
+                "4".to_string(),
+            ]
+        };
+        let frozen = vec![dev("Vulkan1", "NVIDIA GeForce RTX 4070 Laptop GPU", 8188)];
+        // (a) name still enumerated: kept verbatim, no warnings.
+        let live = vec![
+            dev("Vulkan0", "Intel(R) Graphics (RPL-S)", 10256),
+            dev("Vulkan1", "NVIDIA GeForce RTX 4070 Laptop GPU", 8188),
+        ];
+        let (out, w) = Supervisor::map_devices(&argv("Vulkan1"), &frozen, &live);
+        assert!(out.contains(&"Vulkan1".to_string()));
+        assert!(w.is_empty());
+        // (b) same hardware re-enumerated under a new name: rewritten.
+        let live2 = vec![dev("Vulkan0", "NVIDIA GeForce RTX 4070 Laptop GPU", 8188)];
+        let (out, w) = Supervisor::map_devices(&argv("Vulkan1"), &frozen, &live2);
+        assert!(out.contains(&"Vulkan0".to_string()));
+        assert!(!out.contains(&"Vulkan1".to_string()));
+        assert_eq!(w.len(), 1);
+        // (c) no live counterpart: pair dropped with an explanatory warn.
+        let (out, w) = Supervisor::map_devices(&argv("Vulkan1"), &frozen, &[]);
+        assert!(!out.iter().any(|a| a == "--device"));
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("not visible"));
+    }
+
+    #[test]
     fn unit__j2__broken_binary_probe_rolls_back_immediately() {
         let (sup, _root, bus) = j2_sup(1); // --version exits 1: broken
         let mut events = bus.subscribe();
@@ -1973,6 +2408,7 @@ mod routing_tests {
             profile_ctx: 8,
             gpu: "cpu".into(),
             kv_est_bytes: None,
+            auth: None,
             child: tokio::sync::Mutex::new(ChildHandle::new(endpoint, proc)),
             pid,
         };
@@ -2029,13 +2465,19 @@ mod routing_tests {
     async fn unit__replica_key__legacy_no_overlay__plain_name() {
         let sup = routing_sup(1);
         assert_eq!(sup.replica_key("m", None), "m");
-        assert_eq!(sup.replica_key("m", Some(7)), "m");
+        assert_eq!(
+            sup.replica_key("m", Some(PrefixKey { sys: 7, convo: 7 })),
+            "m"
+        );
     }
 
     #[tokio::test]
     async fn unit__replica_key__router_key__passthrough() {
         let sup = routing_sup(4);
-        assert_eq!(sup.replica_key(ROUTER_KEY, Some(7)), ROUTER_KEY);
+        assert_eq!(
+            sup.replica_key(ROUTER_KEY, Some(PrefixKey { sys: 7, convo: 7 })),
+            ROUTER_KEY
+        );
     }
 
     #[tokio::test]
@@ -2267,7 +2709,10 @@ mod routing_tests {
         sup.instances.insert("m#1".into(), a);
         sup.instances.insert("m#2".into(), b);
         sup.prefix_affinity.insert(42, "m#2".to_string());
-        assert_eq!(sup.replica_key("m", Some(42)), "m#2");
+        assert_eq!(
+            sup.replica_key("m", Some(PrefixKey { sys: 42, convo: 42 })),
+            "m#2"
+        );
         kill_all(&[pa, pb]);
     }
 
@@ -2280,8 +2725,60 @@ mod routing_tests {
         // every live replica, so it grows its own cache instead of
         // squatting on m#1's.
         sup.prefix_affinity.insert(42, "m#9".to_string());
-        assert_eq!(sup.replica_key("m", Some(42)), "m#2");
+        assert_eq!(
+            sup.replica_key("m", Some(PrefixKey { sys: 43, convo: 42 })),
+            "m#2"
+        );
         kill_all(&[pa]);
+    }
+
+    #[tokio::test]
+    async fn unit__replica_key__same_sys_class__coalesces_onto_warm_replica() {
+        let sup = routing_sup(3);
+        let (a, pa) = fake_instance("m#1", InstanceState::Ready, 0);
+        let (b, pb) = fake_instance("m#2", InstanceState::Ready, 0);
+        sup.instances.insert("m#1".into(), a);
+        sup.instances.insert("m#2".into(), b);
+        // m#1 recently served sys-class 100: a NEW conversation from the
+        // same system prompt reuses its warm system-prompt KV instead of
+        // growing a cold m#3 (F8 coalesce).
+        sup.sys_rings
+            .entry("m#1".to_string())
+            .or_default()
+            .push_back(100);
+        let picked = sup.replica_key(
+            "m",
+            Some(PrefixKey {
+                sys: 100,
+                convo: 999,
+            }),
+        );
+        assert_eq!(picked, "m#1");
+        kill_all(&[pa, pb]);
+    }
+
+    #[tokio::test]
+    async fn unit__replica_key__unknown_sys_class__grows_per_policy() {
+        let sup = routing_sup(3);
+        let (a, pa) = fake_instance("m#1", InstanceState::Ready, 0);
+        let (b, pb) = fake_instance("m#2", InstanceState::Ready, 0);
+        sup.instances.insert("m#1".into(), a);
+        sup.instances.insert("m#2".into(), b);
+        sup.sys_rings
+            .entry("m#1".to_string())
+            .or_default()
+            .push_back(100);
+        // Neither replica has seen sys-class 777: pinned conversation with
+        // no ring hit grows its own replica (prefix-aware grow policy).
+        let picked = sup.replica_key(
+            "m",
+            Some(PrefixKey {
+                sys: 777,
+                convo: 888,
+            }),
+        );
+        assert_eq!(picked, "m#3");
+        kill_all(&[pa, pb]);
     }
 
     #[tokio::test]

@@ -5,8 +5,16 @@
 
 use pallama_runtime::quantize::{plausible_quant_type, quantize};
 
+// The stub reads PALLAMA_STUB_QUANTIZE_FAIL from the process environment,
+// which is global across test threads — serialize the tests that touch it
+// (default parallel test execution otherwise races success-vs-failure).
+static QUANT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn unit__quantize_success__copies_and_reports_lines() {
+    let _env_guard = QUANT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("src.gguf");
     let dst = tmp.path().join("dst.gguf");
@@ -29,6 +37,9 @@ fn unit__quantize_success__copies_and_reports_lines() {
 
 #[test]
 fn unit__quantize_failure__surfaces_stderr_and_no_output() {
+    let _env_guard = QUANT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("src.gguf");
     let dst = tmp.path().join("dst.gguf");

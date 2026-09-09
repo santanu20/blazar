@@ -6,6 +6,7 @@
 //! sha256:...` — verified before extraction.
 
 use anyhow::{anyhow, Context, Result};
+use pallama_core::config::UpdateChannel;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -73,7 +74,8 @@ pub struct GhClient {
     token: Option<String>,
 }
 
-fn btag_number(tag: &str) -> Option<u64> {
+#[must_use]
+pub fn btag_number(tag: &str) -> Option<u64> {
     tag.strip_prefix('b')?.parse().ok()
 }
 
@@ -122,9 +124,14 @@ impl GhClient {
 
     /// List recent releases (b-tags and v-tags together).
     pub async fn list_releases(&self) -> Result<Vec<GhRelease>> {
+        self.list_releases_repo(LLAMA_CPP_REPO).await
+    }
+
+    /// `list_releases` for an arbitrary repo (whisper.cpp, pallama self, ...).
+    pub async fn list_releases_repo(&self, repo: &str) -> Result<Vec<GhRelease>> {
         let url = self
             .base
-            .join(&format!("repos/{LLAMA_CPP_REPO}/releases?per_page=30"))
+            .join(&format!("repos/{repo}/releases?per_page=30"))
             .unwrap();
         let resp = self
             .auth(self.http.get(url.clone()))
@@ -180,6 +187,38 @@ impl GhClient {
             .filter(|r| btag_number(&r.tag_name).is_some())
             .max_by_key(|r| btag_number(&r.tag_name).unwrap_or(0))
             .ok_or_else(|| anyhow!("no b-tagged llama.cpp releases found"))
+    }
+
+    /// Resolve the llama.cpp target for an update channel.
+    /// `Latest` = newest b-tag (the prerelease firehose); `Stable` = the
+    /// newest vX.Y.Z via `releases/latest`, dereferenced through its
+    /// `nightly-tag.txt` to the concrete b-tag it ships.
+    pub async fn channel_b_release(&self, channel: UpdateChannel) -> Result<GhRelease> {
+        match channel {
+            UpdateChannel::Latest => self.latest_b_release().await,
+            UpdateChannel::Stable => {
+                let stable = self.release_by(LLAMA_CPP_REPO, None).await?;
+                if stable.tag_name.starts_with('v') {
+                    self.resolve_tag(&stable.tag_name).await
+                } else {
+                    Ok(stable)
+                }
+            }
+        }
+    }
+
+    /// Resolve the target release of an arbitrary repo (whisper.cpp,
+    /// pallama self) for an update channel. These upstreams publish
+    /// through GitHub's `/releases/latest` only — no prerelease
+    /// firehose — so both channels coincide; the knob is meaningful for
+    /// the llama.cpp lane (`channel_b_release`).
+    pub async fn channel_repo_release(
+        &self,
+        repo: &str,
+        channel: UpdateChannel,
+    ) -> Result<GhRelease> {
+        let _ = channel;
+        self.release_by(repo, None).await
     }
 
     /// Resolve a user-provided tag: `bNNNN` verbatim; `vX.Y.Z` reads its

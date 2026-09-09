@@ -53,6 +53,7 @@ static META: std::sync::LazyLock<GgufMeta> = std::sync::LazyLock::new(|| GgufMet
     sliding_window: None,
     sliding_window_per_layer: None,
     full_attention_interval: None,
+    recurrent_layers: None,
     quantized_by: None,
     general_version: None,
     pooling_type: None,

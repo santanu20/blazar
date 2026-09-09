@@ -169,7 +169,7 @@ fn parse_version(text: &str) -> Result<(u64, String)> {
 }
 
 /// Parse `  NAME: DESC (TOTAL MiB, FREE MiB free)` device lines.
-fn parse_devices(text: &str) -> Vec<DeviceDesc> {
+pub(crate) fn parse_devices(text: &str) -> Vec<DeviceDesc> {
     let mut out = Vec::new();
     for line in text
         .lines()

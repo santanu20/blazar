@@ -584,7 +584,7 @@ impl HfClient {
         let url = self
             .api_base
             .join(&format!(
-                "api/models?search={}&filter=gguf&limit={limit}&sort=downloads&direction=-1",
+                "api/models?search={}&filter=gguf&limit={limit}&sort=downloads&direction=-1&expand[]=gguf&expand[]=likes",
                 url_encode_path(query)
             ))
             .map_err(|e| anyhow!("bad search URL: {e}"))?;

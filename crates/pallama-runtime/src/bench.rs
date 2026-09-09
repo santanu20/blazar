@@ -288,7 +288,16 @@ impl Tuner<'_> {
                     | "--spec-type"
                     | "--spec-ngram-simple-size-m"
                     | "--spec-ngram-simple-size-n"
-                    | "--spec-ngram-simple-min-hits" => {
+                    | "--spec-ngram-simple-min-hits"
+                    | "--spec-ngram-map-k-size-m"
+                    | "--spec-ngram-map-k-size-n"
+                    | "--spec-ngram-map-k-min-hits"
+                    | "--spec-ngram-map-k4v-size-m"
+                    | "--spec-ngram-map-k4v-size-n"
+                    | "--spec-ngram-map-k4v-min-hits"
+                    | "--spec-ngram-mod-n-match"
+                    | "--spec-ngram-mod-n-max"
+                    | "--spec-ngram-mod-n-min" => {
                         let _ = it.next(); // consume the value
                     }
                     _ => argv.push(a.clone()),

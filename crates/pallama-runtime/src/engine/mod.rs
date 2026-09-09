@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 
+use pallama_core::config::UpdateChannel;
 use pallama_core::store::{EngineRow, Store};
 use pallama_core::PallamaDirs;
 
@@ -66,9 +67,9 @@ fn which_first(names: &[&str]) -> bool {
 }
 
 impl EngineManager {
-    /// Install the requested (or newest) b-tag build and activate it.
-    pub async fn update(&self, tag: Option<&str>) -> Result<EngineRow> {
-        self.update_with_retry_delay(tag, ASSET_UPLOAD_RETRY_DELAY)
+    /// Install the requested tag (or the channel's target) and activate it.
+    pub async fn update(&self, tag: Option<&str>, channel: UpdateChannel) -> Result<EngineRow> {
+        self.update_with_retry_delay(tag, channel, ASSET_UPLOAD_RETRY_DELAY)
             .await
     }
 
@@ -77,12 +78,29 @@ impl EngineManager {
     pub async fn update_with_retry_delay(
         &self,
         tag: Option<&str>,
+        channel: UpdateChannel,
         retry_delay: std::time::Duration,
     ) -> Result<EngineRow> {
-        let mut release = match tag {
+        let release = match tag {
             Some(t) => self.gh.resolve_tag(t).await?,
-            None => self.gh.latest_b_release().await?,
+            None => self.gh.channel_b_release(channel).await?,
         };
+        self.install_with_retries(release, retry_delay).await
+    }
+
+    /// Install an already-resolved release (single-fetch entry for callers
+    /// that needed the `GhRelease` up front, e.g. downgrade gating).
+    pub async fn update_resolved(&self, release: GhRelease) -> Result<EngineRow> {
+        self.install_with_retries(release, ASSET_UPLOAD_RETRY_DELAY)
+            .await
+    }
+
+    /// Fresh-asset retry loop shared by every update entry point.
+    async fn install_with_retries(
+        &self,
+        mut release: GhRelease,
+        retry_delay: std::time::Duration,
+    ) -> Result<EngineRow> {
         let tag_name = release.tag_name.clone();
         for attempt in 0..=ASSET_UPLOAD_RETRY_ATTEMPTS {
             match self.pick(&release)? {

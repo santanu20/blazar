@@ -7,6 +7,7 @@ use sha2::Digest as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use pallama_core::config::UpdateChannel;
 use pallama_core::store::Store;
 use pallama_core::PallamaDirs;
 use pallama_runtime::engine::gh::GhClient;
@@ -175,7 +176,10 @@ async fn integration__install_probe_activate_rollback_cycle() {
     let mgr = manager(&dirs, &api.uri());
 
     // Install b100.
-    let row = mgr.update(Some("b100")).await.unwrap();
+    let row = mgr
+        .update(Some("b100"), UpdateChannel::Latest)
+        .await
+        .unwrap();
     assert_eq!(row.tag, "b100");
     assert_eq!(row.sha256, sha256_hex(&t1));
     let store = Store::open(&dirs).unwrap();
@@ -193,7 +197,9 @@ async fn integration__install_probe_activate_rollback_cycle() {
     assert!(Path::new(&m.server_path).exists());
 
     // Install b200 -> becomes active; rollback returns to b100.
-    mgr.update(Some("b200")).await.unwrap();
+    mgr.update(Some("b200"), UpdateChannel::Latest)
+        .await
+        .unwrap();
     let store = Store::open(&dirs).unwrap();
     assert_eq!(store.active_engine().unwrap().unwrap().tag, "b200");
     let back = mgr.rollback().unwrap();
@@ -234,7 +240,10 @@ async fn integration__sha_mismatch__fail_fast_no_engine_dir() {
         .await;
 
     let mgr = manager(&dirs, &api.uri());
-    let err = mgr.update(Some("b100")).await.unwrap_err();
+    let err = mgr
+        .update(Some("b100"), UpdateChannel::Latest)
+        .await
+        .unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("sha256 mismatch"), "{msg}");
     assert!(
@@ -282,7 +291,10 @@ async fn integration__vtag_resolves_via_nightly_txt() {
     .await;
 
     let mgr = manager(&dirs, &api.uri());
-    let row = mgr.update(Some("v0.4.0")).await.unwrap();
+    let row = mgr
+        .update(Some("v0.4.0"), UpdateChannel::Latest)
+        .await
+        .unwrap();
     assert_eq!(row.tag, "b10809", "v-tag resolved through nightly-tag.txt");
 }
 
@@ -414,7 +426,10 @@ async fn integration__zip_asset_extracted_and_probed() {
     mount_release(&api, "b100", "llama-b100-bin-win-vulkan-x64.zip", &zip).await;
     let mut mgr = manager(&dirs, &api.uri());
     mgr.asset_override = "win-vulkan-x64".into();
-    let row = mgr.update(Some("b100")).await.unwrap();
+    let row = mgr
+        .update(Some("b100"), UpdateChannel::Latest)
+        .await
+        .unwrap();
     let m: Manifest = serde_json::from_str(&row.manifest).unwrap();
     assert!(m.server_path.ends_with("llama-server.exe"));
     assert!(Path::new(&m.server_path).exists());
@@ -435,7 +450,10 @@ async fn integration__asset_override_missing__names_available() {
     .await;
     let mut mgr = manager(&dirs, &api.uri());
     mgr.asset_override = "ubuntu-rocm-10.0-x64".into();
-    let err = mgr.update(Some("b100")).await.unwrap_err();
+    let err = mgr
+        .update(Some("b100"), UpdateChannel::Latest)
+        .await
+        .unwrap_err();
     let msg = format!("{err:#}");
     assert!(
         msg.contains("ubuntu-rocm-10.0-x64") && msg.contains("available"),
@@ -509,7 +527,11 @@ async fn integration__fresh_release_upload_race__waits_then_installs() {
 
     let mgr = manager_auto(&dirs, &api.uri());
     let row = mgr
-        .update_with_retry_delay(Some("b100"), std::time::Duration::from_millis(10))
+        .update_with_retry_delay(
+            Some("b100"),
+            UpdateChannel::Latest,
+            std::time::Duration::from_millis(10),
+        )
         .await
         .expect("retry must ride out the upload window");
     assert_eq!(row.tag, "b100");
@@ -554,7 +576,11 @@ async fn integration__stale_release_no_assets__teaching_error_no_wait() {
     let mgr = manager_auto(&dirs, &api.uri());
     let started = std::time::Instant::now();
     let err = mgr
-        .update_with_retry_delay(Some("b100"), std::time::Duration::from_millis(10))
+        .update_with_retry_delay(
+            Some("b100"),
+            UpdateChannel::Latest,
+            std::time::Duration::from_millis(10),
+        )
         .await
         .unwrap_err();
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
@@ -605,9 +631,97 @@ async fn integration__stale_release_gpu_missing__cpu_last_resort() {
         .await;
     let mgr = manager_auto(&dirs, &api.uri());
     let row = mgr
-        .update_with_retry_delay(Some("b100"), std::time::Duration::from_millis(10))
+        .update_with_retry_delay(
+            Some("b100"),
+            UpdateChannel::Latest,
+            std::time::Duration::from_millis(10),
+        )
         .await
         .unwrap();
     assert_eq!(row.asset, "ubuntu-x64");
     assert_eq!(row.tag, "b100");
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__channel_b_release__stable_resolves_through_nightly_txt() {
+    let api = MockServer::start().await;
+    let nightly = b"b10780\n".to_vec();
+    // GitHub's /releases/latest (non-prerelease) points at a vX.Y.Z whose
+    // nightly-tag.txt names the concrete b-build it ships; resolve_tag
+    // re-fetches the release by tag to read that asset.
+    let v_release = serde_json::json!({
+        "tag_name": "v1.36.0",
+        "prerelease": false,
+        "assets": [{
+            "name": "nightly-tag.txt",
+            "digest": format!("sha256:{}", sha256_hex(&nightly)),
+            "browser_download_url": format!("{}/download/v1.36.0/nightly-tag.txt", api.uri()),
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/repos/ggml-org/llama.cpp/releases/latest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(v_release.clone()))
+        .mount(&api)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/ggml-org/llama.cpp/releases/tags/v1.36.0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(v_release))
+        .mount(&api)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/download/v1.36.0/nightly-tag.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(nightly))
+        .mount(&api)
+        .await;
+    mount_release(
+        &api,
+        "b10780",
+        "llama-b10780-bin-ubuntu-vulkan-x64.tar.gz",
+        &fixture_tarball("b10780"),
+    )
+    .await;
+
+    let gh = GhClient::with_base(&api.uri(), None).unwrap();
+    let rel = gh
+        .channel_b_release(pallama_core::config::UpdateChannel::Stable)
+        .await
+        .unwrap();
+    assert_eq!(
+        rel.tag_name, "b10780",
+        "stable channel dereferences vX.Y.Z through nightly-tag.txt"
+    );
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__channel_repo_release__latest_takes_first_stable_uses_github_latest() {
+    let api = MockServer::start().await;
+    // whisper.cpp/pallama-style upstreams publish through /releases/latest
+    // only: both channels resolve to the same non-prerelease target.
+    Mock::given(method("GET"))
+        .and(path("/repos/ggml-org/llama.cpp/releases/latest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({"tag_name": "v1.8.0", "prerelease": false, "assets": []}),
+        ))
+        .mount(&api)
+        .await;
+
+    let gh = GhClient::with_base(&api.uri(), None).unwrap();
+    let latest = gh
+        .channel_repo_release(
+            "ggml-org/llama.cpp",
+            pallama_core::config::UpdateChannel::Latest,
+        )
+        .await
+        .unwrap();
+    assert_eq!(latest.tag_name, "v1.8.0");
+    let stable = gh
+        .channel_repo_release(
+            "ggml-org/llama.cpp",
+            pallama_core::config::UpdateChannel::Stable,
+        )
+        .await
+        .unwrap();
+    assert_eq!(stable.tag_name, "v1.8.0");
 }
