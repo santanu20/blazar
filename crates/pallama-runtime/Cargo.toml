@@ -35,10 +35,10 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 sysinfo.workspace = true
 libc = { workspace = true }
 getrandom = { workspace = true }
+tempfile = "3"
 
 [dev-dependencies]
 wiremock = "0.6"
-tempfile = "3"
 
 [lints]
 workspace = true

@@ -852,6 +852,11 @@ pub fn build_input<'a>(
         mmproj_path: None, // vision is irrelevant to llama-bench scoring
         engine_tag,
         supported_flags,
+        // llama-bench scoring is llama-server-only (the mistral.rs lane
+        // prints a gate skip instead of benching).
+        engine_kind: pallama_core::engine_kind::EngineKind::LlamaCpp,
+        sibling_devices: Vec::new(),
+        auto_tensor_split: None,
         endpoint,
         data_dir,
         cache_hit_rate: None, // CLI bench: static clamp, no live hint

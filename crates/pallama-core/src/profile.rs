@@ -46,6 +46,11 @@ pub struct ProfileInput<'a> {
     pub engine_tag: &'a str,
     /// Capability manifest flag set of the ACTIVE engine.
     pub supported_flags: &'a BTreeSet<String>,
+    /// Dialect selector: the engines.kind column owns this truth (the
+    /// manifest carries no kind). `MistralRs` compiles a minimal profile —
+    /// the child CLI grammar is foreign and `MistralRsEngine` argv
+    /// translator owns it.
+    pub engine_kind: crate::engine_kind::EngineKind,
     pub endpoint: Endpoint,
     /// Pallama data dir (base for speccache/ + sessions/ paths).
     pub data_dir: &'a str,
@@ -61,6 +66,18 @@ pub struct ProfileInput<'a> {
     /// VRAM estimate (ngl ladder, KV, cache-ram) sizes against the card
     /// the child will actually land on.
     pub device_hint: Option<&'a str>,
+    /// Discrete GPUs NOT taken by the auto-pick (or by manual `devices`),
+    /// best-free-first. Drives placement RECOMMENDATIONS only (spec-draft
+    /// and mmproj offload hints) — never a silent placement decision.
+    /// Empty on single-GPU boxes and when every sibling is integrated.
+    pub sibling_devices: Vec<String>,
+    /// Supervisor-planned `--tensor-split` ratio string (e.g. "2,1"),
+    /// proportional to each discrete card's MEASURED free VRAM. Emitted
+    /// only as a last resort: weights+KV exceed the best single card but
+    /// fit the discrete cards combined, and every manual pin
+    /// (`tensor_split` / `devices` / non-default `main_gpu`) is unset.
+    /// `None` = no auto split planned.
+    pub auto_tensor_split: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -105,6 +122,15 @@ pub struct TuningOverrides {
 /// shuffle state through six one-use helpers.
 #[allow(clippy::too_many_lines)]
 pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Profile, String> {
+    // Dialect fork: mistral.rs has no llama-server grammar (no --jinja,
+    // --ctx-size, -np slots...). Its argv is assembled by
+    // MistralRsEngine::build_argv; the profile only resolves what that
+    // translator consumes — ctx and slot count (mined back out of argv
+    // as `-np N`). Skipping here avoids the manifest flag gate, which
+    // would hard-error on every llama-server-only flag.
+    if input.engine_kind == crate::engine_kind::EngineKind::MistralRs {
+        return Ok(compile_mistralrs(input, tuning));
+    }
     let mut argv: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let overlay = input.overlay;
@@ -243,9 +269,11 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     }
 
     // --- 10. rpc + loras
-    if !config.rpc_servers.trim().is_empty() {
+    // C6: per-model override replaces the global list (empty = inherit).
+    let rpc_servers = config.effective_rpc_servers(input.model_name);
+    if !rpc_servers.is_empty() {
         argv.push("--rpc".into());
-        argv.push(config.rpc_servers.trim().to_string());
+        argv.push(rpc_servers.to_string());
     }
     for (path, scale) in input.loras {
         if (scale - 1.0).abs() < f64::EPSILON {
@@ -315,6 +343,27 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         } else {
             warnings.push(format!(
                 "tensor_split set but engine {} lacks --tensor-split; run: pallama engine update",
+                input.engine_tag
+            ));
+        }
+    } else if let Some(ratios) = &input.auto_tensor_split {
+        // Supervisor-planned last-resort split: weights+KV exceed the best
+        // single card's MEASURED free VRAM but fit the discrete cards
+        // combined. Manual `tensor_split` above always wins (pins
+        // authoritative); this branch is the unset-pin auto path.
+        if input.supported_flags.contains("--tensor-split") {
+            argv.push("--tensor-split".into());
+            argv.push(ratios.clone());
+            warnings.push(format!(
+                "auto tensor-split {ratios}: weights+KV exceed the best single card's free \
+                 VRAM but fit the discrete cards combined — layer split buys capacity, \
+                 not speed (inter-card bandwidth taxes every token); a smaller quant \
+                 (pallama fit) or kv quantization may serve faster. Pin `tensor_split` \
+                 to silence"
+            ));
+        } else {
+            warnings.push(format!(
+                "auto tensor-split planned but engine {} lacks --tensor-split; run: pallama engine update",
                 input.engine_tag
             ));
         }
@@ -396,17 +445,25 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // resolved: spec = "auto" + pulled pair). Pin the draft to P-cores /
     // a spare GPU / fewer threads so it stops stealing from the target.
     if spec_mode == "auto" && input.draft_path.is_some() {
-        if !config.spec_draft_cpu_range.is_empty() {
-            argv.push("--spec-draft-cpu-range".into());
-            argv.push(config.spec_draft_cpu_range.clone());
+        if !config.spec_draft_device.is_empty() {
+            argv.push("--spec-draft-device".into());
+            argv.push(config.spec_draft_device.clone());
+        } else if let Some(spare) = input.sibling_devices.first() {
+            // Teaching, never silent placement: offloading a draft is a
+            // measurable win only on some models — name the spare card
+            // and let the user opt in.
+            warnings.push(format!(
+                "spec draft shares the target's GPU; spare discrete card {spare} \
+                 is idle — try spec_draft_device = \"{spare}\" (bench both ways)"
+            ));
         }
         if config.spec_draft_cpu_strict {
             argv.push("--spec-draft-cpu-strict".into());
             argv.push("1".into());
         }
-        if !config.spec_draft_device.is_empty() {
-            argv.push("--spec-draft-device".into());
-            argv.push(config.spec_draft_device.clone());
+        if !config.spec_draft_cpu_range.is_empty() {
+            argv.push("--spec-draft-cpu-range".into());
+            argv.push(config.spec_draft_cpu_range.clone());
         }
         if !config.spec_draft_ngl.is_empty() {
             argv.push("--spec-draft-ngl".into());
@@ -733,6 +790,17 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     if !config.mmproj_device.is_empty() {
         argv.push("--mmproj-device".into());
         argv.push(config.mmproj_device.clone());
+    } else if input.mmproj_path.is_some() {
+        if let Some(spare) = input.sibling_devices.first() {
+            // Vision prefill bursts steal compute cycles from the target
+            // card; an idle discrete sibling absorbs them for free. Opt-in
+            // (teaching warning) because projector placement is workload-
+            // dependent.
+            warnings.push(format!(
+                "mmproj shares the target's GPU; spare discrete card {spare} \
+                 is idle — try mmproj_device = \"{spare}\""
+            ));
+        }
     }
     if config.embd_normalize > 0 {
         argv.push("--embd-normalize".into());
@@ -1115,6 +1183,61 @@ fn ensure_batch_flag(argv: &mut Vec<String>, flag: &str, floor: u32) {
 
 /// Effective `ctx`: overlay > config default, clamped to the model's
 /// `context_length` when known. Missing metadata warns, never guesses.
+/// Minimal mistral.rs profile: ctx via the same overlay/config/train-cap
+/// clamp as llama-server (so `pallama ps` and KV planning share one
+/// truth), slots as `-np N` for the argv translator to mine. KV estimate
+/// is None: mistral.rs sizes its paged KV from a VRAM fraction, not from
+/// ctx math, so an f16 estimate here would be a lie.
+fn compile_mistralrs(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Profile {
+    let ctx = tuning
+        .ctx
+        .unwrap_or_else(|| resolve_ctx(input, input.overlay, &mut Vec::new()));
+    let slots = input.overlay.slots.unwrap_or(input.config.slots);
+    let mut argv: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    if slots != 0 {
+        argv.push("-np".into());
+        argv.push(slots.to_string());
+    }
+    // Paged-KV budget: upstream's 0.90 default hard-fails at load
+    // ("Num GPU blocks is 0", live-proven with a 9B vision model on an
+    // 8 GB card) — an explicit fraction reclaims the balance for KV.
+    if let Some(frac) = input.config.mistralrs_pa_memory_fraction {
+        if input.supported_flags.contains("--pa-memory-fraction") {
+            argv.push("--pa-memory-fraction".into());
+            argv.push(format!("{frac}"));
+        } else {
+            warnings.push(
+                "config mistralrs_pa_memory_fraction set but this engine lacks \
+                 --pa-memory-fraction; flag skipped (pallama engine install updates it)"
+                    .into(),
+            );
+        }
+    }
+    // Attention backend: classic KV (sized by ctx) instead of paged KV
+    // (sized by VRAM fraction) — the only fit for big vision models on
+    // 8 GB cards, live-proven with qwen3.5-9b + projector.
+    if let Some(pa) = input.config.mistralrs_paged_attn {
+        if input.supported_flags.contains("--paged-attn") {
+            argv.push("--paged-attn".into());
+            argv.push(if pa { "on".into() } else { "off".into() });
+        } else {
+            warnings.push(
+                "config mistralrs_paged_attn set but this engine lacks \
+                 --paged-attn; flag skipped (pallama engine install updates it)"
+                    .into(),
+            );
+        }
+    }
+    Profile {
+        argv,
+        warnings,
+        ctx,
+        gpu: "auto",
+        kv_est_bytes: None,
+    }
+}
+
 fn resolve_ctx(
     input: &ProfileInput<'_>,
     overlay: &ModelOverride,
@@ -1618,6 +1741,7 @@ mod tests {
         flags: &'a BTreeSet<String>,
     ) -> ProfileInput<'a> {
         ProfileInput {
+            engine_kind: crate::engine_kind::EngineKind::default(),
             model_name: "qwen3-8b",
             instance_key: "qwen3-8b",
             model_path: "/models/qwen3-8b.gguf",
@@ -1638,6 +1762,8 @@ mod tests {
             data_dir: "/tmp/pallama-test-data",
             cache_hit_rate: None,
             device_hint: None,
+            sibling_devices: Vec::new(),
+            auto_tensor_split: None,
         }
     }
 
@@ -1664,6 +1790,7 @@ mod tests {
         sampler_defaults: None,
         spm_infill: None,
         late_chunking: None,
+        rpc_servers: None,
     };
 
     #[test]
@@ -2521,6 +2648,54 @@ mod tests {
             .argv
             .windows(2)
             .any(|w| w[0] == "--lora-scaled" && w[1] == "/loras/b.bin:0.5"));
+    }
+
+    #[test]
+    fn unit__rpc__per_model_override_replaces_global_and_empty_inherits() {
+        // C6: a non-empty per-model rpc_servers replaces the global list;
+        // an empty/absent overlay inherits it untouched.
+        let cfg = Config {
+            rpc_servers: "box1:50052,box2:50052".into(),
+            model_overrides: std::collections::BTreeMap::from([(
+                "qwen3-8b".to_string(),
+                ModelOverride {
+                    rpc_servers: Some("gpu3:50052".into()),
+                    ..ModelOverride::default()
+                },
+            )]),
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--rpc" && w[1] == "gpu3:50052"));
+        assert!(!p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--rpc" && w[1].contains("box1")));
+
+        // Overlay present but empty -> global inherited.
+        let cfg = Config {
+            rpc_servers: "box1:50052".into(),
+            model_overrides: std::collections::BTreeMap::from([(
+                "qwen3-8b".to_string(),
+                ModelOverride {
+                    rpc_servers: Some("   ".into()),
+                    ..ModelOverride::default()
+                },
+            )]),
+            ..Config::default()
+        };
+        let inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--rpc" && w[1] == "box1:50052"));
     }
 
     #[test]
@@ -3501,6 +3676,82 @@ mod tests {
     }
 
     #[test]
+    fn unit__compile__mistralrs_dialect_minimal_profile() {
+        // The manifest flag gate must NOT run for mistral.rs engines:
+        // the llama-server dialect is foreign and --jinja/--ctx-size
+        // style flags would hard-error against a foreign flag set (the
+        // live 500 that birthed this fork). The profile is ctx plus
+        // `-np N` for the argv translator to mine — nothing else.
+        let cfg = Config::default();
+        let hw = gpu_hw(0, 32_000, 8);
+        let g = meta();
+        let empty: BTreeSet<String> = BTreeSet::new();
+        let mut inp = input(&g, &hw, &cfg, &empty);
+        inp.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert_eq!(p.argv, vec!["-np".to_string(), cfg.slots.to_string()]);
+        assert!(p.warnings.is_empty());
+        assert_eq!(p.kv_est_bytes, None);
+        // slots = 0 (upstream auto) emits nothing — the translator's
+        // own default applies.
+        let cfg0 = Config {
+            slots: 0,
+            ..Default::default()
+        };
+        let mut inp0 = input(&g, &hw, &cfg0, &empty);
+        inp0.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        let p0 = compile(&inp0, &TuningOverrides::default()).unwrap();
+        assert!(p0.argv.is_empty(), "{:?}", p0.argv);
+        // pa-memory-fraction rides the dialect argv when the binary has
+        // the flag; a missing flag teaches instead of silently dropping.
+        let mut flags = BTreeSet::new();
+        flags.insert("--pa-memory-fraction".to_string());
+        let cfg_frac = Config {
+            mistralrs_pa_memory_fraction: Some(0.35),
+            ..Default::default()
+        };
+        let mut inp_flagged = input(&g, &hw, &cfg_frac, &flags);
+        inp_flagged.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        let pf = compile(&inp_flagged, &TuningOverrides::default()).unwrap();
+        let i = pf
+            .argv
+            .iter()
+            .position(|a| a == "--pa-memory-fraction")
+            .expect("fraction flag emitted");
+        assert_eq!(pf.argv[i + 1], "0.35");
+        let mut inp_unflagged = input(&g, &hw, &cfg_frac, &empty);
+        inp_unflagged.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        let pn = compile(&inp_unflagged, &TuningOverrides::default()).unwrap();
+        assert!(
+            !pn.argv.iter().any(|a| a == "--pa-memory-fraction"),
+            "unsupported flag must not emit"
+        );
+        assert_eq!(pn.warnings.len(), 1);
+        // paged-attn off: the only fit for big vision models on 8 GB
+        // cards (live-proven) — same gate shape as the fraction knob.
+        let cfg_pa = Config {
+            mistralrs_paged_attn: Some(false),
+            ..Default::default()
+        };
+        let mut flags_pa = BTreeSet::new();
+        flags_pa.insert("--paged-attn".to_string());
+        let mut inppa = input(&g, &hw, &cfg_pa, &flags_pa);
+        inppa.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        let ppa = compile(&inppa, &TuningOverrides::default()).unwrap();
+        let ipa = ppa
+            .argv
+            .iter()
+            .position(|a| a == "--paged-attn")
+            .expect("paged-attn emitted");
+        assert_eq!(ppa.argv[ipa + 1], "off");
+        let mut inppa2 = input(&g, &hw, &cfg_pa, &empty);
+        inppa2.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        let ppa2 = compile(&inppa2, &TuningOverrides::default()).unwrap();
+        assert!(!ppa2.argv.iter().any(|a| a == "--paged-attn"));
+        assert_eq!(ppa2.warnings.len(), 1);
+    }
+
+    #[test]
     fn unit__wire__spec_draft_placement_under_auto() {
         let cfg = Config {
             spec_draft_cpu_range: "0-7".into(),
@@ -3541,5 +3792,161 @@ mod tests {
             .argv
             .windows(2)
             .any(|w| w[0] == "--spec-draft-p-min" && w[1].starts_with("0.2")));
+    }
+
+    /// `ALL_FLAGS` + the placement flags the sibling tests pin explicitly
+    /// (the fixture's flag list predates them).
+    fn sibling_flags() -> BTreeSet<String> {
+        let mut f = ALL_FLAGS.clone();
+        f.insert("--spec-draft-device".to_string());
+        f.insert("--mmproj-device".to_string());
+        f
+    }
+
+    #[test]
+    fn unit__siblings__draft_warning_fires_and_pin_silences() {
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let flags = sibling_flags();
+        // spec defaults to "off"; the sibling recommendation only exists
+        // for resolved drafts (spec "auto" + draft model present).
+        let cfg = Config {
+            spec: "auto".into(),
+            ..Config::default()
+        };
+        let mut inp = input(&g, &hw, &cfg, &flags);
+        inp.draft_path = Some("/models/qwen3-0.5b.gguf");
+        inp.sibling_devices = vec!["GPU1".to_string()];
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("spec_draft_device = \"GPU1\"")),
+            "teaching warning must name the spare card, got: {:?}",
+            p.warnings
+        );
+        // Explicit pin silences the recommendation and emits the flag.
+        let pinned_cfg = Config {
+            spec: "auto".into(),
+            spec_draft_device: "GPU1".into(),
+            ..Config::default()
+        };
+        let mut pinned = input(&g, &hw, &pinned_cfg, &flags);
+        pinned.draft_path = Some("/models/qwen3-0.5b.gguf");
+        pinned.sibling_devices = vec!["GPU1".to_string()];
+        let p2 = compile(&pinned, &TuningOverrides::default()).unwrap();
+        assert!(!p2.warnings.iter().any(|w| w.contains("spec draft shares")));
+        assert!(p2
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--spec-draft-device" && w[1] == "GPU1"));
+    }
+
+    #[test]
+    fn unit__auto_tensor_split__emits_with_teaching_and_pin_wins() {
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let cfg = Config::default();
+        let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        inp.auto_tensor_split = Some("2,1".to_string());
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--tensor-split" && w[1] == "2,1"));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("auto tensor-split 2,1") && w.contains("buys capacity")),
+            "bandwidth teaching must ride the auto split, got: {:?}",
+            p.warnings
+        );
+        // Manual tensor_split is authoritative: the auto plan is ignored
+        // (no duplicate emission, no auto warning).
+        let pinned_cfg = Config {
+            tensor_split: "3,1".into(),
+            ..Config::default()
+        };
+        let mut pinned = input(&g, &hw, &pinned_cfg, &ALL_FLAGS);
+        pinned.auto_tensor_split = Some("2,1".to_string());
+        let p2 = compile(&pinned, &TuningOverrides::default()).unwrap();
+        assert_eq!(
+            p2.argv
+                .windows(2)
+                .filter(|w| w[0] == "--tensor-split")
+                .count(),
+            1
+        );
+        assert!(p2
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--tensor-split" && w[1] == "3,1"));
+    }
+
+    #[test]
+    fn unit__auto_tensor_split__engine_without_flag_warns_only() {
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let cfg = Config::default();
+        let mut flags = full_flags();
+        flags.remove("--tensor-split");
+        let mut inp = input(&g, &hw, &cfg, &flags);
+        inp.auto_tensor_split = Some("2,1".to_string());
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.iter().any(|a| a == "--tensor-split"));
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.contains("auto tensor-split planned but engine")
+                && w.contains("lacks --tensor-split")));
+    }
+
+    #[test]
+    fn unit__siblings__mmproj_warning_fires_and_pin_silences() {
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let flags = sibling_flags();
+        let cfg = Config::default();
+        let mut inp = input(&g, &hw, &cfg, &flags);
+        inp.mmproj_path = Some("/models/mmproj.gguf");
+        inp.sibling_devices = vec!["GPU1".to_string()];
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("mmproj_device = \"GPU1\"")),
+            "teaching warning must name the spare card, got: {:?}",
+            p.warnings
+        );
+        let pinned_cfg = Config {
+            mmproj_device: "GPU1".into(),
+            ..Config::default()
+        };
+        let mut pinned = input(&g, &hw, &pinned_cfg, &flags);
+        pinned.mmproj_path = Some("/models/mmproj.gguf");
+        pinned.sibling_devices = vec!["GPU1".to_string()];
+        let p2 = compile(&pinned, &TuningOverrides::default()).unwrap();
+        assert!(!p2.warnings.iter().any(|w| w.contains("mmproj shares")));
+        assert!(p2
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--mmproj-device" && w[1] == "GPU1"));
+    }
+
+    #[test]
+    fn unit__siblings__no_sibling_no_warning() {
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let flags = sibling_flags();
+        let cfg = Config {
+            spec: "auto".into(),
+            ..Config::default()
+        };
+        let mut inp = input(&g, &hw, &cfg, &flags);
+        inp.draft_path = Some("/models/qwen3-0.5b.gguf");
+        inp.mmproj_path = Some("/models/mmproj.gguf");
+        // sibling_devices empty (single-card box): stays silent.
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(!p.warnings.iter().any(|w| w.contains("spare discrete card")));
     }
 }

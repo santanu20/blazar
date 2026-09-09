@@ -40,6 +40,7 @@ parking_lot = "0.12.5"
 pallama-runtime = { workspace = true, features = ["test-util"] }
 wiremock = "0.6"
 tempfile = "3"
+libc = { workspace = true }
 
 [lints]
 workspace = true

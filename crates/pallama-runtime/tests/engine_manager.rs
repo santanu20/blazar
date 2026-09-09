@@ -186,8 +186,11 @@ async fn integration__install_probe_activate_rollback_cycle() {
     assert_eq!(store.active_engine().unwrap().unwrap().tag, "b100");
 
     // Manifest is a real probe of the stub: version/build/devices/flags.
+    // The stub banner reports STUB_BUILD 9999, but the install tag (b100)
+    // is the authoritative build identity — same rule that overrides the
+    // shallow-clone "build 1" artifact on source-built engines.
     let m: Manifest = serde_json::from_str(&row.manifest).unwrap();
-    assert_eq!(m.build_number, 9999, "stub STUB_BUILD default");
+    assert_eq!(m.build_number, 100, "tag build number is authoritative");
     assert_eq!(m.devices.len(), 1, "stub --list-devices GPU fixture");
     assert!(m.has_flag("--ctx-size"));
     assert!(m.has_flag("--jinja"));
@@ -355,6 +358,7 @@ async fn integration__prune_keeps_last_three_and_local() {
                 installed_at: 1000 + i64::try_from(i).unwrap_or(0),
                 active: false,
                 manifest: "{}".into(),
+                kind: pallama_core::engine_kind::EngineKind::default(),
             })
             .unwrap();
     }
@@ -367,6 +371,7 @@ async fn integration__prune_keeps_last_three_and_local() {
             installed_at: 1,
             active: false,
             manifest: "{}".into(),
+            kind: pallama_core::engine_kind::EngineKind::default(),
         })
         .unwrap();
     // b2 marked active (old but active -> kept).

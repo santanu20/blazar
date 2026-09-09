@@ -68,6 +68,9 @@ fn test_input<'a>(
     overlay: &'a ModelOverride,
 ) -> ProfileInput<'a> {
     ProfileInput {
+        engine_kind: pallama_core::engine_kind::EngineKind::default(),
+        sibling_devices: Vec::new(),
+        auto_tensor_split: None,
         mmproj_path: None,
         model_name: "qwen3-8b",
         instance_key: "qwen3-8b",

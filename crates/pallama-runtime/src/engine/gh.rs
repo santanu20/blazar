@@ -76,7 +76,23 @@ pub struct GhClient {
 
 #[must_use]
 pub fn btag_number(tag: &str) -> Option<u64> {
-    tag.strip_prefix('b')?.parse().ok()
+    // Suffix-tolerant: source-built engines carry a provenance suffix
+    // (`b10816-cuda`) but compare by their leading upstream build number.
+    tag.strip_prefix('b')?
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Same-upstream-build comparison: b-tags compare by build number (so
+/// `b10816-cuda` == `b10816`); anything else falls back to equality.
+#[must_use]
+pub fn same_build(a: &str, b: &str) -> bool {
+    match (btag_number(a), btag_number(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
 }
 
 impl GhClient {
@@ -254,9 +270,14 @@ impl GhClient {
     }
 
     pub async fn release_by_tag(&self, tag: &str) -> Result<GhRelease> {
+        self.release_by_tag_repo(LLAMA_CPP_REPO, tag).await
+    }
+
+    /// `release_by_tag` for an arbitrary repo (mistral.rs engine lane).
+    pub async fn release_by_tag_repo(&self, repo: &str, tag: &str) -> Result<GhRelease> {
         let url = self
             .base
-            .join(&format!("repos/{LLAMA_CPP_REPO}/releases/tags/{tag}"))
+            .join(&format!("repos/{repo}/releases/tags/{tag}"))
             .unwrap();
         let resp = self
             .auth(self.http.get(url.clone()))
@@ -265,9 +286,20 @@ impl GhClient {
             .context("GitHub release-by-tag request failed")?;
         match resp.status() {
             reqwest::StatusCode::OK => Ok(resp.json().await.context("decode release")?),
-            reqwest::StatusCode::NOT_FOUND => Err(anyhow!("llama.cpp release {tag} not found")),
-            other => Err(anyhow!("GitHub API {other} for tag {tag}")),
+            reqwest::StatusCode::NOT_FOUND => Err(anyhow!("{repo} release {tag} not found")),
+            other => Err(anyhow!("GitHub API {other} for {repo} tag {tag}")),
         }
+    }
+
+    /// Newest mistral.rs release by semver (`vtag_semver`, not string
+    /// order — v0.10.0 > v0.9.3).
+    pub async fn latest_mistralrs_release(&self) -> Result<GhRelease> {
+        let releases = self.list_releases_repo(MISTRALRS_REPO).await?;
+        releases
+            .into_iter()
+            .filter(|r| vtag_semver(&r.tag_name).is_some())
+            .max_by_key(|r| vtag_semver(&r.tag_name).unwrap_or((0, 0, 0)))
+            .ok_or_else(|| anyhow!("no v-tagged mistral.rs releases found"))
     }
 
     /// Download an asset fully into memory, verifying its sha256 digest
@@ -307,6 +339,70 @@ impl GhClient {
             );
         }
         Ok(bytes.to_vec())
+    }
+
+    /// Stream an asset to `dest` with incremental sha256 — for GiB-class
+    /// assets (mistral.rs CUDA prebuilts are 0.8-1.1 GiB) that must not
+    /// be buffered whole in memory. The client's read-timeout is an
+    /// idle-gap cap, not a total deadline, so slow links survive.
+    /// Returns bytes written.
+    pub async fn download_asset_file(
+        &self,
+        asset: &GhAsset,
+        dest: &std::path::Path,
+    ) -> Result<u64> {
+        let url = reqwest::Url::parse(&asset.browser_download_url)
+            .with_context(|| format!("asset url {:?}", asset.name))?;
+        let mut req = self.http.get(url.clone());
+        if url.host_str() == Some("api.github.com") {
+            req = self.auth(req);
+        }
+        let resp = req.send().await.context("asset download failed")?;
+        if !resp.status().is_success() {
+            return Err(anyhow!(
+                "asset download {} returned {}",
+                asset.name,
+                resp.status()
+            ));
+        }
+        if let Some(len) = resp.content_length() {
+            tracing::info!(
+                "downloading {} ({} MiB) to {}",
+                asset.name,
+                len / (1024 * 1024),
+                dest.display()
+            );
+        }
+        let mut file =
+            std::fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
+        let mut hasher = Sha256::new();
+        let mut total: u64 = 0;
+        let mut resp = resp;
+        while let Some(chunk) = resp.chunk().await.context("read asset stream")? {
+            use std::io::Write;
+            file.write_all(&chunk).context("write asset chunk")?;
+            hasher.update(&chunk);
+            total += chunk.len() as u64;
+        }
+        if let Some(digest) = &asset.digest {
+            let expected = digest
+                .strip_prefix("sha256:")
+                .unwrap_or(digest)
+                .to_lowercase();
+            let got = format!("{:x}", hasher.finalize());
+            if got != expected {
+                return Err(anyhow!(
+                    "sha256 mismatch for {}: expected {expected}, got {got}",
+                    asset.name
+                ));
+            }
+        } else {
+            tracing::warn!(
+                "asset {} has no digest in release metadata; skipping sha verify",
+                asset.name
+            );
+        }
+        Ok(total)
     }
 }
 
@@ -462,6 +558,117 @@ pub fn asset_filename(tag: &str, suffix: &str) -> String {
     format!("llama-{tag}-bin-{suffix}.{ext}")
 }
 
+pub const MISTRALRS_REPO: &str = "EricLBuehler/mistral.rs";
+
+/// CUDA toolkit variants mistral.rs publishes prebuilts for, as the
+/// digit-run used in asset names (12.8 -> 128). Ordered oldest-first;
+/// derivation walks it descending to find the newest the driver allows.
+pub const MISTRALRS_CUDAS: [u32; 6] = [128, 129, 130, 131, 132, 133];
+
+/// GPU compute caps (sm) mistral.rs publishes prebuilts for.
+pub const MISTRALRS_SMS: [u32; 7] = [80, 86, 89, 90, 100, 120, 121];
+
+/// Parse `vX.Y.Z` numerically: missing patch = 0, `-rc.N` style
+/// pre-release suffixes ignored. Currency for v-tagged repos (mistral.rs,
+/// pallama self) must compare numerically — lexicographic order calls
+/// v0.10.0 a "downgrade" from v0.9.3.
+#[must_use]
+pub fn vtag_semver(tag: &str) -> Option<(u64, u64, u64)> {
+    let core = tag.strip_prefix('v')?;
+    let core = core.split('-').next()?;
+    let mut it = core.split('.');
+    let maj: u64 = it.next()?.parse().ok()?;
+    let min: u64 = it.next()?.parse().ok()?;
+    let patch: u64 = it.next().map_or(0, |p| p.parse().unwrap_or(0));
+    Some((maj, min, patch))
+}
+
+/// Ordered mistral.rs asset preferences for this machine (exact names:
+/// mistral.rs asset names carry no tag component). The list is derived
+/// from live driver/GPU facts, never from a compat matrix:
+/// - Linux + Nvidia: `mistralrs-cuda{NNN}-sm{SM}-x86_64-unknown-linux-gnu`
+///   for every published NNN the driver supports (driver CUDA 13.0
+///   allows 130, not 131), newest first; a trailing CPU build marked
+///   `cpu_fallback` covers driver < 12.8. `sm` is the compute cap
+///   verbatim (8.9 -> 89); caps outside the published set are a
+///   teaching error, not a silent mismatch.
+/// - Everything else: the CPU/Metal build that exists for the platform.
+pub fn mistralrs_asset_picks(
+    os: &str,
+    arch: &str,
+    vendor: Option<crate::engine::manifest::Vendor>,
+    driver_cuda: Option<(u32, u32)>,
+    compute_cap: Option<(u32, u32)>,
+) -> Result<Vec<AssetPick>> {
+    use crate::engine::manifest::Vendor;
+    let cpu_linux = |a: &str, fallback: bool| AssetPick {
+        name: format!("mistralrs-cpu-{a}-unknown-linux-gnu.tar.gz"),
+        label: "cpu".into(),
+        cpu_fallback: fallback,
+    };
+    match (os, arch) {
+        ("macos", "aarch64" | "arm64") => Ok(vec![AssetPick {
+            name: "mistralrs-metal-aarch64-apple-darwin.tar.gz".into(),
+            label: "metal".into(),
+            cpu_fallback: false,
+        }]),
+        ("macos", _) => Err(anyhow!(
+            "mistral.rs publishes no prebuilt for macOS x86_64 (Metal/arm64 only)"
+        )),
+        ("windows", "x86_64" | "x64" | "amd64") => Ok(vec![AssetPick {
+            name: "mistralrs-cpu-x86_64-pc-windows-msvc.zip".into(),
+            label: "cpu".into(),
+            cpu_fallback: false,
+        }]),
+        ("windows", _) => Err(anyhow!(
+            "mistral.rs publishes no prebuilt for Windows ARM64"
+        )),
+        ("linux", "x86_64" | "x64" | "amd64") => {
+            if vendor == Some(Vendor::Nvidia) {
+                let Some((dmaj, dmin)) = driver_cuda else {
+                    return Ok(vec![cpu_linux("x86_64", true)]);
+                };
+                let Some((cmaj, cmin)) = compute_cap else {
+                    return Ok(vec![cpu_linux("x86_64", true)]);
+                };
+                let sm = cmaj * 10 + cmin;
+                if !MISTRALRS_SMS.contains(&sm) {
+                    return Err(anyhow!(
+                        "GPU compute cap {cmaj}.{cmin} (sm{sm}) is outside the mistral.rs \
+                         prebuilt set (sm{MISTRALRS_SMS:?}); install the CPU build or compile from source"
+                    ));
+                }
+                let floor = dmaj * 10 + dmin;
+                let mut picks: Vec<AssetPick> = MISTRALRS_CUDAS
+                    .iter()
+                    .rev()
+                    .filter(|&&nnn| nnn <= floor)
+                    .map(|&nnn| AssetPick {
+                        name: format!("mistralrs-cuda{nnn}-sm{sm}-x86_64-unknown-linux-gnu.tar.gz"),
+                        label: format!("cuda{nnn}-sm{sm}"),
+                        cpu_fallback: false,
+                    })
+                    .collect();
+                picks.push(cpu_linux("x86_64", true));
+                Ok(picks)
+            } else {
+                Ok(vec![cpu_linux("x86_64", false)])
+            }
+        }
+        ("linux", "aarch64" | "arm64") => Ok(vec![cpu_linux("aarch64", false)]),
+        _ => Err(anyhow!("mistral.rs publishes no prebuilt for {os}/{arch}")),
+    }
+}
+
+/// First preference whose exact asset name exists on the release.
+#[must_use]
+pub fn resolve_mistralrs_asset(release: &GhRelease, picks: &[AssetPick]) -> Option<AssetPick> {
+    picks
+        .iter()
+        .find(|p| release.assets.iter().any(|a| a.name == p.name))
+        .cloned()
+}
+
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
@@ -484,6 +691,151 @@ mod tests {
                 .collect(),
             published_at: None,
         }
+    }
+
+    #[test]
+    fn unit__btag_number__plain_and_suffixed() {
+        assert_eq!(btag_number("b10816"), Some(10816));
+        assert_eq!(btag_number("b10816-cuda"), Some(10816));
+        assert_eq!(btag_number("b10816-cpu"), Some(10816));
+        assert_eq!(btag_number("local"), None);
+        assert_eq!(btag_number("v0.1.0"), None);
+        assert_eq!(btag_number("b-cuda"), None);
+    }
+
+    #[test]
+    fn unit__same_build__number_first() {
+        assert!(same_build("b10816", "b10816-cuda"));
+        assert!(same_build("b10816-cuda", "b10816"));
+        assert!(!same_build("b10816", "b10817"));
+        assert!(same_build("local", "local"));
+        assert!(!same_build("local", "b10816"));
+    }
+
+    #[test]
+    fn unit__vtag_semver__numeric_order() {
+        assert_eq!(vtag_semver("v0.9.3"), Some((0, 9, 3)));
+        assert_eq!(vtag_semver("v0.10.0"), Some((0, 10, 0)));
+        assert_eq!(vtag_semver("v1.8"), Some((1, 8, 0)));
+        assert_eq!(vtag_semver("v2.0.0-rc.1"), Some((2, 0, 0)));
+        assert_eq!(vtag_semver("b10857"), None);
+        assert_eq!(vtag_semver("vx.y.z"), None);
+        assert!(vtag_semver("v0.10.0") > vtag_semver("v0.9.3"));
+    }
+
+    #[test]
+    fn unit__mistralrs_picks__nvidia_newest_allowed_cuda_first() {
+        let picks = mistralrs_asset_picks(
+            "linux",
+            "x86_64",
+            Some(Vendor::Nvidia),
+            Some((13, 0)),
+            Some((8, 9)),
+        )
+        .unwrap();
+        assert_eq!(
+            picks[0].name,
+            "mistralrs-cuda130-sm89-x86_64-unknown-linux-gnu.tar.gz"
+        );
+        assert_eq!(picks[0].label, "cuda130-sm89");
+        assert!(!picks[0].cpu_fallback);
+        // newer-than-driver variants excluded, older kept as fallbacks
+        assert!(picks.iter().take(3).map(|p| p.name.as_str()).eq([
+            "mistralrs-cuda130-sm89-x86_64-unknown-linux-gnu.tar.gz",
+            "mistralrs-cuda129-sm89-x86_64-unknown-linux-gnu.tar.gz",
+            "mistralrs-cuda128-sm89-x86_64-unknown-linux-gnu.tar.gz",
+        ]));
+        let cpu = picks.last().unwrap();
+        assert_eq!(cpu.label, "cpu");
+        assert!(cpu.cpu_fallback);
+    }
+
+    #[test]
+    fn unit__mistralrs_picks__old_driver_cpu_only_loud_fallback() {
+        let picks = mistralrs_asset_picks(
+            "linux",
+            "x86_64",
+            Some(Vendor::Nvidia),
+            Some((12, 2)),
+            Some((8, 9)),
+        )
+        .unwrap();
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].label, "cpu");
+        assert!(picks[0].cpu_fallback);
+    }
+
+    #[test]
+    fn unit__mistralrs_picks__unknown_driver_or_cap_falls_back() {
+        for driver in [None, Some((11, 0))] {
+            let picks = mistralrs_asset_picks(
+                "linux",
+                "x86_64",
+                Some(Vendor::Nvidia),
+                driver,
+                Some((8, 9)),
+            )
+            .unwrap();
+            assert_eq!(picks.len(), 1);
+            assert!(picks[0].cpu_fallback);
+        }
+        let picks =
+            mistralrs_asset_picks("linux", "x86_64", Some(Vendor::Nvidia), Some((13, 0)), None)
+                .unwrap();
+        assert_eq!(picks.len(), 1);
+        assert!(picks[0].cpu_fallback);
+    }
+
+    #[test]
+    fn unit__mistralrs_picks__unsupported_compute_cap_teaches() {
+        let err = mistralrs_asset_picks(
+            "linux",
+            "x86_64",
+            Some(Vendor::Nvidia),
+            Some((13, 0)),
+            Some((11, 0)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("sm110"), "err: {err}");
+        assert!(err.contains("CPU build"));
+    }
+
+    #[test]
+    fn unit__mistralrs_picks__non_nvidia_and_other_platforms() {
+        let picks =
+            mistralrs_asset_picks("linux", "x86_64", Some(Vendor::Amd), None, None).unwrap();
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].label, "cpu");
+        assert!(!picks[0].cpu_fallback);
+        let picks = mistralrs_asset_picks("macos", "arm64", None, None, None).unwrap();
+        assert_eq!(picks[0].name, "mistralrs-metal-aarch64-apple-darwin.tar.gz");
+        let picks =
+            mistralrs_asset_picks("windows", "x64", Some(Vendor::Nvidia), None, None).unwrap();
+        assert_eq!(picks[0].name, "mistralrs-cpu-x86_64-pc-windows-msvc.zip");
+        assert!(mistralrs_asset_picks("macos", "x86_64", None, None, None).is_err());
+    }
+
+    #[test]
+    fn unit__resolve_mistralrs_asset__first_present_wins() {
+        let picks = mistralrs_asset_picks(
+            "linux",
+            "x86_64",
+            Some(Vendor::Nvidia),
+            Some((13, 0)),
+            Some((8, 9)),
+        )
+        .unwrap();
+        // release carries only the cuda128 fallback variant
+        let release = rel(
+            "v0.9.3",
+            &["mistralrs-cuda128-sm89-x86_64-unknown-linux-gnu.tar.gz"],
+        );
+        let got = resolve_mistralrs_asset(&release, &picks).unwrap();
+        assert_eq!(got.label, "cuda128-sm89");
+        // nothing present -> None (caller teaching-errors)
+        let empty = rel("v0.9.3", &["some-other-asset.txt"]);
+        assert!(resolve_mistralrs_asset(&empty, &picks).is_none());
     }
 
     #[test]

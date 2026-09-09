@@ -108,6 +108,13 @@ impl Histogram {
         }
     }
 
+    /// Total observations recorded (for sample-size gates like the
+    /// predictive admission check).
+    #[must_use]
+    pub fn count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+
     /// Approximate quantile from cumulative buckets (linear
     /// interpolation within the containing bucket). 0 observations = 0.
     #[must_use]

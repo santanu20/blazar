@@ -383,7 +383,11 @@ install_system() {
             i=$((i + 1)); sleep 1
         done
     fi
-    SVC_USER="${PALLAMA_SERVICE_USER:-$(id -un)}"
+    # Under `sudo` the invoking user is SUDO_USER (id -un would say root);
+    # the daemon must run as the data-owning user (engines/models live in
+    # that home), so the unit never points at /root's empty store.
+    SVC_USER="${PALLAMA_SERVICE_USER:-${SUDO_USER:-$(id -un)}}"
+    SVC_GROUP="${PALLAMA_SERVICE_GROUP:-$(id -gn "$SVC_USER")}"
     UNIT_PATH="${PALLAMA_UNIT_PATH:-/etc/systemd/system/pallama.service}"
     SYSTEMCTL="${PALLAMA_SYSTEMCTL:-systemctl}"
     if command -v "$SYSTEMCTL" >/dev/null 2>&1; then
@@ -409,7 +413,7 @@ Wants=network-online.target
 [Service]
 ExecStart=${BIN_DIR}/pallama serve
 User=${SVC_USER}
-Group=${PALLAMA_SERVICE_GROUP:-$(id -gn)}
+Group=${SVC_GROUP}
 ${SG_LINE}
 Restart=always
 RestartSec=3

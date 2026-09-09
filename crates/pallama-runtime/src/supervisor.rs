@@ -16,7 +16,7 @@ use tokio::sync::Notify;
 
 use pallama_core::profile::{self, Endpoint, ProfileInput};
 use pallama_core::store::Store;
-use pallama_core::{Config, Hardware, ModelRow, PallamaDirs};
+use pallama_core::{Config, GpuInfo, Hardware, ModelRow, PallamaDirs};
 
 use crate::events::{EventBus, InstanceState, PallamaEvent};
 
@@ -112,6 +112,10 @@ pub struct Instance {
     /// "partial" | "auto") — what `ps` shows so silent CPU fallback is
     /// never silent.
     pub gpu: String,
+    /// Auto-picked GPU card name (LC2 discrete-first pick); `None` when
+    /// placement was manual (devices config) or unknown. Feeds the
+    /// card-scoped co-residency planner.
+    pub device: Option<String>,
     /// Post-quantization KV-cache estimate from the compiled profile —
     /// feeds the co-residency planner (A15).
     pub kv_est_bytes: Option<u64>,
@@ -124,11 +128,152 @@ pub struct Instance {
 }
 
 /// Measured prompt-cache hit rate, shared between the gateway poller
-/// (writer) and profile compiles (reader). Fixed-point milli-units so the
-/// read path is a single atomic load — no lock on the spawn hot path.
+/// (writer) and profile compiles (reader). Fixed-point milli-units so
+/// the read path is a single atomic load — no lock on the spawn hot path.
 #[derive(Debug)]
 pub struct CacheHint {
     rate_milli: std::sync::atomic::AtomicU32,
+}
+
+/// Auto-pick one GPU: most free VRAM among DISCRETE cards; integrated
+/// cards are considered only when no discrete card exists (their "free"
+/// is shared system RAM — bandwidth-starved for serving). Returns the
+/// index of the pick plus whether a higher-free integrated card was
+/// skipped (caller logs the teaching note). `None` = nothing to pick.
+fn pick_gpu(gpus: &[pallama_core::GpuInfo]) -> Option<(usize, bool)> {
+    if gpus.is_empty() {
+        return None;
+    }
+    let (top_free, _) = gpus
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, g)| g.free_mib)
+        .expect("non-empty gpu slice has a max");
+    match gpus
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| !g.is_integrated())
+        .max_by_key(|(_, g)| g.free_mib)
+    {
+        Some((idx, _)) => Some((idx, gpus[top_free].is_integrated())),
+        // Integrated-only box: serve anyway (laptop iGPU is still a GPU).
+        None => Some((top_free, false)),
+    }
+}
+
+/// Last-resort auto tensor-split planning (#28c): when weights+KV exceed
+/// the best single discrete card's MEASURED free VRAM but fit the
+/// discrete cards COMBINED, return a `--tensor-split` ratio string
+/// proportional to each card's free VRAM. `None` = no split (fits the
+/// best card, fewer than two discrete cards, or not fixable by
+/// splitting). Integrated cards never join the pool (shared-RAM
+/// bandwidth fiction). Callers gate on every manual pin being unset —
+/// this fn is placement math, not policy.
+fn plan_auto_tensor_split(
+    gpus: &[pallama_core::GpuInfo],
+    weights_mib: u64,
+    kv_mib: u64,
+) -> Option<String> {
+    let discrete: Vec<&pallama_core::GpuInfo> =
+        gpus.iter().filter(|g| !g.is_integrated()).collect();
+    if discrete.len() < 2 {
+        return None; // splitting needs at least two discrete cards
+    }
+    let need = weights_mib.saturating_add(kv_mib);
+    let best_free = discrete.iter().map(|g| g.free_mib).max()?;
+    if need <= best_free {
+        return None; // fits the best card: single-card placement wins
+    }
+    let combined: u64 = discrete.iter().map(|g| g.free_mib).sum();
+    if need > combined {
+        return None; // beyond splitting: the CPU-spill lane teaches instead
+    }
+    // Ratios relative to the smallest free card (llama.cpp takes relative
+    // weights): 8188 + 3996 free → "2,1". Clamped ≥1 so a nearly-full
+    // card still receives layers (upstream needs every listed device).
+    let min_free = discrete.iter().map(|g| g.free_mib).min()?.max(1);
+    Some(
+        discrete
+            .iter()
+            .map(|g| (g.free_mib / min_free).clamp(1, 9999).to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+/// Post-spawn settle report (#28a): compare the picked card's free VRAM
+/// before spawn vs after the child came healthy, returning
+/// (card name, measured take in MiB, card-used percentage). `device`
+/// names the picked card; `None` falls back to the max-free card of the
+/// AFTER snapshot (manual-pin boxes have no pick to attribute to).
+fn settle_report(
+    pre: &pallama_core::Hardware,
+    post: &pallama_core::Hardware,
+    device: Option<&str>,
+) -> Option<(String, u64, u64)> {
+    let pre_free_of = |name: &str| {
+        pre.gpus
+            .iter()
+            .find(|g| g.name == name)
+            .map_or(0, |g| g.free_mib)
+    };
+    // A named pick must exist in the AFTER snapshot (a card that vanished
+    // from the census reports garbage, not zero). Without a pick, report
+    // the card whose free VRAM dropped the most — the card the spawn
+    // plausibly landed on.
+    let card = match device {
+        Some(name) => post.gpus.iter().find(|g| g.name == name)?,
+        None => post
+            .gpus
+            .iter()
+            .max_by_key(|g| pre_free_of(&g.name).saturating_sub(g.free_mib))?,
+    };
+    let pre_free = pre_free_of(&card.name);
+    let taken = pre_free.saturating_sub(card.free_mib);
+    let used_pct = ((card.total_mib.saturating_sub(card.free_mib)) * 100)
+        .checked_div(card.total_mib)
+        .unwrap_or(0);
+    Some((card.name.clone(), taken, used_pct))
+}
+
+/// Per-card co-residency pressure (A15, card-scoped): would the candidate
+/// (weights + f16 KV) plus everything already resident on the TARGET card
+/// exceed 95% of that card? Instances whose placement is unknown (spawned
+/// pre-device-recording, or manual multi-card splits) count
+/// conservatively against the target. CPU/partial splits live elsewhere
+/// and never count.
+#[allow(clippy::type_complexity)]
+fn card_pressure_exceeds(
+    target: Option<&str>,
+    gpus: &[pallama_core::GpuInfo],
+    residents: &[(Option<String>, u64, u64, bool)], // (device, weights, kv, gpu_resident)
+    candidate_bytes: u64,
+    candidate_kv: u64,
+) -> Option<bool> {
+    if gpus.is_empty() {
+        return None;
+    }
+    // The target card's VRAM — fall back to the summed pool only when
+    // the placement is unknown (None), matching pre-scoping behavior.
+    let vram = pallama_core::Hardware::bytes(match target {
+        Some(name) => gpus.iter().find(|g| g.name == name)?.total_mib,
+        None => gpus.iter().map(|g| g.total_mib).sum(),
+    });
+    let mut resident = candidate_bytes.saturating_add(candidate_kv);
+    for (device, weights, kv, gpu_resident) in residents {
+        if !gpu_resident {
+            continue;
+        }
+        let same_or_unknown = match (&device, target) {
+            (Some(d), Some(t)) => d == t,
+            // Unknown placement (or no target scope): count conservatively.
+            (None, _) | (Some(_), None) => true,
+        };
+        if same_or_unknown {
+            resident = resident.saturating_add(*weights).saturating_add(*kv);
+        }
+    }
+    Some(resident > vram / 100 * 95)
 }
 
 impl Default for CacheHint {
@@ -189,6 +334,15 @@ pub struct PsRow {
     pub heat: u64,
 }
 
+/// Throttle/dedup state for the measured-pressure feedback loop.
+#[derive(Default)]
+struct MeasuredTick {
+    /// Last hardware re-probe (probes spawn `--list-devices`; ≥60s apart).
+    last_probe: Option<Instant>,
+    /// card name → last pressure-teach instant (10-minute dedup).
+    warned_cards: std::collections::HashMap<String, Instant>,
+}
+
 pub struct Supervisor {
     pub dirs: PallamaDirs,
     /// Total evictions (ladder + capacity) for the metrics gauge.
@@ -245,6 +399,10 @@ pub struct Supervisor {
     /// `x-pallama-session` per model. The idle ladder and capacity
     /// pressure consult this before evicting; force stop releases.
     pub sessions: crate::sessionreg::SessionRegistry,
+    /// Measured-pressure feedback loop: throttle state for the reaper
+    /// tick's hardware re-probe + per-card teach dedup (warn once per
+    /// card per 10 minutes, probe at most once per minute).
+    measured: std::sync::Mutex<MeasuredTick>,
     // Test knobs (prod defaults from config).
     pub load_timeout: Duration,
     pub shutdown_grace: Duration,
@@ -287,6 +445,7 @@ impl Supervisor {
             cache_hint: std::sync::Arc::new(CacheHint::default()),
             spec_accept: std::sync::Arc::new(CacheHint::default()),
             engine_failures: std::sync::Mutex::new(std::collections::HashSet::new()),
+            measured: std::sync::Mutex::new(MeasuredTick::default()),
             load_timeout: Duration::from_secs(3 * 60),
             shutdown_grace: Duration::from_secs(10),
             reaper_interval: Duration::from_secs(10),
@@ -366,25 +525,42 @@ impl Supervisor {
     /// Co-residency check (A15): would the candidate (weights + f16 KV)
     /// join the already-resident models within 95% of VRAM? Only counts
     /// GPU-resident instances (cpu/"partial" splits live elsewhere).
-    fn coresidency_needs_kv_quant(&self, candidate_bytes: u64, candidate_kv: Option<u64>) -> bool {
+    fn coresidency_needs_kv_quant(
+        &self,
+        target: Option<&str>,
+        candidate_bytes: u64,
+        candidate_kv: Option<u64>,
+    ) -> bool {
         if !self.hardware.has_gpu() {
             return false;
         }
         let Some(candidate_kv) = candidate_kv else {
             return false; // no geometry: never guess (H7)
         };
-        let mut resident: u64 = candidate_bytes.saturating_add(candidate_kv);
-        for inst in &self.instances {
-            if matches!(inst.gpu.as_str(), "cpu" | "partial") {
-                continue;
-            }
-            let weights = u64::try_from(inst.model.bytes.max(0)).unwrap_or(u64::MAX);
-            resident = resident
-                .saturating_add(weights)
-                .saturating_add(inst.kv_est_bytes.unwrap_or(0));
-        }
-        let vram = pallama_core::Hardware::bytes(self.hardware.total_vram_mib());
-        resident > vram / 100 * 95
+        // Card-scoped: LC2 picks ONE card per spawn, so pressure must be
+        // computed against that card only — a summed-all-GPUs denominator
+        // fires late (or never) on mixed iGPU+dGPU boxes.
+        let residents: Vec<(Option<String>, u64, u64, bool)> = self
+            .instances
+            .iter()
+            .map(|inst| {
+                let weights = u64::try_from(inst.model.bytes.max(0)).unwrap_or(u64::MAX);
+                (
+                    inst.device.clone(),
+                    weights,
+                    inst.kv_est_bytes.unwrap_or(0),
+                    !matches!(inst.gpu.as_str(), "cpu" | "partial"),
+                )
+            })
+            .collect();
+        card_pressure_exceeds(
+            target,
+            &self.hardware.gpus,
+            &residents,
+            candidate_bytes,
+            candidate_kv,
+        )
+        .unwrap_or(false)
     }
 
     /// Live (non-evicted) TCP children as [`EngineRef`]s (endpoint +
@@ -798,6 +974,9 @@ impl Supervisor {
                 .map(|l| (l.path, l.scale))
                 .collect();
             let input = ProfileInput {
+                engine_kind: self.engine.kind(),
+                sibling_devices: Vec::new(),
+                auto_tensor_split: None,
                 model_name: &m.name,
                 instance_key: &m.name,
                 model_path: &m.path,
@@ -967,6 +1146,7 @@ impl Supervisor {
                         model: synthetic_model.clone(),
                         profile_ctx: 0,
                         gpu: "router".to_string(),
+                        device: None,
                         kv_est_bytes: None,
                         auth: auth.as_ref().map(|a| a.secret.clone()),
                         child: tokio::sync::Mutex::new(child),
@@ -1212,7 +1392,7 @@ impl Supervisor {
             && self.hardware.gpus.len() > 1
             && manifest.flags.contains("--device");
         let fresh = if self.config.spawn_mem_guard && self.hardware.has_gpu() || wants_pick {
-            Some(crate::probe::probe_hardware(Some(manifest)))
+            Some(self.live_hardware())
         } else {
             None
         };
@@ -1237,27 +1417,120 @@ impl Supervisor {
             }
         }
         // Auto GPU bin-packing (LC2): with several cards and no manual
-        // `devices` choice, place the child on the card with the most
-        // free VRAM and scope every downstream VRAM estimate (ngl ladder,
-        // KV, cache-ram, coresidency) to THAT card instead of the summed
-        // pool — a child lands on one card, not the sum. Manual overlay
-        // or global `devices` always wins; fail-open (no pick on probe
-        // weirdness).
+        // `devices` choice, place the child on the DISCRETE card with the
+        // most free VRAM (integrated GPUs report shared-RAM "free" as if
+        // it were dedicated — a bandwidth-starved trap; they serve only
+        // when no discrete card exists) and scope every downstream VRAM
+        // estimate (ngl ladder, KV, cache-ram, coresidency) to THAT card
+        // instead of the summed pool — a child lands on one card, not the
+        // sum. Manual overlay or global `devices` always wins; fail-open
+        // (no pick on probe weirdness).
         let mut scoped_hw: Option<Hardware> = None;
         let mut picked_device: Option<String> = None;
-        if wants_pick {
+        let mut sibling_devices: Vec<String> = Vec::new();
+        let mut auto_split: Option<String> = None;
+        // Tuning overrides are consumed exactly once, ABOVE the endpoint
+        // retry loop (a retry attempt used to re-read an already-removed
+        // `pending_ctx` entry), because the auto-split decision below
+        // needs the candidate KV estimate before any card scoping.
+        let mut tuning = self
+            .pending_ctx
+            .remove(name)
+            .map(|(_, ctx)| pallama_core::TuningOverrides {
+                ctx: Some(ctx),
+                ..Default::default()
+            })
+            .unwrap_or_default();
+        // Candidate f16 KV over the FULL (unscoped) hardware: the split
+        // decision compares weights+KV against the combined discrete
+        // pool before single-card scoping exists. Sibling literal of the
+        // per-attempt input below (that one carries the real endpoint
+        // and the scoping decided here); this probe only feeds the KV
+        // estimator, endpoint is irrelevant to it.
+        let data_dir_str = self.dirs.data_dir.to_string_lossy().into_owned();
+        let candidate_kv_mib = {
+            let probe = ProfileInput {
+                engine_kind: self.engine.kind(),
+                sibling_devices: Vec::new(),
+                auto_tensor_split: None,
+                model_name: name,
+                instance_key: key,
+                model_path: &model.path,
+                model_bytes: u64::try_from(model.bytes.max(0)).unwrap_or(u64::MAX),
+                gguf: &gguf,
+                hardware: fresh.as_ref().unwrap_or(&self.hardware),
+                config: &self.config,
+                overlay: &overlay,
+                loras: &loras,
+                draft_path: draft_path.as_deref(),
+                mmproj_path: model.mmproj_path.as_deref(),
+                engine_tag: &manifest.tag,
+                supported_flags: &manifest.flags,
+                endpoint: Endpoint::Tcp {
+                    host: "127.0.0.1".into(),
+                    port: 0,
+                },
+                data_dir: &data_dir_str,
+                cache_hit_rate: self.cache_hint.get(),
+                device_hint: None,
+            };
+            pallama_core::profile::estimate_kv_f16(&probe, tuning.ctx)
+                .map_or(0, |b| b / (1024 * 1024))
+        };
+        // Last-resort auto tensor-split (#28c): only when EVERY manual
+        // pin is unset (tensor_split / devices / non-default main_gpu)
+        // and the measured pool says weights+KV fit ONLY when spread.
+        let split_pinned = !self.config.tensor_split.is_empty()
+            || !self.config.effective_devices(name).is_empty()
+            || self.config.main_gpu != pallama_core::Config::default().main_gpu;
+        if !split_pinned && self.hardware.has_gpu() {
             let hw = fresh.as_ref().unwrap_or(&self.hardware);
-            if let Some(best) = hw.gpus.iter().max_by_key(|g| g.free_mib) {
+            if let Some(ratios) =
+                plan_auto_tensor_split(&hw.gpus, model_bytes / (1024 * 1024), candidate_kv_mib)
+            {
+                tracing::info!(
+                    model = name,
+                    ratios = %ratios,
+                    "auto tensor-split: weights+KV exceed the best single card's free VRAM but fit the discrete cards combined (manual pins unset; split trades inter-card bandwidth for capacity)"
+                );
+                auto_split = Some(ratios);
+            }
+        }
+        if wants_pick && auto_split.is_none() {
+            let hw = fresh.as_ref().unwrap_or(&self.hardware);
+            if let Some((idx, skipped_integrated)) = pick_gpu(&hw.gpus) {
+                let best = &hw.gpus[idx];
                 let mut scoped = hw.clone();
                 scoped.gpus = vec![best.clone()];
                 picked_device = Some(best.name.clone());
                 scoped_hw = Some(scoped);
+                // Spare discrete cards (manual picks only reserve what
+                // `devices` names): the profile surfaces them as draft/
+                // mmproj placement recommendations.
+                sibling_devices = hw
+                    .gpus
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, g)| *i != idx && !g.is_integrated())
+                    .map(|(_, g)| g.name.clone())
+                    .collect();
                 tracing::info!(
                     model = name,
                     device = %best.name,
                     free_mib = best.free_mib,
                     "auto GPU pick: most free VRAM (manual `devices` unset)"
                 );
+                if skipped_integrated {
+                    let igpu = hw
+                        .gpus
+                        .iter()
+                        .find(|g| g.is_integrated())
+                        .map_or("integrated", |g| g.name.as_str());
+                    tracing::info!(
+                        model = name,
+                        "integrated GPU {igpu} reported more free memory but was skipped (shared-RAM bandwidth); pin it explicitly with `devices` if intended"
+                    );
+                }
             }
         }
         // Cache-file dirs (speccache/, sessions/) must exist before the
@@ -1270,7 +1543,6 @@ impl Supervisor {
                 .sessions_dir()
                 .join(pallama_core::profile::path_safe(key)),
         );
-        let data_dir_str = self.dirs.data_dir.to_string_lossy().into_owned();
         // Retry once on immediate port-race death (bind fail).
         let mut auth_keyfile: Option<std::path::PathBuf> = None;
         let mut child_died_during_load = false;
@@ -1292,6 +1564,9 @@ impl Supervisor {
                 auth_keyfile = Some(p);
             }
             let input = ProfileInput {
+                engine_kind: self.engine.kind(),
+                sibling_devices: sibling_devices.clone(),
+                auto_tensor_split: auto_split.clone(),
                 model_name: name,
                 // Per-replica paths: the argv's sessions/speccache dirs
                 // must match the dir created for THIS instance key.
@@ -1312,14 +1587,6 @@ impl Supervisor {
                 cache_hit_rate: self.cache_hint.get(),
                 device_hint: picked_device.as_deref(),
             };
-            let mut tuning = self
-                .pending_ctx
-                .remove(name)
-                .map(|(_, ctx)| pallama_core::TuningOverrides {
-                    ctx: Some(ctx),
-                    ..Default::default()
-                })
-                .unwrap_or_default();
             // Co-residency planner (A15): when other models are already
             // resident, sum their (weights + post-quant KV) with the
             // candidate's f16 KV; if the box would not fit, downgrade the
@@ -1327,7 +1594,11 @@ impl Supervisor {
             // load. Explicit kv_quant (bench-adopted) is never overridden.
             if tuning.kv_quant.is_none() {
                 let candidate_kv = pallama_core::profile::estimate_kv_f16(&input, tuning.ctx);
-                if self.coresidency_needs_kv_quant(model_bytes, candidate_kv) {
+                if self.coresidency_needs_kv_quant(
+                    picked_device.as_deref(),
+                    model_bytes,
+                    candidate_kv,
+                ) {
                     tracing::warn!(model = name, "co-residency planner: KV downgraded to q8_0 to fit alongside resident models (weights+KV exceed VRAM)");
                     tuning.kv_quant = Some(true);
                 }
@@ -1386,6 +1657,7 @@ impl Supervisor {
                         model,
                         profile_ctx: profile.ctx,
                         gpu: profile.gpu.to_string(),
+                        device: picked_device.clone(),
                         kv_est_bytes: profile.kv_est_bytes,
                         auth: auth.as_ref().map(|a| a.secret.clone()),
                         child: tokio::sync::Mutex::new(child),
@@ -1401,6 +1673,38 @@ impl Supervisor {
                         auth.as_ref().map(|a| a.secret.as_str()),
                     )
                     .await;
+                    // Measured settle check (#28a): the child is healthy
+                    // and its weights+KV are resident — re-probe the card
+                    // and report what the spawn ACTUALLY took vs the
+                    // pre-spawn baseline. Teaching only (drift visibility,
+                    // the ollama in-process-precision gap closed at the
+                    // orchestration plane); needs the pre-spawn probe as
+                    // a baseline, skipped silently without one.
+                    if let Some(pre) = &fresh {
+                        let post = self.live_hardware();
+                        if let Some((card, taken_mib, used_pct)) =
+                            settle_report(pre, &post, picked_device.as_deref())
+                        {
+                            let predicted_mib = model_bytes / (1024 * 1024)
+                                + profile.kv_est_bytes.map_or(0, |b| b / (1024 * 1024));
+                            tracing::info!(
+                                model = name,
+                                card = %card,
+                                measured_mib = taken_mib,
+                                predicted_mib,
+                                used_pct,
+                                "spawn settle: card free-VRAM delta after load (predicted = weights+KV estimate)"
+                            );
+                            if used_pct > 95 {
+                                tracing::warn!(
+                                    model = name,
+                                    card = %card,
+                                    used_pct,
+                                    "card is over 95% committed after this load — expect KV pressure; consider kv quantization, a smaller quant (pallama fit), or freeing co-resident engines (pallama ps)"
+                                );
+                            }
+                        }
+                    }
                     let _ = std::fs::write(
                         self.dirs.run_dir().join(format!("{key}.pid")),
                         pid.to_string(),
@@ -1659,12 +1963,27 @@ impl Supervisor {
                     tracing::warn!(target: "pallama::bank", model = %inst.name, "banked checkpoint > 512 MiB — dropped");
                 }
             }
+            // #20 identity manifest: stamp the shape so bank restores
+            // can refuse stale KV (built from the LIVE instance ctx).
+            match pallama_core::session_identity::build(&self.dirs, &self.config, &inst.name) {
+                Some(mut id) => {
+                    id.ctx = inst.profile_ctx;
+                    if let Err(e) = pallama_core::session_identity::write_manifest(&file, &id) {
+                        tracing::warn!(target: "pallama::bank", model = %inst.name, "bank identity write failed: {e}");
+                    }
+                }
+                None => {
+                    tracing::warn!(target: "pallama::bank", model = %inst.name, "bank identity indeterminate — checkpoint left unverified");
+                }
+            }
         }
     }
 
     /// Bank restore, choke point #2: after a fresh spawn reaches
     /// readiness, a matching `_auto-<ctx>` is restored so the first
-    /// request rides warm KV. Warn-continue on any failure.
+    /// request rides warm KV. Warn-continue on any failure. A #20
+    /// identity mismatch SKIPS the restore — injecting KV from a
+    /// different runtime shape is worse than a cold start.
     async fn bank_restore(&self, name: &str, endpoint: &Endpoint, ctx: u32, auth: Option<&str>) {
         if !self.config.session_bank {
             return;
@@ -1672,6 +1991,25 @@ impl Supervisor {
         let file = self.bank_file(name, ctx);
         if !file.exists() {
             return;
+        }
+        // Shape check before touching the child: refuse silently-stale
+        // banks (engine swap, model re-pull, ctx/cache change).
+        if let Some(saved) = pallama_core::session_identity::read_manifest(&file) {
+            if let Some(mut cur) =
+                pallama_core::session_identity::build(&self.dirs, &self.config, name)
+            {
+                cur.ctx = ctx;
+                let diffs = pallama_core::session_identity::verify(&saved, &cur);
+                if !diffs.is_empty() {
+                    tracing::warn!(
+                        target: "pallama::bank",
+                        model = name,
+                        "bank identity mismatch — SKIPPING restore ({}); continuing cold",
+                        diffs.join("; ")
+                    );
+                    return;
+                }
+            }
         }
         let url = match endpoint {
             Endpoint::Tcp { host, port } => {
@@ -1775,6 +2113,87 @@ impl Supervisor {
         // LC1/LC4 ride the 10s reaper tick.
         self.maybe_preload().await;
         self.adaptive_slots_tick();
+        self.measured_pressure_tick();
+    }
+
+    /// Measured-pressure feedback loop (#28b): re-probe the GPU census
+    /// Live hardware view: CPU/RAM via sysinfo + a REAL `--list-devices`
+    /// census from the engine binary (llama lane; mistral.rs has no
+    /// census flag). Falls back to the manifest's install-day snapshot
+    /// when the census yields nothing (binary missing, backend init
+    /// failed). The census spawns the engine binary — callers throttle
+    /// to spawn-time and ≥60s periodic.
+    fn live_hardware(&self) -> Hardware {
+        let manifest = self.engine.capabilities();
+        let live = if self.engine.kind() == pallama_core::engine_kind::EngineKind::LlamaCpp {
+            crate::engine::manifest::run_list_devices(std::path::Path::new(&manifest.server_path))
+        } else {
+            Vec::new()
+        };
+        if live.is_empty() {
+            return crate::probe::probe_hardware(Some(manifest));
+        }
+        let gpus = live
+            .iter()
+            .map(|d| GpuInfo {
+                name: d.name.clone(),
+                description: d.description.clone(),
+                total_mib: d.total_mib,
+                free_mib: d.free_mib,
+            })
+            .collect();
+        crate::probe::hardware_with(gpus)
+    }
+
+    /// (at most once per minute — the probe spawns `--list-devices`) and
+    /// teach loudly when any card runs over 95% committed. Card-LEVEL by
+    /// design: a co-resident squatter (ollama, a desktop app) counts the
+    /// same as our own children — the number that matters is what the
+    /// NEXT spawn would see. Teach-only; spawn-time policy stays with the
+    /// card-scoped planner (A15), whose inputs the spawn-path probe
+    /// already refreshes.
+    fn measured_pressure_tick(&self) {
+        if self.instances.is_empty() || !self.hardware.has_gpu() {
+            return;
+        }
+        let due = {
+            let mut m = self.measured.lock().expect("measured lock");
+            let due = m
+                .last_probe
+                .is_none_or(|t| t.elapsed() >= Duration::from_mins(1));
+            if due {
+                m.last_probe = Some(Instant::now());
+            }
+            due
+        };
+        if !due {
+            return;
+        }
+        let now = self.live_hardware();
+        for g in &now.gpus {
+            if g.total_mib == 0 {
+                continue;
+            }
+            let used_pct = (g.total_mib.saturating_sub(g.free_mib)) * 100 / g.total_mib;
+            if used_pct <= 95 {
+                continue;
+            }
+            let mut m = self.measured.lock().expect("measured lock");
+            let stale = m
+                .warned_cards
+                .get(&g.name)
+                .is_none_or(|t| t.elapsed() >= Duration::from_mins(10));
+            if stale {
+                m.warned_cards.insert(g.name.clone(), Instant::now());
+                drop(m);
+                tracing::warn!(
+                    card = %g.name,
+                    used_pct,
+                    free_mib = g.free_mib,
+                    "measured VRAM pressure: card is over 95% committed — new spawns will spill or degrade; free co-resident engines (pallama ps / ollama stop) or kv-quantize"
+                );
+            }
+        }
     }
 
     /// LC1 predictive pre-loading: when exactly one model is resident
@@ -1848,8 +2267,7 @@ impl Supervisor {
             return;
         }
         // Fresh VRAM check: both weights must fit on the GPU pool.
-        let manifest = self.engine.capabilities();
-        let fresh = crate::probe::probe_hardware(Some(manifest));
+        let fresh = self.live_hardware();
         let free_vram: u64 = fresh.gpus.iter().map(|g| g.free_mib).sum();
         let need_mib = (a_bytes + b_bytes) / (1024 * 1024);
         if fresh.has_gpu() && free_vram > 0 && need_mib > free_vram * 95 / 100 {
@@ -2171,6 +2589,9 @@ mod routing_tests {
     struct FakeEngine(Manifest);
     #[async_trait::async_trait]
     impl Engine for FakeEngine {
+        fn kind(&self) -> pallama_core::engine_kind::EngineKind {
+            pallama_core::engine_kind::EngineKind::LlamaCpp
+        }
         fn capabilities(&self) -> &Manifest {
             &self.0
         }
@@ -2256,6 +2677,7 @@ mod routing_tests {
                 installed_at: now + 1,
                 active: true,
                 manifest: String::new(),
+                kind: pallama_core::engine_kind::EngineKind::default(),
             })
             .unwrap();
         store
@@ -2266,6 +2688,7 @@ mod routing_tests {
                 installed_at: now,
                 active: false,
                 manifest: String::new(),
+                kind: pallama_core::engine_kind::EngineKind::default(),
             })
             .unwrap();
         let sup = Supervisor::new(
@@ -2407,6 +2830,7 @@ mod routing_tests {
             },
             profile_ctx: 8,
             gpu: "cpu".into(),
+            device: None,
             kv_est_bytes: None,
             auth: None,
             child: tokio::sync::Mutex::new(ChildHandle::new(endpoint, proc)),
@@ -2799,5 +3223,174 @@ mod routing_tests {
         sup.instances.insert("m#2".into(), b);
         assert_eq!(sup.replica_key("m", None), "m#2");
         kill_all(&[pa, pb]);
+    }
+
+    // ---- LC2 discrete-first auto pick + card-scoped pressure ----------
+
+    const MIB: u64 = 1024 * 1024;
+
+    fn gpu(name: &str, desc: &str, total_mib: u64, free_mib: u64) -> pallama_core::GpuInfo {
+        pallama_core::GpuInfo {
+            name: name.to_string(),
+            description: desc.to_string(),
+            total_mib,
+            free_mib,
+        }
+    }
+
+    #[test]
+    fn unit__pick_gpu__discrete_preferred_over_higher_free_integrated() {
+        let igpu = gpu("GPU1", "Intel(R) Graphics (RPL-S)", 16_384, 10_000);
+        let dgpu = gpu("GPU0", "NVIDIA GeForce RTX 4070", 8_188, 4_000);
+        let (idx, skipped) = pick_gpu(&[igpu, dgpu]).expect("a pick exists");
+        assert_eq!(idx, 1, "discrete card wins despite less free VRAM");
+        assert!(skipped, "the higher-free integrated card was skipped");
+    }
+
+    #[test]
+    fn unit__pick_gpu__integrated_only_box_falls_back_to_overall_max() {
+        let a = gpu("a", "Intel(R) Iris Xe Graphics", 8_192, 1_000);
+        let b = gpu("b", "AMD Radeon(TM) Graphics", 8_192, 2_000);
+        let (idx, skipped) = pick_gpu(&[a, b]).expect("a pick exists");
+        assert_eq!(idx, 1, "fallback = overall max-free");
+        assert!(!skipped);
+    }
+
+    #[test]
+    fn unit__pick_gpu__empty_gpu_list_is_none() {
+        assert!(pick_gpu(&[]).is_none());
+    }
+
+    #[test]
+    fn unit__card_pressure__same_card_counts_other_card_does_not() {
+        let gpus = [
+            gpu("ig", "Intel(R) Graphics (RPL-S)", 16_384, 8_000),
+            gpu("dg", "NVIDIA GeForce RTX 4070", 8_188, 4_000),
+        ];
+        let residents = vec![(Some("dg".to_string()), 4_000 * MIB, 0, true)];
+        // 4000 resident + 3500 weights + 500 KV = 8000 MiB > 95% of 8188
+        let same = card_pressure_exceeds(Some("dg"), &gpus, &residents, 3_500 * MIB, 500 * MIB);
+        assert_eq!(same, Some(true));
+        // Same residents pinned to the OTHER card: nothing on "dg" → fits.
+        let others = vec![(Some("ig".to_string()), 4_000 * MIB, 0, true)];
+        let free = card_pressure_exceeds(Some("dg"), &gpus, &others, 3_500 * MIB, 500 * MIB);
+        assert_eq!(free, Some(false));
+    }
+
+    #[test]
+    fn unit__card_pressure__unknown_placement_counts_conservatively() {
+        let gpus = [gpu("dg", "NVIDIA GeForce RTX 4070", 8_188, 4_000)];
+        let residents = vec![(None, 4_000 * MIB, 0, true)];
+        let press = card_pressure_exceeds(Some("dg"), &gpus, &residents, 3_500 * MIB, 500 * MIB);
+        assert_eq!(press, Some(true), "unknown placement must count");
+    }
+
+    #[test]
+    fn unit__card_pressure__ninety_five_percent_boundary_is_exclusive() {
+        let gpus = [gpu("dg", "NVIDIA GeForce RTX 4070", 1_000, 1_000)];
+        // Exactly 95% of a 1000 MiB card: NOT over.
+        let at = card_pressure_exceeds(Some("dg"), &gpus, &[], 900 * MIB, 50 * MIB);
+        assert_eq!(at, Some(false));
+        // One byte over: over.
+        let over = card_pressure_exceeds(Some("dg"), &gpus, &[], 900 * MIB, 50 * MIB + 1);
+        assert_eq!(over, Some(true));
+    }
+
+    // ---- #28c auto tensor-split planning --------------------------------
+
+    fn two_discrete() -> Vec<pallama_core::GpuInfo> {
+        vec![
+            gpu("A", "NVIDIA GeForce RTX 4090", 24_000, 16_000),
+            gpu("B", "NVIDIA GeForce RTX 4070", 8_188, 4_000),
+        ]
+    }
+
+    #[test]
+    fn unit__auto_split__fires_when_over_best_but_fits_combined() {
+        // 17_000 MiB need > best card's 16_000 free, <= 20_000 combined.
+        let ratios = plan_auto_tensor_split(&two_discrete(), 16_000, 1_000);
+        assert_eq!(ratios.as_deref(), Some("4,1"), "proportional to free VRAM");
+    }
+
+    #[test]
+    fn unit__auto_split__none_when_fits_best_card() {
+        assert_eq!(plan_auto_tensor_split(&two_discrete(), 15_000, 500), None);
+    }
+
+    #[test]
+    fn unit__auto_split__none_when_beyond_combined() {
+        assert_eq!(plan_auto_tensor_split(&two_discrete(), 20_000, 1_000), None);
+    }
+
+    #[test]
+    fn unit__auto_split__needs_two_discrete_cards() {
+        let one = vec![gpu("A", "NVIDIA GeForce RTX 4090", 24_000, 16_000)];
+        assert_eq!(plan_auto_tensor_split(&one, 20_000, 1_000), None);
+        assert_eq!(plan_auto_tensor_split(&[], 20_000, 1_000), None);
+    }
+
+    #[test]
+    fn unit__auto_split__integrated_cards_never_join_the_pool() {
+        // iGPU reports huge shared-RAM free; it must not widen the pool
+        // nor appear in the ratio string.
+        let mut gpus = two_discrete();
+        gpus.push(gpu("ig", "Intel(R) Graphics (RPL-S)", 16_384, 12_000));
+        let ratios = plan_auto_tensor_split(&gpus, 16_000, 1_000);
+        assert_eq!(ratios.as_deref(), Some("4,1"), "discrete-only ratios");
+    }
+
+    #[test]
+    fn unit__auto_split__ratio_clamps_to_one_for_nearly_full_card() {
+        let gpus = vec![
+            gpu("A", "NVIDIA GeForce RTX 4090", 24_000, 16_000),
+            gpu("B", "NVIDIA GeForce RTX 4070", 8_188, 100),
+        ];
+        // need 16_050: over A's 16_000 free, within the 16_100 combined.
+        // min_free = 100 → ratios 160:1 (B clamps to ≥1).
+        let ratios = plan_auto_tensor_split(&gpus, 16_000, 50);
+        assert_eq!(ratios.as_deref(), Some("160,1"));
+    }
+
+    // ---- #28a settle report ----------------------------------------------
+
+    fn hw_of(gpus: Vec<pallama_core::GpuInfo>) -> Hardware {
+        Hardware {
+            physical_cores: 8,
+            total_ram_mib: 32_000,
+            gpus,
+        }
+    }
+
+    #[test]
+    fn unit__settle_report__picked_card_delta_and_used_pct() {
+        let pre = hw_of(vec![gpu("dg", "NVIDIA GeForce RTX 4070", 8_188, 6_000)]);
+        let post = hw_of(vec![gpu("dg", "NVIDIA GeForce RTX 4070", 8_188, 1_000)]);
+        let (card, taken, used_pct) =
+            settle_report(&pre, &post, Some("dg")).expect("card present both sides");
+        assert_eq!(card, "dg");
+        assert_eq!(taken, 5_000, "free delta = what the spawn took");
+        assert_eq!(used_pct, (8_188 - 1_000) * 100 / 8_188);
+    }
+
+    #[test]
+    fn unit__settle_report__no_pick_falls_back_to_max_free_card() {
+        let pre = hw_of(vec![
+            gpu("full", "NVIDIA A", 8_000, 7_000),
+            gpu("idle", "NVIDIA B", 8_000, 8_000),
+        ]);
+        let post = hw_of(vec![
+            gpu("full", "NVIDIA A", 8_000, 7_000),
+            gpu("idle", "NVIDIA B", 8_000, 3_000),
+        ]);
+        let (card, taken, _) = settle_report(&pre, &post, None).expect("a card exists");
+        assert_eq!(card, "idle", "max-free card of the AFTER snapshot");
+        assert_eq!(taken, 5_000);
+    }
+
+    #[test]
+    fn unit__settle_report__missing_card_is_none() {
+        let pre = hw_of(vec![gpu("dg", "NVIDIA A", 8_000, 7_000)]);
+        let post = hw_of(Vec::new());
+        assert!(settle_report(&pre, &post, Some("dg")).is_none());
     }
 }

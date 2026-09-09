@@ -20,7 +20,7 @@ pub use daemon::{process_alive_by_pid, wait_for_shutdown_signal, DaemonLock};
 pub use engine::gh::GhClient;
 pub use engine::manifest::{probe as probe_manifest, Manifest, Vendor};
 pub use engine::{system_vendor_hint, EngineManager, LOCAL_TAG};
-pub use engine_impl::{ChildHandle, Engine, LlamaCppEngine};
+pub use engine_impl::{ChildHandle, Engine, LlamaCppEngine, MistralRsEngine};
 pub use events::{EventBus, InstanceState, PallamaEvent};
 pub use hf::{parse_pull_target, registry_name, PullTarget, Puller};
 pub use models::{instance_running, remove_model};

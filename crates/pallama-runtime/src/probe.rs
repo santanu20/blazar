@@ -17,14 +17,6 @@ use crate::engine::manifest::Manifest;
 
 #[must_use]
 pub fn probe_hardware(manifest: Option<&Manifest>) -> Hardware {
-    let mut sys = sysinfo::System::new();
-    sys.refresh_cpu_usage();
-    sys.refresh_memory();
-    let physical_cores = sys
-        .physical_core_count()
-        .map_or(1, |c| u32::try_from(c).unwrap_or(1))
-        .max(1);
-    let total_ram_mib = sys.total_memory() / (1024 * 1024); // sysinfo returns bytes
     let gpus = manifest
         .map(|m| {
             m.devices
@@ -38,6 +30,21 @@ pub fn probe_hardware(manifest: Option<&Manifest>) -> Hardware {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    hardware_with(gpus)
+}
+
+/// sysinfo half + caller-supplied GPU list: the composition point for a
+/// LIVE `--list-devices` census (see `engine::manifest::run_list_devices`).
+#[must_use]
+pub fn hardware_with(gpus: Vec<GpuInfo>) -> Hardware {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_cpu_usage();
+    sys.refresh_memory();
+    let physical_cores = sys
+        .physical_core_count()
+        .map_or(1, |c| u32::try_from(c).unwrap_or(1))
+        .max(1);
+    let total_ram_mib = sys.total_memory() / (1024 * 1024); // sysinfo returns bytes
     Hardware {
         physical_cores,
         total_ram_mib,

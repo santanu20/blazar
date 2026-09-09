@@ -1696,6 +1696,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jsonschema",
+ "libc",
  "pallama-core",
  "pallama-runtime",
  "parking_lot",

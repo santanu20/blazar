@@ -1,6 +1,7 @@
 app currency
 binary
 config
+cuda toolchain
 disk
 engine
 engine binary

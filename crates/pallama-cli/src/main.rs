@@ -8,15 +8,20 @@ use anyhow::{anyhow, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use std::fmt::Write as _;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use pallama_core::engine_kind::EngineKind;
 use pallama_core::{Config, PallamaDirs, Store};
-use pallama_runtime::engine::gh::{btag_number, GhClient};
+use pallama_runtime::engine::build::{
+    detect_toolchain, nvidia_gpu_facts, path_dirs, BuildBackend, BuildOpts, Toolchain,
+};
+use pallama_runtime::engine::gh::{btag_number, same_build, GhClient};
 use pallama_runtime::engine::EngineManager;
+use pallama_runtime::engine_impl::Engine;
 use pallama_runtime::EventBus;
-use pallama_runtime::{LlamaCppEngine, Supervisor};
+use pallama_runtime::{LlamaCppEngine, MistralRsEngine, Supervisor};
 
 #[derive(Parser)]
 #[command(
@@ -32,7 +37,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run the daemon in the foreground (both APIs on one port).
+    /// Run the daemon in the foreground (`OpenAI` + `Anthropic` + ollama
+    /// APIs on one port)
     #[command(alias = "start")]
     Serve,
     /// Copy a model under a new name (zero-byte hardlink alias)
@@ -47,7 +53,7 @@ enum Cmd {
     },
     /// Push a model to a registry — refused: pallama is local-only by design
     Push { model: String },
-    /// Manage API keys (list / add / rm against the running daemon)
+    /// Manage API keys (list / add / rm / rotate against the running daemon)
     Keys {
         #[command(subcommand)]
         action: Option<KeysAction>,
@@ -128,7 +134,7 @@ enum Cmd {
     List,
     /// Show model details, active profile, last benchmark
     Show { model: String },
-    /// Live instances: state, ctx, idle countdown
+    /// Live instances: state, ctx, in-flight requests, idle countdown
     Ps {
         /// Clear crash circuit breakers
         #[arg(long)]
@@ -148,9 +154,10 @@ enum Cmd {
         #[arg(long)]
         max_tokens: Option<u64>,
     },
-    /// Benchmark a model (pp/tg table)
+    /// Benchmark a model (pp/tg table; history kept for tune gates)
     Bench { model: String },
-    /// Tune a model's launch profile (--search = measured grid argmax)
+    /// Tune a model's launch profile (--search = measured grid argmax;
+    /// live probes: --slots/--ngram/--load/--replicas/--cache-reuse)
     Tune {
         model: String,
         #[arg(long)]
@@ -201,8 +208,8 @@ enum Cmd {
     /// Co-residency plan: which local models fit in VRAM together
     /// (weights + f16 KV at each model's ctx; hot-first greedy)
     Coreside,
-    /// Transcribe an audio file (local whisper.cpp lane when installed,
-    /// else a whisper: [[remotes]] entry)
+    /// Transcribe an audio file (local whisper.cpp lane, else a whisper:
+    /// [[remotes]] entry); lane management: --install/--pull/--list/--pin
     Whisper {
         /// Audio file (wav/mp3/flac/...) — omit with --install/--pull/--list
         file: Option<PathBuf>,
@@ -231,7 +238,8 @@ enum Cmd {
         )]
         pin: Option<String>,
     },
-    /// Engine (llama-server) management
+    /// Engine management: llama.cpp releases, mistral.rs lane, source
+    /// builds (`build cuda|cpu`), rollback + update channels
     Engine {
         #[command(subcommand)]
         cmd: EngineCmd,
@@ -263,12 +271,14 @@ enum Cmd {
         dry_run: bool,
     },
     /// Slot KV-cache checkpoints: save/restore a loaded model's context
-    /// state (upstream --slot-save-path; survives unload and restart)
+    /// state (survives unload and restart; restore is identity-checked
+    /// against the engine/model/ctx shape it was saved under)
     Session {
         #[command(subcommand)]
         cmd: SessionCmd,
     },
-    /// Diagnose the local setup: config, engine, hardware, disk, models
+    /// Diagnose the local setup: config, engine, keys, remotes, whisper,
+    /// hardware, disk, models
     Doctor,
     /// Ask why a request misbehaved: sentinel detections for a trace id
     /// (or the most recent observations) with fix hints
@@ -310,6 +320,30 @@ enum EngineCmd {
     Rollback,
     /// Register a locally built llama-server (pseudo-tag "local")
     Local { path: PathBuf },
+    /// Compile llama.cpp from source into an installable engine
+    /// (Linux-CUDA prebuilts don't exist upstream; the backend is in-tree)
+    Build {
+        /// Backend to compile: cuda | cpu
+        backend: String,
+        /// Upstream b-tag to build (default: the update channel's target)
+        tag: Option<String>,
+        /// CUDA architectures override (e.g. 89, or 80;86), for
+        /// cross-builds without a local GPU
+        #[arg(long)]
+        arch: Option<String>,
+        /// CUDA host compiler override (e.g. /usr/bin/g++-12)
+        #[arg(long)]
+        cuda_host_compiler: Option<PathBuf>,
+        /// Parallel compile jobs (default: CPU count)
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Skip the decode-regression gate (tune-baseline bench compare)
+        #[arg(long)]
+        no_gate: bool,
+    },
+    /// Install + activate a mistral.rs engine (prebuilt upstream binary;
+    /// picks CPU/Metal/CUDA asset from the local GPU + driver)
+    Install { tag: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -330,8 +364,15 @@ enum LoraCmd {
 
 #[derive(Subcommand)]
 enum ConfigCmd {
+    /// Print the full effective config as TOML (one knob surface)
     List,
+    /// Print one knob's current line (`config get slots`)
     Get { key: String },
+    /// Set a knob (`config set slots 1`); the candidate is validated
+    /// against the config schema before the file is touched — a bad
+    /// value or unknown key is rejected with the file unchanged.
+    /// Model-scoped overrides live in `[model_overrides."<model>"]`
+    /// tables; edit those in the file directly.
     Set { key: String, value: String },
 }
 
@@ -369,6 +410,132 @@ fn config() -> Result<Config> {
 
 fn daemon_base(cfg: &Config) -> String {
     format!("http://{}:{}", cfg.host, cfg.port)
+}
+
+/// The serving daemon keeps the engine it booted with (supervisor holds
+/// the engine at construction) — after any engine switch, a running
+/// daemon must be restarted before it serves the new binary. Probe-only:
+/// silent when no daemon is up.
+/// Restart command lanes after an engine switch, privilege-free first:
+/// a user-scope service restarts without elevation; a system-scope one
+/// is attempted once via passwordless sudo (`sudo -n`, fails fast when a
+/// password would be needed) — never prompting mid-command.
+fn restart_lanes(os: &str, home: &str, system_unit: bool, user_unit: bool) -> Vec<Vec<String>> {
+    fn cmd(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(std::string::ToString::to_string).collect()
+    }
+    let mut lanes: Vec<Vec<String>> = Vec::new();
+    match os {
+        "linux" => {
+            if user_unit {
+                lanes.push(cmd(&["systemctl", "--user", "restart", "pallama"]));
+            }
+            if system_unit {
+                lanes.push(cmd(&["sudo", "-n", "systemctl", "restart", "pallama"]));
+            }
+        }
+        "macos" => {
+            // crate is forbid(unsafe_code): resolve the uid without libc
+            let uid = std::process::Command::new("id")
+                .arg("-u")
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            if !uid.is_empty() {
+                lanes.push(cmd(&[
+                    "launchctl",
+                    "kickstart",
+                    "-k",
+                    &format!("gui/{uid}/dev.pallama"),
+                ]));
+            }
+            if system_unit {
+                lanes.push(cmd(&[
+                    "sudo",
+                    "-n",
+                    "launchctl",
+                    "kickstart",
+                    "-k",
+                    "system/dev.pallama",
+                ]));
+            }
+        }
+        _ => {}
+    }
+    let _ = home;
+    lanes
+}
+
+/// Post-engine-switch daemon action. Knob off (default): one-line hint.
+/// Knob on (`auto_restart_engine_switch = true`) and the daemon is
+/// alive: restart it through the first working lane and wait for
+/// /healthz; when no lane works (manual daemon, locked-down system
+/// unit) fall back to the printed hint with the reason.
+async fn restart_hint() {
+    let Ok(cfg) = config() else { return };
+    let base = daemon_base(&cfg);
+    let Ok(http) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    else {
+        return;
+    };
+    let alive = match http.get(format!("{base}/healthz")).send().await {
+        Ok(r) => r.status().is_success(),
+        Err(_) => false,
+    };
+    if !alive {
+        return; // nothing serving: the next start picks the engine up
+    }
+    let hint = "a running daemon serves with the engine it booted with — \
+         restart it to pick up the switch (systemd: `systemctl restart pallama`)";
+    if !cfg.auto_restart_engine_switch {
+        println!("note: {hint}");
+        return;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let lanes = restart_lanes(
+        std::env::consts::OS,
+        &home,
+        Path::new("/etc/systemd/system/pallama.service").exists()
+            || Path::new("/Library/LaunchDaemons/dev.pallama.plist").exists(),
+        Path::new(&format!("{home}/.config/systemd/user/pallama.service")).exists(),
+    );
+    let mut last_why = "no service manager lane for this platform".to_string();
+    for lane in &lanes {
+        match tokio::process::Command::new(&lane[0])
+            .args(&lane[1..])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+        {
+            Ok(s) if s.success() => {
+                // wait for the daemon to answer /healthz again (≤30s)
+                for _ in 0..60 {
+                    if let Ok(r) = http.get(format!("{base}/healthz")).send().await {
+                        if r.status().is_success() {
+                            println!(
+                                "note: daemon restarted (auto_restart_engine_switch) — it now serves the new engine"
+                            );
+                            return;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                last_why = "restart command ran but /healthz never came back within 30s".into();
+            }
+            Ok(s) => {
+                last_why = format!("`{}` exited with {s} (needs a password?)", lane.join(" "));
+            }
+            Err(e) => {
+                last_why = format!("`{}` failed to spawn: {e}", lane.join(" "));
+            }
+        }
+    }
+    println!("note: could not auto-restart the daemon ({last_why}) — {hint}");
 }
 
 /// Auto-start (plan G): 1s probe; on refusal, detached self-exec `serve`
@@ -697,6 +864,7 @@ async fn doctor() -> Result<()> {
 
     checks.extend(doctor_engine(&d).await);
     checks.extend(doctor_whisper_currency(&d).await);
+    checks.extend(doctor_whisper_models(&d));
     checks.extend(doctor_binary_shadow());
     checks.extend(doctor_app_currency().await);
     checks.extend(doctor_port().await);
@@ -882,7 +1050,24 @@ fn doctor_exposure(d: &PallamaDirs) -> Vec<Check> {
     let Ok(cfg) = Config::load(d).map_err(|e| anyhow!("{e}")) else {
         return Vec::new(); // config row already failed loudly
     };
-    vec![exposure_verdict(&cfg.host, cfg.port, cfg.keys.len())]
+    let mut checks = vec![exposure_verdict(&cfg.host, cfg.port, cfg.keys.len())];
+    // mistral.rs children accept-and-ignore credentials: there is no
+    // child-auth lane at all. Pallama forces their bind to loopback and
+    // the gateway stays the only authenticated surface — say so loudly
+    // while one is active, so the security model is never silent.
+    if let Ok(store) = Store::open(d) {
+        if let Ok(Some(row)) = store.active_engine() {
+            if row.kind == EngineKind::MistralRs {
+                checks.push(Check::warn(
+                    "exposure",
+                    "mistral.rs engine active: the child has NO authentication and ignores \
+                     bearer keys; pallama binds it to 127.0.0.1 and the gateway remains the \
+                     only authenticated surface",
+                ));
+            }
+        }
+    }
+    checks
 }
 
 /// Pure verdict over (host, port, `n_keys`): loopback needs no auth;
@@ -1049,6 +1234,10 @@ fn service_verdict(enabled: Option<bool>, active: Option<bool>, manager: &str) -
     }
 }
 
+// Probe aggregator: store row + manifest + live --version + GPU pick in
+// one diagnostic sweep; splitting scatters one logical verdict (same
+// precedent as the other long gateway handlers).
+#[allow(clippy::too_many_lines)]
 async fn doctor_engine(d: &PallamaDirs) -> Vec<Check> {
     let mut checks = Vec::new();
     let mut active_tag: Option<String> = None;
@@ -1099,12 +1288,38 @@ async fn doctor_engine(d: &PallamaDirs) -> Vec<Check> {
         },
         Err(e) => checks.push(Check::fail("engine", format!("{e}"))),
     }
+    // The engines row carries the kind (the manifest does not — single
+    // source of truth lives in the store).
+    let active_kind = pallama_core::Store::open(d)
+        .ok()
+        .and_then(|s| s.active_engine().ok().flatten())
+        .map(|r| r.kind);
+    // CUDA opportunity + toolchain readiness (NVIDIA boxes only): a
+    // Vulkan prebuilt on an NVIDIA GPU leaves measured decode/prefill on
+    // the table. mistral.rs-active boxes skip — that lane picks its
+    // asset by driver at install time.
+    let (driver_cuda, compute_cap) = nvidia_gpu_facts().await;
+    checks.extend(cuda_opportunity_rows(
+        active_tag.as_deref(),
+        active_kind,
+        driver_cuda,
+        compute_cap,
+        &detect_toolchain(&path_dirs()),
+    ));
     // Engine currency: prefer reconciling the daemon's last upstream
     // survey against the CURRENT active engine — the marker's own
     // verdict went stale the moment `engine update`/`use`/`rollback`
     // flipped the store between daily ticks. Marker missing or >48h
     // old (daemon never surveyed / long offline): probe upstream live,
     // same 4s-capped warn-only shape as the whisper/app currency rows.
+    // The daily survey tracks llama.cpp only — a mistral.rs-active box
+    // gets its own live mistral.rs check instead.
+    if active_kind == Some(EngineKind::MistralRs) {
+        if let Some(active) = active_tag.as_deref() {
+            checks.push(live_mistralrs_currency(active).await);
+        }
+        return checks;
+    }
     let mut currency: Option<Check> = None;
     let mut marker_usable = false;
     // A marker is only trustworthy for the CURRENT channel: one written by a
@@ -1197,11 +1412,32 @@ fn marker_channel_matches(
 
 /// Direction word for update messaging: llama b-tags compare by build
 /// number (upgrade/downgrade); anything else stays neutral ("update").
+/// Semver tuple for `vX.Y.Z` tags (mistral.rs lane): numeric compare so
+/// "v0.10.0" is an upgrade over "v0.9.3" instead of lexicographic noise.
+use pallama_runtime::engine::gh::vtag_semver;
+
 fn channel_word(active: &str, target: &str) -> &'static str {
     match (btag_number(active), btag_number(target)) {
         (Some(a), Some(t)) if t > a => "upgrade",
         (Some(a), Some(t)) if t < a => "downgrade",
-        _ => "update",
+        _ => match (vtag_semver(active), vtag_semver(target)) {
+            (Some(a), Some(t)) if t > a => "upgrade",
+            (Some(a), Some(t)) if t < a => "downgrade",
+            _ => "update",
+        },
+    }
+}
+
+/// The command that updates the ACTIVE engine's lane: built engines
+/// (`bNNNN-cuda`/`bNNNN-cpu`) refresh by rebuilding the source lane —
+/// `engine update` would install the Vulkan prebuilt instead.
+fn engine_update_command(active_tag: &str) -> &'static str {
+    if active_tag.ends_with("-cuda") {
+        "pallama engine build cuda"
+    } else if active_tag.ends_with("-cpu") {
+        "pallama engine build cpu"
+    } else {
+        "pallama engine update"
     }
 }
 
@@ -1249,6 +1485,107 @@ async fn live_engine_currency(active: &str) -> Check {
     }
 }
 
+/// mistral.rs engine currency (mistral.rs engine active): live 4s-capped
+/// warn-only probe of the mistral.rs release list, mirroring the llama.cpp
+/// live lane — the daemon's daily survey does not track this repo.
+async fn live_mistralrs_currency(active: &str) -> Check {
+    let token = std::env::var("GH_TOKEN")
+        .or_else(|_| std::env::var("GITHUB_TOKEN"))
+        .ok();
+    let Ok(gh) = GhClient::new(token) else {
+        return Check::warn("engine currency", "cannot build GitHub client");
+    };
+    let fetched = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        gh.latest_mistralrs_release(),
+    )
+    .await;
+    match fetched {
+        Ok(Ok(rel)) => {
+            if rel.tag_name == active {
+                Check::ok(
+                    "engine currency",
+                    format!("up to date ({active}, mistral.rs)"),
+                )
+            } else {
+                Check::warn(
+                    "engine currency",
+                    format!(
+                        "{} available: {} (active: {}, mistral.rs) — run: pallama engine install",
+                        channel_word(active, &rel.tag_name),
+                        rel.tag_name,
+                        active
+                    ),
+                )
+            }
+        }
+        Ok(Err(e)) => Check::warn(
+            "engine currency",
+            format!("check failed ({e:#}) — offline? set GH_TOKEN if rate limited"),
+        ),
+        Err(_) => Check::warn("engine currency", "GitHub check timed out after 4s"),
+    }
+}
+
+/// CUDA-opportunity + toolchain-readiness rows for doctor. Pure: GPU
+/// facts and toolchain are passed in (the nvidia-smi probe is the
+/// caller's job), so the decision matrix is unit-testable.
+fn cuda_opportunity_rows(
+    active_tag: Option<&str>,
+    active_kind: Option<EngineKind>,
+    driver_cuda: Option<(u32, u32)>,
+    compute_cap: Option<(u32, u32)>,
+    tc: &Toolchain,
+) -> Vec<Check> {
+    let Some((dmaj, dmin)) = driver_cuda else {
+        return Vec::new(); // no NVIDIA driver: nothing to suggest
+    };
+    let mut rows = Vec::new();
+    // Backend nudge: llamacpp engine that is not the CUDA build (a
+    // `-cuda` tag already IS the fast lane; mistral.rs picked its
+    // asset by driver at install time).
+    if active_kind != Some(EngineKind::MistralRs)
+        && active_tag.is_some_and(|t| !t.ends_with("-cuda"))
+    {
+        let cc = compute_cap.map_or_else(String::new, |(a, b)| format!(", sm {a}{b}"));
+        rows.push(Check::ok(
+            "engine backend",
+            format!(
+                "NVIDIA GPU (driver CUDA {dmaj}.{dmin}{cc}) — a CUDA engine is faster: \
+                 `pallama engine build cuda` (compiles upstream) or \
+                 `pallama engine install` (mistral.rs prebuilt)"
+            ),
+        ));
+    }
+    // Toolchain readiness for the source-build lane.
+    let missing: Vec<&str> = [
+        ("git", tc.git.is_none()),
+        ("cmake", tc.cmake.is_none()),
+        ("nvcc", tc.nvcc.is_none()),
+    ]
+    .iter()
+    .filter(|(_, m)| *m)
+    .map(|(n, _)| *n)
+    .collect();
+    if missing.is_empty() {
+        rows.push(Check::ok(
+            "cuda toolchain",
+            "ready (git, cmake, nvcc) — `pallama engine build cuda` can run now",
+        ));
+    } else {
+        rows.push(Check::warn(
+            "cuda toolchain",
+            format!(
+                "missing {} — install the distro git/cmake packages + the CUDA toolkit \
+                 (https://developer.nvidia.com/cuda-downloads); prebuilt alternative: \
+                 `pallama engine install`",
+                missing.join(", ")
+            ),
+        ));
+    }
+    rows
+}
+
 /// Doctor engine-currency verdict. The marker's `latest`/`checked_at` are
 /// durable (the last upstream survey); its `active`/`update_available` are
 /// write-time derivations that go stale the instant an engine switch lands
@@ -1272,7 +1609,7 @@ fn currency_verdict(
     // The marker's `channel` is what `latest` was resolved against at
     // write time (old markers predate the knob: default latest).
     let channel = marker["channel"].as_str().unwrap_or("latest");
-    if active != latest {
+    if !same_build(active, latest) {
         Some(Check::warn(
             "engine currency",
             format!(
@@ -1344,7 +1681,14 @@ async fn doctor_app_currency() -> Vec<Check> {
 /// --install` stays a human action.
 async fn doctor_whisper_currency(d: &PallamaDirs) -> Vec<Check> {
     let Some((_, tag_dir)) = pallama_runtime::whisper::server_bin(d) else {
-        return Vec::new();
+        // Optional lane absent: say so instead of silently omitting the
+        // row — doctor is where users discover the lane exists (observed
+        // live: all-green doctor while transcription had no backend).
+        return vec![Check::warn(
+            "whisper lane",
+            "not installed — optional: `pallama whisper --install` enables \
+             local /v1/audio/transcriptions",
+        )];
     };
     let installed = tag_dir
         .file_name()
@@ -1365,39 +1709,7 @@ async fn doctor_whisper_currency(d: &PallamaDirs) -> Vec<Check> {
     )
     .await;
     match fetched {
-        Ok(Ok(rel)) => vec![match pallama_runtime::whisper::pinned_tag(d) {
-            // Deliberate pin: name it, and point updates at the
-            // pin-preserving command — plain --install silently unpins.
-            Some(pin) if pin == rel.tag_name => {
-                Check::ok("whisper currency", format!("pinned to {pin} (up to date)"))
-            }
-            Some(pin) => {
-                let ahead = matches!(
-                    (ver_triple(&pin), ver_triple(&rel.tag_name)),
-                    (Some(a), Some(b)) if a > b
-                );
-                if ahead {
-                    Check::ok(
-                        "whisper currency",
-                        format!("pinned to {pin} (ahead of latest release {})", rel.tag_name),
-                    )
-                } else {
-                    Check::warn(
-                        "whisper currency",
-                        format!(
-                            "update available: {} (pinned: {pin}) — run: pallama whisper --install --tag {}",
-                            rel.tag_name, rel.tag_name
-                        ),
-                    )
-                }
-            }
-            None => version_currency_verdict(
-                "whisper currency",
-                &installed,
-                &rel.tag_name,
-                "pallama whisper --install",
-            ),
-        }],
+        Ok(Ok(rel)) => vec![whisper_pin_verdict(d, &installed, &rel.tag_name)],
         Ok(Err(e)) => vec![Check::warn(
             "whisper currency",
             format!("check failed ({e:#}) — offline? set GH_TOKEN if rate limited"),
@@ -1406,6 +1718,62 @@ async fn doctor_whisper_currency(d: &PallamaDirs) -> Vec<Check> {
             "whisper currency",
             "GitHub check timed out after 4s",
         )],
+    }
+}
+
+/// Pinned-whisper currency verdict (pure): deliberate pin named as such —
+/// plain --install silently unpins, so updates point at the
+/// pin-preserving --tag form.
+fn whisper_pin_verdict(d: &PallamaDirs, installed: &str, latest: &str) -> Check {
+    match pallama_runtime::whisper::pinned_tag(d) {
+        Some(pin) if pin == latest => {
+            Check::ok("whisper currency", format!("pinned to {pin} (up to date)"))
+        }
+        Some(pin) => {
+            let ahead =
+                matches!((ver_triple(&pin), ver_triple(latest)), (Some(a), Some(b)) if a > b);
+            if ahead {
+                Check::ok(
+                    "whisper currency",
+                    format!("pinned to {pin} (ahead of latest release {latest})"),
+                )
+            } else {
+                Check::warn(
+                    "whisper currency",
+                    format!(
+                        "update available: {latest} (pinned: {pin}) — run: \
+                         pallama whisper --install --tag {latest}"
+                    ),
+                )
+            }
+        }
+        None => version_currency_verdict(
+            "whisper currency",
+            installed,
+            latest,
+            "pallama whisper --install",
+        ),
+    }
+}
+
+/// Local whisper models health: the server binary alone transcribes
+/// nothing — without a pulled ggml model every request 501s (observed
+/// live in validation: installed server + zero models = broken lane).
+fn doctor_whisper_models(d: &PallamaDirs) -> Vec<Check> {
+    if pallama_runtime::whisper::server_bin(d).is_none() {
+        return Vec::new(); // covered by the "whisper lane" row above
+    }
+    let pulled = pallama_runtime::whisper::list_models(d);
+    if pulled.is_empty() {
+        vec![Check::warn(
+            "whisper models",
+            "none pulled — transcription will 501 until `pallama whisper --pull base`",
+        )]
+    } else {
+        vec![Check::ok(
+            "whisper models",
+            format!("pulled: {}", pulled.join(", ")),
+        )]
     }
 }
 
@@ -1736,7 +2104,21 @@ async fn serve() -> Result<()> {
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    let engine = Arc::new(LlamaCppEngine::with_env(manifest, engine_env));
+    // Engine fork: the active row's kind picks the adapter. Restart is
+    // required to switch kinds (the supervisor holds the engine for its
+    // lifetime) — the restart hint covers that.
+    let engine: Arc<dyn Engine> = match engine_row.kind {
+        pallama_core::engine_kind::EngineKind::MistralRs => {
+            Arc::new(MistralRsEngine::with_staging(
+                manifest,
+                engine_env,
+                Some(d.run_dir().join("mistralrs-staging")),
+            ))
+        }
+        pallama_core::engine_kind::EngineKind::LlamaCpp => {
+            Arc::new(LlamaCppEngine::with_env(manifest, engine_env))
+        }
+    };
     let bus = EventBus::default();
     let sup = Arc::new(Supervisor::new(
         d.clone(),
@@ -3853,86 +4235,15 @@ fn engine_regression_gate(
 async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
     let d = dirs();
     match cmd {
-        EngineCmd::Update { tag, no_gate } => {
-            let token = std::env::var("GH_TOKEN").ok();
-            let gh = GhClient::new(token)?;
-            let cfg = config()?;
-            // Explicit --tag bypasses the configured channel (power-user
-            // override); otherwise the channel resolves the target. The
-            // resolved release is passed through to the manager so the
-            // whole flow is a single upstream fetch.
-            let from_channel = tag.is_none();
-            let resolved = match &tag {
-                Some(_) => None,
-                None => Some(gh.channel_b_release(cfg.update_channel).await?),
-            };
-            let target_tag = match (&tag, &resolved) {
-                (Some(t), _) => t.clone(),
-                (None, Some(rel)) => rel.tag_name.clone(),
-                (None, None) => unreachable!("channel lane always resolves"),
-            };
-            // Channels are pins, not floors: switching latest -> stable
-            // re-targets downward by design. The F7 gate compares perf
-            // and would trip on any intentional downgrade, so it is
-            // skipped when the target is older than the active engine.
-            let active_tag = Store::open(&d)?.active_engine()?.map(|e| e.tag);
-            let downgrade = match &active_tag {
-                Some(a) => matches!(
-                    (btag_number(a), btag_number(&target_tag)),
-                    (Some(x), Some(y)) if y < x
-                ),
-                None => false,
-            };
-            let mgr = EngineManager {
-                dirs: d.clone(),
-                gh,
-                bus: EventBus::default(),
-                asset_override: cfg.engine_asset,
-            };
-            let row = match resolved {
-                Some(rel) => mgr.update_resolved(rel).await?,
-                None => mgr.update(tag.as_deref(), cfg.update_channel).await?,
-            };
-            // F7 gate (FIX5): DEFAULT-config tg128 on BOTH engines —
-            // comparing new-default vs baseline-argmax was apples-to-
-            // oranges, biased to trip. Baseline = most recent tune row.
-            // Skip: --no-gate, PALLAMA_ENGINE_GATE=0, or channel
-            // downgrade (an older build losing to a newer one is the
-            // point of the switch, not a regression).
-            let gate_on = !no_gate
-                && std::env::var("PALLAMA_ENGINE_GATE").as_deref() != Ok("0")
-                && !downgrade;
-            if gate_on {
-                engine_regression_gate(&mgr, &d, &row)?;
-            } else if downgrade {
-                println!("channel switch: downgrade to {target_tag} — regression gate skipped");
-                if let Some(prev) = &active_tag {
-                    println!(
-                        "previous {prev} stays installed — `pallama engine use {prev}` restores it"
-                    );
-                }
-            } else {
-                println!("engine {} installed; regression gate skipped", row.tag);
-            }
-            let m: pallama_runtime::Manifest = serde_json::from_str(&row.manifest)?;
-            if from_channel {
-                println!("update channel: {}", cfg.update_channel);
-            }
-            println!(
-                "engine {} active (build {}, {} devices, {} flags)",
-                row.tag,
-                m.build_number,
-                m.devices.len(),
-                m.flags.len()
-            );
-        }
+        EngineCmd::Update { tag, no_gate } => engine_update(&d, tag, no_gate).await?,
         EngineCmd::List => {
             upstream_update_hint(&d).await;
             let store = Store::open(&d)?;
             for e in store.list_engines()? {
                 println!(
-                    "{:<12} {:<10} {} {}",
+                    "{:<12} {:<9} {:<10} {} {}",
                     e.tag,
+                    e.kind.as_str(),
                     e.asset,
                     if e.active { "[active]" } else { "" },
                     e.sha256.chars().take(12).collect::<String>()
@@ -3943,11 +4254,34 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             let mgr = local_engine_manager(&d)?;
             let row = mgr.use_tag(&tag)?;
             println!("active engine: {}", row.tag);
+            restart_hint().await;
         }
         EngineCmd::Rollback => {
             let mgr = local_engine_manager(&d)?;
             let row = mgr.rollback()?;
             println!("rolled back to: {}", row.tag);
+            restart_hint().await;
+        }
+        EngineCmd::Build {
+            backend,
+            tag,
+            arch,
+            cuda_host_compiler,
+            jobs,
+            no_gate,
+        } => {
+            engine_build(
+                &d,
+                BackendArg {
+                    backend,
+                    tag,
+                    arch,
+                    cuda_host_compiler,
+                    jobs,
+                    no_gate,
+                },
+            )
+            .await?;
         }
         EngineCmd::Local { path } => {
             let mgr = local_engine_manager(&d)?;
@@ -3961,7 +4295,192 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 m.flags.len()
             );
         }
+        EngineCmd::Install { tag } => engine_install_mistralrs(&d, tag).await?,
     }
+    Ok(())
+}
+
+/// `pallama engine install` — install + activate a prebuilt mistral.rs
+/// engine. Asset choice is GPU-aware (CPU / Metal / CUDA-by-driver). The
+/// F7 decode-regression gate is llama-server-only: skipped, and SAID so
+/// (never silently) — llama-bench cannot drive a mistral.rs child.
+async fn engine_install_mistralrs(d: &PallamaDirs, tag: Option<String>) -> Result<()> {
+    let mgr = local_engine_manager(d)?;
+    let wanted = tag.clone().unwrap_or_else(|| "latest".to_string());
+    println!("installing mistral.rs {wanted} (prebuilt upstream binary)");
+    let row = mgr.update_mistralrs(tag.as_deref()).await?;
+    let m: pallama_runtime::Manifest = serde_json::from_str(&row.manifest)?;
+    println!(
+        "engine {} active ({} flags probed, build {})",
+        row.tag,
+        m.flags.len(),
+        m.build_number
+    );
+    println!("note: decode-regression gate is llama-server-only — skipped for mistral.rs engines");
+    restart_hint().await;
+    Ok(())
+}
+
+/// `pallama engine update` — install + activate the newest (or given)
+/// upstream build, gated by the F7 decode-regression bench.
+async fn engine_update(d: &PallamaDirs, tag: Option<String>, no_gate: bool) -> Result<()> {
+    let token = std::env::var("GH_TOKEN").ok();
+    let gh = GhClient::new(token)?;
+    let cfg = config()?;
+    // Explicit --tag bypasses the configured channel (power-user
+    // override); otherwise the channel resolves the target. The
+    // resolved release is passed through to the manager so the
+    // whole flow is a single upstream fetch.
+    let from_channel = tag.is_none();
+    let resolved = match &tag {
+        Some(_) => None,
+        None => Some(gh.channel_b_release(cfg.update_channel).await?),
+    };
+    let target_tag = match (&tag, &resolved) {
+        (Some(t), _) => t.clone(),
+        (None, Some(rel)) => rel.tag_name.clone(),
+        (None, None) => unreachable!("channel lane always resolves"),
+    };
+    // Channels are pins, not floors: switching latest -> stable
+    // re-targets downward by design. The F7 gate compares perf
+    // and would trip on any intentional downgrade, so it is
+    // skipped when the target is older than the active engine.
+    let active_tag = Store::open(d)?.active_engine()?.map(|e| e.tag);
+    let downgrade = match &active_tag {
+        Some(a) => matches!(
+            (btag_number(a), btag_number(&target_tag)),
+            (Some(x), Some(y)) if y < x
+        ),
+        None => false,
+    };
+    let mgr = EngineManager {
+        dirs: d.clone(),
+        gh,
+        bus: EventBus::default(),
+        asset_override: cfg.engine_asset,
+    };
+    let row = match resolved {
+        Some(rel) => mgr.update_resolved(rel).await?,
+        None => mgr.update(tag.as_deref(), cfg.update_channel).await?,
+    };
+    // F7 gate (FIX5): DEFAULT-config tg128 on BOTH engines —
+    // comparing new-default vs baseline-argmax was apples-to-
+    // oranges, biased to trip. Baseline = most recent tune row.
+    // Skip: --no-gate, PALLAMA_ENGINE_GATE=0, or channel
+    // downgrade (an older build losing to a newer one is the
+    // point of the switch, not a regression).
+    let gate_on =
+        !no_gate && std::env::var("PALLAMA_ENGINE_GATE").as_deref() != Ok("0") && !downgrade;
+    if gate_on {
+        engine_regression_gate(&mgr, d, &row)?;
+    } else if downgrade {
+        println!("channel switch: downgrade to {target_tag} — regression gate skipped");
+        if let Some(prev) = &active_tag {
+            println!("previous {prev} stays installed — `pallama engine use {prev}` restores it");
+        }
+    } else {
+        println!("engine {} installed; regression gate skipped", row.tag);
+    }
+    let m: pallama_runtime::Manifest = serde_json::from_str(&row.manifest)?;
+    if from_channel {
+        println!("update channel: {}", cfg.update_channel);
+    }
+    println!(
+        "engine {} active (build {}, {} devices, {} flags)",
+        row.tag,
+        m.build_number,
+        m.devices.len(),
+        m.flags.len()
+    );
+    restart_hint().await;
+    Ok(())
+}
+
+/// `pallama engine build` — compile llama.cpp from source into an
+/// installable engine (see `engine::build`), then the same F7 gate and
+/// summary as `engine update`.
+struct BackendArg {
+    backend: String,
+    tag: Option<String>,
+    arch: Option<String>,
+    cuda_host_compiler: Option<PathBuf>,
+    jobs: Option<usize>,
+    no_gate: bool,
+}
+
+async fn engine_build(d: &PallamaDirs, a: BackendArg) -> Result<()> {
+    let backend = match a.backend.as_str() {
+        "cuda" => BuildBackend::Cuda,
+        "cpu" => BuildBackend::Cpu,
+        other => return Err(anyhow!("unknown backend {other:?} — supported: cuda, cpu")),
+    };
+    // Resolve the source tag exactly like Update: explicit tag, else the
+    // channel target. Must land on a concrete b-tag.
+    let token = std::env::var("GH_TOKEN").ok();
+    let gh = GhClient::new(token)?;
+    let cfg = config()?;
+    let resolved = match &a.tag {
+        Some(t) => gh.resolve_tag(t).await?.tag_name,
+        None => gh.channel_b_release(cfg.update_channel).await?.tag_name,
+    };
+    if btag_number(&resolved).is_none() {
+        return Err(anyhow!(
+            "engine build needs a b-tag; channel resolved {resolved:?}"
+        ));
+    }
+    println!(
+        "building llama.cpp {resolved} (backend {}, from source — this needs \
+         git + cmake + a C++ compiler{cuda_note})",
+        backend.as_str(),
+        cuda_note = if backend == BuildBackend::Cuda {
+            " + the CUDA toolkit (nvcc)"
+        } else {
+            ""
+        }
+    );
+    let mut opts = BuildOpts::new(backend, &resolved);
+    opts.arch = a.arch;
+    opts.cuda_host_compiler = a.cuda_host_compiler;
+    if let Some(j) = a.jobs {
+        opts.jobs = j;
+    }
+    let mgr = EngineManager {
+        dirs: d.clone(),
+        gh,
+        bus: EventBus::default(),
+        asset_override: cfg.engine_asset,
+    };
+    let row = mgr
+        .build_and_install(&opts, &mut |line| println!("  {line}"))
+        .await?;
+    // Same F7 gate as Update: skip on --no-gate, env knob, or an
+    // intentionally older build than the active engine.
+    let active_tag = Store::open(d)?.active_engine()?.map(|e| e.tag);
+    let downgrade = match &active_tag {
+        Some(act) => matches!(
+            (btag_number(act), btag_number(&resolved)),
+            (Some(x), Some(y)) if y < x
+        ),
+        None => false,
+    };
+    let gate_on =
+        !a.no_gate && std::env::var("PALLAMA_ENGINE_GATE").as_deref() != Ok("0") && !downgrade;
+    if gate_on {
+        engine_regression_gate(&mgr, d, &row)?;
+    } else if downgrade {
+        println!("older build {resolved}: regression gate skipped");
+    } else {
+        println!("engine {} installed; regression gate skipped", row.tag);
+    }
+    let m: pallama_runtime::Manifest = serde_json::from_str(&row.manifest)?;
+    println!(
+        "engine {} active (build {}, {} devices, {} flags)",
+        row.tag,
+        m.build_number,
+        m.devices.len(),
+        m.flags.len()
+    );
+    restart_hint().await;
     Ok(())
 }
 
@@ -3984,18 +4503,19 @@ async fn upstream_update_hint(dirs: &PallamaDirs) {
     )
     .await;
     if let Ok(Ok(rel)) = latest {
-        if rel.tag_name == active.tag {
+        if same_build(&active.tag, &rel.tag_name) {
             println!(
                 "engine up to date: {} (channel: {})",
                 active.tag, cfg.update_channel
             );
         } else {
             println!(
-                "{} available: {} (active: {}, channel: {}) — run: pallama engine update",
+                "{} available: {} (active: {}, channel: {}) — run: {}",
                 channel_word(&active.tag, &rel.tag_name),
                 rel.tag_name,
                 active.tag,
-                cfg.update_channel
+                cfg.update_channel,
+                engine_update_command(&active.tag)
             );
         }
     }
@@ -4033,6 +4553,13 @@ fn spawn_engine_check_task(
                 delay = full_delay;
                 continue; // local build: currency is the user's concern
             }
+            if active.kind == EngineKind::MistralRs {
+                delay = full_delay;
+                continue; // the llamacpp channel survey is meaningless
+                          // against a mistral.rs tag (it would nag
+                          // "update available: bNNNN" cross-kind);
+                          // mistral.rs currency lives in `pallama doctor`
+            }
             let Ok(cfg) = Config::load(&dirs) else {
                 delay = retry_delay;
                 continue;
@@ -4064,7 +4591,7 @@ fn spawn_engine_check_task(
                 delay = retry_delay;
                 continue;
             };
-            let newer = rel.tag_name != active.tag;
+            let newer = !same_build(&active.tag, &rel.tag_name);
             if newer {
                 tracing::info!(
                     target: "pallama::engine",
@@ -4292,6 +4819,15 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
         }
         ConfigCmd::Set { key, value } => {
             let path = dirs().config_file();
+            // Fresh-box bootstrap: `config set` may be the first command
+            // ever run — ensure the dirs exist and a config file is
+            // present (Config::load writes a fresh default), instead of
+            // crashing with a raw ENOENT on read below.
+            let d = dirs();
+            d.ensure().ok();
+            if !path.exists() {
+                Config::load(&d).map_err(|e| anyhow!("{e}"))?;
+            }
             let raw = std::fs::read_to_string(&path)?;
             // Values that are not already TOML scalars (numbers, bools,
             // quoted strings, arrays) are written as double-quoted strings:
@@ -4758,13 +5294,135 @@ mod tests {
     }
 
     #[test]
+    fn unit__engine_update_command__lane_aware() {
+        assert_eq!(
+            engine_update_command("b10809-cuda"),
+            "pallama engine build cuda"
+        );
+        assert_eq!(
+            engine_update_command("b4242-cpu"),
+            "pallama engine build cpu"
+        );
+        assert_eq!(engine_update_command("b10809"), "pallama engine update");
+        assert_eq!(engine_update_command("local"), "pallama engine update");
+    }
+
+    #[test]
+    fn unit__restart_lanes__privilege_free_before_sudo() {
+        // linux: user unit restarts without elevation and must come
+        // BEFORE the passwordless-sudo system lane; neither unit ->
+        // no lane (manual daemons get the printed hint).
+        let both = restart_lanes("linux", "/home/u", true, true);
+        assert_eq!(both[0][0..4], ["systemctl", "--user", "restart", "pallama"]);
+        assert_eq!(both[1][0..2], ["sudo", "-n"]);
+        assert!(restart_lanes("linux", "/home/u", false, false).is_empty());
+        let sys_only = restart_lanes("linux", "/home/u", true, false);
+        assert_eq!(sys_only.len(), 1);
+        assert_eq!(sys_only[0][0], "sudo");
+        // macos: launch agent lane is uid-scoped; system daemon via sudo -n
+        let mac = restart_lanes("macos", "/Users/u", true, false);
+        assert_eq!(mac.len(), 2);
+        assert!(mac[0][1] == "kickstart" && mac[0][2] == "-k");
+        assert!(mac[1][0] == "sudo");
+        // unknown platform: nothing to drive
+        assert!(restart_lanes("windows", "C:/u", true, true).is_empty());
+    }
+
+    #[test]
+    fn unit__vtag_semver__parses_or_none() {
+        assert_eq!(vtag_semver("v0.9.3"), Some((0, 9, 3)));
+        assert_eq!(vtag_semver("v0.10.0"), Some((0, 10, 0)));
+        assert_eq!(vtag_semver("v1.8"), Some((1, 8, 0)));
+        assert_eq!(vtag_semver("v2.0.0-rc.1"), Some((2, 0, 0)));
+        assert_eq!(vtag_semver("b10857"), None);
+        assert_eq!(vtag_semver("vx.y.z"), None);
+    }
+
+    #[test]
+    fn unit__cuda_opportunity_rows__nudge_only_for_non_cuda_llamacpp() {
+        let full = Toolchain {
+            git: Some(std::path::PathBuf::from("/usr/bin/git")),
+            cmake: Some(std::path::PathBuf::from("/usr/bin/cmake")),
+            cxx: Some(std::path::PathBuf::from("/usr/bin/g++")),
+            nvcc: Some(std::path::PathBuf::from("/usr/bin/nvcc")),
+            nvidia_smi: Some(std::path::PathBuf::from("/usr/bin/nvidia-smi")),
+        };
+        // NVIDIA + Vulkan-prebuilt active: nudge + ready toolchain.
+        let rows = cuda_opportunity_rows(
+            Some("b10809"),
+            Some(EngineKind::LlamaCpp),
+            Some((13, 0)),
+            Some((8, 9)),
+            &full,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "engine backend");
+        assert!(rows[0].detail.contains("driver CUDA 13.0, sm 89"));
+        assert!(rows[0].detail.contains("pallama engine build cuda"));
+        assert!(rows[0].detail.contains("pallama engine install"));
+        assert_eq!(rows[1].name, "cuda toolchain");
+        assert!(rows[1].detail.contains("ready"));
+        // Already on the CUDA build: no nudge, toolchain row stays.
+        let rows = cuda_opportunity_rows(
+            Some("b10809-cuda"),
+            Some(EngineKind::LlamaCpp),
+            Some((13, 0)),
+            Some((8, 9)),
+            &full,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "cuda toolchain");
+        // mistral.rs active: asset was driver-picked at install, no nudge.
+        let rows = cuda_opportunity_rows(
+            Some("v0.9.3"),
+            Some(EngineKind::MistralRs),
+            Some((13, 0)),
+            Some((8, 9)),
+            &full,
+        );
+        assert_eq!(rows.len(), 1);
+        // No NVIDIA driver: nothing at all.
+        assert!(cuda_opportunity_rows(
+            Some("b10809"),
+            Some(EngineKind::LlamaCpp),
+            None,
+            None,
+            &full
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn unit__cuda_opportunity_rows__missing_toolchain_names_bins() {
+        let empty = Toolchain::default();
+        let rows = cuda_opportunity_rows(
+            Some("b10809"),
+            Some(EngineKind::LlamaCpp),
+            Some((13, 0)),
+            None,
+            &empty,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].name, "cuda toolchain");
+        // Missing compute cap must not garble the nudge line.
+        assert!(rows[0].detail.contains("driver CUDA 13.0)"));
+        assert!(rows[1].detail.contains("git, cmake, nvcc"));
+        assert!(rows[1].detail.contains("pallama engine install"));
+    }
+
+    #[test]
     fn unit__channel_word__btag_direction() {
         assert_eq!(channel_word("b10857", "b10865"), "upgrade");
         assert_eq!(channel_word("b10857", "b10780"), "downgrade");
         assert_eq!(channel_word("b10857", "b10857"), "update");
-        // Non-b tags have no ordering: neutral word.
-        assert_eq!(channel_word("v1.8.0", "v1.9.0"), "update");
+        // v-tags compare numerically per component: the lexicographic bug
+        // ("0.10.0" < "0.9.3") is what this pins.
+        assert_eq!(channel_word("v0.9.3", "v0.10.0"), "upgrade");
+        assert_eq!(channel_word("v1.9.0", "v1.8.0"), "downgrade");
+        assert_eq!(channel_word("v1.8.0", "v1.8.0"), "update");
+        // Mixed shapes have no ordering: neutral word.
         assert_eq!(channel_word("b10857", "v1.36.0"), "update");
+        assert_eq!(channel_word("v1.8.0", "b10865"), "update");
     }
 
     #[test]

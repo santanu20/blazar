@@ -503,6 +503,7 @@ async fn e2e__keys_scoped_rate_and_accounting() {
         tpm: 0,
         daily_tokens: 0,
         max_concurrent: 0,
+        weight: 1,
     };
     let cfg = Config {
         keys: vec![
@@ -1014,7 +1015,7 @@ async fn e2e__audio_transcriptions_no_backend_teaching_501() {
     let r: serde_json::Value = resp.json().await.unwrap();
     let msg = r["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        msg.contains("pallama whisper install"),
+        msg.contains("pallama whisper --install"),
         "teaching error should name the fix: {r}"
     );
     ts.state.sup.shutdown_all().await.unwrap();

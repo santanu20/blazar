@@ -557,6 +557,81 @@ struct PersistState {
     written: u64,
 }
 
+/// D6: bounded LRU caching verdicts of the pure request-side lints —
+/// the same schema/grammar bytes always produce the same verdict, and
+/// `jsonschema::validator_for` (the expensive part) should run once per
+/// distinct schema, not once per request. No TTL: the inputs are pure.
+struct VerdictCache {
+    order: VecDeque<u64>,
+    map: HashMap<u64, Option<String>>,
+    hits: u64,
+    misses: u64,
+}
+
+const VERDICT_CAP: usize = 512;
+
+impl Default for VerdictCache {
+    fn default() -> Self {
+        Self {
+            order: VecDeque::with_capacity(VERDICT_CAP),
+            map: HashMap::with_capacity(VERDICT_CAP),
+            hits: 0,
+            misses: 0,
+        }
+    }
+}
+
+impl VerdictCache {
+    fn get(&mut self, k: u64) -> Option<&Option<String>> {
+        if self.map.contains_key(&k) {
+            if let Some(pos) = self.order.iter().position(|&x| x == k) {
+                self.order.remove(pos);
+                self.order.push_back(k);
+            }
+            self.hits += 1;
+            self.map.get(&k)
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+
+    fn put(&mut self, k: u64, v: Option<String>) {
+        if self.map.len() >= VERDICT_CAP && !self.map.contains_key(&k) {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+        if !self.map.contains_key(&k) {
+            self.order.push_back(k);
+        }
+        self.map.insert(k, v);
+    }
+}
+
+/// FNV-1a over the compact serialization of exactly the fields a lint
+/// reads — two bodies identical in those fields share a verdict.
+fn verdict_key(tag: u64, fields: &[&str], body: &Value) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ tag;
+    for f in fields {
+        for b in f.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let v = body.get(*f).unwrap_or(&Value::Null);
+        match serde_json::to_vec(v) {
+            Ok(bytes) => {
+                for b in bytes {
+                    h ^= u64::from(b);
+                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+            Err(_) => h ^= 0xdead_beef, // non-serializable = unique
+        }
+    }
+    h
+}
+
 /// The observation layer: ring + bounded caches + per-request analyzers.
 pub struct Sentinel {
     enabled: bool,
@@ -564,6 +639,8 @@ pub struct Sentinel {
     ring: Mutex<VecDeque<SentinelRecord>>,
     schemas: Mutex<HashMap<String, Option<Arc<jsonschema::Validator>>>>,
     templates: Mutex<HashMap<String, TemplateSupport>>,
+    /// D6: lint verdicts (see [`VerdictCache`]).
+    verdicts: Mutex<VerdictCache>,
     /// Bounded JSONL at `<run_dir>/sentinel.jsonl`; `None` = memory-only
     /// (no run dir, or open failed — IO problems never take the daemon).
     persist: Option<Mutex<PersistState>>,
@@ -628,6 +705,7 @@ impl Sentinel {
             ring: Mutex::new(ring),
             schemas: Mutex::new(HashMap::new()),
             templates: Mutex::new(HashMap::new()),
+            verdicts: Mutex::new(VerdictCache::default()),
             persist,
             persist_path,
             watch_tx,
@@ -638,6 +716,40 @@ impl Sentinel {
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// D6: cached structured-output lint — identical
+    /// (`grammar`, `format`, `response_format`) triples hit the verdict LRU.
+    #[must_use]
+    pub fn structured_output_error_cached(&self, body: &Value) -> Option<String> {
+        let key = verdict_key(1, &["grammar", "format", "response_format"], body);
+        if let Some(hit) = self.verdicts.lock().get(key) {
+            return hit.clone();
+        }
+        let verdict = structured_output_error(body);
+        self.verdicts.lock().put(key, verdict.clone());
+        verdict
+    }
+
+    /// D6: cached strict-tool-def lint — identical `tools` arrays hit
+    /// the verdict LRU (the `jsonschema::validator_for` compile runs
+    /// once per distinct schema).
+    #[must_use]
+    pub fn strict_tool_def_error_cached(&self, body: &Value) -> Option<String> {
+        let key = verdict_key(2, &["tools"], body);
+        if let Some(hit) = self.verdicts.lock().get(key) {
+            return hit.clone();
+        }
+        let verdict = strict_tool_def_error(body);
+        self.verdicts.lock().put(key, verdict.clone());
+        verdict
+    }
+
+    /// D6 counters for `/metrics` and tests: (hits, misses).
+    #[must_use]
+    pub fn verdict_stats(&self) -> (u64, u64) {
+        let v = self.verdicts.lock();
+        (v.hits, v.misses)
     }
 
     /// Begin observing a request: spawns the analyzer and returns the
@@ -1539,6 +1651,67 @@ mod tests {
         assert!(rec.to_json()["detections"][0]["retry"]
             .as_str()
             .is_some_and(|s| !s.is_empty()));
+    }
+
+    #[test]
+    fn unit__verdict_cache__hits_misses_and_purity() {
+        let s = Sentinel::new(false, 30, None);
+        let body = serde_json::json!({
+            "model": "m",
+            "format": "jsom" // typo'd format -> verdict Some(..)
+        });
+        let v1 = s.structured_output_error_cached(&body);
+        assert!(v1.is_some(), "typo format must lint");
+        // Same read-fields -> cache hit, identical verdict; unrelated
+        // field differences (model) must NOT miss.
+        let body2 = serde_json::json!({
+            "model": "other",
+            "stream": true,
+            "format": "jsom"
+        });
+        let v2 = s.structured_output_error_cached(&body2);
+        assert_eq!(v1, v2);
+        let (hits, misses) = s.verdict_stats();
+        assert_eq!((hits, misses), (1, 1), "second call hits the LRU");
+        // Different format value -> miss -> clean verdict.
+        let clean = serde_json::json!({"format": "json"});
+        assert!(s.structured_output_error_cached(&clean).is_none());
+        let (hits, misses) = s.verdict_stats();
+        assert_eq!((hits, misses), (1, 2));
+    }
+
+    #[test]
+    fn unit__verdict_cache__strict_tools_cached_across_callers() {
+        let s = Sentinel::new(false, 30, None);
+        let broken = serde_json::json!({
+            "tools": [{"function": {"name": "f", "strict": true,
+                "parameters": {"type": "object", "properties": {"x": {}}, "required": ["x"]}}}]
+        });
+        let a = s.strict_tool_def_error_cached(&broken);
+        let b = s.strict_tool_def_error_cached(&broken);
+        assert!(a.is_some() && a == b);
+        assert_eq!(s.verdict_stats(), (1, 1));
+    }
+
+    #[test]
+    fn unit__verdict_cache__lru_bounded_and_fresh_after_eviction() {
+        let s = Sentinel::new(false, 30, None);
+        // VERDICT_CAP + 1 distinct clean bodies evict the first key.
+        for i in 0..=VERDICT_CAP {
+            let b = serde_json::json!({"format": "json", "stream": i});
+            let _ = s.structured_output_error_cached(&b);
+        }
+        assert!(
+            s.verdicts.lock().map.len() <= VERDICT_CAP,
+            "cache stays bounded"
+        );
+        // Distinct grammar bytes hash to distinct keys (no aliasing).
+        let g1 = serde_json::json!({"grammar": "root ::= \"a\""});
+        let g2 = serde_json::json!({"grammar": "root ::= \"b\""});
+        assert_ne!(
+            verdict_key(1, &["grammar", "format", "response_format"], &g1),
+            verdict_key(1, &["grammar", "format", "response_format"], &g2)
+        );
     }
 
     #[test]

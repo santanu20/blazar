@@ -32,7 +32,7 @@ RadixAttention in-engine [V027][SGL].
 | A7 | `tune --search` axis: cache-reuse {0,128,256,512} measured | ✅ | SUP | S | HiCache hit-ratio tuning analog [HICACHE] — shipped: tune --cache-reuse {0,256,512} grid, noise-floored adoption |
 | A8 | **Prefix-hash sticky routing** — RadixAttention-lite at the gateway (B1): hash first N tokens, route to the instance whose cache holds it | ✅ | GW | — | shipped 2026-09-07 (`replicas` overlay + prefix affinity; live-validated sticky warm 172/120 ms); 2026-09-08 routing 2.0: two-level `PrefixKey` (system-prompt class + conversation identity) — new conversations under a seen system prompt coalesce onto the warm replica's system-KV instead of growing a cold child |
 | A9 | Cache-hit tokens per request surfaced (usage.pallama_cache_hit_tokens from child /slots) | ✅ | GW | S | [HICACHE] shipped 2026-09-09 as `prompt_eval_cached_count` (upstream's own `cached_tokens` shape) in /api/chat usage + gateway CacheObs counters on /metrics |
-| A10 | Session KV checkpoints save/restore/erase | ✅ | SUP | — | have (34.6/14.5 ms measured) |
+| A10 | Session KV checkpoints save/restore/erase | ✅ | SUP | — | have (34.6/14.5 ms measured); 2026-09-09 #20: identity manifests — save stamps `<file>.identity.json` (pallama/engine/model SHA + ctx/cache_type/kv_unified/slots), restore pre-flight 400s on shape mismatch with a teaching diff (unknown-vs-unknown skips), erase removes both; supervisor bank save/restore verifies the same way (mismatch = skip restore, continue cold) |
 | A11 | Auto-checkpoint on idle (save slot state without user asking) | ✅ | SUP | S | extends A10; [LMC] write-back idea — shipped: session_bank bank_save on evict + ctx-checkpoints knob |
 | A12 | Checkpoint write policy knob (on-idle / every-turn write-through) | 🟡 | SUP | S | [HICACHE] write_back/write_through analog — cut (adversarial): evict-banking + cache_idle_slots knob cover the need |
 | A13 | Hot-prefix pinning: never-evict list for known system prompts | ✅ | GW | M | [DYN] hot-tier concept — shipped: overlay pin=true skips capacity victim filter |
@@ -52,9 +52,9 @@ RadixAttention in-engine [V027][SGL].
 |---|---|---|---|---|---|
 | B1 | Live slots auto-tune (`tune --slots`) | ✅ | SUP | — | shipped today |
 | B2 | Extend slots candidates {1..8} + workload profiles (agent vs batch) | 🟡 | SUP | S | extends B1 |
-| B3 | SLO admission tiers (interactive vs batch deadlines reorder queue) | ✅ | GW | M | shipped: EDF queue + tiered deadlines (2s/30s/120s) + x-pallama-deadline-ms override + slo_deadline_exceeded counter |
+| B3 | SLO admission tiers (interactive vs batch deadlines reorder queue) | ✅ | GW | M | shipped: EDF queue + tiered deadlines (2s/30s/120s) + x-pallama-deadline-ms override + slo_deadline_exceeded counter; 2026-09-09 #28: predictive early-reject — explicit-deadline requests whose optimistic TTFT p90 (min of warm/cold, ≥20 samples each) exceeds 2× the deadline get an immediate 429 + Retry-After naming the numbers instead of burning queue time |
 | B4 | Priority queue with header override | ✅ | GW | — | have |
-| B5 | Weighted fair queuing between keys (share, not just order) | ❌ | GW | M | LiteLLM-class fairness |
+| B5 | Weighted fair queuing between keys (share, not just order) | ✅ | GW | M | shipped 2026-09-09: `[[keys]] weight` (default 1), virtual-runtime credits (admit += 1/weight, pick min credit) interleaving same-(priority, SLO-tier) waiters — steady state weight-proportional; explicit `x-pallama-deadline-ms` waiters keep strict EDF (barrier rule: a tier waiter never jumps an explicit peer) |
 | B6 | Long-prefill pacing (protect short-request TTFT while big prompts run) | ✅ | GW | M | shipped: body >= 64KiB demotes SLO class one tier at admission (queue.rs PREFILL_HEAVY_BYTES) |
 | B7 | Adaptive spec throttle by load (batch-size-aware steps) | ✅ | CORE | M | [SGL] #24055/#25940 — shipped: adaptive_decay/adaptive_target opt-in knobs |
 | B8 | Identical-prompt single-flight coalescing | ✅ | GW | M | shipped: FNV-1a body key, per-key mutex, twin waits <=5s then proceeds; non-stream chat <=32KiB; stream folds apart |
@@ -68,9 +68,9 @@ RadixAttention in-engine [V027][SGL].
 | C1 | `[[remotes]]` prefix routing (vLLM/MLX/another pallama) | ✅ | GW | — | shipped today |
 | C2 | Remote health-aware failover (mark down, retry alternate remote) | ✅ | GW | S | SHIPPED 2026-09-08: per-remote circuit (3 consecutive fails -> 30 s mark-down, half-open probe after), 503 teaching when pool all-down |
 | C3 | Least-inflight load balancing across duplicate remotes | ✅ | GW | S | SHIPPED 2026-09-08: same-name [[remotes]] pool, header-time in-flight lease (RAII), min-in-flight selection |
-| C4 | Cache-aware remote routing (route to the remote holding the prefix) | ❌ | GW | M | [DYN] tier-aware KV routing |
+| C4 | Cache-aware remote routing (route to the remote holding the prefix) | ✅ | GW | M | shipped 2026-09-09: conversation-prefix hash → member stickiness (bounded 4096-affinity table, bind on success/unbind on fail), sticky-while-live else least-inflight; `x-pallama-remote` response header names the serving member on BOTH lanes (openai + ollama translate) |
 | C5 | Per-model device pinning override | ✅ | CORE | S | 2026-09-07: model_overrides devices; 2026-09-08: unset devices + >1 GPU -> auto-pick max-free card, VRAM math scoped per-card |
-| C6 | Per-model rpc_servers override | ❌ | CORE | S | global exists |
+| C6 | Per-model rpc_servers override | ✅ | CORE | S | shipped 2026-09-09: `model_overrides.rpc_servers` replaces the global list for that model's argv (`effective_rpc_servers`; empty/absent overlay inherits global) |
 | C7 | Federated ps/why across remotes | ❌ | GW | S | extends C1 probe |
 | C8 | Shadow/canary model compare (local vs remote via sentinel diff) | ❌ | GW | M | novel; uses sentinel |
 
@@ -83,7 +83,7 @@ RadixAttention in-engine [V027][SGL].
 | D3 | ollama lane embeddings/rerank translate parity | ✅ | GW | S | 2026-09-07: /api/embed (new-style) + /api/rerank lanes, engine 501 passthrough teaching |
 | D4 | Batch API (/v1/batch: async jobs, results table) | ✅ | GW | M | Shipped 2026-09-08: `POST /v1/files` (multipart JSONL) + `POST /v1/batches` + GET/list/cancel + output file; per-line replay through full auth/quota lane. Honest: starts immediately (no 24h window), sequential worker, restart leaves in_progress (re-submit to rerun) |
 | D5 | Strict-mode function calling (strict:true schema compile + validate) | ✅ | GW | M | OpenAI Responses strict-by-default (fetched) — verified live b10840: engine enforces json_schema strict grammar natively; our lanes pass through + lint |
-| D6 | GBNF/JSON-schema grammar cache per model+schema | ❌ | GW | M | compile cost amortization |
+| D6 | GBNF/JSON-schema grammar cache per model+schema | ✅ | GW | M | shipped 2026-09-09: Sentinel VerdictCache (LRU 512, no TTL — lints are pure) keyed by FNV over exactly the fields each lint reads (`tools` / `grammar+format+response_format`); `jsonschema::validator_for` runs once per distinct schema; hit/miss counters; all 4 lanes swapped (openai, anthropic, ollama x2) |
 | D7 | Anthropic translate when engine lacks /v1/messages | ✅ | GW | M | shipped 2026-09-08: native `/v1/messages` translate lane (tools/tool_use/tool_result, SSE event family, count_tokens); thinking/document blocks skipped, images→text marker |
 | D8 | Capability discovery endpoint (/.well-known/pallama) | ✅ | GW | S | shipped earlier (lib.rs:238): routes, limits, engine identity |
 | D9 | Cache-hit tokens in response usage (pallama_cache_hit_tokens) | ✅ | GW | S | shipped 2026-09-09: `prompt_eval_cached_count` on non-stream + stream final chunk; /v1 streams get include_usage injected so cached_tokens reaches clients |
@@ -96,7 +96,7 @@ RadixAttention in-engine [V027][SGL].
 | E1 | Virtual keys: scope + rpm/tpm/daily budgets + usage | ✅ | GW | — | shipped today |
 | E2 | Key rotation (regenerate secret, keep usage history) | ✅ | GW | S | lifecycle — shipped: keys rotate |
 | E3 | Wildcard model scopes ("qwen3*", "vllm:*") | ✅ | GW | S | extends scope check — shipped: wildcard scopes |
-| E4 | Audit log (key, model, tokens, trace → jsonl) | ❌ | GW | S | enterprise table stakes |
+| E4 | Audit log (key, model, tokens, trace → jsonl) | ✅ | GW | S | shipped 2026-09-09: `audit_log = true` (env PALLAMA_AUDIT_LOG) appends identity+outcome JSONL per generation request (trace/key/model/status/ms/priority/queue_depth — never content) to `<data>/log/audit.jsonl`; off-path writer (bounded 4096 chan, try_send, drop+count), 16 MiB rotation keeps newest 2000 lines, `pallama_audit_dropped_total` metric |
 | E5 | Auto self-signed dev cert (tls on zero-config for LAN) | ❌ | GW | S | DX |
 | E6 | Request body size limits | ❌ | GW | S | hardening |
 | E7 | PII scrub opt-in for why/logs | ✅ | GW | S | 2026-09-07: pii_scrub config; hand-scanned email/secret/IPv4 scrubber on why+watch output |

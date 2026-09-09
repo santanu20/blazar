@@ -21,6 +21,10 @@ use pallama_core::store::{KeyUsageRow, Store};
 #[derive(Clone)]
 pub struct KeyCtx {
     pub name: String,
+    /// B5 scheduling weight (>= 1): the admission queue interleaves
+    /// contending keys proportionally to this. Authless requests share
+    /// the anonymous weight-1 bucket.
+    pub weight: u32,
 }
 
 /// Why a request was rejected (mapped to a response by the caller).
@@ -644,6 +648,7 @@ mod tests {
             tpm,
             daily_tokens: daily,
             max_concurrent: 0,
+            weight: 1,
         }
     }
 

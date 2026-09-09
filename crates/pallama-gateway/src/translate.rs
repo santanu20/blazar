@@ -99,6 +99,26 @@ pub fn chat_to_openai(req: &Value) -> Result<(Value, Option<i64>), String> {
             out["top_logprobs"] = json!(n);
         }
     }
+    // ollama `think` toggle → template-level switch. No OpenAI
+    // equivalent field exists; llama-server consumes
+    // `chat_template_kwargs`, whose variable name varies by model
+    // family (qwen3: `enable_thinking`, others: `thinking`) — set both;
+    // a template only reads the var it knows, so the extra is inert.
+    // Absent = template default (unchanged behavior). mistral.rs
+    // children ignore unknown body fields; the toggle is llama-lane
+    // effective and harmless elsewhere.
+    if let Some(think) = req.get("think").and_then(Value::as_bool) {
+        if out.get("chat_template_kwargs").is_none() {
+            out["chat_template_kwargs"] = json!({});
+        }
+        if let Some(kw) = out
+            .get_mut("chat_template_kwargs")
+            .and_then(Value::as_object_mut)
+        {
+            kw.insert("thinking".into(), json!(think));
+            kw.insert("enable_thinking".into(), json!(think));
+        }
+    }
     let mut num_ctx = None;
     if let Some(opts) = req.get("options").filter(|o| o.is_object()) {
         if let Some(nc) = opts.get("num_ctx").and_then(Value::as_i64) {
@@ -388,6 +408,35 @@ mod tests {
         assert_eq!(out["seed"], 42);
         assert_eq!(out["response_format"]["type"], "json_schema");
         assert_eq!(out["stream"], false);
+    }
+
+    #[test]
+    fn unit__chat_to_openai__think_maps_to_template_kwargs() {
+        // think=false is the ollama "answer directly" switch: both known
+        // template vars carry it; absent think leaves no kwargs key.
+        let req = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "think": false,
+        });
+        let (out, _) = chat_to_openai(&req).unwrap();
+        assert_eq!(out["chat_template_kwargs"]["thinking"], false);
+        assert_eq!(out["chat_template_kwargs"]["enable_thinking"], false);
+
+        let req_on = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "think": true,
+        });
+        let (out_on, _) = chat_to_openai(&req_on).unwrap();
+        assert_eq!(out_on["chat_template_kwargs"]["enable_thinking"], true);
+
+        let req_none = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let (out_none, _) = chat_to_openai(&req_none).unwrap();
+        assert!(out_none.get("chat_template_kwargs").is_none());
     }
 
     #[test]

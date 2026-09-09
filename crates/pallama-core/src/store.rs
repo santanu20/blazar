@@ -16,7 +16,7 @@ pub struct Store {
     conn: Connection,
 }
 
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS engines (
     sha256       TEXT NOT NULL,
     installed_at INTEGER NOT NULL,
     active       INTEGER NOT NULL DEFAULT 0,
-    manifest     TEXT NOT NULL
+    manifest     TEXT NOT NULL,
+    kind         TEXT NOT NULL DEFAULT 'llamacpp'
 );
 CREATE TABLE IF NOT EXISTS models (
     name       TEXT PRIMARY KEY,
@@ -83,6 +84,10 @@ pub struct EngineRow {
     pub installed_at: i64,
     pub active: bool,
     pub manifest: String,
+    /// Which upstream project this engine wraps. Rows written before
+    /// the column existed deserialize as `llamacpp` (serde default).
+    #[serde(default)]
+    pub kind: crate::engine_kind::EngineKind,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -150,6 +155,26 @@ impl Store {
             .query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version < SCHEMA_VERSION {
             self.conn.execute_batch(SCHEMA_SQL)?;
+            // v4 added engines.kind. CREATE TABLE IF NOT EXISTS covers
+            // fresh databases; existing ones need the explicit ALTER.
+            let has_kind: bool = {
+                let mut stmt = self.conn.prepare("PRAGMA table_info(engines)")?;
+                let mut cols = stmt.query([])?;
+                let mut found = false;
+                while let Some(r) = cols.next()? {
+                    let name: String = r.get(1)?;
+                    if name == "kind" {
+                        found = true;
+                    }
+                }
+                found
+            };
+            if !has_kind {
+                self.conn.execute(
+                    "ALTER TABLE engines ADD COLUMN kind TEXT NOT NULL DEFAULT 'llamacpp'",
+                    [],
+                )?;
+            }
             self.conn
                 .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
@@ -162,18 +187,20 @@ impl Store {
 
     pub fn upsert_engine(&self, e: &EngineRow) -> CoreResult<()> {
         self.conn.execute(
-            "INSERT INTO engines (tag, asset, sha256, installed_at, active, manifest)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO engines (tag, asset, sha256, installed_at, active, manifest, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(tag) DO UPDATE SET
                asset = excluded.asset, sha256 = excluded.sha256,
-               installed_at = excluded.installed_at, manifest = excluded.manifest",
+               installed_at = excluded.installed_at, manifest = excluded.manifest,
+               kind = excluded.kind",
             params![
                 e.tag,
                 e.asset,
                 e.sha256,
                 e.installed_at,
                 i64::from(e.active),
-                e.manifest
+                e.manifest,
+                e.kind
             ],
         )?;
         Ok(())
@@ -201,7 +228,7 @@ impl Store {
 
     pub fn active_engine(&self) -> CoreResult<Option<EngineRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT tag, asset, sha256, installed_at, active, manifest FROM engines WHERE active = 1",
+            "SELECT tag, asset, sha256, installed_at, active, manifest, kind FROM engines WHERE active = 1",
         )?;
         let mut rows = stmt.query([])?;
         if let Some(r) = rows.next()? {
@@ -212,6 +239,7 @@ impl Store {
                 installed_at: r.get(3)?,
                 active: r.get::<_, i64>(4)? != 0,
                 manifest: r.get(5)?,
+                kind: r.get(6)?,
             }));
         }
         Ok(None)
@@ -219,7 +247,7 @@ impl Store {
 
     pub fn list_engines(&self) -> CoreResult<Vec<EngineRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT tag, asset, sha256, installed_at, active, manifest FROM engines ORDER BY installed_at DESC, rowid DESC",
+            "SELECT tag, asset, sha256, installed_at, active, manifest, kind FROM engines ORDER BY installed_at DESC, rowid DESC",
         )?;
         let rows = stmt.query_map([], engine_from_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -482,6 +510,7 @@ fn engine_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<EngineRow> {
         installed_at: r.get(3)?,
         active: r.get::<_, i64>(4)? != 0,
         manifest: r.get(5)?,
+        kind: r.get(6)?,
     })
 }
 
@@ -506,6 +535,7 @@ fn model_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRow> {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+    use crate::engine_kind::EngineKind;
 
     fn tmp_store() -> (tempfile::TempDir, Store) {
         let tmp = tempfile::tempdir().unwrap();
@@ -570,6 +600,7 @@ mod tests {
                 installed_at: 1,
                 active: false,
                 manifest: "{}".into(),
+                kind: EngineKind::LlamaCpp,
             })
             .unwrap();
         }

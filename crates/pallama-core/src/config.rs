@@ -216,6 +216,26 @@ pub struct Config {
     /// `ps`, and the log — `pallama engine update` stays a human action.
     #[serde(default = "default_engine_check_secs")]
     pub engine_check_secs: u64,
+    /// Restart the daemon automatically after an engine switch (use/
+    /// update/build/install/rollback activated a different engine).
+    /// false (default) = print the restart hint only: the daemon keeps
+    /// serving with the engine it booted with until restarted.
+    #[serde(default)]
+    pub auto_restart_engine_switch: bool,
+    /// mistral.rs paged-attention KV budget as a fraction of GPU memory
+    /// (`--pa-memory-fraction`): the upstream default (0.90) claims ~90%
+    /// of VRAM for KV and hard-fails at load ("Num GPU blocks is 0")
+    /// when weights + projector crowd an 8 GB card — lower it for big
+    /// vision models. None (default) = upstream default; 0.05..=0.95.
+    #[serde(default)]
+    pub mistralrs_pa_memory_fraction: Option<f32>,
+    /// mistral.rs attention backend override (`--paged-attn on|off`):
+    /// None (default) = upstream auto (paged on CUDA). `Some(false)`
+    /// sizes the classic KV cache from the context instead of a
+    /// VRAM fraction — the only configuration that fits big vision
+    /// models (9B + projector) on 8 GB cards, live-proven.
+    #[serde(default)]
+    pub mistralrs_paged_attn: Option<bool>,
     /// Slot prompt-similarity threshold (`--slot-prompt-similarity`):
     /// how closely a request's prompt must match a slot's cached prompt to
     /// reuse it (prefix affinity at slots > 1). 0 = emit nothing (upstream
@@ -237,6 +257,11 @@ pub struct Config {
     /// there). Per-request `X-Pallama-Enforce: 1|0` overrides.
     #[serde(default)]
     pub sentinel_enforce: bool,
+    /// E4 audit log: append one JSON line per GENERATION request
+    /// (trace id, key, model, status, latency, priority, queue depth)
+    /// to `<data>/log/audit.jsonl`. Off by default; rotates at 16 MiB.
+    #[serde(default)]
+    pub audit_log: bool,
     /// TLS: PEM certificate chain path. Empty = plain HTTP. Must be set
     /// together with `tls_key` (both or neither — validated).
     #[serde(default)]
@@ -657,6 +682,13 @@ pub struct ModelOverride {
     /// 2409.04701). Opt-in: normal models keep byte-proxied embeds.
     #[serde(default)]
     pub late_chunking: Option<bool>,
+    /// Per-model RPC server list (`--rpc`): comma-separated `host:port`
+    /// entries pointing at `llama-server -r` workers. Replaces (not
+    /// merges) the global `rpc_servers` list for this model — C6:
+    /// different models can lean on different GPU boxes without a
+    /// fleet-wide config change. Empty/None = inherit the global.
+    #[serde(default)]
+    pub rpc_servers: Option<String>,
 }
 
 /// Model-level sampling defaults, compiled to `--temp`, `--top-k`, ...
@@ -856,6 +888,22 @@ pub struct ApiKey {
     /// resource being bounded.
     #[serde(default)]
     pub max_concurrent: u32,
+    /// Scheduling weight under contention (B5): when requests from
+    /// multiple keys queue for the same slot class, admission share is
+    /// proportional to weight. 1 = default fair share; 0 is invalid
+    /// (treated as 1); 10 = ~10x the admission rate of a weight-1 key
+    /// in the same priority class. Rate limits still apply on top.
+    #[serde(default)]
+    pub weight: u32,
+}
+
+impl ApiKey {
+    /// Scheduling weight clamped to >= 1 (B5): an unset or 0 weight is
+    /// a plain fair share, never a division-by-zero footgun.
+    #[must_use]
+    pub fn effective_weight(&self) -> u32 {
+        self.weight.max(1)
+    }
 }
 
 fn default_late_chunking_max_tokens() -> usize {
@@ -944,6 +992,9 @@ impl Default for Config {
             semantic_cache: SemanticCacheConfig::default(),
             devices: Vec::new(),
             engine_check_secs: default_engine_check_secs(),
+            auto_restart_engine_switch: false,
+            mistralrs_pa_memory_fraction: None,
+            mistralrs_paged_attn: None,
             spec: "off".to_string(),
             cache_reuse: 256,
             keys: Vec::new(),
@@ -954,6 +1005,7 @@ impl Default for Config {
             sentinel: true,
             sentinel_stall_secs: 30,
             sentinel_enforce: false,
+            audit_log: false,
             tls_cert: String::new(),
             tls_key: String::new(),
             cors_origins: Vec::new(),
@@ -1156,6 +1208,21 @@ impl Config {
     #[must_use]
     pub fn effective_late_chunking(&self, model: &str) -> bool {
         self.overlay_for(model).late_chunking.unwrap_or(false)
+    }
+
+    /// Effective `--rpc` server list for a model (C6): a non-empty
+    /// overlay replaces the global list; empty/absent inherits it.
+    #[must_use]
+    pub fn effective_rpc_servers(&self, model: &str) -> &str {
+        // Borrow the stored overlay (overlay_for returns an owned clone —
+        // borrowing that temporary would dangle).
+        let overlay = self
+            .model_overrides
+            .get(model)
+            .and_then(|o| o.rpc_servers.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        overlay.unwrap_or(self.rpc_servers.trim())
     }
 
     /// Effective spec mode for a model: overlay wins over global default.
@@ -1407,6 +1474,13 @@ impl Config {
                 return Err(CoreError::Config(format!(
                     "reasoning_format must be \"none\", \"deepseek\" or \"deepseek-legacy\", got {other:?}"
                 )))
+            }
+        }
+        if let Some(frac) = self.mistralrs_pa_memory_fraction {
+            if !(0.05..=0.95).contains(&frac) {
+                return Err(CoreError::Config(format!(
+                    "mistralrs_pa_memory_fraction must be 0.05..=0.95, got {frac}"
+                )));
             }
         }
         if self.host.trim().is_empty() {
@@ -1916,6 +1990,9 @@ impl Config {
         }
         if let Some(v) = env("PALLAMA_SENTINEL_ENFORCE") {
             cfg.sentinel_enforce = parse_bool("PALLAMA_SENTINEL_ENFORCE", &v)?;
+        }
+        if let Some(v) = env("PALLAMA_AUDIT_LOG") {
+            cfg.audit_log = parse_bool("PALLAMA_AUDIT_LOG", &v)?;
         }
         cfg.validate()?;
         Ok(cfg)

@@ -111,14 +111,15 @@ pub fn probe(server_path: &Path, tag: &str) -> Result<Manifest> {
     if !version_text.contains("version") {
         version_text = String::from_utf8_lossy(&out.stdout).to_string();
     }
-    let (build_number, version_raw) = parse_version(&version_text)?;
+    let (parsed_build, version_raw) = parse_version(&version_text)?;
+    // The install tag is the authoritative build identity: a source build
+    // from a shallow clone reports a commit-count artifact ("build 1")
+    // where the release binary reports the real count. The tag Pallama
+    // registered (release asset or `engine build`) always carries the
+    // true number; non-b tags ("local") keep the probed value.
+    let build_number = super::gh::btag_number(tag).unwrap_or(parsed_build);
 
-    let out = Command::new(server)
-        .arg("--list-devices")
-        .output()
-        .with_context(|| format!("run {server} --list-devices"))?;
-    // Upstream exits 0 here even when listing; tolerate non-zero but parse stdout.
-    let devices = parse_devices(&String::from_utf8_lossy(&out.stdout));
+    let devices = run_list_devices(server_path);
 
     let out = Command::new(server)
         .arg("--help")
@@ -134,6 +135,81 @@ pub fn probe(server_path: &Path, tag: &str) -> Result<Manifest> {
         devices,
         flags,
         spec_types,
+        server_path: server.to_string(),
+    })
+}
+
+/// Kind-aware probe entry: dispatches to the llamacpp parser (strict —
+/// the banner shape is a verified upstream contract) or the mistralrs
+/// parser (tolerant — its CLI surface is undocumented enough to only
+/// trust what parses).
+pub fn probe_kind(
+    server_path: &Path,
+    tag: &str,
+    kind: &pallama_core::engine_kind::EngineKind,
+) -> Result<Manifest> {
+    match kind {
+        pallama_core::engine_kind::EngineKind::LlamaCpp => probe(server_path, tag),
+        pallama_core::engine_kind::EngineKind::MistralRs => probe_mistralrs(server_path, tag),
+    }
+}
+
+/// Probe a mistralrs binary. Divergences from llama-server (verified
+/// against mistral.rs v0.9.x docs): no `--list-devices` equivalent;
+/// `--version` output is not a documented contract, so the install tag
+/// is the identity and the banner is best-effort; serve flags come from
+/// `serve --help` (merged with the global `--help`).
+fn probe_mistralrs(server_path: &Path, tag: &str) -> Result<Manifest> {
+    let server = server_path
+        .to_str()
+        .ok_or_else(|| anyhow!("non-UTF-8 engine path {}", server_path.display()))?;
+
+    // Best-effort banner; never fatal — the tag is authoritative.
+    let version_raw = match Command::new(server).arg("--version").output() {
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let text = if stdout.contains("mistralrs") || stdout.contains("version") {
+                stdout
+            } else {
+                stderr
+            };
+            text.lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("mistralrs")
+                .to_string()
+        }
+        Err(_) => format!("mistralrs {tag}"),
+    };
+    // Display-only serial from the v-tag (v0.9.3 -> 0000009003): keeps
+    // `engine list` sortable without implying llama.cpp build numbers.
+    let build_number = super::gh::vtag_semver(tag)
+        .map_or(0, |(maj, min, patch)| maj * 1_000_000 + min * 1_000 + patch);
+
+    // Flags: global `--help` + `serve --help`, both best-effort. An empty
+    // set downgrades argv gating to "emit the fixed dialect" — a stale
+    // flag then fails at spawn, loudly.
+    let mut flags = BTreeSet::new();
+    // NEVER probe with zero args: a bare `mistralrs` drops into serving
+    // mode and listens forever, wedging the sync Command::output() call
+    // (and the tokio worker under it). Both help forms exit on their own.
+    let help_invocations: [Vec<String>; 2] =
+        [vec!["--help".into()], vec!["serve".into(), "--help".into()]];
+    for args in help_invocations {
+        if let Ok(out) = Command::new(server).args(&args).output() {
+            let (mut f, _) = parse_help(&String::from_utf8_lossy(&out.stdout));
+            flags.append(&mut f);
+        }
+    }
+
+    Ok(Manifest {
+        tag: tag.to_string(),
+        build_number,
+        version_raw,
+        devices: Vec::new(),
+        flags,
+        spec_types: Vec::new(),
         server_path: server.to_string(),
     })
 }
@@ -166,6 +242,25 @@ fn parse_version(text: &str) -> Result<(u64, String)> {
         })
         .ok_or_else(|| anyhow!("cannot parse build number from {line:?}"))?;
     Ok((build, line.trim().to_string()))
+}
+
+/// Live device census: run `<server> --list-devices` and parse the
+/// per-card TOTAL/FREE MiB straight from the engine binary. This is the
+/// ONLY source of live VRAM numbers — the manifest's stored `devices`
+/// are an install-day snapshot and go stale the moment any other
+/// process (ollama, a desktop session) touches the card.
+///
+/// Failure-tolerant by design: a missing binary or a hung census
+/// returns an empty list and callers fall back to the manifest
+/// snapshot. Census runs take a few hundred milliseconds (backend
+/// init), so callers throttle to spawn-time and ≥60s periodic.
+#[must_use]
+pub fn run_list_devices(server: &Path) -> Vec<DeviceDesc> {
+    let Ok(out) = Command::new(server).arg("--list-devices").output() else {
+        return Vec::new();
+    };
+    // Upstream exits 0 here even when listing; tolerate non-zero but parse stdout.
+    parse_devices(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// Parse `  NAME: DESC (TOTAL MiB, FREE MiB free)` device lines.
@@ -362,5 +457,45 @@ options:
             msg.contains("--spec-draft-model") && msg.contains("engine use"),
             "{msg}"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod live_census_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn unit__run_list_devices__parses_live_census_output() {
+        let dir = std::env::temp_dir().join(format!("pallama-census-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let script = dir.join("fake-server");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'Available devices:\\n  CUDA0: NVIDIA CUDA (7805 MiB, 1200 MiB free)\\n'\n",
+        )
+        .expect("write script");
+        make_executable(&script);
+        let devices = run_list_devices(&script);
+        assert_eq!(devices.len(), 1, "{devices:?}");
+        assert_eq!(devices[0].name, "CUDA0");
+        assert_eq!(devices[0].total_mib, 7805);
+        assert_eq!(devices[0].free_mib, 1200);
+        std::fs::remove_file(&script).ok();
+    }
+
+    #[test]
+    fn unit__run_list_devices__missing_binary_is_empty_not_panic() {
+        let devices = run_list_devices(std::path::Path::new("/nonexistent/pallama-census-probe"));
+        assert!(devices.is_empty());
+    }
+
+    #[cfg(unix)]
+    fn make_executable(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path).expect("stat").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).expect("chmod");
     }
 }

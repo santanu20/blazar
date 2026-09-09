@@ -108,6 +108,20 @@ pub async fn start(config: Config) -> TestServer {
             pulled_at: 1,
         })
         .unwrap();
+    // Production always has an active engine row (engine-manager); the
+    // #20 identity manifest build reads it.
+    store
+        .upsert_engine(&pallama_core::EngineRow {
+            tag: "stub-1".into(),
+            asset: "stub".into(),
+            sha256: "stub-sha".into(),
+            installed_at: 1,
+            active: true,
+            manifest: "{}".into(),
+            kind: pallama_core::engine_kind::EngineKind::default(),
+        })
+        .unwrap();
+    store.set_active_engine("stub-1").unwrap();
     let manifest = pallama_runtime::probe_manifest(&find_stub(), "stub").unwrap();
     let engine = LlamaCppEngine::new(manifest);
     let mut s = Supervisor::new(

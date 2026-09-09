@@ -209,6 +209,133 @@ async fn client__remote_instance__routes_by_prefix() {
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
+/// C4: same-named remotes form a POOL; a conversation prefix sticks to
+/// the member that served it (its KV holds the prefix), surfaced via
+/// `x-pallama-remote`.
+#[tokio::test]
+async fn client__remote_pool__prefix_sticky_and_remote_header() {
+    let a = support::spawn_remote_stub().await;
+    let b = support::spawn_remote_stub().await;
+    let cfg = support::config_with_keys();
+    let cfg = support::with_remote(cfg, "far", &a.base);
+    let cfg = support::with_remote(cfg, "far", &b.base);
+    let ts = start(cfg).await;
+    let c = client();
+    let url = format!("{}/v1/chat/completions", ts.base);
+    let convo = serde_json::json!({
+        "model": "far:m1", "stream": false,
+        "messages": [
+            {"role": "system", "content": "You are a terse oracle."},
+            {"role": "user", "content": "raven facts"}
+        ],
+    });
+    let r1 = c
+        .post(&url)
+        .bearer_auth("plm_admin")
+        .json(&convo)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), 200);
+    let who1 = r1
+        .headers()
+        .get("x-pallama-remote")
+        .expect("serving member named")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(who1.starts_with("far|"), "health-key shape: {who1}");
+
+    // Same prefix (system + first-user head identical): sticky.
+    let r2 = c
+        .post(&url)
+        .bearer_auth("plm_admin")
+        .json(&convo)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 200);
+    let who2 = r2
+        .headers()
+        .get("x-pallama-remote")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(who1, who2, "same conversation prefix sticks to its member");
+
+    // A DIFFERENT prefix: still served, header still present.
+    let other = serde_json::json!({
+        "model": "far:m1", "stream": false,
+        "messages": [{"role": "user", "content": "completely different topic"}],
+    });
+    let r3 = c
+        .post(&url)
+        .bearer_auth("plm_admin")
+        .json(&other)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r3.status(), 200);
+    assert!(r3.headers().get("x-pallama-remote").is_some());
+    a.shutdown().await;
+    b.shutdown().await;
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// E4: `audit_log = true` appends one JSON line per generation request
+/// with identity + outcome (key, model, status) — never content.
+#[tokio::test]
+async fn client__audit_log__generation_lines_written() {
+    let mut cfg = support::config_with_keys();
+    cfg.audit_log = true;
+    let ts = support::start(cfg).await;
+    let c = client();
+    let r = c
+        .post(format!("{}/api/chat", ts.base))
+        .bearer_auth("plm_ci")
+        .json(
+            &serde_json::json!({"model": "m1", "stream": false, "messages": [
+                {"role": "user", "content": "hi"}
+            ]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let trace = r
+        .headers()
+        .get("x-pallama-trace-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Writer is async: poll for the line (bounded).
+    let audit_path = ts.dirs.data_dir.join("log").join("audit.jsonl");
+    let mut line = String::new();
+    for _ in 0..40 {
+        if let Ok(raw) = std::fs::read_to_string(&audit_path) {
+            if let Some(l) = raw.lines().find(|l| l.contains(&trace)) {
+                line = l.to_string();
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(!line.is_empty(), "audit line for {trace} in {audit_path:?}");
+    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(v["key"], "ci", "key name recorded: {line}");
+    assert_eq!(v["model"], "m1", "model recorded: {line}");
+    assert_eq!(v["status"], 200);
+    assert_eq!(v["path"], "/api/chat");
+    assert!(v["ms"].as_u64().is_some(), "latency recorded");
+    assert!(v["ts"].as_u64().is_some(), "timestamp recorded");
+    // Content is never audited.
+    assert!(!line.contains("hi"), "prompt bytes must not appear: {line}");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
 #[tokio::test]
 async fn client__ollama_native__env_dialect_untouched() {
     // ollama-native CLIs (OLLAMA_HOST) speak /api/*; auth still applies

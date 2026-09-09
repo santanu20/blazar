@@ -39,6 +39,52 @@ fn health_key(remote: &Remote) -> String {
     format!("{}|{}", remote.name, remote.url)
 }
 
+/// Bound on the C4 prefix→remote stickiness table: one entry per
+/// distinct conversation prefix; arbitrary eviction keeps it bounded.
+const REMOTE_AFFINITY_CAP: usize = 4096;
+
+/// C4: fold pool name + conversation prefix into one affinity key.
+fn affinity_key(pool_name: &str, prefix: &pallama_runtime::PrefixKey) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in pool_name
+        .as_bytes()
+        .iter()
+        .chain(&prefix.sys.to_le_bytes())
+        .chain(&prefix.convo.to_le_bytes())
+    {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Remember which remote served this prefix (called on success).
+fn bind_remote(
+    map: &std::sync::Mutex<std::collections::HashMap<u64, String>>,
+    key: u64,
+    hkey: &str,
+) {
+    let mut m = map.lock().expect("remote_affinity lock poisoned");
+    if m.len() >= REMOTE_AFFINITY_CAP && !m.contains_key(&key) {
+        if let Some(evict) = m.keys().next().copied() {
+            m.remove(&evict);
+        }
+    }
+    m.insert(key, hkey.to_string());
+}
+
+/// Forget a prefix binding when it points at the failed remote.
+fn unbind_remote(
+    map: &std::sync::Mutex<std::collections::HashMap<u64, String>>,
+    key: u64,
+    hkey: &str,
+) {
+    let mut m = map.lock().expect("remote_affinity lock poisoned");
+    if m.get(&key).is_some_and(|k| k == hkey) {
+        m.remove(&key);
+    }
+}
+
 /// RAII in-flight lease: bumped by `select_remote`, released on drop.
 /// Released when the caller's response HEADERS are ready (forward
 /// functions return at header time); body streaming continues after —
@@ -61,13 +107,17 @@ impl Drop for RemoteLease {
 /// Select the remote for a `<remote>:<model>` request: filter the
 /// name-pool down to live members (marked-down members are skipped —
 /// all-down returns a 503 teaching error with the retry window), then
-/// pick the least-busy (C3). Returns the remote, the stripped model and
-/// an in-flight lease.
-#[allow(clippy::result_large_err)] // `Response` is the gateway's error currency
+/// pick the least-busy (C3). With a conversation `prefix` hint (C4),
+/// prefer the live pool member that last served this prefix — its KV
+/// cache holds the conversation — falling back to least-busy. Returns
+/// the remote, the stripped model, an in-flight lease and the affinity
+/// key to bind/unbind on the result.
+#[allow(clippy::type_complexity, clippy::result_large_err)] // gateway error currency
 pub fn select_remote<'a>(
     state: &'a AppState,
     model: &'a str,
-) -> Result<(&'a Remote, &'a str, RemoteLease), Response> {
+    prefix: Option<&pallama_runtime::PrefixKey>,
+) -> Result<(&'a Remote, &'a str, RemoteLease, Option<u64>), Response> {
     let Some((name, rest)) = model.split_once(':') else {
         return Err(crate::proxy::openai_error(
             400,
@@ -113,17 +163,36 @@ pub fn select_remote<'a>(
             ),
         ));
     }
-    let (remote, _h) = live
-        .iter()
-        .min_by_key(|(_, h)| h.in_flight)
-        .expect("live pool non-empty");
+    // C4: sticky prefix affinity — the live member holding this
+    // conversation's KV wins; without a hint (or after eviction/circuit)
+    // it is plain least-busy.
+    let akey = prefix.map(|p| affinity_key(name, p));
+    let sticky = akey.and_then(|k| {
+        state
+            .remote_affinity
+            .lock()
+            .expect("remote_affinity lock poisoned")
+            .get(&k)
+            .cloned()
+    });
+    let chosen = sticky.as_ref().and_then(|want| {
+        live.iter()
+            .find(|(r, _)| health_key(r) == *want)
+            .map(|(r, _)| *r)
+    });
+    let remote = chosen.unwrap_or_else(|| {
+        live.iter()
+            .min_by_key(|(_, h)| h.in_flight)
+            .map(|(r, _)| *r)
+            .expect("live pool non-empty")
+    });
     let key = health_key(remote);
     map.entry(key.clone()).or_default().in_flight += 1;
     let lease = RemoteLease {
         map: std::sync::Arc::clone(&state.remote_health),
         key,
     };
-    Ok((remote, rest, lease))
+    Ok((remote, rest, lease, akey))
 }
 
 /// Record a forward result: success resets the circuit; a failure
@@ -158,8 +227,35 @@ pub fn note_remote_result(state: &AppState, remote: &Remote, ok: bool) {
     }
 }
 
-/// `forward_openai` + circuit bookkeeping: select (LB + mark-down
-/// filter), forward, note the result by response class (<500 = ok).
+/// Result bookkeeping shared by every remote lane: circuit note, C4
+/// affinity bind/unbind, and the `x-pallama-remote` observability
+/// header naming the member that served the request.
+pub fn tag_remote_result(
+    state: &AppState,
+    remote: &Remote,
+    akey: Option<u64>,
+    mut resp: Response,
+) -> Response {
+    let hkey = health_key(remote);
+    let ok = resp.status().as_u16() < 500;
+    note_remote_result(state, remote, ok);
+    if let Some(k) = akey {
+        if ok {
+            bind_remote(&state.remote_affinity, k, &hkey);
+        } else {
+            unbind_remote(&state.remote_affinity, k, &hkey);
+        }
+    }
+    if let Ok(v) = axum::http::HeaderValue::from_str(&hkey) {
+        resp.headers_mut().insert("x-pallama-remote", v);
+    }
+    resp
+}
+
+/// `forward_openai` + circuit bookkeeping + C4 affinity: select
+/// (prefix-sticky LB + mark-down filter), forward, note the result by
+/// response class (<500 = ok). Success binds the conversation prefix to
+/// the remote that served it; failure unbinds.
 pub async fn forward_with_health(
     state: &AppState,
     model: &str,
@@ -168,7 +264,10 @@ pub async fn forward_with_health(
     headers: &axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let (remote, remote_model, _lease) = match select_remote(state, model) {
+    // Affinity hash over the ORIGINAL body (forward_openai rewrites the
+    // model field — the prefix identity lives in the prompt fields).
+    let prefix = crate::proxy::affinity_hash_bytes(&body);
+    let (remote, remote_model, _lease, akey) = match select_remote(state, model, prefix.as_ref()) {
         Ok(x) => x,
         Err(resp) => return resp,
     };
@@ -182,8 +281,7 @@ pub async fn forward_with_health(
         body,
     )
     .await;
-    note_remote_result(state, remote, resp.status().as_u16() < 500);
-    resp
+    tag_remote_result(state, remote, akey, resp)
 }
 
 /// Forward an OpenAI-shaped request to a remote: rewrite `model` to the
@@ -506,5 +604,50 @@ mod tests {
         assert!(std::str::from_utf8(&b).unwrap().contains(r#""model":"x""#));
         let raw = rewrite_model(axum::body::Bytes::from_static(b"not-json"), "x");
         assert_eq!(&*raw, b"not-json");
+    }
+
+    #[test]
+    fn unit__remote_affinity__key_discriminates_pool_and_convo() {
+        let p = pallama_runtime::PrefixKey { sys: 1, convo: 2 };
+        let a = affinity_key("vllm", &p);
+        assert_eq!(a, affinity_key("vllm", &p), "stable for same inputs");
+        assert_ne!(
+            a,
+            affinity_key("vllm", &pallama_runtime::PrefixKey { sys: 9, convo: 2 }),
+            "different system prompt = different key"
+        );
+        assert_ne!(a, affinity_key("mlx", &p), "different pool = different key");
+    }
+
+    #[test]
+    fn unit__remote_affinity__bind_sticks_unbind_only_owns() {
+        let map = std::sync::Mutex::new(std::collections::HashMap::new());
+        bind_remote(&map, 7, "vllm|http://a:1");
+        assert_eq!(
+            map.lock().unwrap().get(&7).map(String::as_str),
+            Some("vllm|http://a:1")
+        );
+        // Unbind with a DIFFERENT remote's key must not steal the entry.
+        unbind_remote(&map, 7, "vllm|http://b:2");
+        assert!(
+            map.lock().unwrap().contains_key(&7),
+            "foreign unbind no-ops"
+        );
+        // Own unbind removes it.
+        unbind_remote(&map, 7, "vllm|http://a:1");
+        assert!(!map.lock().unwrap().contains_key(&7));
+    }
+
+    #[test]
+    fn unit__remote_affinity__bounded_at_cap() {
+        let map = std::sync::Mutex::new(std::collections::HashMap::new());
+        for i in 0..=REMOTE_AFFINITY_CAP {
+            bind_remote(&map, i as u64, "r|u");
+        }
+        assert!(
+            map.lock().unwrap().len() <= REMOTE_AFFINITY_CAP,
+            "affinity table stays bounded: {}",
+            map.lock().unwrap().len()
+        );
     }
 }

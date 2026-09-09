@@ -2,6 +2,7 @@
 //! supervisor. Router assembly + bearer auth.
 
 pub mod anthropic;
+pub mod audit;
 pub mod batch;
 pub mod histogram;
 pub mod keys;
@@ -76,6 +77,7 @@ async fn auth(State(state): State<Arc<AppState>>, req: Request<Body>, next: Next
                     let mut req = req;
                     req.extensions_mut().insert(keys::KeyCtx {
                         name: k.name.clone(),
+                        weight: k.effective_weight(),
                     });
                     let resp = next.run(req).await;
                     return keys::guard_response(resp, lease);
@@ -96,6 +98,7 @@ async fn auth(State(state): State<Arc<AppState>>, req: Request<Body>, next: Next
 /// Per-request structured log + trace id (debuggability complaint):
 /// method, path, status, duration, priority, trace id — echoed back as
 /// `x-pallama-trace-id` so clients can correlate.
+#[allow(clippy::too_many_lines)] // trace+access+otlp+audit pipeline in one middleware
 async fn request_log(
     State(state): State<Arc<AppState>>,
     req: Request<Body>,
@@ -121,6 +124,43 @@ async fn request_log(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("normal")
         .to_string();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    // E4 audit: buffer the body ONLY when audit is on AND this is an
+    // audited generation lane — extract `model`, hand the bytes back
+    // untouched. Audit off = zero request-path changes.
+    let audit_on = state.audit_tx.is_some();
+    let key = req
+        .extensions()
+        .get::<keys::KeyCtx>()
+        .map(|k| k.name.clone());
+    let mut model = None;
+    if audit_on {
+        let content_len = req
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        if crate::audit::should_sniff(&method, &path, content_len) {
+            let (parts, body) = req.into_parts();
+            match axum::body::to_bytes(body, crate::audit::AUDIT_BODY_SNIFF_LIMIT).await {
+                Ok(bytes) => {
+                    model = crate::audit::extract_model(&bytes);
+                    req = Request::from_parts(parts, Body::from(bytes));
+                }
+                Err(_) => {
+                    // Over the sniff cap == over the gateway body limit; the
+                    // outer DefaultBodyLimit would reject it identically.
+                    return (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "request body exceeds the gateway limit",
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
     let started = std::time::Instant::now();
     let span_start_nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -130,6 +170,28 @@ async fn request_log(
     let status = resp.status().as_u16();
     if let Ok(v) = axum::http::HeaderValue::from_str(&trace) {
         resp.headers_mut().insert("x-pallama-trace-id", v);
+    }
+    // E4 audit line: identity + outcome, never content. try_send — a
+    // saturated writer drops (and counts) rather than stalling the
+    // response.
+    if let Some(tx) = &state.audit_tx {
+        if crate::audit::AUDITED_PATHS.contains(&path.as_str()) {
+            let line = crate::audit::AuditLine {
+                ts,
+                trace: trace.clone(),
+                key,
+                method: method.to_string(),
+                path: path.clone(),
+                model,
+                status,
+                ms,
+                priority: priority.clone(),
+                queue_depth: state.queue.depth(),
+            };
+            if tx.try_send(line).is_err() {
+                state.audit_dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
     if state.otlp.enabled() {
         let (trace_hex, span_hex) = otlp::new_ids();
@@ -428,6 +490,7 @@ async fn keys_list(
                 "tpm": k.tpm,
                 "daily_tokens": k.daily_tokens,
                 "max_concurrent": k.max_concurrent,
+                "weight": k.effective_weight(),
                 "usage": {"day": day, "requests": req, "tokens": tok},
             })
         })
@@ -493,6 +556,7 @@ async fn keys_add(
         tpm: num("tpm", 0).unwrap_or(0),
         daily_tokens: num("daily_tokens", 0).unwrap_or(0),
         max_concurrent: u32::try_from(num("max_concurrent", 0).unwrap_or(0)).unwrap_or(u32::MAX),
+        weight: u32::try_from(num("weight", 1).unwrap_or(1)).unwrap_or(1),
     };
     state.keys.upsert(entry.clone());
     let entries = state.keys.entries();
@@ -604,7 +668,7 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
     let store = pallama_core::Store::open(&state.dirs).ok();
     let engine = store.and_then(|s| s.active_engine().ok().flatten()).map_or(
         serde_json::Value::Null,
-        |e| serde_json::json!({"tag": e.tag, "asset": e.asset}),
+        |e| serde_json::json!({"tag": e.tag, "asset": e.asset, "kind": e.kind.as_str()}),
     );
     axum::Json(serde_json::json!({
         "name": "pallama",

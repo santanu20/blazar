@@ -249,31 +249,54 @@ pub async fn audio_transcriptions(
         }
     }
 
-    // (2) Local lane: installed binary + pulled ggml model.
+    // (2) Local lane: installed binary + pulled ggml model. Name the exact
+    // missing half — "lane not installed" when the server binary is the
+    // gap, "no model pulled" when the server is fine but transcription
+    // has nothing to load (both halves observed live in validation).
     let available = whisper::list_models(&state.dirs);
     let requested = model.as_deref().or(Some("whisper-1"));
-    if let (Some((bin, lib_dir)), Some(size)) = (
-        whisper::server_bin(&state.dirs),
-        whisper::resolve_model(requested, &available),
-    ) {
-        return forward_local(&state, &parts, file, &size, &bin, &lib_dir).await;
+    let server = whisper::server_bin(&state.dirs);
+    let size = server
+        .as_ref()
+        .and_then(|_| whisper::resolve_model(requested, &available));
+    if let (Some((bin, lib_dir)), Some(size)) = (&server, size) {
+        return forward_local(&state, &parts, file, &size, bin, lib_dir).await;
     }
 
     // (3) Teaching error: no local lane and no remote intent.
     openai_error(
         501,
-        &format!(
-            "no transcription backend: local whisper lane not installed \
-             (`pallama whisper install` + `pallama whisper pull base`) and the \
-             request does not name a remote (`whisper:<model>` with a \
-             [[remotes]] entry). Available local models: {:?}.",
-            if available.is_empty() {
-                vec!["<none pulled>".to_string()]
-            } else {
-                available
-            }
+        &teaching_detail(
+            server.is_some(),
+            requested.unwrap_or("whisper-1"),
+            &available,
         ),
     )
+}
+
+/// 501 body for a local-lane miss, naming the EXACT missing half (pure,
+/// unit-tested): the server binary vs the model payload.
+#[must_use]
+fn teaching_detail(has_server: bool, requested: &str, available: &[String]) -> String {
+    let avail = if available.is_empty() {
+        "<none pulled>".to_string()
+    } else {
+        available.join(", ")
+    };
+    if has_server {
+        format!(
+            "whisper server installed but no usable model for {requested:?} \
+             — pull one: `pallama whisper --pull base`. \
+             Available local models: {avail}."
+        )
+    } else {
+        format!(
+            "no transcription backend: whisper server not installed \
+             (`pallama whisper --install`) and the request does not name a \
+             remote (`whisper:<model>` with a [[remotes]] entry). \
+             Available local models: {avail}."
+        )
+    }
 }
 
 #[cfg(test)]
@@ -351,5 +374,35 @@ mod tests {
         let parts = parse_multipart(&b, &ct).expect("parses");
         assert_eq!(parts.len(), 1);
         assert!(parts[0].data.is_empty());
+    }
+
+    #[test]
+    fn unit__teaching_detail__server_missing_names_install() {
+        let d = teaching_detail(false, "whisper-1", &[]);
+        assert!(d.contains("whisper server not installed"), "got: {d}");
+        assert!(d.contains("`pallama whisper --install`"), "got: {d}");
+        assert!(d.contains("<none pulled>"), "got: {d}");
+    }
+
+    #[test]
+    fn unit__teaching_detail__model_missing_names_pull() {
+        let d = teaching_detail(true, "whisper-1", &[]);
+        assert!(
+            d.contains("server installed but no usable model"),
+            "got: {d}"
+        );
+        assert!(d.contains("`pallama whisper --pull base`"), "got: {d}");
+        assert!(
+            !d.contains("not installed"),
+            "must not claim server missing: {d}"
+        );
+    }
+
+    #[test]
+    fn unit__teaching_detail__with_models_lists_them_and_request() {
+        let avail = vec!["base".to_string(), "small".to_string()];
+        let d = teaching_detail(true, "large-v3", &avail);
+        assert!(d.contains("\"large-v3\""), "got: {d}");
+        assert!(d.contains("base, small"), "got: {d}");
     }
 }

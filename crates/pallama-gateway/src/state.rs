@@ -114,6 +114,16 @@ pub struct AppState {
     /// without owning the whole state.
     pub remote_health:
         std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, RemoteHealth>>>,
+    /// C4 cache-aware remote routing: conversation-prefix hash -> the
+    /// `health_key` of the remote that last served it. Sticky while that
+    /// remote stays live; bounded (one entry per distinct prefix).
+    pub remote_affinity: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, String>>>,
+    /// E4 audit: line sender (`None` = audit off; no request-path tax
+    /// when disabled). Dropped-line counter is shared with the writer.
+    pub audit_tx: Option<tokio::sync::mpsc::Sender<crate::audit::AuditLine>>,
+    /// Audit lines dropped because the writer channel was full —
+    /// surfaced via `/metrics` as `pallama_audit_dropped_total`.
+    pub audit_dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AppState {
@@ -126,6 +136,24 @@ impl AppState {
             .expect("gateway http client");
         let run_dir = dirs.run_dir();
         let sentinel = Sentinel::new(config.sentinel, config.sentinel_stall_secs, Some(&run_dir));
+        // E4 audit: spawn the file writer when the knob is on; the
+        // sender rides AppState, the counter survives either way.
+        let (audit_tx, audit_dropped) = if config.audit_log {
+            let (tx, rx) = tokio::sync::mpsc::channel(crate::audit::AUDIT_CHANNEL_CAP);
+            let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let log_dir = dirs.data_dir.join("log");
+            tokio::spawn(crate::audit::writer_task(
+                rx,
+                log_dir,
+                std::sync::Arc::clone(&dropped),
+            ));
+            (Some(tx), dropped)
+        } else {
+            (
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            )
+        };
         // Best-effort pre-load of today's usage: a store failure must not
         // block boot (counters restart at zero, budgets loosen).
         let store = pallama_core::Store::open(&dirs).ok();
@@ -183,6 +211,9 @@ impl AppState {
             whisper: pallama_runtime::whisper::WhisperRuntime::new(),
             http_addr: std::sync::OnceLock::new(),
             remote_health: std::sync::Arc::default(),
+            remote_affinity: std::sync::Arc::default(),
+            audit_tx,
+            audit_dropped,
             singleflight: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }

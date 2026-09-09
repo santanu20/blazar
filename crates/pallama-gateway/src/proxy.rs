@@ -136,6 +136,7 @@ pub async fn ensure_with_admission(
                     None,
                     0,
                     std::time::Duration::from_mins(2),
+                    None,
                 )
                 .await
                 .map_err(|e| openai_error(503, &e))?;
@@ -301,6 +302,7 @@ pub async fn proxy_request(
     // spec-compliant (usage-only extra chunk; ollama lane already does
     // the same). Legacy /completions and non-chat routes pass through.
     let body = inject_include_usage(path_query, body);
+    let body = rewrite_child_model(state, body);
 
     // Single-flight (B8, FIX2): identical NON-STREAM chat requests
     // coalesce AT THE CHILD-CALL BOUNDARY (admission already happened:
@@ -589,6 +591,45 @@ fn is_chat_route(path_query: &str) -> bool {
 /// cache classification reads. Never touches non-stream requests, other
 /// routes, or bodies that already opted in; any parse/serialize failure
 /// returns the original bytes untouched (the child remains the judge).
+/// mistral.rs children register models under derived ids ("default" +
+/// the staging dir path — verified against v0.9.3), not Pallama names;
+/// their CLI has no `--alias` equivalent. The gateway owns the facade,
+/// so the outbound `model` field is rewritten to the child's stable
+/// `default` id for mistral.rs engines. llama-server keeps receiving
+/// Pallama names (its `--alias` lane matches them natively). Non-JSON
+/// bodies and store failures pass through untouched — the child then
+/// answers its own clear not-found error.
+/// mistral.rs derives /v1 model ids from the `-f` path (no --alias
+/// equivalent); Pallama spawns one model per child, so their stable
+/// `default` id is the unambiguous target. Shared by every child-bound
+/// body site (proxy lane + ollama translation lanes).
+pub(crate) fn child_model_default_active(state: &Arc<AppState>) -> bool {
+    pallama_core::Store::open(&state.dirs)
+        .ok()
+        .and_then(|s| s.active_engine().ok().flatten())
+        .is_some_and(|row| row.kind == pallama_core::engine_kind::EngineKind::MistralRs)
+}
+
+pub(crate) fn set_child_model_default(v: &mut serde_json::Value) {
+    if v.get("model").and_then(serde_json::Value::as_str).is_some() {
+        v["model"] = serde_json::Value::String("default".to_string());
+    }
+}
+
+fn rewrite_child_model(state: &Arc<AppState>, body: axum::body::Bytes) -> axum::body::Bytes {
+    if body.is_empty() || !child_model_default_active(state) {
+        return body;
+    }
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    set_child_model_default(&mut v);
+    match serde_json::to_vec(&v) {
+        Ok(bytes) => bytes.into(),
+        Err(_) => body,
+    }
+}
+
 fn inject_include_usage(path_query: &str, body: axum::body::Bytes) -> axum::body::Bytes {
     let p = path_query.split('?').next().unwrap_or(path_query);
     if !p.ends_with("/chat/completions") {
@@ -717,6 +758,50 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// Minimum samples in a TTFT histogram before its p90 is trusted for
+/// predictive rejection (below this, admit and measure instead).
+const PREDICTIVE_MIN_SAMPLES: u64 = 20;
+/// Reject only when the OPTIMISTIC p90 estimate exceeds this multiple of
+/// the caller's explicit deadline — a wide margin so we only early-reject
+/// requests that are near-certain to blow their SLO anyway.
+const PREDICTIVE_MARGIN: f64 = 2.0;
+
+/// Predictive admission (#28): when the caller pinned an explicit
+/// deadline and the gateway's TTFT evidence says even the OPTIMISTIC
+/// p90 (best of warm/cold, whichever has enough samples) overshoots the
+/// deadline by a wide margin, reject fast with a `Retry-After` hint
+/// instead of burning queue time on a request that cannot land in time.
+/// Returns `Some(retry_after_secs)` when rejection is warranted.
+/// Pure decision — unit-tested in isolation from histogram state.
+#[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "p90 latencies are small positive seconds; Retry-After wants whole seconds"
+)]
+pub fn predictive_retry(
+    deadline_ms: u64,
+    warm_p90_ms: Option<(f64, u64)>,
+    cold_p90_ms: Option<(f64, u64)>,
+) -> Option<u64> {
+    // Optimistic estimate: the best p90 among sufficiently-sampled
+    // histograms ((p90_ms, sample_count) pairs; None = no data).
+    let est_ms = [warm_p90_ms, cold_p90_ms]
+        .into_iter()
+        .flatten()
+        .filter(|&(_, n)| n >= PREDICTIVE_MIN_SAMPLES)
+        .map(|(p90, _)| p90)
+        .reduce(f64::min)?;
+    let deadline_ms_f = deadline_ms as f64;
+    if est_ms > PREDICTIVE_MARGIN * deadline_ms_f && deadline_ms > 0 {
+        // Retry-After is whole seconds; ceil the optimistic p90.
+        Some((est_ms / 1000.0).ceil().max(1.0) as u64)
+    } else {
+        None
+    }
+}
+
 /// Slots-aware admission: when the instance already has `slots` requests
 /// in flight (1 by default), WAIT at the caller's priority instead of
 /// colliding with the engine's single slot (instant rejects). Bounded by
@@ -726,23 +811,54 @@ pub async fn admission_gate(
     model: &str,
     priority: Priority,
 ) -> Result<InFlightGuard, Response> {
-    admission_gate_slo(state, model, priority, None, 0).await
+    admission_gate_slo(state, model, priority, None, 0, None).await
 }
 
 /// SLO-aware admission: `deadline_ms` (the `x-pallama-deadline-ms`
-/// header) and `body_len` (prefill-heavy demotion) feed the EDF queue.
+/// header) and `body_len` (prefill-heavy demotion) feed the EDF queue;
+/// `wfq` = (API key name, weight) enables weighted fair queuing among
+/// same-tier waiters under contention.
+#[allow(clippy::too_many_arguments)]
 pub async fn admission_gate_slo(
     state: &Arc<AppState>,
     model: &str,
     priority: Priority,
     deadline_ms: Option<u64>,
     body_len: usize,
+    wfq: Option<(&str, u32)>,
 ) -> Result<InFlightGuard, Response> {
     let max_inflight: i64 = if state.config.slots == 0 {
         4 // auto multi-slot: allow modest concurrency
     } else {
         i64::from(state.config.slots)
     };
+    // Predictive early-reject (#28): an explicit deadline that measured
+    // TTFT p90 says we cannot possibly meet -> fail fast with numbers.
+    if let Some(ms) = deadline_ms {
+        let warm = (
+            state.obs.ttft_warm.quantile(0.9) * 1e3,
+            state.obs.ttft_warm.count(),
+        );
+        let cold = (
+            state.obs.ttft_cold.quantile(0.9) * 1e3,
+            state.obs.ttft_cold.count(),
+        );
+        if let Some(retry) = predictive_retry(ms, Some(warm), Some(cold)) {
+            let mut resp = openai_error(
+                429,
+                &format!(
+                    "predicted TTFT p90 ~{retry}s exceeds 2x your explicit \
+                     deadline {ms}ms; retry after the hint or raise the deadline"
+                ),
+            );
+            resp.headers_mut().insert(
+                "retry-after",
+                axum::http::HeaderValue::from_str(&retry.to_string())
+                    .unwrap_or(axum::http::HeaderValue::from_static("1")),
+            );
+            return Err(resp);
+        }
+    }
     loop {
         let busy = state
             .sup
@@ -761,6 +877,7 @@ pub async fn admission_gate_slo(
                 deadline_ms,
                 body_len,
                 std::time::Duration::from_mins(2),
+                wfq,
             )
             .await
             .map_err(|e| openai_error(503, &e))?;
@@ -977,6 +1094,53 @@ mod affinity_tests {
         let v: serde_json::Value = serde_json::from_slice(body).unwrap();
         assert_eq!(affinity_hash_bytes(body), affinity_hash(&v));
         assert_eq!(affinity_hash_bytes(b"not json"), None);
+    }
+
+    // --- predictive admission (#28) -------------------------------------
+
+    #[test]
+    fn unit__predictive_retry__fires_only_past_double_margin() {
+        // est 5s vs deadline 2s: 5 > 2*2 -> reject, hint ceil(5s).
+        assert_eq!(predictive_retry(2_000, Some((5_000.0, 100)), None), Some(5));
+        // est exactly 2x deadline: within margin -> serve and measure.
+        assert_eq!(
+            predictive_retry(2_000, Some((4_000.0, 100)), None),
+            None,
+            "boundary est == 2x deadline must NOT reject"
+        );
+        // Comfortably under: admit.
+        assert_eq!(predictive_retry(2_000, Some((1_500.0, 100)), None), None);
+    }
+
+    #[test]
+    fn unit__predictive_retry__insufficient_samples_never_rejects() {
+        // 19 samples = below the trust gate on BOTH histograms -> None.
+        assert_eq!(
+            predictive_retry(2_000, Some((9_000.0, 19)), Some((9_500.0, 5))),
+            None,
+            "no histogram has enough samples -> admit and measure"
+        );
+        // One histogram reaching 20 samples is enough for its p90.
+        assert_eq!(predictive_retry(2_000, Some((9_000.0, 20)), None), Some(9));
+    }
+
+    #[test]
+    fn unit__predictive_retry__optimistic_estimate_uses_min_p90() {
+        // Warm 5s, cold 9s: optimistic est = 5s.
+        assert_eq!(
+            predictive_retry(2_000, Some((5_000.0, 100)), Some((9_000.0, 100))),
+            Some(5)
+        );
+        // Cold alone (warm unsampled): under margin -> admit.
+        assert_eq!(predictive_retry(2_000, None, Some((3_000.0, 100))), None);
+        // No data at all: never reject.
+        assert_eq!(predictive_retry(2_000, None, None), None);
+    }
+
+    #[test]
+    fn unit__predictive_retry__fractional_est_ceils_to_seconds() {
+        // 4.1s est -> 5s retry hint (Retry-After is whole seconds).
+        assert_eq!(predictive_retry(2_000, Some((4_100.0, 100)), None), Some(5));
     }
 }
 

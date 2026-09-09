@@ -6,10 +6,12 @@ pub mod catalog;
 pub mod config;
 pub mod coreside;
 pub mod dirs;
+pub mod engine_kind;
 pub mod error;
 pub mod gguf;
 pub mod hardware;
 pub mod profile;
+pub mod session_identity;
 pub mod store;
 pub mod telemetry;
 

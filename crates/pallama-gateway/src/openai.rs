@@ -194,6 +194,9 @@ pub async fn openai_proxy(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Some(resp) = llamacpp_only_gate(&state, &uri) {
+        return resp;
+    }
     let model = extract_model(&body).or_else(|| {
         let ct = headers
             .get("content-type")
@@ -238,7 +241,7 @@ pub async fn openai_proxy(
         || uri.path().ends_with("/responses");
     if chat_family {
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
-            if let Some(err) = crate::sentinel::strict_tool_def_error(&v) {
+            if let Some(err) = state.sentinel.strict_tool_def_error_cached(&v) {
                 return openai_error(400, &format!("invalid tools: {err}"));
             }
             let eff = state
@@ -303,11 +306,19 @@ pub async fn openai_proxy(
         .get("x-pallama-deadline-ms")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
-    let guard =
-        match admission_gate_slo(&state, &model_name, priority, deadline_ms, body.len()).await {
-            Ok(g) => g,
-            Err(resp) => return resp,
-        };
+    let guard = match admission_gate_slo(
+        &state,
+        &model_name,
+        priority,
+        deadline_ms,
+        body.len(),
+        wfq_of(key_ext.as_ref()),
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
     proxy_request(
         &state,
         &engine,
@@ -364,6 +375,49 @@ fn extract_model(body: &[u8]) -> Option<String> {
     v.get("model")?.as_str().map(str::to_string)
 }
 
+/// Child surfaces only llama-server implements. A mistralrs child
+/// would answer these with a bare 404/HTML error; Pallama teaches
+/// instead (fail fast, name the limitation, name the switch).
+const LLAMACPP_ONLY_PATHS: &[&str] = &[
+    "/tokenize",
+    "/detokenize",
+    "/apply-template",
+    "/infill",
+    "/v1/chat/completions/control",
+    "/v1/chat/completions/input_tokens",
+    "/v1/responses/input_tokens",
+    "/responses/input_tokens",
+    "/v1/rerank",
+    "/v1/reranking",
+    "/props",
+    "/slots",
+    "/v1/stream",
+    "/v1/streams/lookup",
+];
+
+/// `Some(teaching 400)` when the path is llama-server-only AND the
+/// active engine is mistralrs. Path matching covers sub-paths
+/// (`/slots/{id}`).
+fn llamacpp_only_gate(state: &AppState, uri: &Uri) -> Option<Response> {
+    let path = uri.path();
+    if !LLAMACPP_ONLY_PATHS
+        .iter()
+        .any(|p| path == *p || path.starts_with(&format!("{p}/")))
+    {
+        return None;
+    }
+    let store = pallama_core::Store::open(&state.dirs).ok()?;
+    let row = store.active_engine().ok().flatten()?;
+    if row.kind != pallama_core::engine_kind::EngineKind::MistralRs {
+        return None;
+    }
+    Some(openai_error(
+        400,
+        "this endpoint is llama-server-only; the active mistralrs engine does not \
+         implement it — switch with `pallama engine use <tag>` (see `pallama engine list`)",
+    ))
+}
+
 /// Engine-scoped upstream surfaces whose body carries no `model` field:
 /// `/props`, `/slots`, `/slots/{id}`, `/v1/stream`, `/v1/streams/lookup`.
 /// Model resolution order: `X-Pallama-Model` header > `?model=` query >
@@ -382,6 +436,9 @@ pub async fn scoped_proxy(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Some(resp) = llamacpp_only_gate(&state, &uri) {
+        return resp;
+    }
     let body_model = if uri.path() == "/v1/streams/lookup" {
         extract_model(&body)
     } else {
@@ -444,11 +501,19 @@ pub async fn scoped_proxy(
         .get("x-pallama-deadline-ms")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
-    let guard =
-        match admission_gate_slo(&state, &model_name, priority, deadline_ms, body.len()).await {
-            Ok(g) => g,
-            Err(resp) => return resp,
-        };
+    let guard = match admission_gate_slo(
+        &state,
+        &model_name,
+        priority,
+        deadline_ms,
+        body.len(),
+        wfq_of(key_ext.as_ref()),
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
     proxy_request(
         &state,
         &engine,
@@ -581,7 +646,16 @@ pub async fn responses_api(
             Err(resp) => return resp,
         };
     let model_name = engine.name.clone();
-    let guard = match admission_gate_slo(&state, &model_name, priority, None, 0).await {
+    let guard = match admission_gate_slo(
+        &state,
+        &model_name,
+        priority,
+        None,
+        0,
+        wfq_of(key_ext.as_ref()),
+    )
+    .await
+    {
         Ok(g) => g,
         Err(resp) => return resp,
     };
@@ -749,6 +823,12 @@ fn extract_model_multipart(body: &[u8], content_type: &str) -> Option<String> {
     None
 }
 
+/// WFQ identity for the admission queue: (key name, weight). Absent for
+/// unauthenticated (open) gateways — those waiters share one bucket.
+fn wfq_of(key_ext: Option<&Extension<crate::keys::KeyCtx>>) -> Option<(&str, u32)> {
+    key_ext.map(|Extension(k)| (k.name.as_str(), k.weight))
+}
+
 fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || hay.len() < needle.len() {
         return None;
@@ -786,7 +866,7 @@ pub async fn lora_adapters(
         path_and_query(&uri).trim_start_matches("/v1/adapters")
     );
     let name = engine.name.clone();
-    let guard = admission_gate_slo(&state, &name, Priority::Normal, None, 0).await;
+    let guard = admission_gate_slo(&state, &name, Priority::Normal, None, 0, None).await;
     match guard {
         Ok(g) => {
             proxy_request(

@@ -72,7 +72,7 @@ pub async fn messages(
         Ok(b) => b,
         Err(msg) => return anthropic_error(400, "invalid_request_error", &msg),
     };
-    if let Some(err) = crate::sentinel::strict_tool_def_error(&openai_body) {
+    if let Some(err) = state.sentinel.strict_tool_def_error_cached(&openai_body) {
         return anthropic_error(
             400,
             "invalid_request_error",
@@ -108,7 +108,17 @@ pub async fn messages(
         .get("x-pallama-deadline-ms")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
-    let guard = match admission_gate_slo(&state, &key_name, priority, deadline_ms, body.len()).await
+    let guard = match admission_gate_slo(
+        &state,
+        &key_name,
+        priority,
+        deadline_ms,
+        body.len(),
+        key_ext
+            .as_ref()
+            .map(|axum::extract::Extension(k)| (k.name.as_str(), k.weight)),
+    )
+    .await
     {
         Ok(g) => g,
         Err(resp) => return resp,

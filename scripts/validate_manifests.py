@@ -6,7 +6,7 @@ WITHOUT extending this file makes the completeness gates fail loudly
 (bidirectional set comparisons), so drift is impossible to miss.
 
 Field inventories verified against crates/pallama-core/src/config.rs:
-  Config          134 fields (13 Option, 4 containers: keys/remotes/engine_env/model_overrides)
+  Config          135 fields (13 Option, 4 containers: keys/remotes/engine_env/model_overrides)
   ModelOverride    20 fields (all Option)
   SamplerDefaults  18 fields (all Option, skip_serializing_if none)
   ApiKey            7 fields    Remote  3 fields
@@ -205,6 +205,15 @@ _K = [
     ("spec", False, False, "existing", None, "phase_config B: --spec-type ngram"),
     ("cache_reuse", False, False, "argv", "G1", "--cache-reuse 128"),
     ("keys", False, True, "behavior", None, "keys lifecycle + phase_auth"),
+    (
+        "audit_log",
+        False,
+        False,
+        "behavior",
+        None,
+        "battery F1: keyed daemon audit_log=true -> audit.jsonl lines "
+        "(200 line + 401 silence)",
+    ),
     (
         "semantic_cache",
         False,

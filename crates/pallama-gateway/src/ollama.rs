@@ -574,18 +574,29 @@ pub async fn chat(
         Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
     };
     let model_field = req["model"].as_str().unwrap_or_default().to_string();
-    // Remote routing: `<remote>:<model>` on the ollama API too.
-    if let Some((remote, remote_model)) = crate::remotes::split_remote(&model_field, &state.config)
-    {
-        let remote = remote.clone();
-        let resp = crate::remotes::ollama_chat_remote(&state, &remote, remote_model, &req).await;
-        crate::remotes::note_remote_result(&state, &remote, resp.status().as_u16() < 500);
-        return resp;
+    // Remote routing: `<remote>:<model>` on the ollama API too —
+    // POOL-aware (C4): select among same-named remotes with prefix
+    // stickiness + circuit health, not just the first configured entry.
+    if crate::remotes::split_remote(&model_field, &state.config).is_some() {
+        let prefix = crate::proxy::affinity_hash(&req);
+        return match crate::remotes::select_remote(&state, &model_field, prefix.as_ref()) {
+            Ok((remote, remote_model, _lease, akey)) => {
+                let remote = remote.clone();
+                let resp =
+                    crate::remotes::ollama_chat_remote(&state, &remote, remote_model, &req).await;
+                crate::remotes::tag_remote_result(&state, &remote, akey, resp)
+            }
+            Err(resp) => resp,
+        };
     }
-    let (openai_req, num_ctx) = match tr::chat_to_openai(&req) {
+    let (mut openai_req, num_ctx) = match tr::chat_to_openai(&req) {
         Ok(r) => r,
         Err(e) => return api_error(400, &e),
     };
+    // mistral.rs children register models as `default` (see proxy.rs).
+    if crate::proxy::child_model_default_active(&state) {
+        crate::proxy::set_child_model_default(&mut openai_req);
+    }
 
     let store = match Store::open(&state.dirs) {
         Ok(s) => s,
@@ -609,12 +620,12 @@ pub async fn chat(
         state.keys.charge_request(name);
     }
     // Strict tool-def lint (tools arrive in OpenAI shape after translate).
-    if let Some(err) = crate::sentinel::strict_tool_def_error(&req) {
+    if let Some(err) = state.sentinel.strict_tool_def_error_cached(&req) {
         return api_error(400, &format!("invalid tools: {err}"));
     }
     // Structured-output lint (R9): malformed format/grammar fails fast
     // before admission instead of dying at the child (or being ignored).
-    if let Some(err) = crate::sentinel::structured_output_error(&req) {
+    if let Some(err) = state.sentinel.structured_output_error_cached(&req) {
         return api_error(400, &format!("invalid structured output: {err}"));
     }
     // Prompt-fit preflight (num_ctx request override counts).
@@ -1244,7 +1255,7 @@ pub async fn embeddings(
         Ok(v) => v,
         Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
     };
-    let openai_req = match tr::embeddings_to_openai(&req) {
+    let mut openai_req = match tr::embeddings_to_openai(&req) {
         Ok(v) => v,
         Err(e) => return api_error(400, &e),
     };
@@ -1285,6 +1296,10 @@ pub async fn embeddings(
             };
         }
         let url = format!("{}/v1/embeddings", child_base(&engine.endpoint));
+        // mistral.rs children register models as `default` (see proxy.rs).
+        if crate::proxy::child_model_default_active(&state) {
+            crate::proxy::set_child_model_default(&mut openai_req);
+        }
         let resp = match child_auth(state.http.post(&url), &engine)
             .json(&openai_req)
             .send()
@@ -1377,7 +1392,11 @@ pub async fn embed(
             };
         }
         let url = format!("{}/v1/embeddings", child_base(&engine.endpoint));
-        let openai_req = json!({"model": model, "input": inputs});
+        let mut openai_req = json!({"model": model, "input": inputs});
+        // mistral.rs children register models as `default` (see proxy.rs).
+        if crate::proxy::child_model_default_active(&state) {
+            crate::proxy::set_child_model_default(&mut openai_req);
+        }
         let resp = match child_auth(state.http.post(&url), &engine)
             .json(&openai_req)
             .send()
@@ -1498,7 +1517,7 @@ pub async fn generate(
         Ok(v) => v,
         Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
     };
-    let openai_req = match tr::generate_to_openai(&req) {
+    let mut openai_req = match tr::generate_to_openai(&req) {
         Ok(Some(v)) => v,
         Ok(None) => {
             return api_error(
@@ -1531,6 +1550,10 @@ pub async fn generate(
         };
     let mut out = with_accounting(&state, &engine.name.clone(), async {
         let url = format!("{}/v1/completions", child_base(&engine.endpoint));
+        // mistral.rs children register models as `default` (see proxy.rs).
+        if crate::proxy::child_model_default_active(&state) {
+            crate::proxy::set_child_model_default(&mut openai_req);
+        }
         let resp = match child_auth(state.http.post(&url), &engine)
             .json(&openai_req)
             .send()
@@ -1626,6 +1649,7 @@ fn valid_session_name(name: &str) -> bool {
 /// "filename", "slot": 0} — pallama-internal: slot KV-cache
 /// checkpoints via upstream `--slot-save-path` + `POST /slots/{id}`.
 /// Ensures the model is loaded first (save needs live slot state).
+#[allow(clippy::too_many_lines)] // save/restore/erase/list + identity pre-flight; precedent: chat()
 pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let v: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -1636,6 +1660,21 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
     };
     if !matches!(action, "save" | "restore" | "erase" | "close") {
         return api_error(400, "action must be save, restore, erase or close");
+    }
+    // Slot KV checkpoints ride llama-server's --slot-save-path + POST
+    // /slots/{id}; mistralrs children have no slot surface. `close`
+    // stays open — it only releases a gateway-side session pin.
+    if action != "close"
+        && pallama_core::Store::open(&state.dirs)
+            .ok()
+            .and_then(|s| s.active_engine().ok().flatten())
+            .is_some_and(|e| e.kind == pallama_core::engine_kind::EngineKind::MistralRs)
+    {
+        return api_error(
+            400,
+            "slot KV checkpoints are llama-server-only; the active mistralrs engine \
+             does not implement /slots — switch with `pallama engine use <tag>`",
+        );
     }
     // Close releases a session PIN (R3) — no model, slot or checkpoint
     // involved; safe to run while children are asleep or absent.
@@ -1682,6 +1721,9 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
             .sessions_dir()
             .join(pallama_core::profile::path_safe(model))
             .join(filename);
+        // Sibling identity manifest dies with the checkpoint (H19: no
+        // orphaned metadata).
+        let _ = std::fs::remove_file(pallama_core::session_identity::manifest_path(&path));
         return match std::fs::remove_file(&path) {
             Ok(()) => axum::Json(json!({"status": "ok", "filename": filename})).into_response(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1696,6 +1738,55 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
             Ok(ok) => ok,
             Err(resp) => return resp,
         };
+    // #20 identity: the LIVE instance ctx wins over config (tuned or
+    // overridden instances — same precedence as the prompt-fit gate).
+    let live_ctx = state
+        .sup
+        .ps()
+        .into_iter()
+        .find(|p| p.name == engine.name)
+        .map_or_else(|| state.config.effective_ctx(&engine.name), |p| p.ctx);
+    let ckpt_dir = state
+        .dirs
+        .sessions_dir()
+        .join(pallama_core::profile::path_safe(model));
+    // RESTORE pre-flight: a checkpoint from a different runtime shape is
+    // silent garbage, not a warm start. Missing manifest = unverifiable
+    // (pre-#20 checkpoint): warn and let the caller decide to proceed.
+    if action == "restore" {
+        let ckpt = ckpt_dir.join(filename);
+        match pallama_core::session_identity::read_manifest(&ckpt) {
+            Some(saved) => {
+                let current =
+                    pallama_core::session_identity::build(&state.dirs, &state.config, &engine.name)
+                        .map(|mut id| {
+                            id.ctx = live_ctx;
+                            id
+                        });
+                if let Some(cur) = current {
+                    let diffs = pallama_core::session_identity::verify(&saved, &cur);
+                    if !diffs.is_empty() {
+                        return api_error(
+                            400,
+                            &format!(
+                                "checkpoint {filename} was saved under a different runtime \
+                                 shape; restoring it would inject stale KV. Diff: {}. \
+                                 Re-save the session under the current shape first",
+                                diffs.join("; ")
+                            ),
+                        );
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    target: "pallama::session",
+                    model = %engine.name,
+                    "restoring checkpoint {filename} with no identity manifest (pre-#20?) — unverified"
+                );
+            }
+        }
+    }
     with_accounting(&state, &engine.name.clone(), async {
         let url = format!(
             "{}/slots/{}?action={action}&filename={filename}",
@@ -1719,6 +1810,37 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
                 let status =
                     StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
                 let body = r.text().await.unwrap_or_default();
+                // SAVE post-success: stamp the identity manifest beside
+                // the checkpoint so future restores can verify shape.
+                if status.is_success() && action == "save" {
+                    let ckpt = ckpt_dir.join(filename);
+                    match pallama_core::session_identity::build(
+                        &state.dirs,
+                        &state.config,
+                        &engine.name,
+                    )
+                    .map(|mut id| {
+                        id.ctx = live_ctx;
+                        id
+                    }) {
+                        Some(id) => {
+                            if let Err(e) =
+                                pallama_core::session_identity::write_manifest(&ckpt, &id)
+                            {
+                                tracing::warn!(
+                                    target: "pallama::session",
+                                    "identity manifest write failed: {e}"
+                                );
+                            }
+                        }
+                        None => {
+                            tracing::warn!(
+                                target: "pallama::session",
+                                "could not determine runtime shape — checkpoint saved WITHOUT identity manifest"
+                            );
+                        }
+                    }
+                }
                 (status, body).into_response()
             }
             Err(e) => api_error(502, &format!("child slot action failed: {e}")),
@@ -1849,6 +1971,7 @@ fn engine_build_gauge(state: &AppState, out: &mut String) {
     }
 }
 
+#[allow(clippy::too_many_lines)] // exported metric families in one responder
 pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     let mut merged = String::new();
     for e in state.sup.live_http_endpoints() {
@@ -1883,6 +2006,15 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         merged,
         "# HELP pallama_evictions_total Total instance evictions\n# TYPE pallama_evictions_total counter\npallama_evictions_total {}\n",
         state.sup.evictions.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    // E4: audit lines dropped (writer saturated / IO failure). Non-zero
+    // while `audit_log = true` means the trail has gaps.
+    let _ = write!(
+        merged,
+        "# HELP pallama_audit_dropped_total Audit lines dropped (writer saturated or IO failure)\n# TYPE pallama_audit_dropped_total counter\npallama_audit_dropped_total {}\n",
+        state
+            .audit_dropped
+            .load(std::sync::atomic::Ordering::Relaxed)
     );
     // Per-key usage today (the [[keys]] tier's live accounting).
     let _ = write!(

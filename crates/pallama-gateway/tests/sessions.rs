@@ -146,3 +146,73 @@ async fn integration__session_close__releases_pin_idempotently() {
         .unwrap();
     assert_eq!(r.status(), 400);
 }
+
+/// #20 identity manifests: save stamps a sibling manifest; restore
+/// verifies the runtime shape and 400s on mismatch with a teaching
+/// error; erase removes checkpoint AND manifest (no orphans).
+#[tokio::test]
+async fn integration__session_identity__manifest_written_tamper_blocks_restore() {
+    let ts = start(pallama_core::Config::default()).await;
+    let c = client();
+    // Warm the child (save needs a live slot).
+    let r = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({"model": "m1", "messages": [
+            {"role": "user", "content": "hi"}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    // Save: 200 + manifest beside the checkpoint.
+    let r = c
+        .post(format!("{}/api/session", ts.base))
+        .json(&serde_json::json!({"model": "m1", "action": "save", "filename": "conv1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "stub slot save works");
+    let ckpt = ts.dirs.sessions_dir().join("m1").join("conv1");
+    assert!(ckpt.exists(), "checkpoint file exists");
+    let id = pallama_core::session_identity::read_manifest(&ckpt)
+        .expect("identity manifest written and parses");
+    assert!(!id.pallama_version.is_empty());
+
+    // Clean restore: shape matches -> passes the gate.
+    let r = c
+        .post(format!("{}/api/session", ts.base))
+        .json(&serde_json::json!({"model": "m1", "action": "restore", "filename": "conv1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "matching identity restores");
+
+    // Tampered shape: restore refused with a teaching 400.
+    let mut bad = id.clone();
+    bad.ctx += 1024;
+    pallama_core::session_identity::write_manifest(&ckpt, &bad).unwrap();
+    let r = c
+        .post(format!("{}/api/session", ts.base))
+        .json(&serde_json::json!({"model": "m1", "action": "restore", "filename": "conv1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let text = r.text().await.unwrap();
+    assert!(
+        text.contains("different runtime shape") && text.contains("ctx"),
+        "teaching error names the diff: {text}"
+    );
+
+    // Erase removes checkpoint AND manifest (H19: no orphaned metadata).
+    let r = c
+        .post(format!("{}/api/session", ts.base))
+        .json(&serde_json::json!({"model": "m1", "action": "erase", "filename": "conv1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(!ckpt.exists());
+    assert!(!pallama_core::session_identity::manifest_path(&ckpt).exists());
+}
