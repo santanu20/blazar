@@ -6,6 +6,26 @@ use serde::{Deserialize, Serialize};
 use crate::dirs::PallamaDirs;
 use crate::error::{CoreError, CoreResult};
 
+/// Engine/app update channel. See `Config::update_channel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    /// Newest release including prereleases (llama.cpp nightly b-tags).
+    #[default]
+    Latest,
+    /// Newest non-prerelease (GitHub `/releases/latest`).
+    Stable,
+}
+
+impl std::fmt::Display for UpdateChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            UpdateChannel::Latest => "latest",
+            UpdateChannel::Stable => "stable",
+        })
+    }
+}
+
 /// Tunables exposed in config.toml. One file, one surface: every Pallama
 /// knob lives here or in a per-model overlay; the documented `PALLAMA_*`
 /// env vars override file values. Secrets (`HF_TOKEN` / `GH_TOKEN`) are env-only
@@ -26,6 +46,26 @@ pub struct Config {
     pub max_loaded_models: u32,
     /// "tcp" (curl-debuggable children) | "unix" (socket files).
     pub child_transport: String,
+    /// Per-child bearer auth (`--api-key-file` on every spawned engine
+    /// child): None = auto (TCP children authenticated — any local
+    /// process could otherwise bypass the gateway's keys by hitting the
+    /// child port directly; UDS children already get filesystem
+    /// permissions), Some(true) = always, Some(false) = never.
+    #[serde(default)]
+    pub child_auth: Option<bool>,
+    /// Tracing `EnvFilter` directive for the daemon, e.g. `"debug"` or
+    /// `"pallama=trace,pallama::engine=debug"`. `None` = built-in default
+    /// (`INFO`). The `RUST_LOG` env var always wins when set (escape hatch
+    /// for systemd units and one-off debugging).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_level: Option<String>,
+    /// Engine/app update channel. `latest` = newest release including
+    /// prereleases (llama.cpp nightly b-tags); `stable` = newest
+    /// non-prerelease. The channel is a PIN, not a floor: switching
+    /// `latest` -> `stable` re-targets (downgrades) to stable's current
+    /// release; `pallama engine update`/`pallama upgrade` then move to it.
+    #[serde(default)]
+    pub update_channel: UpdateChannel,
     /// "auto" or explicit engine asset suffix (e.g. "ubuntu-vulkan-x64").
     pub engine_asset: String,
     /// "" = newest b-tag; else pin like "b10816".
@@ -146,6 +186,26 @@ pub struct Config {
     /// 0 = upstream default (4).
     #[serde(default)]
     pub router_max_models: u32,
+    /// Late chunking (R1): hard cap on total doc tokens a late-chunking
+    /// embed request may carry. Beyond it the gateway answers 413 instead
+    /// of streaming a per-token embedding matrix through JSON. Applies to
+    /// models opted in via `[model_overrides.<name>] late_chunking = true`.
+    #[serde(default = "default_late_chunking_max_tokens")]
+    pub late_chunking_max_tokens: usize,
+    /// Session pins (R3): how long a model stays protected from idle
+    /// eviction after a request carrying `x-pallama-session: <name>`.
+    /// Each such request refreshes the window; `POST /api/session
+    /// {"action":"close","session":name}` releases immediately, and
+    /// `pallama stop` / `/api/stop` always wins. 0 disables pinning
+    /// entirely (header ignored, zero overhead).
+    #[serde(default = "default_session_keep_secs")]
+    pub session_keep_secs: u64,
+    /// R4: opt-in semantic cache for non-stream chat responses.
+    /// Disabled by default — semantic similarity can serve a near-miss
+    /// where an exact match was required; correctness-sensitive lanes
+    /// must stay off (per-request `x-pallama-cache: off` escape hatch).
+    #[serde(default)]
+    pub semantic_cache: SemanticCacheConfig,
     /// Explicit engine device selection (`--device <name>` per entry), for
     /// multi-GPU boxes where auto-pick lands on the wrong card. Names come
     /// from `pallama doctor`'s device list. Empty = engine auto.
@@ -278,18 +338,29 @@ pub struct Config {
     #[serde(default)]
     pub adaptive_target: f64,
 
-    // ---- n-gram speculation tuning (spec = "ngram"). Upstream b10833
-    // REMOVED the generic --spec-ngram-* forms; these emit the typed
-    // --spec-ngram-simple-* flags. 0 = engine default (16/8/2 upstream).
-    /// n-gram lookup table size (tokens of context hashed).
+    // ---- n-gram speculation tuning (spec = "ngram" and the typed
+    // variants "ngram-map-k" | "ngram-map-k4v" | "ngram-mod"). Upstream
+    // b10833 REMOVED the generic --spec-ngram-* forms; these emit the
+    // typed --spec-ngram-<family>-* flags. 0 = engine default.
+    /// n-gram lookup table size (tokens of context hashed). Applies to
+    /// ngram, ngram-map-k and ngram-map-k4v (upstream default 48/48/12).
     #[serde(default)]
     pub ngram_size_m: u32,
-    /// n-gram length.
+    /// n-gram length. Applies to ngram, ngram-map-k and ngram-map-k4v.
     #[serde(default)]
     pub ngram_size_n: u32,
-    /// Minimum table hits before a draft is trusted.
+    /// Minimum table hits before a draft is trusted. Same families.
     #[serde(default)]
     pub ngram_min_hits: u32,
+    /// ngram-mod only: lookup length. 0 = engine default (24). Range 1..=1024.
+    #[serde(default)]
+    pub ngram_mod_n_match: u32,
+    /// ngram-mod only: max drafted tokens. 0 = engine default (64). Range 0..=1024.
+    #[serde(default)]
+    pub ngram_mod_n_max: u32,
+    /// ngram-mod only: min drafted tokens. 0 = engine default (48). Range 0..=1024.
+    #[serde(default)]
+    pub ngram_mod_n_min: u32,
 
     // ---- reasoning control (server-side thinking budget; works on
     // reasoning models, cuts wasted thinking tokens on agent traffic).
@@ -452,12 +523,46 @@ pub struct Config {
     #[serde(default)]
     pub context_shift: bool,
     /// Default sampler chain, semicolon-separated as upstream takes it
-    /// ("" = engine default; e.g. `"top_k;top_p;typical"`).
+    /// ("" = engine default; e.g. `"top_k;top_p;typical"`). The char-encoded
+    /// `--sampler-seq` alias is deliberately not a knob: it writes the same
+    /// upstream param this knob controls.
     #[serde(default)]
     pub samplers: String,
+
+    // ---- compute plumbing / multi-GPU split (0/""/-1 = engine default).
+    /// Logical batch size for prompt processing (0 = engine default).
+    /// Bench-adopted tuning still wins over this knob.
+    #[serde(default)]
+    pub batch_size: u32,
+    /// Physical micro-batch ceiling for prefill (0 = engine default).
+    /// Bench-adopted tuning still wins over this knob.
+    #[serde(default)]
+    pub ubatch_size: u32,
+    /// Batch-phase thread count (0 = follow `threads`).
+    #[serde(default)]
+    pub threads_batch: u32,
+    /// Preferred GPU index for weights/KV in split mode (-1 = engine
+    /// default). Only meaningful on multi-GPU boxes with `devices` set.
+    #[serde(default = "default_main_gpu")]
+    pub main_gpu: i32,
+    /// Multi-GPU split strategy: "" | none | layer | row | tensor
+    /// ("" = engine default `layer`; `tensor` is upstream-experimental).
+    #[serde(default)]
+    pub split_mode: String,
+    /// Comma-separated per-GPU split ratios ("" = even split; e.g. "3,1"
+    /// gives GPU0 three shares per one of GPU1).
+    #[serde(default)]
+    pub tensor_split: String,
+    /// Router-mode model autoload into the child's own LRU (None =
+    /// upstream default off). Complements `router` + `router_max_models`.
+    #[serde(default)]
+    pub models_autoload: Option<bool>,
 }
 
 fn default_reasoning_budget() -> i64 {
+    -1
+}
+fn default_main_gpu() -> i32 {
     -1
 }
 fn default_yarn_ext_factor() -> f64 {
@@ -539,6 +644,19 @@ pub struct ModelOverride {
     /// every request that does not override the param in its body.
     #[serde(default)]
     pub sampler_defaults: Option<SamplerDefaults>,
+    /// Per-model infill token-order toggle (`--spm-infill`): use
+    /// Suffix/Prefix/Middle instead of Prefix/Suffix/Middle for `/infill`.
+    /// Some coder models (e.g. `CodeGemma`) require it. None = upstream
+    /// default (off).
+    #[serde(default)]
+    pub spm_infill: Option<bool>,
+    /// Late chunking (R1): launch this model's child with `--embeddings
+    /// --pooling none` and terminate all embed lanes at the gateway.
+    /// List input on `/api/embed` embeds the joined document ONCE and
+    /// mean-pools per-chunk token spans (jina late-chunking, arXiv
+    /// 2409.04701). Opt-in: normal models keep byte-proxied embeds.
+    #[serde(default)]
+    pub late_chunking: Option<bool>,
 }
 
 /// Model-level sampling defaults, compiled to `--temp`, `--top-k`, ...
@@ -740,6 +858,65 @@ pub struct ApiKey {
     pub max_concurrent: u32,
 }
 
+fn default_late_chunking_max_tokens() -> usize {
+    8192
+}
+
+fn default_session_keep_secs() -> u64 {
+    900
+}
+
+fn default_semantic_ttl_secs() -> u64 {
+    600
+}
+
+fn default_semantic_threshold() -> f64 {
+    0.90
+}
+
+fn default_semantic_max_entries() -> usize {
+    256
+}
+
+/// `[semantic_cache]` — opt-in semantic response cache (R4). The `model`
+/// is a registered embedding-capable model used to embed prompts; the
+/// cache stores L2-normalized prompt vectors and serves stored responses
+/// when cosine similarity meets `threshold` for the same chat model and
+/// API key on the same lane.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SemanticCacheConfig {
+    /// Master switch. Never default-on (correctness risk).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Registered model used to embed prompts (must spawn `--embeddings`,
+    /// e.g. an embedding GGUF or a `late_chunking` override). Required
+    /// when enabled.
+    pub model: Option<String>,
+    /// Entry lifetime in seconds (per-request `x-pallama-cache-ttl`
+    /// overrides, 1..=86400).
+    #[serde(default = "default_semantic_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Cosine similarity gate in (0, 1] (per-request
+    /// `x-pallama-cache-threshold` overrides).
+    #[serde(default = "default_semantic_threshold")]
+    pub threshold: f64,
+    /// Maximum entries (LRU eviction past the cap).
+    #[serde(default = "default_semantic_max_entries")]
+    pub max_entries: usize,
+}
+
+impl Default for SemanticCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: None,
+            ttl_secs: default_semantic_ttl_secs(),
+            threshold: default_semantic_threshold(),
+            max_entries: default_semantic_max_entries(),
+        }
+    }
+}
+
 impl Default for Config {
     // A flat literal of every knob's default: one line each beats
     // splitting across helper fns that hide the table.
@@ -756,9 +933,15 @@ impl Default for Config {
             idle_timeout_secs: 1800,
             max_loaded_models: 0,
             child_transport: "tcp".to_string(),
+            child_auth: None,
+            log_level: None,
+            update_channel: UpdateChannel::default(),
             engine_asset: "auto".to_string(),
             engine_pin: String::new(),
             router_max_models: 0,
+            late_chunking_max_tokens: default_late_chunking_max_tokens(),
+            session_keep_secs: default_session_keep_secs(),
+            semantic_cache: SemanticCacheConfig::default(),
             devices: Vec::new(),
             engine_check_secs: default_engine_check_secs(),
             spec: "off".to_string(),
@@ -821,6 +1004,9 @@ impl Default for Config {
             ngram_size_m: 0,
             ngram_size_n: 0,
             ngram_min_hits: 0,
+            ngram_mod_n_match: 0,
+            ngram_mod_n_max: 0,
+            ngram_mod_n_min: 0,
             reasoning_budget: default_reasoning_budget(),
             reasoning_budget_message: String::new(),
             reasoning_effort: String::new(),
@@ -865,6 +1051,13 @@ impl Default for Config {
             check_tensors: false,
             context_shift: false,
             samplers: String::new(),
+            batch_size: 0,
+            ubatch_size: 0,
+            threads_batch: 0,
+            main_gpu: -1,
+            split_mode: String::new(),
+            tensor_split: String::new(),
+            models_autoload: None,
         }
     }
 }
@@ -957,6 +1150,12 @@ impl Config {
     pub fn effective_ctx(&self, model: &str) -> u32 {
         let o = self.overlay_for(model);
         o.ctx.unwrap_or(self.default_ctx)
+    }
+
+    /// Effective late-chunking mode for a model: overlay wins (default off).
+    #[must_use]
+    pub fn effective_late_chunking(&self, model: &str) -> bool {
+        self.overlay_for(model).late_chunking.unwrap_or(false)
     }
 
     /// Effective spec mode for a model: overlay wins over global default.
@@ -1129,6 +1328,24 @@ impl Config {
             return Err(CoreError::Config("default_ctx must be > 0".into()));
         }
         self.validate_keys()?;
+        let sc = &self.semantic_cache;
+        if sc.enabled && sc.model.as_deref().unwrap_or_default().is_empty() {
+            return Err(CoreError::Config(
+                "semantic_cache.enabled requires semantic_cache.model (a registered embedding-capable model)"
+                    .into(),
+            ));
+        }
+        if sc.enabled && !(0.0..=1.0).contains(&sc.threshold) {
+            return Err(CoreError::Config(format!(
+                "semantic_cache.threshold must be in (0, 1], got {}",
+                sc.threshold
+            )));
+        }
+        if sc.enabled && sc.ttl_secs == 0 {
+            return Err(CoreError::Config(
+                "semantic_cache.ttl_secs must be > 0 when enabled".into(),
+            ));
+        }
         if !LOAD_MODES.contains(&self.load_mode.as_str()) {
             return Err(CoreError::Config(format!(
                 "load_mode must be one of mmap|mlock|direct-io (or empty), got {:?}",
@@ -1164,10 +1381,11 @@ impl Config {
             }
         }
         match self.spec.as_str() {
-            "off" | "auto" | "ngram" => {}
+            "off" | "auto" | "ngram" | "ngram-map-k" | "ngram-map-k4v" | "ngram-mod"
+            | "ngram-cache" => {}
             other => {
                 return Err(CoreError::Config(format!(
-                    "spec must be \"off\", \"auto\" or \"ngram\", got {other:?}"
+                    "spec must be \"off\", \"auto\", \"ngram\", \"ngram-map-k\", \"ngram-map-k4v\", \"ngram-mod\" or \"ngram-cache\", got {other:?}"
                 )))
             }
         }
@@ -1198,9 +1416,18 @@ impl Config {
         self.validate_wire_knobs()?;
         for (name, o) in &self.model_overrides {
             if let Some(spec) = &o.spec {
-                if spec != "off" && spec != "auto" && spec != "ngram" {
+                if !matches!(
+                    spec.as_str(),
+                    "off"
+                        | "auto"
+                        | "ngram"
+                        | "ngram-map-k"
+                        | "ngram-map-k4v"
+                        | "ngram-mod"
+                        | "ngram-cache"
+                ) {
                     return Err(CoreError::Config(format!(
-                        "model_overrides.{name}.spec must be \"off\", \"auto\" or \"ngram\", got {spec:?}"
+                        "model_overrides.{name}.spec must be \"off\", \"auto\", \"ngram\", \"ngram-map-k\", \"ngram-map-k4v\", \"ngram-mod\" or \"ngram-cache\", got {spec:?}"
                     )));
                 }
             }
@@ -1426,6 +1653,56 @@ impl Config {
                 "adaptive_target must be within 0.0..=1.0 (0 = off), got {}",
                 self.adaptive_target
             )));
+        }
+        // Upstream clamps ngram-mod knobs to [0,1024] and rejects a zero
+        // lookup length (arg.cpp: n_min/n_max 0..=1024, n_match 1..=1024).
+        if self.ngram_mod_n_match > 1024 {
+            return Err(CoreError::Config(format!(
+                "ngram_mod_n_match must be 0 (engine default) or 1..=1024, got {}",
+                self.ngram_mod_n_match
+            )));
+        }
+        if self.ngram_mod_n_max > 1024 {
+            return Err(CoreError::Config(format!(
+                "ngram_mod_n_max must be 0 (engine default) or within 0..=1024, got {}",
+                self.ngram_mod_n_max
+            )));
+        }
+        if self.ngram_mod_n_min > 1024 {
+            return Err(CoreError::Config(format!(
+                "ngram_mod_n_min must be 0 (engine default) or within 0..=1024, got {}",
+                self.ngram_mod_n_min
+            )));
+        }
+        if self.main_gpu < -1 {
+            return Err(CoreError::Config(format!(
+                "main_gpu must be >= -1 (-1 = engine default), got {}",
+                self.main_gpu
+            )));
+        }
+        if !self.split_mode.is_empty()
+            && !matches!(
+                self.split_mode.as_str(),
+                "none" | "layer" | "row" | "tensor"
+            )
+        {
+            return Err(CoreError::Config(format!(
+                "split_mode must be one of none|layer|row|tensor (or empty), got {:?}",
+                self.split_mode
+            )));
+        }
+        if !self.tensor_split.is_empty() {
+            for part in self.tensor_split.split(',') {
+                let ok = part
+                    .trim()
+                    .parse::<f64>()
+                    .is_ok_and(|v| v.is_finite() && v > 0.0);
+                if !ok {
+                    return Err(CoreError::Config(format!(
+                        "tensor_split entries must be positive numbers (e.g. \"3,1\"), got {part:?}"
+                    )));
+                }
+            }
         }
         let effort = self.reasoning_effort.trim();
         if !effort.is_empty() && !REASONING_EFFORT_LEVELS.contains(&effort) {
@@ -1940,6 +2217,138 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // manifest snapshot: one cohesive table
+    fn unit__full_manifest_roundtrip_toml__stable() {
+        // Golden contract: a config that sets a representative value on
+        // EVERY knob family (Options, containers, model override + sampler
+        // defaults) must survive to_toml -> from_toml identically, and the
+        // serialization itself must be byte-stable (second pass equal).
+        // Mirrors scripts/validate.py gate (c) at the type level.
+        let lks = std::env::temp_dir().join("pallama-gold-lks.bin");
+        let lkd = std::env::temp_dir().join("pallama-gold-lkd.bin");
+        std::fs::write(&lks, b"lk").unwrap();
+        std::fs::write(&lkd, b"lk").unwrap();
+        let raw = format!(
+            r#"
+host = "127.0.0.1"
+port = 11499
+default_ctx = 2048
+idle_sleep_secs = 77
+cache_reuse = 128
+poll = 77
+reasoning_format = "deepseek"
+slot_prompt_similarity = 0.6
+cpu_range = "0-7"
+cpu_moe_n = 2
+override_tensor = [".ffn_.*_exps.=CPU"]
+spec = "off"
+kv_unified_per_slot = 4096
+swa_full = true
+ctx_checkpoints = 16
+no_kv_offload = true
+load_mode = "mlock"
+agent = true
+cache_idle_slots = false
+warmup = false
+image_max_tokens = 4096
+image_min_tokens = 64
+embd_normalize = 2
+threads_http = 2
+no_host = true
+op_offload = true
+sessions = true
+batch_size = 512
+ubatch_size = 256
+threads_batch = 2
+main_gpu = 0
+split_mode = "layer"
+tensor_split = "3,1"
+prio = 2
+prio_batch = 2
+ctx_extend = 2.0
+yarn_orig_ctx = 4096
+yarn_ext_factor = 1.5
+yarn_attn_factor = 1.75
+child_auth = true
+lookup_cache_static = "{lks}"
+lookup_cache_dynamic = "{lkd}"
+models_autoload = false
+poll_batch = true
+spec_draft_p_min = 0.1
+spec_draft_p_split = 0.1
+spec_draft_poll = 2
+spec_draft_poll_batch = true
+reasoning_preserve = true
+
+[[keys]]
+name = "gatekey"
+key = "plm-gate"
+models = []
+
+[[remotes]]
+name = "edge"
+url = "http://127.0.0.1:1/v1"
+key = "rk"
+
+[engine_env]
+PROBE = "marker"
+
+[model_overrides.m]
+ctx = 3072
+slots = 1
+spec = "ngram"
+loras = []
+extra_args = ["--probe"]
+cache_type = "q8_0"
+kv_unified = true
+ctx_extend = 2.0
+cpu_moe_n = 1
+override_tensor = [".ffn_.*_exps.=CPU"]
+devices = ["Vulkan1"]
+warmup = false
+reasoning_budget = 512
+reasoning_effort = "low"
+replicas = 1
+pin = true
+chat_template = "chatml"
+spm_infill = true
+
+[model_overrides.m.sampler_defaults]
+temperature = 0.7
+top_k = 40
+top_p = 0.9
+min_p = 0.05
+top_n_sigma = 0.0
+typical_p = 1.0
+repeat_penalty = 1.1
+repeat_last_n = 64
+presence_penalty = 0.0
+frequency_penalty = 0.0
+dry_multiplier = 0.8
+dry_base = 1.75
+dry_allowed_length = 2
+dry_penalty_last_n = 256
+xtc_probability = 0.0
+xtc_threshold = 0.1
+mirostat = 0
+seed = 42
+"#,
+            lks = lks.display(),
+            lkd = lkd.display(),
+        );
+        let cfg = Config::from_toml(&raw).unwrap();
+        let out1 = cfg.to_toml().unwrap();
+        let back = Config::from_toml(&out1).unwrap();
+        assert_eq!(cfg, back, "struct round-trip must be lossless");
+        let out2 = back.to_toml().unwrap();
+        assert_eq!(out1, out2, "toml serialization must be byte-stable");
+        assert!(out1.contains("plm-gate"));
+        assert!(out1.contains("chat_template = \"chatml\""));
+        let _ = std::fs::remove_file(&lks);
+        let _ = std::fs::remove_file(&lkd);
+    }
+
+    #[test]
     fn unit__default_file_contains_documented_defaults() {
         let raw = Config::default().to_toml().unwrap();
         assert!(raw.contains("port = 11434"));
@@ -1961,6 +2370,14 @@ default_ctx = 16384
         // spec ngram accepted globally and per-overlay.
         Config::from_toml("spec = \"ngram\"\n").unwrap();
         Config::from_toml("[model_overrides.m]\nspec = \"ngram\"\n").unwrap();
+
+        // Typed n-gram variants accepted at both scopes ("ngram" stays the
+        // only shorthand; "ngram-simple" remains rejected below).
+        for spec in ["ngram-map-k", "ngram-map-k4v", "ngram-mod", "ngram-cache"] {
+            Config::from_toml(&format!("spec = \"{spec}\"\n")).unwrap();
+            Config::from_toml(&format!("[model_overrides.m]\nspec = \"{spec}\"\n")).unwrap();
+        }
+        assert!(Config::from_toml("spec = \"ngram-map\"\n").is_err());
 
         for bad in ["0", "5-1", "lo-hi", "0-15-3"] {
             assert!(
@@ -2276,6 +2693,8 @@ key = "plm_admin"
 
     #[test]
     fn unit__load_creates_default_file_when_absent() {
+        // Same env-leak guard as the file-load test below.
+        let _g = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let dirs = PallamaDirs {
             config_dir: tmp.path().join("cfg"),
@@ -2293,6 +2712,9 @@ key = "plm_admin"
 
     #[test]
     fn unit__load_existing_file__values_honored() {
+        // Config::load applies env overrides; hold the env lock so the
+        // parallel env-override tests can't leak PALLAMA_PORT into us.
+        let _g = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let dirs = PallamaDirs {
             config_dir: tmp.path().join("cfg"),
@@ -2302,6 +2724,33 @@ key = "plm_admin"
         std::fs::write(dirs.config_file(), "port = 9999\ndefault_ctx = 8192\n").unwrap();
         let cfg = Config::load(&dirs).unwrap();
         assert_eq!((cfg.port, cfg.default_ctx), (9999, 8192));
+    }
+
+    #[test]
+    fn unit__log_level__absent_and_present() {
+        let absent = Config::from_toml("port = 9999\n").unwrap();
+        assert_eq!(absent.log_level, None);
+        let present =
+            Config::from_toml("port = 9999\nlog_level = \"pallama=trace,pallama::engine=debug\"\n")
+                .unwrap();
+        assert_eq!(
+            present.log_level.as_deref(),
+            Some("pallama=trace,pallama::engine=debug")
+        );
+    }
+
+    #[test]
+    fn unit__update_channel__absent_stable_invalid() {
+        // Absent = latest (zero behavior change for existing configs).
+        let absent = Config::from_toml("port = 9999\n").unwrap();
+        assert_eq!(absent.update_channel, UpdateChannel::Latest);
+        // Explicit stable parses.
+        let stable = Config::from_toml("port = 9999\nupdate_channel = \"stable\"\n").unwrap();
+        assert_eq!(stable.update_channel, UpdateChannel::Stable);
+        let latest = Config::from_toml("port = 9999\nupdate_channel = \"latest\"\n").unwrap();
+        assert_eq!(latest.update_channel, UpdateChannel::Latest);
+        // Typos fail loudly instead of silently falling back.
+        assert!(Config::from_toml("port = 9999\nupdate_channel = \"nightly\"\n").is_err());
     }
 
     #[test]
@@ -2344,6 +2793,70 @@ key = "plm_admin"
         };
         with(good).validate().unwrap();
         let _ = std::fs::remove_file(&tpl);
+    }
+
+    #[test]
+    fn unit__gpu_split_knobs__validated() {
+        let c = Config {
+            split_mode: "diagonal".into(),
+            ..Config::default()
+        };
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("split_mode"), "{err}");
+
+        let c = Config {
+            tensor_split: "3,zero,1".into(),
+            ..Config::default()
+        };
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("tensor_split"), "{err}");
+
+        let c = Config {
+            tensor_split: "3,-1".into(),
+            ..Config::default()
+        };
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("tensor_split"), "{err}");
+
+        let c = Config {
+            main_gpu: -2,
+            ..Config::default()
+        };
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("main_gpu"), "{err}");
+
+        let c = Config {
+            split_mode: "tensor".into(),
+            tensor_split: "3,1".into(),
+            main_gpu: 0,
+            ..Config::default()
+        };
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn unit__ngram_mod_knobs__validated() {
+        for (field, value) in [
+            ("ngram_mod_n_match", 1025u32),
+            ("ngram_mod_n_max", 2000),
+            ("ngram_mod_n_min", 4096),
+        ] {
+            let mut c = Config::default();
+            match field {
+                "ngram_mod_n_match" => c.ngram_mod_n_match = value,
+                "ngram_mod_n_max" => c.ngram_mod_n_max = value,
+                _ => c.ngram_mod_n_min = value,
+            }
+            let err = c.validate().unwrap_err();
+            assert!(err.to_string().contains(field), "{field}: {err}");
+        }
+        let c = Config {
+            ngram_mod_n_match: 24,
+            ngram_mod_n_max: 64,
+            ngram_mod_n_min: 48,
+            ..Config::default()
+        };
+        c.validate().unwrap();
     }
 
     #[test]

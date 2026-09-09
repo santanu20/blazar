@@ -46,6 +46,13 @@ pub struct GgufMeta {
     /// `{arch}.full_attention_interval` — every Nth layer attends over the
     /// full context, the rest over the sliding window (Qwen3.5-9B ships 4).
     pub full_attention_interval: Option<u64>,
+    /// `{arch}.attention.recurrent_layers` — per-layer boolean array marking
+    /// linear-attention (gated-delta/SSM) layers that hold a constant-size
+    /// recurrent state instead of a ctx-growing KV cache. Read by upstream
+    /// `models/qwen35.cpp`, `qwen3next.cpp`, `qwen4exp.cpp`, `minimax-01.cpp`
+    /// via `get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, n_layer_all)`;
+    /// entries beyond `block_count` are MTP tail layers, not trunk KV.
+    pub recurrent_layers: Option<Vec<bool>>,
     /// `general.quantized_by` — quantizer identity (e.g. "Unsloth");
     /// consumed by the known-bad-quantizer lint.
     pub quantized_by: Option<String>,
@@ -61,6 +68,57 @@ pub struct GgufMeta {
     pub chat_template: Option<String>,
 }
 
+/// Architectures whose every layer is recurrent (no ctx-growing KV at all).
+/// Mirrored from vendored `llama-arch.cpp:1052 llm_arch_is_recurrent`.
+const RECURRENT_ARCHS: &[&str] = &["mamba", "mamba2", "rwkv6", "rwkv6qwen2", "rwkv7", "arwkv7"];
+
+/// Hybrid linear-attention architectures: a mix of recurrent (constant
+/// state) and full-attention (ctx-growing KV) layers. Mirrored from vendored
+/// `llama-arch.cpp:1066 llm_arch_is_hybrid`. Only a fraction of layers holds
+/// KV; without per-layer metadata the fraction is not provable and callers
+/// must stay conservative (count every layer).
+const HYBRID_LINEAR_ARCHS: &[&str] = &[
+    "jamba",
+    "falcon-h1",
+    "plamo2",
+    "granitehybrid",
+    "lfm2",
+    "lfm2moe",
+    "nemotron-h",
+    "nemotron-h-moe",
+    "qwen3next",
+    "kimi-linear",
+    "bailingmoe3",
+    "kimi-k3",
+    "qwen35",
+    "qwen35moe",
+    "qwen4exp",
+    "deepseek4",
+    "minimax-01",
+];
+
+/// Architectures proven to interpret `full_attention_interval` as
+/// recurrent-layer spacing: every `(i + 1) % interval == 0` trunk layer is
+/// full attention, the rest are recurrent (gated delta net) — NOT windowed
+/// SWA. Sources: vendored `models/qwen35.cpp:17-24`, `qwen3next.cpp:17-24`,
+/// `qwen4exp.cpp:128-136`, `minimax-01.cpp:12-19` (interval fallback loop).
+/// Other hybrid archs reading interval differently are deliberately absent:
+/// unlisted archs keep the conservative whole-block estimate.
+const INTERVAL_RECURRENT_ARCHS: &[&str] =
+    &["qwen35", "qwen35moe", "qwen3next", "qwen4exp", "minimax-01"];
+
+/// Attention layout class resolved from `general.architecture`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttentionClass {
+    /// Every layer holds ctx-growing KV (classic transformer).
+    Full,
+    /// Mix of recurrent (constant state) and full-attention layers; only
+    /// the full-attention fraction grows KV.
+    HybridLinear,
+    /// Pure recurrent state; no ctx-growing KV.
+    Recurrent,
+}
+
 impl GgufMeta {
     /// `head_dim`: metadata value, else `embedding_length` / `head_count` when
     /// both present and divisible.
@@ -73,6 +131,81 @@ impl GgufMeta {
             (Some(len), Some(head)) if head > 0 && len % head == 0 => Some(len / head),
             _ => None,
         }
+    }
+
+    /// Attention layout class by architecture name (upstream lists, see the
+    /// const docs). Unknown architectures classify as [`AttentionClass::Full`]
+    /// — the conservative default that keeps the whole-block KV estimate.
+    #[must_use]
+    pub fn attention_class(&self) -> AttentionClass {
+        if RECURRENT_ARCHS.contains(&self.architecture.as_str()) {
+            AttentionClass::Recurrent
+        } else if HYBRID_LINEAR_ARCHS.contains(&self.architecture.as_str()) {
+            AttentionClass::HybridLinear
+        } else {
+            AttentionClass::Full
+        }
+    }
+
+    /// Provable count of trunk layers that hold a ctx-growing KV cache.
+    /// When the recurrent/full split is NOT provable from metadata this
+    /// returns `Some(block_count)` — the conservative all-layers assumption
+    /// callers fall back to; see [`Self::recurrent_split_provable`] to
+    /// distinguish the two.
+    ///
+    /// Precedence: an explicit `recurrent_layers` array (trunk = first
+    /// `block_count` entries; a longer array's tail is MTP layers, outside
+    /// trunk KV), else the recurrent-interval formula for the archs proven
+    /// to use it (`blocks / interval`, floor — upstream marks layer i full
+    /// iff `(i + 1) % interval == 0`). A too-short array is ambiguous →
+    /// `None`.
+    #[must_use]
+    pub fn full_attn_layers(&self) -> Option<u64> {
+        let blocks = self.block_count?;
+        if let Some(trunk) = self.provable_trunk() {
+            return Some(trunk.iter().filter(|rec| !**rec).count() as u64);
+        }
+        if self.recurrent_layers.is_some() {
+            // An array exists but does not cover the trunk: ambiguous.
+            return None;
+        }
+        Some(blocks)
+    }
+
+    /// Whether the recurrent/full-attention layer split is provable from
+    /// metadata (explicit array, or the arch-proven interval formula).
+    /// Hybrid archs without a provable split keep conservative whole-block
+    /// KV estimates — callers warn on exactly that case.
+    #[must_use]
+    pub fn recurrent_split_provable(&self) -> bool {
+        self.provable_trunk().is_some()
+    }
+
+    /// Trunk-layer token budget for KV math: recurrent layers contribute 0,
+    /// full-attention layers contribute `min(window, ctx)` when a per-layer
+    /// window array proves it, else the whole `ctx` (conservative — a scalar
+    /// window is never paired with array typing; gemma-2 lesson).
+    fn recurrent_aware_token_sum(&self, ctx: u64, trunk: &[bool]) -> u64 {
+        let windows = self
+            .sliding_window_per_layer
+            .as_ref()
+            .filter(|w| w.len() == trunk.len());
+        trunk
+            .iter()
+            .enumerate()
+            .map(|(i, rec)| {
+                if *rec {
+                    0
+                } else {
+                    let window = windows.map_or(0, |w| w[i]);
+                    if window == 0 {
+                        ctx
+                    } else {
+                        window.min(ctx)
+                    }
+                }
+            })
+            .sum()
     }
 
     /// Sum over layers of each layer's KV token capacity for a serving
@@ -119,16 +252,58 @@ impl GgufMeta {
     /// the SWA shape is provable, else whole-context for every layer.
     /// `None` when the GGUF lacks the geometry — callers skip-with-warning,
     /// never estimate.
+    ///
+    /// Recurrent/hybrid-linear awareness (R8): recurrent layers hold a
+    /// constant-size state, not ctx-growing KV. Pure-recurrent archs return
+    /// `Some(0)` for the growing term (the constant state rides caller
+    /// headroom); hybrid archs scale by the provable full-attention
+    /// fraction via `full_attn_layers`. Unprovable splits stay
+    /// conservative — every layer, whole context (never guess low).
     #[must_use]
     pub fn kv_f16_bytes(&self, ctx: u64) -> Option<u64> {
+        if self.attention_class() == AttentionClass::Recurrent {
+            // Proven by arch class: the recurrent cache is constant-size
+            // (vendored llama-memory-recurrent); nothing grows with ctx.
+            return Some(0);
+        }
         let blocks = self.block_count?;
         let kv_heads = self.head_count_kv.or(self.head_count)?;
         let head_dim = self.derived_head_dim()?;
         let k_len = self.key_length.unwrap_or(head_dim);
         let v_len = self.value_length.unwrap_or(head_dim);
         let per_token = kv_heads * (k_len + v_len) * 2; // K + V, f16 = 2 B/elem
-        let tokens = self.swa_token_sum(ctx).unwrap_or(blocks * ctx);
+        let tokens = if let Some(trunk) = self.provable_trunk() {
+            self.recurrent_aware_token_sum(ctx, &trunk)
+        } else {
+            self.swa_token_sum(ctx).unwrap_or(blocks * ctx)
+        };
         Some(per_token.saturating_mul(tokens))
+    }
+
+    /// Trunk layer-typing array when provable: an explicit `recurrent_layers`
+    /// array covering the trunk (first `block_count` entries; a longer
+    /// array's tail is MTP layers outside trunk KV), else the interval
+    /// formula for archs proven to use it. Empty when the split is not
+    /// provable — callers keep the conservative whole-block estimate.
+    #[must_use]
+    fn provable_trunk(&self) -> Option<Vec<bool>> {
+        let blocks = self.block_count?;
+        let blocks_idx = usize::try_from(blocks).unwrap_or(usize::MAX);
+        if let Some(arr) = &self.recurrent_layers {
+            if arr.len() >= blocks_idx {
+                return Some(arr[..blocks_idx].to_vec());
+            }
+            return None;
+        }
+        if INTERVAL_RECURRENT_ARCHS.contains(&self.architecture.as_str())
+            && self.full_attention_interval.is_some_and(|i| i > 0)
+        {
+            // Upstream marks trunk layer i full iff (i+1) % interval == 0.
+            let interval = self.full_attention_interval.unwrap_or(1);
+            let trunk: Vec<bool> = (0..blocks).map(|i| (i + 1) % interval != 0).collect();
+            return Some(trunk);
+        }
+        None
     }
 
     /// Structural metadata lint (H4): verifiable completeness warnings only.
@@ -151,6 +326,14 @@ impl GgufMeta {
             if windows.len() != usize::try_from(blocks).unwrap_or(usize::MAX) {
                 out.push("sliding_window array length != block_count — SWA KV savings ignored");
             }
+        }
+        if self.attention_class() == AttentionClass::HybridLinear
+            && !self.recurrent_split_provable()
+        {
+            out.push(
+                "hybrid-linear architecture without a provable recurrent/full layer split — KV \
+                 estimates count every layer (upper bound)",
+            );
         }
         out
     }
@@ -325,6 +508,27 @@ fn read_value(cur: &mut Cursor<'_>, vtype: u32) -> CoreResult<GgufValue> {
     })
 }
 
+/// `{arch}.attention.recurrent_layers` — per-layer boolean array marking
+/// recurrent (linear-attention / SSM) layers; present on hybrid-linear
+/// conversions (R8). Empty or malformed arrays are ignored (None).
+fn recurrent_layer_array(kvs: &[(String, GgufValue)], arch: &str) -> Option<Vec<bool>> {
+    kvs.iter()
+        .find(|(k, _)| k == &format!("{arch}.attention.recurrent_layers"))
+        .and_then(|(_, v)| match v {
+            GgufValue::Array(items) => Some(
+                items
+                    .iter()
+                    .filter_map(|i| match i {
+                        GgufValue::Bool(b) => Some(*b),
+                        _ => None,
+                    })
+                    .collect::<Vec<bool>>(),
+            ),
+            _ => None,
+        })
+        .filter(|items| !items.is_empty())
+}
+
 /// Parse GGUF metadata from an in-memory buffer. Only the KV section is
 /// read. Returns the meta and the byte offset where tensor infos begin.
 pub fn parse_metadata(buf: &[u8]) -> CoreResult<(GgufMeta, usize)> {
@@ -389,6 +593,7 @@ pub fn parse_metadata(buf: &[u8]) -> CoreResult<(GgufMeta, usize)> {
             _ => None,
         })
         .filter(|items| !items.is_empty());
+    let recurrent_layers = recurrent_layer_array(&kvs, &arch);
 
     let meta = GgufMeta {
         name: kvs
@@ -417,6 +622,7 @@ pub fn parse_metadata(buf: &[u8]) -> CoreResult<(GgufMeta, usize)> {
         embedding_length: get(format!("{arch}.embedding_length")),
         key_length: att("key_length"),
         value_length: att("value_length"),
+        recurrent_layers,
         sliding_window: if sliding_window_per_layer.is_some() {
             None
         } else {
@@ -566,6 +772,7 @@ mod tests {
             GgufValue::U8(x) => b.push(*x),
             GgufValue::U16(x) => b.extend_from_slice(&x.to_le_bytes()),
             GgufValue::U32(x) => b.extend_from_slice(&x.to_le_bytes()),
+            GgufValue::Bool(x) => b.push(u8::from(*x)),
             other => panic!("raw fixture writer: unsupported {other:?}"),
         }
     }
@@ -919,5 +1126,156 @@ mod tests {
         std::fs::write(&p, build_gguf(&qwen_like())).unwrap();
         let meta = read_metadata_file(&p).unwrap();
         assert_eq!(meta.architecture, "qwen3");
+    }
+
+    // --- R8: hybrid-linear / recurrent KV awareness ---
+
+    fn hybrid_kv_meta(arch: &str, blocks: u32) -> GgufMeta {
+        GgufMeta {
+            architecture: arch.into(),
+            block_count: Some(u64::from(blocks)),
+            head_count: Some(16),
+            head_count_kv: Some(8),
+            embedding_length: Some(1024),
+            head_dim: Some(64),
+            ..GgufMeta::default()
+        }
+    }
+
+    #[test]
+    fn unit__recurrent_layers__parsed_from_bool_array() {
+        let mut kvs = qwen_like();
+        kvs.push((
+            "qwen3.attention.recurrent_layers",
+            GgufValue::Array(vec![
+                GgufValue::Bool(true),
+                GgufValue::Bool(false),
+                GgufValue::Bool(true),
+            ]),
+        ));
+        let (meta, _) = parse_metadata(&build_gguf(&kvs)).unwrap();
+        assert_eq!(meta.recurrent_layers, Some(vec![true, false, true]));
+    }
+
+    #[test]
+    fn unit__attention_class__arch_lists_mirror_upstream() {
+        // Spot-checks against vendored llama-arch.cpp:1052/:1066.
+        assert_eq!(
+            hybrid_kv_meta("kimi-k3", 69).attention_class(),
+            AttentionClass::HybridLinear
+        );
+        assert_eq!(
+            hybrid_kv_meta("qwen3next", 48).attention_class(),
+            AttentionClass::HybridLinear
+        );
+        assert_eq!(
+            hybrid_kv_meta("mamba", 64).attention_class(),
+            AttentionClass::Recurrent
+        );
+        assert_eq!(
+            hybrid_kv_meta("rwkv7", 32).attention_class(),
+            AttentionClass::Recurrent
+        );
+        assert_eq!(
+            hybrid_kv_meta("qwen3", 28).attention_class(),
+            AttentionClass::Full
+        );
+        // Unknown archs default conservative (Full).
+        assert_eq!(
+            hybrid_kv_meta("future-arch", 8).attention_class(),
+            AttentionClass::Full
+        );
+    }
+
+    #[test]
+    fn unit__kv_f16_bytes__recurrent_array_counts_only_full_layers() {
+        let mut m = hybrid_kv_meta("qwen3", 4);
+        m.recurrent_layers = Some(vec![true, false, true, false]);
+        // per_token = 8 kv_heads * (64+64) * 2 = 4096 B; only layers 1+3
+        // hold KV: 4096 * 2 * 1024 = 8 MiB.
+        assert_eq!(m.kv_f16_bytes(1024), Some(2048 * 2 * 1024));
+    }
+
+    #[test]
+    fn unit__kv_f16_bytes__recurrent_array_with_per_layer_windows() {
+        let mut m = hybrid_kv_meta("qwen3", 2);
+        m.recurrent_layers = Some(vec![false, true]);
+        m.sliding_window_per_layer = Some(vec![512, 512]);
+        // Layer 0 full-attn windowed: min(512, 4096) = 512; layer 1
+        // recurrent: 0. 4096 B/token * 512 = 2 MiB.
+        assert_eq!(m.kv_f16_bytes(4096), Some(2048 * 512));
+    }
+
+    #[test]
+    fn unit__kv_f16_bytes__qwen35_interval_counts_quarter_layers() {
+        // Real Qwen3.5-9B shape: interval 4 → 8 of 32 trunk layers hold KV
+        // (upstream qwen35.cpp: non-interval layers are recurrent gated
+        // delta net, NOT windowed). per_token = 4 * (256+256) * 2 = 4096 B.
+        let (m, _) = parse_metadata(&build_gguf(&qwen35_mla())).unwrap();
+        assert!(m.recurrent_split_provable());
+        assert_eq!(m.full_attn_layers(), Some(8));
+        // 4096 * 8 * 8192 = 256 MiB (was 1 GiB whole-block).
+        assert_eq!(m.kv_f16_bytes(8192), Some(4096 * 8 * 8192));
+    }
+
+    #[test]
+    fn unit__kv_f16_bytes__interval_floor_division_edge() {
+        // 33 trunk layers, interval 4: full at i=3,7,...,31 → 8 = floor.
+        let mut kvs = qwen35_mla();
+        kvs.retain(|(k, _)| !k.ends_with("full_attention_interval"));
+        kvs.push(("qwen35.block_count", GgufValue::U32(33)));
+        kvs.push(("qwen35.full_attention_interval", GgufValue::U32(4)));
+        let (m, _) = parse_metadata(&build_gguf(&kvs)).unwrap();
+        assert_eq!(m.full_attn_layers(), Some(8));
+        // Interval exceeding the trunk: zero full layers, zero growing KV.
+        let mut m2 = hybrid_kv_meta("qwen35", 32);
+        m2.full_attention_interval = Some(128);
+        assert_eq!(m2.full_attn_layers(), Some(0));
+        assert_eq!(m2.kv_f16_bytes(4096), Some(0));
+    }
+
+    #[test]
+    fn unit__full_attn_layers__mtp_tail_uses_trunk_prefix() {
+        // Upstream arrays cover n_layer_all (trunk + MTP tail); trunk KV
+        // is the first block_count entries.
+        let mut m = hybrid_kv_meta("qwen4exp", 32);
+        m.recurrent_layers = Some(vec![true; 32].into_iter().chain([false, false]).collect());
+        assert_eq!(m.full_attn_layers(), Some(0));
+        m.recurrent_layers = Some(vec![false; 32].into_iter().chain([true, true]).collect());
+        assert_eq!(m.full_attn_layers(), Some(32));
+    }
+
+    #[test]
+    fn unit__full_attn_layers__short_array_is_ambiguous() {
+        let mut m = hybrid_kv_meta("qwen4exp", 32);
+        m.recurrent_layers = Some(vec![true; 8]);
+        assert_eq!(m.full_attn_layers(), None);
+        assert!(!m.recurrent_split_provable());
+        // KV math stays whole-block (conservative upper bound).
+        assert_eq!(m.kv_f16_bytes(1024), Some(2048 * 32 * 1024));
+    }
+
+    #[test]
+    fn unit__kv_f16_bytes__mamba_pure_recurrent_is_zero() {
+        // Constant recurrent state rides caller headroom; the growing
+        // term is provably zero (llama-memory-recurrent).
+        let m = hybrid_kv_meta("mamba", 64);
+        assert_eq!(m.kv_f16_bytes(1_000_000), Some(0));
+    }
+
+    #[test]
+    fn unit__kv_f16_bytes__non_interval_hybrid_stays_conservative() {
+        // kimi-k3 without a layer map: no provable split → every layer
+        // counts (never guess low), and lint explains the bound.
+        let m = hybrid_kv_meta("kimi-k3", 69);
+        assert!(!m.recurrent_split_provable());
+        assert_eq!(m.kv_f16_bytes(1024), Some(2048 * 69 * 1024));
+        assert!(m
+            .lint()
+            .iter()
+            .any(|w| w.contains("hybrid-linear architecture")));
+        // Provable split (qwen35 interval): no lint noise.
+        let (q, _) = parse_metadata(&build_gguf(&qwen35_mla())).unwrap();
+        assert!(!q.lint().iter().any(|w| w.contains("hybrid-linear")));
     }
 }

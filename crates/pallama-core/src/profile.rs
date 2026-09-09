@@ -152,13 +152,25 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         .unwrap_or_else(|| input.hardware.physical_cores.max(1));
     argv.push("--threads".into());
     argv.push(threads.to_string());
+    // Batch plumbing: bench-adopted tuning wins over the config knob,
+    // which itself wins over the engine default (0 = unset).
     if let Some(b) = tuning.batch {
         argv.push("-b".into());
         argv.push(b.to_string());
+    } else if config.batch_size > 0 {
+        argv.push("--batch-size".into());
+        argv.push(config.batch_size.to_string());
     }
     if let Some(ub) = tuning.ubatch {
         argv.push("--ubatch-size".into());
         argv.push(ub.to_string());
+    } else if config.ubatch_size > 0 {
+        argv.push("--ubatch-size".into());
+        argv.push(config.ubatch_size.to_string());
+    }
+    if config.threads_batch > 0 {
+        argv.push("--threads-batch".into());
+        argv.push(config.threads_batch.to_string());
     }
 
     // --- 4. gpu layers: resolve "auto" ourselves when the answer is
@@ -271,11 +283,78 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         }
     }
 
+    // --- 10d. multi-GPU split plumbing: preferred GPU, split strategy
+    // and per-GPU tensor ratios. Manifest-gated warn-skip so an engine
+    // update never turns a set knob into a hard failure.
+    if config.main_gpu >= 0 {
+        if input.supported_flags.contains("--main-gpu") {
+            argv.push("--main-gpu".into());
+            argv.push(config.main_gpu.to_string());
+        } else {
+            warnings.push(format!(
+                "main_gpu set but engine {} lacks --main-gpu; run: pallama engine update",
+                input.engine_tag
+            ));
+        }
+    }
+    if !config.split_mode.is_empty() {
+        if input.supported_flags.contains("--split-mode") {
+            argv.push("--split-mode".into());
+            argv.push(config.split_mode.clone());
+        } else {
+            warnings.push(format!(
+                "split_mode set but engine {} lacks --split-mode; run: pallama engine update",
+                input.engine_tag
+            ));
+        }
+    }
+    if !config.tensor_split.is_empty() {
+        if input.supported_flags.contains("--tensor-split") {
+            argv.push("--tensor-split".into());
+            argv.push(config.tensor_split.clone());
+        } else {
+            warnings.push(format!(
+                "tensor_split set but engine {} lacks --tensor-split; run: pallama engine update",
+                input.engine_tag
+            ));
+        }
+    }
+
     // --- 10c. embedding-class models (GGUF carries {arch}.pooling_type,
     // e.g. nomic-bert): enable the embeddings endpoint so /v1/embeddings
     // and /api/embeddings work without manual flags. Generative models
     // gain nothing from --embeddings and keep it off.
-    if let Some(pooling) = input.gguf.pooling_type {
+    // Late-chunking override (R1) wins over GGUF metadata: pooling MUST be
+    // `none` so the gateway receives the per-token embedding matrix.
+    if input.overlay.late_chunking == Some(true) {
+        if input.supported_flags.contains("--embeddings")
+            && input.supported_flags.contains("--pooling")
+        {
+            argv.push("--embeddings".into());
+            argv.push("--pooling".into());
+            argv.push("none".into());
+            // Embedding tasks cannot split across micro-batches (upstream
+            // `!slot.can_split()` rejects input > n_ubatch), so a late-
+            // chunking doc must fit ONE ubatch. Default to the upstream
+            // embedding-preset scale (embeddinggemma etc. use 2048) — a
+            // full-ctx ubatch OOMs the compute buffer on tight GPUs —
+            // while never shrinking an explicit config/tuning value. The
+            // gateway token guard enforces the same number.
+            let late_ubatch = if config.ubatch_size > 0 {
+                config.ubatch_size
+            } else {
+                LATE_CHUNK_UBATCH_DEFAULT.min(ctx)
+            };
+            ensure_batch_flag(&mut argv, "--ubatch-size", late_ubatch);
+            ensure_batch_flag(&mut argv, "--batch-size", late_ubatch);
+            floor_batch_flag(&mut argv, "-b", late_ubatch);
+        } else {
+            warnings.push(format!(
+                "late_chunking = true but engine {} lacks --embeddings/--pooling; run: pallama engine update",
+                input.engine_tag
+            ));
+        }
+    } else if let Some(pooling) = input.gguf.pooling_type {
         if input.supported_flags.contains("--embeddings") {
             argv.push("--embeddings".into());
             let mode = match pooling {
@@ -299,12 +378,18 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     let spec_mode = overlay.spec.as_deref().unwrap_or(config.spec.as_str());
     if spec_mode == "auto" {
         push_spec_args(input, &mut argv, &mut warnings)?;
-    } else if spec_mode == "ngram" {
+    } else if is_ngram_spec(spec_mode) {
         // Self-drafting n-gram speculation: no draft model to pull; drafts
-        // from the context's own n-grams. Bench before adopting at scale —
-        // verification overhead can regress non-repetitive workloads.
+        // from the context's own n-grams ("ngram" is pallama shorthand for
+        // the upstream "ngram-simple"; the typed variants map verbatim).
+        // Bench before adopting at scale — verification overhead can
+        // regress non-repetitive workloads.
         argv.push("--spec-type".into());
-        argv.push("ngram-simple".into());
+        argv.push(if spec_mode == "ngram" {
+            "ngram-simple".into()
+        } else {
+            spec_mode.into()
+        });
     }
 
     // --- 11b. spec-draft placement (only when a draft model is actually
@@ -398,27 +483,49 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         }
     }
 
-    // --- 11c. n-gram tuning (spec = "ngram"). Upstream b10833 REMOVED the
-    // generic --spec-ngram-* forms — the typed --spec-ngram-simple-* flags
+    // --- 11c. n-gram tuning. Upstream b10833 REMOVED the generic
+    // --spec-ngram-* forms — the typed --spec-ngram-<family>-* flags
     // are the live surface. Warn-skip class: tuning is an enhancement, an
-    // older engine still serves with engine defaults.
-    if spec_mode == "ngram" {
-        let ngram_knobs: [(&str, u32); 3] = [
-            ("--spec-ngram-simple-size-m", config.ngram_size_m),
-            ("--spec-ngram-simple-size-n", config.ngram_size_n),
-            ("--spec-ngram-simple-min-hits", config.ngram_min_hits),
-        ];
-        for (flag, value) in ngram_knobs {
-            if value > 0 {
-                if input.supported_flags.contains(flag) {
-                    argv.push(flag.into());
-                    argv.push(value.to_string());
-                } else {
-                    warnings.push(format!(
-                        "ngram tuning skipped: engine {} lacks {flag} (engine update recommended)",
-                        input.engine_tag
-                    ));
-                }
+    // older engine still serves with engine defaults. The generic
+    // size-m/size-n/min-hits knobs feed the simple, map-k and map-k4v
+    // families (identical shape); ngram-mod has its own n-min/n-max/
+    // n-match knobs; ngram-cache is parameterless.
+    if is_ngram_spec(spec_mode) {
+        let family: [(&str, u32); 3] = match spec_mode {
+            "ngram" => [
+                ("--spec-ngram-simple-size-m", config.ngram_size_m),
+                ("--spec-ngram-simple-size-n", config.ngram_size_n),
+                ("--spec-ngram-simple-min-hits", config.ngram_min_hits),
+            ],
+            "ngram-map-k" => [
+                ("--spec-ngram-map-k-size-m", config.ngram_size_m),
+                ("--spec-ngram-map-k-size-n", config.ngram_size_n),
+                ("--spec-ngram-map-k-min-hits", config.ngram_min_hits),
+            ],
+            "ngram-map-k4v" => [
+                ("--spec-ngram-map-k4v-size-m", config.ngram_size_m),
+                ("--spec-ngram-map-k4v-size-n", config.ngram_size_n),
+                ("--spec-ngram-map-k4v-min-hits", config.ngram_min_hits),
+            ],
+            "ngram-mod" => [
+                ("--spec-ngram-mod-n-match", config.ngram_mod_n_match),
+                ("--spec-ngram-mod-n-max", config.ngram_mod_n_max),
+                ("--spec-ngram-mod-n-min", config.ngram_mod_n_min),
+            ],
+            _ => [("", 0), ("", 0), ("", 0)], // ngram-cache: parameterless
+        };
+        for (flag, value) in family {
+            if flag.is_empty() || value == 0 {
+                continue;
+            }
+            if input.supported_flags.contains(flag) {
+                argv.push(flag.into());
+                argv.push(value.to_string());
+            } else {
+                warnings.push(format!(
+                    "ngram tuning skipped: engine {} lacks {flag} (engine update recommended)",
+                    input.engine_tag
+                ));
             }
         }
     }
@@ -653,7 +760,9 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // --- 14. persistent n-gram speculative cache: the lookup table
     // survives restarts, so speculation is warm from the first request
     // after a respawn (default-on convenience: warn-skip on old engines).
-    if spec_mode == "ngram" && config.spec_cache {
+    // Every n-gram family benefits — ngram-cache literally consumes the
+    // lookup-cache paths upstream (common.h ngram_cache struct).
+    if is_ngram_spec(spec_mode) && config.spec_cache {
         if input.supported_flags.contains("--lookup-cache-dynamic") {
             argv.push("--lookup-cache-dynamic".into());
             argv.push(format!(
@@ -863,6 +972,16 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             warnings.push("chat_template_file skipped: engine lacks --chat-template-file".into());
         }
     }
+    // Infill token-order toggle: Suffix/Prefix/Middle for coder models
+    // that were trained on that order (CodeGemma family). Warn-skip on
+    // engines without the flag; `extra_args` remains the escape hatch.
+    if overlay.spm_infill == Some(true) {
+        if input.supported_flags.contains("--spm-infill") {
+            argv.push("--spm-infill".into());
+        } else {
+            warnings.push("spm_infill skipped: engine lacks --spm-infill".into());
+        }
+    }
     if let Some(sd) = &overlay.sampler_defaults {
         // (flag, value) pairs in upstream argv order; None fields emit
         // nothing so per-request body params keep upstream defaults.
@@ -933,7 +1052,20 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     }
 
     // KV estimate for the co-residency planner: f16 bytes scaled by the
-    // quantization grade actually emitted above.
+    // quantization grade actually emitted above. Hybrid-linear models with
+    // a provable recurrent/full split already get the true (fractional) KV
+    // from `kv_f16_bytes`; warn exactly when the split is NOT provable, so
+    // an inflated estimate is never a surprise (R8).
+    if input.gguf.attention_class() == crate::gguf::AttentionClass::HybridLinear
+        && !input.gguf.recurrent_split_provable()
+    {
+        warnings.push(format!(
+            "arch {} is hybrid-linear but the GGUF lacks recurrent_layers/full_attention_interval \
+             metadata — KV estimate counts all layers (upper bound); a newer GGUF conversion may \
+             emit the layer map",
+            input.gguf.architecture
+        ));
+    }
     let kv_est_bytes = kv_f16_bytes(input, ctx).map(|f16| match kv_type.as_deref() {
         Some("q8_0") => f16 / 2,
         Some("q4_0") => f16 / 4,
@@ -950,6 +1082,35 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         gpu: gpu_label,
         kv_est_bytes,
     })
+}
+
+/// Late-chunking ubatch default: upstream embedding-preset scale
+/// (embeddinggemma sets `n_batch` = `n_ubatch` = 2048). One embedding doc
+/// must fit a single micro-batch; a full-ctx ubatch OOMs tight GPUs.
+pub const LATE_CHUNK_UBATCH_DEFAULT: u32 = 2048;
+
+/// Raise an existing `<flag> <value>` argv pair to at least `floor`
+/// (late-chunking correctness: one doc must fit one ubatch). No-op when
+/// the flag is absent or already large enough.
+fn floor_batch_flag(argv: &mut [String], flag: &str, floor: u32) {
+    if let Some(pos) = argv.iter().position(|a| a == flag) {
+        if let Some(v) = argv.get(pos + 1).and_then(|s| s.parse::<u32>().ok()) {
+            if v < floor {
+                argv[pos + 1] = floor.to_string();
+            }
+        }
+    }
+}
+
+/// `floor_batch_flag`, but appends `<flag> <floor>` when the flag is
+/// absent — embedding docs need the knob present at all.
+fn ensure_batch_flag(argv: &mut Vec<String>, flag: &str, floor: u32) {
+    if argv.iter().any(|a| a == flag) {
+        floor_batch_flag(argv, flag, floor);
+    } else {
+        argv.push(flag.to_string());
+        argv.push(floor.to_string());
+    }
 }
 
 /// Effective `ctx`: overlay > config default, clamped to the model's
@@ -1074,6 +1235,15 @@ fn resolve_gpu_offload(
     ("auto", "auto")
 }
 
+/// True for every self-drafting n-gram spec mode ("ngram" is pallama
+/// shorthand for upstream "ngram-simple").
+fn is_ngram_spec(mode: &str) -> bool {
+    matches!(
+        mode,
+        "ngram" | "ngram-map-k" | "ngram-map-k4v" | "ngram-mod" | "ngram-cache"
+    )
+}
+
 /// Rule 11: spec=auto draft pairing. Hard error when the catalog pair
 /// exists but the draft is not pulled.
 fn push_spec_args(
@@ -1125,6 +1295,7 @@ const ROUTER_MODEL_KEYS: &[&str] = &[
     "model",
     "ctx-size",
     "threads",
+    "threads-batch",
     "gpu-layers",
     "flash-attn",
     "cache-reuse",
@@ -1161,6 +1332,16 @@ const ROUTER_MODEL_KEYS: &[&str] = &[
     "spec-ngram-simple-size-m",
     "spec-ngram-simple-size-n",
     "spec-ngram-simple-min-hits",
+    "spec-ngram-map-k-size-m",
+    "spec-ngram-map-k-size-n",
+    "spec-ngram-map-k-min-hits",
+    "spec-ngram-map-k4v-size-m",
+    "spec-ngram-map-k4v-size-n",
+    "spec-ngram-map-k4v-min-hits",
+    "spec-ngram-mod-n-match",
+    "spec-ngram-mod-n-max",
+    "spec-ngram-mod-n-min",
+    "spm-infill",
     "reasoning-budget",
     "reasoning-budget-message",
     "reasoning-effort",
@@ -1350,6 +1531,11 @@ mod tests {
             "-mm",
             "--mmproj",
             "--ubatch-size",
+            "--batch-size",
+            "--threads-batch",
+            "--main-gpu",
+            "--split-mode",
+            "--tensor-split",
             "--cpu-range",
             "--poll",
             "--reasoning-format",
@@ -1381,6 +1567,8 @@ mod tests {
             "--xtc-threshold",
             "--mirostat",
             "--seed",
+            "--embeddings",
+            "--pooling",
         ]
         .iter()
         .map(|f| (*f).to_string())
@@ -1415,6 +1603,7 @@ mod tests {
             sliding_window: None,
             sliding_window_per_layer: None,
             full_attention_interval: None,
+            recurrent_layers: None,
             quantized_by: None,
             general_version: None,
             pooling_type: None,
@@ -1473,7 +1662,50 @@ mod tests {
         chat_template: None,
         chat_template_file: None,
         sampler_defaults: None,
+        spm_infill: None,
+        late_chunking: None,
     };
+
+    #[test]
+    fn unit__late_chunking__forces_embeddings_pooling_none_over_gguf() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        // GGUF says pooling mean (embedding-class model); the R1 override
+        // must win with `none` so the gateway gets a per-token matrix.
+        let mut g = g;
+        g.pooling_type = Some(1);
+        let late = ModelOverride {
+            late_chunking: Some(true),
+            ..ModelOverride::default()
+        };
+        let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        inp.overlay = &late;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p
+            .argv
+            .windows(3)
+            .any(|w| w[0] == "--embeddings" && w[1] == "--pooling" && w[2] == "none"));
+        // no duplicate pooling flag from the GGUF branch
+        assert_eq!(p.argv.iter().filter(|a| *a == "--pooling").count(), 1);
+        // embedding docs must fit one ubatch: default floors at the
+        // upstream preset scale (2048), explicit config.ubatch_size wins
+        assert!(p.argv.windows(2).any(
+            |w| w[0] == "--ubatch-size" && w[1].parse::<u32>() == Ok(LATE_CHUNK_UBATCH_DEFAULT)
+        ));
+        // late off + GGUF pooling -> the metadata branch still wins
+        let mut g2 = meta();
+        g2.pooling_type = Some(1);
+        let p2 = compile(
+            &input(&g2, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p2
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--pooling" && w[1] == "mean"));
+    }
 
     #[test]
     fn unit__profile_base_rules__emitted_in_order() {
@@ -1759,6 +1991,102 @@ mod tests {
         )
         .unwrap();
         assert!(!p2.argv.contains(&"--ubatch-size".to_string()));
+    }
+
+    #[test]
+    fn unit__batch_plumbing__config_knobs_and_tuning_precedence() {
+        let g = meta();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let cfg = Config {
+            batch_size: 4096,
+            ubatch_size: 1024,
+            threads_batch: 4,
+            ..Config::default()
+        };
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--batch-size" && w[1] == "4096"));
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--ubatch-size" && w[1] == "1024"));
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--threads-batch" && w[1] == "4"));
+        // Bench-adopted tuning wins over the config knob (short -b form).
+        let t = TuningOverrides {
+            batch: Some(2048),
+            ubatch: Some(512),
+            ..TuningOverrides::default()
+        };
+        let p2 = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &t).unwrap();
+        assert!(p2.argv.windows(2).any(|w| w[0] == "-b" && w[1] == "2048"));
+        assert!(!p2.argv.contains(&"--batch-size".to_string()));
+        assert!(p2
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--ubatch-size" && w[1] == "512"));
+        // Defaults: nothing emitted.
+        let p3 = compile(
+            &input(&g, &hw, &Config::default(), &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(!p3.argv.contains(&"--batch-size".to_string()));
+        assert!(!p3.argv.contains(&"--threads-batch".to_string()));
+    }
+
+    #[test]
+    fn unit__multi_gpu_split__emitted_and_engine_gated() {
+        let g = meta();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let cfg = Config {
+            main_gpu: 1,
+            split_mode: "row".into(),
+            tensor_split: "3,1".into(),
+            ..Config::default()
+        };
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--main-gpu" && w[1] == "1"));
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--split-mode" && w[1] == "row"));
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--tensor-split" && w[1] == "3,1"));
+        // Old engine lacking the trio: warn-skip, never a hard failure.
+        let sparse: BTreeSet<String> = ALL_FLAGS
+            .iter()
+            .filter(|f| !matches!(f.as_str(), "--main-gpu" | "--split-mode" | "--tensor-split"))
+            .cloned()
+            .collect();
+        let p2 = compile(&input(&g, &hw, &cfg, &sparse), &TuningOverrides::default()).unwrap();
+        assert!(!p2.argv.contains(&"--main-gpu".to_string()));
+        assert!(!p2.argv.contains(&"--split-mode".to_string()));
+        assert!(!p2.argv.contains(&"--tensor-split".to_string()));
+        assert_eq!(
+            p2.warnings
+                .iter()
+                .filter(|w| w.contains("pallama engine update"))
+                .count(),
+            3
+        );
     }
 
     #[test]
@@ -2677,6 +3005,16 @@ mod tests {
             "--spec-ngram-simple-size-m",
             "--spec-ngram-simple-size-n",
             "--spec-ngram-simple-min-hits",
+            "--spec-ngram-map-k-size-m",
+            "--spec-ngram-map-k-size-n",
+            "--spec-ngram-map-k-min-hits",
+            "--spec-ngram-map-k4v-size-m",
+            "--spec-ngram-map-k4v-size-n",
+            "--spec-ngram-map-k4v-min-hits",
+            "--spec-ngram-mod-n-match",
+            "--spec-ngram-mod-n-max",
+            "--spec-ngram-mod-n-min",
+            "--spm-infill",
             "--reasoning-budget",
             "--reasoning-budget-message",
             "--reasoning-effort",
@@ -2820,6 +3158,124 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("--spec-ngram-simple-size-m")));
+    }
+
+    #[test]
+    fn unit__spec_ngram_typed__family_dispatch() {
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        // map-k: generic size knobs feed the map-k flag family.
+        let cfg = Config {
+            spec: "ngram-map-k".into(),
+            ngram_size_m: 64,
+            ngram_size_n: 16,
+            ngram_min_hits: 2,
+            ..Default::default()
+        };
+        let p = compile(
+            &input(&g, &hw, &cfg, &WIRE_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--spec-type" && w[1] == "ngram-map-k"));
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--spec-ngram-map-k-size-m" && w[1] == "64"));
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--spec-ngram-map-k-size-n" && w[1] == "16"));
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--spec-ngram-map-k-min-hits" && w[1] == "2"));
+        assert!(!p.argv.iter().any(|a| a.starts_with("--spec-ngram-simple")));
+        // mod: its own knob family, upstream defaults 24/64/48.
+        let cfg = Config {
+            spec: "ngram-mod".into(),
+            ngram_mod_n_match: 32,
+            ngram_mod_n_max: 96,
+            ngram_mod_n_min: 12,
+            ..Default::default()
+        };
+        let p = compile(
+            &input(&g, &hw, &cfg, &WIRE_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--spec-type" && w[1] == "ngram-mod"));
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--spec-ngram-mod-n-match" && w[1] == "32"));
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--spec-ngram-mod-n-max" && w[1] == "96"));
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--spec-ngram-mod-n-min" && w[1] == "12"));
+        // cache: parameterless — only --spec-type, but the rule-14 lookup
+        // cache still rides when spec_cache is on.
+        let cfg = Config {
+            spec: "ngram-cache".into(),
+            ..Default::default()
+        };
+        let p = compile(
+            &input(&g, &hw, &cfg, &WIRE_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--spec-type" && w[1] == "ngram-cache"));
+        assert!(!p.argv.iter().any(|a| a.starts_with("--spec-ngram-")));
+        assert!(p.argv.windows(2).any(|w| w[0] == "--lookup-cache-dynamic"));
+    }
+
+    #[test]
+    fn unit__overlay_spm_infill__emitted_and_engine_gated() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let o = ModelOverride {
+            spm_infill: Some(true),
+            ..Default::default()
+        };
+        let mut inp = input(&g, &hw, &cfg, &WIRE_FLAGS);
+        inp.overlay = &o;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p.argv.contains(&"--spm-infill".to_string()));
+        // Old engine: warn-skip, argv clean, compile still OK.
+        let sparse: BTreeSet<String> = WIRE_FLAGS
+            .iter()
+            .filter(|f| !f.starts_with("--spm-infill"))
+            .cloned()
+            .collect();
+        let mut inp2 = input(&g, &hw, &cfg, &sparse);
+        inp2.overlay = &o;
+        let p2 = compile(&inp2, &TuningOverrides::default()).unwrap();
+        assert!(!p2.argv.contains(&"--spm-infill".to_string()));
+        assert!(p2.warnings.iter().any(|w| w.contains("--spm-infill")));
+        // Some(false) = explicitly off: nothing emitted, no warning.
+        let o_off = ModelOverride {
+            spm_infill: Some(false),
+            ..Default::default()
+        };
+        let mut inp3 = input(&g, &hw, &cfg, &WIRE_FLAGS);
+        inp3.overlay = &o_off;
+        let p3 = compile(&inp3, &TuningOverrides::default()).unwrap();
+        assert!(!p3.argv.contains(&"--spm-infill".to_string()));
+        assert!(p3.warnings.is_empty(), "{:?}", p3.warnings);
     }
 
     #[test]
@@ -2989,6 +3445,59 @@ mod tests {
         };
         let p2 = compile(&inp, &t).unwrap();
         assert_eq!(p2.kv_est_bytes, Some(f16 / 2));
+    }
+
+    #[test]
+    fn unit__wire__hybrid_linear_without_metadata_warns_and_counts_all_layers() {
+        let cfg = Config::default();
+        let hw = gpu_hw(120_000, 64_000, 8); // huge VRAM: no ladder quant
+        let mut g = meta();
+        g.architecture = "kimi-k3".into();
+        // No recurrent_layers array and no full_attention_interval: the
+        // split is unprovable, so the estimate must stay a full-layer upper
+        // bound and the profile must say so.
+        let inp = input(&g, &hw, &cfg, &WIRE_FLAGS);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        let full = p.kv_est_bytes.expect("geometry present");
+        assert_eq!(full, 2 * 28 * 8 * 64 * 16_384 * 2);
+        assert!(
+            p.warnings.iter().any(|w| w.contains("hybrid-linear")),
+            "expected hybrid-linear upper-bound warning, got {:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__wire__hybrid_linear_interval_fractional_kv_no_warning() {
+        let cfg = Config::default();
+        let hw = gpu_hw(120_000, 64_000, 8); // huge VRAM: no ladder quant
+        let mut g = meta();
+        // qwen35-class: interval 4 over 28 blocks -> 7 full-attention
+        // layers; the other 21 are recurrent (gated delta net) and carry no
+        // per-token KV. The split is provable, so no warning and the KV
+        // estimate is the fractional truth downstream consumers see.
+        g.architecture = "qwen35".into();
+        g.full_attention_interval = Some(4);
+        let inp = input(&g, &hw, &cfg, &WIRE_FLAGS);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert_eq!(
+            p.kv_est_bytes,
+            Some(2 * 7 * 8 * 64 * 16_384 * 2),
+            "expected 7/28 of the full-attention KV"
+        );
+        assert!(
+            !p.warnings.iter().any(|w| w.contains("hybrid-linear")),
+            "provable split must not warn, got {:?}",
+            p.warnings
+        );
+        // Downstream ladder math consumes the fractional number: a forced
+        // q8_0 grade halves the quarter estimate, not a full-layer one.
+        let t = TuningOverrides {
+            kv_quant: Some(true),
+            ..Default::default()
+        };
+        let p2 = compile(&inp, &t).unwrap();
+        assert_eq!(p2.kv_est_bytes, Some(2 * 7 * 8 * 64 * 16_384 * 2 / 2));
     }
 
     #[test]
