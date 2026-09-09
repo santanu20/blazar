@@ -1638,7 +1638,7 @@ checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
 name = "pallama-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1667,7 +1667,7 @@ dependencies = [
 
 [[package]]
 name = "pallama-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dirs",
  "rusqlite",
@@ -1683,7 +1683,7 @@ dependencies = [
 
 [[package]]
 name = "pallama-gateway"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1715,7 +1715,7 @@ dependencies = [
 
 [[package]]
 name = "pallama-runtime"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1724,6 +1724,7 @@ dependencies = [
  "dashmap",
  "flate2",
  "futures",
+ "getrandom 0.3.4",
  "http-body-util",
  "hyper",
  "hyper-util",
