@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::Extension;
 use serde_json::{json, Value};
@@ -21,9 +21,10 @@ use tokio_stream::StreamExt as TsExt;
 use pallama_core::store::Store;
 
 use crate::proxy::{
-    affinity_hash, child_base, ensure_with_admission, resolve_model, with_accounting,
+    affinity_hash, child_auth, child_base, ensure_with_admission, resolve_model, with_accounting,
 };
 use crate::queue::Priority;
+use crate::semcache;
 use crate::sentinel;
 use crate::state::AppState;
 use crate::translate as tr;
@@ -326,7 +327,7 @@ async fn ps_router(state: &Arc<AppState>) -> Response {
         Err(e) => return api_error(503, &e.to_string()),
     };
     let url = format!("{}/models", child_base(&engine.endpoint));
-    let resp = state.http.get(&url).send().await;
+    let resp = child_auth(state.http.get(&url), &engine).send().await;
     let Ok(resp) = resp else {
         return api_error(502, "router /models unreachable");
     };
@@ -382,6 +383,19 @@ fn chrono_like_now() -> i64 {
     .unwrap_or(i64::MAX)
 }
 
+/// Names a /api/pull stream must match. The puller publishes under the
+/// normalized registry name ("ggml-org/Qwen3-0.6B-GGUF:Q4_K_M" ->
+/// "qwen3-0.6b"), while early failures (parse/lock/client) are published
+/// by the handler under the raw request target. Match both so every
+/// terminal path reaches the client.
+fn pull_stream_names(target: &str) -> Vec<String> {
+    let mut names = vec![target.to_string()];
+    if let Ok(parsed) = pallama_runtime::hf::parse_pull_target(target) {
+        names.push(pallama_runtime::hf::registry_name(&parsed.repo));
+    }
+    names
+}
+
 /// POST /api/pull — NDJSON progress straight from the event bus; a
 /// duplicate pull errors and closes the stream (ollama semantics).
 #[allow(clippy::similar_names)] // pull_request vs target distinguish intent
@@ -402,7 +416,7 @@ pub async fn pull(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let dirs = state.dirs.clone();
     let bus = state.bus.clone();
     let rx2 = bus.subscribe();
-    let name_for_stream = target.clone();
+    let stream_names = pull_stream_names(&target);
     let events = tokio_stream::wrappers::BroadcastStream::new(rx2);
     // Emit-then-STOP: the terminal line (success/error) must reach the
     // client AND the stream must end right after it. `take_while` drops
@@ -410,18 +424,18 @@ pub async fn pull(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     // into empty 200s); a bare filter_map never ends the body. The
     // unfold state machine gives both guarantees.
     let stream = futures::stream::unfold(
-        (events, false, name_for_stream),
-        |(mut events, done, name)| async move {
+        (events, false, stream_names),
+        |(mut events, done, names)| async move {
             if done {
                 return None;
             }
             loop {
                 match events.next().await {
                     Some(Ok(e)) => {
-                        let (line, terminal) = pull_event_line(&name, &e);
+                        let (line, terminal) = pull_event_line(&names, &e);
                         return Some((
                             Ok::<_, std::io::Error>(Bytes::from(line)),
-                            (events, terminal, name),
+                            (events, terminal, names),
                         ));
                     }
                     // Broadcast lag yields Err: skip it, keep streaming.
@@ -468,21 +482,24 @@ pub async fn pull(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
 }
 
 /// One NDJSON line per pull event; terminal=true ends the stream.
-fn pull_event_line(name: &str, e: &pallama_runtime::PallamaEvent) -> (String, bool) {
+/// `names` holds both the raw request target and the normalized registry
+/// name (see `pull_stream_names`).
+fn pull_event_line(names: &[String], e: &pallama_runtime::PallamaEvent) -> (String, bool) {
     use pallama_runtime::PallamaEvent::{ModelPulled, PullFailed, PullProgress};
+    let matches = |n: &str| names.iter().any(|nm| n == nm);
     match e {
         PullProgress {
             name: n,
             downloaded,
             total,
-        } if n == name => (
+        } if matches(n) => (
             format!(
                 "{}\n",
                 json!({"status": "pulling", "total": total, "completed": downloaded})
             ),
             false,
         ),
-        ModelPulled { name: n, warning } if n == name => {
+        ModelPulled { name: n, warning } if matches(n) => {
             // ollama NDJSON parity + the health warning when the GGUF
             // header did not parse (quant alternatives included).
             let mut payload = json!({"status": "success"});
@@ -491,7 +508,7 @@ fn pull_event_line(name: &str, e: &pallama_runtime::PallamaEvent) -> (String, bo
             }
             (format!("{payload}\n"), true)
         }
-        PullFailed { name: n, error } if n == name => {
+        PullFailed { name: n, error } if matches(n) => {
             (format!("{}\n", json!({"error": error})), true)
         }
         _ => (String::new(), false),
@@ -561,7 +578,9 @@ pub async fn chat(
     if let Some((remote, remote_model)) = crate::remotes::split_remote(&model_field, &state.config)
     {
         let remote = remote.clone();
-        return crate::remotes::ollama_chat_remote(&state, &remote, remote_model, &req).await;
+        let resp = crate::remotes::ollama_chat_remote(&state, &remote, remote_model, &req).await;
+        crate::remotes::note_remote_result(&state, &remote, resp.status().as_u16() < 500);
+        return resp;
     }
     let (openai_req, num_ctx) = match tr::chat_to_openai(&req) {
         Ok(r) => r,
@@ -593,6 +612,11 @@ pub async fn chat(
     if let Some(err) = crate::sentinel::strict_tool_def_error(&req) {
         return api_error(400, &format!("invalid tools: {err}"));
     }
+    // Structured-output lint (R9): malformed format/grammar fails fast
+    // before admission instead of dying at the child (or being ignored).
+    if let Some(err) = crate::sentinel::structured_output_error(&req) {
+        return api_error(400, &format!("invalid structured output: {err}"));
+    }
     // Prompt-fit preflight (num_ctx request override counts).
     {
         let eff = match req
@@ -611,6 +635,83 @@ pub async fn chat(
         .await
         {
             return resp;
+        }
+    }
+
+    // R4 semantic cache (ollama lane, non-stream only). A hit skips model
+    // admission entirely; embed failures bypass (never fail the request);
+    // malformed override headers fail fast (400). Key-scoped keys whose
+    // scope excludes the embed model bypass silently (the embed admission
+    // would be rejected anyway — no point failing the chat for it).
+    // Structured-output requests (grammar or any non-null format) bypass
+    // in BOTH directions: a constraint narrows the valid response space,
+    // so serving a cached unconstrained answer — or storing a constrained
+    // one for later unconstrained reuse — violates the constraint
+    // (live-pinned 11499: a malformed-grammar request was served a
+    // semantic-cache 200 instead of the child's 400).
+    let constrained = req
+        .get("grammar")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| !s.is_empty())
+        || req.get("format").is_some_and(|v| !v.is_null());
+    let mut sem_ctx: Option<semcache::SemCtx> = None;
+    if !req["stream"].as_bool().unwrap_or(true) && !constrained {
+        let sc = &state.config.semantic_cache;
+        match semcache::directive(
+            sc.enabled,
+            sc.model.is_some(),
+            sc.ttl_secs,
+            sc.threshold,
+            |h| {
+                headers
+                    .get(h)
+                    .and_then(|v| v.to_str().ok().map(str::to_string))
+            },
+        ) {
+            Err(msg) => return api_error(400, &msg),
+            Ok(Some(directive)) => {
+                let embed_model = sc.model.clone().unwrap_or_default();
+                let scope_ok = key_entry
+                    .as_ref()
+                    .is_none_or(|(_, e)| e.models.is_empty() || e.models.contains(&embed_model));
+                if scope_ok {
+                    let prompt_text = emb_prompt_text(&req);
+                    match semcache::embed_prompt(&state, &embed_model, &prompt_text).await {
+                        Ok(emb) => {
+                            let key_name = key_entry.as_ref().map(|(n, _)| n.clone());
+                            if let Some((id, sim, cached)) = state.semcache.lookup(
+                                semcache::LANE_OLLAMA,
+                                &row.name,
+                                key_name.as_deref(),
+                                &emb,
+                                directive.threshold,
+                            ) {
+                                state
+                                    .sem
+                                    .hits
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                return semcache_hit_response(&row.name, &cached, id, sim);
+                            }
+                            state
+                                .sem
+                                .misses
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            sem_ctx = Some(semcache::SemCtx {
+                                emb,
+                                directive,
+                                key: key_name,
+                            });
+                        }
+                        Err(_) => {
+                            state
+                                .sem
+                                .embed_failures
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+            Ok(None) => {}
         }
     }
 
@@ -667,11 +768,23 @@ pub async fn chat(
             load_ms,
             trace_ext.map(|Extension(t)| t.0),
             enforce,
+            sem_ctx,
         )
         .await;
         // keep_alive=0: evict right after this response (complaint #12),
-        // banking the KV checkpoint first.
-        if keep_alive == Some(0) {
+        // banking the KV checkpoint first. A live session pin wins (R3):
+        // the client asked to keep the model for its session — the pin's
+        // TTL (or an explicit close / force stop) ends the protection.
+        if keep_alive == Some(0)
+            && !state2
+                .sup
+                .sessions
+                .pins(
+                    &model_name,
+                    std::time::Duration::from_secs(state2.config.session_keep_secs),
+                )
+                .live
+        {
             let _ = state2.sup.evict_model(&model_name).await;
         }
         resp
@@ -690,6 +803,46 @@ fn parse_keep_alive(v: Option<&Value>) -> Option<i64> {
     let v = v?;
     v.as_i64()
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
+/// Text fed to the embed model for the semantic cache: role-tagged
+/// message contents, so "write code: X" and "review code: X" embed
+/// differently. System + user + assistant history all participate.
+fn emb_prompt_text(req: &Value) -> String {
+    let mut out = String::new();
+    if let Some(msgs) = req["messages"].as_array() {
+        for m in msgs {
+            let role = m["role"].as_str().unwrap_or("user");
+            if let Some(content) = m["content"].as_str() {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(role);
+                out.push_str(": ");
+                out.push_str(content);
+            }
+        }
+    }
+    out
+}
+
+/// Serve a semantic-cache hit: translate the stored `OpenAI` shape back to
+/// ollama (same code path as a live response), attach `cache_debug` and
+/// hit headers. Eval counts come from the original generation.
+fn semcache_hit_response(model: &str, cached: &Value, id: u64, sim: f32) -> Response {
+    let mut ollama = tr::openai_chat_to_ollama(model, cached);
+    ollama["cache_debug"] = serde_json::json!({
+        "cache_hit": true,
+        "hit_type": "semantic",
+        "similarity": sim,
+        "cache_id": id,
+    });
+    let mut resp = axum::Json(ollama).into_response();
+    let headers = resp.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(&format!("hit; similarity={sim:.3}")) {
+        headers.insert(semcache::HDR_CACHE, v);
+    }
+    resp
 }
 
 pub(crate) async fn apply_num_ctx(
@@ -763,19 +916,26 @@ async fn proxy_core_chat(
     load_ms: u128,
     trace: Option<String>,
     enforce: bool,
+    sem: Option<semcache::SemCtx>,
 ) -> Response {
     let base = child_base(&engine.endpoint);
     let url = format!("{base}/v1/chat/completions");
-    let req = state
-        .http
-        .post(&url)
-        .header("content-type", "application/json");
+    let req = child_auth(
+        state
+            .http
+            .post(&url)
+            .header("content-type", "application/json"),
+        engine,
+    );
     if !stream {
         // We translate the non-stream response into ollama shape.
         let t0 = std::time::Instant::now();
+        let ttft_secs;
         let resp = match req.body(openai_body.clone()).send().await {
             Ok(r) => {
-                state.ttft.observe_secs(t0.elapsed().as_secs_f64());
+                let s = t0.elapsed().as_secs_f64();
+                state.ttft.observe_secs(s);
+                ttft_secs = Some(s);
                 r
             }
             Err(e) => {
@@ -795,6 +955,16 @@ async fn proxy_core_chat(
             Ok(v) => v,
             Err(e) => return api_error(502, &format!("bad engine response: {e}")),
         };
+        // Cache observability (R6): classify this completed response
+        // warm/cold from its usage object before translation.
+        match openai.get("usage") {
+            Some(u) => state.obs.record(
+                u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
+                tr::cached_prompt_tokens(openai.get("usage")),
+                ttft_secs,
+            ),
+            None => state.obs.miss(),
+        }
         // Non-stream + enforce: judge before translation (streaming stays
         // warn-only — bytes are already on the wire).
         if enforce {
@@ -832,6 +1002,29 @@ async fn proxy_core_chat(
         if load_ms > 100 {
             ollama["load_duration"] = json!(u64::try_from(load_ms).unwrap_or(u64::MAX) * 1_000_000);
         }
+        // R4: file the response for future semantic hits (miss path from
+        // chat()). Decorates with cache_debug + miss header so clients can
+        // distinguish "computed now" from "served from cache".
+        if let Some(sem) = sem {
+            let id = state.semcache.store(
+                semcache::LANE_OLLAMA,
+                model,
+                sem.key.as_deref(),
+                sem.emb,
+                openai,
+                sem.directive.ttl,
+                state.config.semantic_cache.max_entries,
+            );
+            state
+                .sem
+                .stores
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ollama["cache_debug"] = serde_json::json!({"cache_hit": false, "cache_id": id});
+            let mut resp = axum::Json(ollama).into_response();
+            resp.headers_mut()
+                .insert(semcache::HDR_CACHE, HeaderValue::from_static("miss"));
+            return resp;
+        }
         return axum::Json(ollama).into_response();
     }
     // Stream: child SSE -> ollama NDJSON with final counts. Force the
@@ -841,13 +1034,16 @@ async fn proxy_core_chat(
     body_with_usage["stream_options"] = json!({"include_usage": true});
     let openai_body = serde_json::to_vec(&body_with_usage).unwrap_or_default();
     let _ = req; // silence unused in this branch
-    let resp = match state
-        .http
-        .post(&url)
-        .header("content-type", "application/json")
-        .body(openai_body.clone())
-        .send()
-        .await
+    let resp = match child_auth(
+        state
+            .http
+            .post(&url)
+            .header("content-type", "application/json"),
+        engine,
+    )
+    .body(openai_body.clone())
+    .send()
+    .await
     {
         Ok(r) => r,
         Err(e) => {
@@ -922,8 +1118,19 @@ async fn proxy_core_chat(
             None::<String>,
             false,
             std::sync::Arc::clone(&clock),
+            std::sync::Arc::clone(&state.obs),
         ),
-        |(mut stream, mut buf, model, mut done, mut usage, mut finish, mut usage_sent, clock)| async move {
+        |(
+            mut stream,
+            mut buf,
+            model,
+            mut done,
+            mut usage,
+            mut finish,
+            mut usage_sent,
+            clock,
+            obs,
+        )| async move {
             loop {
                 if done && !usage_sent {
                     // Decode window = last - first byte; total = full wall.
@@ -934,6 +1141,20 @@ async fn proxy_core_chat(
                             None => (None, (c.1 > 0).then_some(c.1)),
                         }
                     };
+                    // Cache observability (R6): classify exactly once at
+                    // completion — first-byte time is the TTFT evidence.
+                    let ttft_secs = {
+                        let c = clock.lock().unwrap();
+                        c.0.map(|ns| std::time::Duration::from_nanos(ns).as_secs_f64())
+                    };
+                    match usage.as_ref() {
+                        Some(u) => obs.record(
+                            u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
+                            tr::cached_prompt_tokens(usage.as_ref()),
+                            ttft_secs,
+                        ),
+                        None => obs.miss(),
+                    }
                     let final_chunk = tr::ollama_final_chunk(
                         &model,
                         usage.as_ref(),
@@ -944,7 +1165,9 @@ async fn proxy_core_chat(
                     usage_sent = true;
                     return Some((
                         Ok(Bytes::from(format!("{final_chunk}\n"))),
-                        (stream, buf, model, done, usage, finish, usage_sent, clock),
+                        (
+                            stream, buf, model, done, usage, finish, usage_sent, clock, obs,
+                        ),
                     ));
                 }
                 match futures::StreamExt::next(&mut stream).await {
@@ -976,13 +1199,17 @@ async fn proxy_core_chat(
                         let body = lines.join("");
                         return Some((
                             Ok(Bytes::from(body)),
-                            (stream, buf, model, done, usage, finish, usage_sent, clock),
+                            (
+                                stream, buf, model, done, usage, finish, usage_sent, clock, obs,
+                            ),
                         ));
                     }
                     Some(Err(e)) => {
                         return Some((
                             Err(std::io::Error::other(e.to_string())),
-                            (stream, buf, model, done, usage, finish, usage_sent, clock),
+                            (
+                                stream, buf, model, done, usage, finish, usage_sent, clock, obs,
+                            ),
                         ));
                     }
                     None => {
@@ -1022,8 +1249,9 @@ pub async fn embeddings(
         Err(e) => return api_error(400, &e),
     };
     let model = openai_req["model"].as_str().unwrap_or_default().to_string();
-    // Scope + request count (embeddings carry no token usage; budgets
-    // apply on request counts only for this route).
+    // Scope + request count (plain embeds carry no token usage, so budgets
+    // apply on request counts; late-chunking embeds additionally charge
+    // their exact token count below).
     if let Some(Extension(k)) = &key_ext {
         if let Some(entry) = state.keys.entry(&k.name) {
             if let Err(rej) = state.keys.check(&entry, &model) {
@@ -1037,8 +1265,31 @@ pub async fn embeddings(
         Err(resp) => return resp,
     };
     with_accounting(&state, &engine.name.clone(), async {
+        // R1 late chunking: gateway-terminated embed for opted-in models.
+        if state.config.effective_late_chunking(&engine.name) {
+            let prompt = req["prompt"].as_str().unwrap_or_default().to_string();
+            return match crate::latechunk::late_embed(&state, &engine, &model, &[prompt]).await {
+                Ok(out) => {
+                    if let Some(Extension(k)) = &key_ext {
+                        state.keys.charge_tokens(&k.name, out.total_tokens);
+                    }
+                    axum::Json(json!({
+                        "model": model,
+                        "embedding": out.embeddings.into_iter().next().unwrap_or_default(),
+                        "prompt_eval_count": out.total_tokens,
+                        "late_chunking": true,
+                    }))
+                    .into_response()
+                }
+                Err((code, msg)) => api_error(code, &msg),
+            };
+        }
         let url = format!("{}/v1/embeddings", child_base(&engine.endpoint));
-        let resp = match state.http.post(&url).json(&openai_req).send().await {
+        let resp = match child_auth(state.http.post(&url), &engine)
+            .json(&openai_req)
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(e) => return api_error(502, &format!("engine request failed: {e:#}")),
         };
@@ -1095,9 +1346,43 @@ pub async fn embed(
         Err(resp) => return resp,
     };
     with_accounting(&state, &engine.name.clone(), async {
+        // R1 late chunking: embed the joined document once (per-token
+        // matrix from the pooling=none child), mean-pool per chunk span.
+        if state.config.effective_late_chunking(&engine.name) {
+            let strings: Option<Vec<String>> = inputs
+                .iter()
+                .map(|v| v.as_str().map(str::to_string))
+                .collect();
+            let Some(strings) = strings else {
+                return api_error(
+                    400,
+                    "late chunking: \"input\" array must contain only strings",
+                );
+            };
+            return match crate::latechunk::late_embed(&state, &engine, &model, &strings).await {
+                Ok(out) => {
+                    if let Some(Extension(k)) = &key_ext {
+                        state.keys.charge_tokens(&k.name, out.total_tokens);
+                    }
+                    axum::Json(json!({
+                        "model": model,
+                        "embeddings": out.embeddings,
+                        "prompt_eval_count": out.total_tokens,
+                        "total_tokens": out.total_tokens,
+                        "late_chunking": true,
+                    }))
+                    .into_response()
+                }
+                Err((code, msg)) => api_error(code, &msg),
+            };
+        }
         let url = format!("{}/v1/embeddings", child_base(&engine.endpoint));
         let openai_req = json!({"model": model, "input": inputs});
-        let resp = match state.http.post(&url).json(&openai_req).send().await {
+        let resp = match child_auth(state.http.post(&url), &engine)
+            .json(&openai_req)
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(e) => return api_error(502, &format!("engine request failed: {e:#}")),
         };
@@ -1177,7 +1462,11 @@ pub async fn rerank(
     };
     with_accounting(&state, &engine.name.clone(), async {
         let url = format!("{}/v1/rerank", child_base(&engine.endpoint));
-        let resp = match state.http.post(&url).json(&forward).send().await {
+        let resp = match child_auth(state.http.post(&url), &engine)
+            .json(&forward)
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(e) => return api_error(502, &format!("engine request failed: {e:#}")),
         };
@@ -1242,7 +1531,11 @@ pub async fn generate(
         };
     let mut out = with_accounting(&state, &engine.name.clone(), async {
         let url = format!("{}/v1/completions", child_base(&engine.endpoint));
-        let resp = match state.http.post(&url).json(&openai_req).send().await {
+        let resp = match child_auth(state.http.post(&url), &engine)
+            .json(&openai_req)
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(e) => return api_error(502, &format!("engine request failed: {e:#}")),
         };
@@ -1298,9 +1591,7 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
             Err(e) => return api_error(503, &e.to_string()),
         };
         let url = format!("{}/models/unload", child_base(&engine.endpoint));
-        return match state
-            .http
-            .post(&url)
+        return match child_auth(state.http.post(&url), &engine)
             .json(&json!({"model": model}))
             .send()
             .await
@@ -1340,15 +1631,36 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
         Ok(v) => v,
         Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
     };
+    let Some(action) = v["action"].as_str() else {
+        return api_error(400, "missing 'action' (save | restore | erase | close)");
+    };
+    if !matches!(action, "save" | "restore" | "erase" | "close") {
+        return api_error(400, "action must be save, restore, erase or close");
+    }
+    // Close releases a session PIN (R3) — no model, slot or checkpoint
+    // involved; safe to run while children are asleep or absent.
+    if action == "close" {
+        let Some(session) = v["session"].as_str() else {
+            return api_error(
+                400,
+                "missing 'session' (the x-pallama-session name to close)",
+            );
+        };
+        if !valid_session_name(session) {
+            return api_error(
+                400,
+                "session must be [A-Za-z0-9._-], not start with '.', max 128 chars",
+            );
+        }
+        let released = state.sup.sessions.release(session);
+        return axum::Json(json!({
+            "status": "ok", "session": session, "released": released
+        }))
+        .into_response();
+    }
     let Some(model) = v["model"].as_str() else {
         return api_error(400, "missing 'model'");
     };
-    let Some(action) = v["action"].as_str() else {
-        return api_error(400, "missing 'action' (save | restore | erase)");
-    };
-    if !matches!(action, "save" | "restore" | "erase") {
-        return api_error(400, "action must be save, restore or erase");
-    }
     let Some(filename) = v["filename"].as_str() else {
         return api_error(400, "missing 'filename'");
     };
@@ -1398,7 +1710,10 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
         } else {
             json!({"filename": filename})
         };
-        let resp = state.http.post(&url).json(&body_json).send().await;
+        let resp = child_auth(state.http.post(&url), &engine)
+            .json(&body_json)
+            .send()
+            .await;
         match resp {
             Ok(r) => {
                 let status =
@@ -1453,6 +1768,72 @@ fn hint_gauge(out: &mut String, rate: Option<f64>, name: &str, help: &str) {
     }
 }
 
+/// Sum one `llamacpp:<name>` counter across the merged child scrapes.
+/// Sample-value lines only (`name <v>`); `_bucket`/`_sum` histogram
+/// suffixes cannot collide with the trailing space.
+fn sum_child_counter(text: &str, name: &str) -> u64 {
+    let prefix = format!("llamacpp:{name} ");
+    text.lines()
+        .filter_map(|l| l.strip_prefix(&prefix))
+        .filter_map(|v| v.split(' ').next())
+        .filter_map(|v| v.parse::<u64>().ok())
+        .sum()
+}
+
+/// Prompt-cache hit ratio from scrape-summed counters. `prompt_processed`
+/// EXCLUDES cached tokens upstream, so the denominator is the sum; returns
+/// `None` when no prompt traffic has been seen yet.
+#[allow(clippy::cast_precision_loss)] // integer counters -> ratio
+fn cache_hit_ratio(cached: u64, prompt_processed: u64) -> Option<f64> {
+    let seen = cached + prompt_processed;
+    (seen > 0).then(|| cached as f64 / seen as f64)
+}
+
+/// Prompt-cache economics block (R6/R7-lite): scrape-summed child
+/// counters as the authoritative hit ratio + the gateway-observed
+/// per-response split (counters + warm/cold TTFT histograms).
+fn cache_metrics(state: &AppState, merged: &mut String) {
+    let cached_total = sum_child_counter(merged, "prompt_tokens_cached_total");
+    // Upstream `prompt_tokens_total` counts tokens PROCESSED, excluding cached
+    // ones (server-task.cpp metric help), so the hit ratio denominator is the
+    // sum — cached/processed alone can exceed 1.
+    let prompt_processed = sum_child_counter(merged, "prompt_tokens_total");
+    if let Some(ratio) = cache_hit_ratio(cached_total, prompt_processed) {
+        let _ = write!(
+            merged,
+            "# HELP pallama_cache_hit_ratio Reused prompt tokens / all prompt tokens seen (cached + processed), summed from live engine scrapes (authoritative)\n# TYPE pallama_cache_hit_ratio gauge\npallama_cache_hit_ratio {ratio:.4}\n"
+        );
+    }
+    let _ = write!(
+        merged,
+        "# HELP pallama_prompt_cached_tokens_observed_total Prompt tokens reported REUSED by completed responses observed at the gateway (per-response usage sum, not the scrape)\n# TYPE pallama_prompt_cached_tokens_observed_total counter\npallama_prompt_cached_tokens_observed_total {}\n# HELP pallama_prompt_tokens_observed_total Prompt tokens reported by completed responses observed at the gateway\n# TYPE pallama_prompt_tokens_observed_total counter\npallama_prompt_tokens_observed_total {}\n# HELP pallama_ttft_unclassified_total Completed responses whose usage never surfaced (aborted before usage chunk or upstream omission) - excluded from the warm/cold split\n# TYPE pallama_ttft_unclassified_total counter\npallama_ttft_unclassified_total {}\n",
+        state.obs.cached_tokens.load(std::sync::atomic::Ordering::Relaxed),
+        state.obs.prompt_tokens.load(std::sync::atomic::Ordering::Relaxed),
+        state.obs.unclassified.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    state.obs.ttft_warm.render(merged);
+    state.obs.ttft_cold.render(merged);
+    let live_sessions = state.sup.sessions.live_len(std::time::Duration::from_secs(
+        state.config.session_keep_secs,
+    ));
+    let _ = write!(
+        merged,
+        "# HELP pallama_sessions_live Sessions with an unexpired eviction pin (x-pallama-session)\n# TYPE pallama_sessions_live gauge\npallama_sessions_live {live_sessions}\n"
+    );
+    let _ = write!(
+        merged,
+        "# HELP pallama_semantic_cache_hits_total Responses served from the semantic cache (x-pallama-cache)\n# TYPE pallama_semantic_cache_hits_total counter\npallama_semantic_cache_hits_total {}\n# HELP pallama_semantic_cache_misses_total Cache-eligible requests that missed (and were stored)\n# TYPE pallama_semantic_cache_misses_total counter\npallama_semantic_cache_misses_total {}\n# HELP pallama_semantic_cache_stores_total Responses filed into the semantic cache\n# TYPE pallama_semantic_cache_stores_total counter\npallama_semantic_cache_stores_total {}\n# HELP pallama_semantic_cache_embed_failures_total Embed-model failures that bypassed the cache (request still served live)\n# TYPE pallama_semantic_cache_embed_failures_total counter\npallama_semantic_cache_embed_failures_total {}\n# HELP pallama_semantic_cache_entries Live (non-expired) semantic cache entries\n# TYPE pallama_semantic_cache_entries gauge\npallama_semantic_cache_entries {}\n",
+        state.sem.hits.load(std::sync::atomic::Ordering::Relaxed),
+        state.sem.misses.load(std::sync::atomic::Ordering::Relaxed),
+        state.sem.stores.load(std::sync::atomic::Ordering::Relaxed),
+        state
+            .sem
+            .embed_failures
+            .load(std::sync::atomic::Ordering::Relaxed),
+        state.semcache.live_len(),
+    );
+}
+
 /// Active engine build gauge; absent when the store is not readable.
 fn engine_build_gauge(state: &AppState, out: &mut String) {
     if let Ok(store) = Store::open(&state.dirs) {
@@ -1470,9 +1851,12 @@ fn engine_build_gauge(state: &AppState, out: &mut String) {
 
 pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     let mut merged = String::new();
-    for p in state.sup.ps() {
-        let url = format!("http://{}/metrics", p.endpoint);
-        if let Ok(resp) = state.http.get(&url).send().await {
+    for e in state.sup.live_http_endpoints() {
+        let pallama_core::profile::Endpoint::Tcp { host, port } = &e.endpoint else {
+            continue;
+        };
+        let url = format!("http://{host}:{port}/metrics");
+        if let Ok(resp) = child_auth(state.http.get(&url), &e).send().await {
             if resp.status().is_success() {
                 if let Ok(text) = resp.text().await {
                     merged.push_str(&text);
@@ -1481,6 +1865,10 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
             }
         }
     }
+    // Prompt-cache economics (R6/R7-lite): authoritative child-side
+    // counters summed across live engines (scrape time = truth), plus
+    // the gateway-observed warm/cold split.
+    cache_metrics(&state, &mut merged);
     let _ = write!(
         merged,
         "# HELP pallama_models_loaded Models currently loaded\n# TYPE pallama_models_loaded gauge\npallama_models_loaded {}\n",
@@ -1577,9 +1965,68 @@ mod tests {
     use pallama_runtime::PallamaEvent;
 
     #[test]
+    fn unit__pull_stream_names__raw_target_includes_registry_name() {
+        // Regression pin (2026-09-09 /api/pull stream starvation): events
+        // publish under the registry name, the client asked by raw target.
+        let names = pull_stream_names("ggml-org/Qwen3-0.6B-GGUF:Q4_K_M");
+        assert!(names.contains(&"ggml-org/Qwen3-0.6B-GGUF:Q4_K_M".to_string()));
+        assert!(names.contains(&"qwen3-0.6b".to_string()));
+    }
+
+    #[test]
+    fn unit__pull_stream_names__bogus_target_keeps_raw() {
+        let names = pull_stream_names("::no such repo::");
+        assert_eq!(names, vec!["::no such repo::".to_string()]);
+    }
+
+    #[test]
+    fn unit__pull_event_line__normalized_event_matches_raw_request_filter() {
+        // The exact lane that hung: request by raw HF coordinate, events
+        // arrive under the normalized registry name -> must terminate.
+        let names = pull_stream_names("ggml-org/Qwen3-0.6B-GGUF:Q4_K_M");
+        let (line, progress) = pull_event_line(
+            &names,
+            &PallamaEvent::PullProgress {
+                name: "qwen3-0.6b".into(),
+                downloaded: 1,
+                total: 10,
+            },
+        );
+        assert!(!progress);
+        assert!(
+            line.contains("\"status\":\"pulling\"") || line.contains("\"status\": \"pulling\"")
+        );
+        let (line, done) = pull_event_line(
+            &names,
+            &PallamaEvent::ModelPulled {
+                name: "qwen3-0.6b".into(),
+                warning: None,
+            },
+        );
+        assert!(done);
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["status"], "success");
+    }
+
+    #[test]
+    fn unit__pull_event_line__handler_failure_path_matches_raw_target() {
+        // Parse/lock failures publish PullFailed under the RAW target.
+        let names = pull_stream_names("ggml-org/Qwen3-0.6B-GGUF:Q4_K_M");
+        let (line, done) = pull_event_line(
+            &names,
+            &PallamaEvent::PullFailed {
+                name: "ggml-org/Qwen3-0.6B-GGUF:Q4_K_M".into(),
+                error: "pull already in flight".into(),
+            },
+        );
+        assert!(done);
+        assert!(line.contains("already in flight"));
+    }
+
+    #[test]
     fn unit__pull_event_line__warning_rides_success_ndjson() {
         let (line, done) = pull_event_line(
-            "m1",
+            &["m1".to_string()],
             &PallamaEvent::ModelPulled {
                 name: "m1".into(),
                 warning: Some("GGUF metadata unreadable: try Q8_0".into()),
@@ -1594,7 +2041,7 @@ mod tests {
     #[test]
     fn unit__pull_event_line__clean_pull_has_no_warning_field() {
         let (line, done) = pull_event_line(
-            "m1",
+            &["m1".to_string()],
             &PallamaEvent::ModelPulled {
                 name: "m1".into(),
                 warning: None,
@@ -1604,5 +2051,42 @@ mod tests {
         let v: Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(v["status"], "success");
         assert!(v.get("warning").is_none());
+    }
+
+    #[test]
+    fn unit__sum_child_counter__sums_samples_and_ignores_collisions() {
+        // Two children merged into one scrape: sample values sum.
+        let scrape = "llamacpp:prompt_tokens_cached_total 96\n\
+                      # HELP llamacpp:prompt_tokens_cached_total tokens\n\
+                      llamacpp:prompt_tokens_cached_total 24\n\
+                      llamacpp:prompt_tokens_total 240\n\
+                      llamacpp:prompt_tokens_cached_total_bucket{le=\"1\"} 7\n";
+        assert_eq!(sum_child_counter(scrape, "prompt_tokens_cached_total"), 120);
+        assert_eq!(sum_child_counter(scrape, "prompt_tokens_total"), 240);
+        // Distinct name must not match the longer counter's lines.
+        assert_eq!(
+            sum_child_counter(
+                "llamacpp:prompt_tokens_cached_total 5\n",
+                "prompt_tokens_total"
+            ),
+            0
+        );
+        // Missing name, non-numeric sample, empty text: zero.
+        assert_eq!(sum_child_counter("", "prompt_tokens_total"), 0);
+        assert_eq!(sum_child_counter("llamacpp:x nan\n", "x"), 0);
+    }
+
+    #[test]
+    fn unit__cache_hit_ratio__denominator_includes_cached() {
+        // Pin (live 11499, 2026-09-09): upstream `prompt_tokens_total` counts
+        // processed tokens EXCLUDING cached ones, so cached/processed hit
+        // 2.27 > 1 on a warm sandbox. The ratio must be cached/(cached+processed).
+        let ratio = cache_hit_ratio(157, 69).expect("traffic seen -> ratio");
+        assert!((ratio - 157.0 / 226.0).abs() < 1e-12, "got {ratio}");
+        // All-cached and all-processed extremes stay inside [0, 1].
+        assert_eq!(cache_hit_ratio(100, 0), Some(1.0));
+        assert_eq!(cache_hit_ratio(0, 100), Some(0.0));
+        // No prompt traffic yet: no gauge.
+        assert_eq!(cache_hit_ratio(0, 0), None);
     }
 }

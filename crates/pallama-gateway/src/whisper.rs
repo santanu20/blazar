@@ -23,17 +23,17 @@ use crate::remotes::split_remote;
 use crate::state::AppState;
 
 /// One parsed multipart part.
-struct Part {
-    name: String,
-    filename: Option<String>,
-    content_type: Option<String>,
-    data: Vec<u8>,
+pub(crate) struct Part {
+    pub(crate) name: String,
+    pub(crate) filename: Option<String>,
+    pub(crate) content_type: Option<String>,
+    pub(crate) data: Vec<u8>,
 }
 
 /// Boundary-aware multipart split (RFC 2046 essentials: `--boundary`
 /// delimiters, CRLF-separated part headers, `--boundary--` terminator).
 /// Returns None on structural garbage (caller 400s).
-fn parse_multipart(body: &[u8], content_type: &str) -> Option<Vec<Part>> {
+pub(crate) fn parse_multipart(body: &[u8], content_type: &str) -> Option<Vec<Part>> {
     let boundary = content_type
         .split(';')
         .map(str::trim)
@@ -233,11 +233,10 @@ pub async fn audio_transcriptions(
 
     // (1) Explicit remote intent wins: `name:model` never goes local.
     if let Some(model) = model.as_deref() {
-        if let Some((remote, remote_model)) = split_remote(model, &state.config) {
-            return crate::remotes::forward_openai(
+        if split_remote(model, &state.config).is_some() {
+            return crate::remotes::forward_with_health(
                 &state,
-                remote,
-                remote_model,
+                model,
                 &method,
                 uri.path_and_query().map_or(
                     "/v1/audio/transcriptions",

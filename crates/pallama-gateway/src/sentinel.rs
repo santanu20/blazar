@@ -128,12 +128,21 @@ pub struct SentinelRecord {
     pub model: String,
     pub status: u16,
     pub stream: bool,
+    /// Engine `finish_reason` (stop / length / `tool_calls` …). `length` on a
+    /// small completion = client budget cap; near ctx = real truncation —
+    /// one glance separates the two in `why`.
+    pub finish: Option<String>,
     pub detections: Vec<Detection>,
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub ctx: Option<u32>,
     pub degraded: bool,
     pub ms: u128,
+    /// Response confidence (R2): mean/min token logprob when the client
+    /// requested logprobs. None = not requested (display skips).
+    pub logprob_mean: Option<f64>,
+    pub logprob_min: Option<f64>,
+    pub logprob_tokens: Option<u64>,
 }
 
 impl SentinelRecord {
@@ -146,6 +155,7 @@ impl SentinelRecord {
             "model": self.model,
             "status": self.status,
             "stream": self.stream,
+            "finish": self.finish,
             "detections": self.detections.iter().map(|d| serde_json::json!({
                 "code": d.code.as_str(),
                 "detail": d.detail,
@@ -157,6 +167,9 @@ impl SentinelRecord {
             "ctx": self.ctx,
             "degraded": self.degraded,
             "ms": self.ms,
+            "logprob_mean": self.logprob_mean,
+            "logprob_min": self.logprob_min,
+            "logprob_tokens": self.logprob_tokens,
         })
     }
 }
@@ -260,6 +273,121 @@ pub fn strict_tool_def_error(body: &Value) -> Option<String> {
                     }
                 }
             }
+        }
+    }
+    None
+}
+
+/// Raw GBNF grammar size cap the gateway will forward (256 KiB — far
+/// beyond any sane grammar, small enough to bound request memory).
+pub const MAX_GRAMMAR_BYTES: usize = 256 * 1024;
+
+/// Structured-output request lint (R9): top-level sanity for ollama
+/// `format`, raw `grammar`, and a client-sent `response_format` BEFORE
+/// admission — a malformed schema or an over-sized grammar fails fast
+/// with a teaching error instead of loading a model to die at the child
+/// (or being silently ignored). Deliberately TOP-LEVEL ONLY: no
+/// recursion, no `$ref` resolution — anything the child's converter
+/// accepts deeper in the schema passes untouched.
+#[must_use]
+pub fn structured_output_error(body: &Value) -> Option<String> {
+    // Raw GBNF grammar: forwarded verbatim downstream — type and cap.
+    let mut grammar_set = false;
+    if let Some(g) = body.get("grammar").filter(|v| !v.is_null()) {
+        match g.as_str() {
+            Some("") => {} // empty = absent
+            Some(s) => {
+                if s.len() > MAX_GRAMMAR_BYTES {
+                    return Some(format!(
+                        "grammar is {} bytes; the gateway cap is {MAX_GRAMMAR_BYTES} bytes",
+                        s.len()
+                    ));
+                }
+                grammar_set = true;
+            }
+            None => return Some("grammar must be a string (GBNF)".into()),
+        }
+    }
+    // ollama `format`: absent/null = unconstrained, "json" = JSON mode,
+    // object = structured schema. Anything else was silently ignored
+    // before — now it fails fast.
+    if let Some(fmt) = body.get("format").filter(|v| !v.is_null()) {
+        match fmt {
+            Value::String(s) if s == "json" => {}
+            Value::String(other) => {
+                return Some(format!(
+                    "format must be \"json\" or a JSON schema object, got {other:?}"
+                ));
+            }
+            Value::Object(_) => {
+                // Mirrors the child's json_schema+grammar mutual exclusion.
+                if grammar_set {
+                    return Some(
+                        "cannot use both format (schema) and grammar — the engine rejects the pair"
+                            .into(),
+                    );
+                }
+                if let Some(e) = schema_shape_error(fmt) {
+                    return Some(e);
+                }
+            }
+            _ => return Some("format must be \"json\" or a JSON schema object".into()),
+        }
+    }
+    // Client-sent `response_format` (OpenAI shape) is NOT consumed on the
+    // ollama lane — but if present and malformed, say so instead of
+    // silently dropping it. Mirrors the child's accepted type set
+    // (server-common.cpp:1168-1180: json_object / json_schema / empty).
+    if let Some(rf) = body.get("response_format").filter(|v| !v.is_null()) {
+        let Some(obj) = rf.as_object() else {
+            return Some("response_format must be an object".into());
+        };
+        if let Some(t) = obj.get("type") {
+            let ok = match t {
+                Value::String(s) => s.is_empty() || s == "json_object" || s == "json_schema",
+                _ => false,
+            };
+            if !ok {
+                return Some(
+                    "response_format.type must be \"json_object\" or \"json_schema\"".into(),
+                );
+            }
+        }
+        if let Some(js) = obj.get("json_schema").filter(|v| !v.is_null()) {
+            if !js.is_object() {
+                return Some("response_format.json_schema must be an object".into());
+            }
+            if let Some(sch) = js.get("schema").filter(|v| !v.is_null()) {
+                if !sch.is_object() {
+                    return Some("response_format.json_schema.schema must be an object".into());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Top-level shape sanity for a schema object carried in ollama `format`.
+fn schema_shape_error(schema: &Value) -> Option<String> {
+    if let Some(p) = schema.get("properties").filter(|v| !v.is_null()) {
+        if !p.is_object() {
+            return Some("format.properties must be an object".into());
+        }
+    }
+    if let Some(r) = schema.get("required").filter(|v| !v.is_null()) {
+        let all_strings = r.as_array().is_some_and(|a| a.iter().all(Value::is_string));
+        if !all_strings {
+            return Some("format.required must be an array of strings".into());
+        }
+    }
+    if let Some(t) = schema.get("type").filter(|v| !v.is_null()) {
+        let ok = match t {
+            Value::String(_) => true,
+            Value::Array(a) => !a.is_empty() && a.iter().all(Value::is_string),
+            _ => false,
+        };
+        if !ok {
+            return Some("format.type must be a string or an array of strings".into());
         }
     }
     None
@@ -997,6 +1125,7 @@ fn request_ms(trace: &str, fallback: std::time::Instant) -> u128 {
     decoded.unwrap_or_else(|| fallback.elapsed().as_millis())
 }
 
+#[allow(clippy::cast_precision_loss)] // token count -> mean divisor
 fn build_record(
     ctx: &RequestCtx,
     acc: &Accum,
@@ -1013,12 +1142,16 @@ fn build_record(
         model: ctx.model.clone(),
         status,
         stream: ctx.stream || sse,
+        finish: acc.finish.clone(),
         detections,
         prompt_tokens: acc.usage_prompt,
         completion_tokens: acc.usage_completion,
         ctx: ctx.ctx,
         degraded,
         ms: request_ms(&ctx.trace, started),
+        logprob_mean: (acc.lp_tokens > 0).then(|| acc.lp_sum / acc.lp_tokens as f64),
+        logprob_min: acc.lp_min,
+        logprob_tokens: (acc.lp_tokens > 0).then_some(acc.lp_tokens),
     }
 }
 
@@ -1070,6 +1203,12 @@ struct Accum {
     last_tool: Option<u64>,
     /// Reasoning seen at all (Responses grammar reports items, not text).
     has_reasoning: bool,
+    /// Logprob confidence (R2): per-token logprobs from
+    /// choices[].logprobs.content[] when the client asked for them.
+    /// Display-only — no detection fires on these.
+    lp_sum: f64,
+    lp_min: Option<f64>,
+    lp_tokens: u64,
 }
 
 #[derive(Default, Clone)]
@@ -1099,6 +1238,23 @@ impl Accum {
         for choice in choices {
             if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
                 self.finish = Some(fr.to_string());
+            }
+            // Logprob confidence (R2): same shape on stream chunks and
+            // complete bodies — content[].logprob per token.
+            if let Some(lps) = choice
+                .pointer("/logprobs/content")
+                .and_then(Value::as_array)
+            {
+                for lp in lps {
+                    if let Some(v) = lp.get("logprob").and_then(Value::as_f64) {
+                        self.lp_sum += v;
+                        self.lp_tokens += 1;
+                        self.lp_min = Some(match self.lp_min {
+                            Some(m) if m <= v => m,
+                            _ => v,
+                        });
+                    }
+                }
             }
             let carrier = choice
                 .get("delta")
@@ -1366,6 +1522,7 @@ mod tests {
             model: "m".into(),
             status: 200,
             stream: false,
+            finish: None,
             detections: vec![Detection {
                 code: Code::CtxTruncated,
                 detail: "d".into(),
@@ -1374,6 +1531,9 @@ mod tests {
             completion_tokens: None,
             ctx: None,
             degraded: false,
+            logprob_mean: None,
+            logprob_min: None,
+            logprob_tokens: None,
             ms: 1,
         };
         assert!(rec.to_json()["detections"][0]["retry"]
@@ -1436,6 +1596,142 @@ mod tests {
             .contains("JSON Schema"));
         // No tools / no strict = None.
         assert!(strict_tool_def_error(&serde_json::json!({"model": "m"})).is_none());
+    }
+
+    #[test]
+    fn unit__structured_output__happy_paths_pass() {
+        // Absent / null / "json" / clean schema / empty grammar / clean
+        // response_format — all pass untouched.
+        for body in [
+            serde_json::json!({"model": "m"}),
+            serde_json::json!({"model": "m", "format": null, "grammar": null}),
+            serde_json::json!({"model": "m", "format": "json"}),
+            serde_json::json!({"model": "m", "format": {"type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]}}),
+            serde_json::json!({"model": "m", "grammar": ""}),
+            serde_json::json!({"model": "m", "grammar": "root ::= \"yes\" | \"no\""}),
+            serde_json::json!({"model": "m", "response_format": {"type": "json_object"}}),
+            serde_json::json!({"model": "m", "response_format": {"type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}}}}),
+        ] {
+            assert_eq!(structured_output_error(&body), None, "body: {body}");
+        }
+    }
+
+    #[test]
+    fn unit__structured_output__garbage_format_fails_fast() {
+        // Unknown string / number / bool / array formats were silently
+        // ignored before R9 — now they 400.
+        for fmt in [
+            serde_json::json!("nonsense"),
+            serde_json::json!(5),
+            serde_json::json!(true),
+            serde_json::json!(["object"]),
+        ] {
+            let body = serde_json::json!({"model": "m", "format": fmt});
+            let err = structured_output_error(&body).expect("must fail");
+            assert!(err.contains("format"), "err: {err}");
+        }
+    }
+
+    #[test]
+    fn unit__structured_output__grammar_shape_and_cap() {
+        // Non-string grammar.
+        let body = serde_json::json!({"model": "m", "grammar": 42});
+        assert!(structured_output_error(&body).unwrap().contains("string"));
+        // Over-cap grammar.
+        let huge = "a".repeat(MAX_GRAMMAR_BYTES + 1);
+        let body = serde_json::json!({"model": "m", "grammar": huge});
+        let err = structured_output_error(&body).unwrap();
+        assert!(err.contains("cap"), "err: {err}");
+        // Exactly at cap passes.
+        let edge = "a".repeat(MAX_GRAMMAR_BYTES);
+        let body = serde_json::json!({"model": "m", "grammar": edge});
+        assert_eq!(structured_output_error(&body), None);
+    }
+
+    #[test]
+    fn unit__structured_output__format_and_grammar_mutually_exclusive() {
+        let body = serde_json::json!({
+            "model": "m",
+            "format": {"type": "object"},
+            "grammar": "root ::= \"x\""
+        });
+        let err = structured_output_error(&body).expect("must fail");
+        assert!(err.contains("both"), "err: {err}");
+        // format:"json" + grammar is resolved by the child, not us.
+        let body = serde_json::json!({"model": "m", "format": "json", "grammar": "root ::= \"x\""});
+        assert_eq!(structured_output_error(&body), None);
+    }
+
+    #[test]
+    fn unit__structured_output__schema_top_level_shape() {
+        let bad_props = serde_json::json!({"model": "m", "format": {"properties": 5}});
+        assert!(structured_output_error(&bad_props)
+            .unwrap()
+            .contains("properties"));
+        let bad_required = serde_json::json!({"model": "m", "format": {"required": ["a", 5]}});
+        assert!(structured_output_error(&bad_required)
+            .unwrap()
+            .contains("required"));
+        let bad_required2 = serde_json::json!({"model": "m", "format": {"required": "a"}});
+        assert!(structured_output_error(&bad_required2)
+            .unwrap()
+            .contains("required"));
+        let bad_type = serde_json::json!({"model": "m", "format": {"type": 7}});
+        assert!(structured_output_error(&bad_type).unwrap().contains("type"));
+        // String-array type is legal.
+        let ok = serde_json::json!({"model": "m", "format": {"type": ["object", "null"]}});
+        assert_eq!(structured_output_error(&ok), None);
+    }
+
+    #[test]
+    fn unit__structured_output__exotic_valid_schemas_never_rejected() {
+        // Deep/compound keywords are the child converter's business —
+        // the gateway lint never recurses into them.
+        let exotic = serde_json::json!({
+            "model": "m",
+            "format": {
+                "oneOf": [{"type": "string"}, {"type": "integer"}],
+                "allOf": [{"type": "object"}],
+                "anyOf": [{"type": "null"}],
+                "$ref": "#/definitions/x",
+                "patternProperties": {"^S_": {"type": "string"}},
+                "definitions": {"x": {"type": "string"}},
+                "nested": {"deep": {"deeper": {"required": [5]}}}
+            }
+        });
+        assert_eq!(structured_output_error(&exotic), None);
+    }
+
+    #[test]
+    fn unit__structured_output__response_format_mirrors_child_type_set() {
+        // Unknown non-empty type → 400 (child: server-common.cpp:1180).
+        let body = serde_json::json!({"model": "m", "response_format": {"type": "yaml"}});
+        assert!(structured_output_error(&body)
+            .unwrap()
+            .contains("response_format.type"));
+        // Non-string type.
+        let body = serde_json::json!({"model": "m", "response_format": {"type": 4}});
+        assert!(structured_output_error(&body)
+            .unwrap()
+            .contains("response_format.type"));
+        // Non-object response_format.
+        let body = serde_json::json!({"model": "m", "response_format": "json"});
+        assert!(structured_output_error(&body)
+            .unwrap()
+            .contains("response_format must be"));
+        // json_schema.schema present-non-object.
+        let body = serde_json::json!({"model": "m",
+            "response_format": {"type": "json_schema", "json_schema": {"schema": "oops"}}});
+        assert!(structured_output_error(&body)
+            .unwrap()
+            .contains("schema must be an object"));
+        // Absent schema inside json_schema = pass (child defaults {}).
+        let body = serde_json::json!({"model": "m",
+            "response_format": {"type": "json_schema", "json_schema": {}}});
+        assert_eq!(structured_output_error(&body), None);
     }
 
     #[test]
@@ -1605,6 +1901,98 @@ mod tests {
     }
 
     #[test]
+    fn unit__apply__logprobs_accumulate_mean_min_tokens() {
+        let mut acc = Accum::default();
+        acc.apply(
+            &json!({"choices": [{"delta": {"content": "he"}, "logprobs": {"content": [
+                {"token": "he", "logprob": -0.2}, {"token": "llo", "logprob": -1.9}
+            ]}}]}),
+        );
+        acc.apply(
+            &json!({"choices": [{"delta": {"content": "llo"}, "logprobs": {"content": [
+                {"token": "!", "logprob": -0.5}
+            ]}}]}),
+        );
+        // A chunk without logprobs (client opted out mid-stream, or the
+        // usage/final event) must not disturb the accumulation.
+        acc.apply(&json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}));
+        assert_eq!(acc.lp_tokens, 3);
+        assert!((acc.lp_sum - (-2.6)).abs() < 1e-9, "{}", acc.lp_sum);
+        assert_eq!(acc.lp_min, Some(-1.9));
+    }
+
+    #[test]
+    fn unit__build_record__logprob_fields_populated_or_none() {
+        let mut acc = Accum::default();
+        acc.apply(
+            &json!({"choices": [{"delta": {"content": "x"}, "logprobs": {"content": [
+                {"logprob": -0.5}, {"logprob": -1.5}
+            ]}}]}),
+        );
+        let rec = build_record(
+            &RequestCtx::default(),
+            &acc,
+            vec![],
+            200,
+            false,
+            false,
+            std::time::Instant::now(),
+        );
+        let mean = rec.logprob_mean.expect("mean");
+        assert!((mean - (-1.0)).abs() < 1e-9, "{mean}");
+        assert_eq!(rec.logprob_min, Some(-1.5));
+        assert_eq!(rec.logprob_tokens, Some(2));
+        // No logprobs requested -> all None, JSON stays lean.
+        let bare = build_record(
+            &RequestCtx::default(),
+            &Accum::default(),
+            vec![],
+            200,
+            false,
+            false,
+            std::time::Instant::now(),
+        );
+        assert_eq!(bare.logprob_mean, None);
+        assert_eq!(bare.logprob_min, None);
+        assert_eq!(bare.logprob_tokens, None);
+        let j = bare.to_json().to_string();
+        assert!(j.contains("\"logprob_mean\":null"), "{j}");
+        let j2 = rec.to_json().to_string();
+        assert!(j2.contains("\"logprob_min\":-1.5"), "{j2}");
+        assert!(j2.contains("\"logprob_tokens\":2"), "{j2}");
+    }
+
+    #[tokio::test]
+    async fn integration__analyze_sse_stream__logprob_confidence_recorded() {
+        let s = Sentinel::new(true, 0, None);
+        let ctx = RequestCtx {
+            trace: "plm-lp-1".into(),
+            model: "m".into(),
+            route: "openai-chat".into(),
+            ..RequestCtx::default()
+        };
+        let feed = s.begin(ctx, 200, true);
+        feed.bytes(b"data: {\"choices\":[{\"delta\":{\"content\":\"he\"},\"logprobs\":{\"content\":[{\"logprob\":-0.2}]}}]}\n\n");
+        feed.bytes(b"data: {\"choices\":[{\"delta\":{\"content\":\"llo\"},\"logprobs\":{\"content\":[{\"logprob\":-3.1}]}}]}\n\n");
+        feed.bytes(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n");
+        feed.bytes(b"data: [DONE]\n\n");
+        feed.end();
+        for _ in 0..50 {
+            if !s.why(None, 10).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let recs = s.why(None, 10);
+        assert_eq!(recs.len(), 1, "{recs:?}");
+        let r = &recs[0];
+        let mean = r.logprob_mean.expect("mean recorded");
+        assert!((mean - (-1.65)).abs() < 1e-9, "{mean}");
+        assert_eq!(r.logprob_min, Some(-3.1));
+        assert_eq!(r.logprob_tokens, Some(2));
+    }
+
+    #[test]
     fn unit__why__ring_filter_and_limit() {
         let s = Sentinel::new(true, 0, None);
         let rec = |trace: &str| SentinelRecord {
@@ -1614,11 +2002,15 @@ mod tests {
             model: "m".into(),
             status: 200,
             stream: true,
+            finish: None,
             detections: vec![],
             prompt_tokens: None,
             completion_tokens: None,
             ctx: None,
             degraded: false,
+            logprob_mean: None,
+            logprob_min: None,
+            logprob_tokens: None,
             ms: 5,
         };
         let mut ring = s.ring.lock();

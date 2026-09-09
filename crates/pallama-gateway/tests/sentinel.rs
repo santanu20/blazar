@@ -232,7 +232,27 @@ async fn integration__sentinel__truncation_and_near_limit() {
     let cs = codes(&rec);
     assert!(cs.contains(&"ctx_truncated"), "{cs:?}");
     assert!(cs.contains(&"ctx_near_limit"), "{cs:?}");
+    // The record persists the engine's finish_reason so `why` separates
+    // budget caps from real truncation at a glance.
+    assert_eq!(rec.finish.as_deref(), Some("length"));
+    assert_eq!(
+        rec.to_json()["finish"].as_str(),
+        Some("length"),
+        "to_json must carry finish for why/watch"
+    );
     ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Old ring lines (pre-`finish` sentinel.jsonl) must keep deserializing:
+/// serde treats a missing Option field as None, never an error.
+#[test]
+#[allow(non_snake_case)]
+fn integration__sentinel__legacy_record_without_finish_deserializes() {
+    let legacy = r#"{"trace":"t1","ts":1,"route":"openai-chat","model":"m","status":200,"stream":true,"detections":[],"prompt_tokens":9,"completion_tokens":8,"ctx":4096,"degraded":false,"ms":42}"#;
+    let rec: pallama_gateway::sentinel::SentinelRecord =
+        serde_json::from_str(legacy).expect("legacy line must load");
+    assert_eq!(rec.finish, None);
+    assert_eq!(rec.completion_tokens, Some(8));
 }
 
 #[tokio::test]

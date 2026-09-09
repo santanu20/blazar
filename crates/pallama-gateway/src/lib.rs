@@ -1,8 +1,11 @@
 //! Pallama gateway: `OpenAI` + ollama-compat HTTP surface over the
 //! supervisor. Router assembly + bearer auth.
 
+pub mod anthropic;
+pub mod batch;
 pub mod histogram;
 pub mod keys;
+pub mod latechunk;
 pub mod ollama;
 pub mod openai;
 pub mod otlp;
@@ -12,7 +15,9 @@ pub mod queue;
 pub mod remotes;
 pub mod responses;
 pub mod scrub;
+pub mod semcache;
 pub mod sentinel;
+pub mod sessions;
 pub mod state;
 pub mod translate;
 pub mod whisper;
@@ -161,19 +166,30 @@ async fn request_log(
     resp
 }
 
+// Flat route table; length is the surface itself, not complexity.
+#[allow(clippy::too_many_lines)]
 pub fn router(state: Arc<AppState>) -> Router {
     let openai_any = Router::new()
         .route("/v1/chat/completions", post(openai::openai_proxy))
         .route("/v1/completions", post(openai::openai_proxy))
-        .route("/v1/embeddings", post(openai::openai_proxy))
+        .route("/v1/embeddings", post(openai::embeddings))
         .route("/v1/rerank", post(openai::openai_proxy))
-        .route("/v1/messages", post(openai::openai_proxy))
+        .route("/v1/messages", post(anthropic::messages))
         // Full upstream API surface (routes verified in upstream server.cpp):
         // Responses API (current-gen OpenAI clients), audio transcriptions
         // (multipart; MTMD audio-in models), FIM infill, control-vector
         // steering, token counting, and the tokenize/apply-template dev
         // tools. All byte-stream proxied with model-affinity routing.
         .route("/v1/responses", post(openai::responses_api))
+        .route(
+            "/v1/batches",
+            post(batch::create_batch).get(batch::list_batches),
+        )
+        .route("/v1/batches/{id}", get(batch::get_batch))
+        .route("/v1/batches/{id}/cancel", post(batch::cancel_batch))
+        .route("/v1/files", post(batch::upload_file))
+        .route("/v1/files/{id}", get(batch::get_file))
+        .route("/v1/files/{id}/content", get(batch::get_file_content))
         .route("/responses", post(openai::responses_api))
         .route("/v1/responses/{id}", get(openai::responses_get))
         .route(
@@ -189,7 +205,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/v1/responses/input_tokens", post(openai::openai_proxy))
         .route("/responses/input_tokens", post(openai::openai_proxy))
-        .route("/v1/messages/count_tokens", post(openai::openai_proxy))
+        .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
         .route("/tokenize", post(openai::openai_proxy))
         .route("/detokenize", post(openai::openai_proxy))
         .route("/apply-template", post(openai::openai_proxy))
@@ -227,6 +243,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/session",
             post(ollama::session).get(ollama::session_list),
         )
+        .route("/api/sessions", get(sessions::list))
         .route("/api/why", get(ollama::why))
         .route("/api/watch", get(ollama::watch))
         .route(
@@ -251,6 +268,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .merge(openai_any)
         .merge(api)
+        // Session pins (R3): innermost layer — auth/CORS/logging/body
+        // limit have already run; only header-carrying requests buffer.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            sessions::pin_mw,
+        ))
         // Hardening: 50 MiB request ceiling (audio uploads fit; nothing
         // legit is larger locally).
         .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))
@@ -595,12 +618,14 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
                        "/apply-template", "/v1/adapters"],
             "ollama": ["/api/chat", "/api/generate", "/api/tags", "/api/ps", "/api/show",
                        "/api/embeddings", "/api/events", "/api/version"],
-            "pallama": ["/api/evict", "/api/session", "/api/why", "/api/watch",
-                        "/api/keys", "/.well-known/pallama", "/metrics", "/healthz"],
+            "pallama": ["/api/evict", "/api/session", "/api/sessions", "/api/why",
+                        "/api/watch", "/api/keys", "/.well-known/pallama", "/metrics",
+                        "/healthz"],
         },
         "headers": ["x-pallama-num-ctx", "x-pallama-deadline-ms", "x-pallama-priority",
                     "x-pallama-enforce", "x-pallama-trace-id", "x-pallama-status",
-                    "x-pallama-warnings"],
+                    "x-pallama-warnings", "x-pallama-session",
+                    "x-pallama-cache", "x-pallama-cache-ttl", "x-pallama-cache-threshold"],
         "features": {
             "keys": !state.keys.is_empty(),
             "tls": !state.config.tls_cert.is_empty(),
@@ -609,6 +634,9 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
             "singleflight": state.config.singleflight,
             "session_bank": state.config.session_bank,
             "prompt_preflight": state.config.prompt_preflight,
+            "session_pins": state.config.session_keep_secs > 0,
+            "semantic_cache": state.config.semantic_cache.enabled
+                && state.config.semantic_cache.model.is_some(),
         },
     }))
     .into_response()
@@ -667,20 +695,23 @@ pub async fn serve(
                 interval.tick().await;
                 let mut totals = (0u64, 0u64);
                 let mut spec_totals = (0u64, 0u64);
-                for (_, endpoint) in state.sup.live_http_endpoints() {
-                    let pallama_core::profile::Endpoint::Tcp { host, port } = endpoint else {
+                for e in state.sup.live_http_endpoints() {
+                    let pallama_core::profile::Endpoint::Tcp { host, port } = &e.endpoint else {
                         continue;
                     };
                     // Child Prometheus text: aggregate counters (the /slots
                     // per-slot stats are short-lived and unreliable — the
                     // metrics counters are the durable truth).
                     let url = format!("http://{host}:{port}/metrics");
-                    let Ok(resp) = state
-                        .http
-                        .get(&url)
-                        .timeout(std::time::Duration::from_secs(2))
-                        .send()
-                        .await
+                    let Ok(resp) = crate::proxy::child_auth(
+                        state
+                            .http
+                            .get(&url)
+                            .timeout(std::time::Duration::from_secs(2)),
+                        &e,
+                    )
+                    .send()
+                    .await
                     else {
                         continue;
                     };
@@ -748,6 +779,17 @@ pub async fn serve(
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .map_err(|e| anyhow::anyhow!("bind {addr}: {e} — another server (ollama?) on this port? stop it or set PALLAMA_PORT"))?;
+        // Record the real bound address for the batch worker (config port
+        // may be 0 = ephemeral; fold wildcard binds to loopback-reachable).
+        if let Ok(sa) = listener.local_addr() {
+            let h = sa.ip().to_string();
+            let h = if h == "0.0.0.0" || h == "::" {
+                "127.0.0.1".to_string()
+            } else {
+                h
+            };
+            let _ = state.http_addr.set((h, sa.port()));
+        }
         tracing::info!("pallama listening on http://{addr} (OpenAI + ollama APIs)");
         tracing::info!(
             "powered by llama.cpp / ggml / ggerganov — https://github.com/ggml-org/llama.cpp"

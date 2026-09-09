@@ -48,6 +48,140 @@ pub async fn models(State(state): State<Arc<AppState>>) -> Response {
     axum::Json(json!({"object": "list", "data": data})).into_response()
 }
 
+/// POST /v1/embeddings — byte-proxied for normal models; gateway-
+/// terminated (R1 late chunking) for models opted in via
+/// `[model_overrides.<name>] late_chunking = true` (their child runs
+/// `--pooling none`, which the OAI-compatible child route rejects, so the
+/// gateway must pool). Input may be a string, an array of strings, or an
+/// array of pre-tokenized int arrays.
+pub async fn embeddings(
+    state: State<Arc<AppState>>,
+    trace_ext: Option<Extension<TraceId>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
+    uri: Uri,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // Resolve the model's registry row for the override lookup; on any
+    // resolve miss fall through to the proxy path (it owns 404 shaping).
+    let requested = extract_model(&body);
+    let late = requested.as_deref().is_some_and(|m| {
+        pallama_core::store::Store::open(&state.dirs)
+            .ok()
+            .and_then(|s| crate::proxy::resolve_model(&s, m).ok())
+            .is_some_and(|row| state.config.effective_late_chunking(&row.name))
+    });
+    if !late {
+        return openai_proxy(state, trace_ext, key_ext, uri, method, headers, body).await;
+    }
+    let model = requested.unwrap_or_default();
+    // Per-key admission mirrors the proxy path (scope + rpm + count).
+    if let Some(Extension(k)) = &key_ext {
+        if let Some(entry) = state.keys.entry(&k.name) {
+            if let Err(rej) = state.keys.check(&entry, &model) {
+                return rej.to_response();
+            }
+            state.keys.charge_request(&k.name);
+        }
+    }
+    let req: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return openai_error(400, &format!("invalid JSON: {e}")),
+    };
+    // Shape-check before admission so malformed input never loads a model.
+    if !matches!(&req["input"], serde_json::Value::String(_))
+        && !matches!(&req["input"], serde_json::Value::Array(a) if !a.is_empty())
+    {
+        return openai_error(400, "\"input\" must be a string or a non-empty array");
+    }
+    // Admission is shape-independent: one call serves all three input lanes.
+    let (engine, _) = match crate::proxy::ensure_with_admission(
+        &state,
+        &model,
+        crate::queue::Priority::Normal,
+        None,
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(resp) => return resp,
+    };
+    let outcome = match &req["input"] {
+        serde_json::Value::String(s) => {
+            crate::latechunk::late_embed(&state, &engine, &model, std::slice::from_ref(s)).await
+        }
+        serde_json::Value::Array(items) => {
+            let all_strings: Option<Vec<String>> = items
+                .iter()
+                .map(|v| v.as_str().map(str::to_string))
+                .collect();
+            if let Some(strings) = all_strings {
+                crate::latechunk::late_embed(&state, &engine, &model, &strings).await
+            } else {
+                let all_int_arrays: Option<Vec<Vec<u64>>> = items
+                    .iter()
+                    .map(|v| {
+                        v.as_array().map(|a| {
+                            a.iter()
+                                .filter_map(serde_json::Value::as_u64)
+                                .collect::<Vec<u64>>()
+                        })
+                    })
+                    .collect();
+                match all_int_arrays {
+                    Some(chunk_ids) => {
+                        crate::latechunk::late_embed_pretokenized(&state, &engine, &model, &chunk_ids)
+                            .await
+                    }
+                    None => {
+                        return openai_error(
+                            400,
+                            "late chunking: \"input\" must be a string, an array of strings, or an array of token-id arrays",
+                        )
+                    }
+                }
+            }
+        }
+        _ => unreachable!("shape checked above"),
+    };
+    match outcome {
+        Ok(out) => {
+            if let Some(Extension(k)) = &key_ext {
+                state.keys.charge_tokens(&k.name, out.total_tokens);
+            }
+            late_openai_response(&model, out)
+        }
+        Err((code, msg)) => openai_error(code, &msg),
+    }
+}
+
+/// Shape a late-chunking result into the `OpenAI` embeddings response body.
+fn late_openai_response(model: &str, out: crate::latechunk::LateChunkOutput) -> Response {
+    let data: Vec<serde_json::Value> = out
+        .embeddings
+        .into_iter()
+        .enumerate()
+        .map(|(i, e)| {
+            json!({
+                "object": "embedding",
+                "index": i,
+                "embedding": e,
+            })
+        })
+        .collect();
+    axum::Json(json!({
+        "object": "list",
+        "data": data,
+        "model": model,
+        "usage": {
+            "prompt_tokens": out.total_tokens,
+            "total_tokens": out.total_tokens,
+        },
+    }))
+    .into_response()
+}
+
 /// All POST /v1/* traffic: one handler, one proxy path, zero body
 /// rewriting. `X-Pallama-Priority` orders admission under load.
 #[allow(clippy::too_many_lines)] // one cohesive admission + forwarding path
@@ -84,12 +218,10 @@ pub async fn openai_proxy(
         }
     }
     // Remote routing: `<remote-name>:<model>` never loads locally.
-    if let Some((remote, remote_model)) = crate::remotes::split_remote(&model, &state.config) {
-        let remote = remote.clone();
-        return crate::remotes::forward_openai(
+    if crate::remotes::split_remote(&model, &state.config).is_some() {
+        return crate::remotes::forward_with_health(
             &state,
-            &remote,
-            remote_model,
+            &model,
             &method,
             &path_and_query(&uri),
             &headers,
@@ -287,12 +419,10 @@ pub async fn scoped_proxy(
             state.keys.charge_request(&key.name);
         }
     }
-    if let Some((remote, remote_model)) = crate::remotes::split_remote(&model, &state.config) {
-        let remote = remote.clone();
-        return crate::remotes::forward_openai(
+    if crate::remotes::split_remote(&model, &state.config).is_some() {
+        return crate::remotes::forward_with_health(
             &state,
-            &remote,
-            remote_model,
+            &model,
             &method,
             &path_and_query(&uri),
             &headers,
@@ -363,12 +493,10 @@ pub async fn responses_api(
         }
     }
     // Remote routing first (registry chaining is local-only today).
-    if let Some((remote, remote_model)) = crate::remotes::split_remote(&model, &state.config) {
-        let remote = remote.clone();
-        return crate::remotes::forward_openai(
+    if crate::remotes::split_remote(&model, &state.config).is_some() {
+        return crate::remotes::forward_with_health(
             &state,
-            &remote,
-            remote_model,
+            &model,
             &method,
             &path_and_query(&uri),
             &headers,
@@ -494,13 +622,16 @@ pub async fn responses_api(
         "{}/v1/responses",
         crate::proxy::child_base(&engine.endpoint)
     );
-    let upstream = state
-        .http
-        .post(&url)
-        .header("content-type", "application/json")
-        .body(new_body.clone())
-        .send()
-        .await;
+    let upstream = crate::proxy::child_auth(
+        state
+            .http
+            .post(&url)
+            .header("content-type", "application/json"),
+        &engine,
+    )
+    .body(new_body.clone())
+    .send()
+    .await;
     let resp = match upstream {
         Ok(r) => r,
         Err(e) => {

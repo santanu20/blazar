@@ -45,12 +45,12 @@ pub async fn enforce_prompt_fits(
     // Over threshold: try the exact count against a RUNNING child.
     let running = state
         .sup
-        .ps()
+        .live_http_endpoints()
         .into_iter()
-        .find(|p| p.name == model)
-        .map(|p| format!("http://{}", p.endpoint));
+        .find(|e| e.name == model)
+        .map(|e| (crate::proxy::child_base(&e.endpoint), e));
     let exact = match running {
-        Some(base) => {
+        Some((base, engine)) => {
             let text = body
                 .pointer("/messages")
                 .and_then(|m| m.as_array())
@@ -61,9 +61,7 @@ pub async fn enforce_prompt_fits(
                         .join("\n")
                 })
                 .unwrap_or_default();
-            match state
-                .http
-                .post(format!("{base}/tokenize"))
+            match crate::proxy::child_auth(state.http.post(format!("{base}/tokenize")), &engine)
                 .json(&serde_json::json!({"content": text}))
                 .send()
                 .await

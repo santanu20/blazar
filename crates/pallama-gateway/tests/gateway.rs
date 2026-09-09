@@ -150,6 +150,7 @@ async fn start_with(config: Config, child_env: Vec<(String, String)>) -> TestSer
         .await
         .unwrap();
     let port = listener.local_addr().unwrap().port();
+    let _ = state.http_addr.set(("127.0.0.1".to_string(), port));
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -1375,7 +1376,10 @@ async fn e2e__scoped_routes_single_child_passthrough() {
         .json()
         .await
         .unwrap();
-    assert!(slots[0]["id"].as_u64().is_some(), "upstream bare-array shape: {slots}");
+    assert!(
+        slots[0]["id"].as_u64().is_some(),
+        "upstream bare-array shape: {slots}"
+    );
 
     let streams: serde_json::Value = c
         .get(format!("{}/v1/stream", ts.base))
@@ -1493,5 +1497,415 @@ async fn e2e__v1_reranking_alias() {
     assert!(!results.is_empty(), "{r}");
     // Stub ranks by length: longer doc first.
     assert_eq!(results[0]["index"], 1, "{r}");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Child-auth hardening (auto: TCP children get `--api-key-file`): the
+/// gateway stamps every child-bound call, so normal lanes keep working,
+/// while DIRECT access to the child port is 401 without the secret and
+/// 200 with it. Proves both the choke-point coverage (a missed site
+/// would fail loudly here) and the bypass closure.
+#[allow(non_snake_case)]
+#[tokio::test]
+async fn e2e__child_auth__gateway_stamps_and_direct_rejected() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    // Warm m1; any successful child-bound lane proves the stamping.
+    let chat: serde_json::Value = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({"model": "m1", "stream": false,
+            "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(chat["choices"].is_array(), "gateway lane served: {chat}");
+
+    // Keyfile minted next to the pidfile, 0600, plm_-prefixed secret.
+    let keyfile = ts.dirs.run_dir().join("m1.apikey");
+    let secret = std::fs::read_to_string(&keyfile)
+        .unwrap_or_else(|e| panic!("keyfile {}: {e}", keyfile.display()));
+    assert!(
+        secret.starts_with("plm_") && secret.len() >= 32,
+        "{secret:?}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&keyfile).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "keyfile must be owner-only");
+    }
+
+    // Direct child access: blocked without the secret, open with it.
+    let ps: serde_json::Value = c
+        .get(format!("{}/api/ps", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let endpoint = ps["models"][0]["pallama_endpoint"]
+        .as_str()
+        .expect("ps endpoint")
+        .to_string();
+    let direct = reqwest::Client::new();
+    let no_key = direct
+        .get(format!("http://{endpoint}/v1/models"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_key.status(), 401, "unauthenticated direct access");
+    let with_key = direct
+        .get(format!("http://{endpoint}/v1/models"))
+        .bearer_auth(&secret)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(with_key.status(), 200, "bearer-stamped direct access");
+
+    // Teardown removes the keyfile alongside the pidfile.
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__remote_failover_circuit_and_lb() {
+    // Remote target = a second healthy pallama server (stub child m1).
+    let target = start(Config::default()).await;
+    // Main server: pool "r" = [dead (port 1 refuses instantly), target].
+    // Tie-break min_by_key picks the FIRST member while both are idle, so
+    // requests 1..3 hit the dead one, rack up consecutive failures and mark
+    // it down (circuit open); request 4 must fail over to the target.
+    let cfg = Config {
+        remotes: vec![
+            pallama_core::config::Remote {
+                name: "r".into(),
+                url: "http://127.0.0.1:1".into(),
+                key: String::new(),
+            },
+            pallama_core::config::Remote {
+                name: "r".into(),
+                url: target.base.clone(),
+                key: String::new(),
+            },
+        ],
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let body = r#"{"model":"r:m1","messages":[{"role":"user","content":"hi"}],"max_tokens":4}"#;
+    for i in 1..=3u32 {
+        let resp = client()
+            .post(format!("{}/v1/chat/completions", ts.base))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 502, "dead member, attempt {i}");
+    }
+    // Circuit open on the dead member: the next request routes to target.
+    let resp = client()
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "failover to healthy member");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        v["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("stub:m1:"),
+        "answered by target's stub child: {v:?}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+    target.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Opt-out lane: `child_auth = false` keeps children open (legacy
+/// behavior) — no keyfile, direct access unauthenticated.
+#[allow(non_snake_case)]
+#[tokio::test]
+async fn e2e__child_auth__disabled_keeps_children_open() {
+    let ts = start(Config {
+        child_auth: Some(false),
+        ..Config::default()
+    })
+    .await;
+    let c = client();
+    let chat: serde_json::Value = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({"model": "m1", "stream": false,
+            "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(chat["choices"].is_array(), "gateway lane served: {chat}");
+    assert!(!ts.dirs.run_dir().join("m1.apikey").exists());
+    let ps: serde_json::Value = c
+        .get(format!("{}/api/ps", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let endpoint = ps["models"][0]["pallama_endpoint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resp = reqwest::Client::new()
+        .get(format!("http://{endpoint}/v1/models"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "opt-out keeps the child open");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+// ---- D7 Anthropic /v1/messages native translate lane ----
+
+/// Non-stream: Claude-dialect request in, Anthropic message shape out.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__anthropic_messages_translate_non_stream() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let v: serde_json::Value = c
+        .post(format!("{}/v1/messages", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "max_tokens": 64,
+            "system": "be terse",
+            "messages": [{"role": "user", "content": "hi there"}],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["type"], "message", "body: {v}");
+    assert_eq!(v["role"], "assistant");
+    assert!(
+        v["id"].as_str().unwrap().starts_with("msg_"),
+        "anthropic id namespace: {}",
+        v["id"]
+    );
+    assert_eq!(v["content"][0]["type"], "text");
+    assert_eq!(v["content"][0]["text"], "stub:m1:hi there");
+    assert_eq!(v["stop_reason"], "end_turn");
+    assert!(v["usage"]["input_tokens"].as_i64().unwrap() > 0);
+    assert!(v["usage"]["output_tokens"].as_i64().unwrap() > 0);
+
+    // Missing model -> Anthropic error envelope, not OpenAI's.
+    let e: serde_json::Value = c
+        .post(format!("{}/v1/messages", ts.base))
+        .json(&serde_json::json!({"max_tokens": 8, "messages": []}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(e["type"], "error");
+    assert_eq!(e["error"]["type"], "invalid_request_error");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Stream: `OpenAI` child SSE -> Anthropic event family.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__anthropic_messages_translate_stream() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let body = c
+        .post(format!("{}/v1/messages", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "max_tokens": 32,
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("event: message_start"), "body: {body}");
+    assert!(body.contains("event: content_block_start"));
+    assert!(body.contains("event: content_block_delta"));
+    assert!(body.contains("\"text_delta\""));
+    assert!(body.contains("event: content_block_stop"));
+    assert!(body.contains("event: message_delta"));
+    assert!(body.contains("event: message_stop"));
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Tool-call child response -> `tool_use` blocks in the Anthropic shape.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__anthropic_messages_translate_tool_use() {
+    let ts = start_with(
+        Config::default(),
+        vec![("STUB_BAD_TOOL_ARGS".to_string(), "1".to_string())],
+    )
+    .await;
+    let c = client();
+    let v: serde_json::Value = c
+        .post(format!("{}/v1/messages", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "call the tool"}],
+            "tools": [{"name": "echo", "description": "echoes",
+                       "input_schema": {"type": "object", "properties": {}}}],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let blocks = v["content"].as_array().unwrap();
+    let tu = blocks
+        .iter()
+        .find(|b| b["type"] == "tool_use")
+        .expect("tool_use block present: {blocks:?}");
+    assert_eq!(tu["name"], "echo");
+    assert_eq!(tu["input"], serde_json::json!({}), "broken json -> {{}}");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Batch API end-to-end: upload JSONL, run batch, poll to completion,
+/// download output file with per-custom_id results.
+#[tokio::test]
+#[allow(non_snake_case)]
+#[allow(clippy::too_many_lines)] // one linear scenario, assertions inline
+async fn e2e__batch_jsonl_end_to_end() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let boundary = "pallamaBatchTest7f2a";
+    let line1 = r#"{"custom_id":"task-1","body":{"model":"m1","messages":[{"role":"user","content":"hello batch"}],"max_tokens":5}}"#;
+    let line2 = r#"{"custom_id":"task-2","body":{"model":"m1","messages":[{"role":"user","content":"second line"}],"max_tokens":5}}"#;
+    let file_body = line1.to_string() + "\n" + line2 + "\n";
+    let multipart = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nbatch\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"reqs.jsonl\"\r\n\
+         Content-Type: application/jsonl\r\n\r\n{file_body}\r\n--{boundary}--\r\n"
+    );
+    let file: serde_json::Value = c
+        .post(format!("{}/v1/files", ts.base))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(multipart)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let file_id = file["id"].as_str().unwrap().to_string();
+    assert!(file_id.starts_with("file-"), "file id: {file:?}");
+    assert_eq!(file["object"], "file");
+    assert_eq!(file["purpose"], "batch");
+
+    // Unknown file -> 404; wrong endpoint -> 400 teaching error.
+    let bad = c
+        .post(format!("{}/v1/batches", ts.base))
+        .json(
+            &serde_json::json!({"input_file_id": "file-none", "endpoint": "/v1/chat/completions"}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 404);
+    let bad = c
+        .post(format!("{}/v1/batches", ts.base))
+        .json(&serde_json::json!({"input_file_id": file_id, "endpoint": "/v1/embeddings"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+
+    let batch: serde_json::Value = c
+        .post(format!("{}/v1/batches", ts.base))
+        .json(&serde_json::json!({"input_file_id": file_id, "endpoint": "/v1/chat/completions"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let batch_id = batch["id"].as_str().unwrap().to_string();
+    assert!(batch_id.starts_with("batch-"), "batch id: {batch:?}");
+    assert_eq!(batch["status"], "in_progress");
+    assert_eq!(batch["request_counts"]["total"], 2);
+
+    // Poll to completion (sequential worker; stub child is instant).
+    let mut final_batch = None;
+    for _ in 0..100 {
+        let v: serde_json::Value = c
+            .get(format!("{}/v1/batches/{batch_id}", ts.base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if v["status"] == "completed" || v["status"] == "failed" || v["status"] == "cancelled" {
+            final_batch = Some(v);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    let done = final_batch.expect("batch reaches a terminal status");
+    assert_eq!(done["status"], "completed", "batch: {done:?}");
+    assert_eq!(done["request_counts"]["completed"], 2);
+    assert_eq!(done["request_counts"]["failed"], 0);
+
+    let out_id = done["output_file_id"].as_str().unwrap().to_string();
+    assert!(out_id.starts_with("file-"), "output file id: {done:?}");
+    let content = c
+        .get(format!("{}/v1/files/{out_id}/content", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let rows: Vec<serde_json::Value> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2, "two output lines: {content}");
+    let ids: Vec<&str> = rows
+        .iter()
+        .map(|r| r["custom_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["task-1", "task-2"], "custom_id order preserved");
+    for r in &rows {
+        assert_eq!(r["response"]["status_code"], 200, "row: {r:?}");
+        let body = &r["response"]["body"];
+        assert!(
+            body["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("stub:m1:"),
+            "stub reply present: {r:?}"
+        );
+    }
     ts.state.sup.shutdown_all().await.unwrap();
 }

@@ -1,5 +1,6 @@
 //! Shared gateway state.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use pallama_core::{Config, PallamaDirs};
@@ -9,7 +10,64 @@ use crate::histogram::Histogram;
 use crate::keys::KeysLimiter;
 use crate::otlp::Otlp;
 use crate::queue::PriorityQueue;
+use crate::remotes::RemoteHealth;
+use crate::semcache::{SemMetrics, SemanticCache};
 use crate::sentinel::Sentinel;
+
+/// Gateway-observed prompt-cache classification (R6/R7-lite): per-response
+/// usage counters + warm/cold TTFT split. `record` runs exactly once per
+/// COMPLETED response; a response whose usage never surfaced (upstream
+/// omission, aborted before the usage chunk) lands in `unclassified`
+/// instead of guessing a side. Atomics only — lock-free on the hot path.
+pub struct CacheObs {
+    pub prompt_tokens: AtomicU64,
+    pub cached_tokens: AtomicU64,
+    /// Completed responses we could NOT classify warm/cold (no usage seen).
+    pub unclassified: AtomicU64,
+    pub ttft_warm: Histogram,
+    pub ttft_cold: Histogram,
+}
+
+impl Default for CacheObs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CacheObs {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            prompt_tokens: AtomicU64::new(0),
+            cached_tokens: AtomicU64::new(0),
+            unclassified: AtomicU64::new(0),
+            ttft_warm: crate::histogram::ttft_warm(),
+            ttft_cold: crate::histogram::ttft_cold(),
+        }
+    }
+
+    /// Classify one completed response. `cached > 0` = warm. A missing
+    /// TTFT with known usage still counts tokens but skips both
+    /// histograms (the split stays honest).
+    pub fn record(&self, prompt: u64, cached: u64, ttft_secs: Option<f64>) {
+        self.prompt_tokens.fetch_add(prompt, Ordering::Relaxed);
+        self.cached_tokens.fetch_add(cached, Ordering::Relaxed);
+        let warm = cached > 0;
+        if let Some(t) = ttft_secs {
+            if warm {
+                self.ttft_warm.observe_secs(t);
+            } else {
+                self.ttft_cold.observe_secs(t);
+            }
+        }
+    }
+
+    /// A response completed without any usage information: counted as
+    /// unclassified rather than silently dropped or forced cold.
+    pub fn miss(&self) {
+        self.unclassified.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 pub struct AppState {
     pub dirs: PallamaDirs,
@@ -22,6 +80,14 @@ pub struct AppState {
     /// vLLM-style evidence loop: measured at the proxy, owned by the gateway.
     pub ttft: Histogram,
     pub tpot: Histogram,
+    /// Prompt-cache observability (R6/R7-lite): gateway-side usage
+    /// classification + warm/cold TTFT split. Arc so stream closures and
+    /// drop-finishers can own it without the whole state.
+    pub obs: Arc<CacheObs>,
+    /// R4: opt-in semantic cache (in-memory, TTL + LRU).
+    pub semcache: Arc<SemanticCache>,
+    /// R4: semantic-cache counters for /metrics.
+    pub sem: Arc<SemMetrics>,
     /// Warn-only response-semantics observation layer (`pallama why`).
     pub sentinel: Arc<Sentinel>,
     /// Per-key scoping / rate limits / usage accounting (`[[keys]]`).
@@ -39,6 +105,15 @@ pub struct AppState {
     /// leader's warm prefix instead of double-prefilling. Bounded.
     pub singleflight:
         tokio::sync::Mutex<std::collections::HashMap<u64, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    /// The ACTUAL bound HTTP listener address (loopback-reachable form),
+    /// set by `serve()` after bind. The batch worker needs this: config
+    /// port 0 / dynamic ports must not be guessed from `config`.
+    pub http_addr: std::sync::OnceLock<(String, u16)>,
+    /// Remote-fleet health (C2/C3): per-remote circuit state + in-flight
+    /// counter, keyed `"{name}|{url}"`. Arc so `RemoteLease` can drop it
+    /// without owning the whole state.
+    pub remote_health:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, RemoteHealth>>>,
 }
 
 impl AppState {
@@ -98,12 +173,71 @@ impl AppState {
             http,
             ttft: crate::histogram::ttft(),
             tpot: crate::histogram::tpot(),
+            obs: Arc::new(CacheObs::new()),
+            semcache: Arc::new(SemanticCache::new()),
+            sem: Arc::new(SemMetrics::default()),
             sentinel,
             keys: Arc::new(keys),
             otlp,
             responses: std::sync::Mutex::new(crate::responses::ResponsesRegistry::new()),
             whisper: pallama_runtime::whisper::WhisperRuntime::new(),
+            http_addr: std::sync::OnceLock::new(),
+            remote_health: std::sync::Arc::default(),
             singleflight: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod tests {
+    use super::*;
+
+    fn rendered(h: &Histogram) -> String {
+        let mut out = String::new();
+        h.render(&mut out);
+        out
+    }
+
+    #[test]
+    fn unit__cache_obs__warm_routes_to_warm_histogram() {
+        let obs = CacheObs::new();
+        obs.record(100, 96, Some(0.05));
+        let warm = rendered(&obs.ttft_warm);
+        let cold = rendered(&obs.ttft_cold);
+        assert!(warm.contains("_count 1"), "{warm}");
+        assert!(cold.contains("_count 0"), "{cold}");
+        assert_eq!(obs.prompt_tokens.load(Ordering::Relaxed), 100);
+        assert_eq!(obs.cached_tokens.load(Ordering::Relaxed), 96);
+        assert_eq!(obs.unclassified.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn unit__cache_obs__cold_routes_to_cold_histogram() {
+        let obs = CacheObs::new();
+        obs.record(100, 0, Some(0.5));
+        assert!(rendered(&obs.ttft_warm).contains("_count 0"));
+        assert!(rendered(&obs.ttft_cold).contains("_count 1"));
+    }
+
+    #[test]
+    fn unit__cache_obs__missing_ttft_counts_tokens_skips_histograms() {
+        // Known usage but no TTFT (e.g. abort between usage and drain):
+        // tokens counted, the warm/cold split stays honest (neither hist).
+        let obs = CacheObs::new();
+        obs.record(70, 40, None);
+        assert_eq!(obs.prompt_tokens.load(Ordering::Relaxed), 70);
+        assert_eq!(obs.cached_tokens.load(Ordering::Relaxed), 40);
+        assert!(rendered(&obs.ttft_warm).contains("_count 0"));
+        assert!(rendered(&obs.ttft_cold).contains("_count 0"));
+    }
+
+    #[test]
+    fn unit__cache_obs__miss_counts_unclassified_only() {
+        let obs = CacheObs::new();
+        obs.miss();
+        obs.miss();
+        assert_eq!(obs.unclassified.load(Ordering::Relaxed), 2);
+        assert_eq!(obs.prompt_tokens.load(Ordering::Relaxed), 0);
     }
 }

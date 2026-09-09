@@ -20,7 +20,7 @@ use pallama_core::ModelRow;
 use crate::queue::Priority;
 use crate::sentinel;
 use crate::state::AppState;
-use pallama_runtime::{EngineRef, SupervisionError};
+use pallama_runtime::{EngineRef, PrefixKey, SupervisionError};
 
 /// Headers never forwarded client->child (hop-by-hop / pallama-internal).
 pub(crate) const STRIP_REQUEST: &[&str] = &[
@@ -106,7 +106,7 @@ pub async fn ensure_with_admission(
     state: &Arc<AppState>,
     model: &str,
     priority: Priority,
-    prefix: Option<u64>,
+    prefix: Option<PrefixKey>,
 ) -> Result<(EngineRef, u128), Response> {
     let started = Instant::now();
     let store = Store::open(&state.dirs).map_err(|e| openai_error(500, &e.to_string()))?;
@@ -157,11 +157,16 @@ pub async fn ensure_with_admission(
 /// part. `None` when no recognizable prompt (embeddings, tools) — no
 /// affinity, plain load-balance.
 #[must_use]
-pub fn affinity_hash(req: &serde_json::Value) -> Option<u64> {
+pub fn affinity_hash(req: &serde_json::Value) -> Option<PrefixKey> {
     use std::hash::{Hash, Hasher};
     type H = std::collections::hash_map::DefaultHasher;
-    let head = |s: &str, h: &mut H| s.as_bytes()[..s.len().min(1024)].hash(h);
-    let mut h = H::new();
+    let head = |s: &str, h: &mut H, cap: usize| {
+        s.as_bytes()[..s.len().min(cap)].hash(h);
+    };
+    // F8: `sys` = shared-prefix class (system prompt head), `convo` =
+    // full conversation identity (system + first user head).
+    let mut hs = H::new();
+    let mut hc = H::new();
     if let Some(messages) = req.get("messages").and_then(serde_json::Value::as_array) {
         if messages.is_empty() {
             return None;
@@ -186,8 +191,9 @@ pub fn affinity_hash(req: &serde_json::Value) -> Option<u64> {
             .find(|m| role_is(m, "user"))
             .or_else(|| messages.first())
             .map(&content)?;
-        head(&system, &mut h);
-        head(&user, &mut h);
+        head(&system, &mut hs, 256);
+        head(&system, &mut hc, 1024);
+        head(&user, &mut hc, 1024);
     } else {
         let prompt = req
             .get("prompt")
@@ -199,14 +205,18 @@ pub fn affinity_hash(req: &serde_json::Value) -> Option<u64> {
                     other => other.to_string(),
                 })
             })?;
-        head(&prompt, &mut h);
+        head(&prompt, &mut hs, 256);
+        head(&prompt, &mut hc, 1024);
     }
-    Some(h.finish())
+    Some(PrefixKey {
+        sys: hs.finish(),
+        convo: hc.finish(),
+    })
 }
 
 /// Byte-slice wrapper for raw-body handlers (one parse).
 #[must_use]
-pub fn affinity_hash_bytes(body: &[u8]) -> Option<u64> {
+pub fn affinity_hash_bytes(body: &[u8]) -> Option<PrefixKey> {
     affinity_hash(&serde_json::from_slice::<serde_json::Value>(body).ok()?)
 }
 
@@ -241,6 +251,18 @@ pub fn openai_error(status: u16, message: &str) -> Response {
         .into_response()
 }
 
+/// Stamp the per-child bearer secret (child `--api-key` hardening) on
+/// a child-bound request. SINGLE CHOKE POINT: every gateway lane that
+/// talks HTTP to a spawned engine child must route its
+/// `reqwest::RequestBuilder` through here — a missed site fails loudly
+/// (the child answers 401), not silently.
+pub fn child_auth(rb: reqwest::RequestBuilder, engine: &EngineRef) -> reqwest::RequestBuilder {
+    match &engine.auth {
+        Some(secret) => rb.bearer_auth(secret),
+        None => rb,
+    }
+}
+
 /// Forward a request to the child byte-for-byte and stream the response
 /// back. `path_query` includes the leading `/`.
 /// Forward one request to the child. Eight distinct request components
@@ -272,6 +294,13 @@ pub async fn proxy_request(
         );
     }
     let url = format!("{base}{path_query}");
+    let began = std::time::Instant::now();
+
+    // R6: force the final usage chunk on /v1 chat streams so warm/cold
+    // classification has data — most clients never opt in. Additive and
+    // spec-compliant (usage-only extra chunk; ollama lane already does
+    // the same). Legacy /completions and non-chat routes pass through.
+    let body = inject_include_usage(path_query, body);
 
     // Single-flight (B8, FIX2): identical NON-STREAM chat requests
     // coalesce AT THE CHILD-CALL BOUNDARY (admission already happened:
@@ -308,6 +337,9 @@ pub async fn proxy_request(
     }
 
     let mut req = state.http.request(method.clone(), &url);
+    // Client `Authorization` was stripped above; the child secret is
+    // stamped fresh here (never the caller's gateway key).
+    req = child_auth(req, engine);
     for (name, value) in headers {
         if !STRIP_REQUEST.contains(&name.as_str()) {
             req = req.header(name, value);
@@ -418,6 +450,9 @@ pub async fn proxy_request(
                     s.push(&buf);
                     s.finish(&state.keys);
                 }
+                // R6: buffered non-stream chat — classify from the exact
+                // JSON (no substring heuristics on this path).
+                record_buffered_chat(&state.obs, &buf, began.elapsed().as_secs_f64());
                 release_sf(state, sf).await;
                 let stream = futures::stream::once(async move { Ok::<_, std::io::Error>(buf) })
                     .chain(futures::stream::unfold(body_guard, |g| async {
@@ -470,11 +505,25 @@ pub async fn proxy_request(
         sniffer,
         Arc::clone(&state.keys),
     )));
+    let cache_tap = std::sync::Arc::new(CacheTap::new());
+    let tap_map = std::sync::Arc::clone(&cache_tap);
+    let first_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let tap_first = std::sync::Arc::clone(&first_ns);
+    let cache_finisher = std::sync::Arc::new(CacheObsFinisher {
+        tap: cache_tap,
+        obs: std::sync::Arc::clone(&state.obs),
+        first_ns,
+        chat: is_chat_route(path_query),
+    });
     let stream = resp.bytes_stream().map(move |r| {
         if r.is_ok() {
             let now = std::time::Instant::now();
             if first_chunk {
                 hist_state.ttft.observe_secs((now - start).as_secs_f64());
+                tap_first.store(
+                    u64::try_from((now - began).as_nanos()).unwrap_or(u64::MAX),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 first_chunk = false;
             } else {
                 hist_state
@@ -484,6 +533,7 @@ pub async fn proxy_request(
             last_chunk = now;
             if let Ok(bytes) = r.as_ref() {
                 sentinel_feed.bytes(bytes.as_ref());
+                tap_map.push(bytes.as_ref());
                 if let Some(s) = sniffer_finisher.lock().expect("sniffer").0.as_mut() {
                     s.push(bytes.as_ref());
                 }
@@ -494,14 +544,18 @@ pub async fn proxy_request(
     // Hold in-flight accounting for the body's lifetime: the guard drops
     // when the client drains (or aborts) the stream.
     let sf_state = std::sync::Arc::clone(state);
-    let stream = stream.chain(futures::stream::unfold((body_guard, sf), move |(g, sf)| {
-        let sf_state = std::sync::Arc::clone(&sf_state);
-        async move {
-            drop(g);
-            release_sf(&sf_state, sf).await; // stream end (or abort): twin may lead
-            None
-        }
-    }));
+    let stream = stream.chain(futures::stream::unfold(
+        (body_guard, sf, cache_finisher),
+        move |(g, sf, cache_finisher)| {
+            let sf_state = std::sync::Arc::clone(&sf_state);
+            async move {
+                drop(g);
+                drop(cache_finisher); // classify at stream end (or abort)
+                release_sf(&sf_state, sf).await; // stream end (or abort): twin may lead
+                None
+            }
+        },
+    ));
     builder
         .body(Body::from_stream(stream))
         .unwrap_or_else(|e| openai_error(500, &format!("proxy body: {e}")))
@@ -528,6 +582,113 @@ async fn release_sf(state: &Arc<AppState>, sf: Option<SingleFlight>) {
 fn is_chat_route(path_query: &str) -> bool {
     let p = path_query.split('?').next().unwrap_or(path_query);
     p.ends_with("/chat/completions") || p.ends_with("/completions") || p.ends_with("/responses")
+}
+
+/// Additive `stream_options.include_usage = true` on /v1 chat STREAM
+/// requests (R6): the final usage chunk is what the gateway's warm/cold
+/// cache classification reads. Never touches non-stream requests, other
+/// routes, or bodies that already opted in; any parse/serialize failure
+/// returns the original bytes untouched (the child remains the judge).
+fn inject_include_usage(path_query: &str, body: axum::body::Bytes) -> axum::body::Bytes {
+    let p = path_query.split('?').next().unwrap_or(path_query);
+    if !p.ends_with("/chat/completions") {
+        return body;
+    }
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    if v.get("stream").and_then(serde_json::Value::as_bool) != Some(true) {
+        return body;
+    }
+    if v.pointer("/stream_options/include_usage")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return body;
+    }
+    v["stream_options"]["include_usage"] = serde_json::Value::Bool(true);
+    match serde_json::to_vec(&v) {
+        Ok(bytes) => axum::body::Bytes::from(bytes),
+        // serializing a parsed Value cannot fail; keep the original on
+        // any error anyway (additive contract: never reject what the
+        // child might accept)
+        Err(_) => body,
+    }
+}
+
+/// Classify a fully-buffered non-stream chat body (enforce path) from
+/// its exact usage object — no substring heuristics on this route.
+fn record_buffered_chat(obs: &std::sync::Arc<crate::state::CacheObs>, buf: &[u8], ttft_secs: f64) {
+    match serde_json::from_slice::<serde_json::Value>(buf) {
+        Ok(v) => match v.get("usage") {
+            Some(u) => obs.record(
+                u.get("prompt_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                crate::translate::cached_prompt_tokens(Some(u)),
+                Some(ttft_secs),
+            ),
+            None => obs.miss(),
+        },
+        Err(_) => obs.miss(),
+    }
+}
+
+/// R6 per-stream cache tap: bounded tail owned by the map closure,
+/// classified once by the Drop finisher at stream end (clean drain
+/// or abort). Same lifetime trick as the usage sniffer.
+struct CacheTap {
+    tail: std::sync::Mutex<Vec<u8>>,
+}
+impl CacheTap {
+    fn new() -> Self {
+        Self {
+            tail: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+    fn push(&self, b: &[u8]) {
+        const CAP: usize = 8 * 1024;
+        let mut t = self.tail.lock().expect("cache tap");
+        if b.len() >= CAP {
+            t.clear();
+            t.extend_from_slice(&b[b.len() - CAP..]);
+        } else if t.len() + b.len() > CAP {
+            let over = t.len() + b.len() - CAP;
+            t.drain(..over);
+            t.extend_from_slice(b);
+        } else {
+            t.extend_from_slice(b);
+        }
+    }
+}
+
+/// Classifies once from the tap tail at stream end. Last-match
+/// (`last_int_after`): the usage payload is always the FINAL event,
+/// so a literal appearing in generated prose earlier cannot win.
+struct CacheObsFinisher {
+    tap: std::sync::Arc<CacheTap>,
+    obs: std::sync::Arc<crate::state::CacheObs>,
+    first_ns: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Chat routes only — embeddings/other bodies would pollute the
+    /// generation warm/cold split.
+    chat: bool,
+}
+impl Drop for CacheObsFinisher {
+    fn drop(&mut self) {
+        if !self.chat {
+            return;
+        }
+        let tail = self.tap.tail.lock().expect("cache tap").clone();
+        if crate::keys::find_sub(&tail, b"\"prompt_tokens\"").is_none() {
+            self.obs.miss();
+            return;
+        }
+        let prompt = crate::keys::last_int_after(&tail, "\"prompt_tokens\"").unwrap_or(0);
+        let cached = crate::keys::last_int_after(&tail, "\"cached_tokens\"").unwrap_or(0);
+        let first = self.first_ns.load(std::sync::atomic::Ordering::Relaxed);
+        let ttft = (first > 0).then(|| std::time::Duration::from_nanos(first).as_secs_f64());
+        self.obs.record(prompt, cached, ttft);
+    }
 }
 
 fn route_name(path_query: &str) -> &'static str {
@@ -678,6 +839,26 @@ mod affinity_tests {
     }
 
     #[test]
+    fn unit__affinity__sys_class__stable_across_users() {
+        // F8: the sys half of the key identifies the shared system-prompt
+        // class, so two different conversations under the same system
+        // prompt coalesce onto one warm replica.
+        let a = affinity_hash(&chat(Some("You are a pirate."), "question one"));
+        let b = affinity_hash(&chat(Some("You are a pirate."), "question two"));
+        let (a, b) = (a.expect("both hash"), b.expect("both hash"));
+        assert_eq!(a.sys, b.sys, "same system prompt shares the sys class");
+        assert_ne!(a.convo, b.convo, "different first-user turns differ");
+    }
+
+    #[test]
+    fn unit__affinity__sys_class__differs_across_system_prompts() {
+        let a = affinity_hash(&chat(Some("You are a pirate."), "question"));
+        let b = affinity_hash(&chat(Some("You are a scientist."), "question"));
+        let (a, b) = (a.expect("both hash"), b.expect("both hash"));
+        assert_ne!(a.sys, b.sys);
+    }
+
+    #[test]
     fn unit__affinity__chat_later_turns_ignored() {
         // Affinity is the CONVERSATION prefix: extra assistant/user
         // turns after the first user turn must not change the hash,
@@ -796,5 +977,199 @@ mod affinity_tests {
         let v: serde_json::Value = serde_json::from_slice(body).unwrap();
         assert_eq!(affinity_hash_bytes(body), affinity_hash(&v));
         assert_eq!(affinity_hash_bytes(b"not json"), None);
+    }
+}
+
+#[cfg(test)]
+mod cache_obs_tests {
+    #![allow(non_snake_case)]
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::Ordering;
+
+    fn json_body(v: &serde_json::Value) -> axum::body::Bytes {
+        axum::body::Bytes::from(serde_json::to_vec(v).unwrap())
+    }
+
+    fn parse(b: &axum::body::Bytes) -> serde_json::Value {
+        serde_json::from_slice(b).unwrap()
+    }
+
+    // --- inject_include_usage -------------------------------------------
+
+    #[test]
+    fn unit__inject_include_usage__stream_true_adds_flag() {
+        let out = inject_include_usage(
+            "/v1/chat/completions",
+            json_body(&json!({"model": "m", "messages": [], "stream": true})),
+        );
+        let v = parse(&out);
+        assert_eq!(
+            v.pointer("/stream_options/include_usage"),
+            Some(&json!(true))
+        );
+        assert_eq!(v["stream"], json!(true), "existing body preserved");
+    }
+
+    #[test]
+    fn unit__inject_include_usage__already_set_passthrough() {
+        let orig = json_body(&json!({"stream": true, "stream_options": {"include_usage": true}}));
+        let out = inject_include_usage("/v1/chat/completions", orig.clone());
+        assert_eq!(out, orig, "byte-identical: nothing to add");
+    }
+
+    #[test]
+    fn unit__inject_include_usage__non_stream_passthrough() {
+        let orig = json_body(&json!({"model": "m", "messages": []}));
+        let out = inject_include_usage("/v1/chat/completions", orig.clone());
+        assert_eq!(out, orig, "non-stream requests untouched");
+    }
+
+    #[test]
+    fn unit__inject_include_usage__non_chat_route_passthrough() {
+        let orig = json_body(&json!({"stream": true}));
+        let out = inject_include_usage("/v1/completions", orig.clone());
+        assert_eq!(
+            out, orig,
+            "completions lane untouched (usage shape differs)"
+        );
+        let out2 = inject_include_usage("/v1/embeddings", orig.clone());
+        assert_eq!(out2, orig);
+    }
+
+    #[test]
+    fn unit__inject_include_usage__invalid_json_passthrough() {
+        let orig = axum::body::Bytes::from_static(b"{not json stream:true");
+        let out = inject_include_usage("/v1/chat/completions", orig.clone());
+        assert_eq!(out, orig, "child remains the judge of odd bodies");
+    }
+
+    // --- record_buffered_chat -------------------------------------------
+
+    #[test]
+    fn unit__record_buffered_chat__usage_records_warm() {
+        let obs = std::sync::Arc::new(crate::state::CacheObs::new());
+        let body = json!({"choices": [], "usage": {
+            "prompt_tokens": 120,
+            "prompt_tokens_details": {"cached_tokens": 96},
+            "completion_tokens": 4,
+        }});
+        record_buffered_chat(&obs, &serde_json::to_vec(&body).unwrap(), 0.25);
+        assert_eq!(obs.prompt_tokens.load(Ordering::Relaxed), 120);
+        assert_eq!(obs.cached_tokens.load(Ordering::Relaxed), 96);
+        assert!(obs.unclassified.load(Ordering::Relaxed) == 0);
+        let mut warm = String::new();
+        obs.ttft_warm.render(&mut warm);
+        assert!(warm.contains("_count 1"), "{warm}");
+    }
+
+    #[test]
+    fn unit__record_buffered_chat__no_usage_or_bad_json_is_miss() {
+        let obs = std::sync::Arc::new(crate::state::CacheObs::new());
+        record_buffered_chat(
+            &obs,
+            &serde_json::to_vec(&json!({"choices": []})).unwrap(),
+            0.1,
+        );
+        record_buffered_chat(&obs, b"not json", 0.1);
+        assert_eq!(obs.unclassified.load(Ordering::Relaxed), 2);
+        assert_eq!(obs.prompt_tokens.load(Ordering::Relaxed), 0);
+    }
+
+    // --- CacheTap bounded tail ------------------------------------------
+
+    #[test]
+    fn unit__cache_tap__oversized_chunk_keeps_last_8kib() {
+        let tap = CacheTap::new();
+        let big: Vec<u8> = (0..16 * 1024u32).map(|i| (i % 251) as u8).collect();
+        tap.push(&big);
+        let t = tap.tail.lock().unwrap();
+        assert_eq!(t.len(), 8 * 1024);
+        assert_eq!(&t[..], &big[big.len() - 8 * 1024..], "tail = last 8KiB");
+    }
+
+    #[test]
+    fn unit__cache_tap__small_pushes_drain_oldest() {
+        let tap = CacheTap::new();
+        for i in 0..1000u32 {
+            tap.push(format!("line-{i:04} ").as_bytes());
+        }
+        let t = tap.tail.lock().unwrap();
+        assert!(t.len() <= 8 * 1024, "{}", t.len());
+        let s = String::from_utf8_lossy(&t.clone()).into_owned();
+        assert!(!s.contains("line-0000"), "oldest drained: {s}");
+        assert!(s.contains("line-0999"), "newest kept: {s}");
+    }
+
+    // --- CacheObsFinisher classification --------------------------------
+
+    fn finisher_with(
+        chunks: &[&[u8]],
+        first_ns: u64,
+        chat: bool,
+    ) -> std::sync::Arc<crate::state::CacheObs> {
+        let tap = std::sync::Arc::new(CacheTap::new());
+        for c in chunks {
+            tap.push(c);
+        }
+        let obs = std::sync::Arc::new(crate::state::CacheObs::new());
+        let first = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(first_ns));
+        drop(CacheObsFinisher {
+            tap,
+            obs: std::sync::Arc::clone(&obs),
+            first_ns: first,
+            chat,
+        });
+        obs
+    }
+
+    const USAGE_FINAL: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],",
+        "\"usage\":{\"prompt_tokens\":120,",
+        "\"prompt_tokens_details\":{\"cached_tokens\":96},",
+        "\"completion_tokens\":4}}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    #[test]
+    fn unit__cache_finisher__usage_with_cached_records_warm_with_ttft() {
+        let obs = finisher_with(&[USAGE_FINAL.as_bytes()], 50_000_000, true);
+        assert_eq!(obs.prompt_tokens.load(Ordering::Relaxed), 120);
+        assert_eq!(obs.cached_tokens.load(Ordering::Relaxed), 96);
+        assert_eq!(obs.unclassified.load(Ordering::Relaxed), 0);
+        let mut warm = String::new();
+        obs.ttft_warm.render(&mut warm);
+        assert!(warm.contains("_count 1"), "warm + measured TTFT: {warm}");
+    }
+
+    #[test]
+    fn unit__cache_finisher__no_usage_is_miss() {
+        let chunks = ["data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n".as_bytes()];
+        let obs = finisher_with(&chunks, 0, true);
+        assert_eq!(obs.unclassified.load(Ordering::Relaxed), 1);
+        assert_eq!(obs.prompt_tokens.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn unit__cache_finisher__non_chat_is_no_op() {
+        let obs = finisher_with(&[USAGE_FINAL.as_bytes()], 50_000_000, false);
+        assert_eq!(obs.unclassified.load(Ordering::Relaxed), 0);
+        assert_eq!(obs.prompt_tokens.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn unit__cache_finisher__prose_literal_earlier_loses_to_final_usage() {
+        // Pin (regression contract): generated prose may contain the
+        // literal `"prompt_tokens"` — classification must read the FINAL
+        // usage event, never the prose occurrence.
+        let prose = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":",
+            "\"echo {\\\"prompt_tokens\\\": 9999, \\\"cached_tokens\\\": 9999}\"",
+            "}}]}\n\n"
+        );
+        let obs = finisher_with(&[prose.as_bytes(), USAGE_FINAL.as_bytes()], 0, true);
+        assert_eq!(obs.prompt_tokens.load(Ordering::Relaxed), 120, "usage wins");
+        assert_eq!(obs.cached_tokens.load(Ordering::Relaxed), 96, "usage wins");
+        assert_eq!(obs.unclassified.load(Ordering::Relaxed), 0);
     }
 }

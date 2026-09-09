@@ -188,6 +188,30 @@ pub fn tpot() -> Histogram {
     )
 }
 
+/// TTFT of responses that reused prompt cache (cached prompt tokens > 0).
+#[must_use]
+pub fn ttft_warm() -> Histogram {
+    Histogram::new(
+        "pallama_ttft_warm_seconds",
+        "Time-to-first-token for warm generations (usage reported cached prompt tokens > 0)",
+        &[
+            0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+        ],
+    )
+}
+
+/// TTFT of responses that processed the whole prompt (no cached tokens).
+#[must_use]
+pub fn ttft_cold() -> Histogram {
+    Histogram::new(
+        "pallama_ttft_cold_seconds",
+        "Time-to-first-token for cold generations (usage reported 0 cached prompt tokens)",
+        &[
+            0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+        ],
+    )
+}
+
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {

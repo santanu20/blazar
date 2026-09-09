@@ -20,6 +20,172 @@ pub fn split_remote<'a>(model: &'a str, cfg: &'a Config) -> Option<(&'a Remote, 
     Some((remote, rest))
 }
 
+/// Consecutive failures before a remote is marked down (circuit open).
+const REMOTE_MARK_DOWN_FAILS: u32 = 3;
+/// How long a marked-down remote is skipped before a half-open probe.
+const REMOTE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Circuit + load state for one remote pool member (C2/C3).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteHealth {
+    pub consec_failures: u32,
+    /// `Some(t)` = marked down until `t` (requests skip it, then one
+    /// half-open probe passes through).
+    pub down_until: Option<std::time::Instant>,
+    pub in_flight: u32,
+}
+
+fn health_key(remote: &Remote) -> String {
+    format!("{}|{}", remote.name, remote.url)
+}
+
+/// RAII in-flight lease: bumped by `select_remote`, released on drop.
+/// Released when the caller's response HEADERS are ready (forward
+/// functions return at header time); body streaming continues after —
+/// header-time is the meaningful queue signal for load balancing.
+pub struct RemoteLease {
+    map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, RemoteHealth>>>,
+    key: String,
+}
+
+impl Drop for RemoteLease {
+    fn drop(&mut self) {
+        if let Ok(mut m) = self.map.lock() {
+            if let Some(h) = m.get_mut(&self.key) {
+                h.in_flight = h.in_flight.saturating_sub(1);
+            }
+        }
+    }
+}
+
+/// Select the remote for a `<remote>:<model>` request: filter the
+/// name-pool down to live members (marked-down members are skipped —
+/// all-down returns a 503 teaching error with the retry window), then
+/// pick the least-busy (C3). Returns the remote, the stripped model and
+/// an in-flight lease.
+#[allow(clippy::result_large_err)] // `Response` is the gateway's error currency
+pub fn select_remote<'a>(
+    state: &'a AppState,
+    model: &'a str,
+) -> Result<(&'a Remote, &'a str, RemoteLease), Response> {
+    let Some((name, rest)) = model.split_once(':') else {
+        return Err(crate::proxy::openai_error(
+            400,
+            "model has no remote prefix",
+        ));
+    };
+    let now = std::time::Instant::now();
+    let mut map = state
+        .remote_health
+        .lock()
+        .expect("remote_health lock poisoned");
+    let pool: Vec<&Remote> = state
+        .config
+        .remotes
+        .iter()
+        .filter(|r| r.name == name)
+        .collect();
+    if pool.is_empty() {
+        return Err(crate::proxy::openai_error(
+            400,
+            &format!("unknown remote {name:?}; check [[remotes]] in config"),
+        ));
+    }
+    let live: Vec<(&Remote, RemoteHealth)> = pool
+        .iter()
+        .filter_map(|r| {
+            let h = map.get(&health_key(r)).copied().unwrap_or_default();
+            let down = h.down_until.is_some_and(|t| t > now);
+            (!down).then_some((*r, h))
+        })
+        .collect();
+    if live.is_empty() {
+        let soonest = pool
+            .iter()
+            .filter_map(|r| map.get(&health_key(r)).and_then(|h| h.down_until))
+            .min()
+            .unwrap_or(now);
+        let secs = soonest.saturating_duration_since(now).as_secs().max(1);
+        return Err(crate::proxy::openai_error(
+            503,
+            &format!(
+                "remote {name:?} marked down (circuit open); retry in ~{secs}s or check the remote"
+            ),
+        ));
+    }
+    let (remote, _h) = live
+        .iter()
+        .min_by_key(|(_, h)| h.in_flight)
+        .expect("live pool non-empty");
+    let key = health_key(remote);
+    map.entry(key.clone()).or_default().in_flight += 1;
+    let lease = RemoteLease {
+        map: std::sync::Arc::clone(&state.remote_health),
+        key,
+    };
+    Ok((remote, rest, lease))
+}
+
+/// Record a forward result: success resets the circuit; a failure
+/// (connect error or 5xx) increments, and `REMOTE_MARK_DOWN_FAILS` in a
+/// row marks the remote down for the cooldown window.
+pub fn note_remote_result(state: &AppState, remote: &Remote, ok: bool) {
+    let key = health_key(remote);
+    let mut map = state
+        .remote_health
+        .lock()
+        .expect("remote_health lock poisoned");
+    let h = map.entry(key).or_default();
+    if ok {
+        if h.consec_failures > 0 || h.down_until.is_some() {
+            tracing::info!(target: "pallama::remotes", remote = %remote.name, "remote recovered");
+        }
+        h.consec_failures = 0;
+        h.down_until = None;
+        return;
+    }
+    h.consec_failures += 1;
+    if h.consec_failures >= REMOTE_MARK_DOWN_FAILS {
+        h.down_until = Some(std::time::Instant::now() + REMOTE_COOLDOWN);
+        tracing::warn!(
+            target: "pallama::remotes",
+            remote = %remote.name,
+            url = %remote.url,
+            "remote marked down for {}s after {fails} consecutive failures",
+            REMOTE_COOLDOWN.as_secs(),
+            fails = h.consec_failures
+        );
+    }
+}
+
+/// `forward_openai` + circuit bookkeeping: select (LB + mark-down
+/// filter), forward, note the result by response class (<500 = ok).
+pub async fn forward_with_health(
+    state: &AppState,
+    model: &str,
+    method: &axum::http::Method,
+    path_query: &str,
+    headers: &axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let (remote, remote_model, _lease) = match select_remote(state, model) {
+        Ok(x) => x,
+        Err(resp) => return resp,
+    };
+    let resp = forward_openai(
+        state,
+        remote,
+        remote_model,
+        method,
+        path_query,
+        headers,
+        body,
+    )
+    .await;
+    note_remote_result(state, remote, resp.status().as_u16() < 500);
+    resp
+}
+
 /// Forward an OpenAI-shaped request to a remote: rewrite `model` to the
 /// stripped name, attach the remote's bearer key, stream the response
 /// back byte-for-byte (the zero-tax contract holds — the remote is
@@ -288,6 +454,27 @@ pub async fn ollama_chat_remote(
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__remote_lease__drop_releases_in_flight_slot() {
+        let map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, RemoteHealth>>> =
+            std::sync::Arc::default();
+        {
+            let lease = RemoteLease {
+                map: std::sync::Arc::clone(&map),
+                key: "r|http://10.0.0.4:8000".into(),
+            };
+            // select_remote bumps in_flight when it hands out the lease.
+            map.lock()
+                .unwrap()
+                .entry(lease.key.clone())
+                .or_default()
+                .in_flight += 1;
+            assert_eq!(map.lock().unwrap()["r|http://10.0.0.4:8000"].in_flight, 1);
+        }
+        // Lease dropped at header time: the LB slot is back.
+        assert_eq!(map.lock().unwrap()["r|http://10.0.0.4:8000"].in_flight, 0);
+    }
 
     #[test]
     fn unit__split_remote__prefix_must_name_a_remote() {

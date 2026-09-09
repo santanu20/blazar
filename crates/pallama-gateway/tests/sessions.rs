@@ -1,0 +1,148 @@
+//! R3 session pins — integration tests over the real router + stub child:
+//! header touch through the middleware, pass-through without the header,
+//! idempotent close, and the /api/sessions listing.
+
+#![allow(non_snake_case)]
+#![allow(clippy::duration_suboptimal_units)]
+
+mod support;
+
+use std::time::Duration;
+
+use support::{client, start};
+
+#[tokio::test]
+async fn integration__pin_mw__header_pins_model_full_stack() {
+    let ts = start(pallama_core::Config::default()).await;
+    let c = client();
+    let body = serde_json::json!({"model": "m1", "messages": [
+        {"role": "user", "content": "hi"}
+    ]});
+    let r = c
+        .post(format!("{}/api/chat", ts.base))
+        .header("x-pallama-session", "agent1")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    // Canonical model pinned through the whole stack (auth → … → pin → handler).
+    assert!(
+        ts.state
+            .sup
+            .sessions
+            .pins("m1", Duration::from_secs(15 * 60))
+            .live
+    );
+
+    // The listing reflects it with shape and TTL bookkeeping.
+    let l: serde_json::Value = c
+        .get(format!("{}/api/sessions", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(l["sessions"].as_array().map(Vec::len), Some(1));
+    assert_eq!(l["sessions"][0]["session"], "agent1");
+    assert_eq!(l["sessions"][0]["model"], "m1");
+    assert_eq!(l["keep_secs"], 900);
+
+    // And the gauge follows the registry.
+    let m = c
+        .get(format!("{}/metrics", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(m.contains("pallama_sessions_live 1"), "gauge in:\n{m}");
+}
+
+#[tokio::test]
+async fn integration__pin_mw__absent_header_no_pin() {
+    let ts = start(pallama_core::Config::default()).await;
+    let c = client();
+    let body = serde_json::json!({"model": "m1", "messages": [
+        {"role": "user", "content": "hi"}
+    ]});
+    let r = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(ts
+        .state
+        .sup
+        .sessions
+        .list(Duration::from_secs(15 * 60))
+        .is_empty());
+}
+
+#[tokio::test]
+async fn integration__session_close__releases_pin_idempotently() {
+    let ts = start(pallama_core::Config::default()).await;
+    let c = client();
+    let body = serde_json::json!({"model": "m1", "messages": [
+        {"role": "user", "content": "hi"}
+    ]});
+    let r = c
+        .post(format!("{}/api/chat", ts.base))
+        .header("x-pallama-session", "agent1")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(
+        ts.state
+            .sup
+            .sessions
+            .pins("m1", Duration::from_secs(15 * 60))
+            .live
+    );
+
+    // Close: no model, no filename — the pin is enough.
+    let r: serde_json::Value = c
+        .post(format!("{}/api/session", ts.base))
+        .json(&serde_json::json!({"action": "close", "session": "agent1"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["status"], "ok");
+    assert_eq!(r["released"], true);
+    assert!(ts
+        .state
+        .sup
+        .sessions
+        .list(Duration::from_secs(15 * 60))
+        .is_empty());
+
+    // Idempotent second close.
+    let r: serde_json::Value = c
+        .post(format!("{}/api/session", ts.base))
+        .json(&serde_json::json!({"action": "close", "session": "agent1"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["released"], false);
+
+    // Invalid names are rejected outright (same policy as checkpoints).
+    let r = c
+        .post(format!("{}/api/session", ts.base))
+        .json(&serde_json::json!({"action": "close", "session": "../evil"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+}

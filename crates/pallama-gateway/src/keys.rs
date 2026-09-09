@@ -544,16 +544,6 @@ impl UsageSniffer {
 /// Extract (prompt + completion) tokens from a response tail. Pure.
 #[must_use]
 pub fn sniff_usage(tail: &[u8]) -> u64 {
-    fn last_int_after(tail: &[u8], key: &str) -> Option<u64> {
-        let mut best: Option<u64> = None;
-        let mut hay = tail;
-        while let Some(pos) = find_sub(hay, key.as_bytes()) {
-            let after = &hay[pos + key.len()..];
-            best = read_leading_int(after).or(best);
-            hay = after;
-        }
-        best
-    }
     let prompt = last_int_after(tail, "\"prompt_tokens\"")
         .or_else(|| last_int_after(tail, "\"input_tokens\""))
         .or_else(|| last_int_after(tail, "\"prompt_eval_count\""));
@@ -563,11 +553,28 @@ pub fn sniff_usage(tail: &[u8]) -> u64 {
     prompt.unwrap_or(0).saturating_add(completion.unwrap_or(0))
 }
 
-fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
+/// Shared substring scan (gateway-internal): cheap gate before any JSON
+/// parse on streamed bodies.
+pub(crate) fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || hay.len() < needle.len() {
         return None;
     }
     hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Value of the LAST `<key> <int>` occurrence in a streamed tail — the
+/// usage payload is always the final event, so a literal appearing in
+/// generated prose earlier must not win. If the last occurrence fails
+/// to parse (prose), the previous parse wins.
+pub(crate) fn last_int_after(tail: &[u8], key: &str) -> Option<u64> {
+    let mut best: Option<u64> = None;
+    let mut hay = tail;
+    while let Some(pos) = find_sub(hay, key.as_bytes()) {
+        let after = &hay[pos + key.len()..];
+        best = read_leading_int(after).or(best);
+        hay = after;
+    }
+    best
 }
 
 /// Wrap a finished handler `Response` so its body charges the key's
@@ -607,7 +614,7 @@ pub fn charge_outgoing(
     axum::http::Response::from_parts(parts, axum::body::Body::from_stream(stream))
 }
 
-fn read_leading_int(bytes: &[u8]) -> Option<u64> {
+pub(crate) fn read_leading_int(bytes: &[u8]) -> Option<u64> {
     let mut i = 0;
     while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b':' || bytes[i] == b'"') {
         i += 1;

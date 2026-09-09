@@ -83,6 +83,22 @@ pub fn chat_to_openai(req: &Value) -> Result<(Value, Option<i64>), String> {
     if let Some(rf) = translate_format(&req["format"]) {
         out["response_format"] = rf;
     }
+    // Raw GBNF passthrough (R9): an explicit grammar is forwarded 1:1 —
+    // the child skips schema conversion entirely for it.
+    if let Some(g) = req.get("grammar").and_then(Value::as_str) {
+        if !g.is_empty() {
+            out["grammar"] = json!(g);
+        }
+    }
+    // Confidence scoring (R2): ollama clients asking for logprobs get
+    // them passed through 1:1 — the sentinel turns them into response
+    // confidence in `why`. Absent = unchanged request.
+    if let Some(lp) = req.get("logprobs").and_then(Value::as_bool) {
+        out["logprobs"] = json!(lp);
+        if let Some(n) = req.get("top_logprobs").and_then(Value::as_u64) {
+            out["top_logprobs"] = json!(n);
+        }
+    }
     let mut num_ctx = None;
     if let Some(opts) = req.get("options").filter(|o| o.is_object()) {
         if let Some(nc) = opts.get("num_ctx").and_then(Value::as_i64) {
@@ -126,6 +142,20 @@ fn merge_timing_fields(v: &mut Value, openai: &Value) {
     }
 }
 
+/// Extract the cached prompt-token count from an `OpenAI` usage object
+/// (`prompt_tokens_details` -> `cached_tokens`; llama-server emits it on
+/// stream usage chunks and non-stream chat). 0 when absent — callers
+/// treat absent as "cold, unmeasured".
+#[must_use]
+pub fn cached_prompt_tokens(usage: Option<&Value>) -> u64 {
+    usage
+        .and_then(|u| {
+            u.pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(0)
+}
+
 /// `OpenAI` non-stream chat response -> ollama `ChatResponse` (done:true with
 /// counts from usage).
 #[must_use]
@@ -149,6 +179,12 @@ pub fn openai_chat_to_ollama(model: &str, openai: &Value) -> Value {
         "prompt_eval_count": openai["usage"]["prompt_tokens"].clone(),
         "eval_count": openai["usage"]["completion_tokens"].clone(),
     });
+    // Cache-hit transparency (A9): surface reused prompt tokens under the
+    // same ollama-shaped key the gateway's /metrics uses.
+    let cached = cached_prompt_tokens(openai.get("usage"));
+    if cached > 0 {
+        v["prompt_eval_cached_count"] = json!(cached);
+    }
     merge_timing_fields(&mut v, openai);
     v
 }
@@ -213,6 +249,12 @@ pub fn ollama_final_chunk(
         "prompt_eval_count": usage.and_then(|u| u["prompt_tokens"].as_i64()).unwrap_or(0),
         "eval_count": usage.and_then(|u| u["completion_tokens"].as_i64()).unwrap_or(0),
     });
+    // Cache-hit transparency (A9): stream usage chunks carry the same
+    // prompt_tokens_details.cached_tokens as non-stream bodies.
+    let cached = cached_prompt_tokens(usage);
+    if cached > 0 {
+        v["prompt_eval_cached_count"] = json!(cached);
+    }
     if let Some(e) = eval_ns {
         v["eval_duration"] = json!(e);
     }
@@ -527,5 +569,115 @@ mod tests {
                 .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()));
             assert_eq!(parsed, Some(expect));
         }
+    }
+
+    #[test]
+    fn unit__cached_prompt_tokens__present_absent_nested() {
+        let full = json!({"prompt_tokens": 120, "prompt_tokens_details": {"cached_tokens": 96}});
+        assert_eq!(cached_prompt_tokens(Some(&full)), 96);
+        // Absent details / None usage / non-numeric: 0, never a panic.
+        assert_eq!(cached_prompt_tokens(Some(&json!({"prompt_tokens": 5}))), 0);
+        assert_eq!(cached_prompt_tokens(None), 0);
+        assert_eq!(
+            cached_prompt_tokens(Some(
+                &json!({"prompt_tokens_details": {"cached_tokens": "x"}})
+            )),
+            0
+        );
+    }
+
+    #[test]
+    fn unit__ollama_final_chunk__cached_count_emitted_only_when_nonzero() {
+        let warm = json!({"prompt_tokens": 120, "prompt_tokens_details": {"cached_tokens": 96}, "completion_tokens": 4});
+        let v = ollama_final_chunk("m", Some(&warm), Some("stop"), None, None);
+        assert_eq!(v["prompt_eval_cached_count"], json!(96));
+        assert_eq!(v["prompt_eval_count"], json!(120));
+        let cold = json!({"prompt_tokens": 40, "completion_tokens": 4});
+        let v2 = ollama_final_chunk("m", Some(&cold), Some("stop"), None, None);
+        assert!(v2.get("prompt_eval_cached_count").is_none(), "{v2}");
+        let v3 = ollama_final_chunk("m", None, None, None, None);
+        assert!(v3.get("prompt_eval_cached_count").is_none(), "{v3}");
+    }
+
+    #[test]
+    fn unit__openai_chat_to_ollama__cached_count_passthrough() {
+        let openai = json!({
+            "choices": [{"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 120, "prompt_tokens_details": {"cached_tokens": 96}, "completion_tokens": 4},
+        });
+        let v = openai_chat_to_ollama("m", &openai);
+        assert_eq!(v["prompt_eval_cached_count"], json!(96));
+        assert_eq!(v["prompt_eval_count"], json!(120));
+        let cold = json!({
+            "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 40, "completion_tokens": 4},
+        });
+        assert!(openai_chat_to_ollama("m", &cold)
+            .get("prompt_eval_cached_count")
+            .is_none());
+    }
+
+    #[test]
+    fn unit__chat_to_openai__logprobs_passthrough() {
+        let req = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": true,
+            "top_logprobs": 5,
+        });
+        let (out, _) = chat_to_openai(&req).unwrap();
+        assert_eq!(out["logprobs"], json!(true));
+        assert_eq!(out["top_logprobs"], json!(5));
+        // top_logprobs without logprobs=true is NOT forwarded (OpenAI
+        // requires the flag; forwarding it alone would 400 upstream).
+        let req2 = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "top_logprobs": 5,
+        });
+        let (out2, _) = chat_to_openai(&req2).unwrap();
+        assert!(out2.get("logprobs").is_none());
+        assert!(out2.get("top_logprobs").is_none());
+        // Plain request: nothing added.
+        let (out3, _) = chat_to_openai(&json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        assert!(out3.get("logprobs").is_none());
+    }
+
+    #[test]
+    fn unit__chat_to_openai__grammar_passthrough() {
+        let gbnf = "root ::= \"yes\" | \"no\"";
+        let req = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "grammar": gbnf,
+        });
+        let (out, _) = chat_to_openai(&req).unwrap();
+        assert_eq!(out["grammar"], json!(gbnf));
+        // Empty grammar = absent (nothing forwarded).
+        let req2 = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "grammar": "",
+        });
+        let (out2, _) = chat_to_openai(&req2).unwrap();
+        assert!(out2.get("grammar").is_none());
+        // Non-string grammar never forwarded (the sentinel lint 400s it
+        // before translate; translate stays defensive).
+        let req3 = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "grammar": 42,
+        });
+        let (out3, _) = chat_to_openai(&req3).unwrap();
+        assert!(out3.get("grammar").is_none());
+        // Plain request: nothing added.
+        let (out4, _) = chat_to_openai(&json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        assert!(out4.get("grammar").is_none());
     }
 }
