@@ -398,6 +398,16 @@ fn banner() {
     );
 }
 
+/// Bounded HTTP client for one-shot CLI calls (F126): a wedged daemon
+/// must fail the command, not hang it. Streaming lanes (watch, chat
+/// stream) deliberately build their own unbounded/600s clients.
+fn cli_http() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_default()
+}
+
 fn dirs() -> PallamaDirs {
     PallamaDirs::from_env()
 }
@@ -568,6 +578,15 @@ async fn ensure_daemon() -> Result<String> {
         use std::os::unix::process::CommandExt as _;
         cmd.process_group(0);
     }
+    #[cfg(windows)]
+    {
+        // F132: without DETACHED_PROCESS the auto-started daemon shares
+        // the CLI's console — Ctrl-C at the prompt kills it too.
+        use std::os::windows::process::CommandExt as _;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
     cmd.spawn().context("spawn detached pallama serve")?;
     let deadline = tokio_deadline(Duration::from_secs(30));
     while std::time::Instant::now() < deadline {
@@ -703,7 +722,7 @@ async fn run(cmd: Cmd) -> Result<()> {
 
 async fn session_cmd(cmd: SessionCmd) -> Result<()> {
     let base = ensure_daemon().await?;
-    let client = reqwest::Client::new();
+    let client = cli_http();
     match cmd {
         SessionCmd::Save { model, name } => {
             let resp = client
@@ -1902,7 +1921,7 @@ async fn doctor_port() -> Vec<Check> {
             format!("{}:{} free (daemon not running)", cfg.host, cfg.port),
         )];
     }
-    let is_pallama = reqwest::Client::new()
+    let is_pallama = cli_http()
         .get(format!("http://{}:{}/healthz", cfg.host, cfg.port))
         .send()
         .await
@@ -2201,6 +2220,14 @@ async fn serve() -> Result<()> {
     .await;
     flusher.abort();
     state.keys.flush(&d);
+    // A hard bind conflict (ollama owns the port) must not feed the
+    // systemd Restart=always loop: exit 3 + RestartPreventExitStatus.
+    if let Err(e) = &served {
+        if e.downcast_ref::<pallama_gateway::BindConflict>().is_some() {
+            eprintln!("pallama: {e} — fix config.toml `port` (or PALLAMA_PORT) and start again");
+            std::process::exit(pallama_gateway::EXIT_BIND_CONFLICT);
+        }
+    }
     served?;
     println!("pallama stopped cleanly");
     Ok(())
@@ -2214,6 +2241,23 @@ fn stop() -> Result<()> {
     let pid: i32 = pid.trim().parse().context("pidfile corrupted")?;
     #[cfg(unix)]
     signal_stop::term(pid);
+    #[cfg(windows)]
+    // F127: `taskkill` (no /F) asks for a close first; a console daemon
+    // without a message pump ignores it, so finish with a hard kill after
+    // a grace beat. Never a group — exact pid only, like the unix lane.
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string()])
+            .status();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let still_alive = pallama_runtime::process_alive_by_pid(u32::try_from(pid).unwrap_or(0));
+        if still_alive {
+            std::process::Command::new("taskkill")
+                .args(["/F", "/PID", &pid.to_string()])
+                .status()
+                .context("taskkill /F")?;
+        }
+    }
     println!("signalled daemon pid {pid}");
     Ok(())
 }
@@ -2371,7 +2415,6 @@ fn import(
             .to_uppercase()
     });
     let size = std::fs::metadata(path).map_err(|e| anyhow!("{e}"))?.len();
-    let fsize = size;
     // Ollama blobs are content-addressed names without quant hints.
     let model_name = name.unwrap_or_else(|| {
         meta.name
@@ -2380,6 +2423,9 @@ fn import(
             .to_lowercase()
             .replace([' ', '.'], "-")
     });
+    // GGUF-embedded names are untrusted input too (F98): a crafted
+    // general.name with '/' would write outside the models dir.
+    pallama_runtime::models::ensure_portable_name(&model_name)?;
     let dest = d.models_dir().join(format!(
         "{model_name}-{}.gguf",
         derived_quant.to_lowercase()
@@ -2403,8 +2449,7 @@ fn import(
             Ok::<_, anyhow::Error>(mdest)
         })
         .transpose()?;
-    let bytes = i64::try_from(fsize).unwrap_or(i64::MAX);
-    let _ = size;
+    let bytes = i64::try_from(size).unwrap_or(i64::MAX);
     let row = pallama_core::ModelRow {
         name: model_name.clone(),
         repo: format!("imported:{}", path.display()),
@@ -2415,7 +2460,7 @@ fn import(
         mmproj_path: mmproj_dest.map(|p| p.display().to_string()),
         shards: 1,
         arch: Some(meta.architecture.clone()),
-        params: Some(pallama_runtime::hf::est_params(fsize, &derived_quant)),
+        params: Some(pallama_runtime::hf::est_params(size, &derived_quant)),
         ctx_train: meta.context_length.and_then(|c| i64::try_from(c).ok()),
         pulled_at: i64::try_from(
             std::time::SystemTime::now()
@@ -2551,7 +2596,7 @@ async fn ps(reset: bool) -> Result<()> {
     }
     if reset {
         let base = ensure_daemon().await?;
-        let _: serde_json::Value = reqwest::Client::new()
+        let _: serde_json::Value = cli_http()
             .get(format!("{base}/api/ps"))
             .send()
             .await?
@@ -2561,7 +2606,7 @@ async fn ps(reset: bool) -> Result<()> {
         return Ok(());
     }
     let base = ensure_daemon().await?;
-    let v: serde_json::Value = reqwest::Client::new()
+    let v: serde_json::Value = cli_http()
         .get(format!("{base}/api/ps"))
         .send()
         .await?
@@ -2666,7 +2711,7 @@ async fn why(trace: Option<&str>) -> Result<()> {
         Some(t) => format!("{base}/api/why?trace={t}"),
         None => format!("{base}/api/why"),
     };
-    let resp = reqwest::Client::new()
+    let resp = cli_http()
         .get(&url)
         .timeout(Duration::from_secs(10))
         .send()
@@ -2753,8 +2798,9 @@ async fn watch() -> Result<()> {
     }
     println!("watching sentinel — Ctrl-C to stop");
     let mut buf = String::new();
+    let mut chunk_lines = pallama_gateway::translate::LineBuffer::new();
     while let Some(chunk) = futures_lite_next(&mut resp).await? {
-        buf.push_str(&String::from_utf8_lossy(&chunk));
+        buf.push_str(&chunk_lines.feed(&chunk));
         while let Some(pos) = buf.find("\n\n") {
             let frame: String = buf.drain(..pos + 2).collect();
             for line in frame.lines() {
@@ -2892,7 +2938,7 @@ Alternatives: model_overrides in ~/.config/pallama/config.toml, or per-request o
         o.loras = Some(spec.loras.clone());
     }
     cfg.model_overrides.insert(model.to_string(), o);
-    std::fs::write(&cfg_path, cfg.to_toml().map_err(|e| anyhow!("{e}"))?)?;
+    pallama_core::persist_config(&cfg_path, &cfg.to_toml().map_err(|e| anyhow!("{e}"))?)?;
     println!(
         "created {model} from {} (hardlink + overlay: ctx={:?}, loras={})",
         spec.base,
@@ -2939,11 +2985,18 @@ enum KeysAction {
 /// (admin) [[keys]] entry from config.toml.
 fn admin_bearer() -> Option<String> {
     if let Ok(v) = std::env::var("PALLAMA_KEYS") {
-        return v
-            .split(',')
-            .map(str::trim)
-            .find(|s| !s.is_empty())
-            .map(|f| f.split_once(':').unwrap_or((f, f)).1.to_string());
+        // F133: a colon-less entry has no secret half — using the entry
+        // itself as the bearer would send the NAME as an auth token.
+        // Skip with a loud teaching line, keep scanning valid entries.
+        for entry in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            match entry.split_once(':') {
+                Some((_name, secret)) => return Some(secret.to_string()),
+                None => eprintln!(
+                    "pallama: ignoring malformed PALLAMA_KEYS entry '{entry}' \
+                     (expected name:key); falling back to config keys"
+                ),
+            }
+        }
     }
     config().ok().and_then(|c| {
         c.keys
@@ -2956,7 +3009,7 @@ fn admin_bearer() -> Option<String> {
 #[allow(clippy::too_many_lines)]
 async fn keys_cmd(action: Option<KeysAction>) -> Result<()> {
     let base = ensure_daemon().await?;
-    let client = reqwest::Client::new();
+    let client = cli_http();
     // `/api/keys` demands an unscoped (admin) bearer once keys exist.
     // PALLAMA_KEYS entries are admin by construction; otherwise the
     // first unscoped [[keys]] entry from config.toml.
@@ -3263,7 +3316,7 @@ async fn launch_cmd(command: Vec<String>, warm: Option<String>, key: Option<Stri
     let base = ensure_daemon().await?;
     if let Some(model) = &warm {
         println!("pre-warming {model} ...");
-        let resp = reqwest::Client::new()
+        let resp = cli_http()
             .post(format!("{base}/v1/chat/completions"))
             .json(&serde_json::json!({
                 "model": model, "max_tokens": 1,
@@ -3385,7 +3438,7 @@ fn migrate_cmd() -> Result<()> {
     std::fs::copy(&path, &backup)
         .with_context(|| format!("backup {} -> {}", path.display(), backup.display()))?;
     let keys = cfg.keys.len();
-    std::fs::write(&path, cfg.to_toml()?)?;
+    pallama_core::persist_config(&path, &cfg.to_toml()?)?;
     println!(
         "migrated: {} api_keys entr{} -> [[keys]] (admin power kept); backup at {}",
         keys,
@@ -3398,6 +3451,9 @@ fn migrate_cmd() -> Result<()> {
 /// `pallama snapshot` — backup the small state (config, store,
 /// sessions list) to `<data>/snapshots/<ts>/`. Models/engines stay in
 /// place (they ARE the bulk; re-pull or re-copy them deliberately).
+/// Snapshots kept on disk; older ones are pruned on each `pallama snapshot`.
+const SNAPSHOTS_KEEP: usize = 10;
+
 fn snapshot_cmd() -> Result<()> {
     let d = dirs();
     let ts = std::time::SystemTime::now()
@@ -3407,23 +3463,44 @@ fn snapshot_cmd() -> Result<()> {
     let dir = d.data_dir.join("snapshots").join(ts.to_string());
     std::fs::create_dir_all(&dir)?;
     let mut copied = vec![];
-    for (src, name) in [
-        (d.config_file(), "config.toml"),
-        (d.db_file(), "pallama.db"),
-    ] {
-        if src.exists() {
-            let dst = dir.join(name);
-            std::fs::copy(&src, &dst)
-                .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
-            copied.push(name.to_string());
-        }
+    if d.config_file().exists() {
+        let dst = dir.join("config.toml");
+        std::fs::copy(d.config_file(), &dst)
+            .with_context(|| format!("copy config -> {}", dst.display()))?;
+        copied.push("config.toml".to_string());
     }
+    if d.db_file().exists() {
+        // F130: VACUUM INTO, never a raw copy of the live WAL database.
+        let store = Store::open(&d)?;
+        store
+            .snapshot_db_to(&dir.join("pallama.db"))
+            .with_context(|| "snapshot pallama.db (VACUUM INTO)".to_string())?;
+        copied.push("pallama.db".to_string());
+    }
+    prune_snapshots(&d, SNAPSHOTS_KEEP);
     println!(
         "snapshot at {} ({}); models/engines not copied (bulk)",
         dir.display(),
         copied.join(", ")
     );
     Ok(())
+}
+
+/// Remove oldest timestamped snapshot dirs beyond `keep`. Only touches
+/// entries whose name parses as a unix-seconds stamp — never stray files.
+fn prune_snapshots(d: &PallamaDirs, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(d.data_dir.join("snapshots")) else {
+        return;
+    };
+    let mut stamps: Vec<u64> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse::<u64>().ok()))
+        .collect();
+    stamps.sort_unstable();
+    while stamps.len() > keep {
+        let oldest = stamps.remove(0);
+        let _ = std::fs::remove_dir_all(d.data_dir.join("snapshots").join(oldest.to_string()));
+    }
 }
 
 /// `pallama coreside` — which local models can stay loaded together.
@@ -3435,16 +3512,14 @@ fn coreside_cmd() -> Result<()> {
     if models.is_empty() {
         return Err(anyhow!("no models pulled (pallama pull <model>)"));
     }
-    let vram = {
-        store
-            .active_engine()
-            .ok()
-            .flatten()
-            .and_then(|e| serde_json::from_str::<pallama_runtime::Manifest>(&e.manifest).ok())
-            .map_or(0, |m| {
-                pallama_runtime::probe_hardware(Some(&m)).total_vram_mib()
-            })
-    };
+    let manifest = store
+        .active_engine()
+        .ok()
+        .flatten()
+        .and_then(|e| serde_json::from_str::<pallama_runtime::Manifest>(&e.manifest).ok());
+    let vram = manifest.as_ref().map_or(0, |m| {
+        pallama_runtime::probe_hardware(Some(m)).total_vram_mib()
+    });
     if vram == 0 {
         return Err(anyhow!(
             "no GPU detected — coreside planning is a VRAM question; CPU boxes load one model at a time anyway"
@@ -3453,9 +3528,21 @@ fn coreside_cmd() -> Result<()> {
     let mut fps = Vec::new();
     for m in &models {
         let ctx = cfg.effective_ctx(&m.name);
-        let kv = pallama_core::read_metadata_file(std::path::Path::new(&m.path))
-            .map_or(0, |meta| {
-                pallama_core::coreside::kv_f16_mib(&meta, u64::from(ctx))
+        // Same unified decision as the spawn profile: --kv-unified hosts
+        // the KV buffer in --cache-ram (system RAM), so the VRAM plan
+        // charges the measured working-set floor, not f16-at-ctx — f16
+        // here made unified models read as 2-4x their real VRAM demand
+        // and get deferred on phantom pressure.
+        let unified = manifest
+            .as_ref()
+            .is_some_and(|mf| pallama_core::profile::kv_unified_for(&cfg, &m.name, &mf.flags));
+        let kv =
+            pallama_core::read_metadata_file(std::path::Path::new(&m.path)).map_or(0, |meta| {
+                if unified {
+                    pallama_core::profile::KV_UNIFIED_VRAM_FLOOR_BYTES / (1024 * 1024)
+                } else {
+                    pallama_core::coreside::kv_f16_mib(&meta, u64::from(ctx))
+                }
             });
         fps.push(pallama_core::coreside::Footprint {
             name: m.name.clone(),
@@ -3466,7 +3553,7 @@ fn coreside_cmd() -> Result<()> {
         });
     }
     let (resident, deferred) = pallama_core::coreside::plan(&fps, vram);
-    println!("VRAM {vram} MiB — co-residency plan (weights + f16 KV @ ctx, 512 MiB headroom):");
+    println!("VRAM {vram} MiB — co-residency plan (weights + KV @ ctx, 512 MiB headroom; unified = RAM-hosted KV, VRAM floor 512M):");
     println!(
         "{:<24} {:>8} {:>9} {:>7}",
         "MODEL", "WEIGHTS", "KV@CTX", "CTX"
@@ -3607,7 +3694,7 @@ async fn whisper_cmd(
     let form = reqwest::multipart::Form::new()
         .text("model", model)
         .part("file", part);
-    let mut req = reqwest::Client::new()
+    let mut req = cli_http()
         .post(format!("{base}/v1/audio/transcriptions"))
         .multipart(form);
     if let Some(b) = &bearer {
@@ -3637,7 +3724,7 @@ async fn stop_cmd(model: Option<String>) -> Result<()> {
         return stop();
     };
     let base = ensure_daemon().await?;
-    let resp = reqwest::Client::new()
+    let resp = cli_http()
         .post(format!("{base}/api/evict"))
         .json(&serde_json::json!({"model": model}))
         .send()
@@ -3698,7 +3785,7 @@ async fn run_repl(model: &str) -> Result<()> {
 }
 
 async fn sysinfo_cmd(base: &str) -> Result<()> {
-    let v: serde_json::Value = reqwest::Client::new()
+    let v: serde_json::Value = cli_http()
         .get(format!("{base}/api/version"))
         .send()
         .await?
@@ -3713,6 +3800,8 @@ async fn sysinfo_cmd(base: &str) -> Result<()> {
 /// (usage-carrying) chunk for --verbose stats.
 #[allow(clippy::duration_suboptimal_units)] // 10-minute generation ceiling
 async fn stream_chat(base: &str, body: &serde_json::Value) -> Result<Option<serde_json::Value>> {
+    // Streaming lane: no total-request ceiling; the 600s per-request
+    // timeout below is the bound (F126 exemption).
     let resp = reqwest::Client::new()
         .post(format!("{base}/api/chat"))
         .json(body)
@@ -3725,11 +3814,12 @@ async fn stream_chat(base: &str, body: &serde_json::Value) -> Result<Option<serd
     }
     let mut resp = resp;
     let mut buf = String::new();
+    let mut chunk_lines = pallama_gateway::translate::LineBuffer::new();
     let mut final_chunk: Option<serde_json::Value> = None;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     while let Some(chunk) = futures_lite_next(&mut resp).await? {
-        buf.push_str(&String::from_utf8_lossy(&chunk));
+        buf.push_str(&chunk_lines.feed(&chunk));
         while let Some(pos) = buf.find('\n') {
             let line: String = buf.drain(..=pos).collect();
             let line = line.trim();
@@ -3838,6 +3928,7 @@ fn tune_full(
         None,
         &engine_row.tag,
         &manifest.flags,
+        &manifest.spec_types,
         pallama_core::Endpoint::Tcp {
             host: "127.0.0.1".into(),
             port: 0,
@@ -3937,7 +4028,7 @@ fn tune_full(
             // Adopt: meaningful winner (>5% over the runner-up).
             let mut cfg2 = config()?;
             cfg2.slots = best_np;
-            std::fs::write(d.config_file(), cfg2.to_toml()?)?;
+            pallama_core::persist_config(&d.config_file(), &cfg2.to_toml()?)?;
             println!(
                 "adopted slots = {best_np} ({best_tps:.1} tok/s, +{:.0}% over runner-up) — restart the daemon to apply",
                 (best_tps / second - 1.0) * 100.0
@@ -3974,6 +4065,7 @@ fn tune_full(
             None,
             &engine_row.tag,
             &manifest.flags,
+            &manifest.spec_types,
             pallama_core::Endpoint::Tcp {
                 host: "127.0.0.1".into(),
                 port: 0,
@@ -4003,7 +4095,7 @@ fn tune_full(
             let mut cfg2 = config()?;
             cfg2.ngram_size_m = bm;
             cfg2.ngram_min_hits = bh;
-            std::fs::write(d.config_file(), cfg2.to_toml()?)?;
+            pallama_core::persist_config(&d.config_file(), &cfg2.to_toml()?)?;
             println!(
                 "adopted ngram_size_m = {bm}, ngram_min_hits = {bh} — restart the daemon to apply"
             );
@@ -4028,6 +4120,7 @@ fn tune_full(
             None,
             &engine_row.tag,
             &manifest.flags,
+            &manifest.spec_types,
             pallama_core::Endpoint::Tcp {
                 host: "127.0.0.1".into(),
                 port: 0,
@@ -4102,7 +4195,7 @@ fn tune_full(
                 // the same config-rewrite path as the ngram lane.
                 let mut cfg2 = config()?;
                 cfg2.cache_reuse = probe.best;
-                std::fs::write(d.config_file(), cfg2.to_toml()?)?;
+                pallama_core::persist_config(&d.config_file(), &cfg2.to_toml()?)?;
                 println!(
                     "adopted cache_reuse = {} — restart the daemon to apply",
                     probe.best
@@ -4113,6 +4206,14 @@ fn tune_full(
         }
     }
     Ok(())
+}
+
+/// Key part of a `key = value` TOML line (trimmed), None when no `=`.
+/// Tolerant of `key="v"`, `key = "v"` and leading indentation.
+fn key_before_eq(line: &str) -> Option<&str> {
+    let (k, _) = line.split_once('=')?;
+    let k = k.trim();
+    (!k.is_empty()).then_some(k)
 }
 
 /// Persist a per-model overlay key (validated immediately).
@@ -4130,15 +4231,14 @@ fn set_model_override(model: &str, key: &str, value: &str) -> Result<()> {
         } else if line.starts_with('[') && in_section {
             in_section = false; // next section started
         }
-        if in_section && line.starts_with(&format!("{key} =")) {
+        // F128: match `key = v`, `key="v"` and indented forms alike —
+        // anything whose text before the first `=` trims to the key.
+        if in_section && key_before_eq(line).is_some_and(|k| k == key) {
             out.push(format!("{key} = {value}"));
             replaced = true;
             continue;
         }
         out.push(line.to_string());
-        if line.trim() == header && !replaced && key == "spec" {
-            // insert right below header
-        }
     }
     // Append key inside the section if never replaced
     if !replaced {
@@ -4160,7 +4260,7 @@ fn set_model_override(model: &str, key: &str, value: &str) -> Result<()> {
     }
     let candidate = out.join("\n") + "\n";
     Config::from_toml(&candidate).map_err(|e| anyhow!("rejected, file unchanged: {e}"))?;
-    std::fs::write(&path, &candidate)?;
+    pallama_core::persist_config(&path, &candidate)?;
     Ok(())
 }
 
@@ -4172,12 +4272,10 @@ fn gate_baseline(store: &Store) -> Result<Option<(String, f64, String)>> {
 }
 
 /// Single-shot tg128 on a specific engine's llama-bench.
-fn quick_tg(d: &PallamaDirs, row: &pallama_core::EngineRow, model_path: &str) -> Result<f64> {
-    let bench_bin = d
-        .engines_dir()
-        .join(&row.tag)
-        .join(format!("llama-{}", row.tag))
-        .join("llama-bench");
+fn quick_tg(d: &PallamaDirs, _row: &pallama_core::EngineRow, model_path: &str) -> Result<f64> {
+    // F129: go through the shared exe-aware discovery instead of
+    // hand-building a unix-only path.
+    let bench_bin = pallama_runtime::bench::find_bench_bin(d)?;
     let tuner = pallama_runtime::bench::Tuner { dirs: d, bench_bin };
     let rows = tuner.bench_default(std::path::Path::new(model_path))?;
     let tg = rows
@@ -4810,7 +4908,10 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
         ConfigCmd::Get { key } => {
             let cfg = config()?;
             let raw = cfg.to_toml().map_err(|e| anyhow!("{e}"))?;
-            if let Some(line) = raw.lines().find(|l| l.starts_with(&format!("{key} ="))) {
+            if let Some(line) = raw
+                .lines()
+                .find(|l| key_before_eq(l).is_some_and(|k| k == key))
+            {
                 println!("{line}");
                 Ok(())
             } else {
@@ -4843,7 +4944,8 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
             let mut out: Vec<String> = Vec::new();
             let mut replaced = false;
             for line in raw.lines() {
-                if line.starts_with(&format!("{key} =")) {
+                // F128: tolerant key match (compact `key="v"`, indented).
+                if key_before_eq(line).is_some_and(|k| k == key) {
                     out.push(format!("{key} = {stored}"));
                     replaced = true;
                 } else {
@@ -4864,7 +4966,7 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
             // Validate BEFORE persisting: a bad value/unknown key must
             // never leave the file broken.
             Config::from_toml(&candidate).map_err(|e| anyhow!("rejected, file unchanged: {e}"))?;
-            std::fs::write(&path, &candidate)?;
+            pallama_core::persist_config(&path, &candidate)?;
             println!("{key} = {stored}");
             Ok(())
         }

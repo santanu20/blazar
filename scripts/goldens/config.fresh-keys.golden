@@ -22,12 +22,12 @@ cpu_strict
 ctx_checkpoints
 ctx_extend
 default_ctx
+deterministic
 devices
 embd_normalize
 engine_asset
 engine_check_secs
 engine_env
-engine_pin
 host
 idle_sleep_secs
 idle_timeout_secs
@@ -37,6 +37,7 @@ keep_tokens
 keys
 kv_unified_per_slot
 late_chunking_max_tokens
+lazy_mode
 load_mode
 main_gpu
 max_loaded_models
