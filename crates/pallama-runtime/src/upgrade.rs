@@ -147,7 +147,11 @@ pub fn extract_binary(asset_name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
 /// running exe — the new binary is parked next to it with instructions.
 pub fn replace_current_exe(binary: &[u8]) -> Result<std::path::PathBuf> {
     let exe = std::env::current_exe().context("resolve current exe path")?;
-    let staged = exe.with_extension("upgrade-new");
+    // Append instead of with_extension: a versioned binary name
+    // (pallama-v2.1) would have its ".1" swapped for the suffix (F106).
+    let mut staged_name = std::ffi::OsString::from(exe.as_os_str());
+    staged_name.push(".upgrade-new");
+    let staged = std::path::PathBuf::from(staged_name);
     std::fs::write(&staged, binary).with_context(|| format!("write {}", staged.display()))?;
 
     #[cfg(unix)]

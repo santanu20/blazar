@@ -149,6 +149,16 @@ impl Store {
         Ok(store)
     }
 
+    /// Consistent snapshot of the live database via `SQLite` `VACUUM INTO`.
+    /// A raw file copy of a live WAL database can be torn mid-transaction
+    /// (F130); `VACUUM INTO` is transactionally consistent by construction.
+    /// Fails if the destination file already exists (`SQLite` contract).
+    pub fn snapshot_db_to(&self, dst: &std::path::Path) -> CoreResult<()> {
+        let dst = dst.to_string_lossy().into_owned();
+        self.conn.execute("VACUUM INTO ?1", [dst])?;
+        Ok(())
+    }
+
     fn migrate(&self) -> CoreResult<()> {
         let version: i32 = self
             .conn
@@ -209,8 +219,10 @@ impl Store {
     /// Flip the active engine. Fails (changing nothing) when `tag` is not
     /// installed — never silently leaves the store with zero active engines.
     pub fn set_active_engine(&self, tag: &str) -> CoreResult<()> {
-        let exists: bool = self
-            .conn
+        // F120: both UPDATEs inside one transaction — a crash between
+        // them used to leave the store with ZERO active engines.
+        let tx = self.conn.unchecked_transaction()?;
+        let exists: bool = tx
             .query_row(
                 "SELECT COUNT(*) FROM engines WHERE tag = ?1",
                 params![tag],
@@ -220,9 +232,9 @@ impl Store {
         if !exists {
             return Err(CoreError::Store(rusqlite::Error::QueryReturnedNoRows));
         }
-        self.conn.execute("UPDATE engines SET active = 0", [])?;
-        self.conn
-            .execute("UPDATE engines SET active = 1 WHERE tag = ?1", params![tag])?;
+        tx.execute("UPDATE engines SET active = 0", [])?;
+        tx.execute("UPDATE engines SET active = 1 WHERE tag = ?1", params![tag])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -394,25 +406,6 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
-    }
-
-    /// Add to a key's daily counters (upsert). Bumped by the gateway's
-    /// write-behind flusher, never on the hot path.
-    pub fn bump_key_usage(
-        &self,
-        day: &str,
-        name: &str,
-        delta_requests: i64,
-        delta_tokens: i64,
-    ) -> CoreResult<()> {
-        self.conn.execute(
-            "INSERT INTO key_usage (day, name, requests, tokens) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(day, name) DO UPDATE SET
-               requests = requests + excluded.requests,
-               tokens   = tokens   + excluded.tokens",
-            rusqlite::params![day, name, delta_requests, delta_tokens],
-        )?;
-        Ok(())
     }
 
     /// Today's (or any day's) per-key counters, for `/api/keys` + budgets.

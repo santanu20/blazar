@@ -94,10 +94,8 @@ pub fn probe(server_path: &Path, tag: &str) -> Result<Manifest> {
         .to_str()
         .ok_or_else(|| anyhow!("non-UTF-8 engine path {}", server_path.display()))?;
 
-    let out = Command::new(server)
-        .arg("--version")
-        .output()
-        .with_context(|| format!("run {server} --version"))?;
+    let out = crate::probe::probe_output(Command::new(server).arg("--version"), 30)
+        .with_context(|| format!("run {server} --version (timed out or failed to spawn)"))?;
     if !out.status.success() {
         return Err(anyhow!(
             "{server} --version exited {}: {}",
@@ -121,10 +119,8 @@ pub fn probe(server_path: &Path, tag: &str) -> Result<Manifest> {
 
     let devices = run_list_devices(server_path);
 
-    let out = Command::new(server)
-        .arg("--help")
-        .output()
-        .with_context(|| format!("run {server} --help"))?;
+    let out = crate::probe::probe_output(Command::new(server).arg("--help"), 30)
+        .with_context(|| format!("run {server} --help (timed out or failed to spawn)"))?;
     let help = String::from_utf8_lossy(&out.stdout).to_string();
     let (flags, spec_types) = parse_help(&help);
 
@@ -165,8 +161,9 @@ fn probe_mistralrs(server_path: &Path, tag: &str) -> Result<Manifest> {
         .ok_or_else(|| anyhow!("non-UTF-8 engine path {}", server_path.display()))?;
 
     // Best-effort banner; never fatal — the tag is authoritative.
-    let version_raw = match Command::new(server).arg("--version").output() {
-        Ok(out) => {
+    // F85: a hung `--version` counts as "no banner", not a wedge.
+    let version_raw = match crate::probe::probe_output(Command::new(server).arg("--version"), 30) {
+        Some(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
             let stdout = String::from_utf8_lossy(&out.stdout);
             let text = if stdout.contains("mistralrs") || stdout.contains("version") {
@@ -180,7 +177,7 @@ fn probe_mistralrs(server_path: &Path, tag: &str) -> Result<Manifest> {
                 .unwrap_or("mistralrs")
                 .to_string()
         }
-        Err(_) => format!("mistralrs {tag}"),
+        None => format!("mistralrs {tag}"),
     };
     // Display-only serial from the v-tag (v0.9.3 -> 0000009003): keeps
     // `engine list` sortable without implying llama.cpp build numbers.
@@ -256,7 +253,11 @@ fn parse_version(text: &str) -> Result<(u64, String)> {
 /// init), so callers throttle to spawn-time and ≥60s periodic.
 #[must_use]
 pub fn run_list_devices(server: &Path) -> Vec<DeviceDesc> {
-    let Ok(out) = Command::new(server).arg("--list-devices").output() else {
+    // F85: the doc's "a hung census returns an empty list" is now
+    // literally true — a deadline-bounded probe replaces the blocking
+    // `.output()` that would wedge forever.
+    let Some(out) = crate::probe::probe_output(Command::new(server).arg("--list-devices"), 30)
+    else {
         return Vec::new();
     };
     // Upstream exits 0 here even when listing; tolerate non-zero but parse stdout.

@@ -104,7 +104,29 @@ pub fn remove_model(dirs: &PallamaDirs, name: &str) -> Result<()> {
 /// Alias a model under a new name (`pallama cp`): zero-byte hardlink of the
 /// GGUF (both files live in the same models dir, so linking always works)
 /// plus a new store row. No blob ceremony, no byte copies.
+/// User-supplied model names become filename components (alias files,
+/// pidfiles, import destinations). Refuse anything that could escape the
+/// models dir or corrupt those paths (F98).
+pub fn ensure_portable_name(name: &str) -> Result<()> {
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(anyhow!("model name must not be empty, '.', or '..'"));
+    }
+    if name.len() > 128 {
+        return Err(anyhow!("model name longer than 128 chars: {}", &name[..64]));
+    }
+    if name
+        .chars()
+        .any(|c| c == '/' || c == '\\' || c.is_control())
+    {
+        return Err(anyhow!(
+            "model name must not contain '/', '\\\\', or control characters: {name}"
+        ));
+    }
+    Ok(())
+}
+
 pub fn copy_model(dirs: &PallamaDirs, src: &str, dst: &str) -> Result<()> {
+    ensure_portable_name(dst)?;
     if instance_running(dirs, src) {
         return Err(anyhow!(
             "model {src} is currently running; copy after it unloads"

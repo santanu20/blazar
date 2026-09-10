@@ -28,13 +28,13 @@ sha2 = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
-bytes = { workspace = true }
-http-body-util = { workspace = true }
 tokio-stream = { workspace = true }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 sysinfo.workspace = true
 libc = { workspace = true }
 getrandom = { workspace = true }
+# Production dep: engine build lane stages its build tree in a scoped
+# tempdir (engine/build.rs) — not test-only.
 tempfile = "3"
 
 [dev-dependencies]

@@ -1,0 +1,100 @@
+//! Throwaway probe: compile the real qwen3.5-9b profile with the live
+//! vulkan census + real mmproj and print slots + warnings.
+//! Run: `cargo run --example slots_probe -p pallama-core`
+use pallama_core::{
+    gguf::read_metadata_file,
+    profile::{compile, ProfileInput, TuningOverrides},
+    Config, Endpoint, GpuInfo, Hardware, ModelOverride,
+};
+use std::collections::BTreeSet;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let model = "~/.local/share/pallama/models/Qwen3.5-9B-Q4_K_M.gguf";
+    let mmproj = "~/.local/share/pallama/models/mmproj-F16.gguf";
+    let gguf = read_metadata_file(std::path::Path::new(model))?;
+    println!("train ctx = {:?}", gguf.context_length);
+    let hw = Hardware {
+        physical_cores: 16,
+        total_ram_mib: 13_675,
+        gpus: vec![
+            GpuInfo {
+                name: "Vulkan0".into(),
+                description: "Intel(R) Graphics (RPL-S)".into(),
+                total_mib: 10_256,
+                free_mib: 8_494,
+            },
+            GpuInfo {
+                name: "Vulkan1".into(),
+                description: "NVIDIA GeForce RTX 4070 Laptop GPU".into(),
+                total_mib: 8_188,
+                free_mib: 7_790,
+            },
+        ],
+    };
+    let flags: BTreeSet<String> = [
+        "--ctx-size",
+        "--threads",
+        "--gpu-layers",
+        "--flash-attn",
+        "--cache-type-k",
+        "--cache-type-v",
+        "--cache-reuse",
+        "--kv-unified",
+        "-mm",
+        "-np",
+        "--cache-ram",
+        "--slot-save-path",
+        "--api-key-file",
+        "--metrics",
+        "--jinja",
+        "--sleep-idle-seconds",
+        "--device",
+        "--alias",
+        "--host",
+        "--port",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    let overlay = ModelOverride::default();
+    let input = ProfileInput {
+        engine_kind: pallama_core::engine_kind::EngineKind::LlamaCpp,
+        model_name: "qwen3.5-9b",
+        instance_key: "qwen3.5-9b",
+        model_path: model,
+        model_bytes: std::fs::metadata(model)?.len(),
+        gguf: &gguf,
+        hardware: &hw,
+        config: &Config::default(),
+        overlay: &overlay,
+        loras: &[],
+        draft_path: None,
+        mmproj_path: Some(mmproj),
+        engine_tag: "b10809",
+        supported_flags: &flags,
+        spec_types: &[],
+        endpoint: Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port: 1,
+        },
+        data_dir: "/tmp/pallama-slots-probe",
+        cache_hit_rate: None,
+        device_hint: None,
+        engine_census: hw.gpus.clone(),
+        sibling_devices: Vec::new(),
+        auto_tensor_split: None,
+    };
+    let p = compile(&input, &TuningOverrides::default())?;
+    println!(
+        "argv np/ctx: {:?}",
+        p.argv
+            .windows(2)
+            .filter(|w| w[0] == "-np" || w[0] == "--ctx-size")
+            .collect::<Vec<_>>()
+    );
+    println!("warnings:");
+    for w in &p.warnings {
+        println!("  - {w}");
+    }
+    Ok(())
+}

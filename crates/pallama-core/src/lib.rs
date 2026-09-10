@@ -15,8 +15,8 @@ pub mod session_identity;
 pub mod store;
 pub mod telemetry;
 
-pub use catalog::{catalog, resolve, spec_pair_for};
-pub use config::{ApiKey, Config, ModelOverride, Remote, SemanticCacheConfig};
+pub use catalog::{catalog, resolve, spec_pair_for, spec_pair_for_typed};
+pub use config::{persist_config, ApiKey, Config, ModelOverride, Remote, SemanticCacheConfig};
 pub use dirs::PallamaDirs;
 pub use error::{CoreError, CoreResult};
 pub use gguf::{read_metadata_file, GgufMeta, GgufValue};

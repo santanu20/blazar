@@ -47,6 +47,7 @@ fn profile(ctx: u32, argv: &[&str]) -> Profile {
         ctx,
         gpu: "auto",
         kv_est_bytes: None,
+        ctx_autofit: None,
     }
 }
 

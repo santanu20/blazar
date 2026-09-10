@@ -45,9 +45,24 @@ pub struct Hardware {
 }
 
 impl Hardware {
+    /// Sum of VRAM across the GPUs that count for capacity math.
+    /// Integrated GPUs report shared system RAM as "VRAM" — summing them
+    /// alongside discrete cards invents capacity (a vulkan census of
+    /// [iGPU 10 GiB shared, 8 GiB discrete] must not read as 18 GiB, or
+    /// offload pins over-commit the real card). When any discrete card
+    /// exists, only discrete cards count; an integrated-only box keeps
+    /// the integrated sum — it still serves.
     #[must_use]
     pub fn total_vram_mib(&self) -> u64 {
-        self.gpus.iter().map(|g| g.total_mib).sum()
+        if self.gpus.iter().any(|g| !g.is_integrated()) {
+            self.gpus
+                .iter()
+                .filter(|g| !g.is_integrated())
+                .map(|g| g.total_mib)
+                .sum()
+        } else {
+            self.gpus.iter().map(|g| g.total_mib).sum()
+        }
     }
 
     #[must_use]
@@ -95,6 +110,46 @@ mod tests {
         assert!(hw.has_gpu());
         assert_eq!(Hardware::bytes(2) / (1024 * 1024), 2);
         assert_eq!(Hardware::mib(Hardware::bytes(5)), 5);
+    }
+
+    #[test]
+    fn unit__hardware__integrated_shared_ram_never_widens_vram() {
+        // Live shape of this box's vulkan census: iGPU reports 10 GiB of
+        // shared system RAM; the discrete 8 GiB card is the real capacity.
+        let hw = Hardware {
+            physical_cores: 8,
+            total_ram_mib: 13_000,
+            gpus: vec![
+                GpuInfo {
+                    name: "Intel".into(),
+                    description: "Intel(R) Graphics (RPL-S)".into(),
+                    total_mib: 10_256,
+                    free_mib: 10_256,
+                },
+                GpuInfo {
+                    name: "NVIDIA".into(),
+                    description: "NVIDIA GeForce RTX 4070 Laptop GPU".into(),
+                    total_mib: 8_188,
+                    free_mib: 8_188,
+                },
+            ],
+        };
+        assert_eq!(hw.total_vram_mib(), 8_188, "discrete-only capacity");
+    }
+
+    #[test]
+    fn unit__hardware__integrated_only_box_keeps_integrated_vram() {
+        let hw = Hardware {
+            physical_cores: 8,
+            total_ram_mib: 16_000,
+            gpus: vec![GpuInfo {
+                name: "i".into(),
+                description: "Intel(R) Iris(R) Xe Graphics".into(),
+                total_mib: 8_192,
+                free_mib: 8_192,
+            }],
+        };
+        assert_eq!(hw.total_vram_mib(), 8_192, "integrated-only still serves");
     }
 
     #[test]

@@ -12,6 +12,7 @@
     { "short_name": "phi-4", "repo": "unsloth/phi-4-GGUF" }
   ],
   "spec_pairs": [
-    { "model_prefix": "qwen3-", "spec_type": "draft-simple", "draft_repo": "ggml-org/Qwen3-0.6B-GGUF:Q4_0" }
+    { "model_prefix": "qwen3-", "spec_type": "draft-simple", "draft_repo": "ggml-org/Qwen3-0.6B-GGUF:Q4_0" },
+    { "model_prefix": "qwen3-8b", "spec_type": "draft-eagle3", "draft_repo": "williamliao/Qwen3-8B-EAGLE3-Speculator-GGUF:F16" }
   ]
 }

@@ -36,6 +36,15 @@ pub enum PallamaEvent {
         from: u32,
         to: u32,
     },
+    /// Slot auto-fit at spawn: the default ctx was re-spent as N shallower
+    /// parallel slots (identical total-ctx capacity budget) because the
+    /// full-depth ctx only fit one concurrent slot on this card.
+    SlotsCtxAutoFit {
+        model: String,
+        per_slot_ctx: u32,
+        slots: u32,
+        total_ctx: u32,
+    },
     ModelPulled {
         name: String,
         /// Post-download GGUF health check: set when the header did not

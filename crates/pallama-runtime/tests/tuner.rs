@@ -58,6 +58,7 @@ static META: std::sync::LazyLock<GgufMeta> = std::sync::LazyLock::new(|| GgufMet
     general_version: None,
     pooling_type: None,
     chat_template: Some("{%- if tools %}{{ tool_calls }}{%- endif %}".into()),
+    mtp_layers: None,
 });
 
 fn test_input<'a>(
@@ -84,6 +85,7 @@ fn test_input<'a>(
         draft_path: None,
         engine_tag: "b-stub",
         supported_flags: flags,
+        spec_types: &[],
         endpoint: Endpoint::Tcp {
             host: "127.0.0.1".into(),
             port: 1,
@@ -91,6 +93,7 @@ fn test_input<'a>(
         data_dir: "/tmp/pallama-test-data",
         cache_hit_rate: None,
         device_hint: None,
+        engine_census: hw.gpus.clone(),
     }
 }
 

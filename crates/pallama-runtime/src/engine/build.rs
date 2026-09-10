@@ -370,10 +370,6 @@ async fn run_step(
                 st = child.wait() => break st,
             }
         };
-        // Drain whatever the reader tasks still had in flight.
-        while let Ok(l) = rx.try_recv() {
-            on_line(&l);
-        }
         status
     })
     .await;
@@ -389,7 +385,16 @@ async fn run_step(
             ));
         }
     };
+    // The relay task owns the stdout pipe: only once it joins is the
+    // channel guaranteed complete. child.wait() alone races lines still
+    // buffered in the pipe — a fast child (stub builds, `cmake --build`
+    // with a script backend) can exit before its final echo is read, and
+    // an eager drain then loses it forever. Forward the remainder only
+    // after the join, until the channel closes (sender dropped).
     let _ = relay.await;
+    while let Some(l) = rx.recv().await {
+        on_line(&l);
+    }
     let tail: std::collections::VecDeque<String> = captured.await.unwrap_or_default();
     if !status.success() {
         let last: Vec<String> = tail
@@ -522,26 +527,33 @@ pub async fn nvidia_gpu_facts() -> (Option<(u32, u32)>, Option<(u32, u32)>) {
     let Some(smi) = detect_toolchain(&path_dirs()).nvidia_smi else {
         return (None, None);
     };
-    let driver_cuda = tokio::process::Command::new(&smi)
-        .output()
-        .await
-        .ok()
-        .and_then(|out| {
-            let text = String::from_utf8_lossy(&out.stdout);
-            let line = text.lines().find(|l| l.contains("CUDA Version:"))?;
-            parse_version_pair(line.split("CUDA Version:").nth(1)?)
-        });
-    let compute_cap = tokio::process::Command::new(&smi)
-        .arg("--query-gpu=compute_cap")
-        .arg("--format=csv,noheader")
-        .output()
-        .await
-        .ok()
-        .and_then(|out| {
-            let csv = String::from_utf8_lossy(&out.stdout);
-            let first = csv.lines().map(str::trim).find(|l| !l.is_empty())?;
-            parse_version_pair(first)
-        });
+    let driver_cuda = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new(&smi).output(),
+    )
+    .await
+    .ok()
+    .and_then(std::result::Result::ok)
+    .and_then(|out| {
+        let text = String::from_utf8_lossy(&out.stdout);
+        let line = text.lines().find(|l| l.contains("CUDA Version:"))?;
+        parse_version_pair(line.split("CUDA Version:").nth(1)?)
+    });
+    let compute_cap = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new(&smi)
+            .arg("--query-gpu=compute_cap")
+            .arg("--format=csv,noheader")
+            .output(),
+    )
+    .await
+    .ok()
+    .and_then(std::result::Result::ok)
+    .and_then(|out| {
+        let csv = String::from_utf8_lossy(&out.stdout);
+        let first = csv.lines().map(str::trim).find(|l| !l.is_empty())?;
+        parse_version_pair(first)
+    });
     (driver_cuda, compute_cap)
 }
 
@@ -553,12 +565,20 @@ async fn query_compute_caps(tc: &Toolchain) -> Result<String> {
          install the NVIDIA driver tools"
         )
     })?;
-    let out = tokio::process::Command::new(smi)
-        .arg("--query-gpu=compute_cap")
-        .arg("--format=csv,noheader")
-        .output()
-        .await
-        .with_context(|| format!("run {} compute_cap query", smi.display()))?;
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new(smi)
+            .arg("--query-gpu=compute_cap")
+            .arg("--format=csv,noheader")
+            .output(),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "run {} compute_cap query (timed out or failed)",
+            smi.display()
+        )
+    })??;
     if !out.status.success() {
         return Err(anyhow!(
             "nvidia-smi compute_cap query exited {}: {}",
@@ -701,16 +721,18 @@ async fn resolve_host_compiler(tc: &Toolchain) -> Result<Option<PathBuf>> {
     let (Some(nvcc), Some(cxx)) = (tc.nvcc.as_ref(), tc.cxx.as_ref()) else {
         return Ok(None);
     };
-    let nvcc_banner = tokio::process::Command::new(nvcc)
-        .arg("--version")
-        .output()
-        .await
-        .context("run nvcc --version")?;
-    let cxx_banner = tokio::process::Command::new(cxx)
-        .arg("--version")
-        .output()
-        .await
-        .context("run compiler --version")?;
+    let nvcc_banner = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new(nvcc).arg("--version").output(),
+    )
+    .await
+    .context("run nvcc --version (timed out or failed)")??;
+    let cxx_banner = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new(cxx).arg("--version").output(),
+    )
+    .await
+    .context("run compiler --version (timed out or failed)")??;
     let (Some(nvcc_major), Some(cxx_major)) = (
         parse_nvcc_major(&String::from_utf8_lossy(&nvcc_banner.stdout)),
         parse_gnu_major(&String::from_utf8_lossy(&cxx_banner.stdout)),

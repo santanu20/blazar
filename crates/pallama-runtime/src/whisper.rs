@@ -108,6 +108,11 @@ pub async fn install(
         .ok_or_else(|| anyhow!("release {} has no asset {asset_name}", release.tag_name))?;
     let bytes = gh.download_asset_bytes(asset).await?;
     let dir = bin_root(dirs).join(&release.tag_name);
+    // F96: replace, don't merge — a re-install over an existing tag dir
+    // must not leave stale binaries from the old extract behind.
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).with_context(|| format!("replace {}", dir.display()))?;
+    }
     std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
     crate::engine::extract_archive(&bytes, &dir, &asset.name)?;
     server_bin_in(&dir).ok_or_else(|| {
@@ -378,10 +383,13 @@ pub async fn pull(
     hf.download_file(WHISPER_MODEL_REPO, &plan, &dest, on_progress)
         .await
         .with_context(|| format!("download {WHISPER_MODEL_REPO}/{display_name}"))?;
-    let head = std::fs::read(&dest)
-        .map(|b| b[..4.min(b.len())].to_vec())
-        .unwrap_or_default();
-    if !matches!(head.as_slice(), b"ggml" | b"lmgg") {
+    // F93: read EXACTLY 4 bytes — `fs::read` buffered the whole multi-GB
+    // ggml into RAM just to inspect the magic (2.9 GB spike for large-v3).
+    let mut head = [0u8; 4];
+    let magic_ok = std::fs::File::open(&dest)
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head))
+        .is_ok();
+    if !magic_ok || !matches!(&head, b"ggml" | b"lmgg") {
         // whisper writes its magic 0x67676d6c little-endian: on disk
         // the first four bytes read "lmgg", not "ggml".
         let _ = std::fs::remove_file(&dest);
@@ -440,7 +448,12 @@ impl WhisperRuntime {
                         .mime_str("text/plain")
                         .context("mime")?;
                     let form = reqwest::multipart::Form::new().part("model", part);
-                    let http = reqwest::Client::new();
+                    // F94: bounded client — this POST runs under the
+                    // instance mutex; a hung whisper-server would pin
+                    // every later transcription behind it.
+                    let http = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_mins(2))
+                        .build()?;
                     let resp = http
                         .post(&url)
                         .multipart(form)
@@ -475,13 +488,20 @@ impl WhisperRuntime {
             let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
             cmd.env("LD_LIBRARY_PATH", format!("{libs}:{existing}"));
         }
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("spawn {}", bin.display()))?;
         let deadline = tokio::time::Instant::now() + ready_timeout;
         loop {
             if tcp_alive(port).await {
                 break;
+            }
+            // F95: a server that died mid-boot fails fast instead of
+            // burning the whole ready timeout against a dead port.
+            if let Ok(Some(status)) = child.try_wait() {
+                return Err(anyhow!(
+                    "whisper-server exited before serving on :{port}: {status}"
+                ));
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(anyhow!(

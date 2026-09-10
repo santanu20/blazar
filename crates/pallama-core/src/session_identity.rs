@@ -59,7 +59,16 @@ pub fn build(dirs: &PallamaDirs, config: &Config, model: &str) -> Option<Session
         ctx: config.effective_ctx(model),
         cache_type: config.effective_cache_type(model).to_string(),
         kv_unified: config.effective_kv_unified(model),
-        slots: config.slots,
+        // F121: record the overlay-effective slot count, not the raw
+        // global — a per-model `slots` override changes what actually
+        // runs, and the restore check compares against this value.
+        // (0 = upstream auto: recorded as configured; the profile
+        // compiler resolves auto downstream.)
+        slots: config
+            .overlay_for(model)
+            .slots
+            .filter(|&s| s != 0)
+            .unwrap_or(config.slots),
         saved_at_unix: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs()),

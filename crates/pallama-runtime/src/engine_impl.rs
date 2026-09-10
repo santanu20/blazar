@@ -68,9 +68,10 @@ impl ChildHandle {
         self.child.kill().await
     }
 
-    /// Reap the exited process.
+    /// Reap the exited process (alias of `wait`, kept for teardown
+    /// call-site readability).
     pub async fn reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.child.wait().await
+        self.wait().await
     }
 
     #[must_use]
@@ -260,8 +261,9 @@ fn spawn_child(
         .kill_on_drop(true);
     #[cfg(unix)]
     {
-        // Own process group: SIGTERM to the group takes down the whole
-        // engine tree, and Ctrl-C on the daemon does not hit children.
+        // Own process group: Ctrl-C on the daemon never reaches the
+        // child. Termination is single-pid by design (terminate()
+        // signals only this pid; never a group signal).
         cmd.process_group(0);
     }
     for (k, v) in child_env {
@@ -620,14 +622,25 @@ async fn pipe_logs<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     tail: LogTail,
 ) {
     use tokio::io::AsyncBufReadExt;
-    let mut lines = tokio::io::BufReader::new(r).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        tracing::debug!(target: "pallama::engine", stream, "{line}");
-        if let Ok(mut t) = tail.lock() {
-            if t.len() >= TAIL_CAP {
-                t.pop_front();
+    // Raw-byte reads + lossy decode (F102): `lines()` aborts the whole
+    // pipe task on one invalid-UTF-8 line and the child goes dark.
+    let mut reader = tokio::io::BufReader::new(r);
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        match reader.read_until(b'\n', &mut raw).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let line = String::from_utf8_lossy(&raw);
+                let line = line.trim_end_matches(['\n', '\r']);
+                tracing::debug!(target: "pallama::engine", stream, "{line}");
+                if let Ok(mut t) = tail.lock() {
+                    if t.len() >= TAIL_CAP {
+                        t.pop_front();
+                    }
+                    t.push_back(line.to_string());
+                }
             }
-            t.push_back(line);
         }
     }
 }

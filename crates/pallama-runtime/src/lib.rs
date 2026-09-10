@@ -1,6 +1,18 @@
 //! Pallama runtime: async engine management, HF client, process
 //! supervision, event bus, bench runner.
 
+/// File name of a llama.cpp tool binary on the current platform
+/// (`llama-quantize` vs `llama-quantize.exe`) — F91: every discovery
+/// site must go through this, not hand-join the unix name.
+#[must_use]
+pub fn tool_file_name(base: &str) -> String {
+    if cfg!(windows) {
+        format!("{base}.exe")
+    } else {
+        base.to_string()
+    }
+}
+
 pub mod bench;
 pub mod daemon;
 pub mod engine;

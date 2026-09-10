@@ -134,7 +134,7 @@ pub fn find_bench_bin(dirs: &PallamaDirs) -> Result<PathBuf> {
             dirs.engines_dir()
                 .join(&e.tag)
                 .join(format!("llama-{}", e.tag))
-                .join("llama-bench")
+                .join(crate::tool_file_name("llama-bench"))
         })
         .find(|p| p.exists())
         .ok_or_else(|| {
@@ -228,7 +228,7 @@ impl Tuner<'_> {
                 .stderr(Stdio::null())
                 .spawn()
                 .with_context(|| format!("spawn {}", server_bin.display()))?;
-            let ok = wait_ready(port, 120.0);
+            let ok = wait_ready(&mut child, port, 120.0);
             let tps = if ok {
                 drive_concurrent(port, clients).ok()
             } else {
@@ -323,7 +323,7 @@ impl Tuner<'_> {
                 .stderr(Stdio::null())
                 .spawn()
                 .with_context(|| format!("spawn {}", server_bin.display()))?;
-            let ok = wait_ready(port, 120.0);
+            let ok = wait_ready(&mut child, port, 120.0);
             let tps = if ok {
                 drive_concurrent(port, 1).ok()
             } else {
@@ -404,7 +404,7 @@ impl Tuner<'_> {
                 .stderr(Stdio::null())
                 .spawn()
                 .with_context(|| format!("spawn {}", server_bin.display()))?;
-            let warm_secs = if wait_ready(port, 180.0) {
+            let warm_secs = if wait_ready(&mut child, port, 180.0) {
                 // Prime, then measure the warm pass (the cache-hit lane).
                 chat_secs(port, &long_prompt)
                     .ok()
@@ -468,7 +468,8 @@ impl Tuner<'_> {
                 .stderr(Stdio::null())
                 .spawn()
                 .with_context(|| format!("spawn {}", server_bin.display()))?;
-            let total = if let (true, Ok(first)) = (wait_ready(port, 180.0), first_chat_secs(port))
+            let total = if let (true, Ok(first)) =
+                (wait_ready(&mut child, port, 180.0), first_chat_secs(port))
             {
                 t0.elapsed().as_secs_f64() + first
             } else {
@@ -519,7 +520,7 @@ impl Tuner<'_> {
         // Run A: single child.
         let p1 = ephemeral_port()?;
         let mut a = spawn_on(p1)?;
-        if !wait_ready(p1, 180.0) {
+        if !wait_ready(&mut a, p1, 180.0) {
             let _ = a.kill();
             let _ = a.wait();
             anyhow::bail!("replica search: baseline child never became ready");
@@ -536,8 +537,8 @@ impl Tuner<'_> {
         let p3 = ephemeral_port()?;
         let mut b1 = spawn_on(p2)?;
         let mut b2 = spawn_on(p3)?;
-        let ready2 = wait_ready(p2, 180.0);
-        let ready3 = wait_ready(p3, 180.0);
+        let ready2 = wait_ready(&mut b1, p2, 180.0);
+        let ready3 = wait_ready(&mut b2, p3, 180.0);
         if !(ready2 && ready3) {
             let _ = b1.kill();
             let _ = b1.wait();
@@ -587,9 +588,8 @@ impl Tuner<'_> {
         store: &Store,
         input: &ProfileInput<'_>,
     ) -> Result<(Profile, TuningOverrides, Vec<BenchRow>)> {
-        let base = profile::compile(input, &TuningOverrides::default())
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let _ = base;
+        // Validation gate: profile must compile before we spawn anything.
+        profile::compile(input, &TuningOverrides::default()).map_err(|e| anyhow::anyhow!("{e}"))?;
         let threads = input.hardware.physical_cores.max(1);
         // Grid axes llama-bench actually supports (verified b10816):
         // threads x KV-quant x flash-attn x batch. (No -c axis: ctx is a
@@ -616,17 +616,13 @@ impl Tuner<'_> {
             let mut g = grid.clone();
             match reduction {
                 1 => {
-                    // KV-quant axis off
-                    let idx: Vec<usize> = g
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| {
-                            i % 2 == 0 && g.get(*i + 1).is_some_and(|v| v == "f16,q8_0")
-                        })
-                        .map(|(i, _)| i)
-                        .collect();
-                    for i in idx.iter().rev() {
-                        g[*i + 1] = "f16".into();
+                    // KV-quant axis off — value-based (F107): collapse
+                    // every pair-axis value to its first leg; no
+                    // positional assumption about where the axis sits.
+                    for v in &mut g {
+                        if v == "f16,q8_0" {
+                            *v = "f16".into();
+                        }
                     }
                     tracing::warn!("tune: retrying grid without KV-quant axis");
                 }
@@ -835,6 +831,7 @@ pub fn build_input<'a>(
     draft_path: Option<&'a str>,
     engine_tag: &'a str,
     supported_flags: &'a BTreeSet<String>,
+    spec_types: &'a [String],
     endpoint: Endpoint,
     data_dir: &'a str,
 ) -> ProfileInput<'a> {
@@ -852,6 +849,7 @@ pub fn build_input<'a>(
         mmproj_path: None, // vision is irrelevant to llama-bench scoring
         engine_tag,
         supported_flags,
+        spec_types,
         // llama-bench scoring is llama-server-only (the mistral.rs lane
         // prints a gate skip instead of benching).
         engine_kind: pallama_core::engine_kind::EngineKind::LlamaCpp,
@@ -861,6 +859,7 @@ pub fn build_input<'a>(
         data_dir,
         cache_hit_rate: None, // CLI bench: static clamp, no live hint
         device_hint: None,
+        engine_census: hardware.gpus.clone(),
     }
 }
 
@@ -873,15 +872,23 @@ fn ephemeral_port() -> Result<u16> {
 
 /// Poll GET /health until 200 or timeout.
 #[allow(clippy::items_after_statements)] // io trait imports sit near their single use
-fn wait_ready(port: u16, timeout_secs: f64) -> bool {
+fn wait_ready(child: &mut std::process::Child, port: u16, timeout_secs: f64) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_secs);
     while std::time::Instant::now() < deadline {
+        // F95: a crashed server fails fast instead of spinning the full
+        // timeout against a dead port.
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return false;
+        }
         if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
             use std::io::{Read, Write};
             let _ = s.write_all(b"GET /health HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
             let mut buf = [0u8; 256];
             if let Ok(n) = s.read(&mut buf) {
-                if String::from_utf8_lossy(&buf[..n]).contains("200") {
+                // F100: judge the STATUS LINE, not "200" anywhere (a
+                // content-length or body digit would false-positive).
+                let head = String::from_utf8_lossy(&buf[..n]);
+                if head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200") {
                     return true;
                 }
             }
@@ -889,6 +896,16 @@ fn wait_ready(port: u16, timeout_secs: f64) -> bool {
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
     false
+}
+
+/// First `n` bytes of `text` cut at a char boundary — lossy-decoded socket
+/// buffers can end mid-char and a raw slice would panic (F100).
+fn head_bytes(text: &str, n: usize) -> &str {
+    let mut cut = text.len().min(n);
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &text[..cut]
 }
 
 /// Wall seconds for ONE tiny non-stream chat round-trip. `tune --load`
@@ -922,11 +939,8 @@ fn chat_secs(port: u16, content: &str) -> Result<f64> {
     let mut buf = Vec::new();
     s.read_to_end(&mut buf)?;
     let text = String::from_utf8_lossy(&buf);
-    if !text.contains("200") {
-        anyhow::bail!(
-            "load probe: first chat failed: {}",
-            &text[..text.len().min(120)]
-        );
+    if !(text.starts_with("HTTP/1.1 200") || text.starts_with("HTTP/1.0 200")) {
+        anyhow::bail!("load probe: first chat failed: {}", head_bytes(&text, 120));
     }
     Ok(t0.elapsed().as_secs_f64())
 }
@@ -959,10 +973,10 @@ fn chat_completion_tokens(port: u16, content: &str) -> Result<u64> {
     let mut buf = Vec::new();
     s.read_to_end(&mut buf)?;
     let text = String::from_utf8_lossy(&buf);
-    if !text.contains("200") {
+    if !(text.starts_with("HTTP/1.1 200") || text.starts_with("HTTP/1.0 200")) {
         anyhow::bail!(
             "replica search: chat failed on :{port}: {}",
-            &text[..text.len().min(120)]
+            head_bytes(&text, 120)
         );
     }
     Ok(text

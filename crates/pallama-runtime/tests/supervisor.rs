@@ -177,22 +177,26 @@ async fn integration__ensure_ready__health_and_argv_flags() {
             "missing {flag} in {argv:?}"
         );
     }
-    // sessions dir is per-model under the data dir
+    // sessions dir is per-model under the data dir (path_safe suffix — derive)
+    let sess_subdir = format!("sessions/{}/", pallama_core::profile::path_safe("m1"));
     assert!(
         argv.windows(2)
-            .any(|w| w[0] == "--slot-save-path" && w[1].ends_with("sessions/m1/")),
+            .any(|w| w[0] == "--slot-save-path" && w[1].ends_with(&sess_subdir)),
         "slot-save-path per-model dir: {argv:?}"
     );
     assert!(argv.windows(2).any(|w| w[0] == "--alias" && w[1] == "m1"));
+    // Default slots=0 auto: train ctx 40960 / base 16384 -> np 2 with the
+    // total ctx scaled; ps still reports the per-slot ctx below.
     assert!(argv
         .windows(2)
-        .any(|w| w[0] == "--ctx-size" && w[1] == "16384"));
+        .any(|w| w[0] == "--ctx-size" && w[1] == "32768"));
+    assert!(argv.windows(2).any(|w| w[0] == "-np" && w[1] == "2"));
 
     // ps shows ready with ctx.
     let ps = sup.ps();
     assert_eq!(ps.len(), 1);
     assert_eq!(ps[0].state, "ready");
-    assert_eq!(ps[0].ctx, 16384);
+    assert_eq!(ps[0].ctx, 16384, "ps ctx stays per-slot");
 
     sup.shutdown_all().await.unwrap();
 }

@@ -218,19 +218,31 @@ impl EngineManager {
                     release.tag_name
                 )
             })?;
-        let bytes = self.gh.download_asset_bytes(asset).await?;
-        let digest = asset
-            .digest
-            .clone()
-            .and_then(|d| d.strip_prefix("sha256:").map(str::to_string))
-            .unwrap_or_else(|| "unverified".into());
-
         let dir = self.dirs.engines_dir().join(&release.tag_name);
         if dir.exists() {
             std::fs::remove_dir_all(&dir).context("replace existing engine dir")?;
         }
         std::fs::create_dir_all(&dir)?;
-        extract_archive(&bytes, &dir, &pick.name)?;
+        // F87: stream to disk — llama.cpp release assets reach ~400 MB
+        // and must not be buffered whole in RAM (the mistralrs lane has
+        // streamed since day one). F88: a failed download or extract
+        // removes the half-populated dir instead of orphaning it.
+        let archive = dir.join(&pick.name);
+        if let Err(e) = self.gh.download_asset_file(asset, &archive).await {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+        let digest = asset
+            .digest
+            .clone()
+            .and_then(|d| d.strip_prefix("sha256:").map(str::to_string))
+            .unwrap_or_else(|| "unverified".into());
+        let extracted = extract_archive_file(&archive, &dir, &pick.name);
+        std::fs::remove_file(&archive).context("remove downloaded archive")?;
+        if let Err(e) = extracted {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
         self.register_engine(
             &dir,
             &release.tag_name,
@@ -271,10 +283,16 @@ impl EngineManager {
         }
         std::fs::create_dir_all(&dir)?;
         let archive = dir.join(&pick.name);
-        self.gh.download_asset_file(asset, &archive).await?;
+        if let Err(e) = self.gh.download_asset_file(asset, &archive).await {
+            let _ = std::fs::remove_dir_all(&dir); // F88: no orphan dir
+            return Err(e);
+        }
         let extracted = extract_archive_file(&archive, &dir, &pick.name);
         std::fs::remove_file(&archive).context("remove downloaded archive")?;
-        extracted?;
+        if let Err(e) = extracted {
+            let _ = std::fs::remove_dir_all(&dir); // F88: no orphan dir
+            return Err(e);
+        }
         if pick.cpu_fallback {
             tracing::warn!(
                 "installed the CPU mistralrs asset {} — this machine's driver/GPU \
@@ -589,13 +607,19 @@ pub(crate) fn find_engine_binary(dir: &Path, names: &[&str]) -> Result<PathBuf> 
         };
         for e in entries.flatten() {
             let p = e.path();
-            if p.is_dir() {
-                walk(&p, names, out);
-            } else if p
-                .file_name()
-                .is_some_and(|n| names.iter().any(|want| n == *want))
-            {
-                out.push(p);
+            // F86: `DirEntry::file_type` does NOT follow symlinks — a
+            // symlinked dir cycles forever under `p.is_dir()` (which
+            // does). Only REAL dirs recurse; symlinks are treated as
+            // leaf files (matchable, never descended).
+            match e.file_type() {
+                Ok(ft) if ft.is_dir() => walk(&p, names, out),
+                _ => {
+                    if p.file_name()
+                        .is_some_and(|n| names.iter().any(|want| n == *want))
+                    {
+                        out.push(p);
+                    }
+                }
             }
         }
     }
@@ -619,7 +643,9 @@ fn make_executable(path: &Path) {
         if let Ok(meta) = std::fs::metadata(path) {
             let mut perms = meta.permissions();
             perms.set_mode(perms.mode() | 0o755);
-            let _ = std::fs::set_permissions(path, perms);
+            if let Err(e) = std::fs::set_permissions(path, perms) {
+                tracing::warn!(target: "pallama::engine", path = %path.display(), error = %e, "chmod +x failed");
+            }
         }
     }
     #[cfg(not(unix))]

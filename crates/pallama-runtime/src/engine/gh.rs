@@ -113,9 +113,8 @@ impl GhClient {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("accept", "application/vnd.github+json".parse()?);
         headers.insert("user-agent", "pallama (llama.cpp orchestrator)".parse()?);
-        if let Some(t) = &token {
+        if token.is_some() {
             headers.insert("x-github-api-version", "2022-11-28".parse()?);
-            let _ = t; // used per-request below
         }
         let http = reqwest::Client::builder()
             .default_headers(headers)

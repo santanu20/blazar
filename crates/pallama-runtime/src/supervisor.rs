@@ -53,6 +53,9 @@ const PRELOAD_MIN_TRANSITIONS: u64 = 3;
 const TRANSITIONS_CAP: usize = 1024;
 /// LC1: cooldown after a failed speculative spawn of a model.
 const PRELOAD_BACKOFF: Duration = Duration::from_mins(5);
+/// F12: `keep_alive: -1` cap — 100 years, far enough to be forever in
+/// practice without risking `Instant` overflow arithmetic.
+const KEEP_ALIVE_FOREVER: Duration = Duration::from_hours(876_600);
 /// LC4: reaper ticks (10s each) of sustained concurrent load before a
 /// slots bump is adopted.
 const SLOTS_STREAK_TICKS: u32 = 6;
@@ -104,6 +107,11 @@ pub struct Instance {
     pub state: std::sync::RwLock<InstanceState>,
     pub last_used: std::sync::RwLock<Instant>,
     pub in_flight: AtomicI64,
+    /// Client-requested pin window (ollama `keep_alive`): `Some(t)` keeps
+    /// the instance exempt from idle evict AND idle sleep until `t`
+    /// (F12). `-1` maps to a far-future cap; `0` clears and the explicit
+    /// evict-after-response path owns teardown.
+    pub keep_until: std::sync::RwLock<Option<Instant>>,
     pub started_at: Instant,
     pub argv: Vec<String>,
     pub model: ModelRow,
@@ -332,6 +340,10 @@ pub struct PsRow {
     /// Prefix heat (computed under the INSTANCE key so replica rows
     /// carry their own warmth).
     pub heat: u64,
+    /// Remaining ollama `keep_alive` pin window (F12); `None` when the
+    /// instance follows the default idle policy. `ps` surfaces it as the
+    /// countdown behind `expires_at`.
+    pub keep_alive_secs: Option<u64>,
 }
 
 /// Throttle/dedup state for the measured-pressure feedback loop.
@@ -365,6 +377,12 @@ pub struct Supervisor {
     pub hardware: Hardware,
     pub engine: Arc<dyn Engine>,
     instances: DashMap<String, Arc<Instance>>,
+    /// F1: names with an evict currently in flight. A spawn that wins the
+    /// race against a slow terminate must NOT insert under the name being
+    /// torn down — the evict's cleanup would delete the fresh instance
+    /// (untracked child, `SIGKILL`ed mid-request by `kill_on_drop`) and shred
+    /// its pidfile/apikey. Spins retry after the evict completes.
+    evicting: std::sync::Mutex<std::collections::HashSet<String>>,
     /// In-flight spawns: waiters subscribe to the Notify for completion.
     loading: DashMap<String, Arc<Notify>>,
     /// Completed load results for waiters: Ok(port) or error text.
@@ -457,6 +475,7 @@ impl Supervisor {
             hardware,
             engine,
             instances: DashMap::new(),
+            evicting: std::sync::Mutex::new(std::collections::HashSet::new()),
             loading: DashMap::new(),
             load_results: DashMap::new(),
             restarts: DashMap::new(),
@@ -914,7 +933,11 @@ impl Supervisor {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                if let Err(e) =
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                {
+                    tracing::warn!(target: "pallama::supervisor", error = %e, "apikey chmod 0600 failed");
+                }
             }
             Ok(Some(ChildAuth {
                 argv: vec!["--api-key-file".into(), path.display().to_string()],
@@ -990,6 +1013,7 @@ impl Supervisor {
                 mmproj_path: m.mmproj_path.as_deref(),
                 engine_tag: &manifest.tag,
                 supported_flags: &manifest.flags,
+                spec_types: &manifest.spec_types,
                 endpoint: Endpoint::Tcp {
                     host: "127.0.0.1".into(),
                     port: 0,
@@ -997,6 +1021,7 @@ impl Supervisor {
                 data_dir: &data_dir_str,
                 cache_hit_rate: self.cache_hint.get(),
                 device_hint: None, // router preset: no per-GPU scoping
+                engine_census: self.hardware.gpus.clone(),
             };
             match profile::compile(&input, &pallama_core::TuningOverrides::default()) {
                 Ok(p) => {
@@ -1141,6 +1166,7 @@ impl Supervisor {
                         state: std::sync::RwLock::new(InstanceState::Ready),
                         last_used: std::sync::RwLock::new(Instant::now()),
                         in_flight: AtomicI64::new(0),
+                        keep_until: std::sync::RwLock::new(None),
                         started_at: Instant::now(),
                         argv,
                         model: synthetic_model.clone(),
@@ -1339,7 +1365,20 @@ impl Supervisor {
             .map(|l| (l.path, l.scale))
             .collect();
         // Draft resolution: same-name model row for the catalog pair repo.
-        let draft_path = pallama_core::spec_pair_for(name).and_then(|pair| {
+        // The manual draft lanes (eagle3/dflash/dspark) must resolve their
+        // typed head, not the generic draft-simple sibling that plain
+        // auto would pick for the same prefix.
+        let spec_mode = overlay
+            .spec
+            .clone()
+            .unwrap_or_else(|| self.config.spec.clone());
+        let pair = match spec_mode.as_str() {
+            "eagle3" => pallama_core::spec_pair_for_typed(name, "draft-eagle3"),
+            "dflash" => pallama_core::spec_pair_for_typed(name, "draft-dflash"),
+            "dspark" => pallama_core::spec_pair_for_typed(name, "draft-dspark"),
+            _ => pallama_core::spec_pair_for(name),
+        };
+        let draft_path = pair.and_then(|pair| {
             let draft_name =
                 crate::hf::registry_name(pair.draft_repo.split(':').next().unwrap_or(""));
             store.get_model(&draft_name).ok().flatten().map(|r| r.path)
@@ -1466,6 +1505,7 @@ impl Supervisor {
                 mmproj_path: model.mmproj_path.as_deref(),
                 engine_tag: &manifest.tag,
                 supported_flags: &manifest.flags,
+                spec_types: &manifest.spec_types,
                 endpoint: Endpoint::Tcp {
                     host: "127.0.0.1".into(),
                     port: 0,
@@ -1473,8 +1513,9 @@ impl Supervisor {
                 data_dir: &data_dir_str,
                 cache_hit_rate: self.cache_hint.get(),
                 device_hint: None,
+                engine_census: fresh.as_ref().unwrap_or(&self.hardware).gpus.clone(),
             };
-            pallama_core::profile::estimate_kv_f16(&probe, tuning.ctx)
+            pallama_core::profile::estimate_kv_vram_charge(&probe, tuning.ctx)
                 .map_or(0, |b| b / (1024 * 1024))
         };
         // Last-resort auto tensor-split (#28c): only when EVERY manual
@@ -1582,10 +1623,17 @@ impl Supervisor {
                 mmproj_path: model.mmproj_path.as_deref(),
                 engine_tag: &manifest.tag,
                 supported_flags: &manifest.flags,
+                spec_types: &manifest.spec_types,
                 endpoint: endpoint.clone(),
                 data_dir: &data_dir_str,
                 cache_hit_rate: self.cache_hint.get(),
                 device_hint: picked_device.as_deref(),
+                // Build-class detection reads the FULL census: scoped
+                // `hardware` above sizes capacity against the picked
+                // card, but whether the engine binary is vulkan-class
+                // (fat ctx-scaled compute buffers with a projector) is
+                // a property of everything it enumerates.
+                engine_census: fresh.as_ref().unwrap_or(&self.hardware).gpus.clone(),
             };
             // Co-residency planner (A15): when other models are already
             // resident, sum their (weights + post-quant KV) with the
@@ -1593,7 +1641,8 @@ impl Supervisor {
             // candidate to q8_0 KV before spawning instead of OOMing mid-
             // load. Explicit kv_quant (bench-adopted) is never overridden.
             if tuning.kv_quant.is_none() {
-                let candidate_kv = pallama_core::profile::estimate_kv_f16(&input, tuning.ctx);
+                let candidate_kv =
+                    pallama_core::profile::estimate_kv_vram_charge(&input, tuning.ctx);
                 if self.coresidency_needs_kv_quant(
                     picked_device.as_deref(),
                     model_bytes,
@@ -1631,6 +1680,21 @@ impl Supervisor {
             let (health, child_died) = self.wait_healthy(&endpoint, &mut child).await;
             match health {
                 Ok(()) => {
+                    // F1: an evict is tearing this name down right now —
+                    // inserting here would race its cleanup (map remove +
+                    // pidfile/apikey deletion). Kill this child and let
+                    // the spawn loop retry; the winner inserts after the
+                    // evict completes. Checked BEFORE the child moves
+                    // into the Instance so it can still be signalled.
+                    if self.evicting.lock().expect("evicting set").contains(key) {
+                        tracing::info!(
+                            model = name,
+                            "spawn deferred: evict in progress for this name"
+                        );
+                        let _ = child.kill().await;
+                        let _ = child.reap().await;
+                        continue;
+                    }
                     // NEVER default the pid: a 0 here would later target
                     // process group 0 (the whole session) on teardown.
                     let pid = child.id().ok_or_else(|| {
@@ -1646,12 +1710,14 @@ impl Supervisor {
                             "engine child pid {pid} is not a safe process-group id"
                         )));
                     }
+                    let autofit_model_name = model.name.clone();
                     let inst = Arc::new(Instance {
                         name: key.to_string(),
                         endpoint: endpoint.clone(),
                         state: std::sync::RwLock::new(InstanceState::Ready),
                         last_used: std::sync::RwLock::new(Instant::now()),
                         in_flight: AtomicI64::new(0),
+                        keep_until: std::sync::RwLock::new(None),
                         started_at: Instant::now(),
                         argv,
                         model,
@@ -1663,6 +1729,18 @@ impl Supervisor {
                         child: tokio::sync::Mutex::new(child),
                         pid,
                     });
+                    // Auto-fit visibility: the spawn traded ctx depth for
+                    // parallel slots — surface it as an event so SSE
+                    // (/api/events) and API consumers see WHY per-slot
+                    // ctx shrank.
+                    if let Some((per_slot, slots)) = profile.ctx_autofit {
+                        let _ = self.bus.publish(PallamaEvent::SlotsCtxAutoFit {
+                            model: autofit_model_name,
+                            per_slot_ctx: per_slot,
+                            slots,
+                            total_ctx: slots * per_slot,
+                        });
+                    }
                     // Bank restore, choke point #2: warm KV before the
                     // first request prefills (ctx-matched only). Banks
                     // are per-replica (key-scoped files).
@@ -1865,12 +1943,18 @@ impl Supervisor {
         entry.retain(|t| t.elapsed() < self.circuit_window);
     }
 
-    /// Kill an instance: SIGTERM process group → grace → SIGKILL.
-    /// Idempotent; publishes Evicted.
+    /// Kill an instance: single-pid TERM → grace → SIGKILL (never a
+    /// process group — see `terminate_group`). Idempotent; publishes
+    /// Evicted.
     pub async fn evict(&self, name: &str) -> Result<()> {
         let Some(inst) = self.instances.get(name).map(|i| i.clone()) else {
             return Ok(());
         };
+        // F1: mark the name as being torn down for the whole evict; a
+        // concurrent spawn retries instead of inserting a fresh child
+        // that our cleanup would then race (map remove + pidfile/apikey
+        // deletion under it).
+        let _evicting = EvictingName::guard(self, name);
         // Session bank, choke point #1 (FIX1): EVERY eviction path —
         // gateway requests, idle ladder, capacity pressure — flows
         // through here, so the `_auto-<ctx>` checkpoint is saved exactly
@@ -1887,10 +1971,26 @@ impl Supervisor {
             let mut child = inst.child.lock().await;
             terminate_group(inst.pid, self.shutdown_grace, &mut child).await?;
         }
-        let _ = std::fs::remove_file(self.dirs.run_dir().join(format!("{name}.pid")));
-        // Child-auth keyfile dies with the child (its secret too).
-        let _ = std::fs::remove_file(self.dirs.run_dir().join(format!("{name}.apikey")));
-        self.instances.remove(name);
+        // F1: a concurrent respawn can insert a FRESH instance under
+        // this name while we waited in the terminate grace; only tear
+        // down the map entry + runtime files when the live entry is
+        // still OURS (ptr identity). Deleting a fresh child here would
+        // orphan it (kill_on_drop SIGKILL mid-request) and remove its
+        // pidfile/apikey under it.
+        if self
+            .instances
+            .remove_if(name, |_k, live| Arc::ptr_eq(live, &inst))
+            .is_some()
+        {
+            let _ = std::fs::remove_file(self.dirs.run_dir().join(format!("{name}.pid")));
+            // Child-auth keyfile dies with the child (its secret too).
+            let _ = std::fs::remove_file(self.dirs.run_dir().join(format!("{name}.apikey")));
+        } else {
+            tracing::info!(
+                model = name,
+                "evict: map entry was replaced by a respawn during termination — fresh instance left intact"
+            );
+        }
         Ok(())
     }
 
@@ -2089,11 +2189,23 @@ impl Supervisor {
                 .sessions
                 .pins(model_of_key(&inst.name), session_ttl)
                 .live;
-            if idle >= Duration::from_secs(self.config.idle_timeout_secs) && !session_pinned {
+            // F12 ollama keep_alive pin: same protection class as a live
+            // session — a client that asked to keep the model loaded gets
+            // no evict and no sleep-mark until its window lapses.
+            let keep_alive = inst
+                .keep_until
+                .read()
+                .expect("idle lock")
+                .is_some_and(|t| t > now);
+            if idle >= Duration::from_secs(self.config.idle_timeout_secs)
+                && !session_pinned
+                && !keep_alive
+            {
                 evictions.push(inst.name.clone());
             } else if idle >= Duration::from_secs(self.config.idle_sleep_secs)
                 && state == InstanceState::Ready
                 && self.hardware.has_gpu()
+                && !keep_alive
             {
                 // Child sleeps itself (--sleep-idle-seconds); mark observed.
                 let inst2 = inst.clone();
@@ -2350,7 +2462,20 @@ impl Supervisor {
 
     pub fn end_request(&self, name: &str) {
         if let Some(i) = self.instances.get(name) {
-            i.in_flight.fetch_sub(1, Ordering::SeqCst);
+            // F1 companion: a request that began on a PREVIOUS generation
+            // of this name can end after a respawn replaced the map entry;
+            // never let the shared counter go negative (a negative value
+            // would read as permanently-busy in ps/admission).
+            let mut cur = i.in_flight.load(Ordering::SeqCst);
+            while cur > 0 {
+                match i
+                    .in_flight
+                    .compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst)
+                {
+                    Ok(_) => break,
+                    Err(now) => cur = now,
+                }
+            }
             *i.last_used.write().expect("idle lock") = Instant::now();
         }
     }
@@ -2378,6 +2503,11 @@ impl Supervisor {
                     pid: i.pid,
                     bytes: i.model.bytes,
                     heat,
+                    keep_alive_secs: i
+                        .keep_until
+                        .read()
+                        .expect("idle lock")
+                        .map(|t| t.saturating_duration_since(Instant::now()).as_secs()),
                 }
             })
             .collect()
@@ -2424,6 +2554,26 @@ impl Supervisor {
     /// against the model's trained context.
     pub fn set_next_ctx(&self, model: &str, ctx: u32) {
         self.pending_ctx.insert(model.to_string(), ctx);
+    }
+
+    /// Apply an ollama `keep_alive` request to a live instance (F12):
+    /// `secs > 0` pins for that window, `secs < 0` pins to a far-future
+    /// cap ("forever"), `0` clears any prior pin (the response lane then
+    /// evicts explicitly). Returns whether the instance was found live.
+    pub fn set_keep_alive(&self, key: &str, secs: i64) -> bool {
+        let Some(inst) = self.instances.get(key) else {
+            return false;
+        };
+        let window = match secs {
+            0 => None,
+            n if n > 0 => Some(Duration::from_secs(
+                u64::try_from(n).unwrap_or(u64::MAX / 2),
+            )),
+            _ => Some(KEEP_ALIVE_FOREVER),
+        };
+        let window = window.map(|d| Instant::now() + d.min(KEEP_ALIVE_FOREVER));
+        *inst.keep_until.write().expect("idle lock") = window;
+        true
     }
 
     /// Prefix heat: +1 per chat-family hit (saturating), decaying with a
@@ -2478,7 +2628,7 @@ impl Supervisor {
         // this snapshot removes the map guard from the await path.
         let snapshot: Vec<std::sync::Arc<Instance>> =
             self.instances.iter().map(|e| e.value().clone()).collect();
-        let mut crashed: Vec<String> = Vec::new();
+        let mut crashed: Vec<std::sync::Arc<Instance>> = Vec::new();
         for inst in &snapshot {
             let mut child = inst.child.lock().await;
             match child.try_status() {
@@ -2487,20 +2637,55 @@ impl Supervisor {
                         model = %inst.name,
                         "engine crashed ({status}); next request will respawn"
                     );
-                    crashed.push(inst.name.clone());
+                    crashed.push(inst.clone());
                 }
                 Ok(None) => {}
                 Err(e) => tracing::warn!(model = %inst.name, "child poll: {e}"),
             }
         }
-        for name in crashed {
-            let _ = std::fs::remove_file(self.dirs.run_dir().join(format!("{name}.pid")));
-            self.instances.remove(&name);
+        for inst in crashed {
+            // F1: only drop the map entry (and runtime files) when the
+            // live entry is still the CRASHED instance — a concurrent
+            // ensure() may have already respawned a fresh child under
+            // this name; deleting it here would orphan it. F3: the
+            // crash lane now also removes the child-auth keyfile (it
+            // previously leaked as a stale secret file).
+            let name = inst.name.clone();
+            if self
+                .instances
+                .remove_if(&name, |_k, live| Arc::ptr_eq(live, &inst))
+                .is_some()
+            {
+                let _ = std::fs::remove_file(self.dirs.run_dir().join(format!("{name}.pid")));
+                let _ = std::fs::remove_file(self.dirs.run_dir().join(format!("{name}.apikey")));
+            }
             self.bus.publish(PallamaEvent::InstanceStateChanged {
                 name,
                 state: InstanceState::Crashed,
             });
         }
+    }
+}
+
+/// F1: clears the evict-in-progress mark when the evict lane ends, on
+/// every path (success, error, early return).
+struct EvictingName<'a>(&'a Supervisor, String);
+impl<'a> EvictingName<'a> {
+    fn guard(s: &'a Supervisor, name: &str) -> Self {
+        s.evicting
+            .lock()
+            .expect("evicting set")
+            .insert(name.to_string());
+        Self(s, name.to_string())
+    }
+}
+impl Drop for EvictingName<'_> {
+    fn drop(&mut self) {
+        self.0
+            .evicting
+            .lock()
+            .expect("evicting set")
+            .remove(&self.1);
     }
 }
 
@@ -2569,7 +2754,7 @@ async fn terminate_group(pid: u32, grace: Duration, child: &mut ChildHandle) -> 
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            tracing::warn!(pid, "engine group did not exit within grace; SIGKILL");
+            tracing::warn!(pid, "engine child did not exit within grace; SIGKILL");
             let _ = child.kill().await;
             let _ = child.reap().await;
             return Ok(());
@@ -2812,6 +2997,7 @@ mod routing_tests {
             state: std::sync::RwLock::new(state),
             last_used: std::sync::RwLock::new(Instant::now()),
             in_flight: AtomicI64::new(load),
+            keep_until: std::sync::RwLock::new(None),
             started_at: Instant::now(),
             argv: vec![],
             model: ModelRow {
@@ -2867,6 +3053,54 @@ mod routing_tests {
                 let _ = pid;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn unit__evict__respawn_during_grace_survives() {
+        // F1 pin: a fresh instance inserted under the same name while an
+        // evict waits in the child mutex (terminate grace) must survive
+        // the evict's cleanup — pre-fix, instances.remove(name) deleted
+        // it and the pidfile/apikey went with it.
+        let sup = std::sync::Arc::new(routing_sup(1));
+        let (old, po) = fake_instance("m", InstanceState::Ready, 0);
+        sup.instances.insert("m".to_string(), old.clone());
+        std::fs::create_dir_all(sup.dirs.run_dir()).unwrap();
+        let pidfile = sup.dirs.run_dir().join("m.pid");
+        std::fs::write(&pidfile, b"1").unwrap();
+        // Park the evict mid-teardown by holding the child lock.
+        let held = old.child.lock().await;
+        let task = tokio::spawn({
+            let sup = std::sync::Arc::clone(&sup);
+            async move { sup.evict("m").await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Simulate the respawn that won the TOCTOU between the evict's
+        // map snapshot and its cleanup (direct insert = a spawn that
+        // started before the evicting mark was set).
+        let (fresh, pf) = fake_instance("m", InstanceState::Ready, 0);
+        sup.instances.insert("m".to_string(), fresh.clone());
+        drop(held);
+        task.await.unwrap().unwrap();
+        let live = sup
+            .instances
+            .get("m")
+            .expect("fresh instance survived")
+            .clone();
+        assert!(
+            std::sync::Arc::ptr_eq(&live, &fresh),
+            "evict must not delete a respawned generation"
+        );
+        assert!(
+            pidfile.exists(),
+            "pidfile of the fresh generation must not be shredded"
+        );
+        assert!(
+            sup.evicting.lock().unwrap().is_empty(),
+            "evicting mark cleared on completion"
+        );
+        drop(live);
+        sup.instances.remove("m");
+        kill_all(&[po, pf]);
     }
 
     #[tokio::test]
@@ -2999,6 +3233,9 @@ mod routing_tests {
     async fn unit__adaptive_slots__adopts_after_streak_and_respects_manual() {
         let mut sup = routing_sup(1);
         sup.config.adaptive_slots = true;
+        // LC4 bumps SINGLE-slot models; the slots=0 auto default makes it
+        // intentionally inert (spawn-time sizing owns that case).
+        sup.config.slots = 1;
         let (inst, ph) = fake_instance("m", InstanceState::Ready, 2);
         sup.instances.insert("m".into(), inst);
         for _ in 0..(SLOTS_STREAK_TICKS - 1) {
@@ -3015,6 +3252,7 @@ mod routing_tests {
         // Manual overlay slots exclude the model entirely.
         let mut sup = routing_sup(1);
         sup.config.adaptive_slots = true;
+        sup.config.slots = 1;
         sup.config.model_overrides.insert(
             "m".into(),
             ModelOverride {

@@ -637,7 +637,12 @@ pub fn fit_rows(siblings: &[HfSibling], vram_bytes: u64, default_ctx: u32) -> Ve
         // KV estimate for the default ctx, assuming q8_0 KV when tight
         // (same trigger as the compiler's rule 6).
         let kv_f16 = kv_estimate_f16(default_ctx);
-        let fits = bytes + kv_f16.min(kv_f16 / 2) <= vram_bytes;
+        // F105: mirror the compiler's rule-6 KV ladder (f16 -> q8 -> q4)
+        // instead of the degenerate `kv_f16.min(kv_f16 / 2)`, which only
+        // ever tested the q8 grade.
+        let fits = bytes + kv_f16 <= vram_bytes
+            || bytes + kv_f16 / 2 <= vram_bytes
+            || bytes + kv_f16 / 4 <= vram_bytes;
         let recommended = if fits {
             default_ctx
         } else {
@@ -779,7 +784,7 @@ impl Puller {
                 let before: u64 = selected.shards[..i].iter().map(|s| s.bytes).sum();
                 progress(before + d.min(t), total_bytes);
             };
-            let dest = unique_dest(&models_dir, &shard.filename);
+            let dest = unique_dest(&models_dir, &shard.filename, &target.repo);
             self.client
                 .download_file(&target.repo, shard, &dest, &mut progress_one)
                 .await
@@ -794,48 +799,33 @@ impl Puller {
         let mmproj_dest = selected
             .mmproj
             .as_ref()
-            .map(|mm| unique_dest(&models_dir, &mm.filename));
+            .map(|mm| unique_dest(&models_dir, &mm.filename, &target.repo));
         if let (Some(mm), Some(dest)) = (&selected.mmproj, &mmproj_dest) {
             self.client
                 .download_file(&target.repo, mm, dest, &mut progress)
-                .await?;
+                .await
+                .inspect_err(|e| {
+                    // F104: mmproj failure must reach /api/pull watchers
+                    // like a shard failure does, not vanish via `?`.
+                    self.bus.publish(PallamaEvent::PullFailed {
+                        name: name.to_string(),
+                        error: format!("mmproj: {e}"),
+                    });
+                })?;
         }
         bar.finish_and_clear();
 
-        // Metadata: prefer real GGUF header; fall back to HF-provided info.
-        // A header that does not parse is a LOUD warning, never silence:
-        // the engine will most likely refuse to load the file (the
-        // qwen3.5-9b quantizer-metadata class of failure).
-        let pull_warning = gguf_health_warning(&shard_paths[0], &target.repo, &info.siblings);
+        let (row, pull_warning) = build_model_row(
+            name,
+            target,
+            &info,
+            &selected,
+            &shard_paths,
+            mmproj_dest.as_ref(),
+        )?;
         if let Some(w) = &pull_warning {
             tracing::warn!(model = %name, "{w}");
         }
-        let gguf_meta = gguf::read_metadata_file(&shard_paths[0]).ok();
-        let arch = gguf_meta
-            .as_ref()
-            .map(|m| m.architecture.clone())
-            .or_else(|| info.gguf.as_ref().and_then(|g| g.architecture.clone()));
-        let ctx_train = gguf_meta
-            .as_ref()
-            .and_then(|m| m.context_length)
-            .or_else(|| info.gguf.as_ref().and_then(|g| g.context_length));
-
-        let bytes: u64 = selected.shards.iter().map(|s| s.bytes).sum();
-        let row = ModelRow {
-            name: name.to_string(),
-            repo: target.repo.clone(),
-            quant: selected.quant.clone(),
-            path: shard_paths[0].display().to_string(),
-            bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
-            sha256: selected.shards[0].sha256.clone(),
-            mmproj_path: mmproj_dest.map(|d| d.display().to_string()),
-            shards: i64::try_from(selected.shards.len()).unwrap_or(i64::MAX),
-            arch,
-            params: Some(est_params(bytes, &selected.quant)),
-            ctx_train: ctx_train.and_then(|c| i64::try_from(c).ok()),
-            pulled_at: i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
-                .unwrap_or(i64::MAX),
-        };
         let store = Store::open(&self.dirs)?;
         store.upsert_model(&row)?;
         self.bus.publish(PallamaEvent::ModelPulled {
@@ -852,6 +842,51 @@ impl Puller {
         }
         Ok(row)
     }
+}
+
+/// Post-download metadata + store row. Health warning: `None` when the
+/// header parses; a LOUD warning otherwise (the engine will most likely
+/// refuse to load the file — the qwen3.5-9b quantizer-metadata class of
+/// failure). GGUF header facts win over HF-provided metadata.
+#[allow(clippy::too_many_arguments)] // cohesive pull-facts tuple; splitting hides the fallback chain
+fn build_model_row(
+    name: &str,
+    target: &PullTarget,
+    info: &HfModelInfo,
+    selected: &SelectedFiles,
+    shard_paths: &[PathBuf],
+    mmproj_dest: Option<&PathBuf>,
+) -> Result<(ModelRow, Option<String>)> {
+    let pull_warning = gguf_health_warning(&shard_paths[0], &target.repo, &info.siblings);
+    let gguf_meta = gguf::read_metadata_file(&shard_paths[0]).ok();
+    let arch = gguf_meta
+        .as_ref()
+        .map(|m| m.architecture.clone())
+        .or_else(|| info.gguf.as_ref().and_then(|g| g.architecture.clone()));
+    let ctx_train = gguf_meta
+        .as_ref()
+        .and_then(|m| m.context_length)
+        .or_else(|| info.gguf.as_ref().and_then(|g| g.context_length));
+
+    let bytes: u64 = selected.shards.iter().map(|s| s.bytes).sum();
+    Ok((
+        ModelRow {
+            name: name.to_string(),
+            repo: target.repo.clone(),
+            quant: selected.quant.clone(),
+            path: shard_paths[0].display().to_string(),
+            bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
+            sha256: selected.shards[0].sha256.clone(),
+            mmproj_path: mmproj_dest.as_ref().map(|d| d.display().to_string()),
+            shards: i64::try_from(selected.shards.len()).unwrap_or(i64::MAX),
+            arch,
+            params: Some(est_params(bytes, &selected.quant)),
+            ctx_train: ctx_train.and_then(|c| i64::try_from(c).ok()),
+            pulled_at: i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+                .unwrap_or(i64::MAX),
+        },
+        pull_warning,
+    ))
 }
 
 /// Post-download GGUF health check: `None` when the header parses;
@@ -886,21 +921,26 @@ pub fn gguf_health_warning(path: &Path, repo: &str, siblings: &[HfSibling]) -> O
     ))
 }
 
-fn unique_dest(dir: &Path, filename: &str) -> PathBuf {
+fn unique_dest(dir: &Path, filename: &str, repo: &str) -> PathBuf {
     let flat = Path::new(filename);
     let leaf = flat.file_name().unwrap_or_default();
     let dest = dir.join(leaf);
     if !dest.exists() {
         return dest;
     }
-    // Collision: prefix with the parent path from the repo (slugified).
+    // Collision: disambiguate with repo-derived path parts so two repos
+    // shipping the same leaf name never clobber each other. Subdir path
+    // first (matches the repo's internal layout), then the repo slug for
+    // flat filenames (e.g. two Qwen3.5-9B-Q4_K_M.gguf from different
+    // repos — verified live: unsloth base vs unsloth MTP collide).
     if let Some(parent) = flat.parent() {
         if !parent.as_os_str().is_empty() {
             let slug: String = parent.to_string_lossy().replace(['/', '\\'], "--");
             return dir.join(format!("{slug}--{}", leaf.to_string_lossy()));
         }
     }
-    dest
+    let repo_slug = repo.replace(['/', '\\'], "--");
+    dir.join(format!("{repo_slug}--{}", leaf.to_string_lossy()))
 }
 
 #[cfg(test)]
@@ -909,6 +949,30 @@ mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn unit__unique_dest__flat_collision_disambiguates_by_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("m.gguf"), b"x").unwrap();
+        // No collision: leaf name kept verbatim.
+        assert_eq!(
+            unique_dest(dir, "fresh.gguf", "unsloth/Base-GGUF"),
+            dir.join("fresh.gguf")
+        );
+        // Flat collision: repo slug prefix — two repos shipping the same
+        // leaf never clobber each other (live case: unsloth base vs MTP
+        // repos both ship Qwen3.5-9B-Q4_K_M.gguf).
+        assert_eq!(
+            unique_dest(dir, "m.gguf", "unsloth/Qwen3.5-9B-MTP-GGUF"),
+            dir.join("unsloth--Qwen3.5-9B-MTP-GGUF--m.gguf")
+        );
+        // Subdir filename collision: internal path slug wins (unchanged).
+        assert_eq!(
+            unique_dest(dir, "org/repo/m.gguf", "unsloth/Other"),
+            dir.join("org--repo--m.gguf")
+        );
+    }
 
     #[test]
     fn unit__gguf_health_warning__bad_header_names_alternatives() {

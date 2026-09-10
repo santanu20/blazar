@@ -68,10 +68,37 @@ pub struct Config {
     pub update_channel: UpdateChannel,
     /// "auto" or explicit engine asset suffix (e.g. "ubuntu-vulkan-x64").
     pub engine_asset: String,
-    /// "" = newest b-tag; else pin like "b10816".
-    pub engine_pin: String,
-    /// "off" | "auto" (auto = adopt spec decode when a draft pair is pulled).
+    /// "off" | "auto" | "mtp" | "eagle3" | "dflash" | "dspark" (auto =
+    /// adopt spec decode when a draft pair is pulled, embedded MTP head
+    /// wins; mtp = MTP head baked into the GGUF, requires an engine
+    /// advertising draft-mtp; eagle3/dflash/dspark = trained /
+    /// block-diffusion draft models, require an engine advertising the
+    /// matching spec type). n-gram variants: see ngram-* keys.
     pub spec: String,
+    /// On-demand tensor loading (`--lazy-mode`): "auto" (engine default:
+    /// on-demand only for tensors > 4 GiB), "on" (all such tensors from
+    /// disk via mmap — big-MoE RAM relief), "off" (fully resident).
+    pub lazy_mode: String,
+    /// EXPERIMENTAL upstream server-side agent tools (`--tools` CSV or
+    /// "all"): the engine gains read/grep/exec/write capabilities —
+    /// opt-in, never defaulted, engine also limits CORS to localhost
+    /// when set. Do not enable in untrusted environments.
+    #[serde(default)]
+    pub server_tools: Option<String>,
+    /// Runtime sandbox for `server_tools` (`--tools-runtime`), one of
+    /// docker:<image> | podman:<image> | docker-container:<id> |
+    /// podman-container:<id> | ssh:<target>. Passthrough only — pallama
+    /// itself never requires docker.
+    #[serde(default)]
+    pub server_tools_runtime: Option<String>,
+    /// Path to a Cursor-compatible JSON of MCP server definitions passed
+    /// to the engine (`--mcp-servers-config`). Exclusive with
+    /// `mcp_servers_json`. EXPERIMENTAL upstream; untrusted-input risk.
+    #[serde(default)]
+    pub mcp_servers_config: Option<String>,
+    /// Inline JSON form of `mcp_servers_config` (`--mcp-servers-json`).
+    #[serde(default)]
+    pub mcp_servers_json: Option<String>,
     /// Min chunk size for KV-shift prefix reuse; 0 disables.
     pub cache_reuse: u32,
     /// API keys (virtual keys): empty = no auth (loopback default).
@@ -93,10 +120,24 @@ pub struct Config {
     /// Child reasoning output format: "none" | "deepseek" | "deepseek-legacy".
     /// Empty = upstream auto (detect from template).
     pub reasoning_format: String,
-    /// Server slots (`-np`). 1 = full-speed single client (default);
-    /// larger = concurrent clients sharing ctx. 0 = auto.
+    /// Server slots (`-np`). 0 = pallama auto (default): capacity-aware
+    /// concurrency — the total ctx scales so each slot keeps the resolved
+    /// per-slot ctx, and the slot count is clamped by the KV budget and the
+    /// model's trained context (up to 4). Concurrent streams then batch on
+    /// the GPU instead of queueing (measured ~2.5x system throughput).
+    /// 1 = full-speed single client pin; N = manual pin (upstream slices
+    /// the resolved ctx across N slots).
     #[serde(default = "default_slots")]
     pub slots: u32,
+    /// Deterministic decoding pin: `true` forces slots = 1 for every
+    /// model without a per-model override. Multi-slot batches perturb
+    /// logits in near-tie positions, so greedy runs under `slots > 1`
+    /// do not reproduce token-for-token (measured: auto-slots np=4
+    /// flipped 14/20 greedy probes vs the same child at slots = 1).
+    /// Costs single-client nothing; concurrent streams queue instead
+    /// of batching (~2.5x system throughput left on the table).
+    #[serde(default)]
+    pub deterministic: bool,
     /// KV cache quantization: "" = auto ladder (`q8_0` when KV+weights near
     /// VRAM, `q4_0` when still tight), or an explicit type: f32, f16, bf16,
     /// `q8_0`, `q4_0`, `q4_1`, `iq4_nl`, `q5_0`, `q5_1`. Quantized V requires flash
@@ -617,7 +658,13 @@ pub struct ModelOverride {
     /// Per-model parallel slots (`-np`); overrides the global `slots`
     /// for this model only. 0 keeps upstream auto.
     pub slots: Option<u32>,
+    /// Per-model determinism pin (None = inherit the global
+    /// `deterministic`). `true` forces slots = 1 for this model.
+    #[serde(default)]
+    pub deterministic: Option<bool>,
     pub spec: Option<String>,
+    /// Per-model on-demand tensor loading (None = inherit `lazy_mode`).
+    pub lazy_mode: Option<String>,
     pub loras: Option<Vec<String>>,
     /// Extra llama-server args, validated against the engine capability
     /// manifest at profile-compile time (unknown flag = error).
@@ -985,7 +1032,6 @@ impl Default for Config {
             log_level: None,
             update_channel: UpdateChannel::default(),
             engine_asset: "auto".to_string(),
-            engine_pin: String::new(),
             router_max_models: 0,
             late_chunking_max_tokens: default_late_chunking_max_tokens(),
             session_keep_secs: default_session_keep_secs(),
@@ -996,11 +1042,17 @@ impl Default for Config {
             mistralrs_pa_memory_fraction: None,
             mistralrs_paged_attn: None,
             spec: "off".to_string(),
+            lazy_mode: "auto".to_string(),
+            server_tools: None,
+            server_tools_runtime: None,
+            mcp_servers_config: None,
+            mcp_servers_json: None,
             cache_reuse: 256,
             keys: Vec::new(),
             rpc_servers: String::new(),
             cache_ram_mb: 8192,
-            slots: 1,
+            slots: default_slots(),
+            deterministic: false,
             slot_prompt_similarity: 0.0,
             sentinel: true,
             sentinel_stall_secs: 30,
@@ -1086,7 +1138,7 @@ impl Default for Config {
             lookup_cache_static: None,
             lookup_cache_dynamic: None,
             predictive_preload: false,
-            adaptive_slots: false,
+            adaptive_slots: true,
             no_host: false,
             op_offload: None,
             keep_tokens: 0,
@@ -1124,6 +1176,42 @@ impl fmt::Display for Config {
     }
 }
 
+/// Persist a `config.toml` body safely. Every config write path routes
+/// through here so nothing can lose user settings silently:
+/// - previous file backed up to `config.toml.bak-<unix-ms>` (5 newest
+///   kept, older pruned) — an uninstall/reinstall cycle or operator
+///   mistake is recoverable;
+/// - write is temp-file + atomic rename (a crash mid-write never leaves
+///   a truncated config behind).
+pub fn persist_config(path: &std::path::Path, body: &str) -> CoreResult<()> {
+    if path.exists() {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        if let Some(dir) = path.parent() {
+            let mut baks: Vec<_> = std::fs::read_dir(dir)?
+                .filter_map(std::result::Result::ok)
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("config.toml.bak-")
+                })
+                .collect();
+            // Timestamp names sort lexically = chronologically.
+            baks.sort_by_key(std::fs::DirEntry::file_name);
+            while baks.len() >= 5 {
+                let _ = std::fs::remove_file(baks.remove(0).path());
+            }
+        }
+        let bak = path.with_file_name(format!("config.toml.bak-{ms}"));
+        std::fs::copy(path, &bak)?;
+    }
+    let tmp = path.with_file_name("config.toml.tmp-write");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 impl Config {
     /// Load config from `<config_dir>/config.toml`, creating it with defaults
     /// if absent. Then apply `PALLAMA_*` env overrides.
@@ -1135,7 +1223,7 @@ impl Config {
         } else {
             let cfg = Self::default();
             std::fs::create_dir_all(&dirs.config_dir)?;
-            std::fs::write(&path, cfg.to_toml()?)?;
+            persist_config(&path, &cfg.to_toml()?)?;
             cfg
         };
         cfg.with_env_overrides()
@@ -1204,6 +1292,19 @@ impl Config {
         o.ctx.unwrap_or(self.default_ctx)
     }
 
+    /// Effective lazy-mode for a model: overlay wins over global default.
+    #[must_use]
+    pub fn effective_lazy_mode(&self, model: &str) -> &str {
+        match self
+            .model_overrides
+            .get(model)
+            .and_then(|o| o.lazy_mode.as_deref())
+        {
+            Some(m) => m,
+            None => self.lazy_mode.as_str(),
+        }
+    }
+
     /// Effective late-chunking mode for a model: overlay wins (default off).
     #[must_use]
     pub fn effective_late_chunking(&self, model: &str) -> bool {
@@ -1243,12 +1344,6 @@ impl Config {
     #[must_use]
     pub fn raw_has_legacy_keys(raw: &str) -> bool {
         toml::from_str::<toml::Table>(raw).is_ok_and(|t| t.contains_key("api_keys"))
-    }
-
-    /// Resolve a presented bearer secret to its key entry (None = unknown).
-    #[must_use]
-    pub fn key_for(&self, presented: &str) -> Option<&ApiKey> {
-        self.keys.iter().find(|k| k.key == presented)
     }
 
     fn validate_keys(&self) -> CoreResult<()> {
@@ -1314,16 +1409,17 @@ impl Config {
     #[must_use]
     pub fn effective_ctx_extend(&self, model: &str) -> f64 {
         let o = self.overlay_for(model);
-        o.ctx_extend
-            .filter(|v| *v != 0.0)
-            .unwrap_or(self.ctx_extend)
+        // F114: Some(0.0) is a VALID explicit off (validate teaches
+        // "0 (off)") — it must override the global, not fall through it.
+        o.ctx_extend.unwrap_or(self.ctx_extend)
     }
 
     /// Effective `MoE` CPU-offload expert count; overlay wins over global.
     #[must_use]
     pub fn effective_cpu_moe_n(&self, model: &str) -> i32 {
         let o = self.overlay_for(model);
-        o.cpu_moe_n.filter(|v| *v > 0).unwrap_or(self.cpu_moe_n)
+        // F114: Some(0) is a VALID explicit off — override, not inherit.
+        o.cpu_moe_n.unwrap_or(self.cpu_moe_n)
     }
 
     /// Effective `--override-tensor` entries; overlay list replaces the
@@ -1402,7 +1498,9 @@ impl Config {
                     .into(),
             ));
         }
-        if sc.enabled && !(0.0..=1.0).contains(&sc.threshold) {
+        // F115: 0.0 must be rejected — the header path enforces
+        // 0.01..=1.0 and 0.0 would make nearly everything a "hit".
+        if sc.enabled && !(sc.threshold > 0.0 && sc.threshold <= 1.0) {
             return Err(CoreError::Config(format!(
                 "semantic_cache.threshold must be in (0, 1], got {}",
                 sc.threshold
@@ -1440,7 +1538,15 @@ impl Config {
             )));
         }
         match self.child_transport.as_str() {
-            "tcp" | "unix" => {}
+            // F35: "unix" was accepted by validation but no lane dials a
+            // UDS — every request would 500. Fail loud at config load
+            // instead of at first request.
+            "tcp" => {}
+            "unix" => {
+                return Err(CoreError::Config(
+                    "child_transport = \"unix\" is not implemented yet — use \"tcp\"".to_string(),
+                ));
+            }
             other => {
                 return Err(CoreError::Config(format!(
                     "child_transport must be \"tcp\" or \"unix\", got {other:?}"
@@ -1449,12 +1555,60 @@ impl Config {
         }
         match self.spec.as_str() {
             "off" | "auto" | "ngram" | "ngram-map-k" | "ngram-map-k4v" | "ngram-mod"
-            | "ngram-cache" => {}
+            | "ngram-cache" | "mtp" | "eagle3" | "dflash" | "dspark" => {}
             other => {
                 return Err(CoreError::Config(format!(
-                    "spec must be \"off\", \"auto\", \"ngram\", \"ngram-map-k\", \"ngram-map-k4v\", \"ngram-mod\" or \"ngram-cache\", got {other:?}"
+                    "spec must be \"off\", \"auto\", \"ngram\", \"ngram-map-k\", \"ngram-map-k4v\", \"ngram-mod\", \"ngram-cache\", \"mtp\", \"eagle3\", \"dflash\" or \"dspark\", got {other:?}"
                 )))
             }
+        }
+        if !matches!(self.lazy_mode.as_str(), "auto" | "on" | "off") {
+            return Err(CoreError::Config(format!(
+                "lazy_mode must be \"auto\", \"on\" or \"off\", got {:?}",
+                self.lazy_mode
+            )));
+        }
+        // Experimental upstream agent-tooling surface. Global-only by
+        // design: a security posture must not vary silently per model.
+        if let Some(rt) = &self.server_tools_runtime {
+            let ok = [
+                "docker:",
+                "podman:",
+                "docker-container:",
+                "podman-container:",
+                "ssh:",
+            ]
+            .iter()
+            .any(|p| rt.starts_with(p) && rt.len() > p.len());
+            if !ok {
+                return Err(CoreError::Config(format!(
+                    "server_tools_runtime must be docker:<image>, podman:<image>, \
+                     docker-container:<id>, podman-container:<id> or ssh:<target>, got {rt:?}"
+                )));
+            }
+            if self.server_tools.is_none() {
+                return Err(CoreError::Config(
+                    "server_tools_runtime is set but server_tools is not — a runtime \
+                     without tools is meaningless; set server_tools (or drop the runtime)"
+                        .into(),
+                ));
+            }
+        }
+        if let Some(json) = &self.mcp_servers_json {
+            if serde_json::from_str::<serde_json::Value>(json).is_err() {
+                return Err(CoreError::Config(
+                    "mcp_servers_json must be valid JSON (Cursor-compatible MCP \
+                     server definitions), parse failed"
+                        .into(),
+                ));
+            }
+        }
+        if self.mcp_servers_config.is_some() && self.mcp_servers_json.is_some() {
+            return Err(CoreError::Config(
+                "mcp_servers_config and mcp_servers_json are mutually exclusive — \
+                 pick the file path or the inline JSON"
+                    .into(),
+            ));
         }
         if !self.cpu_range.is_empty() && !valid_cpu_range(&self.cpu_range) {
             return Err(CoreError::Config(format!(
@@ -1499,9 +1653,20 @@ impl Config {
                         | "ngram-map-k4v"
                         | "ngram-mod"
                         | "ngram-cache"
+                        | "mtp"
+                        | "eagle3"
+                        | "dflash"
+                        | "dspark"
                 ) {
                     return Err(CoreError::Config(format!(
-                        "model_overrides.{name}.spec must be \"off\", \"auto\", \"ngram\", \"ngram-map-k\", \"ngram-map-k4v\", \"ngram-mod\" or \"ngram-cache\", got {spec:?}"
+                        "model_overrides.{name}.spec must be \"off\", \"auto\", \"ngram\", \"ngram-map-k\", \"ngram-map-k4v\", \"ngram-mod\", \"ngram-cache\", \"mtp\", \"eagle3\", \"dflash\" or \"dspark\", got {spec:?}"
+                    )));
+                }
+            }
+            if let Some(lm) = &o.lazy_mode {
+                if !matches!(lm.as_str(), "auto" | "on" | "off") {
+                    return Err(CoreError::Config(format!(
+                        "model_overrides.{name}.lazy_mode must be \"auto\", \"on\" or \"off\", got {lm:?}"
                     )));
                 }
             }
@@ -1912,11 +2077,23 @@ impl Config {
         if let Some(v) = env("PALLAMA_ENGINE_ASSET") {
             cfg.engine_asset = v;
         }
-        if let Some(v) = env("PALLAMA_ENGINE_PIN") {
-            cfg.engine_pin = v;
-        }
         if let Some(v) = env("PALLAMA_SPEC") {
             cfg.spec = v;
+        }
+        if let Some(v) = env("PALLAMA_LAZY_MODE") {
+            cfg.lazy_mode = v;
+        }
+        if let Some(v) = env("PALLAMA_SERVER_TOOLS") {
+            cfg.server_tools = Some(v);
+        }
+        if let Some(v) = env("PALLAMA_SERVER_TOOLS_RUNTIME") {
+            cfg.server_tools_runtime = Some(v);
+        }
+        if let Some(v) = env("PALLAMA_MCP_SERVERS_CONFIG") {
+            cfg.mcp_servers_config = Some(v);
+        }
+        if let Some(v) = env("PALLAMA_MCP_SERVERS_JSON") {
+            cfg.mcp_servers_json = Some(v);
         }
         if let Some(v) = env("PALLAMA_CACHE_REUSE") {
             cfg.cache_reuse = parse_u32("PALLAMA_CACHE_REUSE", &v)?;
@@ -2058,11 +2235,11 @@ fn parse_i32(key: &str, raw: &str) -> CoreResult<i32> {
         .map_err(|e| CoreError::Config(format!("invalid {key} {raw:?}: {e}")))
 }
 
-/// `lo-hi` decimal CPU range with lo <= hi (upstream `--cpu-range` syntax).
 fn default_stall_secs() -> u64 {
     30
 }
 
+/// `lo-hi` decimal CPU range with lo <= hi (upstream `--cpu-range` syntax).
 fn valid_cpu_range(s: &str) -> bool {
     let Some((lo, hi)) = s.split_once('-') else {
         return false;
@@ -2074,7 +2251,7 @@ fn valid_cpu_range(s: &str) -> bool {
 }
 
 fn default_slots() -> u32 {
-    1
+    0
 }
 
 fn default_true() -> bool {
@@ -2546,6 +2723,93 @@ default_ctx = 16384
     }
 
     #[test]
+    fn unit__validation__mtp_spec_accepted_both_scopes() {
+        let mut cfg = Config {
+            spec: "mtp".into(),
+            ..Config::default()
+        };
+        cfg.model_overrides.insert(
+            "m".into(),
+            ModelOverride {
+                spec: Some("mtp".into()),
+                ..Default::default()
+            },
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn unit__validation__server_tools_runtime_shape_and_pairing() {
+        // Well-formed runtime + tools = ok.
+        let cfg = Config {
+            server_tools: Some("all".into()),
+            server_tools_runtime: Some("ssh:gpu-box".into()),
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_ok());
+        // Bad prefix rejected.
+        let cfg = Config {
+            server_tools: Some("all".into()),
+            server_tools_runtime: Some("jail:strict".into()),
+            ..Config::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("server_tools_runtime"), "{err}");
+        // Bare prefix (no value after colon) rejected.
+        let cfg = Config {
+            server_tools: Some("all".into()),
+            server_tools_runtime: Some("docker:".into()),
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_err());
+        // Runtime without tools = meaningless, rejected.
+        let cfg = Config {
+            server_tools_runtime: Some("ssh:gpu-box".into()),
+            ..Config::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("server_tools"), "{err}");
+    }
+
+    #[test]
+    fn unit__validation__mcp_json_syntax_and_exclusivity() {
+        let cfg = Config {
+            mcp_servers_json: Some(r#"{"servers": {"fs": {"command": "x"}}}"#.into()),
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_ok());
+        let cfg = Config {
+            mcp_servers_json: Some("{not json".into()),
+            ..Config::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("mcp_servers_json"), "{err}");
+        let cfg = Config {
+            mcp_servers_config: Some("/tmp/mcp.json".into()),
+            mcp_servers_json: Some("{}".into()),
+            ..Config::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn unit__validation__eagle3_spec_accepted_both_scopes() {
+        let mut cfg = Config {
+            spec: "eagle3".into(),
+            ..Config::default()
+        };
+        cfg.model_overrides.insert(
+            "m".into(),
+            ModelOverride {
+                spec: Some("eagle3".into()),
+                ..Default::default()
+            },
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
     fn unit__env_override__file_plus_env() {
         // Scoped env mutation: serial test, restored unconditionally.
         let _g = env_lock();
@@ -2673,6 +2937,15 @@ default_ctx = 16384
             c.effective_override_tensor("m2"),
             &["global=CPU".to_string()]
         );
+    }
+
+    /// Test-only resolver (F118: the live auth path is gateway keys.rs
+    /// `ct_eq`, constant-time — this plain `==` must never be reachable
+    /// from request handling).
+    impl Config {
+        fn key_for(&self, presented: &str) -> Option<&ApiKey> {
+            self.keys.iter().find(|k| k.key == presented)
+        }
     }
 
     #[test]
@@ -3091,5 +3364,38 @@ key = "plm_admin"
         ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+mod persist_tests {
+    use super::persist_config;
+
+    #[test]
+    fn unit__persist_config__backs_up_keeps_five_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for i in 0..7 {
+            persist_config(&path, &format!("port = 1143{i}\n")).unwrap();
+        }
+        // Final body wins atomically; no temp residue.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "port = 11436\n");
+        assert!(
+            !path.with_file_name("config.toml.tmp-write").exists(),
+            "temp file must be renamed away"
+        );
+        // Backups exist and never exceed keep-5 (same-ms writes may
+        // collapse onto one name, so only bound the range).
+        let baks = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("config.toml.bak-")
+            })
+            .count();
+        assert!((1..=5).contains(&baks), "baks = {baks}");
     }
 }

@@ -66,6 +66,13 @@ pub struct GgufMeta {
     /// raw-jinja `chat_template.jinja` key; array variants concatenated).
     /// Consumed only by capability heuristics (sentinel tool precheck).
     pub chat_template: Option<String>,
+    /// MTP (multi-token-prediction) head layers baked into the weights:
+    /// `{arch}.n_predict_layers` (llama.cpp master) or
+    /// `{arch}.nextn_predict_layers` (ollama converter) — both accepted,
+    /// first non-zero wins. Drives the `spec = "auto"` draft-mtp lane;
+    /// KV-gated upstream, so tensor-only legacy grafts without the key
+    /// report None (the engine could not boot draft-mtp on them either).
+    pub mtp_layers: Option<u64>,
 }
 
 /// Architectures whose every layer is recurrent (no ctx-growing KV at all).
@@ -476,7 +483,16 @@ fn bad(msg: &str) -> CoreError {
     CoreError::Config(format!("gguf: {msg}"))
 }
 
+/// Real metadata nests arrays at most ~2 deep; 8 is a generous ceiling.
+/// Without it a crafted file of nested-array headers recurses one stack
+/// frame per ~12 bytes until the stack overflows (F125).
+const MAX_ARRAY_DEPTH: u8 = 8;
+
 fn read_value(cur: &mut Cursor<'_>, vtype: u32) -> CoreResult<GgufValue> {
+    read_value_at(cur, vtype, 0)
+}
+
+fn read_value_at(cur: &mut Cursor<'_>, vtype: u32, depth: u8) -> CoreResult<GgufValue> {
     Ok(match vtype {
         0 => GgufValue::U8(cur.u8()?),
         1 => GgufValue::I8(i8::from_le_bytes([cur.u8()?])),
@@ -488,6 +504,11 @@ fn read_value(cur: &mut Cursor<'_>, vtype: u32) -> CoreResult<GgufValue> {
         7 => GgufValue::Bool(cur.u8()? != 0),
         8 => GgufValue::String(cur.string()?),
         9 => {
+            if depth >= MAX_ARRAY_DEPTH {
+                return Err(bad(&format!(
+                    "GGUF array nesting exceeds depth cap {MAX_ARRAY_DEPTH}"
+                )));
+            }
             let elem_type = cur.u32()?;
             let count = cur.u64()?;
             if count > MAX_ARRAY_ITEMS {
@@ -497,7 +518,7 @@ fn read_value(cur: &mut Cursor<'_>, vtype: u32) -> CoreResult<GgufValue> {
             }
             let mut items = Vec::new();
             for _ in 0..count {
-                items.push(read_value(cur, elem_type)?);
+                items.push(read_value_at(cur, elem_type, depth + 1)?);
             }
             GgufValue::Array(items)
         }
@@ -515,15 +536,16 @@ fn recurrent_layer_array(kvs: &[(String, GgufValue)], arch: &str) -> Option<Vec<
     kvs.iter()
         .find(|(k, _)| k == &format!("{arch}.attention.recurrent_layers"))
         .and_then(|(_, v)| match v {
-            GgufValue::Array(items) => Some(
-                items
-                    .iter()
-                    .filter_map(|i| match i {
-                        GgufValue::Bool(b) => Some(*b),
-                        _ => None,
-                    })
-                    .collect::<Vec<bool>>(),
-            ),
+            // F124: strict per-layer arrays — one wrong-typed item makes
+            // the WHOLE array absent (conservative default) instead of
+            // silently shifting every later layer index.
+            GgufValue::Array(items) => items
+                .iter()
+                .map(|i| match i {
+                    GgufValue::Bool(b) => Some(*b),
+                    _ => None,
+                })
+                .collect::<Option<Vec<bool>>>(),
             _ => None,
         })
         .filter(|items| !items.is_empty())
@@ -584,12 +606,11 @@ pub fn parse_metadata(buf: &[u8]) -> CoreResult<(GgufMeta, usize)> {
     };
     let sliding_window_per_layer = find(format!("{arch}.attention.sliding_window"))
         .and_then(|v| match v {
-            GgufValue::Array(items) => Some(
-                items
-                    .iter()
-                    .filter_map(GgufValue::as_u64)
-                    .collect::<Vec<u64>>(),
-            ),
+            // F124: strict — see recurrent_layers note above.
+            GgufValue::Array(items) => items
+                .iter()
+                .map(GgufValue::as_u64)
+                .collect::<Option<Vec<u64>>>(),
             _ => None,
         })
         .filter(|items| !items.is_empty());
@@ -631,6 +652,9 @@ pub fn parse_metadata(buf: &[u8]) -> CoreResult<(GgufMeta, usize)> {
         sliding_window_per_layer,
         full_attention_interval: get(format!("{arch}.full_attention_interval")),
         chat_template: extract_chat_template(&kvs),
+        mtp_layers: get(format!("{arch}.n_predict_layers"))
+            .filter(|&n| n > 0)
+            .or_else(|| get(format!("{arch}.nextn_predict_layers")).filter(|&n| n > 0)),
         architecture: arch,
     };
     Ok((meta, meta_end))
@@ -710,6 +734,46 @@ mod tests {
             put_value(&mut b, v);
         }
         b
+    }
+
+    #[test]
+    fn unit__gguf_mtp_layers__master_key_parsed() {
+        let buf = build_gguf(&[
+            ("general.architecture", GgufValue::String("qwen35".into())),
+            ("qwen35.n_predict_layers", GgufValue::U32(1)),
+        ]);
+        let (m, _) = parse_metadata(&buf).unwrap();
+        assert_eq!(m.mtp_layers, Some(1));
+    }
+
+    #[test]
+    fn unit__gguf_mtp_layers__ollama_converter_key_parsed() {
+        let buf = build_gguf(&[
+            ("general.architecture", GgufValue::String("qwen35".into())),
+            ("qwen35.nextn_predict_layers", GgufValue::U32(1)),
+        ]);
+        let (m, _) = parse_metadata(&buf).unwrap();
+        assert_eq!(m.mtp_layers, Some(1));
+    }
+
+    #[test]
+    fn unit__gguf_mtp_layers__master_key_wins_and_zero_is_absent() {
+        let both = build_gguf(&[
+            ("general.architecture", GgufValue::String("qwen35".into())),
+            ("qwen35.n_predict_layers", GgufValue::U32(1)),
+            ("qwen35.nextn_predict_layers", GgufValue::U32(3)),
+        ]);
+        let (m, _) = parse_metadata(&both).unwrap();
+        assert_eq!(m.mtp_layers, Some(1)); // master key takes precedence
+        let zero = build_gguf(&[
+            ("general.architecture", GgufValue::String("qwen35".into())),
+            ("qwen35.n_predict_layers", GgufValue::U32(0)),
+        ]);
+        let (m, _) = parse_metadata(&zero).unwrap();
+        assert_eq!(m.mtp_layers, None); // 0 = not an MTP model
+        let plain = build_gguf(&[("general.architecture", GgufValue::String("qwen35".into()))]);
+        let (m, _) = parse_metadata(&plain).unwrap();
+        assert_eq!(m.mtp_layers, None);
     }
 
     fn put_str(b: &mut Vec<u8>, s: &str) {
@@ -1278,4 +1342,62 @@ mod tests {
         let (q, _) = parse_metadata(&build_gguf(&qwen35_mla())).unwrap();
         assert!(!q.lint().iter().any(|w| w.contains("hybrid-linear")));
     }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod depth_tests {
+    use super::*;
+
+    #[test]
+    fn unit__gguf_depth__nested_arrays_capped_not_stack_overflow() {
+        // F125: one KV whose value is a chain of 64 nested single-element
+        // array headers (~12 bytes per level) — must error at the depth
+        // cap instead of recursing the stack into oblivion.
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes()); // tensors
+        b.extend_from_slice(&1u64.to_le_bytes()); // one KV pair
+                                                  // key "deep"
+        b.extend_from_slice(&4u64.to_le_bytes());
+        b.extend_from_slice(b"deep");
+        // Value: type 9 (array) ONCE — nested levels are just
+        // [elem_type][count] pairs with no repeated type tag.
+        b.extend_from_slice(&9u32.to_le_bytes());
+        for _ in 0..64 {
+            b.extend_from_slice(&9u32.to_le_bytes()); // elem type: array
+            b.extend_from_slice(&1u64.to_le_bytes()); // count: 1
+        }
+        b.extend_from_slice(&0u32.to_le_bytes()); // innermost elem: u8
+        b.push(7);
+        let res = parse_metadata(&b);
+        let Err(err) = res else {
+            panic!("depth cap must fire");
+        };
+        assert!(err.to_string().contains("depth"), "{err}");
+    }
+}
+
+/// Env-gated live check against a real MTP-bearing GGUF
+/// (`PALLAMA_TEST_MTP_GGUF=/path/to/model.gguf cargo test mtp_real`).
+/// Skips silently when the env var is unset (CI has no such file).
+#[test]
+#[allow(non_snake_case)] // integration__ prefix matches the suite convention
+fn integration__gguf_mtp_layers__real_file_when_provided() {
+    let Ok(path) = std::env::var("PALLAMA_TEST_MTP_GGUF") else {
+        eprintln!("skipping: PALLAMA_TEST_MTP_GGUF not set");
+        return;
+    };
+    let meta = read_metadata_file(std::path::Path::new(&path))
+        .unwrap_or_else(|e| panic!("parse {path}: {e}"));
+    assert!(
+        meta.mtp_layers.is_some(),
+        "real MTP GGUF reported no mtp_layers: arch {}",
+        meta.architecture
+    );
+    eprintln!(
+        "arch={} mtp_layers={:?} block_count={:?}",
+        meta.architecture, meta.mtp_layers, meta.block_count
+    );
 }

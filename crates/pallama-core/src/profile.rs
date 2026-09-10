@@ -3,13 +3,16 @@
 //! applied in order. Every emitted flag is validated against the installed
 //! engine's manifest; a needed-but-missing flag is a hard error naming it.
 //!
-//! Pure: no I/O, no time, no randomness — table-testable. The supervisor
+//! Near-pure: no time, no randomness — table-testable. The one I/O
+//! touch is read-only `fs::metadata` on the optional mmproj projector
+//! (sizing must see the real file). The supervisor
 //! picks the endpoint (free port / socket) and passes it in.
 
 use std::collections::BTreeSet;
 
 use crate::config::{Config, ModelOverride};
 use crate::gguf::GgufMeta;
+use crate::hardware::GpuInfo;
 use crate::hardware::Hardware;
 
 /// Where the child will listen (supervisor picks port/sock first; the
@@ -46,6 +49,11 @@ pub struct ProfileInput<'a> {
     pub engine_tag: &'a str,
     /// Capability manifest flag set of the ACTIVE engine.
     pub supported_flags: &'a BTreeSet<String>,
+    /// `--spec-type` values the ACTIVE engine advertises (manifest help
+    /// parsing). Gates `spec = "mtp"` (draft-mtp) with a fail-fast error
+    /// naming the engine update path — an unadvertised value would die in
+    /// the child with an opaque argv error.
+    pub spec_types: &'a [String],
     /// Dialect selector: the engines.kind column owns this truth (the
     /// manifest carries no kind). `MistralRs` compiles a minimal profile —
     /// the child CLI grammar is foreign and `MistralRsEngine` argv
@@ -66,6 +74,14 @@ pub struct ProfileInput<'a> {
     /// VRAM estimate (ngl ladder, KV, cache-ram) sizes against the card
     /// the child will actually land on.
     pub device_hint: Option<&'a str>,
+    /// FULL engine device census BEFORE single-card scoping: the build
+    /// class of the engine binary (e.g. a vulkan build enumerates the
+    /// integrated GPU alongside discrete cards) is a property of the
+    /// CENSUS, not of the card the spawn lands on — `hardware.gpus` may
+    /// be scoped to just the picked card, so build-class detection
+    /// (vulkan-class slot capping in `auto_slots_capacity`) reads THIS.
+    /// Capacity math never does: it stays on `hardware`.
+    pub engine_census: Vec<GpuInfo>,
     /// Discrete GPUs NOT taken by the auto-pick (or by manual `devices`),
     /// best-free-first. Drives placement RECOMMENDATIONS only (spec-draft
     /// and mmproj offload hints) — never a silent placement decision.
@@ -98,6 +114,13 @@ pub struct Profile {
     /// Feeds the co-residency planner (A15); None when GGUF geometry is
     /// missing.
     pub kv_est_bytes: Option<u64>,
+    /// `Some((per_slot_ctx, slots))` when auto-fit divided the default ctx
+    /// to earn parallel slots (see `AUTOFIT_CTX_FLOOR`): the emitted
+    /// `--ctx-size` total buys `-np slots` at `per_slot_ctx` each.
+    /// `Profile.ctx` already reports `per_slot_ctx`; this field exists so
+    /// telemetry can distinguish "ctx 4096 because user pinned" from
+    /// "ctx 4096 because auto-fit traded depth for concurrency".
+    pub ctx_autofit: Option<(u32, u32)>,
 }
 
 /// Tuning knobs the bench grid may override; None = use heuristic value.
@@ -155,9 +178,29 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     argv.push(input.model_name.to_string());
 
     // --- 2. templating/metrics/attention + ctx
-    let ctx = tuning
+    let base_ctx = tuning
         .ctx
         .unwrap_or_else(|| resolve_ctx(input, overlay, &mut warnings));
+    // --- 2a. slots BEFORE the ctx push: auto slots scale the TOTAL ctx
+    // (upstream divides --ctx-size across -np slots), so the emitted ctx
+    // and every downstream capacity rule (offload resolver, KV ladder, KV
+    // estimate) must see the scaled total. Each slot keeps `base_ctx` —
+    // Profile.ctx reports the per-slot value so prompt preflight bounds a
+    // single request correctly.
+    let vram_bytes = Hardware::bytes(input.hardware.total_vram_mib());
+    // default_ctx is a CEILING auto-fit may divide; tuning (bench) and
+    // overlay ctx are hard pins — never divided.
+    let ctx_pinned = tuning.ctx.is_some() || overlay.ctx.is_some();
+    let rs = resolve_slots(
+        input,
+        overlay,
+        base_ctx,
+        vram_bytes,
+        ctx_pinned,
+        &mut warnings,
+    );
+    let slots = rs.slots;
+    let ctx = rs.total_ctx;
     let fa = match tuning.fa {
         Some(true) => "on",
         Some(false) => "off",
@@ -205,15 +248,23 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // comfortable full fit pins 999; no GPU pins 0 (labeled); the tight
     // middle keeps `auto` — the engine's fine-grained layer juggling beats
     // our estimate there, and guessing wrong OOMs loads.
-    let vram_bytes = Hardware::bytes(input.hardware.total_vram_mib());
     argv.push("--gpu-layers".into());
     let (gpu_layers, gpu_label) = resolve_gpu_offload(input, ctx, vram_bytes, &mut warnings);
     argv.push(gpu_layers.into());
 
-    // --- 5. prefix-cache chunk reuse
+    // --- 5. prefix-cache chunk reuse. Upstream disables cache_reuse
+    // whenever a multimodal projector is attached ("cache_reuse is not
+    // supported by multimodal") — emitting it on VL spawns is dead argv
+    // that misleads profile readers, so skip and say why.
     if config.cache_reuse > 0 {
-        argv.push("--cache-reuse".into());
-        argv.push(config.cache_reuse.to_string());
+        if input.mmproj_path.is_some() {
+            warnings.push(
+                "cache_reuse skipped: upstream disables it with a multimodal projector attached (mmproj); prefix reuse is unavailable on VL spawns".into(),
+            );
+        } else {
+            argv.push("--cache-reuse".into());
+            argv.push(config.cache_reuse.to_string());
+        }
     }
 
     // --- 6. KV cache quantization. Bench-adopted tuning wins, then an
@@ -256,17 +307,12 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         argv.push(config.idle_sleep_secs.to_string());
     }
 
-    // --- 9. slots: 1 = full-speed single client (default, ollama-parity
-    // UX); 0 = upstream auto multi-slot for concurrent clients. Overlay
-    // slots shadow the global for this model; the supervisor's LC4
-    // adaptive adoption fills in ONLY where the user set nothing.
-    let slots = overlay.slots.unwrap_or(input.config.slots);
+    // --- 9. slots (resolved at rule 2a: `slots = 0` pallama-auto sizes
+    // concurrency from capacity and scales the total ctx; explicit pins
+    // pass through). The emitted value is always >= 1 — the auto path
+    // subsumes the old upstream `-1` passthrough.
     argv.push("-np".into());
-    if slots == 0 {
-        argv.push("-1".into());
-    } else {
-        argv.push(slots.to_string());
-    }
+    argv.push(slots.to_string());
 
     // --- 10. rpc + loras
     // C6: per-model override replaces the global list (empty = inherit).
@@ -426,7 +472,51 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // --- 11. speculative decoding
     let spec_mode = overlay.spec.as_deref().unwrap_or(config.spec.as_str());
     if spec_mode == "auto" {
-        push_spec_args(input, &mut argv, &mut warnings)?;
+        // Embedded MTP head wins over a catalog draft pair: it drafts from
+        // the target's own trained weights (no separate model to pull) —
+        // the exact lane ollama auto-enables for MTP-bearing GGUFs. Still
+        // opt-in: fires only because the user set spec = "auto"
+        // (spec = "off" never reaches this branch).
+        let embedded_mtp = if let Some(n_layers) = input.gguf.mtp_layers {
+            if input.supported_flags.contains("--spec-type")
+                && input.spec_types.iter().any(|t| t == "draft-mtp")
+            {
+                argv.push("--spec-type".into());
+                argv.push("draft-mtp".into());
+                // Draft steps are bounded by the trained head count — more
+                // is pure verification overhead. Cap at 2 until benched.
+                let n_max = n_layers.min(2);
+                if input.supported_flags.contains("--spec-draft-n-max") {
+                    argv.push("--spec-draft-n-max".into());
+                    argv.push(n_max.to_string());
+                }
+                if input
+                    .supported_flags
+                    .contains("--spec-draft-backend-sampling")
+                {
+                    argv.push("--spec-draft-backend-sampling".into());
+                }
+                warnings.push(format!(
+                    "spec auto: MTP head ({n_layers} layer(s)) baked into the GGUF — \
+                     draft-mtp enabled (n-max {n_max}); set spec = \"off\" to disable, \
+                     bench before adopting at scale"
+                ));
+                true
+            } else {
+                warnings.push(format!(
+                    "spec auto: GGUF carries an MTP head but engine {} lacks \
+                     draft-mtp — using the draft-pair path instead; run: \
+                     pallama engine update",
+                    input.engine_tag
+                ));
+                false
+            }
+        } else {
+            false
+        };
+        if !embedded_mtp {
+            push_spec_args(input, &mut argv, &mut warnings)?;
+        }
     } else if is_ngram_spec(spec_mode) {
         // Self-drafting n-gram speculation: no draft model to pull; drafts
         // from the context's own n-grams ("ngram" is pallama shorthand for
@@ -439,12 +529,84 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         } else {
             spec_mode.into()
         });
+    } else if spec_mode == "mtp" {
+        // Multi-token-prediction head baked into the GGUF itself (no
+        // separate draft model). The head must ship IN the weights — e.g.
+        // the Unsloth Qwen3.5-9B GGUF carries none — so this stays strictly
+        // opt-in, like every other spec mode (never default-on: ngram
+        // precedent showed unmeasured speculation can net-lose).
+        if !input.supported_flags.contains("--spec-type")
+            || !input.spec_types.iter().any(|t| t == "draft-mtp")
+        {
+            return Err(format!(
+                "spec = \"mtp\" needs an engine advertising draft-mtp; \
+                 engine {} does not — run: pallama engine update",
+                input.engine_tag
+            ));
+        }
+        if input.gguf.mtp_layers.is_none() {
+            warnings.push(
+                "spec = \"mtp\" but this GGUF carries no MTP head (no \
+                 n_predict_layers metadata) — the engine will likely fail to \
+                 create an MTP context; pull an MTP-bearing build \
+                 (e.g. unsloth ...-MTP-GGUF)"
+                    .into(),
+            );
+        }
+        argv.push("--spec-type".into());
+        argv.push("draft-mtp".into());
+    } else if let Some(spec_val) = match spec_mode {
+        "eagle3" => Some("draft-eagle3"),
+        "dflash" => Some("draft-dflash"),
+        "dspark" => Some("draft-dspark"),
+        _ => None,
+    } {
+        // Trained / block-diffusion draft lanes: a SEPARATE draft model
+        // (speculator GGUF or dflash/dspark sibling) paired with the
+        // target — unlike MTP there is a real second file to resolve and
+        // place (upstream asserts ctx_dft for all three). Force-modes for
+        // users who benched them; auto keeps its own precedence.
+        if !input.supported_flags.contains("--spec-type")
+            || !input.spec_types.iter().any(|t| t == spec_val)
+        {
+            return Err(format!(
+                "spec = {spec_mode:?} needs an engine advertising {spec_val}; \
+                 engine {} does not — run: pallama engine update",
+                input.engine_tag
+            ));
+        }
+        match crate::catalog::spec_pair_for_typed(input.model_name, spec_val) {
+            Some(pair) => {
+                if let Some(draft) = input.draft_path {
+                    argv.push("--spec-type".into());
+                    argv.push(spec_val.into());
+                    argv.push("--spec-draft-model".into());
+                    argv.push(draft.to_string());
+                } else {
+                    // Same always-hard-error discipline as the auto pair:
+                    // never boot dense when the user asked for a draft lane.
+                    return Err(format!(
+                        "spec={spec_mode} for {} but the draft model is not pulled; run: pallama pull {}",
+                        input.model_name, pair.draft_repo
+                    ));
+                }
+            }
+            None => {
+                return Err(format!(
+                    "spec = {spec_mode:?} has no {spec_val} draft pair for {} in the catalog; \
+                     running dense instead means un-training your intent — pick another \
+                     spec mode (\"auto\" pairs automatically, \"mtp\" uses a baked-in head)",
+                    input.model_name
+                ));
+            }
+        }
     }
 
     // --- 11b. spec-draft placement (only when a draft model is actually
-    // resolved: spec = "auto" + pulled pair). Pin the draft to P-cores /
-    // a spare GPU / fewer threads so it stops stealing from the target.
-    if spec_mode == "auto" && input.draft_path.is_some() {
+    // resolved: spec = "auto"/"eagle3"/"dflash"/"dspark" + pulled pair).
+    // Pin the draft to P-cores / a spare GPU / fewer threads so it stops
+    // stealing from the target.
+    if matches!(spec_mode, "auto" | "eagle3" | "dflash" | "dspark") && input.draft_path.is_some() {
         if !config.spec_draft_device.is_empty() {
             argv.push("--spec-draft-device".into());
             argv.push(config.spec_draft_device.clone());
@@ -587,31 +749,81 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         }
     }
 
+    // --- 11z. on-demand tensor loading (`--lazy-mode`): big-tensor
+    // mmap reads from disk instead of keeping them resident — the
+    // big-MoE RAM-relief lever. Emitted ONLY on deviation: "auto" is
+    // already the engine default (tensors > 4 GiB), so default config
+    // stays argv-clean; a non-default mode on an engine without the
+    // flag is a teaching warning (never a silent no-op of user intent).
+    let lazy_mode = overlay
+        .lazy_mode
+        .as_deref()
+        .unwrap_or(config.lazy_mode.as_str());
+    if lazy_mode != "auto" {
+        if input.supported_flags.contains("--lazy-mode") {
+            argv.push("--lazy-mode".into());
+            argv.push(lazy_mode.into());
+        } else {
+            warnings.push(format!(
+                "lazy_mode = {lazy_mode:?} skipped: engine {} lacks --lazy-mode \
+                 (engine update recommended)",
+                input.engine_tag
+            ));
+        }
+    }
+
+    // --- 11y. experimental upstream agent-tooling passthrough
+    // (`--tools` / `--tools-runtime` / `--mcp-servers-config|-json`).
+    // Opt-in only — never defaulted. The engine limits CORS to localhost
+    // when any of these is set; a flag-less engine degrades to a teaching
+    // warning (user intent stays visible). The MCP config PATH is
+    // existence-checked here: a typo should fail at profile-compile,
+    // not after a 5 s boot (mirrors the draft-model discipline).
+    for (flag, value) in [
+        ("--tools", config.server_tools.as_deref()),
+        ("--tools-runtime", config.server_tools_runtime.as_deref()),
+        ("--mcp-servers-config", config.mcp_servers_config.as_deref()),
+        ("--mcp-servers-json", config.mcp_servers_json.as_deref()),
+    ] {
+        let Some(value) = value else { continue };
+        if flag == "--mcp-servers-config" && !std::path::Path::new(value).is_file() {
+            return Err(format!(
+                "mcp_servers_config = {value:?} does not exist — fix the path \
+                 (engine would refuse the MCP definitions at boot)"
+            ));
+        }
+        if input.supported_flags.contains(flag) {
+            argv.push(flag.into());
+            argv.push(value.into());
+        } else {
+            warnings.push(format!(
+                "{flag} skipped: engine {} lacks the flag (engine update recommended)",
+                input.engine_tag
+            ));
+        }
+    }
+
     // --- 12. prompt-cache budget + vision projector
     if config.cache_ram_mb > 0 {
         // The prompt cache shares physical RAM with everything else on the
         // machine; the upstream-style 8 GiB default starves small-RAM boxes
-        // into swap death. Cap at 30% of physical RAM (measured live: 13 GiB
-        // box + 8192 budget -> 8.3 GiB child RSS plateau, system-wide thrash).
+        // into swap death. Cap at an adaptive share of physical RAM
+        // (A16: prefix-heavy traffic earns 40%, cache-cold releases to
+        // 20%, static 30%; measured live: 13 GiB box + 8192 budget ->
+        // 8.3 GiB child RSS plateau, system-wide thrash).
         // Escape hatches: cache_ram_mb = 0 (unlimited), or a per-model
-        // `extra_args = ["--cache-ram", "<MiB>"]` override (appended later,
-        // last flag wins upstream).
-        let budget = if input.hardware.total_ram_mib > 0 {
-            // Adaptive (A16): prefix-heavy traffic (hit rate > 0.5) earns a
-            // 40% cap, cache-cold traffic (< 0.1) releases to 20%; the
-            // static clamp is 30%. The hint comes from the live daemon's
-            // EWMA — CLI/bench compiles pass None and keep 30%.
-            let pct = match input.cache_hit_rate {
-                Some(h) if h > 0.5 => 40,
-                Some(h) if h < 0.1 => 20,
-                _ => 30,
-            };
-            let cap = input.hardware.total_ram_mib * pct / 100;
-            match u64::try_from(config.cache_ram_mb) {
+        // `extra_args = ["--cache-ram", "<MiB>"]` override (appended
+        // later, last flag wins upstream).
+        let budget = match effective_cache_ram_mib(input) {
+            None => config.cache_ram_mb,
+            Some(cap) => match u64::try_from(config.cache_ram_mb) {
                 Ok(requested) if requested > cap => {
                     warnings.push(format!(
                         "cache_ram_mb {} clamped to {} ({}% of {} MiB RAM, hit-rate {}); override via model_overrides extra_args --cache-ram or set 0 = unlimited",
-                        config.cache_ram_mb, cap, pct, input.hardware.total_ram_mib,
+                        config.cache_ram_mb,
+                        cap,
+                        cache_ram_pct(input.cache_hit_rate),
+                        input.hardware.total_ram_mib,
                         input
                             .cache_hit_rate
                             .map_or_else(|| "n/a".to_string(), |h| format!("{h:.2}"))
@@ -619,9 +831,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
                     i64::try_from(cap).unwrap_or(i64::MAX)
                 }
                 _ => config.cache_ram_mb,
-            }
-        } else {
-            config.cache_ram_mb
+            },
         };
         argv.push("--cache-ram".into());
         argv.push(budget.to_string());
@@ -645,7 +855,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
                 "kv_unified = {on} skipped: engine lacks {flag} (engine update recommended)"
             ));
         }
-    } else if input.supported_flags.contains("--kv-unified") {
+    } else if kv_unified_emitted(input) {
         // Default ON: the unified buffer is upstream's mainline KV path
         // (their own default when slots are auto); K-shift prefix reuse
         // (our --cache-reuse 256) rides it even at -np 1. Opt out with
@@ -818,10 +1028,13 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             argv.push("-mm".into());
             argv.push(mmproj.to_string());
         } else {
-            eprintln!(
-                "pallama profile: model {} has a multimodal projector but engine {} lacks -mm/--mmproj; vision disabled (engine update)",
+            // F108: warnings is the teaching channel (ps/show/tracing) —
+            // eprintln! bypassed it and vanished under daemons.
+            warnings.push(format!(
+                "mmproj skipped: model {} has a multimodal projector but \
+                 engine {} lacks -mm/--mmproj; vision disabled (engine update)",
                 input.model_name, input.engine_tag
-            );
+            ));
         }
     }
 
@@ -1119,11 +1332,16 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         ));
     }
 
-    // KV estimate for the co-residency planner: f16 bytes scaled by the
-    // quantization grade actually emitted above. Hybrid-linear models with
-    // a provable recurrent/full split already get the true (fractional) KV
-    // from `kv_f16_bytes`; warn exactly when the split is NOT provable, so
-    // an inflated estimate is never a surprise (R8).
+    // KV estimate for the co-residency planner. Unified layout: the buffer
+    // lives in the --cache-ram (system RAM) budget, so VRAM only sees the
+    // measured working-set floor — charging full f16 here made the planner
+    // read unified spawns as 2-4x their real VRAM demand and downgrade or
+    // evict on phantom pressure (KV quantization shrinks the RAM buffer,
+    // not this floor). Classic path: f16 bytes scaled by the quantization
+    // grade actually emitted above. Hybrid-linear models with a provable
+    // recurrent/full split already get the true (fractional) KV from
+    // `kv_f16_bytes`; warn exactly when the split is NOT provable, so an
+    // inflated estimate is never a surprise (R8).
     if input.gguf.attention_class() == crate::gguf::AttentionClass::HybridLinear
         && !input.gguf.recurrent_split_provable()
     {
@@ -1134,21 +1352,32 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             input.gguf.architecture
         ));
     }
-    let kv_est_bytes = kv_f16_bytes(input, ctx).map(|f16| match kv_type.as_deref() {
-        Some("q8_0") => f16 / 2,
-        Some("q4_0") => f16 / 4,
-        Some("q4_1") => f16 * 9 / 20,
-        Some("q5_0") => f16 * 11 / 32,
-        Some("q5_1") => f16 * 3 / 8,
-        _ => f16,
-    });
+    let kv_est_bytes = if kv_unified_emitted(input) {
+        Some(KV_UNIFIED_VRAM_FLOOR_BYTES)
+    } else {
+        kv_f16_bytes(input, ctx).map(|f16| match kv_type.as_deref() {
+            Some("q8_0") => f16 / 2,
+            Some("q4_0") => f16 / 4,
+            Some("q4_1") => f16 * 9 / 20,
+            Some("q5_0") => f16 * 11 / 32,
+            Some("q5_1") => f16 * 3 / 8,
+            _ => f16,
+        })
+    };
 
     Ok(Profile {
         argv,
         warnings,
-        ctx,
+        // per-slot ctx: with auto slots the argv --ctx-size is the scaled
+        // TOTAL, but a single request lives in ONE slot — preflight must
+        // bound prompts by what a slot can hold, not the total
+        ctx: rs.per_slot_ctx,
         gpu: gpu_label,
         kv_est_bytes,
+        // Some((per_slot_ctx, slots)) when auto-fit divided the default
+        // ctx to earn parallel slots; telemetry (`ps`, events) uses this
+        // to surface the trade instead of silently shrinking ctx.
+        ctx_autofit: rs.autofit,
     })
 }
 
@@ -1156,6 +1385,35 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
 /// (embeddinggemma sets `n_batch` = `n_ubatch` = 2048). One embedding doc
 /// must fit a single micro-batch; a full-ctx ubatch OOMs tight GPUs.
 pub const LATE_CHUNK_UBATCH_DEFAULT: u32 = 2048;
+
+/// VRAM the unified KV cache still touches when `--kv-unified` hosts the
+/// buffer in the `--cache-ram` (system RAM) budget: the resident slice +
+/// paging working set. Measured as part of the ~548 MiB non-weights
+/// overhead of a fully-offloaded 16k-ctx spawn (CUDA context + compute
+/// buffers included) on an 8 GiB card — see `resolve_gpu_offload`.
+/// Public: the gateway's per-request `num_ctx` preflight charges the same
+/// floor when the spawn carries `--kv-unified` (see `kv_unified_for`).
+pub const KV_UNIFIED_VRAM_FLOOR_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Fixed spawn overhead (CUDA/Vulkan context, graphs, compute buffers)
+/// charged INSTEAD of a percentage margin once the KV term is
+/// floor-charged: the classic 15% reserve mostly stood for KV
+/// uncertainty, which `--kv-unified` removes. Measured ~548 MiB total
+/// non-weights overhead on a fully-offloaded b10809 spawn; 700 MiB adds
+/// margin for bigger compute buffers (long ctx, mmproj bursts).
+const UNIFIED_SPAWN_OVERHEAD_BYTES: u64 = 700 * 1024 * 1024;
+
+/// VRAM that ctx-scaled compute buffers cost per token of TOTAL ctx on
+/// vulkan-class builds (mixed integrated+discrete census) when a
+/// projector is attached — the one combination whose allocation footprint
+/// pallama cannot see ahead of spawn. Measured on an 8 GiB card
+/// (Qwen3.5-9B `Q4_K_M` + mmproj, `--kv-unified`): total ctx 16384 boots
+/// clean (load 3.5s, 88 t/s system), 32768 boots degraded (load 27s,
+/// 47 t/s), 65536 OOMs or crawls at 96% commitment — while the same
+/// shapes without the projector, and CUDA builds with it, stay healthy.
+/// Bounds the true per-token cost to (21, 43) KiB; 24 KiB sits just
+/// above the np2 failure edge. See `auto_slots_capacity`.
+const UNIFIED_COMPUTE_PER_TOKEN_BYTES: u64 = 24 * 1024;
 
 /// Raise an existing `<flag> <value>` argv pair to at least `floor`
 /// (late-chunking correctness: one doc must fit one ubatch). No-op when
@@ -1192,9 +1450,29 @@ fn compile_mistralrs(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Prof
     let ctx = tuning
         .ctx
         .unwrap_or_else(|| resolve_ctx(input, input.overlay, &mut Vec::new()));
-    let slots = input.overlay.slots.unwrap_or(input.config.slots);
+    let mut slots = input.overlay.slots.unwrap_or(input.config.slots);
     let mut argv: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+    if input
+        .overlay
+        .deterministic
+        .unwrap_or(input.config.deterministic)
+    {
+        if slots > 1 {
+            warnings.push(format!(
+                "deterministic = true pins slots = 1 — explicit slots = {slots} ignored: \
+                 multi-slot batches perturb logits in near-tie positions and break \
+                 token-for-token greedy reproducibility; drop one of the two knobs"
+            ));
+        } else if slots == 0 {
+            warnings.push(
+                "deterministic = true: slots pinned to 1 — concurrent streams queue \
+                 instead of batching; unset the pin to recover multi-slot throughput"
+                    .to_string(),
+            );
+        }
+        slots = 1;
+    }
     if slots != 0 {
         argv.push("-np".into());
         argv.push(slots.to_string());
@@ -1217,16 +1495,44 @@ fn compile_mistralrs(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Prof
     // Attention backend: classic KV (sized by ctx) instead of paged KV
     // (sized by VRAM fraction) — the only fit for big vision models on
     // 8 GB cards, live-proven with qwen3.5-9b + projector.
-    if let Some(pa) = input.config.mistralrs_paged_attn {
-        if input.supported_flags.contains("--paged-attn") {
-            argv.push("--paged-attn".into());
-            argv.push(if pa { "on".into() } else { "off".into() });
-        } else {
-            warnings.push(
-                "config mistralrs_paged_attn set but this engine lacks \
-                 --paged-attn; flag skipped (pallama engine install updates it)"
-                    .into(),
-            );
+    match input.config.mistralrs_paged_attn {
+        Some(pa) => {
+            if input.supported_flags.contains("--paged-attn") {
+                argv.push("--paged-attn".into());
+                argv.push(if pa { "on".into() } else { "off".into() });
+            } else {
+                warnings.push(
+                    "config mistralrs_paged_attn set but this engine lacks \
+                     --paged-attn; flag skipped (pallama engine install updates it)"
+                        .into(),
+                );
+            }
+        }
+        None => {
+            // Auto fallback: upstream budgets paged KV as a fraction of
+            // TOTAL VRAM; once weights(+projector) consume most of the
+            // card the block pool computes to zero and the load hard-fails
+            // ("Num GPU blocks is 0", live-proven with a 9B vision model
+            // on an 8 GiB card). Classic ctx-sized KV serves there.
+            if input.supported_flags.contains("--paged-attn") {
+                let vram_bytes = Hardware::bytes(input.hardware.total_vram_mib());
+                let mmproj = input
+                    .mmproj_path
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .map_or(0, |m| m.len());
+                let resident = input.model_bytes.saturating_add(mmproj);
+                if vram_bytes > 0 && resident > vram_bytes * 75 / 100 {
+                    argv.push("--paged-attn".into());
+                    argv.push("off".into());
+                    warnings.push(
+                        "paged-attn auto-off: weights+projector occupy >75% of VRAM and \
+                         upstream's paged-KV block pool computes to zero (load would fail with \
+                         'Num GPU blocks is 0'); classic ctx-sized KV serves instead — set \
+                         mistralrs_paged_attn = true to override"
+                            .into(),
+                    );
+                }
+            }
         }
     }
     Profile {
@@ -1235,6 +1541,7 @@ fn compile_mistralrs(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Prof
         ctx,
         gpu: "auto",
         kv_est_bytes: None,
+        ctx_autofit: None,
     }
 }
 
@@ -1244,23 +1551,44 @@ fn resolve_ctx(
     warnings: &mut Vec<String>,
 ) -> u32 {
     let requested = overlay.ctx.unwrap_or(input.config.default_ctx);
-    match input.gguf.context_length {
-        Some(train) if requested > u32::try_from(train).unwrap_or(u32::MAX) => {
-            warnings.push(format!(
-                "ctx {requested} clamped to model context_length {train} (GGUF metadata)"
-            ));
-            u32::try_from(train).unwrap_or(u32::MAX)
-        }
-        Some(_) => requested,
-        None => {
-            warnings.push(
-                "ctx not clamped: GGUF lacks context_length (rule skipped, not estimated)".into(),
-            );
+    // F109: when YaRN ctx extension is active the usable window is the
+    // TRAINED length stretched by ctx_extend — clamping to the bare
+    // trained length defeated the feature (extend 2.0 on a 64k model
+    // could never run past 65536 no matter what ctx asked for).
+    let extend = input.config.effective_ctx_extend(input.model_name);
+    if let Some(train_raw) = input.gguf.context_length {
+        let train = u32::try_from(train_raw).unwrap_or(u32::MAX);
+        let ceiling = if extend > 1.0 {
+            // train <= u32::MAX and extend is clamped > 1.0 by config
+            // validation, and the min() keeps the product inside u32
+            // range before the cast — no sign or truncation hazard.
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let stretched = (f64::from(train) * extend).floor().min(f64::from(u32::MAX)) as u64;
+            u32::try_from(stretched).unwrap_or(u32::MAX)
+        } else {
+            train
+        };
+        if requested > ceiling {
+            if extend > 1.0 {
+                warnings.push(format!(
+                    "ctx {requested} clamped to yarn-stretched window {ceiling} (trained {train} x ctx_extend {extend})"
+                ));
+            } else {
+                warnings.push(format!(
+                    "ctx {requested} clamped to model context_length {train} (GGUF metadata)"
+                ));
+            }
+            ceiling
+        } else {
             requested
         }
+    } else {
+        warnings.push(
+            "ctx not clamped: GGUF lacks context_length (rule skipped, not estimated)".into(),
+        );
+        requested
     }
 }
-
 /// Rule 6 ladder: KV cache quantization by capacity math, not stacked
 /// thresholds. Estimated f16 KV is `2*blocks*kv_heads*head_dim*ctx*2`
 /// bytes; `q8_0` halves it, `q4_0` quarters it. The cheapest grade that keeps
@@ -1319,6 +1647,288 @@ pub fn estimate_kv_f16(input: &ProfileInput<'_>, ctx: Option<u32>) -> Option<u64
     kv_f16_bytes(input, ctx)
 }
 
+/// VRAM the KV cache will actually occupy at spawn: the full f16 estimate
+/// on the classic path, but only the measured working-set floor when the
+/// compiled argv will carry `--kv-unified` (the buffer then lives in the
+/// `--cache-ram` system-RAM budget). Callers judging GPU capacity — the
+/// supervisor's co-residency planner and auto tensor-split — must charge
+/// THIS, not the raw f16 estimate, or unified spawns read as 2-4x their
+/// real VRAM demand and get downgraded/evicted on phantom pressure.
+#[must_use]
+pub fn estimate_kv_vram_charge(input: &ProfileInput<'_>, ctx: Option<u32>) -> Option<u64> {
+    if kv_unified_emitted(input) {
+        return Some(KV_UNIFIED_VRAM_FLOOR_BYTES);
+    }
+    estimate_kv_f16(input, ctx)
+}
+
+/// A16 RAM-share for the prompt-cache budget, from the live hit-rate hint
+/// (None = static 30%): prefix-heavy traffic earns 40%, cache-cold
+/// releases to 20%.
+fn cache_ram_pct(hit: Option<f64>) -> u32 {
+    match hit {
+        Some(h) if h > 0.5 => 40,
+        Some(h) if h < 0.1 => 20,
+        _ => 30,
+    }
+}
+
+/// The `--cache-ram` budget rule 12 will actually emit, in MiB: the
+/// configured request clamped to the A16 RAM-share cap. None when the
+/// knob requests unlimited (0) or the box RAM is unknown — callers apply
+/// their own fallback share. Single source of truth so slot sizing and
+/// the emitted flag can never disagree.
+fn effective_cache_ram_mib(input: &ProfileInput<'_>) -> Option<u64> {
+    if input.config.cache_ram_mb <= 0 || input.hardware.total_ram_mib == 0 {
+        return None;
+    }
+    let cap = input.hardware.total_ram_mib * u64::from(cache_ram_pct(input.cache_hit_rate)) / 100;
+    let requested = u64::try_from(input.config.cache_ram_mb).unwrap_or(u64::MAX);
+    Some(requested.min(cap))
+}
+
+/// Outcome of slot/ctx resolution: `slots` is the `-np` to emit,
+/// `total_ctx` the `--ctx-size` (upstream divides it across slots),
+/// `per_slot_ctx` what ONE slot holds (feeds `Profile.ctx` so prompt
+/// preflight bounds a single request). `autofit` is Some when auto-fit
+/// divided the resolved ctx to earn parallel slots (see
+/// `AUTOFIT_CTX_FLOOR`).
+struct ResolvedSlots {
+    slots: u32,
+    total_ctx: u32,
+    per_slot_ctx: u32,
+    autofit: Option<(u32, u32)>,
+}
+
+/// Per-slot ctx floor for auto-fit: ollama's own default context (and its
+/// VRAM-tier auto-fit never goes below it). Halving past 4096 would trade
+/// usable prompt room for slots the workload may not have.
+const AUTOFIT_CTX_FLOOR: u32 = 4096;
+
+/// Resolve the slot count and the TOTAL ctx to emit. `slots = 0` (pallama
+/// auto, the default) sizes concurrency from capacity: upstream divides
+/// `--ctx-size` across `-np` slots, so N slots cost N x per-slot KV (RAM
+/// under `--kv-unified`, VRAM on the classic path) and no extra weights —
+/// scaling the total keeps each slot at the resolved per-slot ctx while
+/// concurrent streams batch on the GPU instead of queueing (measured
+/// ~2.5x system throughput at 4 slots for +138 MiB VRAM). Explicit pins —
+/// overlay slots (which the supervisor also uses for LC4-adopted values),
+/// `slots = 1`, manual N — pass through untouched; manual N keeps the
+/// historical slicing semantics (total = resolved ctx, per-slot = ctx/N).
+///
+/// When capacity caps auto at ONE slot and the ctx came from the default
+/// (not pinned by tuning/overlay), auto-fit re-spends the same total-ctx
+/// budget as shallower parallel slots (4x4096 costs the same capacity as
+/// 1x16384) — ollama's throughput-first default. Pinned ctx (per-request,
+/// tuning bench, or overlay) is a hard pin: never divided.
+fn resolve_slots(
+    input: &ProfileInput<'_>,
+    overlay: &ModelOverride,
+    base_ctx: u32,
+    vram_bytes: u64,
+    ctx_pinned: bool,
+    warnings: &mut Vec<String>,
+) -> ResolvedSlots {
+    let slots = overlay.slots.unwrap_or(input.config.slots);
+    if overlay.deterministic.unwrap_or(input.config.deterministic) {
+        if slots > 1 {
+            warnings.push(format!(
+                "deterministic = true pins slots = 1 — explicit slots = {slots} ignored: \
+                 multi-slot batches perturb logits in near-tie positions and break \
+                 token-for-token greedy reproducibility; drop one of the two knobs"
+            ));
+        } else if slots == 0 {
+            warnings.push(
+                "deterministic = true: slots pinned to 1 — concurrent streams queue \
+                 instead of batching; unset the pin to recover multi-slot throughput"
+                    .to_string(),
+            );
+        }
+        return ResolvedSlots {
+            slots: 1,
+            total_ctx: base_ctx,
+            per_slot_ctx: base_ctx,
+            autofit: None,
+        };
+    }
+    if slots != 0 {
+        return ResolvedSlots {
+            slots,
+            total_ctx: base_ctx,
+            per_slot_ctx: base_ctx / slots.max(1),
+            autofit: None,
+        };
+    }
+    // --- auto: probe capacity at the resolved per-slot ctx first
+    let np = auto_slots_capacity(input, base_ctx, vram_bytes);
+    if vulkan_mmproj_guard(input) {
+        warn_vulkan_slot_cap(input, base_ctx, vram_bytes, warnings);
+    }
+    if np >= 2 {
+        warnings.push(format!(
+            "slots auto: -np {np} with total ctx {} (per-slot {base_ctx}) — concurrent streams \
+             batch on the GPU instead of queueing; pin slots = 1 for single-client full-speed",
+            np * base_ctx
+        ));
+        return ResolvedSlots {
+            slots: np,
+            total_ctx: np * base_ctx,
+            per_slot_ctx: base_ctx,
+            autofit: None,
+        };
+    }
+    // --- auto-fit: single slot at the full resolved ctx. If that ctx is
+    // only the config default (not a pin), re-spend its capacity budget
+    // as N shallower slots — the total-ctx charge the capacity guards
+    // scale on is UNCHANGED (4x4096 == 1x16384 under both the unified
+    // per-token compute guard and classic KV math), so this adds zero
+    // boot risk while un-serializing concurrent streams.
+    if !ctx_pinned && base_ctx > AUTOFIT_CTX_FLOOR {
+        let mut best: Option<(u32, u32)> = None;
+        let mut per_slot = base_ctx / 2;
+        while per_slot >= AUTOFIT_CTX_FLOOR {
+            let cand = auto_slots_capacity(input, per_slot, vram_bytes);
+            if cand >= 2 {
+                // iterate order is largest-per-slot first, so keeping the
+                // FIRST shape on np ties tie-breaks to the larger ctx
+                if best.is_none_or(|(bn, _)| cand > bn) {
+                    best = Some((cand, per_slot));
+                }
+            }
+            per_slot /= 2;
+        }
+        if let Some((np, per_slot)) = best {
+            warnings.push(format!(
+                "slots auto-fit: default ctx {base_ctx} fits only 1 concurrent slot — \
+                 re-spent the same capacity as -np {np} x {per_slot} ctx (total {}, identical \
+                 VRAM/KV budget; prompts longer than {per_slot} tokens trigger the num_ctx \
+                 restart-once path at a wider ctx); pin ctx or slots to disable",
+                np * per_slot
+            ));
+            return ResolvedSlots {
+                slots: np,
+                total_ctx: np * per_slot,
+                per_slot_ctx: per_slot,
+                autofit: Some((per_slot, np)),
+            };
+        }
+    }
+    ResolvedSlots {
+        slots: 1,
+        total_ctx: base_ctx,
+        per_slot_ctx: base_ctx,
+        autofit: None,
+    }
+}
+
+/// True when the conservative vulkan-class + projector guard applies (see
+/// `auto_slots_capacity`): mixed integrated+discrete census on a unified
+/// build with a projector attached.
+fn vulkan_mmproj_guard(input: &ProfileInput<'_>) -> bool {
+    let mmproj_bytes = mmproj_size(input);
+    input.engine_census.iter().any(GpuInfo::is_integrated)
+        && input.engine_census.iter().any(|g| !g.is_integrated())
+        && mmproj_bytes > 0
+}
+
+fn mmproj_size(input: &ProfileInput<'_>) -> u64 {
+    input
+        .mmproj_path
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map_or(0, |m| m.len())
+}
+
+/// The capacity warning previously emitted inline by the auto-slot
+/// resolver; kept for the non-autofit path so `ps` readers still see WHY
+/// concurrency is capped on vulkan-class projector spawns.
+fn warn_vulkan_slot_cap(
+    input: &ProfileInput<'_>,
+    per_slot_ctx: u32,
+    vram_bytes: u64,
+    warnings: &mut Vec<String>,
+) {
+    const AUTO_SLOTS_CAP: u32 = 4;
+    let resident = input.model_bytes.saturating_add(mmproj_size(input));
+    let headroom = vram_bytes
+        .saturating_sub(resident)
+        .saturating_sub(KV_UNIFIED_VRAM_FLOOR_BYTES)
+        .saturating_sub(UNIFIED_SPAWN_OVERHEAD_BYTES);
+    let cap = (headroom / (u64::from(per_slot_ctx) * UNIFIED_COMPUTE_PER_TOKEN_BYTES))
+        .min(u64::from(AUTO_SLOTS_CAP))
+        .max(1);
+    if cap < u64::from(AUTO_SLOTS_CAP) {
+        warnings.push(format!(
+            "slots auto capped at {cap}: vulkan-class build (mixed integrated+discrete \
+             census) with a projector attached overcommits VRAM as total ctx scales — \
+             measured degraded boot at np2/32k total ctx on an 8 GiB card; use a \
+             projector-free model or explicit slots to override"
+        ));
+    }
+}
+
+/// Capacity-aware slot count for `slots = 0`, pure (no warnings — the
+/// auto-fit loop probes it repeatedly). Clamps, in order: the measured
+/// 4-slot sweet spot; the model's trained context (the scaled total
+/// cannot exceed it); the KV RAM budget (`--cache-ram` effective value
+/// when unified — unlimited falls back to a third of physical RAM, rule
+/// 12's static clamp share); and, on the classic path where KV IS
+/// VRAM-resident, the same 85% envelope the offload resolver uses.
+/// Unknown KV geometry means unknown cost: stay single-slot, never guess.
+fn auto_slots_capacity(input: &ProfileInput<'_>, base_ctx: u32, vram_bytes: u64) -> u32 {
+    const AUTO_SLOTS_CAP: u32 = 4;
+    if base_ctx == 0 {
+        return 1;
+    }
+    let train_slots = match input.gguf.context_length {
+        Some(train) => u32::try_from(train / u64::from(base_ctx))
+            .unwrap_or(1)
+            .max(1),
+        None => 1,
+    };
+    let Some(kv_per_slot) = kv_f16_bytes(input, base_ctx) else {
+        return 1;
+    };
+    if kv_per_slot == 0 {
+        return 1;
+    }
+    let ram_budget_bytes =
+        Hardware::bytes(effective_cache_ram_mib(input).unwrap_or(input.hardware.total_ram_mib / 3));
+    let clamp_to_cap = |slots: u64| {
+        AUTO_SLOTS_CAP
+            .min(u32::try_from(slots).unwrap_or(AUTO_SLOTS_CAP))
+            .max(1)
+    };
+    let ram_slots = clamp_to_cap(ram_budget_bytes / kv_per_slot);
+    let resident = input.model_bytes.saturating_add(mmproj_size(input));
+    let vram_slots = if kv_unified_emitted(input) {
+        // Unified KV hosts the cache in system RAM, so the classic
+        // ctx-scaled KV charge does not apply — but ctx-scaled compute
+        // buffers still live in VRAM, and vulkan-class builds with a
+        // projector attached allocate fat enough to overcommit the card
+        // at multi-slot totals (measured: see UNIFIED_COMPUTE_PER_TOKEN_
+        // BYTES). CUDA-class builds and projector-free vulkan spawns
+        // measured healthy at the flat cap, so only that combination
+        // pays the conservative per-token charge.
+        if vulkan_mmproj_guard(input) {
+            let headroom = vram_bytes
+                .saturating_sub(resident)
+                .saturating_sub(KV_UNIFIED_VRAM_FLOOR_BYTES)
+                .saturating_sub(UNIFIED_SPAWN_OVERHEAD_BYTES);
+            clamp_to_cap(headroom / (u64::from(base_ctx) * UNIFIED_COMPUTE_PER_TOKEN_BYTES))
+        } else {
+            AUTO_SLOTS_CAP
+        }
+    } else {
+        let headroom = (vram_bytes / 100 * 85).saturating_sub(resident);
+        clamp_to_cap(headroom / kv_per_slot)
+    };
+    AUTO_SLOTS_CAP
+        .min(train_slots)
+        .min(ram_slots)
+        .min(vram_slots)
+        .max(1)
+}
+
 /// Resolve `--gpu-layers` deterministically when the answer is obvious.
 /// Returns (flag-value, ps-label).
 ///
@@ -1352,10 +1962,70 @@ fn resolve_gpu_offload(
         ));
         return ("auto", "partial");
     }
+    // With --kv-unified on the final argv the KV buffer lives in the
+    // --cache-ram (system RAM) budget, not VRAM — charging the full f16
+    // estimate here pushes tight-fit models into the "auto" band, and the
+    // engine's own auto estimator repeats the over-reservation and parks
+    // layers on the CPU (measured: -22% decode on a 1-layer split).
+    //
+    // Unified branch uses an absolute test: the 15% classic reserve mostly
+    // stood for KV uncertainty, which --kv-unified removes, so the standing
+    // charges are the KV working-set floor plus the measured fixed spawn
+    // overhead (CUDA/Vulkan context, graphs, compute buffers). Classic
+    // branch keeps the percentage margin for its full-KV reality.
+    if kv_unified_emitted(input) {
+        let projected = resident
+            .saturating_add(KV_UNIFIED_VRAM_FLOOR_BYTES)
+            .saturating_add(UNIFIED_SPAWN_OVERHEAD_BYTES);
+        if projected <= vram_bytes {
+            // The unified accounting decided the pin (classic full-KV math
+            // would NOT have fit): say so — `ps` shows "full" and the reader
+            // deserves the why.
+            if resident.saturating_add(kv) > vram_bytes / 100 * 85 {
+                warnings.push(format!(
+                    "gpu-layers pinned full via unified-KV accounting: resident {} MiB + {} MiB KV floor + {} MiB spawn overhead <= {} MiB VRAM (--kv-unified hosts the {} MiB f16 KV in the cache-ram budget); revert with kv_unified = false if the load OOMs",
+                    resident / (1 << 20),
+                    KV_UNIFIED_VRAM_FLOOR_BYTES / (1 << 20),
+                    UNIFIED_SPAWN_OVERHEAD_BYTES / (1 << 20),
+                    vram_bytes / (1 << 20),
+                    kv / (1 << 20)
+                ));
+            }
+            return ("999", "full");
+        }
+        return ("auto", "auto");
+    }
     if resident.saturating_add(kv) <= vram_bytes / 100 * 85 {
         return ("999", "full");
     }
     ("auto", "auto")
+}
+
+/// True when the compiled argv will carry the POSITIVE `--kv-unified`
+/// flag: the engine manifest supports it and the user did not opt out
+/// (explicit `kv_unified = false` — including via overlay — means the KV
+/// buffer IS VRAM-resident, so capacity math must charge it in full).
+/// Single source of truth shared by rule 12b's default-on branch and the
+/// gpu-offload resolver so the two can never disagree.
+fn kv_unified_emitted(input: &ProfileInput<'_>) -> bool {
+    kv_unified_for(input.config, input.model_name, input.supported_flags)
+}
+
+/// Same decision as [`kv_unified_emitted`], callable outside profile
+/// compilation: the per-request `num_ctx` preflight (gateway) and the
+/// `coreside` planner must charge the unified 512 MiB working-set floor
+/// instead of the full f16 KV when the spawn will carry `--kv-unified` —
+/// f16 math there made legal `num_ctx` bumps read as OOM and refuse
+/// unnecessarily. Callers without a compiled `ProfileInput` supply the
+/// active engine's manifest flag set directly.
+#[must_use]
+pub fn kv_unified_for(
+    config: &Config,
+    model_name: &str,
+    supported_flags: &BTreeSet<String>,
+) -> bool {
+    config.effective_kv_unified(model_name) != Some(false)
+        && supported_flags.contains("--kv-unified")
 }
 
 /// True for every self-drafting n-gram spec mode ("ngram" is pallama
@@ -1473,6 +2143,34 @@ const ROUTER_MODEL_KEYS: &[&str] = &[
     "image-min-tokens",
     "mtmd-batch-max-tokens",
     "mmproj-device",
+    // F110: per-context knobs the normal profile emits but the router
+    // INI silently dropped — device placement, chat templating, sampler
+    // defaults, sampler chain, warmup and mmproj offload all live with
+    // the model context in upstream arg.cpp.
+    "device",
+    "chat-template",
+    "chat-template-file",
+    "samplers",
+    "no-warmup",
+    "no-mmproj-offload",
+    "temp",
+    "top-k",
+    "top-p",
+    "min-p",
+    "top-n-sigma",
+    "typical-p",
+    "repeat-penalty",
+    "repeat-last-n",
+    "presence-penalty",
+    "frequency-penalty",
+    "dry-multiplier",
+    "dry-base",
+    "dry-allowed-length",
+    "dry-penalty-last-n",
+    "xtc-probability",
+    "xtc-threshold",
+    "mirostat",
+    "seed",
     "embd-normalize",
     "yarn-orig-ctx",
     "yarn-ext-factor",
@@ -1574,10 +2272,20 @@ pub fn generate_router_preset(models: &[(String, Vec<String>)], global: &[String
 }
 
 /// Filesystem-safe form of a model name for cache files (HF repo names
-/// may contain `/` and `:`).
+/// may contain `/` and `:`). Injective up to a 64-bit hash collision:
+/// a discriminator (FNV-1a of the ORIGINAL name) is appended so `a/b`
+/// and `a_b` cannot collide into one speccache/session file (F112).
+/// FNV-1a is inline because `DefaultHasher` is not stable across
+/// runs/versions — these names must survive restarts.
 #[must_use]
 pub fn path_safe(name: &str) -> String {
-    name.chars()
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    let sanitized: String = name
+        .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
                 c
@@ -1585,7 +2293,8 @@ pub fn path_safe(name: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+    format!("{sanitized}-{hash:016x}")
 }
 
 /// Rust's f64 Display already prints the minimal form (2.0 -> "2",
@@ -1650,6 +2359,12 @@ mod tests {
             "--spec-type",
             "--spec-draft-model",
             "--spec-draft-n-max",
+            "--spec-draft-backend-sampling",
+            "--lazy-mode",
+            "--tools",
+            "--tools-runtime",
+            "--mcp-servers-config",
+            "--mcp-servers-json",
             "--cache-ram",
             "-mm",
             "--mmproj",
@@ -1662,7 +2377,6 @@ mod tests {
             "--cpu-range",
             "--poll",
             "--reasoning-format",
-            "--lookup-cache-dynamic",
             "--slot-save-path",
             "--rope-scaling",
             "--rope-scale",
@@ -1690,6 +2404,8 @@ mod tests {
             "--xtc-threshold",
             "--mirostat",
             "--seed",
+            "--no-warmup",
+            "--samplers",
             "--embeddings",
             "--pooling",
         ]
@@ -1731,6 +2447,14 @@ mod tests {
             general_version: None,
             pooling_type: None,
             chat_template: None,
+            mtp_layers: None,
+        }
+    }
+
+    fn meta_with_mtp(layers: u64) -> GgufMeta {
+        GgufMeta {
+            mtp_layers: Some(layers),
+            ..meta()
         }
     }
 
@@ -1739,6 +2463,16 @@ mod tests {
         hw: &'a Hardware,
         cfg: &'a Config,
         flags: &'a BTreeSet<String>,
+    ) -> ProfileInput<'a> {
+        input_with_spec(gguf, hw, cfg, flags, &[])
+    }
+
+    fn input_with_spec<'a>(
+        gguf: &'a GgufMeta,
+        hw: &'a Hardware,
+        cfg: &'a Config,
+        flags: &'a BTreeSet<String>,
+        spec_types: &'a [String],
     ) -> ProfileInput<'a> {
         ProfileInput {
             engine_kind: crate::engine_kind::EngineKind::default(),
@@ -1755,6 +2489,7 @@ mod tests {
             mmproj_path: None,
             engine_tag: "b-test",
             supported_flags: flags,
+            spec_types,
             endpoint: Endpoint::Tcp {
                 host: "127.0.0.1".into(),
                 port: 12345,
@@ -1762,9 +2497,35 @@ mod tests {
             data_dir: "/tmp/pallama-test-data",
             cache_hit_rate: None,
             device_hint: None,
+            engine_census: hw.gpus.clone(),
             sibling_devices: Vec::new(),
             auto_tensor_split: None,
         }
+    }
+
+    static MTP_SPEC_TYPES: LazyLock<Vec<String>> = LazyLock::new(|| vec!["draft-mtp".to_string()]);
+
+    static EAGLE3_SPEC_TYPES: LazyLock<Vec<String>> =
+        LazyLock::new(|| vec!["draft-eagle3".to_string()]);
+
+    static DFLASH_SPEC_TYPES: LazyLock<Vec<String>> =
+        LazyLock::new(|| vec!["draft-dflash".to_string()]);
+
+    /// Same as `input_with_spec` but with a controllable model name — the
+    /// default "qwen3-8b" matches the catalog spec-pair prefix, which is
+    /// wrong for tests that need the no-pair path.
+    fn input_named_with_spec<'a>(
+        model_name: &'a str,
+        gguf: &'a GgufMeta,
+        hw: &'a Hardware,
+        cfg: &'a Config,
+        flags: &'a BTreeSet<String>,
+        spec_types: &'a [String],
+    ) -> ProfileInput<'a> {
+        let mut i = input_with_spec(gguf, hw, cfg, flags, spec_types);
+        i.model_name = model_name;
+        i.instance_key = model_name;
+        i
     }
 
     static ALL_FLAGS: LazyLock<BTreeSet<String>> = LazyLock::new(full_flags);
@@ -1772,6 +2533,7 @@ mod tests {
         ctx: None,
         slots: None,
         spec: None,
+        lazy_mode: None,
         loras: None,
         extra_args: None,
         cache_type: None,
@@ -1791,6 +2553,7 @@ mod tests {
         spm_infill: None,
         late_chunking: None,
         rpc_servers: None,
+        deterministic: None,
     };
 
     #[test]
@@ -1859,7 +2622,8 @@ mod tests {
             .argv
             .windows(2)
             .any(|w| w[0] == "--alias" && w[1] == "qwen3-8b"));
-        // Rule 2: jinja + metrics + flash-attn auto + ctx (default 16384 < 40960)
+        // Rule 2: jinja + metrics + flash-attn auto + ctx — default slots=0
+        // auto earns np=2 (train 40960 / base 16384), scaling the total.
         assert!(p.argv.contains(&"--jinja".to_string()));
         assert!(p.argv.contains(&"--metrics".to_string()));
         assert!(p
@@ -1869,7 +2633,7 @@ mod tests {
         assert!(p
             .argv
             .windows(2)
-            .any(|w| w[0] == "--ctx-size" && w[1] == "16384"));
+            .any(|w| w[0] == "--ctx-size" && w[1] == "32768"));
         // Rule 3: threads = physical cores
         assert!(p
             .argv
@@ -1887,15 +2651,17 @@ mod tests {
             .argv
             .windows(2)
             .any(|w| w[0] == "--cache-reuse" && w[1] == "256"));
-        // Rule 6: KV = 2*28*8*64*16384*2 = 469MB; +5GB < 0.9*12GB -> NO kv quant
+        // Rule 6: KV at the scaled total = 2*28*8*64*32768*2 = 938MB;
+        // +5GB < 0.9*12GB -> NO kv quant
         assert!(!p.argv.contains(&"--cache-type-k".to_string()));
         // Rule 8: sleep (GPU present)
         assert!(p
             .argv
             .windows(2)
             .any(|w| w[0] == "--sleep-idle-seconds" && w[1] == "300"));
-        // Rule 9: default single slot (full-speed single client).
-        assert!(p.argv.windows(2).any(|w| w[0] == "-np" && w[1] == "1"));
+        // Rule 9: default slots=0 = pallama auto -> np 2 on this fixture.
+        assert!(p.argv.windows(2).any(|w| w[0] == "-np" && w[1] == "2"));
+        assert!(p.warnings.iter().any(|w| w.contains("slots auto")));
         // Rule 12: cache-ram default 8192
         assert!(p
             .argv
@@ -1903,8 +2669,15 @@ mod tests {
             .any(|w| w[0] == "--cache-ram" && w[1] == "8192"));
         // Rule 15: sessions dir default-on when the engine supports it
         assert!(p.argv.windows(2).any(|w| w[0] == "--slot-save-path"));
-        assert_eq!(p.ctx, 16384);
-        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        assert_eq!(p.ctx, 16384, "Profile.ctx reports the per-slot ctx");
+        // the slots-auto teaching warning is asserted at rule 9 above; no
+        // OTHER warning may ride the default battery
+        assert_eq!(
+            p.warnings.len(),
+            1,
+            "unexpected extra warnings: {:?}",
+            p.warnings
+        );
     }
 
     #[test]
@@ -1950,6 +2723,93 @@ mod tests {
         .unwrap();
         assert!(!p.argv.contains(&"--kv-unified".to_string()));
         assert!(!p.warnings.iter().any(|w| w.contains("kv_unified")));
+    }
+
+    #[test]
+    fn unit__gpu_offload__unified_kv_floor_pins_full_on_tight_fit() {
+        // Classic-attention meta: kv @16384 = 8*(64+64)*2*28*16384 = 896 MiB.
+        // VRAM 6700 MiB: 5000+896 = 5896 > 85% (5695) — full-KV math says
+        // auto; the unified absolute test (5000+512 floor+700 overhead =
+        // 6212 <= 6700) pins. This is the -22%-decode class of spawn
+        // (measured on shipped pallama).
+        let hw = gpu_hw(6_400, 64_000, 8);
+        let p = compile(
+            &input(&meta(), &hw, &Config::default(), &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--gpu-layers" && w[1] == "999"));
+        assert_eq!(p.gpu, "full");
+        assert!(p.argv.contains(&"--kv-unified".to_string()));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("unified-KV accounting")),
+            "flip must be explained: {:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__gpu_offload__engine_without_unified_keeps_auto() {
+        // Same tight fit, engine manifest lacks --kv-unified: full charge,
+        // auto band, and no floor accounting note (nothing was discounted).
+        let hw = gpu_hw(6_400, 64_000, 8);
+        let mut no_kvu = full_flags();
+        no_kvu.remove("--kv-unified");
+        let p = compile(
+            &input(&meta(), &hw, &Config::default(), &no_kvu),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--gpu-layers" && w[1] == "auto"));
+        assert_eq!(p.gpu, "auto");
+        assert!(!p.warnings.iter().any(|w| w.contains("unified-KV")));
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn unit__gpu_offload__explicit_kv_unified_false_charges_full_kv() {
+        // Opt-out: --no-kv-unified means the KV buffer IS VRAM-resident,
+        // so the pin math must charge all 896 MiB (auto band on 6700 MiB).
+        let hw = gpu_hw(6_400, 64_000, 8);
+        let mut cfg = Config::default();
+        cfg.kv_unified = Some(false);
+        let p = compile(
+            &input(&meta(), &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p.argv.contains(&"--no-kv-unified".to_string()));
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--gpu-layers" && w[1] == "auto"));
+        assert!(!p.warnings.iter().any(|w| w.contains("unified-KV")));
+    }
+
+    #[test]
+    fn unit__rule5__cache_reuse_skipped_with_mmproj() {
+        // Upstream disables cache_reuse with a multimodal projector: the
+        // flag must not ride VL argv, and the skip must be said aloud.
+        let hw = gpu_hw(24_000, 64_000, 8);
+        let cfg = Config::default();
+        let m = meta();
+        let mut i = input(&m, &hw, &cfg, &ALL_FLAGS);
+        i.mmproj_path = Some("/nonexistent/mmproj-F16.gguf");
+        let p = compile(&i, &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.contains(&"--cache-reuse".to_string()));
+        assert!(
+            p.warnings.iter().any(|w| w.contains("multimodal")),
+            "skip must warn: {:?}",
+            p.warnings
+        );
     }
 
     #[test]
@@ -2079,6 +2939,7 @@ mod tests {
     fn unit__spec_ngram__emits_self_drafting_no_draft_model() {
         let cfg = Config {
             spec: "ngram".into(),
+            slots: 1, // purpose-scoped: spec flags, not slot sizing
             ..Config::default()
         };
         let hw = gpu_hw(12_000, 32_000, 8);
@@ -2093,10 +2954,327 @@ mod tests {
             .windows(2)
             .any(|w| w[0] == "--spec-type" && w[1] == "ngram-simple"));
         assert!(!p.argv.contains(&"--spec-draft-model".to_string()));
-        // Rule 14: persistent lookup cache rides along with ngram mode
-        assert!(p.argv.windows(2).any(|w| w[0] == "--lookup-cache-dynamic"
-            && w[1] == "/tmp/pallama-test-data/speccache/qwen3-8b.lcache"));
+        // Rule 14: persistent lookup cache rides along with ngram mode.
+        // Expected path derives via path_safe (FNV-suffixed since the
+        // collision-proofing change) — never hardcode it.
+        let lcache = format!(
+            "/tmp/pallama-test-data/speccache/{}.lcache",
+            path_safe("qwen3-8b")
+        );
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--lookup-cache-dynamic" && w[1] == lcache));
         assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+    }
+
+    #[test]
+    fn unit__spec_mtp__emits_draft_mtp_when_advertised() {
+        let cfg = Config {
+            spec: "mtp".into(),
+            slots: 1, // purpose-scoped: spec flags, not slot sizing
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let p = compile(
+            &input_with_spec(&g, &hw, &cfg, &ALL_FLAGS, &MTP_SPEC_TYPES),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--spec-type" && w[1] == "draft-mtp"));
+        // The MTP head ships inside the GGUF — no draft model to name.
+        assert!(!p.argv.contains(&"--spec-draft-model".to_string()));
+        // n-gram-only lookup cache must not ride along (rule 14 gate).
+        assert!(!p.argv.contains(&"--lookup-cache-dynamic".to_string()));
+        // Headless GGUF under manual mtp: teaching warning fires.
+        assert!(
+            p.warnings.iter().any(|w| w.contains("no MTP head")),
+            "{:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__spec_mtp__engine_lacking_draft_mtp__hard_error() {
+        let cfg = Config {
+            spec: "mtp".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        // Engine advertises --spec-type but not draft-mtp among its values.
+        let err = compile(
+            &input_with_spec(&g, &hw, &cfg, &ALL_FLAGS, &[]),
+            &TuningOverrides::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("draft-mtp") && err.contains("pallama engine update"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unit__spec_eagle3__emits_pair_and_draft_when_advertised() {
+        let cfg = Config {
+            spec: "eagle3".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let mut inp =
+            input_named_with_spec("qwen3-8b", &g, &hw, &cfg, &ALL_FLAGS, &EAGLE3_SPEC_TYPES);
+        inp.draft_path = Some("/models/qwen3-8b-speculator.eagle3-f16.gguf");
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--spec-type" && w[1] == "draft-eagle3"));
+        assert!(p.argv.windows(2).any(|w| w[0] == "--spec-draft-model"
+            && w[1] == "/models/qwen3-8b-speculator.eagle3-f16.gguf"));
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+    }
+
+    #[test]
+    fn unit__spec_eagle3__engine_lacking__hard_error() {
+        let cfg = Config {
+            spec: "eagle3".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let err = compile(
+            &input_named_with_spec("qwen3-8b", &g, &hw, &cfg, &ALL_FLAGS, &[]),
+            &TuningOverrides::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("draft-eagle3") && err.contains("pallama engine update"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unit__spec_eagle3__unpulled_draft__hard_error() {
+        let cfg = Config {
+            spec: "eagle3".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let err = compile(
+            &input_named_with_spec("qwen3-8b", &g, &hw, &cfg, &ALL_FLAGS, &EAGLE3_SPEC_TYPES),
+            &TuningOverrides::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("pallama pull")
+                && err.contains("williamliao/Qwen3-8B-EAGLE3-Speculator-GGUF"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unit__spec_eagle3__no_pair__hard_error() {
+        let cfg = Config {
+            spec: "eagle3".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let err = compile(
+            &input_named_with_spec("llama3.2-3b", &g, &hw, &cfg, &ALL_FLAGS, &EAGLE3_SPEC_TYPES),
+            &TuningOverrides::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("no draft-eagle3 draft pair") && err.contains("llama3.2-3b"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unit__spec_dflash__engine_lacking__hard_error() {
+        let cfg = Config {
+            spec: "dflash".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let err = compile(
+            &input_named_with_spec("qwen3-8b", &g, &hw, &cfg, &ALL_FLAGS, &EAGLE3_SPEC_TYPES),
+            &TuningOverrides::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("draft-dflash") && err.contains("pallama engine update"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unit__spec_dspark__advertised_but_no_catalog_pair__hard_error() {
+        let cfg = Config {
+            spec: "dspark".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let mut err = compile(
+            &input_named_with_spec("qwen3-8b", &g, &hw, &cfg, &ALL_FLAGS, &DFLASH_SPEC_TYPES),
+            &TuningOverrides::default(),
+        )
+        .unwrap_err();
+        // dflash type advertised but dspark asked -> engine gate fires…
+        assert!(err.contains("draft-dspark"), "{err}");
+        // …and a dspark-advertising engine with no catalog pair -> pair gate.
+        err = compile(
+            &input_named_with_spec(
+                "qwen3-8b",
+                &g,
+                &hw,
+                &cfg,
+                &ALL_FLAGS,
+                ["draft-dspark".to_string()].as_slice(),
+            ),
+            &TuningOverrides::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("no draft-dspark draft pair"), "{err}");
+    }
+
+    #[test]
+    fn unit__spec_auto__embedded_mtp_emits_draft_mtp_trio() {
+        let cfg = Config {
+            spec: "auto".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta_with_mtp(1);
+        let p = compile(
+            &input_with_spec(&g, &hw, &cfg, &ALL_FLAGS, &MTP_SPEC_TYPES),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--spec-type" && w[1] == "draft-mtp"));
+        // n-max capped by the trained head count.
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--spec-draft-n-max" && w[1] == "1"));
+        assert!(p
+            .argv
+            .contains(&"--spec-draft-backend-sampling".to_string()));
+        // No external draft model — the head ships in the weights.
+        assert!(!p.argv.contains(&"--spec-draft-model".to_string()));
+        assert!(
+            p.warnings.iter().any(|w| w.contains("MTP head")),
+            "{:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__spec_auto__mtp_n_max_capped_at_two_for_chained_heads() {
+        let cfg = Config {
+            spec: "auto".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta_with_mtp(3); // chain-heads arch with 3 trained steps
+        let p = compile(
+            &input_with_spec(&g, &hw, &cfg, &ALL_FLAGS, &MTP_SPEC_TYPES),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--spec-draft-n-max" && w[1] == "2"));
+    }
+
+    #[test]
+    fn unit__spec_auto__mtp_engine_lacks_draft_mtp__warn_and_no_mtp_args() {
+        let cfg = Config {
+            spec: "auto".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta_with_mtp(1);
+        let p = compile(
+            &input_named_with_spec("llama3.2-3b", &g, &hw, &cfg, &ALL_FLAGS, &[]),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(!p.argv.contains(&"--spec-type".to_string()));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("lacks") && w.contains("pallama engine update")),
+            "{:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__spec_auto__no_mtp_gguf__catalog_path_unchanged() {
+        let cfg = Config {
+            spec: "auto".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta(); // no MTP head
+        let p = compile(
+            &input_named_with_spec("llama3.2-3b", &g, &hw, &cfg, &ALL_FLAGS, &MTP_SPEC_TYPES),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(!p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--spec-type" && w[1] == "draft-mtp"));
+        // qwen3-8b has no catalog pair either: dense, no spec args at all.
+        assert!(!p.argv.contains(&"--spec-type".to_string()));
+    }
+
+    #[test]
+    fn unit__spec_off__never_emits_spec_type_even_with_mtp_gguf() {
+        let cfg = Config {
+            spec: "off".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta(); // no MTP head
+        let p = compile(
+            &input_named_with_spec("llama3.2-3b", &g, &hw, &cfg, &ALL_FLAGS, &MTP_SPEC_TYPES),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(!p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--spec-type" && w[1] == "draft-mtp"));
+        // llama3.2-3b has no catalog pair either: dense, no spec args at all.
+        assert!(!p.argv.contains(&"--spec-type".to_string()));
     }
 
     #[test]
@@ -2233,8 +3411,65 @@ mod tests {
             .argv
             .windows(2)
             .any(|w| w[0] == "--ctx-size" && w[1] == "40960"));
-        assert_eq!(p.ctx, 40_960);
+        // Train clamp bounds the TOTAL; auto-fit then divides it into
+        // 4x10240 shallow slots (default ctx is not a pin).
+        assert_eq!(p.ctx, 10_240);
+        assert_eq!(p.ctx_autofit, Some((10_240, 4)));
         assert!(p.warnings.iter().any(|w| w.contains("clamped")));
+    }
+
+    #[test]
+    fn unit__ctx_extend_yarn__stretches_clamp_ceiling() {
+        // F109 regression: ctx_extend 2.0 on a 40960-trained model lifts
+        // the clamp ceiling to 81920 — the trained-length clamp must not
+        // defeat YaRN.
+        let cfg = Config {
+            default_ctx: 131_072,
+            ctx_extend: 2.0,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        // YaRN lifts the CEILING (81920) — the emitted total stays within
+        // it; auto-fit divides to 4x10240 (total 40960 <= 81920).
+        assert_eq!(p.ctx, 10_240);
+        assert_eq!(p.ctx_autofit, Some((10_240, 4)));
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.contains("yarn-stretched window 81920")));
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--ctx-size" && w[1] == "40960"));
+    }
+
+    #[test]
+    fn unit__ctx_extend_yarn__still_clamps_past_stretched() {
+        let cfg = Config {
+            default_ctx: 131_072,
+            ctx_extend: 1.5, // 40960 -> 61440
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        // Stretched ceiling 61440; auto-fit divides to 4x7680 (30720 total).
+        assert_eq!(p.ctx, 7_680);
+        assert_eq!(p.ctx_autofit, Some((7_680, 4)));
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--ctx-size" && w[1] == "30720"));
     }
 
     #[test]
@@ -2265,7 +3500,10 @@ mod tests {
         // engage; KV/2 total 5.32 GiB <= budget -> q8_0 (the cheapest grade
         // that fits; the old fixed threshold picked q8_0 even when it did
         // not fit).
-        let cfg = Config::default();
+        let cfg = Config {
+            slots: 1, // purpose-scoped: ladder grades, not slot sizing
+            ..Config::default()
+        };
         let hw = gpu_hw(6_100, 32_000, 8);
         let g = meta();
         let p = compile(
@@ -2428,6 +3666,7 @@ mod tests {
             spec: "ngram".into(),
             spec_cache: false,
             sessions: false,
+            slots: 1, // purpose-scoped: opt-out flags, not slot sizing
             ..Config::default()
         };
         let hw = gpu_hw(24_000, 32_000, 8);
@@ -2446,24 +3685,33 @@ mod tests {
     fn unit__router_preset__sections_keys_and_bools() {
         let hw = gpu_hw(24_000, 32_000, 8);
         let g = meta();
-        let cfg = Config::default();
+        let cfg = Config {
+            slots: 1, // purpose-scoped: INI shape, not slot sizing
+            ..Config::default()
+        };
         let p = compile(
             &input(&g, &hw, &cfg, &ALL_FLAGS),
             &TuningOverrides::default(),
         )
         .unwrap();
-        // second model with an overlay knob
+        // second model with an overlay knob (F111: the overlay is now
+        // actually APPLIED — the fixture used to build it and discard)
         let o = ModelOverride {
             ctx: Some(8192),
+            warmup: Some(false),
+            sampler_defaults: Some(SamplerDefaults {
+                temperature: Some(0.7),
+                ..SamplerDefaults::default()
+            }),
             ..ModelOverride::default()
         };
-        let cfg2 = Config::default();
-        let p2 = compile(
-            &input(&g, &hw, &cfg2, &ALL_FLAGS),
-            &TuningOverrides::default(),
-        )
-        .unwrap();
-        let _ = o;
+        let cfg2 = Config {
+            slots: 1,
+            ..Config::default()
+        };
+        let mut ip2 = input(&g, &hw, &cfg2, &ALL_FLAGS);
+        ip2.overlay = &o;
+        let p2 = compile(&ip2, &TuningOverrides::default()).unwrap();
         let ini = generate_router_preset(
             &[
                 ("m1".to_string(), p.argv.clone()),
@@ -2489,6 +3737,17 @@ mod tests {
         assert!(ini.contains("gpu-layers = 999"));
         assert!(ini.contains("parallel = 1"));
         assert!(ini.contains("cache-reuse = 256"));
+        // F111: m2's overlay actually applied — its ctx + sampler +
+        // warmup knobs land in the m2 section.
+        let m2 = ini.split("[m2]\n").nth(1).unwrap_or_default();
+        assert!(m2.contains("ctx-size = 8192"), "{m2}");
+        assert!(m2.contains("temp = 0.7"), "{m2}");
+        // F110: per-context knobs no longer dropped by the INI.
+        assert!(m2.contains("no-warmup = true"), "{m2}");
+        // and they stay OUT of the global section
+        let global = ini.split("\n\n").next().unwrap_or_default();
+        assert!(!global.contains("no-warmup"), "{global}");
+        assert!(!global.contains("ctx-size"), "{global}");
     }
 
     #[test]
@@ -2810,13 +4069,459 @@ mod tests {
         i.overlay = &ov;
         let p = compile(&i, &TuningOverrides::default()).unwrap();
         assert!(p.argv.windows(2).any(|w| w == ["-np", "3"]));
-        // No hint, no overlay: global default (1) still rules.
+        // No hint, no overlay, default slots=0 (pallama auto): capacity
+        // decides — this fixture (train 40960, base 16384, unified KV,
+        // comfortable RAM/VRAM) earns np=2 with the total ctx scaled.
         let p = compile(
             &input(&g, &hw, &Config::default(), &ALL_FLAGS),
             &TuningOverrides::default(),
         )
         .unwrap();
+        assert!(p.argv.windows(2).any(|w| w == ["-np", "2"]));
+        assert!(
+            p.argv.windows(2).any(|w| w == ["--ctx-size", "32768"]),
+            "total ctx scales with auto slots: {:?}",
+            p.argv
+        );
+        assert_eq!(p.ctx, 16_384, "Profile.ctx stays per-slot");
+        assert!(p.warnings.iter().any(|w| w.contains("slots auto")));
+    }
+
+    #[test]
+    fn unit__auto_slots__matrix_train_ram_vram_and_pins() {
+        let g = meta(); // kv/slot @16384 = 896 MiB, train 40960
+        let cfg = Config::default();
+        let cfg_tight = Config {
+            cache_ram_mb: 1024,
+            ..Config::default()
+        };
+        let cfg_pin = Config {
+            slots: 3,
+            ..Config::default()
+        };
+        let g_default = GgufMeta::default();
+        let ov1 = ModelOverride {
+            slots: Some(1),
+            ..Default::default()
+        };
+        // Train cap: unlimited-ish budgets still clamp np to train/base.
+        let hw = gpu_hw(24_000, 64_000, 8);
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p.argv.windows(2).any(|w| w == ["-np", "2"]));
+        assert!(p.argv.windows(2).any(|w| w == ["--ctx-size", "32768"]));
+
+        // RAM clamp: 1 GiB effective cache-ram < 2 x 896 MiB KV -> single
+        // at the FULL ctx, but the default ctx is divisible — auto-fit
+        // re-spends the same RAM budget as 4 x 4096 (224 MiB KV/slot).
+        let p2 = compile(
+            &input(&g, &hw, &cfg_tight, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(
+            p2.argv.windows(2).any(|w| w == ["-np", "4"]),
+            "{:?}",
+            p2.argv
+        );
+        assert!(p2.argv.windows(2).any(|w| w == ["--ctx-size", "16384"]));
+        assert_eq!(
+            p2.ctx, 4_096,
+            "Profile.ctx reports the autofit per-slot ctx"
+        );
+        assert_eq!(p2.ctx_autofit, Some((4_096, 4)));
+        assert!(p2.warnings.iter().any(|w| w.contains("slots auto-fit")));
+
+        // Classic (non-unified) VRAM guard: 85% headroom admits no second
+        // slot's KV -> single, ctx unscaled.
+        let mut classic = full_flags();
+        classic.remove("--kv-unified");
+        let hw_small = gpu_hw(6_400, 64_000, 8);
+        let p3 = compile(
+            &input(&g, &hw_small, &cfg, &classic),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p3.argv.windows(2).any(|w| w == ["-np", "1"]));
+
+        // Unknown KV geometry: never guess a multi-slot cost.
+        let p4 = compile(
+            &input(&g_default, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p4.argv.windows(2).any(|w| w == ["-np", "1"]));
+
+        // Explicit manual pin: pass-through, ctx NOT scaled (upstream
+        // slices the resolved ctx across the pinned slots).
+        let p5 = compile(
+            &input(&g, &hw, &cfg_pin, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p5.argv.windows(2).any(|w| w == ["-np", "3"]));
+        assert!(p5.argv.windows(2).any(|w| w == ["--ctx-size", "16384"]));
+
+        // Overlay pin shadows the global auto entirely.
+        let mut inp6 = input(&g, &hw, &cfg, &ALL_FLAGS);
+        inp6.overlay = &ov1;
+        let p6 = compile(&inp6, &TuningOverrides::default()).unwrap();
+        assert!(p6.argv.windows(2).any(|w| w == ["-np", "1"]));
+        assert!(!p6.warnings.iter().any(|w| w.contains("slots auto")));
+    }
+
+    #[test]
+    fn unit__deterministic__pins_slots_one_llama_lane() {
+        let g = meta();
+        let hw = gpu_hw(24_000, 64_000, 8); // auto would pick np 2 (train cap)
+        let cfg = Config {
+            deterministic: true,
+            ..Config::default()
+        };
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
         assert!(p.argv.windows(2).any(|w| w == ["-np", "1"]));
+        assert!(p.argv.windows(2).any(|w| w == ["--ctx-size", "16384"]));
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.contains("deterministic = true: slots pinned")));
+
+        // Explicit slots > 1 loses to the pin, loudly.
+        let cfg_pin = Config {
+            deterministic: true,
+            slots: 3,
+            ..Config::default()
+        };
+        let p2 = compile(
+            &input(&g, &hw, &cfg_pin, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p2.argv.windows(2).any(|w| w == ["-np", "1"]));
+        assert!(p2
+            .warnings
+            .iter()
+            .any(|w| w.contains("explicit slots = 3 ignored")));
+
+        // Overlay false un-pins a global true.
+        let ov_off = ModelOverride {
+            deterministic: Some(false),
+            ..Default::default()
+        };
+        let mut inp3 = input(&g, &hw, &cfg, &ALL_FLAGS);
+        inp3.overlay = &ov_off;
+        let p3 = compile(&inp3, &TuningOverrides::default()).unwrap();
+        assert!(
+            p3.argv.windows(2).any(|w| w == ["-np", "2"]),
+            "{:?}",
+            p3.argv
+        );
+
+        // slots = 1 + deterministic: already deterministic-shaped, silent.
+        let cfg1 = Config {
+            deterministic: true,
+            slots: 1,
+            ..Config::default()
+        };
+        let p4 = compile(
+            &input(&g, &hw, &cfg1, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p4.argv.windows(2).any(|w| w == ["-np", "1"]));
+        assert!(!p4.warnings.iter().any(|w| w.contains("deterministic")));
+    }
+
+    #[test]
+    fn unit__deterministic__mistralrs_lane_pins_np() {
+        let g = meta();
+        let mut flags = BTreeSet::new();
+        flags.insert("--paged-attn".to_string());
+        let cfg = Config {
+            deterministic: true,
+            ..Config::default()
+        };
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let mut inp = input(&g, &hw, &cfg, &flags);
+        inp.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p.argv.windows(2).any(|w| w == ["-np", "1"]));
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.contains("deterministic = true")));
+    }
+
+    #[test]
+    fn unit__auto_slots__vulkan_class_with_projector_caps_conservatively() {
+        let g = meta();
+        let cfg = Config::default();
+        // Mixed census — integrated iGPU alongside the discrete card —
+        // is the vulkan-class signature (a CUDA census lists CUDA
+        // devices only). 5900 MiB vram: headroom 688 MiB admits exactly
+        // one 16384-ctx slot at the conservative per-token charge.
+        let vulkan_hw = Hardware {
+            physical_cores: 8,
+            total_ram_mib: 64_000,
+            gpus: vec![
+                GpuInfo {
+                    name: "iGPU".into(),
+                    description: "Intel(R) Graphics (RPL-S)".into(),
+                    total_mib: 10_256,
+                    free_mib: 10_256,
+                },
+                GpuInfo {
+                    name: "RTX".into(),
+                    description: "NVIDIA CUDA".into(),
+                    total_mib: 5_900,
+                    free_mib: 5_900,
+                },
+            ],
+        };
+        let mmproj = std::env::temp_dir().join("pallama-test-mmproj.gguf");
+        std::fs::write(&mmproj, vec![0u8; 1024]).unwrap();
+        let mut inp = input(&g, &vulkan_hw, &cfg, &ALL_FLAGS);
+        inp.mmproj_path = Some(mmproj.to_str().unwrap());
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p.argv.windows(2).any(|w| w == ["-np", "1"]), "{:?}", p.argv);
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("slots auto capped at 1") && w.contains("vulkan-class")),
+            "{:?}",
+            p.warnings
+        );
+
+        // CUDA-class census with the same projector: flat cap stands.
+        let hw = gpu_hw(5_900, 64_000, 8);
+        let mut inp2 = input(&g, &hw, &cfg, &ALL_FLAGS);
+        inp2.mmproj_path = Some(mmproj.to_str().unwrap());
+        let p2 = compile(&inp2, &TuningOverrides::default()).unwrap();
+        assert!(p2.argv.windows(2).any(|w| w == ["-np", "2"]));
+        assert!(!p2.warnings.iter().any(|w| w.contains("capped")));
+
+        // Vulkan-class census WITHOUT a projector: measured healthy at
+        // multi-slot totals, so the flat cap stands.
+        let p3 = compile(
+            &input(&g, &vulkan_hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p3.argv.windows(2).any(|w| w == ["-np", "2"]));
+        assert!(!p3.warnings.iter().any(|w| w.contains("capped")));
+    }
+
+    #[test]
+    fn unit__auto_slots__scoped_hardware_full_census_still_caps() {
+        // Product shape (supervisor spawn path): the auto GPU pick
+        // scopes `hardware` to the PICKED card only, while the engine
+        // census stays mixed — the vulkan build enumerated the iGPU
+        // alongside the discrete card. Build-class detection must read
+        // the census, or the cap silently dies at spawn time
+        // (measured live: scoped census spawned np4/65536 and rode the
+        // VRAM cliff that the mixed-census cap was built to avoid).
+        let g = meta();
+        let cfg = Config::default();
+        let mixed_census = vec![
+            GpuInfo {
+                name: "iGPU".into(),
+                description: "Intel(R) Graphics (RPL-S)".into(),
+                total_mib: 10_256,
+                free_mib: 10_256,
+            },
+            GpuInfo {
+                name: "RTX".into(),
+                description: "NVIDIA GeForce RTX 4070 Laptop GPU".into(),
+                total_mib: 5_900,
+                free_mib: 5_900,
+            },
+        ];
+        let scoped_hw = Hardware {
+            physical_cores: 8,
+            total_ram_mib: 64_000,
+            gpus: vec![mixed_census[1].clone()],
+        };
+        let mmproj = std::env::temp_dir().join("pallama-test-mmproj-scoped.gguf");
+        std::fs::write(&mmproj, vec![0u8; 1024]).unwrap();
+        let mut inp = input(&g, &scoped_hw, &cfg, &ALL_FLAGS);
+        inp.mmproj_path = Some(mmproj.to_str().unwrap());
+        inp.engine_census = mixed_census;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv.windows(2).any(|w| w == ["-np", "1"]),
+            "scoped hardware must not hide the vulkan-class build: {:?}",
+            p.argv
+        );
+        assert!(p.warnings.iter().any(|w| w.contains("vulkan-class")));
+    }
+
+    #[test]
+    fn unit__auto_slots__autofit_divides_default_ctx_not_pins() {
+        let g = meta(); // kv/slot @16384 = 896 MiB, train 40960
+        let hw = gpu_hw(24_000, 64_000, 8);
+        // RAM-clamped card (1 GiB effective cache-ram): single slot at
+        // full ctx, but the halved ctx earns capacity — 4x4096 wins.
+        let cfg_tight = Config {
+            cache_ram_mb: 1024,
+            ..Config::default()
+        };
+        let p = compile(
+            &input(&g, &hw, &cfg_tight, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert_eq!(p.ctx_autofit, Some((4_096, 4)));
+        assert!(p.argv.windows(2).any(|w| w == ["-np", "4"]));
+        assert!(p.argv.windows(2).any(|w| w == ["--ctx-size", "16384"]));
+        assert_eq!(p.ctx, 4_096);
+        assert!(p.warnings.iter().any(|w| w.contains("slots auto-fit")));
+
+        // Tuning pin (bench grid): hard pin, never divided.
+        let p2 = compile(
+            &input(&g, &hw, &cfg_tight, &ALL_FLAGS),
+            &TuningOverrides {
+                ctx: Some(16_384),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(p2.ctx_autofit, None);
+        assert!(p2.argv.windows(2).any(|w| w == ["-np", "1"]));
+        assert!(p2.argv.windows(2).any(|w| w == ["--ctx-size", "16384"]));
+
+        // Overlay pin: same hard-pin semantics.
+        let ov = ModelOverride {
+            ctx: Some(16_384),
+            ..Default::default()
+        };
+        let mut inp3 = input(&g, &hw, &cfg_tight, &ALL_FLAGS);
+        inp3.overlay = &ov;
+        let p3 = compile(&inp3, &TuningOverrides::default()).unwrap();
+        assert_eq!(p3.ctx_autofit, None);
+        assert!(p3.argv.windows(2).any(|w| w == ["-np", "1"]));
+
+        // Default ctx already at the floor: nothing to divide.
+        let cfg_floor = Config {
+            default_ctx: 4_096,
+            ..Config::default()
+        };
+        let p4 = compile(
+            &input(&g, &hw, &cfg_floor, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert_eq!(p4.ctx_autofit, None);
+        assert!(p4.argv.windows(2).any(|w| w == ["-np", "4"]));
+
+        // Comfortable card with a shallow default: full cap at the base
+        // ctx, no autofit trade.
+        let cfg_shallow = Config {
+            default_ctx: 8_192,
+            ..Config::default()
+        };
+        let p5 = compile(
+            &input(&g, &hw, &cfg_shallow, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert_eq!(p5.ctx_autofit, None);
+        assert!(p5.argv.windows(2).any(|w| w == ["-np", "4"]));
+        assert!(p5.argv.windows(2).any(|w| w == ["--ctx-size", "32768"]));
+        assert_eq!(p5.ctx, 8_192);
+    }
+
+    #[test]
+    fn unit__kv_est__unified_floor_replaces_f16() {
+        // ALL_FLAGS carries --kv-unified and the default leaves it on: the
+        // VRAM charge collapses to the measured working-set floor,
+        // quant-agnostic (quantization shrinks the RAM buffer, not the
+        // VRAM working set).
+        let hw = gpu_hw(24_000, 64_000, 8);
+        let g = meta();
+        let cfg = Config::default();
+        let inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert_eq!(p.kv_est_bytes, Some(512 * 1024 * 1024));
+        let t = TuningOverrides {
+            kv_quant: Some(true),
+            ..Default::default()
+        };
+        let p2 = compile(&inp, &t).unwrap();
+        assert_eq!(
+            p2.kv_est_bytes,
+            Some(512 * 1024 * 1024),
+            "floor is quant-agnostic"
+        );
+    }
+
+    #[test]
+    fn unit__kv_unified_for__truth_table_for_offline_callers() {
+        // The gateway num_ctx preflight and `coreside` call this WITHOUT a
+        // ProfileInput: same decision as compilation, from (config, model,
+        // manifest flags) alone.
+        let cfg = Config::default();
+        let mut flags = full_flags();
+        assert!(kv_unified_for(&cfg, "qwen3-8b", &flags));
+        flags.remove("--kv-unified");
+        assert!(!kv_unified_for(&cfg, "qwen3-8b", &flags), "engine gate");
+        let opt_out = Config {
+            kv_unified: Some(false),
+            ..Config::default()
+        };
+        let flags = full_flags();
+        assert!(
+            !kv_unified_for(&opt_out, "qwen3-8b", &flags),
+            "user pin wins"
+        );
+    }
+
+    #[test]
+    fn unit__estimate_kv_vram_charge__floor_vs_full() {
+        let hw = gpu_hw(24_000, 64_000, 8);
+        let g = meta();
+        let cfg = Config::default();
+        let unified = input(&g, &hw, &cfg, &ALL_FLAGS);
+        assert_eq!(
+            estimate_kv_vram_charge(&unified, None),
+            Some(512 * 1024 * 1024)
+        );
+        let mut classic_flags = full_flags();
+        classic_flags.remove("--kv-unified");
+        let classic = input(&g, &hw, &cfg, &classic_flags);
+        assert_eq!(
+            estimate_kv_vram_charge(&classic, Some(16_384)).map(|b| b / (1024 * 1024)),
+            Some(896),
+            "classic path keeps the full f16 charge"
+        );
+    }
+
+    #[test]
+    fn unit__mistralrs_pa__auto_off_on_tight_card() {
+        let g = meta();
+        let mut flags = BTreeSet::new();
+        flags.insert("--paged-attn".to_string());
+        let cfg = Config::default();
+        let hw = gpu_hw(6_500, 32_000, 8); // 5000 MiB weights > 75% of 6500
+        let mut tight = input(&g, &hw, &cfg, &flags);
+        tight.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        let p = compile(&tight, &TuningOverrides::default()).unwrap();
+        assert!(p.argv.windows(2).any(|w| w == ["--paged-attn", "off"]));
+        assert!(p.warnings.iter().any(|w| w.contains("paged-attn auto-off")));
+
+        // Comfortable card: the default paged path stands, no flag, no warn.
+        let hw_big = gpu_hw(24_000, 32_000, 8);
+        let mut comfy = input(&g, &hw_big, &cfg, &flags);
+        comfy.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        let p2 = compile(&comfy, &TuningOverrides::default()).unwrap();
+        assert!(!p2.argv.iter().any(|a| a == "--paged-attn"));
+        assert!(!p2.warnings.iter().any(|w| w.contains("paged-attn")));
     }
 
     #[test]
@@ -2964,7 +4669,10 @@ mod tests {
 
     #[test]
     fn unit__overlay_sampler_defaults__argv_flags_and_gating() {
-        let cfg = Config::default();
+        let cfg = Config {
+            slots: 1, // purpose-scoped: sampler flags, not slot sizing
+            ..Config::default()
+        };
         let hw = gpu_hw(12_000, 32_000, 8);
         let g = meta();
         let sd = SamplerDefaults {
@@ -3063,7 +4771,10 @@ mod tests {
 
     #[test]
     fn unit__tuning_overrides__win_over_heuristics() {
-        let cfg = Config::default();
+        let cfg = Config {
+            slots: 1, // purpose-scoped: tuning precedence, not slot sizing
+            ..Config::default()
+        };
         let hw = gpu_hw(12_000, 32_000, 8);
         let g = meta();
         let t = TuningOverrides {
@@ -3251,8 +4962,175 @@ mod tests {
             "--control-vector",
             "--prio",
             "--image-max-tokens",
+            "--lazy-mode",
+            "--tools",
+            "--tools-runtime",
+            "--mcp-servers-config",
+            "--mcp-servers-json",
         ] {
             assert!(!p.argv.iter().any(|a| a == f), "{f} must stay unset");
+        }
+    }
+
+    #[test]
+    fn unit__lazy_mode__emitted_only_on_deviation() {
+        let cfg = Config {
+            lazy_mode: "on".into(),
+            slots: 1, // purpose-scoped: lazy-mode, not slot sizing
+            ..Default::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--lazy-mode" && w[1] == "on"));
+        // Overlay wins over the global pin.
+        let over = ModelOverride {
+            lazy_mode: Some("off".into()),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp2 = input(&g, &hw, &cfg, &ALL_FLAGS);
+        inp2.overlay = &over;
+        let p2 = compile(&inp2, &TuningOverrides::default()).unwrap();
+        assert!(
+            p2.argv
+                .windows(2)
+                .any(|w| w[0] == "--lazy-mode" && w[1] == "off"),
+            "{:?}",
+            p2.argv
+        );
+        assert!(
+            p.warnings.is_empty() && p2.warnings.is_empty(),
+            "p: {:?} p2: {:?}",
+            p.warnings,
+            p2.warnings
+        );
+    }
+
+    #[test]
+    fn unit__lazy_mode__engine_lacking__teaching_warning() {
+        let cfg = Config {
+            lazy_mode: "on".into(),
+            slots: 1, // purpose-scoped: lazy-mode, not slot sizing
+            ..Default::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        // Flags set WITHOUT --lazy-mode: build a trimmed copy of ALL_FLAGS.
+        let flags: BTreeSet<String> = ALL_FLAGS
+            .iter()
+            .filter(|f| f.as_str() != "--lazy-mode")
+            .cloned()
+            .collect();
+        let p = compile(&input(&g, &hw, &cfg, &flags), &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.contains(&"--lazy-mode".to_string()));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("lazy_mode") && w.contains("engine update")),
+            "{:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__server_tools__emits_quartet_when_set() {
+        let mcp = tempfile::NamedTempFile::new().unwrap();
+        let cfg = Config {
+            server_tools: Some("grep_search,read_file".into()),
+            server_tools_runtime: Some("ssh:gpu-box".into()),
+            mcp_servers_config: Some(mcp.path().to_string_lossy().into_owned()),
+            mcp_servers_json: Some(r#"{"mcpServers":{"fs":{}}}"#.into()),
+            slots: 1, // purpose-scoped: tool passthrough, not slot sizing
+            ..Default::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        for (flag, val) in [
+            ("--tools", "grep_search,read_file"),
+            ("--tools-runtime", "ssh:gpu-box"),
+            ("--mcp-servers-config", mcp.path().to_str().unwrap()),
+            ("--mcp-servers-json", r#"{"mcpServers":{"fs":{}}}"#),
+        ] {
+            assert!(
+                p.argv.windows(2).any(|w| w[0] == flag && w[1] == val),
+                "{flag} missing: {:?}",
+                p.argv
+            );
+        }
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+    }
+
+    #[test]
+    fn unit__server_tools__missing_mcp_config__hard_error() {
+        let cfg = Config {
+            mcp_servers_config: Some("/nope/does-not-exist.json".into()),
+            slots: 1,
+            ..Default::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let err = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("does not exist") && err.contains("fix the path"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unit__server_tools__engine_lacking_flags__teaching_warning() {
+        let mcp = tempfile::NamedTempFile::new().unwrap();
+        let cfg = Config {
+            server_tools: Some("all".into()),
+            server_tools_runtime: Some("ssh:gpu-box".into()),
+            mcp_servers_config: Some(mcp.path().to_string_lossy().into_owned()),
+            mcp_servers_json: Some(r#"{"mcpServers":{"fs":{}}}"#.into()),
+            slots: 1,
+            ..Default::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let flags: BTreeSet<String> = ALL_FLAGS
+            .iter()
+            .filter(|f| {
+                !matches!(
+                    f.as_str(),
+                    "--tools" | "--tools-runtime" | "--mcp-servers-config" | "--mcp-servers-json"
+                )
+            })
+            .cloned()
+            .collect();
+        let p = compile(&input(&g, &hw, &cfg, &flags), &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.iter().any(|a| a.starts_with("--tools")));
+        assert!(!p.argv.iter().any(|a| a.starts_with("--mcp")));
+        for flag in [
+            "--tools",
+            "--tools-runtime",
+            "--mcp-servers-config",
+            "--mcp-servers-json",
+        ] {
+            assert!(
+                p.warnings
+                    .iter()
+                    .any(|w| w.contains(flag) && w.contains("lacks the flag")),
+                "{flag} warning missing: {:?}",
+                p.warnings
+            );
         }
     }
 
@@ -3419,7 +5297,10 @@ mod tests {
 
     #[test]
     fn unit__overlay_spm_infill__emitted_and_engine_gated() {
-        let cfg = Config::default();
+        let cfg = Config {
+            slots: 1, // purpose-scoped: spm flag gating, not slot sizing
+            ..Config::default()
+        };
         let hw = gpu_hw(12_000, 32_000, 8);
         let g = meta();
         let o = ModelOverride {
@@ -3605,7 +5486,14 @@ mod tests {
 
     #[test]
     fn unit__wire__kv_est_bytes_quantized() {
-        let cfg = Config::default();
+        // Classic KV layout (kv_unified off): the f16-equivalent estimate
+        // and its quantized grades are the test's subject. The unified
+        // floor has its own test below.
+        let cfg = Config {
+            slots: 1,
+            kv_unified: Some(false),
+            ..Config::default()
+        };
         let hw = gpu_hw(120_000, 64_000, 8); // huge VRAM: no ladder quant
         let g = meta();
         let inp = input(&g, &hw, &cfg, &WIRE_FLAGS);
@@ -3624,7 +5512,11 @@ mod tests {
 
     #[test]
     fn unit__wire__hybrid_linear_without_metadata_warns_and_counts_all_layers() {
-        let cfg = Config::default();
+        let cfg = Config {
+            slots: 1,
+            kv_unified: Some(false),
+            ..Config::default()
+        };
         let hw = gpu_hw(120_000, 64_000, 8); // huge VRAM: no ladder quant
         let mut g = meta();
         g.architecture = "kimi-k3".into();
@@ -3644,7 +5536,11 @@ mod tests {
 
     #[test]
     fn unit__wire__hybrid_linear_interval_fractional_kv_no_warning() {
-        let cfg = Config::default();
+        let cfg = Config {
+            slots: 1,
+            kv_unified: Some(false),
+            ..Config::default()
+        };
         let hw = gpu_hw(120_000, 64_000, 8); // huge VRAM: no ladder quant
         let mut g = meta();
         // qwen35-class: interval 4 over 28 blocks -> 7 full-attention
@@ -3682,26 +5578,30 @@ mod tests {
         // style flags would hard-error against a foreign flag set (the
         // live 500 that birthed this fork). The profile is ctx plus
         // `-np N` for the argv translator to mine — nothing else.
-        let cfg = Config::default();
+        // Explicit slots=1 pins the emission; slots=0 (the new default)
+        // emits nothing and lets the translator's own default apply.
+        let cfg = Config {
+            slots: 1,
+            ..Config::default()
+        };
         let hw = gpu_hw(0, 32_000, 8);
         let g = meta();
         let empty: BTreeSet<String> = BTreeSet::new();
         let mut inp = input(&g, &hw, &cfg, &empty);
         inp.engine_kind = crate::engine_kind::EngineKind::MistralRs;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert_eq!(p.argv, vec!["-np".to_string(), cfg.slots.to_string()]);
+        assert_eq!(p.argv, vec!["-np".to_string(), "1".to_string()]);
         assert!(p.warnings.is_empty());
         assert_eq!(p.kv_est_bytes, None);
-        // slots = 0 (upstream auto) emits nothing — the translator's
-        // own default applies.
-        let cfg0 = Config {
-            slots: 0,
-            ..Default::default()
-        };
-        let mut inp0 = input(&g, &hw, &cfg0, &empty);
-        inp0.engine_kind = crate::engine_kind::EngineKind::MistralRs;
-        let p0 = compile(&inp0, &TuningOverrides::default()).unwrap();
-        assert!(p0.argv.is_empty(), "{:?}", p0.argv);
+        // Default config (slots=0) also emits nothing on this dialect —
+        // pallama's llama-lane auto sizing has no mistral.rs equivalent
+        // (upstream sizes its own sequences).
+        let cfg_def = Config::default();
+        let mut inp_def = input(&g, &hw, &cfg_def, &empty);
+        inp_def.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        let p_def = compile(&inp_def, &TuningOverrides::default()).unwrap();
+        assert!(p_def.argv.is_empty(), "{:?}", p_def.argv);
+        assert!(p_def.warnings.is_empty(), "{:?}", p_def.warnings);
         // pa-memory-fraction rides the dialect argv when the binary has
         // the flag; a missing flag teaches instead of silently dropping.
         let mut flags = BTreeSet::new();

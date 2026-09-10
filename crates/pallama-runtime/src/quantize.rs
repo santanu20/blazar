@@ -20,7 +20,7 @@ pub fn find_imatrix_bin(dirs: &PallamaDirs) -> Result<PathBuf> {
             dirs.engines_dir()
                 .join(&e.tag)
                 .join(format!("llama-{}", e.tag))
-                .join("llama-imatrix")
+                .join(crate::tool_file_name("llama-imatrix"))
         })
         .find(|p| p.exists())
         .ok_or_else(|| {
@@ -43,17 +43,22 @@ where
     F: FnMut(&str),
 {
     // Verified upstream interface (tools/imatrix print_usage): -m -f -o
-    // --output-format gguf. chunk_count stays advisory (0 = default).
-    let _ = chunk_count;
-    let result = std::process::Command::new(bin.as_ref())
-        .arg("-m")
+    // --output-format gguf. chunk_count 0 = tool default.
+    let mut cmd = std::process::Command::new(bin.as_ref());
+    cmd.arg("-m")
         .arg(model)
         .arg("-f")
         .arg(calibration_file)
         .arg("-o")
         .arg(out)
         .arg("--output-format")
-        .arg("gguf")
+        .arg("gguf");
+    // F99: pass the calibration chunk budget through when the caller set
+    // one (0 keeps the tool's own default).
+    if chunk_count > 0 {
+        cmd.arg("--chunk-count").arg(chunk_count.to_string());
+    }
+    let result = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
@@ -92,7 +97,7 @@ pub fn find_quantize_bin(dirs: &PallamaDirs) -> Result<PathBuf> {
             dirs.engines_dir()
                 .join(&e.tag)
                 .join(format!("llama-{}", e.tag))
-                .join("llama-quantize")
+                .join(crate::tool_file_name("llama-quantize"))
         })
         .find(|p| p.exists())
         .ok_or_else(|| {
@@ -112,7 +117,7 @@ pub fn find_perplexity_bin(dirs: &PallamaDirs) -> Result<PathBuf> {
             dirs.engines_dir()
                 .join(&e.tag)
                 .join(format!("llama-{}", e.tag))
-                .join("llama-perplexity")
+                .join(crate::tool_file_name("llama-perplexity"))
         })
         .find(|p| p.exists())
         .ok_or_else(|| {

@@ -38,12 +38,30 @@ impl DaemonLock {
                         path.display()
                     ));
                 }
-                // Stale lock from a dead daemon: take over.
+                // Stale lock from a dead daemon: take over. F90: loop
+                // back through `create_new` instead of remove+plain-write
+                // — the old sequence had a window where a concurrent
+                // successor's fresh pidfile landed between our remove and
+                // our write, and we clobbered it (two daemons, both
+                // convinced they hold the lock).
                 tracing::warn!("removing stale pidfile for dead pid {existing}");
                 std::fs::remove_file(&path)
                     .with_context(|| format!("remove {}", path.display()))?;
-                std::fs::write(&path, format!("{pid}\n"))?;
-                Ok(Self { path, pid })
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    Ok(mut f) => {
+                        use std::io::Write as _;
+                        writeln!(f, "{pid}").ok();
+                        Ok(Self { path, pid })
+                    }
+                    // Lost the re-create race to a live successor: refuse.
+                    Err(_) => Err(anyhow!(
+                        "pallama already running (lock re-taken while replacing stale pidfile); retry"
+                    )),
+                }
             }
             Err(e) => Err(anyhow!("create {}: {e}", path.display())),
         }
@@ -76,7 +94,22 @@ pub fn process_alive_by_pid(pid: u32) -> bool {
     unsafe { libc::kill(i32::try_from(pid).unwrap_or(-1), 0) == 0 }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+#[must_use]
+pub fn process_alive_by_pid(pid: u32) -> bool {
+    // F89: `/proc` never exists on Windows, so the old probe made stale
+    // takeover ALWAYS win — two daemons on one box. tasklist is the
+    // dependency-free truth source (CSV rows quote the pid column).
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
+}
+
+#[cfg(not(any(unix, windows)))]
 #[must_use]
 pub fn process_alive_by_pid(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
@@ -89,7 +122,12 @@ fn process_alive(pid: u32) -> bool {
     unsafe { libc::kill(i32::try_from(pid).unwrap_or(-1), 0) == 0 }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    process_alive_by_pid(pid)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn process_alive(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
 }

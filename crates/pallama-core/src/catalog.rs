@@ -95,6 +95,17 @@ pub fn spec_pair_for(model: &str) -> Option<&'static SpecPair> {
         .find(|p| model.starts_with(&p.model_prefix))
 }
 
+/// Spec-draft pair constrained to one engine spec type (e.g. the manual
+/// `spec = "eagle3"` mode must resolve an eagle3 head, not the generic
+/// draft-simple sibling that plain auto would pick).
+#[must_use]
+pub fn spec_pair_for_typed(model: &str, spec_type: &str) -> Option<&'static SpecPair> {
+    catalog()
+        .spec_pairs
+        .iter()
+        .find(|p| model.starts_with(&p.model_prefix) && p.spec_type == spec_type)
+}
+
 /// Classic DP edit distance; catalog sizes are tiny, O(nm) is fine.
 #[must_use]
 pub fn levenshtein(a: &str, b: &str) -> usize {
@@ -180,6 +191,23 @@ mod tests {
         assert_eq!(pair.spec_type, "draft-simple");
         assert!(pair.draft_repo.starts_with("ggml-org/Qwen3-0.6B"));
         assert!(spec_pair_for("gemma3-4b").is_none());
+    }
+
+    #[test]
+    fn unit__spec_pair_typed__eagle3_pair_order_preserved() {
+        // Typed lookup finds the eagle3 head for the exact family…
+        let pair =
+            spec_pair_for_typed("qwen3-8b", "draft-eagle3").expect("qwen3-8b has an eagle3 pair");
+        assert_eq!(pair.spec_type, "draft-eagle3");
+        assert!(pair.draft_repo.starts_with("williamliao/Qwen3-8B-EAGLE3"));
+        // …while untyped auto lookup on the SAME name keeps the generic
+        // draft-simple sibling (order in catalog.json is precedence).
+        assert_eq!(
+            spec_pair_for("qwen3-8b").expect("auto pair").spec_type,
+            "draft-simple"
+        );
+        // Other families have no eagle3 pair yet.
+        assert!(spec_pair_for_typed("qwen3-14b", "draft-eagle3").is_none());
     }
 
     #[test]
