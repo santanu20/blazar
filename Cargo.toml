@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
@@ -47,8 +47,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 futures = "0.3"
 async-trait = "0.1"
 dashmap = "6"
-bytes = "1"
-http-body-util = "0.1"
 http-body = "1"
 tokio-stream = { version = "0.1", features = ["sync"] }
 
