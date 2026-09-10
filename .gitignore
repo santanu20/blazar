@@ -8,3 +8,6 @@ __pycache__/
 
 # stray runtime pidfiles
 *.pid
+
+# nuclear-audit working ledgers
+/.audit/

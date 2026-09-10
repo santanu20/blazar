@@ -58,7 +58,7 @@ RadixAttention in-engine [V027][SGL].
 | B6 | Long-prefill pacing (protect short-request TTFT while big prompts run) | ✅ | GW | M | shipped: body >= 64KiB demotes SLO class one tier at admission (queue.rs PREFILL_HEAVY_BYTES) |
 | B7 | Adaptive spec throttle by load (batch-size-aware steps) | ✅ | CORE | M | [SGL] #24055/#25940 — shipped: adaptive_decay/adaptive_target opt-in knobs |
 | B8 | Identical-prompt single-flight coalescing | ✅ | GW | M | shipped: FNV-1a body key, per-key mutex, twin waits <=5s then proceeds; non-stream chat <=32KiB; stream folds apart |
-| B9 | Queue-depth-driven slots resize (restart-safe) | ✅ | SUP | M | shipped 2026-09-08: adaptive_slots (opt-in) adopts -np+1 after 60s sustained concurrency, in-memory cap 4, slots_auto_adopted event; tune --slots = persistent |
+| B9 | Queue-depth-driven slots resize (restart-safe) | ✅ | SUP | M | shipped 2026-09-08: adaptive_slots (default-on) adopts -np+1 after 60s sustained concurrency, in-memory cap 4, slots_auto_adopted event; tune --slots = persistent |
 | B10 | num_ctx header restart | ✅ | GW | — | have (133 ms measured) |
 
 ## C. Routing & multi-instance (8)

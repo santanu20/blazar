@@ -46,6 +46,18 @@ function Fail([string]$Message) { Write-Host "ERROR: $Message" -ForegroundColor 
 
 $TaskName = 'pallama'
 
+function Stop-PallamaGraceful([string]$ExePath) {
+    # F155: drain in-flight requests first (`pallama stop` HTTP), then
+    # force-kill only survivors — install.sh:170 parity.
+    try {
+        if ($ExePath -and (Test-Path $ExePath)) {
+            & $ExePath stop *> $null
+            Start-Sleep -Milliseconds 800
+        }
+    } catch { }
+    Get-Process -Name pallama -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
 if ($Uninstall) {
     if (-not $InstallDir) { $InstallDir = Join-Path $env:LOCALAPPDATA 'Programs\pallama' }
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -53,28 +65,36 @@ if ($Uninstall) {
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
         Write-Host ">>> removed scheduled task $TaskName"
     }
-    Get-Process -Name pallama -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    # F155: graceful drain before the hard kill.
+    Stop-PallamaGraceful (Join-Path $InstallDir 'pallama.exe')
     if (Test-Path (Join-Path $InstallDir 'pallama.exe')) {
         Remove-Item $InstallDir -Recurse -Force
         Write-Host ">>> removed $InstallDir"
     }
+    # F155b: exact-entry PATH removal (split on ';', drop the precise
+    # install dir, rejoin) — substring matching over-matches sibling
+    # directories and the leading-';'-only replace left stale entries.
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    if ($userPath -and $userPath -like "*$InstallDir*") {
-        [Environment]::SetEnvironmentVariable('Path', ($userPath -replace [regex]::Escape(";$InstallDir"), ''), 'User')
-        Write-Host '>>> removed PATH entry'
+    if ($userPath) {
+        $entries = @($userPath.Split(';') | Where-Object { $_ -ne '' -and $_ -ne $InstallDir })
+        if ($entries.Count -ne @($userPath.Split(';') | Where-Object { $_ -ne '' }).Count) {
+            [Environment]::SetEnvironmentVariable('Path', ($entries -join ';'), 'User')
+            Write-Host '>>> removed PATH entry'
+        }
     }
     Write-Host '>>> uninstall complete (models + config under LOCALAPPDATA are user data; delete manually if wanted)'
     exit 0
 }
 
 function Register-PallamaTask([string]$ExePath) {
-    # Start at logon (user scope, no admin), keep the daemon alive via
-    # the task's restart policy; `pallama stop` still works — the task
-    # only starts it, it does not supervise it.
+    # Start at logon (user scope, no admin). The task restarts the
+    # daemon only on CRASH (non-zero exit); `pallama stop` exits 0 and
+    # is never undone. F156: restart settings explicit, not defaulted.
     $action = New-ScheduledTaskAction -Execute $ExePath -Argument 'serve'
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
-        -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
+        -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) `
+        -RestartCount 3 -RestartInterval ([TimeSpan]::FromSeconds(30))
     Register-ScheduledTask -TaskName $script:TaskName -Action $action -Trigger $trigger `
         -Settings $settings -Force | Out-Null
     Start-ScheduledTask -TaskName $script:TaskName
@@ -98,7 +118,13 @@ if (-not $Build) {
     try {
         $release = Invoke-RestMethod -Uri "$ApiBase/$releasePath" -Headers $headers
     } catch {
-        Fail "could not fetch release metadata: $($_.Exception.Message)"
+        # F155b: surface the API's own message (rate-limit etc.), not a
+        # raw exception blob.
+        $detail = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
+        if ($detail -match 'rate limit') {
+            Fail "GitHub API rate limit exceeded - set GITHUB_TOKEN and retry, or wait for the window to reset."
+        }
+        Fail "could not fetch release metadata: $detail"
     }
 
     $assetName = "pallama-$($release.tag_name)-$Target.zip"
@@ -178,14 +204,19 @@ try {
     }
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    # Stop a running daemon so the exe file is not locked.
-    Get-Process -Name pallama -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    # Stop a running daemon so the exe file is not locked (F155: HTTP
+    # drain first, force only for survivors).
+    $taskExisted = [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
+    Stop-PallamaGraceful (Join-Path $InstallDir 'pallama.exe')
     Copy-Item $exe (Join-Path $InstallDir 'pallama.exe') -Force
 
+    # F155b: exact-entry PATH add — `-notlike "*dir*"` over-matched
+    # sibling directories (Programs\pallama vs Programs\pallama-old).
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     if (-not $userPath) { $userPath = '' }
-    if ($userPath -notlike "*$InstallDir*") {
-        [Environment]::SetEnvironmentVariable('Path', "$userPath;$InstallDir", 'User')
+    $entries = @($userPath.Split(';') | Where-Object { $_ -ne '' })
+    if ($entries -notcontains $InstallDir) {
+        [Environment]::SetEnvironmentVariable('Path', (($entries + $InstallDir) -join ';'), 'User')
         Write-Host ">>> NOTE: added $InstallDir to your user PATH - open a new terminal for it to take effect"
     }
 
@@ -225,6 +256,12 @@ try {
         } catch { Write-Host ">>> WARN: model pull failed - run: pallama pull $env:PALLAMA_INSTALL_MODEL" }
     }
     if ($WithService) { Register-PallamaTask $installedExe }
+    elseif ($taskExisted) {
+        # F155b: binary was replaced under an existing task — bring the
+        # daemon back up on the new build (Register path re-starts it).
+        Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        Write-Host ">>> restarted scheduled task '$TaskName' on the upgraded binary"
+    }
     Write-Host '>>> system ready - check health: pallama doctor'
     Write-Host '>>> All inference is upstream llama.cpp - ggml, ggerganov and contributors did the hard parts.'
 } finally {

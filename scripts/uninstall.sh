@@ -14,8 +14,12 @@
 #                             NEVER pkill -f, which self-matches)
 #   2. system artifacts       binary (PALLAMA_SYSTEM_BIN_DIR), unit file,
 #                             unit drop-ins, stale ~/.local/bin copy
-#   3. user state             ~/.config/pallama (config + gh-token.env),
-#                             ~/.local/share/pallama minus models
+#   3. user state             ~/.local/share/pallama minus models;
+#                             ~/.config/pallama is KEPT by default (it
+#                             holds your port pin, keys and settings —
+#                             losing it silently re-creates defaults on
+#                             the next install and can collide with
+#                             ollama on 11434). --purge removes it too.
 #   4. models (ASKED)         GGUF models + whisper ggml models — prompt
 #                             shows sizes first; default keep
 #
@@ -23,6 +27,7 @@
 #   --dry-run         print every action, remove nothing
 #   --remove-models   non-interactive full nuke (skips the model prompt)
 #   --keep-models     non-interactive, models explicitly kept
+#   --purge           also remove ~/.config/pallama (config + token)
 #   --yes             no confirmations at all (same as --remove-models)
 #   --help            this text
 #
@@ -45,13 +50,15 @@ usage() { sed -n '2,37p' "$0"; exit 0; }
 
 DRY=0
 MODELS=ask
+PURGE=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY=1 ;;
         --remove-models | --yes) MODELS=remove ;;
         --keep-models) MODELS=keep ;;
+        --purge) PURGE=1 ;;
         --help | -h) usage ;;
-        *) error "unknown option: $1 (supported: --dry-run, --remove-models, --keep-models, --yes, --help)" ;;
+        *) error "unknown option: $1 (supported: --dry-run, --remove-models, --keep-models, --yes, --purge, --help)" ;;
     esac
     shift
 done
@@ -62,6 +69,7 @@ SUDO="${PALLAMA_SUDO-sudo}"
 
 # run <desc> <cmd...>: every mutation goes through here so --dry-run
 # covers everything and the log doubles as an action transcript.
+FAILURES=0
 run() {
     _desc=$1
     shift
@@ -69,8 +77,15 @@ run() {
         printf '  [dry-run] %s\n' "$_desc"
         return 0
     fi
-    "$@" >/dev/null 2>&1 || true
-    printf '  %s\n' "$_desc"
+    if "$@" >/dev/null 2>&1; then
+        printf '  %s\n' "$_desc"
+    else
+        # F152: never print an action that did not happen — the
+        # transcript must not claim success over a failed mutation.
+        _rc=$?
+        FAILURES=$((FAILURES + 1))
+        printf '  [FAIL rc=%s] %s\n' "$_rc" "$_desc"
+    fi
 }
 
 BIN_DIR="${PALLAMA_SYSTEM_BIN_DIR:-/usr/local/bin}"
@@ -190,10 +205,15 @@ if [ "$(uname -s)" = Darwin ]; then
 fi
 
 # --------------------------------------------------------- 3. user state
-status "removing user state (config + store + engines + caches)"
-if [ -e "$CONFIG_DIR" ]; then
-    run "remove $CONFIG_DIR (config.toml, gh-token.env)" rm -rf "$CONFIG_DIR"
+# Config is user settings (port pin, keys, overlays) — kept unless --purge.
+if [ "$PURGE" -eq 1 ]; then
+    if [ -e "$CONFIG_DIR" ]; then
+        run "purge $CONFIG_DIR (config.toml, gh-token.env)" rm -rf "$CONFIG_DIR"
+    fi
+else
+    status "kept $CONFIG_DIR (config.toml, gh-token.env, backups) — re-run with --purge to remove"
 fi
+status "removing regenerable user state (store + engines + caches)"
 
 # Data dir minus models: remove named subpaths (store, engines, runtime,
 # config snapshots, audit log, KV sessions, spec caches — all regenerable
@@ -250,5 +270,9 @@ if [ "$DRY" != 1 ] && [ -d "$DATA_DIR" ]; then
     rmdir "$DATA_DIR" 2>/dev/null || true
 fi
 
+if [ "$FAILURES" -gt 0 ]; then
+    status "INCOMPLETE: ${FAILURES} action(s) failed — re-run and investigate the [FAIL] lines above"
+    exit 1
+fi
 status "done. pallama fully removed (validation sandboxes under ~/.cache untouched)"
 [ "$MODELS" = keep ] && status "models remain at $MODELS_DIR — delete manually when ready"

@@ -130,13 +130,13 @@ jobs:
 
           Linux / macOS (WSL included):
 
-              curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/scripts/install.sh | PALLAMA_REPO=${GITHUB_REPOSITORY} sh
+              curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/master/scripts/install.sh | PALLAMA_REPO=${GITHUB_REPOSITORY} sh
 
           (or clone and run \`sh scripts/install.sh --build\` to compile from source)
 
           Windows (PowerShell):
 
-              irm https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/scripts/install.ps1 | iex
+              irm https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/master/scripts/install.ps1 | iex
 
           Installers verify each asset's sha256 against the GitHub release metadata
           before installing (the same mechanism as \`pallama engine update\`).
@@ -182,7 +182,9 @@ jobs:
             echo "retry $i/3 (asset digests may still be computing)"
             sleep 30
           done
-          export PATH="$HOME/.local/bin:$PATH"
+          # install.sh installs to /usr/local/bin (no user-local
+          # fallback by policy — F161: the old ~/.local/bin PATH export
+          # pointed at a location the installer no longer uses).
           command -v pallama
           pallama --version
       - name: Install (ps1)

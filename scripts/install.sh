@@ -160,6 +160,19 @@ done
 SUDO="${PALLAMA_SUDO-sudo}"
 [ "$(id -u)" -eq 0 ] && SUDO=
 
+# F151: under `sudo sh install.sh`, env_reset makes HOME=/root while the
+# data-owning user is SUDO_USER — user-keyed paths (pidfile stop, config
+# poll, legacy user unit, launch agents, stale ~/.local copies) must
+# resolve through the INVOKING user's home or the unit crash-loops on a
+# port the real user's daemon already owns.
+USER_HOME="$HOME"
+if [ "$(id -u)" -eq 0 ] && [ "${SUDO_USER:-}" != "" ] && [ "$SUDO_USER" != "root" ]; then
+    _hm=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
+    [ -z "$_hm" ] && [ "$(uname -s)" = Darwin ] &&
+        _hm=$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory 2>/dev/null | awk '{print $NF}')
+    [ -n "$_hm" ] && USER_HOME="$_hm"
+fi
+
 # Privilege is enforced where it's needed: the privileged install command
 # itself fails with "cannot create /usr/local/bin (need sudo?)" when root
 # is genuinely unavailable — no fragile tty/sudo probing up front.
@@ -168,7 +181,7 @@ SUDO="${PALLAMA_SUDO-sudo}"
 # NEVER touches models or config — those are user data.
 if [ "$UNINSTALL" = 1 ]; then
     if command -v pallama >/dev/null 2>&1; then pallama stop >/dev/null 2>&1 || true; fi
-    for BIN in "${PALLAMA_SYSTEM_BIN_DIR:-/usr/local/bin}/pallama" "$HOME/.local/bin/pallama"; do
+    for BIN in "${PALLAMA_SYSTEM_BIN_DIR:-/usr/local/bin}/pallama" "$USER_HOME/.local/bin/pallama"; do
         if [ -e "$BIN" ]; then
             ([ -w "$(dirname "$BIN")" ] && rm -f "$BIN") || $SUDO rm -f "$BIN"
             status "removed $BIN"
@@ -179,16 +192,16 @@ if [ "$UNINSTALL" = 1 ]; then
         $SUDO rm -f /etc/systemd/system/pallama.service && status "removed system unit"
         $SUDO systemctl daemon-reload 2>/dev/null || true
     fi
-    if [ -f "$HOME/.config/systemd/user/pallama.service" ]; then
+    if [ -f "$USER_HOME/.config/systemd/user/pallama.service" ]; then
         systemctl --user disable --now pallama 2>/dev/null || true
-        rm -f "$HOME/.config/systemd/user/pallama.service" && status "removed legacy user unit"
+        rm -f "$USER_HOME/.config/systemd/user/pallama.service" && status "removed legacy user unit"
         systemctl --user daemon-reload 2>/dev/null || true
     fi
     if [ "$(uname -s)" = Darwin ]; then
         launchctl bootout "gui/$(id -u)/dev.pallama" 2>/dev/null ||
-            launchctl unload "$HOME/Library/LaunchAgents/dev.pallama.plist" 2>/dev/null || true
-        if [ -f "$HOME/Library/LaunchAgents/dev.pallama.plist" ]; then
-            rm -f "$HOME/Library/LaunchAgents/dev.pallama.plist" && status "removed launch agent"
+            launchctl unload "$USER_HOME/Library/LaunchAgents/dev.pallama.plist" 2>/dev/null || true
+        if [ -f "$USER_HOME/Library/LaunchAgents/dev.pallama.plist" ]; then
+            rm -f "$USER_HOME/Library/LaunchAgents/dev.pallama.plist" && status "removed launch agent"
         fi
         if [ -f /Library/LaunchDaemons/dev.pallama.plist ]; then
             $SUDO launchctl bootout system/dev.pallama 2>/dev/null ||
@@ -294,7 +307,7 @@ install_launchd() {
     <key>UserName</key>
     <string>${SVC_USER}</string>"
     else
-        PLIST_DIR="$HOME/Library/LaunchAgents"
+        PLIST_DIR="$USER_HOME/Library/LaunchAgents"
         USER_KEY=
     fi
     PLIST_PATH="$PLIST_DIR/$LABEL.plist"
@@ -341,8 +354,8 @@ EOF
 # Shared by the systemd and launchd install paths.
 poll_healthz() {
     # poll_healthz <log-hint>
-    HOST=$(sed -n 's/^host[[:space:]]*=[[:space:]]*//p' "$HOME/.config/pallama/config.toml" 2>/dev/null | head -1 | tr -d '"')
-    PORT=$(sed -n 's/^port[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$HOME/.config/pallama/config.toml" 2>/dev/null | head -1)
+    HOST=$(sed -n 's/^host[[:space:]]*=[[:space:]]*//p' "$USER_HOME/.config/pallama/config.toml" 2>/dev/null | head -1 | tr -d '"')
+    PORT=$(sed -n 's/^port[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$USER_HOME/.config/pallama/config.toml" 2>/dev/null | head -1)
     HOST=${HOST:-127.0.0.1}
     PORT=${PORT:-11434}
     i=0
@@ -375,7 +388,7 @@ install_system() {
     error "install to ${BIN_DIR} failed"
     $SUDO mv -f "$BIN_DIR/pallama.new.$$" "$BIN_DIR/pallama"
     # A user-started daemon owns the port; the unit would crash-loop.
-    PIDFILE="$HOME/.local/share/pallama/run/pallama.pid"
+    PIDFILE="$USER_HOME/.local/share/pallama/run/pallama.pid"
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
         kill -TERM "$(cat "$PIDFILE")" 2>/dev/null || true
         i=0
@@ -417,6 +430,9 @@ Group=${SVC_GROUP}
 ${SG_LINE}
 Restart=always
 RestartSec=3
+# pallama serve exits 3 on a hard bind conflict (another server owns the
+# port) — that is never transient, so do not restart-loop it.
+RestartPreventExitStatus=3
 
 [Install]
 WantedBy=multi-user.target
@@ -448,9 +464,9 @@ EOF
     # shellcheck disable=SC3013 # XSI extension; dash/busybox/bash/BSD sh
     # all implement it, and the degraded path removes a copy policy wants
     # gone anyway.
-    if [ -e "$HOME/.local/bin/pallama" ] &&
-       ! [ "$HOME/.local/bin/pallama" -ef "$BIN_DIR/pallama" ]; then
-        rm -f "$HOME/.local/bin/pallama" && status "removed stale user-path copy ~/.local/bin/pallama"
+    if [ -e "$USER_HOME/.local/bin/pallama" ] &&
+       ! [ "$USER_HOME/.local/bin/pallama" -ef "$BIN_DIR/pallama" ]; then
+        rm -f "$USER_HOME/.local/bin/pallama" && status "removed stale user-path copy ~/.local/bin/pallama"
     fi
     # One-click readiness: persist config migrations (legacy api_keys ->
     # [[keys]] etc.) so the first `pallama` invocation never FAILs on an
