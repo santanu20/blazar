@@ -448,7 +448,18 @@ async fn integration__sentinel__responses_api_stream_and_nonstream() {
     assert!(cs.contains(&"tool_args_invalid_json"), "{cs:?}");
     ts.state.sup.shutdown_all().await.unwrap();
 
-    let ts = start(Config::default(), &[("STUB_FINISH", "length")], false).await;
+    // slots pinned: the stub reports usage from the compiled argv
+    // --ctx-size, and auto slots scale that total — the mapping math this
+    // test proves is orthogonal to slot sizing.
+    let ts = start(
+        Config {
+            slots: 1,
+            ..Config::default()
+        },
+        &[("STUB_FINISH", "length")],
+        false,
+    )
+    .await;
     let c = client();
     let r: serde_json::Value = c
         .post(format!("{}/v1/responses", ts.base))

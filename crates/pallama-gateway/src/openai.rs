@@ -11,8 +11,6 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
-use pallama_core::store::Store;
-
 use crate::proxy::{
     admission_gate_slo, affinity_hash_bytes, ensure_with_admission, openai_error, path_and_query,
     proxy_request,
@@ -26,13 +24,10 @@ use axum::Extension;
 /// GET /v1/models — synthesized from the local store (any pulled model is
 /// servable; the engine is hot-swapped underneath).
 pub async fn models(State(state): State<Arc<AppState>>) -> Response {
-    let store = match Store::open(&state.dirs) {
-        Ok(s) => s,
-        Err(e) => return openai_error(500, &e.to_string()),
-    };
-    let list = match store.list_models() {
-        Ok(l) => l,
-        Err(e) => return openai_error(500, &e.to_string()),
+    let list = match state.with_store(pallama_core::Store::list_models) {
+        Some(Ok(l)) => l,
+        Some(Err(e)) => return openai_error(500, &e.to_string()),
+        None => return openai_error(500, "store unavailable"),
     };
     let data: Vec<serde_json::Value> = list
         .iter()
@@ -67,9 +62,9 @@ pub async fn embeddings(
     // resolve miss fall through to the proxy path (it owns 404 shaping).
     let requested = extract_model(&body);
     let late = requested.as_deref().is_some_and(|m| {
-        pallama_core::store::Store::open(&state.dirs)
-            .ok()
-            .and_then(|s| crate::proxy::resolve_model(&s, m).ok())
+        state
+            .with_store(|s| crate::proxy::resolve_model(s, m).ok())
+            .flatten()
             .is_some_and(|row| state.config.effective_late_chunking(&row.name))
     });
     if !late {
@@ -197,17 +192,33 @@ pub async fn openai_proxy(
     if let Some(resp) = llamacpp_only_gate(&state, &uri) {
         return resp;
     }
-    let model = extract_model(&body).or_else(|| {
-        let ct = headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if ct.starts_with("multipart/form-data") {
-            extract_model_multipart(&body, ct)
-        } else {
-            None
-        }
-    });
+    // ONE parse of the JSON body serves every downstream consumer on
+    // this lane (model extraction, usage-flag injection, model-id
+    // rewrite, single-flight stream detection); previously each
+    // re-parsed the same bytes. Multipart bodies skip JSON entirely.
+    let parsed_body: Option<serde_json::Value> = if headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("multipart/form-data"))
+    {
+        None
+    } else {
+        serde_json::from_slice(&body).ok()
+    };
+    let model = parsed_body
+        .as_ref()
+        .and_then(|v| v.get("model")?.as_str().map(str::to_string))
+        .or_else(|| {
+            let ct = headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if ct.starts_with("multipart/form-data") {
+                extract_model_multipart(&body, ct)
+            } else {
+                None
+            }
+        });
     let Some(model) = model else {
         return openai_error(400, "missing `model` field in request body");
     };
@@ -331,6 +342,7 @@ pub async fn openai_proxy(
         trace_ext.map(|Extension(t)| t.0),
         Some(guard),
         key_ext.map(|Extension(k)| k),
+        parsed_body,
     )
     .await
 }
@@ -406,8 +418,9 @@ fn llamacpp_only_gate(state: &AppState, uri: &Uri) -> Option<Response> {
     {
         return None;
     }
-    let store = pallama_core::Store::open(&state.dirs).ok()?;
-    let row = store.active_engine().ok().flatten()?;
+    let row = state
+        .with_store(|s| s.active_engine().ok().flatten())
+        .flatten()?;
     if row.kind != pallama_core::engine_kind::EngineKind::MistralRs {
         return None;
     }
@@ -526,6 +539,7 @@ pub async fn scoped_proxy(
         trace_ext.map(|Extension(t)| t.0),
         Some(guard),
         key_ext.map(|Extension(k)| k),
+        None,
     )
     .await
 }
@@ -678,6 +692,7 @@ pub async fn responses_api(
             trace_ext.map(|Extension(t)| t.0),
             Some(guard),
             key_ext.map(|Extension(k)| k),
+            None,
         )
         .await;
         if stream && store {
@@ -845,13 +860,9 @@ pub async fn lora_adapters(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let store = match Store::open(&state.dirs) {
-        Ok(s) => s,
-        Err(e) => return openai_error(500, &e.to_string()),
-    };
-    let first = match store.list_models() {
-        Ok(l) => l.into_iter().next(),
-        Err(_) => None,
+    let first = match state.with_store(|s| s.list_models().ok()) {
+        Some(list) => list.and_then(|v| v.into_iter().next()),
+        None => return openai_error(500, "store unavailable"),
     };
     let Some(m) = first else {
         return openai_error(404, "no models pulled; adapters apply to a running engine");
@@ -880,6 +891,7 @@ pub async fn lora_adapters(
                 load_ms,
                 None,
                 Some(g),
+                None,
                 None,
             )
             .await

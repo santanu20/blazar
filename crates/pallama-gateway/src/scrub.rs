@@ -43,9 +43,8 @@ pub fn scrub_str(s: &str) -> String {
         // forward-only; instead detect a run containing exactly one '@'
         // with dots after it)
         if is_word(bytes[i]) {
-            let (redacted_email, next) = scan_email(s, i);
-            if let Some(next) = next {
-                out.push_str(&redacted_email);
+            if let Some(next) = scan_email(s, i) {
+                out.push_str("[email redacted]");
                 i = next;
                 continue;
             }
@@ -60,8 +59,13 @@ pub fn scrub_str(s: &str) -> String {
             i = next;
             continue;
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        // Non-ASCII: preserve the whole multi-byte char byte-exactly.
+        // (`bytes[i] as char` re-interprets the first byte as Latin-1 —
+        // mojibake — and the `+1` advance lands mid-char, which panics
+        // on the next `s[i..]` slice.)
+        let ch = s[i..].chars().next().unwrap_or('\u{fffd}');
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -77,33 +81,53 @@ fn scan_word(s: &str, start: usize) -> (String, usize) {
     (s[start..end].to_string(), end)
 }
 
-/// Consume `[word@domain.tld]` starting at `start`; None = not an email.
-fn scan_email(s: &str, start: usize) -> (String, Option<usize>) {
-    let (local, at) = scan_word(s, start);
-    if !s[at..].starts_with('@') {
-        return (local, None);
-    }
-    let domain_start = at + 1;
+/// Consume `[word@domain.tld]` (local part may contain dots) starting at
+/// `start`; None = not an email.
+fn scan_email(s: &str, start: usize) -> Option<usize> {
+    // F84: dotted locals ("first.last@x.com") — the old scan stopped at
+    // the first dot and leaked the local prefix ahead of the redaction.
     let bytes = s.as_bytes();
-    let mut i = domain_start;
-    while i < bytes.len()
-        && (bytes[i].is_ascii_alphanumeric()
-            || bytes[i] == b'.'
-            || bytes[i] == b'-'
-            || bytes[i] == b'_')
-    {
+    let mut i = start;
+    let mut any = false;
+    let mut prev_dot = false;
+    while i < bytes.len() && (is_word(bytes[i]) || bytes[i] == b'.') {
+        if bytes[i] == b'.' {
+            if !any || prev_dot {
+                return None; // leading or doubled dot — not a local part
+            }
+            prev_dot = true;
+        } else {
+            prev_dot = false;
+            any = true;
+        }
         i += 1;
     }
-    let domain = &s[domain_start..i];
+    if !any || prev_dot {
+        return None; // empty or trailing dot
+    }
+    if !s[i..].starts_with('@') {
+        return None;
+    }
+    let domain_start = i + 1;
+    let mut j = domain_start;
+    while j < bytes.len()
+        && (bytes[j].is_ascii_alphanumeric()
+            || bytes[j] == b'.'
+            || bytes[j] == b'-'
+            || bytes[j] == b'_')
+    {
+        j += 1;
+    }
+    let domain = &s[domain_start..j];
     let shape_ok = domain.contains('.')
         && !domain.starts_with(['.', '-'])
         && !domain.ends_with('.')
         && !domain.contains("..")
         && domain.split('.').next_back().is_some_and(|t| !t.is_empty());
     if !shape_ok {
-        return (local, None);
+        return None;
     }
-    ("[email redacted]".to_string(), Some(i))
+    Some(j)
 }
 
 /// Consume `d.d.d.d` (each 0..=255) starting at `start`.
@@ -173,5 +197,43 @@ mod tests {
             .unwrap()
             .contains("[ip redacted]"));
         assert_eq!(out["model"], "m");
+    }
+
+    #[test]
+    fn unit__scrub__multibyte_preserved_not_mojibake() {
+        // F83: the old `bytes[i] as char` fallthrough re-interpreted the
+        // first byte as Latin-1 (mojibake) and the `+1` advance landed
+        // mid-char, panicking on the next `s[i..]` slice.
+        let s = "模型 好 🚦 café naïve";
+        assert_eq!(scrub_str(s), s);
+        // Mixed: CJK around a redactable email/secrets stays intact.
+        let mixed = "模型 user@example.com 好 plm_abc123 🚦 10.0.0.4";
+        let out = scrub_str(mixed);
+        assert!(out.contains("模型"), "{out}");
+        assert!(out.contains("好"), "{out}");
+        assert!(out.contains("🚦"), "{out}");
+        assert!(out.contains("[email redacted]"), "{out}");
+        assert!(out.contains("plm_[redacted]"), "{out}");
+        assert!(!out.contains("example.com"), "{out}");
+        assert!(!out.contains("Ã"), "{out}");
+        assert!(!out.contains("\u{fffd}"), "{out}");
+    }
+
+    #[test]
+    fn unit__scrub__dotted_local_fully_redacted() {
+        // F84: "first.last@x.com" used to leak "first." ahead of the
+        // redaction marker.
+        let out = scrub_str("ping first.last@x.com now");
+        assert!(!out.contains("first"), "{out}");
+        assert!(!out.contains("last"), "{out}");
+        assert_eq!(out.matches("[email redacted]").count(), 1, "{out}");
+        // Malformed locals never yield a FULL intact address — either the
+        // address-shaped suffix gets redacted (conservative) or nothing
+        // email-shaped existed (trailing-dot case passes through).
+        let out = scrub_str("a..b@x.com");
+        assert!(!out.contains("b@x"), "{out}");
+        let out = scrub_str(".a@x.com");
+        assert!(!out.contains("a@x"), "{out}");
+        assert_eq!(scrub_str("a.@x.com"), "a.@x.com");
     }
 }

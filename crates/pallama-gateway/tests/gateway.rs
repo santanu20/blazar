@@ -442,6 +442,36 @@ async fn e2e__num_ctx_restarts_instance_at_requested_size() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn e2e__num_ctx_refuses_oom_shape_with_q8_hint() {
+    // I5 preflight, classic (f16) lane: the stub manifest lacks
+    // --kv-unified, so the charge is full f16 KV — 500k ctx on the 24 GiB
+    // stub card cannot fit and must refuse with the q8_0 teaching hint.
+    // (The unified 512 MiB-floor branch is pinned at the core level in
+    // unit__kv_unified_for__truth_table_for_offline_callers: adding the
+    // flag to the stub --help would cascade into every spawn-argv
+    // battery.)
+    let ts = start(Config::default()).await;
+    let c = client();
+    let body = serde_json::json!({
+        "model": "m1", "stream": false,
+        "messages": [{"role": "user", "content": "a"}],
+        "options": {"num_ctx": 500_000},
+    });
+    let r = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let v: serde_json::Value = r.json().await.unwrap();
+    let msg = format!("{}", v["error"]);
+    assert!(msg.contains("num_ctx 500000"), "{msg}");
+    assert!(msg.contains("q8_0"), "teaching hint present: {msg}");
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn e2e__auth_bearer_required_when_keys_set() {
     let cfg = Config {
         keys: vec![pallama_core::ApiKey {
@@ -1092,8 +1122,12 @@ async fn e2e__session_save_restore_erase_roundtrip() {
         .unwrap();
     assert_eq!(save["status"], "ok", "{save}");
 
-    // file landed in the per-model sessions dir
-    let sess_dir = ts.dirs.sessions_dir().join("m1");
+    // file landed in the per-model sessions dir (path_safe adds the
+    // stable FNV suffix — derive, never hardcode)
+    let sess_dir = ts
+        .dirs
+        .sessions_dir()
+        .join(pallama_core::profile::path_safe("m1"));
     assert!(sess_dir.join("ckpt1").exists(), "checkpoint file missing");
 
     let restore: serde_json::Value = c
@@ -1283,7 +1317,12 @@ async fn e2e__router_mode_sessions_route_by_model() {
         .await
         .unwrap();
     assert_eq!(save["status"], "ok", "{save}");
-    assert!(ts.dirs.sessions_dir().join("m1").join("r1").exists());
+    assert!(ts
+        .dirs
+        .sessions_dir()
+        .join(pallama_core::profile::path_safe("m1"))
+        .join("r1")
+        .exists());
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
@@ -1310,6 +1349,39 @@ async fn e2e__client_disconnect_frees_slot() {
     let ps = ts.state.sup.ps();
     assert!(!ps.is_empty());
     assert_eq!(ps[0].in_flight, 0, "slot freed after client disconnect");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__client_disconnect_frees_slot_ollama_lane() {
+    // F29 pin: the ollama NDJSON lanes must hold accounting for the BODY
+    // lifetime — dropping the response mid-stream frees the slot (the old
+    // with_accounting future-bracket leaked the counter forever on abort).
+    let ts = start_with(
+        Config::default(),
+        vec![("STUB_DELAY_MS".into(), "10000".into())],
+    )
+    .await;
+    let c = client();
+    let body = serde_json::json!({
+        "model": "m1", "stream": true,
+        "messages": [{"role": "user", "content": "slow"}],
+    });
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    drop(resp); // client goes away mid-NDJSON
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let ps = ts.state.sup.ps();
+    assert!(!ps.is_empty());
+    assert_eq!(
+        ps[0].in_flight, 0,
+        "ollama lane slot freed after disconnect"
+    );
     ts.state.sup.shutdown_all().await.unwrap();
 }
 

@@ -497,9 +497,9 @@ pub fn request_ctx(
     let template = if tool_names.is_empty() {
         None
     } else {
-        pallama_core::store::Store::open(&state.dirs)
-            .ok()
-            .and_then(|s| s.get_model(model).ok().flatten())
+        state
+            .with_store(|s| s.get_model(model).ok().flatten())
+            .flatten()
             .and_then(|row| {
                 state
                     .sentinel
@@ -823,6 +823,7 @@ impl Sentinel {
         let responses = ctx.route == "openai-responses";
         let mut acc = Accum::default();
         let mut carry = String::new();
+        let mut lines = tr::LineBuffer::new();
         let mut json_buf: Vec<u8> = Vec::new();
         let mut stalled = false;
         loop {
@@ -847,7 +848,7 @@ impl Sentinel {
             match ev {
                 Some(FeedEvent::Bytes(b)) => {
                     if sse {
-                        carry.push_str(&String::from_utf8_lossy(&b));
+                        carry.push_str(&lines.feed(&b));
                         if carry.len() > MAX_CARRY_BYTES {
                             acc.degraded = true;
                             carry.clear();
@@ -1436,7 +1437,11 @@ impl Accum {
                         // (double-append would corrupt the JSON check).
                         if ty.ends_with("done") {
                             if let Some(a) = item.get("arguments").and_then(Value::as_str) {
-                                if entry.args.is_empty() && !a.is_empty() {
+                                // F61: bound like every sibling accumulator
+                                if entry.args.is_empty()
+                                    && !a.is_empty()
+                                    && entry.args.len() + a.len() < MAX_ACCUM_BYTES
+                                {
                                     entry.args.push_str(a);
                                 }
                             }
@@ -1503,8 +1508,13 @@ impl Accum {
                         if let Some(n) = item.get("name").and_then(Value::as_str) {
                             entry.name = n.to_string();
                         }
+                        // F61: bound like every sibling accumulator — a
+                        // body-limit-sized `arguments` string must not
+                        // mirror into memory unbounded.
                         if let Some(a) = item.get("arguments").and_then(Value::as_str) {
-                            entry.args.push_str(a);
+                            if entry.args.len() + a.len() < MAX_ACCUM_BYTES {
+                                entry.args.push_str(a);
+                            }
                         }
                     }
                     Some("message") => {
@@ -1966,6 +1976,37 @@ mod tests {
         let d = s.finalize(&ctx, &acc, 200);
         assert!(d.iter().any(|x| x.code == Code::CtxTruncated), "{d:?}");
         assert!(d.iter().any(|x| x.code == Code::CtxNearLimit), "{d:?}");
+    }
+
+    #[test]
+    fn unit__accum__responses_object_args_bounded() {
+        // F61: a body-limit-sized `arguments` string must not mirror into
+        // memory unbounded — the accumulator caps like every sibling.
+        let mut acc = Accum::default();
+        let huge = "x".repeat(MAX_ACCUM_BYTES + 1024);
+        let ev = serde_json::json!({
+            "output": [
+                {"type": "function_call", "name": "f", "arguments": huge}
+            ]
+        });
+        acc.apply_responses_object(&ev);
+        assert!(
+            acc.tools
+                .get(&0)
+                .is_none_or(|t| t.args.len() < MAX_ACCUM_BYTES),
+            "args must be bounded"
+        );
+        // Small arguments still accumulate normally.
+        let mut acc = Accum::default();
+        acc.apply_responses_object(&serde_json::json!({
+            "output": [
+                {"type": "function_call", "name": "f", "arguments": "{\"a\":1}"}
+            ]
+        }));
+        assert_eq!(
+            acc.tools.get(&0).map(|t| t.args.as_str()),
+            Some("{\"a\":1}")
+        );
     }
 
     #[test]

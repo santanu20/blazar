@@ -447,10 +447,13 @@ async fn chat_completions(
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let events = sse_events(&text, &model, include_usage, prompt_tokens, &finish);
-    let base_iter =
-        futures::stream::iter(events.into_iter().map(Ok::<bytes::Bytes, std::io::Error>));
+    let base_iter = futures::stream::iter(
+        events
+            .into_iter()
+            .map(Ok::<axum::body::Bytes, std::io::Error>),
+    );
     let stream: std::pin::Pin<
-        Box<dyn futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>,
+        Box<dyn futures::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send>,
     > = if chunk_delay_ms > 0 {
         use futures::StreamExt as _;
         Box::pin(base_iter.then(move |b| async move {
@@ -478,7 +481,7 @@ fn sse_events(
     include_usage: bool,
     prompt_tokens: i64,
     finish: &str,
-) -> Vec<bytes::Bytes> {
+) -> Vec<axum::body::Bytes> {
     let (first, second) = split_in_half(text);
     let completion_tokens = if finish == "length" {
         trunc_usage(prompt_tokens, count_tokens(text)).1
@@ -533,7 +536,7 @@ fn sse_events(
         ));
     }
     events.push("data: [DONE]\n\n".to_string());
-    events.into_iter().map(bytes::Bytes::from).collect()
+    events.into_iter().map(axum::body::Bytes::from).collect()
 }
 
 fn split_in_half(s: &str) -> (String, String) {
@@ -765,7 +768,7 @@ async fn responses_api(
     let stream = futures::stream::iter(
         events
             .into_iter()
-            .map(|s| Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(s))),
+            .map(|s| Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from(s))),
     );
     axum::response::Response::builder()
         .status(200)

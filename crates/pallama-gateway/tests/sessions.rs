@@ -173,7 +173,11 @@ async fn integration__session_identity__manifest_written_tamper_blocks_restore()
         .await
         .unwrap();
     assert_eq!(r.status(), 200, "stub slot save works");
-    let ckpt = ts.dirs.sessions_dir().join("m1").join("conv1");
+    let ckpt = ts
+        .dirs
+        .sessions_dir()
+        .join(pallama_core::profile::path_safe("m1"))
+        .join("conv1");
     assert!(ckpt.exists(), "checkpoint file exists");
     let id = pallama_core::session_identity::read_manifest(&ckpt)
         .expect("identity manifest written and parses");

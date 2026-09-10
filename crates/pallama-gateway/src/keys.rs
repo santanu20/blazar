@@ -78,6 +78,26 @@ impl Rejection {
 }
 
 /// UTC day stamp for the usage table (YYYY-MM-DD).
+/// Constant-time equality for secret material. `str ==` short-circuits on
+/// length and on the first differing byte, letting request timing disclose
+/// how much of a presented secret matched a stored one. This folds every
+/// byte plus both lengths into one accumulator with no early exit.
+/// Defense-in-depth only: the primary barrier is key entropy (plm_ keys
+/// are random 256-bit), not comparison time.
+#[must_use]
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    // Loop count depends only on max length (length itself is not treated
+    // as secret); content never influences control flow.
+    let mut diff: usize = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        let x = if i < a.len() { a[i] } else { 0 };
+        let y = if i < b.len() { b[i] } else { 0 };
+        diff |= usize::from(x ^ y);
+    }
+    diff == 0
+}
+
 #[must_use]
 pub fn utc_day(ts: SystemTime) -> String {
     let secs = ts.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
@@ -94,6 +114,27 @@ pub fn utc_day(ts: SystemTime) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Seconds until the next UTC midnight (`1..=86_400`) — the true reset
+/// point for daily token budgets (F56: was hardcoded 3600).
+fn secs_until_utc_midnight() -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let tomorrow = (now.div_euclid(86_400) + 1) * 86_400;
+    (tomorrow - now).clamp(1, 86_400)
+}
+
+/// Front-drain expired entries from a time-ordered window buffer. The
+/// vecs only ever grow via `push(Instant::now())`, so they stay sorted
+/// ascending and `partition_point` finds the expired prefix in O(log n).
+/// Without this the rpm/tpm vecs grow unboundedly for the daemon's
+/// lifetime and every rate check scans the full history (F54).
+fn prune_window(win: &mut Vec<Instant>, now: Instant) {
+    let cut = win.partition_point(|t| now.duration_since(*t) >= WINDOW);
+    win.drain(..cut);
 }
 
 #[derive(Default)]
@@ -171,13 +212,17 @@ impl KeysLimiter {
     }
 
     /// Bearer secret -> key entry (None = unknown / no keys configured).
+    /// Secret comparison is constant-time (see [`ct_eq`]). `.find()`
+    /// short-circuits, but a later position requires presenting a valid
+    /// secret for some earlier entry — position leaks nothing without
+    /// the key, and per-compare `ct_eq` hides content differences.
     #[must_use]
     pub fn resolve(&self, presented: &str) -> Option<pallama_core::ApiKey> {
         self.entries
             .read()
             .expect("keys entries poisoned")
             .iter()
-            .find(|k| k.key == presented)
+            .find(|k| ct_eq(&k.key, presented))
             .cloned()
     }
 
@@ -268,16 +313,25 @@ impl KeysLimiter {
             });
         }
         if key.tpm > 0 {
-            let spent: u64 = st
-                .tpm
-                .iter()
-                .filter(|(t, _)| now.duration_since(*t) < WINDOW)
-                .map(|(_, n)| n)
-                .sum();
+            let mut oldest_in_window = None;
+            let mut spent: u64 = 0;
+            for (t, n) in &st.tpm {
+                if now.duration_since(*t) < WINDOW {
+                    spent += n;
+                    oldest_in_window = Some(oldest_in_window.unwrap_or(*t).min(*t));
+                }
+            }
             if spent >= key.tpm {
+                let retry = oldest_in_window.map_or(1, |t| {
+                    WINDOW
+                        .checked_sub(now.duration_since(t))
+                        .unwrap_or(WINDOW)
+                        .as_secs()
+                        .max(1)
+                });
                 return Err(Rejection::Rate {
                     kind: "tokens-per-minute",
-                    retry_after_secs: 60,
+                    retry_after_secs: retry,
                     name: key.name.clone(),
                 });
             }
@@ -285,7 +339,7 @@ impl KeysLimiter {
         if key.daily_tokens > 0 && st.tokens >= key.daily_tokens {
             return Err(Rejection::Rate {
                 kind: "daily token budget",
-                retry_after_secs: 3600,
+                retry_after_secs: secs_until_utc_midnight(),
                 name: key.name.clone(),
             });
         }
@@ -300,6 +354,7 @@ impl KeysLimiter {
         let mut states = self.states.lock().expect("keys state poisoned");
         let st = states.entry(name.to_string()).or_default();
         st.roll_day(&today);
+        prune_window(&mut st.rpm, now);
         st.rpm.push(now);
         st.requests += 1;
         st.dirty = true;
@@ -317,6 +372,10 @@ impl KeysLimiter {
         let mut states = self.states.lock().expect("keys state poisoned");
         let st = states.entry(name.to_string()).or_default();
         st.roll_day(&today);
+        let cut = st
+            .tpm
+            .partition_point(|(t, _)| now.duration_since(*t) >= WINDOW);
+        st.tpm.drain(..cut);
         st.tpm.push((now, tokens));
         st.tokens += tokens;
         st.dirty = true;
@@ -351,7 +410,8 @@ impl KeysLimiter {
     }
 
     /// Release a lease (called by `SlotLease::drop`). A key removed
-    /// mid-flight re-creates a zeroed state entry — harmless.
+    /// mid-flight keeps its state entry — `get_mut` only decrements and
+    /// never inserts, so nothing is re-created here.
     fn release(&self, name: &str) {
         let mut states = self.states.lock().expect("keys state poisoned");
         if let Some(st) = states.get_mut(name) {
@@ -377,35 +437,57 @@ impl KeysLimiter {
     }
 
     /// Persist dirty counters (write-behind; called by the flusher task
-    /// and at daemon shutdown). Absolute day-state per key, one tx.
+    /// and at daemon shutdown). Absolute day-state per key, one tx per
+    /// day stamp. F55: entries dirty under a PRIOR day stamp flush under
+    /// that day — `roll_day` resets counters on first charge of the new
+    /// day, so filtering on `today` here silently dropped the last
+    /// <flush-interval of pre-midnight usage every night.
     pub fn flush(&self, dirs: &pallama_core::PallamaDirs) {
-        let today = utc_day(SystemTime::now());
-        let drained: Vec<(String, u64, u64)> = {
+        let drained: Vec<(String, String, u64, u64)> = {
             let mut states = self.states.lock().expect("keys state poisoned");
             states
                 .iter_mut()
-                .filter(|(_, st)| st.dirty && st.day == today)
+                .filter(|(_, st)| st.dirty)
                 .map(|(name, st)| {
                     st.dirty = false;
-                    (name.clone(), st.requests, st.tokens)
+                    (st.day.clone(), name.clone(), st.requests, st.tokens)
                 })
                 .collect()
         };
         if drained.is_empty() {
             return;
         }
-        let Ok(store) = Store::open(dirs) else {
-            tracing::warn!(target: "pallama::keys", "usage flush: store open failed");
-            return;
-        };
-        if let Err(e) = store.set_key_usage_day(&today, &drained) {
-            tracing::warn!(target: "pallama::keys", "usage flush failed: {e}");
-            // Re-mark dirty so the next flush retries.
+        let mark_dirty = |rows: &[(&String, &String, &u64, &u64)]| {
             let mut states = self.states.lock().expect("keys state poisoned");
-            for (name, _, _) in &drained {
-                if let Some(st) = states.get_mut(name) {
+            for (_, name, _, _) in rows {
+                if let Some(st) = states.get_mut(name.as_str()) {
                     st.dirty = true;
                 }
+            }
+        };
+        let Ok(store) = Store::open(dirs) else {
+            tracing::warn!(target: "pallama::keys", "usage flush: store open failed");
+            let rows: Vec<_> = drained.iter().map(|(d, n, r, t)| (d, n, r, t)).collect();
+            mark_dirty(&rows);
+            return;
+        };
+        let mut by_day: std::collections::BTreeMap<String, Vec<(String, u64, u64)>> =
+            std::collections::BTreeMap::new();
+        for (day, name, requests, tokens) in &drained {
+            by_day
+                .entry(day.clone())
+                .or_default()
+                .push((name.clone(), *requests, *tokens));
+        }
+        for (day, rows) in &by_day {
+            if let Err(e) = store.set_key_usage_day(day, rows) {
+                tracing::warn!(target: "pallama::keys", day, "usage flush failed: {e}");
+                let failed: Vec<_> = drained
+                    .iter()
+                    .filter(|(d, _, _, _)| d == day)
+                    .map(|(d, n, r, t)| (d, n, r, t))
+                    .collect();
+                mark_dirty(&failed);
             }
         }
     }
@@ -658,6 +740,64 @@ mod tests {
         assert_eq!(day(0), "1970-01-01");
         assert_eq!(day(1_757_137_200), "2025-09-06"); // 2025-09-06T00:00Z
         assert_eq!(day(1_757_222_600), "2025-09-07"); // next day 23:23:20Z
+    }
+
+    #[test]
+    fn unit__prune_window__drops_expired_prefix_keeps_live_tail() {
+        // F54: charge-time front-drain keeps the rpm/tpm vecs bounded —
+        // without it every rate check scanned the full request history.
+        let now = Instant::now();
+        let old = now
+            .checked_sub(WINDOW + Duration::from_secs(1))
+            .expect("clock goes back far enough for the fixture");
+        let edge = now
+            .checked_sub(
+                WINDOW
+                    .checked_sub(Duration::from_secs(1))
+                    .expect("WINDOW > 1s"),
+            )
+            .expect("clock");
+        let mut win = vec![old, edge, now];
+        prune_window(&mut win, now);
+        assert_eq!(win.len(), 2, "expired prefix dropped, live tail kept");
+        assert!(win[0] >= edge, "boundary entry (just inside) survives");
+        assert_eq!(win[1], now);
+    }
+
+    #[test]
+    fn unit__secs_until_utc_midnight__bounds() {
+        let s = secs_until_utc_midnight();
+        assert!((1..=86_400).contains(&s), "midnight distance in range: {s}");
+    }
+
+    #[test]
+    fn unit__ct_eq__equal_and_prefix_cases() {
+        assert!(ct_eq("plm_alpha", "plm_alpha"), "identical secrets equal");
+        assert!(!ct_eq("plm_alpha", "plm_beta"), "same-length mismatch");
+        // Common-prefix mismatch must NOT early-exit into a false equal.
+        assert!(!ct_eq("plm_aaaa", "plm_aaab"), "last-byte difference found");
+        assert!(
+            !ct_eq("plm_aaaa", "plm_aaaa2"),
+            "length difference folds in"
+        );
+        assert!(!ct_eq("", "x"), "empty vs non-empty");
+        assert!(ct_eq("", ""), "two empties equal");
+    }
+
+    #[test]
+    fn unit__resolve__ct_scan_finds_exact_secret_only() {
+        let lim = KeysLimiter::loaded(None, vec![key("ci", 0, 0, 0, &["m1"])]);
+        let hit = lim.resolve("plm_ci").expect("exact secret resolves");
+        assert_eq!(hit.name, "ci");
+        assert!(
+            lim.resolve("plm_cj").is_none(),
+            "same-length wrong secret rejected"
+        );
+        assert!(
+            lim.resolve("plm_c").is_none(),
+            "prefix-only secret rejected"
+        );
+        assert!(lim.resolve("").is_none(), "empty presentation rejected");
     }
 
     #[test]

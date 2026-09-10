@@ -209,7 +209,10 @@ fn guard_token_budget(
     n_tokens: usize,
 ) -> Result<(), (u16, String)> {
     let cap = state.config.late_chunking_max_tokens;
-    if n_tokens >= cap {
+    // F71: `cap` is an inclusive maximum (a doc of exactly cap tokens is
+    // admissible) — reject only strictly over, matching the message
+    // wording; the 90%-ctx margin below keeps its at-margin rejection.
+    if n_tokens > cap {
         return Err((
             413,
             format!(
@@ -383,14 +386,21 @@ async fn fetch_matrix(
                 "embedding response missing per-token matrix".to_string(),
             )
         })?;
-    let rows: Vec<Vec<f64>> = matrix
-        .iter()
-        .map(|row| {
-            row.as_array()
-                .map(|r| r.iter().filter_map(Value::as_f64).collect())
-                .unwrap_or_default()
-        })
-        .collect();
+    // F72: strict like the semcache sibling — a non-numeric entry is a
+    // malformed matrix and must fail loud, never silently zero-filled.
+    let mut rows: Vec<Vec<f64>> = Vec::with_capacity(matrix.len());
+    for row in matrix {
+        let vals: Option<Vec<f64>> = row
+            .as_array()
+            .and_then(|r| r.iter().map(Value::as_f64).collect());
+        let Some(vals) = vals else {
+            return Err((
+                502u16,
+                "embedding response contains non-numeric matrix entries".to_string(),
+            ));
+        };
+        rows.push(vals);
+    }
     if rows.len() != ids.len() {
         return Err((
             502,

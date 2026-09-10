@@ -209,6 +209,42 @@ async fn client__remote_instance__routes_by_prefix() {
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
+#[tokio::test]
+async fn client__remote_ollama_lane__scoped_key_rejected() {
+    // F11 pin: the ollama /api/chat remote lane pays key admission — a
+    // key scoped to `m1` must NOT reach `far:m1` (pre-fix the remote
+    // split returned before keys.check entirely).
+    let stub = support::spawn_remote_stub().await;
+    let cfg = support::config_with_keys();
+    let cfg = support::with_remote(cfg, "far", &stub.base);
+    let ts = start(cfg).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .bearer_auth("plm_ci")
+        .json(&serde_json::json!({
+            "model": "far:m1", "stream": false,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "scoped key must not reach the remote");
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .bearer_auth("plm_admin")
+        .json(&serde_json::json!({
+            "model": "far:m1", "stream": false,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "unscoped key still reaches the remote");
+    ts.state.sup.shutdown_all().await.unwrap();
+    stub.shutdown().await;
+}
+
 /// C4: same-named remotes form a POOL; a conversation prefix sticks to
 /// the member that served it (its KV holds the prefix), surfaced via
 /// `x-pallama-remote`.

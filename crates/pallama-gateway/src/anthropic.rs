@@ -24,12 +24,10 @@ use crate::queue::Priority;
 #[allow(clippy::too_many_lines)]
 pub async fn messages(
     State(state): State<Arc<crate::state::AppState>>,
-    trace_ext: Option<axum::extract::Extension<crate::TraceId>>,
     key_ext: Option<axum::extract::Extension<crate::keys::KeyCtx>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let _ = trace_ext;
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -56,12 +54,23 @@ pub async fn messages(
              remote-prefixed models are not translated (their dialect is the remote's own)",
         );
     }
+    // F46: the Anthropic schema makes `max_tokens` REQUIRED — accepting
+    // requests without an output cap lets a reasoning model burn the
+    // whole context before the client learns anything.
+    if parsed.get("max_tokens").and_then(Value::as_u64).is_none() {
+        return anthropic_error(
+            400,
+            "invalid_request_error",
+            "max_tokens is required and must be a non-negative integer",
+        );
+    }
     if let Some(key) = key_ext.as_ref().map(|axum::extract::Extension(k)| k) {
         if let Some(entry) = state.keys.entry(&key.name) {
             if let Err(rej) = state.keys.check(&entry, &model) {
                 return rej.to_response();
             }
-            state.keys.charge_request(&key.name);
+            // F53: charge AFTER translate_request validation — 400s must
+            // not consume a request from the key's budget.
         }
     }
     let stream = parsed
@@ -72,6 +81,9 @@ pub async fn messages(
         Ok(b) => b,
         Err(msg) => return anthropic_error(400, "invalid_request_error", &msg),
     };
+    if let Some(key) = key_ext.as_ref().map(|axum::extract::Extension(k)| k) {
+        state.keys.charge_request(&key.name);
+    }
     if let Some(err) = state.sentinel.strict_tool_def_error_cached(&openai_body) {
         return anthropic_error(
             400,
@@ -124,10 +136,9 @@ pub async fn messages(
         Err(resp) => return resp,
     };
     let url = format!("{}/v1/chat/completions", child_base(&engine.endpoint));
-    let client = match reqwest::Client::builder().build() {
-        Ok(c) => c,
-        Err(e) => return anthropic_error(500, "api_error", &format!("http client: {e}")),
-    };
+    // F44: pooled client (10-min total timeout) instead of a per-request
+    // build — same transport every other child lane uses.
+    let client = state.http.clone();
     let send = crate::proxy::child_auth(
         client
             .post(&url)
@@ -140,7 +151,19 @@ pub async fn messages(
             Ok(r) => r,
             Err(e) => return anthropic_error(502, "api_error", &format!("engine: {e}")),
         };
-        let id = format!("msg_{}", uuid_v4());
+        // F45: a non-2xx child body is a JSON error, not an SSE stream —
+        // surfacing it as 200+empty-events hangs clients. Translate the
+        // status instead of framing the error bytes as events.
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            let detail = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+                .unwrap_or_else(|| body.chars().take(200).collect());
+            return anthropic_error(502, "api_error", &format!("engine {status}: {detail}"));
+        }
+        let id = format!("msg_{}", unique_suffix());
         let model_label = model.clone();
         let child_stream = resp.bytes_stream();
         let events = anthropic_sse_stream(child_stream, StreamState::new(&id, &model_label), guard);
@@ -185,9 +208,11 @@ pub async fn count_tokens(
     State(state): State<Arc<crate::state::AppState>>,
     axum::extract::Extension(trace): axum::extract::Extension<crate::TraceId>,
     headers: HeaderMap,
+    key_ext: Option<axum::extract::Extension<crate::keys::KeyCtx>>,
     body: Bytes,
 ) -> Response {
-    let _ = (trace, &headers);
+    tracing::debug!(target: "pallama::anthropic", trace = %trace.0, "count_tokens");
+    let _ = &headers;
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -201,6 +226,16 @@ pub async fn count_tokens(
         .to_string();
     if model.is_empty() {
         return anthropic_error(400, "invalid_request_error", "missing `model` field");
+    }
+    // F48: tokenizing a model SP loads it — scoped keys must not spawn
+    // outside their scope through this lane.
+    if let Some(key) = key_ext.as_ref().map(|axum::extract::Extension(k)| k) {
+        if let Some(entry) = state.keys.entry(&key.name) {
+            if let Err(rej) = state.keys.check(&entry, &model) {
+                return rej.to_response();
+            }
+            state.keys.charge_request(&key.name);
+        }
     }
     let mut text = String::new();
     if let Some(sys) = parsed.get("system") {
@@ -222,7 +257,9 @@ pub async fn count_tokens(
         Err(resp) => return resp,
     };
     let url = format!("{}/tokenize", child_base(&engine.endpoint));
-    let client = reqwest::Client::new();
+    // F44: pooled client — the old bare `Client::new()` had NO timeout,
+    // so a dead child hung the count_tokens lane forever.
+    let client = state.http.clone();
     let resp = match crate::proxy::child_auth(client.post(&url), &engine)
         .json(&json!({"content": text}))
         .send()
@@ -356,6 +393,7 @@ fn translate_message(role: &str, content: &Value, out: &mut Vec<Value>) -> Resul
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut tool_results: Vec<Value> = Vec::new();
+    let mut thinking: Vec<String> = Vec::new();
     for b in blocks {
         match b.get("type").and_then(Value::as_str).unwrap_or("text") {
             "text" => {
@@ -395,7 +433,17 @@ fn translate_message(role: &str, content: &Value, out: &mut Vec<Value>) -> Resul
                 let inner = b.get("content").map(content_to_text).unwrap_or_default();
                 tool_results.push(json!({"role": "tool", "tool_call_id": id, "content": inner}));
             }
-            "thinking" | "redacted_thinking" | "document" => {}
+            // F47: preserve prior-turn reasoning — `thinking` text rides
+            // the assistant message as `reasoning_content` (engines that
+            // model reasoning read it; others ignore unknown fields).
+            // `redacted_thinking` is an opaque encrypted payload with no
+            // OpenAI representation, so dropping it is lossless.
+            "thinking" => {
+                if let Some(t) = b.get("thinking").and_then(Value::as_str) {
+                    thinking.push(t.to_string());
+                }
+            }
+            "redacted_thinking" | "document" => {}
             other => return Err(format!("unsupported content block type: {other}")),
         }
     }
@@ -419,6 +467,17 @@ fn translate_message(role: &str, content: &Value, out: &mut Vec<Value>) -> Resul
         }
     }
     out.extend(tool_results);
+    if !thinking.is_empty() {
+        // F47: attach preserved reasoning to the assistant message this
+        // call produced (text-fold or tool-only push), never to a
+        // trailing tool result.
+        if let Some(slot) = out
+            .iter()
+            .rposition(|m| m.get("role").and_then(Value::as_str) == Some(role))
+        {
+            out[slot]["reasoning_content"] = json!(thinking.join(""));
+        }
+    }
     Ok(())
 }
 
@@ -448,6 +507,13 @@ pub fn translate_response(openai: &Value, model: &str) -> Value {
     let choice = openai.pointer("/choices/0").cloned().unwrap_or(Value::Null);
     let msg = choice.get("message").cloned().unwrap_or(Value::Null);
     let mut content: Vec<Value> = Vec::new();
+    // F47: engines exposing reasoning (DeepSeek-style `reasoning_content`)
+    // surface it as a leading Anthropic `thinking` block, ahead of text.
+    if let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str) {
+        if !rc.is_empty() {
+            content.push(json!({"type": "thinking", "thinking": rc}));
+        }
+    }
     if let Some(text) = msg.get("content").and_then(Value::as_str) {
         if !text.is_empty() {
             content.push(json!({"type": "text", "text": text}));
@@ -498,6 +564,10 @@ pub fn translate_response(openai: &Value, model: &str) -> Value {
 
 /// One `OpenAI` `SSE` chunk → zero or more Anthropic `SSE` events. The state
 /// machine (which block indexes are open) lives in the stream wrapper.
+// Chunk-to-SSE translation is one state machine over event kinds; splitting
+// it scatters the per-state transitions. TODO(split-chunk-events): extract
+// when the parallel gateway wave lands.
+#[allow(clippy::too_many_lines)]
 pub fn chunk_events(chunk: &Value, state: &mut StreamState) -> Vec<(String, Value)> {
     let mut events: Vec<(String, Value)> = Vec::new();
     if !state.started {
@@ -517,21 +587,55 @@ pub fn chunk_events(chunk: &Value, state: &mut StreamState) -> Vec<(String, Valu
         ));
     }
     let choice = chunk.pointer("/choices/0").cloned().unwrap_or(Value::Null);
+    // F47: reasoning deltas ride a leading `thinking` block (Anthropic
+    // orders thinking before text), same open-once semantics as text.
+    if let Some(rc) = choice
+        .pointer("/delta/reasoning_content")
+        .and_then(Value::as_str)
+    {
+        if !rc.is_empty() {
+            match state.thinking_idx {
+                None => {
+                    let i = state.output_blocks;
+                    state.output_blocks += 1;
+                    state.thinking_idx = Some(i);
+                    events.push((
+                        "content_block_start".into(),
+                        json!({"type": "content_block_start", "index": i,
+                               "content_block": {"type": "thinking", "thinking": ""}}),
+                    ));
+                    events.push((
+                        "content_block_delta".into(),
+                        json!({"type": "content_block_delta", "index": i,
+                               "delta": {"type": "thinking_delta", "thinking": rc}}),
+                    ));
+                }
+                Some(i) => events.push((
+                    "content_block_delta".into(),
+                    json!({"type": "content_block_delta", "index": i,
+                           "delta": {"type": "thinking_delta", "thinking": rc}}),
+                )),
+            }
+        }
+    }
     if let Some(text) = choice.pointer("/delta/content").and_then(Value::as_str) {
         if !text.is_empty() {
-            let idx = state.text_block(state.output_blocks);
-            if idx.is_none() {
-                let i = state.output_blocks;
-                state.output_blocks += 1;
-                state.open_text = true;
-                events.push((
-                    "content_block_start".into(),
-                    json!({"type": "content_block_start", "index": i,
-                           "content_block": {"type": "text", "text": ""}}),
-                ));
-                events.push(text_delta(i, text));
-            } else {
-                events.push(text_delta(idx.unwrap_or(0), text));
+            // F50: track the ACTUAL text block index — with tool-first
+            // streams the text slot is not 0 and hardcoding it corrupted
+            // the Anthropic indices.
+            match state.text_idx {
+                None => {
+                    let i = state.output_blocks;
+                    state.output_blocks += 1;
+                    state.text_idx = Some(i);
+                    events.push((
+                        "content_block_start".into(),
+                        json!({"type": "content_block_start", "index": i,
+                               "content_block": {"type": "text", "text": ""}}),
+                    ));
+                    events.push(text_delta(i, text));
+                }
+                Some(i) => events.push(text_delta(i, text)),
             }
         }
     }
@@ -559,14 +663,15 @@ pub fn chunk_events(chunk: &Value, state: &mut StreamState) -> Vec<(String, Valu
             .get("usage")
             .is_some_and(|u| u.pointer("/completion_tokens").is_some())
     {
-        if state.open_text || state.open_tools > 0 {
+        if state.thinking_idx.is_some() || state.text_idx.is_some() || state.open_tools > 0 {
             for i in 0..state.output_blocks {
                 events.push((
                     "content_block_stop".into(),
                     json!({"type": "content_block_stop", "index": i}),
                 ));
             }
-            state.open_text = false;
+            state.thinking_idx = None;
+            state.text_idx = None;
             state.open_tools = 0;
         }
         let stop_reason = match finish.unwrap_or("stop") {
@@ -579,11 +684,22 @@ pub fn chunk_events(chunk: &Value, state: &mut StreamState) -> Vec<(String, Valu
             .pointer("/usage/completion_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        // F49: engines report usage on the FINAL chunk only — the
+        // message_start snapshot stays 0, so correct input_tokens here
+        // where Anthropic clients merge cumulative usage.
+        let input = chunk
+            .pointer("/usage/prompt_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let mut usage = json!({"output_tokens": output});
+        if input > 0 {
+            usage["input_tokens"] = json!(input);
+        }
         events.push((
             "message_delta".into(),
             json!({"type": "message_delta",
                    "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
-                   "usage": {"output_tokens": output}}),
+                   "usage": usage}),
         ));
         events.push(("message_stop".into(), json!({"type": "message_stop"})));
         state.done = true;
@@ -604,7 +720,8 @@ fn text_delta(index: u64, text: &str) -> (String, Value) {
 pub struct StreamState {
     started: bool,
     done: bool,
-    open_text: bool,
+    thinking_idx: Option<u64>,
+    text_idx: Option<u64>,
     open_tools: u64,
     output_blocks: u64,
     tool_map: std::collections::HashMap<u64, u64>,
@@ -619,14 +736,6 @@ impl StreamState {
             id: id.to_string(),
             model: model.to_string(),
             ..Self::default()
-        }
-    }
-
-    fn text_block(&self, _base: u64) -> Option<u64> {
-        if self.open_text {
-            Some(0)
-        } else {
-            None
         }
     }
 
@@ -664,15 +773,22 @@ where
 {
     use std::collections::VecDeque;
     futures::stream::unfold(
-        (child, st, String::new(), VecDeque::new(), Some(guard)),
-        |(mut child, mut st, mut buf, mut queue, guard)| async move {
+        (
+            child,
+            st,
+            String::new(),
+            crate::translate::LineBuffer::new(),
+            VecDeque::new(),
+            Some(guard),
+        ),
+        |(mut child, mut st, mut buf, mut lines, mut queue, guard)| async move {
             loop {
                 if let Some(frame) = queue.pop_front() {
-                    return Some((Ok(frame), (child, st, buf, queue, guard)));
+                    return Some((Ok(frame), (child, st, buf, lines, queue, guard)));
                 }
                 match child.next().await {
                     Some(Ok(chunk)) => {
-                        buf.push_str(&String::from_utf8_lossy(&chunk));
+                        buf.push_str(&lines.feed(&chunk));
                         while let Some(pos) = buf.find('\n') {
                             let line: String = buf.drain(..=pos).collect();
                             let line = line.trim();
@@ -699,7 +815,21 @@ where
                         ));
                         queue.push_back(frame);
                     }
-                    None => return None,
+                    None => {
+                        // F51: child ended without a finish chunk — emit a
+                        // terminal error event so clients see the truncation
+                        // instead of a silent bare EOF.
+                        if !st.done {
+                            st.done = true;
+                            queue.push_back(Bytes::from(format!(
+                                "event: error\ndata: {}\n\n",
+                                json!({"type": "error", "error": {"type": "api_error",
+                                       "message": "upstream stream ended before completion"}})
+                            )));
+                            continue;
+                        }
+                        return None;
+                    }
                 }
             }
         },
@@ -715,7 +845,7 @@ fn anthropic_error(status: u16, err_type: &str, message: &str) -> Response {
         .unwrap_or_else(|_| Response::new(Body::from("{}")))
 }
 
-fn uuid_v4() -> String {
+fn unique_suffix() -> String {
     // cheap uniqueness: no uuid dep in gateway — timestamp + counter
     use std::sync::atomic::{AtomicU64, Ordering};
     static CTR: AtomicU64 = AtomicU64::new(0);
@@ -869,5 +999,136 @@ mod tests {
         assert_eq!(ev[2].1["delta"]["stop_reason"], "tool_use");
         assert_eq!(ev[2].1["usage"]["output_tokens"], 4);
         assert!(st.done);
+    }
+
+    #[test]
+    fn unit__chunk_events__final_chunk_input_tokens_corrected() {
+        // F49: usage arrives only on the final chunk — message_start saw
+        // 0; the closing message_delta must carry the real prompt_tokens.
+        let mut st = StreamState::new("msg_t", "m1");
+        let c1: Value = serde_json::from_str(
+            r#"{"choices": [{"index": 0, "delta": {"content": "x"}, "finish_reason": null}]}"#,
+        )
+        .unwrap();
+        let _ = chunk_events(&c1, &mut st);
+        assert!(st.started);
+        let c2: Value = serde_json::from_str(
+            r#"{"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+               "usage": {"prompt_tokens": 77, "completion_tokens": 3}}"#,
+        )
+        .unwrap();
+        let ev = chunk_events(&c2, &mut st);
+        let delta = ev
+            .iter()
+            .find(|(k, _)| k == "message_delta")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(delta["usage"]["input_tokens"], 77, "{delta}");
+        assert_eq!(delta["usage"]["output_tokens"], 3, "{delta}");
+    }
+
+    #[test]
+    fn unit__chunk_events__tool_first_text_uses_real_index() {
+        // F50: with tool calls opening first, text arrives at block 1 —
+        // deltas must reference index 1, not the old hardcoded 0.
+        let mut st = StreamState::new("msg_t", "m1");
+        let c1 = json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [
+                    {"index": 0, "id": "call_1", "function": {"name": "f", "arguments": ""}}
+                ]},
+                "finish_reason": null
+            }]
+        });
+        let _ = chunk_events(&c1, &mut st);
+        let c2: Value = serde_json::from_str(
+            r#"{"choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": null}]}"#,
+        )
+        .unwrap();
+        let ev = chunk_events(&c2, &mut st);
+        let start = ev
+            .iter()
+            .find(|(k, _)| k == "content_block_start")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(start["index"], 1, "{start}");
+        assert_eq!(start["content_block"]["type"], "text", "{start}");
+        let text_delta = ev
+            .iter()
+            .find(|(k, v)| k == "content_block_delta" && v["delta"]["type"] == "text_delta")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(text_delta["index"], 1, "{text_delta}");
+    }
+
+    #[test]
+    fn unit__chunk_events__reasoning_delta_opens_thinking_block() {
+        // F47 stream direction: reasoning_content rides a leading
+        // thinking block with thinking_delta frames.
+        let mut st = StreamState::new("msg_t", "m1");
+        let c1: Value = serde_json::from_str(
+            r#"{"choices": [{"index": 0, "delta": {"reasoning_content": "hm"}, "finish_reason": null}]}"#,
+        )
+        .unwrap();
+        let ev = chunk_events(&c1, &mut st);
+        assert_eq!(ev[1].1["content_block"]["type"], "thinking", "{ev:?}");
+        assert_eq!(ev[2].1["delta"]["thinking"], "hm", "{ev:?}");
+        assert_eq!(ev[2].1["index"], 0);
+        let c2: Value = serde_json::from_str(
+            r#"{"choices": [{"index": 0, "delta": {"content": "answer"}, "finish_reason": null}]}"#,
+        )
+        .unwrap();
+        let ev = chunk_events(&c2, &mut st);
+        let text_start = ev
+            .iter()
+            .find(|(k, _)| k == "content_block_start")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(text_start["index"], 1, "text after thinking");
+    }
+
+    #[test]
+    fn unit__translate_response__reasoning_becomes_leading_thinking_block() {
+        // F47 non-stream direction.
+        let openai = json!({
+            "choices": [{"index": 0, "message": {
+                "role": "assistant",
+                "reasoning_content": "ponder",
+                "content": "final",
+                "tool_calls": null
+            }, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2}
+        });
+        let out = translate_response(&openai, "m1");
+        let blocks = out["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["thinking"], "ponder");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], "final");
+    }
+
+    #[test]
+    fn unit__translate_message__thinking_preserved_as_reasoning_content() {
+        // F47 request direction: assistant prefill thinking survives as
+        // reasoning_content on the translated OpenAI message.
+        let mut out: Vec<Value> = Vec::new();
+        let content = json!([
+            {"type": "thinking", "thinking": "prior thought"},
+            {"type": "text", "text": "answer"},
+        ]);
+        translate_message("assistant", &content, &mut out).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["content"], "answer");
+        assert_eq!(out[0]["reasoning_content"], "prior thought");
+        // Tool-only assistant message still receives the field.
+        let mut out: Vec<Value> = Vec::new();
+        let content = json!([
+            {"type": "thinking", "thinking": "t1"},
+            {"type": "tool_use", "id": "c1", "name": "f", "input": {}},
+        ]);
+        translate_message("assistant", &content, &mut out).unwrap();
+        assert_eq!(out[0]["reasoning_content"], "t1");
+        assert_eq!(out[0]["tool_calls"].as_array().unwrap().len(), 1);
     }
 }

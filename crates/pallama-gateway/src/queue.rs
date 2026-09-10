@@ -99,6 +99,18 @@ pub const PREFILL_HEAVY_BYTES: usize = 64 * 1024;
 /// key buckets accumulate, drop all credits and start the race even.
 const WFQ_CREDIT_BUCKETS_MAX: usize = 256;
 
+/// Exact wait-duration rendering for the 503 message: whole seconds as
+/// `Ns`, anything fractional as millis (F60: a 1500 ms timeout used to
+/// print "1s" and hide the sub-second budget).
+fn fmt_wait(t: Duration) -> String {
+    let ms = t.as_millis();
+    if ms.is_multiple_of(1000) {
+        format!("{}s", t.as_secs())
+    } else {
+        format!("{ms}ms")
+    }
+}
+
 impl PriorityQueue {
     #[must_use]
     pub fn new() -> Self {
@@ -122,7 +134,7 @@ impl PriorityQueue {
         wfq: Option<(&str, u32)>,
     ) -> Result<(), String> {
         let (tx, rx) = oneshot::channel();
-        {
+        let key = {
             let mut q = self.inner.lock().expect("queue lock");
             q.seq += 1;
             // Inverted rank: smallest key pops first via `next()`.
@@ -163,15 +175,26 @@ impl PriorityQueue {
                     tier_secs,
                 },
             );
-        }
+            key
+        };
         self.notify.notify_waiters();
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err("queue shut down".into()),
-            Err(_) => Err(format!(
-                "waited longer than {}s for a slot (all_slots_busy)",
-                timeout.as_secs()
-            )),
+            Err(_) => {
+                // F59: remove our own entry — on an idle system no future
+                // `signal_free` arrives to lazily clean a timed-out
+                // waiter, and `depth()` would report phantom saturation
+                // (doctor row, /metrics, 503 body) forever.
+                let mut q = self.inner.lock().expect("queue lock");
+                q.waiters.remove(&key);
+                q.meta.remove(&key);
+                drop(q);
+                Err(format!(
+                    "waited longer than {} for a slot (all_slots_busy)",
+                    fmt_wait(timeout)
+                ))
+            }
         }
     }
 

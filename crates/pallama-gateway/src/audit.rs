@@ -115,7 +115,11 @@ pub async fn writer_task(
                     "audit log rotated at {AUDIT_ROTATE_BYTES} bytes (kept {AUDIT_ROTATE_KEEP} lines)"
                 );
             }
-            written = 0;
+            // F79: re-stat instead of blindly zeroing — on a failed
+            // rotate the file is still the old size, and resetting the
+            // counter here would let it grow unbounded with a rotate
+            // attempt on every line forever.
+            written = std::fs::metadata(&path).map_or(0, |m| m.len());
         }
         match std::fs::OpenOptions::new()
             .create(true)

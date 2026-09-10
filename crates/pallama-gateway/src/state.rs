@@ -102,9 +102,18 @@ pub struct AppState {
     pub whisper: pallama_runtime::whisper::WhisperRuntime,
     /// Single-flight for identical NON-STREAM requests (model + body
     /// hash): concurrent duplicates wait for the leader, then ride the
-    /// leader's warm prefix instead of double-prefilling. Bounded.
-    pub singleflight:
-        tokio::sync::Mutex<std::collections::HashMap<u64, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    /// leader's warm prefix instead of double-prefilling. Bounded. The
+    /// outer `Arc<Mutex<..>>` lets the guard remove its own entry in
+    /// `Drop` (F31: abort-safe cleanup).
+    pub singleflight: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<u64, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    >,
+    /// F34: memoized ACTIVE engine kind — `child_model_default_active`
+    /// ran one store SELECT per request just to learn it. Active-engine
+    /// switching is CLI/offline-only (no gateway route calls
+    /// `set_active_engine`), so the kind is constant per process; a
+    /// future live-switch feature MUST add invalidation here.
+    pub active_engine_kind: std::sync::Mutex<Option<pallama_core::engine_kind::EngineKind>>,
     /// The ACTUAL bound HTTP listener address (loopback-reachable form),
     /// set by `serve()` after bind. The batch worker needs this: config
     /// port 0 / dynamic ports must not be guessed from `config`.
@@ -124,6 +133,14 @@ pub struct AppState {
     /// Audit lines dropped because the writer channel was full —
     /// surfaced via `/metrics` as `pallama_audit_dropped_total`.
     pub audit_dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Reused `SQLite` handle for per-request store reads (engine kind,
+    /// tag lists, usage rows). Previously ~15 gateway sites opened a
+    /// fresh connection (open + 3 pragmas) per request. `Mutex`-wrapped
+    /// (rusqlite `Connection` is `Send + !Sync`); all uses are
+    /// synchronous — the guard never crosses an `.await`. We cache the
+    /// CONNECTION, not data: WAL + per-call queries keep CLI-side
+    /// writes immediately visible cross-process.
+    pub store: std::sync::Mutex<Option<pallama_core::Store>>,
 }
 
 impl AppState {
@@ -155,7 +172,8 @@ impl AppState {
             )
         };
         // Best-effort pre-load of today's usage: a store failure must not
-        // block boot (counters restart at zero, budgets loosen).
+        // block boot (counters restart at zero, budgets loosen). The
+        // handle seeds the per-request cache below instead of dropping.
         let store = pallama_core::Store::open(&dirs).ok();
         let keys = KeysLimiter::loaded(store.as_ref(), config.keys.clone());
         let otlp = Arc::new(Otlp::new(&config));
@@ -214,8 +232,25 @@ impl AppState {
             remote_affinity: std::sync::Arc::default(),
             audit_tx,
             audit_dropped,
-            singleflight: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            store: std::sync::Mutex::new(store),
+            singleflight: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            active_engine_kind: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Run `f` against the cached store connection, opening lazily on
+    /// first use. `None` = store unavailable (callers keep their existing
+    /// degraded paths). A failed open is retried on the next call — same
+    /// per-request retry semantics as the old open-per-request sites, at
+    /// zero cost once healthy.
+    pub fn with_store<T>(&self, f: impl FnOnce(&pallama_core::Store) -> T) -> Option<T> {
+        let mut guard = self.store.lock().expect("store handle poisoned");
+        if guard.is_none() {
+            *guard = pallama_core::Store::open(&self.dirs).ok();
+        }
+        guard.as_ref().map(f)
     }
 }
 

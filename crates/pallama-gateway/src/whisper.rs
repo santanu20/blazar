@@ -16,6 +16,7 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
+use axum::Extension;
 use pallama_runtime::whisper;
 
 use crate::proxy::openai_error;
@@ -211,6 +212,7 @@ async fn forward_local(
 
 pub async fn audio_transcriptions(
     State(state): State<Arc<AppState>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
     uri: Uri,
     method: Method,
     headers: HeaderMap,
@@ -232,8 +234,20 @@ pub async fn audio_transcriptions(
     let model = field(&parts, "model");
 
     // (1) Explicit remote intent wins: `name:model` never goes local.
+    // F11: remote audio lanes pay key admission too (scope + rate +
+    // request count) — every other remote lane has since the audit; the
+    // token sniffer has nothing to read in whisper JSON (no usage
+    // field), so request counts are the charge unit here.
     if let Some(model) = model.as_deref() {
         if split_remote(model, &state.config).is_some() {
+            if let Some(Extension(k)) = &key_ext {
+                if let Some(entry) = state.keys.entry(&k.name) {
+                    if let Err(rej) = state.keys.check(&entry, model) {
+                        return rej.to_response();
+                    }
+                    state.keys.charge_request(&k.name);
+                }
+            }
             return crate::remotes::forward_with_health(
                 &state,
                 model,

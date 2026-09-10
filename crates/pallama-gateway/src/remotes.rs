@@ -459,10 +459,13 @@ pub async fn ollama_chat_remote(
         })
         .boxed();
     let model_c = remote_model.to_string();
+    // F70: boundary-safe decode — chunk-split UTF-8 chars stay raw until
+    // their final byte arrives.
     let ndjson = futures::stream::unfold(
         (
             upstream,
             String::new(),
+            crate::translate::LineBuffer::new(),
             model_c,
             false,
             None::<serde_json::Value>,
@@ -470,7 +473,17 @@ pub async fn ollama_chat_remote(
             false,
             std::sync::Arc::clone(&clock),
         ),
-        |(mut stream, mut buf, model, mut done, mut usage, mut finish, mut usage_sent, clock)| async move {
+        |(
+            mut stream,
+            mut buf,
+            mut lines,
+            model,
+            mut done,
+            mut usage,
+            mut finish,
+            mut usage_sent,
+            clock,
+        )| async move {
             loop {
                 if done && !usage_sent {
                     // Decode window = last - first byte; total = full wall.
@@ -491,12 +504,14 @@ pub async fn ollama_chat_remote(
                     usage_sent = true;
                     return Some((
                         Ok(axum::body::Bytes::from(format!("{final_chunk}\n"))),
-                        (stream, buf, model, done, usage, finish, usage_sent, clock),
+                        (
+                            stream, buf, lines, model, done, usage, finish, usage_sent, clock,
+                        ),
                     ));
                 }
                 match stream.next().await {
                     Some(Ok(bytes)) => {
-                        buf.push_str(&String::from_utf8_lossy(&bytes));
+                        buf.push_str(&lines.feed(&bytes));
                         let (events, saw_done, consumed) = crate::translate::parse_sse(&buf);
                         buf.drain(..consumed);
                         for ev in &events {
@@ -510,23 +525,27 @@ pub async fn ollama_chat_remote(
                         if saw_done {
                             done = true;
                         }
-                        let lines: Vec<String> = events
+                        let ndjson_lines: Vec<String> = events
                             .iter()
                             .flat_map(|ev| crate::translate::openai_chunk_to_ollama(&model, ev))
                             .map(|v| format!("{v}\n"))
                             .collect();
-                        if lines.is_empty() {
+                        if ndjson_lines.is_empty() {
                             continue;
                         }
                         return Some((
-                            Ok(axum::body::Bytes::from(lines.join(""))),
-                            (stream, buf, model, done, usage, finish, usage_sent, clock),
+                            Ok(axum::body::Bytes::from(ndjson_lines.join(""))),
+                            (
+                                stream, buf, lines, model, done, usage, finish, usage_sent, clock,
+                            ),
                         ));
                     }
                     Some(Err(e)) => {
                         return Some((
                             Err(std::io::Error::other(e.to_string())),
-                            (stream, buf, model, done, usage, finish, usage_sent, clock),
+                            (
+                                stream, buf, lines, model, done, usage, finish, usage_sent, clock,
+                            ),
                         ));
                     }
                     None => {

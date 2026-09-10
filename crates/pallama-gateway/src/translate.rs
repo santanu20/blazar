@@ -284,6 +284,35 @@ pub fn ollama_final_chunk(
     v
 }
 
+/// Chunk-boundary-safe text accumulator for streaming decodes (F70):
+/// buffers RAW BYTES and only lossily-decodes the region up to the last
+/// complete `\n`, so a multi-byte UTF-8 char split across TCP chunk
+/// boundaries never decodes into twin U+FFFD. Feed every chunk; push
+/// the returned text into the lane's existing line/parsing buffer.
+#[derive(Default)]
+pub struct LineBuffer {
+    buf: Vec<u8>,
+}
+
+impl LineBuffer {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    /// Decode everything up to and including the last complete newline;
+    /// a trailing partial line (possibly a split UTF-8 char) stays
+    /// buffered until the next chunk completes it.
+    pub fn feed(&mut self, chunk: &[u8]) -> String {
+        self.buf.extend_from_slice(chunk);
+        let Some(nl) = self.buf.iter().rposition(|&b| b == b'\n') else {
+            return String::new();
+        };
+        let complete: Vec<u8> = self.buf.drain(..=nl).collect();
+        String::from_utf8_lossy(&complete).into_owned()
+    }
+}
+
 /// Parse `data: {...}` SSE lines from a byte buffer; returns (events, rest).
 /// Handles events split across chunk boundaries and the [DONE] sentinel.
 #[must_use]
@@ -388,6 +417,30 @@ fn iso_now() -> String {
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
+    #[test]
+    fn unit__line_buffer__split_utf8_char_across_chunks() {
+        // F70 pin: a multi-byte char split across TCP chunk boundaries
+        // must reassemble, never decode into twin U+FFFD.
+        let mut lb = super::LineBuffer::new();
+        let text = "data: {\"delta\":\"\u{4f60}\u{597d}\"}\n\n";
+        let bytes = text.as_bytes();
+        let cut = text.find("\u{597d}").expect("char present") + 1; // inside 好's bytes
+        let a = lb.feed(&bytes[..cut]);
+        assert!(a.is_empty(), "partial line held back, got {a:?}");
+        let b = lb.feed(&bytes[cut..]);
+        let joined = format!("{a}{b}");
+        assert_eq!(joined, text);
+        assert!(!joined.contains('\u{fffd}'), "replacement char leaked");
+    }
+
+    #[test]
+    fn unit__line_buffer__complete_lines_pass_through() {
+        let mut lb = super::LineBuffer::new();
+        assert_eq!(lb.feed(b"hello\nworld"), "hello\n");
+        assert_eq!(lb.feed(b"!\n"), "world!\n");
+        assert_eq!(lb.feed(b"tail"), "");
+    }
+
     use super::*;
 
     #[test]

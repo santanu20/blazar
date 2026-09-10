@@ -18,6 +18,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use pallama_core::PallamaDirs;
 use serde_json::{json, Value};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -67,11 +68,14 @@ fn read_json(path: &PathBuf) -> Option<Value> {
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
 }
-fn write_json(path: &PathBuf, v: &Value) {
+fn write_json(path: &PathBuf, v: &Value) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        std::fs::create_dir_all(dir)?;
     }
-    let _ = std::fs::write(path, serde_json::to_vec_pretty(v).unwrap_or_default());
+    std::fs::write(
+        path,
+        serde_json::to_vec_pretty(v).map_err(std::io::Error::other)?,
+    )
 }
 
 fn err(status: StatusCode, message: &str) -> Response {
@@ -113,7 +117,7 @@ pub async fn upload_file(
     if file.data.len() > MAX_UPLOAD_BYTES {
         return err(
             StatusCode::PAYLOAD_TOO_LARGE,
-            "file exceeds 64 MiB batch upload cap",
+            "file exceeds 48 MiB batch upload cap",
         );
     }
     let purpose = parts
@@ -152,7 +156,13 @@ pub async fn upload_file(
         "filename": filename,
         "purpose": purpose.unwrap_or_else(|| "batch".into()),
     });
-    write_json(&dir.join(format!("{id}.meta.json")), &obj);
+    if let Err(e) = write_json(&dir.join(format!("{id}.meta.json")), &obj) {
+        tracing::error!(target: "pallama::batch", file = %id, error = %e, "file meta write failed");
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("write file meta: {e}"),
+        );
+    }
     (StatusCode::OK, axum::Json(obj)).into_response()
 }
 
@@ -245,7 +255,12 @@ pub async fn create_batch(
         "metadata": req.get("metadata").cloned().unwrap_or(json!({})),
         "request_counts": {"total": total, "completed": 0, "failed": 0},
     });
-    write_json(&batch_meta(&state.dirs, &id), &batch);
+    if let Err(e) = write_json(&batch_meta(&state.dirs, &id), &batch) {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("persist batch: {e}"),
+        );
+    }
 
     // Worker replays lines through the gateway's own loopback listener so
     // auth/quotas/sentinel all apply. Prefer the ACTUAL bound address
@@ -302,17 +317,15 @@ async fn replay_line(
     Ok((code, text))
 }
 
-/// Append one failed-request row to the output JSONL.
-fn push_error_line(out: &mut String, custom_id: &str, message: &str) {
-    let row = serde_json::to_string(&json!({
+/// Build one failed-request row for the output JSONL.
+fn error_line(custom_id: &str, message: &str) -> String {
+    serde_json::to_string(&json!({
         "id": short_id("breq"),
         "custom_id": custom_id,
         "response": Value::Null,
         "error": {"message": message},
     }))
-    .unwrap_or_default();
-    out.push_str(&row);
-    out.push('\n');
+    .unwrap_or_default()
 }
 
 /// Everything the background worker needs to replay one batch through
@@ -352,14 +365,30 @@ async fn run_batch(dirs: PallamaDirs, job: BatchJob, input: String) {
         .unwrap_or_default();
     let mut completed = 0u64;
     let mut failed = 0u64;
-    let mut out = String::new();
+    // F74: stream rows straight to disk instead of accumulating the whole
+    // output in memory (a 48 MiB input can inflate far beyond that with
+    // response bodies; a crash also loses everything buffered so far).
+    let mut writer = match std::fs::File::create(&out_path) {
+        Ok(f) => std::io::BufWriter::new(f),
+        Err(e) => {
+            tracing::error!(target: "pallama::batch", batch = %id, error = %e, "batch output file create failed");
+            fail_batch(&dirs, &job_ref, &format!("output file create: {e}"));
+            return;
+        }
+    };
     let base = format!("http://{host}:{port}");
 
     for line in input.lines().filter(|l| !l.trim().is_empty()) {
         // Cancel is signalled through the meta file; check between items.
         if let Some(m) = read_json(&batch_meta(&dirs, &id)) {
             if m["status"] == "cancelling" {
-                finish_batch(&dirs, &job_ref, "cancelled", (completed, failed), &out);
+                finish_batch(
+                    &dirs,
+                    &job_ref,
+                    "cancelled",
+                    (completed, failed),
+                    &mut writer,
+                );
                 return;
             }
         }
@@ -370,87 +399,190 @@ async fn run_batch(dirs: PallamaDirs, job: BatchJob, input: String) {
             ),
             Err(e) => {
                 failed += 1;
-                push_error_line(&mut out, "request", &format!("unparseable input line: {e}"));
-                continue;
+                if write_row(
+                    &mut writer,
+                    &error_line("request", &format!("unparseable input line: {e}")),
+                    &dirs,
+                    &job_ref,
+                    completed,
+                    failed,
+                ) {
+                    continue;
+                }
+                return;
             }
         };
         if body["model"].as_str().is_none() {
             failed += 1;
-            push_error_line(&mut out, &custom_id, "request body has no model");
-            continue;
+            if write_row(
+                &mut writer,
+                &error_line(&custom_id, "request body has no model"),
+                &dirs,
+                &job_ref,
+                completed,
+                failed,
+            ) {
+                continue;
+            }
+            return;
         }
-        let (status_code, resp_body) = match replay_line(&client, &base, &auth_headers, &body).await
-        {
-            Ok(r) => r,
-            Err(e) => (
-                0u16,
-                serde_json::to_string(
-                    &json!({"error": {"message": format!("loopback call: {e}")}}),
-                )
-                .unwrap_or_default(),
-            ),
-        };
-        if status_code == 200 {
+        let (ok, row) = replay_to_row(&client, &base, &auth_headers, &custom_id, &body).await;
+        if ok {
             completed += 1;
         } else {
             failed += 1;
         }
-        let resp_json: Value =
-            serde_json::from_str(&resp_body).unwrap_or(json!({"raw": resp_body}));
-        out.push_str(
-            &serde_json::to_string(&json!({
-                "id": short_id("breq"),
-                "custom_id": custom_id,
-                "response": {"status_code": status_code, "body": resp_json},
-                "error": Value::Null,
-            }))
-            .unwrap_or_default(),
-        );
-        out.push('\n');
-        // Persist progress so GET /v1/batches/{id} reports live counts.
-        update_progress(&dirs, &id, completed, failed);
+        if !write_row(&mut writer, &row, &dirs, &job_ref, completed, failed) {
+            return;
+        }
     }
 
-    finish_batch(&dirs, &job_ref, "completed", (completed, failed), &out);
+    finish_batch(
+        &dirs,
+        &job_ref,
+        "completed",
+        (completed, failed),
+        &mut writer,
+    );
 }
 
+/// Replay one parsed request body through the loopback listener and build
+/// its output JSONL row. Returns (`status_was_200`, row).
+async fn replay_to_row(
+    client: &reqwest::Client,
+    base: &str,
+    auth_headers: &[(String, String)],
+    custom_id: &str,
+    body: &Value,
+) -> (bool, String) {
+    let (status_code, resp_body) = match replay_line(client, base, auth_headers, body).await {
+        Ok(r) => r,
+        Err(e) => (
+            0u16,
+            serde_json::to_string(&json!({"error": {"message": format!("loopback call: {e}")}}))
+                .unwrap_or_default(),
+        ),
+    };
+    let ok = status_code == 200;
+    let resp_json: Value = serde_json::from_str(&resp_body).unwrap_or(json!({"raw": resp_body}));
+    let row = serde_json::to_string(&json!({
+        "id": short_id("breq"),
+        "custom_id": custom_id,
+        "response": {"status_code": status_code, "body": resp_json},
+        "error": Value::Null,
+    }))
+    .unwrap_or_default();
+    (ok, row)
+}
+
+/// Append one JSONL row to the output writer; false = abort the batch
+/// (output write failed — F76: disk errors must not masquerade as success).
+fn write_row(
+    writer: &mut std::io::BufWriter<std::fs::File>,
+    row: &str,
+    dirs: &PallamaDirs,
+    job: &BatchJob,
+    completed: u64,
+    failed: u64,
+) -> bool {
+    if let Err(e) = writeln!(writer, "{row}") {
+        tracing::error!(target: "pallama::batch", batch = %job.id, error = %e, "batch output write failed");
+        fail_batch(dirs, job, &format!("output write: {e}"));
+        return false;
+    }
+    update_progress(dirs, &job.id, completed, failed);
+    true
+}
+
+/// Mark a batch failed with the reason (output-file or flush errors).
+fn fail_batch(dirs: &PallamaDirs, job: &BatchJob, why: &str) {
+    let path = batch_meta(dirs, &job.id);
+    if let Some(mut m) = read_json(&path) {
+        m["status"] = json!("failed");
+        m["error"] = json!({"message": why});
+        m["request_counts"]["failed"] =
+            json!(m["request_counts"]["failed"].as_u64().unwrap_or(0) + 1);
+        m["finalized_at"] = json!(now_secs());
+        if let Err(e) = write_json(&path, &m) {
+            tracing::error!(target: "pallama::batch", batch = %job.id, error = %e, "failed-batch meta write failed");
+        }
+    }
+}
 fn update_progress(dirs: &PallamaDirs, id: &str, completed: u64, failed: u64) {
     let path = batch_meta(dirs, id);
     if let Some(mut m) = read_json(&path) {
+        // F75: never clobber a cancel signal that landed between our read
+        // and write — the worker observes it on its next loop iteration.
+        if m["status"] == "cancelling" {
+            return;
+        }
         m["request_counts"]["completed"] = json!(completed);
         m["request_counts"]["failed"] = json!(failed);
-        write_json(&path, &m);
+        if let Err(e) = write_json(&path, &m) {
+            tracing::warn!(target: "pallama::batch", batch = %id, error = %e, "progress meta write failed");
+        }
     }
 }
 
-fn finish_batch(dirs: &PallamaDirs, job: &BatchJob, status: &str, counts: (u64, u64), out: &str) {
+fn finish_batch(
+    dirs: &PallamaDirs,
+    job: &BatchJob,
+    status: &str,
+    counts: (u64, u64),
+    writer: &mut std::io::BufWriter<std::fs::File>,
+) {
     let (id, output_id) = (&job.id, &job.output_id);
     let (completed, failed) = counts;
     let out_path = files_dir(dirs).join(format!("{output_id}.jsonl"));
-    let _ = std::fs::write(&out_path, out);
+    // F76: a failed flush must not report success — downgrade the status
+    // and surface the reason instead of swallowing it.
+    let flush = writer.flush();
+    let status = if flush.is_err() { "failed" } else { status };
+    let bytes = std::fs::metadata(&out_path).map_or(0, |m| m.len());
+    if let Err(e) = flush {
+        tracing::error!(target: "pallama::batch", batch = %id, error = %e, "batch output flush failed");
+    }
     // The output file gets a file-object meta entry too, so
     // GET /v1/files/{output_file_id} describes it like an upload.
     // (meta + content both live in files/ under {output_id}.)
     let out_meta = json!({
         "id": output_id,
         "object": "file",
-        "bytes": out.len(),
+        "bytes": bytes,
         "created_at": now_secs(),
         "filename": format!("{id}-output.jsonl"),
         "purpose": "batch_output",
     });
-    write_json(
+    if let Err(e) = write_json(
         &files_dir(dirs).join(format!("{output_id}.meta.json")),
         &out_meta,
-    );
+    ) {
+        tracing::warn!(target: "pallama::batch", batch = %id, error = %e, "output file meta write failed");
+    }
+    write_final_meta(dirs, id, output_id, status, completed, failed);
+}
+
+fn write_final_meta(
+    dirs: &PallamaDirs,
+    id: &str,
+    output_id: &str,
+    status: &str,
+    completed: u64,
+    failed: u64,
+) {
     let path = batch_meta(dirs, id);
     if let Some(mut m) = read_json(&path) {
         m["status"] = json!(status);
+        if status == "failed" {
+            m["error"] = json!({"message": "batch output write failed"});
+        }
         m["output_file_id"] = json!(output_id);
         m["request_counts"]["completed"] = json!(completed);
         m["request_counts"]["failed"] = json!(failed);
         m["finalized_at"] = json!(now_secs());
-        write_json(&path, &m);
+        if let Err(e) = write_json(&path, &m) {
+            tracing::error!(target: "pallama::batch", batch = %id, error = %e, "final batch meta write failed");
+        }
     }
     tracing::info!(target: "pallama::batch", batch = %id, status, completed, failed, "batch finished");
 }
@@ -504,6 +636,14 @@ pub async fn cancel_batch(
     State(state): State<std::sync::Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
+    // F77: same charset contract as get_batch — an unvalidated id would
+    // traverse (`../`) into arbitrary JSON files for read+rewrite.
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return err(StatusCode::BAD_REQUEST, "invalid batch id");
+    }
     let path = batch_meta(&state.dirs, &id);
     match read_json(&path) {
         Some(mut m) => {
@@ -512,7 +652,12 @@ pub async fn cancel_batch(
                 return err(StatusCode::BAD_REQUEST, "batch already finished");
             }
             m["status"] = json!("cancelling");
-            write_json(&path, &m);
+            if let Err(e) = write_json(&path, &m) {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("persist cancel: {e}"),
+                );
+            }
             (StatusCode::OK, axum::Json(m)).into_response()
         }
         None => err(StatusCode::NOT_FOUND, "unknown batch id"),

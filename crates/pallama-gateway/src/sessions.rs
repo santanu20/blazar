@@ -9,6 +9,12 @@
 //! Anthropic, embeddings, batch replays) gets pinning for free and no
 //! future handler can forget it. Header-gated: requests without the
 //! header pay nothing (no buffering, no lock, no parse).
+//!
+//! Scope note (F78): the middleware sees the header on ANY lane, but
+//! only the JSON-body lanes (chat/generate/embeddings) carry the model
+//! name inside the parsed body the pin reads — multipart lanes (whisper
+//! audio, file uploads) never pin because they carry no model field to
+//! pin against.
 
 use std::sync::Arc;
 
@@ -99,16 +105,21 @@ pub async fn pin_mw(
         }
     };
     // Best-effort model resolution: unresolvable models (remote routes,
-    // typos) never pin — the request passes through untouched.
-    if let Ok(store) = pallama_core::Store::open(&state.dirs) {
-        if let Some((session, model)) = pin_target(
-            state.config.session_keep_secs,
-            raw_session.as_deref(),
-            &bytes,
-            &store,
-        ) {
-            state.sup.sessions.touch(&session, &model);
-        }
+    // typos) never pin — the request passes through untouched. The
+    // cached-connection visit is fully synchronous (guard never crosses
+    // the `next.run` await below).
+    if let Some((session, model)) = state
+        .with_store(|s| {
+            pin_target(
+                state.config.session_keep_secs,
+                raw_session.as_deref(),
+                &bytes,
+                s,
+            )
+        })
+        .flatten()
+    {
+        state.sup.sessions.touch(&session, &model);
     }
     next.run(Request::from_parts(parts, Body::from(bytes)))
         .await

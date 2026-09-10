@@ -26,6 +26,9 @@ pub struct Otlp {
     service: String,
     tx: tokio::sync::mpsc::Sender<OtlpSpan>,
     rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<OtlpSpan>>>,
+    /// Spans never exported (channel saturated or POST failed) —
+    /// surfaced via `/metrics` as `pallama_otlp_dropped_total` (F81).
+    pub dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 const CHANNEL_CAP: usize = 1024;
@@ -44,6 +47,7 @@ impl Otlp {
             },
             tx,
             rx: std::sync::Mutex::new(Some(rx)),
+            dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -57,7 +61,10 @@ impl Otlp {
         if !self.enabled {
             return;
         }
-        let _ = self.tx.try_send(span);
+        if self.tx.try_send(span).is_err() {
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Background flusher: batch up to 256 spans / 5 s onto
@@ -97,12 +104,20 @@ impl Otlp {
                         tracing::warn!(target: "pallama::otlp", "collector returned {}", r.status());
                         warned = true;
                     }
+                    self.dropped.fetch_add(
+                        u64::try_from(batch.len()).unwrap_or(u64::MAX),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
                 Err(e) => {
                     if !warned {
                         tracing::warn!(target: "pallama::otlp", "collector unreachable: {e}");
                         warned = true;
                     }
+                    self.dropped.fetch_add(
+                        u64::try_from(batch.len()).unwrap_or(u64::MAX),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
             }
         }

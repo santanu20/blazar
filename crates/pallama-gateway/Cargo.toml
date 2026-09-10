@@ -28,11 +28,8 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
-bytes = { workspace = true }
-http-body-util = { workspace = true }
 http-body = { workspace = true }
 tokio-stream = { workspace = true }
-tempfile = "3"
 jsonschema = { version = "0.53.0", default-features = false }
 parking_lot = "0.12.5"
 

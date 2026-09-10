@@ -12,7 +12,7 @@ use std::time::Instant;
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use futures::{Future, StreamExt};
+use futures::StreamExt;
 
 use pallama_core::store::Store;
 use pallama_core::ModelRow;
@@ -109,13 +109,17 @@ pub async fn ensure_with_admission(
     prefix: Option<PrefixKey>,
 ) -> Result<(EngineRef, u128), Response> {
     let started = Instant::now();
-    let store = Store::open(&state.dirs).map_err(|e| openai_error(500, &e.to_string()))?;
-    let row = resolve_model(&store, model).map_err(|e| match e.as_str() {
-        msg if msg.contains("not found") || msg.contains("ambiguous") => {
-            openai_error(StatusCode::NOT_FOUND.as_u16(), msg)
-        }
-        msg => openai_error(500, msg),
-    })?;
+    // Model resolution is the only store need; it completes inside the
+    // cached-connection visit (sync, guard never crosses an await).
+    let row = state
+        .with_store(|s| resolve_model(s, model))
+        .ok_or_else(|| openai_error(500, "store unavailable"))?
+        .map_err(|e| match e.as_str() {
+            msg if msg.contains("not found") || msg.contains("ambiguous") => {
+                openai_error(StatusCode::NOT_FOUND.as_u16(), msg)
+            }
+            msg => openai_error(500, msg),
+        })?;
 
     let first = state.sup.ensure_routed(&row.name, prefix).await;
     // (Bank restore happens inside the supervisor at spawn-readiness.)
@@ -154,9 +158,11 @@ pub async fn ensure_with_admission(
 /// Prompt-prefix affinity hash (B1) from a parsed request body, stable
 /// across conversation turns and blind to samplers/options on purpose:
 /// chat/completions → system + first user turn; generate → `prompt`;
-/// responses → `input` (string or parts array). First 1 KiB of each
-/// part. `None` when no recognizable prompt (embeddings, tools) — no
-/// affinity, plain load-balance.
+/// responses → `input` (string or parts array). Sys-half hashes the
+/// system prompt at 256 B (F33: comment previously claimed 1 KiB);
+/// convo-half hashes system + first user turn at 1 KiB each. `None`
+/// when no recognizable prompt (embeddings, tools) — no affinity,
+/// plain load-balance.
 #[must_use]
 pub fn affinity_hash(req: &serde_json::Value) -> Option<PrefixKey> {
     use std::hash::{Hash, Hasher};
@@ -286,6 +292,10 @@ pub async fn proxy_request(
     trace: Option<String>,
     body_guard: Option<InFlightGuard>,
     key: Option<crate::keys::KeyCtx>,
+    // Hot-lane pre-parse of `body` (one parse, many consumers). `None`
+    // = caller had no parse; consumers that need JSON fall back to
+    // parsing `body` themselves (legacy behavior).
+    parsed: Option<serde_json::Value>,
 ) -> Response {
     let base = child_base(&engine.endpoint);
     if base.is_empty() {
@@ -301,26 +311,32 @@ pub async fn proxy_request(
     // classification has data — most clients never opt in. Additive and
     // spec-compliant (usage-only extra chunk; ollama lane already does
     // the same). Legacy /completions and non-chat routes pass through.
-    let body = inject_include_usage(path_query, body);
-    let body = rewrite_child_model(state, body);
+    // Both consumers reuse the hot lane's single parse.
+    let body = inject_include_usage(path_query, body, parsed.as_ref());
+    let body = rewrite_child_model(state, body, parsed.as_ref());
 
     // Single-flight (B8, FIX2): identical NON-STREAM chat requests
     // coalesce AT THE CHILD-CALL BOUNDARY (admission already happened:
     // queued duplicates are not serialized behind queue waits). Stream
-    // detection is a real JSON parse, not a substring sniff — prompt
-    // text containing `{"stream":true}` cannot fool it. Bounded wait:
-    // after 5s the twin proceeds uncoalesced (long generations never
-    // serialize their duplicates indefinitely).
+    // detection rides the same pre-parsed Value — prompt text containing
+    // `{"stream":true}` cannot fool it (real JSON, not a sniff). Neither
+    // mutation above touches the `stream` field, so the pre-parse stays
+    // authoritative for it. Bounded wait: after 5s the twin proceeds
+    // uncoalesced (long generations never serialize their duplicates
+    // indefinitely).
     let mut sf: Option<SingleFlight> = None;
     if state.config.singleflight && is_chat_route(path_query) && body.len() <= 32 * 1024 {
-        let asks_stream = serde_json::from_slice::<serde_json::Value>(&body)
-            .ok()
+        let asks_stream = parsed
+            .as_ref()
             .and_then(|v| v.get("stream").and_then(serde_json::Value::as_bool))
             .unwrap_or(false);
         if !asks_stream {
             let key = sentinel::singleflight_key(model, &body, false);
             let lock = {
-                let mut map = state.singleflight.lock().await;
+                let mut map = state
+                    .singleflight
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if map.len() > 256 {
                     map.clear(); // bounded; a cleared key elects a new leader
                 }
@@ -333,7 +349,11 @@ pub async fn proxy_request(
                 tokio::time::timeout(std::time::Duration::from_secs(5), lock.clone().lock_owned())
                     .await
             {
-                sf = Some(SingleFlight { key, _guard: guard });
+                sf = Some(SingleFlight {
+                    key,
+                    map: std::sync::Arc::clone(&state.singleflight),
+                    _guard: guard,
+                });
             }
         }
     }
@@ -363,7 +383,7 @@ pub async fn proxy_request(
             // The child may have crashed: reap it now so the NEXT request
             // respawns instead of 502-looping on a stale entry.
             state.sup.reap_dead_children().await;
-            release_sf(state, sf).await;
+            drop(sf); // F31: Drop removes the singleflight entry
             return openai_error(502, &format!("engine request failed: {e:#}"));
         }
     };
@@ -405,13 +425,26 @@ pub async fn proxy_request(
         .map(|e| crate::keys::UsageSniffer::new(&e.name));
     // Enforce (opt-in): non-stream chat requests get judged BEFORE any
     // byte is released — the client waits for the full JSON anyway, so
-    // buffering is bounded (ENFORCE_BODY_CAP) and costs no extra round
-    // trip. Streaming stays warn-only (bytes already on the wire).
+    // buffering costs no extra round trip. F62: bodies whose declared
+    // content-length already exceeds ENFORCE_BODY_CAP skip the
+    // buffering branch (streamed through) — the cap bounds judging,
+    // never the read. Streaming stays warn-only (bytes on the wire).
+    let enforce_oversized = resp
+        .content_length()
+        .is_some_and(|cl| cl > u64::try_from(sentinel::ENFORCE_BODY_CAP).unwrap_or(u64::MAX));
+    if enforce_oversized {
+        tracing::warn!(
+            target: "pallama::sentinel",
+            trace = ?trace,
+            "enforce skipped: declared body exceeds cap (streamed, not buffered)"
+        );
+    }
     if state.config.sentinel
         && !sse
         && status.is_success()
         && is_chat_route(path_query)
         && sentinel::enforce_enabled(&state.config, headers)
+        && !enforce_oversized
     {
         let (ctx, warnings) = sentinel::request_ctx(
             state,
@@ -425,7 +458,16 @@ pub async fn proxy_request(
             builder = builder.header("x-pallama-warnings", warnings.join(","));
         }
         match resp.bytes().await {
-            Err(e) => return openai_error(502, &format!("engine body: {e}")),
+            // F30: the buffered read failed — finish the sniffer (nothing
+            // chargeable was generated) and release the single-flight
+            // entry before returning; previously both leaked on this arm.
+            Err(e) => {
+                if let Some(s) = sniffer.take() {
+                    s.finish(&state.keys);
+                }
+                drop(sf); // F31: Drop removes the singleflight entry
+                return openai_error(502, &format!("engine body: {e}"));
+            }
             Ok(buf) => {
                 if buf.len() > sentinel::ENFORCE_BODY_CAP {
                     tracing::warn!(
@@ -442,6 +484,14 @@ pub async fn proxy_request(
                             .map(|d| format!("[{}] {}", d.code.as_str(), d.detail))
                             .collect::<Vec<_>>()
                             .join("; ");
+                        // F30: a fully-generated enforce-rejected response
+                        // still consumed child tokens — charge the key's
+                        // budgets and release the single-flight entry.
+                        if let Some(mut s) = sniffer.take() {
+                            s.push(&buf);
+                            s.finish(&state.keys);
+                        }
+                        drop(sf); // F31: Drop removes the singleflight entry
                         return openai_error(422, &format!("sentinel enforce: {detail}"));
                     }
                 }
@@ -455,7 +505,7 @@ pub async fn proxy_request(
                 // R6: buffered non-stream chat — classify from the exact
                 // JSON (no substring heuristics on this path).
                 record_buffered_chat(&state.obs, &buf, began.elapsed().as_secs_f64());
-                release_sf(state, sf).await;
+                drop(sf); // F31: Drop removes the singleflight entry
                 let stream = futures::stream::once(async move { Ok::<_, std::io::Error>(buf) })
                     .chain(futures::stream::unfold(body_guard, |g| async {
                         drop(g);
@@ -545,15 +595,13 @@ pub async fn proxy_request(
     });
     // Hold in-flight accounting for the body's lifetime: the guard drops
     // when the client drains (or aborts) the stream.
-    let sf_state = std::sync::Arc::clone(state);
     let stream = stream.chain(futures::stream::unfold(
         (body_guard, sf, cache_finisher),
         move |(g, sf, cache_finisher)| {
-            let sf_state = std::sync::Arc::clone(&sf_state);
             async move {
                 drop(g);
                 drop(cache_finisher); // classify at stream end (or abort)
-                release_sf(&sf_state, sf).await; // stream end (or abort): twin may lead
+                drop(sf); // F31: Drop releases singleflight at stream end or abort
                 None
             }
         },
@@ -568,14 +616,20 @@ pub async fn proxy_request(
 /// so clean drains, client aborts, and early errors all release it).
 struct SingleFlight {
     key: u64,
+    map: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<u64, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    >,
     _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
-/// Release a single-flight slot: map entry out, lock freed on drop.
-async fn release_sf(state: &Arc<AppState>, sf: Option<SingleFlight>) {
-    if let Some(sf) = sf {
-        state.singleflight.lock().await.remove(&sf.key);
-        drop(sf);
+// F31: Drop-safe release — client aborts drop the unfold future before
+// any explicit cleanup ran, leaking the map entry until the 256-clear.
+impl Drop for SingleFlight {
+    fn drop(&mut self) {
+        self.map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
     }
 }
 
@@ -604,10 +658,23 @@ fn is_chat_route(path_query: &str) -> bool {
 /// `default` id is the unambiguous target. Shared by every child-bound
 /// body site (proxy lane + ollama translation lanes).
 pub(crate) fn child_model_default_active(state: &Arc<AppState>) -> bool {
-    pallama_core::Store::open(&state.dirs)
-        .ok()
-        .and_then(|s| s.active_engine().ok().flatten())
-        .is_some_and(|row| row.kind == pallama_core::engine_kind::EngineKind::MistralRs)
+    // F34: one SELECT per process instead of one per request (the kind
+    // is constant for a daemon's lifetime — see state.rs field doc).
+    let mut cache = state
+        .active_engine_kind
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(kind) = cache.as_ref() {
+        return *kind == pallama_core::engine_kind::EngineKind::MistralRs;
+    }
+    let kind = state
+        .with_store(|s| s.active_engine().ok().flatten())
+        .flatten()
+        .map_or(pallama_core::engine_kind::EngineKind::LlamaCpp, |row| {
+            row.kind
+        });
+    *cache = Some(kind);
+    kind == pallama_core::engine_kind::EngineKind::MistralRs
 }
 
 pub(crate) fn set_child_model_default(v: &mut serde_json::Value) {
@@ -616,13 +683,25 @@ pub(crate) fn set_child_model_default(v: &mut serde_json::Value) {
     }
 }
 
-fn rewrite_child_model(state: &Arc<AppState>, body: axum::body::Bytes) -> axum::body::Bytes {
+/// `parsed` = the request body pre-parsed by the hot lane (one parse,
+/// many consumers); `None` = caller had no parse (cold lanes fall back
+/// to parsing here, exactly the old behavior).
+fn rewrite_child_model(
+    state: &Arc<AppState>,
+    body: axum::body::Bytes,
+    parsed: Option<&serde_json::Value>,
+) -> axum::body::Bytes {
     if body.is_empty() || !child_model_default_active(state) {
         return body;
     }
-    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body) else {
+    let maybe_owned = parsed.cloned().map_or_else(
+        || serde_json::from_slice::<serde_json::Value>(&body).ok(),
+        Some,
+    );
+    let Some(v) = maybe_owned else {
         return body;
     };
+    let mut v = v.clone();
     set_child_model_default(&mut v);
     match serde_json::to_vec(&v) {
         Ok(bytes) => bytes.into(),
@@ -630,12 +709,20 @@ fn rewrite_child_model(state: &Arc<AppState>, body: axum::body::Bytes) -> axum::
     }
 }
 
-fn inject_include_usage(path_query: &str, body: axum::body::Bytes) -> axum::body::Bytes {
+fn inject_include_usage(
+    path_query: &str,
+    body: axum::body::Bytes,
+    parsed: Option<&serde_json::Value>,
+) -> axum::body::Bytes {
     let p = path_query.split('?').next().unwrap_or(path_query);
     if !p.ends_with("/chat/completions") {
         return body;
     }
-    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body) else {
+    let maybe_owned = parsed.cloned().map_or_else(
+        || serde_json::from_slice::<serde_json::Value>(&body).ok(),
+        Some,
+    );
+    let Some(v) = maybe_owned else {
         return body;
     };
     if v.get("stream").and_then(serde_json::Value::as_bool) != Some(true) {
@@ -647,6 +734,7 @@ fn inject_include_usage(path_query: &str, body: axum::body::Bytes) -> axum::body
     {
         return body;
     }
+    let mut v = v; // owned already — F32: the clone re-copied the body
     v["stream_options"]["include_usage"] = serde_json::Value::Bool(true);
     match serde_json::to_vec(&v) {
         Ok(bytes) => axum::body::Bytes::from(bytes),
@@ -806,14 +894,6 @@ pub fn predictive_retry(
 /// in flight (1 by default), WAIT at the caller's priority instead of
 /// colliding with the engine's single slot (instant rejects). Bounded by
 /// the queue timeout -> 503.
-pub async fn admission_gate(
-    state: &Arc<AppState>,
-    model: &str,
-    priority: Priority,
-) -> Result<InFlightGuard, Response> {
-    admission_gate_slo(state, model, priority, None, 0, None).await
-}
-
 /// SLO-aware admission: `deadline_ms` (the `x-pallama-deadline-ms`
 /// header) and `body_len` (prefill-heavy demotion) feed the EDF queue;
 /// `wfq` = (API key name, weight) enables weighted fair queuing among
@@ -895,17 +975,30 @@ pub fn begin_accounting(state: &Arc<AppState>, model: &str) -> InFlightGuard {
     }
 }
 
-/// Bracket a NON-streaming request (accounting ends with the future).
-pub async fn with_accounting<T>(
-    state: &Arc<AppState>,
-    model: &str,
-    f: impl Future<Output = T>,
-) -> T {
-    state.sup.begin_request(model);
-    let out = f.await;
-    state.sup.end_request(model);
-    state.queue.signal_free();
-    out
+/// Hold in-flight accounting for an already-built response BODY's
+/// lifetime (F29): the guard rides inside the body stream, so clean
+/// drains, buffered one-shot bodies, AND client aborts (handler future
+/// dropped before the body is consumed) all end accounting exactly
+/// once. Replaces the old `with_accounting` future-bracket, which
+/// released at headers-ready for streams and never on aborts.
+#[must_use]
+pub fn hold_body(guard: InFlightGuard, resp: Response) -> Response {
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = futures::StreamExt::map(Body::into_data_stream(resp.into_body()), |r| {
+        r.map_err(|e| std::io::Error::other(e.to_string()))
+    })
+    .chain(futures::stream::unfold(guard, |g| async move {
+        drop(g);
+        None
+    }));
+    let mut builder = Response::builder().status(status);
+    if let Some(h) = builder.headers_mut() {
+        *h = headers;
+    }
+    builder
+        .body(Body::from_stream(body))
+        .unwrap_or_else(|e| internal(&format!("hold_body: {e}")))
 }
 
 #[must_use]
@@ -1166,6 +1259,7 @@ mod cache_obs_tests {
         let out = inject_include_usage(
             "/v1/chat/completions",
             json_body(&json!({"model": "m", "messages": [], "stream": true})),
+            None,
         );
         let v = parse(&out);
         assert_eq!(
@@ -1176,35 +1270,54 @@ mod cache_obs_tests {
     }
 
     #[test]
+    fn unit__inject_include_usage__pre_parsed_matches_fallback_exactly() {
+        // The hot lane hands the pre-parsed body in; the byte-identical
+        // contract must hold against the None fallback (parse-here)
+        // path for EVERY branch: mutate, already-set, non-stream.
+        let cases = [
+            json!({"model": "m", "messages": [], "stream": true}),
+            json!({"stream": true, "stream_options": {"include_usage": true}}),
+            json!({"model": "m", "messages": []}),
+        ];
+        for body in &cases {
+            let bytes = json_body(body);
+            let pre = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+            let a = inject_include_usage("/v1/chat/completions", bytes.clone(), pre.as_ref());
+            let b = inject_include_usage("/v1/chat/completions", bytes.clone(), None);
+            assert_eq!(a, b, "pre-parsed lane must equal fallback lane: {body}");
+        }
+    }
+
+    #[test]
     fn unit__inject_include_usage__already_set_passthrough() {
         let orig = json_body(&json!({"stream": true, "stream_options": {"include_usage": true}}));
-        let out = inject_include_usage("/v1/chat/completions", orig.clone());
+        let out = inject_include_usage("/v1/chat/completions", orig.clone(), None);
         assert_eq!(out, orig, "byte-identical: nothing to add");
     }
 
     #[test]
     fn unit__inject_include_usage__non_stream_passthrough() {
         let orig = json_body(&json!({"model": "m", "messages": []}));
-        let out = inject_include_usage("/v1/chat/completions", orig.clone());
+        let out = inject_include_usage("/v1/chat/completions", orig.clone(), None);
         assert_eq!(out, orig, "non-stream requests untouched");
     }
 
     #[test]
     fn unit__inject_include_usage__non_chat_route_passthrough() {
         let orig = json_body(&json!({"stream": true}));
-        let out = inject_include_usage("/v1/completions", orig.clone());
+        let out = inject_include_usage("/v1/completions", orig.clone(), None);
         assert_eq!(
             out, orig,
             "completions lane untouched (usage shape differs)"
         );
-        let out2 = inject_include_usage("/v1/embeddings", orig.clone());
+        let out2 = inject_include_usage("/v1/embeddings", orig.clone(), None);
         assert_eq!(out2, orig);
     }
 
     #[test]
     fn unit__inject_include_usage__invalid_json_passthrough() {
         let orig = axum::body::Bytes::from_static(b"{not json stream:true");
-        let out = inject_include_usage("/v1/chat/completions", orig.clone());
+        let out = inject_include_usage("/v1/chat/completions", orig.clone(), None);
         assert_eq!(out, orig, "child remains the judge of odd bodies");
     }
 

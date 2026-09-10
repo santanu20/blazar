@@ -80,7 +80,16 @@ async fn auth(State(state): State<Arc<AppState>>, req: Request<Body>, next: Next
                         weight: k.effective_weight(),
                     });
                     let resp = next.run(req).await;
-                    return keys::guard_response(resp, lease);
+                    let mut resp = keys::guard_response(resp, lease);
+                    // F64: request_log now runs OUTSIDE auth and can no
+                    // longer read KeyCtx off the request — stamp it on
+                    // the response extensions so the audit/access line
+                    // still carries the key name.
+                    resp.extensions_mut().insert(keys::KeyCtx {
+                        name: k.name.clone(),
+                        weight: k.effective_weight(),
+                    });
+                    return resp;
                 }
                 None => {
                     return (
@@ -171,6 +180,13 @@ async fn request_log(
     if let Ok(v) = axum::http::HeaderValue::from_str(&trace) {
         resp.headers_mut().insert("x-pallama-trace-id", v);
     }
+    // F64: auth runs INSIDE this layer now; the key arrives on the
+    // response extensions (stamped by `auth`), not the request.
+    let key = resp
+        .extensions()
+        .get::<keys::KeyCtx>()
+        .map(|k| k.name.clone())
+        .or(key);
     // E4 audit line: identity + outcome, never content. try_send — a
     // saturated writer drops (and counts) rather than stalling the
     // response.
@@ -341,7 +357,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))
         // CORS: opt-in per configured origins (empty = none, matching
         // pre-CORS behavior exactly; ["*"] = any). Non-browser clients
-        // are unaffected either way.
+        // are unaffected either way. Sits OUTSIDE auth (F64): browser
+        // preflights carry no bearer and must get a CORS answer, not a
+        // bare 401.
         .layer(
             tower_http::cors::CorsLayer::new()
                 .allow_origin(cors_allow_origin(&state.config.cors_origins))
@@ -355,8 +373,13 @@ pub fn router(state: Arc<AppState>) -> Router {
                     "x-pallama-trace-id",
                 )]),
         )
-        .layer(middleware::from_fn_with_state(state.clone(), request_log))
+        // Auth INSIDE request_log + CORS (F64): rejected secrets are
+        // still access-logged and traced — brute-force probing no
+        // longer flies blind.
         .layer(middleware::from_fn_with_state(state.clone(), auth))
+        // request_log: outermost — every request, including 401s and
+        // preflights, gets a trace id and an access-log line.
+        .layer(middleware::from_fn_with_state(state.clone(), request_log))
         .with_state(state)
 }
 
@@ -377,10 +400,18 @@ fn cors_allow_origin(origins: &[String]) -> tower_http::cors::AllowOrigin {
 
 /// Persist the live key set back to config.toml ([[keys]] tables).
 /// Full-file round-trip (the established `create`/`config set` pattern):
-/// parse -> swap keys -> validate -> write. Returns an error response on
-/// failure (the live registry is already updated; a failed persist is
-/// loud, never silent — the next daemon restart loses the change).
+/// parse -> swap keys -> validate -> atomic write (temp + rename, F67).
+/// A process-wide mutex excludes the other config.toml writers in this
+/// daemon (SIGHUP reload reads are lock-free but writes serialize), so
+/// two racing mutations can't clobber each other with a stale read.
+/// Returns an error response on failure (the live registry is already
+/// updated; a failed persist is loud, never silent — the next daemon
+/// restart loses the change).
 fn persist_keys(state: &AppState, entries: &[ApiKey]) -> Response {
+    static PERSIST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = PERSIST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let path = state.dirs.config_file();
     let mut cfg = if path.exists() {
         match std::fs::read_to_string(&path)
@@ -397,10 +428,13 @@ fn persist_keys(state: &AppState, entries: &[ApiKey]) -> Response {
     if let Err(e) = cfg.validate() {
         return error_response(400, &format!("generated config invalid: {e}"));
     }
+    // F67: atomic write (temp+rename) + timestamped .bak via the shared
+    // core helper — a crash mid-write can never truncate config.toml and
+    // an overwrite is always recoverable.
     let write = cfg
         .to_toml()
         .map_err(|e| e.to_string())
-        .and_then(|t| std::fs::write(&path, t).map_err(|e| e.to_string()));
+        .and_then(|t| pallama_core::persist_config(&path, &t).map_err(|e| e.to_string()));
     match write {
         Ok(()) => (StatusCode::OK, axum::Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => error_response(500, &format!("write {}: {e}", path.display())),
@@ -523,6 +557,17 @@ async fn keys_add(
     if name.trim().is_empty() {
         return error_response(400, "name must not be empty");
     }
+    // F68: remove/rotate address keys via `?name=` — restrict the
+    // charset at creation so every name stays manageable over HTTP.
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return error_response(
+            400,
+            "key name may only contain [A-Za-z0-9._-] (it is addressed via ?name= queries)",
+        );
+    }
     if state.keys.entries().iter().any(|k| k.name == name) {
         return error_response(
             409,
@@ -539,7 +584,6 @@ async fn keys_add(
         })
         .unwrap_or_default();
     #[allow(clippy::result_large_err)]
-    #[allow(clippy::result_large_err)]
     let num = |field: &str, default: u64| -> Result<u64, Response> {
         match body.get(field) {
             None | Some(serde_json::Value::Null) => Ok(default),
@@ -548,15 +592,32 @@ async fn keys_add(
             }),
         }
     };
+    // F65: the teaching 400s above are answers, not decoration — an
+    // invalid rpm/tpm/daily_tokens must be REJECTED, not silently
+    // coerced to 0 (= unlimited).
+    #[allow(clippy::result_large_err)] // the 400 Response IS the error type here
+    let nums = || -> Result<(u64, u64, u64, u64, u64), Response> {
+        Ok((
+            num("rpm", 0)?,
+            num("tpm", 0)?,
+            num("daily_tokens", 0)?,
+            num("max_concurrent", 0)?,
+            num("weight", 1)?,
+        ))
+    };
+    let (rpm, tpm, daily_tokens, max_concurrent, weight) = match nums() {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     let entry = ApiKey {
         key: format!("plm_{}", rand_secret()),
         name,
         models,
-        rpm: u32::try_from(num("rpm", 0).unwrap_or(0)).unwrap_or(u32::MAX),
-        tpm: num("tpm", 0).unwrap_or(0),
-        daily_tokens: num("daily_tokens", 0).unwrap_or(0),
-        max_concurrent: u32::try_from(num("max_concurrent", 0).unwrap_or(0)).unwrap_or(u32::MAX),
-        weight: u32::try_from(num("weight", 1).unwrap_or(1)).unwrap_or(1),
+        rpm: u32::try_from(rpm).unwrap_or(u32::MAX),
+        tpm,
+        daily_tokens,
+        max_concurrent: u32::try_from(max_concurrent).unwrap_or(u32::MAX),
+        weight: u32::try_from(weight).unwrap_or(1),
     };
     state.keys.upsert(entry.clone());
     let entries = state.keys.entries();
@@ -645,11 +706,15 @@ async fn keys_rotate(
     };
     let rotated = ApiKey {
         key: format!("plm_{}", rand_secret()),
-        ..entry
+        ..entry.clone()
     };
     state.keys.upsert(rotated.clone());
     let persist = persist_keys(&state, &state.keys.entries());
     if persist.status() != StatusCode::OK {
+        // F66: mirror keys_add's rollback — the file is the source of
+        // truth; without this the shown-once new secret dies silently
+        // at the next restart when the old file entry wins.
+        state.keys.upsert(entry);
         return persist;
     }
     (
@@ -665,26 +730,38 @@ async fn keys_rotate(
 /// GET /.well-known/pallama — capability discovery: routes, limits,
 /// engine identity. Clients introspect instead of probing.
 async fn well_known(State(state): State<Arc<AppState>>) -> Response {
-    let store = pallama_core::Store::open(&state.dirs).ok();
-    let engine = store.and_then(|s| s.active_engine().ok().flatten()).map_or(
-        serde_json::Value::Null,
-        |e| serde_json::json!({"tag": e.tag, "asset": e.asset, "kind": e.kind.as_str()}),
-    );
+    let engine = state
+        .with_store(|s| s.active_engine().ok().flatten())
+        .flatten()
+        .map_or(
+            serde_json::Value::Null,
+            |e| serde_json::json!({"tag": e.tag, "asset": e.asset, "kind": e.kind.as_str()}),
+        );
     axum::Json(serde_json::json!({
         "name": "pallama",
         "version": env!("CARGO_PKG_VERSION"),
         "engine": engine,
-        "apis": ["openai", "ollama", "anthropic-passthrough"],
+        // F52: the messages lane TRANSLATES and refuses passthrough —
+        // the label must not advertise passthrough semantics.
+        "apis": ["openai", "ollama", "anthropic"],
+        // F69: full route census (verified against the router table).
         "endpoints": {
-            "openai": ["/v1/chat/completions", "/v1/completions", "/v1/embeddings",
-                       "/v1/rerank", "/v1/responses", "/v1/responses/{id}", "/v1/messages",
+            "openai": ["/v1/chat/completions", "/v1/chat/completions/control",
+                       "/v1/completions", "/v1/embeddings", "/v1/rerank", "/v1/reranking",
+                       "/v1/responses", "/v1/responses/{id}", "/v1/responses/input_tokens",
+                       "/v1/messages", "/v1/messages/count_tokens", "/v1/models",
+                       "/v1/adapters", "/v1/batches", "/v1/batches/{id}",
+                       "/v1/batches/{id}/cancel", "/v1/files", "/v1/files/{id}",
+                       "/v1/files/{id}/content", "/v1/streams/lookup",
                        "/v1/audio/transcriptions", "/infill", "/tokenize", "/detokenize",
-                       "/apply-template", "/v1/adapters"],
+                       "/apply-template", "/slots", "/slots/{id}", "/responses",
+                       "/responses/input_tokens"],
             "ollama": ["/api/chat", "/api/generate", "/api/tags", "/api/ps", "/api/show",
-                       "/api/embeddings", "/api/events", "/api/version"],
+                       "/api/embeddings", "/api/embed", "/api/rerank", "/api/pull",
+                       "/api/delete", "/api/events", "/api/version"],
             "pallama": ["/api/evict", "/api/session", "/api/sessions", "/api/why",
-                        "/api/watch", "/api/keys", "/.well-known/pallama", "/metrics",
-                        "/healthz"],
+                        "/api/watch", "/api/keys", "/api/keys/rotate",
+                        "/.well-known/pallama", "/metrics", "/healthz", "/health"],
         },
         "headers": ["x-pallama-num-ctx", "x-pallama-deadline-ms", "x-pallama-priority",
                     "x-pallama-enforce", "x-pallama-trace-id", "x-pallama-status",
@@ -732,6 +809,28 @@ fn counter(text: &str, name: &str) -> Option<u64> {
 /// Serve the gateway until `shutdown` resolves (SIGTERM/SIGINT), then
 /// drain: stop accepting, stop children, exit clean. TLS when
 /// `tls_cert`/`tls_key` are configured, plain HTTP otherwise.
+#[allow(clippy::too_many_lines)]
+/// Serve returned because the configured listen address is already
+/// taken (another server — typically ollama — owns the port). The CLI
+/// maps this to `EXIT_BIND_CONFLICT` and the systemd unit pins
+/// `RestartPreventExitStatus=` to it: a hard port conflict must fail
+/// loudly once, not crash-loop `Restart=always` into the journal.
+#[derive(Debug)]
+pub struct BindConflict(pub std::io::Error);
+
+impl std::fmt::Display for BindConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "listen address already in use: {}", self.0)
+    }
+}
+
+impl std::error::Error for BindConflict {}
+
+/// `pallama serve` exit code for an unrecoverable bind conflict.
+pub const EXIT_BIND_CONFLICT: i32 = 3;
+
+// One wiring function: listener, TLS, flushers, teardown — all the
+// serve-lifetime setup in a single readable sequence.
 #[allow(clippy::too_many_lines)]
 pub async fn serve(
     state: Arc<AppState>,
@@ -836,13 +935,22 @@ pub async fn serve(
     // OTLP flusher (no-op task when the endpoint is unset).
     let otlp_task = {
         let otlp = Arc::clone(&state.otlp);
-        let http = reqwest::Client::new();
+        // F81: bounded POSTs — a black-hole collector used to wedge the
+        // flusher forever (the 5s select only bounds the first-span wait).
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
         tokio::spawn(async move { otlp.run(http).await })
     };
     if state.config.tls_cert.is_empty() {
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .map_err(|e| anyhow::anyhow!("bind {addr}: {e} — another server (ollama?) on this port? stop it or set PALLAMA_PORT"))?;
+        let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
+            // Typed so the CLI can exit 3 and the systemd unit's
+            // RestartPreventExitStatus=3 stops the Restart=always loop.
+            anyhow::Error::new(BindConflict(e)).context(format!(
+                "bind {addr} — another server (ollama?) on this port? stop it or set PALLAMA_PORT"
+            ))
+        })?;
         // Record the real bound address for the batch worker (config port
         // may be 0 = ephemeral; fold wildcard binds to loopback-reachable).
         if let Ok(sa) = listener.local_addr() {
@@ -874,13 +982,35 @@ pub async fn serve(
         let bind_addr: std::net::SocketAddr = addr
             .parse()
             .map_err(|e| anyhow::anyhow!("bind address {addr}: {e}"))?;
+        // F69: record the bound address on the TLS branch too — the
+        // batch worker's loopback replay must not guess config.port
+        // (invalid when 0 = ephemeral). Binding with tokio first gives
+        // us the real port the same way the plain-HTTP branch gets it.
+        let listener = tokio::net::TcpListener::bind(bind_addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
+        if let Ok(sa) = listener.local_addr() {
+            let h = sa.ip().to_string();
+            let h = if h == "0.0.0.0" || h == "::" {
+                "127.0.0.1".to_string()
+            } else {
+                h
+            };
+            let _ = state.http_addr.set((h, sa.port()));
+        }
         let handle = axum_server::Handle::new();
         let h2 = handle.clone();
         tokio::spawn(async move {
             shutdown.await;
             h2.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
         });
-        axum_server::bind_rustls(bind_addr, rustls_config)
+        // axum-server takes a blocking std listener (its serve loop
+        // re-asserts non-blocking mode itself); tokio's into_std hands
+        // over the already-bound socket without a rebind race.
+        let std_listener = listener
+            .into_std()
+            .map_err(|e| anyhow::anyhow!("tls listener handoff: {e}"))?;
+        axum_server::from_tcp_rustls(std_listener, rustls_config)
             .handle(handle)
             .serve(app.into_make_service())
             .await
@@ -936,5 +1066,23 @@ mod tests {
             None
         );
         assert_eq!(counter(body, "llamacpp:missing_total"), None);
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+mod bind_conflict_tests {
+    use super::BindConflict;
+
+    #[test]
+    fn unit__bind_conflict__downcast_survives_context_chain() {
+        // The CLI exit-3 path relies on anyhow::downcast_ref finding the
+        // typed cause through a .context() wrapper — pin that mechanic.
+        let e = anyhow::Error::new(BindConflict(std::io::Error::other(
+            "Address already in use",
+        )))
+        .context("bind 127.0.0.1:11434 — another server?");
+        assert!(e.downcast_ref::<BindConflict>().is_some());
+        assert_eq!(super::EXIT_BIND_CONFLICT, 3);
     }
 }
