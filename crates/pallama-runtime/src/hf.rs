@@ -795,19 +795,35 @@ impl PullLock {
                 Ok(Self { path })
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Stale-lock steal: older than 6h with no live pid.
-                let age = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
+                // The lockfile carries the owning pid: a dead owner means
+                // the pull crashed (kill -9, power loss) and the lock is
+                // stale — steal it immediately instead of blocking for the
+                // 6h age fallback. Live owner -> refuse, naming the pid.
+                let path_display = path.display().to_string();
+                let owner = std::fs::read_to_string(&path)
                     .ok()
-                    .and_then(|t| t.elapsed().ok())
-                    .unwrap_or_default();
-                if age > Duration::from_hours(6) {
+                    .and_then(|raw| raw.trim().parse::<u32>().ok());
+                let owner_alive = owner.is_some_and(pid_alive);
+                if !owner_alive {
+                    // Unknown/corrupt lockfile with no parseable pid falls
+                    // back to the age heuristic so a corrupt file cannot
+                    // wedge pulls forever either.
+                    let age = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .unwrap_or_default();
+                    if owner.is_none() && age < Duration::from_hours(6) {
+                        return Err(anyhow!(
+                            "pull already in progress for {name} (lockfile {path_display}, unreadable owner); delete it if you are sure no pull is running"
+                        ));
+                    }
                     let _ = std::fs::remove_file(&path);
                     return Self::acquire(dirs, name);
                 }
                 Err(anyhow!(
-                    "pull already in progress for {name} (lockfile {}); delete it if you are sure no pull is running",
-                    path.display()
+                    "pull already in progress for {name} by pid {} (lockfile {path_display})",
+                    owner.unwrap_or_default()
                 ))
             }
             Err(e) => Err(anyhow!("create lock {}: {e}", path.display())),
@@ -818,6 +834,37 @@ impl PullLock {
 impl Drop for PullLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Is a process with this pid alive? Linux: `/proc` — no shell-out.
+/// Other unixes: `kill -0` (signal 0 = existence probe, no delivery).
+/// Windows: `tasklist` filter. Pid reuse can false-positive; the age
+/// fallback and manual delete remain as escape hatches.
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+            .unwrap_or(false)
     }
 }
 
@@ -1552,6 +1599,54 @@ mod tests {
             PullLock::acquire(&dirs, "m").is_ok(),
             "lock released on drop"
         );
+    }
+
+    #[tokio::test]
+    async fn integration__lock_stale__dead_owner_pid_stolen_immediately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = PallamaDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        dirs.ensure().unwrap();
+        // A real, now-exited process: its pid is genuinely dead, no race.
+        let mut child =
+            std::process::Command::new(std::env::var("EXE_TRUE").unwrap_or_else(|_| {
+                if cfg!(windows) {
+                    "cmd".into()
+                } else {
+                    "true".into()
+                }
+            }))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let dead_pid = child.id();
+        let _ = child.wait();
+        let lock = dirs.run_dir().join("pull-m.lock");
+        std::fs::write(&lock, format!("{dead_pid}\n")).unwrap();
+        // Fresh file, well under 6h: must STILL be stolen because the
+        // owner is provably dead.
+        let got = PullLock::acquire(&dirs, "m");
+        assert!(got.is_ok(), "dead-owner lock stolen: {}", got.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn integration__lock_live__owner_pid_named_in_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = PallamaDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        dirs.ensure().unwrap();
+        let lock = dirs.run_dir().join("pull-m.lock");
+        std::fs::write(&lock, format!("{}\n", std::process::id())).unwrap();
+        let err = PullLock::acquire(&dirs, "m").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("already in progress"), "{msg}");
+        assert!(msg.contains(&std::process::id().to_string()), "{msg}");
+        std::fs::remove_file(&lock).unwrap();
     }
 
     #[tokio::test]
