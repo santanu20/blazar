@@ -4785,6 +4785,46 @@ fn lora_cmd(cmd: LoraCmd) -> Result<()> {
     Ok(())
 }
 
+/// Search-table repo-id display: shrink the OWNER (leading ellipsis),
+/// never the model name — the model tail is the discriminator users copy
+/// for `pallama pull` (`…-heretic-i1-GGUF` vs `…-heretic-GGUF` are
+/// different repos). Slash-less ids and oversized model names fall back
+/// to a tail cut. Char-safe: never slices mid-UTF-8.
+fn truncate_repo_id(id: &str, cap: usize) -> String {
+    if id.chars().count() <= cap {
+        return id.to_string();
+    }
+    if let Some((owner, model)) = id.split_once('/') {
+        let model_len = model.chars().count();
+        if model_len + 2 <= cap {
+            let keep = cap - model_len - 2; // room for "…/"
+            let head: String = owner.chars().take(keep).collect();
+            return format!("{head}…/{model}");
+        }
+    }
+    let head: String = id.chars().take(cap - 1).collect();
+    format!("{head}…")
+}
+
+/// Downloads/likes display: round-half-up to one decimal (`2395` ->
+/// `"2.4k"`, not the floored `"2.3k"`), with carry promotion at unit
+/// boundaries (`999_950` -> `"1.0M"`). Integer-only — no float casts.
+fn human_count(n: u64) -> String {
+    if n >= 999_950 {
+        let t = (n + 50_000) / 100_000; // tenths of a million, rounded
+        if t / 10 >= 100 {
+            format!("{}M", t / 10)
+        } else {
+            format!("{}.{}M", t / 10, t % 10)
+        }
+    } else if n >= 995 {
+        let t = (n + 50) / 100; // tenths of a thousand, rounded
+        format!("{}.{}k", t / 10, t % 10)
+    } else {
+        n.to_string()
+    }
+}
+
 async fn search(query: &str) -> Result<()> {
     let token = std::env::var("HF_TOKEN").ok();
     let client = pallama_runtime::hf::HfClient::new(token)?;
@@ -4794,25 +4834,15 @@ async fn search(query: &str) -> Result<()> {
         return Ok(());
     }
     // Column width adapts to the longest repo id (capped) so numbers never
-    // drift out of alignment; oversize ids truncate with an ellipsis.
-    let cap = 48usize;
+    // drift out of alignment; oversize ids shrink the owner, keeping the
+    // model name — the pull discriminator — fully visible.
+    let cap = 64usize;
     let width = results
         .iter()
         .map(|r| r.id.len().min(cap))
         .max()
         .unwrap_or(0)
         .max("REPO".len());
-    let human = |n: u64| {
-        if n >= 1_000_000 {
-            let t = n / 100_000; // e.g. 2_414_570 -> 24 -> "2.4M"
-            format!("{}.{}M", t / 10, t % 10)
-        } else if n >= 1_000 {
-            let t = n / 100; // e.g. 414_570 -> 4145 -> "414.5k"
-            format!("{}.{}k", t / 10, t % 10)
-        } else {
-            n.to_string()
-        }
-    };
     let human_ctx = |c: u64| {
         if c >= 1024 * 1024 {
             format!("{}M", c / (1024 * 1024))
@@ -4823,21 +4853,18 @@ async fn search(query: &str) -> Result<()> {
         }
     };
     println!(
-        "{:<width$}  {:>10}  {:>6}  {:<10}  {:<7}  {:>5}",
+        "{:<width$}  {:>10}  {:>6}  {:<10}  {:<7}  {:>5}  {:<22}",
         "REPO",
         "DOWNLOADS",
         "LIKES",
         "SIZE",
         "ARCH",
         "CTX",
+        "QUANTS",
         width = width
     );
     for r in results {
-        let id = if r.id.len() > cap {
-            format!("{}…", &r.id[..cap - 1])
-        } else {
-            r.id.clone()
-        };
+        let id = truncate_repo_id(&r.id, cap);
         let (size, arch, ctx) = r.gguf.map_or_else(
             || ("-".to_string(), "?".to_string(), "-".to_string()),
             |g| {
@@ -4848,18 +4875,28 @@ async fn search(query: &str) -> Result<()> {
                 )
             },
         );
+        let names =
+            pallama_runtime::hf::quant_tokens(r.siblings.iter().map(|s| s.rfilename.as_str()));
+        let quants = if names.is_empty() {
+            "-".to_string()
+        } else if names.len() <= 3 {
+            names.join(",")
+        } else {
+            format!("{},+{}", names[..3].join(","), names.len() - 3)
+        };
         println!(
-            "{:<width$}  {:>10}  {:>6}  {:<10}  {:<7}  {:>5}",
+            "{:<width$}  {:>10}  {:>6}  {:<10}  {:<7}  {:>5}  {:<22}",
             id,
-            human(r.downloads.unwrap_or(0)),
+            human_count(r.downloads.unwrap_or(0)),
             r.likes.unwrap_or(0),
             size,
             arch,
             ctx,
+            quants,
             width = width
         );
     }
-    println!("\n# pull one: pallama pull <REPO>[:quant]   (size = all quants in repo)");
+    println!("\n# pull one: pallama pull <REPO>[:quant]   (size = all quants in repo; QUANTS lists the choices)");
     Ok(())
 }
 
@@ -5008,6 +5045,44 @@ async fn upgrade(version: Option<String>, dry_run: bool) -> Result<()> {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn unit__truncate_repo_id__shrinks_owner_keeps_model_tail() {
+        // The incident rows: two different repos whose old tail-cut
+        // rendering was byte-identical AND un-copy-pasteable for pull.
+        let i1 = "mradermacher/Parable-Nanbeige4.2-3B-Claude-Fable-5-heretic-i1-GGUF";
+        let plain = "mradermacher/Parable-Nanbeige4.2-3B-Claude-Fable-5-heretic-GGUF";
+        let t = truncate_repo_id(i1, 64);
+        assert!(t.ends_with("heretic-i1-GGUF"), "{t}");
+        assert!(t.contains("…/"), "owner must be the part that shrinks: {t}");
+        assert!(t.chars().count() <= 64);
+        // Fits: untouched (this row previously truncated at 49 chars).
+        assert_eq!(
+            truncate_repo_id(plain, 64),
+            "mradermacher/Parable-Nanbeige4.2-3B-Claude-Fable-5-heretic-GGUF"
+        );
+        assert_eq!(
+            truncate_repo_id("owao/Nanbeige4.2-3B-GGUF", 64),
+            "owao/Nanbeige4.2-3B-GGUF"
+        );
+        // Slash-less / oversized-model fallback: tail cut, never a panic.
+        let no_slash = "a-very-long-repository-name-without-any-slash-at-all-0123456789";
+        let t2 = truncate_repo_id(no_slash, 32);
+        assert!(t2.chars().count() <= 32 && t2.ends_with('…'), "{t2}");
+    }
+
+    #[test]
+    fn unit__human_count__rounds_half_up_with_carry() {
+        assert_eq!(human_count(0), "0");
+        assert_eq!(human_count(994), "994"); // below 0.995k: verbatim
+        assert_eq!(human_count(995), "1.0k"); // 0.995 rounds up
+        assert_eq!(human_count(2_395), "2.4k"); // was floored "2.3k"
+        assert_eq!(human_count(142_502), "142.5k");
+        assert_eq!(human_count(999_949), "999.9k"); // last k row
+        assert_eq!(human_count(999_950), "1.0M"); // carry promotes unit
+        assert_eq!(human_count(2_414_570), "2.4M");
+    }
 
     #[test]
     fn unit__parse_modelfile__supported_subset() {

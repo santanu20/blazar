@@ -574,7 +574,58 @@ pub struct SearchEntry {
     #[serde(default)]
     pub likes: Option<u64>,
     #[serde(default)]
+    pub siblings: Vec<HfSibling>,
+    #[serde(default)]
     pub gguf: Option<HfGgufInfo>,
+}
+
+/// Quant names advertised by a repo's GGUF filenames, canonical uppercase,
+/// deduped, alphabetically sorted. Powers the search table's QUANTS column
+/// so `pallama pull <REPO>[:quant]` can be chosen from the listing itself.
+///
+/// A filename segment qualifies only if it parses as `(IQ|TQ|BF|F|Q)` +
+/// digit + `[A-Za-z0-9_]*` — model-size tags (`3B`), dates (`2511`) and
+/// finetune words (`heretic`, `fable`) don't. Shards (`-00002-of-00005`,
+/// digit-only tail) and `mmproj-*` projectors are excluded by the same
+/// rules.
+pub fn quant_tokens(names: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in names {
+        let Some(quant) = quant_token(name.as_ref()) else {
+            continue;
+        };
+        if !out.contains(&quant) {
+            out.push(quant);
+        }
+    }
+    out.sort();
+    out
+}
+
+fn quant_token(filename: &str) -> Option<String> {
+    if !std::path::Path::new(filename)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+    {
+        return None;
+    }
+    let lower = filename.to_ascii_lowercase();
+    if lower.starts_with("mmproj") {
+        return None;
+    }
+    let stem = &lower[..lower.len() - ".gguf".len()];
+    let last = stem.rsplit(['.', '-']).next()?;
+    for prefix in ["iq", "tq", "bf", "q", "f"] {
+        if let Some(rest) = last.strip_prefix(prefix) {
+            let mut chars = rest.chars();
+            if matches!(chars.next(), Some(d) if d.is_ascii_digit())
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                return Some(last.to_ascii_uppercase());
+            }
+        }
+    }
+    None
 }
 
 impl HfClient {
@@ -584,7 +635,7 @@ impl HfClient {
         let url = self
             .api_base
             .join(&format!(
-                "api/models?search={}&filter=gguf&limit={limit}&sort=downloads&direction=-1&expand[]=gguf&expand[]=likes",
+                "api/models?search={}&filter=gguf&limit={limit}&sort=downloads&direction=-1&expand[]=gguf&expand[]=likes&expand[]=siblings",
                 url_encode_path(query)
             ))
             .map_err(|e| anyhow!("bad search URL: {e}"))?;
@@ -972,6 +1023,37 @@ mod tests {
             unique_dest(dir, "org/repo/m.gguf", "unsloth/Other"),
             dir.join("org--repo--m.gguf")
         );
+    }
+
+    #[test]
+    fn unit__quant_tokens__real_filename_shapes() {
+        // Shapes harvested live from HF nanbeige search results.
+        let files = [
+            "Nanbeige4.2-3B-Q4_K_M.gguf",               // dash separator
+            "nanbeige4.1-3b-q8_0.gguf",                 // lowercase repo style
+            "nanbeige-16b-base-32k.Q2_K.gguf",          // dot separator
+            "Nanbeige4.2-3B-BF16.gguf",
+            "Parable-Nanbeige4.2-3B-Claude-Fable-5-heretic.i1-IQ1_M.gguf",
+            "model-00001-of-00002.gguf",                // shard tail: digits only
+            "mmproj-model-F16.gguf",                    // projector: excluded
+            "README.md",                                // not gguf
+            "Nanbeige4-3B-Thinking-2511.gguf",          // tag tails: not quants
+        ];
+        assert_eq!(
+            quant_tokens(files),
+            ["BF16", "IQ1_M", "Q2_K", "Q4_K_M", "Q8_0"]
+        );
+    }
+
+    #[test]
+    fn unit__quant_tokens__dedups_case_insensitively() {
+        let files = ["m.Q8_0.gguf", "m-q8_0.gguf"];
+        assert_eq!(quant_tokens(files), ["Q8_0"]);
+    }
+
+    #[test]
+    fn unit__quant_tokens__no_gguf_files_is_empty() {
+        assert!(quant_tokens(["README.md", "config.json"]).is_empty());
     }
 
     #[test]
