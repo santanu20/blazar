@@ -1,0 +1,185 @@
+name: engine-cuda
+
+# Prebuilt CUDA channel for the llama.cpp engine: compiles the UPSTREAM
+# ggml-org/llama.cpp source at a b-tag with -DGGML_CUDA=ON against CUDA
+# 12 and CUDA 13 toolkit images, bundles the NVIDIA runtime libraries
+# (cudart/cublas/cublasLt) plus their EULAs, and publishes the archives
+# as `bNNNN-cuda` releases on THIS repository. Pallama's engine lane
+# picks them up automatically on Linux-NVIDIA boxes whose driver can
+# run the toolkit version (zero-touch: the overlay home defaults to
+# pallama/pallama — flip ENGINE_OVERLAY_REPO_DEFAULT in gh.rs if the
+# project repo moves; PALLAMA_ENGINE_REPO=owner/repo points at forks).
+#
+# No source fork: every build checks out the pristine upstream tarball.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream b-tag to build (e.g. b10896). Empty = newest."
+        required: false
+        default: ""
+      architectures:
+        description: "CMAKE_CUDA_ARCHITECTURES override (semicolon list). Empty = per-major default."
+        required: false
+        default: ""
+  schedule:
+    # Weekly probe for a new upstream b-tag (idempotent: re-uploading
+    # an existing bNNNN-cuda release only refreshes its assets).
+    - cron: "0 5 * * 1"
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: ggml-org/llama.cpp
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - name: Resolve upstream b-tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          else
+            # Newest b-tag from upstream releases (prereleases included).
+            tag="$(gh api "repos/${UPSTREAM_REPO}/releases" --paginate -q '.[].tag_name | select(startswith("b"))' | head -1)"
+          fi
+          case "$tag" in
+            b*) echo "tag=$tag" >> "$GITHUB_OUTPUT" ;;
+            *) echo "no b-tag resolved (input: '$INPUT_TAG')" >&2; exit 1 ;;
+          esac
+
+  build:
+    needs: resolve
+    name: cuda ${{ matrix.cuda }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # CUDA minor-version compatibility is deliberately NOT trusted
+          # by the client (driver must be >= asset toolkit version), so
+          # each matrix entry names the exact toolkit it bundles.
+          # Arch lists: CUDA 13 dropped sm<75 (Turing floor); Blackwell
+          # (sm_100/120) needs 12.8+. env-overridable per dispatch.
+          - { cuda: "12.8.1", archs: "61;70;75;80;86;89;90;100;120" }
+          - { cuda: "13.0.0", archs: "75;80;86;89;90;100;120" }
+    runs-on: ubuntu-24.04
+    container:
+      image: nvidia/cuda:${{ matrix.cuda }}-devel-ubuntu24.04
+    env:
+      CMAKE_CUDA_ARCHITECTURES: ${{ github.event.inputs.architectures || matrix.archs }}
+    steps:
+      - name: Install build deps
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl xz-utils zip python3 pip git
+          pip install --no-cache-dir cmake==3.28.3
+
+      - name: Fetch upstream source (${{ needs.resolve.outputs.tag }})
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          curl -fsSL "https://github.com/${UPSTREAM_REPO}/archive/refs/tags/${TAG}.tar.gz" -o src.tar.gz
+          mkdir -p src && tar -xzf src.tar.gz -C src --strip-components=1
+
+      - name: Build llama-server + ggml-rpc-server (CUDA ON)
+        run: |
+          cmake -S src -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CUDA=ON \
+            -DGGML_RPC=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="$CMAKE_CUDA_ARCHITECTURES" \
+            -DGGML_CUDA_F16=ON \
+            -DLLAMA_CURL=OFF \
+            -DBUILD_SHARED_LIBS=ON
+          # ggml-rpc-server ships in upstream prebuilt assets; a
+          # server-only build breaks the runtime's rpc override leg.
+          cmake --build build --config Release -j"$(nproc)" --target llama-server ggml-rpc-server
+
+      - name: Smoke (--help, CUDA device probe is driver-less in CI)
+        run: |
+          find build/bin -name 'llama-server*' -type f | head
+          "$(find build/bin -name 'llama-server' -type f | head -1)" --version
+
+      - name: Package
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+          CUDA_VER: ${{ matrix.cuda }}
+        run: |
+          # Asset label carries the toolkit X.Y the driver gate keys on.
+          ver="$(echo "$CUDA_VER" | cut -d. -f1,2)"
+          stage="$(mktemp -d)/llama-${TAG}-bin-ubuntu-cuda-${ver}-x64"
+          mkdir -p "$stage"
+          bin="$(find build/bin -name 'llama-server' -type f | head -1)"
+          install -m 0755 "$bin" "$stage/"
+          rpc="$(find build/bin -name 'ggml-rpc-server' -type f | head -1)"
+          [ -n "$rpc" ] || { echo "ggml-rpc-server not built" >&2; exit 1; }
+          install -m 0755 "$rpc" "$stage/"
+          # Shared ggml/llama libs (flat: the engine dir is the runtime's
+          # LD_LIBRARY_PATH root) + the NVIDIA runtime libs the binary
+          # links against, straight from the devel image.
+          for lib in build/bin/libggml*.so* build/bin/libllama*.so*; do
+            install -m 0755 "$lib" "$stage/"
+          done
+          for rt in libcudart.so libcublas.so libcublasLt.so; do
+            for p in /usr/local/cuda/lib64 /usr/lib/x86_64-linux-gnu; do
+              matches="$(find "$p" -maxdepth 1 -name "${rt}.*" -type f 2>/dev/null | sort -V | tail -1)"
+              [ -z "$matches" ] || install -m 0755 "$matches" "$stage/"
+            done
+          done
+          # EULA/attribution texts: redistribution obligations.
+          cp -r /usr/local/cuda/doc /tmp/cuda-doc 2>/dev/null || true
+          for f in /usr/local/cuda/doc/EULA.txt /usr/local/cuda/README /opt/nvidia/entropy/nvidia_end_user_license_agreement.txt; do
+            [ -f "$f" ] && cp "$f" "$stage/" || true
+          done
+          [ -n "$(compgen -G "$stage/libcudart*")" ] || { echo "libcudart not bundled" >&2; exit 1; }
+          [ -n "$(compgen -G "$stage/libcublas.so*")" ] || { echo "libcublas not bundled" >&2; exit 1; }
+          tar -C "$(dirname "$stage")" -czf "asset.tar.gz" "$(basename "$stage")"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cuda-${{ matrix.cuda }}
+          path: asset.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Upload to bNNNN-cuda release (idempotent)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          rel="${TAG}-cuda"
+          # gh release create fails on an existing release — create only
+          # when missing, then upload with --clobber so re-runs refresh
+          # assets (digests recompute on GitHub's side automatically).
+          gh release view "$rel" || gh release create "$rel" \
+            --title "$rel" \
+            --notes "Prebuilt CUDA llama-server for upstream ${TAG}.
+
+          Compiled from the pristine ggml-org/llama.cpp ${TAG} source
+          (-DGGML_CUDA=ON, arch matrix per toolkit major). Bundles
+          libcudart/libcublas/libcublasLt plus NVIDIA EULA texts — no
+          CUDA toolkit install needed on the target machine; the NVIDIA
+          driver alone must support the asset's CUDA version.
+
+          Install lane: pallama engine update prefers this channel
+          automatically on Linux-NVIDIA (highest ubuntu-cuda-{X.Y}-x64
+          asset the local driver can run; PALLAMA_ENGINE_REPO overrides
+          the default home for forks)."
+          gh release upload "$rel" dist/* --clobber
