@@ -2288,7 +2288,17 @@ async fn pull(target: &str) -> Result<()> {
         client,
         bus,
     };
-    let row = puller.pull(target).await?;
+    // Foreground by contract: the pull runs in THIS terminal and dies with
+    // it. On interrupt the future is dropped, which releases the pull
+    // lock and keeps the `.part` for a later resume.
+    let row = tokio::select! {
+        r = puller.pull(target) => r?,
+        () = pallama_runtime::events::interrupted() => {
+            return Err(anyhow::anyhow!(
+                "pull interrupted — partial file kept; re-run `pallama pull {target}` to resume"
+            ));
+        }
+    };
     println!(
         "pulled {}: {} ({}, {} shards) -> {}",
         row.name,

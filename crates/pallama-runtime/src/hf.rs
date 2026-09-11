@@ -1705,6 +1705,64 @@ mod tests {
         assert!(second.exists(), "second shard stored alongside");
     }
 
+    #[tokio::test]
+    async fn integration__pull_cancel__lock_released_partial_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = PallamaDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        dirs.ensure().unwrap();
+        let body = vec![7u8; 4096];
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/models/o/slow"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "siblings": [ sibling_json("slow-q4_k_m.gguf", body.len() as u64, &payload(&body)) ]
+            })))
+            .mount(&api)
+            .await;
+        let dl = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/o/slow/resolve/main/slow-q4_k_m.gguf"))
+            // Slow enough for the cancel to land mid-download.
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_bytes(body.clone()),
+            )
+            .mount(&dl)
+            .await;
+        let client = HfClient::with_bases(
+            &api.uri(),
+            &dl.uri(),
+            None,
+            vec![host_of(&api.uri()), host_of(&dl.uri())],
+        )
+        .unwrap();
+        let puller = Puller {
+            dirs: dirs.clone(),
+            client,
+            bus: EventBus::default(),
+        };
+
+        // Cancellation semantics: the select! drop of the pull future is
+        // exactly what an interrupt does in the CLI. Timeout fires first
+        // -> future dropped mid-download.
+        let fut = puller.pull("o/slow:Q4_K_M");
+        let cancelled = tokio::time::timeout(std::time::Duration::from_millis(400), fut).await;
+        assert!(cancelled.is_err(), "pull should still be mid-download");
+
+        // `.part`-kept-on-cancel has no deterministic window with
+        // wiremock (its delay is pre-response, before the file is even
+        // created); persistence on error/cancel is pinned by the resume
+        // tests. Here the contract is the LOCK: released on cancel and
+        // immediately re-acquirable.
+        let lock = dirs.run_dir().join("pull-slow-q4_k_m.lock");
+        assert!(!lock.exists(), "lock must release on cancel, got {lock:?}");
+        assert!(PullLock::acquire(&dirs, "slow-q4_k_m").is_ok());
+    }
+
     fn host_of(uri: &str) -> String {
         uri.rsplit_once("://")
             .map_or(uri, |(_, h)| h)
