@@ -4461,6 +4461,10 @@ async fn engine_update(d: &PallamaDirs, tag: Option<String>, no_gate: bool) -> R
         Some(rel) => mgr.update_resolved(rel).await?,
         None => mgr.update(tag.as_deref(), cfg.update_channel).await?,
     };
+    // Keep-CUDA skip (or a same-tag reinstall) resolves to the pre-call
+    // active engine: nothing new was installed, so there is no fresh
+    // binary to gate, compare, or restart the daemon for.
+    let unchanged = active_tag.as_deref() == Some(row.tag.as_str());
     // F7 gate (FIX5): DEFAULT-config tg128 on BOTH engines —
     // comparing new-default vs baseline-argmax was apples-to-
     // oranges, biased to trip. Baseline = most recent tune row.
@@ -4469,7 +4473,9 @@ async fn engine_update(d: &PallamaDirs, tag: Option<String>, no_gate: bool) -> R
     // point of the switch, not a regression).
     let gate_on =
         !no_gate && std::env::var("PALLAMA_ENGINE_GATE").as_deref() != Ok("0") && !downgrade;
-    if gate_on {
+    if unchanged {
+        println!("engine {} already active — nothing new installed (see the warning above for lane options)", row.tag);
+    } else if gate_on {
         engine_regression_gate(&mgr, d, &row)?;
     } else if downgrade {
         println!("channel switch: downgrade to {target_tag} — regression gate skipped");

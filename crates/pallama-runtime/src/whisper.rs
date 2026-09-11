@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 
-use crate::engine::gh::GhClient;
+use crate::engine::gh::{GhClient, GhRelease};
 use crate::hf::{FilePlan, HfClient};
+use pallama_core::config::UpdateChannel;
 use pallama_core::PallamaDirs;
 
 /// Verified live 2026-09-07: release ships `whisper-bin-*` assets and no
@@ -80,10 +81,70 @@ pub fn asset_name(os: &str, arch: &str) -> Option<&'static str> {
     }
 }
 
+/// Newest release that actually ships `asset`. GitHub serves the list
+/// newest-first. `stable_only` skips prereleases (the `/releases/latest`
+/// contract) — whisper.cpp tags releases (v1.9.4, 2026-09-11) that carry
+/// no assets while the prerelease b-tags carry them, so an asset-blind
+/// "latest" can point installs at a tag that can never install.
+fn newest_with_asset<'a>(
+    releases: &'a [GhRelease],
+    asset: &str,
+    stable_only: bool,
+) -> Option<&'a GhRelease> {
+    releases
+        .iter()
+        .filter(|r| !stable_only || !r.prerelease)
+        .find(|r| r.assets.iter().any(|a| a.name == asset))
+}
+
+/// Asset-aware channel resolution: the newest release this platform can
+/// actually install, as a full release (one API list call). `Latest`
+/// walks all releases (prerelease firehose, mirroring the engine lane);
+/// `Stable` walks non-prereleases only and, when none carries the
+/// server binary, names the newest prerelease that does as the escape
+/// hatch.
+async fn release_for_channel(gh: &GhClient, channel: UpdateChannel) -> Result<GhRelease> {
+    let asset_name = asset_name(std::env::consts::OS, std::env::consts::ARCH).ok_or_else(|| {
+        anyhow!(
+            "whisper.cpp releases ship no {}/{} server binary (macOS: build from source — \
+             https://github.com/ggml-org/whisper.cpp/blob/master/docs/build.md)",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })?;
+    let releases = gh.list_releases_repo(WHISPER_REPO).await?;
+    let stable_only = matches!(channel, UpdateChannel::Stable);
+    if let Some(rel) = newest_with_asset(&releases, asset_name, stable_only) {
+        return Ok(rel.clone());
+    }
+    match newest_with_asset(&releases, asset_name, false) {
+        Some(rel) => Err(anyhow!(
+            "no stable whisper.cpp release ships the {asset_name} server binary; \
+             newest installable is prerelease {} — set update_channel = latest \
+             or install it explicitly: pallama whisper --install --tag {}",
+            rel.tag_name,
+            rel.tag_name
+        )),
+        None => Err(anyhow!(
+            "no recent whisper.cpp release ({} checked) ships the {asset_name} \
+             server binary — upstream may have renamed assets",
+            releases.len()
+        )),
+    }
+}
+
+/// Asset-aware channel target for the whisper server: the newest
+/// release this platform can actually install, by tag. See
+/// `release_for_channel` for the channel semantics.
+pub async fn channel_target(gh: &GhClient, channel: UpdateChannel) -> Result<String> {
+    Ok(release_for_channel(gh, channel).await?.tag_name)
+}
+
 /// Download + extract a whisper.cpp release. `Some(tag)` installs that
 /// release; `pin` decides whether it becomes the runtime pin (explicit
-/// `--tag` = pin, channel-resolution = no pin). `None` installs latest
-/// and returns to tracking the newest tag (clears any pin). Old tags are
+/// `--tag` = pin, channel-resolution = no pin). `None` installs the
+/// newest release that ships this platform's server binary and returns
+/// to tracking the newest tag (clears any pin). Old tags are
 /// pruned to `KEEP_TAGS` (pinned always kept). Returns the installed tag.
 pub async fn install(
     gh: &GhClient,
@@ -100,7 +161,12 @@ pub async fn install(
              https://github.com/ggml-org/whisper.cpp/blob/master/docs/build.md)"
         ));
     };
-    let release = gh.release_by(WHISPER_REPO, tag).await?;
+    // Asset-aware latest: an assetless newest tag (v1.9.4 shape) must
+    // fall through to the newest release that actually installs.
+    let release = match tag {
+        Some(t) => gh.release_by(WHISPER_REPO, Some(t)).await?,
+        None => release_for_channel(gh, UpdateChannel::Latest).await?,
+    };
     let asset = release
         .assets
         .iter()
@@ -573,7 +639,61 @@ fn server_args(port: u16, model_path: &Path) -> Vec<String> {
 #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
 mod tests {
     use super::*;
+    use crate::engine::gh::GhAsset;
     use sha2::Digest;
+
+    fn release(tag: &str, prerelease: bool, assets: &[&str]) -> GhRelease {
+        GhRelease {
+            tag_name: tag.to_string(),
+            prerelease,
+            assets: assets
+                .iter()
+                .map(|n| GhAsset {
+                    name: (*n).to_string(),
+                    digest: None,
+                    size: None,
+                    browser_download_url: String::new(),
+                })
+                .collect(),
+            published_at: None,
+        }
+    }
+
+    /// The 2026-09-11 upstream shape, pinned: v1.9.4 published as a full
+    /// (non-prerelease) release with ZERO assets while the prerelease
+    /// b-tags carry the binaries. Asset-blind "latest" pointed installs
+    /// at a tag that can never install (R2-25).
+    #[test]
+    fn unit__newest_with_asset__skips_assetless_latest() {
+        let rels = vec![
+            release("v1.9.4", false, &[]),
+            release("b5130", true, &["whisper-bin-ubuntu-x64.tar.gz"]),
+            release("b5127", true, &["whisper-bin-ubuntu-x64.tar.gz"]),
+            release("v1.9.3", false, &[]),
+            release("b4938", true, &["whisper-bin-ubuntu-x64.tar.gz"]),
+        ];
+        // Latest channel: newest installable wins, assetless skipped.
+        assert_eq!(
+            newest_with_asset(&rels, "whisper-bin-ubuntu-x64.tar.gz", false)
+                .map(|r| r.tag_name.as_str()),
+            Some("b5130")
+        );
+        // Stable channel: non-prerelease only — v1.9.4 is assetless, so
+        // no stable release qualifies.
+        assert!(newest_with_asset(&rels, "whisper-bin-ubuntu-x64.tar.gz", true).is_none());
+        // A future stable release carrying assets wins over older b-tags.
+        let with_stable = vec![
+            release("v1.9.5", false, &["whisper-bin-ubuntu-x64.tar.gz"]),
+            release("b5130", true, &["whisper-bin-ubuntu-x64.tar.gz"]),
+        ];
+        assert_eq!(
+            newest_with_asset(&with_stable, "whisper-bin-ubuntu-x64.tar.gz", true)
+                .map(|r| r.tag_name.as_str()),
+            Some("v1.9.5")
+        );
+        // No release carries the wanted asset (renamed upstream).
+        assert!(newest_with_asset(&rels, "whisper-bin-ubuntu-musl-x64.tar.gz", false).is_none());
+    }
 
     #[test]
     fn unit__asset_name__platform_matrix() {
@@ -839,6 +959,7 @@ mod tests {
     /// Full wiremock cycle: `--tag` install pins, plain install unpins,
     /// prune keeps the newest `KEEP_TAGS`.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one full install cycle, splitting hides the wire flow
     async fn install__tag_pins_latest_unpins_prunes() {
         async fn mount(
             api: &wiremock::MockServer,
@@ -847,8 +968,23 @@ mod tests {
             asset: &str,
             bytes: &[u8],
         ) {
+            mount_list(api, endpoint, tag, asset, bytes, false).await;
+        }
+
+        // `install(None)` resolves the channel through the paginated
+        // `repos/{repo}/releases` list endpoint (release_for_channel), so the
+        // latest-lane mock must serve an array, not the single-object
+        // `/releases/latest` shape.
+        async fn mount_list(
+            api: &wiremock::MockServer,
+            endpoint: &str,
+            tag: &str,
+            asset: &str,
+            bytes: &[u8],
+            as_array: bool,
+        ) {
             use wiremock::matchers::{method, path};
-            let body = serde_json::json!({
+            let release = serde_json::json!({
                 "tag_name": tag,
                 "prerelease": false,
                 "assets": [{
@@ -858,6 +994,11 @@ mod tests {
                     "browser_download_url": format!("{}/download/{}/{}", api.uri(), tag, asset),
                 }]
             });
+            let body = if as_array {
+                serde_json::json!([release])
+            } else {
+                release
+            };
             wiremock::Mock::given(method("GET"))
                 .and(path(endpoint))
                 .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
@@ -919,12 +1060,13 @@ mod tests {
         )
         .await;
         let v190 = tarball("v1.9.0");
-        mount(
+        mount_list(
             &api,
-            "/repos/ggml-org/whisper.cpp/releases/latest",
+            "/repos/ggml-org/whisper.cpp/releases",
             "v1.9.0",
             asset,
             &v190,
+            true,
         )
         .await;
 

@@ -422,6 +422,105 @@ async fn integration__register_local_engine() {
     assert!(err.to_string().contains("does not exist"), "{err}");
 }
 
+/// A dir containing the stub binary as `llama-server` (what
+/// `register_engine` expects an extracted engine dir to look like).
+fn stub_engine_dir(tag: &str) -> PathBuf {
+    let dir =
+        std::env::temp_dir().join(format!("pallama-engine-test-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(stub_server_bin(), dir.join("llama-server")).unwrap();
+    dir
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__vulkan_never_dethrones_cuda_on_nvidia() {
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+
+    // CUDA engine installed first (vendor gate off — it must activate).
+    let cuda = mgr
+        .register_engine_with_vendor(
+            &stub_engine_dir("b1"),
+            "b1-cuda",
+            "ubuntu-cuda-12.8-x64",
+            "aa",
+            pallama_core::engine_kind::EngineKind::LlamaCpp,
+            pallama_runtime::engine::manifest::Vendor::Other,
+        )
+        .unwrap();
+    assert!(cuda.active);
+
+    // A newer Vulkan install on an NVIDIA box: registered, NOT activated.
+    let vulkan = mgr
+        .register_engine_with_vendor(
+            &stub_engine_dir("b2"),
+            "b2",
+            "ubuntu-vulkan-x64",
+            "bb",
+            pallama_core::engine_kind::EngineKind::LlamaCpp,
+            pallama_runtime::engine::manifest::Vendor::Nvidia,
+        )
+        .unwrap();
+    assert!(!vulkan.active, "guard must keep CUDA active");
+    let store = Store::open(&dirs).unwrap();
+    assert_eq!(store.active_engine().unwrap().unwrap().tag, "b1-cuda");
+
+    // The explicit override still works.
+    let switched = mgr.use_tag("b2").unwrap();
+    assert!(switched.active);
+    assert_eq!(store.active_engine().unwrap().unwrap().tag, "b2");
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__vulkan_activates_without_cuda_even_on_nvidia() {
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    let row = mgr
+        .register_engine_with_vendor(
+            &stub_engine_dir("b3"),
+            "b3",
+            "ubuntu-vulkan-x64",
+            "cc",
+            pallama_core::engine_kind::EngineKind::LlamaCpp,
+            pallama_runtime::engine::manifest::Vendor::Nvidia,
+        )
+        .unwrap();
+    assert!(row.active, "no CUDA engine installed: Vulkan activates");
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__vulkan_activates_on_non_nvidia_despite_cuda_row() {
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    mgr.register_engine_with_vendor(
+        &stub_engine_dir("b4"),
+        "b4-cuda",
+        "ubuntu-cuda-12.8-x64",
+        "dd",
+        pallama_core::engine_kind::EngineKind::LlamaCpp,
+        pallama_runtime::engine::manifest::Vendor::Other,
+    )
+    .unwrap();
+    let row = mgr
+        .register_engine_with_vendor(
+            &stub_engine_dir("b5"),
+            "b5",
+            "ubuntu-vulkan-x64",
+            "ee",
+            pallama_core::engine_kind::EngineKind::LlamaCpp,
+            pallama_runtime::engine::manifest::Vendor::Amd,
+        )
+        .unwrap();
+    assert!(row.active, "AMD box: no NVIDIA guard");
+}
+
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn integration__zip_asset_extracted_and_probed() {
@@ -729,4 +828,186 @@ async fn integration__channel_repo_release__latest_takes_first_stable_uses_githu
         .await
         .unwrap();
     assert_eq!(stable.tag_name, "v1.8.0");
+}
+
+/// R2-25, live-observed 2026-09-11: whisper.cpp tags releases (v1.9.4)
+/// that carry no assets while the prerelease b-tags carry the binaries.
+/// The whisper channel target must skip the assetless tag on Latest and
+/// teach the escape hatch on Stable instead of advertising it.
+/// Host-platform-gated: the mocked asset is the linux-x64 one the
+/// resolver picks on this target.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__whisper_channel_target__assetless_latest_falls_through() {
+    let api = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/ggml-org/whisper.cpp/releases"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"tag_name": "v1.9.4", "prerelease": false, "assets": []},
+            {
+                "tag_name": "b5130",
+                "prerelease": true,
+                "assets": [
+                    {"name": "whisper-bin-ubuntu-x64.tar.gz",
+                     "browser_download_url": "http://example.invalid/w.tar.gz"}
+                ]
+            },
+            {
+                "tag_name": "b5127",
+                "prerelease": true,
+                "assets": [
+                    {"name": "whisper-bin-ubuntu-arm64.tar.gz",
+                     "browser_download_url": "http://example.invalid/a.tar.gz"}
+                ]
+            },
+        ])))
+        .mount(&api)
+        .await;
+
+    let gh = GhClient::with_base(&api.uri(), None).unwrap();
+    let latest =
+        pallama_runtime::whisper::channel_target(&gh, pallama_core::config::UpdateChannel::Latest)
+            .await
+            .unwrap();
+    assert_eq!(
+        latest, "b5130",
+        "Latest channel skips the assetless v1.9.4 and takes the newest b-tag \
+         carrying this platform's server binary"
+    );
+    let stable =
+        pallama_runtime::whisper::channel_target(&gh, pallama_core::config::UpdateChannel::Stable)
+            .await
+            .expect_err("no stable release carries the asset");
+    let msg = format!("{stable:#}");
+    assert!(
+        msg.contains("b5130") && msg.contains("update_channel"),
+        "stable miss must name the newest installable prerelease and the \
+         channel escape hatch, got: {msg}"
+    );
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn unit__keep_cuda_skip_pred__truth_table() {
+    use pallama_runtime::engine::keep_cuda_skip_pred;
+    use pallama_runtime::engine::manifest::Vendor;
+
+    fn row(
+        tag: &str,
+        asset: &str,
+        active: bool,
+        kind: pallama_core::engine_kind::EngineKind,
+    ) -> pallama_core::EngineRow {
+        pallama_core::EngineRow {
+            tag: tag.into(),
+            asset: asset.into(),
+            sha256: "x".into(),
+            installed_at: 1,
+            active,
+            manifest: "{}".into(),
+            kind,
+        }
+    }
+    use pallama_core::engine_kind::EngineKind;
+    let cuda = row("b10900-cuda", "built-cuda", true, EngineKind::LlamaCpp);
+    let yes = |r: &pallama_core::EngineRow| {
+        keep_cuda_skip_pred(Some(r), Vendor::Nvidia, "linux", "x86_64", "auto")
+    };
+
+    assert!(
+        yes(&cuda),
+        "linux-x86_64 NVIDIA + active llamacpp cuda: skip"
+    );
+    assert!(
+        keep_cuda_skip_pred(Some(&cuda), Vendor::Nvidia, "linux", "x86_64", ""),
+        "empty asset_override behaves like auto"
+    );
+    assert!(
+        !keep_cuda_skip_pred(
+            Some(&cuda),
+            Vendor::Nvidia,
+            "linux",
+            "x86_64",
+            "ubuntu-vulkan-x64"
+        ),
+        "engine_asset pin forces the standard lane"
+    );
+    assert!(
+        !keep_cuda_skip_pred(Some(&cuda), Vendor::Amd, "linux", "x86_64", "auto"),
+        "non-NVIDIA box downloads normally"
+    );
+    assert!(
+        !keep_cuda_skip_pred(Some(&cuda), Vendor::Nvidia, "windows", "x86_64", "auto"),
+        "guard is linux-x86_64 scoped (mirrors overlay lane)"
+    );
+    assert!(
+        !keep_cuda_skip_pred(Some(&cuda), Vendor::Nvidia, "linux", "aarch64", "auto"),
+        "aarch64 downloads normally"
+    );
+    assert!(
+        !keep_cuda_skip_pred(None, Vendor::Nvidia, "linux", "x86_64", "auto"),
+        "no active engine: nothing to keep"
+    );
+    let vulkan_active = row("b10900", "ubuntu-vulkan-x64", true, EngineKind::LlamaCpp);
+    assert!(!yes(&vulkan_active), "active engine IS the vulkan lane");
+    let mistral_cuda = row("v1.5", "cuda-12.8", true, EngineKind::MistralRs);
+    assert!(
+        !yes(&mistral_cuda),
+        "mistral.rs lane owns its own updates; never skip llamacpp for it"
+    );
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__update_resolved__keep_cuda_skip_downloads_nothing() {
+    use pallama_runtime::engine::gh::GhRelease;
+    use pallama_runtime::engine::manifest::Vendor;
+
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager_auto(&dirs, &api.uri());
+
+    // Active CUDA engine seeded first (vendor Other: no guard, activates).
+    let cuda = mgr
+        .register_engine_with_vendor(
+            &stub_engine_dir("b10900-cuda"),
+            "b10900-cuda",
+            "built-cuda",
+            "aa",
+            pallama_core::engine_kind::EngineKind::LlamaCpp,
+            Vendor::Other,
+        )
+        .unwrap();
+    assert!(cuda.active);
+
+    // Channel release carries ONLY the vulkan asset. No /download mock is
+    // mounted: any fetch attempt 404s and fails the test — the skip must
+    // guarantee the standard lane never downloads.
+    let release: GhRelease = serde_json::from_value(serde_json::json!({
+        "tag_name": "b10910",
+        "prerelease": true,
+        "assets": [{
+            "name": "llama-b10910-bin-ubuntu-vulkan-x64.tar.gz",
+            "size": 1,
+            "browser_download_url": format!("{}/download/b10910/llama-b10910-bin-ubuntu-vulkan-x64.tar.gz", api.uri())
+        }]
+    }))
+    .unwrap();
+
+    let row = mgr
+        .update_resolved_with_vendor(release, Vendor::Nvidia)
+        .await
+        .unwrap();
+    assert_eq!(row.tag, "b10900-cuda", "kept-active row returned");
+    assert!(row.active);
+
+    let downloads = api
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path().starts_with("/download/"))
+        .count();
+    assert_eq!(downloads, 0, "skip must fetch zero asset bytes");
 }

@@ -221,6 +221,11 @@ impl Engine for LlamaCppEngine {
         }
         let deadline = tokio::time::Instant::now() + timeout;
         let started = std::time::Instant::now();
+        // Adaptive poll: fast at first (the child usually turns healthy
+        // within a few hundred ms of its socket opening), backing off to
+        // the steady 150ms cadence for long loads. Cuts the average
+        // post-ready overshoot from ~75ms to ~12ms on cold first token.
+        let mut poll = std::time::Duration::from_millis(25);
         loop {
             match self.http.get(format!("{url}/health")).send().await {
                 Ok(resp) if resp.status().is_success() => {
@@ -237,7 +242,8 @@ impl Engine for LlamaCppEngine {
                     "engine at {url} did not become healthy within {timeout:?} (model_load_timeout)"
                 ));
             }
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            tokio::time::sleep(poll).await;
+            poll = std::cmp::min(poll.mul_f64(1.6), std::time::Duration::from_millis(150));
         }
     }
 }
@@ -587,6 +593,9 @@ impl Engine for MistralRsEngine {
         let url = format!("http://{host}:{port}");
         let deadline = tokio::time::Instant::now() + timeout;
         let started = std::time::Instant::now();
+        // Adaptive poll, mirroring the llamacpp health lane: fast first
+        // probes, back off to 150ms steady state.
+        let mut poll = std::time::Duration::from_millis(25);
         loop {
             if let Ok(resp) = self.http.get(format!("{url}/v1/models")).send().await {
                 if resp.status().is_success() {
@@ -611,7 +620,8 @@ impl Engine for MistralRsEngine {
                      within {timeout:?} (model_load_timeout)"
                 ));
             }
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            tokio::time::sleep(poll).await;
+            poll = std::cmp::min(poll.mul_f64(1.6), std::time::Duration::from_millis(150));
         }
     }
 }

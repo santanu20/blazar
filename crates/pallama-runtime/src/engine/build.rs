@@ -43,13 +43,17 @@ impl BuildBackend {
 }
 
 /// Binaries copied into the engine dir — exactly the sibling set the
-/// release tarballs ship and the quantize/bench/perplexity lanes discover.
-pub const BUILD_TARGETS: [&str; 5] = [
+/// release tarballs ship and the quantize/bench/perplexity/rpc lanes
+/// discover. ggml-rpc-server is the one prebuilt assets ship that a
+/// server-only build silently omits (F164/F167: the rpc override leg
+/// dies without it).
+pub const BUILD_TARGETS: [&str; 6] = [
     "llama-server",
     "llama-quantize",
     "llama-imatrix",
     "llama-perplexity",
     "llama-bench",
+    "ggml-rpc-server",
 ];
 
 pub const CONFIGURE_TIMEOUT: Duration = Duration::from_mins(5);
@@ -266,6 +270,15 @@ pub fn cmake_configure_args(
     let mut args = vec![
         "-DCMAKE_BUILD_TYPE=Release".to_string(),
         "-DLLAMA_CURL=ON".to_string(),
+        // Parity with upstream prebuilt engines: they ship the
+        // ggml-rpc-server tool (verified live b10896/b10902), and
+        // upstream tools/CMakeLists.txt gates add_subdirectory(rpc)
+        // behind GGML_RPC — without this flag the target does not
+        // exist and BUILD_TARGETS' "ggml-rpc-server" entry fails the
+        // whole build with "No rule to make target" (caught live
+        // 2026-09-11, b10903). The rpc backend is inert unless an
+        // engine is actually launched with --rpc.
+        "-DGGML_RPC=ON".to_string(),
         // CMake build-tree binaries embed an ABSOLUTE build-dir RPATH by
         // default; copying them into the engine store leaves a dead path
         // and the loader fails with a misleading "cannot open shared
@@ -501,7 +514,7 @@ impl EngineManager {
 /// table decoration (`nvidia-smi` banner: `CUDA Version: 13.0     |` —
 /// the trailing pipe is what a plain trim-and-parse chokes on).
 #[must_use]
-fn parse_version_pair(s: &str) -> Option<(u32, u32)> {
+pub(crate) fn parse_version_pair(s: &str) -> Option<(u32, u32)> {
     let digits = |part: &str| -> Option<u32> {
         // Banner fragments arrive space-padded (" 13.0     |") — skip
         // leading whitespace, then take the digit run; junk beyond it
@@ -857,7 +870,10 @@ mod tests {
         assert!(cuda.contains(&"-DCMAKE_CUDA_ARCHITECTURES=89".to_string()));
         assert!(cuda.contains(&"-DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-12".to_string()));
         assert!(cuda.contains(&"-DLLAMA_CURL=ON".to_string()));
+        // rpc tool parity with prebuilts (gates ggml-rpc-server target)
+        assert!(cuda.contains(&"-DGGML_RPC=ON".to_string()));
         let cpu = cmake_configure_args(BuildBackend::Cpu, None, None);
+        assert!(cpu.contains(&"-DGGML_RPC=ON".to_string()));
         assert!(cpu.iter().all(|a| !a.contains("CUDA")));
     }
 

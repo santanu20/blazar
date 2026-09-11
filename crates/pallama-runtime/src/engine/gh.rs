@@ -10,6 +10,8 @@ use pallama_core::config::UpdateChannel;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use super::build::parse_version_pair;
+
 pub const LLAMA_CPP_REPO: &str = "ggml-org/llama.cpp";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -668,6 +670,64 @@ pub fn resolve_mistralrs_asset(release: &GhRelease, picks: &[AssetPick]) -> Opti
         .cloned()
 }
 
+/// Release repo for the prebuilt CUDA overlay channel (our CI's
+/// `bNNNN-cuda` releases of upstream llama.cpp): the repo that runs
+/// the `engine-cuda` workflow. Placeholder until the project's GitHub
+/// home is real — flip this ONE constant then; a missing repo costs
+/// one failed release probe per `engine update`, then Vulkan fallback.
+pub const ENGINE_OVERLAY_REPO_ENV: &str = "PALLAMA_ENGINE_REPO";
+
+pub const ENGINE_OVERLAY_REPO_DEFAULT: &str = "pallama/pallama";
+
+/// Overlay repo for the prebuilt CUDA channel: `PALLAMA_ENGINE_REPO`
+/// (e.g. a private fork) when set to a non-empty value, else the
+/// default home. Never fails — the channel is zero-touch on
+/// Linux-NVIDIA and the env exists purely for overrides.
+#[must_use]
+pub fn engine_overlay_repo() -> String {
+    std::env::var(ENGINE_OVERLAY_REPO_ENV)
+        .ok()
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .unwrap_or_else(|| ENGINE_OVERLAY_REPO_DEFAULT.to_string())
+}
+
+/// Pick the CUDA overlay asset a driver can run: the highest
+/// `ubuntu-cuda-{X.Y}-x64` variant whose toolkit version does not
+/// exceed the driver's reported CUDA version. The bundled
+/// cudart/cublas minor-version compatibility is deliberately NOT
+/// trusted — a driver older than the asset stays on the Vulkan lane
+/// (today's behavior) instead of risking a child that cannot boot.
+#[must_use]
+pub fn resolve_cuda_asset(release: &GhRelease, driver_cuda: (u32, u32)) -> Option<AssetPick> {
+    let tag = &release.tag_name;
+    let head = format!("llama-{tag}-bin-ubuntu-cuda-");
+    let tail = "-x64.tar.gz";
+    let mut best: Option<((u32, u32), String)> = None;
+    for a in &release.assets {
+        let Some(middle) = a.name.strip_prefix(&head) else {
+            continue;
+        };
+        let Some(version) = middle.strip_suffix(tail) else {
+            continue;
+        };
+        let Some(ver) = parse_version_pair(version) else {
+            continue;
+        };
+        if ver > driver_cuda {
+            continue; // driver cannot run this toolkit build
+        }
+        if best.as_ref().is_none_or(|(b, _)| ver > *b) {
+            best = Some((ver, version.to_string()));
+        }
+    }
+    best.map(|(_, version)| AssetPick {
+        name: format!("llama-{tag}-bin-ubuntu-cuda-{version}-x64.tar.gz"),
+        label: format!("ubuntu-cuda-{version}-x64"),
+        cpu_fallback: false,
+    })
+}
+
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
@@ -1033,5 +1093,79 @@ mod tests {
         assert_eq!(r.published_epoch(), None);
         r.published_at = Some("2026-09-07T06:49:18Z".into());
         assert_eq!(r.published_epoch(), Some(1_788_763_758));
+    }
+
+    #[test]
+    fn unit__resolve_cuda_asset__ceiling_and_highest() {
+        let r = rel(
+            "b10896-cuda",
+            &[
+                "llama-b10896-cuda-bin-ubuntu-cuda-13.0-x64.tar.gz",
+                "llama-b10896-cuda-bin-ubuntu-cuda-12.8-x64.tar.gz",
+                "llama-b10896-cuda-bin-ubuntu-vulkan-x64.tar.gz",
+                "llama-b10896-cuda-bin-ubuntu-cuda-11.8-x64.tar.gz",
+            ],
+        );
+        // Driver 13.0: highest runnable is 13.0 itself.
+        let p = resolve_cuda_asset(&r, (13, 0)).unwrap();
+        assert_eq!(p.name, "llama-b10896-cuda-bin-ubuntu-cuda-13.0-x64.tar.gz");
+        assert_eq!(p.label, "ubuntu-cuda-13.0-x64");
+        assert!(!p.cpu_fallback);
+        // Driver 12.x: 13.0 filtered out, 12.8 wins.
+        let p = resolve_cuda_asset(&r, (12, 9)).unwrap();
+        assert_eq!(p.name, "llama-b10896-cuda-bin-ubuntu-cuda-12.8-x64.tar.gz");
+        // Old 12.0-only driver still has a runnable asset (11.8).
+        let p = resolve_cuda_asset(&r, (12, 0)).unwrap();
+        assert_eq!(p.label, "ubuntu-cuda-11.8-x64");
+    }
+
+    #[test]
+    fn unit__resolve_cuda_asset__no_runnable_asset_is_none() {
+        let r = rel(
+            "b10896-cuda",
+            &[
+                "llama-b10896-cuda-bin-ubuntu-cuda-13.0-x64.tar.gz",
+                "llama-b10896-cuda-bin-ubuntu-cuda-12.8-x64.tar.gz",
+            ],
+        );
+        assert_eq!(resolve_cuda_asset(&r, (11, 8)), None);
+        // Vulkan-only release: nothing CUDA-shaped to pick.
+        let v = rel(
+            "b10896-cuda",
+            &["llama-b10896-cuda-bin-ubuntu-vulkan-x64.tar.gz"],
+        );
+        assert_eq!(resolve_cuda_asset(&v, (13, 0)), None);
+        // Wrong shapes never match (prefix/suffix discipline).
+        let w = rel(
+            "b10896-cuda",
+            &[
+                "llama-b10896-cuda-bin-win-cuda-12.8-x64.zip",
+                "llama-b10896-cuda-bin-ubuntu-cuda-12.8-arm64.tar.gz",
+                "llama-b10896-cuda-bin-ubuntu-cuda-x64.tar.gz",
+            ],
+        );
+        assert_eq!(resolve_cuda_asset(&w, (13, 0)), None);
+    }
+
+    #[test]
+    fn unit__engine_overlay_repo__env_override_and_default() {
+        // Env-dependent: assert both states without assuming the ambient
+        // value by pinning it explicitly. The channel is default-ON —
+        // unset/empty env must fall back to the default home, not disable.
+        let saved = std::env::var(ENGINE_OVERLAY_REPO_ENV).ok();
+        std::env::remove_var(ENGINE_OVERLAY_REPO_ENV);
+        assert_eq!(engine_overlay_repo(), ENGINE_OVERLAY_REPO_DEFAULT);
+        std::env::set_var(ENGINE_OVERLAY_REPO_ENV, "");
+        assert_eq!(
+            engine_overlay_repo(),
+            ENGINE_OVERLAY_REPO_DEFAULT,
+            "empty env falls back to the default home"
+        );
+        std::env::set_var(ENGINE_OVERLAY_REPO_ENV, "  acme/pallama  ");
+        assert_eq!(engine_overlay_repo(), "acme/pallama");
+        match saved {
+            Some(v) => std::env::set_var(ENGINE_OVERLAY_REPO_ENV, v),
+            None => std::env::remove_var(ENGINE_OVERLAY_REPO_ENV),
+        }
     }
 }

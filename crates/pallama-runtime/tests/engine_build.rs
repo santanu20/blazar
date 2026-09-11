@@ -41,14 +41,14 @@ fn stub_script(dir: &Path, name: &str, body: &str) -> PathBuf {
 }
 
 /// cmake stub: configure is a no-op; `--build <dir>` materializes all
-/// five llama binaries in `<dir>/bin` as copies of the compiled stub
+/// six llama binaries in `<dir>/bin` as copies of the compiled stub
 /// server (so probe exercises the genuine --version/--help path).
 fn stub_cmake(dir: &Path, body_extra: &str) -> PathBuf {
     let body = format!(
         "if [ \"$1\" = \"--build\" ]; then
   bld=\"$2\"
   mkdir -p \"$bld/bin\"
-  for t in llama-server llama-quantize llama-imatrix llama-perplexity llama-bench; do
+  for t in llama-server llama-quantize llama-imatrix llama-perplexity llama-bench ggml-rpc-server; do
     cp \"${{STUB_SERVER}}\" \"$bld/bin/$t\" || exit 9
   done
   echo fake-lib > \"$bld/bin/libggml.so.0\"
@@ -208,6 +208,12 @@ async fn integration__build_cuda__host_compiler_rule_and_arch_args() {
         cfg_line.contains("-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON"),
         "build-tree RPATH must be $ORIGIN-relative (absolute build-dir \
          RPATH breaks the installed copy once the temp build tree drops): {cfg_line}"
+    );
+    assert!(
+        cfg_line.contains("-DGGML_RPC=ON"),
+        "rpc tool parity: without GGML_RPC upstream gates the \
+         ggml-rpc-server target away and BUILD_TARGETS kills the build \
+         (live: b10903 'No rule to make target ggml-rpc-server'): {cfg_line}"
     );
 }
 

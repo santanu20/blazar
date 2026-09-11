@@ -68,6 +68,38 @@ fn which_first(names: &[&str]) -> bool {
     })
 }
 
+/// Is this engine row a CUDA build? Tag convention (`bNNNN-cuda` overlay
+/// and source-build tags) or the asset label (`ubuntu-cuda-12.8-x64`).
+#[must_use]
+pub fn is_cuda_engine(tag: &str, asset_label: &str) -> bool {
+    tag.ends_with("-cuda") || asset_label.contains("cuda")
+}
+
+/// Pre-download mirror of the keep-CUDA activation guard: on a
+/// Linux-x86_64-NVIDIA box whose active engine is a llama.cpp CUDA
+/// build, a standard-lane (Vulkan) asset can only ever register
+/// dormant — the guard in `register_engine_with_vendor` refuses to
+/// activate it after the fact. Deciding the same thing BEFORE the
+/// download skips the ~28 MiB fetch + probe of an engine that will
+/// never serve. The `engine_asset` config pin bypasses, mirroring
+/// `maybe_cuda_overlay`.
+#[must_use]
+pub fn keep_cuda_skip_pred(
+    active: Option<&EngineRow>,
+    vendor: manifest::Vendor,
+    os: &str,
+    arch: &str,
+    asset_override: &str,
+) -> bool {
+    let Some(active) = active else { return false };
+    active.active
+        && active.kind == EngineKind::LlamaCpp
+        && is_cuda_engine(&active.tag, &active.asset)
+        && vendor == manifest::Vendor::Nvidia
+        && (os, arch) == ("linux", "x86_64")
+        && (asset_override == "auto" || asset_override.is_empty())
+}
+
 impl EngineManager {
     /// Install the requested tag (or the channel's target) and activate it.
     pub async fn update(&self, tag: Option<&str>, channel: UpdateChannel) -> Result<EngineRow> {
@@ -83,18 +115,180 @@ impl EngineManager {
         channel: UpdateChannel,
         retry_delay: std::time::Duration,
     ) -> Result<EngineRow> {
+        // Explicit `-cuda` pins address the overlay repo directly (our
+        // CI publishes `bNNNN-cuda` releases there); every other tag
+        // resolves upstream first and probes the overlay afterwards.
+        if let Some(t) = tag {
+            if t.ends_with("-cuda") {
+                return self.install_cuda_overlay_tag(t).await;
+            }
+        }
         let release = match tag {
             Some(t) => self.gh.resolve_tag(t).await?,
             None => self.gh.channel_b_release(channel).await?,
         };
+        if let Some(row) = self.maybe_cuda_overlay(&release).await? {
+            return Ok(row);
+        }
+        // Channel automation never benefits from the standard (Vulkan)
+        // lane while the keep-CUDA guard holds — explicit tag pins
+        // still download so `pallama engine use <tag>` can reach them.
+        if tag.is_none() {
+            if let Some(row) = self.try_keep_cuda_skip(&release.tag_name, system_vendor_hint())? {
+                return Ok(row);
+            }
+        }
         self.install_with_retries(release, retry_delay).await
     }
 
     /// Install an already-resolved release (single-fetch entry for callers
     /// that needed the `GhRelease` up front, e.g. downgrade gating).
     pub async fn update_resolved(&self, release: GhRelease) -> Result<EngineRow> {
+        self.update_resolved_with_vendor(release, system_vendor_hint())
+            .await
+    }
+
+    /// `update_resolved` with an injectable vendor hint so the keep-CUDA
+    /// skip is deterministically testable on any box (same injection
+    /// pattern as `register_engine_with_vendor`).
+    pub async fn update_resolved_with_vendor(
+        &self,
+        release: GhRelease,
+        vendor_hint: manifest::Vendor,
+    ) -> Result<EngineRow> {
+        if let Some(row) = self.maybe_cuda_overlay(&release).await? {
+            return Ok(row);
+        }
+        if let Some(row) = self.try_keep_cuda_skip(&release.tag_name, vendor_hint)? {
+            return Ok(row);
+        }
         self.install_with_retries(release, ASSET_UPLOAD_RETRY_DELAY)
             .await
+    }
+
+    /// When `keep_cuda_skip_pred` holds, skip the standard asset lane and
+    /// return the kept-active CUDA row instead of downloading an engine
+    /// that would register dormant.
+    fn try_keep_cuda_skip(
+        &self,
+        release_tag: &str,
+        vendor: manifest::Vendor,
+    ) -> Result<Option<EngineRow>> {
+        let Some(active) = Store::open(&self.dirs)?.active_engine()? else {
+            return Ok(None);
+        };
+        if !keep_cuda_skip_pred(
+            Some(&active),
+            vendor,
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            &self.asset_override,
+        ) {
+            return Ok(None);
+        }
+        tracing::warn!(
+            "NVIDIA box with active CUDA engine {} — skipped the standard (Vulkan) asset \
+             download for {release_tag}: the keep-CUDA guard would leave it dormant. Refresh \
+             the CUDA lane with `pallama engine build cuda`, or pin engine_asset \
+             = \"ubuntu-vulkan-x64\" in config.toml to force the Vulkan lane",
+            active.tag
+        );
+        Ok(Some(active))
+    }
+
+    /// Direct install of an overlay `bNNNN-cuda` tag the user pinned
+    /// explicitly (`pallama engine install b10896-cuda`).
+    async fn install_cuda_overlay_tag(&self, tag: &str) -> Result<EngineRow> {
+        let repo = gh::engine_overlay_repo();
+        let release = self
+            .gh
+            .release_by_tag_repo(&repo, tag)
+            .await
+            .with_context(|| {
+                format!(
+                    "overlay release {tag} not found in {repo}; the repo's engine-cuda \
+                     workflow publishes bNNNN-cuda releases (set {} to point at a fork)",
+                    gh::ENGINE_OVERLAY_REPO_ENV
+                )
+            })?;
+        let (driver_cuda, _) = build::nvidia_gpu_facts().await;
+        let Some(driver_cuda) = driver_cuda else {
+            return Err(anyhow!(
+                "cannot select a CUDA overlay asset: no NVIDIA driver CUDA \
+                 capability probed (nvidia-smi absent or failed)"
+            ));
+        };
+        let pick = gh::resolve_cuda_asset(&release, driver_cuda)
+            .ok_or_else(|| anyhow!("no driver-runnable CUDA asset in overlay release {tag}"))?;
+        self.install_picked(&release, &pick)
+            .await
+            .with_context(|| format!("install overlay {tag} asset {}", pick.label))
+    }
+
+    /// Prebuilt CUDA overlay: when this machine is Linux-x86_64-NVIDIA
+    /// with a CUDA-capable driver and our CI has published a
+    /// `bNNNN-cuda` release for the resolved upstream build, install
+    /// that instead of the Vulkan asset (~4% decode uplift, bundled
+    /// cudart/cublas, no toolkit needed). Any miss — release absent,
+    /// asset not runnable — is a quiet return to the normal lane: the
+    /// Vulkan path stays the universal fallback. Zero-touch: the
+    /// overlay repo defaults to the project home; `PALLAMA_ENGINE_REPO`
+    /// exists purely for forks.
+    async fn maybe_cuda_overlay(&self, release: &GhRelease) -> Result<Option<EngineRow>> {
+        if self.asset_override != "auto" && !self.asset_override.is_empty() {
+            return Ok(None); // explicit asset pin wins over every heuristic
+        }
+        if std::env::consts::OS != "linux" || std::env::consts::ARCH != "x86_64" {
+            return Ok(None);
+        }
+        if system_vendor_hint() != manifest::Vendor::Nvidia {
+            return Ok(None);
+        }
+        let repo = gh::engine_overlay_repo();
+        let Some(number) = gh::btag_number(&release.tag_name) else {
+            return Ok(None); // non-b upstream tags never have overlays
+        };
+        let (driver_cuda, _) = build::nvidia_gpu_facts().await;
+        let Some(driver_cuda) = driver_cuda else {
+            tracing::info!(
+                "NVIDIA GPU present but no CUDA driver capability probed; \
+                 staying on the Vulkan asset lane"
+            );
+            return Ok(None);
+        };
+        if driver_cuda.0 < 12 {
+            return Ok(None); // pre-CUDA-12 drivers: keep Vulkan
+        }
+        let overlay_tag = format!("b{number}-cuda");
+        let overlay = match self.gh.release_by_tag_repo(&repo, &overlay_tag).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::info!(
+                    "no CUDA overlay release {overlay_tag} in {repo} ({e:#}); \
+                     using the standard asset lane"
+                );
+                return Ok(None);
+            }
+        };
+        if let Some(pick) = gh::resolve_cuda_asset(&overlay, driver_cuda) {
+            tracing::info!(
+                "installing prebuilt CUDA engine from {repo} {overlay_tag} ({})",
+                pick.label
+            );
+            let row = self
+                .install_picked(&overlay, &pick)
+                .await
+                .with_context(|| format!("install overlay {overlay_tag}"))?;
+            Ok(Some(row))
+        } else {
+            tracing::info!(
+                "CUDA overlay release {overlay_tag} has no asset this \
+                 driver ({}.{}) can run; staying on the Vulkan lane",
+                driver_cuda.0,
+                driver_cuda.1
+            );
+            Ok(None)
+        }
     }
 
     /// Fresh-asset retry loop shared by every update entry point.
@@ -377,6 +571,8 @@ impl EngineManager {
     /// Shared install tail for every engine source (release asset,
     /// source build): probe the binary, warn on GPU-asset-sees-no-GPU,
     /// store the row, activate it, publish, prune old tags.
+    /// Register a probed engine dir and activate it (see the
+    /// CUDA-dethrone guard inside for the NVIDIA exception).
     pub fn register_engine(
         &self,
         dir: &Path,
@@ -384,6 +580,20 @@ impl EngineManager {
         asset_label: &str,
         sha256: &str,
         kind: EngineKind,
+    ) -> Result<EngineRow> {
+        self.register_engine_with_vendor(dir, tag, asset_label, sha256, kind, system_vendor_hint())
+    }
+
+    /// `register_engine` with an injectable vendor hint so the CUDA
+    /// dethrone guard is deterministically testable on any box.
+    pub fn register_engine_with_vendor(
+        &self,
+        dir: &Path,
+        tag: &str,
+        asset_label: &str,
+        sha256: &str,
+        kind: EngineKind,
+        vendor_hint: manifest::Vendor,
     ) -> Result<EngineRow> {
         let server = match kind {
             EngineKind::LlamaCpp => find_server(dir)?,
@@ -422,16 +632,40 @@ impl EngineManager {
         };
         let store = Store::open(&self.dirs)?;
         store.upsert_engine(&row)?;
-        store.set_active_engine(tag)?;
+        // Live-measured on a 4070 (BENCHMARK.md 2026-09-11): the Vulkan
+        // asset costs ~34 ms first-token vs CUDA. Activation used to be
+        // hardware-blind, so one `engine update` (which falls back to the
+        // Vulkan asset while the CUDA overlay repo is not yet publishing)
+        // silently DEMOTED an installed CUDA engine to inactive. On NVIDIA
+        // boxes a Vulkan install never dethrones CUDA; `pallama engine
+        // use <tag>` stays the explicit override.
+        let keep_cuda = row.kind == EngineKind::LlamaCpp
+            && !is_cuda_engine(tag, asset_label)
+            && vendor_hint == manifest::Vendor::Nvidia
+            && store
+                .list_engines()?
+                .iter()
+                .any(|e| e.kind == EngineKind::LlamaCpp && is_cuda_engine(&e.tag, &e.asset));
+        let activated = !keep_cuda;
+        if activated {
+            store.set_active_engine(tag)?;
+        }
         self.bus.publish(PallamaEvent::EngineUpdated {
             tag: tag.to_string(),
         });
         self.prune(&store)?;
+        if keep_cuda {
+            tracing::warn!(
+                "NVIDIA GPU present — registered engine {tag} ({asset_label}) but KEPT the \
+                 installed CUDA engine active (Vulkan first-token is measurably slower); run \
+                 `pallama engine use {tag}` to switch anyway"
+            );
+        }
         // The flip above happened after `row` was built; the caller's
-        // contract ("install activates") expects the returned row to
-        // reflect the post-install store state.
+        // contract expects the returned row to reflect the post-install
+        // store state.
         let row = EngineRow {
-            active: true,
+            active: activated,
             ..row
         };
         Ok(row)
