@@ -68,6 +68,10 @@ pub struct Config {
     pub update_channel: UpdateChannel,
     /// "auto" or explicit engine asset suffix (e.g. "ubuntu-vulkan-x64").
     pub engine_asset: String,
+    /// Parallel byte-range connections used for large model downloads
+    /// (>= 32 MiB). 1 = classic single-stream resume lane. Servers that
+    /// reject Range get the single-stream lane regardless.
+    pub download_connections: u32,
     /// "off" | "auto" | "mtp" | "eagle3" | "dflash" | "dspark" (auto =
     /// adopt spec decode when a draft pair is pulled, embedded MTP head
     /// wins; mtp = MTP head baked into the GGUF, requires an engine
@@ -1032,6 +1036,7 @@ impl Default for Config {
             log_level: None,
             update_channel: UpdateChannel::default(),
             engine_asset: "auto".to_string(),
+            download_connections: 8,
             router_max_models: 0,
             late_chunking_max_tokens: default_late_chunking_max_tokens(),
             session_keep_secs: default_session_keep_secs(),
@@ -1535,6 +1540,12 @@ impl Config {
             return Err(CoreError::Config(format!(
                 "idle_timeout_secs ({}) must be >= idle_sleep_secs ({}) — eviction must not fire before sleep",
                 self.idle_timeout_secs, self.idle_sleep_secs
+            )));
+        }
+        if !(1..=32).contains(&self.download_connections) {
+            return Err(CoreError::Config(format!(
+                "download_connections must be within 1..=32 (1 = single-stream resume), got {}",
+                self.download_connections
             )));
         }
         match self.child_transport.as_str() {
@@ -2076,6 +2087,9 @@ impl Config {
         }
         if let Some(v) = env("PALLAMA_ENGINE_ASSET") {
             cfg.engine_asset = v;
+        }
+        if let Some(v) = env("PALLAMA_DOWNLOAD_CONNECTIONS") {
+            cfg.download_connections = parse_u32("PALLAMA_DOWNLOAD_CONNECTIONS", &v)?;
         }
         if let Some(v) = env("PALLAMA_SPEC") {
             cfg.spec = v;

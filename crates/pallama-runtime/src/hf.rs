@@ -340,6 +340,9 @@ pub struct HfClient {
     api_base: reqwest::Url,
     dl_base: reqwest::Url,
     token: Option<String>,
+    /// Parallel byte-range connections for large downloads (see
+    /// `hf_parallel`). 1 = classic single-stream lane.
+    pub(crate) download_connections: u32,
     /// Test-only extra redirect-allowed hosts (wiremock).
     extra_hosts: Vec<String>,
 }
@@ -347,6 +350,13 @@ pub struct HfClient {
 impl HfClient {
     pub fn new(token: Option<String>) -> Result<Self> {
         Self::with_bases(HF_API_BASE, HF_API_BASE, token, Vec::new())
+    }
+
+    /// Builder: set parallel download connections.
+    #[must_use]
+    pub fn with_download_connections(mut self, connections: u32) -> Self {
+        self.download_connections = connections;
+        self
     }
 
     #[allow(clippy::needless_pass_by_value)] // Vec is stored
@@ -385,6 +395,7 @@ impl HfClient {
             api_base: reqwest::Url::parse(api_base)?,
             dl_base: reqwest::Url::parse(dl_base)?,
             token,
+            download_connections: 8,
             extra_hosts,
         })
     }
@@ -440,6 +451,7 @@ impl HfClient {
     /// Stream one file to `dest` (via `.part` + atomic rename), resuming
     /// from a previous partial when present. Returns final byte count.
     /// `on_progress` is called with (downloaded, total) after each chunk.
+    #[allow(clippy::too_many_lines)] // flat probe->parallel->resume->verify pipeline by design
     pub async fn download_file(
         &self,
         repo: &str,
@@ -454,6 +466,28 @@ impl HfClient {
                 url_encode_path(&plan.filename)
             ))
             .map_err(|e| anyhow!("bad download URL for {}: {e}", plan.filename))?;
+        // Parallel byte-range lane first: engages only when the expected
+        // size (from pull metadata) can pay for it and the server proves
+        // Range support on a probe; every other shape falls through to
+        // the classic lane below.
+        if self.download_connections > 1
+            && (plan.bytes == 0 || plan.bytes >= crate::hf_parallel::MIN_PARALLEL_BYTES)
+        {
+            let token = self.token_for(&url);
+            if let Some(bytes) = crate::hf_parallel::try_parallel(
+                &self.http,
+                token.as_deref(),
+                &url,
+                plan,
+                dest,
+                self.download_connections,
+                &mut on_progress,
+            )
+            .await?
+            {
+                return Ok(bytes);
+            }
+        }
         let part = sibling_part_path(dest);
         let mut have: u64 = 0;
         let mut hasher = Sha256::new();
@@ -556,7 +590,7 @@ fn url_encode_path(path: &str) -> String {
         .join("/")
 }
 
-fn sibling_part_path(dest: &Path) -> PathBuf {
+pub(crate) fn sibling_part_path(dest: &Path) -> PathBuf {
     let mut s = dest.as_os_str().to_os_string();
     s.push(".part");
     PathBuf::from(s)

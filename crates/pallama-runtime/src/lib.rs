@@ -19,6 +19,7 @@ pub mod engine;
 pub mod engine_impl;
 pub mod events;
 pub mod hf;
+pub mod hf_parallel;
 pub mod models;
 pub mod probe;
 pub mod quantize;

@@ -2278,7 +2278,9 @@ async fn pull(target: &str) -> Result<()> {
     let d = dirs();
     d.ensure().ok();
     let token = std::env::var("HF_TOKEN").ok();
-    let client = pallama_runtime::hf::HfClient::new(token)?;
+    let cfg = config()?;
+    let client = pallama_runtime::hf::HfClient::new(token)?
+        .with_download_connections(cfg.download_connections);
     let bus = EventBus::default();
     let mut events = bus.subscribe();
     let puller = pallama_runtime::Puller {
@@ -3661,7 +3663,8 @@ async fn whisper_cmd(
     }
     if let Some(size) = pull {
         let token = std::env::var("HF_TOKEN").ok();
-        let hf = pallama_runtime::hf::HfClient::new(token)?;
+        let hf = pallama_runtime::hf::HfClient::new(token)?
+            .with_download_connections(config()?.download_connections);
         let dest = pallama_runtime::whisper::pull(&hf, &d, &size, |done, total| {
             use std::io::Write as _;
             print!("\rpulling ggml-{size}.bin: {done}/{total} bytes");
