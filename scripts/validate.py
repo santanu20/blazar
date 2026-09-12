@@ -919,6 +919,7 @@ _COMMAND_ATTRS = {
     "stop.model": (True, True, False, False, True),
     "stop.bare": (True, False, False, False, True),
     "pull": (False, False, True, True, False),
+    "run.miss-pulls": (True, True, True, True, False),
     "import.hardlink": (False, False, False, False, True),
     "import.copy": (False, False, False, False, True),
     "mmproj.happy": (False, False, True, True, False),
@@ -6591,10 +6592,13 @@ def phase_commands() -> None:
         # Single explicit retry for transient HF API failures (observed
         # intermittent 429/5xx on /api/models). Policy: max 1 retry, 10s
         # backoff, evidence carries both attempts — never silent.
-        p = cli("pull", *args, timeout=timeout)
+        return _pull_retry_cmd(list(args), timeout=timeout)
+
+    def _pull_retry_cmd(argv, timeout=2400):
+        p = cli(*argv, timeout=timeout)
         if p.returncode != 0:
             time.sleep(10)
-            p2 = cli("pull", *args, timeout=timeout)
+            p2 = cli(*argv, timeout=timeout)
             p2.stderr = (p2.stderr or "") + f" [retry after rc={p.returncode}]"
             return p2
         return p
@@ -6969,6 +6973,31 @@ def phase_commands() -> None:
         lane("pull", _pull)
     else:
         regb("pull", f"disk free {disk_free_gb():.1f}G <= 8G")
+
+    def _run_miss_pulls():
+        # `pallama run` on a missing model must auto-pull (same flow as
+        # `pallama pull`: progress, locks) and then run it — one-shot
+        # prompt mode proves the whole chain parse -> pull -> serve.
+        before = set(cli("list").stdout.split())
+        p = _pull_retry_cmd(
+            ["run", "ggml-org/Qwen3-0.6B-GGUF", "Say ok", "--max-tokens", "8"],
+            timeout=2400,
+        )
+        after = set(cli("list").stdout.split())
+        new = {w for w in after - before if "qwen3" in w.lower()}
+        reg(
+            "run.miss-pulls",
+            p.returncode == 0 and bool(new) and "not in the store" in (p.stdout or ""),
+            f"rc={p.returncode} new={sorted(new)[:3]}",
+        )
+        for name in new:
+            cli("stop", name)
+            cli("rm", name)
+
+    if heavy_ok:
+        lane("run.miss-pulls", _run_miss_pulls)
+    else:
+        regb("run.miss-pulls", f"disk free {disk_free_gb():.1f}G <= 8G")
 
     def _upgrade():
         mtime_before = os.path.getmtime(PAL)

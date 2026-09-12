@@ -66,7 +66,7 @@ pallama engine build cuda                 # rather compile it? no Linux-CUDA pre
                                            #   same probe/gate/activate flow. cpu backend also available
  pallama pull qwen3-0.6b                   # ollama registry shortname (registry.ollama.ai, sha256-verified, resumable)
  pallama pull ggml-org/Qwen3-8B-GGUF:Q4_K_M  # or any owner/repo:QUANT from Hugging Face
- pallama run qwen3-0.6b                    # streaming REPL
+ pallama run qwen3-0.6b                    # streaming REPL — not in the store? auto-pulls first, then runs
  pallama show qwen3.5:9b                   # muscle memory? model:tag colons resolve onto flat rows
                                           #   (CLI commands AND gateway /api/chat + OpenAI routes)
  OLLAMA_HOST=http://127.0.0.1:11434 ollama list   # existing ollama clients just work

@@ -7,6 +7,14 @@ tracked here.
 ## [Unreleased]
 
 ### Added
+- **`run` auto-pull**: `pallama run <model>` with a model missing from
+  the store now pulls it first (the exact `pallama pull` flow —
+  progress, resumable `.part`, pull locks, mmproj attach, warnings)
+  and starts the chat once the download lands. Triggers only when the
+  input parses as an `owner/repo[:QUANT]` ref or a catalog short name;
+  store hits never touch the network, and unknown names keep the
+  not-found teaching error. `pallama pull` itself is unchanged.
+
 - **Colon-name resolution (ollama muscle memory)**: every model-taking
   command (`show`, `run`, `rm`, `cp` source, `stop`, `bench`, `tune`,
   `mmproj`, `quantize`, `drafts`, `session`, `lora`) resolves

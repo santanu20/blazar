@@ -536,6 +536,49 @@ fn dirs() -> PallamaDirs {
     PallamaDirs::from_env()
 }
 
+/// `pallama run` auto-fetch: the store first (with the shared colon
+/// rule), then — on a miss — a pull when the input parses as an
+/// `owner/repo[:QUANT]` ref or a catalog short name. Everything else
+/// passes through so the daemon's not-found error (with its flat-form
+/// teaching hint) stays the teacher of last resort. Store hits never
+/// touch the network.
+async fn ensure_run_model(name: &str) -> Result<String> {
+    let d = dirs();
+    if d.db_file().is_file() {
+        if let Ok(store) = Store::open(&d) {
+            let resolved = store.resolve_model_name(name);
+            if store.get_model(&resolved).is_ok_and(|r| r.is_some()) {
+                return Ok(resolved);
+            }
+            // Miss: repo refs and catalog short names auto-pull
+            // (Ctrl-C keeps the partial; `pallama pull` resumes it).
+            if let Ok(t) = pallama_runtime::hf::parse_pull_target(&resolved) {
+                // Catalog short names differ from the row the pull
+                // normalizes to (`qwen2.5-0.5b` -> row
+                // `qwen2.5-0.5b-instruct`). Check the pull's canonical
+                // name FIRST: pulling over an existing row would
+                // replace + prune it (data hazard, not a fetch).
+                let local = pallama_runtime::hf::registry_name(&t.repo);
+                if store.get_model(&local).is_ok_and(|r| r.is_some()) {
+                    return Ok(local);
+                }
+                println!(
+                    "{resolved} not in the store — pulling {}:{} first \
+                     (Ctrl-C keeps the partial for resume)",
+                    t.repo, t.quant
+                );
+                let (row, already) = pull_model(&resolved).await?;
+                if already {
+                    println!("already present as {} — starting", row.name);
+                }
+                return Ok(row.name);
+            }
+            return Ok(resolved);
+        }
+    }
+    Ok(name.to_string())
+}
+
 /// Not-found error with the flat-name teaching line for ollama
 /// `model:tag` input (reached only when BOTH forms missed, so the
 /// swapped spelling is a suggestion, never a promise).
@@ -790,7 +833,10 @@ async fn run(cmd: Cmd) -> Result<()> {
             prompt,
             verbose,
             max_tokens,
-        } => run_dispatch(&resolve_model_cli(&model), &prompt, verbose, max_tokens).await,
+        } => {
+            let model = ensure_run_model(&model).await?;
+            run_dispatch(&model, &prompt, verbose, max_tokens).await
+        }
         Cmd::Bench { model } => bench(&resolve_model_cli(&model)),
         Cmd::Tune {
             model,
@@ -2502,6 +2548,35 @@ mod signal_stop {
 
 async fn pull(target: &str) -> Result<()> {
     banner();
+    let (row, already_present) = pull_model(target).await?;
+    if already_present {
+        println!(
+            "already present — {}: {} ({}, {} shards) -> {}",
+            row.name,
+            humansize(row.bytes),
+            row.quant,
+            row.shards,
+            row.path
+        );
+    } else {
+        println!(
+            "pulled {}: {} ({}, {} shards) -> {}",
+            row.name,
+            humansize(row.bytes),
+            row.quant,
+            row.shards,
+            row.path
+        );
+    }
+    Ok(())
+}
+
+/// The pull flow without the banner or the summary line, so `pallama
+/// run` can auto-fetch a missing model and reuse every guarantee:
+/// progress, resume-safe `.part` files, pull locks, mmproj attach,
+/// metadata warnings, and the GGUF lint. Returns the store row plus
+/// whether it was already present (caller picks the wording).
+async fn pull_model(target: &str) -> Result<(pallama_core::store::ModelRow, bool)> {
     let d = dirs();
     d.ensure().ok();
     let token = std::env::var("HF_TOKEN").ok();
@@ -2527,25 +2602,7 @@ async fn pull(target: &str) -> Result<()> {
         }
     };
     let row = outcome.row;
-    if outcome.already_present {
-        println!(
-            "already present — {}: {} ({}, {} shards) -> {}",
-            row.name,
-            humansize(row.bytes),
-            row.quant,
-            row.shards,
-            row.path
-        );
-    } else {
-        println!(
-            "pulled {}: {} ({}, {} shards) -> {}",
-            row.name,
-            humansize(row.bytes),
-            row.quant,
-            row.shards,
-            row.path
-        );
-    }
+    let already_present = outcome.already_present;
     // The runtime warned via log + event; surface it in the terminal too
     // (tracing is muted at the default level). The event is the REAL
     // signal — HF metadata fallbacks can still fill `arch`.
@@ -2563,7 +2620,7 @@ async fn pull(target: &str) -> Result<()> {
             println!("WARNING: {w}");
         }
     }
-    Ok(())
+    Ok((row, already_present))
 }
 
 const MIB_F64: f64 = 1_048_576.0;
