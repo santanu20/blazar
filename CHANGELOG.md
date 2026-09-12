@@ -7,6 +7,12 @@ tracked here.
 ## [Unreleased]
 
 ### Added
+- **Profile warnings surfaced to users**: compile-time decisions
+  (unified-KV ctx fit, slot auto `-np`, gpu-offload rationale,
+  cache-ram clamp, dense-fallback) were daemon-log-only. They now ride
+  `/api/ps` rows as `pallama_warnings`, print as `[profile] …` lines
+  after a `pallama run` stream, and as `warn[<model>]` lines under the
+  `ps` table. REPL defers to `pallama ps`.
 - **`run` auto-pull**: `pallama run <model>` with a model missing from
   the store now pulls it first (the exact `pallama pull` flow —
   progress, resumable `.part`, pull locks, mmproj attach, warnings)

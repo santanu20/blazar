@@ -183,6 +183,10 @@ pub struct Instance {
     /// Post-quantization KV-cache estimate from the compiled profile —
     /// feeds the co-residency planner (A15).
     pub kv_est_bytes: Option<u64>,
+    /// Profile-compile warnings (unified-KV fit, slot auto, gpu-offload
+    /// rationale…) — kept on the instance so `ps` and the run path can
+    /// surface them; the daemon tracing loop stays for logs.
+    pub warnings: Vec<String>,
     /// Measured card free-VRAM delta from the spawn settle report — the
     /// footprint the child ACTUALLY took (weights + context + compute +
     /// KV working set). 0 = not settled yet. The bytes admission prefers
@@ -408,6 +412,8 @@ pub struct PsRow {
     /// `None` for router mode / unknown placement. `ps` renders it as
     /// `full@<card>`.
     pub device: Option<String>,
+    /// Profile-compile warnings for this instance (see Instance.warnings).
+    pub warnings: Vec<String>,
     pub pid: u32,
     /// Model bytes on disk (0 in router mode — the front child serves
     /// many models and owns no single size).
@@ -1496,6 +1502,7 @@ impl Supervisor {
                         gpu: "router".to_string(),
                         device: None,
                         kv_est_bytes: None,
+                        warnings: Vec::new(),
                         settled_mib: std::sync::atomic::AtomicU64::new(0),
                         auth: auth.as_ref().map(|a| a.secret.clone()),
                         child: tokio::sync::Mutex::new(child),
@@ -2115,6 +2122,7 @@ impl Supervisor {
                             card_label.clone()
                         },
                         kv_est_bytes: profile.kv_est_bytes,
+                        warnings: profile.warnings.clone(),
                         settled_mib: std::sync::atomic::AtomicU64::new(0),
                         auth: auth.as_ref().map(|a| a.secret.clone()),
                         child: tokio::sync::Mutex::new(child),
@@ -3163,6 +3171,7 @@ impl Supervisor {
                     ctx: i.profile_ctx,
                     gpu: i.gpu.clone(),
                     device: i.device.clone(),
+                    warnings: i.warnings.clone(),
                     pid: i.pid,
                     bytes: i.model.bytes,
                     heat,
@@ -3730,6 +3739,7 @@ mod routing_tests {
             gpu: "full".into(),
             device: None,
             kv_est_bytes: None,
+            warnings: Vec::new(),
             settled_mib: std::sync::atomic::AtomicU64::new(settled_mib),
             auth: None,
             child: tokio::sync::Mutex::new(ChildHandle::new(endpoint, proc)),
@@ -3837,6 +3847,7 @@ mod routing_tests {
             gpu: "cpu".into(),
             device: None,
             kv_est_bytes: None,
+            warnings: Vec::new(),
             settled_mib: std::sync::atomic::AtomicU64::new(0),
             auth: None,
             child: tokio::sync::Mutex::new(ChildHandle::new(endpoint, proc)),

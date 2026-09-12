@@ -2957,6 +2957,16 @@ async fn ps(reset: bool) -> Result<()> {
             m["pallama_in_flight"].as_i64().unwrap_or(0),
             m["pallama_endpoint"].as_str().unwrap_or("-")
         );
+        // Profile decisions worth knowing (ctx fit, slot auto, offload
+        // rationale) — one warn line per instance row, after its table
+        // line; router rows carry none.
+        if let Some(ws) = m["pallama_warnings"].as_array() {
+            for w in ws {
+                if let Some(w) = w.as_str() {
+                    println!("  warn[{display}]: {w}");
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -2985,6 +2995,10 @@ async fn run_dispatch(
         body["options"] = serde_json::json!({ "num_predict": n });
     }
     let final_chunk = stream_chat(&base, &body).await?;
+    // Profile decisions for THIS model (unified-KV ctx fit, slot auto,
+    // offload rationale) — the run that triggered the load is the run
+    // that deserves the why. REPL defers to `pallama ps`.
+    print_profile_warnings(&base, model).await;
     if verbose {
         if let Some(v) = final_chunk {
             let ec = v["eval_count"].as_i64().unwrap_or(0);
@@ -3000,6 +3014,32 @@ async fn run_dispatch(
         }
     }
     Ok(())
+}
+
+/// One-line-per-warning from `/api/ps` for the model this run used.
+/// Missing key (router mode) or no rows (already evicted) = silence.
+async fn print_profile_warnings(base: &str, model: &str) {
+    let Ok(resp) = cli_http().get(format!("{base}/api/ps")).send().await else {
+        return;
+    };
+    let Ok(v) = resp.json::<serde_json::Value>().await else {
+        return;
+    };
+    let Some(models) = v["models"].as_array() else {
+        return;
+    };
+    for m in models {
+        if m["name"].as_str() != Some(model) {
+            continue;
+        }
+        if let Some(ws) = m["pallama_warnings"].as_array() {
+            for w in ws {
+                if let Some(w) = w.as_str() {
+                    println!("[profile] {w}");
+                }
+            }
+        }
+    }
 }
 
 /// ollama cloud commands are refused, loudly: pallama is local-only by
