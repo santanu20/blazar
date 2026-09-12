@@ -183,6 +183,22 @@ impl Engine for LlamaCppEngine {
     }
 
     async fn spawn(&self, argv: &[String], endpoint: &Endpoint) -> Result<ChildHandle> {
+        // Preflight --rpc: upstream llama-server connects RPC backends
+        // EAGERLY at argv-parse and SIGABRTs on a dead endpoint
+        // (ggml-rpc.cpp rpc_dispatcher::start), which crash-loops the
+        // child into 502s. Refuse the spawn with a teaching error naming
+        // the dead endpoint(s) instead — the engine binary itself is
+        // healthy, so this returns before any child exists (no
+        // crash-loop, no engine rollback).
+        let dead = probe_rpc_endpoints(argv).await;
+        if !dead.is_empty() {
+            return Err(anyhow!(
+                "--rpc endpoint(s) unreachable: {} — llama-server aborts at \
+                 startup when an RPC backend is down; start the RPC worker(s) \
+                 or fix `rpc_servers` in the config",
+                dead.join(", ")
+            ));
+        }
         spawn_child(&self.manifest.server_path, argv, endpoint, &self.child_env)
     }
 
@@ -246,6 +262,53 @@ impl Engine for LlamaCppEngine {
             poll = std::cmp::min(poll.mul_f64(1.6), std::time::Duration::from_millis(150));
         }
     }
+}
+
+/// How long each `--rpc` endpoint preflight probe may take. Probes run
+/// in parallel; a live loopback/LAN worker answers in well under a
+/// second, while a dead host with dropped SYNs burns the full budget
+/// once — still cheaper than the child SIGABRT loop it prevents.
+const RPC_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Preflight every `--rpc` endpoint in the FINAL child argv (all
+/// occurrences — config knob, model overlay and `extra_args` can each
+/// add one). TCP-connect each in parallel; a failed connect means
+// upstream's eager connect would SIGABRT the child at argv-parse.
+/// Returns the offending entries (`host:port (reason)`), empty when
+/// every endpoint answered or no `--rpc` flag is present.
+async fn probe_rpc_endpoints(argv: &[String]) -> Vec<String> {
+    let targets: Vec<String> = argv
+        .windows(2)
+        .filter(|w| w[0] == "--rpc")
+        .flat_map(|w| w[1].split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let probes = targets.into_iter().map(|target| async move {
+        let (host, port) = match target.rsplit_once(':') {
+            Some((h, p)) if !h.is_empty() => match p.parse::<u16>() {
+                Ok(p) => (h.to_string(), p),
+                Err(_) => return Some(format!("{target} (malformed port)")),
+            },
+            _ => return Some(format!("{target} (malformed host:port)")),
+        };
+        let connected = tokio::time::timeout(
+            RPC_PROBE_TIMEOUT,
+            tokio::net::TcpStream::connect((host.as_str(), port)),
+        )
+        .await;
+        if matches!(connected, Ok(Ok(_))) {
+            None
+        } else {
+            Some(format!("{target} (unreachable)"))
+        }
+    });
+    futures::future::join_all(probes)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 /// Shared child-process mechanics for every engine kind: null stdin,
@@ -652,5 +715,153 @@ async fn pipe_logs<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)] // repo convention: unit__scenario__expected
+mod tests {
+    use super::*;
+
+    fn rpc_argv(value: &str) -> Vec<String> {
+        vec![
+            "llama-server".to_string(),
+            "--rpc".to_string(),
+            value.to_string(),
+        ]
+    }
+
+    #[tokio::test]
+    async fn unit__probe_rpc__no_flag_is_noop() {
+        let argv = vec![
+            "llama-server".to_string(),
+            "-np".to_string(),
+            "1".to_string(),
+        ];
+        assert!(probe_rpc_endpoints(&argv).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unit__probe_rpc__alive_endpoint_passes() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let argv = rpc_argv(&format!("127.0.0.1:{port}"));
+        assert!(probe_rpc_endpoints(&argv).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unit__probe_rpc__dead_endpoint_reported() {
+        // Bind then drop: the port is (almost certainly) closed again.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let argv = rpc_argv(&format!("127.0.0.1:{port}"));
+        let dead = probe_rpc_endpoints(&argv).await;
+        assert_eq!(dead.len(), 1, "{dead:?}");
+        assert!(dead[0].contains("(unreachable)"), "{dead:?}");
+    }
+
+    #[tokio::test]
+    async fn unit__probe_rpc__mixed_list_reports_only_dead() {
+        let alive = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let alive_port = alive.local_addr().unwrap().port();
+        let dead = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let argv = rpc_argv(&format!("127.0.0.1:{alive_port},127.0.0.1:{dead_port}"));
+        let reported = probe_rpc_endpoints(&argv).await;
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        assert!(
+            reported[0].contains(&format!("127.0.0.1:{dead_port}")),
+            "{reported:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unit__probe_rpc__all_flag_occurrences_probed() {
+        // Config knob + extra_args can each emit --rpc; every occurrence
+        // must be checked, not just the first.
+        let alive = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let alive_port = alive.local_addr().unwrap().port();
+        let dead = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let argv = vec![
+            "llama-server".to_string(),
+            "--rpc".to_string(),
+            format!("127.0.0.1:{alive_port}"),
+            "--rpc".to_string(),
+            format!("127.0.0.1:{dead_port}"),
+        ];
+        let reported = probe_rpc_endpoints(&argv).await;
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        assert!(
+            reported[0].contains(&format!("127.0.0.1:{dead_port}")),
+            "{reported:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unit__probe_rpc__malformed_entries_reported_without_probe() {
+        let argv = rpc_argv("nohostport,box1:notaport, ,127.0.0.1:1");
+        let reported = probe_rpc_endpoints(&argv).await;
+        // 127.0.0.1:1 parses as host:port and connect is refused on
+        // loopback -> unreachable; the other two are malformed; the
+        // empty entry is dropped.
+        assert_eq!(reported.len(), 3, "{reported:?}");
+        assert!(reported
+            .iter()
+            .any(|r| r.contains("nohostport (malformed host:port)")));
+        assert!(reported
+            .iter()
+            .any(|r| r.contains("box1:notaport (malformed port)")));
+        assert!(reported
+            .iter()
+            .any(|r| r.contains("127.0.0.1:1 (unreachable)")));
+    }
+
+    #[tokio::test]
+    async fn unit__llamacpp_spawn__dead_rpc_refuses_before_exec() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let manifest = crate::engine::manifest::Manifest {
+            tag: "fake".into(),
+            build_number: 1,
+            version_raw: "b1".into(),
+            devices: vec![],
+            flags: std::collections::BTreeSet::new(),
+            spec_types: vec![],
+            // Deliberately a nonexistent binary: the preflight must bail
+            // BEFORE any exec, so this path is never touched.
+            server_path: "/nonexistent/llama-server".into(),
+        };
+        let engine = LlamaCppEngine::new(manifest);
+        let argv = rpc_argv(&format!("127.0.0.1:{port}"));
+        let endpoint = Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port: 0,
+        };
+        let err = engine
+            .spawn(&argv, &endpoint)
+            .await
+            .expect_err("dead rpc endpoint must refuse the spawn");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--rpc endpoint(s) unreachable"), "{msg}");
+        assert!(msg.contains("rpc_servers"), "{msg}");
     }
 }

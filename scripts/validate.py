@@ -5394,6 +5394,49 @@ def phase_wave() -> None:
                 except subprocess.TimeoutExpired:
                     rpc_proc.kill()
 
+    # F2b: dead rpc endpoint -> spawn REFUSED with a teaching error (the
+    # LlamaCppEngine::spawn preflight): gateway 500 naming the endpoint,
+    # zero child processes (no SIGABRT crash-loop), no engine rollback.
+    # Needs no ggml-rpc-server binary — runs in both branches above.
+    d.stop()
+    st_dead, elapsed, taught, no_child = 0, 0.0, False, False
+    for _attempt in range(2):  # retry-once: _free_port bind-release race
+        dead_port = _free_port()  # released again = nothing listens there
+        d.start(
+            {
+                "port": PORT,
+                "model_overrides": {f_small: {"rpc_servers": f"127.0.0.1:{dead_port}"}},
+            },
+            floor_model=f_small,
+        )
+        t0 = time.time()
+        st_dead, _, body_dead = _chat(f_small, "You are a careful accountant.", "hi")
+        elapsed = time.time() - t0
+        taught = "unreachable" in str(body_dead).lower()
+        no_child = child_pid(f_small) is None
+        d.stop()
+        if st_dead == 500 and taught and no_child:
+            break
+        time.sleep(1)
+    check(
+        "wave",
+        "rpc dead endpoint -> spawn refused with teaching error (no crash-loop)",
+        st_dead == 500 and taught and no_child,
+        f"st={st_dead} elapsed={elapsed:.1f}s child_spawned={not no_child} "
+        f"err={str(body_dead)[:140]}",
+    )
+
+    # F-identity and every lane after it expect a LIVE keyless daemon; F2b
+    # leaves it stopped. Restart clean — without the dead rpc pin, so the
+    # session lanes spawn f_small normally (same idiom as the F164 skip arm).
+    d.start({"port": PORT}, floor_model=f_small)
+    st = 0
+    t0 = time.time()
+    while time.time() - t0 < 180 and st != 200:
+        st, _, _ = _chat(f_small, "You are a careful accountant.", "hi")
+        if st != 200:
+            time.sleep(2)
+
     # F-identity: save -> manifest exists; clean restore 200; tampered ctx
     # -> 400 teaching; erase removes checkpoint AND manifest.
     st_sv, _, _ = http_json(
