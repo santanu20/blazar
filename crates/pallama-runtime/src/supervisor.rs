@@ -6,7 +6,7 @@
 //! shutdown), teardown is idempotent, SIGTERM→grace→SIGKILL bounded, and
 //! every state transition publishes an event.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,6 +19,33 @@ use pallama_core::store::Store;
 use pallama_core::{Config, GpuInfo, Hardware, ModelRow, PallamaDirs};
 
 use crate::events::{EventBus, InstanceState, PallamaEvent};
+
+/// Resolve the draft-model file path for `model` under `spec_mode`: the
+/// catalog's typed pair (eagle3/dflash/dspark) or the generic pair
+/// (auto), materialized only when that draft is a pulled store row.
+/// Modes that never use an external draft (off/mtp/ngram*) return None
+/// without touching the store. Shared by serve `ensure`, the router
+/// preset, and the CLI bench/tune lanes so every spawn path resolves
+/// drafts identically — profile-compile still gates emission on the
+/// engine manifest and hard-errors on stale (missing) files.
+pub fn resolve_draft_path(store: &Store, model: &str, spec_mode: &str) -> Option<String> {
+    let pair = match spec_mode {
+        "eagle3" => pallama_core::spec_pair_for_typed(model, "draft-eagle3"),
+        "dflash" => pallama_core::spec_pair_for_typed(model, "draft-dflash"),
+        "dspark" => pallama_core::spec_pair_for_typed(model, "draft-dspark"),
+        // off/mtp/ngram never consume an external draft file.
+        "off" | "mtp" | "ngram" | "ngram-map-k" | "ngram-map-k4v" | "ngram-mod" | "ngram-cache" => {
+            None
+        }
+        _ => pallama_core::spec_pair_for(model),
+    }?;
+    let (repo_part, file_part) = pair
+        .draft_repo
+        .split_once(':')
+        .unwrap_or((&pair.draft_repo, ""));
+    let draft_name = crate::hf::draft_aware_name(repo_part, file_part);
+    store.get_model(&draft_name).ok().flatten().map(|r| r.path)
+}
 
 /// Instance key for the single router-mode child (never a model name:
 /// underscore prefix is invalid in HF repo names).
@@ -59,13 +86,26 @@ const KEEP_ALIVE_FOREVER: Duration = Duration::from_hours(876_600);
 /// LC4: reaper ticks (10s each) of sustained concurrent load before a
 /// slots bump is adopted.
 const SLOTS_STREAK_TICKS: u32 = 6;
-/// LC4: max in-memory slots bump (`tune --slots` for higher).
-const SLOTS_ADOPT_CAP: u32 = 4;
+/// LC4: max in-memory slots bump (`tune --slots` for higher). Raised
+/// 4 → 8 on 2026-09-12: the np8 shape measured +19% system t/s and a
+/// 5.4x concurrency TTFT-p99 win over np4 under 8-stream load
+/// (scaling flag-space study, /tmp/opencode/flagprobe/results2.json).
+const SLOTS_ADOPT_CAP: u32 = 8;
+/// Quiet reaper ticks before an adoption decays back to the natural
+/// shape (30 x 10s = 5 min of zero pressure and zero in-flight). The
+/// asymmetry vs [`SLOTS_STREAK_TICKS`] is deliberate anti-flap hysteresis:
+/// scaling up must be eager (demand is now), scaling down must be lazy
+/// (the cost of waiting is only per-stream latency, never queueing).
+const SLOTS_DECAY_TICKS: u32 = 30;
 
 /// Model name behind an instance key: `"qwen#2"` → `"qwen"`. Plain keys
 /// (no `#`) pass through unchanged, so `replicas = 1` stays
 /// byte-identical with the pre-replica world.
+/// A trailing `@vision` marker (projector-carrying respawn of a
+/// text-only instance, see `ensure_vision`) is stripped too, so every
+/// consumer sees the plain model name.
 fn model_of_key(key: &str) -> &str {
+    let key = key.split('@').next().unwrap_or(key);
     match key.split_once('#') {
         Some((model, _)) => model,
         None => key,
@@ -73,8 +113,10 @@ fn model_of_key(key: &str) -> &str {
 }
 
 /// Split an instance key into (model, replica index). `None` for plain
-/// model keys and malformed suffixes.
+/// model keys and malformed suffixes. A `@vision` suffix after the
+/// replica index is tolerated so `evict_model`-style filters match.
 fn split_replica(key: &str) -> Option<(&str, u32)> {
+    let key = key.split('@').next().unwrap_or(key);
     let (model, idx) = key.split_once('#')?;
     let idx = idx.parse::<u32>().ok()?;
     Some((model, idx))
@@ -127,10 +169,25 @@ pub struct Instance {
     /// Post-quantization KV-cache estimate from the compiled profile —
     /// feeds the co-residency planner (A15).
     pub kv_est_bytes: Option<u64>,
+    /// Measured card free-VRAM delta from the spawn settle report — the
+    /// footprint the child ACTUALLY took (weights + context + compute +
+    /// KV working set). 0 = not settled yet. The bytes admission prefers
+    /// this over the weights sum: on 2026-09-11 a 9B VL spawn measured
+    /// 7302 MiB against 5417 weights, and a weights-only admission let a
+    /// 0.5B sibling (~977 MiB actual) join it into an `NVRM NO_MEMORY`
+    /// storm. Relaxed ordering: telemetry-grade hint, not a lock.
+    pub settled_mib: std::sync::atomic::AtomicU64,
     /// Per-child bearer secret (child `--api-key` hardening). Lifecycle
     /// = child lifecycle; `None` on UDS children (filesystem perms
     /// already gate the socket) and on engines lacking `--api-key`.
     pub auth: Option<String>,
+    /// Whether this child was spawned WITH the multimodal projector
+    /// (`-mm`/`--mmproj` in the compiled argv). Under the default Lazy
+    /// policy text-only spawns skip the projector (measured: 875 MiB
+    /// file, ~3.9 s cold TTFT, 1126 MiB VRAM) and `ensure_vision`
+    /// respawns projector-carrying on the first image request. Derived
+    /// from the argv the compiler actually emitted — never assumed.
+    pub projector: bool,
     child: tokio::sync::Mutex<ChildHandle>,
     pid: u32,
 }
@@ -410,9 +467,25 @@ pub struct Supervisor {
     /// Consecutive reaper ticks with concurrent in-flight load on a
     /// single-slot model (LC4 adaptive slots).
     busy_streak: DashMap<String, u32>,
+    /// Consecutive fully-quiet ticks per instance key (no admission
+    /// pressure, zero in-flight) feeding the adoption decay rule.
+    idle_streak: DashMap<String, u32>,
     /// In-memory slots bumps adopted by LC4 (restart resets; `tune
     /// --slots` is the permanent path).
     adopted_slots: DashMap<String, u32>,
+    /// LC4 respawn queue: model → instance key adopted this pass. The
+    /// reaper drain respawns each entry once its streams drain
+    /// (in-flight = 0), so a slot-heavy reshape never kills live
+    /// streams; under 24/7 saturation it defers to the natural
+    /// idle-evict respawn instead.
+    reshape_queue: DashMap<String, String>,
+    /// Admission-pressure events per model since the last reaper tick:
+    /// every gateway request that hit `AllSlotsBusy` and queued (the
+    /// demand signal for adaptive slots — engine `in_flight` can never
+    /// exceed the slot count because admission caps it, so queue-wait
+    /// is the only reachable saturation indicator; live-proven
+    /// 2026-09-12 when a 6-stream load left `in_flight` pinned at slots).
+    slot_pressure: DashMap<String, u32>,
     /// Session pins (R3): sessions that recently carried
     /// `x-pallama-session` per model. The idle ladder and capacity
     /// pressure consult this before evicting; force stop releases.
@@ -421,6 +494,13 @@ pub struct Supervisor {
     /// tick's hardware re-probe + per-card teach dedup (warn once per
     /// card per 10 minutes, probe at most once per minute).
     measured: std::sync::Mutex<MeasuredTick>,
+    /// Live-census TTL cache: back-to-back spawns (cold-start burst,
+    /// preload, pressure tick within seconds) each paid the ~0.2-0.26 s
+    /// `--list-devices` subprocess — measured on the cold path (2026-09-11
+    /// forensics). Cached for [`CENSUS_TTL`]; invalidated on spawn
+    /// failure so the pre-spawn guard never trusts a census that
+    /// predates a failed boot.
+    census_cache: std::sync::Mutex<Option<(Instant, Hardware)>>,
     // Test knobs (prod defaults from config).
     pub load_timeout: Duration,
     pub shutdown_grace: Duration,
@@ -464,6 +544,7 @@ impl Supervisor {
             spec_accept: std::sync::Arc::new(CacheHint::default()),
             engine_failures: std::sync::Mutex::new(std::collections::HashSet::new()),
             measured: std::sync::Mutex::new(MeasuredTick::default()),
+            census_cache: std::sync::Mutex::new(None),
             load_timeout: Duration::from_secs(3 * 60),
             shutdown_grace: Duration::from_secs(10),
             reaper_interval: Duration::from_secs(10),
@@ -487,24 +568,67 @@ impl Supervisor {
             last_requested: std::sync::Mutex::new(None),
             preload_failures: DashMap::new(),
             busy_streak: DashMap::new(),
+            idle_streak: DashMap::new(),
             adopted_slots: DashMap::new(),
+            reshape_queue: DashMap::new(),
+            slot_pressure: DashMap::new(),
             sessions: crate::sessionreg::SessionRegistry::new(),
         }
     }
 
-    /// Capacity for a given model size: explicit config wins; auto = 1 on
-    /// CPU-only, else max(1, floor(VRAM / `model_bytes`)).
+    /// Hard instance-count cap: explicit `max_loaded_models` wins as a
+    /// pure count; CPU-only boxes pin 1 (page cache is shared, but the
+    /// evictor's heat model does not reason about it). `None` on GPU
+    /// boxes in auto mode — the bytes admission below governs there.
     #[must_use]
-    pub fn capacity_for(&self, model_bytes: i64) -> usize {
+    pub fn instance_cap(&self) -> Option<usize> {
         if self.config.max_loaded_models > 0 {
-            return self.config.max_loaded_models as usize;
+            return Some(self.config.max_loaded_models as usize);
         }
-        if !self.hardware.has_gpu() || model_bytes <= 0 {
-            return 1;
+        if !self.hardware.has_gpu() {
+            return Some(1);
         }
-        let vram = pallama_core::Hardware::bytes(self.hardware.total_vram_mib());
-        let model = u64::try_from(model_bytes).unwrap_or(u64::MAX);
-        (usize::try_from(vram / model).unwrap_or(1)).max(1)
+        None
+    }
+
+    /// Bytes admission active exactly when the count cap is not: GPU box,
+    /// auto mode. Heterogeneous-friendly: what matters is the SUM of
+    /// resident weights vs the VRAM budget, not VRAM divided by the
+    /// largest model (a 0.5B + 9B pair co-resides where the old
+    /// floor-division formula said capacity 1).
+    #[must_use]
+    pub fn bytes_admission_active(&self) -> bool {
+        self.config.max_loaded_models == 0 && self.hardware.has_gpu()
+    }
+
+    /// Sum of resident instance footprints for the bytes admission:
+    /// the MEASURED settle delta once known (weights, context, compute
+    /// and KV working set), floored at the weights sum while the settle
+    /// probe has not run yet. CPU-placed children never count (their
+    /// pages live in system RAM, guarded by the J3 `MemAvailable`
+    /// floor); each replica mmaps its own copy, so GPU-resident VRAM
+    /// sums.
+    #[must_use]
+    pub fn resident_bytes(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.instances
+            .iter()
+            .filter(|e| e.value().gpu != "cpu")
+            .map(|e| {
+                let measured =
+                    pallama_core::Hardware::bytes(e.value().settled_mib.load(Ordering::Relaxed));
+                let weights = u64::try_from(e.value().model.bytes.max(0)).unwrap_or(u64::MAX);
+                measured.max(weights)
+            })
+            .sum()
+    }
+
+    /// Total-VRAM planning budget for the bytes admission. Planning, not
+    /// guarding: the fresh free-VRAM probe (spawn guard J3 / preload
+    /// preflight) still owns refuse-vs-warn at spawn time.
+    #[must_use]
+    pub fn vram_budget_bytes(&self) -> u64 {
+        pallama_core::Hardware::bytes(self.hardware.total_vram_mib())
     }
 
     /// Capacity-eviction victim: the coldest evictable instance — zero
@@ -652,6 +776,81 @@ impl Supervisor {
             self.note_transition(name);
         }
         result
+    }
+
+    /// `ensure` for requests that carry images — the mmproj lazy-attach
+    /// path. Policy (same resolution as the profile compiler's rule 19):
+    /// `attach` → plain `ensure_routed` (projector already on the
+    /// spawn); `skip` → loud teaching error (vision is OFF by config,
+    /// never a silent 404); `lazy` → serve any live projector sibling
+    /// of the same base model, else spawn the projector variant under a
+    /// `@vision` key: projector-less live siblings of the same base are
+    /// evicted first (the projector costs ~1.1 GiB measured VRAM —
+    /// keeping both children of one model is double-loading), then the
+    /// KV bank carries the conversation across the respawn.
+    pub async fn ensure_vision(
+        &self,
+        name: &str,
+        prefix: Option<PrefixKey>,
+    ) -> Result<EngineRef, SupervisionError> {
+        if self.config.router && name != ROUTER_KEY {
+            // router child is forced-attach (preset loop) — plain path
+            return Box::pin(self.ensure_routed(name, prefix)).await;
+        }
+        let policy =
+            profile::mmproj_policy_effective(&self.config, name, &self.config.overlay_for(name));
+        match policy {
+            pallama_core::config::MmprojPolicy::Attach => {
+                Box::pin(self.ensure_routed(name, prefix)).await
+            }
+            pallama_core::config::MmprojPolicy::Skip => Err(SupervisionError::Internal(anyhow!(
+                "vision disabled: mmproj = skip spawns {name} text-only — set \
+                 mmproj = true (or \"lazy\") to serve images"
+            ))),
+            pallama_core::config::MmprojPolicy::Lazy => {
+                // (a) a live projector sibling of this base model serves
+                // immediately (sticky @vision replica from an earlier
+                // vision request)
+                let mut serve: Option<Arc<Instance>> = None;
+                let mut text_sibs: Vec<String> = Vec::new();
+                for entry in &self.instances {
+                    if model_of_key(entry.key()) != name {
+                        continue;
+                    }
+                    let inst = entry.value();
+                    let state = inst.state.read().unwrap();
+                    if matches!(*state, InstanceState::Ready | InstanceState::Sleeping) {
+                        if inst.projector {
+                            serve = Some(Arc::clone(inst));
+                        } else {
+                            text_sibs.push(entry.key().clone());
+                        }
+                    }
+                }
+                if let Some(inst) = serve {
+                    return Ok(self.engine_ref(&inst));
+                }
+                // (b) respawn WITH projector: drop the text-only sibling
+                // first (VRAM honesty — never two children of one model)
+                for k in &text_sibs {
+                    tracing::warn!(
+                        target: "pallama::supervisor",
+                        "mmproj lazy: vision request for {name} — respawning \
+                         text-only instance {k} with the projector (KV bank \
+                         carries the conversation)"
+                    );
+                    if let Err(e) = self.evict(k).await {
+                        tracing::warn!(
+                            target: "pallama::supervisor",
+                            error = %e,
+                            "pre-vision evict failed for {k}"
+                        );
+                    }
+                }
+                let vision_key = format!("{}@vision", self.replica_key(name, prefix));
+                Box::pin(self.ensure_key(&vision_key)).await
+            }
+        }
     }
 
     /// LC1: bump the (prev, current) transition count. Bounded table;
@@ -858,6 +1057,18 @@ impl Supervisor {
         // We are the loader.
         let notify = Arc::new(Notify::new());
         self.loading.insert(key.to_string(), notify.clone());
+        // Cancellation safety: if THIS loader future is dropped before the
+        // completion protocol below runs (the caller went away), parked
+        // waiters would sleep forever on a Notify that never fires —
+        // live-repro'd wedge (client timeout during cold spawn wedged every
+        // later generate). The gateway detaches its loads, so this guard is
+        // defense in depth for any other caller that can be dropped.
+        let mut abort = LoadAbort {
+            sup: self,
+            key,
+            notify: notify.clone(),
+            armed: true,
+        };
         let result = if self.config.router && key == ROUTER_KEY {
             self.spawn_router_instance().await
         } else {
@@ -872,9 +1083,73 @@ impl Supervisor {
         tokio::time::sleep(Duration::from_millis(50)).await;
         self.loading.remove(key);
         self.load_results.remove(key);
+        abort.armed = false;
         result
     }
+}
 
+/// Loader-protocol cancellation guard for [`Supervisor::ensure_key`]:
+/// a loader dropped mid-spawn must wake parked waiters with a loud
+/// error and clear the loading slot, never strand the Notify.
+/// One-shot advisory: an NVIDIA box running a Vulkan llama.cpp engine
+/// with NO CUDA engine installed is leaving ~18% first-token latency on
+/// the table (live-measured, BENCHMARK.md 2026-09-11). Upstream ships no
+/// Linux CUDA prebuilts, so the auto-overlay cannot fix this until the
+/// overlay repo publishes — the in-tree build can, today. Once per
+/// process; the dethrone guard in `register_engine_with_vendor` keeps an
+/// installed CUDA engine from being silently replaced later.
+fn advise_cuda_build(store: &Store, active: &pallama_core::store::EngineRow) {
+    static ADVISED: AtomicBool = AtomicBool::new(false);
+    if ADVISED.load(Ordering::Relaxed) {
+        return;
+    }
+    if crate::engine::system_vendor_hint() != crate::engine::manifest::Vendor::Nvidia {
+        return;
+    }
+    if active.kind != pallama_core::engine_kind::EngineKind::LlamaCpp
+        || crate::engine::is_cuda_engine(&active.tag, &active.asset)
+    {
+        return;
+    }
+    let has_cuda = store.list_engines().is_ok_and(|rows| {
+        rows.iter().any(|e| {
+            e.kind == pallama_core::engine_kind::EngineKind::LlamaCpp
+                && crate::engine::is_cuda_engine(&e.tag, &e.asset)
+        })
+    });
+    if has_cuda {
+        return; // CUDA installed but not active: a deliberate `engine use`
+    }
+    ADVISED.store(true, Ordering::Relaxed);
+    tracing::warn!(
+        "NVIDIA GPU with a Vulkan-only llama.cpp engine active — CUDA is ~18% faster on \
+         first token here; build it once with: pallama engine build cuda"
+    );
+}
+
+struct LoadAbort<'a> {
+    sup: &'a Supervisor,
+    key: &'a str,
+    notify: Arc<Notify>,
+    armed: bool,
+}
+
+impl Drop for LoadAbort<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.sup.load_results.insert(
+            self.key.to_string(),
+            Err("load cancelled before completion (loader dropped mid-spawn)".to_string()),
+        );
+        self.notify.notify_waiters();
+        self.sup.loading.remove(self.key);
+        self.sup.load_results.remove(self.key);
+    }
+}
+
+impl Supervisor {
     #[allow(clippy::unused_self)] // symmetrical with future instance methods
     fn engine_ref(&self, inst: &Instance) -> EngineRef {
         EngineRef {
@@ -996,6 +1271,14 @@ impl Supervisor {
                 .into_iter()
                 .map(|l| (l.path, l.scale))
                 .collect();
+            // Same shared draft resolver as `ensure`: a spec=auto router
+            // must not silently drop catalog-paired models with a false
+            // "not pulled" error.
+            let spec_mode = overlay
+                .spec
+                .clone()
+                .unwrap_or_else(|| self.config.spec.clone());
+            let draft_path = resolve_draft_path(&store, &m.name, &spec_mode);
             let input = ProfileInput {
                 engine_kind: self.engine.kind(),
                 sibling_devices: Vec::new(),
@@ -1009,8 +1292,11 @@ impl Supervisor {
                 config: &self.config,
                 overlay: &overlay,
                 loras: &loras,
-                draft_path: None,
+                draft_path: draft_path.as_deref(),
                 mmproj_path: m.mmproj_path.as_deref(),
+                // router preset: every pulled model rides one child incl
+                // VL rows — force the projector on regardless of policy
+                mmproj_force: true,
                 engine_tag: &manifest.tag,
                 supported_flags: &manifest.flags,
                 spec_types: &manifest.spec_types,
@@ -1168,12 +1454,16 @@ impl Supervisor {
                         in_flight: AtomicI64::new(0),
                         keep_until: std::sync::RwLock::new(None),
                         started_at: Instant::now(),
+                        // router serves EVERY pulled model incl VL rows —
+                        // the preset compile forces attach, so reflect it
+                        projector: argv.windows(2).any(|w| w[0] == "-mm" || w[0] == "--mmproj"),
                         argv,
                         model: synthetic_model.clone(),
                         profile_ctx: 0,
                         gpu: "router".to_string(),
                         device: None,
                         kv_est_bytes: None,
+                        settled_mib: std::sync::atomic::AtomicU64::new(0),
                         auth: auth.as_ref().map(|a| a.secret.clone()),
                         child: tokio::sync::Mutex::new(child),
                         pid,
@@ -1364,25 +1654,15 @@ impl Supervisor {
             .into_iter()
             .map(|l| (l.path, l.scale))
             .collect();
-        // Draft resolution: same-name model row for the catalog pair repo.
-        // The manual draft lanes (eagle3/dflash/dspark) must resolve their
-        // typed head, not the generic draft-simple sibling that plain
-        // auto would pick for the same prefix.
+        // Draft resolution mirrors every other spawn path (router
+        // preset, CLI bench/tune): one shared resolver, catalog pair →
+        // pulled store row. Compile-time freshness + manifest gates
+        // live in profile::compile.
         let spec_mode = overlay
             .spec
             .clone()
             .unwrap_or_else(|| self.config.spec.clone());
-        let pair = match spec_mode.as_str() {
-            "eagle3" => pallama_core::spec_pair_for_typed(name, "draft-eagle3"),
-            "dflash" => pallama_core::spec_pair_for_typed(name, "draft-dflash"),
-            "dspark" => pallama_core::spec_pair_for_typed(name, "draft-dspark"),
-            _ => pallama_core::spec_pair_for(name),
-        };
-        let draft_path = pair.and_then(|pair| {
-            let draft_name =
-                crate::hf::registry_name(pair.draft_repo.split(':').next().unwrap_or(""));
-            store.get_model(&draft_name).ok().flatten().map(|r| r.path)
-        });
+        let draft_path = resolve_draft_path(&store, name, &spec_mode);
 
         // Capacity: evict the COLDEST instance first — recency-weighted
         // prefix heat (hot models keep their warm cache across capacity
@@ -1390,8 +1670,36 @@ impl Supervisor {
         // Pinned models (overlay `pin = true`, A13) are never victims:
         // capacity pressure falls on unpinned instances instead, and
         // when everything live is pinned+busy the spawn fails loudly.
-        let cap = self.capacity_for(model.bytes);
-        while self.instances.len() >= cap {
+        // Gates: explicit `max_loaded_models` counts instances; auto on
+        // GPU charges MEASURED resident footprints (settle report) plus
+        // the incoming model's admission floor — weights + projector +
+        // KV floor + spawn overhead, the same standing charges the
+        // unified gpu-layers pin trusts. Weights-only planning
+        // oversubscribed an 8 GiB card on 2026-09-11 (measured 7302 +
+        // 977 actual vs 5854 weights-sum → NVRM NO_MEMORY crash-loop);
+        // a cold box always admits one model, and the J3 spawn guard
+        // owns the honest-refusal path for loads that cannot fit at all.
+        let incoming_bytes = {
+            let mmproj_bytes = model
+                .mmproj_path
+                .as_deref()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map_or(0, |m| m.len());
+            pallama_core::profile::admission_floor_bytes(
+                u64::try_from(model.bytes.max(0)).unwrap_or(u64::MAX),
+                mmproj_bytes,
+            )
+        };
+        loop {
+            let count_blocked = self
+                .instance_cap()
+                .is_some_and(|cap| self.instances.len() >= cap);
+            let bytes_blocked = self.bytes_admission_active()
+                && !self.instances.is_empty()
+                && self.resident_bytes().saturating_add(incoming_bytes) > self.vram_budget_bytes();
+            if !count_blocked && !bytes_blocked {
+                break;
+            }
             match self.victim_key(key) {
                 Some(v) => {
                     self.evict(&v)
@@ -1503,6 +1811,9 @@ impl Supervisor {
                 loras: &loras,
                 draft_path: draft_path.as_deref(),
                 mmproj_path: model.mmproj_path.as_deref(),
+                // KV-estimate probe: policy-neutral (mirror the spawn's
+                // own key-derived force below for estimate honesty)
+                mmproj_force: key.ends_with("@vision"),
                 engine_tag: &manifest.tag,
                 supported_flags: &manifest.flags,
                 spec_types: &manifest.spec_types,
@@ -1621,6 +1932,9 @@ impl Supervisor {
                 loras: &loras,
                 draft_path: draft_path.as_deref(),
                 mmproj_path: model.mmproj_path.as_deref(),
+                // @vision respawn = caller demanded a projector-carrying
+                // child (ensure_vision); every other spawn honors policy
+                mmproj_force: key.ends_with("@vision"),
                 engine_tag: &manifest.tag,
                 supported_flags: &manifest.flags,
                 spec_types: &manifest.spec_types,
@@ -1719,12 +2033,14 @@ impl Supervisor {
                         in_flight: AtomicI64::new(0),
                         keep_until: std::sync::RwLock::new(None),
                         started_at: Instant::now(),
+                        projector: argv.windows(2).any(|w| w[0] == "-mm" || w[0] == "--mmproj"),
                         argv,
                         model,
                         profile_ctx: profile.ctx,
                         gpu: profile.gpu.to_string(),
                         device: picked_device.clone(),
                         kv_est_bytes: profile.kv_est_bytes,
+                        settled_mib: std::sync::atomic::AtomicU64::new(0),
                         auth: auth.as_ref().map(|a| a.secret.clone()),
                         child: tokio::sync::Mutex::new(child),
                         pid,
@@ -1751,38 +2067,6 @@ impl Supervisor {
                         auth.as_ref().map(|a| a.secret.as_str()),
                     )
                     .await;
-                    // Measured settle check (#28a): the child is healthy
-                    // and its weights+KV are resident — re-probe the card
-                    // and report what the spawn ACTUALLY took vs the
-                    // pre-spawn baseline. Teaching only (drift visibility,
-                    // the ollama in-process-precision gap closed at the
-                    // orchestration plane); needs the pre-spawn probe as
-                    // a baseline, skipped silently without one.
-                    if let Some(pre) = &fresh {
-                        let post = self.live_hardware();
-                        if let Some((card, taken_mib, used_pct)) =
-                            settle_report(pre, &post, picked_device.as_deref())
-                        {
-                            let predicted_mib = model_bytes / (1024 * 1024)
-                                + profile.kv_est_bytes.map_or(0, |b| b / (1024 * 1024));
-                            tracing::info!(
-                                model = name,
-                                card = %card,
-                                measured_mib = taken_mib,
-                                predicted_mib,
-                                used_pct,
-                                "spawn settle: card free-VRAM delta after load (predicted = weights+KV estimate)"
-                            );
-                            if used_pct > 95 {
-                                tracing::warn!(
-                                    model = name,
-                                    card = %card,
-                                    used_pct,
-                                    "card is over 95% committed after this load — expect KV pressure; consider kv quantization, a smaller quant (pallama fit), or freeing co-resident engines (pallama ps)"
-                                );
-                            }
-                        }
-                    }
                     let _ = std::fs::write(
                         self.dirs.run_dir().join(format!("{key}.pid")),
                         pid.to_string(),
@@ -1794,6 +2078,53 @@ impl Supervisor {
                         state: InstanceState::Ready,
                     });
                     let inst = self.instances.get(key).expect("just inserted");
+                    // Measured settle check (#28a), OFF the first-request
+                    // critical path: the child is healthy and its
+                    // weights+KV are resident — re-probe the card and
+                    // report what the spawn ACTUALLY took vs the
+                    // pre-spawn baseline. Teaching only (drift
+                    // visibility); needs the pre-spawn probe as a
+                    // baseline, skipped silently without one. Runs as a
+                    // detached task AFTER the instance is visible so the
+                    // cold first token never waits on the census
+                    // subprocess — until the task stores the measured
+                    // number, the bytes admission charges the
+                    // weights-sum floor (the same pre-settle state that
+                    // exists today).
+                    if let Some(pre) = fresh {
+                        let engine = Arc::clone(&self.engine);
+                        let settled_inst = Arc::clone(inst.value());
+                        let picked = picked_device.clone();
+                        let model_name = name.to_string();
+                        let predicted_mib = model_bytes / (1024 * 1024)
+                            + profile.kv_est_bytes.map_or(0, |b| b / (1024 * 1024));
+                        tokio::spawn(async move {
+                            let post = Supervisor::live_hardware_with(&engine);
+                            if let Some((card, taken_mib, used_pct)) =
+                                settle_report(&pre, &post, picked.as_deref())
+                            {
+                                settled_inst
+                                    .settled_mib
+                                    .store(taken_mib, std::sync::atomic::Ordering::Relaxed);
+                                tracing::info!(
+                                    model = %model_name,
+                                    card = %card,
+                                    measured_mib = taken_mib,
+                                    predicted_mib,
+                                    used_pct,
+                                    "spawn settle: card free-VRAM delta after load (predicted = weights+KV estimate)"
+                                );
+                                if used_pct > 95 {
+                                    tracing::warn!(
+                                        model = %model_name,
+                                        card = %card,
+                                        used_pct,
+                                        "card is over 95% committed after this load — expect KV pressure; consider kv quantization, a smaller quant (pallama fit), or freeing co-resident engines (pallama ps)"
+                                    );
+                                }
+                            }
+                        });
+                    }
                     // Engine proven healthy: clear the J2 crash-loop tracker.
                     self.engine_failures.lock().unwrap().clear();
                     return Ok(self.engine_ref(inst.value()));
@@ -1841,6 +2172,22 @@ impl Supervisor {
     /// future spawns only; loud (`EngineRolledBack` event + warn) and
     /// reversible (`pallama engine use <tag>`).
     fn note_engine_failure(&self, model: &str) {
+        // The failed boot invalidates the census TTL cache: the next
+        // spawn must re-measure (the pre-spawn guard never trusts a
+        // census that predates a failure — e.g. an external VRAM
+        // squatter that appeared after the cached reading).
+        *self.census_cache.lock().expect("census cache lock") = None;
+        // LC4 rollback: a spawn failure after an adaptive adoption is
+        // the capacity answer — the bumped shape did not fit. Drop the
+        // adoption (and any queued reshape) so the next spawn returns
+        // to the last-known-good shape instead of crash-looping on it.
+        if self.adopted_slots.remove(model).is_some() {
+            self.reshape_queue.remove(model);
+            tracing::warn!(
+                model = model,
+                "adaptive slots rolled back after spawn failure — the adopted shape did not fit"
+            );
+        }
         let trigger = {
             let mut fails = self.engine_failures.lock().unwrap();
             fails.insert(model.to_string());
@@ -1871,6 +2218,7 @@ impl Supervisor {
         let Ok(Some(row)) = store.active_engine() else {
             return true;
         };
+        advise_cuda_build(&store, &row);
         let dir = self.dirs.engines_dir().join(&row.tag);
         let Ok(bin) = crate::engine::find_server(&dir) else {
             return false; // active engine dir has no server binary: broken
@@ -2224,7 +2572,7 @@ impl Supervisor {
         }
         // LC1/LC4 ride the 10s reaper tick.
         self.maybe_preload().await;
-        self.adaptive_slots_tick();
+        self.adaptive_slots_reap().await;
         self.measured_pressure_tick();
     }
 
@@ -2235,9 +2583,40 @@ impl Supervisor {
     /// when the census yields nothing (binary missing, backend init
     /// failed). The census spawns the engine binary — callers throttle
     /// to spawn-time and ≥60s periodic.
+    /// Live census cache lifetime: short enough that the pre-spawn
+    /// guard re-measures on any normal (non-burst) spawn, long enough
+    /// that a cold-start burst (spawn → settle → pressure tick → next
+    /// model's spawn) doesn't exec the census subprocess per step.
+    const CENSUS_TTL: Duration = Duration::from_secs(10);
+
+    /// TTL cache read (pure; testable without spawning the engine).
+    fn census_from_cache(
+        cache: &std::sync::Mutex<Option<(Instant, Hardware)>>,
+        ttl: Duration,
+    ) -> Option<Hardware> {
+        let guard = cache.lock().expect("census cache lock");
+        match guard.as_ref() {
+            Some((at, hw)) if at.elapsed() < ttl => Some(hw.clone()),
+            _ => None,
+        }
+    }
+
     fn live_hardware(&self) -> Hardware {
-        let manifest = self.engine.capabilities();
-        let live = if self.engine.kind() == pallama_core::engine_kind::EngineKind::LlamaCpp {
+        if let Some(hw) = Self::census_from_cache(&self.census_cache, Self::CENSUS_TTL) {
+            return hw;
+        }
+        let fresh = Self::live_hardware_with(&self.engine);
+        *self.census_cache.lock().expect("census cache lock") =
+            Some((Instant::now(), fresh.clone()));
+        fresh
+    }
+
+    /// Engine-only live census, no `self` borrow: lets the post-spawn
+    /// settle task run detached from the supervisor while the first
+    /// request is already being served.
+    fn live_hardware_with(engine: &Arc<dyn Engine>) -> Hardware {
+        let manifest = engine.capabilities();
+        let live = if engine.kind() == pallama_core::engine_kind::EngineKind::LlamaCpp {
             crate::engine::manifest::run_list_devices(std::path::Path::new(&manifest.server_path))
         } else {
             Vec::new()
@@ -2337,7 +2716,7 @@ impl Supervisor {
         if live.len() != 1 || !self.loading.is_empty() {
             return;
         }
-        let (key, a_bytes) = live[0].clone();
+        let (key, _a_bytes) = live[0].clone();
         let current = model_of_key(&key).to_string();
         // Confident transition target.
         let Some(target) = self
@@ -2375,13 +2754,33 @@ impl Supervisor {
             return;
         };
         let b_bytes = u64::try_from(row.bytes.max(0)).unwrap_or(u64::MAX);
-        if self.capacity_for(row.bytes) <= self.instances.len() {
+        let b_mmproj = row
+            .mmproj_path
+            .as_deref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map_or(0, |m| m.len());
+        let b_floor = pallama_core::profile::admission_floor_bytes(b_bytes, b_mmproj);
+        // Early-exit gates only (the spawn admission re-checks under the
+        // instances lock; the fresh free-VRAM preflight below still owns
+        // the co-residency verdict on live numbers). Both sides charge
+        // admission floors: A's measured footprint (weights floored) and
+        // B's floor — weights-sum planning is what crashed the 8 GiB
+        // card on 2026-09-11.
+        if self
+            .instance_cap()
+            .is_some_and(|cap| self.instances.len() >= cap)
+        {
             return;
         }
-        // Fresh VRAM check: both weights must fit on the GPU pool.
+        if self.bytes_admission_active()
+            && self.resident_bytes().saturating_add(b_floor) > self.vram_budget_bytes()
+        {
+            return;
+        }
+        // Fresh VRAM check: both footprints must fit on the GPU pool.
         let fresh = self.live_hardware();
         let free_vram: u64 = fresh.gpus.iter().map(|g| g.free_mib).sum();
-        let need_mib = (a_bytes + b_bytes) / (1024 * 1024);
+        let need_mib = (self.resident_bytes().saturating_add(b_floor)) / (1024 * 1024);
         if fresh.has_gpu() && free_vram > 0 && need_mib > free_vram * 95 / 100 {
             tracing::debug!(model = %next, need_mib, free_vram, "preload skipped: VRAM");
             return;
@@ -2401,10 +2800,15 @@ impl Supervisor {
         }
     }
 
-    /// LC4 adaptive slots: a single-slot model under sustained
-    /// concurrent load (queueing visible as `in_flight > 1` across ticks)
-    /// earns an in-memory slots bump. Explicit overlay slots, replicas,
-    /// and already-adopted caps are respected; opt-in via config.
+    /// LC4 adaptive slots: a model under sustained concurrent load
+    /// (queueing visible as in-flight > live slots across ticks) earns
+    /// an in-memory slots bump. The live slot count is read from the
+    /// spawned child's argv (`-np`), so capacity-shaped auto spawns
+    /// (config `slots = 0`) adapt too — the pre-2026-09-12 form only
+    /// saw `slots = 1` configs and left the default auto shape inert.
+    /// Explicit overlay slots, replicas, and `deterministic` exclude
+    /// the model (a pin is a policy statement); opt-in via config.
+    /// Adoption queues a respawn (see [`Self::drain_reshape_queue`]).
     fn adaptive_slots_tick(&self) {
         if !self.config.adaptive_slots {
             return;
@@ -2416,20 +2820,49 @@ impl Supervisor {
             let state = *i.state.read().expect("state lock");
             if !matches!(state, InstanceState::Ready) {
                 self.busy_streak.remove(&key);
+                self.idle_streak.remove(&key);
                 continue;
             }
             let overlay = self.config.overlay_for(&model);
-            // Manual slots or replicas exclude the model entirely.
-            if overlay.slots.is_some() || overlay.replicas.unwrap_or(1) > 1 {
+            // Manual slots, replicas, or deterministic mode exclude the
+            // model entirely (deterministic spawns pin slots = 1 by
+            // design — adoption would fight the pin every tick).
+            if overlay.slots.is_some()
+                || overlay.replicas.unwrap_or(1) > 1
+                || overlay.deterministic.unwrap_or(self.config.deterministic)
+            {
                 self.busy_streak.remove(&key);
+                self.idle_streak.remove(&key);
                 continue;
             }
+            // Live shape from the child's own argv (source of truth);
+            // fabricated test instances without argv fall back to the
+            // config value, preserving the pre-generalization semantics.
+            let resolved = i
+                .argv
+                .windows(2)
+                .find(|w| w[0] == "-np" || w[0] == "--parallel")
+                .and_then(|w| w[1].parse::<u32>().ok())
+                .unwrap_or(self.config.slots);
             let effective = self
                 .adopted_slots
                 .get(&model)
-                .map_or(self.config.slots, |v| *v.value());
+                .map_or(resolved, |v| *v.value());
             let in_flight = i.in_flight.load(Ordering::SeqCst);
-            if in_flight > 1 && effective == 1 {
+            // Demand signal: admission pressure since the last tick (the
+            // gateway reports every request that queued on AllSlotsBusy).
+            // in_flight alone is unreachable past the slot count —
+            // admission caps it there (live-proven 2026-09-12: 6-stream
+            // load left in_flight pinned at 4 while 2 requests queued).
+            // gauge PEEK, not a drain: entries live for as long as the
+            // queued request is parked, so sustained queueing shows up
+            // on every tick in the window (an event-drain resets the
+            // streak after one tick — live-caught 2026-09-12)
+            let pressure = self.slot_pressure.get(&model).map_or(0, |v| *v);
+            let saturated = pressure > 0 || (effective > 0 && in_flight > i64::from(effective));
+            if saturated {
+                // Saturation cancels any pending decay count.
+                self.idle_streak.remove(&key);
                 // Scope the entry guard: it must drop BEFORE the remove
                 // below, or the DashMap shard self-deadlocks.
                 let hit_threshold = {
@@ -2440,16 +2873,153 @@ impl Supervisor {
                 if hit_threshold {
                     let from = effective;
                     let to = (from + 1).min(SLOTS_ADOPT_CAP);
-                    self.adopted_slots.insert(model.clone(), to);
                     self.busy_streak.remove(&key);
-                    tracing::info!(model = %model, from, to, "adaptive slots adopted");
-                    self.bus
-                        .publish(PallamaEvent::SlotsAutoAdopted { model, from, to });
+                    if to > from {
+                        self.adopted_slots.insert(model.clone(), to);
+                        // Queue the respawn: the drain below performs it
+                        // once live streams finish (in-flight = 0), so
+                        // the reshape never kills an active stream.
+                        self.reshape_queue.insert(model.clone(), key.clone());
+                        tracing::info!(model = %model, from, to, "adaptive slots adopted");
+                        self.bus
+                            .publish(PallamaEvent::SlotsAutoAdopted { model, from, to });
+                    }
+                }
+            } else if in_flight == 0 && self.adopted_slots.contains_key(&model) {
+                // Decay: the adopted shape buys queue-latency under load
+                // and costs per-stream ITL (np8 ITL 60ms vs np4 37ms,
+                // /tmp/opencode/flagprobe/results2.json) — after a long
+                // fully-quiet window, fall back to the natural shape so
+                // single-stream latency recovers. One-shot to base: the
+                // adopt path re-raises in 60s if demand returns.
+                let decayed = {
+                    let mut streak = self.idle_streak.entry(key.clone()).or_insert(0);
+                    *streak += 1;
+                    *streak >= SLOTS_DECAY_TICKS
+                };
+                if decayed {
+                    self.idle_streak.remove(&key);
+                    self.busy_streak.remove(&key);
+                    self.adopted_slots.remove(&model);
+                    self.reshape_queue.insert(model.clone(), key.clone());
+                    tracing::info!(
+                        model = %model,
+                        to = resolved,
+                        "adaptive slots decayed: sustained quiet — respawning at the natural shape (per-stream latency recovers)"
+                    );
                 }
             } else {
                 self.busy_streak.remove(&key);
+                self.idle_streak.remove(&key);
             }
         }
+    }
+
+    /// LC4 reaper half: observe saturation, then reshape. Runs on the
+    /// 10s tick; see [`Self::adaptive_slots_tick`] for the adoption
+    /// rule and [`Self::drain_reshape_queue`] for the respawn.
+    async fn adaptive_slots_reap(&self) {
+        self.adaptive_slots_tick();
+        self.drain_reshape_queue().await;
+    }
+
+    /// Respawn adopted models whose streams have drained. An entry
+    /// whose instance is still busy stays queued for the next tick
+    /// (sustained 24/7 load defers the reshape to the natural
+    /// idle-evict respawn — honest, never disruptive).
+    async fn drain_reshape_queue(&self) {
+        let entries: Vec<(String, String)> = self
+            .reshape_queue
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        for (model, key) in entries {
+            let busy = self
+                .instances
+                .get(&key)
+                .is_some_and(|i| i.in_flight.load(Ordering::SeqCst) > 0);
+            if busy {
+                continue;
+            }
+            self.reshape_queue.remove(&model);
+            tracing::warn!(
+                model = %model,
+                "adaptive slots: respawning with the adopted slot count \
+                 (the KV bank carries conversations across the reshape)"
+            );
+            if let Err(e) = self.evict(&key).await {
+                tracing::warn!(model = %model, "adaptive reshape evict: {e:#}");
+                continue;
+            }
+            if let Err(e) = self.ensure(&model).await {
+                tracing::warn!(model = %model, "adaptive reshape respawn: {e:#}");
+            }
+        }
+    }
+
+    /// Gateway admission brackets queue-waits with enter/leave calls —
+    /// this is a GAUGE of requests currently parked in the admission
+    /// queue, not an event counter. Live-proven 2026-09-12: an event
+    /// counter drains after the first reaper tick (each queued stream
+    /// reports exactly once on `AllSlotsBusy` and then parks inside
+    /// `queue.wait` without retrying), so a per-tick streak built on
+    /// accumulated events can never reach its threshold. The reaper
+    /// needs the LEVEL (how many are waiting right now), which only a
+    /// gauge carries across ticks.
+    pub fn note_slot_pressure(&self, model: &str) {
+        *self.slot_pressure.entry(model.to_string()).or_insert(0) += 1;
+    }
+
+    /// The leaving half of the admission-pressure gauge: the queued
+    /// request either acquired a slot or gave up — either way it is no
+    /// longer demand the slot reshaper should react to.
+    pub fn note_slot_pressure_release(&self, model: &str) {
+        if let Some(mut e) = self.slot_pressure.get_mut(model) {
+            let left = e.value().saturating_sub(1);
+            *e.value_mut() = left;
+            if left == 0 {
+                drop(e);
+                self.slot_pressure.remove(model);
+            }
+        }
+    }
+
+    /// Live slot ceiling for the gateway admission gate. The static
+    /// `config.slots` is the AUTO sentinel (0) most of the time — a
+    /// hardcoded fallback there would silently cap admission below an
+    /// adopted/reshaped child (live-caught 2026-09-12: `slots == 0`
+    /// mapped to a flat 4 while the reshape path can adopt up to 8).
+    /// Resolution order: adopted count (the reshaper's decision) → the
+    /// live child argv `-np` (source of truth, same parse as the
+    /// adaptive tick) → explicit config value → modest auto default.
+    pub fn slot_cap(&self, model: &str) -> i64 {
+        // Canonicalize first: the gateway may hand a replica key
+        // ("m#1") while adoption is recorded against the base model.
+        let model = model_of_key(model);
+        if let Some(v) = self.adopted_slots.get(model) {
+            return i64::from(*v);
+        }
+        let argv_cap = self.instances.iter().find_map(|e| {
+            if model_of_key(e.key()) != model {
+                return None;
+            }
+            e.value()
+                .argv
+                .windows(2)
+                .find(|w| w[0] == "-np" || w[0] == "--parallel")
+                .and_then(|w| w[1].parse::<u32>().ok())
+                .map(i64::from)
+        });
+        argv_cap
+            .or_else(|| {
+                let s = self.config.slots;
+                if s > 0 {
+                    Some(i64::from(s))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(4)
     }
 
     /// Request accounting: gateway brackets proxied calls with these.
@@ -2633,10 +3203,20 @@ impl Supervisor {
             let mut child = inst.child.lock().await;
             match child.try_status() {
                 Ok(Some(status)) => {
-                    tracing::error!(
-                        model = %inst.name,
-                        "engine crashed ({status}); next request will respawn"
-                    );
+                    // Exit 0 = the child shut itself down on purpose
+                    // (--sleep-idle-seconds idle exit, upstream clean
+                    // shutdown) — not a crash; ERROR here would cry wolf.
+                    if status.success() {
+                        tracing::info!(
+                            model = %inst.name,
+                            "engine exited cleanly ({status}) — idle sleep or upstream shutdown; next request will respawn"
+                        );
+                    } else {
+                        tracing::error!(
+                            model = %inst.name,
+                            "engine crashed ({status}); next request will respawn"
+                        );
+                    }
                     crashed.push(inst.clone());
                 }
                 Ok(None) => {}
@@ -2982,6 +3562,135 @@ mod routing_tests {
         assert_eq!(active.tag, "b_good");
     }
 
+    /// GPU supervisor with one 8188 MiB card — the 2026-09-11 crash box
+    /// shape (`NVRM NO_MEMORY` storm from a weights-only admission).
+    fn gpu_sup() -> (Supervisor, tempfile::TempDir) {
+        let bus = EventBus::default();
+        let root = tempfile::TempDir::new().unwrap();
+        let dirs = PallamaDirs {
+            config_dir: root.path().join("cfg"),
+            data_dir: root.path().join("data"),
+        };
+        std::fs::create_dir_all(&dirs.config_dir).unwrap();
+        let sup = Supervisor::new(
+            dirs,
+            Config::default(),
+            bus,
+            Hardware {
+                physical_cores: 1,
+                total_ram_mib: 16_000,
+                gpus: vec![GpuInfo {
+                    name: "g".into(),
+                    description: "S".into(),
+                    total_mib: 8_188,
+                    free_mib: 8_188,
+                }],
+            },
+            Arc::new(FakeEngine(Manifest {
+                tag: "fake".into(),
+                build_number: 1,
+                version_raw: "b1".into(),
+                devices: vec![],
+                flags: std::collections::BTreeSet::new(),
+                spec_types: vec![],
+                server_path: String::new(),
+            })),
+        );
+        (sup, root)
+    }
+
+    /// GPU-resident fabricated instance carrying a settle-measured
+    /// footprint — mirrors `fake_instance` but with real weights and a
+    /// measured card delta.
+    fn gpu_instance(key: &str, weights_bytes: i64, settled_mib: u64) -> (Arc<Instance>, u32) {
+        let proc = dummy_process();
+        let pid = proc.id().expect("fabricated child pid");
+        let endpoint = Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port: 0,
+        };
+        let inst = Instance {
+            name: key.to_string(),
+            endpoint: endpoint.clone(),
+            state: std::sync::RwLock::new(InstanceState::Ready),
+            last_used: std::sync::RwLock::new(Instant::now()),
+            in_flight: AtomicI64::new(0),
+            keep_until: std::sync::RwLock::new(None),
+            started_at: Instant::now(),
+            argv: vec![],
+            projector: false,
+            model: ModelRow {
+                name: key.to_string(),
+                repo: String::new(),
+                quant: String::new(),
+                path: String::new(),
+                bytes: weights_bytes,
+                sha256: None,
+                mmproj_path: None,
+                shards: 1,
+                arch: None,
+                params: None,
+                ctx_train: None,
+                pulled_at: 0,
+            },
+            profile_ctx: 8,
+            gpu: "full".into(),
+            device: None,
+            kv_est_bytes: None,
+            settled_mib: std::sync::atomic::AtomicU64::new(settled_mib),
+            auth: None,
+            child: tokio::sync::Mutex::new(ChildHandle::new(endpoint, proc)),
+            pid,
+        };
+        (Arc::new(inst), pid)
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__bytes_admission__measured_resident_refuses_oversubscription() {
+        // 2026-09-11 crash shape: the 9B VL model settled at 7302 MiB
+        // measured (5800 weights + context/compute/KV working set the
+        // weights sum never sees). Weights-only arithmetic admitted the
+        // 0.5B sibling (6300 <= 8188 budget) and the card died in an
+        // NVRM NO_MEMORY storm; measured-resident + floor-charged
+        // admission must refuse that exact pair.
+        let mib = |m: u64| m * 1024 * 1024;
+        let (sup, _root) = gpu_sup();
+        let big_weights = i64::try_from(mib(5800)).expect("weights fit i64");
+        let (big, _p1) = gpu_instance("big", big_weights, 7302);
+        sup.instances.insert("big".to_string(), big);
+        assert_eq!(
+            sup.resident_bytes(),
+            mib(7302),
+            "measured settle delta must win over the weights sum"
+        );
+        // CPU-placed siblings never count against the VRAM budget.
+        let (cpu_sibling, _p2) = fake_instance("cpu-model", InstanceState::Ready, 0);
+        cpu_sibling
+            .settled_mib
+            .store(9999, std::sync::atomic::Ordering::Relaxed);
+        sup.instances.insert("cpu-model".to_string(), cpu_sibling);
+        assert_eq!(
+            sup.resident_bytes(),
+            mib(7302),
+            "cpu-placed children are excluded from VRAM admission"
+        );
+        let small_floor = pallama_core::profile::admission_floor_bytes(mib(500), 0);
+        assert_eq!(
+            small_floor,
+            mib(500 + 512 + 700),
+            "floor = weights + KV floor + spawn overhead"
+        );
+        assert!(sup.bytes_admission_active());
+        assert!(
+            sup.resident_bytes().saturating_add(small_floor) > sup.vram_budget_bytes(),
+            "the pair that crashed the 8 GiB card must be refused"
+        );
+        // And the refusal is NOT the old largest-model heuristic: the
+        // weights-only sum would have admitted it (that was the bug).
+        assert!(mib(5800) + mib(500) <= sup.vram_budget_bytes());
+    }
+
     /// Fabricated map entry: real child (so teardown paths stay honest),
     /// throwaway argv/profile. Caller owns the pid for cleanup.
     fn fake_instance(key: &str, state: InstanceState, load: i64) -> (Arc<Instance>, u32) {
@@ -3000,6 +3709,7 @@ mod routing_tests {
             keep_until: std::sync::RwLock::new(None),
             started_at: Instant::now(),
             argv: vec![],
+            projector: false,
             model: ModelRow {
                 name: model_of_key(key).to_string(),
                 repo: String::new(),
@@ -3018,6 +3728,7 @@ mod routing_tests {
             gpu: "cpu".into(),
             device: None,
             kv_est_bytes: None,
+            settled_mib: std::sync::atomic::AtomicU64::new(0),
             auth: None,
             child: tokio::sync::Mutex::new(ChildHandle::new(endpoint, proc)),
             pid,
@@ -3108,6 +3819,11 @@ mod routing_tests {
         assert_eq!(model_of_key("m"), "m");
         assert_eq!(model_of_key("m#3"), "m");
         assert_eq!(model_of_key("m#3#4"), "m"); // first '#' wins
+                                                // @vision suffix (lazy projector respawn key) must never leak
+                                                // into model resolution — evict_model-style filters stay correct
+        assert_eq!(model_of_key("m@vision"), "m");
+        assert_eq!(model_of_key("m#1@vision"), "m");
+        assert_eq!(model_of_key("m@vision#1"), "m"); // '@' stripped first
     }
 
     #[tokio::test]
@@ -3117,6 +3833,9 @@ mod routing_tests {
         assert_eq!(split_replica("m#0"), Some(("m", 0)));
         assert_eq!(split_replica("m#x"), None); // non-numeric suffix
         assert_eq!(split_replica("m#"), None); // empty suffix
+                                               // vision keys keep their replica index underneath the suffix
+        assert_eq!(split_replica("m#1@vision"), Some(("m", 1)));
+        assert_eq!(split_replica("m@vision"), None); // no replica part
     }
 
     #[tokio::test]
@@ -3126,6 +3845,66 @@ mod routing_tests {
         assert_eq!(
             sup.replica_key("m", Some(PrefixKey { sys: 7, convo: 7 })),
             "m"
+        );
+    }
+
+    #[test]
+    fn unit__resolve_draft_path__untyped_typed_and_none() {
+        // R2-2/R2-3: ONE resolver for serve, router and bench. The
+        // untyped auto pair resolves the draft-simple sibling row; the
+        // typed eagle3 mode resolves the speculator row; modes that
+        // never use an external draft return None without a store hit.
+        let (_, root, _) = j2_sup(0);
+        let dirs = PallamaDirs {
+            config_dir: root.path().join("cfg2"),
+            data_dir: root.path().join("data2"),
+        };
+        let store = Store::open(&dirs).unwrap();
+        // Before any pull: family pair resolves but no row exists, and
+        // no-pair / self-drafting / off modes never hit the store.
+        assert_eq!(resolve_draft_path(&store, "qwen3-14b", "auto"), None);
+        assert_eq!(resolve_draft_path(&store, "gemma3-4b", "auto"), None);
+        assert_eq!(resolve_draft_path(&store, "qwen3-8b", "off"), None);
+        assert_eq!(resolve_draft_path(&store, "qwen3-8b", "mtp"), None);
+        assert_eq!(resolve_draft_path(&store, "qwen3-8b", "ngram"), None);
+        let row = |name: &str, path: &str| pallama_core::ModelRow {
+            name: name.into(),
+            repo: name.into(),
+            quant: "Q4_0".into(),
+            path: path.into(),
+            bytes: 1,
+            sha256: None,
+            mmproj_path: None,
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+        };
+        store
+            .upsert_model(&row("qwen3-0.6b", "/models/qwen3-0.6b-q4_0.gguf"))
+            .unwrap();
+        store
+            .upsert_model(&row(
+                "qwen3-8b-eagle3-speculator",
+                "/models/qwen3-8b-eagle3-f16.gguf",
+            ))
+            .unwrap();
+
+        // auto: generic draft-simple pair (catalog precedence).
+        assert_eq!(
+            resolve_draft_path(&store, "qwen3-8b", "auto").as_deref(),
+            Some("/models/qwen3-0.6b-q4_0.gguf")
+        );
+        // eagle3: the TYPED speculator head, not the generic sibling.
+        assert_eq!(
+            resolve_draft_path(&store, "qwen3-8b", "eagle3").as_deref(),
+            Some("/models/qwen3-8b-eagle3-f16.gguf")
+        );
+        // Pulled rows reach every family member via the shared prefix.
+        assert_eq!(
+            resolve_draft_path(&store, "qwen3-14b", "auto").as_deref(),
+            Some("/models/qwen3-0.6b-q4_0.gguf")
         );
     }
 
@@ -3279,6 +4058,174 @@ mod routing_tests {
         }
         assert!(sup.adopted_slots.is_empty());
         kill_all(&[ph]);
+    }
+
+    /// [`slot_cap`] resolution order: adopted > live argv `-np` > explicit
+    /// config > modest auto default. A stale hardcoded auto cap would
+    /// silently defeat an adopted reshape (live-caught 2026-09-12).
+    #[tokio::test]
+    async fn unit__slot_cap__adopted_argv_config_default_resolution() {
+        let sup = routing_sup(1);
+        // No instance, config slots=0 (auto): modest default.
+        assert_eq!(sup.slot_cap("m"), 4);
+        // Live child argv is the source of truth once spawned.
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 0);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "4".into()];
+        sup.instances.insert("m".to_string(), inst);
+        assert_eq!(sup.slot_cap("m"), 4);
+        // Adoption wins over the argv shape (the respawn carries it).
+        sup.adopted_slots.insert("m".to_string(), 6);
+        assert_eq!(sup.slot_cap("m"), 6);
+        // Replica keys of the same model resolve identically.
+        assert_eq!(sup.slot_cap("m#1"), 6);
+        kill_all(&[ph]);
+    }
+
+    /// Decay rule: an adopted shape (np6 over a natural np4) survives
+    /// 29 fully-quiet ticks untouched, then the 30th removes the
+    /// adoption and queues the reshape back to the natural shape.
+    /// Saturation mid-window resets the decay count.
+    #[tokio::test]
+    async fn unit__adaptive_slots__quiet_decay_restores_natural_shape() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        sup.adopted_slots.insert("m".to_string(), 6);
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 0);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "4".into()];
+        sup.instances.insert("m".to_string(), inst);
+        for _ in 0..(SLOTS_DECAY_TICKS - 1) {
+            sup.adaptive_slots_tick();
+        }
+        assert!(sup.adopted_slots.get("m").is_some());
+        assert!(sup.reshape_queue.get("m").is_none());
+        // One more quiet tick crosses the threshold.
+        sup.adaptive_slots_tick();
+        assert!(sup.adopted_slots.get("m").is_none());
+        assert!(sup.reshape_queue.get("m").is_some());
+        // Mid-window saturation resets the count: re-adopt, then verify
+        // a short quiet stretch does NOT decay again.
+        sup.reshape_queue.remove("m");
+        sup.adopted_slots.insert("m".to_string(), 6);
+        sup.note_slot_pressure("m");
+        sup.adaptive_slots_tick();
+        sup.slot_pressure.remove("m");
+        for _ in 0..10 {
+            sup.adaptive_slots_tick();
+        }
+        assert!(sup.adopted_slots.get("m").is_some());
+        kill_all(&[ph]);
+    }
+
+    /// 2026-09-12 live-proven: admission caps engine in-flight at the
+    /// slot count, so queue-wait pressure (gateway `AllSlotsBusy` reports)
+    /// is the reachable saturation signal. The pressure is a GAUGE: two
+    /// parked requests stay visible on every tick (no per-tick drain),
+    /// six saturated ticks adopt even though `in-flight` never exceeds
+    /// the shape, and releasing the gauge resets the streak.
+    #[tokio::test]
+    async fn unit__adaptive_slots__admission_pressure_adopts_without_inflight_excess() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        sup.config.slots = 0;
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 4);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "4".into()];
+        sup.instances.insert("m".into(), inst);
+        // two requests enter the admission queue and STAY parked
+        sup.note_slot_pressure("m");
+        sup.note_slot_pressure("m");
+        for _ in 0..SLOTS_STREAK_TICKS {
+            sup.adaptive_slots_tick();
+        }
+        assert_eq!(sup.adopted_slots.get("m").map(|v| *v), Some(5));
+        assert_eq!(
+            sup.reshape_queue.get("m").map(|v| v.value().clone()),
+            Some("m".to_string())
+        );
+        // gauge release: the queued demand leaving must clear the signal
+        sup.note_slot_pressure_release("m");
+        sup.note_slot_pressure_release("m");
+        assert!(sup.slot_pressure.get("m").is_none());
+        kill_all(&[ph]);
+    }
+
+    /// 2026-09-12 generalization: capacity-shaped auto spawns (child
+    /// argv carries `-np 4`, config slots = 0) must earn bumps too —
+    /// the old `effective == 1` guard left the default shape inert.
+    /// Saturation at in-flight 5 > 4 slots adopts 5 and queues the
+    /// reshape respawn.
+    #[tokio::test]
+    async fn unit__adaptive_slots__auto_shape_saturation_adopts_and_queues() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        sup.config.slots = 0; // auto: the argv is the source of truth
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 5);
+        Arc::get_mut(&mut inst).expect("sole owner").argv = vec![
+            "llama-server".into(),
+            "-np".into(),
+            "4".into(),
+            "--ctx-size".into(),
+            "65536".into(),
+        ];
+        sup.instances.insert("m".into(), inst);
+        for _ in 0..SLOTS_STREAK_TICKS {
+            sup.adaptive_slots_tick();
+        }
+        assert_eq!(sup.adopted_slots.get("m").map(|v| *v), Some(5));
+        assert_eq!(
+            sup.reshape_queue.get("m").map(|v| v.value().clone()),
+            Some("m".to_string())
+        );
+        kill_all(&[ph]);
+    }
+
+    /// At the adoption cap the saturation streak must not re-adopt
+    /// (to <= from skips) — no event spam, no queue churn.
+    #[tokio::test]
+    async fn unit__adaptive_slots__at_cap_does_not_adopt() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        sup.config.slots = 0;
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 9);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "8".into()];
+        sup.instances.insert("m".into(), inst);
+        for _ in 0..(SLOTS_STREAK_TICKS * 2) {
+            sup.adaptive_slots_tick();
+        }
+        assert!(sup.adopted_slots.get("m").is_none());
+        assert!(sup.reshape_queue.is_empty());
+        kill_all(&[ph]);
+    }
+
+    /// `deterministic = true` models are excluded: their spawns pin
+    /// slots = 1 by design and adoption would fight the pin every tick.
+    #[tokio::test]
+    async fn unit__adaptive_slots__deterministic_excluded() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        sup.config.deterministic = true;
+        let (inst, ph) = fake_instance("m", InstanceState::Ready, 4);
+        sup.instances.insert("m".into(), inst);
+        for _ in 0..(SLOTS_STREAK_TICKS * 2) {
+            sup.adaptive_slots_tick();
+        }
+        assert!(sup.adopted_slots.is_empty());
+        kill_all(&[ph]);
+    }
+
+    /// Rollback: a spawn failure after an adoption drops the bump (the
+    /// capacity answer) instead of crash-looping the adopted shape.
+    #[tokio::test]
+    async fn unit__adaptive_slots__spawn_failure_rolls_back_adoption() {
+        let sup = routing_sup(1);
+        sup.adopted_slots.insert("m".into(), 6);
+        sup.reshape_queue.insert("m".into(), "m".into());
+        sup.note_engine_failure("m");
+        assert!(sup.adopted_slots.get("m").is_none());
+        assert!(sup.reshape_queue.get("m").is_none());
     }
 
     /// The 2026-09-08 runtime-freeze pin: `reap_dead_children` must not
@@ -3608,6 +4555,34 @@ mod routing_tests {
         assert_eq!(card, "dg");
         assert_eq!(taken, 5_000, "free delta = what the spawn took");
         assert_eq!(used_pct, (8_188 - 1_000) * 100 / 8_188);
+    }
+
+    #[test]
+    fn unit__census_cache__ttl_hit_miss_and_freshness_window() {
+        // The cache exists so a cold-start burst pays the ~0.25 s census
+        // subprocess once, not per step; TTL expiry re-measures, and an
+        // empty (invalidated) cache is always a miss.
+        use std::sync::Mutex;
+        let hw = hw_of(vec![gpu("dg", "NVIDIA GeForce RTX 4070", 8_188, 6_000)]);
+        let ttl = Duration::from_secs(10);
+        let cache: Mutex<Option<(Instant, Hardware)>> = Mutex::new(None);
+        assert!(
+            Supervisor::census_from_cache(&cache, ttl).is_none(),
+            "empty cache = miss"
+        );
+        *cache.lock().unwrap() = Some((Instant::now(), hw.clone()));
+        assert!(
+            Supervisor::census_from_cache(&cache, ttl).is_some(),
+            "fresh entry = hit"
+        );
+        *cache.lock().unwrap() = Some((
+            Instant::now().checked_sub(Duration::from_secs(11)).unwrap(),
+            hw,
+        ));
+        assert!(
+            Supervisor::census_from_cache(&cache, ttl).is_none(),
+            "expired entry = miss"
+        );
     }
 
     #[test]

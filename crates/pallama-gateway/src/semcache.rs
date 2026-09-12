@@ -319,6 +319,7 @@ pub async fn embed_prompt(
         embed_model,
         crate::queue::Priority::Normal,
         None,
+        false, // semantic-cache embeds are text-only
     )
     .await
     .map_err(|e| format!("embed model admission failed: {e:?}"))?;

@@ -10,7 +10,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::config::{Config, ModelOverride};
+use crate::config::{Config, MmprojPolicy, ModelOverride};
 use crate::gguf::GgufMeta;
 use crate::hardware::GpuInfo;
 use crate::hardware::Hardware;
@@ -46,6 +46,12 @@ pub struct ProfileInput<'a> {
     /// Emitted as `-mm` when the engine supports it; the store's
     /// `mmproj_path` feeds this (rule 19).
     pub mmproj_path: Option<&'a str>,
+    /// Caller-mandated projector attach that overrides the mmproj policy
+    /// (Attach/Skip/Lazy). Set by `ensure_vision`'s `@vision` respawn so
+    /// a Lazy-spawned text-only instance comes back WITH the projector,
+    /// and by the router preset (router serves every model incl VL).
+    /// `extra_args -mm` still wins over this (explicit user argv).
+    pub mmproj_force: bool,
     pub engine_tag: &'a str,
     /// Capability manifest flag set of the ACTIVE engine.
     pub supported_flags: &'a BTreeSet<String>,
@@ -159,6 +165,20 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     let overlay = input.overlay;
     let config = input.config;
 
+    // Draft-row freshness (mirrors the 11y mcp-config existence check):
+    // a stale store row — file deleted or moved after the pull — fails
+    // HERE with a re-pull instruction instead of five seconds into a
+    // child boot with an opaque engine error.
+    if let Some(draft) = input.draft_path {
+        if !std::path::Path::new(draft).is_file() {
+            return Err(format!(
+                "draft model file for {} is missing at {draft} — the store row is \
+                 stale; pull the draft model again to refresh it",
+                input.model_name
+            ));
+        }
+    }
+
     // --- 1. model + endpoint + alias
     argv.push("-m".into());
     argv.push(input.model_path.to_string());
@@ -187,7 +207,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // estimate) must see the scaled total. Each slot keeps `base_ctx` —
     // Profile.ctx reports the per-slot value so prompt preflight bounds a
     // single request correctly.
-    let vram_bytes = Hardware::bytes(input.hardware.total_vram_mib());
+    let vram_bytes = capacity_bytes(input.hardware);
     // default_ctx is a CEILING auto-fit may divide; tuning (bench) and
     // overlay ctx are hard pins — never divided.
     let ctx_pinned = tuning.ctx.is_some() || overlay.ctx.is_some();
@@ -505,8 +525,8 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             } else {
                 warnings.push(format!(
                     "spec auto: GGUF carries an MTP head but engine {} lacks \
-                     draft-mtp — using the draft-pair path instead; run: \
-                     pallama engine update",
+                     draft-mtp — falling back to the catalog draft-pair path (if \
+                     one exists); run: pallama engine update",
                     input.engine_tag
                 ));
                 false
@@ -515,7 +535,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             false
         };
         if !embedded_mtp {
-            push_spec_args(input, &mut argv, &mut warnings)?;
+            push_spec_args(input, &mut argv, &mut warnings);
         }
     } else if is_ngram_spec(spec_mode) {
         // Self-drafting n-gram speculation: no draft model to pull; drafts
@@ -555,6 +575,16 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         }
         argv.push("--spec-type".into());
         argv.push("draft-mtp".into());
+        // Same cap as the auto lane: draft steps are bounded by the
+        // trained head count, and the upstream n-max default (3) makes a
+        // 1-2 layer head pay pure verification overhead.
+        if let Some(n_layers) = input.gguf.mtp_layers {
+            let n_max = n_layers.min(2);
+            if input.supported_flags.contains("--spec-draft-n-max") {
+                argv.push("--spec-draft-n-max".into());
+                argv.push(n_max.to_string());
+            }
+        }
     } else if let Some(spec_val) = match spec_mode {
         "eagle3" => Some("draft-eagle3"),
         "dflash" => Some("draft-dflash"),
@@ -608,8 +638,14 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // stealing from the target.
     if matches!(spec_mode, "auto" | "eagle3" | "dflash" | "dspark") && input.draft_path.is_some() {
         if !config.spec_draft_device.is_empty() {
-            argv.push("--spec-draft-device".into());
-            argv.push(config.spec_draft_device.clone());
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "spec_draft_device",
+                "--spec-draft-device",
+                std::slice::from_ref(&config.spec_draft_device),
+            );
         } else if let Some(spare) = input.sibling_devices.first() {
             // Teaching, never silent placement: offloading a draft is a
             // measurable win only on some models — name the spare card
@@ -620,85 +656,207 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             ));
         }
         if config.spec_draft_cpu_strict {
-            argv.push("--spec-draft-cpu-strict".into());
-            argv.push("1".into());
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "spec_draft_cpu_strict",
+                "--spec-draft-cpu-strict",
+                &["1".to_string()],
+            );
         }
         if !config.spec_draft_cpu_range.is_empty() {
-            argv.push("--spec-draft-cpu-range".into());
-            argv.push(config.spec_draft_cpu_range.clone());
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "spec_draft_cpu_range",
+                "--spec-draft-cpu-range",
+                std::slice::from_ref(&config.spec_draft_cpu_range),
+            );
         }
         if !config.spec_draft_ngl.is_empty() {
-            argv.push("--spec-draft-ngl".into());
-            argv.push(config.spec_draft_ngl.clone());
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "spec_draft_ngl",
+                "--spec-draft-ngl",
+                std::slice::from_ref(&config.spec_draft_ngl),
+            );
         }
         if config.spec_draft_threads > 0 {
-            argv.push("--spec-draft-threads".into());
-            argv.push(config.spec_draft_threads.to_string());
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "spec_draft_threads",
+                "--spec-draft-threads",
+                &[config.spec_draft_threads.to_string()],
+            );
         }
         if let Some(p) = config.spec_draft_p_min {
-            argv.push("--spec-draft-p-min".into());
-            argv.push(format_trimmed(p));
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "spec_draft_p_min",
+                "--spec-draft-p-min",
+                &[format_trimmed(p)],
+            );
         }
         if let Some(p) = config.spec_draft_p_split {
-            argv.push("--spec-draft-p-split".into());
-            argv.push(format_trimmed(p));
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "spec_draft_p_split",
+                "--spec-draft-p-split",
+                &[format_trimmed(p)],
+            );
         }
         if config.spec_draft_poll.is_some() || config.spec_draft_poll_batch.is_some() {
             // Poll level governs both phases unless batch is explicit.
             if let Some(p) = config.spec_draft_poll {
-                argv.push("--spec-draft-poll".into());
-                argv.push(p.to_string());
+                push_gated(
+                    input,
+                    &mut argv,
+                    &mut warnings,
+                    "spec_draft_poll",
+                    "--spec-draft-poll",
+                    &[p.to_string()],
+                );
             }
             if let Some(pb) = config.spec_draft_poll_batch {
-                argv.push("--spec-draft-poll-batch".into());
-                argv.push(if pb { "1".into() } else { "0".into() });
+                push_gated(
+                    input,
+                    &mut argv,
+                    &mut warnings,
+                    "spec_draft_poll_batch",
+                    "--spec-draft-poll-batch",
+                    &[if pb { "1" } else { "0" }.to_string()],
+                );
             }
         }
         if config.spec_draft_prio != 0 {
-            argv.push("--spec-draft-prio".into());
-            argv.push(config.spec_draft_prio.to_string());
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "spec_draft_prio",
+                "--spec-draft-prio",
+                &[config.spec_draft_prio.to_string()],
+            );
         }
         if config.spec_draft_prio_batch != 0 {
-            argv.push("--spec-draft-prio-batch".into());
-            argv.push(config.spec_draft_prio_batch.to_string());
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "spec_draft_prio_batch",
+                "--spec-draft-prio-batch",
+                &[config.spec_draft_prio_batch.to_string()],
+            );
         }
         if config.spec_draft_cpu_strict_batch {
-            argv.push("--spec-draft-cpu-strict-batch".into());
-            argv.push("1".into());
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "spec_draft_cpu_strict_batch",
+                "--spec-draft-cpu-strict-batch",
+                &["1".to_string()],
+            );
         }
         if config.spec_draft_threads_batch > 0 {
-            argv.push("--spec-draft-threads-batch".into());
-            argv.push(config.spec_draft_threads_batch.to_string());
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "spec_draft_threads_batch",
+                "--spec-draft-threads-batch",
+                &[config.spec_draft_threads_batch.to_string()],
+            );
         }
         if !config.spec_draft_type_k.is_empty() {
-            argv.push("--spec-draft-type-k".into());
-            argv.push(config.spec_draft_type_k.clone());
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "spec_draft_type_k",
+                "--spec-draft-type-k",
+                std::slice::from_ref(&config.spec_draft_type_k),
+            );
         }
         if !config.spec_draft_type_v.is_empty() {
-            argv.push("--spec-draft-type-v".into());
-            argv.push(config.spec_draft_type_v.clone());
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "spec_draft_type_v",
+                "--spec-draft-type-v",
+                std::slice::from_ref(&config.spec_draft_type_v),
+            );
         }
         for ot in &config.spec_draft_override_tensor {
-            argv.push("--spec-draft-override-tensor".into());
-            argv.push(ot.clone());
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "spec_draft_override_tensor",
+                "--spec-draft-override-tensor",
+                std::slice::from_ref(ot),
+            );
         }
         if config.spec_draft_n_cpu_moe > 0 {
-            argv.push("--spec-draft-n-cpu-moe".into());
-            argv.push(config.spec_draft_n_cpu_moe.to_string());
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "spec_draft_n_cpu_moe",
+                "--spec-draft-n-cpu-moe",
+                &[config.spec_draft_n_cpu_moe.to_string()],
+            );
         }
         if config.spec_draft_cpu_moe {
-            argv.push("--spec-draft-cpu-moe".into());
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "spec_draft_cpu_moe",
+                "--spec-draft-cpu-moe",
+                &[],
+            );
         }
         if !config.spec_draft_backend_sampling {
-            argv.push("--no-spec-draft-backend-sampling".into());
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "spec_draft_backend_sampling = false",
+                "--no-spec-draft-backend-sampling",
+                &[],
+            );
         }
         if config.adaptive_decay > 0 {
-            argv.push("--adaptive-decay".into());
-            argv.push(config.adaptive_decay.to_string());
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "adaptive_decay",
+                "--adaptive-decay",
+                &[config.adaptive_decay.to_string()],
+            );
         }
         if config.adaptive_target > 0.0 {
-            argv.push("--adaptive-target".into());
-            argv.push(format_trimmed(config.adaptive_target));
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "adaptive_target",
+                "--adaptive-target",
+                &[format_trimmed(config.adaptive_target)],
+            );
         }
     }
 
@@ -904,22 +1062,43 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         }
     }
 
-    // --- 13. latency/affinity passthrough (config-validated, manifest-gated)
-    // Semantics verified against upstream arg.cpp b10816: --cpu-range pins
-    // child threads to a "lo-hi" CPU set (P/E hybrid boxes: pin to P-cores);
-    // --poll 1..100 busy-polls waiting for work (CPU for TTFT);
-    // --reasoning-format selects thought-tag extraction in responses.
+    // --- 13. latency/affinity/reasoning/vision passthrough
+    // (config-validated; every flag below is manifest-gated with a
+    // teaching warn-skip — an older engine serves with its defaults
+    // instead of failing to boot). Semantics verified against upstream
+    // arg.cpp b10816: --cpu-range pins child threads to a "lo-hi" CPU
+    // set (P/E hybrid boxes: pin to P-cores); --poll 1..100 busy-polls
+    // waiting for work (CPU for TTFT); --reasoning-format selects
+    // thought-tag extraction in responses.
     if !config.cpu_range.is_empty() {
-        argv.push("--cpu-range".into());
-        argv.push(config.cpu_range.clone());
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "cpu_range",
+            "--cpu-range",
+            std::slice::from_ref(&config.cpu_range),
+        );
     }
     if config.poll > 0 {
-        argv.push("--poll".into());
-        argv.push(config.poll.to_string());
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "poll",
+            "--poll",
+            &[config.poll.to_string()],
+        );
     }
     if !config.reasoning_format.is_empty() {
-        argv.push("--reasoning-format".into());
-        argv.push(config.reasoning_format.clone());
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "reasoning_format",
+            "--reasoning-format",
+            std::slice::from_ref(&config.reasoning_format),
+        );
     }
 
     // --- 13b. reasoning control (server-side thinking budget/effort).
@@ -931,12 +1110,24 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             .reasoning_budget
             .unwrap_or_else(|| config.effective_reasoning_budget(input.model_name));
         if budget != -1 {
-            argv.push("--reasoning-budget".into());
-            argv.push(budget.to_string());
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "reasoning_budget",
+                "--reasoning-budget",
+                &[budget.to_string()],
+            );
         }
         if !config.reasoning_budget_message.is_empty() {
-            argv.push("--reasoning-budget-message".into());
-            argv.push(config.reasoning_budget_message.clone());
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "reasoning_budget_message",
+                "--reasoning-budget-message",
+                std::slice::from_ref(&config.reasoning_budget_message),
+            );
         }
         let effort = overlay
             .reasoning_effort
@@ -944,58 +1135,140 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             .filter(|e| !e.is_empty())
             .unwrap_or_else(|| config.effective_reasoning_effort(input.model_name));
         if !effort.is_empty() {
-            argv.push("--reasoning-effort".into());
-            argv.push(effort.to_string());
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "reasoning_effort",
+                "--reasoning-effort",
+                &[effort.to_string()],
+            );
         }
         if let Some(preserve) = config.reasoning_preserve {
-            argv.push(if preserve {
-                "--reasoning-preserve".into()
+            if preserve {
+                push_gated(
+                    input,
+                    &mut argv,
+                    &mut warnings,
+                    "reasoning_preserve",
+                    "--reasoning-preserve",
+                    &[],
+                );
             } else {
-                "--no-reasoning-preserve".into()
-            });
+                push_gated(
+                    input,
+                    &mut argv,
+                    &mut warnings,
+                    "reasoning_preserve",
+                    "--no-reasoning-preserve",
+                    &[],
+                );
+            }
         }
     }
 
     // --- 13c. scheduling extras (server-level).
     if config.cpu_strict {
-        argv.push("--cpu-strict".into());
-        argv.push("1".into());
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "cpu_strict",
+            "--cpu-strict",
+            &["1".to_string()],
+        );
     }
     if config.prio != 0 {
-        argv.push("--prio".into());
-        argv.push(config.prio.to_string());
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "prio",
+            "--prio",
+            &[config.prio.to_string()],
+        );
     }
     if config.prio_batch != 0 {
-        argv.push("--prio-batch".into());
-        argv.push(config.prio_batch.to_string());
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "prio_batch",
+            "--prio-batch",
+            &[config.prio_batch.to_string()],
+        );
     }
     if let Some(pb) = config.poll_batch {
-        argv.push("--poll-batch".into());
-        argv.push(if pb { "1".into() } else { "0".into() });
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "poll_batch",
+            "--poll-batch",
+            &[if pb { "1" } else { "0" }.to_string()],
+        );
     }
     if config.threads_http > 0 {
-        argv.push("--threads-http".into());
-        argv.push(config.threads_http.to_string());
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "threads_http",
+            "--threads-http",
+            &[config.threads_http.to_string()],
+        );
     }
 
     // --- 12c. vision / multimodal tuning + embeddings normalization.
     if config.image_max_tokens > 0 {
-        argv.push("--image-max-tokens".into());
-        argv.push(config.image_max_tokens.to_string());
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "image_max_tokens",
+            "--image-max-tokens",
+            &[config.image_max_tokens.to_string()],
+        );
     }
     if config.image_min_tokens > 0 {
-        argv.push("--image-min-tokens".into());
-        argv.push(config.image_min_tokens.to_string());
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "image_min_tokens",
+            "--image-min-tokens",
+            &[config.image_min_tokens.to_string()],
+        );
     }
     if config.mtmd_batch_max_tokens > 0 {
-        argv.push("--mtmd-batch-max-tokens".into());
-        argv.push(config.mtmd_batch_max_tokens.to_string());
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mtmd_batch_max_tokens",
+            "--mtmd-batch-max-tokens",
+            &[config.mtmd_batch_max_tokens.to_string()],
+        );
     }
     if !config.mmproj_offload {
-        argv.push("--no-mmproj-offload".into());
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mmproj_offload = false",
+            "--no-mmproj-offload",
+            &[],
+        );
     }
     if !config.mmproj_auto {
-        argv.push("--no-mmproj-auto".into());
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mmproj_auto = false",
+            "--no-mmproj-auto",
+            &[],
+        );
     }
     if !config.mmproj_device.is_empty() {
         argv.push("--mmproj-device".into());
@@ -1019,10 +1292,58 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // --- 19. multimodal projector: the pulled mmproj wires vision/
     // audio-in into the engine. Explicit `extra_args` -mm wins; a pulled
     // projector on an engine without the flag warns (model still loads,
-    // vision off) — never silently, never fatally.
-    if let Some(mmproj) = overlay.extra_args.as_deref().and_then(find_mmproj_arg) {
+    // vision off) — never silently, never fatally. Policy resolution
+    // (`attach` | `skip` | `lazy`, default `lazy`): `skip` spawns
+    // TEXT-ONLY with vision failing loudly per request; `lazy` also
+    // spawns text-only but the gateway respawns WITH the projector on
+    // the first vision request (KV bank carries the conversation) —
+    // everyone gets the measured cold win (875 MiB projector ≈ +3.9 s
+    // cold TTFT + 1126 MiB VRAM on the 9B VL row) without losing
+    // vision. The supervisor reads the same policy via
+    // `mmproj_policy_effective` to know a spawn is projector-less.
+    let explicit_mm = overlay
+        .extra_args
+        .as_deref()
+        .and_then(find_mmproj_arg)
+        .map(str::to_string)
+        .or_else(|| {
+            config
+                .overlay_for(input.model_name)
+                .extra_args
+                .as_deref()
+                .and_then(find_mmproj_arg)
+                .map(str::to_string)
+        });
+    let mm_policy = mmproj_policy_effective(config, input.model_name, overlay);
+    if let Some(mmproj) = explicit_mm {
         argv.push("-mm".into());
-        argv.push(mmproj.to_string());
+        argv.push(mmproj);
+    } else if input.mmproj_force {
+        // caller-mandated attach (@vision respawn, router preset): policy
+        // machinery stays out of the way — the caller already decided
+        if let Some(mmproj) = input.mmproj_path {
+            argv.push("-mm".into());
+            argv.push(mmproj.to_string());
+        }
+    } else if mm_policy == crate::config::MmprojPolicy::Skip {
+        if let Some(mmproj) = input.mmproj_path {
+            warnings.push(format!(
+                "mmproj suppressed: model_overrides.{}.mmproj = skip — \
+                 text-only spawn, projector {} skipped (cold boot saves the \
+                 projector read; multimodal requests will fail loudly)",
+                input.model_name, mmproj
+            ));
+        }
+    } else if mm_policy == crate::config::MmprojPolicy::Lazy {
+        if let Some(mmproj) = input.mmproj_path {
+            warnings.push(format!(
+                "mmproj lazy: {} spawns text-only (projector {} held back — \
+                 faster cold start, less VRAM); the first vision request \
+                 triggers a projector respawn that carries the conversation \
+                 via the KV bank",
+                input.model_name, mmproj
+            ));
+        }
     } else if let Some(mmproj) = input.mmproj_path {
         if input.supported_flags.contains("--mmproj") || input.supported_flags.contains("-mm") {
             argv.push("-mm".into());
@@ -1122,6 +1443,11 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     if cpu_moe_n > 0 {
         argv.push("--n-cpu-moe".into());
         argv.push(cpu_moe_n.to_string());
+    }
+    let cpu_ffn_n = config.effective_cpu_ffn_n(input.model_name);
+    if cpu_ffn_n > 0 {
+        argv.push("--n-cpu-ffn".into());
+        argv.push(cpu_ffn_n.to_string());
     }
 
     // --- 18. per-tensor device overrides (expert patterns to CPU etc.)
@@ -1403,6 +1729,23 @@ pub const KV_UNIFIED_VRAM_FLOOR_BYTES: u64 = 512 * 1024 * 1024;
 /// margin for bigger compute buffers (long ctx, mmproj bursts).
 const UNIFIED_SPAWN_OVERHEAD_BYTES: u64 = 700 * 1024 * 1024;
 
+/// Measured-floor admission charge for a candidate spawn: weights +
+/// projector + the unified KV working-set floor + the fixed spawn
+/// overhead — the same standing charges the unified gpu-layers pin
+/// trusts, exposed so the supervisor's bytes admission charges incoming
+/// models identically (one decision source). Weights-only admission
+/// oversubscribed an 8 GiB card on 2026-09-11: a 9B VL model settled at
+/// 7302 MiB measured (5417 weights + 875 mmproj) and the 0.5B sibling
+/// (~977 MiB actual, 437 weights) joined it into an `NVRM NO_MEMORY`
+/// storm that SIGABRT-looped every reload at the clip loader.
+#[must_use]
+pub fn admission_floor_bytes(model_bytes: u64, mmproj_bytes: u64) -> u64 {
+    model_bytes
+        .saturating_add(mmproj_bytes)
+        .saturating_add(KV_UNIFIED_VRAM_FLOOR_BYTES)
+        .saturating_add(UNIFIED_SPAWN_OVERHEAD_BYTES)
+}
+
 /// VRAM that ctx-scaled compute buffers cost per token of TOTAL ctx on
 /// vulkan-class builds (mixed integrated+discrete census) when a
 /// projector is attached — the one combination whose allocation footprint
@@ -1515,7 +1858,7 @@ fn compile_mistralrs(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Prof
             // ("Num GPU blocks is 0", live-proven with a 9B vision model
             // on an 8 GiB card). Classic ctx-sized KV serves there.
             if input.supported_flags.contains("--paged-attn") {
-                let vram_bytes = Hardware::bytes(input.hardware.total_vram_mib());
+                let vram_bytes = capacity_bytes(input.hardware);
                 let mmproj = input
                     .mmproj_path
                     .and_then(|p| std::fs::metadata(p).ok())
@@ -1800,8 +2143,9 @@ fn resolve_slots(
         if let Some((np, per_slot)) = best {
             warnings.push(format!(
                 "slots auto-fit: default ctx {base_ctx} fits only 1 concurrent slot — \
-                 re-spent the same capacity as -np {np} x {per_slot} ctx (total {}, identical \
-                 VRAM/KV budget; prompts longer than {per_slot} tokens trigger the num_ctx \
+                 re-spent the same capacity budget as -np {np} x {per_slot} ctx (total {}, \
+                 within the capacity guards — floor-rounding may grant a little extra \
+                 headroom; prompts longer than {per_slot} tokens trigger the num_ctx \
                  restart-once path at a wider ctx); pin ctx or slots to disable",
                 np * per_slot
             ));
@@ -1939,6 +2283,26 @@ fn auto_slots_capacity(input: &ProfileInput<'_>, base_ctx: u32, vram_bytes: u64)
 ///   warning (engine splits layers across CPU+GPU; tok/s drops)
 /// - everything else (tight fits) -> "auto" / "auto": the engine's
 ///   fine-grained estimate beats ours and a wrong pin OOMs the load
+///
+/// Spawn-time capacity for every VRAM-budgeted profile rule: FREE VRAM
+/// when the probe reports any, else the card total. Sizing against totals
+/// pins `-ngl 999` on boxes whose VRAM a neighbour already consumed at
+/// spawn time — the engine's `--fit` refuses to shrink an EXPLICIT ngl
+/// ("already set by user, abort", live-proven) and the load OOMs instead
+/// of degrading to the `auto` band. Free-based math keeps the offload
+/// pin, KV ladder, and slot capacity honest under contention; idle boxes
+/// report free ≈ total so nothing changes there. Zero/absent probe
+/// readings fail open to the total (a stale number beats refusing to
+/// spawn).
+fn capacity_bytes(hw: &Hardware) -> u64 {
+    let free_mib = hw.free_vram_mib();
+    if free_mib > 0 {
+        Hardware::bytes(free_mib)
+    } else {
+        Hardware::bytes(hw.total_vram_mib())
+    }
+}
+
 fn resolve_gpu_offload(
     input: &ProfileInput<'_>,
     ctx: u32,
@@ -2037,31 +2401,117 @@ fn is_ngram_spec(mode: &str) -> bool {
     )
 }
 
-/// Rule 11: spec=auto draft pairing. Hard error when the catalog pair
-/// exists but the draft is not pulled.
-fn push_spec_args(
+/// Manifest-gated passthrough for config knobs: emit `flag` + `values`
+/// only when the active engine advertises the flag; otherwise degrade
+/// to a teaching warning (an older engine still serves with its own
+/// defaults) instead of dying on an unknown flag at child boot.
+fn push_gated(
     input: &ProfileInput<'_>,
     argv: &mut Vec<String>,
     warnings: &mut Vec<String>,
-) -> Result<(), String> {
+    key: &str,
+    flag: &str,
+    values: &[String],
+) {
+    if !input.supported_flags.contains(flag) {
+        warnings.push(format!(
+            "{key} skipped: engine {} lacks {flag}; run: pallama engine update",
+            input.engine_tag
+        ));
+        return;
+    }
+    argv.push(flag.to_string());
+    argv.extend(values.iter().cloned());
+}
+
+/// Rule 11: spec=auto draft pairing, opportunistic by design — an
+/// unpulled or unsupported pair degrades to dense with a teaching
+/// warning; manifest-gated emission when the draft is live.
+fn push_spec_args(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings: &mut Vec<String>) {
     match crate::catalog::spec_pair_for(input.model_name) {
         Some(pair) => {
             if let Some(draft) = input.draft_path {
+                // Self-draft guard: the draft row's registry name can
+                // prefix-collide with its own main model (qwen3.5-9b-mtp
+                // matches the qwen3.5-9b pair) — drafting from the main
+                // weights would loop the same file through both roles.
+                if draft == input.model_path {
+                    warnings.push(format!(
+                        "spec=auto: catalog draft for {} resolved to the main model \
+                         file itself; running dense",
+                        input.model_name
+                    ));
+                    return;
+                }
+                if !input.supported_flags.contains("--spec-type")
+                    || !input
+                        .spec_types
+                        .iter()
+                        .any(|t| t == pair.spec_type.as_str())
+                {
+                    // Old engine + resolved pair: degrade to dense with a
+                    // teaching warning, never a fatal child boot.
+                    warnings.push(format!(
+                        "spec=auto: catalog draft pair ({}) for {} is pulled but \
+                         engine {} lacks it; running dense — run: pallama engine update",
+                        pair.spec_type, input.model_name, input.engine_tag
+                    ));
+                    return;
+                }
+                // Capacity gate: the draft rides the SAME card as the main
+                // model, and the pre-spawn census's free MiB predates the
+                // main load — so the draft must fit alongside model + KV
+                // floor + spawn overhead. Without this an 8 GiB card
+                // (main 5.4 GiB + MTP draft 5.9 GiB) boot-OOMs instead of
+                // serving dense (live-measured: draft-on-CPU is 2x slower,
+                // so a partial-fit spawn is never the fallback).
+                let draft_bytes = std::fs::metadata(draft).map_or(0, |m| m.len());
+                let card_free_bytes: u64 = input
+                    .hardware
+                    .gpus
+                    .iter()
+                    .map(|g| g.free_mib.saturating_mul(1024 * 1024))
+                    .sum();
+                let needed = input
+                    .model_bytes
+                    .saturating_add(draft_bytes)
+                    .saturating_add(KV_UNIFIED_VRAM_FLOOR_BYTES)
+                    .saturating_add(UNIFIED_SPAWN_OVERHEAD_BYTES);
+                if draft_bytes == 0 || needed > card_free_bytes {
+                    warnings.push(format!(
+                        "spec=auto: draft {} ({} MiB) does not fit the picked card \
+                         alongside {} (model {} MiB + KV floor + spawn overhead vs \
+                         {} MiB free); running dense — speculation engages \
+                         automatically on a card that fits both",
+                        pair.spec_type,
+                        draft_bytes / (1024 * 1024),
+                        input.model_name,
+                        input.model_bytes / (1024 * 1024),
+                        card_free_bytes / (1024 * 1024)
+                    ));
+                    return;
+                }
                 argv.push("--spec-type".into());
                 argv.push(pair.spec_type.clone());
                 argv.push("--spec-draft-model".into());
                 argv.push(draft.to_string());
-                argv.push("--spec-draft-n-max".into());
-                argv.push("3".into());
+                if input.supported_flags.contains("--spec-draft-n-max") {
+                    argv.push("--spec-draft-n-max".into());
+                    argv.push("3".into());
+                }
             } else {
-                // Always hard-error on an unpulled draft. The engine's
-                // `--spec-draft-hf` auto-download flag exists in b10840+ but
-                // resolves the repo to an empty path and the child exits
-                // fatally (verified live 2026-09-07) — revisit once upstream
-                // fixes draft-side HF resolution.
-                return Err(format!(
-                    "spec=auto for {} but the draft model is not pulled; run: pallama pull {}",
-                    input.model_name, pair.draft_repo
+                // Opportunistic auto: an unpulled catalog draft degrades
+                // to dense with a teaching warning — auto must never
+                // refuse a spawn (hard errors belong to the explicit
+                // typed modes, where the user asked for THAT drafter).
+                // (`--spec-draft-hf` auto-download exists in b10840+ but
+                // resolves to an empty path and the child exits fatally,
+                // verified live 2026-09-07 — revisit if upstream fixes
+                // draft-side HF resolution.)
+                warnings.push(format!(
+                    "spec=auto: draft pair {} for {} is not pulled; running dense — run: \
+                     pallama pull {} to enable speculation",
+                    pair.spec_type, input.model_name, pair.draft_repo
                 ));
             }
         }
@@ -2070,7 +2520,6 @@ fn push_spec_args(
             input.model_name
         )),
     }
-    Ok(())
 }
 
 /// Router-preset INI generation. Upstream router mode (llama-server with
@@ -2096,6 +2545,7 @@ const ROUTER_MODEL_KEYS: &[&str] = &[
     "cache-type-v",
     "cpu-moe",
     "n-cpu-moe",
+    "n-cpu-ffn",
     "override-tensor",
     "rope-scaling",
     "rope-scale",
@@ -2313,6 +2763,22 @@ fn find_mmproj_arg(extra: &[String]) -> Option<&str> {
         .map(String::as_str)
 }
 
+/// Dual-resolved projector policy: per-model override > global knob >
+/// Lazy default. Shared by rule 19 (argv emission) and the supervisor's
+/// vision-respawn check so both sides always agree on whether a running
+/// instance can serve images.
+#[must_use]
+pub fn mmproj_policy_effective(
+    config: &Config,
+    model: &str,
+    overlay: &ModelOverride,
+) -> MmprojPolicy {
+    MmprojPolicy::effective(
+        overlay.mmproj.or_else(|| config.overlay_for(model).mmproj),
+        config.mmproj_policy,
+    )
+}
+
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
@@ -2323,6 +2789,7 @@ mod tests {
     use crate::gguf::GgufMeta;
     use crate::hardware::GpuInfo;
 
+    #[allow(clippy::too_many_lines)] // one flat flag inventory, not logic
     fn full_flags() -> BTreeSet<String> {
         [
             "-m",
@@ -2381,6 +2848,7 @@ mod tests {
             "--rope-scaling",
             "--rope-scale",
             "--n-cpu-moe",
+            "--n-cpu-ffn",
             "--override-tensor",
             "--agent",
             "--slot-prompt-similarity",
@@ -2408,6 +2876,76 @@ mod tests {
             "--samplers",
             "--embeddings",
             "--pooling",
+            // Modern-engine superset (b10896): the spec-draft placement
+            // family, reasoning control, scheduling extras, and
+            // multimodal knobs. Kept in the canonical fixture so every
+            // manifest gate has a fully-flagged engine to test against
+            // (the wire-everything wave folded in here).
+            "--spec-draft-cpu-range",
+            "--spec-draft-cpu-strict",
+            "--spec-draft-device",
+            "--spec-draft-ngl",
+            "--spec-draft-threads",
+            "--spec-draft-p-min",
+            "--spec-draft-p-split",
+            "--spec-draft-poll",
+            "--spec-draft-poll-batch",
+            "--spec-draft-prio",
+            "--spec-draft-prio-batch",
+            "--spec-draft-cpu-strict-batch",
+            "--spec-draft-threads-batch",
+            "--spec-draft-type-k",
+            "--spec-draft-type-v",
+            "--spec-draft-override-tensor",
+            "--spec-draft-n-cpu-moe",
+            "--spec-draft-cpu-moe",
+            "--no-spec-draft-backend-sampling",
+            "--adaptive-decay",
+            "--adaptive-target",
+            "--reasoning-budget",
+            "--reasoning-budget-message",
+            "--reasoning-effort",
+            "--reasoning-preserve",
+            "--no-reasoning-preserve",
+            "--image-max-tokens",
+            "--image-min-tokens",
+            "--mtmd-batch-max-tokens",
+            "--no-mmproj-offload",
+            "--no-mmproj-auto",
+            "--mmproj-device",
+            "--embd-normalize",
+            "--cpu-strict",
+            "--prio",
+            "--prio-batch",
+            "--poll-batch",
+            "--threads-http",
+            "--spec-ngram-simple-size-m",
+            "--spec-ngram-simple-size-n",
+            "--spec-ngram-simple-min-hits",
+            "--spec-ngram-map-k-size-m",
+            "--spec-ngram-map-k-size-n",
+            "--spec-ngram-map-k-min-hits",
+            "--spec-ngram-map-k4v-size-m",
+            "--spec-ngram-map-k4v-size-n",
+            "--spec-ngram-map-k4v-min-hits",
+            "--spec-ngram-mod-n-match",
+            "--spec-ngram-mod-n-max",
+            "--spec-ngram-mod-n-min",
+            "--spm-infill",
+            "--yarn-orig-ctx",
+            "--yarn-ext-factor",
+            "--yarn-attn-factor",
+            "--yarn-beta-fast",
+            "--yarn-beta-slow",
+            "--no-repack",
+            "--no-host",
+            "--op-offload",
+            "--no-op-offload",
+            "--keep",
+            "--override-kv",
+            "--control-vector",
+            "--control-vector-scaled",
+            "--control-vector-layer-range",
         ]
         .iter()
         .map(|f| (*f).to_string())
@@ -2458,6 +2996,16 @@ mod tests {
         }
     }
 
+    /// Materialize a real (empty) draft file so compile's stale-row
+    /// existence check sees a live path — the fixture must not lie
+    /// about freshness any more than the store may.
+    fn draft_file(tag: &str) -> String {
+        let p =
+            std::env::temp_dir().join(format!("pallama-draft-{tag}-{}.gguf", std::process::id()));
+        std::fs::write(&p, b"gguf").unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
     fn input<'a>(
         gguf: &'a GgufMeta,
         hw: &'a Hardware,
@@ -2487,6 +3035,7 @@ mod tests {
             loras: &[],
             draft_path: None,
             mmproj_path: None,
+            mmproj_force: false,
             engine_tag: "b-test",
             supported_flags: flags,
             spec_types,
@@ -2530,6 +3079,7 @@ mod tests {
 
     static ALL_FLAGS: LazyLock<BTreeSet<String>> = LazyLock::new(full_flags);
     static DEFAULT_OVERLAY: ModelOverride = ModelOverride {
+        cpu_ffn_n: None,
         ctx: None,
         slots: None,
         spec: None,
@@ -2554,6 +3104,7 @@ mod tests {
         late_chunking: None,
         rpc_servers: None,
         deterministic: None,
+        mmproj: None,
     };
 
     #[test]
@@ -2599,7 +3150,10 @@ mod tests {
 
     #[test]
     fn unit__profile_base_rules__emitted_in_order() {
-        let cfg = Config::default();
+        let cfg = Config {
+            spec: "off".into(), // purpose-scoped: base rules, not the spec lane
+            ..Config::default()
+        };
         let hw = gpu_hw(12_000, 32_000, 8);
         let g = meta();
         let p = compile(
@@ -2809,6 +3363,131 @@ mod tests {
             p.warnings.iter().any(|w| w.contains("multimodal")),
             "skip must warn: {:?}",
             p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__rule19__mmproj_suppress_knob_and_extra_args_precedence() {
+        // mmproj=skip spawns text-only (saves the projector cold read +
+        // VL init, measured ~875 MiB file / 1126 MiB VRAM / ~3.9 s cold
+        // TTFT on the 9B VL row) and must say so; mmproj=lazy (the
+        // default) also spawns text-only but promises the @vision
+        // respawn; an explicit extra_args -mm still wins (rule 19's
+        // first branch) without a double warning; mmproj_force
+        // (@vision respawn / router preset) attaches regardless.
+        let hw = gpu_hw(24_000, 64_000, 8);
+        let g = meta();
+        let mmp = "/nonexistent/mmproj-F16.gguf";
+        let ovr = |mo: ModelOverride, cfg: Config| Config {
+            model_overrides: std::collections::BTreeMap::from([("qwen3-8b".into(), mo)]),
+            ..cfg
+        };
+        let base = Config::default();
+
+        // 1. Skip: drop -mm + suppress warning
+        let skip = ovr(
+            ModelOverride {
+                mmproj: Some(MmprojPolicy::Skip),
+                ..ModelOverride::default()
+            },
+            base.clone(),
+        );
+        let mut i = input(&g, &hw, &skip, &ALL_FLAGS);
+        i.mmproj_path = Some(mmp);
+        let p = compile(&i, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.iter().any(|a| a == "-mm"),
+            "skip knob must drop -mm: {:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings.iter().any(|w| w.contains("mmproj suppressed")),
+            "skip must warn: {:?}",
+            p.warnings
+        );
+
+        // 2. Lazy (default, no override, no global): drop -mm + lazy warning
+        let mut i2 = input(&g, &hw, &base, &ALL_FLAGS);
+        i2.mmproj_path = Some(mmp);
+        let p2 = compile(&i2, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p2.argv.iter().any(|a| a == "-mm"),
+            "lazy default must spawn text-only: {:?}",
+            p2.argv
+        );
+        assert!(
+            p2.warnings.iter().any(|w| w.contains("mmproj lazy")),
+            "lazy must warn: {:?}",
+            p2.warnings
+        );
+
+        // 3. extra_args -mm beats the lazy default — attach, no lazy warning
+        let explicit = ovr(
+            ModelOverride {
+                extra_args: Some(vec!["-mm".into(), mmp.into()]),
+                ..ModelOverride::default()
+            },
+            base.clone(),
+        );
+        let mut i3 = input(&g, &hw, &explicit, &ALL_FLAGS);
+        i3.mmproj_path = Some(mmp);
+        let p3 = compile(&i3, &TuningOverrides::default()).unwrap();
+        assert!(p3.argv.iter().any(|a| a == "-mm"), "extra_args wins");
+        assert!(
+            !p3.warnings.iter().any(|w| w.contains("mmproj lazy")),
+            "explicit -mm must not double-warn: {:?}",
+            p3.warnings
+        );
+
+        // 4. mmproj_force (@vision respawn / router preset) attaches
+        //    even under the lazy default
+        let mut i4 = input(&g, &hw, &base, &ALL_FLAGS);
+        i4.mmproj_path = Some(mmp);
+        i4.mmproj_force = true;
+        let p4 = compile(&i4, &TuningOverrides::default()).unwrap();
+        assert!(
+            p4.argv.iter().any(|a| a == "-mm"),
+            "mmproj_force must attach: {:?}",
+            p4.argv
+        );
+        assert!(
+            !p4.warnings.iter().any(|w| w.contains("mmproj lazy")),
+            "forced attach is not lazy: {:?}",
+            p4.warnings
+        );
+
+        // 5. From<bool> spelling: true = Attach, false = Skip
+        assert_eq!(MmprojPolicy::from(true), MmprojPolicy::Attach);
+        assert_eq!(MmprojPolicy::from(false), MmprojPolicy::Skip);
+    }
+
+    #[test]
+    fn unit__policy__mmproj_effective_precedence_overlay_global_lazy() {
+        // overlay > global > Lazy default, resolved per-model
+        let mo = ModelOverride {
+            mmproj: Some(MmprojPolicy::Skip),
+            ..ModelOverride::default()
+        };
+        let cfg = Config {
+            model_overrides: std::collections::BTreeMap::from([("m".into(), mo)]),
+            mmproj_policy: Some(MmprojPolicy::Attach),
+            ..Config::default()
+        };
+        assert_eq!(
+            mmproj_policy_effective(&cfg, "m", &cfg.overlay_for("m")),
+            MmprojPolicy::Skip,
+            "overlay wins"
+        );
+        assert_eq!(
+            mmproj_policy_effective(&cfg, "other", &cfg.overlay_for("other")),
+            MmprojPolicy::Attach,
+            "global serves models without an overlay"
+        );
+        let bare = Config::default();
+        assert_eq!(
+            mmproj_policy_effective(&bare, "any", &bare.overlay_for("any")),
+            MmprojPolicy::Lazy,
+            "None everywhere = Lazy default"
         );
     }
 
@@ -3030,14 +3709,17 @@ mod tests {
         let g = meta();
         let mut inp =
             input_named_with_spec("qwen3-8b", &g, &hw, &cfg, &ALL_FLAGS, &EAGLE3_SPEC_TYPES);
-        inp.draft_path = Some("/models/qwen3-8b-speculator.eagle3-f16.gguf");
+        let draft = draft_file("eagle3");
+        inp.draft_path = Some(&draft);
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert!(p
             .argv
             .windows(2)
             .any(|w| w[0] == "--spec-type" && w[1] == "draft-eagle3"));
-        assert!(p.argv.windows(2).any(|w| w[0] == "--spec-draft-model"
-            && w[1] == "/models/qwen3-8b-speculator.eagle3-f16.gguf"));
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--spec-draft-model" && w[1] == draft.as_str()));
         assert!(p.warnings.is_empty(), "{:?}", p.warnings);
     }
 
@@ -3138,10 +3820,11 @@ mod tests {
         .unwrap_err();
         // dflash type advertised but dspark asked -> engine gate fires…
         assert!(err.contains("draft-dspark"), "{err}");
-        // …and a dspark-advertising engine with no catalog pair -> pair gate.
+        // …and a dspark-advertising engine with no catalog pair for a
+        // model outside the pair prefix -> pair gate.
         err = compile(
             &input_named_with_spec(
-                "qwen3-8b",
+                "llama3.2-3b",
                 &g,
                 &hw,
                 &cfg,
@@ -3253,6 +3936,135 @@ mod tests {
             .any(|w| w[0] == "--spec-type" && w[1] == "draft-mtp"));
         // qwen3-8b has no catalog pair either: dense, no spec args at all.
         assert!(!p.argv.contains(&"--spec-type".to_string()));
+    }
+
+    #[test]
+    fn unit__spec_auto_pair__engine_lacking_spec_type__warn_and_dense() {
+        // R2-1: an old engine (no --spec-type) + resolved catalog pair
+        // must degrade to dense with a teaching warning, not push spec
+        // argv the child rejects at boot.
+        let cfg = Config {
+            spec: "auto".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let mut flags = ALL_FLAGS.clone();
+        flags.remove("--spec-type");
+        flags.remove("--spec-draft-model");
+        flags.remove("--spec-draft-n-max");
+        let mut inp = input_named_with_spec("qwen3-8b", &g, &hw, &cfg, &flags, &[]);
+        let draft = draft_file("auto-pair-old-engine");
+        inp.draft_path = Some(&draft);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.iter().any(|a| a == "--spec-type"),
+            "no spec argv on a flagless engine: {:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("lacks it") && w.contains("pallama engine update")),
+            "teaching warning required: {:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__spec_mtp__manual_caps_n_max_at_head_layers() {
+        // R2-4: manual spec="mtp" must cap --spec-draft-n-max at the
+        // trained head count (min 2), matching the auto lane — the
+        // upstream default of 3 would make a 1-2 layer head pay pure
+        // verification overhead.
+        let cfg = Config {
+            spec: "mtp".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta_with_mtp(3);
+        let p = compile(
+            &input_with_spec(&g, &hw, &cfg, &ALL_FLAGS, &MTP_SPEC_TYPES),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--spec-draft-n-max" && w[1] == "2"));
+    }
+
+    #[test]
+    fn unit__compile__stale_draft_row__hard_error() {
+        // R2-6: a draft_path whose file is gone (stale store row) fails
+        // at profile-compile with a re-pull instruction, not at child
+        // boot with an opaque engine error.
+        let cfg = Config {
+            spec: "auto".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let mut inp = input_named_with_spec("qwen3-8b", &g, &hw, &cfg, &ALL_FLAGS, &[]);
+        let missing =
+            std::env::temp_dir().join(format!("pallama-draft-gone-{}.gguf", std::process::id()));
+        let missing = missing.to_string_lossy().into_owned();
+        inp.draft_path = Some(&missing);
+        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+        assert!(err.contains("stale") && err.contains("pull"), "{err}");
+    }
+
+    #[test]
+    fn unit__section13__config_knobs_manifest_gated() {
+        // R2-7 representative for the whole 13/13b/13c/12c family: a
+        // configured knob on an engine without the flag warn-skips
+        // (engine defaults serve on) instead of boot-failing the child.
+        let cfg = Config {
+            reasoning_budget: 4096,
+            prio: 2,
+            threads_http: 4,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let flags: BTreeSet<String> = ALL_FLAGS
+            .iter()
+            .filter(|f| {
+                !f.starts_with("--reasoning-budget") && *f != "--prio" && *f != "--threads-http"
+            })
+            .cloned()
+            .collect();
+        let p = compile(&input(&g, &hw, &cfg, &flags), &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.iter().any(|a| a == "--reasoning-budget"));
+        assert!(!p.argv.iter().any(|a| a == "--prio"));
+        assert!(!p.argv.iter().any(|a| a == "--threads-http"));
+        for key in ["reasoning_budget", "prio", "threads_http"] {
+            assert!(
+                p.warnings
+                    .iter()
+                    .any(|w| w.starts_with(&format!("{key} skipped"))),
+                "{key} teach-skip missing: {:?}",
+                p.warnings
+            );
+        }
+        // Same config on a fully-flagged engine: all three emitted.
+        let p2 = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p2
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--reasoning-budget" && w[1] == "4096"));
+        assert!(p2.argv.windows(2).any(|w| w[0] == "--prio" && w[1] == "2"));
+        assert!(p2
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--threads-http" && w[1] == "4"));
     }
 
     #[test]
@@ -3501,7 +4313,8 @@ mod tests {
         // that fits; the old fixed threshold picked q8_0 even when it did
         // not fit).
         let cfg = Config {
-            slots: 1, // purpose-scoped: ladder grades, not slot sizing
+            slots: 1,           // purpose-scoped: ladder grades, not slot sizing
+            spec: "off".into(), // purpose-scoped: not the auto spec lane
             ..Config::default()
         };
         let hw = gpu_hw(6_100, 32_000, 8);
@@ -3634,6 +4447,50 @@ mod tests {
             .argv
             .windows(2)
             .any(|w| w[0] == "--override-tensor" && w[1] == ".ffn_.*_exps.=CPU"));
+    }
+
+    #[test]
+    fn unit__cpu_ffn_n__emitted_and_overlay_wins() {
+        let cfg = Config {
+            cpu_ffn_n: 3,
+            ..Config::default()
+        };
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let g = meta();
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--n-cpu-ffn" && w[1] == "3"));
+        // Default stays argv-silent.
+        let p0 = compile(
+            &input(&g, &hw, &Config::default(), &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(!p0.argv.contains(&"--n-cpu-ffn".to_string()));
+        // Overlay Some(0) is an explicit off — F114 discipline.
+        let cfg_off = Config {
+            cpu_ffn_n: 3,
+            model_overrides: std::collections::BTreeMap::from([(
+                "qwen3-8b".into(),
+                ModelOverride {
+                    cpu_ffn_n: Some(0),
+                    ..ModelOverride::default()
+                },
+            )]),
+            ..Config::default()
+        };
+        let p_off = compile(
+            &input(&g, &hw, &cfg_off, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(!p_off.argv.contains(&"--n-cpu-ffn".to_string()));
     }
 
     #[test]
@@ -3863,6 +4720,49 @@ mod tests {
     }
 
     #[test]
+    fn unit__capacity__spawn_free_vram_gates_the_full_pin() {
+        // Contended card: 12 GiB total but a neighbour holds all but
+        // 900 MiB at spawn time. The unified-KV projection (weights +
+        // 512 MiB KV floor + spawn overhead) cannot fit 900 MiB, so the
+        // resolver must decline the `-ngl 999` pin and hand the decision
+        // to the engine's dynamic `auto` band — the live-proven OOM
+        // shape ("n_gpu_layers already set by user to 999, abort").
+        let cfg = Config::default();
+        let mut hw = gpu_hw(12_000, 32_000, 8);
+        hw.gpus[0].free_mib = 900;
+        let g = meta();
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--gpu-layers" && w[1] == "auto"),
+            "contended free VRAM must defer to the engine auto band: {:?}",
+            p.argv
+        );
+        assert!(!p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--gpu-layers" && w[1] == "999"));
+
+        // Same box idle (free == total): the comfortable full fit keeps
+        // the deterministic 999 pin (ps labeling + no estimator drift).
+        let hw_idle = gpu_hw(12_000, 32_000, 8);
+        let p2 = compile(
+            &input(&g, &hw_idle, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p2
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--gpu-layers" && w[1] == "999"));
+    }
+
+    #[test]
     fn unit__gpu_partial__weights_exceed_vram_warns_and_stays_auto() {
         let cfg = Config::default();
         let hw = gpu_hw(2_000, 32_000, 8); // 5 GiB model vs 2 GiB VRAM
@@ -3976,22 +4876,25 @@ mod tests {
 
     #[test]
     fn unit__spec_auto__draft_present_and_missing() {
+        static DRAFT_SIMPLE_SPEC_TYPES: LazyLock<Vec<String>> =
+            LazyLock::new(|| vec!["draft-simple".to_string()]);
         let cfg = Config {
             spec: "auto".into(),
             ..Config::default()
         };
         let hw = gpu_hw(12_000, 32_000, 8);
         let g = meta();
-        let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        let mut inp = input_with_spec(&g, &hw, &cfg, &ALL_FLAGS, &DRAFT_SIMPLE_SPEC_TYPES);
         inp.model_name = "qwen3-8b"; // has catalog draft pair
-        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
-        assert!(
-            err.contains("pallama pull ggml-org/Qwen3-0.6B-GGUF"),
-            "{err}"
-        );
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p.warnings.iter().any(
+            |w| w.contains("not pulled") && w.contains("pallama pull ggml-org/Qwen3-0.6B-GGUF")
+        ));
+        assert!(!p.argv.contains(&"--spec-type".to_string()));
 
         // Draft pulled -> flags emitted.
-        inp.draft_path = Some("/models/qwen3-0.6b-q4_k_m.gguf");
+        let draft = draft_file("auto-pair");
+        inp.draft_path = Some(&draft);
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert!(p
             .argv
@@ -4000,7 +4903,7 @@ mod tests {
         assert!(p
             .argv
             .windows(2)
-            .any(|w| w[0] == "--spec-draft-model" && w[1] == "/models/qwen3-0.6b-q4_k_m.gguf"));
+            .any(|w| w[0] == "--spec-draft-model" && w[1] == draft.as_str()));
         assert!(p
             .argv
             .windows(2)
@@ -4483,6 +5386,30 @@ mod tests {
     }
 
     #[test]
+    fn unit__admission_floor_bytes__charges_standing_overheads() {
+        // Same standing charges the unified gpu-layers pin trusts — the
+        // 2026-09-11 crash: weights-only admission let a 0.5B sibling
+        // (floor 1712 MiB) join a 7302 MiB measured 9B VL resident on an
+        // 8 GiB card. Saturating: a u64-weights row must not wrap.
+        let mib = |m: u64| m * 1024 * 1024;
+        assert_eq!(
+            admission_floor_bytes(mib(500), 0),
+            mib(500 + 512 + 700),
+            "weights + KV floor + spawn overhead"
+        );
+        assert_eq!(
+            admission_floor_bytes(mib(5417), mib(875)),
+            mib(5417 + 875 + 512 + 700),
+            "projector bytes join the charge"
+        );
+        assert_eq!(
+            admission_floor_bytes(u64::MAX, mib(875)),
+            u64::MAX,
+            "saturates instead of wrapping"
+        );
+    }
+
+    #[test]
     fn unit__estimate_kv_vram_charge__floor_vs_full() {
         let hw = gpu_hw(24_000, 64_000, 8);
         let g = meta();
@@ -4549,10 +5476,11 @@ mod tests {
     }
 
     #[test]
-    fn unit__spec_auto__draft_missing__hard_error_even_on_new_engines() {
+    fn unit__spec_auto__draft_missing__opportunistic_dense_with_warning() {
         // Live evidence (b10840): `--spec-draft-hf` resolves the repo to an
-        // empty draft path and the child exits fatally, so an unpulled draft
-        // must hard-error with the pull hint regardless of manifest flags.
+        // empty draft path and the child exits fatally — so auto (now the
+        // default) must degrade to dense with a pull hint instead of
+        // refusing the spawn; hard errors belong to the explicit modes.
         let cfg = Config {
             spec: "auto".into(),
             ..Config::default()
@@ -4563,11 +5491,10 @@ mod tests {
         flags.insert("--spec-draft-hf".to_string());
         let mut inp = input(&g, &hw, &cfg, &flags);
         inp.model_name = "qwen3-8b"; // catalog pair, draft NOT pulled
-        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
-        assert!(
-            err.contains("pallama pull ggml-org/Qwen3-0.6B-GGUF:Q4_0"),
-            "{err}"
-        );
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p.warnings.iter().any(|w| w.contains("not pulled")
+            && w.contains("pallama pull ggml-org/Qwen3-0.6B-GGUF:Q4_0")));
+        assert!(!p.argv.contains(&"--spec-type".to_string()));
     }
 
     #[test]
@@ -4670,7 +5597,8 @@ mod tests {
     #[test]
     fn unit__overlay_sampler_defaults__argv_flags_and_gating() {
         let cfg = Config {
-            slots: 1, // purpose-scoped: sampler flags, not slot sizing
+            slots: 1,           // purpose-scoped: sampler flags, not slot sizing
+            spec: "off".into(), // purpose-scoped: not the auto spec lane
             ..Config::default()
         };
         let hw = gpu_hw(12_000, 32_000, 8);
@@ -4818,20 +5746,53 @@ mod tests {
 
     #[test]
     fn unit__mmproj_from_store__emitted_when_engine_supports() {
-        // Rule 19: a pulled mmproj wires vision automatically (the gap
-        // that left downloaded projectors dead on disk).
+        // Rule 19: a pulled projector reaches the engine when the policy
+        // asks for it. Default is Lazy (text-only spawn + @vision respawn
+        // on first image); Attach — explicit or the @vision/router
+        // mmproj_force — emits -mm from the store row (the gap that
+        // once left downloaded projectors dead on disk).
         let cfg = Config::default();
         let hw = gpu_hw(12_000, 32_000, 8);
         let g = meta();
+
+        // Lazy default: text-only spawn, no -mm, lazy teaching warning
         let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
         inp.mmproj_path = Some("/models/mmproj-F16.gguf");
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert!(
+            !p.argv.iter().any(|a| a == "-mm"),
+            "lazy default spawns text-only: {:?}",
             p.argv
+        );
+
+        // Attach policy: pulled projector emitted
+        let attach_cfg = Config {
+            mmproj_policy: Some(MmprojPolicy::Attach),
+            ..Config::default()
+        };
+        let mut inp_a = input(&g, &hw, &attach_cfg, &ALL_FLAGS);
+        inp_a.mmproj_path = Some("/models/mmproj-F16.gguf");
+        let p_a = compile(&inp_a, &TuningOverrides::default()).unwrap();
+        assert!(
+            p_a.argv
                 .windows(2)
                 .any(|w| w[0] == "-mm" && w[1] == "/models/mmproj-F16.gguf"),
-            "pulled projector must reach the engine: {:?}",
-            p.argv
+            "attach must wire the pulled projector: {:?}",
+            p_a.argv
+        );
+
+        // mmproj_force (@vision respawn / router preset): attached even
+        // under the lazy default
+        let mut inp_f = input(&g, &hw, &cfg, &ALL_FLAGS);
+        inp_f.mmproj_path = Some("/models/mmproj-F16.gguf");
+        inp_f.mmproj_force = true;
+        let p_f = compile(&inp_f, &TuningOverrides::default()).unwrap();
+        assert!(
+            p_f.argv
+                .windows(2)
+                .any(|w| w[0] == "-mm" && w[1] == "/models/mmproj-F16.gguf"),
+            "forced attach must wire the pulled projector: {:?}",
+            p_f.argv
         );
     }
 
@@ -4877,67 +5838,10 @@ mod tests {
     // ---- wire-everything wave pins -------------------------------------
 
     fn wire_flags() -> BTreeSet<String> {
-        let mut f = ALL_FLAGS.clone();
-        for flag in [
-            "--spec-draft-cpu-range",
-            "--spec-draft-cpu-strict",
-            "--spec-draft-device",
-            "--spec-draft-ngl",
-            "--spec-draft-threads",
-            "--spec-draft-p-min",
-            "--spec-draft-p-split",
-            "--spec-draft-poll",
-            "--spec-draft-prio",
-            "--spec-ngram-simple-size-m",
-            "--spec-ngram-simple-size-n",
-            "--spec-ngram-simple-min-hits",
-            "--spec-ngram-map-k-size-m",
-            "--spec-ngram-map-k-size-n",
-            "--spec-ngram-map-k-min-hits",
-            "--spec-ngram-map-k4v-size-m",
-            "--spec-ngram-map-k4v-size-n",
-            "--spec-ngram-map-k4v-min-hits",
-            "--spec-ngram-mod-n-match",
-            "--spec-ngram-mod-n-max",
-            "--spec-ngram-mod-n-min",
-            "--spm-infill",
-            "--reasoning-budget",
-            "--reasoning-budget-message",
-            "--reasoning-effort",
-            "--reasoning-preserve",
-            "--no-reasoning-preserve",
-            "--image-max-tokens",
-            "--image-min-tokens",
-            "--mtmd-batch-max-tokens",
-            "--no-mmproj-offload",
-            "--no-mmproj-auto",
-            "--mmproj-device",
-            "--embd-normalize",
-            "--yarn-orig-ctx",
-            "--yarn-ext-factor",
-            "--yarn-attn-factor",
-            "--yarn-beta-fast",
-            "--yarn-beta-slow",
-            "--cpu-strict",
-            "--prio",
-            "--prio-batch",
-            "--poll-batch",
-            "--threads-http",
-            "--no-warmup",
-            "--no-repack",
-            "--no-cache-idle-slots",
-            "--no-host",
-            "--op-offload",
-            "--no-op-offload",
-            "--keep",
-            "--override-kv",
-            "--control-vector",
-            "--control-vector-scaled",
-            "--control-vector-layer-range",
-        ] {
-            f.insert(flag.to_string());
-        }
-        f
+        // The wire-everything wave folded its modern-engine additions
+        // into the canonical full_flags fixture; this alias keeps the
+        // intent-named entry point for the wire battery.
+        full_flags()
     }
 
     static WIRE_FLAGS: LazyLock<BTreeSet<String>> = LazyLock::new(wire_flags);
@@ -4976,7 +5880,8 @@ mod tests {
     fn unit__lazy_mode__emitted_only_on_deviation() {
         let cfg = Config {
             lazy_mode: "on".into(),
-            slots: 1, // purpose-scoped: lazy-mode, not slot sizing
+            slots: 1,           // purpose-scoped: lazy-mode, not slot sizing
+            spec: "off".into(), // purpose-scoped: not the auto spec lane
             ..Default::default()
         };
         let hw = gpu_hw(12_000, 32_000, 8);
@@ -5047,7 +5952,8 @@ mod tests {
             server_tools_runtime: Some("ssh:gpu-box".into()),
             mcp_servers_config: Some(mcp.path().to_string_lossy().into_owned()),
             mcp_servers_json: Some(r#"{"mcpServers":{"fs":{}}}"#.into()),
-            slots: 1, // purpose-scoped: tool passthrough, not slot sizing
+            slots: 1,           // purpose-scoped: tool passthrough, not slot sizing
+            spec: "off".into(), // purpose-scoped: not the auto spec lane
             ..Default::default()
         };
         let hw = gpu_hw(12_000, 32_000, 8);
@@ -5298,7 +6204,8 @@ mod tests {
     #[test]
     fn unit__overlay_spm_infill__emitted_and_engine_gated() {
         let cfg = Config {
-            slots: 1, // purpose-scoped: spm flag gating, not slot sizing
+            slots: 1,           // purpose-scoped: spm flag gating, not slot sizing
+            spec: "off".into(), // purpose-scoped: not the auto spec lane
             ..Config::default()
         };
         let hw = gpu_hw(12_000, 32_000, 8);
@@ -5675,7 +6582,8 @@ mod tests {
         // With the draft resolved (qwen3-8b has a catalog pair): the pair
         // emission plus the full placement battery.
         let mut inp = input(&g, &hw, &cfg, &WIRE_FLAGS);
-        inp.draft_path = Some("/models/draft.gguf");
+        let draft = draft_file("wire");
+        inp.draft_path = Some(&draft);
         let p2 = compile(&inp, &TuningOverrides::default()).unwrap();
         assert!(
             p2.argv
@@ -5715,7 +6623,8 @@ mod tests {
             ..Config::default()
         };
         let mut inp = input(&g, &hw, &cfg, &flags);
-        inp.draft_path = Some("/models/qwen3-0.5b.gguf");
+        let draft = draft_file("siblings");
+        inp.draft_path = Some(&draft);
         inp.sibling_devices = vec!["GPU1".to_string()];
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert!(
@@ -5732,7 +6641,7 @@ mod tests {
             ..Config::default()
         };
         let mut pinned = input(&g, &hw, &pinned_cfg, &flags);
-        pinned.draft_path = Some("/models/qwen3-0.5b.gguf");
+        pinned.draft_path = Some(&draft);
         pinned.sibling_devices = vec!["GPU1".to_string()];
         let p2 = compile(&pinned, &TuningOverrides::default()).unwrap();
         assert!(!p2.warnings.iter().any(|w| w.contains("spec draft shares")));
@@ -5843,7 +6752,8 @@ mod tests {
             ..Config::default()
         };
         let mut inp = input(&g, &hw, &cfg, &flags);
-        inp.draft_path = Some("/models/qwen3-0.5b.gguf");
+        let draft = draft_file("no-sibling");
+        inp.draft_path = Some(&draft);
         inp.mmproj_path = Some("/models/mmproj.gguf");
         // sibling_devices empty (single-card box): stays silent.
         let p = compile(&inp, &TuningOverrides::default()).unwrap();

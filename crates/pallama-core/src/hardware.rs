@@ -65,6 +65,20 @@ impl Hardware {
         }
     }
 
+    /// Spawn-time FREE capacity across the GPUs that count for capacity
+    /// math — same integrated-filter discipline as [`Self::total_vram_mib`]
+    /// (an iGPU's shared-RAM "free" must never pad a discrete card's
+    /// budget). Returns 0 when no GPU counts.
+    #[must_use]
+    pub fn free_vram_mib(&self) -> u64 {
+        let cards: Vec<&GpuInfo> = if self.gpus.iter().any(|g| !g.is_integrated()) {
+            self.gpus.iter().filter(|g| !g.is_integrated()).collect()
+        } else {
+            self.gpus.iter().collect()
+        };
+        cards.iter().map(|g| g.free_mib).sum()
+    }
+
     #[must_use]
     pub fn has_gpu(&self) -> bool {
         !self.gpus.is_empty()
@@ -150,6 +164,44 @@ mod tests {
             }],
         };
         assert_eq!(hw.total_vram_mib(), 8_192, "integrated-only still serves");
+    }
+
+    #[test]
+    fn unit__hardware__free_vram_mirrors_integrated_filter() {
+        // Same live shape as the totals test, but the neighbour models
+        // hold memory: iGPU "free" is shared-RAM fiction and must not pad
+        // the discrete card's spawn-time budget.
+        let hw = Hardware {
+            physical_cores: 8,
+            total_ram_mib: 13_000,
+            gpus: vec![
+                GpuInfo {
+                    name: "Intel".into(),
+                    description: "Intel(R) Graphics (RPL-S)".into(),
+                    total_mib: 10_256,
+                    free_mib: 9_000,
+                },
+                GpuInfo {
+                    name: "NVIDIA".into(),
+                    description: "NVIDIA GeForce RTX 4070 Laptop GPU".into(),
+                    total_mib: 8_188,
+                    free_mib: 900,
+                },
+            ],
+        };
+        assert_eq!(hw.free_vram_mib(), 900, "discrete free only");
+        // Integrated-only box keeps its (fictional but only) budget.
+        let igpu = Hardware {
+            physical_cores: 8,
+            total_ram_mib: 16_000,
+            gpus: vec![GpuInfo {
+                name: "i".into(),
+                description: "Intel(R) Iris(R) Xe Graphics".into(),
+                total_mib: 8_192,
+                free_mib: 3_000,
+            }],
+        };
+        assert_eq!(igpu.free_vram_mib(), 3_000);
     }
 
     #[test]

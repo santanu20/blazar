@@ -96,17 +96,134 @@ pub struct ProxyOutcome {
     pub duration_ms: u128,
 }
 
+/// Run a supervisor load on a detached task. Dropping the request future
+/// (client disconnect mid-spawn) would otherwise cancel an in-flight
+/// spawn — leaking a half-started child and stranding the loader
+/// protocol (live-repro'd wedge: one timed-out generate wedged every
+/// later generate on that model). A dropped `JoinHandle` detaches, so the
+/// load always runs to completion; only this request stops waiting.
+pub(crate) async fn ensure_detached(
+    sup: &std::sync::Arc<pallama_runtime::Supervisor>,
+    name: &str,
+    prefix: Option<PrefixKey>,
+) -> Result<EngineRef, SupervisionError> {
+    let sup = std::sync::Arc::clone(sup);
+    let name = name.to_string();
+    tokio::spawn(async move { sup.ensure_routed(&name, prefix).await })
+        .await
+        .unwrap_or_else(|e| {
+            Err(SupervisionError::Internal(anyhow::anyhow!(
+                "load task panicked: {e}"
+            )))
+        })
+}
+
+/// Vision-aware variant of [`ensure_detached`]: routes through
+/// `Supervisor::ensure_vision` so a `mmproj = "lazy"` spawn respawns
+/// WITH the projector when the request carries images. Text requests
+/// keep the plain path — zero overhead, zero behavior change.
+pub(crate) async fn ensure_vision_detached(
+    sup: &std::sync::Arc<pallama_runtime::Supervisor>,
+    name: &str,
+    prefix: Option<PrefixKey>,
+) -> Result<EngineRef, SupervisionError> {
+    let sup = std::sync::Arc::clone(sup);
+    let name = name.to_string();
+    tokio::spawn(async move { sup.ensure_vision(&name, prefix).await })
+        .await
+        .unwrap_or_else(|e| {
+            Err(SupervisionError::Internal(anyhow::anyhow!(
+                "vision load task panicked: {e}"
+            )))
+        })
+}
+
+/// Does this parsed chat body carry images? Shapes covered:
+///
+/// - `OpenAI` chat: `messages[].content[]` items with an `image`-prefixed
+///   [`type`] (or a bare `image_url` key — some clients omit the tag)
+/// - `OpenAI` responses: `input[]` items with an `image`-prefixed [`type`]
+/// - Anthropic messages: `messages[].content[]` items `type: "image"`
+///   (the prefix check covers it)
+/// - Ollama chat/generate: `messages[].images` non-empty or a
+///   top-level `images` array (generate shape)
+///
+/// Pure inspection of the single-parsed body — no re-parse on lanes
+/// that already hold one; the responses lane parses once here (it
+/// parses again downstream for translation — one bounded extra parse,
+/// noted, not silently hot-pathed).
+#[must_use]
+pub fn body_needs_vision(parsed: &serde_json::Value, ollama_shape: bool) -> bool {
+    fn image_item(it: &serde_json::Value) -> bool {
+        it.get("type")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t.starts_with("image"))
+            || it.get("image_url").is_some()
+    }
+    if ollama_shape {
+        let msgs = parsed
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .is_some_and(|ms| {
+                ms.iter().any(|msg| {
+                    msg.get("images")
+                        .and_then(|i| i.as_array())
+                        .is_some_and(|a| !a.is_empty())
+                })
+            });
+        let top = parsed
+            .get("images")
+            .and_then(|i| i.as_array())
+            .is_some_and(|a| !a.is_empty());
+        return msgs || top;
+    }
+    let msgs = parsed
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|ms| {
+            ms.iter().any(|msg| {
+                msg.get("content")
+                    .and_then(|c| c.as_array())
+                    .is_some_and(|items| items.iter().any(image_item))
+            })
+        });
+    let input = parsed
+        .get("input")
+        .and_then(|i| i.as_array())
+        .is_some_and(|items| items.iter().any(image_item));
+    msgs || input
+}
+
+/// Router-mode variant: plain ensure on the router key, same detach
+/// contract ([`ensure_detached`]).
+pub(crate) async fn ensure_router_detached(
+    sup: &std::sync::Arc<pallama_runtime::Supervisor>,
+) -> Result<EngineRef, SupervisionError> {
+    let sup = std::sync::Arc::clone(sup);
+    tokio::spawn(async move { sup.ensure(pallama_runtime::ROUTER_KEY).await })
+        .await
+        .unwrap_or_else(|e| {
+            Err(SupervisionError::Internal(anyhow::anyhow!(
+                "router task panicked: {e}"
+            )))
+        })
+}
+
 /// Ensure the model is running (priority-aware admission) and hand back
 /// the engine reference. Errors map to typed HTTP statuses. `prefix`
 /// carries the prompt-affinity hash (B1): chat-family callers pass it
 /// so repeat conversations land on their warm replica; everything else
-/// passes `None`.
+/// passes `None`. `needs_vision` routes the first ensure through the
+/// lazy-attach path (projector respawn) — chat callers derive it from
+/// the single-parsed body via [`body_needs_vision`]; every other lane
+/// passes `false`.
 #[allow(clippy::duration_suboptimal_units)] // 120s admission bound per plan
 pub async fn ensure_with_admission(
     state: &Arc<AppState>,
     model: &str,
     priority: Priority,
     prefix: Option<PrefixKey>,
+    needs_vision: bool,
 ) -> Result<(EngineRef, u128), Response> {
     let started = Instant::now();
     // Model resolution is the only store need; it completes inside the
@@ -121,18 +238,32 @@ pub async fn ensure_with_admission(
             msg => openai_error(500, msg),
         })?;
 
-    let first = state.sup.ensure_routed(&row.name, prefix).await;
+    let ensure_first = |needs: bool| -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<EngineRef, SupervisionError>> + Send>,
+    > {
+        if needs {
+            Box::pin(ensure_vision_detached(&state.sup, &row.name, prefix))
+        } else {
+            Box::pin(ensure_detached(&state.sup, &row.name, prefix))
+        }
+    };
+    let first = ensure_first(needs_vision).await;
     // (Bank restore happens inside the supervisor at spawn-readiness.)
     let engine = match first {
         Ok(ep) => ep,
         Err(SupervisionError::AllSlotsBusy) => {
             // Capacity exhausted: queue at our priority, bounded wait.
+            // Report the pressure — sustained queueing is the demand
+            // signal that drives adaptive slot adoption. Enter/leave
+            // bracketing keeps it a gauge (a level the reaper can see
+            // on every tick, not a one-shot event).
+            state.sup.note_slot_pressure(&row.name);
             state
                 .bus
                 .publish(pallama_runtime::PallamaEvent::QueueDepth {
                     n: state.queue.depth() + 1,
                 });
-            state
+            let waited = state
                 .queue
                 .wait(
                     &row.name,
@@ -142,11 +273,10 @@ pub async fn ensure_with_admission(
                     std::time::Duration::from_mins(2),
                     None,
                 )
-                .await
-                .map_err(|e| openai_error(503, &e))?;
-            state
-                .sup
-                .ensure_routed(&row.name, prefix)
+                .await;
+            state.sup.note_slot_pressure_release(&row.name);
+            waited.map_err(|e| openai_error(503, &e))?;
+            ensure_first(needs_vision)
                 .await
                 .map_err(|e| supervision_error(&e))?
         }
@@ -907,11 +1037,7 @@ pub async fn admission_gate_slo(
     body_len: usize,
     wfq: Option<(&str, u32)>,
 ) -> Result<InFlightGuard, Response> {
-    let max_inflight: i64 = if state.config.slots == 0 {
-        4 // auto multi-slot: allow modest concurrency
-    } else {
-        i64::from(state.config.slots)
-    };
+    let max_inflight: i64 = state.sup.slot_cap(model);
     // Predictive early-reject (#28): an explicit deadline that measured
     // TTFT p90 says we cannot possibly meet -> fail fast with numbers.
     if let Some(ms) = deadline_ms {
@@ -949,7 +1075,15 @@ pub async fn admission_gate_slo(
         if busy < max_inflight {
             return Ok(begin_accounting(state, model));
         }
-        state
+        // The REAL same-model park: this request waits for a slot on the
+        // admission queue. Bracket the wait with the slot-pressure gauge
+        // so the adaptive reshaper sees currently-parked demand every
+        // reaper tick (the ensure-path AllSlotsBusy arm only covers
+        // multi-model spawn contention — live-proven 2026-09-12: 12
+        // streams on one loaded model queued here for 37s with the
+        // gauge reading zero the whole time).
+        state.sup.note_slot_pressure(model);
+        let waited = state
             .queue
             .wait(
                 model,
@@ -959,8 +1093,9 @@ pub async fn admission_gate_slo(
                 std::time::Duration::from_mins(2),
                 wfq,
             )
-            .await
-            .map_err(|e| openai_error(503, &e))?;
+            .await;
+        state.sup.note_slot_pressure_release(model);
+        waited.map_err(|e| openai_error(503, &e))?;
     }
 }
 

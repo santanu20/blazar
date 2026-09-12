@@ -93,6 +93,7 @@ fn test_input<'a>(
         data_dir: "/tmp/pallama-test-data",
         cache_hit_rate: None,
         device_hint: None,
+        mmproj_force: false,
         engine_census: hw.gpus.clone(),
     }
 }

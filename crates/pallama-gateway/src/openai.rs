@@ -96,6 +96,7 @@ pub async fn embeddings(
         &model,
         crate::queue::Priority::Normal,
         None,
+        false, // embeddings: text-only
     )
     .await
     {
@@ -299,7 +300,17 @@ pub async fn openai_proxy(
     } else {
         None
     };
-    let (engine, load_ms) = match ensure_with_admission(&state, &model, priority, prefix).await {
+    let (engine, load_ms) = match ensure_with_admission(
+        &state,
+        &model,
+        priority,
+        prefix,
+        parsed_body
+            .as_ref()
+            .is_some_and(|b| crate::proxy::body_needs_vision(b, false)),
+    )
+    .await
+    {
         Ok(ok) => ok,
         Err(resp) => return resp,
     };
@@ -505,7 +516,8 @@ pub async fn scoped_proxy(
             .get("x-pallama-priority")
             .and_then(|v| v.to_str().ok()),
     );
-    let (engine, load_ms) = match ensure_with_admission(&state, &model, priority, None).await {
+    let (engine, load_ms) = match ensure_with_admission(&state, &model, priority, None, false).await
+    {
         Ok(ok) => ok,
         Err(resp) => return resp,
     };
@@ -654,11 +666,19 @@ pub async fn responses_api(
             .get("x-pallama-priority")
             .and_then(|v| v.to_str().ok()),
     );
-    let (engine, load_ms) =
-        match ensure_with_admission(&state, &model, priority, affinity_hash_bytes(&body)).await {
-            Ok(ok) => ok,
-            Err(resp) => return resp,
-        };
+    let (engine, load_ms) = match ensure_with_admission(
+        &state,
+        &model,
+        priority,
+        affinity_hash_bytes(&body),
+        serde_json::from_slice::<serde_json::Value>(&body)
+            .is_ok_and(|b| crate::proxy::body_needs_vision(&b, false)),
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(resp) => return resp,
+    };
     let model_name = engine.name.clone();
     let guard = match admission_gate_slo(
         &state,
@@ -851,6 +871,25 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Model-less /v1/adapters target resolution: (name, state, `idle_secs`) of
+/// the live engines + the first pulled store row as cold fallback.
+/// Rank 1 = most-recently-used READY engine (a model-less "list my
+/// adapters" means the engine I am using); rank 2 = first store row.
+/// Without the live preference, an arbitrary store-first model hijacks
+/// the request — on boxes with a draft-only model sorted first that
+/// spawns a doomed child and 502s instead of listing the running
+/// engine's adapters. Pure so the ranking is unit-testable.
+fn adapters_target<'a>(
+    live: &'a [(String, String, u64)],
+    store_first: Option<&'a str>,
+) -> Option<&'a str> {
+    live.iter()
+        .filter(|(_, state, _)| state == "ready")
+        .min_by_key(|(name, _, idle)| (*idle, name.clone()))
+        .map(|(name, _, _)| name.as_str())
+        .or(store_first)
+}
+
 /// GET|POST /v1/adapters -> child /lora-adapters (route verified in
 /// upstream server.cpp).
 pub async fn lora_adapters(
@@ -860,15 +899,21 @@ pub async fn lora_adapters(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let first = match state.with_store(|s| s.list_models().ok()) {
-        Some(list) => list.and_then(|v| v.into_iter().next()),
+    let store_first = match state.with_store(|s| s.list_models().ok()) {
+        Some(list) => list.and_then(|v| v.into_iter().next().map(|m| m.name)),
         None => return openai_error(500, "store unavailable"),
     };
-    let Some(m) = first else {
+    let live: Vec<(String, String, u64)> = state
+        .sup
+        .ps()
+        .iter()
+        .map(|p| (p.name.clone(), p.state.to_string(), p.idle_secs))
+        .collect();
+    let Some(m) = adapters_target(&live, store_first.as_deref()) else {
         return openai_error(404, "no models pulled; adapters apply to a running engine");
     };
     let (engine, load_ms) =
-        match ensure_with_admission(&state, &m.name, Priority::Normal, None).await {
+        match ensure_with_admission(&state, m, Priority::Normal, None, false).await {
             Ok(ok) => ok,
             Err(resp) => return resp,
         };
@@ -943,6 +988,52 @@ mod tests {
         assert_eq!(
             extract_model_multipart(b"whatever", "application/json"),
             None
+        );
+    }
+
+    fn row(name: &str, state: &str, idle: u64) -> (String, String, u64) {
+        (name.into(), state.into(), idle)
+    }
+
+    #[test]
+    fn unit__adapters_target__prefers_mru_ready_engine_over_store_first() {
+        // store-first would hijack with the draft-only model (live bug:
+        // doomed spawn + 502); the engine actually in use must win.
+        let live = vec![row("qwen2.5-0.5b-instruct", "ready", 5)];
+        assert_eq!(
+            adapters_target(&live, Some("dflash-qwen3-8b-q8_0")),
+            Some("qwen2.5-0.5b-instruct")
+        );
+    }
+
+    #[test]
+    fn unit__adapters_target__ignores_non_ready_rows() {
+        let live = vec![
+            row("loading-model", "loading", 0),
+            row("stopping-model", "stopping", 0),
+        ];
+        assert_eq!(
+            adapters_target(&live, Some("store-first")),
+            Some("store-first")
+        );
+    }
+
+    #[test]
+    fn unit__adapters_target__tie_breaks_on_name_deterministically() {
+        let live = vec![row("b-model", "ready", 7), row("a-model", "ready", 7)];
+        assert_eq!(adapters_target(&live, Some("s")), Some("a-model"));
+    }
+
+    #[test]
+    fn unit__adapters_target__no_live_no_store_is_none() {
+        assert_eq!(adapters_target(&[], None), None);
+    }
+
+    #[test]
+    fn unit__adapters_target__cold_gateway_falls_back_to_store_first() {
+        assert_eq!(
+            adapters_target(&[], Some("only-pulled")),
+            Some("only-pulled")
         );
     }
 }

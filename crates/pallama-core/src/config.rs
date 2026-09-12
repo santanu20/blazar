@@ -72,12 +72,14 @@ pub struct Config {
     /// (>= 32 MiB). 1 = classic single-stream resume lane. Servers that
     /// reject Range get the single-stream lane regardless.
     pub download_connections: u32,
-    /// "off" | "auto" | "mtp" | "eagle3" | "dflash" | "dspark" (auto =
-    /// adopt spec decode when a draft pair is pulled, embedded MTP head
-    /// wins; mtp = MTP head baked into the GGUF, requires an engine
-    /// advertising draft-mtp; eagle3/dflash/dspark = trained /
-    /// block-diffusion draft models, require an engine advertising the
-    /// matching spec type). n-gram variants: see ngram-* keys.
+    /// "auto" (default: opportunistic — embedded MTP head used when the
+    /// GGUF carries one, catalog draft pair used when pulled, dense with a
+    /// teaching warning otherwise) | "off" | "mtp" | "eagle3" | "dflash" |
+    /// "dspark" (explicit modes fail fast when their inputs are missing).
+    /// n-gram variants: see ngram-* keys. Default flipped off→auto
+    /// 2026-09-11: speculation is verified-lossless (target-side
+    /// verification) and MTP measured +50% decode on Qwen3.5-9B; ollama
+    /// auto-enables MTP the same way.
     pub spec: String,
     /// On-demand tensor loading (`--lazy-mode`): "auto" (engine default:
     /// on-demand only for tensors > 4 GiB), "on" (all such tensors from
@@ -207,6 +209,11 @@ pub struct Config {
     /// cousin of the boolean MoE-offload heuristic. 0 = off.
     #[serde(default)]
     pub cpu_moe_n: i32,
+    /// Keep the dense `FFN` weights of the first N layers on CPU
+    /// (`--n-cpu-ffn`, dense models; the `--n-cpu-moe` analogue for
+    /// non-MoE architectures). 0 = off.
+    #[serde(default)]
+    pub cpu_ffn_n: i32,
     /// Upstream `--override-tensor` entries ("PATTERN=DEVICE", e.g.
     /// `".ffn_.*_exps.=CPU"`); applied per model via overlay.
     #[serde(default)]
@@ -512,6 +519,14 @@ pub struct Config {
     /// Warmup run at startup (upstream default true).
     #[serde(default = "default_true")]
     pub warmup: bool,
+
+    /// Global projector policy default (None = `lazy`: text-only spawn,
+    /// projector attaches on the first vision request via a KV-bank
+    /// respawn — measured 2026-09-11: 875 MiB projector costs +3.9 s
+    /// cold TTFT + 1126 MiB VRAM on a 9B VL row). Per-model
+    /// `model_overrides.<name>.mmproj` wins.
+    #[serde(default, deserialize_with = "de_mmproj")]
+    pub mmproj_policy: Option<MmprojPolicy>,
     /// Weight repacking for CPU/GPU layout (upstream default true).
     #[serde(default = "default_true")]
     pub repack: bool,
@@ -682,6 +697,8 @@ pub struct ModelOverride {
     pub ctx_extend: Option<f64>,
     /// Per-model `MoE` expert CPU-offload count (None = inherit global).
     pub cpu_moe_n: Option<i32>,
+    /// Per-model dense-`FFN` CPU-offload count (None = inherit global).
+    pub cpu_ffn_n: Option<i32>,
     /// Per-model `--override-tensor` entries; replaces (not merges) the
     /// global list for this model.
     pub override_tensor: Option<Vec<String>>,
@@ -740,6 +757,67 @@ pub struct ModelOverride {
     /// fleet-wide config change. Empty/None = inherit the global.
     #[serde(default)]
     pub rpc_servers: Option<String>,
+    /// Per-model projector policy (None = the global default, `lazy`).
+    /// `true`/`"attach"` spawns with the row's mmproj as before;
+    /// `false`/`"skip"` spawns text-only and vision fails loudly;
+    /// `"lazy"` spawns text-only for the measured cold-start/VRAM win
+    /// (2026-09-11: 875 MiB projector ≈ +3.9 s cold TTFT + 1126 MiB VRAM
+    /// on a 9B VL row) and RESPAWNS with the projector on the first
+    /// vision request — conversation state rides the KV bank across the
+    /// respawn, so nothing is lost beyond one warm-cache reload. An
+    /// explicit `-mm` in `extra_args` still wins.
+    #[serde(default, deserialize_with = "de_mmproj")]
+    pub mmproj: Option<MmprojPolicy>,
+}
+
+/// Projector attach policy. Accepts the bool spellings the suppress knob
+/// shipped with (`true`/`false`) plus `"attach"` / `"skip"` / `"lazy"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MmprojPolicy {
+    Attach,
+    Skip,
+    Lazy,
+}
+
+impl From<bool> for MmprojPolicy {
+    fn from(b: bool) -> Self {
+        if b {
+            Self::Attach
+        } else {
+            Self::Skip
+        }
+    }
+}
+
+impl MmprojPolicy {
+    /// Resolve the effective policy from the model override + global
+    /// default (`None` everywhere = `Lazy`).
+    #[must_use]
+    pub fn effective(override_: Option<Self>, global: Option<Self>) -> Self {
+        override_.or(global).unwrap_or(Self::Lazy)
+    }
+}
+
+/// Deserializes `MmprojPolicy` from either the bool spellings the
+/// suppress knob shipped with (`mmproj = false`) or the string forms
+/// (`"attach"` / `"skip"` / `"lazy"`).
+fn de_mmproj<'de, D>(deserializer: D) -> Result<Option<MmprojPolicy>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Bool(bool),
+        Word(MmprojPolicy),
+    }
+    match Option::<Raw>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(Raw::Bool(b)) => Ok(Some(MmprojPolicy::from(b))),
+        Some(Raw::Word(p)) => Ok(Some(p)),
+    }
 }
 
 /// Model-level sampling defaults, compiled to `--temp`, `--top-k`, ...
@@ -1046,7 +1124,7 @@ impl Default for Config {
             auto_restart_engine_switch: false,
             mistralrs_pa_memory_fraction: None,
             mistralrs_paged_attn: None,
-            spec: "off".to_string(),
+            spec: "auto".to_string(),
             lazy_mode: "auto".to_string(),
             server_tools: None,
             server_tools_runtime: None,
@@ -1083,6 +1161,7 @@ impl Default for Config {
             spec_cache: true,
             ctx_extend: 0.0,
             cpu_moe_n: 0,
+            cpu_ffn_n: 0,
             override_tensor: Vec::new(),
             agent: false,
             model_overrides: BTreeMap::new(),
@@ -1138,6 +1217,7 @@ impl Default for Config {
             poll_batch: None,
             threads_http: 0,
             warmup: true,
+            mmproj_policy: None,
             repack: true,
             cache_idle_slots: true,
             lookup_cache_static: None,
@@ -1427,6 +1507,15 @@ impl Config {
         o.cpu_moe_n.unwrap_or(self.cpu_moe_n)
     }
 
+    /// Effective dense-`FFN` CPU-offload layer count; overlay wins over
+    /// global.
+    #[must_use]
+    pub fn effective_cpu_ffn_n(&self, model: &str) -> i32 {
+        let o = self.overlay_for(model);
+        // F114: Some(0) is a VALID explicit off — override, not inherit.
+        o.cpu_ffn_n.unwrap_or(self.cpu_ffn_n)
+    }
+
     /// Effective `--override-tensor` entries; overlay list replaces the
     /// global list when present. A named `tensor_preset` (global or
     /// overlay) expands to its entries and is replaced by any explicit
@@ -1710,6 +1799,13 @@ impl Config {
                     )));
                 }
             }
+            if let Some(n) = o.cpu_ffn_n {
+                if n < 0 {
+                    return Err(CoreError::Config(format!(
+                        "model_overrides.{name}.cpu_ffn_n must be >= 0, got {n}"
+                    )));
+                }
+            }
             if let Some(ots) = &o.override_tensor {
                 for ot in ots {
                     if !valid_override_tensor(ot) {
@@ -1777,6 +1873,12 @@ impl Config {
             return Err(CoreError::Config(format!(
                 "cpu_moe_n must be >= 0, got {}",
                 self.cpu_moe_n
+            )));
+        }
+        if self.cpu_ffn_n < 0 {
+            return Err(CoreError::Config(format!(
+                "cpu_ffn_n must be >= 0, got {}",
+                self.cpu_ffn_n
             )));
         }
         for ot in &self.override_tensor {
@@ -2159,6 +2261,9 @@ impl Config {
         if let Some(v) = env("PALLAMA_CPU_MOE_N") {
             cfg.cpu_moe_n = parse_i32("PALLAMA_CPU_MOE_N", &v)?;
         }
+        if let Some(v) = env("PALLAMA_CPU_FFN_N") {
+            cfg.cpu_ffn_n = parse_i32("PALLAMA_CPU_FFN_N", &v)?;
+        }
         if let Some(v) = env("PALLAMA_OVERRIDE_TENSOR") {
             cfg.override_tensor = v
                 .split(',')
@@ -2508,6 +2613,7 @@ reasoning_format = "deepseek"
 slot_prompt_similarity = 0.6
 cpu_range = "0-7"
 cpu_moe_n = 2
+cpu_ffn_n = 1
 override_tensor = [".ffn_.*_exps.=CPU"]
 spec = "off"
 kv_unified_per_slot = 4096
@@ -2700,7 +2806,7 @@ default_ctx = 16384
         );
         assert_eq!(cfg.effective_ctx("qwen3-coder-30b"), 32768);
         assert_eq!(cfg.effective_ctx("other-model"), cfg.default_ctx);
-        assert_eq!(cfg.effective_spec("qwen3-coder-30b"), "off");
+        assert_eq!(cfg.effective_spec("qwen3-coder-30b"), "auto");
     }
 
     #[test]
@@ -2925,6 +3031,7 @@ default_ctx = 16384
             cache_type: "q8_0".into(),
             ctx_extend: 2.0,
             cpu_moe_n: 4,
+            cpu_ffn_n: 1,
             override_tensor: vec!["global=CPU".into()],
             model_overrides: BTreeMap::from([(
                 "m1".into(),
@@ -2932,6 +3039,7 @@ default_ctx = 16384
                     cache_type: Some("q5_0".into()),
                     ctx_extend: Some(4.0),
                     cpu_moe_n: Some(8),
+                    cpu_ffn_n: Some(2),
                     override_tensor: Some(vec!["local=GPU".into()]),
                     ..ModelOverride::default()
                 },
@@ -2941,6 +3049,7 @@ default_ctx = 16384
         assert_eq!(c.effective_cache_type("m1"), "q5_0");
         assert_eq!(c.effective_ctx_extend("m1").to_bits(), 4.0_f64.to_bits());
         assert_eq!(c.effective_cpu_moe_n("m1"), 8);
+        assert_eq!(c.effective_cpu_ffn_n("m1"), 2);
         assert_eq!(
             c.effective_override_tensor("m1"),
             &["local=GPU".to_string()]

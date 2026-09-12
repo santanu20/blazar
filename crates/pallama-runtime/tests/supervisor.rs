@@ -212,6 +212,43 @@ async fn integration__ensure_unknown_model__named_error() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn regression__dropped_loader_future_does_not_wedge_next_ensure() {
+    // Live-repro'd wedge: a request future dropped mid-spawn (client
+    // timeout during cold load) used to strand `loading[key]` — every
+    // later ensure parked forever on a Notify that never fired. The
+    // LoadAbort guard must clear the slot so the NEXT loader runs.
+    let (_t, dirs) = setup(&[("m1", 500)]);
+    let sup = supervisor(&dirs, base_config(), true);
+    // Drop a loader mid-spawn: 5ms is inside process spawn + health poll.
+    {
+        let mut fut = Box::pin(sup.ensure("m1"));
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_millis(5)) => {},
+            _ = &mut fut => { /* load finished instantly — pin vacuous */ }
+        }
+    } // fut dropped HERE = the client-disconnect cancellation
+    let second = tokio::time::timeout(sup.load_timeout * 3, sup.ensure("m1")).await;
+    let ep = second
+        .expect("subsequent ensure wedged after dropped loader")
+        .expect("ensure");
+    let url = match &ep.endpoint {
+        pallama_core::Endpoint::Tcp { host, port } => format!("http://{host}:{port}"),
+        pallama_core::Endpoint::Unix { .. } => unreachable!(),
+    };
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{url}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["status"], "ok");
+    sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn integration__capacity_two__hot_cache_survives_cold_eviction() {
     // Prefix heat biases capacity eviction: with m1 hot (agent traffic)
     // and m2 cold, admitting m3 must evict m2 — NOT the hot m1 — even
@@ -483,7 +520,7 @@ async fn integration__ensure_fail_fast__child_death_beats_load_timeout() {
 
 #[test]
 #[allow(non_snake_case)]
-fn unit__capacity_auto__cpu_one_gpu_vram_ratio() {
+fn unit__capacity_auto__cpu_one_gpu_bytes_admission() {
     let (_t, dirs) = setup(&[("m", 500)]);
     let s = Supervisor::new(
         dirs,
@@ -496,7 +533,11 @@ fn unit__capacity_auto__cpu_one_gpu_vram_ratio() {
         },
         Arc::new(LlamaCppEngine::new(stub_manifest())),
     );
-    assert_eq!(s.capacity_for(1_000_000_000), 1, "CPU-only -> 1");
+    // CPU-only: pinned to a single instance; bytes admission inactive
+    // (page cache is shared across processes, the heat model does not
+    // reason about it).
+    assert_eq!(s.instance_cap(), Some(1), "CPU-only -> 1");
+    assert!(!s.bytes_admission_active());
     let gpu_hw = Hardware {
         physical_cores: 4,
         total_ram_mib: 16_000,
@@ -517,9 +558,14 @@ fn unit__capacity_auto__cpu_one_gpu_vram_ratio() {
         gpu_hw,
         Arc::new(LlamaCppEngine::new(stub_manifest())),
     );
-    // 24 GiB VRAM (24576 MiB), 4 GiB model -> floor(6) -> 6.
-    assert_eq!(s2.capacity_for(4 * 1024 * 1024 * 1024), 6);
-    // 23.4 GiB VRAM would floor to 5 — auto capacity is conservative.
+    // GPU + auto: no count cap; bytes admission against 24 GiB VRAM.
+    assert_eq!(s2.instance_cap(), None);
+    assert!(s2.bytes_admission_active());
+    assert_eq!(s2.vram_budget_bytes(), 24_576 * 1024 * 1024);
+    // Heterogeneous co-residency the old floor(VRAM/largest) formula
+    // rejected: 23.4 GiB VRAM, a 4 GiB + a 3 GiB model = 7 GiB sum —
+    // admitted (the old formula said capacity 5 by count but capacity 1
+    // whenever the LARGEST model alone crossed VRAM/model).
     let hw_234 = Hardware {
         physical_cores: 4,
         total_ram_mib: 16_000,
@@ -537,8 +583,69 @@ fn unit__capacity_auto__cpu_one_gpu_vram_ratio() {
         },
         base_config(),
         EventBus::default(),
-        hw_234,
+        hw_234.clone(),
         Arc::new(LlamaCppEngine::new(stub_manifest())),
     );
-    assert_eq!(s3.capacity_for(4 * 1024 * 1024 * 1024), 5);
+    assert_eq!(s3.vram_budget_bytes(), 24_000 * 1024 * 1024);
+    // Explicit count override wins over every heuristic.
+    let mut cfg_n = base_config();
+    cfg_n.max_loaded_models = 3;
+    let s4 = Supervisor::new(
+        PallamaDirs {
+            config_dir: std::path::PathBuf::from("/tmp/p-cfg"),
+            data_dir: std::path::PathBuf::from("/tmp/p-data"),
+        },
+        cfg_n,
+        EventBus::default(),
+        hw_234.clone(),
+        Arc::new(LlamaCppEngine::new(stub_manifest())),
+    );
+    assert_eq!(s4.instance_cap(), Some(3));
+    assert!(!s4.bytes_admission_active());
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn unit__bytes_admission__heterogeneous_pair_coresides() {
+    // The scenario the floor-division heuristic got wrong: an 8 GiB card,
+    // a 0.5 GiB model live, a 5.8 GiB model incoming. Old formula:
+    // floor(8188 MiB / 5800 MiB) = 1 -> evict the small. Sum admission:
+    // 0.5 + 5.8 = 6.3 GiB <= 8 GiB budget -> co-reside.
+    let mib = |m: u64| m * 1024 * 1024;
+    let (_t, dirs) = setup(&[("small", mib(500)), ("big", mib(5800))]);
+    let s = Supervisor::new(
+        dirs,
+        base_config(),
+        EventBus::default(),
+        Hardware {
+            physical_cores: 4,
+            total_ram_mib: 16_000,
+            gpus: vec![GpuInfo {
+                name: "g".into(),
+                description: "S".into(),
+                total_mib: 8188,
+                free_mib: 8188,
+            }],
+        },
+        Arc::new(LlamaCppEngine::new(stub_manifest())),
+    );
+    assert!(s.bytes_admission_active());
+
+    let store = pallama_core::store::Store::open(&s.dirs).unwrap();
+    let small = u64::try_from(store.get_model("small").unwrap().unwrap().bytes.max(0)).unwrap();
+    let big = u64::try_from(store.get_model("big").unwrap().unwrap().bytes.max(0)).unwrap();
+    drop(store);
+    let budget = s.vram_budget_bytes();
+
+    // Cold box: resident 0, any single model admitted (J3 spawn guard
+    // owns the honest refusal for loads that cannot fit at all).
+    assert_eq!(s.resident_bytes(), 0);
+    assert!(big <= budget, "cold box must admit any single model");
+
+    // Small resident + big incoming co-resides; a second big crosses.
+    assert!(small + big <= budget, "pair must co-reside");
+    assert!(
+        small + big + big > budget,
+        "second heavyweight must not fit"
+    );
 }

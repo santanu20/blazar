@@ -407,7 +407,7 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
 /// GET /models reports per-model status (downloading/downloaded/unloaded/
 /// loading/loaded/sleeping); `loaded_info` merges child fields when running.
 async fn ps_router(state: &Arc<AppState>) -> Response {
-    let engine = match state.sup.ensure(pallama_runtime::ROUTER_KEY).await {
+    let engine = match crate::proxy::ensure_router_detached(&state.sup).await {
         Ok(e) => e,
         Err(e) => return api_error(503, &e.to_string()),
     };
@@ -879,11 +879,18 @@ pub async fn chat(
         }
     }
 
-    let (engine, load_ms) =
-        match ensure_with_admission(&state, &row.name, priority, affinity_hash(&req)).await {
-            Ok(ok) => ok,
-            Err(resp) => return resp,
-        };
+    let (engine, load_ms) = match ensure_with_admission(
+        &state,
+        &row.name,
+        priority,
+        affinity_hash(&req),
+        crate::proxy::body_needs_vision(&req, true),
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(resp) => return resp,
+    };
     // F12: full keep_alive contract — >0 pins the instance for N s,
     // -1 pins "forever", 0 clears any prior pin (the evict-after-response
     // path below then owns teardown). Applied at admission so the pin
@@ -1492,10 +1499,11 @@ pub async fn embeddings(
             state.keys.charge_request(&k.name);
         }
     }
-    let (engine, _) = match ensure_with_admission(&state, &row.name, Priority::Normal, None).await {
-        Ok(ok) => ok,
-        Err(resp) => return resp,
-    };
+    let (engine, _) =
+        match ensure_with_admission(&state, &row.name, Priority::Normal, None, false).await {
+            Ok(ok) => ok,
+            Err(resp) => return resp,
+        };
     crate::proxy::hold_body(
         crate::proxy::begin_accounting(&state, &engine.name),
         (async {
@@ -1593,10 +1601,11 @@ pub async fn embed(
             state.keys.charge_request(&k.name);
         }
     }
-    let (engine, _) = match ensure_with_admission(&state, &row.name, Priority::Normal, None).await {
-        Ok(ok) => ok,
-        Err(resp) => return resp,
-    };
+    let (engine, _) =
+        match ensure_with_admission(&state, &row.name, Priority::Normal, None, false).await {
+            Ok(ok) => ok,
+            Err(resp) => return resp,
+        };
     crate::proxy::hold_body(
         crate::proxy::begin_accounting(&state, &engine.name),
         (async {
@@ -1724,10 +1733,11 @@ pub async fn rerank(
             state.keys.charge_request(&k.name);
         }
     }
-    let (engine, _) = match ensure_with_admission(&state, &row.name, Priority::Normal, None).await {
-        Ok(ok) => ok,
-        Err(resp) => return resp,
-    };
+    let (engine, _) =
+        match ensure_with_admission(&state, &row.name, Priority::Normal, None, false).await {
+            Ok(ok) => ok,
+            Err(resp) => return resp,
+        };
     let mut forward = forward;
     crate::proxy::hold_body(
         crate::proxy::begin_accounting(&state, &engine.name),
@@ -1851,11 +1861,18 @@ pub async fn generate(
             return resp;
         }
     }
-    let (engine, load_ms) =
-        match ensure_with_admission(&state, &row.name, priority, affinity_hash(&req)).await {
-            Ok(ok) => ok,
-            Err(resp) => return resp,
-        };
+    let (engine, load_ms) = match ensure_with_admission(
+        &state,
+        &row.name,
+        priority,
+        affinity_hash(&req),
+        crate::proxy::body_needs_vision(&req, true),
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(resp) => return resp,
+    };
     // F12: keep_alive parity with /api/chat — pin window at admission,
     // explicit evict after the response on 0 (session pins still win).
     if let Some(secs) = keep_alive {
@@ -1944,7 +1961,7 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
     // Router mode: the engine owns per-model lifecycle — forward the
     // unload to the router child (models stay preset-listed, just unloaded).
     if state.config.router {
-        let engine = match state.sup.ensure(pallama_runtime::ROUTER_KEY).await {
+        let engine = match crate::proxy::ensure_router_detached(&state.sup).await {
             Ok(e) => e,
             Err(e) => return api_error(503, &e.to_string()),
         };
@@ -2074,7 +2091,7 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
     }
 
     let (engine, _load_ms) =
-        match ensure_with_admission(&state, model, Priority::Normal, None).await {
+        match ensure_with_admission(&state, model, Priority::Normal, None, false).await {
             Ok(ok) => ok,
             Err(resp) => return resp,
         };
@@ -2351,7 +2368,7 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     // F25: router mode serves N models through ONE pallama instance —
     // count the router child's loaded models, not supervisor rows.
     let models_loaded = if state.config.router {
-        match state.sup.ensure(pallama_runtime::ROUTER_KEY).await {
+        match crate::proxy::ensure_router_detached(&state.sup).await {
             Ok(engine) => {
                 let url = format!("{}/models", child_base(&engine.endpoint));
                 match child_auth(state.http.get(&url), &engine).send().await {
