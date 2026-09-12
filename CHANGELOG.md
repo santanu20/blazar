@@ -156,6 +156,21 @@ tracked here.
   warning saying so. Dense models keep the pinned fast path.
 
 ### Changed
+
+- **Highest-perf defaults from the elimination audit** (2026-09-12,
+  raw-engine elim sweep, 9B q4, fadvise-cold + GPU-idle asserted per
+  config, 3 reps): `--load-mode mlock` auto-policy — empty `load_mode`
+  now pins weights via mlock when they fit a 40% RAM share (eager
+  page-in measured ~0.7s faster to first token than lazy mmap faults;
+  explicit `load_mode` always wins; low-`RLIMIT_MEMLOCK` boxes degrade
+  to a benign upstream warning + plain mmap), and `cache_reuse`
+  defaults to 0 — the engine's native slot prompt-cache already covers
+  identical prefixes (16x on re-ask, measured) while `--cache-reuse`
+  cost ~0.6s on every cold load; opt back in for cross-slot prefix
+  sharing. Measured free within noise and left unchanged: `--metrics`,
+  `--jinja` (quality path), `-b/-ub` at llama defaults, threads 8/16/24,
+  KV q8_0, ctx 4096 vs 16384 warm.
+
 - **Cold-start TTFT measured**: methodology + numbers landed in README
   (Performance). At 0.5B the cold `run` wall is 1.16–1.94 s, all of it
   engine load (mmap + CUDA init); pallama-side stages (profile

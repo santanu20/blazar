@@ -204,7 +204,7 @@ spec = "auto"             # DEFAULT auto (2026-09-11): opportunistic — draft-m
 # server_tools_runtime = "ssh:gpu-box"    # docker:<img>|podman:<img>|docker-container:<id>|podman-container:<id>|ssh:<host>
 # mcp_servers_config = "/etc/pallama/mcp.json"  # Cursor-compatible MCP defs; path checked at compile
 # mcp_servers_json = '{"mcpServers":{"fs":{}}}' # inline alternative (mutually exclusive with the path)
-cache_reuse = 256         # prefix-cache chunk reuse (0 disables; grid-search via `tune --cache-reuse`)
+cache_reuse = 0          # prefix-cache chunk reuse (0 = off by default: the engine's native slot prompt-cache already covers identical prefixes at 16x, while the flag measured ~0.6s SLOWER cold loads; enable for cross-slot prefix sharing, grid-search via `tune --cache-reuse`)
 cache_idle_slots = true   # false emits --no-cache-idle-slots (skip saving idle slots to prompt cache)
 predictive_preload = false # reaper pre-spawns the next likely model (>=3 A->B transitions) while the current idles
  adaptive_slots = true     # sustained admission pressure (queued requests) auto-adopts -np +1 (cap 8) and respawns at idle drain; default on
@@ -235,7 +235,7 @@ kv_unified_per_slot = 0   # per-slot token budget inside the unified buffer (0 =
 swa_full = false          # keep FULL KV for sliding-window layers (quality at memory cost)
 ctx_checkpoints = 0       # rolling context checkpoints for SWA models
 no_kv_offload = false     # keep all KV on GPU; fail instead of spilling to CPU
-load_mode = ""            # "" | mmap | mlock | direct-io
+load_mode = ""            # "" = auto (mlock when weights <= 40% RAM — eager page-in measured ~0.7s faster to first token) | mmap | mlock | direct-io
 spawn_mem_guard = true    # refuse loads when MemAvailable < model/2 + 512 MiB
                           #   (swap-death prevention; set false to load anyway)
 session_bank = true       # KV checkpoints (_auto) survive eviction; restored on respawn
