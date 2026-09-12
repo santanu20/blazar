@@ -76,6 +76,15 @@ tracked here.
   unchanged. `pallama engine install bNNNN-cuda` pins an overlay build
   explicitly; `engine_asset` overrides still win over the overlay.
 
+### Fixed
+- **Speculative drafts no longer pin `--gpu-layers 999`**: the draft's
+  weights + KV allocate DEVICE-side beyond any planner charge, and a
+  hard pin disables the engine's live fitter (`n_gpu_layers already
+  set by user to 999, abort`) — shared-GPU spec pairs could
+  cudaMalloc-OOM. Spec pairs now leave `--gpu-layers` to the fitter
+  (`auto`), in both unified-KV and classic accounting, with a profile
+  warning saying so. Dense models keep the pinned fast path.
+
 ### Changed
 - **Help branding de-ollama'd**: top-level about, help footer, and the
   four refused-command descriptions (`signin`/`login`/`signout`/

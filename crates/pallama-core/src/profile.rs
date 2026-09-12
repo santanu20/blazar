@@ -2407,6 +2407,20 @@ fn resolve_gpu_offload(
             .saturating_add(KV_UNIFIED_VRAM_FLOOR_BYTES)
             .saturating_add(UNIFIED_SPAWN_OVERHEAD_BYTES);
         if projected <= vram_bytes {
+            if input.draft_path.is_some() {
+                // Speculative draft weights + its KV allocate DEVICE-side
+                // and are charged by no planner here; a hard pin would
+                // also disable the engine's live fitter ("n_gpu_layers
+                // already set by user to 999, abort"). Leave the flag to
+                // the fitter so shared-GPU spec pairs degrade instead of
+                // cudaMalloc-OOM-ing.
+                warnings.push(
+                    "speculative draft adds device-side weights+KV beyond the planner charge; \
+                     --gpu-layers left to the engine live fitter (common_fit_params)"
+                        .to_string(),
+                );
+                return ("auto", "auto");
+            }
             // The unified accounting decided the pin (classic full-KV math
             // would NOT have fit): say so — `ps` shows "full" and the reader
             // deserves the why.
@@ -2425,6 +2439,14 @@ fn resolve_gpu_offload(
         return ("auto", "auto");
     }
     if resident.saturating_add(kv) <= vram_bytes / 100 * 85 {
+        if input.draft_path.is_some() {
+            warnings.push(
+                "speculative draft adds device-side weights+KV beyond the planner charge; \
+                 --gpu-layers left to the engine live fitter (common_fit_params)"
+                    .to_string(),
+            );
+            return ("auto", "auto");
+        }
         return ("999", "full");
     }
     ("auto", "auto")
@@ -3785,7 +3807,55 @@ mod tests {
             .argv
             .windows(2)
             .any(|w| w[0] == "--spec-draft-model" && w[1] == draft.as_str()));
-        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        // Spec pair: gpu-layers is deliberately NOT pinned so the engine
+        // live fitter owns the split (draft weights+KV are unplanned).
+        assert!(
+            !p.argv
+                .windows(2)
+                .any(|w| w[0] == "--gpu-layers" && w[1] == "999"),
+            "spec pair must not pin gpu-layers: {:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("left to the engine live fitter")),
+            "unpin warning required: {:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__spec_draft__gpu_layers_unpinned_both_kv_modes() {
+        // Classic-KV branch (kv_unified off) must unpin too: draft device
+        // allocations are unplanned in BOTH accounting modes.
+        let cfg = Config {
+            spec: "eagle3".into(),
+            slots: 1,
+            kv_unified: Some(false),
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let mut inp =
+            input_named_with_spec("qwen3-8b", &g, &hw, &cfg, &ALL_FLAGS, &EAGLE3_SPEC_TYPES);
+        let draft = draft_file("eagle3-classic");
+        inp.draft_path = Some(&draft);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv
+                .windows(2)
+                .any(|w| w[0] == "--gpu-layers" && w[1] == "999"),
+            "classic-KV spec pair must not pin gpu-layers: {:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("left to the engine live fitter")),
+            "unpin warning required: {:?}",
+            p.warnings
+        );
     }
 
     #[test]
