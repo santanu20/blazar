@@ -3,11 +3,30 @@
 
 use serde_json::{json, Value};
 
+/// llama-server's default sampler chain (verified live via /props on
+/// b10896). Used when `adaptive_p` is enabled without an explicit
+/// `samplers` list — the engine then appends the adaptive sampler itself.
+const DEFAULT_SAMPLER_CHAIN: &[&str] = &[
+    "penalties",
+    "dry",
+    "top_n_sigma",
+    "top_k",
+    "typ_p",
+    "top_p",
+    "min_p",
+    "xtc",
+    "temperature",
+];
+
 /// Ollama sampling options -> `OpenAI` request fields. Unknown option keys
 /// are returned so the caller can 400 listing them (fail fast, complaint
 /// #15's sibling: never silently drop what the user asked for).
 pub fn apply_ollama_options(openai_req: &mut Value, options: &Value) -> Vec<String> {
     let mut unknown = Vec::new();
+    // Recorded during the pass, applied after it: with serde_json's
+    // alphabetical object order "adaptive_p" runs before "samplers", so
+    // an explicit samplers list would clobber the merged chain.
+    let mut adaptive_p = false;
     let Some(map) = options.as_object() else {
         return unknown;
     };
@@ -28,6 +47,46 @@ pub fn apply_ollama_options(openai_req: &mut Value, options: &Value) -> Vec<Stri
             "repeat_last_n" => openai_req["repeat_last_n"] = v.clone(),
             "presence_penalty" => openai_req["presence_penalty"] = v.clone(),
             "frequency_penalty" => openai_req["frequency_penalty"] = v.clone(),
+            // llama-server native sampler fields (verified against the
+            // b10896 request schema): pass through 1:1 like top_k/min_p.
+            "xtc_probability" => openai_req["xtc_probability"] = v.clone(),
+            "xtc_threshold" => openai_req["xtc_threshold"] = v.clone(),
+            "top_n_sigma" => openai_req["top_n_sigma"] = v.clone(),
+            "logit_bias" => openai_req["logit_bias"] = v.clone(),
+            "dry_multiplier" => openai_req["dry_multiplier"] = v.clone(),
+            "dry_base" => openai_req["dry_base"] = v.clone(),
+            "dry_allowed_length" => openai_req["dry_allowed_length"] = v.clone(),
+            "dry_penalty_last_n" => openai_req["dry_penalty_last_n"] = v.clone(),
+            "dry_sequence_breakers" => {
+                // Upstream asserts a non-empty array of strings; a bad
+                // shape must 400 here, not die in the child.
+                let ok = v
+                    .as_array()
+                    .is_some_and(|a| !a.is_empty() && a.iter().all(Value::is_string));
+                if ok {
+                    openai_req["dry_sequence_breakers"] = v.clone();
+                } else {
+                    unknown.push(
+                        "dry_sequence_breakers (must be a non-empty array of strings)".into(),
+                    );
+                }
+            }
+            "mirostat" => openai_req["mirostat"] = v.clone(),
+            "mirostat_tau" => openai_req["mirostat_tau"] = v.clone(),
+            "mirostat_eta" => openai_req["mirostat_eta"] = v.clone(),
+            "dynatemp_range" => openai_req["dynatemp_range"] = v.clone(),
+            "dynatemp_exponent" => openai_req["dynatemp_exponent"] = v.clone(),
+            "adaptive_target" => openai_req["adaptive_target"] = v.clone(),
+            "adaptive_decay" => openai_req["adaptive_decay"] = v.clone(),
+            "samplers" => openai_req["samplers"] = v.clone(),
+            "adaptive_p" => {
+                // No bool field upstream: adaptive_p activates by joining
+                // the samplers chain (engine appends it at chain end).
+                // Applied post-loop — see the flag comment above.
+                if v.as_bool() == Some(true) {
+                    adaptive_p = true;
+                }
+            }
             "num_ctx" | "num_batch" | "num_gpu" | "num_thread" | "num_keep" | "numa" => {
                 // Runner options: num_ctx is handled by the caller
                 // (instance restart); the rest are accepted-and-ignored
@@ -41,6 +100,17 @@ pub fn apply_ollama_options(openai_req: &mut Value, options: &Value) -> Vec<Stri
             }
             _ => unknown.push(k.clone()),
         }
+    }
+    if adaptive_p {
+        let mut chain = openai_req
+            .get("samplers")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_SAMPLER_CHAIN.iter().map(|s| json!(s)).collect());
+        if !chain.iter().any(|s| s == "adaptive_p") {
+            chain.push(json!("adaptive_p"));
+        }
+        openai_req["samplers"] = Value::Array(chain);
     }
     unknown
 }
@@ -442,6 +512,81 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn unit__sampler_options__native_passthrough_table() {
+        // Every llama-server-native sampler field passes through 1:1
+        // (field names verified against the b10896 request schema).
+        let cases: &[(&str, serde_json::Value)] = &[
+            ("xtc_probability", json!(0.5)),
+            ("xtc_threshold", json!(0.1)),
+            ("top_n_sigma", json!(2)),
+            ("logit_bias", json!({"12834": -3.0})),
+            ("dry_multiplier", json!(0.8)),
+            ("dry_base", json!(1.75)),
+            ("dry_allowed_length", json!(2)),
+            ("dry_penalty_last_n", json!(256)),
+            ("mirostat", json!(2)),
+            ("mirostat_tau", json!(5.0)),
+            ("mirostat_eta", json!(0.1)),
+            ("dynatemp_range", json!(1.5)),
+            ("dynatemp_exponent", json!(1.0)),
+            ("adaptive_target", json!(0.9)),
+            ("adaptive_decay", json!(0.9)),
+            ("samplers", json!(["top_k", "temperature"])),
+        ];
+        for (key, val) in cases {
+            let mut out = json!({});
+            let unknown = apply_ollama_options(&mut out, &json!({*key: val.clone()}));
+            assert!(unknown.is_empty(), "{key} flagged unknown: {unknown:?}");
+            assert_eq!(&out[*key], val, "{key} passthrough");
+        }
+    }
+
+    #[test]
+    fn unit__sampler_options__dry_sequence_breakers_shape_checked() {
+        let mut out = json!({});
+        let unknown = apply_ollama_options(
+            &mut out,
+            &json!({"dry_sequence_breakers": ["\\n", ":", "\""]}),
+        );
+        assert!(unknown.is_empty());
+        assert_eq!(
+            out["dry_sequence_breakers"].as_array().map(Vec::len),
+            Some(3)
+        );
+        // Empty array / non-strings must 400, not die in the child.
+        for bad in [json!([]), json!("\\n"), json!([1, 2])] {
+            let mut out2 = json!({});
+            let unknown = apply_ollama_options(&mut out2, &json!({"dry_sequence_breakers": bad}));
+            assert!(
+                unknown.len() == 1 && unknown[0].contains("non-empty array"),
+                "bad shape {bad} must be flagged: {unknown:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unit__sampler_options__adaptive_p_joins_chain() {
+        // Without an explicit samplers list: default chain + adaptive_p.
+        let mut out = json!({});
+        apply_ollama_options(&mut out, &json!({"adaptive_p": true}));
+        let chain = out["samplers"].as_array().expect("chain built");
+        assert_eq!(chain.last(), Some(&json!("adaptive_p")));
+        assert!(chain.len() == DEFAULT_SAMPLER_CHAIN.len() + 1);
+        // With an explicit list (processed AFTER adaptive_p alphabetically):
+        // the user chain is honored and adaptive_p is appended, not lost.
+        let mut out2 = json!({});
+        apply_ollama_options(
+            &mut out2,
+            &json!({"adaptive_p": true, "samplers": ["top_k"]}),
+        );
+        assert_eq!(out2["samplers"], json!(["top_k", "adaptive_p"]));
+        // false / absent: never touched.
+        let mut out3 = json!({});
+        apply_ollama_options(&mut out3, &json!({"adaptive_p": false}));
+        assert!(out3.get("samplers").is_none());
+    }
 
     #[test]
     fn unit__chat_to_openai__sampling_and_schema() {
