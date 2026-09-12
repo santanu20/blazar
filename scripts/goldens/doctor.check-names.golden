@@ -12,5 +12,4 @@ keys
 models
 port
 sentinel
-service
 store
