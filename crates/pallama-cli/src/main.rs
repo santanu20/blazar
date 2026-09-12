@@ -285,6 +285,9 @@ enum Cmd {
     Why {
         /// Trace id from the x-pallama-trace-id response header
         trace: Option<String>,
+        /// Tail sentinel detections live instead (same as `pallama watch`)
+        #[arg(long, conflicts_with = "trace")]
+        watch: bool,
     },
     /// Live tail of sentinel detections as they happen (Ctrl-C to stop)
     Watch,
@@ -715,7 +718,13 @@ async fn run(cmd: Cmd) -> Result<()> {
         Cmd::Logout => cloud_refusal("logout", ""),
         Cmd::Session { cmd } => session_cmd(cmd).await,
         Cmd::Doctor => doctor().await,
-        Cmd::Why { trace } => why(trace.as_deref()).await,
+        Cmd::Why { trace, watch: live } => {
+            if live {
+                watch().await
+            } else {
+                why(trace.as_deref()).await
+            }
+        }
         Cmd::Watch => watch().await,
     }
 }
