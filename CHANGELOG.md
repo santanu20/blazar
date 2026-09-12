@@ -85,6 +85,13 @@ tracked here.
 
 ### Fixed
 
+- **Bank restore defers while the triggering request runs**: the
+  detached slot-restore still queued the request that caused the
+  spawn ~1s behind cache priming (the pending request was invisible
+  to busy-polls). `ensure_routed` now brackets itself with a pending
+  counter and the restore posts only at idle (100ms poll, 30s bound,
+  bank preserved for the next spawn). Racing request: 5.44s vs the
+  5.3s no-bank floor.
 - **Session-bank restore leaves the spawn critical path**: the ~1s
   slot-0 restore POST runs detached behind an fs-only identity
   preflight, so Ready publishes at engine-health time (cold 9B
