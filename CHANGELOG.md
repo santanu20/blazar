@@ -102,6 +102,14 @@ tracked here.
   warning saying so. Dense models keep the pinned fast path.
 
 ### Changed
+- **Cold-start TTFT measured, load-bound (0.5B)**: methodology +
+  numbers landed in README (Performance). tl;dr — cold `run` wall
+  1.16–1.94 s on the RTX 4070 laptop, all of it engine load (mmap +
+  CUDA init); pallama-side stages (profile compile, health poll,
+  admission) are milliseconds. The earlier 8.5 s-vs-6.3 s "gap"
+  against ollama was an 8B-class model under a contended box — not a
+  pallama-side regression. No code change: measurement first, nothing
+  ours to fix at this size.
 - **Help branding de-ollama'd**: top-level about, help footer, and the
   four refused-command descriptions (`signin`/`login`/`signout`/
   `logout`) now say "pallama" instead of "ollama.com"/"ollama-grade".

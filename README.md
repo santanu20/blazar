@@ -105,7 +105,7 @@ Capability discovery: `GET /.well-known/pallama` (routes, headers, features, eng
 |---|---|
 | `serve` / `stop` | Daemon lifecycle (pidfile-guarded, graceful shutdown) |
 | `pull` / `rm` / `list` / `show` | Model store (plain GGUF files; rm refuses while running) |
-| `run <model>` | Streaming REPL (`/exit /clear /model /sysinfo /profile`) |
+| `run <model>` | Streaming REPL (`/exit /clear /model /sysinfo /profile`); profile decisions print as `[profile] …` once after the first turn of each model |
 | `ps [--reset]` | Live instances: state, ctx, **GPU offload + card** (`full@<card>`/`partial@<card>`/`cpu`/`auto` — silent CPU fallback is never silent, and you always see which card holds the model), in-flight, endpoint; `warn[<model>]` lines under the table surface profile decisions (ctx fit, slot auto, offload rationale) |
 | `bench` / `tune --search` | `llama-bench` tables; measured argmax profile adoption |
 | `scripts/bench_matrix.py` | The single benchmarking entry point. Full matrix: every engine × provider (direct child spawn / pallama gateway via sandbox / ollama reference) × ctx/parallel sweep, plus **quality lanes** — llama-perplexity parity, 20-prompt greedy parity + gateway-transparency lane, feature-capability matrix, concurrency, optimization axes (KV quant / spec decode / projector / paged-attn), soak — into resume-safe `cells.jsonl` artifacts, an internal forensics `benchmark.md`, and a **publication-format report** (`--md BENCHMARK.md`, or `--render-only` to re-render an existing campaign without re-measuring). **Cold-start parity lanes**: page-cache-dropped (`posix_fadvise`) + GPU-idle-asserted cold TTFT on every runtime, optional ollama daemon-boot metric (`--ollama-service-restart`, sudo via `BENCH_SUDO_PASSWORD` env). **Idle-wake lane** (pallama sleep ladder vs ollama keep_alive expiry, policy verified via `/api/ps`), **long-ctx curve** (`--ctxcurve-sweep`), **sustained concurrency** (`--conc-rounds`, per-round + cross-round p99 tails). Model pick is store-row-first (scratch files can't 404 the gateway lanes). Supersedes the earlier `bench_engines`/`bench_compare`/`soak.sh` harnesses. Never touches the real daemon, config, or ollama |
@@ -493,6 +493,24 @@ Load-bearing ideas:
 - **Signals are single-pid only** — Pallama never signals process groups; every teardown path is audited and idempotent.
 
 ## Verification
+
+### Cold-start TTFT (measured, 2026-09-12, RTX 4070 laptop, 0.5B)
+
+Method: `pallama stop`, 1 s settle, then `time pallama run
+qwen2.5-0.5b-instruct 'Say ok' --max-tokens 5` — three runs, plus a
+warm `/api/chat` for the floor.
+
+| Stage | Wall |
+|---|---|
+| Cold `run` (3 runs) | 1.16–1.94 s |
+| Warm `/api/chat` total_duration | 21.7 ms (prompt 5.5 + eval 16.2) |
+| Daemon-side spawn (profile → healthy → session-restore) | ~0.86 s |
+
+The cold wall is engine load (mmap + CUDA init) — pallama-side stages
+(profile compile, adaptive health poll ~12 ms overshoot, admission)
+are milliseconds. An 8.5 s-vs-6.3 s comparison against ollama that
+motivated this measurement was an 8B-class model on a contended box;
+at equal conditions the daemon adds no measurable overhead.
 
 764 tests: pure compiler tables, wiremock network suites (resume, sha, allowlist, token isolation), engine install cycles with a real stub engine binary, supervisor lifecycle integration (ladder, capacity, crash-circuit, shutdown), and full gateway round-trips over both APIs — including the sentinel suites (9 detection codes, responses grammar, persistence reload, enforce 422s, live watch SSE, parity-under-observation). `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
