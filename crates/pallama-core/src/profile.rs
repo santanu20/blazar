@@ -211,7 +211,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // default_ctx is a CEILING auto-fit may divide; tuning (bench) and
     // overlay ctx are hard pins — never divided.
     let ctx_pinned = tuning.ctx.is_some() || overlay.ctx.is_some();
-    let rs = resolve_slots(
+    let mut rs = resolve_slots(
         input,
         overlay,
         base_ctx,
@@ -219,6 +219,71 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         ctx_pinned,
         &mut warnings,
     );
+    // --- 2b. unified-KV pool must fit the --cache-ram budget.
+    // With `--kv-unified` the WHOLE KV pool plus the weights mmap live
+    // inside the `--cache-ram` SYSTEM-RAM budget, so a ctx the VRAM
+    // planner happily admits can still blow the RAM budget and the child
+    // dies at context creation ("failed to create context") regardless
+    // of free VRAM. Shrink ctx (never below AUTOFIT_CTX_FLOOR) to fit;
+    // pinned ctx is never touched — warn instead. f16 bytes are an
+    // upper bound (quantized KV only shrinks it) — conservative by
+    // design.
+    if kv_unified_emitted(input) {
+        if let Some(kv) = kv_f16_bytes(input, rs.total_ctx).filter(|kv| *kv > 0) {
+            // Budget the spawn will actually run under: the rule-12
+            // emitted share, else upstream's own default when the knob
+            // is off (flag absent, pool still bounded by it).
+            let budget_mib = effective_cache_ram_mib(input).unwrap_or(8192);
+            // Compute buffers share the budget too; hold a headroom slice.
+            let usable = budget_mib * 1024 * 1024 * 85 / 100;
+            let demand = input.model_bytes.saturating_add(kv);
+            if demand > usable {
+                let mib = |b: u64| b / (1024 * 1024);
+                if ctx_pinned {
+                    warnings.push(format!(
+                        "pinned ctx {} exceeds the unified --cache-ram budget \
+                         ({} MiB): f16 KV {} MiB + weights {} MiB will likely fail \
+                         context creation — lower ctx, or raise the budget via \
+                         model_overrides extra_args --cache-ram",
+                        rs.total_ctx,
+                        budget_mib,
+                        mib(kv),
+                        mib(input.model_bytes)
+                    ));
+                } else {
+                    let per_ctx = kv / u64::from(rs.total_ctx);
+                    let room = usable.saturating_sub(input.model_bytes);
+                    let fit = room / per_ctx.max(1);
+                    // 256-token multiple keeps upstream-friendly sizes.
+                    let new_ctx = u32::try_from(fit).unwrap_or(u32::MAX) & !255;
+                    if new_ctx >= AUTOFIT_CTX_FLOOR && new_ctx < rs.total_ctx {
+                        let per_slot = (new_ctx / rs.slots).max(1);
+                        warnings.push(format!(
+                            "unified KV pool fit: ctx {} -> {} (f16 KV {} MiB + \
+                             weights {} MiB vs --cache-ram budget {} MiB)",
+                            rs.total_ctx,
+                            new_ctx,
+                            mib(kv),
+                            mib(input.model_bytes),
+                            budget_mib
+                        ));
+                        // Same (per_slot, slots) pair resolve_slots uses, so
+                        // the SlotsCtxAutoFit event stays truthful.
+                        rs.autofit = Some((per_slot, rs.slots));
+                        rs.total_ctx = new_ctx;
+                        rs.per_slot_ctx = per_slot;
+                    } else {
+                        warnings.push(format!(
+                            "unified KV pool cannot fit the --cache-ram budget \
+                             ({budget_mib} MiB) even at the ctx floor {AUTOFIT_CTX_FLOOR}: spawn will likely \
+                             fail — raise the budget via model_overrides extra_args \
+                             --cache-ram or reduce weights"
+                        ));
+                    }
+                }
+            }
+        }
+    }
     let slots = rs.slots;
     let ctx = rs.total_ctx;
     let fa = match tuning.fa {
@@ -4219,15 +4284,21 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
+        // Train clamp bounds the TOTAL; auto-fit then divides it into 4
+        // shallow slots. Unified-KV pool fit then shrinks further: f16 KV
+        // 2240 MiB + weights 5000 MiB > 85% of the 8192 MiB cache-ram
+        // budget (6963 MiB usable) — ctx 40960 -> 35840 (4x8960).
         assert!(p
             .argv
             .windows(2)
-            .any(|w| w[0] == "--ctx-size" && w[1] == "40960"));
-        // Train clamp bounds the TOTAL; auto-fit then divides it into
-        // 4x10240 shallow slots (default ctx is not a pin).
-        assert_eq!(p.ctx, 10_240);
-        assert_eq!(p.ctx_autofit, Some((10_240, 4)));
+            .any(|w| w[0] == "--ctx-size" && w[1] == "35840"));
+        assert_eq!(p.ctx, 8_960);
+        assert_eq!(p.ctx_autofit, Some((8_960, 4)));
         assert!(p.warnings.iter().any(|w| w.contains("clamped")));
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.contains("unified KV pool fit: ctx 40960 -> 35840")));
     }
 
     #[test]
@@ -4247,10 +4318,11 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        // YaRN lifts the CEILING (81920) — the emitted total stays within
-        // it; auto-fit divides to 4x10240 (total 40960 <= 81920).
-        assert_eq!(p.ctx, 10_240);
-        assert_eq!(p.ctx_autofit, Some((10_240, 4)));
+        // YaRN lifts the CEILING (81920); the emitted total stays within
+        // it. Same unified-KV budget shrink as the non-YaRN case above
+        // (clamp/autofit total 40960 -> 35840 = 4x8960).
+        assert_eq!(p.ctx, 8_960);
+        assert_eq!(p.ctx_autofit, Some((8_960, 4)));
         assert!(p
             .warnings
             .iter()
@@ -4258,7 +4330,94 @@ mod tests {
         assert!(p
             .argv
             .windows(2)
-            .any(|w| w[0] == "--ctx-size" && w[1] == "40960"));
+            .any(|w| w[0] == "--ctx-size" && w[1] == "35840"));
+    }
+
+    #[test]
+    fn unit__unified_kv_pool_fit__shrinks_ctx_to_cache_ram_budget() {
+        // 2026-09-12 live incident shape (qwen3-1.7b): with --kv-unified
+        // the WHOLE f16 KV pool + weights mmap must fit the --cache-ram
+        // system-RAM budget or the child dies at context creation with
+        // free VRAM to spare. Geometry head_dim 64 -> 57344 B/ctx-token:
+        // kv(131072) = 7168 MiB; budget min(8192, 30% of 13674) = 4102
+        // MiB, usable 85% = 3486 MiB; weights 1200 MiB -> ctx 131072 ->
+        // 41792 (57344 B/token x room 2286 MiB, floored to 256).
+        let cfg = Config {
+            default_ctx: 131_072,
+            ..Config::default()
+        };
+        let hw = gpu_hw(20_000, 13_674, 8); // VRAM never the limiter
+        let g = GgufMeta {
+            context_length: Some(131_072),
+            ..meta()
+        };
+        let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        inp.model_bytes = 1_200 * MIB;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p.argv.windows(2).any(|w| w == ["--cache-ram", "4102"]));
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--ctx-size" && w[1] != "131072"));
+        assert!(p.warnings.iter().any(|w| w.contains("unified KV pool fit")));
+        // (per_slot, slots) pair stays truthful for SlotsCtxAutoFit.
+        let total: u64 = p
+            .argv
+            .windows(2)
+            .find(|w| w[0] == "--ctx-size")
+            .and_then(|w| w[1].parse::<u32>().ok())
+            .map(u64::from)
+            .expect("--ctx-size present");
+        assert!(total < 131_072, "ctx must have shrunk, got {total}");
+        let (per_slot, slots) = p.ctx_autofit.expect("autofit marker set");
+        assert_eq!(u64::from(per_slot) * u64::from(slots), total);
+    }
+
+    #[test]
+    fn unit__unified_kv_pool_fit__pinned_ctx_warns_not_shrinks() {
+        let cfg = Config {
+            default_ctx: 131_072,
+            ..Config::default()
+        };
+        let hw = gpu_hw(20_000, 13_674, 8);
+        let g = GgufMeta {
+            context_length: Some(131_072),
+            ..meta()
+        };
+        let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        inp.model_bytes = 1_200 * MIB;
+        let p = compile(
+            &inp,
+            &TuningOverrides {
+                ctx: Some(131_072), // bench pin: hard pin, never divided
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(p.argv.windows(2).any(|w| w == ["--ctx-size", "131072"]));
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.contains("pinned ctx 131072 exceeds")));
+        assert_eq!(p.ctx_autofit, None);
+    }
+
+    #[test]
+    fn unit__unified_kv_pool_fit__tiny_model_argv_unchanged() {
+        // Regression guard: pools that already fit must keep resolve_slots'
+        // own plan untouched (slots-auto np2, total ctx 32768) and get no
+        // new warning from the unified-KV fit rule.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        inp.model_bytes = 500 * MIB;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p.argv.windows(2).any(|w| w == ["--ctx-size", "32768"]));
+        assert!(!p
+            .warnings
+            .iter()
+            .any(|w| w.contains("unified KV pool") || w.contains("pinned ctx")));
     }
 
     #[test]

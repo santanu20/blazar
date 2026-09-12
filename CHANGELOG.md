@@ -14,7 +14,18 @@ tracked here.
   input parses as an `owner/repo[:QUANT]` ref or a catalog short name;
   store hits never touch the network, and unknown names keep the
   not-found teaching error. `pallama pull` itself is unchanged.
-
+- **Unified-KV pool must fit the `--cache-ram` budget**: with
+  `--kv-unified`, the whole KV pool + weights live inside the
+  `--cache-ram` system-RAM budget — a default 32k ctx on a 1.7B model
+  needs a ~7.3 GiB pool against a ~4.1 GiB budget and the engine child
+  died at context creation regardless of free VRAM. The profile
+  compiler now shrinks ctx (256-token steps, never below the 4096
+  floor) until the f16 KV + weights fit the budget, marks the profile
+  `ctx_autofit`, and warns loudly; a pinned ctx is never touched —
+  it warns instead (raise the budget via model_overrides
+  extra_args `--cache-ram`). Engine-crash errors now carry the
+  child's last log lines (e.g. "failed to create context … cudaMalloc
+  failed: out of memory") instead of a bare key.
 - **Colon-name resolution (ollama muscle memory)**: every model-taking
   command (`show`, `run`, `rm`, `cp` source, `stop`, `bench`, `tune`,
   `mmproj`, `quantize`, `drafts`, `session`, `lora`) resolves

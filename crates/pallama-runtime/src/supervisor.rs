@@ -1385,6 +1385,8 @@ impl Supervisor {
 
         let mut auth_keyfile: Option<std::path::PathBuf> = None;
         let mut child_died_during_load = false;
+        // Dying router child's log tail (see spawn_instance for rationale).
+        let mut last_load_tail = String::new();
         for _attempt in 0..2 {
             let endpoint = self.pick_endpoint(ROUTER_KEY);
             // Child auth dies with the child: minted per attempt (same
@@ -1519,6 +1521,7 @@ impl Supervisor {
                     } else {
                         tracing::warn!(router = ROUTER_KEY, "router health check failed: {e:#}");
                     }
+                    last_load_tail = child.tail_joined();
                     let _ = child.kill().await;
                     let _ = child.reap().await;
                 }
@@ -1528,7 +1531,10 @@ impl Supervisor {
             let _ = std::fs::remove_file(p);
         }
         Err(if child_died_during_load {
-            SupervisionError::EngineCrashed(ROUTER_KEY.to_string())
+            SupervisionError::EngineCrashed(format!(
+                "{ROUTER_KEY}: {}",
+                Self::tail_excerpt(&last_load_tail)
+            ))
         } else {
             SupervisionError::ModelLoadTimeout(ROUTER_KEY.to_string())
         })
@@ -1959,6 +1965,10 @@ impl Supervisor {
         // Retry once on immediate port-race death (bind fail).
         let mut auth_keyfile: Option<std::path::PathBuf> = None;
         let mut child_died_during_load = false;
+        // Last dying child's log tail: the single most useful artifact
+        // when a spawn fails (upstream's own error, e.g. "failed to
+        // create context") — carried into the EngineCrashed payload.
+        let mut last_load_tail = String::new();
         for _attempt in 0..2 {
             let endpoint = self.pick_endpoint(key);
             // Child auth dies with the child: minted per attempt (same
@@ -2204,6 +2214,7 @@ impl Supervisor {
                     } else {
                         tracing::warn!(model = name, "health check failed: {e:#}");
                     }
+                    last_load_tail = child.tail_joined();
                     let _ = child.kill().await;
                     let _ = child.reap().await;
                 }
@@ -2216,10 +2227,26 @@ impl Supervisor {
         }
         self.note_engine_failure(name);
         Err(if child_died_during_load {
-            SupervisionError::EngineCrashed(key.to_string())
+            SupervisionError::EngineCrashed(format!(
+                "{key}: {}",
+                Self::tail_excerpt(&last_load_tail)
+            ))
         } else {
             SupervisionError::ModelLoadTimeout(key.to_string())
         })
+    }
+
+    /// Last few non-empty lines of a dead child's log tail, for the
+    /// `EngineCrashed` payload — the upstream error line usually sits
+    /// right at the end (e.g. "failed to create context").
+    fn tail_excerpt(tail: &str) -> String {
+        let lines: Vec<&str> = tail
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        let take = lines.len().saturating_sub(3)..;
+        lines[take].join(" | ")
     }
 
     /// J2 crash-loop detection: record that `model` failed to spawn and
