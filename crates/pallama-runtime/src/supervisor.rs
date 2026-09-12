@@ -112,6 +112,16 @@ fn model_of_key(key: &str) -> &str {
     }
 }
 
+/// Drops one unit of ensure-window demand when the request's
+/// `ensure_routed` call ends (any exit path).
+struct PendingGuard(Arc<AtomicI64>);
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Not-found payload with the flat-name teaching line for ollama
 /// `model:tag` input (reached only when BOTH forms missed, so the
 /// swapped spelling is a suggestion, never a promise).
@@ -137,7 +147,34 @@ async fn bank_restore_post(
     ctx: u32,
     auth: Option<String>,
     router: bool,
+    pend: Option<Arc<AtomicI64>>,
+    inst: Arc<Instance>,
 ) {
+    // Defer while the triggering request is still in its ensure window
+    // or a generation holds slot 0: the restore POST serializes on
+    // slot 0 upstream, so posting into traffic queues the user behind
+    // cache priming (live A/B: the racing request paid ~1s). Bounded:
+    // busy for 30s means real traffic — leave the bank on disk for
+    // the next spawn. The gap between the guard dropping and the
+    // gateway's begin_request is microseconds; worst case one 1s
+    // queue, the pre-fix behavior.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let pending = pend.as_ref().is_some_and(|p| p.load(Ordering::SeqCst) > 0);
+        let busy = inst.in_flight.load(Ordering::SeqCst) > 0;
+        if !pending && !busy {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            tracing::debug!(
+                target: "pallama::bank",
+                model = %name,
+                "bank restore deferred out — instance busy; bank stays for the next spawn"
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     let (host, port) = match &endpoint {
         pallama_core::Endpoint::Tcp { host, port } => (host, *port),
         // UDS children keep their slot protocol on the socket; the
@@ -538,6 +575,11 @@ pub struct Supervisor {
     /// `reap_dead_children`, consumed by the spawn success path,
     /// cleared by a clean evict (user stop / idle / capacity).
     unclean_dead: DashMap<String, ()>,
+    /// Requests mid-`ensure_routed` (entry-incremented, Drop-decremented
+    /// guard). The detached bank-restore defers while this is > 0: the
+    /// triggering request is otherwise invisible to an in-flight poll
+    /// (`begin_request` fires only after the instance exists).
+    ensure_pending: DashMap<String, Arc<AtomicI64>>,
     /// One-shot ctx override for the NEXT spawn of a model (per-request
     /// `options.num_ctx` — complaint #13). Consumed on use.
     pending_ctx: DashMap<String, u32>,
@@ -653,6 +695,7 @@ impl Supervisor {
             load_results: DashMap::new(),
             restarts: DashMap::new(),
             unclean_dead: DashMap::new(),
+            ensure_pending: DashMap::new(),
             pending_ctx: DashMap::new(),
             heat: std::sync::Mutex::new(std::collections::HashMap::new()),
             prefix_affinity: DashMap::new(),
@@ -838,6 +881,19 @@ impl Supervisor {
             resolved.as_str()
         } else {
             name
+        };
+        // Request-in-window marker for the detached bank restore: the
+        // triggering request pays no cache-priming queue (see the defer
+        // loop in bank_restore_post). Guard decrements on every exit
+        // path via Drop.
+        let _pend_guard = {
+            let counter = self
+                .ensure_pending
+                .entry(name.to_string())
+                .or_default()
+                .clone();
+            counter.fetch_add(1, Ordering::SeqCst);
+            PendingGuard(counter)
         };
         // Router mode: every model name resolves to the ONE router child
         // (upstream autoloads the model on request, LRU-evicts at
@@ -2295,8 +2351,13 @@ impl Supervisor {
                                 let ctx = profile.ctx;
                                 let secret = auth.as_ref().map(|a| a.secret.clone());
                                 let router = self.config.router;
+                                let inst_ref = inst.clone();
+                                let pend = self.ensure_pending.get(key).map(|e| e.value().clone());
                                 tokio::spawn(async move {
-                                    bank_restore_post(name, ep, ctx, secret, router).await;
+                                    bank_restore_post(
+                                        name, ep, ctx, secret, router, pend, inst_ref,
+                                    )
+                                    .await;
                                 });
                             } else {
                                 tracing::warn!(
@@ -3579,6 +3640,35 @@ mod routing_tests {
     use super::*;
     use crate::engine::manifest::Manifest;
     use pallama_core::{ModelOverride, Profile};
+
+    #[test]
+    fn unit__pending_guard__drops_one_unit_on_any_exit() {
+        // Early-return style drop (simulate `?` exiting ensure).
+        fn inner(c: &Arc<AtomicI64>) -> Option<()> {
+            let _g = {
+                c.fetch_add(1, Ordering::SeqCst);
+                PendingGuard(c.clone())
+            };
+            None? // early exit drops the guard
+        }
+        // The bank-restore defer loop polls this counter: +1 at
+        // ensure_routed entry, -1 via Drop on EVERY exit path (the ?
+        // operator included). Arithmetic pinned here because the
+        // restore deferral's correctness hangs on the pairing.
+        let c = Arc::new(AtomicI64::new(0));
+        {
+            let _g = {
+                c.fetch_add(1, Ordering::SeqCst);
+                PendingGuard(c.clone())
+            };
+            assert_eq!(c.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(c.load(Ordering::SeqCst), 0);
+        // Early-return style drop (simulate `?` exiting ensure).
+        let c2 = Arc::new(AtomicI64::new(0));
+        let _ = inner(&c2);
+        assert_eq!(c2.load(Ordering::SeqCst), 0);
+    }
 
     /// Engine stub: routing never spawns, so every method is inert.
     struct FakeEngine(Manifest);
