@@ -5207,12 +5207,17 @@ fn engine_rm(d: &PallamaDirs, tag: &str) -> Result<()> {
     println!(
         "removed engine {tag} ({} MiB reclaimed{})",
         mib,
-        if had_dir { "" } else { ", directory already gone" }
+        if had_dir {
+            ""
+        } else {
+            ", directory already gone"
+        }
     );
     Ok(())
 }
 
-fn local_engine_manager(d: &PallamaDirs) -> Result<EngineManager> {    let token = std::env::var("GH_TOKEN").ok();
+fn local_engine_manager(d: &PallamaDirs) -> Result<EngineManager> {
+    let token = std::env::var("GH_TOKEN").ok();
     let gh = GhClient::new(token)?;
     Ok(EngineManager {
         dirs: d.clone(),
