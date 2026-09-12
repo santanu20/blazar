@@ -1348,6 +1348,9 @@ async fn doctor_engine(d: &PallamaDirs) -> Vec<Check> {
     let cfg_channel = pallama_core::Config::load(d)
         .map(|c| c.update_channel)
         .unwrap_or_default();
+    // Lane-aware update hint: the active engine's asset decides which
+    // command can actually refresh it (source builds vs prebuilt lanes).
+    let active_asset = active_engine_asset(d, active_tag.as_deref());
     if let Ok(raw) = std::fs::read_to_string(d.run_dir().join("engine-check.json")) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
             let now = std::time::SystemTime::now()
@@ -1356,7 +1359,7 @@ async fn doctor_engine(d: &PallamaDirs) -> Vec<Check> {
             marker_usable = now.saturating_sub(v["checked_at"].as_u64().unwrap_or(0)) <= 2 * 86_400
                 && marker_channel_matches(&v, cfg_channel);
             if marker_usable {
-                currency = currency_verdict(active_tag.as_deref(), &v, now);
+                currency = currency_verdict(active_tag.as_deref(), &v, now, &active_asset);
                 // Enumeration drift: install-time probe names the serving
                 // child can no longer see (the daemon's spawn context is
                 // the authority — spawns auto-remap, but the user should
@@ -1386,14 +1389,56 @@ async fn doctor_engine(d: &PallamaDirs) -> Vec<Check> {
                     "local build — upstream currency not tracked",
                 ));
             } else {
-                currency = Some(live_engine_currency(active).await);
+                currency = Some(live_engine_currency(active, &active_asset).await);
             }
         }
     }
     if let Some(c) = currency {
         checks.push(c);
     }
+    // CUDA-channel hint: an NVIDIA box serving the Vulkan asset is
+    // leaving the measured ~4% Vulkan delta on the table. The channel
+    // is zero-touch (default repo, probed automatically at every
+    // `engine update`) — this row only tells the user the lane exists
+    // and where its assets come from.
+    if std::env::consts::OS == "linux"
+        && std::env::consts::ARCH == "x86_64"
+        && pallama_runtime::engine::system_vendor_hint()
+            == pallama_runtime::engine::manifest::Vendor::Nvidia
+        && !active_asset_is_cuda(d, active_tag.as_deref())
+    {
+        let repo = pallama_runtime::engine::gh::engine_overlay_repo();
+        checks.push(Check::ok(
+            "engine cuda channel",
+            format!(
+                "NVIDIA GPU on the Vulkan asset — prebuilt CUDA engines are preferred \
+                 automatically once {repo} publishes bNNNN-cuda releases (engine-cuda \
+                 workflow); set PALLAMA_ENGINE_REPO to use a fork"
+            ),
+        ));
+    }
     checks
+}
+
+/// Active engine's asset string ("" when unknown: no engine, store error,
+/// or tag mismatch). Feeds the lane-aware update hint.
+fn active_engine_asset(d: &PallamaDirs, active_tag: Option<&str>) -> String {
+    let Some(tag) = active_tag else {
+        return String::new();
+    };
+    Store::open(d)
+        .ok()
+        .and_then(|s| s.active_engine().ok().flatten())
+        .filter(|row| row.tag == tag)
+        .map_or_else(String::new, |row| row.asset)
+}
+
+/// True when the ACTIVE llama.cpp engine already serves a CUDA asset
+/// (overlay prebuilt or source-built) — the cuda-channel hint only
+/// applies to Vulkan/CPU assets. Probe failures read as "not cuda":
+/// the hint is advisory, a store error must not hide it.
+fn active_asset_is_cuda(d: &PallamaDirs, active_tag: Option<&str>) -> bool {
+    active_engine_asset(d, active_tag).contains("cuda")
 }
 
 /// Frozen (install-time) names missing from the serving child's census.
@@ -1447,12 +1492,19 @@ fn channel_word(active: &str, target: &str) -> &'static str {
     }
 }
 
-/// The command that updates the ACTIVE engine's lane: built engines
-/// (`bNNNN-cuda`/`bNNNN-cpu`) refresh by rebuilding the source lane —
-/// `engine update` would install the Vulkan prebuilt instead.
-fn engine_update_command(active_tag: &str) -> &'static str {
+/// The command that updates the ACTIVE engine's lane: source-built
+/// engines (`asset` = `built-*`) refresh by rebuilding the source lane —
+/// `engine update` would install the Vulkan prebuilt instead. Overlay
+/// prebuilts (`bNNNN-cuda` from the CUDA channel, `asset` =
+/// `ubuntu-cuda-*`) update through the normal `engine update` lane,
+/// which re-probes the overlay for the channel's build number.
+fn engine_update_command(active_tag: &str, asset: &str) -> &'static str {
     if active_tag.ends_with("-cuda") {
-        "pallama engine build cuda"
+        if asset.starts_with("built-") {
+            "pallama engine build cuda"
+        } else {
+            "pallama engine update"
+        }
     } else if active_tag.ends_with("-cpu") {
         "pallama engine build cpu"
     } else {
@@ -1461,8 +1513,8 @@ fn engine_update_command(active_tag: &str) -> &'static str {
 }
 
 /// Live engine-currency probe (marker missing or >48h stale): 4s cap,
-/// warn-only — `pallama engine update` stays a human action.
-async fn live_engine_currency(active: &str) -> Check {
+/// warn-only — the update itself stays a human action.
+async fn live_engine_currency(active: &str, asset: &str) -> Check {
     let token = std::env::var("GH_TOKEN")
         .or_else(|_| std::env::var("GITHUB_TOKEN"))
         .ok();
@@ -1477,8 +1529,10 @@ async fn live_engine_currency(active: &str) -> Check {
     .await;
     match fetched {
         Ok(Ok(rel)) => {
-            // Engine tags are b-tags: no semver path, equality decides.
-            if rel.tag_name == active {
+            // b-tags compare by build number: lane suffixes (-cuda/-cpu)
+            // are the SAME build — string equality would nag a current
+            // source-built engine forever.
+            if same_build(active, &rel.tag_name) {
                 Check::ok(
                     "engine currency",
                     format!("up to date ({active}, channel: {channel})"),
@@ -1487,11 +1541,12 @@ async fn live_engine_currency(active: &str) -> Check {
                 Check::warn(
                     "engine currency",
                     format!(
-                        "{} available: {} (active: {}, channel: {}) — run: pallama engine update",
+                        "{} available: {} (active: {}, channel: {}) — run: {}",
                         channel_word(active, &rel.tag_name),
                         rel.tag_name,
                         active,
-                        channel
+                        channel,
+                        engine_update_command(active, asset)
                     ),
                 )
             }
@@ -1614,6 +1669,7 @@ fn currency_verdict(
     active_tag: Option<&str>,
     marker: &serde_json::Value,
     now_secs: u64,
+    asset: &str,
 ) -> Option<Check> {
     let active = active_tag?; // no engine installed: the engine row already FAILs
     let latest = marker["latest"].as_str()?;
@@ -1632,8 +1688,9 @@ fn currency_verdict(
         Some(Check::warn(
             "engine currency",
             format!(
-                "{} available: {latest} (active: {active}, channel: {channel}) — run: pallama engine update",
-                channel_word(active, latest)
+                "{} available: {latest} (active: {active}, channel: {channel}) — run: {}",
+                channel_word(active, latest),
+                engine_update_command(active, asset)
             ),
         ))
     } else if stale {
@@ -1722,13 +1779,16 @@ async fn doctor_whisper_currency(d: &PallamaDirs) -> Vec<Check> {
         )];
     };
     let channel = config().map(|c| c.update_channel).unwrap_or_default();
+    // Asset-aware: whisper.cpp tags assetless v-releases (v1.9.4) while
+    // the b-tags carry the binaries — currency must never advertise a
+    // tag the install lane cannot install.
     let fetched = tokio::time::timeout(
         std::time::Duration::from_secs(4),
-        gh.channel_repo_release(pallama_runtime::whisper::WHISPER_REPO, channel),
+        pallama_runtime::whisper::channel_target(&gh, channel),
     )
     .await;
     match fetched {
-        Ok(Ok(rel)) => vec![whisper_pin_verdict(d, &installed, &rel.tag_name)],
+        Ok(Ok(latest)) => vec![whisper_pin_verdict(d, &installed, &latest)],
         Ok(Err(e)) => vec![Check::warn(
             "whisper currency",
             format!("check failed ({e:#}) — offline? set GH_TOKEN if rate limited"),
@@ -3666,17 +3726,14 @@ async fn whisper_cmd(
         // Channel semantics for whisper mirror the engine lane: explicit
         // --tag pins the install; otherwise the configured channel
         // (latest = newest incl. prereleases, stable = GitHub's
-        // releases/latest) resolves the target without pinning.
+        // releases/latest) resolves the newest release that actually
+        // ships this platform's server binary (asset-aware: whisper.cpp
+        // tags assetless v-releases) without pinning.
         let target = match tag.as_deref() {
             Some(t) => Some(t.to_string()),
-            None => Some(
-                gh.channel_repo_release(
-                    pallama_runtime::whisper::WHISPER_REPO,
-                    config()?.update_channel,
-                )
-                .await?
-                .tag_name,
-            ),
+            None => {
+                Some(pallama_runtime::whisper::channel_target(&gh, config()?.update_channel).await?)
+            }
         };
         let tag = pallama_runtime::whisper::install(&gh, &d, target.as_deref(), pinned).await?;
         let pin = if pinned { " (pinned)" } else { "" };
@@ -4514,14 +4571,29 @@ async fn engine_update(d: &PallamaDirs, tag: Option<String>, no_gate: bool) -> R
     if from_channel {
         println!("update channel: {}", cfg.update_channel);
     }
-    println!(
-        "engine {} active (build {}, {} devices, {} flags)",
-        row.tag,
-        m.build_number,
-        m.devices.len(),
-        m.flags.len()
-    );
-    restart_hint().await;
+    if row.active {
+        println!(
+            "engine {} active (build {}, {} devices, {} flags)",
+            row.tag,
+            m.build_number,
+            m.devices.len(),
+            m.flags.len()
+        );
+    } else {
+        // keep-cuda guard fired: an installed CUDA engine stays active.
+        println!(
+            "engine {} registered (build {}, {} devices, {} flags); the active CUDA \
+             engine was kept — run `pallama engine use {}` to switch",
+            row.tag,
+            m.build_number,
+            m.devices.len(),
+            m.flags.len(),
+            row.tag
+        );
+    }
+    if !unchanged {
+        restart_hint().await;
+    }
     Ok(())
 }
 
@@ -4602,13 +4674,26 @@ async fn engine_build(d: &PallamaDirs, a: BackendArg) -> Result<()> {
         println!("engine {} installed; regression gate skipped", row.tag);
     }
     let m: pallama_runtime::Manifest = serde_json::from_str(&row.manifest)?;
-    println!(
-        "engine {} active (build {}, {} devices, {} flags)",
-        row.tag,
-        m.build_number,
-        m.devices.len(),
-        m.flags.len()
-    );
+    if row.active {
+        println!(
+            "engine {} active (build {}, {} devices, {} flags)",
+            row.tag,
+            m.build_number,
+            m.devices.len(),
+            m.flags.len()
+        );
+    } else {
+        // keep-cuda guard fired: an installed CUDA engine stays active.
+        println!(
+            "engine {} registered (build {}, {} devices, {} flags); the active CUDA \
+             engine was kept — run `pallama engine use {}` to switch",
+            row.tag,
+            m.build_number,
+            m.devices.len(),
+            m.flags.len(),
+            row.tag
+        );
+    }
     restart_hint().await;
     Ok(())
 }
@@ -4644,7 +4729,7 @@ async fn upstream_update_hint(dirs: &PallamaDirs) {
                 rel.tag_name,
                 active.tag,
                 cfg.update_channel,
-                engine_update_command(&active.tag)
+                engine_update_command(&active.tag, &active.asset)
             );
         }
     }
@@ -4724,11 +4809,12 @@ fn spawn_engine_check_task(
             if newer {
                 tracing::info!(
                     target: "pallama::engine",
-                    "{} available: {} (active: {}, channel: {}) — run: pallama engine update",
+                    "{} available: {} (active: {}, channel: {}) — run: {}",
                     channel_word(&active.tag, &rel.tag_name),
                     rel.tag_name,
                     active.tag,
-                    cfg.update_channel
+                    cfg.update_channel,
+                    engine_update_command(&active.tag, &active.asset)
                 );
             }
             // Child-context device census: the serving child's own view of
@@ -5150,7 +5236,7 @@ mod tests {
             "active": "b10819",
             "update_available": true,
         });
-        let c = currency_verdict(Some("b10831"), &marker, 1_788_760_000).unwrap();
+        let c = currency_verdict(Some("b10831"), &marker, 1_788_760_000, "").unwrap();
         assert!(c.ok && !c.warn);
         assert_eq!(c.detail, "up to date (b10831)");
     }
@@ -5163,11 +5249,63 @@ mod tests {
             "active": "b10819",
             "update_available": true,
         });
-        let c = currency_verdict(Some("b10819"), &marker, 2_000).unwrap();
+        let c = currency_verdict(Some("b10819"), &marker, 2_000, "").unwrap();
         assert!(c.warn);
         assert_eq!(
             c.detail,
             "upgrade available: b10831 (active: b10819, channel: latest) — run: pallama engine update"
+        );
+    }
+
+    #[test]
+    fn unit__currency_verdict__lane_suffix_same_build_and_lane_aware_hint() {
+        // Live incident: a source-built bNNNN-cuda engine IS the same
+        // build as upstream bNNNN (lane suffix ignored), and the remedy
+        // must name the lane that can actually refresh it — `engine
+        // update` would install the Vulkan prebuilt instead.
+        let same = serde_json::json!({
+            "checked_at": 1_000_u64,
+            "latest": "b10909",
+            "active": "b10909-cuda",
+            "update_available": false,
+        });
+        let c = currency_verdict(Some("b10909-cuda"), &same, 2_000, "built-cuda").unwrap();
+        assert!(c.ok && !c.warn, "{}", c.detail);
+
+        let pending = serde_json::json!({
+            "checked_at": 1_000_u64,
+            "latest": "b10912",
+            "active": "b10909-cuda",
+            "update_available": true,
+        });
+        let c = currency_verdict(Some("b10909-cuda"), &pending, 2_000, "built-cuda").unwrap();
+        assert!(c.warn, "{}", c.detail);
+        assert!(
+            c.detail.contains("run: pallama engine build cuda"),
+            "{}",
+            c.detail
+        );
+
+        // Overlay prebuilts (ubuntu-cuda-*) refresh through engine update.
+        let c = currency_verdict(Some("b10909-cuda"), &pending, 2_000, "ubuntu-cuda-x64").unwrap();
+        assert!(
+            c.detail.contains("run: pallama engine update"),
+            "{}",
+            c.detail
+        );
+
+        // Plain prebuilt tags keep the standard hint.
+        let plain = serde_json::json!({
+            "checked_at": 1_000_u64,
+            "latest": "b10912",
+            "active": "b10909",
+            "update_available": true,
+        });
+        let c = currency_verdict(Some("b10909"), &plain, 2_000, "ubuntu-vulkan-x64").unwrap();
+        assert!(
+            c.detail.contains("run: pallama engine update"),
+            "{}",
+            c.detail
         );
     }
 
@@ -5181,7 +5319,7 @@ mod tests {
             "active": "b10819",
             "update_available": false,
         });
-        let c = currency_verdict(Some("b10817"), &marker, 1_100).unwrap();
+        let c = currency_verdict(Some("b10817"), &marker, 1_100, "").unwrap();
         assert!(c.warn);
         assert!(c.detail.contains("active: b10817"), "{}", c.detail);
     }
@@ -5194,7 +5332,7 @@ mod tests {
             "active": "b10831",
             "update_available": false,
         });
-        let c = currency_verdict(Some("b10831"), &marker, 1_000 + 2 * 86_400 + 1).unwrap();
+        let c = currency_verdict(Some("b10831"), &marker, 1_000 + 2 * 86_400 + 1, "").unwrap();
         assert!(c.warn);
         assert_eq!(
             c.detail,
@@ -5205,7 +5343,7 @@ mod tests {
     #[test]
     fn unit__currency_verdict__local_engine_untracked() {
         let marker = serde_json::json!({"checked_at": 1_u64, "latest": "b10831"});
-        let c = currency_verdict(Some("local"), &marker, 2).unwrap();
+        let c = currency_verdict(Some("local"), &marker, 2, "").unwrap();
         assert!(c.ok && !c.warn);
         assert_eq!(c.detail, "local build — upstream currency not tracked");
     }
@@ -5213,8 +5351,8 @@ mod tests {
     #[test]
     fn unit__currency_verdict__no_engine_or_malformed_marker_skips_row() {
         let marker = serde_json::json!({"checked_at": 1_u64, "active": "b1"});
-        assert!(currency_verdict(None, &marker, 2).is_none());
-        assert!(currency_verdict(Some("b1"), &marker, 2).is_none()); // no latest
+        assert!(currency_verdict(None, &marker, 2, "").is_none());
+        assert!(currency_verdict(Some("b1"), &marker, 2, "").is_none()); // no latest
     }
 
     #[test]
@@ -5503,16 +5641,30 @@ mod tests {
 
     #[test]
     fn unit__engine_update_command__lane_aware() {
+        // Source-built lane: tag suffix + built-* asset -> rebuild.
         assert_eq!(
-            engine_update_command("b10809-cuda"),
+            engine_update_command("b10809-cuda", "built-cuda"),
             "pallama engine build cuda"
         );
         assert_eq!(
-            engine_update_command("b4242-cpu"),
+            engine_update_command("b4242-cpu", "built-cpu"),
             "pallama engine build cpu"
         );
-        assert_eq!(engine_update_command("b10809"), "pallama engine update");
-        assert_eq!(engine_update_command("local"), "pallama engine update");
+        // Overlay prebuilt lane: same tag suffix, ubuntu-* asset ->
+        // normal update lane (re-probes the overlay by build number).
+        assert_eq!(
+            engine_update_command("b10809-cuda", "ubuntu-cuda-12.8-x64"),
+            "pallama engine update"
+        );
+        // Upstream prebuilts and local builds.
+        assert_eq!(
+            engine_update_command("b10809", "ubuntu-vulkan-x64"),
+            "pallama engine update"
+        );
+        assert_eq!(
+            engine_update_command("local", "built-cuda"),
+            "pallama engine update"
+        );
     }
 
     #[test]
@@ -5645,7 +5797,7 @@ mod tests {
             "channel": "stable",
             "update_available": true,
         });
-        let c = currency_verdict(Some("b10857"), &marker, now).unwrap();
+        let c = currency_verdict(Some("b10857"), &marker, now, "").unwrap();
         assert!(c.warn, "{}", c.detail);
         assert!(c.detail.contains("downgrade available"), "{}", c.detail);
         assert!(c.detail.contains("channel: stable"), "{}", c.detail);
@@ -5657,7 +5809,7 @@ mod tests {
             "active": "b10857",
             "update_available": true,
         });
-        let c = currency_verdict(Some("b10857"), &legacy, now).unwrap();
+        let c = currency_verdict(Some("b10857"), &legacy, now, "").unwrap();
         assert!(c.warn, "{}", c.detail);
         assert!(c.detail.contains("upgrade available"), "{}", c.detail);
         assert!(c.detail.contains("channel: latest"), "{}", c.detail);
@@ -5669,7 +5821,7 @@ mod tests {
             "channel": "latest",
             "update_available": false,
         });
-        let c = currency_verdict(Some("b10857"), &fresh, now).unwrap();
+        let c = currency_verdict(Some("b10857"), &fresh, now, "").unwrap();
         assert!(c.ok && !c.warn, "{}", c.detail);
     }
 }
