@@ -323,6 +323,10 @@ enum EngineCmd {
     List,
     /// Activate an installed tag
     Use { tag: String },
+    /// Remove a retired engine (directory + registry row); refuses the
+    /// active tag — `pallama engine use` another first. Reports the
+    /// reclaimed bytes.
+    Rm { tag: String },
     /// Step back to the previous engine
     Rollback,
     /// Register a locally built llama-server (pseudo-tag "local")
@@ -4733,6 +4737,9 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             println!("active engine: {}", row.tag);
             restart_hint().await;
         }
+        EngineCmd::Rm { tag } => {
+            engine_rm(&d, &tag)?;
+        }
         EngineCmd::Rollback => {
             let mgr = local_engine_manager(&d)?;
             let row = mgr.rollback()?;
@@ -5155,8 +5162,57 @@ fn rotate_daemon_log(d: &PallamaDirs) {
     }
 }
 
-fn local_engine_manager(d: &PallamaDirs) -> Result<EngineManager> {
-    let token = std::env::var("GH_TOKEN").ok();
+/// Remove a retired engine: directory + registry row. Refuses the
+/// active tag (a daemon mid-flight on a deleted binary is a crash
+/// class); unknown tags error loudly.
+fn engine_rm(d: &PallamaDirs, tag: &str) -> Result<()> {
+    let store = Store::open(d)?;
+    let row = store
+        .list_engines()?
+        .into_iter()
+        .find(|e| e.tag == tag)
+        .ok_or_else(|| anyhow!("no such engine: {tag} (see `pallama engine list`)"))?;
+    if row.active {
+        anyhow::bail!(
+            "engine {tag} is active — `pallama engine use <other>` first \
+             (a running daemon must not lose its binary)"
+        );
+    }
+    let dir = d.engines_dir().join(tag);
+    let mut reclaimed: u64 = 0;
+    let had_dir = dir.is_dir();
+    if had_dir {
+        // std-only size walk (a walkdir dep for one cleanup is not worth
+        // the tree cost): iterative stack, files only.
+        let mut stack = vec![dir.clone()];
+        while let Some(p) = stack.pop() {
+            if let Ok(rd) = std::fs::read_dir(&p) {
+                for entry in rd.flatten() {
+                    let ep = entry.path();
+                    if let Ok(md) = entry.metadata() {
+                        if md.is_dir() {
+                            stack.push(ep);
+                        } else {
+                            reclaimed += md.len();
+                        }
+                    }
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("failed to remove {}", dir.display()))?;
+    }
+    store.delete_engine(tag)?;
+    let mib = reclaimed / (1024 * 1024);
+    println!(
+        "removed engine {tag} ({} MiB reclaimed{})",
+        mib,
+        if had_dir { "" } else { ", directory already gone" }
+    );
+    Ok(())
+}
+
+fn local_engine_manager(d: &PallamaDirs) -> Result<EngineManager> {    let token = std::env::var("GH_TOKEN").ok();
     let gh = GhClient::new(token)?;
     Ok(EngineManager {
         dirs: d.clone(),
