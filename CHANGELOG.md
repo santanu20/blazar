@@ -126,14 +126,19 @@ tracked here.
   warning saying so. Dense models keep the pinned fast path.
 
 ### Changed
-- **Cold-start TTFT measured, load-bound (0.5B)**: methodology +
-  numbers landed in README (Performance). tl;dr — cold `run` wall
-  1.16–1.94 s on the RTX 4070 laptop, all of it engine load (mmap +
-  CUDA init); pallama-side stages (profile compile, health poll,
-  admission) are milliseconds. The earlier 8.5 s-vs-6.3 s "gap"
-  against ollama was an 8B-class model under a contended box — not a
-  pallama-side regression. No code change: measurement first, nothing
-  ours to fix at this size.
+- **Cold-start TTFT measured**: methodology + numbers landed in README
+  (Performance). At 0.5B the cold `run` wall is 1.16–1.94 s, all of it
+  engine load (mmap + CUDA init); pallama-side stages (profile
+  compile, health poll, admission) are milliseconds. A later 9B
+  parity re-run at uncontended conditions measured pallama cold
+  11.4 s vs ollama 5.7 s and warm decode 12.4 vs 27.2 t/s — traced to
+  the capacity-first default profile (`-np 4` + wide `--ctx-size` +
+  `--kv-unified` hosting a 256k-token KV pool in the system-RAM
+  `--cache-ram` budget, PCIe-bound decode) against ollama's
+  single-slot in-VRAM layout. That is a defaults-policy tradeoff, not
+  a daemon overhead; a single-stream-first tuning pass is the open
+  follow-up. Pin `slots = 1` / `kv_unified = false` (or
+  `model_overrides`) for ollama-shaped single-stream speed today.
 - **Help branding de-ollama'd**: top-level about, help footer, and the
   four refused-command descriptions (`signin`/`login`/`signout`/
   `logout`) now say "pallama" instead of "ollama.com"/"ollama-grade".
