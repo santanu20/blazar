@@ -166,7 +166,6 @@ async fn integration__ensure_ready__health_and_argv_flags() {
         "--jinja",
         "--metrics",
         "--flash-attn",
-        "--cache-reuse",
         "--sleep-idle-seconds",
         "--cache-ram",
         "-np",
@@ -177,6 +176,12 @@ async fn integration__ensure_ready__health_and_argv_flags() {
             "missing {flag} in {argv:?}"
         );
     }
+    // cache-reuse defaults OFF (elim sweep 2026-09-12: native slot cache
+    // covers identical prefixes; --cache-reuse cost ~0.6s cold).
+    assert!(
+        !argv.contains(&"--cache-reuse".to_string()),
+        "cache-reuse must not ride the default argv: {argv:?}"
+    );
     // sessions dir is per-model under the data dir (path_safe suffix — derive)
     let sess_subdir = format!("sessions/{}/", pallama_core::profile::path_safe("m1"));
     assert!(

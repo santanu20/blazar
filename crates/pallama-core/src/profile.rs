@@ -1182,6 +1182,24 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
                 input.config.load_mode
             ));
         }
+    } else if input.supported_flags.contains("--load-mode") {
+        // Auto policy (elim sweep 2026-09-12, 9B q4, 3 reps, 4070
+        // laptop): --load-mode mlock front-loads page-in during load and
+        // measured ~0.7s faster to first token than lazy mmap faults.
+        // Gate on a RAM share that leaves room for a second model;
+        // explicit load_mode always wins. Low-RLIMIT_MEMLOCK boxes
+        // degrade to a benign upstream warning + plain mmap.
+        let weights_mib = input.model_bytes / (1024 * 1024);
+        let ram_mib = input.hardware.total_ram_mib;
+        if ram_mib > 0 && weights_mib * 100 <= ram_mib * 40 {
+            argv.push("--load-mode".into());
+            argv.push("mlock".into());
+            warnings.push(format!(
+                "load-mode mlock auto: weights {weights_mib} MiB <= 40% of {ram_mib} MiB RAM — \
+                 eager page-in measured ~0.7s faster to first token; set load_mode = \"mmap\" \
+                 to opt out"
+            ));
+        }
     }
 
     // --- 13. latency/affinity/reasoning/vision passthrough
@@ -3006,7 +3024,9 @@ mod tests {
             "--swa-full",
             "--ctx-checkpoints",
             "--no-kv-offload",
-            "--load-mode",
+            // "--load-mode" deliberately ABSENT: the shared fixture set
+            // keeps argv-pinning tests stable while the mlock auto
+            // policy exists; dedicated load-mode tests opt in.
             "--cache-type-k",
             "--cache-type-v",
             "--cpu-moe",
@@ -3393,11 +3413,9 @@ mod tests {
             .windows(2)
             .any(|w| w[0] == "--gpu-layers" && w[1] == "999"));
         assert_eq!(p.gpu, "full");
-        // Rule 5: cache-reuse default 256
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cache-reuse" && w[1] == "256"));
+        // Rule 5: cache-reuse defaults OFF (native slot cache covers
+        // identical prefixes; --cache-reuse measured +0.6s cold)
+        assert!(!p.argv.contains(&"--cache-reuse".to_string()));
         // Rule 6: KV at the scaled total = 2*28*8*64*32768*2 = 938MB;
         // +5GB < 0.9*12GB -> NO kv quant
         assert!(!p.argv.contains(&"--cache-type-k".to_string()));
@@ -3546,7 +3564,11 @@ mod tests {
         // Upstream disables cache_reuse with a multimodal projector: the
         // flag must not ride VL argv, and the skip must be said aloud.
         let hw = gpu_hw(24_000, 64_000, 8);
-        let cfg = Config::default();
+        // cache_reuse 256 explicit: rule 5 contract (default is 0 now).
+        let cfg = Config {
+            cache_reuse: 256,
+            ..Config::default()
+        };
         let m = meta();
         let mut i = input(&m, &hw, &cfg, &ALL_FLAGS);
         i.mmproj_path = Some("/nonexistent/mmproj-F16.gguf");
@@ -3686,6 +3708,52 @@ mod tests {
 
     #[test]
     #[allow(clippy::field_reassign_with_default)]
+    fn unit__load_mode_auto__mlock_when_weights_fit_ram_share() {
+        // Elim-sweep contract (2026-09-12): eager mlock page-in measured
+        // ~0.7s faster to first token than lazy mmap faults, so the
+        // auto policy pins when weights fit a 40% RAM share.
+        let mut flags = full_flags();
+        flags.insert("--load-mode".to_string());
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        // Fixture default model_bytes = 5000 MiB = 15.6% of 32 GiB.
+        let p = compile(
+            &input(&g, &hw, &Config::default(), &flags),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        let i = p.argv.iter().position(|a| a == "--load-mode").unwrap();
+        assert_eq!(p.argv[i + 1], "mlock");
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("load-mode mlock auto")),
+            "{:?}",
+            p.warnings
+        );
+
+        // Over the 40% share: no flag, no warning (plain mmap default).
+        let cfg_big = Config::default();
+        let mut big = input(&g, &hw, &cfg_big, &flags);
+        big.model_bytes = 20_000 * MIB;
+        let p = compile(&big, &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.contains(&"--load-mode".to_string()));
+        assert!(
+            !p.warnings.iter().any(|w| w.contains("load-mode")),
+            "{:?}",
+            p.warnings
+        );
+
+        // Explicit load_mode always wins over the auto policy.
+        let mut cfg = Config::default();
+        cfg.load_mode = "mmap".into();
+        let p = compile(&input(&g, &hw, &cfg, &flags), &TuningOverrides::default()).unwrap();
+        let i = p.argv.iter().position(|a| a == "--load-mode").unwrap();
+        assert_eq!(p.argv[i + 1], "mmap");
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn unit__kv_layout__aux_flags_and_gating() {
         let hw = gpu_hw(24_000, 64_000, 8);
         let mut cfg = Config::default();
@@ -3694,8 +3762,10 @@ mod tests {
         cfg.ctx_checkpoints = 8;
         cfg.no_kv_offload = true;
         cfg.load_mode = "mlock".into();
+        let mut with_load_mode = full_flags();
+        with_load_mode.insert("--load-mode".to_string());
         let p = compile(
-            &input(&GgufMeta::default(), &hw, &cfg, &ALL_FLAGS),
+            &input(&GgufMeta::default(), &hw, &cfg, &with_load_mode),
             &TuningOverrides::default(),
         )
         .unwrap();
@@ -4935,7 +5005,7 @@ mod tests {
         assert!(ini.contains("model = /models/qwen3-8b.gguf"));
         assert!(ini.contains("gpu-layers = 999"));
         assert!(ini.contains("parallel = 1"));
-        assert!(ini.contains("cache-reuse = 256"));
+        assert!(!ini.contains("cache-reuse"));
         // F111: m2's overlay actually applied — its ctx + sampler +
         // warmup knobs land in the m2 section.
         let m2 = ini.split("[m2]\n").nth(1).unwrap_or_default();

@@ -105,7 +105,11 @@ pub struct Config {
     /// Inline JSON form of `mcp_servers_config` (`--mcp-servers-json`).
     #[serde(default)]
     pub mcp_servers_json: Option<String>,
-    /// Min chunk size for KV-shift prefix reuse; 0 disables.
+    /// Min chunk size for KV-shift prefix reuse; 0 disables. Default 0:
+    /// the engine's native slot prompt-cache already covers identical
+    /// prefixes (16x on re-ask, measured) at zero cost, while the
+    /// `--cache-reuse` path measured ~0.6s SLOWER cold loads (elim
+    /// sweep 2026-09-12). Opt back in for cross-slot prefix sharing.
     pub cache_reuse: u32,
     /// API keys (virtual keys): empty = no auth (loopback default).
     /// Each entry scopes a bearer key to models + rate/token budgets
@@ -1130,7 +1134,7 @@ impl Default for Config {
             server_tools_runtime: None,
             mcp_servers_config: None,
             mcp_servers_json: None,
-            cache_reuse: 256,
+            cache_reuse: 0,
             keys: Vec::new(),
             rpc_servers: String::new(),
             cache_ram_mb: 8192,
