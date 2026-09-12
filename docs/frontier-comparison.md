@@ -74,9 +74,12 @@ Docker, no YAML, no cluster.
   llama.cpp publishes **no Linux CUDA release assets** (verified across 12 consecutive
   releases: only vulkan/rocm/sycl/openvino/cpu for ubuntu; CUDA is Windows-only). The
   measured Vulkan-vs-CUDA delta on this card is ~4%. Asset preference in `engine/gh.rs`
-  already picks the best available per vendor (rocm for AMD, sycl-fp16 for Intel,
-  versioned win-cuda for Windows NVIDIA) — the residual Linux NVIDIA gap is
-  upstream-asset-bound, not a pallama pick bug.
+  picks the best available per vendor (rocm for AMD, sycl-fp16 for Intel, versioned
+  win-cuda for Windows NVIDIA). The residual Linux NVIDIA gap is now closed by Pallama's
+  own prebuilt channel: the `engine-cuda` CI workflow compiles pristine upstream b-tags
+  with CUDA 12/13 and publishes `bNNNN-cuda` assets (bundled runtimes, driver-ceilinged
+  selection is automatic on Linux-NVIDIA) — enabling it on this box moves the head-to-head
+  onto CUDA and removes the ~4% handicap at the source.
 
 **Sourced benchmark anchors**
 

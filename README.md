@@ -57,11 +57,15 @@ Installs to `%LOCALAPPDATA%\Programs\pallama` and adds it to the user PATH. ARM6
 ```sh
 pallama engine update                     # install + activate upstream llama-server (sha256-verified;
                                            #   regression-gated: >10% decode drop auto-rolls-back; --no-gate skips)
-pallama engine build cuda                 # no Linux-CUDA prebuilts upstream? compile it from source:
+                                           # Linux-NVIDIA? prefers the prebuilt CUDA overlay
+                                           #   CUDA overlay (bundled cudart/cublas, no toolkit needed) and
+                                           #   falls back to Vulkan when the driver cannot run it
+pallama engine build cuda                 # rather compile it? no Linux-CUDA prebuilts upstream? build from source:
                                            #   auto GPU-arch (nvidia-smi), auto host-compiler match
                                            #   (nvcc 12 + gcc 13 -> g++-12), installs as bNNNN-cuda,
                                            #   same probe/gate/activate flow. cpu backend also available
-pallama pull qwen3-0.6b                   # or any owner/repo:QUANT from Hugging Face
+pallama pull qwen3-0.6b                   # ollama registry shortname (registry.ollama.ai, sha256-verified, resumable)
+pallama pull ggml-org/Qwen3-8B-GGUF:Q4_K_M  # or any owner/repo:QUANT from Hugging Face
 pallama run qwen3-0.6b                    # streaming REPL
 OLLAMA_HOST=http://127.0.0.1:11434 ollama list   # existing ollama clients just work
 ```
@@ -78,7 +82,7 @@ Capability discovery: `GET /.well-known/pallama` (routes, headers, features, eng
 | Modelfile copies 30–60 GB to change one parameter; silent `{{ .Prompt }}` fallback | No Modelfile. GGUF is self-contained truth; child always runs `--jinja` (embedded template); params per-request or per-model config overlay |
 | Hashed blob lock-in; limited quants | Plain `.gguf` files at `~/.local/share/pallama/models/` — any tool can use them; any HF quant |
 | No multi-shard GGUF | Shard sets pulled natively (`-0000N-of-0000M`), first shard launched |
-| Registry bottleneck; misleading names | Direct HF pull; name = actual repo name, never a marketing alias |
+| Registry bottleneck; misleading names | Direct HF pull **and** registry.ollama.ai pull (`qwen3:0.6b` shortnames route to the ollama registry; Docker-v2 manifest wire, sha256-verified resumable blobs via 307→presigned-CDN with allowlisted redirects, token only ever on first-party registry host — `PALLAMA_REGISTRY_TOKEN` for private namespaces). HF names = actual repo name, never a marketing alias |
 | CVE-2025-51471 token exfiltration class | HTTPS to HF only; redirect-host allowlist; token sent only to `huggingface.co` (verified in tests) |
 | Cloud pivot; silent off-machine routing | Hard local-only; stated in `--help` and at startup |
 | Opaque 2048 default ctx; silent truncation | Default ctx 16384, shown in `ps`; overflow errors surfaced verbatim with fix hints |
@@ -102,7 +106,7 @@ Capability discovery: `GET /.well-known/pallama` (routes, headers, features, eng
 | `run <model>` | Streaming REPL (`/exit /clear /model /sysinfo /profile`) |
 | `ps [--reset]` | Live instances: state, ctx, **GPU offload** (`full`/`partial`/`cpu`/`auto` — silent CPU fallback is never silent), in-flight, endpoint |
 | `bench` / `tune --search` | `llama-bench` tables; measured argmax profile adoption |
-| `scripts/bench_matrix.py` | The single benchmarking entry point. Full matrix: every engine × provider (direct child spawn / pallama gateway via sandbox / ollama reference) × ctx/parallel sweep, plus **quality lanes** — llama-perplexity parity, 20-prompt greedy parity + gateway-transparency lane, feature-capability matrix, concurrency, optimization axes (KV quant / spec decode / projector / paged-attn), soak — into resume-safe `cells.jsonl` artifacts, an internal forensics `benchmark.md`, and a **publication-format report** (`--md BENCHMARK.md`, or `--render-only` to re-render an existing campaign without re-measuring). Supersedes the earlier `bench_engines`/`bench_compare`/`soak.sh` harnesses. Never touches the real daemon, config, or ollama |
+| `scripts/bench_matrix.py` | The single benchmarking entry point. Full matrix: every engine × provider (direct child spawn / pallama gateway via sandbox / ollama reference) × ctx/parallel sweep, plus **quality lanes** — llama-perplexity parity, 20-prompt greedy parity + gateway-transparency lane, feature-capability matrix, concurrency, optimization axes (KV quant / spec decode / projector / paged-attn), soak — into resume-safe `cells.jsonl` artifacts, an internal forensics `benchmark.md`, and a **publication-format report** (`--md BENCHMARK.md`, or `--render-only` to re-render an existing campaign without re-measuring). **Cold-start parity lanes**: page-cache-dropped (`posix_fadvise`) + GPU-idle-asserted cold TTFT on every runtime, optional ollama daemon-boot metric (`--ollama-service-restart`, sudo via `BENCH_SUDO_PASSWORD` env). **Idle-wake lane** (pallama sleep ladder vs ollama keep_alive expiry, policy verified via `/api/ps`), **long-ctx curve** (`--ctxcurve-sweep`), **sustained concurrency** (`--conc-rounds`, per-round + cross-round p99 tails). Model pick is store-row-first (scratch files can't 404 the gateway lanes). Supersedes the earlier `bench_engines`/`bench_compare`/`soak.sh` harnesses. Never touches the real daemon, config, or ollama |
 | `engine list/update/use/rollback` | Upstream engine management with capability manifests |
 | `engine build cuda\|cpu [--tag bNNNN] [--arch A] [--jobs N]` | Compile llama.cpp from an upstream tag when no prebuilt fits: auto GPU-arch (`nvidia-smi` compute cap), auto CUDA host-compiler match (nvcc 12 + gcc 13 → `g++-12`), installs as `bNNNN-cuda` through the same probe → activate flow. Closes the "no Linux-CUDA prebuilts upstream" gap with upstream's own in-tree ggml-cuda kernels |
 | `engine install [--tag vX.Y.Z]` | mistral.rs as a second engine kind: prebuilt GPU-aware pick (newest `cudaNNN` the driver supports × exact compute cap, Metal on Apple Silicon, CPU otherwise — loud warn on fallback), activated as a `mistralrs`-kind row. Serving paths: OpenAI chat/completions/embeddings + Anthropic `/v1/messages` via the same gateway; llama-server-only surfaces (`/tokenize`, slot sessions, GBNF grammar, steering, rerank) answer a teaching 400 instead of breaking; decode-regression gate is llama-server-only and skipped with a printed note |
@@ -126,16 +130,18 @@ Capability discovery: `GET /.well-known/pallama` (routes, headers, features, eng
 | `replicas = N` (overlay) | Parallel instances of one model (1..=8): distinct conversation prefixes each get their own warm-cache child (prefix-hash sticky routing); conversations sharing a system prompt coalesce onto the replica that already holds that system KV; `ps` shows `model#N` |
 | `pin = true` (overlay) | Never pick this instance as a capacity-eviction victim (hot-prefix pinning; pressure falls on unpinned instances) |
 | Spec draft pairing | `spec = "auto"` pairs via catalog prefix match; the draft must be **pre-pulled** (`pallama pull ggml-org/Qwen3-0.6B-GGUF:Q4_0`) — a missing draft is a hard error naming the pull command. Accept-rate gauge: `pallama_spec_accept_rate` |
-| MTP speculation | `spec = "mtp"` emits `--spec-type draft-mtp` for GGUFs that ship the multi-token-prediction head **inside the weights** (no draft model; e.g. unsloth `Qwen3.5-9B-MTP-GGUF` — the common base Q4_K_M carries none, verified). Under `spec = "auto"` an MTP-bearing GGUF auto-enables draft-mtp when the engine advertises it (emits the ollama trio: `--spec-type draft-mtp --spec-draft-n-max N --spec-draft-backend-sampling`, N = min(head layers, 2)) and beats the catalog draft-pair lane; engines without `draft-mtp` warn-skip to the pair path. Detection reads both `n_predict_layers` (llama.cpp) and `nextn_predict_layers` (ollama converter) metadata keys. `spec = "off"` never speculates even on MTP GGUFs |
+| MTP speculation | `spec = "mtp"` emits `--spec-type draft-mtp` for GGUFs that ship the multi-token-prediction head **inside the weights** (no draft model; e.g. unsloth `Qwen3.5-9B-MTP-GGUF` — the common base Q4_K_M carries none, verified). Under the **default** `spec = "auto"` an MTP-bearing GGUF auto-enables draft-mtp when the engine advertises it (emits the ollama trio: `--spec-type draft-mtp --spec-draft-n-max N --spec-draft-backend-sampling`, N = min(head layers, 2)) and beats the catalog draft-pair lane; engines without `draft-mtp` warn-skip to the pair path; an unpulled catalog draft degrades to dense with a pull hint (auto never refuses a spawn — explicit modes fail fast). Detection reads both `n_predict_layers` (llama.cpp) and `nextn_predict_layers` (ollama converter) metadata keys. `spec = "off"` never speculates even on MTP GGUFs |
 | Engine auto-rollback | Spawn failures across >=2 models (or a failing `--version` probe) auto-rollback to the previous engine tag + `engine_rolled_back` event; restore with `pallama engine use` |
+| CUDA dethrone guard + build advisory | On NVIDIA boxes a newly installed non-CUDA llama.cpp engine never auto-DEMOTEs an installed CUDA engine (Vulkan first-token is measurably slower; override with `pallama engine use`); NVIDIA + Vulkan-only active + no CUDA installed → one-time teaching log: `pallama engine build cuda` (~18% faster first token on this class of card, one-time ~7 min build) |
 | EAGLE3 speculation | `spec = "eagle3"` pairs a trained speculator draft (separate GGUF, RedHatAI-style): emits `--spec-type draft-eagle3 --spec-draft-model <path>` + the full draft-placement knob set (device pin, cpu range, threads, ngl). Catalog pair shipped for `qwen3-8b` (`williamliao/Qwen3-8B-EAGLE3-Speculator-GGUF:F16`, verified ungated) — typed lookup, so plain `auto` keeps its generic draft-simple pair and precedence. Engines without `draft-eagle3` fail fast naming `pallama engine update`; unpulled draft hard-errors naming the pull command (never silently dense) |
-| dflash/dspark speculation | `spec = "dflash"` / `"dspark"` = block-diffusion drafter lanes (newest upstream spec types; two-file pairing like eagle3, ctx_dft asserted upstream). Pass-through gated on the engine advertising the type — b10896 advertises both; no catalog pairs until verified artifacts exist |
+| dflash/dspark speculation | `spec = "dflash"` / `"dspark"` = block-diffusion drafter lanes (newest upstream spec types; two-file pairing like eagle3, ctx_dft asserted upstream). Engine-gated (b10896 advertises both). Catalog pairs shipped for `qwen3-8b` (ggml-org `dflash-`/`dspark-Qwen3-8B-Q8_0.gguf`, exact-filename pull slot) — **measured -17% vs dense on prose** (acceptance 0.17-0.25, BENCHMARK.md); try on code/templated workloads, never defaulted |
 | Lazy tensor residency | `lazy_mode = "auto"\|"on"\|"off"` (global + per-model override) → `--lazy-mode` on deviation from the engine default `auto`: big tensors (>4 GiB) stream from disk on demand instead of sitting resident in RAM — MoE relief on RAM-tight boxes. Emitted only when you deviate (default config stays argv-clean); engine without the flag degrades to a teaching warning |
+| Full sampler surface on ollama options | Request `options` accept every llama-server-native sampler: `xtc_probability`/`xtc_threshold`, `top_n_sigma`, `logit_bias`, `dry_multiplier`/`dry_base`/`dry_allowed_length`/`dry_penalty_last_n`/`dry_sequence_breakers` (shape-checked: non-empty string array), `mirostat`/`mirostat_tau`/`mirostat_eta`, `dynatemp_range`/`dynatemp_exponent`, `adaptive_target`/`adaptive_decay`, `samplers` chain, and `adaptive_p: true` (joins the sampler chain post-pass — order-independent with an explicit `samplers` list). Unknown keys still 400 listing them, never silently dropped |
 | Server-side tools (experimental) | Global-only quartet `server_tools` / `server_tools_runtime` / `mcp_servers_config` / `mcp_servers_json` → `--tools` / `--tools-runtime` / `--mcp-servers-config` / `--mcp-servers-json` (upstream experimental agent tooling; engine limits CORS to localhost when set). Opt-in, never defaulted, **trusted environments only** (tools include `exec_shell_command`); runtime accepts `docker:`/`podman:` images as passthrough values — pallama itself never requires docker. `mcp_servers_config` path is existence-checked at profile-compile (typo fails before boot, not after); global-only on purpose: security posture must not vary silently per model. Old engines degrade to teaching warnings |
 | GGUF metadata lint | `pull`/`import`/`show` warn when context length, attention geometry, or SWA layout is incomplete (KV/VRAM estimates run blind) — warn-only, never blocks |
 | Hybrid-linear KV math | Hybrid-linear archs (qwen3-next/qwen3.5/Kimi-K3-class: linear attention + full-attention mix) get a TRUE fractional KV estimate: only full-attention layers count when the GGUF carries `recurrent_layers` or `full_attention_interval`; pure-recurrent archs (mamba, rwkv) estimate ~0 KV (constant state). Missing metadata on a hybrid arch → conservative full-layer upper bound + warning naming what a newer conversion would emit. Feeds `coreside`, fit checks, and the KV-quant ladder automatically |
 | `predictive_preload = true` | Reaper learns model transitions (A→B counts >= 3) and pre-spawns the next likely model while the current one idles — kills the cold-start on alternating workloads; emits `model_preloaded` event; 5-min failure backoff |
-| `adaptive_slots` (default on) | Sustained >1 concurrent request on a 1-slot model (6 reaper ticks = 60 s) auto-adopts `-np +1` in memory (cap 4, `slots_auto_adopted` event); `tune --slots` remains the persistent path; per-model `slots` overlay wins; set `false` to pin 1-slot until you say otherwise |
+| `adaptive_slots` (default on) | Sustained admission pressure (requests parked waiting for a slot across 6 reaper ticks = 60 s) auto-adopts `-np +1` (cap 8), then respawns the instance at the first idle drain — the KV bank carries conversations across the reshape; spawn failure rolls the adoption back; per-model `slots` overlay, replicas, and `deterministic` models are excluded; `tune --slots` remains the persistent path. After 5 min of quiet the adoption decays back to the natural shape (per-stream latency recovers; re-adopts in 60 s if demand returns) |
 | Slots auto-fit | When capacity caps `slots = auto` at ONE slot and ctx came from the default (not pinned by overlay/tuning/`num_ctx`), the same total-ctx budget is re-spent as parallel shallow slots (e.g. 1x16384 -> 4x4096, floor 4096 — ollama's throughput-first default; identical VRAM/KV budget, concurrent streams batch instead of queueing). Emits `slots_ctx_auto_fit` event + a teaching warning; prompts longer than the per-slot ctx take the existing `num_ctx` restart-once path |
 | `lookup_cache_static` / `lookup_cache_dynamic` | Path to a llama.cpp lookup cache file (validated to exist); `static` is read-only, `dynamic` is refreshed by generation — verbatim passthrough of `-lcs`/`-lcd` |
 | Auto GPU pick (multi-GPU) | With `devices` unset and >1 GPU, each spawn probes `--list-devices` and picks the **discrete** card with the most free VRAM (integrated cards report shared system RAM as "free" — huge but bandwidth-starved; they are skipped and logged, and used only on integrated-only boxes). All VRAM math (ngl, KV, cache-ram, the 95% co-residency KV-downgrade planner) is scoped to that card, not the summed pool. With a spare discrete card left over, profile warnings suggest `spec_draft_device` / `mmproj_device` on it (teaching only — bench before adopting) |
@@ -181,12 +187,14 @@ auto_restart_engine_switch = false  # true: engine use/update/build/install rest
  #   are rejected, file unchanged).
  update_channel = "latest"
 engine_asset = "auto"     # auto picks by OS/GPU (versioned cuda/rocm = newest); or explicit: "ubuntu-vulkan-x64", ...
-spec = "off"              # "auto" = draft-pair speculation when pulled, or draft-mtp when the GGUF
-                           #   ships an MTP head (n_predict_layers); "ngram" = self-drafting (no draft model);
-                           #   "mtp" = MTP head baked into the GGUF (engine must advertise draft-mtp)
-                           #   "eagle3" = trained speculator draft model (engine must advertise draft-eagle3)
-                           #   block-diffusion lanes: "dflash" | "dspark" (engine-gated, no catalog pairs yet)
-                           #   typed n-gram engines: "ngram-map-k" | "ngram-map-k4v" | "ngram-mod" | "ngram-cache"
+spec = "auto"             # DEFAULT auto (2026-09-11): opportunistic — draft-mtp when the GGUF
+                            #   ships an MTP head (n_predict_layers; measured +50% decode), catalog
+                            #   draft pair when pulled, dense + teaching warning otherwise (never
+                            #   refuses a spawn); "off" = dense always; explicit modes fail fast:
+                            #   "mtp" (head in GGUF), "eagle3" (speculator), "dflash"|"dspark"
+                            #   (block-diffusion, engine-gated; qwen3-8b pairs in catalog, -17% prose)
+                            #   "ngram" = self-drafting (no draft model);
+                            #   typed n-gram engines: "ngram-map-k" | "ngram-map-k4v" | "ngram-mod" | "ngram-cache"
  lazy_mode = "auto"         # tensor residency: auto = engine default (>4GiB on-demand), on = all big
                             #   tensors from disk (mmap), off = resident; per-model override exists
 # --- experimental upstream agent tooling (global-only, trusted environments only) ---
@@ -197,7 +205,7 @@ spec = "off"              # "auto" = draft-pair speculation when pulled, or draf
 cache_reuse = 256         # prefix-cache chunk reuse (0 disables; grid-search via `tune --cache-reuse`)
 cache_idle_slots = true   # false emits --no-cache-idle-slots (skip saving idle slots to prompt cache)
 predictive_preload = false # reaper pre-spawns the next likely model (>=3 A->B transitions) while the current idles
- adaptive_slots = true     # sustained concurrency on a 1-slot model auto-adopts -np +1 in memory (cap 4; default on)
+ adaptive_slots = true     # sustained admission pressure (queued requests) auto-adopts -np +1 (cap 8) and respawns at idle drain; default on
  deterministic = false     # true pins slots = 1 (both engine lanes): multi-slot batches
                            #   perturb logits in near-tie positions, so greedy output under
                            #   slots > 1 is not token-for-token reproducible; costs nothing
@@ -259,6 +267,7 @@ max_entries = 256          # LRU cap
 sessions = true           # slot KV checkpoints: `pallama session save/restore` (engine-gated)
 ctx_extend = 0.0          # YaRN context extension factor; 0 = off. >1.0..=32.0; quality tradeoff
 cpu_moe_n = 0             # keep N MoE experts on CPU (finer than the auto heuristic)
+cpu_ffn_n = 0             # dense models: keep first N layers' FFN weights on CPU (--n-cpu-ffn)
 override_tensor = []      # upstream --override-tensor entries, e.g. [".ffn_.*_exps.=CPU"]
 devices = []              # explicit --device selection for multi-GPU boxes (names from `pallama doctor`); empty = engine auto
 engine_check_secs = 86400 # background llama.cpp release check (0 = off); result in `doctor`/`ps` — never auto-installs
@@ -318,7 +327,28 @@ ctx = 32768
 # ctx_extend, cpu_moe_n, override_tensor, devices, warmup,
 # reasoning_budget, reasoning_effort, replicas, pin,
 # chat_template, chat_template_file, sampler_defaults, spm_infill,
-# late_chunking, rpc_servers
+# late_chunking, rpc_servers, mmproj
+# mmproj = "lazy"  # tri-state projector policy (also accepts true/false):
+#                  # lazy (default) — text-only cold spawn (~3.0 s faster,
+#                  # 1126 MiB VRAM freed); first vision request respawns
+#                  # with the projector, conversation carried via KV bank
+#                  # true/attach — always attach the row's projector
+#                  # false/skip   — text-only; vision requests fail loudly
+# Global default knob: mmproj_policy = "lazy" | "attach" | "skip"
+
+# ---- scaling recipes (measured 2026-09-12, qwen3.5-9b / RTX 4070, greedy-parity
+# verified on every shape — all scheduling-only knobs):
+# slots = 8 + ctx = 4096        # concurrency-first: 8 streams batch instead of
+#                               # queue (system +19%, TTFT p99 5.4x at 8 streams,
+#                               # LESS VRAM); per-stream ITL rises ~60% and
+#                               # per-slot ctx shrinks — prefer for many short
+#                               # concurrent clients
+# extra_args = ["--poll", "100", "--threads-http", "4"]
+#                               # high-concurrency tail latency: TTFT p99 ~-11%
+#                               # at the cost of CPU busy-spin while waiting on
+#                               # the GPU; leave default (50) for desktop use
+# NOTE: raising -ub above the 512 default is a measured regression on long
+# prefill (2111 -> 1728 t/s at 8k tokens, +360 MiB) — leave ubatch alone.
 
 [model_overrides."bge-m3"]          # late chunking (jina arXiv 2409.04701):
 late_chunking = true                # doc embedded ONCE per-token (pooling=none),
@@ -454,13 +484,15 @@ pallama-cli       the `pallama` binary: clap commands, REPL, auto-start
 Load-bearing ideas:
 
 - **Capability manifest** — after install, the engine is probed (`--version`, `--list-devices`, `--help`). The profile compiler emits *only* flags the installed build actually supports; a missing flag is a hard error naming it and suggesting `engine use <tag>`. Engine drift becomes a data problem, not a code problem. Source-built engines (`engine build cuda|cpu`) flow through the identical probe → store → gate lane as release assets; their tags carry a `-cuda`/`-cpu` suffix that currency checks compare by build number, so `engine update` hints stay correct across prebuilt ↔ built switches.
+- **Prebuilt CUDA overlay** — upstream publishes no Linux-CUDA binaries, so this repo's `engine-cuda` workflow compiles pristine upstream b-tags with `-DGGML_CUDA=ON` on CUDA 12/13 images and publishes them as `bNNNN-cuda` releases (bundling cudart/cublas/cublasLt + EULAs — no toolkit install on the target). On Linux-NVIDIA this is zero-touch: `pallama engine update` automatically prefers the highest `ubuntu-cuda-{X.Y}` asset the driver can run (strict ceiling: a driver older than the toolkit stays on Vulkan rather than shipping a child that cannot boot); `PALLAMA_ENGINE_REPO=owner/repo` points the channel at a fork, `pallama engine install bNNNN-cuda` pins an overlay build explicitly. No fork: every asset is the unmodified upstream source at a tagged commit.
+- **Bytes-based VRAM admission** — auto capacity sums resident weights against the VRAM budget instead of dividing by the largest model, so heterogeneous pairs co-reside (0.5B + 9B on an 8 GiB card) where a floor heuristic would evict. Explicit `max_loaded_models` still wins as a count; CPU-only boxes stay pinned to one instance; the fresh-probe spawn guard still owns refuse-vs-warn at load time.
 - **Eviction ladder** — active → child-native sleep at `idle_sleep_secs` (VRAM freed, instant wake) → SIGTERM at `idle_timeout_secs`. Nothing burns VRAM forever; nothing dies mid-request.
 - **Zero-tax proxy** — OpenAI traffic is forwarded byte-for-byte (no body parsing, no SSE buffering). Tool calls, structured output, logprobs ride through untouched. Client disconnect aborts the upstream request; the slot frees.
 - **Signals are single-pid only** — Pallama never signals process groups; every teardown path is audited and idempotent.
 
 ## Verification
 
-718 tests: pure compiler tables, wiremock network suites (resume, sha, allowlist, token isolation), engine install cycles with a real stub engine binary, supervisor lifecycle integration (ladder, capacity, crash-circuit, shutdown), and full gateway round-trips over both APIs — including the sentinel suites (9 detection codes, responses grammar, persistence reload, enforce 422s, live watch SSE, parity-under-observation). `cargo clippy --workspace --all-targets -- -D warnings` clean.
+764 tests: pure compiler tables, wiremock network suites (resume, sha, allowlist, token isolation), engine install cycles with a real stub engine binary, supervisor lifecycle integration (ladder, capacity, crash-circuit, shutdown), and full gateway round-trips over both APIs — including the sentinel suites (9 detection codes, responses grammar, persistence reload, enforce 422s, live watch SSE, parity-under-observation). `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 Dev hygiene: cargo never garbage-collects `target/` — after heavy test sessions `sh scripts/clean-target.sh` wipes the stale incremental-compilation cache (18G observed once; safe when no build is running, refuses otherwise).
 
