@@ -3,7 +3,7 @@
     { "short_name": "qwen2.5-0.5b", "repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF" },
     { "short_name": "qwen3-0.6b", "repo": "ggml-org/Qwen3-0.6B-GGUF" },
     { "short_name": "qwen3-1.7b", "repo": "ggml-org/Qwen3-1.7B-GGUF" },
-    { "short_name": "qwen3-8b", "repo": "ggml-org/Qwen3-8B-GGUF" },
+    { "short_name": "qwen3-8b", "repo": "unsloth/Qwen3-8B-GGUF" },
     { "short_name": "qwen3-coder-30b", "repo": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF" },
     { "short_name": "llama3.2-3b", "repo": "unsloth/Llama-3.2-3B-Instruct-GGUF" },
     { "short_name": "gemma3-4b", "repo": "ggml-org/gemma-3-4b-it-GGUF" },
@@ -13,6 +13,9 @@
   ],
   "spec_pairs": [
     { "model_prefix": "qwen3-", "spec_type": "draft-simple", "draft_repo": "ggml-org/Qwen3-0.6B-GGUF:Q4_0" },
-    { "model_prefix": "qwen3-8b", "spec_type": "draft-eagle3", "draft_repo": "williamliao/Qwen3-8B-EAGLE3-Speculator-GGUF:F16" }
+    { "model_prefix": "qwen3-8b", "spec_type": "draft-eagle3", "draft_repo": "williamliao/Qwen3-8B-EAGLE3-Speculator-GGUF:F16" },
+    { "model_prefix": "qwen3-8b", "spec_type": "draft-dflash", "draft_repo": "ggml-org/Qwen3-8B-GGUF:dflash-Qwen3-8B-Q8_0.gguf" },
+    { "model_prefix": "qwen3-8b", "spec_type": "draft-dspark", "draft_repo": "ggml-org/Qwen3-8B-GGUF:dspark-Qwen3-8B-Q8_0.gguf" },
+    { "model_prefix": "qwen3.5-9b", "spec_type": "draft-mtp", "draft_repo": "unsloth/Qwen3.5-9B-MTP-GGUF" }
   ]
 }

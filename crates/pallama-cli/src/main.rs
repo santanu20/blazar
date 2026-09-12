@@ -2791,7 +2791,8 @@ fn cloud_refusal(cmd: &str, model: &str) -> Result<()> {
     };
     Err(anyhow!(
         "pallama {what}: refused — pallama is local-only by design (no registry, no cloud accounts). \
-Pull models straight from Hugging Face: pallama pull <owner/repo:QUANT>"
+Pull models straight from Hugging Face: pallama pull <owner/repo:QUANT> \
+· discover GGUFs first: pallama search <terms>"
     ))
 }
 
@@ -3998,6 +3999,18 @@ fn tune_full(
     let manifest: pallama_runtime::Manifest = serde_json::from_str(&engine_row.manifest)?;
     let bench_bin = pallama_runtime::bench::find_bench_bin(&d)?;
     let mut cfg = config()?;
+    // Persist --spec BEFORE building the profile input so the compiled
+    // argv (and its draft resolution) matches what the daemon will
+    // serve on the next run — mirrors the --ngram lane's
+    // set-then-reload discipline.
+    if let Some(mode) = spec {
+        if mode != "off" && mode != "auto" {
+            return Err(anyhow!("--spec must be \"off\" or \"auto\""));
+        }
+        set_model_override(model, "spec", &format!("\"{mode}\""))?;
+        cfg = config()?;
+        println!("model_overrides.{model}.spec = {mode}");
+    }
     let hw = pallama_runtime::probe_hardware(Some(&manifest));
     let gguf = pallama_core::read_metadata_file(std::path::Path::new(&row.path))?;
     let overlay = cfg.overlay_for(model);
@@ -4007,6 +4020,11 @@ fn tune_full(
         .map(|l| (l.path, l.scale))
         .collect();
     let data_dir = d.data_dir.to_string_lossy();
+    // Draft resolution identical to the serve path: catalog pair ->
+    // pulled store row. A paired draft must not brick `bench --spec
+    // auto` with a false "not pulled" compile error.
+    let spec_mode = overlay.spec.clone().unwrap_or_else(|| cfg.spec.clone());
+    let draft = pallama_runtime::resolve_draft_path(&store, model, &spec_mode);
     let input = pallama_runtime::bench::build_input(
         model,
         &row.path,
@@ -4016,7 +4034,7 @@ fn tune_full(
         &cfg,
         &overlay,
         &loras,
-        None,
+        draft.as_deref(),
         &engine_row.tag,
         &manifest.flags,
         &manifest.spec_types,
@@ -4031,13 +4049,6 @@ fn tune_full(
         dirs: &d,
         bench_bin,
     };
-    if let Some(mode) = spec {
-        if mode != "off" && mode != "auto" {
-            return Err(anyhow!("--spec must be \"off\" or \"auto\""));
-        }
-        set_model_override(model, "spec", &format!("\"{mode}\""))?;
-        println!("model_overrides.{model}.spec = {mode}");
-    }
     if search {
         let (profile, mut winning, rows) = tuner.tune_search(&store2, &input)?;
         // F6: record the winner so `engine update` can gate future
@@ -4144,6 +4155,8 @@ fn tune_full(
             println!("model_overrides.{model}.spec = ngram (set by --ngram)");
         }
         let overlay2 = cfg.overlay_for(model);
+        // n-gram speculation self-drafts from context n-grams — no
+        // external draft model to resolve.
         let input2 = pallama_runtime::bench::build_input(
             model,
             &row.path,
@@ -4199,6 +4212,8 @@ fn tune_full(
         // searches strip endpoint/session/warmup flags themselves, so the
         // children differ only in the axis under test.
         let overlay3 = cfg.overlay_for(model);
+        let spec_mode3 = overlay3.spec.clone().unwrap_or_else(|| cfg.spec.clone());
+        let draft3 = pallama_runtime::resolve_draft_path(&store, model, &spec_mode3);
         let input3 = pallama_runtime::bench::build_input(
             model,
             &row.path,
@@ -4208,7 +4223,7 @@ fn tune_full(
             &cfg,
             &overlay3,
             &loras,
-            None,
+            draft3.as_deref(),
             &engine_row.tag,
             &manifest.flags,
             &manifest.spec_types,
