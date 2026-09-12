@@ -132,7 +132,7 @@ def cov(knob: str, expectation: str, evidence: str, ok: bool = True) -> None:
 # (bidirectional set comparisons), so drift is impossible to miss.
 #
 # Field inventories verified against crates/pallama-core/src/config.rs:
-#   Config          145 fields (19 Option, 4 containers: keys/remotes/engine_env/model_overrides)
+#   Config          146 fields (19 Option, 4 containers: keys/remotes/engine_env/model_overrides)
 #   ModelOverride    25 fields (all Option)
 #   SamplerDefaults  18 fields (all Option, skip_serializing_if none)
 #   ApiKey            7 fields    Remote  3 fields
@@ -933,7 +933,7 @@ _COMMAND_ATTRS = {
     "ps.reset": (True, False, False, False, True),
     "ps.device": (True, False, False, False, True),
     "ps.warnings": (True, False, False, False, True),
-    "chat.colon": (True, True, False, False, True),
+    "run.colon": (True, True, False, False, True),
     "run.single": (True, True, False, False, True),
     "run.repl-exit": (True, True, False, False, True),
     "run.repl-eof": (True, True, False, False, True),
@@ -1077,6 +1077,14 @@ _K = [
     ),
     ("spec", False, False, "existing", None, "phase_config B: --spec-type ngram"),
     ("cache_reuse", False, False, "argv", "G1", "--cache-reuse 128"),
+    (
+        "download_connections",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "parallel byte-range pull knob; 1..=32 bound in config.rs",
+    ),
     ("keys", False, True, "behavior", None, "keys lifecycle + phase_auth"),
     (
         "audit_log",
@@ -6182,7 +6190,7 @@ def phase_commands() -> None:
         extra={"model": MODEL.replace("-", ":", 1), "max_tokens": 8},
     )
     reg(
-        "chat.colon",
+        "run.colon",
         st_c == 200,
         f"model:tag via gateway chat -> {st_c}",
     )
@@ -7438,7 +7446,7 @@ def phase_knobs_behavior() -> None:
 
 
 def _full_toplevel() -> dict:
-    """All 145 manifest knobs with benign explicit values (full-manifest boot).
+    """All 146 manifest knobs with benign explicit values (full-manifest boot).
 
     None values = deliberately omitted from the serialized boot config
     (XOR partners / pairing-gated knobs that cannot co-exist): the key
@@ -7480,6 +7488,7 @@ def _full_toplevel() -> dict:
         "engine_asset": "ubuntu-vulkan-x64",
         "spec": "off",
         "cache_reuse": 128,
+        "download_connections": 8,
         "keys": [
             {
                 "name": "gatekey",
