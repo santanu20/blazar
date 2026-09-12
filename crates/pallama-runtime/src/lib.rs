@@ -36,7 +36,7 @@ pub use engine::manifest::{probe as probe_manifest, Manifest, Vendor};
 pub use engine::{system_vendor_hint, EngineManager, LOCAL_TAG};
 pub use engine_impl::{ChildHandle, Engine, LlamaCppEngine, MistralRsEngine};
 pub use events::{EventBus, InstanceState, PallamaEvent};
-pub use hf::{parse_pull_target, registry_name, PullTarget, Puller};
+pub use hf::{parse_pull_target, registry_name, PullOutcome, PullTarget, Puller};
 pub use models::{instance_running, remove_model};
 pub use probe::probe_hardware;
 pub use supervisor::{EngineRef, PrefixKey, PsRow, SupervisionError, Supervisor, ROUTER_KEY};

@@ -901,20 +901,240 @@ fn pid_alive(pid: u32) -> bool {
     }
 }
 
+/// What a pull produced: the stored row and whether the model was already
+/// present (idempotent fast path — zero bytes moved).
+#[derive(Debug, Clone)]
+pub struct PullOutcome {
+    pub row: ModelRow,
+    pub already_present: bool,
+}
+
+/// What a re-pull of an already-stored model must do.
+#[derive(Debug)]
+pub(crate) enum Repull {
+    /// Files on disk match repo+quant+sha and are intact — zero bytes.
+    Present(Box<ModelRow>),
+    /// Model file intact but the mmproj sidecar differs — download (or
+    /// drop) ONLY the sidecar instead of the multi-GiB model.
+    DeltaMmproj { expected: bool },
+    /// Full download (any dead leaves were already pruned where safe).
+    Full,
+}
+
+/// Derive every shard leaf of a sharded download from its recorded launch
+/// path (`…-00001-of-0000N.gguf` is the HF naming convention). `None`
+/// when the recorded path does not follow the pattern — the caller then
+/// keeps the old files and falls back to collision-disambiguation.
+fn shard_set(model_path: &str, shards: i64) -> Option<Vec<PathBuf>> {
+    let p = Path::new(model_path);
+    let dir = p.parent()?;
+    let name = p.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".gguf")?;
+    let total = u32::try_from(shards).ok()?;
+    let first = format!("-{:05}-of-{:05}", 1, total);
+    let base = stem.strip_suffix(first.as_str())?;
+    Some(
+        (1..=total)
+            .map(|n| dir.join(format!("{base}-{n:05}-of-{total:05}.gguf")))
+            .collect(),
+    )
+}
+
+/// Is the row's main file plausibly intact? Single-shard rows verify the
+/// exact recorded length AND a parseable GGUF header; sharded rows can
+/// only afford a header check on the launch shard (`bytes` is the SUM
+/// across files, not any single file's length).
+pub(crate) fn model_file_intact(row: &ModelRow) -> bool {
+    let path = Path::new(&row.path);
+    if !path.is_file() {
+        return false;
+    }
+    if row.shards <= 1 {
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false;
+        };
+        meta.len() == u64::try_from(row.bytes).unwrap_or(u64::MAX)
+            && gguf::read_metadata_file(path).is_ok()
+    } else {
+        gguf::read_metadata_file(path).is_ok()
+    }
+}
+
+/// The mmproj sidecar agrees with the selection: expected + present, or
+/// absent on both sides.
+pub(crate) fn mmproj_matches(row: &ModelRow, expects_mmproj: bool) -> bool {
+    match (&row.mmproj_path, expects_mmproj) {
+        (Some(p), true) => Path::new(p).is_file(),
+        (None, false) => true,
+        _ => false,
+    }
+}
+
+/// Drop a leftover `.part` (+ its parallel-download sidecar) once the
+/// final leaf is verified present — a stale partial from an interrupted
+/// attempt is pure garbage at that point.
+pub(crate) fn sweep_stale_part(final_path: &str) {
+    for suffix in [".part", ".part.progress"] {
+        let stale = format!("{final_path}{suffix}");
+        if let Err(e) = std::fs::remove_file(&stale) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("could not remove stale partial {stale}: {e}");
+            }
+        }
+    }
+}
+
+/// Decide what a re-pull must do given the row already stored under
+/// `name` (if any). Shared by the HF and registry lanes.
+pub(crate) fn repull_gate(
+    existing: Option<&ModelRow>,
+    name: &str,
+    repo: &str,
+    quant: &str,
+    expected_sha: Option<&str>,
+    expects_mmproj: bool,
+) -> Repull {
+    let Some(row) = existing else {
+        return Repull::Full;
+    };
+    let same_model = row.repo == repo && row.quant.eq_ignore_ascii_case(quant);
+    if !same_model {
+        return Repull::Full;
+    }
+    // Upstream revision check: recorded sha vs the freshly listed one
+    // (metadata compare — instant, no re-hash of the local file).
+    // Unknown on either side (non-LFS files, legacy rows) trusts the
+    // local file rather than forcing a multi-GiB redownload.
+    let sha_current = expected_sha.is_none_or(|s| {
+        row.sha256
+            .as_deref()
+            .is_none_or(|r| r.eq_ignore_ascii_case(s))
+    });
+    if !sha_current {
+        tracing::warn!(
+            model = %name,
+            "upstream revision changed for {}:{} — replacing the local copy",
+            row.repo,
+            row.quant
+        );
+        prune_replaced(name, row, &[], "upstream revision changed");
+        return Repull::Full;
+    }
+    if model_file_intact(row) {
+        if mmproj_matches(row, expects_mmproj) {
+            tracing::info!(
+                model = %name,
+                "already present ({}, {} shards) — skipping download",
+                row.quant,
+                row.shards
+            );
+            Repull::Present(Box::new(row.clone()))
+        } else {
+            Repull::DeltaMmproj {
+                expected: expects_mmproj,
+            }
+        }
+    } else {
+        prune_replaced(name, row, &[], "integrity check failed");
+        Repull::Full
+    }
+}
+
 impl Puller {
     /// Pull a model into the store. `target` = `owner/repo[:QUANT]` or a
-    /// catalog short name.
-    pub async fn pull(&self, target: &str) -> Result<ModelRow> {
+    /// catalog short name. The quant slot may instead carry an exact
+    /// `.gguf` filename (`owner/repo:draft-Model-Q8_0.gguf`) — used for
+    /// drafter artifacts living in the target's own repo; those rows are
+    /// named after the file stem so they never collide with the model row.
+    pub async fn pull(&self, target: &str) -> Result<PullOutcome> {
         let parsed = parse_pull_target(target)?;
         let name = registry_name(&parsed.repo);
         let _lock = PullLock::acquire(&self.dirs, &name)?;
         self.pull_locked(&parsed, &name).await
     }
 
-    async fn pull_locked(&self, target: &PullTarget, name: &str) -> Result<ModelRow> {
+    async fn pull_locked(&self, target: &PullTarget, name: &str) -> Result<PullOutcome> {
         let info = self.client.model_info(&target.repo).await?;
         let selected = select_files(&info.siblings, &target.quant)?;
 
+        let store = Store::open(&self.dirs)?;
+
+        // Idempotent re-pull ladder, shared with the registry lane:
+        //   Present      — repo+quant+sha match, files intact: no-op.
+        //   DeltaMmproj  — model intact, sidecar differs: sidecar-only pull.
+        //   Full         — replace (dead/replaced leaves pruned where the
+        //                  shard set is derivable, so the fresh download
+        //                  lands on the canonical filename instead of the
+        //                  `owner--repo--leaf` collision slug).
+        let existing = store.get_model(name)?;
+        let expected_sha = selected.shards[0].sha256.clone();
+        let decision = repull_gate(
+            existing.as_ref(),
+            name,
+            &target.repo,
+            &selected.quant,
+            expected_sha.as_deref(),
+            selected.mmproj.is_some(),
+        );
+        if let Some(outcome) = self
+            .handle_repull_decision(name, target, &info, &selected, existing.as_ref(), decision)
+            .await?
+        {
+            return Ok(outcome);
+        }
+
+        let (shard_paths, mmproj_dest) = self
+            .download_full_selection(name, target, &selected)
+            .await?;
+
+        let (row, pull_warning) = build_model_row(
+            name,
+            target,
+            &info,
+            &selected,
+            &shard_paths,
+            mmproj_dest.as_ref(),
+        )?;
+        if let Some(w) = &pull_warning {
+            tracing::warn!(model = %name, "{w}");
+        }
+        store.upsert_model(&row)?;
+        // The replaced quant's files are orphaned otherwise (rows are
+        // quant-independent by name; a re-quant swap overwrites the row).
+        if let Some(old) = existing.as_ref() {
+            let keep_model = Path::new(&row.path);
+            let keep_mmproj = row.mmproj_path.as_deref().map(Path::new);
+            let keep: Vec<&Path> = keep_mmproj
+                .as_ref()
+                .map_or_else(|| vec![keep_model], |mm| vec![keep_model, mm]);
+            prune_replaced(name, old, &keep, "superseded by a different quant");
+        }
+        self.bus.publish(PallamaEvent::ModelPulled {
+            name: name.to_string(),
+            warning: pull_warning.clone(),
+        });
+        if selected.quant_fallback {
+            tracing::warn!(
+                "quant {} not found in {}; pulled {} instead",
+                target.quant,
+                target.repo,
+                selected.quant
+            );
+        }
+        Ok(PullOutcome {
+            row,
+            already_present: false,
+        })
+    }
+
+    /// Full-download phase of [`Self::pull_locked`]: one shared progress bar
+    /// across all shards plus the mmproj sidecar.
+    async fn download_full_selection(
+        &self,
+        name: &str,
+        target: &PullTarget,
+        selected: &SelectedFiles,
+    ) -> Result<(Vec<PathBuf>, Option<PathBuf>)> {
         let models_dir = self.dirs.models_dir();
         std::fs::create_dir_all(&models_dir)?;
 
@@ -979,33 +1199,188 @@ impl Puller {
                 })?;
         }
         bar.finish_and_clear();
+        Ok((shard_paths, mmproj_dest))
+    }
 
-        let (row, pull_warning) = build_model_row(
+    /// Act on the gate's decision. `Some(outcome)` = the pull is already
+    /// finished (no-op or delta); `None` = proceed with the full download
+    /// (any pre-download pruning is done here).
+    async fn handle_repull_decision(
+        &self,
+        name: &str,
+        target: &PullTarget,
+        info: &HfModelInfo,
+        selected: &SelectedFiles,
+        existing: Option<&ModelRow>,
+        decision: Repull,
+    ) -> Result<Option<PullOutcome>> {
+        if let Repull::Present(row) = decision {
+            let total = u64::try_from(row.bytes).unwrap_or(0);
+            self.bus.publish(PallamaEvent::PullProgress {
+                name: name.to_string(),
+                downloaded: total,
+                total,
+            });
+            self.bus.publish(PallamaEvent::ModelPulled {
+                name: name.to_string(),
+                warning: None,
+            });
+            sweep_stale_part(&row.path);
+            return Ok(Some(PullOutcome {
+                row: *row,
+                already_present: true,
+            }));
+        }
+        if let Repull::DeltaMmproj { expected } = decision {
+            // Shard paths are only fully known for single-shard rows
+            // (multi-shard rows record just the launch leaf); escalate
+            // those to a full download.
+            if let Some(old) = existing.filter(|r| r.shards <= 1) {
+                let (row, pull_warning) = self
+                    .delta_mmproj(name, target, info, selected, old, expected)
+                    .await?;
+                if let Some(w) = &pull_warning {
+                    tracing::warn!(model = %name, "{w}");
+                }
+                Store::open(&self.dirs)?.upsert_model(&row)?;
+                self.bus.publish(PallamaEvent::ModelPulled {
+                    name: name.to_string(),
+                    warning: pull_warning,
+                });
+                return Ok(Some(PullOutcome {
+                    row,
+                    already_present: false,
+                }));
+            }
+        }
+        if let Some(old) = existing {
+            if old.repo != target.repo {
+                tracing::warn!(
+                    model = %name,
+                    "replacing row previously pulled from {} with {}",
+                    old.repo,
+                    target.repo
+                );
+            }
+            // Same canonical filename as the new selection means the
+            // download would collide — prune BEFORE it so the fresh bytes
+            // land on the canonical leaf (upstream revision change).
+            let new_leaf = selected.shards[0].filename.as_str();
+            if Path::new(&old.path)
+                .file_name()
+                .and_then(|f| f.to_str())
+                .is_some_and(|f| f.eq_ignore_ascii_case(new_leaf))
+            {
+                prune_replaced(name, old, &[], "upstream revision changed");
+            }
+        }
+        Ok(None)
+    }
+
+    /// Sidecar-only pull: the model file is intact and only the mmproj
+    // projector differs (repo added one, or dropped it). Moves megabytes,
+    // not gigabytes.
+    async fn delta_mmproj(
+        &self,
+        name: &str,
+        target: &PullTarget,
+        info: &HfModelInfo,
+        selected: &SelectedFiles,
+        old: &ModelRow,
+        expected: bool,
+    ) -> Result<(ModelRow, Option<String>)> {
+        let models_dir = self.dirs.models_dir();
+        std::fs::create_dir_all(&models_dir)?;
+        let mut mmproj_dest = None;
+        if expected {
+            let mm = selected.mmproj.as_ref().ok_or_else(|| {
+                anyhow!("delta pull requested a projector but the selection has none")
+            })?;
+            let dest = unique_dest(&models_dir, &mm.filename, &target.repo);
+            let bar = indicatif::ProgressBar::new(mm.bytes);
+            bar.set_style(
+                indicatif::ProgressStyle::default_bar()
+                    .template("{msg} {bar:30} {bytes}/{total_bytes} ({eta})")
+                    .expect("valid template"),
+            );
+            bar.set_message(format!("pull {name}:{}", selected.quant));
+            let mut last_publish = 0u64;
+            let mut progress = |downloaded: u64, total: u64| {
+                bar.set_position(downloaded);
+                if downloaded.saturating_sub(last_publish) >= 16 << 20 || downloaded == total {
+                    last_publish = downloaded;
+                    self.bus.publish(PallamaEvent::PullProgress {
+                        name: name.to_string(),
+                        downloaded,
+                        total,
+                    });
+                }
+            };
+            self.client
+                .download_file(&target.repo, mm, &dest, &mut progress)
+                .await
+                .inspect_err(|e| {
+                    self.bus.publish(PallamaEvent::PullFailed {
+                        name: name.to_string(),
+                        error: format!("mmproj: {e}"),
+                    });
+                })?;
+            bar.finish_and_clear();
+            mmproj_dest = Some(dest);
+        } else if let Some(old_mm) = &old.mmproj_path {
+            // Repo dropped the projector: forget it from the row and
+            // remove the dead sidecar file.
+            if let Err(e) = std::fs::remove_file(old_mm) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(model = %name, "could not remove stale mmproj {old_mm}: {e}");
+                }
+            }
+        }
+        build_model_row(
             name,
             target,
-            &info,
-            &selected,
-            &shard_paths,
+            info,
+            selected,
+            &[PathBuf::from(&old.path)],
             mmproj_dest.as_ref(),
-        )?;
-        if let Some(w) = &pull_warning {
-            tracing::warn!(model = %name, "{w}");
-        }
-        let store = Store::open(&self.dirs)?;
-        store.upsert_model(&row)?;
-        self.bus.publish(PallamaEvent::ModelPulled {
-            name: name.to_string(),
-            warning: pull_warning.clone(),
-        });
-        if selected.quant_fallback {
+        )
+    }
+}
+
+/// Remove the replaced row's files (model shard set + sidecar),
+/// skipping `keep`. Best-effort with named warnings; a shard set that
+/// cannot be derived from the recorded leaf is left untouched (the
+/// replacement then lands slug-disambiguated instead).
+pub(crate) fn prune_replaced(name: &str, old: &ModelRow, keep: &[&Path], reason: &str) {
+    let leaves = if old.shards <= 1 {
+        vec![PathBuf::from(&old.path)]
+    } else {
+        let Some(set) = shard_set(&old.path, old.shards) else {
             tracing::warn!(
-                "quant {} not found in {}; pulled {} instead",
-                target.quant,
-                target.repo,
-                selected.quant
+                model = %name,
+                "cannot derive the {}-shard set of the previous download ({reason}); leaving files in place",
+                old.shards
             );
+            return;
+        };
+        set
+    };
+    let mmproj_leaf = old.mmproj_path.as_deref().map(Path::new);
+    for leaf in leaves.iter().map(PathBuf::as_path).chain(mmproj_leaf) {
+        if keep.contains(&leaf) {
+            continue;
         }
-        Ok(row)
+        match std::fs::remove_file(leaf) {
+            Ok(()) => {
+                tracing::info!(model = %name, "pruned replaced file {} ({reason})", leaf.display());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                model = %name,
+                "could not prune replaced file {} ({e}) — remove it manually if disk space matters",
+                leaf.display()
+            ),
+        }
     }
 }
 
@@ -1143,15 +1518,15 @@ mod tests {
     fn unit__quant_tokens__real_filename_shapes() {
         // Shapes harvested live from HF nanbeige search results.
         let files = [
-            "Nanbeige4.2-3B-Q4_K_M.gguf",               // dash separator
-            "nanbeige4.1-3b-q8_0.gguf",                 // lowercase repo style
-            "nanbeige-16b-base-32k.Q2_K.gguf",          // dot separator
+            "Nanbeige4.2-3B-Q4_K_M.gguf",      // dash separator
+            "nanbeige4.1-3b-q8_0.gguf",        // lowercase repo style
+            "nanbeige-16b-base-32k.Q2_K.gguf", // dot separator
             "Nanbeige4.2-3B-BF16.gguf",
             "Parable-Nanbeige4.2-3B-Claude-Fable-5-heretic.i1-IQ1_M.gguf",
-            "model-00001-of-00002.gguf",                // shard tail: digits only
-            "mmproj-model-F16.gguf",                    // projector: excluded
-            "README.md",                                // not gguf
-            "Nanbeige4-3B-Thinking-2511.gguf",          // tag tails: not quants
+            "model-00001-of-00002.gguf",       // shard tail: digits only
+            "mmproj-model-F16.gguf",           // projector: excluded
+            "README.md",                       // not gguf
+            "Nanbeige4-3B-Thinking-2511.gguf", // tag tails: not quants
         ];
         assert_eq!(
             quant_tokens(files),
@@ -1373,6 +1748,494 @@ mod tests {
         format!("{:x}", Sha256::digest(bytes))
     }
 
+    /// Minimal valid GGUF v3 file (header + one string kv) — passes
+    /// `gguf::read_metadata_file`.
+    fn gguf_bytes() -> Vec<u8> {
+        let mut b: Vec<u8> = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes()); // tensor count
+        b.extend_from_slice(&1u64.to_le_bytes()); // kv count
+        let k = "general.architecture";
+        b.extend_from_slice(&(k.len() as u64).to_le_bytes());
+        b.extend_from_slice(k.as_bytes());
+        b.extend_from_slice(&8u32.to_le_bytes()); // string type
+        let v = "qwen3";
+        b.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        b.extend_from_slice(v.as_bytes());
+        b
+    }
+
+    fn seed_row(
+        name: &str,
+        repo: &str,
+        quant: &str,
+        path: &str,
+        bytes: u64,
+        shards: i64,
+    ) -> ModelRow {
+        ModelRow {
+            name: name.to_string(),
+            repo: repo.to_string(),
+            quant: quant.to_string(),
+            path: path.to_string(),
+            bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
+            sha256: None,
+            mmproj_path: None,
+            shards,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+        }
+    }
+
+    #[test]
+    fn unit__model_file_intact__truth_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let good = tmp.path().join("good.gguf");
+        let content = gguf_bytes();
+        std::fs::write(&good, &content).unwrap();
+        let row = |path: &str, bytes: u64, shards: i64| {
+            seed_row("m", "o/r", "Q4_K_M", path, bytes, shards)
+        };
+
+        // Exact length + parseable header.
+        assert!(model_file_intact(&row(
+            good.to_str().unwrap(),
+            content.len() as u64,
+            1
+        )));
+        // Recorded length disagrees (truncation/corruption).
+        assert!(!model_file_intact(&row(good.to_str().unwrap(), 5, 1)));
+        // Missing file.
+        assert!(!model_file_intact(&row(
+            tmp.path().join("nope.gguf").to_str().unwrap(),
+            0,
+            1
+        )));
+        // Garbage header at the "right" length.
+        let bad = tmp.path().join("bad.gguf");
+        std::fs::write(&bad, vec![0u8; content.len()]).unwrap();
+        assert!(!model_file_intact(&row(
+            bad.to_str().unwrap(),
+            content.len() as u64,
+            1
+        )));
+        // Sharded: header-only check on the launch shard (bytes is a SUM
+        // across files, never any single file's length).
+        assert!(model_file_intact(&row(good.to_str().unwrap(), 999_999, 2)));
+        assert!(!model_file_intact(&row(bad.to_str().unwrap(), 8, 2)));
+    }
+
+    #[tokio::test]
+    async fn integration__repull__already_present_skips_download() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = PallamaDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        dirs.ensure().unwrap();
+
+        // Intact on-disk state: valid GGUF at the canonical leaf + a store
+        // row whose repo/quant match what select_files would choose.
+        let content = gguf_bytes();
+        let sha = payload(&content);
+        let leaf = dirs.models_dir().join("r-q4_k_m.gguf");
+        std::fs::write(&leaf, &content).unwrap();
+        let row = seed_row(
+            "r",
+            "o/r",
+            "Q4_K_M",
+            &leaf.display().to_string(),
+            content.len() as u64,
+            1,
+        );
+        Store::open(&dirs).unwrap().upsert_model(&row).unwrap();
+        // Stale partials from an interrupted attempt are garbage once the
+        // final leaf verifies — the fast path sweeps them.
+        std::fs::write(dirs.models_dir().join("r-q4_k_m.gguf.part"), b"junk").unwrap();
+        std::fs::write(dirs.models_dir().join("r-q4_k_m.gguf.part.progress"), b"{}").unwrap();
+
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/models/o/r"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "siblings": [ sibling_json("r-q4_k_m.gguf", content.len() as u64, &sha) ]
+            })))
+            .mount(&api)
+            .await;
+        // Download server with ZERO mocks: any download attempt would 404
+        // and fail the pull — the fast path must not touch it at all.
+        let dl = MockServer::start().await;
+
+        let client = HfClient::with_bases(
+            &api.uri(),
+            &dl.uri(),
+            None,
+            vec![host_of(&api.uri()), host_of(&dl.uri())],
+        )
+        .unwrap();
+        let puller = Puller {
+            dirs: dirs.clone(),
+            client,
+            bus: EventBus::default(),
+        };
+        let outcome = puller.pull("o/r").await.unwrap();
+
+        assert!(outcome.already_present, "gate must short-circuit");
+        assert_eq!(outcome.row.path, leaf.display().to_string());
+        assert!(
+            dl.received_requests().await.unwrap_or_default().is_empty(),
+            "fast path must not fetch a single download byte"
+        );
+        assert!(!dirs.models_dir().join("r-q4_k_m.gguf.part").exists());
+        assert!(!dirs
+            .models_dir()
+            .join("r-q4_k_m.gguf.part.progress")
+            .exists());
+        // Store row NOT clobbered by a re-derived slug twin.
+        assert_eq!(
+            Store::open(&dirs)
+                .unwrap()
+                .get_model("r")
+                .unwrap()
+                .unwrap()
+                .path,
+            leaf.display().to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn integration__repull__self_heal_replaces_corrupt_leaf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = PallamaDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        dirs.ensure().unwrap();
+
+        // Store row points at a truncated file: integrity fails, so the
+        // pull must clear the dead leaf and land the fresh download on
+        // the CANONICAL filename — not the owner--repo--leaf slug.
+        let content = b"fresh-bytes-here".to_vec();
+        let sha = payload(&content);
+        let leaf = dirs.models_dir().join("r-q4_k_m.gguf");
+        std::fs::write(&leaf, b"junk").unwrap();
+        let row = seed_row(
+            "r",
+            "o/r",
+            "Q4_K_M",
+            &leaf.display().to_string(),
+            content.len() as u64,
+            1,
+        );
+        Store::open(&dirs).unwrap().upsert_model(&row).unwrap();
+
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/models/o/r"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "siblings": [ sibling_json("r-q4_k_m.gguf", content.len() as u64, &sha) ]
+            })))
+            .mount(&api)
+            .await;
+        let dl = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/o/r/resolve/main/r-q4_k_m.gguf"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(content.clone()))
+            .mount(&dl)
+            .await;
+
+        let client = HfClient::with_bases(
+            &api.uri(),
+            &dl.uri(),
+            None,
+            vec![host_of(&api.uri()), host_of(&dl.uri())],
+        )
+        .unwrap();
+        let puller = Puller {
+            dirs: dirs.clone(),
+            client,
+            bus: EventBus::default(),
+        };
+        let outcome = puller.pull("o/r").await.unwrap();
+
+        assert!(!outcome.already_present);
+        assert_eq!(
+            outcome.row.path,
+            leaf.display().to_string(),
+            "fresh download must land on the canonical leaf"
+        );
+        assert_eq!(std::fs::read(&leaf).unwrap(), content);
+        assert!(
+            !dirs.models_dir().join("o--r--r-q4_k_m.gguf").exists(),
+            "no collision-slug twin"
+        );
+        // Row healed: byte count matches the fresh file.
+        assert_eq!(
+            Store::open(&dirs)
+                .unwrap()
+                .get_model("r")
+                .unwrap()
+                .unwrap()
+                .bytes,
+            i64::try_from(content.len()).unwrap()
+        );
+    }
+
+    #[test]
+    fn unit__shard_set__derives_all_leaves_and_rejects_non_shard() {
+        let set = shard_set("/m/big-q4_k_m-00001-of-00003.gguf", 3).unwrap();
+        assert_eq!(
+            set,
+            vec![
+                std::path::PathBuf::from("/m/big-q4_k_m-00001-of-00003.gguf"),
+                std::path::PathBuf::from("/m/big-q4_k_m-00002-of-00003.gguf"),
+                std::path::PathBuf::from("/m/big-q4_k_m-00003-of-00003.gguf"),
+            ]
+        );
+        // A single-file name does not follow the shard pattern.
+        assert!(shard_set("/m/big-q4_k_m.gguf", 2).is_none());
+    }
+
+    #[tokio::test]
+    async fn integration__requant__downloads_new_and_prunes_old() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = PallamaDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        dirs.ensure().unwrap();
+
+        let q4 = b"q4-bytes".to_vec();
+        let q8 = gguf_bytes();
+        let q4_leaf = dirs.models_dir().join("r-q4_k_m.gguf");
+        std::fs::write(&q4_leaf, &q4).unwrap();
+        let row = seed_row(
+            "r",
+            "o/r",
+            "Q4_K_M",
+            &q4_leaf.display().to_string(),
+            q4.len() as u64,
+            1,
+        );
+        Store::open(&dirs).unwrap().upsert_model(&row).unwrap();
+
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/models/o/r"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "siblings": [
+                    sibling_json("r-q4_k_m.gguf", q4.len() as u64, &payload(&q4)),
+                    sibling_json("r-q8_0.gguf", q8.len() as u64, &payload(&q8)),
+                ]
+            })))
+            .mount(&api)
+            .await;
+        let dl = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/o/r/resolve/main/r-q8_0.gguf"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(q8.clone()))
+            .mount(&dl)
+            .await;
+
+        let client = HfClient::with_bases(
+            &api.uri(),
+            &dl.uri(),
+            None,
+            vec![host_of(&api.uri()), host_of(&dl.uri())],
+        )
+        .unwrap();
+        let puller = Puller {
+            dirs: dirs.clone(),
+            client,
+            bus: EventBus::default(),
+        };
+        let outcome = puller.pull("o/r:Q8_0").await.unwrap();
+
+        assert!(!outcome.already_present);
+        assert_eq!(outcome.row.quant, "Q8_0");
+        assert!(dirs.models_dir().join("r-q8_0.gguf").is_file());
+        assert!(
+            !q4_leaf.exists(),
+            "superseded quant file must be pruned, not orphaned"
+        );
+    }
+
+    #[tokio::test]
+    async fn integration__repull__upstream_sha_change_replaces_canonically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = PallamaDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        dirs.ensure().unwrap();
+
+        // Recorded sha is the OLD revision; the API now lists a different
+        // sha under the same filename — the pull must replace the leaf in
+        // place (canonical landing), not slug-disambiguate.
+        let old_content = gguf_bytes();
+        let new_content = b"new-revision-bytes".to_vec();
+        let old_sha = payload(&old_content);
+        let new_sha = payload(&new_content);
+        let leaf = dirs.models_dir().join("r-q4_k_m.gguf");
+        std::fs::write(&leaf, &old_content).unwrap();
+        let row = seed_row(
+            "r",
+            "o/r",
+            "Q4_K_M",
+            &leaf.display().to_string(),
+            old_content.len() as u64,
+            1,
+        );
+        let mut row = row;
+        row.sha256 = Some(old_sha);
+        Store::open(&dirs).unwrap().upsert_model(&row).unwrap();
+
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/models/o/r"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "siblings": [ sibling_json("r-q4_k_m.gguf", new_content.len() as u64, &new_sha) ]
+            })))
+            .mount(&api)
+            .await;
+        let dl = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/o/r/resolve/main/r-q4_k_m.gguf"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(new_content.clone()))
+            .mount(&dl)
+            .await;
+
+        let client = HfClient::with_bases(
+            &api.uri(),
+            &dl.uri(),
+            None,
+            vec![host_of(&api.uri()), host_of(&dl.uri())],
+        )
+        .unwrap();
+        let puller = Puller {
+            dirs: dirs.clone(),
+            client,
+            bus: EventBus::default(),
+        };
+        let outcome = puller.pull("o/r").await.unwrap();
+
+        assert!(!outcome.already_present);
+        assert_eq!(
+            outcome.row.path,
+            leaf.display().to_string(),
+            "replacement must land on the canonical leaf"
+        );
+        assert_eq!(std::fs::read(&leaf).unwrap(), new_content);
+        assert!(
+            !dirs.models_dir().join("o--r--r-q4_k_m.gguf").exists(),
+            "no collision-slug twin"
+        );
+        assert_eq!(
+            Store::open(&dirs)
+                .unwrap()
+                .get_model("r")
+                .unwrap()
+                .unwrap()
+                .sha256
+                .as_deref(),
+            Some(new_sha.as_str()),
+            "row records the new revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn integration__repull__delta_mmproj_downloads_only_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = PallamaDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        dirs.ensure().unwrap();
+
+        // Intact model on disk (sha matches the API); the repo now also
+        // ships a projector. Only the sidecar may move.
+        let model = gguf_bytes();
+        let model_sha = payload(&model);
+        let mm = b"mmproj-bytes".to_vec();
+        let mm_sha = payload(&mm);
+        let leaf = dirs.models_dir().join("r-q4_k_m.gguf");
+        std::fs::write(&leaf, &model).unwrap();
+        let row = seed_row(
+            "r",
+            "o/r",
+            "Q4_K_M",
+            &leaf.display().to_string(),
+            model.len() as u64,
+            1,
+        );
+        let mut row = row;
+        row.sha256 = Some(model_sha.clone());
+        Store::open(&dirs).unwrap().upsert_model(&row).unwrap();
+
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/models/o/r"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "siblings": [
+                    sibling_json("r-q4_k_m.gguf", model.len() as u64, &model_sha),
+                    sibling_json("mmproj-r-f16.gguf", mm.len() as u64, &mm_sha),
+                ]
+            })))
+            .mount(&api)
+            .await;
+        // ONLY the sidecar endpoint is mounted: a model re-fetch would
+        // 404 and fail the pull.
+        let dl = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/o/r/resolve/main/mmproj-r-f16.gguf"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(mm.clone()))
+            .mount(&dl)
+            .await;
+
+        let client = HfClient::with_bases(
+            &api.uri(),
+            &dl.uri(),
+            None,
+            vec![host_of(&api.uri()), host_of(&dl.uri())],
+        )
+        .unwrap();
+        let puller = Puller {
+            dirs: dirs.clone(),
+            client,
+            bus: EventBus::default(),
+        };
+        let outcome = puller.pull("o/r").await.unwrap();
+
+        assert!(!outcome.already_present, "sidecar bytes did move");
+        assert_eq!(
+            outcome.row.mmproj_path.as_deref(),
+            Some(
+                dirs.models_dir()
+                    .join("mmproj-r-f16.gguf")
+                    .display()
+                    .to_string()
+                    .as_str()
+            ),
+            "row gains the sidecar"
+        );
+        assert_eq!(std::fs::read(&leaf).unwrap(), model, "model file untouched");
+        assert_eq!(
+            std::fs::read(dirs.models_dir().join("mmproj-r-f16.gguf")).unwrap(),
+            mm
+        );
+        let model_hits = dl
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|rq| rq.url.path().ends_with("r-q4_k_m.gguf"))
+            .count();
+        assert_eq!(model_hits, 0, "model must not be re-downloaded");
+    }
+
     #[tokio::test]
     async fn integration__pull_single_file__downloads_verifies_stores() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1415,7 +2278,7 @@ mod tests {
             client,
             bus: EventBus::default(),
         };
-        let row = puller.pull("owner/m-repo:Q4_K_M").await.unwrap();
+        let row = puller.pull("owner/m-repo:Q4_K_M").await.unwrap().row;
 
         assert_eq!(row.name, "m-repo");
         assert_eq!(row.quant, "Q4_K_M");
@@ -1524,7 +2387,7 @@ mod tests {
             client,
             bus: EventBus::default(),
         };
-        let row = puller.pull("o/r").await.unwrap();
+        let row = puller.pull("o/r").await.unwrap().row;
         let got = std::fs::read(&row.path).unwrap();
         assert_eq!(got, full, "resumed file must equal full content");
     }
@@ -1759,7 +2622,7 @@ mod tests {
             client,
             bus: EventBus::default(),
         };
-        let row = puller.pull("o/big:Q4_K_M").await.unwrap();
+        let row = puller.pull("o/big:Q4_K_M").await.unwrap().row;
         assert_eq!(row.shards, 2);
         assert!(
             row.path.ends_with("-00001-of-00002.gguf"),

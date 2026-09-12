@@ -578,9 +578,8 @@ mod tests {
         let sd = shutdown.clone();
         tokio::spawn(async move {
             loop {
-                let (mut sock, _) = match listener.accept().await {
-                    Ok(s) => s,
-                    Err(_) => break,
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
                 };
                 if sd.load(Ordering::Relaxed) {
                     break;
@@ -597,7 +596,7 @@ mod tests {
                         .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().to_string()));
                     let (code, body, content_range): (u16, Vec<u8>, String) = match range.as_deref()
                     {
-                        Some(r) if r == "bytes=0-0" => {
+                        Some("bytes=0-0") => {
                             if fail_probe
                                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                                     if v > 0 {
@@ -638,7 +637,9 @@ mod tests {
                         body.len()
                     );
                     if !content_range.is_empty() {
-                        head.push_str(&format!("content-range: {content_range}\r\n"));
+                        head.push_str("content-range: ");
+                        head.push_str(&content_range);
+                        head.push_str("\r\n");
                     }
                     head.push_str("connection: close\r\n\r\n");
                     let _ = sock.write_all(head.as_bytes()).await;
@@ -655,15 +656,15 @@ mod tests {
     }
 
     /// 40 MiB of distinct bytes so offset bugs corrupt the body visibly,
-    /// and so the payload clears MIN_PARALLEL_BYTES and yields >= 4 chunks.
+    /// and so the payload clears `MIN_PARALLEL_BYTES` and yields `>= 4` chunks.
     fn write_payload(_dir: &Path) -> Vec<u8> {
-        let block: Vec<u8> = (0..u32::MAX as u64)
+        let block: Vec<u8> = (0..u64::from(u32::MAX))
             .take(1 << 20)
             .map(|i| (i % 251) as u8)
             .collect();
         let mut v = Vec::with_capacity(40 * 1024 * 1024);
-        for rep in 0..40 {
-            v.extend(block.iter().map(|b| b.wrapping_add(rep as u8)));
+        for rep in 0u8..40 {
+            v.extend(block.iter().map(|b| b.wrapping_add(rep)));
         }
         v
     }
@@ -783,7 +784,8 @@ mod tests {
         {
             use std::io::Write;
             let mut f = File::create(&part).unwrap();
-            f.write_all(&payload[..cp.chunk_size as usize]).unwrap();
+            f.write_all(&payload[..usize::try_from(cp.chunk_size).unwrap()])
+                .unwrap();
             f.set_len(cp.total).unwrap();
         }
         store_sidecar(&part, &sc).unwrap();

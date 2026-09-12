@@ -554,12 +554,19 @@ pub async fn pull(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
             client,
             bus: bus.clone(),
         };
-        if let Err(e) = puller.route_pull(&pull_request).await {
-            tracing::warn!("pull {pull_request}: {e:#}");
-            bus.publish(pallama_runtime::PallamaEvent::PullFailed {
-                name: pull_request.clone(),
-                error: format!("{e:#}"),
-            });
+        match puller.route_pull(&pull_request).await {
+            Ok(outcome) => tracing::info!(
+                model = %outcome.row.name,
+                already_present = outcome.already_present,
+                "pull finished"
+            ),
+            Err(e) => {
+                tracing::warn!("pull {pull_request}: {e:#}");
+                bus.publish(pallama_runtime::PallamaEvent::PullFailed {
+                    name: pull_request.clone(),
+                    error: format!("{e:#}"),
+                });
+            }
         }
     });
 

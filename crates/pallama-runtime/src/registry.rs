@@ -38,7 +38,9 @@ use crate::hf::unique_dest;
 use crate::hf::FilePlan;
 use crate::hf::HfClient;
 use crate::hf::PullLock;
+use crate::hf::PullOutcome;
 use crate::hf::Puller;
+use crate::hf::{sweep_stale_part, Repull};
 
 /// Base with a trailing slash so `Url::join("{repo}/manifests/{tag}")`
 /// appends segments instead of replacing the last path element.
@@ -246,7 +248,7 @@ impl HfClient {
 
 impl Puller {
     /// Route by target shape: ollama-registry vs `HuggingFace` lane.
-    pub async fn route_pull(&self, target: &str) -> Result<ModelRow> {
+    pub async fn route_pull(&self, target: &str) -> Result<PullOutcome> {
         if is_registry_shape(target) {
             self.pull_ollama(target).await
         } else {
@@ -258,7 +260,7 @@ impl Puller {
     /// projector; template/params/license/adapter layers are skipped with
     /// a log line — the GGUF's own chat template and sampler defaults are
     /// authoritative in pallama).
-    pub async fn pull_ollama(&self, input: &str) -> Result<ModelRow> {
+    pub async fn pull_ollama(&self, input: &str) -> Result<PullOutcome> {
         let target = parse_registry_target(input)?;
         let name = registry_display_name(&target.repository, &target.tag);
         let _lock = PullLock::acquire(&self.dirs, &name)?;
@@ -266,29 +268,116 @@ impl Puller {
         // Dedicated client: registry bases + registry allowlist. A token
         // (optional, for private namespaces) attaches only to the
         // first-party registry host — never to the presigned R2 hop.
+        // `PALLAMA_REGISTRY_BASE` points the lane at a mirror (or a test
+        // rig); the allowlist follows the base so the mirror is
+        // first-party by construction.
+        let registry_base = std::env::var("PALLAMA_REGISTRY_BASE")
+            .ok()
+            .filter(|b| !b.trim().is_empty())
+            .unwrap_or_else(|| OLLAMA_REGISTRY_BASE.to_string());
         let token = std::env::var("PALLAMA_REGISTRY_TOKEN")
             .ok()
             .filter(|t| !t.trim().is_empty());
         let client = HfClient::with_bases(
-            OLLAMA_REGISTRY_BASE,
-            OLLAMA_REGISTRY_BASE,
+            &registry_base,
+            &registry_base,
             token,
             OLLAMA_REGISTRY_HOSTS
                 .iter()
                 .map(|s| (*s).to_string())
+                .chain([registry_base
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .trim_end_matches('/')
+                    .to_string()])
                 .collect(),
         )?;
 
+        let plan = resolve_registry_plan(&client, &target, &name).await?;
         let RegistryPlan {
             model_layer,
             projector,
             quant,
-        } = resolve_registry_plan(&client, &target, &name).await?;
+        } = &plan;
 
+        let store = Store::open(&self.dirs)?;
+        let expected_repo = format!("registry.ollama.ai/{}:{}", target.repository, target.tag);
+
+        // Same re-pull ladder as the HF lane (see pull_locked): registry
+        // tags pin a digest, so the sha compare detects any upstream
+        // movement — including mutable tags like `latest`.
+        let existing = store.get_model(&name)?;
+        let expected_sha = strip_digest_prefix(&model_layer.digest);
+        let decision = crate::hf::repull_gate(
+            existing.as_ref(),
+            &name,
+            &expected_repo,
+            quant,
+            Some(expected_sha.as_str()),
+            projector.is_some(),
+        );
+        if let Some(outcome) = self
+            .handle_registry_repull_decision(
+                &client,
+                &name,
+                &target,
+                &plan,
+                existing.as_ref(),
+                decision,
+            )
+            .await?
+        {
+            return Ok(outcome);
+        }
+
+        let (dest, model_plan, mmproj_dest) = self
+            .download_registry_layers(&client, &name, &target, model_layer, projector.as_ref())
+            .await?;
+
+        let row = registry_model_row(
+            &name,
+            &target,
+            &model_plan,
+            &dest,
+            mmproj_dest.as_ref(),
+            quant,
+        )?;
+        store.upsert_model(&row)?;
+        // Prune whatever the replaced row owned that the new one does not
+        // (cross-lane name collisions; superseded files after a slug
+        // landing).
+        if let Some(old) = existing.as_ref() {
+            let keep_model = std::path::Path::new(&row.path);
+            let keep_mmproj = row.mmproj_path.as_deref().map(std::path::Path::new);
+            let keep: Vec<&std::path::Path> = keep_mmproj
+                .as_ref()
+                .map_or_else(|| vec![keep_model], |mm| vec![keep_model, mm]);
+            crate::hf::prune_replaced(&name, old, &keep, "replaced by this pull");
+        }
+        self.bus.publish(PallamaEvent::ModelPulled {
+            name: name.clone(),
+            warning: None,
+        });
+        Ok(PullOutcome {
+            row,
+            already_present: false,
+        })
+    }
+
+    /// Full-download phase of [`Self::pull_ollama`]: the model blob plus the
+    /// optional projector blob, one shared progress bar.
+    async fn download_registry_layers(
+        &self,
+        client: &HfClient,
+        name: &str,
+        target: &RegistryTarget,
+        model_layer: &RegistryLayer,
+        projector: Option<&RegistryLayer>,
+    ) -> Result<(PathBuf, FilePlan, Option<PathBuf>)> {
         let models_dir = self.dirs.models_dir();
         std::fs::create_dir_all(&models_dir)?;
 
-        let total_bytes = model_layer.size + projector.as_ref().map_or(0, |p| p.size);
+        let total_bytes = model_layer.size + projector.map_or(0, |p| p.size);
         let bar = indicatif::ProgressBar::new(total_bytes);
         bar.set_style(
             indicatif::ProgressStyle::default_bar()
@@ -303,7 +392,7 @@ impl Puller {
             if downloaded.saturating_sub(last_publish) >= 16 << 20 || downloaded == total {
                 last_publish = downloaded;
                 self.bus.publish(PallamaEvent::PullProgress {
-                    name: name.clone(),
+                    name: name.to_string(),
                     downloaded,
                     total,
                 });
@@ -322,12 +411,12 @@ impl Puller {
             .await
             .inspect_err(|e| {
                 self.bus.publish(PallamaEvent::PullFailed {
-                    name: name.clone(),
+                    name: name.to_string(),
                     error: e.to_string(),
                 });
             })?;
 
-        let mmproj_dest: Option<PathBuf> = projector.as_ref().map(|_| {
+        let mmproj_dest: Option<PathBuf> = projector.map(|_| {
             unique_dest(
                 &models_dir,
                 &format!("{name}-mmproj.gguf"),
@@ -346,29 +435,168 @@ impl Puller {
                 .await
                 .inspect_err(|e| {
                     self.bus.publish(PallamaEvent::PullFailed {
-                        name: name.clone(),
+                        name: name.to_string(),
                         error: format!("mmproj: {e}"),
                     });
                 })?;
         }
         bar.finish_and_clear();
-
-        let row = registry_model_row(
-            &name,
-            &target,
-            &model_plan,
-            &dest,
-            mmproj_dest.as_ref(),
-            &quant,
-        )?;
-        Store::open(&self.dirs)?.upsert_model(&row)?;
-        self.bus.publish(PallamaEvent::ModelPulled {
-            name: name.clone(),
-            warning: None,
-        });
-        Ok(row)
+        Ok((dest, model_plan, mmproj_dest))
     }
 
+    /// Act on the gate's decision for the registry lane. `Some(outcome)`
+    /// = the pull already finished; `None` = proceed with the full
+    /// download (pre-download pruning done here).
+    async fn handle_registry_repull_decision(
+        &self,
+        client: &HfClient,
+        name: &str,
+        target: &RegistryTarget,
+        plan: &RegistryPlan,
+        existing: Option<&ModelRow>,
+        decision: Repull,
+    ) -> Result<Option<PullOutcome>> {
+        let expected_repo = format!("registry.ollama.ai/{}:{}", target.repository, target.tag);
+        if let Repull::Present(row) = decision {
+            let total = u64::try_from(row.bytes).unwrap_or(0);
+            self.bus.publish(PallamaEvent::PullProgress {
+                name: name.to_string(),
+                downloaded: total,
+                total,
+            });
+            self.bus.publish(PallamaEvent::ModelPulled {
+                name: name.to_string(),
+                warning: None,
+            });
+            sweep_stale_part(&row.path);
+            return Ok(Some(PullOutcome {
+                row: *row,
+                already_present: true,
+            }));
+        }
+        if let Repull::DeltaMmproj { expected } = decision {
+            if let Some(old) = existing {
+                let row = self
+                    .registry_delta_mmproj(
+                        client,
+                        name,
+                        target,
+                        old,
+                        plan,
+                        plan.projector.as_ref().filter(|_| expected),
+                    )
+                    .await?;
+                Store::open(&self.dirs)?.upsert_model(&row)?;
+                self.bus.publish(PallamaEvent::ModelPulled {
+                    name: name.to_string(),
+                    warning: None,
+                });
+                return Ok(Some(PullOutcome {
+                    row,
+                    already_present: false,
+                }));
+            }
+        }
+        if let Some(old) = existing {
+            if old.repo != expected_repo {
+                tracing::warn!(
+                    model = %name,
+                    "replacing row previously pulled from {} with {expected_repo}",
+                    old.repo
+                );
+            }
+            // The registry leaf is deterministic (`{name}.gguf`), so any
+            // replaced same-name row collides — prune BEFORE the download
+            // so the fresh bytes land on the canonical leaf.
+            let new_leaf = format!("{name}.gguf");
+            if std::path::Path::new(&old.path)
+                .file_name()
+                .and_then(|f| f.to_str())
+                .is_some_and(|f| f.eq_ignore_ascii_case(&new_leaf))
+            {
+                crate::hf::prune_replaced(name, old, &[], "registry tag moved");
+            }
+        }
+        Ok(None)
+    }
+
+    /// Registry-lane sidecar-only pull: the model blob is intact and only
+    /// the projector differs. Downloads (or drops) just the projector.
+    async fn registry_delta_mmproj(
+        &self,
+        client: &HfClient,
+        name: &str,
+        target: &RegistryTarget,
+        old: &ModelRow,
+        plan: &RegistryPlan,
+        projector: Option<&RegistryLayer>,
+    ) -> Result<ModelRow> {
+        let models_dir = self.dirs.models_dir();
+        std::fs::create_dir_all(&models_dir)?;
+        let mut mmproj_dest: Option<PathBuf> = None;
+        if let Some(p) = projector {
+            let plan = FilePlan {
+                filename: format!("{name}-mmproj.gguf"),
+                bytes: p.size,
+                sha256: Some(strip_digest_prefix(&p.digest)),
+            };
+            let dest = unique_dest(&models_dir, &plan.filename, &target.repository);
+            let url = client.blob_url(&target.repository, &p.digest)?;
+            let bar = indicatif::ProgressBar::new(p.size);
+            bar.set_style(
+                indicatif::ProgressStyle::default_bar()
+                    .template("{msg} {bar:30} {bytes}/{total_bytes} ({eta})")
+                    .expect("valid template"),
+            );
+            bar.set_message(format!("pull {name} mmproj (registry.ollama.ai)"));
+            let mut last_publish = 0u64;
+            let mut progress = |downloaded: u64, total: u64| {
+                bar.set_position(downloaded);
+                if downloaded.saturating_sub(last_publish) >= 16 << 20 || downloaded == total {
+                    last_publish = downloaded;
+                    self.bus.publish(PallamaEvent::PullProgress {
+                        name: name.to_string(),
+                        downloaded,
+                        total,
+                    });
+                }
+            };
+            client
+                .download_to(url, &plan, &dest, &mut progress)
+                .await
+                .inspect_err(|e| {
+                    self.bus.publish(PallamaEvent::PullFailed {
+                        name: name.to_string(),
+                        error: format!("mmproj: {e}"),
+                    });
+                })?;
+            bar.finish_and_clear();
+            mmproj_dest = Some(dest);
+        } else if let Some(old_mm) = &old.mmproj_path {
+            // Tag dropped the projector: forget it from the row and
+            // remove the dead sidecar file.
+            if let Err(e) = std::fs::remove_file(old_mm) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(model = %name, "could not remove stale mmproj {old_mm}: {e}");
+                }
+            }
+        }
+        // Model plan values come from the fresh manifest; the intact blob
+        // already lives at the recorded path.
+        let model_plan = FilePlan {
+            filename: format!("{name}.gguf"),
+            bytes: plan.model_layer.size,
+            sha256: Some(strip_digest_prefix(&plan.model_layer.digest)),
+        };
+        registry_model_row(
+            name,
+            target,
+            &model_plan,
+            std::path::Path::new(&old.path),
+            mmproj_dest.as_ref(),
+            &plan.quant,
+        )
+    }
 }
 
 /// Store row from the downloaded GGUF itself (GGUF facts win over any
@@ -527,6 +755,9 @@ fn hex(bytes: &[u8]) -> String {
 #[allow(non_snake_case)] // repo convention: unit__scenario__expected
 mod tests {
     use super::*;
+    use pallama_core::PallamaDirs;
+
+    use crate::events::EventBus;
 
     const MANIFEST: &str = include_str!("../tests/fixtures/ollama-registry-qwen3-manifest.json");
 
@@ -630,6 +861,22 @@ mod tests {
 
     /// Minimal valid GGUF v3 file — passes `gguf::read_metadata_file`
     /// (integrity gate). Mirrors the HF test-mod helper.
+    fn gguf_seed_bytes() -> Vec<u8> {
+        let mut b: Vec<u8> = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes());
+        let k = "general.architecture";
+        b.extend_from_slice(&(k.len() as u64).to_le_bytes());
+        b.extend_from_slice(k.as_bytes());
+        b.extend_from_slice(&8u32.to_le_bytes());
+        let v = "qwen3";
+        b.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        b.extend_from_slice(v.as_bytes());
+        b
+    }
+
     async fn manifest_mock(server: &wiremock::MockServer) {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/v2/library/qwen3/manifests/0.6b"))
@@ -695,6 +942,73 @@ mod tests {
         assert!(err.to_string().contains("no such model"), "{err}");
     }
 
+    #[tokio::test]
+    async fn integration__registry_repull__already_present_skips_blobs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = PallamaDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        dirs.ensure().unwrap();
+
+        // Manifest only — no blob endpoints mounted. Any blob fetch would
+        // 404 and fail the pull: the gate must resolve from metadata.
+        let api = wiremock::MockServer::start().await;
+        manifest_mock(&api).await;
+        std::env::set_var("PALLAMA_REGISTRY_BASE", format!("{}/v2/", api.uri()));
+
+        // Seed an intact row exactly as a prior pull would have recorded
+        // it (repo string, tag-pinned sha, canonical `{name}.gguf` leaf).
+        let m: RegistryManifest = serde_json::from_str(MANIFEST).unwrap();
+        let model = m
+            .layers
+            .iter()
+            .find(|l| l.media_type == OLLAMA_MODEL_LAYER)
+            .unwrap();
+        let leaf = dirs.models_dir().join("qwen3-0.6b.gguf");
+        let content = gguf_seed_bytes();
+        std::fs::write(&leaf, &content).unwrap();
+        let row = pallama_core::store::ModelRow {
+            name: "qwen3-0.6b".into(),
+            repo: "registry.ollama.ai/library/qwen3:0.6b".into(),
+            quant: "registry".into(),
+            path: leaf.display().to_string(),
+            bytes: i64::try_from(content.len()).unwrap(),
+            sha256: Some(strip_digest_prefix(&model.digest)),
+            mmproj_path: None,
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+        };
+        pallama_core::store::Store::open(&dirs)
+            .unwrap()
+            .upsert_model(&row)
+            .unwrap();
+
+        let puller = Puller {
+            dirs: dirs.clone(),
+            client: registry_client(&api, None, vec![host_of(&api.uri())]),
+            bus: EventBus::default(),
+        };
+        let outcome = puller.pull_ollama("qwen3:0.6b").await.unwrap();
+        std::env::remove_var("PALLAMA_REGISTRY_BASE");
+
+        assert!(outcome.already_present, "gate must short-circuit");
+        assert_eq!(outcome.row.path, leaf.display().to_string());
+        // The config blob (quant source) is honest resolution metadata;
+        // the WEIGHTS blob is what must never move again.
+        let model_digest = strip_digest_prefix(&model.digest);
+        let weight_hits = api
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path().contains("/blobs/") && r.url.path().contains(&model_digest))
+            .count();
+        assert_eq!(weight_hits, 0, "fast path must not fetch a weights byte");
+    }
 
     #[tokio::test]
     async fn integration__registry_blob__redirects_and_token_never_reaches_cdn() {

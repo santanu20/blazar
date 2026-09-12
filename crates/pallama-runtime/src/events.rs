@@ -133,6 +133,30 @@ impl EventBus {
     }
 }
 
+/// Resolves when the process receives an interrupt-class signal (SIGINT,
+/// SIGTERM, SIGHUP on unix; Ctrl+C on Windows). Use inside `tokio::select!`
+/// to cancel long-running futures gracefully: cancellation drops the
+/// future's locals, which releases file locks and keeps `.part` files
+/// for resume. A second signal hits the default disposition (hard kill).
+pub async fn interrupted() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+        let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        let mut sighup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
+        tokio::select! {
+            _ = sigint.recv() => {}
+            _ = sigterm.recv() => {}
+            _ = sighup.recv() => {}
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
@@ -172,29 +196,5 @@ mod tests {
     async fn unit__bus__no_subscriber__not_an_error() {
         let bus = EventBus::default();
         assert_eq!(bus.publish(PallamaEvent::QueueDepth { n: 1 }), 0);
-    }
-}
-
-/// Resolves when the process receives an interrupt-class signal (SIGINT,
-/// SIGTERM, SIGHUP on unix; Ctrl+C on Windows). Use inside `tokio::select!`
-/// to cancel long-running futures gracefully: cancellation drops the
-/// future's locals, which releases file locks and keeps `.part` files
-/// for resume. A second signal hits the default disposition (hard kill).
-pub async fn interrupted() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-        let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-        let mut sighup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
-        tokio::select! {
-            _ = sigint.recv() => {}
-            _ = sigterm.recv() => {}
-            _ = sighup.recv() => {}
-        }
-    }
-    #[cfg(windows)]
-    {
-        let _ = tokio::signal::ctrl_c().await;
     }
 }

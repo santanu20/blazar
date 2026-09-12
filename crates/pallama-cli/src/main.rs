@@ -2291,7 +2291,7 @@ async fn pull(target: &str) -> Result<()> {
     // Foreground by contract: the pull runs in THIS terminal and dies with
     // it. On interrupt the future is dropped, which releases the pull
     // lock and keeps the `.part` for a later resume.
-    let row = tokio::select! {
+    let outcome = tokio::select! {
         r = puller.route_pull(target) => r?,
         () = pallama_runtime::events::interrupted() => {
             return Err(anyhow::anyhow!(
@@ -2299,14 +2299,26 @@ async fn pull(target: &str) -> Result<()> {
             ));
         }
     };
-    println!(
-        "pulled {}: {} ({}, {} shards) -> {}",
-        row.name,
-        humansize(row.bytes),
-        row.quant,
-        row.shards,
-        row.path
-    );
+    let row = outcome.row;
+    if outcome.already_present {
+        println!(
+            "already present — {}: {} ({}, {} shards) -> {}",
+            row.name,
+            humansize(row.bytes),
+            row.quant,
+            row.shards,
+            row.path
+        );
+    } else {
+        println!(
+            "pulled {}: {} ({}, {} shards) -> {}",
+            row.name,
+            humansize(row.bytes),
+            row.quant,
+            row.shards,
+            row.path
+        );
+    }
     // The runtime warned via log + event; surface it in the terminal too
     // (tracing is muted at the default level). The event is the REAL
     // signal — HF metadata fallbacks can still fill `arch`.
