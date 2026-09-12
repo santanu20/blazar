@@ -2033,7 +2033,16 @@ impl Supervisor {
                 model_path: &model.path,
                 model_bytes: u64::try_from(model.bytes.max(0)).unwrap_or(u64::MAX),
                 gguf: &gguf,
-                hardware: scoped_hw.as_ref().unwrap_or(&self.hardware),
+                // Scoped (picked card) > fresh census > boot snapshot:
+                // single-GPU boxes previously planned against the
+                // BOOT-TIME free VRAM (live-repro'd: daemon booted
+                // while a foreign 5 GiB context held the card → every
+                // later spawn needlessly CPU-split and declined its
+                // draft, even with 7.8 GiB actually free).
+                hardware: scoped_hw
+                    .as_ref()
+                    .or(fresh.as_ref())
+                    .unwrap_or(&self.hardware),
                 config: &self.config,
                 overlay: &overlay,
                 loras: &loras,
@@ -2439,6 +2448,12 @@ impl Supervisor {
         // that our cleanup would then race (map remove + pidfile/apikey
         // deletion under it).
         let _evicting = EvictingName::guard(self, name);
+        // Our own teardown just (re)claimed card capacity: the census
+        // cache must not survive it, or the next spawn plans against the
+        // PRE-evict free-VRAM reading (live-repro'd: 7637 MiB free, a
+        // stale census said 3177, and the 8B spawn needlessly split
+        // layers / declined its draft).
+        *self.census_cache.lock().expect("census cache lock") = None;
         // A clean teardown (user stop / idle ladder / capacity) resets
         // the crash history for this key: the next spawn is a cold
         // start, not a respawn-after-crash.

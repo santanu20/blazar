@@ -84,6 +84,16 @@ tracked here.
   explicitly; `engine_asset` overrides still win over the overlay.
 
 ### Fixed
+- **Spawns plan against live census VRAM, not the boot snapshot**:
+  single-GPU boxes fell back to the daemon-boot `Hardware` when no
+  card pick applied, so a daemon started while a foreign context
+  (e.g. the user's ollama model) held VRAM would forever CPU-split
+  spawns and decline speculative drafts against stale free-VRAM
+  readings (live-repro'd: 7.8 GiB free, planner saw 3.2 GiB). The
+  profile now uses scoped-pick > fresh census > boot snapshot, and
+  evict invalidates the census cache so our own teardowns are
+  re-measured. Measured effect on qwen3-8b + draft pair: 28 t/s
+  dense CPU-split → 45.8 t/s spec-accelerated full-GPU.
 - **`run` parses its flags instead of swallowing them into the
   prompt**: `trailing_var_arg` made `pallama run m 'Say ok'
   --max-tokens 5 --verbose` send the flag TEXT to the model and
