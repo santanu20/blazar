@@ -84,6 +84,21 @@ tracked here.
   explicitly; `engine_asset` overrides still win over the overlay.
 
 ### Fixed
+
+- **Sub-weights `--cache-ram` budget no longer CPU-splits the model**:
+  the unified-KV budget floor now derives from rule 2b's own
+  constraint at the ctx floor (weights + f16 KV + 64 MiB, over the
+  0.85 compute share) and engages rule 2b at the raw budget — floored
+  spawns stop hard-warning by construction and autofit ctx outcomes
+  survive.
+- **Bench cross-runtime prefill parity**: the ollama lane (no tokenize
+  route) sized prompts by char estimate — 371 real tokens vs pallama's
+  527 at the same target. Lanes now converge on the engine's own
+  `prompt_eval_count`; re-measured same-token counts put pallama at or
+  above ollama on every metric (prefill 1346 vs 1337 t/s, decode 41.1
+  vs 40.5, ttft 123 vs 131 ms, qwen3.5-9b warm) — the reported 29%
+  prefill gap was a measurement artifact.
+
 - **Draft-decline keeps the gpu-layers pin**: the wave-5 unpin
   (draft pairs leave `--gpu-layers` to the engine fitter) now only
   applies when the draft will actually attach; a capacity-declined
