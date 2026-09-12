@@ -758,6 +758,29 @@ def count_tokens(port: int, text: str, ollama: bool, model: str) -> int | None:
         return None
 
 
+def _probe_prompt_tokens(port: int, text: str, ollama: bool, model: str) -> int | None:
+    """Real prompt token count for tokenize-less lanes: one untimed
+    1-token generate, read the engine's prompt_eval_count. None when the
+    lane can't answer (caller keeps its estimate)."""
+    if not ollama:
+        return None  # pallama lanes tokenize server-side already
+    try:
+        j = http_json(
+            f"http://127.0.0.1:{port}/api/generate",
+            {
+                "model": model,
+                "prompt": text,
+                "stream": False,
+                "options": {"num_predict": 1},
+            },
+            timeout=120.0,
+        )
+        n = j.get("prompt_eval_count")
+        return n if isinstance(n, int) and n > 0 else None
+    except (urllib.error.URLError, json.JSONDecodeError, OSError, ValueError):
+        return None
+
+
 _SIZED_PROMPT_CACHE: dict[tuple[int, int], str] = {}
 
 
@@ -798,6 +821,33 @@ def sized_prompt(port: int, target_tokens: int, ollama: bool, model: str) -> str
             taken += len(sent) + 1
             i += 1
         text = " ".join(parts)
+        got = _probe_prompt_tokens(port, text, ollama, model)
+        if got is not None:
+            # Real-count convergence for tokenize-less lanes (ollama
+            # ships no /api/tokenize): scale the char budget by the
+            # engine's own prompt_eval_count from untimed 1-token
+            # probes. Without this the char estimate left the ollama
+            # lane at 371 real tokens vs the pallama lane's 527 at the
+            # same 512 target — cross-runtime prefill comparisons were
+            # invalid (shorter prompt = lower amortized prefill t/s).
+            need_chars = len(text)
+            for _ in range(3):
+                if abs(got - target_tokens) <= target_tokens * 0.15:
+                    break
+                need_chars = max(200, round(need_chars * target_tokens / max(got, 1)))
+                parts2: list[str] = []
+                taken = 0
+                i = 0
+                while taken < need_chars:
+                    sent = PREFILL_BANK[i % len(PREFILL_BANK)]
+                    parts2.append(sent)
+                    taken += len(sent) + 1
+                    i += 1
+                text = " ".join(parts2)
+                nxt = _probe_prompt_tokens(port, text, ollama, model)
+                if nxt is None:
+                    break
+                got = nxt
         _SIZED_PROMPT_CACHE[(port, target_tokens)] = text
         return text
     for _ in range(3):
