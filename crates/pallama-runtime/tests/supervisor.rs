@@ -417,6 +417,29 @@ async fn integration__crash__respawn_and_circuit() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn integration__evict__concurrent_marks_clear_without_starving() {
+    // The evicting mark is a tokio Mutex with an explicit clear (no
+    // Drop): two concurrent evicts of one name must both complete and
+    // leave the set empty — a leaked mark would defer every future
+    // spawn of that name (starvation), the wedge class observed once
+    // live as a /api/evict timeout.
+    let (_t, dirs) = setup(&[("m1", 500)]);
+    let sup = supervisor(&dirs, base_config(), false);
+    sup.ensure("m1").await.unwrap();
+    let (ra, rb) = tokio::join!(sup.evict("m1"), sup.evict("m1"));
+    ra.unwrap();
+    rb.unwrap();
+    assert!(
+        sup.evicting_is_empty().await,
+        "evict marks must clear under concurrency"
+    );
+    // And the name is immediately spawnable again.
+    sup.ensure("m1").await.unwrap();
+    sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn integration__churn__clean_stop_run_never_trips_circuit() {
     // Live-repro'd bug: record_restart fired on EVERY successful spawn,
     // so a user stop→run churn ×4 inside the breaker window opened the

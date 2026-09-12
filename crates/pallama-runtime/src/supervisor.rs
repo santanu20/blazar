@@ -463,7 +463,12 @@ pub struct Supervisor {
     /// torn down — the evict's cleanup would delete the fresh instance
     /// (untracked child, `SIGKILL`ed mid-request by `kill_on_drop`) and shred
     /// its pidfile/apikey. Spins retry after the evict completes.
-    evicting: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// In-flight evictions (F1). tokio Mutex: the RAII mark lives
+    /// across the whole async evict (bank save + terminate grace can
+    /// run ~12s worst-case) — a std Mutex held across those awaits
+    /// pins every worker that touches the set (spawn deferral check,
+    /// idle ladder) and panics cascade on poisoning.
+    evicting: tokio::sync::Mutex<std::collections::HashSet<String>>,
     /// In-flight spawns: waiters subscribe to the Notify for completion.
     loading: DashMap<String, Arc<Notify>>,
     /// Completed load results for waiters: Ok(port) or error text.
@@ -587,7 +592,7 @@ impl Supervisor {
             hardware,
             engine,
             instances: DashMap::new(),
-            evicting: std::sync::Mutex::new(std::collections::HashSet::new()),
+            evicting: tokio::sync::Mutex::new(std::collections::HashSet::new()),
             loading: DashMap::new(),
             load_results: DashMap::new(),
             restarts: DashMap::new(),
@@ -2117,7 +2122,7 @@ impl Supervisor {
                     // the spawn loop retry; the winner inserts after the
                     // evict completes. Checked BEFORE the child moves
                     // into the Instance so it can still be signalled.
-                    if self.evicting.lock().expect("evicting set").contains(key) {
+                    if self.evicting.lock().await.contains(key) {
                         tracing::info!(
                             model = name,
                             "spawn deferred: evict in progress for this name"
@@ -2436,8 +2441,13 @@ impl Supervisor {
         entry.retain(|t| t.elapsed() < self.circuit_window);
     }
 
-    /// Kill an instance: single-pid TERM → grace → SIGKILL (never a
-    /// process group — see `terminate_group`). Idempotent; publishes
+    /// True when no name is mid-teardown — leaked marks would defer
+    /// every future spawn of that name (starvation class).
+    pub async fn evicting_is_empty(&self) -> bool {
+        self.evicting.lock().await.is_empty()
+    }
+
+    /// Idempotent; publishes
     /// Evicted.
     pub async fn evict(&self, name: &str) -> Result<()> {
         let Some(inst) = self.instances.get(name).map(|i| i.clone()) else {
@@ -2446,8 +2456,15 @@ impl Supervisor {
         // F1: mark the name as being torn down for the whole evict; a
         // concurrent spawn retries instead of inserting a fresh child
         // that our cleanup would then race (map remove + pidfile/apikey
-        // deletion under it).
-        let _evicting = EvictingName::guard(self, name);
+        // deletion under it). Cleared explicitly on every exit path —
+        // see EvictingName (no Drop: it cannot await).
+        let evicting = EvictingName::guard(self, name).await;
+        let result = self.evict_teardown(name, &inst).await;
+        evicting.release().await;
+        result
+    }
+
+    async fn evict_teardown(&self, name: &str, inst: &Arc<Instance>) -> Result<()> {
         // Our own teardown just (re)claimed card capacity: the census
         // cache must not survive it, or the next spawn plans against the
         // PRE-evict free-VRAM reading (live-repro'd: 7637 MiB free, a
@@ -2463,7 +2480,7 @@ impl Supervisor {
         // through here, so the `_auto-<ctx>` checkpoint is saved exactly
         // once, bounded, and only for idle instances (live requests own
         // their KV).
-        self.bank_save(&inst).await;
+        self.bank_save(inst).await;
         *inst.state.write().expect("state lock") = InstanceState::Evicted;
         self.evictions.fetch_add(1, Ordering::Relaxed);
         self.bus.publish(PallamaEvent::InstanceStateChanged {
@@ -2482,7 +2499,7 @@ impl Supervisor {
         // pidfile/apikey under it.
         if self
             .instances
-            .remove_if(name, |_k, live| Arc::ptr_eq(live, &inst))
+            .remove_if(name, |_k, live| Arc::ptr_eq(live, inst))
             .is_some()
         {
             let _ = std::fs::remove_file(self.dirs.run_dir().join(format!("{name}.pid")));
@@ -3409,23 +3426,20 @@ impl Supervisor {
 
 /// F1: clears the evict-in-progress mark when the evict lane ends, on
 /// every path (success, error, early return).
+/// F1: in-flight eviction marks. NOT RAII — Drop cannot await, and a
+/// best-effort sync clear could leak the mark (permanently deferring
+/// spawns). `evict` clears explicitly on every path; the set is
+/// advisory (spawn deferral), so a same-name re-evict race at worst
+/// lets a spawn through mid-teardown, which the F1 ptr-identity check
+/// in the teardown itself already handles.
 struct EvictingName<'a>(&'a Supervisor, String);
 impl<'a> EvictingName<'a> {
-    fn guard(s: &'a Supervisor, name: &str) -> Self {
-        s.evicting
-            .lock()
-            .expect("evicting set")
-            .insert(name.to_string());
+    async fn guard(s: &'a Supervisor, name: &str) -> Self {
+        s.evicting.lock().await.insert(name.to_string());
         Self(s, name.to_string())
     }
-}
-impl Drop for EvictingName<'_> {
-    fn drop(&mut self) {
-        self.0
-            .evicting
-            .lock()
-            .expect("evicting set")
-            .remove(&self.1);
+    async fn release(&self) {
+        self.0.evicting.lock().await.remove(&self.1);
     }
 }
 
@@ -3984,7 +3998,7 @@ mod routing_tests {
             "pidfile of the fresh generation must not be shredded"
         );
         assert!(
-            sup.evicting.lock().unwrap().is_empty(),
+            sup.evicting.lock().await.is_empty(),
             "evicting mark cleared on completion"
         );
         drop(live);
