@@ -4096,6 +4096,9 @@ async fn run_repl(model: &str) -> Result<()> {
     let mut rl = rustyline::DefaultEditor::new()?;
     let mut model = model.to_string();
     let mut history: Vec<serde_json::Value> = Vec::new();
+    // Profile warnings print once per model switch (ctx fit, slot auto,
+    // offload rationale) — the first turn is the one that paid the load.
+    let mut warned = false;
     println!("pallama REPL — /exit /clear /model <name> /sysinfo /profile");
     while let Ok(line) = rl.readline(">>> ") {
         let line = line.trim();
@@ -4121,6 +4124,7 @@ async fn run_repl(model: &str) -> Result<()> {
             _ if line.starts_with("/model ") => {
                 model = line["/model ".len()..].trim().to_string();
                 history.clear();
+                warned = false;
                 println!("(switched to {model})");
                 continue;
             }
@@ -4133,6 +4137,10 @@ async fn run_repl(model: &str) -> Result<()> {
             "stream": true,
         });
         stream_chat(&base, &body).await?;
+        if !warned {
+            print_profile_warnings(&base, &model).await;
+            warned = true;
+        }
     }
     Ok(())
 }
