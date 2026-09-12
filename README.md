@@ -506,11 +506,17 @@ warm `/api/chat` for the floor.
 | Warm `/api/chat` total_duration | 21.7 ms (prompt 5.5 + eval 16.2) |
 | Daemon-side spawn (profile → healthy → session-restore) | ~0.86 s |
 
-The cold wall is engine load (mmap + CUDA init) — pallama-side stages
+The cold wall at 0.5B is engine load (mmap + CUDA init) — pallama-side stages
 (profile compile, adaptive health poll ~12 ms overshoot, admission)
-are milliseconds. An 8.5 s-vs-6.3 s comparison against ollama that
-motivated this measurement was an 8B-class model on a contended box;
-at equal conditions the daemon adds no measurable overhead.
+are milliseconds. A 9B parity re-run at uncontended conditions
+(same file, ctx aligned, disk-cold + GPU-idle asserted on both) told a
+different story: pallama cold TTFT 11.4 s vs ollama 5.7 s, warm decode
+12.4 vs 27.2 t/s — the gap is the capacity-first default profile
+(`-np 4` + wide `--ctx-size` + `--kv-unified` hosting a 256k-token KV
+pool in the system-RAM `--cache-ram` budget; PCIe-bound decode), not
+daemon overhead. For ollama-shaped single-stream speed, pin
+`slots = 1` and `kv_unified = false` (or `model_overrides`); a
+single-stream-first defaults pass is on the roadmap.
 
 764 tests: pure compiler tables, wiremock network suites (resume, sha, allowlist, token isolation), engine install cycles with a real stub engine binary, supervisor lifecycle integration (ladder, capacity, crash-circuit, shutdown), and full gateway round-trips over both APIs — including the sentinel suites (9 detection codes, responses grammar, persistence reload, enforce 422s, live watch SSE, parity-under-observation). `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
