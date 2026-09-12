@@ -861,6 +861,7 @@ pub fn build_input<'a>(
         endpoint,
         data_dir,
         cache_hit_rate: None, // CLI bench: static clamp, no live hint
+        resident_ram_mib: 0,  // bench scores one argv in isolation
         device_hint: None,
         engine_census: hardware.gpus.clone(),
     }

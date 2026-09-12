@@ -78,6 +78,12 @@ pub struct ProfileInput<'a> {
     /// prefix-heavy traffic earns a bigger cache budget, cache-cold
     /// traffic releases RAM back. None = static 30% clamp.
     pub cache_hit_rate: Option<f64>,
+    /// Sum of OTHER live instances' weights (MiB) at spawn time. The
+    /// mlock auto-policy charges it: a dying engine's pinned pages are
+    /// not released until its teardown completes, so overlapping
+    /// replacements must not re-pin the same RAM share (churn live-
+    /// repro'd: 2 × 5.4 GiB mlock on 13.6 GiB RAM → spawn failures).
+    pub resident_ram_mib: u64,
     /// Auto-picked GPU id (e.g. "Vulkan1") from `--list-devices` free
     /// memory at spawn time. Only consulted when neither overlay nor
     /// config set `devices` — manual selection always wins. The same
@@ -1191,13 +1197,15 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         // degrade to a benign upstream warning + plain mmap.
         let weights_mib = input.model_bytes / (1024 * 1024);
         let ram_mib = input.hardware.total_ram_mib;
-        if ram_mib > 0 && weights_mib * 100 <= ram_mib * 40 {
+        let pinned_mib = weights_mib + input.resident_ram_mib;
+        if ram_mib > 0 && pinned_mib * 100 <= ram_mib * 40 {
             argv.push("--load-mode".into());
             argv.push("mlock".into());
             warnings.push(format!(
-                "load-mode mlock auto: weights {weights_mib} MiB <= 40% of {ram_mib} MiB RAM — \
-                 eager page-in measured ~0.7s faster to first token; set load_mode = \"mmap\" \
-                 to opt out"
+                "load-mode mlock auto: weights {weights_mib} MiB (+ {} MiB resident) <= 40% \
+                 of {ram_mib} MiB RAM — eager page-in measured ~0.7s faster to first token; \
+                 set load_mode = \"mmap\" to opt out",
+                input.resident_ram_mib
             ));
         }
     }
@@ -3258,6 +3266,7 @@ mod tests {
             },
             data_dir: "/tmp/pallama-test-data",
             cache_hit_rate: None,
+            resident_ram_mib: 0,
             device_hint: None,
             engine_census: hw.gpus.clone(),
             sibling_devices: Vec::new(),
@@ -3742,6 +3751,18 @@ mod tests {
             !p.warnings.iter().any(|w| w.contains("load-mode")),
             "{:?}",
             p.warnings
+        );
+
+        // Resident siblings charge the same share: a churn replacement
+        // whose dying predecessor's pins overlap must NOT re-pin.
+        let cfg_res = Config::default();
+        let mut res = input(&g, &hw, &cfg_res, &flags);
+        res.resident_ram_mib = 9_000;
+        let p = compile(&res, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.contains(&"--load-mode".to_string()),
+            "resident charge must suppress mlock: {:?}",
+            p.argv
         );
 
         // Explicit load_mode always wins over the auto policy.

@@ -1357,6 +1357,13 @@ impl Supervisor {
                 },
                 data_dir: &data_dir_str,
                 cache_hit_rate: self.cache_hint.get(),
+                resident_ram_mib: self
+                    .instances
+                    .iter()
+                    .filter(|e| e.key() != &m.name)
+                    .map(|e| u64::try_from(e.value().model.bytes.max(0)).unwrap_or(0))
+                    .sum::<u64>()
+                    / (1024 * 1024),
                 device_hint: None, // router preset: no per-GPU scoping
                 engine_census: self.hardware.gpus.clone(),
             };
@@ -1904,6 +1911,13 @@ impl Supervisor {
                 },
                 data_dir: &data_dir_str,
                 cache_hit_rate: self.cache_hint.get(),
+                resident_ram_mib: self
+                    .instances
+                    .iter()
+                    .filter(|e| e.key() != key)
+                    .map(|e| u64::try_from(e.value().model.bytes.max(0)).unwrap_or(0))
+                    .sum::<u64>()
+                    / (1024 * 1024),
                 device_hint: None,
                 engine_census: fresh.as_ref().unwrap_or(&self.hardware).gpus.clone(),
             };
@@ -2063,6 +2077,13 @@ impl Supervisor {
                 endpoint: endpoint.clone(),
                 data_dir: &data_dir_str,
                 cache_hit_rate: self.cache_hint.get(),
+                resident_ram_mib: self
+                    .instances
+                    .iter()
+                    .filter(|e| e.key() != key)
+                    .map(|e| u64::try_from(e.value().model.bytes.max(0)).unwrap_or(0))
+                    .sum::<u64>()
+                    / (1024 * 1024),
                 device_hint: picked_device.as_deref(),
                 // Build-class detection reads the FULL census: scoped
                 // `hardware` above sizes capacity against the picked

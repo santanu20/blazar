@@ -80,6 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         data_dir: "/tmp/pallama-slots-probe",
         cache_hit_rate: None,
+        resident_ram_mib: 0,
         device_hint: None,
         mmproj_force: false,
         engine_census: hw.gpus.clone(),
