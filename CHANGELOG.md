@@ -7,6 +7,17 @@ tracked here.
 ## [Unreleased]
 
 ### Added
+- **`pallama doctor` flags config pins that mirror retired defaults**:
+  template pins outlive default changes — a config written when
+  `cache_reuse = 256` or `spec = "off"` were the defaults silently keeps
+  the old behavior after the defaults moved to `0` / `"auto"` (both bit
+  live users). Doctor now emits one WARN row naming each stale pin, the
+  retired value and the current default, teaching that deleting the
+  line adopts the new default while keeping it is legitimate for
+  deliberate pins (e.g. `spec = "off"` for bit-exact greedy). Global
+  and `model_overrides` spellings both checked; a fresh/default config
+  emits no row. The check registry is a maintenance contract: future
+  default changes add their entry there.
 - **Profile warnings surfaced to users**: compile-time decisions
   (unified-KV ctx fit, slot auto `-np`, gpu-offload rationale,
   cache-ram clamp, dense-fallback) were daemon-log-only. They now ride
@@ -85,6 +96,16 @@ tracked here.
 
 ### Fixed
 
+- **Dead `--rpc` endpoint no longer crash-loops the child**: upstream
+  llama-server connects RPC backends eagerly at argv-parse and SIGABRTs
+  when one is down (ggml-rpc.cpp), so a `rpc_servers` entry pointing at
+  a stopped worker turned every spawn into a crash-loop of 502s. Every
+  `--rpc` endpoint in the final child argv (global knob, model overlay
+  and `extra_args` occurrences alike) is now TCP-probed in parallel
+  (2s budget) before the process exists: a dead one refuses the spawn
+  with a teaching 500 naming the endpoint, with no child process, no
+  engine rollback and no circuit-breaker trip — the engine binary is
+  healthy, the worker is not.
 - **Bank restore defers while the triggering request runs**: the
   detached slot-restore still queued the request that caused the
   spawn ~1s behind cache priming (the pending request was invisible

@@ -95,7 +95,7 @@ Capability discovery: `GET /.well-known/pallama` (routes, headers, features, eng
 | Unbounded cache RAM; blind pulls | `cache_ram_mb` config (auto-capped at 30% of physical RAM — measured live: unclamped 8 GiB budget on a 13 GiB box drove the child to an 8.3 GiB RSS plateau and system-wide swap death); `pallama fit` previews VRAM fit + quant alternatives *before* downloading, incl. the ctx headroom a q8_0 KV cache buys |
 | No KV-quant control; VRAM cliffs | capacity-math ladder: f16 -> q8_0 (KV/2) -> q4_0 (KV/4) at 90% VRAM, or pin any type via `cache_type`; visible in `pallama show` warnings |
 | No session/context persistence | `pallama session save/restore`: slot KV checkpoints that survive unload and daemon restarts |
-| No diagnostics when things break | `pallama doctor`: config, port conflicts (incl. the ollama-11434 class), engine, hardware, disk, model health, component update-currency in one table |
+| No diagnostics when things break | `pallama doctor`: config (incl. stale pins that mirror retired defaults), port conflicts (incl. the ollama-11434 class), engine, hardware, disk, model health, component update-currency in one table |
 | No discovery; env sprawl | `pallama search` (HF GGUF); every knob in one documented `config.toml`, inspectable via `pallama config` |
 | "API returns 200 but nothing useful happens"; silent truncation; plain-text instead of tool calls; agents loop on malformed tool args | sentinel: warn-only semantic observation on every chat request — `finish_reason: length` with fix hints, tool-arg JSON + hallucinated-name + parameters-schema checks, `json_schema`/`json_object` validation, empty-response and reasoning-with-no-answer detection, stalled-stream detection, and a pre-inference template-capability check (`x-pallama-warnings` header) when the model's chat template cannot render tools. `pallama why [trace]` answers any request after the fact |
 
@@ -218,7 +218,10 @@ predictive_preload = false # reaper pre-spawns the next likely model (>=3 A->B t
 api_keys = []             # non-empty = Bearer auth at the gateway (children stay loopback)
 rpc_servers = ""          # e.g. "box1:50052,box2:50052" -> --rpc (per-model
                           #   override: model_overrides.rpc_servers replaces it
-                          #   for that model; empty/absent overlay inherits)
+                          #   for that model; empty/absent overlay inherits).
+                          #   Endpoints are TCP-probed before every spawn: a
+                          #   dead one fails fast with a teaching 500 instead
+                          #   of crash-looping the child (upstream SIGABRTs)
 cache_ram_mb = 8192       # child prompt-cache budget; auto-capped at 30% of RAM (0 = unlimited)
 cpu_range = ""            # pin child threads to CPUs "lo-hi" (P/E hybrids: pin P-cores, discover via `lscpu -e`)
 poll = 0                  # 1..=100 busy-poll waiting for work (trades idle CPU for TTFT)
