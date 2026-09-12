@@ -7,6 +7,18 @@ tracked here.
 ## [Unreleased]
 
 ### Added
+- **Colon-name resolution (ollama muscle memory)**: every model-taking
+  command (`show`, `run`, `rm`, `cp` source, `stop`, `bench`, `tune`,
+  `mmproj`, `quantize`, `drafts`, `session`, `lora`) resolves
+  `model:tag` input onto the flat store row (`qwen3.5:9b` →
+  `qwen3.5-9b`), and the gateway's `ensure` choke point applies the
+  same rule to API traffic (`/api/chat`, `/api/generate`, the OpenAI
+  routes) — colon-gated, so canonical-name requests pay nothing. Exact
+  rows always win; a miss on both forms errors with the input verbatim
+  plus a flat-form teaching hint (`pallama names are flat; …-form
+  would be its flat form`). `pull` is exempt — its colon is the
+  `owner/repo:QUANT` separator. The rule lives in
+  `Store::resolve_model_name` (one implementation, CLI + gateway).
 - **Grouped top-level help**: `pallama --help` renders commands by
   category (Serve & Chat / Model Management / Tuning & Benchmarks /
   Engine & Config / Observability / Refused by design) instead of a

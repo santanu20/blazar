@@ -927,8 +927,10 @@ _COMMAND_ATTRS = {
     "list": (False, False, False, False, True),
     "ls": (False, False, False, False, True),
     "show": (False, False, False, False, True),
+    "show.colon": (False, False, False, False, True),
     "ps": (True, False, False, False, True),
     "ps.reset": (True, False, False, False, True),
+    "chat.colon": (True, True, False, False, True),
     "run.single": (True, True, False, False, True),
     "run.repl-exit": (True, True, False, False, True),
     "run.repl-eof": (True, True, False, False, True),
@@ -6098,8 +6100,31 @@ def phase_commands() -> None:
     p = cli("show", MODEL)
     reg("show", p.returncode == 0, "rc0")
 
+    # ollama-migrant colon input (`model:tag`) must resolve onto the flat
+    # store row (qwen2.5:0.5b-instruct -> qwen2.5-0.5b-instruct).
+    p = cli("show", MODEL.replace("-", ":", 1))
+    reg(
+        "show.colon",
+        p.returncode == 0 and MODEL in p.stdout,
+        f"colon input rc0 + canonical row printed; out={p.stdout.strip()[:60]!r}",
+    )
+
     p = cli("ps", "--reset")
     reg("ps.reset", p.returncode == 0, f"rc0; out={p.stdout.strip()[:80]!r}")
+
+
+    # Gateway-side colon resolution: ollama-style model:tag must route
+    # onto the flat row through the same ensure() choke point (rides the
+    # instance loaded above — warm, cheap).
+    st_c, _, _ = chat(
+        "Say ok",
+        extra={"model": MODEL.replace("-", ":", 1), "max_tokens": 8},
+    )
+    reg(
+        "chat.colon",
+        st_c == 200,
+        f"model:tag via gateway chat -> {st_c}",
+    )
 
     p = cli("why")
     reg("why", p.returncode == 0, "rc0")

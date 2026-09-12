@@ -536,6 +536,36 @@ fn dirs() -> PallamaDirs {
     PallamaDirs::from_env()
 }
 
+/// Not-found error with the flat-name teaching line for ollama
+/// `model:tag` input (reached only when BOTH forms missed, so the
+/// swapped spelling is a suggestion, never a promise).
+fn no_such_model(name: &str) -> anyhow::Error {
+    if name.contains(':') {
+        anyhow!(
+            "no such model: {name} — pallama names are flat; `{}` would be its flat form \
+             (see `pallama list`)",
+            name.replace(':', "-")
+        )
+    } else {
+        anyhow!("no such model: {name} (see `pallama list`)")
+    }
+}
+
+/// CLI-boundary wrapper over the shared `Store::resolve_model_name`
+/// rule (exact row first, then `:`→`-` swap, miss = input verbatim so
+/// callers keep their own error text). Read-only: a missing store is a
+/// passthrough, never created here.
+fn resolve_model_cli(name: &str) -> String {
+    let d = dirs();
+    if !d.db_file().is_file() {
+        return name.to_string();
+    }
+    match Store::open(&d) {
+        Ok(store) => store.resolve_model_name(name),
+        Err(_) => name.to_string(),
+    }
+}
+
 fn config() -> Result<Config> {
     let d = dirs();
     d.ensure().ok();
@@ -738,7 +768,7 @@ fn tokio_deadline(d: Duration) -> std::time::Instant {
 async fn run(cmd: Cmd) -> Result<()> {
     match cmd {
         Cmd::Serve => serve().await,
-        Cmd::Stop { model } => stop_cmd(model).await,
+        Cmd::Stop { model } => stop_cmd(model.map(|m| resolve_model_cli(&m))).await,
         Cmd::Pull { target } => pull(&target).await,
         Cmd::Import {
             path,
@@ -747,18 +777,21 @@ async fn run(cmd: Cmd) -> Result<()> {
             copy,
             mmproj,
         } => import(&path, name, quant, copy, mmproj.as_ref()),
-        Cmd::Mmproj { model, path } => mmproj_cmd(&model, &path),
-        Cmd::Rm { models } => rm_multi(&models),
+        Cmd::Mmproj { model, path } => mmproj_cmd(&resolve_model_cli(&model), &path),
+        Cmd::Rm { models } => {
+            let resolved: Vec<String> = models.iter().map(|m| resolve_model_cli(m)).collect();
+            rm_multi(&resolved)
+        }
         Cmd::List => list(),
-        Cmd::Show { model } => show(&model),
+        Cmd::Show { model } => show(&resolve_model_cli(&model)),
         Cmd::Ps { reset } => ps(reset).await,
         Cmd::Run {
             model,
             prompt,
             verbose,
             max_tokens,
-        } => run_dispatch(&model, &prompt, verbose, max_tokens).await,
-        Cmd::Bench { model } => bench(&model),
+        } => run_dispatch(&resolve_model_cli(&model), &prompt, verbose, max_tokens).await,
+        Cmd::Bench { model } => bench(&resolve_model_cli(&model)),
         Cmd::Tune {
             model,
             search,
@@ -770,7 +803,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             replicas,
             cache_reuse,
         } => tune_full(
-            &model,
+            &resolve_model_cli(&model),
             search,
             ctx,
             spec,
@@ -789,7 +822,7 @@ async fn run(cmd: Cmd) -> Result<()> {
         Cmd::Cp {
             source,
             destination,
-        } => cp_cmd(&source, &destination),
+        } => cp_cmd(&resolve_model_cli(&source), &destination),
         Cmd::Create { model, file } => create_cmd(&model, file.as_deref()),
         Cmd::Push { model } => cloud_refusal("push", &model),
         Cmd::Keys { action } => keys_cmd(action).await,
@@ -804,7 +837,7 @@ async fn run(cmd: Cmd) -> Result<()> {
         } => {
             let gate = verify.then_some(max_degradation);
             quantize_cmd(
-                &model,
+                &resolve_model_cli(&model),
                 &qtype,
                 name.as_deref(),
                 imatrix.as_deref(),
@@ -823,7 +856,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             pin,
         } => whisper_cmd(file.as_ref(), model, install, tag, pull, list, pin).await,
         Cmd::Coreside => coreside_cmd(),
-        Cmd::Drafts { model } => drafts_cmd(&model).await,
+        Cmd::Drafts { model } => drafts_cmd(&resolve_model_cli(&model)).await,
         Cmd::Migrate => migrate_cmd(),
         Cmd::Snapshot => snapshot_cmd(),
         Cmd::Completions { shell } => {
@@ -855,6 +888,7 @@ async fn session_cmd(cmd: SessionCmd) -> Result<()> {
     let client = cli_http();
     match cmd {
         SessionCmd::Save { model, name } => {
+            let model = resolve_model_cli(&model);
             let resp = client
                 .post(format!("{base}/api/session"))
                 .json(&serde_json::json!({
@@ -865,6 +899,7 @@ async fn session_cmd(cmd: SessionCmd) -> Result<()> {
             print_session_result(resp, "saved", &model, &name).await?;
         }
         SessionCmd::Restore { model, name } => {
+            let model = resolve_model_cli(&model);
             let resp = client
                 .post(format!("{base}/api/session"))
                 .json(&serde_json::json!({
@@ -875,6 +910,7 @@ async fn session_cmd(cmd: SessionCmd) -> Result<()> {
             print_session_result(resp, "restored", &model, &name).await?;
         }
         SessionCmd::Rm { model, name } => {
+            let model = resolve_model_cli(&model);
             let resp = client
                 .post(format!("{base}/api/session"))
                 .json(&serde_json::json!({
@@ -885,6 +921,7 @@ async fn session_cmd(cmd: SessionCmd) -> Result<()> {
             print_session_result(resp, "deleted", &model, &name).await?;
         }
         SessionCmd::List { model } => {
+            let model = resolve_model_cli(&model);
             let resp = client
                 .get(format!("{base}/api/session?model={model}"))
                 .send()
@@ -2578,7 +2615,7 @@ fn mmproj_cmd(model: &str, path: &std::path::Path) -> Result<()> {
     let store = Store::open(&d)?;
     let mut row = store
         .get_model(model)?
-        .ok_or_else(|| anyhow!("no such model: {model} (see `pallama list`)"))?;
+        .ok_or_else(|| no_such_model(model))?;
     let mmproj_meta = pallama_core::read_metadata_file(path)
         .map_err(|e| anyhow!("not a readable GGUF projector ({}): {e}", path.display()))?;
     // Vision projectors are CLIP-based GGUFs; anything else (e.g. a language
@@ -2765,7 +2802,7 @@ fn show(model: &str) -> Result<()> {
     let store = Store::open(&d)?;
     let row = store
         .get_model(model)?
-        .ok_or_else(|| anyhow!("no such model: {model}"))?;
+        .ok_or_else(|| no_such_model(model))?;
     println!("name:    {}", row.name);
     println!("repo:    {}", row.repo);
     println!("quant:   {}", row.quant);
@@ -4068,7 +4105,7 @@ fn bench(model: &str) -> Result<()> {
     let store = Store::open(&d)?;
     let row = store
         .get_model(model)?
-        .ok_or_else(|| anyhow!("no such model: {model}"))?;
+        .ok_or_else(|| no_such_model(model))?;
     let bench_bin = pallama_runtime::bench::find_bench_bin(&d)?;
     let tuner = pallama_runtime::Tuner {
         dirs: &d,
@@ -4113,7 +4150,7 @@ fn tune_full(
     let store = Store::open(&d)?;
     let row = store
         .get_model(model)?
-        .ok_or_else(|| anyhow!("no such model: {model}"))?;
+        .ok_or_else(|| no_such_model(model))?;
     let engine_row = store
         .active_engine()?
         .ok_or_else(|| anyhow!("no engine installed; run: pallama engine update"))?;
@@ -5019,6 +5056,7 @@ fn lora_cmd(cmd: LoraCmd) -> Result<()> {
     let store = Store::open(&d)?;
     match cmd {
         LoraCmd::Add { model, path, scale } => {
+            let model = resolve_model_cli(&model);
             let id = store.add_lora(&model, &path.display().to_string(), scale)?;
             println!("lora #{id} attached to {model} (scale {scale})");
         }
@@ -5030,6 +5068,7 @@ fn lora_cmd(cmd: LoraCmd) -> Result<()> {
             }
         }
         LoraCmd::List { model } => {
+            let model = model.map(|m| resolve_model_cli(&m));
             for l in store.list_loras(model.as_deref())? {
                 println!(
                     "#{:<4} {:<24} scale {:<6} {}",

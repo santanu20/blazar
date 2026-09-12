@@ -112,6 +112,20 @@ fn model_of_key(key: &str) -> &str {
     }
 }
 
+/// Not-found payload with the flat-name teaching line for ollama
+/// `model:tag` input (reached only when BOTH forms missed, so the
+/// swapped spelling is a suggestion, never a promise).
+fn not_found_name(name: &str) -> String {
+    if name.contains(':') {
+        format!(
+            "{name} — pallama names are flat; `{}` would be its flat form (see `pallama list`)",
+            name.replace(':', "-")
+        )
+    } else {
+        name.to_string()
+    }
+}
+
 /// Split an instance key into (model, replica index). `None` for plain
 /// model keys and malformed suffixes. A `@vision` suffix after the
 /// replica index is tolerated so `evict_model`-style filters match.
@@ -733,6 +747,19 @@ impl Supervisor {
         name: &str,
         prefix: Option<PrefixKey>,
     ) -> Result<EngineRef, SupervisionError> {
+        // ollama API clients send `model:tag`; pallama rows are flat.
+        // Same rule as the CLI boundary (`Store::resolve_model_name`),
+        // colon-gated so the per-request hot path pays nothing for
+        // canonical names: the store opens only when a ':' is present.
+        let resolved;
+        let name = if name.contains(':') {
+            let store =
+                Store::open(&self.dirs).map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
+            resolved = store.resolve_model_name(name);
+            resolved.as_str()
+        } else {
+            name
+        };
         // Router mode: every model name resolves to the ONE router child
         // (upstream autoloads the model on request, LRU-evicts at
         // models-max). Unknown names still fail fast against the store.
@@ -1636,7 +1663,7 @@ impl Supervisor {
         let model = store
             .get_model(name)
             .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?
-            .ok_or_else(|| SupervisionError::ModelNotFound(name.to_string()))?;
+            .ok_or_else(|| SupervisionError::ModelNotFound(not_found_name(name)))?;
         let gguf = pallama_core::read_metadata_file(std::path::Path::new(&model.path))
             .map_err(|e| SupervisionError::Internal(anyhow!("gguf metadata: {e}")))?;
         let mut overlay = self.config.overlay_for(name);

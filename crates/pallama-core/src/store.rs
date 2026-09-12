@@ -332,6 +332,28 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Map a user-supplied model name onto a store row for ollama
+    /// migrants: exact match first, then a `model:tag` → `model-tag`
+    /// `:`→`-` swap. Returns the input unchanged when nothing matches,
+    /// so callers keep their own not-found error text (fail loud, no
+    /// hidden rewrite). Shared rule for the CLI boundary and the
+    /// gateway's `ensure` path; `pull` never uses it (its colon is the
+    /// `owner/repo:QUANT` separator).
+    pub fn resolve_model_name(&self, name: &str) -> String {
+        if !name.contains(':') {
+            return name.to_string();
+        }
+        let hit = |n: &str| self.get_model(n).is_ok_and(|r| r.is_some());
+        if hit(name) {
+            return name.to_string();
+        }
+        let swapped = name.replace(':', "-");
+        if hit(&swapped) {
+            return swapped;
+        }
+        name.to_string()
+    }
+
     pub fn delete_model(&self, name: &str) -> CoreResult<bool> {
         Ok(self
             .conn
@@ -548,6 +570,18 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('engines','models','profiles','loras')", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn unit__resolve_model_name__colon_swaps_only_onto_existing_rows() {
+        let (_t, s) = tmp_store();
+        s.upsert_model(&base_model("qwen3.5-9b")).unwrap();
+        // Flat names pass through untouched (no store probe needed).
+        assert_eq!(s.resolve_model_name("qwen3.5-9b"), "qwen3.5-9b");
+        // ollama migrant input resolves onto the flat row.
+        assert_eq!(s.resolve_model_name("qwen3.5:9b"), "qwen3.5-9b");
+        // Miss on both forms returns the input verbatim (caller errors).
+        assert_eq!(s.resolve_model_name("nope:9b"), "nope:9b");
     }
 
     fn base_model(name: &str) -> ModelRow {
