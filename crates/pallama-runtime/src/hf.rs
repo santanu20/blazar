@@ -41,6 +41,21 @@ pub fn is_allowed_download_host(host: &str) -> bool {
         || EXTRA_DOWNLOAD_HOSTS.contains(&host)
 }
 
+/// Extra-host match with wildcard support: an exact pattern matches only
+/// itself; a `*.suffix` pattern admits any subdomain of `suffix` (the
+/// apex itself is NOT matched — presigned-CDN families live on
+/// subdomains, e.g. `*.r2.cloudflarestorage.com`).
+#[must_use]
+pub(crate) fn extra_host_matches(host: &str, pattern: &str) -> bool {
+    if pattern == host {
+        return true;
+    }
+    pattern.strip_prefix("*.").is_some_and(|suffix| {
+        host.strip_suffix(suffix)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Naming (complaint #6: registry name = actual repo name, never an alias)
 // ---------------------------------------------------------------------------
@@ -336,8 +351,8 @@ pub fn est_params(bytes: u64, quant: &str) -> f64 {
 // ---------------------------------------------------------------------------
 
 pub struct HfClient {
-    http: reqwest::Client,
-    api_base: reqwest::Url,
+    pub(crate) http: reqwest::Client,
+    pub(crate) api_base: reqwest::Url,
     dl_base: reqwest::Url,
     token: Option<String>,
     /// Parallel byte-range connections for large downloads (see
@@ -375,7 +390,8 @@ impl HfClient {
             if host.is_empty() {
                 return attempt.error("redirect target has no host");
             }
-            if is_allowed_download_host(&host) || extra.contains(&host) {
+            if is_allowed_download_host(&host) || extra.iter().any(|p| extra_host_matches(&host, p))
+            {
                 attempt.follow()
             } else {
                 attempt.error(format!(
@@ -401,8 +417,12 @@ impl HfClient {
     }
 
     /// Token rides ONLY on first-party huggingface.co requests (test
-    /// stand-ins included); CDN hops never see it.
-    fn token_for(&self, url: &reqwest::Url) -> Option<String> {
+    /// stand-ins included); CDN hops never see it. Wildcard extra-host
+    /// patterns ("*.suffix") never receive the token by construction —
+    /// the equality below can't match them; presigned CDN URLs are
+    /// already authorized and forwarding credentials there would be
+    /// exfiltration.
+    pub(crate) fn token_for(&self, url: &reqwest::Url) -> Option<String> {
         let host = url.host_str()?;
         let first_party = host == "huggingface.co" || host.ends_with(".huggingface.co");
         (first_party || self.extra_hosts.iter().any(|h| h == host))
@@ -451,7 +471,6 @@ impl HfClient {
     /// Stream one file to `dest` (via `.part` + atomic rename), resuming
     /// from a previous partial when present. Returns final byte count.
     /// `on_progress` is called with (downloaded, total) after each chunk.
-    #[allow(clippy::too_many_lines)] // flat probe->parallel->resume->verify pipeline by design
     pub async fn download_file(
         &self,
         repo: &str,
@@ -466,6 +485,20 @@ impl HfClient {
                 url_encode_path(&plan.filename)
             ))
             .map_err(|e| anyhow!("bad download URL for {}: {e}", plan.filename))?;
+        self.download_to(url, plan, dest, &mut on_progress).await
+    }
+
+    /// Generic streaming-download core: `.part` resume, Range, sha256
+    /// verify, atomic rename. The URL arrives prebuilt by the caller (HF
+    /// resolve path, ollama-registry blob path, ...), so this client's
+    /// redirect allowlist and token policy apply uniformly.
+    pub(crate) async fn download_to(
+        &self,
+        url: reqwest::Url,
+        plan: &FilePlan,
+        dest: &Path,
+        mut on_progress: impl FnMut(u64, u64),
+    ) -> Result<u64> {
         // Parallel byte-range lane first: engages only when the expected
         // size (from pull metadata) can pay for it and the server proves
         // Range support on a probe; every other shape falls through to
@@ -776,12 +809,12 @@ pub struct Puller {
 
 /// RAII lockfile guard: released (removed) on drop, panic-safe.
 #[derive(Debug)]
-struct PullLock {
+pub(crate) struct PullLock {
     path: PathBuf,
 }
 
 impl PullLock {
-    fn acquire(dirs: &PallamaDirs, name: &str) -> Result<Self> {
+    pub(crate) fn acquire(dirs: &PallamaDirs, name: &str) -> Result<Self> {
         std::fs::create_dir_all(dirs.run_dir())?;
         let path = dirs.run_dir().join(format!("pull-{name}.lock"));
         match std::fs::OpenOptions::new()
@@ -1053,7 +1086,7 @@ pub fn gguf_health_warning(path: &Path, repo: &str, siblings: &[HfSibling]) -> O
     ))
 }
 
-fn unique_dest(dir: &Path, filename: &str, repo: &str) -> PathBuf {
+pub(crate) fn unique_dest(dir: &Path, filename: &str, repo: &str) -> PathBuf {
     let flat = Path::new(filename);
     let leaf = flat.file_name().unwrap_or_default();
     let dest = dir.join(leaf);
@@ -1135,6 +1168,38 @@ mod tests {
     #[test]
     fn unit__quant_tokens__no_gguf_files_is_empty() {
         assert!(quant_tokens(["README.md", "config.json"]).is_empty());
+    }
+
+    #[test]
+    fn unit__extra_host_matches__exact_and_wildcard_semantics() {
+        // Exact pattern: only itself.
+        assert!(extra_host_matches(
+            "registry.ollama.ai",
+            "registry.ollama.ai"
+        ));
+        assert!(!extra_host_matches(
+            "x.registry.ollama.ai",
+            "registry.ollama.ai"
+        ));
+        // Wildcard: any subdomain, apex EXCLUDED (presigned CDN families
+        // live on subdomains — the apex is a different, untrusted site).
+        assert!(extra_host_matches(
+            "blob-store.r2.cloudflarestorage.com",
+            "*.r2.cloudflarestorage.com"
+        ));
+        assert!(!extra_host_matches(
+            "r2.cloudflarestorage.com",
+            "*.r2.cloudflarestorage.com"
+        ));
+        assert!(!extra_host_matches(
+            "evil.r2.cloudflarestorage.com.attacker.io",
+            "*.r2.cloudflarestorage.com"
+        ));
+        // Suffix without dot boundary must not match.
+        assert!(!extra_host_matches(
+            "xr2.cloudflarestorage.com",
+            "*.r2.cloudflarestorage.com"
+        ));
     }
 
     #[test]

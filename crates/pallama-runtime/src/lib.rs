@@ -23,6 +23,7 @@ pub mod hf_parallel;
 pub mod models;
 pub mod probe;
 pub mod quantize;
+pub mod registry;
 pub mod sessionreg;
 pub mod supervisor;
 pub mod upgrade;

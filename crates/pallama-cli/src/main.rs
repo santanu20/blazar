@@ -2292,7 +2292,7 @@ async fn pull(target: &str) -> Result<()> {
     // it. On interrupt the future is dropped, which releases the pull
     // lock and keeps the `.part` for a later resume.
     let row = tokio::select! {
-        r = puller.pull(target) => r?,
+        r = puller.route_pull(target) => r?,
         () = pallama_runtime::events::interrupted() => {
             return Err(anyhow::anyhow!(
                 "pull interrupted — partial file kept; re-run `pallama pull {target}` to resume"

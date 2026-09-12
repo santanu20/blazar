@@ -554,7 +554,7 @@ pub async fn pull(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
             client,
             bus: bus.clone(),
         };
-        if let Err(e) = puller.pull(&pull_request).await {
+        if let Err(e) = puller.route_pull(&pull_request).await {
             tracing::warn!("pull {pull_request}: {e:#}");
             bus.publish(pallama_runtime::PallamaEvent::PullFailed {
                 name: pull_request.clone(),
