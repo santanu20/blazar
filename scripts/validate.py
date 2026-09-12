@@ -8166,15 +8166,18 @@ def _gold_items() -> dict:
         # whether a whisper server is installed in the phase's sandbox
         # (commands installs one; a fresh golds-only run has none), on
         # whether a systemd/launchd manager + pallama unit is probeable on
-        # the host (dev boxes/sandboxes without a unit emit no row), and on
+        # the host (dev boxes/sandboxes without a unit emit no row), on
         # whether the host is Linux-NVIDIA serving a non-CUDA asset
-        # (the cuda-channel hint row is vendor/asset-conditional).
+        # (the cuda-channel hint row is vendor/asset-conditional), and on
+        # whether the config pins retired defaults (the gates full-manifest
+        # boot deliberately writes spec="off"; pristine configs emit no row).
         - {
             "whisper currency",
             "whisper lane",
             "whisper models",
             "service",
             "engine cuda channel",
+            "config pins",
         }
     )
     items["doctor.check-names"] = "\n".join(names)

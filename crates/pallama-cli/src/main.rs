@@ -1089,6 +1089,7 @@ async fn doctor() -> Result<()> {
                     format!("pinned to {}", cfg.cpu_range),
                 ));
             }
+            checks.extend(doctor_config_pins(&cfg));
         }
         Err(e) => {
             checks.push(Check::fail(
@@ -1161,6 +1162,26 @@ fn doctor_next_steps(checks: &[Check]) -> Vec<String> {
         steps.push("chat: pallama run <model>".to_string());
     }
     steps
+}
+
+/// Retired-default pins: a config line that still carries a value an old
+/// default shipped with keeps silently overriding the new default
+/// (template pins outlive default changes). One aggregated WARN row so
+/// the check list stays deterministic; a deliberate pin is fine — the
+/// row teaches, it does not block.
+fn doctor_config_pins(cfg: &pallama_core::Config) -> Vec<Check> {
+    let pins = cfg.retired_default_pins();
+    if pins.is_empty() {
+        return Vec::new();
+    }
+    vec![Check::warn(
+        "config pins",
+        format!(
+            "{} — delete the line(s) to adopt the new default, or keep \
+             them if the pin is deliberate",
+            pins.join("; ")
+        ),
+    )]
 }
 
 /// F8: keys health — parse, uniqueness, admin existence, gateway
@@ -5938,6 +5959,31 @@ mod tests {
         // Inconclusive probes: no row at all.
         assert!(service_verdict(None, Some(true), "systemd").is_none());
         assert!(service_verdict(Some(true), None, "systemd").is_none());
+    }
+
+    #[test]
+    fn unit__doctor_config_pins__silent_on_current_defaults() {
+        assert!(doctor_config_pins(&pallama_core::Config::default()).is_empty());
+    }
+
+    #[test]
+    fn unit__doctor_config_pins__warns_one_row_per_stale_pin_set() {
+        let cfg = pallama_core::Config {
+            cache_reuse: 256,
+            spec: "off".into(),
+            ..pallama_core::Config::default()
+        };
+        let checks = doctor_config_pins(&cfg);
+        assert_eq!(checks.len(), 1);
+        assert!(checks[0].warn && checks[0].ok, "{}", checks[0].detail);
+        assert_eq!(checks[0].name, "config pins");
+        assert!(
+            checks[0].detail.contains("cache_reuse = 256")
+                && checks[0].detail.contains("spec = \"off\"")
+                && checks[0].detail.contains("deliberate"),
+            "{}",
+            checks[0].detail
+        );
     }
 
     #[test]

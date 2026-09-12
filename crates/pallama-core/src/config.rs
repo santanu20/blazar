@@ -1435,6 +1435,36 @@ impl Config {
         toml::from_str::<toml::Table>(raw).is_ok_and(|t| t.contains_key("api_keys"))
     }
 
+    /// Config pins whose value mirrors a RETIRED default: the file was
+    /// written when the old value was the default, the default has
+    /// since changed, and the pin now silently keeps the old behavior.
+    /// Returns one human-readable line per offending pin (empty = none)
+    /// for `pallama doctor` to surface as a WARN — a deliberate pin is
+    /// legitimate, the point is visibility.
+    ///
+    /// MAINTENANCE CONTRACT: whenever a default value changes, add a
+    /// check here naming the knob, the retired value and the new
+    /// default (both global and `model_overrides` spellings when the
+    /// knob has an overlay field).
+    #[must_use]
+    pub fn retired_default_pins(&self) -> Vec<String> {
+        let mut pins = Vec::new();
+        if self.cache_reuse == 256 {
+            pins.push("cache_reuse = 256 (a retired default; current default: 0)".to_string());
+        }
+        if self.spec == "off" {
+            pins.push("spec = \"off\" (a retired default; current default: \"auto\")".to_string());
+        }
+        for (model, overlay) in &self.model_overrides {
+            if overlay.spec.as_deref() == Some("off") {
+                pins.push(format!(
+                    "model_overrides.\"{model}\".spec = \"off\" (a retired default; current default: \"auto\")"
+                ));
+            }
+        }
+        pins
+    }
+
     fn validate_keys(&self) -> CoreResult<()> {
         for (i, k) in self.keys.iter().enumerate() {
             if k.name.trim().is_empty() {
@@ -2407,6 +2437,54 @@ fn valid_override_tensor(s: &str) -> bool {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__retired_pins__default_config_has_none() {
+        assert!(Config::default().retired_default_pins().is_empty());
+    }
+
+    #[test]
+    fn unit__retired_pins__each_retired_global_value_fires() {
+        let pins = Config {
+            cache_reuse: 256,
+            spec: "off".into(),
+            ..Config::default()
+        }
+        .retired_default_pins();
+        assert_eq!(pins.len(), 2, "{pins:?}");
+        assert!(
+            pins.iter().any(|p| p.contains("cache_reuse = 256")),
+            "{pins:?}"
+        );
+        assert!(
+            pins.iter().any(|p| p.contains("spec = \"off\"")),
+            "{pins:?}"
+        );
+        // Current-default values never fire, explicit or not.
+        assert!(Config {
+            cache_reuse: 0,
+            spec: "auto".into(),
+            ..Config::default()
+        }
+        .retired_default_pins()
+        .is_empty());
+    }
+
+    #[test]
+    fn unit__retired_pins__overlay_spec_names_the_model() {
+        let mut cfg = Config::default();
+        cfg.model_overrides.insert(
+            "qwen3.5-9b".into(),
+            ModelOverride {
+                spec: Some("off".into()),
+                ..ModelOverride::default()
+            },
+        );
+        let pins = cfg.retired_default_pins();
+        assert_eq!(pins.len(), 1, "{pins:?}");
+        assert!(pins[0].contains("qwen3.5-9b"), "{}", pins[0]);
+        assert!(pins[0].contains("spec"), "{}", pins[0]);
+    }
 
     #[test]
     fn unit__lookup_cache__validation_requires_existing_file() {
