@@ -71,6 +71,21 @@ pub fn registry_name(repo: &str) -> String {
         .to_string()
 }
 
+/// Row name for a pull: the repo tail, or — when the quant slot carries
+/// an exact `.gguf` filename (drafter-in-same-repo pulls) — that file's
+/// stem, so `dflash-Qwen3-8B-Q8_0.gguf` and `Qwen3-8B-Q8_0.gguf` from
+/// one repo land as distinct rows (`dflash-qwen3-8b-q8_0` vs
+/// `qwen3-8b`).
+#[must_use]
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // operand pre-lowercased
+pub fn draft_aware_name(repo: &str, quant_slot: &str) -> String {
+    let lowered = quant_slot.to_lowercase();
+    if lowered.ends_with(".gguf") {
+        return lowered.trim_end_matches(".gguf").to_string();
+    }
+    registry_name(repo)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PullTarget {
     pub repo: String,
@@ -215,16 +230,44 @@ pub fn select_files(siblings: &[HfSibling], wanted_quant: &str) -> Result<Select
         }
     };
 
-    // Try requested quant among singles first, then shard sets.
-    for s in &singles {
-        if quant_of(&s.rfilename).as_deref() == Some(wanted.as_str()) {
-            return Ok(finish(
-                vec![plan(s)],
-                wanted_quant.to_string(),
-                false,
-                siblings,
-            ));
-        }
+    // Exact-filename request (the quant slot carries a `.gguf` leaf,
+    // e.g. `owner/repo:dflash-Model-Q8_0.gguf`): unambiguous single-file
+    // selection — how drafter artifacts that share a quant token with
+    // their target get pulled.
+    if wanted.ends_with(".gguf") {
+        return exact_filename_selection(siblings, &wanted);
+    }
+
+    // Try requested quant among singles first, then shard sets. When
+    // several singles share the quant token (a repo hosting both a model
+    // and its drafter, or mmproj-F16 beside model-F16), the LARGEST file
+    // is the model — deterministic, no filename-prefix heuristics — and
+    // the skipped same-quant siblings are named in a warning.
+    let mut quant_hits: Vec<&HfSibling> = singles
+        .iter()
+        .copied()
+        .filter(|s| quant_of(&s.rfilename).as_deref() == Some(wanted.as_str()))
+        .collect();
+    if quant_hits.len() > 1 {
+        quant_hits.sort_by_key(|s| std::cmp::Reverse(plan(s).bytes));
+        let skipped: Vec<&str> = quant_hits[1..]
+            .iter()
+            .map(|s| s.rfilename.as_str())
+            .collect();
+        tracing::warn!(
+            "quant {wanted:?} matches {} files; taking {} (largest), skipping {}",
+            quant_hits.len(),
+            quant_hits[0].rfilename,
+            skipped.join(", ")
+        );
+    }
+    if let Some(chosen) = quant_hits.first() {
+        return Ok(finish(
+            vec![plan(chosen)],
+            wanted_quant.to_string(),
+            false,
+            siblings,
+        ));
     }
     for ((base, _count), group) in &sharded {
         if quant_of(base).as_deref() == Some(wanted.as_str()) {
@@ -255,6 +298,25 @@ pub fn select_files(siblings: &[HfSibling], wanted_quant: &str) -> Result<Select
     let plans: Vec<FilePlan> = ordered.iter().map(|s| plan(s)).collect();
     let q = quant_of(&ordered[0].rfilename).unwrap_or_else(|| "unknown".into());
     Ok(finish(plans, q.to_uppercase(), true, siblings))
+}
+
+/// Exact-`.gguf`-filename selection for the quant slot. A filename-shaped
+/// slot NEVER falls back to a quant guess: no match is a named error.
+fn exact_filename_selection(siblings: &[HfSibling], wanted: &str) -> Result<SelectedFiles> {
+    let hit = siblings.iter().find(|s| {
+        let lower = s.rfilename.to_lowercase();
+        lower.ends_with(&format!("/{wanted}")) || lower == wanted
+    });
+    let Some(hit) = hit else {
+        return Err(anyhow!("repo has no file matching {wanted:?}"));
+    };
+    // The slot is a selector, not a display quant: the row shows the
+    // trailing quant-looking token of the actual filename ("…-Q8_0.gguf"
+    // -> "Q8_0") so `pallama list` and est_params see a real quant
+    // instead of the whole uppercased filename.
+    let stem = wanted.trim_end_matches(".gguf").to_lowercase();
+    let display_quant = stem.rsplit('-').next().unwrap_or(&stem).to_uppercase();
+    Ok(finish(vec![plan(hit)], display_quant, false, siblings))
 }
 
 /// `base-q4_k_m-00001-of-00002.gguf` -> `(1, 2, "base-q4_k_m")`.
@@ -1048,7 +1110,7 @@ impl Puller {
     /// named after the file stem so they never collide with the model row.
     pub async fn pull(&self, target: &str) -> Result<PullOutcome> {
         let parsed = parse_pull_target(target)?;
-        let name = registry_name(&parsed.repo);
+        let name = draft_aware_name(&parsed.repo, &parsed.quant);
         let _lock = PullLock::acquire(&self.dirs, &name)?;
         self.pull_locked(&parsed, &name).await
     }
@@ -1675,6 +1737,51 @@ mod tests {
         assert_eq!(sel.shards.len(), 1);
         assert_eq!(sel.shards[0].filename, "model-Q4_K_M.gguf");
         assert!(!sel.quant_fallback);
+    }
+
+    #[test]
+    fn unit__select_files__same_quant_multiple_singles__largest_wins() {
+        // ggml-org layout: dflash/dspark drafters share the quant token
+        // with the target. The MODEL is the largest same-quant file.
+        let sibs = vec![
+            sib("dflash-Qwen3-8B-Q8_0.gguf", 1120, None),
+            sib("Qwen3-8B-Q8_0.gguf", 8710, None),
+            sib("dspark-Qwen3-8B-Q8_0.gguf", 1200, None),
+        ];
+        let sel = select_files(&sibs, "Q8_0").unwrap();
+        assert_eq!(sel.shards[0].filename, "Qwen3-8B-Q8_0.gguf");
+        assert!(!sel.quant_fallback);
+    }
+
+    #[test]
+    fn unit__select_files__exact_filename_slot__selects_drafter() {
+        let sibs = vec![
+            sib("dflash-Qwen3-8B-Q8_0.gguf", 1120, None),
+            sib("Qwen3-8B-Q8_0.gguf", 8710, None),
+        ];
+        // The quant slot carrying a .gguf leaf = exact-file request; case
+        // and repo-path insensitive.
+        let sel = select_files(&sibs, "dflash-qwen3-8b-q8_0.gguf").unwrap();
+        assert_eq!(sel.shards[0].filename, "dflash-Qwen3-8B-Q8_0.gguf");
+        assert!(!sel.quant_fallback);
+        // Display quant = trailing token of the filename, NOT the whole slot.
+        assert_eq!(sel.quant, "Q8_0");
+        // No such file: named error, no silent fallback.
+        let err = select_files(&sibs, "nope.gguf").unwrap_err();
+        assert!(err.to_string().contains("no file matching"), "{err}");
+    }
+
+    #[test]
+    fn unit__draft_aware_name__filename_slot_names_row_by_stem() {
+        assert_eq!(
+            draft_aware_name("ggml-org/Qwen3-8B-GGUF", "dflash-Qwen3-8B-Q8_0.gguf"),
+            "dflash-qwen3-8b-q8_0"
+        );
+        // Quant-style slots keep the repo-tail name.
+        assert_eq!(
+            draft_aware_name("ggml-org/Qwen3-0.6B-GGUF", "Q4_0"),
+            "qwen3-0.6b"
+        );
     }
 
     #[test]
