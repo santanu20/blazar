@@ -84,6 +84,21 @@ tracked here.
   explicitly; `engine_asset` overrides still win over the overlay.
 
 ### Fixed
+- **Draft-decline keeps the gpu-layers pin**: the wave-5 unpin
+  (draft pairs leave `--gpu-layers` to the engine fitter) now only
+  applies when the draft will actually attach; a capacity-declined
+  draft (running dense) keeps the pinned fast path instead of
+  inheriting the fitter's conservative split.
+- **Sub-weights cache-ram budget under unified KV floored at the
+  weights** (3.3x decode fix): on a 13.6 GiB RAM / 8 GiB VRAM box the
+  30% clamp (4102 MiB) sat below qwen3.5-9b's weights (5417 MiB) while
+  `--kv-unified` was on, so the engine's live fitter honored the
+  unsatisfiable sysmem budget and CPU-split the layers — 15.6 vs 39.9
+  t/s, silently. The budget is now floored at weights + KV floor +
+  64 MiB with a loud warning (measured numbers included); a floor over
+  60% of RAM keeps the clamp and teaches `kv_unified = false` / smaller
+  quant instead. Default-config 9B decode is 40.9 t/s (was 12.4;
+  ollama 40.5 same-settings, direct ceiling 41.2).
 - **Spawns plan against live census VRAM, not the boot snapshot**:
   single-GPU boxes fell back to the daemon-boot `Hardware` when no
   card pick applied, so a daemon started while a foreign context
