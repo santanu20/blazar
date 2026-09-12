@@ -1,15 +1,10 @@
 # Pallama inference benchmark
 
-_Rendered 20260910-003328; pallama 0.5.0; power state of gateway rows: ac. Post-render addenda (2026-09-10 P0 wave) follow the executive summary._
+_Rendered 20260911-223054; pallama 0.5.0; power state of gateway rows: ac._
 
 ## Executive summary
 
-llama.cpp b10809 (Vulkan): gateway 39.0 vs direct 39.1 t/s (-0.1%); llama.cpp b10809 (CUDA build): gateway 40.7 vs direct 41.2 t/s (-1.2%); llama.cpp b10809 (Vulkan) prompt-cache prefill 6629 vs 1011 t/s cold; 4-stream concurrency: 37.3 t/s system (1x16384 shape); 98.6 t/s system (4x65536 shape); 15.2 t/s system (engine-scheduled shape); gateway cold boot 0.53 s.
-
-## Addenda (2026-09-10 vs-ollama audit + P0 wave)
-
-- **Prefill gap REFUTED as product gap:** controlled A/B, same build class — llama-bench (b10809-cuda, -ngl 999, -fa auto, pp512, 3 reps) 1630 t/s vs ollama /api/generate raw:true same-counter nonce probe 1726/1672 t/s warm → 2-6% engine-build-flag territory (different compile flags, same llama.cpp tree), NOT a gateway/planner gap. No chase.
-- **Slots auto-fit (P0b) live-proven on the tight lane:** vulkan build + mmproj + 8 GiB card, default ctx 16384 — pre-feature spawn = 1x16384 (37.3 t/s serialized at 4 streams, the G1 gap); post-feature spawn resolves 4x4096 (identical total-ctx budget), argv `--ctx-size 16384 -np 4 --kv-unified`, `slots_ctx_auto_fit` event on /api/events, spawn settle 88% used (healthy zone, ~3.5 s load — not the 27 s degraded boot at 32k total). 4-stream probe: short streams completed in 4.4/5.7 s WHILE long streams were still generating (impossible under 1-slot serialization); long stream decoded at 31.5 t/s under 4-way contention.
+b10903-cuda: gateway 40.3 vs direct 41.1 t/s (-1.9%); b10903-cuda prompt-cache prefill 7332 vs 1207 t/s cold; 4-stream concurrency: 104.2 t/s system (4x65536 shape); gateway cold boot 0.54 s; cold TTFT 11577 ms vs ollama 6566 ms (0.6x); idle wake 2104 ms (sleep) vs ollama 7194 ms (full reload).
 
 ## Test bed
 
@@ -33,6 +28,12 @@ llama.cpp b10809 (Vulkan): gateway 39.0 vs direct 39.1 t/s (-0.1%); llama.cpp b1
 - Greedy parity: 20 fixed prompts, greedy sampling, 256 tokens; exact-match count and text-similarity ratio vs a same-engine reference run.
 - Gateway transparency: a second greedy lane through the pallama gateway with identical sampling; any divergence vs the direct lane isolates translation overhead.
 - Perplexity: llama-perplexity on an offline ASCII corpus, ctx 2048.
+- Cold-start parity: the model file's page cache is dropped (posix_fadvise DONTNEED) and the GPU asserted idle (<512 MiB) before every cold probe on every runtime — a cold load is disk-cold, not memory-warm.
+- Cold TTFT = first-token latency of the cold probe itself (max_tokens 4, aligned num_ctx 16384 on both runtimes).
+- ollama daemon boot is only measured with --ollama-service-restart (systemd restart, sudo password via BENCH_SUDO_PASSWORD env, stdin-only); without it the daemon stays warm and the row says so.
+- Idle-wake: pallama's reaper sleeps the child at idle_sleep_secs (weights stay RAM-resident, VRAM released) — wake TTFT is a sleep-wake; ollama's keep_alive expiry fully unloads — wake TTFT is a disk reload. The policy column names the semantic; both measured after the policy is observed via /api/ps.
+- Long-context curve: per-ctx cells (pallama model_overrides ctx / ollama num_ctx) × 3-run decode suites; each ollama point evicts first so the runner respawns at that ctx.
+- Sustained concurrency: sequential bursts of the parallel-stream lane (default 3 rounds); TTFT p99 aggregates every stream of every round.
 - Every pallama row records the spawned engine's argv (slots/context shown in tables) and stamps pallama version, wall clock, 5-min load average, and AC/battery power state; GPU cells refuse to run on battery.
 
 ## Results
@@ -41,22 +42,17 @@ llama.cpp b10809 (Vulkan): gateway 39.0 vs direct 39.1 t/s (-0.1%); llama.cpp b1
 
 | Runtime | slots x ctx | decode t/s | TTFT p50 ms | TTFT p99 ms | ITL p50 ms | ITL p99 ms | prefill cold t/s | prefill cached t/s | GPU peak MiB | GPU power W |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| pallama gateway - llama.cpp b10809 (Vulkan) | 1x16384 | 39.0 | 145.5 | 162.7 | 25.6 | 26.8 | 1011.1 | 6628.6 | 6707 | 57.9 |
-| pallama gateway - llama.cpp b10809 (CUDA build) | 4x65536 | 40.7 | 135.3 | 137.3 | 24.5 | 25.9 | 1287.2 | 7339.4 | 7328 | 55.2 |
-| pallama gateway - mistral.rs 0.9.3 (CUDA sm89) | engine-scheduled | 18.0 | 137.4 | 153.4 | 56.9 | 68.8 | 222.9 | 225.5 | 7044 | 41.9 |
-| direct engine - llama.cpp b10809 (Vulkan) | 1x16384 | 39.1 | 149.1 | 161.7 | 25.6 | 26.9 | 1023.7 | 6629.0 | 5605 | 55.2 |
-| direct engine - llama.cpp b10809 (CUDA build) | 1x16384 | 41.2 | 137.3 | 144.0 | 24.3 | 25.6 | 1280.0 | 7371.5 | 5716 | 55.6 |
-| ollama 0.33.3 - qwen3.5:9b | service | 40.4 | 139.8 | 148.6 | 25.0 | 75.5 | 1755.3 | 5400.0 | 6448 | 56.6 |
+| pallama gateway - b10903-cuda | 4x65536 | 40.3 | 119.3 | 123.1 | 24.7 | 27.4 | 1207.3 | 7332.2 | 6329 | 56.5 |
+| direct engine - b10903-cuda | 1x16384 | 41.1 | 120.9 | 125.2 | 24.3 | 25.4 | 1300.1 | 7658.4 | 5716 | 56.0 |
+| ollama 0.33.3 - qwen3.5:9b | service | 40.4 | 141.1 | 148.0 | 25.0 | 75.1 | 1641.6 | 5611.2 | 6446 | 57.3 |
 
 ### Concurrency (4 parallel streams x 128 tokens)
 
-| Runtime | slots | ok streams | system t/s | sum-stream t/s | wall s | TTFT max ms | TTFT spread ms | ITL p99 ms |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
-| direct engine - llama.cpp b10809 (Vulkan) | 4 | 4/4 | 86.8 | 92.3 | 5.90 | 390 | 4 | 46.1 |
-| direct engine - llama.cpp b10809 (CUDA build) | 4 | 4/4 | 98.5 | 102.9 | 5.20 | 262 | 3 | 41.2 |
-| pallama gateway - llama.cpp b10809 (Vulkan) | 1x16384 | 4/4 | 37.3 | 155.6 | 13.72 | 10454 | 10283 | 27.3 |
-| pallama gateway - llama.cpp b10809 (CUDA build) | 4x65536 | 4/4 | 98.6 | 103.5 | 5.19 | 285 | 7 | 41.8 |
-| pallama gateway - mistral.rs 0.9.3 (CUDA sm89) | engine-scheduled | 4/4 | 15.2 | 15.4 | 8.43 | 269 | 88 | 70.5 |
+| Runtime | slots | ok streams | rounds | system t/s | sum-stream t/s | wall s | TTFT max ms | TTFT p99 ms | ITL p99 ms |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| direct engine - b10903-cuda | 4 | 4/4 | 1 | 108.8 | 113.8 | 4.71 | 251 | - | 38.8 |
+| pallama gateway - b10903-cuda | 4x65536 | 12/4 | 3 | 104.2 | 338.7 | 14.73 | 529 | 529 | 37.9 |
+| ollama - qwen3.5:9b | service | 12/4 | 3 | 33.4 | 482.4 | 46.02 | 16306 | 15943 | 75.5 |
 
 _sum-stream >> system t/s means streams serialize on one slot; roughly equal means genuinely parallel._
 
@@ -64,19 +60,14 @@ _sum-stream >> system t/s means streams serialize on one slot; roughly equal mea
 
 | Engine | perplexity (ctx 2048, offline ASCII corpus) |
 |---|---:|
-| llama.cpp b10809 (Vulkan) | 36.76 ± 2.18 |
-| llama.cpp b10809 (CUDA build) | 34.95 ± 2.05 |
-| mistral.rs 0.9.3 (CUDA sm89) | not applicable (tool is llama.cpp-family) |
+| b10903-cuda | 16.75 ± 0.88 |
 
 ### Greedy parity and gateway transparency (20 prompts, 256 tokens)
 
 | Comparison | exact / total | ratio mean | ratio min |
 |---|---:|---:|---:|
-| llama.cpp b10809 (Vulkan) vs same-engine reference (direct) | 20/20 | 1.000 | 1.000 |
-| llama.cpp b10809 (CUDA build) vs same-engine reference (direct) | 12/20 | 0.771 | 0.050 |
-| mistral.rs 0.9.3 (CUDA sm89) vs same-engine reference (direct) | 0/20 | 0.531 | 0.000 |
-| llama.cpp b10809 (Vulkan) through pallama gateway vs direct | 18/20 | 0.915 | 0.015 |
-| llama.cpp b10809 (CUDA build) through pallama gateway vs direct | 6/20 | 0.551 | 0.015 |
+| b10903-cuda vs same-engine reference (direct) | 20/20 | 1.000 | 1.000 |
+| b10903-cuda through pallama gateway vs direct | 5/20 | 0.559 | 0.027 |
 
 _Exact-match divergence across GPU backends is expected float nondeterminism (batch shape and backend kernels), not translation drift; bit-parity across runs requires single-slot decoding (pallama `deterministic = true` pins it)._
 
@@ -84,44 +75,60 @@ _Exact-match divergence across GPU backends is expected float nondeterminism (ba
 
 | Engine | axis | setting | decode t/s | delta vs dense | prefill cold t/s | delta |
 |---|---|---|---:|---:|---:|---:|
-| llama.cpp b10809 (Vulkan) | kv | q8_0 | 38.9 | -0.0 | 77.6 | -941.0 |
-| llama.cpp b10809 (Vulkan) | spec | ngram-simple | 38.7 | -0.2 | 1013.3 | -5.3 |
-| llama.cpp b10809 (Vulkan) | mmproj | True | 39.2 | 0.2 | 932.6 | -86.0 |
-| llama.cpp b10809 (CUDA build) | kv | q8_0 | 40.8 | -0.4 | 1300.7 | 67.8 |
-| llama.cpp b10809 (CUDA build) | spec | ngram-simple | 40.8 | -0.4 | 1273.4 | 40.5 |
-| llama.cpp b10809 (CUDA build) | mmproj | True | 41.1 | -0.1 | 1246.1 | 13.1 |
-| mistral.rs 0.9.3 (CUDA sm89) | pa | off | 18.0 | - | 235.5 | - |
+| b10903-cuda | kv | q8_0 | 40.6 | -0.7 | 1301.7 | 62.5 |
+| b10903-cuda | spec | ngram-simple | 40.7 | -0.5 | 1327.7 | 88.5 |
+| b10903-cuda | mmproj | True | 41.1 | -0.1 | 1290.8 | 51.6 |
 
 ### Engine capability matrix
 
-| Capability | llama.cpp b10809 (Vulkan) | llama.cpp b10809 (CUDA build) | mistral.rs 0.9.3 (CUDA sm89) |
-|---|---:|---:|---:|
-| anthropic-api | no | no | yes |
-| ctx-override | yes | yes | yes |
-| embeddings | yes | yes | no |
-| grammar-gbnf | yes | yes | no |
-| json-schema | yes | yes | yes |
-| kv-quant | yes | yes | yes |
-| lora-adapter | yes | yes | yes |
-| metrics-endpoint | yes | yes | yes |
-| paged-attn | yes | yes | yes |
-| parallel-np | yes | yes | yes |
-| quant-on-load | yes | yes | yes |
-| rerank | yes | yes | no |
-| slots-sessions | yes | yes | no |
-| spec-decode | yes | yes | yes |
-| tokenize-endpoint | yes | yes | no |
-| vision-mmproj | yes | yes | yes |
+| Capability | b10903-cuda |
+|---|---:|
+| anthropic-api | no |
+| ctx-override | yes |
+| embeddings | yes |
+| grammar-gbnf | yes |
+| json-schema | yes |
+| kv-quant | yes |
+| lora-adapter | yes |
+| metrics-endpoint | yes |
+| paged-attn | yes |
+| parallel-np | yes |
+| quant-on-load | yes |
+| rerank | yes |
+| slots-sessions | yes |
+| spec-decode | yes |
+| tokenize-endpoint | yes |
+| vision-mmproj | yes |
 
 ### Cold start and footprint
 
-| Runtime | daemon boot s | first request (cold engine load) s | engine load s | RSS peak MiB |
-|---|---:|---:|---:|---:|
-| pallama gateway - llama.cpp b10809 (Vulkan) | 0.53 | 3.68 | - | 1944 |
-| pallama gateway - llama.cpp b10809 (CUDA build) | 0.52 | 3.81 | - | 2075 |
-| pallama gateway - mistral.rs 0.9.3 (CUDA sm89) | 0.52 | 12.04 | - | 8291 |
-| direct engine - llama.cpp b10809 (Vulkan) | - | - | 2.51 | 5673 |
-| direct engine - llama.cpp b10809 (CUDA build) | - | - | 2.51 | 5706 |
+| Runtime | daemon boot s | first request (cold engine load) s | cold TTFT ms | engine load s | RSS peak MiB |
+|---|---:|---:|---:|---:|---:|
+| pallama gateway - b10903-cuda | 0.54 | 11.66 | 11577 | - | 2181 |
+| direct engine - b10903-cuda | - | - | - | 2.51 | 5705 |
+| ollama - qwen3.5:9b | 4.13 | 6.65 | 6566 | 6.36 | - |
+
+_Every cold probe runs page-cache-dropped and GPU-idle-asserted on both runtimes; ollama rows without --ollama-service-restart leave the daemon warm (note in the artifact)._
+
+### Idle wake (sleep vs keep_alive expiry)
+
+| Runtime | idle policy | policy observed | wake TTFT ms | reload s | note |
+|---|---|---|---:|---:|---|
+| pallama - b10903-cuda | sleep at 15s (weights stay RAM-resident) | yes | 2104 | - |  |
+| ollama - qwen3.5:9b | keep_alive 20s -> full unload | yes | 7194 | 7.00 |  |
+
+_pallama sleeps with weights in RAM (wake = resume); ollama unloads at keep_alive expiry (wake = full disk reload). Policies differ by design — the table measures each runtime's own idle path after the policy verifiably fired._
+
+### Long-context degradation curve
+
+| Runtime | ctx | decode t/s | TTFT p50 ms |
+|---|---:|---:|---:|
+| ollama - qwen3.5:9b | 2048 | 40.1 | 146 |
+| ollama - qwen3.5:9b | 8192 | 40.3 | 147 |
+| ollama - qwen3.5:9b | 16384 | 40.3 | 149 |
+| pallama - b10903-cuda | 2048 | 40.8 | 117 |
+| pallama - b10903-cuda | 8192 | 40.5 | 122 |
+| pallama - b10903-cuda | 16384 | 40.4 | 121 |
 
 ## Findings
 
@@ -147,4 +154,4 @@ python3 scripts/bench_matrix.py --pallama-bin target/release/pallama --md BENCHM
 python3 scripts/bench_matrix.py --render-only --artifacts-dir <dir> --md BENCHMARK.md
 ```
 
-_Raw per-cell records (argv, per-run lists, daemon logs): `~/.cache/pallama-bench-matrix/20260910-003328/cells.jsonl`._
+_Raw per-cell records (argv, per-run lists, daemon logs): `~/.cache/pallama-bench-matrix/20260911-223054/cells.jsonl`._

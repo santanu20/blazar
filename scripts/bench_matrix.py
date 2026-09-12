@@ -47,6 +47,7 @@ ollama cell is HTTP-only against an already-running service.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import difflib
 import importlib
 import hashlib
@@ -462,6 +463,96 @@ def mem_guard(floor_mib: float, what: str) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# cold-start parity plumbing (page cache + GPU idle + privileged service)
+
+
+def fadvise_dontneed(paths) -> int:
+    """Drop the kernel page cache for the given files (POSIX_FADV_DONTNEED).
+
+    Cold-load lanes MUST run with the same cache state on every runtime:
+    after any earlier lane the multi-GiB model sits in page cache and the
+    next "cold" load is memory-fast, not disk-cold. Userspace, no root.
+    Returns the number of files actually advised (missing files skip).
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    advised = 0
+    for p in paths:
+        if p is None:
+            continue
+        try:
+            fd = os.open(str(p), os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            # 4 = POSIX_FADV_DONTNEED
+            if libc.posix_fadvise(fd, 0, 0, 4) == 0:
+                advised += 1
+        finally:
+            os.close(fd)
+    return advised
+
+
+def wait_gpu_idle(max_mib: float = 512.0, timeout_s: float = 60.0) -> bool:
+    """Poll until the GPU drains below `max_mib` (eviction settle)."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if gpu_used_mib() <= max_mib:
+            return True
+        time.sleep(1.0)
+    return gpu_used_mib() <= max_mib
+
+
+def ollama_blob_paths(min_bytes: int = 100 * 1024 * 1024) -> list[Path]:
+    """Model blobs (>100 MiB) from the host ollama store, for fadvise."""
+    blobs = Path.home() / ".ollama" / "models" / "blobs"
+    if not blobs.is_dir():
+        return []
+    return [p for p in blobs.iterdir() if p.is_file() and p.stat().st_size >= min_bytes]
+
+
+def sudo_systemctl(*args: str, password: str | None = None) -> bool:
+    """systemctl via sudo -S. The password travels on stdin only —
+    NEVER in argv (ps-visible) and never logged. False on any failure."""
+    if password is None:
+        return False
+    try:
+        out = subprocess.run(
+            ["sudo", "-S", "--", "systemctl", *args],
+            input=password + "\n",
+            capture_output=True,
+            text=True,
+            timeout=90,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return out.returncode == 0
+
+
+def sandbox_model_files(sb, model_name: str) -> tuple[Path | None, Path | None]:
+    """(weights file, mmproj file) from the sandbox store row — the cold
+    probe drops the page cache on BOTH: a cold VL spawn reads the
+    projector (875 MiB on the 9B row) off disk too, and leaving it
+    cached would hand pallama a warmer cold start than the ollama lane
+    (which has no projector at all)."""
+    db = Path(sb.data_home) / "pallama" / "pallama.db"
+    if not db.exists():
+        return None, None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            for p, mp in con.execute(
+                "SELECT path, mmproj_path FROM models WHERE name = ?", (model_name,)
+            ):
+                return Path(p), Path(mp) if mp else None
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None, None
+    return None, None
+
+
 def http_json(url: str, payload: dict | None = None, timeout: float = 30.0):
     data = None if payload is None else json.dumps(payload).encode()
     req = urllib.request.Request(
@@ -618,6 +709,9 @@ def ollama_stream_timed(port: int, body: dict, timeout: float = 300.0) -> dict:
     eval_dur_s = (final.get("eval_duration") or 0) / 1e9
     prompt_eval_count = final.get("prompt_eval_count")
     prompt_eval_dur_s = (final.get("prompt_eval_duration") or 0) / 1e9
+    # ollama's own model-load accounting (ns in the final chunk) — the
+    # engine-authoritative number for cold-start rows
+    load_dur_s = (final.get("load_duration") or 0) / 1e9
     if eval_count and eval_dur_s > 0:
         # engine-side exact: excludes network + harness parse overhead
         decode_tps = eval_count / eval_dur_s
@@ -636,6 +730,7 @@ def ollama_stream_timed(port: int, body: dict, timeout: float = 300.0) -> dict:
         "tokens": eval_count or tokens,
         "prompt_tokens": prompt_eval_count,
         "prompt_eval_dur_s": prompt_eval_dur_s if prompt_eval_count else None,
+        "load_dur_s": load_dur_s if load_dur_s > 0 else None,
         "itls_ms": itls,
         "tokens_source": src,
     }
@@ -804,7 +899,12 @@ def median_run_suite(
 
 
 def conc_suite(
-    port: int, model: str, level: int, tg: int, ollama: bool = False
+    port: int,
+    model: str,
+    level: int,
+    tg: int,
+    ollama: bool = False,
+    rounds: int = 1,
 ) -> dict:
     """`level` concurrent streams -> aggregate throughput + tail latency.
 
@@ -812,42 +912,56 @@ def conc_suite(
     all streams pay real prefill). Exercises admission/queueing on the
     pallama path (WFQ/slot leases/predictive reject) and llama-server
     slot scheduling on the direct path.
+
+    rounds > 1 = sustained load: sequential bursts with per-round and
+    cross-round tail stats (a single burst never shows queue-drain p99s
+    or thermal/admission drift).
     """
     fn = ollama_stream_timed if ollama else openai_stream_timed
-    results: list[Any] = [None] * level
 
-    def worker(i: int) -> None:
+    def body(max_tokens: int, i: int) -> dict:
         prompt = (
             f"Stream {i}: explain in one short paragraph why the sea is "
             f"salty, variation {i}, answer directly."
         )
         if ollama:
-            body = {
+            return {
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
                 "options": {"num_ctx": 8192},
-                "max_tokens": tg,
+                "max_tokens": max_tokens,
             }
-        else:
-            body = {
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": tg,
-            }
-        try:
-            results[i] = fn(port, body, timeout=300.0)
-        except Exception as exc:  # noqa: BLE001 — one stream failing is a datum
-            results[i] = f"error: {exc}"
+        return {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+        }
 
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(level)]
-    t0 = time.perf_counter()
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    wall_s = time.perf_counter() - t0
-    ok = [r for r in results if isinstance(r, dict)]
-    errs = [r for r in results if isinstance(r, str)]
+    def burst() -> dict:
+        results: list[Any] = [None] * level
+
+        def worker(i: int) -> None:
+            try:
+                results[i] = fn(port, body(tg, i), timeout=300.0)
+            except Exception as exc:  # noqa: BLE001 — one stream failing is a datum
+                results[i] = f"error: {exc}"
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(level)]
+        t0 = time.perf_counter()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return {
+            "wall_s": time.perf_counter() - t0,
+            "ok": [r for r in results if isinstance(r, dict)],
+            "errs": [r for r in results if isinstance(r, str)],
+        }
+
+    burst_recs = [burst() for _ in range(max(1, rounds))]
+    wall_s = sum(b["wall_s"] for b in burst_recs)
+    ok = [r for b in burst_recs for r in b["ok"]]
+    errs = [e for b in burst_recs for e in b["errs"]]
     if not ok:
         # All streams failed is a dead backend, not a 0 t/s datapoint
         # (v2.0 recorded a degenerate "ok" row with ttft 0 / decode 0).
@@ -855,8 +969,15 @@ def conc_suite(
     ttfts = [r["ttft_ms"] for r in ok]
     itls = [i for r in ok for i in r["itls_ms"]]
     total_tokens = sum(r.get("tokens") or 0 for r in ok)
-    return {
+    round_sys = [
+        round(sum(r.get("tokens") or 0 for r in b["ok"]) / b["wall_s"], 2)
+        for b in burst_recs
+        if b["ok"] and b["wall_s"] > 0
+    ]
+    round_walls = [round(b["wall_s"], 2) for b in burst_recs]
+    out = {
         "conc_level": level,
+        "conc_rounds": len(burst_recs),
         "conc_wall_s": round(wall_s, 2),
         "conc_ok": len(ok),
         "conc_errors": len(errs),
@@ -871,6 +992,22 @@ def conc_suite(
         "itl_p99_ms": round(percentile(itls, 99), 2) if itls else None,
         "total_tokens": total_tokens,
     }
+    if len(burst_recs) > 1:
+        out.update(
+            {
+                "conc_sys_tps_per_round": round_sys,
+                "conc_sys_tps_p50": round(statistics.median(round_sys), 2)
+                if round_sys
+                else None,
+                "conc_ttft_p99_ms": round(percentile(ttfts, 99), 1) if ttfts else None,
+                "conc_wall_p99_s": round(
+                    percentile([float(w) for w in round_walls], 99), 2
+                )
+                if round_walls
+                else None,
+            }
+        )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1256,17 +1393,42 @@ def run_pallama_cell(
             # median_run_suite drives it — time the warmup ourselves by
             # wrapping: run one explicit cold request first so the
             # cold-start number is clean, THEN the suite warms up.
+            #
+            # Parity hardening (same env as the ollama cold lane):
+            # (1) drop the page cache on the model file the child will
+            #     mmap — earlier lanes leave multi-GiB cached and a
+            #     "cold" load would be memory-fast;
+            # (2) assert the GPU drained (no co-resident squatter
+            #     inflating the load);
+            # (3) capture the probe's OWN ttft — first-token latency on
+            #     a cold engine is the user-felt number and was
+            #     previously discarded into the wall time.
+            mfile, mmfile = sandbox_model_files(sb, model_name)
+            rec["cold_fadvise_files"] = fadvise_dontneed([mfile, mmfile])
+            if not wait_gpu_idle(max_mib=512.0, timeout_s=30.0):
+                rec["cold_gpu_busy_mib"] = round(gpu_used_mib(), 0)
             t_cold0 = time.perf_counter()
-            openai_stream_timed(
-                port,
-                {
-                    "model": model_name,
-                    "messages": [{"role": "user", "content": "cold-start probe"}],
-                    "max_tokens": 4,
-                },
-                timeout=600.0,
-            )
-            rec["cold_first_request_s"] = round(time.perf_counter() - t_cold0, 2)
+            try:
+                coldm = openai_stream_timed(
+                    port,
+                    {
+                        "model": model_name,
+                        "messages": [{"role": "user", "content": "cold-start probe"}],
+                        "max_tokens": 4,
+                    },
+                    timeout=600.0,
+                )
+                rec["cold_first_request_s"] = round(time.perf_counter() - t_cold0, 2)
+                rec["cold_ttft_ms"] = round(coldm.get("ttft_ms") or 0.0, 1)
+                rec["cold_prompt_tokens"] = coldm.get("prompt_tokens")
+            except Exception as cold_exc:  # noqa: BLE001 — keep forensics
+                # a failed cold probe (e.g. 502 spawn-failure behind the
+                # gateway) must still carry boot metrics + daemon tail for
+                # diagnosis — return rec; the finally block captures the
+                # rest (sampler peaks, daemon.stop, log tail, teardown)
+                rec["error"] = f"cold probe failed: {cold_exc}"
+                rec["cold_first_request_s"] = round(time.perf_counter() - t_cold0, 2)
+                return rec
             child_pid = find_sandbox_engine_pid()
             if child_pid is not None:
                 rec["child_pid"] = child_pid
@@ -1342,7 +1504,9 @@ def run_pallama_cell(
     return rec
 
 
-def run_pallama_conc_cell(eng: Engine, model_name: str, level: int, cfg: dict) -> dict:
+def run_pallama_conc_cell(
+    eng: Engine, model_name: str, level: int, cfg: dict, rounds: int = 1
+) -> dict:
     """Concurrency lane through the full gateway path (admission,
     queueing, slot leases — Pallama's scheduling surface)."""
     os.environ["PALLAMA_VALIDATE_PORT"] = str(free_port())
@@ -1398,7 +1562,7 @@ def run_pallama_conc_cell(eng: Engine, model_name: str, level: int, cfg: dict) -
             if child_pid is not None:
                 rec["child_pid"] = child_pid
                 rec["child_argv"] = read_proc_argv(child_pid)
-            rec.update(conc_suite(port, model_name, level, cfg["tg"]))
+            rec.update(conc_suite(port, model_name, level, cfg["tg"], rounds=rounds))
         finally:
             rec["gpu_peak_mib"] = round(sampler.gpu_peak_mib, 1)
             daemon.stop()
@@ -1426,7 +1590,514 @@ def run_pallama_conc_cell(eng: Engine, model_name: str, level: int, cfg: dict) -
 
 
 # ---------------------------------------------------------------------------
+# idle-wake lane (sleep-vs-expiry semantics: pallama keeps weights in RAM
+# and wakes cheap; ollama's keep_alive expiry unloads and pays a reload)
+
+
+def run_pallama_idle_cell(eng: Engine, model_name: str, cfg: dict) -> dict:
+    """Warm the model, let the reaper ladder sleep it (idle_sleep_secs),
+    then measure the wake TTFT — pallama's structural idle advantage."""
+    os.environ["PALLAMA_VALIDATE_PORT"] = str(free_port())
+    V = importlib.import_module("validate")
+    V.PORT = int(os.environ["PALLAMA_VALIDATE_PORT"])
+
+    idle_sleep = 15
+    rec: dict[str, Any] = {
+        "idle_policy": f"sleep at {idle_sleep}s (weights stay RAM-resident)",
+    }
+    sb = V.Sandbox()
+    sampler = Sampler(None)
+    sampler.start()
+    try:
+        con = sqlite3.connect(Path(sb.data_home) / "pallama" / "pallama.db")
+        con.execute("UPDATE engines SET active = (tag = ?)", (eng.tag,))
+        con.commit()
+        con.close()
+        daemon = V.Daemon(sb)
+        port: int | None = None
+        try:
+            daemon.start(
+                cfg={"port": V.PORT, "idle_sleep_secs": idle_sleep},
+                floor_model=model_name,
+            )
+            port = V.PORT
+            deadline = time.time() + 600
+            healthy = False
+            while time.time() < deadline:
+                try:
+                    http_json(f"http://127.0.0.1:{port}/healthz", timeout=5.0)
+                    healthy = True
+                    break
+                except json.JSONDecodeError:
+                    healthy = True
+                    break
+                except (urllib.error.URLError, OSError):
+                    time.sleep(0.5)
+            if not healthy:
+                return {"error": "sandbox daemon failed to boot"}
+            assert port is not None
+            openai_stream_timed(
+                port,
+                {
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": "warmup"}],
+                    "max_tokens": 8,
+                },
+                timeout=600.0,
+            )
+            loaded_gpu_mib = gpu_used_mib()
+            # sleep detect: /api/ps pallama_state flips to Sleeping (the
+            # child sleeps itself; weights stay RAM, VRAM released);
+            # VRAM drop as fallback signal. Timeout must cover the idle
+            # window + the 10s reaper tick + margin.
+            slept = False
+            deadline = time.time() + idle_sleep + 10 + 60
+            while time.time() < deadline:
+                try:
+                    ps = http_json(f"http://127.0.0.1:{port}/api/ps", timeout=5.0)
+                    states = [
+                        str(r.get("pallama_state", "")).lower()
+                        for r in ps.get("models", [])
+                    ]
+                    if any("sleep" in s for s in states):
+                        slept = True
+                        break
+                except (urllib.error.URLError, OSError, json.JSONDecodeError):
+                    pass
+                if gpu_used_mib() < loaded_gpu_mib - 512:
+                    slept = True
+                    rec["sleep_detect"] = "vram_drop"
+                    break
+                time.sleep(1.0)
+            rec["slept"] = slept
+            if not slept:
+                rec["idle_note"] = (
+                    "model never reached Sleeping within "
+                    f"{idle_sleep + 10 + 60}s — wake TTFT below is warm-path"
+                )
+            rec["gpu_at_sleep_mib"] = round(gpu_used_mib(), 1)
+            m = openai_stream_timed(
+                port,
+                {
+                    "model": model_name,
+                    "messages": [
+                        {"role": "user", "content": "wake probe — answer in one word"}
+                    ],
+                    "max_tokens": 8,
+                },
+                timeout=600.0,
+            )
+            rec["idle_wake_ttft_ms"] = round(m.get("ttft_ms") or 0.0, 1)
+            rec["idle_wake_wall_s"] = round(
+                (m.get("ttft_ms") or 0.0) / 1000.0 + sum(m.get("itls_ms", [])) / 1000.0,
+                2,
+            )
+            rec["gpu_peak_mib"] = round(sampler.gpu_peak_mib, 1)
+        finally:
+            daemon.stop()
+            dlog = Path(sb.data_dir) / "run" / "daemon.log"
+            if dlog.exists():
+                rec["daemon_log_tail"] = "\n".join(
+                    dlog.read_text(errors="replace").splitlines()[-12:]
+                )
+            dark = False
+            if port is not None:
+                for _ in range(20):
+                    try:
+                        urllib.request.urlopen(
+                            f"http://127.0.0.1:{port}/healthz", timeout=1.0
+                        )
+                        time.sleep(0.5)
+                    except (urllib.error.URLError, OSError):
+                        dark = True
+                        break
+            rec["teardown_ok"] = dark
+    finally:
+        sampler.stop_evt.set()
+        sb.destroy()
+    return rec
+
+
+def run_ollama_idle_cell(cfg: dict, args_model: str | None) -> dict:
+    """keep_alive expiry = ollama's idle policy: FULL unload. After the
+    window the model row leaves /api/ps and the next request pays a
+    complete reload — measure that TTFT against pallama's sleep-wake."""
+    try:
+        tags = http_json(f"http://127.0.0.1:{OLLAMA_PORT}/api/tags", timeout=5.0)
+    except (urllib.error.URLError, OSError):
+        return {"error": "ollama not reachable on 11434 (skipped, not started)"}
+    models = [m["name"] for m in tags.get("models", [])]
+    pick = pick_ollama_model(models, args_model)
+    if pick is None:
+        return {"error": f"no ollama model comparable to '{args_model}'"}
+    keep_alive_s = 20
+    rec: dict[str, Any] = {
+        "ollama_model": pick,
+        "idle_policy": f"keep_alive {keep_alive_s}s -> full unload",
+    }
+    sampler = Sampler(None)
+    sampler.start()
+    try:
+        ollama_stream_timed(
+            OLLAMA_PORT,
+            {
+                "model": pick,
+                "messages": [{"role": "user", "content": "warmup"}],
+                "options": {"num_ctx": 8192},
+                "keep_alive": f"{keep_alive_s}s",
+                "max_tokens": 8,
+            },
+            timeout=600.0,
+        )
+        # poll until the expiry unloads it (row gone from /api/ps)
+        gone = False
+        deadline = time.time() + keep_alive_s + 90
+        while time.time() < deadline:
+            try:
+                ps = http_json(f"http://127.0.0.1:{OLLAMA_PORT}/api/ps", timeout=5.0)
+                if not any(r.get("name") == pick for r in ps.get("models", [])):
+                    gone = True
+                    break
+            except (urllib.error.URLError, OSError, json.JSONDecodeError):
+                pass
+            time.sleep(1.0)
+        rec["expired"] = gone
+        if not gone:
+            rec["idle_note"] = (
+                f"model still loaded after keep_alive {keep_alive_s}s+90s — "
+                "wake TTFT below is warm-path (expiry semantics unverifiable)"
+            )
+        else:
+            # disk-cold reload: same fadvise parity as the cold lane
+            rec["cold_fadvise_files"] = fadvise_dontneed(ollama_blob_paths())
+        m = ollama_stream_timed(
+            OLLAMA_PORT,
+            {
+                "model": pick,
+                "messages": [
+                    {"role": "user", "content": "wake probe — answer in one word"}
+                ],
+                "options": {"num_ctx": 8192},
+                "max_tokens": 8,
+            },
+            timeout=600.0,
+        )
+        rec["idle_wake_ttft_ms"] = round(m.get("ttft_ms") or 0.0, 1)
+        if m.get("load_dur_s"):
+            rec["idle_reload_s"] = round(m["load_dur_s"], 2)
+        rec["gpu_peak_mib"] = round(sampler.gpu_peak_mib, 1)
+    finally:
+        sampler.stop_evt.set()
+        sampler.join(timeout=2.0)
+    rec["teardown_ok"] = ollama_evict(pick)
+    return rec
+
+
+# ---------------------------------------------------------------------------
+# long-context degradation curve (decode t/s + TTFT vs ctx on both runtimes)
+
+
+def run_pallama_ctx_cell(eng: Engine, model_name: str, ctx: int, cfg: dict) -> dict:
+    """One ctx point on the curve: sandbox daemon with the per-model ctx
+    override, 3-run decode suite. The profile compiler resolves ctx into
+    the child argv (recorded) so the exact allocation is in the artifact."""
+    os.environ["PALLAMA_VALIDATE_PORT"] = str(free_port())
+    V = importlib.import_module("validate")
+    V.PORT = int(os.environ["PALLAMA_VALIDATE_PORT"])
+
+    rec: dict[str, Any] = {"ctx": ctx}
+    sb = V.Sandbox()
+    sampler = Sampler(None)
+    sampler.start()
+    try:
+        con = sqlite3.connect(Path(sb.data_home) / "pallama" / "pallama.db")
+        con.execute("UPDATE engines SET active = (tag = ?)", (eng.tag,))
+        con.commit()
+        con.close()
+        daemon = V.Daemon(sb)
+        port: int | None = None
+        try:
+            daemon.start(
+                cfg={
+                    "port": V.PORT,
+                    "model_overrides": {model_name: {"ctx": ctx}},
+                },
+                floor_model=model_name,
+            )
+            port = V.PORT
+            deadline = time.time() + 600
+            healthy = False
+            while time.time() < deadline:
+                try:
+                    http_json(f"http://127.0.0.1:{port}/healthz", timeout=5.0)
+                    healthy = True
+                    break
+                except json.JSONDecodeError:
+                    healthy = True
+                    break
+                except (urllib.error.URLError, OSError):
+                    time.sleep(0.5)
+            if not healthy:
+                return {"error": f"sandbox daemon failed to boot at ctx {ctx}"}
+            assert port is not None
+            rec.update(median_run_suite(port, model_name, 3, cfg["pp"], cfg["tg"]))
+            child_pid = find_sandbox_engine_pid()
+            if child_pid is not None:
+                rec["child_argv"] = read_proc_argv(child_pid)
+            rec["gpu_peak_mib"] = round(sampler.gpu_peak_mib, 1)
+        finally:
+            daemon.stop()
+            dark = False
+            if port is not None:
+                for _ in range(20):
+                    try:
+                        urllib.request.urlopen(
+                            f"http://127.0.0.1:{port}/healthz", timeout=1.0
+                        )
+                        time.sleep(0.5)
+                    except (urllib.error.URLError, OSError):
+                        dark = True
+                        break
+            rec["teardown_ok"] = dark
+    finally:
+        sampler.stop_evt.set()
+        sb.destroy()
+    return rec
+
+
+def run_ollama_ctx_cell(cfg: dict, args_model: str | None, ctx: int) -> dict:
+    """One ctx point on ollama's curve: evict (runner respawn at the
+    request's num_ctx — ollama reloads when the option changes), then a
+    3-run decode suite pinned to that num_ctx."""
+    try:
+        tags = http_json(f"http://127.0.0.1:{OLLAMA_PORT}/api/tags", timeout=5.0)
+    except (urllib.error.URLError, OSError):
+        return {"error": "ollama not reachable on 11434 (skipped, not started)"}
+    models = [m["name"] for m in tags.get("models", [])]
+    pick = pick_ollama_model(models, args_model)
+    if pick is None:
+        return {"error": f"no ollama model comparable to '{args_model}'"}
+    rec: dict[str, Any] = {"ctx": ctx, "ollama_model": pick}
+    sampler = Sampler(None)
+    sampler.start()
+    try:
+        ollama_evict(pick)
+
+        def runs() -> list[dict]:
+            out = []
+            for _ in range(3):
+                out.append(
+                    ollama_stream_timed(
+                        OLLAMA_PORT,
+                        {
+                            "model": pick,
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": "List fun facts about the ocean, one per line.",
+                                }
+                            ],
+                            "options": {"num_ctx": ctx},
+                            "max_tokens": cfg["tg"],
+                        },
+                        timeout=300.0,
+                    )
+                )
+            return out
+
+        decode = runs()
+        ttfts = [x["ttft_ms"] for x in decode]
+        rec.update(
+            {
+                "ttft_ms_p50": statistics.median(ttfts),
+                "decode_tps_p50": statistics.median(x["decode_tps"] for x in decode),
+                "decode_tps_runs": [round(x["decode_tps"], 2) for x in decode],
+                "runs": 3,
+            }
+        )
+        first_load = next(
+            (x.get("load_dur_s") for x in decode if x.get("load_dur_s")), None
+        )
+        if first_load:
+            rec["load_s"] = round(first_load, 2)
+        rec["gpu_peak_mib"] = round(sampler.gpu_peak_mib, 1)
+    finally:
+        sampler.stop_evt.set()
+        sampler.join(timeout=2.0)
+    rec["teardown_ok"] = ollama_evict(pick)
+    return rec
+
+
+def run_ollama_conc_cell(
+    cfg: dict, args_model: str | None, level: int, rounds: int = 1
+) -> dict:
+    """Concurrency parity on the ollama host service — same conc_suite,
+    same unique-prompt bursts, same sustained rounds as the gateway lane."""
+    try:
+        tags = http_json(f"http://127.0.0.1:{OLLAMA_PORT}/api/tags", timeout=5.0)
+    except (urllib.error.URLError, OSError):
+        return {"error": "ollama not reachable on 11434 (skipped, not started)"}
+    models = [m["name"] for m in tags.get("models", [])]
+    pick = pick_ollama_model(models, args_model)
+    if pick is None:
+        return {"error": f"no ollama model comparable to '{args_model}'"}
+    rec: dict[str, Any] = {"ollama_model": pick}
+    sampler = Sampler(None)
+    sampler.start()
+    try:
+        # first stream of round 1 pays the load — that is the honest
+        # sustained-load shape for a service that starts cold
+        rec.update(
+            conc_suite(OLLAMA_PORT, pick, level, cfg["tg"], ollama=True, rounds=rounds)
+        )
+        rec["gpu_peak_mib"] = round(sampler.gpu_peak_mib, 1)
+    finally:
+        sampler.stop_evt.set()
+        sampler.join(timeout=2.0)
+    rec["teardown_ok"] = ollama_evict(pick)
+    return rec
+
+
+# ---------------------------------------------------------------------------
 # ollama reference (HTTP-only, one cell)
+
+
+def pick_ollama_model(models: list[str], args_model: str | None) -> str | None:
+    """SAME-model reference pick: derive family+size from the matrix model
+    name ("Qwen3.5-9B-Q4_K_M" -> family "qwen3.5", size "9b") and match
+    the ollama tag exactly, then loosely. A junk fallback is worse than
+    an honest skip — v2.0's stem-needle match missed "qwen3.5:9b" and
+    benchmarked an alphabetically-first OCR model at 70 t/s."""
+    if not args_model:
+        return None
+    stem = args_model.lower()
+    parts = re.split(r"[-_:]", stem)
+    family = parts[0] if parts else stem
+    size = next((p for p in parts[1:] if p.endswith("b") and p[:-1].isdigit()), "")
+    exact = f"{family}:{size}" if size else None
+    if exact and exact in models:
+        return exact
+    hits = [m for m in models if family in m.lower()]
+    if hits:
+        # prefer the size-matching variant, then the shortest tag
+        return min(hits, key=lambda m: (0 if size and size in m else 1, len(m)))
+    return None
+
+
+def ollama_evict(model: str, timeout_s: float = 90.0) -> bool:
+    """keep_alive=0 unload + GPU drain poll. The host service is not our
+    child — "teardown" means the model is actually gone from VRAM."""
+    try:
+        http_json(
+            f"http://127.0.0.1:{OLLAMA_PORT}/api/generate",
+            {"model": model, "keep_alive": 0},
+            timeout=15.0,
+        )
+    except (urllib.error.URLError, OSError) as exc:
+        log(f"  ! ollama evict {model} failed: {exc}")
+        return False
+    return wait_gpu_idle(max_mib=512.0, timeout_s=timeout_s)
+
+
+def run_ollama_cold_cell(
+    cfg: dict, args_model: str | None, service_restart: bool = False
+) -> dict:
+    """Cold-start parity lane: ollama daemon-boot → disk-cold model load
+    → first token. Mirrors the pallama cold probe exactly (fadvise'd
+    blobs, GPU-idle assert, aligned num_ctx) so the coldstart table
+    compares the same physical state on both runtimes."""
+    try:
+        tags = http_json(f"http://127.0.0.1:{OLLAMA_PORT}/api/tags", timeout=5.0)
+    except (urllib.error.URLError, OSError):
+        return {"error": "ollama not reachable on 11434 (skipped, not started)"}
+    models = [m["name"] for m in tags.get("models", [])]
+    if not models:
+        return {"error": "ollama reachable but no models pulled"}
+    pick = pick_ollama_model(models, args_model)
+    if pick is None:
+        return {
+            "error": (
+                f"no ollama model comparable to '{args_model}' "
+                f"(have: {', '.join(models[:6])}) — pull a matching tag"
+            )
+        }
+    rec: dict[str, Any] = {"ollama_model": pick}
+
+    # daemon boot (optional — restarting the user's systemd service is
+    # opt-in via --ollama-service-restart; without it the daemon is warm
+    # and only the model-load path is cold, disclosed via note)
+    if service_restart:
+        pw = os.environ.get("BENCH_SUDO_PASSWORD")
+        if pw and sudo_systemctl("restart", "ollama", password=pw):
+            t_boot0 = time.perf_counter()
+            deadline = time.time() + 120.0
+            while time.time() < deadline:
+                try:
+                    http_json(
+                        f"http://127.0.0.1:{OLLAMA_PORT}/api/version", timeout=3.0
+                    )
+                    rec["ollama_daemon_boot_s"] = round(
+                        time.perf_counter() - t_boot0, 2
+                    )
+                    break
+                except (urllib.error.URLError, OSError, json.JSONDecodeError):
+                    time.sleep(0.25)
+            else:
+                rec["ollama_daemon_boot_s"] = None
+                rec["ollama_daemon_boot_note"] = (
+                    "service restarted but /api/version never answered in 120s"
+                )
+        else:
+            rec["ollama_daemon_boot_note"] = (
+                "service restart unavailable (no BENCH_SUDO_PASSWORD or sudo failed) "
+                "— daemon-warm cold-load measured"
+            )
+    else:
+        rec["ollama_daemon_boot_note"] = (
+            "daemon left warm (no --ollama-service-restart) — model-load path only"
+        )
+
+    sampler = Sampler(None)  # global GPU/power: the service is not our child
+    sampler.start()
+    try:
+        if not ollama_evict(pick):
+            rec["cold_gpu_busy_mib"] = round(gpu_used_mib(), 0)
+        rec["cold_fadvise_files"] = fadvise_dontneed(ollama_blob_paths())
+        # num_ctx 16384 = the pallama gateway cell's resolved ctx for the
+        # matrix model — identical KV allocation on both runtimes
+        m = ollama_stream_timed(
+            OLLAMA_PORT,
+            {
+                "model": pick,
+                "messages": [{"role": "user", "content": "cold-start probe"}],
+                "options": {"num_ctx": 16384},
+                "max_tokens": 4,
+            },
+            timeout=600.0,
+        )
+        rec["ollama_cold_ttft_ms"] = round(m.get("ttft_ms") or 0.0, 1)
+        rec["ollama_cold_wall_s"] = round(
+            (m.get("ttft_ms") or 0.0) / 1000.0 + sum(m.get("itls_ms", [])) / 1000.0,
+            2,
+        )
+        if m.get("load_dur_s"):
+            rec["ollama_load_s"] = round(m["load_dur_s"], 2)
+        rec["ollama_cold_prompt_tokens"] = m.get("prompt_tokens")
+        rec["gpu_peak_mib"] = round(sampler.gpu_peak_mib, 1)
+        rec["gpu_base_mib"] = round(sampler.gpu_base_mib, 1)
+        rec["gpu_power_peak_w"] = round(sampler.gpu_power_peak_w, 1)
+    finally:
+        sampler.stop_evt.set()
+        sampler.join(timeout=2.0)
+    # free VRAM for later lanes + honest teardown check
+    rec["teardown_ok"] = ollama_evict(pick)
+    # service must be alive for the campaign to continue (Restart=always
+    # normally guarantees it; a stopped service is a hard env break)
+    try:
+        http_json(f"http://127.0.0.1:{OLLAMA_PORT}/api/version", timeout=5.0)
+    except (urllib.error.URLError, OSError):
+        rec["ollama_service_down"] = True
+    return rec
 
 
 def run_ollama_cell(cfg: dict, args_model: str | None = None) -> dict:
@@ -1437,25 +2108,7 @@ def run_ollama_cell(cfg: dict, args_model: str | None = None) -> dict:
     models = [m["name"] for m in tags.get("models", [])]
     if not models:
         return {"error": "ollama reachable but no models pulled"}
-    # SAME-model reference: derive family+size from the matrix model name
-    # ("Qwen3.5-9B-Q4_K_M" -> family "qwen3.5", size "9b") and match the
-    # ollama tag exactly, then loosely. A junk fallback is worse than an
-    # honest skip — v2.0's stem-needle match missed "qwen3.5:9b" and
-    # benchmarked an alphabetically-first OCR model at 70 t/s.
-    pick = None
-    if args_model:
-        stem = args_model.lower()
-        parts = re.split(r"[-_:]", stem)
-        family = parts[0] if parts else stem
-        size = next((p for p in parts[1:] if p.endswith("b") and p[:-1].isdigit()), "")
-        exact = f"{family}:{size}" if size else None
-        if exact and exact in models:
-            pick = exact
-        if pick is None:
-            hits = [m for m in models if family in m.lower()]
-            if hits:
-                # prefer the size-matching variant, then the shortest tag
-                pick = min(hits, key=lambda m: (0 if size and size in m else 1, len(m)))
+    pick = pick_ollama_model(models, args_model)
     if pick is None:
         return {
             "error": (
@@ -1478,23 +2131,10 @@ def run_ollama_cell(cfg: dict, args_model: str | None = None) -> dict:
     finally:
         sampler.stop_evt.set()
         sampler.join(timeout=2.0)
-    # Unload the served model (keep_alive=0) so later GPU lanes (conc,
-    # ppl, greedy) get the VRAM — v2.0 left the reference model resident
-    # and every following lane starved or died.
-    try:
-        http_json(
-            f"http://127.0.0.1:{OLLAMA_PORT}/api/generate",
-            {"model": pick, "keep_alive": 0},
-            timeout=15.0,
-        )
-        for _ in range(60):
-            if gpu_used_mib() <= 512:
-                break
-            time.sleep(1.0)
-    except (urllib.error.URLError, OSError) as exc:
-        log(f"  ! ollama unload after reference failed: {exc}")
-    # host service: "teardown" = model actually evicted from VRAM
-    out["teardown_ok"] = gpu_used_mib() <= 512
+    # Unload the served model so later GPU lanes (conc, ppl, greedy) get
+    # the VRAM — v2.0 left the reference model resident and every
+    # following lane starved or died.
+    out["teardown_ok"] = ollama_evict(pick)
     # the reference row sits in the same table as the matrix model —
     # name it loudly when it differs or the t/s columns mislead
     if args_model and args_model.lower() not in pick.lower():
@@ -2433,6 +3073,30 @@ def main() -> int:
     ap.add_argument("--skip-greedy", action="store_true")
     ap.add_argument("--skip-features", action="store_true")
     ap.add_argument("--skip-conc", action="store_true")
+    ap.add_argument("--skip-idle", action="store_true", help="skip the idle-wake lane")
+    ap.add_argument(
+        "--skip-ctxcurve", action="store_true", help="skip the long-ctx curve lane"
+    )
+    ap.add_argument(
+        "--conc-rounds",
+        type=int,
+        default=3,
+        help="sustained-load rounds per concurrency level (1 = single burst)",
+    )
+    ap.add_argument(
+        "--ctxcurve-sweep",
+        default="2048,8192,16384",
+        help="ctx points for the long-context degradation curve",
+    )
+    ap.add_argument(
+        "--ollama-service-restart",
+        action="store_true",
+        help=(
+            "restart the host ollama systemd service for the cold lane's "
+            "daemon-boot metric (needs BENCH_SUDO_PASSWORD in env; default: "
+            "daemon left warm)"
+        ),
+    )
     ap.add_argument(
         "--skip-variants", action="store_true", help="skip kv/spec/mmproj/pa axis cells"
     )
@@ -2516,42 +3180,58 @@ def main() -> int:
     conc_sweep = tuple(int(x) for x in str(args.conc_sweep).split(",") if x.strip())
 
     data_dir = Path(args.data_dir).expanduser()
-    models_dir = data_dir / "models"
-    ggufs = sorted(
-        models_dir.glob("*.gguf"), key=lambda p: p.stat().st_size, reverse=True
-    )
-    # exclude projectors + scratch files
-    ggufs = [
-        p
-        for p in ggufs
-        if "mmproj" not in p.name and not p.name.startswith(("imx-", "r5-"))
-    ]
-    if not ggufs:
-        log("no candidate .gguf models in data dir")
+    # Model pick is DB-FIRST: a gateway cell can only serve store ROWS —
+    # directory-only files (scratch exports like the collision-slug
+    # "mtp-textonly" file, live-caught 2026-09-11) have no row, so a
+    # stem-derived name 404s every sandbox daemon. Pick from rows whose
+    # file exists; the row's name IS the gateway name (no stem fallback
+    # to get wrong), and its mmproj column owns projector attachment.
+    db = data_dir / "pallama.db"
+    if not db.exists():
+        log(f"no pallama.db under {data_dir} — nothing servable")
         return 2
-    model = ggufs[0]
+    rows: list[tuple[Path, str, str | None]] = []
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        for path, name, mmproj in con.execute(
+            "SELECT path, name, mmproj_path FROM models"
+        ):
+            p = Path(path)
+            if (
+                not p.exists()
+                or "mmproj" in p.name
+                or p.name.startswith(("imx-", "r5-"))
+            ):
+                continue
+            rows.append((p, name, mmproj))
+    finally:
+        con.close()
+    if not rows:
+        log("no DB-registered .gguf models with existing files")
+        return 2
+    rows.sort(key=lambda r: r[0].stat().st_size, reverse=True)
     if args.model:
-        hits = [p for p in ggufs if args.model.lower() in p.name.lower()]
+        hits = [
+            r
+            for r in rows
+            if args.model.lower() in r[0].name.lower()
+            or args.model.lower() in r[1].lower()
+        ]
         if not hits:
-            log(f"no model matching {args.model!r}")
+            log(f"no DB model matching {args.model!r}")
             return 2
-        model = hits[0]
-    model_name = model.stem.lower().removesuffix("-q4_k_m").removesuffix("-q4_0")
+        # substring hits prefer the EXACT row name: "qwen3.5-9b" must not
+        # silently select the larger "qwen3.5-9b-mtp" variant (different
+        # weights file than the ollama reference blob)
+        want = args.model.lower()
+        hits.sort(key=lambda r: r[1].lower() != want)
+        rows = hits
+    model, gw_model_name, own_mmproj_s = rows[0]
+    model_name = gw_model_name
     # mmproj ownership is a per-model DB column, NOT dir proximity —
     # mistral.rs scans the model dir for projectors, so attaching a
     # stray one would poison a text model (the Bug-C class).
-    own_mmproj: Path | None = None
-    db = data_dir / "pallama.db"
-    if db.exists():
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-        try:
-            for (mp,) in con.execute(
-                "SELECT mmproj_path FROM models WHERE path = ?", (str(model),)
-            ):
-                if mp:
-                    own_mmproj = Path(mp)
-        finally:
-            con.close()
+    own_mmproj: Path | None = Path(own_mmproj_s) if own_mmproj_s else None
 
     engines = load_engines(data_dir)
     if args.engines:
@@ -2729,9 +3409,22 @@ def main() -> int:
                 log(f"[pallama {eng.tag}] resumed — skipping")
                 continue
             log(f"[pallama {eng.tag}] (sandbox, gateway, default profile)")
+            # guard BEFORE the cell: a prior direct-sweep teardown can
+            # still hold VRAM when the sandbox child spawns (live-caught
+            # 2026-09-11: 502 right after the np4 direct cells)
+            if not mem_guard(2048.0, f"pre-pallama {eng.tag}"):
+                emit(
+                    eng.tag,
+                    eng.kind,
+                    "pallama",
+                    params,
+                    key,
+                    {"error": "GPU memory floor exceeded before cell"},
+                )
+                continue
             try:
                 rec = run_pallama_cell(
-                    eng, model_name, cfg, "sandboxed gateway cell", soak_s=args.soak
+                    eng, gw_model_name, cfg, "sandboxed gateway cell", soak_s=args.soak
                 )
             except Exception as exc:  # noqa: BLE001 — campaign continues (R4)
                 rec = {"error": f"pallama cell crashed: {exc}"}
@@ -2745,7 +3438,7 @@ def main() -> int:
                 try:
                     rec = run_pallama_cell(
                         eng,
-                        model_name,
+                        gw_model_name,
                         cfg,
                         "sandboxed gateway cell, mistralrs_paged_attn=false",
                         pallama_cfg={"mistralrs_paged_attn": False},
@@ -2767,6 +3460,99 @@ def main() -> int:
             except Exception as exc:  # noqa: BLE001 — campaign continues (R4)
                 rec = {"error": f"ollama cell crashed: {exc}"}
             emit("ollama-host", "ollama", "ollama", params, key, rec)
+
+        # ---- ollama cold-start parity (disk-cold load + first token)
+        params = {"cold": True}
+        key = cell_key("ollama-host", "cold-ollama", params, model.name)
+        if key in done:
+            log("[ollama cold] resumed — skipping")
+        else:
+            log("[ollama cold-start parity]")
+            try:
+                rec = run_ollama_cold_cell(
+                    cfg, args.model or model_name, args.ollama_service_restart
+                )
+            except Exception as exc:  # noqa: BLE001
+                rec = {"error": f"ollama cold cell crashed: {exc}"}
+            emit("ollama-host", "ollama", "cold-ollama", params, key, rec)
+
+    # ---- idle-wake lane (sleep-vs-expiry: the idle-policy headline)
+    if not args.skip_idle:
+        if "pallama" in args.providers:
+            for eng in engines:
+                params = {"idle": True}
+                key = cell_key(eng.tag, "idle-pallama", params, model.name)
+                if key in done:
+                    continue
+                log(f"[idle-wake pallama {eng.tag}]")
+                if not mem_guard(2048.0, f"pre-idle {eng.tag}"):
+                    emit(
+                        eng.tag,
+                        eng.kind,
+                        "idle-pallama",
+                        params,
+                        key,
+                        {"error": "GPU memory floor exceeded before cell"},
+                    )
+                    continue
+                try:
+                    rec = run_pallama_idle_cell(eng, gw_model_name, cfg)
+                except Exception as exc:  # noqa: BLE001
+                    rec = {"error": f"idle cell crashed: {exc}"}
+                emit(eng.tag, eng.kind, "idle-pallama", params, key, rec)
+        if "ollama" in args.providers:
+            params = {"idle": True}
+            key = cell_key("ollama-host", "idle-ollama", params, model.name)
+            if key in done:
+                log("[idle-wake ollama] resumed — skipping")
+            else:
+                log("[idle-wake ollama (keep_alive expiry)]")
+                try:
+                    rec = run_ollama_idle_cell(cfg, args.model or model_name)
+                except Exception as exc:  # noqa: BLE001
+                    rec = {"error": f"ollama idle cell crashed: {exc}"}
+                emit("ollama-host", "ollama", "idle-ollama", params, key, rec)
+
+    # ---- long-context degradation curve (decode t/s + TTFT vs ctx)
+    if not args.skip_ctxcurve:
+        ctxcurve = tuple(
+            int(x) for x in str(args.ctxcurve_sweep).split(",") if x.strip()
+        )
+        if "pallama" in args.providers:
+            for eng in engines:
+                for ctx in ctxcurve:
+                    params = {"ctx": ctx}
+                    key = cell_key(eng.tag, "ctxcurve-pallama", params, model.name)
+                    if key in done:
+                        continue
+                    log(f"[ctxcurve pallama {eng.tag} ctx={ctx}]")
+                    if not mem_guard(2048.0, f"pre-ctxcurve {eng.tag} {ctx}"):
+                        emit(
+                            eng.tag,
+                            eng.kind,
+                            "ctxcurve-pallama",
+                            params,
+                            key,
+                            {"error": "GPU memory floor exceeded before cell"},
+                        )
+                        continue
+                    try:
+                        rec = run_pallama_ctx_cell(eng, gw_model_name, ctx, cfg)
+                    except Exception as exc:  # noqa: BLE001
+                        rec = {"error": f"ctxcurve cell crashed: {exc}"}
+                    emit(eng.tag, eng.kind, "ctxcurve-pallama", params, key, rec)
+        if "ollama" in args.providers:
+            for ctx in ctxcurve:
+                params = {"ctx": ctx}
+                key = cell_key("ollama-host", "ctxcurve-ollama", params, model.name)
+                if key in done:
+                    continue
+                log(f"[ctxcurve ollama ctx={ctx}]")
+                try:
+                    rec = run_ollama_ctx_cell(cfg, args.model or model_name, ctx)
+                except Exception as exc:  # noqa: BLE001
+                    rec = {"error": f"ollama ctxcurve cell crashed: {exc}"}
+                emit("ollama-host", "ollama", "ctxcurve-ollama", params, key, rec)
 
     # ---- concurrency lane (direct np-sized child + full gateway path)
     if not args.skip_conc and conc_sweep:
@@ -2799,11 +3585,11 @@ def main() -> int:
                     emit(eng.tag, eng.kind, "conc-direct", params, key, rec)
             if "pallama" in args.providers:
                 for eng in engines:
-                    params = {"conc": level}
+                    params = {"conc": level, "rounds": args.conc_rounds}
                     key = cell_key(eng.tag, "conc-pallama", params, model.name)
                     if key in done:
                         continue
-                    log(f"[conc pallama {eng.tag} x{level}]")
+                    log(f"[conc pallama {eng.tag} x{level} x{args.conc_rounds}r]")
                     if not mem_guard(2048.0, f"pre-conc-pallama {eng.tag}"):
                         emit(
                             eng.tag,
@@ -2815,10 +3601,25 @@ def main() -> int:
                         )
                         continue
                     try:
-                        rec = run_pallama_conc_cell(eng, model_name, level, cfg)
+                        rec = run_pallama_conc_cell(
+                            eng, gw_model_name, level, cfg, rounds=args.conc_rounds
+                        )
                     except Exception as exc:  # noqa: BLE001
                         rec = {"error": f"conc cell crashed: {exc}"}
                     emit(eng.tag, eng.kind, "conc-pallama", params, key, rec)
+            if "ollama" in args.providers:
+                params = {"conc": level, "rounds": args.conc_rounds}
+                key = cell_key("ollama-host", "conc-ollama", params, model.name)
+                if key in done:
+                    continue
+                log(f"[conc ollama x{level} x{args.conc_rounds}r]")
+                try:
+                    rec = run_ollama_conc_cell(
+                        cfg, args.model or model_name, level, args.conc_rounds
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    rec = {"error": f"ollama conc cell crashed: {exc}"}
+                emit("ollama-host", "ollama", "conc-ollama", params, key, rec)
 
     # ---- quality: perplexity parity (llama.cpp engines)
     if not args.skip_ppl:
@@ -2916,7 +3717,7 @@ def main() -> int:
                 log(f"[greedy gateway-transparency {eng.tag}]")
                 try:
                     rec = run_greedy_gateway_cell(
-                        eng, model, own_mmproj, model_name, reference
+                        eng, model, own_mmproj, gw_model_name, reference
                     )
                 except Exception as exc:  # noqa: BLE001
                     rec = {"error": f"greedy gw cell crashed: {exc}"}
@@ -3054,6 +3855,12 @@ METHODOLOGY = [
     "Greedy parity: 20 fixed prompts, greedy sampling, 256 tokens; exact-match count and text-similarity ratio vs a same-engine reference run.",
     "Gateway transparency: a second greedy lane through the pallama gateway with identical sampling; any divergence vs the direct lane isolates translation overhead.",
     "Perplexity: llama-perplexity on an offline ASCII corpus, ctx 2048.",
+    "Cold-start parity: the model file's page cache is dropped (posix_fadvise DONTNEED) and the GPU asserted idle (<512 MiB) before every cold probe on every runtime — a cold load is disk-cold, not memory-warm.",
+    "Cold TTFT = first-token latency of the cold probe itself (max_tokens 4, aligned num_ctx 16384 on both runtimes).",
+    "ollama daemon boot is only measured with --ollama-service-restart (systemd restart, sudo password via BENCH_SUDO_PASSWORD env, stdin-only); without it the daemon stays warm and the row says so.",
+    "Idle-wake: pallama's reaper sleeps the child at idle_sleep_secs (weights stay RAM-resident, VRAM released) — wake TTFT is a sleep-wake; ollama's keep_alive expiry fully unloads — wake TTFT is a disk reload. The policy column names the semantic; both measured after the policy is observed via /api/ps.",
+    "Long-context curve: per-ctx cells (pallama model_overrides ctx / ollama num_ctx) × 3-run decode suites; each ollama point evicts first so the runner respawns at that ctx.",
+    "Sustained concurrency: sequential bursts of the parallel-stream lane (default 3 rounds); TTFT p99 aggregates every stream of every round.",
     "Every pallama row records the spawned engine's argv (slots/context shown in tables) and stamps pallama version, wall clock, 5-min load average, and AC/battery power state; GPU cells refuse to run on battery.",
 ]
 
@@ -3156,41 +3963,45 @@ def conc_table(recs: list[dict]) -> str:
     rows = []
     for r in recs:
         prov = r.get("provider")
-        if prov not in ("conc-pallama", "conc-direct") or "error" in r:
+        if prov not in ("conc-pallama", "conc-direct", "conc-ollama") or "error" in r:
             continue
-        name = (
-            f"pallama gateway - {engine_label(r['tag'])}"
-            if prov == "conc-pallama"
-            else f"direct engine - {engine_label(r['tag'])}"
-        )
-        shape = child_shape(r) or (
-            f"{r.get('params', {}).get('np')} slots"
-            if r.get("params", {}).get("np")
-            else "engine-scheduled"
-        )
+        if prov == "conc-pallama":
+            name = f"pallama gateway - {engine_label(r['tag'])}"
+            shape = child_shape(r) or "engine-scheduled"
+        elif prov == "conc-direct":
+            name = f"direct engine - {engine_label(r['tag'])}"
+            shape = child_shape(r) or (
+                f"{r.get('params', {}).get('np')} slots"
+                if r.get("params", {}).get("np")
+                else "engine-scheduled"
+            )
+        else:
+            name = f"ollama - {r.get('ollama_model', 'reference')}"
+            shape = "service"
         rows.append(
             (
                 name,
                 shape,
                 r.get("conc_ok"),
                 r.get("params", {}).get("conc", "?"),
+                r.get("conc_rounds"),
                 r.get("sys_tps"),
                 r.get("sum_stream_tps"),
                 r.get("conc_wall_s"),
                 r.get("ttft_max_ms"),
-                r.get("ttft_spread_ms"),
+                r.get("conc_ttft_p99_ms"),
                 r.get("itl_p99_ms"),
             )
         )
     head = (
-        "| Runtime | slots | ok streams | system t/s | sum-stream t/s | wall s |"
-        " TTFT max ms | TTFT spread ms | ITL p99 ms |"
+        "| Runtime | slots | ok streams | rounds | system t/s | sum-stream t/s | wall s |"
+        " TTFT max ms | TTFT p99 ms | ITL p99 ms |"
     )
-    sep = "|---|---|---:|---:|---:|---:|---:|---:|---:|"
+    sep = "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"
     body = [
-        f"| {n} | {s} | {ok}/{den} | {pfmt(sys)} | {pfmt(sm)} | {pfmt(w, 2)} | {pfmt(tm, 0)} |"
-        f" {pfmt(ts, 0)} | {pfmt(i9, 1)} |"
-        for n, s, ok, den, sys, sm, w, tm, ts, i9 in rows
+        f"| {n} | {s} | {ok}/{den} | {pfmt(rd, 0)} | {pfmt(sys)} | {pfmt(sm)} | {pfmt(w, 2)} |"
+        f" {pfmt(tm, 0)} | {pfmt(tp, 0)} | {pfmt(i9, 1)} |"
+        for n, s, ok, den, rd, sys, sm, w, tm, tp, i9 in rows
     ]
     return "\n".join([head, sep, *body])
 
@@ -3329,6 +4140,7 @@ def coldstart_table(recs: list[dict]) -> str:
             f"pallama gateway - {engine_label(r['tag'])}",
             r.get("daemon_boot_s"),
             r.get("cold_first_request_s"),
+            r.get("cold_ttft_ms"),
             r.get("load_s"),
             r.get("rss_peak_mib"),
         )
@@ -3340,6 +4152,7 @@ def coldstart_table(recs: list[dict]) -> str:
             f"direct engine - {engine_label(r['tag'])}",
             None,
             None,
+            None,
             r.get("load_s"),
             r.get("rss_peak_mib"),
         )
@@ -3349,14 +4162,101 @@ def coldstart_table(recs: list[dict]) -> str:
         and r.get("params", {}).get("ctx") == 16384
         and r.get("params", {}).get("np") == 1
     ]
+    rows += [
+        (
+            f"ollama - {r.get('ollama_model', 'reference')}",
+            r.get("ollama_daemon_boot_s"),
+            r.get("ollama_cold_wall_s"),
+            r.get("ollama_cold_ttft_ms"),
+            r.get("ollama_load_s"),
+            None,
+        )
+        for r in recs
+        if r.get("provider") == "cold-ollama" and "error" not in r
+    ]
     if not rows:
         return "_Not measured._"
-    head = "| Runtime | daemon boot s | first request (cold engine load) s | engine load s | RSS peak MiB |"
-    sep = "|---|---:|---:|---:|---:|"
+    head = (
+        "| Runtime | daemon boot s | first request (cold engine load) s |"
+        " cold TTFT ms | engine load s | RSS peak MiB |"
+    )
+    sep = "|---|---:|---:|---:|---:|---:|"
     body = [
-        f"| {n} | {pfmt(b, 2)} | {pfmt(c, 2)} | {pfmt(ld, 2)} | {pfmt(r, 0)} |"
-        for n, b, c, ld, r in rows
+        f"| {n} | {pfmt(b, 2)} | {pfmt(c, 2)} | {pfmt(t, 0)} | {pfmt(ld, 2)} | {pfmt(r, 0)} |"
+        for n, b, c, t, ld, r in rows
     ]
+    return "\n".join([head, sep, *body])
+
+
+def idle_wake_table(recs: list[dict]) -> str:
+    rows = []
+    for r in recs:
+        prov = r.get("provider")
+        if prov == "idle-pallama" and "error" not in r:
+            rows.append(
+                (
+                    f"pallama - {engine_label(r['tag'])}",
+                    r.get("idle_policy", "sleep ladder"),
+                    r.get("slept"),
+                    r.get("idle_wake_ttft_ms"),
+                    None,
+                    r.get("idle_note"),
+                )
+            )
+        elif prov == "idle-ollama" and "error" not in r:
+            rows.append(
+                (
+                    f"ollama - {r.get('ollama_model', 'reference')}",
+                    r.get("idle_policy", "keep_alive expiry"),
+                    r.get("expired"),
+                    r.get("idle_wake_ttft_ms"),
+                    r.get("idle_reload_s"),
+                    r.get("idle_note"),
+                )
+            )
+    if not rows:
+        return "_Not measured._"
+    head = (
+        "| Runtime | idle policy | policy observed | wake TTFT ms | reload s | note |"
+    )
+    sep = "|---|---|---|---:|---:|---|"
+    body = []
+    for n, pol, seen, ttft, rel, note in rows:
+        seen_s = {True: "yes", False: "NO"}.get(seen, "?")
+        body.append(
+            f"| {n} | {pol} | {seen_s} | {pfmt(ttft, 0)} | {pfmt(rel, 2)} | {note or ''} |"
+        )
+    return "\n".join([head, sep, *body])
+
+
+def ctxcurve_table(recs: list[dict]) -> str:
+    rows = []
+    for r in recs:
+        prov = r.get("provider")
+        if prov == "ctxcurve-pallama" and "error" not in r:
+            rows.append(
+                (
+                    f"pallama - {engine_label(r['tag'])}",
+                    r.get("ctx"),
+                    r.get("decode_tps_p50"),
+                    r.get("ttft_ms_p50"),
+                )
+            )
+        elif prov == "ctxcurve-ollama" and "error" not in r:
+            rows.append(
+                (
+                    f"ollama - {r.get('ollama_model', 'reference')}",
+                    r.get("ctx"),
+                    r.get("decode_tps_p50"),
+                    r.get("ttft_ms_p50"),
+                )
+            )
+    if not rows:
+        return "_Not measured._"
+    rows.sort(key=lambda x: (x[0], x[1] or 0))
+    head = "| Runtime | ctx | decode t/s | TTFT p50 ms |"
+    sep = "|---|---:|---:|---:|"
+    body = [f"| {n} | {pfmt(c, 0)} | {pfmt(d)} | {pfmt(t, 0)} |" for n, c, d, t in rows]
     return "\n".join([head, sep, *body])
 
 
@@ -3405,6 +4305,46 @@ def executive_summary(recs: list[dict]) -> str:
     )
     if boot:
         parts.append(f"gateway cold boot {pfmt(boot, 2)} s")
+    cold_ttft = next(
+        (r.get("cold_ttft_ms") for r in gw.values() if r.get("cold_ttft_ms")), None
+    )
+    oc = next(
+        (r for r in recs if r.get("provider") == "cold-ollama" and "error" not in r),
+        None,
+    )
+    if cold_ttft and oc and oc.get("ollama_cold_ttft_ms"):
+        ratio = oc["ollama_cold_ttft_ms"] / cold_ttft
+        parts.append(
+            f"cold TTFT {pfmt(cold_ttft, 0)} ms vs ollama "
+            f"{pfmt(oc['ollama_cold_ttft_ms'], 0)} ms ({ratio:.1f}x)"
+        )
+    idle_p = next(
+        (
+            r
+            for r in recs
+            if r.get("provider") == "idle-pallama"
+            and "error" not in r
+            and r.get("slept")
+            and r.get("idle_wake_ttft_ms")
+        ),
+        None,
+    )
+    idle_o = next(
+        (
+            r
+            for r in recs
+            if r.get("provider") == "idle-ollama"
+            and "error" not in r
+            and r.get("expired")
+            and r.get("idle_wake_ttft_ms")
+        ),
+        None,
+    )
+    if idle_p and idle_o:
+        parts.append(
+            f"idle wake {pfmt(idle_p['idle_wake_ttft_ms'], 0)} ms (sleep) vs ollama "
+            f"{pfmt(idle_o['idle_wake_ttft_ms'], 0)} ms (full reload)"
+        )
     return "; ".join(parts) + "." if parts else "_No complete rows._"
 
 
@@ -3485,6 +4425,22 @@ def write_publication_report(
     L.append("### Cold start and footprint")
     L.append("")
     L.append(coldstart_table(recs))
+    L.append("")
+    L.append(
+        "_Every cold probe runs page-cache-dropped and GPU-idle-asserted on both runtimes; ollama rows without --ollama-service-restart leave the daemon warm (note in the artifact)._"
+    )
+    L.append("")
+    L.append("### Idle wake (sleep vs keep_alive expiry)")
+    L.append("")
+    L.append(idle_wake_table(recs))
+    L.append("")
+    L.append(
+        "_pallama sleeps with weights in RAM (wake = resume); ollama unloads at keep_alive expiry (wake = full disk reload). Policies differ by design — the table measures each runtime's own idle path after the policy verifiably fired._"
+    )
+    L.append("")
+    L.append("### Long-context degradation curve")
+    L.append("")
+    L.append(ctxcurve_table(recs))
     L.append("")
     L.append("## Findings")
     L.append("")
