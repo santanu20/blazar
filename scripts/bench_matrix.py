@@ -3349,6 +3349,21 @@ def main() -> int:
                 f"exact, ratio {rec.get('ratio_mean') or 0:.4f} "
                 f"(min {rec.get('ratio_min') or 0:.4f})"
             )
+        elif "ollama_cold_ttft_ms" in rec:
+            # Cold cell: the warm-lane keys are absent by design — print
+            # the cold metric the cell actually measured (cells.jsonl
+            # always carried it; the stdout line used to read 0s).
+            log(
+                f"  ok: cold ttft {rec.get('ollama_cold_ttft_ms', 0):.0f}ms "
+                f"load {rec.get('ollama_load_s', 0):.1f}s "
+                f"gpu {rec.get('gpu_peak_mib', 0):.0f}MiB"
+            )
+        elif "cold_ttft_ms" in rec and "ttft_ms_p50" not in rec:
+            log(
+                f"  ok: cold ttft {rec.get('cold_ttft_ms', 0):.0f}ms "
+                f"first-request {rec.get('cold_first_request_s', 0):.1f}s "
+                f"gpu {rec.get('gpu_peak_mib', 0):.0f}MiB"
+            )
         else:
             log(
                 f"  ok: ttft {rec.get('ttft_ms_p50', 0):.0f}ms "
@@ -3447,7 +3462,30 @@ def main() -> int:
                     rec = {"error": f"pallama cell crashed: {exc}"}
                 emit(eng.tag, eng.kind, "pallama", params, key, rec)
 
-    # ---- ollama reference (one cell)
+        # ---- pallama single-stream variant (slots=1, classic in-VRAM
+        # KV): the same-settings cell for the ollama parity question —
+        # ollama serves one slot with KV in VRAM; this pins pallama to
+        # the identical layout so any remaining delta is orchestration,
+        # not defaults policy.
+        params = {"config": "single-stream"}
+        key = cell_key(eng.tag, "pallama", params, model.name)
+        if key in done:
+            log(f"[pallama {eng.tag} single-stream] resumed — skipping")
+        else:
+            log(
+                f"[pallama {eng.tag} single-stream] (sandbox, slots=1, kv_unified=false)"
+            )
+            try:
+                rec = run_pallama_cell(
+                    eng,
+                    gw_model_name,
+                    cfg,
+                    "sandboxed gateway cell, slots=1 + kv_unified=false",
+                    pallama_cfg={"slots": 1, "kv_unified": False},
+                )
+            except Exception as exc:  # noqa: BLE001
+                rec = {"error": f"pallama cell crashed: {exc}"}
+            emit(eng.tag, eng.kind, "pallama", params, key, rec)
     if "ollama" in args.providers:
         params = {"reference": True}
         key = cell_key("ollama-host", "ollama", params, model.name)
