@@ -1,6 +1,6 @@
 # pallama
 
-**llama.cpp orchestration: ollama-grade UX, zero engine fork.**
+**llama.cpp orchestration: pallama-grade UX, zero engine fork.**
 
 One Rust binary — `pallama` — that wraps upstream [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server`: official binaries, side-by-side versions, atomic switching, and a byte-stream gateway exposing both the **OpenAI** and **Ollama** APIs on port **11434** (drop-in `OLLAMA_HOST` replacement).
 

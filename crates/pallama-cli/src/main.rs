@@ -27,7 +27,7 @@ use pallama_runtime::{LlamaCppEngine, MistralRsEngine, Supervisor};
 #[command(
     name = "pallama",
     version,
-    about = "llama.cpp orchestration: ollama-grade UX, zero engine fork",
+    about = "llama.cpp orchestration: pallama-grade UX, zero engine fork",
     after_help = "Quickstart: pallama pull <model> · pallama run <model> · pallama doctor\n\nLocal-only: no telemetry, no cloud endpoints. Powered by llama.cpp / ggml / ggerganov."
 )]
 struct Cli {
@@ -99,13 +99,13 @@ enum Cmd {
         #[arg(long)]
         key: Option<String>,
     },
-    /// ollama.com account sign-in — refused: no cloud accounts by design
+    /// pallama account sign-in — refused: no cloud accounts by design
     Signin,
-    /// ollama.com account login — refused: no cloud accounts by design
+    /// pallama account login — refused: no cloud accounts by design
     Login,
-    /// ollama.com account sign-out — refused: no cloud accounts by design
+    /// pallama account sign-out — refused: no cloud accounts by design
     Signout,
-    /// ollama.com account logout — refused: no cloud accounts by design
+    /// pallama account logout — refused: no cloud accounts by design
     Logout,
     /// Stop the daemon; with a model name, unload that model now
     Stop { model: Option<String> },
@@ -456,7 +456,7 @@ fn render_grouped_help() -> String {
     let mut out = String::new();
     writeln!(
         out,
-        "pallama {} — llama.cpp orchestration: ollama-grade UX, zero engine fork",
+        "pallama {} — llama.cpp orchestration: pallama-grade UX, zero engine fork",
         env!("CARGO_PKG_VERSION")
     )
     .unwrap();

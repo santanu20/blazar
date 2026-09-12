@@ -41,6 +41,12 @@ tracked here.
   explicitly; `engine_asset` overrides still win over the overlay.
 
 ### Changed
+- **Help branding de-ollama'd**: top-level about, help footer, and the
+  four refused-command descriptions (`signin`/`login`/`signout`/
+  `logout`) now say "pallama" instead of "ollama.com"/"ollama-grade".
+  Factual wire-compat references (the ollama API dialect the gateway
+  speaks, `OLLAMA_HOST`, port-11434 hint) intentionally keep the name.
+
 - **Golden harness**: all three `--help` consumers (commands registry
   check, gates manifest cross-check, goldens capture) now share one
   parser, `_help_command_names()`, which understands the grouped help
