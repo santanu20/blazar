@@ -224,6 +224,62 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         ctx_pinned,
         &mut warnings,
     );
+    // --- 2a-bis. effective --cache-ram budget, computed ONCE: the
+    // adaptive clamp (A16) may pull it below the model's own weights,
+    // which under --kv-unified is unsatisfiable (weights live in the
+    // budget). The upstream live fitter then CPU-splits layers to honor
+    // the nonsense budget — live-measured on a 9B/8 GiB-VRAM/13.6 GiB
+    // box: --cache-ram 4102 < weights 5417 decoded at 15.6 t/s while
+    // a budget covering the weights decoded at 39.9 t/s, same argv
+    // otherwise. Floor the budget at weights + KV working-set floor +
+    // headroom when unified is on and the box's RAM can actually host
+    // it (60% sanity guard); otherwise keep the clamp and escalate.
+    let cache_ram_budget: Option<u64> = if config.cache_ram_mb > 0 {
+        let requested = u64::try_from(config.cache_ram_mb).unwrap_or(u64::MAX);
+        let clamped = effective_cache_ram_mib(input).map_or(requested, |cap| requested.min(cap));
+        if clamped < requested {
+            warnings.push(format!(
+                "cache_ram_mb {} clamped to {} ({}% of {} MiB RAM, hit-rate {}); override via model_overrides extra_args --cache-ram or set 0 = unlimited",
+                config.cache_ram_mb,
+                clamped,
+                cache_ram_pct(input.cache_hit_rate),
+                input.hardware.total_ram_mib,
+                input
+                    .cache_hit_rate
+                    .map_or_else(|| "n/a".to_string(), |h| format!("{h:.2}"))
+            ));
+        }
+        if kv_unified_emitted(input) && input.model_bytes > 0 {
+            let weights_mib = input.model_bytes / (1024 * 1024);
+            let floor_mib = weights_mib
+                .saturating_add(KV_UNIFIED_VRAM_FLOOR_BYTES / (1024 * 1024))
+                .saturating_add(64);
+            let ram_guard = input.hardware.total_ram_mib * 60 / 100;
+            if clamped < floor_mib && floor_mib <= ram_guard {
+                warnings.push(format!(
+                    "cache-ram budget {clamped} MiB < weights {weights_mib} MiB under \
+                     --kv-unified (the budget must hold weights + KV) — floored to \
+                     {floor_mib} MiB; a sub-weights budget makes the engine fitter \
+                     CPU-split layers (measured 15.6 vs 39.9 t/s on a 9B)"
+                ));
+                Some(floor_mib)
+            } else if clamped < floor_mib {
+                warnings.push(format!(
+                    "cache-ram budget {clamped} MiB cannot cover weights {weights_mib} MiB \
+                     under --kv-unified and the {floor_mib} MiB floor exceeds the 60% RAM \
+                     guard ({ram_guard} MiB) — set kv_unified = false, quant down \
+                     (pallama fit), or raise the budget; the fitter may CPU-split layers"
+                ));
+                Some(clamped)
+            } else {
+                Some(clamped)
+            }
+        } else {
+            Some(clamped)
+        }
+    } else {
+        None
+    };
     // --- 2b. unified-KV pool must fit the --cache-ram budget.
     // With `--kv-unified` the WHOLE KV pool plus the weights mmap live
     // inside the `--cache-ram` SYSTEM-RAM budget, so a ctx the VRAM
@@ -236,9 +292,10 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     if kv_unified_emitted(input) {
         if let Some(kv) = kv_f16_bytes(input, rs.total_ctx).filter(|kv| *kv > 0) {
             // Budget the spawn will actually run under: the rule-12
-            // emitted share, else upstream's own default when the knob
-            // is off (flag absent, pool still bounded by it).
-            let budget_mib = effective_cache_ram_mib(input).unwrap_or(8192);
+            // emitted share (weights-floored in 2a-bis), else upstream's
+            // own default when the knob is off (flag absent, pool still
+            // bounded by it).
+            let budget_mib = cache_ram_budget.unwrap_or(8192);
             // Compute buffers share the budget too; hold a headroom slice.
             let usable = budget_mib * 1024 * 1024 * 85 / 100;
             let demand = input.model_bytes.saturating_add(kv);
@@ -1033,34 +1090,13 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
 
     // --- 12. prompt-cache budget + vision projector
     if config.cache_ram_mb > 0 {
-        // The prompt cache shares physical RAM with everything else on the
-        // machine; the upstream-style 8 GiB default starves small-RAM boxes
-        // into swap death. Cap at an adaptive share of physical RAM
-        // (A16: prefix-heavy traffic earns 40%, cache-cold releases to
-        // 20%, static 30%; measured live: 13 GiB box + 8192 budget ->
-        // 8.3 GiB child RSS plateau, system-wide thrash).
-        // Escape hatches: cache_ram_mb = 0 (unlimited), or a per-model
-        // `extra_args = ["--cache-ram", "<MiB>"]` override (appended
-        // later, last flag wins upstream).
-        let budget = match effective_cache_ram_mib(input) {
-            None => config.cache_ram_mb,
-            Some(cap) => match u64::try_from(config.cache_ram_mb) {
-                Ok(requested) if requested > cap => {
-                    warnings.push(format!(
-                        "cache_ram_mb {} clamped to {} ({}% of {} MiB RAM, hit-rate {}); override via model_overrides extra_args --cache-ram or set 0 = unlimited",
-                        config.cache_ram_mb,
-                        cap,
-                        cache_ram_pct(input.cache_hit_rate),
-                        input.hardware.total_ram_mib,
-                        input
-                            .cache_hit_rate
-                            .map_or_else(|| "n/a".to_string(), |h| format!("{h:.2}"))
-                    ));
-                    i64::try_from(cap).unwrap_or(i64::MAX)
-                }
-                _ => config.cache_ram_mb,
-            },
-        };
+        // 2a-bis computed the effective budget (adaptive clamp +
+        // unified weights floor) once, with its warnings; emit it here.
+        let budget = i64::try_from(
+            cache_ram_budget
+                .unwrap_or_else(|| u64::try_from(config.cache_ram_mb).unwrap_or(u64::MAX)),
+        )
+        .unwrap_or(i64::MAX);
         argv.push("--cache-ram".into());
         argv.push(budget.to_string());
     }
@@ -2391,6 +2427,34 @@ fn capacity_bytes(hw: &Hardware) -> u64 {
     }
 }
 
+/// True when the speculative draft will actually ride this spawn:
+/// path known, file present, and the picked card fits dense + draft +
+/// KV floor + spawn overhead. Rule 4's gpu-layers unpin and rule 7's
+/// capacity gate must AGREE — a declined draft (running dense) must not
+/// needlessly hand gpu-layers to the live fitter (live-repro'd: 9B with
+/// an MTP pair too big for the card ran dense but unpinned).
+fn spec_draft_will_attach(input: &ProfileInput<'_>) -> bool {
+    let Some(draft) = input.draft_path else {
+        return false;
+    };
+    let draft_bytes = std::fs::metadata(draft).map_or(0, |m| m.len());
+    if draft_bytes == 0 {
+        return false;
+    }
+    let card_free_bytes: u64 = input
+        .hardware
+        .gpus
+        .iter()
+        .map(|g| g.free_mib.saturating_mul(1024 * 1024))
+        .sum();
+    input
+        .model_bytes
+        .saturating_add(draft_bytes)
+        .saturating_add(KV_UNIFIED_VRAM_FLOOR_BYTES)
+        .saturating_add(UNIFIED_SPAWN_OVERHEAD_BYTES)
+        <= card_free_bytes
+}
+
 fn resolve_gpu_offload(
     input: &ProfileInput<'_>,
     ctx: u32,
@@ -2430,7 +2494,7 @@ fn resolve_gpu_offload(
             .saturating_add(KV_UNIFIED_VRAM_FLOOR_BYTES)
             .saturating_add(UNIFIED_SPAWN_OVERHEAD_BYTES);
         if projected <= vram_bytes {
-            if input.draft_path.is_some() {
+            if spec_draft_will_attach(input) {
                 // Speculative draft weights + its KV allocate DEVICE-side
                 // and are charged by no planner here; a hard pin would
                 // also disable the engine's live fitter ("n_gpu_layers
@@ -2462,7 +2526,7 @@ fn resolve_gpu_offload(
         return ("auto", "auto");
     }
     if resident.saturating_add(kv) <= vram_bytes / 100 * 85 {
-        if input.draft_path.is_some() {
+        if spec_draft_will_attach(input) {
             warnings.push(
                 "speculative draft adds device-side weights+KV beyond the planner charge; \
                  --gpu-layers left to the engine live fitter (common_fit_params)"
@@ -2587,6 +2651,8 @@ fn push_spec_args(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings: &m
                     .saturating_add(draft_bytes)
                     .saturating_add(KV_UNIFIED_VRAM_FLOOR_BYTES)
                     .saturating_add(UNIFIED_SPAWN_OVERHEAD_BYTES);
+                // Same predicate rule 4 consults (spec_draft_will_attach)
+                // — keep the local math only for the warning numbers.
                 if draft_bytes == 0 || needed > card_free_bytes {
                     warnings.push(format!(
                         "spec=auto: draft {} ({} MiB) does not fit the picked card \
@@ -3656,6 +3722,11 @@ mod tests {
     fn unit__cache_ram_clamped_to_30pct_of_ram_on_small_boxes() {
         // Live case: 13 GiB laptop, default 8192 -> cap 4007 (30% of 13359).
         // Unclamped, the child RSS plateaus at 8.3 GiB and the box swap-thrashes.
+        // Under default --kv-unified the 5000 MiB weights ALSO live in the
+        // budget, so the 2a-bis floor lifts 4007 -> 5576 (weights + KV
+        // floor + headroom; 42% of RAM, inside the 60% guard): a
+        // sub-weights budget makes the engine fitter CPU-split layers
+        // (measured 15.6 vs 39.9 t/s on a 9B).
         let cfg = Config::default();
         let hw = gpu_hw(12_000, 13_359, 8);
         let g = meta();
@@ -3667,11 +3738,12 @@ mod tests {
         assert!(p
             .argv
             .windows(2)
-            .any(|w| w[0] == "--cache-ram" && w[1] == "4007"));
+            .any(|w| w[0] == "--cache-ram" && w[1] == "5576"));
         assert!(p
             .warnings
             .iter()
             .any(|w| w.contains("cache_ram_mb 8192 clamped to 4007")));
+        assert!(p.warnings.iter().any(|w| w.contains("floored to 5576 MiB")));
     }
 
     #[test]
@@ -6680,21 +6752,25 @@ mod tests {
             .argv
             .windows(2)
             .any(|w| w[0] == "--cache-ram" && w[1] == "6553"));
-        // Cold: 20% cap = 3276.
+        // Cold: 20% cap = 3276, but the 2a-bis unified weights floor
+        // (5000 MiB weights + 512 + 64) lifts every below-floor cap to
+        // 5576 — a sub-weights budget CPU-splits layers at the fitter.
         let mut inp = input(&g, &hw, &cfg, &WIRE_FLAGS);
         inp.cache_hit_rate = Some(0.01);
         let p2 = compile(&inp, &TuningOverrides::default()).unwrap();
         assert!(p2
             .argv
             .windows(2)
-            .any(|w| w[0] == "--cache-ram" && w[1] == "3276"));
-        // None: static 30% = 4915.
+            .any(|w| w[0] == "--cache-ram" && w[1] == "5576"));
+        // The tier itself stays visible in the clamp warning.
+        assert!(p2.warnings.iter().any(|w| w.contains("clamped to 3276")));
+        // None: static 30% = 4915 — also below the floor.
         let inp = input(&g, &hw, &cfg, &WIRE_FLAGS);
         let p3 = compile(&inp, &TuningOverrides::default()).unwrap();
         assert!(p3
             .argv
             .windows(2)
-            .any(|w| w[0] == "--cache-ram" && w[1] == "4915"));
+            .any(|w| w[0] == "--cache-ram" && w[1] == "5576"));
     }
 
     #[test]
