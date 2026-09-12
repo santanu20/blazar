@@ -144,7 +144,11 @@ enum Cmd {
     /// with an inline PROMPT: single-shot generation, prints and exits
     Run {
         model: String,
-        #[arg(trailing_var_arg = true)]
+        /// Prompt words (joined); flags go BEFORE the prompt — a leading
+        /// `-` word needs quoting or `--` (`trailing_var_arg` would
+        /// swallow `--max-tokens`/`--verbose` INTO the prompt, which
+        /// live-repro'd: every completion echoed the flag text and
+        /// neither flag ever parsed).
         prompt: Vec<String>,
         /// Print eval counts (tokens, t/s) after generation
         #[arg(long, short = 'v')]

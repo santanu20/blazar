@@ -84,6 +84,13 @@ tracked here.
   explicitly; `engine_asset` overrides still win over the overlay.
 
 ### Fixed
+- **`run` parses its flags instead of swallowing them into the
+  prompt**: `trailing_var_arg` made `pallama run m 'Say ok'
+  --max-tokens 5 --verbose` send the flag TEXT to the model and
+  never parse either flag (live-repro'd: every completion echoed
+  "--max-tokens 5"; `--verbose` stats silently absent from the
+  wave-6 TTFT notes). Flags now parse normally before the prompt; a
+  leading `-` word needs quoting or `--`.
 - **Circuit breaker counts crash restarts, not churn**:
   `record_restart` fired on every successful spawn, so a user
   stop→run churn ×4 inside the 60 s window opened the breaker on the
