@@ -85,6 +85,20 @@ tracked here.
 
 ### Fixed
 
+- **Evict teardown no longer pins a std lock across awaits**: the
+  evicting mark is a `tokio::sync::Mutex` with an explicit async
+  release (every exit path clears it; a leaked mark starved every
+  future spawn of that name — the `/api/evict`-timeout wedge class
+  observed once live). Concurrent `stop`+`run` churn on a 9B is
+  clean 6/6 (was 3/6 with spawn failures).
+- **mlock auto-policy charges resident siblings**: the 40%-of-RAM
+  gate now counts other live instances' weights, so a churn
+  replacement racing its dying predecessor's pinned pages degrades
+  to plain mmap instead of double-pinning (2 × 5.4 GiB mlock on
+  13.6 GiB RAM live-repro'd as spawn failures).
+- **Bench warm cells assert GPU idle**: `gpu_busy_mib` recorded in
+  cells.jsonl; contaminated runs self-label instead of silently
+  halving both sides' decode numbers.
 - **Sub-weights `--cache-ram` budget no longer CPU-splits the model**:
   the unified-KV budget floor now derives from rule 2b's own
   constraint at the ctx floor (weights + f16 KV + 64 MiB, over the
