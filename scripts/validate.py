@@ -3,7 +3,7 @@
 
 The Step-11 "god tier" validator as a permanent script: boots an ISOLATED
 pallama daemon (temp XDG dirs, copied store DB, symlinked real engine +
-model files, own port 11499) and walks every config knob, API route, CLI
+model files, own random-free port) and walks every config knob, API route, CLI
 command, sentinel surface, and lifecycle behavior with real inference —
 printing evidence for every check.
 
@@ -37,6 +37,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import socket
 import ssl
 import sqlite3
 import subprocess
@@ -49,7 +50,18 @@ import time
 import tomllib
 import urllib.error
 
-PORT = int(os.environ.get("PALLAMA_VALIDATE_PORT", "11499"))
+
+def _free_port() -> int:
+    """Kernel-assigned ephemeral TCP port (probe-reserve-release)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+# Default to a random free port so two concurrent validate campaigns can
+# never collide on the main listener (live 2026-09-10 cross-run 502s);
+# PALLAMA_VALIDATE_PORT still pins an explicit port when set.
+PORT = int(os.environ.get("PALLAMA_VALIDATE_PORT") or _free_port())
 # Fast default: the 0.5B keeps every lane quick; PALLAMA_VALIDATE_MODEL
 # overrides (e.g. release-grade runs pinning the 9B).
 MODEL = os.environ.get("PALLAMA_VALIDATE_MODEL", "qwen2.5-0.5b-instruct")
@@ -120,8 +132,8 @@ def cov(knob: str, expectation: str, evidence: str, ok: bool = True) -> None:
 # (bidirectional set comparisons), so drift is impossible to miss.
 #
 # Field inventories verified against crates/pallama-core/src/config.rs:
-#   Config          139 fields (13 Option, 4 containers: keys/remotes/engine_env/model_overrides)
-#   ModelOverride    23 fields (all Option)
+#   Config          145 fields (19 Option, 4 containers: keys/remotes/engine_env/model_overrides)
+#   ModelOverride    25 fields (all Option)
 #   SamplerDefaults  18 fields (all Option, skip_serializing_if none)
 #   ApiKey            7 fields    Remote  3 fields
 # Command set verified against `pallama --help` (38 subcommands + help).
@@ -992,7 +1004,7 @@ TOPLEVEL_COMMANDS = sorted(
 )
 
 # ---------------------------------------------------------------------------
-# TOPLEVEL_KNOBS manifest: all 134 Config fields.
+# TOPLEVEL_KNOBS manifest: all 145 Config fields.
 # option=True  -> Option<T>, absent from fresh `config list` until set
 # container=True -> keys / remotes / engine_env / model_overrides section
 # tier  -> evidence class (see module docstring); group -> knobs_argv batch
@@ -1006,7 +1018,7 @@ _K = [
         False,
         "behavior",
         None,
-        "binds 127.0.0.1:11499 (every daemon phase)",
+        "binds 127.0.0.1:<port> (every daemon phase; random-free unless PALLAMA_VALIDATE_PORT pins one)",
     ),
     (
         "port",
@@ -1014,7 +1026,7 @@ _K = [
         False,
         "behavior",
         None,
-        "binds 127.0.0.1:11499 (every daemon phase)",
+        "binds 127.0.0.1:<port> (every daemon phase; random-free unless PALLAMA_VALIDATE_PORT pins one)",
     ),
     ("default_ctx", False, False, "existing", None, "phase_config A: --ctx-size 8192"),
     ("idle_sleep_secs", False, False, "argv", "G1", "--sleep-idle-seconds 77"),
@@ -1183,6 +1195,7 @@ _K = [
     ),
     ("ctx_extend", False, False, "existing", None, "phase_config B: yarn/rope flags"),
     ("cpu_moe_n", False, False, "argv", "G1", "--n-cpu-moe 2"),
+    ("cpu_ffn_n", False, False, "argv", "G1", "--n-cpu-ffn 2"),
     (
         "override_tensor",
         False,
@@ -1445,7 +1458,7 @@ _K = [
         "missing-file refusal (wave) + echo + boot",
     ),
     ("predictive_preload", False, False, "existing", None, "phase_wave preload lane"),
-    ("adaptive_slots", True, False, "roundtrip", None, "echo + boot"),
+    ("adaptive_slots", False, False, "roundtrip", None, "echo + boot"),
     (
         "lazy_mode",
         False,
@@ -1604,7 +1617,7 @@ CONTAINER_KNOBS = [k["name"] for k in TOPLEVEL_KNOBS if k["container"]]
 FRESH_VISIBLE_KNOBS = [k["name"] for k in TOPLEVEL_KNOBS if not k["option"]]
 
 # ---------------------------------------------------------------------------
-# MODEL_OVERRIDE manifest: all 23 ModelOverride fields + 18 SamplerDefaults
+# MODEL_OVERRIDE manifest: all 25 ModelOverride fields + 18 SamplerDefaults
 # leaves. Evidence = overlay round-trip (gate d) + argv/wave lanes noted.
 # ---------------------------------------------------------------------------
 
@@ -1622,6 +1635,7 @@ MODEL_OVERRIDE_FIELDS = [
     ("kv_unified", "roundtrip echo"),
     ("ctx_extend", "argv: rope flags"),
     ("cpu_moe_n", "argv: --n-cpu-moe"),
+    ("cpu_ffn_n", "argv: --n-cpu-ffn"),
     ("override_tensor", "argv: --override-tensor"),
     ("devices", "argv: --device (phase_config A2)"),
     ("warmup", "argv: false -> --no-warmup"),
@@ -1709,6 +1723,7 @@ def argv_groups():
             ("poll", 77, "--poll 77"),
             ("slot_prompt_similarity", 0.6, "--slot-prompt-similarity 0.6"),
             ("cpu_moe_n", 2, "--n-cpu-moe 2"),
+            ("cpu_ffn_n", 2, "--n-cpu-ffn 2"),
             ("override_tensor", [".ffn_.*_exps.=CPU"], "--override-tensor"),
             ("agent", True, "--agent"),
             ("kv_unified_per_slot", 4096, "--kv-unified-per-slot 4096"),
@@ -1848,6 +1863,53 @@ def total_mem_mib() -> int:
     return 0
 
 
+def _gpu_free_mib() -> int:
+    """Free VRAM across GPUs (MiB); 0 when NVIDIA tooling is absent."""
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if out.returncode == 0:
+            return max(int(x) for x in out.stdout.split())
+    except Exception:
+        pass
+    return 0
+
+
+def _gpu_headroom_mib() -> int | None:
+    """Free VRAM (MiB); None on CPU-only boxes (no nvidia tooling)."""
+    if shutil.which("nvidia-smi") is None:
+        return None
+    return _gpu_free_mib()
+
+
+def _gpu_compute_holders() -> list[str]:
+    """One human line per process holding GPU memory right now."""
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid,process_name,used_memory",
+                "--format=csv,noheader",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if out.returncode == 0:
+            return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+    except Exception:
+        pass
+    return []
+
+
 # ---------------------------------------------------------------- sandbox
 
 
@@ -1935,6 +1997,11 @@ class Sandbox:
                 # Top-level container struct (e.g. [semantic_cache]):
                 # render as a TOML table section, never a quoted string.
                 tables.append((k, v))
+            elif v is None:
+                # Deliberately-omitted knob (XOR partner / pairing-gated):
+                # present in the manifest dict for the (c0) membership
+                # gate, absent from the serialized boot config.
+                continue
             elif isinstance(v, bool):
                 lines.append(f"{k} = {'true' if v else 'false'}")
             elif isinstance(v, (int, float)):
@@ -2181,10 +2248,11 @@ class Daemon:
 
     def _find_marker_orphans(self) -> list[int]:
         """Harness-marked pallama daemons from DEAD runs (parent exited,
-        process reparented) or leaked by THIS process earlier — the
-        random-port leak class the port orphan check cannot see. A live
-        parent that is not us means a concurrent validate run: leave it
-        strictly alone."""
+        process reparented to init) — the random-port leak class the port
+        orphan check cannot see. Live-parented marker daemons are NEVER
+        touched: our own deliberate spawns (Daemon instances, battery-F
+        edge daemons) are direct children of this process, and a live
+        non-us parent = concurrent validate run, left strictly alone."""
         out: list[int] = []
         me = os.getpid()
         for pid_dir in Path("/proc").iterdir():
@@ -2206,9 +2274,16 @@ class Daemon:
                     if line.startswith("PPid:"):
                         ppid = int(line.split()[1])
                         break
-                if ppid == me:
-                    out.append(pid)  # our own earlier leak
-                elif ppid <= 1 or not os.path.exists(f"/proc/{ppid}"):
+                # Live-parented marker daemons are NEVER orphans: our own
+                # deliberate spawns (Daemon instances + battery-F edge
+                # daemons) are direct children of THIS process, and a
+                # concurrent run's daemons are children of ITS python.
+                # Reaping live children killed battery-F edge daemons at
+                # the next d.start() -> instant-refused 502 trio (live
+                # 2026-09-11: pids 3120088/3120129 TERM-ignored-SIGKILLed).
+                # Only reparented (ppid<=1) or dead-parent processes are
+                # orphans of DEAD runs — the 2026-09-09 leak class.
+                if ppid <= 1 or not os.path.exists(f"/proc/{ppid}"):
                     out.append(pid)  # reparented orphan of a dead run
             except OSError:
                 continue
@@ -2296,6 +2371,48 @@ class Daemon:
                 return f.read()[-4000:].decode(errors="replace")
         except Exception:
             return "<no log>"
+
+
+def _reap_orphan_validate_engines() -> None:
+    """Kill engine children this harness stranded: llama-server cmdline,
+    PALLAMA_VALIDATE=1 in their environ, and NOT parented by a live
+    pallama daemon (a validate engine's only legitimate parent). Reparent
+    targets include subreapers — init, a dead parent, or a shell wrapper
+    all mean the owning daemon is gone; /api/evict owns live-daemon
+    children, and a concurrent run's engines stay safe because their
+    daemon parent matches."""
+    pids: list[int] = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\x00", b" ").decode("utf-8", "replace")
+            if "llama-server" not in cmd:
+                continue
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                env = f.read().replace(b"\x00", b"\n").decode("utf-8", "replace")
+            if "PALLAMA_VALIDATE=1" not in env:
+                continue
+            ppid = 0
+            with open(f"/proc/{pid}/status") as f:
+                for line in f:
+                    if line.startswith("PPid:"):
+                        ppid = int(line.split()[1])
+                        break
+            parent_cmd = ""
+            if os.path.exists(f"/proc/{ppid}"):
+                with open(f"/proc/{ppid}/cmdline", "rb") as f:
+                    parent_cmd = (
+                        f.read().replace(b"\x00", b" ").decode("utf-8", "replace")
+                    )
+            if ppid <= 1 or "pallama" not in parent_cmd:
+                pids.append(pid)
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+    if pids:
+        Daemon._reap_pids(sorted(pids), "orphan engine")
 
 
 # ------------------------------------------------------------------- http
@@ -2511,6 +2628,18 @@ def daemon_log_contains(needle: str) -> bool:
         return False
 
 
+def daemon_vram_mib() -> int:
+    """Total VRAM (MiB) from the daemon hardware banner; 0 when absent."""
+    try:
+        with open(DAEMON.log_path, "rb") as f:
+            m = re.search(rb"hardware: .*?, (\d+) MiB VRAM", f.read())
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return 0
+
+
 def http_multipart(
     path: str,
     fields: dict,
@@ -2624,6 +2753,23 @@ def cli(
     if check_exit and p.returncode != 0:
         print(f"    cli stderr: {p.stderr.strip()[:400]}")
     return p
+
+
+def _help_command_names(help_stdout: str) -> list[str]:
+    """Command names advertised by the grouped top-level help.
+
+    Every command line is two-space indented starting with a lowercase
+    name (aliases live in parens after the name, e.g. `serve (start)`);
+    Options lines start with '-'; headings and the footer are not
+    indented. Single parser shared by the commands registry check, the
+    gates manifest cross-check and the goldens capture — keep in sync
+    with `render_grouped_help()` in crates/pallama-cli/src/main.rs.
+    """
+    return [
+        ln.strip().split()[0]
+        for ln in help_stdout.splitlines()
+        if re.match(r"^  [a-z]", ln)
+    ]
 
 
 # ----------------------------------------------------------------- phases
@@ -2744,6 +2890,7 @@ def phase_config() -> None:
             "reasoning_format": "deepseek",
             "slot_prompt_similarity": 0.5,
             "cpu_moe_n": 2,
+            "cpu_ffn_n": 1,
             "override_tensor": [".ffn_.*_exps.=CPU"],
         }
     )
@@ -2762,10 +2909,13 @@ def phase_config() -> None:
 
     row = wait_loaded()
     ctx_now = row_ctx(row or {}) if row else None
+    # ps ctx = PER-SLOT ctx by design (profile.rs: --ctx-size is the total,
+    # upstream divides it across -np slots; Profile.ctx/ps report what ONE
+    # slot holds) — slots:2 + default_ctx 8192 => argv total 8192, ps 4096.
     check(
         "config",
-        "default_ctx 8192 -> child --ctx-size + ps ctx",
-        has("--ctx-size", "8192") and str(ctx_now) == "8192",
+        "default_ctx 8192 + slots 2 -> --ctx-size 8192 total, ps per-slot ctx 4096",
+        has("--ctx-size", "8192") and str(ctx_now) == "4096",
         f"argv --ctx-size={'8192' if has('--ctx-size', '8192') else 'MISSING'} ps ctx={ctx_now}",
     )
     cov("default_ctx", "--ctx-size 8192 in argv; ps ctx 8192", f"ps ctx={ctx_now}")
@@ -3647,67 +3797,112 @@ def phase_api() -> None:
         if BIG == MODEL or not any(BIG.split(":")[0] in n for n in _names_t):
             print(f"  (skip vision chat lane: no distinct vision model {BIG})")
         else:
-            st, _, v = http_json(
-                "POST",
-                "/v1/chat/completions",
-                {
-                    "model": BIG,
-                    "stream": False,
-                    "max_tokens": 128,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": "Describe this image in one short sentence.",
-                                },
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": "data:image/png;base64,"
-                                        + _tiny_png_b64()
+            # Honest env gate: BIG is a full 9B-class load; a co-resident
+            # engine (e.g. ollama) squeezing VRAM/RAM makes pallama's
+            # spawn guard refuse pre-spawn (a 500 in ~100ms, by design).
+            # Mirror the guard: free VRAM + MemAvailable vs BIG's bytes.
+            # R2-28: clear OUR OWN residue first — earlier phases leave
+            # live children (idle-sleep not yet fired) or crash-battery
+            # orphans; only boundary on what an external holder keeps.
+            def _vision_env_ok() -> tuple[bool, int]:
+                free = _gpu_free_mib()
+                ok = (free == 0 or free >= big_bytes_mib) and (
+                    mem_available_mib() >= big_bytes_mib
+                )
+                return ok, free
+
+            big_bytes_mib = model_bytes_mib(BIG)
+            vision_ok_env, free_vram_mib = _vision_env_ok()
+            if not vision_ok_env:
+                for _m in sorted({MODEL, BIG}):
+                    try:
+                        http_json("POST", "/api/evict", {"model": _m})
+                    except Exception:
+                        pass
+                _reap_orphan_validate_engines()
+                time.sleep(3)
+                vision_ok_env, free_vram_mib = _vision_env_ok()
+            if not vision_ok_env:
+                holders = _gpu_compute_holders()
+                boundary(
+                    "api",
+                    "vision chat battery (memory ceiling)",
+                    f"free VRAM {free_vram_mib} MiB / MemAvailable "
+                    f"{mem_available_mib()} MiB vs {BIG} ~{big_bytes_mib} MiB "
+                    "after evicting this harness's engines and reaping "
+                    "orphans — pallama's spawn guard refuses the load by "
+                    "design; GPU holders now: "
+                    + ("; ".join(holders) if holders else "none visible"),
+                )
+            else:
+                st, _, v = http_json(
+                    "POST",
+                    "/v1/chat/completions",
+                    {
+                        "model": BIG,
+                        "stream": False,
+                        "max_tokens": 128,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": "Describe this image in one short sentence.",
                                     },
-                                },
-                            ],
-                        }
-                    ],
-                },
-                timeout=300,
-            )
-            vtxt = ""
-            vusage = {}
-            vfinish = ""
-            vfield = ""
-            try:
-                ch = v["choices"][0]
-                # qwen3.5 thinks first: tokens land in reasoning_content until
-                # thinking completes (translate.rs maps it to anthropic
-                # `thinking`); either field proves real generation over the
-                # image tokens.
-                for fld in ("content", "reasoning_content"):
-                    val = (ch.get("message") or {}).get(fld)
-                    if val and str(val).strip():
-                        vtxt = val
-                        vfield = fld
-                        break
-                vfinish = ch.get("finish_reason") or ""
-            except Exception:
-                pass
-            try:
-                vusage = v.get("usage") or {}
-            except Exception:
-                pass
-            ctoks = vusage.get("completion_tokens")
-            check(
-                "api",
-                "vision chat: real image through mmproj yields text",
-                st == 200
-                and bool(str(vtxt).strip())
-                and isinstance(ctoks, int)
-                and ctoks > 0,
-                f"status={st} finish={vfinish} ctok={ctoks} field={vfield or 'none'} txt={str(vtxt)[:60]!r}",
-            )
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": "data:image/png;base64,"
+                                            + _tiny_png_b64()
+                                        },
+                                    },
+                                ],
+                            }
+                        ],
+                    },
+                    timeout=300,
+                )
+                vtxt = ""
+                vusage = {}
+                vfinish = ""
+                vfield = ""
+                verr = ""
+                if st != 200:
+                    # P5: the error body IS the evidence on failure —
+                    # print it (spawn-guard refusals carry named reasons).
+                    verr = v if isinstance(v, str) else json.dumps(v)[:200]
+                try:
+                    ch = v["choices"][0]
+                    # qwen3.5 thinks first: tokens land in reasoning_content until
+                    # thinking completes (translate.rs maps it to anthropic
+                    # `thinking`); either field proves real generation over the
+                    # image tokens.
+                    for fld in ("content", "reasoning_content"):
+                        val = (ch.get("message") or {}).get(fld)
+                        if val and str(val).strip():
+                            vtxt = val
+                            vfield = fld
+                            break
+                    vfinish = ch.get("finish_reason") or ""
+                except Exception:
+                    pass
+                try:
+                    vusage = v.get("usage") or {}
+                except Exception:
+                    pass
+                ctoks = vusage.get("completion_tokens")
+                check(
+                    "api",
+                    "vision chat: real image through mmproj yields text",
+                    st == 200
+                    and bool(str(vtxt).strip())
+                    and isinstance(ctoks, int)
+                    and ctoks > 0,
+                    f"status={st} finish={vfinish} ctok={ctoks} "
+                    f"field={vfield or 'none'} txt={str(vtxt)[:60]!r} "
+                    f"err={verr!r}",
+                )
 
 
 def phase_sentinel() -> None:
@@ -4072,11 +4267,13 @@ def phase_behavior() -> None:
         if pid:
             os.kill(pid, signal.SIGKILL)  # our daemon's own child
             time.sleep(2)
-            # By design: post-crash requests 502 until the corpse is reaped
-            # and the respawn serves a retry. Since the 2026-09-09 engine
-            # supervisor refactor, detection rides a periodic tick (~12s
-            # measured) instead of firing instantly on the first 502, so
-            # the retry window spans the tick + model reload (~10s).
+            # Post-crash the supervisor must (a) log the crash loudly,
+            # (b) respawn a NEW child, (c) serve a request in the window.
+            # Two legitimate shapes: the request 502s first then a retry
+            # hits the respawned child, OR admission holds it through the
+            # respawn and it lands as a single 200 (the 2026-09-11
+            # admission-await path detects+respawns in ~1.3s, faster than
+            # this probe can observe a 502). Both prove the contract.
             statuses = []
             deadline = time.time() + 60
             while time.time() < deadline:
@@ -4086,11 +4283,13 @@ def phase_behavior() -> None:
                     break
                 time.sleep(3)
             new_pid = child_pid()
+            crash_logged = daemon_log_contains("engine crashed")
             check(
                 "behavior",
-                "crashed engine: first request 502s (reap), retry respawns",
-                200 in statuses and new_pid not in (None, pid) and len(statuses) > 1,
-                f"old={pid} new={new_pid} statuses={statuses}",
+                "crashed engine: logged + respawned + request served",
+                200 in statuses and new_pid not in (None, pid) and crash_logged,
+                f"old={pid} new={new_pid} statuses={statuses} "
+                f"crash_logged={crash_logged}",
             )
     else:
         boundary("behavior", "crash respawn", "skipped in FAST mode")
@@ -4234,7 +4433,21 @@ def phase_behavior() -> None:
             for r in ps_rows()
             if str(ps_field(r, "name", "model") or "").split(":")[0] == MODEL
         ]
-        return bool(rows) and int(row_inflight(rows[0]) or 0) >= 1
+        if rows and int(row_inflight(rows[0]) or 0) >= 1:
+            return True
+        # R2-30: a streamed holder arriving while the engine respawns is HELD
+        # at the gateway — by design it does not count as ps in_flight (see
+        # the slots-queue lane), so an in_flight-only poll is blind to it and
+        # the 120s spins exhaust (sweep-9 priority / sweep-11 deadline
+        # flakes). The pallama_queue_depth gauge ("waiting requests",
+        # gateway queue) sees held requests; single-model daemon here, so the
+        # global gauge is this model's queue.
+        try:
+            _, _, raw = http("GET", "/metrics")
+        except Exception:
+            return False
+        m = re.search(rb"^pallama_queue_depth (\d+)", raw, re.M)
+        return bool(m) and int(m.group(1)) >= 1
 
     holder = threading.Thread(target=_hold_slot)
     holder.start()
@@ -4401,14 +4614,18 @@ def phase_cli() -> None:
     )
     reg("config.set", ok, "set 4096 -> get + file parse")
     p = cli("engine", "list")
-    ok = p.returncode == 0 and "b108" in p.stdout
+    cur = _active_engine_tag()
+    ok = p.returncode == 0 and (
+        (cur and cur in p.stdout)
+        or (cur is None and re.search(r"\bb\d+", p.stdout) is not None)
+    )
     check(
         "cli",
         "engine list shows the installed engine",
         ok,
         p.stdout.strip().splitlines()[-1][:120] if p.stdout else "",
     )
-    reg("engine.list", ok, "b108 tags listed")
+    reg("engine.list", ok, f"active {cur or 'any b-tag'} listed")
     p = cli("run", MODEL, "--verbose", "--max-tokens", "64", "Say: inline")
     low = p.stdout.lower()
     ok = p.returncode == 0 and ("count" in low or "tokens" in low or "duration" in low)
@@ -4629,6 +4846,26 @@ def phase_wave() -> None:
         else []
     )
     big_ok = big != small and any(big in t for t in tag_names)
+    # Capacity pre-check mirroring the supervisor's bytes admission: the
+    # reaper's maybe_preload skips when the MEASURED resident footprint
+    # plus the incoming model's admission floor (weights + projector +
+    # 512 MiB KV floor + 700 MiB spawn overhead — the same charges the
+    # unified gpu-layers pin trusts) would cross the VRAM budget.
+    # Weights-only math oversubscribed an 8 GiB card on 2026-09-11: the
+    # 9B VL model settled at 7302 MiB MEASURED (5417 weights) and the
+    # 0.5B sibling (~977 actual) crashed the pair into an NVRM
+    # NO_MEMORY storm. MiB-floored approximation (window of disagreement
+    # < 0.1%); assumes max_loaded_models = 0 (harness default).
+    vram_mib = daemon_vram_mib()
+    small_mib = model_bytes_mib(small)
+    big_mib = model_bytes_mib(big)
+    OVERHEAD_MIB = 512 + 700  # KV floor + spawn overhead, per spawn
+    pair_fits = (
+        vram_mib > 0
+        and small_mib > 0
+        and big_mib > 0
+        and (small_mib + big_mib + 2 * OVERHEAD_MIB) <= vram_mib
+    )
     if FAST:
         print(
             f"  (FAST: skipping predictive-preload battery — needs {small}+{big} loads)"
@@ -4644,6 +4881,18 @@ def phase_wave() -> None:
             "predictive_preload battery (no distinct big model)",
             f"PALLAMA_VALIDATE_BIG_MODEL={big!r} equals small or is not in the "
             "store; pull it to enable this battery",
+        )
+    elif not pair_fits:
+        boundary(
+            "wave",
+            "predictive_preload battery (VRAM capacity ceiling)",
+            f"small {small_mib} + big {big_mib} + 2x{OVERHEAD_MIB} MiB admission floors "
+            f"> vram {vram_mib} MiB: the bytes admission (measured resident + "
+            "incoming floor <= budget) gates maybe_preload on this GPU, so "
+            "small+big co-residency cannot happen (mirror of supervisor.rs "
+            "resident_bytes/admission_floor_bytes); point "
+            "PALLAMA_VALIDATE_BIG_MODEL at a smaller model to exercise "
+            "the battery",
         )
     else:
         d.start({"port": PORT, "predictive_preload": True})
@@ -5061,6 +5310,7 @@ def phase_wave() -> None:
     # FileNotFoundError here and truncate every phase after the battery.
     # Skip the rpc leg with a recorded failure and keep the harness alive
     # (the CUDA asset ships without ggml-rpc-server; see F167).
+    rargv: list[str] = []  # bound here so the cov() below survives the skip
     rpc_skip = not os.path.exists(rpc_srv_path)
     if rpc_skip:
         check(
@@ -5077,13 +5327,17 @@ def phase_wave() -> None:
             if st != 200:
                 time.sleep(2)
     else:
+        # Kernel-assigned free port — the fixed 54321 made two concurrent
+        # validate runs fight over one ggml-rpc-server (same class as the
+        # edge-port collision, 2026-09-10).
+        rpc_port = _free_port()
+        rpc_target = f"127.0.0.1:{rpc_port}"
         rpc_proc = subprocess.Popen(
-            [rpc_srv_path, "--host", "127.0.0.1", "--port", "54321"],
+            [rpc_srv_path, "--host", "127.0.0.1", "--port", str(rpc_port)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
         )
-        import socket
 
         rpc_up = False
         t0 = time.time()
@@ -5091,7 +5345,7 @@ def phase_wave() -> None:
             s = socket.socket()
             s.settimeout(1)
             try:
-                s.connect(("127.0.0.1", 54321))
+                s.connect(("127.0.0.1", rpc_port))
                 rpc_up = True
             except OSError:
                 time.sleep(0.5)
@@ -5100,12 +5354,12 @@ def phase_wave() -> None:
             if rpc_up:
                 break
         if not rpc_up:
-            raise RuntimeError("ggml-rpc-server did not accept on 127.0.0.1:54321")
+            raise RuntimeError(f"ggml-rpc-server did not accept on {rpc_target}")
         try:
             d.start(
                 {
                     "port": PORT,
-                    "model_overrides": {f_small: {"rpc_servers": "127.0.0.1:54321"}},
+                    "model_overrides": {f_small: {"rpc_servers": rpc_target}},
                 },
                 floor_model=f_small,
             )
@@ -5119,10 +5373,10 @@ def phase_wave() -> None:
             rargv = child_argv(rpid) if rpid else []
             check(
                 "wave",
-                "model_overrides.rpc_servers -> child --rpc 127.0.0.1:54321",
+                f"model_overrides.rpc_servers -> child --rpc {rpc_target}",
                 st == 200
                 and any(
-                    rargv[i] == "--rpc" and rargv[i + 1] == "127.0.0.1:54321"
+                    rargv[i] == "--rpc" and rargv[i + 1] == rpc_target
                     for i in range(len(rargv) - 1)
                 ),
                 f"load_st={st} pid={rpid} rpc={[a for a in rargv if a == '--rpc']}",
@@ -5206,7 +5460,7 @@ def phase_wave() -> None:
         "per-model --rpc emission",
         "phase 8 battery F argv",
         any(
-            rargv[i] == "--rpc" and rargv[i + 1] == "127.0.0.1:54321"
+            rargv[i] == "--rpc" and rargv[i + 1] == rpc_target
             for i in range(len(rargv) - 1)
         ),
     )
@@ -5214,10 +5468,13 @@ def phase_wave() -> None:
 
     # F-remotes: two REAL secondary daemons as one "far" pool; prefix
     # stickiness binds a conversation to one backend and says so in the
-    # x-pallama-remote response header.
-    edge_ports = (11500, 11501)
+    # x-pallama-remote response header. Edge ports are kernel-assigned
+    # free ports — the fixed 115xx defaults made two concurrent validate
+    # runs bind each other's backends and 502 mid-battery (2026-09-10).
+    edge_ports = (_free_port(), _free_port())
     edge_sbs: list[Sandbox] = []
     edge_procs: list[subprocess.Popen] = []
+    remote_ok = False
     try:
         for ep in edge_ports:
             esb = Sandbox()
@@ -5282,8 +5539,8 @@ def phase_wave() -> None:
             "remote pool: forward through real 2nd-level daemon + header",
             st_r1 == 200
             and hop1 is not None
-            and hop1.startswith("far|http://127.0.0.1:115"),
-            f"status={st_r1} header={hop1}",
+            and any(hop1 == f"far|http://127.0.0.1:{ep}" for ep in edge_ports),
+            f"status={st_r1} header={hop1} edge_ports={edge_ports}",
         )
         check(
             "wave",
@@ -5303,8 +5560,21 @@ def phase_wave() -> None:
             "phase 8 battery F",
             st_r1 == 200 and hop2 == hop1,
         )
+        remote_ok = st_r1 == 200 and st_r2 == 200 and st_r3 == 200
     finally:
         d.stop()
+        # Autopsy aid: on failure the edge daemon logs are the ONLY
+        # evidence of a 2nd-level crash — surface their tails before the
+        # sandboxes (and logs) are destroyed.
+        if not remote_ok:
+            for esb in edge_sbs:
+                lp = os.path.join(esb.data_dir, "run", "daemon.log")
+                try:
+                    with open(lp, "rb") as f:
+                        tail = f.read()[-2000:].decode(errors="replace")
+                    print(f"  (edge daemon log tail {lp}):\n{tail}")
+                except OSError:
+                    pass
         for eproc in edge_procs:
             if eproc.poll() is None:
                 eproc.terminate()
@@ -5738,10 +6008,13 @@ def _active_engine_tag() -> str | None:
 def _full_engine_tags() -> list[str]:
     """Real b-numbered engine tags carrying both llama-server and llama-quantize.
 
-    The real store is user-mutable (updates prune old tags, `engine local`
-    registers non-b tags), so tests must never hardcode engine tags.
-    Disk dirs WITHOUT a store row are orphaned install debris — `engine use`
-    refuses them ("Query returned no rows") — so intersect with the table.
+    Covers plain upstream tags (bNNNN) AND CUDA overlay/source tags
+    (bNNNN-cuda) — `engine use`/`rollback` switch between them the same
+    way, so the gate must count both. The real store is user-mutable
+    (updates prune old tags, `engine local` registers non-b tags), so
+    tests must never hardcode engine tags. Disk dirs WITHOUT a store row
+    are orphaned install debris — `engine use` refuses them ("Query
+    returned no rows") — so intersect with the table.
     """
     try:
         db = sqlite3.connect(os.path.join(REAL_DATA, "pallama.db"))
@@ -5754,7 +6027,7 @@ def _full_engine_tags() -> list[str]:
     if os.path.isdir(eng_root):
         for name in os.listdir(eng_root):
             if (
-                re.fullmatch(r"b\d+", name)
+                re.fullmatch(r"b\d+(?:-cuda)?", name)
                 and (rows is None or name in rows)
                 and all(
                     os.path.isfile(os.path.join(eng_root, name, f"llama-{name}", tool))
@@ -5762,7 +6035,7 @@ def _full_engine_tags() -> list[str]:
                 )
             ):
                 tags.append(name)
-    return sorted(tags, key=lambda t: int(t[1:]), reverse=True)
+    return sorted(tags, key=lambda t: int(t[1:].split("-")[0]), reverse=True)
 
 
 def _stat_nice(pid: int) -> int:
@@ -5805,7 +6078,13 @@ def phase_commands() -> None:
 
     # -- A: light store/inspect commands --------------------------------
     p = cli("--help")
-    reg("help", p.returncode == 0 and "Commands:" in p.stdout, "rc0 + Commands: block")
+    reg(
+        "help",
+        p.returncode == 0
+        and "Usage: pallama <COMMAND>" in p.stdout
+        and bool(_help_command_names(p.stdout)),
+        "rc0 + usage line + grouped command listing",
+    )
 
     p = cli("list")
     reg(
@@ -6190,9 +6469,29 @@ def phase_commands() -> None:
     # -- heavy lanes below run daemonless --------------------------------
     d.stop()
 
-    heavy_ok = disk_free_gb() > 8.0
+    # R2-29: bench/tune spawn llama-bench directly. Crash-battery engines
+    # orphaned by hard teardown can still hold VRAM and starve CUDA init
+    # (sweep-10: every lane died exit 1 under residue while the identical
+    # invocation passed post-run on a free GPU). Clear own residue first;
+    # boundary honestly if an external holder remains.
+    _reap_orphan_validate_engines()
+    gpu_mib = _gpu_headroom_mib()
+    if gpu_mib is not None and gpu_mib < 1200:
+        time.sleep(3)
+        _reap_orphan_validate_engines()
+        gpu_mib = _gpu_headroom_mib()
+    vram_starved = gpu_mib is not None and gpu_mib < 1200
+    heavy_ok = disk_free_gb() > 8.0 and not vram_starved
 
     def _bench():
+        if vram_starved:
+            regb(
+                "bench",
+                f"free VRAM {gpu_mib} MiB < 1200 MiB after reaping this "
+                f"harness's orphaned engines — GPU holders: "
+                f"{'; '.join(_gpu_compute_holders()) or 'none visible'}",
+            )
+            return
         p = cli("bench", MODEL, timeout=900)
         reg(
             "bench",
@@ -6223,7 +6522,7 @@ def phase_commands() -> None:
                 (
                     p.stdout.strip().splitlines()[-1][:90]
                     if p.stdout.strip()
-                    else f"rc={p.returncode} err={p.stderr[:120]}"
+                    else f"rc={p.returncode} err={p.stderr[:200]}"
                 ),
             )
 
@@ -6246,7 +6545,13 @@ def phase_commands() -> None:
         else:
             regb(
                 f"tune.{flag.lstrip('-')}",
-                f"disk free {disk_free_gb():.1f}G <= 8G: heavy lane skipped",
+                (
+                    f"free VRAM {gpu_mib} MiB < 1200 MiB after reaping "
+                    f"orphaned engines; GPU holders: "
+                    f"{'; '.join(_gpu_compute_holders()) or 'none visible'}"
+                    if vram_starved
+                    else f"disk free {disk_free_gb():.1f}G <= 8G: heavy lane skipped"
+                ),
             )
 
     def _pull_retry(*args, timeout=2400):
@@ -6485,6 +6790,14 @@ def phase_commands() -> None:
 
     tags = _full_engine_tags()
     anchor, dance = (tags + [None, None])[:2]
+    # Prefer a plain upstream tag for the pin-update dance so the lane
+    # exercises the standard asset path whenever the store has one; a
+    # -cuda pick goes through the CUDA overlay repo (needs bNNNN-cuda
+    # releases published there — boundary row when the channel is not
+    # live yet).
+    update_pick = next(
+        (t for t in tags if t != anchor and not t.endswith("-cuda")), dance
+    )
 
     def _engine_full():
         p = cli("engine", "use", dance)
@@ -6511,8 +6824,29 @@ def phase_commands() -> None:
             p.returncode == 0 and _active_engine_tag() == anchor,
             f"active={_active_engine_tag()}",
         )
-        p = cli("engine", "update", dance, "--no-gate", timeout=1800)
+        p = cli("engine", "update", update_pick, "--no-gate", timeout=1800)
         eout = p.stdout + p.stderr
+        overlay_miss = (
+            update_pick.endswith("-cuda")
+            and p.returncode != 0
+            and "overlay release" in eout
+            and "PALLAMA_ENGINE_REPO" in eout
+        )
+        if overlay_miss:
+            regb(
+                "engine.update",
+                "CUDA overlay channel not live yet (placeholder pallama/pallama); "
+                f"tag-pinned update to {update_pick} needs a published bNNNN-cuda "
+                "release there — the switch path is proven by engine.use above and "
+                "the channel-update path by live engine-update runs",
+            )
+            p = cli("engine", "use", anchor)
+            reg(
+                "engine.update",
+                p.returncode == 0 and _active_engine_tag() == anchor,
+                f"active restored to {anchor}",
+            )
+            return
         rate_limited = p.returncode != 0 and (
             "rate limited" in eout.lower() or "403" in eout
         )
@@ -6972,8 +7306,16 @@ def phase_knobs_behavior() -> None:
     d.stop()
 
     # -- curated rows for knobs proven by earlier phases ------------------
-    cov("host", "binds 127.0.0.1:11499", "every daemon phase + healthz 200")
-    cov("port", "binds 127.0.0.1:11499", "every daemon phase + healthz 200")
+    cov(
+        "host",
+        f"binds 127.0.0.1:{PORT}",
+        "every daemon phase + healthz 200",
+    )
+    cov(
+        "port",
+        f"binds 127.0.0.1:{PORT}",
+        "every daemon phase + healthz 200",
+    )
     cov(
         "router",
         "router mode serves chat from one child",
@@ -6982,14 +7324,36 @@ def phase_knobs_behavior() -> None:
 
 
 def _full_toplevel() -> dict:
-    """All 135 manifest knobs with benign explicit values (full-manifest boot)."""
+    """All 145 manifest knobs with benign explicit values (full-manifest boot).
+
+    None values = deliberately omitted from the serialized boot config
+    (XOR partners / pairing-gated knobs that cannot co-exist): the key
+    still counts for the (c0) membership gate.
+    """
     lk = os.path.join(SANDBOX.root, "lookup-static.bin")
     open(lk, "wb").close()
+    mcp_cfg = os.path.join(SANDBOX.root, "mcp-servers.json")
+    with open(mcp_cfg, "w") as f:
+        f.write('{"mcpServers":{}}')
     return {
         "host": "127.0.0.1",
         "port": PORT,
         "late_chunking_max_tokens": 8192,
         "session_keep_secs": 900,
+        # agent-tooling wave: validated for prefix/pairing/JSON/XOR in
+        # config.rs; a real (valid-JSON) config file exercises the
+        # existence-checked path, runtime + inline JSON stay omitted.
+        "server_tools": "read_file",
+        "server_tools_runtime": None,
+        "mcp_servers_config": mcp_cfg,
+        "mcp_servers_json": None,
+        "mistralrs_pa_memory_fraction": 0.5,
+        "mistralrs_paged_attn": False,
+        "lazy_mode": "auto",
+        "deterministic": False,
+        "audit_log": False,
+        "auto_restart_engine_switch": False,
+        "cpu_ffn_n": 1,
         # container knob: benign explicit boot (enabled=false — true would
         # require a model; config.rs validation rule)
         "semantic_cache": {"enabled": False},
@@ -7197,17 +7561,7 @@ def phase_gates() -> None:
 
     # (a) --help x manifest, bidirectional -------------------------------
     p = cli("--help")
-    names: set[str] = set()
-    in_cmds = False
-    for line in p.stdout.splitlines():
-        if line.startswith("Commands:"):
-            in_cmds = True
-            continue
-        if in_cmds:
-            if line.startswith("  ") and line.strip():
-                names.add(line.strip().split()[0])
-            elif line.strip():
-                break
+    names = set(_help_command_names(p.stdout))
     want = set(TOPLEVEL_COMMANDS)
     ok_a = names == want
     check(
@@ -7309,7 +7663,7 @@ def phase_gates() -> None:
     ok_d = ok_d and not miss_samp
     check(
         "gates",
-        "(d) overlay round-trip echoes all 20 override fields",
+        f"(d) overlay round-trip echoes all {len(MODEL_OVERRIDE_FIELDS)} override fields",
         ok_d,
         f"missing={miss_fields}",
     )
@@ -7644,18 +7998,10 @@ def _gold_items() -> dict:
     items: dict[str, str] = {}
 
     p = cli("--help")
-    cmds = []
-    in_block = False
-    for ln in p.stdout.splitlines():
-        if ln.startswith("Commands:"):
-            in_block = True
-            continue
-        if in_block:
-            if not ln.startswith("  "):
-                break
-            cmds.append(ln.strip().split()[0])
+    # Grouped help: same name set as the old single Commands: block
+    # (shared parser — see _help_command_names).
+    cmds = _help_command_names(p.stdout)
     items["help.commands"] = "\n".join(sorted(cmds))
-
     cfg_path = os.path.join(SANDBOX.root, "config", "pallama", "config.toml")
     backup = open(cfg_path, "rb").read() if os.path.exists(cfg_path) else None
     try:
@@ -7704,8 +8050,18 @@ def _gold_items() -> dict:
         }
         # Context-conditional doctor rows: they appear/differ based on
         # whether a whisper server is installed in the phase's sandbox
-        # (commands installs one; a fresh golds-only run has none).
-        - {"whisper currency", "whisper lane", "whisper models"}
+        # (commands installs one; a fresh golds-only run has none), on
+        # whether a systemd/launchd manager + pallama unit is probeable on
+        # the host (dev boxes/sandboxes without a unit emit no row), and on
+        # whether the host is Linux-NVIDIA serving a non-CUDA asset
+        # (the cuda-channel hint row is vendor/asset-conditional).
+        - {
+            "whisper currency",
+            "whisper lane",
+            "whisper models",
+            "service",
+            "engine cuda channel",
+        }
     )
     items["doctor.check-names"] = "\n".join(names)
 
