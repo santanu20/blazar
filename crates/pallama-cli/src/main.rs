@@ -379,7 +379,128 @@ enum ConfigCmd {
     Set { key: String, value: String },
 }
 
+/// Grouping table for the top-level help. Descriptions and aliases come
+/// live from clap (single source of truth); this table owns ONLY the
+/// grouping. `unit__grouped_help__covers_every_subcommand` pins the two
+/// together: a command added to the enum but not to a group (or vice
+/// versa) fails `cargo test`.
+const HELP_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "Serve & Chat",
+        &["serve", "run", "ps", "stop", "launch", "session"],
+    ),
+    (
+        "Model Management",
+        &[
+            "pull", "import", "cp", "create", "rm", "list", "show", "quantize", "mmproj", "search",
+            "fit", "lora",
+        ],
+    ),
+    (
+        "Tuning & Benchmarks",
+        &["bench", "tune", "drafts", "coreside"],
+    ),
+    (
+        "Engine & Config",
+        &[
+            "engine",
+            "config",
+            "keys",
+            "whisper",
+            "doctor",
+            "migrate",
+            "snapshot",
+            "upgrade",
+            "completions",
+        ],
+    ),
+    ("Observability", &["why", "watch"]),
+    (
+        "Refused by design (local-only)",
+        &["push", "signin", "login", "signout", "logout"],
+    ),
+    ("General", &["help"]),
+];
+
+/// Render the top-level help with commands grouped by category. clap has
+/// no native subcommand grouping (verified against clap 4.6); the enums
+/// stay authoritative for parsing, per-command help and completions.
+fn render_grouped_help() -> String {
+    let mut cmd = Cli::command();
+    // Materialize clap's auto `help` subcommand (added lazily at build).
+    cmd.build();
+    let mut about = std::collections::BTreeMap::new();
+    let mut aliases = std::collections::BTreeMap::new();
+    for sc in cmd.get_subcommands() {
+        about.insert(
+            sc.get_name().to_string(),
+            sc.get_about()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+                .replace('\n', " "),
+        );
+        let al: Vec<String> = sc.get_all_aliases().map(str::to_string).collect();
+        if !al.is_empty() {
+            aliases.insert(sc.get_name().to_string(), format!(" ({})", al.join(", ")));
+        }
+    }
+    // Width: longest "name (aliases)" across ALL groups, for one aligned
+    // column (clap-style two-space indent, two-space gutter).
+    let entry = |n: &str| format!("{n}{}", aliases.get(n).map_or("", String::as_str));
+    let width = HELP_GROUPS
+        .iter()
+        .flat_map(|(_, ns)| ns.iter())
+        .map(|n| entry(n).len())
+        .max()
+        .unwrap_or(0);
+    let mut out = String::new();
+    writeln!(
+        out,
+        "pallama {} — llama.cpp orchestration: ollama-grade UX, zero engine fork",
+        env!("CARGO_PKG_VERSION")
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "Usage: pallama <COMMAND>").unwrap();
+    for (heading, names) in HELP_GROUPS {
+        writeln!(out, "\n{heading}:").unwrap();
+        for n in *names {
+            let a = about
+                .get(*n)
+                .unwrap_or_else(|| panic!("help group lists unknown command {n:?}"));
+            writeln!(out, "  {:<width$}  {}", entry(n), a, width = width).unwrap();
+        }
+    }
+    writeln!(out, "\nOptions:").unwrap();
+    writeln!(out, "  -h, --help     Print help").unwrap();
+    writeln!(out, "  -V, --version  Print version").unwrap();
+    writeln!(
+        out,
+        "\nQuickstart: pallama pull <model> · pallama run <model> · pallama doctor"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "\nLocal-only: no telemetry, no cloud endpoints. Powered by llama.cpp / ggml / ggerganov."
+    )
+    .unwrap();
+    out
+}
+
 fn main() {
+    // Grouped help intercept: clap renders an ungrouped 38-command wall.
+    // Only the TOP-level listing is replaced; `pallama help <cmd>`,
+    // `pallama <cmd> --help` and error usage stay clap-native.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let grouped_help = match argv.first().map(String::as_str) {
+        Some("--help" | "-h") => true,
+        Some("help") => argv.len() == 1,
+        _ => false,
+    };
+    if grouped_help {
+        print!("{}", render_grouped_help());
+        return;
+    }
     let cli = Cli::parse();
     // Peek log_level from the config file WITHOUT creating it
     // (Config::load writes a fresh file when absent; a plain read must not).
@@ -5181,6 +5302,35 @@ async fn upgrade(version: Option<String>, dry_run: bool) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn unit__grouped_help__covers_every_subcommand_exactly_once() {
+        let rendered = render_grouped_help();
+        // Rendered command lines: two-space indent, lowercase name first
+        // (Options lines start with '-'; headings and footer are not
+        // indented).
+        let mut listed: Vec<String> = rendered
+            .lines()
+            .filter(|l| l.starts_with("  ") && !l.trim_start().starts_with('-'))
+            .map(|l| l.split_whitespace().next().unwrap().to_string())
+            .collect();
+        listed.sort();
+        let mut clap_names: Vec<String> = {
+            let mut c = Cli::command();
+            c.build();
+            c.get_subcommands()
+                .map(|s| s.get_name().to_string())
+                .collect()
+        };
+        clap_names.sort();
+        assert_eq!(
+            listed, clap_names,
+            "rendered help and the clap enum disagree (missing from a HELP_GROUPS entry, \
+             or a new command not grouped)"
+        );
+        // validate.py asserts the llama.cpp credit on --help; keep it here
+        // so a renderer rewrite cannot silently drop it.
+        assert!(rendered.contains("llama.cpp"));
+    }
 
     #[test]
     fn unit__truncate_repo_id__shrinks_owner_keeps_model_tail() {
