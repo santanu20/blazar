@@ -896,8 +896,29 @@ async fn e2e__generate_raw_ok_templated_400_and_embeddings() {
         .unwrap();
     assert!(r["done"] == true, "generate done: {r}");
     assert!(r["response"].as_str().unwrap().contains("complete this"));
+    assert!(
+        r.get("message").is_none(),
+        "generate shape, not chat shape: {r}"
+    );
 
-    let templated = serde_json::json!({"model": "m1", "prompt": "x", "system": "sys"});
+    // system now rides the chat bus (ollama templated-generate parity).
+    let with_system = serde_json::json!({
+        "model": "m1", "prompt": "say hi", "system": "be terse", "stream": false
+    });
+    let r2: serde_json::Value = c
+        .post(format!("{}/api/generate", ts.base))
+        .json(&with_system)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(r2["done"] == true, "system generate works: {r2}");
+    assert!(r2["response"].as_str().unwrap().contains("say hi"));
+
+    // template/suffix stay rejected — the engine owns the template.
+    let templated = serde_json::json!({"model": "m1", "prompt": "x", "template": "{{.System}}"});
     let resp = c
         .post(format!("{}/api/generate", ts.base))
         .json(&templated)
@@ -919,6 +940,128 @@ async fn e2e__generate_raw_ok_templated_400_and_embeddings() {
         .await
         .unwrap();
     assert!(r["embedding"].as_array().is_some(), "embedding array: {r}");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__generate_images_and_streaming_chat_bus() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    // pdf_ocr-shaped payload: images[] (b64 of PNG magic + padding) +
+    // system + options.
+    let png_b64 = "iVBORw0KGgoAAAA";
+    let vision = serde_json::json!({
+        "model": "m1",
+        "prompt": "describe",
+        "system": "be terse",
+        "images": [png_b64],
+        "stream": false,
+        "options": {"temperature": 0.2, "num_predict": 64}
+    });
+    let r: serde_json::Value = c
+        .post(format!("{}/api/generate", ts.base))
+        .json(&vision)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(r["done"] == true, "vision generate works: {r}");
+    assert!(r["response"].as_str().unwrap().contains("describe"));
+
+    // Bad image magic: fail fast 400 (never a silent text-only answer).
+    let bad = serde_json::json!({
+        "model": "m1", "prompt": "x", "images": ["AAAAAAAA"], "stream": false
+    });
+    let resp = c
+        .post(format!("{}/api/generate", ts.base))
+        .json(&bad)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let b: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        b["error"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported image format"),
+        "{b}"
+    );
+
+    // Streaming generate (websearch shape): NDJSON response deltas ending
+    // in a done:true line carrying counts.
+    let stream_req = serde_json::json!({
+        "model": "m1", "prompt": "stream me", "system": "sys", "stream": true, "think": false
+    });
+    let resp = c
+        .post(format!("{}/api/generate", ts.base))
+        .json(&stream_req)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("ndjson")));
+    let body = resp.text().await.unwrap();
+    let mut saw_delta = false;
+    let mut final_line: Option<serde_json::Value> = None;
+    for line in body.lines().filter(|l| !l.is_empty()) {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        if v["done"] == false {
+            saw_delta = true;
+            assert!(v.get("response").is_some(), "delta shape: {v}");
+            assert!(v.get("message").is_none(), "generate lane: {v}");
+        } else {
+            final_line = Some(v);
+        }
+    }
+    assert!(saw_delta, "stream produced deltas: {body}");
+    let fin = final_line.expect("stream ends with a done:true line");
+    assert!(fin["done"] == true);
+    assert!(fin["done_reason"].as_str().is_some());
+    assert!(
+        fin["eval_count"].as_i64().is_some(),
+        "counts ride final: {fin}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__chat_message_images_translate_to_parts() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    // b64 of PNG magic + 4 zero bytes (decodes cleanly at 12 bytes).
+    let png_b64 = "iVBORw0KGgoAAAA";
+    let body = serde_json::json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [
+            {"role": "user", "content": "what is this?", "images": [png_b64]}
+        ]
+    });
+    let r: serde_json::Value = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // The stub echoes the last user content — parts were forwarded (not
+    // silently dropped): the text part survives in the echo.
+    let content = r["message"]["content"].as_str().unwrap_or_default();
+    assert!(
+        content.contains("what is this?"),
+        "vision parts forwarded: {r}"
+    );
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
@@ -961,6 +1104,11 @@ async fn e2e__ps_and_show() {
         .unwrap();
     assert_eq!(s["details"]["quantization_level"], "Q4_K_M");
     assert_eq!(s["model_info"]["general.architecture"], "qwen3");
+    // ollama-parity capability discovery (geokit vision detection):
+    // m1 has no mmproj -> completion only, never a vision lie.
+    let caps = s["capabilities"].as_array().expect("capabilities array");
+    assert!(caps.iter().any(|c| c == "completion"), "{s}");
+    assert!(!caps.iter().any(|c| c == "vision"), "{s}");
     ts.state.sup.shutdown_all().await.unwrap();
 }
 

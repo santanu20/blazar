@@ -7,6 +7,42 @@ tracked here.
 ## [Unreleased]
 
 ### Added
+- **Ollama drop-in parity: `/api/generate` rides the full chat-bus
+  pipeline.** The generate lane previously mapped to a bare
+  `/v1/completions` post — no streaming (an SSE request hit a
+  `.json()` parse and died), no images, no `system`, no `think`, no
+  sentinel enforcement, no TTFT clock. It now translates through the
+  same `/v1/chat/completions` core as `/api/chat` (admission,
+  preflight, num_ctx restart, keep_alive, priority, sentinel
+  enforce+observe, TTFT/TPOT, accounting, evict-after) with a
+  generate-shaped wire: `system` becomes `messages[0]`, the raw
+  `prompt` the user turn, `images[]` multimodal `image_url` parts
+  (mime sniffed from magic bytes — PNG/JPEG/GIF/WEBP; unknown magic
+  is a 400, never a silent mislabel), `think` maps to
+  `chat_template_kwargs` exactly like the chat lane, and
+  `stream:true` returns real NDJSON `response` deltas with a usage
+  final line. `template`/`suffix` stay rejected with a teaching 400
+  (the engine owns templates). One semantic change: raw generate
+  prompts now get the engine's chat template applied — matching real
+  ollama, whose generate is templated (raw completions remain one
+  `POST /v1/completions` away).
+- **Ollama chat `images[]` translate to multimodal parts.**
+  Message-level `images[]` were copied verbatim to the child, which ignores
+  unknown fields — vision routing (`@vision` respawn, mmproj attach)
+  existed but the pixels never reached the model. `chat_to_openai`
+  now converts them to `image_url` data-URL parts; text-only
+  requests are byte-identical to before.
+- **`/api/show` reports `capabilities`.** `["completion"]` always,
+  `"vision"` when the store row has an `mmproj` path — the
+  evidence-based source, no guessing. Ollama clients that probe
+  capabilities (geokit's vision-model discovery) now see vision
+  models.
+- **`logprobs` mapped back in `/api/chat`.** Requests with
+  `logprobs:true` passed through but the response never carried
+  them back. Both the non-stream body and every stream chunk now
+  clone `choices[].logprobs.content` to the top-level `logprobs`
+  array (ollama-native field names — verifier clients parse it
+  directly).
 - **`pallama doctor` flags config pins that mirror retired defaults**:
   template pins outlive default changes — a config written when
   `cache_reuse = 256` or `spec = "off"` were the defaults silently keeps

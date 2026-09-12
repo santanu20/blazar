@@ -267,10 +267,18 @@ pub async fn show(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
         details["block_count"] = json!(g.block_count.unwrap_or(0));
         details["expert_count"] = json!(g.expert_count.unwrap_or(0));
     }
+    // ollama-parity capability discovery (geokit vision detection reads
+    // this): vision iff an mmproj projector is attached to the model —
+    // evidence from the store, never a filename guess.
+    let mut capabilities = vec!["completion"];
+    if row.mmproj_path.is_some() {
+        capabilities.push("vision");
+    }
     let mut resp = json!({
         "license": "see upstream model card",
         "modelfile": format!("# pallama: plain GGUF at {}", row.path),
         "parameters": "see config overlay",
+        "capabilities": capabilities,
         "details": details,
         "model_info": {
             "general.architecture": row.arch.clone().unwrap_or_default(),
@@ -931,6 +939,7 @@ pub async fn chat(
                 trace_ext.map(|Extension(t)| t.0),
                 enforce,
                 sem_ctx,
+                OutputShape::Chat,
             )
             .await;
             // keep_alive=0: evict right after this response (complaint #12),
@@ -1133,6 +1142,24 @@ pub(crate) async fn apply_num_ctx(
     Ok(())
 }
 
+/// Output wire-shape for the unified chat-bus pipeline: /api/chat emits
+/// `message` objects, /api/generate emits `response` objects. Everything
+/// else (sentinel, TTFT/TPOT, admission, usage accounting) is shared.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputShape {
+    Chat,
+    Generate,
+}
+
+impl OutputShape {
+    fn lane(self) -> &'static str {
+        match self {
+            Self::Chat => "ollama-chat",
+            Self::Generate => "ollama-generate",
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)] // one cohesive translation path
 async fn proxy_core_chat(
     state: &Arc<AppState>,
@@ -1144,6 +1171,7 @@ async fn proxy_core_chat(
     trace: Option<String>,
     enforce: bool,
     sem: Option<semcache::SemCtx>,
+    shape: OutputShape,
 ) -> Response {
     let base = child_base(&engine.endpoint);
     let url = format!("{base}/v1/chat/completions");
@@ -1196,7 +1224,7 @@ async fn proxy_core_chat(
         // warn-only — bytes are already on the wire).
         if enforce {
             let (ctx, _) =
-                sentinel::request_ctx(state, "ollama-chat", model, &openai_body, trace, false);
+                sentinel::request_ctx(state, shape.lane(), model, &openai_body, trace, false);
             let hard =
                 state
                     .sentinel
@@ -1212,7 +1240,7 @@ async fn proxy_core_chat(
         } else {
             let (feed, _) = sentinel::begin_chat_observation(
                 state,
-                "ollama-chat",
+                shape.lane(),
                 model,
                 &openai_body,
                 trace,
@@ -1223,7 +1251,10 @@ async fn proxy_core_chat(
             // Drop fires End: the analyzer finalizes off the response path.
             drop(feed);
         }
-        let mut ollama = tr::openai_chat_to_ollama(model, &openai);
+        let mut ollama = match shape {
+            OutputShape::Chat => tr::openai_chat_to_ollama(model, &openai),
+            OutputShape::Generate => tr::openai_chat_to_generate(model, &openai),
+        };
         // Cold-load wall (only when a spawn actually happened) for ollama
         // parity: clients read load_duration after first requests.
         if load_ms > 100 {
@@ -1290,7 +1321,7 @@ async fn proxy_core_chat(
     // in the observation closure, analyzer parses off the hot path.
     let (sentinel_feed, _) = sentinel::begin_chat_observation(
         state,
-        "ollama-chat",
+        shape.lane(),
         model,
         &openai_body,
         trace,
@@ -1347,6 +1378,7 @@ async fn proxy_core_chat(
             false,
             std::sync::Arc::clone(&clock),
             std::sync::Arc::clone(&state.obs),
+            shape,
         ),
         |(
             mut stream,
@@ -1359,6 +1391,7 @@ async fn proxy_core_chat(
             mut usage_sent,
             clock,
             obs,
+            shape,
         )| async move {
             loop {
                 if done && !usage_sent {
@@ -1384,18 +1417,28 @@ async fn proxy_core_chat(
                         ),
                         None => obs.miss(),
                     }
-                    let final_chunk = tr::ollama_final_chunk(
-                        &model,
-                        usage.as_ref(),
-                        finish.as_deref(),
-                        eval_ns,
-                        total_ns,
-                    );
+                    let final_chunk = match shape {
+                        OutputShape::Chat => tr::ollama_final_chunk(
+                            &model,
+                            usage.as_ref(),
+                            finish.as_deref(),
+                            eval_ns,
+                            total_ns,
+                        ),
+                        OutputShape::Generate => tr::ollama_generate_final_chunk(
+                            &model,
+                            usage.as_ref(),
+                            finish.as_deref(),
+                            eval_ns,
+                            total_ns,
+                        ),
+                    };
                     usage_sent = true;
                     return Some((
                         Ok(Bytes::from(format!("{final_chunk}\n"))),
                         (
                             stream, buf, lines, model, done, usage, finish, usage_sent, clock, obs,
+                            shape,
                         ),
                     ));
                 }
@@ -1419,7 +1462,10 @@ async fn proxy_core_chat(
                         }
                         let ndjson_lines: Vec<String> = events
                             .iter()
-                            .flat_map(|ev| tr::openai_chunk_to_ollama(&model, ev))
+                            .flat_map(|ev| match shape {
+                                OutputShape::Chat => tr::openai_chunk_to_ollama(&model, ev),
+                                OutputShape::Generate => tr::openai_chunk_to_generate(&model, ev),
+                            })
                             .map(|v| format!("{v}\n"))
                             .collect();
                         if ndjson_lines.is_empty() {
@@ -1430,7 +1476,7 @@ async fn proxy_core_chat(
                             Ok(Bytes::from(body)),
                             (
                                 stream, buf, lines, model, done, usage, finish, usage_sent, clock,
-                                obs,
+                                obs, shape,
                             ),
                         ));
                     }
@@ -1439,7 +1485,7 @@ async fn proxy_core_chat(
                             Err(std::io::Error::other(e.to_string())),
                             (
                                 stream, buf, lines, model, done, usage, finish, usage_sent, clock,
-                                obs,
+                                obs, shape,
                             ),
                         ));
                     }
@@ -1774,7 +1820,9 @@ pub async fn rerank(
     )
 }
 
-/// POST /api/generate — raw prompts only (templated -> 400 + pointer).
+/// POST /api/generate — chat-bus translation (system/prompt/images/think
+/// map onto /v1/chat/completions exactly like ollama's templated
+/// generate); template/suffix stay rejected (400 + pointer).
 #[allow(clippy::too_many_lines)] // one cohesive translation path
 pub async fn generate(
     State(state): State<Arc<AppState>>,
@@ -1792,7 +1840,7 @@ pub async fn generate(
         Ok(None) => {
             return api_error(
                 400,
-                "templated /api/generate is not supported; use /api/chat (the model's own template is applied by the engine)",
+                "template/suffix in /api/generate are not supported; the engine applies the model's own template (use /api/chat for full message control)",
             );
         }
         Err(msg) => return api_error(400, &msg),
@@ -1882,51 +1930,35 @@ pub async fn generate(
     }
     state.sup.note_prefix_hit(&engine.name);
     let model_name = row.name.clone();
+    // mistral.rs children register models as `default` (see proxy.rs).
+    if crate::proxy::child_model_default_active(&state) {
+        crate::proxy::set_child_model_default(&mut openai_req);
+    }
+    let openai_bytes = serde_json::to_vec(&openai_req).unwrap_or_default();
+    // ollama defaults stream=true on generate; the chat bus mirrors it.
+    let stream = req["stream"].as_bool().unwrap_or(true);
     let state_ej = state.clone();
     let mut out = crate::proxy::hold_body(
         crate::proxy::begin_accounting(&state, &engine.name),
-        (async {
-            let url = format!("{}/v1/completions", child_base(&engine.endpoint));
-            // mistral.rs children register models as `default` (see proxy.rs).
-            if crate::proxy::child_model_default_active(&state) {
-                crate::proxy::set_child_model_default(&mut openai_req);
-            }
-            let resp = match child_auth(state.http.post(&url), &engine)
-                .json(&openai_req)
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => return api_error(502, &format!("engine request failed: {e:#}")),
-            };
-            if !resp.status().is_success() {
-                let status = resp.status().as_u16();
-                let text = resp.text().await.unwrap_or_default();
-                return api_error(status, &text);
-            }
-            let openai: Value = match resp.json().await {
-                Ok(v) => v,
-                Err(e) => return api_error(502, &format!("bad engine response: {e}")),
-            };
-            let (feed, _) = sentinel::begin_chat_observation(
-                &state,
-                "ollama-generate",
-                &model,
-                &serde_json::to_vec(&openai_req).unwrap_or_default(),
+        (async move {
+            let enforce =
+                state_ej.config.sentinel && sentinel::enforce_enabled(&state_ej.config, &headers);
+            let resp = proxy_core_chat(
+                &state_ej,
+                &engine,
+                &model_name,
+                openai_bytes,
+                stream,
+                load_ms,
                 trace_ext.map(|Extension(t)| t.0),
-                200,
-                false,
-            );
-            feed.value(openai.clone());
-            drop(feed);
-            let mut ollama = tr::openai_completion_to_ollama(&model, &openai);
-            if load_ms > 100 {
-                ollama["load_duration"] =
-                    json!(u64::try_from(load_ms).unwrap_or(u64::MAX) * 1_000_000);
-            }
-            let resp = axum::Json(ollama).into_response();
-            // F12: keep_alive=0 evicts right after this response; a live
-            // session pin wins (R3) — identical to the /api/chat lane.
+                enforce,
+                None, // semantic cache is chat-lane only (response-shape keyed)
+                OutputShape::Generate,
+            )
+            .await;
+            // keep_alive=0: evict right after this response (complaint
+            // #12), banking the KV checkpoint first. A live session pin
+            // wins (R3) — identical to the /api/chat lane.
             if keep_alive == Some(0)
                 && !state_ej
                     .sup
@@ -1943,7 +1975,6 @@ pub async fn generate(
         })
         .await,
     );
-    // /api/generate responses are always whole JSON with usage inside.
     if let Some((name, _entry)) = key_entry.filter(|(_, e)| e.tpm > 0 || e.daily_tokens > 0) {
         out = crate::keys::charge_outgoing(out, &name, Arc::clone(&state.keys));
     }

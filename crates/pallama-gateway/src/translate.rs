@@ -126,6 +126,107 @@ pub fn translate_format(format: &Value) -> Option<Value> {
     }
 }
 
+/// Standard-alphabet base64 symbol -> 6-bit value.
+fn b64_val(c: u8) -> Option<u8> {
+    match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+/// Decode the first `n` bytes of a standard-alphabet base64 string —
+/// enough for magic-byte sniffing without a full decoder (or a new
+/// dependency). Short/garbage input yields fewer bytes than asked.
+fn b64_prefix_bytes(b64: &str, n: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(n);
+    let bytes = b64.as_bytes();
+    for g in 0..bytes.len() / 4 {
+        let Some(v) = b64_val(bytes[4 * g])
+            .zip(b64_val(bytes[4 * g + 1]))
+            .and_then(|(a, b)| {
+                b64_val(bytes[4 * g + 2])
+                    .zip(b64_val(bytes[4 * g + 3]))
+                    .map(|(c, d)| (a, b, c, d))
+            })
+        else {
+            break;
+        };
+        out.extend_from_slice(&[v.0 << 2 | v.1 >> 4, v.1 << 4 | v.2 >> 2, v.2 << 6 | v.3]);
+        if out.len() >= n {
+            break;
+        }
+    }
+    out.truncate(n);
+    out
+}
+
+/// Sniff the image MIME type from decoded magic bytes.
+fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF8") {
+        Some("image/gif")
+    } else if bytes.starts_with(b"RIFF") && bytes.len() >= 12 && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// ollama base64 image -> `data:` URL for `OpenAI` `image_url` parts.
+/// 12 decoded bytes cover every supported magic; an unrecognized (or
+/// undecodable) prefix fails fast instead of guessing a MIME (H1).
+fn image_data_url(b64: &str) -> Result<String, String> {
+    let head = b64_prefix_bytes(b64, 12);
+    let mime = sniff_image_mime(&head)
+        .ok_or_else(|| "unsupported image format (supported: png, jpeg, gif, webp)".to_string())?;
+    Ok(format!("data:{mime};base64,{b64}"))
+}
+
+/// ollama messages -> `OpenAI` messages: any message carrying ollama-style
+/// `images: [<base64>]` becomes multimodal content parts with `image_url`
+/// data-URLs; messages without images pass through verbatim.
+fn translate_message_images(messages: &Value) -> Result<Value, String> {
+    let Some(list) = messages.as_array() else {
+        return Ok(messages.clone());
+    };
+    let mut out = Vec::with_capacity(list.len());
+    for msg in list {
+        let Some(images) = msg.get("images").filter(|i| i.is_array()) else {
+            out.push(msg.clone());
+            continue;
+        };
+        let mut parts = Vec::new();
+        if let Some(text) = msg.get("content").and_then(Value::as_str) {
+            if !text.is_empty() {
+                parts.push(json!({"type": "text", "text": text}));
+            }
+        }
+        if let Some(arr) = images.as_array() {
+            for img in arr {
+                let b64 = img
+                    .as_str()
+                    .ok_or("message images must be base64 strings")?;
+                parts
+                    .push(json!({"type": "image_url", "image_url": {"url": image_data_url(b64)?}}));
+            }
+        }
+        let mut m = msg.clone();
+        if let Some(obj) = m.as_object_mut() {
+            obj.remove("images");
+        }
+        m["content"] = Value::Array(parts);
+        out.push(m);
+    }
+    Ok(Value::Array(out))
+}
+
 /// /api/chat request -> /v1/chat/completions body.
 pub fn chat_to_openai(req: &Value) -> Result<(Value, Option<i64>), String> {
     let model = req["model"].as_str().unwrap_or_default().to_string();
@@ -137,7 +238,9 @@ pub fn chat_to_openai(req: &Value) -> Result<(Value, Option<i64>), String> {
     }
     let mut out = json!({
         "model": model,
-        "messages": req["messages"],
+        // ollama-style message images[] become multimodal content parts
+        // (children ignore the raw field — this was silent vision loss).
+        "messages": translate_message_images(&req["messages"])?,
     });
     // ollama defaults stream=true; OpenAI defaults false — mirror the
     // caller's explicit choice only.
@@ -275,6 +378,15 @@ pub fn openai_chat_to_ollama(model: &str, openai: &Value) -> Value {
     if cached > 0 {
         v["prompt_eval_cached_count"] = json!(cached);
     }
+    // Confidence scoring (R2): map the child's token logprobs back into
+    // ollama's native top-level array (field names align 1:1 — pure clone).
+    if let Some(lp) = choice
+        .get("logprobs")
+        .and_then(|l| l.get("content"))
+        .filter(|c| c.as_array().is_some_and(|a| !a.is_empty()))
+    {
+        v["logprobs"] = lp.clone();
+    }
     merge_timing_fields(&mut v, openai);
     v
 }
@@ -305,12 +417,22 @@ pub fn openai_chunk_to_ollama(model: &str, chunk: &Value) -> Vec<Value> {
                 if let Some(tc) = delta.get("tool_calls") {
                     msg["tool_calls"] = tc.clone();
                 }
-                out.push(json!({
+                let mut line = json!({
                     "model": model,
                     "created_at": iso_now(),
                     "message": msg,
                     "done": false,
-                }));
+                });
+                // R2: streaming logprobs ride the line top-level, same
+                // ollama-native shape as the non-stream path.
+                if let Some(lp) = choice
+                    .get("logprobs")
+                    .and_then(|l| l.get("content"))
+                    .filter(|c| c.as_array().is_some_and(|a| !a.is_empty()))
+                {
+                    line["logprobs"] = lp.clone();
+                }
+                out.push(line);
             }
         }
     }
@@ -432,13 +554,18 @@ pub fn openai_embeddings_to_ollama(model: &str, openai: &Value) -> Value {
     })
 }
 
-/// /api/generate raw prompt -> /v1/completions body. `Ok(None)` when the
-/// request uses templated features (documented divergence: use /api/chat,
-/// which passes the model's own template through --jinja). Unknown
-/// sampling options are an `Err` — the generate lane must fail fast
-/// exactly like the chat lane, never silently drop what was asked for.
+/// /api/generate request -> /v1/chat/completions body (chat-bus unified
+/// translation): `system` -> messages[0], `prompt` -> user text part,
+/// `images` -> `image_url` data-URL parts, `think` ->
+/// `chat_template_kwargs` — the same machinery as /api/chat, so the
+/// engine's own template shapes the request exactly like ollama's
+/// (templated) generate. `template`/`suffix` stay unsupported (the
+/// engine owns the template) -> `Ok(None)` for the caller's teaching
+/// 400. Unknown sampling options are an `Err` — the generate lane must
+/// fail fast exactly like the chat lane, never silently drop what was
+/// asked for.
 pub fn generate_to_openai(req: &Value) -> Result<Option<Value>, String> {
-    let templated = ["system", "template", "suffix", "images"]
+    let templated = ["template", "suffix"]
         .iter()
         .any(|k| req.get(*k).is_some_and(|v| !v.is_null()));
     if templated {
@@ -446,9 +573,33 @@ pub fn generate_to_openai(req: &Value) -> Result<Option<Value>, String> {
     }
     let model = req["model"].as_str().ok_or("missing field: model")?;
     let prompt = req["prompt"].as_str().ok_or("missing field: prompt")?;
-    let mut out = json!({"model": model, "prompt": prompt});
+    let mut messages = Vec::new();
+    if let Some(system) = req.get("system").and_then(Value::as_str) {
+        if !system.is_empty() {
+            messages.push(json!({"role": "system", "content": system}));
+        }
+    }
+    let mut user = json!({"role": "user", "content": prompt});
+    if let Some(images) = req
+        .get("images")
+        .filter(|i| i.is_array() && !i.as_array().unwrap().is_empty())
+    {
+        let mut parts = vec![json!({"type": "text", "text": prompt})];
+        for img in images.as_array().unwrap() {
+            let b64 = img.as_str().ok_or("images must be base64 strings")?;
+            parts.push(json!({"type": "image_url", "image_url": {"url": image_data_url(b64)?}}));
+        }
+        user["content"] = Value::Array(parts);
+    }
+    messages.push(user);
+    let mut out = json!({"model": model, "messages": messages});
     if let Some(stream) = req["stream"].as_bool() {
         out["stream"] = json!(stream);
+    }
+    // ollama `think` toggle — identical mapping to the chat lane (both
+    // template variable names set; a template reads only the one it knows).
+    if let Some(think) = req.get("think").and_then(Value::as_bool) {
+        out["chat_template_kwargs"] = json!({"thinking": think, "enable_thinking": think});
     }
     if let Some(opts) = req.get("options").filter(|o| o.is_object()) {
         let unknown = apply_ollama_options(&mut out, opts);
@@ -459,19 +610,92 @@ pub fn generate_to_openai(req: &Value) -> Result<Option<Value>, String> {
     Ok(Some(out))
 }
 
-/// `OpenAI` completion response -> ollama `GenerateResponse`.
+/// `OpenAI` non-stream chat response -> ollama `GenerateResponse`
+/// (chat-bus generate: the response is the assistant message content).
 #[must_use]
-pub fn openai_completion_to_ollama(model: &str, openai: &Value) -> Value {
+pub fn openai_chat_to_generate(model: &str, openai: &Value) -> Value {
+    let choice = &openai["choices"][0];
+    let message = &choice["message"];
     let mut v = json!({
         "model": model,
         "created_at": iso_now(),
-        "response": openai["choices"][0]["text"].clone(),
+        "response": message["content"].clone(),
+        "done_reason": choice["finish_reason"].clone(),
         "done": true,
-        "done_reason": openai["choices"][0]["finish_reason"].clone(),
+        "total_duration": 0,
         "prompt_eval_count": openai["usage"]["prompt_tokens"].clone(),
         "eval_count": openai["usage"]["completion_tokens"].clone(),
     });
+    if let Some(reasoning) = message.get("reasoning_content") {
+        v["thinking"] = reasoning.clone();
+    }
+    let cached = cached_prompt_tokens(openai.get("usage"));
+    if cached > 0 {
+        v["prompt_eval_cached_count"] = json!(cached);
+    }
     merge_timing_fields(&mut v, openai);
+    v
+}
+
+/// One `OpenAI` SSE chunk -> ollama generate NDJSON lines (`response`
+/// deltas; empty deltas emit nothing, mirroring the chat mapper).
+#[must_use]
+pub fn openai_chunk_to_generate(model: &str, chunk: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    if let Some(choices) = chunk["choices"].as_array() {
+        for choice in choices {
+            let delta = &choice["delta"];
+            let has_content = delta
+                .get("content")
+                .is_some_and(|c| c.as_str().is_some_and(|s| !s.is_empty()));
+            let has_thinking = delta
+                .get("reasoning_content")
+                .is_some_and(|c| c.as_str().is_some_and(|s| !s.is_empty()));
+            if has_content || has_thinking {
+                let mut v = json!({"model": model, "created_at": iso_now(), "done": false});
+                if has_content {
+                    v["response"] = delta["content"].clone();
+                }
+                if has_thinking {
+                    v["thinking"] = delta["reasoning_content"].clone();
+                }
+                out.push(v);
+            }
+        }
+    }
+    out
+}
+
+/// Final ollama generate line from usage/finish (stream path — gateway-
+/// measured durations, same contract as `ollama_final_chunk`).
+#[must_use]
+pub fn ollama_generate_final_chunk(
+    model: &str,
+    usage: Option<&Value>,
+    finish: Option<&str>,
+    eval_ns: Option<u64>,
+    total_ns: Option<u64>,
+) -> Value {
+    let mut v = json!({
+        "model": model,
+        "created_at": iso_now(),
+        "response": "",
+        "done_reason": finish.unwrap_or("stop"),
+        "done": true,
+        "total_duration": 0,
+        "prompt_eval_count": usage.and_then(|u| u["prompt_tokens"].as_i64()).unwrap_or(0),
+        "eval_count": usage.and_then(|u| u["completion_tokens"].as_i64()).unwrap_or(0),
+    });
+    let cached = cached_prompt_tokens(usage);
+    if cached > 0 {
+        v["prompt_eval_cached_count"] = json!(cached);
+    }
+    if let Some(e) = eval_ns {
+        v["eval_duration"] = json!(e);
+    }
+    if let Some(t) = total_ns {
+        v["total_duration"] = json!(t);
+    }
     v
 }
 
@@ -741,13 +965,236 @@ mod tests {
 
     #[test]
     fn unit__generate_raw_and_templated() {
+        // Raw: user message carries the prompt, engine template applies.
         let raw = json!({"model": "m", "prompt": "say x", "stream": false});
         let oai = generate_to_openai(&raw).unwrap().unwrap();
-        assert_eq!(oai["prompt"], "say x");
-        let templated = json!({"model": "m", "prompt": "x", "system": "you are y"});
+        assert_eq!(oai["messages"][0]["role"], "user");
+        assert_eq!(oai["messages"][0]["content"], "say x");
+        assert_eq!(oai["stream"], false);
+        assert!(
+            oai.get("prompt").is_none(),
+            "chat bus carries no raw prompt"
+        );
+        // template/suffix stay rejected (engine owns the template).
+        let templated = json!({"model": "m", "prompt": "x", "template": "..."});
         assert!(generate_to_openai(&templated).unwrap().is_none());
-        let with_images = json!({"model": "m", "prompt": "x", "images": [""]});
-        assert!(generate_to_openai(&with_images).unwrap().is_none());
+        let suffixed = json!({"model": "m", "prompt": "x", "suffix": "..."});
+        assert!(generate_to_openai(&suffixed).unwrap().is_none());
+    }
+
+    #[test]
+    fn unit__generate_system_images_think_options() {
+        // The full geokit pdf_ocr shape: system + prompt + images + options.
+        // "iVBORw0KGgo" = 12-byte PNG magic prefix.
+        let req = json!({
+            "model": "m",
+            "prompt": "describe",
+            "system": "be terse",
+            "images": ["iVBORw0KGgo"],
+            "think": true,
+            "stream": false,
+            "options": {"temperature": 0.2, "num_predict": 64, "num_ctx": 8192}
+        });
+        let oai = generate_to_openai(&req).unwrap().unwrap();
+        assert_eq!(oai["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(oai["messages"][0]["role"], "system");
+        assert_eq!(oai["messages"][0]["content"], "be terse");
+        let user = &oai["messages"][1];
+        assert_eq!(user["role"], "user");
+        let parts = user["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2, "text + image: {parts:?}");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "describe");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(
+            parts[1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw0KGgo"
+        );
+        assert_eq!(oai["chat_template_kwargs"]["thinking"], true);
+        assert_eq!(oai["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(oai["temperature"], 0.2);
+        assert_eq!(oai["max_tokens"], 64);
+        // Empty system is dropped, not an empty system message.
+        let no_sys = json!({"model": "m", "prompt": "x", "system": ""});
+        let oai2 = generate_to_openai(&no_sys).unwrap().unwrap();
+        assert_eq!(oai2["messages"].as_array().unwrap().len(), 1);
+        // think:false still forwards the explicit toggle (chat-lane parity).
+        let off = json!({"model": "m", "prompt": "x", "think": false});
+        let oai3 = generate_to_openai(&off).unwrap().unwrap();
+        assert_eq!(oai3["chat_template_kwargs"]["thinking"], false);
+        // No think key: nothing injected.
+        let bare = json!({"model": "m", "prompt": "x"});
+        let oai4 = generate_to_openai(&bare).unwrap().unwrap();
+        assert!(oai4.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn unit__generate_image_mime_sniffing() {
+        let mimes = [
+            ("iVBORw0KGgo", "image/png"),       // \x89PNG
+            ("/9j/4AAQ", "image/jpeg"),         // \xff\xd8\xff
+            ("R0lGODlh", "image/gif"),          // GIF8
+            ("UklGRgAAAABXRUJQ", "image/webp"), // RIFF....WEBP
+        ];
+        for (b64, mime) in mimes {
+            let req = json!({"model": "m", "prompt": "x", "images": [b64]});
+            let oai = generate_to_openai(&req)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{b64} should map to {mime}"));
+            let url = oai["messages"][0]["content"][1]["image_url"]["url"]
+                .as_str()
+                .unwrap();
+            assert!(url.starts_with(&format!("data:{mime};base64,")), "{url}");
+        }
+        // Unrecognized magic fails fast, never guesses a MIME.
+        let bad = json!({"model": "m", "prompt": "x", "images": ["AAAAAAAA"]});
+        let err = generate_to_openai(&bad).unwrap_err();
+        assert!(err.contains("unsupported image format"), "{err}");
+        // Garbage (non-base64) fails fast too.
+        let garbage = json!({"model": "m", "prompt": "x", "images": ["!!not-b64!!"]});
+        assert!(generate_to_openai(&garbage).is_err());
+        // Non-string image entries are a shape error.
+        let shaped = json!({"model": "m", "prompt": "x", "images": [42]});
+        let err2 = generate_to_openai(&shaped).unwrap_err();
+        assert!(err2.contains("base64 strings"), "{err2}");
+    }
+
+    #[test]
+    fn unit__chat_message_images_become_parts() {
+        // ollama-style message images[] -> multimodal content parts.
+        let req = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "what is this?", "images": ["iVBORw0KGgo"]},
+                {"role": "assistant", "content": "a png"},
+                {"role": "user", "content": "plain"}
+            ]
+        });
+        let (out, _) = chat_to_openai(&req).unwrap();
+        let msgs = out["messages"].as_array().unwrap();
+        let parts = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(
+            parts[1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw0KGgo"
+        );
+        assert!(msgs[0].get("images").is_none(), "ollama field removed");
+        assert_eq!(msgs[1]["content"], "a png", "untouched message verbatim");
+        assert_eq!(msgs[2]["content"], "plain");
+        // Images-only message (empty content): no empty text part.
+        let img_only = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "", "images": ["iVBORw0KGgo"]}]
+        });
+        let (out2, _) = chat_to_openai(&img_only).unwrap();
+        let parts2 = out2["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts2.len(), 1);
+        assert_eq!(parts2[0]["type"], "image_url");
+        // Bad image in a message: hard error, not silent text-only.
+        let bad = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "x", "images": ["zzz"]}]
+        });
+        assert!(chat_to_openai(&bad).is_err());
+    }
+
+    #[test]
+    fn unit__logprobs_mapped_back_in_chat_response() {
+        // geokit verifier shape: top-level logprobs array with
+        // token/logprob/top_logprobs, cloned 1:1 from the child.
+        let openai = json!({
+            "choices": [{
+                "message": {"content": "hi"},
+                "finish_reason": "stop",
+                "logprobs": {"content": [
+                    {"token": "h", "logprob": -0.1, "top_logprobs": [
+                        {"token": "h", "logprob": -0.1}, {"token": "i", "logprob": -2.0}
+                    ]}
+                ]}
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1}
+        });
+        let v = openai_chat_to_ollama("m", &openai);
+        let lp = v["logprobs"].as_array().unwrap();
+        assert_eq!(lp.len(), 1);
+        assert_eq!(lp[0]["token"], "h");
+        assert_eq!(lp[0]["logprob"], -0.1);
+        assert_eq!(lp[0]["top_logprobs"].as_array().unwrap().len(), 2);
+        // Absent logprobs: key stays absent (native parity).
+        let bare = json!({
+            "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1}
+        });
+        assert!(openai_chat_to_ollama("m", &bare).get("logprobs").is_none());
+    }
+
+    #[test]
+    fn unit__logprobs_mapped_back_in_stream_chunks() {
+        let chunk = json!({
+            "choices": [{
+                "delta": {"content": "h"},
+                "logprobs": {"content": [
+                    {"token": "h", "logprob": -0.1, "top_logprobs": [
+                        {"token": "h", "logprob": -0.1}
+                    ]}
+                ]}
+            }]
+        });
+        let lines = openai_chunk_to_ollama("m", &chunk);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["logprobs"][0]["token"], "h");
+        assert_eq!(lines[0]["logprobs"][0]["logprob"], -0.1);
+        // No logprobs on the chunk: line stays lean.
+        let bare = json!({"choices": [{"delta": {"content": "h"}}]});
+        let lines2 = openai_chunk_to_ollama("m", &bare);
+        assert_eq!(lines2.len(), 1);
+        assert!(lines2[0].get("logprobs").is_none());
+    }
+
+    #[test]
+    fn unit__generate_response_mappers() {
+        // Non-stream: response = assistant content, thinking passthrough.
+        let openai = json!({
+            "choices": [{
+                "message": {"content": "42", "reasoning_content": "thinking..."},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+            "timings": {"prompt_ms": 100.0, "predicted_ms": 200.0}
+        });
+        let g = openai_chat_to_generate("m", &openai);
+        assert_eq!(g["response"], "42");
+        assert_eq!(g["thinking"], "thinking...");
+        assert_eq!(g["done"], true);
+        assert_eq!(g["done_reason"], "stop");
+        assert_eq!(g["prompt_eval_count"], 10);
+        assert_eq!(g["eval_count"], 2);
+        assert_eq!(g["prompt_eval_duration"], 100_000_000);
+        assert_eq!(g["eval_duration"], 200_000_000);
+        assert_eq!(g["total_duration"], 300_000_000);
+        // Stream chunks: response deltas, empty deltas dropped.
+        let chunks = json!({"choices": [{"delta": {"content": "he"}}]});
+        let lines = openai_chunk_to_generate("m", &chunks);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["response"], "he");
+        assert_eq!(lines[0]["done"], false);
+        let think_only = json!({"choices": [{"delta": {"reasoning_content": "hm"}}]});
+        let lines2 = openai_chunk_to_generate("m", &think_only);
+        assert_eq!(lines2.len(), 1);
+        assert_eq!(lines2[0]["thinking"], "hm");
+        let empty = json!({"choices": [{"delta": {"content": ""}}]});
+        assert!(openai_chunk_to_generate("m", &empty).is_empty());
+        // Final line: counts + done_reason + measured durations.
+        let usage = json!({"prompt_tokens": 10, "completion_tokens": 2});
+        let fin = ollama_generate_final_chunk("m", Some(&usage), Some("length"), Some(1), Some(2));
+        assert_eq!(fin["response"], "");
+        assert_eq!(fin["done"], true);
+        assert_eq!(fin["done_reason"], "length");
+        assert_eq!(fin["eval_count"], 2);
+        assert_eq!(fin["eval_duration"], 1);
+        assert_eq!(fin["total_duration"], 2);
     }
 
     #[test]
@@ -791,7 +1238,8 @@ mod tests {
         assert_eq!(c["prompt_eval_duration"], 100_500_000);
         assert_eq!(c["eval_duration"], 200_250_000);
         assert_eq!(c["total_duration"], 300_750_000);
-        let g = openai_completion_to_ollama("m", &openai);
+        let g = openai_chat_to_generate("m", &openai);
+        assert_eq!(g["response"], "hi");
         assert_eq!(g["eval_duration"], 200_250_000);
         assert_eq!(g["total_duration"], 300_750_000);
         // No timings: keys stay absent, total stays the legacy 0.
