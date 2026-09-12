@@ -126,6 +126,62 @@ fn not_found_name(name: &str) -> String {
     }
 }
 
+/// Detached banked-session restore POST (the ~1s HTTP half of the old
+/// serial `bank_restore`): runs AFTER Ready publishes so fresh chats
+/// never wait for it; continuation requests land while it streams and
+/// the engine queues behind the restore slot. Identity was already
+/// verified by the (cheap, fs-only) preflight at the call site.
+async fn bank_restore_post(
+    name: String,
+    endpoint: pallama_core::Endpoint,
+    ctx: u32,
+    auth: Option<String>,
+    router: bool,
+) {
+    let (host, port) = match &endpoint {
+        pallama_core::Endpoint::Tcp { host, port } => (host, *port),
+        // UDS children keep their slot protocol on the socket; the
+        // REST restore endpoint is not reachable — same as before.
+        pallama_core::Endpoint::Unix { .. } => return,
+    };
+    let url = format!("http://{host}:{port}/slots/0?action=restore&filename=_auto-{ctx}");
+    let mut body = serde_json::json!({ "filename": format!("_auto-{ctx}") });
+    if router {
+        body["model"] = serde_json::json!(name);
+    }
+    let mut req = reqwest::Client::new()
+        .post(&url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(2));
+    if let Some(secret) = &auth {
+        req = req.bearer_auth(secret);
+    }
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::info!(
+                target: "pallama::bank",
+                model = %name,
+                "restored banked session _auto-{ctx}"
+            );
+        }
+        Ok(resp) => {
+            tracing::warn!(
+                target: "pallama::bank",
+                model = %name,
+                "bank restore HTTP {} — continuing cold",
+                resp.status()
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "pallama::bank",
+                model = %name,
+                "bank restore failed: {e:#} — continuing cold"
+            );
+        }
+    }
+}
+
 /// Split an instance key into (model, replica index). `None` for plain
 /// model keys and malformed suffixes. A `@vision` suffix after the
 /// replica index is tolerated so `evict_model`-style filters match.
@@ -2205,16 +2261,53 @@ impl Supervisor {
                             total_ctx: slots * per_slot,
                         });
                     }
-                    // Bank restore, choke point #2: warm KV before the
-                    // first request prefills (ctx-matched only). Banks
-                    // are per-replica (key-scoped files).
-                    self.bank_restore(
-                        key,
-                        &endpoint,
-                        profile.ctx,
-                        auth.as_ref().map(|a| a.secret.as_str()),
-                    )
-                    .await;
+                    // Bank restore, choke point #2: warm KV for
+                    // conversation CONTINUATIONS (ctx-matched only,
+                    // per-replica key-scoped files). Preflight is cheap
+                    // (config gate + manifest verify, pure fs); the
+                    // ~1s slot-restore POST is DETACHED so the spawn
+                    // publishes Ready immediately — measured live, the
+                    // serial restore delayed EVERY cold spawn by ~1s,
+                    // and only continuations ever recoup it (fresh
+                    // chats waited for nothing). A racing first request
+                    // prefills normally; the engine queues behind the
+                    // restore slot when one does land.
+                    if self.config.session_bank {
+                        let file = self.bank_file(key, profile.ctx);
+                        if file.exists() {
+                            let diffs = match (
+                                pallama_core::session_identity::read_manifest(&file),
+                                pallama_core::session_identity::build(
+                                    &self.dirs,
+                                    &self.config,
+                                    key,
+                                ),
+                            ) {
+                                (Some(saved), Some(mut cur)) => {
+                                    cur.ctx = profile.ctx;
+                                    pallama_core::session_identity::verify(&saved, &cur)
+                                }
+                                _ => Vec::new(),
+                            };
+                            if diffs.is_empty() {
+                                let name = key.to_string();
+                                let ep = endpoint.clone();
+                                let ctx = profile.ctx;
+                                let secret = auth.as_ref().map(|a| a.secret.clone());
+                                let router = self.config.router;
+                                tokio::spawn(async move {
+                                    bank_restore_post(name, ep, ctx, secret, router).await;
+                                });
+                            } else {
+                                tracing::warn!(
+                                    target: "pallama::bank",
+                                    model = key,
+                                    "bank identity mismatch — SKIPPING restore ({}); continuing cold",
+                                    diffs.join("; ")
+                                );
+                            }
+                        }
+                    }
                     let _ = std::fs::write(
                         self.dirs.run_dir().join(format!("{key}.pid")),
                         pid.to_string(),
@@ -2625,64 +2718,6 @@ impl Supervisor {
     /// request rides warm KV. Warn-continue on any failure. A #20
     /// identity mismatch SKIPS the restore — injecting KV from a
     /// different runtime shape is worse than a cold start.
-    async fn bank_restore(&self, name: &str, endpoint: &Endpoint, ctx: u32, auth: Option<&str>) {
-        if !self.config.session_bank {
-            return;
-        }
-        let file = self.bank_file(name, ctx);
-        if !file.exists() {
-            return;
-        }
-        // Shape check before touching the child: refuse silently-stale
-        // banks (engine swap, model re-pull, ctx/cache change).
-        if let Some(saved) = pallama_core::session_identity::read_manifest(&file) {
-            if let Some(mut cur) =
-                pallama_core::session_identity::build(&self.dirs, &self.config, name)
-            {
-                cur.ctx = ctx;
-                let diffs = pallama_core::session_identity::verify(&saved, &cur);
-                if !diffs.is_empty() {
-                    tracing::warn!(
-                        target: "pallama::bank",
-                        model = name,
-                        "bank identity mismatch — SKIPPING restore ({}); continuing cold",
-                        diffs.join("; ")
-                    );
-                    return;
-                }
-            }
-        }
-        let url = match endpoint {
-            Endpoint::Tcp { host, port } => {
-                format!("http://{host}:{port}/slots/0?action=restore&filename=_auto-{ctx}")
-            }
-            Endpoint::Unix { .. } => return, // no HTTP lane on UDS children
-        };
-        let body = if self.config.router {
-            serde_json::json!({"filename": format!("_auto-{ctx}"), "model": name})
-        } else {
-            serde_json::json!({"filename": format!("_auto-{ctx}")})
-        };
-        let mut req = reqwest::Client::new()
-            .post(&url)
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(2));
-        if let Some(secret) = auth {
-            req = req.bearer_auth(secret);
-        }
-        match req.send().await {
-            Ok(r) if r.status().is_success() => {
-                tracing::info!(target: "pallama::bank", model = name, "restored banked session _auto-{ctx}");
-            }
-            Ok(r) => {
-                tracing::warn!(target: "pallama::bank", model = name, "bank restore HTTP {} — continuing cold", r.status());
-            }
-            Err(e) => {
-                tracing::warn!(target: "pallama::bank", model = name, "bank restore failed: {e:#} — continuing cold");
-            }
-        }
-    }
-
     /// Stop every instance (daemon shutdown). Bounded by grace per child.
     pub async fn shutdown_all(&self) -> Result<()> {
         let names: Vec<String> = self.instances.iter().map(|e| e.key().clone()).collect();
