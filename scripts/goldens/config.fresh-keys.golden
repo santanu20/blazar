@@ -25,6 +25,7 @@ ctx_extend
 default_ctx
 deterministic
 devices
+download_connections
 embd_normalize
 engine_asset
 engine_check_secs

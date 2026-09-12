@@ -930,6 +930,7 @@ _COMMAND_ATTRS = {
     "show.colon": (False, False, False, False, True),
     "ps": (True, False, False, False, True),
     "ps.reset": (True, False, False, False, True),
+    "ps.device": (True, False, False, False, True),
     "chat.colon": (True, True, False, False, True),
     "run.single": (True, True, False, False, True),
     "run.repl-exit": (True, True, False, False, True),
@@ -6112,6 +6113,13 @@ def phase_commands() -> None:
     p = cli("ps", "--reset")
     reg("ps.reset", p.returncode == 0, f"rc0; out={p.stdout.strip()[:80]!r}")
 
+    # /api/ps rows must carry the placement card (CLI renders full@card).
+    dev_rows = ps_rows()
+    reg(
+        "ps.device",
+        bool(dev_rows) and all("pallama_device" in r for r in dev_rows),
+        f"{len(dev_rows)} api ps rows carry pallama_device",
+    )
 
     # Gateway-side colon resolution: ollama-style model:tag must route
     # onto the flat row through the same ensure() choke point (rides the

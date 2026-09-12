@@ -19,6 +19,11 @@ tracked here.
   would be its flat form`). `pull` is exempt — its colon is the
   `owner/repo:QUANT` separator. The rule lives in
   `Store::resolve_model_name` (one implementation, CLI + gateway).
+- **`ps` names the card**: `/api/ps` rows carry `pallama_device` and
+  the CLI GPU column renders `full@<card>` (e.g. `full@NVIDIA
+  GeForce RTX 4070`) so you always see which card holds the model;
+  router mode / unknown placement keeps the bare offload label.
+
 - **Grouped top-level help**: `pallama --help` renders commands by
   category (Serve & Chat / Model Management / Tuning & Benchmarks /
   Engine & Config / Observability / Refused by design) instead of a

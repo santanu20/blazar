@@ -404,6 +404,10 @@ pub struct PsRow {
     /// Offload label ("full" | "cpu" | "partial" | "auto") — surfaces
     /// silent CPU fallback, ollama's most-common complaint.
     pub gpu: String,
+    /// Card the instance was placed on (auto-pick or `devices` config);
+    /// `None` for router mode / unknown placement. `ps` renders it as
+    /// `full@<card>`.
+    pub device: Option<String>,
     pub pid: u32,
     /// Model bytes on disk (0 in router mode — the front child serves
     /// many models and owns no single size).
@@ -1801,6 +1805,9 @@ impl Supervisor {
         // (no pick on probe weirdness).
         let mut scoped_hw: Option<Hardware> = None;
         let mut picked_device: Option<String> = None;
+        // Display twin of `picked_device` (census description, not the
+        // backend id) for the ps card label.
+        let mut picked_display: Option<String> = None;
         let mut sibling_devices: Vec<String> = Vec::new();
         let mut auto_split: Option<String> = None;
         // Tuning overrides are consumed exactly once, ABOVE the endpoint
@@ -1882,6 +1889,7 @@ impl Supervisor {
                 let mut scoped = hw.clone();
                 scoped.gpus = vec![best.clone()];
                 picked_device = Some(best.name.clone());
+                picked_display = Some(best.display_name().to_string());
                 scoped_hw = Some(scoped);
                 // Spare discrete cards (manual picks only reserve what
                 // `devices` names): the profile surfaces them as draft/
@@ -1912,6 +1920,32 @@ impl Supervisor {
                 }
             }
         }
+        // Placement label for `ps` (`full@<card>`): auto-pick names its
+        // card above; cover the other placements — manual `devices`
+        // (joined, a multi-card pin spans cards), single-GPU boxes (the
+        // child lands on the only card), and auto tensor-split (spans
+        // all discrete cards). Nulled for pure-CPU spawns at Instance
+        // construction.
+        let card_label = picked_display
+            .clone()
+            .or_else(|| {
+                let manual = self.config.effective_devices(name);
+                (!manual.is_empty()).then(|| manual.join("+"))
+            })
+            .or_else(|| {
+                let hw = fresh.as_ref().unwrap_or(&self.hardware);
+                (hw.gpus.len() == 1).then(|| hw.gpus[0].display_name().to_string())
+            })
+            .or_else(|| {
+                (auto_split.is_some()).then(|| {
+                    let hw = fresh.as_ref().unwrap_or(&self.hardware);
+                    hw.gpus
+                        .iter()
+                        .map(|g| g.display_name().to_string())
+                        .collect::<Vec<_>>()
+                        .join("+")
+                })
+            });
         // Cache-file dirs (speccache/, sessions/) must exist before the
         // child opens them; profile emission names these paths. Upstream
         // validates --slot-save-path IS a directory, so the per-model
@@ -2065,7 +2099,11 @@ impl Supervisor {
                         model,
                         profile_ctx: profile.ctx,
                         gpu: profile.gpu.to_string(),
-                        device: picked_device.clone(),
+                        device: if profile.gpu == "cpu" {
+                            None
+                        } else {
+                            card_label.clone()
+                        },
                         kv_est_bytes: profile.kv_est_bytes,
                         settled_mib: std::sync::atomic::AtomicU64::new(0),
                         auth: auth.as_ref().map(|a| a.secret.clone()),
@@ -3097,6 +3135,7 @@ impl Supervisor {
                     in_flight: i.in_flight.load(Ordering::SeqCst),
                     ctx: i.profile_ctx,
                     gpu: i.gpu.clone(),
+                    device: i.device.clone(),
                     pid: i.pid,
                     bytes: i.model.bytes,
                     heat,
@@ -3670,6 +3709,22 @@ mod routing_tests {
             pid,
         };
         (Arc::new(inst), pid)
+    }
+
+    #[tokio::test]
+    async fn unit__ps_row__carries_instance_device() {
+        let (sup, _root) = gpu_sup();
+        let (mut inst, _pid) = gpu_instance("dev-model", 1000, 0);
+        // Auto-pick records the card; ps() must surface it so `full@card`
+        // renders in the CLI GPU column.
+        if let Some(i) = Arc::get_mut(&mut inst) {
+            i.device = Some("RTX 4070".into());
+        }
+        sup.instances.insert("dev-model".to_string(), inst);
+        let rows = sup.ps();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].gpu, "full");
+        assert_eq!(rows[0].device.as_deref(), Some("RTX 4070"));
     }
 
     #[tokio::test]

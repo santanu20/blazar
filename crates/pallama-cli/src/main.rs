@@ -2885,12 +2885,18 @@ async fn ps(reset: bool) -> Result<()> {
             Some(r) => format!("{}#{}", m["name"].as_str().unwrap_or("?"), r),
             None => m["name"].as_str().unwrap_or("?").to_string(),
         };
+        // GPU cell: offload label, card-suffixed when placement is known
+        // (`full@RTX 4070`); router/unknown placement stays bare.
+        let gpu = match m["pallama_device"].as_str() {
+            Some(dev) => format!("{}@{}", m["pallama_gpu"].as_str().unwrap_or("-"), dev),
+            None => m["pallama_gpu"].as_str().unwrap_or("-").to_string(),
+        };
         println!(
             "{:<24} {:<9} {:>7} {:>6} {:>10}  {}",
             display,
             m["pallama_state"].as_str().unwrap_or("?"),
             m["pallama_ctx"].as_i64().unwrap_or(0),
-            m["pallama_gpu"].as_str().unwrap_or("-"),
+            gpu,
             m["pallama_in_flight"].as_i64().unwrap_or(0),
             m["pallama_endpoint"].as_str().unwrap_or("-")
         );

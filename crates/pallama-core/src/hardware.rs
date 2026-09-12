@@ -9,6 +9,21 @@ pub struct GpuInfo {
     pub free_mib: u64,
 }
 
+impl GpuInfo {
+    /// Human-facing label: the census description (`NVIDIA GeForce RTX
+    /// 4070`) when present, else the backend id (`CUDA0`). Engine
+    /// plumbing (`--device`, settle matching) keeps `name`; only
+    /// user-facing surfaces (ps) use this.
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        if self.description.is_empty() {
+            &self.name
+        } else {
+            &self.description
+        }
+    }
+}
+
 /// Vulkan device-description substrings that identify INTEGRATED GPUs
 /// (silicon shares system RAM: huge "free" numbers are a fiction and the
 /// effective bandwidth is a fraction of a discrete card). Matched

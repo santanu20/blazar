@@ -371,6 +371,7 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
                 "pallama_state": p.state,
                 "pallama_ctx": p.ctx,
                 "pallama_gpu": p.gpu,
+                "pallama_device": p.device,
                 "pallama_in_flight": p.in_flight,
                 "pallama_endpoint": p.endpoint,
                 "pallama_heat": p.heat,
