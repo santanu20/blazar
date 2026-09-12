@@ -85,6 +85,11 @@ tracked here.
 
 ### Fixed
 
+- **Session-bank restore leaves the spawn critical path**: the ~1s
+  slot-0 restore POST runs detached behind an fs-only identity
+  preflight, so Ready publishes at engine-health time (cold 9B
+  5.37s vs ~6.4s) and non-racing first requests pay nothing;
+  continuation chats still get the banked KV.
 - **Evict teardown no longer pins a std lock across awaits**: the
   evicting mark is a `tokio::sync::Mutex` with an explicit async
   release (every exit path clears it; a leaked mark starved every
