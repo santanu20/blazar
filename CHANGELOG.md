@@ -84,6 +84,13 @@ tracked here.
   explicitly; `engine_asset` overrides still win over the overlay.
 
 ### Fixed
+- **Circuit breaker counts crash restarts, not churn**:
+  `record_restart` fired on every successful spawn, so a user
+  stop→run churn ×4 inside the 60 s window opened the breaker on the
+  5th and 503'd until `pallama ps --reset` (live-repro'd). Restarts
+  now count only when the spawn consumes an unclean-death mark set by
+  the child reaper (non-zero exit); clean teardowns (stop / idle /
+  capacity) reset the mark — churn is a cold start, not a crash loop.
 - **Draft KV charged in the co-residency planner**: the pressure and
   admission math counted only the dense model's KV
   (`kv_est_bytes`), so a speculative pair's draft KV (device-side,

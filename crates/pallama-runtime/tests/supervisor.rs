@@ -412,6 +412,25 @@ async fn integration__crash__respawn_and_circuit() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn integration__churn__clean_stop_run_never_trips_circuit() {
+    // Live-repro'd bug: record_restart fired on EVERY successful spawn,
+    // so a user stop→run churn ×4 inside the breaker window opened the
+    // circuit on the 5th and 503'd until `ps --reset`. A clean teardown
+    // is a cold start, not a crash restart — churn must never trip.
+    let (_t, dirs) = setup(&[("m1", 500)]);
+    let sup = supervisor(&dirs, base_config(), false);
+    for round in 0..6 {
+        sup.evict("m1").await.unwrap();
+        match sup.ensure("m1").await {
+            Ok(_) => {}
+            Err(e) => panic!("clean churn round {round} must not trip the breaker: {e}"),
+        }
+    }
+    sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn integration__shutdown_kills_children__idempotent() {
     let (_t, dirs) = setup(&[("m1", 500), ("m2", 500)]);
     let mut cfg = base_config();

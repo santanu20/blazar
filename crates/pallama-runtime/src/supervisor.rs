@@ -468,8 +468,15 @@ pub struct Supervisor {
     loading: DashMap<String, Arc<Notify>>,
     /// Completed load results for waiters: Ok(port) or error text.
     load_results: DashMap<String, Result<EngineRef, String>>,
-    /// Crash-restart timestamps per model (circuit breaker).
+    /// Crash-restart timestamps per model (circuit breaker). Recorded
+    /// ONLY for spawns that consume an unclean-death mark — a user
+    /// stop→run churn is a cold start, not a crash restart.
     restarts: DashMap<String, Vec<Instant>>,
+    /// Models whose child died UNCLEANLY (non-zero exit) and whose next
+    /// successful spawn therefore counts as a crash restart. Set by
+    /// `reap_dead_children`, consumed by the spawn success path,
+    /// cleared by a clean evict (user stop / idle / capacity).
+    unclean_dead: DashMap<String, ()>,
     /// One-shot ctx override for the NEXT spawn of a model (per-request
     /// `options.num_ctx` — complaint #13). Consumed on use.
     pending_ctx: DashMap<String, u32>,
@@ -584,6 +591,7 @@ impl Supervisor {
             loading: DashMap::new(),
             load_results: DashMap::new(),
             restarts: DashMap::new(),
+            unclean_dead: DashMap::new(),
             pending_ctx: DashMap::new(),
             heat: std::sync::Mutex::new(std::collections::HashMap::new()),
             prefix_affinity: DashMap::new(),
@@ -1514,7 +1522,9 @@ impl Supervisor {
                         pid.to_string(),
                     );
                     self.instances.insert(ROUTER_KEY.to_string(), inst);
-                    self.record_restart(ROUTER_KEY);
+                    if self.unclean_dead.remove(ROUTER_KEY).is_some() {
+                        self.record_restart(ROUTER_KEY);
+                    }
                     self.bus.publish(PallamaEvent::InstanceStateChanged {
                         name: ROUTER_KEY.to_string(),
                         state: InstanceState::Ready,
@@ -2175,7 +2185,13 @@ impl Supervisor {
                         pid.to_string(),
                     );
                     self.instances.insert(key.to_string(), inst);
-                    self.record_restart(key);
+                    // A restart only counts when it follows an unclean
+                    // death — churn (stop→run) is a cold start, not a
+                    // crash loop (live-repro'd: 4 clean churns in 60s
+                    // used to open the breaker and 503 the 5th).
+                    if self.unclean_dead.remove(key).is_some() {
+                        self.record_restart(key);
+                    }
                     self.bus.publish(PallamaEvent::InstanceStateChanged {
                         name: key.to_string(),
                         state: InstanceState::Ready,
@@ -2423,6 +2439,10 @@ impl Supervisor {
         // that our cleanup would then race (map remove + pidfile/apikey
         // deletion under it).
         let _evicting = EvictingName::guard(self, name);
+        // A clean teardown (user stop / idle ladder / capacity) resets
+        // the crash history for this key: the next spawn is a cold
+        // start, not a respawn-after-crash.
+        self.unclean_dead.remove(name);
         // Session bank, choke point #1 (FIX1): EVERY eviction path —
         // gateway requests, idle ladder, capacity pressure — flows
         // through here, so the `_auto-<ctx>` checkpoint is saved exactly
@@ -3338,6 +3358,9 @@ impl Supervisor {
                             model = %inst.name,
                             "engine crashed ({status}); next request will respawn"
                         );
+                        // Unclean death: the next successful spawn of
+                        // this key counts toward the circuit breaker.
+                        self.unclean_dead.insert(inst.name.clone(), ());
                     }
                     crashed.push(inst.clone());
                 }
