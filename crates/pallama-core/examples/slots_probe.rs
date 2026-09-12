@@ -69,6 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         overlay: &overlay,
         loras: &[],
         draft_path: None,
+        draft_gguf: None,
         mmproj_path: Some(mmproj),
         engine_tag: "b10809",
         supported_flags: &flags,

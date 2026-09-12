@@ -42,6 +42,11 @@ pub struct ProfileInput<'a> {
     pub loras: &'a [(String, f64)],
     /// Local path of the pulled draft model when spec=auto resolved one.
     pub draft_path: Option<&'a str>,
+    /// Parsed GGUF header of that draft model, when available — lets the
+    /// planner charge the draft's device-side KV alongside the dense
+    /// model's. `None` = header unreadable (spawn still proceeds; the
+    /// charge degrades to dense-only with a daemon-side warn).
+    pub draft_gguf: Option<&'a GgufMeta>,
     /// Multimodal projector pulled alongside the model (vision/audio-in).
     /// Emitted as `-mm` when the engine supports it; the store's
     /// `mmproj_path` feeds this (rule 19).
@@ -1743,16 +1748,28 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             input.gguf.architecture
         ));
     }
+    // Draft KV: the spec pair allocates its own device-side KV at the
+    // same compiled ctx; charge it (f16, conservative) so the
+    // co-residency planner stops under-counting spec pairs. Unified mode
+    // keeps the dense KV in the cache-ram budget (floor charge) but the
+    // DRAFT's KV still lands on the card.
+    let draft_kv = input
+        .draft_gguf
+        .and_then(|g| kv_f16_bytes_meta(g, rs.total_ctx))
+        .unwrap_or(0);
     let kv_est_bytes = if kv_unified_emitted(input) {
-        Some(KV_UNIFIED_VRAM_FLOOR_BYTES)
+        Some(KV_UNIFIED_VRAM_FLOOR_BYTES + draft_kv)
     } else {
-        kv_f16_bytes(input, ctx).map(|f16| match kv_type.as_deref() {
-            Some("q8_0") => f16 / 2,
-            Some("q4_0") => f16 / 4,
-            Some("q4_1") => f16 * 9 / 20,
-            Some("q5_0") => f16 * 11 / 32,
-            Some("q5_1") => f16 * 3 / 8,
-            _ => f16,
+        kv_f16_bytes(input, ctx).map(|f16| {
+            let dense = match kv_type.as_deref() {
+                Some("q8_0") => f16 / 2,
+                Some("q4_0") => f16 / 4,
+                Some("q4_1") => f16 * 9 / 20,
+                Some("q5_0") => f16 * 11 / 32,
+                Some("q5_1") => f16 * 3 / 8,
+                _ => f16,
+            };
+            dense + draft_kv
         })
     };
 
@@ -2045,6 +2062,12 @@ fn kv_quant_ladder(
 #[must_use]
 fn kv_f16_bytes(input: &ProfileInput<'_>, ctx: u32) -> Option<u64> {
     input.gguf.kv_f16_bytes(u64::from(ctx))
+}
+
+/// Geometry-only f16 KV bytes for a given header (shared by the dense
+/// estimate and the draft-model planner charge).
+fn kv_f16_bytes_meta(gguf: &GgufMeta, ctx: u32) -> Option<u64> {
+    gguf.kv_f16_bytes(u64::from(ctx))
 }
 
 /// Public KV estimate for callers outside the compiler (the supervisor's
@@ -3121,6 +3144,7 @@ mod tests {
             overlay: &DEFAULT_OVERLAY,
             loras: &[],
             draft_path: None,
+            draft_gguf: None,
             mmproj_path: None,
             mmproj_force: false,
             engine_tag: "b-test",
@@ -5591,6 +5615,59 @@ mod tests {
             Some(512 * 1024 * 1024),
             "floor is quant-agnostic"
         );
+    }
+
+    #[test]
+    fn unit__kv_est__draft_kv_charged_unified() {
+        // Spec pair on unified KV: the dense KV lives in the cache-ram
+        // budget (floor charge), but the DRAFT's KV still lands on the
+        // card — the planner charge is floor + draft f16 KV at the
+        // compiled total ctx.
+        let hw = gpu_hw(24_000, 64_000, 8);
+        let g = meta();
+        let draft = GgufMeta {
+            block_count: Some(2),
+            ..meta()
+        };
+        let cfg = Config {
+            spec: "eagle3".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let mut inp =
+            input_named_with_spec("qwen3-8b", &g, &hw, &cfg, &ALL_FLAGS, &EAGLE3_SPEC_TYPES);
+        let path = draft_file("kv-charge");
+        inp.draft_path = Some(&path);
+        inp.draft_gguf = Some(&draft);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        let expect = KV_UNIFIED_VRAM_FLOOR_BYTES + draft.kv_f16_bytes(16_384).unwrap();
+        assert_eq!(p.kv_est_bytes, Some(expect));
+    }
+
+    #[test]
+    fn unit__kv_est__draft_kv_charged_classic() {
+        // Classic KV: dense quantized estimate PLUS the draft's f16 KV.
+        // Roomy VRAM keeps the quant ladder off, so dense stays f16.
+        let hw = gpu_hw(24_000, 64_000, 8);
+        let g = meta();
+        let draft = GgufMeta {
+            block_count: Some(2),
+            ..meta()
+        };
+        let cfg = Config {
+            spec: "eagle3".into(),
+            slots: 1,
+            kv_unified: Some(false),
+            ..Config::default()
+        };
+        let mut inp =
+            input_named_with_spec("qwen3-8b", &g, &hw, &cfg, &ALL_FLAGS, &EAGLE3_SPEC_TYPES);
+        let path = draft_file("kv-charge");
+        inp.draft_path = Some(&path);
+        inp.draft_gguf = Some(&draft);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        let expect = g.kv_f16_bytes(16_384).unwrap() + draft.kv_f16_bytes(16_384).unwrap();
+        assert_eq!(p.kv_est_bytes, Some(expect));
     }
 
     #[test]

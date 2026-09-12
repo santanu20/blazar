@@ -1330,6 +1330,7 @@ impl Supervisor {
                 overlay: &overlay,
                 loras: &loras,
                 draft_path: draft_path.as_deref(),
+                draft_gguf: None, // router preset: one child, no co-residency planning
                 mmproj_path: m.mmproj_path.as_deref(),
                 // router preset: every pulled model rides one child incl
                 // VL rows — force the projector on regardless of policy
@@ -1707,7 +1708,24 @@ impl Supervisor {
             .clone()
             .unwrap_or_else(|| self.config.spec.clone());
         let draft_path = resolve_draft_path(&store, name, &spec_mode);
-
+        // Draft header for the planner's device-KV charge (A15): the
+        // spec pair allocates its own KV at the compiled ctx. An
+        // unreadable header degrades to dense-only with a warn — it
+        // must never block the spawn itself.
+        let draft_gguf =
+            draft_path.as_deref().and_then(|p| {
+                match pallama_core::read_metadata_file(std::path::Path::new(p)) {
+                    Ok(g) => Some(g),
+                    Err(e) => {
+                        tracing::warn!(
+                            model = name,
+                            draft = p,
+                            "draft header unreadable; co-residency planner charges dense-only: {e}"
+                        );
+                        None
+                    }
+                }
+            });
         // Capacity: evict the COLDEST instance first — recency-weighted
         // prefix heat (hot models keep their warm cache across capacity
         // pressure; the radix-lite lane), ties broken by longest-idle.
@@ -1857,6 +1875,7 @@ impl Supervisor {
                 overlay: &overlay,
                 loras: &loras,
                 draft_path: draft_path.as_deref(),
+                draft_gguf: draft_gguf.as_ref(),
                 mmproj_path: model.mmproj_path.as_deref(),
                 // KV-estimate probe: policy-neutral (mirror the spawn's
                 // own key-derived force below for estimate honesty)
@@ -2009,6 +2028,7 @@ impl Supervisor {
                 overlay: &overlay,
                 loras: &loras,
                 draft_path: draft_path.as_deref(),
+                draft_gguf: draft_gguf.as_ref(),
                 mmproj_path: model.mmproj_path.as_deref(),
                 // @vision respawn = caller demanded a projector-carrying
                 // child (ensure_vision); every other spawn honors policy

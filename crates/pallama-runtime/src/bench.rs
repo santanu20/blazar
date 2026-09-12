@@ -846,6 +846,8 @@ pub fn build_input<'a>(
         overlay,
         loras,
         draft_path,
+        // bench scores one argv in isolation; no co-residency planning
+        draft_gguf: None,
         mmproj_path: None, // vision is irrelevant to llama-bench scoring
         mmproj_force: false,
         engine_tag,

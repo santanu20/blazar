@@ -84,6 +84,15 @@ tracked here.
   explicitly; `engine_asset` overrides still win over the overlay.
 
 ### Fixed
+- **Draft KV charged in the co-residency planner**: the pressure and
+  admission math counted only the dense model's KV
+  (`kv_est_bytes`), so a speculative pair's draft KV (device-side,
+  often LARGER than its weights — e.g. 2.2 GiB vs 0.35 GiB on the
+  eagle3 8B pair) was invisible to card-capacity decisions. The
+  profile now adds the draft's f16 KV at the resolved ctx (unified:
+  on top of the floor; classic: on top of the quantized dense KV);
+  an unreadable draft header degrades to dense-only with a daemon
+  warning rather than blocking the spawn.
 - **Speculative drafts no longer pin `--gpu-layers 999`**: the draft's
   weights + KV allocate DEVICE-side beyond any planner charge, and a
   hard pin disables the engine's live fitter (`n_gpu_layers already

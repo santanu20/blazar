@@ -83,6 +83,7 @@ fn test_input<'a>(
         overlay,
         loras: &[],
         draft_path: None,
+        draft_gguf: None,
         engine_tag: "b-stub",
         supported_flags: flags,
         spec_types: &[],
