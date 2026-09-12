@@ -1380,7 +1380,14 @@ impl Accum {
                 self.has_reasoning = true;
                 Self::push_bounded(&mut self.reasoning, &mut self.degraded, s);
             }
-            if let Some(s) = carrier.get("text").and_then(Value::as_str) {
+            // Legacy completions grammar puts `text` directly on the
+            // choice (no delta/message carrier); both keys are read so
+            // /api/generate + /v1/completions traffic accumulates.
+            let text = carrier
+                .get("text")
+                .or_else(|| choice.get("text"))
+                .and_then(Value::as_str);
+            if let Some(s) = text {
                 Self::push_bounded(&mut self.text, &mut self.degraded, s);
             }
             if let Some(tcs) = carrier.get("tool_calls").and_then(Value::as_array) {
@@ -2079,6 +2086,101 @@ mod tests {
         let d = s.finalize(&RequestCtx::default(), &acc, 200);
         assert!(d.iter().any(|x| x.code == Code::ReasoningNoAnswer), "{d:?}");
         assert!(!d.iter().any(|x| x.code == Code::EmptyResponse), "{d:?}");
+    }
+
+    #[test]
+    fn unit__apply__completions_grammar_text_on_choice() {
+        // Pin: the legacy completions grammar puts `text` directly on the
+        // choice (never under delta/message). Dropping it made every
+        // /api/generate + /v1/completions response look empty (observed:
+        // 100% false EmptyResponse rate on both routes).
+        let s = Sentinel::new(true, 0, None);
+        let mut acc = Accum::default();
+        acc.apply(&serde_json::json!({
+            "choices": [{"text": "benchmark tokens", "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2}
+        }));
+        assert_eq!(acc.text, "benchmark tokens");
+        assert!(acc.saw_any_choice);
+        let d = s.finalize(&RequestCtx::default(), &acc, 200);
+        assert!(
+            !d.iter().any(|x| x.code == Code::EmptyResponse),
+            "completions text on choice must count as content: {d:?}"
+        );
+
+        // Genuinely empty completions response still flags.
+        let mut empty = Accum::default();
+        empty.apply(&serde_json::json!({
+            "choices": [{"text": "", "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2}
+        }));
+        let d2 = s.finalize(&RequestCtx::default(), &empty, 200);
+        assert!(d2.iter().any(|x| x.code == Code::EmptyResponse), "{d2:?}");
+
+        // Chat grammar (delta/message carriers) must keep working.
+        let mut chat = Accum::default();
+        chat.apply(&serde_json::json!({
+            "choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]
+        }));
+        assert_eq!(chat.content, "hi");
+        let d3 = s.finalize(&RequestCtx::default(), &chat, 200);
+        assert!(!d3.iter().any(|x| x.code == Code::EmptyResponse), "{d3:?}");
+    }
+
+    #[test]
+    fn unit__accum__captures_every_upstream_grammar() {
+        // Coverage pin: every response grammar any lane can feed the
+        // analyzer must land in the accumulator — a grammar the parser
+        // silently drops becomes a 100% false-flag route (the
+        // EmptyResponse incident on ollama-generate/openai-completions).
+        // Chat non-stream (message carrier).
+        let mut chat_json = Accum::default();
+        chat_json.apply(&serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "a"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1}
+        }));
+        assert_eq!(chat_json.content, "a");
+        assert_eq!(chat_json.finish.as_deref(), Some("stop"));
+        assert_eq!(chat_json.usage_completion, Some(1));
+
+        // Chat SSE delta chunks, content + reasoning.
+        let mut chat_sse = Accum::default();
+        chat_sse.apply(&serde_json::json!({"choices": [{"delta": {"reasoning_content": "th"}}]}));
+        chat_sse.apply(&serde_json::json!({"choices": [{"delta": {"content": "b"}}]}));
+        chat_sse.apply(&serde_json::json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}));
+        assert_eq!(chat_sse.reasoning, "th");
+        assert_eq!(chat_sse.content, "b");
+
+        // Completions non-stream + SSE chunk (text on the choice).
+        let mut comp = Accum::default();
+        comp.apply(&serde_json::json!({"choices": [{"text": "c"}]}));
+        comp.apply(&serde_json::json!({"choices": [{"text": "d", "finish_reason": "length"}]}));
+        assert_eq!(comp.text, "cd");
+
+        // Streamed tool-call fragments reassemble by index.
+        let mut tools = Accum::default();
+        tools.apply(&serde_json::json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"name": "get_weather"}}
+        ]}}]}));
+        tools.apply(&serde_json::json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": "{\"city\":"}}
+        ]}}]}));
+        tools.apply(&serde_json::json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": "\"Oslo\"}"}}
+        ]}}]}));
+        let frag = tools.tools.get(&0).expect("fragment keyed by index");
+        assert_eq!(frag.name, "get_weather");
+        assert_eq!(frag.args, "{\"city\":\"Oslo\"}");
+
+        // Each populated grammar alone must clear EmptyResponse.
+        let s = Sentinel::new(true, 0, None);
+        for acc in [chat_json, chat_sse, comp, tools] {
+            let d = s.finalize(&RequestCtx::default(), &acc, 200);
+            assert!(
+                !d.iter().any(|x| x.code == Code::EmptyResponse),
+                "grammar dropped by the accumulator: {d:?}"
+            );
+        }
     }
 
     #[test]
