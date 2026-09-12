@@ -234,7 +234,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // otherwise. Floor the budget at weights + KV working-set floor +
     // headroom when unified is on and the box's RAM can actually host
     // it (60% sanity guard); otherwise keep the clamp and escalate.
-    let cache_ram_budget: Option<u64> = if config.cache_ram_mb > 0 {
+    let (cache_ram_budget, budget_floored): (Option<u64>, bool) = if config.cache_ram_mb > 0 {
         let requested = u64::try_from(config.cache_ram_mb).unwrap_or(u64::MAX);
         let clamped = effective_cache_ram_mib(input).map_or(requested, |cap| requested.min(cap));
         if clamped < requested {
@@ -251,9 +251,17 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         }
         if kv_unified_emitted(input) && input.model_bytes > 0 {
             let weights_mib = input.model_bytes / (1024 * 1024);
-            let floor_mib = weights_mib
-                .saturating_add(KV_UNIFIED_VRAM_FLOOR_BYTES / (1024 * 1024))
-                .saturating_add(64);
+            // Derive the floor FROM 2b's own fit constraint at the ctx
+            // floor: demand (weights + f16 KV @ AUTOFIT_CTX_FLOOR + 64
+            // slack) must fit 2b's usable share (85%). A floor built any
+            // other way makes 2b hard-warn BY CONSTRUCTION — live-repro'd
+            // on a 9B: floor 5993 → 2b usable 5094 < weights 5417 alone,
+            // "cannot fit even at the ctx floor" on a spawn the engine
+            // handled fine. ×20/17 = ÷0.85 in integers.
+            let kv_floor_mib = kv_f16_bytes(input, AUTOFIT_CTX_FLOOR)
+                .unwrap_or(KV_UNIFIED_VRAM_FLOOR_BYTES)
+                / (1024 * 1024);
+            let floor_mib = (weights_mib + kv_floor_mib + 64) * 20 / 17;
             let ram_guard = input.hardware.total_ram_mib * 60 / 100;
             if clamped < floor_mib && floor_mib <= ram_guard {
                 warnings.push(format!(
@@ -262,7 +270,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
                      {floor_mib} MiB; a sub-weights budget makes the engine fitter \
                      CPU-split layers (measured 15.6 vs 39.9 t/s on a 9B)"
                 ));
-                Some(floor_mib)
+                (Some(floor_mib), true)
             } else if clamped < floor_mib {
                 warnings.push(format!(
                     "cache-ram budget {clamped} MiB cannot cover weights {weights_mib} MiB \
@@ -270,15 +278,15 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
                      guard ({ram_guard} MiB) — set kv_unified = false, quant down \
                      (pallama fit), or raise the budget; the fitter may CPU-split layers"
                 ));
-                Some(clamped)
+                (Some(clamped), false)
             } else {
-                Some(clamped)
+                (Some(clamped), false)
             }
         } else {
-            Some(clamped)
+            (Some(clamped), false)
         }
     } else {
-        None
+        (None, false)
     };
     // --- 2b. unified-KV pool must fit the --cache-ram budget.
     // With `--kv-unified` the WHOLE KV pool plus the weights mmap live
@@ -297,7 +305,15 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             // bounded by it).
             let budget_mib = cache_ram_budget.unwrap_or(8192);
             // Compute buffers share the budget too; hold a headroom slice.
-            let usable = budget_mib * 1024 * 1024 * 85 / 100;
+            // Headroom lives in EXACTLY ONE place: a 2a-bis floor is
+            // BUILT with the 0.85 share already inside, so the fit check
+            // compares against the raw floor; an unfloored (clamped or
+            // explicit) budget still reserves the 15% here.
+            let usable = if budget_floored {
+                budget_mib * 1024 * 1024
+            } else {
+                budget_mib * 1024 * 1024 * 85 / 100
+            };
             let demand = input.model_bytes.saturating_add(kv);
             if demand > usable {
                 let mib = |b: u64| b / (1024 * 1024);
@@ -3723,8 +3739,9 @@ mod tests {
         // Live case: 13 GiB laptop, default 8192 -> cap 4007 (30% of 13359).
         // Unclamped, the child RSS plateaus at 8.3 GiB and the box swap-thrashes.
         // Under default --kv-unified the 5000 MiB weights ALSO live in the
-        // budget, so the 2a-bis floor lifts 4007 -> 5576 (weights + KV
-        // floor + headroom; 42% of RAM, inside the 60% guard): a
+        // budget, so the 2a-bis floor lifts 4007 -> 6221 (weights + f16 KV
+        // at the ctx floor + 64 slack, all over the 0.85 compute share;
+        // inside the 60% guard): a
         // sub-weights budget makes the engine fitter CPU-split layers
         // (measured 15.6 vs 39.9 t/s on a 9B).
         let cfg = Config::default();
@@ -3738,12 +3755,12 @@ mod tests {
         assert!(p
             .argv
             .windows(2)
-            .any(|w| w[0] == "--cache-ram" && w[1] == "5576"));
+            .any(|w| w[0] == "--cache-ram" && w[1] == "6221"));
         assert!(p
             .warnings
             .iter()
             .any(|w| w.contains("cache_ram_mb 8192 clamped to 4007")));
-        assert!(p.warnings.iter().any(|w| w.contains("floored to 5576 MiB")));
+        assert!(p.warnings.iter().any(|w| w.contains("floored to 6221 MiB")));
     }
 
     #[test]
@@ -6753,15 +6770,15 @@ mod tests {
             .windows(2)
             .any(|w| w[0] == "--cache-ram" && w[1] == "6553"));
         // Cold: 20% cap = 3276, but the 2a-bis unified weights floor
-        // (5000 MiB weights + 512 + 64) lifts every below-floor cap to
-        // 5576 — a sub-weights budget CPU-splits layers at the fitter.
+        // (5000 + kv@4096 224 + 64, all over 0.85) lifts every below-floor
+        // cap to 6221 — a sub-weights budget CPU-splits layers at the fitter.
         let mut inp = input(&g, &hw, &cfg, &WIRE_FLAGS);
         inp.cache_hit_rate = Some(0.01);
         let p2 = compile(&inp, &TuningOverrides::default()).unwrap();
         assert!(p2
             .argv
             .windows(2)
-            .any(|w| w[0] == "--cache-ram" && w[1] == "5576"));
+            .any(|w| w[0] == "--cache-ram" && w[1] == "6221"));
         // The tier itself stays visible in the clamp warning.
         assert!(p2.warnings.iter().any(|w| w.contains("clamped to 3276")));
         // None: static 30% = 4915 — also below the floor.
@@ -6770,7 +6787,7 @@ mod tests {
         assert!(p3
             .argv
             .windows(2)
-            .any(|w| w[0] == "--cache-ram" && w[1] == "5576"));
+            .any(|w| w[0] == "--cache-ram" && w[1] == "6221"));
     }
 
     #[test]
