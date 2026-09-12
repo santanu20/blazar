@@ -1204,6 +1204,17 @@ def direct_argv(
     return argv
 
 
+def warm_cell_gpu_guard(where: str) -> float:
+    """Warm cells measured WITH a foreign GPU resident are contaminated
+    (live twice: a production daemon's 5 GiB engine cut BOTH runtimes to
+    ~5 t/s). Drain-wait, then flag what remains on the record."""
+    if not wait_gpu_idle(max_mib=512.0, timeout_s=30.0):
+        busy = round(gpu_used_mib(), 0)
+        log(f"  ! {where}: GPU busy {busy} MiB — warm numbers are contaminated")
+        return busy
+    return 0.0
+
+
 def run_direct_cell(
     eng: Engine,
     model: Path,
@@ -1214,6 +1225,7 @@ def run_direct_cell(
     stage_root: Path,
 ) -> dict:
     port = free_port()
+    rec = {"gpu_busy_mib": warm_cell_gpu_guard("direct cell")}
     staged = None
     if eng.kind == "mistralrs":
         staged = stage_mistralrs_view(model, mmproj, stage_root)
@@ -1412,6 +1424,7 @@ def run_pallama_cell(
         con.commit()
         con.close()
         daemon = V.Daemon(sb)
+        rec["gpu_busy_mib"] = warm_cell_gpu_guard("pallama cell")
         t_boot0 = time.perf_counter()
         port: int | None = None
         try:
@@ -2167,10 +2180,12 @@ def run_ollama_cell(cfg: dict, args_model: str | None = None) -> dict:
             )
         }
     sampler = Sampler(None)  # global GPU/power: the service is not our child
+    gpu_busy = warm_cell_gpu_guard("ollama cell")
     sampler.start()
     try:
         out = {
             "ollama_model": pick,
+            "gpu_busy_mib": gpu_busy,
             **median_run_suite(
                 OLLAMA_PORT, pick, cfg["runs"], cfg["pp"], cfg["tg"], ollama=True
             ),
