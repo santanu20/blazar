@@ -4446,6 +4446,7 @@ async fn sysinfo_cmd(base: &str) -> Result<()> {
 /// (usage-carrying) chunk for --verbose stats.
 #[allow(clippy::duration_suboptimal_units)] // 10-minute generation ceiling
 async fn stream_chat(base: &str, body: &serde_json::Value) -> Result<Option<serde_json::Value>> {
+    use std::io::IsTerminal as _;
     // Streaming lane: no total-request ceiling; the 600s per-request
     // timeout below is the bound (F126 exemption).
     let resp = reqwest::Client::new()
@@ -4463,6 +4464,10 @@ async fn stream_chat(base: &str, body: &serde_json::Value) -> Result<Option<serd
     let mut chunk_lines = pallama_gateway::translate::LineBuffer::new();
     let mut final_chunk: Option<serde_json::Value> = None;
     let stdout = std::io::stdout();
+    // Thinking deltas render dimmed only on a real terminal; piped output
+    // stays clean for downstream consumers (jq, scripts, files).
+    let is_tty = stdout.is_terminal();
+    let mut after_thinking = false;
     let mut out = stdout.lock();
     while let Some(chunk) = futures_lite_next(&mut resp).await? {
         buf.push_str(&chunk_lines.feed(&chunk));
@@ -4473,8 +4478,22 @@ async fn stream_chat(base: &str, body: &serde_json::Value) -> Result<Option<serd
                 continue;
             }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if is_tty {
+                    if let Some(thinking) = v["message"]["thinking"].as_str() {
+                        if !thinking.is_empty() {
+                            write!(out, "\x1b[2m{thinking}\x1b[0m").ok();
+                            after_thinking = true;
+                        }
+                    }
+                }
                 if let Some(content) = v["message"]["content"].as_str() {
-                    write!(out, "{content}").ok();
+                    if !content.is_empty() {
+                        if after_thinking {
+                            writeln!(out).ok();
+                            after_thinking = false;
+                        }
+                        write!(out, "{content}").ok();
+                    }
                 }
                 if v["done"].as_bool().unwrap_or(false) {
                     final_chunk = Some(v);
