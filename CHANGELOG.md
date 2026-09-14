@@ -133,6 +133,17 @@ tracked here.
   clone `choices[].logprobs.content` to the top-level `logprobs`
   array (ollama-native field names — verifier clients parse it
   directly).
+- **`pallama doctor` flags model-dir orphans**: GGUF files in the
+  models folder that no store row owns (the "folder shows many, `list`
+  shows few" confusion) are reported by the models check with a
+  `pallama import <file> --name <n>` hint — import to register or
+  delete to reclaim. Hardlink twins of registered files (import's
+  dedup shape, e.g. case-duplicate leaves) are counted separately with
+  the teaching that deleting them reclaims no space (same inode);
+  attached projectors are never orphans (they ride their model row).
+  Unix uses (dev,ino) twin detection; Windows counts all unreferenced
+  GGUFs as orphans. Clean boxes emit byte-identical output (suffix
+  only appears when there is something to say).
 - **`pallama doctor` flags config pins that mirror retired defaults**:
   template pins outlive default changes — a config written when
   `cache_reuse = 256` or `spec = "off"` were the defaults silently keeps
@@ -144,6 +155,26 @@ tracked here.
   and `model_overrides` spellings both checked; a fresh/default config
   emits no row. The check registry is a maintenance contract: future
   default changes add their entry there.
+- **GPU driver preflight — the zero-touch last mile**: the Linux
+  installer now detects PCI GPU hardware before the engine bootstrap
+  (`lspci`; pciutils provisioned when missing) and, when the driver
+  userspace is absent, installs it from **first-party distro repos
+  only** (announce-then-act, never fatal): NVIDIA via apt's
+  `nvidia-driver` metapackage / pacman's `nvidia nvidia-utils`; dnf
+  auto-installs `akmod-nvidia` only when RPMFusion is already enabled;
+  zypper (and every third-party-only lane) prints the exact command
+  instead of running it. AMD/Intel cards without a Vulkan ICD get
+  `mesa-vulkan-drivers`/`vulkan-radeon`/`vulkan-intel`. A driver
+  install ends with the loud chain: REBOOT, then `pallama engine
+  update` — which auto-picks the newest CUDA build the driver supports
+  (runtimes bundled; no CUDA toolkit). Opt out with
+  `PALLAMA_AUTO_DRIVER=0` (acknowledged even when the engine bootstrap
+  is off; skipped entirely under `PALLAMA_INSTALL_ENGINE=0`). The
+  Windows installer is advise-only (detects NVIDIA hardware without
+  `nvidia-smi`, links the driver download). `pallama doctor` gains
+  `nvidia driver` / `vulkan driver` WARN rows when PCI GPU hardware is
+  present but its driver is not (new pure helpers
+  `probe::parse_pci_vendors`/`pci_gpu_vendors`).
 - **Profile warnings surfaced to users**: compile-time decisions
   (unified-KV ctx fit, slot auto `-np`, gpu-offload rationale,
   cache-ram clamp, dense-fallback) were daemon-log-only. They now ride

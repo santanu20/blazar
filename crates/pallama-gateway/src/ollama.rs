@@ -75,10 +75,15 @@ pub async fn watch(State(state): State<Arc<AppState>>) -> Response {
         .unwrap_or_else(|e| api_error(500, &format!("watch body: {e}")))
 }
 
-/// GET /api/why[?trace=...] — the sentinel ring: what the model returned,
+/// GET /api/why — the sentinel ring: what the model returned,
 /// what was wrong with it, which knob fixes it. Powers `pallama why`.
 /// `sentinel: false` reports the kill-switch state instead of an error:
 /// silent-empty is the exact failure mode this exists to expose.
+/// Params: `trace=<id>` (exact match), `model=<substr>`,
+/// `code=<substr>` (detection code), `flagged=1` (detection-carrying
+/// records only), `limit=<n>` (default 10, capped at the ring size) —
+/// filters apply before the newest-first cut so flagged records older
+/// than the latest clean batch stay reachable.
 /// Minimal percent-decoding for hand-parsed query values (F19: model
 /// names like `Qwen3%2F0.6` must round-trip; `+` is left alone since
 /// path-shaped values never use the form-encoding space convention).
@@ -108,6 +113,8 @@ pub async fn why(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
     let mut trace = None;
     let mut model = None;
     let mut code = None;
+    let mut flagged_only = false;
+    let mut limit = 10usize;
     for pair in q.split('&') {
         if let Some(v) = pair.strip_prefix("trace=") {
             trace = Some(percent_decode(v));
@@ -115,22 +122,22 @@ pub async fn why(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
             model = Some(percent_decode(v));
         } else if let Some(v) = pair.strip_prefix("code=") {
             code = Some(percent_decode(v));
+        } else if pair == "flagged=1" {
+            flagged_only = true;
+        } else if let Some(v) = pair.strip_prefix("limit=") {
+            limit = v.parse().unwrap_or(10);
         }
     }
-    let records: Vec<_> = state
-        .sentinel
-        .why(trace.as_deref(), 100)
-        .into_iter()
-        .filter(|r| model.as_ref().is_none_or(|m| r.model.contains(m.as_str())))
-        .filter(|r| {
-            code.as_ref().is_none_or(|c| {
-                r.detections
-                    .iter()
-                    .any(|d| d.code.as_str().contains(c.as_str()))
-            })
-        })
-        .take(10)
-        .collect();
+    // Scan the full ring (not a fixed 100) so filtered views reach older
+    // records; the cap + take live in filter_why_records. `limit` above
+    // RING_CAP would just return the whole ring — clamp for honesty.
+    let records = sentinel::filter_why_records(
+        state.sentinel.why(trace.as_deref(), sentinel::RING_CAP),
+        model.as_deref(),
+        code.as_deref(),
+        flagged_only,
+        limit.min(sentinel::RING_CAP),
+    );
     let records_json: Vec<_> = records
         .iter()
         .map(sentinel::SentinelRecord::to_json)
@@ -673,6 +680,52 @@ fn event_kind(e: &pallama_runtime::PallamaEvent) -> &'static str {
     }
 }
 
+/// ollama unload idiom: `{model, keep_alive: 0}` with no inference
+/// payload is a load-state ping, not a request — real ollama answers
+/// 200 (harnesses release models with exactly this shape; a 400 here
+/// broke `_unload_all`-style sweeps). Evict-if-running, session pins
+/// still win (R3, same contract as the serve-then-evict path), then a
+/// minimal lane-shaped done body.
+async fn unload_ping(state: &Arc<AppState>, model: &str, chat_shape: bool) -> Response {
+    let row = match state.with_store(|s| resolve_model(s, model)) {
+        Some(Ok(r)) => r,
+        Some(Err(e)) => return api_error(404, &e),
+        None => return api_error(500, "store unavailable"),
+    };
+    let pinned = state
+        .sup
+        .sessions
+        .pins(
+            &row.name,
+            std::time::Duration::from_secs(state.config.session_keep_secs),
+        )
+        .live;
+    if !pinned {
+        let _ = state.sup.evict_model(&row.name).await;
+    }
+    let body = if chat_shape {
+        serde_json::json!({
+            "model": row.name,
+            "created_at": tr::iso_now(),
+            "message": {"role": "assistant", "content": ""},
+            "done": true,
+        })
+    } else {
+        serde_json::json!({
+            "model": row.name,
+            "created_at": tr::iso_now(),
+            "response": "",
+            "done": true,
+        })
+    };
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
 /// POST /api/chat — full translation incl. `num_ctx` + `keep_alive`.
 #[allow(clippy::too_many_lines)] // one cohesive translation + admission path
 pub async fn chat(
@@ -724,6 +777,15 @@ pub async fn chat(
             out = crate::keys::charge_outgoing(out, &name, Arc::clone(&state.keys));
         }
         return out;
+    }
+    // ollama unload idiom: no messages + keep_alive 0 = release ping.
+    if parse_keep_alive(req.get("keep_alive")) == Some(0)
+        && req
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_none_or(|m: &Vec<Value>| m.is_empty())
+    {
+        return unload_ping(&state, &model_field, true).await;
     }
     let (mut openai_req, num_ctx) = match tr::chat_to_openai(&req) {
         Ok(r) => r,
@@ -1835,6 +1897,18 @@ pub async fn generate(
         Ok(v) => v,
         Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
     };
+    // ollama unload idiom: no/empty prompt + keep_alive 0 = release
+    // ping — must short-circuit before the translator's required-field
+    // 400 (real ollama is an idempotent 200).
+    if parse_keep_alive(req.get("keep_alive")) == Some(0)
+        && req
+            .get("prompt")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        let ping_model = req["model"].as_str().unwrap_or_default().to_string();
+        return unload_ping(&state, &ping_model, false).await;
+    }
     let mut openai_req = match tr::generate_to_openai(&req) {
         Ok(Some(v)) => v,
         Ok(None) => {

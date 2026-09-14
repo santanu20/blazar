@@ -35,6 +35,15 @@
 #   PALLAMA_INSTALL_BASE_URL   replace the GitHub API base (mirrors, tests)
 #   PALLAMA_INSTALL_ENGINE     0 = skip the engine bootstrap (default: install
 #                              the llama.cpp engine so the box is infer-ready)
+#   PALLAMA_UNIT_MEMORY_HIGH  systemd soft memory ceiling for the daemon
+#                              cgroup (default: 85% of RAM, recomputed by
+#                              systemd at every unit start — adapts to RAM
+#                              changes). Soft = reclaim/throttle only, never
+#                              an OOM kill. Set to an empty string to omit
+#                              the line entirely.
+#   PALLAMA_AUTO_DRIVER        0 = skip the GPU preflight (default: detect PCI
+#                              GPUs and, when the driver userspace is missing,
+#                              install it from FIRST-PARTY distro repos only)
 #   PALLAMA_INSTALL_MODEL      optional first model to pull (e.g.
 #                              qwen2.5:0.5b) — opt-in, never defaulted
 #   PALLAMA_SYSTEM_BIN_DIR     binary destination (default /usr/local/bin)
@@ -112,14 +121,45 @@ derive_repo() {
     esac
 }
 
+# ---- invoking-user scope (sudo one-click support) --------------------------
+# `curl | sudo sh install.sh` runs everything as root: user-keyed paths
+# (HOME, cargo/rustup, the pallama store) belong to the INVOKING user.
+# Every user-environment action (toolchain probe, source build, migrate/
+# engine/pull CLIs) goes through as_user so nothing populates /root's
+# store or leaves root-owned files in the user's checkout.
+USER_HOME="$HOME"
+BUILD_USER=
+if [ "$(id -u)" -eq 0 ] && [ "${SUDO_USER:-}" != "" ] && [ "$SUDO_USER" != "root" ]; then
+    BUILD_USER="$SUDO_USER"
+    _hm=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
+    [ -z "$_hm" ] && [ "$(uname -s)" = Darwin ] &&
+        _hm=$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory 2>/dev/null | awk '{print $NF}')
+    [ -n "$_hm" ] && USER_HOME="$_hm"
+fi
+USER_CARGO_BIN="$USER_HOME/.cargo/bin"
+
+as_user() {
+    # as_user <cmd...> — run in the invoking user's environment (HOME +
+    # cargo on PATH). Unprivileged installs run in place.
+    if [ -z "$BUILD_USER" ]; then
+        HOME="$USER_HOME" PATH="$USER_CARGO_BIN:$PATH" "$@"
+    elif command -v runuser >/dev/null 2>&1; then
+        runuser -u "$BUILD_USER" -- env HOME="$USER_HOME" PATH="$USER_CARGO_BIN:$PATH" "$@"
+    else
+        sudo -H -u "$BUILD_USER" env PATH="$USER_CARGO_BIN:$PATH" "$@"
+    fi
+}
+
 # Provision a missing compile toolchain (cc + rust) via bootstrap.sh
 # --minimal, announce-then-act. Returns 0 when a source build is
 # possible (already present, or bootstrapped now); 1 when declined
 # (PALLAMA_AUTO_BOOTSTRAP=0), impossible (no bootstrap script) or the
 # bootstrap itself failed — NEVER a silent path: the caller reports.
+# Probes and rustup land in the INVOKING user's environment (a root-run
+# probe used to miss ~/.cargo and re-install rustup into /root).
 ensure_toolchain() {
     if [ "${PALLAMA_FORCE_BOOTSTRAP:-0}" != 1 ]; then
-        command -v cargo >/dev/null 2>&1 && command -v cc >/dev/null 2>&1 && return 0
+        as_user sh -c 'command -v cargo >/dev/null 2>&1 && command -v cc >/dev/null 2>&1' && return 0
     fi
     [ "${PALLAMA_AUTO_BOOTSTRAP:-1}" = 1 ] || return 1
     _bs="${PALLAMA_BOOTSTRAP:-}"
@@ -128,14 +168,177 @@ ensure_toolchain() {
     fi
     [ -n "$_bs" ] || return 1
     status "toolchain missing — bootstrapping cc/make/rust via: sh $_bs --minimal"
-    if ! sh "$_bs" --minimal; then
+    # bootstrap.sh mixes root work (cc via the package manager) with
+    # user work (rustup into $HOME/.cargo): run it as root but with the
+    # invoking user's HOME, then hand the fresh ~/.cargo/.rustup back to
+    # that user — root-owned rustup files break every later user build.
+    if [ -n "$BUILD_USER" ]; then
+        if ! HOME="$USER_HOME" sh "$_bs" --minimal; then
+            status "WARN: toolchain bootstrap failed (output above) — source build unavailable on this box"
+            return 1
+        fi
+        chown -R "$BUILD_USER:$(id -gn "$BUILD_USER")" "$USER_HOME/.cargo" "$USER_HOME/.rustup" 2>/dev/null
+    elif ! sh "$_bs" --minimal; then
         status "WARN: toolchain bootstrap failed (output above) — source build unavailable on this box"
         return 1
     fi
     # rustup ran in a child process; its ~/.cargo/env can't reach us, so
-    # refresh PATH manually.
-    PATH="$HOME/.cargo/bin:$PATH"
-    command -v cargo >/dev/null 2>&1 && command -v cc >/dev/null 2>&1
+    # verify through the user environment explicitly.
+    as_user sh -c 'command -v cargo >/dev/null 2>&1 && command -v cc >/dev/null 2>&1'
+}
+
+# ---- GPU preflight: the zero-touch last mile ------------------------------
+# The engine bootstrap at the end of install_system picks its asset by
+# driver presence — a driverless NVIDIA box silently serves on CPU and
+# nobody is told why. This preflight detects PCI GPU hardware (lspci) and,
+# when the driver userspace is missing, installs it from FIRST-PARTY
+# distro repos only — announce-then-act, never fatal to the install.
+# Third-party-only sources (RPMFusion on Fedora, NVIDIA's own repo on
+# openSUSE) are PRINTED with exact commands, never executed: adding a
+# third-party repository as root is a line this installer does not cross.
+# Opt out: PALLAMA_AUTO_DRIVER=0. CUDA asset choice stays in pallama
+# itself (`pallama engine update` picks the newest CUDA build the driver
+# supports — resolve_cuda_asset; runtimes are bundled, no toolkit needed).
+gpu_preflight() {
+    [ "$(uname -s)" = Linux ] || return 0
+    # An explicit user opt-out is acknowledged before any internal-lane
+    # skip (e.g. PALLAMA_INSTALL_ENGINE=0) — the operator asked for silence
+    # by name and gets the confirmation line regardless of what else is on.
+    if [ "${PALLAMA_AUTO_DRIVER:-1}" != 1 ]; then
+        status "GPU preflight skipped (PALLAMA_AUTO_DRIVER=0)"
+        return 0
+    fi
+    [ "${PALLAMA_INSTALL_ENGINE:-1}" != 0 ] || return 0
+    # Containers/WSL1 expose no PCI bus — nothing to detect.
+    if [ ! -d /sys/bus/pci ]; then
+        status "GPU preflight: no PCI bus (container/WSL?) — skipped"
+        return 0
+    fi
+
+    PM=
+    for c in apt-get dnf pacman zypper; do
+        if command -v "$c" >/dev/null 2>&1; then PM=$c; break; fi
+    done
+
+    # lspci (pciutils) is the only hardware oracle; provision it when
+    # missing via the same announce-then-act lane as bootstrap.sh.
+    if ! command -v lspci >/dev/null 2>&1; then
+        if [ -z "$PM" ]; then
+            status "GPU preflight: lspci missing and no supported package manager — skipped"
+            return 0
+        fi
+        status "lspci missing — installing pciutils (GPU hardware detection)"
+        case "$PM" in
+            apt-get) $SUDO apt-get update && $SUDO apt-get install -y pciutils ;;
+            dnf) $SUDO dnf install -y pciutils ;;
+            pacman) $SUDO pacman -Sy --noconfirm --needed pciutils ;;
+            zypper) $SUDO zypper --non-interactive install pciutils ;;
+        esac || { status "WARN: pciutils install failed — GPU preflight skipped"; return 0; }
+    fi
+    command -v lspci >/dev/null 2>&1 ||
+        { status "GPU preflight: lspci unavailable — skipped"; return 0; }
+
+    # PCI vendor census over VGA (0300) + 3D-controller (0302) classes.
+    # `lspci -n` lines look like `0000:01:00.0 0300: 10de:28a0 (rev a1)`;
+    # the space-prefixed ` 10de:` token anchors the vendor match (a bare
+    # `10de:` glob would false-positive on device ids).
+    PCI_GPUS=$(lspci -n -d ::0300 2>/dev/null; lspci -n -d ::0302 2>/dev/null)
+    [ -n "$PCI_GPUS" ] ||
+        { status "GPU preflight: no PCI display controllers — CPU lane"; return 0; }
+    HW_NVIDIA=0 HW_AMD=0 HW_INTEL=0
+    case "$PCI_GPUS" in *" 10de:"*) HW_NVIDIA=1 ;; esac
+    case "$PCI_GPUS" in *" 1002:"*) HW_AMD=1 ;; esac
+    case "$PCI_GPUS" in *" 8086:"*) HW_INTEL=1 ;; esac
+
+    if [ "$HW_NVIDIA" = 1 ]; then
+        if ! command -v nvidia-smi >/dev/null 2>&1; then
+            status "NVIDIA GPU detected (PCI 10de:) but no NVIDIA driver userspace — installing from distro repos"
+            NVIDIA_INSTALLED=0
+            case "$PM" in
+                apt-get)
+                    if command -v ubuntu-drivers >/dev/null 2>&1; then
+                        status "  running: ubuntu-drivers autoinstall (picks the right driver branch)"
+                        if $SUDO ubuntu-drivers autoinstall; then NVIDIA_INSTALLED=1; fi
+                    fi
+                    if [ "$NVIDIA_INSTALLED" != 1 ]; then
+                        status "  running: apt-get install -y nvidia-driver (Debian metapackage)"
+                        if $SUDO apt-get update && $SUDO apt-get install -y nvidia-driver; then NVIDIA_INSTALLED=1; fi
+                    fi
+                    ;;
+                dnf)
+                    # akmod-nvidia lives in RPMFusion (third party) — only
+                    # install when the user has already enabled it.
+                    if $SUDO dnf repolist --enabled 2>/dev/null | grep -qi rpmfusion; then
+                        status "  running: dnf install -y akmod-nvidia (kernel module compiles — takes minutes)"
+                        if $SUDO dnf install -y akmod-nvidia; then NVIDIA_INSTALLED=1; fi
+                    fi
+                    ;;
+                pacman)
+                    status "  running: pacman -S nvidia nvidia-utils (official repo)"
+                    if $SUDO pacman -Sy --noconfirm --needed nvidia nvidia-utils; then NVIDIA_INSTALLED=1; fi
+                    ;;
+            esac
+            if [ "$NVIDIA_INSTALLED" = 1 ]; then
+                if command -v mokutil >/dev/null 2>&1 &&
+                   mokutil --sb-state 2>/dev/null | grep -qi enabled; then
+                    status "Secure Boot ON: distro-signed packages (Ubuntu) load as-is; locally built modules (Fedora akmods) may prompt a MokManager key enrollment at next boot"
+                fi
+                status "NVIDIA driver installed — REBOOT REQUIRED, then run: pallama engine update"
+                status "  (auto-picks the newest CUDA build this driver supports; CUDA runtimes are bundled — no toolkit install)"
+            else
+                status "WARN: NVIDIA driver not auto-installed on this distro — manual lanes:"
+                status "  Ubuntu/Debian: sudo ubuntu-drivers autoinstall   (needs the 'universe' repo: sudo add-apt-repository universe)"
+                status "  Fedora/RHEL:  sudo dnf install https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora 2>/dev/null || echo VERSION).noarch.rpm && sudo dnf install akmod-nvidia"
+                status "  openSUSE:     add the NVIDIA repo (zypper ar -f https://download.nvidia.com/opensuse/leap nvidia) then zypper install nvidia-driver-G06"
+                status "  any distro:   https://www.nvidia.com/drivers — after install + reboot: pallama engine update"
+            fi
+        elif ! timeout 10 nvidia-smi -L >/dev/null 2>&1; then
+            status "NVIDIA driver installed but not communicating (module unloaded?) — a REBOOT usually brings it up; then: pallama engine update"
+        else
+            status "GPU preflight: NVIDIA driver present — CUDA engine lane eligible (pallama engine update picks the newest driver-compatible CUDA build)"
+        fi
+    fi
+
+    if [ "$HW_AMD" = 1 ] || [ "$HW_INTEL" = 1 ]; then
+        ICD_FOUND=0
+        for d in /usr/share/vulkan/icd.d /etc/vulkan/icd.d; do
+            if [ -d "$d" ] && ls "$d"/*.json >/dev/null 2>&1; then ICD_FOUND=1; fi
+        done
+        if [ "$ICD_FOUND" = 0 ]; then
+            status "AMD/Intel GPU detected but no Vulkan ICD found — the Vulkan engine lane would fall back to CPU"
+            ICD_PKGS=
+            ICD_INSTALLED=0
+            case "$PM" in
+                apt-get | dnf)
+                    ICD_PKGS=mesa-vulkan-drivers
+                    status "  running: $PM install -y $ICD_PKGS"
+                    if [ "$PM" = apt-get ]; then
+                        if $SUDO apt-get update && $SUDO apt-get install -y "$ICD_PKGS"; then ICD_INSTALLED=1; fi
+                    else
+                        if $SUDO dnf install -y "$ICD_PKGS"; then ICD_INSTALLED=1; fi
+                    fi
+                    ;;
+                pacman)
+                    [ "$HW_AMD" = 1 ] && ICD_PKGS="vulkan-radeon"
+                    [ "$HW_INTEL" = 1 ] && ICD_PKGS="${ICD_PKGS:+$ICD_PKGS }vulkan-intel"
+                    if [ -n "$ICD_PKGS" ]; then
+                        status "  running: pacman -S $ICD_PKGS"
+                        if $SUDO pacman -Sy --noconfirm --needed $ICD_PKGS; then ICD_INSTALLED=1; fi
+                    fi
+                    ;;
+                zypper)
+                    ICD_PKGS=Mesa-vulkan-drivers
+                    status "  running: zypper install $ICD_PKGS"
+                    if $SUDO zypper --non-interactive install "$ICD_PKGS"; then ICD_INSTALLED=1; fi
+                    ;;
+            esac
+            if [ "$ICD_INSTALLED" = 1 ]; then
+                status "Vulkan ICDs installed ($ICD_PKGS) — GPU lane ready, no reboot normally needed"
+            else
+                status "WARN: Vulkan ICDs not installed — manual: install mesa-vulkan-drivers (apt/dnf), vulkan-radeon/vulkan-intel (pacman), Mesa-vulkan-drivers (zypper)"
+            fi
+        fi
+    fi
 }
 
 UNINSTALL=0
@@ -165,13 +368,8 @@ SUDO="${PALLAMA_SUDO-sudo}"
 # poll, legacy user unit, launch agents, stale ~/.local copies) must
 # resolve through the INVOKING user's home or the unit crash-loops on a
 # port the real user's daemon already owns.
-USER_HOME="$HOME"
-if [ "$(id -u)" -eq 0 ] && [ "${SUDO_USER:-}" != "" ] && [ "$SUDO_USER" != "root" ]; then
-    _hm=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
-    [ -z "$_hm" ] && [ "$(uname -s)" = Darwin ] &&
-        _hm=$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory 2>/dev/null | awk '{print $NF}')
-    [ -n "$_hm" ] && USER_HOME="$_hm"
-fi
+# USER_HOME/BUILD_USER are derived in the early as_user block near the
+# top — nothing user-scoped is resolved from $HOME past this point.
 
 # Privilege is enforced where it's needed: the privileged install command
 # itself fails with "cannot create /usr/local/bin (need sudo?)" when root
@@ -232,10 +430,13 @@ build_from_checkout() {
     # loud fallback). NEVER exits from here — when called via $(...) an
     # exit only kills the subshell and the caller would silently degrade
     # to the release channel.
-    command -v cargo >/dev/null 2>&1 || return 1
+    as_user sh -c 'command -v cargo >/dev/null 2>&1' || return 1
     CK=$(find_checkout) || return 1
     status "building from source: cargo build --release -p pallama-cli (in ${CK})"
-    if ! (cd "$CK" && cargo build --release -p pallama-cli); then
+    # Always build in the invoking user's environment: a root-run build
+    # leaves root-owned artifacts in the user's target/ and breaks every
+    # later user build.
+    if ! as_user sh -c "cd '$CK' && cargo build --release -p pallama-cli"; then
         echo "ERROR: source build failed (cargo output above)" >&2
         return 1
     fi
@@ -357,7 +558,9 @@ poll_healthz() {
     HOST=$(sed -n 's/^host[[:space:]]*=[[:space:]]*//p' "$USER_HOME/.config/pallama/config.toml" 2>/dev/null | head -1 | tr -d '"')
     PORT=$(sed -n 's/^port[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$USER_HOME/.config/pallama/config.toml" 2>/dev/null | head -1)
     HOST=${HOST:-127.0.0.1}
-    PORT=${PORT:-11434}
+    # Pallama's own default port — NEVER 11434 (that is ollama's; a
+    # fallback poll there would read a FOREIGN server's health).
+    PORT=${PORT:-11435}
     i=0
     while ! curl -s --max-time 2 "http://${HOST}:${PORT}/healthz" 2>/dev/null | grep -q ok; do
         i=$((i + 1)); [ "$i" -gt 30 ] && break
@@ -416,6 +619,12 @@ install_system() {
         done
         SG_LINE=
         [ -n "$SG" ] && SG_LINE="SupplementaryGroups=$SG"
+        # Soft memory ceiling for the daemon cgroup: protects the rest of
+        # the box from runaway children without OOM-killing legit model
+        # loads (mmap'd weights are reclaimable). Empty knob = no line.
+        MEMORY_HIGH="${PALLAMA_UNIT_MEMORY_HIGH-85%}"
+        MH_LINE=
+        [ -n "$MEMORY_HIGH" ] && MH_LINE="MemoryHigh=$MEMORY_HIGH"
         $SUDO mkdir -p "$(dirname "$UNIT_PATH")"
         UNIT=$(cat <<EOF
 [Unit]
@@ -428,6 +637,7 @@ ExecStart=${BIN_DIR}/pallama serve
 User=${SVC_USER}
 Group=${SVC_GROUP}
 ${SG_LINE}
+${MH_LINE}
 Restart=always
 RestartSec=3
 # pallama serve exits 3 on a hard bind conflict (another server owns the
@@ -440,14 +650,19 @@ EOF
 )
         printf '%s\n' "$UNIT" | $SUDO tee "$UNIT_PATH" >/dev/null || error "writing $UNIT_PATH failed"
         $SUDO "$SYSTEMCTL" daemon-reload || error "systemctl daemon-reload failed"
-        # Upgrade-in-place: restart an already-active unit (like ollama),
-        # enable+start otherwise.
+        # Upgrade-in-place: restart an already-active unit (like ollama).
+        # Fresh install: enable WITHOUT --now — starting the unit before
+        # the engine bootstrap below crash-loops serve() ("no engine
+        # installed", exit 1 + Restart=always) for the whole engine
+        # download (measured: 86 restarts during a 28 MiB asset fetch).
+        # The start is deferred to just after the engine exists.
         if $SUDO "$SYSTEMCTL" is-active --quiet pallama 2>/dev/null; then
             $SUDO "$SYSTEMCTL" restart pallama || error "restarting pallama.service failed"
+            poll_healthz "logs: journalctl -u pallama"
         else
-            $SUDO "$SYSTEMCTL" enable --now pallama || error "enabling pallama.service failed"
+            $SUDO "$SYSTEMCTL" enable pallama || error "enabling pallama.service failed"
+            DEFERRED_START=1
         fi
-        poll_healthz "logs: journalctl -u pallama"
         SERVICE_DESC=" + systemd unit ${UNIT_PATH}"
     elif [ "$(uname -s)" = Darwin ] && command -v launchctl >/dev/null 2>&1; then
         install_launchd
@@ -472,7 +687,10 @@ EOF
     # [[keys]] etc.) so the first `pallama` invocation never FAILs on an
     # old config. Best-effort: a missing config or an offline box must
     # not fail the install.
-    if "$BIN_DIR/pallama" migrate >/dev/null 2>&1; then
+# Run a user-store CLI (migrate, engine update, pull) as the DATA-OWNING
+# user — see the as_user block above for why a root-run installer must
+# never populate /root's store (engine-less crash-looping daemon).
+    if as_user "$BIN_DIR/pallama" migrate >/dev/null 2>&1; then
         status "config migrated/verified (canonical form)"
     else
         status "config migration skipped (no config or parse issue — run: pallama migrate)"
@@ -484,9 +702,9 @@ EOF
     # PALLAMA_INSTALL_MODEL=<repo> (pull lane, opt-in — model choice is
     # the user's call, not the installer's).
     if [ "${PALLAMA_INSTALL_ENGINE:-1}" != 0 ] &&
-       ! "$BIN_DIR/pallama" engine list 2>/dev/null | grep -q '\[active\]'; then
+       ! as_user "$BIN_DIR/pallama" engine list 2>/dev/null | grep -q '\[active\]'; then
         status "bootstrapping llama.cpp engine (pallama engine update — largest download of this install)..."
-        if "$BIN_DIR/pallama" engine update --no-gate; then
+        if as_user "$BIN_DIR/pallama" engine update --no-gate; then
             status "engine bootstrap complete"
         else
             status "WARN: engine bootstrap failed (offline?) — inference NOT ready. Run: pallama engine update"
@@ -494,9 +712,17 @@ EOF
     else
         status "engine already active (or bootstrap disabled) — skipping engine download"
     fi
+    # Fresh-install start, deferred until the engine exists (see the
+    # enable block above). Started even when bootstrap failed: a running
+    # crash-looping unit still answers `systemctl status` diagnostics
+    # better than a silent inactive one.
+    if [ "${DEFERRED_START:-0}" = 1 ]; then
+        $SUDO "$SYSTEMCTL" start pallama || error "starting pallama.service failed"
+        poll_healthz "logs: journalctl -u pallama"
+    fi
     if [ -n "${PALLAMA_INSTALL_MODEL:-}" ]; then
         status "pulling first model: ${PALLAMA_INSTALL_MODEL}..."
-        if "$BIN_DIR/pallama" pull "${PALLAMA_INSTALL_MODEL}"; then
+        if as_user "$BIN_DIR/pallama" pull "${PALLAMA_INSTALL_MODEL}"; then
             status "model ready: ${PALLAMA_INSTALL_MODEL}"
         else
             status "WARN: model pull failed — run: pallama pull ${PALLAMA_INSTALL_MODEL}"
@@ -512,6 +738,11 @@ EOF
     status "All inference is upstream llama.cpp — ggml, ggerganov and contributors did the hard parts."
 }
 
+
+# GPU preflight runs before every install_system lane (bootstrap --from,
+# auto-build, release download): the engine bootstrap inside picks its
+# asset by driver presence, so the driver must be provisioned first.
+gpu_preflight
 
 # Bootstrap/--from/auto-build channels install directly.
 if [ -n "$FROM_BIN" ]; then

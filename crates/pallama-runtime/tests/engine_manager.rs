@@ -339,7 +339,7 @@ async fn integration__rate_limit__gh_token_hint() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
-async fn integration__prune_keeps_last_three_and_local() {
+async fn integration__prune_keeps_newest_keep_tags_and_local() {
     let (_t, dirs) = tmp_dirs();
     let api = MockServer::start().await;
     let mgr = manager(&dirs, &api.uri());
@@ -384,20 +384,91 @@ async fn integration__prune_keeps_last_three_and_local() {
         .into_iter()
         .map(|e| e.tag)
         .collect();
-    // Newest KEEP_TAGS (b3,b4,b5) + local + active b2 survive; b1 pruned.
-    for kept in ["b2", "b3", "b4", "b5", LOCAL_TAG] {
+    // Newest KEEP_TAGS of (b1..=b5) + local + active b2 survive; every
+    // older tag is pruned. Expectations derive from the const so a
+    // retention-policy change re-pins this test for free.
+    let all: Vec<String> = (1..=5).map(|n| format!("b{n}")).collect();
+    let newest_kept: Vec<String> = all.iter().rev().take(KEEP_TAGS).cloned().collect();
+    let expected_kept: Vec<String> = newest_kept
+        .iter()
+        .cloned()
+        .chain([("b2".to_string()), (LOCAL_TAG.to_string())])
+        .collect();
+    for kept in &expected_kept {
         assert!(
             remaining.iter().any(|t| t == kept),
             "missing {kept} in {remaining:?}"
         );
     }
-    assert!(
-        !remaining.iter().any(|t| t == "b1"),
-        "b1 should be pruned: {remaining:?}"
-    );
-    assert!(!dirs.engines_dir().join("b1").exists());
+    for pruned in all.iter().filter(|t| !expected_kept.contains(t)) {
+        assert!(
+            !remaining.iter().any(|t| t == pruned),
+            "{pruned} should be pruned: {remaining:?}"
+        );
+        assert!(!dirs.engines_dir().join(pruned).exists());
+    }
     // Pruned count matches KEEP_TAGS policy.
     assert_eq!(remaining.len(), KEEP_TAGS + 2);
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__prune_retention_is_scoped_per_kind() {
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    let store = Store::open(&dirs).unwrap();
+
+    let stage = |tag: &str, kind: pallama_core::engine_kind::EngineKind, at: i64| {
+        let dir = dirs.engines_dir().join(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("marker"), tag).unwrap();
+        store
+            .upsert_engine(&pallama_core::EngineRow {
+                tag: tag.to_string(),
+                asset: "x".into(),
+                sha256: "x".into(),
+                installed_at: at,
+                active: false,
+                manifest: "{}".into(),
+                kind,
+            })
+            .unwrap();
+    };
+    use pallama_core::engine_kind::EngineKind;
+    // llamacpp lane past retention (3 > KEEP_TAGS) ...
+    stage("b1", EngineKind::LlamaCpp, 1000);
+    stage("b2", EngineKind::LlamaCpp, 1001);
+    stage("b3", EngineKind::LlamaCpp, 1002);
+    // ... while the mistralrs and sglang lanes each hold few engines that
+    // are NOT substitutes for a llamacpp rollback anchor: they must
+    // survive a llamacpp prune entirely.
+    stage("m1", EngineKind::MistralRs, 1003);
+    stage("m2", EngineKind::MistralRs, 1004);
+    stage("s1", EngineKind::Sglang, 1005);
+    store.set_active_engine("b2").unwrap();
+
+    mgr.prune(&store).unwrap();
+    let mut remaining: Vec<String> = store
+        .list_engines()
+        .unwrap()
+        .into_iter()
+        .map(|e| e.tag)
+        .collect();
+    remaining.sort();
+    let mut expected = vec![
+        format!("b2"), // active llamacpp
+        format!("b3"), // newest KEEP_TAGS llamacpp
+    ];
+    for extra in ["m1", "m2", "s1"] {
+        expected.push(extra.to_string());
+    }
+    expected.sort();
+    assert_eq!(remaining, expected, "cross-kind engines are not anchors");
+    assert!(!dirs.engines_dir().join("b1").exists());
+    for kept in ["b2", "b3", "m1", "m2", "s1"] {
+        assert!(dirs.engines_dir().join(kept).exists(), "{kept} dir gone");
+    }
 }
 
 #[tokio::test]
@@ -424,13 +495,17 @@ async fn integration__register_local_engine() {
 
 /// A dir containing the stub binary as `llama-server` (what
 /// `register_engine` expects an extracted engine dir to look like).
-fn stub_engine_dir(tag: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("pallama-engine-test-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::copy(stub_server_bin(), dir.join("llama-server")).unwrap();
-    dir
+/// Stage a llama-server stub into a unique temp dir owned by the caller.
+/// Returns the path plus the drop guard — binding the guard keeps the
+/// staged binary alive for the test and guarantees cleanup on exit (the
+/// earlier pid-keyed dir leaked one copy per `cargo test` run).
+fn stub_engine_dir(tag: &str) -> (PathBuf, tempfile::TempDir) {
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("pallama-engine-test-{tag}-"))
+        .tempdir()
+        .expect("staging tempdir");
+    std::fs::copy(stub_server_bin(), dir.path().join("llama-server")).expect("copy stub");
+    (dir.path().to_path_buf(), dir)
 }
 
 #[tokio::test]
@@ -443,7 +518,7 @@ async fn integration__vulkan_never_dethrones_cuda_on_nvidia() {
     // CUDA engine installed first (vendor gate off — it must activate).
     let cuda = mgr
         .register_engine_with_vendor(
-            &stub_engine_dir("b1"),
+            &stub_engine_dir("b1").0,
             "b1-cuda",
             "ubuntu-cuda-12.8-x64",
             "aa",
@@ -456,7 +531,7 @@ async fn integration__vulkan_never_dethrones_cuda_on_nvidia() {
     // A newer Vulkan install on an NVIDIA box: registered, NOT activated.
     let vulkan = mgr
         .register_engine_with_vendor(
-            &stub_engine_dir("b2"),
+            &stub_engine_dir("b2").0,
             "b2",
             "ubuntu-vulkan-x64",
             "bb",
@@ -482,7 +557,7 @@ async fn integration__vulkan_activates_without_cuda_even_on_nvidia() {
     let mgr = manager(&dirs, &api.uri());
     let row = mgr
         .register_engine_with_vendor(
-            &stub_engine_dir("b3"),
+            &stub_engine_dir("b3").0,
             "b3",
             "ubuntu-vulkan-x64",
             "cc",
@@ -500,7 +575,7 @@ async fn integration__vulkan_activates_on_non_nvidia_despite_cuda_row() {
     let api = MockServer::start().await;
     let mgr = manager(&dirs, &api.uri());
     mgr.register_engine_with_vendor(
-        &stub_engine_dir("b4"),
+        &stub_engine_dir("b4").0,
         "b4-cuda",
         "ubuntu-cuda-12.8-x64",
         "dd",
@@ -510,7 +585,7 @@ async fn integration__vulkan_activates_on_non_nvidia_despite_cuda_row() {
     .unwrap();
     let row = mgr
         .register_engine_with_vendor(
-            &stub_engine_dir("b5"),
+            &stub_engine_dir("b5").0,
             "b5",
             "ubuntu-vulkan-x64",
             "ee",
@@ -971,7 +1046,7 @@ async fn integration__update_resolved__keep_cuda_skip_downloads_nothing() {
     // Active CUDA engine seeded first (vendor Other: no guard, activates).
     let cuda = mgr
         .register_engine_with_vendor(
-            &stub_engine_dir("b10900-cuda"),
+            &stub_engine_dir("b10900-cuda").0,
             "b10900-cuda",
             "built-cuda",
             "aa",
@@ -996,7 +1071,7 @@ async fn integration__update_resolved__keep_cuda_skip_downloads_nothing() {
     .unwrap();
 
     let row = mgr
-        .update_resolved_with_vendor(release, Vendor::Nvidia)
+        .update_resolved_with_vendor(release, Vendor::Nvidia, false)
         .await
         .unwrap();
     assert_eq!(row.tag, "b10900-cuda", "kept-active row returned");

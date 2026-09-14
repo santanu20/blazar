@@ -1,0 +1,65 @@
+name: overlay-freshness
+
+# Keeps the prebuilt CUDA overlay at most ~1 hour + one build behind
+# upstream llama.cpp. The user-facing contract (see engine-cuda.yml):
+# a pallama user on an NVIDIA box must get CUDA via DOWNLOAD in
+# minutes — a stale overlay is what silently shunts them into the
+# hour-class source-build lane.
+#
+# Hourly: compare the newest upstream b-tag with the newest published
+# bNNNN-cuda release here; when upstream is ahead AND no engine-cuda
+# run is already in flight, dispatch engine-cuda for the new tag.
+#
+# Guarded to the overlay repo only: workflow dispatch with GITHUB_TOKEN
+# works same-repo, so this is a no-op everywhere else and the file can
+# live in the working repo as the single source of truth.
+
+on:
+  schedule:
+    # :23 past the hour — avoids the top-of-hour cron congestion.
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+env:
+  UPSTREAM_REPO: ggml-org/llama.cpp
+  OVERLAY_REPO: santanu20/pallama
+
+jobs:
+  check-and-dispatch:
+    if: github.repository == 'santanu20/pallama'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Upstream vs overlay freshness
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          upstream="$(gh api "repos/${UPSTREAM_REPO}/releases" -q '.[].tag_name | select(startswith("b"))' | head -1)"
+          case "$upstream" in
+            b*) ;;
+            *) echo "no upstream b-tag resolved; nothing to do" >&2; exit 0 ;;
+          esac
+          overlay="$(gh api "repos/${OVERLAY_REPO}/releases" -q '.[].tag_name | select(startswith("b"))' | head -1)"
+          up_n="${upstream#b}"
+          ov_n="${overlay#b}"
+          ov_n="${ov_n:-0}"
+          echo "upstream=${upstream} overlay=${overlay:-none}"
+          if [ "$up_n" -le "$ov_n" ]; then
+            echo "overlay is current (or ahead); no dispatch"
+            exit 0
+          fi
+          # Never stack builds: if an engine-cuda run is queued or
+          # running, the watcher leaves it to finish and publish.
+          busy="$(gh run list --repo "$OVERLAY_REPO" --workflow engine-cuda.yml \
+                    --status in_progress --json databaseId --jq 'length')"
+          queued="$(gh run list --repo "$OVERLAY_REPO" --workflow engine-cuda.yml \
+                    --status queued --json databaseId --jq 'length')"
+          if [ "$((busy + queued))" -gt 0 ]; then
+            echo "engine-cuda already in flight; watcher stands down"
+            exit 0
+          fi
+          gh workflow run engine-cuda.yml --repo "$OVERLAY_REPO" -f "tag=${upstream}"
+          echo "dispatched engine-cuda for ${upstream} (overlay was at ${overlay:-none})"

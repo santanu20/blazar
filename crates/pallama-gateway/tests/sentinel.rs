@@ -426,6 +426,71 @@ async fn integration__sentinel__ollama_chat_path_observed() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn integration__why__flagged_filter_limit_and_code_reach() {
+    // Every stub answer here is empty -> every record carries
+    // empty_response: proves the query params actually reach the ring
+    // query (flagged=1 keeps them, limit= caps them, code= selects).
+    let ts = start(Config::default(), &[("STUB_EMPTY", "1")], false).await;
+    let c = client();
+    for _ in 0..3 {
+        let _: serde_json::Value = c
+            .post(format!("{}/v1/chat/completions", ts.base))
+            .json(&serde_json::json!({"model": "m1", "stream": false,
+                "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    }
+    let rec = await_record(&ts, "openai-chat").await;
+    assert!(codes(&rec).contains(&"empty_response"), "{:?}", codes(&rec));
+
+    let flagged: serde_json::Value = c
+        .get(format!("{}/api/why?flagged=1&limit=2", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = flagged["records"].as_array().unwrap();
+    assert_eq!(arr.len(), 2, "limit=2 must cap the result");
+    assert!(arr
+        .iter()
+        .all(|r| { r["detections"].as_array().is_some_and(|d| !d.is_empty()) }));
+
+    let by_code: serde_json::Value = c
+        .get(format!("{}/api/why?code=empty_response&limit=256", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = by_code["records"].as_array().unwrap();
+    assert!(!arr.is_empty());
+    assert!(arr.iter().all(|r| {
+        r["detections"]
+            .as_array()
+            .is_some_and(|d| d.iter().any(|x| x["code"] == "empty_response"))
+    }));
+
+    let none: serde_json::Value = c
+        .get(format!("{}/api/why?code=no_such_code", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(none["records"].as_array().unwrap().is_empty());
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn integration__sentinel__responses_api_stream_and_nonstream() {
     // Responses grammar: streamed function_call fragments merge into an
     // invalid-args detection; non-stream incomplete maps to truncation.

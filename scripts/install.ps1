@@ -24,7 +24,8 @@
 #   back to the x86_64 one (emulated on Win11 ARM64) with a warning
 #   when a release has no native build.
 #   [env] PALLAMA_INSTALL_BASE_URL  replace the GitHub API base (mirrors, tests)
-#   [env] GITHUB_TOKEN              optional API token
+#   [env] PALLAMA_AUTO_DRIVER        '0' skips the GPU driver preflight advisory
+#   [env] GITHUB_TOKEN               optional API token
 #
 #   flags need a saved script: irm <url> -OutFile install.ps1; .\install.ps1 -Build
 
@@ -224,6 +225,25 @@ try {
     $ver = & $installedExe --version
     Write-Host ">>> Installed pallama $ver to $installedExe"
     Write-Host ">>> Next: pallama pull <model> (find: pallama search qwen3) | pallama run <model> | pallama doctor"
+    # GPU preflight (advise-only; Windows drivers come from the vendor's
+    # own installer — this script never installs kernel drivers). The
+    # engine bootstrap below picks its asset by driver presence, so a
+    # driverless NVIDIA box would silently serve on CPU: detect and say
+    # so instead. Opt out: PALLAMA_AUTO_DRIVER=0.
+    if ($env:PALLAMA_INSTALL_ENGINE -ne '0' -and $env:PALLAMA_AUTO_DRIVER -ne '0') {
+        try { $gpus = @(Get-CimInstance Win32_VideoController -ErrorAction Stop) } catch { $gpus = @() }
+        if ($gpus.Count -gt 0) {
+            $nvidia = $gpus | Where-Object { $_.Name -match 'NVIDIA' }
+            if ($nvidia -and -not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
+                Write-Host '>>> WARN: NVIDIA GPU detected but no NVIDIA driver (nvidia-smi missing) - the engine will serve on CPU/Vulkan.'
+                Write-Host '>>>       install the driver from https://www.nvidia.com/drivers (GeForce or Studio branch), reboot,'
+                Write-Host '>>>       then: pallama engine update  (auto-picks the newest CUDA build the driver supports; runtimes bundled)'
+            } elseif ($nvidia) {
+                Write-Host '>>> GPU preflight: NVIDIA driver present - CUDA engine lane eligible (pallama engine update picks the newest driver-compatible CUDA build)'
+            }
+        }
+    }
+
     # One-click readiness: persist config migrations (legacy api_keys ->
     # [[keys]]). Best-effort: never fail the install on it.
     try {

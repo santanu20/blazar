@@ -99,6 +99,7 @@ async fn integration__build_cpu__installs_probes_activates() {
         cxx: Some(bin_dir.join("g++")),
         nvcc: None,
         nvidia_smi: None,
+        compiler_cache: None,
     };
     std::fs::write(bin_dir.join("g++"), "#!/bin/sh\nexit 0").unwrap();
 
@@ -172,6 +173,7 @@ async fn integration__build_cuda__host_compiler_rule_and_arch_args() {
             "echo 'Cuda compilation tools, release 12.0, V12.0.140'",
         )),
         nvidia_smi: None,
+        compiler_cache: None,
     };
     // System g++ reports gcc 13 (newer than nvcc 12 supports); a
     // g++-12 sits next to it -> the rule must pick it up.
@@ -233,6 +235,7 @@ async fn integration__build_fail__error_carries_stderr_tail() {
         cxx: Some(bin_dir.join("g++")),
         nvcc: None,
         nvidia_smi: None,
+        compiler_cache: None,
     };
     std::fs::write(bin_dir.join("g++"), "#!/bin/sh\nexit 0").unwrap();
 
@@ -274,6 +277,7 @@ exit 0";
         cxx: Some(bin_dir.join("g++")),
         nvcc: None,
         nvidia_smi: None,
+        compiler_cache: None,
     };
     std::fs::write(bin_dir.join("g++"), "#!/bin/sh\nexit 0").unwrap();
 
@@ -302,6 +306,7 @@ async fn integration__build_rejects__non_btag_and_local_tag_safety() {
         cxx: Some(bin_dir.join("g++")),
         nvcc: None,
         nvidia_smi: None,
+        compiler_cache: None,
     };
     std::fs::write(bin_dir.join("g++"), "#!/bin/sh\nexit 0").unwrap();
     let mut o = opts(BuildBackend::Cpu, "v1.2.3");

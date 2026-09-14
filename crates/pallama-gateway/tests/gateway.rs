@@ -881,6 +881,46 @@ async fn e2e__responses_chaining_and_store() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn e2e__keep_alive_zero_unload_ping_idempotent() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    // The ollama unload idiom: {model, keep_alive: 0} with NO payload —
+    // idempotent 200 even when the model was never loaded (a 400 here
+    // breaks _unload_all-style harness sweeps).
+    for (path, lane) in [("/api/generate", "response"), ("/api/chat", "message")] {
+        let r: serde_json::Value = c
+            .post(format!("{}{}", ts.base, path))
+            .json(&serde_json::json!({"model": "m1", "keep_alive": 0}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(r["done"] == true, "{lane} ping done: {r}");
+        assert!(r.get(lane).is_some(), "{lane} ping shape: {r}");
+    }
+    // Prompt-less WITHOUT keep_alive 0 is still a hard 400 — inference
+    // genuinely requires the field; only the release ping is exempt.
+    let r = c
+        .post(format!("{}/api/generate", ts.base))
+        .json(&serde_json::json!({"model": "m1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "no-prompt non-ping must fail fast");
+    // Unknown model in a ping resolves like any request: 404.
+    let r = c
+        .post(format!("{}/api/generate", ts.base))
+        .json(&serde_json::json!({"model": "no-such", "keep_alive": 0}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404, "unknown ping model must 404");
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn e2e__generate_raw_ok_templated_400_and_embeddings() {
     let ts = start(Config::default()).await;
     let c = client();

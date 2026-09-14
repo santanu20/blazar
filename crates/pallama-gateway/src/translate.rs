@@ -699,7 +699,7 @@ pub fn ollama_generate_final_chunk(
     v
 }
 
-fn iso_now() -> String {
+pub(crate) fn iso_now() -> String {
     // Cheap UTC timestamp without pulling chrono.
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

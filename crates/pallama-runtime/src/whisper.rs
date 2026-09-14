@@ -920,11 +920,11 @@ mod tests {
         assert!(installed_tags(&dirs).contains(&"v1.1.0".to_string()));
         set_pin(&dirs, None).expect("unpin -> prune");
         assert!(!installed_tags(&dirs).contains(&"v1.1.0".to_string()));
-        assert_eq!(installed_tags(&dirs).len(), 3);
+        assert_eq!(installed_tags(&dirs).len(), crate::engine::KEEP_TAGS);
     }
 
     #[test]
-    fn unit__prune__keeps_newest_three_and_pinned() {
+    fn unit__prune__keeps_newest_keep_tags_and_pinned() {
         let tmp = tempfile::tempdir().expect("tmp");
         let dirs = PallamaDirs {
             config_dir: tmp.path().join("cfg"),
@@ -936,8 +936,14 @@ mod tests {
         std::fs::create_dir_all(bin_root(&dirs)).expect("root");
         std::fs::write(pin_path(&dirs), "v1.1.0\n").expect("pin");
         prune(&dirs).expect("prune");
-        let left = installed_tags(&dirs);
-        assert_eq!(left, vec!["v1.5.0", "v1.4.0", "v1.3.0", "v1.1.0"]);
+        // Newest KEEP_TAGS (newest-first list) plus the pinned old tag.
+        let expected: Vec<String> = ["v1.5.0", "v1.4.0", "v1.3.0", "v1.2.0"]
+            .into_iter()
+            .take(crate::engine::KEEP_TAGS)
+            .chain(["v1.1.0"])
+            .map(String::from)
+            .collect();
+        assert_eq!(installed_tags(&dirs), expected);
     }
 
     #[test]
@@ -952,8 +958,12 @@ mod tests {
             stage_server(&dirs, t);
         }
         prune(&dirs).expect("prune");
-        let left = installed_tags(&dirs);
-        assert_eq!(left, vec!["v1.10.0", "v1.9.0", "v1.8.0"]);
+        let expected: Vec<String> = ["v1.10.0", "v1.9.0", "v1.8.0", "v1.7.0"]
+            .into_iter()
+            .take(crate::engine::KEEP_TAGS)
+            .map(String::from)
+            .collect();
+        assert_eq!(installed_tags(&dirs), expected);
     }
 
     /// Full wiremock cycle: `--tag` install pins, plain install unpins,
@@ -1080,7 +1090,8 @@ mod tests {
         assert_eq!(pinned_tag(&dirs), Some("v1.8.1".into()));
         assert!(server_bin(&dirs).is_some_and(|(_, d)| d.ends_with("v1.8.1")));
 
-        // Older staged dirs + a latest install: unpins, prunes to 3 newest.
+        // Older staged dirs + a latest install: unpins, prunes to the
+        // KEEP_TAGS newest.
         for t in ["v1.7.0", "v1.6.0", "v1.5.0"] {
             stage_server(&dirs, t);
         }
@@ -1089,6 +1100,11 @@ mod tests {
             .expect("latest install");
         assert_eq!(tag, "v1.9.0");
         assert_eq!(pinned_tag(&dirs), None);
-        assert_eq!(installed_tags(&dirs), vec!["v1.9.0", "v1.8.1", "v1.7.0"]);
+        let expected: Vec<String> = ["v1.9.0", "v1.8.1", "v1.7.0", "v1.6.0", "v1.5.0"]
+            .into_iter()
+            .take(crate::engine::KEEP_TAGS)
+            .map(String::from)
+            .collect();
+        assert_eq!(installed_tags(&dirs), expected);
     }
 }

@@ -28,7 +28,9 @@ sudo sh scripts/install.sh
 sudo sh scripts/install.sh --build
 ```
 
-**One-click readiness:** after the binary lands, the installer bootstraps the llama.cpp engine (idempotent — skips when an engine is already active) so a fresh install can serve inference immediately; failures are loud warnings, never silent. Opt out with `PALLAMA_INSTALL_ENGINE=0`, pre-pull a model with `PALLAMA_INSTALL_MODEL=<name>`, or point engine downloads at a mirror with `PALLAMA_GH_BASE` (e.g. a GitHub API proxy). `sudo sh scripts/install.sh` and the PowerShell installer behave the same.
+**One-click readiness:** after the binary lands, the installer bootstraps the llama.cpp engine (idempotent — skips when an engine is already active) so a fresh install can serve inference immediately; failures are loud warnings, never silent. Opt out with `PALLAMA_INSTALL_ENGINE=0`, pre-pull a model with `PALLAMA_INSTALL_MODEL=<name>`, point engine downloads at a mirror with `PALLAMA_GH_BASE`, or cap the daemon cgroup with `PALLAMA_UNIT_MEMORY_HIGH` (systemd `MemoryHigh`, default `85%` of RAM — soft reclaim/throttle only, never an OOM kill; empty string omits the line) (e.g. a GitHub API proxy). `sudo sh scripts/install.sh` and the PowerShell installer behave the same.
+
+**GPU preflight (Linux):** before the engine lands, the installer censuses PCI GPU hardware (`lspci`, provisioned when missing) and — when the driver userspace is absent — installs it from **first-party distro repos only** (announce-then-act): NVIDIA via apt's `nvidia-driver` / pacman's `nvidia nvidia-utils`; dnf auto-installs `akmod-nvidia` only when RPMFusion is already enabled; zypper and all third-party-only lanes print the exact command instead of running it. AMD/Intel without a Vulkan ICD get the mesa Vulkan drivers. Every install ends with the loud chain: **REBOOT, then `pallama engine update`** — which auto-picks the newest CUDA build the installed driver supports (runtimes are bundled; no CUDA toolkit is ever installed). Opt out with `PALLAMA_AUTO_DRIVER=0` (acknowledged even when the engine bootstrap is off). Windows is advise-only: the PowerShell installer detects NVIDIA hardware without `nvidia-smi` and links the driver download. `pallama doctor` warns (`nvidia driver` / `vulkan driver` rows) whenever PCI GPU hardware is present but its driver is not.
 
 Like ollama's installer: **system-wide only** — root-owned binary in `/usr/local/bin` plus a systemd unit (`Restart=always`, GPU groups, auto-start, restart-on-upgrade; runs as the invoking user — under `sudo` the unit targets `SUDO_USER`, not root) on Linux, or a launchd service (`KeepAlive`, `RunAtLoad`) on macOS. There is deliberately no user-path (`~/.local/bin`) install mode: a second copy there is how stale-binary daemon races happen (`pallama doctor` flags any that already exist, and the installer removes one it finds). Root or sudo is required.
 
@@ -95,7 +97,7 @@ Capability discovery: `GET /.well-known/pallama` (routes, headers, features, eng
 | Unbounded cache RAM; blind pulls | `cache_ram_mb` config (auto-capped at 30% of physical RAM — measured live: unclamped 8 GiB budget on a 13 GiB box drove the child to an 8.3 GiB RSS plateau and system-wide swap death); `pallama fit` previews VRAM fit + quant alternatives *before* downloading, incl. the ctx headroom a q8_0 KV cache buys |
 | No KV-quant control; VRAM cliffs | capacity-math ladder: f16 -> q8_0 (KV/2) -> q4_0 (KV/4) at 90% VRAM, or pin any type via `cache_type`; visible in `pallama show` warnings |
 | No session/context persistence | `pallama session save/restore`: slot KV checkpoints that survive unload and daemon restarts |
-| No diagnostics when things break | `pallama doctor`: config (incl. stale pins that mirror retired defaults), port conflicts (incl. the ollama-11434 class), engine, hardware, disk, model health, component update-currency in one table |
+| No diagnostics when things break | `pallama doctor`: config (incl. stale pins that mirror retired defaults), port conflicts (incl. the ollama-11434 class), engine, hardware, disk, model health (incl. model-dir orphans vs the store — unmanaged GGUFs get a `pallama import` hint, hardlink twins flagged as zero-space), component update-currency in one table |
 | No discovery; env sprawl | `pallama search` (HF GGUF); every knob in one documented `config.toml`, inspectable via `pallama config` |
 | "API returns 200 but nothing useful happens"; silent truncation; plain-text instead of tool calls; agents loop on malformed tool args | sentinel: warn-only semantic observation on every chat request — `finish_reason: length` with fix hints, tool-arg JSON + hallucinated-name + parameters-schema checks, `json_schema`/`json_object` validation, empty-response and reasoning-with-no-answer detection, stalled-stream detection, and a pre-inference template-capability check (`x-pallama-warnings` header) when the model's chat template cannot render tools. `pallama why [trace]` answers any request after the fact |
 
@@ -119,7 +121,7 @@ Capability discovery: `GET /.well-known/pallama` (routes, headers, features, eng
 | `push` / `login` family | refused by design: local-only, no registry or cloud accounts |
 | `search <query>` | HF GGUF search (downloads, likes, sizes) |
 | `session save/restore/rm/list` | slot KV-cache checkpoints: pause a model's context, resume later (survives unload + restart) |
-| `doctor` | one-command diagnostics: config, port conflicts, engine (+ binary `--version` smoke, + GPU enumeration-drift vs the serving child), hardware, disk, model health, sqlite store integrity, service-manager state (systemd/launchd), bind+auth exposure, update currency (llama.cpp `engine update`, whisper.cpp `whisper --install`, pallama `upgrade` — warn-only, never auto-installs) |
+| `doctor` | one-command diagnostics: config, port conflicts, engine (+ binary `--version` smoke, + GPU enumeration-drift vs the serving child), hardware (incl. PCI GPU present but driverless — `nvidia driver`/`vulkan driver` warnings), disk, model health, sqlite store integrity, service-manager state (systemd/launchd), bind+auth exposure, update currency (llama.cpp `engine update`, whisper.cpp `whisper --install`, pallama `upgrade` — warn-only, never auto-installs) |
 | `why [trace]` | sentinel: what the model returned, what was wrong with it (truncation, invalid tool args, schema violations, empty replies, stalls), which knob fixes it |
 | `watch` | live tail of sentinel detections as they happen (SSE; Ctrl-C to stop) |
 | `router = true` (config) | one child serves ALL models: preset INI auto-generated per model, engine-native autoload + LRU; `pallama stop <model>` becomes an engine unload |
@@ -227,6 +229,7 @@ cache_ram_mb = 8192       # child prompt-cache budget; auto-capped at 30% of RAM
 cpu_range = ""            # pin child threads to CPUs "lo-hi" (P/E hybrids: pin P-cores, discover via `lscpu -e`)
 poll = 0                  # 1..=100 busy-poll waiting for work (trades idle CPU for TTFT)
 reasoning_format = ""     # "" auto | "none" | "deepseek" | "deepseek-legacy" thought-tag extraction
+reasoning = ""            # "" engine auto | "on" | "off" | "auto" server-side reasoning switch (--reasoning; per-model override supported)
 router = false            # ONE llama-server serves every model (upstream router: preset INI generated from the store, engine-side autoload + LRU); false = one child per model
 router_max_models = 0    # router mode: max concurrently loaded models (0 = upstream default 4)
 slot_prompt_similarity = 0.0  # >0 tunes prefix-affinity slot reuse at slots > 1 (upstream default 0.1; 0 = emit nothing)
@@ -421,6 +424,7 @@ sampler_defaults.dry_multiplier = 0.8
 #   true = --models-autoload, false = --no-models-autoload
 
 # reasoning control (cuts wasted thinking tokens on agent traffic)
+# reasoning = ""                 # "" engine auto-detect | "on" | "off" | "auto" (server-side switch; authoritative for templates that ignore the thinking/enable_thinking request vars)
 # reasoning_budget = -1           # -1 unrestricted | 0 end now | N token budget
 # reasoning_budget_message = ""   # injected when the budget runs out
 # reasoning_effort = ""           # "" | minimal|low|medium|high|xhigh|max

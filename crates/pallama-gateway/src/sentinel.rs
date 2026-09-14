@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 
 use crate::translate as tr;
 
-const RING_CAP: usize = 256;
+pub const RING_CAP: usize = 256;
 const CHANNEL_CAP: usize = 64;
 /// Accumulation caps: beyond these the record is marked degraded and the
 /// analyzer stops accumulating (memory is bounded by construction).
@@ -48,8 +48,13 @@ const PERSIST_KEEP: usize = 128;
 const NEAR_LIMIT_TENTHS: u64 = 9;
 
 /// Detection vocabulary. `as_str` is the machine code (response headers,
-/// `/api/why` consumers); `hint` is the human fix.
+/// `/api/why` consumers); `hint` is the human fix. `rename_all` keeps the
+/// derive path (persisted `run/sentinel.jsonl`, doctor's offline scan) on
+/// the same `snake_case` spelling as `as_str` — the two spellings diverged
+/// once (derive = `PascalCase`, display = `snake`) and doctor's
+/// `pallama why --code` hint dead-ended against the filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Code {
     CtxTruncated,
     CtxNearLimit,
@@ -1059,10 +1064,22 @@ impl Sentinel {
             let has_reasoning = acc.has_reasoning || !acc.reasoning.trim().is_empty();
             if !has_content && !has_tools {
                 if has_reasoning {
+                    // Detail must name the budget when usage proves it:
+                    // finish=length at N completion tokens is the client's
+                    // own max_tokens budget eaten by thinking — an
+                    // answerable hint, not a mystery. Client-abort shape
+                    // (finish/usage unknown) keeps the base sentence.
+                    let budget = match (acc.finish.as_deref(), acc.usage_completion) {
+                        (Some(f), Some(c)) => format!(
+                            " — finish={f} at {c} completion tokens (reasoning consumed the budget)"
+                        ),
+                        (Some(f), None) => format!(" — finish={f}"),
+                        _ => String::new(),
+                    };
                     out.push(Detection {
                         code: Code::ReasoningNoAnswer,
                         detail: format!(
-                            "{} reasoning chars, zero answer content",
+                            "{} reasoning chars, zero answer content{budget}",
                             acc.reasoning.len()
                         ),
                     });
@@ -1296,6 +1313,26 @@ fn preview(s: &str, n: usize) -> String {
     } else {
         format!("{}…", t.chars().take(n).collect::<String>())
     }
+}
+
+/// Post-`why` filtering for `/api/why` + `pallama why`: substring model,
+/// substring detection code, flagged-only, then newest-first `limit`.
+/// Pure so the reach past the newest-clean wall (flagged records older
+/// than the latest batch) is unit-testable without a live ring.
+pub(crate) fn filter_why_records(
+    records: Vec<SentinelRecord>,
+    model: Option<&str>,
+    code: Option<&str>,
+    flagged_only: bool,
+    limit: usize,
+) -> Vec<SentinelRecord> {
+    records
+        .into_iter()
+        .filter(|r| model.is_none_or(|m| r.model.contains(m)))
+        .filter(|r| code.is_none_or(|c| r.detections.iter().any(|d| d.code.as_str().contains(c))))
+        .filter(|r| !flagged_only || !r.detections.is_empty())
+        .take(limit)
+        .collect()
 }
 
 /// Accumulated response state. Handles both streamed deltas and complete
@@ -2086,6 +2123,160 @@ mod tests {
         let d = s.finalize(&RequestCtx::default(), &acc, 200);
         assert!(d.iter().any(|x| x.code == Code::ReasoningNoAnswer), "{d:?}");
         assert!(!d.iter().any(|x| x.code == Code::EmptyResponse), "{d:?}");
+    }
+
+    #[test]
+    fn unit__finalize__reasoning_no_answer_detail_names_budget() {
+        // finish + usage present: the detail must say WHICH budget the
+        // reasoning ate, or the doctor aggregate reads as a mystery fault
+        // (live 2026-09-13: 43x tiny max_tokens=4-5 requests).
+        let s = Sentinel::new(true, 0, None);
+        let mut acc = Accum {
+            saw_any_choice: true,
+            finish: Some("length".into()),
+            usage_completion: Some(5),
+            ..Accum::default()
+        };
+        acc.reasoning = "thinking".into();
+        let d = s.finalize(&RequestCtx::default(), &acc, 200);
+        let det = d
+            .iter()
+            .find(|x| x.code == Code::ReasoningNoAnswer)
+            .expect("detection present");
+        assert!(
+            det.detail.contains("finish=length at 5 completion tokens"),
+            "detail: {}",
+            det.detail
+        );
+
+        // finish only (no usage): suffix carries finish alone.
+        let mut acc = Accum {
+            saw_any_choice: true,
+            finish: Some("stop".into()),
+            ..Accum::default()
+        };
+        acc.reasoning = "x".into();
+        let d = s.finalize(&RequestCtx::default(), &acc, 200);
+        let det = d
+            .iter()
+            .find(|x| x.code == Code::ReasoningNoAnswer)
+            .expect("detection present");
+        assert!(det.detail.contains("finish=stop"), "detail: {}", det.detail);
+        assert!(
+            !det.detail.contains("completion tokens"),
+            "detail: {}",
+            det.detail
+        );
+
+        // Client-abort shape (finish + usage unknown): base sentence only.
+        let mut acc = Accum {
+            saw_any_choice: true,
+            ..Accum::default()
+        };
+        acc.reasoning = "x".into();
+        let d = s.finalize(&RequestCtx::default(), &acc, 200);
+        let det = d
+            .iter()
+            .find(|x| x.code == Code::ReasoningNoAnswer)
+            .expect("detection present");
+        assert!(!det.detail.contains("finish="), "detail: {}", det.detail);
+        assert!(det.detail.contains("zero answer content"));
+    }
+
+    #[test]
+    fn unit__code__derive_serialization_matches_as_str() {
+        // The unification contract: persisted JSONL (derive) and every
+        // display/filter surface (as_str) must spell codes identically,
+        // or `pallama why --code <hinted>` dead-ends.
+        for (variant, expect) in [
+            (Code::CtxTruncated, "ctx_truncated"),
+            (Code::CtxNearLimit, "ctx_near_limit"),
+            (Code::ToolArgsInvalidJson, "tool_args_invalid_json"),
+            (Code::ToolNameUnknown, "tool_name_unknown"),
+            (Code::SchemaViolation, "schema_violation"),
+            (Code::EmptyResponse, "empty_response"),
+            (Code::ReasoningNoAnswer, "reasoning_no_answer"),
+            (Code::StalledStream, "stalled_stream"),
+            (Code::TemplateNoTools, "template_no_tools"),
+        ] {
+            assert_eq!(variant.as_str(), expect);
+            assert_eq!(
+                serde_json::to_string(&variant).unwrap(),
+                format!("\"{expect}\"")
+            );
+            let back: Code = serde_json::from_str(&format!("\"{expect}\"")).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn unit__filter_why_records__flagged_code_model_limit_reach() {
+        // Ring of 20: the 12 NEWEST records clean, the 8 OLDEST flagged
+        // (the doctor dead-end shape — flagged history behind clean
+        // traffic). Ring order here is oldest-first (append order); the
+        // caller passes newest-first, so build the input reversed.
+        let rec = |i: usize, flagged: bool, model: &str| SentinelRecord {
+            trace: format!("plm-t{i}"),
+            ts: 1_000 + i as u64,
+            route: "openai-chat".into(),
+            model: model.into(),
+            status: 200,
+            stream: false,
+            finish: Some("length".into()),
+            detections: if flagged {
+                vec![Detection {
+                    code: Code::ReasoningNoAnswer,
+                    detail: "d".into(),
+                }]
+            } else {
+                Vec::new()
+            },
+            prompt_tokens: Some(10),
+            completion_tokens: Some(5),
+            ctx: Some(32_768),
+            degraded: false,
+            logprob_mean: None,
+            logprob_min: None,
+            logprob_tokens: None,
+            ms: 1,
+        };
+        // i in 0..20: 0..8 flagged-old, 8..20 clean-new; feed newest-first.
+        let ring: Vec<SentinelRecord> = (0..20)
+            .rev()
+            .map(|i| rec(i, i < 8, if i % 2 == 0 { "qwen3.5-9b" } else { "other" }))
+            .collect();
+
+        // Default window (limit 10, no filters) misses every flagged
+        // record — the exact bug this helper exists to fix.
+        let plain = filter_why_records(ring.clone(), None, None, false, 10);
+        assert_eq!(plain.len(), 10);
+        assert!(plain.iter().all(|r| r.detections.is_empty()));
+
+        // flagged=1 reaches past the clean wall to the oldest flagged.
+        let flagged = filter_why_records(ring.clone(), None, None, true, 10);
+        assert_eq!(flagged.len(), 8);
+        assert!(flagged.iter().all(|r| !r.detections.is_empty()));
+        assert_eq!(flagged.first().unwrap().trace, "plm-t7"); // newest flagged
+        assert_eq!(flagged.last().unwrap().trace, "plm-t0"); // oldest flagged
+
+        // limit > matches: capped by available flagged records.
+        assert_eq!(
+            filter_why_records(ring.clone(), None, None, true, 256).len(),
+            8
+        );
+
+        // code filter matches by substring and combines with flagged.
+        let by_code = filter_why_records(ring.clone(), None, Some("reasoning"), true, 10);
+        assert_eq!(by_code.len(), 8);
+        assert!(filter_why_records(ring.clone(), None, Some("no_such_code"), true, 10).is_empty());
+
+        // model filter stacks on flagged (flagged half is even-i = qwen).
+        let by_model = filter_why_records(ring.clone(), Some("qwen3"), None, true, 10);
+        assert_eq!(by_model.len(), 4);
+        assert!(by_model.iter().all(|r| r.model == "qwen3.5-9b"));
+
+        // zero limit: empty, never panics.
+        assert!(filter_why_records(ring, None, None, false, 0).is_empty());
     }
 
     #[test]

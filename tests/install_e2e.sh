@@ -58,14 +58,17 @@ cat > "$TMP/fakesudo" <<'EOF'
 exec "$@"
 EOF
 chmod +x "$TMP/fakesudo"
-cat > "$TMP/fakesystemctl" <<'EOF'
+cat > "$TMP/fakesystemctl" <<EOF
 #!/bin/sh
-case "$1" in
+# Args log: lets tests assert call ORDER (enable-before-start, no --now).
+printf '%s\n' "\$*" >> "$TMP/systemctl.log"
+case "\$1" in
     is-active) exit 3 ;;
     *) exit 0 ;;
 esac
 EOF
 chmod +x "$TMP/fakesystemctl"
+: > "$TMP/systemctl.log"
 UNIT_OUT="$TMP/pallama.service"
 SYSTEM_BIN="$TMP/system-bin"
 SERVER_PID=
@@ -160,6 +163,16 @@ fi
 grep -q "Restart=always" "$UNIT_OUT" 2>/dev/null && ok "unit Restart=always" || bad "unit lacks Restart=always"
 grep -q "ExecStart=$SYSTEM_BIN/pallama serve" "$UNIT_OUT" 2>/dev/null &&
     ok "unit ExecStart points at the installed binary" || bad "unit ExecStart wrong"
+grep -q '^MemoryHigh=85%$' "$UNIT_OUT" 2>/dev/null &&
+    ok "unit MemoryHigh default 85%" || bad "unit lacks MemoryHigh=85%"
+# PALLAMA_UNIT_MEMORY_HIGH='' must omit the line (operator opt-out)
+rm -rf "$UNIT_OUT"
+OUT=$(env $INSTALL_ENV PALLAMA_UNIT_MEMORY_HIGH= sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
+if [ "$RC" = 0 ] && [ -f "$UNIT_OUT" ] && ! grep -q '^MemoryHigh=' "$UNIT_OUT"; then
+    ok "empty memory knob omits MemoryHigh line"
+else
+    bad "empty memory knob did not omit MemoryHigh (rc=$RC)"
+fi
 echo "$OUT" | grep -q "sha256 verified" && ok "digest verified message" || bad "no 'sha256 verified' in output"
 # --- 2. tampered digest ------------------------------------------------------
 printf '{"tag_name":"%s","assets":[{"name":"%s","digest":"sha256:%s","browser_download_url":"%s/download/%s"}]}' \
@@ -314,6 +327,188 @@ else
     echo "SKIP: case 7 needs x86_64 host (fake-armv7 tarball carries the host binary)"
 fi
 
+# --- 8. GPU preflight: wiring, opt-out, driverless-NVIDIA lane ----------------
+# (a) full-flow wiring: PALLAMA_AUTO_DRIVER=0 reaches the preflight and
+#     skips it; (b) function-level: a driverless NVIDIA PCI census drives
+#     the apt driver lane (fake apt-get records its argv) with the REBOOT
+#     + engine-update messaging — no real package is touched.
+rm -rf "$SYSTEM_BIN" "$UNIT_OUT" "${TMP:?}/home"
+mkdir -p "$TMP/home"
+printf '{"tag_name":"%s","assets":[{"name":"%s","digest":"sha256:%s","browser_download_url":"%s/download/%s"}]}' \
+    "$TAG" "$ASSET" "$SHA" "$BASE" "$ASSET" > "$SRV/release.json"
+OUT=$(env $INSTALL_ENV PALLAMA_AUTO_DRIVER=0 sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "GPU preflight skipped (PALLAMA_AUTO_DRIVER=0)"; then
+    ok "full flow: GPU preflight wired and opt-out honored"
+else
+    bad "GPU preflight opt-out not observed in full flow (rc=$RC)"
+fi
+
+# Function-level scenario: extract gpu_preflight verbatim from install.sh
+# and run it against a scratch PATH whose lspci reports a driverless
+# NVIDIA card and whose apt-get is a recorder. nvidia-smi is absent from
+# the scratch PATH — the driverless branch must fire.
+GPDIR="$TMP/gpu"
+mkdir -p "$GPDIR/scratch" "$GPDIR/fake"
+sed -n '/^gpu_preflight() {/,/^}/p' "$INSTALL_SH" > "$GPDIR/fn.sh"
+cat > "$GPDIR/fake/lspci" <<'EOF'
+#!/bin/sh
+case "$3" in ::0300|::0302) printf '0000:01:00.0 0300: 10de:28a0 (rev a1)\n' ;; esac
+exit 0
+EOF
+cat > "$GPDIR/fake/apt-get" <<EOF
+#!/bin/sh
+echo "apt-get \$*" >> "$GPDIR/fake/apt.log"
+exit 0
+EOF
+chmod +x "$GPDIR/fake/lspci" "$GPDIR/fake/apt-get"
+for b in uname ls timeout grep; do
+    ln -sf "$(command -v "$b")" "$GPDIR/scratch/$b"
+done
+ln -sf "$GPDIR/fake/lspci" "$GPDIR/scratch/lspci"
+ln -sf "$GPDIR/fake/apt-get" "$GPDIR/scratch/apt-get"
+cat > "$GPDIR/run.sh" <<EOF
+status() { echo ">>> \$*"; }
+SUDO="$TMP/fakesudo"
+PATH="$GPDIR/scratch"
+. "$GPDIR/fn.sh"
+gpu_preflight
+EOF
+OUT=$(sh "$GPDIR/run.sh" 2>&1)
+if echo "$OUT" | grep -q "NVIDIA GPU detected (PCI 10de:) but no NVIDIA driver userspace" &&
+   grep -q "install -y nvidia-driver" "$GPDIR/fake/apt.log" 2>/dev/null; then
+    ok "driverless NVIDIA: detected, driver lane executed via apt-get"
+else
+    bad "driverless NVIDIA lane did not fire"; echo "$OUT" | sed 's/^/    /'
+fi
+echo "$OUT" | grep -q "REBOOT REQUIRED, then run: pallama engine update" &&
+    ok "driverless NVIDIA: REBOOT + engine-update chain in message" ||
+    bad "missing REBOOT/engine-update guidance"
+echo "$OUT" | grep -q "newest CUDA build this driver supports" &&
+    ok "driverless NVIDIA: latest-compatible-CUDA messaging present" ||
+    bad "missing latest-CUDA messaging"
+# Opt-out at function level: nothing installed, skip announced.
+rm -f "$GPDIR/fake/apt.log"
+cat > "$GPDIR/run.sh" <<EOF
+status() { echo ">>> \$*"; }
+SUDO="$TMP/fakesudo"
+PATH="$GPDIR/scratch"
+PALLAMA_AUTO_DRIVER=0
+. "$GPDIR/fn.sh"
+gpu_preflight
+EOF
+OUT=$(sh "$GPDIR/run.sh" 2>&1)
+if echo "$OUT" | grep -q "GPU preflight skipped" && [ ! -f "$GPDIR/fake/apt.log" ]; then
+    ok "opt-out: preflight skipped, no package command run"
+else
+    bad "opt-out leaked a package install"; echo "$OUT" | sed 's/^/    /'
+fi
+
 echo
+# --- 9. uninstall.sh flag matrix + install deferred-start ordering ---------
+
+UNINSTALL="$ROOT/scripts/uninstall.sh"
+UENV="HOME=$TMP/home PALLAMA_SUDO=$TMP/fakesudo PALLAMA_SYSTEMCTL=$TMP/fakesystemctl PALLAMA_SYSTEM_BIN_DIR=$SYSTEM_BIN PALLAMA_UNIT_PATH=$UNIT_OUT"
+
+stage_installed() {
+    rm -rf "$TMP/home" "$SYSTEM_BIN" ; mkdir -p "$TMP/home"
+    D="$TMP/home/.local/share/pallama"
+    mkdir -p "$D/models" "$D/engines/b1" "$D/whisper/models" "$D/whisper/bin" "$D/run" \
+             "$TMP/home/.config/pallama" "$SYSTEM_BIN"
+    echo gguf > "$D/models/qwen3-0.6b-q4_0.gguf"
+    echo ggml > "$D/whisper/models/ggml-base.bin"
+    echo bin  > "$D/whisper/bin/whisper-server"
+    echo db   > "$D/pallama.db"
+    echo wal  > "$D/pallama.db-wal"
+    echo shm  > "$D/pallama.db-shm"
+    echo pid  > "$D/run/pallama.pid"
+    echo cfg  > "$TMP/home/.config/pallama/config.toml"
+    printf '#!/bin/sh\nexit 0\n' > "$SYSTEM_BIN/pallama"
+    chmod +x "$SYSTEM_BIN/pallama"
+    printf '[Unit]\n' > "$UNIT_OUT"
+}
+
+# 9a. --dry-run removes nothing.
+stage_installed
+env $UENV sh "$UNINSTALL" --dry-run --keep-models >/dev/null 2>&1 </dev/null
+[ $? -eq 0 ] && ok "uninstall --dry-run exits 0" || bad "uninstall --dry-run exits 0"
+[ -f "$SYSTEM_BIN/pallama" ] && [ -f "$TMP/home/.local/share/pallama/pallama.db" ] \
+    && ok "uninstall --dry-run removed nothing" || bad "uninstall --dry-run removed nothing"
+
+# 9b. --keep-models --yes (the once-destructive combo): models KEPT, all
+# regenerable state + WAL sidecars gone, config kept.
+stage_installed
+env $UENV sh "$UNINSTALL" --keep-models --yes >/dev/null 2>&1 </dev/null
+D="$TMP/home/.local/share/pallama"
+[ -f "$D/models/qwen3-0.6b-q4_0.gguf" ] && ok "uninstall --yes keeps gguf models" || bad "uninstall --yes keeps gguf models"
+[ -f "$D/whisper/models/ggml-base.bin" ] && ok "uninstall --yes keeps whisper models" || bad "uninstall --yes keeps whisper models"
+[ ! -e "$D/pallama.db" ] && [ ! -e "$D/pallama.db-wal" ] && [ ! -e "$D/pallama.db-shm" ] \
+    && ok "uninstall removes db + WAL sidecars" || bad "uninstall removes db + WAL sidecars"
+[ ! -d "$D/engines" ] && [ ! -d "$D/whisper/bin" ] && [ ! -e "$SYSTEM_BIN/pallama" ] && [ ! -e "$UNIT_OUT" ] \
+    && ok "uninstall removes engines, whisper bins, system binary, unit" || bad "uninstall removes engines, whisper bins, system binary, unit"
+[ -f "$TMP/home/.config/pallama/config.toml" ] && ok "uninstall keeps config (no --purge)" || bad "uninstall keeps config (no --purge)"
+
+# 9c. --yes --remove-models conflicts hard BEFORE any mutation.
+stage_installed
+env $UENV sh "$UNINSTALL" --yes --remove-models >/dev/null 2>&1 </dev/null && RC=0 || RC=$?
+[ "$RC" -ne 0 ] && ok "uninstall --yes --remove-models refused" || bad "uninstall --yes --remove-models refused"
+[ -f "$TMP/home/.local/share/pallama/models/qwen3-0.6b-q4_0.gguf" ] && [ -f "$SYSTEM_BIN/pallama" ] \
+    && ok "refused uninstall mutated nothing" || bad "refused uninstall mutated nothing"
+
+# 9d. --remove-models alone is the explicit full nuke.
+stage_installed
+env $UENV sh "$UNINSTALL" --remove-models >/dev/null 2>&1 </dev/null && RC=0 || RC=$?
+D="$TMP/home/.local/share/pallama"
+[ "$RC" = 0 ] && ok "uninstall --remove-models completes" || bad "uninstall --remove-models completes (rc=$RC)"
+[ ! -e "$D/models/qwen3-0.6b-q4_0.gguf" ] && ok "uninstall --remove-models removes gguf models" || bad "uninstall --remove-models removes gguf models"
+[ ! -e "$D/whisper/models/ggml-base.bin" ] && ok "uninstall --remove-models removes whisper models" || bad "uninstall --remove-models removes whisper models"
+stage_installed
+env $UENV sh "$UNINSTALL" --remove-models --yes >/dev/null 2>&1 </dev/null && RC=0 || RC=$?
+[ "$RC" -ne 0 ] && ok "uninstall --remove-models --yes (either order) refused" || bad "uninstall --remove-models --yes (either order) refused"
+
+# 9e. privilege preflight: default sudo + non-tty + no cached creds refused
+# BEFORE mutation. A PATH-shimmed failing sudo makes the credential probe
+# deterministic on any host.
+stage_installed
+mkdir -p "$TMP/fakesbin"
+printf '#!/bin/sh\nexit 1\n' > "$TMP/fakesbin/sudo"; chmod +x "$TMP/fakesbin/sudo"
+env -u PALLAMA_SUDO HOME="$TMP/home" PATH="$TMP/fakesbin:$PATH" \
+    PALLAMA_SYSTEMCTL="$TMP/fakesystemctl" PALLAMA_SYSTEM_BIN_DIR="$SYSTEM_BIN" \
+    PALLAMA_UNIT_PATH="$UNIT_OUT" \
+    sh "$UNINSTALL" --keep-models >/dev/null 2>&1 </dev/null && RC=0 || RC=$?
+[ "$RC" -ne 0 ] && ok "uninstall preflight refuses non-tty default sudo" || bad "uninstall preflight refuses non-tty default sudo"
+[ -f "$SYSTEM_BIN/pallama" ] && [ -f "$TMP/home/.local/share/pallama/pallama.db" ] \
+    && ok "preflight refusal mutated nothing" || bad "preflight refusal mutated nothing"
+
+# 9f. install deferred-start ordering: fresh install enables WITHOUT --now,
+# then explicitly starts after the engine bootstrap (never crash-loops on a
+# engine-less unit).
+printf '{"tag_name":"%s","assets":[{"name":"%s","digest":"sha256:%s","browser_download_url":"%s/download/%s"}]}' \
+    "$TAG" "$ASSET" "$SHA" "$BASE" "$ASSET" > "$SRV/release.json"
+: > "$TMP/systemctl.log"
+OUT=$(env $INSTALL_ENV sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
+if grep -qx 'enable pallama' "$TMP/systemctl.log" && ! grep -q 'enable --now pallama' "$TMP/systemctl.log"; then
+    ok "fresh install enables without --now"
+else
+    bad "fresh install enables without --now"
+fi
+if grep -qx 'start pallama' "$TMP/systemctl.log"; then
+    ok "fresh install explicitly starts the unit"
+else
+    bad "fresh install explicitly starts the unit"
+fi
+if [ "$(grep -nx 'enable pallama\|start pallama' "$TMP/systemctl.log" | head -1 | cut -d: -f1)" \
+     -lt "$(grep -nx 'start pallama' "$TMP/systemctl.log" | head -1 | cut -d: -f1)" ]; then
+    ok "enable precedes start"
+else
+    bad "enable precedes start"
+fi
+
+# 9g. health poll target pin: the fallback port must be pallama's 11435,
+# never ollama's 11434 (it answers green while pallama is dead). Comments
+# may name 11434 to document the hazard; functional code may not.
+sed 's/#.*$//' "$ROOT/scripts/install.sh" | grep -q 11434 &&
+    bad "install.sh functionally references 11434" ||
+    ok "install.sh polls 11435, never 11434"
+
 echo "install e2e: $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

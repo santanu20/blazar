@@ -25,10 +25,12 @@
 #
 # Options:
 #   --dry-run         print every action, remove nothing
-#   --remove-models   non-interactive full nuke (skips the model prompt)
+#   --remove-models   non-interactive full nuke (models deleted!)
 #   --keep-models     non-interactive, models explicitly kept
 #   --purge           also remove ~/.config/pallama (config + token)
-#   --yes             no confirmations at all (same as --remove-models)
+#   --yes             skip prompts using SAFE defaults (models KEPT);
+#                     never implies --remove-models — data deletion is
+#                     opt-in only via the explicit flag
 #   --help            this text
 #
 # Env overrides (testing/mirrors; defaults match install.sh):
@@ -51,21 +53,43 @@ usage() { sed -n '2,37p' "$0"; exit 0; }
 DRY=0
 MODELS=ask
 PURGE=0
+YES=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY=1 ;;
-        --remove-models | --yes) MODELS=remove ;;
+        --remove-models) MODELS=remove ;;
         --keep-models) MODELS=keep ;;
         --purge) PURGE=1 ;;
+        --yes) YES=1 ;;
         --help | -h) usage ;;
         *) error "unknown option: $1 (supported: --dry-run, --remove-models, --keep-models, --yes, --purge, --help)" ;;
     esac
     shift
 done
+# --yes = skip prompts with SAFE defaults. It can never combine with an
+# explicit model deletion (silent last-flag-wins here once destroyed
+# 19 GiB of user models on 2026-09-13).
+[ "$YES" -eq 1 ] && {
+    [ "$MODELS" = remove ] &&
+        error "--yes cannot combine with --remove-models (safe default: models kept)"
+    MODELS=keep
+}
 
 # ollama-style privilege: root runs plain, everyone else needs sudo.
 SUDO="${PALLAMA_SUDO-sudo}"
 [ "$(id -u)" -eq 0 ] && SUDO=
+
+# Privilege preflight BEFORE any mutation: privileged actions (disable
+# unit, remove binary/unit) must be actionable or we refuse to start.
+# The split-brain alternative (system state kept, user state deleted
+# under a crash-looping restart) is far worse than a clean refusal.
+# Allowed: root; a tty (sudo can prompt); a non-default PALLAMA_SUDO
+# wrapper (caller owns its auth). Refused: default sudo, no tty, no
+# cached credentials.
+if [ "$(id -u)" -ne 0 ] && [ "$SUDO" = sudo ] && [ "$DRY" != 1 ] &&
+    [ ! -t 0 ] && ! sudo -n true 2>/dev/null; then
+    error "sudo cannot run non-interactively (no tty / no cached credentials) — refusing to start a partial uninstall. Re-run from a terminal for the password prompt, or pipe credentials to 'sudo -S', or set PALLAMA_SUDO for CI."
+fi
 
 # run <desc> <cmd...>: every mutation goes through here so --dry-run
 # covers everything and the log doubles as an action transcript.
@@ -91,11 +115,21 @@ run() {
 BIN_DIR="${PALLAMA_SYSTEM_BIN_DIR:-/usr/local/bin}"
 UNIT_PATH="${PALLAMA_UNIT_PATH:-/etc/systemd/system/pallama.service}"
 SYSTEMCTL="${PALLAMA_SYSTEMCTL:-systemctl}"
-CONFIG_DIR="$HOME/.config/pallama"
-DATA_DIR="$HOME/.local/share/pallama"
+# Run-as-root support (parity with install.sh): under `sudo sh
+# uninstall.sh` $HOME is /root — user-keyed state (config, data, models,
+# user unit) belongs to the INVOKING user, resolved via SUDO_USER.
+USER_HOME="$HOME"
+if [ "$(id -u)" -eq 0 ] && [ "${SUDO_USER:-}" != "" ] && [ "$SUDO_USER" != "root" ]; then
+    _hm=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
+    [ -z "$_hm" ] && [ "$(uname -s)" = Darwin ] &&
+        _hm=$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory 2>/dev/null | awk '{print $NF}')
+    [ -n "$_hm" ] && USER_HOME="$_hm"
+fi
+CONFIG_DIR="$USER_HOME/.config/pallama"
+DATA_DIR="$USER_HOME/.local/share/pallama"
 MODELS_DIR="$DATA_DIR/models"
 WHISPER_MODELS_DIR="$DATA_DIR/whisper/models"
-USER_UNIT="$HOME/.config/systemd/user/pallama.service"
+USER_UNIT="$USER_HOME/.config/systemd/user/pallama.service"
 UNIT_DROPIN="$UNIT_PATH.d"
 
 # ---------------------------------------------------------------- 1. stop
@@ -184,9 +218,9 @@ status "removing system artifacts"
 if [ -e "$BIN_DIR/pallama" ] || [ "$DRY" = 1 ]; then
     run "remove $BIN_DIR/pallama" $SUDO rm -f "$BIN_DIR/pallama"
 fi
-if [ -e "$HOME/.local/bin/pallama" ]; then
+if [ -e "$USER_HOME/.local/bin/pallama" ]; then
     run "remove stale user-path copy ~/.local/bin/pallama" \
-        rm -f "$HOME/.local/bin/pallama"
+        rm -f "$USER_HOME/.local/bin/pallama"
 fi
 if [ -e "$UNIT_PATH" ]; then
     run "remove unit $UNIT_PATH" $SUDO rm -f "$UNIT_PATH"
@@ -198,8 +232,8 @@ if [ -e "$USER_UNIT" ]; then
     run "remove legacy user unit $USER_UNIT" rm -f "$USER_UNIT"
 fi
 if [ "$(uname -s)" = Darwin ]; then
-    [ -e "$HOME/Library/LaunchAgents/dev.pallama.plist" ] &&
-        run "remove launch agent plist" rm -f "$HOME/Library/LaunchAgents/dev.pallama.plist"
+    [ -e "$USER_HOME/Library/LaunchAgents/dev.pallama.plist" ] &&
+        run "remove launch agent plist" rm -f "$USER_HOME/Library/LaunchAgents/dev.pallama.plist"
     [ -e /Library/LaunchDaemons/dev.pallama.plist ] &&
         run "remove launch daemon plist" $SUDO rm -f /Library/LaunchDaemons/dev.pallama.plist
 fi
@@ -219,7 +253,9 @@ status "removing regenerable user state (store + engines + caches)"
 # config snapshots, audit log, KV sessions, spec caches — all regenerable
 # or re-downloadable) so a declined model removal leaves the directory
 # itself intact.
-for _sub in pallama.db engines run snapshots log sessions speccache; do
+# pallama.db plus its SQLite WAL sidecars (-wal, -shm) that can outlive
+# the db file after a daemon shutdown — orphaned checkpoints, not data.
+for _sub in pallama.db pallama.db-wal pallama.db-shm engines run snapshots log sessions speccache; do
     [ -e "$DATA_DIR/$_sub" ] &&
         run "remove $DATA_DIR/$_sub" rm -rf "$DATA_DIR/$_sub"
 done
@@ -275,4 +311,10 @@ if [ "$FAILURES" -gt 0 ]; then
     exit 1
 fi
 status "done. pallama fully removed (validation sandboxes under ~/.cache untouched)"
-[ "$MODELS" = keep ] && status "models remain at $MODELS_DIR — delete manually when ready"
+# NOT `[ ... ] && status` as the last line: a false test there becomes the
+# script's exit status (POSIX footgun; --remove-models runs used to exit 1
+# after a flawless uninstall).
+if [ "$MODELS" = keep ]; then
+    status "models remain at $MODELS_DIR — delete manually when ready"
+fi
+exit 0

@@ -10,17 +10,43 @@ use std::time::{Duration, Instant};
 /// `None` is returned — callers decide whether that is an error (fatal
 /// probes) or an empty census (best-effort probes). Long-running tool
 /// invocations (quantize, builds) must NOT route through this.
+///
+/// Both pipes are drained on reader threads WHILE the child runs: a child
+/// that writes more than the OS pipe buffer (~64 KiB) would otherwise
+/// block on write, never exit, and turn into a guaranteed deadline kill —
+/// a silent 30 s stall masquerading as a hung binary. Spawn failures are
+/// logged with their `io::Error` (a transient EAGAIN under fork pressure
+/// must not be indistinguishable from a missing binary).
 pub fn probe_output(cmd: &mut Command, secs: u64) -> Option<std::process::Output> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().ok()?;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("probe spawn failed ({e}): {:?}", cmd.get_program());
+            return None;
+        }
+    };
+    // Drain both pipes concurrently with the poll loop (see doc comment).
+    let stdout_handle = child
+        .stdout
+        .take()
+        .map(|p| std::thread::spawn(move || drain_pipe(p)));
+    let stderr_handle = child
+        .stderr
+        .take()
+        .map(|p| std::thread::spawn(move || drain_pipe(p)));
     let deadline = Instant::now() + Duration::from_secs(secs);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
+                    tracing::warn!(
+                        "probe {:?} exceeded {secs}s deadline — killing",
+                        cmd.get_program()
+                    );
                     let _ = child.kill();
                     let _ = child.wait();
                     return None;
@@ -30,19 +56,22 @@ pub fn probe_output(cmd: &mut Command, secs: u64) -> Option<std::process::Output
             Err(_) => return None,
         }
     };
-    let mut stdout = Vec::new();
-    if let Some(mut s) = child.stdout.take() {
-        let _ = s.read_to_end(&mut stdout);
-    }
-    let mut stderr = Vec::new();
-    if let Some(mut s) = child.stderr.take() {
-        let _ = s.read_to_end(&mut stderr);
-    }
+    let stdout = stdout_handle.map_or_else(Vec::new, |h| h.join().unwrap_or_default());
+    let stderr = stderr_handle.map_or_else(Vec::new, |h| h.join().unwrap_or_default());
     Some(std::process::Output {
         status,
         stdout,
         stderr,
     })
+}
+
+/// Reader-thread body: drain a pipe to EOF into a buffer. A panicked
+/// reader (torn pipe) yields an empty buffer — the caller's status check
+/// already fails the probe.
+fn drain_pipe(mut pipe: impl Read) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let _ = pipe.read_to_end(&mut buf);
+    buf
 }
 
 /// Live `MemAvailable` (MiB). The spawn-time memory guard: below a hard
@@ -147,6 +176,80 @@ pub fn hardware_with(gpus: Vec<GpuInfo>) -> Hardware {
     }
 }
 
+/// PCI vendor ids of display-class hardware (VGA 0300 + 3D 0302), parsed
+/// from `lspci -n -d ::0300`-style output. Works WITHOUT any driver
+/// installed — this is the doctor's hardware-vs-driver oracle for the
+/// "GPU present but its driver userspace is missing" warning. Sorted,
+/// deduplicated, lowercase. Known ids: `10de` NVIDIA, `1002` AMD, `8086`
+/// Intel; unknown ids pass through verbatim (never guessed into a brand).
+#[must_use]
+pub fn parse_pci_vendors(lspci_text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in lspci_text.lines() {
+        // `0000:01:00.0 0300: 10de:28a0 (rev a1)` — take the token
+        // following the class field (` 0300: `), then its vendor half.
+        let mut fields = line.split_whitespace();
+        let _addr = fields.next();
+        let Some(class) = fields.next() else { continue };
+        if !class.ends_with(':') {
+            continue;
+        }
+        let Some(id) = fields.next() else { continue };
+        let Some((vendor, _device)) = id.split_once(':') else {
+            continue;
+        };
+        if vendor.len() == 4 && vendor.chars().all(|c| c.is_ascii_hexdigit()) {
+            let vendor = vendor.to_ascii_lowercase();
+            if !out.contains(&vendor) {
+                out.push(vendor);
+            }
+        }
+    }
+    out
+}
+
+/// Live PCI display-hardware census via `lspci -n` (driver-independent).
+/// Empty when lspci is absent or the box has no PCI bus (containers,
+/// WSL1) — callers treat empty as "no oracle", never as "no GPU".
+#[must_use]
+pub fn pci_gpu_vendors() -> Vec<String> {
+    let Some(out) = probe_output(
+        std::process::Command::new("lspci")
+            .arg("-n")
+            .arg("-d")
+            .arg("::0300"),
+        10,
+    ) else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut vendors = parse_pci_vendors(&text);
+    // 3D controllers (0302) are a separate class: discrete NVIDIA on
+    // hybrid laptops routinely lands here instead of 0300.
+    if let Some(out2) = probe_output(
+        std::process::Command::new("lspci")
+            .arg("-n")
+            .arg("-d")
+            .arg("::0302"),
+        10,
+    ) {
+        if out2.status.success() {
+            let text2 = String::from_utf8_lossy(&out2.stdout).into_owned();
+            for v in parse_pci_vendors(&text2) {
+                if !vendors.contains(&v) {
+                    vendors.push(v);
+                }
+            }
+        }
+    }
+    vendors.sort();
+    vendors.dedup();
+    vendors
+}
+
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
@@ -193,5 +296,63 @@ mod tests {
         assert!(!gpus[0].is_integrated(), "nvidia entries read discrete");
         // Garbage lines skip; partial lines skip — never a guessed entry.
         assert!(parse_nvidia_csv("nope\n\nRTX, only-two\n").is_empty());
+    }
+
+    #[test]
+    fn unit__parse_pci_vendors__vga_and_3d_lines() {
+        let out = parse_pci_vendors(
+            "0000:00:02.0 0300: 8086:46a6 (rev 0c)\n\
+             0000:01:00.0 0300: 10de:28a0 (rev a1)\n\
+             0000:01:00.1 0403: 10de:28ba (rev a1)\n",
+        );
+        assert_eq!(out, vec!["8086".to_string(), "10de".to_string()]);
+    }
+
+    #[test]
+    fn unit__parse_pci_vendors__dedup_unknown_and_garbage() {
+        let out = parse_pci_vendors(
+            "0000:01:00.0 0300: 10de:28a0 (rev a1)\n\
+             0000:02:00.0 0300: 10de:2684 (rev a1)\n\
+             0000:03:00.0 0300: 1a03:1150 (rev 10)\n\
+             garbage line entirely\n\
+             0000:04:00.0 0300 no-colon-class\n",
+        );
+        assert_eq!(out, vec!["10de".to_string(), "1a03".to_string()]);
+    }
+
+    #[test]
+    fn unit__parse_pci_vendors__uppercase_hex_normalized() {
+        let out = parse_pci_vendors("0000:01:00.0 0300: 10DE:28A0 (rev a1)\n");
+        assert_eq!(out, vec!["10de".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unit__probe_output__survives_pipe_buffer_flood() {
+        // 4 MiB of output — far past the ~64 KiB OS pipe buffer. The
+        // pre-fix poll-then-read shape deadlocked exactly here: the child
+        // blocked on write, never exited, and the probe surfaced as a
+        // bogus "timed out or failed to spawn".
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "head -c 4194304 /dev/zero | base64"]);
+        let start = std::time::Instant::now();
+        let out = probe_output(&mut cmd, 30).expect("flood child must complete");
+        assert!(out.status.success());
+        assert!(
+            out.stdout.len() > 1_000_000,
+            "flood output lost: {} bytes",
+            out.stdout.len()
+        );
+        assert!(
+            start.elapsed().as_secs() < 25,
+            "flood probe took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn unit__probe_output__missing_binary_is_none_not_panic() {
+        let mut cmd = std::process::Command::new("/nonexistent/pallama-probe-binary");
+        assert!(probe_output(&mut cmd, 5).is_none());
     }
 }
