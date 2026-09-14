@@ -42,6 +42,13 @@ fn write_gguf(path: &std::path::Path) {
         ("qwen3.head_count", 4, 16u32.to_le_bytes().to_vec()),
         ("qwen3.head_count_kv", 4, 8u32.to_le_bytes().to_vec()),
         ("qwen3.embedding_length", 4, 1024u32.to_le_bytes().to_vec()),
+        // ChatML template with a thinking marker: exercises the
+        // evidence-based `thinking` capability in /api/show.
+        (
+            "tokenizer.chat_template",
+            8,
+            pstr("{% if enable_thinking %}{{ content }}{% endif %}"),
+        ),
     ];
     b.extend_from_slice(&(kvs.len() as u64).to_le_bytes());
     for (k, t, v) in kvs {
@@ -1144,10 +1151,12 @@ async fn e2e__ps_and_show() {
         .unwrap();
     assert_eq!(s["details"]["quantization_level"], "Q4_K_M");
     assert_eq!(s["model_info"]["general.architecture"], "qwen3");
-    // ollama-parity capability discovery (geokit vision detection):
-    // m1 has no mmproj -> completion only, never a vision lie.
+    // ollama-parity capability discovery (geokit vision + thinking
+    // detection): m1 has no mmproj but its fixture template carries an
+    // enable_thinking marker -> completion + thinking, never a vision lie.
     let caps = s["capabilities"].as_array().expect("capabilities array");
     assert!(caps.iter().any(|c| c == "completion"), "{s}");
+    assert!(caps.iter().any(|c| c == "thinking"), "{s}");
     assert!(!caps.iter().any(|c| c == "vision"), "{s}");
     ts.state.sup.shutdown_all().await.unwrap();
 }

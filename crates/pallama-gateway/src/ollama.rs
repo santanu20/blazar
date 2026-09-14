@@ -281,6 +281,17 @@ pub async fn show(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     if row.mmproj_path.is_some() {
         capabilities.push("vision");
     }
+    // Thinking capability is template-evidenced — the same marker sniff
+    // the think:true request gate uses. Harnesses (geokit THINK_OK) read
+    // this to decide whether the `think` request key is legal; an
+    // unreadable row never claims the capability (fail-closed).
+    if gguf
+        .as_ref()
+        .and_then(|g| g.chat_template.as_deref())
+        .is_some_and(template_supports_thinking)
+    {
+        capabilities.push("thinking");
+    }
     let mut resp = json!({
         "license": "see upstream model card",
         "modelfile": format!("# pallama: plain GGUF at {}", row.path),

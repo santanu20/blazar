@@ -44,6 +44,13 @@ fn write_gguf(path: &std::path::Path) {
         ("qwen3.head_count", 4, 16u32.to_le_bytes().to_vec()),
         ("qwen3.head_count_kv", 4, 8u32.to_le_bytes().to_vec()),
         ("qwen3.embedding_length", 4, 1024u32.to_le_bytes().to_vec()),
+        // ChatML template with a thinking marker: exercises the
+        // evidence-based `thinking` capability in /api/show.
+        (
+            "tokenizer.chat_template",
+            8,
+            pstr("{% if enable_thinking %}{{ content }}{% endif %}"),
+        ),
     ];
     b.extend_from_slice(&(kvs.len() as u64).to_le_bytes());
     for (k, t, v) in kvs {
