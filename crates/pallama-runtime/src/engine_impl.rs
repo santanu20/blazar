@@ -731,6 +731,35 @@ mod tests {
         ]
     }
 
+    /// A loopback port that is VERIFIED unreachable at hand-off. The
+    /// naive bind-drop pattern races the suite's parallel port-0 binds:
+    /// another test can rebind the just-released port mid-test and the
+    /// "dead" endpoint quietly turns alive (seen live: `probe_rpc` and
+    /// `dead_rpc` spawn tests failed ~1-in-10 full runs, a different one
+    /// each time). Here the port is re-checked by an actual connect and
+    /// swapped out if anyone grabbed it.
+    async fn dead_port() -> u16 {
+        for _ in 0..64 {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind");
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                tokio::net::TcpStream::connect(("127.0.0.1", port)),
+            )
+            .await
+            {
+                // timeout (still closed) or refused: verifiably dead
+                Err(_) | Ok(Err(_)) => return port,
+                // someone rebound it: try another port
+                Ok(Ok(_)) => {}
+            }
+        }
+        panic!("could not secure a dead loopback port in 64 tries");
+    }
+
     #[tokio::test]
     async fn unit__probe_rpc__no_flag_is_noop() {
         let argv = vec![
@@ -754,11 +783,7 @@ mod tests {
     #[tokio::test]
     async fn unit__probe_rpc__dead_endpoint_reported() {
         // Bind then drop: the port is (almost certainly) closed again.
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let port = dead_port().await;
         let argv = rpc_argv(&format!("127.0.0.1:{port}"));
         let dead = probe_rpc_endpoints(&argv).await;
         assert_eq!(dead.len(), 1, "{dead:?}");
@@ -771,11 +796,7 @@ mod tests {
             .await
             .unwrap();
         let alive_port = alive.local_addr().unwrap().port();
-        let dead = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let dead_port = dead.local_addr().unwrap().port();
-        drop(dead);
+        let dead_port = dead_port().await;
         let argv = rpc_argv(&format!("127.0.0.1:{alive_port},127.0.0.1:{dead_port}"));
         let reported = probe_rpc_endpoints(&argv).await;
         assert_eq!(reported.len(), 1, "{reported:?}");
@@ -793,11 +814,7 @@ mod tests {
             .await
             .unwrap();
         let alive_port = alive.local_addr().unwrap().port();
-        let dead = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let dead_port = dead.local_addr().unwrap().port();
-        drop(dead);
+        let dead_port = dead_port().await;
         let argv = vec![
             "llama-server".to_string(),
             "--rpc".to_string(),
@@ -834,11 +851,7 @@ mod tests {
 
     #[tokio::test]
     async fn unit__llamacpp_spawn__dead_rpc_refuses_before_exec() {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let port = dead_port().await;
         let manifest = crate::engine::manifest::Manifest {
             tag: "fake".into(),
             build_number: 1,
