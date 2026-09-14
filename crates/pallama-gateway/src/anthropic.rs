@@ -349,6 +349,28 @@ pub fn translate_request(v: &Value, stream: bool) -> Result<Value, String> {
             }
         }
     }
+    // Thinking budget (Anthropic `thinking` block → engine template
+    // kwargs): `max_tokens` is REQUIRED on this API and must exceed the
+    // thinking budget — the spec's own constraint, enforced here so the
+    // child never sees an impossible split. `enabled` without a budget is
+    // tolerated (flags only): the template decides how much to think.
+    if let Some(thinking) = obj.get("thinking") {
+        let enabled = thinking.get("type").and_then(Value::as_str) == Some("enabled");
+        let budget = thinking.get("budget_tokens").and_then(Value::as_u64);
+        let mut kwargs = json!({"thinking": enabled, "enable_thinking": enabled});
+        if enabled && budget.is_some_and(|b| b > 0) {
+            let b = budget.unwrap_or_default();
+            if let Some(mt) = out.get("max_tokens").and_then(Value::as_u64) {
+                if b >= mt {
+                    return Err(format!(
+                        "max_tokens must be greater than thinking.budget_tokens (got max_tokens {mt}, budget_tokens {b})"
+                    ));
+                }
+            }
+            kwargs["thinking_budget"] = json!(b);
+        }
+        out["chat_template_kwargs"] = kwargs;
+    }
     out["stream"] = json!(stream);
     if stream {
         out["stream_options"] = json!({"include_usage": true});
@@ -928,6 +950,56 @@ mod tests {
         assert_eq!(out["stop"], json!(["END"]));
         assert_eq!(out["stream"], true);
         assert_eq!(out["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn unit__translate_request__thinking_budget_maps_to_kwargs() {
+        let mut v = anthropic_req();
+        v["thinking"] = json!({"type": "enabled", "budget_tokens": 32});
+        let out = translate_request(&v, false).expect("ok");
+        let kwargs = &out["chat_template_kwargs"];
+        assert_eq!(kwargs["thinking"], true);
+        assert_eq!(kwargs["enable_thinking"], true);
+        assert_eq!(kwargs["thinking_budget"], 32);
+        // absent thinking must not conjure the key at all
+        let plain = translate_request(&anthropic_req(), false).expect("ok");
+        assert!(plain.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn unit__translate_request__thinking_budget_exceeding_max_tokens_errors() {
+        let mut v = anthropic_req(); // max_tokens 64
+        v["thinking"] = json!({"type": "enabled", "budget_tokens": 64});
+        let err = translate_request(&v, false).expect_err("budget >= max must err");
+        assert_eq!(
+            err,
+            "max_tokens must be greater than thinking.budget_tokens (got max_tokens 64, budget_tokens 64)"
+        );
+        let mut over = anthropic_req();
+        over["thinking"] = json!({"type": "enabled", "budget_tokens": 512});
+        let err2 = translate_request(&over, false).expect_err("budget > max must err");
+        assert!(err2.contains("budget_tokens 512"));
+    }
+
+    #[test]
+    fn unit__translate_request__thinking_disabled_and_budgetless_flags_only() {
+        let mut v = anthropic_req();
+        v["thinking"] = json!({"type": "disabled"});
+        let out = translate_request(&v, false).expect("ok");
+        assert_eq!(out["chat_template_kwargs"]["thinking"], false);
+        assert_eq!(out["chat_template_kwargs"]["enable_thinking"], false);
+        assert!(out["chat_template_kwargs"].get("thinking_budget").is_none());
+
+        // enabled without budget_tokens: flags-only pair (documented leniency —
+        // the Anthropic spec requires budget_tokens but we tolerate its absence)
+        let mut budgetless = anthropic_req();
+        budgetless["thinking"] = json!({"type": "enabled"});
+        let out2 = translate_request(&budgetless, false).expect("ok");
+        assert_eq!(out2["chat_template_kwargs"]["thinking"], true);
+        assert_eq!(out2["chat_template_kwargs"]["enable_thinking"], true);
+        assert!(out2["chat_template_kwargs"]
+            .get("thinking_budget")
+            .is_none());
     }
 
     #[test]
