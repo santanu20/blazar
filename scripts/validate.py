@@ -1616,6 +1616,22 @@ _K = [
         None,
         "mistralrs Option knob; mistralrs lane not installed in sandbox",
     ),
+    (
+        "sglang",
+        False,
+        True,
+        "boundary",
+        None,
+        "sglang engine tuning section (all-Option leaves; covered by profile ladder units + live matrix)",
+    ),
+    (
+        "reasoning",
+        False,
+        False,
+        "boundary",
+        None,
+        "server-side reasoning switch string ('' = auto-detect; overlay roundtrip)",
+    ),
 ]
 
 TOPLEVEL_KNOBS = [
@@ -4739,7 +4755,7 @@ def wave_replica_rows(model: str) -> list[dict]:
 def phase_wave() -> None:
     print("\n== phase 8: wave battery (replicas/preload/keys/whisper/gauges) ==")
     d = DAEMON
-    small = "qwen2.5-0.5b-instruct"
+    small = MODEL  # fixture-drift fix: honor PALLAMA_VALIDATE_MODEL like every other phase (default is still qwen2.5-0.5b-instruct)
     big = BIG  # second DISTINCT model (default qwen3.5-9b)
 
     # -- battery A: replicas + slots/pin/cache_idle_slots overlays ----------
@@ -5316,8 +5332,17 @@ def phase_wave() -> None:
     # ggml-rpc-server first — anything less crash-loops the child.
     d.stop()
     rpc_tag = _active_engine_tag()
-    rpc_srv_path = os.path.join(
-        SANDBOX.data_dir, "engines", rpc_tag, f"llama-{rpc_tag}", "ggml-rpc-server"
+    # derive the real engine layout: CUDA assets unpack into vendor-suffixed
+    # dirs (llama-<tag>-bin-ubuntu-cuda-...), not llama-<tag> (F167)
+    rpc_srv_path = next(
+        (
+            str(p)
+            for p in Path(SANDBOX.data_dir, "engines", rpc_tag).rglob("ggml-rpc-server")
+        ),
+        # fallback preserves the F164 skip-and-record when genuinely absent
+        os.path.join(
+            SANDBOX.data_dir, "engines", rpc_tag, f"llama-{rpc_tag}", "ggml-rpc-server"
+        ),
     )
     # F164: existence precheck — a missing binary used to raise
     # FileNotFoundError here and truncate every phase after the battery.
@@ -5652,7 +5677,7 @@ def phase_wave() -> None:
 def phase_parity() -> None:
     print("\n== phase 9: parity battery (templates/samplers/scoped surfaces) ==")
     d = DAEMON
-    small = "qwen2.5-0.5b-instruct"
+    small = MODEL  # fixture-drift fix: honor PALLAMA_VALIDATE_MODEL like every other phase (default is still qwen2.5-0.5b-instruct)
 
     # -- battery A: overlay sampler_defaults + chat_template reach argv -----
     d.start(
@@ -6085,10 +6110,40 @@ def _full_engine_tags() -> list[str]:
             if (
                 re.fullmatch(r"b\d+(?:-cuda)?", name)
                 and (rows is None or name in rows)
+                # derive real layout: CUDA overlay assets unpack into
+                # vendor-suffixed dirs (llama-<tag>-bin-ubuntu-cuda-...),
+                # not llama-<tag> — rglob instead of assuming
                 and all(
-                    os.path.isfile(os.path.join(eng_root, name, f"llama-{name}", tool))
+                    any(Path(eng_root, name).rglob(tool))
                     for tool in ("llama-server", "llama-quantize")
                 )
+            ):
+                tags.append(name)
+    return sorted(tags, key=lambda t: int(t[1:].split("-")[0]), reverse=True)
+
+
+def _server_engine_tags() -> list[str]:
+    """Any llamacpp engine tag carrying llama-server (slim CUDA overlay
+    assets ship server-only — no llama-quantize). Fallback pin when no
+    full bundle exists on the box."""
+    try:
+        db = sqlite3.connect(os.path.join(REAL_DATA, "pallama.db"))
+        rows = {
+            tag
+            for tag, kind in db.execute("SELECT tag, kind FROM engines")
+            if kind == "llamacpp"
+        }
+        db.close()
+    except Exception:
+        rows = None
+    tags: list[str] = []
+    eng_root = os.path.join(REAL_DATA, "engines")
+    if os.path.isdir(eng_root):
+        for name in os.listdir(eng_root):
+            if (
+                re.fullmatch(r"b\d+(?:-cuda)?", name)
+                and (rows is None or name in rows)
+                and any(Path(eng_root, name).rglob("llama-server"))
             ):
                 tags.append(name)
     return sorted(tags, key=lambda t: int(t[1:].split("-")[0]), reverse=True)
@@ -6126,7 +6181,13 @@ def phase_commands() -> None:
     print("\n== phase commands: every CLI path, real (no-mock) ==")
     # The user's real store may hold a partial/local engine active; pin a
     # full one in the sandbox so quantize + child spawns resolve real tools.
-    cli("engine", "use", _full_engine_tags()[0])
+    # Slim CUDA assets ship server-only: fall back to any server-bearing
+    # llamacpp tag; if none, keep the sandbox copy's active engine.
+    pin_tags = _full_engine_tags() or _server_engine_tags()
+    if pin_tags:
+        cli("engine", "use", pin_tags[0])
+    else:
+        print("note: no llamacpp engine tag on disk — pinning skipped")
 
     d = DAEMON
     d.start({"port": PORT})
@@ -6887,6 +6948,12 @@ def phase_commands() -> None:
 
     tags = _full_engine_tags()
     anchor, dance = (tags + [None, None])[:2]
+    if anchor is None:
+        # slim-asset box (CUDA overlay ships server-only): fall back to any
+        # server-bearing llamacpp tag so local/use lanes still exercise a
+        # real engine; dance stays None and its lanes degrade gracefully
+        server_tags = _server_engine_tags()
+        anchor = server_tags[0] if server_tags else None
     # Prefer a plain upstream tag for the pin-update dance so the lane
     # exercises the standard asset path whenever the store has one; a
     # -cuda pick goes through the CUDA overlay repo (needs bNNNN-cuda
@@ -6932,7 +6999,8 @@ def phase_commands() -> None:
         if overlay_miss:
             regb(
                 "engine.update",
-                "CUDA overlay channel not live yet (placeholder pallama/pallama); "
+                "CUDA overlay channel not live yet (no bNNNN-cuda release "
+                f"published in the overlay repo); "
                 f"tag-pinned update to {update_pick} needs a published bNNNN-cuda "
                 "release there — the switch path is proven by engine.use above and "
                 "the channel-update path by live engine-update runs",
@@ -6998,23 +7066,33 @@ def phase_commands() -> None:
                 f"need >=2 full b-engines in real store, found {len(tags)}: {tags}",
             )
     p = cli("engine", "list")
-    reg("engine.list", p.returncode == 0 and anchor in p.stdout, "")
-    local_server = os.path.join(
-        SANDBOX.data_dir, "engines", anchor, f"llama-{anchor}", "llama-server"
+    reg("engine.list", p.returncode == 0 and (anchor or "") in (p.stdout or ""), "")
+    # derive the real engine layout (vendor-suffixed CUDA dirs) instead of
+    # assuming llama-<tag>
+    local_server = (
+        next(
+            (str(q) for q in Path(REAL_DATA, "engines", anchor).rglob("llama-server")),
+            "",
+        )
+        if anchor
+        else ""
     )
-    p = cli("engine", "local", local_server)
-    reg(
-        "engine.local",
-        p.returncode == 0 and "local" in cli("engine", "list").stdout,
-        p.stdout.strip()[:80],
-    )
-    cli("engine", "use", anchor)
-    check(
-        "commands",
-        f"engine active left on full engine {anchor}",
-        _active_engine_tag() == anchor,
-        f"active={_active_engine_tag()}",
-    )
+    if anchor and local_server:
+        p = cli("engine", "local", local_server)
+        reg(
+            "engine.local",
+            p.returncode == 0 and "local" in (cli("engine", "list").stdout or ""),
+            p.stdout.strip()[:80],
+        )
+        cli("engine", "use", anchor)
+        check(
+            "commands",
+            f"engine active left on full engine {anchor}",
+            _active_engine_tag() == anchor,
+            f"active={_active_engine_tag()}",
+        )
+    else:
+        regb("engine.local", "no server-bearing llamacpp engine on disk")
 
     def _pull():
         before = set(cli("list").stdout.split())
@@ -7471,6 +7549,8 @@ def _full_toplevel() -> dict:
         "mcp_servers_json": None,
         "mistralrs_pa_memory_fraction": 0.5,
         "mistralrs_paged_attn": False,
+        "reasoning": "",
+        "sglang": {},
         "lazy_mode": "auto",
         "deterministic": False,
         "audit_log": False,
@@ -8177,9 +8257,11 @@ def _gold_items() -> dict:
         # whether a systemd/launchd manager + pallama unit is probeable on
         # the host (dev boxes/sandboxes without a unit emit no row), on
         # whether the host is Linux-NVIDIA serving a non-CUDA asset
-        # (the cuda-channel hint row is vendor/asset-conditional), and on
+        # (the cuda-channel hint row is vendor/asset-conditional), on
         # whether the config pins retired defaults (the gates full-manifest
-        # boot deliberately writes spec="off"; pristine configs emit no row).
+        # boot deliberately writes spec="off"; pristine configs emit no row),
+        # and on PCI-vs-driver state (a driverless GPU box emits the
+        # nvidia/vulkan driver rows; every drivered host omits them).
         - {
             "whisper currency",
             "whisper lane",
@@ -8187,6 +8269,8 @@ def _gold_items() -> dict:
             "service",
             "engine cuda channel",
             "config pins",
+            "nvidia driver",
+            "vulkan driver",
         }
     )
     items["doctor.check-names"] = "\n".join(names)
@@ -8458,6 +8542,20 @@ def main() -> int:
                 SANDBOX.destroy()
 
     atexit.register(_cleanup)
+
+    # SIGTERM (timeout(1), CI runners) kills python WITHOUT running
+    # atexit handlers — the exact hole that leaked daemon pid 1134882
+    # for 8h on 2026-09-13. Route external termination through the same
+    # cleanup; the daemon-side PDEATHSIG guard covers harness SIGKILL.
+    def _on_signal(signum: int, frame: object) -> None:
+        _cleanup()
+        sys.exit(128 + signum)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        try:
+            signal.signal(sig, _on_signal)
+        except (ValueError, OSError):
+            pass  # unsupported signal on this platform
 
     phases = [
         ("manifests", phase_manifests),

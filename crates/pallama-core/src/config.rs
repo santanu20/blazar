@@ -292,6 +292,18 @@ pub struct Config {
     /// models (9B + projector) on 8 GB cards, live-proven.
     #[serde(default)]
     pub mistralrs_paged_attn: Option<bool>,
+    /// sglang engine tuning knobs (global defaults; per-model
+    /// `model_overrides.<name>.sglang` replaces this whole struct when
+    /// present). Every field maps 1:1 to a `python -m sglang.launch_server`
+    /// flag and is emitted only when the active engine's capability
+    /// manifest advertises it — unknown-on-this-version flags skip with a
+    /// warning instead of erroring. The VRAM ladder flags
+    /// (`--mem-fraction-static`, `--cpu-offload-gb`, `--kv-cache-dtype`,
+    /// `--context-length`) are owned by the profile compiler; the tuning
+    /// struct only overrides `mem_fraction_static` and `kv_cache_dtype`
+    /// explicitly (explicit user pin always wins over the ladder).
+    #[serde(default)]
+    pub sglang: SglangTuning,
     /// Slot prompt-similarity threshold (`--slot-prompt-similarity`):
     /// how closely a request's prompt must match a slot's cached prompt to
     /// reuse it (prefix affinity at slots > 1). 0 = emit nothing (upstream
@@ -459,6 +471,12 @@ pub struct Config {
     /// Keep reasoning content in responses. None = engine default.
     #[serde(default)]
     pub reasoning_preserve: Option<bool>,
+    /// Server-side reasoning switch: "" (engine default = auto-detect
+    /// from the chat template) | "on" | "off" | "auto". Authoritative
+    /// for templates that ignore the `thinking`/`enable_thinking`
+    /// request variables.
+    #[serde(default)]
+    pub reasoning: String,
 
     // ---- vision / multimodal tuning (models with an mmproj).
     /// Max tokens per image (dynamic-resolution vision models). 0 = model.
@@ -718,6 +736,9 @@ pub struct ModelOverride {
     /// Per-model reasoning effort (None = inherit global).
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Per-model server-side reasoning switch (None = inherit global).
+    #[serde(default)]
+    pub reasoning: Option<String>,
     /// Per-model replica count (1 = single instance — the default and
     /// the exact pre-replica behavior). >1 enables prefix-affinity
     /// routing across identical children of the same model.
@@ -772,6 +793,11 @@ pub struct ModelOverride {
     /// explicit `-mm` in `extra_args` still wins.
     #[serde(default, deserialize_with = "de_mmproj")]
     pub mmproj: Option<MmprojPolicy>,
+    /// Per-model sglang tuning; replaces (not merges) the global
+    /// `sglang` struct for this model. Only read when the model spawns on
+    /// a `sglang` engine.
+    #[serde(default)]
+    pub sglang: Option<SglangTuning>,
 }
 
 /// Projector attach policy. Accepts the bool spellings the suppress knob
@@ -800,6 +826,105 @@ impl MmprojPolicy {
     #[must_use]
     pub fn effective(override_: Option<Self>, global: Option<Self>) -> Self {
         override_.or(global).unwrap_or(Self::Lazy)
+    }
+}
+
+/// sglang `launch_server` tuning knobs. All-`Option` on purpose: `None`
+/// never emits a flag (upstream default applies); values are passed
+/// through verbatim (validated as flag-gated at profile-compile, so a
+/// value this Pallama build does not know still reaches a newer sglang
+/// that supports it).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SglangTuning {
+    /// `--attention-backend` (triton, fa3, fa4, flashinfer, `trtllm_mha`...).
+    pub attention_backend: Option<String>,
+    /// `--sampling-backend` (pytorch, flashinfer, ascend).
+    pub sampling_backend: Option<String>,
+    /// `--tool-call-parser` (qwen25, mistral, llama4...).
+    pub tool_call_parser: Option<String>,
+    /// `--reasoning-parser` (deepseek-r1, qwen3...).
+    pub reasoning_parser: Option<String>,
+    /// `--tokenizer-path`: separate tokenizer dir/file.
+    pub tokenizer_path: Option<String>,
+    /// `--dtype` (auto, half, bfloat16, float...).
+    pub dtype: Option<String>,
+    /// `--quantization` (awq, gptq, fp8, marlin...) — overrides the
+    /// checkpoint's own quantization config.
+    pub quantization: Option<String>,
+    /// `--kv-cache-dtype` (auto, bf16, `fp8_e5m2`, `fp8_e4m3`...). Explicit
+    /// pin wins over the profile compiler's VRAM ladder.
+    pub kv_cache_dtype: Option<String>,
+    /// `--mem-fraction-static` (0.05..=0.95). Explicit pin wins over the
+    /// ladder's derived fraction.
+    pub mem_fraction_static: Option<f32>,
+    /// `--cpu-offload-gb`: weights GBs pinned to host RAM (low-VRAM
+    /// ladder engages this automatically; an explicit pin wins).
+    pub cpu_offload_gb: Option<f32>,
+    /// `--page-size` (tokens per KV page).
+    pub page_size: Option<u64>,
+    /// `--schedule-policy` (lpm, fcfs, dfs-weight...).
+    pub schedule_policy: Option<String>,
+    /// `--schedule-conservativeness`.
+    pub schedule_conservativeness: Option<f64>,
+    /// `--chunked-prefill-size` (0.5.19 default 8192; the ladder lowers
+    /// it on tight fits).
+    pub chunked_prefill_size: Option<u64>,
+    /// `--max-prefill-tokens`.
+    pub max_prefill_tokens: Option<u64>,
+    /// `--stream-interval` (tokens between stream chunks).
+    pub stream_interval: Option<u32>,
+    /// `--random-seed`.
+    pub random_seed: Option<i64>,
+    /// `--cuda-graph-max-bs` (0.5.19 default 256 — expensive on small
+    /// cards; the ladder lowers it on tight fits).
+    pub cuda_graph_max_bs: Option<u32>,
+    /// `--enable-hierarchical-cache`: KV hierarchical caching to host
+    /// RAM (`HiCache`). Off by default.
+    pub hicache_enable: Option<bool>,
+    /// `--hicache-ratio` (host:device KV size ratio, default 2.0).
+    pub hicache_ratio: Option<f64>,
+    /// `--hicache-size` (host KV cache size in GB).
+    pub hicache_size: Option<f64>,
+    /// `--enable-metrics` (Prometheus /metrics).
+    pub metrics: Option<bool>,
+    /// `--skip-server-warmup` (faster cold start; first request pays it).
+    pub skip_warmup: Option<bool>,
+    /// `--enable-torch-compile`.
+    pub torch_compile: Option<bool>,
+}
+
+impl SglangTuning {
+    /// Per-model resolution: override replaces global (not merges),
+    /// mirroring `override_tensor` semantics.
+    #[must_use]
+    pub fn effective(override_: Option<&SglangTuning>, global: &SglangTuning) -> SglangTuning {
+        override_.cloned().unwrap_or_else(|| global.clone())
+    }
+
+    fn validate(&self, where_: &str) -> Result<(), CoreError> {
+        if let Some(frac) = self.mem_fraction_static {
+            if !(0.05..=0.95).contains(&frac) {
+                return Err(CoreError::Config(format!(
+                    "{where_}.mem_fraction_static must be 0.05..=0.95, got {frac}"
+                )));
+            }
+        }
+        if let Some(gb) = self.cpu_offload_gb {
+            if gb < 0.0 {
+                return Err(CoreError::Config(format!(
+                    "{where_}.cpu_offload_gb must be >= 0, got {gb}"
+                )));
+            }
+        }
+        if let Some(r) = self.hicache_ratio {
+            if r <= 0.0 {
+                return Err(CoreError::Config(format!(
+                    "{where_}.hicache_ratio must be > 0, got {r}"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1128,6 +1253,7 @@ impl Default for Config {
             auto_restart_engine_switch: false,
             mistralrs_pa_memory_fraction: None,
             mistralrs_paged_attn: None,
+            sglang: SglangTuning::default(),
             spec: "auto".to_string(),
             lazy_mode: "auto".to_string(),
             server_tools: None,
@@ -1202,6 +1328,7 @@ impl Default for Config {
             reasoning_budget: default_reasoning_budget(),
             reasoning_budget_message: String::new(),
             reasoning_effort: String::new(),
+            reasoning: String::new(),
             reasoning_preserve: None,
             image_max_tokens: 0,
             image_min_tokens: 0,
@@ -1611,6 +1738,15 @@ impl Config {
             .unwrap_or(self.reasoning_effort.as_str())
     }
 
+    /// Effective server-side reasoning switch: overlay beats global.
+    #[must_use]
+    pub fn effective_reasoning(&self, model: &str) -> &str {
+        self.model_overrides
+            .get(model)
+            .and_then(|o| o.reasoning.as_deref())
+            .unwrap_or(self.reasoning.as_str())
+    }
+
     /// Cross-field sanity. Violations are config errors, not warnings:
     /// fail fast rather than run with contradictory knobs.
     #[allow(clippy::too_many_lines)] // flat one-check-per-knob by design
@@ -1764,11 +1900,25 @@ impl Config {
                 )))
             }
         }
+        match self.reasoning.as_str() {
+            "" | "on" | "off" | "auto" => {}
+            other => {
+                return Err(CoreError::Config(format!(
+                    "reasoning must be \"on\", \"off\" or \"auto\", got {other:?}"
+                )))
+            }
+        }
         if let Some(frac) = self.mistralrs_pa_memory_fraction {
             if !(0.05..=0.95).contains(&frac) {
                 return Err(CoreError::Config(format!(
                     "mistralrs_pa_memory_fraction must be 0.05..=0.95, got {frac}"
                 )));
+            }
+        }
+        self.sglang.validate("sglang")?;
+        for (name, o) in &self.model_overrides {
+            if let Some(t) = &o.sglang {
+                t.validate(&format!("model_overrides.{name}.sglang"))?;
             }
         }
         if self.host.trim().is_empty() {
@@ -2182,6 +2332,14 @@ impl Config {
                     )));
                 }
             }
+            if let Some(r) = o.reasoning.as_deref() {
+                let r = r.trim();
+                if !matches!(r, "on" | "off" | "auto" | "") {
+                    return Err(CoreError::Config(format!(
+                        "model_overrides.{name}.reasoning must be \"on\", \"off\" or \"auto\", got {r:?}"
+                    )));
+                }
+            }
             if let Some(d) = o.devices.as_ref() {
                 if d.iter().any(|x| x.trim().is_empty()) {
                     return Err(CoreError::Config(format!(
@@ -2531,6 +2689,42 @@ mod tests {
         }
         .validate()
         .unwrap();
+        // Server-side reasoning switch: tri-state vocabulary, empty = off.
+        for bad in ["enabled", "true", "0"] {
+            let cfg = Config {
+                reasoning: bad.into(),
+                ..Default::default()
+            };
+            assert!(
+                cfg.validate().is_err(),
+                "reasoning {bad:?} must be rejected"
+            );
+        }
+        for good in ["", "on", "off", "auto"] {
+            Config {
+                reasoning: good.into(),
+                ..Default::default()
+            }
+            .validate()
+            .unwrap_or_else(|e| panic!("reasoning {good:?} must validate: {e}"));
+        }
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert(
+            "m1".to_string(),
+            ModelOverride {
+                reasoning: Some("yes".into()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            Config {
+                model_overrides: overrides,
+                ..Default::default()
+            }
+            .validate()
+            .is_err(),
+            "overlay reasoning vocabulary must be enforced"
+        );
         assert!(
             Config {
                 prio: 4,

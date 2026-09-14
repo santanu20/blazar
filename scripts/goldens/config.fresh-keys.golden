@@ -68,6 +68,7 @@ predictive_preload
 prio
 prio_batch
 prompt_preflight
+reasoning
 reasoning_budget
 reasoning_budget_message
 reasoning_effort
@@ -85,6 +86,7 @@ sentinel_stall_secs
 session_bank
 session_keep_secs
 sessions
+sglang
 singleflight
 slot_prompt_similarity
 slots

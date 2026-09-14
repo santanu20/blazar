@@ -6,7 +6,97 @@ tracked here.
 
 ## [Unreleased]
 
+### Changed
+- **Engine retention tightened from 3 to 2 installed builds (2026-09-13).** Auto-prune (which runs after every engine install) now keeps the newest engine plus one rollback anchor (~215 MiB each); `local` and the active tag stay protected on top. Users who want deeper history still have `pallama engine use <tag>` re-download on demand.
+- **Prebuilt CUDA engine channel slimmed to consumer archs + PTX forward-JIT (2026-09-13).** The overlay CI (`engine-cuda`) built fat binaries across every SASS arch (sm 61–120 per toolkit, both real+virtual per arch). Builds now emit SASS for the consumer set only (`61-real;75-real;86-real;89-real;120` on CUDA 12.8.1, `75-real;86-real;89-real;120` on 13.0) plus full SASS+PTX on the newest arch, so future GPUs JIT forward from its PTX — roughly a third of the nvcc work and a much smaller download. Datacenter archs (sm 70/80/90/100) stay reachable through the source lane (`pallama engine build cuda`). The CI link step also resolves CUDA driver-API symbols via the toolkit stubs (GPU-less runners have no `libcuda.so.1`; the stub's SONAME keeps the runtime NEEDED entry correct on real machines).
+
+### Fixed
+- Engine retention is now scoped per engine kind: installing a mistral.rs or sglang engine no longer prunes the newest llama.cpp builds (and vice versa) — each lane keeps its own newest `KEEP_TAGS`; active and `local` stay protected on top. Kind-blind retention deleted cross-lane engines on back-to-back installs (mistralrs install pruned the active CUDA engine; the CUDA reinstall then pruned sglang).
+- **Interrupted large downloads no longer 416-loop (found live during the SGLang validation pull).** The parallel downloader preallocates `.part` files to full length (sparse holes); if its resume sidecar was lost mid-download, the next attempt declined the parallel lane and the classic lane sent `bytes=<full-length>-` against a sparse file — 416 with no self-heal. Now: a full-length `.part` without a sidecar is re-fetched in place by the parallel lane (chunk writes are idempotent), a short sidecar-less `.part` is handed to the classic lane from zero (hasher reset, no Range header), and only a mismatched sidecar is discarded. Pinned by wiremock 416-mount tests plus a live interrupted-pull rerun.
+- **Test-only port TOCTOU (1-in-10 full-suite flakes).** Three engine tests asserted connect-fails on ports they had just bound-and-dropped; under parallel runs another test's port-0 bind could rebind the released port, flipping "dead endpoint" fixtures alive. Replaced by a `dead_port()` helper that verifies refusal (retrying on a different port if something rebinds) — 10/10 consecutive full-suite runs green.
+- Engine probes (`--version`/`--help`/device census) can no longer deadlock or fail blind: `probe_output` drained piped stdout/stderr only after the child exited, so any probe target writing more than the ~64 KiB pipe buffer blocked on write, never exited, and surfaced as a misleading "timed out or failed to spawn" after a full 30 s deadline. Pipes are now drained on reader threads while the child runs (pinned by a 4 MiB flood test), and transient spawn failures (e.g. fork pressure) are logged with their `io::Error` instead of being silently folded into the timeout case.
+- **`uninstall.sh --yes` no longer implies `--remove-models` (data-loss fix, found in the 2026-09-13 uninstall/install loop).** Flag parsing aliased `--remove-models | --yes` (last-flag-wins), so `--keep-models --yes` silently deleted every downloaded model. `--yes` now means "skip prompts using SAFE defaults (models kept)" and conflicts hard with `--remove-models`. Also: privilege preflight refuses non-tty unprivileged runs instead of half-deleting (systemd crash-loop split-brain); root-run uninstalls resolve the real user's home via `SUDO_USER` instead of `/root`; SQLite WAL sidecars (`pallama.db-wal/-shm`) are removed with the db; and a trailing `[ … ] && status` made flawless `--remove-models` runs exit 1 (a false test as the script's last command becomes its exit status — POSIX footgun, now an explicit `if` + `exit 0`).
+- **`install.sh` now runs every user-state step as the invoking user.** Under `sudo`, toolchain probing, `migrate`, engine bootstrap, model pulls, and the source build previously ran as root — populating `/root` (rustup into `/root/.cargo`, root-owned `target/`, engine rows the service user could never see → permanent engine-less crash-loop). All steps route through an `as_user` wrapper; the health poll falls back to port 11435 (was 11434 — ollama's port, answered green while pallama was dead); fresh installs `enable` without `--now` and start the unit only after the engine bootstrap (previously measured 86 `no engine installed` restarts during the install window).
+- Test-suite leaks: `unit__run_list_devices__parses_live_census_output` hand-rolled a `/tmp/pallama-census-<pid>` fixture dir and removed only the script file, and the engine-manager suite's `stub_engine_dir` staged pid-keyed dirs it never removed — together one leaked dir per `cargo test` run (200+ had accumulated). Both fixtures now own `tempfile` guards that clean up on drop.
+- `pallama engine update` on an NVIDIA box now warns with the exact recovery command whenever the prebuilt CUDA lane is dropped — driver older than the overlay's newest asset (both versions named), overlay release not yet published for a fresh upstream tag, driver CUDA capability unprobed (reboot path), or pre-CUDA-12 drivers. These lane drops were `info`-level and easy to miss.
+
 ### Added
+- **Per-arch CUDA engine assets (~60% smaller downloads).** The prebuilt CUDA channel now publishes one slim asset per GPU architecture (`llama-bNNNN-bin-ubuntu-cuda-13.0-sm89-x64.tar.gz`, 9 assets per tag across CUDA 12.8/13.0) instead of a fat multi-arch tarball; the sm120 asset carries PTX for forward JIT on future GPUs. `pallama engine update` picks the exact asset for the local GPU's compute capability, falls back to legacy fat assets during the transition, then to the PTX asset for GPUs newer than sm120. CI wall time drops in parallel (per-arch jobs ~15-20min with ccache vs ~50min serial fat build).
+- mistral.rs profiles now reach the FULL `mistralrs serve` surface: every flag the probed engine binary offers forwards verbatim (bools like `--flash-attn` and valued pairs like `--dtype bf16` — attention method, dtype, KV-cache quant, prefix cache, token source, LoRA, device mapping, log control), gated by the same manifest capability check as the sglang lane. Explicit profile values beat derived ones (`--max-model-len` from the profile wins over ctx synthesis, no duplicates); llama.cpp-only dialect words are still dropped with the compiler's existing warning.
+- **SGLang engine kind + safetensors model lane (2026-09-14).** `pallama engine install --kind sglang [version]` installs a pinned venv (`sglang==0.5.19` default; uv lane with `--prerelease=allow` for transitive pre-release pins, pip fallback; `ninja` installed and venv-PATH exported in the shim so flashinfer JIT can compile; ≥10 GiB disk preflight; orphan-dir cleanup on every failure path; non-Linux fails fast with a teaching error). `pallama pull <hf-repo>` gains a safetensors lane for repos without GGUFs: root-level shards + config/tokenizer allowlist land in `models/<name>.d/` with LFS sha256 verification, `.part` resume, shard-index coverage checks, and idempotent repulls; GGUF repos keep the existing lane and a repo offering both teaches which lane won. SGLang models serve through the same single-port gateway — `/api/chat`, `/api/generate`, OpenAI `/v1/*`, Anthropic `/v1/messages` — with zero client change and per-child auth. The profile compiler adds a low-VRAM ladder (full → KV fp8 → CPU offload bounded by host RAM → refusal with weights/KV/VRAM numbers — it can never emit a spawn that OOM-crash-loops), `--max-running-requests` from slots, EAGLE3 speculative pair, ~20 first-class tuning knobs under `models.<name>.sglang.*`, a reserved-flag guard on `extra_args` for lifecycle/security flags the ladder owns, and portability-first attention/sampling backend defaults (`triton`/`pytorch`, flag-gated and overridable) for boxes whose system nvcc can't satisfy flashinfer JIT. Unix child transport is refused with a teaching error (SGLang is TCP-only).
+- **Overlay-lag fallback for CUDA engine updates (2026-09-13).** When the update channel resolves a target build that the prebuilt overlay has not published yet (upstream moved first, watcher up to an hour behind), `engine update` now installs the newest *published* overlay build the driver can run — never newer than the channel target, never the already-active tag — instead of demoting the box to Vulkan or the hours-long source lane. Exact-tag pins never fall back. With the hourly freshness watcher this bounds the CUDA-download lane to minutes of user time in the common case.
+- `pallama engine prune` — manual trigger for the engine retention policy (same keep-newest + protect-active/local logic that runs automatically after each install); useful after lowering retention or cleaning up accumulated builds.
+- Installer: `PALLAMA_UNIT_MEMORY_HIGH` sets a systemd `MemoryHigh` soft ceiling on the daemon cgroup (default `85%` of RAM, recomputed by systemd at every unit start — soft reclaim/throttle only, never an OOM kill; empty string omits the line).
+- **Sentinel detection codes unified to snake_case everywhere
+  (2026-09-13).** The `Code` enum serialized via serde derive as
+  PascalCase (`ReasoningNoAnswer`) while every display/filter surface
+  used its `as_str()` snake_case form (`reasoning_no_answer`) — the
+  persisted `run/sentinel.jsonl` and doctor's offline scan counted the
+  former, so doctor's own hint `pallama why --code ReasoningNoAnswer`
+  matched nothing. `#[serde(rename_all = "snake_case")]` puts the
+  derive path (persistence, doctor) on the same spelling as `/api/why`,
+  the CLI, and the filter; existing JSONL histories migrate with a
+  one-time rewrite (backup kept alongside). Pinned by a round-trip test
+  over all nine codes.
+- **`pallama engine update` no-op on source-built engines — now routes
+  to the local build lane (2026-09-13).** With a source-built engine
+  active (`built-cuda`/`built-cpu` asset) and no prebuilt overlay
+  release published, `engine update` resolved the channel target,
+  found nothing installable, and exited with "engine b…-cuda already
+  active — nothing new installed" behind a dead-end warning (live:
+  b10931-cuda active, b10936 target, overlay repo 404). Update now
+  detects that state (source-built active + strictly newer upstream
+  target + `engine_asset` not pinned to a prebuilt lane) and, when the
+  toolchain is present, delegates to the `engine build` flow — same F7
+  regression gate, progress lines, and restart hint; explicit `--tag`
+  pins and channel downgrades keep the old behavior. Missing
+  toolchain now prints the exact install hint instead of the vague
+  lane warning.
+- **`pallama why` observability dead-end + actionable
+  ReasoningNoAnswer detail + validate-daemon orphan leak
+  (2026-09-13).** `/api/why` scanned only the newest 100 ring records
+  and hard-capped output at 10 — flagged records older than the latest
+  clean batch were unreachable, making doctor's `pallama why` hint a
+  dead end (live: 45 flagged requests invisible behind 10 clean ones).
+  New `/api/why` params `flagged=1` and `limit=<n>` (default 10, capped
+  at the 256-record ring) plus `pallama why --flagged/--code/--model/
+  --limit`; filters apply before the newest-first cut. Doctor's
+  sentinel hint is now directly runnable (`pallama why --flagged`,
+  plus `pallama why --code <dominant>`). ReasoningNoAnswer detail now
+  names the budget when usage proves it (`finish=length at 5
+  completion tokens (reasoning consumed the budget)`). Validate
+  sandbox daemons install a Linux PDEATHSIG parent-death guard
+  (`PALLAMA_VALIDATE=1` only) and validate.py routes SIGTERM/SIGHUP/
+  SIGINT through its atexit cleanup — a `timeout(1)` kill previously
+  leaked daemons for hours (live: pid 1134882, 8h).
+
+### Changed
+- **Source builds now use ccache/sccache when on PATH.** Every build
+  ran cold in a fresh tempdir (by design: probe-after-teardown keeps
+  the install check honest), so each engine update recompiled all of
+  llama.cpp (10-30 min for CUDA). `detect_toolchain` now also probes
+  `ccache`/`sccache` and, when found, configure gains
+  `CMAKE_{C,CXX,CUDA}_COMPILER_LAUNCHER` — repeat builds skip
+  recompiling unchanged translation units while the per-build tempdir
+  discipline stays intact. The cache is purely optional;
+  `require_toolchain` never demands it.
+
+### Added
+- **`reasoning` config knob — llama.cpp's server-side reasoning
+  switch.** `reasoning = "on" | "off" | "auto"` (default `""` = engine
+  auto-detect from the chat template) maps to llama-server's
+  `--reasoning` flag, global or per-model via
+  `[model_overrides.<model>].reasoning`. This is the authoritative
+  thinking kill-switch for templates that ignore the
+  `thinking`/`enable_thinking` request variables (the ollama `think`
+  toggle sets template vars, which qwen-family templates honor but
+  e.g. harmony-class ones do not). Invalid values fail config load
+  naming the `on|off|auto` set (overlay values validated too);
+  default emits no flag, argv byte-identical. Completes Pallama's
+  wiring of llama.cpp's full reasoning flag family
+  (`--reasoning`, `--reasoning-format`, `--reasoning-effort`,
+  `--reasoning-budget`, `--reasoning-budget-message`,
+  `--reasoning-preserve`).
 - **Ollama drop-in parity: `/api/generate` rides the full chat-bus
   pipeline.** The generate lane previously mapped to a bare
   `/v1/completions` post — no streaming (an SSE request hit a
