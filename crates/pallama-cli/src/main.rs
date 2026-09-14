@@ -15,7 +15,8 @@ use std::time::Duration;
 use pallama_core::engine_kind::EngineKind;
 use pallama_core::{Config, PallamaDirs, Store};
 use pallama_runtime::engine::build::{
-    detect_toolchain, nvidia_gpu_facts, path_dirs, BuildBackend, BuildOpts, Toolchain,
+    detect_toolchain, nvidia_gpu_facts, path_dirs, require_toolchain, BuildBackend, BuildOpts,
+    Toolchain,
 };
 use pallama_runtime::engine::gh::{btag_number, same_build, GhClient};
 use pallama_runtime::engine::EngineManager;
@@ -289,6 +290,19 @@ enum Cmd {
     Why {
         /// Trace id from the x-pallama-trace-id response header
         trace: Option<String>,
+        /// Only records whose detection code contains this
+        /// (e.g. `reasoning_no_answer`)
+        #[arg(long)]
+        code: Option<String>,
+        /// Only records whose model name contains this
+        #[arg(long)]
+        model: Option<String>,
+        /// Max records to show (default 10; daemon caps at the ring size)
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Only flagged records (carrying at least one detection)
+        #[arg(long)]
+        flagged: bool,
         /// Tail sentinel detections live instead (same as `pallama watch`)
         #[arg(long, conflicts_with = "trace")]
         watch: bool,
@@ -327,6 +341,10 @@ enum EngineCmd {
     /// active tag — `pallama engine use` another first. Reports the
     /// reclaimed bytes.
     Rm { tag: String },
+    /// Apply the engine retention policy now: keep the newest engines per
+    /// policy (plus `local` and the active tag), remove the rest. Runs
+    /// automatically after every install; this is the manual trigger.
+    Prune,
     /// Step back to the previous engine
     Rollback,
     /// Register a locally built llama-server (pseudo-tag "local")
@@ -352,9 +370,15 @@ enum EngineCmd {
         #[arg(long)]
         no_gate: bool,
     },
-    /// Install + activate a mistral.rs engine (prebuilt upstream binary;
-    /// picks CPU/Metal/CUDA asset from the local GPU + driver)
-    Install { tag: Option<String> },
+    /// Install + activate an engine lane: mistral.rs (prebuilt upstream
+    /// binary; picks CPU/Metal/CUDA asset from the local GPU + driver)
+    /// or sglang (pip venv lane; Linux + CUDA/ROCm, safetensors models)
+    Install {
+        /// Engine lane to install: mistralrs | sglang
+        #[arg(long, default_value = "mistralrs")]
+        kind: String,
+        tag: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -926,11 +950,25 @@ async fn run(cmd: Cmd) -> Result<()> {
         Cmd::Logout => cloud_refusal("logout", ""),
         Cmd::Session { cmd } => session_cmd(cmd).await,
         Cmd::Doctor => doctor().await,
-        Cmd::Why { trace, watch: live } => {
+        Cmd::Why {
+            trace,
+            watch: live,
+            code,
+            model,
+            limit,
+            flagged,
+        } => {
             if live {
                 watch().await
             } else {
-                why(trace.as_deref()).await
+                why(
+                    trace.as_deref(),
+                    code.as_deref(),
+                    model.as_deref(),
+                    limit,
+                    flagged,
+                )
+                .await
             }
         }
         Cmd::Watch => watch().await,
@@ -1567,6 +1605,24 @@ async fn doctor_engine(d: &PallamaDirs) -> Vec<Check> {
         compute_cap,
         &detect_toolchain(&path_dirs()),
     ));
+    // GPU hardware-vs-driver gap (Linux): PCI display hardware the driver
+    // userspace cannot see — a driverless GPU box silently serves CPU.
+    if std::env::consts::OS == "linux" {
+        let pci = pallama_runtime::probe::pci_gpu_vendors();
+        let icd = ["/usr/share/vulkan/icd.d", "/etc/vulkan/icd.d"]
+            .iter()
+            .any(|d| {
+                std::fs::read_dir(d).is_ok_and(|rd| {
+                    rd.filter_map(std::result::Result::ok)
+                        .any(|e| e.path().extension().is_some_and(|x| x == "json"))
+                })
+            });
+        checks.extend(gpu_driver_rows(
+            &pci,
+            pallama_runtime::engine::system_vendor_hint(),
+            icd,
+        ));
+    }
     // Engine currency: prefer reconciling the daemon's last upstream
     // survey against the CURRENT active engine — the marker's own
     // verdict went stale the moment `engine update`/`use`/`rollback`
@@ -1579,6 +1635,20 @@ async fn doctor_engine(d: &PallamaDirs) -> Vec<Check> {
         if let Some(active) = active_tag.as_deref() {
             checks.push(live_mistralrs_currency(active).await);
         }
+        return checks;
+    }
+    // sglang is a pinned pip lane (no rolling channel to survey): teach
+    // the version in place and the one-command refresh path instead of
+    // nagging with the llama.cpp channel.
+    if active_kind == Some(EngineKind::Sglang) {
+        let active = active_tag.as_deref().unwrap_or("?");
+        checks.push(Check::ok(
+            "engine currency",
+            format!(
+                "{active} (sglang pip lane, version pinned at install) — update with: \
+                 pallama engine install --kind sglang [version]"
+            ),
+        ));
         return checks;
     }
     let mut currency: Option<Check> = None;
@@ -1861,6 +1931,7 @@ fn cuda_opportunity_rows(
     // `-cuda` tag already IS the fast lane; mistral.rs picked its
     // asset by driver at install time).
     if active_kind != Some(EngineKind::MistralRs)
+        && active_kind != Some(EngineKind::Sglang)
         && active_tag.is_some_and(|t| !t.ends_with("-cuda"))
     {
         let cc = compute_cap.map_or_else(String::new, |(a, b)| format!(", sm {a}{b}"));
@@ -1897,6 +1968,38 @@ fn cuda_opportunity_rows(
                  `pallama engine install`",
                 missing.join(", ")
             ),
+        ));
+    }
+    rows
+}
+
+/// GPU hardware-vs-driver rows for doctor: PCI display hardware is
+/// present but the matching driver userspace is missing — the box would
+/// silently serve CPU/Vulkan and nobody would be told why. Pure: the PCI
+/// census, vendor hint and Vulkan-ICD presence are passed in (probes are
+/// the caller's job), so the matrix is unit-testable.
+fn gpu_driver_rows(
+    pci_vendors: &[String],
+    system_vendor: pallama_runtime::engine::manifest::Vendor,
+    vulkan_icd_present: bool,
+) -> Vec<Check> {
+    use pallama_runtime::engine::manifest::Vendor;
+    let mut rows = Vec::new();
+    if pci_vendors.iter().any(|v| v == "10de") && system_vendor != Vendor::Nvidia {
+        rows.push(Check::warn(
+            "nvidia driver",
+            "NVIDIA GPU present (PCI 10de:) but no NVIDIA driver userspace (nvidia-smi missing) \
+             — inference falls back to CPU/Vulkan. Re-run scripts/install.sh (its GPU preflight \
+             installs the distro driver from first-party repos), reboot, then `pallama engine \
+             update` picks the newest CUDA build the driver supports",
+        ));
+    }
+    if (pci_vendors.iter().any(|v| v == "1002" || v == "8086")) && !vulkan_icd_present {
+        rows.push(Check::warn(
+            "vulkan driver",
+            "AMD/Intel GPU present but no Vulkan ICD — the Vulkan engine lane is unavailable \
+             (CPU fallback). Install mesa-vulkan-drivers (apt/dnf), vulkan-radeon/vulkan-intel \
+             (pacman) or Mesa-vulkan-drivers (zypper)",
         ));
     }
     rows
@@ -2311,13 +2414,97 @@ fn doctor_sentinel(d: &PallamaDirs) -> Vec<Check> {
         )];
     }
     let top: Vec<String> = counts.iter().map(|(c, n)| format!("{c} x{n}")).collect();
+    // Name the dominant code so the hint is directly runnable — the bare
+    // `pallama why` of record used to be a dead end whenever the flagged
+    // population sat older than the newest 10 clean records.
+    let top_code = counts
+        .iter()
+        .max_by_key(|(_, n)| *n)
+        .map_or_else(String::new, |(c, _)| format!(" (`pallama why --code {c}`)"));
     vec![Check::warn(
         "sentinel",
         format!(
-            "{flagged} of {records} requests in 24h flagged: {} — `pallama why` for details + retry hints",
+            "{flagged} of {records} requests in 24h flagged: {} — `pallama why --flagged` for details + retry hints{top_code}",
             top.join(", ")
         ),
     )]
+}
+
+/// Files in the models dir that no store row owns. Projectors ride on
+/// their model row (`mmproj_path`), hardlink twins of registered files
+/// are counted separately: deleting a twin reclaims nothing (same
+/// inode), so teaching "delete the orphans" without the twin split
+/// would promise disk back that never comes.
+struct OrphanReport {
+    orphans: Vec<String>,
+    twins: usize,
+}
+
+/// Pure dir-vs-rows diff (testable; no store access). `dir` missing or
+/// unreadable = empty report (fresh installs stay silent, never noisy).
+fn orphan_scan(models: &[pallama_core::store::ModelRow], dir: &Path) -> OrphanReport {
+    let referenced: Vec<std::path::PathBuf> = models
+        .iter()
+        .flat_map(|m| {
+            let mut v = vec![PathBuf::from(&m.path)];
+            if let Some(p) = m.mmproj_path.as_ref().filter(|s| !s.is_empty()) {
+                v.push(PathBuf::from(p));
+            }
+            v
+        })
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+        .collect();
+    #[cfg(unix)]
+    let referenced_inodes: std::collections::HashSet<(u64, u64)> = {
+        use std::os::unix::fs::MetadataExt as _;
+        referenced
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| (m.dev(), m.ino()))
+            .collect()
+    };
+    let mut out = OrphanReport {
+        orphans: Vec::new(),
+        twins: 0,
+    };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path
+            .extension()
+            .is_none_or(|e| !e.eq_ignore_ascii_case("gguf"))
+        {
+            continue;
+        }
+        let canon = std::fs::canonicalize(&path).unwrap_or(path.clone());
+        if referenced.contains(&canon) {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if let Ok(md) = std::fs::metadata(&canon) {
+                if referenced_inodes.contains(&(md.dev(), md.ino())) {
+                    out.twins += 1;
+                    continue;
+                }
+            }
+        }
+        // Windows: no std inode access — every unreferenced GGUF is
+        // reported as an orphan (twin split unavailable, still correct
+        // about which files pallama does not manage).
+        out.orphans.push(path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        ));
+    }
+    out.orphans.sort();
+    out
 }
 
 fn doctor_models(d: &PallamaDirs) -> Vec<Check> {
@@ -2332,20 +2519,57 @@ fn doctor_models(d: &PallamaDirs) -> Vec<Check> {
         .filter(|m| pallama_core::read_metadata_file(std::path::Path::new(&m.path)).is_err())
         .map(|m| m.name.clone())
         .collect();
-    if bad.is_empty() {
+    let report = orphan_scan(&models, &d.models_dir());
+    // Folder-vs-list divergence teaching: same bytes, zero noise on
+    // clean boxes (suffix only appended when there is something to say).
+    let orphan_suffix = |r: &OrphanReport| -> String {
+        use std::fmt::Write as _;
+        let mut s = String::new();
+        if !r.orphans.is_empty() {
+            let shown: Vec<&str> = r.orphans.iter().take(3).map(String::as_str).collect();
+            let more = r.orphans.len().saturating_sub(shown.len());
+            let extra = if more > 0 {
+                format!(" (+{more} more)")
+            } else {
+                String::new()
+            };
+            write!(
+                s,
+                "; {} unmanaged file(s): {}{} — `pallama import <file> --name <n>` to register, or delete to reclaim",
+                r.orphans.len(),
+                shown.join(", "),
+                extra
+            )
+            .ok();
+        }
+        if r.twins > 0 {
+            write!(
+                s,
+                "; {} hardlink twin(s) of registered models (deleting reclaims no space)",
+                r.twins
+            )
+            .ok();
+        }
+        s
+    };
+    let suffix = orphan_suffix(&report);
+    if bad.is_empty() && suffix.is_empty() {
         vec![Check::ok(
             "models",
             format!("{} pulled, all parse", models.len()),
         )]
     } else {
-        vec![Check::warn(
-            "models",
+        let mut detail = if bad.is_empty() {
+            format!("{} pulled, all parse", models.len())
+        } else {
             format!(
                 "{} pulled; metadata unreadable: {} (re-pull or rm)",
                 models.len(),
                 bad.join(", ")
-            ),
-        )]
+            )
+        };
+        detail.push_str(&suffix);
+        vec![Check::warn("models", detail)]
     }
 }
 
@@ -2383,8 +2607,12 @@ async fn print_session_result(
 }
 
 #[allow(clippy::too_many_lines)] // one cohesive startup: hook wiring, flushers, listener
+/// Validate-harness daemons must not outlive their harness
+/// (`PALLAMA_VALIDATE=1`): the runtime installs a Linux PDEATHSIG
+/// parent-death guard; see `pallama_runtime::validate_parent_death_guard`.
 async fn serve() -> Result<()> {
     banner();
+    pallama_runtime::validate_parent_death_guard();
     let d = dirs();
     d.ensure().ok();
     let cfg = config()?;
@@ -2436,6 +2664,9 @@ async fn serve() -> Result<()> {
                 Some(d.run_dir().join("mistralrs-staging")),
             ))
         }
+        pallama_core::engine_kind::EngineKind::Sglang => Arc::new(
+            pallama_runtime::SglangEngine::with_env(manifest, engine_env),
+        ),
         pallama_core::engine_kind::EngineKind::LlamaCpp => {
             Arc::new(LlamaCppEngine::with_env(manifest, engine_env))
         }
@@ -3088,13 +3319,35 @@ Pull models straight from Hugging Face: pallama pull <owner/repo:QUANT> \
 
 /// `pallama why [trace]` — sentinel ring dump: what the model returned,
 /// what was wrong with it, which knob fixes it. Auto-starts the daemon
-/// like every other serving command.
-async fn why(trace: Option<&str>) -> Result<()> {
+/// like every other serving command. Filters (--code/--model/--flagged)
+/// and --limit ride as /api/why query params; the daemon caps the limit
+/// at the ring size (256).
+async fn why(
+    trace: Option<&str>,
+    code: Option<&str>,
+    model: Option<&str>,
+    limit: usize,
+    flagged: bool,
+) -> Result<()> {
     let base = ensure_daemon().await?;
-    let url = match trace {
-        Some(t) => format!("{base}/api/why?trace={t}"),
-        None => format!("{base}/api/why"),
-    };
+    // trace/code/model values are trace ids, snake_case codes, and model
+    // name substrings — all URL-safe shapes (same assumption the old
+    // single-param path made).
+    let mut q: Vec<String> = Vec::new();
+    if let Some(t) = trace {
+        q.push(format!("trace={t}"));
+    }
+    if let Some(c) = code {
+        q.push(format!("code={c}"));
+    }
+    if let Some(m) = model {
+        q.push(format!("model={m}"));
+    }
+    q.push(format!("limit={limit}"));
+    if flagged {
+        q.push("flagged=1".into());
+    }
+    let url = format!("{base}/api/why?{}", q.join("&"));
     let resp = cli_http()
         .get(&url)
         .timeout(Duration::from_secs(10))
@@ -4327,7 +4580,7 @@ fn tune_full(
         model,
         &row.path,
         u64::try_from(row.bytes.max(0)).unwrap_or(u64::MAX),
-        &gguf,
+        pallama_core::ModelMeta::Gguf(&gguf),
         &hw,
         &cfg,
         &overlay,
@@ -4459,7 +4712,7 @@ fn tune_full(
             model,
             &row.path,
             u64::try_from(row.bytes.max(0)).unwrap_or(u64::MAX),
-            &gguf,
+            pallama_core::ModelMeta::Gguf(&gguf),
             &hw,
             &cfg,
             &overlay2,
@@ -4516,7 +4769,7 @@ fn tune_full(
             model,
             &row.path,
             u64::try_from(row.bytes.max(0)).unwrap_or(u64::MAX),
-            &gguf,
+            pallama_core::ModelMeta::Gguf(&gguf),
             &hw,
             &cfg,
             &overlay3,
@@ -4758,6 +5011,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             println!("active engine: {}", row.tag);
             restart_hint().await;
         }
+        EngineCmd::Prune => engine_prune(&d)?,
         EngineCmd::Rm { tag } => {
             engine_rm(&d, &tag)?;
         }
@@ -4800,7 +5054,21 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 m.flags.len()
             );
         }
-        EngineCmd::Install { tag } => engine_install_mistralrs(&d, tag).await?,
+        EngineCmd::Install { kind, tag } => {
+            let engine_kind: EngineKind = kind
+                .parse()
+                .map_err(|e| anyhow!("engine install --kind {kind:?}: {e}"))?;
+            match engine_kind {
+                EngineKind::MistralRs => engine_install_mistralrs(&d, tag).await?,
+                EngineKind::Sglang => engine_install_sglang(&d, tag).await?,
+                EngineKind::LlamaCpp => {
+                    return Err(anyhow!(
+                        "llama.cpp engines install via `pallama engine update` / `pallama engine \
+                         build` — `engine install --kind` serves mistralrs and sglang"
+                    ));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -4826,8 +5094,114 @@ async fn engine_install_mistralrs(d: &PallamaDirs, tag: Option<String>) -> Resul
     Ok(())
 }
 
+/// `pallama engine install --kind sglang [version]` — pip venv lane
+/// (Linux + CUDA/ROCm). Multi-GB download: torch rides the venv. The
+/// F7 decode-regression gate is llama-server-only: skipped, and SAID
+/// so — llama-bench cannot drive an sglang child.
+async fn engine_install_sglang(d: &PallamaDirs, version: Option<String>) -> Result<()> {
+    let mgr = local_engine_manager(d)?;
+    if let Some(v) = &version {
+        println!("installing sglang {v} (pip venv lane — multi-GB download incl. torch)");
+    } else {
+        println!("installing sglang (pip venv lane — multi-GB download incl. torch)");
+    }
+    let row = mgr.install_sglang(version.as_deref()).await?;
+    let m: pallama_runtime::Manifest = serde_json::from_str(&row.manifest)?;
+    println!(
+        "engine {} active ({} flags probed, build {})",
+        row.tag,
+        m.flags.len(),
+        m.build_number
+    );
+    println!("note: decode-regression gate is llama-server-only — skipped for sglang engines");
+    println!("next: pull a safetensors model (e.g. pallama pull Qwen/Qwen2.5-0.5B-Instruct)");
+    restart_hint().await;
+    Ok(())
+}
+
 /// `pallama engine update` — install + activate the newest (or given)
 /// upstream build, gated by the F7 decode-regression bench.
+/// Backend a source-built engine was compiled with, from its asset
+/// (`built-cuda` / `built-cpu`, exactly as `build_and_install` writes it).
+fn built_backend(asset: &str) -> Option<BuildBackend> {
+    match asset.strip_prefix("built-")? {
+        "cuda" => Some(BuildBackend::Cuda),
+        "cpu" => Some(BuildBackend::Cpu),
+        _ => None,
+    }
+}
+
+/// Fix A eligibility: route `engine update` to the local build lane when
+/// the active engine is source-built, the channel target is a NEWER
+/// upstream build, and the asset config pins no prebuilt lane — the
+/// state where the prebuilt overlay is dead and Update used to no-op
+/// with a dead-end hint. Returns the backend to compile.
+fn build_lane_routing(
+    active_asset: &str,
+    active_tag: &str,
+    target_tag: &str,
+    asset_cfg: &str,
+) -> Option<BuildBackend> {
+    if !(asset_cfg.is_empty() || asset_cfg == "auto") {
+        return None;
+    }
+    let backend = built_backend(active_asset)?;
+    let newer = matches!(
+        (btag_number(active_tag), btag_number(target_tag)),
+        (Some(a), Some(t)) if t > a
+    );
+    newer.then_some(backend)
+}
+
+/// Fix A delegation: when Update would no-op behind a dead prebuilt
+/// lane (see `build_lane_routing`), hand off to the `engine build` flow
+/// — inheriting its F7 gate, progress lines, and restart hint. Returns
+/// `true` when this call produced the command's final output (caller
+/// returns immediately); `false` = routing did not apply.
+async fn route_update_to_build(
+    d: &PallamaDirs,
+    active_asset: &str,
+    active_tag: &str,
+    target_tag: &str,
+    asset_cfg: &str,
+    no_gate: bool,
+) -> Result<bool> {
+    let Some(backend) = build_lane_routing(active_asset, active_tag, target_tag, asset_cfg) else {
+        return Ok(false);
+    };
+    let tc = detect_toolchain(&path_dirs());
+    match require_toolchain(&tc, backend) {
+        Ok(()) => {
+            println!(
+                "engine {active_tag} -> {target_tag}: no prebuilt asset published — \
+                 building {} locally (source lane)",
+                backend.as_str()
+            );
+            engine_build(
+                d,
+                BackendArg {
+                    backend: backend.as_str().to_string(),
+                    tag: Some(target_tag.to_string()),
+                    arch: None,
+                    cuda_host_compiler: None,
+                    jobs: None,
+                    no_gate,
+                },
+            )
+            .await?;
+            Ok(true)
+        }
+        Err(e) => {
+            println!(
+                "engine {active_tag} already active — nothing new installed; to build \
+                 {target_tag} locally, the toolchain is missing:"
+            );
+            println!("  {e}");
+            Ok(true)
+        }
+    }
+}
+
 async fn engine_update(d: &PallamaDirs, tag: Option<String>, no_gate: bool) -> Result<()> {
     let token = std::env::var("GH_TOKEN").ok();
     let gh = GhClient::new(token)?;
@@ -4850,7 +5224,8 @@ async fn engine_update(d: &PallamaDirs, tag: Option<String>, no_gate: bool) -> R
     // re-targets downward by design. The F7 gate compares perf
     // and would trip on any intentional downgrade, so it is
     // skipped when the target is older than the active engine.
-    let active_tag = Store::open(d)?.active_engine()?.map(|e| e.tag);
+    let active = Store::open(d)?.active_engine()?;
+    let active_tag = active.as_ref().map(|e| e.tag.clone());
     let downgrade = match &active_tag {
         Some(a) => matches!(
             (btag_number(a), btag_number(&target_tag)),
@@ -4862,10 +5237,10 @@ async fn engine_update(d: &PallamaDirs, tag: Option<String>, no_gate: bool) -> R
         dirs: d.clone(),
         gh,
         bus: EventBus::default(),
-        asset_override: cfg.engine_asset,
+        asset_override: cfg.engine_asset.clone(),
     };
     let row = match resolved {
-        Some(rel) => mgr.update_resolved(rel).await?,
+        Some(rel) => mgr.update_resolved(rel, tag.is_some()).await?,
         None => mgr.update(tag.as_deref(), cfg.update_channel).await?,
     };
     // Keep-CUDA skip (or a same-tag reinstall) resolves to the pre-call
@@ -4881,6 +5256,26 @@ async fn engine_update(d: &PallamaDirs, tag: Option<String>, no_gate: bool) -> R
     let gate_on =
         !no_gate && std::env::var("PALLAMA_ENGINE_GATE").as_deref() != Ok("0") && !downgrade;
     if unchanged {
+        // Fix A: source-built active + newer channel target + no prebuilt
+        // lane published = Update routes itself to the local build lane
+        // (with the same F7 gate and restart hint as `engine build`)
+        // instead of no-op'ing behind a dead-end hint.
+        if from_channel {
+            if let Some(active_row) = active.as_ref() {
+                if route_update_to_build(
+                    d,
+                    &active_row.asset,
+                    &active_row.tag,
+                    &target_tag,
+                    &cfg.engine_asset,
+                    no_gate,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+            }
+        }
         println!("engine {} already active — nothing new installed (see the warning above for lane options)", row.tag);
     } else if gate_on {
         engine_regression_gate(&mgr, d, &row)?;
@@ -5092,12 +5487,13 @@ fn spawn_engine_check_task(
                 delay = full_delay;
                 continue; // local build: currency is the user's concern
             }
-            if active.kind == EngineKind::MistralRs {
+            if matches!(active.kind, EngineKind::MistralRs | EngineKind::Sglang) {
                 delay = full_delay;
                 continue; // the llamacpp channel survey is meaningless
-                          // against a mistral.rs tag (it would nag
+                          // against non-llamacpp tags (it would nag
                           // "update available: bNNNN" cross-kind);
-                          // mistral.rs currency lives in `pallama doctor`
+                          // mistral.rs currency lives in `pallama doctor`,
+                          // sglang is a pinned pip lane
             }
             let Ok(cfg) = Config::load(&dirs) else {
                 delay = retry_delay;
@@ -5186,6 +5582,32 @@ fn rotate_daemon_log(d: &PallamaDirs) {
 /// Remove a retired engine: directory + registry row. Refuses the
 /// active tag (a daemon mid-flight on a deleted binary is a crash
 /// class); unknown tags error loudly.
+/// Manual trigger for the engine retention policy (runs automatically
+/// after every install): newest `KEEP_TAGS` engines plus `local` and the
+/// active tag survive, everything older is removed.
+fn engine_prune(d: &PallamaDirs) -> Result<()> {
+    let store = Store::open(d)?;
+    let before: Vec<String> = store.list_engines()?.into_iter().map(|e| e.tag).collect();
+    let mgr = local_engine_manager(d)?;
+    mgr.prune(&store)?;
+    let after: Vec<String> = store.list_engines()?.into_iter().map(|e| e.tag).collect();
+    let removed: Vec<&str> = before
+        .iter()
+        .map(String::as_str)
+        .filter(|t| !after.iter().any(|kept| kept == t))
+        .collect();
+    if removed.is_empty() {
+        println!(
+            "nothing to prune — {} engines kept: {}",
+            after.len(),
+            after.join(", ")
+        );
+    } else {
+        println!("pruned {} (kept: {})", removed.join(", "), after.join(", "));
+    }
+    Ok(())
+}
+
 fn engine_rm(d: &PallamaDirs, tag: &str) -> Result<()> {
     let store = Store::open(d)?;
     let row = store
@@ -5566,6 +5988,49 @@ mod tests {
         // validate.py asserts the llama.cpp credit on --help; keep it here
         // so a renderer rewrite cannot silently drop it.
         assert!(rendered.contains("llama.cpp"));
+    }
+
+    #[test]
+    fn unit__built_backend__maps_asset_suffix() {
+        assert_eq!(built_backend("built-cuda"), Some(BuildBackend::Cuda));
+        assert_eq!(built_backend("built-cpu"), Some(BuildBackend::Cpu));
+        assert_eq!(built_backend("ubuntu-vulkan-x64"), None);
+        assert_eq!(built_backend("built-"), None);
+        assert_eq!(built_backend("built-rocm"), None);
+    }
+
+    #[test]
+    fn unit__build_lane_routing__eligibility_matrix() {
+        // Source-built active + newer channel target + auto asset: route.
+        assert_eq!(
+            build_lane_routing("built-cuda", "b10931-cuda", "b10936", "auto"),
+            Some(BuildBackend::Cuda)
+        );
+        // Empty asset config behaves as auto.
+        assert_eq!(
+            build_lane_routing("built-cpu", "b10931", "b10936", ""),
+            Some(BuildBackend::Cpu)
+        );
+        // Already current (same upstream build): no route.
+        assert_eq!(
+            build_lane_routing("built-cuda", "b10936-cuda", "b10936", "auto"),
+            None
+        );
+        // Channel downgrade is a pin, not an update: no route.
+        assert_eq!(
+            build_lane_routing("built-cuda", "b10940-cuda", "b10936", "auto"),
+            None
+        );
+        // Prebuilt active engine: the asset lane owns it, no route.
+        assert_eq!(
+            build_lane_routing("ubuntu-vulkan-x64", "b10931", "b10936", "auto"),
+            None
+        );
+        // User pinned a prebuilt lane in config: respect it, no route.
+        assert_eq!(
+            build_lane_routing("built-cuda", "b10931-cuda", "b10936", "ubuntu-vulkan-x64"),
+            None
+        );
     }
 
     #[test]
@@ -5986,6 +6451,109 @@ mod tests {
         );
     }
 
+    /// Minimal model row for orphan-scan tests: only path matters.
+    fn row_with_path(path: &std::path::Path) -> pallama_core::store::ModelRow {
+        pallama_core::store::ModelRow {
+            name: "m".into(),
+            repo: "r".into(),
+            quant: "Q4_K_M".into(),
+            path: path.display().to_string(),
+            bytes: 1,
+            sha256: None,
+            mmproj_path: None,
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+        }
+    }
+
+    #[test]
+    fn unit__orphan_scan__clean_dir_reports_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("models");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("m.gguf"), b"x").unwrap();
+        let models = vec![row_with_path(&dir.join("m.gguf"))];
+        let r = orphan_scan(&models, &dir);
+        assert!(r.orphans.is_empty() && r.twins == 0);
+    }
+
+    #[test]
+    fn unit__orphan_scan__lists_unmanaged_with_projector_attached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("models");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("owned.gguf"), b"x").unwrap();
+        std::fs::write(dir.join("sidecar.gguf"), b"x").unwrap();
+        std::fs::write(dir.join("stray.gguf"), b"x").unwrap();
+        let mut row = row_with_path(&dir.join("owned.gguf"));
+        row.mmproj_path = Some(dir.join("sidecar.gguf").display().to_string());
+        let r = orphan_scan(&[row], &dir);
+        assert_eq!(r.orphans, vec!["stray.gguf".to_string()]);
+        assert_eq!(r.twins, 0);
+    }
+
+    #[test]
+    fn unit__orphan_scan__hardlink_twin_counted_not_listed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("models");
+        std::fs::create_dir_all(&dir).unwrap();
+        let registered = dir.join("Model-Q4.gguf");
+        std::fs::write(&registered, b"x").unwrap();
+        // Same bytes, second directory entry: import's hardlink shape.
+        std::fs::hard_link(&registered, dir.join("model-q4.gguf")).unwrap();
+        let models = vec![row_with_path(&registered)];
+        let r = orphan_scan(&models, &dir);
+        assert!(r.orphans.is_empty(), "{:?}", r.orphans);
+        assert_eq!(r.twins, 1);
+    }
+
+    #[test]
+    fn unit__orphan_scan__missing_dir_and_non_gguf_silent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let absent = orphan_scan(&[], &tmp.path().join("nope"));
+        assert!(absent.orphans.is_empty() && absent.twins == 0);
+        let dir = tmp.path().join("models");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        std::fs::write(dir.join("UPPER.GGUF"), b"x").unwrap();
+        let r = orphan_scan(&[], &dir);
+        assert_eq!(r.orphans, vec!["UPPER.GGUF".to_string()]); // case-insensitive ext
+    }
+
+    #[test]
+    fn unit__doctor_models__orphans_warn_with_import_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = PallamaDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.models_dir()).unwrap();
+        drop(pallama_core::store::Store::open(&d).unwrap());
+        std::fs::write(d.models_dir().join("registered.gguf"), b"x").unwrap();
+        std::fs::write(d.models_dir().join("orphan.gguf"), b"x").unwrap();
+        // Register by direct insert: doctor_models reads the real store.
+        {
+            let store = pallama_core::store::Store::open(&d).unwrap();
+            store
+                .upsert_model(&row_with_path(&d.models_dir().join("registered.gguf")))
+                .unwrap();
+        }
+        let checks = doctor_models(&d);
+        assert_eq!(checks.len(), 1, "{:?}", checks.len());
+        assert!(checks[0].warn && checks[0].ok, "{}", checks[0].detail);
+        assert!(
+            checks[0].detail.contains("orphan.gguf")
+                && checks[0]
+                    .detail
+                    .contains("pallama import <file> --name <n>"),
+            "{}",
+            checks[0].detail
+        );
+    }
+
     #[test]
     fn unit__doctor_store__absent_fresh_ok() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6141,6 +6709,7 @@ mod tests {
             cxx: Some(std::path::PathBuf::from("/usr/bin/g++")),
             nvcc: Some(std::path::PathBuf::from("/usr/bin/nvcc")),
             nvidia_smi: Some(std::path::PathBuf::from("/usr/bin/nvidia-smi")),
+            compiler_cache: None,
         };
         // NVIDIA + Vulkan-prebuilt active: nudge + ready toolchain.
         let rows = cuda_opportunity_rows(
@@ -6203,6 +6772,36 @@ mod tests {
         assert!(rows[0].detail.contains("driver CUDA 13.0)"));
         assert!(rows[1].detail.contains("git, cmake, nvcc"));
         assert!(rows[1].detail.contains("pallama engine install"));
+    }
+
+    #[test]
+    fn unit__gpu_driver_rows__hardware_without_driver_warns() {
+        use pallama_runtime::engine::manifest::Vendor;
+        // Driverless NVIDIA box: the warn row with the fix chain.
+        let rows = gpu_driver_rows(&["10de".to_string()], Vendor::Other, true);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "nvidia driver");
+        assert!(rows[0].detail.contains("PCI 10de"));
+        assert!(rows[0].detail.contains("engine update"));
+        // Drivered NVIDIA box: silent (cuda_opportunity_rows owns it).
+        assert!(gpu_driver_rows(&["10de".to_string()], Vendor::Nvidia, true).is_empty());
+        // Driverless AMD/Intel without a Vulkan ICD: the ICD row.
+        let rows = gpu_driver_rows(&["1002".to_string()], Vendor::Other, false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "vulkan driver");
+        assert!(rows[0].detail.contains("mesa-vulkan-drivers"));
+        // ICDs present: nothing to say.
+        assert!(gpu_driver_rows(&["8086".to_string()], Vendor::Intel, true).is_empty());
+        // No GPU hardware: never a row.
+        assert!(gpu_driver_rows(&[], Vendor::Other, false).is_empty());
+        // Hybrid box (Intel iGPU + NVIDIA) with only the NVIDIA driver
+        // present: no vulkan row for the iGPU when ICDs exist.
+        assert!(gpu_driver_rows(
+            &["10de".to_string(), "8086".to_string()],
+            Vendor::Nvidia,
+            true
+        )
+        .is_empty());
     }
 
     #[test]

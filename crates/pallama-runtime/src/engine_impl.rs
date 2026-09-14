@@ -689,6 +689,142 @@ impl Engine for MistralRsEngine {
     }
 }
 
+/// sglang engine (`python -m sglang.launch_server` behind an executable
+/// shim). Dialect differences that shaped this impl (verified against
+/// sglang v0.5.19 `http_server.py` + `server_args.py`):
+/// - `/health` and `/health_generate` share one handler: 503 while the
+///   server is `Starting`, 200 once serving (generate-backed). Readiness
+///   is the STATUS alone — there is no `{"status":"ok"}` body contract.
+/// - no `--list-devices` equivalent; device enumeration unavailable.
+/// - no unix-socket transport: endpoints are always TCP.
+/// - auth exists upstream (`--api-key`): the supervisor's minted
+///   per-child secret rides the connection quintet like llamacpp.
+pub struct SglangEngine {
+    pub manifest: crate::engine::manifest::Manifest,
+    /// HTTP client for health polls (children are loopback).
+    http: reqwest::Client,
+    /// Extra env injected into children (config `engine_env`).
+    pub child_env: Vec<(String, String)>,
+}
+
+impl SglangEngine {
+    #[must_use]
+    pub fn new(manifest: crate::engine::manifest::Manifest) -> Self {
+        Self::with_env(manifest, Vec::new())
+    }
+
+    /// `env` pairs apply to every spawned child (config `engine_env`).
+    #[must_use]
+    pub fn with_env(
+        manifest: crate::engine::manifest::Manifest,
+        env: Vec<(String, String)>,
+    ) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("health client");
+        Self {
+            manifest,
+            http,
+            child_env: env,
+        }
+    }
+}
+
+/// sglang connection quintet + compiled profile. The profile argv is
+/// already `launch_server` grammar (context-length, max-running-requests,
+/// mem-fraction-static, ...), so this only PREPENDS what the supervisor
+/// owns: model dir, loopback bind, port, public name. The per-child
+/// `--api-key` secret is appended by the supervisor's child-auth mint
+/// (same as llamacpp) — one choke point, not engine business.
+fn sglang_argv(
+    model: &pallama_core::ModelRow,
+    profile: &Profile,
+    endpoint: &Endpoint,
+) -> Vec<String> {
+    let port = match endpoint {
+        Endpoint::Tcp { port, .. } => *port,
+        // Supervisor rejects unix endpoints for sglang engines before
+        // argv assembly; a placeholder here cannot produce a valid child.
+        Endpoint::Unix { .. } => 0,
+    };
+    let mut argv = vec![
+        "--model-path".to_string(),
+        model.path.clone(),
+        // Forced loopback: even with the API key set, the child is not
+        // the public face — the gateway is (binding revision 3).
+        "--host".to_string(),
+        "127.0.0.1".to_string(),
+        "--port".to_string(),
+        port.to_string(),
+        "--served-model-name".to_string(),
+        model.name.clone(),
+    ];
+    argv.extend(profile.argv.iter().cloned());
+    argv
+}
+
+#[async_trait]
+impl Engine for SglangEngine {
+    fn kind(&self) -> pallama_core::engine_kind::EngineKind {
+        pallama_core::engine_kind::EngineKind::Sglang
+    }
+
+    fn capabilities(&self) -> &crate::engine::manifest::Manifest {
+        &self.manifest
+    }
+
+    fn build_argv(
+        &self,
+        model: &pallama_core::ModelRow,
+        profile: &Profile,
+        endpoint: &Endpoint,
+    ) -> Vec<String> {
+        sglang_argv(model, profile, endpoint)
+    }
+
+    async fn spawn(&self, argv: &[String], endpoint: &Endpoint) -> Result<ChildHandle> {
+        if matches!(endpoint, Endpoint::Unix { .. }) {
+            return Err(anyhow!(
+                "sglang engines have no unix-socket transport; set \
+                 child_transport = \"tcp\" in the pallama config"
+            ));
+        }
+        // No --rpc preflight: sglang has no rpc-worker flag surface.
+        spawn_child(&self.manifest.server_path, argv, endpoint, &self.child_env)
+    }
+
+    async fn health_check(&self, endpoint: &Endpoint, timeout: std::time::Duration) -> Result<()> {
+        let Endpoint::Tcp { host, port } = endpoint else {
+            return Err(anyhow!("sglang engines require a TCP endpoint"));
+        };
+        let url = format!("http://{host}:{port}");
+        let deadline = tokio::time::Instant::now() + timeout;
+        let started = std::time::Instant::now();
+        // Same adaptive poll as the other engines. Readiness = HTTP 200
+        // on /health: sglang answers 503 while `Starting` (weights
+        // loading, warmup generate) and 200 once it serves — the body is
+        // not a contract (v0.5.19 http_server.py:662).
+        let mut poll = std::time::Duration::from_millis(25);
+        loop {
+            if let Ok(resp) = self.http.get(format!("{url}/health")).send().await {
+                if resp.status().is_success() {
+                    tracing::debug!("sglang healthy at {url} after {:?}", started.elapsed());
+                    return Ok(());
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "sglang at {url} did not turn healthy (HTTP 200 on /health) \
+                     within {timeout:?} (model_load_timeout)"
+                ));
+            }
+            tokio::time::sleep(poll).await;
+            poll = std::cmp::min(poll.mul_f64(1.6), std::time::Duration::from_millis(150));
+        }
+    }
+}
+
 async fn pipe_logs<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     r: R,
     stream: &str,

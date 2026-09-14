@@ -672,12 +672,13 @@ pub fn resolve_mistralrs_asset(release: &GhRelease, picks: &[AssetPick]) -> Opti
 
 /// Release repo for the prebuilt CUDA overlay channel (our CI's
 /// `bNNNN-cuda` releases of upstream llama.cpp): the repo that runs
-/// the `engine-cuda` workflow. Placeholder until the project's GitHub
-/// home is real — flip this ONE constant then; a missing repo costs
-/// one failed release probe per `engine update`, then Vulkan fallback.
+/// the `engine-cuda` workflow. Live since 2026-09-13 (b10937-cuda
+/// built on demand); move the channel by flipping this ONE constant —
+/// a missing repo costs one failed release probe per `engine update`,
+/// then Vulkan fallback.
 pub const ENGINE_OVERLAY_REPO_ENV: &str = "PALLAMA_ENGINE_REPO";
 
-pub const ENGINE_OVERLAY_REPO_DEFAULT: &str = "pallama/pallama";
+pub const ENGINE_OVERLAY_REPO_DEFAULT: &str = "santanu20/pallama";
 
 /// Overlay repo for the prebuilt CUDA channel: `PALLAMA_ENGINE_REPO`
 /// (e.g. a private fork) when set to a non-empty value, else the
@@ -699,11 +700,28 @@ pub fn engine_overlay_repo() -> String {
 /// trusted — a driver older than the asset stays on the Vulkan lane
 /// (today's behavior) instead of risking a child that cannot boot.
 #[must_use]
-pub fn resolve_cuda_asset(release: &GhRelease, driver_cuda: (u32, u32)) -> Option<AssetPick> {
-    let tag = &release.tag_name;
+pub fn resolve_cuda_asset(
+    release: &GhRelease,
+    driver_cuda: (u32, u32),
+    sm: Option<u32>,
+) -> Option<AssetPick> {
+    // Release tag carries the lane suffix (`b10941-cuda`) but the ASSET
+    // name embeds the bare upstream tag (`llama-b10941-bin-...`) — match
+    // run-8+ reality, verified against the published overlay release.
+    let tag = release
+        .tag_name
+        .strip_suffix("-cuda")
+        .unwrap_or(&release.tag_name);
     let head = format!("llama-{tag}-bin-ubuntu-cuda-");
     let tail = "-x64.tar.gz";
-    let mut best: Option<((u32, u32), String)> = None;
+    // Per-arch channel: slim `-smNN` assets (SASS for exactly that arch)
+    // plus one `-sm120` build carrying SASS+PTX for forward JIT. Ranking:
+    // exact-GPU-arch slim beats the legacy fat (no -smNN) build; the
+    // PTX-carrying sm120 build only serves GPUs NEWER than every shipped
+    // SASS arch (PTX JITs forward, never backward).
+    let mut exact: Option<((u32, u32), String)> = None;
+    let mut fat: Option<((u32, u32), String)> = None;
+    let mut jit: Option<((u32, u32), String)> = None;
     for a in &release.assets {
         let Some(middle) = a.name.strip_prefix(&head) else {
             continue;
@@ -711,21 +729,88 @@ pub fn resolve_cuda_asset(release: &GhRelease, driver_cuda: (u32, u32)) -> Optio
         let Some(version) = middle.strip_suffix(tail) else {
             continue;
         };
-        let Some(ver) = parse_version_pair(version) else {
+        let (base, asset_sm) = match version.split_once("-sm") {
+            Some((b, s)) => match s.parse::<u32>() {
+                Ok(n) => (b, Some(n)),
+                Err(_) => continue,
+            },
+            None => (version, None),
+        };
+        let Some(ver) = parse_version_pair(base) else {
             continue;
         };
         if ver > driver_cuda {
             continue; // driver cannot run this toolkit build
         }
-        if best.as_ref().is_none_or(|(b, _)| ver > *b) {
-            best = Some((ver, version.to_string()));
+        let slot = match asset_sm {
+            Some(a) if Some(a) == sm => &mut exact,
+            None => &mut fat,
+            Some(120) if sm.is_some_and(|s| s > 120) => &mut jit,
+            // SASS for a different arch, and its PTX (if any) cannot
+            // JIT backward onto this GPU.
+            Some(_) => continue,
+        };
+        if slot.as_ref().is_none_or(|(b, _)| ver > *b) {
+            *slot = Some((ver, version.to_string()));
         }
     }
-    best.map(|(_, version)| AssetPick {
-        name: format!("llama-{tag}-bin-ubuntu-cuda-{version}-x64.tar.gz"),
-        label: format!("ubuntu-cuda-{version}-x64"),
-        cpu_fallback: false,
-    })
+    exact
+        .or(fat)
+        .or(jit)
+        .map(|(_, version)| AssetPick {
+            name: format!("llama-{tag}-bin-ubuntu-cuda-{version}-x64.tar.gz"),
+            label: format!("ubuntu-cuda-{version}-x64"),
+            cpu_fallback: false,
+        })
+}
+
+/// Newest CUDA toolkit an overlay release's assets were built with,
+/// ignoring any driver ceiling. Feeds the lane-drop warning so the
+/// operator learns exactly how far their driver is from the prebuilt
+/// lane ("needs CUDA 13.0, this driver runs 12.8").
+#[must_use]
+pub fn newest_asset_cuda(release: &GhRelease) -> Option<(u32, u32)> {
+    // Same lane-suffix contract as resolve_cuda_asset: tag carries
+    // `-cuda`, asset names embed the bare tag.
+    let tag = release
+        .tag_name
+        .strip_suffix("-cuda")
+        .unwrap_or(&release.tag_name);
+    let head = format!("llama-{tag}-bin-ubuntu-cuda-");
+    let tail = "-x64.tar.gz";
+    release
+        .assets
+        .iter()
+        .filter_map(|a| {
+            let middle = a.name.strip_prefix(&head)?;
+            let version = middle.strip_suffix(tail)?;
+            parse_version_pair(version)
+        })
+        .max()
+}
+
+/// Newest overlay release (`bNNNN-cuda`) at or below `target` whose
+/// release carries a driver-runnable CUDA asset. Pure selection over
+/// the overlay's release list — feeds the overlay-lag fallback (the
+/// channel target is not published yet, so take the newest build that
+/// IS). Never returns anything newer than `target` and never one whose
+/// every asset exceeds the driver (that would recreate the very
+/// Vulkan-lane demotion the caller is trying to avoid).
+#[must_use]
+pub fn newest_runnable_overlay(
+    releases: &[GhRelease],
+    driver_cuda: (u32, u32),
+    sm: Option<u32>,
+    target: u64,
+) -> Option<&GhRelease> {
+    releases
+        .iter()
+        .filter(|r| r.tag_name.ends_with("-cuda"))
+        .filter_map(|r| btag_number(&r.tag_name).map(|n| (r, n)))
+        .filter(|(_, n)| *n <= target)
+        .filter(|(r, _)| resolve_cuda_asset(r, driver_cuda, sm).is_some())
+        .max_by_key(|(_, n)| *n)
+        .map(|(r, _)| r)
 }
 
 #[cfg(test)]
@@ -1100,23 +1185,106 @@ mod tests {
         let r = rel(
             "b10896-cuda",
             &[
-                "llama-b10896-cuda-bin-ubuntu-cuda-13.0-x64.tar.gz",
-                "llama-b10896-cuda-bin-ubuntu-cuda-12.8-x64.tar.gz",
-                "llama-b10896-cuda-bin-ubuntu-vulkan-x64.tar.gz",
-                "llama-b10896-cuda-bin-ubuntu-cuda-11.8-x64.tar.gz",
+                "llama-b10896-bin-ubuntu-cuda-13.0-x64.tar.gz",
+                "llama-b10896-bin-ubuntu-cuda-12.8-x64.tar.gz",
+                "llama-b10896-bin-ubuntu-vulkan-x64.tar.gz",
+                "llama-b10896-bin-ubuntu-cuda-11.8-x64.tar.gz",
             ],
         );
         // Driver 13.0: highest runnable is 13.0 itself.
-        let p = resolve_cuda_asset(&r, (13, 0)).unwrap();
-        assert_eq!(p.name, "llama-b10896-cuda-bin-ubuntu-cuda-13.0-x64.tar.gz");
+        let p = resolve_cuda_asset(&r, (13, 0), Some(89)).unwrap();
+        assert_eq!(p.name, "llama-b10896-bin-ubuntu-cuda-13.0-x64.tar.gz");
         assert_eq!(p.label, "ubuntu-cuda-13.0-x64");
         assert!(!p.cpu_fallback);
         // Driver 12.x: 13.0 filtered out, 12.8 wins.
-        let p = resolve_cuda_asset(&r, (12, 9)).unwrap();
-        assert_eq!(p.name, "llama-b10896-cuda-bin-ubuntu-cuda-12.8-x64.tar.gz");
+        let p = resolve_cuda_asset(&r, (12, 9), Some(89)).unwrap();
+        assert_eq!(p.name, "llama-b10896-bin-ubuntu-cuda-12.8-x64.tar.gz");
         // Old 12.0-only driver still has a runnable asset (11.8).
-        let p = resolve_cuda_asset(&r, (12, 0)).unwrap();
+        let p = resolve_cuda_asset(&r, (12, 0), Some(89)).unwrap();
         assert_eq!(p.label, "ubuntu-cuda-11.8-x64");
+    }
+
+    #[test]
+    fn unit__newest_asset_cuda__ignores_driver_ceiling() {
+        let r = rel(
+            "b10896-cuda",
+            &[
+                "llama-b10896-bin-ubuntu-cuda-12.8-x64.tar.gz",
+                "llama-b10896-bin-ubuntu-vulkan-x64.tar.gz",
+                "llama-b10896-bin-ubuntu-cuda-13.0-x64.tar.gz",
+            ],
+        );
+        // Names the newest toolkit regardless of any driver.
+        assert_eq!(newest_asset_cuda(&r), Some((13, 0)));
+        // Non-CUDA-only release: nothing to name.
+        let r = rel(
+            "b10896-cuda",
+            &["llama-b10896-bin-ubuntu-vulkan-x64.tar.gz"],
+        );
+        assert_eq!(newest_asset_cuda(&r), None);
+    }
+
+    #[test]
+    fn unit__newest_runnable_overlay__lag_target_skips_newer_and_unrunnable() {
+        // Fixture builder: release with one cuda asset (12.8 = runnable
+        // by a 12.8 driver; 13.0-only = unrunnable by it).
+        #[test]
+        fn unit__resolve_cuda_asset__per_arch_ranking() {
+            let r = rel(
+                "b200-cuda",
+                &[
+                    "llama-b200-bin-ubuntu-cuda-12.8-sm89-x64.tar.gz",
+                    "llama-b200-bin-ubuntu-cuda-13.0-sm120-x64.tar.gz",
+                    "llama-b200-bin-ubuntu-cuda-12.8-x64.tar.gz",
+                    "llama-b200-bin-ubuntu-cuda-12.8-sm61-x64.tar.gz",
+                ],
+            );
+            // Exact-arch slim beats the fat build even at lower toolkit.
+            let p = resolve_cuda_asset(&r, (13, 0), Some(89)).unwrap();
+            assert_eq!(p.name, "llama-b200-bin-ubuntu-cuda-12.8-sm89-x64.tar.gz");
+            // GPU newer than every SASS arch: the legacy fat build still
+            // serves via its embedded sm120 PTX (forward JIT).
+            let q = resolve_cuda_asset(&r, (13, 0), Some(121)).unwrap();
+            assert_eq!(q.name, "llama-b200-bin-ubuntu-cuda-12.8-x64.tar.gz");
+            // Other-arch slim only: not runnable (PTX never JITs backward).
+            let only61 = rel(
+                "b201-cuda",
+                &["llama-b201-bin-ubuntu-cuda-12.8-sm61-x64.tar.gz"],
+            );
+            assert!(resolve_cuda_asset(&only61, (13, 0), Some(89)).is_none());
+            // sm120-only release: serves newer GPUs, never older ones.
+            let only120 = rel(
+                "b202-cuda",
+                &["llama-b202-bin-ubuntu-cuda-13.0-sm120-x64.tar.gz"],
+            );
+            let j = resolve_cuda_asset(&only120, (13, 0), Some(121)).unwrap();
+            assert_eq!(j.name, "llama-b202-bin-ubuntu-cuda-13.0-sm120-x64.tar.gz");
+            assert!(resolve_cuda_asset(&only120, (13, 0), Some(89)).is_none());
+        }
+
+        fn rel_cuda(tag: &str, ver: &str) -> GhRelease {
+            rel(
+                tag,
+                &[&format!(
+                    "llama-{}-bin-ubuntu-cuda-{ver}-x64.tar.gz",
+                    tag.strip_suffix("-cuda").unwrap_or(tag)
+                )],
+            )
+        }
+        let releases = vec![
+            rel_cuda("b100-cuda", "12.8"),
+            rel_cuda("b101-cuda", "13.0"), // newest <= target, unrunnable
+            rel_cuda("b102-cuda", "12.8"), // newer than target — excluded
+            rel_cuda("b99-cuda", "13.0"),  // unrunnable AND older
+            rel("b103", &[]),              // not an overlay tag
+        ];
+        let got = newest_runnable_overlay(&releases, (12, 8), Some(89), 101).unwrap();
+        assert_eq!(got.tag_name, "b100-cuda");
+        // Target itself runnable wins when present.
+        let got = newest_runnable_overlay(&releases, (13, 0), Some(89), 101).unwrap();
+        assert_eq!(got.tag_name, "b101-cuda");
+        // Nothing runnable at all: driver ceiling filters everything.
+        assert!(newest_runnable_overlay(&releases, (12, 0), Some(89), 101).is_none());
     }
 
     #[test]
@@ -1124,27 +1292,27 @@ mod tests {
         let r = rel(
             "b10896-cuda",
             &[
-                "llama-b10896-cuda-bin-ubuntu-cuda-13.0-x64.tar.gz",
-                "llama-b10896-cuda-bin-ubuntu-cuda-12.8-x64.tar.gz",
+                "llama-b10896-bin-ubuntu-cuda-13.0-x64.tar.gz",
+                "llama-b10896-bin-ubuntu-cuda-12.8-x64.tar.gz",
             ],
         );
-        assert_eq!(resolve_cuda_asset(&r, (11, 8)), None);
+        assert_eq!(resolve_cuda_asset(&r, (11, 8), Some(89)), None);
         // Vulkan-only release: nothing CUDA-shaped to pick.
         let v = rel(
             "b10896-cuda",
-            &["llama-b10896-cuda-bin-ubuntu-vulkan-x64.tar.gz"],
+            &["llama-b10896-bin-ubuntu-vulkan-x64.tar.gz"],
         );
-        assert_eq!(resolve_cuda_asset(&v, (13, 0)), None);
+        assert_eq!(resolve_cuda_asset(&v, (13, 0), Some(89)), None);
         // Wrong shapes never match (prefix/suffix discipline).
         let w = rel(
             "b10896-cuda",
             &[
-                "llama-b10896-cuda-bin-win-cuda-12.8-x64.zip",
-                "llama-b10896-cuda-bin-ubuntu-cuda-12.8-arm64.tar.gz",
-                "llama-b10896-cuda-bin-ubuntu-cuda-x64.tar.gz",
+                "llama-b10896-bin-win-cuda-12.8-x64.zip",
+                "llama-b10896-bin-ubuntu-cuda-12.8-arm64.tar.gz",
+                "llama-b10896-bin-ubuntu-cuda-x64.tar.gz",
             ],
         );
-        assert_eq!(resolve_cuda_asset(&w, (13, 0)), None);
+        assert_eq!(resolve_cuda_asset(&w, (13, 0), Some(89)), None);
     }
 
     #[test]

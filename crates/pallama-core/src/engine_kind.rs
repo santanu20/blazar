@@ -20,6 +20,9 @@ pub enum EngineKind {
     LlamaCpp,
     /// EricLBuehler/mistral.rs `mistralrs serve` (prebuilt assets).
     MistralRs,
+    /// sgl-project/sglang `python -m sglang.launch_server` (pip venv;
+    /// HF safetensors models, Linux CUDA/ROCm upstream).
+    Sglang,
 }
 
 impl EngineKind {
@@ -28,6 +31,7 @@ impl EngineKind {
         match self {
             EngineKind::LlamaCpp => "llamacpp",
             EngineKind::MistralRs => "mistralrs",
+            EngineKind::Sglang => "sglang",
         }
     }
 }
@@ -45,8 +49,9 @@ impl FromStr for EngineKind {
         match s {
             "llamacpp" => Ok(EngineKind::LlamaCpp),
             "mistralrs" => Ok(EngineKind::MistralRs),
+            "sglang" => Ok(EngineKind::Sglang),
             other => Err(format!(
-                "unknown engine kind {other:?} (supported: llamacpp, mistralrs)"
+                "unknown engine kind {other:?} (supported: llamacpp, mistralrs, sglang)"
             )),
         }
     }
@@ -79,14 +84,18 @@ mod tests {
             #[serde(default)]
             kind: EngineKind,
         }
-        for k in [EngineKind::LlamaCpp, EngineKind::MistralRs] {
+        for k in [
+            EngineKind::LlamaCpp,
+            EngineKind::MistralRs,
+            EngineKind::Sglang,
+        ] {
             assert_eq!(EngineKind::from_str(k.as_str()), Ok(k));
             let json = serde_json::to_string(&k).unwrap();
             assert_eq!(serde_json::from_str::<EngineKind>(&json).unwrap(), k);
         }
         assert_eq!(
             EngineKind::from_str("vllm").unwrap_err(),
-            "unknown engine kind \"vllm\" (supported: llamacpp, mistralrs)"
+            "unknown engine kind \"vllm\" (supported: llamacpp, mistralrs, sglang)"
         );
         // serde default on missing field = llamacpp (old rows).
         assert_eq!(

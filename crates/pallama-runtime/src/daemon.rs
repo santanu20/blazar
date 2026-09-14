@@ -115,6 +115,36 @@ pub fn process_alive_by_pid(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
+/// Validate-harness daemons (`PALLAMA_VALIDATE=1` in the environment)
+/// must not outlive their harness: when the parent dies — a `timeout(1)`
+/// SIGKILL bypasses every atexit sweep — the kernel delivers the signal
+/// installed here. Belt to validate.py's marker sweep; Linux-only
+/// because `PR_SET_PDEATHSIG` is a Linux prctl (other platforms fall
+/// back to the harness sweep + signal-routed cleanup).
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // one prctl flag set + one ppid read on this thread
+pub fn validate_parent_death_guard() {
+    if std::env::var("PALLAMA_VALIDATE").ok().as_deref() != Some("1") {
+        return;
+    }
+    // SAFETY: prctl(PR_SET_PDEATHSIG, SIGTERM) sets one kernel flag on
+    // this thread; no pointers, no allocation. Failure leaves the
+    // harness marker sweep as the covering net.
+    unsafe {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+            return;
+        }
+        // Race: the parent may have died between spawn and prctl — the
+        // signal would never fire. Reparenting to init already happened.
+        if libc::getppid() == 1 {
+            std::process::exit(0);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn validate_parent_death_guard() {}
+
 #[cfg(unix)]
 #[allow(unsafe_code)] // existence probe via signal 0 to one exact pid
 fn process_alive(pid: u32) -> bool {

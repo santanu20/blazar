@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use pallama_core::config::Config;
-use pallama_core::gguf::GgufMeta;
 use pallama_core::hardware::Hardware;
 use pallama_core::profile::{self, Endpoint, Profile, ProfileInput, TuningOverrides};
 use pallama_core::store::{ProfileRow, Store};
@@ -823,7 +822,7 @@ pub fn build_input<'a>(
     model_name: &'a str,
     model_path: &'a str,
     model_bytes: u64,
-    gguf: &'a GgufMeta,
+    meta: pallama_core::ModelMeta<'a>,
     hardware: &'a Hardware,
     config: &'a Config,
     overlay: &'a ModelOverride,
@@ -840,7 +839,7 @@ pub fn build_input<'a>(
         instance_key: model_name,
         model_path,
         model_bytes,
-        gguf,
+        meta,
         hardware,
         config,
         overlay,

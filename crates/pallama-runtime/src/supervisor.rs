@@ -112,6 +112,43 @@ fn model_of_key(key: &str) -> &str {
     }
 }
 
+/// Owned model metadata for either storage lane, lendable as the
+/// compiler's borrowed `ModelMeta` (no self-referential struct).
+pub(crate) enum MetaBox {
+    Gguf(Box<pallama_core::GgufMeta>),
+    Hf(pallama_core::HfMeta),
+}
+
+impl MetaBox {
+    #[must_use]
+    pub(crate) fn borrow_meta(&self) -> pallama_core::ModelMeta<'_> {
+        match self {
+            MetaBox::Gguf(g) => pallama_core::ModelMeta::Gguf(g),
+            MetaBox::Hf(h) => pallama_core::ModelMeta::Hf(h),
+        }
+    }
+}
+
+/// Read the row's metadata through the lane its engine consumes:
+/// sglang rows are safetensors dirs (config.json), everything else is a
+/// GGUF file header. Errors name the reader so the caller's skip/teach
+/// message says WHICH metadata was missing.
+pub(crate) fn read_model_meta(
+    path: &str,
+    kind: pallama_core::engine_kind::EngineKind,
+) -> Result<MetaBox, String> {
+    match kind {
+        pallama_core::engine_kind::EngineKind::Sglang => {
+            pallama_core::read_hf_config(std::path::Path::new(path))
+                .map(MetaBox::Hf)
+                .map_err(|e| format!("hf config: {e}"))
+        }
+        _ => pallama_core::read_metadata_file(std::path::Path::new(path))
+            .map(|m| MetaBox::Gguf(Box::new(m)))
+            .map_err(|e| format!("gguf metadata: {e}")),
+    }
+}
+
 /// Drops one unit of ensure-window demand when the request's
 /// `ensure_routed` call ends (any exit path).
 struct PendingGuard(Arc<AtomicI64>);
@@ -1449,7 +1486,7 @@ impl Supervisor {
                 instance_key: &m.name,
                 model_path: &m.path,
                 model_bytes: u64::try_from(m.bytes.max(0)).unwrap_or(u64::MAX),
-                gguf: &gguf,
+                meta: pallama_core::ModelMeta::Gguf(&gguf),
                 hardware: &self.hardware,
                 config: &self.config,
                 overlay: &overlay,
@@ -1816,8 +1853,8 @@ impl Supervisor {
             .get_model(name)
             .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?
             .ok_or_else(|| SupervisionError::ModelNotFound(not_found_name(name)))?;
-        let gguf = pallama_core::read_metadata_file(std::path::Path::new(&model.path))
-            .map_err(|e| SupervisionError::Internal(anyhow!("gguf metadata: {e}")))?;
+        let meta_box = read_model_meta(&model.path, self.engine.kind())
+            .map_err(|e| SupervisionError::Internal(anyhow!("model metadata: {e}")))?;
         let mut overlay = self.config.overlay_for(name);
         // LC4: in-memory adaptive slots fill in ONLY where the user left
         // slots unset (manual overlay always wins; `tune --slots` writes
@@ -1845,8 +1882,11 @@ impl Supervisor {
         // Draft header for the planner's device-KV charge (A15): the
         // spec pair allocates its own KV at the compiled ctx. An
         // unreadable header degrades to dense-only with a warn — it
-        // must never block the spawn itself.
-        let draft_gguf =
+        // must never block the spawn itself. sglang drafts are
+        // safetensors dirs (eagle3 class): no GGUF header to read.
+        let draft_gguf = if self.engine.kind() == pallama_core::engine_kind::EngineKind::Sglang {
+            None
+        } else {
             draft_path.as_deref().and_then(|p| {
                 match pallama_core::read_metadata_file(std::path::Path::new(p)) {
                     Ok(g) => Some(g),
@@ -1859,7 +1899,8 @@ impl Supervisor {
                         None
                     }
                 }
-            });
+            })
+        };
         // Capacity: evict the COLDEST instance first — recency-weighted
         // prefix heat (hot models keep their warm cache across capacity
         // pressure; the radix-lite lane), ties broken by longest-idle.
@@ -2003,7 +2044,7 @@ impl Supervisor {
                 instance_key: key,
                 model_path: &model.path,
                 model_bytes: u64::try_from(model.bytes.max(0)).unwrap_or(u64::MAX),
-                gguf: &gguf,
+                meta: meta_box.borrow_meta(),
                 hardware: fresh.as_ref().unwrap_or(&self.hardware),
                 config: &self.config,
                 overlay: &overlay,
@@ -2163,7 +2204,7 @@ impl Supervisor {
                 instance_key: key,
                 model_path: &model.path,
                 model_bytes: u64::try_from(model.bytes.max(0)).unwrap_or(u64::MAX),
-                gguf: &gguf,
+                meta: meta_box.borrow_meta(),
                 // Scoped (picked card) > fresh census > boot snapshot:
                 // single-GPU boxes previously planned against the
                 // BOOT-TIME free VRAM (live-repro'd: daemon booted

@@ -45,6 +45,23 @@ pub fn remove_model(dirs: &PallamaDirs, name: &str) -> Result<()> {
         .get_model(name)?
         .ok_or_else(|| anyhow!("no such model: {name}"))?;
 
+    // Safetensors dir rows (sglang lane): the recorded path IS the model
+    // directory — remove it wholesale. The shared-asset guard applies:
+    // another row pointing at the same dir keeps it alive.
+    let row_path = PathBuf::from(&row.path);
+    if row_path.is_dir() {
+        let shared = store
+            .list_models()?
+            .into_iter()
+            .any(|m| m.name != row.name && m.path == row.path);
+        if !shared {
+            std::fs::remove_dir_all(&row_path)
+                .map_err(|e| anyhow!("delete {}: {e}", row_path.display()))?;
+        }
+        store.delete_model(name)?;
+        return Ok(());
+    }
+
     let mut files: Vec<PathBuf> = vec![PathBuf::from(&row.path)];
     // Shards share the stored first-shard filename convention
     // (`base-NNNNN-of-MMMMM.gguf`); collect every part of the set.
@@ -140,6 +157,13 @@ pub fn copy_model(dirs: &PallamaDirs, src: &str, dst: &str) -> Result<()> {
         return Err(anyhow!("model {dst} already exists"));
     }
     let src_path = PathBuf::from(&row.path);
+    // Dir rows (safetensors/sglang lane) cannot be hardlink-aliased;
+    // teach the pull-again path instead of failing deep in link(2).
+    if src_path.is_dir() {
+        return Err(anyhow!(
+            "model {src} is a safetensors directory (sglang lane) — directories cannot be aliased; pull the repo again under the new name"
+        ));
+    }
     let leaf = src_path
         .file_name()
         .unwrap_or_default()
@@ -239,6 +263,92 @@ mod tests {
         assert!(!d.join("m-q4_k_m-00001-of-00002.gguf").exists());
         assert!(!d.join("m-q4_k_m-00002-of-00002.gguf").exists());
         assert!(!d.join("mmproj-m.gguf").exists());
+    }
+
+    #[test]
+    fn unit__remove_model__deletes_safetensors_dir_and_row() {
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir().join("m.d");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("config.json"), b"{}").unwrap();
+        std::fs::write(d.join("model.safetensors"), b"weights").unwrap();
+        let store = Store::open(&dirs).unwrap();
+        store
+            .upsert_model(&pallama_core::ModelRow {
+                name: "m".into(),
+                repo: "o/m".into(),
+                quant: "BF16".into(),
+                path: d.display().to_string(),
+                bytes: 9,
+                sha256: None,
+                mmproj_path: None,
+                shards: 1,
+                arch: None,
+                params: None,
+                ctx_train: None,
+                pulled_at: 1,
+            })
+            .unwrap();
+
+        remove_model(&dirs, "m").unwrap();
+        assert!(store.get_model("m").unwrap().is_none());
+        assert!(!d.exists(), "dir row removal deletes the whole dir");
+    }
+
+    #[test]
+    fn unit__remove_model__shared_dir_survives_other_rows() {
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir().join("m.d");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("config.json"), b"{}").unwrap();
+        let store = Store::open(&dirs).unwrap();
+        for name in ["m", "alias"] {
+            store
+                .upsert_model(&pallama_core::ModelRow {
+                    name: name.into(),
+                    repo: "o/m".into(),
+                    quant: "BF16".into(),
+                    path: d.display().to_string(),
+                    bytes: 2,
+                    sha256: None,
+                    mmproj_path: None,
+                    shards: 1,
+                    arch: None,
+                    params: None,
+                    ctx_train: None,
+                    pulled_at: 1,
+                })
+                .unwrap();
+        }
+        remove_model(&dirs, "m").unwrap();
+        assert!(d.exists(), "dir still referenced by `alias` must survive");
+        assert!(store.get_model("alias").unwrap().is_some());
+    }
+
+    #[test]
+    fn unit__copy_model__dir_row_refused_with_teaching() {
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir().join("m.d");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("config.json"), b"{}").unwrap();
+        let s = Store::open(&dirs).unwrap();
+        s.upsert_model(&pallama_core::ModelRow {
+            name: "m".into(),
+            repo: "r".into(),
+            quant: "BF16".into(),
+            path: d.display().to_string(),
+            bytes: 2,
+            sha256: None,
+            mmproj_path: None,
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 1,
+        })
+        .unwrap();
+        let err = copy_model(&dirs, "m", "m-alias").unwrap_err();
+        assert!(err.to_string().contains("cannot be aliased"), "{err}");
     }
 
     #[test]

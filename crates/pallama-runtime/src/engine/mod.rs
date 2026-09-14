@@ -5,6 +5,7 @@
 pub mod build;
 pub mod gh;
 pub mod manifest;
+pub mod sglang_install;
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,7 +21,10 @@ use crate::events::{EventBus, PallamaEvent};
 use gh::{GhClient, GhRelease};
 use manifest::Manifest;
 
-pub const KEEP_TAGS: usize = 3;
+/// Retention for engine dirs: the newest 2 survive auto-prune — the
+/// fresh build plus one rollback anchor (~215 MiB each). `local` and the
+/// active tag are always kept on top of this.
+pub const KEEP_TAGS: usize = 2;
 pub const LOCAL_TAG: &str = "local";
 /// Wait between asset-list re-fetches while a fresh release finishes
 /// uploading (observed: full asset matrix lands ~75-120 s after publish).
@@ -127,7 +131,7 @@ impl EngineManager {
             Some(t) => self.gh.resolve_tag(t).await?,
             None => self.gh.channel_b_release(channel).await?,
         };
-        if let Some(row) = self.maybe_cuda_overlay(&release).await? {
+        if let Some(row) = self.maybe_cuda_overlay(&release, tag.is_some()).await? {
             return Ok(row);
         }
         // Channel automation never benefits from the standard (Vulkan)
@@ -143,20 +147,23 @@ impl EngineManager {
 
     /// Install an already-resolved release (single-fetch entry for callers
     /// that needed the `GhRelease` up front, e.g. downgrade gating).
-    pub async fn update_resolved(&self, release: GhRelease) -> Result<EngineRow> {
-        self.update_resolved_with_vendor(release, system_vendor_hint())
+    pub async fn update_resolved(&self, release: GhRelease, exact_pin: bool) -> Result<EngineRow> {
+        self.update_resolved_with_vendor(release, system_vendor_hint(), exact_pin)
             .await
     }
 
     /// `update_resolved` with an injectable vendor hint so the keep-CUDA
     /// skip is deterministically testable on any box (same injection
-    /// pattern as `register_engine_with_vendor`).
+    /// pattern as `register_engine_with_vendor`). `exact_pin`: the
+    /// release came from a user-pinned tag — the overlay-lag fallback
+    /// must not swap an exact pin for an older build.
     pub async fn update_resolved_with_vendor(
         &self,
         release: GhRelease,
         vendor_hint: manifest::Vendor,
+        exact_pin: bool,
     ) -> Result<EngineRow> {
-        if let Some(row) = self.maybe_cuda_overlay(&release).await? {
+        if let Some(row) = self.maybe_cuda_overlay(&release, exact_pin).await? {
             return Ok(row);
         }
         if let Some(row) = self.try_keep_cuda_skip(&release.tag_name, vendor_hint)? {
@@ -211,14 +218,16 @@ impl EngineManager {
                     gh::ENGINE_OVERLAY_REPO_ENV
                 )
             })?;
-        let (driver_cuda, _) = build::nvidia_gpu_facts().await;
+        let (driver_cuda, cc) = build::nvidia_gpu_facts().await;
+        // Compute capability (8,9) -> sm 89 for the per-arch asset rank.
+        let sm = cc.map(|(maj, min)| maj * 10 + min);
         let Some(driver_cuda) = driver_cuda else {
             return Err(anyhow!(
                 "cannot select a CUDA overlay asset: no NVIDIA driver CUDA \
                  capability probed (nvidia-smi absent or failed)"
             ));
         };
-        let pick = gh::resolve_cuda_asset(&release, driver_cuda)
+        let pick = gh::resolve_cuda_asset(&release, driver_cuda, sm)
             .ok_or_else(|| anyhow!("no driver-runnable CUDA asset in overlay release {tag}"))?;
         self.install_picked(&release, &pick)
             .await
@@ -234,7 +243,11 @@ impl EngineManager {
     /// Vulkan path stays the universal fallback. Zero-touch: the
     /// overlay repo defaults to the project home; `PALLAMA_ENGINE_REPO`
     /// exists purely for forks.
-    async fn maybe_cuda_overlay(&self, release: &GhRelease) -> Result<Option<EngineRow>> {
+    async fn maybe_cuda_overlay(
+        &self,
+        release: &GhRelease,
+        exact_pin: bool,
+    ) -> Result<Option<EngineRow>> {
         if self.asset_override != "auto" && !self.asset_override.is_empty() {
             return Ok(None); // explicit asset pin wins over every heuristic
         }
@@ -248,29 +261,54 @@ impl EngineManager {
         let Some(number) = gh::btag_number(&release.tag_name) else {
             return Ok(None); // non-b upstream tags never have overlays
         };
-        let (driver_cuda, _) = build::nvidia_gpu_facts().await;
+        let (driver_cuda, cc) = build::nvidia_gpu_facts().await;
+        // Compute capability (8,9) -> sm 89 for the per-arch asset rank.
+        let sm = cc.map(|(maj, min)| maj * 10 + min);
         let Some(driver_cuda) = driver_cuda else {
-            tracing::info!(
-                "NVIDIA GPU present but no CUDA driver capability probed; \
-                 staying on the Vulkan asset lane"
+            tracing::warn!(
+                "NVIDIA GPU present but no CUDA driver capability probed \
+                 (driver installed but not rebooted?); staying on the Vulkan \
+                 lane — after a driver install, reboot then run: pallama \
+                 engine update"
             );
             return Ok(None);
         };
         if driver_cuda.0 < 12 {
-            return Ok(None); // pre-CUDA-12 drivers: keep Vulkan
+            tracing::warn!(
+                "driver CUDA {}.{} predates CUDA 12 — the prebuilt CUDA lane \
+                 is never eligible for it; staying on the Vulkan lane",
+                driver_cuda.0,
+                driver_cuda.1
+            );
+            return Ok(None);
         }
         let overlay_tag = format!("b{number}-cuda");
         let overlay = match self.gh.release_by_tag_repo(&repo, &overlay_tag).await {
             Ok(r) => r,
             Err(e) => {
-                tracing::info!(
-                    "no CUDA overlay release {overlay_tag} in {repo} ({e:#}); \
-                     using the standard asset lane"
+                // Overlay-lag fallback: a channel update must never shunt
+                // an NVIDIA user into the hour-class source lane just
+                // because the overlay has not published the brand-new tag
+                // yet — install the newest PUBLISHED build instead.
+                tracing::warn!(
+                    "no CUDA overlay release {overlay_tag} in {repo} yet \
+                     ({e:#}) — probing published overlay builds as a fallback"
+                );
+                if !exact_pin {
+                    if let Some(row) = self.overlay_lag_fallback(driver_cuda, sm, number).await? {
+                        return Ok(Some(row));
+                    }
+                }
+                tracing::warn!(
+                    "overlay fallback found nothing runnable; using the \
+                     Vulkan lane this update (the overlay publishes on an \
+                     hourly cadence). Local CUDA for THIS driver: pallama \
+                     engine build cuda"
                 );
                 return Ok(None);
             }
         };
-        if let Some(pick) = gh::resolve_cuda_asset(&overlay, driver_cuda) {
+        if let Some(pick) = gh::resolve_cuda_asset(&overlay, driver_cuda, sm) {
             tracing::info!(
                 "installing prebuilt CUDA engine from {repo} {overlay_tag} ({})",
                 pick.label
@@ -281,14 +319,66 @@ impl EngineManager {
                 .with_context(|| format!("install overlay {overlay_tag}"))?;
             Ok(Some(row))
         } else {
-            tracing::info!(
-                "CUDA overlay release {overlay_tag} has no asset this \
-                 driver ({}.{}) can run; staying on the Vulkan lane",
+            let need = gh::newest_asset_cuda(&overlay)
+                .map_or_else(|| "unknown".into(), |(a, b)| format!("{a}.{b}"));
+            tracing::warn!(
+                "CUDA overlay {overlay_tag} needs CUDA {need}; this driver \
+                 runs {}.{} — staying on the Vulkan lane. Options: pallama \
+                 engine build cuda (builds locally for THIS driver), or pin \
+                 an older overlay tag: pallama engine install b<N>-cuda",
                 driver_cuda.0,
                 driver_cuda.1
             );
             Ok(None)
         }
+    }
+
+    /// Overlay-lag fallback for channel updates: the channel target is
+    /// not published in the overlay yet, so install the newest PUBLISHED
+    /// overlay build the driver can run — never newer than the target,
+    /// never the already-active tag (no reinstall churn). A
+    /// minutes-class download beats the hour-class source lane while
+    /// the overlay's hourly freshness watcher catches up.
+    async fn overlay_lag_fallback(
+        &self,
+        driver_cuda: (u32, u32),
+        sm: Option<u32>,
+        target: u64,
+    ) -> Result<Option<EngineRow>> {
+        let repo = gh::engine_overlay_repo();
+        let releases = match self.gh.list_releases_repo(&repo).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("overlay fallback probe of {repo} failed: {e:#}");
+                return Ok(None);
+            }
+        };
+        let Some(pick_rel) = gh::newest_runnable_overlay(&releases, driver_cuda, sm, target) else {
+            return Ok(None);
+        };
+        let active = Store::open(&self.dirs)?.active_engine()?.map(|e| e.tag);
+        if Some(&pick_rel.tag_name) == active.as_ref() {
+            tracing::info!(
+                "newest runnable overlay build {} is already active",
+                pick_rel.tag_name
+            );
+            return Ok(None);
+        }
+        let Some(pick) = gh::resolve_cuda_asset(pick_rel, driver_cuda, sm) else {
+            return Ok(None); // consistency guard; selection pre-filtered
+        };
+        let behind = target.saturating_sub(gh::btag_number(&pick_rel.tag_name).unwrap_or(0));
+        tracing::warn!(
+            "overlay lags the channel target by {behind} build(s): installing \
+             published {} instead ({} asset; fresh overlay builds land hourly)",
+            pick_rel.tag_name,
+            pick.label
+        );
+        let row = self
+            .install_picked(pick_rel, &pick)
+            .await
+            .with_context(|| format!("install overlay fallback {}", pick_rel.tag_name))?;
+        Ok(Some(row))
     }
 
     /// Fresh-asset retry loop shared by every update entry point.
@@ -503,6 +593,45 @@ impl EngineManager {
         )
     }
 
+    /// Install a sglang engine: venv + pip + shim under
+    /// `engines/sglang-<version>`, then the shared register/probe tail.
+    /// `version = None` pins to [`sglang_install::SGLANG_DEFAULT_VERSION`]
+    /// (verified flag contract; see its doc for why not auto-latest).
+    /// F88: every failure path after dir creation removes the dir.
+    pub async fn install_sglang(&self, version: Option<&str>) -> Result<EngineRow> {
+        if !cfg!(target_os = "linux") {
+            anyhow::bail!(
+                "sglang upstream supports Linux (CUDA/ROCm) only; {} is not \
+                 installable here — llamacpp (default) and mistralrs serve \
+                 Windows/macOS",
+                std::env::consts::OS
+            );
+        }
+        let version = version.unwrap_or(sglang_install::SGLANG_DEFAULT_VERSION);
+        // Reject malformed pins early: the tag IS the version string that
+        // probe_sglang's semver parse and pip both consume.
+        if version.is_empty() || !version.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            anyhow::bail!("sglang version must be dotted digits (e.g. 0.5.19), got {version:?}");
+        }
+        let tag = format!("sglang-{version}");
+        let dir = self.dirs.engines_dir().join(&tag);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).context("replace existing engine dir")?;
+        }
+        std::fs::create_dir_all(&dir)?;
+        if let Err(e) = sglang_install::install_into(&dir, version).await {
+            let _ = std::fs::remove_dir_all(&dir); // F88: no orphan dir
+            return Err(e);
+        }
+        self.register_engine(
+            &dir,
+            &tag,
+            &format!("pip:sglang=={version}"),
+            "unverified",
+            EngineKind::Sglang,
+        )
+    }
+
     /// Resolve and install a mistralrs release: explicit `vX.Y.Z` tag or
     /// latest. Asset choice derives from the live driver CUDA version +
     /// compute cap (never a hardcoded compatibility matrix); a fresh
@@ -598,6 +727,9 @@ impl EngineManager {
         let server = match kind {
             EngineKind::LlamaCpp => find_server(dir)?,
             EngineKind::MistralRs => find_engine_binary(dir, &["mistralrs", "mistralrs.exe"])?,
+            // The install lane writes the shim; anything else is a
+            // hand-copied dir, and the shim name is the contract.
+            EngineKind::Sglang => find_engine_binary(dir, &["sglang-server"])?,
         };
         make_executable(&server);
 
@@ -619,6 +751,9 @@ impl EngineManager {
             // cross-check here — an unusable GPU build fails at spawn.
             EngineKind::MistralRs => {
                 tracing::debug!(target: "pallama::engine", "registered mistralrs {tag} ({asset_label}); device use follows the asset label");
+            }
+            EngineKind::Sglang => {
+                tracing::debug!(target: "pallama::engine", "registered sglang {tag} ({asset_label})");
             }
         }
         let row = EngineRow {
@@ -709,8 +844,18 @@ impl EngineManager {
     pub fn prune(&self, store: &Store) -> Result<()> {
         let engines = store.list_engines()?; // newest first
         let active = engines.iter().find(|e| e.active).map(|e| e.tag.clone());
-        for e in engines.iter().skip(KEEP_TAGS) {
-            if e.tag == LOCAL_TAG || Some(&e.tag) == active.as_ref() {
+        // Retention is scoped per engine KIND: a mistral.rs build is never
+        // a rollback anchor for an active llama.cpp engine (and vice
+        // versa), so each lane keeps its own newest KEEP_TAGS. Kind-blind
+        // retention deleted cross-lane engines on back-to-back installs
+        // (mistralrs install pruned the active CUDA engine; the CUDA
+        // reinstall then pruned sglang).
+        let mut kept_per_kind: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        for e in engines.iter() {
+            let seen = kept_per_kind.entry(e.kind.as_str()).or_insert(0);
+            *seen += 1;
+            if *seen <= KEEP_TAGS || e.tag == LOCAL_TAG || Some(&e.tag) == active.as_ref() {
                 continue;
             }
             let dir = self.dirs.engines_dir().join(&e.tag);

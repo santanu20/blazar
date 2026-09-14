@@ -147,6 +147,7 @@ pub fn probe_kind(
     match kind {
         pallama_core::engine_kind::EngineKind::LlamaCpp => probe(server_path, tag),
         pallama_core::engine_kind::EngineKind::MistralRs => probe_mistralrs(server_path, tag),
+        pallama_core::engine_kind::EngineKind::Sglang => probe_sglang(server_path, tag),
     }
 }
 
@@ -203,6 +204,100 @@ fn probe_mistralrs(server_path: &Path, tag: &str) -> Result<Manifest> {
     Ok(Manifest {
         tag: tag.to_string(),
         build_number,
+        version_raw,
+        devices: Vec::new(),
+        flags,
+        spec_types: Vec::new(),
+        server_path: server.to_string(),
+    })
+}
+
+/// Probe a sglang venv install through its shim script. Layout contract
+/// (`sglang_install.rs)`: `engines/<tag>/sglang-server` is an executable
+/// shim `exec <dir>/venv/bin/python -m sglang.launch_server "$@"`, so
+/// the shim's sibling `venv/` holds the interpreter.
+///
+/// Divergences from the other engines (verified against sglang v0.5.19):
+/// - no `--version` flag on `launch_server`; the version comes from
+///   `importlib.metadata` against the venv python (a metadata read — no
+///   torch import, seconds even cold).
+/// - flags come from `launch_server --help` (standard argparse renderer,
+///   `server_args.py:345 add_cli_args`) — but the import chain behind it
+///   pulls torch, so the FIRST cold run can take a minute: 120s budget.
+/// - NEVER probe with zero args: a bare `launch_server` starts serving
+///   and never exits (same wedge class as mistralrs).
+fn probe_sglang(server_path: &Path, tag: &str) -> Result<Manifest> {
+    let server = server_path
+        .to_str()
+        .ok_or_else(|| anyhow!("non-UTF-8 engine path {}", server_path.display()))?;
+    let venv_python = server_path
+        .parent()
+        .ok_or_else(|| anyhow!("engine path {server} has no parent dir"))?
+        .join("venv")
+        .join("bin")
+        .join("python");
+
+    // Version: importlib metadata read. Strict — a broken venv must fail
+    // the probe here with the venv path named, not at spawn.
+    let version_out = crate::probe::probe_output(
+        Command::new(&venv_python)
+            .arg("-c")
+            .arg("import importlib.metadata as m; print(m.version('sglang'))"),
+        30,
+    )
+    .with_context(|| {
+        format!(
+            "run {} -c importlib.metadata (sglang venv broken?)",
+            venv_python.display()
+        )
+    })?;
+    if !version_out.status.success() {
+        return Err(anyhow!(
+            "sglang version probe exited {}: {}",
+            version_out.status,
+            String::from_utf8_lossy(&version_out.stderr)
+        ));
+    }
+    let version_raw = format!(
+        "sglang {}",
+        String::from_utf8_lossy(&version_out.stdout).trim()
+    );
+
+    // Display-only serial from the install tag (sglang-0.5.19 ->
+    // 0000005019): keeps `engine list` sortable, same convention as the
+    // mistralrs lane.
+    let tag_serial = tag
+        .strip_prefix("sglang-")
+        .and_then(|rest| rest.split(['-', '+']).next())
+        .and_then(|v| {
+            let mut it = v.split('.');
+            let maj = it.next()?.parse::<u64>().ok()?;
+            let min = it.next().unwrap_or("0").parse::<u64>().ok()?;
+            let patch = it.next().unwrap_or("0").parse::<u64>().ok()?;
+            Some(maj * 1_000_000 + min * 1_000 + patch)
+        })
+        .unwrap_or(0);
+
+    // Flags: launch_server --help via the shim. Argparse renderer, so
+    // parse_help applies. Torch import behind it: 120s cold budget. A
+    // zero-token parse is a FORMAT change upstream — treat as probe
+    // failure (fail fast) rather than degrading every gated emission.
+    let help_out = crate::probe::probe_output(Command::new(server).arg("--help"), 120)
+        .with_context(|| {
+            format!("run {server} --help (sglang import chain can take a minute cold)")
+        })?;
+    let help = String::from_utf8_lossy(&help_out.stdout).to_string();
+    let (flags, _) = parse_help(&help);
+    if flags.is_empty() {
+        return Err(anyhow!(
+            "sglang --help parsed to zero flags (output format changed upstream?): {}",
+            help.lines().take(3).collect::<Vec<_>>().join(" | ")
+        ));
+    }
+
+    Ok(Manifest {
+        tag: tag.to_string(),
+        build_number: tag_serial,
         version_raw,
         devices: Vec::new(),
         flags,
@@ -459,6 +554,70 @@ options:
             "{msg}"
         );
     }
+
+    // ------------------------------------------------------------------
+    // sglang probe: venv-version + argparse --help contract
+    // ------------------------------------------------------------------
+
+    #[cfg(unix)]
+    fn fake_sglang_install(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let root = dir.join("sglang-0.5.19");
+        std::fs::create_dir_all(root.join("venv/bin")).expect("venv dir");
+        // version stub: prints like importlib.metadata regardless of args
+        std::fs::write(root.join("venv/bin/python"), "#!/bin/sh\necho 0.5.19\n")
+            .expect("python stub");
+        // shim stub: argparse-style help surface
+        std::fs::write(
+            root.join("sglang-server"),
+            "#!/bin/sh\nprintf 'usage: launch_server [options]\\n\\noptions:\\n  --model-path MODEL_PATH\\n  --context-length N\\n  --mem-fraction-static F\\n  --kv-cache-dtype DTYPE\\n'\n",
+        )
+        .expect("shim stub");
+        for f in ["venv/bin/python", "sglang-server"] {
+            let p = root.join(f);
+            let mut perm = std::fs::metadata(&p).expect("meta").permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(p, perm).expect("chmod");
+        }
+        root.join("sglang-server")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unit__probe_sglang__stub_venv_yields_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shim = fake_sglang_install(dir.path());
+        let m = probe_sglang(&shim, "sglang-0.5.19").expect("probe");
+        assert_eq!(m.tag, "sglang-0.5.19");
+        assert_eq!(m.version_raw, "sglang 0.5.19");
+        assert_eq!(m.build_number, 5_019);
+        assert!(m.flags.contains("--model-path"), "{:?}", m.flags);
+        assert!(m.flags.contains("--context-length"), "{:?}", m.flags);
+        assert!(m.flags.contains("--mem-fraction-static"), "{:?}", m.flags);
+        assert!(m.flags.contains("--kv-cache-dtype"), "{:?}", m.flags);
+        assert!(m.devices.is_empty());
+        assert!(m.spec_types.is_empty());
+        assert_eq!(m.server_path, shim);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unit__probe_sglang__broken_venv_fails_naming_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        // shim exists, venv does not: strict version probe must fail and
+        // name the venv python path (fail at probe, not at first spawn).
+        let root = dir.path().join("sglang-0.5.19");
+        std::fs::create_dir_all(&root).expect("dir");
+        let shim = root.join("sglang-server");
+        std::fs::write(&shim, "#!/bin/sh\nexit 0\n").expect("shim");
+        let mut perm = std::fs::metadata(&shim).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&shim, perm).unwrap();
+        let err = probe_sglang(&shim, "sglang-0.5.19").expect_err("must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("venv"), "{msg}");
+    }
 }
 
 #[cfg(test)]
@@ -469,9 +628,12 @@ mod live_census_tests {
     #[cfg(unix)]
     #[test]
     fn unit__run_list_devices__parses_live_census_output() {
-        let dir = std::env::temp_dir().join(format!("pallama-census-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let script = dir.join("fake-server");
+        // tempfile guard: an earlier revision hand-rolled the fixture dir
+        // and removed only the script file — every `cargo test` leaked an
+        // empty /tmp/pallama-census-<pid> dir (200+ accumulated on the
+        // dev box before this was noticed).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("fake-server");
         std::fs::write(
             &script,
             "#!/bin/sh\nprintf 'Available devices:\\n  CUDA0: NVIDIA CUDA (7805 MiB, 1200 MiB free)\\n'\n",
@@ -483,7 +645,6 @@ mod live_census_tests {
         assert_eq!(devices[0].name, "CUDA0");
         assert_eq!(devices[0].total_mib, 7805);
         assert_eq!(devices[0].free_mib, 1200);
-        std::fs::remove_file(&script).ok();
     }
 
     #[test]

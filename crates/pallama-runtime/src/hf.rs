@@ -373,6 +373,153 @@ fn finish(
     }
 }
 
+/// Root-level non-weight files of an HF model repo that the
+/// safetensors lane downloads alongside the shards.
+const HF_AUX_FILES: &[&str] = &[
+    "config.json",
+    "generation_config.json",
+    "model.safetensors.index.json",
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "vocab.json",
+    "merges.txt",
+    "vocab.txt",
+    "preprocessor_config.json",
+    "processor_config.json",
+];
+
+/// Selection for the safetensors (sglang) lane.
+#[derive(Debug, Clone)]
+pub struct SafetensorsSelection {
+    /// Aux files (config/tokenizer/index) first, then shards in filename
+    /// order — a partial pull keeps the small metadata early.
+    pub files: Vec<FilePlan>,
+    pub shard_count: usize,
+}
+
+/// Pick the safetensors file set from repo siblings: every ROOT-level
+/// `*.safetensors` shard plus the loader/config/tokenizer allowlist.
+/// Nested trees (`original/`, `onnx/`, `consolidated/`) and foreign
+/// formats (`.bin`, `.pth`) are skipped — the sglang lane loads the
+/// canonical HF layout only. `config.json` is mandatory (H1: a dir
+/// without it is unloadable; fail at pull time with a teaching error).
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // operand pre-lowercased
+pub fn select_safetensors_files(siblings: &[HfSibling]) -> Result<SafetensorsSelection> {
+    let mut aux = Vec::new();
+    let mut shards = Vec::new();
+    for s in siblings.iter().filter(|s| !s.rfilename.contains('/')) {
+        let lower = s.rfilename.to_lowercase();
+        if lower.ends_with(".safetensors") {
+            shards.push(plan(s));
+        } else if lower.ends_with(".jinja") || HF_AUX_FILES.contains(&lower.as_str()) {
+            aux.push(plan(s));
+        }
+    }
+    if shards.is_empty() {
+        return Err(anyhow!("repo has no root-level .safetensors shards"));
+    }
+    if !aux
+        .iter()
+        .any(|a| a.filename.eq_ignore_ascii_case("config.json"))
+    {
+        return Err(anyhow!(
+            "repo has safetensors shards but no config.json — not a loadable HF model repo"
+        ));
+    }
+    aux.sort_by(|a, b| a.filename.cmp(&b.filename));
+    shards.sort_by(|a, b| a.filename.cmp(&b.filename));
+    let shard_count = shards.len();
+    aux.extend(shards);
+    Ok(SafetensorsSelection {
+        files: aux,
+        shard_count,
+    })
+}
+
+/// Stable identity of a repo revision for dir rows: sha256 over the
+/// sorted `filename:bytes:sha` lines of the full selection.
+fn revision_digest(files: &[FilePlan]) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    let mut lines: Vec<String> = files
+        .iter()
+        .map(|f| {
+            format!(
+                "{}:{}:{}",
+                f.filename,
+                f.bytes,
+                f.sha256.as_deref().unwrap_or("-")
+            )
+        })
+        .collect();
+    lines.sort();
+    for l in lines {
+        h.update(l.as_bytes());
+        h.update(b"\n");
+    }
+    format!("{:x}", h.finalize())
+}
+
+/// Is the pulled dir complete? Every planned file present with the
+/// exact listed size (cheap metadata check — downloads already
+/// sha-verified each file).
+fn safetensors_dir_intact(dir: &Path, sel: &SafetensorsSelection) -> bool {
+    sel.files.iter().all(|f| {
+        std::fs::metadata(dir.join(&f.filename)).is_ok_and(|m| {
+            // A missing sibling size (0) can only be confirmed by
+            // re-download; treat as not intact.
+            f.bytes > 0 && m.len() == f.bytes
+        })
+    })
+}
+
+/// Post-download integrity: every shard named by
+/// `model.safetensors.index.json` (the repo's own manifest) must be on
+/// disk. Missing = the download is incomplete or the repo layout is
+/// non-canonical — refuse now instead of at engine spawn.
+fn verify_index_coverage(dir: &Path) -> Result<()> {
+    let idx = dir.join("model.safetensors.index.json");
+    if !idx.is_file() {
+        return Ok(());
+    }
+    let raw = std::fs::read_to_string(&idx).with_context(|| format!("read {}", idx.display()))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", idx.display()))?;
+    let Some(map) = v.get("weight_map").and_then(serde_json::Value::as_object) else {
+        return Ok(());
+    };
+    for shard in map.values().filter_map(serde_json::Value::as_str) {
+        if !dir.join(shard).is_file() {
+            return Err(anyhow!(
+                "shard {shard} named by model.safetensors.index.json is missing from the download"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Display quant label for an HF model dir: quantization bits when the
+/// repo carries a `quantization_config`, else the weight dtype. Uses
+/// the HF-side vocabulary (BIT/BF16/FP16/F32/FP8), not llama quant
+/// names — labels stay truthful for `est_params`.
+fn hf_quant_label(meta: &pallama_core::hfmeta::HfMeta) -> String {
+    if let Some(bits) = meta.quant_bits {
+        return format!("{bits}BIT");
+    }
+    let d = meta.dtype.as_deref().map(str::to_lowercase);
+    match d.as_deref() {
+        Some(x) if x.starts_with("float8") || x.starts_with("fp8") => "FP8".to_string(),
+        Some("bfloat16" | "bf16") => "BF16".to_string(),
+        Some("float16" | "f16" | "fp16") => "FP16".to_string(),
+        Some("float32" | "f32") => "F32".to_string(),
+        Some(x) => x.to_uppercase(),
+        None => "SAFETENSORS".to_string(),
+    }
+}
+
 /// Rough bits-per-weight for a quant label; display-only param estimation.
 fn quant_bpw(quant: &str) -> f64 {
     let q = quant.to_lowercase();
@@ -383,15 +530,16 @@ fn quant_bpw(quant: &str) -> f64 {
         "q3_k_l" => 4.27,
         "q4_0" | "q4_1" => 4.55,
         "iq4_xs" => 4.25,
-        "q4_k_s" => 4.5,
         "q4_k_m" => 4.85,
         "q5_0" | "q5_1" => 5.7,
         "q5_k_s" => 5.54,
         "q5_k_m" => 5.69,
         "q6_k" => 6.59,
-        "q8_0" => 8.5,
+        "q8_0" | "fp8" | "8bit" => 8.5,
         "fp16" | "f16" | "bf16" => 16.0,
         "f32" => 32.0,
+        // HF-side labels from the safetensors lane (hf_quant_label).
+        "q4_k_s" | "4bit" => 4.5,
         _ => 5.0,
     }
 }
@@ -1115,6 +1263,38 @@ pub(crate) fn repull_gate(
     }
 }
 
+/// Assemble the store row for a fully-downloaded safetensors dir:
+/// metadata from config.json, quant label from `quantization_config` /
+/// dtype, byte totals from the selection. Kept beside the GGUF row
+/// builders so the row dialect stays in one place.
+fn safetensors_model_row(
+    name: &str,
+    repo: &str,
+    dir: &std::path::Path,
+    sel: &SafetensorsSelection,
+    digest: String,
+) -> Result<ModelRow> {
+    let meta = pallama_core::hfmeta::read_hf_config(dir)
+        .map_err(|e| anyhow!("hf model dir {} unusable: {e}", dir.display()))?;
+    let quant = hf_quant_label(&meta);
+    let bytes: u64 = sel.files.iter().map(|f| f.bytes).sum();
+    Ok(ModelRow {
+        name: name.to_string(),
+        repo: repo.to_string(),
+        quant: quant.clone(),
+        path: dir.display().to_string(),
+        bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
+        sha256: Some(digest),
+        mmproj_path: None,
+        shards: i64::try_from(sel.shard_count).unwrap_or(i64::MAX),
+        arch: (!meta.architecture.is_empty()).then(|| meta.architecture.clone()),
+        params: Some(est_params(bytes, &quant)),
+        ctx_train: meta.ctx_train.and_then(|c| i64::try_from(c).ok()),
+        pulled_at: i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+            .unwrap_or(i64::MAX),
+    })
+}
+
 impl Puller {
     /// Pull a model into the store. `target` = `owner/repo[:QUANT]` or a
     /// catalog short name. The quant slot may instead carry an exact
@@ -1130,6 +1310,38 @@ impl Puller {
 
     async fn pull_locked(&self, target: &PullTarget, name: &str) -> Result<PullOutcome> {
         let info = self.client.model_info(&target.repo).await?;
+        // Lane fork: GGUF files (llamacpp/mistralrs engines) vs a
+        // safetensors model directory (sglang engine). A repo with BOTH
+        // keeps the GGUF lane — existing behavior unchanged; the log
+        // teaches the safetensors half exists.
+        let has_gguf = info
+            .siblings
+            .iter()
+            .any(|s| s.rfilename.to_lowercase().ends_with(".gguf"));
+        if !has_gguf {
+            if info
+                .siblings
+                .iter()
+                .any(|s| s.rfilename.to_lowercase().ends_with(".safetensors"))
+            {
+                return self.pull_safetensors_locked(target, name, &info).await;
+            }
+            return Err(anyhow!(
+                "repo {} has no .gguf or .safetensors model files",
+                target.repo
+            ));
+        }
+        if info
+            .siblings
+            .iter()
+            .any(|s| s.rfilename.to_lowercase().ends_with(".safetensors"))
+        {
+            tracing::info!(
+                model = %name,
+                "repo {} also hosts safetensors weights; pulling the GGUF lane (llamacpp/mistralrs)",
+                target.repo
+            );
+        }
         let selected = select_files(&info.siblings, &target.quant)?;
 
         let store = Store::open(&self.dirs)?;
@@ -1196,6 +1408,128 @@ impl Puller {
                 selected.quant
             );
         }
+        Ok(PullOutcome {
+            row,
+            already_present: false,
+        })
+    }
+
+    /// Safetensors lane: the repo has no GGUFs, so the model is an HF
+    /// transformers repo (sharded `*.safetensors` + config + tokenizer).
+    /// Everything lands in a `models/<name>.d/` directory consumed by the
+    /// sglang engine; the row's `path` is the directory. Identity = a
+    /// digest over the full file listing (name+size+sha), so a re-pull
+    /// of the same revision is a no-op and a moved tag replaces cleanly.
+    async fn pull_safetensors_locked(
+        &self,
+        target: &PullTarget,
+        name: &str,
+        info: &HfModelInfo,
+    ) -> Result<PullOutcome> {
+        let sel = select_safetensors_files(&info.siblings)?;
+        let digest = revision_digest(&sel.files);
+        let dir = self.dirs.models_dir().join(format!("{name}.d"));
+        let store = Store::open(&self.dirs)?;
+
+        if let Some(row) = store.get_model(name)?.as_ref() {
+            let same_revision = row.repo == target.repo
+                && row
+                    .sha256
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case(&digest));
+            if same_revision && safetensors_dir_intact(&dir, &sel) {
+                let total = u64::try_from(row.bytes).unwrap_or(0);
+                self.bus.publish(PallamaEvent::PullProgress {
+                    name: name.to_string(),
+                    downloaded: total,
+                    total,
+                });
+                self.bus.publish(PallamaEvent::ModelPulled {
+                    name: name.to_string(),
+                    warning: None,
+                });
+                return Ok(PullOutcome {
+                    row: row.clone(),
+                    already_present: true,
+                });
+            }
+            // Different revision (or damaged dir): replace. A previous
+            // dir row at a different path is removed wholesale; a GGUF
+            // row under the same name goes through the shared pruner.
+            let old_path = Path::new(&row.path);
+            if old_path.is_dir() {
+                if old_path != dir.as_path() {
+                    if let Err(e) = std::fs::remove_dir_all(old_path) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            tracing::warn!(
+                                model = %name,
+                                "could not remove replaced dir {}: {e}",
+                                old_path.display()
+                            );
+                        }
+                    }
+                }
+            } else {
+                prune_replaced(name, row, &[], "replaced by a safetensors pull");
+            }
+        }
+
+        if dir.exists() {
+            tracing::info!(
+                model = %name,
+                "reusing {} — completed files re-verify, files dropped upstream are left in place",
+                dir.display()
+            );
+        }
+        std::fs::create_dir_all(&dir)?;
+
+        let total_bytes: u64 = sel.files.iter().map(|f| f.bytes).sum();
+        let bar = indicatif::ProgressBar::new(total_bytes);
+        bar.set_style(
+            indicatif::ProgressStyle::default_bar()
+                .template("{msg} {bar:30} {bytes}/{total_bytes} ({eta})")
+                .expect("valid template"),
+        );
+        bar.set_message(format!("pull {name} (safetensors)"));
+        let mut last_publish = 0u64;
+        let mut progress = |downloaded: u64, total: u64| {
+            bar.set_position(downloaded);
+            if downloaded.saturating_sub(last_publish) >= 16 << 20 || downloaded == total {
+                last_publish = downloaded;
+                self.bus.publish(PallamaEvent::PullProgress {
+                    name: name.to_string(),
+                    downloaded,
+                    total,
+                });
+            }
+        };
+
+        for (i, file) in sel.files.iter().enumerate() {
+            let before: u64 = sel.files[..i].iter().map(|f| f.bytes).sum();
+            let mut progress_one = |d: u64, t: u64| progress(before + d.min(t), total_bytes);
+            let dest = dir.join(&file.filename);
+            self.client
+                .download_file(&target.repo, file, &dest, &mut progress_one)
+                .await
+                .inspect_err(|e| {
+                    self.bus.publish(PallamaEvent::PullFailed {
+                        name: name.to_string(),
+                        error: e.to_string(),
+                    });
+                })?;
+        }
+        bar.finish_and_clear();
+
+        // Integrity: the shard index is the repo's own manifest — every
+        // shard it names must be on disk (H1: fail now, not at load).
+        verify_index_coverage(&dir)?;
+
+        let row = safetensors_model_row(name, &target.repo, &dir, &sel, digest)?;
+        store.upsert_model(&row)?;
+        self.bus.publish(PallamaEvent::ModelPulled {
+            name: name.to_string(),
+            warning: None,
+        });
         Ok(PullOutcome {
             row,
             already_present: false,
@@ -2863,6 +3197,263 @@ mod tests {
         let lock = dirs.run_dir().join("pull-slow-q4_k_m.lock");
         assert!(!lock.exists(), "lock must release on cancel, got {lock:?}");
         assert!(PullLock::acquire(&dirs, "slow-q4_k_m").is_ok());
+    }
+
+    fn sib_st(name: &str, size: u64, sha: &str) -> HfSibling {
+        // Non-LFS small files carry no lfs object (config/tokenizer shape).
+        let v = if sha.is_empty() || sha == "-" {
+            serde_json::json!({"rfilename": name, "size": size})
+        } else {
+            serde_json::json!({"rfilename": name, "size": size,
+                "lfs": {"sha256": sha, "size": size}})
+        };
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn unit__select_safetensors_files__shards_aux_skip_nested_and_foreign() {
+        let sibs = vec![
+            sib_st("config.json", 10, "-"),
+            sib_st("generation_config.json", 5, "-"),
+            sib_st("tokenizer.json", 7, "-"),
+            sib_st("model.safetensors.index.json", 9, "-"),
+            sib_st("model-00002-of-00002.safetensors", 200, "bb"),
+            sib_st("model-00001-of-00002.safetensors", 100, "aa"),
+            sib_st("chat_template.jinja", 3, "-"),
+            sib_st("original/model-00001-of-00002.safetensors", 999, "zz"), // nested
+            sib_st("pytorch_model.bin", 500, "-"),                          // foreign
+            sib_st("README.md", 2, "-"),                                    // doc
+        ];
+        let sel = select_safetensors_files(&sibs).unwrap();
+        assert_eq!(sel.shard_count, 2);
+        let names: Vec<&str> = sel.files.iter().map(|f| f.filename.as_str()).collect();
+        // Aux sorted first, shards sorted after; nested/bin/README absent.
+        assert_eq!(
+            names,
+            [
+                "chat_template.jinja",
+                "config.json",
+                "generation_config.json",
+                "model.safetensors.index.json",
+                "tokenizer.json",
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+            ]
+        );
+    }
+
+    #[test]
+    fn unit__select_safetensors_files__missing_config_is_teaching_error() {
+        let sibs = vec![sib_st("model.safetensors", 10, "a")];
+        let err = select_safetensors_files(&sibs).unwrap_err();
+        assert!(err.to_string().contains("config.json"), "{err}");
+    }
+
+    #[test]
+    fn unit__select_safetensors_files__no_shards_is_error() {
+        let sibs = vec![sib_st("config.json", 10, "-")];
+        assert!(select_safetensors_files(&sibs).is_err());
+    }
+
+    #[test]
+    fn unit__hf_quant_label__bits_dtype_default() {
+        let m = |quant_bits: Option<u8>, dtype: Option<&str>| pallama_core::hfmeta::HfMeta {
+            quant_bits,
+            dtype: dtype.map(str::to_string),
+            ..Default::default()
+        };
+        assert_eq!(hf_quant_label(&m(Some(4), None)), "4BIT");
+        assert_eq!(hf_quant_label(&m(Some(8), Some("bfloat16"))), "8BIT");
+        assert_eq!(hf_quant_label(&m(None, Some("bfloat16"))), "BF16");
+        assert_eq!(hf_quant_label(&m(None, Some("float16"))), "FP16");
+        assert_eq!(hf_quant_label(&m(None, Some("float32"))), "F32");
+        assert_eq!(hf_quant_label(&m(None, Some("float8_e4m3fn"))), "FP8");
+        assert_eq!(hf_quant_label(&m(None, Some("custom"))), "CUSTOM");
+        assert_eq!(hf_quant_label(&m(None, None)), "SAFETENSORS");
+    }
+
+    #[test]
+    fn unit__revision_digest__order_independent_content_sensitive() {
+        let a = FilePlan {
+            filename: "a".into(),
+            bytes: 1,
+            sha256: Some("x".into()),
+        };
+        let b = FilePlan {
+            filename: "b".into(),
+            bytes: 2,
+            sha256: None,
+        };
+        assert_eq!(
+            revision_digest(&[a.clone(), b.clone()]),
+            revision_digest(&[b.clone(), a.clone()])
+        );
+        let c = FilePlan {
+            filename: "a".into(),
+            bytes: 3,
+            sha256: Some("x".into()),
+        };
+        assert_ne!(revision_digest(&[a, b.clone()]), revision_digest(&[c, b]));
+    }
+
+    #[tokio::test]
+    async fn integration__safetensors_pull__dir_row_then_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = PallamaDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        dirs.ensure().unwrap();
+
+        let config = br#"{"architectures":["Qwen2ForCausalLM"],"model_type":"qwen2",
+            "max_position_embeddings":32768,"torch_dtype":"bfloat16","num_hidden_layers":28,
+            "num_attention_heads":14,"num_key_value_heads":2,"head_dim":128}"#
+            .to_vec();
+        let index = br#"{"metadata":{"total_size":300},"weight_map":{
+            "a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors"}}"#
+            .to_vec();
+        let shard1 = b"SHARD1-BYTES".to_vec();
+        let shard2 = b"SHARD2-BYTES-LONGER".to_vec();
+        let files: Vec<(&str, Vec<u8>, bool)> = vec![
+            ("config.json", config.clone(), false),
+            ("generation_config.json", b"{}".to_vec(), false),
+            ("tokenizer.json", b"{}".to_vec(), false),
+            ("model.safetensors.index.json", index.clone(), false),
+            ("model-00001-of-00002.safetensors", shard1.clone(), true),
+            ("model-00002-of-00002.safetensors", shard2.clone(), true),
+        ];
+        let siblings: Vec<serde_json::Value> = files
+            .iter()
+            .map(|(n, b, lfs)| {
+                let sha = payload(b);
+                sibling_json_cond(n, b.len() as u64, &sha, *lfs)
+            })
+            .chain([serde_json::json!({"rfilename": "original/model.bin", "size": 500})])
+            .collect();
+
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/models/Qwen/Qwen2.5-0.5B-Instruct"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "siblings": siblings
+            })))
+            .mount(&api)
+            .await;
+        let dl = MockServer::start().await;
+        for (name, body, _) in &files {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/{name}"
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+                .mount(&dl)
+                .await;
+        }
+
+        let client = HfClient::with_bases(
+            &api.uri(),
+            &dl.uri(),
+            None,
+            vec![host_of(&api.uri()), host_of(&dl.uri())],
+        )
+        .unwrap();
+        let puller = Puller {
+            dirs: dirs.clone(),
+            client,
+            bus: EventBus::default(),
+        };
+        let outcome = puller.pull("Qwen/Qwen2.5-0.5B-Instruct").await.unwrap();
+        let dir = dirs.models_dir().join("qwen2.5-0.5b-instruct.d");
+        assert_eq!(outcome.row.path, dir.display().to_string());
+        assert_eq!(outcome.row.shards, 2);
+        assert_eq!(outcome.row.quant, "BF16");
+        assert_eq!(outcome.row.arch.as_deref(), Some("Qwen2ForCausalLM"));
+        assert_eq!(outcome.row.ctx_train, Some(32768));
+        let bytes = files.iter().map(|(_, b, _)| b.len() as u64).sum::<u64>();
+        assert_eq!(u64::try_from(outcome.row.bytes).unwrap(), bytes);
+        for (name, body, _) in &files {
+            assert_eq!(
+                std::fs::read(dir.join(name)).unwrap(),
+                *body,
+                "{name} must be on disk"
+            );
+        }
+        assert!(!dir.join("original").exists(), "nested files never pulled");
+
+        // Second pull of the same revision: no-op, zero download bytes.
+        let before = dl.received_requests().await.unwrap_or_default().len();
+        let again = puller.pull("Qwen/Qwen2.5-0.5B-Instruct").await.unwrap();
+        assert!(again.already_present, "same revision must short-circuit");
+        let after = dl.received_requests().await.unwrap_or_default().len();
+        assert_eq!(before, after, "no download requests on re-pull");
+    }
+
+    #[tokio::test]
+    async fn integration__safetensors_pull__index_names_missing_shard_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = PallamaDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        dirs.ensure().unwrap();
+
+        let config = br#"{"architectures":["Qwen2ForCausalLM"]}"#.to_vec();
+        // Index names a shard the repo listing never had: the download
+        // completes, the coverage gate must refuse (H1).
+        let index =
+            br#"{"weight_map":{"a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors"}}"#
+                .to_vec();
+        let files: Vec<(&str, Vec<u8>, bool)> = vec![
+            ("config.json", config, false),
+            ("model.safetensors.index.json", index, false),
+            ("model-00001-of-00002.safetensors", b"ONE".to_vec(), true),
+        ];
+        let siblings: Vec<serde_json::Value> = files
+            .iter()
+            .map(|(n, b, lfs)| sibling_json_cond(n, b.len() as u64, &payload(b), *lfs))
+            .collect();
+
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/models/o/m"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "siblings": siblings
+            })))
+            .mount(&api)
+            .await;
+        let dl = MockServer::start().await;
+        for (name, body, _) in &files {
+            Mock::given(method("GET"))
+                .and(path(format!("/o/m/resolve/main/{name}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+                .mount(&dl)
+                .await;
+        }
+        let client = HfClient::with_bases(
+            &api.uri(),
+            &dl.uri(),
+            None,
+            vec![host_of(&api.uri()), host_of(&dl.uri())],
+        )
+        .unwrap();
+        let puller = Puller {
+            dirs,
+            client,
+            bus: EventBus::default(),
+        };
+        let err = puller.pull("o/m").await.unwrap_err();
+        assert!(
+            err.to_string().contains("missing from the download"),
+            "{err}"
+        );
+    }
+
+    fn sibling_json_cond(name: &str, size: u64, sha: &str, lfs: bool) -> serde_json::Value {
+        serde_json::json!({
+            "rfilename": name,
+            "size": size,
+            "lfs": lfs.then(|| serde_json::json!({"sha256": sha, "size": size}))
+        })
     }
 
     fn host_of(uri: &str) -> String {

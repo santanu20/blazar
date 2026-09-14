@@ -119,6 +119,10 @@ pub struct Toolchain {
     pub cxx: Option<PathBuf>,
     pub nvcc: Option<PathBuf>,
     pub nvidia_smi: Option<PathBuf>,
+    /// Optional compile-cache launcher (`ccache`/`sccache`). Purely an
+    /// accelerator: absent means an uncached build, never an error, and
+    /// `require_toolchain` deliberately never demands it.
+    pub compiler_cache: Option<PathBuf>,
 }
 
 /// Find `names` in order, first hit wins, across the given search path.
@@ -149,6 +153,7 @@ pub fn detect_toolchain(search: &[PathBuf]) -> Toolchain {
         cxx: find_bin(&search, &["g++", "c++", "clang++"]),
         nvcc: find_bin(&search, &["nvcc"]),
         nvidia_smi: find_bin(&search, &["nvidia-smi"]),
+        compiler_cache: find_bin(&search, &["ccache", "sccache"]),
     }
 }
 
@@ -266,6 +271,7 @@ pub fn cmake_configure_args(
     backend: BuildBackend,
     arch: Option<&str>,
     host_compiler: Option<&Path>,
+    compiler_cache: Option<&Path>,
 ) -> Vec<String> {
     let mut args = vec![
         "-DCMAKE_BUILD_TYPE=Release".to_string(),
@@ -296,6 +302,18 @@ pub fn cmake_configure_args(
         }
         if let Some(hc) = host_compiler {
             args.push(format!("-DCMAKE_CUDA_HOST_COMPILER={}", hc.display()));
+        }
+    }
+    if let Some(cache) = compiler_cache {
+        // A launcher cache gives repeat builds their speed WITHOUT a
+        // persistent build dir: the fresh-tempdir-per-build discipline
+        // (probe-after-teardown, see `build_and_install`) stays intact,
+        // while unchanged translation units come from the cache.
+        let c = cache.display();
+        args.push(format!("-DCMAKE_C_COMPILER_LAUNCHER={c}"));
+        args.push(format!("-DCMAKE_CXX_COMPILER_LAUNCHER={c}"));
+        if backend == BuildBackend::Cuda {
+            args.push(format!("-DCMAKE_CUDA_COMPILER_LAUNCHER={c}"));
         }
     }
     args
@@ -472,8 +490,21 @@ impl EngineManager {
             let src = fetch_source(build_root.path(), &tc, opts, &tag, on_line).await?;
 
             let bld = build_root.path().join("build");
-            let args =
-                cmake_configure_args(opts.backend, arch.as_deref(), host_compiler.as_deref());
+            if let Some(cache) = &tc.compiler_cache {
+                let name = cache.file_name().map_or_else(
+                    || cache.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
+                (on_line)(&format!(
+                    "compiler cache: {name} — repeat builds skip recompiling"
+                ));
+            }
+            let args = cmake_configure_args(
+                opts.backend,
+                arch.as_deref(),
+                host_compiler.as_deref(),
+                tc.compiler_cache.as_deref(),
+            );
             (on_line)(&format!("configuring {tag} ({})", args.join(" ")));
             let mut cfg = tokio::process::Command::new(tc.cmake.clone().context("cmake gone")?);
             cfg.arg("-S").arg(&src).arg("-B").arg(&bld);
@@ -865,6 +896,7 @@ mod tests {
             BuildBackend::Cuda,
             Some("89"),
             Some(Path::new("/usr/bin/g++-12")),
+            None,
         );
         assert!(cuda.contains(&"-DGGML_CUDA=ON".to_string()));
         assert!(cuda.contains(&"-DCMAKE_CUDA_ARCHITECTURES=89".to_string()));
@@ -872,9 +904,25 @@ mod tests {
         assert!(cuda.contains(&"-DLLAMA_CURL=ON".to_string()));
         // rpc tool parity with prebuilts (gates ggml-rpc-server target)
         assert!(cuda.contains(&"-DGGML_RPC=ON".to_string()));
-        let cpu = cmake_configure_args(BuildBackend::Cpu, None, None);
+        let cpu = cmake_configure_args(BuildBackend::Cpu, None, None, None);
         assert!(cpu.contains(&"-DGGML_RPC=ON".to_string()));
         assert!(cpu.iter().all(|a| !a.contains("CUDA")));
+    }
+
+    #[test]
+    fn unit__cmake_args__compiler_cache_launchers() {
+        let cache = Path::new("/usr/bin/ccache");
+        let cuda = cmake_configure_args(BuildBackend::Cuda, None, None, Some(cache));
+        assert!(cuda.contains(&"-DCMAKE_C_COMPILER_LAUNCHER=/usr/bin/ccache".to_string()));
+        assert!(cuda.contains(&"-DCMAKE_CXX_COMPILER_LAUNCHER=/usr/bin/ccache".to_string()));
+        assert!(cuda.contains(&"-DCMAKE_CUDA_COMPILER_LAUNCHER=/usr/bin/ccache".to_string()));
+        // CPU backend must not carry any CUDA flag, cache or otherwise.
+        let cpu = cmake_configure_args(BuildBackend::Cpu, None, None, Some(cache));
+        assert!(cpu.contains(&"-DCMAKE_C_COMPILER_LAUNCHER=/usr/bin/ccache".to_string()));
+        assert!(cpu.iter().all(|a| !a.contains("CUDA")));
+        // No cache on PATH -> no launcher flags at all.
+        let bare = cmake_configure_args(BuildBackend::Cuda, None, None, None);
+        assert!(bare.iter().all(|a| !a.contains("LAUNCHER")));
     }
 
     #[test]
@@ -903,8 +951,19 @@ mod tests {
             cxx: Some(PathBuf::from("/usr/bin/g++")),
             nvcc: Some(PathBuf::from("/usr/bin/nvcc")),
             nvidia_smi: None,
+            compiler_cache: None,
         };
         assert!(require_toolchain(&ok, BuildBackend::Cuda).is_ok());
+        // A ccache-only addition changes nothing: the cache is optional.
+        let cached = Toolchain {
+            compiler_cache: Some(PathBuf::from("/usr/bin/ccache")),
+            ..ok
+        };
+        assert!(require_toolchain(&cached, BuildBackend::Cuda).is_ok());
+        assert_eq!(
+            detect_toolchain(&[PathBuf::from("/nonexistent")]).compiler_cache,
+            None
+        );
     }
 
     #[test]

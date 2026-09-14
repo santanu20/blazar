@@ -77,7 +77,7 @@ fn test_input<'a>(
         instance_key: "qwen3-8b",
         model_path,
         model_bytes: 5_000 * 1024 * 1024,
-        gguf: &META,
+        meta: pallama_core::ModelMeta::Gguf(&META),
         hardware: hw,
         config: cfg,
         overlay,

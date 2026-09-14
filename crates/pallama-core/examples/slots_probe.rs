@@ -4,7 +4,7 @@
 use pallama_core::{
     gguf::read_metadata_file,
     profile::{compile, ProfileInput, TuningOverrides},
-    Config, Endpoint, GpuInfo, Hardware, ModelOverride,
+    Config, Endpoint, GpuInfo, Hardware, ModelMeta, ModelOverride,
 };
 use std::collections::BTreeSet;
 
@@ -63,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         instance_key: "qwen3.5-9b",
         model_path: model,
         model_bytes: std::fs::metadata(model)?.len(),
-        gguf: &gguf,
+        meta: ModelMeta::Gguf(&gguf),
         hardware: &hw,
         config: &Config::default(),
         overlay: &overlay,
