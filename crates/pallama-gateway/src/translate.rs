@@ -254,12 +254,15 @@ fn normalize_tool_call_types(messages: &Value) -> Value {
                 let mut c = call.clone();
                 if let Some(obj) = c.as_object_mut() {
                     // Insertion order: type first, then the function body.
+                    // The stale (empty) type entry, if any, must not
+                    // overwrite the filled one during the merge.
+                    let old = std::mem::take(obj);
                     let mut entry = serde_json::Map::new();
                     entry.insert("type".into(), json!("function"));
-                    // Reborrow: obj itself must survive the loop so the
-                    // rebuilt map can be stored back below.
-                    for (k, v) in &mut *obj {
-                        entry.insert(k.clone(), v.clone());
+                    for (k, v) in old {
+                        if k != "type" {
+                            entry.insert(k, v);
+                        }
                     }
                     *obj = entry;
                 }
@@ -1187,6 +1190,54 @@ mod tests {
         let shaped = json!({"model": "m", "prompt": "x", "images": [42]});
         let err2 = generate_to_openai(&shaped).unwrap_err();
         assert!(err2.contains("base64 strings"), "{err2}");
+    }
+
+    #[test]
+    fn unit__assistant_tool_calls_gain_type_function() {
+        // ollama wire shape omits `type` on tool_calls entries; the child
+        // rejects them with "Missing tool call type" (live-repro'd via the
+        // geokit server-compare harness: every MULTITURN replay 500'd).
+        let req = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Compute Mg# for Fo=90"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"function": {"name": "compute_geochem", "arguments": {"query": "Mg# Fo=90"}}}
+                ]},
+                {"role": "tool", "name": "compute_geochem", "content": "Mg# = 90.9"}
+            ]
+        });
+        let (out, _) = chat_to_openai(&req).unwrap();
+        let call = &out["messages"][1]["tool_calls"][0];
+        assert_eq!(call["type"], "function", "type filled");
+        assert_eq!(call["function"]["name"], "compute_geochem");
+        assert_eq!(
+            call["function"]["arguments"]["query"], "Mg# Fo=90",
+            "function body untouched"
+        );
+        // Explicit type is preserved verbatim (never overwritten), and
+        // empty-string type is treated as absent (children reject "").
+        let typed = json!({
+            "model": "m",
+            "messages": [
+                {"role": "assistant", "tool_calls": [
+                    {"type": "custom", "function": {"name": "f", "arguments": {}}}
+                ]},
+                {"role": "assistant", "tool_calls": [
+                    {"type": "", "function": {"name": "g", "arguments": {}}}
+                ]}
+            ]
+        });
+        let (out2, _) = chat_to_openai(&typed).unwrap();
+        assert_eq!(out2["messages"][0]["tool_calls"][0]["type"], "custom");
+        assert_eq!(out2["messages"][1]["tool_calls"][0]["type"], "function");
+        // Messages without tool_calls ride through untouched.
+        let (out3, _) = chat_to_openai(&json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        assert_eq!(out3["messages"][0]["content"], "hi");
     }
 
     #[test]

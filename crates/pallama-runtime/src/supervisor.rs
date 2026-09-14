@@ -2770,11 +2770,17 @@ impl Supervisor {
         if released > 0 {
             tracing::info!(target: "pallama::sessions", model = %model, released, "force stop released session pins");
         }
+        // Every instance-key grammar of this model dies with it: plain,
+        // `#replica`, `@vision` (lazy projector respawn), and combined
+        // forms — a bare `model@vision` slot survived keep_alive:0 pings
+        // before (live-repro'd: the vision bench lane respawned under the
+        // suffixed key, the unload ping evicted only the text slot, and
+        // the server still "held a live slot" minutes later).
         let keys: Vec<String> = self
             .instances
             .iter()
             .map(|e| e.key().clone())
-            .filter(|k| k == model || split_replica(k).is_some_and(|(m, _)| m == model))
+            .filter(|k| model_of_key(k) == model)
             .collect();
         for k in keys {
             self.evict(&k).await?;
