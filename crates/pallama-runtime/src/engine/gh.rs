@@ -754,14 +754,11 @@ pub fn resolve_cuda_asset(
             *slot = Some((ver, version.to_string()));
         }
     }
-    exact
-        .or(fat)
-        .or(jit)
-        .map(|(_, version)| AssetPick {
-            name: format!("llama-{tag}-bin-ubuntu-cuda-{version}-x64.tar.gz"),
-            label: format!("ubuntu-cuda-{version}-x64"),
-            cpu_fallback: false,
-        })
+    exact.or(fat).or(jit).map(|(_, version)| AssetPick {
+        name: format!("llama-{tag}-bin-ubuntu-cuda-{version}-x64.tar.gz"),
+        label: format!("ubuntu-cuda-{version}-x64"),
+        cpu_fallback: false,
+    })
 }
 
 /// Newest CUDA toolkit an overlay release's assets were built with,

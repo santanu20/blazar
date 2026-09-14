@@ -272,6 +272,27 @@ pub fn chat_to_openai(req: &Value) -> Result<(Value, Option<i64>), String> {
             out["top_logprobs"] = json!(n);
         }
     }
+    // User-supplied `chat_template_kwargs` forwards 1:1 (audit H1: the
+    // field used to be silently dropped — power users coming from
+    // llama-server/vllm/sglang lost their template switches with no
+    // error). Copied BEFORE the think injection so explicit user keys
+    // beat pallama's derived pair.
+    if let Some(kw) = req.get("chat_template_kwargs").filter(|k| k.is_object()) {
+        let mut merged = kw.clone();
+        if let Some(dst) = out
+            .get_mut("chat_template_kwargs")
+            .and_then(Value::as_object_mut)
+        {
+            for (k, v) in dst.iter() {
+                merged
+                    .as_object_mut()
+                    .expect("checked object")
+                    .entry(k.clone())
+                    .or_insert(v.clone());
+            }
+        }
+        out["chat_template_kwargs"] = merged;
+    }
     // ollama `think` toggle → template-level switch. No OpenAI
     // equivalent field exists; llama-server consumes
     // `chat_template_kwargs`, whose variable name varies by model
@@ -279,7 +300,9 @@ pub fn chat_to_openai(req: &Value) -> Result<(Value, Option<i64>), String> {
     // a template only reads the var it knows, so the extra is inert.
     // Absent = template default (unchanged behavior). mistral.rs
     // children ignore unknown body fields; the toggle is llama-lane
-    // effective and harmless elsewhere.
+    // effective and harmless elsewhere. Keys already present (copied
+    // from the user's own chat_template_kwargs above) keep the user's
+    // value — explicit beats derived.
     if let Some(think) = req.get("think").and_then(Value::as_bool) {
         if out.get("chat_template_kwargs").is_none() {
             out["chat_template_kwargs"] = json!({});
@@ -288,8 +311,11 @@ pub fn chat_to_openai(req: &Value) -> Result<(Value, Option<i64>), String> {
             .get_mut("chat_template_kwargs")
             .and_then(Value::as_object_mut)
         {
-            kw.insert("thinking".into(), json!(think));
-            kw.insert("enable_thinking".into(), json!(think));
+            // Fill-only: a user-supplied key (copied above) keeps its
+            // value — explicit beats derived.
+            kw.entry("thinking".to_string()).or_insert(json!(think));
+            kw.entry("enable_thinking".to_string())
+                .or_insert(json!(think));
         }
     }
     let mut num_ctx = None;
@@ -599,7 +625,36 @@ pub fn generate_to_openai(req: &Value) -> Result<Option<Value>, String> {
     // ollama `think` toggle — identical mapping to the chat lane (both
     // template variable names set; a template reads only the one it knows).
     if let Some(think) = req.get("think").and_then(Value::as_bool) {
-        out["chat_template_kwargs"] = json!({"thinking": think, "enable_thinking": think});
+        // Fill only missing keys: user-supplied chat_template_kwargs
+        // (forwarded below) beats the derived pair — same precedence
+        // as the chat lane.
+        if out.get("chat_template_kwargs").is_none() {
+            out["chat_template_kwargs"] = json!({});
+        }
+        let kw = out
+            .get_mut("chat_template_kwargs")
+            .and_then(Value::as_object_mut)
+            .expect("just inserted");
+        kw.entry("thinking".to_string()).or_insert(json!(think));
+        kw.entry("enable_thinking".to_string())
+            .or_insert(json!(think));
+    }
+    // Same forwarding as the chat lane (audit H1: silently dropped).
+    if let Some(kw) = req.get("chat_template_kwargs").filter(|k| k.is_object()) {
+        let mut merged = kw.clone();
+        if let Some(dst) = out
+            .get_mut("chat_template_kwargs")
+            .and_then(Value::as_object_mut)
+        {
+            for (k, v) in dst.iter() {
+                merged
+                    .as_object_mut()
+                    .expect("checked object")
+                    .entry(k.clone())
+                    .or_insert(v.clone());
+            }
+        }
+        out["chat_template_kwargs"] = merged;
     }
     if let Some(opts) = req.get("options").filter(|o| o.is_object()) {
         let unknown = apply_ollama_options(&mut out, opts);
@@ -980,6 +1035,35 @@ mod tests {
         assert!(generate_to_openai(&templated).unwrap().is_none());
         let suffixed = json!({"model": "m", "prompt": "x", "suffix": "..."});
         assert!(generate_to_openai(&suffixed).unwrap().is_none());
+    }
+
+    #[test]
+    fn unit__chat_to_openai__user_template_kwargs_beat_derived_think() {
+        // Audit H1 pin: user chat_template_kwargs forward 1:1 and WIN
+        // over the think-derived pair (explicit beats derived).
+        let req = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "think": true,
+            "chat_template_kwargs": {"enable_thinking": false}
+        });
+        let (out, _) = chat_to_openai(&req).expect("translate");
+        let kw = &out["chat_template_kwargs"];
+        assert_eq!(kw["enable_thinking"], json!(false), "user key must win");
+        assert_eq!(kw["thinking"], json!(true), "missing key filled from think");
+
+        // Without user kwargs the derived pair lands whole.
+        let req2 = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "think": false
+        });
+        let (out2, _) = chat_to_openai(&req2).expect("translate2");
+        assert_eq!(out2["chat_template_kwargs"]["thinking"], json!(false));
+        assert_eq!(
+            out2["chat_template_kwargs"]["enable_thinking"],
+            json!(false)
+        );
     }
 
     #[test]

@@ -8313,6 +8313,11 @@ def _gold_items() -> dict:
         # boot deliberately writes spec="off"; pristine configs emit no row),
         # and on PCI-vs-driver state (a driverless GPU box emits the
         # nvidia/vulkan driver rows; every drivered host omits them).
+        # The doctor-regroup wave adds three more conditional rows:
+        # daemon uptime needs a systemd/launchd pallama unit (same class
+        # as the "service" row), gpu fit needs VRAM plus at least one
+        # pulled model, and gpu arch match needs an active CUDA asset
+        # (CPU-only hosts and unit-less sandboxes emit neither).
         - {
             "whisper currency",
             "whisper lane",
@@ -8322,6 +8327,9 @@ def _gold_items() -> dict:
             "config pins",
             "nvidia driver",
             "vulkan driver",
+            "daemon uptime",
+            "gpu fit",
+            "gpu arch match",
         }
     )
     items["doctor.check-names"] = "\n".join(names)

@@ -284,7 +284,16 @@ enum Cmd {
     },
     /// Diagnose the local setup: config, engine, keys, remotes, whisper,
     /// hardware, disk, models
-    Doctor,
+    /// Local-state diagnostics, grouped (SYSTEM/GPU/ENGINES/MODELS/
+    /// CHANNELS/RUNTIME). `--flat` keeps the legacy single table;
+    /// `--json` emits one {group, check, status, detail} object per
+    /// check for tooling.
+    Doctor {
+        #[arg(long)]
+        flat: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Ask why a request misbehaved: sentinel detections for a trace id
     /// (or the most recent observations) with fix hints
     Why {
@@ -952,7 +961,7 @@ async fn run(cmd: Cmd) -> Result<()> {
         Cmd::Signout => cloud_refusal("signout", ""),
         Cmd::Logout => cloud_refusal("logout", ""),
         Cmd::Session { cmd } => session_cmd(cmd).await,
-        Cmd::Doctor => doctor().await,
+        Cmd::Doctor { flat, json } => doctor(flat, json).await,
         Cmd::Why {
             trace,
             watch: live,
@@ -1093,7 +1102,7 @@ impl Check {
 /// (engine/whisper/app). Warn-only — never installs or starts anything
 /// (the engine row executes the engine binary with `--version`, nothing
 /// more).
-async fn doctor() -> Result<()> {
+async fn doctor(flat: bool, json: bool) -> Result<()> {
     let d = dirs();
     let mut checks: Vec<Check> = Vec::new();
 
@@ -1145,6 +1154,9 @@ async fn doctor() -> Result<()> {
     }
 
     checks.extend(doctor_engine(&d).await);
+    checks.extend(doctor_gpu(&d).await);
+    checks.extend(doctor_engines(&d));
+    checks.extend(doctor_channels());
     checks.extend(doctor_whisper_currency(&d).await);
     checks.extend(doctor_whisper_models(&d));
     checks.extend(doctor_binary_shadow());
@@ -1155,31 +1167,454 @@ async fn doctor() -> Result<()> {
     checks.extend(doctor_disk(&d));
     checks.extend(doctor_store(&d));
     checks.extend(doctor_models(&d));
+    checks.extend(doctor_model_types(&d));
     checks.extend(doctor_sentinel(&d));
+    checks.extend(doctor_runtime(&d));
     checks.extend(doctor_exposure(&d));
     checks.extend(doctor_keys(&d));
     checks.extend(doctor_remotes().await);
 
     // render
-    println!("{:<26} {:<5} DETAIL", "CHECK", "ST");
-    for c in &checks {
-        println!("{:<26} {:<5} {}", c.name, c.status_word(), c.detail);
-    }
     let fails = checks.iter().filter(|c| !c.ok).count();
     let warns = checks.iter().filter(|c| c.warn).count();
+    if json {
+        for c in &checks {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "group": doctor_group(c.name),
+                    "check": c.name,
+                    "status": c.status_word(),
+                    "detail": c.detail,
+                })
+            );
+        }
+        println!(
+            "{}",
+            serde_json::json!({"summary": {"checks": checks.len(), "warn": warns, "fail": fails}})
+        );
+        return Ok(());
+    }
+    if flat {
+        println!("{:<26} {:<5} DETAIL", "CHECK", "ST");
+        for c in &checks {
+            println!("{:<26} {:<5} {}", c.name, c.status_word(), c.detail);
+        }
+    } else {
+        for group in GROUPS {
+            let rows: Vec<&Check> = checks
+                .iter()
+                .filter(|c| doctor_group(c.name) == group)
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
+            println!("{group}");
+            for c in &rows {
+                println!("  {:<24} {:<5} {}", c.name, c.status_word(), c.detail);
+            }
+            let ok_n = rows.iter().filter(|c| c.ok).count();
+            let warn_n = rows.iter().filter(|c| c.warn).count();
+            let fail_n = rows.iter().filter(|c| !c.ok).count();
+            let mut rollup = format!("{ok_n} ok");
+            if warn_n > 0 {
+                rollup.push_str(&format!(", {warn_n} warn"));
+            }
+            if fail_n > 0 {
+                rollup.push_str(&format!(", {fail_n} FAIL"));
+            }
+            println!("  ({rollup})\n");
+        }
+    }
     if fails > 0 {
-        println!("\n{fails} failing check(s) — fix the FAIL rows above");
+        println!("{fails} failing check(s) — fix the FAIL rows above");
     } else {
         if warns > 0 {
-            println!("\nall checks pass; {warns} warning(s)");
+            println!("all checks pass; {warns} warning(s)");
         } else {
-            println!("\nall checks pass");
+            println!("all checks pass");
         }
         for step in doctor_next_steps(&checks) {
             println!("next: {step}");
         }
     }
     Ok(())
+}
+
+/// Section order for the grouped doctor render. SYSTEM also catches
+/// every unmapped name (remotes, config pins, future rows) so no check
+/// ever disappears in grouped mode.
+const GROUPS: [&str; 6] = ["SYSTEM", "GPU", "ENGINES", "MODELS", "CHANNELS", "RUNTIME"];
+
+fn doctor_group(name: &str) -> &'static str {
+    match name {
+        "hardware" | "gpu driver" | "gpu vram" | "gpu fit" | "gpu arch match" => "GPU",
+        "engine"
+        | "engine binary"
+        | "engine currency"
+        | "cuda channel"
+        | "cuda toolchain"
+        | "inventory llamacpp"
+        | "inventory mistralrs"
+        | "inventory sglang"
+        | "engine retention"
+        | "whisper lane"
+        | "whisper currency"
+        | "whisper models" => "ENGINES",
+        "models" | "model types" => "MODELS",
+        "ccache" => "CHANNELS",
+        "disk" | "store" | "sentinel" | "daemon uptime" | "tempdir hygiene" | "bench baseline" => {
+            "RUNTIME"
+        }
+        _ => "SYSTEM",
+    }
+}
+
+/// GPU section: NVIDIA driver/CUDA + compute capability facts, VRAM
+/// census, largest-model fit, and active-asset arch match (the per-arch
+/// channel makes this actionable — a wrong-arch slim asset would run
+/// but JIT or miss SASS).
+async fn doctor_gpu(d: &PallamaDirs) -> Vec<Check> {
+    let mut out = Vec::new();
+    let (driver_cuda, cc) = pallama_runtime::engine::build::nvidia_gpu_facts().await;
+    let sm = cc.map(|(maj, min)| maj * 10 + min);
+    match (driver_cuda, sm) {
+        (Some((maj, min)), Some(sm)) => out.push(Check::ok(
+            "gpu driver",
+            format!("driver CUDA {maj}.{min}, GPU sm {sm}"),
+        )),
+        _ => out.push(Check::warn(
+            "gpu driver",
+            "no NVIDIA facts (non-NVIDIA box or driver absent) — Vulkan/CPU lanes apply"
+                .to_string(),
+        )),
+    }
+    let hw = pallama_runtime::probe_hardware(None);
+    let vram = hw.total_vram_mib();
+    if vram > 0 {
+        out.push(Check::ok(
+            "gpu vram",
+            format!("{vram} MiB across {} GPU(s)", hw.gpus.len()),
+        ));
+    } else {
+        out.push(Check::warn(
+            "gpu vram",
+            "no GPUs visible to the probe — CPU-only serving".to_string(),
+        ));
+    }
+    // Fit: largest registered model vs total VRAM (weights only; KV
+    // cache needs headroom on top).
+    if vram > 0 {
+        if let Ok(store) = Store::open(d) {
+            if let Ok(models) = store.list_models() {
+                if let Some(big) = models.iter().max_by_key(|m| m.bytes) {
+                    let gib = big.bytes as f64 / 1_073_741_824.0;
+                    let vram_gib = vram as f64 / 1024.0;
+                    if (big.bytes as u64 / 1_048_576) < vram as u64 {
+                        out.push(Check::ok(
+                            "gpu fit",
+                            format!("largest model {} ({gib:.1} GiB) fits VRAM ({vram_gib:.1} GiB) — KV cache has headroom", big.name),
+                        ));
+                    } else {
+                        out.push(Check::warn(
+                            "gpu fit",
+                            format!("largest model {} ({gib:.1} GiB) exceeds VRAM ({vram_gib:.1} GiB) — layers will offload to RAM", big.name),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    // Arch match: the active engine asset's -smNN vs the GPU's sm.
+    if let Ok(store) = Store::open(d) {
+        if let Ok(Some(active)) = store.active_engine() {
+            let asset = active.asset.as_str();
+            if asset.contains("cuda") {
+                let asset_sm = asset
+                    .split_once("-sm")
+                    .and_then(|(_, rest)| rest.split('-').next())
+                    .and_then(|n| n.parse::<u32>().ok());
+                match (asset_sm, sm) {
+                    (Some(a), Some(g)) if a == g => out.push(Check::ok(
+                        "gpu arch match",
+                        format!("active asset targets sm{a} == GPU sm{g} (exact SASS)"),
+                    )),
+                    (Some(a), Some(g)) if a == 120 && g > 120 => out.push(Check::ok(
+                        "gpu arch match",
+                        format!("sm120 PTX asset JITs forward to GPU sm{g}"),
+                    )),
+                    (Some(a), Some(g)) => out.push(Check::warn(
+                        "gpu arch match",
+                        format!("active asset targets sm{a} but GPU is sm{g} — `pallama engine update` should pick the right per-arch asset"),
+                    )),
+                    (None, Some(_)) => out.push(Check::ok(
+                        "gpu arch match",
+                        "active CUDA asset is multi-arch (fat) — runs on any sm".to_string(),
+                    )),
+                    _ => {}
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Recursive on-disk size of an engine directory (tarball included
+/// until the keep-tarball improvement lands).
+fn dir_bytes_deep(p: &std::path::Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(p) else {
+        return 0;
+    };
+    let mut n = 0u64;
+    for e in rd.flatten() {
+        match e.file_type() {
+            Ok(ft) if ft.is_dir() => n += dir_bytes_deep(&e.path()),
+            Ok(_) => n += e.metadata().map(|m| m.len()).unwrap_or(0),
+            Err(_) => {}
+        }
+    }
+    n
+}
+
+/// ENGINES section additions: per-kind inventory (tag, size,
+/// provenance) and retention vs the per-kind KEEP_TAGS policy.
+fn doctor_engines(d: &PallamaDirs) -> Vec<Check> {
+    let mut out = Vec::new();
+    let Ok(store) = Store::open(d) else {
+        return out;
+    };
+    let Ok(engines) = store.list_engines() else {
+        return out;
+    };
+    for (kind, label) in [
+        ("llamacpp", "inventory llamacpp"),
+        ("mistralrs", "inventory mistralrs"),
+        ("sglang", "inventory sglang"),
+    ] {
+        let rows: Vec<&pallama_core::store::EngineRow> =
+            engines.iter().filter(|e| e.kind.as_str() == kind).collect();
+        if rows.is_empty() {
+            out.push(Check::warn(
+                label,
+                format!("none installed — `pallama engine install --kind {kind}`"),
+            ));
+            continue;
+        }
+        let entries: Vec<String> = rows
+            .iter()
+            .map(|e| {
+                let gib = dir_bytes_deep(&d.engines_dir().join(&e.tag)) as f64 / 1_073_741_824.0;
+                let provenance = if e.asset.starts_with("built-") {
+                    "source-built"
+                } else if e.asset.starts_with("pip:") {
+                    "pip venv"
+                } else {
+                    "overlay prebuilt"
+                };
+                let active_mark = if e.active { " [active]" } else { "" };
+                format!(
+                    "{} ({asset}, {provenance}, {gib:.1} GiB){active_mark}",
+                    e.tag,
+                    asset = e.asset
+                )
+            })
+            .collect();
+        out.push(Check::ok(label, entries.join(" | ")));
+    }
+    // Retention: per-kind count vs KEEP_TAGS (local + active protected
+    // on top; prune runs on the next install).
+    let keep = pallama_runtime::engine::KEEP_TAGS;
+    let mut over: Vec<String> = Vec::new();
+    for kind in ["llamacpp", "mistralrs", "sglang"] {
+        let n = engines.iter().filter(|e| e.kind.as_str() == kind).count();
+        if n > keep {
+            over.push(format!("{kind}: {n} > {keep}"));
+        }
+    }
+    if over.is_empty() {
+        out.push(Check::ok(
+            "engine retention",
+            format!("every kind ≤ {keep} engine dir(s) — `pallama engine prune` enforces"),
+        ));
+    } else {
+        out.push(Check::warn(
+            "engine retention",
+            format!("{} — `pallama engine prune` reclaims disk", over.join(", ")),
+        ));
+    }
+    out
+}
+
+/// CHANNELS section: compiler-cache detect (the local source-build
+/// accelerator; optional by design).
+fn doctor_channels() -> Vec<Check> {
+    let path = std::env::var_os("PATH").and_then(|p| {
+        std::env::split_paths(&p)
+            .map(|d| d.join("ccache"))
+            .chain(std::env::split_paths(&p).map(|d| d.join("sccache")))
+            .find(|cand| cand.exists())
+    });
+    match path {
+        Some(p) => vec![Check::ok(
+            "ccache",
+            format!("{} — repeat source builds skip recompiling", p.display()),
+        )],
+        None => vec![Check::warn(
+            "ccache",
+            "none on PATH — source-lane builds recompile from scratch (apt install ccache)"
+                .to_string(),
+        )],
+    }
+}
+
+/// RUNTIME section: daemon uptime/restarts, tempdir hygiene, bench
+/// baseline.
+fn doctor_runtime(d: &PallamaDirs) -> Vec<Check> {
+    let mut out = Vec::new();
+    let show = std::process::Command::new("systemctl")
+        .args([
+            "show",
+            "pallama",
+            "--property=ActiveEnterTimestamp,NRestarts",
+        ])
+        .output();
+    if let Ok(o) = show {
+        if o.status.success() {
+            let txt = String::from_utf8_lossy(&o.stdout);
+            let since = txt
+                .lines()
+                .find_map(|l| l.strip_prefix("ActiveEnterTimestamp="))
+                .unwrap_or("unknown")
+                .to_string();
+            let restarts: u64 = txt
+                .lines()
+                .find_map(|l| l.strip_prefix("NRestarts="))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            if restarts == 0 {
+                out.push(Check::ok(
+                    "daemon uptime",
+                    format!("up since {since}, 0 restarts"),
+                ));
+            } else {
+                out.push(Check::warn(
+                    "daemon uptime",
+                    format!("up since {since}, {restarts} restart(s) — `journalctl -u pallama -e` for the cause"),
+                ));
+            }
+        } else {
+            out.push(Check::warn(
+                "daemon uptime",
+                "systemd unit not active (user-launched daemon?)".to_string(),
+            ));
+        }
+    }
+    // Tempdir hygiene: fixture/probe dirs pallama creates under /tmp;
+    // test runs used to leak them by the hundred.
+    let stale = ["pallama-census-*", "pallama-engine-test-*", "pallama-res-*"]
+        .iter()
+        .map(|pat| {
+            let mut n = 0u32;
+            if let Ok(rd) = std::fs::read_dir("/tmp") {
+                for e in rd.flatten() {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    let hit = match *pat {
+                        "pallama-census-*" => name.starts_with("pallama-census-"),
+                        "pallama-engine-test-*" => name.starts_with("pallama-engine-test-"),
+                        _ => name.starts_with("pallama-res-"),
+                    };
+                    if hit {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        })
+        .sum::<u32>();
+    if stale == 0 {
+        out.push(Check::ok(
+            "tempdir hygiene",
+            "no stale pallama dirs under /tmp".to_string(),
+        ));
+    } else {
+        out.push(Check::warn(
+            "tempdir hygiene",
+            format!("{stale} stale pallama dir(s) under /tmp — safe to rm"),
+        ));
+    }
+    // Bench baseline: the F7 gate anchor.
+    if let Ok(store) = Store::open(d) {
+        match store.latest_bench_by_time() {
+            Ok(Some((tag, tg, model))) => out.push(Check::ok(
+                "bench baseline",
+                format!("{tg:.1} t/s with {model} on {tag} (F7 gate anchor)"),
+            )),
+            _ => out.push(Check::warn(
+                "bench baseline",
+                "no bench history — `pallama bench <model>` sets the engine-gate baseline"
+                    .to_string(),
+            )),
+        }
+    }
+    out
+}
+
+/// MODELS section addition: on-disk type mix via the same label helper
+/// the list table uses.
+fn doctor_model_types(d: &PallamaDirs) -> Vec<Check> {
+    let Ok(store) = Store::open(d) else {
+        return Vec::new();
+    };
+    let Ok(models) = store.list_models() else {
+        return Vec::new();
+    };
+    let (mut gguf, mut st, mut missing, mut other) = (0u32, 0u32, 0u32, 0u32);
+    for m in &models {
+        match model_type_label(&m.path).as_str() {
+            "gguf" => gguf += 1,
+            "safetensors" => st += 1,
+            "missing!" => missing += 1,
+            _ => other += 1,
+        }
+    }
+    let mut detail = format!("{gguf} gguf, {st} safetensors");
+    if other > 0 {
+        detail.push_str(&format!(", {other} other"));
+    }
+    if missing > 0 {
+        detail.push_str(&format!(
+            ", {missing} MISSING (stale rows — `pallama rm` or re-pull)"
+        ));
+    }
+    if missing > 0 {
+        vec![Check::warn("model types", detail)]
+    } else {
+        vec![Check::ok("model types", detail)]
+    }
+}
+
+#[cfg(test)]
+mod doctor_tests {
+    use super::*;
+
+    #[test]
+    fn unit__doctor_group__known_names_map_and_order_is_stable() {
+        assert_eq!(doctor_group("engine"), "ENGINES");
+        assert_eq!(doctor_group("inventory sglang"), "ENGINES");
+        assert_eq!(doctor_group("gpu fit"), "GPU");
+        assert_eq!(doctor_group("hardware"), "GPU");
+        assert_eq!(doctor_group("model types"), "MODELS");
+        assert_eq!(doctor_group("ccache"), "CHANNELS");
+        assert_eq!(doctor_group("sentinel"), "RUNTIME");
+        assert_eq!(doctor_group("bench baseline"), "RUNTIME");
+        assert_eq!(doctor_group("config"), "SYSTEM");
+        assert_eq!(doctor_group("totally unknown future row"), "SYSTEM");
+        assert_eq!(
+            GROUPS,
+            ["SYSTEM", "GPU", "ENGINES", "MODELS", "CHANNELS", "RUNTIME"]
+        );
+    }
 }
 
 /// Adaptive "what to do next" footer for `pallama doctor`. Reuses the
@@ -3056,6 +3491,93 @@ fn import(
     Ok(())
 }
 
+/// Display label for the on-disk model format. GGUF = single file; an
+/// HF-style directory (config.json + safetensors shards) feeds the
+/// mistralrs/sglang lanes. `dir?` = a directory without safetensors
+/// (unexpected — `pallama show <name>` to inspect); `missing!` = the
+/// row's path is gone (stale entry — same convention as the VISION
+/// column's missing projector).
+fn model_type_label(path: &str) -> String {
+    let Ok(md) = std::fs::metadata(path) else {
+        return "missing!".to_string();
+    };
+    if !md.is_dir() {
+        return "gguf".to_string();
+    }
+    let has_safetensors = std::fs::read_dir(path)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .any(|e| e.file_name().to_string_lossy().ends_with(".safetensors"))
+        })
+        .unwrap_or(false);
+    if has_safetensors {
+        "safetensors".to_string()
+    } else {
+        "dir?".to_string()
+    }
+}
+
+/// Char-safe truncation with a trailing ellipsis. Byte-slicing here (the
+/// old form) panicked on multibyte names; chars never split.
+fn trunc_ellipsis(s: &str, cap: usize) -> String {
+    if s.chars().count() <= cap {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(cap.saturating_sub(1)).collect();
+    format!("{cut}…")
+}
+
+/// Adaptive-width table: every column sizes to its widest cell (header
+/// included) so a value can never bleed into the next column — the old
+/// fixed ARCH width let `Qwen2ForCausalLM` overlap CTX. NAME and ARCH cap
+/// with an ellipsis; SIZE and CTX right-align; PATH (last) is uncapped.
+fn render_list_table(header: [&str; 8], rows: &[[String; 8]]) -> String {
+    const NAME_CAP: usize = 26;
+    const ARCH_CAP: usize = 18;
+    let mut cells: Vec<[String; 8]> = vec![header.map(str::to_string)];
+    for r in rows {
+        cells.push([
+            trunc_ellipsis(&r[0], NAME_CAP),
+            r[1].clone(),
+            r[2].clone(),
+            r[3].clone(),
+            trunc_ellipsis(&r[4], ARCH_CAP),
+            r[5].clone(),
+            r[6].clone(),
+            r[7].clone(),
+        ]);
+    }
+    let width = |col: usize| {
+        cells
+            .iter()
+            .map(|r| r[col].chars().count())
+            .max()
+            .unwrap_or(0)
+    };
+    let mut out = String::new();
+    for r in &cells {
+        out.push_str(&format!(
+            "{:<n$}  {:<q$}  {:>s$}  {:<v$}  {:<a$}  {:>c$}  {:<t$}  {}\n",
+            r[0],
+            r[1],
+            r[2],
+            r[3],
+            r[4],
+            r[5],
+            r[6],
+            r[7],
+            n = width(0),
+            q = width(1),
+            s = width(2),
+            v = width(3),
+            a = width(4),
+            c = width(5),
+            t = width(6),
+        ));
+    }
+    out.trim_end().to_string()
+}
+
 fn list() -> Result<()> {
     let store = Store::open(&dirs())?;
     let models = store.list_models()?;
@@ -3063,57 +3585,43 @@ fn list() -> Result<()> {
         println!("no models pulled");
         return Ok(());
     }
-    // Adaptive name width (capped) keeps columns aligned for long names;
-    // oversize names truncate with an ellipsis instead of shifting the row.
-    let name_cap = 26usize;
-    let name_w = models
+    let rows: Vec<[String; 8]> = models
         .iter()
-        .map(|m| m.name.len().min(name_cap))
-        .max()
-        .unwrap_or(0)
-        .max("NAME".len());
+        .map(|m| {
+            // Multimodal visibility: the projector is a real on-disk cost
+            // the user otherwise cannot see anywhere (list was
+            // LLM-bytes only).
+            let vision = m.mmproj_path.as_ref().map_or_else(
+                || "-".to_string(),
+                |p| {
+                    let mm = std::fs::metadata(p)
+                        .map_or(0, |md| i64::try_from(md.len()).unwrap_or(i64::MAX));
+                    if mm > 0 {
+                        format!("+{}", humansize(mm))
+                    } else {
+                        "missing!".to_string()
+                    }
+                },
+            );
+            [
+                m.name.clone(),
+                m.quant.clone(),
+                humansize(m.bytes),
+                vision,
+                m.arch.clone().unwrap_or_else(|| "?".to_string()),
+                m.ctx_train.map_or_else(String::new, |c| c.to_string()),
+                model_type_label(&m.path),
+                m.path.clone(),
+            ]
+        })
+        .collect();
     println!(
-        "{:<name_w$}  {:<8}  {:<9}  {:<10}  {:<8}  {:>7}  PATH",
-        "NAME",
-        "QUANT",
-        "SIZE",
-        "VISION",
-        "ARCH",
-        "CTX",
-        name_w = name_w
+        "{}",
+        render_list_table(
+            ["NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "PATH"],
+            &rows
+        )
     );
-    for m in models {
-        // Multimodal visibility: the projector is a real on-disk cost the
-        // user otherwise cannot see anywhere (list was LLM-bytes only).
-        let vision = m.mmproj_path.as_ref().map_or_else(
-            || "-".to_string(),
-            |p| {
-                let mm = std::fs::metadata(p)
-                    .map_or(0, |md| i64::try_from(md.len()).unwrap_or(i64::MAX));
-                if mm > 0 {
-                    format!("+{}", humansize(mm))
-                } else {
-                    "missing!".to_string()
-                }
-            },
-        );
-        let name = if m.name.len() > name_cap {
-            format!("{}…", &m.name[..name_cap - 1])
-        } else {
-            m.name.clone()
-        };
-        println!(
-            "{:<name_w$}  {:<8}  {:<9}  {:<10}  {:<8}  {:>7}  {}",
-            name,
-            m.quant,
-            humansize(m.bytes),
-            vision,
-            m.arch.as_deref().unwrap_or("?"),
-            m.ctx_train.map_or_else(String::new, |c| c.to_string()),
-            m.path,
-            name_w = name_w
-        );
-    }
     Ok(())
 }
 
@@ -6041,6 +6549,101 @@ async fn upgrade(version: Option<String>, dry_run: bool) -> Result<()> {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__model_type_label__gguf_file_safetensors_dir_unknowns() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        // Single GGUF file.
+        let gguf = tmp.path().join("m.gguf");
+        std::fs::write(&gguf, b"gguf").expect("write");
+        assert_eq!(model_type_label(gguf.to_str().unwrap()), "gguf");
+        // HF-style dir with a safetensors shard.
+        let hf = tmp.path().join("m.d");
+        std::fs::create_dir_all(&hf).expect("mkdir");
+        std::fs::write(hf.join("model-00001-of-00002.safetensors"), b"st").expect("st");
+        assert_eq!(model_type_label(hf.to_str().unwrap()), "safetensors");
+        // Dir without safetensors = honestly unknown, not guessed.
+        let bare = tmp.path().join("bare.d");
+        std::fs::create_dir_all(&bare).expect("mkdir");
+        assert_eq!(model_type_label(bare.to_str().unwrap()), "dir?");
+        // Missing path = stale row, flagged loudly not guessed.
+        assert_eq!(
+            model_type_label(tmp.path().join("nope.gguf").to_str().unwrap()),
+            "missing!"
+        );
+    }
+
+    #[test]
+    fn unit__render_list_table__columns_never_overlap() {
+        let rows = [
+            [
+                "nanbeige4.2-3b".to_string(),
+                "Q4_K_M".to_string(),
+                "2.4 GiB".to_string(),
+                "-".to_string(),
+                "nanbeige".to_string(),
+                "262144".to_string(),
+                "gguf".to_string(),
+                "/m/Nanbeige.gguf".to_string(),
+            ],
+            [
+                "qwen2.5-0.5b-instruct".to_string(),
+                "BF16".to_string(),
+                "953 MiB".to_string(),
+                "-".to_string(),
+                // Oversized arch: old fixed width bled this into CTX.
+                "Qwen2ForCausalLM".to_string(),
+                "32768".to_string(),
+                "safetensors".to_string(),
+                "/m/qwen.d".to_string(),
+            ],
+        ];
+        let out = render_list_table(
+            [
+                "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "PATH",
+            ],
+            &rows,
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3);
+        // Column-start proof: every cell begins exactly at its header's
+        // column offset on both data rows — a value overflowing its
+        // column would push itself or its right neighbour off offset.
+        let col = |l: &str, h: &str| out.lines().next().unwrap().find(h).unwrap();
+        let at = |l: &str, v: &str, off: usize| {
+            assert_eq!(l.find(v), Some(off), "{v} misaligned in: {l}");
+        };
+        at(lines[1], "nanbeige4.2-3b", 0);
+        at(lines[1], "Q4_K_M", col(lines[0], "QUANT"));
+        at(lines[1], "gguf", col(lines[0], "TYPE"));
+        at(lines[2], "Qwen2ForCausalLM", col(lines[0], "ARCH"));
+        at(lines[2], "safetensors", col(lines[0], "TYPE"));
+        // Right-aligned CTX: all rows END at the same column offset
+        // (start offsets vary with digit count by design).
+        let cend = |l: &str, v: &str| l.find(v).unwrap() + v.len();
+        let hctx = col(lines[0], "CTX") + "CTX".len();
+        assert_eq!(cend(lines[1], "262144"), hctx);
+        assert_eq!(cend(lines[2], "32768"), hctx);
+        // Oversize arch beyond the cap truncates with an ellipsis, never
+        // panics on multibyte names.
+        let long = [[
+            "имя-модели-очень-длинное-больше-лимита".to_string(),
+            "Q8_0".to_string(),
+            "1 GiB".to_string(),
+            "-".to_string(),
+            "Qwen2VLForConditionalGeneration".to_string(),
+            "4096".to_string(),
+            "gguf".to_string(),
+            "/m/x.gguf".to_string(),
+        ]];
+        let out2 = render_list_table(
+            [
+                "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "PATH",
+            ],
+            &long,
+        );
+        assert!(out2.lines().nth(1).unwrap().contains('…'));
+    }
 
     #[test]
     fn unit__grouped_help__covers_every_subcommand_exactly_once() {

@@ -1,15 +1,25 @@
 app currency
+bench baseline
 binary
+ccache
 config
 cuda toolchain
 disk
 engine
 engine binary
 engine currency
+engine retention
 exposure
+gpu driver
+gpu vram
 hardware
+inventory llamacpp
+inventory mistralrs
+inventory sglang
 keys
+model types
 models
 port
 sentinel
 store
+tempdir hygiene
