@@ -1225,43 +1225,43 @@ mod tests {
     }
 
     #[test]
+    fn unit__resolve_cuda_asset__per_arch_ranking() {
+        let r = rel(
+            "b200-cuda",
+            &[
+                "llama-b200-bin-ubuntu-cuda-12.8-sm89-x64.tar.gz",
+                "llama-b200-bin-ubuntu-cuda-13.0-sm120-x64.tar.gz",
+                "llama-b200-bin-ubuntu-cuda-12.8-x64.tar.gz",
+                "llama-b200-bin-ubuntu-cuda-12.8-sm61-x64.tar.gz",
+            ],
+        );
+        // Exact-arch slim beats the fat build even at lower toolkit.
+        let p = resolve_cuda_asset(&r, (13, 0), Some(89)).unwrap();
+        assert_eq!(p.name, "llama-b200-bin-ubuntu-cuda-12.8-sm89-x64.tar.gz");
+        // GPU newer than every SASS arch: the legacy fat build still
+        // serves via its embedded sm120 PTX (forward JIT).
+        let q = resolve_cuda_asset(&r, (13, 0), Some(121)).unwrap();
+        assert_eq!(q.name, "llama-b200-bin-ubuntu-cuda-12.8-x64.tar.gz");
+        // Other-arch slim only: not runnable (PTX never JITs backward).
+        let only61 = rel(
+            "b201-cuda",
+            &["llama-b201-bin-ubuntu-cuda-12.8-sm61-x64.tar.gz"],
+        );
+        assert!(resolve_cuda_asset(&only61, (13, 0), Some(89)).is_none());
+        // sm120-only release: serves newer GPUs, never older ones.
+        let only120 = rel(
+            "b202-cuda",
+            &["llama-b202-bin-ubuntu-cuda-13.0-sm120-x64.tar.gz"],
+        );
+        let j = resolve_cuda_asset(&only120, (13, 0), Some(121)).unwrap();
+        assert_eq!(j.name, "llama-b202-bin-ubuntu-cuda-13.0-sm120-x64.tar.gz");
+        assert!(resolve_cuda_asset(&only120, (13, 0), Some(89)).is_none());
+    }
+
+    #[test]
     fn unit__newest_runnable_overlay__lag_target_skips_newer_and_unrunnable() {
         // Fixture builder: release with one cuda asset (12.8 = runnable
         // by a 12.8 driver; 13.0-only = unrunnable by it).
-        #[test]
-        fn unit__resolve_cuda_asset__per_arch_ranking() {
-            let r = rel(
-                "b200-cuda",
-                &[
-                    "llama-b200-bin-ubuntu-cuda-12.8-sm89-x64.tar.gz",
-                    "llama-b200-bin-ubuntu-cuda-13.0-sm120-x64.tar.gz",
-                    "llama-b200-bin-ubuntu-cuda-12.8-x64.tar.gz",
-                    "llama-b200-bin-ubuntu-cuda-12.8-sm61-x64.tar.gz",
-                ],
-            );
-            // Exact-arch slim beats the fat build even at lower toolkit.
-            let p = resolve_cuda_asset(&r, (13, 0), Some(89)).unwrap();
-            assert_eq!(p.name, "llama-b200-bin-ubuntu-cuda-12.8-sm89-x64.tar.gz");
-            // GPU newer than every SASS arch: the legacy fat build still
-            // serves via its embedded sm120 PTX (forward JIT).
-            let q = resolve_cuda_asset(&r, (13, 0), Some(121)).unwrap();
-            assert_eq!(q.name, "llama-b200-bin-ubuntu-cuda-12.8-x64.tar.gz");
-            // Other-arch slim only: not runnable (PTX never JITs backward).
-            let only61 = rel(
-                "b201-cuda",
-                &["llama-b201-bin-ubuntu-cuda-12.8-sm61-x64.tar.gz"],
-            );
-            assert!(resolve_cuda_asset(&only61, (13, 0), Some(89)).is_none());
-            // sm120-only release: serves newer GPUs, never older ones.
-            let only120 = rel(
-                "b202-cuda",
-                &["llama-b202-bin-ubuntu-cuda-13.0-sm120-x64.tar.gz"],
-            );
-            let j = resolve_cuda_asset(&only120, (13, 0), Some(121)).unwrap();
-            assert_eq!(j.name, "llama-b202-bin-ubuntu-cuda-13.0-sm120-x64.tar.gz");
-            assert!(resolve_cuda_asset(&only120, (13, 0), Some(89)).is_none());
-        }
-
         fn rel_cuda(tag: &str, ver: &str) -> GhRelease {
             rel(
                 tag,
