@@ -118,27 +118,61 @@ pub fn strip_for_load(base_argv: &[String]) -> Vec<String> {
     argv
 }
 
-/// Locate a llama-bench in an installed engine directory (upstream
-/// release tarballs ship llama-bench alongside llama-server; a manually
-/// registered `local` engine may not). No external fallback paths: pallama
-/// is self-contained — if nothing ships a bench binary, the error says so.
+/// Locate a llama-bench in an installed engine directory. Engine assets
+/// unpack into either the classic `llama-<tag>` dir or vendor-suffixed
+/// per-arch dirs (`llama-bNNNN-bin-ubuntu-cuda-13.0-sm89-x64`), so the
+/// search walks the engine dir for the real layout instead of assuming
+/// one path shape (shallowest match = deterministic). Only llamacpp
+/// rows are scanned (mistralrs/sglang engines ship no llama-bench), the
+/// active engine wins. A candidate only counts when `llama-server` sits
+/// in the SAME dir — the Tuner spawns load/replica probes from
+/// `bench_bin.parent()` and a tool-only dir would break them with a
+/// confusing error later. A manually registered `local` engine may
+/// lack llama-bench entirely; no external fallback paths — pallama is
+/// self-contained, and the error names remedies that actually produce
+/// a bench binary.
 pub fn find_bench_bin(dirs: &PallamaDirs) -> Result<PathBuf> {
     let store = Store::open(dirs)?;
     let engines = store.list_engines()?;
-    engines
+    let llamacpp: Vec<_> = engines
+        .iter()
+        .filter(|e| e.kind == pallama_core::engine_kind::EngineKind::LlamaCpp)
+        .collect();
+    if llamacpp.is_empty() {
+        return Err(anyhow!(
+            "no engine installed; run `pallama engine update` (prebuilt \
+             per-arch CUDA assets ship llama-server only — `pallama engine \
+             build cuda` builds the full tool set, incl. llama-bench)"
+        ));
+    }
+    let ordered: Vec<_> = llamacpp
         .iter()
         .filter(|e| e.active)
-        .chain(engines.iter().filter(|e| !e.active))
-        .map(|e| {
-            dirs.engines_dir()
-                .join(&e.tag)
-                .join(format!("llama-{}", e.tag))
-                .join(crate::tool_file_name("llama-bench"))
-        })
-        .find(|p| p.exists())
-        .ok_or_else(|| {
-            anyhow!("no llama-bench found in any installed engine; run `pallama engine update`")
-        })
+        .chain(llamacpp.iter().filter(|e| !e.active))
+        .collect();
+    for e in ordered {
+        let bench_name = crate::tool_file_name("llama-bench");
+        let server_name = crate::tool_file_name("llama-server");
+        let engine_dir = dirs.engines_dir().join(&e.tag);
+        // Reuse the engine module's symlink-safe walk (F86): it finds the
+        // binary under any unpack layout and picks the shallowest match.
+        let Ok(bench) = crate::engine::find_engine_binary(&engine_dir, &[bench_name.as_str()])
+        else {
+            continue;
+        };
+        if bench
+            .parent()
+            .is_some_and(|d| d.join(&server_name).exists())
+        {
+            return Ok(bench);
+        }
+    }
+    Err(anyhow!(
+        "no llama-bench found in any installed engine. Prebuilt per-arch \
+         CUDA assets ship llama-server only; `pallama engine build cuda` \
+         builds the full tool set (incl. llama-bench), or register a full \
+         bundle: `pallama engine local <dir>`"
+    ))
 }
 
 /// Default bench grid: prompt processing + generation, 2 reps.
@@ -1030,6 +1064,129 @@ fn drive_concurrent_multi(ports: &[u16], clients: u32, gens: u32) -> Result<f64>
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+    use pallama_core::engine_kind::EngineKind;
+    use pallama_core::store::EngineRow;
+
+    fn test_dirs() -> (tempfile::TempDir, PallamaDirs) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = PallamaDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        dirs.ensure().unwrap();
+        (tmp, dirs)
+    }
+
+    fn engine_row(tag: &str, active: bool, kind: EngineKind) -> EngineRow {
+        EngineRow {
+            tag: tag.into(),
+            asset: "test".into(),
+            sha256: String::new(),
+            installed_at: 0,
+            active,
+            manifest: String::new(),
+            kind,
+        }
+    }
+
+    fn touch(path: &Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, b"#!/bin/sh\n").unwrap();
+    }
+
+    #[test]
+    fn unit__find_bench_bin__vendor_suffixed_layout_and_sibling_rule() {
+        let (tmp, dirs) = test_dirs();
+        let store = Store::open(&dirs).unwrap();
+        store
+            .upsert_engine(&engine_row("b1-cuda", true, EngineKind::LlamaCpp))
+            .unwrap();
+        store
+            .upsert_engine(&engine_row("b2-cuda", false, EngineKind::LlamaCpp))
+            .unwrap();
+
+        // Active engine ships the per-arch slim layout: server only — its
+        // lone llama-bench sits in a TOOL-ONLY dir without a sibling
+        // llama-server and must NOT be picked.
+        let eng1 = dirs.engines_dir().join("b1-cuda");
+        touch(
+            &eng1
+                .join("llama-b1-cuda-bin-ubuntu-cuda-13.0-sm89-x64")
+                .join(crate::tool_file_name("llama-server")),
+        );
+        touch(
+            &eng1
+                .join("toolsonly")
+                .join(crate::tool_file_name("llama-bench")),
+        );
+
+        // Second engine: full bundle in a vendor-suffixed dir — the pick.
+        let want = dirs
+            .engines_dir()
+            .join("b2-cuda")
+            .join("llama-b2-cuda-bin-ubuntu-vulkan-x64")
+            .join(crate::tool_file_name("llama-bench"));
+        touch(&want);
+        touch(
+            &want
+                .parent()
+                .unwrap()
+                .join(crate::tool_file_name("llama-server")),
+        );
+
+        let got = find_bench_bin(&dirs).unwrap();
+        assert_eq!(got, want);
+        drop(store);
+        drop(tmp);
+    }
+
+    #[test]
+    fn unit__find_bench_bin__slim_llamacpp_store_teaches_build_cuda() {
+        let (tmp, dirs) = test_dirs();
+        let store = Store::open(&dirs).unwrap();
+        // Slim llamacpp: server only. A mistralrs engine MAY carry a bench
+        // pair but is never scanned (wrong engine family).
+        store
+            .upsert_engine(&engine_row("b1-cuda", true, EngineKind::LlamaCpp))
+            .unwrap();
+        store
+            .upsert_engine(&engine_row("mistral", false, EngineKind::MistralRs))
+            .unwrap();
+        let eng1 = dirs.engines_dir().join("b1-cuda");
+        touch(
+            &eng1
+                .join("llama-b1-cuda-bin-ubuntu-cuda-13.0-sm89-x64")
+                .join(crate::tool_file_name("llama-server")),
+        );
+        let bench = dirs
+            .engines_dir()
+            .join("mistral")
+            .join(crate::tool_file_name("llama-bench"));
+        touch(&bench);
+        touch(
+            &bench
+                .parent()
+                .unwrap()
+                .join(crate::tool_file_name("llama-server")),
+        );
+
+        let err = find_bench_bin(&dirs).unwrap_err().to_string();
+        assert!(err.contains("pallama engine build cuda"), "got: {err}");
+        assert!(err.contains("pallama engine local"), "got: {err}");
+        drop(store);
+        drop(tmp);
+    }
+
+    #[test]
+    fn unit__find_bench_bin__empty_store_teaches_engine_update() {
+        let (tmp, dirs) = test_dirs();
+        let err = find_bench_bin(&dirs).unwrap_err().to_string();
+        assert!(err.contains("no engine installed"), "got: {err}");
+        assert!(err.contains("pallama engine update"), "got: {err}");
+        drop(tmp);
+    }
 
     fn row(test: &str, ts: f64, ctx: u64, threads: u64, k: &str, v: &str) -> BenchRow {
         BenchRow {

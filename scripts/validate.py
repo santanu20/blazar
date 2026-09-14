@@ -6646,6 +6646,20 @@ def phase_commands() -> None:
     vram_starved = gpu_mib is not None and gpu_mib < 1200
     heavy_ok = disk_free_gb() > 8.0 and not vram_starved
 
+    def _bench_unavailable(p) -> str | None:
+        # Slim per-arch engine assets ship llama-server only — bench/tune
+        # fail fast with a teaching that names the real remedy. That is an
+        # environment boundary (build/register a bench-bearing engine to
+        # run these lanes), not a pallama regression.
+        err = p.stderr + p.stdout
+        if "no llama-bench found in any installed engine" in err:
+            return (
+                "slim engine assets ship llama-server only — no llama-bench "
+                "on this box; `pallama engine build cuda` or `engine local` "
+                "a full bundle to run this lane"
+            )
+        return None
+
     def _bench():
         if vram_starved:
             regb(
@@ -6656,6 +6670,10 @@ def phase_commands() -> None:
             )
             return
         p = cli("bench", MODEL, timeout=900)
+        unavail = _bench_unavailable(p)
+        if unavail:
+            regb("bench", unavail)
+            return
         reg(
             "bench",
             p.returncode == 0 and len(p.stdout.strip()) > 0,
@@ -6679,6 +6697,10 @@ def phase_commands() -> None:
                 )
             )
             p = cli(*args, timeout=2400)
+            unavail = _bench_unavailable(p)
+            if unavail:
+                regb(f"tune.{flag.lstrip('-')}", unavail)
+                return
             reg(
                 f"tune.{flag.lstrip('-')}",
                 p.returncode == 0,
@@ -6959,9 +6981,12 @@ def phase_commands() -> None:
     if anchor is None:
         # slim-asset box (CUDA overlay ships server-only): fall back to any
         # server-bearing llamacpp tag so local/use lanes still exercise a
-        # real engine; dance stays None and its lanes degrade gracefully
+        # real engine. With >=2 of them, dance too — the switch lanes'
+        # whole purpose is a REAL engine dance, and two slim tags prove
+        # switching just as well as two full bundles.
         server_tags = _server_engine_tags()
         anchor = server_tags[0] if server_tags else None
+        dance = server_tags[1] if len(server_tags) > 1 else None
     # Prefer a plain upstream tag for the pin-update dance so the lane
     # exercises the standard asset path whenever the store has one; a
     # -cuda pick goes through the CUDA overlay repo (needs bNNNN-cuda
