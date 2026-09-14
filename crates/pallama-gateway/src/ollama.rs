@@ -810,6 +810,11 @@ pub async fn chat(
         }
         state.keys.charge_request(name);
     }
+    // Think-capability gate (ollama parity): refuse `think: true` on a
+    // provably non-thinking template instead of silently ignoring it.
+    if let Some(resp) = refuse_unsupported_think(&row, &req) {
+        return resp;
+    }
     // Strict tool-def lint (tools arrive in OpenAI shape after translate).
     if let Some(err) = state.sentinel.strict_tool_def_error_cached(&req) {
         return api_error(400, &format!("invalid tools: {err}"));
@@ -1113,6 +1118,41 @@ fn refuse_remote_prefix(state: &AppState, model: &str) -> Option<Response> {
         ));
     }
     None
+}
+
+/// Whether a GGUF chat template carries thinking machinery. Template
+/// dialects vary (`enable_thinking` switch, `<think>` tags, `reasoning`
+/// blocks); any marker counts. Same evidence class the engine itself
+/// uses when deciding whether to emit reasoning content.
+fn template_supports_thinking(template: &str) -> bool {
+    template.contains("enable_thinking")
+        || template.contains("<think>")
+        || template.contains("reasoning")
+}
+
+/// Think-capability gate (ollama parity): `think: true` on a model whose
+/// chat template provably lacks thinking markers is a teaching 400, not
+/// a silent no-op. Fail-open on unreadable/absent templates — safetensors
+/// lanes and legacy GGUFs without `tokenizer.chat_template` keep today's
+/// behavior; refuse only on evidence.
+fn refuse_unsupported_think(row: &pallama_core::ModelRow, req: &Value) -> Option<Response> {
+    if req["think"].as_bool() != Some(true) {
+        return None;
+    }
+    let template = pallama_core::gguf::read_metadata_file(std::path::Path::new(&row.path))
+        .ok()
+        .and_then(|meta| meta.chat_template)
+        .unwrap_or_default();
+    if template.is_empty() || template_supports_thinking(&template) {
+        return None;
+    }
+    Some(api_error(
+        400,
+        &format!(
+            "model {} does not support thinking: its chat template has no thinking markers (enable_thinking/<think>/reasoning); omit \"think\" or use a thinking-capable model",
+            row.name
+        ),
+    ))
 }
 
 /// hit headers. Eval counts come from the original generation.
@@ -1998,6 +2038,10 @@ pub async fn generate(
         }
         state.keys.charge_request(name);
     }
+    // Think-capability gate (ollama parity), same as /api/chat.
+    if let Some(resp) = refuse_unsupported_think(&row, &req) {
+        return resp;
+    }
     let priority = Priority::from_header(
         headers
             .get("x-pallama-priority")
@@ -2683,6 +2727,114 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
 mod tests {
     use super::*;
     use pallama_runtime::PallamaEvent;
+
+    /// Minimal GGUF with `general.architecture` + optional
+    /// `tokenizer.chat_template` — just enough header for
+    /// `read_metadata_file` to reach the template field.
+    fn write_gguf_with_template(path: &std::path::Path, template: Option<&str>) {
+        let mut b: Vec<u8> = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes()); // version
+        b.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        let mut kvs: Vec<(&str, String)> = vec![("general.architecture", "qwen3".into())];
+        if let Some(t) = template {
+            kvs.push(("tokenizer.chat_template", t.to_string()));
+        }
+        b.extend_from_slice(&u64::try_from(kvs.len()).unwrap().to_le_bytes());
+        for (k, v) in kvs {
+            b.extend_from_slice(&u64::try_from(k.len()).unwrap().to_le_bytes());
+            b.extend_from_slice(k.as_bytes());
+            b.extend_from_slice(&8u32.to_le_bytes()); // GgufValue::String
+            b.extend_from_slice(&u64::try_from(v.len()).unwrap().to_le_bytes());
+            b.extend_from_slice(v.as_bytes());
+        }
+        std::fs::write(path, b).unwrap();
+    }
+
+    fn row_with_path(path: &str) -> pallama_core::ModelRow {
+        pallama_core::ModelRow {
+            name: "m1".into(),
+            repo: "registry.ollama.ai/library/m1".into(),
+            quant: "Q4_K_M".into(),
+            path: path.into(),
+            bytes: 500,
+            sha256: None,
+            mmproj_path: None,
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: Some(40960),
+            pulled_at: 0,
+        }
+    }
+
+    fn think_req(think: Option<bool>) -> Value {
+        let mut v = serde_json::json!({"model": "m1", "messages": []});
+        if let Some(t) = think {
+            v["think"] = serde_json::Value::Bool(t);
+        }
+        v
+    }
+
+    #[test]
+    fn unit__template_supports_thinking__marker_dialects() {
+        assert!(template_supports_thinking(
+            "{%- if enable_thinking -%}<think>"
+        ));
+        assert!(template_supports_thinking("{{- '<think>' -}}"));
+        assert!(template_supports_thinking("{{ reasoning }}"));
+        assert!(!template_supports_thinking(
+            "You are a helpful assistant.<|im_end|>"
+        ));
+        assert!(!template_supports_thinking(""));
+    }
+
+    #[test]
+    fn unit__refuse_unsupported_think__gates_on_evidence_fail_open_without() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Plain template + think:true -> teaching 400.
+        let plain = tmp.path().join("plain.gguf");
+        write_gguf_with_template(&plain, Some("You are a helpful assistant."));
+        let resp = refuse_unsupported_think(
+            &row_with_path(plain.to_str().unwrap()),
+            &think_req(Some(true)),
+        )
+        .expect("plain template + think:true must refuse");
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        // Thinking template + think:true -> pass.
+        let thinker = tmp.path().join("thinker.gguf");
+        write_gguf_with_template(&thinker, Some("{%- if enable_thinking -%}"));
+        assert!(refuse_unsupported_think(
+            &row_with_path(thinker.to_str().unwrap()),
+            &think_req(Some(true))
+        )
+        .is_none());
+        // Template absent -> fail-open (legacy GGUFs).
+        let bare = tmp.path().join("bare.gguf");
+        write_gguf_with_template(&bare, None);
+        assert!(refuse_unsupported_think(
+            &row_with_path(bare.to_str().unwrap()),
+            &think_req(Some(true))
+        )
+        .is_none());
+        // Unreadable path -> fail-open (safetensors lanes).
+        assert!(refuse_unsupported_think(
+            &row_with_path("/nonexistent/m1.gguf"),
+            &think_req(Some(true))
+        )
+        .is_none());
+        // Gate dormant without an explicit think:true.
+        assert!(refuse_unsupported_think(
+            &row_with_path(plain.to_str().unwrap()),
+            &think_req(None)
+        )
+        .is_none());
+        assert!(refuse_unsupported_think(
+            &row_with_path(plain.to_str().unwrap()),
+            &think_req(Some(false))
+        )
+        .is_none());
+    }
 
     #[test]
     fn unit__pull_stream_names__raw_target_includes_registry_name() {
