@@ -417,6 +417,69 @@ async fn integration__crash__respawn_and_circuit() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn integration__crash__spawn_phase_death_counts_toward_circuit() {
+    // num_ctx-storm shape (live 2026-09-13): a child that dies during
+    // LOAD never becomes a tracked instance, so record_restart never
+    // fired and the breaker stayed closed through 21 consecutive
+    // spawn-retry 502s — each request re-pinned a doomed ctx and the
+    // child died at context creation on every attempt. A death during
+    // load is a crash-class restart; clean churn and pure load
+    // timeouts stay uncounted (the wave-7 contract).
+    let (_t, dirs) = setup(&[("m1", 500)]);
+    let mut engine = LlamaCppEngine::new(stub_manifest());
+    engine.child_env = vec![
+        (
+            "STUB_ARGV_FILE".into(),
+            dirs.run_dir().join("argv.json").display().to_string(),
+        ),
+        (
+            "STUB_DEVICES".into(),
+            "stub-gpu: STUB GPU (24000 MiB, 24000 MiB free)".into(),
+        ),
+        // Health can never win the race (503 forever) and the child
+        // dies (exit 3) mid-load on EVERY attempt: the 2-attempt spawn
+        // loop exhausts with child_died set — the storm's exact shape.
+        ("STUB_HEALTH_NEVER".into(), "1".into()),
+        ("STUB_DIE_MS".into(), "300".into()),
+    ];
+    let hw = Hardware {
+        physical_cores: 4,
+        total_ram_mib: 16_000,
+        gpus: vec![],
+    };
+    let mut s = Supervisor::new(
+        dirs.clone(),
+        base_config(),
+        EventBus::default(),
+        hw,
+        Arc::new(engine),
+    );
+    s.load_timeout = Duration::from_secs(3);
+    s.shutdown_grace = Duration::from_secs(2);
+    s.circuit_window = Duration::from_secs(30);
+    s.max_restarts = 2;
+    let sup = Arc::new(s);
+    // Three doomed spawn rounds → three counted restarts; the fourth
+    // ensure must hit CircuitOpen (recent 3 > max 2) instead of another
+    // full spawn-retry cycle.
+    for round in 0..3 {
+        let err = sup.ensure("m1").await.expect_err("child dies mid-load");
+        assert!(
+            matches!(err, SupervisionError::EngineCrashed(_)),
+            "round {round}: {err}"
+        );
+    }
+    match sup.ensure("m1").await {
+        Ok(_) => panic!("breaker must open after repeated load-phase deaths"),
+        Err(e) => assert!(matches!(e, SupervisionError::CircuitOpen(_)), "{e}"),
+    }
+    // Reset re-opens the path (unchanged breaker contract).
+    sup.reset_circuit(Some("m1"));
+    sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn integration__evict__concurrent_marks_clear_without_starving() {
     // The evicting mark is a tokio Mutex with an explicit clear (no
     // Drop): two concurrent evicts of one name must both complete and

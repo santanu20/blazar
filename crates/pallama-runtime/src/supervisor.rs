@@ -2499,6 +2499,16 @@ impl Supervisor {
         if let Some(p) = &auth_keyfile {
             let _ = std::fs::remove_file(p);
         }
+        // A child that DIED mid-load is a crash-class restart for the
+        // breaker's purposes: the num_ctx-storm shape (per-request
+        // respawn of a child that can never create its context) ran 21
+        // consecutive spawn-retries with the breaker never opening,
+        // because record_restart only counted deaths of TRACKED
+        // instances. Clean churn and pure load timeouts stay
+        // uncounted (the wave-7 contract).
+        if child_died_during_load {
+            self.record_restart(key);
+        }
         self.note_engine_failure(name);
         Err(if child_died_during_load {
             SupervisionError::EngineCrashed(format!(
