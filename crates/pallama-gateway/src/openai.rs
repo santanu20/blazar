@@ -1,7 +1,11 @@
 //! OpenAI-compatible surface: byte-faithful proxy to the child engine.
 //! Pallama never parses or rewrites these bodies — tool calls, structured
 //! output, logprobs, `stream_options` ride through untouched (complaint #1
-//! fidelity argument).
+//! fidelity argument). Two deliberate exceptions, both additive and
+//! user-explicit-wins: top-level `reasoning_effort` is bridged into
+//! `chat_template_kwargs` on /chat/completions (llama-server reads the
+//! kwarg, not the `OpenAI` field), and `stream_options.include_usage` is
+//! injected on streams so token accounting survives translation.
 
 use std::sync::Arc;
 
@@ -178,6 +182,37 @@ fn late_openai_response(model: &str, out: crate::latechunk::LateChunkOutput) -> 
     .into_response()
 }
 
+/// Bridge 's top-level `reasoning_effort` into llama-server's
+/// template dialect (`chat_template_kwargs.reasoning_effort`) — the child
+/// ignores the `OpenAI` field, templates that expose an effort knob read it
+/// from the kwargs. Returns true when the kwarg was injected. Explicit
+/// user kwargs always win; non-string/empty values ride verbatim.
+fn inject_reasoning_effort_kwarg(body: &mut serde_json::Value) -> bool {
+    let Some(effort) = body
+        .get("reasoning_effort")
+        .and_then(|v| v.as_str())
+        .filter(|e| !e.is_empty())
+        .map(str::to_string)
+    else {
+        return false;
+    };
+    if let Some(map) = body
+        .get_mut("chat_template_kwargs")
+        .and_then(|v| v.as_object_mut())
+    {
+        if map.contains_key("reasoning_effort") {
+            return false;
+        }
+        map.insert(
+            "reasoning_effort".to_string(),
+            serde_json::Value::String(effort.clone()),
+        );
+        return true;
+    }
+    body["chat_template_kwargs"] = json!({"reasoning_effort": effort});
+    true
+}
+
 /// All POST /v1/* traffic: one handler, one proxy path, zero body
 /// rewriting. `X-Pallama-Priority` orders admission under load.
 #[allow(clippy::too_many_lines)] // one cohesive admission + forwarding path
@@ -197,7 +232,7 @@ pub async fn openai_proxy(
     // this lane (model extraction, usage-flag injection, model-id
     // rewrite, single-flight stream detection); previously each
     // re-parsed the same bytes. Multipart bodies skip JSON entirely.
-    let parsed_body: Option<serde_json::Value> = if headers
+    let mut parsed_body: Option<serde_json::Value> = if headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.starts_with("multipart/form-data"))
@@ -243,6 +278,18 @@ pub async fn openai_proxy(
             body,
         )
         .await;
+    }
+    // Reasoning-effort bridge (chat lane only — /completions and
+    // /responses are unverified child surfaces for the kwarg): rewrite
+    // the parsed body BEFORE every downstream consumer so lint, affinity
+    // hashing, and the forwarded bytes all see the same final body.
+    let mut body = body;
+    if uri.path().ends_with("/chat/completions") {
+        if let Some(v) = parsed_body.as_mut() {
+            if inject_reasoning_effort_kwarg(v) {
+                body = Bytes::from(serde_json::to_vec(v).unwrap_or_default());
+            }
+        }
     }
     // Strict tool-def lint: catch broken definitions before the model
     // burns a turn (chat/responses lanes only). Prompt-fit preflight:
@@ -1035,5 +1082,47 @@ mod tests {
             adapters_target(&[], Some("only-pulled")),
             Some("only-pulled")
         );
+    }
+
+    #[test]
+    fn unit__inject_reasoning_effort_kwarg__bridges_top_level_field() {
+        let mut v = json!({
+            "model": "m1",
+            "reasoning_effort": "low",
+            "messages": [],
+        });
+        assert!(inject_reasoning_effort_kwarg(&mut v));
+        assert_eq!(v["chat_template_kwargs"]["reasoning_effort"], "low");
+        // Top-level field stays (children that DO read it still can).
+        assert_eq!(v["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn unit__inject_reasoning_effort_kwarg__explicit_user_kwarg_wins() {
+        let mut v = json!({
+            "reasoning_effort": "low",
+            "chat_template_kwargs": {"reasoning_effort": "max"},
+        });
+        assert!(!inject_reasoning_effort_kwarg(&mut v));
+        assert_eq!(v["chat_template_kwargs"]["reasoning_effort"], "max");
+        // Existing kwargs object keeps its siblings untouched.
+        let mut v2 = json!({
+            "reasoning_effort": "low",
+            "chat_template_kwargs": {"enable_thinking": true},
+        });
+        assert!(inject_reasoning_effort_kwarg(&mut v2));
+        assert_eq!(v2["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(v2["chat_template_kwargs"]["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn unit__inject_reasoning_effort_kwarg__non_string_and_empty_ignored() {
+        let mut num = json!({"reasoning_effort": 3});
+        assert!(!inject_reasoning_effort_kwarg(&mut num));
+        assert!(num.get("chat_template_kwargs").is_none());
+        let mut empty = json!({"reasoning_effort": ""});
+        assert!(!inject_reasoning_effort_kwarg(&mut empty));
+        let mut absent = json!({"model": "m1"});
+        assert!(!inject_reasoning_effort_kwarg(&mut absent));
     }
 }
