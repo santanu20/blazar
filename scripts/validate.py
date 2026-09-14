@@ -1410,6 +1410,14 @@ _K = [
     ("ngram_mod_n_max", False, False, "tune", None, "tune --ngram lane"),
     ("ngram_mod_n_min", False, False, "tune", None, "tune --ngram lane"),
     (
+        "reasoning",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "echo + boot (empty = flag not passed)",
+    ),
+    (
         "reasoning_budget",
         False,
         False,
