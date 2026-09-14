@@ -584,27 +584,17 @@ impl HfClient {
             }
         }
         let part = sibling_part_path(dest);
-        let mut have: u64 = 0;
-        let mut hasher = Sha256::new();
+        let (mut have, mut hasher) = seed_partial(&part).await?;
 
-        if part.exists() {
-            let len = std::fs::metadata(&part)
-                .map_err(|e| anyhow!("stat {}: {e}", part.display()))?
-                .len();
-            // Seed the hasher with existing bytes.
-            let existing = tokio::fs::File::open(&part).await?;
-            let mut reader = tokio::io::BufReader::new(existing);
-            let mut buf = vec![0u8; 1 << 20];
-            loop {
-                let n = reader.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-            }
-            have = len;
+        // A full-length `.part` reaching this lane is a sparse parallel
+        // artifact (or a stale upstream size): `bytes=have-` would 416 and
+        // appending past the end can only corrupt. Restart from zero —
+        // the sha256 gate still owns correctness.
+        if have > 0 && plan.bytes > 0 && have >= plan.bytes {
+            have = 0;
+            hasher = Sha256::new();
+            let _ = tokio::fs::remove_file(&part).await;
         }
-
         let mut req = self.http.get(url.clone());
         if let Some(token) = self.token_for(&url) {
             req = req.bearer_auth(token);
@@ -683,6 +673,29 @@ fn url_encode_path(path: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// Tail-resume seed for the classic lane: hash the existing `.part` bytes
+/// so the final sha256 covers the whole file, and report its length.
+async fn seed_partial(part: &Path) -> Result<(u64, Sha256)> {
+    let mut hasher = Sha256::new();
+    if !part.exists() {
+        return Ok((0, hasher));
+    }
+    let len = std::fs::metadata(part)
+        .map_err(|e| anyhow!("stat {}: {e}", part.display()))?
+        .len();
+    let existing = tokio::fs::File::open(part).await?;
+    let mut reader = tokio::io::BufReader::new(existing);
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok((len, hasher))
 }
 
 pub(crate) fn sibling_part_path(dest: &Path) -> PathBuf {
@@ -2497,6 +2510,60 @@ mod tests {
         let row = puller.pull("o/r").await.unwrap().row;
         let got = std::fs::read(&row.path).unwrap();
         assert_eq!(got, full, "resumed file must equal full content");
+    }
+
+    #[tokio::test]
+    async fn integration__resume_full_length_part__restarts_from_zero() {
+        // A `.part` already at the expected size is a sparse parallel-lane
+        // artifact (or a stale size): `bytes=have-` would 416. The classic
+        // lane must restart from zero instead of Range-requesting at EOF.
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = PallamaDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        dirs.ensure().unwrap();
+        let full = b"0123456789abcdef".to_vec();
+        let sha = payload(&full);
+
+        let dl = MockServer::start().await;
+        // Any Range request answers 416 (what a real server does at EOF);
+        // the plain GET serves the whole body.
+        Mock::given(method("GET"))
+            .and(path("/o/r/resolve/main/r.gguf"))
+            .and(wiremock::matchers::header_exists("Range"))
+            .respond_with(ResponseTemplate::new(416))
+            .mount(&dl)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/o/r/resolve/main/r.gguf"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(full.clone()))
+            .mount(&dl)
+            .await;
+
+        let dest = dirs.models_dir().join("r.gguf");
+        std::fs::write(dirs.models_dir().join("r.gguf.part"), [0xAA; 16]).unwrap();
+
+        let client =
+            HfClient::with_bases(&dl.uri(), &dl.uri(), None, vec![host_of(&dl.uri())]).unwrap();
+        let url: reqwest::Url = format!("{}/o/r/resolve/main/r.gguf", dl.uri())
+            .parse()
+            .unwrap();
+        let plan = FilePlan {
+            filename: "r.gguf".into(),
+            bytes: 16,
+            sha256: Some(sha),
+        };
+        let n = client
+            .download_to(url, &plan, &dest, &mut |_, _| {})
+            .await
+            .unwrap();
+        assert_eq!(n, 16);
+        assert_eq!(std::fs::read(&dest).unwrap(), full);
+        assert!(
+            !dirs.models_dir().join("r.gguf.part").exists(),
+            "no partial left"
+        );
     }
 
     #[tokio::test]

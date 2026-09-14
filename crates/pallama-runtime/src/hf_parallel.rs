@@ -162,16 +162,26 @@ pub(crate) async fn try_parallel(
     }
     let part = crate::hf::sibling_part_path(dest);
 
-    // Legacy compatibility: a `.part` without our sidecar belongs to the
-    // classic lane (tail-resume owns it), not us.
-    if part.exists() && load_sidecar(&part).ok().flatten().is_none() {
-        return Ok(None);
-    }
-
     // Probe: strict 206 + Content-Range. Anything else -> classic lane.
     let Some(total) = probe_range_total(http, token, url).await? else {
         return Ok(None);
     };
+
+    // A `.part` without our sidecar is either a classic-lane tail partial
+    // (contiguous verified prefix, shorter than the file) or our own
+    // orphaned full-length preallocation (sidecar lost; its length can
+    // never certify sparse chunk bytes). Only the latter is ours to
+    // re-fetch in place; the former must reach the classic tail-resume.
+    if part.exists() && load_sidecar(&part).ok().flatten().is_none() {
+        let len = std::fs::metadata(&part).map_or(0, |m| m.len());
+        if len < total {
+            return Ok(None);
+        }
+        tracing::info!(
+            "orphaned full-length .part without sidecar — re-fetching all chunks in place: {}",
+            part.display()
+        );
+    }
 
     let cp = chunk_plan(total, connections);
     let Some(done) = resume_state(&part, url, total, &cp)? else {
@@ -362,11 +372,18 @@ fn resume_state(
         {
             done = sc.done;
         }
-        Ok(_) => {
-            // Absent (fresh download) or mismatched (upstream changed,
-            // sidecar from another layout): discard and start clean.
+        Ok(Some(_)) => {
+            // Mismatched sidecar (upstream changed / foreign layout):
+            // discard both and start clean.
             let _ = std::fs::remove_file(part);
             let _ = std::fs::remove_file(sidecar_path(part));
+        }
+        Ok(None) => {
+            // No sidecar: fresh download, or an orphaned full-length
+            // preallocation whose allocation we keep (every chunk is
+            // re-fetched at fixed offsets either way). A short classic
+            // partial never reaches here — try_parallel routes it to
+            // the classic lane before we run.
         }
         Err(_) => return Ok(None),
     }
@@ -698,6 +715,68 @@ mod tests {
         let got = std::fs::read(&part).unwrap();
         assert_eq!(got, *payload);
         assert_eq!(progress.load(Ordering::Relaxed), payload_len);
+        sd.store(true, Ordering::Relaxed);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn integration__try_parallel__orphaned_full_length_part_refetched() {
+        // Sidecar lost after a preallocated failure: the full-length .part
+        // must be re-fetched in place by the parallel lane (every chunk,
+        // write_at is idempotent) — never handed down to the classic lane,
+        // whose length-based resume would send `bytes=total-` and 416.
+        let payload = Arc::new(write_payload(Path::new(".")));
+        let payload_len = payload.len() as u64;
+        let (addr, sd) = range_server(payload.clone(), Arc::new(AtomicU64::new(0))).await;
+        let dir = std::env::temp_dir().join(format!("pallama-orp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("m.gguf");
+        let part = crate::hf::sibling_part_path(&dest);
+        let _ = std::fs::remove_file(sidecar_path(&part));
+        let f = std::fs::File::create(&part).unwrap();
+        f.set_len(payload_len).unwrap();
+        drop(f);
+        let url: reqwest::Url = format!("http://{addr}/f.gguf").parse().unwrap();
+        let plan = FilePlan {
+            filename: "f.gguf".into(),
+            bytes: payload_len,
+            sha256: None,
+        };
+        let mut prog = |_, _| {};
+        let out = try_parallel(&http_client(), None, &url, &plan, &dest, 4, &mut prog)
+            .await
+            .unwrap();
+        assert_eq!(out, Some(payload_len));
+        assert_eq!(std::fs::read(&dest).unwrap(), *payload);
+        assert!(!part.exists(), "artifact finalized into dest");
+        sd.store(true, Ordering::Relaxed);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn integration__try_parallel__short_part_without_sidecar_routed_to_classic() {
+        // A short .part with no sidecar is a classic-lane tail partial
+        // (contiguous prefix): even against a Range-capable server the
+        // parallel lane must decline so the classic lane can resume it.
+        let payload = Arc::new(write_payload(Path::new(".")));
+        let payload_len = payload.len() as u64;
+        let (addr, sd) = range_server(payload.clone(), Arc::new(AtomicU64::new(0))).await;
+        let dir = std::env::temp_dir().join(format!("pallama-sho-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("m.gguf");
+        let part = crate::hf::sibling_part_path(&dest);
+        std::fs::write(&part, vec![0x5Au8; 1024]).unwrap();
+        let url: reqwest::Url = format!("http://{addr}/f.gguf").parse().unwrap();
+        let plan = FilePlan {
+            filename: "f.gguf".into(),
+            bytes: payload_len,
+            sha256: None,
+        };
+        let mut prog = |_, _| {};
+        let out = try_parallel(&http_client(), None, &url, &plan, &dest, 4, &mut prog)
+            .await
+            .unwrap();
+        assert_eq!(out, None, "short classic partial belongs to classic lane");
         sd.store(true, Ordering::Relaxed);
         std::fs::remove_dir_all(&dir).unwrap();
     }
