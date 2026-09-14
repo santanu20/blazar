@@ -852,7 +852,7 @@ impl EngineManager {
         // reinstall then pruned sglang).
         let mut kept_per_kind: std::collections::BTreeMap<&str, usize> =
             std::collections::BTreeMap::new();
-        for e in engines.iter() {
+        for e in &engines {
             let seen = kept_per_kind.entry(e.kind.as_str()).or_insert(0);
             *seen += 1;
             if *seen <= KEEP_TAGS || e.tag == LOCAL_TAG || Some(&e.tag) == active.as_ref() {

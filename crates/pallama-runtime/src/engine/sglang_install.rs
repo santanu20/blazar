@@ -213,12 +213,22 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
     // passthrough keeps probe (--) and spawn argv identical in shape.
     // venv/bin goes first on PATH so JIT build tools shipped inside the
     // venv (ninja — flashinfer compiles kernels at runtime) resolve.
+    // SGLANG_CACHE_DIR scopes sglang's third-party JIT caches (triton,
+    // inductor, nv, flashinfer — all derived from it since v0.5.19,
+    // setdefault semantics) to the engine dir: compiled kernels survive
+    // restarts AND `engine rm` reclaims them; `:-` keeps an explicit
+    // user override in charge.
+    let cache = dir.join("cache");
     let shim = dir.join("sglang-server");
     let script = format!(
-        "#!/bin/sh\nexport PATH=\"{}:$PATH\"\nexec \"{}\" -m sglang.launch_server \"$@\"\n",
+        "#!/bin/sh\nexport PATH=\"{}:$PATH\"\nexport \
+         SGLANG_CACHE_DIR=\"${{SGLANG_CACHE_DIR:-{}}}\"\nexec \"{}\" -m \
+         sglang.launch_server \"$@\"\n",
         venv.join("bin").display(),
+        cache.display(),
         venv_python.display()
     );
+    std::fs::create_dir_all(&cache).context("create engine cache dir")?;
     std::fs::write(&shim, script).context("write sglang-server shim")?;
     make_executable(&shim)?;
     Ok(shim)
@@ -235,6 +245,56 @@ fn make_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Parse an `X.Y.Z` version into a comparable tuple (`0.5.19` ->
+/// `(0, 5, 19)`). Pre-release suffixes (`0.5.20rc1`) compare by their
+/// numeric head, which is all the currency hint needs.
+#[must_use]
+pub fn version_tuple(v: &str) -> Option<(u64, u64, u64)> {
+    // Keep only the leading `X.Y.Z` core; anything after the first
+    // non-[0-9.] char is a pre-release suffix (`0.5.20rc1` -> `0.5.20`).
+    let core_end = v
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(v.len());
+    let mut it = v[..core_end]
+        .trim_end_matches('.')
+        .split('.')
+        .filter_map(|p| p.parse::<u64>().ok());
+    let maj = it.next()?;
+    let min = it.next()?;
+    let patch = it.next().unwrap_or(0);
+    Some((maj, min, patch))
+}
+
+/// Latest `sglang` version on `PyPI` (`/pypi/sglang/json` endpoint).
+/// Currency checks only — never a gate; failures surface as errors the CLI
+/// turns into a "cannot check" note, not a failed update.
+pub async fn pypi_latest_sglang(timeout: std::time::Duration) -> Result<String> {
+    #[derive(serde::Deserialize)]
+    struct PypiInfo {
+        version: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct PypiResp {
+        info: PypiInfo,
+    }
+    let http = reqwest::Client::builder()
+        .timeout(timeout)
+        .user_agent(concat!("pallama/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("pypi http client")?;
+    let resp: PypiResp = http
+        .get("https://pypi.org/pypi/sglang/json")
+        .send()
+        .await
+        .context("pypi sglang query")?
+        .error_for_status()
+        .context("pypi sglang status")?
+        .json()
+        .await
+        .context("pypi sglang json")?;
+    Ok(resp.info.version)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,5 +307,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let avail = disk_avail_bytes(dir.path()).unwrap();
         assert!(avail > 0);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__version_tuple__numeric_and_prerelease_heads() {
+        assert_eq!(version_tuple("0.5.19"), Some((0, 5, 19)));
+        assert_eq!(version_tuple("0.5.20rc1"), Some((0, 5, 20)));
+        assert_eq!(version_tuple("1.2"), Some((1, 2, 0)));
+        assert_eq!(version_tuple("latest"), None);
     }
 }

@@ -328,6 +328,9 @@ enum SessionCmd {
 enum EngineCmd {
     /// Install + activate the newest (or given) upstream build
     Update {
+        /// Engine lane to update: llamacpp (default) | sglang
+        #[arg(long, default_value = "llamacpp")]
+        kind: String,
         tag: Option<String>,
         /// Skip the decode-regression gate (tune-baseline bench compare)
         #[arg(long)]
@@ -1646,7 +1649,7 @@ async fn doctor_engine(d: &PallamaDirs) -> Vec<Check> {
             "engine currency",
             format!(
                 "{active} (sglang pip lane, version pinned at install) — update with: \
-                 pallama engine install --kind sglang [version]"
+                 pallama engine update --kind sglang [version]"
             ),
         ));
         return checks;
@@ -4990,7 +4993,21 @@ fn engine_regression_gate(
 async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
     let d = dirs();
     match cmd {
-        EngineCmd::Update { tag, no_gate } => engine_update(&d, tag, no_gate).await?,
+        EngineCmd::Update { kind, tag, no_gate } => {
+            let engine_kind: EngineKind = kind
+                .parse()
+                .map_err(|e| anyhow!("engine update --kind {kind:?}: {e}"))?;
+            match engine_kind {
+                EngineKind::LlamaCpp => engine_update(&d, tag, no_gate).await?,
+                EngineKind::Sglang => engine_update_sglang(&d, tag).await?,
+                EngineKind::MistralRs => {
+                    return Err(anyhow!(
+                        "mistralrs engines update via `pallama engine install --kind mistralrs \
+                         [tag]` — the update lane serves llamacpp and sglang"
+                    ));
+                }
+            }
+        }
         EngineCmd::List => {
             upstream_update_hint(&d).await;
             let store = Store::open(&d)?;
@@ -5094,7 +5111,7 @@ async fn engine_install_mistralrs(d: &PallamaDirs, tag: Option<String>) -> Resul
     Ok(())
 }
 
-/// `pallama engine install --kind sglang [version]` — pip venv lane
+/// `pallama engine update --kind sglang [version]` — pip venv lane
 /// (Linux + CUDA/ROCm). Multi-GB download: torch rides the venv. The
 /// F7 decode-regression gate is llama-server-only: skipped, and SAID
 /// so — llama-bench cannot drive an sglang child.
@@ -5116,6 +5133,60 @@ async fn engine_install_sglang(d: &PallamaDirs, version: Option<String>) -> Resu
     println!("note: decode-regression gate is llama-server-only — skipped for sglang engines");
     println!("next: pull a safetensors model (e.g. pallama pull Qwen/Qwen2.5-0.5B-Instruct)");
     restart_hint().await;
+    Ok(())
+}
+
+/// `engine update --kind sglang [version]` — explicit version installs
+/// directly; bare call is a warn-only `PyPI` currency check (the flag
+/// contract is pinned to the version this Pallama build was verified
+/// against, so newer releases opt in per-version, never auto-install).
+async fn engine_update_sglang(d: &PallamaDirs, version: Option<String>) -> Result<()> {
+    if version.is_some() {
+        return engine_install_sglang(d, version).await;
+    }
+    let store = Store::open(d)?;
+    let installed = store
+        .list_engines()?
+        .into_iter()
+        .filter(|e| e.kind == EngineKind::Sglang)
+        .max_by_key(|e| {
+            pallama_runtime::engine::sglang_install::version_tuple(
+                e.tag.trim_start_matches("sglang-"),
+            )
+            .unwrap_or((0, 0, 0))
+        })
+        .map(|e| e.tag.trim_start_matches("sglang-").to_string());
+    let Some(installed) = installed else {
+        return Err(anyhow!(
+            "no sglang engine installed — `pallama engine install --kind sglang` first"
+        ));
+    };
+    let latest = match pallama_runtime::engine::sglang_install::pypi_latest_sglang(
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            println!("sglang {installed} installed; cannot check PyPI right now: {e:#}");
+            return Ok(());
+        }
+    };
+    let pinned = pallama_runtime::engine::sglang_install::SGLANG_DEFAULT_VERSION;
+    match (
+        pallama_runtime::engine::sglang_install::version_tuple(&installed),
+        pallama_runtime::engine::sglang_install::version_tuple(&latest),
+    ) {
+        (Some(a), Some(b)) if b > a => {
+            println!("sglang {installed} installed; {latest} is available on PyPI.");
+            println!(
+                "note: this Pallama build verifies the sglang flag contract on {pinned} — \
+                 newer versions run with unknown flags skipped (profile warnings); opt in with:"
+            );
+            println!("  pallama engine update --kind sglang {latest}");
+        }
+        _ => println!("sglang {installed} is current (PyPI latest: {latest})."),
+    }
     Ok(())
 }
 

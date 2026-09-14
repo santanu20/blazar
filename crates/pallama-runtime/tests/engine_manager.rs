@@ -414,6 +414,7 @@ async fn integration__prune_keeps_newest_keep_tags_and_local() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn integration__prune_retention_is_scoped_per_kind() {
+    use pallama_core::engine_kind::EngineKind;
     let (_t, dirs) = tmp_dirs();
     let api = MockServer::start().await;
     let mgr = manager(&dirs, &api.uri());
@@ -435,7 +436,6 @@ async fn integration__prune_retention_is_scoped_per_kind() {
             })
             .unwrap();
     };
-    use pallama_core::engine_kind::EngineKind;
     // llamacpp lane past retention (3 > KEEP_TAGS) ...
     stage("b1", EngineKind::LlamaCpp, 1000);
     stage("b2", EngineKind::LlamaCpp, 1001);
