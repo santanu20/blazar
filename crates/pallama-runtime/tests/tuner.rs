@@ -59,6 +59,7 @@ static META: std::sync::LazyLock<GgufMeta> = std::sync::LazyLock::new(|| GgufMet
     pooling_type: None,
     chat_template: Some("{%- if tools %}{{ tool_calls }}{%- endif %}".into()),
     mtp_layers: None,
+    num_loops: None,
 });
 
 fn test_input<'a>(

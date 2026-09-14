@@ -1172,23 +1172,20 @@ fn semcache_hit_response(model: &str, cached: &Value, id: u64, sim: f32) -> Resp
     resp
 }
 
-/// The `--cache-ram` budget model for the unified `num_ctx` preflight:
-/// explicit `extra_args` wins; else the config request clamped at the
-/// MAX A16 tier (40% RAM) so this edge never refuses a shape compile
-/// would host (compile's live hit-rate tier may be looser, never
-/// tighter).
-fn unified_gateway_budget(
-    explicit_mib: Option<u64>,
-    config_mb: i64,
-    total_ram_mib: u64,
-) -> Option<u64> {
-    explicit_mib.or_else(|| {
-        let requested = u64::try_from(config_mb.max(0)).ok()?;
-        if requested == 0 {
-            return None;
-        }
-        Some(requested.min(total_ram_mib * 40 / 100))
-    })
+/// Scale the f16 KV estimate by the effective `cache_type` quant the
+/// spawn will actually use (mirrors the compiler's kv ladder), so the
+/// preflight judges the buffer the child allocates — the 400's own
+/// teaching (`cache_type = "q8_0" halves KV`) must not be a dead end
+/// when the user applies it.
+fn scale_kv_by_cache_type(kv_bytes: u64, cache_type: Option<&str>) -> u64 {
+    match cache_type {
+        Some("q8_0") => kv_bytes / 2,
+        Some("q4_0") => kv_bytes / 4,
+        Some("q4_1") => kv_bytes * 9 / 20,
+        Some("q5_0") => kv_bytes * 11 / 32,
+        Some("q5_1") => kv_bytes * 3 / 8,
+        _ => kv_bytes,
+    }
 }
 
 pub(crate) async fn apply_num_ctx(
@@ -1200,12 +1197,12 @@ pub(crate) async fn apply_num_ctx(
         return Err(api_error(400, "options.num_ctx must be positive"));
     }
     // ctx preflight (I5): refuse a num_ctx no spawn could host, BEFORE
-    // the evict below can take a healthy instance down. Unified spawns
-    // judge the --cache-ram RAM budget via the shared 2b verdict;
-    // classic spawns judge empty-GPU VRAM (weights + f16 KV).
-    // Conservative by design (no live-free query exists across
-    // backends): anything that passes still gets the engine's own fit
-    // juggling at spawn.
+    // the evict below can take a healthy instance down. One placement
+    // model for both lanes (device truth): the KV pool is device-backed
+    // under `--kv-unified` too, so both judge empty-GPU VRAM through
+    // the same shared 2b verdict. Conservative by design (no live-free
+    // query exists across backends): anything that passes still gets
+    // the engine's own fit juggling at spawn.
     {
         let row = state
             .with_store(|s| s.get_model(model).ok().flatten())
@@ -1214,70 +1211,23 @@ pub(crate) async fn apply_num_ctx(
             if let Ok(meta) = pallama_core::read_metadata_file(std::path::Path::new(&row.path)) {
                 let total_vram = state.sup.hardware.total_vram_mib();
                 if total_vram > 0 {
-                    let kv_unified = pallama_core::profile::kv_unified_for(
-                        &state.config,
-                        model,
-                        &state.sup.engine.capabilities().flags,
-                    );
-                    if kv_unified {
-                        // Same shared verdict as profile 2b: refuse a
-                        // doomed pin BEFORE the evict below can take a
-                        // healthy instance down and 502-loop the
-                        // requester through spawn retries. The budget
-                        // model mirrors compilation: explicit
-                        // extra_args --cache-ram wins; else the config
-                        // request clamped at the MAX A16 tier (40%) so
-                        // this edge never refuses a shape compile would
-                        // host (compile's tier may be looser, never
-                        // tighter).
-                        let explicit = state
-                            .config
-                            .overlay_for(model)
-                            .extra_args
-                            .as_deref()
-                            .and_then(pallama_core::profile::cache_ram_from_extra_args);
-                        let budget_mib = unified_gateway_budget(
-                            explicit,
-                            state.config.cache_ram_mb,
-                            state.sup.hardware.total_ram_mib,
-                        );
-                        let kv_bytes = crate::preflight::kv_f16_mib(
+                    let kv_bytes = scale_kv_by_cache_type(
+                        crate::preflight::kv_f16_mib(
                             &meta,
                             u64::try_from(want).unwrap_or(u64::MAX),
                         ) * 1024
-                            * 1024;
-                        if let pallama_core::profile::UnifiedCtxVerdict::Refuse(msg) =
-                            pallama_core::profile::unified_ctx_verdict(
-                                u64::try_from(row.bytes.max(0)).unwrap_or(u64::MAX),
-                                kv_bytes,
-                                budget_mib,
-                                false,
-                                state.sup.hardware.total_ram_mib,
-                                u32::try_from(want).unwrap_or(u32::MAX),
-                            )
-                        {
-                            return Err(api_error(400, &msg));
-                        }
-                        // Fit or RaiseTo: proceed — compile applies the
-                        // raise (or the explicit budget) at spawn.
-                    } else {
-                        // KV (MiB, f16): 2 (K+V) * layers * kv_heads * head_dim * ctx * 2B
-                        let kv = crate::preflight::kv_f16_mib(
-                            &meta,
-                            u64::try_from(want).unwrap_or(u64::MAX),
-                        );
-                        let weights =
-                            u64::try_from(row.bytes.max(0)).unwrap_or(u64::MAX) / (1024 * 1024);
-                        if weights.saturating_add(kv) > total_vram {
-                            return Err(api_error(
-                                400,
-                                &format!(
-                            "num_ctx {want} needs ~{kv} MiB KV on top of {weights} MiB weights — \
-                             over the {total_vram} MiB GPU. Lower num_ctx, pull a smaller quant, \
-                             or set cache_type = \"q8_0\""
-                                ),
-                            ));
-                        }
+                            * 1024,
+                        state.config.overlay_for(model).cache_type.as_deref(),
+                    );
+                    if let pallama_core::profile::UnifiedCtxVerdict::Refuse(msg) =
+                        pallama_core::profile::unified_ctx_verdict(
+                            u64::try_from(row.bytes.max(0)).unwrap_or(u64::MAX),
+                            kv_bytes,
+                            total_vram * 1024 * 1024,
+                            u32::try_from(want).unwrap_or(u32::MAX),
+                        )
+                    {
+                        return Err(api_error(400, &msg));
                     }
                 }
             }
@@ -2869,23 +2819,6 @@ mod tests {
         // day/month/year rollups land on real calendar boundaries
         assert_eq!(iso(86_399), "1970-01-01T23:59:59Z");
         assert_eq!(iso(86_400), "1970-01-02T00:00:00Z");
-    }
-
-    #[test]
-    fn unit__unified_gateway_budget__explicit_wins_then_max_tier_cap() {
-        // Explicit extra_args --cache-ram owns the budget verbatim…
-        assert_eq!(
-            unified_gateway_budget(Some(12_000), 8_192, 16_000),
-            Some(12_000)
-        );
-        // …else the config request clamped at the MAX A16 tier (40% of
-        // RAM) — never tighter than any live hit-rate tier compile may
-        // pick, so the gateway cannot refuse a shape compile would host.
-        assert_eq!(unified_gateway_budget(None, 8_192, 16_000), Some(6_400));
-        assert_eq!(unified_gateway_budget(None, 2_000, 16_000), Some(2_000));
-        // Knob off (0 = unlimited): no budget to judge — the shared
-        // verdict falls back to upstream's default pool bound.
-        assert_eq!(unified_gateway_budget(None, 0, 16_000), None);
     }
 
     #[test]

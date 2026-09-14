@@ -73,6 +73,14 @@ pub struct GgufMeta {
     /// KV-gated upstream, so tensor-only legacy grafts without the key
     /// report None (the engine could not boot draft-mtp on them either).
     pub mtp_layers: Option<u64>,
+    /// `{arch}.num_loops` — loop architectures (e.g. nanbeige) replay each
+    /// block N times: the loader builds `n_layer` = `block_count` × `num_loops`
+    /// KV-holding layers. Live-verified on nanbeige4.2: 22 blocks × 2
+    /// loops = 44 layers → 5632 MiB f16 KV @ 32768 ctx, exactly 2× the
+    /// block-only estimate. Clamped 1..=8 at parse; absent = 1. Only the
+    /// dense per-block token math scales with it — per-layer arrays
+    /// (recurrent/swa) count physical layers and stay unscaled.
+    pub num_loops: Option<u32>,
 }
 
 /// Architectures whose every layer is recurrent (no ctx-growing KV at all).
@@ -273,7 +281,10 @@ impl GgufMeta {
             // (vendored llama-memory-recurrent); nothing grows with ctx.
             return Some(0);
         }
-        let blocks = self.block_count?;
+        // Loop archs multiply the KV-holding layer count: the dense
+        // fallback (and only it — see the field doc) scales with loops.
+        let loops = u64::from(self.num_loops.unwrap_or(1));
+        let blocks = self.block_count?.saturating_mul(loops);
         let kv_heads = self.head_count_kv.or(self.head_count)?;
         let head_dim = self.derived_head_dim()?;
         let k_len = self.key_length.unwrap_or(head_dim);
@@ -652,6 +663,8 @@ pub fn parse_metadata(buf: &[u8]) -> CoreResult<(GgufMeta, usize)> {
         sliding_window_per_layer,
         full_attention_interval: get(format!("{arch}.full_attention_interval")),
         chat_template: extract_chat_template(&kvs),
+        num_loops: get(format!("{arch}.num_loops"))
+            .map(|n| u32::try_from(n.clamp(1, 8)).unwrap_or(1)),
         mtp_layers: get(format!("{arch}.n_predict_layers"))
             .filter(|&n| n > 0)
             .or_else(|| get(format!("{arch}.nextn_predict_layers")).filter(|&n| n > 0)),

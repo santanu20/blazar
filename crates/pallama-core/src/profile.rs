@@ -133,7 +133,7 @@ pub struct Profile {
     /// = weights exceed VRAM, engine splits CPU+GPU).
     pub gpu: &'static str,
     /// Estimated f16-equivalent KV-cache bytes at the compiled ctx, after
-    /// any KV quantization the profile chose (`q8_0` halves, `q4_0`
+    /// w KV quantization the profile chose (`q8_0` halves, `q4_0`
     /// quarters).
     /// Feeds the co-residency planner (A15); None when GGUF geometry is
     /// missing.
@@ -257,22 +257,26 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // 2b fit below sees — a second, drifting copy would walk to a
     // different np than 2b then hosts. Otherwise: the adaptive clamp
     // (A16) may pull the budget below the model's own weights, which
-    // under --kv-unified is unsatisfiable (weights live in the budget).
-    // The upstream live fitter then CPU-splits layers to honor the
-    // nonsense budget — live-measured on a 9B/8 GiB-VRAM/13.6 GiB
-    // box: --cache-ram 4102 < weights 5417 decoded at 15.6 t/s while
-    // a budget covering the weights decoded at 39.9 t/s, same argv
-    // otherwise. Floor the budget at weights + KV working-set floor +
-    // headroom when unified is on and the box's RAM can actually host
-    // it (60% sanity guard); otherwise keep the clamp and escalate.
-    let (mut cache_ram_budget, budget_floored): (Option<u64>, bool) = if let Some(v) =
+    // `--cache-ram` caps the model WEIGHTS mmap plus the prompt cache —
+    // it does NOT move the KV pool off the GPU (live-verified b10948:
+    // `llama_kv_cache: CUDA0 KV buffer` with `--kv-unified` on; the
+    // upstream flag only shares ONE buffer across sequences, and
+    // `--cache-ram` is the mmap cache cap per PR #16391). A sub-weights
+    // budget is still nonsense — the upstream live fitter then
+    // CPU-splits layers to honor it — live-measured on a 9B/8
+    // GiB-VRAM/13.6 GiB box: --cache-ram 4102 < weights 5417 decoded at
+    // 15.6 t/s while a budget covering the weights decoded at 39.9 t/s,
+    // same argv otherwise. Floor the budget at weights + headroom when
+    // unified is on and the box's RAM can actually host it (60% sanity
+    // guard); otherwise keep the clamp and escalate.
+    let cache_ram_budget: Option<u64> = if let Some(v) =
         cache_ram_from_extra_args(input.overlay.extra_args.as_deref().unwrap_or_default())
     {
         // Explicit `extra_args --cache-ram` wins over the config
         // knob (same doctrine as `-mm`): deliberate argv owns the
         // budget — no clamp, no floor, rule 12 emits nothing (the
         // flag lands exactly once, via extra_args itself).
-        (Some(v), false)
+        Some(v)
     } else if config.cache_ram_mb > 0 {
         let requested = u64::try_from(config.cache_ram_mb).unwrap_or(u64::MAX);
         let clamped = effective_cache_ram_mib(input).map_or(requested, |cap| requested.min(cap));
@@ -290,42 +294,35 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         }
         if kv_unified_emitted(input) && input.model_bytes > 0 {
             let weights_mib = input.model_bytes / (1024 * 1024);
-            // Derive the floor FROM 2b's own fit constraint at the ctx
-            // floor: demand (weights + f16 KV @ AUTOFIT_CTX_FLOOR + 64
-            // slack) must fit 2b's usable share (85%). A floor built any
-            // other way makes 2b hard-warn BY CONSTRUCTION — live-repro'd
-            // on a 9B: floor 5993 → 2b usable 5094 < weights 5417 alone,
-            // "cannot fit even at the ctx floor" on a spawn the engine
-            // handled fine. ×20/17 = ÷0.85 in integers.
-            let kv_floor_mib = kv_f16_bytes(input, AUTOFIT_CTX_FLOOR)
-                .unwrap_or(KV_UNIFIED_VRAM_FLOOR_BYTES)
-                / (1024 * 1024);
-            let floor_mib = (weights_mib + kv_floor_mib + 64) * 20 / 17;
+            // Floor FROM the budget's true job: it must host the weights
+            // mmap (x20/17 integer ÷0.85 headroom). The KV pool is
+            // device-side and deliberately NOT part of this budget.
+            let floor_mib = (weights_mib + 64) * 20 / 17;
             let ram_guard = input.hardware.total_ram_mib * 60 / 100;
             if clamped < floor_mib && floor_mib <= ram_guard {
                 warnings.push(format!(
-                    "cache-ram budget {clamped} MiB < weights {weights_mib} MiB under \
-                     --kv-unified (the budget must hold weights + KV) — floored to \
-                     {floor_mib} MiB; a sub-weights budget makes the engine fitter \
-                     CPU-split layers (measured 15.6 vs 39.9 t/s on a 9B)"
+                    "cache-ram budget {clamped} MiB < weights {weights_mib} MiB (the budget \
+                     caps the weights mmap) — floored to {floor_mib} MiB; a sub-weights budget \
+                     makes the engine fitter CPU-split layers (measured 15.6 vs 39.9 t/s on \
+                     a 9B)"
                 ));
-                (Some(floor_mib), true)
+                Some(floor_mib)
             } else if clamped < floor_mib {
                 warnings.push(format!(
                     "cache-ram budget {clamped} MiB cannot cover weights {weights_mib} MiB \
-                     under --kv-unified and the {floor_mib} MiB floor exceeds the 60% RAM \
-                     guard ({ram_guard} MiB) — set kv_unified = false, quant down \
-                     (pallama fit), or raise the budget; the fitter may CPU-split layers"
+                     and the {floor_mib} MiB floor exceeds the 60% RAM guard ({ram_guard} MiB) \
+                     — set kv_unified = false, quant down (pallama fit), or raise the budget; \
+                     the fitter may CPU-split layers"
                 ));
-                (Some(clamped), false)
+                Some(clamped)
             } else {
-                (Some(clamped), false)
+                Some(clamped)
             }
         } else {
-            (Some(clamped), false)
+            Some(clamped)
         }
     } else {
-        (None, false)
+        None
     };
     let mut rs = resolve_slots(
         input,
@@ -333,130 +330,119 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         base_ctx,
         vram_bytes,
         ctx_pinned,
-        UnifiedBudget {
-            mib: cache_ram_budget,
-            floored: budget_floored,
-        },
         &mut warnings,
     );
-    // --- 2b. unified-KV pool must fit the --cache-ram budget.
-    // With `--kv-unified` the WHOLE KV pool plus the weights mmap live
-    // inside the `--cache-ram` SYSTEM-RAM budget, so a ctx the VRAM
-    // planner happily admits can still blow the RAM budget and the child
-    // dies at context creation ("failed to create context") regardless
-    // of free VRAM. Shrink ctx (never below AUTOFIT_CTX_FLOOR) to fit;
-    // pinned ctx is never touched — warn instead. f16 bytes are an
-    // upper bound (quantized KV only shrinks it) — conservative by
-    // design.
+    // --- 2b. KV pool must fit the GPU. Live-verified child physics
+    // (b10948, manual exec): the KV cache allocates DEVICE-side on
+    // BOTH lanes — `--kv-unified` shares ONE buffer across sequences
+    // (its real saving: no per-slot duplication) and `--cache-ram` is
+    // the weights-mmap cap, not a KV relocation. Judge the unified
+    // pool against VRAM exactly like the classic path; the only
+    // unified-specific part is the shared-buffer geometry (KV scales
+    // with TOTAL ctx across slots either way). Shrink ctx (never
+    // below AUTOFIT_CTX_FLOOR) to fit; pinned ctx is never touched —
+    // verdict/refuse instead. f16 bytes are an upper bound (quantized
+    // KV only shrinks it) — conservative by design.
     if kv_unified_emitted(input) {
-        if let Some(kv) = kv_f16_bytes(input, rs.total_ctx).filter(|kv| *kv > 0) {
-            // Budget the spawn will actually run under: the rule-12
-            // emitted share (weights-floored in 2a-bis), else upstream's
-            // own default when the knob is off (flag absent, pool still
-            // bounded by it).
-            let budget_mib = cache_ram_budget.unwrap_or(8192);
-            // Compute buffers share the budget too; hold a headroom slice.
-            // Headroom lives in EXACTLY ONE place: a 2a-bis floor is
-            // BUILT with the 0.85 share already inside, so the fit check
-            // compares against the raw floor; an unfloored (clamped or
-            // explicit) budget still reserves the 15% here.
-            let usable = if budget_floored {
-                budget_mib * 1024 * 1024
+        if let Some(f16) = kv_f16_bytes(input, rs.total_ctx).filter(|kv| *kv > 0) {
+            // A PIN the f16 pool cannot host may still be hostable at
+            // the quant the spawn will actually run: an explicit
+            // cache_type override, or the ladder demotion the same
+            // tight card triggers anyway. The refuse teaching names
+            // this exact lever — it must not be a dead end.
+            let pinned_quant = if tuning.kv_quant == Some(true) {
+                Some("q8_0")
             } else {
-                budget_mib * 1024 * 1024 * 85 / 100
-            };
-            let demand = input.model_bytes.saturating_add(kv);
-            if demand > usable {
-                let mib = |b: u64| b / (1024 * 1024);
-                if ctx_pinned {
-                    // Pinned ctx is sovereign — never shrunk. The 2b
-                    // decision is the SHARED verdict (same fn the
-                    // gateway preflights with): honor the pin by
-                    // raising the budget when the RAM guard allows,
-                    // refuse with teaching when nothing legal can host
-                    // it. Warn-yet-proceed here is how a doomed pin
-                    // 502-looped through 21 spawn retries while the
-                    // child died at context creation every time.
-                    match unified_ctx_verdict(
-                        input.model_bytes,
-                        kv,
-                        cache_ram_budget,
-                        budget_floored,
-                        input.hardware.total_ram_mib,
-                        rs.total_ctx,
-                    ) {
-                        UnifiedCtxVerdict::Fit => {}
-                        UnifiedCtxVerdict::RaiseTo(raise_mib)
-                            if cache_ram_from_extra_args(
-                                input.overlay.extra_args.as_deref().unwrap_or_default(),
-                            )
-                            .is_none() =>
-                        {
-                            warnings.push(format!(
-                                "pinned ctx {}: --cache-ram budget raised {} -> {} MiB to \
-                                 honor the pin (weights {} + f16 KV {} MiB; within the 60% \
-                                 RAM guard)",
-                                rs.total_ctx,
-                                budget_mib,
-                                raise_mib,
-                                mib(input.model_bytes),
-                                mib(kv)
-                            ));
-                            cache_ram_budget = Some(raise_mib);
-                        }
-                        UnifiedCtxVerdict::RaiseTo(raise_mib) => {
-                            // An explicit extra_args budget cannot be
-                            // raised behind the user's back — the flag
-                            // would land twice with different values.
-                            return Err(format!(
-                                "extra_args --cache-ram {budget_mib} MiB cannot host pinned \
-                                 ctx {} (weights {} + f16 KV {} = {} MiB): raise the \
-                                 extra_args value to at least {raise_mib} MiB, lower num_ctx, \
-                                 a smaller quant (pallama fit), or kv_unified = false",
-                                rs.total_ctx,
-                                mib(input.model_bytes),
-                                mib(kv),
-                                mib(demand),
-                            ));
-                        }
-                        UnifiedCtxVerdict::Refuse(msg) => return Err(msg),
-                    }
+                let explicit = config.effective_cache_type(input.model_name);
+                if explicit.is_empty() {
+                    let mut scratch: Vec<String> = Vec::new();
+                    kv_quant_ladder(input, vram_bytes, rs.total_ctx, &mut scratch)
                 } else {
-                    let per_ctx = kv / u64::from(rs.total_ctx);
-                    let room = usable.saturating_sub(input.model_bytes);
-                    let fit = room / per_ctx.max(1);
-                    // 256-token multiple keeps upstream-friendly sizes.
-                    let new_ctx = u32::try_from(fit).unwrap_or(u32::MAX) & !255;
-                    if new_ctx >= AUTOFIT_CTX_FLOOR && new_ctx < rs.total_ctx {
-                        let per_slot = (new_ctx / rs.slots).max(1);
-                        warnings.push(format!(
-                            "unified KV pool fit: ctx {} -> {} (f16 KV {} MiB + \
-                             weights {} MiB vs --cache-ram budget {} MiB)",
-                            rs.total_ctx,
-                            new_ctx,
-                            mib(kv),
-                            mib(input.model_bytes),
-                            budget_mib
-                        ));
-                        // Same (per_slot, slots) pair resolve_slots uses, so
-                        // the SlotsCtxAutoFit event stays truthful.
-                        rs.autofit = Some((per_slot, rs.slots));
-                        rs.total_ctx = new_ctx;
-                        rs.per_slot_ctx = per_slot;
-                    } else {
-                        warnings.push(format!(
-                            "unified KV pool cannot fit the --cache-ram budget \
-                             ({budget_mib} MiB) even at the ctx floor {AUTOFIT_CTX_FLOOR}: spawn will likely \
-                             fail — raise the budget via model_overrides extra_args \
-                             --cache-ram or reduce weights"
-                        ));
+                    match explicit {
+                        "f32" | "f16" | "bf16" => None,
+                        t => Some(match t {
+                            "q8_0" => "q8_0",
+                            "q4_0" => "q4_0",
+                            "q4_1" => "q4_1",
+                            "q5_0" => "q5_0",
+                            "q5_1" => "q5_1",
+                            _ => "f16",
+                        }),
                     }
+                }
+            };
+            let kv = match pinned_quant {
+                Some("q8_0") => f16 / 2,
+                Some("q4_0") => f16 / 4,
+                Some("q4_1") => f16 * 9 / 20,
+                Some("q5_0") => f16 * 11 / 32,
+                Some("q5_1") => f16 * 3 / 8,
+                _ => f16,
+            };
+            let mib = |b: u64| b / (1024 * 1024);
+            let demand = input.model_bytes.saturating_add(kv);
+            let vram85 = vram_bytes / 100 * 85;
+            if ctx_pinned {
+                // Pinned ctx is sovereign — never shrunk. The SHARED
+                // verdict (same fn the gateway preflights with) refuses
+                // a pin the device cannot host; warn-yet-proceed here is
+                // how a doomed pin 502-looped through spawn retries
+                // while the child died at context creation every time.
+                if let UnifiedCtxVerdict::Refuse(msg) =
+                    unified_ctx_verdict(input.model_bytes, kv, vram_bytes, rs.total_ctx)
+                {
+                    return Err(msg);
+                }
+                if demand > vram85 {
+                    // Middle zone (85%..100%): physically hostable, so
+                    // serve it — but gpu-layers stays on the engine's
+                    // live fitter, which may CPU-split the last layers.
+                    // Honest degraded serve, not a refuse.
+                    warnings.push(format!(
+                        "pinned ctx {} fits the {} MiB VRAM only above the 85% share \
+                         (demand {} MiB) — gpu-layers left to the engine fitter; it may \
+                         CPU-split layers for the last stretch",
+                        rs.total_ctx,
+                        mib(vram_bytes),
+                        mib(demand)
+                    ));
+                }
+            } else if demand > vram_bytes {
+                let per_ctx = kv / u64::from(rs.total_ctx);
+                let fit =
+                    (vram_bytes / 100 * 85).saturating_sub(input.model_bytes) / per_ctx.max(1);
+                // 256-token multiple keeps upstream-friendly sizes.
+                let new_ctx = u32::try_from(fit).unwrap_or(u32::MAX) & !255;
+                if new_ctx >= AUTOFIT_CTX_FLOOR && new_ctx < rs.total_ctx {
+                    let per_slot = (new_ctx / rs.slots).max(1);
+                    warnings.push(format!(
+                        "unified KV pool fit: ctx {} -> {} (f16 KV {} MiB + weights {} MiB \
+                             vs {} MiB VRAM)",
+                        rs.total_ctx,
+                        new_ctx,
+                        mib(kv),
+                        mib(input.model_bytes),
+                        mib(vram_bytes)
+                    ));
+                    // Same (per_slot, slots) pair resolve_slots uses, so
+                    // the SlotsCtxAutoFit event stays truthful.
+                    rs.autofit = Some((per_slot, rs.slots));
+                    rs.total_ctx = new_ctx;
+                    rs.per_slot_ctx = per_slot;
+                } else {
+                    warnings.push(format!(
+                        "unified KV pool cannot fit the {} MiB VRAM even at the ctx floor \
+                             {AUTOFIT_CTX_FLOOR}: spawn will likely fail — pull a smaller quant \
+                             (pallama fit) or set cache_type = \"q8_0\"",
+                        mib(vram_bytes)
+                    ));
                 }
             }
         }
     }
     let slots = rs.slots;
     let ctx = rs.total_ctx;
+
     let fa = match tuning.fa {
         Some(true) => "on",
         Some(false) => "off",
@@ -1169,7 +1155,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // --- 11y. experimental upstream agent-tooling passthrough
     // (`--tools` / `--tools-runtime` / `--mcp-servers-config|-json`).
     // Opt-in only — never defaulted. The engine limits CORS to localhost
-    // when any of these is set; a flag-less engine degrades to a teaching
+    // when w of these is set; a flag-less engine degrades to a teaching
     // warning (user intent stays visible). The MCP config PATH is
     // existence-checked here: a typo should fail at profile-compile,
     // not after a 5 s boot (mirrors the draft-model discipline).
@@ -1938,28 +1924,24 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     }
     // Draft KV: the spec pair allocates its own device-side KV at the
     // same compiled ctx; charge it (f16, conservative) so the
-    // co-residency planner stops under-counting spec pairs. Unified mode
-    // keeps the dense KV in the cache-ram budget (floor charge) but the
-    // DRAFT's KV still lands on the card.
+    // co-residency planner stops under-counting spec pairs. Device
+    // truth: dense and draft KV both live on the card on EITHER lane
+    // (`--kv-unified` shares buffers, it does not relocate them).
     let draft_kv = input
         .draft_gguf
         .and_then(|g| kv_f16_bytes_meta(g, rs.total_ctx))
         .unwrap_or(0);
-    let kv_est_bytes = if kv_unified_emitted(input) {
-        Some(KV_UNIFIED_VRAM_FLOOR_BYTES + draft_kv)
-    } else {
-        kv_f16_bytes(input, ctx).map(|f16| {
-            let dense = match kv_type.as_deref() {
-                Some("q8_0") => f16 / 2,
-                Some("q4_0") => f16 / 4,
-                Some("q4_1") => f16 * 9 / 20,
-                Some("q5_0") => f16 * 11 / 32,
-                Some("q5_1") => f16 * 3 / 8,
-                _ => f16,
-            };
-            dense + draft_kv
-        })
-    };
+    let kv_est_bytes = kv_f16_bytes(input, ctx).map(|f16| {
+        let dense = match kv_type.as_deref() {
+            Some("q8_0") => f16 / 2,
+            Some("q4_0") => f16 / 4,
+            Some("q4_1") => f16 * 9 / 20,
+            Some("q5_0") => f16 * 11 / 32,
+            Some("q5_1") => f16 * 3 / 8,
+            _ => f16,
+        };
+        dense + draft_kv
+    });
 
     Ok(Profile {
         argv,
@@ -1982,21 +1964,22 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
 /// must fit a single micro-batch; a full-ctx ubatch OOMs tight GPUs.
 pub const LATE_CHUNK_UBATCH_DEFAULT: u32 = 2048;
 
-/// VRAM the unified KV cache still touches when `--kv-unified` hosts the
-/// buffer in the `--cache-ram` (system RAM) budget: the resident slice +
-/// paging working set. Measured as part of the ~548 MiB non-weights
-/// overhead of a fully-offloaded 16k-ctx spawn (CUDA context + compute
-/// buffers included) on an 8 GiB card — see `resolve_gpu_offload`.
-/// Public: the gateway's per-request `num_ctx` preflight charges the same
-/// floor when the spawn carries `--kv-unified` (see `kv_unified_for`).
+/// VRAM the unified KV cache still touches on TOP of its f16 pool when
+/// `--kv-unified` is on: the resident slice + paging working set
+/// (device-backed pool — see `estimate_kv_vram_charge`). Measured as
+/// part of the ~548 MiB non-weights overhead of a fully-offloaded 16k
+/// spawn (CUDA context + compute buffers included) on an 8 GiB card.
+/// Public: the supervisor's bytes admission charges it as the standing
+/// working-set slice (see `admission_floor_bytes`).
 pub const KV_UNIFIED_VRAM_FLOOR_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Fixed spawn overhead (CUDA/Vulkan context, graphs, compute buffers)
-/// charged INSTEAD of a percentage margin once the KV term is
-/// floor-charged: the classic 15% reserve mostly stood for KV
-/// uncertainty, which `--kv-unified` removes. Measured ~548 MiB total
-/// non-weights overhead on a fully-offloaded b10809 spawn; 700 MiB adds
-/// margin for bigger compute buffers (long ctx, mmproj bursts).
+/// charged as the standing overhead when the planner floor-charges
+/// instead of using a percentage margin (bytes admission, the unified
+/// ctx verdict's refuse threshold, spec-draft attach gate). Measured
+/// ~548 MiB total non-weights overhead on a fully-offloaded b10809
+/// spawn; 700 MiB adds margin for bigger compute buffers (long ctx,
+/// mmproj bursts).
 const UNIFIED_SPAWN_OVERHEAD_BYTES: u64 = 700 * 1024 * 1024;
 
 /// Measured-floor admission charge for a candidate spawn: weights +
@@ -2230,7 +2213,7 @@ fn push_tuned(
 /// - C: weights alone overflow -> derived `--cpu-offload-gb` for the
 ///   overflow (host RAM permitting) + fp8 KV + tight knobs.
 /// - D: even offload can't bridge it (or host RAM is too small) -> hard
-///   refusal with the numbers, BEFORE any child spawns. An OOM
+///   refusal with the numbers, BEFORE w child spawns. An OOM
 ///   crash-loop at spawn is a planner bug, not an operational state.
 ///
 /// No GPU at all → `--device cpu` lane with a loud warning.
@@ -2938,18 +2921,15 @@ pub fn estimate_kv_f16(input: &ProfileInput<'_>, ctx: Option<u32>) -> Option<u64
     kv_f16_bytes(input, ctx)
 }
 
-/// VRAM the KV cache will actually occupy at spawn: the full f16 estimate
-/// on the classic path, but only the measured working-set floor when the
-/// compiled argv will carry `--kv-unified` (the buffer then lives in the
-/// `--cache-ram` system-RAM budget). Callers judging GPU capacity — the
-/// supervisor's co-residency planner and auto tensor-split — must charge
-/// THIS, not the raw f16 estimate, or unified spawns read as 2-4x their
-/// real VRAM demand and get downgraded/evicted on phantom pressure.
+/// VRAM the KV cache will actually occupy at spawn. Device truth
+/// (live-verified b10948): the KV cache allocates DEVICE-side on BOTH
+/// lanes — `--kv-unified` shares one buffer across sequences but never
+/// moves it to system RAM — so the charge is the full f16 estimate
+/// either way. Lane-independent by design: unified spawns must not be
+/// read as 2-4x cheaper than they really are, or co-residency planning
+/// downgrades/evicts on phantom headroom.
 #[must_use]
 pub fn estimate_kv_vram_charge(input: &ProfileInput<'_>, ctx: Option<u32>) -> Option<u64> {
-    if kv_unified_emitted(input) {
-        return Some(KV_UNIFIED_VRAM_FLOOR_BYTES);
-    }
     estimate_kv_f16(input, ctx)
 }
 
@@ -2978,60 +2958,56 @@ fn effective_cache_ram_mib(input: &ProfileInput<'_>) -> Option<u64> {
     Some(requested.min(cap))
 }
 
-/// Verdict for a PINNED unified-KV ctx against the `--cache-ram` budget:
-/// the 2b fit constraint as ONE decision shared by profile compilation
-/// and the gateway `num_ctx` preflight. Both sites must refuse the same
-/// shapes — a split brain here is how a doomed pin evicts a healthy
-/// instance and 502-loops the requester (live-repro'd 2026-09-13: 21x
+/// Verdict for a PINNED unified-KV ctx against the GPU: the 2b fit
+/// constraint as ONE decision shared by profile compilation and the
+/// gateway `num_ctx` preflight. Both sites must refuse the same shapes
+/// — a split brain here is how a doomed pin evicts a healthy instance
+/// and 502-loops the requester (live-repro'd 2026-09-13: 21x
 /// spawn-retry of a child that could never create its context).
 #[must_use]
 pub enum UnifiedCtxVerdict {
-    /// Weights + f16 KV fit the usable budget share as-is.
+    /// Weights + f16 KV fit the device (the 85%..100% band is still
+    /// `Fit` — the offload resolver answers it with `auto`, letting
+    /// the engine fitter split layers; honest degraded serve).
     Fit,
-    /// The pin is honorable by raising the `--cache-ram` budget to this
-    /// many MiB — demand + headroom with the 0.85 share pre-applied
-    /// (the same floor algebra 2a-bis uses), legal only within the 60%
-    /// RAM sanity guard.
-    RaiseTo(u64),
-    /// No legal budget can host the pin: refuse, with teaching text.
+    /// The device cannot host the pin even at 100%: refuse, with
+    /// teaching text.
     Refuse(String),
 }
 
-/// The shared 2b decision. `model_bytes`/`kv_bytes` are bytes (f16 KV at
-/// the pinned TOTAL ctx); `budget_mib` is the effective `--cache-ram`
-/// budget in MiB (None = knob off, upstream default pool); `budget_floored`
-/// marks a 2a-bis floor (share already inside).
+/// The shared 2b decision, judged against DEVICE VRAM — the unified KV
+/// pool is device-backed (live-verified b10948: `CUDA0 KV buffer` with
+/// `--kv-unified` on; the flag shares one buffer across sequences, it
+/// does not move the pool to system RAM). `model_bytes`/`kv_bytes` are
+/// bytes (f16 KV at the pinned TOTAL ctx), `total_vram_bytes` the
+/// capacity the spawn would contend for.
 pub fn unified_ctx_verdict(
     model_bytes: u64,
     kv_bytes: u64,
-    budget_mib: Option<u64>,
-    budget_floored: bool,
-    total_ram_mib: u64,
+    total_vram_bytes: u64,
     ctx: u32,
 ) -> UnifiedCtxVerdict {
     let mib = |b: u64| b / (1024 * 1024);
     let weights_mib = mib(model_bytes);
     let kv_mib = mib(kv_bytes);
-    let usable_mib = match budget_mib {
-        Some(b) if budget_floored => b,
-        Some(b) => b * 85 / 100,
-        None => 8192 * 85 / 100,
-    };
-    if weights_mib + kv_mib <= usable_mib {
+    let vram_mib = mib(total_vram_bytes);
+    let demand_mib = weights_mib + kv_mib;
+    if demand_mib
+        .saturating_mul(1024 * 1024)
+        .saturating_add(UNIFIED_SPAWN_OVERHEAD_BYTES)
+        <= total_vram_bytes
+    {
         return UnifiedCtxVerdict::Fit;
     }
-    let raise_mib = (weights_mib + kv_mib + 64) * 20 / 17;
-    let ram_guard_mib = total_ram_mib * 60 / 100;
-    if raise_mib <= ram_guard_mib {
-        return UnifiedCtxVerdict::RaiseTo(raise_mib);
-    }
     UnifiedCtxVerdict::Refuse(format!(
-        "pinned num_ctx {ctx} cannot fit: weights {weights_mib} MiB + f16 KV {kv_mib} MiB = {} MiB demand and the {raise_mib} MiB budget raise it needs exceeds the 60% RAM guard ({ram_guard_mib} MiB of {total_ram_mib} MiB) — lower num_ctx, a smaller quant (pallama fit), cache_type = \"q8_0\", or kv_unified = false",
-        weights_mib + kv_mib
+        "pinned num_ctx {ctx} cannot fit the GPU: weights {weights_mib} MiB + KV {kv_mib} \
+         MiB = {demand_mib} MiB demand (+{} MiB spawn overhead) exceeds the {vram_mib} MiB VRAM \
+         — lower num_ctx, cache_type = \"q8_0\" (halves KV), or a smaller quant (pallama fit)",
+        UNIFIED_SPAWN_OVERHEAD_BYTES / (1024 * 1024)
     ))
 }
 
-/// The `--cache-ram <MiB>` value spelled in `extra_args`, if any
+/// The `--cache-ram <MiB>` value spelled in `extra_args`, if w
 /// (`--cache-ram=X` accepted). Explicit argv wins over the config knob
 /// (the same doctrine as `-mm`): the user owns the budget, the A16
 /// clamp and the 2a-bis floor do not override deliberate argv, and
@@ -3066,16 +3042,6 @@ struct ResolvedSlots {
     autofit: Option<(u32, u32)>,
 }
 
-/// The effective `--cache-ram` budget resolved by compile's 2a-bis block
-/// (explicit `extra_args` > config clamp/floor), passed to the slot
-/// resolver so a pinned-ctx slot walk-down judges against the EXACT
-/// budget the 2b fit will use — never a second, drifting copy of it.
-#[derive(Clone, Copy)]
-struct UnifiedBudget {
-    mib: Option<u64>,
-    floored: bool,
-}
-
 /// Per-slot ctx floor for auto-fit: ollama's own default context (and its
 /// VRAM-tier auto-fit never goes below it). Halving past 4096 would trade
 /// usable prompt room for slots the workload may not have.
@@ -3103,7 +3069,6 @@ fn resolve_slots(
     base_ctx: u32,
     vram_bytes: u64,
     ctx_pinned: bool,
-    budget: UnifiedBudget,
     warnings: &mut Vec<String>,
 ) -> ResolvedSlots {
     let slots = overlay.slots.unwrap_or(input.config.slots);
@@ -3137,15 +3102,9 @@ fn resolve_slots(
         };
     }
     // --- auto: probe capacity at the resolved per-slot ctx first
-    let mut np = auto_slots_capacity(input, base_ctx, vram_bytes);
+    let np = auto_slots_capacity(input, base_ctx, vram_bytes);
     if vulkan_mmproj_guard(input) {
         warn_vulkan_slot_cap(input, base_ctx, vram_bytes, warnings);
-    }
-    // A PINNED ctx makes the pool total (np x pin) a hard demand the
-    // capacity axes never validated (see walk_pinned_np) — re-derive a
-    // hostable count before committing to one.
-    if ctx_pinned && kv_unified_emitted(input) && np >= 2 {
-        np = walk_pinned_np(input, np, base_ctx, budget, warnings);
     }
     if np >= 2 {
         warnings.push(format!(
@@ -3205,77 +3164,6 @@ fn resolve_slots(
     }
 }
 
-/// Walk an auto-derived slot count DOWN while the pinned-ctx pool it
-/// implies refuses the shared unified verdict: the capacity axes
-/// (`ram_slots` = budget / per-slot KV) never charge the weights sharing
-/// that budget nor the pool multiplier, so auto can hand 2b an np whose
-/// pool no legal budget raise can host (live: pin 32768 on a
-/// 262k-trained model auto-derived np4 -> pool 131072 -> refuse, while
-/// np1 hosted the same pin fine). Returns the largest hostable count —
-/// 1 when every count refuses, which is the true teaching shape (the
-/// same np = 1 form the gateway's per-request preflight judges).
-/// Explicit slots never enter here: a user pin conflicting with the
-/// budget fails loudly at 2b instead of being silently re-derived.
-fn walk_pinned_np(
-    input: &ProfileInput<'_>,
-    np: u32,
-    base_ctx: u32,
-    budget: UnifiedBudget,
-    warnings: &mut Vec<String>,
-) -> u32 {
-    if pool_hosts_pin(input, np, base_ctx, budget) {
-        return np;
-    }
-    let mut walked = 1;
-    for cand in (1..np).rev() {
-        if pool_hosts_pin(input, cand, base_ctx, budget) {
-            walked = cand;
-            break;
-        }
-    }
-    warnings.push(format!(
-        "pinned ctx {base_ctx}: auto slots np {np} pool ({} ctx) exceeds the \
-         --cache-ram budget and its raisable headroom (60% RAM guard) — \
-         walked down to np {walked} (pool {}); pin slots = {np} to force the \
-         conflict to error instead",
-        np * base_ctx,
-        walked * base_ctx
-    ));
-    walked
-}
-
-/// True when the unified pool `slots x per_ctx` can host a pinned ctx
-/// under the exact 2a-bis budget: verdict `Fit` (already fits) or
-/// `RaiseTo` (a legal budget raise exists within the 60% RAM guard).
-/// Refuse means no legal shape hosts that count. Unknown KV geometry is
-/// only ever "hostable" at a single slot — same never-guess doctrine as
-/// `auto_slots_capacity`.
-fn pool_hosts_pin(
-    input: &ProfileInput<'_>,
-    slots: u32,
-    per_ctx: u32,
-    budget: UnifiedBudget,
-) -> bool {
-    if slots <= 1 {
-        return true;
-    }
-    let total = slots * per_ctx;
-    match kv_f16_bytes(input, total) {
-        Some(kv) if kv > 0 => !matches!(
-            unified_ctx_verdict(
-                input.model_bytes,
-                kv,
-                budget.mib,
-                budget.floored,
-                input.hardware.total_ram_mib,
-                total,
-            ),
-            UnifiedCtxVerdict::Refuse(_)
-        ),
-        _ => false,
-    }
-}
-
 /// True when the conservative vulkan-class + projector guard applies (see
 /// `auto_slots_capacity`): mixed integrated+discrete census on a unified
 /// build with a projector attached.
@@ -3304,10 +3192,12 @@ fn warn_vulkan_slot_cap(
 ) {
     const AUTO_SLOTS_CAP: u32 = 4;
     let resident = input.model_bytes.saturating_add(mmproj_size(input));
+    let Some(kv_per_slot) = kv_f16_bytes(input, per_slot_ctx) else {
+        return;
+    };
     let headroom = vram_bytes
         .saturating_sub(resident)
-        .saturating_sub(KV_UNIFIED_VRAM_FLOOR_BYTES)
-        .saturating_sub(UNIFIED_SPAWN_OVERHEAD_BYTES);
+        .saturating_sub(kv_per_slot);
     let cap = (headroom / (u64::from(per_slot_ctx) * UNIFIED_COMPUTE_PER_TOKEN_BYTES))
         .min(u64::from(AUTO_SLOTS_CAP))
         .max(1);
@@ -3324,11 +3214,11 @@ fn warn_vulkan_slot_cap(
 /// Capacity-aware slot count for `slots = 0`, pure (no warnings — the
 /// auto-fit loop probes it repeatedly). Clamps, in order: the measured
 /// 4-slot sweet spot; the model's trained context (the scaled total
-/// cannot exceed it); the KV RAM budget (`--cache-ram` effective value
-/// when unified — unlimited falls back to a third of physical RAM, rule
-/// 12's static clamp share); and, on the classic path where KV IS
-/// VRAM-resident, the same 85% envelope the offload resolver uses.
-/// Unknown KV geometry means unknown cost: stay single-slot, never guess.
+/// cannot exceed it); the `--cache-ram` mmap soft cap (prompt-cache
+/// working set, NOT the KV pool — the pool is device-backed on both
+/// lanes); and the 85% VRAM envelope the offload resolver uses (the KV
+/// charge is VRAM-resident everywhere). Unknown KV geometry means
+/// unknown cost: stay single-slot, never guess.
 fn auto_slots_capacity(input: &ProfileInput<'_>, base_ctx: u32, vram_bytes: u64) -> u32 {
     const AUTO_SLOTS_CAP: u32 = 4;
     if base_ctx == 0 {
@@ -3355,25 +3245,19 @@ fn auto_slots_capacity(input: &ProfileInput<'_>, base_ctx: u32, vram_bytes: u64)
     };
     let ram_slots = clamp_to_cap(ram_budget_bytes / kv_per_slot);
     let resident = input.model_bytes.saturating_add(mmproj_size(input));
-    let vram_slots = if kv_unified_emitted(input) {
-        // Unified KV hosts the cache in system RAM, so the classic
-        // ctx-scaled KV charge does not apply — but ctx-scaled compute
-        // buffers still live in VRAM, and vulkan-class builds with a
-        // projector attached allocate fat enough to overcommit the card
-        // at multi-slot totals (measured: see UNIFIED_COMPUTE_PER_TOKEN_
-        // BYTES). CUDA-class builds and projector-free vulkan spawns
-        // measured healthy at the flat cap, so only that combination
-        // pays the conservative per-token charge.
-        if vulkan_mmproj_guard(input) {
-            let headroom = vram_bytes
-                .saturating_sub(resident)
-                .saturating_sub(KV_UNIFIED_VRAM_FLOOR_BYTES)
-                .saturating_sub(UNIFIED_SPAWN_OVERHEAD_BYTES);
-            clamp_to_cap(headroom / (u64::from(base_ctx) * UNIFIED_COMPUTE_PER_TOKEN_BYTES))
-        } else {
-            AUTO_SLOTS_CAP
-        }
+    let vram_slots = if vulkan_mmproj_guard(input) {
+        // Mixed integrated+discrete census with a projector attached:
+        // each slot costs its f16 KV PLUS the measured per-token compute
+        // charge (see UNIFIED_COMPUTE_PER_TOKEN_BYTES) — the vulkan
+        // build allocates fat ctx-scaled compute buffers that the KV
+        // term alone never sees (measured degraded boot at np2/32k on
+        // an 8 GiB card).
+        let per_slot_bytes = kv_per_slot + u64::from(base_ctx) * UNIFIED_COMPUTE_PER_TOKEN_BYTES;
+        let headroom = vram_bytes.saturating_sub(resident);
+        clamp_to_cap(headroom / per_slot_bytes)
     } else {
+        // Device truth: the KV pool is VRAM-resident on BOTH lanes, so
+        // slot capacity pays the same 85% envelope everywhere.
         let headroom = (vram_bytes / 100 * 85).saturating_sub(resident);
         clamp_to_cap(headroom / kv_per_slot)
     };
@@ -3396,7 +3280,7 @@ fn auto_slots_capacity(input: &ProfileInput<'_>, base_ctx: u32, vram_bytes: u64)
 ///   fine-grained estimate beats ours and a wrong pin OOMs the load
 ///
 /// Spawn-time capacity for every VRAM-budgeted profile rule: FREE VRAM
-/// when the probe reports any, else the card total. Sizing against totals
+/// when the probe reports w, else the card total. Sizing against totals
 /// pins `-ngl 999` on boxes whose VRAM a neighbour already consumed at
 /// spawn time — the engine's `--fit` refuses to shrink an EXPLICIT ngl
 /// ("already set by user, abort", live-proven) and the load OOMs instead
@@ -3465,53 +3349,13 @@ fn resolve_gpu_offload(
         ));
         return ("auto", "partial");
     }
-    // With --kv-unified on the final argv the KV buffer lives in the
-    // --cache-ram (system RAM) budget, not VRAM — charging the full f16
-    // estimate here pushes tight-fit models into the "auto" band, and the
-    // engine's own auto estimator repeats the over-reservation and parks
-    // layers on the CPU (measured: -22% decode on a 1-layer split).
-    //
-    // Unified branch uses an absolute test: the 15% classic reserve mostly
-    // stood for KV uncertainty, which --kv-unified removes, so the standing
-    // charges are the KV working-set floor plus the measured fixed spawn
-    // overhead (CUDA/Vulkan context, graphs, compute buffers). Classic
-    // branch keeps the percentage margin for its full-KV reality.
-    if kv_unified_emitted(input) {
-        let projected = resident
-            .saturating_add(KV_UNIFIED_VRAM_FLOOR_BYTES)
-            .saturating_add(UNIFIED_SPAWN_OVERHEAD_BYTES);
-        if projected <= vram_bytes {
-            if spec_draft_will_attach(input) {
-                // Speculative draft weights + its KV allocate DEVICE-side
-                // and are charged by no planner here; a hard pin would
-                // also disable the engine's live fitter ("n_gpu_layers
-                // already set by user to 999, abort"). Leave the flag to
-                // the fitter so shared-GPU spec pairs degrade instead of
-                // cudaMalloc-OOM-ing.
-                warnings.push(
-                    "speculative draft adds device-side weights+KV beyond the planner charge; \
-                     --gpu-layers left to the engine live fitter (common_fit_params)"
-                        .to_string(),
-                );
-                return ("auto", "auto");
-            }
-            // The unified accounting decided the pin (classic full-KV math
-            // would NOT have fit): say so — `ps` shows "full" and the reader
-            // deserves the why.
-            if resident.saturating_add(kv) > vram_bytes / 100 * 85 {
-                warnings.push(format!(
-                    "gpu-layers pinned full via unified-KV accounting: resident {} MiB + {} MiB KV floor + {} MiB spawn overhead <= {} MiB VRAM (--kv-unified hosts the {} MiB f16 KV in the cache-ram budget); revert with kv_unified = false if the load OOMs",
-                    resident / (1 << 20),
-                    KV_UNIFIED_VRAM_FLOOR_BYTES / (1 << 20),
-                    UNIFIED_SPAWN_OVERHEAD_BYTES / (1 << 20),
-                    vram_bytes / (1 << 20),
-                    kv / (1 << 20)
-                ));
-            }
-            return ("999", "full");
-        }
-        return ("auto", "auto");
-    }
+    // One placement model for both lanes (device truth): the KV pool is
+    // device-backed under `--kv-unified` too (shared buffer, not host
+    // memory), so the classic 85% envelope is THE gate. The 85%..100%
+    // band falls through to "auto" — the engine's live fitter places
+    // the last layers, possibly CPU-splitting them (honest degraded
+    // serve), and a hard pin there would abort the fitter ("already
+    // set by user to 999") into a cudaMalloc OOM.
     if resident.saturating_add(kv) <= vram_bytes / 100 * 85 {
         if spec_draft_will_attach(input) {
             warnings.push(
@@ -3538,11 +3382,11 @@ fn kv_unified_emitted(input: &ProfileInput<'_>) -> bool {
 
 /// Same decision as [`kv_unified_emitted`], callable outside profile
 /// compilation: the per-request `num_ctx` preflight (gateway) and the
-/// `coreside` planner must charge the unified 512 MiB working-set floor
-/// instead of the full f16 KV when the spawn will carry `--kv-unified` —
-/// f16 math there made legal `num_ctx` bumps read as OOM and refuse
-/// unnecessarily. Callers without a compiled `ProfileInput` supply the
-/// active engine's manifest flag set directly.
+/// `coreside` planner need to know whether the spawn will carry
+/// `--kv-unified` (shared single KV buffer) for argv-shape decisions.
+/// Capacity math itself is lane-independent now — the KV pool is
+/// device-backed either way. Callers without a compiled `ProfileInput`
+/// supply the active engine's manifest flag set directly.
 #[must_use]
 pub fn kv_unified_for(
     config: &Config,
@@ -4152,6 +3996,7 @@ mod tests {
             pooling_type: None,
             chat_template: None,
             mtp_layers: None,
+            num_loops: None,
         }
     }
 
@@ -4164,7 +4009,7 @@ mod tests {
 
     /// Materialize a real (empty) draft file so compile's stale-row
     /// existence check sees a live path — the fixture must not lie
-    /// about freshness any more than the store may.
+    /// about freshness w more than the store may.
     fn draft_file(tag: &str) -> String {
         let p =
             std::env::temp_dir().join(format!("pallama-draft-{tag}-{}.gguf", std::process::id()));
@@ -4448,12 +4293,14 @@ mod tests {
     }
 
     #[test]
-    fn unit__gpu_offload__unified_kv_floor_pins_full_on_tight_fit() {
+    fn unit__gpu_offload__unified_tight_fit_leaves_fitter_band() {
         // Classic-attention meta: kv @16384 = 8*(64+64)*2*28*16384 = 896 MiB.
-        // VRAM 6700 MiB: 5000+896 = 5896 > 85% (5695) — full-KV math says
-        // auto; the unified absolute test (5000+512 floor+700 overhead =
-        // 6212 <= 6700) pins. This is the -22%-decode class of spawn
-        // (measured on shipped pallama).
+        // VRAM 6400 MiB: 5000+896 = 5896 > 85% (5440) — device truth: the
+        // unified pool is VRAM-resident too, so this tight fit goes to the
+        // engine's live fitter band (may CPU-split the last layers)
+        // instead of the old floor-accounted 999 pin. That pin was the
+        // storm class: it disabled the fitter ("already set by user to
+        // 999, abort") while the true device demand OOM'd.
         let hw = gpu_hw(6_400, 64_000, 8);
         let p = compile(
             &input(&meta(), &hw, &Config::default(), &ALL_FLAGS),
@@ -4463,16 +4310,13 @@ mod tests {
         assert!(p
             .argv
             .windows(2)
-            .any(|w| w[0] == "--gpu-layers" && w[1] == "999"));
-        assert_eq!(p.gpu, "full");
+            .any(|w| w[0] == "--gpu-layers" && w[1] == "auto"));
+        assert_eq!(p.gpu, "auto");
         assert!(p.argv.contains(&"--kv-unified".to_string()));
-        assert!(
-            p.warnings
-                .iter()
-                .any(|w| w.contains("unified-KV accounting")),
-            "flip must be explained: {:?}",
-            p.warnings
-        );
+        assert!(!p
+            .warnings
+            .iter()
+            .any(|w| w.contains("unified-KV accounting")));
     }
 
     #[test]
@@ -4657,7 +4501,7 @@ mod tests {
         );
         let bare = Config::default();
         assert_eq!(
-            mmproj_policy_effective(&bare, "any", &bare.overlay_for("any")),
+            mmproj_policy_effective(&bare, "other", &bare.overlay_for("other")),
             MmprojPolicy::Lazy,
             "None everywhere = Lazy default"
         );
@@ -4777,12 +4621,10 @@ mod tests {
     fn unit__cache_ram_clamped_to_30pct_of_ram_on_small_boxes() {
         // Live case: 13 GiB laptop, default 8192 -> cap 4007 (30% of 13359).
         // Unclamped, the child RSS plateaus at 8.3 GiB and the box swap-thrashes.
-        // Under default --kv-unified the 5000 MiB weights ALSO live in the
-        // budget, so the 2a-bis floor lifts 4007 -> 6221 (weights + f16 KV
-        // at the ctx floor + 64 slack, all over the 0.85 compute share;
-        // inside the 60% guard): a
-        // sub-weights budget makes the engine fitter CPU-split layers
-        // (measured 15.6 vs 39.9 t/s on a 9B).
+        // The budget caps the weights mmap, so the 2a-bis floor lifts
+        // 4007 -> 5957 ((5000 weights + 64 slack) over the 0.85 compute
+        // share, inside the 60% guard): a sub-weights budget makes the
+        // engine fitter CPU-split layers (measured 15.6 vs 39.9 t/s on a 9B).
         let cfg = Config::default();
         let hw = gpu_hw(12_000, 13_359, 8);
         let g = meta();
@@ -4794,12 +4636,12 @@ mod tests {
         assert!(p
             .argv
             .windows(2)
-            .any(|w| w[0] == "--cache-ram" && w[1] == "6221"));
+            .any(|w| w[0] == "--cache-ram" && w[1] == "5957"));
         assert!(p
             .warnings
             .iter()
             .any(|w| w.contains("cache_ram_mb 8192 clamped to 4007")));
-        assert!(p.warnings.iter().any(|w| w.contains("floored to 6221 MiB")));
+        assert!(p.warnings.iter().any(|w| w.contains("floored to 5957 MiB")));
     }
 
     #[test]
@@ -5506,21 +5348,17 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        // Train clamp bounds the TOTAL; auto-fit then divides it into 4
-        // shallow slots. Unified-KV pool fit then shrinks further: f16 KV
-        // 2240 MiB + weights 5000 MiB > 85% of the 8192 MiB cache-ram
-        // budget (6963 MiB usable) — ctx 40960 -> 35840 (4x8960).
+        // Train clamp bounds the TOTAL; the classic VRAM axis (device
+        // truth) then re-spends it as 4 shallow slots (train_slots 1 at
+        // the full clamp, so the re-spend branch wins): 4x10240.
         assert!(p
             .argv
             .windows(2)
-            .any(|w| w[0] == "--ctx-size" && w[1] == "35840"));
-        assert_eq!(p.ctx, 8_960);
-        assert_eq!(p.ctx_autofit, Some((8_960, 4)));
+            .any(|w| w[0] == "--ctx-size" && w[1] == "40960"));
+        assert!(p.argv.windows(2).any(|w| w == ["-np", "4"]));
+        assert_eq!(p.ctx, 10_240);
+        assert_eq!(p.ctx_autofit, Some((10_240, 4)));
         assert!(p.warnings.iter().any(|w| w.contains("clamped")));
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("unified KV pool fit: ctx 40960 -> 35840")));
     }
 
     #[test]
@@ -5540,11 +5378,12 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        // YaRN lifts the CEILING (81920); the emitted total stays within
-        // it. Same unified-KV budget shrink as the non-YaRN case above
-        // (clamp/autofit total 40960 -> 35840 = 4x8960).
-        assert_eq!(p.ctx, 8_960);
-        assert_eq!(p.ctx_autofit, Some((8_960, 4)));
+        // YaRN lifts the CEILING (81920); the capacity re-spend then
+        // lands on 4x10240 (train_slots 2 caps the 20480 probe; the
+        // 10240 probe earns the full 4) — f16 KV 2240 MiB + weights
+        // 5000 <= the 12000 MiB card, no shrink needed.
+        assert_eq!(p.ctx, 10_240);
+        assert_eq!(p.ctx_autofit, Some((10_240, 4)));
         assert!(p
             .warnings
             .iter()
@@ -5552,35 +5391,33 @@ mod tests {
         assert!(p
             .argv
             .windows(2)
-            .any(|w| w[0] == "--ctx-size" && w[1] == "35840"));
+            .any(|w| w[0] == "--ctx-size" && w[1] == "40960"));
     }
 
     #[test]
     fn unit__unified_kv_pool_fit__shrinks_ctx_to_cache_ram_budget() {
-        // 2026-09-12 live incident shape (qwen3-1.7b): with --kv-unified
-        // the WHOLE f16 KV pool + weights mmap must fit the --cache-ram
-        // system-RAM budget or the child dies at context creation with
-        // free VRAM to spare. Geometry head_dim 64 -> 57344 B/ctx-token:
-        // kv(131072) = 7168 MiB; budget min(8192, 30% of 13674) = 4102
-        // MiB, usable 85% = 3486 MiB; weights 1200 MiB -> ctx 131072 ->
-        // 41792 (57344 B/token x room 2286 MiB, floored to 256).
+        // Device truth (live b10948): the KV pool is VRAM-resident on
+        // BOTH lanes, so an autofit ctx whose pool overflows the card
+        // must shrink against the 85% VRAM envelope — at the quant the
+        // spawn will actually run. Geometry head_dim 64 -> 57344
+        // B/ctx-token: kv(131072) = 7168 MiB f16; the tight 6000 MiB
+        // card drives the ladder to q4_0 (1792 MiB pool, 14336
+        // B/token), so the shrink fits (5100 - 4800) MiB / 14336 B =
+        // 21951 -> floored to a 256 multiple = 21760.
         let cfg = Config {
             default_ctx: 131_072,
             ..Config::default()
         };
-        let hw = gpu_hw(20_000, 13_674, 8); // VRAM never the limiter
+        let hw = gpu_hw(6_000, 13_674, 8);
         let g = GgufMeta {
             context_length: Some(131_072),
             ..meta()
         };
         let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
-        inp.model_bytes = 1_200 * MIB;
+        inp.model_bytes = 4_800 * MIB;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p.argv.windows(2).any(|w| w == ["--cache-ram", "4102"]));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--ctx-size" && w[1] != "131072"));
+        assert!(p.argv.windows(2).any(|w| w == ["--ctx-size", "21760"]));
+        assert!(p.argv.windows(2).any(|w| w == ["--cache-type-k", "q8_0"]));
         assert!(p.warnings.iter().any(|w| w.contains("unified KV pool fit")));
         // (per_slot, slots) pair stays truthful for SlotsCtxAutoFit.
         let total: u64 = p
@@ -5590,30 +5427,30 @@ mod tests {
             .and_then(|w| w[1].parse::<u32>().ok())
             .map(u64::from)
             .expect("--ctx-size present");
-        assert!(total < 131_072, "ctx must have shrunk, got {total}");
+        assert_eq!(total, 21_760);
         let (per_slot, slots) = p.ctx_autofit.expect("autofit marker set");
         assert_eq!(u64::from(per_slot) * u64::from(slots), total);
     }
 
     #[test]
     fn unit__unified_kv_pool_fit__pinned_ctx_refuses_when_guard_blocks() {
-        // Pinned ctx is sovereign (never shrunk) but a pin no legal
-        // budget can host is a REFUSAL, not a warning: warn-yet-proceed
-        // here is how the num_ctx storm 502-looped (child died at
-        // context creation on every spawn retry). Shape: weights 1200 +
-        // f16 KV 7168 = 8368 MiB demand; raise target (8368+64)*20/17 =
-        // 9920 MiB > 60% RAM guard 8204 MiB → refuse with teaching.
+        // Pinned ctx is sovereign (never shrunk) but a pin the DEVICE
+        // cannot host — even at the ladder's max q4_0 demotion — is a
+        // REFUSAL, not a warning: warn-yet-proceed here is how the
+        // num_ctx storm 502-looped (child died at context creation on
+        // every spawn retry). Shape: weights 5000 + KV 7168 f16 / 1792
+        // q4_0 = 6792 MiB demand + 700 overhead > 6000 MiB VRAM.
         let cfg = Config {
             default_ctx: 131_072,
             ..Config::default()
         };
-        let hw = gpu_hw(20_000, 13_674, 8);
+        let hw = gpu_hw(6_000, 13_674, 8);
         let g = GgufMeta {
             context_length: Some(131_072),
             ..meta()
         };
         let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
-        inp.model_bytes = 1_200 * MIB;
+        inp.model_bytes = 5_000 * MIB;
         let err = compile(
             &inp,
             &TuningOverrides {
@@ -5623,32 +5460,27 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("pinned num_ctx 131072 cannot fit"), "{err}");
-        assert!(err.contains("9920"), "names the raise target: {err}");
-        assert!(err.contains("8204"), "names the RAM guard: {err}");
-        assert!(
-            err.contains("q8_0") && err.contains("kv_unified = false"),
-            "{err}"
-        );
+        assert!(err.contains("6792"), "names the demand: {err}");
+        assert!(err.contains("6000"), "names the VRAM: {err}");
+        assert!(err.contains("q8_0"), "teaches the KV-halving lever: {err}");
     }
 
     #[test]
-    fn unit__unified_kv_pool_fit__pinned_ctx_raises_budget_within_guard() {
-        // The storm shape (live 2026-09-13, nanbeige4.2-3b): pinned
-        // 32768 after a warmup that clamped --cache-ram to 4102 MiB.
-        // demand = weights 2455 + f16 KV 1792 = 4247 MiB > usable 3486
-        // — but the raise target (4247+64)*20/17 = 5071 MiB fits the
-        // 8204 MiB guard: HONOR the pin by raising the budget (2a-bis
-        // floor algebra at the pinned demand) instead of spawning a
-        // doomed child.
+    fn unit__unified_kv_pool_fit__pinned_middle_zone_serves_degraded() {
+        // Middle zone (85%..100% of VRAM): physically hostable, so the
+        // pin is SERVED — verdict Fit — but gpu-layers goes to the
+        // engine fitter (may CPU-split the last layers) with an honest
+        // warning. Shape: weights 2700 + f16 KV 1792 = 4492 MiB; VRAM
+        // 5200 (85% share = 4420): demand fits the card (4492 + 700
+        // overhead <= 5200) but not the 85% share.
         let cfg = Config {
             default_ctx: 32_768,
-            cache_ram_mb: 8192,
             ..Config::default()
         };
-        let hw = gpu_hw(20_000, 13_674, 8); // VRAM never the limiter
+        let hw = gpu_hw(5_200, 13_674, 8);
         let g = meta(); // trained 40960 ≥ the pin; 57344 B/ctx-token
         let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
-        inp.model_bytes = 2_455 * MIB;
+        inp.model_bytes = 2_700 * MIB;
         let p = compile(
             &inp,
             &TuningOverrides {
@@ -5660,90 +5492,10 @@ mod tests {
         // The pin is honored untouched…
         assert!(p.argv.windows(2).any(|w| w == ["--ctx-size", "32768"]));
         assert_eq!(p.ctx_autofit, None);
-        // …and the budget carries the raise.
-        assert!(p.argv.windows(2).any(|w| w == ["--cache-ram", "5071"]));
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("budget raised 4102 -> 5071")));
-    }
-
-    #[test]
-    fn unit__pinned_ctx__auto_slots_walk_down_to_hostable_np() {
-        // The T2 live shape (2026-09-14, qwen3.5-9b): a model trained
-        // long enough that capacity axes derive np4 at the pin — but the
-        // np4 POOL (4 x 16384) exceeds every legal budget raise, while
-        // np3's raise fits the 60% guard. Auto slots are a DERIVED knob:
-        // walk them down instead of refusing a pin a smaller pool hosts.
-        // Fixed-point arithmetic: budget floors to (4000+224+64)*20/17 =
-        // 5044; np4 needs raise (7584+64)*20/17 = 8997 > guard 8204
-        // (refuse); np3 raise (6688+64)*20/17 = 7943 <= 8204 (hostable).
-        let cfg = Config {
-            default_ctx: 16_384,
-            cache_ram_mb: 8192,
-            ..Config::default()
-        };
-        let hw = gpu_hw(20_000, 13_674, 8);
-        let g = GgufMeta {
-            context_length: Some(262_144), // train_slots 16 at the pin
-            ..meta()
-        };
-        let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
-        inp.model_bytes = 4_000 * MIB;
-        let p = compile(
-            &inp,
-            &TuningOverrides {
-                ctx: Some(16_384),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        // The walk: capacity said np4, the pool math said no.
-        assert!(p.warnings.iter().any(|w| w.contains("walked down to np 3")));
-        // Pool argv reflects the WALKED count, per-slot keeps the pin.
-        assert!(p.argv.windows(2).any(|w| w == ["--ctx-size", "49152"]));
-        assert!(p.argv.windows(2).any(|w| w == ["-np", "3"]));
-        assert_eq!(p.ctx_autofit, None);
-        // 2b then raises the (floored) budget for the np3 pool.
-        assert!(p.argv.windows(2).any(|w| w == ["--cache-ram", "7943"]));
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("budget raised 5044 -> 7943")));
-    }
-
-    #[test]
-    fn unit__pinned_ctx__all_np_refuse_teaches_at_np1() {
-        // Weights so large the 2a-bis floor itself busts the 60% RAM
-        // guard (budget stays clamped 4102): EVERY pool count refuses —
-        // the walk lands at np 1 and 2b emits the single teaching error
-        // at the np1 shape, the same form the gateway preflight judges.
-        let cfg = Config {
-            default_ctx: 16_384,
-            cache_ram_mb: 8192,
-            ..Config::default()
-        };
-        let hw = gpu_hw(20_000, 13_674, 8);
-        let g = GgufMeta {
-            context_length: Some(262_144),
-            ..meta()
-        };
-        let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
-        inp.model_bytes = 6_800 * MIB; // floor (7088*20/17=8338) > guard 8204
-        let err = compile(
-            &inp,
-            &TuningOverrides {
-                ctx: Some(16_384),
-                ..Default::default()
-            },
-        )
-        .unwrap_err();
-        assert!(
-            err.contains("pinned num_ctx 16384 cannot fit")
-                && err.contains("kv_unified = false")
-                && err.contains("guard"),
-            "{err}"
-        );
+        // …and the degraded serve is surfaced, not hidden.
+        assert!(p.warnings.iter().any(
+            |w| w.contains("fits the 5200 MiB VRAM only above the 85% share (demand 4492 MiB)")
+        ));
     }
 
     #[test]
@@ -5751,34 +5503,39 @@ mod tests {
         use super::{unified_ctx_verdict, UnifiedCtxVerdict};
         let weights = 2_455 * MIB;
         let kv = 1_792 * MIB;
-        // Fits the usable share as-is.
+        // Weights + KV + spawn overhead fit the device as-is
+        // (2455 + 1792 + 700 = 4947 <= 5200).
         assert!(matches!(
-            unified_ctx_verdict(weights, kv, Some(6_000), false, 13_674, 32_768),
+            unified_ctx_verdict(weights, kv, 5_200 * MIB, 32_768),
             UnifiedCtxVerdict::Fit
         ));
-        // Unfit but the raise is guard-legal.
+        // Exact boundary: demand + overhead == VRAM is still hostable.
         assert!(matches!(
-            unified_ctx_verdict(weights, kv, Some(4_102), false, 13_674, 32_768),
-            UnifiedCtxVerdict::RaiseTo(5_071)
+            unified_ctx_verdict(weights, kv, 4_947 * MIB, 32_768),
+            UnifiedCtxVerdict::Fit
         ));
-        // Guard blocks the raise → refuse with teaching.
+        // One MiB less → physically impossible → refuse with teaching.
+        let v = unified_ctx_verdict(weights, kv, 4_946 * MIB, 32_768);
+        let UnifiedCtxVerdict::Refuse(msg) = v else {
+            panic!("must refuse below the demand+overhead line");
+        };
+        assert!(
+            msg.contains("q8_0") && msg.contains("smaller quant"),
+            "{msg}"
+        );
+        // A fat-KV pin over a small card refuses too.
         assert!(matches!(
-            unified_ctx_verdict(weights, kv * 4, Some(4_102), false, 13_674, 131_072),
+            unified_ctx_verdict(weights, kv * 4, 5_200 * MIB, 131_072),
             UnifiedCtxVerdict::Refuse(_)
-        ));
-        // Knob off: upstream's default pool bound is the budget.
-        assert!(matches!(
-            unified_ctx_verdict(weights, kv, None, false, 13_674, 32_768),
-            UnifiedCtxVerdict::Fit
         ));
     }
 
     #[test]
     fn unit__extra_args_cache_ram__explicit_wins_and_lands_once() {
         // Explicit extra_args --cache-ram owns the budget (same doctrine
-        // as `-mm`): rule 12 must not double-emit the flag, the A16
-        // clamp must not shrink it, and an unfit pin under it refuses
-        // by teaching the user to raise THEIR value.
+        // as `-mm`): rule 12 must not double-emit the flag and the A16
+        // clamp must not touch it (the explicit branch wins before the
+        // clamp is even computed).
         let cfg = Config {
             default_ctx: 32_768,
             cache_ram_mb: 8192,
@@ -5792,7 +5549,7 @@ mod tests {
             ..Default::default()
         };
         inp.overlay = &explicit;
-        inp.model_bytes = 6_000 * MIB; // demand 6000+1792 fits 12000*0.85
+        inp.model_bytes = 6_000 * MIB;
         let p = compile(
             &inp,
             &TuningOverrides {
@@ -5808,23 +5565,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(emissions.len(), 1, "flag lands exactly once");
         assert_eq!(emissions[0], ["--cache-ram", "12000"]);
-
-        // Explicit budget too small for the pin: refuse naming it.
-        let tight = ModelOverride {
-            extra_args: Some(vec!["--cache-ram=2000".into()]),
-            ..Default::default()
-        };
-        inp.overlay = &tight;
-        let err = compile(
-            &inp,
-            &TuningOverrides {
-                ctx: Some(32_768),
-                ..Default::default()
-            },
-        )
-        .unwrap_err();
-        assert!(err.contains("extra_args --cache-ram 2000"), "{err}");
-        assert!(err.contains("raise the"), "{err}");
+        // The explicit branch wins before the A16 clamp — no clamp
+        // warning for the explicit value.
+        assert!(!p.warnings.iter().any(|w| w.contains("clamped")));
     }
 
     #[test]
@@ -6777,7 +6520,11 @@ mod tests {
         let mut inp = input(&g, &vulkan_hw, &cfg, &ALL_FLAGS);
         inp.mmproj_path = Some(mmproj.to_str().unwrap());
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p.argv.windows(2).any(|w| w == ["-np", "1"]), "{:?}", p.argv);
+        // Device truth: the vulkan axis (per-slot KV + measured
+        // per-token compute) refuses the full 16384 slot, but the
+        // autofit re-spend at 4096 honestly earns np2 on the card.
+        assert!(p.argv.windows(2).any(|w| w == ["-np", "2"]), "{:?}", p.argv);
+        assert!(p.argv.windows(2).any(|w| w == ["--ctx-size", "8192"]));
         assert!(
             p.warnings
                 .iter()
@@ -6786,22 +6533,24 @@ mod tests {
             p.warnings
         );
 
-        // CUDA-class census with the same projector: flat cap stands.
+        // CUDA-class census with the same projector: the classic 85%
+        // axis gates it — 5000 weights + 2x448 KV do not fit 5900 MiB
+        // at the share, and no shallower re-spend pays either.
         let hw = gpu_hw(5_900, 64_000, 8);
         let mut inp2 = input(&g, &hw, &cfg, &ALL_FLAGS);
         inp2.mmproj_path = Some(mmproj.to_str().unwrap());
         let p2 = compile(&inp2, &TuningOverrides::default()).unwrap();
-        assert!(p2.argv.windows(2).any(|w| w == ["-np", "2"]));
+        assert!(p2.argv.windows(2).any(|w| w == ["-np", "1"]));
         assert!(!p2.warnings.iter().any(|w| w.contains("capped")));
 
-        // Vulkan-class census WITHOUT a projector: measured healthy at
-        // multi-slot totals, so the flat cap stands.
+        // Vulkan-class census WITHOUT a projector: classic axis only —
+        // same single-slot truth, no conservative-cap warning.
         let p3 = compile(
             &input(&g, &vulkan_hw, &cfg, &ALL_FLAGS),
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p3.argv.windows(2).any(|w| w == ["-np", "2"]));
+        assert!(p3.argv.windows(2).any(|w| w == ["-np", "1"]));
         assert!(!p3.warnings.iter().any(|w| w.contains("capped")));
     }
 
@@ -6841,8 +6590,11 @@ mod tests {
         inp.mmproj_path = Some(mmproj.to_str().unwrap());
         inp.engine_census = mixed_census;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        // The census (not the scoped hardware) drives the vulkan-class
+        // detection: conservative full-slot cap + honest shallow
+        // re-spend, exactly like the unscoped mixed-box case.
         assert!(
-            p.argv.windows(2).any(|w| w == ["-np", "1"]),
+            p.argv.windows(2).any(|w| w == ["-np", "2"]),
             "scoped hardware must not hide the vulkan-class build: {:?}",
             p.argv
         );
@@ -6925,17 +6677,24 @@ mod tests {
     }
 
     #[test]
-    fn unit__kv_est__unified_floor_replaces_f16() {
-        // ALL_FLAGS carries --kv-unified and the default leaves it on: the
-        // VRAM charge collapses to the measured working-set floor,
-        // quant-agnostic (quantization shrinks the RAM buffer, not the
-        // VRAM working set).
+    fn unit__kv_est__unified_lane_charges_full_device_pool() {
+        // Device truth: the unified pool is VRAM-resident (live-verified
+        // b10948), so the planner charge is the full f16 estimate —
+        // and the quant ladder applies to it like the classic lane
+        // (q8_0 halves the buffer the child actually allocates).
         let hw = gpu_hw(24_000, 64_000, 8);
         let g = meta();
         let cfg = Config::default();
         let inp = input(&g, &hw, &cfg, &ALL_FLAGS);
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert_eq!(p.kv_est_bytes, Some(512 * 1024 * 1024));
+        let total: u64 = p
+            .argv
+            .windows(2)
+            .find(|w| w[0] == "--ctx-size")
+            .and_then(|w| w[1].parse::<u32>().ok())
+            .map(u64::from)
+            .expect("--ctx-size present");
+        assert_eq!(p.kv_est_bytes, g.kv_f16_bytes(total));
         let t = TuningOverrides {
             kv_quant: Some(true),
             ..Default::default()
@@ -6943,17 +6702,16 @@ mod tests {
         let p2 = compile(&inp, &t).unwrap();
         assert_eq!(
             p2.kv_est_bytes,
-            Some(512 * 1024 * 1024),
-            "floor is quant-agnostic"
+            g.kv_f16_bytes(total).map(|f16| f16 / 2),
+            "quant ladder halves the device pool estimate"
         );
     }
 
     #[test]
     fn unit__kv_est__draft_kv_charged_unified() {
-        // Spec pair on unified KV: the dense KV lives in the cache-ram
-        // budget (floor charge), but the DRAFT's KV still lands on the
-        // card — the planner charge is floor + draft f16 KV at the
-        // compiled total ctx.
+        // Spec pair on unified KV: BOTH pools are device-backed (the
+        // flag shares buffers, it does not relocate them) — the planner
+        // charge is dense f16 + draft f16 at the compiled total ctx.
         let hw = gpu_hw(24_000, 64_000, 8);
         let g = meta();
         let draft = GgufMeta {
@@ -6971,7 +6729,7 @@ mod tests {
         inp.draft_path = Some(&path);
         inp.draft_gguf = Some(&draft);
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        let expect = KV_UNIFIED_VRAM_FLOOR_BYTES + draft.kv_f16_bytes(16_384).unwrap();
+        let expect = g.kv_f16_bytes(16_384).unwrap() + draft.kv_f16_bytes(16_384).unwrap();
         assert_eq!(p.kv_est_bytes, Some(expect));
     }
 
@@ -7048,13 +6806,18 @@ mod tests {
 
     #[test]
     fn unit__estimate_kv_vram_charge__floor_vs_full() {
+        // Device truth: the KV pool is VRAM-resident on BOTH lanes
+        // (live-verified b10948 — `CUDA0 KV buffer` with --kv-unified),
+        // so the charge is the full f16 estimate regardless of the
+        // unified flag. Geometry: 57344 B/token x 16384 = 896 MiB.
         let hw = gpu_hw(24_000, 64_000, 8);
         let g = meta();
         let cfg = Config::default();
         let unified = input(&g, &hw, &cfg, &ALL_FLAGS);
         assert_eq!(
-            estimate_kv_vram_charge(&unified, None),
-            Some(512 * 1024 * 1024)
+            estimate_kv_vram_charge(&unified, Some(16_384)).map(|b| b / (1024 * 1024)),
+            Some(896),
+            "unified path charges the full device-backed pool"
         );
         let mut classic_flags = full_flags();
         classic_flags.remove("--kv-unified");
@@ -8034,16 +7797,16 @@ mod tests {
             .argv
             .windows(2)
             .any(|w| w[0] == "--cache-ram" && w[1] == "6553"));
-        // Cold: 20% cap = 3276, but the 2a-bis unified weights floor
-        // (5000 + kv@4096 224 + 64, all over 0.85) lifts every below-floor
-        // cap to 6221 — a sub-weights budget CPU-splits layers at the fitter.
+        // Cold: 20% cap = 3276, but the 2a-bis weights floor (5000 + 64
+        // over 0.85 = 5957) lifts every below-floor cap to 5957 — a
+        // sub-weights budget CPU-splits layers at the fitter.
         let mut inp = input(&g, &hw, &cfg, &WIRE_FLAGS);
         inp.cache_hit_rate = Some(0.01);
         let p2 = compile(&inp, &TuningOverrides::default()).unwrap();
         assert!(p2
             .argv
             .windows(2)
-            .any(|w| w[0] == "--cache-ram" && w[1] == "6221"));
+            .any(|w| w[0] == "--cache-ram" && w[1] == "5957"));
         // The tier itself stays visible in the clamp warning.
         assert!(p2.warnings.iter().any(|w| w.contains("clamped to 3276")));
         // None: static 30% = 4915 — also below the floor.
@@ -8052,7 +7815,7 @@ mod tests {
         assert!(p3
             .argv
             .windows(2)
-            .any(|w| w[0] == "--cache-ram" && w[1] == "6221"));
+            .any(|w| w[0] == "--cache-ram" && w[1] == "5957"));
     }
 
     #[test]

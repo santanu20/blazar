@@ -4168,21 +4168,13 @@ fn coreside_cmd() -> Result<()> {
     let mut fps = Vec::new();
     for m in &models {
         let ctx = cfg.effective_ctx(&m.name);
-        // Same unified decision as the spawn profile: --kv-unified hosts
-        // the KV buffer in --cache-ram (system RAM), so the VRAM plan
-        // charges the measured working-set floor, not f16-at-ctx — f16
-        // here made unified models read as 2-4x their real VRAM demand
-        // and get deferred on phantom pressure.
-        let unified = manifest
-            .as_ref()
-            .is_some_and(|mf| pallama_core::profile::kv_unified_for(&cfg, &m.name, &mf.flags));
-        let kv =
-            pallama_core::read_metadata_file(std::path::Path::new(&m.path)).map_or(0, |meta| {
-                if unified {
-                    pallama_core::profile::KV_UNIFIED_VRAM_FLOOR_BYTES / (1024 * 1024)
-                } else {
-                    pallama_core::coreside::kv_f16_mib(&meta, u64::from(ctx))
-                }
+        // Device truth: the KV pool is VRAM-resident on BOTH lanes
+        // (--kv-unified shares one buffer across sequences, it does not
+        // relocate it to system RAM), so the footprint plan charges the
+        // f16 estimate everywhere.
+        let kv = pallama_core::read_metadata_file(std::path::Path::new(&m.path))
+            .map_or(0, |meta| {
+                pallama_core::coreside::kv_f16_mib(&meta, u64::from(ctx))
             });
         fps.push(pallama_core::coreside::Footprint {
             name: m.name.clone(),
