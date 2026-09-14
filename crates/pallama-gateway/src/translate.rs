@@ -227,6 +227,51 @@ fn translate_message_images(messages: &Value) -> Result<Value, String> {
     Ok(Value::Array(out))
 }
 
+/// ollama assistant `tool_calls` entries may omit the `type` field
+/// (ollama's own wire shape); llama-server rejects them with
+/// "Missing tool call type". Fill `type: "function"` where absent so
+/// multi-turn tool transcripts replay 1:1. Non-array messages and
+/// entries that already carry a string `type` pass through verbatim.
+fn normalize_tool_call_types(messages: &Value) -> Value {
+    let Some(list) = messages.as_array() else {
+        return messages.clone();
+    };
+    let mut out = Vec::with_capacity(list.len());
+    for msg in list {
+        let Some(calls) = msg.get("tool_calls").filter(|c| c.is_array()) else {
+            out.push(msg.clone());
+            continue;
+        };
+        let mut m = msg.clone();
+        let mut fixed = Vec::with_capacity(calls.as_array().unwrap().len());
+        for call in calls.as_array().unwrap() {
+            let has_type = call
+                .get("type")
+                .is_some_and(|t| t.as_str().is_some_and(|s| !s.is_empty()));
+            if has_type {
+                fixed.push(call.clone());
+            } else {
+                let mut c = call.clone();
+                if let Some(obj) = c.as_object_mut() {
+                    // Insertion order: type first, then the function body.
+                    let mut entry = serde_json::Map::new();
+                    entry.insert("type".into(), json!("function"));
+                    // Reborrow: obj itself must survive the loop so the
+                    // rebuilt map can be stored back below.
+                    for (k, v) in &mut *obj {
+                        entry.insert(k.clone(), v.clone());
+                    }
+                    *obj = entry;
+                }
+                fixed.push(c);
+            }
+        }
+        m["tool_calls"] = Value::Array(fixed);
+        out.push(m);
+    }
+    Value::Array(out)
+}
+
 /// /api/chat request -> /v1/chat/completions body.
 pub fn chat_to_openai(req: &Value) -> Result<(Value, Option<i64>), String> {
     let model = req["model"].as_str().unwrap_or_default().to_string();
@@ -239,8 +284,9 @@ pub fn chat_to_openai(req: &Value) -> Result<(Value, Option<i64>), String> {
     let mut out = json!({
         "model": model,
         // ollama-style message images[] become multimodal content parts
-        // (children ignore the raw field — this was silent vision loss).
-        "messages": translate_message_images(&req["messages"])?,
+        // (children ignore the raw field — this was silent vision loss),
+        // and ollama tool_calls entries gain the `type` the child demands.
+        "messages": normalize_tool_call_types(&translate_message_images(&req["messages"])?),
     });
     // ollama defaults stream=true; OpenAI defaults false — mirror the
     // caller's explicit choice only.
