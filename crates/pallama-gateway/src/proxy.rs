@@ -50,9 +50,17 @@ pub fn child_base(ep: &pallama_core::Endpoint) -> String {
     }
 }
 
-/// Resolve a user-visible model name (with optional `:quant` suffix) to
-/// the stored row: exact -> unique prefix -> levenshtein-3 suggestion.
+/// Resolve a user-visible model name to the stored row: exact match
+/// (case-insensitive) → ollama-migrant `model:tag` `:`→`-` swap onto an
+/// existing row (the shared `Store::resolve_model_name` rule the CLI and
+/// supervisor use) → unique bare prefix → levenshtein-3 suggestion.
+/// The tag is never discarded: a colon form that swaps onto no row falls
+/// to the prefix ladder, which reports ambiguity instead of guessing.
 pub fn resolve_model(store: &Store, requested: &str) -> Result<ModelRow, String> {
+    let canonical = store.resolve_model_name(&requested.to_lowercase());
+    if let Ok(Some(m)) = store.get_model(&canonical) {
+        return Ok(m);
+    }
     let bare = requested
         .split(':')
         .next()
@@ -1583,5 +1591,96 @@ mod cache_obs_tests {
         assert_eq!(obs.prompt_tokens.load(Ordering::Relaxed), 120, "usage wins");
         assert_eq!(obs.cached_tokens.load(Ordering::Relaxed), 96, "usage wins");
         assert_eq!(obs.unclassified.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod resolve_model_tests {
+    use super::*;
+    use pallama_core::{ModelRow, PallamaDirs, Store};
+
+    fn row(name: &str) -> ModelRow {
+        ModelRow {
+            name: name.to_string(),
+            repo: format!("registry.ollama.ai/library/{name}"),
+            quant: "q4_k_m".to_string(),
+            path: format!("/models/{name}"),
+            bytes: 1,
+            sha256: None,
+            mmproj_path: None,
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+        }
+    }
+
+    fn store_with(names: &[&str]) -> (tempfile::TempDir, Store) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = PallamaDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let store = Store::open(&dirs).unwrap();
+        for n in names {
+            store.upsert_model(&row(n)).unwrap();
+        }
+        (tmp, store)
+    }
+
+    #[test]
+    fn unit__resolve_model__colon_tag_swaps_onto_exact_row() {
+        // Regression pin (2026-09-14 validate run.colon): the live store
+        // qwen2.5-0.5b + qwen2.5-0.5b-instruct + qwen2.5-1.5b-instruct
+        // made `qwen2.5:0.5b` 404 as "ambiguous" — the tag was discarded
+        // and the bare prefix matched three rows. The colon form must
+        // resolve through the shared exact/swap rule like the CLI does.
+        let (_tmp, store) = store_with(&[
+            "qwen2.5-0.5b",
+            "qwen2.5-0.5b-instruct",
+            "qwen2.5-1.5b-instruct",
+        ]);
+        let m = resolve_model(&store, "qwen2.5:0.5b").expect("colon tag resolves");
+        assert_eq!(m.name, "qwen2.5-0.5b");
+    }
+
+    #[test]
+    fn unit__resolve_model__wrong_tag_stays_ambiguous_teaching() {
+        // A tag that swaps onto no row must fail loud with the candidate
+        // rows — never silently resolve a sibling.
+        let (_tmp, store) = store_with(&[
+            "qwen2.5-0.5b",
+            "qwen2.5-0.5b-instruct",
+            "qwen2.5-1.5b-instruct",
+        ]);
+        let err = resolve_model(&store, "qwen2.5:7b").unwrap_err();
+        assert!(err.contains("ambiguous"), "err: {err}");
+        assert!(err.contains("qwen2.5-0.5b-instruct"), "err: {err}");
+        assert!(err.contains("qwen2.5-1.5b-instruct"), "err: {err}");
+    }
+
+    #[test]
+    fn unit__resolve_model__colonless_exact_case_insensitive() {
+        let (_tmp, store) = store_with(&["qwen2.5-0.5b", "qwen2.5-0.5b-instruct"]);
+        let m = resolve_model(&store, "Qwen2.5-0.5b").expect("case-insensitive exact");
+        assert_eq!(m.name, "qwen2.5-0.5b");
+    }
+
+    #[test]
+    fn unit__resolve_model__unique_prefix_still_resolves() {
+        let (_tmp, store) =
+            store_with(&["qwen2.5-0.5b", "qwen2.5-0.5b-instruct", "nanbeige4.2-3b"]);
+        let m = resolve_model(&store, "nanbeige").expect("unique prefix");
+        assert_eq!(m.name, "nanbeige4.2-3b");
+    }
+
+    #[test]
+    fn unit__resolve_model__typo_keeps_levenshtein_suggestion() {
+        let (_tmp, store) = store_with(&["qwen2.5-0.5b"]);
+        let err = resolve_model(&store, "qwen2.5-0.5c").unwrap_err();
+        assert!(err.contains("did you mean"), "err: {err}");
+        assert!(err.contains("qwen2.5-0.5b"), "err: {err}");
     }
 }
