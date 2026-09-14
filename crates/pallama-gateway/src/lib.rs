@@ -1067,6 +1067,34 @@ mod tests {
         );
         assert_eq!(counter(body, "llamacpp:missing_total"), None);
     }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__supervision_error__unsupported_model_maps_to_400_with_remedy() {
+        use crate::proxy::supervision_error;
+        use pallama_runtime::SupervisionError;
+        let resp = supervision_error(&SupervisionError::UnsupportedModel(
+            "safetensors model /m.d is not servable by the llama.cpp engine \
+             — run: pallama engine install --kind sglang"
+                .to_string(),
+        ));
+        assert_eq!(resp.status(), 400);
+        let body = axum::body::to_bytes(
+            resp.into_body(),
+            usize::MAX,
+        )
+        .await
+        .expect("read body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            v["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("engine install --kind sglang"),
+            true,
+            "teaching remedy must survive the mapping"
+        );
+    }
 }
 
 #[cfg(test)]

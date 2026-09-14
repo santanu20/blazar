@@ -63,8 +63,16 @@ def _free_port() -> int:
 # PALLAMA_VALIDATE_PORT still pins an explicit port when set.
 PORT = int(os.environ.get("PALLAMA_VALIDATE_PORT") or _free_port())
 # Fast default: the 0.5B keeps every lane quick; PALLAMA_VALIDATE_MODEL
-# overrides (e.g. release-grade runs pinning the 9B).
-MODEL = os.environ.get("PALLAMA_VALIDATE_MODEL", "qwen2.5-0.5b-instruct")
+# overrides (e.g. release-grade runs pinning the 9B). The name is the
+# CANONICAL store row ("qwen2.5-0.5b" — rows are tagless; the display
+# form is name:quant). The earlier "qwen2.5-0.5b-instruct" fixture
+# silently drifted when the sglang wave re-pulled that row as a bf16
+# safetensors DIRECTORY (no GGUF twin exists locally), making every
+# llamacpp chat lane 500 on "gguf metadata: Is a directory". Canonical
+# names also key model_overrides and model_bytes_mib's SQL lookup
+# exactly. No phase depends on instruct-ness of the fixture
+# (think/template lanes pin their own models).
+MODEL = os.environ.get("PALLAMA_VALIDATE_MODEL", "qwen2.5-0.5b")
 # Second DISTINCT model for lanes that structurally need two models live at
 # once (wave battery B predictive preload, mmproj projector attach). Separate
 # from MODEL so the fast default stays small without collapsing those lanes.
@@ -1881,12 +1889,22 @@ def mem_available_mib() -> int:
 
 
 def model_bytes_mib(name: str = MODEL) -> int:
+    # Store rows are tagless; accept both the canonical name and the
+    # name:quant display form (tag stripped, then a unique-prefix
+    # fallback) so a display-form override still sizes honestly.
     try:
         db = sqlite3.connect(os.path.join(REAL_DATA, "pallama.db"))
-        row = db.execute("SELECT bytes FROM models WHERE name = ?", (name,)).fetchone()
+        rows = db.execute("SELECT name, bytes FROM models").fetchall()
         db.close()
-        if row and row[0]:
-            return int(row[0]) // (1024 * 1024)
+        by_name = {n: b for n, b in rows if b}
+        if name in by_name:
+            return by_name[name] // (1024 * 1024)
+        base = name.split(":")[0]
+        if base in by_name:
+            return by_name[base] // (1024 * 1024)
+        candidates = [n for n in by_name if n.startswith(base)]
+        if len(candidates) == 1:
+            return by_name[candidates[0]] // (1024 * 1024)
     except Exception:
         pass
     return 5500  # conservative default for a ~9B Q4 model

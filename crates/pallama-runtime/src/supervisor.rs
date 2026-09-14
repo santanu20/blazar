@@ -129,21 +129,35 @@ impl MetaBox {
     }
 }
 
-/// Read the row's metadata through the lane its engine consumes:
-/// sglang rows are safetensors dirs (config.json), everything else is a
-/// GGUF file header. Errors name the reader so the caller's skip/teach
-/// message says WHICH metadata was missing.
+/// Read the row's metadata in the on-disk shape, cross-checked against
+/// what the ACTIVE engine kind can consume. Wrong-lane pairs (a
+/// safetensors directory on the llama.cpp lane, a GGUF file on the
+/// sglang lane) return a TEACHING error naming the remedy — the raw
+/// io-error they used to surface ("Is a directory") told the user
+/// nothing. mistral.rs consumes both shapes, so its read follows the
+/// disk. Errors name the reader so the caller's skip/teach message
+/// says WHICH metadata was missing.
 pub(crate) fn read_model_meta(
     path: &str,
     kind: pallama_core::engine_kind::EngineKind,
 ) -> Result<MetaBox, String> {
-    match kind {
-        pallama_core::engine_kind::EngineKind::Sglang => {
-            pallama_core::read_hf_config(std::path::Path::new(path))
-                .map(MetaBox::Hf)
-                .map_err(|e| format!("hf config: {e}"))
-        }
-        _ => pallama_core::read_metadata_file(std::path::Path::new(path))
+    use pallama_core::engine_kind::EngineKind as K;
+    let is_dir = std::path::Path::new(path).is_dir();
+    match (kind, is_dir) {
+        (K::LlamaCpp, true) => Err(format!(
+            "safetensors model {path} is not servable by the llama.cpp engine \
+             — run: pallama engine install --kind sglang (or --kind mistralrs), \
+             then pallama engine use <tag> and restart the daemon"
+        )),
+        (K::Sglang, false) => Err(format!(
+            "sglang serves safetensors models; {path} is GGUF \
+             — run: pallama engine install --kind mistralrs, \
+             or pallama engine use <llamacpp-tag> for the GGUF lane"
+        )),
+        (_, true) => pallama_core::read_hf_config(std::path::Path::new(path))
+            .map(MetaBox::Hf)
+            .map_err(|e| format!("hf config: {e}")),
+        (_, false) => pallama_core::read_metadata_file(std::path::Path::new(path))
             .map(|m| MetaBox::Gguf(Box::new(m)))
             .map_err(|e| format!("gguf metadata: {e}")),
     }
@@ -273,6 +287,8 @@ use crate::engine_impl::{ChildHandle, Engine};
 pub enum SupervisionError {
     #[error("no such model: {0} (try `pallama pull`)")]
     ModelNotFound(String),
+    #[error("{0}")]
+    UnsupportedModel(String),
     #[error("engine crashed while loading or serving {0}")]
     EngineCrashed(String),
     #[error("model {0} did not become healthy in time")]
@@ -1854,7 +1870,7 @@ impl Supervisor {
             .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?
             .ok_or_else(|| SupervisionError::ModelNotFound(not_found_name(name)))?;
         let meta_box = read_model_meta(&model.path, self.engine.kind())
-            .map_err(|e| SupervisionError::Internal(anyhow!("model metadata: {e}")))?;
+            .map_err(SupervisionError::UnsupportedModel)?;
         let mut overlay = self.config.overlay_for(name);
         // LC4: in-memory adaptive slots fill in ONLY where the user left
         // slots unset (manual overlay always wins; `tune --slots` writes
@@ -2262,8 +2278,12 @@ impl Supervisor {
                     tuning.kv_quant = Some(true);
                 }
             }
+            // The profile compiler is the teaching layer: its errors
+            // name user-fixable conditions (wrong-lane model, unfit
+            // pins, reserved flags) — UnsupportedModel maps them to a
+            // 400 on the gateway instead of an opaque 500.
             let profile = profile::compile(&input, &tuning)
-                .map_err(|e| SupervisionError::Internal(anyhow!("profile: {e}")))?;
+                .map_err(|e| SupervisionError::UnsupportedModel(format!("profile: {e}")))?;
             for w in &profile.warnings {
                 tracing::warn!(model = name, "profile: {w}");
             }
@@ -3691,6 +3711,45 @@ mod routing_tests {
     use super::*;
     use crate::engine::manifest::Manifest;
     use pallama_core::{ModelOverride, Profile};
+
+    #[test]
+    fn unit__read_model_meta__wrong_lane_pairs_teach_the_engine_remedy() {
+        use pallama_core::engine_kind::EngineKind as K;
+        // A safetensors directory on the llama.cpp lane: the raw
+        // "gguf metadata: Is a directory" io-error taught nothing; the
+        // guard must name the sglang/mistralrs install remedy.
+        let dir = std::env::temp_dir().join("pallama-lane-guard-dir");
+        std::fs::create_dir_all(&dir).expect("mkdir fixture");
+        // MetaBox is not Debug, so expect_err cannot be used — take the
+        // error arm explicitly.
+        fn err_of(r: Result<MetaBox, String>) -> String {
+            match r {
+                Ok(_) => panic!("expected the wrong-lane guard to fire"),
+                Err(e) => e,
+            }
+        }
+        let err = err_of(read_model_meta(dir.to_str().unwrap(), K::LlamaCpp));
+        assert!(
+            err.contains("engine install --kind sglang"),
+            "llamacpp-on-dir teaching missing remedy: {err}"
+        );
+        // A GGUF file on the sglang lane: mirror guard.
+        let file = std::env::temp_dir().join("pallama-lane-guard.gguf");
+        std::fs::write(&file, b"gguf").expect("write fixture");
+        let err = err_of(read_model_meta(file.to_str().unwrap(), K::Sglang));
+        assert!(
+            err.contains("mistralrs"),
+            "sglang-on-file teaching missing remedy: {err}"
+        );
+        // mistral.rs follows the on-disk shape: a directory goes down
+        // the HF-config reader (even when the read itself fails, the
+        // error names that reader — never the GGUF one).
+        let err = err_of(read_model_meta(dir.to_str().unwrap(), K::MistralRs));
+        assert!(
+            err.starts_with("hf config:"),
+            "mistralrs-on-dir must read HF config, got: {err}"
+        );
+    }
 
     #[test]
     fn unit__pending_guard__drops_one_unit_on_any_exit() {

@@ -369,6 +369,9 @@ pub fn affinity_hash_bytes(body: &[u8]) -> Option<PrefixKey> {
 pub fn supervision_error(e: &SupervisionError) -> Response {
     match e {
         SupervisionError::ModelNotFound(m) => openai_error(404, &format!("no such model: {m}")),
+        // Wrong-lane model (safetensors dir on llama.cpp, GGUF on
+        // sglang): the message carries the engine-kind remedy.
+        SupervisionError::UnsupportedModel(m) => openai_error(400, m),
         SupervisionError::ModelLoadTimeout(m) => openai_error(
             503,
             &format!("model {m} failed to become healthy (model_load_timeout); check `pallama ps`"),
