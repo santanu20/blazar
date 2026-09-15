@@ -473,6 +473,69 @@ async fn integration__prune_retention_is_scoped_per_kind() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn integration__prune_siblings_deletes_same_kind_keeps_rest() {
+    use pallama_core::engine_kind::EngineKind;
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    let store = Store::open(&dirs).unwrap();
+
+    let stage = |tag: &str, kind: EngineKind, at: i64| {
+        let dir = dirs.engines_dir().join(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("server"), vec![7u8; 4096]).unwrap();
+        store
+            .upsert_engine(&pallama_core::EngineRow {
+                tag: tag.to_string(),
+                asset: "x".into(),
+                sha256: "x".into(),
+                installed_at: at,
+                active: false,
+                manifest: "{}".into(),
+                kind,
+            })
+            .unwrap();
+    };
+    // Two superseded llamacpp builds, the fresh one, a cross-kind
+    // neighbor, and the never-pruned local pseudo-tag.
+    stage("b-old", EngineKind::LlamaCpp, 1000);
+    stage("b-mid", EngineKind::LlamaCpp, 1001);
+    stage("b-new", EngineKind::LlamaCpp, 1002);
+    stage("s1", EngineKind::Sglang, 1003);
+    stage(LOCAL_TAG, EngineKind::LlamaCpp, 1);
+    store.set_active_engine("b-new").unwrap();
+
+    let freed = mgr.prune_siblings("llamacpp", "b-new").unwrap();
+    let mut freed_tags: Vec<&str> = freed.iter().map(|(t, _)| t.as_str()).collect();
+    freed_tags.sort();
+    assert_eq!(
+        freed_tags,
+        vec!["b-mid", "b-old"],
+        "only same-kind siblings"
+    );
+    // Freed bytes measured from the dir contents before deletion.
+    for (_, bytes) in &freed {
+        assert!(*bytes >= 4096, "byte counts come from the removed dir");
+    }
+    let mut remaining: Vec<String> = store
+        .list_engines()
+        .unwrap()
+        .into_iter()
+        .map(|e| e.tag)
+        .collect();
+    remaining.sort();
+    let mut expected = vec!["b-new".to_string(), LOCAL_TAG.to_string(), "s1".to_string()];
+    expected.sort();
+    assert_eq!(remaining, expected, "cross-kind + local + keeper survive");
+    assert!(!dirs.engines_dir().join("b-old").exists());
+    assert!(!dirs.engines_dir().join("b-mid").exists());
+    for kept in ["b-new", "s1", LOCAL_TAG] {
+        assert!(dirs.engines_dir().join(kept).exists(), "{kept} dir gone");
+    }
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn integration__register_local_engine() {
     let (_t, dirs) = tmp_dirs();
     let api = MockServer::start().await;

@@ -509,7 +509,9 @@ Examples:
   pallama config get slots          show the current effective value
   pallama config unset slots        remove the pin, return to the built-in default
   pallama config defaults slots     show the built-in default (omit KEY for all)
-  pallama config list               full effective config as TOML";
+  pallama config list               full effective config as TOML
+  pallama config set sglang.grammar_backend xgrammar    dotted keys reach table knobs
+  pallama config unset sglang.grammar_backend           ...and unset them the same way";
 
 /// Grouping table for the top-level help. Descriptions and aliases come
 /// live from clap (single source of truth); this table owns ONLY the
@@ -5601,6 +5603,17 @@ fn key_before_eq(line: &str) -> Option<&str> {
 /// VALIDATES, and probe values are placeholders that must not trip
 /// value validation. `deny_unknown_fields` is the authority either way.
 fn known_config_key(key: &str) -> bool {
+    if key.contains('.') {
+        // Dotted table-leaf keys probe with the header + one leaf line:
+        // `sglang.grammar_backend` parses as `[sglang]\ngrammar_backend = …`.
+        // Any scalar shape the schema accepts proves the path is real.
+        return split_table_path(key).is_some_and(|(path, leaf)| {
+            let header = table_header(&path);
+            ["\"s\"", "0", "0.5", "true", "[]"]
+                .iter()
+                .any(|v| toml::from_str::<Config>(&format!("{header}\n{leaf} = {v}\n")).is_ok())
+        });
+    }
     if !key
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
@@ -5638,6 +5651,212 @@ fn remove_top_level_pin(raw: &str, key: &str) -> (String, Option<String>) {
         }
     }
     (out.join("\n") + "\n", removed)
+}
+
+/// Split a dotted config key into its table path and leaf field:
+/// `model_overrides.qwen.sglang.grammar_backend` resolves to table
+/// ["model_overrides", "qwen", "sglang"], leaf "grammar_backend".
+/// Bare keys (no dot) return None and keep the top-level flow.
+/// Quote-aware split of a dotted path into raw segment ranges:
+/// `a."b.c".d` -> ranges for ["a", "\"b.c\"", "d"]. Dots inside double
+/// quotes are part of the name. Unbalanced quotes -> None.
+fn quoted_seg_ranges(s: &str) -> Option<Vec<(usize, usize)>> {
+    let bytes = s.as_bytes();
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut in_quotes = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => in_quotes = !in_quotes,
+            b'.' if !in_quotes => {
+                ranges.push((start, i));
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if in_quotes {
+        return None;
+    }
+    ranges.push((start, s.len()));
+    Some(ranges)
+}
+
+fn split_table_path(key: &str) -> Option<(Vec<&str>, &str)> {
+    if !key.contains('.') {
+        return None;
+    }
+    let ranges = quoted_seg_ranges(key)?;
+    if ranges.len() < 2 {
+        return None;
+    }
+    fn clean_seg(s: &str) -> &str {
+        s.strip_prefix('"')
+            .and_then(|t| t.strip_suffix('"'))
+            .unwrap_or(s)
+    }
+    let parts: Vec<&str> = ranges[..ranges.len() - 1]
+        .iter()
+        .map(|&(a, b)| clean_seg(&key[a..b]))
+        .collect();
+    let (a, b) = ranges[ranges.len() - 1];
+    Some((parts, clean_seg(&key[a..b])))
+}
+
+/// Normalize a TOML table header into comparable segments:
+/// `[model_overrides."qwen-7b".sglang]` -> ["model_overrides", "qwen-7b", "sglang"].
+/// Array-of-tables headers (`[[...]]`) are a different structure: None.
+fn header_segments(line: &str) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    let body = trimmed.strip_prefix('[')?.strip_suffix(']')?;
+    if body.starts_with('[') {
+        return None;
+    }
+    // Quote-aware: a header like [model_overrides."qwen2.5-0.5b".sglang]
+    // keeps the dotted model name as ONE segment.
+    Some(
+        quoted_seg_ranges(body)?
+            .into_iter()
+            .map(|(a, b)| body[a..b].trim().trim_matches('"').to_string())
+            .collect(),
+    )
+}
+
+/// Emit a table header, quoting segments that are not TOML bare keys
+/// (model names with dots/spaces: `[model_overrides."qwen 7b"]`).
+fn table_header(path: &[&str]) -> String {
+    let joined = path
+        .iter()
+        .map(|s| {
+            let bare = !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            if bare {
+                (*s).to_string()
+            } else {
+                format!("{s:?}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+    format!("[{joined}]")
+}
+
+/// Set `leaf = stored` inside the table at `path`, creating the header
+/// (after the longest existing prefix section, or at EOF) when absent.
+/// Every other line survives byte-for-byte; an existing leaf line is
+/// replaced in place.
+fn set_table_key(raw: &str, path: &[&str], leaf: &str, stored: &str) -> String {
+    let want: Vec<String> = path.iter().map(|s| s.to_string()).collect();
+    let lines: Vec<&str> = raw.lines().collect();
+    let newline = format!("{leaf} = {stored}");
+    if let Some(h) = lines
+        .iter()
+        .position(|l| header_segments(l).is_some_and(|segs| segs == want))
+    {
+        // Replace in place, or insert after the last non-empty line of the
+        // section (keeps related keys grouped above the next header).
+        let end = lines
+            .iter()
+            .enumerate()
+            .skip(h + 1)
+            .find(|(_, l)| l.trim_start().starts_with('['))
+            .map_or(lines.len(), |(i, _)| i);
+        if let Some(leaf_idx) = lines[h + 1..end]
+            .iter()
+            .position(|l| key_before_eq(l.trim_start()) == Some(leaf))
+        {
+            let at = h + 1 + leaf_idx;
+            let mut out = lines.clone();
+            out[at] = &newline;
+            return out.join("\n") + "\n";
+        }
+        let mut insert_at = end;
+        while insert_at > h + 1 && lines[insert_at - 1].trim().is_empty() {
+            insert_at -= 1;
+        }
+        let mut out = lines.clone();
+        out.insert(insert_at, &newline);
+        return out.join("\n") + "\n";
+    }
+    // Header absent: create it after the longest existing prefix table
+    // (so [model_overrides.m.sglang] lands inside m's section footprint),
+    // else append at EOF.
+    let mut insert_at = lines.len();
+    for depth in (1..path.len()).rev() {
+        let prefix: Vec<String> = path[..depth].iter().map(|s| s.to_string()).collect();
+        if let Some(h) = lines
+            .iter()
+            .position(|l| header_segments(l).is_some_and(|segs| segs == prefix))
+        {
+            insert_at = lines
+                .iter()
+                .enumerate()
+                .skip(h + 1)
+                .find(|(_, l)| l.trim_start().starts_with('['))
+                .map_or(lines.len(), |(i, _)| i);
+            break;
+        }
+    }
+    let header = table_header(path);
+    let mut out = lines.clone();
+    out.insert(insert_at, &header);
+    out.insert(insert_at + 1, &newline);
+    out.join("\n") + "\n"
+}
+
+/// Read `path.leaf` from the config file (pins only — table knobs have no
+/// defaults in the serialized document). Returns the pinned line, if any.
+fn get_table_key(raw: &str, path: &[&str], leaf: &str) -> Option<String> {
+    let want: Vec<String> = path.iter().map(|s| s.to_string()).collect();
+    let lines: Vec<&str> = raw.lines().collect();
+    let h = lines
+        .iter()
+        .position(|l| header_segments(l).is_some_and(|segs| segs == want))?;
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(h + 1)
+        .find(|(_, l)| l.trim_start().starts_with('['))
+        .map(|(i, _)| i)
+        .unwrap_or(lines.len());
+    lines[h + 1..end]
+        .iter()
+        .find(|l| key_before_eq(l.trim_start()) == Some(leaf))
+        .map(|l| l.trim().to_string())
+}
+
+/// Remove a table-scoped pin (`path.leaf`). The table header survives
+/// (empty sections are harmless); returns the removed line, if any.
+fn remove_table_key(raw: &str, path: &[&str], leaf: &str) -> (String, Option<String>) {
+    let want: Vec<String> = path.iter().map(|s| s.to_string()).collect();
+    let lines: Vec<&str> = raw.lines().collect();
+    let Some(h) = lines
+        .iter()
+        .position(|l| header_segments(l).is_some_and(|segs| segs == want))
+    else {
+        return (raw.to_string(), None);
+    };
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(h + 1)
+        .find(|(_, l)| l.trim_start().starts_with('['))
+        .map(|(i, _)| i)
+        .unwrap_or(lines.len());
+    if let Some(leaf_idx) = lines[h + 1..end]
+        .iter()
+        .position(|l| key_before_eq(l.trim_start()) == Some(leaf))
+    {
+        let at = h + 1 + leaf_idx;
+        let removed = lines[at].trim().to_string();
+        let mut out: Vec<&str> = lines.clone();
+        out.remove(at);
+        return (out.join("\n") + "\n", Some(removed));
+    }
+    (raw.to_string(), None)
 }
 
 /// Persist a per-model overlay key (validated immediately).
@@ -5937,6 +6156,16 @@ async fn engine_install_sglang(d: &PallamaDirs, version: Option<String>) -> Resu
         m.build_number
     );
     println!("note: decode-regression gate is llama-server-only — skipped for sglang engines");
+    // Same one-build-per-lane contract as the llama-server update: the
+    // superseded sglang venvs (multi-GB each) are freed on a successful
+    // install/activate.
+    for (tag, bytes) in mgr.prune_siblings(EngineKind::Sglang.as_str(), &row.tag)? {
+        println!(
+            "removed superseded engine {} (freed {})",
+            tag,
+            humansize(bytes as i64)
+        );
+    }
     println!("next: pull a safetensors model (e.g. pallama pull Qwen/Qwen2.5-0.5B-Instruct)");
     restart_hint().await;
     Ok(())
@@ -6158,11 +6387,27 @@ async fn engine_update(d: &PallamaDirs, tag: Option<String>, no_gate: bool) -> R
         engine_regression_gate(&mgr, d, &row)?;
     } else if downgrade {
         println!("channel switch: downgrade to {target_tag} — regression gate skipped");
-        if let Some(prev) = &active_tag {
-            println!("previous {prev} stays installed — `pallama engine use {prev}` restores it");
-        }
     } else {
         println!("engine {} installed; regression gate skipped", row.tag);
+    }
+    // A verified, ACTIVE update leaves exactly one build per lane: the
+    // superseded same-kind siblings (the KEEP_TAGS retention copies) are
+    // deleted outright — "engine update should clean the old builds".
+    // Non-active updates (keep-CUDA guard) keep the incumbent; the gate
+    // failure path returns Err above and never reaches this line.
+    let mut freed_gib = 0.0;
+    if !unchanged && row.active {
+        for (tag, bytes) in mgr.prune_siblings(row.kind.as_str(), &row.tag)? {
+            println!(
+                "removed superseded engine {} (freed {})",
+                tag,
+                humansize(bytes as i64)
+            );
+            freed_gib += bytes as f64 / GIB_F64;
+        }
+        if freed_gib > 0.0 {
+            println!("lane {} now holds only {target_tag}", row.kind);
+        }
     }
     let m: pallama_runtime::Manifest = serde_json::from_str(&row.manifest)?;
     if from_channel {
@@ -6279,6 +6524,15 @@ async fn engine_build(d: &PallamaDirs, a: BackendArg) -> Result<()> {
             m.devices.len(),
             m.flags.len()
         );
+        // One-build-per-lane contract (see `engine_update`): a freshly
+        // built AND activated engine frees its superseded siblings.
+        for (tag, bytes) in mgr.prune_siblings(row.kind.as_str(), &row.tag)? {
+            println!(
+                "removed superseded engine {} (freed {})",
+                tag,
+                humansize(bytes as i64)
+            );
+        }
     } else {
         // keep-cuda guard fired: an installed CUDA engine stays active.
         println!(
@@ -6741,15 +6995,32 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
         }
         ConfigCmd::Get { key } => {
             let cfg = config()?;
-            let raw = cfg.to_toml().map_err(|e| anyhow!("{e}"))?;
-            if let Some(line) = raw
-                .lines()
-                .find(|l| key_before_eq(l).is_some_and(|k| k == key))
-            {
-                println!("{line}");
-                Ok(())
+            if let Some((tpath, leaf)) = split_table_path(&key) {
+                // Dotted keys read the pin from the file itself — the
+                // serialized config would dump whole tables instead.
+                let raw = std::fs::read_to_string(dirs().config_file())?;
+                match get_table_key(&raw, &tpath, leaf) {
+                    Some(line) => {
+                        println!("{line}");
+                        Ok(())
+                    }
+                    None if known_config_key(&key) => {
+                        println!("{key} = <not set>");
+                        Ok(())
+                    }
+                    None => Err(anyhow!("unknown config key: {key}")),
+                }
             } else {
-                Err(anyhow!("unknown config key: {key}"))
+                let raw = cfg.to_toml().map_err(|e| anyhow!("{e}"))?;
+                if let Some(line) = raw
+                    .lines()
+                    .find(|l| key_before_eq(l).is_some_and(|k| k == key))
+                {
+                    println!("{line}");
+                    Ok(())
+                } else {
+                    Err(anyhow!("unknown config key: {key}"))
+                }
             }
         }
         ConfigCmd::Set { key, value } => {
@@ -6775,28 +7046,36 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
             } else {
                 format!("{value:?}")
             };
-            let mut out: Vec<String> = Vec::new();
-            let mut replaced = false;
-            for line in raw.lines() {
-                // F128: tolerant key match (compact `key="v"`, indented).
-                if key_before_eq(line).is_some_and(|k| k == key) {
-                    out.push(format!("{key} = {stored}"));
-                    replaced = true;
-                } else {
-                    out.push(line.to_string());
+            // Dotted keys (`sglang.grammar_backend`,
+            // `model_overrides.qwen.sglang.stream_interval`) target a table
+            // leaf and take the surgical insert path; bare keys keep the
+            // root-scope replace/insert flow.
+            let candidate = if let Some((tpath, leaf)) = split_table_path(&key) {
+                set_table_key(&raw, &tpath, leaf, &stored)
+            } else {
+                let mut out: Vec<String> = Vec::new();
+                let mut replaced = false;
+                for line in raw.lines() {
+                    // F128: tolerant key match (compact `key="v"`, indented).
+                    if key_before_eq(line).is_some_and(|k| k == key) {
+                        out.push(format!("{key} = {stored}"));
+                        replaced = true;
+                    } else {
+                        out.push(line.to_string());
+                    }
                 }
-            }
-            if !replaced {
-                // A NEW top-level key must go ABOVE the first table header
-                // (`[engine_env]`, `[model_overrides.x]`…); appending at the
-                // end would nest it inside that table.
-                let insert_at = out
-                    .iter()
-                    .position(|l| l.starts_with('['))
-                    .unwrap_or(out.len());
-                out.insert(insert_at, format!("{key} = {stored}"));
-            }
-            let candidate = out.join("\n") + "\n";
+                if !replaced {
+                    // A NEW top-level key must go ABOVE the first table header
+                    // (`[engine_env]`, `[model_overrides.x]`…); appending at the
+                    // end would nest it inside that table.
+                    let insert_at = out
+                        .iter()
+                        .position(|l| l.starts_with('['))
+                        .unwrap_or(out.len());
+                    out.insert(insert_at, format!("{key} = {stored}"));
+                }
+                out.join("\n") + "\n"
+            };
             // Validate BEFORE persisting: a bad value/unknown key must
             // never leave the file broken.
             Config::from_toml(&candidate).map_err(|e| anyhow!("rejected, file unchanged: {e}"))?;
@@ -6815,6 +7094,26 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                 Config::load(&d).map_err(|e| anyhow!("{e}"))?;
             }
             let raw = std::fs::read_to_string(&path)?;
+            if let Some((tpath, leaf)) = split_table_path(&key) {
+                let (candidate, removed) = remove_table_key(&raw, &tpath, leaf);
+                return match removed {
+                    Some(old) => {
+                        Config::from_toml(&candidate)
+                            .map_err(|e| anyhow!("rejected, file unchanged: {e}"))?;
+                        pallama_core::persist_config(&path, &candidate)?;
+                        println!("{key} unset (was: {old}) — not set by default");
+                        Ok(())
+                    }
+                    None if known_config_key(&key) => {
+                        println!("{key} is not pinned — already at the built-in default");
+                        Ok(())
+                    }
+                    None => Err(anyhow!(
+                        "unknown config key: {key} (tuning knobs live under \
+                         [sglang], [mistralrs] and [model_overrides.<model>])"
+                    )),
+                };
+            }
             let (candidate, removed) = remove_top_level_pin(&raw, &key);
             match removed {
                 Some(old) => {
@@ -6842,8 +7141,8 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                     Ok(())
                 }
                 None => Err(anyhow!(
-                    "unknown config key: {key} (table settings like [semantic_cache] \
-                     and [model_overrides] are edited in the file directly)"
+                    "unknown config key: {key} (table knobs use dotted keys: \
+                     pallama config set sglang.stream_interval 1)"
                 )),
             }
         }
@@ -6960,6 +7259,209 @@ mod tests {
     }
 
     #[test]
+    fn unit__known_config_key__dotted_table_paths() {
+        // Real table-leaf knobs across all three engine tables and both
+        // scopes (global table + model override nesting).
+        for k in [
+            "sglang.grammar_backend",
+            "sglang.cuda_graph_bs",
+            "sglang.stream_interval",
+            "mistralrs.max_batch_size",
+            "mistralrs.mtp_draft_sampling",
+            "mistralrs.device_layers",
+            "model_overrides.m.sglang.grammar_backend",
+            "model_overrides.m.mistralrs.prefix_cache_n",
+        ] {
+            assert!(known_config_key(k), "{k} must be a known dotted knob");
+        }
+        // Plausible-but-fake leaves and tables must be rejected by the
+        // schema probes (deny_unknown_fields on the tuning structs).
+        for k in [
+            "sglang.bogus",
+            "mistralrs.bogus",
+            "sglangx.grammar_backend",
+            "model_overrides.m.sglang.bogus",
+            "model_overrides.m.bogus.k",
+            "model_overrides.bogus.sglang",
+        ] {
+            assert!(!known_config_key(k), "{k} must be unknown");
+        }
+    }
+
+    #[test]
+    fn unit__set_table_key__replace_create_and_grouping() {
+        // Replace in place inside an existing header, byte-preserving the
+        // rest of the section.
+        let raw = concat!(
+            "host = \"127.0.0.1\"\n",
+            "\n",
+            "[sglang]\n",
+            "stream_interval = 1\n",
+            "mem_fraction_static = 0.8\n",
+        );
+        let out = set_table_key(raw, &["sglang"], "stream_interval", "4");
+        assert!(out.contains("stream_interval = 4"), "replaced in place");
+        assert!(!out.contains("stream_interval = 1"), "old line gone");
+        assert!(out.contains("mem_fraction_static = 0.8"), "sibling kept");
+        assert!(out.starts_with("host ="), "root scope untouched");
+        assert!(Config::from_toml(&out).is_ok());
+
+        // New leaf in an existing section lands inside it, above the next
+        // header (grouped with its siblings, not appended at EOF).
+        let raw2 = concat!(
+            "[sglang]\n",
+            "stream_interval = 1\n",
+            "\n",
+            "[mistralrs]\n",
+            "max_batch_size = 2\n",
+        );
+        let out2 = set_table_key(raw2, &["sglang"], "grammar_backend", "\"outlines\"");
+        let gpos = out2.find("grammar_backend").expect("leaf inserted");
+        let mpos = out2.find("[mistralrs]").expect("mistralrs header");
+        assert!(gpos < mpos, "leaf grouped inside [sglang]");
+        assert!(
+            out2.contains("grammar_backend = \"outlines\""),
+            "stored verbatim"
+        );
+        assert!(Config::from_toml(&out2).is_ok());
+
+        // Absent header: created after the longest existing prefix
+        // ([model_overrides."qwen 7b"] exists; the .sglang child nests
+        // right after its parent section, not at EOF over other tables).
+        let raw3 = concat!(
+            "[sglang]\n",
+            "stream_interval = 1\n",
+            "\n",
+            "[model_overrides.\"qwen 7b\"]\n",
+            "slots = 2\n",
+            "\n",
+            "[mistralrs]\n",
+            "max_batch_size = 2\n",
+        );
+        let out3 = set_table_key(
+            raw3,
+            &["model_overrides", "qwen 7b", "sglang"],
+            "page_size",
+            "32",
+        );
+        let hpos = out3
+            .find("[model_overrides.\"qwen 7b\".sglang]")
+            .expect("nested header created, non-bare segment quoted");
+        let global_pos = out3.find("[sglang]").expect("global table");
+        let mistral_pos = out3.find("[mistralrs]").expect("mistralrs table");
+        assert!(hpos > global_pos, "nested after global [sglang]");
+        assert!(hpos < mistral_pos, "nested before unrelated [mistralrs]");
+        assert!(out3.contains("page_size = 32"), "leaf under new header");
+        assert!(Config::from_toml(&out3).is_ok());
+
+        // No prefix at all: header appended at EOF.
+        let out4 = set_table_key("host = \"h\"\n", &["sglang"], "page_size", "16");
+        assert!(
+            out4.trim_end().ends_with("[sglang]\npage_size = 16")
+                || out4.contains("\n[sglang]\npage_size = 16\n"),
+            "EOF append shape: {out4:?}"
+        );
+        assert!(Config::from_toml(&out4).is_ok());
+    }
+
+    #[test]
+    fn unit__get_and_remove_table_key__roundtrip() {
+        let raw = concat!(
+            "[sglang]\n",
+            "stream_interval = 3\n",
+            "\n",
+            "[model_overrides.\"m\"]\n",
+            "slots = 2\n",
+        );
+        assert_eq!(
+            get_table_key(raw, &["sglang"], "stream_interval").as_deref(),
+            Some("stream_interval = 3"),
+            "get returns the raw pinned line"
+        );
+        assert_eq!(
+            get_table_key(raw, &["model_overrides", "m"], "slots").as_deref(),
+            Some("slots = 2"),
+            "quoted segment headers match"
+        );
+        assert!(
+            get_table_key(raw, &["sglang"], "page_size").is_none(),
+            "unpinned leaf is None"
+        );
+        assert!(
+            get_table_key(raw, &["mistralrs"], "max_batch_size").is_none(),
+            "absent table is None"
+        );
+
+        let (out, removed) = remove_table_key(raw, &["sglang"], "stream_interval");
+        assert_eq!(
+            removed.as_deref(),
+            Some("stream_interval = 3"),
+            "removed line reported for the was: message"
+        );
+        assert!(
+            !out.contains("stream_interval"),
+            "leaf gone from the section"
+        );
+        assert!(out.contains("[sglang]"), "header survives");
+        assert!(out.contains("slots = 2"), "other tables untouched");
+        assert!(Config::from_toml(&out).is_ok());
+
+        let (out2, removed2) = remove_table_key(raw, &["sglang"], "page_size");
+        assert!(removed2.is_none(), "unpinned leaf removes nothing");
+        assert_eq!(out2, raw, "byte-identical when nothing to remove");
+    }
+
+    #[test]
+    fn unit__split_table_path_and_header_segments__grammar() {
+        assert!(split_table_path("slots").is_none(), "bare key");
+        assert_eq!(
+            split_table_path("sglang.page_size"),
+            Some((vec!["sglang"], "page_size"))
+        );
+        assert_eq!(
+            split_table_path("model_overrides.m.sglang.page_size"),
+            Some((vec!["model_overrides", "m", "sglang"], "page_size"))
+        );
+        // Quoted segment with dots stays whole; quotes stripped from output.
+        assert_eq!(
+            split_table_path("model_overrides.\"qwen2.5-0.5b-instruct\".mistralrs.prefix_cache_n"),
+            Some((
+                vec!["model_overrides", "qwen2.5-0.5b-instruct", "mistralrs"],
+                "prefix_cache_n"
+            ))
+        );
+        // Unterminated quoting is a grammar error, not a path.
+        assert!(split_table_path("model_overrides.\"qwen2.5.sglang.k").is_none());
+        // Header with dots inside the quoted segment stays one segment.
+        assert_eq!(
+            header_segments("[model_overrides.\"qwen2.5-0.5b-instruct\".mistralrs]").unwrap(),
+            vec![
+                "model_overrides".to_string(),
+                "qwen2.5-0.5b-instruct".to_string(),
+                "mistralrs".to_string()
+            ]
+        );
+        assert!(header_segments("[model_overrides.\"qwen2.5.mistralrs]").is_none());
+        // Header parsing: quotes stripped, [[array]] refused.
+        assert_eq!(
+            header_segments("[model_overrides.\"qwen 7b\".sglang]").unwrap(),
+            vec!["model_overrides", "qwen 7b", "sglang"]
+        );
+        assert_eq!(header_segments("[sglang]").unwrap(), vec!["sglang"]);
+        assert!(header_segments("[[engine_env]]").is_none(), "array header");
+        assert!(
+            header_segments("stream_interval = 1").is_none(),
+            "not a header"
+        );
+        // Emission: bare segments bare, others quoted.
+        assert_eq!(
+            table_header(&["model_overrides", "qwen 7b", "sglang"]),
+            "[model_overrides.\"qwen 7b\".sglang]"
+        );
+        assert_eq!(table_header(&["sglang"]), "[sglang]");
+    }
+
+    #[test]
     fn unit__remove_top_level_pin__unpinned_is_none_and_byte_preserving() {
         let raw = "host = \"127.0.0.1\"\n";
         let (out, removed) = remove_top_level_pin(raw, "slots");
@@ -7045,7 +7547,7 @@ mod tests {
         // Column-start proof: every cell begins exactly at its header's
         // column offset on both data rows — a value overflowing its
         // column would push itself or its right neighbour off offset.
-        let col = |l: &str, h: &str| out.lines().next().unwrap().find(h).unwrap();
+        let col = |_l: &str, h: &str| out.lines().next().unwrap().find(h).unwrap();
         let at = |l: &str, v: &str, off: usize| {
             assert_eq!(l.find(v), Some(off), "{v} misaligned in: {l}");
         };

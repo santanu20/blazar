@@ -25,6 +25,22 @@ use manifest::Manifest;
 /// fresh build plus one rollback anchor (~215 MiB each). `local` and the
 /// active tag are always kept on top of this.
 pub const KEEP_TAGS: usize = 2;
+
+/// Recursive byte size of an engine dir (for the update-prune summary).
+fn engine_dir_bytes(p: &Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(p) else {
+        return 0;
+    };
+    let mut n = 0u64;
+    for e in rd.flatten() {
+        match e.file_type() {
+            Ok(ft) if ft.is_dir() => n += engine_dir_bytes(&e.path()),
+            Ok(_) => n += e.metadata().map_or(0, |m| m.len()),
+            Err(_) => {}
+        }
+    }
+    n
+}
 pub const LOCAL_TAG: &str = "local";
 /// Wait between asset-list re-fetches while a fresh release finishes
 /// uploading (observed: full asset matrix lands ~75-120 s after publish).
@@ -902,6 +918,40 @@ impl EngineManager {
                 .publish(PallamaEvent::EngineRemoved { tag: e.tag.clone() });
         }
         Ok(())
+    }
+
+    /// Delete every OTHER engine of the same kind: a verified, activated
+    /// update leaves exactly one build per lane (the user-facing "why do
+    /// I see two llama.cpp engines after updating" contract). The `local`
+    /// pseudo-tag and `keep_tag` itself survive; cross-kind rows are
+    /// untouched. Returns the freed (tag, bytes) pairs for the summary.
+    pub fn prune_siblings(&self, kind: &str, keep_tag: &str) -> Result<Vec<(String, u64)>> {
+        let store = Store::open(&self.dirs)?;
+        let engines = store.list_engines()?;
+        let mut freed = Vec::new();
+        for e in engines {
+            if e.kind.as_str() != kind || e.tag == keep_tag || e.tag == LOCAL_TAG {
+                continue;
+            }
+            let dir = self.dirs.engines_dir().join(&e.tag);
+            let mut bytes = 0u64;
+            if dir.exists() {
+                bytes = engine_dir_bytes(&dir);
+                std::fs::remove_dir_all(&dir)
+                    .with_context(|| format!("prune engine dir {}", dir.display()))?;
+            }
+            store.delete_engine(&e.tag)?;
+            tracing::info!(
+                "pruned superseded engine {} ({} bytes) after update to {}",
+                e.tag,
+                bytes,
+                keep_tag
+            );
+            self.bus
+                .publish(PallamaEvent::EngineRemoved { tag: e.tag.clone() });
+            freed.push((e.tag, bytes));
+        }
+        Ok(freed)
     }
 
     /// Register a locally built llama-server (`PALLAMA_ENGINE_PATH`) under the
