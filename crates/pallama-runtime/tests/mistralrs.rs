@@ -573,3 +573,94 @@ fn manifest_flags(extra: &[&str]) -> Manifest {
     }
     m
 }
+
+#[test]
+fn unit__mistralrs_argv__tuning_passthrough_pairs_and_bools() {
+    // compile_mistralrs emits tuning tokens into profile.argv; the argv
+    // builder must forward every pair (and bare bool) the manifest knows,
+    // order-preserving, and drop the rest.
+    let m = model("/data/m.gguf", None);
+    let p = profile(
+        8192,
+        &[
+            "--max-batch-size",
+            "4",
+            "--prefix-cache-n",
+            "0",
+            "--lora",
+            "style=/loras/style.gguf",
+            "--mtp",
+            "--mtp-model",
+            "mtp-draft",
+            "--mtp-draft-sampling",
+            "greedy",
+            "--device-layers",
+            "0:12",
+            "--disable-metrics",
+        ],
+    );
+    let engine = MistralRsEngine::with_env(
+        manifest_flags(&[
+            "--max-batch-size",
+            "--prefix-cache-n",
+            "--lora",
+            "--mtp",
+            "--mtp-model",
+            "--mtp-draft-sampling",
+            "--device-layers",
+            "--disable-metrics",
+        ]),
+        Vec::new(),
+    );
+    let argv = engine.build_argv(&m, &p, &tcp());
+    for pair in [
+        ("--max-batch-size", "4"),
+        ("--prefix-cache-n", "0"),
+        ("--lora", "style=/loras/style.gguf"),
+        ("--mtp-model", "mtp-draft"),
+        ("--mtp-draft-sampling", "greedy"),
+        ("--device-layers", "0:12"),
+    ] {
+        assert!(
+            argv.windows(2).any(|w| w == [pair.0, pair.1]),
+            "missing {pair:?}: {argv:?}"
+        );
+    }
+    for bare in ["--mtp", "--disable-metrics"] {
+        assert!(argv.iter().any(|t| t == bare), "missing {bare}: {argv:?}");
+    }
+    let mtp = argv.iter().position(|t| t == "--mtp").unwrap();
+    let mtp_model = argv.iter().position(|t| t == "--mtp-model").unwrap();
+    assert!(
+        mtp < mtp_model,
+        "family switch must lead dependents: {argv:?}"
+    );
+}
+
+#[test]
+fn unit__mistralrs_argv__tuning_passthrough_gated_by_manifest() {
+    // Old engine (manifest lacks the tuning flags): every tuning token is
+    // dropped from the child argv — the compile-time warning already taught.
+    let m = model("/data/m.gguf", None);
+    let p = profile(
+        8192,
+        &[
+            "--max-batch-size",
+            "4",
+            "--mtp",
+            "--device-layers",
+            "0:12",
+            "--disable-access-log",
+        ],
+    );
+    let engine = MistralRsEngine::with_env(manifest(), Vec::new());
+    let argv = engine.build_argv(&m, &p, &tcp());
+    for flag in [
+        "--max-batch-size",
+        "--mtp",
+        "--device-layers",
+        "--disable-access-log",
+    ] {
+        assert!(!argv.iter().any(|t| t == flag), "{flag} leaked: {argv:?}");
+    }
+}

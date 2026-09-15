@@ -10,8 +10,8 @@
 
 use std::collections::BTreeSet;
 
-use crate::config::SglangTuning;
 use crate::config::{Config, MmprojPolicy, ModelOverride};
+use crate::config::{MistralrsTuning, SglangTuning};
 use crate::gguf::GgufMeta;
 use crate::hardware::GpuInfo;
 use crate::hardware::Hardware;
@@ -1464,6 +1464,78 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         );
     }
 
+    // --- 12b-bis. child HTTP server behavior knobs (llama-server
+    // lane; all flag-gated with the usual engine-update teaching).
+    if let Some(secs) = config.sse_ping_interval {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "sse_ping_interval",
+            "--sse-ping-interval",
+            &[secs.to_string()],
+        );
+    }
+    if let Some(secs) = config.server_timeout_secs {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "server_timeout_secs",
+            "--timeout",
+            &[secs.to_string()],
+        );
+    }
+    if let Some(kwargs) = &config.chat_template_kwargs {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "chat_template_kwargs",
+            "--chat-template-kwargs",
+            std::slice::from_ref(kwargs),
+        );
+    }
+    match config.cont_batching {
+        Some(true) => push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "cont_batching",
+            "--cont-batching",
+            &[],
+        ),
+        Some(false) => push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "cont_batching = false",
+            "--no-cont-batching",
+            &[],
+        ),
+        None => {}
+    }
+    if config.reuse_port {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "reuse_port",
+            "--reuse-port",
+            &[],
+        );
+    }
+    if config.lora_init_without_apply {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "lora_init_without_apply",
+            "--lora-init-without-apply",
+            &[],
+        );
+    }
+
     // --- 12c. vision / multimodal tuning + embeddings normalization.
     if config.image_max_tokens > 0 {
         push_gated(
@@ -2043,6 +2115,7 @@ fn ensure_batch_flag(argv: &mut Vec<String>, flag: &str, floor: u32) {
 /// truth), slots as `-np N` for the argv translator to mine. KV estimate
 /// is None: mistral.rs sizes its paged KV from a VRAM fraction, not from
 /// ctx math, so an f16 estimate here would be a lie.
+#[allow(clippy::too_many_lines)] // one flat flag inventory, not logic
 fn compile_mistralrs(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Profile {
     let ctx = tuning
         .ctx
@@ -2132,6 +2205,278 @@ fn compile_mistralrs(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Prof
             }
         }
     }
+    // mistral.rs tuning struct (global `[mistralrs]` or per-model
+    // `model_overrides.<name>.mistralrs`, override-replaces). All
+    // emissions flag-gated with the usual engine-update teaching.
+    let tun = MistralrsTuning::effective(input.overlay.mistralrs.as_ref(), &input.config.mistralrs);
+
+    // LoRA adapter lane: mistral.rs `--lora ALIAS=SOURCE` accepts
+    // repeated pairs (alias --lora-modules), GGUF and safetensors
+    // alike — unlike the sglang lane there is no format split. The
+    // llamacpp `scale` field has no ALIAS=SOURCE form (the upstream
+    // JSON form is undocumented in --help); warn instead of guessing.
+    for (path, scale) in input.loras {
+        let alias = std::path::Path::new(path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("lora");
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "loras",
+            "--lora",
+            &[format!("{alias}={path}")],
+        );
+        if (*scale - 1.0).abs() > f64::EPSILON {
+            warnings.push(format!(
+                "lora scale {scale} ignored on the mistralrs engine — its ALIAS=SOURCE \
+                 form has no scale; the adapter serves at its trained strength"
+            ));
+        }
+    }
+
+    // Scheduler family.
+    if let Some(n) = tun.max_batch_size {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.max_batch_size",
+            "--max-batch-size",
+            &[n.to_string()],
+        );
+    }
+    if let Some(n) = tun.max_prefill_chunk_tokens {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.max_prefill_chunk_tokens",
+            "--max-prefill-chunk-tokens",
+            &[n.to_string()],
+        );
+    }
+    if let Some(n) = tun.max_decode_steps_before_prefill {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.max_decode_steps_before_prefill",
+            "--max-decode-steps-before-prefill",
+            &[n.to_string()],
+        );
+    }
+    if let Some(n) = tun.prefix_cache_n {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.prefix_cache_n",
+            "--prefix-cache-n",
+            &[n.to_string()],
+        );
+    }
+
+    // Paged-attention detail family (the two legacy globals above cover
+    // the fraction and the on/off switch).
+    if let Some(n) = tun.pa_block_size {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.pa_block_size",
+            "--pa-block-size",
+            &[n.to_string()],
+        );
+    }
+    if let Some(t) = &tun.pa_cache_type {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.pa_cache_type",
+            "--pa-cache-type",
+            std::slice::from_ref(t),
+        );
+    }
+    if let Some(n) = tun.pa_context_len {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.pa_context_len",
+            "--pa-context-len",
+            &[n.to_string()],
+        );
+    }
+
+    // LoRA capacity family.
+    if let Some(n) = tun.lora_max_rank {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.lora_max_rank",
+            "--lora-max-rank",
+            &[n.to_string()],
+        );
+    }
+    if let Some(n) = tun.lora_max_adapters {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.lora_max_adapters",
+            "--lora-max-adapters",
+            &[n.to_string()],
+        );
+    }
+    if let Some(n) = tun.lora_max_bytes {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.lora_max_bytes",
+            "--lora-max-bytes",
+            &[n.to_string()],
+        );
+    }
+
+    // MTP speculative family (--mtp first so the head is enabled before
+    // its parameters land).
+    if tun.mtp == Some(true) {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.mtp",
+            "--mtp",
+            &[],
+        );
+    }
+    if let Some(m) = &tun.mtp_model {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.mtp_model",
+            "--mtp-model",
+            std::slice::from_ref(m),
+        );
+    }
+    if let Some(n) = tun.mtp_n_predict {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.mtp_n_predict",
+            "--mtp-n-predict",
+            &[n.to_string()],
+        );
+    }
+    if let Some(s) = &tun.mtp_draft_sampling {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.mtp_draft_sampling",
+            "--mtp-draft-sampling",
+            std::slice::from_ref(s),
+        );
+    }
+
+    // Vision capacity family.
+    if let Some(mb) = tun.encoder_cache_memory_mb {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.encoder_cache_memory_mb",
+            "--encoder-cache-memory-mb",
+            &[mb.to_string()],
+        );
+    }
+    if let Some(n) = tun.max_num_images {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.max_num_images",
+            "--max-num-images",
+            &[n.to_string()],
+        );
+    }
+    if let Some(n) = tun.max_image_length {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.max_image_length",
+            "--max-image-length",
+            &[n.to_string()],
+        );
+    }
+
+    // Observability switches (child's Prometheus recorder and HTTP
+    // access log are on by default upstream).
+    if tun.disable_metrics == Some(true) {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.disable_metrics",
+            "--disable-metrics",
+            &[],
+        );
+    }
+    if tun.disable_access_log == Some(true) {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.disable_access_log",
+            "--disable-access-log",
+            &[],
+        );
+    }
+
+    // Layer mapping pin: emit only with a teaching nudge on single-GPU
+    // boxes (mirrors the sglang parallelism pins).
+    if let Some(layers) = &tun.device_layers {
+        if input.hardware.gpus.len() < 2 {
+            warnings.push(
+                "mistralrs.device_layers set but this box has a single GPU — a manual \
+                 layer split only makes sense multi-GPU; drop the pin for automatic \
+                 mapping"
+                    .to_string(),
+            );
+        }
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.device_layers",
+            "--device-layers",
+            std::slice::from_ref(layers),
+        );
+    }
+
+    // extra_args is llama-server dialect; mistral.rs `serve` shares almost
+    // none of it, so a passthrough of stale llamacpp flags hard-fails the
+    // boot. Drop with a named warning instead of emitting (the llamacpp
+    // lane validates-and-emits, sglang validates-strictly; this lane has
+    // no safe validator, so it refuses).
+    if let Some(extra) = &input.overlay.extra_args {
+        if !extra.is_empty() {
+            warnings.push(format!(
+                "extra_args [{}] ignored on the mistralrs engine — its `serve` grammar \
+                 does not accept llama-server flags; remove the override or switch engines \
+                 with `pallama engine use <tag>` (see `pallama engine list`)",
+                extra.join(" ")
+            ));
+        }
+    }
     Profile {
         argv,
         warnings,
@@ -2161,9 +2506,10 @@ const SGLANG_MEM_FRACTION_MAX: f32 = 0.90;
 
 /// Flags `SglangEngine::build_argv` owns. An `extra_args` entry naming
 /// one of these is a hand-written attempt to fight the connection
-/// quintet or the VRAM ladder — hard error with the reason, never a
-/// silent duplicate flag (last-one-wins argv semantics would let a user
-/// accidentally unpublish the API key or move the child off loopback).
+/// quintet, the VRAM ladder, or the loras lane — hard error with the
+/// reason, never a silent duplicate flag (last-one-wins argv semantics
+/// would let a user accidentally unpublish the API key or move the
+/// child off loopback).
 const SGLANG_RESERVED_FLAGS: &[&str] = &[
     "--model-path",
     "--host",
@@ -2173,6 +2519,8 @@ const SGLANG_RESERVED_FLAGS: &[&str] = &[
     "--context-length",
     "--mem-fraction-static",
     "--cpu-offload-gb",
+    "--enable-lora",
+    "--lora-paths",
 ];
 
 /// Flag-gated argv push for tuning knobs: knobs may target a newer sglang
@@ -2193,6 +2541,28 @@ fn push_tuned(
         if !value.is_empty() {
             argv.push(value.to_string());
         }
+    } else {
+        warnings.push(format!(
+            "{warning_prefix} set but this sglang engine lacks {flag}; \
+             skipped (pallama engine install updates it)"
+        ));
+    }
+}
+
+/// List-shaped sibling of `push_tuned` for nargs flags (`--cuda-graph-bs
+/// 1 2 4`): the flag once, then every value as its own argv token —
+/// argparse consumes tokens until the next `--` flag.
+fn push_tuned_list(
+    argv: &mut Vec<String>,
+    flags: &std::collections::BTreeSet<String>,
+    warning_prefix: &str,
+    flag: &str,
+    values: &[String],
+    warnings: &mut Vec<String>,
+) {
+    if flags.contains(flag) {
+        argv.push(flag.to_string());
+        argv.extend(values.iter().cloned());
     } else {
         warnings.push(format!(
             "{warning_prefix} set but this sglang engine lacks {flag}; \
@@ -2271,7 +2641,12 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
 
     // --- concurrency: slots -> --max-running-requests (sglang's batching
     // parallelism; 0/None keeps upstream auto). Deterministic pin forces
-    // single-stream exactly like the mistralrs profile.
+    // single-stream exactly like the mistralrs profile, and additionally
+    // engages sglang's native deterministic-inference flag when the
+    // installed engine advertises it (batch-invariant kernels on top of
+    // the serialization pin — additive, never a replacement: the slots=1
+    // pin is what actually guarantees token-for-token greedy
+    // reproducibility).
     let mut slots = input.overlay.slots.unwrap_or(input.config.slots);
     if input
         .overlay
@@ -2287,6 +2662,14 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
             ));
         }
         slots = 1;
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "deterministic",
+            "--enable-deterministic-inference",
+            "",
+            &mut warnings,
+        );
     }
     if slots != 0 {
         push_tuned(
@@ -2295,6 +2678,57 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
             "model slots",
             "--max-running-requests",
             &slots.to_string(),
+            &mut warnings,
+        );
+    }
+
+    // --- loras: sglang serves PEFT/safetensors adapters via --enable-lora
+    // + --lora-paths name=path. llama.cpp-class .gguf/.bin adapters are a
+    // different format entirely — hard error with the lane teaching
+    // instead of a child crash mid-boot. The llama.cpp `scale` dial has no
+    // sglang equivalent (upstream applies the adapter at its trained
+    // strength): warn, never silently drop the pair.
+    if !input.loras.is_empty() {
+        let mut lora_tokens: Vec<String> = Vec::new();
+        let mut scale_warned = false;
+        for (path, scale) in input.loras {
+            let p = std::path::Path::new(path);
+            let is_llamacpp_adapter = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("gguf") || e.eq_ignore_ascii_case("bin"));
+            if is_llamacpp_adapter {
+                return Err(format!(
+                    "lora {path} is a .gguf/.bin adapter — the sglang engine loads \
+                     PEFT/safetensors adapters only (adapter_model.safetensors \
+                     dirs); run it on the llamacpp engine or pull a PEFT variant"
+                ));
+            }
+            let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("adapter");
+            lora_tokens.push(format!("{name}={path}"));
+            if (*scale - 1.0).abs() > f64::EPSILON && !scale_warned {
+                warnings.push(
+                    "lora scale is llama.cpp vocabulary and is ignored on sglang — \
+                     adapters apply at their trained strength"
+                        .into(),
+                );
+                scale_warned = true;
+            }
+        }
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "loras",
+            "--enable-lora",
+            "",
+            &mut warnings,
+        );
+        push_tuned_list(
+            &mut argv,
+            input.supported_flags,
+            "loras",
+            "--lora-paths",
+            &lora_tokens,
             &mut warnings,
         );
     }
@@ -2731,6 +3165,268 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
         );
     }
 
+    // --- tokenizer / detokenizer throughput family
+    if let Some(v) = &tun.tokenizer_mode {
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "sglang.tokenizer_mode",
+            "--tokenizer-mode",
+            v,
+            &mut warnings,
+        );
+    }
+    if let Some(v) = &tun.tokenizer_backend {
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "sglang.tokenizer_backend",
+            "--tokenizer-backend",
+            v,
+            &mut warnings,
+        );
+    }
+    if let Some(v) = tun.tokenizer_worker_num {
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "sglang.tokenizer_worker_num",
+            "--tokenizer-worker-num",
+            &v.to_string(),
+            &mut warnings,
+        );
+    }
+    if let Some(v) = tun.detokenizer_worker_num {
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "sglang.detokenizer_worker_num",
+            "--detokenizer-worker-num",
+            &v.to_string(),
+            &mut warnings,
+        );
+    }
+    if tun.dynamic_batch_tokenizer == Some(true) {
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "sglang.dynamic_batch_tokenizer",
+            "--enable-dynamic-batch-tokenizer",
+            "",
+            &mut warnings,
+        );
+    }
+    if let Some(v) = tun.dynamic_batch_tokenizer_batch_size {
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "sglang.dynamic_batch_tokenizer_batch_size",
+            "--dynamic-batch-tokenizer-batch-size",
+            &v.to_string(),
+            &mut warnings,
+        );
+    }
+    if let Some(v) = tun.dynamic_batch_tokenizer_batch_timeout {
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "sglang.dynamic_batch_tokenizer_batch_timeout",
+            "--dynamic-batch-tokenizer-batch-timeout",
+            &format!("{v}"),
+            &mut warnings,
+        );
+    }
+
+    // --- structured output + radix cache policy family
+    if let Some(v) = &tun.grammar_backend {
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "sglang.grammar_backend",
+            "--grammar-backend",
+            v,
+            &mut warnings,
+        );
+    }
+    if let Some(v) = &tun.radix_eviction_policy {
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "sglang.radix_eviction_policy",
+            "--radix-eviction-policy",
+            v,
+            &mut warnings,
+        );
+    }
+    if tun.session_radix_cache == Some(true) {
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "sglang.session_radix_cache",
+            "--enable-session-radix-cache",
+            "",
+            &mut warnings,
+        );
+    }
+    if tun.mixed_chunk == Some(true) {
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "sglang.mixed_chunk",
+            "--enable-mixed-chunk",
+            "",
+            &mut warnings,
+        );
+    }
+
+    // --- idle / lifecycle hygiene family
+    if tun.sleep_on_idle == Some(true) {
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "sglang.sleep_on_idle",
+            "--sleep-on-idle",
+            "",
+            &mut warnings,
+        );
+    }
+    if tun.memory_saver == Some(true) {
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "sglang.memory_saver",
+            "--enable-memory-saver",
+            "",
+            &mut warnings,
+        );
+    }
+    if let Some(v) = tun.watchdog_timeout {
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "sglang.watchdog_timeout",
+            "--watchdog-timeout",
+            &format!("{v}"),
+            &mut warnings,
+        );
+    }
+
+    // --- scheduler / observability family
+    if tun.cache_report == Some(true) {
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "sglang.cache_report",
+            "--enable-cache-report",
+            "",
+            &mut warnings,
+        );
+    }
+    if let Some(v) = tun.batch_notify_size {
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "sglang.batch_notify_size",
+            "--batch-notify-size",
+            &v.to_string(),
+            &mut warnings,
+        );
+    }
+    if let Some(v) = tun.scheduler_recv_interval {
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "sglang.scheduler_recv_interval",
+            "--scheduler-recv-interval",
+            &v.to_string(),
+            &mut warnings,
+        );
+    }
+
+    // --- explicit cuda-graph capture list + KV token cap
+    if let Some(list) = &tun.cuda_graph_bs {
+        let tokens: Vec<String> = list.iter().map(ToString::to_string).collect();
+        push_tuned_list(
+            &mut argv,
+            input.supported_flags,
+            "sglang.cuda_graph_bs",
+            "--cuda-graph-bs",
+            &tokens,
+            &mut warnings,
+        );
+    }
+    if let Some(v) = tun.max_total_tokens {
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "sglang.max_total_tokens",
+            "--max-total-tokens",
+            &v.to_string(),
+            &mut warnings,
+        );
+    }
+
+    // --- parallel sizes: only meaningful above 1; a >1 pin on a
+    // single-GPU machine is a spawn-time death (sglang shards across
+    // tp/dp/pp/ep ranks), so warn at compile time with the census.
+    let parallel_pins = [
+        ("tp_size", &tun.tp_size, "--tp-size"),
+        ("dp_size", &tun.dp_size, "--dp-size"),
+        ("pp_size", &tun.pp_size, "--pp-size"),
+        ("ep_size", &tun.ep_size, "--ep-size"),
+    ];
+    let multi_pin = parallel_pins
+        .iter()
+        .any(|(_, v, _)| v.is_some_and(|n| n > 1));
+    for (field, v, flag) in parallel_pins {
+        if let Some(n) = v {
+            if *n > 1 {
+                push_tuned(
+                    &mut argv,
+                    input.supported_flags,
+                    &format!("sglang.{field}"),
+                    flag,
+                    &n.to_string(),
+                    &mut warnings,
+                );
+            } else {
+                warnings.push(format!(
+                    "sglang.{field} = {n} is the upstream default; nothing emitted"
+                ));
+            }
+        }
+    }
+    if multi_pin && input.hardware.gpus.len() < 2 {
+        warnings.push(format!(
+            "sglang parallel sizes > 1 on a {} GPU machine — sglang shards the \
+             model across ranks and will fail or CPU-shard at spawn; this pin \
+             only makes sense multi-GPU",
+            input.hardware.gpus.len()
+        ));
+    }
+
+    // --- lora capacity knobs (adapters themselves ride the loras lane)
+    if let Some(v) = tun.max_lora_rank {
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "sglang.max_lora_rank",
+            "--max-lora-rank",
+            &v.to_string(),
+            &mut warnings,
+        );
+    }
+    if let Some(v) = &tun.lora_backend {
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "sglang.lora_backend",
+            "--lora-backend",
+            v,
+            &mut warnings,
+        );
+    }
+
     // --- extra_args: strict. Reserved flags (connection quintet + ladder
     // outputs) are a hard error — a duplicate would silently shadow the
     // supervisor-owned values (loopback bind, API key, VRAM budget).
@@ -2778,7 +3474,9 @@ fn sglang_tight_fit_knobs(
     tun: &SglangTuning,
     warnings: &mut Vec<String>,
 ) {
-    if tun.cuda_graph_max_bs.is_none() {
+    // Explicit pins win: either a max-bs scalar or an explicit capture
+    // list suppresses the ladder's derived value.
+    if tun.cuda_graph_max_bs.is_none() && tun.cuda_graph_bs.is_none() {
         let bs = if slots == 0 { 4 } else { slots.min(4) };
         push_tuned(
             argv,
@@ -4148,6 +4846,7 @@ mod tests {
         cpu_moe_n: None,
         override_tensor: None,
         devices: None,
+        mistralrs: None,
         warmup: None,
         reasoning_budget: None,
         reasoning_effort: None,
@@ -6625,6 +7324,251 @@ mod tests {
             .any(|w| w.contains("deterministic = true")));
     }
 
+    fn llama_server_knobs_flags() -> BTreeSet<String> {
+        [
+            "--sse-ping-interval",
+            "--timeout",
+            "--chat-template-kwargs",
+            "--no-cont-batching",
+            "--reuse-port",
+            "--lora-init-without-apply",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    }
+
+    fn llama_server_cfg() -> Config {
+        Config {
+            sse_ping_interval: Some(-1),
+            server_timeout_secs: Some(600),
+            chat_template_kwargs: Some(r#"{"enable_thinking": false}"#.into()),
+            cont_batching: Some(false),
+            reuse_port: true,
+            lora_init_without_apply: true,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn unit__llama_server_knobs__emitted_with_negation() {
+        let g = meta();
+        let cfg = llama_server_cfg();
+        let mut flags = full_flags();
+        flags.extend(llama_server_knobs_flags());
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let p = compile(&input(&g, &hw, &cfg, &flags), &TuningOverrides::default()).unwrap();
+        let a = &p.argv;
+        assert!(a.windows(2).any(|w| w == ["--sse-ping-interval", "-1"]));
+        assert!(a.windows(2).any(|w| w == ["--timeout", "600"]));
+        assert!(a
+            .windows(2)
+            .any(|w| w == ["--chat-template-kwargs", r#"{"enable_thinking": false}"#]));
+        // Some(false) is the NEGATION spelling, never the positive flag.
+        assert!(a.iter().any(|t| t == "--no-cont-batching"));
+        assert!(!a.iter().any(|t| t == "--cont-batching"));
+        assert!(a.iter().any(|t| t == "--reuse-port"));
+        assert!(a.iter().any(|t| t == "--lora-init-without-apply"));
+        for key in [
+            "sse_ping_interval",
+            "server_timeout_secs",
+            "chat_template_kwargs",
+            "cont_batching",
+            "reuse_port",
+            "lora_init_without_apply",
+        ] {
+            assert!(
+                !p.warnings.iter().any(|w| w.contains(key)),
+                "{key} must not warn on a full-flag engine: {:?}",
+                p.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn unit__llama_server_knobs__warn_skip_on_old_engine() {
+        let g = meta();
+        let cfg = llama_server_cfg();
+        // full_flags() deliberately lacks the six new flags (house rule:
+        // shared fixture stays minimal) — exactly the old-engine shape.
+        let flags = full_flags();
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let p = compile(&input(&g, &hw, &cfg, &flags), &TuningOverrides::default()).unwrap();
+        for flag in [
+            "--sse-ping-interval",
+            "--timeout",
+            "--chat-template-kwargs",
+            "--no-cont-batching",
+            "--reuse-port",
+            "--lora-init-without-apply",
+        ] {
+            assert!(!p.argv.iter().any(|t| t == flag), "{flag} must be gated");
+        }
+        for key in [
+            "sse_ping_interval",
+            "server_timeout_secs",
+            "chat_template_kwargs",
+            "cont_batching",
+            "reuse_port",
+            "lora_init_without_apply",
+        ] {
+            assert!(
+                p.warnings.iter().any(|w| w.contains(key)),
+                "{key} warn-skip missing: {:?}",
+                p.warnings
+            );
+        }
+    }
+
+    fn mistralrs_knobs_flags() -> BTreeSet<String> {
+        [
+            "--lora",
+            "--max-batch-size",
+            "--max-prefill-chunk-tokens",
+            "--max-decode-steps-before-prefill",
+            "--prefix-cache-n",
+            "--pa-block-size",
+            "--pa-cache-type",
+            "--pa-context-len",
+            "--lora-max-rank",
+            "--lora-max-adapters",
+            "--lora-max-bytes",
+            "--mtp",
+            "--mtp-model",
+            "--mtp-n-predict",
+            "--mtp-draft-sampling",
+            "--encoder-cache-memory-mb",
+            "--max-num-images",
+            "--max-image-length",
+            "--disable-metrics",
+            "--disable-access-log",
+            "--device-layers",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    }
+
+    #[test]
+    fn unit__mistralrs_knobs__emit_across_all_families() {
+        let g = meta();
+        let cfg = Config {
+            mistralrs: MistralrsTuning {
+                max_batch_size: Some(4),
+                max_prefill_chunk_tokens: Some(1024),
+                max_decode_steps_before_prefill: Some(16),
+                prefix_cache_n: Some(0),
+                pa_block_size: Some(64),
+                pa_cache_type: Some("bf16".into()),
+                pa_context_len: Some(4096),
+                lora_max_rank: Some(64),
+                lora_max_adapters: Some(2),
+                lora_max_bytes: Some(1_073_741_824),
+                mtp: Some(true),
+                mtp_model: Some("mtp-draft".into()),
+                mtp_n_predict: Some(3),
+                mtp_draft_sampling: Some("greedy".into()),
+                encoder_cache_memory_mb: Some(512),
+                max_num_images: Some(2),
+                max_image_length: Some(1024),
+                disable_metrics: Some(true),
+                disable_access_log: Some(true),
+                device_layers: Some("0:12".into()),
+            },
+            ..Config::default()
+        };
+        let loras = [("loras/style.gguf".to_string(), 2.0)];
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let flags = mistralrs_knobs_flags();
+        let mut inp = input(&g, &hw, &cfg, &flags);
+        inp.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        inp.loras = &loras;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        let a = &p.argv;
+        for pair in [
+            ("--max-batch-size", "4"),
+            ("--max-prefill-chunk-tokens", "1024"),
+            ("--max-decode-steps-before-prefill", "16"),
+            ("--prefix-cache-n", "0"),
+            ("--pa-block-size", "64"),
+            ("--pa-cache-type", "bf16"),
+            ("--pa-context-len", "4096"),
+            ("--lora-max-rank", "64"),
+            ("--lora-max-adapters", "2"),
+            ("--lora-max-bytes", "1073741824"),
+            ("--mtp-model", "mtp-draft"),
+            ("--mtp-n-predict", "3"),
+            ("--mtp-draft-sampling", "greedy"),
+            ("--encoder-cache-memory-mb", "512"),
+            ("--max-num-images", "2"),
+            ("--max-image-length", "1024"),
+            ("--device-layers", "0:12"),
+            ("--lora", "style=loras/style.gguf"),
+        ] {
+            assert!(
+                a.windows(2).any(|w| w == [pair.0, pair.1]),
+                "missing {pair:?}"
+            );
+        }
+        for bare in ["--mtp", "--disable-metrics", "--disable-access-log"] {
+            assert!(a.iter().any(|t| t == bare), "missing {bare}");
+        }
+        // --mtp is the family switch: it must precede its dependents.
+        let mtp = a.iter().position(|t| t == "--mtp").unwrap();
+        let mtp_model = a.iter().position(|t| t == "--mtp-model").unwrap();
+        assert!(mtp < mtp_model, "--mtp must lead its dependents");
+        // Single-GPU box: device_layers still emits, with the teaching.
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.contains("single GPU") && w.contains("device_layers")));
+        // GGUF adapters are first-class on mistral.rs; scale warns.
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.contains("ignored on the mistralrs engine")));
+    }
+
+    #[test]
+    fn unit__mistralrs_knobs__warn_skip_on_old_engine() {
+        let g = meta();
+        let cfg = Config {
+            mistralrs: MistralrsTuning {
+                max_batch_size: Some(4),
+                mtp: Some(true),
+                mtp_model: Some("mtp-draft".into()),
+                device_layers: Some("0:12".into()),
+                ..MistralrsTuning::default()
+            },
+            ..Config::default()
+        };
+        let empty: BTreeSet<String> = BTreeSet::new();
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let mut inp = input(&g, &hw, &cfg, &empty);
+        inp.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        for flag in [
+            "--max-batch-size",
+            "--mtp",
+            "--mtp-model",
+            "--device-layers",
+        ] {
+            assert!(!p.argv.iter().any(|t| t == flag), "{flag} must be gated");
+        }
+        for key in [
+            "mistralrs.max_batch_size",
+            "mistralrs.mtp",
+            "mistralrs.mtp_model",
+            "mistralrs.device_layers",
+        ] {
+            assert!(
+                p.warnings.iter().any(|w| w.contains(key)),
+                "{key} warn-skip missing: {:?}",
+                p.warnings
+            );
+        }
+    }
+
     #[test]
     fn unit__auto_slots__vulkan_class_with_projector_caps_conservatively() {
         let g = meta();
@@ -8122,6 +9066,74 @@ mod tests {
     }
 
     #[test]
+    fn unit__compile_mistralrs__extra_args_warn_and_drop() {
+        // audit GAP-2: extra_args is llama-server dialect; a passthrough
+        // would hard-fail the mistral.rs boot. The lane must DROP the args
+        // (never emit) and teach in a warning naming every dropped flag.
+        let hw = gpu_hw(0, 32_000, 8);
+        let g = meta();
+        let empty: BTreeSet<String> = BTreeSet::new();
+        let ov = ModelOverride {
+            extra_args: Some(vec!["--jinja".into(), "--flash-attn".into()]),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let cfg = Config::default();
+        let mut inp = input(&g, &hw, &cfg, &empty);
+        inp.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        inp.overlay = &ov;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.iter().any(|a| a == "--jinja" || a == "--flash-attn"),
+            "llama-server flags must not reach the mistralrs argv: {:?}",
+            p.argv
+        );
+        assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
+        let w = &p.warnings[0];
+        assert!(w.contains("--jinja") && w.contains("--flash-attn"), "{w}");
+        assert!(w.contains("mistralrs") && w.contains("engine use"), "{w}");
+        // Empty extra_args stays silent — no warning noise for no action.
+        let ov_empty = ModelOverride {
+            extra_args: Some(Vec::new()),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp2 = input(&g, &hw, &cfg, &empty);
+        inp2.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        inp2.overlay = &ov_empty;
+        let p2 = compile(&inp2, &TuningOverrides::default()).unwrap();
+        assert!(p2.warnings.is_empty(), "{:?}", p2.warnings);
+    }
+
+    #[test]
+    fn unit__compile__safetensors_on_llamacpp_teaches_working_remedy() {
+        // audit GAP-1: the wrong-lane teaching once pointed at
+        // `pallama run <model> --engine sglang` — a flag the Run command
+        // never had (clap would reject it). The remedy must name the
+        // engine install/use lane and the daemon restart.
+        let hw = gpu_hw(0, 32_000, 8);
+        let g = meta();
+        let hf = crate::hfmeta::HfMeta {
+            architecture: "Qwen2ForCausalLM".into(),
+            ctx_train: Some(32_768),
+            dtype: Some("bfloat16".into()),
+            quant_bits: None,
+            kv: crate::hfmeta::KvGeom {
+                layers: Some(28),
+                kv_heads: Some(2),
+                head_dim: Some(128),
+            },
+        };
+        let empty: BTreeSet<String> = BTreeSet::new();
+        let cfg = Config::default();
+        let mut inp = input(&g, &hw, &cfg, &empty);
+        inp.meta = ModelMeta::Hf(&hf);
+        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+        assert!(err.contains("engine install --kind sglang"), "{err}");
+        assert!(err.contains("engine use"), "{err}");
+        assert!(err.contains("restart"), "{err}");
+        assert!(!err.contains("--engine sglang"), "dead-end flag: {err}");
+    }
+
+    #[test]
     fn unit__wire__spec_draft_placement_under_auto() {
         let cfg = Config {
             spec_draft_cpu_range: "0-7".into(),
@@ -8759,5 +9771,358 @@ mod tests {
         assert!(p.warnings.iter().any(|w| w.contains("lacks KV geometry")));
         // no mem-fraction guess without geometry — sglang defaults apply
         assert!(!p.argv.iter().any(|a| a == "--mem-fraction-static"));
+    }
+
+    /// The 0.5.19 surface plus every knob wired after the initial 28-flag
+    /// contract: the "new engine" fixture for emission tests.
+    fn sglang_flags_extended() -> BTreeSet<String> {
+        let mut flags = sglang_flags();
+        for flag in [
+            "--enable-deterministic-inference",
+            "--enable-lora",
+            "--lora-paths",
+            "--tokenizer-mode",
+            "--tokenizer-backend",
+            "--tokenizer-worker-num",
+            "--detokenizer-worker-num",
+            "--enable-dynamic-batch-tokenizer",
+            "--dynamic-batch-tokenizer-batch-size",
+            "--dynamic-batch-tokenizer-batch-timeout",
+            "--grammar-backend",
+            "--radix-eviction-policy",
+            "--enable-session-radix-cache",
+            "--enable-mixed-chunk",
+            "--sleep-on-idle",
+            "--enable-memory-saver",
+            "--watchdog-timeout",
+            "--enable-cache-report",
+            "--batch-notify-size",
+            "--scheduler-recv-interval",
+            "--cuda-graph-bs",
+            "--max-total-tokens",
+            "--tp-size",
+            "--dp-size",
+            "--pp-size",
+            "--ep-size",
+            "--max-lora-rank",
+            "--lora-backend",
+        ] {
+            flags.insert(flag.to_string());
+        }
+        flags
+    }
+
+    #[test]
+    fn unit__sglang__deterministic_native_flag_additive_with_slots_pin() {
+        // Deterministic keeps the slots=1 serialization pin (the actual
+        // reproducibility guarantee) AND adds the native
+        // --enable-deterministic-inference flag when the engine has it.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let flags = sglang_flags_extended();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            deterministic: Some(true),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        inp.supported_flags = &flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--max-running-requests" && w[1] == "1"));
+        assert!(p
+            .argv
+            .contains(&"--enable-deterministic-inference".to_string()));
+    }
+
+    #[test]
+    fn unit__sglang__deterministic_native_flag_warn_skips_on_old_engine() {
+        // Engine without the flag: legacy slots=1 pin still stands, the
+        // native flag degrades to a warn-skip (never a spawn error).
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            deterministic: Some(true),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--max-running-requests" && w[1] == "1"));
+        assert!(!p
+            .argv
+            .contains(&"--enable-deterministic-inference".to_string()));
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.contains("--enable-deterministic-inference")));
+    }
+
+    #[test]
+    fn unit__sglang__new_knobs_emit_across_all_families() {
+        // One sweep across every post-28-flag knob: values, bools (flag
+        // alone, never a phantom "" positional), and the nargs list.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let flags = sglang_flags_extended();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                tokenizer_mode: Some("slow".into()),
+                tokenizer_backend: Some("fastokens".into()),
+                tokenizer_worker_num: Some(2),
+                detokenizer_worker_num: Some(2),
+                dynamic_batch_tokenizer: Some(true),
+                dynamic_batch_tokenizer_batch_size: Some(8),
+                dynamic_batch_tokenizer_batch_timeout: Some(0.01),
+                grammar_backend: Some("xgrammar".into()),
+                radix_eviction_policy: Some("lfu".into()),
+                session_radix_cache: Some(true),
+                mixed_chunk: Some(true),
+                sleep_on_idle: Some(true),
+                memory_saver: Some(true),
+                watchdog_timeout: Some(300.0),
+                cache_report: Some(true),
+                batch_notify_size: Some(32),
+                scheduler_recv_interval: Some(2),
+                cuda_graph_bs: Some(vec![1, 2, 4]),
+                max_total_tokens: Some(65_536),
+                max_lora_rank: Some(64),
+                lora_backend: Some("pytorch".into()),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        inp.supported_flags = &flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        let pair = |flag: &str, val: &str| {
+            assert!(
+                p.argv.windows(2).any(|w| w[0] == flag && w[1] == val),
+                "missing {flag} {val} in {:?}",
+                p.argv
+            );
+        };
+        let bare = |flag: &str| {
+            assert!(
+                p.argv.contains(&flag.to_string()),
+                "missing bool {flag} in {:?}",
+                p.argv
+            );
+        };
+        pair("--tokenizer-mode", "slow");
+        pair("--tokenizer-backend", "fastokens");
+        pair("--tokenizer-worker-num", "2");
+        pair("--detokenizer-worker-num", "2");
+        bare("--enable-dynamic-batch-tokenizer");
+        pair("--dynamic-batch-tokenizer-batch-size", "8");
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--dynamic-batch-tokenizer-batch-timeout" && w[1] == "0.01"));
+        pair("--grammar-backend", "xgrammar");
+        pair("--radix-eviction-policy", "lfu");
+        bare("--enable-session-radix-cache");
+        bare("--enable-mixed-chunk");
+        bare("--sleep-on-idle");
+        bare("--enable-memory-saver");
+        pair("--watchdog-timeout", "300");
+        bare("--enable-cache-report");
+        pair("--batch-notify-size", "32");
+        pair("--scheduler-recv-interval", "2");
+        pair("--max-total-tokens", "65536");
+        pair("--max-lora-rank", "64");
+        pair("--lora-backend", "pytorch");
+        // nargs list: flag once, then each size as its own token
+        let idx = p
+            .argv
+            .iter()
+            .position(|a| a == "--cuda-graph-bs")
+            .expect("cuda-graph-bs flag");
+        assert_eq!(&p.argv[idx + 1..idx + 4], &["1", "2", "4"]);
+        // bool flags never push a phantom empty-string positional
+        assert!(
+            !p.argv.iter().map(String::as_str).any(str::is_empty),
+            "{:?}",
+            p.argv
+        );
+    }
+
+    #[test]
+    fn unit__sglang__new_knobs_warn_skip_on_old_engine() {
+        // Base fixture lacks every new flag: knobs degrade to warn-skips,
+        // argv stays clean — an old engine never receives unknown flags.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                grammar_backend: Some("xgrammar".into()),
+                sleep_on_idle: Some(true),
+                cuda_graph_bs: Some(vec![1, 2]),
+                tp_size: Some(2),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        for flag in [
+            "--grammar-backend",
+            "--sleep-on-idle",
+            "--cuda-graph-bs",
+            "--tp-size",
+        ] {
+            assert!(
+                !p.argv.contains(&flag.to_string()),
+                "{flag} leaked: {:?}",
+                p.argv
+            );
+            assert!(
+                p.warnings.iter().any(|w| w.contains(flag)),
+                "no warn-skip for {flag}: {:?}",
+                p.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn unit__sglang__lora_gguf_refused_with_teaching() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let loras = vec![("adapter.gguf".to_string(), 1.0)];
+        let overlay = sglang_ctx_overlay();
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        inp.loras = &loras;
+        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+        assert!(err.contains(".gguf"), "got: {err}");
+        assert!(err.contains("PEFT"), "got: {err}");
+    }
+
+    #[test]
+    fn unit__sglang__lora_hf_dir_emitted_with_scale_teaching() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let flags = sglang_flags_extended();
+        let loras = vec![("/models/adapters/qwen-lora-r16".to_string(), 4.0)];
+        let overlay = sglang_ctx_overlay();
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        inp.loras = &loras;
+        inp.supported_flags = &flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p.argv.contains(&"--enable-lora".to_string()));
+        let idx = p
+            .argv
+            .iter()
+            .position(|a| a == "--lora-paths")
+            .expect("lora-paths");
+        assert_eq!(
+            p.argv[idx + 1],
+            "qwen-lora-r16=/models/adapters/qwen-lora-r16"
+        );
+        // llama.cpp scale has no upstream equivalent — teach, never drop
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.contains("scale") && w.contains("ignored")));
+    }
+
+    #[test]
+    fn unit__sglang__lora_extra_args_reserved() {
+        // --enable-lora/--lora-paths are compile-owned now: an extra_args
+        // attempt is a hard error pointing at the loras lane.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            extra_args: Some(vec!["--enable-lora".into()]),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+        assert!(err.contains("reserved"), "got: {err}");
+        assert!(err.contains("--enable-lora"), "got: {err}");
+    }
+
+    #[test]
+    fn unit__sglang__parallel_pins_emit_above_one_and_warn_single_gpu() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8); // single GPU
+        let hf = hf_meta();
+        let flags = sglang_flags_extended();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                tp_size: Some(2),
+                dp_size: Some(1), // upstream default: nothing emitted
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        inp.supported_flags = &flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--tp-size" && w[1] == "2"));
+        assert!(!p.argv.iter().any(|a| a == "--dp-size"));
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.contains("dp_size = 1 is the upstream default")));
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.contains("only makes sense multi-GPU")));
+    }
+
+    #[test]
+    fn unit__sglang__cuda_graph_bs_list_suppresses_tight_fit_scalar() {
+        // Tier B engages tight-fit knobs; an explicit capture list wins
+        // over the ladder's derived cuda-graph-max-bs scalar.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let flags = sglang_flags_extended();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                cuda_graph_bs: Some(vec![1, 2]),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 9_400 * MIB); // Tier B weights
+        inp.overlay = &overlay;
+        inp.supported_flags = &flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p.argv.iter().any(|a| a == "--cuda-graph-bs"));
+        assert!(!p.argv.iter().any(|a| a == "--cuda-graph-max-bs"));
+        // chunked-prefill tight-fit still applies (different knob)
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--chunked-prefill-size" && w[1] == "2048"));
     }
 }

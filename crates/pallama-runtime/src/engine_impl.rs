@@ -630,9 +630,10 @@ pub fn mistralrs_argv(
         }
     }
     // Engine-tuning passthrough: the mistral.rs profile dialect emits
-    // paired tuning flags (pa-memory-fraction, paged-attn); forward
-    // them verbatim. The profile compiler already warned when the
-    // binary lacks one.
+    // tuning flags (pa-memory-fraction, paged-attn, scheduler/MTP/
+    // vision/LoRA knobs, --lora pairs); forward them verbatim when the
+    // binary advertises them. The profile compiler already warned when
+    // the engine lacks one.
     for w in profile.argv.windows(2) {
         if (w[0] == "--pa-memory-fraction" && flags.contains("--pa-memory-fraction"))
             || (w[0] == "--paged-attn" && flags.contains("--paged-attn"))
@@ -641,7 +642,64 @@ pub fn mistralrs_argv(
             argv.push(w[1].clone());
         }
     }
+    mistralrs_tuning_passthrough(&profile.argv, flags, &mut argv);
     argv
+}
+
+/// Flags the mistral.rs profile dialect emits that take a value
+/// (forwarded with their following token). Keep in lockstep with
+/// `compile_mistralrs` in pallama-core.
+const MISTRALRS_TUNING_VALUE_FLAGS: &[&str] = &[
+    "--max-batch-size",
+    "--max-prefill-chunk-tokens",
+    "--max-decode-steps-before-prefill",
+    "--prefix-cache-n",
+    "--pa-block-size",
+    "--pa-cache-type",
+    "--pa-context-len",
+    "--lora",
+    "--lora-max-rank",
+    "--lora-max-adapters",
+    "--lora-max-bytes",
+    "--mtp-model",
+    "--mtp-n-predict",
+    "--mtp-draft-sampling",
+    "--encoder-cache-memory-mb",
+    "--max-num-images",
+    "--max-image-length",
+    "--device-layers",
+];
+
+/// Valueless (`store_true`) tuning flags the dialect emits.
+const MISTRALRS_TUNING_BOOL_FLAGS: &[&str] =
+    &["--mtp", "--disable-metrics", "--disable-access-log"];
+
+/// Forward the dialect's tuning tokens from the compiled profile argv
+/// into the child argv, manifest-gated per flag. Pair flags carry a
+/// value token; bool flags stand alone.
+fn mistralrs_tuning_passthrough(
+    dialect: &[String],
+    flags: &std::collections::BTreeSet<String>,
+    out: &mut Vec<String>,
+) {
+    let mut i = 0;
+    while i < dialect.len() {
+        let tok = dialect[i].as_str();
+        if MISTRALRS_TUNING_BOOL_FLAGS.contains(&tok) {
+            if flags.contains(tok) {
+                out.push(tok.to_string());
+            }
+            i += 1;
+        } else if MISTRALRS_TUNING_VALUE_FLAGS.contains(&tok) && i + 1 < dialect.len() {
+            if flags.contains(tok) {
+                out.push(tok.to_string());
+                out.push(dialect[i + 1].clone());
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
 }
 
 #[async_trait]

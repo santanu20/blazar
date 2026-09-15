@@ -292,6 +292,16 @@ pub struct Config {
     /// models (9B + projector) on 8 GB cards, live-proven.
     #[serde(default)]
     pub mistralrs_paged_attn: Option<bool>,
+    /// mistral.rs engine tuning knobs (global defaults; per-model
+    /// `model_overrides.<name>.mistralrs` replaces this whole struct
+    /// when present). Every field maps 1:1 to a `mistralrs serve` flag
+    /// and is emitted only when the active engine's capability manifest
+    /// advertises it — unknown-on-this-version flags skip with a
+    /// warning instead of erroring. The two legacy globals
+    /// (`mistralrs_pa_memory_fraction`, `mistralrs_paged_attn`) predate
+    /// the struct and keep their names.
+    #[serde(default)]
+    pub mistralrs: MistralrsTuning,
     /// sglang engine tuning knobs (global defaults; per-model
     /// `model_overrides.<name>.sglang` replaces this whole struct when
     /// present). Every field maps 1:1 to a `python -m sglang.launch_server`
@@ -535,6 +545,34 @@ pub struct Config {
     /// HTTP-server thread count (0 = engine default).
     #[serde(default)]
     pub threads_http: u32,
+
+    // ---- child HTTP server behavior (llama-server lane).
+    /// SSE keep-alive ping interval in seconds (-1 = disabled; upstream
+    /// default 30). Keeps proxies and clients from idling out a stream
+    /// during long generations.
+    #[serde(default)]
+    pub sse_ping_interval: Option<i64>,
+    /// Child server read/write timeout in seconds (upstream default
+    /// 3600). Lower values fail stuck connections sooner.
+    #[serde(default)]
+    pub server_timeout_secs: Option<u64>,
+    /// Extra params for the child's JSON chat-template parser, as a JSON
+    /// object string (e.g. `{"enable_thinking": false}`). The engine
+    /// rejects a non-object string at boot.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<String>,
+    /// Continuous (dynamic) batching (upstream default true). Disabling
+    /// serializes slots — useful only for debugging near-tie logits.
+    #[serde(default)]
+    pub cont_batching: Option<bool>,
+    /// `SO_REUSEPORT` on the child listener (upstream default false). Lets
+    /// a replacement child bind while the old one drains.
+    #[serde(default)]
+    pub reuse_port: bool,
+    /// Load `LoRA` adapters without applying them at spawn (apply later
+    /// per-request). Upstream default false.
+    #[serde(default)]
+    pub lora_init_without_apply: bool,
 
     // ---- engine behavior toggles (upstream defaults preserved; the
     // knob exists to disable).
@@ -798,6 +836,11 @@ pub struct ModelOverride {
     /// a `sglang` engine.
     #[serde(default)]
     pub sglang: Option<SglangTuning>,
+    /// mistral.rs tuning override; replaces the global `[mistralrs]`
+    /// struct for this model. Ignored unless the active engine is a
+    /// `mistralrs` engine.
+    #[serde(default)]
+    pub mistralrs: Option<MistralrsTuning>,
 }
 
 /// Projector attach policy. Accepts the bool spellings the suppress knob
@@ -892,6 +935,67 @@ pub struct SglangTuning {
     pub skip_warmup: Option<bool>,
     /// `--enable-torch-compile`.
     pub torch_compile: Option<bool>,
+    /// `--tokenizer-mode` (auto, slow).
+    pub tokenizer_mode: Option<String>,
+    /// `--tokenizer-backend` (huggingface, fastokens).
+    pub tokenizer_backend: Option<String>,
+    /// `--tokenizer-worker-num`: dedicated tokenizer processes.
+    pub tokenizer_worker_num: Option<u32>,
+    /// `--detokenizer-worker-num`: dedicated detokenizer processes.
+    pub detokenizer_worker_num: Option<u32>,
+    /// `--enable-dynamic-batch-tokenizer`: batch encodes concurrent
+    /// prompts instead of one-by-one.
+    pub dynamic_batch_tokenizer: Option<bool>,
+    /// `--dynamic-batch-tokenizer-batch-size`.
+    pub dynamic_batch_tokenizer_batch_size: Option<u32>,
+    /// `--dynamic-batch-tokenizer-batch-timeout` (seconds).
+    pub dynamic_batch_tokenizer_batch_timeout: Option<f64>,
+    /// `--grammar-backend` (xgrammar, outlines, llguidance, none) for
+    /// structured/JSON output.
+    pub grammar_backend: Option<String>,
+    /// `--radix-eviction-policy` (lru, lfu, slru, priority) for the
+    /// prefix (radix) cache.
+    pub radix_eviction_policy: Option<String>,
+    /// `--enable-session-radix-cache`: per-session radix cache
+    /// isolation (session-aware prefix reuse).
+    pub session_radix_cache: Option<bool>,
+    /// `--enable-mixed-chunk`: let prefill chunks mix with decode
+    /// batches (lower latency under mixed load).
+    pub mixed_chunk: Option<bool>,
+    /// `--sleep-on-idle`: reduce CPU usage when idle.
+    pub sleep_on_idle: Option<bool>,
+    /// `--enable-memory-saver`: release weights VRAM while idle
+    /// (co-residency hygiene; reload cost on wake).
+    pub memory_saver: Option<bool>,
+    /// `--watchdog-timeout` (seconds).
+    pub watchdog_timeout: Option<f64>,
+    /// `--enable-cache-report`: report prefix-cache hits in
+    /// `usage.prompt_tokens_details`.
+    pub cache_report: Option<bool>,
+    /// `--batch-notify-size`: asyncio notification batching under high
+    /// concurrency (upstream default 16).
+    pub batch_notify_size: Option<u32>,
+    /// `--scheduler-recv-interval`: scheduler request-poll interval;
+    /// > 1 reduces CPU overhead at a latency cost.
+    pub scheduler_recv_interval: Option<u32>,
+    /// `--cuda-graph-bs`: explicit capture list of decode batch sizes
+    /// (e.g. `[1, 2, 4]`). Overrides the ladder's derived
+    /// cuda-graph-max-bs on tight fits.
+    pub cuda_graph_bs: Option<Vec<u32>>,
+    /// `--max-total-tokens`: hard cap on KV tokens (ctx * capacity).
+    pub max_total_tokens: Option<u64>,
+    /// `--tp-size`: tensor parallelism. Emits only when > 1.
+    pub tp_size: Option<u32>,
+    /// `--dp-size`: data parallelism. Emits only when > 1.
+    pub dp_size: Option<u32>,
+    /// `--pp-size`: pipeline parallelism. Emits only when > 1.
+    pub pp_size: Option<u32>,
+    /// `--ep-size`: expert parallelism (`MoE` models). Emits only when > 1.
+    pub ep_size: Option<u32>,
+    /// `--max-lora-rank`: rank ceiling for served `LoRA` adapters.
+    pub max_lora_rank: Option<u32>,
+    /// `--lora-backend` (pytorch, flashinfer).
+    pub lora_backend: Option<String>,
 }
 
 impl SglangTuning {
@@ -903,6 +1007,15 @@ impl SglangTuning {
     }
 
     fn validate(&self, where_: &str) -> Result<(), CoreError> {
+        self.validate_scalar_ranges(where_)?;
+        self.validate_choice_fields(where_)?;
+        self.validate_count_floors(where_)?;
+        Ok(())
+    }
+
+    /// Numeric envelopes for knobs the engine would only reject
+    /// (or silently misbehave with) at spawn time.
+    fn validate_scalar_ranges(&self, where_: &str) -> Result<(), CoreError> {
         if let Some(frac) = self.mem_fraction_static {
             if !(0.05..=0.95).contains(&frac) {
                 return Err(CoreError::Config(format!(
@@ -923,6 +1036,253 @@ impl SglangTuning {
                     "{where_}.hicache_ratio must be > 0, got {r}"
                 )));
             }
+        }
+        if let Some(t) = self.watchdog_timeout {
+            if t <= 0.0 {
+                return Err(CoreError::Config(format!(
+                    "{where_}.watchdog_timeout must be > 0, got {t}"
+                )));
+            }
+        }
+        if let Some(t) = self.dynamic_batch_tokenizer_batch_timeout {
+            if t <= 0.0 {
+                return Err(CoreError::Config(format!(
+                    "{where_}.dynamic_batch_tokenizer_batch_timeout must be > 0, got {t}"
+                )));
+            }
+        }
+        if let Some(t) = self.max_total_tokens {
+            if t == 0 {
+                return Err(CoreError::Config(format!(
+                    "{where_}.max_total_tokens must be >= 1, got 0"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Choice lists mirror the installed sglang 0.5.19 `--help`
+    /// grammar — rejecting at config-write time beats an opaque
+    /// argparse death at spawn.
+    fn validate_choice_fields(&self, where_: &str) -> Result<(), CoreError> {
+        let choice = |field: &str, v: &Option<String>, allowed: &[&str]| -> Option<CoreError> {
+            let s = v.as_ref()?;
+            if allowed.contains(&s.as_str()) {
+                None
+            } else {
+                Some(CoreError::Config(format!(
+                    "{where_}.{field} must be one of {allowed:?}, got {s:?}"
+                )))
+            }
+        };
+        if let Some(e) = choice("tokenizer_mode", &self.tokenizer_mode, &["auto", "slow"]) {
+            return Err(e);
+        }
+        if let Some(e) = choice(
+            "tokenizer_backend",
+            &self.tokenizer_backend,
+            &["huggingface", "fastokens"],
+        ) {
+            return Err(e);
+        }
+        if let Some(e) = choice(
+            "grammar_backend",
+            &self.grammar_backend,
+            &["xgrammar", "outlines", "llguidance", "none"],
+        ) {
+            return Err(e);
+        }
+        if let Some(e) = choice(
+            "radix_eviction_policy",
+            &self.radix_eviction_policy,
+            &["lru", "lfu", "slru", "priority"],
+        ) {
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// `>= 1` floors for worker counts, batch sizes, parallel degrees,
+    /// plus the cuda-graph capture list shape.
+    fn validate_count_floors(&self, where_: &str) -> Result<(), CoreError> {
+        let min_one_u32 = |field: &str, v: Option<u32>| -> Option<CoreError> {
+            v.filter(|n| *n == 0)
+                .map(|_| CoreError::Config(format!("{where_}.{field} must be >= 1, got 0")))
+        };
+        for (field, v) in [
+            ("tokenizer_worker_num", self.tokenizer_worker_num),
+            ("detokenizer_worker_num", self.detokenizer_worker_num),
+            (
+                "dynamic_batch_tokenizer_batch_size",
+                self.dynamic_batch_tokenizer_batch_size,
+            ),
+            ("batch_notify_size", self.batch_notify_size),
+            ("scheduler_recv_interval", self.scheduler_recv_interval),
+            ("tp_size", self.tp_size),
+            ("dp_size", self.dp_size),
+            ("pp_size", self.pp_size),
+            ("ep_size", self.ep_size),
+            ("max_lora_rank", self.max_lora_rank),
+        ] {
+            if let Some(e) = min_one_u32(field, v) {
+                return Err(e);
+            }
+        }
+        if let Some(list) = &self.cuda_graph_bs {
+            if list.is_empty() {
+                return Err(CoreError::Config(format!(
+                    "{where_}.cuda_graph_bs must list at least one batch size, got []"
+                )));
+            }
+            if let Some(bad) = list.iter().find(|bs| **bs == 0) {
+                return Err(CoreError::Config(format!(
+                    "{where_}.cuda_graph_bs batch sizes must be >= 1, got {bad}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// mistral.rs `serve` tuning knobs. All-`Option` on purpose: `None`
+/// never emits a flag (upstream default applies); emission is
+/// manifest-flag-gated at profile-compile with the usual warn-skip.
+/// Grammar mirrors the installed v0.9.3 `mistralrs serve --help`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MistralrsTuning {
+    /// `--max-batch-size`: max batch for automatic device mapping
+    /// (upstream default 1).
+    pub max_batch_size: Option<u64>,
+    /// `--max-prefill-chunk-tokens`: CUDA prompt-token quantum while
+    /// decode is resident (upstream default 512).
+    pub max_prefill_chunk_tokens: Option<u64>,
+    /// `--max-decode-steps-before-prefill`: decode steps admitted
+    /// before a waiting prefill batch (upstream default 8; higher
+    /// favors token throughput, lower favors TTFT).
+    pub max_decode_steps_before_prefill: Option<u64>,
+    /// `--prefix-cache-n`: prefix cache entries (0 disables; upstream
+    /// default 16).
+    pub prefix_cache_n: Option<u64>,
+    /// `--pa-block-size`: tokens per paged-KV block (upstream default
+    /// 32 on CUDA).
+    pub pa_block_size: Option<u32>,
+    /// `--pa-cache-type`: paged KV quantization (upstream default
+    /// `auto`; e.g. `f16`, `q8_0`).
+    pub pa_cache_type: Option<String>,
+    /// `--pa-context-len`: allocate paged KV for this context length
+    /// instead of a VRAM fraction.
+    pub pa_context_len: Option<u64>,
+    /// `--lora-max-rank`: rank ceiling for served `LoRA` adapters
+    /// (upstream default 256).
+    pub lora_max_rank: Option<u32>,
+    /// `--lora-max-adapters`: loaded `LoRA` aliases and resident adapter
+    /// generations (upstream default 16).
+    pub lora_max_adapters: Option<u32>,
+    /// `--lora-max-bytes`: memory cap for loaded adapters (upstream
+    /// default 8 GiB).
+    pub lora_max_bytes: Option<u64>,
+    /// `--mtp`: MTP speculative decoding with the head built into the
+    /// checkpoint (qwen3.5-class MTP rows).
+    pub mtp: Option<bool>,
+    /// `--mtp-model`: MTP assistant model id or path (external head).
+    pub mtp_model: Option<String>,
+    /// `--mtp-n-predict`: draft tokens proposed per target step.
+    pub mtp_n_predict: Option<u32>,
+    /// `--mtp-draft-sampling` (auto, greedy, probabilistic).
+    pub mtp_draft_sampling: Option<String>,
+    /// `--encoder-cache-memory-mb`: MiB cap for the multimodal encoder
+    /// cache.
+    pub encoder_cache_memory_mb: Option<u64>,
+    /// `--max-num-images`: images per request.
+    pub max_num_images: Option<u32>,
+    /// `--max-image-length`: max image dimension for device mapping.
+    pub max_image_length: Option<u32>,
+    /// `--disable-metrics`: turn the child's Prometheus recorder off
+    /// (default on upstream).
+    pub disable_metrics: Option<bool>,
+    /// `--disable-access-log`: turn the child's HTTP access log off.
+    pub disable_access_log: Option<bool>,
+    /// `--device-layers`: layer mapping `ORD:NUM;...` (e.g.
+    /// `0:10;1:20`). Single-GPU boxes get a teaching warning.
+    pub device_layers: Option<String>,
+}
+
+impl MistralrsTuning {
+    /// Per-model resolution: override replaces global (not merges),
+    /// mirroring `SglangTuning::effective`.
+    #[must_use]
+    pub fn effective(
+        override_: Option<&MistralrsTuning>,
+        global: &MistralrsTuning,
+    ) -> MistralrsTuning {
+        override_.cloned().unwrap_or_else(|| global.clone())
+    }
+
+    fn validate(&self, where_: &str) -> Result<(), CoreError> {
+        let min_one = |field: &str, zero: bool| -> Option<CoreError> {
+            zero.then(|| CoreError::Config(format!("{where_}.{field} must be >= 1, got 0")))
+        };
+        for (field, zero) in [
+            ("max_batch_size", self.max_batch_size == Some(0)),
+            (
+                "max_prefill_chunk_tokens",
+                self.max_prefill_chunk_tokens == Some(0),
+            ),
+            (
+                "max_decode_steps_before_prefill",
+                self.max_decode_steps_before_prefill == Some(0),
+            ),
+            ("pa_block_size", self.pa_block_size == Some(0)),
+            ("pa_context_len", self.pa_context_len == Some(0)),
+            ("lora_max_rank", self.lora_max_rank == Some(0)),
+            ("lora_max_adapters", self.lora_max_adapters == Some(0)),
+            ("lora_max_bytes", self.lora_max_bytes == Some(0)),
+            ("mtp_n_predict", self.mtp_n_predict == Some(0)),
+            (
+                "encoder_cache_memory_mb",
+                self.encoder_cache_memory_mb == Some(0),
+            ),
+            ("max_num_images", self.max_num_images == Some(0)),
+            ("max_image_length", self.max_image_length == Some(0)),
+        ] {
+            if let Some(e) = min_one(field, zero) {
+                return Err(e);
+            }
+        }
+        // prefix_cache_n: 0 is a valid "disable" — only negative is
+        // impossible in u64, so no floor check.
+        if let Some(s) = &self.mtp_draft_sampling {
+            if !["auto", "greedy", "probabilistic"].contains(&s.as_str()) {
+                return Err(CoreError::Config(format!(
+                    "{where_}.mtp_draft_sampling must be one of [\"auto\", \"greedy\", \"probabilistic\"], got {s:?}"
+                )));
+            }
+        }
+        if let Some(layers) = &self.device_layers {
+            let pair = |p: &str| -> bool {
+                let mut parts = p.split(':');
+                match (parts.next(), parts.next(), parts.next()) {
+                    (Some(a), Some(b), None) => {
+                        let digits =
+                            |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+                        digits(a) && digits(b)
+                    }
+                    _ => false,
+                }
+            };
+            if layers.is_empty() || !layers.split(';').all(pair) {
+                return Err(CoreError::Config(format!(
+                    "{where_}.device_layers must be ORD:NUM pairs joined by ';' (e.g. \"0:10;1:20\"), got {layers:?}"
+                )));
+            }
+        }
+        if self.mtp_model.is_some() && self.mtp != Some(true) {
+            // Not an error: the model pin is inert without --mtp —
+            // surface as a config-time footgun catch.
+            return Err(CoreError::Config(format!(
+                "{where_}.mtp_model set but mtp is not true — the MTP head stays inactive; set mtp = true or drop mtp_model"
+            )));
         }
         Ok(())
     }
@@ -1253,6 +1613,7 @@ impl Default for Config {
             auto_restart_engine_switch: false,
             mistralrs_pa_memory_fraction: None,
             mistralrs_paged_attn: None,
+            mistralrs: MistralrsTuning::default(),
             sglang: SglangTuning::default(),
             spec: "auto".to_string(),
             lazy_mode: "auto".to_string(),
@@ -1347,6 +1708,12 @@ impl Default for Config {
             prio_batch: 0,
             poll_batch: None,
             threads_http: 0,
+            sse_ping_interval: None,
+            server_timeout_secs: None,
+            chat_template_kwargs: None,
+            cont_batching: None,
+            reuse_port: false,
+            lora_init_without_apply: false,
             warmup: true,
             mmproj_policy: None,
             repack: true,
@@ -1916,9 +2283,41 @@ impl Config {
             }
         }
         self.sglang.validate("sglang")?;
+        self.mistralrs.validate("mistralrs")?;
         for (name, o) in &self.model_overrides {
             if let Some(t) = &o.sglang {
                 t.validate(&format!("model_overrides.{name}.sglang"))?;
+            }
+            if let Some(t) = &o.mistralrs {
+                t.validate(&format!("model_overrides.{name}.mistralrs"))?;
+            }
+        }
+        // Child HTTP server behavior knobs.
+        if let Some(p) = self.sse_ping_interval {
+            if p < -1 {
+                return Err(CoreError::Config(format!(
+                    "sse_ping_interval must be >= -1 (-1 disables), got {p}"
+                )));
+            }
+        }
+        if let Some(t) = self.server_timeout_secs {
+            if t == 0 {
+                return Err(CoreError::Config(
+                    "server_timeout_secs must be >= 1, got 0".into(),
+                ));
+            }
+        }
+        if let Some(kwargs) = &self.chat_template_kwargs {
+            let trimmed = kwargs.trim();
+            if trimmed.is_empty() {
+                return Err(CoreError::Config(
+                    "chat_template_kwargs must be a JSON object string, got \"\"".into(),
+                ));
+            }
+            if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+                return Err(CoreError::Config(format!(
+                    "chat_template_kwargs must be a JSON object string (e.g. \"{{\\\"enable_thinking\\\": false}}\"), got {kwargs:?}"
+                )));
             }
         }
         if self.host.trim().is_empty() {
@@ -3046,6 +3445,141 @@ default_ctx = 16384
             Config::from_toml("spec = \"ngram-simple\"\n").is_err(),
             "raw spec types are not config values"
         );
+    }
+
+    #[test]
+    fn unit__sglang_knobs__validated() {
+        // Accepted: the full post-28-flag knob surface parses + validates.
+        Config::from_toml(
+            "[sglang]\ngrammar_backend = \"xgrammar\"\ntokenizer_mode = \"slow\"\n\
+             tokenizer_backend = \"fastokens\"\nradix_eviction_policy = \"lfu\"\n\
+             sleep_on_idle = true\nmemory_saver = true\nsession_radix_cache = true\n\
+             mixed_chunk = true\ncache_report = true\ndynamic_batch_tokenizer = true\n\
+             tokenizer_worker_num = 2\ndetokenizer_worker_num = 2\n\
+             dynamic_batch_tokenizer_batch_size = 8\n\
+             dynamic_batch_tokenizer_batch_timeout = 0.01\nbatch_notify_size = 32\n\
+             scheduler_recv_interval = 2\nwatchdog_timeout = 300.0\n\
+             cuda_graph_bs = [1, 2, 4]\nmax_total_tokens = 65536\n\
+             tp_size = 2\nmax_lora_rank = 64\nlora_backend = \"pytorch\"\n",
+        )
+        .unwrap();
+
+        // Choice rejections name the field and the allowed set.
+        for (field, raw) in [
+            ("grammar_backend", "[sglang]\ngrammar_backend = \"regex\"\n"),
+            ("tokenizer_mode", "[sglang]\ntokenizer_mode = \"turbo\"\n"),
+            (
+                "tokenizer_backend",
+                "[sglang]\ntokenizer_backend = \"slowmatic\"\n",
+            ),
+            (
+                "radix_eviction_policy",
+                "[sglang]\nradix_eviction_policy = \"fifo\"\n",
+            ),
+        ] {
+            let err = Config::from_toml(raw).unwrap_err().to_string();
+            assert!(err.contains(field), "{field}: {err}");
+            assert!(err.contains("must be one of"), "{field}: {err}");
+        }
+
+        // Numeric floors + list sanity, global scope.
+        for (field, raw) in [
+            ("batch_notify_size", "[sglang]\nbatch_notify_size = 0\n"),
+            (
+                "scheduler_recv_interval",
+                "[sglang]\nscheduler_recv_interval = 0\n",
+            ),
+            ("watchdog_timeout", "[sglang]\nwatchdog_timeout = 0.0\n"),
+            ("max_total_tokens", "[sglang]\nmax_total_tokens = 0\n"),
+            ("cuda_graph_bs", "[sglang]\ncuda_graph_bs = []\n"),
+            ("cuda_graph_bs", "[sglang]\ncuda_graph_bs = [1, 0]\n"),
+        ] {
+            let err = Config::from_toml(raw).unwrap_err().to_string();
+            assert!(err.contains(field), "{field}: {err}");
+        }
+
+        // Per-overlay scope validates with the full where_ path.
+        let err = Config::from_toml("[model_overrides.m.sglang]\ntokenizer_mode = \"turbo\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("model_overrides.m.sglang.tokenizer_mode"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unit__llama_server_knobs__validated() {
+        // Full llama-server surface parses at both scopes.
+        Config::from_toml(
+            "sse_ping_interval = -1\nserver_timeout_secs = 600\n\
+             chat_template_kwargs = \"{\\\"enable_thinking\\\": false}\"\n\
+             cont_batching = false\nreuse_port = true\nlora_init_without_apply = true\n",
+        )
+        .unwrap();
+        Config::from_toml("cont_batching = true\nsse_ping_interval = 30\n").unwrap();
+
+        // -1 (disable) is the floor for the SSE ping; 0-second server timeout
+        // would kill every stream; the kwargs string must be a JSON object.
+        for (field, raw) in [
+            ("sse_ping_interval", "sse_ping_interval = -2\n"),
+            ("server_timeout_secs", "server_timeout_secs = 0\n"),
+            ("chat_template_kwargs", "chat_template_kwargs = \"[]\"\n"),
+            (
+                "chat_template_kwargs",
+                "chat_template_kwargs = \"not json\"\n",
+            ),
+        ] {
+            let err = Config::from_toml(raw).unwrap_err().to_string();
+            assert!(err.contains(field), "{field}: {err}");
+        }
+    }
+
+    #[test]
+    fn unit__mistralrs_knobs__validated() {
+        // Accepted: the full 20-knob surface parses + validates, globally and
+        // per-overlay.
+        let full = "[mistralrs]\nmax_batch_size = 4\nmax_prefill_chunk_tokens = 1024\n\
+                    max_decode_steps_before_prefill = 16\nprefix_cache_n = 0\n\
+                    pa_block_size = 64\npa_cache_type = \"bf16\"\npa_context_len = 4096\n\
+                    lora_max_rank = 64\nlora_max_adapters = 2\nlora_max_bytes = 1073741824\n\
+                    mtp = true\nmtp_model = \"mtp-draft\"\nmtp_n_predict = 3\n\
+                    mtp_draft_sampling = \"greedy\"\nencoder_cache_memory_mb = 512\n\
+                    max_num_images = 2\nmax_image_length = 1024\ndisable_metrics = true\n\
+                    disable_access_log = true\ndevice_layers = \"0:12;1:24\"\n";
+        Config::from_toml(full).unwrap();
+        Config::from_toml("[model_overrides.m.mistralrs]\nmax_batch_size = 2\n").unwrap();
+
+        // Floors name the field.
+        for (field, raw) in [
+            ("max_batch_size", "[mistralrs]\nmax_batch_size = 0\n"),
+            (
+                "prefix_cache_n_is_exempt",
+                "[mistralrs]\nprefix_cache_n = 0\n",
+            ),
+            ("pa_block_size", "[mistralrs]\npa_block_size = 0\n"),
+            ("lora_max_rank", "[mistralrs]\nlora_max_rank = 0\n"),
+            ("mtp_n_predict", "[mistralrs]\nmtp_n_predict = 0\n"),
+        ] {
+            let ok = field == "prefix_cache_n_is_exempt";
+            let res = Config::from_toml(raw);
+            assert_eq!(res.is_ok(), ok, "{field}: {res:?}");
+        }
+
+        // Draft-sampling choices + the mtp_model-without-mtp footgun + the
+        // device_layers ORD:NUM grammar.
+        for (field, raw) in [
+            (
+                "mtp_draft_sampling",
+                "[mistralrs]\nmtp_draft_sampling = \"chaotic\"\n",
+            ),
+            ("mtp_model", "[mistralrs]\nmtp_model = \"orphan-draft\"\n"),
+            ("device_layers", "[mistralrs]\ndevice_layers = \"0-12\"\n"),
+            ("device_layers", "[mistralrs]\ndevice_layers = \"all\"\n"),
+        ] {
+            let err = Config::from_toml(raw).unwrap_err().to_string();
+            assert!(err.contains(field), "{field}: {err}");
+        }
     }
 
     #[test]
