@@ -297,6 +297,11 @@ pub fn cmake_configure_args(
     ];
     if backend == BuildBackend::Cuda {
         args.push("-DGGML_CUDA=ON".to_string());
+        // CI parity (.github/workflows/engine-cuda.yml): the prebuilt
+        // overlay builds with half-precision CUDA math, which measured
+        // +15% decode on sm89 (b10955 overlay 592 tok/s vs a local
+        // b10970 build without this flag at 512 tok/s, same model).
+        args.push("-DGGML_CUDA_F16=ON".to_string());
         if let Some(a) = arch {
             args.push(format!("-DCMAKE_CUDA_ARCHITECTURES={a}"));
         }
@@ -923,6 +928,16 @@ mod tests {
         // No cache on PATH -> no launcher flags at all.
         let bare = cmake_configure_args(BuildBackend::Cuda, None, None, None);
         assert!(bare.iter().all(|a| !a.contains("LAUNCHER")));
+    }
+
+    #[test]
+    fn unit__cmake_args__cuda_f16_ci_parity() {
+        // The overlay CI builds with half-precision CUDA math; a local
+        // build without it measured -15% decode on sm89. CPU stays off.
+        let cuda = cmake_configure_args(BuildBackend::Cuda, None, None, None);
+        assert!(cuda.contains(&"-DGGML_CUDA_F16=ON".to_string()));
+        let cpu = cmake_configure_args(BuildBackend::Cpu, None, None, None);
+        assert!(cpu.iter().all(|a| !a.contains("F16")));
     }
 
     #[test]
