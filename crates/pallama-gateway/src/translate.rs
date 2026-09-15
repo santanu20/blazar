@@ -182,11 +182,24 @@ fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
 /// ollama base64 image -> `data:` URL for `OpenAI` `image_url` parts.
 /// 12 decoded bytes cover every supported magic; an unrecognized (or
 /// undecodable) prefix fails fast instead of guessing a MIME (H1).
+///
+/// MIME-tolerant input (RFC 2045): ollama clients — python's
+/// `base64.encodebytes`, go's mime writers — may wrap payloads in
+/// newlines every 76 chars. The engine's strict decoder rejects
+/// whitespace inside data-URL base64 (live-caught on b10970: geokit
+/// fixture images 400'd as "Failed to load image or audio file" while
+/// ollama accepted the same payload). Strip it once here so both the
+/// magic sniff and the forwarded URL see clean base64.
 fn image_data_url(b64: &str) -> Result<String, String> {
-    let head = b64_prefix_bytes(b64, 12);
+    let clean: std::borrow::Cow<'_, str> = if b64.contains(char::is_whitespace) {
+        std::borrow::Cow::Owned(b64.chars().filter(|c| !c.is_whitespace()).collect())
+    } else {
+        std::borrow::Cow::Borrowed(b64)
+    };
+    let head = b64_prefix_bytes(&clean, 12);
     let mime = sniff_image_mime(&head)
         .ok_or_else(|| "unsupported image format (supported: png, jpeg, gif, webp)".to_string())?;
-    Ok(format!("data:{mime};base64,{b64}"))
+    Ok(format!("data:{mime};base64,{clean}"))
 }
 
 /// ollama messages -> `OpenAI` messages: any message carrying ollama-style
@@ -1456,6 +1469,27 @@ mod tests {
             "messages": [{"role": "user", "content": "x", "images": ["zzz"]}]
         });
         assert!(chat_to_openai(&bad).is_err());
+    }
+
+    #[test]
+    fn unit__image_data_url__strips_mime_wrapped_base64() {
+        // RFC 2045 line-wrapped base64 (python base64.encodebytes, go mime
+        // writers): the engine's strict decoder rejects whitespace inside
+        // data URLs (live-caught on b10970 — geokit fixture images 400'd).
+        let wrapped = "iVBORw0KGgoAAA\nANSUhEUgAAAAg=\n";
+        let url = image_data_url(wrapped).unwrap();
+        assert_eq!(url, "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAg=");
+        // Clean input passes through byte-identical (no rebuild churn).
+        assert_eq!(
+            image_data_url("iVBORw0KGgo").unwrap(),
+            "data:image/png;base64,iVBORw0KGgo"
+        );
+        // CRLF + spaces are stripped too; garbage still fails loudly.
+        assert_eq!(
+            image_data_url("iVBORw0KGgo\r\n").unwrap(),
+            "data:image/png;base64,iVBORw0KGgo"
+        );
+        assert!(image_data_url("zzz\nzzz").is_err());
     }
 
     #[test]
