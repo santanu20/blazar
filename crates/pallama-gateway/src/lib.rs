@@ -1087,12 +1087,9 @@ mod tests {
                 .to_string(),
         ));
         assert_eq!(resp.status(), 400);
-        let body = axum::body::to_bytes(
-            resp.into_body(),
-            usize::MAX,
-        )
-        .await
-        .expect("read body");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
         let v: serde_json::Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(
             v["error"]["message"]

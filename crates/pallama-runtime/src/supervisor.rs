@@ -1397,10 +1397,18 @@ impl Supervisor {
             return Ok(None);
         }
         if !manifest.flags.contains("--api-key-file") && !manifest.flags.contains("--api-key") {
+            // Kind-forked remedy: mistral.rs has no update lane (its engine
+            // update command itself teaches `engine install`), so name the
+            // install lane directly instead.
+            let remedy = if self.engine.kind() == pallama_core::engine_kind::EngineKind::MistralRs {
+                "pallama engine install --kind mistralrs"
+            } else {
+                "pallama engine update"
+            };
             tracing::warn!(
                 model = key,
                 "child_auth: engine {} lacks --api-key/--api-key-file; child stays \
-                 unauthenticated (run: pallama engine update)",
+                 unauthenticated (run: {remedy})",
                 manifest.tag
             );
             return Ok(None);
@@ -1461,10 +1469,23 @@ impl Supervisor {
             .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
         let manifest = self.engine.capabilities();
         if !manifest.flags.contains("--models-preset") {
-            return Err(SupervisionError::Internal(anyhow!(
-                "router mode: engine {} lacks --models-preset; run: pallama engine update",
-                manifest.tag
-            )));
+            // --models-preset is a llama-server router feature; no mistral.rs
+            // or sglang build grows it, so the remedy forks on kind: a stale
+            // llamacpp can update into it, anything else must switch lanes.
+            let detail = if self.engine.kind() == pallama_core::engine_kind::EngineKind::LlamaCpp {
+                format!(
+                    "router mode: engine {} lacks --models-preset; run: pallama engine update",
+                    manifest.tag
+                )
+            } else {
+                format!(
+                    "router mode is llama-server-only; engine {} is {} — switch with \
+                     `pallama engine use <llamacpp-tag>` (see `pallama engine list`)",
+                    manifest.tag,
+                    self.engine.kind()
+                )
+            };
+            return Err(SupervisionError::Internal(anyhow!("{detail}")));
         }
         let _ = self.dirs.ensure();
         let data_dir_str = self.dirs.data_dir.to_string_lossy().into_owned();
@@ -3721,11 +3742,6 @@ mod routing_tests {
     #[test]
     fn unit__read_model_meta__wrong_lane_pairs_teach_the_engine_remedy() {
         use pallama_core::engine_kind::EngineKind as K;
-        // A safetensors directory on the llama.cpp lane: the raw
-        // "gguf metadata: Is a directory" io-error taught nothing; the
-        // guard must name the sglang/mistralrs install remedy.
-        let dir = std::env::temp_dir().join("pallama-lane-guard-dir");
-        std::fs::create_dir_all(&dir).expect("mkdir fixture");
         // MetaBox is not Debug, so expect_err cannot be used — take the
         // error arm explicitly.
         fn err_of(r: Result<MetaBox, String>) -> String {
@@ -3734,6 +3750,11 @@ mod routing_tests {
                 Err(e) => e,
             }
         }
+        // A safetensors directory on the llama.cpp lane: the raw
+        // "gguf metadata: Is a directory" io-error taught nothing; the
+        // guard must name the sglang/mistralrs install remedy.
+        let dir = std::env::temp_dir().join("pallama-lane-guard-dir");
+        std::fs::create_dir_all(&dir).expect("mkdir fixture");
         let err = err_of(read_model_meta(dir.to_str().unwrap(), K::LlamaCpp));
         assert!(
             err.contains("engine install --kind sglang"),

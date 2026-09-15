@@ -445,9 +445,10 @@ fn extract_model(body: &[u8]) -> Option<String> {
     v.get("model")?.as_str().map(str::to_string)
 }
 
-/// Child surfaces only llama-server implements. A mistralrs child
-/// would answer these with a bare 404/HTML error; Pallama teaches
-/// instead (fail fast, name the limitation, name the switch).
+/// Child surfaces only llama-server implements. A non-llamacpp child
+/// (mistralrs, sglang) would answer these with a bare 404/HTML error;
+/// Pallama teaches instead (fail fast, name the limitation, name the
+/// switch).
 const LLAMACPP_ONLY_PATHS: &[&str] = &[
     "/tokenize",
     "/detokenize",
@@ -466,7 +467,8 @@ const LLAMACPP_ONLY_PATHS: &[&str] = &[
 ];
 
 /// `Some(teaching 400)` when the path is llama-server-only AND the
-/// active engine is mistralrs. Path matching covers sub-paths
+/// active engine is not llamacpp (mistralrs and sglang children both
+/// lack these surfaces). Path matching covers sub-paths
 /// (`/slots/{id}`).
 fn llamacpp_only_gate(state: &AppState, uri: &Uri) -> Option<Response> {
     let path = uri.path();
@@ -479,13 +481,16 @@ fn llamacpp_only_gate(state: &AppState, uri: &Uri) -> Option<Response> {
     let row = state
         .with_store(|s| s.active_engine().ok().flatten())
         .flatten()?;
-    if row.kind != pallama_core::engine_kind::EngineKind::MistralRs {
+    if row.kind == pallama_core::engine_kind::EngineKind::LlamaCpp {
         return None;
     }
     Some(openai_error(
         400,
-        "this endpoint is llama-server-only; the active mistralrs engine does not \
-         implement it — switch with `pallama engine use <tag>` (see `pallama engine list`)",
+        &format!(
+            "this endpoint is llama-server-only; the active {} engine does not \
+             implement it — switch with `pallama engine use <tag>` (see `pallama engine list`)",
+            row.kind
+        ),
     ))
 }
 

@@ -272,7 +272,8 @@ enum Cmd {
     },
     /// Pre-download fit preview: VRAM/RAM split + quant alternatives
     Fit { target: String },
-    /// Config inspection and editing (one knob surface)
+    /// Inspect and edit config.toml knobs (set / get / unset / defaults)
+    #[command(after_help = CONFIG_EXAMPLES)]
     Config {
         #[command(subcommand)]
         cmd: ConfigCmd,
@@ -356,7 +357,10 @@ enum SessionCmd {
     },
     /// List checkpoints for a model
     #[command(alias = "ls")]
-    List { model: String },
+    List {
+        /// Model whose checkpoints to list
+        model: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -453,15 +457,15 @@ enum EngineCmd {
 #[derive(Subcommand)]
 enum LoraCmd {
     Add {
+        /// Model row the adapter attaches to
         model: String,
+        /// Path to the `LoRA` adapter file
         path: PathBuf,
+        /// Merge scale applied to the adapter
         #[arg(default_value = "1.0")]
         scale: f64,
-        /// Model row the adapter attaches to
     },
-        /// Path to the `LoRA` adapter file
     Rm {
-        /// Merge scale applied to the adapter
         id: i64,
     },
     List {
@@ -481,7 +485,31 @@ enum ConfigCmd {
     /// Model-scoped overrides live in `[model_overrides."<model>"]`
     /// tables; edit those in the file directly.
     Set { key: String, value: String },
+    /// Remove a top-level pin so the knob returns to its built-in
+    /// default (`config unset slots`); idempotent when the key carries
+    /// no pin. The running daemon keeps the config it booted with
+    /// until restarted; `PALLAMA_*` env overrides still win over the
+    /// file either way.
+    Unset { key: String },
+    /// Print the built-in defaults as TOML — exactly what a fresh
+    /// install writes — or one knob's default line
+    /// (`config defaults slots`). Shows defaults only; use `get`/`list`
+    /// for the effective config.
+    Defaults {
+        /// One knob name; omit to print every default
+        key: Option<String>,
+    },
 }
+
+/// `pallama config --help` footer: the set → get → unset → defaults
+/// round-trip in one glance (unset restores the built-in default).
+const CONFIG_EXAMPLES: &str = "\
+Examples:
+  pallama config set slots 1        pin a knob (validated before the file is touched)
+  pallama config get slots          show the current effective value
+  pallama config unset slots        remove the pin, return to the built-in default
+  pallama config defaults slots     show the built-in default (omit KEY for all)
+  pallama config list               full effective config as TOML";
 
 /// Grouping table for the top-level help. Descriptions and aliases come
 /// live from clap (single source of truth); this table owns ONLY the
@@ -1659,6 +1687,24 @@ mod doctor_tests {
     use super::*;
 
     #[test]
+    #[test]
+    fn unit__quantize_temp__drop_removes_partial_defuse_keeps() {
+        let dir = std::env::temp_dir();
+        // Armed guard: any early return drops the partial write with it.
+        let armed = QuantizeTemp::new(&dir, "unit-qt-armed");
+        let armed_path = armed.path.clone();
+        std::fs::write(&armed_path, b"partial").unwrap();
+        drop(armed);
+        assert!(!armed_path.exists(), "partial must be removed on drop");
+        // Defused guard: the promoted rename survives the drop.
+        let done = QuantizeTemp::new(&dir, "unit-qt-done");
+        let done_path = done.path.clone();
+        std::fs::write(&done_path, b"complete").unwrap();
+        done.defuse();
+        assert!(done_path.exists(), "defused temp must survive drop");
+        let _ = std::fs::remove_file(&done_path);
+    }
+
     fn unit__doctor_group__known_names_map_and_order_is_stable() {
         assert_eq!(doctor_group("engine"), "ENGINES");
         assert_eq!(doctor_group("inventory sglang"), "ENGINES");
@@ -1687,24 +1733,6 @@ fn doctor_next_steps(checks: &[Check]) -> Vec<String> {
         .iter()
         .any(|c| c.name == "models" && c.ok && c.detail.starts_with("0 pulled"));
     let mut steps = Vec::new();
-    #[test]
-    fn unit__quantize_temp__drop_removes_partial_defuse_keeps() {
-        let dir = std::env::temp_dir();
-        // Armed guard: any early return drops the partial write with it.
-        let armed = QuantizeTemp::new(&dir, "unit-qt-armed");
-        let armed_path = armed.path.clone();
-        std::fs::write(&armed_path, b"partial").unwrap();
-        drop(armed);
-        assert!(!armed_path.exists(), "partial must be removed on drop");
-        // Defused guard: the promoted rename survives the drop.
-        let done = QuantizeTemp::new(&dir, "unit-qt-done");
-        let done_path = done.path.clone();
-        std::fs::write(&done_path, b"complete").unwrap();
-        done.defuse();
-        assert!(done_path.exists(), "defused temp must survive drop");
-        let _ = std::fs::remove_file(&done_path);
-    }
-
     if !port_up {
         steps.push("start the daemon: pallama serve (or: systemctl start pallama)".to_string());
     }
@@ -2340,6 +2368,23 @@ fn engine_update_command(active_tag: &str, asset: &str) -> &'static str {
     }
 }
 
+/// The active engine sits on the prebuilt CUDA overlay lane (not a
+/// local source build): those assets publish hourly from the overlay
+/// repo and can lag the channel target. The currency row must teach
+/// that divergence so doctor's "upgrade available" never contradicts
+/// `engine update`'s "nothing new installed" while the overlay catches
+/// up (live confusion: doctor said b10969, update installed nothing).
+fn overlay_lag_note(active_tag: &str, asset: &str) -> &'static str {
+    if active_tag.ends_with("-cuda") && !asset.starts_with("built-") {
+        " (CUDA prebuilts publish hourly from the overlay repo and may lag \
+         the newest build; when `pallama engine update` reports the overlay \
+         is behind, `pallama engine build cuda` compiles the newest build \
+         locally)"
+    } else {
+        ""
+    }
+}
+
 /// Live engine-currency probe (marker missing or >48h stale): 4s cap,
 /// warn-only — the update itself stays a human action.
 async fn live_engine_currency(active: &str, asset: &str) -> Check {
@@ -2369,12 +2414,13 @@ async fn live_engine_currency(active: &str, asset: &str) -> Check {
                 Check::warn(
                     "engine currency",
                     format!(
-                        "{} available: {} (active: {}, channel: {}) — run: {}",
+                        "{} available: {} (active: {}, channel: {}) — run: {}{}",
                         channel_word(active, &rel.tag_name),
                         rel.tag_name,
                         active,
                         channel,
-                        engine_update_command(active, asset)
+                        engine_update_command(active, asset),
+                        overlay_lag_note(active, asset)
                     ),
                 )
             }
@@ -2549,9 +2595,10 @@ fn currency_verdict(
         Some(Check::warn(
             "engine currency",
             format!(
-                "{} available: {latest} (active: {active}, channel: {channel}) — run: {}",
+                "{} available: {latest} (active: {active}, channel: {channel}) — run: {}{}",
                 channel_word(active, latest),
-                engine_update_command(active, asset)
+                engine_update_command(active, asset),
+                overlay_lag_note(active, asset)
             ),
         ))
     } else if stale {
@@ -3338,6 +3385,9 @@ mod signal_stop {
 
 async fn pull(target: &str) -> Result<()> {
     let (row, already_present) = pull_model(target).await?;
+    // Banner only on success: an upgrade hint decorating a pull FAILURE
+    // reads as noise (fit/mmproj already follow this order).
+    banner();
     if already_present {
         println!(
             "already present — {}: {} ({}, {} shards) -> {}",
@@ -3385,9 +3435,6 @@ async fn pull_model(target: &str) -> Result<(pallama_core::store::ModelRow, bool
     let outcome = tokio::select! {
         r = puller.route_pull(target) => r?,
         () = pallama_runtime::events::interrupted() => {
-    // Banner only on success: an upgrade hint decorating a pull FAILURE
-    // reads as noise (fit/mmproj already follow this order).
-    banner();
             return Err(anyhow::anyhow!(
                 "pull interrupted — partial file kept; re-run `pallama pull {target}` to resume"
             ));
@@ -4405,53 +4452,6 @@ async fn keys_cmd(action: Option<KeysAction>) -> Result<()> {
 
 /// `pallama quantize <model> -t Q4_K_M` — run the engine's own
 /// llama-quantize and register the output in the store.
-#[allow(clippy::too_many_lines)]
-fn quantize_cmd(
-    model: &str,
-    qtype: &str,
-    name: Option<&str>,
-    imatrix: Option<&std::path::Path>,
-    allow_requantize: bool,
-    verify_gate_pct: Option<f64>,
-) -> Result<()> {
-    if !pallama_runtime::quantize::plausible_quant_type(qtype) {
-        return Err(anyhow!(
-            "implausible quant type {qtype:?}: expected something like Q4_K_M, Q5_K_S, IQ4_XS, f16"
-        ));
-    }
-    let d = dirs();
-    let store = Store::open(&d)?;
-    let row = store
-        .get_model(model)?
-        .ok_or_else(|| anyhow!("unknown model {model:?} (pallama list)"))?;
-    let bin = pallama_runtime::quantize::find_quantize_bin(&d)?;
-    let base = row.name.split('-').next().unwrap_or(&row.name).to_string();
-    let out_name = name.map_or_else(|| format!("{base}-{qtype}"), str::to_string);
-    let dst = d.models_dir().join(format!("{out_name}.gguf"));
-    if dst.exists() {
-        return Err(anyhow!(
-            "output {} already exists (rm it first or pass --name)",
-            dst.display()
-        ));
-    }
-    println!("quantizing {} -> {} ({qtype})", row.path, dst.display());
-    let src_bytes = std::fs::metadata(&row.path)?.len();
-    // Optional importance matrix: calibrate first, then quantize with it
-    // (verified upstream CLI: llama-imatrix -m -f -o --output-format gguf;
-    // llama-quantize --imatrix file).
-    let mut imatrix_args: Vec<String> = match &imatrix {
-        Some(calib) => {
-            let ibin = pallama_runtime::quantize::find_imatrix_bin(&d)?;
-            let ipath = d.data_dir.join(format!(
-                "{}-imatrix.gguf",
-                row.name.replace(['/', '\\', ':'], "_")
-            ));
-            println!(
-                "calibrating imatrix from {} (a full forward pass — takes minutes)...",
-                calib.display()
-            );
-            let im = pallama_runtime::quantize::imatrix(
-                &ibin,
 ///
 /// RAII guard for a partially written quantization output: the child writes
 /// to a hidden sibling (`.name.gguf.part-<pid>`) and only an atomic rename
@@ -4487,6 +4487,54 @@ impl Drop for QuantizeTemp {
     }
 }
 
+#[allow(clippy::too_many_lines)]
+fn quantize_cmd(
+    model: &str,
+    qtype: &str,
+    name: Option<&str>,
+    imatrix: Option<&std::path::Path>,
+    allow_requantize: bool,
+    verify_gate_pct: Option<f64>,
+) -> Result<()> {
+    if !pallama_runtime::quantize::plausible_quant_type(qtype) {
+        return Err(anyhow!(
+            "implausible quant type {qtype:?}: expected something like Q4_K_M, Q5_K_S, IQ4_XS, f16"
+        ));
+    }
+    let d = dirs();
+    let store = Store::open(&d)?;
+    let row = store
+        .get_model(model)?
+        .ok_or_else(|| anyhow!("unknown model {model:?} (pallama list)"))?;
+    let bin = pallama_runtime::quantize::find_quantize_bin(&d)?;
+    let base = row.name.split('-').next().unwrap_or(&row.name).to_string();
+    let out_name = name.map_or_else(|| format!("{base}-{qtype}"), str::to_string);
+    let dst = d.models_dir().join(format!("{out_name}.gguf"));
+    if dst.exists() {
+        return Err(anyhow!(
+            "output {} already exists (rm it first or pass --name)",
+            dst.display()
+        ));
+    }
+    let tmp = QuantizeTemp::new(&d.models_dir(), &out_name);
+    println!("quantizing {} -> {} ({qtype})", row.path, dst.display());
+    let src_bytes = std::fs::metadata(&row.path)?.len();
+    // Optional importance matrix: calibrate first, then quantize with it
+    // (verified upstream CLI: llama-imatrix -m -f -o --output-format gguf;
+    // llama-quantize --imatrix file).
+    let mut imatrix_args: Vec<String> = match &imatrix {
+        Some(calib) => {
+            let ibin = pallama_runtime::quantize::find_imatrix_bin(&d)?;
+            let ipath = d.data_dir.join(format!(
+                "{}-imatrix.gguf",
+                row.name.replace(['/', '\\', ':'], "_")
+            ));
+            println!(
+                "calibrating imatrix from {} (a full forward pass — takes minutes)...",
+                calib.display()
+            );
+            let im = pallama_runtime::quantize::imatrix(
+                &ibin,
                 std::path::Path::new(&row.path),
                 calib,
                 &ipath,
@@ -4505,7 +4553,7 @@ impl Drop for QuantizeTemp {
     let out = pallama_runtime::quantize::quantize_im(
         &bin,
         std::path::Path::new(&row.path),
-        &dst,
+        &tmp.path,
         qtype,
         &imatrix_args,
         |line| {
@@ -4516,7 +4564,6 @@ impl Drop for QuantizeTemp {
     // a failing output is deleted and never registered.
     if let Some(max_degradation_pct) = verify_gate_pct {
         let pbin = pallama_runtime::quantize::find_perplexity_bin(&d)?;
-    let tmp = QuantizeTemp::new(&d.models_dir(), &out_name);
         let probe = pallama_runtime::quantize::write_verify_probe(&d)?;
         println!("verify: perplexity pass 1/2 (base) — full forward passes, this takes a while...");
         let base_ppl = pallama_runtime::quantize::perplexity(
@@ -4547,12 +4594,18 @@ impl Drop for QuantizeTemp {
     let meta = pallama_core::read_metadata_file(&out)
         .map_err(|e| anyhow!("output not a readable GGUF ({e}): {}", out.display()))?;
     let out_bytes = std::fs::metadata(&out)?.len();
+    // Atomic promote: same-filesystem rename makes the final name appear
+    // only as a complete, validated GGUF; the RAII guard is defused so the
+    // (now moved) temp path is not cleaned up on drop.
+    std::fs::rename(&out, &dst)
+        .map_err(|e| anyhow!("promote {} -> {}: {e}", out.display(), dst.display()))?;
+    tmp.defuse();
     let bytes = i64::try_from(out_bytes).unwrap_or(i64::MAX);
     store.upsert_model(&pallama_core::ModelRow {
         name: out_name.clone(),
         repo: format!("{}/local-quant", row.repo),
         quant: qtype.to_string(),
-        path: out.display().to_string(),
+        path: dst.display().to_string(),
         bytes,
         sha256: None,
         mmproj_path: row.mmproj_path.clone(),
@@ -4594,12 +4647,6 @@ async fn launch_cmd(command: Vec<String>, warm: Option<String>, key: Option<Stri
     let base = ensure_daemon().await?;
     if let Some(model) = &warm {
         println!("pre-warming {model} ...");
-    // Atomic promote: same-filesystem rename makes the final name appear
-    // only as a complete, validated GGUF; the RAII guard is defused so the
-    // (now moved) temp path is not cleaned up on drop.
-    std::fs::rename(&out, &dst)
-        .map_err(|e| anyhow!("promote {} -> {}: {e}", out.display(), dst.display()))?;
-    tmp.defuse();
         let resp = cli_http()
             .post(format!("{base}/v1/chat/completions"))
             .json(&serde_json::json!({
@@ -4835,6 +4882,12 @@ fn coreside_cmd() -> Result<()> {
         "MODEL", "WEIGHTS", "KV@CTX", "CTX"
     );
     for f in &resident {
+        // 0 = unmeasurable (HF rows / unreadable GGUF) — never-guess dash
+        let kv_disp = if f.kv_mib > 0 {
+            format!("{}M", f.kv_mib)
+        } else {
+            "-".to_string()
+        };
         println!(
             "{:<24} {:>7}M {:>9} {:>7}",
             f.name, f.weights_mib, kv_disp, f.ctx
@@ -4845,6 +4898,11 @@ fn coreside_cmd() -> Result<()> {
     } else {
         println!("deferred (swap in on demand):");
         for f in &deferred {
+            let kv_disp = if f.kv_mib > 0 {
+                format!("{}M", f.kv_mib)
+            } else {
+                "-".to_string()
+            };
             println!(
                 "{:<24} {:>7}M {:>9} {:>7}",
                 f.name, f.weights_mib, kv_disp, f.ctx
@@ -4882,12 +4940,6 @@ async fn whisper_cmd(
     if list {
         match pallama_runtime::whisper::server_bin(&d) {
             Some((bin, _)) => {
-        // 0 = unmeasurable (HF rows / unreadable GGUF) — never-guess dash
-        let kv_disp = if f.kv_mib > 0 {
-            format!("{}M", f.kv_mib)
-        } else {
-            "-".to_string()
-        };
                 let tag = bin
                     .parent()
                     .and_then(|p| p.parent())
@@ -4898,11 +4950,6 @@ async fn whisper_cmd(
                 } else {
                     ""
                 };
-            let kv_disp = if f.kv_mib > 0 {
-                format!("{}M", f.kv_mib)
-            } else {
-                "-".to_string()
-            };
                 println!("server: {tag}{pin} ({})", bin.display());
             }
             None => println!("server: not installed (pallama whisper --install)"),
@@ -5542,6 +5589,54 @@ fn key_before_eq(line: &str) -> Option<&str> {
     (!k.is_empty()).then_some(k)
 }
 
+/// Does the config schema know this top-level knob? Two sources,
+/// unioned: the keys `Config::default()` serializes (every non-Option
+/// knob — strings, ints, floats, bools, enums) and parse-only scalar
+/// probes against the serde schema (Option knobs serialize as absent
+/// while None, so they never appear in the default TOML). Probes go
+/// through `toml::from_str`, never `Config::from_toml` — that also
+/// VALIDATES, and probe values are placeholders that must not trip
+/// value validation. `deny_unknown_fields` is the authority either way.
+fn known_config_key(key: &str) -> bool {
+    if !key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return false; // TOML bare keys only; anything else is a typo
+    }
+    let defaults = Config::default()
+        .to_toml()
+        .expect("serializing the built-in default config cannot fail");
+    if defaults.lines().any(|l| key_before_eq(l) == Some(key)) {
+        return true;
+    }
+    ["\"s\"", "0", "0.5", "true", "[]"]
+        .iter()
+        .any(|v| toml::from_str::<Config>(&format!("{key} = {v}\n")).is_ok())
+}
+
+/// Remove a top-level pin (`key = ...` before the first `[table]`
+/// header). Table-scoped keys are never touched — the same knob name
+/// inside `[model_overrides."<model>"]` is a different setting. Returns
+/// the candidate file and the removed line (None when the key carries
+/// no top-level pin).
+fn remove_top_level_pin(raw: &str, key: &str) -> (String, Option<String>) {
+    let mut removed = None;
+    let mut in_root_scope = true;
+    let mut out: Vec<&str> = Vec::new();
+    for line in raw.lines() {
+        if in_root_scope && line.starts_with('[') {
+            in_root_scope = false;
+        }
+        if in_root_scope && key_before_eq(line) == Some(key) {
+            removed = Some(line.to_string());
+        } else {
+            out.push(line);
+        }
+    }
+    (out.join("\n") + "\n", removed)
+}
+
 /// Persist a per-model overlay key (validated immediately).
 fn set_model_override(model: &str, key: &str, value: &str) -> Result<()> {
     let d = dirs();
@@ -5603,6 +5698,9 @@ fn quick_tg(d: &PallamaDirs, _row: &pallama_core::EngineRow, model_path: &str) -
     // hand-building a unix-only path.
     let bench_bin = pallama_runtime::bench::find_bench_bin(d)?;
     let tuner = pallama_runtime::bench::Tuner { dirs: d, bench_bin };
+    // llama-bench loads the full model before its first row appears —
+    // say so or the probe reads as a silent multi-second hang.
+    println!("probing decode (tg128; loads the model first, ~30-60s)...");
     let rows = tuner.bench_default(std::path::Path::new(model_path))?;
     let tg = rows
         .iter()
@@ -5677,7 +5775,9 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
         EngineCmd::List => {
             upstream_update_hint(&d).await;
             let store = Store::open(&d)?;
+            let mut seen: Vec<&str> = Vec::new();
             for e in store.list_engines()? {
+                seen.push(e.kind.as_str());
                 println!(
                     "{:<12} {:<9} {:<10} {} {}",
                     e.tag,
@@ -5686,6 +5786,31 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                     if e.active { "[active]" } else { "" },
                     e.sha256.chars().take(12).collect::<String>()
                 );
+            }
+            // Point-of-need catalog: `engine list` is where users look
+            // for "what can I install" — every lane this pallama can
+            // run but doesn't have yet gets one discoverability line,
+            // and the separate voice lane is always named.
+            if !seen.contains(&"llamacpp") {
+                println!(
+                    "llama.cpp:  not installed — pallama engine update (prebuilt) / pallama engine build cuda (source; GGUF lane)"
+                );
+            }
+            if !seen.contains(&"mistralrs") {
+                println!(
+                    "mistral.rs: not installed — pallama engine install --kind mistralrs (safetensors)"
+                );
+            }
+            if !seen.contains(&"sglang") {
+                println!(
+                    "sglang:     not installed — pallama engine install --kind sglang (safetensors; Linux + CUDA/ROCm)"
+                );
+            }
+            match pallama_runtime::whisper::installed_tags(&d).first() {
+                Some(tag) => println!("whisper:    {tag} (voice lane) — pallama whisper --list"),
+                None => {
+                    println!("whisper:    not installed (voice lane) — pallama whisper --install")
+                }
             }
         }
         EngineCmd::Use { tag } => {
@@ -5698,9 +5823,6 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
         EngineCmd::Rm { tag } => {
             engine_rm(&d, &tag)?;
         }
-    // llama-bench loads the full model before its first row appears —
-    // say so or the probe reads as a silent multi-second hang.
-    println!("probing decode (tg128; loads the model first, ~30-60s)...");
         EngineCmd::Rollback => {
             let mgr = local_engine_manager(&d)?;
             let row = mgr.rollback()?;
@@ -5741,6 +5863,18 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             );
         }
         EngineCmd::Install { kind, tag } => {
+            // Bare `engine install` must never guess a lane: each lane
+            // serves different model formats, and the old silent
+            // mistralrs default started installs users did not ask for.
+            let Some(kind) = kind else {
+                return Err(anyhow!(
+                    "engine install needs a lane — each serves different model formats:\n  \
+                     llama.cpp         GGUF files — pallama engine update (prebuilt) or pallama engine build cuda (source)\n  \
+                     --kind mistralrs  HF safetensors dirs — prebuilt mistral.rs server\n  \
+                     --kind sglang     HF safetensors dirs — pip venv (Linux + CUDA/ROCm)\n  \
+                     voice (whisper)   pallama whisper --install (separate transcription lane)"
+                ));
+            };
             let engine_kind: EngineKind = kind
                 .parse()
                 .map_err(|e| anyhow!("engine install --kind {kind:?}: {e}"))?;
@@ -5772,9 +5906,7 @@ async fn engine_install_mistralrs(d: &PallamaDirs, tag: Option<String>) -> Resul
     println!(
         "engine {} active ({} flags probed, build {})",
         row.tag,
-            let mut seen: Vec<&str> = Vec::new();
         m.flags.len(),
-                seen.push(e.kind.as_str());
         m.build_number
     );
     println!("note: decode-regression gate is llama-server-only — skipped for mistral.rs engines");
@@ -5784,31 +5916,6 @@ async fn engine_install_mistralrs(d: &PallamaDirs, tag: Option<String>) -> Resul
 
 /// `pallama engine update --kind sglang [version]` — pip venv lane
 /// (Linux + CUDA/ROCm). Multi-GB download: torch rides the venv. The
-            // Point-of-need catalog: `engine list` is where users look
-            // for "what can I install" — every lane this pallama can
-            // run but doesn't have yet gets one discoverability line,
-            // and the separate voice lane is always named.
-            if !seen.contains(&"llamacpp") {
-                println!(
-                    "llama.cpp:  not installed — pallama engine update (prebuilt) / pallama engine build cuda (source; GGUF lane)"
-                );
-            }
-            if !seen.contains(&"mistralrs") {
-                println!(
-                    "mistral.rs: not installed — pallama engine install --kind mistralrs (safetensors)"
-                );
-            }
-            if !seen.contains(&"sglang") {
-                println!(
-                    "sglang:     not installed — pallama engine install --kind sglang (safetensors; Linux + CUDA/ROCm)"
-                );
-            }
-            match pallama_runtime::whisper::installed_tags(&d).first() {
-                Some(tag) => println!("whisper:    {tag} (voice lane) — pallama whisper --list"),
-                None => {
-                    println!("whisper:    not installed (voice lane) — pallama whisper --install")
-                }
-            }
 /// F7 decode-regression gate is llama-server-only: skipped, and SAID
 /// so — llama-bench cannot drive an sglang child.
 async fn engine_install_sglang(d: &PallamaDirs, version: Option<String>) -> Result<()> {
@@ -5860,18 +5967,6 @@ async fn engine_update_sglang(d: &PallamaDirs, version: Option<String>) -> Resul
     let latest = match pallama_runtime::engine::sglang_install::pypi_latest_sglang(
         std::time::Duration::from_secs(10),
     )
-            // Bare `engine install` must never guess a lane: each lane
-            // serves different model formats, and the old silent
-            // mistralrs default started installs users did not ask for.
-            let Some(kind) = kind else {
-                return Err(anyhow!(
-                    "engine install needs a lane — each serves different model formats:\n  \
-                     llama.cpp         GGUF files — pallama engine update (prebuilt) or pallama engine build cuda (source)\n  \
-                     --kind mistralrs  HF safetensors dirs — prebuilt mistral.rs server\n  \
-                     --kind sglang     HF safetensors dirs — pip venv (Linux + CUDA/ROCm)\n  \
-                     voice (whisper)   pallama whisper --install (separate transcription lane)"
-                ));
-            };
     .await
     {
         Ok(v) => v,
@@ -6706,6 +6801,71 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
             println!("{key} = {stored}");
             Ok(())
         }
+        ConfigCmd::Unset { key } => {
+            // Same fresh-box bootstrap as `set`: unset may be the first
+            // command ever run on a box — the config file must exist
+            // before it can be read below.
+            let d = dirs();
+            d.ensure().ok();
+            let path = d.config_file();
+            if !path.exists() {
+                Config::load(&d).map_err(|e| anyhow!("{e}"))?;
+            }
+            let raw = std::fs::read_to_string(&path)?;
+            let (candidate, removed) = remove_top_level_pin(&raw, &key);
+            match removed {
+                Some(old) => {
+                    // A candidate the schema rejects must never replace
+                    // the file (same contract as `set`).
+                    Config::from_toml(&candidate)
+                        .map_err(|e| anyhow!("rejected, file unchanged: {e}"))?;
+                    pallama_core::persist_config(&path, &candidate)?;
+                    let defaults = Config::default().to_toml().map_err(|e| anyhow!("{e}"))?;
+                    match defaults
+                        .lines()
+                        .find(|l| key_before_eq(l) == Some(key.as_str()))
+                    {
+                        Some(line) => {
+                            println!("{key} unset (was: {old}) — now: {line}");
+                        }
+                        None => {
+                            println!("{key} unset (was: {old}) — not set by default");
+                        }
+                    }
+                    Ok(())
+                }
+                None if known_config_key(&key) => {
+                    println!("{key} is not pinned — already at the built-in default");
+                    Ok(())
+                }
+                None => Err(anyhow!(
+                    "unknown config key: {key} (table settings like [semantic_cache] \
+                     and [model_overrides] are edited in the file directly)"
+                )),
+            }
+        }
+        ConfigCmd::Defaults { key } => {
+            let defaults = Config::default().to_toml().map_err(|e| anyhow!("{e}"))?;
+            match key {
+                None => {
+                    println!("{defaults}");
+                    Ok(())
+                }
+                Some(key) => {
+                    if let Some(line) = defaults
+                        .lines()
+                        .find(|l| key_before_eq(l) == Some(key.as_str()))
+                    {
+                        println!("{line}");
+                    } else if known_config_key(&key) {
+                        println!("{key} = <not set by default>");
+                    } else {
+                        return Err(anyhow!("unknown config key: {key}"));
+                    }
+                    Ok(())
+                }
+            }
+        }
     }
 }
 
@@ -6738,6 +6898,90 @@ async fn upgrade(version: Option<String>, dry_run: bool) -> Result<()> {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__known_config_key__defaults_options_and_typos() {
+        // Serialized-by-default knobs (every scalar/enum shape).
+        for k in [
+            "host",
+            "port",
+            "slots",
+            "spec",
+            "update_channel",
+            "ctx_extend",
+            "keys",
+        ] {
+            assert!(known_config_key(k), "{k} must be a known knob");
+        }
+        // Option knobs: absent from the default TOML while None — only
+        // the parse probes can recognize them.
+        for k in [
+            "child_auth",
+            "log_level",
+            "kv_unified",
+            "mistralrs_pa_memory_fraction",
+        ] {
+            assert!(
+                known_config_key(k),
+                "{k} (Option knob) must be known via probes"
+            );
+        }
+        // Typos and nonsense: bare-key charset gate + schema probes.
+        for k in ["slot", "bogus_key", "PORT", "a b", "keys=1"] {
+            assert!(!known_config_key(k), "{k:?} must be unknown");
+        }
+    }
+
+    #[test]
+    fn unit__remove_top_level_pin__removes_only_root_scope() {
+        // R4 pin: the same knob name at top level and inside a model
+        // override table is TWO settings — unset must only touch root.
+        let raw = concat!(
+            "cache_type = \"f16\"\n",
+            "host = \"127.0.0.1\"\n",
+            "\n",
+            "[model_overrides.\"m\"]\n",
+            "cache_type = \"q8_0\"\n",
+            "slots = 4\n",
+        );
+        let (out, removed) = remove_top_level_pin(raw, "cache_type");
+        assert_eq!(removed.as_deref(), Some("cache_type = \"f16\""));
+        assert!(out.contains("host = \"127.0.0.1\""), "other pins kept");
+        assert!(
+            out.contains("cache_type = \"q8_0\""),
+            "table-scoped pin untouched"
+        );
+        assert!(out.contains("slots = 4"), "table body kept");
+        // The candidate must still be schema-valid TOML.
+        assert!(Config::from_toml(&out).is_ok());
+    }
+
+    #[test]
+    fn unit__remove_top_level_pin__unpinned_is_none_and_byte_preserving() {
+        let raw = "host = \"127.0.0.1\"\n";
+        let (out, removed) = remove_top_level_pin(raw, "slots");
+        assert!(removed.is_none());
+        assert_eq!(out, raw, "nothing pinned — bytes pass through");
+        // Commented-out lines are not pins (no '=' before the comment).
+        let (out, _) = remove_top_level_pin("# cache_type = \"f16\"\n", "cache_type");
+        assert!(out.contains("# cache_type"));
+    }
+
+    #[test]
+    fn unit__config_defaults__builtin_toml_is_valid_and_complete() {
+        let defaults = Config::default().to_toml().expect("default toml");
+        // Round-trip: the printed defaults must parse back cleanly.
+        assert!(Config::from_toml(&defaults).is_ok());
+        // Non-Option knobs carry a default line.
+        assert!(defaults.lines().any(|l| key_before_eq(l) == Some("slots")));
+        // None-valued Option knobs serialize as absent (probe-only).
+        assert!(
+            !defaults
+                .lines()
+                .any(|l| key_before_eq(l) == Some("child_auth")),
+            "Option knob at None must not appear in default TOML"
+        );
+    }
 
     #[test]
     fn unit__model_type_label__gguf_file_safetensors_dir_unknowns() {
@@ -7054,6 +7298,70 @@ mod tests {
         assert!(
             c.detail.contains("run: pallama engine update"),
             "{}",
+            c.detail
+        );
+    }
+
+    #[test]
+    fn unit__currency_verdict__overlay_lane_teaches_hourly_lag_and_local_escape() {
+        // Live incident: doctor said "b10969 available — run: pallama
+        // engine update", update then installed nothing (overlay hadn't
+        // published b10969-cuda yet). The row must explain the overlay
+        // cadence and name the local-build escape so the two surfaces
+        // tell one story.
+        let pending = serde_json::json!({
+            "checked_at": 1_000_u64,
+            "latest": "b10969",
+            "active": "b10955-cuda",
+            "update_available": true,
+        });
+        let c = currency_verdict(
+            Some("b10955-cuda"),
+            &pending,
+            2_000,
+            "ubuntu-cuda-13.0-sm89-x64",
+        )
+        .unwrap();
+        assert!(c.warn, "{}", c.detail);
+        assert!(
+            c.detail.contains("run: pallama engine update"),
+            "prebuilt lane still refreshes through update: {}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("overlay repo"),
+            "names the overlay source: {}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("pallama engine build cuda"),
+            "names the local-build escape: {}",
+            c.detail
+        );
+    }
+
+    #[test]
+    fn unit__currency_verdict__built_and_vulkan_lanes_get_no_overlay_note() {
+        let pending = serde_json::json!({
+            "checked_at": 1_000_u64,
+            "latest": "b10969",
+            "active": "b10955-cuda",
+            "update_available": true,
+        });
+        // Source-built CUDA: refreshes via local build, overlay cadence
+        // is irrelevant to it.
+        let c = currency_verdict(Some("b10955-cuda"), &pending, 2_000, "built-cuda").unwrap();
+        assert!(
+            c.detail.contains("run: pallama engine build cuda")
+                && !c.detail.contains("overlay repo"),
+            "built lane: {}",
+            c.detail
+        );
+        // Vulkan prebuilt: upstream standard asset, no overlay involved.
+        let c = currency_verdict(Some("b10955"), &pending, 2_000, "ubuntu-vulkan-x64").unwrap();
+        assert!(
+            !c.detail.contains("overlay repo"),
+            "vulkan lane: {}",
             c.detail
         );
     }

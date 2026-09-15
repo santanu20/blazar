@@ -194,8 +194,9 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         ModelMeta::Hf(h) => {
             return Err(format!(
                 "model {} is a safetensors directory (arch {}) — llamacpp/mistralrs engines \
-                 consume GGUF files; pull it on the sglang engine \
-                 (`pallama engine install --kind sglang` + `pallama run <model> --engine sglang`)",
+                 consume GGUF files; serve it on the sglang engine: `pallama engine install \
+                 --kind sglang`, `pallama engine use <sglang-tag>` (see `pallama engine list`), \
+                 then restart the daemon",
                 input.model_name, h.architecture
             ));
         }
@@ -3063,22 +3064,6 @@ const AUTOFIT_CTX_FLOOR: u32 = 4096;
 /// budget as shallower parallel slots (4x4096 costs the same capacity as
 /// 1x16384) — ollama's throughput-first default. Pinned ctx (per-request,
 /// tuning bench, or overlay) is a hard pin: never divided.
-fn resolve_slots(
-    input: &ProfileInput<'_>,
-    overlay: &ModelOverride,
-    base_ctx: u32,
-    vram_bytes: u64,
-    ctx_pinned: bool,
-    warnings: &mut Vec<String>,
-) -> ResolvedSlots {
-    let slots = overlay.slots.unwrap_or(input.config.slots);
-    if overlay.deterministic.unwrap_or(input.config.deterministic) {
-        if slots > 1 {
-            warnings.push(format!(
-                "deterministic = true pins slots = 1 — explicit slots = {slots} ignored: \
-                 multi-slot batches perturb logits in near-tie positions and break \
-                 token-for-token greedy reproducibility; drop one of the two knobs"
-            ));
 /// Pinned-pool walk (unified lane): the capacity vram-slots axis is
 /// CAP-blind under `--kv-unified`, so it can admit an np whose whole pool
 /// (np × `base_ctx` of device-backed KV on top of the weights) the 2b
@@ -3118,6 +3103,22 @@ fn walk_pinned_np(
     np
 }
 
+fn resolve_slots(
+    input: &ProfileInput<'_>,
+    overlay: &ModelOverride,
+    base_ctx: u32,
+    vram_bytes: u64,
+    ctx_pinned: bool,
+    warnings: &mut Vec<String>,
+) -> ResolvedSlots {
+    let slots = overlay.slots.unwrap_or(input.config.slots);
+    if overlay.deterministic.unwrap_or(input.config.deterministic) {
+        if slots > 1 {
+            warnings.push(format!(
+                "deterministic = true pins slots = 1 — explicit slots = {slots} ignored: \
+                 multi-slot batches perturb logits in near-tie positions and break \
+                 token-for-token greedy reproducibility; drop one of the two knobs"
+            ));
         } else if slots == 0 {
             warnings.push(
                 "deterministic = true: slots pinned to 1 — concurrent streams queue \
@@ -5508,22 +5509,6 @@ mod tests {
     }
 
     #[test]
-    fn unit__unified_kv_pool_fit__pinned_middle_zone_serves_degraded() {
-        // Middle zone (85%..100% of VRAM): physically hostable, so the
-        // pin is SERVED — verdict Fit — but gpu-layers goes to the
-        // engine fitter (may CPU-split the last layers) with an honest
-        // warning. Shape: weights 2700 + f16 KV 1792 = 4492 MiB; VRAM
-        // 5200 (85% share = 4420): demand fits the card (4492 + 700
-        // overhead <= 5200) but not the 85% share.
-        let cfg = Config {
-            default_ctx: 32_768,
-            ..Config::default()
-        };
-        let hw = gpu_hw(5_200, 13_674, 8);
-        let g = meta(); // trained 40960 ≥ the pin; 57344 B/ctx-token
-        let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
-        inp.model_bytes = 2_700 * MIB;
-    #[test]
     fn unit__pinned_pool_walk__auto_slots_walk_to_hostable_np() {
         // The capacity vram-slots axis is CAP-blind under --kv-unified: it
         // admits np4 at a pinned 8192 while the DEVICE verdict refuses
@@ -5616,6 +5601,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unit__unified_kv_pool_fit__pinned_middle_zone_serves_degraded() {
+        // Middle zone (85%..100% of VRAM): physically hostable, so the
+        // pin is SERVED — verdict Fit — but gpu-layers goes to the
+        // engine fitter (may CPU-split the last layers) with an honest
+        // warning. Shape: weights 2700 + f16 KV 1792 = 4492 MiB; VRAM
+        // 5200 (85% share = 4420): demand fits the card (4492 + 700
+        // overhead <= 5200) but not the 85% share.
+        let cfg = Config {
+            default_ctx: 32_768,
+            ..Config::default()
+        };
+        let hw = gpu_hw(5_200, 13_674, 8);
+        let g = meta(); // trained 40960 ≥ the pin; 57344 B/ctx-token
+        let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        inp.model_bytes = 2_700 * MIB;
         let p = compile(
             &inp,
             &TuningOverrides {

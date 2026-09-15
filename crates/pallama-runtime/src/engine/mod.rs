@@ -85,6 +85,20 @@ pub fn is_cuda_engine(tag: &str, asset_label: &str) -> bool {
 /// dormant — the guard in `register_engine_with_vendor` refuses to
 /// activate it after the fact. Deciding the same thing BEFORE the
 /// download skips the ~28 MiB fetch + probe of an engine that will
+/// Result of the overlay-lag fallback probe (see
+/// `overlay_lag_fallback`): which of the three lanes the run
+/// actually took, so narration matches the decision.
+enum LagOutcome {
+    /// A published build older than the channel target was installed.
+    Installed(EngineRow),
+    /// The newest published runnable build IS the active engine —
+    /// nothing to do until the overlay drops the next build.
+    AlreadyActive(EngineRow),
+    /// Nothing runnable published (or the probe failed): the
+    /// standard Vulkan lane is the next resort.
+    NothingRunnable,
+}
+
 /// never serve. The `engine_asset` config pin bypasses, mirroring
 /// `maybe_cuda_overlay`.
 #[must_use]
@@ -295,8 +309,20 @@ impl EngineManager {
                      ({e:#}) — probing published overlay builds as a fallback"
                 );
                 if !exact_pin {
-                    if let Some(row) = self.overlay_lag_fallback(driver_cuda, sm, number).await? {
-                        return Ok(Some(row));
+                    match self.overlay_lag_fallback(driver_cuda, sm, number).await? {
+                        LagOutcome::Installed(row) => return Ok(Some(row)),
+                        LagOutcome::AlreadyActive(row) => {
+                            tracing::warn!(
+                                "overlay hasn't published {overlay_tag} yet ({repo} drops \
+                                 hourly); newest published CUDA build {} is already active — \
+                                 rerun `pallama engine update` after the next overlay drop, \
+                                 or run `pallama engine build cuda` to compile {} locally now",
+                                row.tag,
+                                release.tag_name
+                            );
+                            return Ok(Some(row));
+                        }
+                        LagOutcome::NothingRunnable => {} // Vulkan warn below is truthful
                     }
                 }
                 tracing::warn!(
@@ -339,33 +365,40 @@ impl EngineManager {
     /// never the already-active tag (no reinstall churn). A
     /// minutes-class download beats the hour-class source lane while
     /// the overlay's hourly freshness watcher catches up.
+    ///
+    /// The outcome is tri-state so the caller narrates each arm
+    /// distinctly: "newest published build is already active" used to
+    /// collapse into `None` and read as "found nothing runnable",
+    /// printing a Vulkan-lane switch the keep-CUDA guard then
+    /// cancelled — three contradictory decisions in one run.
     async fn overlay_lag_fallback(
         &self,
         driver_cuda: (u32, u32),
         sm: Option<u32>,
         target: u64,
-    ) -> Result<Option<EngineRow>> {
+    ) -> Result<LagOutcome> {
         let repo = gh::engine_overlay_repo();
         let releases = match self.gh.list_releases_repo(&repo).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("overlay fallback probe of {repo} failed: {e:#}");
-                return Ok(None);
+                return Ok(LagOutcome::NothingRunnable);
             }
         };
         let Some(pick_rel) = gh::newest_runnable_overlay(&releases, driver_cuda, sm, target) else {
-            return Ok(None);
+            return Ok(LagOutcome::NothingRunnable);
         };
-        let active = Store::open(&self.dirs)?.active_engine()?.map(|e| e.tag);
-        if Some(&pick_rel.tag_name) == active.as_ref() {
-            tracing::info!(
-                "newest runnable overlay build {} is already active",
-                pick_rel.tag_name
-            );
-            return Ok(None);
+        if let Some(row) = Store::open(&self.dirs)?.active_engine()? {
+            if row.tag == pick_rel.tag_name {
+                tracing::info!(
+                    "newest runnable overlay build {} is already active",
+                    pick_rel.tag_name
+                );
+                return Ok(LagOutcome::AlreadyActive(row));
+            }
         }
         let Some(pick) = gh::resolve_cuda_asset(pick_rel, driver_cuda, sm) else {
-            return Ok(None); // consistency guard; selection pre-filtered
+            return Ok(LagOutcome::NothingRunnable); // consistency guard; selection pre-filtered
         };
         let behind = target.saturating_sub(gh::btag_number(&pick_rel.tag_name).unwrap_or(0));
         tracing::warn!(
@@ -378,7 +411,7 @@ impl EngineManager {
             .install_picked(pick_rel, &pick)
             .await
             .with_context(|| format!("install overlay fallback {}", pick_rel.tag_name))?;
-        Ok(Some(row))
+        Ok(LagOutcome::Installed(row))
     }
 
     /// Fresh-asset retry loop shared by every update entry point.

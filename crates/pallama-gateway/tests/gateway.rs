@@ -2179,3 +2179,95 @@ async fn e2e__batch_jsonl_end_to_end() {
     }
     ts.state.sup.shutdown_all().await.unwrap();
 }
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__llamacpp_only_gate__non_llamacpp_kinds_get_teaching_400() {
+    // audit GAP-3: the gate used to fire only for mistralrs — an sglang
+    // child proxied /props, /slots, /api/session-save class requests to a
+    // bare upstream 404. Every NON-llamacpp kind must get the teaching
+    // 400 naming its kind; llamacpp passes the gate untouched. The gates
+    // read the store per request (only proxy's model-rewrite memoizes
+    // kind — F34 — and never these), so a post-boot row flip is live.
+    let ts = start(Config::default()).await;
+    let c = client();
+
+    // llamacpp active: the gate must stay silent. /props then fails on
+    // model resolution (no child, no header) — a DIFFERENT error that
+    // must not carry the gate's teaching.
+    let r = c.get(format!("{}/props", ts.base)).send().await.unwrap();
+    let text = r.text().await.unwrap();
+    assert!(
+        !text.contains("llama-server-only"),
+        "llamacpp must pass the gate: {text}"
+    );
+
+    let flip = |tag: &str, kind: pallama_core::engine_kind::EngineKind| {
+        ts.state.with_store(|s| {
+            s.upsert_engine(&pallama_core::EngineRow {
+                tag: tag.into(),
+                asset: "stub".into(),
+                sha256: "flip".into(),
+                installed_at: 2,
+                active: true,
+                manifest: "{}".into(),
+                kind,
+            })
+            .unwrap();
+            s.set_active_engine(tag).unwrap();
+        })
+    };
+
+    for (tag, kind, name) in [
+        (
+            "sglang-t",
+            pallama_core::engine_kind::EngineKind::Sglang,
+            "sglang",
+        ),
+        (
+            "mistralrs-t",
+            pallama_core::engine_kind::EngineKind::MistralRs,
+            "mistralrs",
+        ),
+    ] {
+        flip(tag, kind);
+        // openai surface: /props and friends teach with the kind named.
+        let r = c.get(format!("{}/props", ts.base)).send().await.unwrap();
+        assert_eq!(r.status(), 400, "{name} /props");
+        let v: serde_json::Value = r.json().await.unwrap();
+        let msg = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("llama-server-only") && msg.contains(name),
+            "{name} /props teaching: {msg}"
+        );
+        // ollama surface: slot KV checkpoint actions teach too...
+        let r = c
+            .post(format!("{}/api/session", ts.base))
+            .json(&serde_json::json!({"action": "save", "session": "s"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{name} session save");
+        let v: serde_json::Value = r.json().await.unwrap();
+        let msg = v.to_string();
+        assert!(
+            msg.contains("llama-server-only") && msg.contains(name),
+            "{name} session save teaching: {msg}"
+        );
+        // ...but `close` stays open — it releases a gateway-side pin,
+        // no slot surface involved (fails on unknown session instead).
+        let r = c
+            .post(format!("{}/api/session", ts.base))
+            .json(&serde_json::json!({"action": "close", "session": "nope"}))
+            .send()
+            .await
+            .unwrap();
+        let v: serde_json::Value = r.json().await.unwrap();
+        assert!(
+            !v.to_string().contains("llama-server-only"),
+            "{name} close must bypass the gate: {v}"
+        );
+    }
+
+    ts.state.sup.shutdown_all().await.unwrap();
+}

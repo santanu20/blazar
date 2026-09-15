@@ -2285,19 +2285,24 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
         return api_error(400, "action must be save, restore, erase or close");
     }
     // Slot KV checkpoints ride llama-server's --slot-save-path + POST
-    // /slots/{id}; mistralrs children have no slot surface. `close`
-    // stays open — it only releases a gateway-side session pin.
-    if action != "close"
-        && state
-            .with_store(|s| s.active_engine().ok().flatten())
-            .flatten()
-            .is_some_and(|e| e.kind == pallama_core::engine_kind::EngineKind::MistralRs)
-    {
-        return api_error(
-            400,
-            "slot KV checkpoints are llama-server-only; the active mistralrs engine \
-             does not implement /slots — switch with `pallama engine use <tag>`",
-        );
+    // /slots/{id}; non-llamacpp children (mistralrs, sglang) have no slot
+    // surface. `close` stays open — it only releases a gateway-side
+    // session pin.
+    let engine_kind = state
+        .with_store(|s| s.active_engine().ok().flatten())
+        .flatten()
+        .map(|e| e.kind);
+    if let Some(kind) = engine_kind {
+        if action != "close" && kind != pallama_core::engine_kind::EngineKind::LlamaCpp {
+            return api_error(
+                400,
+                &format!(
+                    "slot KV checkpoints are llama-server-only; the active {} engine \
+                     does not implement /slots — switch with `pallama engine use <tag>`",
+                    kind
+                ),
+            );
+        }
     }
     // Close releases a session PIN (R3) — no model, slot or checkpoint
     // involved; safe to run while children are asleep or absent.
