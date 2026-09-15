@@ -1,4 +1,4 @@
-//! `pallama` — llama.cpp orchestration platform.
+//! `pallama` — multi-engine local inference platform (llama.cpp, mistral.rs, SGLang).
 //!
 //! Local-only by design: no telemetry, no cloud endpoints; the only
 //! outbound traffic is user-initiated engine/model downloads. Powered by
@@ -28,8 +28,8 @@ use pallama_runtime::{LlamaCppEngine, MistralRsEngine, Supervisor};
 #[command(
     name = "pallama",
     version,
-    about = "llama.cpp orchestration: pallama-grade UX, zero engine fork",
-    after_help = "Quickstart: pallama pull <model> · pallama run <model> · pallama doctor\n\nLocal-only: no telemetry, no cloud endpoints. Powered by llama.cpp / ggml / ggerganov."
+    about = "multi-engine local inference: llama.cpp, mistral.rs and SGLang orchestrated behind one OpenAI + Ollama + Anthropic gateway",
+    after_help = "Quickstart: pallama pull <model> · pallama run <model> · pallama doctor\n\nLocal-only: no telemetry, no cloud endpoints. Powered by upstream llama.cpp, mistral.rs and SGLang — unmodified."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -538,7 +538,7 @@ fn render_grouped_help() -> String {
     let mut out = String::new();
     writeln!(
         out,
-        "pallama {} — llama.cpp orchestration: pallama-grade UX, zero engine fork",
+        "pallama {} — multi-engine local inference: llama.cpp, mistral.rs and SGLang orchestrated behind one OpenAI + Ollama + Anthropic gateway",
         env!("CARGO_PKG_VERSION")
     )
     .unwrap();

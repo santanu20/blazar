@@ -1,10 +1,10 @@
 # pallama
 
-**llama.cpp orchestration: pallama-grade UX, zero engine fork.**
+**Multi-engine local inference: llama.cpp, mistral.rs and SGLang orchestrated behind one OpenAI + Ollama + Anthropic gateway.**
 
-One Rust binary — `pallama` — that wraps upstream [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server`: official binaries, side-by-side versions, atomic switching, and a byte-stream gateway exposing both the **OpenAI** and **Ollama** APIs on port **11434** (drop-in `OLLAMA_HOST` replacement).
+One Rust binary — `pallama` — that orchestrates upstream engines unmodified: [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server` (GGUF models), [mistral.rs](https://github.com/EricLBuehler/mistral.rs) (HF-style safetensors) and [SGLang](https://github.com/sgl-project/sglang) (safetensors + AWQ/GPTQ on CUDA/ROCm) — official binaries, side-by-side versions, atomic switching, and a byte-stream gateway exposing the **OpenAI**, **Ollama** and **Anthropic** APIs on port **11434** (drop-in `OLLAMA_HOST` replacement).
 
-Local-only by design: **no telemetry, no cloud endpoints**; the only outbound traffic is user-initiated engine/model downloads. Powered by llama.cpp / ggml / ggerganov.
+Local-only by design: **no telemetry, no cloud endpoints**; the only outbound traffic is user-initiated engine/model downloads. Powered by the upstream engines, unmodified.
 
 ## Install
 
@@ -115,7 +115,7 @@ Capability discovery: `GET /.well-known/pallama` (routes, headers, features, eng
 | `engine build cuda\|cpu [--tag bNNNN] [--arch A] [--jobs N]` | Compile llama.cpp from an upstream tag when no prebuilt fits: auto GPU-arch (`nvidia-smi` compute cap), auto CUDA host-compiler match (nvcc 12 + gcc 13 → `g++-12`), installs as `bNNNN-cuda` through the same probe → activate flow. Closes the "no Linux-CUDA prebuilts upstream" gap with upstream's own in-tree ggml-cuda kernels |
 | `engine install --kind sglang [version]` | SGLang as a third engine kind for **safetensors models** (non-GGUF lane): uv/pip venv install pinned per release (`sglang==0.5.19` default, `ninja` bundled for flashinfer JIT, venv-PATH shim), Linux x86_64/aarch64 CUDA/ROCm. `pallama pull` grows a safetensors lane — whole-repo downloads (shards + config + tokenizer, LFS sha256-verified, `.part` resume) into `models/<name>.d/` dir rows. Same one-port gateway (`/api/chat`, `/api/generate`, OpenAI `/v1/*`, Anthropic `/v1/messages`) with zero client change. Low-VRAM ladder compiled at spawn: full → KV fp8 (`--kv-cache-dtype`) → CPU offload (`--cpu-offload-gb`, host-RAM-capped) → loud refusal with the numbers; ~20 first-class knobs under `models.<name>.sglang.*` + reserved-flag guard on `extra_args`; portability defaults (`--attention-backend triton --sampling-backend pytorch`, overridable) survive boxes where system nvcc can't compile flashinfer JIT. GGUF models keep using llamacpp/mistralrs — engine/model mismatches fail with teaching errors |
 | `engine install [--tag vX.Y.Z]` | mistral.rs as a second engine kind: prebuilt GPU-aware pick (newest `cudaNNN` the driver supports × exact compute cap, Metal on Apple Silicon, CPU otherwise — loud warn on fallback), activated as a `mistralrs`-kind row. Serving paths: OpenAI chat/completions/embeddings + Anthropic `/v1/messages` via the same gateway; llama-server-only surfaces (`/tokenize`, slot sessions, GBNF grammar, steering, rerank) answer a teaching 400 instead of breaking; decode-regression gate is llama-server-only and skipped with a printed note |
-| `config list/get/set` | One knob surface (validates on set) |
+| `config list/get/set/unset/defaults` | One knob surface (validates on set; unset restores built-in defaults) |
 | `cp <src> <dst>` / `create <name> -f Modelfile` | ollama-parity aliases: zero-byte hardlink + config overlay (no blob copies; unsupported Modelfile keys are named rejections) |
 | `run <model> [prompt…]` / `stop <model>` | inline single-shot generation (`--verbose` counts) / unload a model now |
 | `push` / `login` family | refused by design: local-only, no registry or cloud accounts |

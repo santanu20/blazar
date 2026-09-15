@@ -3,7 +3,7 @@ name = "pallama-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "pallama binary: llama.cpp orchestration platform CLI and daemon"
+description = "pallama binary: multi-engine local inference platform (llama.cpp, mistral.rs, SGLang) CLI and daemon"
 
 [[bin]]
 name = "pallama"
