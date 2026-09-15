@@ -640,8 +640,10 @@ ${SG_LINE}
 ${MH_LINE}
 Restart=always
 RestartSec=3
-# pallama serve exits 3 on a hard bind conflict (another server owns the
-# port) — that is never transient, so do not restart-loop it.
+# pallama serve exits 3 on hard singleton conflicts — another server
+# owns the port, or a live peer owns the daemon lock (e.g. a session
+# `pallama serve` while the unit is active). Neither is transient, so
+# do not restart-loop them.
 RestartPreventExitStatus=3
 
 [Install]

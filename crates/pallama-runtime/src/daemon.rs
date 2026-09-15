@@ -1,9 +1,25 @@
 //! Daemon lifecycle: pidfile guard and shutdown-signal handling.
 //! One daemon per data dir; a second start fails fast naming the pid.
+//! Refusals carry the [`LockHeld`] marker so the CLI can map them to the
+//! singleton-conflict exit code the systemd unit refuses to restart on.
 
 use anyhow::{anyhow, Context, Result};
 
 use pallama_core::PallamaDirs;
+
+/// Refusing to start because a live peer owns the daemon lock. Distinct
+/// error type so `pallama serve` can exit with the same hard-conflict
+/// code as a port bind conflict — `Restart=always` must not loop on it.
+#[derive(Debug)]
+pub struct LockHeld;
+
+impl std::fmt::Display for LockHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "daemon lock held by a live peer")
+    }
+}
+
+impl std::error::Error for LockHeld {}
 
 /// RAII daemon lock: `<run_dir>/pallama.pid`, removed on drop.
 #[derive(Debug)]
@@ -33,10 +49,10 @@ impl DaemonLock {
                     .and_then(|s| s.trim().parse().ok())
                     .unwrap_or(0);
                 if existing > 1 && process_alive(existing) {
-                    return Err(anyhow!(
+                    return Err(anyhow::Error::new(LockHeld).context(format!(
                         "pallama already running (pid {existing}); if this is wrong, remove {}",
                         path.display()
-                    ));
+                    )));
                 }
                 // Stale lock from a dead daemon: take over. F90: loop
                 // back through `create_new` instead of remove+plain-write
@@ -58,8 +74,8 @@ impl DaemonLock {
                         Ok(Self { path, pid })
                     }
                     // Lost the re-create race to a live successor: refuse.
-                    Err(_) => Err(anyhow!(
-                        "pallama already running (lock re-taken while replacing stale pidfile); retry"
+                    Err(_) => Err(anyhow::Error::new(LockHeld).context(
+                        "pallama already running (lock re-taken while replacing stale pidfile); retry",
                     )),
                 }
             }
@@ -229,6 +245,9 @@ mod tests {
         let err = DaemonLock::acquire(&d).unwrap_err();
         assert!(err.to_string().contains("already running"), "{err}");
         assert!(err.to_string().contains(&a.pid().to_string()));
+        // The marker rides the chain: the CLI maps it to the exit code
+        // the systemd unit refuses to restart on.
+        assert!(err.downcast_ref::<LockHeld>().is_some());
         drop(a);
         assert!(DaemonLock::acquire(&d).is_ok(), "released on drop");
     }

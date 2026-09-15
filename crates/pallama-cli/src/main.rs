@@ -3132,7 +3132,21 @@ async fn serve() -> Result<()> {
     let d = dirs();
     d.ensure().ok();
     let cfg = config()?;
-    let _lock = pallama_runtime::DaemonLock::acquire(&d).map_err(|e| anyhow!("{e}"))?;
+    // A live peer owning the daemon lock is the same hard singleton
+    // conflict as a port bind conflict: exit the code the systemd unit
+    // pins RestartPreventExitStatus to, or Restart=always crash-loops
+    // while a session-spawned daemon legitimately holds the lock.
+    let _lock = match pallama_runtime::DaemonLock::acquire(&d) {
+        Ok(lock) => lock,
+        Err(e) if e.downcast_ref::<pallama_runtime::LockHeld>().is_some() => {
+            eprintln!(
+                "pallama: {e:#} — another daemon owns the lock; if this is wrong, remove {}",
+                d.run_dir().join("pallama.pid").display()
+            );
+            std::process::exit(pallama_gateway::EXIT_BIND_CONFLICT);
+        }
+        Err(e) => return Err(e),
+    };
     rotate_daemon_log(&d);
     let store = Store::open(&d)?;
     // PALLAMA_ENGINE_PATH: register/refresh the local build and prefer it

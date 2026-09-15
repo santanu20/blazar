@@ -32,6 +32,7 @@ pub mod whisper;
 pub use bench::{parse_bench_json, BenchRow, Tuner};
 pub use daemon::{
     process_alive_by_pid, validate_parent_death_guard, wait_for_shutdown_signal, DaemonLock,
+    LockHeld,
 };
 pub use engine::gh::GhClient;
 pub use engine::manifest::{probe as probe_manifest, Manifest, Vendor};
