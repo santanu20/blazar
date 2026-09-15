@@ -537,4 +537,4 @@ Live harnesses (real engine, real model, no mocks):
 
 ## Credit
 
-Pallama is an orchestrator: all inference is upstream [llama.cpp](https://github.com/ggml-org/llama.cpp) — ggml, ggerganov and hundreds of contributors did the hard parts. Models come from their publishers on Hugging Face.
+Pallama is an orchestrator: inference is upstream [llama.cpp](https://github.com/ggml-org/llama.cpp) (ggml, ggerganov and hundreds of contributors), [mistral.rs](https://github.com/EricLBuehler/mistral.rs) and [SGLang](https://github.com/sgl-project/sglang) — the engine authors did the hard parts. Models come from their publishers on Hugging Face.

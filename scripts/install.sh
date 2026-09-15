@@ -735,7 +735,7 @@ EOF
         status "  pallama pull <model>    # e.g. pallama pull Qwen3-0.6B (find one: pallama search qwen3)"
     fi
     status "  pallama doctor          # health check with per-row hints"
-    status "All inference is upstream llama.cpp — ggml, ggerganov and contributors did the hard parts."
+    status "All inference is upstream llama.cpp, mistral.rs and SGLang — the engine authors did the hard parts."
 }
 
 

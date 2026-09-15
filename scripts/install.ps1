@@ -283,7 +283,7 @@ try {
         Write-Host ">>> restarted scheduled task '$TaskName' on the upgraded binary"
     }
     Write-Host '>>> system ready - check health: pallama doctor'
-    Write-Host '>>> All inference is upstream llama.cpp - ggml, ggerganov and contributors did the hard parts.'
+    Write-Host '>>> All inference is upstream llama.cpp, mistral.rs and SGLang - the engine authors did the hard parts.'
 } finally {
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }

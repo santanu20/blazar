@@ -964,9 +964,7 @@ pub async fn serve(
             let _ = state.http_addr.set((h, sa.port()));
         }
         tracing::info!("pallama listening on http://{addr} (OpenAI + ollama APIs)");
-        tracing::info!(
-            "powered by llama.cpp / ggml / ggerganov — https://github.com/ggml-org/llama.cpp"
-        );
+        tracing::info!("powered by upstream llama.cpp, mistral.rs and SGLang — unmodified engines");
         // TCP_NODELAY on every accepted socket: NDJSON/SSE streams are strings
         // of small writes, and with Nagle the first content packet waits for
         // the client's delayed ACK of the headers/role packet — a flat

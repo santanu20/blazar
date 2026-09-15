@@ -2,7 +2,7 @@
 //!
 //! Local-only by design: no telemetry, no cloud endpoints; the only
 //! outbound traffic is user-initiated engine/model downloads. Powered by
-//! llama.cpp / ggml / ggerganov — <https://github.com/ggml-org/llama.cpp>
+//! upstream llama.cpp, mistral.rs and SGLang — unmodified.
 
 use anyhow::{anyhow, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -563,7 +563,7 @@ fn render_grouped_help() -> String {
     .unwrap();
     writeln!(
         out,
-        "\nLocal-only: no telemetry, no cloud endpoints. Powered by llama.cpp / ggml / ggerganov."
+        "\nLocal-only: no telemetry, no cloud endpoints. Powered by upstream llama.cpp, mistral.rs and SGLang — unmodified."
     )
     .unwrap();
     out
@@ -599,7 +599,7 @@ fn main() {
 
 fn banner() {
     println!(
-        "pallama {} — powered by llama.cpp / ggml / ggerganov",
+        "pallama {} — powered by upstream llama.cpp, mistral.rs and SGLang",
         env!("CARGO_PKG_VERSION")
     );
 }
