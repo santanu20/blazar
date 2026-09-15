@@ -1,8 +1,8 @@
-//! `pallama` — multi-engine local inference platform (llama.cpp, mistral.rs, SGLang).
+//! `pallama` — multi-engine local inference platform (llama.cpp, mistral.rs, `SGLang`).
 //!
 //! Local-only by design: no telemetry, no cloud endpoints; the only
 //! outbound traffic is user-initiated engine/model downloads. Powered by
-//! upstream llama.cpp, mistral.rs and SGLang — unmodified.
+//! upstream llama.cpp, mistral.rs and `SGLang` — unmodified.
 
 use anyhow::{anyhow, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -266,6 +266,7 @@ enum Cmd {
     },
     /// Search Hugging Face for GGUF repos (multiple words are joined)
     Search {
+        /// Search query (HF + registry lanes); omit to browse popular models
         #[arg(trailing_var_arg = true, num_args = 1..)]
         query: Vec<String>,
     },
@@ -333,11 +334,26 @@ enum Cmd {
 #[derive(Subcommand)]
 enum SessionCmd {
     /// Checkpoint the current slot state of a loaded model
-    Save { model: String, name: String },
+    Save {
+        /// Model whose live slot to checkpoint
+        model: String,
+        /// Checkpoint name to save under
+        name: String,
+    },
     /// Load a checkpoint back into the model's slot
-    Restore { model: String, name: String },
+    Restore {
+        /// Model to restore the checkpoint into
+        model: String,
+        /// Checkpoint name to load
+        name: String,
+    },
     /// Delete a checkpoint file
-    Rm { model: String, name: String },
+    Rm {
+        /// Model that owns the checkpoint
+        model: String,
+        /// Checkpoint name to delete
+        name: String,
+    },
     /// List checkpoints for a model
     #[command(alias = "ls")]
     List { model: String },
@@ -441,8 +457,11 @@ enum LoraCmd {
         path: PathBuf,
         #[arg(default_value = "1.0")]
         scale: f64,
+        /// Model row the adapter attaches to
     },
+        /// Path to the `LoRA` adapter file
     Rm {
+        /// Merge scale applied to the adapter
         id: i64,
     },
     List {
@@ -1668,6 +1687,24 @@ fn doctor_next_steps(checks: &[Check]) -> Vec<String> {
         .iter()
         .any(|c| c.name == "models" && c.ok && c.detail.starts_with("0 pulled"));
     let mut steps = Vec::new();
+    #[test]
+    fn unit__quantize_temp__drop_removes_partial_defuse_keeps() {
+        let dir = std::env::temp_dir();
+        // Armed guard: any early return drops the partial write with it.
+        let armed = QuantizeTemp::new(&dir, "unit-qt-armed");
+        let armed_path = armed.path.clone();
+        std::fs::write(&armed_path, b"partial").unwrap();
+        drop(armed);
+        assert!(!armed_path.exists(), "partial must be removed on drop");
+        // Defused guard: the promoted rename survives the drop.
+        let done = QuantizeTemp::new(&dir, "unit-qt-done");
+        let done_path = done.path.clone();
+        std::fs::write(&done_path, b"complete").unwrap();
+        done.defuse();
+        assert!(done_path.exists(), "defused temp must survive drop");
+        let _ = std::fs::remove_file(&done_path);
+    }
+
     if !port_up {
         steps.push("start the daemon: pallama serve (or: systemctl start pallama)".to_string());
     }
@@ -3286,7 +3323,6 @@ mod signal_stop {
 }
 
 async fn pull(target: &str) -> Result<()> {
-    banner();
     let (row, already_present) = pull_model(target).await?;
     if already_present {
         println!(
@@ -3335,6 +3371,9 @@ async fn pull_model(target: &str) -> Result<(pallama_core::store::ModelRow, bool
     let outcome = tokio::select! {
         r = puller.route_pull(target) => r?,
         () = pallama_runtime::events::interrupted() => {
+    // Banner only on success: an upgrade hint decorating a pull FAILURE
+    // reads as noise (fit/mmproj already follow this order).
+    banner();
             return Err(anyhow::anyhow!(
                 "pull interrupted — partial file kept; re-run `pallama pull {target}` to resume"
             ));
@@ -4399,6 +4438,41 @@ fn quantize_cmd(
             );
             let im = pallama_runtime::quantize::imatrix(
                 &ibin,
+///
+/// RAII guard for a partially written quantization output: the child writes
+/// to a hidden sibling (`.name.gguf.part-<pid>`) and only an atomic rename
+/// promotes it to the final name. Any early return — child failure, verify
+/// gate, unreadable GGUF — drops the guard and removes the partial file, so
+/// an interrupted `quantize` never leaves an orphan at the destination that
+/// blocks the next run with "output already exists".
+struct QuantizeTemp {
+    path: std::path::PathBuf,
+    armed: bool,
+}
+
+impl QuantizeTemp {
+    fn new(models_dir: &std::path::Path, out_name: &str) -> Self {
+        Self {
+            path: models_dir.join(format!(".{out_name}.gguf.part-{}", std::process::id())),
+            armed: true,
+        }
+    }
+
+    /// Disarm after the atomic rename succeeded — the file now lives at the
+    /// destination and must survive.
+    fn defuse(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for QuantizeTemp {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
                 std::path::Path::new(&row.path),
                 calib,
                 &ipath,
@@ -4428,6 +4502,7 @@ fn quantize_cmd(
     // a failing output is deleted and never registered.
     if let Some(max_degradation_pct) = verify_gate_pct {
         let pbin = pallama_runtime::quantize::find_perplexity_bin(&d)?;
+    let tmp = QuantizeTemp::new(&d.models_dir(), &out_name);
         let probe = pallama_runtime::quantize::write_verify_probe(&d)?;
         println!("verify: perplexity pass 1/2 (base) — full forward passes, this takes a while...");
         let base_ppl = pallama_runtime::quantize::perplexity(
@@ -4505,6 +4580,12 @@ async fn launch_cmd(command: Vec<String>, warm: Option<String>, key: Option<Stri
     let base = ensure_daemon().await?;
     if let Some(model) = &warm {
         println!("pre-warming {model} ...");
+    // Atomic promote: same-filesystem rename makes the final name appear
+    // only as a complete, validated GGUF; the RAII guard is defused so the
+    // (now moved) temp path is not cleaned up on drop.
+    std::fs::rename(&out, &dst)
+        .map_err(|e| anyhow!("promote {} -> {}: {e}", out.display(), dst.display()))?;
+    tmp.defuse();
         let resp = cli_http()
             .post(format!("{base}/v1/chat/completions"))
             .json(&serde_json::json!({
@@ -4734,15 +4815,15 @@ fn coreside_cmd() -> Result<()> {
         });
     }
     let (resident, deferred) = pallama_core::coreside::plan(&fps, vram);
-    println!("VRAM {vram} MiB — co-residency plan (weights + KV @ ctx, 512 MiB headroom; unified = RAM-hosted KV, VRAM floor 512M):");
+    println!("VRAM {vram} MiB — co-residency plan (weights + KV @ ctx; KV is device-backed on both lanes, --kv-unified shares one buffer across sequences; 512 MiB headroom):");
     println!(
         "{:<24} {:>8} {:>9} {:>7}",
         "MODEL", "WEIGHTS", "KV@CTX", "CTX"
     );
     for f in &resident {
         println!(
-            "{:<24} {:>7}M {:>8}M {:>7}",
-            f.name, f.weights_mib, f.kv_mib, f.ctx
+            "{:<24} {:>7}M {:>9} {:>7}",
+            f.name, f.weights_mib, kv_disp, f.ctx
         );
     }
     if deferred.is_empty() {
@@ -4751,8 +4832,8 @@ fn coreside_cmd() -> Result<()> {
         println!("deferred (swap in on demand):");
         for f in &deferred {
             println!(
-                "{:<24} {:>7}M {:>8}M {:>7}",
-                f.name, f.weights_mib, f.kv_mib, f.ctx
+                "{:<24} {:>7}M {:>9} {:>7}",
+                f.name, f.weights_mib, kv_disp, f.ctx
             );
         }
     }
@@ -4787,6 +4868,12 @@ async fn whisper_cmd(
     if list {
         match pallama_runtime::whisper::server_bin(&d) {
             Some((bin, _)) => {
+        // 0 = unmeasurable (HF rows / unreadable GGUF) — never-guess dash
+        let kv_disp = if f.kv_mib > 0 {
+            format!("{}M", f.kv_mib)
+        } else {
+            "-".to_string()
+        };
                 let tag = bin
                     .parent()
                     .and_then(|p| p.parent())
@@ -4797,6 +4884,11 @@ async fn whisper_cmd(
                 } else {
                     ""
                 };
+            let kv_disp = if f.kv_mib > 0 {
+                format!("{}M", f.kv_mib)
+            } else {
+                "-".to_string()
+            };
                 println!("server: {tag}{pin} ({})", bin.display());
             }
             None => println!("server: not installed (pallama whisper --install)"),
@@ -5592,6 +5684,9 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
         EngineCmd::Rm { tag } => {
             engine_rm(&d, &tag)?;
         }
+    // llama-bench loads the full model before its first row appears —
+    // say so or the probe reads as a silent multi-second hang.
+    println!("probing decode (tg128; loads the model first, ~30-60s)...");
         EngineCmd::Rollback => {
             let mgr = local_engine_manager(&d)?;
             let row = mgr.rollback()?;

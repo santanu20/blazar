@@ -195,7 +195,17 @@ impl HfClient {
         match resp.status() {
             reqwest::StatusCode::OK => {}
             reqwest::StatusCode::NOT_FOUND => {
-                return Err(anyhow!("no such model: {repository}:{tag}"));
+                // The registry serves no tag listing (module doc), so a
+                // 404 here conflates "no such repository" with "repo
+                // exists, quant tag miss" — teach both plus the HF
+                // search lane instead of echoing the library/ prefix the
+                // user never typed.
+                let display = repository.strip_prefix("library/").unwrap_or(repository);
+                return Err(anyhow!(
+                    "no such model or tag: {display}:{tag} — both the name and the quant tag \
+                     must exist and the registry serves no tag listing; check spelling or run \
+                     `pallama search {display}` to discover variants"
+                ));
             }
             other => {
                 return Err(anyhow!("registry manifest {other} for {repository}:{tag}"));
