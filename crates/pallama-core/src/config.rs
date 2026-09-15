@@ -205,6 +205,14 @@ pub struct Config {
     /// (`--lookup-cache-dynamic`, one file per model).
     #[serde(default = "default_true")]
     pub spec_cache: bool,
+    /// Warm-peg JIT-class engines (sglang) at spawn: after /health turns
+    /// 200, fire one tiny single completion (drains the residual warmup
+    /// queue) plus a small concurrent burst (pegs the bs=N batch shapes)
+    /// BEFORE Ready publishes — the JIT cost lands in spawn instead of on
+    /// a random first request. No-op for engines that ship precompiled
+    /// kernels (llamacpp/mistralrs).
+    #[serde(default = "default_true")]
+    pub warm_after_spawn: bool,
     /// `YaRN` `RoPE` context-extension factor: 0 = off; e.g. 2.0 doubles the
     /// usable context beyond the trained window at some quality cost.
     #[serde(default)]
@@ -1650,6 +1658,7 @@ impl Default for Config {
             singleflight: true,
             prompt_preflight: true,
             spec_cache: true,
+            warm_after_spawn: true,
             ctx_extend: 0.0,
             cpu_moe_n: 0,
             cpu_ffn_n: 0,

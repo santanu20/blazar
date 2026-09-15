@@ -282,6 +282,108 @@ fn split_replica(key: &str) -> Option<(&str, u32)> {
 
 use crate::engine_impl::{ChildHandle, Engine};
 
+/// Post-spawn warm-peg for JIT-class engines (sglang): the child's
+/// /health flips 200 BEFORE residual warmup drains — the first user
+/// request then eats a ~30s queue (measured live: first post-boot TTFT
+/// 29.9s vs 0.04s warm) and the first concurrent batch pays another
+/// shape-JIT penalty (first bs=4 burst 4.4s vs 0.13s on a warm engine).
+/// One tiny single completion drains the queue; `concurrency` tiny
+/// concurrent completions peg the bs=N batch shapes (triton JIT /
+/// graph capture). Runs INSIDE spawn, before Ready publishes, so the
+/// cost lands where it belongs instead of on a random first request.
+/// Warn-and-continue: a failed peg never fails an otherwise healthy
+/// child — the next request pays the JIT instead.
+async fn warm_peg_sglang(
+    model: &str,
+    endpoint: &pallama_core::Endpoint,
+    auth: Option<&str>,
+    concurrency: usize,
+) {
+    let (host, port) = match endpoint {
+        pallama_core::Endpoint::Tcp { host, port } => (host, *port),
+        // sglang is TCP-only (SglangEngine::spawn rejects unix); same
+        // guard as bank_restore_post for symmetry.
+        pallama_core::Endpoint::Unix { .. } => return,
+    };
+    let url = format!("http://{host}:{port}/v1/chat/completions");
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": "Reply with: OK" }],
+        "max_tokens": 4,
+        "stream": false,
+    });
+    let client = reqwest::Client::new();
+    let started = std::time::Instant::now();
+    // Single probe first: drains the residual warmup queue (up to ~30s
+    // on a cold venv+torch boot; generous bound so a slow-but-healthy
+    // child is still pegged, not abandoned).
+    let mut single = client
+        .post(&url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(90));
+    if let Some(secret) = auth {
+        single = single.bearer_auth(secret);
+    }
+    match single.send().await {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => {
+            tracing::warn!(
+                target: "pallama::warmpeg",
+                model,
+                "warm-peg single probe HTTP {} — leaving warmup to the first request",
+                resp.status()
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "pallama::warmpeg",
+                model,
+                "warm-peg single probe failed: {e:#} — leaving warmup to the first request"
+            );
+            return;
+        }
+    }
+    let single_s = started.elapsed().as_secs_f32();
+    // Concurrent peg: N in-flight completions at once so the bs=N
+    // decode/prefill shapes are captured together. JoinSet keeps the
+    // probes genuinely parallel (sequential awaits would serialize and
+    // peg only bs=1 again).
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..concurrency.max(1) {
+        let mut req = client
+            .post(&url)
+            .json(&body)
+            .timeout(std::time::Duration::from_mins(1));
+        if let Some(secret) = auth {
+            req = req.bearer_auth(secret);
+        }
+        set.spawn(async move { req.send().await.is_ok_and(|r| r.status().is_success()) });
+    }
+    let mut failed = 0usize;
+    while let Some(res) = set.join_next().await {
+        if !res.unwrap_or(false) {
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        tracing::warn!(
+            target: "pallama::warmpeg",
+            model,
+            "warm-peg: {failed}/{} concurrent probes failed — first concurrent batch may still pay shape JIT",
+            concurrency.max(1)
+        );
+    } else {
+        tracing::info!(
+            target: "pallama::warmpeg",
+            model,
+            concurrency = concurrency.max(1),
+            "spawn warm-peg done in {:.1}s (single {single_s:.1}s + concurrent burst) — first request arrives warm",
+            started.elapsed().as_secs_f32()
+        );
+    }
+}
+
 /// Typed failures the gateway maps onto HTTP statuses.
 #[derive(Debug, thiserror::Error)]
 pub enum SupervisionError {
@@ -2346,6 +2448,32 @@ impl Supervisor {
                         let _ = child.reap().await;
                         continue;
                     }
+                    // Warm-peg (sglang only): drain residual JIT warmup
+                    // and peg concurrent batch shapes BEFORE Ready
+                    // publishes. Gated on engine kind — llamacpp/
+                    // mistralrs ship precompiled kernels and pay
+                    // nothing, so pegging them would only add spawn
+                    // latency. Burst width mirrors the compiled slots
+                    // (unpinned slots peg the auto default of 4).
+                    if self.config.warm_after_spawn
+                        && self.engine.kind() == pallama_core::engine_kind::EngineKind::Sglang
+                    {
+                        let peg_n = argv
+                            .windows(2)
+                            .find_map(|w| {
+                                (w[0] == "--max-running-requests")
+                                    .then(|| w[1].parse::<usize>().unwrap_or(4))
+                            })
+                            .map_or(4, |v| v.clamp(1, 8));
+                        warm_peg_sglang(
+                            &model.name,
+                            &endpoint,
+                            auth.as_ref().map(|a| a.secret.as_str()),
+                            peg_n,
+                        )
+                        .await;
+                    }
+
                     // NEVER default the pid: a 0 here would later target
                     // process group 0 (the whole session) on teardown.
                     let pid = child.id().ok_or_else(|| {
@@ -4117,6 +4245,27 @@ mod routing_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].gpu, "full");
         assert_eq!(rows[0].device.as_deref(), Some("RTX 4070"));
+    }
+
+    #[tokio::test]
+    async fn unit__warm_peg_sglang__unix_endpoint_noop_fast() {
+        // sglang is TCP-only; a unix endpoint must return instantly
+        // without touching the network — the fail-fast guard before any
+        // HTTP machinery spins up.
+        let started = std::time::Instant::now();
+        warm_peg_sglang(
+            "m",
+            &Endpoint::Unix {
+                socket: "/tmp/pallama-test.sock".into(),
+            },
+            None,
+            4,
+        )
+        .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "unix guard returns without HTTP"
+        );
     }
 
     #[tokio::test]
