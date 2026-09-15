@@ -269,6 +269,20 @@ fn normalize_tool_call_types(messages: &Value) -> Value {
                 fixed.push(c);
             }
         }
+        // ollama's dialect sends `arguments` as a PARSED object; the child
+        // demands a JSON STRING. Clients that capture our ollama-shape
+        // responses replay them verbatim, so stringify object arguments
+        // on the way in.
+        for call in &mut fixed {
+            if let Some(args) = call
+                .get_mut("function")
+                .and_then(|f| f.get_mut("arguments"))
+            {
+                if args.is_object() {
+                    *args = Value::String(args.to_string());
+                }
+            }
+        }
         m["tool_calls"] = Value::Array(fixed);
         out.push(m);
     }
@@ -431,8 +445,25 @@ pub fn openai_chat_to_ollama(model: &str, openai: &Value) -> Value {
     let choice = &openai["choices"][0];
     let message = &choice["message"];
     let mut msg = json!({"role": "assistant", "content": message["content"].clone()});
-    if let Some(tc) = message.get("tool_calls") {
-        msg["tool_calls"] = tc.clone();
+    if let Some(tc) = message.get("tool_calls").and_then(Value::as_array) {
+        // Ollama dialect: `index` inside `function`, `arguments` as a
+        // PARSED object (the child returns a JSON string). Clients replay
+        // these verbatim, so the shape must match ollama's exactly.
+        let calls = tc
+            .iter()
+            .enumerate()
+            .map(|(i, call)| {
+                let f = &call["function"];
+                let raw = f["arguments"].as_str().unwrap_or("");
+                let args =
+                    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
+                json!({
+                    "id": call["id"].clone(),
+                    "function": {"index": i, "name": f["name"].clone(), "arguments": args},
+                })
+            })
+            .collect::<Vec<_>>();
+        msg["tool_calls"] = Value::Array(calls);
     }
     if let Some(reasoning) = message.get("reasoning_content") {
         msg["thinking"] = reasoning.clone();
@@ -466,9 +497,105 @@ pub fn openai_chat_to_ollama(model: &str, openai: &Value) -> Value {
     v
 }
 
+/// Accumulates `OpenAI` streaming `tool_call` fragments into complete calls.
+#[derive(Default)]
+pub struct ToolCallAccum {
+    calls: Vec<Value>,
+}
+
+impl ToolCallAccum {
+    /// Merge one delta's `tool_calls` array (keyed by `index`).
+    fn absorb(&mut self, fragments: &[Value]) {
+        for frag in fragments {
+            let idx = frag
+                .get("index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .try_into()
+                .unwrap_or(usize::MAX);
+            while self.calls.len() <= idx {
+                let i = self.calls.len();
+                self.calls.push(json!({
+                    "id": null,
+                    "function": {"index": i, "name": null, "arguments": ""},
+                }));
+            }
+            let slot = &mut self.calls[idx];
+            if let Some(id) = frag.get("id").and_then(Value::as_str) {
+                slot["id"] = Value::String(id.to_string());
+            }
+            if let Some(f) = frag.get("function") {
+                if let Some(n) = f.get("name").and_then(Value::as_str) {
+                    slot["function"]["name"] = Value::String(n.to_string());
+                }
+                if let Some(a) = f.get("arguments").and_then(Value::as_str) {
+                    let joined = format!(
+                        "{}{a}",
+                        slot["function"]["arguments"].as_str().unwrap_or("")
+                    );
+                    slot["function"]["arguments"] = Value::String(joined);
+                }
+            }
+        }
+    }
+
+    /// True while merged calls await their flush.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.calls.is_empty()
+    }
+
+    /// Flush merged calls as a ready-to-write NDJSON line (with newline).
+    #[must_use]
+    pub fn flush_line(&mut self, model: &str) -> Option<String> {
+        self.flush()
+            .map(|calls| format!("{}\n", tool_calls_line(model, &calls)))
+    }
+
+    /// Drain merged calls as one ollama-dialect `tool_calls` array.
+    /// Malformed accumulated arguments (broken model output) fall back to
+    /// the raw string instead of failing the stream.
+    fn flush(&mut self) -> Option<Value> {
+        if self.calls.is_empty() {
+            return None;
+        }
+        let calls = std::mem::take(&mut self.calls);
+        let mut out = Vec::with_capacity(calls.len());
+        for mut call in calls {
+            let raw = call["function"]["arguments"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            call["function"]["arguments"] = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(_) => Value::String(raw),
+            };
+            out.push(call);
+        }
+        Some(Value::Array(out))
+    }
+}
+
+fn tool_calls_line(model: &str, calls: &Value) -> Value {
+    json!({
+        "model": model,
+        "created_at": iso_now(),
+        "message": {"role": "assistant", "tool_calls": calls},
+        "done": false,
+    })
+}
+
 /// One `OpenAI` SSE chunk -> zero or more ollama NDJSON lines.
+///
+/// Tool-call deltas are MERGED across chunks: ollama-native streaming
+/// emits each call exactly once, complete, in ollama dialect
+/// (`{id, function: {index, name, arguments: <parsed object>}}`), while
+/// the child streams fragments (id+name first, argument shards after).
+/// Clients built for the ollama wire (e.g. geokit's compare harness)
+/// `extend()` fragments verbatim and replay them, which the child rejects
+/// ("Missing tool call name") — merging at the edge restores the contract.
 #[must_use]
-pub fn openai_chunk_to_ollama(model: &str, chunk: &Value) -> Vec<Value> {
+pub fn openai_chunk_to_ollama(accum: &mut ToolCallAccum, model: &str, chunk: &Value) -> Vec<Value> {
     let mut out = Vec::new();
     if let Some(choices) = chunk["choices"].as_array() {
         for choice in choices {
@@ -479,7 +606,22 @@ pub fn openai_chunk_to_ollama(model: &str, chunk: &Value) -> Vec<Value> {
             let has_thinking = delta
                 .get("reasoning_content")
                 .is_some_and(|c| c.as_str().is_some_and(|s| !s.is_empty()));
-            if has_content || has_thinking || delta.get("tool_calls").is_some() {
+            let fragments = delta
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .filter(|a| !a.is_empty());
+            // A non-tool delta after fragments means the call is complete —
+            // flush the merged calls as their own line first.
+            if fragments.is_none() && !accum.is_empty() {
+                if let Some(merged) = accum.flush() {
+                    out.push(tool_calls_line(model, &merged));
+                }
+            }
+            if let Some(frags) = fragments {
+                accum.absorb(frags);
+                continue;
+            }
+            if has_content || has_thinking {
                 let mut msg = json!({"role": "assistant"});
                 if let Some(c) = delta.get("content") {
                     if c.as_str().is_some_and(|s| !s.is_empty()) {
@@ -488,9 +630,6 @@ pub fn openai_chunk_to_ollama(model: &str, chunk: &Value) -> Vec<Value> {
                 }
                 if let Some(rc) = delta.get("reasoning_content") {
                     msg["thinking"] = rc.clone();
-                }
-                if let Some(tc) = delta.get("tool_calls") {
-                    msg["tool_calls"] = tc.clone();
                 }
                 let mut line = json!({
                     "model": model,
@@ -1023,21 +1162,56 @@ mod tests {
     #[test]
     fn unit__openai_chunk_to_ollama__content_and_tool_deltas() {
         let c1 = json!({"choices": [{"delta": {"content": "he"}}]});
-        let c2 = json!({"choices": [{"delta": {"tool_calls": [{"id": "t1", "function": {"name": "f", "arguments": "{\"a\""}}]}}]});
+        let c2 = json!({"choices": [{"delta": {"tool_calls": [{"id": "t1", "function": {"name": "f", "arguments": "{\"a"}}]}}]});
+        let c2b = json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "\":1}"}}]}}]});
         let c3 = json!({"choices": [{"delta": {}}]});
-        let o1 = openai_chunk_to_ollama("m", &c1);
+        let o1 = openai_chunk_to_ollama(&mut ToolCallAccum::default(), "m", &c1);
         assert_eq!(o1.len(), 1);
         assert_eq!(o1[0]["message"]["content"], "he");
         assert_eq!(o1[0]["done"], false);
-        let o2 = openai_chunk_to_ollama("m", &c2);
+        // Fragments MERGE: the id+name delta absorbs, the argument shard
+        // appends, and the empty delta after them flushes ONE complete
+        // ollama-dialect call (index inside function, parsed arguments).
+        let mut acc = ToolCallAccum::default();
+        assert!(openai_chunk_to_ollama(&mut acc, "m", &c2).is_empty());
+        assert!(openai_chunk_to_ollama(&mut acc, "m", &c2b).is_empty());
+        let o2 = openai_chunk_to_ollama(&mut acc, "m", &c3);
         assert_eq!(o2.len(), 1);
-        assert!(o2[0]["message"]["tool_calls"].is_array());
+        let call = &o2[0]["message"]["tool_calls"][0];
+        assert_eq!(call["id"], "t1");
+        assert_eq!(call["function"]["name"], "f");
+        assert_eq!(call["function"]["index"], 0);
+        assert_eq!(call["function"]["arguments"], json!({"a": 1}));
+        assert_eq!(o2[0]["done"], false);
         // Thinking deltas (reasoning_content) map to message.thinking.
         let c4 = json!({"choices": [{"delta": {"reasoning_content": "hmm"}}]});
-        let o4 = openai_chunk_to_ollama("m", &c4);
+        let o4 = openai_chunk_to_ollama(&mut ToolCallAccum::default(), "m", &c4);
         assert_eq!(o4.len(), 1);
         assert_eq!(o4[0]["message"]["thinking"], "hmm");
-        assert!(openai_chunk_to_ollama("m", &c3).is_empty());
+        assert!(openai_chunk_to_ollama(&mut ToolCallAccum::default(), "m", &c3).is_empty());
+    }
+
+    #[test]
+    fn unit__tool_call_accum__parallel_indexes_and_malformed_fallback() {
+        let mut acc = ToolCallAccum::default();
+        acc.absorb(&[
+            json!({"index": 0, "id": "a", "function": {"name": "fa", "arguments": "{\"x\":"}}),
+        ]);
+        acc.absorb(&[
+            json!({"index": 1, "id": "b", "function": {"name": "fb", "arguments": "not-json"}}),
+        ]);
+        acc.absorb(&[json!({"index": 0, "function": {"arguments": "1}"}})]);
+        let line = acc.flush_line("m").unwrap();
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        let calls = v["message"]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["function"]["name"], "fa");
+        assert_eq!(calls[0]["function"]["arguments"], json!({"x": 1}));
+        // Malformed accumulated arguments fall back to the raw string.
+        assert_eq!(calls[1]["function"]["arguments"], "not-json");
+        assert_eq!(calls[1]["function"]["index"], 1);
+        assert!(acc.is_empty());
+        assert!(acc.flush_line("m").is_none());
     }
 
     #[test]
@@ -1211,9 +1385,12 @@ mod tests {
         let call = &out["messages"][1]["tool_calls"][0];
         assert_eq!(call["type"], "function", "type filled");
         assert_eq!(call["function"]["name"], "compute_geochem");
+        // ollama sends `arguments` as a parsed object; the child demands a
+        // JSON string — the request translator stringifies it.
+        let want_args = json!({"query": "Mg# Fo=90"}).to_string();
         assert_eq!(
-            call["function"]["arguments"]["query"], "Mg# Fo=90",
-            "function body untouched"
+            call["function"]["arguments"], want_args,
+            "arguments stringified for the child"
         );
         // Explicit type is preserved verbatim (never overwritten), and
         // empty-string type is treated as absent (children reject "").
@@ -1323,13 +1500,13 @@ mod tests {
                 ]}
             }]
         });
-        let lines = openai_chunk_to_ollama("m", &chunk);
+        let lines = openai_chunk_to_ollama(&mut ToolCallAccum::default(), "m", &chunk);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0]["logprobs"][0]["token"], "h");
         assert_eq!(lines[0]["logprobs"][0]["logprob"], -0.1);
         // No logprobs on the chunk: line stays lean.
         let bare = json!({"choices": [{"delta": {"content": "h"}}]});
-        let lines2 = openai_chunk_to_ollama("m", &bare);
+        let lines2 = openai_chunk_to_ollama(&mut ToolCallAccum::default(), "m", &bare);
         assert_eq!(lines2.len(), 1);
         assert!(lines2[0].get("logprobs").is_none());
     }

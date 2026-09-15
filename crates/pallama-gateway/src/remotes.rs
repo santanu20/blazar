@@ -472,6 +472,7 @@ pub async fn ollama_chat_remote(
             None::<String>,
             false,
             std::sync::Arc::clone(&clock),
+            crate::translate::ToolCallAccum::default(),
         ),
         |(
             mut stream,
@@ -483,6 +484,7 @@ pub async fn ollama_chat_remote(
             mut finish,
             mut usage_sent,
             clock,
+            mut tool_accum,
         )| async move {
             loop {
                 if done && !usage_sent {
@@ -502,10 +504,14 @@ pub async fn ollama_chat_remote(
                         total_ns,
                     );
                     usage_sent = true;
+                    let flush_prefix = tool_accum.flush_line(&model).unwrap_or_default();
                     return Some((
-                        Ok(axum::body::Bytes::from(format!("{final_chunk}\n"))),
+                        Ok(axum::body::Bytes::from(format!(
+                            "{flush_prefix}{final_chunk}\n"
+                        ))),
                         (
                             stream, buf, lines, model, done, usage, finish, usage_sent, clock,
+                            tool_accum,
                         ),
                     ));
                 }
@@ -527,7 +533,13 @@ pub async fn ollama_chat_remote(
                         }
                         let ndjson_lines: Vec<String> = events
                             .iter()
-                            .flat_map(|ev| crate::translate::openai_chunk_to_ollama(&model, ev))
+                            .flat_map(|ev| {
+                                crate::translate::openai_chunk_to_ollama(
+                                    &mut tool_accum,
+                                    &model,
+                                    ev,
+                                )
+                            })
                             .map(|v| format!("{v}\n"))
                             .collect();
                         if ndjson_lines.is_empty() {
@@ -537,6 +549,7 @@ pub async fn ollama_chat_remote(
                             Ok(axum::body::Bytes::from(ndjson_lines.join(""))),
                             (
                                 stream, buf, lines, model, done, usage, finish, usage_sent, clock,
+                                tool_accum,
                             ),
                         ));
                     }
@@ -545,6 +558,7 @@ pub async fn ollama_chat_remote(
                             Err(std::io::Error::other(e.to_string())),
                             (
                                 stream, buf, lines, model, done, usage, finish, usage_sent, clock,
+                                tool_accum,
                             ),
                         ));
                     }

@@ -1529,6 +1529,7 @@ async fn proxy_core_chat(
             std::sync::Arc::clone(&clock),
             std::sync::Arc::clone(&state.obs),
             shape,
+            tr::ToolCallAccum::default(),
         ),
         |(
             mut stream,
@@ -1542,6 +1543,7 @@ async fn proxy_core_chat(
             clock,
             obs,
             shape,
+            mut tool_accum,
         )| async move {
             loop {
                 if done && !usage_sent {
@@ -1584,11 +1586,14 @@ async fn proxy_core_chat(
                         ),
                     };
                     usage_sent = true;
+                    // A stream that ended mid-call (no post-fragment chunk)
+                    // still owes the client its merged tool_calls line.
+                    let flush_prefix = tool_accum.flush_line(&model).unwrap_or_default();
                     return Some((
-                        Ok(Bytes::from(format!("{final_chunk}\n"))),
+                        Ok(Bytes::from(format!("{flush_prefix}{final_chunk}\n"))),
                         (
                             stream, buf, lines, model, done, usage, finish, usage_sent, clock, obs,
-                            shape,
+                            shape, tool_accum,
                         ),
                     ));
                 }
@@ -1613,7 +1618,9 @@ async fn proxy_core_chat(
                         let ndjson_lines: Vec<String> = events
                             .iter()
                             .flat_map(|ev| match shape {
-                                OutputShape::Chat => tr::openai_chunk_to_ollama(&model, ev),
+                                OutputShape::Chat => {
+                                    tr::openai_chunk_to_ollama(&mut tool_accum, &model, ev)
+                                }
                                 OutputShape::Generate => tr::openai_chunk_to_generate(&model, ev),
                             })
                             .map(|v| format!("{v}\n"))
@@ -1626,7 +1633,7 @@ async fn proxy_core_chat(
                             Ok(Bytes::from(body)),
                             (
                                 stream, buf, lines, model, done, usage, finish, usage_sent, clock,
-                                obs, shape,
+                                obs, shape, tool_accum,
                             ),
                         ));
                     }
@@ -1635,7 +1642,7 @@ async fn proxy_core_chat(
                             Err(std::io::Error::other(e.to_string())),
                             (
                                 stream, buf, lines, model, done, usage, finish, usage_sent, clock,
-                                obs, shape,
+                                obs, shape, tool_accum,
                             ),
                         ));
                     }
