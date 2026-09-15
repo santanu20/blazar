@@ -23,6 +23,7 @@ hyper-util = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+dashmap = { workspace = true }
 getrandom = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

@@ -31,6 +31,7 @@ use axum::http::{Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::serve::ListenerExt;
 use axum::Router;
 
 use pallama_core::ApiKey;
@@ -966,6 +967,15 @@ pub async fn serve(
         tracing::info!(
             "powered by llama.cpp / ggml / ggerganov — https://github.com/ggml-org/llama.cpp"
         );
+        // TCP_NODELAY on every accepted socket: NDJSON/SSE streams are strings
+        // of small writes, and with Nagle the first content packet waits for
+        // the client's delayed ACK of the headers/role packet — a flat
+        // +40-60ms on first-token latency for every streaming response
+        // (live-measured: child's first content SSE at ~77ms reached the
+        // client at ~135ms; Go net/http, ollama's stack, sets nodelay too).
+        let listener = listener.tap_io(|stream| {
+            let _ = stream.set_nodelay(true);
+        });
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown)
             .await

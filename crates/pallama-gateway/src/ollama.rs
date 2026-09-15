@@ -1166,24 +1166,61 @@ fn default_think_off(row: &pallama_core::ModelRow, req: &mut Value) {
     if !req.get("think").is_none_or(Value::is_null) {
         return;
     }
+    if template_supports_thinking_cached(row) {
+        req["think"] = Value::Bool(false);
+    }
+}
+
+/// Per-path cache for `template_supports_thinking`, validated by file
+/// length + mtime. The think gates run on every request that omits
+/// `think`, and a full GGUF metadata parse walks the whole tokenizer
+/// vocabulary — live-measured ~60ms on a 5.7 GiB model, the single
+/// largest first-token latency component on the ollama lane (parity
+/// probes: explicit `think:false` 74-80ms vs absent key 133-141ms).
+/// Model files are immutable once pulled; the stat guard keeps the
+/// cache honest if a path is ever replaced on disk.
+static TEMPLATE_SUPPORT_CACHE: std::sync::OnceLock<
+    dashmap::DashMap<String, (u64, std::time::SystemTime, bool)>,
+> = std::sync::OnceLock::new();
+
+fn template_supports_thinking_cached(row: &pallama_core::ModelRow) -> bool {
+    let cache = TEMPLATE_SUPPORT_CACHE.get_or_init(dashmap::DashMap::new);
+    let Ok(meta) = std::fs::metadata(&row.path) else {
+        return false; // fail-open, same as an unreadable file below
+    };
+    let Some(mtime) = meta.modified().ok() else {
+        return false;
+    };
+    if let Some(entry) = cache.get(&row.path) {
+        let (len, seen_mtime, supports) = *entry;
+        if len == meta.len() && seen_mtime == mtime {
+            return supports;
+        }
+    }
     let template = pallama_core::read_metadata_file(std::path::Path::new(&row.path))
         .ok()
         .and_then(|gguf| gguf.chat_template)
         .unwrap_or_default();
-    if template_supports_thinking(&template) {
-        req["think"] = Value::Bool(false);
-    }
+    let supports = template_supports_thinking(&template);
+    cache.insert(row.path.clone(), (meta.len(), mtime, supports));
+    supports
 }
 
 fn refuse_unsupported_think(row: &pallama_core::ModelRow, req: &Value) -> Option<Response> {
     if req["think"].as_bool() != Some(true) {
         return None;
     }
+    if template_supports_thinking_cached(row) {
+        return None;
+    }
+    // Distinguish "read the template and it lacks markers" (refuse) from
+    // "could not read" (fail-open): an empty template never reaches the
+    // cache with `true`, so re-derive emptiness only on the slow path.
     let template = pallama_core::gguf::read_metadata_file(std::path::Path::new(&row.path))
         .ok()
         .and_then(|meta| meta.chat_template)
         .unwrap_or_default();
-    if template.is_empty() || template_supports_thinking(&template) {
+    if template.is_empty() {
         return None;
     }
     Some(api_error(
