@@ -425,6 +425,13 @@ impl MistralRsEngine {
         model: &pallama_core::ModelRow,
     ) -> (std::path::PathBuf, Option<std::path::PathBuf>) {
         let raw_mmproj = model.mmproj_path.as_deref().map(std::path::PathBuf::from);
+        // HF-style directory rows (safetensors trees) serve from their raw
+        // location: the shard-view farm below stages only *.gguf siblings,
+        // so a directory row would produce an empty view and hand the
+        // engine a nonexistent path.
+        if std::path::Path::new(&model.path).is_dir() {
+            return (std::path::PathBuf::from(&model.path), raw_mmproj);
+        }
         let Some(root) = self.staging_root.as_deref() else {
             return (std::path::PathBuf::from(&model.path), raw_mmproj);
         };
@@ -562,9 +569,16 @@ pub fn mistralrs_argv(
         // argv assembly; a placeholder here cannot produce a valid child.
         Endpoint::Unix { .. } => 0,
     };
+    // mistral.rs dialect: GGUF rows ride `-f` (the filename suffix selects
+    // GGUF/GGML); HF-style safetensors directories ride `-m/--model-id`,
+    // which accepts a local model directory (v0.9.3 `serve --help`:
+    // "Hugging Face model ID or local model directory"). A directory under
+    // `-f` aborts the child: "Cannot infer model format from
+    // `--quantized-file`".
+    let is_hf_dir = std::path::Path::new(&model.path).is_dir();
     let mut argv = vec![
         "serve".to_string(),
-        "-f".to_string(),
+        if is_hf_dir { "-m" } else { "-f" }.to_string(),
         model.path.clone(),
         // Forced loopback: the child is unauthenticated by design; the
         // gateway is the only public face (binding revision 3).
@@ -574,7 +588,11 @@ pub fn mistralrs_argv(
         port.to_string(),
         "--no-ui".to_string(),
     ];
-    if profile.ctx > 0 && flags.contains("--max-model-len") {
+    // `--max-model-len` is a GGUF-loader knob in mistral.rs (v0.9.3): the
+    // HF/safetensors loader aborts with "max_model_len=N is not supported
+    // by this model loader" and serves the model's native context from
+    // config.json instead. Only GGUF rows carry the flag.
+    if profile.ctx > 0 && !is_hf_dir && flags.contains("--max-model-len") {
         argv.push("--max-model-len".into());
         argv.push(profile.ctx.to_string());
     }
@@ -1012,5 +1030,138 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("--rpc endpoint(s) unreachable"), "{msg}");
         assert!(msg.contains("rpc_servers"), "{msg}");
+    }
+
+    fn mistralrs_row(path: &str) -> pallama_core::ModelRow {
+        pallama_core::ModelRow {
+            name: "qwen2.5-0.5b-instruct".into(),
+            repo: "registry.ollama.ai/library/qwen2.5-0.5b-instruct".into(),
+            quant: "BF16".into(),
+            path: path.into(),
+            bytes: 988_000_000,
+            sha256: None,
+            mmproj_path: None,
+            shards: 1,
+            arch: Some("Qwen2ForCausalLM".into()),
+            params: None,
+            ctx_train: Some(32_768),
+            pulled_at: 0,
+        }
+    }
+
+    fn mistralrs_profile() -> Profile {
+        Profile::default()
+    }
+
+    fn mistralrs_flags() -> std::collections::BTreeSet<String> {
+        std::collections::BTreeSet::new()
+    }
+
+    #[test]
+    fn unit__mistralrs_argv__gguf_file_rides_dash_f() {
+        let row = mistralrs_row("/store/qwen2.5-0.5b Q4_K_M.gguf");
+        let argv = mistralrs_argv(
+            &row,
+            &mistralrs_profile(),
+            &Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 8123,
+            },
+            &mistralrs_flags(),
+        );
+        assert_eq!(argv[0], "serve");
+        assert_eq!(argv[1], "-f");
+        assert_eq!(argv[2], row.path);
+        // GGUF loader keeps the ctx knob (mirror of the HF-dir pin).
+        let mut p = mistralrs_profile();
+        p.ctx = 32768;
+        let flags = ["--max-model-len".to_string()].into_iter().collect();
+        let argv = mistralrs_argv(
+            &row,
+            &p,
+            &Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 8123,
+            },
+            &flags,
+        );
+        let i = argv
+            .iter()
+            .position(|a| a == "--max-model-len")
+            .expect("GGUF rows keep --max-model-len");
+        assert_eq!(argv[i + 1], "32768");
+    }
+
+    #[test]
+    fn unit__mistralrs_argv__hf_directory_rides_model_id() {
+        // The exact live failure: a safetensors directory under `-f`
+        // aborted the child with "Cannot infer model format from
+        // `--quantized-file`" (first live mistralrs serve, matrix pilot).
+        let tmp = std::env::temp_dir().join(format!("pallama-mistralrs-hf-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("hf dir");
+        let row = mistralrs_row(tmp.to_str().unwrap_or("/tmp/x"));
+        let argv = mistralrs_argv(
+            &row,
+            &mistralrs_profile(),
+            &Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 8123,
+            },
+            &mistralrs_flags(),
+        );
+        assert_eq!(argv[1], "-m", "HF dirs must ride --model-id, not -f");
+        assert_eq!(argv[2], row.path);
+        // The second live failure: the HF loader rejects the GGUF-only
+        // `--max-model-len` ("not supported by this model loader").
+        let mut p = mistralrs_profile();
+        p.ctx = 32768;
+        let flags = ["--max-model-len".to_string()].into_iter().collect();
+        let argv = mistralrs_argv(
+            &row,
+            &p,
+            &Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 8123,
+            },
+            &flags,
+        );
+        assert!(
+            !argv.contains(&"--max-model-len".to_string()),
+            "HF loader must not receive --max-model-len"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn unit__mistralrs_staging__hf_directory_bypasses_shard_view() {
+        // With a staging root set (production shape), a directory row must
+        // come back UNTOUCHED: the shard-view farm would stage an empty
+        // view (only *.gguf siblings match) and hand the engine a
+        // nonexistent path.
+        let tmp =
+            std::env::temp_dir().join(format!("pallama-mistralrs-stage-{}", std::process::id()));
+        let hf = tmp.join("model.d");
+        let staging = tmp.join("staging-root");
+        std::fs::create_dir_all(&hf).expect("hf dir");
+        std::fs::create_dir_all(&staging).expect("staging root");
+        let mut manifest = crate::engine::manifest::Manifest {
+            tag: "v0.9.3".into(),
+            build_number: 0,
+            version_raw: "v0.9.3".into(),
+            devices: vec![],
+            flags: std::collections::BTreeSet::new(),
+            spec_types: vec![],
+            server_path: String::new(),
+        };
+        manifest.server_path = "/nonexistent/mistralrs".into();
+        let engine = MistralRsEngine::with_staging(manifest, Vec::new(), Some(staging));
+        let (staged, mmproj) = engine.stage_model_view(&mistralrs_row(hf.to_str().unwrap_or("")));
+        assert_eq!(staged, hf, "HF dir must serve from its raw location");
+        assert!(mmproj.is_none());
+        assert!(
+            !staged.starts_with(tmp.join("staging-root")),
+            "no view must be built for directory rows"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }
