@@ -245,6 +245,15 @@ enum Cmd {
     },
     /// Engine management: llama.cpp releases, mistral.rs lane, source
     /// builds (`build cuda|cpu`), rollback + update channels
+    ///
+    /// Models route by format: GGUF files serve on the llama.cpp lane,
+    /// HF-style safetensors directories serve on the mistral.rs / sglang
+    /// lane — whichever lane is ACTIVE serves its formats, and a format
+    /// the active engine cannot load fails with a teaching that names
+    /// the install + `engine use` remedy. Switching engines
+    /// (`update`, `use`, `rollback`, `install`, `build`, `local`)
+    /// activates the tag; restart the daemon so running spawns pick
+    /// it up.
     Engine {
         #[command(subcommand)]
         cmd: EngineCmd,
@@ -336,6 +345,13 @@ enum SessionCmd {
 #[derive(Subcommand)]
 enum EngineCmd {
     /// Install + activate the newest (or given) upstream build
+    ///
+    /// `update` tracks the newest PREBUILT asset available for your
+    /// GPU/driver class, which can lag upstream llama.cpp (the banner's
+    /// b-tag is upstream truth; CUDA prebuilts publish on an overlay
+    /// cadence). To compile the true latest locally, use
+    /// `pallama engine build cuda`. Activates the installed tag;
+    /// restart the daemon so running spawns pick it up.
     Update {
         /// Engine lane to update: llamacpp (default) | sglang
         #[arg(long, default_value = "llamacpp")]
@@ -347,7 +363,13 @@ enum EngineCmd {
     },
     /// List installed engines with capability summaries
     List,
-    /// Activate an installed tag
+    /// Activate an installed tag (see `pallama engine list` for tags)
+    ///
+    /// Applies to children spawned after the switch — restart the
+    /// daemon (`systemctl restart pallama`, or `pallama stop` +
+    /// `pallama serve`) so running instances move to the new engine.
+    /// GGUF models need a llama.cpp tag active; safetensors (HF-style
+    /// directory) models need mistral.rs or sglang active.
     Use { tag: String },
     /// Remove a retired engine (directory + registry row); refuses the
     /// active tag — `pallama engine use` another first. Reports the
@@ -357,12 +379,23 @@ enum EngineCmd {
     /// policy (plus `local` and the active tag), remove the rest. Runs
     /// automatically after every install; this is the manual trigger.
     Prune,
-    /// Step back to the previous engine
+    /// Step back to the previous engine (undo the last update/use)
+    ///
+    /// Re-activates the tag that was active before the last switch;
+    /// restart the daemon so running spawns pick it up.
     Rollback,
     /// Register a locally built llama-server (pseudo-tag "local")
+    ///
+    /// Points the store at YOUR binary (toolchain/cmake output) and
+    /// activates it; restart the daemon so running spawns pick it up.
     Local { path: PathBuf },
     /// Compile llama.cpp from source into an installable engine
     /// (Linux-CUDA prebuilts don't exist upstream; the backend is in-tree)
+    ///
+    /// Builds the true latest upstream (or a given b-tag) with your
+    /// local toolchain — this is the remedy when `engine update` reports
+    /// the newest prebuilt lags upstream. Installs as a new tag and
+    /// activates it; restart the daemon so running spawns pick it up.
     Build {
         /// Backend to compile: cuda | cpu
         backend: String,
@@ -385,6 +418,11 @@ enum EngineCmd {
     /// Install + activate an engine lane: mistral.rs (prebuilt upstream
     /// binary; picks CPU/Metal/CUDA asset from the local GPU + driver)
     /// or sglang (pip venv lane; Linux + CUDA/ROCm, safetensors models)
+    ///
+    /// These lanes serve HF-style safetensors directories (e.g.
+    /// qwen2.5-1.5b-instruct.d) — GGUF files stay on llama.cpp. After
+    /// install, `engine use` the tag and restart the daemon to serve
+    /// safetensors models.
     Install {
         /// Engine lane to install: mistralrs | sglang
         #[arg(long, default_value = "mistralrs")]
