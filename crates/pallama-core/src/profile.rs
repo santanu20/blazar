@@ -2311,36 +2311,63 @@ fn compile_mistralrs(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Prof
         );
     }
 
-    // LoRA capacity family.
-    if let Some(n) = tun.lora_max_rank {
-        push_gated(
-            input,
-            &mut argv,
-            &mut warnings,
-            "mistralrs.lora_max_rank",
-            "--lora-max-rank",
-            &[n.to_string()],
+    // LoRA family: --enable-lora (dynamic serving switch) leads; the
+    // runtime limits only take effect with it or a preloaded adapter —
+    // upstream rejects bare limits with a hard error at boot.
+    let lora_serving = tun.enable_lora == Some(true) || !input.loras.is_empty();
+    if !lora_serving
+        && (tun.lora_max_rank.is_some()
+            || tun.lora_max_adapters.is_some()
+            || tun.lora_max_bytes.is_some())
+    {
+        warnings.push(
+            "mistralrs.lora_max_rank/lora_max_adapters/lora_max_bytes set but no LoRA serving \
+             (mistralrs.enable_lora absent and no adapters preloaded); upstream rejects bare \
+             LoRA runtime limits — set mistralrs.enable_lora = true or attach adapters"
+                .to_string(),
         );
     }
-    if let Some(n) = tun.lora_max_adapters {
+    if tun.enable_lora == Some(true) {
         push_gated(
             input,
             &mut argv,
             &mut warnings,
-            "mistralrs.lora_max_adapters",
-            "--lora-max-adapters",
-            &[n.to_string()],
+            "mistralrs.enable_lora",
+            "--enable-lora",
+            &[],
         );
     }
-    if let Some(n) = tun.lora_max_bytes {
-        push_gated(
-            input,
-            &mut argv,
-            &mut warnings,
-            "mistralrs.lora_max_bytes",
-            "--lora-max-bytes",
-            &[n.to_string()],
-        );
+    if lora_serving {
+        if let Some(n) = tun.lora_max_rank {
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "mistralrs.lora_max_rank",
+                "--lora-max-rank",
+                &[n.to_string()],
+            );
+        }
+        if let Some(n) = tun.lora_max_adapters {
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "mistralrs.lora_max_adapters",
+                "--lora-max-adapters",
+                &[n.to_string()],
+            );
+        }
+        if let Some(n) = tun.lora_max_bytes {
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "mistralrs.lora_max_bytes",
+                "--lora-max-bytes",
+                &[n.to_string()],
+            );
+        }
     }
 
     // MTP speculative family (--mtp first so the head is enabled before
@@ -7423,6 +7450,7 @@ mod tests {
     fn mistralrs_knobs_flags() -> BTreeSet<String> {
         [
             "--lora",
+            "--enable-lora",
             "--max-batch-size",
             "--max-prefill-chunk-tokens",
             "--max-decode-steps-before-prefill",
@@ -7454,6 +7482,7 @@ mod tests {
         let g = meta();
         let cfg = Config {
             mistralrs: MistralrsTuning {
+                enable_lora: Some(true),
                 max_batch_size: Some(4),
                 max_prefill_chunk_tokens: Some(1024),
                 max_decode_steps_before_prefill: Some(16),
@@ -7510,7 +7539,12 @@ mod tests {
                 "missing {pair:?}"
             );
         }
-        for bare in ["--mtp", "--disable-metrics", "--disable-access-log"] {
+        for bare in [
+            "--mtp",
+            "--disable-metrics",
+            "--disable-access-log",
+            "--enable-lora",
+        ] {
             assert!(a.iter().any(|t| t == bare), "missing {bare}");
         }
         // --mtp is the family switch: it must precede its dependents.
@@ -7527,6 +7561,37 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("ignored on the mistralrs engine")));
+    }
+
+    #[test]
+    fn unit__mistralrs_knobs__lora_caps_require_serving() {
+        // Bare LoRA runtime limits (no enable_lora, no preloaded adapters)
+        // are rejected by upstream at boot — warn and suppress them.
+        let g = meta();
+        let cfg = Config {
+            mistralrs: MistralrsTuning {
+                lora_max_rank: Some(64),
+                lora_max_adapters: Some(2),
+                ..MistralrsTuning::default()
+            },
+            ..Config::default()
+        };
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let flags = mistralrs_knobs_flags();
+        let mut inp = input(&g, &hw, &cfg, &flags);
+        inp.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.iter().any(|t| t.starts_with("--lora-max")),
+            "{:?}",
+            p.argv
+        );
+        assert!(!p.argv.contains(&"--enable-lora".to_string()));
+        assert!(
+            p.warnings.iter().any(|w| w.contains("no LoRA serving")),
+            "{:?}",
+            p.warnings
+        );
     }
 
     #[test]

@@ -671,8 +671,12 @@ const MISTRALRS_TUNING_VALUE_FLAGS: &[&str] = &[
 ];
 
 /// Valueless (`store_true`) tuning flags the dialect emits.
-const MISTRALRS_TUNING_BOOL_FLAGS: &[&str] =
-    &["--mtp", "--disable-metrics", "--disable-access-log"];
+const MISTRALRS_TUNING_BOOL_FLAGS: &[&str] = &[
+    "--mtp",
+    "--disable-metrics",
+    "--disable-access-log",
+    "--enable-lora",
+];
 
 /// Forward the dialect's tuning tokens from the compiled profile argv
 /// into the child argv, manifest-gated per flag. Pair flags carry a

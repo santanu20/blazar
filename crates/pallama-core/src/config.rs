@@ -1181,6 +1181,10 @@ pub struct MistralrsTuning {
     /// `--pa-context-len`: allocate paged KV for this context length
     /// instead of a VRAM fraction.
     pub pa_context_len: Option<u64>,
+    /// `--enable-lora`: enable dynamic `LoRA` serving without preloading
+    /// an adapter. `LoRA` runtime limits only take effect with this or a
+    /// preloaded adapter (upstream rejects bare limits).
+    pub enable_lora: Option<bool>,
     /// `--lora-max-rank`: rank ceiling for served `LoRA` adapters
     /// (upstream default 256).
     pub lora_max_rank: Option<u32>,
