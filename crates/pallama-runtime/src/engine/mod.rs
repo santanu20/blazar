@@ -948,14 +948,17 @@ impl EngineManager {
         Ok(row)
     }
 
-    /// Active engine's manifest (probed capabilities).
+    /// Active engine's manifest (probed capabilities). The recorded
+    /// server path is re-anchored to this data dir's engines root so rows
+    /// installed elsewhere (moved data dir, copied DB) still resolve.
     pub fn active_manifest(&self) -> Result<Option<Manifest>> {
         let store = Store::open(&self.dirs)?;
         let Some(row) = store.active_engine()? else {
             return Ok(None);
         };
-        let m: Manifest = serde_json::from_str(&row.manifest)
+        let mut m: Manifest = serde_json::from_str(&row.manifest)
             .with_context(|| format!("decode manifest for {}", row.tag))?;
+        m.re_root_server_path(&self.dirs.engines_dir());
         Ok(Some(m))
     }
 }

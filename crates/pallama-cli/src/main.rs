@@ -3209,8 +3209,11 @@ async fn serve() -> Result<()> {
     let engine_row = store
         .active_engine()?
         .ok_or_else(|| anyhow!("no engine installed; run: pallama engine update"))?;
-    let manifest: pallama_runtime::Manifest = serde_json::from_str(&engine_row.manifest)
+    let mut manifest: pallama_runtime::Manifest = serde_json::from_str(&engine_row.manifest)
         .with_context(|| format!("decode engine manifest {}", engine_row.tag))?;
+    // Rows installed under a different data dir still resolve: adopt the
+    // live engines root when the recorded absolute path is gone.
+    manifest.re_root_server_path(&d.engines_dir());
     println!(
         "engine: {} (build {})",
         engine_row.tag, manifest.build_number

@@ -60,7 +60,8 @@ pub struct Manifest {
     pub flags: BTreeSet<String>,
     /// Speculative-decoding types accepted by `--spec-type`, when advertised.
     pub spec_types: Vec<String>,
-    /// Absolute path to the llama-server binary.
+    /// Absolute path to the engine's server binary, as probed at install
+    /// time. Relocatable on load: see [`Manifest::re_root_server_path`].
     pub server_path: String,
 }
 
@@ -85,6 +86,44 @@ impl Manifest {
             }
         }
         Ok(())
+    }
+
+    /// Engine rows bake the absolute server path probed at install time,
+    /// which makes a row non-relocatable: move `XDG_DATA_HOME` (or copy
+    /// the DB into another data dir) and every pre-existing row points at
+    /// the old root while the binaries sit intact under the new one.
+    /// Re-anchor on load: when the recorded path is gone but the same
+    /// `engines/<tag>/...` tail exists under the live engines dir, adopt
+    /// it. Anything else stays untouched so a genuinely missing binary
+    /// still fails loudly at spawn.
+    pub fn re_root_server_path(&mut self, engines_dir: &Path) -> bool {
+        let recorded = Path::new(&self.server_path);
+        if recorded.exists() {
+            return false;
+        }
+        let components: Vec<_> = recorded.components().collect();
+        let Some(pos) = components
+            .iter()
+            .position(|c| c.as_os_str() == std::ffi::OsStr::new("engines"))
+        else {
+            return false;
+        };
+        let mut live = engines_dir.to_path_buf();
+        for component in &components[pos + 1..] {
+            live.push(component);
+        }
+        if !live.exists() {
+            return false;
+        }
+        tracing::warn!(
+            "engine {} was installed under a different data dir (recorded {}); \
+             re-rooted to {}",
+            self.tag,
+            self.server_path,
+            live.display()
+        );
+        self.server_path = live.display().to_string();
+        true
     }
 }
 
@@ -476,6 +515,75 @@ mod tests {
     #[test]
     fn unit__parse_version__missing__error() {
         assert!(parse_version("llama.server\n").is_err());
+    }
+
+    #[test]
+    fn unit__re_root_server_path__relocated_row_adopts_live_engines_dir() {
+        // Sandbox regression (2026-09-15): a DB copied from another data
+        // dir kept the old absolute server_path and failed ENOENT at
+        // spawn while the binary sat intact under the live engines dir.
+        let tmp = tempfile::tempdir().unwrap();
+        let engines = tmp.path().join("data/pallama/engines");
+        let live_bin = engines.join("b10970-cuda/llama-b10970-cuda/llama-server");
+        std::fs::create_dir_all(live_bin.parent().unwrap()).unwrap();
+        std::fs::write(&live_bin, b"#!/bin/sh\n").unwrap();
+
+        let mut m = Manifest {
+            tag: "b10970-cuda".into(),
+            build_number: 10970,
+            version_raw: "version: b10970".into(),
+            devices: Vec::new(),
+            flags: BTreeSet::new(),
+            spec_types: Vec::new(),
+            server_path: "/home/other/.local/share/pallama/engines/b10970-cuda/llama-b10970-cuda/llama-server".into(),
+        };
+        assert!(m.re_root_server_path(&engines));
+        assert_eq!(m.server_path, live_bin.display().to_string());
+    }
+
+    #[test]
+    fn unit__re_root_server_path__recorded_path_wins_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engines = tmp.path().join("engines");
+        std::fs::create_dir_all(&engines).unwrap();
+
+        let present = tmp.path().join("original/llama-server");
+        std::fs::create_dir_all(present.parent().unwrap()).unwrap();
+        std::fs::write(&present, b"#!/bin/sh\n").unwrap();
+
+        let mut m = Manifest {
+            tag: "local".into(),
+            build_number: 0,
+            version_raw: String::new(),
+            devices: Vec::new(),
+            flags: BTreeSet::new(),
+            spec_types: Vec::new(),
+            server_path: present.display().to_string(),
+        };
+        assert!(!m.re_root_server_path(&engines));
+        assert_eq!(m.server_path, present.display().to_string());
+    }
+
+    #[test]
+    fn unit__re_root_server_path__no_tail_anywhere__fail_loud_unmodified() {
+        // Neither the recorded path nor a live tail exists (and no
+        // "engines" marker at all, e.g. the `local` pseudo-engine): the
+        // manifest is left untouched so spawn fails loudly with ENOENT.
+        let tmp = tempfile::tempdir().unwrap();
+        let engines = tmp.path().join("engines");
+        std::fs::create_dir_all(&engines).unwrap();
+
+        let mut m = Manifest {
+            tag: "local".into(),
+            build_number: 0,
+            version_raw: String::new(),
+            devices: Vec::new(),
+            flags: BTreeSet::new(),
+            spec_types: Vec::new(),
+            server_path: "/gone/custom/llama-server".into(),
+        };
+        assert!(!m.re_root_server_path(&engines));
+        assert_eq!(m.server_path, "/gone/custom/llama-server");
     }
 
     #[test]

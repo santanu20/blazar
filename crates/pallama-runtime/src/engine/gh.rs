@@ -321,6 +321,21 @@ impl GhClient {
             ));
         }
         let bytes = resp.bytes().await.context("read asset body")?;
+        // Truncation guard: a proxy or origin that closes the body early
+        // looks like a clean end-of-stream to reqwest — the digest check
+        // below only runs when GH published one, so a digest-less asset
+        // could install truncated (live case: 14 MiB of a 1+ GiB
+        // mistral.rs tarball accepted, gzip EOF mid-extract). The
+        // release-API size is authoritative; enforce it.
+        if let Some(size) = asset.size {
+            if bytes.len() as u64 != size {
+                return Err(anyhow!(
+                    "asset {} truncated: got {} bytes, release metadata says {size}",
+                    asset.name,
+                    bytes.len()
+                ));
+            }
+        }
         if let Some(digest) = &asset.digest {
             let expected = digest
                 .strip_prefix("sha256:")
@@ -394,15 +409,70 @@ impl GhClient {
             std::fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
         let mut hasher = Sha256::new();
         let mut total: u64 = 0;
+        let declared_len = resp.content_length();
         let mut resp = resp;
-        while let Some(chunk) = resp.chunk().await.context("read asset stream")? {
-            use std::io::Write;
-            file.write_all(&chunk).context("write asset chunk")?;
-            hasher.update(&chunk);
-            total += chunk.len() as u64;
-            bar.inc(chunk.len() as u64);
+        loop {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    use std::io::Write;
+                    if let Err(e) = file.write_all(&chunk) {
+                        drop(file);
+                        let _ = std::fs::remove_file(dest);
+                        return Err(anyhow!("write asset chunk: {e}"));
+                    }
+                    hasher.update(&chunk);
+                    total += chunk.len() as u64;
+                    bar.inc(chunk.len() as u64);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    // Mid-stream death: no partial file may survive —
+                    // a retry restarting onto a corrupt prefix is worse
+                    // than redownloading.
+                    drop(file);
+                    let _ = std::fs::remove_file(dest);
+                    return Err(anyhow!("asset {} read stream: {e:#}", asset.name));
+                }
+            }
         }
         bar.finish_and_clear();
+        Self::verify_streamed_asset(asset, dest, file, hasher, declared_len, total)?;
+        Ok(total)
+    }
+
+    /// Post-stream verification for `download_asset_file`: truncation
+    /// and digest. Truncation is checked against two sources — the
+    /// HTTP Content-Length header and the release-API size — because a
+    /// cleanly-closed-early body streams to a short total with NO
+    /// error; without this check a digest-less asset installs
+    /// truncated and dies later at extraction (live case: 14 MiB of a
+    /// 1+ GiB tarball accepted). Every failure path removes the
+    /// partial file so a retry starts clean instead of resuming onto
+    /// a corrupt prefix.
+    fn verify_streamed_asset(
+        asset: &GhAsset,
+        dest: &std::path::Path,
+        file: std::fs::File,
+        hasher: Sha256,
+        declared_len: Option<u64>,
+        total: u64,
+    ) -> Result<()> {
+        drop(file);
+        let truncated = |declared: Option<u64>, actual: u64| -> Option<String> {
+            match declared {
+                Some(len) if len != actual => {
+                    Some(format!("got {actual} bytes, Content-Length said {len}"))
+                }
+                _ => asset
+                    .size
+                    .filter(|s| *s != actual)
+                    .map(|s| format!("got {actual} bytes, release metadata said {s}")),
+            }
+        };
+        if let Some(why) = truncated(declared_len, total) {
+            let _ = std::fs::remove_file(dest);
+            return Err(anyhow!("asset {} truncated: {why}", asset.name));
+        }
         if let Some(digest) = &asset.digest {
             let expected = digest
                 .strip_prefix("sha256:")
@@ -410,6 +480,7 @@ impl GhClient {
                 .to_lowercase();
             let got = format!("{:x}", hasher.finalize());
             if got != expected {
+                let _ = std::fs::remove_file(dest);
                 return Err(anyhow!(
                     "sha256 mismatch for {}: expected {expected}, got {got}",
                     asset.name
@@ -417,11 +488,11 @@ impl GhClient {
             }
         } else {
             tracing::warn!(
-                "asset {} has no digest in release metadata; skipping sha verify",
+                "asset {} has no digest in release metadata; length-verified only",
                 asset.name
             );
         }
-        Ok(total)
+        Ok(())
     }
 }
 
@@ -1426,6 +1497,103 @@ mod tests {
         assert!(
             err.to_string().contains("sha256 mismatch"),
             "error names the mismatch: {err}"
+        );
+        assert!(
+            !dest.exists(),
+            "partial file removed on digest mismatch — a retry starts clean"
+        );
+    }
+
+    /// One-shot server that ADVERTISES a Content-Length larger than the
+    /// body it sends, then closes — the truncated-download failure shape
+    /// (live case: 14 MiB of a 1+ GiB mistral.rs tarball accepted).
+    fn serve_truncated(advertised_len: usize, send_len: usize) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let url = format!("http://{addr}/asset.bin");
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 1024];
+            let mut seen = 0;
+            while seen < buf.len() {
+                let n = sock.read(&mut buf).expect("read request");
+                if n == 0 {
+                    break;
+                }
+                seen += n;
+                if buf[..seen].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {advertised_len}\r\nConnection: close\r\n\r\n"
+            );
+            sock.write_all(head.as_bytes()).expect("write head");
+            sock.write_all(&vec![7u8; send_len])
+                .expect("write short body");
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn unit__download_asset_file__truncated_stream_is_an_error_and_partial_removed() {
+        // Digest-less asset (GH releases without digests). hyper itself
+        // rejects most header/body mismatches as a decode error; when the
+        // transport instead ends cleanly short (HTTP/2 END_STREAM, some
+        // proxies) the Content-Length guard fires. Either way the CONTRACT
+        // is: the download fails and no partial file survives.
+        let url = serve_truncated(1_000_000, 140_000);
+        let client = GhClient::with_base("http://127.0.0.1", None).expect("client");
+        let mut a = asset(&url, None);
+        a.size = None; // no API size either — header/stream guard is the only net
+        let dest = std::env::temp_dir().join("pallama-gh-dl-pin-trunc.bin");
+        let err = client
+            .download_asset_file(&a, &dest)
+            .await
+            .expect_err("truncation must fail");
+        assert!(
+            err.to_string().contains("read stream") || err.to_string().contains("truncated"),
+            "error names the failure: {err}"
+        );
+        assert!(!dest.exists(), "partial file removed");
+    }
+
+    #[tokio::test]
+    async fn unit__download_asset_file__api_size_mismatch_is_an_error() {
+        // Honest Content-Length but a LYING release-API size: the
+        // metadata cross-check catches it even when the header matches.
+        let body: &'static [u8] = b"complete-body-but-wrong-metadata-size";
+        let url = serve_once(body);
+        let client = GhClient::with_base("http://127.0.0.1", None).expect("client");
+        let mut a = asset(&url, None);
+        a.size = Some((body.len() as u64) + 999);
+        let dest = std::env::temp_dir().join("pallama-gh-dl-pin-size.bin");
+        let err = client
+            .download_asset_file(&a, &dest)
+            .await
+            .expect_err("size mismatch must fail");
+        assert!(
+            err.to_string().contains("release metadata"),
+            "error names the metadata source: {err}"
+        );
+        assert!(!dest.exists(), "partial file removed");
+    }
+
+    #[tokio::test]
+    async fn unit__download_asset_bytes__api_size_mismatch_is_an_error() {
+        let body: &'static [u8] = b"buffered-asset-wrong-size";
+        let url = serve_once(body);
+        let client = GhClient::with_base("http://127.0.0.1", None).expect("client");
+        let mut a = asset(&url, None);
+        a.size = Some((body.len() as u64) + 5);
+        let err = client
+            .download_asset_bytes(&a)
+            .await
+            .expect_err("size mismatch must fail");
+        assert!(
+            err.to_string().contains("truncated"),
+            "error names truncation: {err}"
         );
     }
 }
