@@ -4668,6 +4668,44 @@ def phase_cli() -> None:
         f"get={p2.stdout.strip()!r} file default_ctx={parsed.get('default_ctx')}",
     )
     reg("config.set", ok, "set 4096 -> get + file parse")
+    # unset round-trip: pin removal restores the built-in default.
+    p = cli("config", "unset", "default_ctx")
+    p2 = cli("config", "get", "default_ctx")
+    with open(os.path.join(SANDBOX.config_dir, "config.toml"), "rb") as f:
+        parsed = tomllib.load(f)
+    ok = (
+        p.returncode == 0
+        and "was:" in p.stdout
+        and "default_ctx" not in parsed
+        and "16384" in p2.stdout
+    )
+    check(
+        "cli",
+        "config unset removes the pin and restores the default",
+        ok,
+        f"unset={p.stdout.strip()!r} get={p2.stdout.strip()!r} "
+        f"file_has_key={'default_ctx' in parsed}",
+    )
+    reg("config.unset", ok, "pin gone, get back to 16384")
+    p = cli("config", "unset", "default_ctx")
+    ok = p.returncode == 0 and "not pinned" in p.stdout
+    check("cli", "config unset idempotent when unpinned", ok, p.stdout.strip())
+    reg("config.unset.idempotent", ok, "not-pinned teaching")
+    p = cli("config", "defaults", "default_ctx")
+    p2 = cli("config", "unset", "bogus_key_xyz")
+    ok = (
+        p.returncode == 0
+        and "16384" in p.stdout
+        and p2.returncode != 0
+        and "unknown config key" in p2.stderr
+    )
+    check(
+        "cli",
+        "config defaults shows builtin; unknown unset fails fast",
+        ok,
+        f"defaults={p.stdout.strip()!r} unset_rc={p2.returncode}",
+    )
+    reg("config.defaults", ok, "default line + typo rejection")
     p = cli("engine", "list")
     cur = _active_engine_tag()
     ok = p.returncode == 0 and (
@@ -6735,7 +6773,7 @@ def phase_commands() -> None:
     # values in the current CLI; the rest are switches.
     for flag, value in (
         ("--search", None),
-        ("--ctx", "16384"),
+        ("--ctx", "8192"),
         ("--spec", "auto"),
         ("--slots", "2"),
         ("--ngram", None),
@@ -6996,15 +7034,17 @@ def phase_commands() -> None:
 
     tags = _full_engine_tags()
     anchor, dance = (tags + [None, None])[:2]
-    if anchor is None:
-        # slim-asset box (CUDA overlay ships server-only): fall back to any
-        # server-bearing llamacpp tag so local/use lanes still exercise a
-        # real engine. With >=2 of them, dance too — the switch lanes'
-        # whole purpose is a REAL engine dance, and two slim tags prove
-        # switching just as well as two full bundles.
+    if dance is None:
+        # slim-asset box (CUDA overlay ships server-only) or a mixed store
+        # (one full + one slim): fall back to any server-bearing llamacpp
+        # tag so local/use lanes still exercise a real engine. With >=2 of
+        # them, dance too — the switch lanes' whole purpose is a REAL
+        # engine dance, and slim pairs prove switching just as well as full
+        # bundles (quantize presence is irrelevant to use/rollback).
         server_tags = _server_engine_tags()
-        anchor = server_tags[0] if server_tags else None
-        dance = server_tags[1] if len(server_tags) > 1 else None
+        if anchor is None:
+            anchor = server_tags[0] if server_tags else None
+        dance = next((t for t in server_tags if t != anchor), None)
     # Prefer a plain upstream tag for the pin-update dance so the lane
     # exercises the standard asset path whenever the store has one; a
     # -cuda pick goes through the CUDA overlay repo (needs bNNNN-cuda
@@ -7150,11 +7190,30 @@ def phase_commands() -> None:
         p = _pull_retry("ggml-org/Qwen3-0.6B-GGUF")
         after = set(cli("list").stdout.split())
         new = {w for w in after - before if "qwen3" in w.lower()}
-        reg(
-            "pull",
-            p.returncode == 0 and bool(new),
-            f"rc={p.returncode} new={sorted(new)[:3]}",
+        err = (p.stderr or "").lower()
+        # A double HF-side failure (429/5xx on both attempts) is a transient
+        # upstream window, not a regression — boundary it (run.miss-pulls
+        # re-proves the pull path later in the same sweep).
+        transient = p.returncode != 0 and (
+            "429" in err
+            or "500" in err
+            or "502" in err
+            or "503" in err
+            or "rate" in err
+            or "timed out" in err
+            or "connection" in err
         )
+        if transient:
+            regb(
+                "pull",
+                f"transient HF window (rc={p.returncode}): {(p.stderr or '').strip()[:140]}",
+            )
+        else:
+            reg(
+                "pull",
+                p.returncode == 0 and bool(new),
+                f"rc={p.returncode} new={sorted(new)[:3]}",
+            )
         for name in new:
             cli("rm", name)
 

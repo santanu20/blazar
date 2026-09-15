@@ -3079,6 +3079,45 @@ fn resolve_slots(
                  multi-slot batches perturb logits in near-tie positions and break \
                  token-for-token greedy reproducibility; drop one of the two knobs"
             ));
+/// Pinned-pool walk (unified lane): the capacity vram-slots axis is
+/// CAP-blind under `--kv-unified`, so it can admit an np whose whole pool
+/// (np × `base_ctx` of device-backed KV on top of the weights) the 2b
+/// verdict refuses — the spawn would die at context creation and retry
+/// per request. Walk down to the largest count the verdict actually
+/// hosts and say so. Explicit slot pins never reach here (an unfit pin
+/// must error loudly at 2b, not be silently reshaped); the classic lane's
+/// capacity axis already subtracts the weights, so it keeps its own math.
+fn walk_pinned_np(
+    input: &ProfileInput<'_>,
+    np: u32,
+    base_ctx: u32,
+    vram_bytes: u64,
+    warnings: &mut Vec<String>,
+) -> u32 {
+    let pool_hosts = |n: u32| match kv_f16_bytes(input, n * base_ctx) {
+        Some(kv) => !matches!(
+            unified_ctx_verdict(input.model_bytes, kv, vram_bytes, base_ctx),
+            UnifiedCtxVerdict::Refuse(_)
+        ),
+        None => false, // unknown KV charge — never guess that it fits
+    };
+    let full = np;
+    let mut np = np;
+    while np > 1 && !pool_hosts(np) {
+        np -= 1;
+    }
+    if np < full {
+        warnings.push(format!(
+            "pinned ctx {base_ctx}: auto slots np {full} pool ({} ctx) exceeds the GPU \
+             VRAM budget — walked down to np {np} (pool {}); pin slots = {full} to force \
+             the conflict to error instead",
+            full * base_ctx,
+            np * base_ctx
+        ));
+    }
+    np
+}
+
         } else if slots == 0 {
             warnings.push(
                 "deterministic = true: slots pinned to 1 — concurrent streams queue \
@@ -3102,7 +3141,10 @@ fn resolve_slots(
         };
     }
     // --- auto: probe capacity at the resolved per-slot ctx first
-    let np = auto_slots_capacity(input, base_ctx, vram_bytes);
+    let mut np = auto_slots_capacity(input, base_ctx, vram_bytes);
+    if ctx_pinned && np >= 2 && kv_unified_emitted(input) {
+        np = walk_pinned_np(input, np, base_ctx, vram_bytes, warnings);
+    }
     if vulkan_mmproj_guard(input) {
         warn_vulkan_slot_cap(input, base_ctx, vram_bytes, warnings);
     }
@@ -5481,6 +5523,99 @@ mod tests {
         let g = meta(); // trained 40960 ≥ the pin; 57344 B/ctx-token
         let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
         inp.model_bytes = 2_700 * MIB;
+    #[test]
+    fn unit__pinned_pool_walk__auto_slots_walk_to_hostable_np() {
+        // The capacity vram-slots axis is CAP-blind under --kv-unified: it
+        // admits np4 at a pinned 8192 while the DEVICE verdict refuses
+        // every pool above np1 (weights 379 + KV@8192 469 + 700 overhead
+        // = 1548 <= 1600 VRAM fits ONLY at np1; np2 pool 16384 = 2017
+        // refuses). Auto walks down and says so; the pin itself stays.
+        let cfg = Config {
+            default_ctx: 8_192,
+            ..Config::default()
+        };
+        let hw = gpu_hw(1_600, 13_674, 8);
+        let g = meta();
+        let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        inp.model_bytes = 379 * MIB;
+        let p = compile(
+            &inp,
+            &TuningOverrides {
+                ctx: Some(8_192),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            p.warnings.iter().any(|w| w.contains("walked down to np 1")),
+            "walk warning present: {:?}",
+            p.warnings
+        );
+        assert!(p.argv.windows(2).any(|w| w == ["--ctx-size", "8192"]));
+        assert!(p.argv.windows(2).any(|w| w == ["-np", "1"]));
+    }
+
+    #[test]
+    fn unit__pinned_pool_walk__all_np_refuse_errors_at_np1() {
+        // Nothing hostable at ANY count (weights 2000 + KV 469 + 700 =
+        // 3169 > 1600 even at np1): the walk lands at 1 and the 2b
+        // verdict teaches the refusal — never a warn-yet-proceed spawn.
+        let cfg = Config {
+            default_ctx: 8_192,
+            ..Config::default()
+        };
+        let hw = gpu_hw(1_600, 13_674, 8);
+        let g = meta();
+        let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        inp.model_bytes = 2_000 * MIB;
+        let err = compile(
+            &inp,
+            &TuningOverrides {
+                ctx: Some(8_192),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("pinned num_ctx 8192 cannot fit"), "{err}");
+        assert!(err.contains("q8_0"), "teaches the KV lever: {err}");
+    }
+
+    #[test]
+    fn unit__pinned_pool_walk__explicit_slots_never_walk() {
+        // An explicit slots pin is sovereign: the walk must NOT reshape
+        // it. Explicit -np divides --ctx-size across slots upstream (the
+        // pool total STAYS the pin — argv keeps ctx 8192 + -np 2), so a
+        // hostable pin serves at the requested concurrency with no walk
+        // warning; an unhostable pin errors at 2b (covered by the
+        // refuses-when-guard-blocks pin).
+        let cfg = Config {
+            default_ctx: 8_192,
+            ..Config::default()
+        };
+        let hw = gpu_hw(1_600, 13_674, 8);
+        let g = meta();
+        let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        inp.model_bytes = 379 * MIB;
+        let mut ov = ModelOverride::default();
+        ov.slots = Some(2);
+        inp.overlay = &ov;
+        let p = compile(
+            &inp,
+            &TuningOverrides {
+                ctx: Some(8_192),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(p.argv.windows(2).any(|w| w == ["--ctx-size", "8192"]));
+        assert!(p.argv.windows(2).any(|w| w == ["-np", "2"]));
+        assert!(
+            !p.warnings.iter().any(|w| w.contains("walked down")),
+            "explicit pins never walk: {:?}",
+            p.warnings
+        );
+    }
+
         let p = compile(
             &inp,
             &TuningOverrides {
