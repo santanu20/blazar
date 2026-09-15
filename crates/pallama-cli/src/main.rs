@@ -253,7 +253,8 @@ enum Cmd {
     /// the install + `engine use` remedy. Switching engines
     /// (`update`, `use`, `rollback`, `install`, `build`, `local`)
     /// activates the tag; restart the daemon so running spawns pick
-    /// it up.
+    /// it up. Voice (whisper.cpp transcription) is a separate lane:
+    /// `pallama whisper --install` / `--pull` / `--list`.
     Engine {
         #[command(subcommand)]
         cmd: EngineCmd,
@@ -424,9 +425,11 @@ enum EngineCmd {
     /// install, `engine use` the tag and restart the daemon to serve
     /// safetensors models.
     Install {
-        /// Engine lane to install: mistralrs | sglang
-        #[arg(long, default_value = "mistralrs")]
-        kind: String,
+        /// Engine lane to install: mistralrs | sglang (required — bare
+        /// `engine install` prints the lane chooser; llama.cpp installs
+        /// ride `engine update` / `engine build`)
+        #[arg(long)]
+        kind: Option<String>,
         tag: Option<String>,
     },
 }
@@ -5660,7 +5663,9 @@ async fn engine_install_mistralrs(d: &PallamaDirs, tag: Option<String>) -> Resul
     println!(
         "engine {} active ({} flags probed, build {})",
         row.tag,
+            let mut seen: Vec<&str> = Vec::new();
         m.flags.len(),
+                seen.push(e.kind.as_str());
         m.build_number
     );
     println!("note: decode-regression gate is llama-server-only — skipped for mistral.rs engines");
@@ -5670,6 +5675,31 @@ async fn engine_install_mistralrs(d: &PallamaDirs, tag: Option<String>) -> Resul
 
 /// `pallama engine update --kind sglang [version]` — pip venv lane
 /// (Linux + CUDA/ROCm). Multi-GB download: torch rides the venv. The
+            // Point-of-need catalog: `engine list` is where users look
+            // for "what can I install" — every lane this pallama can
+            // run but doesn't have yet gets one discoverability line,
+            // and the separate voice lane is always named.
+            if !seen.contains(&"llamacpp") {
+                println!(
+                    "llama.cpp:  not installed — pallama engine update (prebuilt) / pallama engine build cuda (source; GGUF lane)"
+                );
+            }
+            if !seen.contains(&"mistralrs") {
+                println!(
+                    "mistral.rs: not installed — pallama engine install --kind mistralrs (safetensors)"
+                );
+            }
+            if !seen.contains(&"sglang") {
+                println!(
+                    "sglang:     not installed — pallama engine install --kind sglang (safetensors; Linux + CUDA/ROCm)"
+                );
+            }
+            match pallama_runtime::whisper::installed_tags(&d).first() {
+                Some(tag) => println!("whisper:    {tag} (voice lane) — pallama whisper --list"),
+                None => {
+                    println!("whisper:    not installed (voice lane) — pallama whisper --install")
+                }
+            }
 /// F7 decode-regression gate is llama-server-only: skipped, and SAID
 /// so — llama-bench cannot drive an sglang child.
 async fn engine_install_sglang(d: &PallamaDirs, version: Option<String>) -> Result<()> {
@@ -5721,6 +5751,18 @@ async fn engine_update_sglang(d: &PallamaDirs, version: Option<String>) -> Resul
     let latest = match pallama_runtime::engine::sglang_install::pypi_latest_sglang(
         std::time::Duration::from_secs(10),
     )
+            // Bare `engine install` must never guess a lane: each lane
+            // serves different model formats, and the old silent
+            // mistralrs default started installs users did not ask for.
+            let Some(kind) = kind else {
+                return Err(anyhow!(
+                    "engine install needs a lane — each serves different model formats:\n  \
+                     llama.cpp         GGUF files — pallama engine update (prebuilt) or pallama engine build cuda (source)\n  \
+                     --kind mistralrs  HF safetensors dirs — prebuilt mistral.rs server\n  \
+                     --kind sglang     HF safetensors dirs — pip venv (Linux + CUDA/ROCm)\n  \
+                     voice (whisper)   pallama whisper --install (separate transcription lane)"
+                ));
+            };
     .await
     {
         Ok(v) => v,
