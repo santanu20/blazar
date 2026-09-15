@@ -596,6 +596,16 @@ pub fn mistralrs_argv(
         argv.push("--max-model-len".into());
         argv.push(profile.ctx.to_string());
     }
+    // mistral.rs's paged-attention scheduler processes at most
+    // `--max-num-batched-tokens` tokens per step and defaults to 4096:
+    // any prompt longer than that dies as an HTTP 200 with an empty
+    // choices array and `error: service_unavailable` (live-proven on
+    // v0.9.3 — geokit's ~4.3k-token system prompt tripped it). Raise the
+    // step to the serving context so prefill is never chunk-starved.
+    if profile.ctx > 0 && flags.contains("--max-num-batched-tokens") {
+        argv.push("--max-num-batched-tokens".into());
+        argv.push(profile.ctx.max(4096).to_string());
+    }
     // Parallelism: mine the compiled llama.cpp argv for `-np N` /
     // `--parallel=N` (the profile's slot count).
     let np = profile
@@ -1075,7 +1085,12 @@ mod tests {
         // GGUF loader keeps the ctx knob (mirror of the HF-dir pin).
         let mut p = mistralrs_profile();
         p.ctx = 32768;
-        let flags = ["--max-model-len".to_string()].into_iter().collect();
+        let flags = [
+            "--max-model-len".to_string(),
+            "--max-num-batched-tokens".to_string(),
+        ]
+        .into_iter()
+        .collect();
         let argv = mistralrs_argv(
             &row,
             &p,
@@ -1090,6 +1105,14 @@ mod tests {
             .position(|a| a == "--max-model-len")
             .expect("GGUF rows keep --max-model-len");
         assert_eq!(argv[i + 1], "32768");
+        // The batch-step floor rides both loaders: v0.9.3 defaults to
+        // 4096 tokens per paged-attention step, so any longer prompt
+        // returns an empty-choices 200 (live-proven on the matrix run).
+        let b = argv
+            .iter()
+            .position(|a| a == "--max-num-batched-tokens")
+            .expect("GGUF rows raise the scheduler batch step");
+        assert_eq!(argv[b + 1], "32768");
     }
 
     #[test]
@@ -1129,6 +1152,42 @@ mod tests {
             !argv.contains(&"--max-model-len".to_string()),
             "HF loader must not receive --max-model-len"
         );
+        // The batch-step raise is loader-independent (same paged
+        // scheduler serves HF weights).
+        let flags = ["--max-num-batched-tokens".to_string()]
+            .into_iter()
+            .collect();
+        let argv = mistralrs_argv(
+            &row,
+            &p,
+            &Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 8123,
+            },
+            &flags,
+        );
+        let b = argv
+            .iter()
+            .position(|a| a == "--max-num-batched-tokens")
+            .expect("HF rows raise the scheduler batch step too");
+        assert_eq!(argv[b + 1], "32768");
+        // Small contexts never LOWER the engine default below the floor.
+        let mut tiny = mistralrs_profile();
+        tiny.ctx = 1024;
+        let argv = mistralrs_argv(
+            &row,
+            &tiny,
+            &Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 8123,
+            },
+            &flags,
+        );
+        let b = argv
+            .iter()
+            .position(|a| a == "--max-num-batched-tokens")
+            .expect("tiny ctx still raises the floor");
+        assert_eq!(argv[b + 1], "4096");
         std::fs::remove_dir_all(&tmp).ok();
     }
 

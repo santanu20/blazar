@@ -1232,6 +1232,26 @@ fn refuse_unsupported_think(row: &pallama_core::ModelRow, req: &Value) -> Option
     ))
 }
 
+/// A child can answer HTTP 200 with an empty `choices` array and an
+/// `error` object attached (live-proven: mistral.rs returns
+/// `service_unavailable` this way when a prompt exceeds the
+/// paged-attention batch step). Mapping that to an empty 200 hides the
+/// failure from clients; the sentinel logs it but the caller still sees
+/// "success". Surface it as a 502 instead.
+fn child_error_body(v: &Value) -> Option<String> {
+    let choices_empty = match v.get("choices").and_then(Value::as_array) {
+        Some(a) => a.is_empty(),
+        None => true,
+    };
+    if !choices_empty {
+        return None;
+    }
+    v.get("error").map(|e| match e {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    })
+}
+
 /// hit headers. Eval counts come from the original generation.
 fn semcache_hit_response(model: &str, cached: &Value, id: u64, sim: f32) -> Response {
     let mut ollama = tr::openai_chat_to_ollama(model, cached);
@@ -1437,6 +1457,9 @@ async fn proxy_core_chat(
             feed.value(openai.clone());
             // Drop fires End: the analyzer finalizes off the response path.
             drop(feed);
+        }
+        if let Some(msg) = child_error_body(&openai) {
+            return api_error(502, &format!("engine error: {msg}"));
         }
         let mut ollama = match shape {
             OutputShape::Chat => tr::openai_chat_to_ollama(model, &openai),
@@ -2826,6 +2849,27 @@ mod tests {
             "You are a helpful assistant.<|im_end|>"
         ));
         assert!(!template_supports_thinking(""));
+    }
+
+    #[test]
+    fn unit__child_error_body__empty_choices_with_error_surfaced() {
+        // The exact live failure shape: mistral.rs 200s with an empty
+        // choices array and a service_unavailable error object when a
+        // prompt exceeds the paged-attention batch step.
+        let body = serde_json::json!({
+            "id": "x",
+            "choices": [],
+            "error": {"message": "service_unavailable", "code": 503}
+        });
+        let msg = child_error_body(&body).expect("empty-choices error must surface");
+        assert!(msg.contains("service_unavailable"));
+        // String-typed error works too.
+        let str_err = serde_json::json!({"choices": [], "error": "boom"});
+        assert_eq!(child_error_body(&str_err).as_deref(), Some("boom"));
+        // Normal responses and error-free empties stay None.
+        assert!(child_error_body(&serde_json::json!({"choices": [{"i": 0}]})).is_none());
+        assert!(child_error_body(&serde_json::json!({"choices": []})).is_none());
+        assert!(child_error_body(&serde_json::json!({})).is_none());
     }
 
     #[test]
