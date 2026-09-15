@@ -6814,7 +6814,7 @@ def phase_commands() -> None:
         # llama-quantize refuses requantizing already-quantized tensors, so
         # the happy lane needs a real f16 source (1.5G download).
         src_repo = "ggml-org/Qwen3-0.6B-GGUF:F16"
-        psrc = _pull_retry(src_repo, timeout=3600)
+        psrc = _pull_retry("pull", src_repo, timeout=3600)
         if psrc.returncode != 0:
             regb(
                 "quantize.happy",
@@ -7187,7 +7187,7 @@ def phase_commands() -> None:
 
     def _pull():
         before = set(cli("list").stdout.split())
-        p = _pull_retry("ggml-org/Qwen3-0.6B-GGUF")
+        p = _pull_retry("pull", "ggml-org/Qwen3-0.6B-GGUF")
         after = set(cli("list").stdout.split())
         new = {w for w in after - before if "qwen3" in w.lower()}
         err = (p.stderr or "").lower()
