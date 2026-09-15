@@ -746,7 +746,7 @@ pub async fn chat(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let req: Value = match serde_json::from_slice(&body) {
+    let mut req: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
     };
@@ -798,15 +798,6 @@ pub async fn chat(
     {
         return unload_ping(&state, &model_field, true).await;
     }
-    let (mut openai_req, num_ctx) = match tr::chat_to_openai(&req) {
-        Ok(r) => r,
-        Err(e) => return api_error(400, &e),
-    };
-    // mistral.rs children register models as `default` (see proxy.rs).
-    if crate::proxy::child_model_default_active(&state) {
-        crate::proxy::set_child_model_default(&mut openai_req);
-    }
-
     let row = match state.with_store(|s| resolve_model(s, &model_field)) {
         Some(Ok(r)) => r,
         Some(Err(e)) => return api_error(404, &e),
@@ -823,8 +814,24 @@ pub async fn chat(
     }
     // Think-capability gate (ollama parity): refuse `think: true` on a
     // provably non-thinking template instead of silently ignoring it.
+    // Both think gates run BEFORE translation — the translator maps
+    // `think` to engine kwargs, so a post-translate mutation would never
+    // reach the child (live-caught: injected `think:false` was a no-op
+    // while explicit `think:false` worked).
     if let Some(resp) = refuse_unsupported_think(&row, &req) {
         return resp;
+    }
+    // Ollama parity for the absent toggle: thinking-capable templates
+    // default OFF when the caller did not say `think` (local lane only —
+    // remote forwards carry the caller's own bytes to the remote's policy).
+    default_think_off(&row, &mut req);
+    let (mut openai_req, num_ctx) = match tr::chat_to_openai(&req) {
+        Ok(r) => r,
+        Err(e) => return api_error(400, &e),
+    };
+    // mistral.rs children register models as `default` (see proxy.rs).
+    if crate::proxy::child_model_default_active(&state) {
+        crate::proxy::set_child_model_default(&mut openai_req);
     }
     // Strict tool-def lint (tools arrive in OpenAI shape after translate).
     if let Some(err) = state.sentinel.strict_tool_def_error_cached(&req) {
@@ -1146,6 +1153,28 @@ fn template_supports_thinking(template: &str) -> bool {
 /// a silent no-op. Fail-open on unreadable/absent templates — safetensors
 /// lanes and legacy GGUFs without `tokenizer.chat_template` keep today's
 /// behavior; refuse only on evidence.
+/// Ollama thinking parity for the *absent* `think` key: qwen3-dialect
+/// templates render thinking ON when the kwarg is missing, so an unbounded
+/// reasoning trace eats the whole `num_predict` budget and the answer never
+/// arrives (70k-char `reasoning_no_answer` spirals observed live). Ollama's
+/// documented default for thinking-capable models is OFF unless `think` is
+/// set — inject the explicit off-toggle when the template carries a thinking
+/// switch. Evidence rule matches the refuse gate: no readable template =
+/// no injection (fail-open). Explicit user `chat_template_kwargs` still win
+/// — the translate layer fills only missing keys.
+fn default_think_off(row: &pallama_core::ModelRow, req: &mut Value) {
+    if !req.get("think").is_none_or(Value::is_null) {
+        return;
+    }
+    let template = pallama_core::read_metadata_file(std::path::Path::new(&row.path))
+        .ok()
+        .and_then(|gguf| gguf.chat_template)
+        .unwrap_or_default();
+    if template_supports_thinking(&template) {
+        req["think"] = Value::Bool(false);
+    }
+}
+
 fn refuse_unsupported_think(row: &pallama_core::ModelRow, req: &Value) -> Option<Response> {
     if req["think"].as_bool() != Some(true) {
         return None;
@@ -1952,7 +1981,7 @@ pub async fn generate(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let req: Value = match serde_json::from_slice(&body) {
+    let mut req: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
     };
@@ -1968,17 +1997,7 @@ pub async fn generate(
         let ping_model = req["model"].as_str().unwrap_or_default().to_string();
         return unload_ping(&state, &ping_model, false).await;
     }
-    let mut openai_req = match tr::generate_to_openai(&req) {
-        Ok(Some(v)) => v,
-        Ok(None) => {
-            return api_error(
-                400,
-                "template/suffix in /api/generate are not supported; the engine applies the model's own template (use /api/chat for full message control)",
-            );
-        }
-        Err(msg) => return api_error(400, &msg),
-    };
-    let model = openai_req["model"].as_str().unwrap_or_default().to_string();
+    let model = req["model"].as_str().unwrap_or_default().to_string();
     let key_entry = key_ext
         .as_ref()
         .map(|Extension(k)| k.name.clone())
@@ -1999,10 +2018,25 @@ pub async fn generate(
         }
         state.keys.charge_request(name);
     }
-    // Think-capability gate (ollama parity), same as /api/chat.
+    // Think-capability gate (ollama parity), same as /api/chat. Both
+    // think gates run BEFORE translation — the translator maps `think`
+    // to engine kwargs, so a post-translate mutation would never reach
+    // the child (live-caught on /api/chat; same ordering here).
     if let Some(resp) = refuse_unsupported_think(&row, &req) {
         return resp;
     }
+    // Ollama parity for the absent toggle (local lane), same as /api/chat.
+    default_think_off(&row, &mut req);
+    let mut openai_req = match tr::generate_to_openai(&req) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return api_error(
+                400,
+                "template/suffix in /api/generate are not supported; the engine applies the model's own template (use /api/chat for full message control)",
+            );
+        }
+        Err(msg) => return api_error(400, &msg),
+    };
     let priority = Priority::from_header(
         headers
             .get("x-pallama-priority")
@@ -2795,6 +2829,45 @@ mod tests {
             &think_req(Some(false))
         )
         .is_none());
+    }
+
+    #[test]
+    fn unit__default_think_off__injects_false_only_for_thinking_templates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let thinker = tmp.path().join("thinker.gguf");
+        write_gguf_with_template(&thinker, Some("{%- if enable_thinking -%}"));
+        let plain = tmp.path().join("plain.gguf");
+        write_gguf_with_template(&plain, Some("You are a helpful assistant."));
+        let bare = tmp.path().join("bare.gguf");
+        write_gguf_with_template(&bare, None);
+
+        // Thinking template + absent think -> injected false (ollama parity).
+        let mut req = think_req(None);
+        default_think_off(&row_with_path(thinker.to_str().unwrap()), &mut req);
+        assert_eq!(req["think"], serde_json::Value::Bool(false));
+        // null think is treated as absent -> injected false.
+        let mut req: Value = serde_json::json!({"model": "m1", "messages": [], "think": null});
+        default_think_off(&row_with_path(thinker.to_str().unwrap()), &mut req);
+        assert_eq!(req["think"], serde_json::Value::Bool(false));
+        // Explicit user toggles are never touched.
+        let mut req = think_req(Some(true));
+        default_think_off(&row_with_path(thinker.to_str().unwrap()), &mut req);
+        assert_eq!(req["think"], serde_json::Value::Bool(true));
+        let mut req = think_req(Some(false));
+        default_think_off(&row_with_path(thinker.to_str().unwrap()), &mut req);
+        assert_eq!(req["think"], serde_json::Value::Bool(false));
+        // Non-thinking template: template default (off) already correct -> untouched.
+        let mut req = think_req(None);
+        default_think_off(&row_with_path(plain.to_str().unwrap()), &mut req);
+        assert!(req.get("think").is_none());
+        // Template-less GGUF -> fail-open, no injection.
+        let mut req = think_req(None);
+        default_think_off(&row_with_path(bare.to_str().unwrap()), &mut req);
+        assert!(req.get("think").is_none());
+        // Unreadable path -> fail-open (safetensors lanes).
+        let mut req = think_req(None);
+        default_think_off(&row_with_path("/nonexistent/m1.gguf"), &mut req);
+        assert!(req.get("think").is_none());
     }
 
     #[test]

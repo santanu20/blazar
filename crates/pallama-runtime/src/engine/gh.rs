@@ -374,6 +374,22 @@ impl GhClient {
                 dest.display()
             );
         }
+        // tty-only progress bar, same style as the model pull lane.
+        // indicatif hides itself when stderr is not a terminal, so
+        // daemon-driven installs keep their log-only behavior.
+        let bar = match resp.content_length() {
+            Some(len) => {
+                let bar = indicatif::ProgressBar::new(len);
+                bar.set_style(
+                    indicatif::ProgressStyle::default_bar()
+                        .template("{msg} {bar:30} {bytes}/{total_bytes} ({eta})")
+                        .expect("valid template"),
+                );
+                bar
+            }
+            None => indicatif::ProgressBar::new_spinner(),
+        };
+        bar.set_message(format!("engine {}", asset.name));
         let mut file =
             std::fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
         let mut hasher = Sha256::new();
@@ -384,7 +400,9 @@ impl GhClient {
             file.write_all(&chunk).context("write asset chunk")?;
             hasher.update(&chunk);
             total += chunk.len() as u64;
+            bar.inc(chunk.len() as u64);
         }
+        bar.finish_and_clear();
         if let Some(digest) = &asset.digest {
             let expected = digest
                 .strip_prefix("sha256:")
@@ -1332,5 +1350,82 @@ mod tests {
             Some(v) => std::env::set_var(ENGINE_OVERLAY_REPO_ENV, v),
             None => std::env::remove_var(ENGINE_OVERLAY_REPO_ENV),
         }
+    }
+
+    // Minimal one-shot HTTP/1.1 server on a loopback listener; serves
+    // `body` in two flushes so the client's chunk loop iterates more
+    // than once (progress bar increments ride the same path).
+    fn serve_once(body: &'static [u8]) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let url = format!("http://{addr}/asset.bin");
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 1024];
+            let mut seen = 0;
+            while seen < buf.len() {
+                let n = sock.read(&mut buf).expect("read request");
+                if n == 0 {
+                    break;
+                }
+                seen += n;
+                if buf[..seen].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            sock.write_all(head.as_bytes()).expect("write head");
+            let (a, b) = body.split_at(body.len() / 2);
+            sock.write_all(a).expect("write body a");
+            sock.flush().expect("flush a");
+            sock.write_all(b).expect("write body b");
+        });
+        url
+    }
+
+    fn asset(url: &str, digest: Option<&str>) -> GhAsset {
+        GhAsset {
+            name: "asset.bin".to_string(),
+            digest: digest.map(str::to_string),
+            size: None,
+            browser_download_url: url.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn unit__download_asset_file__streams_verifies_and_counts() {
+        let body: &'static [u8] = Box::leak(vec![7u8; 300_000].into_boxed_slice());
+        let url = serve_once(body);
+        let client = GhClient::with_base("http://127.0.0.1", None).expect("client");
+        let digest = format!("sha256:{:x}", Sha256::digest(body));
+        let dest = std::env::temp_dir().join("pallama-gh-dl-pin.bin");
+        let wrote = client
+            .download_asset_file(&asset(&url, Some(&digest)), &dest)
+            .await
+            .expect("download");
+        assert_eq!(wrote, body.len() as u64, "byte count");
+        let on_disk = std::fs::read(&dest).expect("read back");
+        assert_eq!(on_disk.len(), body.len(), "file length");
+        assert!(on_disk.iter().all(|&b| b == 7), "file content");
+    }
+
+    #[tokio::test]
+    async fn unit__download_asset_file__digest_mismatch_is_an_error() {
+        let body: &'static [u8] = b"tiny-but-hashed-wrong";
+        let url = serve_once(body);
+        let client = GhClient::with_base("http://127.0.0.1", None).expect("client");
+        let dest = std::env::temp_dir().join("pallama-gh-dl-pin-mismatch.bin");
+        let err = client
+            .download_asset_file(&asset(&url, Some("sha256:deadbeef")), &dest)
+            .await
+            .expect_err("mismatch must fail");
+        assert!(
+            err.to_string().contains("sha256 mismatch"),
+            "error names the mismatch: {err}"
+        );
     }
 }
