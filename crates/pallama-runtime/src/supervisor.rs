@@ -293,7 +293,7 @@ use crate::engine_impl::{ChildHandle, Engine};
 /// cost lands where it belongs instead of on a random first request.
 /// Warn-and-continue: a failed peg never fails an otherwise healthy
 /// child — the next request pays the JIT instead.
-async fn warm_peg_sglang(
+async fn warm_peg_child(
     model: &str,
     endpoint: &pallama_core::Endpoint,
     auth: Option<&str>,
@@ -301,8 +301,9 @@ async fn warm_peg_sglang(
 ) {
     let (host, port) = match endpoint {
         pallama_core::Endpoint::Tcp { host, port } => (host, *port),
-        // sglang is TCP-only (SglangEngine::spawn rejects unix); same
-        // guard as bank_restore_post for symmetry.
+        // Pegged engines are TCP-only (sglang and llama-server both
+        // reject unix sockets here); same guard as bank_restore_post
+        // for symmetry.
         pallama_core::Endpoint::Unix { .. } => return,
     };
     let url = format!("http://{host}:{port}/v1/chat/completions");
@@ -2448,30 +2449,58 @@ impl Supervisor {
                         let _ = child.reap().await;
                         continue;
                     }
-                    // Warm-peg (sglang only): drain residual JIT warmup
-                    // and peg concurrent batch shapes BEFORE Ready
-                    // publishes. Gated on engine kind — llamacpp/
-                    // mistralrs ship precompiled kernels and pay
-                    // nothing, so pegging them would only add spawn
-                    // latency. Burst width mirrors the compiled slots
-                    // (unpinned slots peg the auto default of 4).
+                    // Warm-peg (sglang + llamacpp): drain residual JIT
+                    // warmup and peg concurrent batch shapes. sglang
+                    // BLOCKS here — its health flips 200 before the
+                    // residual queue drains, so the first request pays
+                    // ~30 s anyway; pegging before Ready hands that cost
+                    // to the spawn instead, and every later request
+                    // arrives warm. llamacpp DETACHES: its first-request
+                    // cost is tiny and a blocking peg would tax every
+                    // spawn on a slow child (pinned live: a 10 s/request
+                    // child nearly tripled first-request latency).
+                    // mistralrs serves eagerly (matrix:
+                    // cold-to-first-token instant) and stays unpegged.
+                    // Burst width mirrors the compiled slots (unpinned
+                    // slots peg the auto default of 4). Probes hit the
+                    // child directly — they never touch gateway slot
+                    // accounting — and are bounded (90 s + 60 s).
+                    let kind = self.engine.kind();
                     if self.config.warm_after_spawn
-                        && self.engine.kind() == pallama_core::engine_kind::EngineKind::Sglang
+                        && matches!(
+                            kind,
+                            pallama_core::engine_kind::EngineKind::Sglang
+                                | pallama_core::engine_kind::EngineKind::LlamaCpp
+                        )
                     {
+                        let slots_flag = if kind == pallama_core::engine_kind::EngineKind::Sglang {
+                            "--max-running-requests"
+                        } else {
+                            "-np"
+                        };
                         let peg_n = argv
                             .windows(2)
                             .find_map(|w| {
-                                (w[0] == "--max-running-requests")
-                                    .then(|| w[1].parse::<usize>().unwrap_or(4))
+                                (w[0] == slots_flag).then(|| w[1].parse::<usize>().unwrap_or(4))
                             })
                             .map_or(4, |v| v.clamp(1, 8));
-                        warm_peg_sglang(
-                            &model.name,
-                            &endpoint,
-                            auth.as_ref().map(|a| a.secret.as_str()),
-                            peg_n,
-                        )
-                        .await;
+                        if kind == pallama_core::engine_kind::EngineKind::Sglang {
+                            warm_peg_child(
+                                &model.name,
+                                &endpoint,
+                                auth.as_ref().map(|a| a.secret.as_str()),
+                                peg_n,
+                            )
+                            .await;
+                        } else {
+                            let model_name = model.name.clone();
+                            let endpoint = endpoint.clone();
+                            let secret = auth.as_ref().map(|a| a.secret.clone());
+                            tokio::spawn(async move {
+                                warm_peg_child(&model_name, &endpoint, secret.as_deref(), peg_n)
+                                    .await;
+                            });
+                        }
                     }
 
                     // NEVER default the pid: a 0 here would later target
@@ -4253,7 +4282,7 @@ mod routing_tests {
         // without touching the network — the fail-fast guard before any
         // HTTP machinery spins up.
         let started = std::time::Instant::now();
-        warm_peg_sglang(
+        warm_peg_child(
             "m",
             &Endpoint::Unix {
                 socket: "/tmp/pallama-test.sock".into(),
