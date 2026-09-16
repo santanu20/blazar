@@ -7172,9 +7172,10 @@ def phase_commands() -> None:
         # ONE llamacpp build — the >=2-llamacpp dance is only reachable on
         # pre-dedaceb legacy stores. The designed switch dance on a modern
         # store pairs the llamacpp anchor with a real cross-kind engine
-        # row (sglang/mistralrs): `engine use`/`rollback` are history-
-        # driven and cross-kind by design (verified live: rollback off a
-        # freshly built engine steps to the sglang row, rc=0).
+        # row (sglang/mistralrs). `engine rollback` steps to the
+        # NEXT-OLDER row in the install-time list (newest-first), which
+        # crosses kinds naturally — verified live: rollback off a fresh
+        # llamacpp build steps to the sglang row, rc=0.
         dance = next((t for t in _store_engine_tags() if t != anchor), None)
     # Prefer a plain upstream tag for the pin-update dance so the lane
     # exercises the standard asset path whenever the store has one; a
@@ -7193,9 +7194,23 @@ def phase_commands() -> None:
         update_pick = anchor
 
     def _engine_full():
+        # Dance order fits rollback's real semantics: `engine rollback`
+        # activates engines[active_idx + 1] in the NEWEST-FIRST install
+        # list, so it must run while the NEWER anchor is active — it then
+        # lands on dance deterministically (anchor is always the newer
+        # row: full/server tags sort by build number desc, and a
+        # cross-kind dance partner is an older install). The historical
+        # order (use dance -> rollback) only worked on 3+-row stores
+        # where another row sat below dance in the list.
         p = cli("engine", "use", dance)
         ok_use = p.returncode == 0 and _active_engine_tag() == dance
         reg("engine.use", ok_use, f"active={_active_engine_tag()}")
+        p = cli("engine", "use", anchor)
+        reg(
+            "engine.use",
+            p.returncode == 0 and _active_engine_tag() == anchor,
+            f"active={_active_engine_tag()}",
+        )
         p = cli("engine", "rollback")
         stepped = _active_engine_tag()
         rout = p.stdout + p.stderr
@@ -7208,14 +7223,15 @@ def phase_commands() -> None:
         else:
             reg(
                 "engine.rollback",
-                p.returncode == 0 and stepped not in (None, dance),
-                f"rc={p.returncode} stepped to {stepped} out={rout.strip()[:60]}",
+                p.returncode == 0 and stepped == dance,
+                f"rc={p.returncode} stepped to {stepped} "
+                f"(expected next-older {dance}) out={rout.strip()[:60]}",
             )
         p = cli("engine", "use", anchor)
         reg(
-            "engine.use",
+            "engine.rollback",
             p.returncode == 0 and _active_engine_tag() == anchor,
-            f"active={_active_engine_tag()}",
+            "active restored after rollback dance",
         )
         p = cli("engine", "update", update_pick, "--no-gate", timeout=1800)
         eout = p.stdout + p.stderr
