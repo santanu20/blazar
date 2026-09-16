@@ -1427,10 +1427,7 @@ fn doctor_routing(d: &pallama_core::dirs::PallamaDirs) -> Vec<Check> {
         if let Err(teach) = routed_engine_lane(&cfg, global.as_ref(), &installed, &m.name, &m.path)
         {
             unservable += 1;
-            checks.push(Check::warn(
-                "routing",
-                format!("{}: {teach}", m.name),
-            ));
+            checks.push(Check::warn("routing", format!("{}: {teach}", m.name)));
         }
     }
     if unservable == 0 {
@@ -6511,11 +6508,7 @@ async fn engine_install_sglang(d: &PallamaDirs, version: Option<String>) -> Resu
 /// directly; bare call is a warn-only `PyPI` currency check (the flag
 /// contract is pinned to the version this Pallama build was verified
 /// against, so newer releases opt in per-version, never auto-install).
-async fn engine_update_sglang(
-    d: &PallamaDirs,
-    version: Option<String>,
-    check: bool,
-) -> Result<()> {
+async fn engine_update_sglang(d: &PallamaDirs, version: Option<String>, check: bool) -> Result<()> {
     // The no-version path is report-only by design (probe PyPI + print);
     // --check extends that to the pinned-version case so a dry-run never
     // reaches the venv install.
@@ -6659,7 +6652,12 @@ async fn route_update_to_build(
     }
 }
 
-async fn engine_update(d: &PallamaDirs, tag: Option<String>, no_gate: bool, check: bool) -> Result<()> {
+async fn engine_update(
+    d: &PallamaDirs,
+    tag: Option<String>,
+    no_gate: bool,
+    check: bool,
+) -> Result<()> {
     let token = std::env::var("GH_TOKEN").ok();
     let gh = GhClient::new(token)?;
     let cfg = config()?;
@@ -6704,7 +6702,10 @@ async fn engine_update(d: &PallamaDirs, tag: Option<String>, no_gate: bool, chec
             None => mgr.gh.resolve_tag(&target_tag).await?,
         };
         let lane = mgr.check_lane(&release).await?;
-        println!("update check — llamacpp lane, channel {}", cfg.update_channel);
+        println!(
+            "update check — llamacpp lane, channel {}",
+            cfg.update_channel
+        );
         match active_tag.as_deref() {
             Some(a) if a == target_tag => println!("up to date: {a} active"),
             Some(a) => println!(
@@ -8128,22 +8129,24 @@ mod tests {
         let err = routed_engine_lane(&cfg, None, &[], "m", "/x/m.gguf").unwrap_err();
         assert!(err.contains("pallama engine install"), "{err}");
         // A per-model pin to an uninstalled lane teaches with the roster.
-        let pinned = pallama_core::Config::from_toml(
-            "[model_overrides.m]\nengine = \"mistralrs\"\n",
-        )
-        .unwrap();
-        let err = routed_engine_lane(&pinned, Some(&global), &installed, "m", "/x/m.gguf")
-            .unwrap_err();
+        let pinned =
+            pallama_core::Config::from_toml("[model_overrides.m]\nengine = \"mistralrs\"\n")
+                .unwrap();
+        let err =
+            routed_engine_lane(&pinned, Some(&global), &installed, "m", "/x/m.gguf").unwrap_err();
         assert!(err.contains("no mistralrs engine installed"), "{err}");
         // Auto mode routes safetensors away from the llamacpp global.
         // (is_dir() must see a REAL directory — the format signal.)
         let dir = std::env::temp_dir();
-        let auto = pallama_core::Config::from_toml(
-            "[engine_routing]\nmode = \"auto\"\n",
-        )
-        .unwrap();
+        let auto = pallama_core::Config::from_toml("[engine_routing]\nmode = \"auto\"\n").unwrap();
         assert_eq!(
-            routed_engine_lane(&auto, Some(&global), &installed, "m", &dir.to_string_lossy()),
+            routed_engine_lane(
+                &auto,
+                Some(&global),
+                &installed,
+                "m",
+                &dir.to_string_lossy()
+            ),
             Ok("sg-1".to_string())
         );
     }
