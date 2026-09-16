@@ -1648,6 +1648,107 @@ _K = [
         None,
         "server-side reasoning switch string ('' = auto-detect; overlay roundtrip)",
     ),
+    # Post-v0.6.0 wave knobs that landed after the last registry sweep:
+    # 5 fresh-visible (gate (b) went RED on the first fresh-config-list
+    # diff: engine_routing/mistralrs/warm_peg tables always serialize,
+    # reuse_port/lora_init_without_apply are non-Option bools) + 6 Option
+    # knobs invisible in fresh output but required for the (c0)
+    # full-manifest membership denominator.
+    (
+        "engine_routing",
+        False,
+        True,
+        "roundtrip",
+        None,
+        "[engine_routing] table: mode manual|auto (auto default since the "
+        "routing-auto wave), policy quality|latency|throughput; dotted "
+        "set/get/unset round-trip",
+    ),
+    (
+        "mistralrs",
+        False,
+        True,
+        "boundary",
+        None,
+        "mistralrs engine tuning section (all-Option leaves; covered by "
+        "profile ladder units + argv-translator lockstep pins)",
+    ),
+    (
+        "warm_peg",
+        False,
+        True,
+        "roundtrip",
+        None,
+        "warm-peg table {default, sglang, llamacpp}; supervisor gate "
+        "enabled_for(kind) (unreleased rename hard-errors old pins)",
+    ),
+    (
+        "reuse_port",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "llama-server SO_REUSEPORT bool",
+    ),
+    (
+        "lora_init_without_apply",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "llama-server --lora-init-without-apply bool",
+    ),
+    (
+        "cont_batching",
+        True,
+        False,
+        "roundtrip",
+        None,
+        "tri-state: true -> --cont-batching, false -> --no-cont-batching, "
+        "None = engine default",
+    ),
+    (
+        "chat_template_kwargs",
+        True,
+        False,
+        "boundary",
+        None,
+        "JSON-object knob, shape-validated at parse (reasoning_effort "
+        "bridging wave); llama lane only",
+    ),
+    (
+        "server_timeout_secs",
+        True,
+        False,
+        "roundtrip",
+        None,
+        "llama-server --timeout (>0)",
+    ),
+    (
+        "sse_ping_interval",
+        True,
+        False,
+        "roundtrip",
+        None,
+        "SSE ping interval (>=-1; -1 disables)",
+    ),
+    (
+        "model_load_timeout_secs",
+        True,
+        False,
+        "roundtrip",
+        None,
+        "raises the 180s JIT-lane health budget (marlin repack / graph "
+        "capture lanes needed 600)",
+    ),
+    (
+        "mmproj_policy",
+        True,
+        False,
+        "boundary",
+        None,
+        "mmproj selection policy option",
+    ),
 ]
 
 TOPLEVEL_KNOBS = [
@@ -7808,6 +7909,19 @@ def _full_toplevel() -> dict:
         "models_autoload": False,
         "log_level": "pallama=info",
         "update_channel": "stable",
+        # post-v0.6.0 wave knobs (registry sweep): benign explicit values,
+        # None = deliberately omitted (Option knobs that pair poorly).
+        "engine_routing": {"mode": "manual", "policy": "quality"},
+        "mistralrs": {},
+        "warm_peg": {},
+        "reuse_port": False,
+        "lora_init_without_apply": False,
+        "cont_batching": None,
+        "chat_template_kwargs": None,
+        "server_timeout_secs": 300,
+        "sse_ping_interval": 15,
+        "model_load_timeout_secs": 600,
+        "mmproj_policy": None,
     }
 
 
