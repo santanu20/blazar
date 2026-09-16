@@ -2108,6 +2108,40 @@ fn ensure_batch_flag(argv: &mut Vec<String>, flag: &str, floor: u32) {
     }
 }
 
+/// Mistral.rs tuning flags that take a value. Single source of truth:
+/// `compile_mistralrs` emits them and the runtime argv translator
+/// forwards them — the lockstep unit test diffs a full-knob compile
+/// against these lists so neither side can drift alone.
+pub const MISTRALRS_TUNING_VALUE_FLAGS: &[&str] = &[
+    "--max-batch-size",
+    "--max-prefill-chunk-tokens",
+    "--max-decode-steps-before-prefill",
+    "--prefix-cache-n",
+    "--pa-block-size",
+    "--pa-cache-type",
+    "--pa-context-len",
+    "--lora",
+    "--lora-max-rank",
+    "--lora-max-adapters",
+    "--lora-max-bytes",
+    "--mtp-model",
+    "--mtp-n-predict",
+    "--mtp-draft-sampling",
+    "--encoder-cache-memory-mb",
+    "--max-num-images",
+    "--max-image-length",
+    "--device-layers",
+];
+
+/// Valueless (`store_true`) mistral.rs tuning flags. Same lockstep
+/// contract as [`MISTRALRS_TUNING_VALUE_FLAGS`].
+pub const MISTRALRS_TUNING_BOOL_FLAGS: &[&str] = &[
+    "--mtp",
+    "--disable-metrics",
+    "--disable-access-log",
+    "--enable-lora",
+];
+
 /// Effective `ctx`: overlay > config default, clamped to the model's
 /// `context_length` when known. Missing metadata warns, never guesses.
 /// Minimal mistral.rs profile: ctx via the same overlay/config/train-cap
@@ -7477,33 +7511,37 @@ mod tests {
         .collect()
     }
 
+    fn full_mistralrs_tuning() -> MistralrsTuning {
+        MistralrsTuning {
+            enable_lora: Some(true),
+            max_batch_size: Some(4),
+            max_prefill_chunk_tokens: Some(1024),
+            max_decode_steps_before_prefill: Some(16),
+            prefix_cache_n: Some(0),
+            pa_block_size: Some(64),
+            pa_cache_type: Some("bf16".into()),
+            pa_context_len: Some(4096),
+            lora_max_rank: Some(64),
+            lora_max_adapters: Some(2),
+            lora_max_bytes: Some(1_073_741_824),
+            mtp: Some(true),
+            mtp_model: Some("mtp-draft".into()),
+            mtp_n_predict: Some(3),
+            mtp_draft_sampling: Some("greedy".into()),
+            encoder_cache_memory_mb: Some(512),
+            max_num_images: Some(2),
+            max_image_length: Some(1024),
+            disable_metrics: Some(true),
+            disable_access_log: Some(true),
+            device_layers: Some("0:12".into()),
+        }
+    }
+
     #[test]
     fn unit__mistralrs_knobs__emit_across_all_families() {
         let g = meta();
         let cfg = Config {
-            mistralrs: MistralrsTuning {
-                enable_lora: Some(true),
-                max_batch_size: Some(4),
-                max_prefill_chunk_tokens: Some(1024),
-                max_decode_steps_before_prefill: Some(16),
-                prefix_cache_n: Some(0),
-                pa_block_size: Some(64),
-                pa_cache_type: Some("bf16".into()),
-                pa_context_len: Some(4096),
-                lora_max_rank: Some(64),
-                lora_max_adapters: Some(2),
-                lora_max_bytes: Some(1_073_741_824),
-                mtp: Some(true),
-                mtp_model: Some("mtp-draft".into()),
-                mtp_n_predict: Some(3),
-                mtp_draft_sampling: Some("greedy".into()),
-                encoder_cache_memory_mb: Some(512),
-                max_num_images: Some(2),
-                max_image_length: Some(1024),
-                disable_metrics: Some(true),
-                disable_access_log: Some(true),
-                device_layers: Some("0:12".into()),
-            },
+            mistralrs: full_mistralrs_tuning(),
             ..Config::default()
         };
         let loras = [("loras/style.gguf".to_string(), 2.0)];
@@ -7561,6 +7599,63 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("ignored on the mistralrs engine")));
+    }
+
+    #[test]
+    fn unit__mistralrs_tuning_flags__lockstep_with_compile_emission() {
+        // The argv translator forwards exactly the flags in
+        // MISTRALRS_TUNING_{VALUE,BOOL}_FLAGS. Diff a full-knob compile
+        // (plus a LoRA adapter, whose --lora token also rides the
+        // passthrough) against a default compile: every flag the knobs
+        // add must be listed (else the child argv silently drops it),
+        // and every listed flag must be emitted (else the list is stale).
+        let g = meta();
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let flags = mistralrs_knobs_flags();
+        let loras = [("loras/style.gguf".to_string(), 2.0)];
+        let cfg_full = Config {
+            mistralrs: full_mistralrs_tuning(),
+            ..Config::default()
+        };
+        let mut inp_full = input(&g, &hw, &cfg_full, &flags);
+        inp_full.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        inp_full.loras = &loras;
+        let argv_full = compile(&inp_full, &TuningOverrides::default())
+            .unwrap()
+            .argv;
+        let cfg_base = Config::default();
+        let mut inp_base = input(&g, &hw, &cfg_base, &flags);
+        inp_base.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        let argv_base = compile(&inp_base, &TuningOverrides::default())
+            .unwrap()
+            .argv;
+
+        let emitted_by_knobs: std::collections::BTreeSet<&str> = argv_full
+            .iter()
+            .filter(|t| t.starts_with("--") && !argv_base.contains(*t))
+            .map(String::as_str)
+            .collect();
+        let listed: std::collections::BTreeSet<&str> = MISTRALRS_TUNING_VALUE_FLAGS
+            .iter()
+            .chain(MISTRALRS_TUNING_BOOL_FLAGS.iter())
+            .copied()
+            .collect();
+        for t in &emitted_by_knobs {
+            assert!(
+                listed.contains(t),
+                "compile emits {t} but the translator flag lists lack it — the child argv would drop it"
+            );
+        }
+        for f in &listed {
+            assert!(
+                argv_full.iter().any(|t| t == f),
+                "translator lists {f} but no knob or adapter lane emits it — stale entry"
+            );
+        }
+        assert!(
+            !emitted_by_knobs.is_empty(),
+            "diff produced nothing — the fixture stopped exercising the knobs"
+        );
     }
 
     #[test]

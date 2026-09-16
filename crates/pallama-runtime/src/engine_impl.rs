@@ -646,46 +646,16 @@ pub fn mistralrs_argv(
     argv
 }
 
-/// Flags the mistral.rs profile dialect emits that take a value
-/// (forwarded with their following token). Keep in lockstep with
-/// `compile_mistralrs` in pallama-core.
-const MISTRALRS_TUNING_VALUE_FLAGS: &[&str] = &[
-    "--max-batch-size",
-    "--max-prefill-chunk-tokens",
-    "--max-decode-steps-before-prefill",
-    "--prefix-cache-n",
-    "--pa-block-size",
-    "--pa-cache-type",
-    "--pa-context-len",
-    "--lora",
-    "--lora-max-rank",
-    "--lora-max-adapters",
-    "--lora-max-bytes",
-    "--mtp-model",
-    "--mtp-n-predict",
-    "--mtp-draft-sampling",
-    "--encoder-cache-memory-mb",
-    "--max-num-images",
-    "--max-image-length",
-    "--device-layers",
-];
-
-/// Valueless (`store_true`) tuning flags the dialect emits.
-const MISTRALRS_TUNING_BOOL_FLAGS: &[&str] = &[
-    "--mtp",
-    "--disable-metrics",
-    "--disable-access-log",
-    "--enable-lora",
-];
-
 /// Forward the dialect's tuning tokens from the compiled profile argv
 /// into the child argv, manifest-gated per flag. Pair flags carry a
-/// value token; bool flags stand alone.
+/// value token; bool flags stand alone. The flag lists live in
+/// pallama-core next to `compile_mistralrs` — one source of truth.
 fn mistralrs_tuning_passthrough(
     dialect: &[String],
     flags: &std::collections::BTreeSet<String>,
     out: &mut Vec<String>,
 ) {
+    use pallama_core::profile::{MISTRALRS_TUNING_BOOL_FLAGS, MISTRALRS_TUNING_VALUE_FLAGS};
     let mut i = 0;
     while i < dialect.len() {
         let tok = dialect[i].as_str();
