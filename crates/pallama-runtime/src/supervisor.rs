@@ -2777,8 +2777,12 @@ impl Supervisor {
         }
     }
 
-    /// Exec the active engine's `llama-server --version` (5 s budget).
-    /// Any clean exit = healthy; timeout/crash/non-zero = broken.
+    /// Liveness check of the ACTIVE engine's own binary, per kind (see
+    /// `engine::verify_engine_binary`). Gates the rollback below: a
+    /// false verdict de-thrones a healthy engine, so probes exec what
+    /// the lane ships (llama-server --version / sglang venv metadata /
+    /// mistralrs --version) under a per-kind budget instead of the old
+    /// llamacpp-only name walk that structurally failed the venv lanes.
     fn probe_active_engine(&self) -> bool {
         let Ok(store) = Store::open(&self.dirs) else {
             return true; // cannot probe: assume innocent (H1: no false rollbacks)
@@ -2787,17 +2791,11 @@ impl Supervisor {
             return true;
         };
         advise_cuda_build(&store, &row);
-        let dir = self.dirs.engines_dir().join(&row.tag);
-        let Ok(bin) = crate::engine::find_server(&dir) else {
-            return false; // active engine dir has no server binary: broken
-        };
-        let ok = std::process::Command::new(&bin)
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
-        ok
+        crate::engine::verify_engine_binary(
+            &row.kind,
+            &self.dirs.engines_dir(),
+            Some(&row.manifest),
+        )
     }
 
     /// Switch the active engine to the previous install (same ordering as

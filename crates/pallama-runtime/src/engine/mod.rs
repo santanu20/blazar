@@ -1186,3 +1186,201 @@ fn make_executable(path: &Path) {
     #[cfg(not(unix))]
     let _ = path;
 }
+
+/// Run a read-only version probe under a time budget. Returns false on
+/// spawn failure, non-zero exit, or budget exhaustion.
+///
+/// No kill on timeout, by design: these probes are self-exiting version
+/// checks (never GPU/HTTP work), the worker thread reaps the child
+/// whenever it does finish, and sharing the `Child` handle across the
+/// waiter and a killer thread reintroduces the classic wait-vs-kill lock
+/// race. Bounding the DECISION (not the child's life) is the contract —
+/// the previous probe blocked the spawn path indefinitely instead.
+fn exec_version_probe(bin: &Path, args: &[&str], budget: std::time::Duration) -> bool {
+    let Ok(child) = std::process::Command::new(bin)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut child = child;
+        let _ = tx.send(child.wait().ok());
+    });
+    matches!(rx.recv_timeout(budget), Ok(Some(st)) if st.success())
+}
+
+/// Post-crash liveness check of the ACTIVE engine's own binary, per
+/// kind. This gates the supervisor's engine rollback: a false verdict
+/// silently de-thrones a healthy engine, so the probe must exec what the
+/// lane actually ships — historically this walked for `llama-server` by
+/// name only, which structurally failed for sglang (shim is
+/// `sglang-server`) and mistral.rs, making EVERY spawn failure on those
+/// lanes a guaranteed false rollback.
+///
+/// Per-kind probes (cheap, no GPU, no torch import):
+/// - llamacpp: `llama-server --version` (native exec, 5 s)
+/// - sglang: the venv's `importlib.metadata` version read — NOT the
+///   shim, which boots python+torch and parses `launch_server` args
+///   (slow, and `--version` is not a launch_server flag) (15 s)
+/// - mistral.rs: `mistralrs --version` (clap, native exec, 15 s)
+///
+/// `manifest_json` is the engine row's manifest; its `server_path`
+/// names the lane binary. llamacpp falls back to a name walk for
+/// manifest-less rows; the venv lanes cannot (their layout is the
+/// install contract).
+#[must_use]
+pub fn verify_engine_binary(
+    kind: &EngineKind,
+    engines_dir: &Path,
+    manifest_json: Option<&str>,
+) -> bool {
+    let mut manifest: Option<crate::engine::manifest::Manifest> = manifest_json
+        .and_then(|raw| serde_json::from_str::<crate::engine::manifest::Manifest>(raw).ok());
+    // Rows written before re-rooting carry stale absolute paths;
+    // `re_root_server_path` adopts the live engines dir when the
+    // recorded one is gone.
+    if let Some(m) = manifest.as_mut() {
+        m.re_root_server_path(engines_dir);
+    }
+    match kind {
+        EngineKind::LlamaCpp => {
+            let bin = manifest
+                .map(|m| PathBuf::from(m.server_path))
+                .or_else(|| find_server(engines_dir).ok());
+            bin.is_some_and(|b| {
+                exec_version_probe(&b, &["--version"], std::time::Duration::from_secs(5))
+            })
+        }
+        EngineKind::Sglang => {
+            // server_path = <engines>/<tag>/sglang-server → the venv sits
+            // next to the shim (sglang_install layout contract).
+            let py = manifest
+                .map(|m| PathBuf::from(m.server_path))
+                .and_then(|shim| shim.parent().map(|d| d.join("venv/bin/python")));
+            py.is_some_and(|p| {
+                exec_version_probe(
+                    &p,
+                    &[
+                        "-c",
+                        "import importlib.metadata as m; print(m.version(\"sglang\"))",
+                    ],
+                    std::time::Duration::from_secs(15),
+                )
+            })
+        }
+        EngineKind::MistralRs => manifest
+            .map(|m| PathBuf::from(m.server_path))
+            .is_some_and(|b| {
+                exec_version_probe(&b, &["--version"], std::time::Duration::from_secs(15))
+            }),
+    }
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::*;
+    use pallama_core::engine_kind::EngineKind;
+    use std::path::PathBuf;
+
+    fn fake_bin(dir: &std::path::Path, rel: &str, body: &str) -> PathBuf {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        make_executable(&p);
+        p
+    }
+
+    fn manifest_for(server_path: &std::path::Path) -> String {
+        serde_json::json!({
+            "tag": "t-test",
+            "build_number": 1,
+            "version_raw": "t",
+            "devices": [],
+            "flags": [],
+            "spec_types": [],
+            "server_path": server_path.display().to_string(),
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn unit__verify_engine_binary__llamacpp_version_probe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = fake_bin(tmp.path(), "llama-b/llama-server", "exit 0");
+        assert!(verify_engine_binary(
+            &EngineKind::LlamaCpp,
+            tmp.path(),
+            Some(&manifest_for(&bin))
+        ));
+        let bad = fake_bin(tmp.path(), "llama-bad/llama-server", "exit 3");
+        assert!(!verify_engine_binary(
+            &EngineKind::LlamaCpp,
+            tmp.path(),
+            Some(&manifest_for(&bad))
+        ));
+    }
+
+    #[test]
+    fn unit__verify_engine_binary__sglang_venv_metadata_probe() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The flashinfer-class regression pin: a sglang dir with NO
+        // llama-server anywhere and a WORKING venv must verify TRUE —
+        // the old name-walk probe returned false unconditionally for
+        // this lane and rolled healthy engines back.
+        let shim = fake_bin(tmp.path(), "sglang-server", "exec venv/bin/python \"$@\"");
+        fake_bin(
+            tmp.path(),
+            "venv/bin/python",
+            "echo 0.5.19 # fake metadata read",
+        );
+        assert!(verify_engine_binary(
+            &EngineKind::Sglang,
+            tmp.path(),
+            Some(&manifest_for(&shim))
+        ));
+        // Broken venv python (non-zero exit) must fail the probe.
+        let tmp2 = tempfile::tempdir().unwrap();
+        let shim2 = fake_bin(tmp2.path(), "sglang-server", "exec venv/bin/python \"$@\"");
+        fake_bin(tmp2.path(), "venv/bin/python", "exit 1");
+        assert!(!verify_engine_binary(
+            &EngineKind::Sglang,
+            tmp2.path(),
+            Some(&manifest_for(&shim2))
+        ));
+    }
+
+    #[test]
+    fn unit__verify_engine_binary__mistralrs_version_probe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = fake_bin(tmp.path(), "mistralrs", "echo mistralrs 0.9.3; exit 0");
+        assert!(verify_engine_binary(
+            &EngineKind::MistralRs,
+            tmp.path(),
+            Some(&manifest_for(&bin))
+        ));
+        // No manifest (legacy row): the venv lanes cannot fall back to a
+        // name walk — their layout is the install contract.
+        assert!(!verify_engine_binary(
+            &EngineKind::MistralRs,
+            tmp.path(),
+            None
+        ));
+    }
+
+    #[test]
+    fn unit__exec_version_probe__budget_bounds_the_decision_not_the_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = fake_bin(tmp.path(), "slow-probe", "sleep 30; exit 0");
+        let t0 = std::time::Instant::now();
+        let ok = exec_version_probe(&bin, &["--version"], std::time::Duration::from_secs(1));
+        assert!(!ok, "budget exhaustion must read as a failed probe");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "probe must return at roughly the budget, not the child lifetime"
+        );
+    }
+}
