@@ -6350,7 +6350,6 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                     use std::str::FromStr;
                     let wanted = pallama_core::engine_kind::EngineKind::from_str(&kind)
                         .map_err(|e| anyhow!("--kind {kind}: {e}"))?;
-                    let mgr = local_engine_manager(&d)?;
                     let rows = pallama_core::store::Store::open(&d)?.list_engines()?;
                     // list_engines is newest-first (rollback() treats
                     // idx+1 as older), so the first kind match IS the
