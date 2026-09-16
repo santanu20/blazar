@@ -108,12 +108,6 @@ pub struct AppState {
     pub singleflight: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<u64, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     >,
-    /// F34: memoized ACTIVE engine kind — `child_model_default_active`
-    /// ran one store SELECT per request just to learn it. Active-engine
-    /// switching is CLI/offline-only (no gateway route calls
-    /// `set_active_engine`), so the kind is constant per process; a
-    /// future live-switch feature MUST add invalidation here.
-    pub active_engine_kind: std::sync::Mutex<Option<pallama_core::engine_kind::EngineKind>>,
     /// The ACTUAL bound HTTP listener address (loopback-reachable form),
     /// set by `serve()` after bind. The batch worker needs this: config
     /// port 0 / dynamic ports must not be guessed from `config`.
@@ -236,7 +230,6 @@ impl AppState {
             singleflight: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            active_engine_kind: std::sync::Mutex::new(None),
         }
     }
 

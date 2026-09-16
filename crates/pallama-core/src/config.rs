@@ -1655,9 +1655,13 @@ pub struct EngineRouting {
     /// safetensors → sglang-else-mistral.rs).
     #[serde(default)]
     pub mode: RoutingMode,
-    /// Intent hint for route ordering once overlap tables carry weights.
-    /// Validated now, reserved in v1: routing is format-driven only, so a
-    /// `policy` value never changes which engine serves today.
+    /// Route ordering when engines overlap. `quality`/`throughput`
+    /// prefer sglang on safetensors (0.612-vs-0.575 quality, 752-vs-509
+    /// tok/s conc4); `latency` prefers mistral.rs there (26-vs-73 ms warm
+    /// TTFT, 8-vs-92 s cold boot). GGUF stays on llamacpp quant kernels
+    /// under every policy until a quant-matched mistral.rs GGUF matrix
+    /// row exists. Default `quality` — the same routing the format table
+    /// shipped with.
     #[serde(default)]
     pub policy: RoutingPolicy,
 }
@@ -1666,7 +1670,7 @@ impl Default for EngineRouting {
     fn default() -> Self {
         Self {
             mode: RoutingMode::Manual,
-            policy: RoutingPolicy::Latency,
+            policy: RoutingPolicy::Quality,
         }
     }
 }
@@ -1683,14 +1687,16 @@ pub enum RoutingMode {
     Auto,
 }
 
-/// `[engine_routing]` `policy` — reserved intent hint (v1: format-driven
-/// routing only).
+/// `[engine_routing]` `policy` — which engine wins when the format
+/// overlaps (safetensors is the only weighted fork in v1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum RoutingPolicy {
+    /// sglang on safetensors (quality + conc4 evidence); the default.
     #[default]
-    Latency,
     Quality,
+    /// mistral.rs on safetensors (TTFT + cold-boot evidence).
+    Latency,
     Throughput,
 }
 
@@ -3660,7 +3666,7 @@ default_ctx = 16384
         // reserved intent hint.
         let d = Config::default().engine_routing;
         assert_eq!(d.mode, RoutingMode::Manual);
-        assert_eq!(d.policy, RoutingPolicy::Latency);
+        assert_eq!(d.policy, RoutingPolicy::Quality);
 
         let cfg = Config::from_toml("[engine_routing]\nmode = \"auto\"\npolicy = \"throughput\"\n")
             .expect("auto + throughput parse");

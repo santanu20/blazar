@@ -407,6 +407,11 @@ pub enum SupervisionError {
 #[derive(Debug)]
 pub struct Instance {
     pub name: String,
+    /// Kind of the engine THIS child was spawned through — under
+    /// `[engine_routing]` auto/pin a routed adapter can differ from the
+    /// daemon-global active row; the gateway keys per-child protocol
+    /// quirks off this (never off the global kind).
+    pub kind: pallama_core::engine_kind::EngineKind,
     pub endpoint: Endpoint,
     /// Shared interior state: mutated by ensure/reaper under this lock.
     pub state: std::sync::RwLock<InstanceState>,
@@ -802,6 +807,10 @@ pub struct Supervisor {
 #[derive(Debug, Clone)]
 pub struct EngineRef {
     pub name: String,
+    /// Per-child serving kind (see `Instance::kind`) — the gateway's
+    /// authoritative answer to "which engine owns this child" under
+    /// routing.
+    pub kind: pallama_core::engine_kind::EngineKind,
     pub endpoint: Endpoint,
     /// Per-child bearer secret, stamped on every gateway call to this
     /// child (`proxy::child_auth` is the single choke point). Never
@@ -1474,6 +1483,7 @@ impl Supervisor {
     fn engine_ref(&self, inst: &Instance) -> EngineRef {
         EngineRef {
             name: inst.name.clone(),
+            kind: inst.kind,
             endpoint: inst.endpoint.clone(),
             auth: inst.auth.clone(),
         }
@@ -1799,6 +1809,8 @@ impl Supervisor {
                     }
                     let inst = Arc::new(Instance {
                         name: ROUTER_KEY.to_string(),
+                        // the router child IS a llama-server process
+                        kind: pallama_core::engine_kind::EngineKind::LlamaCpp,
                         endpoint,
                         state: std::sync::RwLock::new(InstanceState::Ready),
                         last_used: std::sync::RwLock::new(Instant::now()),
@@ -2002,7 +2014,6 @@ impl Supervisor {
         model_path: &str,
     ) -> Result<Option<(Arc<dyn Engine>, String)>, String> {
         use pallama_core::engine_kind::EngineKind;
-        use std::str::FromStr;
 
         let rows = store
             .list_engines()
@@ -2047,61 +2058,37 @@ impl Supervisor {
                 .join(", ")
         };
 
-        // 1. Per-model pin: exact tag first, then kind shorthand.
-        if let Some(pin) = overlay.engine.as_deref() {
-            if let Some(row) = rows.iter().find(|r| r.tag == pin) {
-                return adapter_for(row)
-                    .map(|a| Some((a, row.tag.clone())))
-                    .ok_or_else(|| format!("engine pin {pin:?}: manifest undecodable — reinstall it (pallama engine install --kind {})", row.kind.as_str()));
-            }
-            if let Ok(kind) = EngineKind::from_str(pin) {
-                if let Some(row) = rows.iter().find(|r| r.kind == kind) {
-                    return adapter_for(row)
-                        .map(|a| Some((a, row.tag.clone())))
-                        .ok_or_else(|| format!("engine pin {pin:?}: manifest undecodable — reinstall it (pallama engine install --kind {pin})"));
-                }
-                return Err(format!(
-                    "engine pin {pin:?} for {name}: no {pin} engine installed — roster: {}",
-                    roster()
-                ));
-            }
-            return Err(format!(
-                "engine pin {pin:?} for {name} matches no installed tag or kind — roster: {}",
+        // Shared decision (core `serving_lane`) — the gateway consults
+        // the SAME function to predict the serving lane for per-child
+        // protocol quirks, so supervisor and gateway can never disagree.
+        let installed: Vec<(String, EngineKind)> =
+            rows.iter().map(|r| (r.tag.clone(), r.kind)).collect();
+        let safetensors = std::path::Path::new(model_path).is_dir();
+        let Some((tag, _kind)) = pallama_core::engine_kind::serving_lane(
+            self.config.engine_routing.mode,
+            self.config.engine_routing.policy,
+            overlay.engine.as_deref(),
+            safetensors,
+            self.engine.kind(),
+            &installed,
+        )?
+        else {
+            // Manual mode, or auto picked the already-active lane.
+            return Ok(None);
+        };
+        let row = rows.iter().find(|r| r.tag == tag).ok_or_else(|| {
+            format!(
+                "routing picked {tag:?} but its row vanished — roster: {}",
                 roster()
-            ));
-        }
-
-        // 2. Auto mode: route on the model's storage format. A
-        // directory is a safetensors/HF layout, a file is GGUF — the
-        // same signal read_model_meta branches on.
-        if self.config.engine_routing.mode == pallama_core::config::RoutingMode::Auto {
-            let installed: Vec<EngineKind> = rows.iter().map(|r| r.kind).collect();
-            let safetensors = std::path::Path::new(model_path).is_dir();
-            match EngineKind::route_format(safetensors, &installed) {
-                Some(kind) => {
-                    if kind == self.engine.kind() {
-                        return Ok(None);
-                    }
-                    let row = rows.iter().find(|r| r.kind == kind);
-                    return row
-                        .and_then(adapter_for)
-                        .map(|a| Some((a, row.map(|r| r.tag.clone()).unwrap_or_default())))
-                        .ok_or_else(|| {
-                            format!("routing needs a {kind:?} engine — roster: {}", roster())
-                        });
-                }
-                None => {
-                    return Err(format!(
-                        "no installed engine serves the {} format of {name} — install one \
-                         (pallama engine install --kind sglang | --kind mistralrs for \
-                         safetensors, or an llamacpp build for GGUF); roster: {}",
-                        if safetensors { "safetensors" } else { "GGUF" },
-                        roster()
-                    ));
-                }
-            }
-        }
-        Ok(None)
+            )
+        })?;
+        adapter_for(row)
+            .map(|a| Some((a, row.tag.clone())))
+            .ok_or_else(|| {
+                format!(
+                    "engine {tag:?}: manifest undecodable — reinstall it (pallama engine install)"
+                )
+            })
     }
 
     async fn spawn_instance(&self, key: &str) -> Result<EngineRef, SupervisionError> {
@@ -2656,6 +2643,7 @@ impl Supervisor {
                     let autofit_model_name = model.name.clone();
                     let inst = Arc::new(Instance {
                         name: key.to_string(),
+                        kind: engine.kind(),
                         endpoint: endpoint.clone(),
                         state: std::sync::RwLock::new(InstanceState::Ready),
                         last_used: std::sync::RwLock::new(Instant::now()),
@@ -4358,6 +4346,7 @@ mod routing_tests {
         };
         let inst = Instance {
             name: key.to_string(),
+            kind: pallama_core::engine_kind::EngineKind::LlamaCpp,
             endpoint: endpoint.clone(),
             state: std::sync::RwLock::new(InstanceState::Ready),
             last_used: std::sync::RwLock::new(Instant::now()),
@@ -4487,6 +4476,7 @@ mod routing_tests {
         };
         let inst = Instance {
             name: key.to_string(),
+            kind: pallama_core::engine_kind::EngineKind::LlamaCpp,
             endpoint: endpoint.clone(),
             state: std::sync::RwLock::new(state),
             last_used: std::sync::RwLock::new(Instant::now()),

@@ -830,7 +830,8 @@ pub async fn chat(
         Err(e) => return api_error(400, &e),
     };
     // mistral.rs children register models as `default` (see proxy.rs).
-    if crate::proxy::child_model_default_active(&state) {
+    // Pre-spawn: predict the routed lane (engine not resolved yet).
+    if crate::proxy::child_model_default_predicted(&state, &row.name, &row.path) {
         crate::proxy::set_child_model_default(&mut openai_req);
     }
     // Strict tool-def lint (tools arrive in OpenAI shape after translate).
@@ -1794,7 +1795,7 @@ pub async fn embeddings(
             }
             let url = format!("{}/v1/embeddings", child_base(&engine.endpoint));
             // mistral.rs children register models as `default` (see proxy.rs).
-            if crate::proxy::child_model_default_active(&state) {
+            if crate::proxy::child_model_default(&engine) {
                 crate::proxy::set_child_model_default(&mut openai_req);
             }
             let resp = match child_auth(state.http.post(&url), &engine)
@@ -1907,7 +1908,7 @@ pub async fn embed(
             let url = format!("{}/v1/embeddings", child_base(&engine.endpoint));
             let mut openai_req = json!({"model": model, "input": inputs});
             // mistral.rs children register models as `default` (see proxy.rs).
-            if crate::proxy::child_model_default_active(&state) {
+            if crate::proxy::child_model_default(&engine) {
                 crate::proxy::set_child_model_default(&mut openai_req);
             }
             let resp = match child_auth(state.http.post(&url), &engine)
@@ -2010,7 +2011,7 @@ pub async fn rerank(
             let url = format!("{}/v1/rerank", child_base(&engine.endpoint));
             // mistral.rs children register models as `default` (see
             // proxy.rs) — F28: rerank lane now rewrites like every other.
-            if crate::proxy::child_model_default_active(&state) {
+            if crate::proxy::child_model_default(&engine) {
                 crate::proxy::set_child_model_default(&mut forward);
             }
             let resp = match child_auth(state.http.post(&url), &engine)
@@ -2169,7 +2170,7 @@ pub async fn generate(
     state.sup.note_prefix_hit(&engine.name);
     let model_name = row.name.clone();
     // mistral.rs children register models as `default` (see proxy.rs).
-    if crate::proxy::child_model_default_active(&state) {
+    if crate::proxy::child_model_default(&engine) {
         crate::proxy::set_child_model_default(&mut openai_req);
     }
     let openai_bytes = serde_json::to_vec(&openai_req).unwrap_or_default();

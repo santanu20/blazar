@@ -454,7 +454,7 @@ pub async fn proxy_request(
     // the same). Legacy /completions and non-chat routes pass through.
     // Both consumers reuse the hot lane's single parse.
     let body = inject_include_usage(path_query, body, parsed.as_ref());
-    let body = rewrite_child_model(state, body, parsed.as_ref());
+    let body = rewrite_child_model(engine, body, parsed.as_ref());
 
     // Single-flight (B8, FIX2): identical NON-STREAM chat requests
     // coalesce AT THE CHILD-CALL BOUNDARY (admission already happened:
@@ -798,24 +798,43 @@ fn is_chat_route(path_query: &str) -> bool {
 /// equivalent); Pallama spawns one model per child, so their stable
 /// `default` id is the unambiguous target. Shared by every child-bound
 /// body site (proxy lane + ollama translation lanes).
-pub(crate) fn child_model_default_active(state: &Arc<AppState>) -> bool {
-    // F34: one SELECT per process instead of one per request (the kind
-    // is constant for a daemon's lifetime — see state.rs field doc).
-    let mut cache = state
-        .active_engine_kind
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(kind) = cache.as_ref() {
-        return *kind == pallama_core::engine_kind::EngineKind::MistralRs;
-    }
-    let kind = state
-        .with_store(|s| s.active_engine().ok().flatten())
-        .flatten()
-        .map_or(pallama_core::engine_kind::EngineKind::LlamaCpp, |row| {
-            row.kind
-        });
-    *cache = Some(kind);
-    kind == pallama_core::engine_kind::EngineKind::MistralRs
+pub(crate) fn child_model_default(engine: &EngineRef) -> bool {
+    engine.kind == pallama_core::engine_kind::EngineKind::MistralRs
+}
+
+/// Pre-spawn prediction of [`child_model_default`] for sites that mutate
+/// the request BEFORE the engine exists (ollama chat translation).
+/// Consults the SAME core `serving_lane` the supervisor routes by, so
+/// the prediction and the actual spawn can never disagree — the
+/// daemon-global kind cache this replaces was wrong under
+/// `[engine_routing]` (routed mistral.rs children kept the caller's
+/// model name and answered `model ... was not found`).
+pub(crate) fn child_model_default_predicted(
+    state: &Arc<AppState>,
+    model_name: &str,
+    model_path: &str,
+) -> bool {
+    use pallama_core::engine_kind::{self, EngineKind};
+    let overlay = state.config.overlay_for(model_name);
+    let decision = state.with_store(|s| {
+        let rows = s.list_engines().unwrap_or_default();
+        let installed: Vec<(String, EngineKind)> =
+            rows.iter().map(|r| (r.tag.clone(), r.kind)).collect();
+        let global = s
+            .active_engine()
+            .ok()
+            .flatten()
+            .map_or(EngineKind::LlamaCpp, |r| r.kind);
+        engine_kind::serving_lane(
+            state.config.engine_routing.mode,
+            state.config.engine_routing.policy,
+            overlay.engine.as_deref(),
+            std::path::Path::new(model_path).is_dir(),
+            global,
+            &installed,
+        )
+    });
+    matches!(decision, Some(Ok(Some((_, EngineKind::MistralRs)))))
 }
 
 pub(crate) fn set_child_model_default(v: &mut serde_json::Value) {
@@ -828,11 +847,11 @@ pub(crate) fn set_child_model_default(v: &mut serde_json::Value) {
 /// many consumers); `None` = caller had no parse (cold lanes fall back
 /// to parsing here, exactly the old behavior).
 fn rewrite_child_model(
-    state: &Arc<AppState>,
+    engine: &EngineRef,
     body: axum::body::Bytes,
     parsed: Option<&serde_json::Value>,
 ) -> axum::body::Bytes {
-    if body.is_empty() || !child_model_default_active(state) {
+    if body.is_empty() || !child_model_default(engine) {
         return body;
     }
     let maybe_owned = parsed.cloned().map_or_else(
