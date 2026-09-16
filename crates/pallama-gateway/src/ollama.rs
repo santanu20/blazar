@@ -177,6 +177,11 @@ pub async fn tags(State(state): State<Arc<AppState>>) -> Response {
                     "mmproj_bytes": mm_bytes,
                 })
             });
+            // Which engine row WOULD serve this model right now (routed
+            // lane, or the global active row in manual mode). null =
+            // nothing can serve it — the spawn path teaches on use.
+            let engine =
+                crate::proxy::resolve_serving(&state, &m.name, &m.path).and_then(|lane| lane.tag);
             json!({
                 "name": format!("{}:{}", m.name, m.quant.to_lowercase()),
                 "model": format!("{}:{}", m.name, m.quant.to_lowercase()),
@@ -184,6 +189,7 @@ pub async fn tags(State(state): State<Arc<AppState>>) -> Response {
                 "size": m.bytes.saturating_add(mm_bytes),
                 "vision": details_vision,
                 "digest": m.sha256.clone().unwrap_or_default(),
+                "engine": engine,
                 "details": {
                     "family": m.arch.clone().unwrap_or_default(),
                     "parameter_size": format_params(m.params),

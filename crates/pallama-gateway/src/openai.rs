@@ -36,11 +36,17 @@ pub async fn models(State(state): State<Arc<AppState>>) -> Response {
     let data: Vec<serde_json::Value> = list
         .iter()
         .map(|m| {
+            // Which engine row WOULD serve this model right now (routed
+            // lane, or the global active row in manual mode). null =
+            // nothing can serve it — the spawn path teaches on use.
+            let engine =
+                crate::proxy::resolve_serving(&state, &m.name, &m.path).and_then(|lane| lane.tag);
             json!({
                 "id": format!("{}:{}", m.name, m.quant.to_lowercase()),
                 "object": "model",
                 "owned_by": "pallama",
                 "created": m.pulled_at,
+                "engine": engine,
             })
         })
         .collect();

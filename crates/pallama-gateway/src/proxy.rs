@@ -802,6 +802,63 @@ pub(crate) fn child_model_default(engine: &EngineRef) -> bool {
     engine.kind == pallama_core::engine_kind::EngineKind::MistralRs
 }
 
+/// Per-model serving resolution for sites that must answer BEFORE a
+/// spawn exists (request translation + model listings). `tag` is the
+/// engine row that WOULD serve this model right now — the routed lane's
+/// tag, or the global active row's tag when manual mode (or a pin)
+/// resolves to the global engine. `None` from the fn = store
+/// unavailable; `tag: None` inside = nothing can serve this model.
+pub(crate) struct LaneResolution {
+    pub tag: Option<String>,
+    pub kind: pallama_core::engine_kind::EngineKind,
+}
+
+pub(crate) fn resolve_serving(
+    state: &Arc<AppState>,
+    model_name: &str,
+    model_path: &str,
+) -> Option<LaneResolution> {
+    use pallama_core::engine_kind::{self, EngineKind};
+    let overlay = state.config.overlay_for(model_name);
+    state
+        .with_store(|s| {
+            let rows = s.list_engines().unwrap_or_default();
+            let installed: Vec<(String, EngineKind)> =
+                rows.iter().map(|r| (r.tag.clone(), r.kind)).collect();
+            let global_row = s.active_engine().ok().flatten();
+            let global = global_row.as_ref().map_or(EngineKind::LlamaCpp, |r| r.kind);
+            let lane = engine_kind::serving_lane(
+                state.config.engine_routing.mode,
+                state.config.engine_routing.policy,
+                overlay.engine.as_deref(),
+                std::path::Path::new(model_path).is_dir(),
+                global,
+                &installed,
+            );
+            match lane {
+                // Routed lane: its row is the answer.
+                Ok(Some((tag, kind))) => Some(LaneResolution {
+                    tag: Some(tag),
+                    kind,
+                }),
+                // Manual mode (or a pin resolving to the global engine): the
+                // GLOBAL engine serves — same contract the pre-routing
+                // daemon-lifetime cache had.
+                Ok(None) => Some(LaneResolution {
+                    tag: global_row.map(|r| r.tag),
+                    kind: global,
+                }),
+                // Nothing can serve (or a bad pin): no tag to advertise; the
+                // spawn path delivers the teaching error on use.
+                Err(_) => Some(LaneResolution {
+                    tag: None,
+                    kind: global,
+                }),
+            }
+        })
+        .flatten()
+}
+
 /// Pre-spawn prediction of [`child_model_default`] for sites that mutate
 /// the request BEFORE the engine exists (ollama chat translation).
 /// Consults the SAME core `serving_lane` the supervisor routes by, so
@@ -814,35 +871,12 @@ pub(crate) fn child_model_default_predicted(
     model_name: &str,
     model_path: &str,
 ) -> bool {
-    use pallama_core::engine_kind::{self, EngineKind};
-    let overlay = state.config.overlay_for(model_name);
-    let decision = state.with_store(|s| {
-        let rows = s.list_engines().unwrap_or_default();
-        let installed: Vec<(String, EngineKind)> =
-            rows.iter().map(|r| (r.tag.clone(), r.kind)).collect();
-        let global = s
-            .active_engine()
-            .ok()
-            .flatten()
-            .map_or(EngineKind::LlamaCpp, |r| r.kind);
-        let lane = engine_kind::serving_lane(
-            state.config.engine_routing.mode,
-            state.config.engine_routing.policy,
-            overlay.engine.as_deref(),
-            std::path::Path::new(model_path).is_dir(),
-            global,
-            &installed,
-        );
-        // Manual mode (or a pin resolving to the global engine) yields
-        // Ok(None) — the GLOBAL engine serves, so its kind decides the
-        // rewrite exactly like the pre-routing daemon-lifetime cache.
-        match lane {
-            Ok(Some((_, EngineKind::MistralRs))) => Some(true),
-            Ok(None) => Some(global == EngineKind::MistralRs),
-            _ => None,
-        }
-    });
-    decision.flatten().unwrap_or(false)
+    use pallama_core::engine_kind::EngineKind;
+    // `tag: None` = nothing can serve (or a bad pin) — the spawn path
+    // delivers the teaching error, so no rewrite fires; matching the
+    // pre-refactor contract where every Err predicted `false`.
+    resolve_serving(state, model_name, model_path)
+        .is_some_and(|lane| lane.tag.is_some() && lane.kind == EngineKind::MistralRs)
 }
 
 pub(crate) fn set_child_model_default(v: &mut serde_json::Value) {
