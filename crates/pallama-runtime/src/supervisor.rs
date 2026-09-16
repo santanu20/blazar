@@ -2008,7 +2008,6 @@ impl Supervisor {
     /// name nothing installed, or formats nothing installed can serve.
     fn resolve_routed_engine(
         &self,
-        name: &str,
         store: &Store,
         overlay: &pallama_core::config::ModelOverride,
         model_path: &str,
@@ -2117,7 +2116,7 @@ impl Supervisor {
         // Co-residency on small cards is handled by the same VRAM
         // ladders that guard any multi-instance box.
         let engine: Arc<dyn Engine> =
-            match self.resolve_routed_engine(name, &store, &overlay, &model.path) {
+            match self.resolve_routed_engine( &store, &overlay, &model.path) {
                 Ok(Some((routed, tag))) => {
                     tracing::info!(
                         model = name,
