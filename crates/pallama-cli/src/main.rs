@@ -3703,10 +3703,10 @@ fn trunc_ellipsis(s: &str, cap: usize) -> String {
 /// included) so a value can never bleed into the next column — the old
 /// fixed ARCH width let `Qwen2ForCausalLM` overlap CTX. NAME and ARCH cap
 /// with an ellipsis; SIZE and CTX right-align; PATH (last) is uncapped.
-fn render_list_table(header: [&str; 8], rows: &[[String; 8]]) -> String {
+fn render_list_table(header: [&str; 9], rows: &[[String; 9]]) -> String {
     const NAME_CAP: usize = 26;
     const ARCH_CAP: usize = 18;
-    let mut cells: Vec<[String; 8]> = vec![header.map(str::to_string)];
+    let mut cells: Vec<[String; 9]> = vec![header.map(str::to_string)];
     for r in rows {
         cells.push([
             trunc_ellipsis(&r[0], NAME_CAP),
@@ -3717,6 +3717,7 @@ fn render_list_table(header: [&str; 8], rows: &[[String; 8]]) -> String {
             r[5].clone(),
             r[6].clone(),
             r[7].clone(),
+            r[8].clone(),
         ]);
     }
     let width = |col: usize| {
@@ -3729,7 +3730,7 @@ fn render_list_table(header: [&str; 8], rows: &[[String; 8]]) -> String {
     let mut out = String::new();
     for r in &cells {
         out.push_str(&format!(
-            "{:<n$}  {:<q$}  {:>s$}  {:<v$}  {:<a$}  {:>c$}  {:<t$}  {}\n",
+            "{:<n$}  {:<q$}  {:>s$}  {:<v$}  {:<a$}  {:>c$}  {:<t$}  {:<e$}  {}\n",
             r[0],
             r[1],
             r[2],
@@ -3738,6 +3739,7 @@ fn render_list_table(header: [&str; 8], rows: &[[String; 8]]) -> String {
             r[5],
             r[6],
             r[7],
+            r[8],
             n = width(0),
             q = width(1),
             s = width(2),
@@ -3745,6 +3747,7 @@ fn render_list_table(header: [&str; 8], rows: &[[String; 8]]) -> String {
             a = width(4),
             c = width(5),
             t = width(6),
+            e = width(7),
         ));
     }
     out.trim_end().to_string()
@@ -3757,7 +3760,21 @@ fn list() -> Result<()> {
         println!("no models pulled");
         return Ok(());
     }
-    let rows: Vec<[String; 8]> = models
+    // Routed-engine column: the same lane decision the gateway's
+    // /v1/models and /api/tags rows carry, so the three listings can
+    // never disagree (manual = the active engine; auto = format+policy
+    // lane; "-" = nothing installed serves the model).
+    let cfg = pallama_core::Config::load(&dirs()).unwrap_or_default();
+    let engine_rows = store.list_engines()?;
+    let installed: Vec<(String, pallama_core::engine_kind::EngineKind)> = engine_rows
+        .iter()
+        .map(|r| (r.tag.clone(), r.kind))
+        .collect();
+    let global = engine_rows
+        .iter()
+        .find(|r| r.active)
+        .map(|r| (r.tag.clone(), r.kind));
+    let rows: Vec<[String; 9]> = models
         .iter()
         .map(|m| {
             // Multimodal visibility: the projector is a real on-disk cost
@@ -3775,6 +3792,26 @@ fn list() -> Result<()> {
                     }
                 },
             );
+            let engine = match &global {
+                Some((g_tag, g_kind)) => {
+                    let overlay = cfg.overlay_for(&m.name);
+                    let pin = overlay.engine.as_deref();
+                    let safetensors = std::path::Path::new(&m.path).is_dir();
+                    match pallama_core::engine_kind::serving_lane(
+                        cfg.engine_routing.mode,
+                        cfg.engine_routing.policy,
+                        pin,
+                        safetensors,
+                        *g_kind,
+                        &installed,
+                    ) {
+                        Ok(Some((tag, _))) => tag,
+                        Ok(None) => g_tag.clone(),
+                        Err(_) => "-".to_string(),
+                    }
+                }
+                None => "-".to_string(),
+            };
             [
                 m.name.clone(),
                 m.quant.clone(),
@@ -3783,6 +3820,7 @@ fn list() -> Result<()> {
                 m.arch.clone().unwrap_or_else(|| "?".to_string()),
                 m.ctx_train.map_or_else(String::new, |c| c.to_string()),
                 model_type_label(&m.path),
+                engine,
                 m.path.clone(),
             ]
         })
@@ -3790,7 +3828,7 @@ fn list() -> Result<()> {
     println!(
         "{}",
         render_list_table(
-            ["NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "PATH"],
+            ["NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "ENGINE", "PATH"],
             &rows
         )
     );
@@ -8013,6 +8051,7 @@ mod tests {
                 "nanbeige".to_string(),
                 "262144".to_string(),
                 "gguf".to_string(),
+                "b-test".to_string(),
                 "/m/Nanbeige.gguf".to_string(),
             ],
             [
@@ -8024,12 +8063,13 @@ mod tests {
                 "Qwen2ForCausalLM".to_string(),
                 "32768".to_string(),
                 "safetensors".to_string(),
+                "b-test".to_string(),
                 "/m/qwen.d".to_string(),
             ],
         ];
         let out = render_list_table(
             [
-                "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "PATH",
+                "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "ENGINE", "PATH",
             ],
             &rows,
         );
@@ -8045,6 +8085,7 @@ mod tests {
         at(lines[1], "nanbeige4.2-3b", 0);
         at(lines[1], "Q4_K_M", col(lines[0], "QUANT"));
         at(lines[1], "gguf", col(lines[0], "TYPE"));
+        at(lines[1], "b-test", col(lines[0], "ENGINE"));
         at(lines[2], "Qwen2ForCausalLM", col(lines[0], "ARCH"));
         at(lines[2], "safetensors", col(lines[0], "TYPE"));
         // Right-aligned CTX: all rows END at the same column offset
@@ -8063,11 +8104,12 @@ mod tests {
             "Qwen2VLForConditionalGeneration".to_string(),
             "4096".to_string(),
             "gguf".to_string(),
+            "sg-test".to_string(),
             "/m/x.gguf".to_string(),
         ]];
         let out2 = render_list_table(
             [
-                "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "PATH",
+                "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "ENGINE", "PATH",
             ],
             &long,
         );
