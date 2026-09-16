@@ -1987,6 +1987,123 @@ impl Supervisor {
     /// user-facing resolves through `model_of_key`, everything
     /// instance-scoped (pidfile, socket, sessions dir, maps, events)
     /// uses the full key so replicas never collide.
+    /// Resolve the engine that should serve THIS spawn (routing v1).
+    ///
+    /// Precedence: per-model pin (`[model_overrides."<name>"] engine =
+    /// "<tag-or-kind>"`) > format route in auto mode > `None` (keep the
+    /// daemon's global engine; manual mode is byte-identical to a Pallama
+    /// built without routing). An `Err` carries teaching for pins that
+    /// name nothing installed, or formats nothing installed can serve.
+    fn resolve_routed_engine(
+        &self,
+        name: &str,
+        store: &Store,
+        overlay: &pallama_core::config::ModelOverride,
+        model_path: &str,
+    ) -> Result<Option<(Arc<dyn Engine>, String)>, String> {
+        use pallama_core::engine_kind::EngineKind;
+        use std::str::FromStr;
+
+        let rows = store
+            .list_engines()
+            .map_err(|e| format!("list engines: {e}"))?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        // Local adapter for an installed row: manifest decode + the
+        // same re-root + env + staging wiring `serve()` uses, so a
+        // routed spawn behaves exactly like a daemon booted on that
+        // row.
+        let adapter_for = |row: &pallama_core::store::EngineRow| -> Option<Arc<dyn Engine>> {
+            let mut manifest: crate::engine::manifest::Manifest =
+                serde_json::from_str(&row.manifest).ok()?;
+            manifest.re_root_server_path(&self.dirs.engines_dir());
+            let env: Vec<(String, String)> = self
+                .config
+                .engine_env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            Some(match row.kind {
+                EngineKind::MistralRs => {
+                    Arc::new(crate::engine_impl::MistralRsEngine::with_staging(
+                        manifest,
+                        env,
+                        Some(self.dirs.run_dir().join("mistralrs-staging")),
+                    ))
+                }
+                EngineKind::Sglang => {
+                    Arc::new(crate::engine_impl::SglangEngine::with_env(manifest, env))
+                }
+                EngineKind::LlamaCpp => {
+                    Arc::new(crate::engine_impl::LlamaCppEngine::with_env(manifest, env))
+                }
+            })
+        };
+        let roster = || {
+            rows.iter()
+                .map(|r| format!("{} ({})", r.tag, r.kind.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        // 1. Per-model pin: exact tag first, then kind shorthand.
+        if let Some(pin) = overlay.engine.as_deref() {
+            if let Some(row) = rows.iter().find(|r| r.tag == pin) {
+                return adapter_for(row)
+                    .map(|a| Some((a, row.tag.clone())))
+                    .ok_or_else(|| format!("engine pin {pin:?}: manifest undecodable — reinstall it (pallama engine install --kind {})", row.kind.as_str()));
+            }
+            if let Ok(kind) = EngineKind::from_str(pin) {
+                if let Some(row) = rows.iter().find(|r| r.kind == kind) {
+                    return adapter_for(row)
+                        .map(|a| Some((a, row.tag.clone())))
+                        .ok_or_else(|| format!("engine pin {pin:?}: manifest undecodable — reinstall it (pallama engine install --kind {pin})"));
+                }
+                return Err(format!(
+                    "engine pin {pin:?} for {name}: no {pin} engine installed — roster: {}",
+                    roster()
+                ));
+            }
+            return Err(format!(
+                "engine pin {pin:?} for {name} matches no installed tag or kind — roster: {}",
+                roster()
+            ));
+        }
+
+        // 2. Auto mode: route on the model's storage format. A
+        // directory is a safetensors/HF layout, a file is GGUF — the
+        // same signal read_model_meta branches on.
+        if self.config.engine_routing.mode == pallama_core::config::RoutingMode::Auto {
+            let installed: Vec<EngineKind> = rows.iter().map(|r| r.kind).collect();
+            let safetensors = std::path::Path::new(model_path).is_dir();
+            match EngineKind::route_format(safetensors, &installed) {
+                Some(kind) => {
+                    if kind == self.engine.kind() {
+                        return Ok(None);
+                    }
+                    let row = rows.iter().find(|r| r.kind == kind);
+                    return row
+                        .and_then(adapter_for)
+                        .map(|a| Some((a, row.map(|r| r.tag.clone()).unwrap_or_default())))
+                        .ok_or_else(|| {
+                            format!("routing needs a {kind:?} engine — roster: {}", roster())
+                        });
+                }
+                None => {
+                    return Err(format!(
+                        "no installed engine serves the {} format of {name} — install one \
+                         (pallama engine install --kind sglang | --kind mistralrs for \
+                         safetensors, or an llamacpp build for GGUF); roster: {}",
+                        if safetensors { "safetensors" } else { "GGUF" },
+                        roster()
+                    ));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     async fn spawn_instance(&self, key: &str) -> Result<EngineRef, SupervisionError> {
         let name = model_of_key(key);
         let store =
@@ -1995,8 +2112,6 @@ impl Supervisor {
             .get_model(name)
             .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?
             .ok_or_else(|| SupervisionError::ModelNotFound(not_found_name(name)))?;
-        let meta_box = read_model_meta(&model.path, self.engine.kind())
-            .map_err(SupervisionError::UnsupportedModel)?;
         let mut overlay = self.config.overlay_for(name);
         // LC4: in-memory adaptive slots fill in ONLY where the user left
         // slots unset (manual overlay always wins; `tune --slots` writes
@@ -2006,6 +2121,30 @@ impl Supervisor {
                 overlay.slots = Some(*adopted);
             }
         }
+        // Engine routing v1: per-model pin (overlay `engine`, tag or
+        // kind) > auto-format route (mode = "auto") > the daemon's
+        // global engine (manual, byte-identical to no routing). A
+        // routed spawn builds a LOCAL adapter for the target row —
+        // adapters are cheap manifest+env structs — so the global
+        // active engine and its daemon-lifetime Arc stay untouched.
+        // Co-residency on small cards is handled by the same VRAM
+        // ladders that guard any multi-instance box.
+        let engine: Arc<dyn Engine> =
+            match self.resolve_routed_engine(name, &store, &overlay, &model.path) {
+                Ok(Some((routed, tag))) => {
+                    tracing::info!(
+                        model = name,
+                        from = self.engine.kind().as_str(),
+                        routed_to = tag.as_str(),
+                        "engine routing: spawn uses a routed adapter"
+                    );
+                    routed
+                }
+                Ok(None) => self.engine.clone(),
+                Err(teach) => return Err(SupervisionError::UnsupportedModel(teach)),
+            };
+        let meta_box = read_model_meta(&model.path, engine.kind())
+            .map_err(SupervisionError::UnsupportedModel)?;
         let loras: Vec<(String, f64)> = store
             .list_loras(Some(name))
             .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?
@@ -2026,7 +2165,7 @@ impl Supervisor {
         // unreadable header degrades to dense-only with a warn — it
         // must never block the spawn itself. sglang drafts are
         // safetensors dirs (eagle3 class): no GGUF header to read.
-        let draft_gguf = if self.engine.kind() == pallama_core::engine_kind::EngineKind::Sglang {
+        let draft_gguf = if engine.kind() == pallama_core::engine_kind::EngineKind::Sglang {
             None
         } else {
             draft_path.as_deref().and_then(|p| {
@@ -2109,7 +2248,7 @@ impl Supervisor {
             }
         }
 
-        let manifest = self.engine.capabilities();
+        let manifest = engine.capabilities();
         let model_bytes = u64::try_from(model.bytes.max(0)).unwrap_or(u64::MAX);
         // One fresh hardware probe serves both spawn-time decisions: the
         // J3 VRAM preflight and the LC2 auto GPU pick. The boot-time
@@ -2179,7 +2318,7 @@ impl Supervisor {
         let data_dir_str = self.dirs.data_dir.to_string_lossy().into_owned();
         let candidate_kv_mib = {
             let probe = ProfileInput {
-                engine_kind: self.engine.kind(),
+                engine_kind: engine.kind(),
                 sibling_devices: Vec::new(),
                 auto_tensor_split: None,
                 model_name: name,
@@ -2337,7 +2476,7 @@ impl Supervisor {
                 auth_keyfile = Some(p);
             }
             let input = ProfileInput {
-                engine_kind: self.engine.kind(),
+                engine_kind: engine.kind(),
                 sibling_devices: sibling_devices.clone(),
                 auto_tensor_split: auto_split.clone(),
                 model_name: name,
@@ -2413,12 +2552,12 @@ impl Supervisor {
             for w in &profile.warnings {
                 tracing::warn!(model = name, "profile: {w}");
             }
-            let mut argv = self.engine.build_argv(&model, &profile, &endpoint);
+            let mut argv = engine.build_argv(&model, &profile, &endpoint);
             if let Some(a) = &auth {
                 argv.extend(a.argv.iter().cloned());
             }
             self.remap_device_argv(&mut argv, name).await;
-            let mut child = self.engine.spawn(&argv, &endpoint).await.map_err(|e| {
+            let mut child = engine.spawn(&argv, &endpoint).await.map_err(|e| {
                 if let Some(p) = &auth_keyfile {
                     let _ = std::fs::remove_file(p);
                 }

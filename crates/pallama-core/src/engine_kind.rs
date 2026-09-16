@@ -34,6 +34,38 @@ impl EngineKind {
             EngineKind::Sglang => "sglang",
         }
     }
+
+    /// Format-driven route for `[engine_routing] mode = "auto"`: pick the
+    /// serving engine for one model from the installed kinds. GGUF runs
+    /// everywhere but llamacpp's quant kernels are the reference
+    /// (mistral.rs is the overlap fallback); safetensors is sglang's
+    /// native lane (mistral.rs fallback — llamacpp has no safetensors
+    /// lane at all). `None` = nothing installed can serve the format
+    /// (caller teaches; e.g. safetensors with only llamacpp installed).
+    #[must_use]
+    pub fn route_format(safetensors: bool, installed: &[EngineKind]) -> Option<EngineKind> {
+        if safetensors {
+            installed
+                .iter()
+                .find(|k| matches!(k, EngineKind::Sglang))
+                .or_else(|| {
+                    installed
+                        .iter()
+                        .find(|k| matches!(k, EngineKind::MistralRs))
+                })
+                .copied()
+        } else {
+            installed
+                .iter()
+                .find(|k| matches!(k, EngineKind::LlamaCpp))
+                .or_else(|| {
+                    installed
+                        .iter()
+                        .find(|k| matches!(k, EngineKind::MistralRs))
+                })
+                .copied()
+        }
+    }
 }
 
 impl fmt::Display for EngineKind {
@@ -102,5 +134,33 @@ mod tests {
             serde_json::from_str::<Old>("{}").unwrap().kind,
             EngineKind::LlamaCpp
         );
+    }
+
+    /// The `[engine_routing]` format table: GGUF prefers llamacpp with
+    /// mistral.rs as the overlap fallback; safetensors is sglang-native
+    /// (mistral.rs fallback, llamacpp has no lane at all); nothing
+    /// installed that can serve = None (caller teaches).
+    #[test]
+    fn unit__route_format__prefers_native_and_falls_back() {
+        use EngineKind::{LlamaCpp, MistralRs, Sglang};
+
+        let all = [LlamaCpp, MistralRs, Sglang];
+        assert_eq!(EngineKind::route_format(false, &all), Some(LlamaCpp));
+        assert_eq!(EngineKind::route_format(true, &all), Some(Sglang));
+
+        // Overlap fallbacks: GGUF without llamacpp, safetensors without
+        // sglang — both land on mistral.rs.
+        assert_eq!(
+            EngineKind::route_format(false, &[MistralRs, Sglang]),
+            Some(MistralRs)
+        );
+        assert_eq!(
+            EngineKind::route_format(true, &[LlamaCpp, MistralRs]),
+            Some(MistralRs)
+        );
+
+        // Unserved formats teach instead of guessing.
+        assert_eq!(EngineKind::route_format(true, &[LlamaCpp]), None);
+        assert_eq!(EngineKind::route_format(false, &[Sglang]), None);
     }
 }

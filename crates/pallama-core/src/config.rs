@@ -222,6 +222,17 @@ pub struct Config {
     /// first-ever JIT lanes (a cold sglang quantized spawn — marlin repack +
     /// CUDA-graph capture — can exceed 180 s on slow boxes).
     pub model_load_timeout_secs: Option<u64>,
+
+    /// Per-request engine routing (the `[engine_routing]` table). `manual`
+    /// (default) is byte-identical to today: the daemon's active engine
+    /// serves everything and format mismatches teach. `auto` routes each
+    /// spawn by model format — GGUF to llamacpp (else mistral.rs),
+    /// safetensors to sglang (else mistral.rs) — building the routed
+    /// engine's adapter for that spawn only; the global active engine is
+    /// untouched. Per-model `model_overrides.<name>.engine` pins win over
+    /// both modes.
+    #[serde(default)]
+    pub engine_routing: EngineRouting,
     /// `YaRN` `RoPE` context-extension factor: 0 = off; e.g. 2.0 doubles the
     /// usable context beyond the trained window at some quality cost.
     #[serde(default)]
@@ -858,6 +869,12 @@ pub struct ModelOverride {
     /// `mistralrs` engine.
     #[serde(default)]
     pub mistralrs: Option<MistralrsTuning>,
+    /// Pin this model to one engine — an exact engine tag (`b10980-cuda`)
+    /// or a kind (`llamacpp` / `sglang` / `mistralrs`). Wins over both
+    /// `[engine_routing]` modes; a tag that is not installed fails loudly
+    /// at spawn with the roster.
+    #[serde(default)]
+    pub engine: Option<String>,
 }
 
 /// Projector attach policy. Accepts the bool spellings the suppress knob
@@ -1626,6 +1643,57 @@ impl WarmPeg {
     }
 }
 
+/// Per-request engine routing — the `[engine_routing]` table. `manual`
+/// (default) keeps today's single-active-engine behavior byte-identical;
+/// `auto` picks the serving engine per model at spawn time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineRouting {
+    /// `manual` (default): the daemon's active engine serves everything;
+    /// format mismatches keep their teaching error. `auto`: route each
+    /// spawn by model format (GGUF → llamacpp-else-mistral.rs,
+    /// safetensors → sglang-else-mistral.rs).
+    #[serde(default)]
+    pub mode: RoutingMode,
+    /// Intent hint for route ordering once overlap tables carry weights.
+    /// Validated now, reserved in v1: routing is format-driven only, so a
+    /// `policy` value never changes which engine serves today.
+    #[serde(default)]
+    pub policy: RoutingPolicy,
+}
+
+impl Default for EngineRouting {
+    fn default() -> Self {
+        Self {
+            mode: RoutingMode::Manual,
+            policy: RoutingPolicy::Latency,
+        }
+    }
+}
+
+/// `[engine_routing]` `mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RoutingMode {
+    /// Active engine serves everything (byte-identical to pre-router
+    /// Pallama).
+    #[default]
+    Manual,
+    /// Route each spawn by model format.
+    Auto,
+}
+
+/// `[engine_routing]` `policy` — reserved intent hint (v1: format-driven
+/// routing only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RoutingPolicy {
+    #[default]
+    Latency,
+    Quality,
+    Throughput,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticCacheConfig {
@@ -1729,6 +1797,7 @@ impl Default for Config {
             prompt_preflight: true,
             spec_cache: true,
             warm_peg: WarmPeg::default(),
+            engine_routing: EngineRouting::default(),
             model_load_timeout_secs: None,
             ctx_extend: 0.0,
             cpu_moe_n: 0,
@@ -3582,6 +3651,40 @@ default_ctx = 16384
         assert!(
             err.to_string().contains("model_load_timeout_secs"),
             "error names the field: {err}"
+        );
+    }
+
+    #[test]
+    fn unit__engine_routing__parsed_and_guarded() {
+        // Default: manual = today's byte-identical behavior, policy is a
+        // reserved intent hint.
+        let d = Config::default().engine_routing;
+        assert_eq!(d.mode, RoutingMode::Manual);
+        assert_eq!(d.policy, RoutingPolicy::Latency);
+
+        let cfg = Config::from_toml("[engine_routing]\nmode = \"auto\"\npolicy = \"throughput\"\n")
+            .expect("auto + throughput parse");
+        assert_eq!(cfg.engine_routing.mode, RoutingMode::Auto);
+        assert_eq!(cfg.engine_routing.policy, RoutingPolicy::Throughput);
+
+        // Unknown mode/policy values fail loudly at parse time.
+        let err = Config::from_toml("[engine_routing]\nmode = \"yolo\"\n")
+            .expect_err("unknown mode rejected");
+        assert!(err.to_string().contains("yolo"), "error names it: {err}");
+        let err = Config::from_toml("[engine_routing]\npolicy = \"balanced\"\n")
+            .expect_err("unknown policy rejected");
+        assert!(
+            err.to_string().contains("balanced"),
+            "error names it: {err}"
+        );
+
+        // Per-model pin: exact tag or kind, wins over both modes.
+        let cfg =
+            Config::from_toml("[model_overrides.\"qwen2.5-0.5b\"]\nengine = \"b10980-cuda\"\n")
+                .expect("engine pin parses");
+        assert_eq!(
+            cfg.model_overrides["qwen2.5-0.5b"].engine.as_deref(),
+            Some("b10980-cuda")
         );
     }
 

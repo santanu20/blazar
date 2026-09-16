@@ -5045,6 +5045,7 @@ mod tests {
         override_tensor: None,
         devices: None,
         mistralrs: None,
+        engine: None,
         warmup: None,
         reasoning_budget: None,
         reasoning_effort: None,
