@@ -1225,7 +1225,7 @@ fn exec_version_probe(bin: &Path, args: &[&str], budget: std::time::Duration) ->
 /// - llamacpp: `llama-server --version` (native exec, 5 s)
 /// - sglang: the venv's `importlib.metadata` version read — NOT the
 ///   shim, which boots python+torch and parses `launch_server` args
-///   (slow, and `--version` is not a launch_server flag) (15 s)
+///   (slow, and `--version` is not a `launch_server` flag) (15 s)
 /// - mistral.rs: `mistralrs --version` (clap, native exec, 15 s)
 ///
 /// `manifest_json` is the engine row's manifest; its `server_path`
