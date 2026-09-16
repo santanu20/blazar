@@ -205,14 +205,17 @@ pub struct Config {
     /// (`--lookup-cache-dynamic`, one file per model).
     #[serde(default = "default_true")]
     pub spec_cache: bool,
-    /// Warm-peg JIT-class engines (sglang) at spawn: after /health turns
-    /// 200, fire one tiny single completion (drains the residual warmup
-    /// queue) plus a small concurrent burst (pegs the bs=N batch shapes)
-    /// BEFORE Ready publishes — the JIT cost lands in spawn instead of on
-    /// a random first request. No-op for engines that ship precompiled
-    /// kernels (llamacpp/mistralrs).
-    #[serde(default = "default_true")]
-    pub warm_after_spawn: bool,
+    /// Spawn warm-peg policy (the `[warm_peg]` table). `default` gates
+    /// every engine that benefits; `sglang`/`llamacpp` override it per
+    /// engine. Pegged engines fire one tiny single completion (drains
+    /// sglang's residual warmup queue) plus a small concurrent burst
+    /// (pegs the bs=N batch shapes) right after /health turns 200 — the
+    /// JIT cost lands in spawn instead of on a random first request.
+    /// sglang pegs blocking (its first request paid ~30 s anyway),
+    /// llamacpp pegs detached (near-zero cost). Engines that ship
+    /// precompiled kernels or serve eagerly (mistralrs) stay unpegged.
+    #[serde(default)]
+    pub warm_peg: WarmPeg,
     /// `YaRN` `RoPE` context-extension factor: 0 = off; e.g. 2.0 doubles the
     /// usable context beyond the trained window at some quality cost.
     #[serde(default)]
@@ -1561,7 +1564,50 @@ fn default_semantic_max_entries() -> usize {
 /// cache stores L2-normalized prompt vectors and serves stored responses
 /// when cosine similarity meets `threshold` for the same chat model and
 /// API key on the same lane.
+/// Spawn warm-peg policy — the `[warm_peg]` table. `default` gates every
+/// engine that benefits; `sglang`/`llamacpp` override it per engine
+/// (`pallama config set warm_peg.sglang false`). Engines outside the
+/// pegged set are never pegged regardless of `default`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WarmPeg {
+    /// Gate for every engine with a peg lane when no per-engine override
+    /// is pinned.
+    #[serde(default = "default_true")]
+    pub default: bool,
+    /// sglang override (its peg blocks spawn by design — set false to
+    /// publish Ready as soon as /health flips and let the first request
+    /// pay the residual warmup).
+    pub sglang: Option<bool>,
+    /// llamacpp override (its peg is detached and near-free).
+    pub llamacpp: Option<bool>,
+}
+
+impl Default for WarmPeg {
+    fn default() -> Self {
+        Self {
+            default: true,
+            sglang: None,
+            llamacpp: None,
+        }
+    }
+}
+
+impl WarmPeg {
+    /// Per-engine resolution: override wins over `default`; engines
+    /// without a peg lane are always false.
+    pub fn enabled_for(&self, kind: &crate::engine_kind::EngineKind) -> bool {
+        use crate::engine_kind::EngineKind;
+        match kind {
+            EngineKind::Sglang => self.sglang.unwrap_or(self.default),
+            EngineKind::LlamaCpp => self.llamacpp.unwrap_or(self.default),
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SemanticCacheConfig {
     /// Master switch. Never default-on (correctness risk).
     #[serde(default)]
@@ -1662,7 +1708,7 @@ impl Default for Config {
             singleflight: true,
             prompt_preflight: true,
             spec_cache: true,
-            warm_after_spawn: true,
+            warm_peg: WarmPeg::default(),
             ctx_extend: 0.0,
             cpu_moe_n: 0,
             cpu_ffn_n: 0,
@@ -3457,6 +3503,44 @@ default_ctx = 16384
         assert!(
             Config::from_toml("spec = \"ngram-simple\"\n").is_err(),
             "raw spec types are not config values"
+        );
+    }
+
+    #[test]
+    fn unit__warm_peg__per_engine_overrides_resolve() {
+        use crate::engine_kind::EngineKind;
+        // Defaults: peg both lanes, never the eager engines.
+        let base = WarmPeg::default();
+        assert!(base.enabled_for(&EngineKind::Sglang));
+        assert!(base.enabled_for(&EngineKind::LlamaCpp));
+        assert!(!base.enabled_for(&EngineKind::MistralRs));
+
+        // Per-engine override beats the default; siblings keep it.
+        let off = WarmPeg {
+            sglang: Some(false),
+            ..base.clone()
+        };
+        assert!(!off.enabled_for(&EngineKind::Sglang));
+        assert!(off.enabled_for(&EngineKind::LlamaCpp));
+
+        // Default-off kills both unless an engine opts back in.
+        let selective = WarmPeg {
+            default: false,
+            llamacpp: Some(true),
+            ..base
+        };
+        assert!(!selective.enabled_for(&EngineKind::Sglang));
+        assert!(selective.enabled_for(&EngineKind::LlamaCpp));
+
+        // The [warm_peg] table parses end-to-end and the legacy top-level
+        // pin is gone (fail-loud rename, no compat shim).
+        let cfg = Config::from_toml("[warm_peg]\ndefault = false\nsglang = true\n")
+            .expect("warm_peg table parses");
+        assert!(!cfg.warm_peg.enabled_for(&EngineKind::LlamaCpp));
+        assert!(cfg.warm_peg.enabled_for(&EngineKind::Sglang));
+        assert!(
+            Config::from_toml("warm_after_spawn = false\n").is_err(),
+            "the old top-level pin must fail loudly after the rename"
         );
     }
 

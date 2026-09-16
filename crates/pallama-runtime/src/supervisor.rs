@@ -2466,13 +2466,7 @@ impl Supervisor {
                     // child directly — they never touch gateway slot
                     // accounting — and are bounded (90 s + 60 s).
                     let kind = self.engine.kind();
-                    if self.config.warm_after_spawn
-                        && matches!(
-                            kind,
-                            pallama_core::engine_kind::EngineKind::Sglang
-                                | pallama_core::engine_kind::EngineKind::LlamaCpp
-                        )
-                    {
+                    if self.config.warm_peg.enabled_for(&kind) {
                         let slots_flag = if kind == pallama_core::engine_kind::EngineKind::Sglang {
                             "--max-running-requests"
                         } else {
