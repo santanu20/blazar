@@ -500,8 +500,15 @@ enum ConfigCmd {
         key: Option<String>,
     },
     /// Open the config file in `$VISUAL`/`$EDITOR`. The daemon keeps
-    /// the config it booted with until restarted.
-    Edit,
+    /// the config it booted with until restarted. With a model name the
+    /// editor opens with a comment hint block at the top listing that
+    /// model's engine tuning knobs — delete it or leave it, it strips
+    /// itself on save.
+    Edit {
+        /// Model name (from `pallama list`); its engine's knobs become
+        /// editor hints
+        model: Option<String>,
+    },
 }
 
 /// `pallama config --help` footer: the set → get → unset → defaults
@@ -515,7 +522,8 @@ Examples:
   pallama config list               full effective config as TOML
   pallama config set sglang.grammar_backend xgrammar    dotted keys reach table knobs
   pallama config unset sglang.grammar_backend           ...and unset them the same way
-  pallama config edit                 open the file in $VISUAL/$EDITOR";
+  pallama config edit                 open the file in $VISUAL/$EDITOR
+  pallama config edit qwen2.5-0.5b    ...with that model's engine knobs as editor hints";
 
 /// Grouping table for the top-level help. Descriptions and aliases come
 /// live from clap (single source of truth); this table owns ONLY the
@@ -5659,10 +5667,10 @@ fn remove_top_level_pin(raw: &str, key: &str) -> (String, Option<String>) {
 
 /// Split a dotted config key into its table path and leaf field:
 /// `model_overrides.qwen.sglang.grammar_backend` resolves to table
-/// ["model_overrides", "qwen", "sglang"], leaf "grammar_backend".
+/// path `model_overrides`, `qwen`, `sglang` and leaf `grammar_backend`.
 /// Bare keys (no dot) return None and keep the top-level flow.
 /// Quote-aware split of a dotted path into raw segment ranges:
-/// `a."b.c".d` -> ranges for ["a", "\"b.c\"", "d"]. Dots inside double
+/// `a."b.c".d` yields the ranges of `a`, `"b.c"`, `d`. Dots inside double
 /// quotes are part of the name. Unbalanced quotes -> None.
 fn quoted_seg_ranges(s: &str) -> Option<Vec<(usize, usize)>> {
     let bytes = s.as_bytes();
@@ -5688,18 +5696,186 @@ fn quoted_seg_ranges(s: &str) -> Option<Vec<(usize, usize)>> {
     Some(ranges)
 }
 
+/// Resolve a model name against the store and report the ACTIVE engine
+/// lane serving it (kind + tag) — the lane decides which knob families
+/// the editor hints list. Unknown models fail with the store's roster.
+fn resolve_model_and_engine(
+    model: &str,
+) -> Result<(String, pallama_core::engine_kind::EngineKind, String)> {
+    use pallama_core::engine_kind::EngineKind;
+    let d = dirs();
+    if !d.db_file().is_file() {
+        return Err(anyhow!(
+            "no pallama store yet — start the daemon once before asking for {model}'s knobs"
+        ));
+    }
+    let store = pallama_core::store::Store::open(&d).map_err(|e| anyhow!("{e}"))?;
+    let resolved = store.resolve_model_name(model);
+    let known = store
+        .list_models()
+        .map_err(|e| anyhow!("{e}"))?
+        .iter()
+        .map(|m| m.name.clone())
+        .collect::<Vec<_>>();
+    if !known.iter().any(|k| k == &resolved) {
+        let roster = if known.is_empty() {
+            "the store has no models yet".to_string()
+        } else {
+            known.join(", ")
+        };
+        return Err(anyhow!("unknown model: {model} (store: {roster})"));
+    }
+    // No active engine row = nothing serves yet; hint with the llamacpp
+    // dialect (the default lane) and say so.
+    let row = store.active_engine().map_err(|e| anyhow!("{e}"))?;
+    match row {
+        Some(r) => Ok((resolved, r.kind, r.tag)),
+        None => Ok((resolved, EngineKind::LlamaCpp, "none-active".into())),
+    }
+}
+
+/// Editor hint block for `pallama config edit <model>`: a comment-only
+/// TOML prelude listing the engine's tuning knobs and this model's
+/// override-table skeleton. Key sets are pinned to the config schema by
+/// `unit__knob_hint_block__keys_match_config_schema` (stale keys fail
+/// the probe ladder; NEW knobs need a line here — keep families short).
+fn knob_hint_block(model: &str, kind: pallama_core::engine_kind::EngineKind, tag: &str) -> String {
+    use pallama_core::engine_kind::EngineKind;
+    let mut out: Vec<String> = vec![format!(
+        "# --- pallama knob hints for {model} (safe to delete) ---"
+    )];
+    let lane = match kind {
+        EngineKind::LlamaCpp => "llama-server",
+        EngineKind::MistralRs => "mistral.rs",
+        EngineKind::Sglang => "sglang",
+    };
+    out.push(format!("# engine lane: {lane} ({tag})"));
+    out.push(
+        "# model-scoped table (uncomment lines you want — everything else stays at the engine default):"
+            .into(),
+    );
+    let knob = |line: &str| format!("#   {line}");
+    if let EngineKind::LlamaCpp = kind {
+        // llamacpp knobs are top-level scalars — listed first so an
+        // uncomment-all pass keeps them at root scope; the override
+        // table carries the routing/scheduling family.
+        out.push("# top-level llama-server child knobs (`config get <key>` shows current):".into());
+        out.push(knob("sse_ping_interval = -1    server_timeout_secs = 600"));
+        out.push(knob(
+            "chat_template_kwargs = \"{}\"    cont_batching = true",
+        ));
+        out.push(knob(
+            "reuse_port = false    lora_init_without_apply = false",
+        ));
+        out.push("#".into());
+        out.push(format!("# [model_overrides.\"{model}\"]"));
+        out.push(knob("replicas = 1    slots = 0    deterministic = false"));
+        out.push(knob("cache_type = \"\""));
+    } else {
+        let (table, families) = match kind {
+            EngineKind::Sglang => (
+                "sglang",
+                vec![
+                    "attention_backend = \"triton\"    sampling_backend = \"pytorch\"",
+                    "tool_call_parser = \"\"    reasoning_parser = \"\"    tokenizer_path = \"\"",
+                    "dtype = \"bfloat16\"    quantization = \"\"    kv_cache_dtype = \"auto\"",
+                    "mem_fraction_static = 0.85    cpu_offload_gb = 0    page_size = 1",
+                    "schedule_policy = \"fcfs\"    schedule_conservativeness = 1.0",
+                    "chunked_prefill_size = 8192    max_prefill_tokens = 16384    stream_interval = 1",
+                    "random_seed = 0    cuda_graph_max_bs = 8    cuda_graph_bs = [1, 2, 4]",
+                    "max_total_tokens = 4096    hicache_enable = false    hicache_ratio = 2.0    hicache_size = 0",
+                    "metrics = false    skip_warmup = false    torch_compile = false",
+                    "tokenizer_mode = \"auto\"    tokenizer_backend = \"huggingface\"",
+                    "tokenizer_worker_num = 1    detokenizer_worker_num = 1",
+                    "dynamic_batch_tokenizer = false    dynamic_batch_tokenizer_batch_size = 32",
+                    "dynamic_batch_tokenizer_batch_timeout = 2.0",
+                    "grammar_backend = \"xgrammar\"    radix_eviction_policy = \"lru\"",
+                    "session_radix_cache = false    mixed_chunk = false    sleep_on_idle = false",
+                    "memory_saver = false    watchdog_timeout = 300.0    cache_report = false",
+                    "batch_notify_size = 16    scheduler_recv_interval = 1",
+                    "tp_size = 1    dp_size = 1    pp_size = 1    ep_size = 1",
+                    "max_lora_rank = 16    lora_backend = \"\"",
+                ],
+            ),
+            EngineKind::MistralRs => (
+                "mistralrs",
+                vec![
+                    "max_batch_size = 1    max_prefill_chunk_tokens = 512",
+                    "max_decode_steps_before_prefill = 8    prefix_cache_n = 16",
+                    "pa_block_size = 32    pa_cache_type = \"auto\"    pa_context_len = 4096",
+                    "enable_lora = false    lora_max_rank = 16    lora_max_adapters = 16    lora_max_bytes = 8",
+                    "mtp = true    mtp_model = \"draft.gguf\"    mtp_n_predict = 1    mtp_draft_sampling = \"auto\"",
+                    "encoder_cache_memory_mb = 512    max_num_images = 1    max_image_length = 1024",
+                    "disable_metrics = false    disable_access_log = false    device_layers = \"0:10;1:20\"",
+                ],
+            ),
+            EngineKind::LlamaCpp => unreachable!("llamacpp handled above"),
+        };
+        out.push(format!("# [model_overrides.\"{model}\".{table}]"));
+        out.extend(families.into_iter().map(knob));
+        out.push(format!(
+            "# (also global [{table}] table — model rows override it wholesale)"
+        ));
+    }
+    out.push(
+        "# generic per-model rows (any engine): replicas / slots / deterministic / cache_type / ctx"
+            .into(),
+    );
+    out.push("# full knob surface: `pallama config defaults`".into());
+    out.push("# --- end knob hints ---".into());
+    out.join("\n") + "\n"
+}
+
+/// Remove the hint block injected by `config edit <model>` — only when
+/// both markers survived the editor untouched; anything mangled stays
+/// (comments are valid TOML, and guessing the end would eat user edits).
+fn strip_hint_block(raw: &str, model: &str) -> String {
+    let start = format!("# --- pallama knob hints for {model} (safe to delete) ---");
+    let end = "# --- end knob hints ---";
+    let lines: Vec<&str> = raw.lines().collect();
+    let s = lines.iter().position(|l| l.trim() == start);
+    let e = lines.iter().position(|l| l.trim() == end);
+    // Swallow the blank separator lines the injection left between
+    // the end marker and the original content.
+    let e = e.map(|e| {
+        let mut e = e;
+        while e + 1 < lines.len() && lines[e + 1].trim().is_empty() {
+            e += 1;
+        }
+        e
+    });
+    match (s, e) {
+        (Some(s), Some(e)) if s <= e => {
+            let mut stripped = lines
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i < s || *i > e)
+                .map(|(_, l)| *l)
+                .collect::<Vec<_>>()
+                .join("\n");
+            // `lines()` drops the final newline; restore it so a
+            // no-op strip is byte-identical to the input.
+            if raw.ends_with('\n') && !stripped.ends_with('\n') {
+                stripped.push('\n');
+            }
+            stripped
+        }
+        _ => raw.to_string(),
+    }
+}
+
 fn split_table_path(key: &str) -> Option<(Vec<&str>, &str)> {
+    fn clean_seg(s: &str) -> &str {
+        s.strip_prefix('"')
+            .and_then(|t| t.strip_suffix('"'))
+            .unwrap_or(s)
+    }
     if !key.contains('.') {
         return None;
     }
     let ranges = quoted_seg_ranges(key)?;
     if ranges.len() < 2 {
         return None;
-    }
-    fn clean_seg(s: &str) -> &str {
-        s.strip_prefix('"')
-            .and_then(|t| t.strip_suffix('"'))
-            .unwrap_or(s)
     }
     let parts: Vec<&str> = ranges[..ranges.len() - 1]
         .iter()
@@ -5710,8 +5886,9 @@ fn split_table_path(key: &str) -> Option<(Vec<&str>, &str)> {
 }
 
 /// Normalize a TOML table header into comparable segments:
-/// `[model_overrides."qwen-7b".sglang]` -> ["model_overrides", "qwen-7b", "sglang"].
-/// Array-of-tables headers (`[[...]]`) are a different structure: None.
+/// `[model_overrides."qwen-7b".sglang]` becomes `model_overrides`,
+/// `qwen-7b`, `sglang`. Array-of-tables headers (`[[...]]`) are a
+/// different structure: `None`.
 fn header_segments(line: &str) -> Option<Vec<String>> {
     let trimmed = line.trim();
     let body = trimmed.strip_prefix('[')?.strip_suffix(']')?;
@@ -7172,7 +7349,7 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                 }
             }
         }
-        ConfigCmd::Edit => {
+        ConfigCmd::Edit { model } => {
             // $VISUAL wins over $EDITOR (git convention); no fallback
             // to a hard-coded editor — guessing vi/nano on a box that
             // has neither fails more confusingly than this teaching.
@@ -7187,6 +7364,21 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
             if !path.exists() {
                 Config::load(&d).map_err(|e| anyhow!("{e}"))?;
             }
+            // Model-aware edit: resolve the model against the store,
+            // inject a comment hint block naming its engine's knobs,
+            // and strip it again when the editor exits.
+            let hint_model = match &model {
+                Some(m) => {
+                    let (resolved, kind, tag) = resolve_model_and_engine(m)?;
+                    let raw = std::fs::read_to_string(&path)
+                        .map_err(|e| anyhow!("read {}: {e}", path.display()))?;
+                    let injected = format!("{}\n{}", knob_hint_block(&resolved, kind, &tag), raw);
+                    std::fs::write(&path, injected)
+                        .map_err(|e| anyhow!("write {}: {e}", path.display()))?;
+                    Some(resolved)
+                }
+                None => None,
+            };
             let status = std::process::Command::new(&editor)
                 .arg(&path)
                 .status()
@@ -7194,7 +7386,18 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                     anyhow!("could not run editor {editor:?} on {}: {e}", path.display())
                 })?;
             if !status.success() {
+                // Leave any hint block in place: comments are valid
+                // TOML and the user may still be mid-edit.
                 return Err(anyhow!("editor {editor:?} exited with {status}"));
+            }
+            // Strip the hint block (only when both markers survived the
+            // editor; a deleted or mangled block stays as harmless
+            // comments rather than guessing where it ends).
+            if let Some(m) = hint_model {
+                let raw = std::fs::read_to_string(&path)
+                    .map_err(|e| anyhow!("read {}: {e}", path.display()))?;
+                std::fs::write(&path, strip_hint_block(&raw, &m))
+                    .map_err(|e| anyhow!("write {}: {e}", path.display()))?;
             }
             // Post-edit validation: a hand-broken file should surface
             // here, not at the next daemon boot.
@@ -7447,6 +7650,81 @@ mod tests {
         let (out2, removed2) = remove_table_key(raw, &["sglang"], "page_size");
         assert!(removed2.is_none(), "unpinned leaf removes nothing");
         assert_eq!(out2, raw, "byte-identical when nothing to remove");
+    }
+
+    /// `config edit <model>` hint blocks must stay in lockstep with the
+    /// config schema: uncommenting EVERY hinted `key = value` pair (with
+    /// the hint's own example values) has to parse through
+    /// `Config::from_toml` — a renamed or removed field fails
+    /// `deny_unknown_fields` here. New knobs without a hint line are NOT
+    /// caught (schema has no field iteration); add them to the family
+    /// lines when touching the tuning structs.
+    #[test]
+    fn unit__knob_hint_block__keys_match_config_schema() {
+        use pallama_core::engine_kind::EngineKind;
+
+        let uncomment = |block: &str| -> String {
+            let mut doc = String::new();
+            for line in block.lines() {
+                if let Some(header) = line.strip_prefix("# [") {
+                    doc.push('[');
+                    doc.push_str(header);
+                    doc.push('\n');
+                    continue;
+                }
+                let Some(pairs) = line.strip_prefix("#   ") else {
+                    continue;
+                };
+                for chunk in pairs.split("    ") {
+                    let chunk = chunk.trim();
+                    if chunk.contains(" = ") {
+                        doc.push_str(chunk);
+                        doc.push('\n');
+                    }
+                }
+            }
+            doc
+        };
+
+        for kind in [
+            EngineKind::Sglang,
+            EngineKind::MistralRs,
+            EngineKind::LlamaCpp,
+        ] {
+            let block = knob_hint_block("m", kind, "t-test");
+            assert!(block.starts_with("# --- pallama knob hints for m"));
+            assert!(block.contains("# --- end knob hints ---"));
+
+            let doc = uncomment(&block);
+            assert!(
+                !doc.is_empty(),
+                "{kind:?} block must carry uncommentable pairs"
+            );
+            Config::from_toml(&doc).unwrap_or_else(|e| {
+                panic!("{kind:?} hint keys drifted from the config schema: {e}\n--- doc ---\n{doc}")
+            });
+        }
+    }
+
+    /// The hint block strips itself cleanly after an editor roundtrip,
+    /// and a mangled marker pair leaves the file byte-identical.
+    #[test]
+    fn unit__strip_hint_block__roundtrip_and_mangled() {
+        let payload = "port = 11437\n\n[sglang]\nstream_interval = 2\n";
+        let block = knob_hint_block("m", pallama_core::engine_kind::EngineKind::Sglang, "t");
+        let injected = format!("{block}\n{payload}");
+        assert_eq!(strip_hint_block(&injected, "m"), payload);
+        // Editor deleted the end marker: nothing is stripped (comments
+        // stay, user edits are never guessed at).
+        let mangled: String = injected
+            .lines()
+            .filter(|l| !l.contains("# --- end knob hints ---"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert_eq!(strip_hint_block(&mangled, "m"), mangled);
+        // No block at all: passthrough.
+        assert_eq!(strip_hint_block(payload, "m"), payload);
     }
 
     #[test]
