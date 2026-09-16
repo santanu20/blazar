@@ -22,7 +22,7 @@ as of 2026-09-17 (v0.6.x era). Evidence tags:
 | safetensors dir, BF16/F16 | HF-name | refused | **native** | native | `PROVEN` (sglang 0.612 quality; mistral.rs 0.575) |
 | safetensors dir, AWQ | HF-name | refused | **native** (awq_marlin auto) | AWQ lane exists | `PROVEN` on sglang: marlin ~1.7x BF16 same-window decode, 369 tok/s through gateway = zero overhead |
 | safetensors dir, GPTQ | HF-name | refused | **native** (auto-detect) | GPTQ lane | `PROVEN` on sglang (0.5B Int4 pull + serve bench, see below) |
-| safetensors dir, FP8 (e4m3/e5m2) | HF-name | refused | native on Ada/Hopper | no | `EXPECTED` — sglang native lane; unbenched here |
+| safetensors dir, FP8 (e4m3/e5m2) | HF-name | refused | native on Ada/Hopper | no | `PROVEN` — RedHatAI/Qwen2.5-0.5B-Instruct-FP8-dynamic (876 MiB): cold 31.7 s (needs `model_load_timeout_secs = 600` + `cuda_graph_backend_prefill = "disabled"` on this laptop), warm ~260-275 tok/s triton w8a8-dynamic |
 | PyTorch `.bin` pickle shards (legacy HF) | HF-name | refused | loads via transformers loader | loads via loader | `EXPECTED` — works upstream, prefer safetensors remasters; unbenched here |
 | MLX (`.mlx` dirs, mlx-lm format) | HF-name fetches files | no | no | no | `N/A` on Linux — Apple-silicon ecosystem format; convert with `mlx-lm convert` (on a Mac) to safetensors, then serve on any lane |
 | EXL2 / ExLlamaV2 | fetches files | no | no | no | `N/A` — ExLlamaV2 runtime is not among Pallama's engines |
