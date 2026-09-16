@@ -396,7 +396,16 @@ enum EngineCmd {
     /// `pallama serve`) so running instances move to the new engine.
     /// GGUF models need a llama.cpp tag active; safetensors (HF-style
     /// directory) models need mistral.rs or sglang active.
-    Use { tag: String },
+    Use {
+        /// Exact engine tag (pallama engine list). Mutually exclusive
+        /// with --kind.
+        tag: Option<String>,
+        /// Engine kind name (llamacpp|sglang|mistralrs): activates the
+        /// newest installed row of that lane. Mutually exclusive with a
+        /// positional tag.
+        #[arg(long)]
+        kind: Option<String>,
+    },
     /// Remove a retired engine (directory + registry row); refuses the
     /// active tag — `pallama engine use` another first. Reports the
     /// reclaimed bytes.
@@ -6227,9 +6236,38 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 }
             }
         }
-        EngineCmd::Use { tag } => {
+        EngineCmd::Use { tag, kind } => {
+            let resolved_tag = match (tag, kind) {
+                (Some(tag), None) => tag,
+                (None, Some(kind)) => {
+                    use std::str::FromStr;
+                    let wanted = pallama_core::engine_kind::EngineKind::from_str(&kind)
+                        .map_err(|e| anyhow!("--kind {kind}: {e}"))?;
+                    let mgr = local_engine_manager(&d)?;
+                    let rows = pallama_core::store::Store::open(&d)?.list_engines()?;
+                    // list_engines is newest-first (rollback() treats
+                    // idx+1 as older), so the first kind match IS the
+                    // lane's newest build.
+                    rows.iter()
+                        .find(|r| r.kind == wanted && r.tag != "local")
+                        .map(|r| r.tag.clone())
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "no {kind} engine installed — pallama engine install --kind {kind}"
+                            )
+                        })?
+                }
+                (Some(_), Some(_)) => {
+                    return Err(anyhow!("pass either a tag or --kind, not both"));
+                }
+                (None, None) => {
+                    return Err(anyhow!(
+                        "engine use needs a tag or --kind (llamacpp|sglang|mistralrs)"
+                    ));
+                }
+            };
             let mgr = local_engine_manager(&d)?;
-            let row = mgr.use_tag(&tag)?;
+            let row = mgr.use_tag(&resolved_tag)?;
             println!("active engine: {}", row.tag);
             restart_hint().await;
         }
