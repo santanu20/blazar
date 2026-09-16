@@ -3531,6 +3531,19 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
             &mut warnings,
         );
     }
+    // Prefill graph backend: the 42-shape breakable prefill capture has
+    // deadlocked at 0% on hybrid-GPU laptops (live-proven with an AWQ
+    // marlin model); `disabled` skips it while decode graphs stay on.
+    if let Some(backend) = &tun.cuda_graph_backend_prefill {
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "sglang.cuda_graph_backend_prefill",
+            "--cuda-graph-backend-prefill",
+            backend,
+            &mut warnings,
+        );
+    }
     if let Some(v) = tun.max_total_tokens {
         push_tuned(
             &mut argv,
@@ -10305,6 +10318,7 @@ mod tests {
             "--batch-notify-size",
             "--scheduler-recv-interval",
             "--cuda-graph-bs",
+            "--cuda-graph-backend-prefill",
             "--max-total-tokens",
             "--tp-size",
             "--dp-size",
@@ -10402,6 +10416,7 @@ mod tests {
                 batch_notify_size: Some(32),
                 scheduler_recv_interval: Some(2),
                 cuda_graph_bs: Some(vec![1, 2, 4]),
+                cuda_graph_backend_prefill: Some("disabled".into()),
                 max_total_tokens: Some(65_536),
                 max_lora_rank: Some(64),
                 lora_backend: Some("pytorch".into()),
@@ -10457,6 +10472,8 @@ mod tests {
             .position(|a| a == "--cuda-graph-bs")
             .expect("cuda-graph-bs flag");
         assert_eq!(&p.argv[idx + 1..idx + 4], &["1", "2", "4"]);
+        // prefill graph backend rides as a value pair
+        pair("--cuda-graph-backend-prefill", "disabled");
         // bool flags never push a phantom empty-string positional
         assert!(
             !p.argv.iter().map(String::as_str).any(str::is_empty),
@@ -10478,6 +10495,7 @@ mod tests {
                 grammar_backend: Some("xgrammar".into()),
                 sleep_on_idle: Some(true),
                 cuda_graph_bs: Some(vec![1, 2]),
+                cuda_graph_backend_prefill: Some("disabled".into()),
                 tp_size: Some(2),
                 ..crate::config::SglangTuning::default()
             }),
@@ -10490,6 +10508,7 @@ mod tests {
             "--grammar-backend",
             "--sleep-on-idle",
             "--cuda-graph-bs",
+            "--cuda-graph-backend-prefill",
             "--tp-size",
         ] {
             assert!(

@@ -993,6 +993,12 @@ pub struct SglangTuning {
     /// (e.g. `[1, 2, 4]`). Overrides the ladder's derived
     /// cuda-graph-max-bs on tight fits.
     pub cuda_graph_bs: Option<Vec<u32>>,
+    /// `--cuda-graph-backend-prefill`: prefill-graph capture strategy —
+    /// `full`, `breakable` (upstream default), `tc_piecewise`, or
+    /// `disabled`. On some hybrid-GPU laptops the 42-shape breakable
+    /// prefill capture deadlocks at 0% (live-proven with an AWQ model);
+    /// `disabled` skips it while decode graphs stay captured.
+    pub cuda_graph_backend_prefill: Option<String>,
     /// `--max-total-tokens`: hard cap on KV tokens (ctx * capacity).
     pub max_total_tokens: Option<u64>,
     /// `--tp-size`: tensor parallelism. Emits only when > 1.
@@ -1107,6 +1113,13 @@ impl SglangTuning {
             "radix_eviction_policy",
             &self.radix_eviction_policy,
             &["lru", "lfu", "slru", "priority"],
+        ) {
+            return Err(e);
+        }
+        if let Some(e) = choice(
+            "cuda_graph_backend_prefill",
+            &self.cuda_graph_backend_prefill,
+            &["full", "breakable", "tc_piecewise", "disabled"],
         ) {
             return Err(e);
         }
@@ -3558,6 +3571,7 @@ default_ctx = 16384
              dynamic_batch_tokenizer_batch_timeout = 0.01\nbatch_notify_size = 32\n\
              scheduler_recv_interval = 2\nwatchdog_timeout = 300.0\n\
              cuda_graph_bs = [1, 2, 4]\nmax_total_tokens = 65536\n\
+             cuda_graph_backend_prefill = \"disabled\"\n\
              tp_size = 2\nmax_lora_rank = 64\nlora_backend = \"pytorch\"\n",
         )
         .unwrap();
@@ -3591,6 +3605,10 @@ default_ctx = 16384
             ("max_total_tokens", "[sglang]\nmax_total_tokens = 0\n"),
             ("cuda_graph_bs", "[sglang]\ncuda_graph_bs = []\n"),
             ("cuda_graph_bs", "[sglang]\ncuda_graph_bs = [1, 0]\n"),
+            (
+                "cuda_graph_backend_prefill",
+                "[sglang]\ncuda_graph_backend_prefill = \"junk\"\n",
+            ),
         ] {
             let err = Config::from_toml(raw).unwrap_err().to_string();
             assert!(err.contains(field), "{field}: {err}");

@@ -6,6 +6,9 @@ tracked here.
 
 ## [Unreleased]
 
+### Added
+- **`sglang.cuda_graph_backend_prefill` knob (2026-09-16): unsticks quantized spawns on hybrid-GPU laptops.** sglang 0.5.19's default `breakable` prefill CUDA-graph capture (42 shapes) deadlocks at 0% on hybrid iGPU+dGPU laptops — live-proven with an AWQ marlin load that never finished capturing while decode graphs captured fine. `cuda_graph_backend_prefill = "disabled"` (choices: full/breakable/tc_piecewise/disabled) skips the prefill capture and lets the spawn reach healthy: AWQ cold 21.8 s, warm ~369 tok/s through the gateway (parity with direct-shim 371 = zero gateway overhead). AWQ/marlin lane itself verified end-to-end (quant auto-detected, 0.46 GB weights); on 0.5B models BF16 stays 10-20% faster — quantization pays off only when weights outgrow VRAM.
+
 ### Changed
 - **mistral.rs `extra_args` is now strict manifest-gated passthrough (2026-09-16).** The lane used to blanket-refuse every override with a warn-drop ("its 'serve' grammar does not accept llama-server flags"), which silently disabled legitimate mistral.rs-only flags (`--isq` measured a perfect 1.00x A/B doing nothing). Now mirrors the sglang contract: a flag must exist in the engine's probed manifest (unknown → hard error with manifest teaching) and must not collide with the twelve supervisor/ladder-owned flags (reserved → hard error); everything else rides the child argv verbatim, and the argv translator forwards it manifest-gated. Live caveat from the proving experiment: mistral.rs v0.9.3 `--isq` itself is broken upstream on the cuda130-sm89 build (request-time `model_error` for GGUF and safetensors sources, `q4k` and `q8_0`, free or busy GPU) — passthrough verified working end-to-end, documented in `docs/engine-coverage.md`.
 
