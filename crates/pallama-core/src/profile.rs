@@ -4150,7 +4150,16 @@ fn warn_vulkan_slot_cap(
 /// charge is VRAM-resident everywhere). Unknown KV geometry means
 /// unknown cost: stay single-slot, never guess.
 fn auto_slots_capacity(input: &ProfileInput<'_>, base_ctx: u32, vram_bytes: u64) -> u32 {
-    const AUTO_SLOTS_CAP: u32 = 4;
+    // Capacity-aware ceiling. Cards with 8 GiB+ take 8 (np-sweep on an
+    // 8 GiB RTX 4070: slots 8 = 440.7 tok/s combined on a 4-stream burst
+    // vs 394 at the old cap of 4, identical per-request walls = true
+    // parallelism, not queueing); smaller cards keep the conservative 4
+    // where the KV budget, not the scheduler, stays the binding cap.
+    let auto_slots_cap: u32 = if vram_bytes >= Hardware::bytes(8192) {
+        8
+    } else {
+        4
+    };
     if base_ctx == 0 {
         return 1;
     }
@@ -4169,8 +4178,8 @@ fn auto_slots_capacity(input: &ProfileInput<'_>, base_ctx: u32, vram_bytes: u64)
     let ram_budget_bytes =
         Hardware::bytes(effective_cache_ram_mib(input).unwrap_or(input.hardware.total_ram_mib / 3));
     let clamp_to_cap = |slots: u64| {
-        AUTO_SLOTS_CAP
-            .min(u32::try_from(slots).unwrap_or(AUTO_SLOTS_CAP))
+        auto_slots_cap
+            .min(u32::try_from(slots).unwrap_or(auto_slots_cap))
             .max(1)
     };
     let ram_slots = clamp_to_cap(ram_budget_bytes / kv_per_slot);
@@ -4191,7 +4200,7 @@ fn auto_slots_capacity(input: &ProfileInput<'_>, base_ctx: u32, vram_bytes: u64)
         let headroom = (vram_bytes / 100 * 85).saturating_sub(resident);
         clamp_to_cap(headroom / kv_per_slot)
     };
-    AUTO_SLOTS_CAP
+    auto_slots_cap
         .min(train_slots)
         .min(ram_slots)
         .min(vram_slots)
@@ -6280,15 +6289,16 @@ mod tests {
         )
         .unwrap();
         // Train clamp bounds the TOTAL; the classic VRAM axis (device
-        // truth) then re-spends it as 4 shallow slots (train_slots 1 at
-        // the full clamp, so the re-spend branch wins): 4x10240.
+        // truth) then re-spends it as 8 shallow slots (train_slots 1 at
+        // the full clamp, so the re-spend branch wins; the auto ceiling
+        // on this 8 GiB+ card is 8): 8x5120.
         assert!(p
             .argv
             .windows(2)
             .any(|w| w[0] == "--ctx-size" && w[1] == "40960"));
-        assert!(p.argv.windows(2).any(|w| w == ["-np", "4"]));
-        assert_eq!(p.ctx, 10_240);
-        assert_eq!(p.ctx_autofit, Some((10_240, 4)));
+        assert!(p.argv.windows(2).any(|w| w == ["-np", "8"]));
+        assert_eq!(p.ctx, 5_120);
+        assert_eq!(p.ctx_autofit, Some((5_120, 8)));
         assert!(p.warnings.iter().any(|w| w.contains("clamped")));
     }
 
@@ -6310,11 +6320,12 @@ mod tests {
         )
         .unwrap();
         // YaRN lifts the CEILING (81920); the capacity re-spend then
-        // lands on 4x10240 (train_slots 2 caps the 20480 probe; the
-        // 10240 probe earns the full 4) — f16 KV 2240 MiB + weights
-        // 5000 <= the 12000 MiB card, no shrink needed.
-        assert_eq!(p.ctx, 10_240);
-        assert_eq!(p.ctx_autofit, Some((10_240, 4)));
+        // lands on 8x5120 (train_slots 2 caps the 20480 probe; the
+        // 5120 probe earns the full auto ceiling of 8 on this 8 GiB+
+        // card) — f16 KV 2240 MiB + weights 5000 <= the 12000 MiB card,
+        // no shrink needed.
+        assert_eq!(p.ctx, 5_120);
+        assert_eq!(p.ctx_autofit, Some((5_120, 8)));
         assert!(p
             .warnings
             .iter()
@@ -6626,13 +6637,15 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        // Stretched ceiling 61440; auto-fit divides to 4x7680 (30720 total).
+        // Stretched ceiling 61440; auto-fit divides to 5x7680 (38400
+        // total) — the raised auto ceiling admits the fifth slot on
+        // this 8 GiB+ card.
         assert_eq!(p.ctx, 7_680);
-        assert_eq!(p.ctx_autofit, Some((7_680, 4)));
+        assert_eq!(p.ctx_autofit, Some((7_680, 5)));
         assert!(p
             .argv
             .windows(2)
-            .any(|w| w[0] == "--ctx-size" && w[1] == "30720"));
+            .any(|w| w[0] == "--ctx-size" && w[1] == "38400"));
     }
 
     #[test]
@@ -7425,6 +7438,43 @@ mod tests {
         let p6 = compile(&inp6, &TuningOverrides::default()).unwrap();
         assert!(p6.argv.windows(2).any(|w| w == ["-np", "1"]));
         assert!(!p6.warnings.iter().any(|w| w.contains("slots auto")));
+    }
+
+    #[test]
+    fn unit__auto_slots__eight_cap_on_big_cards_only() {
+        // 8 GiB+ card with train/RAM/VRAM budgets that all admit 8: the
+        // ceiling itself binds (np-sweep evidence — true parallelism at
+        // slots 8 on an 8 GiB RTX 4070, 440.7 vs 394 tok/s at cap 4).
+        // Classic (non-unified) flags keep this on the direct
+        // auto_slots_capacity path; a small model keeps the small
+        // card's budget math away from the resident-weight floor.
+        let g = GgufMeta {
+            context_length: Some(131_072),
+            ..meta()
+        };
+        let cfg = Config::default();
+        let mut classic = full_flags();
+        classic.remove("--kv-unified");
+        let hw = gpu_hw(24_000, 64_000, 8);
+        let inp = ProfileInput {
+            model_bytes: 500 * MIB,
+            ..input(&g, &hw, &cfg, &classic).clone()
+        };
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p.argv.windows(2).any(|w| w == ["-np", "8"]), "{:?}", p.argv);
+
+        // Same budgets on a sub-8-GiB card keep the conservative 4.
+        let hw_small = gpu_hw(6_400, 64_000, 8);
+        let inp2 = ProfileInput {
+            model_bytes: 500 * MIB,
+            ..input(&g, &hw_small, &cfg, &classic).clone()
+        };
+        let p2 = compile(&inp2, &TuningOverrides::default()).unwrap();
+        assert!(
+            p2.argv.windows(2).any(|w| w == ["-np", "4"]),
+            "{:?}",
+            p2.argv
+        );
     }
 
     #[test]
@@ -8256,9 +8306,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p4.ctx_autofit, None);
-        assert!(p4.argv.windows(2).any(|w| w == ["-np", "4"]));
+        // 8 GiB+ card: the raised auto ceiling (8) now binds where the
+        // old cap of 4 used to.
+        assert!(p4.argv.windows(2).any(|w| w == ["-np", "8"]));
 
-        // Comfortable card with a shallow default: full cap at the base
+        // Comfortable card with a shallow default: train cap at the base
         // ctx, no autofit trade.
         let cfg_shallow = Config {
             default_ctx: 8_192,
@@ -8270,8 +8322,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p5.ctx_autofit, None);
-        assert!(p5.argv.windows(2).any(|w| w == ["-np", "4"]));
-        assert!(p5.argv.windows(2).any(|w| w == ["--ctx-size", "32768"]));
+        assert!(p5.argv.windows(2).any(|w| w == ["-np", "5"]));
+        assert!(p5.argv.windows(2).any(|w| w == ["--ctx-size", "40960"]));
         assert_eq!(p5.ctx, 8_192);
     }
 
@@ -9585,10 +9637,12 @@ mod tests {
     }
 
     #[test]
-    fn unit__compile_mistralrs__extra_args_warn_and_drop() {
-        // audit GAP-2: extra_args is llama-server dialect; a passthrough
-        // would hard-fail the mistral.rs boot. The lane must DROP the args
-        // (never emit) and teach in a warning naming every dropped flag.
+    fn unit__compile_mistralrs__extra_args_llama_dialect_refused() {
+        // audit GAP-2, post-strict-passthrough contract: extra_args with
+        // llama-server dialect on the mistralrs lane hard-fails at
+        // compile with manifest teaching (the old warn-and-drop silently
+        // disabled engine-only flags — see the ISQ A/B that measured
+        // nothing). Unknown-to-the-manifest = Err, never silent.
         let hw = gpu_hw(0, 32_000, 8);
         let g = meta();
         let empty: BTreeSet<String> = BTreeSet::new();
@@ -9600,16 +9654,13 @@ mod tests {
         let mut inp = input(&g, &hw, &cfg, &empty);
         inp.engine_kind = crate::engine_kind::EngineKind::MistralRs;
         inp.overlay = &ov;
-        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        let err = compile(&inp, &TuningOverrides::default())
+            .expect_err("llama-dialect extra_args must be refused loudly");
+        assert!(err.contains("--jinja"), "{err}");
         assert!(
-            !p.argv.iter().any(|a| a == "--jinja" || a == "--flash-attn"),
-            "llama-server flags must not reach the mistralrs argv: {:?}",
-            p.argv
+            err.contains("not in this mistralrs engine's probed manifest"),
+            "{err}"
         );
-        assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
-        let w = &p.warnings[0];
-        assert!(w.contains("--jinja") && w.contains("--flash-attn"), "{w}");
-        assert!(w.contains("mistralrs") && w.contains("engine use"), "{w}");
         // Empty extra_args stays silent — no warning noise for no action.
         let ov_empty = ModelOverride {
             extra_args: Some(Vec::new()),
