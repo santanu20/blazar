@@ -6,6 +6,9 @@ tracked here.
 
 ## [Unreleased]
 
+### Added
+- **The installer teaches the engine menu (2026-09-16).** Bootstrap stays zero-touch (llamacpp auto-picks the newest driver-compatible CUDA build; skip with `PALLAMA_INSTALL_ENGINE=0`), but every install now prints the one-liner for the other engines — `pallama engine install --kind sglang` / `--kind mistralrs` with honest cost notes (~6 GiB venv, Linux+NVIDIA; ~0.8 GiB) plus `engine list` / `engine use <tag>` for switching — so the choice is discoverable from the install output itself instead of the docs.
+
 ## [0.6.0] — 2026-09-16
 
 Full native tuning surface for all three engines, warm-peg, and the

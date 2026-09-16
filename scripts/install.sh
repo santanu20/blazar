@@ -718,6 +718,13 @@ EOF
     else
         status "engine already active (or bootstrap disabled) — skipping engine download"
     fi
+    # The bootstrap lane is llamacpp-only (zero-touch default: any GGUF,
+    # fastest cold start). The other engines are one command away — say
+    # so, every install, so the choice is discoverable without docs.
+    status "other engines, one command each:"
+    status "  pallama engine install --kind sglang     # SGLang: safetensors lane, best quality + batching (Linux + NVIDIA, ~6 GiB)"
+    status "  pallama engine install --kind mistralrs  # mistral.rs: GGUF + safetensors (~0.8 GiB)"
+    status "  pallama engine list                      # what is installed; pallama engine use <tag> switches the serving engine"
     # Fresh-install start, deferred until the engine exists (see the
     # enable block above). Started even when bootstrap failed: a running
     # crash-looping unit still answers `systemctl status` diagnostics
@@ -741,6 +748,7 @@ EOF
         status "  pallama pull <model>    # e.g. pallama pull Qwen3-0.6B (find one: pallama search qwen3)"
     fi
     status "  pallama doctor          # health check with per-row hints"
+    status "engines: llamacpp serves by default; the menu above installs SGLang or mistral.rs"
     status "All inference is upstream llama.cpp, mistral.rs and SGLang — the engine authors did the hard parts."
 }
 
