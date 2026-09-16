@@ -1218,6 +1218,39 @@ impl Check {
 /// (engine/whisper/app). Warn-only — never installs or starts anything
 /// (the engine row executes the engine binary with `--version`, nothing
 /// more).
+/// Resolve which engine tag would serve `name` right now — the ONE
+/// resolver behind `pallama list`'s ENGINE column and `pallama doctor`'s
+/// routing rows (the gateway has its own mirror for /v1/models +
+/// /api/tags; both call `serving_lane`). `Ok(None)`-lanes (manual mode,
+/// pin-to-global) resolve to the global tag; unservable models return
+/// the teaching error verbatim.
+fn routed_engine_lane(
+    cfg: &pallama_core::Config,
+    global: Option<&(String, pallama_core::engine_kind::EngineKind)>,
+    installed: &[(String, pallama_core::engine_kind::EngineKind)],
+    name: &str,
+    path: &str,
+) -> Result<String, String> {
+    let Some((g_tag, g_kind)) = global else {
+        return Err("no engine installed — pallama engine install --kind <kind>".to_string());
+    };
+    let overlay = cfg.overlay_for(name);
+    let pin = overlay.engine.as_deref();
+    let safetensors = std::path::Path::new(path).is_dir();
+    match pallama_core::engine_kind::serving_lane(
+        cfg.engine_routing.mode,
+        cfg.engine_routing.policy,
+        pin,
+        safetensors,
+        *g_kind,
+        installed,
+    ) {
+        Ok(Some((tag, _))) => Ok(tag),
+        Ok(None) => Ok(g_tag.clone()),
+        Err(teach) => Err(teach),
+    }
+}
+
 async fn doctor(flat: bool, json: bool) -> Result<()> {
     let d = dirs();
     let mut checks: Vec<Check> = Vec::new();
@@ -1272,6 +1305,7 @@ async fn doctor(flat: bool, json: bool) -> Result<()> {
     checks.extend(doctor_engine(&d).await);
     checks.extend(doctor_gpu(&d).await);
     checks.extend(doctor_engines(&d));
+    checks.extend(doctor_routing(&d));
     checks.extend(doctor_channels());
     checks.extend(doctor_whisper_currency(&d).await);
     checks.extend(doctor_whisper_models(&d));
@@ -1361,6 +1395,59 @@ async fn doctor(flat: bool, json: bool) -> Result<()> {
 /// every unmapped name (remotes, config pins, future rows) so no check
 /// ever disappears in grouped mode.
 const GROUPS: [&str; 6] = ["SYSTEM", "GPU", "ENGINES", "MODELS", "CHANNELS", "RUNTIME"];
+
+/// Routing rows: every pulled model must have a lane that can serve it
+/// (global active in manual mode, format+policy in auto). Unservable
+/// models surface the install command instead of failing at request
+/// time with the same text.
+fn doctor_routing(d: &pallama_core::dirs::PallamaDirs) -> Vec<Check> {
+    let Ok(store) = pallama_core::store::Store::open(d) else {
+        return Vec::new();
+    };
+    let models = match store.list_models() {
+        Ok(m) if !m.is_empty() => m,
+        _ => return Vec::new(),
+    };
+    let cfg = pallama_core::Config::load(d).unwrap_or_default();
+    let engine_rows = match store.list_engines() {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let installed: Vec<(String, pallama_core::engine_kind::EngineKind)> = engine_rows
+        .iter()
+        .map(|r| (r.tag.clone(), r.kind))
+        .collect();
+    let global = engine_rows
+        .iter()
+        .find(|r| r.active)
+        .map(|r| (r.tag.clone(), r.kind));
+    let mut checks = Vec::new();
+    let mut unservable = 0;
+    for m in &models {
+        if let Err(teach) = routed_engine_lane(&cfg, global.as_ref(), &installed, &m.name, &m.path)
+        {
+            unservable += 1;
+            checks.push(Check::warn(
+                "routing",
+                format!("{}: {teach}", m.name),
+            ));
+        }
+    }
+    if unservable == 0 {
+        checks.push(Check::ok(
+            "routing",
+            format!(
+                "{} mode — all {} pulled model(s) have a serving lane (see `pallama list`)",
+                match cfg.engine_routing.mode {
+                    pallama_core::config::RoutingMode::Auto => "auto",
+                    pallama_core::config::RoutingMode::Manual => "manual",
+                },
+                models.len()
+            ),
+        ));
+    }
+    checks
+}
 
 fn doctor_group(name: &str) -> &'static str {
     match name {
@@ -3792,26 +3879,8 @@ fn list() -> Result<()> {
                     }
                 },
             );
-            let engine = match &global {
-                Some((g_tag, g_kind)) => {
-                    let overlay = cfg.overlay_for(&m.name);
-                    let pin = overlay.engine.as_deref();
-                    let safetensors = std::path::Path::new(&m.path).is_dir();
-                    match pallama_core::engine_kind::serving_lane(
-                        cfg.engine_routing.mode,
-                        cfg.engine_routing.policy,
-                        pin,
-                        safetensors,
-                        *g_kind,
-                        &installed,
-                    ) {
-                        Ok(Some((tag, _))) => tag,
-                        Ok(None) => g_tag.clone(),
-                        Err(_) => "-".to_string(),
-                    }
-                }
-                None => "-".to_string(),
-            };
+            let engine = routed_engine_lane(&cfg, global.as_ref(), &installed, &m.name, &m.path)
+                .unwrap_or_else(|_| "-".to_string());
             [
                 m.name.clone(),
                 m.quant.clone(),
@@ -8037,6 +8106,46 @@ mod tests {
         assert_eq!(
             model_type_label(tmp.path().join("nope.gguf").to_str().unwrap()),
             "missing!"
+        );
+    }
+
+    #[test]
+    fn unit__routed_engine_lane__mirrors_serving_lane_contract() {
+        use pallama_core::engine_kind::EngineKind;
+
+        let cfg = pallama_core::Config::default();
+        let installed = vec![
+            ("b-new".to_string(), EngineKind::LlamaCpp),
+            ("sg-1".to_string(), EngineKind::Sglang),
+        ];
+        let global = ("b-new".to_string(), EngineKind::LlamaCpp);
+
+        // Manual mode: the global lane serves, tag echoed back.
+        assert_eq!(
+            routed_engine_lane(&cfg, Some(&global), &installed, "m", "/x/m.gguf"),
+            Ok("b-new".to_string())
+        );
+        // No engines at all: teaching error names the install command.
+        let err = routed_engine_lane(&cfg, None, &[], "m", "/x/m.gguf").unwrap_err();
+        assert!(err.contains("pallama engine install"), "{err}");
+        // A per-model pin to an uninstalled lane teaches with the roster.
+        let pinned = pallama_core::Config::from_toml(
+            "[model_overrides.m]\nengine = \"mistralrs\"\n",
+        )
+        .unwrap();
+        let err = routed_engine_lane(&pinned, Some(&global), &installed, "m", "/x/m.gguf")
+            .unwrap_err();
+        assert!(err.contains("no mistralrs engine installed"), "{err}");
+        // Auto mode routes safetensors away from the llamacpp global.
+        // (is_dir() must see a REAL directory — the format signal.)
+        let dir = std::env::temp_dir();
+        let auto = pallama_core::Config::from_toml(
+            "[engine_routing]\nmode = \"auto\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            routed_engine_lane(&auto, Some(&global), &installed, "m", &dir.to_string_lossy()),
+            Ok("sg-1".to_string())
         );
     }
 
