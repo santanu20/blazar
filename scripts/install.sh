@@ -642,8 +642,12 @@ Restart=always
 RestartSec=3
 # pallama serve exits 3 on hard singleton conflicts — another server
 # owns the port, or a live peer owns the daemon lock (e.g. a session
-# `pallama serve` while the unit is active). Neither is transient, so
+# pallama serve while the unit is active). Neither is transient, so
 # do not restart-loop them.
+# NOTE: no backticks and no literal dollar-parenthesis text anywhere in
+# this heredoc body — dash executes both while parsing the enclosing
+# command substitution at READ time (the installer hung for 40+ minutes
+# running "pallama serve" from a comment).
 RestartPreventExitStatus=3
 
 [Install]
