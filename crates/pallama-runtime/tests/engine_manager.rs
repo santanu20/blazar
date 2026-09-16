@@ -507,7 +507,7 @@ async fn integration__prune_siblings_deletes_same_kind_keeps_rest() {
 
     let freed = mgr.prune_siblings("llamacpp", "b-new").unwrap();
     let mut freed_tags: Vec<&str> = freed.iter().map(|(t, _)| t.as_str()).collect();
-    freed_tags.sort();
+    freed_tags.sort_unstable();
     assert_eq!(
         freed_tags,
         vec!["b-mid", "b-old"],
@@ -571,6 +571,38 @@ fn stub_engine_dir(tag: &str) -> (PathBuf, tempfile::TempDir) {
     (dir.path().to_path_buf(), dir)
 }
 
+/// `register_engine_with_vendor` with a bounded retry for the one
+/// failure class `probe_output` documents as environment-transient: a
+/// probe spawn under fork/thread pressure (EAGAIN) or a stub binary
+/// momentarily starved by a parallel test run. These tests stage a REAL
+/// stub binary, so an environment hiccup must not flake the dethrone
+/// logic under test — anything else still fails loudly on attempt one.
+fn register_stable(
+    mgr: &EngineManager,
+    dir: &std::path::Path,
+    tag: &str,
+    asset: &str,
+    sha: &str,
+    kind: pallama_core::engine_kind::EngineKind,
+    vendor: pallama_runtime::engine::manifest::Vendor,
+) -> anyhow::Result<pallama_core::EngineRow> {
+    let mut last = None;
+    for attempt in 0..4 {
+        match mgr.register_engine_with_vendor(dir, tag, asset, sha, kind, vendor) {
+            Ok(row) => return Ok(row),
+            Err(e) => {
+                let transient = e.to_string().contains("timed out or failed to spawn");
+                last = Some(e);
+                if transient && attempt < 3 {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    continue;
+                }
+            }
+        }
+    }
+    Err(last.expect("loop runs at least once"))
+}
+
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn integration__vulkan_never_dethrones_cuda_on_nvidia() {
@@ -579,29 +611,29 @@ async fn integration__vulkan_never_dethrones_cuda_on_nvidia() {
     let mgr = manager(&dirs, &api.uri());
 
     // CUDA engine installed first (vendor gate off — it must activate).
-    let cuda = mgr
-        .register_engine_with_vendor(
-            &stub_engine_dir("b1").0,
-            "b1-cuda",
-            "ubuntu-cuda-12.8-x64",
-            "aa",
-            pallama_core::engine_kind::EngineKind::LlamaCpp,
-            pallama_runtime::engine::manifest::Vendor::Other,
-        )
-        .unwrap();
+    let cuda = register_stable(
+        &mgr,
+        &stub_engine_dir("b1").0,
+        "b1-cuda",
+        "ubuntu-cuda-12.8-x64",
+        "aa",
+        pallama_core::engine_kind::EngineKind::LlamaCpp,
+        pallama_runtime::engine::manifest::Vendor::Other,
+    )
+    .unwrap();
     assert!(cuda.active);
 
     // A newer Vulkan install on an NVIDIA box: registered, NOT activated.
-    let vulkan = mgr
-        .register_engine_with_vendor(
-            &stub_engine_dir("b2").0,
-            "b2",
-            "ubuntu-vulkan-x64",
-            "bb",
-            pallama_core::engine_kind::EngineKind::LlamaCpp,
-            pallama_runtime::engine::manifest::Vendor::Nvidia,
-        )
-        .unwrap();
+    let vulkan = register_stable(
+        &mgr,
+        &stub_engine_dir("b2").0,
+        "b2",
+        "ubuntu-vulkan-x64",
+        "bb",
+        pallama_core::engine_kind::EngineKind::LlamaCpp,
+        pallama_runtime::engine::manifest::Vendor::Nvidia,
+    )
+    .unwrap();
     assert!(!vulkan.active, "guard must keep CUDA active");
     let store = Store::open(&dirs).unwrap();
     assert_eq!(store.active_engine().unwrap().unwrap().tag, "b1-cuda");
@@ -618,16 +650,16 @@ async fn integration__vulkan_activates_without_cuda_even_on_nvidia() {
     let (_t, dirs) = tmp_dirs();
     let api = MockServer::start().await;
     let mgr = manager(&dirs, &api.uri());
-    let row = mgr
-        .register_engine_with_vendor(
-            &stub_engine_dir("b3").0,
-            "b3",
-            "ubuntu-vulkan-x64",
-            "cc",
-            pallama_core::engine_kind::EngineKind::LlamaCpp,
-            pallama_runtime::engine::manifest::Vendor::Nvidia,
-        )
-        .unwrap();
+    let row = register_stable(
+        &mgr,
+        &stub_engine_dir("b3").0,
+        "b3",
+        "ubuntu-vulkan-x64",
+        "cc",
+        pallama_core::engine_kind::EngineKind::LlamaCpp,
+        pallama_runtime::engine::manifest::Vendor::Nvidia,
+    )
+    .unwrap();
     assert!(row.active, "no CUDA engine installed: Vulkan activates");
 }
 
@@ -637,7 +669,8 @@ async fn integration__vulkan_activates_on_non_nvidia_despite_cuda_row() {
     let (_t, dirs) = tmp_dirs();
     let api = MockServer::start().await;
     let mgr = manager(&dirs, &api.uri());
-    mgr.register_engine_with_vendor(
+    register_stable(
+        &mgr,
         &stub_engine_dir("b4").0,
         "b4-cuda",
         "ubuntu-cuda-12.8-x64",
@@ -646,16 +679,16 @@ async fn integration__vulkan_activates_on_non_nvidia_despite_cuda_row() {
         pallama_runtime::engine::manifest::Vendor::Other,
     )
     .unwrap();
-    let row = mgr
-        .register_engine_with_vendor(
-            &stub_engine_dir("b5").0,
-            "b5",
-            "ubuntu-vulkan-x64",
-            "ee",
-            pallama_core::engine_kind::EngineKind::LlamaCpp,
-            pallama_runtime::engine::manifest::Vendor::Amd,
-        )
-        .unwrap();
+    let row = register_stable(
+        &mgr,
+        &stub_engine_dir("b5").0,
+        "b5",
+        "ubuntu-vulkan-x64",
+        "ee",
+        pallama_core::engine_kind::EngineKind::LlamaCpp,
+        pallama_runtime::engine::manifest::Vendor::Amd,
+    )
+    .unwrap();
     assert!(row.active, "AMD box: no NVIDIA guard");
 }
 
