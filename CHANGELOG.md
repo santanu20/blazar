@@ -7,6 +7,7 @@ tracked here.
 ## [Unreleased]
 
 ### Added
+- **`pallama engine update --check` (2026-09-16).** Dry-run both lanes: resolves the newest compatible build and prints the full upgrade story — channel, up-to-date-or-available, and for the llamacpp CUDA lane the overlay state (driver vs newest CUDA, overlay-published-but-too-new with the `pallama engine build cuda` hint, or the hourly overlay-lag note) — without downloading, installing, or writing anything. sglang lane: reports PyPI currency the same way; a pinned `--version` is ignored with a note under `--check`.
 - **The installer teaches the engine menu (2026-09-16).** Bootstrap stays zero-touch (llamacpp auto-picks the newest driver-compatible CUDA build; skip with `PALLAMA_INSTALL_ENGINE=0`), but every install now prints the one-liner for the other engines — `pallama engine install --kind sglang` / `--kind mistralrs` with honest cost notes (~6 GiB venv, Linux+NVIDIA; ~0.8 GiB) plus `engine list` / `engine use <tag>` for switching — so the choice is discoverable from the install output itself instead of the docs.
 
 ## [0.6.0] — 2026-09-16

@@ -62,6 +62,26 @@ pub struct EngineManager {
     pub asset_override: String,
 }
 
+/// Dry-run report for `pallama engine update --check` (see
+/// [`EngineManager::check_lane`]): what an update would target for this
+/// box, with nothing fetched beyond release metadata.
+#[derive(Debug, Clone)]
+pub struct LaneCheck {
+    /// Channel target tag (e.g. `b10985`).
+    pub target_tag: String,
+    /// Derived overlay tag an NVIDIA/linux box would install
+    /// (`b10985-cuda`); `None` when the CUDA lane does not apply
+    /// (asset pin, non-NVIDIA, or pre-CUDA-12 driver).
+    pub overlay_tag: Option<String>,
+    /// Prebuilt asset this box would install from that overlay.
+    pub cuda_asset: Option<gh::AssetPick>,
+    /// Newest CUDA toolkit the overlay was built with, when the overlay
+    /// exists but nothing fits this driver.
+    pub newest_cuda: Option<(u32, u32)>,
+    /// This box's driver CUDA version (`None` = no NVIDIA driver).
+    pub driver_cuda: Option<(u32, u32)>,
+}
+
 /// System-level GPU vendor hint used to pick the first engine asset
 /// (before any engine exists to probe). Filesystem checks — no GPU libs
 /// loaded, works on every distro.
@@ -180,6 +200,56 @@ impl EngineManager {
     pub async fn update_resolved(&self, release: GhRelease, exact_pin: bool) -> Result<EngineRow> {
         self.update_resolved_with_vendor(release, system_vendor_hint(), exact_pin)
             .await
+    }
+
+    /// Read-only dry-run of the update lane for `engine update --check`:
+    /// resolves exactly what an update WOULD target — the derived CUDA
+    /// overlay tag and the prebuilt asset this box would install —
+    /// without downloading, installing, or writing anything. The guards
+    /// mirror `maybe_cuda_overlay` so the dry-run and the real lane can
+    /// never disagree about applicability.
+    pub async fn check_lane(&self, release: &GhRelease) -> Result<LaneCheck> {
+        let mut out = LaneCheck {
+            target_tag: release.tag_name.clone(),
+            overlay_tag: None,
+            cuda_asset: None,
+            newest_cuda: None,
+            driver_cuda: None,
+        };
+        if (self.asset_override != "auto" && !self.asset_override.is_empty())
+            || std::env::consts::OS != "linux"
+            || std::env::consts::ARCH != "x86_64"
+            || system_vendor_hint() != manifest::Vendor::Nvidia
+        {
+            return Ok(out); // standard asset lane; no CUDA story to report
+        }
+        let Some(number) = gh::btag_number(&release.tag_name) else {
+            return Ok(out); // non-b upstream tags never have overlays
+        };
+        let (driver_cuda, cc) = build::nvidia_gpu_facts().await;
+        // Compute capability (8,9) -> sm 89, same as install_cuda_overlay_tag.
+        let sm = cc.map(|(maj, min)| maj * 10 + min);
+        out.driver_cuda = driver_cuda;
+        let Some(dc) = driver_cuda else {
+            return Ok(out);
+        };
+        if dc.0 < 12 {
+            return Ok(out);
+        }
+        let overlay_tag = format!("b{number}-cuda");
+        out.overlay_tag = Some(overlay_tag.clone());
+        if let Ok(overlay) = self
+            .gh
+            .release_by_tag_repo(&gh::engine_overlay_repo(), &overlay_tag)
+            .await
+        {
+            out.cuda_asset = gh::resolve_cuda_asset(&overlay, dc, sm);
+            out.newest_cuda = gh::newest_asset_cuda(&overlay);
+        }
+        // A missing overlay release stays overlay_tag=Some + asset=None:
+        // the CLI reports the hourly-cadence lag instead of pretending
+        // the lane was evaluated.
+        Ok(out)
     }
 
     /// `update_resolved` with an injectable vendor hint so the keep-CUDA

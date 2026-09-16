@@ -381,6 +381,11 @@ enum EngineCmd {
         /// Skip the decode-regression gate (tune-baseline bench compare)
         #[arg(long)]
         no_gate: bool,
+        /// Dry-run: report the channel target and the prebuilt asset
+        /// this box would install, then exit — nothing is downloaded,
+        /// installed, or written
+        #[arg(long)]
+        check: bool,
     },
     /// List installed engines with capability summaries
     List,
@@ -6160,13 +6165,18 @@ fn engine_regression_gate(
 async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
     let d = dirs();
     match cmd {
-        EngineCmd::Update { kind, tag, no_gate } => {
+        EngineCmd::Update {
+            kind,
+            tag,
+            no_gate,
+            check,
+        } => {
             let engine_kind: EngineKind = kind
                 .parse()
                 .map_err(|e| anyhow!("engine update --kind {kind:?}: {e}"))?;
             match engine_kind {
-                EngineKind::LlamaCpp => engine_update(&d, tag, no_gate).await?,
-                EngineKind::Sglang => engine_update_sglang(&d, tag).await?,
+                EngineKind::LlamaCpp => engine_update(&d, tag, no_gate, check).await?,
+                EngineKind::Sglang => engine_update_sglang(&d, tag, check).await?,
                 EngineKind::MistralRs => {
                     return Err(anyhow!(
                         "mistralrs engines update via `pallama engine install --kind mistralrs \
@@ -6356,9 +6366,21 @@ async fn engine_install_sglang(d: &PallamaDirs, version: Option<String>) -> Resu
 /// directly; bare call is a warn-only `PyPI` currency check (the flag
 /// contract is pinned to the version this Pallama build was verified
 /// against, so newer releases opt in per-version, never auto-install).
-async fn engine_update_sglang(d: &PallamaDirs, version: Option<String>) -> Result<()> {
-    if version.is_some() {
+async fn engine_update_sglang(
+    d: &PallamaDirs,
+    version: Option<String>,
+    check: bool,
+) -> Result<()> {
+    // The no-version path is report-only by design (probe PyPI + print);
+    // --check extends that to the pinned-version case so a dry-run never
+    // reaches the venv install.
+    if version.is_some() && !check {
         return engine_install_sglang(d, version).await;
+    }
+    if check {
+        if let Some(v) = &version {
+            println!("--check ignores the version pin (drop --check to install sglang {v})");
+        }
     }
     let store = Store::open(d)?;
     let installed = store
@@ -6389,6 +6411,9 @@ async fn engine_update_sglang(d: &PallamaDirs, version: Option<String>) -> Resul
         }
     };
     let pinned = pallama_runtime::engine::sglang_install::SGLANG_DEFAULT_VERSION;
+    if check {
+        println!("dry-run: nothing installed, nothing written");
+    }
     match (
         pallama_runtime::engine::sglang_install::version_tuple(&installed),
         pallama_runtime::engine::sglang_install::version_tuple(&latest),
@@ -6489,7 +6514,7 @@ async fn route_update_to_build(
     }
 }
 
-async fn engine_update(d: &PallamaDirs, tag: Option<String>, no_gate: bool) -> Result<()> {
+async fn engine_update(d: &PallamaDirs, tag: Option<String>, no_gate: bool, check: bool) -> Result<()> {
     let token = std::env::var("GH_TOKEN").ok();
     let gh = GhClient::new(token)?;
     let cfg = config()?;
@@ -6526,6 +6551,54 @@ async fn engine_update(d: &PallamaDirs, tag: Option<String>, no_gate: bool) -> R
         bus: EventBus::default(),
         asset_override: cfg.engine_asset.clone(),
     };
+    if check {
+        // Dry-run: report the channel target and the prebuilt-asset story
+        // for THIS box, then leave — nothing downloaded or written.
+        let release = match resolved {
+            Some(rel) => rel,
+            None => mgr.gh.resolve_tag(&target_tag).await?,
+        };
+        let lane = mgr.check_lane(&release).await?;
+        println!("update check — llamacpp lane, channel {}", cfg.update_channel);
+        match active_tag.as_deref() {
+            Some(a) if a == target_tag => println!("up to date: {a} active"),
+            Some(a) => println!(
+                "update available: {a} -> {target_tag}{}",
+                if downgrade {
+                    " (channel downgrade — channels are pins, not floors)"
+                } else {
+                    ""
+                }
+            ),
+            None => println!("no active engine — target {target_tag}"),
+        }
+        match (&lane.driver_cuda, &lane.cuda_asset) {
+            (Some((maj, min)), Some(pick)) => println!(
+                "driver CUDA {maj}.{min} — prebuilt asset for this box: {} ({})",
+                pick.name, pick.label
+            ),
+            (Some((maj, min)), None) => match lane.overlay_tag {
+                Some(overlay) => match lane.newest_cuda {
+                    Some((need_maj, need_min)) => println!(
+                        "overlay {overlay} published, but its CUDA {need_maj}.{need_min} assets \
+                         exceed this driver ({maj}.{min}) — `pallama engine build cuda` compiles \
+                         locally for this driver"
+                    ),
+                    None => println!(
+                        "no CUDA overlay release {overlay} published yet (overlay drops \
+                         hourly) — rerun after the next drop, or `pallama engine build cuda`"
+                    ),
+                },
+                None => println!(
+                    "driver CUDA {maj}.{min} — the CUDA prebuilt lane does not apply; the \
+                     standard asset lane would serve this update"
+                ),
+            },
+            (None, _) => println!("no NVIDIA driver detected — standard asset lane applies"),
+        }
+        println!("dry-run: nothing installed, nothing written (drop --check to update)");
+        return Ok(());
+    }
     let row = match resolved {
         Some(rel) => mgr.update_resolved(rel, tag.is_some()).await?,
         None => mgr.update(tag.as_deref(), cfg.update_channel).await?,
