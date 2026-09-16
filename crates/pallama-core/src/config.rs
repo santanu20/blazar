@@ -216,6 +216,12 @@ pub struct Config {
     /// precompiled kernels or serve eagerly (mistralrs) stay unpegged.
     #[serde(default)]
     pub warm_peg: WarmPeg,
+
+    /// Health-check budget for a spawning engine child (`model_load_timeout`).
+    /// Default 180 s fits precompiled llamacpp/mistral.rs loads; raise it for
+    /// first-ever JIT lanes (a cold sglang quantized spawn — marlin repack +
+    /// CUDA-graph capture — can exceed 180 s on slow boxes).
+    pub model_load_timeout_secs: Option<u64>,
     /// `YaRN` `RoPE` context-extension factor: 0 = off; e.g. 2.0 doubles the
     /// usable context beyond the trained window at some quality cost.
     #[serde(default)]
@@ -1723,6 +1729,7 @@ impl Default for Config {
             prompt_preflight: true,
             spec_cache: true,
             warm_peg: WarmPeg::default(),
+            model_load_timeout_secs: None,
             ctx_extend: 0.0,
             cpu_moe_n: 0,
             cpu_ffn_n: 0,
@@ -2193,6 +2200,11 @@ impl Config {
     pub fn validate(&self) -> CoreResult<()> {
         if self.default_ctx == 0 {
             return Err(CoreError::Config("default_ctx must be > 0".into()));
+        }
+        if self.model_load_timeout_secs == Some(0) {
+            return Err(CoreError::Config(
+                "model_load_timeout_secs must be > 0 when set".into(),
+            ));
         }
         self.validate_keys()?;
         let sc = &self.semantic_cache;
@@ -3555,6 +3567,21 @@ default_ctx = 16384
         assert!(
             Config::from_toml("warm_after_spawn = false\n").is_err(),
             "the old top-level pin must fail loudly after the rename"
+        );
+    }
+
+    #[test]
+    fn unit__model_load_timeout_secs__parsed_and_guarded() {
+        // Accept: raises the JIT-lane health budget.
+        let cfg = Config::from_toml("model_load_timeout_secs = 600\n").expect("600 parses");
+        assert_eq!(cfg.model_load_timeout_secs, Some(600));
+        // Default: None = the built-in 180s.
+        assert_eq!(Config::default().model_load_timeout_secs, None);
+        // Reject: zero budgets out every spawn.
+        let err = Config::from_toml("model_load_timeout_secs = 0\n").expect_err("0 rejected");
+        assert!(
+            err.to_string().contains("model_load_timeout_secs"),
+            "error names the field: {err}"
         );
     }
 

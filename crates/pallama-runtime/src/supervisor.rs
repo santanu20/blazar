@@ -835,7 +835,9 @@ impl Supervisor {
             engine_failures: std::sync::Mutex::new(std::collections::HashSet::new()),
             measured: std::sync::Mutex::new(MeasuredTick::default()),
             census_cache: std::sync::Mutex::new(None),
-            load_timeout: Duration::from_secs(3 * 60),
+            load_timeout: config
+                .model_load_timeout_secs
+                .map_or_else(|| Duration::from_secs(3 * 60), Duration::from_secs),
             shutdown_grace: Duration::from_secs(10),
             reaper_interval: Duration::from_secs(10),
             circuit_window: Duration::from_secs(60),
