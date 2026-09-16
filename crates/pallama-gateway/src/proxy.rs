@@ -825,16 +825,24 @@ pub(crate) fn child_model_default_predicted(
             .ok()
             .flatten()
             .map_or(EngineKind::LlamaCpp, |r| r.kind);
-        engine_kind::serving_lane(
+        let lane = engine_kind::serving_lane(
             state.config.engine_routing.mode,
             state.config.engine_routing.policy,
             overlay.engine.as_deref(),
             std::path::Path::new(model_path).is_dir(),
             global,
             &installed,
-        )
+        );
+        // Manual mode (or a pin resolving to the global engine) yields
+        // Ok(None) — the GLOBAL engine serves, so its kind decides the
+        // rewrite exactly like the pre-routing daemon-lifetime cache.
+        match lane {
+            Ok(Some((_, EngineKind::MistralRs))) => Some(true),
+            Ok(None) => Some(global == EngineKind::MistralRs),
+            _ => None,
+        }
     });
-    matches!(decision, Some(Ok(Some((_, EngineKind::MistralRs)))))
+    decision.flatten().unwrap_or(false)
 }
 
 pub(crate) fn set_child_model_default(v: &mut serde_json::Value) {
