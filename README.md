@@ -478,6 +478,35 @@ sampler_defaults.dry_multiplier = 0.8
 # pii_scrub = false               # redact emails/secrets/IPs from why/watch
 ```
 
+## Engine routing
+
+One active engine serves at a time (`pallama engine use`), but models come in
+formats engines digest differently. Routing picks the right lane per model —
+opt-in, off by default:
+
+```toml
+[engine_routing]
+mode = "auto"        # "manual" (default) = the active engine serves everything
+policy = "quality"   # quality (default) | latency | throughput
+```
+
+- **When it fires:** at spawn time — the first request for a model spawns it
+  through the routed engine (lazy, same as every spawn). Pulling a model never
+  routes anything; there is no separate loading step.
+- **Both API dialects route identically** — `/api/chat` (ollama clients) and
+  `/v1/chat/completions` go through the same gateway resolver.
+- **Per-model pin wins over both modes:**
+  `[model_overrides."my-model"] engine = "sglang"` (a tag or a kind).
+- **See what would serve what:** `pallama list` (ENGINE column), `/v1/models`,
+  and `/api/tags` all carry the resolved engine per model.
+- **Evidence-backed route table** (measured, quant-matched, on this class of
+  hardware): safetensors → sglang on quality/throughput (0.612 quality,
+  747 tok/s conc4) or mistral.rs on latency (26 ms TTFT, 8 s cold); GGUF →
+  llamacpp on every policy (mistral.rs GGUF scored 0.462 vs llamacpp's 0.500
+  on the same Q4_K_M model); nothing-can-serve → teaching error, never a guess.
+- **manual mode is byte-identical** to pre-routing behavior: the active engine
+  serves or refuses with its usual teaching.
+
 ## Architecture
 
 ```
