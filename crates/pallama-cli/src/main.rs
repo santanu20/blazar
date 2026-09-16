@@ -499,6 +499,9 @@ enum ConfigCmd {
         /// One knob name; omit to print every default
         key: Option<String>,
     },
+    /// Open the config file in `$VISUAL`/`$EDITOR`. The daemon keeps
+    /// the config it booted with until restarted.
+    Edit,
 }
 
 /// `pallama config --help` footer: the set → get → unset → defaults
@@ -511,7 +514,8 @@ Examples:
   pallama config defaults slots     show the built-in default (omit KEY for all)
   pallama config list               full effective config as TOML
   pallama config set sglang.grammar_backend xgrammar    dotted keys reach table knobs
-  pallama config unset sglang.grammar_backend           ...and unset them the same way";
+  pallama config unset sglang.grammar_backend           ...and unset them the same way
+  pallama config edit                 open the file in $VISUAL/$EDITOR";
 
 /// Grouping table for the top-level help. Descriptions and aliases come
 /// live from clap (single source of truth); this table owns ONLY the
@@ -7167,6 +7171,40 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                     Ok(())
                 }
             }
+        }
+        ConfigCmd::Edit => {
+            // $VISUAL wins over $EDITOR (git convention); no fallback
+            // to a hard-coded editor — guessing vi/nano on a box that
+            // has neither fails more confusingly than this teaching.
+            let editor = std::env::var("VISUAL")
+                .or_else(|_| std::env::var("EDITOR"))
+                .map_err(|_| {
+                    anyhow!("no editor set: export EDITOR (or VISUAL) to your editor, e.g. EDITOR=nano pallama config edit")
+                })?;
+            let d = dirs();
+            d.ensure().ok();
+            let path = d.config_file();
+            if !path.exists() {
+                Config::load(&d).map_err(|e| anyhow!("{e}"))?;
+            }
+            let status = std::process::Command::new(&editor)
+                .arg(&path)
+                .status()
+                .map_err(|e| {
+                    anyhow!("could not run editor {editor:?} on {}: {e}", path.display())
+                })?;
+            if !status.success() {
+                return Err(anyhow!("editor {editor:?} exited with {status}"));
+            }
+            // Post-edit validation: a hand-broken file should surface
+            // here, not at the next daemon boot.
+            let raw = std::fs::read_to_string(&path)
+                .map_err(|e| anyhow!("read {}: {e}", path.display()))?;
+            Config::from_toml(&raw).map_err(|e| {
+                anyhow!("config is invalid after edit: {e} — fix it with another {editor:?} run")
+            })?;
+            println!("{} ok", path.display());
+            Ok(())
         }
     }
 }
