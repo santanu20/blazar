@@ -30,6 +30,7 @@ embd_normalize
 engine_asset
 engine_check_secs
 engine_env
+engine_routing
 host
 idle_sleep_secs
 idle_timeout_secs
@@ -41,8 +42,10 @@ kv_unified_per_slot
 late_chunking_max_tokens
 lazy_mode
 load_mode
+lora_init_without_apply
 main_gpu
 max_loaded_models
+mistralrs
 mmproj_auto
 mmproj_device
 mmproj_offload
@@ -75,6 +78,7 @@ reasoning_effort
 reasoning_format
 remotes
 repack
+reuse_port
 router
 router_max_models
 rpc_servers
@@ -121,6 +125,7 @@ update_channel
 video_ffmpeg_dir
 video_fps
 video_timestamp_interval
+warm_peg
 warmup
 yarn_attn_factor
 yarn_beta_fast

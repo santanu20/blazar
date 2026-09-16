@@ -20,6 +20,7 @@ keys
 model types
 models
 port
+routing
 sentinel
 store
 tempdir hygiene
