@@ -492,19 +492,39 @@ enum ConfigCmd {
     /// Print the full effective config as TOML (one knob surface)
     List,
     /// Print one knob's current line (`config get slots`)
-    Get { key: String },
+    Get {
+        /// Top-level knob name or dotted table path (see
+        /// `config set --help` for the key grammar)
+        key: String,
+    },
     /// Set a knob (`config set slots 1`); the candidate is validated
     /// against the config schema before the file is touched — a bad
     /// value or unknown key is rejected with the file unchanged.
     /// Model-scoped overrides live in `[model_overrides."<model>"]`
     /// tables; edit those in the file directly.
-    Set { key: String, value: String },
+    #[command(after_help = CONFIG_SET_EXAMPLES)]
+    Set {
+        /// Top-level knob name (`slots`) or dotted path into a table
+        /// (`sglang.grammar_backend`,
+        /// `model_overrides."qwen2.5-0.5b".mistralrs.prefix_cache_n` —
+        /// a quoted segment stays one segment). `pallama config defaults`
+        /// lists every knob; `pallama config edit <model>` hints that
+        /// model's engine knobs.
+        key: String,
+        /// TOML scalar (`1`, `true`, `0.5`, `"auto"`, `["a","b"]`);
+        /// bare words are stored as strings automatically
+        value: String,
+    },
     /// Remove a top-level pin so the knob returns to its built-in
     /// default (`config unset slots`); idempotent when the key carries
     /// no pin. The running daemon keeps the config it booted with
     /// until restarted; `PALLAMA_*` env overrides still win over the
     /// file either way.
-    Unset { key: String },
+    Unset {
+        /// Top-level knob name or dotted table path (see
+        /// `config set --help` for the key grammar)
+        key: String,
+    },
     /// Print the built-in defaults as TOML — exactly what a fresh
     /// install writes — or one knob's default line
     /// (`config defaults slots`). Shows defaults only; use `get`/`list`
@@ -538,6 +558,18 @@ Examples:
   pallama config unset sglang.grammar_backend           ...and unset them the same way
   pallama config edit                 open the file in $VISUAL/$EDITOR
   pallama config edit qwen2.5-0.5b    ...with that model's engine knobs as editor hints";
+
+/// `pallama config set --help` footer: what `set` itself accepts — the
+/// key grammar in canonical lines. The parent `config --help` footer
+/// owns the set → get → unset → defaults round-trip view.
+const CONFIG_SET_EXAMPLES: &str = "\
+Examples:
+  pallama config set slots 1                      top-level knob
+  pallama config set sse_ping_interval -1         ints, bools, floats, \"strings\", [\"lists\"]
+  pallama config set sglang.grammar_backend xgrammar    dotted path into a table knob
+  pallama config set model_overrides.\"qwen2.5-0.5b\".mistralrs.prefix_cache_n 0    per-model override
+  pallama config defaults                         every knob + its built-in default
+An unknown key or bad value is rejected with the file unchanged.";
 
 /// Grouping table for the top-level help. Descriptions and aliases come
 /// live from clap (single source of truth); this table owns ONLY the
