@@ -2150,6 +2150,73 @@ pub const MISTRALRS_TUNING_BOOL_FLAGS: &[&str] = &[
 /// is None: mistral.rs sizes its paged KV from a VRAM fraction, not from
 /// ctx math, so an f16 estimate here would be a lie.
 #[allow(clippy::too_many_lines)] // one flat flag inventory, not logic
+#[allow(clippy::cast_precision_loss)] // MiB-scale integers: 52-bit f64 mantissa is exact here
+/// Derive `--pa-memory-fraction` from FREE VRAM when a GPU co-tenant
+/// shrinks the pool upstream's 0.90-of-total default would silently
+/// truncate into empty responses (live-proven: instant ~60ms empties on
+/// long prompts, real replies on short ones — the worst failure mode,
+/// serving while broken). Ladder mirrors sglang: derive a fraction that
+/// fits what is actually free → fall back to classic ctx-sized KV →
+/// warn with numbers. No-op on single-tenant boxes (free ≈ total) and
+/// when the operator pinned `mistralrs_pa_memory_fraction` or turned
+/// paged attention off. `forced_on`: `mistralrs_paged_attn = true` was
+/// pinned — never emit a conflicting `--paged-attn off`, warn instead.
+fn derive_pa_fraction_under_cotenancy(
+    input: &ProfileInput<'_>,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+    forced_on: bool,
+) {
+    const COTENANT_SLACK_MIB: u64 = 256;
+    const HEADROOM_MIB: i64 = 512;
+    const MIN_KV_MIB: i64 = 256;
+    const MIB: u64 = 1024 * 1024;
+    if input.config.mistralrs_pa_memory_fraction.is_some() {
+        return;
+    }
+    if !input.supported_flags.contains("--pa-memory-fraction") {
+        return;
+    }
+    let total = input.hardware.total_vram_mib();
+    let free = input.hardware.free_vram_mib();
+    if total == 0 || free == 0 || free + COTENANT_SLACK_MIB >= total {
+        return;
+    }
+    let mmproj = input
+        .mmproj_path
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map_or(0, |m| m.len());
+    let resident = (input.model_bytes.saturating_add(mmproj)) / MIB;
+    let budget = free.cast_signed() - resident.cast_signed() - HEADROOM_MIB;
+    if budget >= MIN_KV_MIB {
+        let frac = (budget as f64 / total as f64).clamp(0.05, 0.90);
+        argv.push("--pa-memory-fraction".into());
+        argv.push(format!("{frac:.2}"));
+        warnings.push(format!(
+            "pa-memory-fraction {frac:.2} derived from free VRAM: a GPU co-tenant holds \
+             most of the card (total {total} MiB, free {free} MiB, weights+projector \
+             {resident} MiB) — upstream's 0.90-of-total default would silently truncate \
+             the KV pool into empty responses; pin mistralrs_pa_memory_fraction to override"
+        ));
+    } else if !forced_on {
+        argv.push("--paged-attn".into());
+        argv.push("off".into());
+        warnings.push(format!(
+            "paged-attn off: the GPU co-tenant leaves no paged-KV room (total {total} MiB, \
+             free {free} MiB, weights+projector {resident} MiB) — classic ctx-sized KV \
+             either serves or fails loudly at load; free the GPU or reroute the model"
+        ));
+    } else {
+        warnings.push(format!(
+            "GPU co-tenant leaves ~{} MiB for paged KV (total {total} MiB, free {free} MiB, \
+             weights+projector {resident} MiB) — expect a loud load failure; set \
+             mistralrs_paged_attn = false for classic KV or free the GPU",
+            budget.max(0)
+        ));
+    }
+}
+
+#[allow(clippy::too_many_lines)] // one flat flag inventory, not logic
 fn compile_mistralrs(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Profile {
     let ctx = tuning
         .ctx
@@ -2199,11 +2266,25 @@ fn compile_mistralrs(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Prof
     // Attention backend: classic KV (sized by ctx) instead of paged KV
     // (sized by VRAM fraction) — the only fit for big vision models on
     // 8 GB cards, live-proven with qwen3.5-9b + projector.
+    //
+    // Co-tenancy: upstream's --pa-memory-fraction is a fraction of
+    // TOTAL VRAM, and its 0.90 default silently truncates the KV pool
+    // when another GPU tenant (a desktop ollama, a second model server)
+    // already holds most of the card — the engine then serves
+    // instant-empty responses instead of failing (live-proven: 0.5B
+    // BF16 on a 8 GiB card with 6.3 GiB resident elsewhere = ~60ms
+    // empty replies on long tool prompts, real replies on short ones).
+    // When a co-tenant is detected we therefore DERIVE a fraction from
+    // what is actually free, mirroring the sglang fit ladder:
+    // derive → classic-KV fallback → refuse with numbers.
     match input.config.mistralrs_paged_attn {
         Some(pa) => {
             if input.supported_flags.contains("--paged-attn") {
                 argv.push("--paged-attn".into());
                 argv.push(if pa { "on".into() } else { "off".into() });
+                if pa {
+                    derive_pa_fraction_under_cotenancy(input, &mut argv, &mut warnings, true);
+                }
             } else {
                 warnings.push(
                     "config mistralrs_paged_attn set but this engine lacks \
@@ -2235,6 +2316,11 @@ fn compile_mistralrs(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Prof
                          mistralrs_paged_attn = true to override"
                             .into(),
                     );
+                } else {
+                    // PA stays on (weights fit): under a co-tenant the
+                    // upstream 0.90-of-total fraction still points at
+                    // absent memory — derive from free instead.
+                    derive_pa_fraction_under_cotenancy(input, &mut argv, &mut warnings, false);
                 }
             }
         }
@@ -7383,6 +7469,164 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("deterministic = true")));
+    }
+
+    /// Hardware with a co-tenant GPU: total 8 GiB, only `free` still
+    /// available (the live bug shape: ollama holding 6.3 GiB).
+    fn cotenant_hw(total_mib: u64, free_mib: u64, ram_mib: u64) -> Hardware {
+        let mut hw = gpu_hw(total_mib, ram_mib, 8);
+        hw.gpus[0].free_mib = free_mib;
+        hw
+    }
+
+    fn mistralrs_pa_flags() -> BTreeSet<String> {
+        ["--paged-attn", "--pa-memory-fraction"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
+    /// mistral.rs enables paged attention BY DEFAULT and its stock
+    /// `--pa-memory-fraction` is 0.90 of TOTAL VRAM — with a co-tenant
+    /// on the GPU that pool points at memory the engine cannot have,
+    /// silently truncating KV into ~60 ms empty responses (live-proven:
+    /// 0.5B BF16 + 6.3 GiB tenant on an 8 GiB card). Under co-tenancy
+    /// the compiler must derive a fraction from what is actually FREE.
+    #[test]
+    fn unit__mistralrs_pa_fraction__derived_under_cotenancy() {
+        let g = meta();
+        let flags = mistralrs_pa_flags();
+        let cfg = Config::default();
+        // The live incident: total 8192, free 1843, model 942 MiB →
+        // budget 1843-942-512 = 389 MiB → 389/8192 = 0.047 → floor 0.05.
+        let hw = cotenant_hw(8_192, 1_843, 16_000);
+        let mut inp = input(&g, &hw, &cfg, &flags);
+        inp.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        inp.model_bytes = 942 * MIB;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w == ["--pa-memory-fraction", "0.05"]),
+            "co-tenant spawn must derive a floor-clamped fraction, got {:?}",
+            p.argv
+        );
+        assert!(p.warnings.iter().any(|w| w.contains("co-tenant")));
+    }
+
+    /// Healthy co-tenant budget derives a proportional fraction (not the
+    /// floor): free 6144 − resident 942 − headroom 512 = 4690/8192 ≈ 0.57.
+    #[test]
+    fn unit__mistralrs_pa_fraction__healthy_budget_derives_proportionally() {
+        let g = meta();
+        let flags = mistralrs_pa_flags();
+        let cfg = Config::default();
+        let hw = cotenant_hw(8_192, 6_144, 16_000);
+        let mut inp = input(&g, &hw, &cfg, &flags);
+        inp.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        inp.model_bytes = 942 * MIB;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w == ["--pa-memory-fraction", "0.57"]),
+            "expected derived 0.57, got {:?}",
+            p.argv
+        );
+    }
+
+    /// When even a minimal KV pool does not fit next to the tenant, the
+    /// auto lane falls back to classic KV (--paged-attn off) with a loud
+    /// numbers warning instead of serving silently-truncated context.
+    #[test]
+    fn unit__mistralrs_pa_fraction__nothing_fits_auto_falls_back_to_classic_kv() {
+        let g = meta();
+        let flags = mistralrs_pa_flags();
+        let cfg = Config::default();
+        // resident 800 = 50% of free 1550 (auto-off 75% heuristic does
+        // NOT fire) but budget 1550-800-512 = 238 < 256 → classic KV.
+        let hw = cotenant_hw(8_192, 1_550, 16_000);
+        let mut inp = input(&g, &hw, &cfg, &flags);
+        inp.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        inp.model_bytes = 800 * MIB;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv.windows(2).any(|w| w == ["--paged-attn", "off"]),
+            "tight-but-under-heuristic spawn must fall back to classic KV, got {:?}",
+            p.argv
+        );
+        assert!(!p.argv.windows(2).any(|w| w[0] == "--pa-memory-fraction"));
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.contains("classic ctx-sized KV")));
+    }
+
+    /// An explicit `mistralrs_paged_attn = true` pin is respected even
+    /// when nothing fits: warn with numbers, but never emit a conflicting
+    /// `--paged-attn off` after the user forced it on.
+    #[test]
+    fn unit__mistralrs_pa_fraction__forced_on_never_conflicts() {
+        let g = meta();
+        let flags = mistralrs_pa_flags();
+        let cfg = Config {
+            mistralrs_paged_attn: Some(true),
+            ..Config::default()
+        };
+        let hw = cotenant_hw(8_192, 1_550, 16_000);
+        let mut inp = input(&g, &hw, &cfg, &flags);
+        inp.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        inp.model_bytes = 800 * MIB;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p.argv.windows(2).any(|w| w == ["--paged-attn", "on"]));
+        assert!(!p.argv.windows(2).any(|w| w == ["--paged-attn", "off"]));
+        assert!(!p.argv.windows(2).any(|w| w[0] == "--pa-memory-fraction"));
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.contains("expect a loud load failure")));
+    }
+
+    /// Single-tenant GPUs (free ≈ total) are exactly today's argv: the
+    /// engine's own defaults are already correct there — no derivation,
+    /// no warning, no behavior change.
+    #[test]
+    fn unit__mistralrs_pa_fraction__single_tenant_unchanged() {
+        let g = meta();
+        let flags = mistralrs_pa_flags();
+        let cfg = Config::default();
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let mut inp = input(&g, &hw, &cfg, &flags);
+        inp.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.windows(2).any(|w| w[0] == "--pa-memory-fraction"));
+        assert!(!p.argv.windows(2).any(|w| w == ["--paged-attn", "off"]));
+        assert!(!p.warnings.iter().any(|w| w.contains("co-tenant")));
+    }
+
+    /// An explicit `mistralrs_pa_memory_fraction` pin always wins — the
+    /// derivation never second-guesses an operator.
+    #[test]
+    fn unit__mistralrs_pa_fraction__explicit_pin_wins() {
+        let g = meta();
+        let flags = mistralrs_pa_flags();
+        let cfg = Config {
+            mistralrs_pa_memory_fraction: Some(0.40),
+            ..Config::default()
+        };
+        let hw = cotenant_hw(8_192, 1_843, 16_000);
+        let mut inp = input(&g, &hw, &cfg, &flags);
+        inp.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        inp.model_bytes = 942 * MIB;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w == ["--pa-memory-fraction", "0.4"]),
+            "explicit pin must emit verbatim, got {:?}",
+            p.argv
+        );
+        assert!(!p.warnings.iter().any(|w| w.contains("co-tenant")));
     }
 
     fn llama_server_knobs_flags() -> BTreeSet<String> {

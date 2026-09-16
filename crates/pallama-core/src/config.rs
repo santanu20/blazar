@@ -1596,12 +1596,13 @@ impl Default for WarmPeg {
 impl WarmPeg {
     /// Per-engine resolution: override wins over `default`; engines
     /// without a peg lane are always false.
+    #[must_use]
     pub fn enabled_for(&self, kind: &crate::engine_kind::EngineKind) -> bool {
         use crate::engine_kind::EngineKind;
         match kind {
             EngineKind::Sglang => self.sglang.unwrap_or(self.default),
             EngineKind::LlamaCpp => self.llamacpp.unwrap_or(self.default),
-            _ => false,
+            EngineKind::MistralRs => false,
         }
     }
 }
