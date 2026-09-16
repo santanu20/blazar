@@ -17,13 +17,23 @@ each engine's surface into two layers with different guarantees:
    tests that assert the exact child argv.
 2. **Universal passthrough** — every other flag in each engine's
    manifest stays reachable through per-model `extra_args`:
-   llamacpp/mistralrs pass tokens through verbatim (the child validates
-   at boot); sglang is stricter — a passthrough flag must exist in the
-   probed manifest (typo-proof) and must not collide with the seven
-   flags the supervisor/VRAM ladder own (`--host`, `--port`,
-   `--model-path`, `--served-model-name`, `--context-length`,
-   `--mem-fraction-static`, `--cpu-offload-gb`), which is a hard error
-   with a pointer to the config knob that owns the value.
+   llamacpp passes tokens through verbatim (the child validates at
+   boot); mistralrs is strict-manifest-gated like sglang (a passthrough
+   flag must exist in the probed manifest — typo-proof — and must not
+   collide with the twelve flags the supervisor/VRAM ladder own
+   (`--host`, `--port`, `-m`, `-f`, `--mmproj`, `--max-model-len`,
+   `-np`, `--max-seqs`, `--max-num-batched-tokens`, `--paged-attn`,
+   `--pa-memory-fraction`, `--no-ui`); both violations are hard errors
+   with manifest teaching); sglang same contract with its reserved
+   seven (`--host`, `--port`, `--model-path`, `--served-model-name`,
+   `--context-length`, `--mem-fraction-static`, `--cpu-offload-gb`),
+   which is a hard error with a pointer to the config knob that owns
+   the value.
+   Live caveat: mistral.rs v0.9.3's `--isq` in-situ quantization passes
+   through cleanly (argv verified, ~6 GiB conversion working set) but
+   the engine answers `model_error` on every request for both GGUF and
+   safetensors sources and every ISQ level tried (`q4k`, `q8_0`) on the
+   cuda130-sm89 build — upstream status, not a routing gap.
 
 Nothing is unreachable: a flag is either a knob or a passthrough; the
 only blocked flags are the reserved seven, whose values Pallama

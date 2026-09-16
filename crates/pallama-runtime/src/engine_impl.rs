@@ -643,6 +643,44 @@ pub fn mistralrs_argv(
         }
     }
     mistralrs_tuning_passthrough(&profile.argv, flags, &mut argv);
+    // User extra_args ride profile.argv after compile-time strict
+    // validation (manifest-gated, reserved-flag refusal). Forward them
+    // verbatim here — skipping everything this function owns or the
+    // tuning passthrough already translated — with the spawn-time
+    // manifest check as belt-and-braces against stale profiles.
+    let owned: &[&str] = &[
+        "-m",
+        "-f",
+        "--host",
+        "--port",
+        "--no-ui",
+        "--max-model-len",
+        "--max-num-batched-tokens",
+        "--max-seqs",
+        "--mmproj",
+        "-np",
+        "--paged-attn",
+        "--pa-memory-fraction",
+    ];
+    for (i, tok) in profile.argv.iter().enumerate() {
+        let t = tok.as_str();
+        if !t.starts_with('-')
+            || t.starts_with("--parallel=")
+            || owned.contains(&t)
+            || pallama_core::profile::MISTRALRS_TUNING_BOOL_FLAGS.contains(&t)
+            || pallama_core::profile::MISTRALRS_TUNING_VALUE_FLAGS.contains(&t)
+        {
+            continue;
+        }
+        if flags.contains(t) {
+            argv.push(t.to_string());
+            if let Some(v) = profile.argv.get(i + 1) {
+                if !v.starts_with('-') {
+                    argv.push(v.clone());
+                }
+            }
+        }
+    }
     argv
 }
 

@@ -176,7 +176,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // as `-np N`). Skipping here avoids the manifest flag gate, which
     // would hard-error on every llama-server-only flag.
     if input.engine_kind == crate::engine_kind::EngineKind::MistralRs {
-        return Ok(compile_mistralrs(input, tuning));
+        return compile_mistralrs(input, tuning);
     }
     // Dialect fork: sglang speaks `launch_server` grammar, sizes KV from a
     // VRAM fraction (not ctx math), and reads safetensors dirs — none of
@@ -2217,7 +2217,10 @@ fn derive_pa_fraction_under_cotenancy(
 }
 
 #[allow(clippy::too_many_lines)] // one flat flag inventory, not logic
-fn compile_mistralrs(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Profile {
+fn compile_mistralrs(
+    input: &ProfileInput<'_>,
+    tuning: &TuningOverrides,
+) -> Result<Profile, String> {
     let ctx = tuning
         .ctx
         .unwrap_or_else(|| resolve_ctx(input, input.overlay, &mut Vec::new()));
@@ -2609,29 +2612,55 @@ fn compile_mistralrs(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Prof
         );
     }
 
-    // extra_args is llama-server dialect; mistral.rs `serve` shares almost
-    // none of it, so a passthrough of stale llamacpp flags hard-fails the
-    // boot. Drop with a named warning instead of emitting (the llamacpp
-    // lane validates-and-emits, sglang validates-strictly; this lane has
-    // no safe validator, so it refuses).
+    // extra_args: strict manifest-gated passthrough — the same contract
+    // as the sglang lane. The probed manifest IS the dialect's grammar:
+    // unknown flags hard-fail with it (a silent warn-drop once measured
+    // nothing for a whole ISQ A/B run), and pallama-owned flags refuse
+    // rather than double-set host/port/model/scheduling pins.
     if let Some(extra) = &input.overlay.extra_args {
-        if !extra.is_empty() {
-            warnings.push(format!(
-                "extra_args [{}] ignored on the mistralrs engine — its `serve` grammar \
-                 does not accept llama-server flags; remove the override or switch engines \
-                 with `pallama engine use <tag>` (see `pallama engine list`)",
-                extra.join(" ")
-            ));
+        const RESERVED: &[&str] = &[
+            "--host",
+            "--port",
+            "-m",
+            "-f",
+            "--mmproj",
+            "--max-model-len",
+            "-np",
+            "--max-seqs",
+            "--max-num-batched-tokens",
+            "--paged-attn",
+            "--pa-memory-fraction",
+            "--no-ui",
+        ];
+        for tok in extra {
+            if !tok.starts_with('-') {
+                continue; // value token riding its preceding flag
+            }
+            if RESERVED.contains(&tok.as_str()) {
+                return Err(format!(
+                    "extra_args {tok} is reserved — pallama owns it on the mistralrs \
+                     engine (host/port/model/scheduling pins); remove it from the \
+                     override"
+                ));
+            }
+            if !input.supported_flags.contains(tok.as_str()) {
+                return Err(format!(
+                    "extra_args {tok} is not in this mistralrs engine's probed manifest \
+                     (pallama engine list) — drop it, or pallama engine update refreshes \
+                     the probe"
+                ));
+            }
         }
+        argv.extend(extra.iter().cloned());
     }
-    Profile {
+    Ok(Profile {
         argv,
         warnings,
         ctx,
         gpu: "auto",
         kv_est_bytes: None,
         ctx_autofit: None,
-    }
+    })
 }
 
 /// sglang runtime overhead the server needs beyond weights+KV: CUDA
@@ -7843,6 +7872,79 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("ignored on the mistralrs engine")));
+    }
+
+    /// `extra_args` on the mistralrs lane: manifest-gated strict
+    /// passthrough (the sglang contract) — known flags ride the argv,
+    /// unknown flags fail with the manifest pointer, pallama-owned
+    /// flags refuse instead of double-setting.
+    #[test]
+    fn unit__mistralrs_extra_args__strict_passthrough_and_refusals() {
+        let g = meta();
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let cfg = Config::default();
+        let mut flags = mistralrs_knobs_flags();
+        for f in ["--isq", "--host", "--port", "-m", "--no-ui"] {
+            flags.insert(f.to_string());
+        }
+        let base = input(&g, &hw, &cfg, &flags);
+
+        let isq = crate::config::ModelOverride {
+            extra_args: Some(vec!["--isq".into(), "q4k".into()]),
+            ..crate::config::ModelOverride::default()
+        };
+        let p = compile(
+            &ProfileInput {
+                engine_kind: crate::engine_kind::EngineKind::MistralRs,
+                model_bytes: 900 * MIB,
+                overlay: &isq,
+                ..base.clone()
+            },
+            &TuningOverrides::default(),
+        )
+        .expect("known extra_args compile");
+        assert!(
+            p.argv.windows(2).any(|w| w == ["--isq", "q4k"]),
+            "isq pair must ride the argv"
+        );
+
+        let bad = crate::config::ModelOverride {
+            extra_args: Some(vec!["--ctx-size".into(), "4096".into()]),
+            ..crate::config::ModelOverride::default()
+        };
+        let err = compile(
+            &ProfileInput {
+                engine_kind: crate::engine_kind::EngineKind::MistralRs,
+                model_bytes: 900 * MIB,
+                overlay: &bad,
+                ..base.clone()
+            },
+            &TuningOverrides::default(),
+        )
+        .expect_err("llama-dialect flag must fail loudly");
+        assert!(
+            err.contains("not in this mistralrs engine's probed manifest"),
+            "teaching must point at the manifest: {err}"
+        );
+
+        let res = crate::config::ModelOverride {
+            extra_args: Some(vec!["--host".into(), "0.0.0.0".into()]),
+            ..crate::config::ModelOverride::default()
+        };
+        let err = compile(
+            &ProfileInput {
+                engine_kind: crate::engine_kind::EngineKind::MistralRs,
+                model_bytes: 900 * MIB,
+                overlay: &res,
+                ..base.clone()
+            },
+            &TuningOverrides::default(),
+        )
+        .expect_err("reserved flag must refuse");
+        assert!(
+            err.contains("reserved") && err.contains("pallama owns it"),
+            "reserved refusal must name the owner: {err}"
+        );
     }
 
     #[test]

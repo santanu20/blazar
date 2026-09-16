@@ -664,3 +664,29 @@ fn unit__mistralrs_argv__tuning_passthrough_gated_by_manifest() {
         assert!(!argv.iter().any(|t| t == flag), "{flag} leaked: {argv:?}");
     }
 }
+
+#[test]
+fn unit__mistralrs_argv__extra_args_forwarded_manifest_gated() {
+    // extra_args ride profile.argv after compile-time strict validation;
+    // the generic passthrough forwards manifest-known pairs verbatim
+    // (--isq q4k) and drops tokens an old engine lacks.
+    let m = model("/data/m.d", None);
+    let p = profile(8192, &["-np", "2", "--isq", "q4k"]);
+    let engine = MistralRsEngine::with_env(
+        manifest_flags(&["--max-model-len", "--isq", "--no-ui"]),
+        Vec::new(),
+    );
+    let argv = engine.build_argv(&m, &p, &tcp());
+    assert!(
+        argv.windows(2).any(|w| w == ["--isq", "q4k"]),
+        "isq pair must reach the child argv: {argv:?}"
+    );
+
+    let stale =
+        MistralRsEngine::with_env(manifest_flags(&["--max-model-len", "--no-ui"]), Vec::new());
+    let argv = stale.build_argv(&m, &p, &tcp());
+    assert!(
+        !argv.iter().any(|t| t == "--isq"),
+        "engine without the flag must not receive it: {argv:?}"
+    );
+}
