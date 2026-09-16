@@ -482,11 +482,11 @@ sampler_defaults.dry_multiplier = 0.8
 
 One active engine serves at a time (`pallama engine use`), but models come in
 formats engines digest differently. Routing picks the right lane per model —
-opt-in, off by default:
+on by default (set `mode = "manual"` to keep one engine for everything):
 
 ```toml
 [engine_routing]
-mode = "auto"        # "manual" (default) = the active engine serves everything
+mode = "auto"        # default; "manual" = the active engine serves everything
 policy = "quality"   # quality (default) | latency | throughput
 ```
 

@@ -1649,7 +1649,10 @@ impl WarmPeg {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EngineRouting {
-    /// `manual` (default): the daemon's active engine serves everything;
+    /// `auto` (default): each model's spawn routes by format (GGUF →
+    /// llamacpp, safetensors → sglang/mistral.rs per `policy`) so a
+    /// freshly pulled model never hits the wrong-lane 400 out of the
+    /// box; `manual`: the daemon's active engine serves everything;
     /// format mismatches keep their teaching error. `auto`: route each
     /// spawn by model format (GGUF → llamacpp-else-mistral.rs,
     /// safetensors → sglang-else-mistral.rs).
@@ -1669,7 +1672,7 @@ pub struct EngineRouting {
 impl Default for EngineRouting {
     fn default() -> Self {
         Self {
-            mode: RoutingMode::Manual,
+            mode: RoutingMode::Auto,
             policy: RoutingPolicy::Quality,
         }
     }
@@ -1680,10 +1683,12 @@ impl Default for EngineRouting {
 #[serde(rename_all = "lowercase")]
 pub enum RoutingMode {
     /// Active engine serves everything (byte-identical to pre-router
-    /// Pallama).
-    #[default]
+    /// Pallama) — opt back in with `mode = "manual"`.
     Manual,
-    /// Route each spawn by model format.
+    /// Route each spawn by model format — the default: the wrong-lane
+    /// 400 on a freshly pulled safetensors model should never happen
+    /// out of the box.
+    #[default]
     Auto,
 }
 
@@ -3662,11 +3667,15 @@ default_ctx = 16384
 
     #[test]
     fn unit__engine_routing__parsed_and_guarded() {
-        // Default: manual = today's byte-identical behavior, policy is a
-        // reserved intent hint.
+        // Default: auto — a freshly pulled model never hits the
+        // wrong-lane 400 out of the box. Manual stays reachable.
         let d = Config::default().engine_routing;
-        assert_eq!(d.mode, RoutingMode::Manual);
+        assert_eq!(d.mode, RoutingMode::Auto);
         assert_eq!(d.policy, RoutingPolicy::Quality);
+
+        let cfg = Config::from_toml("[engine_routing]\nmode = \"manual\"\n")
+            .expect("manual parses explicitly");
+        assert_eq!(cfg.engine_routing.mode, RoutingMode::Manual);
 
         let cfg = Config::from_toml("[engine_routing]\nmode = \"auto\"\npolicy = \"throughput\"\n")
             .expect("auto + throughput parse");
