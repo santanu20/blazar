@@ -6314,6 +6314,26 @@ def _server_engine_tags() -> list[str]:
     return sorted(tags, key=lambda t: int(t[1:].split("-")[0]), reverse=True)
 
 
+def _store_engine_tags() -> list[str]:
+    """Real engine rows of ANY kind (llamacpp + sglang + mistral.rs).
+
+    `engine use`/`rollback` switch across kinds via activation history
+    (verified live on 2026-09-17: rollback off a freshly built llamacpp
+    engine steps to the sglang row, rc=0), so any real row is a valid
+    dance partner for the switch lanes. The `local` pseudo-tag is
+    excluded — it is a path registration, not a store lane.
+    """
+    try:
+        db = sqlite3.connect(os.path.join(REAL_DATA, "pallama.db"))
+        rows = sorted(
+            r[0] for r in db.execute("SELECT tag FROM engines") if r[0] != "local"
+        )
+        db.close()
+        return rows
+    except Exception:
+        return []
+
+
 def _stat_nice(pid: int) -> int:
     with open(f"/proc/{pid}/stat") as f:
         parts = f.read().rsplit(")", 1)[1].split()
@@ -7146,6 +7166,16 @@ def phase_commands() -> None:
         if anchor is None:
             anchor = server_tags[0] if server_tags else None
         dance = next((t for t in server_tags if t != anchor), None)
+    if dance is None and anchor is not None:
+        # One-per-lane prune contract (dedaceb, 2026-09-16): every install
+        # path prune_siblings its lane, so a healthy store holds EXACTLY
+        # ONE llamacpp build — the >=2-llamacpp dance is only reachable on
+        # pre-dedaceb legacy stores. The designed switch dance on a modern
+        # store pairs the llamacpp anchor with a real cross-kind engine
+        # row (sglang/mistralrs): `engine use`/`rollback` are history-
+        # driven and cross-kind by design (verified live: rollback off a
+        # freshly built engine steps to the sglang row, rc=0).
+        dance = next((t for t in _store_engine_tags() if t != anchor), None)
     # Prefer a plain upstream tag for the pin-update dance so the lane
     # exercises the standard asset path whenever the store has one; a
     # -cuda pick goes through the CUDA overlay repo (needs bNNNN-cuda
@@ -7154,6 +7184,13 @@ def phase_commands() -> None:
     update_pick = next(
         (t for t in tags if t != anchor and not t.endswith("-cuda")), dance
     )
+    if update_pick is not None and update_pick not in tags:
+        # Cross-kind dance partner (or a non-b store row): the llamacpp
+        # updater only accepts llamacpp tags, so pin the update lane to
+        # the anchor itself — a plain anchor re-exercises the standard
+        # asset path, a -cuda anchor hits the documented overlay-miss
+        # boundary (bNNNN-cuda release not published in the overlay repo).
+        update_pick = anchor
 
     def _engine_full():
         p = cli("engine", "use", dance)
