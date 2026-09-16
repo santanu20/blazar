@@ -6,6 +6,26 @@ tracked here.
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-09-17
+
+Engine routing, the HF format audit, and a hardened engine store — the "pick the right engine for the model" release. Era highlights below; entries were drafted under Unreleased as they landed.
+
+### Added
+- **Engine routing v1 — `[engine_routing]` mode + policy + per-model pin (2026-09-16/17).** Default `manual` is byte-identical to 0.6.0. `mode = "auto"` routes each spawn by model format through the evidence-backed table: GGUF → llamacpp (mistral.rs GGUF 0.462 vs llama 0.500/0.526 quality, same Q4_K_M — measured, not assumed); safetensors → sglang on `quality`/`throughput` (0.612 quality / 752 tok/s conc4) or mistral.rs on `latency` (26 ms TTFT, 8 s cold). `policy` routes for real; a per-model `engine = "<tag|kind>"` pin beats both modes. Routed spawns use a per-spawn local adapter — the global active engine and the supervisor arc are untouched — and the gateway now keys mistral.rs quirks off the per-child kind (Instance/EngineRef carry `kind`). `/v1/models` + `/api/tags` advertise the routed engine per model row.
+- **`pallama engine use --kind <kind>`** — switch lanes by kind, newest-first.
+- **`model_load_timeout_secs`** — raise the hardcoded 180 s health budget for first-ever JIT lanes (marlin repack + graph capture can exceed it).
+- **HF file-type coverage audit** (`docs/hf-format-coverage.md`) — pull/serve lane + evidence tag for every HF format: GGUF (any quant, sharded, MTP heads — llamacpp, PROVEN incl 1.35x MTP speedup), safetensors BF16/AWQ/GPTQ/FP8 on sglang (AWQ marlin ~1.7x faster than BF16 same-window; GPTQ 329-358 tok/s; FP8 ~260-275 tok/s w8a8), MLX/EXL2 documented convert-first (no fake support), mistral.rs fallbacks + its ISQ lane verdict (upstream-broken at request time in v0.9.3).
+- **Auto-slots ceiling 8 on ≥8 GiB cards** (np-sweep evidence), **llama-server child knobs** (sse ping, timeout, template kwargs, cont-batching, reuse-port, lora-init), **mistral.rs tuning surface** (21 knobs + LoRA ALIAS=SOURCE lane), **dotted config edits** (`config set sglang.grammar_backend xgrammar`), **`config edit [model]`** with schema-pinned knob hints, **installer engine menu**, **`engine update --check`** dry-run.
+
+### Fixed
+- **Per-kind engine probe** — false rollbacks dethroned healthy sglang/mistral.rs engines on ANY spawn failure (the probe only ever looked for `llama-server`).
+- **mistral.rs paged-attention co-tenancy** — the 0.90-of-total PA fraction silently truncated KV into ~60 ms empty responses on shared GPUs (the matrix MULTITURN 0.0 mystery); now derived from free VRAM with a classic-KV fallback. Matrix recovery: quality 0.509 → 0.575, MULTITURN 0.0 → 0.733, conc4 186 → 508.
+- **mistral.rs `extra_args` strict manifest-gated passthrough** — the blanket refusal silently disabled engine-only flags (ISQ A/B measured 1.00x doing nothing).
+- **Manual-mode mistral.rs model rewrite regression** (introduced + fixed within this release): the pre-spawn predictor now resolves `Ok(None)` to the global kind.
+- **Installer hangs forever running `pallama serve` from a comment** — dash executes backticks inside `$( )` heredocs at parse time; also wrote a corrupted unit file.
+- **Relocatable engine rows + verified downloads** — `server_path` re-roots to the live data dir; engine downloads verify length AND digest and never leave partials behind (the truncated 14 MiB/768 MiB mistral.rs tarball class).
+- **Warm-peg after sglang/llamacpp spawn** (`[warm_peg]`) — health flips 200 before sglang's residual warmup; the first concurrent batch paid a one-time shape JIT (the 39.6 tok/s mystery → 752 at steady state).
+
 ### Added
 - **FP8 safetensors proven live (2026-09-17).** RedHatAI/Qwen2.5-0.5B-Instruct-FP8-dynamic pulls by HF name and serves on the sglang lane: cold 31.7 s (raise `model_load_timeout_secs` and disable the prefill graph on JIT-laptop boxes), warm ~260-275 tok/s — the w8a8-dynamic class sits between BF16 and 4-bit marlin as expected. Coverage table updated.
 - **`/v1/models` and `/api/tags` advertise the routed engine per model (2026-09-17).** Every model row carries an additive `engine` field naming the tag that would serve it right now: manual mode shows the global active engine; `[engine_routing] mode = "auto"` resolves per model through the same format+policy lane as the supervisor (GGUF → llamacpp, safetensors → sglang/mistral.rs per policy); `null` means nothing installed can serve it. One shared resolver (`LaneResolution`) backs the listing, the chat-time model rewrite, and routing — the three can no longer disagree.
