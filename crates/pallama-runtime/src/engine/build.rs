@@ -572,6 +572,13 @@ pub(crate) fn parse_version_pair(s: &str) -> Option<(u32, u32)> {
 /// comes from the `nvidia-smi` banner (`CUDA Version: 13.0`), which
 /// reflects the driver's runtime capability — exactly the ceiling a
 /// prebuilt CUDA binary must not exceed.
+///
+/// Latency contract: with driver persistence mode OFF (laptop default)
+/// the GPU drops to P3 after ~45 s idle and the FIRST nvidia-smi of a
+/// burst pays ~1.9 s re-waking it (measured 3/3 after idle vs 33-46 ms
+/// back-to-back; CPU load does not reproduce it). Callers that time
+/// this probe must budget seconds, not milliseconds — `sudo
+/// nvidia-smi -pm 1` pins persistence for servers that want it.
 pub async fn nvidia_gpu_facts() -> (Option<(u32, u32)>, Option<(u32, u32)>) {
     let Some(smi) = detect_toolchain(&path_dirs()).nvidia_smi else {
         return (None, None);

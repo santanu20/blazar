@@ -828,9 +828,11 @@ async fn integration__stale_release_no_assets__teaching_error_no_wait() {
     // Budget note: this pins the CONTRACT "fails fast instead of
     // waiting out the ~20 s fresh-release asset-upload window", not
     // raw subprocess speed. maybe_cuda_overlay probes real GPU facts
-    // (NVML/driver) whose latency swings ~0.1 s to ~2 s with driver and
-    // box state — observed flipping the same binary between runs. 15 s
-    // still proves no upload-wait happened while tolerating that swing.
+    // (two nvidia-smi spawns): with driver persistence mode OFF the
+    // first spawn after ~45 s idle re-wakes the GPU from P3 at a
+    // measured 1.9 s (3/3 reproducible; back-to-back runs are 33-46
+    // ms and CPU load does NOT trigger it). 15 s still proves no
+    // upload-wait happened while tolerating that driver wake.
     assert!(started.elapsed() < std::time::Duration::from_secs(15));
     let msg = format!("{err:#}");
     assert!(

@@ -7656,9 +7656,9 @@ mod tests {
     /// config schema: uncommenting EVERY hinted `key = value` pair (with
     /// the hint's own example values) has to parse through
     /// `Config::from_toml` — a renamed or removed field fails
-    /// `deny_unknown_fields` here. New knobs without a hint line are NOT
-    /// caught (schema has no field iteration); add them to the family
-    /// lines when touching the tuning structs.
+    /// `deny_unknown_fields` here. The missing direction (a new knob
+    /// without a hint line) is pinned by
+    /// `unit__knob_hint_block__covers_every_tuning_field`.
     #[test]
     fn unit__knob_hint_block__keys_match_config_schema() {
         use pallama_core::engine_kind::EngineKind;
@@ -7703,6 +7703,69 @@ mod tests {
             Config::from_toml(&doc).unwrap_or_else(|e| {
                 panic!("{kind:?} hint keys drifted from the config schema: {e}\n--- doc ---\n{doc}")
             });
+        }
+    }
+
+    /// Completes the schema lockstep in the MISSING direction: every
+    /// field of the tuning structs must appear as a hint key, and every
+    /// hint key must be a struct field. Field names are parsed from the
+    /// pallama-core source (`include_str!`) because serde has no field
+    /// iteration — a knob added to `SglangTuning`/`MistralrsTuning`
+    /// without a hint line fails here with its name.
+    #[test]
+    fn unit__knob_hint_block__covers_every_tuning_field() {
+        use pallama_core::engine_kind::EngineKind;
+        let core_src = include_str!("../../pallama-core/src/config.rs");
+
+        let struct_fields = |struct_name: &str| -> Vec<&str> {
+            let start = core_src
+                .find(&format!("pub struct {struct_name} {{"))
+                .unwrap_or_else(|| panic!("{struct_name} not found in core source"));
+            // Skip past the opening brace: the header line itself is
+            // not a field.
+            let body = &core_src[start + format!("pub struct {struct_name} {{").len()..];
+            let end = body.find("\n}").expect("struct terminator");
+            body[..end]
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("pub "))
+                .map(|rest| rest.split(':').next().unwrap_or(rest).trim())
+                .collect()
+        };
+
+        let hint_keys = |block: &str| -> Vec<String> {
+            block
+                .lines()
+                .filter_map(|l| l.strip_prefix("#   "))
+                .flat_map(|pairs| pairs.split("    "))
+                .filter_map(|chunk| chunk.split_once(" = ").map(|(k, _)| k.trim().to_string()))
+                .collect()
+        };
+
+        for (kind, struct_name) in [
+            (EngineKind::Sglang, "SglangTuning"),
+            (EngineKind::MistralRs, "MistralrsTuning"),
+        ] {
+            let fields = struct_fields(struct_name);
+            let keys = hint_keys(&knob_hint_block("m", kind, "t"));
+            let missing: Vec<&str> = fields
+                .iter()
+                .filter(|f| !keys.iter().any(|k| k == *f))
+                .copied()
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "{struct_name} fields without a hint line in knob_hint_block: {missing:?} \
+                 — add them to the family lines"
+            );
+            let unknown: Vec<String> = keys
+                .iter()
+                .filter(|k| !fields.iter().any(|f| f == k))
+                .cloned()
+                .collect();
+            assert!(
+                unknown.is_empty(),
+                "hint keys that are not {struct_name} fields: {unknown:?}"
+            );
         }
     }
 
