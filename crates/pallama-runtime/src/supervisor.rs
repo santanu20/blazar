@@ -163,6 +163,56 @@ pub(crate) fn read_model_meta(
     }
 }
 
+/// Pure core of the store-aware mismatch remedy: given the installed
+/// lanes, the engine that just refused the model, and the model's
+/// format, name a concrete `engine use` target when one exists.
+/// Returns `None` when only the generic install advice applies.
+fn remedy_suffix(
+    installed: &[(String, pallama_core::engine_kind::EngineKind)],
+    current: pallama_core::engine_kind::EngineKind,
+    safetensors: bool,
+) -> Option<String> {
+    use pallama_core::engine_kind::EngineKind as K;
+    let serving: &[K] = if safetensors {
+        &[K::Sglang, K::MistralRs]
+    } else {
+        &[K::LlamaCpp, K::MistralRs]
+    };
+    let (tag, _) = installed
+        .iter()
+        .find(|(_, k)| *k != current && serving.contains(k))?;
+    Some(format!(
+        " — but {tag} is already installed: pallama engine use {tag} \
+         (then restart the daemon), or let routing pick per model: \
+         pallama config set engine_routing.mode auto"
+    ))
+}
+
+/// Upgrade the static format-mismatch teaching (`read_model_meta`) with
+/// the store's actual lanes so a user who HAS sglang installed is told
+/// to `engine use` it, not to install it. Other error classes pass
+/// through untouched.
+fn store_aware_remedy(
+    store: &pallama_core::store::Store,
+    current: pallama_core::engine_kind::EngineKind,
+    path: &str,
+    err: String,
+) -> String {
+    let mismatch = err.contains("not servable") || err.contains("sglang serves");
+    if !mismatch {
+        return err;
+    }
+    let Ok(rows) = store.list_engines() else {
+        return err;
+    };
+    let installed: Vec<(String, pallama_core::engine_kind::EngineKind)> =
+        rows.into_iter().map(|r| (r.tag, r.kind)).collect();
+    match remedy_suffix(&installed, current, std::path::Path::new(path).is_dir()) {
+        Some(suffix) => format!("{err}{suffix}"),
+        None => err,
+    }
+}
+
 /// Drops one unit of ensure-window demand when the request's
 /// `ensure_routed` call ends (any exit path).
 struct PendingGuard(Arc<AtomicI64>);
@@ -2116,7 +2166,7 @@ impl Supervisor {
         // Co-residency on small cards is handled by the same VRAM
         // ladders that guard any multi-instance box.
         let engine: Arc<dyn Engine> =
-            match self.resolve_routed_engine( &store, &overlay, &model.path) {
+            match self.resolve_routed_engine(&store, &overlay, &model.path) {
                 Ok(Some((routed, tag))) => {
                     tracing::info!(
                         model = name,
@@ -2129,8 +2179,14 @@ impl Supervisor {
                 Ok(None) => self.engine.clone(),
                 Err(teach) => return Err(SupervisionError::UnsupportedModel(teach)),
             };
-        let meta_box = read_model_meta(&model.path, engine.kind())
-            .map_err(SupervisionError::UnsupportedModel)?;
+        let meta_box = read_model_meta(&model.path, engine.kind()).map_err(|e| {
+            SupervisionError::UnsupportedModel(store_aware_remedy(
+                &store,
+                engine.kind(),
+                &model.path,
+                e,
+            ))
+        })?;
         let loras: Vec<(String, f64)> = store
             .list_loras(Some(name))
             .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?
@@ -4053,6 +4109,30 @@ mod routing_tests {
             err.starts_with("hf config:"),
             "mistralrs-on-dir must read HF config, got: {err}"
         );
+    }
+
+    #[test]
+    fn unit__remedy_suffix__names_installed_lane_and_auto_routing() {
+        use pallama_core::engine_kind::EngineKind as K;
+        let installed = vec![
+            ("b10980-cuda".to_string(), K::LlamaCpp),
+            ("sglang-0.5.19".to_string(), K::Sglang),
+        ];
+        // The exact user hit: llamacpp active, safetensors model,
+        // sglang installed — the remedy names the tag + routing.
+        let s = remedy_suffix(&installed, K::LlamaCpp, true).expect("remedy");
+        assert!(s.contains("sglang-0.5.19 is already installed"), "{s}");
+        assert!(s.contains("pallama engine use sglang-0.5.19"), "{s}");
+        assert!(s.contains("engine_routing.mode auto"), "{s}");
+        // Mirror case: sglang active, GGUF model, llamacpp installed.
+        let s = remedy_suffix(&installed, K::Sglang, false).expect("remedy");
+        assert!(s.contains("b10980-cuda is already installed"), "{s}");
+        // Nothing servable installed (llamacpp only, safetensors):
+        // generic install advice stays, no bogus tag.
+        let llama_only = vec![("b10980-cuda".to_string(), K::LlamaCpp)];
+        assert!(remedy_suffix(&llama_only, K::LlamaCpp, true).is_none());
+        // Same-kind rows never count as an alternative lane.
+        assert!(remedy_suffix(&llama_only, K::LlamaCpp, false).is_none());
     }
 
     #[test]
