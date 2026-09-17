@@ -817,8 +817,16 @@ impl SglangEngine {
         manifest: crate::engine::manifest::Manifest,
         env: Vec<(String, String)>,
     ) -> Self {
+        // 5s, not the 2s the fast lanes use: sglang 0.5.19's default
+        // /health is a GENERATE probe (SGLANG_ENABLE_HEALTH_ENDPOINT_
+        // GENERATION defaults true, environ.py) that sleeps in 1s steps
+        // waiting for a 1-token round trip — ~1.2s idle, >2s under load.
+        // A 2s total timeout never completes one 200 and the poll reports
+        // a healthy child as dead for the whole model_load_timeout window
+        // (seen live: uvicorn access log full of 200s the daemon never
+        // received within budget).
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_secs(5))
             .build()
             .expect("health client");
         Self {
@@ -918,7 +926,12 @@ impl Engine for SglangEngine {
                 ));
             }
             tokio::time::sleep(poll).await;
-            poll = std::cmp::min(poll.mul_f64(1.6), std::time::Duration::from_millis(150));
+            // 1s cap, not the 150ms the fast lanes use: every sglang
+            // /health poll costs the child a 1-token generate on the GPU
+            // (generate-probe default), so a 150ms hammer queues ~7
+            // probes/second against a booting scheduler and self-congests
+            // the exact responses the poll is waiting for.
+            poll = std::cmp::min(poll.mul_f64(1.6), std::time::Duration::from_secs(1));
         }
     }
 }
@@ -1110,6 +1123,93 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("--rpc endpoint(s) unreachable"), "{msg}");
         assert!(msg.contains("rpc_servers"), "{msg}");
+    }
+
+    /// sglang 0.5.19 /health is a generate probe: the handler sleeps in
+    /// 1s steps waiting for a 1-token round trip, so a 200 takes ~1.2s
+    /// idle and 2s+ under load. A stub answers every /health with 200
+    /// AFTER a probe-like latency — the health client's total timeout
+    /// must outlive it or the poll declares a healthy child dead (the
+    /// live failure: uvicorn logged a steady stream of 200s the daemon
+    /// never completed within its old 2s budget, so every spawn was
+    /// killed at model_load_timeout).
+    async fn probe_latency_health_stub(latency: std::time::Duration) -> u16 {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind stub");
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    use tokio::io::AsyncReadExt;
+                    loop {
+                        let Ok(n) = sock.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 || buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(latency).await;
+                    use tokio::io::AsyncWriteExt;
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn unit__sglang_health__slow_generate_probe_200_still_passes() {
+        let port = probe_latency_health_stub(std::time::Duration::from_millis(2500)).await;
+        let engine = SglangEngine::new(crate::engine::manifest::Manifest {
+            tag: "fake".into(),
+            build_number: 1,
+            version_raw: "b1".into(),
+            devices: vec![],
+            flags: std::collections::BTreeSet::new(),
+            spec_types: vec![],
+            server_path: String::new(),
+        });
+        let endpoint = Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port,
+        };
+        // 2.5s response latency: the old 2s-total client timed out on
+        // EVERY attempt and never returned Ok within any budget.
+        engine
+            .health_check(&endpoint, std::time::Duration::from_secs(30))
+            .await
+            .expect("probe-latency 200 must count as healthy");
+    }
+
+    #[tokio::test]
+    async fn unit__sglang_health__deadline_still_bounded() {
+        let port = dead_port().await;
+        let engine = SglangEngine::new(crate::engine::manifest::Manifest {
+            tag: "fake".into(),
+            build_number: 1,
+            version_raw: "b1".into(),
+            devices: vec![],
+            flags: std::collections::BTreeSet::new(),
+            spec_types: vec![],
+            server_path: String::new(),
+        });
+        let endpoint = Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port,
+        };
+        let err = engine
+            .health_check(&endpoint, std::time::Duration::from_secs(2))
+            .await
+            .expect_err("dead port must fail");
+        assert!(err.to_string().contains("model_load_timeout"), "{err:#}");
     }
 
     fn mistralrs_row(path: &str) -> pallama_core::ModelRow {
