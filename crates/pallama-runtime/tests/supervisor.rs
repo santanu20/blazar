@@ -232,7 +232,10 @@ async fn regression__dropped_loader_future_does_not_wedge_next_ensure() {
             _ = &mut fut => { /* load finished instantly — pin vacuous */ }
         }
     } // fut dropped HERE = the client-disconnect cancellation
-    let budget = Duration::from_secs(sup.load_timeout_secs.expect("helper pins a fast load timeout")) * 3;
+    let budget = Duration::from_secs(
+        sup.load_timeout_secs
+            .expect("helper pins a fast load timeout"),
+    ) * 3;
     let second = tokio::time::timeout(budget, sup.ensure("m1")).await;
     let ep = second
         .expect("subsequent ensure wedged after dropped loader")
