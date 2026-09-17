@@ -301,12 +301,6 @@ pub struct Config {
     /// `ps`, and the log — `pallama engine update` stays a human action.
     #[serde(default = "default_engine_check_secs")]
     pub engine_check_secs: u64,
-    /// Restart the daemon automatically after an engine switch (use/
-    /// update/build/install/rollback activated a different engine).
-    /// false (default) = print the restart hint only: the daemon keeps
-    /// serving with the engine it booted with until restarted.
-    #[serde(default)]
-    pub auto_restart_engine_switch: bool,
     /// mistral.rs paged-attention KV budget as a fraction of GPU memory
     /// (`--pa-memory-fraction`): the upstream default (0.90) claims ~90%
     /// of VRAM for KV and hard-fails at load ("Num GPU blocks is 0")
@@ -1768,7 +1762,6 @@ impl Default for Config {
             semantic_cache: SemanticCacheConfig::default(),
             devices: Vec::new(),
             engine_check_secs: default_engine_check_secs(),
-            auto_restart_engine_switch: false,
             mistralrs_pa_memory_fraction: None,
             mistralrs_paged_attn: None,
             mistralrs: MistralrsTuning::default(),

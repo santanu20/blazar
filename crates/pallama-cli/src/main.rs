@@ -872,132 +872,6 @@ fn daemon_base(cfg: &Config) -> String {
     format!("http://{}:{}", cfg.host, cfg.port)
 }
 
-/// The serving daemon keeps the engine it booted with (supervisor holds
-/// the engine at construction) — after any engine switch, a running
-/// daemon must be restarted before it serves the new binary. Probe-only:
-/// silent when no daemon is up.
-/// Restart command lanes after an engine switch, privilege-free first:
-/// a user-scope service restarts without elevation; a system-scope one
-/// is attempted once via passwordless sudo (`sudo -n`, fails fast when a
-/// password would be needed) — never prompting mid-command.
-fn restart_lanes(os: &str, home: &str, system_unit: bool, user_unit: bool) -> Vec<Vec<String>> {
-    fn cmd(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(std::string::ToString::to_string).collect()
-    }
-    let mut lanes: Vec<Vec<String>> = Vec::new();
-    match os {
-        "linux" => {
-            if user_unit {
-                lanes.push(cmd(&["systemctl", "--user", "restart", "pallama"]));
-            }
-            if system_unit {
-                lanes.push(cmd(&["sudo", "-n", "systemctl", "restart", "pallama"]));
-            }
-        }
-        "macos" => {
-            // crate is forbid(unsafe_code): resolve the uid without libc
-            let uid = std::process::Command::new("id")
-                .arg("-u")
-                .output()
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .unwrap_or_default();
-            if !uid.is_empty() {
-                lanes.push(cmd(&[
-                    "launchctl",
-                    "kickstart",
-                    "-k",
-                    &format!("gui/{uid}/dev.pallama"),
-                ]));
-            }
-            if system_unit {
-                lanes.push(cmd(&[
-                    "sudo",
-                    "-n",
-                    "launchctl",
-                    "kickstart",
-                    "-k",
-                    "system/dev.pallama",
-                ]));
-            }
-        }
-        _ => {}
-    }
-    let _ = home;
-    lanes
-}
-
-/// Post-engine-switch daemon action. Knob off (default): one-line hint.
-/// Knob on (`auto_restart_engine_switch = true`) and the daemon is
-/// alive: restart it through the first working lane and wait for
-/// /healthz; when no lane works (manual daemon, locked-down system
-/// unit) fall back to the printed hint with the reason.
-async fn restart_hint() {
-    let Ok(cfg) = config() else { return };
-    let base = daemon_base(&cfg);
-    let Ok(http) = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-    else {
-        return;
-    };
-    let alive = match http.get(format!("{base}/healthz")).send().await {
-        Ok(r) => r.status().is_success(),
-        Err(_) => false,
-    };
-    if !alive {
-        return; // nothing serving: the next start picks the engine up
-    }
-    let hint = "a running daemon serves with the engine it booted with — \
-         restart it to pick up the switch (systemd: `systemctl restart pallama`)";
-    if !cfg.auto_restart_engine_switch {
-        println!("note: {hint}");
-        return;
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    let lanes = restart_lanes(
-        std::env::consts::OS,
-        &home,
-        Path::new("/etc/systemd/system/pallama.service").exists()
-            || Path::new("/Library/LaunchDaemons/dev.pallama.plist").exists(),
-        Path::new(&format!("{home}/.config/systemd/user/pallama.service")).exists(),
-    );
-    let mut last_why = "no service manager lane for this platform".to_string();
-    for lane in &lanes {
-        match tokio::process::Command::new(&lane[0])
-            .args(&lane[1..])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await
-        {
-            Ok(s) if s.success() => {
-                // wait for the daemon to answer /healthz again (≤30s)
-                for _ in 0..60 {
-                    if let Ok(r) = http.get(format!("{base}/healthz")).send().await {
-                        if r.status().is_success() {
-                            println!(
-                                "note: daemon restarted (auto_restart_engine_switch) — it now serves the new engine"
-                            );
-                            return;
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-                last_why = "restart command ran but /healthz never came back within 30s".into();
-            }
-            Ok(s) => {
-                last_why = format!("`{}` exited with {s} (needs a password?)", lane.join(" "));
-            }
-            Err(e) => {
-                last_why = format!("`{}` failed to spawn: {e}", lane.join(" "));
-            }
-        }
-    }
-    println!("note: could not auto-restart the daemon ({last_why}) — {hint}");
-}
-
 /// Auto-start (plan G): 1s probe; on refusal, detached self-exec `serve`
 /// (own session, logs to run/daemon.log), then poll /healthz ≤30s.
 async fn ensure_daemon() -> Result<String> {
@@ -6877,7 +6751,6 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             let mgr = local_engine_manager(&d)?;
             let row = mgr.use_tag(&resolved_tag)?;
             println!("active engine: {}", row.tag);
-            restart_hint().await;
         }
         EngineCmd::Prune => engine_prune(&d)?,
         EngineCmd::Rm { tag } => {
@@ -6887,7 +6760,6 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             let mgr = local_engine_manager(&d)?;
             let row = mgr.rollback()?;
             println!("rolled back to: {}", row.tag);
-            restart_hint().await;
         }
         EngineCmd::Build {
             backend,
@@ -6979,7 +6851,6 @@ async fn engine_install_mistralrs(d: &PallamaDirs, tag: Option<String>) -> Resul
             humansize(bytes as i64)
         );
     }
-    restart_hint().await;
     Ok(())
 }
 
@@ -7099,7 +6970,6 @@ async fn engine_install_sglang(d: &PallamaDirs, version: Option<String>) -> Resu
         );
     }
     println!("next: pull a safetensors model (e.g. pallama pull Qwen/Qwen2.5-0.5B-Instruct)");
-    restart_hint().await;
     Ok(())
 }
 
@@ -7438,9 +7308,7 @@ async fn engine_update(
             row.tag
         );
     }
-    if !unchanged {
-        restart_hint().await;
-    }
+    if !unchanged {}
     Ok(())
 }
 
@@ -7550,7 +7418,6 @@ async fn engine_build(d: &PallamaDirs, a: BackendArg) -> Result<()> {
             row.tag
         );
     }
-    restart_hint().await;
     Ok(())
 }
 
@@ -9999,27 +9866,6 @@ mod tests {
             engine_update_command("local", "built-cuda"),
             "pallama engine update"
         );
-    }
-
-    #[test]
-    fn unit__restart_lanes__privilege_free_before_sudo() {
-        // linux: user unit restarts without elevation and must come
-        // BEFORE the passwordless-sudo system lane; neither unit ->
-        // no lane (manual daemons get the printed hint).
-        let both = restart_lanes("linux", "/home/u", true, true);
-        assert_eq!(both[0][0..4], ["systemctl", "--user", "restart", "pallama"]);
-        assert_eq!(both[1][0..2], ["sudo", "-n"]);
-        assert!(restart_lanes("linux", "/home/u", false, false).is_empty());
-        let sys_only = restart_lanes("linux", "/home/u", true, false);
-        assert_eq!(sys_only.len(), 1);
-        assert_eq!(sys_only[0][0], "sudo");
-        // macos: launch agent lane is uid-scoped; system daemon via sudo -n
-        let mac = restart_lanes("macos", "/Users/u", true, false);
-        assert_eq!(mac.len(), 2);
-        assert!(mac[0][1] == "kickstart" && mac[0][2] == "-k");
-        assert!(mac[1][0] == "sudo");
-        // unknown platform: nothing to drive
-        assert!(restart_lanes("windows", "C:/u", true, true).is_empty());
     }
 
     #[test]

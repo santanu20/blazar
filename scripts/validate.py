@@ -1604,18 +1604,9 @@ _K = [
         None,
         "engine/app update channel (stable|latest); fresh-visible + roundtrip boot",
     ),
-    # F146: three config.rs knobs that were absent from the registry —
-    # gate (b) would have gone RED on the first fresh-config-list diff
-    # (auto_restart_engine_switch is list-visible), and the two Options
-    # were invisible holes in the manifest denominator.
-    (
-        "auto_restart_engine_switch",
-        False,
-        False,
-        "boundary",
-        None,
-        "engine-switch restart policy; no dedicated phase (engine list only)",
-    ),
+    # F146: config.rs knobs that were absent from the registry —
+    # gate (b) would have gone RED on the first fresh-config-list diff,
+    # and the Options were invisible holes in the manifest denominator.
     (
         "mistralrs_pa_memory_fraction",
         True,
@@ -7899,7 +7890,6 @@ def _full_toplevel() -> dict:
         "lazy_mode": "auto",
         "deterministic": False,
         "audit_log": False,
-        "auto_restart_engine_switch": False,
         "cpu_ffn_n": 1,
         # container knob: benign explicit boot (enabled=false — true would
         # require a model; config.rs validation rule)

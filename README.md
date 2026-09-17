@@ -171,9 +171,6 @@ idle_sleep_secs = 300     # child-native GPU sleep (frees VRAM, warm wake)
 idle_timeout_secs = 1800  # process eviction after idle
 max_loaded_models = 0     # 0 = auto from VRAM / model size
 child_transport = "tcp"   # "tcp" (curl-debuggable) — "unix" rejected at load (not implemented)
-auto_restart_engine_switch = false  # true: engine use/update/build/install restarts a
-                                    #   live daemon itself (user-scope service or
-                                    #   passwordless sudo; else falls back to the hint)
 # child_auth: unset = auto (TCP children authed, UDS not) | true | false.
 #   Per-child secret minted at spawn (0600 keyfile run/<model>.apikey, never in
 #   argv on engines with --api-key-file), gateway stamps every child call;
