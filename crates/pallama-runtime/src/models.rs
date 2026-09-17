@@ -187,26 +187,7 @@ pub fn reconcile_models(dirs: &PallamaDirs, store: &Store) -> ReconcileReport {
     // hardlink twins of owned files (aliases) are not double-adopted.
     // Linked projectors count as owned too: a surviving row's mmproj must
     // never be re-attached to a different model by reconcile.
-    let mut owned: HashSet<PathBuf> = HashSet::new();
-    let mut owned_inodes: HashSet<(u64, u64)> = HashSet::new();
-    for row in store.list_models().unwrap_or_default() {
-        for p in [
-            Some(PathBuf::from(&row.path)),
-            row.mmproj_path.map(PathBuf::from),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if let Ok(c) = p.canonicalize() {
-                owned.insert(c);
-            }
-            #[cfg(unix)]
-            if let Ok(md) = std::fs::metadata(&p) {
-                use std::os::unix::fs::MetadataExt as _;
-                owned_inodes.insert((md.dev(), md.ino()));
-            }
-        }
-    }
+    let (owned, owned_inodes) = ownership_set(store);
 
     // Deterministic scan order: boot output must be stable across runs.
     let mut names: Vec<String> = entries
@@ -241,34 +222,12 @@ pub fn reconcile_models(dirs: &PallamaDirs, store: &Store) -> ReconcileReport {
     }
     let mut attached_sidecars: HashSet<String> = HashSet::new();
     let mut adopted_inodes: HashSet<(u64, u64)> = HashSet::new();
-    for leaves in shard_sets.values() {
-        adopt_gguf(
-            &models_dir,
-            store,
-            leaves,
-            &owned,
-            &owned_inodes,
-            &sidecars,
-            &mut attached_sidecars,
-            &mut adopted_inodes,
-            &mut report,
-        );
-    }
-    for leaf in &singles {
-        adopt_gguf(
-            &models_dir,
-            store,
-            std::slice::from_ref(leaf),
-            &owned,
-            &owned_inodes,
-            &sidecars,
-            &mut attached_sidecars,
-            &mut adopted_inodes,
-            &mut report,
-        );
-    }
 
-    // Safetensors dirs: the pull lane names them `<model>.d`.
+    // Safetensors dirs adopt BEFORE any GGUF: a dir's name minus `.d` is
+    // the model's own canonical repo name, while a GGUF's embedded
+    // general.name is a candidate ladder rung that can collide with it
+    // (quant siblings all embed the base name). Dirs-first lets the dir
+    // claim its name and the GGUF ladder fall through honestly.
     for name in &names {
         let dir = models_dir.join(name);
         if !dir.is_dir() {
@@ -281,6 +240,33 @@ pub fn reconcile_models(dirs: &PallamaDirs, store: &Store) -> ReconcileReport {
         if !root_safetensors(&dir).is_empty() || looks_pulled {
             adopt_dir(&models_dir, store, name, &owned, &mut report);
         }
+    }
+
+    for leaves in shard_sets.values() {
+        let mut ctx = AdoptCtx {
+            owned: &owned,
+            owned_inodes: &owned_inodes,
+            sidecars: &sidecars,
+            attached_sidecars: &mut attached_sidecars,
+            adopted_inodes: &mut adopted_inodes,
+        };
+        adopt_gguf(&models_dir, store, leaves, &mut ctx, &mut report);
+    }
+    for leaf in &singles {
+        let mut ctx = AdoptCtx {
+            owned: &owned,
+            owned_inodes: &owned_inodes,
+            sidecars: &sidecars,
+            attached_sidecars: &mut attached_sidecars,
+            adopted_inodes: &mut adopted_inodes,
+        };
+        adopt_gguf(
+            &models_dir,
+            store,
+            std::slice::from_ref(leaf),
+            &mut ctx,
+            &mut report,
+        );
     }
 
     // Backfill: rows adopted before their projector sidecar existed (or
@@ -320,6 +306,34 @@ pub fn reconcile_models(dirs: &PallamaDirs, store: &Store) -> ReconcileReport {
     report
 }
 
+/// Canonical paths + inodes of everything existing rows own (model files
+/// and linked projectors). Hardlink twins of these are silently skipped
+/// during adoption; a row's projector must never be re-attached to a
+/// different model by reconcile.
+fn ownership_set(store: &Store) -> (HashSet<PathBuf>, HashSet<(u64, u64)>) {
+    let mut owned: HashSet<PathBuf> = HashSet::new();
+    let mut owned_inodes: HashSet<(u64, u64)> = HashSet::new();
+    for row in store.list_models().unwrap_or_default() {
+        for p in [
+            Some(PathBuf::from(&row.path)),
+            row.mmproj_path.map(PathBuf::from),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Ok(c) = p.canonicalize() {
+                owned.insert(c);
+            }
+            #[cfg(unix)]
+            if let Ok(md) = std::fs::metadata(&p) {
+                use std::os::unix::fs::MetadataExt as _;
+                owned_inodes.insert((md.dev(), md.ino()));
+            }
+        }
+    }
+    (owned, owned_inodes)
+}
+
 /// Root-level `.safetensors` weights of an HF model dir (the pull lane's
 /// selection rule: shards live at the root, config.json is mandatory).
 fn root_safetensors(dir: &Path) -> Vec<PathBuf> {
@@ -339,6 +353,16 @@ fn root_safetensors(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// Shared adoption working state: what the store already owns (paths +
+/// inodes), the sidecar pool, and the cross-adoption bookkeeping.
+struct AdoptCtx<'a> {
+    owned: &'a HashSet<PathBuf>,
+    owned_inodes: &'a HashSet<(u64, u64)>,
+    sidecars: &'a [String],
+    attached_sidecars: &'a mut HashSet<String>,
+    adopted_inodes: &'a mut HashSet<(u64, u64)>,
+}
+
 /// Adopt one GGUF (or a whole shard set) at its EXISTING location.
 /// Mirrors `pallama import`'s derivation exactly: quant from the filename
 /// tail-token, name from GGUF metadata or the file stem.
@@ -346,16 +370,15 @@ fn adopt_gguf(
     models_dir: &Path,
     store: &Store,
     leaves: &[String],
-    owned: &HashSet<PathBuf>,
-    owned_inodes: &HashSet<(u64, u64)>,
-    sidecars: &[String],
-    attached_sidecars: &mut HashSet<String>,
-    adopted_inodes: &mut HashSet<(u64, u64)>,
+    ctx: &mut AdoptCtx<'_>,
     report: &mut ReconcileReport,
 ) {
     let first = &leaves[0];
     let path = models_dir.join(first);
-    if owned.contains(&path.canonicalize().unwrap_or_else(|_| path.clone())) {
+    if ctx
+        .owned
+        .contains(&path.canonicalize().unwrap_or_else(|_| path.clone()))
+    {
         return; // a row already owns this file
     }
     #[cfg(unix)]
@@ -363,10 +386,10 @@ fn adopt_gguf(
         use std::os::unix::fs::MetadataExt as _;
         if let Ok(md) = std::fs::metadata(&path) {
             let ino = (md.dev(), md.ino());
-            if owned_inodes.contains(&ino) || adopted_inodes.contains(&ino) {
+            if ctx.owned_inodes.contains(&ino) || ctx.adopted_inodes.contains(&ino) {
                 return; // hardlink twin of an owned/adopted file
             }
-            adopted_inodes.insert(ino);
+            ctx.adopted_inodes.insert(ino);
         }
     }
     let label = if leaves.len() > 1 {
@@ -410,7 +433,7 @@ fn adopt_gguf(
     // `owner--repo--` prefix) belongs to this model with the same
     // certainty pull had when it stored both files. Bare sidecars carry
     // no repo signal and are never guessed onto a bare model.
-    let mmproj_path = match_sidecar_for(first, sidecars, attached_sidecars)
+    let mmproj_path = match_sidecar_for(first, ctx.sidecars, ctx.attached_sidecars)
         .map(|f| models_dir.join(f).display().to_string());
     let row = ModelRow {
         name: model_name.clone(),
@@ -1019,6 +1042,42 @@ mod tests {
         let r2 = reconcile_models(&dirs, &store);
         assert!(r2.adopted.is_empty(), "{:?}", r2.adopted);
         assert!(r2.skipped.is_empty(), "{:?}", r2.skipped);
+    }
+
+    #[test]
+    fn unit__reconcile__dir_wins_canonical_name_over_gguf_meta_ladder() {
+        // Real-world shape from the 09-17 reinstall: the fp16 GGUF's
+        // embedded general.name ("Qwen2.5 0.5B Instruct") collides with
+        // the safetensors dir's own repo name. Dirs adopt first so the
+        // dir claims qwen2.5-0.5b-instruct and the GGUF ladder falls
+        // through to its full stem — no shadowing, no warn, both rows.
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        let sd = d.join("qwen2.5-0.5b-instruct.d");
+        std::fs::create_dir_all(&sd).unwrap();
+        std::fs::write(
+            sd.join("config.json"),
+            br#"{"architectures":["Qwen2ForCausalLM"],"torch_dtype":"bfloat16"}"#,
+        )
+        .unwrap();
+        std::fs::write(sd.join("model.safetensors"), b"aaaa").unwrap();
+        write_gguf(
+            &d.join("qwen2.5-0.5b-instruct-fp16.gguf"),
+            "qwen3",
+            Some("Qwen2.5 0.5B Instruct"),
+        );
+        let store = Store::open(&dirs).unwrap();
+
+        let r = reconcile_models(&dirs, &store);
+        assert_eq!(r.adopted.len(), 2, "{:?}", r.skipped);
+        assert!(r.skipped.is_empty(), "{:?}", r.skipped);
+        let dir_row = store.get_model("qwen2.5-0.5b-instruct").unwrap().unwrap();
+        assert_eq!(dir_row.path, sd.display().to_string());
+        let gguf_row = store
+            .get_model("qwen2.5-0.5b-instruct-fp16")
+            .unwrap()
+            .unwrap();
+        assert!(gguf_row.path.ends_with(".gguf"));
     }
 
     #[test]
