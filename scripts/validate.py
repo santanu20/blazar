@@ -3191,58 +3191,79 @@ def phase_config() -> None:
         )
 
     # engine_check_secs: background marker lands within a few seconds.
-    d.start({"default_ctx": 2048, "engine_check_secs": 5})
-    marker = os.path.join(SANDBOX.data_dir, "run", "engine-check.json")
-    deadline = time.time() + 45
-    marker_ok = False
-    while time.time() < deadline and not marker_ok:
-        try:
-            with open(marker) as f:
-                m = json.load(f)
-            marker_ok = isinstance(m.get("active"), str) and "latest" in m
-        except Exception:
-            time.sleep(1)
-    if marker_ok:
-        check(
+    # The llamacpp channel survey deliberately skips non-llamacpp ACTIVE
+    # engines (product design: a cross-kind "update available: bNNNN"
+    # nag is meaningless) — boundary-skip the battery in that env.
+    _ec_db = _sandbox_db()
+    _ec_row = _ec_db.execute("SELECT kind FROM engines WHERE active = 1").fetchone()
+    _ec_db.close()
+    _ec_kind = _ec_row[0] if _ec_row else None
+    if _ec_kind not in (None, "llamacpp"):
+        boundary(
             "config",
             "engine_check_secs 5 -> run/engine-check.json marker",
-            True,
-            "marker=ok",
+            f"sandbox active engine is {_ec_kind}: the llamacpp currency "
+            "survey intentionally skips cross-kind actives; marker "
+            "machinery covered by Rust unit tests",
         )
-        cov("engine_check_secs", "background currency marker", "ok")
+        cov(
+            "engine_check_secs",
+            "background currency marker",
+            f"boundary: active={_ec_kind}",
+        )
     else:
-        gh_budget = None
-        try:
-            with urllib.request.urlopen(
-                "https://api.github.com/rate_limit", timeout=5
-            ) as r:
-                gh_budget = json.load(r)["resources"]["core"]["remaining"]
-        except Exception:
-            gh_budget = None
-        if gh_budget == 0:
-            boundary(
-                "config",
-                "engine_check_secs 5 -> run/engine-check.json marker",
-                "GH latest_b_release rate-limited (core budget 0) this window; "
-                "marker task verified by Rust unit tests + writes when budget returns",
-            )
-            cov(
-                "engine_check_secs",
-                "background currency marker",
-                "boundary: GH rate limit",
-            )
-        else:
+        d.start({"default_ctx": 2048, "engine_check_secs": 5})
+        marker = os.path.join(SANDBOX.data_dir, "run", "engine-check.json")
+        deadline = time.time() + 45
+        marker_ok = False
+        while time.time() < deadline and not marker_ok:
+            try:
+                with open(marker) as f:
+                    m = json.load(f)
+                marker_ok = isinstance(m.get("active"), str) and "latest" in m
+            except Exception:
+                time.sleep(1)
+        if marker_ok:
             check(
                 "config",
                 "engine_check_secs 5 -> run/engine-check.json marker",
-                False,
-                f"marker=missing (GH budget={gh_budget} — not a rate limit)",
+                True,
+                "marker=ok",
             )
-            cov(
-                "engine_check_secs",
-                "background currency marker",
-                "MISSING",
-            )
+            cov("engine_check_secs", "background currency marker", "ok")
+        else:
+            gh_budget = None
+            try:
+                with urllib.request.urlopen(
+                    "https://api.github.com/rate_limit", timeout=5
+                ) as r:
+                    gh_budget = json.load(r)["resources"]["core"]["remaining"]
+            except Exception:
+                gh_budget = None
+            if gh_budget == 0:
+                boundary(
+                    "config",
+                    "engine_check_secs 5 -> run/engine-check.json marker",
+                    "GH latest_b_release rate-limited (core budget 0) this window; "
+                    "marker task verified by Rust unit tests + writes when budget returns",
+                )
+                cov(
+                    "engine_check_secs",
+                    "background currency marker",
+                    "boundary: GH rate limit",
+                )
+            else:
+                check(
+                    "config",
+                    "engine_check_secs 5 -> run/engine-check.json marker",
+                    False,
+                    f"marker=missing (GH budget={gh_budget} — not a rate limit)",
+                )
+                cov(
+                    "engine_check_secs",
+                    "background currency marker",
+                    "MISSING",
+                )
 
     # ps rows carry the resolved GPU-offload label.
     st, v, _ = chat("Say ok")
@@ -5532,7 +5553,10 @@ def phase_wave() -> None:
     # SIGABRTs on a dead one (ggml-rpc.cpp:547), so spawn a REAL
     # ggml-rpc-server first — anything less crash-loops the child.
     d.stop()
-    rpc_tag = _active_engine_tag()
+    # ggml-rpc-server is a llama.cpp binary: resolve the dir from a
+    # llamacpp engine row (the ACTIVE row may be a JIT-installed
+    # mistral.rs, whose dir never carries it).
+    rpc_tag = _llamacpp_engine_tag()
     # derive the real engine layout: CUDA assets unpack into vendor-suffixed
     # dirs (llama-<tag>-bin-ubuntu-cuda-...), not llama-<tag> (F167)
     rpc_srv_path = next(
@@ -6285,6 +6309,26 @@ def _active_engine_tag() -> str | None:
     row = db.execute("SELECT tag FROM engines WHERE active = 1").fetchone()
     db.close()
     return row[0] if row else None
+
+
+def _llamacpp_engine_tag() -> str | None:
+    """Tag of the engine dir that carries llama.cpp binaries.
+
+    Router/rpc batteries exercise llama-server features (ggml-rpc-server,
+    --models-preset); a non-llamacpp ACTIVE row (e.g. a JIT mistral.rs
+    install) must not point them at the wrong dir. Prefer the active row
+    when it is llamacpp, else the newest llamacpp row, else the active
+    tag (preserving the honest missing-binary skip when no llamacpp
+    engine exists at all).
+    """
+    db = _sandbox_db()
+    rows = db.execute("SELECT tag, kind, active, installed_at FROM engines").fetchall()
+    db.close()
+    active = next((r for r in rows if r[2] == 1), None)
+    if active and active[1] == "llamacpp":
+        return active[0]
+    llamacpp = sorted((r for r in rows if r[1] == "llamacpp"), key=lambda r: r[3])
+    return llamacpp[-1][0] if llamacpp else (active[0] if active else None)
 
 
 def _full_engine_tags() -> list[str]:
