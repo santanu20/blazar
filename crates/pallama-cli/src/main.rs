@@ -132,7 +132,12 @@ enum Cmd {
     Rm { models: Vec<String> },
     /// List pulled models
     #[command(alias = "ls")]
-    List,
+    List {
+        /// One JSON object per model (JSONL, like `doctor --json`);
+        /// suppresses the table
+        #[arg(long)]
+        json: bool,
+    },
     /// Show model details, active profile, last benchmark
     Show { model: String },
     /// Live instances: state, ctx, in-flight requests, idle countdown
@@ -140,6 +145,10 @@ enum Cmd {
         /// Clear crash circuit breakers
         #[arg(long)]
         reset: bool,
+        /// One JSON object per instance (JSONL, like `doctor --json`);
+        /// suppresses the daemon banner and table
+        #[arg(long)]
+        json: bool,
     },
     /// Chat REPL against a model (streams; /exit /clear /model /sysinfo /profile);
     /// with an inline PROMPT: single-shot generation, prints and exits
@@ -402,7 +411,12 @@ enum EngineCmd {
         check: bool,
     },
     /// List installed engines with capability summaries
-    List,
+    List {
+        /// One JSON object per installed engine (JSONL); suppresses the
+        /// table and the install-catalog hints
+        #[arg(long)]
+        json: bool,
+    },
     /// Activate an installed tag (see `pallama engine list` for tags)
     ///
     /// Applies to children spawned after the switch — restart the
@@ -1047,9 +1061,9 @@ async fn run(cmd: Cmd) -> Result<()> {
             let resolved: Vec<String> = models.iter().map(|m| resolve_model_cli(m)).collect();
             rm_multi(&resolved)
         }
-        Cmd::List => list(),
+        Cmd::List { json } => list(json),
         Cmd::Show { model } => show(&resolve_model_cli(&model)),
-        Cmd::Ps { reset } => ps(reset).await,
+        Cmd::Ps { reset, json } => ps(reset, json).await,
         Cmd::Run {
             model,
             prompt,
@@ -3903,13 +3917,9 @@ fn render_list_table(header: [&str; 9], rows: &[[String; 9]]) -> String {
     out.trim_end().to_string()
 }
 
-fn list() -> Result<()> {
+fn list(json: bool) -> Result<()> {
     let store = Store::open(&dirs())?;
     let models = store.list_models()?;
-    if models.is_empty() {
-        println!("no models pulled");
-        return Ok(());
-    }
     // Routed-engine column: the same lane decision the gateway's
     // /v1/models and /api/tags rows carry, so the three listings can
     // never disagree (manual = the active engine; auto = format+policy
@@ -3924,6 +3934,40 @@ fn list() -> Result<()> {
         .iter()
         .find(|r| r.active)
         .map(|r| (r.tag.clone(), r.kind));
+    if json {
+        // Machine-typed mirror of the table: mmproj_bytes null = no
+        // projector configured (0 = configured but missing on disk),
+        // engine null = nothing installed serves the model.
+        for m in &models {
+            let mmproj_bytes = m.mmproj_path.as_ref().map(|p| {
+                std::fs::metadata(p)
+                    .map(|md| u64::try_from(md.len()).unwrap_or(u64::MAX))
+                    .unwrap_or(0)
+            });
+            let engine = routed_engine_lane(&cfg, global.as_ref(), &installed, &m.name, &m.path)
+                .ok()
+                .and_then(|lane| (!lane.is_empty()).then_some(lane));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "name": m.name,
+                    "quant": m.quant,
+                    "bytes": m.bytes,
+                    "mmproj_bytes": mmproj_bytes,
+                    "arch": m.arch,
+                    "ctx_train": m.ctx_train,
+                    "format": model_type_label(&m.path),
+                    "engine": engine,
+                    "path": m.path,
+                })
+            );
+        }
+        return Ok(());
+    }
+    if models.is_empty() {
+        println!("no models pulled");
+        return Ok(());
+    }
     let rows: Vec<[String; 9]> = models
         .iter()
         .map(|m| {
@@ -4011,10 +4055,7 @@ fn show(model: &str) -> Result<()> {
     Ok(())
 }
 
-async fn ps(reset: bool) -> Result<()> {
-    if !reset {
-        upstream_update_hint(&dirs()).await;
-    }
+async fn ps(reset: bool, json: bool) -> Result<()> {
     if reset {
         let base = ensure_daemon().await?;
         let _: serde_json::Value = cli_http()
@@ -4026,6 +4067,9 @@ async fn ps(reset: bool) -> Result<()> {
         println!("circuits reset");
         return Ok(());
     }
+    if !json {
+        upstream_update_hint(&dirs()).await;
+    }
     let base = ensure_daemon().await?;
     let v: serde_json::Value = cli_http()
         .get(format!("{base}/api/ps"))
@@ -4034,6 +4078,28 @@ async fn ps(reset: bool) -> Result<()> {
         .json()
         .await?;
     let models = v["models"].as_array().cloned().unwrap_or_default();
+    if json {
+        // Machine-typed mirror of the table; the daemon banner, the
+        // "no models loaded" line and warn decorations stay human-only.
+        for m in models {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "name": m["name"].as_str(),
+                    "replica": m["pallama_replica"].as_i64(),
+                    "state": m["pallama_state"].as_str(),
+                    "ctx": m["pallama_ctx"].as_i64().unwrap_or(0),
+                    "gpu": m["pallama_gpu"].as_str().unwrap_or("-"),
+                    "device": m["pallama_device"].as_str(),
+                    "in_flight": m["pallama_in_flight"].as_i64().unwrap_or(0),
+                    "endpoint": m["pallama_endpoint"].as_str().unwrap_or("-"),
+                    "warnings": m["pallama_warnings"].as_array().cloned()
+                        .unwrap_or_default(),
+                })
+            );
+        }
+        return Ok(());
+    }
     // Which binary owns the daemon (stale-copy race visibility).
     let d = dirs();
     if let (Ok(pid), Ok(path)) = (
@@ -5333,7 +5399,7 @@ async fn sysinfo_cmd(base: &str) -> Result<()> {
         .json()
         .await?;
     println!("daemon: {}", v["version"].as_str().unwrap_or("?"));
-    list()?;
+    list(false)?;
     Ok(())
 }
 
@@ -6365,11 +6431,28 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 }
             }
         }
-        EngineCmd::List => {
-            upstream_update_hint(&d).await;
+        EngineCmd::List { json } => {
+            if !json {
+                upstream_update_hint(&d).await;
+            }
             let store = Store::open(&d)?;
             let mut seen: Vec<&str> = Vec::new();
             for e in store.list_engines()? {
+                if json {
+                    // Full sha256 (the table truncates to 12 chars) —
+                    // scripts verifying assets want the whole digest.
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "tag": e.tag,
+                            "kind": e.kind.as_str(),
+                            "asset": e.asset,
+                            "active": e.active,
+                            "sha256": e.sha256,
+                        })
+                    );
+                    continue;
+                }
                 seen.push(e.kind.as_str());
                 println!(
                     "{:<12} {:<9} {:<10} {} {}",
@@ -6379,6 +6462,9 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                     if e.active { "[active]" } else { "" },
                     e.sha256.chars().take(12).collect::<String>()
                 );
+            }
+            if json {
+                return Ok(());
             }
             // Point-of-need catalog: `engine list` is where users look
             // for "what can I install" — every lane this pallama can
