@@ -111,7 +111,14 @@ enum Cmd {
     /// Stop the daemon; with a model name, unload that model now
     Stop { model: Option<String> },
     /// Pull a model (owner/repo[:QUANT] or catalog name)
-    Pull { target: String },
+    Pull {
+        target: String,
+        /// Replace an existing model of the same name even when the
+        /// format flips (safetensors directory <-> GGUF file); the old
+        /// files stay on disk and boot preflight re-adopts them.
+        #[arg(long)]
+        force: bool,
+    },
     /// Import an existing GGUF file (hardlinks by default; --copy for a copy)
     Import {
         path: PathBuf,
@@ -819,7 +826,7 @@ async fn ensure_run_model(name: &str) -> Result<String> {
                      (Ctrl-C keeps the partial for resume)",
                     t.repo, t.quant
                 );
-                let (row, already) = pull_model(&resolved).await?;
+                let (row, already) = pull_model(&resolved, false).await?;
                 if already {
                     println!("already present as {} — starting", row.name);
                 }
@@ -939,7 +946,7 @@ async fn run(cmd: Cmd) -> Result<()> {
     match cmd {
         Cmd::Serve => serve().await,
         Cmd::Stop { model } => stop_cmd(model.map(|m| resolve_model_cli(&m))).await,
-        Cmd::Pull { target } => pull(&target).await,
+        Cmd::Pull { target, force } => pull(&target, force).await,
         Cmd::Import {
             path,
             name,
@@ -3742,8 +3749,8 @@ mod signal_stop {
     }
 }
 
-async fn pull(target: &str) -> Result<()> {
-    let (row, already_present) = pull_model(target).await?;
+async fn pull(target: &str, force: bool) -> Result<()> {
+    let (row, already_present) = pull_model(target, force).await?;
     // Banner only on success: an upgrade hint decorating a pull FAILURE
     // reads as noise (fit/mmproj already follow this order).
     banner();
@@ -3777,7 +3784,7 @@ async fn pull(target: &str) -> Result<()> {
 /// progress, resume-safe `.part` files, pull locks, mmproj attach,
 /// metadata warnings, and the GGUF lint. Returns the store row plus
 /// whether it was already present (caller picks the wording).
-async fn pull_model(target: &str) -> Result<(pallama_core::store::ModelRow, bool)> {
+async fn pull_model(target: &str, force: bool) -> Result<(pallama_core::store::ModelRow, bool)> {
     let d = dirs();
     d.ensure().ok();
     let token = std::env::var("HF_TOKEN").ok();
@@ -3790,6 +3797,7 @@ async fn pull_model(target: &str) -> Result<(pallama_core::store::ModelRow, bool
         dirs: d.clone(),
         client,
         bus,
+        force,
     };
     // Foreground by contract: the pull runs in THIS terminal and dies with
     // it. On interrupt the future is dropped, which releases the pull

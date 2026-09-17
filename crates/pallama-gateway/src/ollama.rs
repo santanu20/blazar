@@ -583,10 +583,13 @@ pub async fn pull(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
                 return;
             }
         };
+        // API pulls never force: a format flip needs the CLI's explicit
+        // --force (the refusal message teaches it).
         let puller = pallama_runtime::Puller {
             dirs,
             client,
             bus: bus.clone(),
+            force: false,
         };
         match puller.route_pull(&pull_request).await {
             Ok(outcome) => tracing::info!(

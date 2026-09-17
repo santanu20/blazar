@@ -317,6 +317,9 @@ impl Puller {
         // tags pin a digest, so the sha compare detects any upstream
         // movement — including mutable tags like `latest`.
         let existing = store.get_model(&name)?;
+        // Registry weights are GGUF-class: guard against flipping an
+        // existing safetensors-directory row under the same name.
+        crate::hf::flip_guard(&name, existing.as_ref(), false, self.force)?;
         let expected_sha = strip_digest_prefix(&model_layer.digest);
         let decision = crate::hf::repull_gate(
             existing.as_ref(),
@@ -1001,6 +1004,7 @@ mod tests {
             dirs: dirs.clone(),
             client: registry_client(&api, None, vec![host_of(&api.uri())]),
             bus: EventBus::default(),
+            force: false,
         };
         let outcome = puller.pull_ollama("qwen3:0.6b").await.unwrap();
         std::env::remove_var("PALLAMA_REGISTRY_BASE");

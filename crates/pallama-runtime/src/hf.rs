@@ -1154,6 +1154,44 @@ pub struct Puller {
     pub dirs: PallamaDirs,
     pub client: HfClient,
     pub bus: EventBus,
+    /// Allow a pull to flip the model's format (safetensors dir <->
+    /// GGUF file) over an existing row. Guarded by [`flip_guard`] —
+    /// see the incident note there.
+    pub force: bool,
+}
+
+/// Format-flip refusal for pulls: replacing an existing model row with
+/// a DIFFERENT format (GGUF file over a safetensors `.d` directory, or
+/// the reverse) is almost never what the user asked for — a short-name
+/// catalog resolve can silently flip formats (live incident 2026-09-17:
+/// `pull qwen2.5-0.5b` replaced a 954 MiB safetensors row with a GGUF
+/// under the same canonical name). Refuse without `--force`; a forced
+/// flip keeps the superseded files on disk — boot preflight re-adopts
+/// them under a derived name.
+pub(crate) fn flip_guard(
+    name: &str,
+    existing: Option<&pallama_core::store::ModelRow>,
+    incoming_is_dir: bool,
+    force: bool,
+) -> Result<()> {
+    let Some(row) = existing else {
+        return Ok(());
+    };
+    let existing_is_dir = Path::new(&row.path).is_dir();
+    if existing_is_dir == incoming_is_dir || force {
+        return Ok(());
+    }
+    let (have, want) = if existing_is_dir {
+        ("a safetensors directory", "a GGUF")
+    } else {
+        ("a GGUF", "a safetensors directory")
+    };
+    anyhow::bail!(
+        "model {name} is already pulled as {have} ({}); this pull would replace it with \
+         {want} — pass --force to flip (the old files stay on disk; boot preflight \
+         re-adopts them) or pull the exact repo",
+        row.path
+    )
 }
 
 /// RAII lockfile guard: released (removed) on drop, panic-safe.
@@ -1480,6 +1518,7 @@ impl Puller {
         //                  lands on the canonical filename instead of the
         //                  `owner--repo--leaf` collision slug).
         let existing = store.get_model(name)?;
+        flip_guard(name, existing.as_ref(), false, self.force)?;
         let expected_sha = selected.shards[0].sha256.clone();
         let decision = repull_gate(
             existing.as_ref(),
@@ -1557,47 +1596,17 @@ impl Puller {
         let dir = self.dirs.models_dir().join(format!("{name}.d"));
         let store = Store::open(&self.dirs)?;
 
-        if let Some(row) = store.get_model(name)?.as_ref() {
-            let same_revision = row.repo == target.repo
-                && row
-                    .sha256
-                    .as_deref()
-                    .is_some_and(|s| s.eq_ignore_ascii_case(&digest));
-            if same_revision && safetensors_dir_intact(&dir, &sel) {
-                let total = u64::try_from(row.bytes).unwrap_or(0);
-                self.bus.publish(PallamaEvent::PullProgress {
-                    name: name.to_string(),
-                    downloaded: total,
-                    total,
-                });
-                self.bus.publish(PallamaEvent::ModelPulled {
-                    name: name.to_string(),
-                    warning: None,
-                });
-                return Ok(PullOutcome {
-                    row: row.clone(),
-                    already_present: true,
-                });
-            }
-            // Different revision (or damaged dir): replace. A previous
-            // dir row at a different path is removed wholesale; a GGUF
-            // row under the same name goes through the shared pruner.
-            let old_path = Path::new(&row.path);
-            if old_path.is_dir() {
-                if old_path != dir.as_path() {
-                    if let Err(e) = std::fs::remove_dir_all(old_path) {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            tracing::warn!(
-                                model = %name,
-                                "could not remove replaced dir {}: {e}",
-                                old_path.display()
-                            );
-                        }
-                    }
-                }
-            } else {
-                prune_replaced(name, row, &[], "replaced by a safetensors pull");
-            }
+        let existing = store.get_model(name)?;
+        flip_guard(name, existing.as_ref(), true, self.force)?;
+        if let Some(outcome) = self.safetensors_repull_outcome(
+            existing.as_ref(),
+            &dir,
+            &sel,
+            &digest,
+            &target.repo,
+            name,
+        )? {
+            return Ok(outcome);
         }
 
         if dir.exists() {
@@ -1660,6 +1669,64 @@ impl Puller {
             row,
             already_present: false,
         })
+    }
+
+    /// Idempotence + supersede for the safetensors lane:
+    /// `Some(outcome)` = resolved (no-op re-pull; caller returns it),
+    /// `None` = proceed with the download — stale files already cleaned.
+    fn safetensors_repull_outcome(
+        &self,
+        existing: Option<&pallama_core::store::ModelRow>,
+        dir: &Path,
+        sel: &SafetensorsSelection,
+        digest: &str,
+        repo: &str,
+        name: &str,
+    ) -> Result<Option<PullOutcome>> {
+        let Some(row) = existing else {
+            return Ok(None);
+        };
+        let same_revision = row.repo == repo
+            && row
+                .sha256
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(digest));
+        if same_revision && safetensors_dir_intact(dir, sel) {
+            let total = u64::try_from(row.bytes).unwrap_or(0);
+            self.bus.publish(PallamaEvent::PullProgress {
+                name: name.to_string(),
+                downloaded: total,
+                total,
+            });
+            self.bus.publish(PallamaEvent::ModelPulled {
+                name: name.to_string(),
+                warning: None,
+            });
+            return Ok(Some(PullOutcome {
+                row: row.clone(),
+                already_present: true,
+            }));
+        }
+        // Different revision (or damaged dir): replace. A previous
+        // dir row at a different path is removed wholesale; a GGUF
+        // row under the same name goes through the shared pruner.
+        let old_path = Path::new(&row.path);
+        if old_path.is_dir() {
+            if old_path != dir {
+                if let Err(e) = std::fs::remove_dir_all(old_path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            model = %name,
+                            "could not remove replaced dir {}: {e}",
+                            old_path.display()
+                        );
+                    }
+                }
+            }
+        } else {
+            prune_replaced(name, row, &[], "replaced by a safetensors pull");
+        }
+        Ok(None)
     }
 
     /// Full-download phase of [`Self::pull_locked`]: one shared progress bar
@@ -2532,6 +2599,31 @@ mod tests {
     }
 
     #[test]
+    fn unit__flip_guard__format_flip_refused_until_forced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_row = seed_row("m", "r", "BF16", tmp.path().to_str().unwrap(), 1, 1);
+        let gguf = tmp.path().join("m.gguf");
+        std::fs::write(&gguf, b"x").unwrap();
+        let gguf_row = seed_row("m", "r", "Q4_K_M", gguf.to_str().unwrap(), 1, 1);
+
+        // GGUF pull over a safetensors dir: refused, names both
+        // formats, teaches --force (the 2026-09-17 short-name incident).
+        let err = flip_guard("m", Some(&dir_row), false, false).expect_err("flip refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("safetensors directory"), "{msg}");
+        assert!(msg.contains("--force"), "{msg}");
+
+        // Reverse direction: safetensors pull over a GGUF row.
+        let err = flip_guard("m", Some(&gguf_row), true, false).expect_err("flip refused");
+        assert!(format!("{err:#}").contains("a GGUF"), "{err:#}");
+
+        // Same format, forced flip, and a fresh name all pass.
+        assert!(flip_guard("m", Some(&dir_row), true, false).is_ok());
+        assert!(flip_guard("m", Some(&dir_row), false, true).is_ok());
+        assert!(flip_guard("m", None, false, false).is_ok());
+    }
+
+    #[test]
     fn unit__model_file_intact__truth_table() {
         let tmp = tempfile::tempdir().unwrap();
         let good = tmp.path().join("good.gguf");
@@ -2621,6 +2713,7 @@ mod tests {
             dirs: dirs.clone(),
             client,
             bus: EventBus::default(),
+            force: false,
         };
         let outcome = puller.pull("o/r").await.unwrap();
 
@@ -2699,6 +2792,7 @@ mod tests {
             dirs: dirs.clone(),
             client,
             bus: EventBus::default(),
+            force: false,
         };
         let outcome = puller.pull("o/r").await.unwrap();
 
@@ -2792,6 +2886,7 @@ mod tests {
             dirs: dirs.clone(),
             client,
             bus: EventBus::default(),
+            force: false,
         };
         let outcome = puller.pull("o/r:Q8_0").await.unwrap();
 
@@ -2860,6 +2955,7 @@ mod tests {
             dirs: dirs.clone(),
             client,
             bus: EventBus::default(),
+            force: false,
         };
         let outcome = puller.pull("o/r").await.unwrap();
 
@@ -2947,6 +3043,7 @@ mod tests {
             dirs: dirs.clone(),
             client,
             bus: EventBus::default(),
+            force: false,
         };
         let outcome = puller.pull("o/r").await.unwrap();
 
@@ -3018,6 +3115,7 @@ mod tests {
             dirs: dirs.clone(),
             client,
             bus: EventBus::default(),
+            force: false,
         };
         let row = puller.pull("owner/m-repo:Q4_K_M").await.unwrap().row;
 
@@ -3067,6 +3165,7 @@ mod tests {
             dirs: dirs.clone(),
             client,
             bus: EventBus::default(),
+            force: false,
         };
         let err = puller.pull("o/r").await.unwrap_err();
         assert!(err.to_string().contains("sha256 mismatch"), "{err}");
@@ -3127,6 +3226,7 @@ mod tests {
             dirs,
             client,
             bus: EventBus::default(),
+            force: false,
         };
         let row = puller.pull("o/r").await.unwrap().row;
         let got = std::fs::read(&row.path).unwrap();
@@ -3416,6 +3516,7 @@ mod tests {
             dirs: dirs.clone(),
             client,
             bus: EventBus::default(),
+            force: false,
         };
         let row = puller.pull("o/big:Q4_K_M").await.unwrap().row;
         assert_eq!(row.shards, 2);
@@ -3467,6 +3568,7 @@ mod tests {
             dirs: dirs.clone(),
             client,
             bus: EventBus::default(),
+            force: false,
         };
 
         // Cancellation semantics: the select! drop of the pull future is
@@ -3648,6 +3750,7 @@ mod tests {
             dirs: dirs.clone(),
             client,
             bus: EventBus::default(),
+            force: false,
         };
         let outcome = puller.pull("Qwen/Qwen2.5-0.5B-Instruct").await.unwrap();
         let dir = dirs.models_dir().join("qwen2.5-0.5b-instruct.d");
@@ -3727,6 +3830,7 @@ mod tests {
             dirs,
             client,
             bus: EventBus::default(),
+            force: false,
         };
         let err = puller.pull("o/m").await.unwrap_err();
         assert!(
