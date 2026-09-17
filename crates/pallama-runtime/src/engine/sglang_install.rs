@@ -217,6 +217,10 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
     // passthrough keeps probe (--) and spawn argv identical in shape.
     // venv/bin goes first on PATH so JIT build tools shipped inside the
     // venv (ninja — flashinfer compiles kernels at runtime) resolve.
+    // The sglang wheels pull a `nvidia-cuda-nvcc` wheel whose nvcc MATCHES
+    // the bundled CUDA torch: put its bin dir ahead of the system PATH so
+    // flashinfer JIT self-hosts instead of dying on a system nvcc that
+    // mismatches the wheels (e.g. system 12.0 vs cu13 torch).
     // SGLANG_CACHE_DIR scopes sglang's third-party JIT caches (triton,
     // inductor, nv, flashinfer — all derived from it since v0.5.19,
     // setdefault semantics) to the engine dir: compiled kernels survive
@@ -224,11 +228,15 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
     // user override in charge.
     let cache = dir.join("cache");
     let shim = dir.join("sglang-server");
+    let mut path_prefix = venv.join("bin").display().to_string();
+    if let Some(nvcc_dir) = bundled_nvcc_bin_dir(&venv) {
+        path_prefix = format!("{}:{}", nvcc_dir.display(), path_prefix);
+    }
     let script = format!(
         "#!/bin/sh\nexport PATH=\"{}:$PATH\"\nexport \
          SGLANG_CACHE_DIR=\"${{SGLANG_CACHE_DIR:-{}}}\"\nexec \"{}\" -m \
          sglang.launch_server \"$@\"\n",
-        venv.join("bin").display(),
+        path_prefix,
         cache.display(),
         venv_python.display()
     );
@@ -236,6 +244,30 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
     std::fs::write(&shim, script).context("write sglang-server shim")?;
     make_executable(&shim)?;
     Ok(shim)
+}
+
+/// The venv's bundled nvcc bin dir when the sglang wheels pulled a
+/// `nvidia-cuda-nvcc` wheel
+/// (`lib/python3.X/site-packages/nvidia/cuda_nvcc/bin`), so the shim can
+/// self-host flashinfer's JIT toolchain.
+fn bundled_nvcc_bin_dir(venv: &Path) -> Option<PathBuf> {
+    let lib = std::fs::read_dir(venv.join("lib")).ok()?;
+    let python_dir = lib
+        .filter_map(|e| e.ok())
+        .find(|e| {
+            e.path()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("python"))
+        })?
+        .path();
+    let bin = python_dir
+        .join("site-packages")
+        .join("nvidia")
+        .join("cuda_nvcc")
+        .join("bin");
+    let nvcc = if cfg!(windows) { "nvcc.exe" } else { "nvcc" };
+    bin.join(nvcc).is_file().then_some(bin)
 }
 
 fn make_executable(path: &Path) -> Result<()> {
@@ -320,5 +352,30 @@ mod tests {
         assert_eq!(version_tuple("0.5.20rc1"), Some((0, 5, 20)));
         assert_eq!(version_tuple("1.2"), Some((1, 2, 0)));
         assert_eq!(version_tuple("latest"), None);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__bundled_nvcc_bin_dir__detects_wheel_and_stays_silent_without() {
+        // Real sglang venv layout: the nvidia-cuda-nvcc wheel lands its
+        // compiler in lib/python3.X/site-packages/nvidia/cuda_nvcc/bin.
+        let venv = tempfile::tempdir().unwrap();
+        assert_eq!(bundled_nvcc_bin_dir(venv.path()), None);
+
+        let bin = venv
+            .path()
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages")
+            .join("nvidia")
+            .join("cuda_nvcc")
+            .join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // Dir alone (no nvcc binary) still yields None.
+        assert_eq!(bundled_nvcc_bin_dir(venv.path()), None);
+
+        std::fs::write(bin.join("nvcc"), "#!/bin/sh\n").unwrap();
+        let found = bundled_nvcc_bin_dir(venv.path()).expect("wheel nvcc detected");
+        assert!(found.ends_with("cuda_nvcc/bin"), "{found:?}");
     }
 }

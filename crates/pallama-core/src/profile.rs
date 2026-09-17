@@ -3285,11 +3285,15 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
             "triton",
             &mut warnings,
         );
-        warnings.push(
+        // Static portability rationale, not a per-instance health fact:
+        // journal only (once per spawn), never the per-session REPL
+        // [profile] surface — there the line is noise the user cannot act
+        // on whenever the local toolchain cannot host flashinfer anyway.
+        tracing::info!(
+            model = input.model_name,
             "sglang: attention defaults to triton for portability (flashinfer JIT requires a \
-             system nvcc matching the bundled CUDA wheels); override with \
+             matching nvcc; the sglang venv bundles one on the child PATH); override with \
              models.<name>.sglang.attention_backend"
-                .into(),
         );
     }
     if tun.sampling_backend.is_none() {
