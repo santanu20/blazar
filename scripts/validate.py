@@ -8497,24 +8497,39 @@ def phase_realuser():
             f"rc={res['rc']} err={res['err'][:60]}",
         )
 
-        for path, key, label in (
-            ("run.repl.ctrl-d", b"\x04", "ctrl-d"),
-            ("run.repl.ctrl-c", b"\x03", "ctrl-c"),
-        ):
-            res = _pty_session(
-                [PAL, "run", MODEL],
-                [
-                    {"send": None, "expect": "REPL", "budget": 90},
-                    {"send": None, "expect": ">>> ", "budget": 60},
-                    {"send": key, "expect": None},
-                ],
-                env=env,
-            )
-            reg(
-                path,
-                res["rc"] == 0 and not res["err"],
-                f"{label} at prompt -> rc={res['rc']} err={res['err'][:60]}",
-            )
+        # ctrl-d at the prompt is EOF: the REPL exits cleanly.
+        res = _pty_session(
+            [PAL, "run", MODEL],
+            [
+                {"send": None, "expect": "REPL", "budget": 90},
+                {"send": None, "expect": ">>> ", "budget": 60},
+                {"send": b"\x04", "expect": None},
+            ],
+            env=env,
+        )
+        reg(
+            "run.repl.ctrl-d",
+            res["rc"] == 0 and not res["err"],
+            f"ctrl-d at prompt -> rc={res['rc']} err={res['err'][:60]}",
+        )
+
+        # ctrl-c at the prompt is NON-fatal (ollama parity): the REPL
+        # prints the exit hint and keeps serving; /exit still quits.
+        res = _pty_session(
+            [PAL, "run", MODEL],
+            [
+                {"send": None, "expect": "REPL", "budget": 90},
+                {"send": None, "expect": ">>> ", "budget": 60},
+                {"send": b"\x03", "expect": "use /exit or Ctrl+D", "budget": 30},
+                {"send": b"/exit\n", "expect": None},
+            ],
+            env=env,
+        )
+        reg(
+            "run.repl.ctrl-c",
+            res["rc"] == 0 and not res["err"],
+            f"ctrl-c hints and stays alive -> rc={res['rc']} err={res['err'][:60]}",
+        )
 
         res = _pty_session(
             [PAL, "run", MODEL, "Reply with just: ok"],
