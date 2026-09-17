@@ -3,7 +3,6 @@ adaptive_slots
 adaptive_target
 agent
 audit_log
-auto_restart_engine_switch
 batch_size
 cache_idle_slots
 cache_ram_mb
