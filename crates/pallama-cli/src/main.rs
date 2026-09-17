@@ -1510,11 +1510,14 @@ fn read_menu_line() -> Option<String> {
 
 /// Run the chosen installs sequentially, then report the lane truth —
 /// the fresh re-check (not the install result) is what the user reads.
+/// A failing kind does not stop the rest: "both" must still try the
+/// one that fits (e.g. disk too small for sglang, fine for mistral.rs).
 async fn install_offer_kinds(
     d: &PallamaDirs,
     row: &pallama_core::store::ModelRow,
     kinds: &[pallama_core::engine_kind::EngineKind],
 ) {
+    let mut failures = Vec::new();
     for kind in kinds {
         if let Err(e) = install_missing_kind(d, *kind).await {
             eprintln!("engine install failed: {e:#}");
@@ -1522,11 +1525,24 @@ async fn install_offer_kinds(
                 "your model is safe in the store — retry with: {}",
                 engine_install_command(*kind)
             );
-            return;
+            failures.push(*kind);
         }
     }
     match lane_state_for(d, row) {
-        LaneState::Served => eprintln!("engine ready — this model now has a serving lane"),
+        LaneState::Served => {
+            if failures.is_empty() {
+                eprintln!("engine ready — this model now has a serving lane");
+            } else {
+                eprintln!(
+                    "engine ready — this model now has a serving lane (skipped: {})",
+                    failures
+                        .iter()
+                        .map(|k| k.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
         LaneState::Missing(_, teach) => eprintln!("{teach}"),
     }
 }
