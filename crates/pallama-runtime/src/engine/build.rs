@@ -126,12 +126,21 @@ pub struct Toolchain {
 }
 
 /// Find `names` in order, first hit wins, across the given search path.
+/// Does `dir` contain executable `name` under either spelling (bare or
+/// `.exe`)? Windows installs append `.exe` (System32's
+/// `nvidia-smi.exe`); matching both on every OS keeps discovery
+/// testable on POSIX.
+#[must_use]
+pub fn bin_on_path(dir: &Path, name: &str) -> bool {
+    dir.join(name).is_file() || dir.join(format!("{name}.exe")).is_file()
+}
+
+/// Resolve a tool by name across PATH-style dirs.
 fn find_bin(search: &[PathBuf], names: &[&str]) -> Option<PathBuf> {
     for dir in search {
         for name in names {
-            let p = dir.join(name);
-            if p.is_file() {
-                return Some(p);
+            if bin_on_path(dir, name) {
+                return Some(dir.join(name));
             }
         }
     }
@@ -909,6 +918,25 @@ mod tests {
         // Unversioned .so alone never satisfies a major query.
         let unversioned = "\tlibcudart.so (libc6,x86-64) => /opt/cuda/lib/libcudart.so\n";
         assert!(!cuda_runtime_complete_from_ldconfig(unversioned, 12));
+    }
+
+    #[test]
+    fn unit__bin_on_path__exe_spelling_matches_windows_installs() {
+        // Windows installs put `nvidia-smi.exe` in System32; both
+        // spellings must resolve so vendor hints and driver probes work
+        // cross-platform. Verified on a POSIX box via the .exe arm.
+        let dir = std::env::temp_dir().join("pallama-bin-on-path-pin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("nvidia-smi.exe");
+        std::fs::write(&exe, b"").unwrap();
+        assert!(bin_on_path(&dir, "nvidia-smi"));
+        assert!(!bin_on_path(&dir, "rocminfo"));
+        let bare = dir.join("nvidia-smi");
+        std::fs::write(&bare, b"").unwrap();
+        assert!(bin_on_path(&dir, "nvidia-smi"));
+        drop(bare);
+        drop(exe);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

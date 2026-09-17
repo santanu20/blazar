@@ -577,12 +577,19 @@ pub struct AssetPick {
 
 /// Walk the candidate list against the release's actual assets and
 /// return the first match. `None` = nothing usable (not even CPU).
+///
+/// `driver_cuda` caps `Versioned` CUDA candidates (win-cuda): a
+/// prebuilt binary newer than the driver cannot start, so versions
+/// above the cap are skipped — when at least one exists — and the
+/// lane falls through to Vulkan with a warning instead of a
+/// guaranteed probe failure. `None` = cap unknown, pick the newest.
 #[must_use]
 pub fn resolve_asset(
     release: &GhRelease,
     os: &str,
     arch: &str,
     vendor: Option<crate::engine::manifest::Vendor>,
+    driver_cuda: Option<(u32, u32)>,
 ) -> Option<AssetPick> {
     let candidates = pick_asset(os, arch, vendor);
     let wants_gpu = candidates.iter().any(|c| !matches!(c, Candidate::Cpu(_)));
@@ -608,7 +615,9 @@ pub fn resolve_asset(
                 };
                 let head = format!("llama-{tag}-bin-{prefix}");
                 let tail = format!("{suffix}.{ext}");
+                let capped = prefix.contains("cuda");
                 let mut best: Option<(Vec<u32>, String)> = None;
+                let mut skipped_over_cap = 0usize;
                 for a in &release.assets {
                     let Some(middle) = a.name.strip_prefix(&head) else {
                         continue;
@@ -619,6 +628,12 @@ pub fn resolve_asset(
                     let parts: Option<Vec<u32>> =
                         version.split('.').map(|p| p.parse().ok()).collect();
                     let Some(parts) = parts else { continue };
+                    if let (true, Some((dmin_maj, dmin_min))) = (capped, driver_cuda) {
+                        if parts > vec![dmin_maj, dmin_min] {
+                            skipped_over_cap += 1;
+                            continue;
+                        }
+                    }
                     if best.as_ref().is_none_or(|(b, _)| parts > *b) {
                         best = Some((parts, version.to_string()));
                     }
@@ -630,6 +645,16 @@ pub fn resolve_asset(
                         label,
                         cpu_fallback: false,
                     });
+                }
+                if skipped_over_cap > 0 {
+                    tracing::warn!(
+                        "release {tag} ships {skipped_over_cap} {prefix} asset(s) \
+                         but all exceed the driver's CUDA {}.{} — using the \
+                         next lane (Vulkan/CPU); update the NVIDIA driver or \
+                         pin an older release",
+                        driver_cuda.map_or(0, |d| d.0),
+                        driver_cuda.map_or(0, |d| d.1),
+                    );
                 }
             }
         }
@@ -1213,7 +1238,7 @@ mod tests {
                 "llama-b10833-bin-ubuntu-rocm-11.2-x64.tar.gz",
             ],
         );
-        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Amd)).unwrap();
+        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Amd), None).unwrap();
         assert_eq!(p.name, "llama-b10833-bin-ubuntu-rocm-11.2-x64.tar.gz");
         assert_eq!(p.label, "ubuntu-rocm-11.2-x64");
         assert!(!p.cpu_fallback);
@@ -1229,7 +1254,7 @@ mod tests {
                 "llama-b1-bin-win-cuda-10.0-x64.zip",
             ],
         );
-        let p = resolve_asset(&r, "windows", "x86_64", Some(Vendor::Nvidia)).unwrap();
+        let p = resolve_asset(&r, "windows", "x86_64", Some(Vendor::Nvidia), None).unwrap();
         assert_eq!(p.label, "win-cuda-10.0-x64");
     }
 
@@ -1238,7 +1263,7 @@ mod tests {
         // The exact live b10833 scenario: nvidia box, vulkan asset not
         // uploaded yet, CPU asset visible.
         let r = rel("b10833", &["llama-b10833-bin-ubuntu-x64.tar.gz"]);
-        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Nvidia)).unwrap();
+        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Nvidia), None).unwrap();
         assert_eq!(p.label, "ubuntu-x64");
         assert!(p.cpu_fallback, "must be flagged, never silent");
     }
@@ -1246,7 +1271,7 @@ mod tests {
     #[test]
     fn unit__resolve__no_assets__none() {
         let r = rel("b10833", &[]);
-        assert!(resolve_asset(&r, "linux", "x86_64", Some(Vendor::Nvidia)).is_none());
+        assert!(resolve_asset(&r, "linux", "x86_64", Some(Vendor::Nvidia), None).is_none());
     }
 
     #[test]
@@ -1259,7 +1284,7 @@ mod tests {
             ],
         );
         // Intel: fp16 exact miss -> vulkan (sycl-fp32 is not a candidate).
-        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Intel)).unwrap();
+        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Intel), None).unwrap();
         assert_eq!(p.label, "ubuntu-vulkan-x64");
         assert!(!p.cpu_fallback);
     }
@@ -1273,8 +1298,61 @@ mod tests {
                 "llama-b1-bin-win-vulkan-x64.zip",
             ],
         );
-        let p = resolve_asset(&r, "windows", "x86_64", Some(Vendor::Nvidia)).unwrap();
+        let p = resolve_asset(&r, "windows", "x86_64", Some(Vendor::Nvidia), None).unwrap();
         assert_eq!(p.label, "win-vulkan-x64");
+    }
+
+    #[test]
+    fn unit__resolve_asset__win_cuda_driver_cap_picks_runnable_version() {
+        // Live shape from b11011-era releases: two win-cuda flavors ship
+        // side by side; the driver ceiling must select the older one.
+        let r = rel(
+            "b11011",
+            &[
+                "llama-b11011-bin-win-cuda-12.4-x64.zip",
+                "llama-b11011-bin-win-cuda-13.4-x64.zip",
+                "llama-b11011-bin-win-vulkan-x64.zip",
+            ],
+        );
+        let pick = |cap: Option<(u32, u32)>| {
+            resolve_asset(&r, "windows", "x86_64", Some(Vendor::Nvidia), cap).unwrap()
+        };
+        assert_eq!(pick(Some((12, 6))).label, "win-cuda-12.4-x64");
+        assert_eq!(pick(Some((13, 9))).label, "win-cuda-13.4-x64");
+        // Uncapped keeps today's newest-wins behavior.
+        assert_eq!(pick(None).label, "win-cuda-13.4-x64");
+    }
+
+    #[test]
+    fn unit__resolve_asset__win_cuda_all_over_cap_falls_to_vulkan() {
+        // Every cuda asset exceeds the driver: the Vulkan lane answers
+        // instead of a binary that cannot start.
+        let r = rel(
+            "b11011",
+            &[
+                "llama-b11011-bin-win-cuda-13.4-x64.zip",
+                "llama-b11011-bin-win-vulkan-x64.zip",
+            ],
+        );
+        let p =
+            resolve_asset(&r, "windows", "x86_64", Some(Vendor::Nvidia), Some((12, 4))).unwrap();
+        assert_eq!(p.label, "win-vulkan-x64");
+        assert!(!p.cpu_fallback);
+    }
+
+    #[test]
+    fn unit__resolve_asset__driver_cap_ignores_non_cuda_versioned_lanes() {
+        // The cap exists for CUDA only; a rocm Versioned lane must stay
+        // newest-wins regardless of the NVIDIA driver ceiling.
+        let r = rel(
+            "b11011",
+            &[
+                "llama-b11011-bin-ubuntu-rocm-10.0-x64.tar.gz",
+                "llama-b11011-bin-ubuntu-x64.tar.gz",
+            ],
+        );
+        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Amd), Some((12, 0))).unwrap();
+        assert_eq!(p.label, "ubuntu-rocm-10.0-x64");
     }
 
     #[test]

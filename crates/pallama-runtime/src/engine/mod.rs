@@ -115,9 +115,8 @@ pub fn system_vendor_hint() -> manifest::Vendor {
 }
 
 fn which_first(names: &[&str]) -> bool {
-    names.iter().any(|n| {
-        std::env::var_os("PATH")
-            .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(n).exists()))
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| names.iter().any(|n| build::bin_on_path(&dir, n)))
     })
 }
 
@@ -700,8 +699,36 @@ impl EngineManager {
     ) -> Result<EngineRow> {
         let tag_name = release.tag_name.clone();
         for attempt in 0..=ASSET_UPLOAD_RETRY_ATTEMPTS {
-            match self.pick(&release)? {
+            match self.pick(&release).await? {
                 Some(pick) => {
+                    // A Windows CUDA build dlopens cudart/cublas DLLs that
+                    // Windows never ships system-wide — no companion means
+                    // a guaranteed probe failure, so name it up front
+                    // instead of shipping a 150+ MiB corpse.
+                    let companion = if std::env::consts::OS == "windows"
+                        && pick.label.starts_with("win-cuda")
+                    {
+                        let comp = gh::resolve_cudart_companion(&release, &pick);
+                        if comp.is_none() {
+                            return Err(anyhow!(
+                                "release {tag_name} ships {} but no cudart \
+                                 companion — the DLLs are not system-provided on \
+                                 Windows and the engine cannot boot; pin an older \
+                                 release or use the Vulkan lane (pallama engine \
+                                 install <tag> after `pallama config set \
+                                 engine_asset win-vulkan-x64`)",
+                                pick.label
+                            ));
+                        }
+                        tracing::info!(
+                            "queuing cudart companion for {} — Windows never \
+                             ships the CUDA DLLs system-wide",
+                            pick.label
+                        );
+                        comp
+                    } else {
+                        None
+                    };
                     let last = attempt == ASSET_UPLOAD_RETRY_ATTEMPTS;
                     if pick.cpu_fallback && release_is_fresh(&release) && !last {
                         // Fresh release: the GPU asset is probably still
@@ -728,7 +755,7 @@ impl EngineManager {
                         );
                     }
                     return self
-                        .install_picked(&release, &pick, None)
+                        .install_picked(&release, &pick, companion.as_ref())
                         .await
                         .with_context(|| format!("install {tag_name} asset {}", pick.label));
                 }
@@ -766,8 +793,12 @@ impl EngineManager {
 
     /// Resolve the asset for this machine: explicit `engine_asset`
     /// override first (exact name, teaching error on miss), then the
-    /// auto matrix against the release's actual assets.
-    fn pick(&self, release: &GhRelease) -> Result<Option<gh::AssetPick>> {
+    /// auto matrix against the release's actual assets. On the Windows
+    /// NVIDIA lane the driver's CUDA ceiling caps the win-cuda version
+    /// choice (a newer prebuilt cannot start); Linux-NVIDIA never lands
+    /// here with a CUDA asset — the upstream/overlay chain in
+    /// `maybe_cuda_overlay` owns that decision.
+    async fn pick(&self, release: &GhRelease) -> Result<Option<gh::AssetPick>> {
         if self.asset_override != "auto" && !self.asset_override.is_empty() {
             let name = gh::asset_filename(&release.tag_name, &self.asset_override);
             if release.assets.iter().any(|a| a.name == name) {
@@ -792,7 +823,27 @@ impl EngineManager {
         let os = std::env::consts::OS;
         let arch = std::env::consts::ARCH;
         let vendor = system_vendor_hint();
-        Ok(gh::resolve_asset(release, os, arch, Some(vendor)))
+        let driver_cuda = if os == "windows" && vendor == manifest::Vendor::Nvidia {
+            let (driver_cuda, _) = build::nvidia_gpu_facts().await;
+            if driver_cuda.is_none() {
+                tracing::warn!(
+                    "NVIDIA GPU present but the driver's CUDA ceiling could not \
+                     be probed (nvidia-smi missing or unparsable); picking the \
+                     newest win-cuda asset uncapped — install the driver's \
+                     nvidia-smi or pin an older release if the probe fails"
+                );
+            }
+            driver_cuda
+        } else {
+            None
+        };
+        Ok(gh::resolve_asset(
+            release,
+            os,
+            arch,
+            Some(vendor),
+            driver_cuda,
+        ))
     }
 
     /// Download, verify, extract, then register (probe + store +
