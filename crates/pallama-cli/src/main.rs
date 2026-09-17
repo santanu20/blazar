@@ -5743,6 +5743,11 @@ async fn stream_chat(base: &str, body: &serde_json::Value) -> Result<Option<serd
     let is_tty = stdout.is_terminal();
     let mut after_thinking = false;
     let mut out = stdout.lock();
+    // A 200 stream that never carries content is indistinguishable from
+    // failure to a human at the REPL (e.g. an engine serving a quant it
+    // cannot decode): remember whether anything rendered so the silent case
+    // gets an honest error line instead of a blank prompt.
+    let mut rendered_any = false;
     while let Some(chunk) = futures_lite_next(&mut resp).await? {
         buf.push_str(&chunk_lines.feed(&chunk));
         while let Some(pos) = buf.find('\n') {
@@ -5757,6 +5762,7 @@ async fn stream_chat(base: &str, body: &serde_json::Value) -> Result<Option<serd
                         if !thinking.is_empty() {
                             write!(out, "\x1b[2m{thinking}\x1b[0m").ok();
                             after_thinking = true;
+                            rendered_any = true;
                         }
                     }
                 }
@@ -5767,6 +5773,7 @@ async fn stream_chat(base: &str, body: &serde_json::Value) -> Result<Option<serd
                             after_thinking = false;
                         }
                         write!(out, "{content}").ok();
+                        rendered_any = true;
                     }
                 }
                 if v["done"].as_bool().unwrap_or(false) {
@@ -5776,7 +5783,15 @@ async fn stream_chat(base: &str, body: &serde_json::Value) -> Result<Option<serd
         }
         out.flush().ok();
     }
-    writeln!(out).ok();
+    if rendered_any {
+        writeln!(out).ok();
+    } else {
+        let model = body["model"].as_str().unwrap_or("model");
+        eprintln!(
+            "pallama: {model} returned an empty response — no content arrived \
+             (try a different quant or engine lane: pallama engine list)"
+        );
+    }
     Ok(final_chunk)
 }
 
