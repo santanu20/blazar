@@ -2115,7 +2115,7 @@ impl Supervisor {
         &self,
         store: &Store,
         overlay: &pallama_core::config::ModelOverride,
-        model_path: &str,
+        model: &pallama_core::store::ModelRow,
     ) -> Result<Option<(Arc<dyn Engine>, String)>, String> {
         use pallama_core::engine_kind::EngineKind;
 
@@ -2167,12 +2167,13 @@ impl Supervisor {
         // protocol quirks, so supervisor and gateway can never disagree.
         let installed: Vec<(String, EngineKind)> =
             rows.iter().map(|r| (r.tag.clone(), r.kind)).collect();
-        let safetensors = std::path::Path::new(model_path).is_dir();
+        let safetensors = std::path::Path::new(&model.path).is_dir();
         let Some((tag, _kind)) = pallama_core::engine_kind::serving_lane(
             self.config.engine_routing.mode,
             self.config.engine_routing.policy,
             overlay.engine.as_deref(),
             safetensors,
+            model.is_quantized_safetensors(),
             self.engine.kind(),
             &installed,
         )?
@@ -2220,20 +2221,19 @@ impl Supervisor {
         // active engine and its daemon-lifetime Arc stay untouched.
         // Co-residency on small cards is handled by the same VRAM
         // ladders that guard any multi-instance box.
-        let engine: Arc<dyn Engine> =
-            match self.resolve_routed_engine(&store, &overlay, &model.path) {
-                Ok(Some((routed, tag))) => {
-                    tracing::info!(
-                        model = name,
-                        from = self.engine.kind().as_str(),
-                        routed_to = tag.as_str(),
-                        "engine routing: spawn uses a routed adapter"
-                    );
-                    routed
-                }
-                Ok(None) => self.engine.clone(),
-                Err(teach) => return Err(SupervisionError::UnsupportedModel(teach)),
-            };
+        let engine: Arc<dyn Engine> = match self.resolve_routed_engine(&store, &overlay, &model) {
+            Ok(Some((routed, tag))) => {
+                tracing::info!(
+                    model = name,
+                    from = self.engine.kind().as_str(),
+                    routed_to = tag.as_str(),
+                    "engine routing: spawn uses a routed adapter"
+                );
+                routed
+            }
+            Ok(None) => self.engine.clone(),
+            Err(teach) => return Err(SupervisionError::UnsupportedModel(teach)),
+        };
         let meta_box = read_model_meta(&model.path, engine.kind()).map_err(|e| {
             SupervisionError::UnsupportedModel(store_aware_remedy(
                 &store,

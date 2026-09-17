@@ -52,9 +52,18 @@ impl EngineKind {
     /// served when the preferred lane is not installed. `None` =
     /// nothing installed can serve the format (caller teaches; e.g.
     /// safetensors with only llamacpp installed).
+    ///
+    /// `quantized` (AWQ/GPTQ/FP8 safetensors checkpoints) collapses the
+    /// candidate list to sglang: mistral.rs prebuilt builds dequant
+    /// these checkpoints broken (live-proven v0.9.3: dtype-mismatch
+    /// empty 200s on default dtype; f16 workaround emits garbage
+    /// tokens) while the same lanes serve BF16 dirs perfectly — so a
+    /// quantized dir routes sglang-only, and an absent sglang teaches
+    /// instead of routing into a known-broken lane.
     #[must_use]
     pub fn route_format(
         safetensors: bool,
+        quantized: bool,
         installed: &[EngineKind],
         policy: crate::config::RoutingPolicy,
     ) -> Option<EngineKind> {
@@ -65,6 +74,9 @@ impl EngineKind {
                 .find(|k| *k == primary)
                 .or_else(|| installed.iter().copied().find(|k| *k == fallback))
         };
+        if safetensors && quantized {
+            return installed.iter().copied().find(|k| *k == EngineKind::Sglang);
+        }
         let [primary, fallback] = Self::format_preference_order(safetensors, policy);
         prefer(primary, fallback)
     }
@@ -101,8 +113,14 @@ pub enum LaneError {
     PinKindMissing { kind: EngineKind, roster: String },
     /// The model's engine pin matches no installed tag or kind.
     PinUnknown { pin: String, roster: String },
-    /// No installed engine serves the model's format.
-    FormatUnserved { safetensors: bool, roster: String },
+    /// No installed engine serves the model's format. `quantized` =
+    /// AWQ/GPTQ/FP8 safetensors checkpoint — the teaching narrows to
+    /// sglang, the only lane that serves those.
+    FormatUnserved {
+        safetensors: bool,
+        quantized: bool,
+        roster: String,
+    },
 }
 
 impl LaneError {
@@ -113,8 +131,16 @@ impl LaneError {
         match self {
             Self::PinKindMissing { kind, .. } => vec![*kind],
             Self::PinUnknown { .. } => Vec::new(),
-            Self::FormatUnserved { safetensors, .. } => {
-                EngineKind::format_preference_order(*safetensors, policy).to_vec()
+            Self::FormatUnserved {
+                safetensors,
+                quantized,
+                ..
+            } => {
+                if *safetensors && *quantized {
+                    vec![EngineKind::Sglang]
+                } else {
+                    EngineKind::format_preference_order(*safetensors, policy).to_vec()
+                }
             }
         }
     }
@@ -131,7 +157,17 @@ impl fmt::Display for LaneError {
                 f,
                 "model engine pin \"{pin}\" matches no installed tag or kind — installed: {roster}"
             ),
-            Self::FormatUnserved { safetensors, roster } => write!(
+            Self::FormatUnserved {
+                safetensors,
+                quantized,
+                roster,
+            } if *safetensors && *quantized => write!(
+                f,
+                "no installed engine serves quantized safetensors (AWQ/GPTQ/FP8) — sglang is the lane for those; pallama engine install --kind sglang (installed: {roster})"
+            ),
+            Self::FormatUnserved {
+                safetensors, roster, ..
+            } => write!(
                 f,
                 "no installed engine serves the {} format — install one (sglang|mistralrs for safetensors, llamacpp for GGUF); installed: {roster}",
                 if *safetensors { "safetensors" } else { "GGUF" }
@@ -155,10 +191,12 @@ pub fn serving_lane(
     policy: crate::config::RoutingPolicy,
     pin: Option<&str>,
     safetensors: bool,
+    quantized: bool,
     global: EngineKind,
     installed: &[(String, EngineKind)],
 ) -> Result<Option<(String, EngineKind)>, String> {
-    serving_lane_typed(mode, policy, pin, safetensors, global, installed).map_err(|e| e.to_string())
+    serving_lane_typed(mode, policy, pin, safetensors, quantized, global, installed)
+        .map_err(|e| e.to_string())
 }
 
 /// [`serving_lane`] with the failure reason typed — callers that act on
@@ -169,6 +207,7 @@ pub fn serving_lane_typed(
     policy: crate::config::RoutingPolicy,
     pin: Option<&str>,
     safetensors: bool,
+    quantized: bool,
     global: EngineKind,
     installed: &[(String, EngineKind)],
 ) -> Result<Option<(String, EngineKind)>, LaneError> {
@@ -202,7 +241,7 @@ pub fn serving_lane_typed(
         return Ok(None);
     }
     let kinds: Vec<EngineKind> = installed.iter().map(|(_, k)| *k).collect();
-    match EngineKind::route_format(safetensors, &kinds, policy) {
+    match EngineKind::route_format(safetensors, quantized, &kinds, policy) {
         Some(kind) if kind == global => Ok(None),
         // `kinds` is built from `installed`, so the find always matches;
         // the None arm is pure type-shape.
@@ -212,6 +251,7 @@ pub fn serving_lane_typed(
             .map(|row| row.clone())),
         None => Err(LaneError::FormatUnserved {
             safetensors,
+            quantized,
             roster: roster(),
         }),
     }
@@ -298,44 +338,77 @@ mod tests {
 
         let all = [LlamaCpp, MistralRs, Sglang];
         assert_eq!(
-            EngineKind::route_format(false, &all, Quality),
+            EngineKind::route_format(false, false, &all, Quality),
             Some(LlamaCpp)
         );
-        assert_eq!(EngineKind::route_format(true, &all, Quality), Some(Sglang));
         assert_eq!(
-            EngineKind::route_format(true, &all, Throughput),
+            EngineKind::route_format(true, false, &all, Quality),
+            Some(Sglang)
+        );
+        assert_eq!(
+            EngineKind::route_format(true, false, &all, Throughput),
             Some(Sglang)
         );
         // Latency flips safetensors to mistral.rs on TTFT/cold evidence;
         // GGUF stays on llamacpp quant kernels regardless.
         assert_eq!(
-            EngineKind::route_format(true, &all, Latency),
+            EngineKind::route_format(true, false, &all, Latency),
             Some(MistralRs)
         );
         assert_eq!(
-            EngineKind::route_format(false, &all, Latency),
+            EngineKind::route_format(false, false, &all, Latency),
+            Some(LlamaCpp)
+        );
+
+        // Quantized safetensors (AWQ/GPTQ/FP8): sglang-only, every
+        // policy — mistral.rs dequant is broken on these checkpoints
+        // (live-proven v0.9.3), so it must never be the fallback, and
+        // a latency policy must not flip a quantized dir onto it.
+        assert_eq!(
+            EngineKind::route_format(true, true, &all, Quality),
+            Some(Sglang)
+        );
+        assert_eq!(
+            EngineKind::route_format(true, true, &all, Latency),
+            Some(Sglang)
+        );
+        assert_eq!(
+            EngineKind::route_format(true, true, &[LlamaCpp, MistralRs], Quality),
+            None,
+            "quantized dir with no sglang = unservable (teach), never mistral.rs"
+        );
+        // GGUF ignores the quantized flag — GGUF quants are their own
+        // well-served lane.
+        assert_eq!(
+            EngineKind::route_format(false, true, &all, Quality),
             Some(LlamaCpp)
         );
 
         // Overlap fallbacks: GGUF without llamacpp, safetensors without
         // sglang — both land on mistral.rs.
         assert_eq!(
-            EngineKind::route_format(false, &[MistralRs, Sglang], Quality),
+            EngineKind::route_format(false, false, &[MistralRs, Sglang], Quality),
             Some(MistralRs)
         );
         assert_eq!(
-            EngineKind::route_format(true, &[LlamaCpp, MistralRs], Quality),
+            EngineKind::route_format(true, false, &[LlamaCpp, MistralRs], Quality),
             Some(MistralRs)
         );
         // Latency without mistral.rs falls back to sglang.
         assert_eq!(
-            EngineKind::route_format(true, &[LlamaCpp, Sglang], Latency),
+            EngineKind::route_format(true, false, &[LlamaCpp, Sglang], Latency),
             Some(Sglang)
         );
 
         // Unserved formats teach instead of guessing.
-        assert_eq!(EngineKind::route_format(true, &[LlamaCpp], Quality), None);
-        assert_eq!(EngineKind::route_format(false, &[Sglang], Quality), None);
+        assert_eq!(
+            EngineKind::route_format(true, false, &[LlamaCpp], Quality),
+            None
+        );
+        assert_eq!(
+            EngineKind::route_format(false, false, &[Sglang], Quality),
+            None
+        );
     }
 
     /// The JIT-install offer derives its menu from the typed failure:
@@ -368,6 +441,7 @@ mod tests {
         assert_eq!(
             LaneError::FormatUnserved {
                 safetensors: true,
+                quantized: false,
                 roster: roster.clone()
             }
             .missing_kinds(Quality),
@@ -376,6 +450,7 @@ mod tests {
         assert_eq!(
             LaneError::FormatUnserved {
                 safetensors: true,
+                quantized: false,
                 roster: roster.clone()
             }
             .missing_kinds(Latency),
@@ -384,10 +459,31 @@ mod tests {
         assert_eq!(
             LaneError::FormatUnserved {
                 safetensors: false,
+                quantized: false,
                 roster
             }
             .missing_kinds(Quality),
             vec![LlamaCpp, MistralRs]
+        );
+        // Quantized safetensors offer narrows to sglang alone — the
+        // JIT install menu must not recommend a known-broken lane.
+        assert_eq!(
+            LaneError::FormatUnserved {
+                safetensors: true,
+                quantized: true,
+                roster: "b1 (llamacpp)".to_string()
+            }
+            .missing_kinds(Latency),
+            vec![Sglang]
+        );
+        assert_eq!(
+            LaneError::FormatUnserved {
+                safetensors: true,
+                quantized: true,
+                roster: "b1 (llamacpp)".to_string()
+            }
+            .to_string(),
+            "no installed engine serves quantized safetensors (AWQ/GPTQ/FP8) — sglang is the lane for those; pallama engine install --kind sglang (installed: b1 (llamacpp))"
         );
     }
 
@@ -407,6 +503,7 @@ mod tests {
                 RoutingPolicy::Quality,
                 Some(pin),
                 safetensors,
+                false,
                 LlamaCpp,
                 &installed,
             )
@@ -417,6 +514,7 @@ mod tests {
                 RoutingPolicy::Quality,
                 Some(pin),
                 safetensors,
+                false,
                 LlamaCpp,
                 &installed,
             )
@@ -429,6 +527,7 @@ mod tests {
             RoutingPolicy::Quality,
             None,
             true,
+            false,
             LlamaCpp,
             &installed,
         )

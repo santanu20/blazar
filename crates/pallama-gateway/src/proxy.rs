@@ -901,6 +901,7 @@ pub(crate) fn resolve_serving(
                 state.config.engine_routing.policy,
                 overlay.engine.as_deref(),
                 std::path::Path::new(model_path).is_dir(),
+                pallama_core::store::quantized_safetensors_signal(model_name, "", model_path),
                 global,
                 &installed,
             );

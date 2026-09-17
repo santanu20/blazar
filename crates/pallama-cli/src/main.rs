@@ -1334,11 +1334,13 @@ fn routed_engine_lane(
     let overlay = cfg.overlay_for(name);
     let pin = overlay.engine.as_deref();
     let safetensors = std::path::Path::new(path).is_dir();
+    let quantized = pallama_core::store::quantized_safetensors_signal(name, "", path);
     match pallama_core::engine_kind::serving_lane(
         cfg.engine_routing.mode,
         cfg.engine_routing.policy,
         pin,
         safetensors,
+        quantized,
         *g_kind,
         installed,
     ) {
@@ -1427,6 +1429,7 @@ fn lane_state_for(d: &PallamaDirs, row: &pallama_core::store::ModelRow) -> LaneS
                 cfg.engine_routing.policy,
                 pin,
                 safetensors,
+                row.is_quantized_safetensors(),
                 active.kind,
                 &installed,
             ) {

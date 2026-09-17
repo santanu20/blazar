@@ -112,6 +112,42 @@ pub struct ModelRow {
     pub pulled_at: i64,
 }
 
+/// Quantization-method tokens that mark a safetensors checkpoint as
+/// engine-picky: AWQ/GPTQ/FP8 dirs serve on sglang's vLLM-style loader
+/// but dequant broken on mistral.rs prebuilt builds (live-proven
+/// v0.9.3: dtype-mismatch empty 200s, garbage tokens under f16).
+const QUANTIZED_SAFETENSORS_TOKENS: [&str; 3] = ["awq", "gptq", "fp8"];
+
+/// The quantized-safetensors routing signal, shared by every caller
+/// (store rows, CLI name+path pairs): true when the checkpoint is NOT
+/// a GGUF file and any name/repo/path token names a quantization
+/// method. Word-boundary matched so names like "hawk" stay clean.
+#[must_use]
+pub fn quantized_safetensors_signal(name: &str, repo: &str, path: &str) -> bool {
+    if path.to_ascii_lowercase().ends_with(".gguf") {
+        return false;
+    }
+    [name, repo, path].iter().any(|s| {
+        s.to_ascii_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|tok| QUANTIZED_SAFETENSORS_TOKENS.contains(&tok))
+    })
+}
+
+impl ModelRow {
+    /// True for quantized safetensors checkpoints (AWQ/GPTQ/FP8). The
+    /// `quant` column is UNRELIABLE for this (an AWQ dir pulls with
+    /// quant `4BIT`, an FP8-dynamic dir with `BF16`) — the honest
+    /// signal is the quantization-method token in the name/repo/path,
+    /// which the pull convention always carries
+    /// (`model-instruct-awq.d`). GGUF rows are never "quantized
+    /// safetensors" — GGUF quants are a different, well-served lane.
+    #[must_use]
+    pub fn is_quantized_safetensors(&self) -> bool {
+        quantized_safetensors_signal(&self.name, &self.repo, &self.path)
+    }
+}
+
 fn default_shards() -> i64 {
     1
 }
@@ -703,6 +739,54 @@ mod tests {
         assert_eq!(s.list_loras(None).unwrap().len(), 2);
         assert!(s.delete_lora(id).unwrap());
         assert!(s.list_loras(Some("m")).unwrap().is_empty());
+    }
+
+    /// The quantized-safetensors routing signal: pull-convention dir
+    /// names carry the quant-method token; `quant` column values never
+    /// enter it (awq rows pull as `4BIT`, fp8-dynamic as `BF16`).
+    #[test]
+    fn unit__quantized_safetensors_signal__tokens_and_boundaries() {
+        let row = |name: &str, repo: &str, path: &str| ModelRow {
+            name: name.into(),
+            repo: repo.into(),
+            quant: "BF16".into(), // unreliable on purpose — never read
+            path: path.into(),
+            bytes: 1,
+            sha256: None,
+            mmproj_path: None,
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+        };
+        // The live incident rows: awq/gptq/fp8 dirs quantize true.
+        assert!(row(
+            "qwen2.5-0.5b-instruct-awq",
+            "qwen/qwen2.5-0.5b-instruct-awq",
+            "/models/qwen2.5-0.5b-instruct-awq.d"
+        )
+        .is_quantized_safetensors());
+        assert!(row("m-gptq", "r", "/models/m-gptq.d").is_quantized_safetensors());
+        assert!(row("m-fp8-dynamic", "r", "/models/m-fp8-dynamic.d").is_quantized_safetensors());
+        // Word boundary: 'hawk' embeds awq as a substring but splits
+        // into its own token — stays a normal lane.
+        assert!(!row("hawk", "r", "/models/hawk.d").is_quantized_safetensors());
+        // Plain BF16 dir: the lane mistral.rs serves perfectly.
+        assert!(!row(
+            "qwen2.5-0.5b-instruct",
+            "qwen/qwen2.5-0.5b-instruct",
+            "/models/qwen2.5-0.5b-instruct.d"
+        )
+        .is_quantized_safetensors());
+        // GGUF never counts, even when the filename carries a token.
+        assert!(!row("m-awq", "r", "/models/m-awq-q4_k_m.gguf").is_quantized_safetensors());
+        // Repo token alone (a dir renamed clean) still signals.
+        assert!(quantized_safetensors_signal(
+            "renamed",
+            "qwen/qwen2.5-0.5b-instruct-awq",
+            "/models/renamed.d"
+        ));
     }
 
     #[test]
