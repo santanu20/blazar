@@ -139,7 +139,13 @@ enum Cmd {
         json: bool,
     },
     /// Show model details, active profile, last benchmark
-    Show { model: String },
+    Show {
+        model: String,
+        /// One JSON object (machine-typed); metadata and the stored
+        /// profile/benchmark embed as nested values, not strings
+        #[arg(long)]
+        json: bool,
+    },
     /// Live instances: state, ctx, in-flight requests, idle countdown
     Ps {
         /// Clear crash circuit breakers
@@ -1062,7 +1068,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             rm_multi(&resolved)
         }
         Cmd::List { json } => list(json),
-        Cmd::Show { model } => show(&resolve_model_cli(&model)),
+        Cmd::Show { model, json } => show(&resolve_model_cli(&model), json),
         Cmd::Ps { reset, json } => ps(reset, json).await,
         Cmd::Run {
             model,
@@ -4011,12 +4017,58 @@ fn list(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn show(model: &str) -> Result<()> {
+fn show(model: &str, json: bool) -> Result<()> {
     let d = dirs();
     let store = Store::open(&d)?;
     let row = store
         .get_model(model)?
         .ok_or_else(|| no_such_model(model))?;
+    let meta = pallama_core::read_metadata_file(std::path::Path::new(&row.path)).ok();
+    let profile = store.active_engine()?.and_then(|e| {
+        store
+            .get_profile(&row.name, &e.tag)
+            .ok()
+            .flatten()
+            .map(|p| (e.tag, p))
+    });
+    if json {
+        // Machine-typed mirror of the key-value view; stored argv and
+        // benchmark arrive as JSON *strings* in the row — embed them as
+        // real values so consumers get one object, not double encoding.
+        let meta_json = meta.as_ref().map(|m| {
+            serde_json::json!({
+                "architecture": m.architecture,
+                "block_count": m.block_count,
+                "context_length": m.context_length,
+                "expert_count": m.expert_count,
+                "quantized_by": m.quantized_by,
+                "version": m.general_version,
+                "lint": m.lint(),
+            })
+        });
+        let profile_json = profile.map(|(tag, p)| {
+            serde_json::json!({
+                "engine": tag,
+                "argv": embedded_json(&p.args_json),
+                "benchmark": p.benchmark_json.as_deref().map(embedded_json),
+            })
+        });
+        println!(
+            "{}",
+            serde_json::json!({
+                "name": row.name,
+                "repo": row.repo,
+                "quant": row.quant,
+                "path": row.path,
+                "bytes": row.bytes,
+                "shards": row.shards,
+                "mmproj": row.mmproj_path,
+                "meta": meta_json,
+                "profile": profile_json,
+            })
+        );
+        return Ok(());
+    }
     println!("name:    {}", row.name);
     println!("repo:    {}", row.repo);
     println!("quant:   {}", row.quant);
@@ -4026,8 +4078,7 @@ fn show(model: &str) -> Result<()> {
     if let Some(mm) = &row.mmproj_path {
         println!("mmproj:  {mm}");
     }
-    let meta = pallama_core::read_metadata_file(std::path::Path::new(&row.path));
-    if let Ok(m) = &meta {
+    if let Some(m) = &meta {
         println!("arch:    {}", m.architecture);
         println!("blocks:  {:?}", m.block_count);
         println!("ctx_train: {:?}", m.context_length);
@@ -4043,16 +4094,21 @@ fn show(model: &str) -> Result<()> {
             println!("WARNING: {w}");
         }
     }
-    if let Some(engine) = store.active_engine()? {
-        if let Some(p) = store.get_profile(&row.name, &engine.tag)? {
-            println!("profile (engine {}):", engine.tag);
-            println!("  argv: {}", p.args_json);
-            if let Some(b) = &p.benchmark_json {
-                println!("  benchmark: {b}");
-            }
+    if let Some((tag, p)) = profile {
+        println!("profile (engine {tag}):");
+        println!("  argv: {}", p.args_json);
+        if let Some(b) = &p.benchmark_json {
+            println!("  benchmark: {b}");
         }
     }
     Ok(())
+}
+
+/// Stored JSON text (argv/benchmark columns) embedded as a real value;
+/// a corrupted row degrades to the raw string instead of crashing the
+/// listing.
+fn embedded_json(raw: &str) -> serde_json::Value {
+    serde_json::from_str(raw).unwrap_or(serde_json::Value::String(raw.to_string()))
 }
 
 async fn ps(reset: bool, json: bool) -> Result<()> {
@@ -5364,7 +5420,7 @@ async fn run_repl(model: &str) -> Result<()> {
                 continue;
             }
             "/profile" => {
-                show(&model)?;
+                show(&model, false)?;
                 continue;
             }
             _ if line.starts_with("/model ") => {
@@ -8014,6 +8070,16 @@ mod tests {
             ["4BIT"]
         );
         assert_eq!(quant_markers("openbmb/MiniCPM-V-4_5"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn unit__embedded_json__parses_or_degrades_to_string() {
+        assert_eq!(
+            embedded_json(r#"["--ctx-size","8192"]"#),
+            serde_json::json!(["--ctx-size", "8192"])
+        );
+        // Corrupted row: raw string survives instead of crashing listings.
+        assert_eq!(embedded_json("[oops"), serde_json::json!("[oops"));
     }
 
     #[test]

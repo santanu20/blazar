@@ -106,7 +106,7 @@ Capability discovery: `GET /.well-known/pallama` (routes, headers, features, eng
 | Command | Purpose |
 |---|---|
 | `serve` / `stop` | Daemon lifecycle (pidfile-guarded, graceful shutdown) |
-| `pull` / `rm` / `list [--json]` / `show` | Model store (plain GGUF files; rm refuses while running) |
+| `pull` / `rm` / `list [--json]` / `show [--json]` | Model store (plain GGUF files; rm refuses while running) |
 | `run <model>` | Streaming REPL (`/exit /clear /model /sysinfo /profile`); profile decisions print as `[profile] …` once after the first turn of each model |
 | `ps [--reset] [--json]` | Live instances: state, ctx, **GPU offload + card** (`full@<card>`/`partial@<card>`/`cpu`/`auto` — silent CPU fallback is never silent, and you always see which card holds the model), in-flight, endpoint; `warn[<model>]` lines under the table surface profile decisions (ctx fit, slot auto, offload rationale) |
 | `bench` / `tune --search` | `llama-bench` tables; measured argmax profile adoption |

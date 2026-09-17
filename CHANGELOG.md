@@ -6,6 +6,7 @@ tracked here.
 
 ## [Unreleased]
 ### Added
+- `pallama show --json`: the model card as one machine-typed object — nested GGUF metadata (null on safetensors rows) and the stored profile with argv/benchmark embedded as real JSON values instead of double-encoded strings (a corrupted row degrades to its raw string rather than failing the listing).
 - `--json` on `list`, `ps` and `engine list`: the `search --json` JSONL contract across every table command — machine-typed rows (raw bytes, null-able optionals, full untruncated engine sha256), banners/hints/catalog lines suppressed so stdout is pure data; empty listings stream zero rows.
 - `pallama fit` on safetensors repos: one aggregate row (full shard set summed from Hub blob sizes) through the same rule-6 KV ladder as the GGUF lane, with the sglang/mistralrs serving-lane hint; sizeless repos now teach "nothing to preview" instead of printing a bare empty table.
 - `pallama search --json`: one JSON object per row (JSONL, matching `doctor --json`) — machine-typed `ctx`/`size_bytes`/`arch` (null without GGUF metadata) and the FULL quants list (no `+N` collapse) for scripting; empty results stream zero rows (`jq -s` reads `[]`), and SIGPIPE is reset to default so `| head`/`| jq` closing early ends quietly instead of panicking.
