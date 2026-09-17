@@ -71,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         model_name: "qwen3.5-9b",
         instance_key: "qwen3.5-9b",
         model_path: &model,
-        model_bytes: std::fs::metadata(model)?.len(),
+        model_bytes: std::fs::metadata(&model)?.len(),
         meta: ModelMeta::Gguf(&gguf),
         hardware: &hw,
         config: &Config::default(),
