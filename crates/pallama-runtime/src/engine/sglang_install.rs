@@ -253,7 +253,7 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
 fn bundled_nvcc_bin_dir(venv: &Path) -> Option<PathBuf> {
     let lib = std::fs::read_dir(venv.join("lib")).ok()?;
     let python_dir = lib
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .find(|e| {
             e.path()
                 .file_name()
