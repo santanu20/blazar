@@ -1841,7 +1841,9 @@ impl Supervisor {
                 let _ = child.reap().await;
                 continue;
             }
-            let (health, child_died) = self.wait_healthy(&endpoint, &mut child).await;
+            let (health, child_died) = self
+                .wait_healthy(self.engine.as_ref(), &endpoint, &mut child)
+                .await;
             match health {
                 Ok(()) => {
                     let pid = child.id().ok_or_else(|| {
@@ -1928,12 +1930,20 @@ impl Supervisor {
     /// lines — never keep polling a corpse for the full `model_load_timeout`
     /// (mislabeling an instant crash as a slow model load).
     /// Returns the health result plus `true` when the failure is child death.
+    ///
+    /// The engine passed in is the one that SPAWNED the child — for a
+    /// routed spawn that is the target lane's adapter, not the daemon's
+    /// global engine. Health contracts are engine-specific (llamacpp
+    /// answers `{"status":"ok"}`; sglang answers a bare 200 with an
+    /// empty body), so gating a routed child on the global engine's
+    /// parser rejects a healthy child for the whole load window.
     async fn wait_healthy(
         &self,
+        engine: &dyn Engine,
         endpoint: &Endpoint,
         child: &mut ChildHandle,
     ) -> (anyhow::Result<()>, bool) {
-        let mut health = Box::pin(self.engine.health_check(endpoint, self.load_timeout));
+        let mut health = Box::pin(engine.health_check(endpoint, self.load_timeout));
         let mut liveness = Box::pin(async {
             loop {
                 if let Ok(Some(status)) = child.try_status() {
@@ -2614,7 +2624,9 @@ impl Supervisor {
                 continue;
             }
 
-            let (health, child_died) = self.wait_healthy(&endpoint, &mut child).await;
+            let (health, child_died) = self
+                .wait_healthy(engine.as_ref(), &endpoint, &mut child)
+                .await;
             match health {
                 Ok(()) => {
                     // F1: an evict is tearing this name down right now —
@@ -2648,7 +2660,10 @@ impl Supervisor {
                     // slots peg the auto default of 4). Probes hit the
                     // child directly — they never touch gateway slot
                     // accounting — and are bounded (90 s + 60 s).
-                    let kind = self.engine.kind();
+                    // Warm-peg kind follows the SPAWN's engine (a routed
+                    // adapter), never the global one: the peg's flags and
+                    // blocking semantics are engine-specific.
+                    let kind = engine.kind();
                     if self.config.warm_peg.enabled_for(&kind) {
                         let slots_flag = if kind == pallama_core::engine_kind::EngineKind::Sglang {
                             "--max-running-requests"
@@ -2817,7 +2832,10 @@ impl Supervisor {
                     // weights-sum floor (the same pre-settle state that
                     // exists today).
                     if let Some(pre) = fresh {
-                        let engine = Arc::clone(&self.engine);
+                        // Census with the spawn's (routed) engine: the
+                        // settle report must probe the lane that actually
+                        // serves, not the daemon's global one.
+                        let engine = Arc::clone(&engine);
                         let settled_inst = Arc::clone(inst.value());
                         let picked = picked_device.clone();
                         let model_name = name.to_string();
