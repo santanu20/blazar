@@ -300,7 +300,13 @@ enum Cmd {
         json: bool,
     },
     /// Pre-download fit preview: VRAM/RAM split + quant alternatives
-    Fit { target: String },
+    Fit {
+        target: String,
+        /// One JSON object per fit row (JSONL); suppresses the header,
+        /// table and lane hints
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect and edit config.toml knobs (set / get / unset / defaults)
     #[command(after_help = CONFIG_EXAMPLES)]
     Config {
@@ -1108,7 +1114,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             format,
             json,
         } => search(&query.join(" "), &format, json).await,
-        Cmd::Fit { target } => fit(&target).await,
+        Cmd::Fit { target, json } => fit(&target, json).await,
         Cmd::Config { cmd } => config_cmd(cmd),
         Cmd::Upgrade { version, dry_run } => upgrade(version, dry_run).await,
         Cmd::Cp {
@@ -7701,7 +7707,7 @@ fn collapse_tokens(tokens: &[String]) -> String {
     }
 }
 
-async fn fit(target: &str) -> Result<()> {
+async fn fit(target: &str, json: bool) -> Result<()> {
     let parsed = pallama_runtime::parse_pull_target(target)?;
     let token = std::env::var("HF_TOKEN").ok();
     let client = pallama_runtime::hf::HfClient::new(token)?;
@@ -7719,6 +7725,18 @@ async fn fit(target: &str) -> Result<()> {
     };
     let vram_bytes = pallama_core::Hardware::bytes(vram);
     let rows = pallama_runtime::hf::fit_rows(&info.siblings, vram_bytes, cfg.default_ctx);
+    if json {
+        // One object per row (JSONL contract). vram_bytes and repo ride on
+        // every row like doctor's group field — `fits_vram` is meaningless
+        // without the machine context that produced it.
+        for r in &rows {
+            let mut v = serde_json::to_value(r).map_err(|e| anyhow!("serialize fit row: {e}"))?;
+            v["repo"] = serde_json::json!(parsed.repo);
+            v["vram_bytes"] = serde_json::json!(vram_bytes);
+            println!("{v}");
+        }
+        return Ok(());
+    }
     println!(
         "fit preview for {} (local VRAM: {})",
         parsed.repo,
