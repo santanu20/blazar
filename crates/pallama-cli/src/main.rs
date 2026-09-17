@@ -4398,23 +4398,18 @@ async fn run_dispatch(
         // a top-level max_tokens key would be silently ignored.
         body["options"] = serde_json::json!({ "num_predict": n });
     }
-    let final_chunk = stream_chat(&base, &body).await?;
+    let outcome = stream_chat(base.clone(), body.clone()).await?;
+    if outcome.interrupted {
+        println!("\n^C interrupted");
+        std::process::exit(130);
+    }
     // Profile decisions for THIS model (unified-KV ctx fit, slot auto,
     // offload rationale) — the run that triggered the load is the run
     // that deserves the why. REPL defers to `pallama ps`.
     print_profile_warnings(&base, model).await;
     if verbose {
-        if let Some(v) = final_chunk {
-            let ec = v["eval_count"].as_i64().unwrap_or(0);
-            let ed = v["eval_duration"].as_i64().unwrap_or(0);
-            let pc = v["prompt_eval_count"].as_i64().unwrap_or(0);
-            #[allow(clippy::cast_precision_loss, reason = "token counts fit f64 exactly")]
-            let rate = if ed > 0 {
-                f64::from(ec as f32) * 1e9 / f64::from(ed as f32)
-            } else {
-                0.0
-            };
-            println!("\n\ntotal duration: answer {ec} tokens at {rate:.1} t/s; prompt {pc} tokens");
+        if let Some(v) = &outcome.final_chunk {
+            println!("\n\n{}", chat_stats_line(v));
         }
     }
     Ok(())
@@ -5562,28 +5557,180 @@ async fn stop_cmd(model: Option<String>) -> Result<()> {
     }
 }
 
+/// Ctrl+C during a REPL generation. tokio's async signal listener can
+/// stay unresolved for the entire stream under ready-chunk flood on this
+/// runtime (live-proven), so the interrupt travels as an async-signal-
+/// safe flag that the chunk loop polls; the signal scheduler is never
+/// on the critical path.
+static STREAM_INTERRUPTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+static SIGINT_RESTORE: std::sync::Mutex<Option<libc::sigaction>> = std::sync::Mutex::new(None);
+
+#[cfg(unix)]
+extern "C" fn stash_sigint(_sig: libc::c_int) {
+    STREAM_INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Install the REPL's SIGINT flag-handler, remembering the previous
+/// disposition so REPL exit restores the process-wide state.
+#[cfg(unix)]
+#[allow(unsafe_code)] // one-time signal install; no pointers escape
+fn install_repl_sigint() {
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        let mut act: libc::sigaction = std::mem::zeroed();
+        act.sa_sigaction = stash_sigint as *const () as usize;
+        act.sa_flags = 0;
+        libc::sigemptyset(&mut act.sa_mask);
+        if libc::sigaction(libc::SIGINT, &act, &raw mut old) == 0 {
+            *SIGINT_RESTORE.lock().unwrap() = Some(old);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)] // restores the saved disposition on REPL exit
+fn restore_repl_sigint() {
+    let prev = SIGINT_RESTORE.lock().unwrap().take();
+    if let Some(old) = prev {
+        unsafe {
+            libc::sigaction(libc::SIGINT, &raw const old, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Multi-line block reader for the REPL: continuation lines under a
+/// `... ` prompt until a closing `"""`. `None` = empty block (no-op turn).
+fn read_multiline(rl: &mut rustyline::DefaultEditor) -> Option<String> {
+    let mut block = String::new();
+    loop {
+        match rl.readline("... ") {
+            Ok(l) if l.trim() == "\"\"\"" => break,
+            Ok(l) => {
+                block.push_str(&l);
+                block.push('\n');
+            }
+            Err(_) => break,
+        }
+    }
+    let joined = block.trim_end().to_string();
+    (!joined.is_empty()).then_some(joined)
+}
+
+/// Synchronous REPL commands (everything that needs no daemon round
+/// trip). `Some(true)` = quit, `Some(false)` = handled, `None` = not a
+/// command — the caller lets the line through to the model.
+fn repl_local_command(
+    line: &str,
+    history: &mut Vec<serde_json::Value>,
+    system_msg: &mut Option<String>,
+    model: &mut String,
+    verbose: &mut bool,
+    warned: &mut bool,
+) -> Option<bool> {
+    match line {
+        "/exit" | "/bye" => return Some(true),
+        "/clear" => {
+            history.clear();
+            *system_msg = None;
+            println!("(history cleared)");
+        }
+        "/help" => {
+            println!(
+                "commands: /exit /bye /clear /model <name> /set system <text> \
+                 /verbose /sysinfo /profile"
+            );
+            println!("input:   plain text, or \"\"\" ... \"\"\" for multi-line");
+        }
+        "/verbose" => {
+            *verbose = !*verbose;
+            println!("(verbose {})", if *verbose { "on" } else { "off" });
+        }
+        "/set system" => match &*system_msg {
+            Some(sys) => println!("system: {sys}"),
+            None => println!("(no system message — /set system <text> to set one)"),
+        },
+        _ if line.starts_with("/set system ") => {
+            let rest = line["/set system ".len()..].trim().to_string();
+            if rest == "\"\"" {
+                *system_msg = None;
+                println!("(system message cleared)");
+            } else {
+                *system_msg = Some(rest);
+                println!("(system message set — /set system to show, /set system \"\" to clear)");
+            }
+        }
+        _ if line.starts_with("/model ") => {
+            *model = line["/model ".len()..].trim().to_string();
+            history.clear();
+            *system_msg = None;
+            *warned = false;
+            println!("(switched to {model})");
+        }
+        _ => return None,
+    }
+    Some(false)
+}
+
 async fn run_repl(model: &str) -> Result<()> {
+    use rustyline::error::ReadlineError;
     let base = ensure_daemon().await?;
     let mut rl = rustyline::DefaultEditor::new()?;
     let mut model = model.to_string();
+    // Conversation memory: user AND assistant turns, so follow-ups can
+    // reference earlier answers. `system_msg` rides outside the history
+    // so `/set system` survives a bare turn, not `/clear`.
     let mut history: Vec<serde_json::Value> = Vec::new();
+    let mut system_msg: Option<String> = None;
+    let mut verbose = false;
     // Profile warnings print once per model switch (ctx fit, slot auto,
     // offload rationale) — the first turn is the one that paid the load.
     let mut warned = false;
-    println!("pallama REPL — /exit /clear /model <name> /sysinfo /profile");
-    while let Ok(line) = rl.readline(">>> ") {
-        let line = line.trim();
+    #[cfg(unix)]
+    install_repl_sigint();
+    println!("pallama REPL — /help for commands");
+    loop {
+        let line = match rl.readline(">>> ") {
+            Ok(l) => l,
+            // Ctrl+C at the prompt is a nudge, not an exit — ollama REPL
+            // semantics keep the session alive.
+            Err(ReadlineError::Interrupted) => {
+                println!("^C (use /exit or Ctrl+D to quit)");
+                continue;
+            }
+            Err(_) => break,
+        };
+        let line = line.trim().to_string();
         if line.is_empty() {
             continue;
         }
-        rl.add_history_entry(line).ok();
-        match line {
-            "/exit" => break,
-            "/clear" => {
-                history.clear();
-                println!("(history cleared)");
-                continue;
+        rl.add_history_entry(&line).ok();
+        // Multi-line input: a `"""` opener reads continuation lines (with
+        // a `... ` prompt) until the closing `"""`; empty blocks are a
+        // no-op. Plain `"""` text is rare enough to repurpose cleanly.
+        let line = if line == "\"\"\"" {
+            match read_multiline(&mut rl) {
+                Some(block) => block,
+                None => continue,
             }
+        } else {
+            line
+        };
+        match repl_local_command(
+            &line,
+            &mut history,
+            &mut system_msg,
+            &mut model,
+            &mut verbose,
+            &mut warned,
+        ) {
+            Some(true) => break,
+            Some(false) => continue,
+            None => {}
+        }
+        match line.as_str() {
             "/sysinfo" => {
                 sysinfo_cmd(&base).await?;
                 continue;
@@ -5592,28 +5739,69 @@ async fn run_repl(model: &str) -> Result<()> {
                 show(&model, false)?;
                 continue;
             }
-            _ if line.starts_with("/model ") => {
-                model = line["/model ".len()..].trim().to_string();
-                history.clear();
-                warned = false;
-                println!("(switched to {model})");
-                continue;
-            }
             _ => {}
         }
         history.push(serde_json::json!({"role": "user", "content": line}));
-        let body = serde_json::json!({
-            "model": model,
-            "messages": history,
-            "stream": true,
-        });
-        stream_chat(&base, &body).await?;
+        if repl_turn(&base, &model, &mut history, system_msg.as_deref(), verbose).await? {
+            continue;
+        }
         if !warned {
             print_profile_warnings(&base, &model).await;
             warned = true;
         }
     }
+    #[cfg(unix)]
+    restore_repl_sigint();
     Ok(())
+}
+
+/// One REPL conversation turn: send the history (with any system message
+/// prepended outside it), stream the answer into the terminal, and record
+/// the assistant reply as conversation memory. Returns `true` when Ctrl+C
+/// interrupted the generation — partial output rendered but the turn is
+/// discarded, and dropping the response future closes the connection so
+/// the daemon frees the slot on client disconnect (validated behavior).
+///
+/// The interrupt travels via an async-signal-safe flag checked per chunk:
+/// tokio's ctrl_c listener can stay unresolved for the whole stream under
+/// chunk-flood load (live-proven on this runtime), so the REPL must not
+/// depend on the async signal scheduler for this.
+async fn repl_turn(
+    base: &str,
+    model: &str,
+    history: &mut Vec<serde_json::Value>,
+    system_msg: Option<&str>,
+    verbose: bool,
+) -> Result<bool> {
+    let mut messages = Vec::with_capacity(history.len() + 1);
+    if let Some(sys) = system_msg {
+        messages.push(serde_json::json!({"role": "system", "content": sys}));
+    }
+    messages.extend(history.iter().cloned());
+    let body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "stream": true,
+    });
+    let outcome = stream_chat(base.to_string(), body).await?;
+    if outcome.interrupted {
+        println!("\n^C interrupted");
+        return Ok(true);
+    }
+    if !outcome.text.is_empty() {
+        history.push(serde_json::json!({"role": "assistant", "content": outcome.text}));
+    }
+    if verbose {
+        if let Some(v) = &outcome.final_chunk {
+            use std::io::IsTerminal as _;
+            if std::io::stdout().is_terminal() {
+                println!("\x1b[2m{}\x1b[0m", chat_stats_line(v));
+            } else {
+                println!("{}", chat_stats_line(v));
+            }
+        }
+    }
+    Ok(false)
 }
 
 async fn sysinfo_cmd(base: &str) -> Result<()> {
@@ -5628,16 +5816,42 @@ async fn sysinfo_cmd(base: &str) -> Result<()> {
     Ok(())
 }
 
-/// Stream an /api/chat NDJSON response to stdout; returns the final
-/// (usage-carrying) chunk for --verbose stats.
+/// What a completed /api/chat stream yielded: the usage-carrying final
+/// chunk (for stats) plus the accumulated assistant text (for REPL
+/// conversation memory).
+struct StreamOutcome {
+    /// Ctrl+C was seen mid-stream: partial text rendered, but the turn
+    /// is discarded — callers must not record it as conversation memory.
+    pub interrupted: bool,
+    final_chunk: Option<serde_json::Value>,
+    text: String,
+}
+
+/// One dimmed stats line from the final chunk's usage fields; `None`
+/// when no final chunk arrived at all.
+fn chat_stats_line(v: &serde_json::Value) -> String {
+    let ec = v["eval_count"].as_i64().unwrap_or(0);
+    let ed = v["eval_duration"].as_i64().unwrap_or(0);
+    let pc = v["prompt_eval_count"].as_i64().unwrap_or(0);
+    #[allow(clippy::cast_precision_loss, reason = "token counts fit f64 exactly")]
+    let rate = if ed > 0 {
+        f64::from(ec as f32) * 1e9 / f64::from(ed as f32)
+    } else {
+        0.0
+    };
+    format!("total duration: answer {ec} tokens at {rate:.1} t/s; prompt {pc} tokens")
+}
+
+/// Stream an /api/chat NDJSON response to stdout, accumulating the
+/// assistant text alongside the final (usage-carrying) chunk.
 #[allow(clippy::duration_suboptimal_units)] // 10-minute generation ceiling
-async fn stream_chat(base: &str, body: &serde_json::Value) -> Result<Option<serde_json::Value>> {
+async fn stream_chat(base: String, body: serde_json::Value) -> Result<StreamOutcome> {
     use std::io::IsTerminal as _;
     // Streaming lane: no total-request ceiling; the 600s per-request
     // timeout below is the bound (F126 exemption).
     let resp = reqwest::Client::new()
         .post(format!("{base}/api/chat"))
-        .json(body)
+        .json(&body)
         .timeout(std::time::Duration::from_secs(600))
         .send()
         .await?;
@@ -5649,18 +5863,26 @@ async fn stream_chat(base: &str, body: &serde_json::Value) -> Result<Option<serd
     let mut buf = String::new();
     let mut chunk_lines = pallama_gateway::translate::LineBuffer::new();
     let mut final_chunk: Option<serde_json::Value> = None;
+    let mut text = String::new();
     let stdout = std::io::stdout();
     // Thinking deltas render dimmed only on a real terminal; piped output
     // stays clean for downstream consumers (jq, scripts, files).
     let is_tty = stdout.is_terminal();
     let mut after_thinking = false;
-    let mut out = stdout.lock();
+
     // A 200 stream that never carries content is indistinguishable from
     // failure to a human at the REPL (e.g. an engine serving a quant it
     // cannot decode): remember whether anything rendered so the silent case
     // gets an honest error line instead of a blank prompt.
     let mut rendered_any = false;
+    // Park-time ^C (at the prompt) must not kill the NEXT generation:
+    // consume any stale flag before the stream starts.
+    let mut interrupted = STREAM_INTERRUPTED.swap(false, std::sync::atomic::Ordering::Relaxed);
     while let Some(chunk) = futures_lite_next(&mut resp).await? {
+        if STREAM_INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+            interrupted = true;
+            break; // drop the response: connection close frees the slot
+        }
         buf.push_str(&chunk_lines.feed(&chunk));
         while let Some(pos) = buf.find('\n') {
             let line: String = buf.drain(..=pos).collect();
@@ -5672,7 +5894,7 @@ async fn stream_chat(base: &str, body: &serde_json::Value) -> Result<Option<serd
                 if is_tty {
                     if let Some(thinking) = v["message"]["thinking"].as_str() {
                         if !thinking.is_empty() {
-                            write!(out, "\x1b[2m{thinking}\x1b[0m").ok();
+                            write!(stdout.lock(), "\x1b[2m{thinking}\x1b[0m").ok();
                             after_thinking = true;
                             rendered_any = true;
                         }
@@ -5681,10 +5903,11 @@ async fn stream_chat(base: &str, body: &serde_json::Value) -> Result<Option<serd
                 if let Some(content) = v["message"]["content"].as_str() {
                     if !content.is_empty() {
                         if after_thinking {
-                            writeln!(out).ok();
+                            writeln!(stdout.lock()).ok();
                             after_thinking = false;
                         }
-                        write!(out, "{content}").ok();
+                        write!(stdout.lock(), "{content}").ok();
+                        text.push_str(content);
                         rendered_any = true;
                     }
                 }
@@ -5693,10 +5916,10 @@ async fn stream_chat(base: &str, body: &serde_json::Value) -> Result<Option<serd
                 }
             }
         }
-        out.flush().ok();
+        stdout.lock().flush().ok();
     }
     if rendered_any {
-        writeln!(out).ok();
+        writeln!(stdout.lock()).ok();
     } else {
         let model = body["model"].as_str().unwrap_or("model");
         eprintln!(
@@ -5704,7 +5927,11 @@ async fn stream_chat(base: &str, body: &serde_json::Value) -> Result<Option<serd
              (try a different quant or engine lane: pallama engine list)"
         );
     }
-    Ok(final_chunk)
+    Ok(StreamOutcome {
+        interrupted,
+        final_chunk,
+        text,
+    })
 }
 
 /// Minimal chunked-body reader without importing a stream crate in main.
@@ -8346,6 +8573,27 @@ async fn upgrade(version: Option<String>, dry_run: bool) -> Result<()> {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__chat_stats_line__formats_and_degrades() {
+        let full = serde_json::json!({
+            "eval_count": 43,
+            "eval_duration": 21_500_000_000_i64,
+            "prompt_eval_count": 7,
+        });
+        let line = chat_stats_line(&full);
+        // 43 tokens / 21.5s = 2.0 t/s — the same shape the --verbose
+        // single-shot lane prints; REPL /verbose shares it dimmed.
+        assert!(line.contains("answer 43 tokens at 2.0 t/s"), "{line}");
+        assert!(line.contains("prompt 7 tokens"), "{line}");
+        // Missing usage fields degrade to the zero form instead of
+        // panicking or printing "unknown".
+        let bare = serde_json::json!({});
+        assert_eq!(
+            chat_stats_line(&bare),
+            "total duration: answer 0 tokens at 0.0 t/s; prompt 0 tokens"
+        );
+    }
 
     #[test]
     fn unit__format_of__specific_tag_beats_container() {
