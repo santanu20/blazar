@@ -7507,9 +7507,11 @@ async fn search(query: &str, format: &str, json: bool) -> Result<()> {
         return Ok(());
     }
     if json {
-        // Same fields as the table, machine-typed: ctx/size_bytes/arch are
-        // null when the Hub carries no GGUF metadata; quants is the FULL
-        // list (the table's `+N` collapse is display dressing).
+        // Same fields as the table, machine-typed: GGUF rows read the
+        // free root metadata; safetensors rows carry a dtype-derived
+        // byte estimate + config arch (ctx stays null — the Hub's search
+        // expansion has no context field outside gguf); quants is the
+        // FULL list (the table's `+N` collapse is display dressing).
         for r in &results {
             println!(
                 "{}",
@@ -7517,12 +7519,12 @@ async fn search(query: &str, format: &str, json: bool) -> Result<()> {
                     "repo": r.id,
                     "downloads": r.downloads.unwrap_or(0),
                     "likes": r.likes.unwrap_or(0),
-                    "format": match format_of(&r.tags).as_str() {
+                    "format": match format_of_entry(r).as_str() {
                         "?" => serde_json::Value::Null,
                         f => serde_json::Value::String(f.to_string()),
                     },
-                    "size_bytes": r.gguf.as_ref().and_then(|g| g.total),
-                    "arch": r.gguf.as_ref().and_then(|g| g.architecture.clone()),
+                    "size_bytes": entry_size_bytes(r),
+                    "arch": entry_arch(r),
                     "ctx": r.gguf.as_ref().and_then(|g| g.context_length),
                     "quants": entry_quants(r),
                 })
@@ -7563,15 +7565,16 @@ async fn search(query: &str, format: &str, json: bool) -> Result<()> {
     );
     for r in results {
         let id = truncate_repo_id(&r.id, cap);
-        let (size, arch, ctx) = r.gguf.as_ref().map_or_else(
-            || ("-".to_string(), "?".to_string(), "-".to_string()),
-            |g| {
-                (
-                    humansize(i64::try_from(g.total.unwrap_or(0)).unwrap_or(i64::MAX)),
-                    g.architecture.as_deref().unwrap_or("?").to_string(),
-                    g.context_length.map_or_else(|| "-".to_string(), &human_ctx),
-                )
-            },
+        let (size, arch, ctx) = (
+            entry_size_bytes(&r).map_or_else(
+                || "-".to_string(),
+                |b| humansize(i64::try_from(b).unwrap_or(i64::MAX)),
+            ),
+            entry_arch(&r).unwrap_or_else(|| "?".to_string()),
+            r.gguf
+                .as_ref()
+                .and_then(|g| g.context_length)
+                .map_or_else(|| "-".to_string(), &human_ctx),
         );
         let names = entry_quants(&r);
         // GGUF rows carry real per-file quants; MLX/AWQ/GPTQ/FP8 rows only
@@ -7582,7 +7585,7 @@ async fn search(query: &str, format: &str, json: bool) -> Result<()> {
             id,
             human_count(r.downloads.unwrap_or(0)),
             r.likes.unwrap_or(0),
-            format_of(&r.tags),
+            format_of_entry(&r),
             size,
             arch,
             ctx,
@@ -7592,7 +7595,7 @@ async fn search(query: &str, format: &str, json: bool) -> Result<()> {
     }
     match format.as_str() {
         "any" | "all" => println!(
-            "\n# pull: pallama pull <REPO>[:quant] (GGUF) or pallama pull <REPO> (safetensors — sglang/mistralrs lane); MLX needs conversion"
+            "\n# pull: pallama pull <REPO>[:quant] (GGUF → llamacpp) or pallama pull <REPO> (safetensors/AWQ/GPTQ/FP8 → sglang/mistralrs)\n# MLX repos are Apple-silicon-only — pull the same model's GGUF or safetensors repo instead"
         ),
         "gguf" => println!(
             "\n# pull one: pallama pull <REPO>[:quant]   (size = all quants in repo; QUANTS lists the choices)"
@@ -7645,6 +7648,48 @@ fn format_of(tags: &[String]) -> String {
         }
     }
     "?".to_string()
+}
+
+/// FORMAT for a search row: tag priority from [`format_of`], except MLX
+/// repos that never tagged themselves `mlx` (openbmb ships `-MLX`
+/// suffixed safetensors) — the id is the only honest signal there.
+fn format_of_entry(r: &pallama_runtime::hf::SearchEntry) -> String {
+    let model = r.id.rsplit('/').next().unwrap_or(&r.id);
+    if model
+        .split(['-', '.', '_'])
+        .any(|seg| seg.eq_ignore_ascii_case("mlx"))
+    {
+        return "mlx".to_string();
+    }
+    format_of(&r.tags)
+}
+
+/// SIZE for a search row: exact GGUF total when the Hub carries the
+/// free root metadata; otherwise the safetensors dtype-derived byte
+/// estimate (width × count — what `pull` actually downloads).
+fn entry_size_bytes(r: &pallama_runtime::hf::SearchEntry) -> Option<u64> {
+    r.gguf
+        .as_ref()
+        .and_then(|g| g.total)
+        .or_else(|| r.safetensors.as_ref().and_then(|s| s.byte_estimate()))
+}
+
+/// ARCH for a search row: gguf architecture > config `model_type` >
+/// first config architecture (lowercased) > None.
+fn entry_arch(r: &pallama_runtime::hf::SearchEntry) -> Option<String> {
+    r.gguf
+        .as_ref()
+        .and_then(|g| g.architecture.clone())
+        .or_else(|| {
+            r.config.as_ref().and_then(|c| {
+                c.model_type.clone().or_else(|| {
+                    c.architectures
+                        .as_ref()
+                        .and_then(|a| a.first())
+                        .map(|a| a.to_ascii_lowercase())
+                })
+            })
+        })
 }
 
 /// Quant-method tokens mined from a repo id (display-only dressing): MLX /
@@ -8055,7 +8100,129 @@ mod tests {
         assert_eq!(format_of(&tags(&["gguf", "mlx", "transformers"])), "gguf");
         assert_eq!(format_of(&tags(&["pytorch"])), "pytorch");
         assert_eq!(format_of(&tags(&["transformers"])), "?");
-        assert_eq!(format_of(&[]), "?");
+        assert_eq!(format_of(&tags(&[])), "?");
+    }
+
+    #[test]
+    fn unit__format_of_entry__untagged_mlx_detected_from_repo_id() {
+        // openbmb ships -MLX safetensors WITHOUT the mlx tag — the id is
+        // the only honest signal (live-verified against the Hub).
+        let entry = |id: &str, tags: &[&str]| pallama_runtime::hf::SearchEntry {
+            id: id.to_string(),
+            downloads: None,
+            likes: None,
+            siblings: Vec::new(),
+            gguf: None,
+            safetensors: None,
+            config: None,
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+        };
+        assert_eq!(
+            format_of_entry(&entry("openbmb/MiniCPM5-1B-MLX", &["safetensors"])),
+            "mlx"
+        );
+        // mlx-community repos tag themselves — the tag path answers.
+        assert_eq!(
+            format_of_entry(&entry(
+                "mlx-community/Qwen3-8B-4bit",
+                &["safetensors", "mlx"]
+            )),
+            "mlx"
+        );
+        // Tagged rows keep the tag answer; untagged plain repos unaffected.
+        assert_eq!(format_of_entry(&entry("a/b", &["gguf"])), "gguf");
+        assert_eq!(
+            format_of_entry(&entry("a/b", &["safetensors"])),
+            "safetensors"
+        );
+        // A repo merely MENTIONING mlx mid-name in a non-segment position
+        // (e.g. "Silmax") must not trip the detector: split on -, ., _.
+        assert_eq!(
+            format_of_entry(&entry("a/Silmax-Fusion", &["safetensors"])),
+            "safetensors"
+        );
+    }
+
+    #[test]
+    fn unit__entry_size_and_arch__safetensors_rows_carry_real_metadata() {
+        use std::collections::BTreeMap;
+        let hist = |pairs: &[(&str, u64)]| pallama_runtime::hf::HfSafetensorsInfo {
+            parameters: Some(
+                pairs
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), *v))
+                    .collect::<BTreeMap<_, _>>(),
+            ),
+            total: None,
+        };
+        let base = |gguf: Option<pallama_runtime::hf::HfGgufInfo>,
+                    st: Option<pallama_runtime::hf::HfSafetensorsInfo>,
+                    cfg: Option<pallama_runtime::hf::HfConfigSummary>| {
+            pallama_runtime::hf::SearchEntry {
+                id: "x/y".to_string(),
+                downloads: None,
+                likes: None,
+                siblings: Vec::new(),
+                gguf,
+                safetensors: st,
+                config: cfg,
+                tags: vec!["safetensors".to_string()],
+            }
+        };
+        // GGUF total wins when present (exact bytes).
+        assert_eq!(
+            entry_size_bytes(&base(
+                Some(pallama_runtime::hf::HfGgufInfo {
+                    total: Some(123),
+                    architecture: Some("llama".to_string()),
+                    context_length: Some(4096),
+                }),
+                Some(hist(&[("BF16", 1_000)])),
+                None,
+            )),
+            Some(123)
+        );
+        // Safetensors fallback: dtype math (2 bytes × 2.5B).
+        assert_eq!(
+            entry_size_bytes(&base(None, Some(hist(&[("BF16", 2_500_000_000)])), None)),
+            Some(5_000_000_000)
+        );
+        // Nothing derivable: honest None.
+        assert_eq!(entry_size_bytes(&base(None, None, None)), None);
+        // ARCH ladder: gguf > model_type > first architecture lowercased.
+        let cfg = |mt: Option<&str>, archs: Option<&[&str]>| pallama_runtime::hf::HfConfigSummary {
+            architectures: archs.map(|a| a.iter().map(|s| s.to_string()).collect()),
+            model_type: mt.map(str::to_string),
+        };
+        assert_eq!(
+            entry_arch(&base(
+                Some(pallama_runtime::hf::HfGgufInfo {
+                    total: None,
+                    architecture: Some("qwen3".to_string()),
+                    context_length: None,
+                }),
+                None,
+                Some(cfg(Some("llama"), Some(&["LlamaForCausalLM"]))),
+            )),
+            Some("qwen3".to_string())
+        );
+        assert_eq!(
+            entry_arch(&base(
+                None,
+                None,
+                Some(cfg(Some("llama"), Some(&["LlamaForCausalLM"])))
+            )),
+            Some("llama".to_string())
+        );
+        assert_eq!(
+            entry_arch(&base(
+                None,
+                None,
+                Some(cfg(None, Some(&["MiniCPMV4_6ForConditionalGeneration"])))
+            )),
+            Some("minicpmv4_6forconditionalgeneration".to_string())
+        );
+        assert_eq!(entry_arch(&base(None, None, Some(cfg(None, None)))), None);
     }
 
     #[test]

@@ -149,6 +149,60 @@ pub struct HfGgufInfo {
     pub context_length: Option<u64>,
 }
 
+/// `expand[]=safetensors` summary — the Hub's per-repo parameter
+/// histogram. `parameters` maps safetensors dtype keys to tensor-element
+/// counts (MLX/GPTQ quants pack 8 weights per U32/I32, so counts are
+/// ELEMENTS, not on-disk cells); `total` is the element sum.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct HfSafetensorsInfo {
+    #[serde(default)]
+    pub parameters: Option<std::collections::BTreeMap<String, u64>>,
+    #[serde(default)]
+    pub total: Option<u64>,
+}
+
+impl HfSafetensorsInfo {
+    /// On-disk byte estimate = Σ dtype-width × element count — exactly
+    /// what `pull` downloads (a U32-packed MLX 4-bit cell is still 4
+    /// bytes on disk). `None` when the histogram is empty or carries an
+    /// unknown dtype (never guess a size).
+    #[must_use]
+    pub fn byte_estimate(&self) -> Option<u64> {
+        let params = self.parameters.as_ref()?;
+        if params.is_empty() {
+            return None;
+        }
+        let mut total = 0u64;
+        for (dtype, count) in params {
+            total = total.checked_add(count.checked_mul(dtype_width_bytes(dtype)?)?)?;
+        }
+        Some(total)
+    }
+}
+
+/// On-disk bytes per safetensors element for the Hub's dtype keys.
+#[must_use]
+fn dtype_width_bytes(dtype: &str) -> Option<u64> {
+    Some(match dtype {
+        "F64" | "I64" | "U64" => 8,
+        "F32" | "I32" | "U32" => 4,
+        "BF16" | "F16" | "I16" | "U16" => 2,
+        "I8" | "U8" | "BOOL" | "F8_E4M3" | "F8_E5M2" => 1,
+        _ => return None,
+    })
+}
+
+/// `expand[]=config` summary — enough to label ARCH without pulling
+/// `config.json` per repo (`max_position_embeddings` is NOT part of the
+/// search expansion, so context stays a GGUF-only column).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct HfConfigSummary {
+    #[serde(default)]
+    pub architectures: Option<Vec<String>>,
+    #[serde(default)]
+    pub model_type: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct HfModelInfo {
     #[serde(default)]
@@ -867,6 +921,10 @@ pub struct SearchEntry {
     pub siblings: Vec<HfSibling>,
     #[serde(default)]
     pub gguf: Option<HfGgufInfo>,
+    #[serde(default)]
+    pub safetensors: Option<HfSafetensorsInfo>,
+    #[serde(default)]
+    pub config: Option<HfConfigSummary>,
     /// Hub format tags (`gguf`, `mlx`, `safetensors`, `awq`, `onnx`, …).
     /// MLX repos carry BOTH `mlx` and `safetensors` — callers display with
     /// most-specific-first priority, not first-match.
@@ -950,14 +1008,16 @@ impl HfClient {
 /// `awq`, `gptq`, `fp8`, `onnx`, … — case-insensitive, trimmed); the
 /// sentinels `any`/`all` drop the filter entirely so every format is
 /// browsable. An empty `query` omits `search=` (browse-most-popular).
-/// `expand[]=tags` feeds the per-row FORMAT column; `expand[]=gguf` is
-/// harmless on non-GGUF repos (field is simply absent) and keeps one
-/// code path for every format.
+/// `expand[]=tags` feeds the per-row FORMAT column; `expand[]=gguf` and
+/// `expand[]=safetensors` + `expand[]=config` fill SIZE/ARCH for GGUF and
+/// safetensors rows respectively (each is simply absent on the other
+/// format — one code path for every format, zero extra round-trips).
 #[must_use]
 pub fn search_path(query: &str, format: &str, limit: u32) -> String {
     let mut path = format!(
         "api/models?limit={limit}&sort=downloads&direction=-1\
-         &expand[]=gguf&expand[]=likes&expand[]=siblings&expand[]=tags"
+         &expand[]=gguf&expand[]=safetensors&expand[]=config\
+         &expand[]=likes&expand[]=siblings&expand[]=tags"
     );
     if !query.is_empty() {
         path.push_str("&search=");
@@ -1966,6 +2026,50 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
+    fn unit__safetensors_byte_estimate__dtype_math_and_unknown_refusal() {
+        use std::collections::BTreeMap;
+        let hist = |pairs: &[(&str, u64)]| HfSafetensorsInfo {
+            parameters: Some(
+                pairs
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), *v))
+                    .collect::<BTreeMap<_, _>>(),
+            ),
+            total: None,
+        };
+        // Plain BF16 (MiniCPM5-2B shape): 2 bytes/element.
+        assert_eq!(
+            hist(&[("BF16", 2_516_756_480)]).byte_estimate(),
+            Some(5_033_512_960)
+        );
+        // MLX 4-bit packing: histogram counts are wide-int CELLS (a
+        // 1B-param repo live-shows {BF16: 33.8M, U32: 135M} because each
+        // U32 cell packs 8 params), so on-disk bytes stay width × count:
+        // 2×33.8M + 4×135M.
+        assert_eq!(
+            hist(&[("BF16", 33_842_688), ("U32", 135_069_696)]).byte_estimate(),
+            Some(607_964_160)
+        );
+        // GPTQ shape: F16 embeddings kept + I32-packed weights.
+        assert_eq!(
+            hist(&[("F16", 803_402_992), ("I32", 497_025_024)]).byte_estimate(),
+            Some(3_594_906_080)
+        );
+        // Unknown dtype: never guess — refuse the whole estimate.
+        assert_eq!(hist(&[("BF16", 10), ("WEIRD_Q", 10)]).byte_estimate(), None);
+        // Empty histogram / absent histogram: no estimate.
+        assert_eq!(hist(&[]).byte_estimate(), None);
+        assert_eq!(
+            HfSafetensorsInfo {
+                parameters: None,
+                total: Some(1)
+            }
+            .byte_estimate(),
+            None
+        );
+    }
+
+    #[test]
     fn unit__search_path__format_filter_sentinels_and_browse() {
         // gguf lane keeps the historical filter.
         let gguf = search_path("minicpm", "gguf", 20);
@@ -1985,7 +2089,13 @@ mod tests {
         // Every lane requests the metadata the table renders from.
         for fmt in ["gguf", "any", "awq"] {
             let p = search_path("x", fmt, 5);
-            for need in ["expand[]=gguf", "expand[]=siblings", "expand[]=tags"] {
+            for need in [
+                "expand[]=gguf",
+                "expand[]=safetensors",
+                "expand[]=config",
+                "expand[]=siblings",
+                "expand[]=tags",
+            ] {
                 assert!(p.contains(need), "{fmt} missing {need}: {p}");
             }
         }
