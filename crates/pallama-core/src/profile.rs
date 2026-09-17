@@ -2213,14 +2213,18 @@ fn derive_pa_fraction(
         .mmproj_path
         .and_then(|p| std::fs::metadata(p).ok())
         .map_or(0, |m| m.len());
-    let resident_mib: i64 = ((input.model_bytes.saturating_add(mmproj)) / MIB) as i64;
+    // Probe values are MiB from real hardware/files — always inside i64.
+    let resident_mib: i64 =
+        i64::try_from(input.model_bytes.saturating_add(mmproj) / MIB).expect("MiB fits i64");
 
     // Candidate 1: geometry — only for safetensors dirs (HfMeta). The
     // GGUF-on-mistralrs lane keeps the co-tenant guard only; GGUF KV
     // sizing lives in the llamacpp arch tables.
-    let ctx = resolve_ctx(input, input.overlay, &mut Vec::new()) as u64;
+    let ctx = u64::from(resolve_ctx(input, input.overlay, &mut Vec::new()));
     let geometry_mib: Option<i64> = match input.meta {
-        crate::hfmeta::ModelMeta::Hf(hf) => hf_kv_bytes(&hf.kv, ctx, 2).map(|b| (b / MIB) as i64),
+        crate::hfmeta::ModelMeta::Hf(hf) => {
+            hf_kv_bytes(&hf.kv, ctx, 2).map(|b| i64::try_from(b / MIB).expect("MiB fits i64"))
+        }
         crate::hfmeta::ModelMeta::Gguf(_) => None,
     };
     let geometry_frac = geometry_mib
@@ -2228,7 +2232,8 @@ fn derive_pa_fraction(
 
     // Candidate 2: free-VRAM budget under a co-tenant.
     let cotenant = free > 0 && free + COTENANT_SLACK_MIB < total;
-    let budget_mib: Option<i64> = cotenant.then_some(free as i64 - resident_mib - HEADROOM_MIB);
+    let budget_mib: Option<i64> = cotenant
+        .then_some(i64::try_from(free).expect("MiB fits i64") - resident_mib - HEADROOM_MIB);
 
     let mut emit = |frac: f64, warn: String| {
         let frac = frac.clamp(0.05, 0.90);
