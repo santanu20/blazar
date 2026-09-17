@@ -985,6 +985,35 @@ pub struct FitRow {
     pub recommended_ctx_q8: u32,
 }
 
+/// Rule-6 KV ladder outcome for `bytes` of weights against `vram_bytes`:
+/// (fits at default ctx, recommended ctx, ctx with q8_0 KV). The same
+/// f16 → q8 → q4 halving the profile compiler applies, pre-download.
+fn kv_ladder(bytes: u64, vram_bytes: u64, default_ctx: u32) -> (bool, u32, u32) {
+    let kv_f16 = kv_estimate_f16(default_ctx);
+    // F105: mirror the compiler's rule-6 KV ladder (f16 -> q8 -> q4)
+    // instead of the degenerate `kv_f16.min(kv_f16 / 2)`, which only
+    // ever tested the q8 grade.
+    let fits = bytes + kv_f16 <= vram_bytes
+        || bytes + kv_f16 / 2 <= vram_bytes
+        || bytes + kv_f16 / 4 <= vram_bytes;
+    let recommended = if fits {
+        default_ctx
+    } else {
+        // shrink ctx until KV fits alongside the weights
+        let mut ctx = default_ctx;
+        while ctx > 1024 && bytes + kv_estimate_f16(ctx) > vram_bytes {
+            ctx /= 2;
+        }
+        ctx
+    };
+    // Same shrink loop with halved KV: what q8_0 KV buys (rule-6 grade).
+    let mut ctx_q8 = default_ctx;
+    while ctx_q8 > 1024 && bytes + kv_estimate_f16(ctx_q8) / 2 > vram_bytes {
+        ctx_q8 /= 2;
+    }
+    (fits, recommended, ctx_q8)
+}
+
 /// Pre-download compatibility preview (complaint #14): given a repo's
 /// sibling list, produce per-quant fit rows against the local hardware.
 /// Uses the same KV math as the profile compiler's rule 6.
@@ -1004,39 +1033,47 @@ pub fn fit_rows(siblings: &[HfSibling], vram_bytes: u64, default_ctx: u32) -> Ve
             continue;
         }
         let quant = stem.rsplit('-').next().unwrap_or("unknown").to_uppercase();
-        // KV estimate for the default ctx, assuming q8_0 KV when tight
-        // (same trigger as the compiler's rule 6).
-        let kv_f16 = kv_estimate_f16(default_ctx);
-        // F105: mirror the compiler's rule-6 KV ladder (f16 -> q8 -> q4)
-        // instead of the degenerate `kv_f16.min(kv_f16 / 2)`, which only
-        // ever tested the q8 grade.
-        let fits = bytes + kv_f16 <= vram_bytes
-            || bytes + kv_f16 / 2 <= vram_bytes
-            || bytes + kv_f16 / 4 <= vram_bytes;
-        let recommended = if fits {
-            default_ctx
-        } else {
-            // shrink ctx until KV fits alongside the weights
-            let mut ctx = default_ctx;
-            while ctx > 1024 && bytes + kv_estimate_f16(ctx) > vram_bytes {
-                ctx /= 2;
-            }
-            ctx
-        };
-        // Same shrink loop with halved KV: what q8_0 KV buys (rule-6 grade).
-        let mut ctx_q8 = default_ctx;
-        while ctx_q8 > 1024 && bytes + kv_estimate_f16(ctx_q8) / 2 > vram_bytes {
-            ctx_q8 /= 2;
-        }
+        let (fits, recommended, ctx_q8) = kv_ladder(bytes, vram_bytes, default_ctx);
         rows.push(FitRow {
             quant,
             file: s.rfilename.clone(),
             bytes,
             fits_vram: fits,
-            kv_bytes_at_default_ctx: kv_f16,
+            kv_bytes_at_default_ctx: kv_estimate_f16(default_ctx),
             recommended_ctx: recommended,
             recommended_ctx_q8: ctx_q8,
         });
+    }
+    // Safetensors lane (sglang/mistralrs): one AGGREGATE row — shards are
+    // parts of a single quantization state, unlike GGUF where each file
+    // is a separate quant choice. Same conservative KV allowance; the
+    // arch-true number is measured at serve time.
+    if rows.is_empty() {
+        let mut total: u64 = 0;
+        let mut shards = 0u32;
+        for s in siblings {
+            if !s.rfilename.to_lowercase().ends_with(".safetensors") {
+                continue;
+            }
+            if let Some(bytes) = s.lfs.as_ref().and_then(|l| l.size).or(s.size) {
+                if bytes > 0 {
+                    total = total.saturating_add(bytes);
+                    shards += 1;
+                }
+            }
+        }
+        if total > 0 {
+            let (fits, recommended, ctx_q8) = kv_ladder(total, vram_bytes, default_ctx);
+            rows.push(FitRow {
+                quant: "safetensors".to_string(),
+                file: format!("{shards} safetensors shard(s)"),
+                bytes: total,
+                fits_vram: fits,
+                kv_bytes_at_default_ctx: kv_estimate_f16(default_ctx),
+                recommended_ctx: recommended,
+                recommended_ctx_q8: ctx_q8,
+            });
+        }
     }
     rows.sort_by_key(|r| std::cmp::Reverse(r.bytes));
     rows
@@ -1962,6 +1999,72 @@ mod tests {
         let p = search_path("mini cpm+", "a&b=c", 5);
         assert!(p.contains("search=mini%20cpm%2B"), "{p}");
         assert!(p.contains("filter=a%26b%3Dc"), "{p}");
+    }
+
+    #[test]
+    fn unit__fit_rows__safetensors_aggregate_when_no_gguf() {
+        let sib = |name: &str, size: u64| HfSibling {
+            rfilename: name.to_string(),
+            size: None,
+            lfs: Some(HfLfs {
+                sha256: "x".to_string(),
+                size: Some(size),
+            }),
+        };
+        // Shards are parts of ONE quantization state: one aggregate row,
+        // bytes summed, same KV ladder as the GGUF lane.
+        let rows = fit_rows(
+            &[
+                sib("config.json", 512),
+                sib("model-00001-of-00002.safetensors", 4_000_000_000),
+                sib("model-00002-of-00002.safetensors", 2_000_000_000),
+            ],
+            24_000_000_000,
+            32_768,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].quant, "safetensors");
+        assert_eq!(rows[0].bytes, 6_000_000_000);
+        assert_eq!(rows[0].file, "2 safetensors shard(s)");
+        assert!(rows[0].fits_vram);
+    }
+
+    #[test]
+    fn unit__fit_rows__gguf_present_beats_safetensors_lane() {
+        let sib = |name: &str, size: u64| HfSibling {
+            rfilename: name.to_string(),
+            size: None,
+            lfs: Some(HfLfs {
+                sha256: "x".to_string(),
+                size: Some(size),
+            }),
+        };
+        // A repo with GGUF files is a GGUF repo: per-file rows only.
+        let rows = fit_rows(
+            &[
+                sib("model-Q4_K_M.gguf", 1_000_000_000),
+                sib("model.safetensors", 5_000_000_000),
+            ],
+            24_000_000_000,
+            32_768,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].quant, "Q4_K_M");
+    }
+
+    #[test]
+    fn unit__fit_rows__unsized_safetensors_stays_empty() {
+        // No sizes from the Hub -> nothing honest to preview.
+        let rows = fit_rows(
+            &[HfSibling {
+                rfilename: "model.safetensors".to_string(),
+                size: None,
+                lfs: None,
+            }],
+            24_000_000_000,
+            32_768,
+        );
+        assert!(rows.is_empty());
     }
 
     #[test]

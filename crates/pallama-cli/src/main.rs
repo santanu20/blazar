@@ -7586,7 +7586,7 @@ async fn fit(target: &str) -> Result<()> {
         "{:<10} {:>10} {:>8} {:>12} {:>12}  FILE",
         "QUANT", "SIZE", "FITS", "REC_CTX", "CTX@KV_Q8"
     );
-    for r in rows {
+    for r in &rows {
         println!(
             "{:<10} {:>10} {:>8} {:>12} {:>12}  {}",
             r.quant,
@@ -7596,6 +7596,13 @@ async fn fit(target: &str) -> Result<()> {
             r.recommended_ctx_q8,
             r.file
         );
+    }
+    if rows.first().is_some_and(|r| r.quant == "safetensors") {
+        println!(
+            "\n# safetensors lane: serves via sglang/mistralrs (`pallama engine install --kind sglang`) — llamacpp cannot load it; SIZE is the full shard set and KV is arch-dependent, measured at serve"
+        );
+    } else if rows.is_empty() {
+        println!("\n# no sized GGUF or safetensors weights in this repo — nothing to preview");
     }
     Ok(())
 }
