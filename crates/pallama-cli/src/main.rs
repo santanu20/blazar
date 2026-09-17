@@ -797,7 +797,8 @@ async fn ensure_run_model(name: &str) -> Result<String> {
     if d.db_file().is_file() {
         if let Ok(store) = Store::open(&d) {
             let resolved = store.resolve_model_name(name);
-            if store.get_model(&resolved).is_ok_and(|r| r.is_some()) {
+            if let Ok(Some(row)) = store.get_model(&resolved) {
+                offer_missing_engine(&d, &row).await;
                 return Ok(resolved);
             }
             // Miss: repo refs and catalog short names auto-pull
@@ -809,7 +810,8 @@ async fn ensure_run_model(name: &str) -> Result<String> {
                 // name FIRST: pulling over an existing row would
                 // replace + prune it (data hazard, not a fetch).
                 let local = pallama_runtime::hf::registry_name(&t.repo);
-                if store.get_model(&local).is_ok_and(|r| r.is_some()) {
+                if let Ok(Some(row)) = store.get_model(&local) {
+                    offer_missing_engine(&d, &row).await;
                     return Ok(local);
                 }
                 println!(
@@ -821,6 +823,7 @@ async fn ensure_run_model(name: &str) -> Result<String> {
                 if already {
                     println!("already present as {} — starting", row.name);
                 }
+                offer_missing_engine(&d, &row).await;
                 return Ok(row.name);
             }
             return Ok(resolved);
@@ -1342,6 +1345,189 @@ fn routed_engine_lane(
         Ok(Some((tag, _))) => Ok(tag),
         Ok(None) => Ok(g_tag.clone()),
         Err(teach) => Err(teach),
+    }
+}
+
+/// The command that installs `kind` — llamacpp rides the `engine
+/// update` lane (install --kind has no llamacpp arm).
+fn engine_install_command(kind: pallama_core::engine_kind::EngineKind) -> String {
+    use pallama_core::engine_kind::EngineKind;
+    match kind {
+        EngineKind::LlamaCpp => "pallama engine update".to_string(),
+        other => format!("pallama engine install --kind {other}"),
+    }
+}
+
+/// One line of the just-in-time install menu: what the kind is, what
+/// it costs, and why you'd want it. Sizes are disclosures, not quotes.
+fn engine_offer_line(kind: pallama_core::engine_kind::EngineKind) -> String {
+    use pallama_core::engine_kind::EngineKind;
+    match kind {
+        EngineKind::Sglang => {
+            "sglang (~6 GiB, Linux + NVIDIA) — best quality + batching for safetensors".to_string()
+        }
+        EngineKind::MistralRs => {
+            "mistral.rs (~0.8 GiB, any platform) — fastest cold boot, GGUF + safetensors"
+                .to_string()
+        }
+        EngineKind::LlamaCpp => {
+            "llamacpp (~0.2-0.7 GiB via engine update) — the GGUF default lane".to_string()
+        }
+    }
+}
+
+async fn install_missing_kind(
+    d: &PallamaDirs,
+    kind: pallama_core::engine_kind::EngineKind,
+) -> Result<()> {
+    use pallama_core::engine_kind::EngineKind;
+    match kind {
+        EngineKind::Sglang => engine_install_sglang(d, None).await,
+        EngineKind::MistralRs => engine_install_mistralrs(d, None).await,
+        EngineKind::LlamaCpp => engine_update(d, None, false, false).await,
+    }
+}
+
+/// What stands between `row` and a serving lane right now.
+enum LaneState {
+    /// A lane already serves the model — nothing to offer.
+    Served,
+    /// Missing kinds (best first) plus the teaching text for the
+    /// current failure. Empty kinds = installing nothing helps
+    /// (unknown pin); the text still teaches.
+    Missing(Vec<pallama_core::engine_kind::EngineKind>, String),
+}
+
+fn lane_state_for(d: &PallamaDirs, row: &pallama_core::store::ModelRow) -> LaneState {
+    use pallama_core::engine_kind::{EngineKind, LaneError};
+    let Ok(store) = Store::open(d) else {
+        return LaneState::Served;
+    };
+    let Ok(engine_rows) = store.list_engines() else {
+        return LaneState::Served;
+    };
+    let installed: Vec<(String, EngineKind)> = engine_rows
+        .iter()
+        .map(|r| (r.tag.clone(), r.kind))
+        .collect();
+    let cfg = pallama_core::Config::load(d).unwrap_or_default();
+    // No engine at all: the product's default lane is llamacpp and
+    // `engine update` is its installer — same offer, one candidate.
+    match engine_rows.iter().find(|r| r.active) {
+        None => LaneState::Missing(
+            vec![EngineKind::LlamaCpp],
+            "no engine installed — pallama engine update".to_string(),
+        ),
+        Some(active) => {
+            let overlay = cfg.overlay_for(&row.name);
+            let pin = overlay.engine.as_deref();
+            let safetensors = std::path::Path::new(&row.path).is_dir();
+            match pallama_core::engine_kind::serving_lane_typed(
+                cfg.engine_routing.mode,
+                cfg.engine_routing.policy,
+                pin,
+                safetensors,
+                active.kind,
+                &installed,
+            ) {
+                Ok(_) => LaneState::Served,
+                Err(e @ (LaneError::PinKindMissing { .. } | LaneError::FormatUnserved { .. })) => {
+                    LaneState::Missing(e.missing_kinds(cfg.engine_routing.policy), e.to_string())
+                }
+                Err(e) => LaneState::Missing(Vec::new(), e.to_string()),
+            }
+        }
+    }
+}
+
+/// Just-in-time engine install at pull/run: when the model the user
+/// just asked for has no serving lane, ask once — on a real TTY —
+/// whether to install the missing engine kind(s) now, then continue.
+/// Piped/CI stdin and `PALLAMA_NO_PROMPT=1` print the teaching line
+/// and return without blocking; the daemon's request paths never reach
+/// this (they serve whatever is installed and teach via errors).
+async fn offer_missing_engine(d: &PallamaDirs, row: &pallama_core::store::ModelRow) {
+    use std::io::IsTerminal as _;
+
+    let (missing, teach) = match lane_state_for(d, row) {
+        LaneState::Served => return,
+        LaneState::Missing(kinds, teach) => (kinds, teach),
+    };
+    if missing.is_empty() {
+        eprintln!("{teach}");
+        return;
+    }
+    if !std::io::stdin().is_terminal() || std::env::var_os("PALLAMA_NO_PROMPT").is_some() {
+        eprintln!("{teach}");
+        return;
+    }
+    // One prompt per invocation; EOF or an unrecognised answer = skip.
+    let picked = if missing.len() == 1 {
+        eprintln!();
+        eprintln!("this model needs an engine that is not installed:");
+        eprintln!("  {}", engine_offer_line(missing[0]));
+        eprint!("install it now? [y/N] ");
+        let _ = std::io::stderr().flush();
+        let yes = read_menu_line().is_some_and(|a| a.eq_ignore_ascii_case("y"));
+        if yes {
+            missing.clone()
+        } else {
+            Vec::new()
+        }
+    } else {
+        eprintln!();
+        eprintln!("this model's format has no serving engine installed:");
+        eprintln!("  1) {}  [recommended]", engine_offer_line(missing[0]));
+        eprintln!("  2) {}", engine_offer_line(missing[1]));
+        eprintln!("  3) both");
+        eprintln!("  4) skip — print the install commands instead");
+        eprint!("choose [1-4]: ");
+        let _ = std::io::stderr().flush();
+        match read_menu_line().as_deref() {
+            Some("1") => vec![missing[0]],
+            Some("2") => vec![missing[1]],
+            Some("3") => missing.clone(),
+            _ => Vec::new(),
+        }
+    };
+    if picked.is_empty() {
+        eprintln!("skipped — when you are ready:");
+        for kind in &missing {
+            eprintln!("  {}", engine_install_command(*kind));
+        }
+        return;
+    }
+    install_offer_kinds(d, row, &picked).await;
+}
+
+/// Read one trimmed stdin line; `None` on EOF (Ctrl-C/Ctrl-D = skip).
+fn read_menu_line() -> Option<String> {
+    use std::io::BufRead as _;
+    let mut line = String::new();
+    let n = std::io::stdin().lock().read_line(&mut line).ok()?;
+    (n > 0).then(|| line.trim().to_string())
+}
+
+/// Run the chosen installs sequentially, then report the lane truth —
+/// the fresh re-check (not the install result) is what the user reads.
+async fn install_offer_kinds(
+    d: &PallamaDirs,
+    row: &pallama_core::store::ModelRow,
+    kinds: &[pallama_core::engine_kind::EngineKind],
+) {
+    for kind in kinds {
+        if let Err(e) = install_missing_kind(d, *kind).await {
+            eprintln!("engine install failed: {e:#}");
+            eprintln!(
+                "your model is safe in the store — retry with: {}",
+                engine_install_command(*kind)
+            );
+            return;
+        }
+    }
+    match lane_state_for(d, row) {
+        LaneState::Served => eprintln!("engine ready — this model now has a serving lane"),
+        LaneState::Missing(_, teach) => eprintln!("{teach}"),
     }
 }
 
@@ -3657,6 +3843,9 @@ async fn pull(target: &str) -> Result<()> {
             row.path
         );
     }
+    // A model with no serving lane is half-installed: offer the
+    // missing engine now (no-op when a lane already serves it).
+    offer_missing_engine(&dirs(), &row).await;
     Ok(())
 }
 
