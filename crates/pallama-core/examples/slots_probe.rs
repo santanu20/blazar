@@ -1,6 +1,6 @@
 //! Throwaway probe: compile the real qwen3.5-9b profile with the live
 //! vulkan census + real mmproj and print slots + warnings.
-//! Run: `cargo run --example slots_probe -p pallama-core`
+//! Run: `cargo run --example slots_probe -p pallama-core -- <model.gguf> <mmproj.gguf>`
 use pallama_core::{
     gguf::read_metadata_file,
     profile::{compile, ProfileInput, TuningOverrides},
@@ -9,9 +9,18 @@ use pallama_core::{
 use std::collections::BTreeSet;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let model = "~/.local/share/pallama/models/Qwen3.5-9B-Q4_K_M.gguf";
-    let mmproj = "~/.local/share/pallama/models/mmproj-F16.gguf";
-    let gguf = read_metadata_file(std::path::Path::new(model))?;
+    let mut args = std::env::args().skip(1);
+    let (model, mmproj) = match (args.next(), args.next()) {
+        (Some(m), Some(p)) => (m, p),
+        _ => {
+            eprintln!(
+                "usage: cargo run --example slots_probe -p pallama-core -- \
+                 <model.gguf> <mmproj.gguf>"
+            );
+            std::process::exit(2);
+        }
+    };
+    let gguf = read_metadata_file(std::path::Path::new(&model))?;
     println!("train ctx = {:?}", gguf.context_length);
     let hw = Hardware {
         physical_cores: 16,
