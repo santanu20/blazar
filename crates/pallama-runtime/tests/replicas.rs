@@ -114,7 +114,7 @@ fn supervisor(dirs: &PallamaDirs, replicas: Option<u32>) -> Arc<Supervisor> {
         hw,
         Arc::new(engine),
     );
-    s.load_timeout = Duration::from_secs(8);
+    s.load_timeout_secs = Some(8);
     s.shutdown_grace = Duration::from_secs(2);
     Arc::new(s)
 }

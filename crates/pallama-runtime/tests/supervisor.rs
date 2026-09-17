@@ -125,7 +125,7 @@ fn supervisor(dirs: &PallamaDirs, config: Config, gpu: bool) -> Arc<Supervisor> 
         Arc::new(engine),
     );
     // Fast test timings.
-    s.load_timeout = Duration::from_secs(4);
+    s.load_timeout_secs = Some(4);
     s.shutdown_grace = Duration::from_secs(2);
     s.circuit_window = Duration::from_secs(4);
     s.max_restarts = 2;
@@ -232,7 +232,8 @@ async fn regression__dropped_loader_future_does_not_wedge_next_ensure() {
             _ = &mut fut => { /* load finished instantly — pin vacuous */ }
         }
     } // fut dropped HERE = the client-disconnect cancellation
-    let second = tokio::time::timeout(sup.load_timeout * 3, sup.ensure("m1")).await;
+    let budget = Duration::from_secs(sup.load_timeout_secs.expect("helper pins a fast load timeout")) * 3;
+    let second = tokio::time::timeout(budget, sup.ensure("m1")).await;
     let ep = second
         .expect("subsequent ensure wedged after dropped loader")
         .expect("ensure");
@@ -349,7 +350,7 @@ async fn integration__ladder__sleep_then_evict() {
         Arc::new(LlamaCppEngine::new(stub_manifest())),
     );
     s.reaper_interval = Duration::from_millis(200);
-    s.load_timeout = Duration::from_secs(4);
+    s.load_timeout_secs = Some(4);
     s.shutdown_grace = Duration::from_secs(2);
     let sup = Arc::new(s);
     let _reaper = sup.spawn_reaper();
@@ -454,7 +455,7 @@ async fn integration__crash__spawn_phase_death_counts_toward_circuit() {
         hw,
         Arc::new(engine),
     );
-    s.load_timeout = Duration::from_secs(3);
+    s.load_timeout_secs = Some(3);
     s.shutdown_grace = Duration::from_secs(2);
     s.circuit_window = Duration::from_secs(30);
     s.max_restarts = 2;
@@ -573,7 +574,7 @@ async fn integration__load_timeout__never_healthy_stub() {
         Arc::new(engine),
     );
     let mut s = s;
-    s.load_timeout = Duration::from_secs(1);
+    s.load_timeout_secs = Some(1);
     let sup = Arc::new(s);
     let err = sup.ensure("m1").await.unwrap_err();
     assert!(
@@ -610,7 +611,7 @@ async fn integration__ensure_fail_fast__child_death_beats_load_timeout() {
         Arc::new(engine),
     );
     let mut s = s;
-    s.load_timeout = Duration::from_secs(30); // 2 attempts = 60s without the race
+    s.load_timeout_secs = Some(30); // 2 attempts = 60s without the race
     s.shutdown_grace = Duration::from_secs(2);
     let sup = Arc::new(s);
     let t0 = Instant::now();
