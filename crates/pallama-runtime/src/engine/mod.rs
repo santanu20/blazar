@@ -42,6 +42,15 @@ fn engine_dir_bytes(p: &Path) -> u64 {
     n
 }
 pub const LOCAL_TAG: &str = "local";
+
+/// Error-context marker for the PROBE phase of engine registration
+/// (binary discovery + version probe). The asset-install lanes match it
+/// to decide an extracted dir is unusable garbage — a SIGILL-class
+/// instruction mismatch or a missing server binary — and remove it
+/// instead of orphaning hundreds of MB (`engines/b11005-cuda` lesson).
+/// Store-phase failures never carry it: a store row may already
+/// reference the dir, so deleting it would desync dir and row.
+pub const ENGINE_PROBE_FAILED: &str = "engine probe failed";
 /// Wait between asset-list re-fetches while a fresh release finishes
 /// uploading (observed: full asset matrix lands ~75-120 s after publish).
 pub const ASSET_UPLOAD_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(20);
@@ -646,7 +655,7 @@ impl EngineManager {
             let _ = std::fs::remove_dir_all(&dir);
             return Err(e);
         }
-        self.register_engine(
+        self.register_or_clean(
             &dir,
             &release.tag_name,
             &pick.label,
@@ -703,7 +712,7 @@ impl EngineManager {
                 pick.name
             );
         }
-        self.register_engine(
+        self.register_or_clean(
             &dir,
             &release.tag_name,
             &pick.label,
@@ -742,7 +751,7 @@ impl EngineManager {
             let _ = std::fs::remove_dir_all(&dir); // F88: no orphan dir
             return Err(e);
         }
-        self.register_engine(
+        self.register_or_clean(
             &dir,
             &tag,
             &format!("pip:sglang=={version}"),
@@ -844,15 +853,17 @@ impl EngineManager {
         vendor_hint: manifest::Vendor,
     ) -> Result<EngineRow> {
         let server = match kind {
-            EngineKind::LlamaCpp => find_server(dir)?,
-            EngineKind::MistralRs => find_engine_binary(dir, &["mistralrs", "mistralrs.exe"])?,
+            EngineKind::LlamaCpp => find_server(dir),
+            EngineKind::MistralRs => find_engine_binary(dir, &["mistralrs", "mistralrs.exe"]),
             // The install lane writes the shim; anything else is a
             // hand-copied dir, and the shim name is the contract.
-            EngineKind::Sglang => find_engine_binary(dir, &["sglang-server"])?,
-        };
+            EngineKind::Sglang => find_engine_binary(dir, &["sglang-server"]),
+        }
+        .map_err(|e| e.context(ENGINE_PROBE_FAILED))?;
         make_executable(&server);
 
-        let m = manifest::probe_kind(&server, tag, &kind)?;
+        let m = manifest::probe_kind(&server, tag, &kind)
+            .map_err(|e| e.context(ENGINE_PROBE_FAILED))?;
         match kind {
             EngineKind::LlamaCpp => {
                 if m.devices.is_empty()
@@ -923,6 +934,33 @@ impl EngineManager {
             ..row
         };
         Ok(row)
+    }
+
+    /// Register a dir the caller JUST extracted for this install, removing
+    /// the dir when the probe phase rejects the binary (unusable asset:
+    /// SIGILL-class instruction mismatch, missing server binary) — F88's
+    /// no-orphan contract extended through the register tail. Store-phase
+    /// failures keep the dir: a store row may already reference it.
+    fn register_or_clean(
+        &self,
+        dir: &Path,
+        tag: &str,
+        asset_label: &str,
+        sha256: &str,
+        kind: EngineKind,
+    ) -> Result<EngineRow> {
+        match self.register_engine(dir, tag, asset_label, sha256, kind) {
+            Ok(row) => Ok(row),
+            Err(e) => {
+                let probe_class = e
+                    .chain()
+                    .any(|c| c.to_string().contains(ENGINE_PROBE_FAILED));
+                if probe_class {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Activate an installed tag by name.
@@ -1382,5 +1420,86 @@ mod verify_tests {
             t0.elapsed() < std::time::Duration::from_secs(5),
             "probe must return at roughly the budget, not the child lifetime"
         );
+    }
+
+    /// register_or_clean pins: an unusable binary (exec-format /
+    /// SIGILL-class probe failure) must take its whole engine dir with
+    /// it — the engines/b11005-cuda 927 MiB orphan lesson — while a
+    /// healthy dir registers normally. Linux-only: the fixtures are
+    /// /bin/sh scripts.
+    #[cfg(target_os = "linux")]
+    mod register_or_clean_tests {
+        use super::super::*;
+        use super::fake_bin;
+        use pallama_core::engine_kind::EngineKind;
+
+        fn manager_in(tmp: &tempfile::TempDir) -> EngineManager {
+            EngineManager {
+                dirs: pallama_core::PallamaDirs {
+                    config_dir: tmp.path().join("cfg"),
+                    data_dir: tmp.path().join("data"),
+                },
+                gh: GhClient::with_base("http://127.0.0.1", None).expect("gh client"),
+                bus: crate::events::EventBus::default(),
+                asset_override: "auto".into(),
+            }
+        }
+
+        /// A llama-server that satisfies the probe contract: `--version`
+        /// prints a `version:` line with a build number, `--help` exits 0.
+        fn healthy_server(dir: &std::path::Path) {
+            fake_bin(
+                dir,
+                "llama-server",
+                "case \"$1\" in --version) echo 'version: 4242 (stub)';; --help) echo 'usage: stub';; esac; exit 0",
+            );
+        }
+
+        #[test]
+        fn unit__register_or_clean__probe_failure_removes_the_dir() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mgr = manager_in(&tmp);
+            let dir = tmp.path().join("data/engines/b1-cuda");
+            // Garbage bytes with the +x bit: spawn fails at exec — the
+            // same register-tail failure class as a SIGILL'd asset.
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("llama-server"), b"not an elf").unwrap();
+            make_executable(&dir.join("llama-server"));
+            let err = mgr
+                .register_or_clean(
+                    &dir,
+                    "b1-cuda",
+                    "ubuntu-cuda-12.8-x64",
+                    "x",
+                    EngineKind::LlamaCpp,
+                )
+                .expect_err("garbage binary must fail the probe");
+            assert!(
+                format!("{err:#}").contains(ENGINE_PROBE_FAILED),
+                "probe-class failures carry the marker: {err:#}"
+            );
+            assert!(!dir.exists(), "probe-failed engine dir must be removed");
+        }
+
+        #[test]
+        fn unit__register_or_clean__healthy_stub_registers_and_keeps_dir() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mgr = manager_in(&tmp);
+            let dir = tmp.path().join("data/engines/b2-cuda");
+            std::fs::create_dir_all(&dir).unwrap();
+            healthy_server(&dir);
+            let row = mgr
+                .register_or_clean(
+                    &dir,
+                    "b2-cuda",
+                    "ubuntu-cuda-12.8-x64",
+                    "x",
+                    EngineKind::LlamaCpp,
+                )
+                .expect("healthy stub registers");
+            assert_eq!(row.tag, "b2-cuda");
+            assert!(dir.exists(), "healthy engine dir survives");
+            assert!(dir.join("llama-server").exists(), "binary survives");
+        }
     }
 }
