@@ -847,7 +847,10 @@ pub struct Supervisor {
     /// predates a failed boot.
     census_cache: std::sync::Mutex<Option<(Instant, Hardware)>>,
     // Test knobs (prod defaults from config).
-    pub load_timeout: Duration,
+    /// User-set health-gate budget (`model_load_timeout_secs`), `None` =
+    /// unset. Resolved PER KIND at the health gate — see
+    /// [`Supervisor::resolved_load_timeout`].
+    pub load_timeout_secs: Option<u64>,
     pub shutdown_grace: Duration,
     pub reaper_interval: Duration,
     pub circuit_window: Duration,
@@ -884,6 +887,32 @@ struct ChildAuth {
 }
 
 impl Supervisor {
+    /// Health-gate budget for a spawning child when the user leaves
+    /// `model_load_timeout_secs` unset. Fits precompiled loaders
+    /// (llamacpp/mistralrs) on a warm page cache.
+    const DEFAULT_MODEL_LOAD_TIMEOUT_SECS: u64 = 180;
+
+    /// Unset-budget override for the sglang lane: a first-ever spawn JITs
+    /// every triton kernel into a cold scoped cache, which legitimately
+    /// runs past the generic 180 s (measured cold >180 s vs warm ~60-90 s
+    /// on the same box). Killing at 180 s discarded real progress each
+    /// attempt, so the lane could never bootstrap.
+    const SGLANG_MODEL_LOAD_TIMEOUT_SECS: u64 = 600;
+
+    /// Effective health-gate budget for a lane: the user's explicit
+    /// `model_load_timeout_secs` always wins; otherwise the per-kind
+    /// default above.
+    fn resolved_load_timeout(
+        user: Option<u64>,
+        kind: pallama_core::engine_kind::EngineKind,
+    ) -> Duration {
+        let fallback = match kind {
+            pallama_core::engine_kind::EngineKind::Sglang => Self::SGLANG_MODEL_LOAD_TIMEOUT_SECS,
+            _ => Self::DEFAULT_MODEL_LOAD_TIMEOUT_SECS,
+        };
+        Duration::from_secs(user.unwrap_or(fallback))
+    }
+
     #[allow(clippy::duration_suboptimal_units)] // plain second counts
     pub fn new(
         dirs: PallamaDirs,
@@ -899,9 +928,7 @@ impl Supervisor {
             engine_failures: std::sync::Mutex::new(std::collections::HashSet::new()),
             measured: std::sync::Mutex::new(MeasuredTick::default()),
             census_cache: std::sync::Mutex::new(None),
-            load_timeout: config
-                .model_load_timeout_secs
-                .map_or_else(|| Duration::from_secs(3 * 60), Duration::from_secs),
+            load_timeout_secs: config.model_load_timeout_secs,
             shutdown_grace: Duration::from_secs(10),
             reaper_interval: Duration::from_secs(10),
             circuit_window: Duration::from_secs(60),
@@ -1958,7 +1985,10 @@ impl Supervisor {
         endpoint: &Endpoint,
         child: &mut ChildHandle,
     ) -> (anyhow::Result<()>, bool) {
-        let mut health = Box::pin(engine.health_check(endpoint, self.load_timeout));
+        let mut health = Box::pin(engine.health_check(
+            endpoint,
+            Supervisor::resolved_load_timeout(self.load_timeout_secs, engine.kind()),
+        ));
         let mut liveness = Box::pin(async {
             loop {
                 if let Ok(Some(status)) = child.try_status() {
@@ -4104,6 +4134,34 @@ mod routing_tests {
     use super::*;
     use crate::engine::manifest::Manifest;
     use pallama_core::{ModelOverride, Profile};
+
+    #[test]
+    fn unit__resolved_load_timeout__per_kind_default_and_user_pin() {
+        use pallama_core::engine_kind::EngineKind as K;
+        use std::time::Duration as D;
+        // Unset: per-kind defaults (sglang's cold JIT lane gets headroom;
+        // precompiled lanes keep the tight 180 s).
+        assert_eq!(
+            Supervisor::resolved_load_timeout(None, K::Sglang),
+            D::from_secs(600)
+        );
+        assert_eq!(
+            Supervisor::resolved_load_timeout(None, K::LlamaCpp),
+            D::from_secs(180)
+        );
+        assert_eq!(
+            Supervisor::resolved_load_timeout(None, K::MistralRs),
+            D::from_secs(180)
+        );
+        // User-set pins EVERY lane — the explicit knob wins, never
+        // silently widened by the per-kind fallback.
+        for kind in [K::Sglang, K::LlamaCpp, K::MistralRs] {
+            assert_eq!(
+                Supervisor::resolved_load_timeout(Some(45), kind),
+                D::from_secs(45)
+            );
+        }
+    }
 
     #[test]
     fn unit__read_model_meta__wrong_lane_pairs_teach_the_engine_remedy() {

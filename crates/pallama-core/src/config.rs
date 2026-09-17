@@ -218,9 +218,10 @@ pub struct Config {
     pub warm_peg: WarmPeg,
 
     /// Health-check budget for a spawning engine child (`model_load_timeout`).
-    /// Default 180 s fits precompiled llamacpp/mistral.rs loads; raise it for
-    /// first-ever JIT lanes (a cold sglang quantized spawn — marlin repack +
-    /// CUDA-graph capture — can exceed 180 s on slow boxes).
+    /// When unset, per-kind defaults apply: 180 s (precompiled llamacpp /
+    /// mistral.rs loads) and 600 s for sglang, whose first-ever spawn JITs
+    /// every triton kernel into a cold cache and can legitimately exceed
+    /// 180 s. Setting this value pins ALL lanes to it.
     pub model_load_timeout_secs: Option<u64>,
 
     /// Per-request engine routing (the `[engine_routing]` table). `manual`
