@@ -2005,10 +2005,45 @@ impl Config {
         } else {
             raw.to_string()
         };
+        // Removed knobs strip IN MEMORY (same contract as the api_keys
+        // migration above): an old config line must never lock the whole
+        // daemon out with an unknown-field error after an upgrade —
+        // while genuinely-unknown keys (typos) still fail loud.
+        let stripped = Self::strip_removed_knobs(&raw)?;
         let cfg: Config =
-            toml::from_str(&raw).map_err(|e| CoreError::Config(format!("parse: {e}")))?;
+            toml::from_str(&stripped).map_err(|e| CoreError::Config(format!("parse: {e}")))?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Config knobs deleted by policy (§ backwards-compat: NONE). Each entry
+    /// is stripped at load with a warning instead of hard-failing the whole
+    /// config — an upgraded binary must never lock the daemon out over a
+    /// line the user never touched. Unknown keys NOT in this list stay hard
+    /// errors (typo catching).
+    const REMOVED_KNOBS: &[&str] = &["auto_restart_engine_switch"];
+
+    /// Strip [`REMOVED_KNOBS`] from a raw config document, warning once per
+    /// stripped key. Parse errors still surface (the document must be valid
+    /// TOML before stripping).
+    fn strip_removed_knobs(raw: &str) -> CoreResult<String> {
+        let mut table: toml::Table =
+            toml::from_str(raw).map_err(|e| CoreError::Config(format!("parse: {e}")))?;
+        let mut removed: Vec<&str> = Vec::new();
+        for knob in Self::REMOVED_KNOBS {
+            if table.remove(*knob).is_some() {
+                removed.push(knob);
+            }
+        }
+        if removed.is_empty() {
+            return Ok(raw.to_string());
+        }
+        tracing::warn!(
+            target: "pallama::config",
+            "removed knob(s) ignored: {} — deleted in this version; persist the canonical form with `pallama migrate`",
+            removed.join(", ")
+        );
+        toml::to_string(&table).map_err(|e| CoreError::Config(format!("serialize: {e}")))
     }
 
     pub fn to_toml(&self) -> CoreResult<String> {
@@ -3157,6 +3192,36 @@ mod tests {
     #[test]
     fn unit__retired_pins__default_config_has_none() {
         assert!(Config::default().retired_default_pins().is_empty());
+    }
+
+    #[test]
+    fn unit__strip_removed_knobs__removed_key_loads_instead_of_locking_out() {
+        // The exact shape of every config written while the knob lived:
+        // an upgraded binary must load it (warn + strip), never deny.
+        let raw = "port = 11435\nauto_restart_engine_switch = false\n";
+        let cfg = Config::from_toml(raw).expect("removed knob must not lock out load");
+        assert_eq!(cfg.port, 11435);
+        let stripped = Config::strip_removed_knobs(raw).expect("strip");
+        assert!(
+            !stripped.contains("auto_restart_engine_switch"),
+            "{stripped}"
+        );
+        assert!(stripped.contains("port = 11435"), "{stripped}");
+    }
+
+    #[test]
+    fn unit__strip_removed_knobs__unknown_key_stays_hard_error() {
+        // Typo catching survives the strip lane: anything not in
+        // REMOVED_KNOBS is still a load failure.
+        let err = Config::from_toml("port = 11435\nnot_a_real_knob = true\n")
+            .expect_err("unknown keys must stay loud");
+        assert!(err.to_string().contains("not_a_real_knob"), "{err:#}");
+    }
+
+    #[test]
+    fn unit__strip_removed_knobs__clean_config_passes_through_unchanged() {
+        let raw = "port = 11435\ndefault_ctx = 4096\n";
+        assert_eq!(Config::strip_removed_knobs(raw).expect("strip"), raw);
     }
 
     #[test]
