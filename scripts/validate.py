@@ -4571,79 +4571,97 @@ def phase_behavior() -> None:
         )
         order[tag] = (time.time(), st)
 
-    def _hold_slot() -> None:
-        # Streaming holder: on a fast GPU a non-streamed 0.5B generation
-        # finishes sub-second (early EOS), and the 0.2s ps poller can miss
-        # the whole in_flight window (seal2 flake). The streamed drain holds
-        # the slot for the full token budget, making queued=True reliable.
-        chat(
-            "Write the numbers from 1 to 300, one per line.",
-            stream=True,
-            extra={"max_tokens": 1500},
-            timeout=300,
-        )
+    def _hold_slot(ev: threading.Event | None = None) -> None:
+        # Streaming holder on a raw socket. Two flake classes died here:
+        # (1) max_tokens is a CAP, not a floor — a 0.5B base model can EOS
+        # at 13 tokens (65ms stream), and the old 0.2s ps poller could
+        # never catch that window (seal2/sweep-9/sweep-11 flakes), and
+        # (2) a thread-per-request holder can starve on the GIL behind the
+        # main thread's poll loop for the whole 120s spin (observed live:
+        # request fired exactly at each join()). Instead the holder
+        # signals `ev` on the FIRST response byte = slot acquired and
+        # generating, so the choreography fires inside the generation
+        # window (single-digit ms) instead of racing a poller against it.
+        import socket
 
-    def _slot_busy() -> bool:
-        rows = [
-            r
-            for r in ps_rows()
-            if str(ps_field(r, "name", "model") or "").split(":")[0] == MODEL
-        ]
-        if rows and int(row_inflight(rows[0]) or 0) >= 1:
-            return True
-        # R2-30: a streamed holder arriving while the engine respawns is HELD
-        # at the gateway — by design it does not count as ps in_flight (see
-        # the slots-queue lane), so an in_flight-only poll is blind to it and
-        # the 120s spins exhaust (sweep-9 priority / sweep-11 deadline
-        # flakes). The pallama_queue_depth gauge ("waiting requests",
-        # gateway queue) sees held requests; single-model daemon here, so the
-        # global gauge is this model's queue.
+        body = json.dumps(
+            {
+                "model": MODEL,
+                "stream": True,
+                "max_tokens": 1500,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Write the numbers from 1 to 300, one per line.",
+                    }
+                ],
+            }
+        ).encode()
+        head = (
+            f"POST /v1/chat/completions HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{PORT}\r\n"
+            f"content-type: application/json\r\n"
+            f"content-length: {len(body)}\r\n\r\n"
+        ).encode()
+        s = None
         try:
-            _, _, raw = http("GET", "/metrics")
-        except Exception:
-            return False
-        m = re.search(rb"^pallama_queue_depth (\d+)", raw, re.M)
-        return bool(m) and int(m.group(1)) >= 1
+            s = socket.create_connection(("127.0.0.1", PORT), timeout=30)
+            s.sendall(head + body)
+            s.settimeout(300)
+            buf = b""
+            while b"[DONE]" not in buf:  # SSE terminator = stream end
+                r = s.recv(4096)
+                if not r:  # server closed (e.g. error responses)
+                    break
+                buf += r
+                if (
+                    ev is not None
+                    and not ev.is_set()
+                    and buf.startswith(b"HTTP/1.1 200")
+                ):
+                    # response bytes flowing on a 200 = admitted, generating;
+                    # an error status must NOT release the choreography
+                    ev.set()
+        except OSError:
+            pass
+        finally:
+            if s is not None:
+                try:
+                    s.close()
+                except OSError:
+                    pass
 
-    holder = threading.Thread(target=_hold_slot)
+    admitted = threading.Event()
+    holder = threading.Thread(target=_hold_slot, args=(admitted,))
     holder.start()
-    queued = False
-    for _attempt in range(2):
-        spin = time.time() + 120
-        while time.time() < spin and not _slot_busy():
-            time.sleep(0.2)
-        queued = _slot_busy()
-        if queued:
-            break
-        # Holder may finish before ps catches it on a fast box: re-hold
-        # once and retry the busy detection (check below still asserts
-        # queued=True, so this cannot mask a real ordering failure).
+    if not admitted.wait(30):
+        boundary(
+            "behavior",
+            "x-pallama-priority: high admitted before queued low",
+            "holder never acquired the slot within 30s (engine unavailable)",
+        )
         holder.join(timeout=300)
-        holder = threading.Thread(target=_hold_slot)
-        holder.start()
-    t_low = threading.Thread(target=_pri_track, args=("low", "low", 512))
-    t_high = threading.Thread(target=_pri_track, args=("high", "high", 5))
-    if queued:
+    else:
+        t_low = threading.Thread(target=_pri_track, args=("low", "low", 512))
+        t_high = threading.Thread(target=_pri_track, args=("high", "high", 5))
+        # Near-zero gap: with the holder confirmed generating, BOTH requests
+        # must land in the gateway queue together for priority to reorder
+        # them. A long gap lets the fast holder finish first, low starts
+        # running, and a running request can never be reordered.
         t_low.start()
-        # Near-zero gap: with the holder confirmed busy (queued=True), BOTH
-        # requests must land in the gateway queue together for priority to
-        # reorder them. A long gap lets the fast holder finish first, low
-        # starts running, and a running request can never be reordered.
         time.sleep(0.05)
         t_high.start()
-    holder.join(timeout=300)
-    if queued:
+        holder.join(timeout=300)
         t_low.join(timeout=300)
         t_high.join(timeout=300)
-    check(
-        "behavior",
-        "x-pallama-priority: high admitted before queued low",
-        queued
-        and order.get("low", (0.0, 0))[1] == 200
-        and order.get("high", (0.0, 0))[1] == 200
-        and order["high"][0] < order["low"][0],
-        f"queued={queued} low={order.get('low')} high={order.get('high')}",
-    )
+        check(
+            "behavior",
+            "x-pallama-priority: high admitted before queued low",
+            order.get("low", (0.0, 0))[1] == 200
+            and order.get("high", (0.0, 0))[1] == 200
+            and order["high"][0] < order["low"][0],
+            f"low={order.get('low')} high={order.get('high')}",
+        )
 
     # deadline accounting: a request admitted past its deadline lands in
     # pallama_slo_deadline_exceeded_total (or is 503-rejected — both honor SLO).
@@ -4654,20 +4672,10 @@ def phase_behavior() -> None:
 
     slo_before = _slo_counter()
     tight: dict[str, int] = {}
-    holder2 = threading.Thread(target=_hold_slot)
+    admitted2 = threading.Event()
+    holder2 = threading.Thread(target=_hold_slot, args=(admitted2,))
     holder2.start()
-    for _attempt in range(2):
-        spin = time.time() + 120
-        while time.time() < spin and not _slot_busy():
-            time.sleep(0.2)
-        if _slot_busy():
-            break
-        # Same fast-box race as the priority block above: retry the hold
-        # once when the holder outlived the ps polling window.
-        holder2.join(timeout=300)
-        holder2 = threading.Thread(target=_hold_slot)
-        holder2.start()
-    if _slot_busy():
+    if admitted2.wait(30):
         st, _, _ = chat(
             "Say the word late.",
             extra={"max_tokens": 5},
@@ -4680,16 +4688,23 @@ def phase_behavior() -> None:
         tight["st"] = st
     holder2.join(timeout=300)
     slo_after = _slo_counter()
-    check(
-        "behavior",
-        "x-pallama-deadline-ms: late admission accounted or rejected",
-        # 429 = predictive early-reject (frontier #28): when TTFT history
-        # proves the deadline is unreachable, admission refuses BEFORE
-        # queueing — the strongest form of honoring the SLO.
-        tight.get("st") in (200, 503, 429)
-        and (slo_after > slo_before or tight.get("st") in (503, 429)),
-        f"status={tight.get('st')} counter {slo_before}->{slo_after}",
-    )
+    if "st" not in tight:
+        boundary(
+            "behavior",
+            "x-pallama-deadline-ms: late admission accounted or rejected",
+            "holder never acquired the slot within 30s (engine unavailable)",
+        )
+    else:
+        check(
+            "behavior",
+            "x-pallama-deadline-ms: late admission accounted or rejected",
+            # 429 = predictive early-reject (frontier #28): when TTFT history
+            # proves the deadline is unreachable, admission refuses BEFORE
+            # queueing — the strongest form of honoring the SLO.
+            tight.get("st") in (200, 503, 429)
+            and (slo_after > slo_before or tight.get("st") in (503, 429)),
+            f"status={tight.get('st')} counter {slo_before}->{slo_after}",
+        )
     # speculative decode e2e: ngram self-speculation needs no draft model.
     d.start({"port": PORT, "spec": "ngram"})
     chat("Write the numbers from 1 to 10, one per line.", extra={"max_tokens": 64})
