@@ -248,7 +248,7 @@ pub fn serving_lane_typed(
         Some(kind) => Ok(installed
             .iter()
             .find(|(_, k)| *k == kind)
-            .map(|row| row.clone())),
+            .map(|(tag, _)| (tag.clone(), kind))),
         None => Err(LaneError::FormatUnserved {
             safetensors,
             quantized,
