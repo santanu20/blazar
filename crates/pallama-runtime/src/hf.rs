@@ -559,7 +559,7 @@ fn verify_index_coverage(dir: &Path) -> Result<()> {
 /// repo carries a `quantization_config`, else the weight dtype. Uses
 /// the HF-side vocabulary (BIT/BF16/FP16/F32/FP8), not llama quant
 /// names — labels stay truthful for `est_params`.
-fn hf_quant_label(meta: &pallama_core::hfmeta::HfMeta) -> String {
+pub(crate) fn hf_quant_label(meta: &pallama_core::hfmeta::HfMeta) -> String {
     if let Some(bits) = meta.quant_bits {
         return format!("{bits}BIT");
     }

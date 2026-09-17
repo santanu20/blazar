@@ -157,6 +157,61 @@ fn parse_nvidia_csv(text: &str) -> Vec<GpuInfo> {
         .collect()
 }
 
+/// One external process currently holding GPU memory.
+#[derive(Debug)]
+pub struct GpuTenant {
+    pub pid: u32,
+    pub process_name: String,
+    pub used_mib: u64,
+}
+
+/// Best-effort census of processes holding GPU compute memory
+/// (`nvidia-smi --query-compute-apps`). None when the tool is absent or
+/// fails — the caller reports nothing rather than a guessed tenant list.
+/// Pure parser: `pid, process_name, used_mib` per csv line.
+#[must_use]
+pub fn parse_gpu_tenants(csv: &str) -> Vec<GpuTenant> {
+    csv.lines()
+        .filter_map(|ln| {
+            let mut parts = ln.split(',').map(str::trim);
+            let pid: u32 = parts.next()?.parse().ok()?;
+            let process_name = parts.next()?.to_string();
+            if process_name.is_empty() {
+                return None;
+            }
+            // `used_mib` may carry a unit suffix on some driver versions.
+            let used_mib: u64 = parts
+                .next()?
+                .trim_end_matches(|c: char| !c.is_ascii_digit())
+                .parse()
+                .ok()?;
+            Some(GpuTenant {
+                pid,
+                process_name,
+                used_mib,
+            })
+        })
+        .collect()
+}
+
+/// Live GPU compute tenants at boot: whoever is holding VRAM before
+/// pallama has spawned any child of its own. Advisory only — pallama
+/// never kills another product's process.
+#[must_use]
+pub fn gpu_compute_tenants() -> Option<Vec<GpuTenant>> {
+    let out = probe_output(
+        std::process::Command::new("nvidia-smi").args([
+            "--query-compute-apps=pid,process_name,used_memory",
+            "--format=csv,noheader,nounits",
+        ]),
+        10,
+    )?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(parse_gpu_tenants(&String::from_utf8_lossy(&out.stdout)))
+}
+
 /// sysinfo half + caller-supplied GPU list: the composition point for a
 /// LIVE `--list-devices` census (see `engine::manifest::run_list_devices`).
 #[must_use]
@@ -296,6 +351,23 @@ mod tests {
         assert!(!gpus[0].is_integrated(), "nvidia entries read discrete");
         // Garbage lines skip; partial lines skip — never a guessed entry.
         assert!(parse_nvidia_csv("nope\n\nRTX, only-two\n").is_empty());
+    }
+
+    #[test]
+    fn unit__parse_gpu_tenants__csv_shapes_and_unit_suffix() {
+        let t = parse_gpu_tenants(
+            "1588925, /usr/local/bin/pallama, 2314\n\
+             1637391, ollama, 1858\n",
+        );
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0].pid, 1_588_925);
+        assert_eq!(t[0].process_name, "/usr/local/bin/pallama");
+        assert_eq!(t[0].used_mib, 2_314);
+        // Some driver versions append " MiB" to the memory column.
+        let s = parse_gpu_tenants("42, ollama, 972 MiB\n");
+        assert_eq!(s[0].used_mib, 972, "unit suffix tolerated");
+        // Non-numeric pid / empty name / short lines skip silently.
+        assert!(parse_gpu_tenants("NotFound, , \nnope\n").is_empty());
     }
 
     #[test]

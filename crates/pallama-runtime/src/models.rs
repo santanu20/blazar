@@ -1,14 +1,13 @@
-//! Model store operations: remove with running-instance guard, listing.
-//! The `run/<name>.pid` marker is the same file the supervisor (step E)
-//! writes; sharing the contract here means rm refuses while running from
-//! day one (409 semantics) without coupling to the supervisor.
+//! Model store operations: remove with running-instance guard, listing,
+//! and the boot-time models-dir reconcile.
 
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 
 use pallama_core::store::Store;
-use pallama_core::PallamaDirs;
+use pallama_core::{ModelRow, PallamaDirs};
 
 /// True when an instance marker exists for `name` (process may be loading
 /// or serving; the supervisor owns the marker's lifecycle).
@@ -140,6 +139,397 @@ pub fn ensure_portable_name(name: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// A model adopted from disk by the boot-time reconcile.
+#[derive(Debug)]
+pub struct AdoptedModel {
+    pub name: String,
+    /// "gguf" or "safetensors" — the lane the row serves on.
+    pub format: &'static str,
+    pub bytes: i64,
+}
+
+/// Outcome of a boot-time models-dir reconcile. Never an error state: a
+/// store with nothing to adopt is the healthy common case.
+pub struct ReconcileReport {
+    pub adopted: Vec<AdoptedModel>,
+    /// (file/dir, reason) for candidates that looked like models but
+    /// were refused — surfaced as boot warnings, never fatal.
+    pub skipped: Vec<(String, String)>,
+}
+
+/// Adopt store-external model files living in the models dir: GGUFs (and
+/// GGUF shard sets) whose path no row owns, plus safetensors dirs with a
+/// readable `config.json`. Adds rows ONLY — never moves, renames, or
+/// deletes files, so an uninstall that kept model files stays honest
+/// across reinstalls. Row dialects mirror `pallama import` (GGUF) and the
+/// pull lane (safetensors); `repo` carries an `adopted:<path>` marker so
+/// adopted rows are identifiable in `pallama list`.
+#[must_use]
+pub fn reconcile_models(dirs: &PallamaDirs, store: &Store) -> ReconcileReport {
+    let mut report = ReconcileReport {
+        adopted: Vec::new(),
+        skipped: Vec::new(),
+    };
+    let models_dir = dirs.models_dir();
+    let Ok(entries) = std::fs::read_dir(&models_dir) else {
+        return report; // no dir yet = nothing to adopt
+    };
+
+    // Ownership = canonical paths of existing rows plus their inodes, so
+    // hardlink twins of owned files (aliases) are not double-adopted.
+    let mut owned: HashSet<PathBuf> = HashSet::new();
+    let mut owned_inodes: HashSet<(u64, u64)> = HashSet::new();
+    for row in store.list_models().unwrap_or_default() {
+        let p = PathBuf::from(&row.path);
+        if let Ok(c) = p.canonicalize() {
+            owned.insert(c);
+        }
+        #[cfg(unix)]
+        if let Ok(md) = std::fs::metadata(&p) {
+            use std::os::unix::fs::MetadataExt as _;
+            owned_inodes.insert((md.dev(), md.ino()));
+        }
+    }
+
+    // Deterministic scan order: boot output must be stable across runs.
+    let mut names: Vec<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+
+    // GGUF shard sets (`base-00001-of-00002.gguf`) adopt as ONE model.
+    let mut shard_sets: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut singles: Vec<String> = Vec::new();
+    for name in &names {
+        if !name.to_lowercase().ends_with(".gguf") {
+            continue;
+        }
+        match crate::hf::parse_shard_marker_pub(name) {
+            Some((_, _, base)) => shard_sets.entry(base).or_default().push(name.clone()),
+            None => singles.push(name.clone()),
+        }
+    }
+    let mut adopted_inodes: HashSet<(u64, u64)> = HashSet::new();
+    for leaves in shard_sets.values() {
+        adopt_gguf(
+            &models_dir,
+            store,
+            leaves,
+            &owned,
+            &owned_inodes,
+            &mut adopted_inodes,
+            &mut report,
+        );
+    }
+    for leaf in &singles {
+        adopt_gguf(
+            &models_dir,
+            store,
+            std::slice::from_ref(leaf),
+            &owned,
+            &owned_inodes,
+            &mut adopted_inodes,
+            &mut report,
+        );
+    }
+
+    // Safetensors dirs: the pull lane names them `<model>.d`.
+    for name in &names {
+        let dir = models_dir.join(name);
+        if !dir.is_dir() {
+            continue;
+        }
+        let looks_pulled = name.to_lowercase().ends_with(".d");
+        if !dir.join("config.json").exists() {
+            continue; // not an HF model dir — never ours to judge
+        }
+        if !root_safetensors(&dir).is_empty() || looks_pulled {
+            adopt_dir(&models_dir, store, name, &owned, &mut report);
+        }
+    }
+    report
+}
+
+/// Root-level `.safetensors` weights of an HF model dir (the pull lane's
+/// selection rule: shards live at the root, config.json is mandatory).
+fn root_safetensors(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.file_name()
+                    .is_some_and(|f| f.to_string_lossy().to_lowercase().ends_with(".safetensors"))
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// Adopt one GGUF (or a whole shard set) at its EXISTING location.
+/// Mirrors `pallama import`'s derivation exactly: quant from the filename
+/// tail-token, name from GGUF metadata or the file stem.
+fn adopt_gguf(
+    models_dir: &Path,
+    store: &Store,
+    leaves: &[String],
+    owned: &HashSet<PathBuf>,
+    owned_inodes: &HashSet<(u64, u64)>,
+    adopted_inodes: &mut HashSet<(u64, u64)>,
+    report: &mut ReconcileReport,
+) {
+    let first = &leaves[0];
+    let path = models_dir.join(first);
+    if owned.contains(&path.canonicalize().unwrap_or_else(|_| path.clone())) {
+        return; // a row already owns this file
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if let Ok(md) = std::fs::metadata(&path) {
+            let ino = (md.dev(), md.ino());
+            if owned_inodes.contains(&ino) || adopted_inodes.contains(&ino) {
+                return; // hardlink twin of an owned/adopted file
+            }
+            adopted_inodes.insert(ino);
+        }
+    }
+    let label = if leaves.len() > 1 {
+        format!("{} (+{} shards)", first, leaves.len() - 1)
+    } else {
+        first.clone()
+    };
+    let meta = match pallama_core::read_metadata_file(&path) {
+        Ok(m) => m,
+        Err(e) => {
+            report
+                .skipped
+                .push((label, format!("not a readable GGUF: {e}")));
+            return;
+        }
+    };
+    // Vision projectors are sidecars, not servable models (import's
+    // --mmproj validation uses the same architecture test).
+    if meta.architecture == "clip" {
+        return;
+    }
+    let (quant, candidates) = gguf_derivations(first, &meta);
+    // First free-and-portable candidate wins; quant siblings share
+    // embedded metadata names (base + fp16 both say "Qwen2.5 0.5B
+    // Instruct") and must not shadow each other.
+    let Some(model_name) = candidates
+        .iter()
+        .find(|c| portable_model_name(c).is_ok() && store.get_model(c).ok().flatten().is_none())
+        .cloned()
+    else {
+        report.skipped.push((
+            label,
+            format!(
+                "every derived name is taken or unusable: {}",
+                candidates.join(", ")
+            ),
+        ));
+        return;
+    };
+    let bytes: u64 = leaves
+        .iter()
+        .filter_map(|l| std::fs::metadata(models_dir.join(l)).ok())
+        .map(|m| m.len())
+        .sum();
+    let row = ModelRow {
+        name: model_name.clone(),
+        repo: format!("adopted:{}", path.display()),
+        quant: quant.clone(),
+        path: path.display().to_string(),
+        bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
+        sha256: None,
+        // mmproj siblings are NOT guessed: re-import with --mmproj to
+        // attach a projector (no-guessing rule).
+        mmproj_path: None,
+        shards: i64::try_from(leaves.len()).unwrap_or(i64::MAX),
+        arch: Some(meta.architecture.clone()),
+        params: Some(crate::hf::est_params(bytes, &quant)),
+        ctx_train: meta.context_length.and_then(|c| i64::try_from(c).ok()),
+        pulled_at: now_secs(),
+    };
+    match store.upsert_model(&row) {
+        Ok(()) => report.adopted.push(AdoptedModel {
+            name: model_name,
+            format: "gguf",
+            bytes: row.bytes,
+        }),
+        Err(e) => report
+            .skipped
+            .push((label, format!("store refused row: {e}"))),
+    }
+}
+
+/// Adopt a safetensors model dir (`<name>.d`) at its existing location,
+/// mirroring the pull lane's row dialect.
+fn adopt_dir(
+    models_dir: &Path,
+    store: &Store,
+    dir_name: &str,
+    owned: &HashSet<PathBuf>,
+    report: &mut ReconcileReport,
+) {
+    let dir = models_dir.join(dir_name);
+    let weights = root_safetensors(&dir);
+    let model_name = dir_name.strip_suffix(".d").unwrap_or(dir_name);
+    if weights.is_empty() {
+        report.skipped.push((
+            dir_name.to_string(),
+            "has config.json but no root .safetensors weights".to_string(),
+        ));
+        return;
+    }
+    // A row already pointing at THIS dir is the idempotent second boot —
+    // not a collision, and not worth a warning on every start.
+    let canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+    if owned.contains(&canon) {
+        return;
+    }
+    let meta = match pallama_core::hfmeta::read_hf_config(&dir) {
+        Ok(m) => m,
+        Err(e) => {
+            report
+                .skipped
+                .push((dir_name.to_string(), format!("config.json unusable: {e}")));
+            return;
+        }
+    };
+    if let Err(reason) = portable_model_name(model_name) {
+        report.skipped.push((dir_name.to_string(), reason));
+        return;
+    }
+    if store.get_model(model_name).ok().flatten().is_some() {
+        report.skipped.push((
+            dir_name.to_string(),
+            format!("name `{model_name}` already taken by another row"),
+        ));
+        return;
+    }
+    let bytes: u64 = weights
+        .iter()
+        .filter_map(|w| std::fs::metadata(w).ok())
+        .map(|m| m.len())
+        .sum();
+    let quant = crate::hf::hf_quant_label(&meta);
+    let row = ModelRow {
+        name: model_name.to_string(),
+        repo: format!("adopted:{}", dir.display()),
+        quant: quant.clone(),
+        path: dir.display().to_string(),
+        bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
+        sha256: None,
+        mmproj_path: None,
+        shards: i64::try_from(weights.len()).unwrap_or(i64::MAX),
+        arch: (!meta.architecture.is_empty()).then(|| meta.architecture.clone()),
+        params: Some(crate::hf::est_params(bytes, &quant)),
+        ctx_train: meta.ctx_train.and_then(|c| i64::try_from(c).ok()),
+        pulled_at: now_secs(),
+    };
+    match store.upsert_model(&row) {
+        Ok(()) => report.adopted.push(AdoptedModel {
+            name: model_name.to_string(),
+            format: "safetensors",
+            bytes: row.bytes,
+        }),
+        Err(e) => report
+            .skipped
+            .push((dir_name.to_string(), format!("store refused row: {e}"))),
+    }
+}
+
+/// GGUF quant-name family shape (`q4_k_m`, `iq4_xs`, `q8_0`, `f16`,
+/// `fp8`, ...). Non-quant tail tokens (`0.5b`) must not be mistaken for
+/// a quant suffix when stripping the name stem.
+fn is_quant_token(token: &str) -> bool {
+    let t = token.to_lowercase();
+    let q_prefixed = |p: &str| {
+        t.strip_prefix(p)
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+    };
+    q_prefixed("q")
+        || q_prefixed("iq")
+        || matches!(
+            t.as_str(),
+            "f16" | "f32" | "bf16" | "fp4" | "fp6" | "fp8" | "fp16"
+        )
+}
+
+/// Derive (quant label, candidate names) from a GGUF's on-disk filename
+/// and metadata. Candidate names, most-faithful first: (1) pull
+/// downloads name files `owner--repo--leaf.gguf` — the repo segment
+/// reproduces the exact pre-uninstall name; (2) GGUF `general.name`;
+/// (3) stem minus a quant-shaped tail; (4) full stem. All keep dots
+/// (`qwen2.5-0.5b`) — these files were written by pull, whose registry
+/// names carry them; only interactive import rewrites dots. The quant
+/// tail-token comes from the base name, not the shard leaf
+/// (`base-00001-of-00002` would otherwise derive quant `00002`).
+fn gguf_derivations(first_leaf: &str, meta: &pallama_core::GgufMeta) -> (String, Vec<String>) {
+    let quant_source = crate::hf::parse_shard_marker_pub(first_leaf)
+        .map_or_else(
+            || first_leaf.trim_end_matches(".gguf").to_string(),
+            |(_, _, base)| base,
+        )
+        .to_lowercase();
+    let quant = quant_source
+        .rsplit('-')
+        .next()
+        .unwrap_or("adopted")
+        .to_uppercase();
+    let mut candidates: Vec<String> = Vec::new();
+    let segments: Vec<&str> = quant_source.split("--").collect();
+    if segments.len() >= 3 {
+        let repo = segments[1].to_lowercase();
+        let repo = repo.strip_suffix("-gguf").unwrap_or(&repo);
+        candidates.push(repo.replace(' ', "-"));
+    }
+    if let Some(name) = meta
+        .name
+        .as_ref()
+        .map(|n| n.to_lowercase().replace(' ', "-"))
+    {
+        candidates.push(name);
+    }
+    let tail = quant_source
+        .rsplit('-')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    if is_quant_token(&tail) {
+        if let Some(base) = quant_source.strip_suffix(&format!("-{tail}")) {
+            candidates.push(base.to_string());
+        }
+    }
+    candidates.push(quant_source.clone());
+    (quant, candidates)
+}
+
+/// Name gate shared by both arms: portable-name rules plus the store's
+/// reserved `#` (replica keys).
+fn portable_model_name(name: &str) -> Result<(), String> {
+    if name.contains('#') {
+        return Err(format!("derived name `{name}` contains reserved '#'"));
+    }
+    ensure_portable_name(name).map_err(|e| e.to_string())
+}
+
+fn now_secs() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+    .unwrap_or(i64::MAX)
 }
 
 pub fn copy_model(dirs: &PallamaDirs, src: &str, dst: &str) -> Result<()> {
@@ -403,6 +793,338 @@ mod tests {
         assert!(
             copy_model(&dirs, "m", "m-alias").is_err(),
             "duplicate alias refused"
+        );
+    }
+
+    // ---- boot-time reconcile (reconcile_models) ----
+
+    /// Minimal valid GGUF v3 with a `general.architecture` string kv and
+    /// an optional `general.name` string kv — the same byte dialect as
+    /// the gguf health tests in hf.rs.
+    fn write_gguf(path: &std::path::Path, arch: &str, name: Option<&str>) {
+        fn str_kv(b: &mut Vec<u8>, k: &str, v: &str) {
+            b.extend_from_slice(&(k.len() as u64).to_le_bytes());
+            b.extend_from_slice(k.as_bytes());
+            b.extend_from_slice(&8u32.to_le_bytes()); // GGUF type: string
+            b.extend_from_slice(&(v.len() as u64).to_le_bytes());
+            b.extend_from_slice(v.as_bytes());
+        }
+        let mut b: Vec<u8> = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes()); // version
+        b.extend_from_slice(&0u64.to_le_bytes()); // tensor count
+        let kv = 1 + usize::from(name.is_some());
+        b.extend_from_slice(&(kv as u64).to_le_bytes());
+        str_kv(&mut b, "general.architecture", arch);
+        if let Some(n) = name {
+            str_kv(&mut b, "general.name", n);
+        }
+        std::fs::write(path, b).unwrap();
+    }
+
+    fn row(path: &std::path::Path, name: &str) -> pallama_core::ModelRow {
+        pallama_core::ModelRow {
+            name: name.into(),
+            repo: "o/m".into(),
+            quant: "Q4_K_M".into(),
+            path: path.display().to_string(),
+            bytes: 1,
+            sha256: None,
+            mmproj_path: None,
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 1,
+        }
+    }
+
+    #[test]
+    fn unit__reconcile__adopts_orphan_gguf_with_import_dialect() {
+        let (_t, dirs) = setup();
+        let f = dirs.models_dir().join("keepme-0.5b-q4_k_m.gguf");
+        write_gguf(&f, "qwen3", Some("KeepMe 0.5B"));
+        let store = Store::open(&dirs).unwrap();
+
+        let r = reconcile_models(&dirs, &store);
+        assert_eq!(r.adopted.len(), 1, "{:?}", r.skipped);
+        assert_eq!(r.adopted[0].name, "keepme-0.5b"); // name kv, dots kept (pull dialect)
+        assert_eq!(r.adopted[0].format, "gguf");
+        let m = store.get_model("keepme-0.5b").unwrap().unwrap();
+        assert_eq!(m.quant, "Q4_K_M", "quant from filename tail token");
+        assert_eq!(m.arch.as_deref(), Some("qwen3"));
+        assert_eq!(m.shards, 1);
+        assert!(m.repo.starts_with("adopted:"), "{}", m.repo);
+        assert_eq!(
+            m.path,
+            f.display().to_string(),
+            "adopted at its EXISTING location"
+        );
+        assert!(m.mmproj_path.is_none(), "no mmproj guessing");
+
+        // Second boot: no churn — the file is owned now.
+        let r2 = reconcile_models(&dirs, &store);
+        assert!(
+            r2.adopted.is_empty() && r2.skipped.is_empty(),
+            "{:?} {:?}",
+            r2.adopted,
+            r2.skipped
+        );
+    }
+
+    #[test]
+    fn unit__reconcile__shard_set_adopts_as_one_model() {
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        write_gguf(
+            &d.join("big-00001-of-00002.gguf"),
+            "llama",
+            Some("Big Model"),
+        );
+        write_gguf(&d.join("big-00002-of-00002.gguf"), "llama", None);
+        let store = Store::open(&dirs).unwrap();
+
+        let r = reconcile_models(&dirs, &store);
+        assert_eq!(r.adopted.len(), 1, "{:?}", r.skipped);
+        let m = store.get_model("big-model").unwrap().unwrap();
+        assert_eq!(m.shards, 2, "shard set adopts as one row");
+        assert_eq!(
+            m.path,
+            d.join("big-00001-of-00002.gguf").display().to_string()
+        );
+    }
+
+    #[test]
+    fn unit__reconcile__adopts_safetensors_dir_with_pull_dialect() {
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir().join("qwen-instruct.d");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("config.json"),
+            br#"{"architectures":["Qwen2ForCausalLM"],"torch_dtype":"bfloat16","max_position_embeddings":32768}"#,
+        )
+        .unwrap();
+        std::fs::write(d.join("model-00001-of-00002.safetensors"), b"aaaa").unwrap();
+        std::fs::write(d.join("model-00002-of-00002.safetensors"), b"bb").unwrap();
+        let store = Store::open(&dirs).unwrap();
+
+        let r = reconcile_models(&dirs, &store);
+        assert_eq!(r.adopted.len(), 1, "{:?}", r.skipped);
+        assert_eq!(r.adopted[0].name, "qwen-instruct"); // .d suffix stripped
+        assert_eq!(r.adopted[0].format, "safetensors");
+        let m = store.get_model("qwen-instruct").unwrap().unwrap();
+        assert_eq!(m.quant, "BF16");
+        assert_eq!(m.bytes, 6, "bytes = sum of root safetensors");
+        assert_eq!(m.shards, 2);
+        assert_eq!(m.arch.as_deref(), Some("Qwen2ForCausalLM"));
+        assert_eq!(m.ctx_train, Some(32768));
+        assert_eq!(m.path, d.display().to_string());
+
+        // Second boot: fully silent — owned dirs are not collisions and
+        // must not warn on every start.
+        let r2 = reconcile_models(&dirs, &store);
+        assert!(r2.adopted.is_empty(), "{:?}", r2.adopted);
+        assert!(r2.skipped.is_empty(), "{:?}", r2.skipped);
+    }
+
+    #[test]
+    fn unit__reconcile__owned_and_twins_left_alone() {
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        let owned_file = d.join("m-q4_k_m.gguf");
+        write_gguf(&owned_file, "qwen3", Some("m"));
+        let store = Store::open(&dirs).unwrap();
+        store.upsert_model(&row(&owned_file, "m")).unwrap();
+        // Hardlink twin of the owned file under a different name.
+        std::fs::hard_link(&owned_file, d.join("twin-copy.gguf")).unwrap();
+        // Random non-model file stays silent.
+        std::fs::write(d.join("mmproj-15b.gguf"), b"sidecar").unwrap();
+        std::fs::write(d.join("model.part"), b"partial").unwrap();
+
+        let r = reconcile_models(&dirs, &store);
+        assert!(r.adopted.is_empty(), "{:?}", r.adopted);
+        // mmproj.part/model.part: silent skips (non-gguf / non-model files
+        // are not ours to judge); twin is silent too.
+        assert!(
+            r.skipped
+                .iter()
+                .all(|(f, _)| !f.contains("twin") && !f.contains(".part")),
+            "{:?}",
+            r.skipped
+        );
+    }
+
+    #[test]
+    fn unit__reconcile__clip_sidecar_and_corrupt_skipped() {
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        write_gguf(&d.join("m-mmproj.gguf"), "clip", None); // projector, not a model
+        std::fs::write(d.join("broken-q4.gguf"), b"garbage not gguf").unwrap();
+        let store = Store::open(&dirs).unwrap();
+
+        let r = reconcile_models(&dirs, &store);
+        assert!(r.adopted.is_empty(), "{:?}", r.adopted);
+        assert!(
+            r.skipped
+                .iter()
+                .any(|(f, why)| f == "broken-q4.gguf" && why.contains("not a readable GGUF")),
+            "{:?}",
+            r.skipped
+        );
+        assert!(
+            r.skipped.iter().all(|(f, _)| !f.contains("mmproj")),
+            "clip sidecars are silent (not model candidates): {:?}",
+            r.skipped
+        );
+    }
+
+    #[test]
+    fn unit__reconcile__taken_name_falls_through_candidates_never_shadows() {
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        // Row `m` exists pointing at ANOTHER path; the orphan's GGUF
+        // metadata derives the same name. The ladder must NOT shadow the
+        // existing row — it falls through to the stem-derived name, and
+        // only skips when EVERY candidate is taken.
+        let elsewhere = dirs.data_dir.join("elsewhere.gguf");
+        write_gguf(&elsewhere, "qwen3", None);
+        let store = Store::open(&dirs).unwrap();
+        store.upsert_model(&row(&elsewhere, "m")).unwrap();
+        write_gguf(&d.join("orphan-q8_0.gguf"), "llama", Some("m"));
+
+        let r = reconcile_models(&dirs, &store);
+        assert_eq!(r.adopted.len(), 1, "{:?}", r.skipped);
+        assert_eq!(r.adopted[0].name, "orphan", "stem minus quant tail");
+        // The pre-existing row is untouched.
+        assert_eq!(
+            store.get_model("m").unwrap().unwrap().path,
+            elsewhere.display().to_string()
+        );
+    }
+
+    #[test]
+    fn unit__reconcile__total_name_saturation_skips_honestly() {
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        // Row `dup` lives elsewhere; the orphan's stem AND metadata both
+        // derive exactly `dup` — every candidate is taken, so it must
+        // skip with an honest reason instead of shadowing.
+        let elsewhere = dirs.data_dir.join("elsewhere.gguf");
+        write_gguf(&elsewhere, "qwen3", None);
+        let store = Store::open(&dirs).unwrap();
+        store.upsert_model(&row(&elsewhere, "dup")).unwrap();
+        write_gguf(&d.join("dup.gguf"), "llama", Some("dup"));
+
+        let r = reconcile_models(&dirs, &store);
+        assert!(r.adopted.is_empty(), "{:?}", r.adopted);
+        assert!(
+            r.skipped
+                .iter()
+                .any(|(f, why)| f == "dup.gguf" && why.contains("every derived name is taken")),
+            "{:?}",
+            r.skipped
+        );
+        // File survives untouched — adoption never deletes.
+        assert!(d.join("dup.gguf").exists());
+    }
+
+    #[test]
+    fn unit__reconcile__clean_store_is_noop() {
+        let (_t, dirs) = setup();
+        std::fs::write(dirs.models_dir().join("readme.txt"), b"hi").unwrap();
+        let store = Store::open(&dirs).unwrap();
+        let r = reconcile_models(&dirs, &store);
+        assert!(
+            r.adopted.is_empty() && r.skipped.is_empty(),
+            "{:?} {:?}",
+            r.adopted,
+            r.skipped
+        );
+    }
+
+    #[test]
+    fn unit__reconcile__pull_convention_recovers_repo_name() {
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        // Pull-lane on-disk naming: owner--repo--leaf.gguf. The repo
+        // segment (minus -gguf suffix) is the pre-uninstall model name —
+        // it must win over GGUF-internal general.name.
+        write_gguf(
+            &d.join("unsloth--Qwen3.5-9B-MTP-GGUF--Qwen3.5-9B-Q4_K_M.gguf"),
+            "qwen3",
+            Some("Qwen3.5 9B"),
+        );
+        let store = Store::open(&dirs).unwrap();
+        let r = reconcile_models(&dirs, &store);
+        assert_eq!(r.adopted.len(), 1, "{:?}", r.skipped);
+        assert_eq!(
+            r.adopted[0].name, "qwen3.5-9b-mtp",
+            "repo segment, -gguf stripped"
+        );
+        let m = store.get_model("qwen3.5-9b-mtp").unwrap().unwrap();
+        assert_eq!(m.quant, "Q4_K_M", "quant from leaf tail token");
+    }
+
+    #[test]
+    fn unit__reconcile__gguf_meta_name_used_when_not_pull_convention() {
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        write_gguf(&d.join("plain-q4_k_m.gguf"), "llama", Some("My Model 8B"));
+        let store = Store::open(&dirs).unwrap();
+        reconcile_models(&dirs, &store);
+        assert!(
+            store.get_model("my-model-8b").unwrap().is_some(),
+            "meta.name dialect, dots kept"
+        );
+    }
+
+    #[test]
+    fn unit__reconcile__shared_meta_name_falls_to_stem_candidates() {
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        // Real-world class: base + fp16 GGUF embed the SAME general.name,
+        // and a safetensors row already holds that name. Each file must
+        // still adopt under its own stem-derived name.
+        let st = dirs.models_dir().join("qwen2.5-0.5b-instruct.d");
+        std::fs::create_dir_all(&st).unwrap();
+        std::fs::write(
+            st.join("config.json"),
+            br#"{"architectures":["Qwen2ForCausalLM"],"torch_dtype":"bfloat16"}"#,
+        )
+        .unwrap();
+        std::fs::write(st.join("model.safetensors"), b"aaaa").unwrap();
+        let store = Store::open(&dirs).unwrap();
+        reconcile_models(&dirs, &store);
+        assert!(store.get_model("qwen2.5-0.5b-instruct").unwrap().is_some());
+
+        write_gguf(
+            &d.join("qwen2.5-0.5b.gguf"),
+            "qwen3",
+            Some("Qwen2.5 0.5B Instruct"),
+        );
+        write_gguf(
+            &d.join("qwen2.5-0.5b-instruct-fp16.gguf"),
+            "qwen3",
+            Some("Qwen2.5 0.5B Instruct"),
+        );
+        let r = reconcile_models(&dirs, &store);
+        assert_eq!(r.adopted.len(), 2, "{:?}", r.skipped);
+        // Base file: meta + stem-minus-tail both taken/invalid (`0.5b` is
+        // not a quant token) → full stem.
+        assert!(
+            store.get_model("qwen2.5-0.5b").unwrap().is_some(),
+            "{:?}",
+            r.adopted
+        );
+        // fp16 file: meta taken → stem-minus-quant-tail ALSO taken →
+        // full stem with quant.
+        assert!(
+            store
+                .get_model("qwen2.5-0.5b-instruct-fp16")
+                .unwrap()
+                .is_some(),
+            "{:?}",
+            r.adopted
         );
     }
 }

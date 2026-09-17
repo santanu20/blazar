@@ -3402,6 +3402,25 @@ async fn serve() -> Result<()> {
     };
     rotate_daemon_log(&d);
     let store = Store::open(&d)?;
+    // Boot preflight (1/2): adopt model files that live in the models dir
+    // without a store row — the uninstall-keeps-models / reinstall case.
+    // Rows only; files are never moved or deleted (reconcile_models doc).
+    let reconcile = pallama_runtime::models::reconcile_models(&d, &store);
+    if !reconcile.adopted.is_empty() {
+        let listed = reconcile
+            .adopted
+            .iter()
+            .map(|m| format!("{} ({}, {})", m.name, m.format, humansize(m.bytes)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "preflight: adopted {} model(s) from disk: {listed}",
+            reconcile.adopted.len()
+        );
+    }
+    for (what, why) in &reconcile.skipped {
+        println!("WARNING: preflight skipped {what}: {why}");
+    }
     // PALLAMA_ENGINE_PATH: register/refresh the local build and prefer it
     // for this run (plan C: pseudo-tag "local", never pruned).
     let local_override = std::env::var("PALLAMA_ENGINE_PATH").ok();
@@ -3432,6 +3451,22 @@ async fn serve() -> Result<()> {
         hw.gpus.len(),
         hw.total_vram_mib()
     );
+    // Boot preflight (2/2): VRAM already held before pallama spawns any
+    // child of its own. Advisory only — pallama never kills another
+    // product's process.
+    if let Some(tenants) = pallama_runtime::probe::gpu_compute_tenants() {
+        let held: u64 = tenants.iter().map(|t| t.used_mib).sum();
+        if held > 0 {
+            println!(
+                "vram: {held} MiB already held by {} other process(es):",
+                tenants.len()
+            );
+            for t in &tenants {
+                println!("  - pid {} {} ({} MiB)", t.pid, t.process_name, t.used_mib);
+            }
+            println!("  stop or unload them to free VRAM for larger models");
+        }
+    }
     println!("config: {}", d.config_file().display());
     println!("data:   {}", d.data_dir.display());
     let engine_env: Vec<(String, String)> = cfg
