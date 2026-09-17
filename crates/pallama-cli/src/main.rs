@@ -279,6 +279,10 @@ enum Cmd {
             value_parser = clap::builder::NonEmptyStringValueParser::new()
         )]
         format: String,
+        /// One JSON object per row (JSONL, like `doctor --json`) for
+        /// scripting; suppresses the table, footers and hints.
+        #[arg(long)]
+        json: bool,
     },
     /// Pre-download fit preview: VRAM/RAM split + quant alternatives
     Fit { target: String },
@@ -689,7 +693,23 @@ fn render_grouped_help() -> String {
     out
 }
 
+/// One audited libc call (mirrors the statvfs precedent): reset SIGPIPE
+/// to its default disposition so `search --json | head`/`| jq` closing
+/// early ends the process quietly instead of panicking on a broken pipe.
+/// Runs first in `main`, before any thread exists.
+#[cfg(unix)]
+#[allow(unsafe_code)] // one-time signal reset; no pointers escape
+fn reset_sigpipe_default() {
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_sigpipe_default() {}
+
 fn main() {
+    reset_sigpipe_default();
     // Grouped help intercept: clap renders an ungrouped 38-command wall.
     // Only the TOP-level listing is replaced; `pallama help <cmd>`,
     // `pallama <cmd> --help` and error usage stay clap-native.
@@ -1063,7 +1083,11 @@ async fn run(cmd: Cmd) -> Result<()> {
         ),
         Cmd::Engine { cmd } => engine_cmd(cmd).await,
         Cmd::Lora { cmd } => lora_cmd(cmd),
-        Cmd::Search { query, format } => search(&query.join(" "), &format).await,
+        Cmd::Search {
+            query,
+            format,
+            json,
+        } => search(&query.join(" "), &format, json).await,
         Cmd::Fit { target } => fit(&target).await,
         Cmd::Config { cmd } => config_cmd(cmd),
         Cmd::Upgrade { version, dry_run } => upgrade(version, dry_run).await,
@@ -7318,17 +7342,44 @@ fn human_count(n: u64) -> String {
     }
 }
 
-async fn search(query: &str, format: &str) -> Result<()> {
+async fn search(query: &str, format: &str, json: bool) -> Result<()> {
     let token = std::env::var("HF_TOKEN").ok();
     let client = pallama_runtime::hf::HfClient::new(token)?;
     let results = client.search(query, format, 20).await?;
     let format = format.trim().to_ascii_lowercase();
     if results.is_empty() {
         // The Hub answers an unknown tag with 200 + [] — teach the valid
-        // lanes instead of looking like "no such model exists".
-        println!(
-            "no {format} repos matched {query:?} — try `--format any`, or a known tag: gguf, safetensors, awq, gptq, fp8, mlx"
-        );
+        // lanes instead of looking like "no such model exists". JSONL
+        // consumers get a clean zero-row stream (jq -s reads it as []).
+        if !json {
+            println!(
+                "no {format} repos matched {query:?} — try `--format any`, or a known tag: gguf, safetensors, awq, gptq, fp8, mlx"
+            );
+        }
+        return Ok(());
+    }
+    if json {
+        // Same fields as the table, machine-typed: ctx/size_bytes/arch are
+        // null when the Hub carries no GGUF metadata; quants is the FULL
+        // list (the table's `+N` collapse is display dressing).
+        for r in &results {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "repo": r.id,
+                    "downloads": r.downloads.unwrap_or(0),
+                    "likes": r.likes.unwrap_or(0),
+                    "format": match format_of(&r.tags).as_str() {
+                        "?" => serde_json::Value::Null,
+                        f => serde_json::Value::String(f.to_string()),
+                    },
+                    "size_bytes": r.gguf.as_ref().and_then(|g| g.total),
+                    "arch": r.gguf.as_ref().and_then(|g| g.architecture.clone()),
+                    "ctx": r.gguf.as_ref().and_then(|g| g.context_length),
+                    "quants": entry_quants(r),
+                })
+            );
+        }
         return Ok(());
     }
     // Column width adapts to the longest repo id (capped) so numbers never
@@ -7364,25 +7415,20 @@ async fn search(query: &str, format: &str) -> Result<()> {
     );
     for r in results {
         let id = truncate_repo_id(&r.id, cap);
-        let (size, arch, ctx) = r.gguf.map_or_else(
+        let (size, arch, ctx) = r.gguf.as_ref().map_or_else(
             || ("-".to_string(), "?".to_string(), "-".to_string()),
             |g| {
                 (
                     humansize(i64::try_from(g.total.unwrap_or(0)).unwrap_or(i64::MAX)),
-                    g.architecture.unwrap_or_else(|| "?".to_string()),
+                    g.architecture.as_deref().unwrap_or("?").to_string(),
                     g.context_length.map_or_else(|| "-".to_string(), &human_ctx),
                 )
             },
         );
-        let names =
-            pallama_runtime::hf::quant_tokens(r.siblings.iter().map(|s| s.rfilename.as_str()));
+        let names = entry_quants(&r);
         // GGUF rows carry real per-file quants; MLX/AWQ/GPTQ/FP8 rows only
         // name their bit-width in the repo id.
-        let quants = if names.is_empty() {
-            collapse_tokens(&quant_markers(&r.id))
-        } else {
-            collapse_tokens(&names)
-        };
+        let quants = collapse_tokens(&names);
         println!(
             "{:<width$}  {:>10}  {:>6}  {:<11}  {:<10}  {:<7}  {:>5}  {:<22}",
             id,
@@ -7416,16 +7462,32 @@ async fn search(query: &str, format: &str) -> Result<()> {
     Ok(())
 }
 
+/// QUANTS source shared by the table and `--json`: per-file GGUF tokens
+/// when the repo has them, else repo-id markers (MLX/AWQ/GPTQ lanes name
+/// their bit-width in the repo id, not in file quants).
+fn entry_quants(r: &pallama_runtime::hf::SearchEntry) -> Vec<String> {
+    let names = pallama_runtime::hf::quant_tokens(r.siblings.iter().map(|s| s.rfilename.as_str()));
+    if names.is_empty() {
+        quant_markers(&r.id)
+    } else {
+        names
+    }
+}
+
 /// FORMAT column: the repo's weight format from Hub tags, most-specific
 /// first — an MLX repo also carries `safetensors`, an AWQ repo too, so the
-/// specific tag is the actionable one. Unknown or missing tags show `?`.
+/// specific tag is the actionable one. `gguf` outranks `mlx` because GGUF
+/// mirrors (mradermacher-style) self-tag `mlx` for discoverability while
+/// their actionable payload is the GGUF set; pure MLX repos never carry
+/// the `gguf` tag (live-verified against both repo shapes). Unknown or
+/// missing tags show `?`.
 fn format_of(tags: &[String]) -> String {
     for known in [
-        "mlx",
         "awq",
         "gptq",
         "fp8",
         "gguf",
+        "mlx",
         "safetensors",
         "pytorch",
         "onnx",
@@ -7821,6 +7883,9 @@ mod tests {
         assert_eq!(format_of(&tags(&["safetensors", "mlx"])), "mlx");
         assert_eq!(format_of(&tags(&["safetensors", "awq"])), "awq");
         assert_eq!(format_of(&tags(&["gguf"])), "gguf");
+        // GGUF mirrors self-tag `mlx` but their actionable payload is the
+        // GGUF set; pure MLX repos never carry `gguf`.
+        assert_eq!(format_of(&tags(&["gguf", "mlx", "transformers"])), "gguf");
         assert_eq!(format_of(&tags(&["pytorch"])), "pytorch");
         assert_eq!(format_of(&tags(&["transformers"])), "?");
         assert_eq!(format_of(&[]), "?");

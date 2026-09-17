@@ -6,7 +6,8 @@ tracked here.
 
 ## [Unreleased]
 ### Added
-- `pallama search --format <F>`: weight-format filter beyond the GGUF default — any Hub tag (`safetensors`, `awq`, `gptq`, `fp8`, `mlx`, `onnx`, …) or `any`/`all` for an unfiltered browse; `--format` works in any argument position; new FORMAT column (Hub tags, most-specific-first: an AWQ repo shows `awq`, not its `safetensors` container tag), non-GGUF QUANTS mined from repo-id bit-widths (`-8bit`, `-AWQ`, `-GPTQ-Int4`), and format-aware pull footers (safetensors → sglang/mistralrs lane; MLX → convert guidance). Empty results now name the format and teach valid tags.
+- `pallama search --json`: one JSON object per row (JSONL, matching `doctor --json`) — machine-typed `ctx`/`size_bytes`/`arch` (null without GGUF metadata) and the FULL quants list (no `+N` collapse) for scripting; empty results stream zero rows (`jq -s` reads `[]`), and SIGPIPE is reset to default so `| head`/`| jq` closing early ends quietly instead of panicking.
+- `pallama search --format <F>`: weight-format filter beyond the GGUF default — any Hub tag (`safetensors`, `awq`, `gptq`, `fp8`, `mlx`, `onnx`, …) or `any`/`all` for an unfiltered browse; `--format` works in any argument position; new FORMAT column (Hub tags, most-specific-first: an AWQ repo shows `awq`, not its `safetensors` container tag; `gguf` outranks the `mlx` tag GGUF mirrors self-apply), non-GGUF QUANTS mined from repo-id bit-widths (`-8bit`, `-AWQ`, `-GPTQ-Int4`, `IQ4_XS`), and format-aware pull footers (safetensors → sglang/mistralrs lane; MLX → convert guidance). Empty results now name the format and teach valid tags.
 
 ## [0.6.1] — 2026-09-17
 
