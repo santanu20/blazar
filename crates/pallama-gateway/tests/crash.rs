@@ -1,7 +1,9 @@
-//! Crash-respawn contract at the GATEWAY boundary: a crashed engine
-//! child must be reaped on demand by the first failed request, not on
-//! the 10s reaper tick. The harness disables the tick (1h interval), so
-//! any recovery observed here is the on-demand reap path alone.
+//! Crash-respawn contract at the GATEWAY boundary: a request whose
+//! forward dies in the crash window (child killed between health gate
+//! and send) must respawn the exact lane and retry ITSELF in-band —
+//! single-shot clients never observe the 502. The harness disables the
+//! reaper tick (1h interval), so any recovery observed here is the
+//! on-demand reap + in-band retry path alone.
 #![allow(unsafe_code)] // SAFETY: only libc::kill against our own child pid below
 
 mod support;
@@ -32,7 +34,7 @@ async fn chat(base: &str, n: u32) -> u16 {
 
 #[tokio::test]
 #[allow(non_snake_case)]
-async fn integration__crash__on_demand_reap_respawns_within_one_retry() {
+async fn integration__crash__in_band_respawn_retry_serves_first_post_crash_request() {
     let server = support::start(Config::default()).await;
     // Warm: child up and serving.
     assert_eq!(chat(&server.base, 0).await, 200);
@@ -42,34 +44,23 @@ async fn integration__crash__on_demand_reap_respawns_within_one_retry() {
     unsafe { libc::kill(i32::try_from(pid).unwrap_or(-1), libc::SIGKILL) };
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Retry loop: request 1 may hit the stale entry (502, its error path
-    // reaps the corpse); the NEXT ensure() must respawn and serve. The
-    // reaper tick is 1h here — no recovery within budget = the on-demand
-    // contract regressed to periodic-only.
+    // Contract (upgraded from bridging-502s): the FIRST request after
+    // the crash self-heals — the failed forward reaps the corpse,
+    // respawns the exact instance lane, and retries once in-band. A 502
+    // here means the crash-window retry regressed to next-request-only
+    // recovery. The reaper tick is 1h here, so nothing else can save it.
     let t0 = Instant::now();
-    let mut timeline: Vec<(u128, u16)> = Vec::new();
-    let recovered = loop {
-        let st = chat(
-            &server.base,
-            u32::try_from(timeline.len() + 1).unwrap_or(u32::MAX),
-        )
-        .await;
-        timeline.push((t0.elapsed().as_millis(), st));
-        if st == 200 {
-            break true;
-        }
-        if t0.elapsed() > Duration::from_secs(8) {
-            break false;
-        }
-        tokio::time::sleep(Duration::from_millis(150)).await;
-    };
-    let fifties = timeline.iter().filter(|(_, s)| *s == 502).count();
+    let st = chat(&server.base, 1).await;
+    let took = t0.elapsed();
     let new_pid = server.state.sup.ps().first().map(|r| r.pid);
 
-    assert!(recovered, "no recovery in 8s (tick disabled): {timeline:?}");
+    assert_eq!(st, 200, "first post-crash request must self-heal, got {st}");
     assert!(
-        (1..=3).contains(&fifties),
-        "expected 1-3 bridging 502s, got {fifties}: {timeline:?}"
+        took < Duration::from_secs(8),
+        "in-band respawn+retry too slow: {took:?}"
     );
     assert_ne!(new_pid, Some(pid), "must serve from a respawned child");
+
+    // And the lane stays healthy for the next client (no half-state).
+    assert_eq!(chat(&server.base, 2).await, 200);
 }

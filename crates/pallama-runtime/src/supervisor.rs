@@ -857,6 +857,11 @@ pub struct Supervisor {
 #[derive(Debug, Clone)]
 pub struct EngineRef {
     pub name: String,
+    /// Instance-map key for this lane (`model`, replica `model#N`, or
+    /// projector lane `model@vision`) — the exact address a crash-window
+    /// respawn must re-`ensure` (`model` alone can resolve to a sibling
+    /// replica or a different routed engine under auto-routing).
+    pub key: String,
     /// Per-child serving kind (see `Instance::kind`) — the gateway's
     /// authoritative answer to "which engine owns this child" under
     /// routing.
@@ -1067,7 +1072,7 @@ impl Supervisor {
         self.instances
             .iter()
             .filter(|i| matches!(i.endpoint, Endpoint::Tcp { .. }))
-            .map(|i| self.engine_ref(i.value()))
+            .map(|i| self.engine_ref(i.key(), i.value()))
             .collect()
     }
 
@@ -1191,6 +1196,7 @@ impl Supervisor {
                 // immediately (sticky @vision replica from an earlier
                 // vision request)
                 let mut serve: Option<Arc<Instance>> = None;
+                let mut serve_key = String::new();
                 let mut text_sibs: Vec<String> = Vec::new();
                 for entry in &self.instances {
                     if model_of_key(entry.key()) != name {
@@ -1201,13 +1207,14 @@ impl Supervisor {
                     if matches!(*state, InstanceState::Ready | InstanceState::Sleeping) {
                         if inst.projector {
                             serve = Some(Arc::clone(inst));
+                            serve_key = entry.key().clone();
                         } else {
                             text_sibs.push(entry.key().clone());
                         }
                     }
                 }
                 if let Some(inst) = serve {
-                    return Ok(self.engine_ref(&inst));
+                    return Ok(self.engine_ref(&serve_key, &inst));
                 }
                 // (b) respawn WITH projector: drop the text-only sibling
                 // first (VRAM honesty — never two children of one model)
@@ -1375,7 +1382,14 @@ impl Supervisor {
     }
 
     /// Load/wait core, keyed by INSTANCE key (model or model#N).
-    async fn ensure_key(&self, key: &str) -> Result<EngineRef, SupervisionError> {
+    ///
+    /// Public for the gateway's crash-window respawn: when a forwarded
+    /// request fails at the transport layer (child died mid-request),
+    /// `proxy` re-ensures this exact lane detached and retries the
+    /// forward once against the fresh child. Callers inside a request
+    /// future MUST detach (`tokio::spawn` + await) — see the
+    /// `ensure_detached` contract in `crate::proxy`.
+    pub async fn ensure_key(&self, key: &str) -> Result<EngineRef, SupervisionError> {
         // Fast path: running (or sleeping — the child wakes on traffic).
         if let Some(inst) = self.instances.get(key) {
             let snapshot = (
@@ -1394,7 +1408,7 @@ impl Supervisor {
                         state: InstanceState::Ready,
                     });
                 }
-                return Ok(self.engine_ref(&live));
+                return Ok(self.engine_ref(key, &live));
             }
         }
 
@@ -1425,7 +1439,7 @@ impl Supervisor {
                 }
                 // Loader finished between checks.
                 if let Some(inst) = self.instances.get(key) {
-                    return Ok(self.engine_ref(inst.value()));
+                    return Ok(self.engine_ref(key, inst.value()));
                 }
                 return Err(SupervisionError::Internal(anyhow!(
                     "load of {key} vanished without result"
@@ -1530,9 +1544,10 @@ impl Drop for LoadAbort<'_> {
 
 impl Supervisor {
     #[allow(clippy::unused_self)] // symmetrical with future instance methods
-    fn engine_ref(&self, inst: &Instance) -> EngineRef {
+    fn engine_ref(&self, key: &str, inst: &Instance) -> EngineRef {
         EngineRef {
             name: inst.name.clone(),
+            key: key.to_string(),
             kind: inst.kind,
             endpoint: inst.endpoint.clone(),
             auth: inst.auth.clone(),
@@ -1897,7 +1912,7 @@ impl Supervisor {
                         state: InstanceState::Ready,
                     });
                     let inst = self.instances.get(ROUTER_KEY).expect("just inserted");
-                    return Ok(self.engine_ref(inst.value()));
+                    return Ok(self.engine_ref(ROUTER_KEY, inst.value()));
                 }
                 Err(e) => {
                     child_died_during_load |= child_died;
@@ -2870,7 +2885,7 @@ impl Supervisor {
                     }
                     // Engine proven healthy: clear the J2 crash-loop tracker.
                     self.engine_failures.lock().unwrap().clear();
-                    return Ok(self.engine_ref(inst.value()));
+                    return Ok(self.engine_ref(key, inst.value()));
                 }
                 Err(e) => {
                     // Health never came up: kill and retry once (port

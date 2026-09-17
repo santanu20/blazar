@@ -421,6 +421,53 @@ pub fn child_auth(rb: reqwest::RequestBuilder, engine: &EngineRef) -> reqwest::R
     clippy::too_many_lines,
     clippy::items_after_statements
 )] // one cohesive forwarding path: headers -> sentinel/enforce -> stream
+/// Crash-window variant of [`ensure_detached`]: re-ensures the exact
+/// INSTANCE lane that died (`model`, replica `model#N`, projector
+/// `model@vision`) instead of re-resolving the model name, which
+/// auto-routing could hand to a sibling replica. Rides the same detach
+/// contract — the respawn must survive a dropped request future.
+pub(crate) async fn ensure_key_detached(
+    sup: &std::sync::Arc<pallama_runtime::Supervisor>,
+    key: &str,
+) -> Result<EngineRef, SupervisionError> {
+    let sup = std::sync::Arc::clone(sup);
+    let key = key.to_string();
+    tokio::spawn(async move { sup.ensure_key(&key).await })
+        .await
+        .unwrap_or_else(|e| {
+            Err(SupervisionError::Internal(anyhow::anyhow!(
+                "respawn task panicked: {e}"
+            )))
+        })
+}
+
+/// One child-engine transport attempt: child auth, hop-by-hop header
+/// filtering, send. The hot path and the crash-window retry both ride
+/// it, so a retry carries identical auth and header hygiene.
+async fn forward_once(
+    state: &Arc<AppState>,
+    engine: &EngineRef,
+    method: &axum::http::Method,
+    url: &str,
+    headers: &HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let mut req = state.http.request(method.clone(), url);
+    // Client `Authorization` was stripped above; the child secret is
+    // stamped fresh here (never the caller's gateway key).
+    req = child_auth(req, engine);
+    for (name, value) in headers {
+        if !STRIP_REQUEST.contains(&name.as_str()) {
+            req = req.header(name, value);
+        }
+    }
+    req.body(reqwest::Body::wrap_stream(futures::stream::once(
+        async move { Ok::<_, std::io::Error>(body) },
+    )))
+    .send()
+    .await
+}
+
 pub async fn proxy_request(
     state: &Arc<AppState>,
     engine: &EngineRef,
@@ -499,33 +546,55 @@ pub async fn proxy_request(
         }
     }
 
-    let mut req = state.http.request(method.clone(), &url);
-    // Client `Authorization` was stripped above; the child secret is
-    // stamped fresh here (never the caller's gateway key).
-    req = child_auth(req, engine);
-    for (name, value) in headers {
-        if !STRIP_REQUEST.contains(&name.as_str()) {
-            req = req.header(name, value);
-        }
-    }
     // Bytes clone = refcount bump: the sentinel request-side parse reads
-    // this snapshot after `body` moved into the upstream stream.
-    let body_snapshot = body.clone();
-    let upstream = req
-        .body(reqwest::Body::wrap_stream(futures::stream::once(
-            async move { Ok::<_, std::io::Error>(body) },
-        )))
-        .send()
-        .await;
+    // this snapshot after `body` moved into the upstream stream. The
+    // crash-window retry below also rebuilds from it.
+    let mut body_snapshot = body.clone();
+    let upstream = forward_once(state, engine, method, &url, headers, body).await;
     let resp = match upstream {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(model, "proxy {path_query}: {e:#}");
-            // The child may have crashed: reap it now so the NEXT request
-            // respawns instead of 502-looping on a stale entry.
+            // The child died in the crash window between the health gate
+            // and this forward. Reap, respawn the exact lane detached,
+            // and retry ONCE in-band — single-shot clients (run
+            // --verbose) otherwise eat a 502 for a child they never
+            // got to talk to. The circuit breaker inside `ensure_key`
+            // bounds crash-looping; exactly one retry (H16).
             state.sup.reap_dead_children().await;
-            drop(sf); // F31: Drop removes the singleflight entry
-            return openai_error(502, &format!("engine request failed: {e:#}"));
+            match ensure_key_detached(&state.sup, &engine.key).await {
+                Ok(fresh) => {
+                    let fresh_url = format!("{}{path_query}", child_base(&fresh.endpoint));
+                    tracing::warn!(
+                        model,
+                        "proxy {path_query}: child died mid-request; retrying once on respawned lane {}",
+                        fresh.key
+                    );
+                    let retry_body =
+                        rewrite_child_model(&fresh, body_snapshot.clone(), parsed.as_ref());
+                    body_snapshot = retry_body.clone();
+                    match forward_once(state, &fresh, method, &fresh_url, headers, retry_body).await
+                    {
+                        Ok(r) => r,
+                        Err(e2) => {
+                            drop(sf); // F31: Drop removes the singleflight entry
+                            return openai_error(
+                                502,
+                                &format!(
+                                    "engine request failed: {e:#}; retry on respawned child: {e2:#}"
+                                ),
+                            );
+                        }
+                    }
+                }
+                Err(re) => {
+                    drop(sf); // F31: Drop removes the singleflight entry
+                    return openai_error(
+                        502,
+                        &format!("engine request failed: {e:#}; respawn: {re:#}"),
+                    );
+                }
+            }
         }
     };
 
