@@ -3641,9 +3641,40 @@ async fn serve() -> Result<()> {
         mgr.use_tag(&row.tag)?;
         println!("PALLAMA_ENGINE_PATH: engine local active ({})", p.display());
     }
-    let engine_row = store
-        .active_engine()?
-        .ok_or_else(|| anyhow!("no engine installed; run: pallama engine update"))?;
+    // Router mode is a llama-server feature (`--models-preset`): serve
+    // with the llamacpp lane even when another kind holds the active
+    // slot, so a JIT mistral.rs install (or any `engine use`) never
+    // breaks router mode while a llamacpp engine is installed.
+    let engine_row = if cfg.router {
+        let active = store.active_engine()?;
+        if active
+            .as_ref()
+            .is_some_and(|r| r.kind == EngineKind::LlamaCpp)
+        {
+            active
+        } else {
+            let llamacpp = store
+                .list_engines()?
+                .into_iter()
+                .filter(|r| r.kind == EngineKind::LlamaCpp)
+                .max_by_key(|r| r.installed_at);
+            match llamacpp {
+                Some(row) => {
+                    println!(
+                        "router mode: serving with llamacpp engine {} (active is {})",
+                        row.tag,
+                        active.map(|a| a.tag).unwrap_or_else(|| "none".into())
+                    );
+                    Some(row)
+                }
+                None => active,
+            }
+        }
+    } else {
+        store.active_engine()?
+    };
+    let engine_row =
+        engine_row.ok_or_else(|| anyhow!("no engine installed; run: pallama engine update"))?;
     let mut manifest: pallama_runtime::Manifest = serde_json::from_str(&engine_row.manifest)
         .with_context(|| format!("decode engine manifest {}", engine_row.tag))?;
     // Rows installed under a different data dir still resolve: adopt the
