@@ -6750,6 +6750,12 @@ async fn engine_update(
             ),
             None => println!("no active engine — target {target_tag}"),
         }
+        if let (Some((maj, min)), Some(pick)) = (&lane.driver_cuda, &lane.upstream_cuda) {
+            println!(
+                "driver CUDA {maj}.{min} — upstream official CUDA asset for this box: {} ({})",
+                pick.name, pick.label
+            );
+        }
         match (&lane.driver_cuda, &lane.cuda_asset) {
             (Some((maj, min)), Some(pick)) => println!(
                 "driver CUDA {maj}.{min} — prebuilt asset for this box: {} ({})",

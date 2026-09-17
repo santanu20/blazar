@@ -613,6 +613,47 @@ pub async fn nvidia_gpu_facts() -> (Option<(u32, u32)>, Option<(u32, u32)>) {
     (driver_cuda, compute_cap)
 }
 
+/// Runtime libs the cudart companion ships that a CUDA llama-server
+/// actually dlopens at boot (verified against the b11011 companion
+/// listing: libcublasLt, libcublas, libcudart). Checked per CUDA major.
+const CUDA_RUNTIME_LIBS: [&str; 3] = ["libcudart", "libcublas", "libcublasLt"];
+
+/// Decide from `ldconfig -p` output whether the system already exposes
+/// the full CUDA runtime for `major`, so a 410-594 MiB companion
+/// download can be skipped. Pure parser — unit-testable on any box.
+#[must_use]
+pub fn cuda_runtime_complete_from_ldconfig(text: &str, major: u32) -> bool {
+    let suffix = format!(".so.{major} ");
+    CUDA_RUNTIME_LIBS.iter().all(|lib| {
+        text.lines()
+            .any(|l| l.trim_start().starts_with(lib) && l.contains(&suffix))
+    })
+}
+
+/// Live probe: does this system expose the full CUDA runtime for
+/// `major`? Linux parses `ldconfig -p` (cudart + cublas + cublasLt for
+/// the major); non-Linux always answers false — Windows resolves DLLs
+/// from the exe dir, so the companion belongs beside the binary and the
+/// probe would only risk a wrong skip.
+pub async fn system_cuda_runtime_complete(major: u32) -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new("ldconfig").arg("-p").output(),
+    )
+    .await
+    .ok()
+    .and_then(std::result::Result::ok);
+    match out {
+        Some(o) => cuda_runtime_complete_from_ldconfig(&String::from_utf8_lossy(&o.stdout), major),
+        // ldconfig missing (exotic distro): treat as incomplete — the
+        // companion download is the fail-safe answer, never a skip.
+        None => false,
+    }
+}
+
 async fn query_compute_caps(tc: &Toolchain) -> Result<String> {
     let smi = tc.nvidia_smi.as_ref().ok_or_else(|| {
         anyhow!(
@@ -848,6 +889,26 @@ mod tests {
         assert_eq!(parse_version_pair(""), None);
         assert_eq!(parse_version_pair("x.y"), None);
         assert_eq!(parse_version_pair("13"), None);
+    }
+
+    #[test]
+    fn unit__cuda_runtime_complete_from_ldconfig__needs_all_three_for_major() {
+        // Real `ldconfig -p` row shape (indent + name (arch) => path).
+        let full_12 = "\
+        \tlibcudart.so.12 (libc6,x86-64) => /usr/local/cuda/lib64/libcudart.so.12\n\
+        \tlibcublas.so.12 (libc6,x86-64) => /lib/x86_64-linux-gnu/libcublas.so.12\n\
+        \tlibcublasLt.so.12 (libc6,x86-64) => /lib/x86_64-linux-gnu/libcublasLt.so.12\n\
+        \tlibcuda.so.1 (libc6,x86-64) => /lib/x86_64-linux-gnu/libcuda.so.1\n";
+        assert!(cuda_runtime_complete_from_ldconfig(full_12, 12));
+        // Missing libcublasLt: incomplete — the companion is the
+        // fail-safe answer, never a half-skip.
+        let no_lt = &full_12.replace("libcublasLt.so.12", "libother.so.12");
+        assert!(!cuda_runtime_complete_from_ldconfig(no_lt, 12));
+        // Wrong major present only: a 13 pick must not ride on 12 libs.
+        assert!(!cuda_runtime_complete_from_ldconfig(full_12, 13));
+        // Unversioned .so alone never satisfies a major query.
+        let unversioned = "\tlibcudart.so (libc6,x86-64) => /opt/cuda/lib/libcudart.so\n";
+        assert!(!cuda_runtime_complete_from_ldconfig(unversioned, 12));
     }
 
     #[test]

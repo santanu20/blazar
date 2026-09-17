@@ -78,6 +78,10 @@ pub struct EngineManager {
 pub struct LaneCheck {
     /// Channel target tag (e.g. `b10985`).
     pub target_tag: String,
+    /// Upstream official ubuntu-cuda asset this box would install from
+    /// the target release itself (lane 1); `None` when the release
+    /// ships no driver-runnable upstream CUDA asset.
+    pub upstream_cuda: Option<gh::AssetPick>,
     /// Derived overlay tag an NVIDIA/linux box would install
     /// (`b10985-cuda`); `None` when the CUDA lane does not apply
     /// (asset pin, non-NVIDIA, or pre-CUDA-12 driver).
@@ -130,6 +134,17 @@ pub fn is_cuda_engine(tag: &str, asset_label: &str) -> bool {
 /// dormant — the guard in `register_engine_with_vendor` refuses to
 /// activate it after the fact. Deciding the same thing BEFORE the
 /// download skips the ~28 MiB fetch + probe of an engine that will
+/// Preconditions every CUDA lane probe in `maybe_cuda_overlay` shares:
+/// the driver's CUDA ceiling, the GPU's compute capability (as sm), the
+/// asset arch lane (`x64`/`arm64`), and the upstream build number the
+/// update targets.
+struct CudaLane {
+    driver_cuda: (u32, u32),
+    sm: Option<u32>,
+    arch: &'static str,
+    number: u64,
+}
+
 /// Result of the overlay-lag fallback probe (see
 /// `overlay_lag_fallback`): which of the three lanes the run
 /// actually took, so narration matches the decision.
@@ -220,14 +235,21 @@ impl EngineManager {
     pub async fn check_lane(&self, release: &GhRelease) -> Result<LaneCheck> {
         let mut out = LaneCheck {
             target_tag: release.tag_name.clone(),
+            upstream_cuda: None,
             overlay_tag: None,
             cuda_asset: None,
             newest_cuda: None,
             driver_cuda: None,
         };
+        // Same arch universe as the install-time lane (x64/arm64 linux).
+        let arch = match std::env::consts::ARCH {
+            "x86_64" => "x64",
+            "aarch64" => "arm64",
+            _ => "",
+        };
         if (self.asset_override != "auto" && !self.asset_override.is_empty())
             || std::env::consts::OS != "linux"
-            || std::env::consts::ARCH != "x86_64"
+            || arch.is_empty()
             || system_vendor_hint() != manifest::Vendor::Nvidia
         {
             return Ok(out); // standard asset lane; no CUDA story to report
@@ -245,6 +267,8 @@ impl EngineManager {
         if dc.0 < 12 {
             return Ok(out);
         }
+        // Lane 1 report: the release's own ubuntu-cuda assets.
+        out.upstream_cuda = gh::resolve_cuda_asset(release, dc, sm, arch);
         let overlay_tag = format!("b{number}-cuda");
         out.overlay_tag = Some(overlay_tag.clone());
         if let Ok(overlay) = self
@@ -252,7 +276,7 @@ impl EngineManager {
             .release_by_tag_repo(&gh::engine_overlay_repo(), &overlay_tag)
             .await
         {
-            out.cuda_asset = gh::resolve_cuda_asset(&overlay, dc, sm);
+            out.cuda_asset = gh::resolve_cuda_asset(&overlay, dc, sm, arch);
             out.newest_cuda = gh::newest_asset_cuda(&overlay);
         }
         // A missing overlay release stays overlay_tag=Some + asset=None:
@@ -336,22 +360,36 @@ impl EngineManager {
                  capability probed (nvidia-smi absent or failed)"
             ));
         };
-        let pick = gh::resolve_cuda_asset(&release, driver_cuda, sm)
+        let arch = match std::env::consts::ARCH {
+            "x86_64" => "x64",
+            "aarch64" => "arm64",
+            other => {
+                return Err(anyhow!(
+                    "no CUDA overlay asset for CPU arch {other} (prebuilt lane \
+                     publishes x64 and arm64 only) — `pallama engine build cuda` \
+                     compiles locally"
+                ));
+            }
+        };
+        let pick = gh::resolve_cuda_asset(&release, driver_cuda, sm, arch)
             .ok_or_else(|| anyhow!("no driver-runnable CUDA asset in overlay release {tag}"))?;
-        self.install_picked(&release, &pick)
+        self.install_picked(&release, &pick, None)
             .await
             .with_context(|| format!("install overlay {tag} asset {}", pick.label))
     }
 
-    /// Prebuilt CUDA overlay: when this machine is Linux-x86_64-NVIDIA
-    /// with a CUDA-capable driver and our CI has published a
-    /// `bNNNN-cuda` release for the resolved upstream build, install
-    /// that instead of the Vulkan asset (~4% decode uplift, bundled
-    /// cudart/cublas, no toolkit needed). Any miss — release absent,
-    /// asset not runnable — is a quiet return to the normal lane: the
-    /// Vulkan path stays the universal fallback. Zero-touch: the
-    /// overlay repo defaults to the project home; `PALLAMA_ENGINE_REPO`
-    /// exists purely for forks.
+    /// Prebuilt CUDA lane: when this machine is Linux-NVIDIA (x64 or
+    /// arm64) with a CUDA-capable driver, prefer a prebuilt CUDA engine
+    /// over the Vulkan asset (~4% decode uplift). Chain, first wins:
+    /// (1) upstream official ubuntu-cuda asset from the SAME release
+    /// (generic SASS + CPU dispatch — runs on nearly every box, needs
+    /// a system CUDA runtime or the cudart companion), (2) our CI's
+    /// `bNNNN-cuda` overlay for the same tag (sm-slim SASS, bundled
+    /// cudart), (3) the newest published overlay build (overlay-lag
+    /// fallback), else the Vulkan universal fallback. Any miss — asset
+    /// absent, not runnable — is a quiet return to the next lane.
+    /// Zero-touch: the overlay repo defaults to the project home;
+    /// `PALLAMA_ENGINE_REPO` exists purely for forks.
     async fn maybe_cuda_overlay(
         &self,
         release: &GhRelease,
@@ -360,9 +398,18 @@ impl EngineManager {
         if self.asset_override != "auto" && !self.asset_override.is_empty() {
             return Ok(None); // explicit asset pin wins over every heuristic
         }
-        if std::env::consts::OS != "linux" || std::env::consts::ARCH != "x86_64" {
-            return Ok(None);
+        if std::env::consts::OS != "linux" {
+            return Ok(None); // upstream/overlay CUDA assets are linux-only tarballs
         }
+        // Upstream names its assets ...-cuda-{X.Y}-{arch}.tar.gz with
+        // arch in {x64, arm64}; keep the box's own lane.
+        let arch = if std::env::consts::ARCH == "aarch64" {
+            "arm64"
+        } else if std::env::consts::ARCH == "x86_64" {
+            "x64"
+        } else {
+            return Ok(None); // no upstream CUDA asset for this CPU arch
+        };
         if system_vendor_hint() != manifest::Vendor::Nvidia {
             return Ok(None);
         }
@@ -391,7 +438,19 @@ impl EngineManager {
             );
             return Ok(None);
         }
-        let overlay_tag = format!("b{number}-cuda");
+        let lane = CudaLane {
+            driver_cuda,
+            sm,
+            arch,
+            number,
+        };
+        // Lane 1 — upstream official CUDA (same tag, driver-capped,
+        // generic SASS + CPU dispatch). Falls through to the overlay on
+        // a decline or a probe-class failure; infra errors propagate.
+        if let Some(row) = self.upstream_lane_or_none(release, &lane).await? {
+            return Ok(Some(row));
+        }
+        let overlay_tag = format!("b{}-cuda", lane.number);
         let overlay = match self.gh.release_by_tag_repo(&repo, &overlay_tag).await {
             Ok(r) => r,
             Err(e) => {
@@ -403,22 +462,11 @@ impl EngineManager {
                     "no CUDA overlay release {overlay_tag} in {repo} yet \
                      ({e:#}) — probing published overlay builds as a fallback"
                 );
-                if !exact_pin {
-                    match self.overlay_lag_fallback(driver_cuda, sm, number).await? {
-                        LagOutcome::Installed(row) => return Ok(Some(row)),
-                        LagOutcome::AlreadyActive(row) => {
-                            tracing::warn!(
-                                "overlay hasn't published {overlay_tag} yet ({repo} drops \
-                                 hourly); newest published CUDA build {} is already active — \
-                                 rerun `pallama engine update` after the next overlay drop, \
-                                 or run `pallama engine build cuda` to compile {} locally now",
-                                row.tag,
-                                release.tag_name
-                            );
-                            return Ok(Some(row));
-                        }
-                        LagOutcome::NothingRunnable => {} // Vulkan warn below is truthful
-                    }
+                if let Some(row) = self
+                    .overlay_lag_or_none(&overlay_tag, exact_pin, &lane, &release.tag_name)
+                    .await?
+                {
+                    return Ok(Some(row));
                 }
                 tracing::warn!(
                     "overlay fallback found nothing runnable; using the \
@@ -429,13 +477,13 @@ impl EngineManager {
                 return Ok(None);
             }
         };
-        if let Some(pick) = gh::resolve_cuda_asset(&overlay, driver_cuda, sm) {
+        if let Some(pick) = gh::resolve_cuda_asset(&overlay, lane.driver_cuda, lane.sm, lane.arch) {
             tracing::info!(
                 "installing prebuilt CUDA engine from {repo} {overlay_tag} ({})",
                 pick.label
             );
             let row = self
-                .install_picked(&overlay, &pick)
+                .install_picked(&overlay, &pick, None)
                 .await
                 .with_context(|| format!("install overlay {overlay_tag}"))?;
             Ok(Some(row))
@@ -447,11 +495,142 @@ impl EngineManager {
                  runs {}.{} — staying on the Vulkan lane. Options: pallama \
                  engine build cuda (builds locally for THIS driver), or pin \
                  an older overlay tag: pallama engine install b<N>-cuda",
-                driver_cuda.0,
-                driver_cuda.1
+                lane.driver_cuda.0,
+                lane.driver_cuda.1
             );
             Ok(None)
         }
+    }
+
+    /// Lane 1 of the prebuilt chain: try the upstream release's own
+    /// official ubuntu-cuda asset before any overlay probe. `None`
+    /// means the lane declined or the binary proved unusable here —
+    /// the overlay lanes are the next resort; hard errors propagate.
+    async fn upstream_lane_or_none(
+        &self,
+        release: &GhRelease,
+        lane: &CudaLane,
+    ) -> Result<Option<EngineRow>> {
+        let Some(pick) = gh::resolve_cuda_asset(release, lane.driver_cuda, lane.sm, lane.arch)
+        else {
+            return Ok(None);
+        };
+        match self.install_upstream_cuda(release, &pick).await {
+            Ok(Some(row)) => Ok(Some(row)),
+            // lane politely declined (no companion) — try overlay
+            Ok(None) => Ok(None),
+            Err(e)
+                if e.chain()
+                    .any(|c| c.to_string().contains(ENGINE_PROBE_FAILED)) =>
+            {
+                tracing::warn!(
+                    "upstream CUDA asset {} unusable on this machine \
+                     ({e:#}) — trying the overlay lane",
+                    pick.label
+                );
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The overlay-lag arm of [`EngineManager::maybe_cuda_overlay`]:
+    /// when the same-tag overlay release is missing, run the lag
+    /// fallback (never for an exact pin — a user-pinned tag must not be
+    /// silently swapped for an older build) and narrate each outcome.
+    /// `Some(row)` = a lag lane resolved the update; `None` = fall
+    /// through to the Vulkan warn.
+    async fn overlay_lag_or_none(
+        &self,
+        overlay_tag: &str,
+        exact_pin: bool,
+        lane: &CudaLane,
+        target_tag: &str,
+    ) -> Result<Option<EngineRow>> {
+        if exact_pin {
+            return Ok(None);
+        }
+        match self.overlay_lag_fallback(lane).await? {
+            LagOutcome::Installed(row) => Ok(Some(row)),
+            LagOutcome::AlreadyActive(row) => {
+                tracing::warn!(
+                    "overlay hasn't published {overlay_tag} yet ({} drops hourly); \
+                     newest published CUDA build {} is already active — rerun \
+                     `pallama engine update` after the next overlay drop, or run \
+                     `pallama engine build cuda` to compile {target_tag} locally now",
+                    gh::engine_overlay_repo(),
+                    row.tag
+                );
+                Ok(Some(row))
+            }
+            LagOutcome::NothingRunnable => Ok(None), // Vulkan warn is truthful
+        }
+    }
+
+    /// Lane 1 of the prebuilt chain: install the upstream release's
+    /// official ubuntu-cuda asset under the overlay's `bNNNN-cuda` tag
+    /// (same lane separation, keep-CUDA guard, and prune semantics).
+    /// Skips (returns `Ok(None)`) when the system lacks the CUDA runtime
+    /// for the pick's major AND the release ships no cudart companion —
+    /// better a quiet lane decline than a guaranteed-dead 168 MB
+    /// download. The cudart companion extracts beside the binaries;
+    /// RUNPATH=$ORIGIN resolves it with zero env wiring.
+    async fn install_upstream_cuda(
+        &self,
+        release: &GhRelease,
+        pick: &gh::AssetPick,
+    ) -> Result<Option<EngineRow>> {
+        // AssetPick::label is `ubuntu-cuda-{major.minor}-{arch}` — the
+        // major decides which runtime libs must be present.
+        let cuda_major = pick
+            .label
+            .split_once("ubuntu-cuda-")
+            .and_then(|(_, rest)| rest.split('.').next().map(str::to_owned))
+            .and_then(|m| m.parse::<u32>().ok());
+        let Some(cuda_major) = cuda_major else {
+            tracing::warn!(
+                "cannot parse CUDA major from asset label {} — skipping the \
+                 upstream CUDA lane this update",
+                pick.label
+            );
+            return Ok(None);
+        };
+        let runtime_present = build::system_cuda_runtime_complete(cuda_major).await;
+        let companion = gh::resolve_cudart_companion(release, pick);
+        if companion.is_none() && !runtime_present {
+            tracing::warn!(
+                "system lacks the CUDA {} runtime and release {} ships no \
+                 cudart companion for {} — skipping the upstream CUDA lane \
+                 (overlay bundles its own runtime)",
+                cuda_major,
+                release.tag_name,
+                pick.label
+            );
+            return Ok(None);
+        }
+        // Register under the overlay tag so the row lands in the CUDA
+        // lane (is_cuda_build, keep-CUDA guard, one-per-lane prune) —
+        // install_picked finds the asset by pick.name, so the cloned
+        // release with a rewritten tag resolves identically.
+        let mut cuda_release = release.clone();
+        if !cuda_release.tag_name.ends_with("-cuda") {
+            cuda_release.tag_name = format!("{}-cuda", cuda_release.tag_name);
+        }
+        tracing::info!(
+            "installing upstream CUDA engine {} ({}){}",
+            cuda_release.tag_name,
+            pick.label,
+            if companion.is_some() {
+                " + cudart companion"
+            } else {
+                " (system runtime)"
+            }
+        );
+        let row = self
+            .install_picked(&cuda_release, pick, companion.as_ref())
+            .await
+            .with_context(|| format!("install upstream {}", cuda_release.tag_name))?;
+        Ok(Some(row))
     }
 
     /// Overlay-lag fallback for channel updates: the channel target is
@@ -466,12 +645,7 @@ impl EngineManager {
     /// collapse into `None` and read as "found nothing runnable",
     /// printing a Vulkan-lane switch the keep-CUDA guard then
     /// cancelled — three contradictory decisions in one run.
-    async fn overlay_lag_fallback(
-        &self,
-        driver_cuda: (u32, u32),
-        sm: Option<u32>,
-        target: u64,
-    ) -> Result<LagOutcome> {
+    async fn overlay_lag_fallback(&self, lane: &CudaLane) -> Result<LagOutcome> {
         let repo = gh::engine_overlay_repo();
         let releases = match self.gh.list_releases_repo(&repo).await {
             Ok(r) => r,
@@ -480,7 +654,13 @@ impl EngineManager {
                 return Ok(LagOutcome::NothingRunnable);
             }
         };
-        let Some(pick_rel) = gh::newest_runnable_overlay(&releases, driver_cuda, sm, target) else {
+        let Some(pick_rel) = gh::newest_runnable_overlay(
+            &releases,
+            lane.driver_cuda,
+            lane.sm,
+            lane.number,
+            lane.arch,
+        ) else {
             return Ok(LagOutcome::NothingRunnable);
         };
         if let Some(row) = Store::open(&self.dirs)?.active_engine()? {
@@ -492,10 +672,13 @@ impl EngineManager {
                 return Ok(LagOutcome::AlreadyActive(row));
             }
         }
-        let Some(pick) = gh::resolve_cuda_asset(pick_rel, driver_cuda, sm) else {
+        let Some(pick) = gh::resolve_cuda_asset(pick_rel, lane.driver_cuda, lane.sm, lane.arch)
+        else {
             return Ok(LagOutcome::NothingRunnable); // consistency guard; selection pre-filtered
         };
-        let behind = target.saturating_sub(gh::btag_number(&pick_rel.tag_name).unwrap_or(0));
+        let behind = lane
+            .number
+            .saturating_sub(gh::btag_number(&pick_rel.tag_name).unwrap_or(0));
         tracing::warn!(
             "overlay lags the channel target by {behind} build(s): installing \
              published {} instead ({} asset; fresh overlay builds land hourly)",
@@ -503,7 +686,7 @@ impl EngineManager {
             pick.label
         );
         let row = self
-            .install_picked(pick_rel, &pick)
+            .install_picked(pick_rel, &pick, None)
             .await
             .with_context(|| format!("install overlay fallback {}", pick_rel.tag_name))?;
         Ok(LagOutcome::Installed(row))
@@ -545,7 +728,7 @@ impl EngineManager {
                         );
                     }
                     return self
-                        .install_picked(&release, &pick)
+                        .install_picked(&release, &pick, None)
                         .await
                         .with_context(|| format!("install {tag_name} asset {}", pick.label));
                 }
@@ -613,11 +796,17 @@ impl EngineManager {
     }
 
     /// Download, verify, extract, then register (probe + store +
-    /// activate + prune).
+    /// activate + prune). `companion` is the optional cudart runtime
+    /// archive (upstream splits the CUDA runtime out of the main
+    /// tarball): downloaded after the main extract and flattened into
+    /// the server binary's dir — the binaries carry RUNPATH=$ORIGIN
+    /// (verified b11011), so libs beside the binary resolve with no env
+    /// wiring, and Windows resolves DLLs from the exe dir natively.
     pub async fn install_picked(
         &self,
         release: &GhRelease,
         pick: &gh::AssetPick,
+        companion: Option<&gh::GhAsset>,
     ) -> Result<EngineRow> {
         let asset = release
             .assets
@@ -654,6 +843,42 @@ impl EngineManager {
         if let Err(e) = extracted {
             let _ = std::fs::remove_dir_all(&dir);
             return Err(e);
+        }
+        if let Some(comp) = companion {
+            let comp_size = comp
+                .size
+                .map_or_else(String::new, |b| format!(" ({} MiB)", b / 1_048_576));
+            tracing::info!(
+                "downloading CUDA runtime companion {}{} — the system lacks \
+                 the runtime for this build and the binary dlopens it at boot",
+                comp.name,
+                comp_size
+            );
+            let comp_archive = dir.join(&comp.name);
+            if let Err(e) = self.gh.download_asset_file(comp, &comp_archive).await {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(e);
+            }
+            let scratch = dir.join("cudart-incoming");
+            std::fs::create_dir_all(&scratch).context("stage companion extract")?;
+            let comp_extracted = extract_archive_file(&comp_archive, &scratch, &comp.name);
+            let _ = std::fs::remove_file(&comp_archive);
+            let merged = comp_extracted.and_then(|()| {
+                let server = find_server(&dir).map_err(|e| {
+                    e.context(ENGINE_PROBE_FAILED)
+                        .context("companion merge needs the server binary location")
+                })?;
+                let bin_dir = server
+                    .parent()
+                    .ok_or_else(|| anyhow!("server path {} has no parent", server.display()))?
+                    .to_path_buf();
+                flatten_payload_into(&scratch, &bin_dir)
+            });
+            let _ = std::fs::remove_dir_all(&scratch);
+            if let Err(e) = merged {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(e);
+            }
         }
         self.register_or_clean(
             &dir,
@@ -1169,6 +1394,38 @@ fn extract_reader<R: std::io::Read + std::io::Seek>(
 /// (release archives use `llama-<tag>/llama-server` roots).
 pub(crate) fn find_server(dir: &Path) -> Result<PathBuf> {
     find_engine_binary(dir, &["llama-server", "llama-server.exe"])
+}
+
+/// Move every file of an extracted runtime payload (cudart companion)
+/// into `dst`, flattening whatever root layout the archive used —
+/// upstream wraps it in its own top-level dir, and the layout differs
+/// per platform, so the merge must not depend on it. Same-filesystem
+/// renames; an existing file of the same name wins (the main tarball
+/// is authoritative) and the incoming copy is dropped.
+fn flatten_payload_into(src: &Path, dst: &Path) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(src) else {
+        return Ok(()); // nothing staged: nothing to merge
+    };
+    for entry in entries.flatten() {
+        let from = entry.path();
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            flatten_payload_into(&from, dst)?;
+            let _ = std::fs::remove_dir(&from);
+        } else {
+            let to = dst.join(entry.file_name());
+            if to.exists() {
+                tracing::debug!(
+                    "runtime payload file {} already present — keeping the main tarball's copy",
+                    to.display()
+                );
+                let _ = std::fs::remove_file(&from);
+            } else {
+                std::fs::rename(&from, &to)
+                    .with_context(|| format!("merge {} into {}", from.display(), to.display()))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Find an engine binary by exact file name anywhere under `dir`,
