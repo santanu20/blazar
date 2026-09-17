@@ -141,8 +141,12 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
     }
     let avail = disk_avail_bytes(dir).context("disk preflight")?;
     if avail < SGLANG_MIN_DISK_BYTES {
+        // Compare AND display in the same unit (GiB = 1024^3): an
+        // earlier revision divided bytes by 1e9 for the message, so a
+        // 9.4-GiB-free disk printed "10.1 GiB avail" while being
+        // refused — an apparent contradiction (live-reported).
         #[allow(clippy::cast_precision_loss)]
-        let avail_gib = avail as f64 / 1e9;
+        let avail_gib = avail as f64 / f64::from(1024 * 1024 * 1024);
         anyhow::bail!(
             "sglang needs >= {} GiB free for its venv (torch + flashinfer); \
              {} has only {avail_gib:.1} GiB avail",
