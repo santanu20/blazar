@@ -2151,17 +2151,43 @@ pub const MISTRALRS_TUNING_BOOL_FLAGS: &[&str] = &[
 /// ctx math, so an f16 estimate here would be a lie.
 #[allow(clippy::too_many_lines)] // one flat flag inventory, not logic
 #[allow(clippy::cast_precision_loss)] // MiB-scale integers: 52-bit f64 mantissa is exact here
-/// Derive `--pa-memory-fraction` from FREE VRAM when a GPU co-tenant
-/// shrinks the pool upstream's 0.90-of-total default would silently
-/// truncate into empty responses (live-proven: instant ~60ms empties on
-/// long prompts, real replies on short ones — the worst failure mode,
-/// serving while broken). Ladder mirrors sglang: derive a fraction that
-/// fits what is actually free → fall back to classic ctx-sized KV →
-/// warn with numbers. No-op on single-tenant boxes (free ≈ total) and
-/// when the operator pinned `mistralrs_pa_memory_fraction` or turned
-/// paged attention off. `forced_on`: `mistralrs_paged_attn = true` was
+/// f16-element KV bytes for a full context: `layers × kv_heads ×
+/// head_dim × 2 (K+V) × ctx × elem`. Shared by the sglang fit ladder
+/// and the mistral.rs pa-fraction derive so both engines size KV from
+/// ONE formula. `None` = checkpoint lacks complete KV geometry.
+fn hf_kv_bytes(kv: &crate::hfmeta::KvGeom, ctx: u64, elem: u64) -> Option<u64> {
+    Some(
+        kv.layers?
+            .saturating_mul(kv.kv_heads?)
+            .saturating_mul(kv.head_dim?)
+            .saturating_mul(2)
+            .saturating_mul(ctx)
+            .saturating_mul(elem),
+    )
+}
+
+/// Derive `--pa-memory-fraction` from what the spawn actually NEEDS,
+/// not from what the card happens to have. Two candidates, min wins:
+///
+/// * geometry — weights + ctx-sized f16 KV + runtime floor, from the
+///   checkpoint's own KV geometry. Upstream's 0.90-of-TOTAL default
+///   made a 0.5B spawn hold ~7 GiB of an 8 GiB card (live-proven:
+///   6984 MiB resident for a 942 MiB model) and starve every
+///   co-resident lane pallama routes beside it — sizing KV to serving
+///   intent (ctx × slots geometry) is the fix, mirroring the sglang
+///   ladder. Absent geometry (incomplete config.json) degrades
+///   silently to the co-tenant guard below.
+/// * free-VRAM budget — when a GPU co-tenant shrinks the pool
+///   upstream's fraction would silently truncate into empty responses
+///   (live-proven: instant ~60ms empties on long prompts, real replies
+///   on short ones — the worst failure mode, serving while broken).
+///
+/// No-op when the operator pinned `mistralrs_pa_memory_fraction`,
+/// the engine lacks the flag, or (no geometry AND single-tenant —
+/// nothing to correct). `forced_on`: `mistralrs_paged_attn = true` was
 /// pinned — never emit a conflicting `--paged-attn off`, warn instead.
-fn derive_pa_fraction_under_cotenancy(
+#[allow(clippy::cast_precision_loss)] // MiB-scale integers: 52-bit f64 mantissa is exact here
+fn derive_pa_fraction(
     input: &ProfileInput<'_>,
     argv: &mut Vec<String>,
     warnings: &mut Vec<String>,
@@ -2170,6 +2196,7 @@ fn derive_pa_fraction_under_cotenancy(
     const COTENANT_SLACK_MIB: u64 = 256;
     const HEADROOM_MIB: i64 = 512;
     const MIN_KV_MIB: i64 = 256;
+    const MISTRALRS_RUNTIME_FLOOR_MIB: i64 = 512;
     const MIB: u64 = 1024 * 1024;
     if input.config.mistralrs_pa_memory_fraction.is_some() {
         return;
@@ -2178,41 +2205,98 @@ fn derive_pa_fraction_under_cotenancy(
         return;
     }
     let total = input.hardware.total_vram_mib();
-    let free = input.hardware.free_vram_mib();
-    if total == 0 || free == 0 || free + COTENANT_SLACK_MIB >= total {
+    if total == 0 {
         return;
     }
+    let free = input.hardware.free_vram_mib();
     let mmproj = input
         .mmproj_path
         .and_then(|p| std::fs::metadata(p).ok())
         .map_or(0, |m| m.len());
-    let resident = (input.model_bytes.saturating_add(mmproj)) / MIB;
-    let budget = free.cast_signed() - resident.cast_signed() - HEADROOM_MIB;
-    if budget >= MIN_KV_MIB {
-        let frac = (budget as f64 / total as f64).clamp(0.05, 0.90);
+    let resident_mib: i64 = ((input.model_bytes.saturating_add(mmproj)) / MIB) as i64;
+
+    // Candidate 1: geometry — only for safetensors dirs (HfMeta). The
+    // GGUF-on-mistralrs lane keeps the co-tenant guard only; GGUF KV
+    // sizing lives in the llamacpp arch tables.
+    let ctx = resolve_ctx(input, input.overlay, &mut Vec::new()) as u64;
+    let geometry_mib: Option<i64> = match input.meta {
+        crate::hfmeta::ModelMeta::Hf(hf) => hf_kv_bytes(&hf.kv, ctx, 2).map(|b| (b / MIB) as i64),
+        crate::hfmeta::ModelMeta::Gguf(_) => None,
+    };
+    let geometry_frac = geometry_mib
+        .map(|kv| (resident_mib + kv + MISTRALRS_RUNTIME_FLOOR_MIB) as f64 / total as f64);
+
+    // Candidate 2: free-VRAM budget under a co-tenant.
+    let cotenant = free > 0 && free + COTENANT_SLACK_MIB < total;
+    let budget_mib: Option<i64> = cotenant.then_some(free as i64 - resident_mib - HEADROOM_MIB);
+
+    let mut emit = |frac: f64, warn: String| {
+        let frac = frac.clamp(0.05, 0.90);
         argv.push("--pa-memory-fraction".into());
         argv.push(format!("{frac:.2}"));
-        warnings.push(format!(
-            "pa-memory-fraction {frac:.2} derived from free VRAM: a GPU co-tenant holds \
-             most of the card (total {total} MiB, free {free} MiB, weights+projector \
-             {resident} MiB) — upstream's 0.90-of-total default would silently truncate \
-             the KV pool into empty responses; pin mistralrs_pa_memory_fraction to override"
-        ));
-    } else if !forced_on {
-        argv.push("--paged-attn".into());
-        argv.push("off".into());
-        warnings.push(format!(
-            "paged-attn off: the GPU co-tenant leaves no paged-KV room (total {total} MiB, \
-             free {free} MiB, weights+projector {resident} MiB) — classic ctx-sized KV \
-             either serves or fails loudly at load; free the GPU or reroute the model"
-        ));
-    } else {
-        warnings.push(format!(
-            "GPU co-tenant leaves ~{} MiB for paged KV (total {total} MiB, free {free} MiB, \
-             weights+projector {resident} MiB) — expect a loud load failure; set \
-             mistralrs_paged_attn = false for classic KV or free the GPU",
-            budget.max(0)
-        ));
+        warnings.push(warn);
+    };
+
+    match (geometry_frac, budget_mib) {
+        // Both apply: the need must fit the free pool — min wins.
+        (Some(g), Some(b)) if b >= MIN_KV_MIB => {
+            emit(
+                g.min(b as f64 / total as f64),
+                format!(
+                    "pa-memory-fraction {g:.2}→min(geometry, free) applied: a GPU co-tenant holds \
+                 part of the card (total {total} MiB, free {free} MiB, weights+projector \
+                 {resident_mib} MiB); pin mistralrs_pa_memory_fraction to override"
+                ),
+            );
+        }
+        // Geometry alone (single tenant): the idle-GPU grab fix — KV
+        // sized to ctx×geometry, the rest of the card stays free for
+        // co-resident lanes.
+        (Some(g), None) => {
+            emit(g, format!(
+                "pa-memory-fraction {g:.2} sized from model geometry (weights+projector \
+                 {resident_mib} MiB + f16 KV {} MiB at ctx {ctx} + floor {MISTRALRS_RUNTIME_FLOOR_MIB} MiB, \
+                 of {total} MiB total) — upstream's 0.90-of-total default would grab the \
+                 whole card and starve co-resident lanes; pin mistralrs_pa_memory_fraction \
+                 to override",
+                geometry_mib.unwrap_or(0)
+            ));
+        }
+        // Co-tenant guard only (no geometry): the historical behavior.
+        (None, Some(b)) if b >= MIN_KV_MIB => {
+            let frac = b as f64 / total as f64;
+            emit(
+                frac,
+                format!(
+                    "pa-memory-fraction {frac:.2} derived from free VRAM: a GPU co-tenant holds \
+                 most of the card (total {total} MiB, free {free} MiB, weights+projector \
+                 {resident_mib} MiB) — upstream's 0.90-of-total default would silently truncate \
+                 the KV pool into empty responses; pin mistralrs_pa_memory_fraction to override"
+                ),
+            );
+        }
+        // No viable paged pool next to the tenant (geometry can't
+        // rescue it: the need includes weights, which already exceed
+        // free) — classic ctx-sized KV either serves or fails loudly.
+        (_, Some(_)) if !forced_on => {
+            argv.push("--paged-attn".into());
+            argv.push("off".into());
+            warnings.push(format!(
+                "paged-attn off: the GPU co-tenant leaves no paged-KV room (total {total} MiB, \
+                 free {free} MiB, weights+projector {resident_mib} MiB) — classic ctx-sized KV \
+                 either serves or fails loudly at load; free the GPU or reroute the model"
+            ));
+        }
+        (_, Some(_)) => {
+            warnings.push(format!(
+                "GPU co-tenant leaves ~{} MiB for paged KV (total {total} MiB, free {free} MiB, \
+                 weights+projector {resident_mib} MiB) — expect a loud load failure; set \
+                 mistralrs_paged_attn = false for classic KV or free the GPU",
+                budget_mib.map_or(0, |b| b.max(0))
+            ));
+        }
+        // No geometry, single tenant: nothing to correct.
+        (None, None) => {}
     }
 }
 
@@ -2286,7 +2370,7 @@ fn compile_mistralrs(
                 argv.push("--paged-attn".into());
                 argv.push(if pa { "on".into() } else { "off".into() });
                 if pa {
-                    derive_pa_fraction_under_cotenancy(input, &mut argv, &mut warnings, true);
+                    derive_pa_fraction(input, &mut argv, &mut warnings, true);
                 }
             } else {
                 warnings.push(
@@ -2323,7 +2407,7 @@ fn compile_mistralrs(
                     // PA stays on (weights fit): under a co-tenant the
                     // upstream 0.90-of-total fraction still points at
                     // absent memory — derive from free instead.
-                    derive_pa_fraction_under_cotenancy(input, &mut argv, &mut warnings, false);
+                    derive_pa_fraction(input, &mut argv, &mut warnings, false);
                 }
             }
         }
@@ -2954,15 +3038,8 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
         .unwrap_or_else(|| "auto".to_string());
     let kv_bytes_at = |elem: u64| -> Option<u64> {
         // layers * kv_heads * head_dim * 2 (K and V) * ctx * elem bytes
-        Some(
-            hf.kv
-                .layers?
-                .saturating_mul(hf.kv.kv_heads?)
-                .saturating_mul(hf.kv.head_dim?)
-                .saturating_mul(2)
-                .saturating_mul(u64::from(ctx))
-                .saturating_mul(elem),
-        )
+        // — shared with the mistral.rs pa-fraction derive (one formula).
+        hf_kv_bytes(&hf.kv, u64::from(ctx), elem)
     };
 
     let gpu_label: &'static str;
@@ -7624,6 +7701,121 @@ mod tests {
                 .windows(2)
                 .any(|w| w == ["--pa-memory-fraction", "0.57"]),
             "expected derived 0.57, got {:?}",
+            p.argv
+        );
+    }
+
+    /// mistralrs pa-fraction input over an HF (safetensors dir) meta —
+    /// the geometry path these pins exercise.
+    fn mistralrs_hf_input<'a>(
+        hf: &'a crate::hfmeta::HfMeta,
+        hw: &'a Hardware,
+        cfg: &'a Config,
+        flags: &'a BTreeSet<String>,
+        weights: u64,
+        overlay: &'a ModelOverride,
+    ) -> ProfileInput<'a> {
+        ProfileInput {
+            engine_kind: crate::engine_kind::EngineKind::MistralRs,
+            model_name: "qwen2.5-0.5b-instruct",
+            instance_key: "qwen2.5-0.5b-instruct",
+            model_path: "/models/qwen2.5-0.5b-instruct.d",
+            model_bytes: weights,
+            meta: ModelMeta::Hf(hf),
+            hardware: hw,
+            config: cfg,
+            overlay,
+            loras: &[],
+            draft_path: None,
+            draft_gguf: None,
+            mmproj_path: None,
+            mmproj_force: false,
+            engine_tag: "v0.9.3",
+            supported_flags: flags,
+            spec_types: &[],
+            endpoint: Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 12345,
+            },
+            data_dir: "/tmp/pallama-test-data",
+            cache_hit_rate: None,
+            resident_ram_mib: 0,
+            device_hint: None,
+            engine_census: hw.gpus.clone(),
+            sibling_devices: Vec::new(),
+            auto_tensor_split: None,
+        }
+    }
+
+    /// THE live incident (user's JIT run): idle 8 GiB card, 0.5B BF16
+    /// dir (942 MiB) — upstream's 0.90-of-total default made the child
+    /// hold 6984 MiB and starve the next routed lane. With KV geometry
+    /// the compiler must size the fraction from need: weights 942 +
+    /// f16 KV 896 (28*2*128*2*32768*2 B) + floor 512 = 2350 of 8192 =
+    /// 0.29 — the other 71% of the card stays free for co-residents.
+    #[test]
+    fn unit__mistralrs_pa_fraction__geometry_sizes_idle_card() {
+        let hf = hf_meta();
+        let flags = mistralrs_pa_flags();
+        let cfg = Config::default();
+        let hw = cotenant_hw(8_192, 8_192, 16_000); // idle: free == total
+        let overlay = ModelOverride {
+            ctx: Some(32_768), // deterministic KV: 896 MiB
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let inp = mistralrs_hf_input(&hf, &hw, &cfg, &flags, 942 * MIB, &overlay);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w == ["--pa-memory-fraction", "0.29"]),
+            "idle card must get geometry-sized 0.29, got {:?}",
+            p.argv
+        );
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.contains("sized from model geometry")));
+    }
+
+    /// Geometry caps under a co-tenant too: free 6144 gives a budget
+    /// fraction of 0.57, but geometry only NEEDS 0.29 — min wins, so
+    /// the tenant keeps its memory and the spawn stops there.
+    #[test]
+    fn unit__mistralrs_pa_fraction__geometry_and_cotenant_take_the_min() {
+        let hf = hf_meta();
+        let flags = mistralrs_pa_flags();
+        let cfg = Config::default();
+        let hw = cotenant_hw(8_192, 6_144, 16_000);
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let inp = mistralrs_hf_input(&hf, &hw, &cfg, &flags, 942 * MIB, &overlay);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w == ["--pa-memory-fraction", "0.29"]),
+            "min(geometry 0.29, budget 0.57) must emit 0.29, got {:?}",
+            p.argv
+        );
+    }
+
+    /// No geometry (GGUF file on the mistralrs lane) + idle card: the
+    /// historical no-op stands — nothing to correct without geometry.
+    #[test]
+    fn unit__mistralrs_pa_fraction__gguf_idle_card_stays_noop() {
+        let g = meta();
+        let flags = mistralrs_pa_flags();
+        let cfg = Config::default();
+        let hw = cotenant_hw(8_192, 8_192, 16_000);
+        let mut inp = input(&g, &hw, &cfg, &flags);
+        inp.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.iter().any(|a| a == "--pa-memory-fraction"),
+            "GGUF without geometry must stay no-op, got {:?}",
             p.argv
         );
     }
