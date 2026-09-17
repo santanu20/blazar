@@ -5,6 +5,8 @@ Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
 ## [Unreleased]
+### Added
+- `pallama search --format <F>`: weight-format filter beyond the GGUF default — any Hub tag (`safetensors`, `awq`, `gptq`, `fp8`, `mlx`, `onnx`, …) or `any`/`all` for an unfiltered browse; `--format` works in any argument position; new FORMAT column (Hub tags, most-specific-first: an AWQ repo shows `awq`, not its `safetensors` container tag), non-GGUF QUANTS mined from repo-id bit-widths (`-8bit`, `-AWQ`, `-GPTQ-Int4`), and format-aware pull footers (safetensors → sglang/mistralrs lane; MLX → convert guidance). Empty results now name the format and teach valid tags.
 
 ## [0.6.1] — 2026-09-17
 

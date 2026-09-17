@@ -264,11 +264,21 @@ enum Cmd {
         #[command(subcommand)]
         cmd: LoraCmd,
     },
-    /// Search Hugging Face for GGUF repos (multiple words are joined)
+    /// Search Hugging Face model repos (words joined; omit to browse popular)
     Search {
-        /// Search query (HF + registry lanes); omit to browse popular models
-        #[arg(trailing_var_arg = true, num_args = 1..)]
+        /// Search query (words joined); omit to browse popular models
+        #[arg(num_args = 0..)]
         query: Vec<String>,
+        /// Weight-format filter, any Hub tag: gguf (default), safetensors,
+        /// awq, gptq, fp8, mlx, onnx, … — or `any`/`all` for no filter.
+        /// Works in any position: pallama search minicpm --format mlx
+        #[arg(
+            long,
+            value_name = "FORMAT",
+            default_value = "gguf",
+            value_parser = clap::builder::NonEmptyStringValueParser::new()
+        )]
+        format: String,
     },
     /// Pre-download fit preview: VRAM/RAM split + quant alternatives
     Fit { target: String },
@@ -1053,7 +1063,7 @@ async fn run(cmd: Cmd) -> Result<()> {
         ),
         Cmd::Engine { cmd } => engine_cmd(cmd).await,
         Cmd::Lora { cmd } => lora_cmd(cmd),
-        Cmd::Search { query } => search(&query.join(" ")).await,
+        Cmd::Search { query, format } => search(&query.join(" "), &format).await,
         Cmd::Fit { target } => fit(&target).await,
         Cmd::Config { cmd } => config_cmd(cmd),
         Cmd::Upgrade { version, dry_run } => upgrade(version, dry_run).await,
@@ -4887,7 +4897,7 @@ async fn drafts_cmd(model: &str) -> Result<()> {
     println!("draft candidates for {model:?} (verify with `pallama tune {model} --spec`):");
     let mut any = false;
     for q in &queries {
-        for e in client.search(q, 5).await? {
+        for e in client.search(q, "gguf", 5).await? {
             let repo = e.id.clone();
             if seen.insert(repo.clone()) {
                 let dl = e.downloads.unwrap_or(0);
@@ -7308,12 +7318,17 @@ fn human_count(n: u64) -> String {
     }
 }
 
-async fn search(query: &str) -> Result<()> {
+async fn search(query: &str, format: &str) -> Result<()> {
     let token = std::env::var("HF_TOKEN").ok();
     let client = pallama_runtime::hf::HfClient::new(token)?;
-    let results = client.search(query, 20).await?;
+    let results = client.search(query, format, 20).await?;
+    let format = format.trim().to_ascii_lowercase();
     if results.is_empty() {
-        println!("no GGUF repos matched {query:?}");
+        // The Hub answers an unknown tag with 200 + [] — teach the valid
+        // lanes instead of looking like "no such model exists".
+        println!(
+            "no {format} repos matched {query:?} — try `--format any`, or a known tag: gguf, safetensors, awq, gptq, fp8, mlx"
+        );
         return Ok(());
     }
     // Column width adapts to the longest repo id (capped) so numbers never
@@ -7336,10 +7351,11 @@ async fn search(query: &str) -> Result<()> {
         }
     };
     println!(
-        "{:<width$}  {:>10}  {:>6}  {:<10}  {:<7}  {:>5}  {:<22}",
+        "{:<width$}  {:>10}  {:>6}  {:<11}  {:<10}  {:<7}  {:>5}  {:<22}",
         "REPO",
         "DOWNLOADS",
         "LIKES",
+        "FORMAT",
         "SIZE",
         "ARCH",
         "CTX",
@@ -7360,18 +7376,19 @@ async fn search(query: &str) -> Result<()> {
         );
         let names =
             pallama_runtime::hf::quant_tokens(r.siblings.iter().map(|s| s.rfilename.as_str()));
+        // GGUF rows carry real per-file quants; MLX/AWQ/GPTQ/FP8 rows only
+        // name their bit-width in the repo id.
         let quants = if names.is_empty() {
-            "-".to_string()
-        } else if names.len() <= 3 {
-            names.join(",")
+            collapse_tokens(&quant_markers(&r.id))
         } else {
-            format!("{},+{}", names[..3].join(","), names.len() - 3)
+            collapse_tokens(&names)
         };
         println!(
-            "{:<width$}  {:>10}  {:>6}  {:<10}  {:<7}  {:>5}  {:<22}",
+            "{:<width$}  {:>10}  {:>6}  {:<11}  {:<10}  {:<7}  {:>5}  {:<22}",
             id,
             human_count(r.downloads.unwrap_or(0)),
             r.likes.unwrap_or(0),
+            format_of(&r.tags),
             size,
             arch,
             ctx,
@@ -7379,8 +7396,88 @@ async fn search(query: &str) -> Result<()> {
             width = width
         );
     }
-    println!("\n# pull one: pallama pull <REPO>[:quant]   (size = all quants in repo; QUANTS lists the choices)");
+    match format.as_str() {
+        "any" | "all" => println!(
+            "\n# pull: pallama pull <REPO>[:quant] (GGUF) or pallama pull <REPO> (safetensors — sglang/mistralrs lane); MLX needs conversion"
+        ),
+        "gguf" => println!(
+            "\n# pull one: pallama pull <REPO>[:quant]   (size = all quants in repo; QUANTS lists the choices)"
+        ),
+        "safetensors" => println!(
+            "\n# pull one: pallama pull <REPO>   (safetensors serve via the sglang/mistralrs lane — `pallama engine install --kind sglang`)"
+        ),
+        "mlx" => println!(
+            "\n# MLX is Apple-silicon native; Pallama serves GGUF + safetensors — search the same model's GGUF repo or convert"
+        ),
+        _ => println!(
+            "\n# pull one: pallama pull <REPO>   (GGUF/safetensors serve; MLX needs conversion)"
+        ),
+    }
     Ok(())
+}
+
+/// FORMAT column: the repo's weight format from Hub tags, most-specific
+/// first — an MLX repo also carries `safetensors`, an AWQ repo too, so the
+/// specific tag is the actionable one. Unknown or missing tags show `?`.
+fn format_of(tags: &[String]) -> String {
+    for known in [
+        "mlx",
+        "awq",
+        "gptq",
+        "fp8",
+        "gguf",
+        "safetensors",
+        "pytorch",
+        "onnx",
+    ] {
+        if tags.iter().any(|t| t.eq_ignore_ascii_case(known)) {
+            return known.to_string();
+        }
+    }
+    "?".to_string()
+}
+
+/// Quant-method tokens mined from a repo id (display-only dressing): MLX /
+/// AWQ / GPTQ / FP8 repos advertise bit-widths in the NAME
+/// (`…-8bit`, `…-AWQ`, `…-GPTQ-Int4`), not in per-file quants. Never gates
+/// behavior — pull/serve decisions read real file metadata.
+fn quant_markers(repo_id: &str) -> Vec<String> {
+    let model = repo_id.rsplit('/').next().unwrap_or(repo_id);
+    let mut out: Vec<String> = Vec::new();
+    for token in model.to_ascii_lowercase().split(['-', '_', '.']) {
+        let marker = if matches!(token, "awq" | "gptq" | "bf16" | "fp16" | "fp8") {
+            token.to_ascii_uppercase()
+        } else if let Some(bits) = token
+            .strip_suffix("bit")
+            .or_else(|| token.strip_suffix("bits"))
+            .filter(|b| !b.is_empty() && b.chars().all(|c| c.is_ascii_digit()))
+        {
+            format!("{bits}BIT")
+        } else if let Some(digits) = token
+            .strip_prefix("int")
+            .filter(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))
+        {
+            format!("INT{digits}")
+        } else {
+            continue;
+        };
+        if !out.contains(&marker) {
+            out.push(marker);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// QUANTS cell: up to three tokens, then `+N` overflow; `-` when empty.
+fn collapse_tokens(tokens: &[String]) -> String {
+    if tokens.is_empty() {
+        "-".to_string()
+    } else if tokens.len() <= 3 {
+        tokens.join(",")
+    } else {
+        format!("{},+{}", tokens[..3].join(","), tokens.len() - 3)
+    }
 }
 
 async fn fit(target: &str) -> Result<()> {
@@ -7698,6 +7795,49 @@ async fn upgrade(version: Option<String>, dry_run: bool) -> Result<()> {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__format_of__specific_tag_beats_container() {
+        let tags = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // MLX and AWQ repos ALSO carry `safetensors` — the specific tag
+        // wins because it is the actionable one for engine routing.
+        assert_eq!(format_of(&tags(&["safetensors", "mlx"])), "mlx");
+        assert_eq!(format_of(&tags(&["safetensors", "awq"])), "awq");
+        assert_eq!(format_of(&tags(&["gguf"])), "gguf");
+        assert_eq!(format_of(&tags(&["pytorch"])), "pytorch");
+        assert_eq!(format_of(&tags(&["transformers"])), "?");
+        assert_eq!(format_of(&[]), "?");
+    }
+
+    #[test]
+    fn unit__quant_markers__mines_repo_id_bitwidths() {
+        // Marker tokens live in the repo NAME for non-GGUF lanes.
+        assert_eq!(quant_markers("mlx-community/MiniCPM5-2B-8bit"), ["8BIT"]);
+        // Digit tokens sort before letters: 8BIT < AWQ.
+        assert_eq!(
+            quant_markers("cyankiwi/MiniCPM-SALA-AWQ-8bit"),
+            ["8BIT", "AWQ"]
+        );
+        assert_eq!(
+            quant_markers("Qwen/Qwen2.5-72B-Instruct-GPTQ-Int4"),
+            ["GPTQ", "INT4"]
+        );
+        // Plain repos and format-only suffixes carry no quant claim.
+        assert_eq!(quant_markers("openbmb/MiniCPM5-2B"), Vec::<String>::new());
+        assert_eq!(
+            quant_markers("openbmb/MiniCPM5-2B-MLX"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn unit__collapse_tokens__dash_three_and_overflow() {
+        assert_eq!(collapse_tokens(&[]), "-");
+        let two: Vec<String> = vec!["AWQ".into(), "8BIT".into()];
+        assert_eq!(collapse_tokens(&two), "AWQ,8BIT");
+        let four: Vec<String> = vec!["A".into(), "B".into(), "C".into(), "D".into()];
+        assert_eq!(collapse_tokens(&four), "A,B,C,+1");
+    }
 
     #[test]
     fn unit__known_config_key__defaults_options_and_typos() {

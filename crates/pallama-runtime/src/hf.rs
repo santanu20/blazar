@@ -867,6 +867,11 @@ pub struct SearchEntry {
     pub siblings: Vec<HfSibling>,
     #[serde(default)]
     pub gguf: Option<HfGgufInfo>,
+    /// Hub format tags (`gguf`, `mlx`, `safetensors`, `awq`, `onnx`, …).
+    /// MLX repos carry BOTH `mlx` and `safetensors` — callers display with
+    /// most-specific-first priority, not first-match.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// Quant names advertised by a repo's GGUF filenames, canonical uppercase,
@@ -919,15 +924,13 @@ fn quant_token(filename: &str) -> Option<String> {
 }
 
 impl HfClient {
-    /// GGUF-filtered model search (complaint #15: discovery beyond a
-    /// registry; any community quant is findable).
-    pub async fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchEntry>> {
+    /// Hub model search across every weight format (complaint #15:
+    /// discovery beyond a registry; any community quant is findable).
+    /// `format` picks the lane — see [`search_path`].
+    pub async fn search(&self, query: &str, format: &str, limit: u32) -> Result<Vec<SearchEntry>> {
         let url = self
             .api_base
-            .join(&format!(
-                "api/models?search={}&filter=gguf&limit={limit}&sort=downloads&direction=-1&expand[]=gguf&expand[]=likes&expand[]=siblings",
-                url_encode_path(query)
-            ))
+            .join(&search_path(query, format, limit))
             .map_err(|e| anyhow!("bad search URL: {e}"))?;
         let resp = self
             .http
@@ -940,6 +943,32 @@ impl HfClient {
         }
         resp.json().await.context("decode search results")
     }
+}
+
+/// Build the `api/models` query for [`HfClient::search`]. `format` is a
+/// Hub tag filter passed through verbatim (`gguf`, `safetensors`, `mlx`,
+/// `awq`, `gptq`, `fp8`, `onnx`, … — case-insensitive, trimmed); the
+/// sentinels `any`/`all` drop the filter entirely so every format is
+/// browsable. An empty `query` omits `search=` (browse-most-popular).
+/// `expand[]=tags` feeds the per-row FORMAT column; `expand[]=gguf` is
+/// harmless on non-GGUF repos (field is simply absent) and keeps one
+/// code path for every format.
+#[must_use]
+pub fn search_path(query: &str, format: &str, limit: u32) -> String {
+    let mut path = format!(
+        "api/models?limit={limit}&sort=downloads&direction=-1\
+         &expand[]=gguf&expand[]=likes&expand[]=siblings&expand[]=tags"
+    );
+    if !query.is_empty() {
+        path.push_str("&search=");
+        path.push_str(&url_encode_path(query));
+    }
+    let format = format.trim().to_ascii_lowercase();
+    if !format.is_empty() && format != "any" && format != "all" {
+        path.push_str("&filter=");
+        path.push_str(&url_encode_path(&format));
+    }
+    path
 }
 
 /// One row of a fit preview.
@@ -1898,6 +1927,51 @@ mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn unit__search_path__format_filter_sentinels_and_browse() {
+        // gguf lane keeps the historical filter.
+        let gguf = search_path("minicpm", "gguf", 20);
+        assert!(gguf.contains("filter=gguf"), "{gguf}");
+        assert!(gguf.contains("search=minicpm"), "{gguf}");
+        // any/all (case- and whitespace-tolerant) drop the filter entirely.
+        for sentinel in ["any", "all", "ANY", " All "] {
+            let p = search_path("q", sentinel, 5);
+            assert!(!p.contains("filter="), "{sentinel}: {p}");
+        }
+        // Free-form tags pass through verbatim (trimmed + lowercased).
+        assert!(search_path("q", " AWQ ", 5).contains("filter=awq"));
+        assert!(search_path("q", "gptq", 5).contains("filter=gptq"));
+        assert!(search_path("q", "mlx", 5).contains("filter=mlx"));
+        // Empty query = browse mode: no search= param at all.
+        assert!(!search_path("", "gguf", 5).contains("search="));
+        // Every lane requests the metadata the table renders from.
+        for fmt in ["gguf", "any", "awq"] {
+            let p = search_path("x", fmt, 5);
+            for need in ["expand[]=gguf", "expand[]=siblings", "expand[]=tags"] {
+                assert!(p.contains(need), "{fmt} missing {need}: {p}");
+            }
+        }
+    }
+
+    #[test]
+    fn unit__search_path__query_and_tag_percent_encoded() {
+        // The encoder must be query-component safe: space, +, &, = all
+        // percent-encoded, else a crafted query/format could splice extra
+        // params into the Hub request.
+        let p = search_path("mini cpm+", "a&b=c", 5);
+        assert!(p.contains("search=mini%20cpm%2B"), "{p}");
+        assert!(p.contains("filter=a%26b%3Dc"), "{p}");
+    }
+
+    #[test]
+    fn unit__search_entry__tags_and_siblings_default_when_hub_omits() {
+        let e: SearchEntry = serde_json::from_str(r#"{"id":"o/m"}"#).unwrap();
+        assert_eq!(e.id, "o/m");
+        assert!(e.tags.is_empty());
+        assert!(e.siblings.is_empty());
+        assert!(e.gguf.is_none());
+    }
 
     #[test]
     fn unit__unique_dest__flat_collision_disambiguates_by_repo() {

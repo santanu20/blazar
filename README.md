@@ -98,7 +98,7 @@ Capability discovery: `GET /.well-known/pallama` (routes, headers, features, eng
 | No KV-quant control; VRAM cliffs | capacity-math ladder: f16 -> q8_0 (KV/2) -> q4_0 (KV/4) at 90% VRAM, or pin any type via `cache_type`; visible in `pallama show` warnings |
 | No session/context persistence | `pallama session save/restore`: slot KV checkpoints that survive unload and daemon restarts |
 | No diagnostics when things break | `pallama doctor`: config (incl. stale pins that mirror retired defaults), port conflicts (incl. the ollama-11434 class), engine, hardware, disk, model health (incl. model-dir orphans vs the store — unmanaged GGUFs get a `pallama import` hint, hardlink twins flagged as zero-space), component update-currency in one table |
-| No discovery; env sprawl | `pallama search` (HF GGUF); every knob in one documented `config.toml`, inspectable via `pallama config` |
+| No discovery; env sprawl | `pallama search` (HF, every weight format via `--format`); every knob in one documented `config.toml`, inspectable via `pallama config` |
 | "API returns 200 but nothing useful happens"; silent truncation; plain-text instead of tool calls; agents loop on malformed tool args | sentinel: warn-only semantic observation on every chat request — `finish_reason: length` with fix hints, tool-arg JSON + hallucinated-name + parameters-schema checks, `json_schema`/`json_object` validation, empty-response and reasoning-with-no-answer detection, stalled-stream detection, and a pre-inference template-capability check (`x-pallama-warnings` header) when the model's chat template cannot render tools. `pallama why [trace]` answers any request after the fact |
 
 ## Commands
@@ -119,7 +119,7 @@ Capability discovery: `GET /.well-known/pallama` (routes, headers, features, eng
 | `cp <src> <dst>` / `create <name> -f Modelfile` | ollama-parity aliases: zero-byte hardlink + config overlay (no blob copies; unsupported Modelfile keys are named rejections) |
 | `run <model> [prompt…]` / `stop <model>` | inline single-shot generation (`--verbose` counts) / unload a model now |
 | `push` / `login` family | refused by design: local-only, no registry or cloud accounts |
-| `search <query>` | HF GGUF search (downloads, likes, sizes) |
+| `search <query> [--format F]` | HF model search across every weight format (downloads, likes, format, sizes): `--format gguf` (default), `safetensors`, `awq`, `gptq`, `fp8`, `mlx`, `onnx`, … — any Hub tag, or `any`/`all` for no filter |
 | `session save/restore/rm/list` | slot KV-cache checkpoints: pause a model's context, resume later (survives unload + restart) |
 | `doctor` | one-command diagnostics: config, port conflicts, engine (+ binary `--version` smoke, + GPU enumeration-drift vs the serving child), hardware (incl. PCI GPU present but driverless — `nvidia driver`/`vulkan driver` warnings), disk, model health, sqlite store integrity, service-manager state (systemd/launchd), bind+auth exposure, update currency (llama.cpp `engine update`, whisper.cpp `whisper --install`, pallama `upgrade` — warn-only, never auto-installs) |
 | `why [trace]` | sentinel: what the model returned, what was wrong with it (truncation, invalid tool args, schema violations, empty replies, stalls), which knob fixes it |
