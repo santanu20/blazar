@@ -2024,9 +2024,12 @@ impl Config {
     const REMOVED_KNOBS: &[&str] = &["auto_restart_engine_switch"];
 
     /// Strip [`REMOVED_KNOBS`] from a raw config document, warning once per
-    /// stripped key. Parse errors still surface (the document must be valid
-    /// TOML before stripping).
+    /// stripped key PER PROCESS (a REPL turn loads the config more than
+    /// once — daemon base + profile — and the user must not see the same
+    /// hygiene line twice at the prompt). Parse errors still surface (the
+    /// document must be valid TOML before stripping).
     fn strip_removed_knobs(raw: &str) -> CoreResult<String> {
+        static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
         let mut table: toml::Table =
             toml::from_str(raw).map_err(|e| CoreError::Config(format!("parse: {e}")))?;
         let mut removed: Vec<&str> = Vec::new();
@@ -2038,11 +2041,22 @@ impl Config {
         if removed.is_empty() {
             return Ok(raw.to_string());
         }
-        tracing::warn!(
-            target: "pallama::config",
-            "removed knob(s) ignored: {} — deleted in this version; persist the canonical form with `pallama migrate`",
-            removed.join(", ")
-        );
+        let mut warned = WARNED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fresh: Vec<&str> = removed
+            .iter()
+            .filter(|k| !warned.iter().any(|w| w == *k))
+            .copied()
+            .collect();
+        if !fresh.is_empty() {
+            tracing::warn!(
+                target: "pallama::config",
+                "removed knob(s) ignored: {} — deleted in this version; persist the canonical form with `pallama migrate`",
+                fresh.join(", ")
+            );
+            warned.extend(fresh.iter().map(|k| (*k).to_string()));
+        }
         toml::to_string(&table).map_err(|e| CoreError::Config(format!("serialize: {e}")))
     }
 
