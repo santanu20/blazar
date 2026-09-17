@@ -409,7 +409,7 @@ enum EngineCmd {
     /// `pallama engine build cuda`. Activates the installed tag;
     /// restart the daemon so running spawns pick it up.
     Update {
-        /// Engine lane to update: llamacpp (default) | sglang
+        /// Engine lane to update: llamacpp (default) | sglang | mistralrs
         #[arg(long, default_value = "llamacpp")]
         kind: String,
         tag: Option<String>,
@@ -2663,7 +2663,7 @@ async fn live_mistralrs_currency(active: &str) -> Check {
                 Check::warn(
                     "engine currency",
                     format!(
-                        "{} available: {} (active: {}, mistral.rs) — run: pallama engine install",
+                        "{} available: {} (active: {}, mistral.rs) — run: pallama engine update --kind mistralrs",
                         channel_word(active, &rel.tag_name),
                         rel.tag_name,
                         active
@@ -6485,12 +6485,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             match engine_kind {
                 EngineKind::LlamaCpp => engine_update(&d, tag, no_gate, check).await?,
                 EngineKind::Sglang => engine_update_sglang(&d, tag, check).await?,
-                EngineKind::MistralRs => {
-                    return Err(anyhow!(
-                        "mistralrs engines update via `pallama engine install --kind mistralrs \
-                         [tag]` — the update lane serves llamacpp and sglang"
-                    ));
-                }
+                EngineKind::MistralRs => engine_update_mistralrs(&d, tag, check).await?,
             }
         }
         EngineCmd::List { json } => {
@@ -6679,8 +6674,102 @@ async fn engine_install_mistralrs(d: &PallamaDirs, tag: Option<String>) -> Resul
         m.build_number
     );
     println!("note: decode-regression gate is llama-server-only — skipped for mistral.rs engines");
+    // Same one-build-per-lane contract as the llamacpp/sglang lanes:
+    // superseded mistral.rs dirs free their space on a successful
+    // install/activate.
+    for (tag, bytes) in mgr.prune_siblings(EngineKind::MistralRs.as_str(), &row.tag)? {
+        println!(
+            "removed superseded engine {tag} (freed {})",
+            humansize(bytes as i64)
+        );
+    }
     restart_hint().await;
     Ok(())
+}
+
+/// `pallama engine update --kind mistralrs [tag]` — lane parity with the
+/// llamacpp update: a bare call probes mistral.rs GitHub currency and
+/// installs the newest release when one exists (flags are probed fresh
+/// at install, so there is no pinned flag contract to protect — unlike
+/// the sglang venv lane); an explicit `vX.Y.Z` tag force-installs that
+/// release. `--check` resolves and reports, installing nothing.
+async fn engine_update_mistralrs(d: &PallamaDirs, tag: Option<String>, check: bool) -> Result<()> {
+    let store = Store::open(d)?;
+    let Some(installed) = newest_mistralrs_tag(&store)? else {
+        return Err(anyhow!(
+            "no mistralrs engine installed — `pallama engine install --kind mistralrs` first"
+        ));
+    };
+    let pinned = tag.is_some();
+    let target = if let Some(t) = tag {
+        t
+    } else {
+        // Currency probe: live 4s-capped latest-tag resolve (same cap
+        // as `pallama doctor`'s mistral.rs row; the daemon's daily
+        // survey tracks llama.cpp only).
+        let mgr = local_engine_manager(d)?;
+        let fetched = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            mgr.gh.latest_mistralrs_release(),
+        )
+        .await;
+        match fetched {
+            Ok(Ok(rel)) => rel.tag_name,
+            Ok(Err(e)) => anyhow::bail!(
+                "cannot check mistral.rs releases: {e:#} — offline? set GH_TOKEN if rate limited"
+            ),
+            Err(_) => anyhow::bail!("mistral.rs release check timed out after 4s"),
+        }
+    };
+    let newer = matches!(
+        (
+            mistralrs_version_tuple(&installed),
+            mistralrs_version_tuple(&target),
+        ),
+        (Some(a), Some(b)) if b > a
+    );
+    if check {
+        println!("dry-run: nothing installed, nothing written");
+        if newer {
+            println!("would update mistral.rs {installed} -> {target}");
+            println!("  pallama engine update --kind mistralrs {target}");
+        } else {
+            println!("mistral.rs {installed} stays (target: {target})");
+        }
+        return Ok(());
+    }
+    if !pinned && !newer {
+        println!("mistral.rs {installed} is current (upstream latest: {target}).");
+        return Ok(());
+    }
+    engine_install_mistralrs(d, Some(target)).await
+}
+
+/// Newest installed mistral.rs tag (`vX.Y.Z`), the currency baseline for
+/// the update lane. `list_engines` is newest-first, but the explicit
+/// version compare keeps the pick honest if row order ever changes.
+fn newest_mistralrs_tag(store: &Store) -> Result<Option<String>> {
+    Ok(store
+        .list_engines()?
+        .into_iter()
+        .filter(|e| e.kind == EngineKind::MistralRs)
+        .max_by_key(|e| mistralrs_version_tuple(&e.tag).unwrap_or((0, 0, 0)))
+        .map(|e| e.tag.clone()))
+}
+
+/// `v0.10.0` → `(0, 10, 0)` — numeric, so v0.10 beats v0.9 where string
+/// compare would not. Non-semver tags (`local`) → `None` so callers
+/// degrade to equality instead of mis-ranking.
+fn mistralrs_version_tuple(tag: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = tag.strip_prefix('v')?.split('.');
+    let mut tuple = [0u64; 3];
+    for slot in &mut tuple {
+        match parts.next() {
+            Some(p) => *slot = p.parse().ok()?,
+            None => break,
+        }
+    }
+    Some((tuple[0], tuple[1], tuple[2]))
 }
 
 /// `pallama engine update --kind sglang [version]` — pip venv lane
@@ -9763,6 +9852,24 @@ mod tests {
         // Mixed shapes have no ordering: neutral word.
         assert_eq!(channel_word("b10857", "v1.36.0"), "update");
         assert_eq!(channel_word("v1.8.0", "b10865"), "update");
+    }
+
+    #[test]
+    fn unit__mistralrs_version_tuple__numeric_and_malformed() {
+        // Numeric per-component compare: 10 > 9 numerically, not
+        // lexicographically — the exact bug class the tuple prevents.
+        assert_eq!(mistralrs_version_tuple("v0.9.3"), Some((0, 9, 3)));
+        assert_eq!(mistralrs_version_tuple("v0.10.0"), Some((0, 10, 0)));
+        assert!(
+            mistralrs_version_tuple("v0.10.0") > mistralrs_version_tuple("v0.9.3"),
+            "v0.10.0 must rank above v0.9.3"
+        );
+        // Short tags keep trailing zeros; no 'v' prefix or non-numeric
+        // parts are not mistral.rs release tags at all.
+        assert_eq!(mistralrs_version_tuple("v2.0"), Some((2, 0, 0)));
+        assert_eq!(mistralrs_version_tuple("0.9.3"), None);
+        assert_eq!(mistralrs_version_tuple("local"), None);
+        assert_eq!(mistralrs_version_tuple("vX.Y.Z"), None);
     }
 
     #[test]
