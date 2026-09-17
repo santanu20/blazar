@@ -882,6 +882,31 @@ pub(crate) struct LaneResolution {
     pub kind: pallama_core::engine_kind::EngineKind,
 }
 
+/// Kind of the engine the router will use for `model` — the ROUTED lane,
+/// not the global active row: since auto-routing the active tag is a
+/// coincidence for anything but manual mode, so surface gates keyed on it
+/// (llama-only endpoints, slot checkpoints) wrongly 400 models that route
+/// to a llamacpp child. Unknown model: the global active kind (`None`
+/// when no engines, mirroring the old gate-skip). Err lanes resolve to
+/// the global kind inside [`resolve_serving`] — the spawn delivers the
+/// real teaching error.
+pub(crate) fn routed_kind_for(
+    state: &Arc<AppState>,
+    model: &str,
+) -> Option<pallama_core::engine_kind::EngineKind> {
+    let row = state
+        .with_store(|s| s.get_model(model).ok().flatten())
+        .flatten()?;
+    resolve_serving(state, model, &row.path)
+        .map(|lane| lane.kind)
+        .or_else(|| {
+            state
+                .with_store(|s| s.active_engine().ok().flatten())
+                .flatten()
+                .map(|e| e.kind)
+        })
+}
+
 pub(crate) fn resolve_serving(
     state: &Arc<AppState>,
     model_name: &str,

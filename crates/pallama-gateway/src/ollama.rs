@@ -2293,20 +2293,27 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
     }
     // Slot KV checkpoints ride llama-server's --slot-save-path + POST
     // /slots/{id}; non-llamacpp children (mistralrs, sglang) have no slot
-    // surface. `close` stays open — it only releases a gateway-side
-    // session pin.
-    let engine_kind = state
-        .with_store(|s| s.active_engine().ok().flatten())
-        .flatten()
-        .map(|e| e.kind);
+    // surface. Keyed on the ROUTED lane for this model, not the global
+    // active row — auto-routing serves GGUF models on a llamacpp child
+    // regardless of which engine is globally active. `close` stays open —
+    // it only releases a gateway-side session pin.
+    let engine_kind = v["model"]
+        .as_str()
+        .and_then(|m| crate::proxy::routed_kind_for(&state, m))
+        .or_else(|| {
+            state
+                .with_store(|s| s.active_engine().ok().flatten())
+                .flatten()
+                .map(|e| e.kind)
+        });
     if let Some(kind) = engine_kind {
         if action != "close" && kind != pallama_core::engine_kind::EngineKind::LlamaCpp {
             return api_error(
                 400,
                 &format!(
-                    "slot KV checkpoints are llama-server-only; the active {} engine \
-                     does not implement /slots — switch with `pallama engine use <tag>`",
-                    kind
+                    "slot KV checkpoints are llama-server-only; the {kind} lane that \
+                     serves this request does not implement /slots — switch with \
+                     `pallama engine use <tag>` or a model_overrides engine pin",
                 ),
             );
         }

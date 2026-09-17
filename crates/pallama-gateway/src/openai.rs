@@ -231,9 +231,6 @@ pub async fn openai_proxy(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Some(resp) = llamacpp_only_gate(&state, &uri) {
-        return resp;
-    }
     // ONE parse of the JSON body serves every downstream consumer on
     // this lane (model extraction, usage-flag injection, model-id
     // rewrite, single-flight stream detection); previously each
@@ -261,6 +258,11 @@ pub async fn openai_proxy(
                 None
             }
         });
+    // Routed-lane surface gate: needs the model to know which engine
+    // will serve it (GGUF routes llamacpp regardless of the active row).
+    if let Some(resp) = llamacpp_only_gate(&state, &uri, model.as_deref()) {
+        return resp;
+    }
     let Some(model) = model else {
         return openai_error(400, "missing `model` field in request body");
     };
@@ -472,11 +474,15 @@ const LLAMACPP_ONLY_PATHS: &[&str] = &[
     "/v1/streams/lookup",
 ];
 
-/// `Some(teaching 400)` when the path is llama-server-only AND the
-/// active engine is not llamacpp (mistralrs and sglang children both
-/// lack these surfaces). Path matching covers sub-paths
-/// (`/slots/{id}`).
-fn llamacpp_only_gate(state: &AppState, uri: &Uri) -> Option<Response> {
+/// `Some(teaching 400)` when the path is llama-server-only AND the engine
+/// the router will use for `model` is not llamacpp (mistralrs and sglang
+/// children both lack these surfaces). Keys on the ROUTED lane, not the
+/// global active row — auto-routing serves GGUF models on a llamacpp
+/// child regardless of which engine is globally active. Path matching
+/// covers sub-paths (`/slots/{id}`). `model: None` (no resolvable
+/// target) falls back to the global active kind, matching the
+/// pre-routing estimate.
+fn llamacpp_only_gate(state: &Arc<AppState>, uri: &Uri, model: Option<&str>) -> Option<Response> {
     let path = uri.path();
     if !LLAMACPP_ONLY_PATHS
         .iter()
@@ -484,18 +490,23 @@ fn llamacpp_only_gate(state: &AppState, uri: &Uri) -> Option<Response> {
     {
         return None;
     }
-    let row = state
-        .with_store(|s| s.active_engine().ok().flatten())
-        .flatten()?;
-    if row.kind == pallama_core::engine_kind::EngineKind::LlamaCpp {
+    let kind = model
+        .and_then(|m| crate::proxy::routed_kind_for(state, m))
+        .or_else(|| {
+            state
+                .with_store(|s| s.active_engine().ok().flatten())
+                .flatten()
+                .map(|r| r.kind)
+        })?;
+    if kind == pallama_core::engine_kind::EngineKind::LlamaCpp {
         return None;
     }
     Some(openai_error(
         400,
         &format!(
-            "this endpoint is llama-server-only; the active {} engine does not \
-             implement it — switch with `pallama engine use <tag>` (see `pallama engine list`)",
-            row.kind
+            "this endpoint is llama-server-only; the {kind} lane that serves this \
+             request does not implement it — switch with `pallama engine use <tag>` \
+             or a model_overrides engine pin (see `pallama engine list`)",
         ),
     ))
 }
@@ -518,14 +529,20 @@ pub async fn scoped_proxy(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Some(resp) = llamacpp_only_gate(&state, &uri) {
-        return resp;
-    }
-    let body_model = if uri.path() == "/v1/streams/lookup" {
+    // Model-carrying bodies: /v1/streams/lookup (chat-shaped) plus the
+    // llama-only surfaces whose POST bodies name their model
+    // (/tokenize, /detokenize, /apply-template) — the gate needs the
+    // target to know which lane will serve it.
+    let body_model = if matches!(uri.path(), "/tokenize" | "/detokenize" | "/apply-template")
+        || uri.path() == "/v1/streams/lookup"
+    {
         extract_model(&body)
     } else {
         None
     };
+    if let Some(resp) = llamacpp_only_gate(&state, &uri, body_model.as_deref()) {
+        return resp;
+    }
     let header_model = headers
         .get("x-pallama-model")
         .and_then(|v| v.to_str().ok())

@@ -2271,3 +2271,121 @@ async fn e2e__llamacpp_only_gate__non_llamacpp_kinds_get_teaching_400() {
 
     ts.state.sup.shutdown_all().await.unwrap();
 }
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__llamacpp_only_gates__routed_lane_beats_active_row() {
+    // Auto-routing: a GGUF model serves on a llamacpp child even when a
+    // mistralrs engine is globally active (JIT installs activate their
+    // engine, so the mismatch is a default-config reality). The surface
+    // gates must key on the ROUTED lane, not the active row.
+    let ts = start(Config::default()).await;
+    let c = client();
+
+    // A safetensors-dir model so routing has a mistralrs candidate; the
+    // dir must exist — the router checks `path.is_dir()`.
+    let st_dir = ts.dirs.models_dir().join("st1.d");
+    std::fs::create_dir_all(&st_dir).unwrap();
+    ts.state.with_store(|s| {
+        // The GGUF lane needs an installed llamacpp row to route to —
+        // this harness seeds no engine rows by default (unlike the
+        // support/ harness), so install both lanes explicitly.
+        s.upsert_engine(&pallama_core::EngineRow {
+            tag: "stub-l".into(),
+            asset: "stub".into(),
+            sha256: "l".into(),
+            installed_at: 1,
+            active: true,
+            manifest: "{}".into(),
+            kind: pallama_core::engine_kind::EngineKind::default(),
+        })
+        .unwrap();
+        s.upsert_engine(&pallama_core::EngineRow {
+            tag: "mistralrs-t".into(),
+            asset: "stub".into(),
+            sha256: "flip".into(),
+            installed_at: 2,
+            active: true,
+            manifest: "{}".into(),
+            kind: pallama_core::engine_kind::EngineKind::MistralRs,
+        })
+        .unwrap();
+        s.set_active_engine("mistralrs-t").unwrap();
+        s.upsert_model(&pallama_core::ModelRow {
+            name: "st1".into(),
+            repo: "o/st1".into(),
+            quant: "BF16".into(),
+            path: st_dir.display().to_string(),
+            bytes: 1,
+            sha256: None,
+            mmproj_path: None,
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 1,
+        })
+        .unwrap();
+    });
+
+    // GGUF m1 routes llamacpp: /tokenize passes the gate and the stub
+    // child answers (pre-fix this 400'd whenever mistralrs was active).
+    let r = c
+        .post(format!("{}/tokenize", ts.base))
+        .json(&serde_json::json!({"model": "m1", "content": "hello"}))
+        .send()
+        .await
+        .unwrap();
+    let status = r.status();
+    let body = r.text().await.unwrap();
+    assert_eq!(
+        status, 200,
+        "GGUF model must keep llama-only surfaces (body: {body})"
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v.get("tokens").is_some(), "stub tokenize shape: {v}");
+
+    // Safetensors st1 routes mistralrs: the gate teaches with the
+    // routed kind named.
+    let r = c
+        .post(format!("{}/tokenize", ts.base))
+        .json(&serde_json::json!({"model": "st1", "content": "hello"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "st1 /tokenize");
+    let v: serde_json::Value = r.json().await.unwrap();
+    let msg = v.to_string();
+    assert!(
+        msg.contains("llama-server-only") && msg.contains("mistralrs"),
+        "st1 /tokenize teaching: {msg}"
+    );
+
+    // Same contract on the session lane: slot checkpoints follow the
+    // routed lane, and the GGUF model bypasses the gate entirely.
+    let r = c
+        .post(format!("{}/api/session", ts.base))
+        .json(&serde_json::json!({"model": "st1", "action": "save", "filename": "f"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "st1 session save");
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert!(
+        v.to_string().contains("llama-server-only"),
+        "st1 session save teaching: {v}"
+    );
+    let r = c
+        .post(format!("{}/api/session", ts.base))
+        .json(&serde_json::json!({"model": "m1", "action": "save", "filename": "f"}))
+        .send()
+        .await
+        .unwrap();
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert!(
+        !v.to_string().contains("llama-server-only"),
+        "m1 session save must bypass the gate: {v}"
+    );
+
+    ts.state.sup.shutdown_all().await.unwrap();
+}
