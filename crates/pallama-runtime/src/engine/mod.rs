@@ -51,6 +51,37 @@ pub const LOCAL_TAG: &str = "local";
 /// Store-phase failures never carry it: a store row may already
 /// reference the dir, so deleting it would desync dir and row.
 pub const ENGINE_PROBE_FAILED: &str = "engine probe failed";
+/// Does this error chain carry the probe marker? (SIGILL-class binary
+/// mismatch, missing server binary — the asset is fine for other boxes,
+/// just unusable on THIS one.) Lanes convert it to a decline so the next
+/// lane (overlay, then Vulkan) gets a chance; infra errors propagate.
+fn is_probe_failure(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.to_string().contains(ENGINE_PROBE_FAILED))
+}
+/// Pure lane-1 scan-back selection (test seam, no network): the newest
+/// release STRICTLY behind the lane's channel number whose assets
+/// resolve for this driver/arch, within [`UPSTREAM_SCANBACK_DEPTH`].
+/// The channel release itself is excluded — the caller already tried
+/// its own assets before scanning.
+fn scanback_release<'a>(releases: &'a [GhRelease], lane: &CudaLane) -> Option<&'a GhRelease> {
+    let mut behind: Vec<(u64, &GhRelease)> = releases
+        .iter()
+        .filter_map(|r| gh::btag_number(&r.tag_name).map(|n| (n, r)))
+        .filter(|(n, _)| *n < lane.number)
+        .collect();
+    behind.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
+    behind
+        .into_iter()
+        .take(UPSTREAM_SCANBACK_DEPTH)
+        .find_map(|(_, cand)| {
+            gh::resolve_cuda_asset(cand, lane.driver_cuda, lane.sm, lane.arch).map(|_| cand)
+        })
+}
+/// How many releases behind the channel target lane 1 may scan for an
+/// upstream ubuntu-cuda asset. Most upstream releases ship none; the
+/// scan stays shallow so we never wander into stale runtimes.
+const UPSTREAM_SCANBACK_DEPTH: usize = 5;
 /// Wait between asset-list re-fetches while a fresh release finishes
 /// uploading (observed: full asset matrix lands ~75-120 s after publish).
 pub const ASSET_UPLOAD_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(20);
@@ -231,7 +262,7 @@ impl EngineManager {
     /// without downloading, installing, or writing anything. The guards
     /// mirror `maybe_cuda_overlay` so the dry-run and the real lane can
     /// never disagree about applicability.
-    pub async fn check_lane(&self, release: &GhRelease) -> Result<LaneCheck> {
+    pub async fn check_lane(&self, release: &GhRelease, exact_pin: bool) -> Result<LaneCheck> {
         let mut out = LaneCheck {
             target_tag: release.tag_name.clone(),
             upstream_cuda: None,
@@ -266,8 +297,19 @@ impl EngineManager {
         if dc.0 < 12 {
             return Ok(out);
         }
-        // Lane 1 report: the release's own ubuntu-cuda assets.
-        out.upstream_cuda = gh::resolve_cuda_asset(release, dc, sm, arch);
+        // Lane 1 report: the SAME helper the install lane uses (own
+        // asset, else scan-back for the newest release that ships one —
+        // never behind an exact pin).
+        let lane = CudaLane {
+            driver_cuda: dc,
+            sm,
+            arch,
+            number,
+        };
+        out.upstream_cuda = self
+            .upstream_cuda_pick(release, &lane, exact_pin)
+            .await
+            .map(|(_, p)| p);
         let overlay_tag = format!("b{number}-cuda");
         out.overlay_tag = Some(overlay_tag.clone());
         if let Ok(overlay) = self
@@ -446,7 +488,10 @@ impl EngineManager {
         // Lane 1 — upstream official CUDA (same tag, driver-capped,
         // generic SASS + CPU dispatch). Falls through to the overlay on
         // a decline or a probe-class failure; infra errors propagate.
-        if let Some(row) = self.upstream_lane_or_none(release, &lane).await? {
+        if let Some(row) = self
+            .upstream_lane_or_none(release, &lane, exact_pin)
+            .await?
+        {
             return Ok(Some(row));
         }
         let overlay_tag = format!("b{}-cuda", lane.number);
@@ -477,15 +522,8 @@ impl EngineManager {
             }
         };
         if let Some(pick) = gh::resolve_cuda_asset(&overlay, lane.driver_cuda, lane.sm, lane.arch) {
-            tracing::info!(
-                "installing prebuilt CUDA engine from {repo} {overlay_tag} ({})",
-                pick.label
-            );
-            let row = self
-                .install_picked(&overlay, &pick, None)
+            self.install_same_tag_overlay(&overlay, &overlay_tag, &pick, &repo)
                 .await
-                .with_context(|| format!("install overlay {overlay_tag}"))?;
-            Ok(Some(row))
         } else {
             let need = gh::newest_asset_cuda(&overlay)
                 .map_or_else(|| "unknown".into(), |(a, b)| format!("{a}.{b}"));
@@ -501,6 +539,37 @@ impl EngineManager {
         }
     }
 
+    /// Lane 2 — the same-tag overlay asset. A probe-class failure
+    /// (SIGILL-class baseline mismatch) means this box cannot run the
+    /// overlay build: fall to the Vulkan lane instead of failing the
+    /// whole update. Infra errors still propagate.
+    async fn install_same_tag_overlay(
+        &self,
+        overlay: &GhRelease,
+        overlay_tag: &str,
+        pick: &gh::AssetPick,
+        repo: &str,
+    ) -> Result<Option<EngineRow>> {
+        tracing::info!(
+            "installing prebuilt CUDA engine from {repo} {overlay_tag} ({})",
+            pick.label
+        );
+        match self.install_picked(overlay, pick, None).await {
+            Ok(row) => Ok(Some(row)),
+            Err(e) if is_probe_failure(&e) => {
+                tracing::warn!(
+                    "overlay CUDA asset {overlay_tag}/{} unusable on \
+                     this machine ({e:#}) — using the Vulkan lane this \
+                     update; `pallama engine build cuda` compiles a \
+                     local build for this exact CPU",
+                    pick.label
+                );
+                Ok(None)
+            }
+            Err(e) => Err(e).with_context(|| format!("install overlay {overlay_tag}")),
+        }
+    }
+
     /// Lane 1 of the prebuilt chain: try the upstream release's own
     /// official ubuntu-cuda asset before any overlay probe. `None`
     /// means the lane declined or the binary proved unusable here —
@@ -509,19 +578,17 @@ impl EngineManager {
         &self,
         release: &GhRelease,
         lane: &CudaLane,
+        exact_pin: bool,
     ) -> Result<Option<EngineRow>> {
-        let Some(pick) = gh::resolve_cuda_asset(release, lane.driver_cuda, lane.sm, lane.arch)
+        let Some((asset_release, pick)) = self.upstream_cuda_pick(release, lane, exact_pin).await
         else {
             return Ok(None);
         };
-        match self.install_upstream_cuda(release, &pick).await {
+        match self.install_upstream_cuda(&asset_release, &pick).await {
             Ok(Some(row)) => Ok(Some(row)),
             // lane politely declined (no companion) — try overlay
             Ok(None) => Ok(None),
-            Err(e)
-                if e.chain()
-                    .any(|c| c.to_string().contains(ENGINE_PROBE_FAILED)) =>
-            {
+            Err(e) if is_probe_failure(&e) => {
                 tracing::warn!(
                     "upstream CUDA asset {} unusable on this machine \
                      ({e:#}) — trying the overlay lane",
@@ -531,6 +598,51 @@ impl EngineManager {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// The lane-1 asset choice, shared by the install lane and the
+    /// `--check` dry-run so they can never disagree: the release's own
+    /// ubuntu-cuda asset, else (auto updates only — never an exact pin)
+    /// the newest release at or behind the channel target that ships
+    /// one. Roughly two thirds of upstream releases carry no ubuntu-cuda
+    /// assets; without the scan an asset-less channel target would punt
+    /// CUDA users to the sm-slim overlay or Vulkan for no reason.
+    async fn upstream_cuda_pick(
+        &self,
+        release: &GhRelease,
+        lane: &CudaLane,
+        exact_pin: bool,
+    ) -> Option<(GhRelease, gh::AssetPick)> {
+        if let Some(pick) = gh::resolve_cuda_asset(release, lane.driver_cuda, lane.sm, lane.arch) {
+            return Some((release.clone(), pick));
+        }
+        if exact_pin {
+            return None; // a pinned tag must not silently become an older build
+        }
+        let releases = match self.gh.list_releases_repo(gh::LLAMA_CPP_REPO).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    "cannot list {} for the upstream-asset scan-back \
+                     ({e:#}) — continuing on the overlay lanes",
+                    gh::LLAMA_CPP_REPO
+                );
+                return None;
+            }
+        };
+        if let Some(cand) = scanback_release(&releases, lane) {
+            let pick = gh::resolve_cuda_asset(cand, lane.driver_cuda, lane.sm, lane.arch)
+                .expect("scanback only returns releases that resolve");
+            tracing::info!(
+                "channel release {} ships no ubuntu-cuda asset for this \
+                 driver/arch — using upstream {} ({}) instead",
+                release.tag_name,
+                cand.tag_name,
+                pick.label
+            );
+            return Some((cand.clone(), pick));
+        }
+        None
     }
 
     /// The overlay-lag arm of [`EngineManager::maybe_cuda_overlay`]:
@@ -549,7 +661,23 @@ impl EngineManager {
         if exact_pin {
             return Ok(None);
         }
-        match self.overlay_lag_fallback(lane).await? {
+        let lag = match self.overlay_lag_fallback(lane).await {
+            Ok(outcome) => outcome,
+            // Same contract as the same-tag overlay arm: a probe-class
+            // failure (the lagged overlay's sm-slim baseline does not
+            // run on this CPU) falls through to Vulkan, not a dead end.
+            Err(e) if is_probe_failure(&e) => {
+                tracing::warn!(
+                    "lagged overlay CUDA asset unusable on this machine \
+                     ({e:#}) — using the Vulkan lane this update; \
+                     `pallama engine build cuda` compiles a local build \
+                     for this exact CPU"
+                );
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        match lag {
             LagOutcome::Installed(row) => Ok(Some(row)),
             LagOutcome::AlreadyActive(row) => {
                 tracing::warn!(
@@ -1808,6 +1936,88 @@ mod verify_tests {
             assert_eq!(row.tag, "b2-cuda");
             assert!(dir.exists(), "healthy engine dir survives");
             assert!(dir.join("llama-server").exists(), "binary survives");
+        }
+    }
+
+    mod scanback_tests {
+        use super::super::*;
+
+        fn cuda_release(tag: &str, asset_names: &[&str]) -> GhRelease {
+            GhRelease {
+                tag_name: tag.to_string(),
+                prerelease: false,
+                assets: asset_names
+                    .iter()
+                    .map(|n| gh::GhAsset {
+                        name: (*n).to_string(),
+                        digest: None,
+                        size: None,
+                        browser_download_url: format!("https://x/{n}"),
+                    })
+                    .collect(),
+                published_at: None,
+            }
+        }
+
+        fn x64_lane(channel_number: u64) -> CudaLane {
+            CudaLane {
+                driver_cuda: (13, 0),
+                sm: Some(89),
+                arch: "x64",
+                number: channel_number,
+            }
+        }
+
+        #[test]
+        fn unit__scanback_release__picks_newest_assetful_strictly_behind() {
+            // The exact 09-17 shape: channel b11027 ships no ubuntu-cuda
+            // assets; b11026 does; a NEWER b11028 exists upstream but is
+            // not behind the channel target; b11020 also has assets but
+            // is older than b11026.
+            let releases = vec![
+                cuda_release("b11028", &["llama-b11028-bin-ubuntu-cuda-12.8-x64.tar.gz"]),
+                cuda_release("b11027", &["llama-b11027-bin-ubuntu-vulkan-x64.tar.gz"]),
+                cuda_release("b11026", &["llama-b11026-bin-ubuntu-cuda-12.8-x64.tar.gz"]),
+                cuda_release("b11025", &["llama-b11025-bin-ubuntu-vulkan-x64.tar.gz"]),
+                cuda_release("b11020", &["llama-b11020-bin-ubuntu-cuda-12.8-x64.tar.gz"]),
+            ];
+            let hit = scanback_release(&releases, &x64_lane(11027))
+                .expect("b11026 is the newest assetful release behind");
+            assert_eq!(hit.tag_name, "b11026");
+        }
+
+        #[test]
+        fn unit__scanback_release__depth_cap_returns_none() {
+            // Assets exist 17 builds behind — beyond UPSTREAM_SCANBACK_DEPTH.
+            let mut releases = Vec::new();
+            for n in (11010..=11027).rev() {
+                let assets: Vec<String> = if n == 11010 {
+                    vec!["llama-b11010-bin-ubuntu-cuda-12.8-x64.tar.gz".to_string()]
+                } else {
+                    vec![format!("llama-b{n}-bin-ubuntu-vulkan-x64.tar.gz")]
+                };
+                releases.push(cuda_release(
+                    &format!("b{n}"),
+                    &assets.iter().map(String::as_str).collect::<Vec<_>>(),
+                ));
+            }
+            assert!(
+                scanback_release(&releases, &x64_lane(11027)).is_none(),
+                "scan must not wander past the depth cap into stale runtimes"
+            );
+        }
+
+        #[test]
+        fn unit__scanback_release__driver_cap_skips_overcap_candidates() {
+            // b11026 ships only 13.3 assets — over this driver's 13.0
+            // ceiling — so the scan continues to b11020's 12.8 asset.
+            let releases = vec![
+                cuda_release("b11026", &["llama-b11026-bin-ubuntu-cuda-13.3-x64.tar.gz"]),
+                cuda_release("b11020", &["llama-b11020-bin-ubuntu-cuda-12.8-x64.tar.gz"]),
+            ];
+            let hit = scanback_release(&releases, &x64_lane(11027))
+                .expect("13.3-only release is skipped, 12.8 picked");
+            assert_eq!(hit.tag_name, "b11020");
         }
     }
 }

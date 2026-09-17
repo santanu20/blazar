@@ -7047,7 +7047,7 @@ async fn engine_update(
             Some(rel) => rel,
             None => mgr.gh.resolve_tag(&target_tag).await?,
         };
-        let lane = mgr.check_lane(&release).await?;
+        let lane = mgr.check_lane(&release, !from_channel).await?;
         println!(
             "update check — llamacpp lane, channel {}",
             cfg.update_channel
