@@ -3941,6 +3941,23 @@ def phase_api() -> None:
     if FAST:
         print("  (skip vision chat lane: FAST mode)")
     else:
+        # Boot-adopt era: a store rebuilt from disk can only re-link
+        # pull-convention projectors (owner--repo--mmproj*.gguf), so BIG
+        # may legitimately carry no mmproj after an uninstall/reinstall.
+        # Pick the vision fixture by ACTUAL projector attachment instead
+        # of assuming the configured BIG still has one.
+        def _vision_model_or_any() -> str | None:
+            db = _sandbox_db()
+            try:
+                rows = db.execute("SELECT name, mmproj_path FROM models").fetchall()
+            finally:
+                db.close()
+            attached = sorted(n for n, mm in rows if mm and n != MODEL)
+            if BIG in attached:
+                return BIG
+            return attached[0] if attached else None
+
+        vision_model = _vision_model_or_any()
         _st_t, _, _v_t = http_json("GET", "/api/tags")
         _names_t = (
             [
@@ -3950,8 +3967,12 @@ def phase_api() -> None:
             if isinstance(_v_t, dict)
             else []
         )
-        if BIG == MODEL or not any(BIG.split(":")[0] in n for n in _names_t):
-            print(f"  (skip vision chat lane: no distinct vision model {BIG})")
+        if vision_model is None or not any(
+            vision_model.split(":")[0] in n for n in _names_t
+        ):
+            print(
+                f"  (skip vision chat lane: no model with attached mmproj ({vision_model or 'none found'}))"
+            )
         else:
             # Honest env gate: BIG is a full 9B-class load; a co-resident
             # engine (e.g. ollama) squeezing VRAM/RAM makes pallama's
@@ -3967,10 +3988,10 @@ def phase_api() -> None:
                 )
                 return ok, free
 
-            big_bytes_mib = model_bytes_mib(BIG)
+            big_bytes_mib = model_bytes_mib(vision_model)
             vision_ok_env, free_vram_mib = _vision_env_ok()
             if not vision_ok_env:
-                for _m in sorted({MODEL, BIG}):
+                for _m in sorted({MODEL, vision_model}):
                     try:
                         http_json("POST", "/api/evict", {"model": _m})
                     except Exception:
@@ -3984,7 +4005,7 @@ def phase_api() -> None:
                     "api",
                     "vision chat battery (memory ceiling)",
                     f"free VRAM {free_vram_mib} MiB / MemAvailable "
-                    f"{mem_available_mib()} MiB vs {BIG} ~{big_bytes_mib} MiB "
+                    f"{mem_available_mib()} MiB vs {vision_model} ~{big_bytes_mib} MiB "
                     "after evicting this harness's engines and reaping "
                     "orphans — pallama's spawn guard refuses the load by "
                     "design; GPU holders now: "
@@ -3995,7 +4016,7 @@ def phase_api() -> None:
                     "POST",
                     "/v1/chat/completions",
                     {
-                        "model": BIG,
+                        "model": vision_model,
                         "stream": False,
                         "max_tokens": 128,
                         "messages": [
@@ -6491,13 +6512,14 @@ def phase_commands() -> None:
             p.stdout.strip()[:100],
         )
         # multi-word query joins into one HF search; table carries the
-        # SIZE/ARCH/CTX columns and a pull-hint footer.
+        # SIZE/ARCH/CTX columns and a pull-hint footer (phrase-agnostic:
+        # the any/gguf/safetensors footers all say `pallama pull <REPO>`).
         p2 = cli("search", "qwen", "0.5b", "gguf", timeout=120)
         reg(
             "search.multi-word-columns",
             p2.returncode == 0
             and all(h in p2.stdout for h in ("SIZE", "ARCH", "CTX"))
-            and "pull one" in p2.stdout,
+            and "pallama pull <REPO>" in p2.stdout,
             p2.stdout.strip().splitlines()[0][:100] if p2.stdout.strip() else "",
         )
 

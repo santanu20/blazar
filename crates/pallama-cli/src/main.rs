@@ -3418,6 +3418,12 @@ async fn serve() -> Result<()> {
             reconcile.adopted.len()
         );
     }
+    if !reconcile.relinked.is_empty() {
+        println!(
+            "preflight: re-linked projector(s) on: {}",
+            reconcile.relinked.join(", ")
+        );
+    }
     for (what, why) in &reconcile.skipped {
         println!("WARNING: preflight skipped {what}: {why}");
     }

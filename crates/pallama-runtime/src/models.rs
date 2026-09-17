@@ -152,8 +152,13 @@ pub struct AdoptedModel {
 
 /// Outcome of a boot-time models-dir reconcile. Never an error state: a
 /// store with nothing to adopt is the healthy common case.
+#[derive(Debug)]
 pub struct ReconcileReport {
     pub adopted: Vec<AdoptedModel>,
+    /// Models whose projector sidecar was re-linked on a later boot
+    /// (row adopted before the sidecar existed on disk, or before
+    /// reconcile could match it).
+    pub relinked: Vec<String>,
     /// (file/dir, reason) for candidates that looked like models but
     /// were refused — surfaced as boot warnings, never fatal.
     pub skipped: Vec<(String, String)>,
@@ -170,6 +175,7 @@ pub struct ReconcileReport {
 pub fn reconcile_models(dirs: &PallamaDirs, store: &Store) -> ReconcileReport {
     let mut report = ReconcileReport {
         adopted: Vec::new(),
+        relinked: Vec::new(),
         skipped: Vec::new(),
     };
     let models_dir = dirs.models_dir();
@@ -179,17 +185,26 @@ pub fn reconcile_models(dirs: &PallamaDirs, store: &Store) -> ReconcileReport {
 
     // Ownership = canonical paths of existing rows plus their inodes, so
     // hardlink twins of owned files (aliases) are not double-adopted.
+    // Linked projectors count as owned too: a surviving row's mmproj must
+    // never be re-attached to a different model by reconcile.
     let mut owned: HashSet<PathBuf> = HashSet::new();
     let mut owned_inodes: HashSet<(u64, u64)> = HashSet::new();
     for row in store.list_models().unwrap_or_default() {
-        let p = PathBuf::from(&row.path);
-        if let Ok(c) = p.canonicalize() {
-            owned.insert(c);
-        }
-        #[cfg(unix)]
-        if let Ok(md) = std::fs::metadata(&p) {
-            use std::os::unix::fs::MetadataExt as _;
-            owned_inodes.insert((md.dev(), md.ino()));
+        for p in [
+            Some(PathBuf::from(&row.path)),
+            row.mmproj_path.map(PathBuf::from),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Ok(c) = p.canonicalize() {
+                owned.insert(c);
+            }
+            #[cfg(unix)]
+            if let Ok(md) = std::fs::metadata(&p) {
+                use std::os::unix::fs::MetadataExt as _;
+                owned_inodes.insert((md.dev(), md.ino()));
+            }
         }
     }
 
@@ -201,17 +216,30 @@ pub fn reconcile_models(dirs: &PallamaDirs, store: &Store) -> ReconcileReport {
     names.sort();
 
     // GGUF shard sets (`base-00001-of-00002.gguf`) adopt as ONE model.
+    // `mmproj*` GGUFs pulled beside a model are vision projector sidecars:
+    // pull-convention names carry the repo prefix, which is the only
+    // deterministic way to re-link one after a store rebuild.
+    let mut sidecars: Vec<String> = Vec::new();
     let mut shard_sets: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut singles: Vec<String> = Vec::new();
     for name in &names {
         if !name.to_lowercase().ends_with(".gguf") {
             continue;
         }
+        let path = models_dir.join(name);
+        if owned.contains(&path.canonicalize().unwrap_or_else(|_| path.clone())) {
+            continue;
+        }
+        if name.to_lowercase().contains("mmproj") {
+            sidecars.push(name.clone());
+            continue; // sidecars are never adopted as servable models
+        }
         match crate::hf::parse_shard_marker_pub(name) {
             Some((_, _, base)) => shard_sets.entry(base).or_default().push(name.clone()),
             None => singles.push(name.clone()),
         }
     }
+    let mut attached_sidecars: HashSet<String> = HashSet::new();
     let mut adopted_inodes: HashSet<(u64, u64)> = HashSet::new();
     for leaves in shard_sets.values() {
         adopt_gguf(
@@ -220,6 +248,8 @@ pub fn reconcile_models(dirs: &PallamaDirs, store: &Store) -> ReconcileReport {
             leaves,
             &owned,
             &owned_inodes,
+            &sidecars,
+            &mut attached_sidecars,
             &mut adopted_inodes,
             &mut report,
         );
@@ -231,6 +261,8 @@ pub fn reconcile_models(dirs: &PallamaDirs, store: &Store) -> ReconcileReport {
             std::slice::from_ref(leaf),
             &owned,
             &owned_inodes,
+            &sidecars,
+            &mut attached_sidecars,
             &mut adopted_inodes,
             &mut report,
         );
@@ -248,6 +280,41 @@ pub fn reconcile_models(dirs: &PallamaDirs, store: &Store) -> ReconcileReport {
         }
         if !root_safetensors(&dir).is_empty() || looks_pulled {
             adopt_dir(&models_dir, store, name, &owned, &mut report);
+        }
+    }
+
+    // Backfill: rows adopted before their projector sidecar existed (or
+    // before prefix matching landed) converge on the next boot. Only
+    // reconcile-adopted rows are healed — pull/import rows carry their
+    // own linkage contract.
+    let current: Vec<ModelRow> = store.list_models().unwrap_or_default();
+    // One working set across iterations: two adopted rows sharing a repo
+    // prefix (quant siblings) must not both claim the single sidecar.
+    let mut consumed: HashSet<String> = current
+        .iter()
+        .filter_map(|r| {
+            r.mmproj_path
+                .as_ref()
+                .and_then(|p| Path::new(p).file_name())
+                .map(|f| f.to_string_lossy().into_owned())
+        })
+        .chain(attached_sidecars.iter().cloned())
+        .collect();
+    for mut row in current {
+        if row.mmproj_path.is_some() || !row.repo.starts_with("adopted:") {
+            continue;
+        }
+        let Some(leaf) = Path::new(&row.path)
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+        else {
+            continue;
+        };
+        if let Some(hit) = match_sidecar_for(&leaf, &sidecars, &mut consumed) {
+            row.mmproj_path = Some(models_dir.join(&hit).display().to_string());
+            if store.upsert_model(&row).is_ok() {
+                report.relinked.push(row.name.clone());
+            }
         }
     }
     report
@@ -281,6 +348,8 @@ fn adopt_gguf(
     leaves: &[String],
     owned: &HashSet<PathBuf>,
     owned_inodes: &HashSet<(u64, u64)>,
+    sidecars: &[String],
+    attached_sidecars: &mut HashSet<String>,
     adopted_inodes: &mut HashSet<(u64, u64)>,
     report: &mut ReconcileReport,
 ) {
@@ -314,11 +383,6 @@ fn adopt_gguf(
             return;
         }
     };
-    // Vision projectors are sidecars, not servable models (import's
-    // --mmproj validation uses the same architecture test).
-    if meta.architecture == "clip" {
-        return;
-    }
     let (quant, candidates) = gguf_derivations(first, &meta);
     // First free-and-portable candidate wins; quant siblings share
     // embedded metadata names (base + fp16 both say "Qwen2.5 0.5B
@@ -342,6 +406,12 @@ fn adopt_gguf(
         .filter_map(|l| std::fs::metadata(models_dir.join(l)).ok())
         .map(|m| m.len())
         .sum();
+    // Projector re-link: a sidecar from the SAME pull repo (identical
+    // `owner--repo--` prefix) belongs to this model with the same
+    // certainty pull had when it stored both files. Bare sidecars carry
+    // no repo signal and are never guessed onto a bare model.
+    let mmproj_path = match_sidecar_for(first, sidecars, attached_sidecars)
+        .map(|f| models_dir.join(f).display().to_string());
     let row = ModelRow {
         name: model_name.clone(),
         repo: format!("adopted:{}", path.display()),
@@ -349,9 +419,9 @@ fn adopt_gguf(
         path: path.display().to_string(),
         bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
         sha256: None,
-        // mmproj siblings are NOT guessed: re-import with --mmproj to
-        // attach a projector (no-guessing rule).
-        mmproj_path: None,
+        // Re-linked deterministically from the pull-convention prefix
+        // when possible; bare projectors are never guessed.
+        mmproj_path,
         shards: i64::try_from(leaves.len()).unwrap_or(i64::MAX),
         arch: Some(meta.architecture.clone()),
         params: Some(crate::hf::est_params(bytes, &quant)),
@@ -372,6 +442,30 @@ fn adopt_gguf(
 
 /// Adopt a safetensors model dir (`<name>.d`) at its existing location,
 /// mirroring the pull lane's row dialect.
+/// Pick the projector sidecar belonging to a pull-convention GGUF.
+///
+/// Pull stores model and projector under the same `owner--repo--` prefix;
+/// that shared prefix is the only disk-surviving proof of the pairing, so
+/// it is the only one reconcile trusts. Bare names (`mmproj-F16.gguf`)
+/// carry no repo signal and stay unattached (import `--mmproj` is the
+/// manual path for those).
+fn match_sidecar_for(
+    leaf: &str,
+    sidecars: &[String],
+    attached: &mut HashSet<String>,
+) -> Option<String> {
+    let parts: Vec<&str> = leaf.split("--").collect();
+    if parts.len() < 3 {
+        return None; // bare or non-pull name — no repo prefix to match
+    }
+    let prefix = format!("{}--{}--", parts[0], parts[1]);
+    let hit = sidecars
+        .iter()
+        .find(|s| s.starts_with(&prefix) && !attached.contains(*s))?;
+    attached.insert(hit.clone());
+    Some(hit.clone())
+}
+
 fn adopt_dir(
     models_dir: &Path,
     store: &Store,
@@ -1063,6 +1157,135 @@ mod tests {
         );
         let m = store.get_model("qwen3.5-9b-mtp").unwrap().unwrap();
         assert_eq!(m.quant, "Q4_K_M", "quant from leaf tail token");
+    }
+
+    #[test]
+    fn unit__reconcile__pull_convention_sidecar_relinked() {
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        let weights = "unsloth--Qwen3.5-9B-MTP-GGUF--Qwen3.5-9B-Q4_K_M.gguf";
+        let projector = "unsloth--Qwen3.5-9B-MTP-GGUF--mmproj-F16.gguf";
+        write_gguf(&d.join(weights), "qwen3", Some("Qwen3.5 9B"));
+        write_gguf(&d.join(projector), "clip", None);
+        let store = Store::open(&dirs).unwrap();
+
+        let r = reconcile_models(&dirs, &store);
+        assert_eq!(r.adopted.len(), 1, "{:?}", r.skipped);
+        assert!(
+            r.skipped.is_empty(),
+            "sidecar must not warn: {:?}",
+            r.skipped
+        );
+        let m = store.get_model("qwen3.5-9b-mtp").unwrap().unwrap();
+        assert_eq!(
+            m.mmproj_path.as_deref(),
+            Some(d.join(projector).display().to_string().as_str()),
+            "same-repo sidecar re-linked by pull prefix"
+        );
+        // The projector itself is never adopted as a servable model.
+        assert!(store.get_model("mmproj-f16").unwrap().is_none());
+        // Second boot: no churn, linkage stable.
+        let r2 = reconcile_models(&dirs, &store);
+        assert!(r2.adopted.is_empty() && r2.skipped.is_empty(), "{r2:?}");
+    }
+
+    #[test]
+    fn unit__reconcile__owned_projector_never_reassigned() {
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        let projector = "unsloth--Qwen3.5-9B-MTP-GGUF--mmproj-F16.gguf";
+        write_gguf(
+            &d.join("unsloth--Qwen3.5-9B-MTP-GGUF--Qwen3.5-9B-Q4_K_M.gguf"),
+            "qwen3",
+            Some("Qwen3.5 9B"),
+        );
+        write_gguf(&d.join(projector), "clip", None);
+        // A surviving row (different model, elsewhere) already owns the
+        // projector: reconcile must not attach it to the adopted model.
+        let other = d.join("other-q8_0.gguf");
+        write_gguf(&other, "llama", Some("other"));
+        let store = Store::open(&dirs).unwrap();
+        let mut orow = row(&other, "other");
+        orow.mmproj_path = Some(d.join(projector).display().to_string());
+        store.upsert_model(&orow).unwrap();
+
+        let r = reconcile_models(&dirs, &store);
+        assert_eq!(r.adopted.len(), 1, "{:?}", r.skipped);
+        let m = store.get_model("qwen3.5-9b-mtp").unwrap().unwrap();
+        assert!(
+            m.mmproj_path.is_none(),
+            "projector owned by another row must not be re-attached"
+        );
+    }
+
+    #[test]
+    fn unit__reconcile__bare_sidecar_never_guessed() {
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        write_gguf(
+            &d.join("Qwen3.5-9B-Q4_K_M.gguf"),
+            "qwen3",
+            Some("Qwen3.5 9B"),
+        );
+        write_gguf(&d.join("mmproj-F16.gguf"), "clip", None);
+        let store = Store::open(&dirs).unwrap();
+
+        let r = reconcile_models(&dirs, &store);
+        assert_eq!(r.adopted.len(), 1, "{:?}", r.skipped);
+        let m = store.get_model("qwen3.5-9b").unwrap().unwrap();
+        assert!(
+            m.mmproj_path.is_none(),
+            "bare sidecar has no repo signal — never guessed"
+        );
+    }
+
+    #[test]
+    fn unit__reconcile__backfill_relinks_older_adopted_row() {
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        let weights = "unsloth--Qwen3.5-9B-MTP-GGUF--Qwen3.5-9B-Q4_K_M.gguf";
+        let projector = "unsloth--Qwen3.5-9B-MTP-GGUF--mmproj-F16.gguf";
+        write_gguf(&d.join(weights), "qwen3", Some("Qwen3.5 9B"));
+        write_gguf(&d.join(projector), "clip", None);
+        // Simulate the two-boot reality: the row was adopted by an older
+        // build (no sidecar matching), projector link missing.
+        let store = Store::open(&dirs).unwrap();
+        let mut old = row(&d.join(weights), "qwen3.5-9b-mtp");
+        old.repo = format!("adopted:{}", d.join(weights).display());
+        store.upsert_model(&old).unwrap();
+
+        let r = reconcile_models(&dirs, &store);
+        assert!(r.adopted.is_empty(), "{:?}", r.adopted);
+        assert_eq!(r.relinked, ["qwen3.5-9b-mtp"]);
+        let m = store.get_model("qwen3.5-9b-mtp").unwrap().unwrap();
+        assert_eq!(
+            m.mmproj_path.as_deref(),
+            Some(d.join(projector).display().to_string().as_str())
+        );
+        // Third boot: fully stable.
+        let r3 = reconcile_models(&dirs, &store);
+        assert!(r3.adopted.is_empty() && r3.relinked.is_empty(), "{r3:?}");
+    }
+
+    #[test]
+    fn unit__reconcile__backfill_never_touches_pull_rows() {
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        let weights = "unsloth--Qwen3.5-9B-MTP-GGUF--Qwen3.5-9B-Q4_K_M.gguf";
+        let projector = "unsloth--Qwen3.5-9B-MTP-GGUF--mmproj-F16.gguf";
+        write_gguf(&d.join(weights), "qwen3", Some("Qwen3.5 9B"));
+        write_gguf(&d.join(projector), "clip", None);
+        // Pull/import rows own their linkage contract: reconcile must not
+        // edit them even when a matching sidecar sits unused on disk.
+        let store = Store::open(&dirs).unwrap();
+        store
+            .upsert_model(&row(&d.join(weights), "qwen3.5-9b-mtp"))
+            .unwrap();
+
+        let r = reconcile_models(&dirs, &store);
+        assert!(r.adopted.is_empty() && r.relinked.is_empty(), "{r:?}");
+        let m = store.get_model("qwen3.5-9b-mtp").unwrap().unwrap();
+        assert!(m.mmproj_path.is_none());
     }
 
     #[test]
