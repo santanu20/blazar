@@ -7441,23 +7441,40 @@ fn format_of(tags: &[String]) -> String {
 /// AWQ / GPTQ / FP8 repos advertise bit-widths in the NAME
 /// (`…-8bit`, `…-AWQ`, `…-GPTQ-Int4`), not in per-file quants. Never gates
 /// behavior — pull/serve decisions read real file metadata.
+/// `iq4_xs`/`q8_0`-style quant token: `prefix` must be followed by a digit.
+fn embedded_quant(token: &str, prefix: &str) -> bool {
+    token
+        .strip_prefix(prefix)
+        .is_some_and(|tail| tail.starts_with(|c: char| c.is_ascii_digit()))
+}
+
 fn quant_markers(repo_id: &str) -> Vec<String> {
     let model = repo_id.rsplit('/').next().unwrap_or(repo_id);
     let mut out: Vec<String> = Vec::new();
-    for token in model.to_ascii_lowercase().split(['-', '_', '.']) {
-        let marker = if matches!(token, "awq" | "gptq" | "bf16" | "fp16" | "fp8") {
-            token.to_ascii_uppercase()
-        } else if let Some(bits) = token
+    // `_` stays INSIDE a token: quant names embedded in repo ids (IQ4_XS,
+    // Q4_K_M) use it as part of the name, while `-` and `.` separate
+    // segments. Word/bitwidth classes additionally accept `_`-embedded
+    // spellings (`8_bit`, `Int_4`) via the underscore-stripped form.
+    for token in model.to_ascii_lowercase().split(['-', '.']) {
+        let flat = token.replace('_', "");
+        let marker = if matches!(flat.as_str(), "awq" | "gptq" | "bf16" | "fp16" | "fp8") {
+            flat.to_ascii_uppercase()
+        } else if let Some(bits) = flat
             .strip_suffix("bit")
-            .or_else(|| token.strip_suffix("bits"))
+            .or_else(|| flat.strip_suffix("bits"))
             .filter(|b| !b.is_empty() && b.chars().all(|c| c.is_ascii_digit()))
         {
             format!("{bits}BIT")
-        } else if let Some(digits) = token
+        } else if let Some(digits) = flat
             .strip_prefix("int")
             .filter(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))
         {
             format!("INT{digits}")
+        } else if embedded_quant(token, "iq") || embedded_quant(token, "q") {
+            // IQ4_XS, iq2m, Q4_K_M, q8_0 — GGUF-style quant names spelled
+            // into repo ids; `optiq`/`qwen2` can't match (needs the prefix
+            // immediately followed by a digit).
+            token.to_ascii_uppercase()
         } else {
             continue;
         };
@@ -7828,6 +7845,17 @@ mod tests {
             quant_markers("openbmb/MiniCPM5-2B-MLX"),
             Vec::<String>::new()
         );
+        // Compound GGUF-style names keep `_` inside the token.
+        assert_eq!(quant_markers("NANI-Nithin/MiniCPM5-2B-IQ4_XS"), ["IQ4_XS"]);
+        assert_eq!(quant_markers("mirror/MiniCPM5-2B-q8_0"), ["Q8_0"]);
+        // `_`-embedded spellings still hit the word/bitwidth classes.
+        assert_eq!(quant_markers("mlx-community/MiniCPM5-2B-8_bit"), ["8BIT"]);
+        // `optiq` and `qwen2` must NOT false-positive as IQ/Q quants.
+        assert_eq!(
+            quant_markers("mlx-community/MiniCPM5-1B-OptiQ-4bit"),
+            ["4BIT"]
+        );
+        assert_eq!(quant_markers("openbmb/MiniCPM-V-4_5"), Vec::<String>::new());
     }
 
     #[test]
