@@ -2098,7 +2098,6 @@ mod doctor_tests {
     use super::*;
 
     #[test]
-    #[test]
     fn unit__quantize_temp__drop_removes_partial_defuse_keeps() {
         let dir = std::env::temp_dir();
         // Armed guard: any early return drops the partial write with it.
