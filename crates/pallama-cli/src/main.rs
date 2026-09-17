@@ -284,13 +284,15 @@ enum Cmd {
         /// Search query (words joined); omit to browse popular models
         #[arg(num_args = 0..)]
         query: Vec<String>,
-        /// Weight-format filter, any Hub tag: gguf (default), safetensors,
-        /// awq, gptq, fp8, mlx, onnx, … — or `any`/`all` for no filter.
+        /// Weight-format filter, any Hub tag: gguf, safetensors, awq,
+        /// gptq, fp8, mlx, onnx, … — default `any` shows every servable
+        /// lane (GGUF + safetensors quants); `--format gguf` narrows to
+        /// the llama.cpp lane.
         /// Works in any position: pallama search minicpm --format mlx
         #[arg(
             long,
             value_name = "FORMAT",
-            default_value = "gguf",
+            default_value = "any",
             value_parser = clap::builder::NonEmptyStringValueParser::new()
         )]
         format: String,
@@ -7590,7 +7592,7 @@ async fn search(query: &str, format: &str, json: bool) -> Result<()> {
         // consumers get a clean zero-row stream (jq -s reads it as []).
         if !json {
             println!(
-                "no {format} repos matched {query:?} — try `--format any`, or a known tag: gguf, safetensors, awq, gptq, fp8, mlx"
+                "no repos matched {query:?} — try a narrower tag: --format gguf | safetensors | awq | gptq | fp8 | mlx"
             );
         }
         return Ok(());
