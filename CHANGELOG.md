@@ -5,6 +5,10 @@ Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
 ## [Unreleased]
+
+## [0.6.1] - 2026-09-18
+
+First tagged source release of the Pallama server.
 ### Added
 - `pallama fit --json`: fit rows as JSONL with the machine context (`repo`, `vram_bytes`) riding every row — `fits_vram` is meaningless without the hardware that produced it; header, table and lane hints suppressed.
 - `pallama show --json`: the model card as one machine-typed object — nested GGUF metadata (null on safetensors rows) and the stored profile with argv/benchmark embedded as real JSON values instead of double-encoded strings (a corrupted row degrades to its raw string rather than failing the listing).
