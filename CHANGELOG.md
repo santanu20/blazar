@@ -4,6 +4,11 @@ All notable changes to Pallama are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
+## [Unreleased]
+
+### Fixed
+- **A failed engine replacement can no longer destroy the working engine it was replacing.** All install lanes (llama.cpp release assets, mistral.rs releases, sglang pip venvs, source builds) now run through one rollback-safe swap: the installed `engines/<tag>` dir is renamed aside before the new install starts at the final path (venvs and extracted archives embed absolute paths, so a scratch-name build cannot be renamed in), restored untouched when anything fails — download, extract, probe rejection, store failure; live incident 2026-09-18: a full disk ate a healthy sglang venv mid-rebuild under the old remove-first flow — and the superseded copy is deleted only after the replacement registers. A replacement briefly needs headroom for both copies; that disk cost is the price of never leaving a tag empty-handed. Leftover rollback copies from crashed runs of the same tag are swept automatically.
+
 ## [0.7.0] - 2026-09-18
 
 ### Fixed
