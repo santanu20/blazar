@@ -175,8 +175,15 @@ else
 fi
 echo "$OUT" | grep -q "sha256 verified" && ok "digest verified message" || bad "no 'sha256 verified' in output"
 # --- 2. tampered digest ------------------------------------------------------
+# Flip the leading hex char to one guaranteed different from the real one:
+# the tarball is built on the test host, so its digest is host-dependent and
+# a fixed replacement char would leave the digest untampered 1 run in 16.
+case "$SHA" in
+    0*) TAMPERED="f${SHA#?}" ;;
+    *)  TAMPERED="0${SHA#?}" ;;
+esac
 printf '{"tag_name":"%s","assets":[{"name":"%s","digest":"sha256:%s","browser_download_url":"%s/download/%s"}]}' \
-    "$TAG" "$ASSET" "0${SHA#?}" "$BASE" "$ASSET" > "$SRV/release.json"
+    "$TAG" "$ASSET" "$TAMPERED" "$BASE" "$ASSET" > "$SRV/release.json"
 
 rm -rf "$SYSTEM_BIN" "$UNIT_OUT"
 OUT=$(env $INSTALL_ENV sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
