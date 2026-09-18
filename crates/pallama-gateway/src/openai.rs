@@ -111,7 +111,7 @@ pub async fn embeddings(
     .await
     {
         Ok(ok) => ok,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let outcome = match &req["input"] {
         serde_json::Value::String(s) => {
@@ -319,7 +319,7 @@ pub async fn openai_proxy(
                 .map_or_else(|| state.config.effective_ctx(&model), |p| p.ctx);
             if let Err(resp) = crate::preflight::enforce_prompt_fits(&state, &model, &v, eff).await
             {
-                return resp;
+                return *resp;
             }
         }
     }
@@ -346,7 +346,7 @@ pub async fn openai_proxy(
             return openai_error(400, "X-Pallama-Num-Ctx must be positive");
         }
         if let Err(resp) = crate::ollama::apply_num_ctx(&state, &model, want).await {
-            return resp;
+            return *resp;
         }
     }
 
@@ -367,7 +367,7 @@ pub async fn openai_proxy(
     .await
     {
         Ok(ok) => ok,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let model_name = engine.name.clone();
     // Prefix heat (FIX3): chat-family traffic warms the RESOLVED name —
@@ -394,7 +394,7 @@ pub async fn openai_proxy(
     .await
     {
         Ok(g) => g,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     proxy_request(
         &state,
@@ -594,7 +594,7 @@ pub async fn scoped_proxy(
     let (engine, load_ms) = match ensure_with_admission(&state, &model, priority, None, false).await
     {
         Ok(ok) => ok,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let model_name = engine.name.clone();
     let deadline_ms = headers
@@ -612,7 +612,7 @@ pub async fn scoped_proxy(
     .await
     {
         Ok(g) => g,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     proxy_request(
         &state,
@@ -752,7 +752,7 @@ pub async fn responses_api(
     .await
     {
         Ok(ok) => ok,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let model_name = engine.name.clone();
     let guard = match admission_gate_slo(
@@ -766,7 +766,7 @@ pub async fn responses_api(
     .await
     {
         Ok(g) => g,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     if stream || !store {
@@ -990,7 +990,7 @@ pub async fn lora_adapters(
     let (engine, load_ms) =
         match ensure_with_admission(&state, m, Priority::Normal, None, false).await {
             Ok(ok) => ok,
-            Err(resp) => return resp,
+            Err(resp) => return *resp,
         };
     let url = format!(
         "/lora-adapters{}",
@@ -1016,7 +1016,7 @@ pub async fn lora_adapters(
             )
             .await
         }
-        Err(resp) => resp,
+        Err(resp) => *resp,
     }
 }
 

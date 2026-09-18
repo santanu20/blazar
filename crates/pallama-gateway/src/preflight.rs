@@ -47,7 +47,7 @@ pub async fn enforce_prompt_fits(
     model: &str,
     body: &serde_json::Value,
     effective_ctx: u32,
-) -> Result<(), axum::response::Response> {
+) -> Result<(), Box<axum::response::Response>> {
     if !state.config.prompt_preflight || effective_ctx == 0 {
         return Ok(());
     }
@@ -138,16 +138,18 @@ pub async fn enforce_prompt_fits(
         } else {
             "estimated"
         };
-        Err(crate::proxy::openai_error(
-            400,
-            &format!(
-                "prompt {tokens} tokens ({how}) exceeds the {effective_ctx}-token context for \
-                 {model:?} — the engine would silently truncate it. Shorten the prompt, raise ctx \
-                 (config/[model_overrides] ctx or X-Pallama-Num-Ctx), or set \
-                 prompt_preflight = false to allow truncation",
-            ),
-        )
-        .into_response())
+        Err(Box::new(
+            crate::proxy::openai_error(
+                400,
+                &format!(
+                    "prompt {tokens} tokens ({how}) exceeds the {effective_ctx}-token context for \
+                     {model:?} — the engine would silently truncate it. Shorten the prompt, raise \
+                     ctx (config/[model_overrides] ctx or X-Pallama-Num-Ctx), or set \
+                     prompt_preflight = false to allow truncation",
+                ),
+            )
+            .into_response(),
+        ))
     } else {
         Ok(())
     }

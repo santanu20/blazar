@@ -100,7 +100,7 @@ pub async fn messages(
     if let Err(resp) =
         crate::preflight::enforce_prompt_fits(&state, &model, &openai_body, eff).await
     {
-        return resp;
+        return *resp;
     }
     let priority = Priority::from_header(
         headers
@@ -120,7 +120,7 @@ pub async fn messages(
     .await
     {
         Ok(ok) => ok,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let key_name = engine.name.clone();
     state.sup.note_prefix_hit(&key_name);
@@ -141,7 +141,7 @@ pub async fn messages(
     .await
     {
         Ok(g) => g,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let url = format!("{}/v1/chat/completions", child_base(&engine.endpoint));
     // F44: pooled client (10-min total timeout) instead of a per-request
@@ -263,7 +263,7 @@ pub async fn count_tokens(
     let (engine, _) =
         match ensure_with_admission(&state, &model, Priority::Normal, None, false).await {
             Ok(ok) => ok,
-            Err(resp) => return resp,
+            Err(resp) => return *resp,
         };
     let url = format!("{}/tokenize", child_base(&engine.endpoint));
     // F44: pooled client — the old bare `Client::new()` had NO timeout,

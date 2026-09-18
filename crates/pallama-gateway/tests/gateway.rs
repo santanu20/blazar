@@ -1070,7 +1070,7 @@ async fn e2e__generate_images_and_streaming_chat_bus() {
     }
     assert!(saw_delta, "stream produced deltas: {body}");
     let fin = final_line.expect("stream ends with a done:true line");
-    assert!(fin["done"] == true);
+    assert_eq!(fin["done"], true);
     assert!(fin["done_reason"].as_str().is_some());
     assert!(
         fin["eval_count"].as_i64().is_some(),

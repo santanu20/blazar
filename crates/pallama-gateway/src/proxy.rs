@@ -232,18 +232,18 @@ pub async fn ensure_with_admission(
     priority: Priority,
     prefix: Option<PrefixKey>,
     needs_vision: bool,
-) -> Result<(EngineRef, u128), Response> {
+) -> Result<(EngineRef, u128), Box<Response>> {
     let started = Instant::now();
     // Model resolution is the only store need; it completes inside the
     // cached-connection visit (sync, guard never crosses an await).
     let row = state
         .with_store(|s| resolve_model(s, model))
-        .ok_or_else(|| openai_error(500, "store unavailable"))?
+        .ok_or_else(|| Box::new(openai_error(500, "store unavailable")))?
         .map_err(|e| match e.as_str() {
             msg if msg.contains("not found") || msg.contains("ambiguous") => {
-                openai_error(StatusCode::NOT_FOUND.as_u16(), msg)
+                Box::new(openai_error(StatusCode::NOT_FOUND.as_u16(), msg))
             }
-            msg => openai_error(500, msg),
+            msg => Box::new(openai_error(500, msg)),
         })?;
 
     let ensure_first = |needs: bool| -> std::pin::Pin<
@@ -283,12 +283,12 @@ pub async fn ensure_with_admission(
                 )
                 .await;
             state.sup.note_slot_pressure_release(&row.name);
-            waited.map_err(|e| openai_error(503, &e))?;
+            waited.map_err(|e| Box::new(openai_error(503, &e)))?;
             ensure_first(needs_vision)
                 .await
-                .map_err(|e| supervision_error(&e))?
+                .map_err(|e| Box::new(supervision_error(&e)))?
         }
-        Err(e) => return Err(supervision_error(&e)),
+        Err(e) => return Err(Box::new(supervision_error(&e))),
     };
     Ok((engine, started.elapsed().as_millis()))
 }
@@ -1208,7 +1208,7 @@ pub async fn admission_gate_slo(
     deadline_ms: Option<u64>,
     body_len: usize,
     wfq: Option<(&str, u32)>,
-) -> Result<InFlightGuard, Response> {
+) -> Result<InFlightGuard, Box<Response>> {
     let max_inflight: i64 = state.sup.slot_cap(model);
     // Predictive early-reject (#28): an explicit deadline that measured
     // TTFT p90 says we cannot possibly meet -> fail fast with numbers.
@@ -1234,7 +1234,7 @@ pub async fn admission_gate_slo(
                 axum::http::HeaderValue::from_str(&retry.to_string())
                     .unwrap_or(axum::http::HeaderValue::from_static("1")),
             );
-            return Err(resp);
+            return Err(Box::new(resp));
         }
     }
     loop {
@@ -1267,7 +1267,7 @@ pub async fn admission_gate_slo(
             )
             .await;
         state.sup.note_slot_pressure_release(model);
-        waited.map_err(|e| openai_error(503, &e))?;
+        waited.map_err(|e| Box::new(openai_error(503, &e)))?;
     }
 }
 
@@ -1641,7 +1641,7 @@ mod cache_obs_tests {
         record_buffered_chat(&obs, &serde_json::to_vec(&body).unwrap(), 0.25);
         assert_eq!(obs.prompt_tokens.load(Ordering::Relaxed), 120);
         assert_eq!(obs.cached_tokens.load(Ordering::Relaxed), 96);
-        assert!(obs.unclassified.load(Ordering::Relaxed) == 0);
+        assert_eq!(obs.unclassified.load(Ordering::Relaxed), 0);
         let mut warm = String::new();
         obs.ttft_warm.render(&mut warm);
         assert!(warm.contains("_count 1"), "{warm}");
