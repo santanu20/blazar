@@ -600,7 +600,7 @@ pub fn mistralrs_argv(
     // `--max-num-batched-tokens` tokens per step and defaults to 4096:
     // any prompt longer than that dies as an HTTP 200 with an empty
     // choices array and `error: service_unavailable` (live-proven on
-    // v0.9.3 — geokit's ~4.3k-token system prompt tripped it). Raise the
+    // v0.9.3 — a real-world ~4.3k-token system prompt tripped it). Raise the
     // step to the serving context so prefill is never chunk-starved.
     if profile.ctx > 0 && flags.contains("--max-num-batched-tokens") {
         argv.push("--max-num-batched-tokens".into());

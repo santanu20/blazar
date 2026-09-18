@@ -1,7 +1,7 @@
 //! stub-llama-server: test-double for the real llama-server child.
 //!
 //! Mirrors the observable surface Pallama depends on (verified against
-//! upstream master `references/llama.cpp-master`):
+//! ggml-org/llama.cpp upstream master):
 //!   - `--list-devices` prints PLAIN TEXT (not JSON):
 //!     "Available devices:\n  NAME: DESC (TOTAL MiB, FREE MiB free)\n"
 //!   - `--version` prints "version: NNNN (commit)" style lines

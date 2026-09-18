@@ -41,8 +41,7 @@ impl EngineKind {
     /// GGUF runs everywhere but llamacpp's quant kernels are the
     /// reference (mistral.rs is the overlap fallback) — for every
     /// policy, until a quant-matched mistral.rs GGUF row lands in the
-    /// engine matrix (that experiment is pending; see
-    /// docs/engine-coverage.md).
+    /// engine matrix (that experiment is pending).
     ///
     /// safetensors routes by policy, on measured evidence: quality and
     /// throughput prefer sglang (0.612-vs-0.575 quality and

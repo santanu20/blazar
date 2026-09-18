@@ -186,7 +186,7 @@ fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
 /// MIME-tolerant input (RFC 2045): ollama clients — python's
 /// `base64.encodebytes`, go's mime writers — may wrap payloads in
 /// newlines every 76 chars. The engine's strict decoder rejects
-/// whitespace inside data-URL base64 (live-caught on b10970: geokit
+/// whitespace inside data-URL base64 (live-caught on b10970: client
 /// fixture images 400'd as "Failed to load image or audio file" while
 /// ollama accepted the same payload). Strip it once here so both the
 /// magic sniff and the forwarded URL see clean base64.
@@ -604,7 +604,7 @@ fn tool_calls_line(model: &str, calls: &Value) -> Value {
 /// emits each call exactly once, complete, in ollama dialect
 /// (`{id, function: {index, name, arguments: <parsed object>}}`), while
 /// the child streams fragments (id+name first, argument shards after).
-/// Clients built for the ollama wire (e.g. geokit's compare harness)
+/// Clients built for the ollama wire (replay-compare harnesses)
 /// `extend()` fragments verbatim and replay them, which the child rejects
 /// ("Missing tool call name") — merging at the edge restores the contract.
 #[must_use]
@@ -1304,7 +1304,7 @@ mod tests {
 
     #[test]
     fn unit__generate_system_images_think_options() {
-        // The full geokit pdf_ocr shape: system + prompt + images + options.
+        // Full-surface vision shape: system + prompt + images + options.
         // "iVBORw0KGgo" = 12-byte PNG magic prefix.
         let req = json!({
             "model": "m",
@@ -1382,8 +1382,8 @@ mod tests {
     #[test]
     fn unit__assistant_tool_calls_gain_type_function() {
         // ollama wire shape omits `type` on tool_calls entries; the child
-        // rejects them with "Missing tool call type" (live-repro'd via the
-        // geokit server-compare harness: every MULTITURN replay 500'd).
+        // rejects them with "Missing tool call type" (live-repro'd via a
+        // server-compare harness: every MULTITURN replay 500'd).
         let req = json!({
             "model": "m",
             "messages": [
@@ -1475,7 +1475,7 @@ mod tests {
     fn unit__image_data_url__strips_mime_wrapped_base64() {
         // RFC 2045 line-wrapped base64 (python base64.encodebytes, go mime
         // writers): the engine's strict decoder rejects whitespace inside
-        // data URLs (live-caught on b10970 — geokit fixture images 400'd).
+        // data URLs (live-caught on b10970 — client fixture images 400'd).
         let wrapped = "iVBORw0KGgoAAA\nANSUhEUgAAAAg=\n";
         let url = image_data_url(wrapped).unwrap();
         assert_eq!(url, "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAg=");
@@ -1494,7 +1494,7 @@ mod tests {
 
     #[test]
     fn unit__logprobs_mapped_back_in_chat_response() {
-        // geokit verifier shape: top-level logprobs array with
+        // ollama-parity verifier shape: top-level logprobs array with
         // token/logprob/top_logprobs, cloned 1:1 from the child.
         let openai = json!({
             "choices": [{
