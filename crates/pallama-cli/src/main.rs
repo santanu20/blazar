@@ -5609,6 +5609,7 @@ fn repl_local_command(
     system_msg: &mut Option<String>,
     model: &mut String,
     verbose: &mut bool,
+    thinks: &mut bool,
 ) -> Option<bool> {
     match line {
         "/exit" | "/bye" => return Some(true),
@@ -5646,6 +5647,8 @@ fn repl_local_command(
             *model = line["/model ".len()..].trim().to_string();
             history.clear();
             *system_msg = None;
+            // Fresh model: let it negotiate thinking capability again.
+            *thinks = true;
             println!("(switched to {model})");
         }
         _ => return None,
@@ -5664,6 +5667,9 @@ async fn run_repl(model: &str) -> Result<()> {
     let mut history: Vec<serde_json::Value> = Vec::new();
     let mut system_msg: Option<String> = None;
     let mut verbose = false;
+    // Per-model thinking capability: assumed until the daemon's teaching
+    // 400 proves otherwise (first turn), reset on /model switch.
+    let mut thinks = true;
     #[cfg(unix)]
     install_repl_sigint();
     println!("pallama REPL — /help for commands");
@@ -5700,6 +5706,7 @@ async fn run_repl(model: &str) -> Result<()> {
             &mut system_msg,
             &mut model,
             &mut verbose,
+            &mut thinks,
         ) {
             Some(true) => break,
             Some(false) => continue,
@@ -5717,11 +5724,47 @@ async fn run_repl(model: &str) -> Result<()> {
             _ => {}
         }
         history.push(serde_json::json!({"role": "user", "content": line}));
-        repl_turn(&base, &model, &mut history, system_msg.as_deref(), verbose).await?;
+        // Capability negotiation, not a silent retry: the first turn per
+        // model asks for thinking; if the daemon's teaching 400 says the
+        // model has no thinking mode, remember that and re-send once
+        // without the knob. The notice keeps the fallback loud.
+        if let Err(e) = repl_turn(
+            &base,
+            &model,
+            &mut history,
+            system_msg.as_deref(),
+            verbose,
+            thinks,
+        )
+        .await
+        {
+            if thinks && is_unsupported_think_error(&e.to_string()) {
+                thinks = false;
+                println!("(this model has no thinking mode — answers only)");
+                repl_turn(
+                    &base,
+                    &model,
+                    &mut history,
+                    system_msg.as_deref(),
+                    verbose,
+                    thinks,
+                )
+                .await?;
+            } else {
+                return Err(e);
+            }
+        }
     }
     #[cfg(unix)]
     restore_repl_sigint();
     Ok(())
+}
+
+/// The daemon's teaching refusal for `think: true` on a template without
+/// thinking markers (gateway ollama.rs `refuse_unsupported_think`). The
+/// marker string is the gateway's stable error contract.
+fn is_unsupported_think_error(msg: &str) -> bool {
+    msg.contains("does not support thinking")
 }
 
 /// One REPL conversation turn: send the history (with any system message
@@ -5741,17 +5784,27 @@ async fn repl_turn(
     history: &mut Vec<serde_json::Value>,
     system_msg: Option<&str>,
     verbose: bool,
+    thinks: bool,
 ) -> Result<bool> {
     let mut messages = Vec::with_capacity(history.len() + 1);
     if let Some(sys) = system_msg {
         messages.push(serde_json::json!({"role": "system", "content": sys}));
     }
     messages.extend(history.iter().cloned());
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "messages": messages,
         "stream": true,
     });
+    if thinks {
+        // Reasoning is requested by default: the gateway translates the
+        // ollama-dialect `think` field to the engine's chat_template_kwargs
+        // (thinking + enable_thinking) and the engine's reasoning-format
+        // splits thoughts into a separate field — tags never leak into the
+        // visible stream. Dropped for models the daemon taught us cannot
+        // think (is_unsupported_think_error fallback above).
+        body["think"] = serde_json::json!(true);
+    }
     let outcome = stream_chat(base.to_string(), body).await?;
     if outcome.interrupted {
         println!("\n^C interrupted");
@@ -5863,7 +5916,9 @@ async fn stream_chat(base: String, body: serde_json::Value) -> Result<StreamOutc
                 if is_tty {
                     if let Some(thinking) = v["message"]["thinking"].as_str() {
                         if !thinking.is_empty() {
-                            write!(stdout.lock(), "\x1b[2m{thinking}\x1b[0m").ok();
+                            // Dull font for the reasoning block: dim +
+                            // italic, distinct at a glance from the answer.
+                            write!(stdout.lock(), "\x1b[2;3m{thinking}\x1b[0m").ok();
                             after_thinking = true;
                             rendered_any = true;
                         }
@@ -5872,6 +5927,10 @@ async fn stream_chat(base: String, body: serde_json::Value) -> Result<StreamOutc
                 if let Some(content) = v["message"]["content"].as_str() {
                     if !content.is_empty() {
                         if after_thinking {
+                            // End the thinking block's line, then one blank
+                            // line so the answer starts crisp at full
+                            // brightness — the visual split IS the feature.
+                            writeln!(stdout.lock()).ok();
                             writeln!(stdout.lock()).ok();
                             after_thinking = false;
                         }
@@ -8582,6 +8641,19 @@ mod tests {
             chat_stats_line(&bare),
             "total duration: answer 0 tokens at 0.0 t/s; prompt 0 tokens"
         );
+    }
+
+    #[test]
+    fn unit__is_unsupported_think_error__matches_gateway_contract_only() {
+        // The gateway's teaching 400 (ollama.rs refuse_unsupported_think)
+        // is the only string that may trigger the graceful fallback.
+        assert!(is_unsupported_think_error(
+            "daemon: {\"error\":{\"code\":400,\"message\":\"model qwen2.5-0.5b does not support thinking: its chat template has no thinking markers\"}}"
+        ));
+        // Unrelated daemon/API errors must NOT be swallowed into a retry.
+        assert!(!is_unsupported_think_error("daemon: model not found"));
+        assert!(!is_unsupported_think_error("connection refused"));
+        assert!(!is_unsupported_think_error(""));
     }
 
     #[test]
