@@ -1742,7 +1742,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             host: "127.0.0.1".to_string(),
-            port: 11434,
+            port: 11435,
             default_ctx: 16384,
             idle_sleep_secs: 300,
             cpu_range: String::new(),
@@ -3638,10 +3638,14 @@ seed = 42
     #[test]
     fn unit__default_file_contains_documented_defaults() {
         let raw = Config::default().to_toml().unwrap();
-        assert!(raw.contains("port = 11434"));
+        assert!(raw.contains("port = 11435"));
         assert!(raw.contains("default_ctx = 16384"));
         assert!(raw.contains("idle_sleep_secs = 300"));
         assert!(raw.contains("idle_timeout_secs = 1800"));
+        // Docs-drift pins: these two defaults were wrongly documented from a stale
+        // code reading and only caught by diffing the live `config defaults` dump.
+        assert!(raw.contains("adaptive_slots = true"));
+        assert!(raw.contains("engine_check_secs = 86400"));
     }
 
     #[test]
