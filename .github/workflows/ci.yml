@@ -2,7 +2,8 @@ name: ci
 
 on:
   push:
-    branches: [master]
+    # main: the published export repo's branch; master: the dev tree.
+    branches: [master, main]
   pull_request:
 
 jobs:
@@ -71,3 +72,15 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  hygiene:
+    name: hygiene gates (paths + AI artifacts)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Machine-specific absolute paths and AI-agent artifacts were
+      # caught only in manual pre-release scans (AGENTS.md absolute-path
+      # gate + AI-artifact gate); one straggler shipped before being
+      # caught. The script self-tests both directions on every run.
+      - run: shellcheck -S warning scripts/check_hygiene.sh
+      - run: sh scripts/check_hygiene.sh
