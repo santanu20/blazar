@@ -4,6 +4,75 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// Retry budget for spawn-class transients. 4 attempts / 250 ms flat
+/// backoff is the measured-cure bar from the original vulkan-flake fix
+/// (3ce05e1); flat rather than jittered because a single sync caller
+/// retries alone — no in-process herd to de-synchronize, and parallel
+/// test binaries are bounded by the same 4-attempt cap.
+const SPAWN_RETRY_ATTEMPTS: u32 = 4;
+const SPAWN_RETRY_BACKOFF: Duration = Duration::from_millis(250);
+
+/// Is this spawn error environment-transient (worth a bounded retry)?
+/// The classes, all reproduced live under parallel load:
+///
+/// - EAGAIN/EWOULDBLOCK (fork/thread pressure — `ErrorKind::WouldBlock`),
+///   EINTR (`Interrupted`), ENOMEM;
+/// - EMFILE/ENFILE (fd pressure — `ulimit -n` repro: the probe's pipe
+///   pair loses the race for the last descriptors);
+/// - ETXTBSY (write->close->exec writeback race on a JUST-INSTALLED
+///   binary — os error 26, captured live: `fs::copy`/tar-extract closes
+///   the fd, execve still briefly sees the inode write-open while pages
+///   flush; hits the real install lane, not only tests).
+///
+/// Everything else is permanent — ENOENT (missing binary), EACCES,
+/// ENOEXEC (garbage/foreign-arch asset — the register-or-clean fast-fail
+/// pin depends on that one NOT being retried) — and must fail on
+/// attempt one so the loud error is not delayed.
+fn is_transient_spawn_err(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        matches!(
+            e.raw_os_error(),
+            Some(libc::ENOMEM | libc::EMFILE | libc::ENFILE | libc::ETXTBSY)
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Run a spawn-class operation under the bounded transient-retry policy
+/// (H16: explicit attempts, backoff, abort on permanent class). Covers
+/// `Command::spawn` and `Command::output` alike; the final error is
+/// returned as-is — retry never masks, it only rides out pressure.
+pub(crate) fn with_spawn_retry<T>(
+    mut op: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let mut attempt = 1;
+    loop {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if !is_transient_spawn_err(&e) || attempt >= SPAWN_RETRY_ATTEMPTS {
+                    return Err(e);
+                }
+                tracing::warn!(
+                    "transient spawn failure ({e}), retry {attempt}/{} in {:?}",
+                    SPAWN_RETRY_ATTEMPTS - 1,
+                    SPAWN_RETRY_BACKOFF
+                );
+                std::thread::sleep(SPAWN_RETRY_BACKOFF);
+                attempt += 1;
+            }
+        }
+    }
+}
+
 /// Run a short-lived probe command (`--version`/`--help`/census class)
 /// under a hard deadline. A hung probe binary must fail fast instead of
 /// wedging the caller forever (F85); on timeout the child is killed and
@@ -16,12 +85,13 @@ use std::time::{Duration, Instant};
 /// block on write, never exit, and turn into a guaranteed deadline kill —
 /// a silent 30 s stall masquerading as a hung binary. Spawn failures are
 /// logged with their `io::Error` (a transient EAGAIN under fork pressure
-/// must not be indistinguishable from a missing binary).
+/// is retried by [`with_spawn_retry`]; what survives is logged with the
+/// error so it stays distinguishable from a missing binary).
 pub fn probe_output(cmd: &mut Command, secs: u64) -> Option<std::process::Output> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = match cmd.spawn() {
+    let mut child = match with_spawn_retry(|| cmd.spawn()) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("probe spawn failed ({e}): {:?}", cmd.get_program());
@@ -426,5 +496,75 @@ mod tests {
     fn unit__probe_output__missing_binary_is_none_not_panic() {
         let mut cmd = std::process::Command::new("/nonexistent/pallama-probe-binary");
         assert!(probe_output(&mut cmd, 5).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unit__is_transient_spawn_err__classifies_pressure_vs_permanent() {
+        use std::io::Error;
+        let transient = [
+            Error::from_raw_os_error(libc::EAGAIN),
+            Error::from_raw_os_error(libc::EWOULDBLOCK),
+            Error::from_raw_os_error(libc::EINTR),
+            Error::from_raw_os_error(libc::ENOMEM),
+            Error::from_raw_os_error(libc::EMFILE),
+            Error::from_raw_os_error(libc::ENFILE),
+            Error::from_raw_os_error(libc::ETXTBSY),
+            Error::new(std::io::ErrorKind::Interrupted, "interrupted"),
+        ];
+        for e in &transient {
+            assert!(is_transient_spawn_err(e), "{e} must classify transient");
+        }
+        // Permanent classes fail attempt one — ENOEXEC is the register
+        // fast-fail pin's mechanism (garbage asset), it must never retry.
+        let permanent = [
+            Error::from_raw_os_error(libc::ENOENT),
+            Error::from_raw_os_error(libc::EACCES),
+            Error::from_raw_os_error(libc::ENOEXEC),
+            Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        ];
+        for e in &permanent {
+            assert!(!is_transient_spawn_err(e), "{e} must classify permanent");
+        }
+    }
+
+    #[test]
+    fn unit__with_spawn_retry__transient_retries_then_succeeds() {
+        let attempts = std::cell::Cell::new(0u32);
+        let r = with_spawn_retry(|| {
+            attempts.set(attempts.get() + 1);
+            match attempts.get() {
+                n if n < 3 => Err(std::io::Error::from_raw_os_error(libc::EAGAIN)),
+                _ => Ok(42),
+            }
+        });
+        assert_eq!(r.unwrap(), 42);
+        assert_eq!(
+            attempts.get(),
+            3,
+            "two transients then success = 3 attempts"
+        );
+    }
+
+    #[test]
+    fn unit__with_spawn_retry__transient_exhausts_after_max_attempts() {
+        let attempts = std::cell::Cell::new(0u32);
+        let r = with_spawn_retry(|| {
+            attempts.set(attempts.get() + 1);
+            Err::<(), _>(std::io::Error::from_raw_os_error(libc::EAGAIN))
+        });
+        assert!(r.is_err(), "exhausted transients surface the final error");
+        assert_eq!(attempts.get(), SPAWN_RETRY_ATTEMPTS);
+    }
+
+    #[test]
+    fn unit__with_spawn_retry__permanent_fails_fast_attempt_one() {
+        let attempts = std::cell::Cell::new(0u32);
+        let r = with_spawn_retry(|| {
+            attempts.set(attempts.get() + 1);
+            Err::<(), _>(std::io::Error::from_raw_os_error(libc::ENOENT))
+        });
+        assert!(r.is_err());
+        assert_eq!(attempts.get(), 1, "permanent errors are never retried");
     }
 }

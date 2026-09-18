@@ -234,7 +234,11 @@ fn probe_mistralrs(server_path: &Path, tag: &str) -> Result<Manifest> {
     let help_invocations: [Vec<String>; 2] =
         [vec!["--help".into()], vec!["serve".into(), "--help".into()]];
     for args in help_invocations {
-        if let Ok(out) = Command::new(server).args(&args).output() {
+        // Same bounded transient-retry policy as every other probe spawn:
+        // an EAGAIN under load must not silently shrink the flag set.
+        if let Ok(out) =
+            crate::probe::with_spawn_retry(|| Command::new(server).args(&args).output())
+        {
             let (mut f, _) = parse_help(&String::from_utf8_lossy(&out.stdout));
             flags.append(&mut f);
         }

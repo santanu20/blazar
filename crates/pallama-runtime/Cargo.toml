@@ -38,6 +38,7 @@ getrandom = { workspace = true }
 tempfile = "3"
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true }
 wiremock = "0.6"
 
 [lints]

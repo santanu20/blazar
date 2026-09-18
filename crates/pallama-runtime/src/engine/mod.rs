@@ -1671,12 +1671,13 @@ fn make_executable(path: &Path) {
 /// race. Bounding the DECISION (not the child's life) is the contract —
 /// the previous probe blocked the spawn path indefinitely instead.
 fn exec_version_probe(bin: &Path, args: &[&str], budget: std::time::Duration) -> bool {
-    let Ok(child) = std::process::Command::new(bin)
-        .args(args)
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(args)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    else {
+        .stderr(std::process::Stdio::null());
+    // Bounded transient retry (EAGAIN-class under parallel load) — a
+    // permanent failure (missing/garbage binary) still fails attempt one.
+    let Ok(child) = crate::probe::with_spawn_retry(|| cmd.spawn()) else {
         return false;
     };
     let (tx, rx) = std::sync::mpsc::channel();
