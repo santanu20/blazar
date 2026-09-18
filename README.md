@@ -18,7 +18,7 @@
 
 **No fork. No lock-in. No telemetry. No cloud.** The engines are official upstream binaries, sha256-verified, installed side-by-side with atomic switching and rollback. Your models stay plain `.gguf` files you can touch with any tool. The only outbound traffic pallama ever generates is the engine/model downloads you ask for.
 
-**Contents:** [The numbers](#the-numbers) · [Switch from ollama](#switch-from-ollama) · [Who it's for](#who-its-for) · [Install](#install) · [Quickstart](#60-second-quickstart) · [Ollama complaint table](#every-ollama-complaint-fixed-at-the-root) · [How it works](#how-it-works) · [Quality](#quality) · [Docs](#documentation)
+**Contents:** [The numbers](#the-numbers) · [Switch from ollama](#switch-from-ollama) · [Who it's for](#who-its-for) · [Install](#install) · [Quickstart](#60-second-quickstart) · [Power-tool CLI](#the-power-tool-cli) · [Ollama complaint table](#every-ollama-complaint-fixed-at-the-root) · [How it works](#how-it-works) · [Quality](#quality) · [Docs](#documentation)
 
 ## The numbers
 
@@ -80,6 +80,19 @@ The switch is low-risk and incremental: pallama runs **alongside** ollama (diffe
 
 4. **Go full drop-in when ready.** Set `port = 11434` in `config.toml`, remove ollama, and every `OLLAMA_HOST`-less client keeps working unchanged.
 
+What changes on disk — and what doesn't:
+
+```
+ollama                                  pallama
+-----------------------------------     -----------------------------------
+~/.ollama/models/                       ~/.local/share/pallama/models/
+  blobs/sha256-8f4a8e...   opaque         qwen3-8b-q4_k_m.gguf   plain file
+  blobs/sha256-1c9d02...   opaque         qwen3-8b-q8_0.gguf     plain file
+manifests/library/qwen3   hash tree     config.toml            documented knobs
+```
+
+Left: content-addressed blobs only ollama understands. Right: plain GGUF files any tool can touch — `pallama import` hardlinks them in place, so nothing is re-downloaded and nothing is duplicated.
+
 What you gain from the switch is the whole point — the measured table [above](#the-numbers), plus every long-standing ollama complaint resolved at the root in the [table below](#every-ollama-complaint-fixed-at-the-root): plain `.gguf` files instead of a hashed blob store, any HF quant, multi-shard GGUF, `keep_alive` and `num_ctx` honored in both APIs, concurrent streams that actually run in parallel.
 
 ## Who it's for
@@ -130,6 +143,8 @@ Installs to `%LOCALAPPDATA%\Programs\pallama` and adds it to the user PATH. ARM6
 
 **From source:** `sudo cargo install --path crates/pallama-cli` (recent stable Rust) — or just run the installer from the checkout.
 
+**Staying current:** `pallama upgrade` self-updates the binary from GitHub Releases (sha256-verified, same mechanism as engine installs; `--dry-run` to preview, `--version` to pin).
+
 ### What the installer does for you
 
 - **One-click readiness:** after the binary lands, it bootstraps the llama.cpp engine (idempotent — skips when an engine is already active) so a fresh install can serve inference immediately; failures are loud warnings, never silent. Opt out with `PALLAMA_INSTALL_ENGINE=0`, pre-pull a model with `PALLAMA_INSTALL_MODEL=<name>`, point engine downloads at a mirror with `PALLAMA_GH_BASE`, or cap the daemon cgroup with `PALLAMA_UNIT_MEMORY_HIGH` (systemd `MemoryHigh`, default `85%` of RAM — soft reclaim/throttle only, never an OOM kill; empty string omits the line).
@@ -167,6 +182,46 @@ Three API dialects on the one port:
 
 Full route table with payloads and error codes: [docs/4.API_SPEC](docs/4.API_SPEC.md).
 
+## The power-tool CLI
+
+The advanced surface, grouped by job. `--json`/JSONL output on the inspection commands (`list`, `ps`, `show`, `fit`, `doctor`) keeps them script-friendly.
+
+**Models & weights**
+
+| Command | What it does |
+|---|---|
+| `pallama pull owner/repo:QUANT` \| `shortname` | Hugging Face or registry.ollama.ai, sha256-verified, resumable, multi-shard native |
+| `pallama import model.gguf --name x` | Register a GGUF already on disk — hardlinked in place, zero copy |
+| `pallama quantize -t Q4_K_M [--imatrix calib.txt]` | Derive new quants locally with the engine's own llama-quantize; imatrix calibration for better Q4 accuracy |
+| `pallama create` | Parameter aliases from a Modelfile (`FROM` + `PARAMETER`) — zero-copy, no 30–60 GB blob duplication |
+| `pallama lora` / `pallama mmproj` | LoRA adapter management; attach a vision projector to any model |
+| `pallama search --format <tag>` | Search Hugging Face across every weight format |
+| `pallama fit [--json]` | VRAM fit + quant alternatives *before* downloading |
+| `pallama coreside` | Co-residency plan: which local models fit in VRAM together (weights + f16 KV at each model's ctx) |
+
+**Performance**
+
+| Command | What it does |
+|---|---|
+| `pallama tune --search` | Measured launch profile: grid argmax over real runs; live probes for slots/n-gram/load tuning |
+| `pallama bench` | llama-bench runner for measured, comparable numbers |
+| `pallama drafts <model>` | Speculative-decoding draft candidates — EAGLE3/MTP heads plus small same-family models |
+
+**Operations & safety**
+
+| Command | What it does |
+|---|---|
+| `pallama engine update/use/rollback/build` | sha256-verified engines, side-by-side, regression-gated; CUDA source builds through the same flow |
+| `pallama upgrade [--dry-run]` | Self-update the binary from GitHub Releases, sha256-verified |
+| `pallama keys` | API key lifecycle — list / add / rm / rotate against the daemon |
+| `pallama launch --warm <model> -- <cli>` | Pre-warm a model, exec a CLI, hand it a gateway key |
+| `pallama session save/restore` | Slot KV checkpoints that survive unload and daemon restarts |
+| `pallama snapshot` | Timestamped backup of config + store + sessions manifest (older ones auto-pruned) |
+| `pallama doctor` / `pallama why` / `pallama watch` | One-table diagnosis; post-hoc trace answers; live tail of sentinel detections |
+| `pallama whisper` | Audio transcription (wav/mp3/flac/…; `--install`/`--pull`/`--list` manage the model) |
+
+Plus `cp`/`rm`/`stop` for model housekeeping, `migrate` (config migration with timestamped backup), and `completions <shell>`.
+
 ## Every ollama complaint, fixed at the root
 
 Every row is a real, long-standing ollama complaint with pallama's root-cause resolution. No workarounds — different architecture.
@@ -183,7 +238,7 @@ Every row is a real, long-standing ollama complaint with pallama's root-cause re
 
 | ollama failure | pallama resolution |
 |---|---|
-| Modelfile copies 30–60 GB to change one parameter; silent `{{ .Prompt }}` fallback | No Modelfile. GGUF is self-contained truth; child always runs `--jinja` (embedded template); params per-request or per-model config overlay |
+| Modelfile copies 30–60 GB to change one parameter; silent `{{ .Prompt }}` fallback | No blob copies. `pallama create` aliases `FROM` + `PARAMETER` zero-copy; child always runs `--jinja` (embedded template); params per-request or per-model config overlay |
 | Hashed blob lock-in; limited quants | Plain `.gguf` files at `~/.local/share/pallama/models/` — any tool can use them; any HF quant |
 | No multi-shard GGUF | Shard sets pulled natively (`-0000N-of-0000M`), first shard launched |
 | Registry bottleneck; misleading names | Direct HF pull **and** registry.ollama.ai pull (shortnames route to the ollama registry; Docker-v2 manifest wire, sha256-verified resumable blobs via 307→presigned-CDN with allowlisted redirects, token only ever on first-party registry host — `PALLAMA_REGISTRY_TOKEN` for private namespaces). HF names = actual repo name, never a marketing alias |
