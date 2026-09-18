@@ -3678,7 +3678,7 @@ impl Supervisor {
             } else if in_flight == 0 && self.adopted_slots.contains_key(&model) {
                 // Decay: the adopted shape buys queue-latency under load
                 // and costs per-stream ITL (np8 ITL 60ms vs np4 37ms,
-                // /tmp/opencode/flagprobe/results2.json) — after a long
+                // flagprobe 2026-09-12) — after a long
                 // fully-quiet window, fall back to the natural shape so
                 // single-stream latency recovers. One-shot to base: the
                 // adopt path re-raises in 60s if demand returns.
