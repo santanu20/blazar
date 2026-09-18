@@ -4412,41 +4412,14 @@ async fn run_dispatch(
         std::process::exit(130);
     }
     // Profile decisions for THIS model (unified-KV ctx fit, slot auto,
-    // offload rationale) — the run that triggered the load is the run
-    // that deserves the why. REPL defers to `pallama ps`.
-    print_profile_warnings(&base, model).await;
+    // offload rationale) stay off the chat stream — `pallama ps` and the
+    // REPL /profile command own that surface.
     if verbose {
         if let Some(v) = &outcome.final_chunk {
             println!("\n\n{}", chat_stats_line(v));
         }
     }
     Ok(())
-}
-
-/// One-line-per-warning from `/api/ps` for the model this run used.
-/// Missing key (router mode) or no rows (already evicted) = silence.
-async fn print_profile_warnings(base: &str, model: &str) {
-    let Ok(resp) = cli_http().get(format!("{base}/api/ps")).send().await else {
-        return;
-    };
-    let Ok(v) = resp.json::<serde_json::Value>().await else {
-        return;
-    };
-    let Some(models) = v["models"].as_array() else {
-        return;
-    };
-    for m in models {
-        if m["name"].as_str() != Some(model) {
-            continue;
-        }
-        if let Some(ws) = m["pallama_warnings"].as_array() {
-            for w in ws {
-                if let Some(w) = w.as_str() {
-                    println!("[profile] {w}");
-                }
-            }
-        }
-    }
 }
 
 /// ollama cloud commands are refused, loudly: pallama is local-only by
@@ -5636,7 +5609,6 @@ fn repl_local_command(
     system_msg: &mut Option<String>,
     model: &mut String,
     verbose: &mut bool,
-    warned: &mut bool,
 ) -> Option<bool> {
     match line {
         "/exit" | "/bye" => return Some(true),
@@ -5674,7 +5646,6 @@ fn repl_local_command(
             *model = line["/model ".len()..].trim().to_string();
             history.clear();
             *system_msg = None;
-            *warned = false;
             println!("(switched to {model})");
         }
         _ => return None,
@@ -5693,9 +5664,6 @@ async fn run_repl(model: &str) -> Result<()> {
     let mut history: Vec<serde_json::Value> = Vec::new();
     let mut system_msg: Option<String> = None;
     let mut verbose = false;
-    // Profile warnings print once per model switch (ctx fit, slot auto,
-    // offload rationale) — the first turn is the one that paid the load.
-    let mut warned = false;
     #[cfg(unix)]
     install_repl_sigint();
     println!("pallama REPL — /help for commands");
@@ -5732,7 +5700,6 @@ async fn run_repl(model: &str) -> Result<()> {
             &mut system_msg,
             &mut model,
             &mut verbose,
-            &mut warned,
         ) {
             Some(true) => break,
             Some(false) => continue,
@@ -5750,13 +5717,7 @@ async fn run_repl(model: &str) -> Result<()> {
             _ => {}
         }
         history.push(serde_json::json!({"role": "user", "content": line}));
-        if repl_turn(&base, &model, &mut history, system_msg.as_deref(), verbose).await? {
-            continue;
-        }
-        if !warned {
-            print_profile_warnings(&base, &model).await;
-            warned = true;
-        }
+        repl_turn(&base, &model, &mut history, system_msg.as_deref(), verbose).await?;
     }
     #[cfg(unix)]
     restore_repl_sigint();

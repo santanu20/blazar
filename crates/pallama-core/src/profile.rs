@@ -10,7 +10,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::config::{Config, MmprojPolicy, ModelOverride};
+use crate::config::{Config, MmprojPolicy, ModelOverride, DEFAULT_CACHE_RAM_MB};
 use crate::config::{MistralrsTuning, SglangTuning};
 use crate::gguf::GgufMeta;
 use crate::hardware::GpuInfo;
@@ -282,7 +282,11 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         let requested = u64::try_from(config.cache_ram_mb).unwrap_or(u64::MAX);
         let clamped = effective_cache_ram_mib(input).map_or(requested, |cap| requested.min(cap));
         if clamped < requested {
-            warnings.push(format!(
+            // The shipped default meeting the adaptive cap is auto-tuning
+            // doing its designed job — journal only. A user-pinned budget
+            // being lowered is a real divergence and stays a warning.
+            let user_pinned = config.cache_ram_mb != DEFAULT_CACHE_RAM_MB;
+            let line = format!(
                 "cache_ram_mb {} clamped to {} ({}% of {} MiB RAM, hit-rate {}); override via model_overrides extra_args --cache-ram or set 0 = unlimited",
                 config.cache_ram_mb,
                 clamped,
@@ -291,7 +295,12 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
                 input
                     .cache_hit_rate
                     .map_or_else(|| "n/a".to_string(), |h| format!("{h:.2}"))
-            ));
+            );
+            if user_pinned {
+                warnings.push(line);
+            } else {
+                tracing::info!(model = input.model_name, "profile: {line}");
+            }
         }
         if kv_unified_emitted(input) && input.model_bytes > 0 {
             let weights_mib = input.model_bytes / (1024 * 1024);
@@ -1281,12 +1290,15 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         if ram_mib > 0 && pinned_mib * 100 <= ram_mib * 40 {
             argv.push("--load-mode".into());
             argv.push("mlock".into());
-            warnings.push(format!(
-                "load-mode mlock auto: weights {weights_mib} MiB (+ {} MiB resident) <= 40% \
-                 of {ram_mib} MiB RAM — eager page-in measured ~0.7s faster to first token; \
-                 set load_mode = \"mmap\" to opt out",
+            // Auto policy rationale: journal only — the decision note is
+            // not a user-facing warning.
+            tracing::info!(
+                model = input.model_name,
+                "profile: load-mode mlock auto — weights {weights_mib} MiB (+ {} MiB resident) \
+                 <= 40% of {ram_mib} MiB RAM; eager page-in measured ~0.7s faster to first \
+                 token; set load_mode = \"mmap\" to opt out",
                 input.resident_ram_mib
-            ));
+            );
         }
     }
 
@@ -4123,11 +4135,15 @@ fn resolve_slots(
         warn_vulkan_slot_cap(input, base_ctx, vram_bytes, warnings);
     }
     if np >= 2 {
-        warnings.push(format!(
-            "slots auto: -np {np} with total ctx {} (per-slot {base_ctx}) — concurrent streams \
-             batch on the GPU instead of queueing; pin slots = 1 for single-client full-speed",
+        // Auto-slot decision rationale: journal only — a machine decision
+        // with a tuning tip is not a user-facing warning.
+        tracing::info!(
+            model = input.model_name,
+            "profile: slots auto -np {np} with total ctx {} (per-slot {base_ctx}) — concurrent \
+             streams batch on the GPU instead of queueing; pin slots = 1 for single-client \
+             full-speed",
             np * base_ctx
-        ));
+        );
         return ResolvedSlots {
             slots: np,
             total_ctx: np * base_ctx,
@@ -4156,14 +4172,17 @@ fn resolve_slots(
             per_slot /= 2;
         }
         if let Some((np, per_slot)) = best {
-            warnings.push(format!(
-                "slots auto-fit: default ctx {base_ctx} fits only 1 concurrent slot — \
+            // Auto-fit decision rationale: journal only — same
+            // classification as the -np auto note above.
+            tracing::info!(
+                model = input.model_name,
+                "profile: slots auto-fit default ctx {base_ctx} fits only 1 concurrent slot — \
                  re-spent the same capacity budget as -np {np} x {per_slot} ctx (total {}, \
                  within the capacity guards — floor-rounding may grant a little extra \
                  headroom; prompts longer than {per_slot} tokens trigger the num_ctx \
                  restart-once path at a wider ctx); pin ctx or slots to disable",
                 np * per_slot
-            ));
+            );
             return ResolvedSlots {
                 slots: np,
                 total_ctx: np * per_slot,
@@ -4458,99 +4477,99 @@ fn push_gated(
 /// unpulled or unsupported pair degrades to dense with a teaching
 /// warning; manifest-gated emission when the draft is live.
 fn push_spec_args(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings: &mut Vec<String>) {
-    match crate::catalog::spec_pair_for(input.model_name) {
-        Some(pair) => {
-            if let Some(draft) = input.draft_path {
-                // Self-draft guard: the draft row's registry name can
-                // prefix-collide with its own main model (qwen3.5-9b-mtp
-                // matches the qwen3.5-9b pair) — drafting from the main
-                // weights would loop the same file through both roles.
-                if draft == input.model_path {
-                    warnings.push(format!(
-                        "spec=auto: catalog draft for {} resolved to the main model \
+    if let Some(pair) = crate::catalog::spec_pair_for(input.model_name) {
+        if let Some(draft) = input.draft_path {
+            // Self-draft guard: the draft row's registry name can
+            // prefix-collide with its own main model (qwen3.5-9b-mtp
+            // matches the qwen3.5-9b pair) — drafting from the main
+            // weights would loop the same file through both roles.
+            if draft == input.model_path {
+                warnings.push(format!(
+                    "spec=auto: catalog draft for {} resolved to the main model \
                          file itself; running dense",
-                        input.model_name
-                    ));
-                    return;
-                }
-                if !input.supported_flags.contains("--spec-type")
-                    || !input
-                        .spec_types
-                        .iter()
-                        .any(|t| t == pair.spec_type.as_str())
-                {
-                    // Old engine + resolved pair: degrade to dense with a
-                    // teaching warning, never a fatal child boot.
-                    warnings.push(format!(
-                        "spec=auto: catalog draft pair ({}) for {} is pulled but \
-                         engine {} lacks it; running dense — run: pallama engine update",
-                        pair.spec_type, input.model_name, input.engine_tag
-                    ));
-                    return;
-                }
-                // Capacity gate: the draft rides the SAME card as the main
-                // model, and the pre-spawn census's free MiB predates the
-                // main load — so the draft must fit alongside model + KV
-                // floor + spawn overhead. Without this an 8 GiB card
-                // (main 5.4 GiB + MTP draft 5.9 GiB) boot-OOMs instead of
-                // serving dense (live-measured: draft-on-CPU is 2x slower,
-                // so a partial-fit spawn is never the fallback).
-                let draft_bytes = std::fs::metadata(draft).map_or(0, |m| m.len());
-                let card_free_bytes: u64 = input
-                    .hardware
-                    .gpus
+                    input.model_name
+                ));
+                return;
+            }
+            if !input.supported_flags.contains("--spec-type")
+                || !input
+                    .spec_types
                     .iter()
-                    .map(|g| g.free_mib.saturating_mul(1024 * 1024))
-                    .sum();
-                let needed = input
-                    .model_bytes
-                    .saturating_add(draft_bytes)
-                    .saturating_add(KV_UNIFIED_VRAM_FLOOR_BYTES)
-                    .saturating_add(UNIFIED_SPAWN_OVERHEAD_BYTES);
-                // Same predicate rule 4 consults (spec_draft_will_attach)
-                // — keep the local math only for the warning numbers.
-                if draft_bytes == 0 || needed > card_free_bytes {
-                    warnings.push(format!(
-                        "spec=auto: draft {} ({} MiB) does not fit the picked card \
+                    .any(|t| t == pair.spec_type.as_str())
+            {
+                // Old engine + resolved pair: degrade to dense with a
+                // teaching warning, never a fatal child boot.
+                warnings.push(format!(
+                    "spec=auto: catalog draft pair ({}) for {} is pulled but \
+                         engine {} lacks it; running dense — run: pallama engine update",
+                    pair.spec_type, input.model_name, input.engine_tag
+                ));
+                return;
+            }
+            // Capacity gate: the draft rides the SAME card as the main
+            // model, and the pre-spawn census's free MiB predates the
+            // main load — so the draft must fit alongside model + KV
+            // floor + spawn overhead. Without this an 8 GiB card
+            // (main 5.4 GiB + MTP draft 5.9 GiB) boot-OOMs instead of
+            // serving dense (live-measured: draft-on-CPU is 2x slower,
+            // so a partial-fit spawn is never the fallback).
+            let draft_bytes = std::fs::metadata(draft).map_or(0, |m| m.len());
+            let card_free_bytes: u64 = input
+                .hardware
+                .gpus
+                .iter()
+                .map(|g| g.free_mib.saturating_mul(1024 * 1024))
+                .sum();
+            let needed = input
+                .model_bytes
+                .saturating_add(draft_bytes)
+                .saturating_add(KV_UNIFIED_VRAM_FLOOR_BYTES)
+                .saturating_add(UNIFIED_SPAWN_OVERHEAD_BYTES);
+            // Same predicate rule 4 consults (spec_draft_will_attach)
+            // — keep the local math only for the warning numbers.
+            if draft_bytes == 0 || needed > card_free_bytes {
+                warnings.push(format!(
+                    "spec=auto: draft {} ({} MiB) does not fit the picked card \
                          alongside {} (model {} MiB + KV floor + spawn overhead vs \
                          {} MiB free); running dense — speculation engages \
                          automatically on a card that fits both",
-                        pair.spec_type,
-                        draft_bytes / (1024 * 1024),
-                        input.model_name,
-                        input.model_bytes / (1024 * 1024),
-                        card_free_bytes / (1024 * 1024)
-                    ));
-                    return;
-                }
-                argv.push("--spec-type".into());
-                argv.push(pair.spec_type.clone());
-                argv.push("--spec-draft-model".into());
-                argv.push(draft.to_string());
-                if input.supported_flags.contains("--spec-draft-n-max") {
-                    argv.push("--spec-draft-n-max".into());
-                    argv.push("3".into());
-                }
-            } else {
-                // Opportunistic auto: an unpulled catalog draft degrades
-                // to dense with a teaching warning — auto must never
-                // refuse a spawn (hard errors belong to the explicit
-                // typed modes, where the user asked for THAT drafter).
-                // (`--spec-draft-hf` auto-download exists in b10840+ but
-                // resolves to an empty path and the child exits fatally,
-                // verified live 2026-09-07 — revisit if upstream fixes
-                // draft-side HF resolution.)
-                warnings.push(format!(
-                    "spec=auto: draft pair {} for {} is not pulled; running dense — run: \
-                     pallama pull {} to enable speculation",
-                    pair.spec_type, input.model_name, pair.draft_repo
+                    pair.spec_type,
+                    draft_bytes / (1024 * 1024),
+                    input.model_name,
+                    input.model_bytes / (1024 * 1024),
+                    card_free_bytes / (1024 * 1024)
                 ));
+                return;
             }
+            argv.push("--spec-type".into());
+            argv.push(pair.spec_type.clone());
+            argv.push("--spec-draft-model".into());
+            argv.push(draft.to_string());
+            if input.supported_flags.contains("--spec-draft-n-max") {
+                argv.push("--spec-draft-n-max".into());
+                argv.push("3".into());
+            }
+        } else {
+            // Opportunistic auto: an unpulled catalog draft degrades
+            // to dense with a teaching warning — auto must never
+            // refuse a spawn (hard errors belong to the explicit
+            // typed modes, where the user asked for THAT drafter).
+            // (`--spec-draft-hf` auto-download exists in b10840+ but
+            // resolves to an empty path and the child exits fatally,
+            // verified live 2026-09-07 — revisit if upstream fixes
+            // draft-side HF resolution.)
+            warnings.push(format!(
+                "spec=auto: draft pair {} for {} is not pulled; running dense — run: \
+                     pallama pull {} to enable speculation",
+                pair.spec_type, input.model_name, pair.draft_repo
+            ));
         }
-        None => warnings.push(format!(
-            "spec=auto but no draft pair for {} in the catalog; running dense",
+    } else {
+        tracing::info!(
+            model = input.model_name,
+            "profile: spec=auto found no draft pair for {} in the catalog; running dense",
             input.model_name
-        )),
+        );
     }
 }
 
@@ -5255,7 +5274,8 @@ mod tests {
             .any(|w| w[0] == "--sleep-idle-seconds" && w[1] == "300"));
         // Rule 9: default slots=0 = pallama auto -> np 2 on this fixture.
         assert!(p.argv.windows(2).any(|w| w[0] == "-np" && w[1] == "2"));
-        assert!(p.warnings.iter().any(|w| w.contains("slots auto")));
+        // Auto-slot rationale is journal-only now.
+        assert!(!p.warnings.iter().any(|w| w.contains("slots auto")));
         // Rule 12: cache-ram default 8192
         assert!(p
             .argv
@@ -5264,11 +5284,11 @@ mod tests {
         // Rule 15: sessions dir default-on when the engine supports it
         assert!(p.argv.windows(2).any(|w| w[0] == "--slot-save-path"));
         assert_eq!(p.ctx, 16384, "Profile.ctx reports the per-slot ctx");
-        // the slots-auto teaching warning is asserted at rule 9 above; no
-        // OTHER warning may ride the default battery
+        // A default battery rides NO warnings: auto-decision rationale
+        // lives in the journal, warnings are for user-input divergence.
         assert_eq!(
             p.warnings.len(),
-            1,
+            0,
             "unexpected extra warnings: {:?}",
             p.warnings
         );
@@ -5552,8 +5572,9 @@ mod tests {
         .unwrap();
         let i = p.argv.iter().position(|a| a == "--load-mode").unwrap();
         assert_eq!(p.argv[i + 1], "mlock");
+        // Decision rationale lives in the journal, never the warning vec.
         assert!(
-            p.warnings
+            !p.warnings
                 .iter()
                 .any(|w| w.contains("load-mode mlock auto")),
             "{:?}",
@@ -5664,11 +5685,30 @@ mod tests {
             .argv
             .windows(2)
             .any(|w| w[0] == "--cache-ram" && w[1] == "5957"));
-        assert!(p
+        // Default budget meeting the adaptive cap is silent auto-tuning.
+        assert!(p.warnings.iter().any(|w| w.contains("floored to 5957 MiB")));
+        assert!(
+            !p.warnings
+                .iter()
+                .any(|w| w.contains("cache_ram_mb 8192 clamped")),
+            "{:?}",
+            p.warnings
+        );
+
+        // A user-pinned budget getting clamped stays a warning.
+        let cfg_pinned = Config {
+            cache_ram_mb: 16384,
+            ..Config::default()
+        };
+        let p2 = compile(
+            &input(&g, &hw, &cfg_pinned, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p2
             .warnings
             .iter()
-            .any(|w| w.contains("cache_ram_mb 8192 clamped to 4007")));
-        assert!(p.warnings.iter().any(|w| w.contains("floored to 5957 MiB")));
+            .any(|w| w.contains("cache_ram_mb 16384 clamped to 4007")));
     }
 
     #[test]
@@ -7440,7 +7480,8 @@ mod tests {
             p.argv
         );
         assert_eq!(p.ctx, 16_384, "Profile.ctx stays per-slot");
-        assert!(p.warnings.iter().any(|w| w.contains("slots auto")));
+        // Auto-slot rationale is journal-only now.
+        assert!(!p.warnings.iter().any(|w| w.contains("slots auto")));
     }
 
     #[test]
@@ -7489,7 +7530,8 @@ mod tests {
             "Profile.ctx reports the autofit per-slot ctx"
         );
         assert_eq!(p2.ctx_autofit, Some((4_096, 4)));
-        assert!(p2.warnings.iter().any(|w| w.contains("slots auto-fit")));
+        // Auto-fit rationale is journal-only now.
+        assert!(!p2.warnings.iter().any(|w| w.contains("slots auto")));
 
         // Classic (non-unified) VRAM guard: 85% headroom admits no second
         // slot's KV -> single, ctx unscaled.
@@ -8473,7 +8515,8 @@ mod tests {
         assert!(p.argv.windows(2).any(|w| w == ["-np", "4"]));
         assert!(p.argv.windows(2).any(|w| w == ["--ctx-size", "16384"]));
         assert_eq!(p.ctx, 4_096);
-        assert!(p.warnings.iter().any(|w| w.contains("slots auto-fit")));
+        // Auto-fit rationale is journal-only now.
+        assert!(!p.warnings.iter().any(|w| w.contains("slots auto")));
 
         // Tuning pin (bench grid): hard pin, never divided.
         let p2 = compile(
@@ -8753,7 +8796,7 @@ mod tests {
     }
 
     #[test]
-    fn unit__spec_auto__no_pair_for_model__dense_with_warning() {
+    fn unit__spec_auto__no_pair_for_model__dense_without_user_noise() {
         let cfg = Config {
             spec: "auto".into(),
             ..Config::default()
@@ -8764,7 +8807,9 @@ mod tests {
         inp.model_name = "gemma3-4b"; // no catalog pair
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert!(!p.argv.contains(&"--spec-type".to_string()));
-        assert!(p.warnings.iter().any(|w| w.contains("no draft pair")));
+        // Auto-mode fallback to dense is the system working as designed —
+        // rationale lives in the journal, not the warning vec.
+        assert!(!p.warnings.iter().any(|w| w.contains("draft pair")));
     }
 
     #[test]
@@ -9638,8 +9683,11 @@ mod tests {
 
     #[test]
     fn unit__wire__cache_hint_adapts_ram_cap() {
+        // 16384 (not the shipped 8192 default): a user-pinned budget, so
+        // the adaptive clamp is a divergence worth a warning — the tier
+        // numbers below stay visible through that warning.
         let cfg = Config {
-            cache_ram_mb: 8192,
+            cache_ram_mb: 16384,
             ..Default::default()
         };
         let hw = gpu_hw(12_000, 16_384, 8); // 16 GiB RAM
