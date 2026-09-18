@@ -6,11 +6,20 @@ tracked here.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-18
+
+### Added
+- **The REPL asks for thinking on every turn.** The gateway translates the request to the engine's chat-template thinking knobs; reasoning streams dim-italic with a blank line before the bright answer — no tags, no toggles, nothing chat-app-shaped. Models whose template has no thinking markers get a teaching 400 from the gateway; the CLI remembers that per model (reset on `/model`), prints a one-line notice, and re-sends without the knob — capability negotiation, never a silent retry. Reasoning stays out of conversation memory; only the answer is remembered.
+
 ### Changed
 - **The interactive REPL chat stream is sacred: no `[profile]` lines after replies anymore.** Profile telemetry for a run (KV/ctx fit, slot autofit, load-mode choice, spec fallback) now reaches the user only through `pallama ps` (table `warn[...]` rows and `--json`) — the surfaces you consult on purpose — while pure auto-tuning decision notes (`slots auto`, `slots auto-fit`, `spec=auto` dense fallback, `load-mode mlock auto`, and the `cache_ram_mb` default meeting the adaptive 30%-of-RAM cap) moved to the daemon journal (`journalctl -u pallama`), emitted once per spawn. What stays a `pallama ps` warning is input divergence worth acting on: a user-pinned `cache_ram_mb` that got clamped, a spec draft pair that exists in the catalog but is not pulled, engines lacking flags you requested. Net effect on a default-config small-RAM box: zero warning noise, same decisions, same journal audit trail.
+- **README restructured for scannability** with the ollama conversion path up front, and CI hardened: audit-job annotations, ruff pinned at 0.16.8 with a frozen rule set, hermetic e2e XDG pins, tampered-digest guarantee.
 
 ### Fixed
 - **A failed engine replacement can no longer destroy the working engine it was replacing.** All install lanes (llama.cpp release assets, mistral.rs releases, sglang pip venvs, source builds) now run through one rollback-safe swap: the installed `engines/<tag>` dir is renamed aside before the new install starts at the final path (venvs and extracted archives embed absolute paths, so a scratch-name build cannot be renamed in), restored untouched when anything fails — download, extract, probe rejection, store failure; live incident 2026-09-18: a full disk ate a healthy sglang venv mid-rebuild under the old remove-first flow — and the superseded copy is deleted only after the replacement registers. A replacement briefly needs headroom for both copies; that disk cost is the price of never leaving a tag empty-handed. Leftover rollback copies from crashed runs of the same tag are swept automatically.
+
+### Security
+- **rustls bumped to 0.23.45** (RUSTSEC-2026-0285) across the workspace HTTP stack.
 
 ## [0.7.0] - 2026-09-18
 
