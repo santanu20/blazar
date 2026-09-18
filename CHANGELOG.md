@@ -6,6 +6,9 @@ tracked here.
 
 ## [Unreleased]
 
+### Added
+- **Cache-busting client detection (`cache_bust_system`).** Chatty agent clients that mutate the system prompt or tool list every turn silently destroy prefix-cache reuse — every turn re-prefills the whole conversation. The gateway now fingerprints system+tools per conversation (first-user-message identity, 1 KiB affinity discipline) on `/api/chat` and `/v1/chat/completions`, and after two consecutive mutations on a stable conversation emits one advisory detection into the sentinel ring (`pallama why`), with the fix spelled out: keep the system prompt byte-stable, move per-turn values into the last user message. Purely advisory telemetry — requests are never modified, rejected, or retried.
+
 ## [0.8.0] - 2026-09-18
 
 ### Added

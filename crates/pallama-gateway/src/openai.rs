@@ -376,6 +376,24 @@ pub async fn openai_proxy(
     if chat_family {
         state.sup.note_prefix_hit(&model_name);
     }
+    // Cache-bust telemetry (chat completions only: the messages+tools
+    // shape the detector fingerprints). Strictly advisory — never
+    // mutates parsed_body, never blocks the forward.
+    if uri.path().ends_with("/chat/completions") {
+        if let Some(req) = parsed_body.as_ref() {
+            crate::cache_bust::note_request(
+                &state.sentinel,
+                &state.cache_bust,
+                &model_name,
+                req,
+                "v1/chat/completions",
+                &trace_ext
+                    .as_ref()
+                    .map(|Extension(t)| t.0.clone())
+                    .unwrap_or_default(),
+            );
+        }
+    }
 
     // SLO: explicit deadline header + prefill-heavy body demotion feed
     // the EDF queue (same-priority shorts beat giant prefills).

@@ -4,6 +4,7 @@
 pub mod anthropic;
 pub mod audit;
 pub mod batch;
+pub mod cache_bust;
 pub mod histogram;
 pub mod keys;
 pub mod latechunk;

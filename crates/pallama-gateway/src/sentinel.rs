@@ -65,6 +65,7 @@ pub enum Code {
     ReasoningNoAnswer,
     StalledStream,
     TemplateNoTools,
+    CacheBustSystem,
 }
 
 impl Code {
@@ -80,6 +81,7 @@ impl Code {
             Self::ReasoningNoAnswer => "reasoning_no_answer",
             Self::StalledStream => "stalled_stream",
             Self::TemplateNoTools => "template_no_tools",
+            Self::CacheBustSystem => "cache_bust_system",
         }
     }
 
@@ -95,6 +97,7 @@ impl Code {
             Self::ReasoningNoAnswer => "model produced reasoning but never answered",
             Self::StalledStream => "stream alive but no chunks for the stall threshold (swap thrash / CPU fallback?)",
             Self::TemplateNoTools => "request carries tools but the model's chat template has no tool support — expect plain text instead of tool calls",
+            Self::CacheBustSystem => "system prompt or tools mutate between turns on a stable conversation — every turn re-prefills from scratch (KV cache busted). If unintended, keep the system prompt byte-stable (move counters/timestamps to the last user message)",
         }
     }
 
@@ -112,6 +115,7 @@ impl Code {
             Self::ReasoningNoAnswer => "retry: resend (reasoning consumed the budget); persistent -> raise max tokens or switch reasoning_format",
             Self::StalledStream => "retry after checking `pallama ps` (swap thrash / CPU fallback); the request may still complete late",
             Self::TemplateNoTools => "no retry will help: pull a tool-capable model (template with tool markers) for tool work",
+            Self::CacheBustSystem => "no retry needed — advisory: stabilize the client system prompt to restore full prefix-cache reuse",
         }
     }
 }
@@ -918,7 +922,7 @@ impl Sentinel {
     }
 
     /// Warn, ring-insert, and persist one finalized record.
-    fn commit(&self, record: &SentinelRecord) {
+    pub(crate) fn commit(&self, record: &SentinelRecord) {
         for d in &record.detections {
             tracing::warn!(
                 target: "pallama::sentinel",

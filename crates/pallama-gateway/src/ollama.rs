@@ -821,6 +821,22 @@ pub async fn chat(
         }
         state.keys.charge_request(name);
     }
+    // Agent-client cache teaching (advisory, never mutates `req`): flag
+    // a conversation whose system-prompt/tools fingerprint churns turn
+    // over turn — that client silently re-prefills from scratch every
+    // request. Runs on the local lane only (remote hops manage their
+    // own cache).
+    crate::cache_bust::note_request(
+        &state.sentinel,
+        &state.cache_bust,
+        &row.name,
+        &req,
+        "api/chat",
+        &trace_ext
+            .as_ref()
+            .map(|Extension(t)| t.0.clone())
+            .unwrap_or_default(),
+    );
     // Think-capability gate (ollama parity): refuse `think: true` on a
     // provably non-thinking template instead of silently ignoring it.
     // Both think gates run BEFORE translation — the translator maps

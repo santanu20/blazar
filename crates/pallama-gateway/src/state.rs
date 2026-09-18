@@ -90,6 +90,10 @@ pub struct AppState {
     pub sem: Arc<SemMetrics>,
     /// Warn-only response-semantics observation layer (`pallama why`).
     pub sentinel: Arc<Sentinel>,
+    /// System/tools fingerprint churn detector (agent-client cache-bust
+    /// teaching): flags conversations whose prefix mutates every turn.
+    /// Advisory only — never mutates requests.
+    pub cache_bust: Arc<crate::cache_bust::CacheBustTracker>,
     /// Per-key scoping / rate limits / usage accounting (`[[keys]]`).
     pub keys: Arc<KeysLimiter>,
     /// OTLP trace export (default off; bounded, never blocks).
@@ -211,6 +215,7 @@ impl AppState {
             bus,
             queue: Arc::new(PriorityQueue::new()),
             http,
+            cache_bust: Arc::new(crate::cache_bust::CacheBustTracker::new()),
             ttft: crate::histogram::ttft(),
             tpot: crate::histogram::tpot(),
             obs: Arc::new(CacheObs::new()),
