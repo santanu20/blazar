@@ -479,3 +479,74 @@ async fn client__keys_rotate__old_secret_dies_new_works() {
     );
     ts.state.sup.shutdown_all().await.unwrap();
 }
+
+#[tokio::test]
+async fn client__ollama_options_spec__invalid_mode_teaches_vocabulary() {
+    // `options.spec` is the per-request spec-mode override (REPL
+    // --no-draft rides it). A typo must 400 with the full valid-mode
+    // list — NOT fall through to the generic catalog pair, which would
+    // silently serve the wrong spawn shape.
+    let ts = start(support::config_with_keys()).await;
+    let c = client();
+    let r: serde_json::Value = c
+        .post(format!("{}/api/chat", ts.base))
+        .bearer_auth("plm_admin")
+        .json(&serde_json::json!({
+            "model": "m1", "stream": false,
+            "messages": [{"role": "user", "content": "hi"}],
+            "options": {"spec": "eagle"},
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let err = r["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("options.spec must be one of") && err.contains("\"eagle3\""),
+        "teaching 400 must list the vocabulary: {r}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn client__ollama_options_spec__off_shapes_the_spawn_and_ps_reports_it() {
+    // A valid `options.spec` rides the request: the instance spawns
+    // dense for it, and /api/ps surfaces the effective mode so the
+    // shape is never a guess.
+    let ts = start(support::config_with_keys()).await;
+    let c = client();
+    let r: serde_json::Value = c
+        .post(format!("{}/api/chat", ts.base))
+        .bearer_auth("plm_admin")
+        .json(&serde_json::json!({
+            "model": "m1", "stream": false,
+            "messages": [{"role": "user", "content": "hi"}],
+            "options": {"spec": "off"},
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(r.get("message").is_some(), "chat answered: {r}");
+    let ps: serde_json::Value = c
+        .get(format!("{}/api/ps", ts.base))
+        .bearer_auth("plm_admin")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = ps["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"].as_str() == Some("m1"))
+        .expect("m1 instance row");
+    assert_eq!(row["pallama_spec"].as_str(), Some("off"));
+    ts.state.sup.shutdown_all().await.unwrap();
+}

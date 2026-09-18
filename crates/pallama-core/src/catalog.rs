@@ -106,6 +106,26 @@ pub fn spec_pair_for_typed(model: &str, spec_type: &str) -> Option<&'static Spec
         .find(|p| model.starts_with(&p.model_prefix) && p.spec_type == spec_type)
 }
 
+/// Spec-draft pair for a model under a spec MODE (the
+/// `is_valid_spec_mode` vocabulary): typed modes resolve their typed
+/// head, file-less modes (off/mtp/ngram*) never consume a draft file,
+/// anything else (auto, unknown families) falls back to the generic
+/// catalog pair. Single source for spawn-time draft resolution and the
+/// `spec_autopull` lane so both agree on what "a draft exists" means.
+#[must_use]
+pub fn pair_for_spec_mode(model: &str, spec_mode: &str) -> Option<&'static SpecPair> {
+    match spec_mode {
+        "eagle3" => spec_pair_for_typed(model, "draft-eagle3"),
+        "dflash" => spec_pair_for_typed(model, "draft-dflash"),
+        "dspark" => spec_pair_for_typed(model, "draft-dspark"),
+        // off/mtp/ngram never consume an external draft file.
+        "off" | "mtp" | "ngram" | "ngram-map-k" | "ngram-map-k4v" | "ngram-mod" | "ngram-cache" => {
+            None
+        }
+        _ => spec_pair_for(model),
+    }
+}
+
 /// Classic DP edit distance; catalog sizes are tiny, O(nm) is fine.
 #[must_use]
 pub fn levenshtein(a: &str, b: &str) -> usize {
@@ -128,6 +148,24 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__pair_for_spec_mode__typed_fileless_and_generic() {
+        // qwen3 carries both a generic pair and an eagle3 head in the
+        // catalog (mirrors the resolve_draft_path pins).
+        assert!(pair_for_spec_mode("qwen3-8b", "auto").is_some());
+        assert!(pair_for_spec_mode("qwen3-8b", "eagle3").is_some());
+        // File-less modes never consume an external draft — at any
+        // model, regardless of catalog content.
+        for mode in ["off", "mtp", "ngram", "ngram-map-k", "ngram-mod"] {
+            assert!(
+                pair_for_spec_mode("qwen3-8b", mode).is_none(),
+                "{mode} must never resolve a draft file"
+            );
+        }
+        // Unknown model families have no pair under any file mode.
+        assert!(pair_for_spec_mode("m1", "auto").is_none());
+    }
 
     #[test]
     fn unit__catalog_embedded__parses_and_unique() {

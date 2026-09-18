@@ -81,6 +81,14 @@ pub struct Config {
     /// verification) and MTP measured +50% decode on Qwen3.5-9B; ollama
     /// auto-enables MTP the same way.
     pub spec: String,
+    /// Pull a missing draft model on first spawn instead of degrading to
+    /// dense (spec = "auto") or failing (explicit modes). Applies to the
+    /// per-model ensure lane only — router presets keep their
+    /// skip-with-warning semantics. A failed autopull never blocks the
+    /// spawn: it falls back to exactly what would have happened with
+    /// autopull off. Default false.
+    #[serde(default)]
+    pub spec_autopull: bool,
     /// On-demand tensor loading (`--lazy-mode`): "auto" (engine default:
     /// on-demand only for tensors > 4 GiB), "on" (all such tensors from
     /// disk via mmap — big-MoE RAM relief), "off" (fully resident).
@@ -728,6 +736,28 @@ pub struct Config {
     /// upstream default off). Complements `router` + `router_max_models`.
     #[serde(default)]
     pub models_autoload: Option<bool>,
+}
+
+/// The spec-mode vocabulary shared by config validation (global
+/// `spec`, `model_overrides.<name>.spec`) and the per-request
+/// `options.spec` / `X-Pallama-Spec` override — one list, one teaching
+/// error, no drift between the lanes that accept a mode.
+#[must_use]
+pub fn is_valid_spec_mode(mode: &str) -> bool {
+    matches!(
+        mode,
+        "off"
+            | "auto"
+            | "ngram"
+            | "ngram-map-k"
+            | "ngram-map-k4v"
+            | "ngram-mod"
+            | "ngram-cache"
+            | "mtp"
+            | "eagle3"
+            | "dflash"
+            | "dspark"
+    )
 }
 
 fn default_reasoning_budget() -> i64 {
@@ -1775,6 +1805,7 @@ impl Default for Config {
             mistralrs: MistralrsTuning::default(),
             sglang: SglangTuning::default(),
             spec: "auto".to_string(),
+            spec_autopull: false,
             lazy_mode: "auto".to_string(),
             server_tools: None,
             server_tools_runtime: None,
@@ -2406,14 +2437,11 @@ impl Config {
                 )))
             }
         }
-        match self.spec.as_str() {
-            "off" | "auto" | "ngram" | "ngram-map-k" | "ngram-map-k4v" | "ngram-mod"
-            | "ngram-cache" | "mtp" | "eagle3" | "dflash" | "dspark" => {}
-            other => {
-                return Err(CoreError::Config(format!(
-                    "spec must be \"off\", \"auto\", \"ngram\", \"ngram-map-k\", \"ngram-map-k4v\", \"ngram-mod\", \"ngram-cache\", \"mtp\", \"eagle3\", \"dflash\" or \"dspark\", got {other:?}"
-                )))
-            }
+        if !is_valid_spec_mode(&self.spec) {
+            return Err(CoreError::Config(format!(
+                "spec must be \"off\", \"auto\", \"ngram\", \"ngram-map-k\", \"ngram-map-k4v\", \"ngram-mod\", \"ngram-cache\", \"mtp\", \"eagle3\", \"dflash\" or \"dspark\", got {:?}",
+                self.spec
+            )));
         }
         if !matches!(self.lazy_mode.as_str(), "auto" | "on" | "off") {
             return Err(CoreError::Config(format!(
@@ -2543,20 +2571,7 @@ impl Config {
         self.validate_wire_knobs()?;
         for (name, o) in &self.model_overrides {
             if let Some(spec) = &o.spec {
-                if !matches!(
-                    spec.as_str(),
-                    "off"
-                        | "auto"
-                        | "ngram"
-                        | "ngram-map-k"
-                        | "ngram-map-k4v"
-                        | "ngram-mod"
-                        | "ngram-cache"
-                        | "mtp"
-                        | "eagle3"
-                        | "dflash"
-                        | "dspark"
-                ) {
+                if !is_valid_spec_mode(spec) {
                     return Err(CoreError::Config(format!(
                         "model_overrides.{name}.spec must be \"off\", \"auto\", \"ngram\", \"ngram-map-k\", \"ngram-map-k4v\", \"ngram-mod\", \"ngram-cache\", \"mtp\", \"eagle3\", \"dflash\" or \"dspark\", got {spec:?}"
                     )));
@@ -3537,6 +3552,10 @@ cpu_moe_n = 2
 cpu_ffn_n = 1
 override_tensor = [".ffn_.*_exps.=CPU"]
 spec = "off"
+# Pull a missing catalog draft on first spawn instead of degrading to
+# dense (auto) / failing (explicit modes); failure falls back to the
+# without-autopull behavior. Per-model ensure lane only.
+spec_autopull = true
 kv_unified_per_slot = 4096
 swa_full = true
 ctx_checkpoints = 16
@@ -4012,6 +4031,30 @@ default_ctx = 16384
             },
         );
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn unit__is_valid_spec_mode__full_vocabulary_and_rejects_typos() {
+        for mode in [
+            "off",
+            "auto",
+            "ngram",
+            "ngram-map-k",
+            "ngram-map-k4v",
+            "ngram-mod",
+            "ngram-cache",
+            "mtp",
+            "eagle3",
+            "dflash",
+            "dspark",
+        ] {
+            assert!(is_valid_spec_mode(mode), "{mode} must be valid");
+        }
+        // Typos/case drift the teaching 400 must catch instead of
+        // silently falling to the generic catalog pair.
+        for bad in ["", "of", "dense", "eagle", "OFF", "Auto", "ngram-map"] {
+            assert!(!is_valid_spec_mode(bad), "{bad:?} must be rejected");
+        }
     }
 
     #[test]

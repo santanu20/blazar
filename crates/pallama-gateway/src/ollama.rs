@@ -405,6 +405,8 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
                 "pallama_gpu": p.gpu,
                 "pallama_device": p.device,
                 "pallama_warnings": p.warnings,
+                "pallama_spec": p.spec_mode,
+                "pallama_draft": p.draft,
                 "pallama_in_flight": p.in_flight,
                 "pallama_endpoint": p.endpoint,
                 "pallama_heat": p.heat,
@@ -489,6 +491,8 @@ async fn ps_router(state: &Arc<AppState>) -> Response {
                 "size": 0,
                 "pallama_state": pallama_state,
                 "pallama_ctx": 0,
+                "pallama_spec": "",
+                "pallama_draft": null,
                 "pallama_in_flight": 0,
                 "pallama_endpoint": "router",
                 "expires_at": iso(now_secs.saturating_add(i64::try_from(idle_remaining).unwrap_or(i64::MAX))),
@@ -999,6 +1003,26 @@ pub async fn chat(
             return *resp;
         }
     }
+    // Per-request spec mode (`options.spec`): same restart-once shape
+    // as num_ctx, and router mode refuses it for the same reason — one
+    // shared child has no per-model spawn shape to override.
+    if let Some(mode) = req
+        .pointer("/options/spec")
+        .and_then(serde_json::Value::as_str)
+    {
+        if state.config.router {
+            return api_error(
+                400,
+                &format!(
+                    "router mode serves all models from one child; per-request spec is not available — set [model_overrides.{}] spec = \"{mode}\" in config.toml and restart the daemon",
+                    row.name
+                ),
+            );
+        }
+        if let Err(resp) = apply_spec(&state, &row.name, mode).await {
+            return *resp;
+        }
+    }
 
     let (engine, load_ms) = match ensure_with_admission(
         &state,
@@ -1371,6 +1395,40 @@ pub(crate) async fn apply_num_ctx(
         state
             .sup
             .set_next_ctx(model, u32::try_from(want).unwrap_or(u32::MAX));
+    }
+    Ok(())
+}
+
+/// Per-request spec-mode override (`options.spec`, `X-Pallama-Spec`,
+/// and the REPL's `--no-draft`): queue the mode for the model's NEXT
+/// spawn; a live instance spawned under a DIFFERENT mode is recycled
+/// first when idle (same restart-once shape as `apply_num_ctx`). Same
+/// shape = no-op, so a REPL re-sending `spec: "off"` every turn never
+/// churns a matching instance. Draft availability/manifest gates stay
+/// in `profile::compile` — queueing `eagle3` without the draft pulled
+/// fails at spawn exactly like config-pinned eagle3 does.
+pub(crate) async fn apply_spec(
+    state: &Arc<AppState>,
+    model: &str,
+    want: &str,
+) -> Result<(), Box<Response>> {
+    if !pallama_core::is_valid_spec_mode(want) {
+        return Err(Box::new(api_error(
+            400,
+            &format!(
+                "options.spec must be one of \"off\", \"auto\", \"ngram\", \"ngram-map-k\", \
+                 \"ngram-map-k4v\", \"ngram-mod\", \"ngram-cache\", \"mtp\", \"eagle3\", \
+                 \"dflash\" or \"dspark\", got {want:?} (see `spec` in config.toml)"
+            ),
+        )));
+    }
+    if let Some(p) = state.sup.ps().into_iter().find(|p| p.name == model) {
+        if p.spec_mode != want && p.in_flight == 0 {
+            let _ = state.sup.evict_model(model).await;
+            state.sup.set_next_spec(model, want);
+        }
+    } else {
+        state.sup.set_next_spec(model, want);
     }
     Ok(())
 }
@@ -2172,6 +2230,25 @@ pub async fn generate(
             );
         }
         if let Err(resp) = apply_num_ctx(&state, &row.name, i64::from(want)).await {
+            return *resp;
+        }
+    }
+    // options.spec parity on /api/generate (chat above explains the
+    // router refusal).
+    if let Some(mode) = req
+        .pointer("/options/spec")
+        .and_then(serde_json::Value::as_str)
+    {
+        if state.config.router {
+            return api_error(
+                400,
+                &format!(
+                    "router mode serves all models from one child; per-request spec is not available — set [model_overrides.{}] spec = \"{mode}\" in config.toml and restart the daemon",
+                    row.name
+                ),
+            );
+        }
+        if let Err(resp) = apply_spec(&state, &row.name, mode).await {
             return *resp;
         }
     }

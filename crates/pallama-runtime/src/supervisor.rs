@@ -29,22 +29,22 @@ use crate::events::{EventBus, InstanceState, PallamaEvent};
 /// drafts identically — profile-compile still gates emission on the
 /// engine manifest and hard-errors on stale (missing) files.
 pub fn resolve_draft_path(store: &Store, model: &str, spec_mode: &str) -> Option<String> {
-    let pair = match spec_mode {
-        "eagle3" => pallama_core::spec_pair_for_typed(model, "draft-eagle3"),
-        "dflash" => pallama_core::spec_pair_for_typed(model, "draft-dflash"),
-        "dspark" => pallama_core::spec_pair_for_typed(model, "draft-dspark"),
-        // off/mtp/ngram never consume an external draft file.
-        "off" | "mtp" | "ngram" | "ngram-map-k" | "ngram-map-k4v" | "ngram-mod" | "ngram-cache" => {
-            None
-        }
-        _ => pallama_core::spec_pair_for(model),
-    }?;
+    let pair = pallama_core::catalog::pair_for_spec_mode(model, spec_mode)?;
     let (repo_part, file_part) = pair
         .draft_repo
         .split_once(':')
         .unwrap_or((&pair.draft_repo, ""));
     let draft_name = crate::hf::draft_aware_name(repo_part, file_part);
     store.get_model(&draft_name).ok().flatten().map(|r| r.path)
+}
+
+/// Spec-mode resolution order for a spawn: a queued per-request override
+/// (`options.spec` / `X-Pallama-Spec`, consume-once) beats the model
+/// overlay, which beats the global config. Pure so the tiering is
+/// pinnable without a live supervisor.
+#[must_use]
+pub fn resolve_spec_mode(queued: Option<String>, overlay: Option<String>, config: &str) -> String {
+    queued.or(overlay).unwrap_or_else(|| config.to_string())
 }
 
 /// Instance key for the single router-mode child (never a model name:
@@ -491,6 +491,15 @@ pub struct Instance {
     /// rationale…) — kept on the instance so `ps` and the run path can
     /// surface them; the daemon tracing loop stays for logs.
     pub warnings: Vec<String>,
+    /// Spec mode that drove this spawn (queued request override, model
+    /// overlay, or global config — whatever `resolve_spec_mode` picked)
+    /// plus the draft model's file name when one rode along. `ps`
+    /// surfaces both; the gateway's per-request spec override compares
+    /// against `spec_mode` to decide whether a restart is warranted.
+    /// Router children serve many models with per-section drafts — no
+    /// single mode — so they carry an empty string.
+    pub spec_mode: String,
+    pub draft: Option<String>,
     /// Measured card free-VRAM delta from the spawn settle report — the
     /// footprint the child ACTUALLY took (weights + context + compute +
     /// KV working set). 0 = not settled yet. The bytes admission prefers
@@ -718,6 +727,10 @@ pub struct PsRow {
     pub device: Option<String>,
     /// Profile-compile warnings for this instance (see Instance.warnings).
     pub warnings: Vec<String>,
+    /// Effective spec mode of this spawn + draft file name (see
+    /// `Instance.spec_mode`). Display label; router rows carry "".
+    pub spec_mode: String,
+    pub draft: Option<String>,
     pub pid: u32,
     /// Model bytes on disk (0 in router mode — the front child serves
     /// many models and owns no single size).
@@ -794,6 +807,11 @@ pub struct Supervisor {
     /// One-shot ctx override for the NEXT spawn of a model (per-request
     /// `options.num_ctx` — complaint #13). Consumed on use.
     pending_ctx: DashMap<String, u32>,
+    /// One-shot spec-mode override for the NEXT spawn of a model
+    /// (per-request `options.spec` / `X-Pallama-Spec`, e.g. the REPL's
+    /// `--no-draft`). Consumed on use; re-queued by every carrying
+    /// request, so a REPL session keeps its shape across evictions.
+    pending_spec: DashMap<String, String>,
     /// Prefix heat per model: (hits, last-hit instant); decayed on read.
     heat: std::sync::Mutex<std::collections::HashMap<String, (u64, Instant)>>,
     /// Prompt-prefix → replica-key affinity (B1): hashes of
@@ -946,6 +964,7 @@ impl Supervisor {
             unclean_dead: DashMap::new(),
             ensure_pending: DashMap::new(),
             pending_ctx: DashMap::new(),
+            pending_spec: DashMap::new(),
             heat: std::sync::Mutex::new(std::collections::HashMap::new()),
             prefix_affinity: DashMap::new(),
             sys_rings: DashMap::new(),
@@ -1720,11 +1739,10 @@ impl Supervisor {
                 .collect();
             // Same shared draft resolver as `ensure`: a spec=auto router
             // must not silently drop catalog-paired models with a false
-            // "not pulled" error.
-            let spec_mode = overlay
-                .spec
-                .clone()
-                .unwrap_or_else(|| self.config.spec.clone());
+            // "not pulled" error. Router mode has no per-request spec
+            // (the gateway rejects options.spec there), so resolution
+            // is overlay → config only.
+            let spec_mode = resolve_spec_mode(None, overlay.spec.clone(), &self.config.spec);
             let draft_path = resolve_draft_path(&store, &m.name, &spec_mode);
             let input = ProfileInput {
                 engine_kind: self.engine.kind(),
@@ -1925,6 +1943,9 @@ impl Supervisor {
                         device: None,
                         kv_est_bytes: None,
                         warnings: Vec::new(),
+                        // router: no single spec mode (per-section drafts)
+                        spec_mode: String::new(),
+                        draft: None,
                         settled_mib: std::sync::atomic::AtomicU64::new(0),
                         auth: auth.as_ref().map(|a| a.secret.clone()),
                         child: tokio::sync::Mutex::new(child),
@@ -2258,12 +2279,21 @@ impl Supervisor {
         // Draft resolution mirrors every other spawn path (router
         // preset, CLI bench/tune): one shared resolver, catalog pair →
         // pulled store row. Compile-time freshness + manifest gates
-        // live in profile::compile.
-        let spec_mode = overlay
-            .spec
-            .clone()
-            .unwrap_or_else(|| self.config.spec.clone());
-        let draft_path = resolve_draft_path(&store, name, &spec_mode);
+        // live in profile::compile. A queued per-request spec
+        // (`options.spec`) wins over overlay/config; consumed HERE,
+        // before every loop in this fn, so retries never re-read it.
+        let spec_mode = resolve_spec_mode(
+            self.pending_spec.remove(name).map(|(_, m)| m),
+            overlay.spec.clone(),
+            &self.config.spec,
+        );
+        let mut draft_path = resolve_draft_path(&store, name, &spec_mode);
+        if draft_path.is_none() && self.config.spec_autopull {
+            // opt-in: pull the missing catalog draft, then re-resolve.
+            // Any failure falls back to exactly the without-autopull
+            // behavior (dense degrade / explicit-mode compile error).
+            draft_path = self.autopull_draft(name, &spec_mode).await;
+        }
         // Draft header for the planner's device-KV charge (A15): the
         // spec pair allocates its own KV at the compiled ctx. An
         // unreadable header degrades to dense-only with a warn — it
@@ -2784,6 +2814,12 @@ impl Supervisor {
                         },
                         kv_est_bytes: profile.kv_est_bytes,
                         warnings: profile.warnings.clone(),
+                        spec_mode: spec_mode.clone(),
+                        draft: draft_path.as_deref().map(|p| {
+                            std::path::Path::new(p)
+                                .file_name()
+                                .map_or_else(|| p.to_string(), |f| f.to_string_lossy().into_owned())
+                        }),
                         settled_mib: std::sync::atomic::AtomicU64::new(0),
                         auth: auth.as_ref().map(|a| a.secret.clone()),
                         child: tokio::sync::Mutex::new(child),
@@ -3862,6 +3898,8 @@ impl Supervisor {
                     gpu: i.gpu.clone(),
                     device: i.device.clone(),
                     warnings: i.warnings.clone(),
+                    spec_mode: i.spec_mode.clone(),
+                    draft: i.draft.clone(),
                     pid: i.pid,
                     bytes: i.model.bytes,
                     heat,
@@ -3916,6 +3954,67 @@ impl Supervisor {
     /// against the model's trained context.
     pub fn set_next_ctx(&self, model: &str, ctx: u32) {
         self.pending_ctx.insert(model.to_string(), ctx);
+    }
+
+    /// Queue a spec-mode override for the model's next spawn
+    /// (per-request `options.spec` / `X-Pallama-Spec`). Consumed once;
+    /// callers that want the shape to persist across evictions re-queue
+    /// on every request (the REPL's `--no-draft` does).
+    pub fn set_next_spec(&self, model: &str, mode: &str) {
+        self.pending_spec
+            .insert(model.to_string(), mode.to_string());
+    }
+
+    /// Opt-in (`spec_autopull` config) missing-draft pull on the ensure
+    /// lane: resolve the catalog pair for (model, mode), pull
+    /// `pair.draft_repo` through the standard Puller (progress rides
+    /// the event bus like any `pallama pull`), then re-resolve. Never
+    /// fails the spawn — every error logs and returns `None` so the
+    /// caller keeps exactly the without-autopull behavior (dense
+    /// degrade under auto, hard compile error under explicit modes).
+    /// Takes no `&Store`: the store handle is `!Sync`, and holding the
+    /// caller's borrow across the download await would make the ensure
+    /// future non-Send — a fresh handle is opened after the pull ends.
+    async fn autopull_draft(&self, name: &str, spec_mode: &str) -> Option<String> {
+        let pair = pallama_core::pair_for_spec_mode(name, spec_mode)?;
+        let client = match crate::hf::HfClient::new(std::env::var("HF_TOKEN").ok()) {
+            Ok(c) => c.with_download_connections(self.config.download_connections),
+            Err(e) => {
+                tracing::warn!(model = name, "spec_autopull skipped (hf client): {e:#}");
+                return None;
+            }
+        };
+        let puller = crate::Puller {
+            dirs: self.dirs.clone(),
+            client,
+            bus: self.bus.clone(),
+            force: false,
+        };
+        tracing::info!(
+            model = name,
+            draft = %pair.draft_repo,
+            "spec_autopull: pulling missing draft model"
+        );
+        match puller.pull(&pair.draft_repo).await {
+            Ok(outcome) => {
+                tracing::info!(
+                    model = name,
+                    draft = %outcome.row.name,
+                    already_present = outcome.already_present,
+                    "spec_autopull: draft available"
+                );
+                Store::open(&self.dirs)
+                    .ok()
+                    .and_then(|s| resolve_draft_path(&s, name, spec_mode))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    model = name,
+                    "spec_autopull failed; keeping without-autopull behavior: {e:#}"
+                );
+                None
+            }
+        }
     }
 
     /// Apply an ollama `keep_alive` request to a live instance (F12):
@@ -4551,6 +4650,8 @@ mod routing_tests {
             device: None,
             kv_est_bytes: None,
             warnings: Vec::new(),
+            spec_mode: "off".into(),
+            draft: None,
             settled_mib: std::sync::atomic::AtomicU64::new(settled_mib),
             auth: None,
             child: tokio::sync::Mutex::new(ChildHandle::new(endpoint, proc)),
@@ -4681,6 +4782,8 @@ mod routing_tests {
             device: None,
             kv_est_bytes: None,
             warnings: Vec::new(),
+            spec_mode: "off".into(),
+            draft: None,
             settled_mib: std::sync::atomic::AtomicU64::new(0),
             auth: None,
             child: tokio::sync::Mutex::new(ChildHandle::new(endpoint, proc)),
@@ -4859,6 +4962,17 @@ mod routing_tests {
             resolve_draft_path(&store, "qwen3-14b", "auto").as_deref(),
             Some("/models/qwen3-0.6b-q4_0.gguf")
         );
+    }
+
+    #[test]
+    fn unit__resolve_spec_mode__queued_beats_overlay_beats_config() {
+        use super::resolve_spec_mode as r;
+        // The per-request override (`options.spec`) always wins.
+        assert_eq!(r(Some("off".into()), Some("eagle3".into()), "auto"), "off");
+        // No request: the model overlay wins over the global config.
+        assert_eq!(r(None, Some("eagle3".into()), "auto"), "eagle3");
+        // Neither: the global config default.
+        assert_eq!(r(None, None, "auto"), "auto");
     }
 
     #[tokio::test]

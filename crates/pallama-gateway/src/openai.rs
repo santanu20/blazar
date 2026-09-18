@@ -350,6 +350,15 @@ pub async fn openai_proxy(
         }
     }
 
+    // X-Pallama-Spec: per-request spec mode on the OpenAI path —
+    // protocol has no such field, the extension header fills the gap
+    // (same semantics as options.spec on the ollama API).
+    if let Some(raw) = headers.get("x-pallama-spec").and_then(|v| v.to_str().ok()) {
+        if let Err(resp) = crate::ollama::apply_spec(&state, &model, raw).await {
+            return *resp;
+        }
+    }
+
     let prefix = if chat_family {
         affinity_hash_bytes(&body)
     } else {

@@ -180,6 +180,11 @@ enum Cmd {
         /// Without it a reasoning model can ramble to the context limit.
         #[arg(long)]
         max_tokens: Option<u64>,
+        /// Spawn WITHOUT a draft model this session (spec = "off" for
+        /// every request, never persisted to config). Useful to compare
+        /// speculative vs dense throughput side by side.
+        #[arg(long)]
+        no_draft: bool,
     },
     /// Benchmark a model (pp/tg table; history kept for tune gates)
     Bench { model: String },
@@ -967,9 +972,10 @@ async fn run(cmd: Cmd) -> Result<()> {
             prompt,
             verbose,
             max_tokens,
+            no_draft,
         } => {
             let model = ensure_run_model(&model).await?;
-            run_dispatch(&model, &prompt, verbose, max_tokens).await
+            run_dispatch(&model, &prompt, verbose, max_tokens, no_draft).await
         }
         Cmd::Bench { model } => bench(&resolve_model_cli(&model)),
         Cmd::Tune {
@@ -1470,6 +1476,7 @@ async fn doctor(flat: bool, json: bool) -> Result<()> {
                 ));
             }
             checks.extend(doctor_config_pins(&cfg));
+            checks.extend(doctor_chunking(&cfg));
         }
         Err(e) => {
             checks.push(Check::fail(
@@ -1643,9 +1650,8 @@ fn doctor_group(name: &str) -> &'static str {
         | "whisper models" => "ENGINES",
         "models" | "model types" => "MODELS",
         "ccache" => "CHANNELS",
-        "disk" | "store" | "sentinel" | "daemon uptime" | "tempdir hygiene" | "bench baseline" => {
-            "RUNTIME"
-        }
+        "disk" | "store" | "sentinel" | "daemon uptime" | "tempdir hygiene" | "bench baseline"
+        | "chunking" => "RUNTIME",
         _ => "SYSTEM",
     }
 }
@@ -1851,6 +1857,32 @@ fn doctor_channels() -> Vec<Check> {
                 .to_string(),
         )],
     }
+}
+
+/// Prefill-chunking visibility (pure — config in, rows out): the
+/// effective knobs that shape prompt-processing memory/latency on each
+/// lane. Shows the pinned value or the engine default the knob falls
+/// back to; visibility only, no judgments.
+fn doctor_chunking(cfg: &pallama_core::Config) -> Vec<Check> {
+    let ubatch = if cfg.ubatch_size == 0 {
+        "auto (engine default)".to_string()
+    } else {
+        cfg.ubatch_size.to_string()
+    };
+    let chunked = cfg.sglang.chunked_prefill_size.map_or_else(
+        || "auto (sglang 0.5.19 default 8192)".to_string(),
+        |v| v.to_string(),
+    );
+    let mixed = cfg
+        .sglang
+        .mixed_chunk
+        .map_or_else(|| "auto (engine default)".to_string(), |v| v.to_string());
+    vec![Check::ok(
+        "chunking",
+        format!(
+            "llamacpp ubatch_size = {ubatch}; sglang chunked_prefill_size = {chunked}, mixed_chunk = {mixed}"
+        ),
+    )]
 }
 
 /// RUNTIME section: daemon uptime/restarts, tempdir hygiene, bench
@@ -4346,8 +4378,8 @@ async fn ps(reset: bool, json: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<24} {:<9} {:>7} {:>6} {:>10}  ENDPOINT",
-        "NAME", "STATE", "CTX", "GPU", "IN_FLIGHT"
+        "{:<24} {:<9} {:>7} {:>6} {:<20} {:>10}  ENDPOINT",
+        "NAME", "STATE", "CTX", "GPU", "SPEC", "IN_FLIGHT"
     );
     for m in models {
         let display = match m["pallama_replica"].as_i64() {
@@ -4360,12 +4392,24 @@ async fn ps(reset: bool, json: bool) -> Result<()> {
             Some(dev) => format!("{}@{}", m["pallama_gpu"].as_str().unwrap_or("-"), dev),
             None => m["pallama_gpu"].as_str().unwrap_or("-").to_string(),
         };
+        // Spec cell: the mode this instance spawned under, draft file
+        // suffixed when one rode along (`eagle3+qwen3-0.6b-...gguf`).
+        // Router rows carry an empty mode — a shared child has none.
+        let spec = match (
+            m["pallama_spec"].as_str().unwrap_or(""),
+            m["pallama_draft"].as_str(),
+        ) {
+            ("", _) => "-".to_string(),
+            (mode, Some(draft)) => format!("{mode}+{draft}"),
+            (mode, None) => mode.to_string(),
+        };
         println!(
-            "{:<24} {:<9} {:>7} {:>6} {:>10}  {}",
+            "{:<24} {:<9} {:>7} {:>6} {:<20} {:>10}  {}",
             display,
             m["pallama_state"].as_str().unwrap_or("?"),
             m["pallama_ctx"].as_i64().unwrap_or(0),
             gpu,
+            spec,
             m["pallama_in_flight"].as_i64().unwrap_or(0),
             m["pallama_endpoint"].as_str().unwrap_or("-")
         );
@@ -4389,9 +4433,10 @@ async fn run_dispatch(
     prompt: &[String],
     verbose: bool,
     max_tokens: Option<u64>,
+    no_draft: bool,
 ) -> Result<()> {
     if prompt.is_empty() {
-        return run_repl(model).await;
+        return run_repl(model, no_draft).await;
     }
     let base = ensure_daemon().await?;
     let text = prompt.join(" ");
@@ -4400,11 +4445,19 @@ async fn run_dispatch(
         "messages": [{"role": "user", "content": text}],
         "stream": true,
     });
+    // Both per-run knobs ride `options`: num_predict caps generation
+    // (the ollama dialect's slot for it — a top-level max_tokens would
+    // be silently ignored), spec = "off" queues a dense spawn for this
+    // request (consume-once at the daemon, re-sent per request).
+    let mut options = serde_json::Map::new();
     if let Some(n) = max_tokens {
-        // /api/chat is the ollama dialect: the generation cap lives in
-        // options.num_predict (translated to max_tokens for the engine),
-        // a top-level max_tokens key would be silently ignored.
-        body["options"] = serde_json::json!({ "num_predict": n });
+        options.insert("num_predict".into(), serde_json::json!(n));
+    }
+    if no_draft {
+        options.insert("spec".into(), serde_json::json!("off"));
+    }
+    if !options.is_empty() {
+        body["options"] = serde_json::Value::Object(options);
     }
     let outcome = stream_chat(base.clone(), body.clone()).await?;
     if outcome.interrupted {
@@ -5656,7 +5709,7 @@ fn repl_local_command(
     Some(false)
 }
 
-async fn run_repl(model: &str) -> Result<()> {
+async fn run_repl(model: &str, no_draft: bool) -> Result<()> {
     use rustyline::error::ReadlineError;
     let base = ensure_daemon().await?;
     let mut rl = rustyline::DefaultEditor::new()?;
@@ -5735,6 +5788,7 @@ async fn run_repl(model: &str) -> Result<()> {
             system_msg.as_deref(),
             verbose,
             thinks,
+            no_draft,
         )
         .await
         {
@@ -5748,6 +5802,7 @@ async fn run_repl(model: &str) -> Result<()> {
                     system_msg.as_deref(),
                     verbose,
                     thinks,
+                    no_draft,
                 )
                 .await?;
             } else {
@@ -5785,6 +5840,7 @@ async fn repl_turn(
     system_msg: Option<&str>,
     verbose: bool,
     thinks: bool,
+    no_draft: bool,
 ) -> Result<bool> {
     let mut messages = Vec::with_capacity(history.len() + 1);
     if let Some(sys) = system_msg {
@@ -5804,6 +5860,12 @@ async fn repl_turn(
         // visible stream. Dropped for models the daemon taught us cannot
         // think (is_unsupported_think_error fallback above).
         body["think"] = serde_json::json!(true);
+    }
+    if no_draft {
+        // Re-sent EVERY turn: the daemon consumes the override at spawn,
+        // so a mid-session eviction + respawn would otherwise fall back
+        // to the configured spec mode.
+        body["options"] = serde_json::json!({ "spec": "off" });
     }
     let outcome = stream_chat(base.to_string(), body).await?;
     if outcome.interrupted {
@@ -8621,6 +8683,38 @@ async fn upgrade(version: Option<String>, dry_run: bool) -> Result<()> {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__run_no_draft__parses_before_prompt_only() {
+        // Flags BEFORE the prompt parse (trailing_var_arg owns
+        // everything after the first non-flag word).
+        let cli = Cli::try_parse_from(["pallama", "run", "m1", "--no-draft", "hi"]).unwrap();
+        match cli.cmd {
+            Cmd::Run {
+                no_draft, prompt, ..
+            } => {
+                assert!(no_draft);
+                assert_eq!(prompt, vec!["hi".to_string()]);
+            }
+            _ => panic!("expected Run, got another subcommand"),
+        }
+        // AFTER the prompt clap still parses it (interspersed flags
+        // work; only a LEADING `-` word is the quoting trap, next case).
+        let cli = Cli::try_parse_from(["pallama", "run", "m1", "hi", "--no-draft"]).unwrap();
+        match cli.cmd {
+            Cmd::Run {
+                no_draft, prompt, ..
+            } => {
+                assert!(no_draft);
+                assert_eq!(prompt, vec!["hi".to_string()]);
+            }
+            _ => panic!("expected Run, got another subcommand"),
+        }
+        // The documented trap: a prompt STARTING with `-` needs `--`
+        // (or quoting) — clap reads it as an unknown flag otherwise.
+        assert!(Cli::try_parse_from(["pallama", "run", "m1", "-flaggy"]).is_err());
+        assert!(Cli::try_parse_from(["pallama", "run", "m1", "--", "-flaggy"]).is_ok());
+    }
 
     #[test]
     fn unit__chat_stats_line__formats_and_degrades() {

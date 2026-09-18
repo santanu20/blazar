@@ -87,12 +87,13 @@ pub fn apply_ollama_options(openai_req: &mut Value, options: &Value) -> Vec<Stri
                     adaptive_p = true;
                 }
             }
-            "num_ctx" | "num_batch" | "num_gpu" | "num_thread" | "num_keep" | "numa" => {
-                // Runner options: num_ctx is handled by the caller
-                // (instance restart); the rest are accepted-and-ignored
-                // only for num_ctx's siblings — explicitly listed, not
-                // silently swallowed.
-                if k != "num_ctx" {
+            "num_ctx" | "spec" | "num_batch" | "num_gpu" | "num_thread" | "num_keep" | "numa" => {
+                // Runner options: num_ctx (instance restart) and spec
+                // (spawn-shape override, the `--no-draft` rail) are
+                // handled by the caller from the ORIGINAL request; the
+                // rest are accepted-and-ignored only for num_ctx's
+                // siblings — explicitly listed, not silently swallowed.
+                if k != "num_ctx" && k != "spec" {
                     unknown.push(format!(
                         "{k} (not settable per-request in pallama; use config)"
                     ));
