@@ -1,6 +1,6 @@
 //! registry.ollama.ai pull lane.
 //!
-//! Wire protocol (live-verified 2026-09-10, see docs/registry-ollama-pull.md):
+//! Wire protocol (live-verified 2026-09-10):
 //! - `GET /v2/{ns}/{model}/manifests/{tag}` with an
 //!   `Accept: application/vnd.docker.distribution.manifest.v2+json` header
 //!   returns a Docker-v2 manifest envelope whose layers are

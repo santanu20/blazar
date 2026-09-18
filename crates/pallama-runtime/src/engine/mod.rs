@@ -95,6 +95,87 @@ fn release_is_fresh(release: &GhRelease) -> bool {
         .is_some_and(|t| now_secs().saturating_sub(t) < FRESH_RELEASE_SECS)
 }
 
+/// Aside-dir prefix for an engine preserved across a replacement
+/// install. Dot-prefixed: invisible to dir scans, and DB rows (the only
+/// thing that names engine dirs) never point at it.
+const RETIRED_ENGINE_PREFIX: &str = ".retired-";
+
+/// Rename the installed `engines/<tag>` aside so a replacement build can
+/// run at the FINAL path — venvs and extracted archives embed absolute
+/// paths, so building under a scratch name and renaming in is not an
+/// option. The aside copy is the rollback: `restore_retired_engine`
+/// puts it back when the replacement fails, `discard_retired_engine`
+/// deletes it once the new engine registers. Asides from CRASHED runs
+/// of the same tag are swept here: nothing else references them and
+/// they would leak GiB. Returns `None` when no installed dir existed
+/// (fresh install — nothing to preserve).
+fn retire_engine_dir(dir: &Path) -> Result<Option<PathBuf>> {
+    if !dir.exists() {
+        return Ok(None);
+    }
+    let engines = dir.parent().context("engine dir has no parent")?;
+    let tag = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("engine tag is not UTF-8")?;
+    let aside_prefix = format!("{RETIRED_ENGINE_PREFIX}{tag}-");
+    for entry in std::fs::read_dir(engines)
+        .with_context(|| format!("scan {}", engines.display()))?
+        .flatten()
+    {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(&aside_prefix))
+        {
+            // A crashed run's rollback copy: the replacement about to
+            // run supersedes anything it held. (Concurrent installs of
+            // the same tag are already undefined — both write this same
+            // final dir.)
+            std::fs::remove_dir_all(entry.path())
+                .with_context(|| format!("sweep stale aside {}", entry.path().display()))?;
+        }
+    }
+    let aside = engines.join(format!("{aside_prefix}{}", std::process::id()));
+    std::fs::rename(dir, &aside).with_context(|| format!("retire {} aside", dir.display()))?;
+    Ok(Some(aside))
+}
+
+/// Put a retired engine back after a failed replacement. The failed
+/// replacement's remains go first (`register_or_clean` already removed
+/// probe-class dirs; store-class keeps them — neither may block the
+/// rename). A restore failure means both copies are stranded: logged at
+/// error level with the aside left on disk for the next same-tag
+/// install (or a human) to recover — never silently dropped.
+fn restore_retired_engine(aside: Option<&Path>, dir: &Path) {
+    if dir.exists() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    let Some(aside) = aside else { return };
+    if let Err(e) = std::fs::rename(aside, dir) {
+        tracing::error!(
+            "cannot restore retired engine {} -> {}: {e} — the previous engine \
+             is preserved at {} until the next install of this tag",
+            aside.display(),
+            dir.display(),
+            aside.display()
+        );
+    }
+}
+
+/// Delete the superseded engine copy after its replacement registered.
+/// A leak here wastes disk but breaks nothing — warn, never fail the
+/// install that already succeeded.
+fn discard_retired_engine(aside: Option<&Path>) {
+    let Some(aside) = aside else { return };
+    if let Err(e) = std::fs::remove_dir_all(aside) {
+        tracing::warn!(
+            "leaked retired engine dir {} ({e}): remove it to reclaim disk",
+            aside.display()
+        );
+    }
+}
+
 pub struct EngineManager {
     pub dirs: PallamaDirs,
     pub gh: GhClient,
@@ -998,74 +1079,67 @@ impl EngineManager {
                     release.tag_name
                 )
             })?;
-        let dir = self.dirs.engines_dir().join(&release.tag_name);
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir).context("replace existing engine dir")?;
-        }
-        std::fs::create_dir_all(&dir)?;
-        // F87: stream to disk — llama.cpp release assets reach ~400 MB
-        // and must not be buffered whole in RAM (the mistralrs lane has
-        // streamed since day one). F88: a failed download or extract
-        // removes the half-populated dir instead of orphaning it.
-        let archive = dir.join(&pick.name);
-        if let Err(e) = self.gh.download_asset_file(asset, &archive).await {
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err(e);
-        }
         let digest = asset
             .digest
             .clone()
             .and_then(|d| d.strip_prefix("sha256:").map(str::to_string))
             .unwrap_or_else(|| "unverified".into());
-        let extracted = extract_archive_file(&archive, &dir, &pick.name);
-        std::fs::remove_file(&archive).context("remove downloaded archive")?;
-        if let Err(e) = extracted {
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err(e);
-        }
-        if let Some(comp) = companion {
-            let comp_size = comp
-                .size
-                .map_or_else(String::new, |b| format!(" ({} MiB)", b / 1_048_576));
-            tracing::info!(
-                "downloading CUDA runtime companion {}{} — the system lacks \
-                 the runtime for this build and the binary dlopens it at boot",
-                comp.name,
-                comp_size
-            );
-            let comp_archive = dir.join(&comp.name);
-            if let Err(e) = self.gh.download_asset_file(comp, &comp_archive).await {
-                let _ = std::fs::remove_dir_all(&dir);
-                return Err(e);
-            }
-            let scratch = dir.join("cudart-incoming");
-            std::fs::create_dir_all(&scratch).context("stage companion extract")?;
-            let comp_extracted = extract_archive_file(&comp_archive, &scratch, &comp.name);
-            let _ = std::fs::remove_file(&comp_archive);
-            let merged = comp_extracted.and_then(|()| {
-                let server = find_server(&dir).map_err(|e| {
-                    e.context(ENGINE_PROBE_FAILED)
-                        .context("companion merge needs the server binary location")
-                })?;
-                let bin_dir = server
-                    .parent()
-                    .ok_or_else(|| anyhow!("server path {} has no parent", server.display()))?
-                    .to_path_buf();
-                flatten_payload_into(&scratch, &bin_dir)
-            });
-            let _ = std::fs::remove_dir_all(&scratch);
-            if let Err(e) = merged {
-                let _ = std::fs::remove_dir_all(&dir);
-                return Err(e);
-            }
-        }
-        self.register_or_clean(
-            &dir,
-            &release.tag_name,
-            &pick.label,
+        // F87: stream to disk — llama.cpp release assets reach ~400 MB
+        // and must not be buffered whole in RAM (the mistralrs lane has
+        // streamed since day one). F88 + rollback: a failed download or
+        // extract restores the previously installed engine instead of
+        // orphaning a half-populated dir.
+        let tag = release.tag_name.clone();
+        let pick_name = pick.name.clone();
+        let pick_label = pick.label.clone();
+        self.install_with_rollback(
+            &tag,
+            &pick_label,
             &digest,
             EngineKind::LlamaCpp,
+            |dir| async move {
+                std::fs::create_dir_all(&dir)?;
+                let archive = dir.join(&pick_name);
+                self.gh.download_asset_file(asset, &archive).await?;
+                let extracted = extract_archive_file(&archive, &dir, &pick_name);
+                std::fs::remove_file(&archive).context("remove downloaded archive")?;
+                extracted?;
+                if let Some(comp) = companion {
+                    let comp_size = comp
+                        .size
+                        .map_or_else(String::new, |b| format!(" ({} MiB)", b / 1_048_576));
+                    tracing::info!(
+                        "downloading CUDA runtime companion {}{} — the system lacks \
+                         the runtime for this build and the binary dlopens it at boot",
+                        comp.name,
+                        comp_size
+                    );
+                    let comp_archive = dir.join(&comp.name);
+                    self.gh.download_asset_file(comp, &comp_archive).await?;
+                    let scratch = dir.join("cudart-incoming");
+                    std::fs::create_dir_all(&scratch).context("stage companion extract")?;
+                    let comp_extracted = extract_archive_file(&comp_archive, &scratch, &comp.name);
+                    let _ = std::fs::remove_file(&comp_archive);
+                    let merged = comp_extracted.and_then(|()| {
+                        let server = find_server(&dir).map_err(|e| {
+                            e.context(ENGINE_PROBE_FAILED)
+                                .context("companion merge needs the server binary location")
+                        })?;
+                        let bin_dir = server
+                            .parent()
+                            .ok_or_else(|| {
+                                anyhow!("server path {} has no parent", server.display())
+                            })?
+                            .to_path_buf();
+                        flatten_payload_into(&scratch, &bin_dir)
+                    });
+                    let _ = std::fs::remove_dir_all(&scratch);
+                    merged?;
+                }
+                Ok(())
+            },
         )
+        .await
     }
 
     /// Install one mistralrs release asset. Same shape as
@@ -1092,37 +1166,33 @@ impl EngineManager {
             .clone()
             .and_then(|d| d.strip_prefix("sha256:").map(str::to_string))
             .unwrap_or_else(|| "unverified".into());
-
-        let dir = self.dirs.engines_dir().join(&release.tag_name);
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir).context("replace existing engine dir")?;
-        }
-        std::fs::create_dir_all(&dir)?;
-        let archive = dir.join(&pick.name);
-        if let Err(e) = self.gh.download_asset_file(asset, &archive).await {
-            let _ = std::fs::remove_dir_all(&dir); // F88: no orphan dir
-            return Err(e);
-        }
-        let extracted = extract_archive_file(&archive, &dir, &pick.name);
-        std::fs::remove_file(&archive).context("remove downloaded archive")?;
-        if let Err(e) = extracted {
-            let _ = std::fs::remove_dir_all(&dir); // F88: no orphan dir
-            return Err(e);
-        }
-        if pick.cpu_fallback {
-            tracing::warn!(
-                "installed the CPU mistralrs asset {} — this machine's driver/GPU \
-                 does not qualify for a CUDA prebuilt; expect CPU-only speed",
-                pick.name
-            );
-        }
-        self.register_or_clean(
-            &dir,
-            &release.tag_name,
-            &pick.label,
+        let tag = release.tag_name.clone();
+        let pick_name = pick.name.clone();
+        let pick_label = pick.label.clone();
+        let cpu_fallback = pick.cpu_fallback;
+        self.install_with_rollback(
+            &tag,
+            &pick_label,
             &digest,
             EngineKind::MistralRs,
+            |dir| async move {
+                std::fs::create_dir_all(&dir)?;
+                let archive = dir.join(&pick_name);
+                self.gh.download_asset_file(asset, &archive).await?;
+                let extracted = extract_archive_file(&archive, &dir, &pick_name);
+                std::fs::remove_file(&archive).context("remove downloaded archive")?;
+                extracted?;
+                if cpu_fallback {
+                    tracing::warn!(
+                        "installed the CPU mistralrs asset {} — this machine's driver/GPU \
+                         does not qualify for a CUDA prebuilt; expect CPU-only speed",
+                        pick_name
+                    );
+                }
+                Ok(())
+            },
         )
+        .await
     }
 
     /// Install a sglang engine: venv + pip + shim under
@@ -1146,22 +1216,23 @@ impl EngineManager {
             anyhow::bail!("sglang version must be dotted digits (e.g. 0.5.19), got {version:?}");
         }
         let tag = format!("sglang-{version}");
-        let dir = self.dirs.engines_dir().join(&tag);
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir).context("replace existing engine dir")?;
-        }
-        std::fs::create_dir_all(&dir)?;
-        if let Err(e) = sglang_install::install_into(&dir, version).await {
-            let _ = std::fs::remove_dir_all(&dir); // F88: no orphan dir
-            return Err(e);
-        }
-        self.register_or_clean(
-            &dir,
+        // Rollback-safe: a rebuild that dies mid-venv (a 100%-full disk
+        // ate one live, 2026-09-18) restores the previously installed
+        // engine instead of destroying it.
+        let asset_label = format!("pip:sglang=={version}");
+        self.install_with_rollback(
             &tag,
-            &format!("pip:sglang=={version}"),
+            &asset_label,
             "unverified",
             EngineKind::Sglang,
+            |dir| async move {
+                std::fs::create_dir_all(&dir)?;
+                sglang_install::install_into(&dir, version)
+                    .await
+                    .map(|_| ())
+            },
         )
+        .await
     }
 
     /// Resolve and install a mistralrs release: explicit `vX.Y.Z` tag or
@@ -1338,6 +1409,46 @@ impl EngineManager {
             ..row
         };
         Ok(row)
+    }
+
+    /// Rollback-safe engine install for the release/asset lanes: the
+    /// installed `engines/<tag>` dir is renamed aside (instant) before
+    /// `build` runs at the FINAL path — venvs and extracted archives
+    /// embed absolute paths, so a scratch-name build cannot be renamed
+    /// in — and restored untouched when anything fails: build error
+    /// (disk-full mid-venv), probe rejection, store failure. The aside
+    /// copy is deleted only after the replacement registers, so a
+    /// replacement needs headroom for BOTH copies at peak — that disk
+    /// cost is the price of never destroying a working engine (live
+    /// incident 2026-09-18: a 100%-full disk ate the sglang venv
+    /// mid-rebuild under the old rm-first flow).
+    async fn install_with_rollback<B, F>(
+        &self,
+        tag: &str,
+        asset_label: &str,
+        sha256: &str,
+        kind: EngineKind,
+        build: B,
+    ) -> Result<EngineRow>
+    where
+        B: FnOnce(PathBuf) -> F,
+        F: std::future::Future<Output = Result<()>>,
+    {
+        let dir = self.dirs.engines_dir().join(tag);
+        let aside = retire_engine_dir(&dir)?;
+        let outcome = build(dir.clone())
+            .await
+            .and_then(|()| self.register_or_clean(&dir, tag, asset_label, sha256, kind));
+        match outcome {
+            Ok(row) => {
+                discard_retired_engine(aside.as_deref());
+                Ok(row)
+            }
+            Err(e) => {
+                restore_retired_engine(aside.as_deref(), &dir);
+                Err(e)
+            }
+        }
     }
 
     /// Register a dir the caller JUST extracted for this install, removing
@@ -1939,6 +2050,190 @@ mod verify_tests {
             assert_eq!(row.tag, "b2-cuda");
             assert!(dir.exists(), "healthy engine dir survives");
             assert!(dir.join("llama-server").exists(), "binary survives");
+        }
+    }
+
+    /// `install_with_rollback` contract: a failed replacement must never
+    /// cost the previously installed engine (dir + row), and a successful
+    /// one must not leak the retired copy. Linux-only: the fixtures are
+    /// /bin/sh scripts.
+    #[cfg(target_os = "linux")]
+    mod install_with_rollback_tests {
+        use super::super::*;
+        use super::fake_bin;
+        use pallama_core::engine_kind::EngineKind;
+        use pallama_core::store::{EngineRow, Store};
+
+        fn manager_in(tmp: &tempfile::TempDir) -> EngineManager {
+            EngineManager {
+                dirs: pallama_core::PallamaDirs {
+                    config_dir: tmp.path().join("cfg"),
+                    data_dir: tmp.path().join("data"),
+                },
+                gh: GhClient::with_base("http://127.0.0.1", None).expect("gh client"),
+                bus: crate::events::EventBus::default(),
+                asset_override: "auto".into(),
+            }
+        }
+
+        /// A llama-server that satisfies the probe contract: `--version`
+        /// prints a `version:` line with a build number, `--help` exits 0.
+        fn healthy_server(dir: &std::path::Path) {
+            fake_bin(
+                dir,
+                "llama-server",
+                "case \"$1\" in --version) echo 'version: 4242 (stub)';; --help) echo 'usage: stub';; esac; exit 0",
+            );
+        }
+
+        /// Installed engine to protect: healthy binary, a marker file,
+        /// and the store row that serves it.
+        fn seed_installed_engine(mgr: &EngineManager, dir: &std::path::Path, tag: &str) {
+            std::fs::create_dir_all(dir).unwrap();
+            healthy_server(dir);
+            std::fs::write(dir.join("marker"), b"previous build").unwrap();
+            let store = Store::open(&mgr.dirs).unwrap();
+            store
+                .upsert_engine(&EngineRow {
+                    tag: tag.to_string(),
+                    asset: "old".into(),
+                    sha256: "old".into(),
+                    installed_at: 1,
+                    active: true,
+                    manifest: "{}".into(),
+                    kind: EngineKind::LlamaCpp,
+                })
+                .unwrap();
+        }
+
+        fn aside_leftovers(mgr: &EngineManager) -> Vec<String> {
+            let engines_dir = mgr.dirs.engines_dir();
+            if !engines_dir.exists() {
+                return Vec::new();
+            }
+            std::fs::read_dir(engines_dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with(".retired-"))
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn unit__install_with_rollback__build_failure_restores_existing_engine() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mgr = manager_in(&tmp);
+            let dir = tmp.path().join("data/engines/b1-cuda");
+            seed_installed_engine(&mgr, &dir, "b1-cuda");
+            let err = mgr
+                .install_with_rollback("b1-cuda", "lbl", "x", EngineKind::LlamaCpp, |_dir| async {
+                    Err(anyhow!("simulated disk-full mid-build"))
+                })
+                .await
+                .expect_err("failed build must surface");
+            assert!(
+                format!("{err:#}").contains("disk-full"),
+                "original error must survive the rollback: {err:#}"
+            );
+            assert!(dir.join("llama-server").exists(), "old binary survives");
+            assert!(dir.join("marker").exists(), "old dir content survives");
+            let store = Store::open(&mgr.dirs).unwrap();
+            assert_eq!(store.list_engines().unwrap().len(), 1, "row survives");
+            assert!(aside_leftovers(&mgr).is_empty(), "no aside lingered");
+        }
+
+        #[tokio::test]
+        async fn unit__install_with_rollback__probe_failure_restores_existing_engine() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mgr = manager_in(&tmp);
+            let dir = tmp.path().join("data/engines/b2-cuda");
+            seed_installed_engine(&mgr, &dir, "b2-cuda");
+            let err = mgr
+                .install_with_rollback(
+                    "b2-cuda",
+                    "lbl",
+                    "x",
+                    EngineKind::LlamaCpp,
+                    |dir| async move {
+                        // Garbage bytes with the +x bit: spawn fails at
+                        // exec — the register-tail failure class a
+                        // SIGILL'd asset hits.
+                        std::fs::create_dir_all(&dir).unwrap();
+                        std::fs::write(dir.join("llama-server"), b"not an elf").unwrap();
+                        make_executable(&dir.join("llama-server"));
+                        Ok(())
+                    },
+                )
+                .await
+                .expect_err("garbage binary must fail the probe");
+            assert!(
+                format!("{err:#}").contains(ENGINE_PROBE_FAILED),
+                "probe-class failures carry the marker: {err:#}"
+            );
+            assert!(
+                dir.join("marker").exists(),
+                "old dir content restored after probe failure"
+            );
+            let store = Store::open(&mgr.dirs).unwrap();
+            assert_eq!(store.list_engines().unwrap().len(), 1, "row survives");
+            assert!(aside_leftovers(&mgr).is_empty(), "no aside lingered");
+        }
+
+        #[tokio::test]
+        async fn unit__install_with_rollback__success_replaces_and_discards_retired() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mgr = manager_in(&tmp);
+            let dir = tmp.path().join("data/engines/b3-cuda");
+            seed_installed_engine(&mgr, &dir, "b3-cuda");
+            let row = mgr
+                .install_with_rollback(
+                    "b3-cuda",
+                    "lbl",
+                    "x",
+                    EngineKind::LlamaCpp,
+                    |dir| async move {
+                        std::fs::create_dir_all(&dir).unwrap();
+                        healthy_server(&dir);
+                        Ok(())
+                    },
+                )
+                .await
+                .expect("healthy replacement registers");
+            assert_eq!(row.tag, "b3-cuda");
+            assert!(!dir.join("marker").exists(), "old content replaced");
+            assert!(dir.join("llama-server").exists(), "new binary in place");
+            let store = Store::open(&mgr.dirs).unwrap();
+            assert_eq!(
+                store.list_engines().unwrap().len(),
+                1,
+                "one row for the tag"
+            );
+            assert!(aside_leftovers(&mgr).is_empty(), "retired copy discarded");
+        }
+
+        #[tokio::test]
+        async fn unit__install_with_rollback__fresh_install_failure_leaves_no_dir() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mgr = manager_in(&tmp);
+            let err = mgr
+                .install_with_rollback(
+                    "fresh-cuda",
+                    "lbl",
+                    "x",
+                    EngineKind::LlamaCpp,
+                    |_dir| async { Err(anyhow!("boom")) },
+                )
+                .await
+                .expect_err("failure surfaces");
+            assert!(
+                format!("{err:#}").contains("boom"),
+                "original error must survive: {err:#}"
+            );
+            assert!(
+                !mgr.dirs.engines_dir().join("fresh-cuda").exists(),
+                "F88: no orphan dir from a failed fresh install"
+            );
+            assert!(aside_leftovers(&mgr).is_empty());
         }
     }
 

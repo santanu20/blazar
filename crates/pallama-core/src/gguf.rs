@@ -1,6 +1,6 @@
 //! Minimal GGUF metadata reader. Parses only the header + KV section
 //! (tensor infos and data are seeked past, never read). Format truth:
-//! references/llama.cpp-master/ggml/src/gguf.cpp (v2 and v3 both use u64
+//! ggml-org/llama.cpp `ggml/src/gguf.cpp` (v2 and v3 both use u64
 //! lengths/counts; v3 added big-endian support only).
 //!
 //! Extracts exactly what Pallama needs: architecture identity + the fields

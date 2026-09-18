@@ -154,4 +154,4 @@ python3 scripts/bench_matrix.py --pallama-bin target/release/pallama --md BENCHM
 python3 scripts/bench_matrix.py --render-only --artifacts-dir <dir> --md BENCHMARK.md
 ```
 
-_Raw per-cell records (argv, per-run lists, daemon logs): `~/.cache/pallama-bench-matrix/20260911-223054/cells.jsonl`._
+_Raw per-cell records (argv, per-run lists, daemon logs): `~/.cache/pallama-bench-matrix/<run-id>/cells.jsonl`._

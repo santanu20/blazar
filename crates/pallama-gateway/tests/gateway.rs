@@ -1151,7 +1151,7 @@ async fn e2e__ps_and_show() {
         .unwrap();
     assert_eq!(s["details"]["quantization_level"], "Q4_K_M");
     assert_eq!(s["model_info"]["general.architecture"], "qwen3");
-    // ollama-parity capability discovery (geokit vision + thinking
+    // ollama-parity capability discovery (client vision + thinking
     // detection): m1 has no mmproj but its fixture template carries an
     // enable_thinking marker -> completion + thinking, never a vision lie.
     let caps = s["capabilities"].as_array().expect("capabilities array");

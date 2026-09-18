@@ -21,7 +21,7 @@ use pallama_core::store::EngineRow;
 use pallama_core::PallamaDirs;
 
 use super::gh::LLAMA_CPP_REPO;
-use super::EngineManager;
+use super::{discard_retired_engine, restore_retired_engine, retire_engine_dir, EngineManager};
 
 /// Backends Pallama can build from source. Intentionally only the two
 /// that upstream does not ship as Linux prebuilts worth building
@@ -498,7 +498,8 @@ impl EngineManager {
         // let a broken install pass its probe — exactly the live failure
         // of 2026-09-09. Probe-after-teardown keeps the install check
         // honest: the stored engine must stand on its own.
-        let (dir, digest) = {
+        let engine_dir = self.dirs.engines_dir().join(&engine_tag);
+        let built: Result<(String, Option<PathBuf>)> = {
             let build_root =
                 tempfile::TempDir::with_prefix("pallama-build-").context("create build tempdir")?;
             let src = fetch_source(build_root.path(), &tc, opts, &tag, on_line).await?;
@@ -542,15 +543,40 @@ impl EngineManager {
             ));
             run_step(bldcmd, "cmake --build", opts.timeout, on_line).await?;
 
-            install_built_binaries(&self.dirs, &bld, &engine_tag, on_line)?
+            // Rollback-safe swap (same contract as the release lanes'
+            // install_with_rollback): the old build is displaced only
+            // AFTER the new one compiled — restored on any later
+            // failure, discarded once the new row lands. Retire must
+            // precede the extraction: install_built_binaries refuses to
+            // merge into a live dir.
+            let aside = retire_engine_dir(&engine_dir)?;
+            match install_built_binaries(&self.dirs, &bld, &engine_tag, on_line) {
+                Ok((_, digest)) => Ok((digest, aside)),
+                Err(e) => {
+                    restore_retired_engine(aside.as_deref(), &engine_dir);
+                    Err(e)
+                }
+            }
         };
-        self.register_engine(
-            &dir,
+        let (digest, aside) = built?;
+        // The build tree is torn down above BEFORE registering so the
+        // probe cannot resolve through it.
+        match self.register_engine(
+            &engine_dir,
             &engine_tag,
             &format!("built-{}", opts.backend.as_str()),
             &digest,
             EngineKind::LlamaCpp,
-        )
+        ) {
+            Ok(row) => {
+                discard_retired_engine(aside.as_deref());
+                Ok(row)
+            }
+            Err(e) => {
+                restore_retired_engine(aside.as_deref(), &engine_dir);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -749,10 +775,13 @@ fn install_built_binaries(
     on_line: &mut dyn FnMut(&str),
 ) -> Result<(PathBuf, String)> {
     let dir = dirs.engines_dir().join(engine_tag);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir)
-            .with_context(|| format!("replace existing engine dir {}", dir.display()))?;
-    }
+    // The caller retires any existing copy first (rollback-safe swap);
+    // merging into a live dir would leave stale files behind.
+    anyhow::ensure!(
+        !dir.exists(),
+        "engine dir {} already exists — the caller must retire it first",
+        dir.display()
+    );
     let inner = dir.join(format!("llama-{engine_tag}"));
     std::fs::create_dir_all(&inner).with_context(|| format!("create {}", inner.display()))?;
     let bin = bld.join("bin");

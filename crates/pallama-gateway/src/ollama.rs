@@ -1,5 +1,5 @@
 //! Ollama-compat surface (drop-in `OLLAMA_HOST` replacement). Shapes
-//! mirrored from references/ollama-main/api/types.go; divergences are
+//! mirrored from ollama's upstream `api/types.go`; divergences are
 //! deliberate and documented:
 //! - `options.num_ctx` restarts the instance at the requested size (never
 //!   silently truncates — complaint #13)
@@ -280,16 +280,16 @@ pub async fn show(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
         details["block_count"] = json!(g.block_count.unwrap_or(0));
         details["expert_count"] = json!(g.expert_count.unwrap_or(0));
     }
-    // ollama-parity capability discovery (geokit vision detection reads
-    // this): vision iff an mmproj projector is attached to the model —
+    // ollama-parity capability discovery (vision clients read this):
+    // vision iff an mmproj projector is attached to the model —
     // evidence from the store, never a filename guess.
     let mut capabilities = vec!["completion"];
     if row.mmproj_path.is_some() {
         capabilities.push("vision");
     }
     // Thinking capability is template-evidenced — the same marker sniff
-    // the think:true request gate uses. Harnesses (geokit THINK_OK) read
-    // this to decide whether the `think` request key is legal; an
+    // the think:true request gate uses. Downstream tooling reads this
+    // to decide whether the `think` request key is legal; an
     // unreadable row never claims the capability (fail-closed).
     if gguf
         .as_ref()

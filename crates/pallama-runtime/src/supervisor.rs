@@ -89,7 +89,7 @@ const SLOTS_STREAK_TICKS: u32 = 6;
 /// LC4: max in-memory slots bump (`tune --slots` for higher). Raised
 /// 4 → 8 on 2026-09-12: the np8 shape measured +19% system t/s and a
 /// 5.4x concurrency TTFT-p99 win over np4 under 8-stream load
-/// (scaling flag-space study, /tmp/opencode/flagprobe/results2.json).
+/// (scaling flag-space study, flagprobe 2026-09-12).
 const SLOTS_ADOPT_CAP: u32 = 8;
 /// Quiet reaper ticks before an adoption decays back to the natural
 /// shape (30 x 10s = 5 min of zero pressure and zero in-flight). The
