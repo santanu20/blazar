@@ -347,7 +347,7 @@ fn server_bin_in(dir: &Path) -> Option<PathBuf> {
     walk_for_file(dir, name)
 }
 
-fn walk_for_file(dir: &Path, name: &str) -> Option<PathBuf> {
+pub(crate) fn walk_for_file(dir: &Path, name: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
     for e in entries.filter_map(std::result::Result::ok) {
         let p = e.path();

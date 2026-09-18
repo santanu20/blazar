@@ -270,6 +270,42 @@ enum Cmd {
         )]
         pin: Option<String>,
     },
+    /// Offline text-to-speech (piper): install the binary, pull a voice,
+    /// synthesize text to a WAV file.
+    Tts {
+        /// Text to synthesize — omit with --install/--pull/--list
+        text: Option<String>,
+        /// Piper voice id (e.g. en_US-amy-medium; default: first pulled)
+        #[arg(long)]
+        voice: Option<String>,
+        /// Install the piper binary from its GitHub release
+        #[arg(long)]
+        install: bool,
+        /// Install this specific release tag and pin the lane to it
+        /// (plain --install tracks the latest release)
+        #[arg(long, requires = "install")]
+        tag: Option<String>,
+        /// Download a piper voice by id (en_US-amy-medium, ...)
+        #[arg(long)]
+        pull: Option<String>,
+        /// List installed piper tag + pulled voices
+        #[arg(long)]
+        list: bool,
+        /// Pin piper to an installed tag ("none" unpins — tracks the
+        /// newest installed tag). No download involved.
+        #[arg(
+            long,
+            value_name = "TAG|none",
+            conflicts_with_all = ["install", "tag", "pull", "list", "text"]
+        )]
+        pin: Option<String>,
+        /// Output WAV path ("-" for stdout); default: <voice>-<n>.wav
+        #[arg(long, requires = "text")]
+        out: Option<PathBuf>,
+        /// Playback speed (0.25..=4.0, 1.0 = native)
+        #[arg(long, requires = "text")]
+        speed: Option<f64>,
+    },
     /// Engine management: llama.cpp releases, mistral.rs lane, source
     /// builds (`build cuda|cpu`), rollback + update channels
     ///
@@ -653,6 +689,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "config",
             "keys",
             "whisper",
+            "tts",
             "doctor",
             "migrate",
             "snapshot",
@@ -1045,6 +1082,30 @@ async fn run(cmd: Cmd) -> Result<()> {
             list,
             pin,
         } => whisper_cmd(file.as_ref(), model, install, tag, pull, list, pin).await,
+        Cmd::Tts {
+            text,
+            voice,
+            install,
+            tag,
+            pull,
+            list,
+            pin,
+            out,
+            speed,
+        } => {
+            tts_cmd(
+                text,
+                voice.as_deref(),
+                install,
+                tag,
+                pull,
+                list,
+                pin,
+                out,
+                speed,
+            )
+            .await
+        }
         Cmd::Coreside => coreside_cmd(),
         Cmd::Drafts { model } => drafts_cmd(&resolve_model_cli(&model)).await,
         Cmd::Migrate => migrate_cmd(),
@@ -5446,6 +5507,181 @@ fn coreside_cmd() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `pallama tts` — piper lane management + local synthesis through the
+/// daemon's `/v1/audio/speech` (same key-gating as every route).
+#[allow(clippy::too_many_arguments)]
+async fn tts_cmd(
+    text: Option<String>,
+    voice: Option<&str>,
+    install: bool,
+    tag: Option<String>,
+    pull: Option<String>,
+    list: bool,
+    pin: Option<String>,
+    out: Option<PathBuf>,
+    speed: Option<f64>,
+) -> Result<()> {
+    let d = dirs();
+    if let Some(value) = pin {
+        let unpin = value.trim().eq_ignore_ascii_case("none");
+        let target = if unpin { None } else { Some(value.as_str()) };
+        pallama_runtime::piper::set_pin(&d, target)?;
+        if unpin {
+            println!("piper pin removed — tracking the newest installed tag");
+        } else {
+            println!("piper pinned to {}", value.trim());
+        }
+        return Ok(());
+    }
+    if list {
+        match pallama_runtime::piper::server_bin(&d) {
+            Some((bin, _)) => {
+                let pin = if pallama_runtime::piper::pinned_tag(&d).is_some() {
+                    " (pinned)"
+                } else {
+                    ""
+                };
+                let tag = bin
+                    .ancestors()
+                    .nth(2)
+                    .and_then(std::path::Path::file_name)
+                    .map_or_else(|| "?".into(), |n| n.to_string_lossy().into_owned());
+                println!("server: {tag}{pin} ({})", bin.display());
+            }
+            None => println!("server: not installed (pallama tts --install)"),
+        }
+        let voices = pallama_runtime::piper::list_voices(&d);
+        if voices.is_empty() {
+            println!("voices: none pulled (pallama tts --pull en_US-amy-medium)");
+        } else {
+            for v in voices {
+                println!("voice: {v}");
+            }
+        }
+        return Ok(());
+    }
+    if install {
+        let pinned = tag.is_some();
+        let token = std::env::var("GH_TOKEN").ok();
+        let gh = GhClient::new(token)?;
+        let tag = pallama_runtime::piper::install(&gh, &d, tag.as_deref(), pinned).await?;
+        let pin = if pinned { " (pinned)" } else { "" };
+        println!("piper installed{pin}: {tag}");
+        return Ok(());
+    }
+    if let Some(voice) = pull {
+        let token = std::env::var("HF_TOKEN").ok();
+        let hf = pallama_runtime::hf::HfClient::new(token)?
+            .with_download_connections(config()?.download_connections);
+        let dest = pallama_runtime::piper::pull_voice(&hf, &d, &voice, |done, total| {
+            use std::io::Write as _;
+            print!("\rpulling {voice}.onnx: {done}/{total} bytes");
+            let _ = std::io::stdout().flush();
+        })
+        .await?;
+        println!("\npulled {}", dest.display());
+        return Ok(());
+    }
+    let Some(text) = text else {
+        return Err(anyhow!(
+            "no text given — pass text to synthesize, or use --install/--pull/--list"
+        ));
+    };
+    tts_speak(&d, &text, voice, out.as_deref(), speed).await
+}
+
+/// Synthesis arm of `pallama tts`: resolve the voice (default: first
+/// pulled), POST the daemon's `/v1/audio/speech`, write the WAV.
+async fn tts_speak(
+    d: &PallamaDirs,
+    text: &str,
+    voice: Option<&str>,
+    out: Option<&Path>,
+    speed: Option<f64>,
+) -> Result<()> {
+    let voice = if let Some(v) = voice {
+        v.to_string()
+    } else {
+        pallama_runtime::piper::list_voices(d)
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("no voice pulled — run: pallama tts --pull en_US-amy-medium"))?
+    };
+    let base = ensure_daemon().await?;
+    let bearer = admin_bearer();
+    let mut body = serde_json::json!({ "model": voice, "input": text });
+    if let Some(speed) = speed {
+        body["speed"] = serde_json::json!(speed);
+    }
+    let mut req = cli_http()
+        .post(format!("{base}/v1/audio/speech"))
+        .json(&body);
+    if let Some(b) = bearer {
+        req = req.bearer_auth(b);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let msg = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("speech failed ({status}): {}", msg.trim()));
+    }
+    let wav = resp.bytes().await?;
+    if out == Some(Path::new("-")) {
+        use std::io::Write as _;
+        std::io::stdout().write_all(&wav)?;
+    } else {
+        let path = out.map_or_else(
+            || format!("{}-{}.wav", voice, chrono_now_compact()),
+            |p| p.display().to_string(),
+        );
+        std::fs::write(&path, &wav).with_context(|| format!("write {path}"))?;
+        println!(
+            "wrote {path} ({} bytes, {} s audio)",
+            wav.len(),
+            wav_duration_secs(&wav)
+        );
+    }
+    Ok(())
+}
+
+/// Compact timestamp for default output names (no chrono dep needed for
+/// a stamp this simple).
+fn chrono_now_compact() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    secs.to_string()
+}
+
+/// WAV duration from the RIFF header: walks the chunk list for `fmt `
+/// (byte rate) and `data` (payload length); 0.0 when the bytes are not
+/// a parseable WAV. Chunks are word-aligned per RIFF.
+#[allow(clippy::cast_precision_loss)] // WAV byte sizes sit far below 2^52
+fn wav_duration_secs(wav: &[u8]) -> f64 {
+    if wav.len() < 12 || &wav[..4] != b"RIFF" || &wav[8..12] != b"WAVE" {
+        return 0.0;
+    }
+    let le = |off: usize| -> u32 {
+        u32::from_le_bytes([wav[off], wav[off + 1], wav[off + 2], wav[off + 3]])
+    };
+    let mut pos = 12;
+    let mut byte_rate = 0u32;
+    while pos + 8 <= wav.len() {
+        let id = &wav[pos..pos + 4];
+        let len = le(pos + 4) as usize;
+        let body = pos + 8;
+        if id == b"fmt " && body + 12 <= wav.len() {
+            // fmt layout: format(2) channels(2) rate(4) byte_rate(4).
+            byte_rate = le(body + 8);
+        } else if id == b"data" && byte_rate > 0 {
+            let data_len = len.min(wav.len().saturating_sub(body));
+            return data_len as f64 / f64::from(byte_rate);
+        }
+        pos = body + len + (len & 1);
+    }
+    0.0
 }
 
 /// `pallama whisper file.mp3` — STT via the `whisper` [[remotes]] entry.

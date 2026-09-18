@@ -81,6 +81,13 @@ impl PallamaDirs {
         self.data_dir.join("sessions")
     }
 
+    /// Piper TTS voices (`<voice>/<voice>.onnx` + `.onnx.json`), from
+    /// `rhasspy/piper-voices` on HF.
+    #[must_use]
+    pub fn voices_dir(&self) -> PathBuf {
+        self.data_dir.join("voices")
+    }
+
     /// Ensure all data subdirectories exist (config dir included).
     pub fn ensure(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.config_dir)?;
@@ -89,6 +96,7 @@ impl PallamaDirs {
         std::fs::create_dir_all(self.run_dir())?;
         std::fs::create_dir_all(self.speccache_dir())?;
         std::fs::create_dir_all(self.sessions_dir())?;
+        std::fs::create_dir_all(self.voices_dir())?;
         Ok(())
     }
 }

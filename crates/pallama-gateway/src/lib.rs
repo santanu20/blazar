@@ -22,6 +22,7 @@ pub mod sentinel;
 pub mod sessions;
 pub mod state;
 pub mod translate;
+pub mod tts;
 pub mod whisper;
 
 use std::sync::Arc;
@@ -276,6 +277,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v1/audio/transcriptions",
             post(whisper::audio_transcriptions),
         )
+        .route("/v1/audio/speech", post(tts::audio_speech))
         .route("/audio/transcriptions", post(whisper::audio_transcriptions))
         .route("/infill", post(openai::openai_proxy))
         .route("/v1/chat/completions/control", post(openai::openai_proxy))

@@ -555,3 +555,55 @@ async fn client__ollama_options_spec__off_shapes_the_spawn_and_ps_reports_it() {
     assert!(row.get("pallama_cache_hit").is_some());
     ts.state.sup.shutdown_all().await.unwrap();
 }
+
+#[tokio::test]
+async fn client__audio_speech__teaches_install_and_format_lanes() {
+    // Hermetic harness dir carries no piper install: the route must
+    // name the exact remedy, and the WAV-only contract must teach the
+    // alternative instead of silently transcoding.
+    let ts = start(support::config_with_keys()).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/v1/audio/speech", ts.base))
+        .bearer_auth("plm_admin")
+        .json(&serde_json::json!({
+            "model": "en_US-amy-medium", "input": "hello"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("pallama tts --install"),
+        "missing-lane teaching: {body}"
+    );
+    let resp = c
+        .post(format!("{}/v1/audio/speech", ts.base))
+        .bearer_auth("plm_admin")
+        .json(&serde_json::json!({
+            "model": "en_US-amy-medium", "input": "hi",
+            "response_format": "mp3"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("WAV") && body.contains("mp3"),
+        "format teaching: {body}"
+    );
+    let resp = c
+        .post(format!("{}/v1/audio/speech", ts.base))
+        .bearer_auth("plm_admin")
+        .json(&serde_json::json!({
+            "model": "en_US-amy-medium", "input": "hi", "speed": 9.0
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("0.25..=4.0"), "speed range teaching: {body}");
+}
