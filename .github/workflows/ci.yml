@@ -1,0 +1,73 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    name: fmt + clippy + workspace tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # F159: the codebase ships Windows/macOS code paths (tasklist
+        # probes, .exe tool discovery, taskkill stop, detached spawn) —
+        # a Linux-only matrix left them structurally untestable.
+        # ubuntu-22.04 stays the glibc floor the release binaries target.
+        os: [ubuntu-22.04, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace -- --test-threads=1
+
+  scripts:
+    name: shellcheck + installer e2e (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # x86_64 runs everything; arm64 proves the aarch64 asset lane
+        # (e2e cases 4+7 are x86_64-gated and skip there by design).
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: shellcheck -S warning scripts/*.sh tests/install_e2e.sh
+      # e2e installs real artifacts: host pallama binary + the stub engine
+      # (stub only needed where case 4 runs — x86_64).
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p pallama-cli
+      - run: |
+          if [ "$(uname -m)" = x86_64 ]; then
+            cargo build --release -p pallama-runtime --features test-util --bin stub-llama-server
+          fi
+      - run: sh tests/install_e2e.sh
+
+  python:
+    name: ruff + py_compile (scripts)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/ruff-action@v3
+      # F161: the harness had no CI lint gate — the F9 ruff errors lived
+      # in the tree for months, uncatchable.
+      - run: ruff check scripts/
+      - run: python3 -m py_compile scripts/*.py
+
+  audit:
+    name: cargo audit (dep CVEs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # F161: no dep-vulnerability gate existed (7c dependency audit).
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

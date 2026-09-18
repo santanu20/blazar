@@ -1,0 +1,60 @@
+[package]
+name = "pallama-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pallama runtime: engine installer, HF client, process supervisor, event bus, bench runner"
+
+[features]
+default = []
+test-util = ["dep:axum", "dep:hyper-util"]
+
+[dependencies]
+pallama-core = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true, optional = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true, optional = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+dashmap = { workspace = true }
+indicatif = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+tokio-stream = { workspace = true }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+sysinfo.workspace = true
+libc = { workspace = true }
+getrandom = { workspace = true }
+# Production dep: engine build lane stages its build tree in a scoped
+# tempdir (engine/build.rs) — not test-only.
+tempfile = "3"
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+wiremock = "0.6"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "stub-llama-server"
+path = "../../tests/fixtures/stub_llama_server.rs"
+required-features = ["test-util"]
+
+[[bin]]
+name = "stub-llama-bench"
+path = "../../tests/fixtures/stub_llama_bench.rs"
+required-features = ["test-util"]
+
+[[bin]]
+name = "stub-llama-quantize"
+path = "../../tests/fixtures/stub_llama_quantize.rs"
+required-features = ["test-util"]

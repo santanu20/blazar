@@ -1,0 +1,26 @@
+{
+ "generated": "2026-09-17T20:34:41+00:00",
+ "generator": "python3 scripts/validate.py --update-goldens",
+ "items": {
+  "api.ps.row": "21c36294e1153f0763175e317d5d4a3eaa37a0391008ede6fc31e83557a1fb96",
+  "api.version": "5ca4f3850ccc331aaf8a257d6086e526a3b42a63e18cb11d020847985b31d188",
+  "chat.sse-final-keys": "3b4e5535f31a42b2c0a4b499f0c1932737308c8541f39bb3c887f1b5a0ede997",
+  "completions.bash": "a5c1a7fce789287e1f984e6b847cab1c8c1d8d6505e060aa04cec6121dc99c40",
+  "completions.fish": "978644d42222bee6244062e7613c226946f2e4cc4eb0081dc618f1f57bdb6967",
+  "completions.powershell": "6dd91f71fe40b676cf7c386d89252c83ca2c282b76a35af5cace9b79b0ca6e9c",
+  "completions.zsh": "fb2435e31a4afebb89a9304560bffc81d2f412131e59204714a9d60fcdfa1673",
+  "config.fresh-keys": "d00b646917115a865f357d7dae1819cdb1f5cb166882b5407bd355d1700a3f88",
+  "doctor.check-names": "88c5b56e3d9b40f20f076b8d1c5fd53b67e9525471ca36fd81fba17a1fbc22df",
+  "header.keys": "b0fe68a7cc7edf348b6478e081eee45c9e4c2575d721611ca3a8933c3acd92fd",
+  "header.list": "5295c6d82c59a145d6da3840a94ef561e3eff5981a35e8fda2aea538b27c3454",
+  "header.ps": "2993e85f298a52a01974aa6588d76343033a71993177d961e705066a6feef05f",
+  "header.show": "4742626c1c664550e2594f4d78eb23d274aa491a8e268cca6ceef22d43f1b4ef",
+  "help.commands": "39cbf19ef9a7daf1696092ea49c2d2f2e836b9efc89fcaf7876fd4f2932980d7",
+  "refusal.login": "a41a45fdd831cedc489bde23a31d544f5e3b5430b78ebeb2e7d6a0754f490a33",
+  "refusal.logout": "0603ce665ca004c7bf7c9abc1289bb3372c90b86d3561c76b9672fd8e98be9be",
+  "refusal.push": "0e780d1c1322ef137182e0ac56a45af6dc58fa6f89940d75fd2f02266f2625b5",
+  "refusal.signin": "ab545510d7fb40dd69ffca78a364e7d0ca8d7331aa705ab199e465e2e8b03aa4",
+  "refusal.signout": "468639f55e4f692d3a2d966792df755aa5c1b4c5ddc246d1fb2b3415c52acd21"
+ },
+ "provenance": "captured from the release binary on a FULL-run-verified sandbox; payloads are machine-stable by construction (sorted key sets, exact refusal lines, column names, shas)"
+}

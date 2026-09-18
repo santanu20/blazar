@@ -1,0 +1,44 @@
+[package]
+name = "pallama-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pallama gateway: OpenAI + ollama-compat APIs, metrics aggregation, priority queue, SSE"
+
+[features]
+default = []
+test-util = []
+
+[dependencies]
+pallama-core = { workspace = true }
+pallama-runtime = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+axum-server = { workspace = true }
+tower-http = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+dashmap = { workspace = true }
+getrandom = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+http-body = { workspace = true }
+tokio-stream = { workspace = true }
+jsonschema = { version = "0.53.0", default-features = false }
+parking_lot = "0.12.5"
+
+[dev-dependencies]
+pallama-runtime = { workspace = true, features = ["test-util"] }
+wiremock = "0.6"
+tempfile = "3"
+libc = { workspace = true }
+
+[lints]
+workspace = true

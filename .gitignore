@@ -1,0 +1,18 @@
+/target
+/references
+__pycache__/
+
+# machine-local agent tool state
+.codegraph/
+.serena/
+
+# stray runtime pidfiles
+*.pid
+
+# personal agent working files — never leave this machine
+/AGENTS.md
+/MEMORY.md
+/MEMORY-archive-*.md
+
+# nuclear-audit working ledgers
+/.audit/
