@@ -102,14 +102,42 @@ const SLOTS_DECAY_TICKS: u32 = 30;
 /// (no `#`) pass through unchanged, so `replicas = 1` stays
 /// byte-identical with the pre-replica world.
 /// A trailing `@vision` marker (projector-carrying respawn of a
-/// text-only instance, see `ensure_vision`) is stripped too, so every
+/// text-only instance, see `ensure_vision`) and an on-demand `+lora`
+/// variant marker (see `spawn_instance`) are stripped too, so every
 /// consumer sees the plain model name.
 fn model_of_key(key: &str) -> &str {
+    let key = key.split('@').next().unwrap_or(key);
+    let key = match key.split_once('#') {
+        Some((model, _)) => model,
+        None => key,
+    };
+    match key.split_once('+') {
+        Some((model, _)) => model,
+        None => key,
+    }
+}
+
+/// Instance display name: like [`model_of_key`] but KEEPS the `+lora`
+/// marker so `ps` distinguishes an adapted child from the dense one.
+/// `@vision` and `#N` stay hidden — those are the same weights serving
+/// the same traffic, while a `LoRA` variant is a genuinely different
+/// instance users must be able to tell apart.
+fn display_name_of_key(key: &str) -> &str {
     let key = key.split('@').next().unwrap_or(key);
     match key.split_once('#') {
         Some((model, _)) => model,
         None => key,
     }
+}
+
+/// Adapter stem from a `model+lora` instance key (`None` for dense,
+/// vision, and plain replica keys). Strips in the same order as
+/// [`model_of_key`] (`@` first, then `#N`, then `+`).
+fn lora_suffix_of_key(key: &str) -> Option<&str> {
+    let key = key.split('@').next().unwrap_or(key);
+    let key = key.split_once('#').map_or(key, |(k, _)| k);
+    key.split_once('+')
+        .and_then(|(_, stem)| (!stem.is_empty()).then_some(stem))
 }
 
 /// Owned model metadata for either storage lane, lendable as the
@@ -1167,6 +1195,18 @@ impl Supervisor {
         // (upstream autoloads the model on request, LRU-evicts at
         // models-max). Unknown names still fail fast against the store.
         if self.config.router && name != ROUTER_KEY {
+            // `model+adapter` variants spawn a per-model child; the
+            // router child can't do that (it owns no per-model argv).
+            // Reject with the working alternative instead of letting the
+            // child 404 on a name it was never taught.
+            if pallama_core::catalog::split_lora_suffix(name).1.is_some() {
+                return Err(SupervisionError::ModelNotFound(format!(
+                    "router mode serves adapters dynamically at /v1/adapters; \
+                     `{name}` needs a per-model variant child — disable \
+                     `router` in config.toml or attach the adapter \
+                     always-on with `pallama lora add`"
+                )));
+            }
             let store =
                 Store::open(&self.dirs).map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
             store
@@ -2221,6 +2261,46 @@ impl Supervisor {
             })
     }
 
+    /// Adapter set for a spawn: dense lanes load every attached row
+    /// (`pallama lora add` = always-on, the pre-variant semantics); an
+    /// on-demand `model+adapter` lane loads ONLY the named row so the
+    /// adapted child coexists with the dense one as a separate instance.
+    /// The stem names the adapter FILE (path stem given to
+    /// `pallama lora add`); unknown or duplicated stems are teaching
+    /// errors, never silent drops.
+    fn resolve_lora_lane(
+        rows: Vec<pallama_core::LoraRow>,
+        name: &str,
+        stem: Option<&str>,
+    ) -> Result<Vec<(String, f64)>, SupervisionError> {
+        let Some(stem) = stem else {
+            return Ok(rows.into_iter().map(|l| (l.path, l.scale)).collect());
+        };
+        let matches: Vec<&pallama_core::LoraRow> = rows
+            .iter()
+            .filter(|l| {
+                std::path::Path::new(&l.path)
+                    .file_stem()
+                    .is_some_and(|s| s == stem)
+            })
+            .collect();
+        match matches.as_slice() {
+            [only] => Ok(vec![(only.path.clone(), only.scale)]),
+            [] => Err(SupervisionError::ModelNotFound(format!(
+                "no lora {stem:?} attached to {name:?}: attach it with \
+                 `pallama lora add {name} <adapter-file>` then request \
+                 `{name}+{stem}` (attached rows: `pallama lora list`)"
+            ))),
+            many => {
+                let ids: Vec<i64> = many.iter().map(|l| l.id).collect();
+                Err(SupervisionError::ModelNotFound(format!(
+                    "lora {stem:?} on {name:?} is ambiguous (rows {ids:?}) — \
+                     `pallama lora rm <id>` the duplicates"
+                )))
+            }
+        }
+    }
+
     // Full child lifecycle in one pass: argv build, spawn, settle, health
     // gate, registration. Splitting it would scatter the invariants.
     #[allow(clippy::too_many_lines)]
@@ -2270,12 +2350,13 @@ impl Supervisor {
                 e,
             ))
         })?;
-        let loras: Vec<(String, f64)> = store
-            .list_loras(Some(name))
-            .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?
-            .into_iter()
-            .map(|l| (l.path, l.scale))
-            .collect();
+        let loras = Self::resolve_lora_lane(
+            store
+                .list_loras(Some(name))
+                .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?,
+            name,
+            lora_suffix_of_key(key),
+        )?;
         // Draft resolution mirrors every other spawn path (router
         // preset, CLI bench/tune): one shared resolver, catalog pair →
         // pulled store row. Compile-time freshness + manifest gates
@@ -3885,7 +3966,11 @@ impl Supervisor {
                 let i = e.value();
                 let heat = self.heat_of(&i.name);
                 PsRow {
-                    name: model_of_key(&i.name).to_string(),
+                    // Display keeps the `+lora` variant marker (dense vs
+                    // adapted children must be distinguishable); heat,
+                    // bank, and keep_alive matching use the plain model
+                    // name via model_of_key elsewhere.
+                    name: display_name_of_key(&i.name).to_string(),
                     replica: split_replica(&i.name).map(|(_, idx)| idx),
                     state: i.state.read().expect("state lock").as_str(),
                     endpoint: match &i.endpoint {
@@ -4880,6 +4965,68 @@ mod routing_tests {
         assert_eq!(model_of_key("m@vision"), "m");
         assert_eq!(model_of_key("m#1@vision"), "m");
         assert_eq!(model_of_key("m@vision#1"), "m"); // '@' stripped first
+                                                     // +lora variant keys: stem stripped after '@' and '#N'
+        assert_eq!(model_of_key("m+adapter"), "m");
+        assert_eq!(model_of_key("m+adapter#2"), "m");
+        assert_eq!(model_of_key("m#2+adapter"), "m"); // '#' first if adjacent
+        assert_eq!(model_of_key("m+adapter@vision"), "m");
+    }
+
+    #[tokio::test]
+    async fn unit__key_grammar__lora_suffix_and_display() {
+        // Stem extraction mirrors the strip order of model_of_key.
+        assert_eq!(lora_suffix_of_key("m+foo"), Some("foo"));
+        assert_eq!(lora_suffix_of_key("m+foo#2"), Some("foo"));
+        assert_eq!(lora_suffix_of_key("m+foo@vision"), Some("foo"));
+        assert_eq!(lora_suffix_of_key("m"), None);
+        assert_eq!(lora_suffix_of_key("m#2"), None);
+        assert_eq!(lora_suffix_of_key("m@vision"), None);
+        assert_eq!(lora_suffix_of_key("m+"), None); // degenerate stays dense
+                                                    // Display keeps the variant marker so ps distinguishes children;
+                                                    // @vision/#N stay hidden.
+        assert_eq!(display_name_of_key("m+foo"), "m+foo");
+        assert_eq!(display_name_of_key("m+foo#2"), "m+foo");
+        assert_eq!(display_name_of_key("m@vision"), "m");
+        assert_eq!(display_name_of_key("m#2"), "m");
+    }
+
+    #[test]
+    fn unit__resolve_lora_lane__dense_variant_and_teaching() {
+        use pallama_core::LoraRow;
+        let row = |id: i64, path: &str, scale: f64| LoraRow {
+            id,
+            model_name: "m".into(),
+            path: path.into(),
+            scale,
+        };
+        let rows = vec![
+            row(1, "/adapters/rsmma.gguf", 1.0),
+            row(2, "/tmp/x.gguf", 0.5),
+        ];
+        // Dense lane: every attached row, always-on semantics preserved.
+        let dense = Supervisor::resolve_lora_lane(rows.clone(), "m", None).unwrap();
+        assert_eq!(dense.len(), 2);
+        assert_eq!(dense[1], ("/tmp/x.gguf".to_string(), 0.5));
+        // Variant lane: ONLY the named stem, with its own scale.
+        let variant = Supervisor::resolve_lora_lane(rows.clone(), "m", Some("rsmma")).unwrap();
+        assert_eq!(variant, vec![("/adapters/rsmma.gguf".to_string(), 1.0)]);
+        // Unknown stem: teaching error names the model and the command.
+        let err = Supervisor::resolve_lora_lane(rows.clone(), "m", Some("nope")).unwrap_err();
+        let SupervisionError::ModelNotFound(msg) = &err else {
+            panic!("unknown stem must be ModelNotFound, got {err:?}");
+        };
+        assert!(msg.contains("pallama lora add"), "{msg}");
+        assert!(msg.contains("m+nope"), "{msg}");
+        // Duplicate stems: ambiguity teaching with row ids.
+        let dup = vec![row(3, "/a/rsmma.gguf", 1.0), row(4, "/b/rsmma.gguf", 1.0)];
+        let err = Supervisor::resolve_lora_lane(dup, "m", Some("rsmma")).unwrap_err();
+        let SupervisionError::ModelNotFound(msg) = &err else {
+            panic!("duplicate stems must be ModelNotFound, got {err:?}");
+        };
+        assert!(
+            msg.contains("ambiguous") && msg.contains('3') && msg.contains('4'),
+            "{msg}"
+        );
     }
 
     #[tokio::test]

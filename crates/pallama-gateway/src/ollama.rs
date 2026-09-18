@@ -1027,7 +1027,7 @@ pub async fn chat(
 
     let (engine, load_ms) = match ensure_with_admission(
         &state,
-        &row.name,
+        &model_field,
         priority,
         affinity_hash(&req),
         crate::proxy::body_needs_vision(&req, true),
@@ -1852,7 +1852,7 @@ pub async fn embeddings(
         }
     }
     let (engine, _) =
-        match ensure_with_admission(&state, &row.name, Priority::Normal, None, false).await {
+        match ensure_with_admission(&state, &model, Priority::Normal, None, false).await {
             Ok(ok) => ok,
             Err(resp) => return *resp,
         };
@@ -1954,7 +1954,7 @@ pub async fn embed(
         }
     }
     let (engine, _) =
-        match ensure_with_admission(&state, &row.name, Priority::Normal, None, false).await {
+        match ensure_with_admission(&state, &model, Priority::Normal, None, false).await {
             Ok(ok) => ok,
             Err(resp) => return *resp,
         };
@@ -2086,7 +2086,7 @@ pub async fn rerank(
         }
     }
     let (engine, _) =
-        match ensure_with_admission(&state, &row.name, Priority::Normal, None, false).await {
+        match ensure_with_admission(&state, &model, Priority::Normal, None, false).await {
             Ok(ok) => ok,
             Err(resp) => return *resp,
         };
@@ -2257,7 +2257,7 @@ pub async fn generate(
     }
     let (engine, load_ms) = match ensure_with_admission(
         &state,
-        &row.name,
+        &model,
         priority,
         affinity_hash(&req),
         crate::proxy::body_needs_vision(&req, true),

@@ -56,23 +56,23 @@ pub fn child_base(ep: &pallama_core::Endpoint) -> String {
 /// supervisor use) → unique bare prefix → levenshtein-3 suggestion.
 /// The tag is never discarded: a colon form that swaps onto no row falls
 /// to the prefix ladder, which reports ambiguity instead of guessing.
+/// An on-demand `LoRA` variant suffix (`model+adapter`) resolves the BASE
+/// row here; the stem rides the caller's request string through to the
+/// supervisor's variant lane (see `ensure_with_admission`).
 pub fn resolve_model(store: &Store, requested: &str) -> Result<ModelRow, String> {
-    let canonical = store.resolve_model_name(&requested.to_lowercase());
+    let (base, _lora) = pallama_core::catalog::split_lora_suffix(requested);
+    let canonical = store.resolve_model_name(&base.to_lowercase());
     if let Ok(Some(m)) = store.get_model(&canonical) {
         return Ok(m);
     }
-    let bare = requested
-        .split(':')
-        .next()
-        .unwrap_or(requested)
-        .to_lowercase();
+    let colonless = base.split(':').next().unwrap_or(base).to_lowercase();
     let models = store.list_models().map_err(|e| e.to_string())?;
-    if let Some(m) = models.iter().find(|m| m.name == bare) {
+    if let Some(m) = models.iter().find(|m| m.name == colonless) {
         return Ok(m.clone());
     }
     let prefixed: Vec<&ModelRow> = models
         .iter()
-        .filter(|m| m.name.starts_with(&bare))
+        .filter(|m| m.name.starts_with(&colonless))
         .collect();
     match prefixed.len() {
         1 => return Ok(prefixed[0].clone()),
@@ -85,7 +85,7 @@ pub fn resolve_model(store: &Store, requested: &str) -> Result<ModelRow, String>
     // Levenshtein-3 suggestion across names (hand-rolled in core catalog).
     let near: Vec<&str> = models
         .iter()
-        .filter(|m| pallama_core::catalog::levenshtein(&m.name, &bare) <= 3)
+        .filter(|m| pallama_core::catalog::levenshtein(&m.name, &colonless) <= 3)
         .map(|m| m.name.as_str())
         .collect();
     if near.is_empty() {
@@ -245,14 +245,23 @@ pub async fn ensure_with_admission(
             }
             msg => Box::new(openai_error(500, msg)),
         })?;
+    // On-demand LoRA variant (`model+adapter`): re-attach the stem to
+    // the CANONICAL base row so the supervisor spawns/looks up the
+    // variant lane (`base+adapter`) regardless of how the caller spelled
+    // the base (prefix, colon tag, case).
+    let lane = match pallama_core::catalog::split_lora_suffix(model).1 {
+        Some(stem) => format!("{}+{}", row.name, stem),
+        None => row.name.clone(),
+    };
+    let lane = lane.as_str();
 
     let ensure_first = |needs: bool| -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<EngineRef, SupervisionError>> + Send>,
     > {
         if needs {
-            Box::pin(ensure_vision_detached(&state.sup, &row.name, prefix))
+            Box::pin(ensure_vision_detached(&state.sup, lane, prefix))
         } else {
-            Box::pin(ensure_detached(&state.sup, &row.name, prefix))
+            Box::pin(ensure_detached(&state.sup, lane, prefix))
         }
     };
     let first = ensure_first(needs_vision).await;
@@ -1819,6 +1828,23 @@ mod resolve_model_tests {
         ]);
         let m = resolve_model(&store, "qwen2.5:0.5b").expect("colon tag resolves");
         assert_eq!(m.name, "qwen2.5-0.5b");
+    }
+
+    #[test]
+    fn unit__resolve_model__lora_variant_resolves_base_row() {
+        let (_tmp, store) = store_with(&["qwen2.5-0.5b", "qwen2.5-1.5b-instruct"]);
+        // The stem is not part of model resolution: every spelling of
+        // the base keeps working with the suffix attached.
+        let m = resolve_model(&store, "qwen2.5-0.5b+rsmma").expect("variant resolves base");
+        assert_eq!(m.name, "qwen2.5-0.5b");
+        let m = resolve_model(&store, "qwen2.5:0.5b+rsmma").expect("colon+stem resolves base");
+        assert_eq!(m.name, "qwen2.5-0.5b");
+        let m = resolve_model(&store, "qwen2.5-0.5+rsmma").expect("prefix+stem resolves base");
+        assert_eq!(m.name, "qwen2.5-0.5b");
+        // Degenerate suffixes pass through and fail with the user's own
+        // spelling (never a silent wrong-model match).
+        let err = resolve_model(&store, "qwen2.5-0.5b+").unwrap_err();
+        assert!(err.contains("qwen2.5-0.5b+"), "{err}");
     }
 
     #[test]

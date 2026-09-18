@@ -144,10 +144,39 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// Split an on-demand `LoRA` variant request (`model+adapter`) into its
+/// base model name and adapter stem. `+` cannot occur in pulled or
+/// imported model names, so the split is unambiguous; `model:lora` was
+/// rejected because colon is ollama's `model:tag` separator. Degenerate
+/// forms (`+adapter`, `model+`, `model++x`) pass through unchanged and
+/// fail later model resolution with the user's own spelling.
+#[must_use]
+pub fn split_lora_suffix(requested: &str) -> (&str, Option<&str>) {
+    match requested.split_once('+') {
+        Some((base, stem)) if !base.is_empty() && !stem.is_empty() => (base, Some(stem)),
+        _ => (requested, None),
+    }
+}
+
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__split_lora_suffix__variants_and_degenerates() {
+        assert_eq!(split_lora_suffix("m+foo"), ("m", Some("foo")));
+        assert_eq!(
+            split_lora_suffix("owner/m:tag+foo"),
+            ("owner/m:tag", Some("foo"))
+        );
+        // Degenerate forms pass through unchanged (model resolution
+        // reports the user's own spelling, never a wrong base match).
+        assert_eq!(split_lora_suffix("m+"), ("m+", None));
+        assert_eq!(split_lora_suffix("+foo"), ("+foo", None));
+        assert_eq!(split_lora_suffix("m"), ("m", None));
+        assert_eq!(split_lora_suffix("m:tag"), ("m:tag", None));
+    }
 
     #[test]
     fn unit__pair_for_spec_mode__typed_fileless_and_generic() {
