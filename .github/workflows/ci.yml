@@ -72,6 +72,12 @@ jobs:
   audit:
     name: cargo audit (dep CVEs)
     runs-on: ubuntu-latest
+    # audit-check reports findings as a check-run annotation; the job-level
+    # token must be allowed to write checks or the action errors out after a
+    # clean scan ("Resource not accessible by integration").
+    permissions:
+      checks: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       # F161: no dep-vulnerability gate existed (7c dependency audit).
