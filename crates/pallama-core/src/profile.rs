@@ -3586,7 +3586,12 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
     }
 
     // --- scheduler / observability family
-    if tun.cache_report == Some(true) {
+    // Default-on: the report powers the gateway's warm/cold split and
+    // per-model cache-hit surfaces (`ps` HIT, /metrics); it is metrics
+    // reporting only, never a scheduling change. `cache_report = false`
+    // opts out. Engines without the flag degrade via push_tuned's
+    // supported-flags guard (warn + skip), same as any tuned knob.
+    if tun.cache_report != Some(false) {
         push_tuned(
             &mut argv,
             input.supported_flags,
@@ -10688,6 +10693,35 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("--enable-deterministic-inference")));
+    }
+
+    #[test]
+    fn unit__sglang__cache_report_default_on_and_opt_out() {
+        // The report powers the gateway's warm/cold split and per-model
+        // cache-hit surfaces — pallama-managed children carry it by
+        // default, `cache_report = false` is the explicit opt-out.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let flags = sglang_flags_extended();
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.supported_flags = &flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p.argv.contains(&"--enable-cache-report".to_string()));
+
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                cache_report: Some(false),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        inp.supported_flags = &flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.contains(&"--enable-cache-report".to_string()));
     }
 
     #[test]

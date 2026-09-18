@@ -26,6 +26,17 @@ pub struct CacheObs {
     pub unclassified: AtomicU64,
     pub ttft_warm: Histogram,
     pub ttft_cold: Histogram,
+    /// Per-model split of the same token counters (keyed by the resolved
+    /// model name): powers per-model cache-hit surfaces (`ps` HIT column,
+    /// `/api/ps`, per-model metrics) without touching child scrapes. One
+    /// entry per distinct model — bounded by the store, not by traffic.
+    pub per_model: dashmap::DashMap<String, ModelCacheObs>,
+}
+
+/// Per-model prompt-cache counters; same lock-free shape as the global.
+pub struct ModelCacheObs {
+    pub prompt_tokens: AtomicU64,
+    pub cached_tokens: AtomicU64,
 }
 
 impl Default for CacheObs {
@@ -43,15 +54,32 @@ impl CacheObs {
             unclassified: AtomicU64::new(0),
             ttft_warm: crate::histogram::ttft_warm(),
             ttft_cold: crate::histogram::ttft_cold(),
+            per_model: dashmap::DashMap::new(),
         }
     }
 
     /// Classify one completed response. `cached > 0` = warm. A missing
     /// TTFT with known usage still counts tokens but skips both
     /// histograms (the split stays honest).
-    pub fn record(&self, prompt: u64, cached: u64, ttft_secs: Option<f64>) {
+    pub fn record(&self, model: &str, prompt: u64, cached: u64, ttft_secs: Option<f64>) {
         self.prompt_tokens.fetch_add(prompt, Ordering::Relaxed);
         self.cached_tokens.fetch_add(cached, Ordering::Relaxed);
+        if let Some(e) = self.per_model.get(model) {
+            e.prompt_tokens.fetch_add(prompt, Ordering::Relaxed);
+            e.cached_tokens.fetch_add(cached, Ordering::Relaxed);
+        } else {
+            let e = self
+                .per_model
+                .entry(model.to_string())
+                .or_insert_with(|| ModelCacheObs {
+                    prompt_tokens: AtomicU64::new(0),
+                    cached_tokens: AtomicU64::new(0),
+                });
+            // Loser of an insert race re-adds its tokens onto the
+            // winner's entry — totals stay exact.
+            e.prompt_tokens.fetch_add(prompt, Ordering::Relaxed);
+            e.cached_tokens.fetch_add(cached, Ordering::Relaxed);
+        }
         let warm = cached > 0;
         if let Some(t) = ttft_secs {
             if warm {
@@ -59,6 +87,57 @@ impl CacheObs {
             } else {
                 self.ttft_cold.observe_secs(t);
             }
+        }
+    }
+
+    /// Lifetime cache-hit ratio for one model: `None` until the gateway
+    /// has observed at least one prompt token for it (the ps HIT column
+    /// renders `-`, never a lying 0%).
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // integer counters -> ratio
+    pub fn hit_ratio(&self, model: &str) -> Option<f64> {
+        let e = self.per_model.get(model)?;
+        let prompt = e.prompt_tokens.load(Ordering::Relaxed);
+        let cached = e.cached_tokens.load(Ordering::Relaxed);
+        (prompt > 0).then(|| cached as f64 / prompt as f64)
+    }
+
+    /// Render the per-model gateway-observed counters (sorted by model
+    /// for stable scrapes). Distinct name-space from the scrape-derived
+    /// `pallama_cache_hit_ratio`: that one is the engine-side truth,
+    /// these are what completed responses actually reported.
+    #[allow(clippy::cast_precision_loss)] // integer counters -> ratio
+    pub fn render_per_model(&self, out: &mut String) {
+        use std::fmt::Write as _;
+        let mut rows: Vec<(String, u64, u64)> = self
+            .per_model
+            .iter()
+            .map(|e| {
+                (
+                    e.key().clone(),
+                    e.value().prompt_tokens.load(Ordering::Relaxed),
+                    e.value().cached_tokens.load(Ordering::Relaxed),
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut help_written = false;
+        for (model, prompt, cached) in rows {
+            if prompt == 0 {
+                continue;
+            }
+            if !help_written {
+                let _ = write!(
+                    out,
+                    "# HELP pallama_gateway_cache_hit_ratio Cache-hit ratio of prompt tokens observed at the gateway, per model (completed responses only; scrape-based pallama_cache_hit_ratio remains the engine-side truth)\n# TYPE pallama_gateway_cache_hit_ratio gauge\n"
+                );
+                help_written = true;
+            }
+            let ratio = cached as f64 / prompt as f64;
+            let _ = writeln!(
+                out,
+                "pallama_gateway_cache_hit_ratio{{model=\"{model}\"}} {ratio:.4}"
+            );
         }
     }
 
@@ -266,7 +345,7 @@ mod tests {
     #[test]
     fn unit__cache_obs__warm_routes_to_warm_histogram() {
         let obs = CacheObs::new();
-        obs.record(100, 96, Some(0.05));
+        obs.record("m", 100, 96, Some(0.05));
         let warm = rendered(&obs.ttft_warm);
         let cold = rendered(&obs.ttft_cold);
         assert!(warm.contains("_count 1"), "{warm}");
@@ -279,7 +358,7 @@ mod tests {
     #[test]
     fn unit__cache_obs__cold_routes_to_cold_histogram() {
         let obs = CacheObs::new();
-        obs.record(100, 0, Some(0.5));
+        obs.record("m", 100, 0, Some(0.5));
         assert!(rendered(&obs.ttft_warm).contains("_count 0"));
         assert!(rendered(&obs.ttft_cold).contains("_count 1"));
     }
@@ -289,7 +368,7 @@ mod tests {
         // Known usage but no TTFT (e.g. abort between usage and drain):
         // tokens counted, the warm/cold split stays honest (neither hist).
         let obs = CacheObs::new();
-        obs.record(70, 40, None);
+        obs.record("m", 70, 40, None);
         assert_eq!(obs.prompt_tokens.load(Ordering::Relaxed), 70);
         assert_eq!(obs.cached_tokens.load(Ordering::Relaxed), 40);
         assert!(rendered(&obs.ttft_warm).contains("_count 0"));
@@ -303,5 +382,52 @@ mod tests {
         obs.miss();
         assert_eq!(obs.unclassified.load(Ordering::Relaxed), 2);
         assert_eq!(obs.prompt_tokens.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn unit__cache_obs__per_model_ratio_isolated_and_null_before_data() {
+        let obs = CacheObs::new();
+        // No traffic yet: ratio is None (the ps HIT column renders `-`,
+        // never a lying 0%).
+        assert_eq!(obs.hit_ratio("a"), None);
+        obs.record("a", 100, 96, Some(0.05));
+        obs.record("a", 100, 4, Some(0.05));
+        obs.record("b", 50, 0, Some(0.5));
+        // Per-model split: a = 100/200, b = 0/50 — independent buckets.
+        assert_eq!(obs.hit_ratio("a"), Some(0.5));
+        assert_eq!(obs.hit_ratio("b"), Some(0.0));
+        assert_eq!(obs.hit_ratio("c"), None);
+        // Globals still sum across models.
+        assert_eq!(obs.prompt_tokens.load(Ordering::Relaxed), 250);
+        assert_eq!(obs.cached_tokens.load(Ordering::Relaxed), 100);
+    }
+
+    #[test]
+    fn unit__cache_obs__render_per_model_sorted_and_skips_empty() {
+        let obs = CacheObs::new();
+        obs.record("b-model", 100, 100, None);
+        obs.record("a-model", 80, 40, None);
+        obs.per_model.insert(
+            "z-empty".to_string(),
+            super::ModelCacheObs {
+                prompt_tokens: std::sync::atomic::AtomicU64::new(0),
+                cached_tokens: std::sync::atomic::AtomicU64::new(0),
+            },
+        );
+        let mut out = String::new();
+        obs.render_per_model(&mut out);
+        // Sorted scrape-stable order; zero-traffic models stay silent.
+        let a = out.find("pallama_gateway_cache_hit_ratio{model=\"a-model\"} 0.5000");
+        let b = out.find("pallama_gateway_cache_hit_ratio{model=\"b-model\"} 1.0000");
+        assert!(a.is_some(), "{out}");
+        assert!(b.is_some(), "{out}");
+        assert!(a.unwrap() < b.unwrap(), "{out}");
+        assert!(!out.contains("z-empty"), "{out}");
+        // HELP/TYPE emitted exactly once for the family.
+        assert_eq!(
+            out.matches("# HELP pallama_gateway_cache_hit_ratio")
+                .count(),
+            1
+        );
     }
 }

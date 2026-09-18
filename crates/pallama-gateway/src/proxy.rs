@@ -731,7 +731,7 @@ pub async fn proxy_request(
                 }
                 // R6: buffered non-stream chat — classify from the exact
                 // JSON (no substring heuristics on this path).
-                record_buffered_chat(&state.obs, &buf, began.elapsed().as_secs_f64());
+                record_buffered_chat(&state.obs, model, &buf, began.elapsed().as_secs_f64());
                 drop(sf); // F31: Drop removes the singleflight entry
                 let stream = futures::stream::once(async move { Ok::<_, std::io::Error>(buf) })
                     .chain(futures::stream::unfold(body_guard, |g| async {
@@ -781,6 +781,7 @@ pub async fn proxy_request(
         obs: std::sync::Arc::clone(&state.obs),
         first_ns,
         chat: is_chat_route(path_query),
+        model: model.to_string(),
     });
     let stream = resp.bytes_stream().map(move |r| {
         if r.is_ok() {
@@ -1049,10 +1050,16 @@ fn inject_include_usage(
 
 /// Classify a fully-buffered non-stream chat body (enforce path) from
 /// its exact usage object — no substring heuristics on this route.
-fn record_buffered_chat(obs: &std::sync::Arc<crate::state::CacheObs>, buf: &[u8], ttft_secs: f64) {
+fn record_buffered_chat(
+    obs: &std::sync::Arc<crate::state::CacheObs>,
+    model: &str,
+    buf: &[u8],
+    ttft_secs: f64,
+) {
     match serde_json::from_slice::<serde_json::Value>(buf) {
         Ok(v) => match v.get("usage") {
             Some(u) => obs.record(
+                model,
                 u.get("prompt_tokens")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0),
@@ -1103,6 +1110,8 @@ struct CacheObsFinisher {
     /// Chat routes only — embeddings/other bodies would pollute the
     /// generation warm/cold split.
     chat: bool,
+    /// Per-model attribution for the cache-hit surfaces.
+    model: String,
 }
 impl Drop for CacheObsFinisher {
     fn drop(&mut self) {
@@ -1118,7 +1127,7 @@ impl Drop for CacheObsFinisher {
         let cached = crate::keys::last_int_after(&tail, "\"cached_tokens\"").unwrap_or(0);
         let first = self.first_ns.load(std::sync::atomic::Ordering::Relaxed);
         let ttft = (first > 0).then(|| std::time::Duration::from_nanos(first).as_secs_f64());
-        self.obs.record(prompt, cached, ttft);
+        self.obs.record(&self.model, prompt, cached, ttft);
     }
 }
 
@@ -1638,7 +1647,7 @@ mod cache_obs_tests {
             "prompt_tokens_details": {"cached_tokens": 96},
             "completion_tokens": 4,
         }});
-        record_buffered_chat(&obs, &serde_json::to_vec(&body).unwrap(), 0.25);
+        record_buffered_chat(&obs, "m", &serde_json::to_vec(&body).unwrap(), 0.25);
         assert_eq!(obs.prompt_tokens.load(Ordering::Relaxed), 120);
         assert_eq!(obs.cached_tokens.load(Ordering::Relaxed), 96);
         assert_eq!(obs.unclassified.load(Ordering::Relaxed), 0);
@@ -1652,10 +1661,11 @@ mod cache_obs_tests {
         let obs = std::sync::Arc::new(crate::state::CacheObs::new());
         record_buffered_chat(
             &obs,
+            "m",
             &serde_json::to_vec(&json!({"choices": []})).unwrap(),
             0.1,
         );
-        record_buffered_chat(&obs, b"not json", 0.1);
+        record_buffered_chat(&obs, "m", b"not json", 0.1);
         assert_eq!(obs.unclassified.load(Ordering::Relaxed), 2);
         assert_eq!(obs.prompt_tokens.load(Ordering::Relaxed), 0);
     }
@@ -1703,6 +1713,7 @@ mod cache_obs_tests {
             obs: std::sync::Arc::clone(&obs),
             first_ns: first,
             chat,
+            model: "m".to_string(),
         });
         obs
     }

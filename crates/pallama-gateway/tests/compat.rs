@@ -548,5 +548,10 @@ async fn client__ollama_options_spec__off_shapes_the_spawn_and_ps_reports_it() {
         .find(|m| m["name"].as_str() == Some("m1"))
         .expect("m1 instance row");
     assert_eq!(row["pallama_spec"].as_str(), Some("off"));
+    // Cache-hit surface: the key exists on every row (null until the
+    // gateway has classified a completed response for the model —
+    // the earlier chat in this test may or may not have carried
+    // usage, so only the key shape is pinned here).
+    assert!(row.get("pallama_cache_hit").is_some());
     ts.state.sup.shutdown_all().await.unwrap();
 }

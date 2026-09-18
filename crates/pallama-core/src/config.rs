@@ -1032,7 +1032,9 @@ pub struct SglangTuning {
     /// `--watchdog-timeout` (seconds).
     pub watchdog_timeout: Option<f64>,
     /// `--enable-cache-report`: report prefix-cache hits in
-    /// `usage.prompt_tokens_details`.
+    /// `usage.prompt_tokens_details`. Pallama-managed sglang children
+    /// default this ON (the report powers `ps` HIT, warm/cold TTFT
+    /// splits and per-model metrics); `false` opts out.
     pub cache_report: Option<bool>,
     /// `--batch-notify-size`: asyncio notification batching under high
     /// concurrency (upstream default 16).

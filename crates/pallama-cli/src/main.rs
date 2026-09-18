@@ -4320,6 +4320,35 @@ fn embedded_json(raw: &str) -> serde_json::Value {
     serde_json::from_str(raw).unwrap_or(serde_json::Value::String(raw.to_string()))
 }
 
+/// Per-row table cells for `pallama ps`: GPU label (offload + card),
+/// SPEC label (mode + draft file), and the lifetime cache-hit ratio
+/// (`-` until the gateway has classified a completed response for the
+/// model — never a lying 0%).
+fn ps_row_cells(m: &serde_json::Value) -> (String, String, String) {
+    // GPU cell: offload label, card-suffixed when placement is known
+    // (`full@RTX 4070`); router/unknown placement stays bare.
+    let gpu = match m["pallama_device"].as_str() {
+        Some(dev) => format!("{}@{}", m["pallama_gpu"].as_str().unwrap_or("-"), dev),
+        None => m["pallama_gpu"].as_str().unwrap_or("-").to_string(),
+    };
+    // Spec cell: the mode this instance spawned under, draft file
+    // suffixed when one rode along (`eagle3+qwen3-0.6b-...gguf`).
+    // Router rows carry an empty mode — a shared child has none.
+    let spec = match (
+        m["pallama_spec"].as_str().unwrap_or(""),
+        m["pallama_draft"].as_str(),
+    ) {
+        ("", _) => "-".to_string(),
+        (mode, Some(draft)) => format!("{mode}+{draft}"),
+        (mode, None) => mode.to_string(),
+    };
+    let hit = match m["pallama_cache_hit"].as_f64() {
+        Some(r) => format!("{:.0}%", r * 100.0),
+        None => "-".to_string(),
+    };
+    (gpu, spec, hit)
+}
+
 async fn ps(reset: bool, json: bool) -> Result<()> {
     if reset {
         let base = ensure_daemon().await?;
@@ -4356,6 +4385,7 @@ async fn ps(reset: bool, json: bool) -> Result<()> {
                     "ctx": m["pallama_ctx"].as_i64().unwrap_or(0),
                     "gpu": m["pallama_gpu"].as_str().unwrap_or("-"),
                     "device": m["pallama_device"].as_str(),
+                    "cache_hit": m["pallama_cache_hit"].as_f64(),
                     "in_flight": m["pallama_in_flight"].as_i64().unwrap_or(0),
                     "endpoint": m["pallama_endpoint"].as_str().unwrap_or("-"),
                     "warnings": m["pallama_warnings"].as_array().cloned()
@@ -4378,38 +4408,23 @@ async fn ps(reset: bool, json: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<24} {:<9} {:>7} {:>6} {:<20} {:>10}  ENDPOINT",
-        "NAME", "STATE", "CTX", "GPU", "SPEC", "IN_FLIGHT"
+        "{:<24} {:<9} {:>7} {:>6} {:<20} {:>4} {:>10}  ENDPOINT",
+        "NAME", "STATE", "CTX", "GPU", "SPEC", "HIT", "IN_FLIGHT"
     );
     for m in models {
         let display = match m["pallama_replica"].as_i64() {
             Some(r) => format!("{}#{}", m["name"].as_str().unwrap_or("?"), r),
             None => m["name"].as_str().unwrap_or("?").to_string(),
         };
-        // GPU cell: offload label, card-suffixed when placement is known
-        // (`full@RTX 4070`); router/unknown placement stays bare.
-        let gpu = match m["pallama_device"].as_str() {
-            Some(dev) => format!("{}@{}", m["pallama_gpu"].as_str().unwrap_or("-"), dev),
-            None => m["pallama_gpu"].as_str().unwrap_or("-").to_string(),
-        };
-        // Spec cell: the mode this instance spawned under, draft file
-        // suffixed when one rode along (`eagle3+qwen3-0.6b-...gguf`).
-        // Router rows carry an empty mode — a shared child has none.
-        let spec = match (
-            m["pallama_spec"].as_str().unwrap_or(""),
-            m["pallama_draft"].as_str(),
-        ) {
-            ("", _) => "-".to_string(),
-            (mode, Some(draft)) => format!("{mode}+{draft}"),
-            (mode, None) => mode.to_string(),
-        };
+        let (gpu, spec, hit) = ps_row_cells(&m);
         println!(
-            "{:<24} {:<9} {:>7} {:>6} {:<20} {:>10}  {}",
+            "{:<24} {:<9} {:>7} {:>6} {:<20} {:>4} {:>10}  {}",
             display,
             m["pallama_state"].as_str().unwrap_or("?"),
             m["pallama_ctx"].as_i64().unwrap_or(0),
             gpu,
             spec,
+            hit,
             m["pallama_in_flight"].as_i64().unwrap_or(0),
             m["pallama_endpoint"].as_str().unwrap_or("-")
         );

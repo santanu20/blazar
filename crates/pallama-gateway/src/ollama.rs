@@ -407,6 +407,7 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
                 "pallama_warnings": p.warnings,
                 "pallama_spec": p.spec_mode,
                 "pallama_draft": p.draft,
+                "pallama_cache_hit": state.obs.hit_ratio(&p.name),
                 "pallama_in_flight": p.in_flight,
                 "pallama_endpoint": p.endpoint,
                 "pallama_heat": p.heat,
@@ -1505,6 +1506,7 @@ async fn proxy_core_chat(
         // warm/cold from its usage object before translation.
         match openai.get("usage") {
             Some(u) => state.obs.record(
+                model,
                 u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
                 tr::cached_prompt_tokens(openai.get("usage")),
                 ttft_secs,
@@ -1707,6 +1709,7 @@ async fn proxy_core_chat(
                     };
                     match usage.as_ref() {
                         Some(u) => obs.record(
+                            &model,
                             u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
                             tr::cached_prompt_tokens(usage.as_ref()),
                             ttft_secs,
@@ -2693,6 +2696,7 @@ fn cache_metrics(state: &AppState, merged: &mut String) {
     );
     state.obs.ttft_warm.render(merged);
     state.obs.ttft_cold.render(merged);
+    state.obs.render_per_model(merged);
     let live_sessions = state.sup.sessions.live_len(std::time::Duration::from_secs(
         state.config.session_keep_secs,
     ));
