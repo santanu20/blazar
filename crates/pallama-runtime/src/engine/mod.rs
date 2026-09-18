@@ -1756,6 +1756,8 @@ pub fn verify_engine_binary(
 
 #[cfg(test)]
 mod verify_tests {
+    // Established unit__scenario__expected naming convention for the suite.
+    #![allow(non_snake_case)]
     use super::*;
     use pallama_core::engine_kind::EngineKind;
     use std::path::PathBuf;
@@ -1858,7 +1860,7 @@ mod verify_tests {
         );
     }
 
-    /// register_or_clean pins: an unusable binary (exec-format /
+    /// `register_or_clean` pins: an unusable binary (exec-format /
     /// SIGILL-class probe failure) must take its whole engine dir with
     /// it — the engines/b11005-cuda 927 MiB orphan lesson — while a
     /// healthy dir registers normally. Linux-only: the fixtures are

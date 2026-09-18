@@ -410,7 +410,7 @@ UNINSTALL="$ROOT/scripts/uninstall.sh"
 UENV="HOME=$TMP/home PALLAMA_SUDO=$TMP/fakesudo PALLAMA_SYSTEMCTL=$TMP/fakesystemctl PALLAMA_SYSTEM_BIN_DIR=$SYSTEM_BIN PALLAMA_UNIT_PATH=$UNIT_OUT"
 
 stage_installed() {
-    rm -rf "$TMP/home" "$SYSTEM_BIN" ; mkdir -p "$TMP/home"
+    rm -rf "${TMP:?}/home" "${SYSTEM_BIN:?}" ; mkdir -p "$TMP/home"
     D="$TMP/home/.local/share/pallama"
     mkdir -p "$D/models" "$D/engines/b1" "$D/whisper/models" "$D/whisper/bin" "$D/run" \
              "$TMP/home/.config/pallama" "$SYSTEM_BIN"

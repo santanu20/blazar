@@ -1569,6 +1569,10 @@ impl Drop for LoadAbort<'_> {
     }
 }
 
+/// Routed (engine, tag) pick for a model row: `Ok(None)` = serve with the
+/// global active engine.
+type RoutedPick = Result<Option<(Arc<dyn Engine>, String)>, String>;
+
 impl Supervisor {
     #[allow(clippy::unused_self)] // symmetrical with future instance methods
     fn engine_ref(&self, key: &str, inst: &Instance) -> EngineRef {
@@ -2116,7 +2120,7 @@ impl Supervisor {
         store: &Store,
         overlay: &pallama_core::config::ModelOverride,
         model: &pallama_core::store::ModelRow,
-    ) -> Result<Option<(Arc<dyn Engine>, String)>, String> {
+    ) -> RoutedPick {
         use pallama_core::engine_kind::EngineKind;
 
         let rows = store
@@ -2196,6 +2200,9 @@ impl Supervisor {
             })
     }
 
+    // Full child lifecycle in one pass: argv build, spawn, settle, health
+    // gate, registration. Splitting it would scatter the invariants.
+    #[allow(clippy::too_many_lines)]
     async fn spawn_instance(&self, key: &str) -> Result<EngineRef, SupervisionError> {
         let name = model_of_key(key);
         let store =
@@ -4143,15 +4150,15 @@ mod routing_tests {
         // precompiled lanes keep the tight 180 s).
         assert_eq!(
             Supervisor::resolved_load_timeout(None, K::Sglang),
-            D::from_secs(600)
+            D::from_mins(10)
         );
         assert_eq!(
             Supervisor::resolved_load_timeout(None, K::LlamaCpp),
-            D::from_secs(180)
+            D::from_mins(3)
         );
         assert_eq!(
             Supervisor::resolved_load_timeout(None, K::MistralRs),
-            D::from_secs(180)
+            D::from_mins(3)
         );
         // User-set pins EVERY lane — the explicit knob wins, never
         // silently widened by the per-kind fallback.

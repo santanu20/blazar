@@ -595,7 +595,6 @@ fn register_stable(
                 last = Some(e);
                 if transient && attempt < 3 {
                     std::thread::sleep(std::time::Duration::from_millis(250));
-                    continue;
                 }
             }
         }

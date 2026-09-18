@@ -1132,7 +1132,7 @@ mod tests {
     /// must outlive it or the poll declares a healthy child dead (the
     /// live failure: uvicorn logged a steady stream of 200s the daemon
     /// never completed within its old 2s budget, so every spawn was
-    /// killed at model_load_timeout).
+    /// killed at `model_load_timeout`).
     async fn probe_latency_health_stub(latency: std::time::Duration) -> u16 {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -1144,8 +1144,8 @@ mod tests {
                     return;
                 };
                 tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 4096];
-                    use tokio::io::AsyncReadExt;
                     loop {
                         let Ok(n) = sock.read(&mut buf).await else {
                             return;
@@ -1155,7 +1155,6 @@ mod tests {
                         }
                     }
                     tokio::time::sleep(latency).await;
-                    use tokio::io::AsyncWriteExt;
                     let _ = sock
                         .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
                         .await;

@@ -468,6 +468,23 @@ async fn forward_once(
     .await
 }
 
+/// Abort-safe finisher: `Drop` runs on clean drain AND client abort.
+struct FinishSniffer(
+    Option<crate::keys::UsageSniffer>,
+    std::sync::Arc<crate::keys::KeysLimiter>,
+);
+impl Drop for FinishSniffer {
+    fn drop(&mut self) {
+        if let Some(s) = self.0.take() {
+            s.finish(&self.1);
+        }
+    }
+}
+
+// The forwarding core: every per-request concern (auth, tracing, model
+// rewrite, singleflight, sentinel) is deliberately threaded through this
+// one signature rather than hidden in shared state.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn proxy_request(
     state: &Arc<AppState>,
     engine: &EngineRef,
@@ -747,18 +764,6 @@ pub async fn proxy_request(
     // for this generation. Observing is infallible (atomics only); the
     // stream's data/errors pass through untouched. The in-flight guard
     // chain below still owns the body lifetime.
-    /// Abort-safe finisher: `Drop` runs on clean drain AND client abort.
-    struct FinishSniffer(
-        Option<crate::keys::UsageSniffer>,
-        std::sync::Arc<crate::keys::KeysLimiter>,
-    );
-    impl Drop for FinishSniffer {
-        fn drop(&mut self) {
-            if let Some(s) = self.0.take() {
-                s.finish(&self.1);
-            }
-        }
-    }
     let start = std::time::Instant::now();
     let mut first_chunk = true;
     let mut last_chunk = start;

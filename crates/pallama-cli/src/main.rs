@@ -1421,7 +1421,7 @@ async fn install_offer_kinds(
                     "engine ready — this model now has a serving lane (skipped: {})",
                     failures
                         .iter()
-                        .map(|k| k.to_string())
+                        .map(std::string::ToString::to_string)
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
@@ -1431,6 +1431,7 @@ async fn install_offer_kinds(
     }
 }
 
+#[allow(clippy::too_many_lines)] // report builder: one row per subsystem, cohesive
 async fn doctor(flat: bool, json: bool) -> Result<()> {
     let d = dirs();
     let mut checks: Vec<Check> = Vec::new();
@@ -1548,10 +1549,10 @@ async fn doctor(flat: bool, json: bool) -> Result<()> {
             let fail_n = rows.iter().filter(|c| !c.ok).count();
             let mut rollup = format!("{ok_n} ok");
             if warn_n > 0 {
-                rollup.push_str(&format!(", {warn_n} warn"));
+                let _ = write!(rollup, ", {warn_n} warn");
             }
             if fail_n > 0 {
-                rollup.push_str(&format!(", {fail_n} FAIL"));
+                let _ = write!(rollup, ", {fail_n} FAIL");
             }
             println!("  ({rollup})\n");
         }
@@ -1589,9 +1590,8 @@ fn doctor_routing(d: &pallama_core::dirs::PallamaDirs) -> Vec<Check> {
         _ => return Vec::new(),
     };
     let cfg = pallama_core::Config::load(d).unwrap_or_default();
-    let engine_rows = match store.list_engines() {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
+    let Ok(engine_rows) = store.list_engines() else {
+        return Vec::new();
     };
     let installed: Vec<(String, pallama_core::engine_kind::EngineKind)> = engine_rows
         .iter()
@@ -1688,9 +1688,14 @@ async fn doctor_gpu(d: &PallamaDirs) -> Vec<Check> {
         if let Ok(store) = Store::open(d) {
             if let Ok(models) = store.list_models() {
                 if let Some(big) = models.iter().max_by_key(|m| m.bytes) {
+                    // display + MiB-fit heuristic: precision/sign loss is irrelevant here
+                    #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
+                    let fits = (big.bytes as u64 / 1_048_576) < vram as u64;
+                    #[allow(clippy::cast_precision_loss)]
                     let gib = big.bytes as f64 / 1_073_741_824.0;
+                    #[allow(clippy::cast_precision_loss)]
                     let vram_gib = vram as f64 / 1024.0;
-                    if (big.bytes as u64 / 1_048_576) < vram as u64 {
+                    if fits {
                         out.push(Check::ok(
                             "gpu fit",
                             format!("largest model {} ({gib:.1} GiB) fits VRAM ({vram_gib:.1} GiB) — KV cache has headroom", big.name),
@@ -1749,7 +1754,7 @@ fn dir_bytes_deep(p: &std::path::Path) -> u64 {
     for e in rd.flatten() {
         match e.file_type() {
             Ok(ft) if ft.is_dir() => n += dir_bytes_deep(&e.path()),
-            Ok(_) => n += e.metadata().map(|m| m.len()).unwrap_or(0),
+            Ok(_) => n += e.metadata().map_or(0, |m| m.len()),
             Err(_) => {}
         }
     }
@@ -1757,7 +1762,7 @@ fn dir_bytes_deep(p: &std::path::Path) -> u64 {
 }
 
 /// ENGINES section additions: per-kind inventory (tag, size,
-/// provenance) and retention vs the per-kind KEEP_TAGS policy.
+/// provenance) and retention vs the per-kind `KEEP_TAGS` policy.
 fn doctor_engines(d: &PallamaDirs) -> Vec<Check> {
     let mut out = Vec::new();
     let Ok(store) = Store::open(d) else {
@@ -1783,6 +1788,7 @@ fn doctor_engines(d: &PallamaDirs) -> Vec<Check> {
         let entries: Vec<String> = rows
             .iter()
             .map(|e| {
+                #[allow(clippy::cast_precision_loss)] // GiB display
                 let gib = dir_bytes_deep(&d.engines_dir().join(&e.tag)) as f64 / 1_073_741_824.0;
                 let provenance = if e.asset.starts_with("built-") {
                     "source-built"
@@ -1960,12 +1966,13 @@ fn doctor_model_types(d: &PallamaDirs) -> Vec<Check> {
     }
     let mut detail = format!("{gguf} gguf, {st} safetensors");
     if other > 0 {
-        detail.push_str(&format!(", {other} other"));
+        let _ = write!(detail, ", {other} other");
     }
     if missing > 0 {
-        detail.push_str(&format!(
+        let _ = write!(
+            detail,
             ", {missing} MISSING (stale rows — `pallama rm` or re-pull)"
-        ));
+        );
     }
     if missing > 0 {
         vec![Check::warn("model types", detail)]
@@ -1979,6 +1986,7 @@ mod doctor_tests {
     use super::*;
 
     #[test]
+    #[allow(non_snake_case)]
     fn unit__quantize_temp__drop_removes_partial_defuse_keeps() {
         let dir = std::env::temp_dir();
         // Armed guard: any early return drops the partial write with it.
@@ -1996,6 +2004,8 @@ mod doctor_tests {
         let _ = std::fs::remove_file(&done_path);
     }
 
+    #[test]
+    #[allow(non_snake_case)]
     fn unit__doctor_group__known_names_map_and_order_is_stable() {
         assert_eq!(doctor_group("engine"), "ENGINES");
         assert_eq!(doctor_group("inventory sglang"), "ENGINES");
@@ -3544,7 +3554,7 @@ async fn serve() -> Result<()> {
                     println!(
                         "router mode: serving with llamacpp engine {} (active is {})",
                         row.tag,
-                        active.map(|a| a.tag).unwrap_or_else(|| "none".into())
+                        active.map_or_else(|| "none".into(), |a| a.tag)
                     );
                     Some(row)
                 }
@@ -4015,12 +4025,10 @@ fn model_type_label(path: &str) -> String {
     if !md.is_dir() {
         return "gguf".to_string();
     }
-    let has_safetensors = std::fs::read_dir(path)
-        .map(|rd| {
-            rd.filter_map(Result::ok)
-                .any(|e| e.file_name().to_string_lossy().ends_with(".safetensors"))
-        })
-        .unwrap_or(false);
+    let has_safetensors = std::fs::read_dir(path).is_ok_and(|rd| {
+        rd.filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().ends_with(".safetensors"))
+    });
     if has_safetensors {
         "safetensors".to_string()
     } else {
@@ -4068,8 +4076,9 @@ fn render_list_table(header: [&str; 9], rows: &[[String; 9]]) -> String {
     };
     let mut out = String::new();
     for r in &cells {
-        out.push_str(&format!(
-            "{:<n$}  {:<q$}  {:>s$}  {:<v$}  {:<a$}  {:>c$}  {:<t$}  {:<e$}  {}\n",
+        let _ = writeln!(
+            out,
+            "{:<n$}  {:<q$}  {:>s$}  {:<v$}  {:<a$}  {:>c$}  {:<t$}  {:<e$}  {}",
             r[0],
             r[1],
             r[2],
@@ -4087,7 +4096,7 @@ fn render_list_table(header: [&str; 9], rows: &[[String; 9]]) -> String {
             c = width(5),
             t = width(6),
             e = width(7),
-        ));
+        );
     }
     out.trim_end().to_string()
 }
@@ -4114,11 +4123,10 @@ fn list(json: bool) -> Result<()> {
         // projector configured (0 = configured but missing on disk),
         // engine null = nothing installed serves the model.
         for m in &models {
-            let mmproj_bytes = m.mmproj_path.as_ref().map(|p| {
-                std::fs::metadata(p)
-                    .map(|md| u64::try_from(md.len()).unwrap_or(u64::MAX))
-                    .unwrap_or(0)
-            });
+            let mmproj_bytes = m
+                .mmproj_path
+                .as_ref()
+                .map(|p| std::fs::metadata(p).map_or(0, |md| md.len()));
             let engine = routed_engine_lane(&cfg, global.as_ref(), &installed, &m.name, &m.path)
                 .ok()
                 .and_then(|lane| (!lane.is_empty()).then_some(lane));
@@ -5583,8 +5591,8 @@ fn install_repl_sigint() {
         let mut act: libc::sigaction = std::mem::zeroed();
         act.sa_sigaction = stash_sigint as *const () as usize;
         act.sa_flags = 0;
-        libc::sigemptyset(&mut act.sa_mask);
-        if libc::sigaction(libc::SIGINT, &act, &raw mut old) == 0 {
+        libc::sigemptyset(&raw mut act.sa_mask);
+        if libc::sigaction(libc::SIGINT, &raw const act, &raw mut old) == 0 {
             *SIGINT_RESTORE.lock().unwrap() = Some(old);
         }
     }
@@ -5763,7 +5771,7 @@ async fn run_repl(model: &str) -> Result<()> {
 /// the daemon frees the slot on client disconnect (validated behavior).
 ///
 /// The interrupt travels via an async-signal-safe flag checked per chunk:
-/// tokio's ctrl_c listener can stay unresolved for the whole stream under
+/// tokio's `ctrl_c` listener can stay unresolved for the whole stream under
 /// chunk-flood load (live-proven on this runtime), so the REPL must not
 /// depend on the async signal scheduler for this.
 async fn repl_turn(
@@ -6648,7 +6656,7 @@ fn table_header(path: &[&str]) -> String {
 /// Every other line survives byte-for-byte; an existing leaf line is
 /// replaced in place.
 fn set_table_key(raw: &str, path: &[&str], leaf: &str, stored: &str) -> String {
-    let want: Vec<String> = path.iter().map(|s| s.to_string()).collect();
+    let want: Vec<String> = path.iter().map(std::string::ToString::to_string).collect();
     let lines: Vec<&str> = raw.lines().collect();
     let newline = format!("{leaf} = {stored}");
     if let Some(h) = lines
@@ -6685,7 +6693,10 @@ fn set_table_key(raw: &str, path: &[&str], leaf: &str, stored: &str) -> String {
     // else append at EOF.
     let mut insert_at = lines.len();
     for depth in (1..path.len()).rev() {
-        let prefix: Vec<String> = path[..depth].iter().map(|s| s.to_string()).collect();
+        let prefix: Vec<String> = path[..depth]
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
         if let Some(h) = lines
             .iter()
             .position(|l| header_segments(l).is_some_and(|segs| segs == prefix))
@@ -6709,7 +6720,7 @@ fn set_table_key(raw: &str, path: &[&str], leaf: &str, stored: &str) -> String {
 /// Read `path.leaf` from the config file (pins only — table knobs have no
 /// defaults in the serialized document). Returns the pinned line, if any.
 fn get_table_key(raw: &str, path: &[&str], leaf: &str) -> Option<String> {
-    let want: Vec<String> = path.iter().map(|s| s.to_string()).collect();
+    let want: Vec<String> = path.iter().map(std::string::ToString::to_string).collect();
     let lines: Vec<&str> = raw.lines().collect();
     let h = lines
         .iter()
@@ -6719,8 +6730,7 @@ fn get_table_key(raw: &str, path: &[&str], leaf: &str) -> Option<String> {
         .enumerate()
         .skip(h + 1)
         .find(|(_, l)| l.trim_start().starts_with('['))
-        .map(|(i, _)| i)
-        .unwrap_or(lines.len());
+        .map_or(lines.len(), |(i, _)| i);
     lines[h + 1..end]
         .iter()
         .find(|l| key_before_eq(l.trim_start()) == Some(leaf))
@@ -6730,7 +6740,7 @@ fn get_table_key(raw: &str, path: &[&str], leaf: &str) -> Option<String> {
 /// Remove a table-scoped pin (`path.leaf`). The table header survives
 /// (empty sections are harmless); returns the removed line, if any.
 fn remove_table_key(raw: &str, path: &[&str], leaf: &str) -> (String, Option<String>) {
-    let want: Vec<String> = path.iter().map(|s| s.to_string()).collect();
+    let want: Vec<String> = path.iter().map(std::string::ToString::to_string).collect();
     let lines: Vec<&str> = raw.lines().collect();
     let Some(h) = lines
         .iter()
@@ -6743,8 +6753,7 @@ fn remove_table_key(raw: &str, path: &[&str], leaf: &str) -> (String, Option<Str
         .enumerate()
         .skip(h + 1)
         .find(|(_, l)| l.trim_start().starts_with('['))
-        .map(|(i, _)| i)
-        .unwrap_or(lines.len());
+        .map_or(lines.len(), |(i, _)| i);
     if let Some(leaf_idx) = lines[h + 1..end]
         .iter()
         .position(|l| key_before_eq(l.trim_start()) == Some(leaf))
@@ -6875,6 +6884,7 @@ fn engine_regression_gate(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // command dispatch: one arm per engine subcommand
 async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
     let d = dirs();
     match cmd {
@@ -6950,7 +6960,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             match pallama_runtime::whisper::installed_tags(&d).first() {
                 Some(tag) => println!("whisper:    {tag} (voice lane) — pallama whisper --list"),
                 None => {
-                    println!("whisper:    not installed (voice lane) — pallama whisper --install")
+                    println!("whisper:    not installed (voice lane) — pallama whisper --install");
                 }
             }
         }
@@ -7081,9 +7091,12 @@ async fn engine_install_mistralrs(d: &PallamaDirs, tag: Option<String>) -> Resul
     // superseded mistral.rs dirs free their space on a successful
     // install/activate.
     for (tag, bytes) in mgr.prune_siblings(EngineKind::MistralRs.as_str(), &row.tag)? {
+        // fs sizes fit i64
+        #[allow(clippy::cast_possible_wrap)]
+        let freed = bytes as i64;
         println!(
             "removed superseded engine {tag} (freed {})",
-            humansize(bytes as i64)
+            humansize(freed)
         );
     }
     Ok(())
@@ -7198,10 +7211,13 @@ async fn engine_install_sglang(d: &PallamaDirs, version: Option<String>) -> Resu
     // superseded sglang venvs (multi-GB each) are freed on a successful
     // install/activate.
     for (tag, bytes) in mgr.prune_siblings(EngineKind::Sglang.as_str(), &row.tag)? {
+        // fs sizes fit i64
+        #[allow(clippy::cast_possible_wrap)]
+        let freed = bytes as i64;
         println!(
             "removed superseded engine {} (freed {})",
             tag,
-            humansize(bytes as i64)
+            humansize(freed)
         );
     }
     println!("next: pull a safetensors model (e.g. pallama pull Qwen/Qwen2.5-0.5B-Instruct)");
@@ -7356,6 +7372,7 @@ async fn route_update_to_build(
     }
 }
 
+#[allow(clippy::too_many_lines)] // lane chain: resolve, download, install, register, prune
 async fn engine_update(
     d: &PallamaDirs,
     tag: Option<String>,
@@ -7508,12 +7525,17 @@ async fn engine_update(
     let mut freed_gib = 0.0;
     if !unchanged && row.active {
         for (tag, bytes) in mgr.prune_siblings(row.kind.as_str(), &row.tag)? {
+            // fs sizes fit i64; freed-GiB is a display rounding
+            #[allow(clippy::cast_possible_wrap)]
+            let freed = bytes as i64;
             println!(
                 "removed superseded engine {} (freed {})",
                 tag,
-                humansize(bytes as i64)
+                humansize(freed)
             );
-            freed_gib += bytes as f64 / GIB_F64;
+            #[allow(clippy::cast_precision_loss)]
+            let freed_gib_delta = freed as f64 / GIB_F64;
+            freed_gib += freed_gib_delta;
         }
         if freed_gib > 0.0 {
             println!("lane {} now holds only {target_tag}", row.kind);
@@ -7543,7 +7565,7 @@ async fn engine_update(
             row.tag
         );
     }
-    if !unchanged {}
+
     Ok(())
 }
 
@@ -7635,10 +7657,13 @@ async fn engine_build(d: &PallamaDirs, a: BackendArg) -> Result<()> {
         // One-build-per-lane contract (see `engine_update`): a freshly
         // built AND activated engine frees its superseded siblings.
         for (tag, bytes) in mgr.prune_siblings(row.kind.as_str(), &row.tag)? {
+            // fs sizes fit i64
+            #[allow(clippy::cast_possible_wrap)]
+            let freed = bytes as i64;
             println!(
                 "removed superseded engine {} (freed {})",
                 tag,
-                humansize(bytes as i64)
+                humansize(freed)
             );
         }
     } else {
@@ -7977,6 +8002,7 @@ fn human_count(n: u64) -> String {
     }
 }
 
+#[allow(clippy::too_many_lines)] // result table renderer: header, rows, footer
 async fn search(query: &str, format: &str, json: bool) -> Result<()> {
     let token = std::env::var("HF_TOKEN").ok();
     let client = pallama_runtime::hf::HfClient::new(token)?;
@@ -8155,10 +8181,11 @@ fn format_of_entry(r: &pallama_runtime::hf::SearchEntry) -> String {
 /// free root metadata; otherwise the safetensors dtype-derived byte
 /// estimate (width × count — what `pull` actually downloads).
 fn entry_size_bytes(r: &pallama_runtime::hf::SearchEntry) -> Option<u64> {
-    r.gguf
-        .as_ref()
-        .and_then(|g| g.total)
-        .or_else(|| r.safetensors.as_ref().and_then(|s| s.byte_estimate()))
+    r.gguf.as_ref().and_then(|g| g.total).or_else(|| {
+        r.safetensors
+            .as_ref()
+            .and_then(pallama_runtime::hf::HfSafetensorsInfo::byte_estimate)
+    })
 }
 
 /// ARCH for a search row: gguf architecture > config `model_type` >
@@ -8299,6 +8326,7 @@ async fn fit(target: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // command dispatch: one arm per config subcommand
 fn config_cmd(cmd: ConfigCmd) -> Result<()> {
     match cmd {
         ConfigCmd::List => {
@@ -8597,7 +8625,11 @@ mod tests {
 
     #[test]
     fn unit__format_of__specific_tag_beats_container() {
-        let tags = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let tags = |v: &[&str]| {
+            v.iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+        };
         // MLX and AWQ repos ALSO carry `safetensors` — the specific tag
         // wins because it is the actionable one for engine routing.
         assert_eq!(format_of(&tags(&["safetensors", "mlx"])), "mlx");
@@ -8623,7 +8655,7 @@ mod tests {
             gguf: None,
             safetensors: None,
             config: None,
-            tags: tags.iter().map(|s| s.to_string()).collect(),
+            tags: tags.iter().map(std::string::ToString::to_string).collect(),
         };
         assert_eq!(
             format_of_entry(&entry("openbmb/MiniCPM5-1B-MLX", &["safetensors"])),
@@ -8699,7 +8731,7 @@ mod tests {
         assert_eq!(entry_size_bytes(&base(None, None, None)), None);
         // ARCH ladder: gguf > model_type > first architecture lowercased.
         let cfg = |mt: Option<&str>, archs: Option<&[&str]>| pallama_runtime::hf::HfConfigSummary {
-            architectures: archs.map(|a| a.iter().map(|s| s.to_string()).collect()),
+            architectures: archs.map(|a| a.iter().map(std::string::ToString::to_string).collect()),
             model_type: mt.map(str::to_string),
         };
         assert_eq!(

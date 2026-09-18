@@ -6567,8 +6567,10 @@ mod tests {
         let g = meta();
         let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
         inp.model_bytes = 379 * MIB;
-        let mut ov = ModelOverride::default();
-        ov.slots = Some(2);
+        let ov = ModelOverride {
+            slots: Some(2),
+            ..Default::default()
+        };
         inp.overlay = &ov;
         let p = compile(
             &inp,

@@ -10,15 +10,12 @@ use std::collections::BTreeSet;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let (model, mmproj) = match (args.next(), args.next()) {
-        (Some(m), Some(p)) => (m, p),
-        _ => {
-            eprintln!(
-                "usage: cargo run --example slots_probe -p pallama-core -- \
-                 <model.gguf> <mmproj.gguf>"
-            );
-            std::process::exit(2);
-        }
+    let (Some(model), Some(mmproj)) = (args.next(), args.next()) else {
+        eprintln!(
+            "usage: cargo run --example slots_probe -p pallama-core -- \
+             <model.gguf> <mmproj.gguf>"
+        );
+        std::process::exit(2);
     };
     let gguf = read_metadata_file(std::path::Path::new(&model))?;
     println!("train ctx = {:?}", gguf.context_length);

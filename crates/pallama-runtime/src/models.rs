@@ -172,6 +172,9 @@ pub struct ReconcileReport {
 /// pull lane (safetensors); `repo` carries an `adopted:<path>` marker so
 /// adopted rows are identifiable in `pallama list`.
 #[must_use]
+// One cohesive adoption pass (dirs -> shard sets -> singles -> sidecar
+// backfill); extracted helpers already carry the real logic.
+#[allow(clippy::too_many_lines)]
 pub fn reconcile_models(dirs: &PallamaDirs, store: &Store) -> ReconcileReport {
     let mut report = ReconcileReport {
         adopted: Vec::new(),
@@ -1077,7 +1080,7 @@ mod tests {
             .get_model("qwen2.5-0.5b-instruct-fp16")
             .unwrap()
             .unwrap();
-        assert!(gguf_row.path.ends_with(".gguf"));
+        assert!(gguf_row.path.to_ascii_lowercase().ends_with(".gguf"));
     }
 
     #[test]
@@ -1353,7 +1356,7 @@ mod tests {
         let d = dirs.models_dir();
         write_gguf(&d.join("plain-q4_k_m.gguf"), "llama", Some("My Model 8B"));
         let store = Store::open(&dirs).unwrap();
-        reconcile_models(&dirs, &store);
+        let _report = reconcile_models(&dirs, &store);
         assert!(
             store.get_model("my-model-8b").unwrap().is_some(),
             "meta.name dialect, dots kept"
@@ -1376,7 +1379,7 @@ mod tests {
         .unwrap();
         std::fs::write(st.join("model.safetensors"), b"aaaa").unwrap();
         let store = Store::open(&dirs).unwrap();
-        reconcile_models(&dirs, &store);
+        let _report = reconcile_models(&dirs, &store);
         assert!(store.get_model("qwen2.5-0.5b-instruct").unwrap().is_some());
 
         write_gguf(

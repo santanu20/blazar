@@ -1091,12 +1091,11 @@ mod tests {
             .await
             .expect("read body");
         let v: serde_json::Value = serde_json::from_slice(&body).expect("json body");
-        assert_eq!(
+        assert!(
             v["error"]["message"]
                 .as_str()
                 .expect("message")
                 .contains("engine install --kind sglang"),
-            true,
             "teaching remedy must survive the mapping"
         );
     }

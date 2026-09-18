@@ -1046,7 +1046,7 @@ pub struct FitRow {
 }
 
 /// Rule-6 KV ladder outcome for `bytes` of weights against `vram_bytes`:
-/// (fits at default ctx, recommended ctx, ctx with q8_0 KV). The same
+/// (fits at default ctx, recommended ctx, ctx with `q8_0` KV). The same
 /// f16 → q8 → q4 halving the profile compiler applies, pre-download.
 fn kv_ladder(bytes: u64, vram_bytes: u64, default_ctx: u32) -> (bool, u32, u32) {
     let kv_f16 = kv_estimate_f16(default_ctx);
@@ -1605,7 +1605,7 @@ impl Puller {
             &digest,
             &target.repo,
             name,
-        )? {
+        ) {
             return Ok(outcome);
         }
 
@@ -1682,10 +1682,8 @@ impl Puller {
         digest: &str,
         repo: &str,
         name: &str,
-    ) -> Result<Option<PullOutcome>> {
-        let Some(row) = existing else {
-            return Ok(None);
-        };
+    ) -> Option<PullOutcome> {
+        let row = existing?;
         let same_revision = row.repo == repo
             && row
                 .sha256
@@ -1702,10 +1700,10 @@ impl Puller {
                 name: name.to_string(),
                 warning: None,
             });
-            return Ok(Some(PullOutcome {
+            return Some(PullOutcome {
                 row: row.clone(),
                 already_present: true,
-            }));
+            });
         }
         // Different revision (or damaged dir): replace. A previous
         // dir row at a different path is removed wholesale; a GGUF
@@ -1726,7 +1724,7 @@ impl Puller {
         } else {
             prune_replaced(name, row, &[], "replaced by a safetensors pull");
         }
-        Ok(None)
+        None
     }
 
     /// Full-download phase of [`Self::pull_locked`]: one shared progress bar
