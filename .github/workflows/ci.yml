@@ -16,7 +16,11 @@ jobs:
         # probes, .exe tool discovery, taskkill stop, detached spawn) —
         # a Linux-only matrix left them structurally untestable.
         # ubuntu-22.04 stays the glibc floor the release binaries target.
-        os: [ubuntu-22.04, windows-latest, macos-latest]
+        # main is the published release-candidate branch: it runs the
+        # ubuntu floor only — cross-OS coverage comes from the tag-driven
+        # release build+smoke matrix. The dev branch and every PR run
+        # the full matrix.
+        os: ${{ github.ref_name == 'main' && fromJSON('["ubuntu-22.04"]') || fromJSON('["ubuntu-22.04", "windows-latest", "macos-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -78,9 +82,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Machine-specific absolute paths and AI-agent artifacts were
-      # caught only in manual pre-release scans (AGENTS.md absolute-path
-      # gate + AI-artifact gate); one straggler shipped before being
-      # caught. The script self-tests both directions on every run.
+      # Keeps the tree free of machine-specific absolute paths and
+      # AI-agent artifacts (unexplained external project names, agent
+      # scratch paths) — the classes a code review easily misses. The
+      # script self-tests both directions on every run.
       - run: shellcheck -S warning scripts/check_hygiene.sh
       - run: sh scripts/check_hygiene.sh

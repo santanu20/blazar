@@ -1,8 +1,9 @@
 #!/bin/sh
 # Hygiene gates: machine-specific absolute paths + AI-agent artifacts.
-# Blocks the release classes codified in AGENTS.md (absolute-path gate,
-# AI-artifact gate) at CI time instead of relying on manual pre-push
-# scans. Exits non-zero listing every offending file:line.
+# Blocks the classes a code review easily misses — real home dirs and
+# agent scratch paths baked into comments/fixtures, external project
+# names leaking into shipped source — at CI time. Exits non-zero
+# listing every offending file:line.
 #
 # Usage: check_hygiene.sh [paths...]
 #   With no args, scans every git-tracked file. Explicit paths are
@@ -33,6 +34,14 @@ scan_files() {
     while IFS= read -r f; do
         [ -f "$f" ] || continue
         [ "$f" = "CHANGELOG.md" ] && continue
+        # The scanner's own pattern vocabulary is not a violation,
+        # however the script and target were spelled (rel/abs).
+        case "$f" in
+            "$0"|*/"$0") continue ;;
+        esac
+        case "$0" in
+            "$f"|*/"$f") continue ;;
+        esac
         grep -HnE "$PATH_PATTERNS|$ARTIFACT_PATTERNS" -- "$f" 2>/dev/null |
             grep -vE "^$ALLOWLIST$" || true
     done
