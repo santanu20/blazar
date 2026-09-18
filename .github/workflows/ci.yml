@@ -61,9 +61,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/ruff-action@v3
       # F161: the harness had no CI lint gate — the F9 ruff errors lived
-      # in the tree for months, uncatchable.
+      # in the tree for months, uncatchable. Version is pinned so new
+      # ruff releases cannot flip CI red overnight; ruff.toml freezes
+      # the rule set, this freezes the binary.
+      - run: python3 -m pip install ruff==0.16.8
       - run: ruff check scripts/
       - run: python3 -m py_compile scripts/*.py
 

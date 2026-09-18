@@ -32,23 +32,24 @@ import atexit
 import hashlib
 import json
 import os
-from os.path import abspath, dirname
-from pathlib import Path
 import re
 import shutil
 import signal
 import socket
-import ssl
 import sqlite3
+import ssl
 import subprocess
 import sys
 import tempfile
-import traceback
-import urllib.request
 import threading
 import time
-import tomllib
+import traceback
 import urllib.error
+import urllib.request
+from os.path import abspath, dirname
+from pathlib import Path
+
+import tomllib
 
 
 def _free_port() -> int:
@@ -100,8 +101,8 @@ MEM_FLOOR_MIB = 1536
 
 CHECKS: list[dict] = []
 COVERAGE: list[dict] = []
-DAEMON: "Daemon | None" = None
-SANDBOX: "Sandbox | None" = None
+DAEMON: Daemon | None = None
+SANDBOX: Sandbox | None = None
 USER_CONFIG_SHA = None
 
 
@@ -1932,7 +1933,7 @@ def disk_free_gb(path: str = REAL_DATA) -> float:
 
 
 def _metric_value(raw: bytes, name: str) -> float | None:
-    m = re.search(rb"^" + name.encode() + rb" ([0-9.eE+-]+)", raw, re.M)
+    m = re.search(rb"^" + name.encode() + rb" ([0-9.eE+-]+)", raw, re.MULTILINE)
     return float(m.group(1)) if m else None
 
 
@@ -1991,7 +1992,7 @@ def model_bytes_mib(name: str = MODEL) -> int:
         by_name = {n: b for n, b in rows if b}
         if name in by_name:
             return by_name[name] // (1024 * 1024)
-        base = name.split(":")[0]
+        base = name.split(":", maxsplit=1)[0]
         if base in by_name:
             return by_name[base] // (1024 * 1024)
         candidates = [n for n in by_name if n.startswith(base)]
@@ -2022,6 +2023,7 @@ def _gpu_free_mib() -> int:
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
         if out.returncode == 0:
             return max(int(x) for x in out.stdout.split())
@@ -2049,6 +2051,7 @@ def _gpu_compute_holders() -> list[str]:
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
         if out.returncode == 0:
             return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
@@ -2277,7 +2280,7 @@ class Daemon:
             except ProcessLookupError:
                 pass
 
-        log = open(self.log_path, "ab")
+        log = open(self.log_path, "ab")  # noqa: SIM115 — daemon append log, lives with the child
         self.proc = subprocess.Popen(
             [PAL, serve_cmd],
             env=self.sb.env(env_extra),
@@ -2309,7 +2312,9 @@ class Daemon:
                         )
             except Exception:
                 if self.proc.poll() is not None:
-                    raise RuntimeError(f"daemon exited early; log:\n{self.tail_log()}")
+                    raise RuntimeError(
+                        f"daemon exited early; log:\n{self.tail_log()}"
+                    ) from None
                 time.sleep(0.5)
         raise RuntimeError(f"daemon not healthy in 240s; log:\n{self.tail_log()}")
 
@@ -2383,7 +2388,7 @@ class Daemon:
             if not pid_dir.name.isdigit():
                 continue
             pid = int(pid_dir.name)
-            if pid == me or pid == exclude:
+            if pid in (me, exclude):
                 continue
             try:
                 environ = (pid_dir / "environ").read_bytes()
@@ -2641,7 +2646,7 @@ def sse_collect(
         while b"\r\n\r\n" not in buf and time.time() < deadline:
             try:
                 r = s.recv(4096)
-            except socket.timeout:
+            except TimeoutError:
                 continue
             if not r:
                 break
@@ -2679,7 +2684,7 @@ def sse_collect(
                 return True, out.decode(errors="replace")
             try:
                 r = s.recv(4096)
-            except socket.timeout:
+            except TimeoutError:
                 continue
             if not r:
                 break
@@ -2742,7 +2747,7 @@ def wait_loaded(model: str = MODEL, budget: float = 300.0) -> dict | None:
     while time.time() < deadline:
         for row in ps_rows():
             name = str(ps_field(row, "name", "model") or "")
-            if name.split(":")[0] == model:
+            if name.split(":", maxsplit=1)[0] == model:
                 return row
         time.sleep(1)
     return None
@@ -2895,7 +2900,12 @@ def cli(
 ) -> subprocess.CompletedProcess:
     assert SANDBOX is not None
     p = subprocess.run(
-        [PAL, *args], env=SANDBOX.env(), capture_output=True, text=True, timeout=timeout
+        [PAL, *args],
+        env=SANDBOX.env(),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
     )
     if check_exit and p.returncode != 0:
         print(f"    cli stderr: {p.stderr.strip()[:400]}")
@@ -3010,7 +3020,7 @@ def phase_baseline() -> None:
         "" if row else "no ps row after load",
     )
     # Banner attribution (the anti-ollama complaint).
-    p = subprocess.run([PAL, "--help"], capture_output=True, text=True)
+    p = subprocess.run([PAL, "--help"], capture_output=True, text=True, check=False)
     check(
         "baseline",
         "--help carries llama.cpp credit",
@@ -3041,7 +3051,7 @@ def phase_config() -> None:
             "override_tensor": [".ffn_.*_exps.=CPU"],
         }
     )
-    st, v, _ = chat("Say ok")
+    chat("Say ok")
     pid = child_pid()
     argv = child_argv(pid) if pid else []
 
@@ -3257,7 +3267,7 @@ def phase_config() -> None:
                 )
 
     # ps rows carry the resolved GPU-offload label.
-    st, v, _ = chat("Say ok")
+    chat("Say ok")
     rows = ps_rows()
     gpu = rows and ps_field(rows[0], "pallama_gpu", "gpu")
     check(
@@ -3838,13 +3848,13 @@ def phase_api() -> None:
     if batch_id:
         deadline = time.time() + 180
         while time.time() < deadline:
-            st_g, _, v_g = http_json("GET", f"/v1/batches/{batch_id}")
+            _, _, v_g = http_json("GET", f"/v1/batches/{batch_id}")
             status = str(v_g.get("status") or "") if isinstance(v_g, dict) else ""
             if status in ("completed", "cancelled", "failed"):
                 batch_done = status
                 break
             time.sleep(2)
-    st_g, _, v_g = http_json("GET", f"/v1/batches/{batch_id}")
+    _, _, v_g = http_json("GET", f"/v1/batches/{batch_id}")
     counts = v_g.get("request_counts") if isinstance(v_g, dict) else None
     out_file = str(v_g.get("output_file_id") or "") if isinstance(v_g, dict) else ""
     check(
@@ -3897,7 +3907,7 @@ def phase_api() -> None:
     p = cli("cp", MODEL, "validate-del")
     cp_ok = p.returncode == 0
     st, _, v = http_json("POST", "/api/delete", {"model": "validate-del"})
-    st_t, _, v_t = http_json("GET", "/api/tags")
+    _, _, v_t = http_json("GET", "/api/tags")
     names = (
         [str(t.get("name") or t.get("model") or "") for t in v_t.get("models") or []]
         if isinstance(v_t, dict)
@@ -4466,7 +4476,7 @@ def phase_behavior() -> None:
             statuses = []
             deadline = time.time() + 60
             while time.time() < deadline:
-                st, v, _ = chat("Say ok")
+                st, _, _ = chat("Say ok")
                 statuses.append(st)
                 if st == 200:
                     break
@@ -4563,7 +4573,7 @@ def phase_behavior() -> None:
     results: list[tuple[int, int]] = []
 
     def _one(i: int) -> None:
-        st, v, _ = chat(f"Say {i}", extra={"max_tokens": 80}, timeout=300)
+        st, _, _ = chat(f"Say {i}", extra={"max_tokens": 80}, timeout=300)
         results.append((i, st))
 
     ts = [threading.Thread(target=_one, args=(i,)) for i in range(2)]
@@ -4700,7 +4710,7 @@ def phase_behavior() -> None:
     # pallama_slo_deadline_exceeded_total (or is 503-rejected — both honor SLO).
     def _slo_counter() -> int:
         _, _, raw = http("GET", "/metrics")
-        m = re.search(rb"^pallama_slo_deadline_exceeded_total (\d+)", raw, re.M)
+        m = re.search(rb"^pallama_slo_deadline_exceeded_total (\d+)", raw, re.MULTILINE)
         return int(m.group(1)) if m else -1
 
     slo_before = _slo_counter()
@@ -4751,7 +4761,7 @@ def phase_behavior() -> None:
     )
     # router mode.
     d.start({"port": PORT, "router": True})
-    st, v, _ = chat("Say ok")
+    st, _, _ = chat("Say ok")
     rows = ps_rows()
     check(
         "behavior",
@@ -5081,7 +5091,7 @@ def phase_wave() -> None:
     # -- battery B: predictive preload (heavy: two model loads) ------------
     # Needs TWO distinct live models; guard against BIG==small or BIG not
     # in the store (honest boundary, never a silent collapse to one model).
-    st_t, _, v_t = http_json("GET", "/api/tags")
+    _, _, v_t = http_json("GET", "/api/tags")
     tag_names = (
         [m.get("name", "") for m in v_t.get("models", [])]
         if isinstance(v_t, dict)
@@ -5218,7 +5228,7 @@ def phase_wave() -> None:
     for _ in range(2):
         wave_chat(small, "You echo single words. Say OK.")
     time.sleep(68)
-    st, hdr, raw = http("GET", "/metrics")
+    st, _, raw = http("GET", "/metrics")
     check(
         "wave",
         "poller gauge pallama_prefix_cache_hit_rate published",
@@ -5781,7 +5791,9 @@ def phase_wave() -> None:
                     "keys": [{"name": "edge", "key": "edge-secret-1"}],
                 }
             )
-            elog = open(os.path.join(esb.data_dir, "run", "daemon.log"), "ab")
+            elog = open(  # noqa: SIM115 — daemon append log, lives with the child
+                os.path.join(esb.data_dir, "run", "daemon.log"), "ab"
+            )
             eproc = subprocess.Popen(
                 [PAL, "serve"],
                 env=esb.env(),
@@ -6095,7 +6107,7 @@ def phase_parity() -> None:
         key_exists = True
         mode = os.stat(keyfile).st_mode & 0o777
         mode_ok = mode == 0o600
-        secret = open(keyfile).read().strip()
+        secret = Path(keyfile).read_text().strip()
         key_ok = secret.startswith("plm_") and len(secret) >= 32
     check(
         "parity",
@@ -6278,6 +6290,7 @@ def run_input(
         text=True,
         input=input_text,
         timeout=timeout,
+        check=False,
     )
 
 
@@ -6586,6 +6599,7 @@ def phase_commands() -> None:
         env=SANDBOX.env(),
         capture_output=True,
         text=True,
+        check=False,
     )
     reg(
         "watch",
@@ -6872,7 +6886,9 @@ def phase_commands() -> None:
                 f.write(p.stdout)
             comp_ok = (
                 comp_ok
-                and subprocess.run(["bash", "-n", sf], capture_output=True).returncode
+                and subprocess.run(
+                    ["bash", "-n", sf], capture_output=True, check=False
+                ).returncode
                 == 0
             )
             comp_ev.append("bash -n:ok")
@@ -7226,7 +7242,7 @@ def phase_commands() -> None:
     )
 
     tags = _full_engine_tags()
-    anchor, dance = (tags + [None, None])[:2]
+    anchor, dance = ([*tags, None, None])[:2]
     if dance is None:
         # slim-asset box (CUDA overlay ships server-only) or a mixed store
         # (one full + one slim): fall back to any server-bearing llamacpp
@@ -7492,6 +7508,7 @@ def phase_commands() -> None:
             text=True,
             timeout=900,
             env=env,
+            check=False,
         )
         reg(
             "upgrade.dry-run",
@@ -7654,6 +7671,7 @@ def phase_knobs_behavior() -> None:
         ],
         capture_output=True,
         text=True,
+        check=False,
     )
     if gen.returncode == 0:
         d.start({"port": PORT, "tls_cert": cert, "tls_key": key})
@@ -8161,7 +8179,7 @@ def phase_gates() -> None:
     # (c) full-manifest daemon boot (deny_unknown_fields proof) -----------
     full = _full_toplevel()
     full["model_overrides"] = {MODEL: _overlay_a()}
-    missing_full = sorted(set(k["name"] for k in TOPLEVEL_KNOBS) - set(full))
+    missing_full = sorted({k["name"] for k in TOPLEVEL_KNOBS} - set(full))
     ok_c = not missing_full
     check(
         "gates",
@@ -8264,7 +8282,7 @@ def phase_gates() -> None:
     # -- completeness enforcement -----------------------------------------
     if enforce:
         ok_rows = {c["knob"] for c in COVERAGE if c["ok"]}
-        want_knobs = set(k["name"] for k in TOPLEVEL_KNOBS)
+        want_knobs = {k["name"] for k in TOPLEVEL_KNOBS}
         missing_knobs = sorted(want_knobs - ok_rows)
         check(
             "gates",
@@ -8569,7 +8587,7 @@ def _gold_items() -> dict:
     cmds = _help_command_names(p.stdout)
     items["help.commands"] = "\n".join(sorted(cmds))
     cfg_path = os.path.join(SANDBOX.root, "config", "pallama", "config.toml")
-    backup = open(cfg_path, "rb").read() if os.path.exists(cfg_path) else None
+    backup = Path(cfg_path).read_bytes() if os.path.exists(cfg_path) else None
     try:
         SANDBOX.write_config({"port": PORT})
         fresh = tomllib.loads(cli("config", "list").stdout)
@@ -8654,7 +8672,7 @@ def _gold_items() -> dict:
     d = DAEMON
     d.start({"port": PORT})
     try:
-        st, body, _ = chat("Say ok")
+        st, _, _ = chat("Say ok")
         assert st == 200, f"chat {st}"
         v = http_json("GET", "/api/version")[2]
         items["api.version"] = ",".join(sorted(v.keys()))
@@ -8777,7 +8795,11 @@ def phase_golds():
         if not ok:
             wl, gl = want_payload.splitlines(), payload.splitlines()
             ev += f" want {len(wl)}L got {len(gl)}L first-diff: " + next(
-                (f"want {a!r} got {b!r}" for a, b in zip(wl, gl) if a != b),
+                (
+                    f"want {a!r} got {b!r}"
+                    for a, b in zip(wl, gl, strict=False)
+                    if a != b
+                ),
                 "prefix/length",
             )
         check("golds", f"golden {name}", ok, ev)
