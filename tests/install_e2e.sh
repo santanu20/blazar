@@ -51,6 +51,15 @@ TMP=$(mktemp -d)
 SRV="$TMP/srv"
 mkdir -p "$SRV" "$TMP/home"
 
+# Hermetic HOME means hermetic XDG too: pallama resolves its config/data
+# roots via the dirs crate, which prefers XDG_CONFIG_HOME/XDG_DATA_HOME
+# over $HOME/.config. CI images export XDG_CONFIG_HOME machine-wide
+# (GitHub runners: /etc/environment), so an unpinned XDG would point the
+# test binary at the runner's real config and silently change behavior
+# per host.
+export XDG_CONFIG_HOME="$TMP/home/.config"
+export XDG_DATA_HOME="$TMP/home/.local/share"
+
 # Fake privileged environment: "sudo" executes plainly, "systemctl" says
 # the unit is inactive (so the enable path runs) and accepts everything.
 cat > "$TMP/fakesudo" <<'EOF'
