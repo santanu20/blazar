@@ -464,8 +464,8 @@ async fn integration__prune_retention_is_scoped_per_kind() {
         .collect();
     remaining.sort();
     let mut expected = vec![
-        format!("b2"), // active llamacpp
-        format!("b3"), // newest KEEP_TAGS llamacpp
+        "b2".to_string(), // active llamacpp
+        "b3".to_string(), // newest KEEP_TAGS llamacpp
     ];
     for extra in ["m1", "m2", "s1"] {
         expected.push(extra.to_string());

@@ -47,11 +47,14 @@ ollama cell is HTTP-only against an already-running service.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
 import difflib
-import importlib
 import hashlib
+import importlib
+import itertools
 import json
+import math
 import os
 import re
 import shutil
@@ -641,9 +644,9 @@ def openai_stream_timed(port: int, body: dict, timeout: float = 300.0) -> dict:
     if usage:
         tokens_usage = usage.get("completions_tokens")
         prompt_tokens = usage.get("prompt_tokens")
-    tokens = tokens_usage if tokens_usage else len(stamps)
+    tokens = tokens_usage or len(stamps)
     src = "usage" if tokens_usage else "chunks"
-    itls = [(b - a) * 1000 for a, b in zip(stamps, stamps[1:])]
+    itls = [(b - a) * 1000 for a, b in itertools.pairwise(stamps)]
     return {
         "ttft_ms": (ttft - t0) * 1000 if ttft is not None else total * 1000,
         "decode_tps": (
@@ -722,7 +725,7 @@ def ollama_stream_timed(port: int, body: dict, timeout: float = 300.0) -> dict:
     else:
         decode_tps = 0.0
         src = "chunks"
-    itls = [(b - a) * 1000 for a, b in zip(stamps, stamps[1:])]
+    itls = [(b - a) * 1000 for a, b in itertools.pairwise(stamps)]
     return {
         "ttft_ms": (ttft - t0) * 1000 if ttft is not None else total * 1000,
         "decode_tps": decode_tps,
@@ -993,7 +996,7 @@ def conc_suite(
         def worker(i: int) -> None:
             try:
                 results[i] = fn(port, body(tg, i), timeout=300.0)
-            except Exception as exc:  # noqa: BLE001 — one stream failing is a datum
+            except Exception as exc:
                 results[i] = f"error: {exc}"
 
         threads = [threading.Thread(target=worker, args=(i,)) for i in range(level)]
@@ -1110,17 +1113,13 @@ def teardown_proc(proc: subprocess.Popen, sampler: Sampler) -> dict:
     sampler.stop_evt.set()
     sampler.join(timeout=2.0)
     base = gpu_used_mib()
-    try:
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
         os.killpg(proc.pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
     try:
         proc.wait(timeout=20)
     except subprocess.TimeoutExpired:
-        try:
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
             os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
         proc.wait(timeout=10)
     ok = True
     for _ in range(15):
@@ -1262,10 +1261,8 @@ def run_direct_cell(
         t_load0 = time.perf_counter()
         if not wait_healthy(eng.kind, port, 600.0, proc=proc):
             tail = ""
-            try:
+            with contextlib.suppress(OSError):
                 tail = errlog.read_text(errors="replace")[-400:].replace("\n", " | ")
-            except OSError:
-                pass
             rec["error"] = (
                 f"child exited rc={proc.poll()} during load"
                 if proc.poll() is not None
@@ -1484,7 +1481,7 @@ def run_pallama_cell(
                 rec["cold_first_request_s"] = round(time.perf_counter() - t_cold0, 2)
                 rec["cold_ttft_ms"] = round(coldm.get("ttft_ms") or 0.0, 1)
                 rec["cold_prompt_tokens"] = coldm.get("prompt_tokens")
-            except Exception as cold_exc:  # noqa: BLE001 — keep forensics
+            except Exception as cold_exc:
                 # a failed cold probe (e.g. 502 spawn-failure behind the
                 # gateway) must still carry boot metrics + daemon tail for
                 # diagnosis — return rec; the finally block captures the
@@ -2338,7 +2335,7 @@ def _greedy_spawn(
         extras = {"pa": "off"}
     argv = direct_argv(eng, model, mmproj, port, 4096, 1, DEFAULT_NGL, staged, extras)
     errfh_path = stage_root / f"greedy-{eng.tag}-{port}.stderr"
-    errfh = open(errfh_path, "wb")
+    errfh = open(errfh_path, "wb")  # noqa: SIM115 — stderr sink handed to Popen, lives with the child
     proc = subprocess.Popen(
         argv,
         cwd=str(eng.dir),
@@ -2357,13 +2354,13 @@ def _greedy_stats(gots: list[str], refs: list[str]) -> dict:
     ratios = []
     exact = 0
     first_div = []
-    for got, ref in zip(gots, refs):
+    for got, ref in zip(gots, refs, strict=True):
         if got == ref:
             exact += 1
         ratios.append(difflib.SequenceMatcher(None, ref, got).ratio())
         first_div.append(
             next(
-                (k for k, (a, b) in enumerate(zip(ref, got)) if a != b),
+                (k for k, (a, b) in enumerate(zip(ref, got, strict=False)) if a != b),
                 min(len(ref), len(got)),
             )
         )
@@ -3382,7 +3379,7 @@ def main() -> int:
             "measured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             # env stamp: 5-min loadavg covers the cell window; a contended
             # run (rust-analyzer, parallel builds) is diagnosable later
-            "loadavg_5m": open("/proc/loadavg").read().split()[1],
+            "loadavg_5m": Path("/proc/loadavg").read_text().split()[1],
             "power_state": ("battery" if power_state()["on_battery"] else "ac"),
             **rec,
         }
@@ -3475,7 +3472,7 @@ def main() -> int:
                     rec = run_direct_cell(
                         eng, model, own_mmproj, params, model_name, cfg, stage_root
                     )
-                except Exception as exc:  # noqa: BLE001 — campaign continues (R4)
+                except Exception as exc:
                     rec = {"error": f"direct cell crashed: {exc}"}
                 emit(eng.tag, eng.kind, "direct", params, key, rec)
 
@@ -3506,7 +3503,7 @@ def main() -> int:
                 rec = run_pallama_cell(
                     eng, gw_model_name, cfg, "sandboxed gateway cell", soak_s=args.soak
                 )
-            except Exception as exc:  # noqa: BLE001 — campaign continues (R4)
+            except Exception as exc:
                 rec = {"error": f"pallama cell crashed: {exc}"}
             emit(eng.tag, eng.kind, "pallama", params, key, rec)
             if eng.kind == "mistralrs" and not args.skip_variants:
@@ -3523,7 +3520,7 @@ def main() -> int:
                         "sandboxed gateway cell, mistralrs_paged_attn=false",
                         pallama_cfg={"mistralrs_paged_attn": False},
                     )
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     rec = {"error": f"pallama cell crashed: {exc}"}
                 emit(eng.tag, eng.kind, "pallama", params, key, rec)
 
@@ -3548,7 +3545,7 @@ def main() -> int:
                     "sandboxed gateway cell, slots=1 + kv_unified=false",
                     pallama_cfg={"slots": 1, "kv_unified": False},
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 rec = {"error": f"pallama cell crashed: {exc}"}
             emit(eng.tag, eng.kind, "pallama", params, key, rec)
     if "ollama" in args.providers:
@@ -3560,7 +3557,7 @@ def main() -> int:
             log("[ollama reference]")
             try:
                 rec = run_ollama_cell(cfg, args.model or model_name)
-            except Exception as exc:  # noqa: BLE001 — campaign continues (R4)
+            except Exception as exc:
                 rec = {"error": f"ollama cell crashed: {exc}"}
             emit("ollama-host", "ollama", "ollama", params, key, rec)
 
@@ -3575,7 +3572,7 @@ def main() -> int:
                 rec = run_ollama_cold_cell(
                     cfg, args.model or model_name, args.ollama_service_restart
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 rec = {"error": f"ollama cold cell crashed: {exc}"}
             emit("ollama-host", "ollama", "cold-ollama", params, key, rec)
 
@@ -3600,7 +3597,7 @@ def main() -> int:
                     continue
                 try:
                     rec = run_pallama_idle_cell(eng, gw_model_name, cfg)
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     rec = {"error": f"idle cell crashed: {exc}"}
                 emit(eng.tag, eng.kind, "idle-pallama", params, key, rec)
         if "ollama" in args.providers:
@@ -3612,7 +3609,7 @@ def main() -> int:
                 log("[idle-wake ollama (keep_alive expiry)]")
                 try:
                     rec = run_ollama_idle_cell(cfg, args.model or model_name)
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     rec = {"error": f"ollama idle cell crashed: {exc}"}
                 emit("ollama-host", "ollama", "idle-ollama", params, key, rec)
 
@@ -3641,7 +3638,7 @@ def main() -> int:
                         continue
                     try:
                         rec = run_pallama_ctx_cell(eng, gw_model_name, ctx, cfg)
-                    except Exception as exc:  # noqa: BLE001
+                    except Exception as exc:
                         rec = {"error": f"ctxcurve cell crashed: {exc}"}
                     emit(eng.tag, eng.kind, "ctxcurve-pallama", params, key, rec)
         if "ollama" in args.providers:
@@ -3653,7 +3650,7 @@ def main() -> int:
                 log(f"[ctxcurve ollama ctx={ctx}]")
                 try:
                     rec = run_ollama_ctx_cell(cfg, args.model or model_name, ctx)
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     rec = {"error": f"ollama ctxcurve cell crashed: {exc}"}
                 emit("ollama-host", "ollama", "ctxcurve-ollama", params, key, rec)
 
@@ -3683,7 +3680,7 @@ def main() -> int:
                         rec = run_direct_conc_cell(
                             eng, model, own_mmproj, level, model_name, cfg, stage_root
                         )
-                    except Exception as exc:  # noqa: BLE001
+                    except Exception as exc:
                         rec = {"error": f"conc cell crashed: {exc}"}
                     emit(eng.tag, eng.kind, "conc-direct", params, key, rec)
             if "pallama" in args.providers:
@@ -3707,7 +3704,7 @@ def main() -> int:
                         rec = run_pallama_conc_cell(
                             eng, gw_model_name, level, cfg, rounds=args.conc_rounds
                         )
-                    except Exception as exc:  # noqa: BLE001
+                    except Exception as exc:
                         rec = {"error": f"conc cell crashed: {exc}"}
                     emit(eng.tag, eng.kind, "conc-pallama", params, key, rec)
             if "ollama" in args.providers:
@@ -3720,7 +3717,7 @@ def main() -> int:
                     rec = run_ollama_conc_cell(
                         cfg, args.model or model_name, level, args.conc_rounds
                     )
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     rec = {"error": f"ollama conc cell crashed: {exc}"}
                 emit("ollama-host", "ollama", "conc-ollama", params, key, rec)
 
@@ -3764,7 +3761,7 @@ def main() -> int:
                 continue
             try:
                 rec = run_perplexity(eng, model, corpus, cfg)
-            except Exception as exc:  # noqa: BLE001 — campaign continues (R4)
+            except Exception as exc:
                 rec = {"error": f"ppl cell crashed: {exc}"}
             emit(eng.tag, eng.kind, "ppl", params, key, rec)
 
@@ -3804,7 +3801,7 @@ def main() -> int:
                     rec = run_greedy_parity(
                         eng, model, own_mmproj, model_name, reference, stage_root
                     )
-                except Exception as exc:  # noqa: BLE001 — campaign continues (R4)
+                except Exception as exc:
                     rec = {"error": f"greedy cell crashed: {exc}"}
                 if "error" not in rec:
                     rec["vs"] = ref_tag or (ref_eng.tag if ref_eng else "unknown")
@@ -3822,7 +3819,7 @@ def main() -> int:
                     rec = run_greedy_gateway_cell(
                         eng, model, own_mmproj, gw_model_name, reference
                     )
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     rec = {"error": f"greedy gw cell crashed: {exc}"}
                 emit(eng.tag, eng.kind, "greedy_gw", params, key, rec)
 
@@ -3962,14 +3959,14 @@ METHODOLOGY = [
     "Cold TTFT = first-token latency of the cold probe itself (max_tokens 4, aligned num_ctx 16384 on both runtimes).",
     "ollama daemon boot is only measured with --ollama-service-restart (systemd restart, sudo password via BENCH_SUDO_PASSWORD env, stdin-only); without it the daemon stays warm and the row says so.",
     "Idle-wake: pallama's reaper sleeps the child at idle_sleep_secs (weights stay RAM-resident, VRAM released) — wake TTFT is a sleep-wake; ollama's keep_alive expiry fully unloads — wake TTFT is a disk reload. The policy column names the semantic; both measured after the policy is observed via /api/ps.",
-    "Long-context curve: per-ctx cells (pallama model_overrides ctx / ollama num_ctx) × 3-run decode suites; each ollama point evicts first so the runner respawns at that ctx.",
+    "Long-context curve: per-ctx cells (pallama model_overrides ctx / ollama num_ctx) x 3-run decode suites; each ollama point evicts first so the runner respawns at that ctx.",
     "Sustained concurrency: sequential bursts of the parallel-stream lane (default 3 rounds); TTFT p99 aggregates every stream of every round.",
     "Every pallama row records the spawned engine's argv (slots/context shown in tables) and stamps pallama version, wall clock, 5-min load average, and AC/battery power state; GPU cells refuse to run on battery.",
 ]
 
 
 def pfmt(x, nd=1, unit=""):
-    if x is None or x != x:
+    if x is None or (isinstance(x, float) and math.isnan(x)):
         return "-"
     return f"{x:.{nd}f}{unit}"
 
@@ -4376,9 +4373,9 @@ def executive_summary(recs: list[dict]) -> str:
         and "error" not in r
     }
     parts = []
-    for tag in gw:
+    for tag, gw_row in gw.items():
         if tag in direct:
-            g, d = gw[tag].get("decode_tps_p50"), direct[tag].get("decode_tps_p50")
+            g, d = gw_row.get("decode_tps_p50"), direct[tag].get("decode_tps_p50")
             if g and d:
                 delta = (g / d - 1) * 100
                 parts.append(

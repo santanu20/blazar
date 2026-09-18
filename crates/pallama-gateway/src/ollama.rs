@@ -869,7 +869,7 @@ pub async fn chat(
         )
         .await
         {
-            return resp;
+            return *resp;
         }
     }
 
@@ -980,7 +980,7 @@ pub async fn chat(
             );
         }
         if let Err(resp) = apply_num_ctx(&state, &row.name, want).await {
-            return resp;
+            return *resp;
         }
     }
 
@@ -994,7 +994,7 @@ pub async fn chat(
     .await
     {
         Ok(ok) => ok,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     // F12: full keep_alive contract — >0 pins the instance for N s,
     // -1 pins "forever", 0 clears any prior pin (the evict-after-response
@@ -1299,9 +1299,9 @@ pub(crate) async fn apply_num_ctx(
     state: &Arc<AppState>,
     model: &str,
     want: i64,
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     if want <= 0 {
-        return Err(api_error(400, "options.num_ctx must be positive"));
+        return Err(Box::new(api_error(400, "options.num_ctx must be positive")));
     }
     // ctx preflight (I5): refuse a num_ctx no spawn could host, BEFORE
     // the evict below can take a healthy instance down. One placement
@@ -1334,7 +1334,7 @@ pub(crate) async fn apply_num_ctx(
                             u32::try_from(want).unwrap_or(u32::MAX),
                         )
                     {
-                        return Err(api_error(400, &msg));
+                        return Err(Box::new(api_error(400, &msg)));
                     }
                 }
             }
@@ -1777,7 +1777,7 @@ pub async fn embeddings(
     let (engine, _) =
         match ensure_with_admission(&state, &row.name, Priority::Normal, None, false).await {
             Ok(ok) => ok,
-            Err(resp) => return resp,
+            Err(resp) => return *resp,
         };
     crate::proxy::hold_body(
         crate::proxy::begin_accounting(&state, &engine.name),
@@ -1879,7 +1879,7 @@ pub async fn embed(
     let (engine, _) =
         match ensure_with_admission(&state, &row.name, Priority::Normal, None, false).await {
             Ok(ok) => ok,
-            Err(resp) => return resp,
+            Err(resp) => return *resp,
         };
     crate::proxy::hold_body(
         crate::proxy::begin_accounting(&state, &engine.name),
@@ -2011,7 +2011,7 @@ pub async fn rerank(
     let (engine, _) =
         match ensure_with_admission(&state, &row.name, Priority::Normal, None, false).await {
             Ok(ok) => ok,
-            Err(resp) => return resp,
+            Err(resp) => return *resp,
         };
     let mut forward = forward;
     crate::proxy::hold_body(
@@ -2135,7 +2135,7 @@ pub async fn generate(
         )
         .await
         {
-            return resp;
+            return *resp;
         }
     }
     // F13: honor options.num_ctx — restart once at the requested size;
@@ -2156,7 +2156,7 @@ pub async fn generate(
             );
         }
         if let Err(resp) = apply_num_ctx(&state, &row.name, i64::from(want)).await {
-            return resp;
+            return *resp;
         }
     }
     let (engine, load_ms) = match ensure_with_admission(
@@ -2169,7 +2169,7 @@ pub async fn generate(
     .await
     {
         Ok(ok) => ok,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     // F12: keep_alive parity with /api/chat — pin window at admission,
     // explicit evict after the response on 0 (session pins still win).
@@ -2386,7 +2386,7 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
     let (engine, _load_ms) =
         match ensure_with_admission(&state, model, Priority::Normal, None, false).await {
             Ok(ok) => ok,
-            Err(resp) => return resp,
+            Err(resp) => return *resp,
         };
     // #20 identity: the LIVE instance ctx wins over config (tuned or
     // overridden instances — same precedence as the prompt-fit gate).

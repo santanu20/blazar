@@ -837,7 +837,7 @@ mod tests {
             .layers
             .iter()
             .all(|l| l.media_type != OLLAMA_PROJECTOR_LAYER));
-        assert!(m.layers.len() == 4);
+        assert_eq!(m.layers.len(), 4);
         assert_eq!(
             m.config.as_ref().map(|c| c.digest.as_str()),
             Some("sha256:b0830f4ff6a0220cfd995455206353b0ed23c0aee865218b154b7a75087b4e55")

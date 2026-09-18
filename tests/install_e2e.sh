@@ -220,8 +220,9 @@ if [ "$(uname -m)" = x86_64 ] && [ -x "$STUB" ]; then
     cp "$STUB" "$ESTAGE/bin/llama-server"
     tar -czf "$SRV/$EASSET" -C "$ESTAGE" .
     ESA=$(sha256sum "$SRV/$EASSET" | cut -d' ' -f1)
-    printf '[{"tag_name":"%s","prerelease":true,"published_at":"2026-09-08T00:00:00Z","assets":[{"name":"%s","digest":"sha256:%s","size":1,"browser_download_url":"%s/download/%s"}]}]' \
-        "$ETAG" "$EASSET" "$ESA" "$BASE" "$EASSET" > "$SRV/llama-releases.json"
+    ESZ=$(wc -c < "$SRV/$EASSET" | tr -d ' ')
+    printf '[{"tag_name":"%s","prerelease":true,"published_at":"2026-09-08T00:00:00Z","assets":[{"name":"%s","digest":"sha256:%s","size":%s,"browser_download_url":"%s/download/%s"}]}]' \
+        "$ETAG" "$EASSET" "$ESA" "$ESZ" "$BASE" "$EASSET" > "$SRV/llama-releases.json"
     # Pin the asset pick (config engine_asset = Exact candidate) and a
     # port that cannot clash with any real daemon.
     mkdir -p "$TMP/home/.config/pallama"

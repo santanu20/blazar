@@ -1,0 +1,32 @@
+# Deterministic lint surface for the Python tooling (bench_matrix, validate,
+# engine_coverage). The rule set is frozen here so a newer ruff on CI can
+# never silently widen the gate; CI pins the exact ruff version to match.
+
+target-version = "py310"
+
+[lint]
+select = [
+    "E4", "E7", "E9", "F",  # core errors
+    "I",                    # import order
+    "UP",                   # modernization
+    "B",                    # bugbear (real bug classes)
+    "SIM",                  # simplification
+    "RUF",                  # ruff-native
+    "C4",                   # comprehension hygiene
+    "FURB",                 # refurb
+    "PLC0206",              # dict access without .items()
+    "PLR0124",              # name compared with itself
+    "PLW1510",              # subprocess.run without explicit check
+]
+ignore = [
+    # Implicit string concatenation is this codebase's deliberate style for
+    # wrapping long option-list entries; parenthesizing adds nothing.
+    "ISC004",
+]
+
+[lint.per-file-ignores]
+# validate.py is a best-effort validation harness: phase runners catch broad
+# exceptions on purpose (a crashing phase must not kill the report), cleanup
+# paths pass silently, and same-iteration closures over per-group state are
+# the established shape (audited: no deferred-call capture).
+"scripts/validate.py" = ["BLE001", "S110", "SIM105", "B023"]

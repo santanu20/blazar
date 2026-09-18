@@ -118,7 +118,10 @@ pub struct Config {
     pub keys: Vec<ApiKey>,
     /// Comma-separated RPC servers, e.g. "box1:50052,box2:50052".
     pub rpc_servers: String,
-    /// Child prompt-cache budget in MiB; 0 = unlimited.
+    /// Child prompt-cache budget in MiB; 0 = unlimited. The default is a
+    /// starting point the profile's adaptive RAM cap (30% of total) may
+    /// silently lower on small boxes — a user-set value that gets clamped
+    /// is the only case worth a warning.
     pub cache_ram_mb: i64,
     /// CPU affinity range for child threads, "lo-hi" (e.g. "0-15" for the
     /// P-core threads on an 8P+8E hybrid; discover with `lscpu -e`).
@@ -1735,6 +1738,11 @@ impl Default for SemanticCacheConfig {
     }
 }
 
+/// Shipped `cache_ram_mb` default. Shared with the profile compiler so it
+/// can tell "the default met the adaptive cap" (silent auto-tuning) from
+/// "a user-pinned budget got clamped" (worth a warning).
+pub const DEFAULT_CACHE_RAM_MB: i64 = 8192;
+
 impl Default for Config {
     // A flat literal of every knob's default: one line each beats
     // splitting across helper fns that hide the table.
@@ -1775,7 +1783,7 @@ impl Default for Config {
             cache_reuse: 0,
             keys: Vec::new(),
             rpc_servers: String::new(),
-            cache_ram_mb: 8192,
+            cache_ram_mb: DEFAULT_CACHE_RAM_MB,
             slots: default_slots(),
             deterministic: false,
             slot_prompt_similarity: 0.0,

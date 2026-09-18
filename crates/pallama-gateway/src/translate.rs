@@ -1053,7 +1053,7 @@ mod tests {
         apply_ollama_options(&mut out, &json!({"adaptive_p": true}));
         let chain = out["samplers"].as_array().expect("chain built");
         assert_eq!(chain.last(), Some(&json!("adaptive_p")));
-        assert!(chain.len() == DEFAULT_SAMPLER_CHAIN.len() + 1);
+        assert_eq!(chain.len(), DEFAULT_SAMPLER_CHAIN.len() + 1);
         // With an explicit list (processed AFTER adaptive_p alphabetically):
         // the user chain is honored and adaptive_p is appended, not lost.
         let mut out2 = json!({});
