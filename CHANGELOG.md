@@ -4,11 +4,17 @@ All notable changes to Pallama are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
-## [Unreleased]
+## [0.7.0] - 2026-09-18
+
+### Fixed
+- **Engine probes no longer misread fork/fd/writeback pressure as a broken engine.** `Command::spawn` transients — EAGAIN/EINTR/ENOMEM (fork pressure), EMFILE/ENFILE (fd pressure), ETXTBSY (write→close→exec writeback race on a just-installed binary, captured live on the install lane, not only tests) — are now classified and retried through one bounded policy (4 attempts, 250 ms backoff) at the shared spawn layer: `probe_output`, the post-crash `verify_engine_binary` probe, and the mistral.rs help census all inherit it. Permanent failures (missing binary, permissions, ENOEXEC/garbage asset) still fail on attempt one, so a genuinely bad engine is rejected just as fast as before; what disappears is the flake class where a healthy engine failed its probe under load and `register_or_clean` deleted a perfectly good engine dir. The retry lives in `pallama-runtime` internals — no config surface, no behavior change for healthy runs.
+
+### Changed
+- **Default gateway port: 11434 → 11435.** Pallama now owns its port identity and never collides with a running ollama (which lives on 11434). Config files without an explicit `port` inherit the new default on upgrade — re-point clients (`OLLAMA_HOST=http://127.0.0.1:11435`, OpenAI base URL) accordingly. Drop-in `OLLAMA_HOST` replacement remains available as an opt-in: set `port = 11434` in `config.toml` once ollama is removed from the box. Explicit `port = 11434` pins keep parsing and binding unchanged.
 
 ## [0.6.1] - 2026-09-18
 
-First tagged source release of the Pallama server.
+First tagged source release of the Pallama server (consolidates the 2026-09-17 engine-routing era entries below under the same version).
 ### Added
 - `pallama fit --json`: fit rows as JSONL with the machine context (`repo`, `vram_bytes`) riding every row — `fits_vram` is meaningless without the hardware that produced it; header, table and lane hints suppressed.
 - `pallama show --json`: the model card as one machine-typed object — nested GGUF metadata (null on safetensors rows) and the stored profile with argv/benchmark embedded as real JSON values instead of double-encoded strings (a corrupted row degrades to its raw string rather than failing the listing).
@@ -16,8 +22,6 @@ First tagged source release of the Pallama server.
 - `pallama fit` on safetensors repos: one aggregate row (full shard set summed from Hub blob sizes) through the same rule-6 KV ladder as the GGUF lane, with the sglang/mistralrs serving-lane hint; sizeless repos now teach "nothing to preview" instead of printing a bare empty table.
 - `pallama search --json`: one JSON object per row (JSONL, matching `doctor --json`) — machine-typed `ctx`/`size_bytes`/`arch` (null without GGUF metadata) and the FULL quants list (no `+N` collapse) for scripting; empty results stream zero rows (`jq -s` reads `[]`), and SIGPIPE is reset to default so `| head`/`| jq` closing early ends quietly instead of panicking.
 - `pallama search --format <F>`: weight-format filter beyond the GGUF default — any Hub tag (`safetensors`, `awq`, `gptq`, `fp8`, `mlx`, `onnx`, …) or `any`/`all` for an unfiltered browse; `--format` works in any argument position; new FORMAT column (Hub tags, most-specific-first: an AWQ repo shows `awq`, not its `safetensors` container tag; `gguf` outranks the `mlx` tag GGUF mirrors self-apply), non-GGUF QUANTS mined from repo-id bit-widths (`-8bit`, `-AWQ`, `-GPTQ-Int4`, `IQ4_XS`), and format-aware pull footers (safetensors → sglang/mistralrs lane; MLX → convert guidance). Empty results now name the format and teach valid tags.
-
-## [0.6.1] — 2026-09-17
 
 Engine routing, the HF format audit, and a hardened engine store — the "pick the right engine for the model" release. Era highlights below; entries were drafted under Unreleased as they landed.
 
