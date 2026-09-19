@@ -305,7 +305,40 @@ fn fixture_mistralrs_tarball() -> Vec<u8> {
     gz.finish().unwrap()
 }
 
-const CPU_ASSET: &str = "mistralrs-cpu-x86_64-unknown-linux-gnu.tar.gz";
+/// The asset this host's mistral.rs lane requests (mirrors
+/// `gh::mistralrs_asset_picks` for GPU-less machines): the suite runs on
+/// linux x64, linux arm64, macOS arm64 and Windows x64, so every CI lane
+/// asks for the CPU/Metal build, never a CUDA pick.
+fn host_asset() -> (&'static str, &'static str) {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        ("mistralrs-metal-aarch64-apple-darwin.tar.gz", "metal")
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        ("mistralrs-cpu-x86_64-pc-windows-msvc.zip", "cpu")
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        ("mistralrs-cpu-aarch64-unknown-linux-gnu.tar.gz", "cpu")
+    } else {
+        ("mistralrs-cpu-x86_64-unknown-linux-gnu.tar.gz", "cpu")
+    }
+}
+
+/// Fixture archive in the format the host lane downloads: tar.gz on the
+/// unix lanes, zip for the Windows CPU lane.
+fn fixture_mistralrs_archive() -> Vec<u8> {
+    if cfg!(windows) {
+        let bin = std::fs::read(PathBuf::from(env!("CARGO_BIN_EXE_stub-llama-server")))
+            .expect("read stub binary");
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        let opts: zip::write::SimpleFileOptions =
+            zip::write::SimpleFileOptions::default().unix_permissions(0o755);
+        zip.start_file("mistralrs", opts).unwrap();
+        zip.write_all(&bin).unwrap();
+        zip.finish().unwrap();
+        buf.into_inner()
+    } else {
+        fixture_mistralrs_tarball()
+    }
+}
 
 async fn mount_mistralrs_release(api: &MockServer, tag: &str, assets: &[(&str, Vec<u8>)]) {
     let body = serde_json::json!({
@@ -360,8 +393,9 @@ fn tmp_dirs() -> (tempfile::TempDir, PallamaDirs) {
 #[tokio::test]
 async fn integration__install_mistralrs__latest_resolves_registers_activates() {
     let api = MockServer::start().await;
-    let asset = fixture_mistralrs_tarball();
-    mount_mistralrs_release(&api, "v0.9.3", &[(CPU_ASSET, asset)]).await;
+    let (asset_name, asset_label) = host_asset();
+    let asset = fixture_mistralrs_archive();
+    mount_mistralrs_release(&api, "v0.9.3", &[(asset_name, asset)]).await;
     Mock::given(method("GET"))
         .and(path("/repos/EricLBuehler/mistral.rs/releases"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
@@ -377,7 +411,7 @@ async fn integration__install_mistralrs__latest_resolves_registers_activates() {
     assert_eq!(row.tag, "v0.9.3");
     assert_eq!(row.kind, EngineKind::MistralRs);
     assert!(row.active, "install activates the engine");
-    assert_eq!(row.asset, "cpu");
+    assert_eq!(row.asset, asset_label);
     // vtag serial: 0*1_000_000 + 9*1_000 + 3
     let m: Manifest = serde_json::from_str(&row.manifest).unwrap();
     assert_eq!(m.build_number, 9003);
@@ -396,8 +430,9 @@ async fn integration__install_mistralrs__latest_resolves_registers_activates() {
 #[tokio::test]
 async fn integration__install_mistralrs__explicit_tag_uses_tags_endpoint() {
     let api = MockServer::start().await;
-    let asset = fixture_mistralrs_tarball();
-    mount_mistralrs_release(&api, "v0.9.2", &[(CPU_ASSET, asset)]).await;
+    let (asset_name, _asset_label) = host_asset();
+    let asset = fixture_mistralrs_archive();
+    mount_mistralrs_release(&api, "v0.9.2", &[(asset_name, asset)]).await;
 
     let (t, dirs) = tmp_dirs();
     let mgr = manager(&dirs, &api.uri());
@@ -413,12 +448,18 @@ async fn integration__install_mistralrs__explicit_tag_uses_tags_endpoint() {
 #[tokio::test]
 async fn integration__install_mistralrs__missing_asset_error_lists_wanted() {
     let api = MockServer::start().await;
-    // Only an unrelated (metal) asset exists; the wanted-list error must
-    // name the CPU asset so the user can see what was searched.
+    // Only a never-pickable CUDA asset exists; the wanted-list error must
+    // name the asset this host asked for so the user can see what was
+    // searched. cuda999 sorts above any real driver floor, and GPU-less
+    // hosts never request CUDA picks at all, so the decoy is never chosen
+    // on any runner or dev box.
     mount_mistralrs_release(
         &api,
         "v0.9.3",
-        &[("mistralrs-metal-aarch64-apple-darwin.tar.gz", vec![1, 2, 3])],
+        &[(
+            "mistralrs-cuda999-sm89-x86_64-unknown-linux-gnu.tar.gz",
+            vec![1, 2, 3],
+        )],
     )
     .await;
 
@@ -430,7 +471,7 @@ async fn integration__install_mistralrs__missing_asset_error_lists_wanted() {
         .expect_err("no matching asset must fail fast");
     let msg = format!("{err}");
     assert!(
-        msg.contains("mistralrs-cpu-x86_64-unknown-linux-gnu.tar.gz"),
+        msg.contains(host_asset().0),
         "error lists wanted picks: {msg}"
     );
     // Nothing registered on failure.
