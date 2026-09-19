@@ -8,14 +8,20 @@
 
 **Every model. Every API. Your hardware at full speed. One binary.**
 
-`pallama` is one Rust binary that turns any machine into a complete local inference server:
+`pallama` is one Rust binary that turns any machine into a complete local inference server.
 
-- **Every model** — three engines, unmodified and side-by-side: [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server` (GGUF), [mistral.rs](https://github.com/EricLBuehler/mistral.rs) (HF-style safetensors), [SGLang](https://github.com/sgl-project/sglang) (safetensors + AWQ/GPTQ on CUDA/ROCm).
-- **Every API** — one gateway speaking the **OpenAI**, **Ollama** and **Anthropic** APIs simultaneously.
-- **Your hardware at full speed** — engines are probed, profiled and orchestrated; nothing is reimplemented or slowed down.
-- **One binary, port 11435** — pallama's own port, so it never collides with a running ollama; point existing clients at it with zero code changes.
+| The pitch | The reality |
+|---|---|
+| **Every model** | Three engines, unmodified, side-by-side: [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server` (GGUF) · [mistral.rs](https://github.com/EricLBuehler/mistral.rs) (HF safetensors) · [SGLang](https://github.com/sgl-project/sglang) (safetensors + AWQ/GPTQ on CUDA/ROCm) |
+| **Every API** | One gateway speaking the **OpenAI**, **Ollama** and **Anthropic** APIs simultaneously |
+| **Full speed** | Engines are probed, profiled and orchestrated — nothing reimplemented, nothing slowed down |
+| **One binary** | Port **11435** — pallama's own port, so it never collides with a running ollama; point existing clients at it with zero code changes |
 
-**No fork. No lock-in. No telemetry. No cloud.** The engines are official upstream binaries, sha256-verified, installed side-by-side with atomic switching and rollback. Your models stay plain `.gguf` files you can touch with any tool. The only outbound traffic pallama ever generates is the engine/model downloads you ask for.
+| Guarantee | How it is kept |
+|---|---|
+| **No fork** | Official upstream engine binaries, sha256-verified, installed side-by-side with atomic switching and rollback |
+| **No lock-in** | Models stay plain `.gguf` files you can touch with any tool |
+| **No telemetry, no cloud** | The only outbound traffic pallama ever generates is the engine/model downloads you ask for — stated in `--help` and at startup |
 
 **Contents:** [The numbers](#the-numbers) · [Switch from ollama](#switch-from-ollama) · [Who it's for](#who-its-for) · [Install](#install) · [Quickstart](#60-second-quickstart) · [Power-tool CLI](#the-power-tool-cli) · [Ollama complaint table](#every-ollama-complaint-fixed-at-the-root) · [How it works](#how-it-works) · [Quality](#quality) · [Docs](#documentation)
 
@@ -32,9 +38,11 @@ Measured, not marketed. Same laptop, same model (Qwen3.5-9B Q4_K_M), reproducibl
 | Gateway overhead vs direct engine (decode t/s) | 40.3 | 41.1 | **-1.9% (noise)** |
 | Daemon boot (s) | **0.54** | 4.13 | **7.7x** |
 
-What that means in practice: **3x more concurrent streams from the GPU you already own**, agent loops that don't stall on tail latency, sessions that wake in a blink — and cached prefill that stops re-paying the long-context tax every turn.
+In practice: **3x more concurrent streams from the GPU you already own**, agent loops that don't stall on tail latency, sessions that wake in a blink, and cached prefill that stops re-paying the long-context tax every turn.
 
-Test bed: i7-14650HX, RTX 4070 Laptop 8 GiB, Linux; pallama 0.5.0 gateway over llama.cpp b10903-cuda. Honesty clause: cold-load first token is slower than ollama's (11.6 s vs 6.6 s) because pallama defaults to a 16384 context where ollama silently truncates at 2048 — you can set `ctx` lower and get ollama's load time back, but you can't buy ollama's missing 14 Ki of context at any price. Ratios travel across hardware; absolute numbers shift.
+| Test bed | i7-14650HX · RTX 4070 Laptop 8 GiB · Linux · pallama 0.5.0 gateway over llama.cpp b10903-cuda |
+|---|---|
+| Honesty clause | Cold-load first token is slower (11.6 s vs 6.6 s): pallama defaults to a 16384 context where ollama silently truncates at 2048. Set `ctx` lower and get ollama's load time back — you can't buy ollama's missing 14 Ki of context at any price. Ratios travel across hardware; absolute numbers shift. |
 
 Reproduce it yourself:
 
@@ -44,39 +52,14 @@ python3 scripts/bench_matrix.py --pallama-bin target/release/pallama --md BENCHM
 
 ## Switch from ollama
 
-The switch is low-risk and incremental: pallama runs **alongside** ollama (different port), keeps using the models you already have, and only becomes a drop-in replacement when *you* decide.
+Low-risk and incremental: pallama runs **alongside** ollama (different port), keeps using the models you already have, and only becomes a drop-in replacement when *you* decide.
 
-1. **Install pallama** (Linux/macOS; Windows and source builds in [Install](#install)):
-
-   ```sh
-   curl --proto '=https' --tlsv1.2 -fsSL \
-     https://raw.githubusercontent.com/santanu20/pallama/main/scripts/install.sh | sh
-   ```
-
-   The installer bootstraps the llama.cpp engine automatically (sha256-verified; on Linux it even preflights your GPU driver — details in [What the installer does](#what-the-installer-does-for-you)), so a fresh install can serve inference immediately.
-
-2. **Keep your models — no re-downloads.** GGUF files already on disk are registered in place, hardlinked (zero copy; `--copy` if you want a duplicate):
-
-   ```sh
-   pallama import /path/to/model.gguf --name mymodel
-   ```
-
-   Or re-pull by the shortnames you know — they route to registry.ollama.ai, sha256-verified and resumable — and any `owner/repo:QUANT` from Hugging Face works too:
-
-   ```sh
-   pallama pull qwen3-0.6b
-   pallama pull ggml-org/Qwen3-8B-GGUF:Q4_K_M
-   ```
-
-3. **Point your tools at it — zero code changes.** Same shortnames, same `model:tag` colons, same wire formats, all on `http://127.0.0.1:11435`:
-
-   ```sh
-   OLLAMA_HOST=http://127.0.0.1:11435 ollama list      # ollama clients just work
-   # OpenAI SDK: base_url = "http://127.0.0.1:11435/v1"
-   # Anthropic SDK: base_url = "http://127.0.0.1:11435"
-   ```
-
-4. **Go full drop-in when ready.** Set `port = 11434` in `config.toml`, remove ollama, and every `OLLAMA_HOST`-less client keeps working unchanged.
+| Step | Action |
+|---|---|
+| 1 · Install | `curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/santanu20/pallama/main/scripts/install.sh \| sh` — the installer bootstraps the llama.cpp engine automatically (sha256-verified; Linux preflights your GPU driver), so a fresh install serves inference immediately. Windows + source paths: [Install](#install) |
+| 2 · Keep your models | `pallama import /path/to/model.gguf --name mymodel` registers GGUF already on disk, hardlinked in place (zero copy; `--copy` for a duplicate). Or re-pull the shortnames you know — they route to registry.ollama.ai, sha256-verified and resumable — and any `owner/repo:QUANT` from Hugging Face works: `pallama pull qwen3-0.6b` · `pallama pull ggml-org/Qwen3-8B-GGUF:Q4_K_M` |
+| 3 · Repoint your tools | Zero code changes — same shortnames, same `model:tag` colons, same wire formats, all on `http://127.0.0.1:11435`: `OLLAMA_HOST=http://127.0.0.1:11435 ollama list` · OpenAI SDK `base_url = "http://127.0.0.1:11435/v1"` · Anthropic SDK `base_url = "http://127.0.0.1:11435"` |
+| 4 · Go full drop-in | When ready: set `port = 11434` in `config.toml`, remove ollama — every `OLLAMA_HOST`-less client keeps working unchanged |
 
 What changes on disk — and what doesn't:
 
@@ -89,25 +72,27 @@ ollama                                  pallama
 manifests/library/qwen3   hash tree     config.toml            documented knobs
 ```
 
-Left: content-addressed blobs only ollama understands. Right: plain GGUF files any tool can touch — `pallama import` hardlinks them in place, so nothing is re-downloaded and nothing is duplicated.
-
-What you gain from the switch is the whole point — the measured table [above](#the-numbers), plus every long-standing ollama complaint resolved at the root in the [table below](#every-ollama-complaint-fixed-at-the-root): plain `.gguf` files instead of a hashed blob store, any HF quant, multi-shard GGUF, `keep_alive` and `num_ctx` honored in both APIs, concurrent streams that actually run in parallel.
+Left: content-addressed blobs only ollama understands. Right: plain GGUF files any tool can touch — `pallama import` hardlinks them in place, so nothing is re-downloaded and nothing is duplicated. The payoff is the [measured table above](#the-numbers) plus every long-standing ollama complaint resolved at the root in the [table below](#every-ollama-complaint-fixed-at-the-root).
 
 ## Who it's for
 
-**The agent builder.** Point your OpenAI SDK, your ollama client, or your Anthropic client at `http://127.0.0.1:11435` and go — three API dialects, one port, zero code changes. Tool calls, `json_schema` structured output, embeddings, rerank, audio transcription, batch endpoints, capability discovery at `/.well-known/pallama`. And when your agent loop mysteriously stalls, `pallama why [trace]` tells you exactly what that request did and what went wrong — after the fact, from real telemetry.
-
-**The ollama refugee.** Every classic complaint, fixed at the root — see the [table below](#every-ollama-complaint-fixed-at-the-root). Plain `.gguf` files instead of a hashed blob store. Any Hugging Face quant instead of a curated shortlist. Multi-shard GGUF pulled natively. `keep_alive` and `num_ctx` honored in both APIs, never silently ignored. Concurrent streams that actually run in parallel.
-
-**The power user.** Per-request context sizes with budget validation *before* spawn. KV-cache quantization ladder (f16 → q8_0 → q4_0) with visible VRAM math. Slot-level session checkpoints that survive unload and daemon restarts (`pallama session save/restore`). Speculative decoding, LoRA adapters, vision projector support, GBNF grammars — every capability the installed engine has, probed and exposed, none hand-configured.
-
-**The cautious operator.** `pallama fit` previews VRAM fit and quant alternatives *before* you download 30 GB. `pallama doctor` diagnoses config, ports, engines, hardware, disk and model health in one table. Engine updates are regression-gated: a >10% decode drop auto-rolls-back. A crash circuit restarts children; an eviction ladder sleeps idle models without killing in-flight requests. systemd/launchd units with `Restart=always` ship in the box.
-
-**The privacy hardliner.** Local-only by design, stated in `--help` and at startup. No telemetry, no cloud endpoints, no phone-home. HTTPS to Hugging Face only; registry tokens only ever sent to first-party hosts, verified by tests (the CVE-2025-51471 token-exfiltration class cannot happen here).
+| You are | What pallama hands you |
+|---|---|
+| **The agent builder** | Point your OpenAI, ollama or Anthropic SDK at one port and go — three API dialects, zero code changes. Tool calls, `json_schema` structured output, embeddings, rerank, transcription, speech, batch endpoints, capability discovery at `/.well-known/pallama`. When an agent loop mysteriously stalls, `pallama why [trace]` says exactly what that request did and what went wrong — after the fact, from real telemetry |
+| **The ollama refugee** | Every classic complaint fixed at the root — [the table below](#every-ollama-complaint-fixed-at-the-root). Plain `.gguf` files instead of a hashed blob store, any HF quant, multi-shard GGUF pulled natively, `keep_alive` and `num_ctx` honored in both APIs, concurrent streams that actually run in parallel |
+| **The power user** | Per-request context sizes with budget validation *before* spawn · KV-cache quantization ladder (f16 → q8_0 → q4_0) with visible VRAM math · slot-level session checkpoints that survive unload and restarts · speculative decoding with per-request control (`options.spec`, `--no-draft`) · LoRA adapters and `model+adapter` variants · vision projectors · GBNF grammars — every capability the installed engine has, probed and exposed, none hand-configured |
+| **The cautious operator** | `pallama fit` previews VRAM fit and quant alternatives *before* you download 30 GB · `pallama doctor` diagnoses config, ports, engines, hardware, disk and model health in one table · engine updates are regression-gated (a >10% decode drop auto-rolls-back) · a crash circuit restarts children; an eviction ladder sleeps idle models without killing in-flight requests · systemd/launchd units with `Restart=always` ship in the box |
+| **The privacy hardliner** | Local-only by design, stated in `--help` and at startup — no telemetry, no cloud endpoints, no phone-home. HTTPS to Hugging Face only; registry tokens only ever sent to first-party hosts, verified by tests (the CVE-2025-51471 token-exfiltration class cannot happen here) |
 
 ## Install
 
-Prebuilt binaries for **Linux** (x86_64/aarch64/armv7, glibc ≥ 2.35 or static musl), **macOS** (x86_64/Apple Silicon), and **Windows** (x64/ARM64) are published on GitHub Releases, sha256-verified against the release metadata by the installers (the same mechanism as `pallama engine update`).
+Prebuilt binaries, sha256-verified against release metadata by the installers (the same mechanism as `pallama engine update`):
+
+| OS | Architectures | Notes |
+|---|---|---|
+| **Linux** | x86_64 · aarch64 · armv7 | glibc ≥ 2.35, or static musl (Alpine and old-glibc hosts auto-fallback; 32-bit ARM boards get static armv7-musl) |
+| **macOS** | x86_64 · Apple Silicon | launchd service (`KeepAlive`, `RunAtLoad`) |
+| **Windows** | x64 · ARM64 | installs to `%LOCALAPPDATA%\Programs\pallama`, adds user PATH; ARM64 hosts pick the native asset, falling back to emulated x64 with a warning when a release has none |
 
 **Linux / macOS (WSL included):**
 
@@ -136,22 +121,25 @@ irm https://raw.githubusercontent.com/santanu20/pallama/main/scripts/install.ps1
 .\install.ps1 -Build
 ```
 
-Installs to `%LOCALAPPDATA%\Programs\pallama` and adds it to the user PATH. ARM64 hosts pick the native asset automatically (falling back to the emulated x64 one with a warning when a release has none).
-
 **From source:** `sudo cargo install --path crates/pallama-cli` (recent stable Rust) — or just run the installer from the checkout.
 
 **Staying current:** `pallama upgrade` self-updates the binary from GitHub Releases (sha256-verified, same mechanism as engine installs; `--dry-run` to preview, `--version` to pin).
 
 ### What the installer does for you
 
-- **One-click readiness:** after the binary lands, it bootstraps the llama.cpp engine (idempotent — skips when an engine is already active) so a fresh install can serve inference immediately; failures are loud warnings, never silent. Opt out with `PALLAMA_INSTALL_ENGINE=0`, pre-pull a model with `PALLAMA_INSTALL_MODEL=<name>`, point engine downloads at a mirror with `PALLAMA_GH_BASE`, or cap the daemon cgroup with `PALLAMA_UNIT_MEMORY_HIGH` (systemd `MemoryHigh`, default `85%` of RAM — soft reclaim/throttle only, never an OOM kill; empty string omits the line).
-- **GPU preflight (Linux):** before the engine lands, the installer censuses PCI GPU hardware and — when the driver userspace is absent — installs it from **first-party distro repos only** (announce-then-act), then walks you through REBOOT → `pallama engine update`, which auto-picks the newest CUDA build your driver supports (runtimes bundled; no CUDA toolkit ever installed). Windows is advise-only; `pallama doctor` warns whenever PCI GPU hardware is present but its driver is not. Opt out with `PALLAMA_AUTO_DRIVER=0`. Full per-distro detail: [docs/7.SETUP — GPU driver preflight](docs/7.SETUP.md#gpu-driver-preflight-installer).
-- **Older glibc than 2.35, or Alpine?** Automatic fallback to the static musl build (32-bit ARM boards get the static `armv7-unknown-linux-musleabihf` build). Pin a version with `PALLAMA_VERSION=v0.4.0`, a mirror with `PALLAMA_INSTALL_BASE_URL`, or a build repo with `PALLAMA_CHECKOUT`. No toolchain? It is bootstrapped for you (`scripts/bootstrap.sh --minimal`, opt out with `PALLAMA_AUTO_BOOTSTRAP=0`).
-- **System-wide only, like ollama's installer:** root-owned binary in `/usr/local/bin` plus a systemd unit (`Restart=always`, GPU groups, auto-start, restart-on-upgrade; runs as the invoking user — under `sudo` the unit targets `SUDO_USER`, not root) on Linux, or a launchd service (`KeepAlive`, `RunAtLoad`) on macOS. There is deliberately no user-path (`~/.local/bin`) install mode: a second copy there is how stale-binary daemon races happen (`pallama doctor` flags any that already exist, and the installer removes one it finds). Root or sudo is required.
+| Capability | Detail |
+|---|---|
+| **One-click readiness** | After the binary lands, bootstraps the llama.cpp engine (idempotent — skips when an engine is already active) so a fresh install serves inference immediately; failures are loud warnings, never silent. Opt out `PALLAMA_INSTALL_ENGINE=0` · pre-pull a model `PALLAMA_INSTALL_MODEL=<name>` · engine mirror `PALLAMA_GH_BASE` · daemon cgroup cap `PALLAMA_UNIT_MEMORY_HIGH` (systemd `MemoryHigh`, default `85%` of RAM — soft reclaim/throttle only, never an OOM kill; empty string omits the line) |
+| **GPU preflight (Linux)** | Before the engine lands: censuses PCI GPU hardware; when driver userspace is absent, installs it from **first-party distro repos only** (announce-then-act), then walks you through REBOOT → `pallama engine update`, which auto-picks the newest CUDA build your driver supports (runtimes bundled; no CUDA toolkit ever installed). Windows is advise-only (`pallama doctor` warns on driverless GPUs). Opt out `PALLAMA_AUTO_DRIVER=0`. Per-distro detail: [docs/7.SETUP — GPU driver preflight](docs/7.SETUP.md#gpu-driver-preflight-installer) |
+| **Old glibc or Alpine** | Automatic fallback to the static musl build. Pin a version `PALLAMA_VERSION=v0.4.0` · mirror `PALLAMA_INSTALL_BASE_URL` · build repo `PALLAMA_CHECKOUT`. No toolchain? Bootstrapped for you (`scripts/bootstrap.sh --minimal`, opt out `PALLAMA_AUTO_BOOTSTRAP=0`) |
+| **System-wide only, like ollama's installer** | Root-owned binary in `/usr/local/bin` plus a systemd unit (`Restart=always`, GPU groups, auto-start, restart-on-upgrade; runs as the invoking user — under `sudo` the unit targets `SUDO_USER`, not root) on Linux, or a launchd service on macOS. Deliberately no user-path (`~/.local/bin`) mode: a second copy there is how stale-binary daemon races happen (`pallama doctor` flags any; the installer removes one it finds). Root or sudo required |
 
 ### Uninstall
 
-`sh scripts/uninstall.sh` removes everything the installer put here plus per-user state — services, binary, unit + drop-ins, config (incl. `gh-token.env`), store, engines, runtime/caches — in one pass. Models are the one exception: GGUF + whisper model files are expensive re-downloads, so the script **asks first** (sizes shown, default keep; `--remove-models`/`--yes` for non-interactive full nuke, `--keep-models` to skip the prompt, `--dry-run` for an action transcript). For the quick binary+units-only removal, `sh scripts/install.sh --uninstall` leaves all user data in place (models and config under `~/.local/share/pallama` / `~/.config/pallama` stay until you delete them).
+| Mode | Command | Scope |
+|---|---|---|
+| Full | `sh scripts/uninstall.sh` | Services, binary, unit + drop-ins, config (incl. `gh-token.env`), store, engines, runtime/caches — models **asked first** (sizes shown, default keep; `--remove-models`/`--yes` non-interactive, `--keep-models` skip, `--dry-run` transcript) |
+| Quick | `sh scripts/install.sh --uninstall` | Binary + units only; models and config under `~/.local/share/pallama` / `~/.config/pallama` stay until you delete them |
 
 ## 60-second quickstart
 
@@ -173,9 +161,11 @@ Want a CUDA build from source? `pallama engine build cuda` compiles the in-tree 
 
 Three API dialects on the one port:
 
-- **OpenAI:** `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/rerank`, `/v1/messages`, `/v1/responses`, `/v1/batches`, `/v1/files`, `/v1/audio/transcriptions`, `/infill`, `/tokenize`
-- **Ollama:** `/api/chat`, `/api/generate`, `/api/tags`, `/api/ps`, `/api/pull`
-- **pallama-native:** `/api/evict`, `/api/session` + session bank, `/api/keys`, `/api/why`, `/api/watch`, `/.well-known/pallama` capability discovery
+| Dialect | Endpoints |
+|---|---|
+| **OpenAI** | `/v1/chat/completions` · `/v1/completions` · `/v1/embeddings` · `/v1/rerank` · `/v1/messages` · `/v1/responses` · `/v1/batches` · `/v1/files` · `/v1/audio/transcriptions` · `/v1/audio/speech` · `/infill` · `/tokenize` |
+| **Ollama** | `/api/chat` · `/api/generate` · `/api/tags` · `/api/ps` · `/api/pull` |
+| **pallama-native** | `/api/evict` · `/api/session` + session bank · `/api/keys` · `/api/why` · `/api/watch` · `/.well-known/pallama` capability discovery |
 
 Full route table with payloads and error codes: [docs/4.API_SPEC](docs/4.API_SPEC.md).
 
@@ -191,7 +181,7 @@ The advanced surface, grouped by job. `--json`/JSONL output on the inspection co
 | `pallama import model.gguf --name x` | Register a GGUF already on disk — hardlinked in place, zero copy |
 | `pallama quantize -t Q4_K_M [--imatrix calib.txt]` | Derive new quants locally with the engine's own llama-quantize; imatrix calibration for better Q4 accuracy |
 | `pallama create` | Parameter aliases from a Modelfile (`FROM` + `PARAMETER`) — zero-copy, no 30–60 GB blob duplication |
-| `pallama lora` / `pallama mmproj` | LoRA adapter management; attach a vision projector to any model |
+| `pallama lora` / `pallama mmproj` | LoRA adapter management; request `model+adapter` to spawn a variant beside the dense model; attach a vision projector to any model |
 | `pallama search --format <tag>` | Search Hugging Face across every weight format |
 | `pallama fit [--json]` | VRAM fit + quant alternatives *before* downloading |
 | `pallama coreside` | Co-residency plan: which local models fit in VRAM together (weights + f16 KV at each model's ctx) |
@@ -202,7 +192,7 @@ The advanced surface, grouped by job. `--json`/JSONL output on the inspection co
 |---|---|
 | `pallama tune --search` | Measured launch profile: grid argmax over real runs; live probes for slots/n-gram/load tuning |
 | `pallama bench` | llama-bench runner for measured, comparable numbers |
-| `pallama drafts <model>` | Speculative-decoding draft candidates — EAGLE3/MTP heads plus small same-family models |
+| `pallama drafts <model>` | Speculative-decoding candidates — EAGLE3/MTP heads plus small same-family models; steer per request with `options.spec` or `--no-draft` |
 
 **Operations & safety**
 
@@ -216,6 +206,7 @@ The advanced surface, grouped by job. `--json`/JSONL output on the inspection co
 | `pallama snapshot` | Timestamped backup of config + store + sessions manifest (older ones auto-pruned) |
 | `pallama doctor` / `pallama why` / `pallama watch` | One-table diagnosis; post-hoc trace answers; live tail of sentinel detections |
 | `pallama whisper` | Audio transcription (wav/mp3/flac/…; `--install`/`--pull`/`--list` manage the model) |
+| `pallama tts` | Offline speech synthesis (piper): `--install` the engine, `--pull <voice>` from the voice catalog, `--list` voices; WAV to file or stdout |
 
 Plus `cp`/`rm`/`stop` for model housekeeping, `migrate` (config migration with timestamped backup), and `completions <shell>`.
 
@@ -253,7 +244,7 @@ Every row is a real, long-standing ollama complaint with pallama's root-cause re
 
 | ollama failure | pallama resolution |
 |---|---|
-| Hidden concurrency | `ps` shows slots/ctx/ports/in-flight; loaders stream `X-Pallama-Status: loading`; explicit priority queue (`X-Pallama-Priority`) |
+| Hidden concurrency | `ps` shows slots/ctx/ports/in-flight/spec/cache-hit; loaders stream `X-Pallama-Status: loading`; explicit priority queue (`X-Pallama-Priority`) |
 | No session/context persistence | `pallama session save/restore`: slot KV checkpoints that survive unload and daemon restarts |
 | No diagnostics when things break | `pallama doctor`: config (incl. stale pins), port conflicts (incl. the ollama-11434 class), engine, hardware, disk, model health (model-dir orphans vs the store, hardlink twins flagged as zero-space), update-currency in one table |
 | No discovery; env sprawl | `pallama search` (HF, every weight format via `--format`); every knob in one documented `config.toml`, inspectable via `pallama config` |
@@ -274,9 +265,11 @@ Every row is a real, long-standing ollama complaint with pallama's root-cause re
 
 One active engine serves at a time (`pallama engine use`), but models come in formats engines digest differently. Routing is on by default and picks the lane per model at spawn time:
 
-- quantized safetensors (AWQ/GPTQ/FP8) → sglang only
-- GGUF → llama.cpp (mistral.rs as alternate)
-- plain safetensors → sglang or mistral.rs per `policy` (quality / latency / throughput)
+| Model format | Lane |
+|---|---|
+| Quantized safetensors (AWQ/GPTQ/FP8) | sglang only |
+| GGUF | llama.cpp (mistral.rs as alternate) |
+| Plain safetensors | sglang or mistral.rs per `policy` (quality / latency / throughput) |
 
 `mode = "manual"` keeps one engine for everything (byte-identical to pre-routing behavior); a per-model `[model_overrides] engine = ...` pin wins over both modes. Both API dialects route identically; `pallama list`, `/v1/models`, and `/api/tags` all show the resolved engine per model; nothing-can-serve is a teaching error, never a guess. Details + decision table: [docs/2.ARCHITECTURE](docs/2.ARCHITECTURE.md) and [docs/10.SCIENTIFIC](docs/10.SCIENTIFIC.md).
 
@@ -295,18 +288,27 @@ pallama-cli       the `pallama` binary: clap commands, REPL, auto-start
 
 ### Design principles
 
-- **Capability manifest** — engines are probed after install; the profile compiler emits only flags the installed build supports. Engine drift becomes a data problem.
-- **Prebuilt CUDA, straight from upstream** — official llama.cpp ubuntu-cuda assets install automatically on Linux-NVIDIA boxes (same-release first, scan-back for the newest that ships one); `PALLAMA_ENGINE_REPO` opts into a self-hosted overlay for sm-slim builds.
-- **Bytes-based VRAM admission** — heterogeneous models co-reside by actual bytes, not a count heuristic.
-- **Eviction ladder** — child-native sleep at `idle_sleep_secs` → SIGTERM at `idle_timeout_secs`; nothing burns VRAM forever, nothing dies mid-request.
-- **Zero-tax proxy** — OpenAI traffic forwarded byte-for-byte; client disconnect aborts the upstream request and frees the slot.
-- **Single-pid signals only.**
+| Principle | What it buys you |
+|---|---|
+| **Capability manifest** | Engines are probed after install; the profile compiler emits only flags the installed build supports — engine drift becomes a data problem, not an outage |
+| **Prebuilt CUDA, straight from upstream** | Official llama.cpp ubuntu-cuda assets install automatically on Linux-NVIDIA boxes (same-release first, scan-back for the newest that ships one); `PALLAMA_ENGINE_REPO` opts into a self-hosted overlay for sm-slim builds |
+| **Bytes-based VRAM admission** | Heterogeneous models co-reside by actual bytes, not a count heuristic |
+| **Eviction ladder** | Child-native sleep at `idle_sleep_secs` → SIGTERM at `idle_timeout_secs`; nothing burns VRAM forever, nothing dies mid-request |
+| **Zero-tax proxy** | OpenAI traffic forwarded byte-for-byte; client disconnect aborts the upstream request and frees the slot |
+| **Single-pid signals only** | pallama never signals a process group — an errant kill can never take down your shell session or unrelated children |
 
 Full walkthrough: [docs/2.ARCHITECTURE](docs/2.ARCHITECTURE.md).
 
 ## Quality
 
-1099 tests (compiler tables, wiremock network suites, engine install cycles with a real stub engine, supervisor lifecycle integration, full gateway round-trips over both APIs incl. sentinel suites); `cargo clippy --workspace --all-targets -- -D warnings` clean; live E2E harnesses with a real engine (`scripts/validate.py`, `scripts/bench_matrix.py`); CI runs the suite plus shellcheck, ruff, installer e2e on x86_64 and arm64 Linux, dependency CVE audit, and repo hygiene gates. Details: [docs/7.SETUP](docs/7.SETUP.md).
+| Gate | Standing |
+|---|---|
+| Tests | **1099** — compiler tables, wiremock network suites, engine install cycles with a real stub engine, supervisor lifecycle integration, full gateway round-trips over both APIs incl. sentinel suites |
+| Lint | `cargo clippy --workspace --all-targets -- -D warnings` clean |
+| Live E2E | Real-engine harnesses: `scripts/validate.py`, `scripts/bench_matrix.py` |
+| CI | The suite plus shellcheck, ruff, installer e2e on x86_64 **and** arm64 Linux, dependency CVE audit, repo hygiene gates |
+
+Details: [docs/7.SETUP](docs/7.SETUP.md).
 
 ## Documentation
 
