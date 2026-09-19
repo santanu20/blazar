@@ -1306,6 +1306,9 @@ fn child_error_body(v: &Value) -> Option<String> {
 /// hit headers. Eval counts come from the original generation.
 fn semcache_hit_response(model: &str, cached: &Value, id: u64, sim: f32) -> Response {
     let mut ollama = tr::openai_chat_to_ollama(model, cached);
+    // Entries cached before raw-think suppression may carry think
+    // blocks in content; stripping again is idempotent for clean ones.
+    tr::suppress_raw_think_response(&mut ollama);
     ollama["cache_debug"] = serde_json::json!({
         "cache_hit": true,
         "hit_type": "semantic",
@@ -1551,6 +1554,12 @@ async fn proxy_core_chat(
             OutputShape::Chat => tr::openai_chat_to_ollama(model, &openai),
             OutputShape::Generate => tr::openai_chat_to_generate(model, &openai),
         };
+        // Templates that ignore the thinking-off kwargs still emit raw
+        // <think> blocks; hide them when the request did not ask for
+        // thinking (already-split content is unaffected — idempotent).
+        if !tr::request_think_on(&openai_body) {
+            tr::suppress_raw_think_response(&mut ollama);
+        }
         // Cold-load wall (only when a spawn actually happened) for ollama
         // parity: clients read load_duration after first requests.
         if load_ms > 100 {
@@ -1676,6 +1685,7 @@ async fn proxy_core_chat(
             std::sync::Arc::clone(&state.obs),
             shape,
             tr::ToolCallAccum::default(),
+            (!tr::request_think_on(&openai_body)).then(tr::ThinkSplitter::new),
         ),
         |(
             mut stream,
@@ -1690,6 +1700,7 @@ async fn proxy_core_chat(
             obs,
             shape,
             mut tool_accum,
+            mut think_split,
         )| async move {
             loop {
                 if done && !usage_sent {
@@ -1736,11 +1747,52 @@ async fn proxy_core_chat(
                     // A stream that ended mid-call (no post-fragment chunk)
                     // still owes the client its merged tool_calls line.
                     let flush_prefix = tool_accum.flush_line(&model).unwrap_or_default();
+                    // The think suppressor may still hold a literal tail
+                    // (an unterminated marker prefix is plain text); ship
+                    // it as one last content line before the final chunk.
+                    let think_tail = match think_split.as_mut() {
+                        Some(splitter) => {
+                            let tail = splitter.finish();
+                            if tail.is_empty() {
+                                String::new()
+                            } else {
+                                let ev = json!({"choices": [{"delta": {"content": tail}}]});
+                                let lines = match shape {
+                                    OutputShape::Chat => {
+                                        tr::openai_chunk_to_ollama(&mut tool_accum, &model, &ev)
+                                    }
+                                    OutputShape::Generate => {
+                                        tr::openai_chunk_to_generate(&model, &ev)
+                                    }
+                                };
+                                let mut rendered = String::new();
+                                for line in lines {
+                                    rendered.push_str(&line.to_string());
+                                    rendered.push('\n');
+                                }
+                                rendered
+                            }
+                        }
+                        None => String::new(),
+                    };
                     return Some((
-                        Ok(Bytes::from(format!("{flush_prefix}{final_chunk}\n"))),
+                        Ok(Bytes::from(format!(
+                            "{flush_prefix}{think_tail}{final_chunk}\n"
+                        ))),
                         (
-                            stream, buf, lines, model, done, usage, finish, usage_sent, clock, obs,
-                            shape, tool_accum,
+                            stream,
+                            buf,
+                            lines,
+                            model,
+                            done,
+                            usage,
+                            finish,
+                            usage_sent,
+                            clock,
+                            obs,
+                            shape,
+                            tool_accum,
+                            think_split,
                         ),
                     ));
                 }
@@ -1762,6 +1814,27 @@ async fn proxy_core_chat(
                         if saw_done {
                             done = true;
                         }
+                        // Raw <think> suppression: rewrite the content
+                        // delta in place; an emptied delta renders no
+                        // ollama line (both translators skip empty
+                        // content).
+                        let mut events = events;
+                        if let Some(splitter) = think_split.as_mut() {
+                            for ev in &mut events {
+                                let Some(delta) = ev
+                                    .get_mut("choices")
+                                    .and_then(Value::as_array_mut)
+                                    .and_then(|c| c.first_mut())
+                                    .and_then(|c| c.get_mut("delta"))
+                                    .and_then(|d| d.get_mut("content"))
+                                else {
+                                    continue;
+                                };
+                                if let Value::String(content) = delta {
+                                    *content = splitter.feed(content.as_str());
+                                }
+                            }
+                        }
                         let ndjson_lines: Vec<String> = events
                             .iter()
                             .flat_map(|ev| match shape {
@@ -1779,8 +1852,19 @@ async fn proxy_core_chat(
                         return Some((
                             Ok(Bytes::from(body)),
                             (
-                                stream, buf, lines, model, done, usage, finish, usage_sent, clock,
-                                obs, shape, tool_accum,
+                                stream,
+                                buf,
+                                lines,
+                                model,
+                                done,
+                                usage,
+                                finish,
+                                usage_sent,
+                                clock,
+                                obs,
+                                shape,
+                                tool_accum,
+                                think_split,
                             ),
                         ));
                     }
@@ -1788,8 +1872,19 @@ async fn proxy_core_chat(
                         return Some((
                             Err(std::io::Error::other(e.to_string())),
                             (
-                                stream, buf, lines, model, done, usage, finish, usage_sent, clock,
-                                obs, shape, tool_accum,
+                                stream,
+                                buf,
+                                lines,
+                                model,
+                                done,
+                                usage,
+                                finish,
+                                usage_sent,
+                                clock,
+                                obs,
+                                shape,
+                                tool_accum,
+                                think_split,
                             ),
                         ));
                     }

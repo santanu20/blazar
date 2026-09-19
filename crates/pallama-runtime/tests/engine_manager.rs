@@ -1383,7 +1383,11 @@ async fn integration__stale_release_gpu_missing__cpu_last_resort() {
     let (_t, dirs) = tmp_dirs();
     let api = MockServer::start().await;
     let tar = fixture_host_archive("b100");
-    let cpu_asset = format!("llama-b100-bin-{}.{}", host_cpu_asset_label(), host_asset_ext());
+    let cpu_asset = format!(
+        "llama-b100-bin-{}.{}",
+        host_cpu_asset_label(),
+        host_asset_ext()
+    );
     let stale = iso_from_epoch(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1666,7 +1670,11 @@ async fn integration__update_resolved__keep_cuda_skip_downloads_nothing() {
     // Channel release carries ONLY the host platform's primary asset. No
     // /download mock is mounted: any fetch attempt 404s and fails the
     // test — the skip must guarantee the standard lane never downloads.
-    let primary_asset = format!("llama-b10910-bin-{}.{}", host_asset_labels()[0], host_asset_ext());
+    let primary_asset = format!(
+        "llama-b10910-bin-{}.{}",
+        host_asset_labels()[0],
+        host_asset_ext()
+    );
     let release: GhRelease = serde_json::from_value(serde_json::json!({
         "tag_name": "b10910",
         "prerelease": true,

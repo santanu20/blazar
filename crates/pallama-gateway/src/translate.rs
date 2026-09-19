@@ -923,6 +923,157 @@ pub fn openai_chunk_to_generate(model: &str, chunk: &Value) -> Vec<Value> {
     out
 }
 
+/// Streaming `<think>` suppressor (ollama parity). Models whose chat
+/// template ignores the thinking-off kwargs still emit raw
+/// `<think>...</think>` blocks inside ordinary content; the ollama
+/// dialect expects the gateway to hide reasoning when thinking is not
+/// requested. Feed each content delta through [`ThinkSplitter::feed`]
+/// and forward only what it returns — think blocks and their markers
+/// vanish, plain text passes through untouched, and a marker split
+/// across chunk boundaries is handled by holding back the ambiguous
+/// tail until it resolves.
+pub struct ThinkSplitter {
+    in_think: bool,
+    held: String,
+}
+
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+impl Default for ThinkSplitter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ThinkSplitter {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            in_think: false,
+            held: String::new(),
+        }
+    }
+
+    /// Feed one content delta; returns the text to forward. Everything
+    /// inside a think block (and the markers themselves) is dropped.
+    /// A partial marker at the tail is held back until the next feed
+    /// or [`ThinkSplitter::finish`] resolves it.
+    pub fn feed(&mut self, delta: &str) -> String {
+        let mut pending = std::mem::take(&mut self.held);
+        pending.push_str(delta);
+        let mut out = String::new();
+        loop {
+            if self.in_think {
+                let Some(pos) = pending.find(THINK_CLOSE) else {
+                    // No close marker yet: suppress everything except a
+                    // possible marker prefix at the tail.
+                    let keep = tail_marker_prefix_len(&pending, THINK_CLOSE);
+                    let suppress = pending.len() - keep;
+                    pending.drain(..suppress);
+                    self.held = pending;
+                    return out;
+                };
+                pending.drain(..pos + THINK_CLOSE.len());
+                self.in_think = false;
+            } else {
+                let Some(pos) = pending.find(THINK_OPEN) else {
+                    let keep = tail_marker_prefix_len(&pending, THINK_OPEN);
+                    let emit = pending.len() - keep;
+                    out.push_str(&pending[..emit]);
+                    pending.drain(..emit);
+                    self.held = pending;
+                    return out;
+                };
+                out.push_str(&pending[..pos]);
+                pending.drain(..pos + THINK_OPEN.len());
+                self.in_think = true;
+            }
+        }
+    }
+
+    /// End of stream: an unterminated think block was reasoning all
+    /// the way down (drop it); otherwise a held partial marker is
+    /// literal text and ships as content.
+    pub fn finish(&mut self) -> String {
+        let held = std::mem::take(&mut self.held);
+        if self.in_think {
+            String::new()
+        } else {
+            held
+        }
+    }
+}
+
+/// Length of the longest proper prefix of `marker` that the string
+/// ends with — the bytes that might grow into the marker on the next
+/// delta. Char-boundary checked so multibyte tails never split.
+fn tail_marker_prefix_len(s: &str, marker: &str) -> usize {
+    let marker_bytes = marker.as_bytes();
+    for len in (1..marker_bytes.len()).rev() {
+        if len > s.len() {
+            continue;
+        }
+        if s.as_bytes().ends_with(&marker_bytes[..len]) && s.is_char_boundary(s.len() - len) {
+            return len;
+        }
+    }
+    0
+}
+
+/// One-shot think suppression for a complete content string.
+#[must_use]
+pub fn suppress_think_text(text: &str) -> String {
+    let mut splitter = ThinkSplitter::new();
+    let mut out = splitter.feed(text);
+    out.push_str(&splitter.finish());
+    out
+}
+
+/// Whether the translated child request carries thinking ON. The
+/// gateway think gates plus the translator fill
+/// `chat_template_kwargs.thinking`/`enable_thinking` for every
+/// explicit or defaulted toggle, so a missing or false pair means the
+/// effective request runs with thinking off.
+pub fn request_think_on(body: &[u8]) -> bool {
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let kwargs = v.get("chat_template_kwargs");
+    kwargs
+        .and_then(|k| k.get("thinking"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            kwargs
+                .and_then(|k| k.get("enable_thinking"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+/// Strip raw think blocks from a complete ollama-shaped response
+/// (chat `message.content` and generate `response` — whichever key
+/// exists). Idempotent: an already-split response passes through.
+pub fn suppress_raw_think_response(v: &mut Value) {
+    if let Some(choices) = v.get_mut("choices").and_then(Value::as_array_mut) {
+        for choice in choices {
+            if let Some(Value::String(content)) =
+                choice.get_mut("message").and_then(|m| m.get_mut("content"))
+            {
+                *content = suppress_think_text(content);
+            }
+        }
+    }
+    if let Some(Value::String(response)) = v.get_mut("response") {
+        *response = suppress_think_text(response);
+    }
+    // Ollama chat shape (non-stream): the content lives on a top-level
+    // `message` object, not under `choices`.
+    if let Some(Value::String(content)) = v.get_mut("message").and_then(|m| m.get_mut("content")) {
+        *content = suppress_think_text(content);
+    }
+}
+
 /// Final ollama generate line from usage/finish (stream path — gateway-
 /// measured durations, same contract as `ollama_final_chunk`).
 #[must_use]
@@ -1767,5 +1918,119 @@ mod tests {
         }))
         .unwrap();
         assert!(out4.get("grammar").is_none());
+    }
+
+    #[test]
+    fn unit__think_splitter__suppresses_whole_block_in_one_delta() {
+        let mut sp = ThinkSplitter::new();
+        assert_eq!(
+            sp.feed("Hello!<think>secret reasoning</think>Bye."),
+            "Hello!Bye."
+        );
+        assert_eq!(sp.finish(), "");
+    }
+
+    #[test]
+    fn unit__think_splitter__handles_marker_split_across_deltas() {
+        // '<th' is ambiguous (could grow into <think>) — held back; the
+        // next delta completes the marker and the block is suppressed.
+        let mut sp = ThinkSplitter::new();
+        assert_eq!(sp.feed("A<th"), "A");
+        assert_eq!(sp.feed("ink>x</th"), "");
+        assert_eq!(sp.feed("ink>B"), "B");
+        assert_eq!(sp.finish(), "");
+        // Same for a closing marker split mid-shard.
+        let mut sp2 = ThinkSplitter::new();
+        assert_eq!(sp2.feed("<think>reasoning</"), "");
+        assert_eq!(sp2.feed("think>done"), "done");
+        assert_eq!(sp2.finish(), "");
+    }
+
+    #[test]
+    fn unit__think_splitter__unterminated_think_drops_at_finish() {
+        let mut sp = ThinkSplitter::new();
+        assert_eq!(sp.feed("ok<think>half a thought, stream cut"), "ok");
+        assert_eq!(sp.finish(), "");
+    }
+
+    #[test]
+    fn unit__think_splitter__partial_marker_tail_ships_literal_at_finish() {
+        let mut sp = ThinkSplitter::new();
+        // 'hi<' is not a marker prefix... '<' alone IS a prefix of
+        // <think> — held at EOS it must ship literally.
+        assert_eq!(sp.feed("plain text <"), "plain text ");
+        assert_eq!(sp.finish(), "<");
+    }
+
+    #[test]
+    fn unit__think_splitter__no_think_passthrough_exact() {
+        let mut sp = ThinkSplitter::new();
+        assert_eq!(
+            sp.feed("plain answer, no markers at all"),
+            "plain answer, no markers at all"
+        );
+        assert_eq!(sp.finish(), "");
+    }
+
+    #[test]
+    fn unit__think_splitter__multiple_blocks_in_one_delta() {
+        let mut sp = ThinkSplitter::new();
+        assert_eq!(sp.feed("A<think>x</think>B<think>y</think>C"), "ABC");
+        assert_eq!(sp.finish(), "");
+    }
+
+    #[test]
+    fn unit__think_splitter__empty_deltas_are_inert() {
+        let mut sp = ThinkSplitter::new();
+        assert_eq!(sp.feed(""), "");
+        assert_eq!(sp.feed("<think>"), "");
+        assert_eq!(sp.feed(""), "");
+        assert_eq!(sp.feed("</think>"), "");
+        assert_eq!(sp.finish(), "");
+    }
+
+    #[test]
+    fn unit__suppress_think_text__idempotent_on_clean_text() {
+        assert_eq!(suppress_think_text("clean"), "clean");
+        assert_eq!(
+            suppress_think_text(&suppress_think_text("a<think>b</think>c")),
+            "ac"
+        );
+    }
+
+    #[test]
+    fn unit__suppress_raw_think_response__chat_and_generate_shapes() {
+        let mut chat = json!({
+            "choices": [{"message": {"role": "assistant", "content": "<think>why</think>answer"}}],
+        });
+        suppress_raw_think_response(&mut chat);
+        assert_eq!(chat["choices"][0]["message"]["content"], json!("answer"));
+        // Idempotent: a second pass leaves the clean text untouched.
+        suppress_raw_think_response(&mut chat);
+        assert_eq!(chat["choices"][0]["message"]["content"], json!("answer"));
+
+        let mut gen = json!({"response": "<think>plan</think>result"});
+        suppress_raw_think_response(&mut gen);
+        assert_eq!(gen["response"], json!("result"));
+
+        // Ollama chat non-stream shape: top-level message.content.
+        let mut ollama_chat =
+            json!({"message": {"role": "assistant", "content": "<think>why</think>answer"}});
+        suppress_raw_think_response(&mut ollama_chat);
+        assert_eq!(ollama_chat["message"]["content"], json!("answer"));
+    }
+
+    #[test]
+    fn unit__request_think_on__reads_translator_kwargs() {
+        let on = json!({"chat_template_kwargs": {"thinking": true, "enable_thinking": true}});
+        assert!(request_think_on(on.to_string().as_bytes()));
+        let enable_only = json!({"chat_template_kwargs": {"enable_thinking": true}});
+        assert!(request_think_on(enable_only.to_string().as_bytes()));
+        // Absent or false means the answer should be clean content.
+        assert!(!request_think_on(br"{}"));
+        let off = json!({"chat_template_kwargs": {"thinking": false, "enable_thinking": false}});
+        assert!(!request_think_on(off.to_string().as_bytes()));
+        // Garbage bytes are not a think-on request.
+        assert!(!request_think_on(b"not json"));
     }
 }
