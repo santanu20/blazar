@@ -317,7 +317,7 @@ Full walkthrough: [docs/2.ARCHITECTURE](docs/2.ARCHITECTURE.md).
 
 | Gate | Standing |
 |---|---|
-| Tests | **1099** — compiler tables, wiremock network suites, engine install cycles with a real stub engine, supervisor lifecycle integration, full gateway round-trips over both APIs incl. sentinel suites |
+| Tests | **1134** — compiler tables, wiremock network suites, engine install cycles with a real stub engine, supervisor lifecycle integration, full gateway round-trips over both APIs incl. sentinel suites |
 | Lint | `cargo clippy --workspace --all-targets -- -D warnings` clean |
 | Live E2E | Real-engine harnesses: `scripts/validate.py`, `scripts/bench_matrix.py` |
 | CI | The suite plus shellcheck, ruff, installer e2e on x86_64 **and** arm64 Linux, dependency CVE audit, repo hygiene gates |
