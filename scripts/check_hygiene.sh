@@ -17,7 +17,9 @@ set -u
 # Each allowlisted hit must carry a functional justification:
 # - /home/other (manifest.rs): invented-user fixture proving that a
 #   manifest recorded on a foreign machine re-roots onto this install.
-ALLOWLIST='crates/pallama-runtime/src/engine/manifest\.rs:[0-9]*:.*"/home/other/\.local/share/pallama.*'
+# - /home/other (pallama-cli main.rs): invented-user fixture proving the
+#   list rendering never truncates long foreign model paths.
+ALLOWLIST='crates/pallama-runtime/src/engine/manifest\.rs:[0-9]*:.*"/home/other/\.local/share/pallama.*|crates/pallama-cli/src/main\.rs:[0-9]*:.*"/home/other/\.local/share/pallama.*'
 
 # Machine-specific absolute paths: real home dirs and agent scratch
 # areas. Functionally-required system prefixes (/usr/local/bin,

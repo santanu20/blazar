@@ -10164,7 +10164,7 @@ mod tests {
     #[test]
     fn unit__render_list_table__name_never_truncated_bands_keep_values_whole() {
         let long_tag = "fork-csabakecskemeti_llama.cpp-7a3c74eb-cuda";
-        let long_path = "/home/user/.local/share/pallama/models/amd.Instella-MoE-16B-A3B-Think.f16.gguf.Q2_K.gguf";
+        let long_path = "/home/other/.local/share/pallama/models/amd.Instella-MoE-16B-A3B-Think.f16.gguf.Q2_K.gguf";
         let rows = [
             [
                 "amd.instella-moe-16b-a3b-think".to_string(),
