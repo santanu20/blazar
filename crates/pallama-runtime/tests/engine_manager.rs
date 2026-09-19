@@ -195,13 +195,33 @@ fn host_cpu_asset_label() -> &'static str {
     }
 }
 
+/// Archive bytes matching the wire shape the picker expects for this
+/// host: upstream publishes win-* assets as zip, everything else as
+/// tar.gz (see `gh::asset_filename`). Fixtures carrying the wrong
+/// extension make the picker report "no usable asset".
+fn fixture_host_archive(tag: &str) -> Vec<u8> {
+    if cfg!(windows) {
+        fixture_zip(tag)
+    } else {
+        fixture_tarball(tag)
+    }
+}
+
+fn host_asset_ext() -> &'static str {
+    if cfg!(windows) {
+        "zip"
+    } else {
+        "tar.gz"
+    }
+}
+
 /// Release-`assets` JSON for every host-platform candidate, digest and
 /// size included, download URLs pointing at the wiremock server.
 fn host_assets_json(api_uri: &str, tag: &str, tar: &[u8]) -> serde_json::Value {
     host_asset_labels()
         .iter()
         .map(|label| {
-            let name = format!("llama-{tag}-bin-{label}.tar.gz");
+            let name = format!("llama-{tag}-bin-{label}.{}", host_asset_ext());
             serde_json::json!({
                 "name": name,
                 "digest": format!("sha256:{}", sha256_hex(tar)),
@@ -1241,7 +1261,7 @@ async fn integration__asset_override_missing__names_available() {
 async fn integration__fresh_release_upload_race__waits_then_installs() {
     let (_t, dirs) = tmp_dirs();
     let api = MockServer::start().await;
-    let tar = fixture_tarball("b100");
+    let tar = fixture_host_archive("b100");
     let complete = serde_json::json!({
         "tag_name": "b100",
         "prerelease": true,
@@ -1272,7 +1292,7 @@ async fn integration__fresh_release_upload_race__waits_then_installs() {
         .mount(&api)
         .await;
     for label in host_asset_labels() {
-        let name = format!("llama-b100-bin-{label}.tar.gz");
+        let name = format!("llama-b100-bin-{label}.{}", host_asset_ext());
         Mock::given(method("GET"))
             .and(path(format!("/download/b100/{name}")))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(tar.clone()))
@@ -1362,8 +1382,8 @@ async fn integration__stale_release_no_assets__teaching_error_no_wait() {
 async fn integration__stale_release_gpu_missing__cpu_last_resort() {
     let (_t, dirs) = tmp_dirs();
     let api = MockServer::start().await;
-    let tar = fixture_tarball("b100");
-    let cpu_asset = format!("llama-b100-bin-{}.tar.gz", host_cpu_asset_label());
+    let tar = fixture_host_archive("b100");
+    let cpu_asset = format!("llama-b100-bin-{}.{}", host_cpu_asset_label(), host_asset_ext());
     let stale = iso_from_epoch(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1646,7 +1666,7 @@ async fn integration__update_resolved__keep_cuda_skip_downloads_nothing() {
     // Channel release carries ONLY the host platform's primary asset. No
     // /download mock is mounted: any fetch attempt 404s and fails the
     // test — the skip must guarantee the standard lane never downloads.
-    let primary_asset = format!("llama-b10910-bin-{}.tar.gz", host_asset_labels()[0]);
+    let primary_asset = format!("llama-b10910-bin-{}.{}", host_asset_labels()[0], host_asset_ext());
     let release: GhRelease = serde_json::from_value(serde_json::json!({
         "tag_name": "b10910",
         "prerelease": true,
