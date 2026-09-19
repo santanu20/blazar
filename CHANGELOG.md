@@ -6,6 +6,8 @@ tracked here.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-19
+
 ### Changed
 - **Engine overlay channel moved off the product repo; all build automation removed.** The prebuilt CUDA channel's release home is now the dedicated `santanu20/pallama-engines` repo (`ENGINE_OVERLAY_REPO_DEFAULT`), populated only by explicit manual builds — never automatically. The hourly freshness watcher and the CUDA build workflow no longer exist in the product repo: nothing in either repo builds llama.cpp, dispatches workflows, or publishes `bNNNN-cuda` tags on its own. Self-hosted overlays point `PALLAMA_ENGINE_REPO` at their own repo; a missing or empty channel home costs one failed probe per `pallama engine update`, then the documented fallback lanes.
 
