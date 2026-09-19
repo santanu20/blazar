@@ -24,19 +24,28 @@ pub struct PallamaDirs {
 
 impl PallamaDirs {
     /// Real user directories via the `dirs` crate (XDG on Linux).
+    ///
+    /// An explicitly exported `XDG_CONFIG_HOME` / `XDG_DATA_HOME` wins on
+    /// EVERY platform, ahead of the platform default the `dirs` crate
+    /// would pick (macOS `~/Library/Application Support`, Windows
+    /// `%APPDATA%`). The override is deliberate user intent; the default
+    /// stays whatever the platform expects when the env is unset.
     /// F123: a missing HOME/XDG root falls back to CWD — loudly. The old
     /// silent `.` fallback hid a broken env until files started landing
     /// in whatever directory the daemon happened to start from.
     #[must_use]
     pub fn from_env() -> Self {
-        let config_root = dirs::config_dir().unwrap_or_else(|| {
-            warn_fallback("XDG config root");
-            PathBuf::from(".")
-        });
-        let data_root = dirs::data_dir().unwrap_or_else(|| {
-            warn_fallback("XDG data root");
-            PathBuf::from(".")
-        });
+        let xdg =
+            |var: &str, label: &str, platform_default: Option<PathBuf>| match std::env::var_os(var)
+            {
+                Some(v) if !v.is_empty() => PathBuf::from(v),
+                _ => platform_default.unwrap_or_else(|| {
+                    warn_fallback(label);
+                    PathBuf::from(".")
+                }),
+            };
+        let config_root = xdg("XDG_CONFIG_HOME", "XDG config root", dirs::config_dir());
+        let data_root = xdg("XDG_DATA_HOME", "XDG data root", dirs::data_dir());
         Self {
             config_dir: config_root.join("pallama"),
             data_dir: data_root.join("pallama"),
