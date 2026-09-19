@@ -784,15 +784,15 @@ pub fn resolve_mistralrs_asset(release: &GhRelease, picks: &[AssetPick]) -> Opti
         .cloned()
 }
 
-/// Release repo for the prebuilt CUDA overlay channel (our CI's
-/// `bNNNN-cuda` releases of upstream llama.cpp): the repo that runs
-/// the `engine-cuda` workflow. Live since 2026-09-13 (b10937-cuda
-/// built on demand); move the channel by flipping this ONE constant —
-/// a missing repo costs one failed release probe per `engine update`,
-/// then Vulkan fallback.
+/// Release repo for the prebuilt CUDA overlay channel (`bNNNN-cuda`
+/// releases of upstream llama.cpp). The channel home is the dedicated
+/// `pallama-engines` repo — never the product repo — and is populated
+/// only by explicit, manual builds; a missing or empty home costs one
+/// failed release probe per `engine update`, then Vulkan fallback.
+/// Self-hosted overlays point `PALLAMA_ENGINE_REPO` at their own repo.
 pub const ENGINE_OVERLAY_REPO_ENV: &str = "PALLAMA_ENGINE_REPO";
 
-pub const ENGINE_OVERLAY_REPO_DEFAULT: &str = "santanu20/pallama";
+pub const ENGINE_OVERLAY_REPO_DEFAULT: &str = "santanu20/pallama-engines";
 
 /// Overlay repo for the prebuilt CUDA channel: `PALLAMA_ENGINE_REPO`
 /// (e.g. a private fork) when set to a non-empty value, else the
