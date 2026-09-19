@@ -3,3 +3,16 @@ jobs = 2
 
 [term]
 color = "never"
+
+# Windows PE default main-thread stack is 1 MiB; the tokio main future
+# (whole CLI dispatch tree in one state machine) overflows it in debug
+# builds. Match the linux 8 MiB norm with headroom for the release
+# profiles too. Zero behavior change — stack reserve only.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-args=/STACK:16777216"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "link-args=/STACK:16777216"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-args=-Wl,--stack,16777216"]
