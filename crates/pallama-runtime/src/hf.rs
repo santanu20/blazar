@@ -261,28 +261,9 @@ pub fn select_files(siblings: &[HfSibling], wanted_quant: &str) -> Result<Select
         }
     }
 
-    let quant_of = |fname: &str| -> Option<String> {
-        // Works on full filenames ("m-q4_k_m.gguf") and shard bases
-        // ("m-q4_k_m"): the quant token is the trailing path-free segment.
-        let lower = fname.to_lowercase();
-        let leaf = lower.rsplit('/').next().unwrap_or(&lower);
-        let stem = leaf.strip_suffix(".gguf").unwrap_or(leaf);
-        let token = stem.rsplit('-').next()?;
-        // Recognized quant shapes: q4_k_m, q8_0, iq4_xs, fp16, bf16, f16, q2_k...
-        let t = token.trim_start_matches('.');
-        if t.starts_with('q')
-            || t.starts_with("iq")
-            || t.starts_with("bx")
-            || t == "fp16"
-            || t == "bf16"
-            || t == "f16"
-            || t == "f32"
-        {
-            Some(t.to_string())
-        } else {
-            None
-        }
-    };
+    // Same grammar as the search table (`quant_token_of`): shard bases
+    // and full filenames both parse, lowercase to match `wanted`.
+    let quant_of = |fname: &str| -> Option<String> { quant_token_of(fname) };
 
     // Exact-filename request (the quant slot carries a `.gguf` leaf,
     // e.g. `owner/repo:dflash-Model-Q8_0.gguf`): unambiguous single-file
@@ -932,6 +913,64 @@ pub struct SearchEntry {
     pub tags: Vec<String>,
 }
 
+/// Extract the quantization token from a filename or shard base, in
+/// lowercase. One grammar shared by the search-table listing
+/// (`quant_tokens`) and the actual file selection (`select_files`) so
+/// the two can never disagree on what counts as a quant:
+///
+/// - the leaf (path-free) segment, lowercased, `mmproj*` excluded;
+/// - `.gguf` suffix optional (shard base names have none);
+/// - a trailing `-NNNNN-of-NNNNN` shard marker is stripped first;
+/// - the token is the last `.`/`-`-separated segment, matching either
+///   the literal `fp16` or an `iq`/`tq`/`bf`/`q`/`f` prefix followed by
+///   a required ASCII digit and `[A-Za-z0-9_]*`.
+///
+/// `q4_k_m`, `iq4_xs`, `f16`, `bf16`, `f32` match; model-size tags
+/// (`3b`), dates (`2511`) and finetune words (`heretic`) don't — the
+/// required digit after the prefix is what separates them.
+fn quant_token_of(fname: &str) -> Option<String> {
+    let lower = fname.to_ascii_lowercase();
+    let leaf = lower.rsplit('/').next().unwrap_or(&lower);
+    if leaf.starts_with("mmproj") {
+        return None;
+    }
+    let stem = strip_shard_tail(leaf.strip_suffix(".gguf").unwrap_or(leaf));
+    let last = stem.rsplit(['.', '-']).next()?;
+    if last == "fp16" {
+        return Some(last.to_string());
+    }
+    for prefix in ["iq", "tq", "bf", "q", "f"] {
+        if let Some(rest) = last.strip_prefix(prefix) {
+            let mut chars = rest.chars();
+            if matches!(chars.next(), Some(d) if d.is_ascii_digit())
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                return Some(last.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Strip a trailing `-00001-of-00005` gguf-split marker, if present.
+/// `parse_shard_marker_pub` needs the `.gguf` suffix, so this walks the
+/// last 14 bytes by hand instead.
+fn strip_shard_tail(stem: &str) -> &str {
+    const TAIL: usize = "-00000-of-00000".len();
+    if stem.len() < TAIL {
+        return stem;
+    }
+    let (head, tail) = stem.split_at(stem.len() - TAIL);
+    let b = tail.as_bytes();
+    // `-NNNNN-of-NNNNN` layout: digits at 1..=5 and 10..=14.
+    let digits = |from: usize, to: usize| (from..to).all(|i| b[i].is_ascii_digit());
+    if b[0] == b'-' && &tail[6..9] == "-of" && digits(1, 6) && digits(10, TAIL) {
+        head
+    } else {
+        stem
+    }
+}
+
 /// Quant names advertised by a repo's GGUF filenames, canonical uppercase,
 /// deduped, alphabetically sorted. Powers the search table's QUANTS column
 /// so `pallama pull <REPO>[:quant]` can be chosen from the listing itself.
@@ -955,6 +994,8 @@ pub fn quant_tokens(names: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<Str
     out
 }
 
+/// `.gguf`-gated variant of [`quant_token_of`] for the search table:
+/// only real GGUF files contribute tokens, canonical uppercase.
 fn quant_token(filename: &str) -> Option<String> {
     if !std::path::Path::new(filename)
         .extension()
@@ -962,23 +1003,7 @@ fn quant_token(filename: &str) -> Option<String> {
     {
         return None;
     }
-    let lower = filename.to_ascii_lowercase();
-    if lower.starts_with("mmproj") {
-        return None;
-    }
-    let stem = &lower[..lower.len() - ".gguf".len()];
-    let last = stem.rsplit(['.', '-']).next()?;
-    for prefix in ["iq", "tq", "bf", "q", "f"] {
-        if let Some(rest) = last.strip_prefix(prefix) {
-            let mut chars = rest.chars();
-            if matches!(chars.next(), Some(d) if d.is_ascii_digit())
-                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
-                return Some(last.to_ascii_uppercase());
-            }
-        }
-    }
-    None
+    quant_token_of(filename).map(|t| t.to_ascii_uppercase())
 }
 
 impl HfClient {
@@ -2393,6 +2418,71 @@ mod tests {
             "size": size,
             "lfs": {"sha256": sha, "size": size, "pointerSize": 135}
         })
+    }
+
+    #[test]
+    fn unit__quant_token_of__dotted_and_dashed_segments_agree() {
+        // Live regression: DevQuasar-style filenames carry the quant in
+        // a '.'-separated tail; the old select_files grammar split on
+        // '-' only and mis-pulled these as UNKNOWN.
+        assert_eq!(
+            quant_token_of("amd.instella-moe-16b-a3b-think.f16.gguf.Q2_K.gguf"),
+            Some("q2_k".to_string())
+        );
+        assert_eq!(quant_token_of("m-q4_k_m.gguf"), Some("q4_k_m".to_string()));
+        // Shard bases carry no .gguf suffix.
+        assert_eq!(quant_token_of("m-q4_k_m"), Some("q4_k_m".to_string()));
+        assert_eq!(
+            quant_token_of("Model-IQ4_XS.gguf"),
+            Some("iq4_xs".to_string())
+        );
+        assert_eq!(quant_token_of("m-fp16.gguf"), Some("fp16".to_string()));
+        assert_eq!(quant_token_of("m-f16.gguf"), Some("f16".to_string()));
+        assert_eq!(quant_token_of("m-f32.gguf"), Some("f32".to_string()));
+        // Non-quants stay non-quants in both spellings.
+        assert_eq!(quant_token_of("nanbeige-16b-base-32k.gguf"), None);
+        assert_eq!(quant_token_of("model-heretic.gguf"), None);
+        assert_eq!(quant_token_of("model-2025-11.gguf"), None);
+        assert_eq!(quant_token_of("mmproj-f16.gguf"), None);
+        // `q`-prefixed finetune words need the digit to qualify.
+        assert_eq!(quant_token_of("model-quiet.gguf"), None);
+    }
+
+    #[test]
+    fn unit__quant_token_of__strips_shard_tails() {
+        assert_eq!(
+            quant_token_of("m-q4_k_m-00001-of-00005.gguf"),
+            Some("q4_k_m".to_string())
+        );
+        // Shard markers only: a real `-of-` word mid-name is not one.
+        assert_eq!(strip_shard_tail("m-q4_k_m"), "m-q4_k_m");
+        assert_eq!(strip_shard_tail("b-00001-of-00002"), "b");
+    }
+
+    #[test]
+    fn unit__select_files__dotted_quant_tail__matches_requested_quant() {
+        // The exact live shape that regressed: without '.'-splitting the
+        // request fell through to the smallest-file fallback with quant
+        // UNKNOWN.
+        let sibs = vec![
+            sib(
+                "amd.instella-moe-16b-a3b-think.f16.gguf.Q2_K.gguf",
+                6000,
+                None,
+            ),
+            sib(
+                "amd.instella-moe-16b-a3b-think.f16.gguf.Q4_K.gguf",
+                9000,
+                None,
+            ),
+        ];
+        let sel = select_files(&sibs, "q2_k").unwrap();
+        assert_eq!(
+            sel.shards[0].filename,
+            "amd.instella-moe-16b-a3b-think.f16.gguf.Q2_K.gguf"
+        );
+        assert_eq!(sel.quant, "q2_k");
+        assert!(!sel.quant_fallback);
     }
 
     #[test]
