@@ -26,6 +26,16 @@ dst_branch=${PALLAMA_PUSH_TO:-main}
 
 say() { printf 'push-export: %s\n' "$1"; }
 
+# The gates and the push must cover the same commits: refuse to run
+# from any checkout other than the publish branch, so work committed
+# on a side branch can never silently miss the push.
+current_branch=$(git branch --show-current)
+if [ "$current_branch" != "$src_branch" ]; then
+    say "checked out on '$current_branch', but publishing from '$src_branch'" >&2
+    say "merge the work into $src_branch first (git checkout $src_branch && git merge --ff-only $current_branch)" >&2
+    exit 1
+fi
+
 # The gates validate HEAD; uncommitted tracked changes would publish
 # something other than what the gates validated. Untracked files
 # never enter the push and are fine to exist.
