@@ -16,11 +16,7 @@ jobs:
         # probes, .exe tool discovery, taskkill stop, detached spawn) —
         # a Linux-only matrix left them structurally untestable.
         # ubuntu-22.04 stays the glibc floor the release binaries target.
-        # main is the published release-candidate branch: it runs the
-        # ubuntu floor only — cross-OS coverage comes from the tag-driven
-        # release build+smoke matrix. The dev branch and every PR run
-        # the full matrix.
-        os: ${{ github.ref_name == 'main' && fromJSON('["ubuntu-22.04"]') || fromJSON('["ubuntu-22.04", "windows-latest", "macos-latest"]') }}
+        os: [ubuntu-22.04, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
