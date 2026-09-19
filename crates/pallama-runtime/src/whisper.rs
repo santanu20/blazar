@@ -1041,8 +1041,14 @@ mod tests {
                 let mut z = zip::ZipWriter::new(&mut buf);
                 let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
                 z.add_directory(root.clone(), opts).unwrap();
-                z.start_file(format!("{root}/whisper-server"), opts)
-                    .unwrap();
+                // The install lane probes the platform-specific binary name
+                // (server_bin_in), so the fixture must carry it too.
+                let bin = if cfg!(windows) {
+                    "whisper-server.exe"
+                } else {
+                    "whisper-server"
+                };
+                z.start_file(format!("{root}/{bin}"), opts).unwrap();
                 z.write_all(b"stub").unwrap();
                 z.finish().unwrap();
                 return buf.into_inner();
