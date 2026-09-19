@@ -18,8 +18,14 @@ use pallama_runtime::{LlamaCppEngine, Supervisor};
 /// cargo target dir (works under deps/, debug/, release/).
 fn stub_bin() -> PathBuf {
     let exe = std::env::current_exe().expect("test exe path");
+    // Windows binaries carry the .exe suffix cargo appends at build time.
+    let name = if cfg!(windows) {
+        "stub-llama-server.exe"
+    } else {
+        "stub-llama-server"
+    };
     for dir in exe.ancestors() {
-        let candidate = dir.join("stub-llama-server");
+        let candidate = dir.join(name);
         if candidate.exists() {
             return candidate;
         }

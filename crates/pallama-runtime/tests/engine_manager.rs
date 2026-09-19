@@ -1140,6 +1140,7 @@ fn unit__keep_cuda_skip_pred__truth_table() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+#[cfg(not(target_os = "macos"))] // vulkan-never-dethrones-cuda guard: the concept under test
 async fn integration__update_resolved__keep_cuda_skip_downloads_nothing() {
     use pallama_runtime::engine::gh::GhRelease;
     use pallama_runtime::engine::manifest::Vendor;

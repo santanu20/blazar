@@ -22,9 +22,15 @@ pub struct TestServer {
 }
 
 fn find_stub() -> std::path::PathBuf {
+    // Windows binaries carry the .exe suffix cargo appends at build time.
+    let name = if cfg!(windows) {
+        "stub-llama-server.exe"
+    } else {
+        "stub-llama-server"
+    };
     let exe = std::env::current_exe().unwrap();
     for dir in exe.ancestors().skip(1) {
-        let candidate = dir.join("stub-llama-server");
+        let candidate = dir.join(name);
         if candidate.exists() {
             return candidate;
         }
