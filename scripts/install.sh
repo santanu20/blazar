@@ -484,15 +484,17 @@ fi
 
 # Repo guard is release-channel only: --from bootstrap and mirror/test
 # base URLs never touch the GitHub release API. PALLAMA_REPO unset:
-# derive owner/name from the checkout's git origin (README one-liners
-# work inside a clone with zero exports).
+# derive owner/name from the checkout's git origin, else fall back to
+# the published repo (fresh curl|sh needs zero exports).
 if [ -z "${PALLAMA_INSTALL_BASE_URL:-}" ] && [ -z "${FROM_BIN:-}" ] && [ -z "$REPO" ]; then
     REPO=$(derive_repo) || REPO=
-    [ -n "$REPO" ] && status "PALLAMA_REPO unset — derived from git origin: ${REPO}"
+    if [ -n "$REPO" ]; then
+        status "PALLAMA_REPO unset — derived from git origin: ${REPO}"
+    else
+        REPO=santanu20/pallama
+        status "PALLAMA_REPO unset — using the published repo ${REPO}"
+    fi
     API_BASE="${PALLAMA_INSTALL_BASE_URL:-https://api.github.com/repos/${REPO}}"
-fi
-if [ -z "${PALLAMA_INSTALL_BASE_URL:-}" ] && [ -z "${FROM_BIN:-}" ] && [ -z "$REPO" ]; then
-    error "PALLAMA_REPO is not set and no git origin to derive it from. Either export PALLAMA_REPO=owner/pallama (the GitHub repo hosting releases) and re-run, or clone the repo and run scripts/install.sh from inside it (compiles from source, no release needed)"
 fi
 
 # macOS service via launchd (called from install_system when systemctl

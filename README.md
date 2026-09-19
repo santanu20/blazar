@@ -1,8 +1,7 @@
 # pallama
 
-<!-- Swap owner/pallama in the CI + release badges when the repo goes public. -->
-[![CI](https://github.com/owner/pallama/actions/workflows/ci.yml/badge.svg)](https://github.com/owner/pallama/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/owner/pallama?include_prereleases)](https://github.com/owner/pallama/releases)
+[![CI](https://github.com/santanu20/pallama/actions/workflows/ci.yml/badge.svg)](https://github.com/santanu20/pallama/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/santanu20/pallama?include_prereleases)](https://github.com/santanu20/pallama/releases)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue)](#license)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#install)
 [![Engines](https://img.shields.io/badge/engines-llama.cpp%20%7C%20mistral.rs%20%7C%20SGLang-orange)](#credit)
@@ -30,7 +29,7 @@ Measured, not marketed. Same laptop, same model (Qwen3.5-9B Q4_K_M), reproducibl
 | Tail latency, inter-token p99 (ms) | **27.4** | 75.1 | **2.7x tighter** |
 | Wake from idle (ms) — sleep vs full reload | **2104** | 7194 | **3.4x** |
 | Prefill on cached prompt (t/s) | **7332** | 5611 | **1.3x** (and 6x over pallama's own cold prefill) |
-| Gateway overhead vs direct engine (decode t/s) | 40.3 vs 41.1 | — | **-1.9% (noise)** |
+| Gateway overhead vs direct engine (decode t/s) | 40.3 | 41.1 | **-1.9% (noise)** |
 | Daemon boot (s) | **0.54** | 4.13 | **7.7x** |
 
 What that means in practice: **3x more concurrent streams from the GPU you already own**, agent loops that don't stall on tail latency, sessions that wake in a blink — and cached prefill that stops re-paying the long-context tax every turn.
@@ -50,9 +49,8 @@ The switch is low-risk and incremental: pallama runs **alongside** ollama (diffe
 1. **Install pallama** (Linux/macOS; Windows and source builds in [Install](#install)):
 
    ```sh
-   export PALLAMA_REPO=owner/pallama
    curl --proto '=https' --tlsv1.2 -fsSL \
-     "https://raw.githubusercontent.com/${PALLAMA_REPO%%/*}/pallama/master/scripts/install.sh" | sh
+     https://raw.githubusercontent.com/santanu20/pallama/main/scripts/install.sh | sh
    ```
 
    The installer bootstraps the llama.cpp engine automatically (sha256-verified; on Linux it even preflights your GPU driver — details in [What the installer does](#what-the-installer-does-for-you)), so a fresh install can serve inference immediately.
@@ -114,11 +112,10 @@ Prebuilt binaries for **Linux** (x86_64/aarch64/armv7, glibc ≥ 2.35 or static 
 **Linux / macOS (WSL included):**
 
 ```sh
-# from a published repo (set PALLAMA_REPO to the owner/name that hosts releases;
-# inside a clone it is derived from the git origin automatically):
-export PALLAMA_REPO=owner/pallama
+# one-liner from the published repo (override with PALLAMA_REPO=<owner>/<name>;
+# inside a clone the repo is derived from the git origin automatically):
 curl --proto '=https' --tlsv1.2 -fsSL \
-  "https://raw.githubusercontent.com/${PALLAMA_REPO%%/*}/pallama/master/scripts/install.sh" | sh
+  https://raw.githubusercontent.com/santanu20/pallama/main/scripts/install.sh | sh
 
 # from a source checkout (zero arguments: builds the checkout fresh with
 # cargo, then installs system-wide; a missing cc/rust toolchain is
@@ -132,11 +129,11 @@ sudo sh scripts/install.sh --build
 **Windows (PowerShell):**
 
 ```powershell
-$env:PALLAMA_REPO = 'owner/pallama'; irm https://raw.githubusercontent.com/owner/pallama/master/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/santanu20/pallama/main/scripts/install.ps1 | iex
 
 # or compile from source (rustup is installed via winget when missing):
-irm https://raw.githubusercontent.com/owner/pallama/master/scripts/install.ps1 -OutFile install.ps1
-.\install.ps1 -Build -Repo owner/pallama
+irm https://raw.githubusercontent.com/santanu20/pallama/main/scripts/install.ps1 -OutFile install.ps1
+.\install.ps1 -Build
 ```
 
 Installs to `%LOCALAPPDATA%\Programs\pallama` and adds it to the user PATH. ARM64 hosts pick the native asset automatically (falling back to the emulated x64 one with a warning when a release has none).

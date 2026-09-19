@@ -6,27 +6,27 @@
 # install.sh / engine-update digest chain is the same asset set.
 class Pallama < Formula
   desc "Multi-engine local inference server: OpenAI, ollama and Anthropic APIs"
-  homepage "https://github.com/OWNER/pallama"
+  homepage "https://github.com/santanu20/pallama"
   version "VERSION"
 
   on_macos do
     if Hardware::CPU.intel?
-      url "https://github.com/OWNER/pallama/releases/download/VERSION/pallama-VERSION-x86_64-apple-darwin.tar.gz"
+      url "https://github.com/santanu20/pallama/releases/download/VERSION/pallama-VERSION-x86_64-apple-darwin.tar.gz"
       sha256 "FILL_PER_RELEASE"
     end
     if Hardware::CPU.arm?
-      url "https://github.com/OWNER/pallama/releases/download/VERSION/pallama-VERSION-aarch64-apple-darwin.tar.gz"
+      url "https://github.com/santanu20/pallama/releases/download/VERSION/pallama-VERSION-aarch64-apple-darwin.tar.gz"
       sha256 "FILL_PER_RELEASE"
     end
   end
 
   on_linux do
     if Hardware::CPU.intel?
-      url "https://github.com/OWNER/pallama/releases/download/VERSION/pallama-VERSION-x86_64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/santanu20/pallama/releases/download/VERSION/pallama-VERSION-x86_64-unknown-linux-gnu.tar.gz"
       sha256 "FILL_PER_RELEASE"
     end
     if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
-      url "https://github.com/OWNER/pallama/releases/download/VERSION/pallama-VERSION-aarch64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/santanu20/pallama/releases/download/VERSION/pallama-VERSION-aarch64-unknown-linux-gnu.tar.gz"
       sha256 "FILL_PER_RELEASE"
     end
   end

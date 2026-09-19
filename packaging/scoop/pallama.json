@@ -1,29 +1,29 @@
 {
   "version": "VERSION",
   "description": "Multi-engine local inference server: OpenAI, ollama and Anthropic APIs",
-  "homepage": "https://github.com/OWNER/pallama",
+  "homepage": "https://github.com/santanu20/pallama",
   "license": "MIT OR Apache-2.0",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/OWNER/pallama/releases/download/VERSION/pallama-VERSION-x86_64-pc-windows-msvc.zip",
+      "url": "https://github.com/santanu20/pallama/releases/download/VERSION/pallama-VERSION-x86_64-pc-windows-msvc.zip",
       "hash": "FILL_PER_RELEASE"
     },
     "arm64": {
-      "url": "https://github.com/OWNER/pallama/releases/download/VERSION/pallama-VERSION-aarch64-pc-windows-msvc.zip",
+      "url": "https://github.com/santanu20/pallama/releases/download/VERSION/pallama-VERSION-aarch64-pc-windows-msvc.zip",
       "hash": "FILL_PER_RELEASE"
     }
   },
   "bin": "pallama.exe",
   "checkver": {
-    "github": "https://github.com/OWNER/pallama"
+    "github": "https://github.com/santanu20/pallama"
   },
   "autoupdate": {
     "architecture": {
       "64bit": {
-        "url": "https://github.com/OWNER/pallama/releases/download/$version/pallama-$version-x86_64-pc-windows-msvc.zip"
+        "url": "https://github.com/santanu20/pallama/releases/download/$version/pallama-$version-x86_64-pc-windows-msvc.zip"
       },
       "arm64": {
-        "url": "https://github.com/OWNER/pallama/releases/download/$version/pallama-$version-aarch64-pc-windows-msvc.zip"
+        "url": "https://github.com/santanu20/pallama/releases/download/$version/pallama-$version-aarch64-pc-windows-msvc.zip"
       }
     }
   },

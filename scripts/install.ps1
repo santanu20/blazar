@@ -103,7 +103,8 @@ function Register-PallamaTask([string]$ExePath) {
 }
 
 if (-not $Build -and -not $Repo -and -not $ApiBase) {
-    Fail 'PALLAMA_REPO is not configured. Run with -Repo owner/pallama (or set $env:PALLAMA_REPO), or -Build from a checkout.'
+    $Repo = 'santanu20/pallama'
+    Write-Host ">>> -Repo unset — using the published repo $Repo"
 }
 if (-not $ApiBase) { $ApiBase = "https://api.github.com/repos/$Repo" }
 
