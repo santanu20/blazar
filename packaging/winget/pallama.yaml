@@ -8,7 +8,7 @@ PackageVersion: VERSION
 PackageName: pallama
 Publisher: OWNER
 License: MIT OR Apache-2.0
-ShortDescription: Local-first llama.cpp orchestrator (OpenAI + ollama APIs)
+ShortDescription: Multi-engine local inference server (OpenAI, ollama, Anthropic APIs)
 PackageUrl: https://github.com/OWNER/pallama
 Installers:
   - Architecture: x64

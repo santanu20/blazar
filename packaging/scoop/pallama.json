@@ -1,11 +1,15 @@
 {
-  "version": "0.3.0",
-  "description": "Local-first llama.cpp orchestrator: OpenAI + ollama APIs, zero-fork engine management",
+  "version": "VERSION",
+  "description": "Multi-engine local inference server: OpenAI, ollama and Anthropic APIs",
   "homepage": "https://github.com/OWNER/pallama",
   "license": "MIT OR Apache-2.0",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/OWNER/pallama/releases/download/v0.3.0/pallama-v0.3.0-x86_64-pc-windows-msvc.zip",
+      "url": "https://github.com/OWNER/pallama/releases/download/VERSION/pallama-VERSION-x86_64-pc-windows-msvc.zip",
+      "hash": "FILL_PER_RELEASE"
+    },
+    "arm64": {
+      "url": "https://github.com/OWNER/pallama/releases/download/VERSION/pallama-VERSION-aarch64-pc-windows-msvc.zip",
       "hash": "FILL_PER_RELEASE"
     }
   },
@@ -17,6 +21,9 @@
     "architecture": {
       "64bit": {
         "url": "https://github.com/OWNER/pallama/releases/download/$version/pallama-$version-x86_64-pc-windows-msvc.zip"
+      },
+      "arm64": {
+        "url": "https://github.com/OWNER/pallama/releases/download/$version/pallama-$version-aarch64-pc-windows-msvc.zip"
       }
     }
   },
