@@ -2210,7 +2210,6 @@ mod verify_tests {
     // Established unit__scenario__expected naming convention for the suite.
     #![allow(non_snake_case)]
     use super::*;
-    use pallama_core::engine_kind::EngineKind;
     use std::path::PathBuf;
 
     fn fake_bin(dir: &std::path::Path, rel: &str, body: &str) -> PathBuf {
@@ -2221,6 +2220,9 @@ mod verify_tests {
         p
     }
 
+    // Only the unix-gated probe tests read the manifest; Windows has no
+    // success-path tests in this module (fake bins are shell scripts).
+    #[cfg(unix)]
     fn manifest_for(server_path: &std::path::Path) -> String {
         serde_json::json!({
             "tag": "t-test",
