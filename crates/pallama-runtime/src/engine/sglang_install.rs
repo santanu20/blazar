@@ -376,7 +376,10 @@ mod tests {
         // Dir alone (no nvcc binary) still yields None.
         assert_eq!(bundled_nvcc_bin_dir(venv.path()), None);
 
-        std::fs::write(bin.join("nvcc"), "#!/bin/sh\n").unwrap();
+        // The wheel lands nvcc.exe on Windows, bare nvcc elsewhere —
+        // the probe checks the platform-correct name.
+        let nvcc = if cfg!(windows) { "nvcc.exe" } else { "nvcc" };
+        std::fs::write(bin.join(nvcc), "#!/bin/sh\n").unwrap();
         let found = bundled_nvcc_bin_dir(venv.path()).expect("wheel nvcc detected");
         assert!(found.ends_with("cuda_nvcc/bin"), "{found:?}");
     }

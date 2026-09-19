@@ -1087,6 +1087,9 @@ mod tests {
     }
 
     #[test]
+    // Twin detection is inode-based and unix-only by design (std exposes
+    // no file-index surface on Windows); there a link twin is adoptable.
+    #[cfg(unix)]
     fn unit__reconcile__owned_and_twins_left_alone() {
         let (_t, dirs) = setup();
         let d = dirs.models_dir();

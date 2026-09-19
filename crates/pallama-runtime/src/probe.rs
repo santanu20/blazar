@@ -531,10 +531,14 @@ mod tests {
     #[test]
     fn unit__with_spawn_retry__transient_retries_then_succeeds() {
         let attempts = std::cell::Cell::new(0u32);
+        // Kind-based transient: raw errno tables decode differently on
+        // Windows (errno 11 there is bad-format, not EAGAIN), while the
+        // WouldBlock kind is portable across both classifiers.
+        let transient = || std::io::Error::from(std::io::ErrorKind::WouldBlock);
         let r = with_spawn_retry(|| {
             attempts.set(attempts.get() + 1);
             match attempts.get() {
-                n if n < 3 => Err(std::io::Error::from_raw_os_error(libc::EAGAIN)),
+                n if n < 3 => Err(transient()),
                 _ => Ok(42),
             }
         });
@@ -551,7 +555,7 @@ mod tests {
         let attempts = std::cell::Cell::new(0u32);
         let r = with_spawn_retry(|| {
             attempts.set(attempts.get() + 1);
-            Err::<(), _>(std::io::Error::from_raw_os_error(libc::EAGAIN))
+            Err::<(), _>(std::io::Error::from(std::io::ErrorKind::WouldBlock))
         });
         assert!(r.is_err(), "exhausted transients surface the final error");
         assert_eq!(attempts.get(), SPAWN_RETRY_ATTEMPTS);

@@ -1911,6 +1911,9 @@ mod verify_tests {
     }
 
     #[test]
+    // The fake bins are unix shell scripts; Windows cannot spawn an
+    // extensionless script, so the success-path probes run on unix only.
+    #[cfg(unix)]
     fn unit__verify_engine_binary__llamacpp_version_probe() {
         let tmp = tempfile::tempdir().unwrap();
         let bin = fake_bin(tmp.path(), "llama-b/llama-server", "exit 0");
@@ -1928,6 +1931,9 @@ mod verify_tests {
     }
 
     #[test]
+    // The fake bins are unix shell scripts; Windows cannot spawn an
+    // extensionless script, so the success-path probes run on unix only.
+    #[cfg(unix)]
     fn unit__verify_engine_binary__sglang_venv_metadata_probe() {
         let tmp = tempfile::tempdir().unwrap();
         // The flashinfer-class regression pin: a sglang dir with NO
@@ -1957,6 +1963,9 @@ mod verify_tests {
     }
 
     #[test]
+    // The fake bins are unix shell scripts; Windows cannot spawn an
+    // extensionless script, so the success-path probes run on unix only.
+    #[cfg(unix)]
     fn unit__verify_engine_binary__mistralrs_version_probe() {
         let tmp = tempfile::tempdir().unwrap();
         let bin = fake_bin(tmp.path(), "mistralrs", "echo mistralrs 0.9.3; exit 0");

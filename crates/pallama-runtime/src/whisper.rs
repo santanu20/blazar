@@ -1031,12 +1031,25 @@ mod tests {
         };
         let api = wiremock::MockServer::start().await;
 
-        let tarball = |tag: &str| -> Vec<u8> {
+        let archive = |tag: &str| -> Vec<u8> {
             use std::io::Write as _;
+            let root = format!("whisper-{tag}");
+            // Upstream ships zips to Windows and tar.gz everywhere else;
+            // the fixture mirrors the format the host lane downloads.
+            if cfg!(windows) {
+                let mut buf = std::io::Cursor::new(Vec::new());
+                let mut z = zip::ZipWriter::new(&mut buf);
+                let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
+                z.add_directory(root.clone(), opts).unwrap();
+                z.start_file(format!("{root}/whisper-server"), opts)
+                    .unwrap();
+                z.write_all(b"stub").unwrap();
+                z.finish().unwrap();
+                return buf.into_inner();
+            }
             let mut tarbuf = Vec::new();
             {
                 let mut builder = tar::Builder::new(&mut tarbuf);
-                let root = format!("whisper-{tag}");
                 let mut header = tar::Header::new_gnu();
                 header.set_size(0);
                 header.set_entry_type(tar::EntryType::Directory);
@@ -1060,7 +1073,7 @@ mod tests {
             gz.finish().unwrap()
         };
 
-        let v181 = tarball("v1.8.1");
+        let v181 = archive("v1.8.1");
         mount(
             &api,
             "/repos/ggml-org/whisper.cpp/releases/tags/v1.8.1",
@@ -1069,7 +1082,7 @@ mod tests {
             &v181,
         )
         .await;
-        let v190 = tarball("v1.9.0");
+        let v190 = archive("v1.9.0");
         mount_list(
             &api,
             "/repos/ggml-org/whisper.cpp/releases",

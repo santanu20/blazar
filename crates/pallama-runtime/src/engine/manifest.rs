@@ -528,7 +528,10 @@ mod tests {
         // spawn while the binary sat intact under the live engines dir.
         let tmp = tempfile::tempdir().unwrap();
         let engines = tmp.path().join("data/pallama/engines");
-        let live_bin = engines.join("b10970-cuda/llama-b10970-cuda/llama-server");
+        let live_bin = engines
+            .join("b10970-cuda")
+            .join("llama-b10970-cuda")
+            .join("llama-server");
         std::fs::create_dir_all(live_bin.parent().unwrap()).unwrap();
         std::fs::write(&live_bin, b"#!/bin/sh\n").unwrap();
 
