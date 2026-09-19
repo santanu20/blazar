@@ -171,6 +171,47 @@ fn tmp_dirs() -> (tempfile::TempDir, PallamaDirs) {
     (tmp, dirs)
 }
 
+/// Asset labels `pick_asset` could match for the HOST platform (primary
+/// first). Fixtures built from this list stay honest on any runner
+/// OS/arch instead of assuming a linux/x64 host.
+fn host_asset_labels() -> &'static [&'static str] {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", _) => &["macos-arm64", "macos-x64"],
+        ("windows", "x86_64") => &["win-vulkan-x64", "win-cpu-x64"],
+        ("windows", _) => &["win-cpu-arm64"],
+        ("linux", "aarch64") => &["ubuntu-vulkan-arm64", "ubuntu-arm64"],
+        _ => &["ubuntu-vulkan-x64", "ubuntu-x64"],
+    }
+}
+
+/// The CPU-tier label for the host platform (the last-resort candidate).
+fn host_cpu_asset_label() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86_64") => "win-cpu-x64",
+        ("windows", _) => "win-cpu-arm64",
+        ("linux", "aarch64") => "ubuntu-arm64",
+        _ => "ubuntu-x64",
+    }
+}
+
+/// Release-`assets` JSON for every host-platform candidate, digest and
+/// size included, download URLs pointing at the wiremock server.
+fn host_assets_json(api_uri: &str, tag: &str, tar: &[u8]) -> serde_json::Value {
+    host_asset_labels()
+        .iter()
+        .map(|label| {
+            let name = format!("llama-{tag}-bin-{label}.tar.gz");
+            serde_json::json!({
+                "name": name,
+                "digest": format!("sha256:{}", sha256_hex(tar)),
+                "size": tar.len() as u64,
+                "browser_download_url": format!("{api_uri}/download/{tag}/{name}"),
+            })
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn integration__install_probe_activate_rollback_cycle() {
@@ -728,20 +769,7 @@ async fn integration__fresh_release_upload_race__waits_then_installs() {
                 .unwrap()
                 .as_secs().try_into().unwrap_or(i64::MAX)
         ),
-        "assets": [
-            {
-                "name": "llama-b100-bin-ubuntu-vulkan-x64.tar.gz",
-                "digest": format!("sha256:{}", sha256_hex(&tar)),
-                "size": tar.len() as u64,
-                "browser_download_url": format!("{}/download/b100/llama-b100-bin-ubuntu-vulkan-x64.tar.gz", api.uri()),
-            },
-            {
-                "name": "llama-b100-bin-ubuntu-x64.tar.gz",
-                "digest": format!("sha256:{}", sha256_hex(&tar)),
-                "size": tar.len() as u64,
-                "browser_download_url": format!("{}/download/b100/llama-b100-bin-ubuntu-x64.tar.gz", api.uri()),
-            },
-        ],
+        "assets": host_assets_json(&api.uri(), "b100", &tar),
     });
     let empty = serde_json::json!({
         "tag_name": "b100",
@@ -761,18 +789,14 @@ async fn integration__fresh_release_upload_race__waits_then_installs() {
         .respond_with(ResponseTemplate::new(200).set_body_json(complete))
         .mount(&api)
         .await;
-    Mock::given(method("GET"))
-        .and(path(
-            "/download/b100/llama-b100-bin-ubuntu-vulkan-x64.tar.gz",
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(tar.clone()))
-        .mount(&api)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/download/b100/llama-b100-bin-ubuntu-x64.tar.gz"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(tar))
-        .mount(&api)
-        .await;
+    for label in host_asset_labels() {
+        let name = format!("llama-b100-bin-{label}.tar.gz");
+        Mock::given(method("GET"))
+            .and(path(format!("/download/b100/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tar.clone()))
+            .mount(&api)
+            .await;
+    }
 
     let mgr = manager_auto(&dirs, &api.uri());
     let row = mgr
@@ -787,7 +811,7 @@ async fn integration__fresh_release_upload_race__waits_then_installs() {
     // Vendor-dependent pick (vulkan on GPU boxes, cpu otherwise) but the
     // install must have succeeded off the SECOND fetch.
     assert!(
-        row.asset == "ubuntu-vulkan-x64" || row.asset == "ubuntu-x64",
+        host_asset_labels().contains(&row.asset.as_str()),
         "{}",
         row.asset
     );
@@ -852,10 +876,12 @@ async fn integration__stale_release_no_assets__teaching_error_no_wait() {
 /// last-resort with the fallback recorded in the row.
 #[tokio::test]
 #[allow(non_snake_case)]
+#[cfg(not(target_os = "macos"))] // macos has no cpu-fallback tier: both candidates are full builds
 async fn integration__stale_release_gpu_missing__cpu_last_resort() {
     let (_t, dirs) = tmp_dirs();
     let api = MockServer::start().await;
     let tar = fixture_tarball("b100");
+    let cpu_asset = format!("llama-b100-bin-{}.tar.gz", host_cpu_asset_label());
     let stale = iso_from_epoch(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -870,10 +896,10 @@ async fn integration__stale_release_gpu_missing__cpu_last_resort() {
         "prerelease": true,
         "published_at": stale,
         "assets": [{
-            "name": "llama-b100-bin-ubuntu-x64.tar.gz",
+            "name": cpu_asset,
             "digest": format!("sha256:{}", sha256_hex(&tar)),
             "size": tar.len() as u64,
-            "browser_download_url": format!("{}/download/b100/llama-b100-bin-ubuntu-x64.tar.gz", api.uri()),
+            "browser_download_url": format!("{}/download/b100/{}", api.uri(), cpu_asset),
         }],
     });
     Mock::given(method("GET"))
@@ -882,7 +908,7 @@ async fn integration__stale_release_gpu_missing__cpu_last_resort() {
         .mount(&api)
         .await;
     Mock::given(method("GET"))
-        .and(path("/download/b100/llama-b100-bin-ubuntu-x64.tar.gz"))
+        .and(path(format!("/download/b100/{cpu_asset}")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(tar))
         .mount(&api)
         .await;
@@ -895,7 +921,7 @@ async fn integration__stale_release_gpu_missing__cpu_last_resort() {
         )
         .await
         .unwrap();
-    assert_eq!(row.asset, "ubuntu-x64");
+    assert_eq!(row.asset, host_cpu_asset_label());
     assert_eq!(row.tag, "b100");
 }
 
@@ -1134,16 +1160,17 @@ async fn integration__update_resolved__keep_cuda_skip_downloads_nothing() {
         .unwrap();
     assert!(cuda.active);
 
-    // Channel release carries ONLY the vulkan asset. No /download mock is
-    // mounted: any fetch attempt 404s and fails the test — the skip must
-    // guarantee the standard lane never downloads.
+    // Channel release carries ONLY the host platform's primary asset. No
+    // /download mock is mounted: any fetch attempt 404s and fails the
+    // test — the skip must guarantee the standard lane never downloads.
+    let primary_asset = format!("llama-b10910-bin-{}.tar.gz", host_asset_labels()[0]);
     let release: GhRelease = serde_json::from_value(serde_json::json!({
         "tag_name": "b10910",
         "prerelease": true,
         "assets": [{
-            "name": "llama-b10910-bin-ubuntu-vulkan-x64.tar.gz",
+            "name": primary_asset,
             "size": 1,
-            "browser_download_url": format!("{}/download/b10910/llama-b10910-bin-ubuntu-vulkan-x64.tar.gz", api.uri())
+            "browser_download_url": format!("{}/download/b10910/{}", api.uri(), primary_asset)
         }]
     }))
     .unwrap();

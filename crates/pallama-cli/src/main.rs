@@ -10372,6 +10372,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // twin detection is inode identity — a unix filesystem concept
     fn unit__orphan_scan__hardlink_twin_counted_not_listed() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("models");
