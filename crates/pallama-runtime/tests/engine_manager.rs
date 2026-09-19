@@ -820,10 +820,10 @@ async fn integration__fork_lane_registration_never_dethrones_active_engine() {
     // First of its kind: nothing to keep, the fork lane activates.
     let (_t2, dirs2) = tmp_dirs();
     let mgr2 = manager(&dirs2, &api.uri());
-    let (dir2, _guard2) = stub_engine_dir("firstfork");
+    let (fork_dir, _firstfork_guard) = stub_engine_dir("firstfork");
     let row2 = mgr2
         .register_engine_provenanced(
-            &dir2,
+            &fork_dir,
             tag,
             "built-fork",
             "cafebabe",

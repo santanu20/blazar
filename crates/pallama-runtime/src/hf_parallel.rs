@@ -741,7 +741,7 @@ mod tests {
         // byte-exact, with the progress bar refunded for the partial
         // attempt's bytes.
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        let payload: Vec<u8> = (0u32..64 * 1024).map(|i| (i % 251) as u8).collect();
         let full = payload.clone();
         let half = payload[..10].to_vec();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
