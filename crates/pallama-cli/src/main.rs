@@ -877,12 +877,35 @@ fn dirs() -> PallamaDirs {
     PallamaDirs::from_env()
 }
 
+/// Exact-basename fallback for `pallama run <file>.gguf`: the user
+/// knows the file on disk, not the row name. Case-sensitive full
+/// basename equality against every row's path — one hit rewrites to
+/// that row's name, zero or several hits stay unresolved (ambiguity
+/// is the user's to break, never ours to guess).
+fn match_model_basename(input: &str, rows: &[pallama_core::store::ModelRow]) -> Option<String> {
+    if !input.contains('.') {
+        return None;
+    }
+    let hits: Vec<&pallama_core::store::ModelRow> = rows
+        .iter()
+        .filter(|r| {
+            std::path::Path::new(&r.path)
+                .file_name()
+                .is_some_and(|f| f == input)
+        })
+        .collect();
+    match hits.as_slice() {
+        [only] => Some(only.name.clone()),
+        _ => None,
+    }
+}
+
 /// `pallama run` auto-fetch: the store first (with the shared colon
-/// rule), then — on a miss — a pull when the input parses as an
-/// `owner/repo[:QUANT]` ref or a catalog short name. Everything else
-/// passes through so the daemon's not-found error (with its flat-form
-/// teaching hint) stays the teacher of last resort. Store hits never
-/// touch the network.
+/// rule), then — on a miss — a basename rewrite for file-shaped
+/// input, then a pull when the input parses as an `owner/repo[:QUANT]`
+/// ref or a catalog short name. Anything else is a named error BEFORE
+/// the REPL opens (the daemon's not-found error stays the teacher of
+/// last resort for API callers). Store hits never touch the network.
 async fn ensure_run_model(name: &str) -> Result<String> {
     let d = dirs();
     if d.db_file().is_file() {
@@ -891,6 +914,18 @@ async fn ensure_run_model(name: &str) -> Result<String> {
             if let Ok(Some(row)) = store.get_model(&resolved) {
                 offer_missing_engine(&d, &row).await;
                 return Ok(resolved);
+            }
+            // Miss with a file-shaped input: resolve by exact basename
+            // before anything network-shaped gets a chance (`run
+            // model-Q2_K.gguf` is never a repo ref worth pulling).
+            if let Ok(rows) = store.list_models() {
+                if let Some(local) = match_model_basename(&resolved, &rows) {
+                    if let Ok(Some(row)) = store.get_model(&local) {
+                        println!("{resolved} resolves to stored model {local}");
+                        offer_missing_engine(&d, &row).await;
+                        return Ok(local);
+                    }
+                }
             }
             // Miss: repo refs and catalog short names auto-pull
             // (Ctrl-C keeps the partial; `pallama pull` resumes it).
@@ -917,7 +952,11 @@ async fn ensure_run_model(name: &str) -> Result<String> {
                 offer_missing_engine(&d, &row).await;
                 return Ok(row.name);
             }
-            return Ok(resolved);
+            // Nothing matched and nothing parses: fail HERE, not at
+            // the daemon on the first REPL send. The daemon's
+            // not-found teaching stays reachable for callers that
+            // bypass the CLI (`curl /v1/...`).
+            return Err(no_such_model(&resolved));
         }
     }
     Ok(name.to_string())
@@ -9331,6 +9370,60 @@ mod tests {
         // (or quoting) — clap reads it as an unknown flag otherwise.
         assert!(Cli::try_parse_from(["pallama", "run", "m1", "-flaggy"]).is_err());
         assert!(Cli::try_parse_from(["pallama", "run", "m1", "--", "-flaggy"]).is_ok());
+    }
+
+    fn row(name: &str, path: &str) -> pallama_core::store::ModelRow {
+        pallama_core::store::ModelRow {
+            name: name.to_string(),
+            repo: String::new(),
+            quant: String::new(),
+            path: path.to_string(),
+            bytes: 0,
+            sha256: None,
+            mmproj_path: None,
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+        }
+    }
+
+    #[test]
+    fn unit__match_model_basename__unique_hit_rewrites() {
+        let rows = [
+            row("spark-x2.5-1.7b", "/models/Spark-X2.5-1.7B-Q4_K_M.gguf"),
+            row(
+                "instella",
+                "/models/amd.instella-moe-16b-a3b-think.f16.gguf.Q2_K.gguf",
+            ),
+        ];
+        // The DevQuasar-shaped leaf the user actually typed resolves.
+        assert_eq!(
+            match_model_basename("amd.instella-moe-16b-a3b-think.f16.gguf.Q2_K.gguf", &rows),
+            Some("instella".to_string())
+        );
+        // Plain model names and non-matching leaves stay unresolved.
+        assert_eq!(match_model_basename("spark-x2.5-1.7b", &rows), None);
+        assert_eq!(match_model_basename("nope.gguf", &rows), None);
+        // Case-sensitive by design: a re-cased leaf is NOT a hit.
+        assert_eq!(
+            match_model_basename("AMD.Instella-Moe-16B.gguf", &rows),
+            None
+        );
+    }
+
+    #[test]
+    fn unit__match_model_basename__ambiguity_and_dotless_stay_unresolved() {
+        let rows = [
+            row("a", "/m1/model-Q2_K.gguf"),
+            row("b", "/m2/model-Q2_K.gguf"),
+        ];
+        // Two rows share the basename: never guess which one.
+        assert_eq!(match_model_basename("model-Q2_K.gguf", &rows), None);
+        // Dotless input is a model-name shape, not a file shape.
+        assert_eq!(match_model_basename("model", &rows), None);
+        assert_eq!(match_model_basename("", &rows), None);
     }
 
     #[test]
