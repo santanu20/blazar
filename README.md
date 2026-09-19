@@ -63,16 +63,15 @@ Low-risk and incremental: pallama runs **alongside** ollama (different port), ke
 
 What changes on disk — and what doesn't:
 
-```
-ollama                                  pallama
------------------------------------     -----------------------------------
-~/.ollama/models/                       ~/.local/share/pallama/models/
-  blobs/sha256-8f4a8e...   opaque         qwen3-8b-q4_k_m.gguf   plain file
-  blobs/sha256-1c9d02...   opaque         qwen3-8b-q8_0.gguf     plain file
-manifests/library/qwen3   hash tree     config.toml            documented knobs
-```
+| | ollama | pallama |
+|---|---|---|
+| **Models live in** | `~/.ollama/models/` | `~/.local/share/pallama/models/` |
+| **A quant on disk** | `blobs/sha256-8f4a8e…` — opaque blob, only ollama reads it | `qwen3-8b-q4_k_m.gguf` — plain file, any tool |
+| **Same model, other quant** | `blobs/sha256-1c9d02…` — opaque blob | `qwen3-8b-q8_0.gguf` — plain file, any tool |
+| **Model metadata** | `manifests/library/qwen3` — internal hash tree | SQLite store, fully inspectable (`pallama show`) |
+| **Configuration** | `OLLAMA_*` env sprawl, undocumented defaults | one documented `~/.config/pallama/config.toml` |
 
-Left: content-addressed blobs only ollama understands. Right: plain GGUF files any tool can touch — `pallama import` hardlinks them in place, so nothing is re-downloaded and nothing is duplicated. The payoff is the [measured table above](#the-numbers) plus every long-standing ollama complaint resolved at the root in the [table below](#every-ollama-complaint-fixed-at-the-root).
+Everything on the pallama side is a plain file or an inspectable row — `pallama import` hardlinks GGUF in place, so nothing is re-downloaded and nothing is duplicated. The payoff is the [measured table above](#the-numbers) plus every long-standing ollama complaint resolved at the root in the [table below](#every-ollama-complaint-fixed-at-the-root).
 
 ## Who it's for
 
