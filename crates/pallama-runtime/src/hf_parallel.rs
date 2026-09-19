@@ -478,24 +478,34 @@ async fn fetch_chunk(
             ));
             continue;
         }
-        let Ok(file) = File::options().write(true).open(part) else {
-            return Err(anyhow!(
-                "open {}: {}",
-                part.display(),
-                last_err.unwrap_or_default()
-            ));
+        let file = match File::options().write(true).open(part) {
+            Ok(f) => f,
+            Err(e) => return Err(anyhow!("open {}: {e}", part.display())),
         };
         let mut written: u64 = 0;
         let mut resp = resp;
         let mut ok = true;
-        while let Some(piece) = resp.chunk().await? {
-            match write_positional(&file, &piece, start + written) {
-                Ok(()) => {
-                    written += piece.len() as u64;
-                    progress.fetch_add(piece.len() as u64, Ordering::Relaxed);
-                }
+        loop {
+            match resp.chunk().await {
+                Ok(Some(piece)) => match write_positional(&file, &piece, start + written) {
+                    Ok(()) => {
+                        written += piece.len() as u64;
+                        progress.fetch_add(piece.len() as u64, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        last_err = Some(format!("write: {e}"));
+                        ok = false;
+                        break;
+                    }
+                },
+                Ok(None) => break,
                 Err(e) => {
-                    last_err = Some(format!("write: {e}"));
+                    // Mid-body read failure (HF resetting the connection
+                    // partway through a chunk): consume it as a retryable
+                    // attempt instead of propagating out of the loop —
+                    // positional writes make re-fetching the range
+                    // overwrite-safe.
+                    last_err = Some(format!("body: {e}"));
                     ok = false;
                     break;
                 }
@@ -507,6 +517,9 @@ async fn fetch_chunk(
         if ok {
             last_err = Some(format!("short chunk body {written}/{len}"));
         }
+        // A partial attempt's bytes are re-downloaded from scratch:
+        // give the progress bar its bytes back.
+        progress.fetch_sub(written, Ordering::Relaxed);
     }
     Err(anyhow!(last_err.unwrap_or_else(|| "chunk failed".into())))
 }
@@ -716,6 +729,67 @@ mod tests {
         assert_eq!(got, *payload);
         assert_eq!(progress.load(Ordering::Relaxed), payload_len);
         sd.store(true, Ordering::Relaxed);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn integration__fetch_chunk__mid_body_reset_is_retried() {
+        // HF occasionally resets the connection partway through a chunk
+        // body ("end of file before message length reached"). The
+        // body-read error must consume a retry attempt — not propagate
+        // out of the attempt loop — and the retried range must land
+        // byte-exact, with the progress bar refunded for the partial
+        // attempt's bytes.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        let full = payload.clone();
+        let half = payload[..10].to_vec();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut served = 0u32;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                served += 1;
+                let body = if served == 1 { &half } else { &full };
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\ncontent-length: {}\r\n\
+                     content-range: bytes 0-{}/{}\r\nconnection: close\r\n\r\n",
+                    full.len(),
+                    full.len() - 1,
+                    full.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                // First attempt closes mid-body (content-length already
+                // promised the full chunk): premature EOF for the client.
+                let _ = sock.shutdown().await;
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("pallama-rst-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("m.gguf.part");
+        std::fs::write(&part, b"").unwrap();
+        let url: reqwest::Url = format!("http://{addr}/f.gguf").parse().unwrap();
+        let progress = AtomicU64::new(0);
+        fetch_chunk(
+            &http_client(),
+            None,
+            &url,
+            &part,
+            0,
+            payload.len() as u64,
+            &progress,
+        )
+        .await
+        .expect("mid-body reset must be retried, not fatal");
+        assert_eq!(std::fs::read(&part).unwrap(), payload);
+        assert_eq!(
+            progress.load(Ordering::Relaxed),
+            payload.len() as u64,
+            "partial attempt bytes refunded"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
