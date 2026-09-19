@@ -358,6 +358,7 @@ fn root_safetensors(dir: &Path) -> Vec<PathBuf> {
 
 /// Shared adoption working state: what the store already owns (paths +
 /// inodes), the sidecar pool, and the cross-adoption bookkeeping.
+#[cfg_attr(not(unix), allow(dead_code))] // inode sets are only consulted on unix
 struct AdoptCtx<'a> {
     owned: &'a HashSet<PathBuf>,
     owned_inodes: &'a HashSet<(u64, u64)>,

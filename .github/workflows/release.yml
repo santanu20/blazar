@@ -21,8 +21,13 @@ jobs:
         include:
           # glibc 2.35 floor (ubuntu-22.04). Older glibc / Alpine -> musl assets.
           - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04, smoke: true }
-          - { target: x86_64-unknown-linux-musl, os: ubuntu-22.04, apt: musl-tools, smoke: true }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04, apt: "gcc-aarch64-linux-gnu", smoke: false }
+          # Cross C deps (aws-lc-sys needs a target sysroot for their C
+          # sources): the cross images carry the full toolchain + libc
+          # headers, where hand-rolled apt cross-gcc leaves them missing
+          # and a glibc-compiled object linked into a static musl binary
+          # segfaults at startup.
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-22.04, cross: true, smoke: true }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04, cross: true, smoke: false }
           - { target: aarch64-unknown-linux-musl, os: ubuntu-22.04, cross: true, smoke: false }
           # 32-bit ARM boards (Pi 3/4 on 32-bit OS etc.): musl for old-libc freedom.
           - { target: armv7-unknown-linux-musleabihf, os: ubuntu-22.04, cross: true, smoke: false }
@@ -46,21 +51,6 @@ jobs:
 
       - name: Add Rust target
         run: rustup toolchain install stable --profile minimal --no-self-update && rustup target add ${{ matrix.target }}
-
-      - name: Configure linkers
-        if: runner.os == 'Linux' && matrix.cross != true
-        shell: bash
-        run: |
-          case "${{ matrix.target }}" in
-            aarch64-unknown-linux-gnu)
-              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
-              echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
-              echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar" >> "$GITHUB_ENV"
-              ;;
-            x86_64-unknown-linux-musl)
-              echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> "$GITHUB_ENV"
-              ;;
-          esac
 
       - name: Build
         shell: bash

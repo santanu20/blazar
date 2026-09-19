@@ -270,6 +270,7 @@ fn bundled_nvcc_bin_dir(venv: &Path) -> Option<PathBuf> {
     bin.join(nvcc).is_file().then_some(bin)
 }
 
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps, unused_variables))] // chmod is unix-only
 fn make_executable(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {

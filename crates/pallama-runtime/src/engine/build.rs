@@ -826,6 +826,7 @@ fn install_built_binaries(
 
 /// Copy `build/bin` contents: regular files verbatim, symlinks recreated
 /// as symlinks (the loader needs the `lib*.so -> lib*.so.N` chains).
+#[cfg_attr(not(unix), allow(clippy::only_used_in_recursion))] // link count only moves on unix
 fn copy_bin_tree(from: &Path, to: &Path, files: &mut usize, links: &mut usize) -> Result<()> {
     for entry in std::fs::read_dir(from).with_context(|| format!("read {}", from.display()))? {
         let entry = entry.with_context(|| format!("stat {}", from.display()))?;

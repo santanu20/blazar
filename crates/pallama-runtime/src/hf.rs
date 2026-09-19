@@ -1283,8 +1283,7 @@ fn pid_alive(pid: u32) -> bool {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
-            .unwrap_or(false)
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
     }
 }
 

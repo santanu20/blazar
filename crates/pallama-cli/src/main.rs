@@ -3547,7 +3547,9 @@ fn free_gib(path: &std::path::Path) -> Option<f64> {
     #[allow(clippy::useless_conversion, clippy::unnecessary_fallible_conversions)]
     // field types vary across libcs
     let free: u64 = stat.f_bfree.try_into().ok()?;
-    let bsize: u64 = stat.f_bsize;
+    #[allow(clippy::useless_conversion, clippy::unnecessary_fallible_conversions)]
+    // field types vary across libcs
+    let bsize: u64 = stat.f_bsize.try_into().ok()?;
     #[allow(clippy::cast_precision_loss)] // byte counts -> GiB display only
     Some(free as f64 * bsize as f64 / 1_073_741_824.0)
 }
@@ -10377,7 +10379,9 @@ mod tests {
         let registered = dir.join("Model-Q4.gguf");
         std::fs::write(&registered, b"x").unwrap();
         // Same bytes, second directory entry: import's hardlink shape.
-        std::fs::hard_link(&registered, dir.join("model-q4.gguf")).unwrap();
+        // Distinct name (not a case variant) so case-insensitive
+        // filesystems see two entries, not a collision.
+        std::fs::hard_link(&registered, dir.join("model-q4-twin.gguf")).unwrap();
         let models = vec![row_with_path(&registered)];
         let r = orphan_scan(&models, &dir);
         assert!(r.orphans.is_empty(), "{:?}", r.orphans);
