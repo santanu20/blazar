@@ -49,8 +49,62 @@ pub enum Vendor {
     Other,
 }
 
+/// Where an installed engine's code came from. `Fork` marks a
+/// capability lane built from an unmerged llama.cpp fork at a pinned
+/// commit (see `engine build --fork`); routing logic never branches on
+/// this — it only colors provenance display and retention policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EngineSource {
+    /// Release asset or source build of the upstream repo.
+    #[default]
+    Upstream,
+    /// Immutable `owner/repo@sha` capability lane.
+    Fork,
+    /// User-registered local binary (the `local` pseudo-tag).
+    Local,
+}
+
+impl EngineSource {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Upstream => "upstream",
+            Self::Fork => "fork",
+            Self::Local => "local",
+        }
+    }
+}
+
+/// Build-time provenance merged into a probed manifest when the engine
+/// was compiled from source: everything needed to answer "which commit
+/// of which repo produced this binary, and what did it claim to
+/// support at build time".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneProvenance {
+    pub source: EngineSource,
+    /// e.g. `ggml-org/llama.cpp` or `acme/llama.cpp`.
+    pub repo: Option<String>,
+    /// Full commit SHA the tree was checked out at (forks are
+    /// immutable: never a branch or tag name).
+    pub ref_pin: Option<String>,
+    /// Upstream anchor recorded when the lane was created (`bNNNN`
+    /// base or `master`); provenance only — consumed by the Phase 3
+    /// retire lifecycle, never by routing.
+    pub base_ref: Option<String>,
+    /// Architecture names mined from the built source's
+    /// `llama-arch.cpp` (`LLM_ARCH_NAMES`). A CANDIDATE filter, not a
+    /// guarantee: the runtime load verifies.
+    pub architectures: BTreeSet<String>,
+}
+
 /// Everything Pallama knows about one installed engine build.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// The v2 fields (`source`..`architectures`) are all
+/// `#[serde(default)]`, so manifests serialized by older Pallama
+/// versions (v1 shape) decode unchanged as upstream lanes with no
+/// advertised architectures.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub tag: String,
     pub build_number: u64,
@@ -63,12 +117,71 @@ pub struct Manifest {
     /// Absolute path to the engine's server binary, as probed at install
     /// time. Relocatable on load: see [`Manifest::re_root_server_path`].
     pub server_path: String,
+    /// Where this build's code came from (v2; defaults to upstream for
+    /// pre-v2 manifests).
+    #[serde(default)]
+    pub source: EngineSource,
+    /// `owner/repo` for source-built lanes (v2).
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Immutable commit pin for fork lanes (v2).
+    #[serde(default)]
+    pub ref_pin: Option<String>,
+    /// Upstream anchor the fork lane was created against (v2;
+    /// provenance only).
+    #[serde(default)]
+    pub base_ref: Option<String>,
+    /// Architecture names this build advertises (v2) — mined from the
+    /// source tree at build time. Empty = unknown/unverified: such a
+    /// lane is never picked by architecture-based re-routing.
+    #[serde(default)]
+    pub architectures: BTreeSet<String>,
 }
 
 impl Manifest {
     #[must_use]
     pub fn has_flag(&self, flag: &str) -> bool {
         self.flags.contains(flag)
+    }
+
+    /// Does this lane advertise a GGUF architecture? An advertised name
+    /// is a CANDIDATE filter for re-routing (the runtime load is the
+    /// verification); lanes with no mined set never match.
+    #[must_use]
+    pub fn advertises_arch(&self, arch: &str) -> bool {
+        self.architectures.contains(arch)
+    }
+
+    /// Merge build-time provenance into a probed manifest (source
+    /// builds only): marks the lane's origin and bakes in the
+    /// architecture set mined from the built source tree.
+    pub fn merge_provenance(&mut self, prov: &LaneProvenance) {
+        self.source = prov.source;
+        self.repo.clone_from(&prov.repo);
+        self.ref_pin.clone_from(&prov.ref_pin);
+        self.base_ref.clone_from(&prov.base_ref);
+        self.architectures.clone_from(&prov.architectures);
+    }
+
+    /// Short provenance label for tables and teaching strings, e.g.
+    /// `fork acme/llama.cpp@7c81a9f0 (base b10980)`; empty for plain
+    /// upstream builds.
+    #[must_use]
+    pub fn provenance_label(&self) -> String {
+        match (self.source, &self.ref_pin) {
+            (EngineSource::Fork, Some(pin)) => {
+                let short = &pin[..pin.len().min(8)];
+                let repo = self.repo.as_deref().unwrap_or("?");
+                let base = self
+                    .base_ref
+                    .as_deref()
+                    .map(|b| format!(" (base {b})"))
+                    .unwrap_or_default();
+                format!("fork {repo}@{short}{base}")
+            }
+            (EngineSource::Local, _) => "local".to_string(),
+            _ => String::new(),
+        }
     }
 
     /// Assert every flag in `needed` exists; error names the first missing
@@ -171,6 +284,11 @@ pub fn probe(server_path: &Path, tag: &str) -> Result<Manifest> {
         flags,
         spec_types,
         server_path: server.to_string(),
+        source: EngineSource::Upstream,
+        repo: None,
+        ref_pin: None,
+        base_ref: None,
+        architectures: BTreeSet::new(),
     })
 }
 
@@ -252,6 +370,7 @@ fn probe_mistralrs(server_path: &Path, tag: &str) -> Result<Manifest> {
         flags,
         spec_types: Vec::new(),
         server_path: server.to_string(),
+        ..Default::default()
     })
 }
 
@@ -346,6 +465,7 @@ fn probe_sglang(server_path: &Path, tag: &str) -> Result<Manifest> {
         flags,
         spec_types: Vec::new(),
         server_path: server.to_string(),
+        ..Default::default()
     })
 }
 
@@ -543,6 +663,7 @@ mod tests {
             flags: BTreeSet::new(),
             spec_types: Vec::new(),
             server_path: "/home/other/.local/share/pallama/engines/b10970-cuda/llama-b10970-cuda/llama-server".into(),
+            ..Default::default()
         };
         assert!(m.re_root_server_path(&engines));
         assert_eq!(m.server_path, live_bin.display().to_string());
@@ -566,6 +687,7 @@ mod tests {
             flags: BTreeSet::new(),
             spec_types: Vec::new(),
             server_path: present.display().to_string(),
+            ..Default::default()
         };
         assert!(!m.re_root_server_path(&engines));
         assert_eq!(m.server_path, present.display().to_string());
@@ -588,6 +710,7 @@ mod tests {
             flags: BTreeSet::new(),
             spec_types: Vec::new(),
             server_path: "/gone/custom/llama-server".into(),
+            ..Default::default()
         };
         assert!(!m.re_root_server_path(&engines));
         assert_eq!(m.server_path, "/gone/custom/llama-server");
@@ -658,6 +781,7 @@ options:
             flags: BTreeSet::from(["--jinja".to_string()]),
             spec_types: vec![],
             server_path: "/x".into(),
+            ..Default::default()
         };
         assert!(m.require_flags(&["--jinja"]).is_ok());
         let err = m
@@ -668,6 +792,73 @@ options:
             msg.contains("--spec-draft-model") && msg.contains("engine use"),
             "{msg}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Manifest v2: provenance fields, v1 decode compat, capability set
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn unit__manifest__v1_json_decodes_as_upstream_with_no_archs() {
+        // Rows written by pre-v2 Pallama carry only the seven v1 fields;
+        // they must decode losslessly (serde defaults) as upstream lanes
+        // that advertise nothing — never a fork, never a blocked lane.
+        let v1 = r#"{
+            "tag": "b10980-cuda",
+            "build_number": 10980,
+            "version_raw": "version: 0.4.0",
+            "devices": [],
+            "flags": ["--ctx-size"],
+            "spec_types": [],
+            "server_path": "/x/llama-server"
+        }"#;
+        let m: Manifest = serde_json::from_str(v1).expect("v1 decode");
+        assert_eq!(m.source, EngineSource::Upstream);
+        assert_eq!(m.repo, None);
+        assert_eq!(m.ref_pin, None);
+        assert_eq!(m.base_ref, None);
+        assert!(m.architectures.is_empty());
+        assert!(!m.advertises_arch("llama"));
+        assert_eq!(m.provenance_label(), "");
+    }
+
+    #[test]
+    fn unit__manifest__roundtrip_preserves_fork_provenance() {
+        let mut m = Manifest {
+            tag: "fork-acme_llama.cpp-7c81a9f0-cpu".into(),
+            build_number: 0,
+            version_raw: "version: dev".into(),
+            devices: vec![],
+            flags: BTreeSet::new(),
+            spec_types: vec![],
+            server_path: "/x/llama-server".into(),
+            ..Default::default()
+        };
+        m.merge_provenance(&LaneProvenance {
+            source: EngineSource::Fork,
+            repo: Some("acme/llama.cpp".into()),
+            ref_pin: Some("7c81a9f0123456789abcdef0123456789abcdef01".into()),
+            base_ref: Some("b10980".into()),
+            architectures: BTreeSet::from(["qwen35".into(), "llama".into()]),
+        });
+        let json = serde_json::to_string(&m).unwrap();
+        let back: Manifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, m);
+        assert!(back.advertises_arch("qwen35"));
+        assert!(!back.advertises_arch("qwen3"));
+        assert_eq!(
+            back.provenance_label(),
+            "fork acme/llama.cpp@7c81a9f0 (base b10980)"
+        );
+    }
+
+    #[test]
+    fn unit__manifest__local_label() {
+        let m = Manifest {
+            source: EngineSource::Local,
+            ..Default::default()
+        };
+        assert_eq!(m.provenance_label(), "local");
     }
 
     // ------------------------------------------------------------------

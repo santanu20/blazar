@@ -6,6 +6,7 @@
 //! shutdown), teardown is idempotent, SIGTERM→grace→SIGKILL bounded, and
 //! every state transition publishes an event.
 
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -798,6 +799,12 @@ pub struct Supervisor {
     /// the crash-loop engine rollback (probe-gated, see
     /// `note_engine_failure`).
     engine_failures: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Capability-lane pins (capability lanes): model name -> engine tag
+    /// of the lane that rescued it after the mainstream lane rejected
+    /// the model's architecture. Daemon-lifetime memory only — never
+    /// written into the user's config behind their back (an explicit
+    /// `model_overrides.<model>.engine` pin always wins over this map).
+    capability_pins: std::sync::Mutex<std::collections::HashMap<String, String>>,
     pub config: Config,
     pub bus: EventBus,
     pub hardware: Hardware,
@@ -972,6 +979,7 @@ impl Supervisor {
             cache_hint: std::sync::Arc::new(CacheHint::default()),
             spec_accept: std::sync::Arc::new(CacheHint::default()),
             engine_failures: std::sync::Mutex::new(std::collections::HashSet::new()),
+            capability_pins: std::sync::Mutex::new(std::collections::HashMap::new()),
             measured: std::sync::Mutex::new(MeasuredTick::default()),
             census_cache: std::sync::Mutex::new(None),
             load_timeout_secs: config.model_load_timeout_secs,
@@ -1690,7 +1698,6 @@ impl Supervisor {
         let mut secret = String::with_capacity(4 + raw.len() * 2);
         secret.push_str("plm_");
         for b in &raw {
-            use std::fmt::Write as _;
             let _ = write!(secret, "{b:02x}");
         }
         if manifest.flags.contains("--api-key-file") {
@@ -2227,6 +2234,42 @@ impl Supervisor {
                 .join(", ")
         };
 
+        // Capability-lane pin from a previous unknown-architecture
+        // rescue: without a user overlay pin, the learned pin routes
+        // straight back to the lane that last served this model. A pin
+        // whose lane was removed (pallama engine rm) is dropped and
+        // routing falls through to the normal resolver.
+        if overlay.engine.is_none() {
+            let pinned = self
+                .capability_pins
+                .lock()
+                .expect("capability pins lock")
+                .get(&model.name)
+                .cloned();
+            if let Some(tag) = pinned {
+                if let Some(row) = rows.iter().find(|r| r.tag == tag) {
+                    if let Some(adapter) = adapter_for(row) {
+                        tracing::info!(
+                            model = %model.name,
+                            engine = %row.tag,
+                            "capability pin: spawn reuses the lane that rescued this model"
+                        );
+                        return Ok(Some((adapter, row.tag.clone())));
+                    }
+                } else {
+                    self.capability_pins
+                        .lock()
+                        .expect("capability pins lock")
+                        .remove(&model.name);
+                    tracing::warn!(
+                        model = %model.name,
+                        tag = %tag,
+                        "capability pin target no longer installed — routing normally"
+                    );
+                }
+            }
+        }
+
         // Shared decision (core `serving_lane`) — the gateway consults
         // the SAME function to predict the serving lane for per-child
         // protocol quirks, so supervisor and gateway can never disagree.
@@ -2303,8 +2346,21 @@ impl Supervisor {
 
     // Full child lifecycle in one pass: argv build, spawn, settle, health
     // gate, registration. Splitting it would scatter the invariants.
-    #[allow(clippy::too_many_lines)]
     async fn spawn_instance(&self, key: &str) -> Result<EngineRef, SupervisionError> {
+        self.spawn_instance_forced(key, false).await
+    }
+
+    /// `spawn_instance` with the capability-rescue bound: `true` means
+    /// this spawn IS already the single unknown-architecture re-route —
+    /// classification still informs the error teaching, but a second
+    /// re-route never happens (one rescue per spawn, however many
+    /// in-spawn retries run).
+    #[allow(clippy::too_many_lines)]
+    async fn spawn_instance_forced(
+        &self,
+        key: &str,
+        forced_lane: bool,
+    ) -> Result<EngineRef, SupervisionError> {
         let name = model_of_key(key);
         let store =
             Store::open(&self.dirs).map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
@@ -2329,6 +2385,7 @@ impl Supervisor {
         // active engine and its daemon-lifetime Arc stay untouched.
         // Co-residency on small cards is handled by the same VRAM
         // ladders that guard any multi-instance box.
+        let routed_tag: Option<String>;
         let engine: Arc<dyn Engine> = match self.resolve_routed_engine(&store, &overlay, &model) {
             Ok(Some((routed, tag))) => {
                 tracing::info!(
@@ -2337,9 +2394,13 @@ impl Supervisor {
                     routed_to = tag.as_str(),
                     "engine routing: spawn uses a routed adapter"
                 );
+                routed_tag = Some(tag);
                 routed
             }
-            Ok(None) => self.engine.clone(),
+            Ok(None) => {
+                routed_tag = None;
+                self.engine.clone()
+            }
             Err(teach) => return Err(SupervisionError::UnsupportedModel(teach)),
         };
         let meta_box = read_model_meta(&model.path, engine.kind()).map_err(|e| {
@@ -3073,6 +3134,51 @@ impl Supervisor {
             self.record_restart(key);
         }
         self.note_engine_failure(name);
+        // Capability-lane rescue: a child that died rejecting the
+        // model's architecture ("unknown model architecture: 'x'") is
+        // exactly what fork lanes exist for. Bound the rescue to ONE
+        // re-route per spawn (the recursive attempt runs with
+        // forced_lane set) and never override a user pin — the overlay
+        // pin is the user's explicit choice and stays untouched (H4).
+        if let Some(arch) = Self::classify_unknown_arch(&last_load_tail) {
+            let advertisers = Self::advertising_lanes(&arch, &store, routed_tag.as_deref());
+            if !forced_lane && overlay.engine.is_none() {
+                if let Some(tag) = advertisers.first() {
+                    tracing::warn!(
+                        model = name,
+                        architecture = %arch,
+                        engine = %tag,
+                        "mainstream lane rejected this architecture — re-routing to the \
+                         installed lane that advertises it (single attempt)"
+                    );
+                    self.capability_pins
+                        .lock()
+                        .expect("capability pins lock")
+                        .insert(name.to_string(), tag.clone());
+                    return Box::pin(self.spawn_instance_forced(key, true)).await;
+                }
+            }
+            // No rescue available (no advertiser, already re-routed, or
+            // the user pinned the failing lane): teach the escape hatch.
+            let mut msg = format!("{key}: {}", Self::tail_excerpt(&last_load_tail));
+            if child_died_during_load {
+                if let Some(tag) = advertisers.first() {
+                    let _ = write!(
+                        msg,
+                        " — engine(s) advertising '{arch}': {tag}; pin one with \
+                         model_overrides.{name}.engine in config.toml"
+                    );
+                } else {
+                    let _ = write!(
+                        msg,
+                        " — no installed engine advertises architecture '{arch}'. A llama.cpp \
+                         fork may already support it: build a temporary capability lane with \
+                         `pallama engine build --fork <owner>/llama.cpp@<commit-sha> --backend cpu`"
+                    );
+                }
+                return Err(SupervisionError::EngineCrashed(msg));
+            }
+        }
         Err(if child_died_during_load {
             SupervisionError::EngineCrashed(format!(
                 "{key}: {}",
@@ -3081,6 +3187,46 @@ impl Supervisor {
         } else {
             SupervisionError::ModelLoadTimeout(key.to_string())
         })
+    }
+
+    /// Installed llama.cpp lanes whose manifest advertises `arch`
+    /// (newest first, matching `list_engines` order), excluding the tag
+    /// that already failed. The manifest's architecture set is mined
+    /// from the source's `llama-arch.cpp` at build time — advertisement
+    /// is a candidate filter; the actual load on the fork lane is the
+    /// verification.
+    fn advertising_lanes(arch: &str, store: &Store, exclude: Option<&str>) -> Vec<String> {
+        let Ok(rows) = store.list_engines() else {
+            return Vec::new();
+        };
+        rows.iter()
+            .filter(|r| r.kind == pallama_core::engine_kind::EngineKind::LlamaCpp)
+            .filter(|r| Some(r.tag.as_str()) != exclude)
+            .filter(|r| {
+                serde_json::from_str::<crate::engine::manifest::Manifest>(&r.manifest)
+                    .is_ok_and(|m| m.advertises_arch(arch))
+            })
+            .map(|r| r.tag.clone())
+            .collect()
+    }
+
+    /// Classify a dead child's log tail as llama.cpp's
+    /// unknown-architecture rejection and extract the architecture name
+    /// it choked on:
+    /// `... unknown model architecture: 'qwen35'` -> `qwen35`.
+    /// Case-insensitive phrase match (loader wording varies slightly
+    /// across versions); the architecture must appear in single quotes
+    /// — anything else classifies as None (conservative: a wrong
+    /// rescue is worse than no rescue).
+    fn classify_unknown_arch(tail: &str) -> Option<String> {
+        let lower = tail.to_lowercase();
+        let idx = lower.find("unknown model architecture")?;
+        let after = &tail[idx + "unknown model architecture".len()..];
+        let start = after.find('\'')? + 1;
+        let rest = &after[start..];
+        let end = rest.find('\'')?;
+        let name = &rest[..end];
+        (!name.is_empty()).then(|| name.to_string())
     }
 
     /// Last few non-empty lines of a dead child's log tail, for the
@@ -4481,6 +4627,7 @@ mod routing_tests {
             flags: std::collections::BTreeSet::new(),
             spec_types: vec![],
             server_path: String::new(),
+            ..Default::default()
         };
         let mut config = Config::default();
         config.model_overrides.insert(
@@ -4528,6 +4675,7 @@ mod routing_tests {
             flags: flags.iter().map(|s| (*s).to_string()).collect(),
             spec_types: vec![],
             server_path: String::new(),
+            ..Default::default()
         };
         let sup = |config: Config| {
             Supervisor::new(
@@ -4679,6 +4827,7 @@ mod routing_tests {
                 flags: std::collections::BTreeSet::new(),
                 spec_types: vec![],
                 server_path: String::new(),
+                ..Default::default()
             })),
         );
         (sup, root, bus)
@@ -4803,6 +4952,7 @@ mod routing_tests {
                 flags: std::collections::BTreeSet::new(),
                 spec_types: vec![],
                 server_path: String::new(),
+                ..Default::default()
             })),
         );
         (sup, root)
@@ -5234,6 +5384,174 @@ mod routing_tests {
         assert_eq!(r(None, Some("eagle3".into()), "auto"), "eagle3");
         // Neither: the global config default.
         assert_eq!(r(None, None, "auto"), "auto");
+    }
+
+    #[test]
+    fn unit__classify_unknown_arch__extracts_quoted_architecture() {
+        // Wording from llama.cpp's loader on an unmerged architecture.
+        let tail = "llama_model_load: error loading model: unknown model \
+                    architecture: 'qwen35'";
+        assert_eq!(
+            Supervisor::classify_unknown_arch(tail).as_deref(),
+            Some("qwen35")
+        );
+        // Phrase match is case-insensitive across loader versions.
+        assert_eq!(
+            Supervisor::classify_unknown_arch("Unknown Model Architecture: 'x-arch'").as_deref(),
+            Some("x-arch")
+        );
+        // The excerpt sits mid-tail with later lines after it.
+        let noisy = "loading tensors\nunknown model architecture: 'granite4'\nbye";
+        assert_eq!(
+            Supervisor::classify_unknown_arch(noisy).as_deref(),
+            Some("granite4")
+        );
+    }
+
+    #[test]
+    fn unit__classify_unknown_arch__unquoted_or_absent_is_none() {
+        // Unquoted (conservative: no guess where the name ends).
+        assert_eq!(
+            Supervisor::classify_unknown_arch("unknown model architecture: qwen35"),
+            None
+        );
+        // Empty quotes.
+        assert_eq!(
+            Supervisor::classify_unknown_arch("unknown model architecture: ''"),
+            None
+        );
+        // Unrelated failure tails must never classify.
+        for tail in ["failed to create context", "unknown model quant: 'q8'", ""] {
+            assert_eq!(Supervisor::classify_unknown_arch(tail), None, "{tail:?}");
+        }
+    }
+
+    /// Engine rows for capability-lane tests: fork rows carry the
+    /// architecture set a real build would have mined.
+    fn lane_row(tag: &str, archs: &[&str], at: i64) -> pallama_core::EngineRow {
+        let fork = !archs.is_empty();
+        pallama_core::EngineRow {
+            tag: tag.into(),
+            asset: if fork {
+                "built-fork".into()
+            } else {
+                "built-cpu".into()
+            },
+            sha256: "x".into(),
+            installed_at: at,
+            active: false,
+            manifest: serde_json::to_string(&crate::engine::manifest::Manifest {
+                tag: tag.into(),
+                source: if fork {
+                    crate::engine::manifest::EngineSource::Fork
+                } else {
+                    crate::engine::manifest::EngineSource::Upstream
+                },
+                architectures: archs.iter().map(|s| (*s).to_string()).collect(),
+                ..Default::default()
+            })
+            .unwrap(),
+            kind: pallama_core::engine_kind::EngineKind::LlamaCpp,
+        }
+    }
+
+    #[test]
+    fn unit__advertising_lanes__newest_llamacpp_advertiser_first() {
+        let sup = routing_sup(1);
+        let store = Store::open(&sup.dirs).unwrap();
+        // Two fork lanes advertise qwen35 (fork-b newer); the mainstream
+        // lane and a same-claim mistral.rs row do not count.
+        store
+            .upsert_engine(&lane_row("fork-a/llama.cpp-1111-cpu", &["qwen35"], 1000))
+            .unwrap();
+        store
+            .upsert_engine(&lane_row("fork-b/llama.cpp-2222-cpu", &["qwen35"], 2000))
+            .unwrap();
+        store
+            .upsert_engine(&lane_row("b-main-cpu", &[], 3000))
+            .unwrap();
+        store
+            .upsert_engine(&pallama_core::EngineRow {
+                kind: pallama_core::engine_kind::EngineKind::MistralRs,
+                ..lane_row("m1", &["qwen35"], 4000)
+            })
+            .unwrap();
+
+        // list_engines is newest-first: fork-b precedes fork-a.
+        let lanes = Supervisor::advertising_lanes("qwen35", &store, Some("b-main-cpu"));
+        assert_eq!(
+            lanes,
+            vec![
+                "fork-b/llama.cpp-2222-cpu".to_string(),
+                "fork-a/llama.cpp-1111-cpu".to_string()
+            ]
+        );
+        // Unknown to every lane.
+        assert!(Supervisor::advertising_lanes("nope-arch", &store, None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn unit__resolve_routed_engine__capability_pin_priority() {
+        let sup = routing_sup(1);
+        let store = Store::open(&sup.dirs).unwrap();
+        let fork_tag = "fork-acme/llama.cpp-7c81a9f0-cpu";
+        // Mainstream lane is NEWER: plain auto-routing prefers it.
+        store
+            .upsert_engine(&lane_row(fork_tag, &["qwen35"], 1000))
+            .unwrap();
+        store
+            .upsert_engine(&lane_row("b1-cuda", &[], 2000))
+            .unwrap();
+        let model = pallama_core::ModelRow {
+            name: "m".into(),
+            repo: "m".into(),
+            quant: "Q4_0".into(),
+            path: "/models/m-q4_0.gguf".into(),
+            bytes: 1,
+            sha256: None,
+            mmproj_path: None,
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+        };
+        let overlay = pallama_core::config::ModelOverride::default();
+
+        // Learned pin (no user overlay): routes to the fork lane.
+        sup.capability_pins
+            .lock()
+            .unwrap()
+            .insert("m".into(), fork_tag.into());
+        let Some((_, tag)) = sup.resolve_routed_engine(&store, &overlay, &model).unwrap() else {
+            panic!("capability pin must route");
+        };
+        assert_eq!(tag, fork_tag);
+
+        // User overlay pin ALWAYS outranks the learned pin.
+        let user_pin = pallama_core::config::ModelOverride {
+            engine: Some("b1-cuda".into()),
+            ..Default::default()
+        };
+        let Some((_, tag)) = sup
+            .resolve_routed_engine(&store, &user_pin, &model)
+            .unwrap()
+        else {
+            panic!("user pin must route");
+        };
+        assert_eq!(tag, "b1-cuda");
+
+        // Stale pin (lane deleted): dropped, normal routing resumes.
+        store.delete_engine(fork_tag).unwrap();
+        sup.capability_pins
+            .lock()
+            .unwrap()
+            .insert("m".into(), fork_tag.into());
+        let _ = sup.resolve_routed_engine(&store, &overlay, &model).unwrap();
+        assert!(
+            !sup.capability_pins.lock().unwrap().contains_key("m"),
+            "stale pin must be dropped"
+        );
     }
 
     #[tokio::test]

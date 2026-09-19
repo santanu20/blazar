@@ -2,6 +2,7 @@
 //! probe capabilities, activate/rollback, prune old tags. A local build
 //! registers as pseudo-tag `local` and is never pruned.
 
+pub mod arch_miner;
 pub mod build;
 pub mod gh;
 pub mod manifest;
@@ -237,6 +238,21 @@ fn which_first(names: &[&str]) -> bool {
 #[must_use]
 pub fn is_cuda_engine(tag: &str, asset_label: &str) -> bool {
     tag.ends_with("-cuda") || asset_label.contains("cuda")
+}
+
+/// Is this engine row a fork capability lane? Recognized by the
+/// `fork-*` tag convention or by the recorded manifest naming a fork
+/// source (the tag check is the fast path; the manifest check keeps the
+/// classification honest for lanes registered by older/other tooling).
+/// Fork lanes are user-installed escape hatches for capabilities
+/// upstream has not merged: they never count against mainstream
+/// retention budgets and are never auto-pruned — removal is explicit
+/// (`pallama engine rm <tag>`).
+#[must_use]
+pub fn is_fork_lane(row: &EngineRow) -> bool {
+    row.tag.starts_with("fork-")
+        || serde_json::from_str::<manifest::Manifest>(&row.manifest)
+            .is_ok_and(|m| m.source == manifest::EngineSource::Fork)
 }
 
 /// Pre-download mirror of the keep-CUDA activation guard: on a
@@ -1328,7 +1344,39 @@ impl EngineManager {
         sha256: &str,
         kind: EngineKind,
     ) -> Result<EngineRow> {
-        self.register_engine_with_vendor(dir, tag, asset_label, sha256, kind, system_vendor_hint())
+        self.register_engine_inner(
+            dir,
+            tag,
+            asset_label,
+            sha256,
+            kind,
+            system_vendor_hint(),
+            None,
+        )
+    }
+
+    /// `register_engine` plus lane provenance: build lanes (upstream
+    /// b-tags and fork pins) bake their source repo, commit SHA, and
+    /// mined architecture set into the row's manifest — the capability
+    /// currency the supervisor's unknown-architecture re-route consumes.
+    pub fn register_engine_provenanced(
+        &self,
+        dir: &Path,
+        tag: &str,
+        asset_label: &str,
+        sha256: &str,
+        kind: EngineKind,
+        prov: &manifest::LaneProvenance,
+    ) -> Result<EngineRow> {
+        self.register_engine_inner(
+            dir,
+            tag,
+            asset_label,
+            sha256,
+            kind,
+            system_vendor_hint(),
+            Some(prov),
+        )
     }
 
     /// `register_engine` with an injectable vendor hint so the CUDA
@@ -1342,6 +1390,22 @@ impl EngineManager {
         kind: EngineKind,
         vendor_hint: manifest::Vendor,
     ) -> Result<EngineRow> {
+        self.register_engine_inner(dir, tag, asset_label, sha256, kind, vendor_hint, None)
+    }
+
+    // Argument list maps 1:1 onto the public register_* API; bundling
+    // into a seed struct would hide that correspondence.
+    #[allow(clippy::too_many_arguments)]
+    fn register_engine_inner(
+        &self,
+        dir: &Path,
+        tag: &str,
+        asset_label: &str,
+        sha256: &str,
+        kind: EngineKind,
+        vendor_hint: manifest::Vendor,
+        prov: Option<&manifest::LaneProvenance>,
+    ) -> Result<EngineRow> {
         let server = match kind {
             EngineKind::LlamaCpp => find_server(dir),
             EngineKind::MistralRs => find_engine_binary(dir, &["mistralrs", "mistralrs.exe"]),
@@ -1352,8 +1416,11 @@ impl EngineManager {
         .map_err(|e| e.context(ENGINE_PROBE_FAILED))?;
         make_executable(&server);
 
-        let m = manifest::probe_kind(&server, tag, &kind)
+        let mut m = manifest::probe_kind(&server, tag, &kind)
             .map_err(|e| e.context(ENGINE_PROBE_FAILED))?;
+        if let Some(p) = prov {
+            m.merge_provenance(p);
+        }
         match kind {
             EngineKind::LlamaCpp => {
                 if m.devices.is_empty()
@@ -1527,7 +1594,8 @@ impl EngineManager {
     }
 
     /// Keep the newest `KEEP_TAGS` engines; `local` and the active tag are
-    /// never pruned.
+    /// never pruned. Fork capability lanes are exempt entirely — see
+    /// [`is_fork_lane`].
     pub fn prune(&self, store: &Store) -> Result<()> {
         let engines = store.list_engines()?; // newest first
         let active = engines.iter().find(|e| e.active).map(|e| e.tag.clone());
@@ -1540,6 +1608,12 @@ impl EngineManager {
         let mut kept_per_kind: std::collections::BTreeMap<&str, usize> =
             std::collections::BTreeMap::new();
         for e in &engines {
+            // A user-installed fork lane never consumes a mainstream
+            // retention slot: skipping BEFORE the count keeps KEEP_TAGS
+            // reserved for upstream currency.
+            if is_fork_lane(e) {
+                continue;
+            }
             let seen = kept_per_kind.entry(e.kind.as_str()).or_insert(0);
             *seen += 1;
             if *seen <= KEEP_TAGS || e.tag == LOCAL_TAG || Some(&e.tag) == active.as_ref() {
@@ -1561,14 +1635,22 @@ impl EngineManager {
     /// Delete every OTHER engine of the same kind: a verified, activated
     /// update leaves exactly one build per lane (the user-facing "why do
     /// I see two llama.cpp engines after updating" contract). The `local`
-    /// pseudo-tag and `keep_tag` itself survive; cross-kind rows are
-    /// untouched. Returns the freed (tag, bytes) pairs for the summary.
+    /// pseudo-tag, `keep_tag` itself, and fork capability lanes survive;
+    /// cross-kind rows are untouched. Returns the freed (tag, bytes)
+    /// pairs for the summary.
     pub fn prune_siblings(&self, kind: &str, keep_tag: &str) -> Result<Vec<(String, u64)>> {
         let store = Store::open(&self.dirs)?;
         let engines = store.list_engines()?;
         let mut freed = Vec::new();
         for e in engines {
-            if e.kind.as_str() != kind || e.tag == keep_tag || e.tag == LOCAL_TAG {
+            if e.kind.as_str() != kind
+                || e.tag == keep_tag
+                || e.tag == LOCAL_TAG
+                // Fork lanes are additive siblings, not superseded
+                // currency: an upstream update must not delete a lane
+                // some model still depends on.
+                || is_fork_lane(&e)
+            {
                 continue;
             }
             let dir = self.dirs.engines_dir().join(&e.tag);

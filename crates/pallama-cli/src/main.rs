@@ -15,8 +15,8 @@ use std::time::Duration;
 use pallama_core::engine_kind::EngineKind;
 use pallama_core::{Config, PallamaDirs, Store};
 use pallama_runtime::engine::build::{
-    detect_toolchain, nvidia_gpu_facts, path_dirs, require_toolchain, BuildBackend, BuildOpts,
-    Toolchain,
+    detect_toolchain, nvidia_gpu_facts, parse_fork_spec, path_dirs, require_toolchain,
+    validate_commit_sha, validate_repo_slug, BuildBackend, BuildOpts, BuildSource, Toolchain,
 };
 use pallama_runtime::engine::gh::{btag_number, same_build, GhClient};
 use pallama_runtime::engine::EngineManager;
@@ -526,6 +526,23 @@ enum EngineCmd {
         backend: String,
         /// Upstream b-tag to build (default: the update channel's target)
         tag: Option<String>,
+        /// Fork capability lane shorthand: owner/repo@commit-sha. Builds
+        /// an immutable pin of a llama.cpp fork — a temporary lane for
+        /// architectures upstream hasn't merged (see README "Capability
+        /// lanes"). Mutually exclusive with --repo/--ref.
+        #[arg(long, conflicts_with_all = ["repo", "git_ref"])]
+        fork: Option<String>,
+        /// Fork repo, explicit form (with --ref): owner/name
+        #[arg(long = "repo", requires = "git_ref")]
+        repo: Option<String>,
+        /// Fork commit SHA, explicit form (with --repo): 4-40 hex digits.
+        /// Branch/tag names are rejected — fork lanes are immutable.
+        #[arg(long = "ref", requires = "repo")]
+        git_ref: Option<String>,
+        /// Upstream anchor (b-tag) the fork builds on, e.g. b10980.
+        /// Recorded as provenance; display-only.
+        #[arg(long = "base")]
+        base: Option<String>,
         /// CUDA architectures override (e.g. 89, or 80;86), for
         /// cross-builds without a local GPU
         #[arg(long)]
@@ -7249,27 +7266,42 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             let store = Store::open(&d)?;
             let mut seen: Vec<&str> = Vec::new();
             for e in store.list_engines()? {
+                // Provenance suffix from the row's manifest: fork lanes
+                // show their immutable pin, source builds their commit.
+                // v1 rows (pre-Manifest-v2) decode as plain upstream.
+                let prov = serde_json::from_str::<pallama_runtime::Manifest>(&e.manifest)
+                    .ok()
+                    .map(|m| (m.provenance_label(), m.source.as_str().to_string()));
                 if json {
                     // Full sha256 (the table truncates to 12 chars) —
                     // scripts verifying assets want the whole digest.
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "tag": e.tag,
-                            "kind": e.kind.as_str(),
-                            "asset": e.asset,
-                            "active": e.active,
-                            "sha256": e.sha256,
-                        })
-                    );
+                    // `source`/`provenance` are additive keys.
+                    let mut obj = serde_json::json!({
+                        "tag": e.tag,
+                        "kind": e.kind.as_str(),
+                        "asset": e.asset,
+                        "active": e.active,
+                        "sha256": e.sha256,
+                        "source": prov.as_ref().map_or("unknown", |(_, s)| s.as_str()),
+                    });
+                    if let Some((label, _)) = &prov {
+                        if !label.is_empty() {
+                            obj["provenance"] = serde_json::Value::String(label.clone());
+                        }
+                    }
+                    println!("{obj}");
                     continue;
                 }
                 seen.push(e.kind.as_str());
+                let asset = match &prov {
+                    Some((label, _)) if !label.is_empty() => format!("{} {}", e.asset, label),
+                    _ => e.asset.clone(),
+                };
                 println!(
                     "{:<12} {:<9} {:<10} {} {}",
                     e.tag,
                     e.kind.as_str(),
-                    e.asset,
+                    asset,
                     if e.active { "[active]" } else { "" },
                     e.sha256.chars().take(12).collect::<String>()
                 );
@@ -7348,6 +7380,10 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
         EngineCmd::Build {
             backend,
             tag,
+            fork,
+            repo,
+            git_ref,
+            base,
             arch,
             cuda_host_compiler,
             jobs,
@@ -7358,6 +7394,10 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 BackendArg {
                     backend,
                     tag,
+                    fork,
+                    repo,
+                    git_ref,
+                    base,
                     arch,
                     cuda_host_compiler,
                     jobs,
@@ -7691,6 +7731,10 @@ async fn route_update_to_build(
                 BackendArg {
                     backend: backend.as_str().to_string(),
                     tag: Some(target_tag.to_string()),
+                    fork: None,
+                    repo: None,
+                    git_ref: None,
+                    base: None,
                     arch: None,
                     cuda_host_compiler: None,
                     jobs: None,
@@ -7916,14 +7960,101 @@ async fn engine_update(
 
 /// `pallama engine build` — compile llama.cpp from source into an
 /// installable engine (see `engine::build`), then the same F7 gate and
-/// summary as `engine update`.
+/// summary as `engine update`. With `--fork`/`--repo`+`--ref` the
+/// source is an immutable fork pin instead of an upstream b-tag.
 struct BackendArg {
     backend: String,
     tag: Option<String>,
+    fork: Option<String>,
+    repo: Option<String>,
+    git_ref: Option<String>,
+    base: Option<String>,
     arch: Option<String>,
     cuda_host_compiler: Option<PathBuf>,
     jobs: Option<usize>,
     no_gate: bool,
+}
+
+/// Resolve the `--fork owner/repo@sha` shorthand (or the explicit
+/// `--repo` + `--ref` pair, whose pairing clap enforces) into a fork
+/// build source, printing the trust banner first: fork code compiles
+/// and runs with the user's privileges and Pallama cannot audit it.
+fn fork_lane_source(a: &BackendArg) -> Result<Option<BuildSource>> {
+    let (repo, sha) = if let Some(spec) = &a.fork {
+        parse_fork_spec(spec)?
+    } else if let (Some(repo), Some(sha)) = (&a.repo, &a.git_ref) {
+        validate_repo_slug(repo)?;
+        validate_commit_sha(sha)?;
+        (repo.clone(), sha.clone())
+    } else {
+        return Ok(None);
+    };
+    println!(
+        "TRUST: building code from fork {repo}@{sha} — it compiles and runs on this \
+         machine with your privileges. Only build forks you trust. The pin is immutable \
+         (commit {sha}); Pallama records but cannot audit fork code."
+    );
+    Ok(Some(BuildSource::Fork {
+        repo,
+        ref_sha: sha,
+        base_ref: a.base.clone(),
+    }))
+}
+
+/// The F7 decode-regression gate applies to mainstream b-tag builds
+/// only: fork lanes are opt-in capability additions outside the upstream
+/// currency, and downgrade builds skip by existing policy. Returns
+/// (`gate_on`, `downgrade`) so the caller can keep the historical messages.
+fn engine_gate_on(
+    fork: bool,
+    a: &BackendArg,
+    d: &PallamaDirs,
+    resolved: &str,
+) -> Result<(bool, bool)> {
+    let active_tag = Store::open(d)?.active_engine()?.map(|e| e.tag);
+    let downgrade = match &active_tag {
+        Some(act) => matches!(
+            (btag_number(act), btag_number(resolved)),
+            (Some(x), Some(y)) if y < x
+        ),
+        None => false,
+    };
+    if fork || a.no_gate || std::env::var("PALLAMA_ENGINE_GATE").as_deref() == Ok("0") {
+        return Ok((false, downgrade));
+    }
+    Ok((!downgrade, downgrade))
+}
+
+/// Post-install fork-lane summary: provenance, advertised architecture
+/// count, and how to pin a model onto the lane permanently.
+fn print_fork_lane_howto(row: &pallama_core::EngineRow, m: &pallama_runtime::Manifest) {
+    println!(
+        "fork lane {} — {}, advertises {} architectures (from the source's llama-arch.cpp)",
+        row.tag,
+        m.provenance_label(),
+        m.architectures.len()
+    );
+    println!(
+        "serve a model on it: auto-routing rescues unknown-architecture loads, or pin \
+         explicitly in config.toml: [model_overrides.<model>]\nengine = \"{}\"",
+        row.tag
+    );
+}
+
+/// Source label for the build log: upstream resolves exactly like
+/// Update (explicit tag, else the channel target; must be a b-tag),
+/// while a fork lane is identified by its pinned SHA.
+async fn resolve_build_label(
+    gh: &GhClient,
+    channel: pallama_core::config::UpdateChannel,
+    a: &BackendArg,
+    source: &BuildSource,
+) -> Result<String> {
+    match (&a.tag, source) {
+        (Some(t), BuildSource::Upstream) => Ok(gh.resolve_tag(t).await?.tag_name),
+        (None, BuildSource::Upstream) => Ok(gh.channel_b_release(channel).await?.tag_name),
+        (_, BuildSource::Fork { ref_sha, .. }) => Ok(ref_sha.clone()),
+    }
 }
 
 async fn engine_build(d: &PallamaDirs, a: BackendArg) -> Result<()> {
@@ -7932,22 +8063,22 @@ async fn engine_build(d: &PallamaDirs, a: BackendArg) -> Result<()> {
         "cpu" => BuildBackend::Cpu,
         other => return Err(anyhow!("unknown backend {other:?} — supported: cuda, cpu")),
     };
-    // Resolve the source tag exactly like Update: explicit tag, else the
-    // channel target. Must land on a concrete b-tag.
+    let source = fork_lane_source(&a)?.unwrap_or(BuildSource::Upstream);
+    let fork = matches!(source, BuildSource::Fork { .. });
+    // Resolve the source label: for upstream, exactly like Update; for
+    // forks it is the pinned SHA.
     let token = std::env::var("GH_TOKEN").ok();
     let gh = GhClient::new(token)?;
     let cfg = config()?;
-    let resolved = match &a.tag {
-        Some(t) => gh.resolve_tag(t).await?.tag_name,
-        None => gh.channel_b_release(cfg.update_channel).await?.tag_name,
-    };
-    if btag_number(&resolved).is_none() {
+    let resolved = resolve_build_label(&gh, cfg.update_channel, &a, &source).await?;
+    if !fork && btag_number(&resolved).is_none() {
         return Err(anyhow!(
             "engine build needs a b-tag; channel resolved {resolved:?}"
         ));
     }
+    let lane_word = if fork { " fork lane" } else { "" };
     println!(
-        "building llama.cpp {resolved} (backend {}, from source — this needs \
+        "building llama.cpp{lane_word} {resolved} (backend {}, from source — this needs \
          git + cmake + a C++ compiler{cuda_note})",
         backend.as_str(),
         cuda_note = if backend == BuildBackend::Cuda {
@@ -7957,8 +8088,9 @@ async fn engine_build(d: &PallamaDirs, a: BackendArg) -> Result<()> {
         }
     );
     let mut opts = BuildOpts::new(backend, &resolved);
-    opts.arch = a.arch;
-    opts.cuda_host_compiler = a.cuda_host_compiler;
+    opts.source = source;
+    opts.arch = a.arch.clone();
+    opts.cuda_host_compiler = a.cuda_host_compiler.clone();
     if let Some(j) = a.jobs {
         opts.jobs = j;
     }
@@ -7971,26 +8103,28 @@ async fn engine_build(d: &PallamaDirs, a: BackendArg) -> Result<()> {
     let row = mgr
         .build_and_install(&opts, &mut |line| println!("  {line}"))
         .await?;
-    // Same F7 gate as Update: skip on --no-gate, env knob, or an
-    // intentionally older build than the active engine.
-    let active_tag = Store::open(d)?.active_engine()?.map(|e| e.tag);
-    let downgrade = match &active_tag {
-        Some(act) => matches!(
-            (btag_number(act), btag_number(&resolved)),
-            (Some(x), Some(y)) if y < x
-        ),
-        None => false,
-    };
-    let gate_on =
-        !a.no_gate && std::env::var("PALLAMA_ENGINE_GATE").as_deref() != Ok("0") && !downgrade;
+    // Fork lanes are opt-in capability additions, not mainstream
+    // currency: the F7 gate compares a build against the tune baseline
+    // of the ACTIVE engine line, which a fork lane is not part of.
+    // Skipping is a policy statement, not a shortcut.
+    let (gate_on, downgrade) = engine_gate_on(fork, &a, d, &resolved)?;
     if gate_on {
         engine_regression_gate(&mgr, d, &row)?;
+    } else if fork {
+        println!(
+            "engine {} installed; regression gate skipped (fork lane — outside the \
+             upstream b-tag currency)",
+            row.tag
+        );
     } else if downgrade {
         println!("older build {resolved}: regression gate skipped");
     } else {
         println!("engine {} installed; regression gate skipped", row.tag);
     }
     let m: pallama_runtime::Manifest = serde_json::from_str(&row.manifest)?;
+    if fork {
+        print_fork_lane_howto(&row, &m);
+    }
     if row.active {
         println!(
             "engine {} active (build {}, {} devices, {} flags)",
@@ -8001,15 +8135,19 @@ async fn engine_build(d: &PallamaDirs, a: BackendArg) -> Result<()> {
         );
         // One-build-per-lane contract (see `engine_update`): a freshly
         // built AND activated engine frees its superseded siblings.
-        for (tag, bytes) in mgr.prune_siblings(row.kind.as_str(), &row.tag)? {
-            // fs sizes fit i64
-            #[allow(clippy::cast_possible_wrap)]
-            let freed = bytes as i64;
-            println!(
-                "removed superseded engine {} (freed {})",
-                tag,
-                humansize(freed)
-            );
+        // Fork lanes are additive — they never trigger sibling cleanup
+        // (the mainstream line must survive a fork install untouched).
+        if !fork {
+            for (tag, bytes) in mgr.prune_siblings(row.kind.as_str(), &row.tag)? {
+                // fs sizes fit i64
+                #[allow(clippy::cast_possible_wrap)]
+                let freed = bytes as i64;
+                println!(
+                    "removed superseded engine {} (freed {})",
+                    tag,
+                    humansize(freed)
+                );
+            }
         }
     } else {
         // keep-cuda guard fired: an installed CUDA engine stays active.

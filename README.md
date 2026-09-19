@@ -198,6 +198,7 @@ The advanced surface, grouped by job. `--json`/JSONL output on the inspection co
 | Command | What it does |
 |---|---|
 | `pallama engine update/use/rollback/build` | sha256-verified engines, side-by-side, regression-gated; CUDA source builds through the same flow |
+| `pallama engine build --fork owner/llama.cpp@<sha>` | Temporary capability lane for GGUF archs mainline can't load yet: immutable SHA pin, architecture set mined from the fork's source, provenance in `engine list`; a model that dies on `unknown model architecture` re-routes to an installed advertising lane exactly once and remembers the pin |
 | `pallama upgrade [--dry-run]` | Self-update the binary from GitHub Releases, sha256-verified |
 | `pallama keys` | API key lifecycle — list / add / rm / rotate against the daemon |
 | `pallama launch --warm <model> -- <cli>` | Pre-warm a model, exec a CLI, hand it a gateway key |

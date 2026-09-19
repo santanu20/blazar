@@ -21,7 +21,92 @@ use pallama_core::store::EngineRow;
 use pallama_core::PallamaDirs;
 
 use super::gh::LLAMA_CPP_REPO;
+use super::manifest::{EngineSource, LaneProvenance};
 use super::{discard_retired_engine, restore_retired_engine, retire_engine_dir, EngineManager};
+
+/// Where `engine build` compiles from. Upstream = a `bNNNN` tag of
+/// `ggml-org/llama.cpp`; Fork = an immutable `owner/repo@sha` pin of a
+/// llama.cpp fork (a temporary capability lane — see the README's
+/// capability-lanes section).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildSource {
+    Upstream,
+    Fork {
+        /// `owner/repo` slug (validated by [`validate_repo_slug`]; the
+        /// `https://github.com/` prefix is constructed, never user input).
+        repo: String,
+        /// Full or abbreviated commit SHA (validated by
+        /// [`validate_commit_sha`]); resolved to the full SHA after
+        /// checkout.
+        ref_sha: String,
+        /// Upstream anchor to record as provenance (e.g. `b10980`);
+        /// display-only in this phase.
+        base_ref: Option<String>,
+    },
+}
+
+/// `owner/repo` slug rules: exactly two non-empty segments of
+/// `[A-Za-z0-9_.-]`. Rejects full URLs, `.git` suffixes, and anything
+/// that could escape the github.com path we construct.
+pub fn validate_repo_slug(repo: &str) -> Result<()> {
+    let parts: Vec<&str> = repo.split('/').collect();
+    let ok = parts.len() == 2
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                // `repo.git` is a clone-URL spelling, not a slug — the
+                // constructed github.com URL would double the suffix.
+                && !p.rsplit_once('.')
+                    .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("git"))
+                && p.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+        });
+    if ok {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "invalid repo {repo:?} — pass an owner/name slug like ggml-org/llama.cpp \
+             (letters, digits, _ . - only; no URL, no .git)"
+        ))
+    }
+}
+
+/// Commit SHA rules: 4-40 hex digits (full or abbreviated; the full
+/// SHA is resolved and recorded after checkout).
+pub fn validate_commit_sha(sha: &str) -> Result<()> {
+    let ok = (4..=40).contains(&sha.len()) && sha.chars().all(|c| c.is_ascii_hexdigit());
+    if ok {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "invalid commit {sha:?} — pass the fork's commit SHA (4-40 hex \
+             digits, e.g. 7c81a9f0), never a branch or tag name: fork lanes \
+             are immutable"
+        ))
+    }
+}
+
+/// Split the `--fork owner/repo@sha` shorthand into its parts.
+pub fn parse_fork_spec(spec: &str) -> Result<(String, String)> {
+    let Some((repo, sha)) = spec.rsplit_once('@') else {
+        return Err(anyhow!(
+            "invalid --fork {spec:?} — expected owner/repo@commit-sha"
+        ));
+    };
+    validate_repo_slug(repo)?;
+    validate_commit_sha(sha)?;
+    Ok((repo.to_string(), sha.to_string()))
+}
+
+/// Engine tag for a fork lane: `fork-<owner>_<repo>-<sha8>-<backend>`.
+/// Deterministic per (repo, commit, backend) so a rebuild replaces the
+/// same row; the `fork-` prefix keeps it outside the `bNNNN` namespace
+/// (`btag_number` yields None — safe from upstream currency checks).
+#[must_use]
+pub fn derive_fork_engine_tag(repo: &str, full_sha: &str, backend: BuildBackend) -> String {
+    let slug = repo.replace('/', "_");
+    let short = &full_sha[..full_sha.len().min(8)];
+    format!("fork-{slug}-{short}-{}", backend.as_str())
+}
 
 /// Backends Pallama can build from source. Intentionally only the two
 /// that upstream does not ship as Linux prebuilts worth building
@@ -69,8 +154,13 @@ pub const ERROR_TAIL_LINES: usize = 25;
 #[derive(Debug, Clone)]
 pub struct BuildOpts {
     pub backend: BuildBackend,
-    /// Concrete upstream `bNNNN` tag to compile.
+    /// Concrete upstream `bNNNN` tag to compile (the Fork source
+    /// ignores it for naming — the engine tag derives from the pinned
+    /// SHA — but it still labels the build log).
     pub tag: String,
+    /// Where the source comes from: an upstream `bNNNN` tag (default)
+    /// or an immutable `owner/repo@sha` fork pin.
+    pub source: BuildSource,
     /// Pre-fetched source tree (skips the clone entirely).
     pub source_dir: Option<PathBuf>,
     /// Git remote override (default: `github.com/<LLAMA_CPP_REPO>`).
@@ -96,6 +186,7 @@ impl BuildOpts {
         Self {
             backend,
             tag: tag.into(),
+            source: BuildSource::Upstream,
             source_dir: None,
             clone_url: None,
             arch: None,
@@ -343,6 +434,60 @@ pub fn derive_engine_tag(btag: &str, backend: BuildBackend) -> String {
 /// One spawned build step: process-group isolation, hard timeout, stdout
 /// relayed LIVE through `on_line` (mpsc + select against child.wait),
 /// stderr captured for the error tail.
+/// Configure and compile the build targets in `bld` from the fetched
+/// source `src`, streaming progress through `on_line`.
+// Argument list mirrors the cmake invocation inputs 1:1; a bundling
+// struct would obscure that correspondence.
+#[allow(clippy::too_many_arguments)]
+async fn run_cmake_build(
+    tc: &Toolchain,
+    opts: &BuildOpts,
+    src: &Path,
+    bld: &Path,
+    tag: &str,
+    arch: Option<&str>,
+    host_compiler: Option<&Path>,
+    on_line: &mut dyn FnMut(&str),
+) -> Result<()> {
+    if let Some(cache) = &tc.compiler_cache {
+        let name = cache.file_name().map_or_else(
+            || cache.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        (on_line)(&format!(
+            "compiler cache: {name} — repeat builds skip recompiling"
+        ));
+    }
+    let args = cmake_configure_args(
+        opts.backend,
+        arch,
+        host_compiler,
+        tc.compiler_cache.as_deref(),
+    );
+    (on_line)(&format!("configuring {tag} ({})", args.join(" ")));
+    let mut cfg = tokio::process::Command::new(tc.cmake.clone().context("cmake gone")?);
+    cfg.arg("-S").arg(src).arg("-B").arg(bld);
+    for a in &args {
+        cfg.arg(a);
+    }
+    run_step(cfg, "cmake configure", CONFIGURE_TIMEOUT, on_line).await?;
+
+    let mut bldcmd = tokio::process::Command::new(tc.cmake.clone().context("cmake gone")?);
+    bldcmd
+        .arg("--build")
+        .arg(bld)
+        .arg("--target")
+        .args(BUILD_TARGETS.iter().copied())
+        .arg("-j")
+        .arg(opts.jobs.to_string());
+    (on_line)(&format!(
+        "compiling {} targets with {} jobs (10-30 min for CUDA)",
+        BUILD_TARGETS.len(),
+        opts.jobs
+    ));
+    run_step(bldcmd, "cmake --build", opts.timeout, on_line).await
+}
+
 async fn run_step(
     mut cmd: tokio::process::Command,
     what: &str,
@@ -457,6 +602,54 @@ async fn run_step(
     Ok(())
 }
 
+/// Identity of what a build produced, resolved after fetch: a fork's
+/// engine tag needs the FULL commit SHA only the fetch step can resolve.
+struct BuiltLane {
+    tag: String,
+    dir: PathBuf,
+    provenance: LaneProvenance,
+}
+
+/// Resolve the installed lane's identity: engine tag plus the provenance
+/// recorded into its manifest (repo, commit pin, upstream anchor, and the
+/// architecture set mined from the source).
+fn lane_identity(
+    source: &BuildSource,
+    tag: &str,
+    full_sha: Option<&str>,
+    architectures: std::collections::BTreeSet<String>,
+    backend: BuildBackend,
+) -> (String, LaneProvenance) {
+    match source {
+        BuildSource::Upstream => (
+            derive_engine_tag(tag, backend),
+            LaneProvenance {
+                source: EngineSource::Upstream,
+                repo: Some(LLAMA_CPP_REPO.to_string()),
+                ref_pin: full_sha.map(str::to_string),
+                base_ref: None,
+                architectures,
+            },
+        ),
+        BuildSource::Fork {
+            repo,
+            ref_sha,
+            base_ref,
+        } => (
+            derive_fork_engine_tag(repo, full_sha.unwrap_or(ref_sha), backend),
+            LaneProvenance {
+                source: EngineSource::Fork,
+                repo: Some(repo.clone()),
+                ref_pin: full_sha
+                    .map(str::to_string)
+                    .or_else(|| Some(ref_sha.clone())),
+                base_ref: base_ref.clone(),
+                architectures,
+            },
+        ),
+    }
+}
+
 impl EngineManager {
     /// Clone (or take) the source tree, configure, build, install, probe,
     /// activate. The build tree is a tempfile — torn down on every exit
@@ -473,10 +666,18 @@ impl EngineManager {
         require_toolchain(&tc, opts.backend)?;
 
         let tag = opts.tag.trim().to_string();
-        if super::gh::btag_number(&tag).is_none() {
-            return Err(anyhow!(
-                "engine build needs a concrete upstream b-tag like b10816 (got {tag:?})"
-            ));
+        match &opts.source {
+            BuildSource::Upstream => {
+                if super::gh::btag_number(&tag).is_none() {
+                    return Err(anyhow!(
+                        "engine build needs a concrete upstream b-tag like b10816 (got {tag:?})"
+                    ));
+                }
+            }
+            // Fork lanes deliberately live outside the bNNNN currency
+            // system: their identity is the pinned commit, not an
+            // upstream tag.
+            BuildSource::Fork { .. } => {}
         }
 
         // CUDA specifics: architecture from the GPU (or override), host
@@ -490,7 +691,6 @@ impl EngineManager {
             host_compiler = resolve_host_compiler(&tc).await?;
         }
 
-        let engine_tag = derive_engine_tag(&tag, opts.backend);
         // Build in a scoped tempfile so it is fully torn down BEFORE the
         // installed copy is probed. An absolute build-dir RPATH (the CMake
         // default this lane guards against via BUILD_RPATH_USE_ORIGIN)
@@ -498,50 +698,39 @@ impl EngineManager {
         // let a broken install pass its probe — exactly the live failure
         // of 2026-09-09. Probe-after-teardown keeps the install check
         // honest: the stored engine must stand on its own.
-        let engine_dir = self.dirs.engines_dir().join(&engine_tag);
-        let built: Result<(String, Option<PathBuf>)> = {
+        let built: Result<(String, Option<PathBuf>, BuiltLane)> = {
             let build_root =
                 tempfile::TempDir::with_prefix("pallama-build-").context("create build tempdir")?;
-            let src = fetch_source(build_root.path(), &tc, opts, &tag, on_line).await?;
+            let (src, full_sha) = fetch_source(build_root.path(), &tc, opts, &tag, on_line).await?;
+
+            // Mine the architecture set the source advertises — the
+            // capability currency the supervisor's unknown-arch re-route
+            // consumes — and pin the lane's identity from it.
+            let architectures = super::arch_miner::mine_architectures(&src);
+            let (engine_tag, provenance) = lane_identity(
+                &opts.source,
+                &tag,
+                full_sha.as_deref(),
+                architectures,
+                opts.backend,
+            );
+            (on_line)(&format!(
+                "lane {engine_tag}: source advertises {} architectures",
+                provenance.architectures.len()
+            ));
 
             let bld = build_root.path().join("build");
-            if let Some(cache) = &tc.compiler_cache {
-                let name = cache.file_name().map_or_else(
-                    || cache.display().to_string(),
-                    |n| n.to_string_lossy().into_owned(),
-                );
-                (on_line)(&format!(
-                    "compiler cache: {name} — repeat builds skip recompiling"
-                ));
-            }
-            let args = cmake_configure_args(
-                opts.backend,
+            run_cmake_build(
+                &tc,
+                opts,
+                &src,
+                &bld,
+                &tag,
                 arch.as_deref(),
                 host_compiler.as_deref(),
-                tc.compiler_cache.as_deref(),
-            );
-            (on_line)(&format!("configuring {tag} ({})", args.join(" ")));
-            let mut cfg = tokio::process::Command::new(tc.cmake.clone().context("cmake gone")?);
-            cfg.arg("-S").arg(&src).arg("-B").arg(&bld);
-            for a in &args {
-                cfg.arg(a);
-            }
-            run_step(cfg, "cmake configure", CONFIGURE_TIMEOUT, on_line).await?;
-
-            let mut bldcmd = tokio::process::Command::new(tc.cmake.clone().context("cmake gone")?);
-            bldcmd
-                .arg("--build")
-                .arg(&bld)
-                .arg("--target")
-                .args(BUILD_TARGETS.iter().copied())
-                .arg("-j")
-                .arg(opts.jobs.to_string());
-            (on_line)(&format!(
-                "compiling {} targets with {} jobs (10-30 min for CUDA)",
-                BUILD_TARGETS.len(),
-                opts.jobs
-            ));
-            run_step(bldcmd, "cmake --build", opts.timeout, on_line).await?;
+                on_line,
+            )
+            .await?;
 
             // Rollback-safe swap (same contract as the release lanes'
             // install_with_rollback): the old build is displaced only
@@ -549,31 +738,47 @@ impl EngineManager {
             // failure, discarded once the new row lands. Retire must
             // precede the extraction: install_built_binaries refuses to
             // merge into a live dir.
+            let engine_dir = self.dirs.engines_dir().join(&engine_tag);
             let aside = retire_engine_dir(&engine_dir)?;
             match install_built_binaries(&self.dirs, &bld, &engine_tag, on_line) {
-                Ok((_, digest)) => Ok((digest, aside)),
+                Ok((_, digest)) => Ok((
+                    digest,
+                    aside,
+                    BuiltLane {
+                        tag: engine_tag,
+                        dir: engine_dir,
+                        provenance,
+                    },
+                )),
                 Err(e) => {
                     restore_retired_engine(aside.as_deref(), &engine_dir);
                     Err(e)
                 }
             }
         };
-        let (digest, aside) = built?;
+        let (digest, aside, lane) = built?;
         // The build tree is torn down above BEFORE registering so the
         // probe cannot resolve through it.
-        match self.register_engine(
-            &engine_dir,
-            &engine_tag,
-            &format!("built-{}", opts.backend.as_str()),
+        let asset_label = match &opts.source {
+            // Fork builds are opt-in capability lanes, not mainstream
+            // currency; the backend rides in the tag.
+            BuildSource::Fork { .. } => "built-fork".to_string(),
+            BuildSource::Upstream => format!("built-{}", opts.backend.as_str()),
+        };
+        match self.register_engine_provenanced(
+            &lane.dir,
+            &lane.tag,
+            &asset_label,
             &digest,
             EngineKind::LlamaCpp,
+            &lane.provenance,
         ) {
             Ok(row) => {
                 discard_retired_engine(aside.as_deref());
                 Ok(row)
             }
             Err(e) => {
-                restore_retired_engine(aside.as_deref(), &engine_dir);
+                restore_retired_engine(aside.as_deref(), &lane.dir);
                 Err(e)
             }
         }
@@ -727,36 +932,133 @@ async fn query_compute_caps(tc: &Toolchain) -> Result<String> {
     cuda_architectures(&caps)
 }
 
-/// Caller-provided source tree, or a shallow recursive clone of the tag
-/// (recursive is a no-op now that ggml is in-tree, and still correct for
-/// tags that carried it as a submodule).
+/// Caller-provided source tree, or a fresh clone — plus the resolved
+/// full commit SHA of the checked-out tree (`None` where no git history
+/// exists, e.g. a test fixture tree). The SHA is recorded as lane
+/// provenance so an engine row always names the exact code it runs.
+///
+/// Upstream: shallow recursive clone of the tag (recursive is a no-op
+/// now that ggml is in-tree, and still correct for tags that carried it
+/// as a submodule).
+///
+/// Fork: clone without checkout, fetch the pinned SHA straight from
+/// origin (no local ref exists for an arbitrary commit), detach onto
+/// `FETCH_HEAD`, verify the checkout matches the pin, then init
+/// submodules — a no-op when the fork carries none.
 async fn fetch_source(
     build_root: &Path,
     tc: &Toolchain,
     opts: &BuildOpts,
     tag: &str,
     on_line: &mut dyn FnMut(&str),
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, Option<String>)> {
     if let Some(s) = &opts.source_dir {
-        return Ok(s.clone());
+        // Fixture trees often have no .git; provenance is best-effort.
+        let full = git_rev_parse(tc, s).await.ok();
+        return Ok((s.clone(), full));
     }
-    let url = opts
-        .clone_url
-        .clone()
-        .unwrap_or_else(|| format!("https://github.com/{LLAMA_CPP_REPO}.git"));
     let src = build_root.join("src");
-    (on_line)(&format!("cloning {tag} from {url}"));
-    let mut cmd = tokio::process::Command::new(tc.git.clone().context("git gone")?);
-    cmd.arg("clone")
-        .arg("--depth")
-        .arg("1")
-        .arg("--branch")
-        .arg(tag)
-        .arg("--recursive")
-        .arg(&url)
-        .arg(&src);
-    run_step(cmd, &format!("git clone {tag}"), CLONE_TIMEOUT, on_line).await?;
-    Ok(src)
+    match &opts.source {
+        BuildSource::Fork { repo, ref_sha, .. } => {
+            let url = format!("https://github.com/{repo}.git");
+            let git = tc.git.clone().context("git gone")?;
+            (on_line)(&format!("fetching fork {repo}@{ref_sha}"));
+            let mut clone = tokio::process::Command::new(&git);
+            clone
+                .arg("clone")
+                .arg("--depth")
+                .arg("1")
+                .arg("--no-checkout")
+                .arg(&url)
+                .arg(&src);
+            run_step(clone, &format!("git clone {repo}"), CLONE_TIMEOUT, on_line).await?;
+            let mut fetch = tokio::process::Command::new(&git);
+            fetch
+                .arg("-C")
+                .arg(&src)
+                .arg("fetch")
+                .arg("--depth")
+                .arg("1")
+                .arg("origin")
+                .arg(ref_sha);
+            run_step(
+                fetch,
+                &format!("git fetch origin {ref_sha}"),
+                CLONE_TIMEOUT,
+                on_line,
+            )
+            .await?;
+            let mut checkout = tokio::process::Command::new(&git);
+            checkout
+                .arg("-C")
+                .arg(&src)
+                .arg("checkout")
+                .arg("--detach")
+                .arg("FETCH_HEAD");
+            run_step(checkout, "git checkout FETCH_HEAD", CLONE_TIMEOUT, on_line).await?;
+            let full = git_rev_parse(tc, &src).await?;
+            anyhow::ensure!(
+                full.to_lowercase().starts_with(&ref_sha.to_lowercase()),
+                "checked out {full} but the pin asked for {ref_sha} — refusing an \
+                 unverified fork lane (forks must build exactly the pinned commit)"
+            );
+            let mut subs = tokio::process::Command::new(&git);
+            subs.arg("-C")
+                .arg(&src)
+                .arg("submodule")
+                .arg("update")
+                .arg("--init")
+                .arg("--depth")
+                .arg("1")
+                .arg("--recursive");
+            run_step(subs, "git submodule update", CLONE_TIMEOUT, on_line).await?;
+            Ok((src, Some(full)))
+        }
+        BuildSource::Upstream => {
+            let url = opts
+                .clone_url
+                .clone()
+                .unwrap_or_else(|| format!("https://github.com/{LLAMA_CPP_REPO}.git"));
+            (on_line)(&format!("cloning {tag} from {url}"));
+            let mut cmd = tokio::process::Command::new(tc.git.clone().context("git gone")?);
+            cmd.arg("clone")
+                .arg("--depth")
+                .arg("1")
+                .arg("--branch")
+                .arg(tag)
+                .arg("--recursive")
+                .arg(&url)
+                .arg(&src);
+            run_step(cmd, &format!("git clone {tag}"), CLONE_TIMEOUT, on_line).await?;
+            let full = git_rev_parse(tc, &src).await.ok();
+            Ok((src, full))
+        }
+    }
+}
+
+/// `git -C <dir> rev-parse HEAD` — full commit SHA of a checked-out
+/// tree, for lane provenance.
+async fn git_rev_parse(tc: &Toolchain, dir: &Path) -> Result<String> {
+    let git = tc.git.as_ref().context("git gone")?;
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::process::Command::new(git)
+            .arg("-C")
+            .arg(dir)
+            .arg("rev-parse")
+            .arg("HEAD")
+            .output(),
+    )
+    .await
+    .context("git rev-parse HEAD timed out")??;
+    anyhow::ensure!(
+        out.status.success(),
+        "git rev-parse HEAD in {} exited {}: {}",
+        dir.display(),
+        out.status,
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Copy the built output into the standard engine layout — the same

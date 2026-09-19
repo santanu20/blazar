@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 
 use pallama_core::store::Store;
 use pallama_core::PallamaDirs;
-use pallama_runtime::engine::build::{BuildBackend, BuildOpts, Toolchain};
+use pallama_runtime::engine::build::{
+    derive_fork_engine_tag, parse_fork_spec, validate_commit_sha, validate_repo_slug, BuildBackend,
+    BuildOpts, Toolchain,
+};
 use pallama_runtime::engine::{EngineManager, LOCAL_TAG};
 use pallama_runtime::EventBus;
 
@@ -322,4 +325,89 @@ async fn integration__build_rejects__non_btag_and_local_tag_safety() {
 
     // Suffixed engine tags never collide with the never-pruned `local`.
     assert_ne!(LOCAL_TAG, "b4242-cpu");
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn unit__parse_fork_spec__accepts_slug_at_sha() {
+    let (repo, sha) = parse_fork_spec("acme/llama.cpp@7c81a9f0").unwrap();
+    assert_eq!(repo, "acme/llama.cpp");
+    assert_eq!(sha, "7c81a9f0");
+    // Full 40-hex SHAs are equally valid shorthand input.
+    let full = "7c81a9f0".repeat(5);
+    let (repo, sha) = parse_fork_spec(&format!("ggml-org/llama.cpp@{full}")).unwrap();
+    assert_eq!(repo, "ggml-org/llama.cpp");
+    assert_eq!(sha, full);
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn unit__parse_fork_spec__rejects_branches_urls_and_git_suffixes() {
+    // No @ separator at all.
+    assert!(parse_fork_spec("acme/llama.cpp").is_err());
+    // A branch name is not a commit: immutability is the whole contract.
+    let err = parse_fork_spec("acme/llama.cpp@main")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("commit"), "{err}");
+    // Full URLs must be rejected — we construct the clone URL ourselves.
+    assert!(parse_fork_spec("https://github.com/acme/llama.cpp@7c81a9f0").is_err());
+    // `.git` is a clone-URL spelling, not an owner/name slug.
+    assert!(parse_fork_spec("acme/llama.cpp.git@7c81a9f0").is_err());
+    // Bare owner without repo.
+    assert!(parse_fork_spec("acme@7c81a9f0").is_err());
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn unit__validate_commit_sha__hex_length_window() {
+    assert!(validate_commit_sha("7c81a9f0").is_ok());
+    assert!(validate_commit_sha("7c81").is_ok());
+    assert!(validate_commit_sha(&"a".repeat(40)).is_ok());
+    assert!(validate_commit_sha("main").is_err());
+    assert!(validate_commit_sha("abc").is_err(), "too short");
+    assert!(validate_commit_sha(&"a".repeat(41)).is_err(), "too long");
+    assert!(validate_commit_sha("7c81a9fZ").is_err(), "non-hex digit");
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn unit__validate_repo_slug__two_clean_segments_only() {
+    assert!(validate_repo_slug("acme/llama.cpp").is_ok());
+    assert!(validate_repo_slug("ggml-org/llama.cpp").is_ok());
+    assert!(validate_repo_slug("acme").is_err(), "missing repo segment");
+    assert!(
+        validate_repo_slug("acme/llama.cpp/deep").is_err(),
+        "extra segment"
+    );
+    assert!(
+        validate_repo_slug("acme/llama.cpp.git").is_err(),
+        "clone spelling"
+    );
+    assert!(
+        validate_repo_slug("acme/llama cpp").is_err(),
+        "space in slug"
+    );
+    assert!(validate_repo_slug("/llama.cpp").is_err(), "empty owner");
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn unit__derive_fork_engine_tag__deterministic_and_namespaced() {
+    let full = format!("{}{}", "7c81a9f0", "1".repeat(32));
+    let tag = derive_fork_engine_tag("acme/llama.cpp", &full, BuildBackend::Cpu);
+    assert_eq!(tag, "fork-acme_llama.cpp-7c81a9f0-cpu");
+    // Rebuild of the same (repo, commit, backend) reuses the same row.
+    assert_eq!(
+        tag,
+        derive_fork_engine_tag("acme/llama.cpp", &full, BuildBackend::Cpu)
+    );
+    // A different backend is a different lane.
+    assert_ne!(
+        tag,
+        derive_fork_engine_tag("acme/llama.cpp", &full, BuildBackend::Cuda)
+    );
+    // The fork- prefix keeps the tag outside the bNNNN currency: it must
+    // never parse as a build number.
+    assert!(!tag.starts_with('b'));
 }

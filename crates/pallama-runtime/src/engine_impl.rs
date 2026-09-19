@@ -1109,6 +1109,7 @@ mod tests {
             // Deliberately a nonexistent binary: the preflight must bail
             // BEFORE any exec, so this path is never touched.
             server_path: "/nonexistent/llama-server".into(),
+            ..Default::default()
         };
         let engine = LlamaCppEngine::new(manifest);
         let argv = rpc_argv(&format!("127.0.0.1:{port}"));
@@ -1175,6 +1176,7 @@ mod tests {
             flags: std::collections::BTreeSet::new(),
             spec_types: vec![],
             server_path: String::new(),
+            ..Default::default()
         });
         let endpoint = Endpoint::Tcp {
             host: "127.0.0.1".into(),
@@ -1199,6 +1201,7 @@ mod tests {
             flags: std::collections::BTreeSet::new(),
             spec_types: vec![],
             server_path: String::new(),
+            ..Default::default()
         });
         let endpoint = Endpoint::Tcp {
             host: "127.0.0.1".into(),
@@ -1380,6 +1383,7 @@ mod tests {
             flags: std::collections::BTreeSet::new(),
             spec_types: vec![],
             server_path: String::new(),
+            ..Default::default()
         };
         manifest.server_path = "/nonexistent/mistralrs".into();
         let engine = MistralRsEngine::with_staging(manifest, Vec::new(), Some(staging));

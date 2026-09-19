@@ -6,6 +6,9 @@ tracked here.
 
 ## [Unreleased]
 
+### Added
+- **Capability lanes: run GGUF architectures that only exist in unmerged llama.cpp forks.** `pallama engine build --backend cpu --fork owner/llama.cpp@<commit-sha>` (long form: `--repo owner/llama.cpp --ref <sha>`) clones the fork at that exact commit — never a branch — verifies the checked-out SHA matches the pin, mines the architecture table out of the fork's `src/llama-arch.cpp`, and registers the build as an additive engine lane (`fork-owner_repo-<sha8>-<backend>`) whose manifest records full provenance (source, repo, ref pin, base tag, advertised architecture set). Fork lanes never consume the KEEP_TAGS retention budget and are never auto-pruned or sibling-pruned; `engine list` shows the provenance suffix (`fork owner/llama.cpp@7c81a9f0 (base bNNNN)`) and `--json` rows gain additive `source`/`provenance` keys. At spawn time, a model that dies with `unknown model architecture: 'x'` is classified, and if an installed lane advertises that architecture the supervisor re-routes to it exactly once per spawn and remembers the rescue pin for the daemon's lifetime — a user `model_overrides.<model>.engine` pin always wins and is never overwritten; when no lane advertises the architecture the failure teaches the exact `--fork` build command. Upstream source builds now record their own resolved commit in the same provenance fields. Fork builds print an explicit trust banner (third-party code compiled and run with your privileges), skip the b-tag regression gate (they live outside the b-tag currency), and leave sibling engines untouched.
+
 ## [0.9.0] - 2026-09-19
 
 ### Changed

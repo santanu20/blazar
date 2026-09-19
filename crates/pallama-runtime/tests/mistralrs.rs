@@ -70,6 +70,7 @@ fn manifest() -> Manifest {
         flags: flags(true),
         spec_types: Vec::new(),
         server_path: "/nonexistent/mistralrs".into(),
+        ..Default::default()
     }
 }
 

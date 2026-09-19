@@ -395,6 +395,7 @@ mod tests {
             flags: std::collections::BTreeSet::default(),
             spec_types: vec![],
             server_path: "/x".into(),
+            ..Default::default()
         };
         let hw = probe_hardware(Some(&m));
         assert!(hw.physical_cores >= 1);

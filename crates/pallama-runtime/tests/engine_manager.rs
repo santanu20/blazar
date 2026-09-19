@@ -11,7 +11,7 @@ use pallama_core::config::UpdateChannel;
 use pallama_core::store::Store;
 use pallama_core::PallamaDirs;
 use pallama_runtime::engine::gh::GhClient;
-use pallama_runtime::engine::manifest::Manifest;
+use pallama_runtime::engine::manifest::{EngineSource, LaneProvenance, Manifest};
 use pallama_runtime::engine::{EngineManager, KEEP_TAGS, LOCAL_TAG};
 use pallama_runtime::EventBus;
 use wiremock::matchers::{method, path};
@@ -581,6 +581,196 @@ async fn integration__prune_siblings_deletes_same_kind_keeps_rest() {
     for kept in ["b-new", "s1", LOCAL_TAG] {
         assert!(dirs.engines_dir().join(kept).exists(), "{kept} dir gone");
     }
+}
+
+/// Stage an engine row whose manifest marks it as a fork capability lane.
+/// Used by the prune-safety pins: fork lanes must never be auto-pruned no
+/// matter how old they are.
+fn stage_fork_row(store: &Store, dirs: &PallamaDirs, tag: &str, at: i64) {
+    let dir = dirs.engines_dir().join(tag);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("marker"), tag).unwrap();
+    let manifest = Manifest {
+        tag: tag.to_string(),
+        source: EngineSource::Fork,
+        repo: Some("acme/llama.cpp".into()),
+        ref_pin: Some("7c81a9f0".repeat(5)),
+        architectures: std::collections::BTreeSet::from([
+            "qwen35".to_string(),
+            "qwen35_moe".to_string(),
+        ]),
+        ..Default::default()
+    };
+    store
+        .upsert_engine(&pallama_core::EngineRow {
+            tag: tag.to_string(),
+            asset: "built-fork".into(),
+            sha256: "x".into(),
+            installed_at: at,
+            active: false,
+            manifest: serde_json::to_string(&manifest).unwrap(),
+            kind: pallama_core::engine_kind::EngineKind::LlamaCpp,
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__prune_never_removes_fork_lanes() {
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    let store = Store::open(&dirs).unwrap();
+
+    // Five upstream builds plus a fork lane OLDER than everything: the
+    // fork must survive retention without consuming a KEEP_TAGS slot.
+    for (i, tag) in ["b1", "b2", "b3", "b4", "b5"].iter().enumerate() {
+        let dir = dirs.engines_dir().join(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("marker"), tag).unwrap();
+        store
+            .upsert_engine(&pallama_core::EngineRow {
+                tag: tag.to_string(),
+                asset: "x".into(),
+                sha256: "x".into(),
+                installed_at: 1000 + i64::try_from(i).unwrap_or(0),
+                active: false,
+                manifest: "{}".into(),
+                kind: pallama_core::engine_kind::EngineKind::LlamaCpp,
+            })
+            .unwrap();
+    }
+    let fork_tag = "fork-acme_llama.cpp-7c81a9f0-cpu";
+    stage_fork_row(&store, &dirs, fork_tag, 1);
+    store.set_active_engine("b5").unwrap();
+
+    mgr.prune(&store).unwrap();
+    let mut remaining: Vec<String> = store
+        .list_engines()
+        .unwrap()
+        .into_iter()
+        .map(|e| e.tag)
+        .collect();
+    remaining.sort();
+    // Newest KEEP_TAGS upstream builds + active + the fork: the fork rides
+    // along free — no upstream build is evicted to make room for it.
+    let mut expected: Vec<String> = (1..=5)
+        .map(|n| format!("b{n}"))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .take(KEEP_TAGS)
+        .collect();
+    expected.push(fork_tag.to_string());
+    expected.sort();
+    assert_eq!(
+        remaining, expected,
+        "fork lane survives prune and spends no retention budget"
+    );
+    assert!(
+        dirs.engines_dir().join(fork_tag).exists(),
+        "fork lane dir must survive"
+    );
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__prune_siblings_never_removes_fork_lanes() {
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    let store = Store::open(&dirs).unwrap();
+
+    // An upstream update normally frees same-kind siblings; the fork lane
+    // is an additive capability lane, never a superseded sibling.
+    for tag in ["b-old", "b-new"] {
+        let dir = dirs.engines_dir().join(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("server"), vec![7u8; 4096]).unwrap();
+        store
+            .upsert_engine(&pallama_core::EngineRow {
+                tag: tag.to_string(),
+                asset: "x".into(),
+                sha256: "x".into(),
+                installed_at: if tag == "b-new" { 1002 } else { 1000 },
+                active: false,
+                manifest: "{}".into(),
+                kind: pallama_core::engine_kind::EngineKind::LlamaCpp,
+            })
+            .unwrap();
+    }
+    let fork_tag = "fork-acme_llama.cpp-7c81a9f0-cpu";
+    stage_fork_row(&store, &dirs, fork_tag, 1001);
+    store.set_active_engine("b-new").unwrap();
+
+    let freed = mgr.prune_siblings("llamacpp", "b-new").unwrap();
+    let freed_tags: Vec<&str> = freed.iter().map(|(t, _)| t.as_str()).collect();
+    assert_eq!(freed_tags, vec!["b-old"], "only the upstream sibling frees");
+    let mut remaining: Vec<String> = store
+        .list_engines()
+        .unwrap()
+        .into_iter()
+        .map(|e| e.tag)
+        .collect();
+    remaining.sort_unstable();
+    assert_eq!(
+        remaining,
+        vec!["b-new".to_string(), fork_tag.to_string()],
+        "fork lane is additive, never a prune sibling"
+    );
+    assert!(dirs.engines_dir().join(fork_tag).exists());
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__register_engine_provenanced_bakes_source_and_architectures() {
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+
+    let ref_sha = "7c81a9f0".repeat(5);
+    let prov = LaneProvenance {
+        source: EngineSource::Fork,
+        repo: Some("acme/llama.cpp".into()),
+        ref_pin: Some(ref_sha.clone()),
+        base_ref: Some("b10980".into()),
+        architectures: std::collections::BTreeSet::from([
+            "qwen35".to_string(),
+            "qwen35_moe".to_string(),
+        ]),
+    };
+    let tag = "fork-acme_llama.cpp-7c81a9f0-cpu";
+    let (dir, _guard) = stub_engine_dir("prov");
+    let row = mgr
+        .register_engine_provenanced(
+            &dir,
+            tag,
+            "built-fork",
+            "cafebabe",
+            pallama_core::engine_kind::EngineKind::LlamaCpp,
+            &prov,
+        )
+        .unwrap();
+
+    let m: Manifest = serde_json::from_str(&row.manifest).unwrap();
+    assert_eq!(m.source, EngineSource::Fork);
+    assert_eq!(m.repo.as_deref(), Some("acme/llama.cpp"));
+    assert_eq!(m.ref_pin.as_deref(), Some(ref_sha.as_str()));
+    assert!(m.advertises_arch("qwen35"), "mined arch must be baked in");
+    assert!(m.advertises_arch("qwen35_moe"));
+    assert!(
+        !m.advertises_arch("llama"),
+        "only advertised architectures claim support"
+    );
+    let label = m.provenance_label();
+    assert!(
+        label.contains("acme/llama.cpp@7c81a9f0"),
+        "label pins the exact commit: {label}"
+    );
+    assert!(
+        label.contains("base b10980"),
+        "label shows the merge target: {label}"
+    );
 }
 
 #[tokio::test]
