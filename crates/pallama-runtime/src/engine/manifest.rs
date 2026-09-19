@@ -76,6 +76,31 @@ impl EngineSource {
     }
 }
 
+/// Who vouched for a fork lane's code. Curated lanes come from the
+/// Pallama capability registry (pinned commit, recorded provenance) and
+/// may be auto-retired once upstream covers their architectures; user
+/// lanes were built explicitly with `engine build --fork` and are never
+/// touched by lifecycle automation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrustTier {
+    /// Built by explicit user command (default).
+    #[default]
+    User,
+    /// Installed from a registry entry via `engine install --lane`.
+    Curated,
+}
+
+impl TrustTier {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Curated => "curated",
+        }
+    }
+}
+
 /// Build-time provenance merged into a probed manifest when the engine
 /// was compiled from source: everything needed to answer "which commit
 /// of which repo produced this binary, and what did it claim to
@@ -136,6 +161,23 @@ pub struct Manifest {
     /// lane is never picked by architecture-based re-routing.
     #[serde(default)]
     pub architectures: BTreeSet<String>,
+    /// Who vouched for a fork lane (v2.1): user-built lanes are never
+    /// auto-retired; curated registry lanes may be, after a grace
+    /// period. Defaults to `user` for all pre-existing manifests.
+    #[serde(default)]
+    pub trust: TrustTier,
+    /// Tag of the upstream lane whose architecture coverage superseded
+    /// every architecture this fork lane was built for (v2.1). `None`
+    /// = live lane. Set once by the supersede check; routing keeps the
+    /// lane eligible as a rescue fallback (the runtime load is the
+    /// truth — if upstream support turns out partial, the rescue path
+    /// re-pins this lane).
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+    /// Unix epoch seconds when the lane was marked superseded (v2.1);
+    /// starts the auto-retire grace clock for curated lanes.
+    #[serde(default)]
+    pub superseded_at_epoch: Option<i64>,
 }
 
 impl Manifest {
@@ -164,8 +206,8 @@ impl Manifest {
     }
 
     /// Short provenance label for tables and teaching strings, e.g.
-    /// `fork acme/llama.cpp@7c81a9f0 (base b10980)`; empty for plain
-    /// upstream builds.
+    /// `fork acme/llama.cpp@7c81a9f0 (base b10980)` or `curated fork
+    /// acme/llama.cpp@7c81a9f0`; empty for plain upstream builds.
     #[must_use]
     pub fn provenance_label(&self) -> String {
         match (self.source, &self.ref_pin) {
@@ -177,7 +219,11 @@ impl Manifest {
                     .as_deref()
                     .map(|b| format!(" (base {b})"))
                     .unwrap_or_default();
-                format!("fork {repo}@{short}{base}")
+                let tier = match self.trust {
+                    TrustTier::User => "fork",
+                    TrustTier::Curated => "curated fork",
+                };
+                format!("{tier} {repo}@{short}{base}")
             }
             (EngineSource::Local, _) => "local".to_string(),
             _ => String::new(),
@@ -289,6 +335,9 @@ pub fn probe(server_path: &Path, tag: &str) -> Result<Manifest> {
         ref_pin: None,
         base_ref: None,
         architectures: BTreeSet::new(),
+        trust: TrustTier::default(),
+        superseded_by: None,
+        superseded_at_epoch: None,
     })
 }
 

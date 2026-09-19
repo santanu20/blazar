@@ -4,6 +4,7 @@
 
 pub mod arch_miner;
 pub mod build;
+pub mod capability_registry;
 pub mod gh;
 pub mod manifest;
 pub mod sglang_install;
@@ -1352,6 +1353,7 @@ impl EngineManager {
             kind,
             system_vendor_hint(),
             None,
+            manifest::TrustTier::default(),
         )
     }
 
@@ -1359,6 +1361,10 @@ impl EngineManager {
     /// b-tags and fork pins) bake their source repo, commit SHA, and
     /// mined architecture set into the row's manifest — the capability
     /// currency the supervisor's unknown-architecture re-route consumes.
+    /// `trust` marks registry-installed curated lanes (auto-retirable
+    /// once mainline covers them); user builds pass the default.
+    // Mirrors register_engine_inner's surface 1:1.
+    #[allow(clippy::too_many_arguments)]
     pub fn register_engine_provenanced(
         &self,
         dir: &Path,
@@ -1367,6 +1373,7 @@ impl EngineManager {
         sha256: &str,
         kind: EngineKind,
         prov: &manifest::LaneProvenance,
+        trust: manifest::TrustTier,
     ) -> Result<EngineRow> {
         self.register_engine_inner(
             dir,
@@ -1376,6 +1383,7 @@ impl EngineManager {
             kind,
             system_vendor_hint(),
             Some(prov),
+            trust,
         )
     }
 
@@ -1390,7 +1398,16 @@ impl EngineManager {
         kind: EngineKind,
         vendor_hint: manifest::Vendor,
     ) -> Result<EngineRow> {
-        self.register_engine_inner(dir, tag, asset_label, sha256, kind, vendor_hint, None)
+        self.register_engine_inner(
+            dir,
+            tag,
+            asset_label,
+            sha256,
+            kind,
+            vendor_hint,
+            None,
+            manifest::TrustTier::default(),
+        )
     }
 
     // Argument list maps 1:1 onto the public register_* API; bundling
@@ -1405,6 +1422,7 @@ impl EngineManager {
         kind: EngineKind,
         vendor_hint: manifest::Vendor,
         prov: Option<&manifest::LaneProvenance>,
+        trust: manifest::TrustTier,
     ) -> Result<EngineRow> {
         let server = match kind {
             EngineKind::LlamaCpp => find_server(dir),
@@ -1420,6 +1438,11 @@ impl EngineManager {
             .map_err(|e| e.context(ENGINE_PROBE_FAILED))?;
         if let Some(p) = prov {
             m.merge_provenance(p);
+        }
+        // Trust tier distinguishes registry-installed curated lanes
+        // (auto-retirable) from user-pinned forks (never auto-deleted).
+        if trust == manifest::TrustTier::Curated {
+            m.trust = trust;
         }
         match kind {
             EngineKind::LlamaCpp => {
@@ -1628,6 +1651,225 @@ impl EngineManager {
             tracing::info!("pruned old engine {}", e.tag);
             self.bus
                 .publish(PallamaEvent::EngineRemoved { tag: e.tag.clone() });
+        }
+        Ok(())
+    }
+
+    /// Phase-3 supersede lifecycle, run at daemon start and after any
+    /// roster change:
+    ///
+    /// (a) one-time architecture mining for binary-installed upstream
+    ///     lanes (release assets ship no manifest architectures; the
+    ///     raw `src/llama-arch.cpp` at the lane's tag is fetched once
+    ///     and the mined set persisted — never refetched);
+    /// (b) supersede marking — a fork lane whose advertised architecture
+    ///     set is fully covered by mainstream lanes gets
+    ///     `superseded_by`/`superseded_at` stamped, so `engine list` can
+    ///     show the graduation and the supervisor can drop learned pins;
+    /// (c) retirement sweep — curated fork lanes past
+    ///     `fork_retire_days` (0 = never) are deleted, EXCEPT rows that
+    ///     are active or referenced by `pinned_tags` (user pins and
+    ///     in-flight rescue pins override the lifecycle; user-built
+    ///     forks are never auto-deleted at all).
+    ///
+    /// Every step fails open: supersede bookkeeping must never break
+    /// engine registration or serving.
+    pub async fn refresh_supersede_state(
+        &self,
+        fork_retire_days: u64,
+        pinned_tags: &[String],
+    ) -> Result<()> {
+        let store = Store::open(&self.dirs)?;
+        self.mine_missing_architectures(&store).await;
+        Self::mark_superseded_lanes(&store)?;
+        self.sweep_retired_lanes(&store, fork_retire_days, pinned_tags)?;
+        Ok(())
+    }
+
+    /// Supersede step (a): one-time architecture mining for
+    /// binary-installed upstream lanes (release assets ship no manifest
+    /// architectures; source builds mine at build time). Fetch failures
+    /// warn and move on — supersede coverage catches up on the next
+    /// restart once the raw host is reachable again.
+    async fn mine_missing_architectures(&self, store: &Store) {
+        let rows = store.list_engines().unwrap_or_default(); // newest first
+        for row in &rows {
+            if row.kind != EngineKind::LlamaCpp {
+                continue;
+            }
+            let Ok(mut manifest) = serde_json::from_str::<Manifest>(&row.manifest) else {
+                continue;
+            };
+            if manifest.source != manifest::EngineSource::Upstream
+                || !manifest.architectures.is_empty()
+            {
+                continue;
+            }
+            // Engine tags carry an asset suffix (b11026-cuda); the raw
+            // source lives at the bare upstream tag.
+            let source_tag = match gh::btag_number(&row.tag) {
+                Some(n) => format!("b{n}"),
+                None => row.tag.clone(),
+            };
+            match self.gh.fetch_llama_arch_source(&source_tag).await {
+                Ok(text) => {
+                    let archs = arch_miner::parse_arch_table(&text);
+                    if archs.is_empty() {
+                        tracing::warn!(
+                            "lane {}: mined 0 architectures from upstream {} — leaving manifest untouched",
+                            row.tag,
+                            source_tag
+                        );
+                        continue;
+                    }
+                    manifest.architectures = archs;
+                    match serde_json::to_string(&manifest)
+                        .context("encode mined manifest")
+                        .and_then(|encoded| {
+                            store
+                                .update_engine_manifest(&row.tag, &encoded)
+                                .context("persist mined architectures")
+                        }) {
+                        Ok(()) => tracing::info!(
+                            "lane {}: mined {} architectures from upstream {} (one-time)",
+                            row.tag,
+                            manifest.architectures.len(),
+                            source_tag
+                        ),
+                        Err(e) => tracing::warn!(
+                            "lane {}: could not persist mined architectures ({e:#})",
+                            row.tag
+                        ),
+                    }
+                }
+                Err(e) => {
+                    // Fail open: an unreachable raw host must not block
+                    // registration or the rest of the supersede pass.
+                    tracing::warn!(
+                        "lane {}: one-time arch mining skipped ({e:#}) — supersede coverage may be incomplete until next restart",
+                        row.tag
+                    );
+                }
+            }
+        }
+    }
+
+    /// Supersede step (b): stamp fork lanes whose advertised
+    /// architecture set is fully covered by mainstream lanes. Partial
+    /// coverage keeps the fork active — partial mainstream support is
+    /// exactly the self-correcting case (unknown-arch rescue re-pins
+    /// the fork for the archs mainline still rejects).
+    fn mark_superseded_lanes(store: &Store) -> Result<()> {
+        let rows = store.list_engines()?; // newest first
+        let mut decoded: Vec<(EngineRow, Manifest)> = rows
+            .iter()
+            .filter_map(|row| {
+                serde_json::from_str::<Manifest>(&row.manifest)
+                    .ok()
+                    .map(|manifest| (row.clone(), manifest))
+            })
+            .collect();
+        // Mainstream coverage set, newest-first (list_engines is
+        // installed_at DESC): upstream + local llamacpp lanes that
+        // advertise architectures. Owned (tag, arch set) pairs so the
+        // fork rows below can be mutated while mainstream stays alive.
+        let mainstream: Vec<(String, std::collections::BTreeSet<String>)> = decoded
+            .iter()
+            .filter(|(row, manifest)| {
+                row.kind == EngineKind::LlamaCpp
+                    && manifest.source != manifest::EngineSource::Fork
+                    && !manifest.architectures.is_empty()
+            })
+            .map(|(row, manifest)| (row.tag.clone(), manifest.architectures.clone()))
+            .collect();
+        let covers = |arch: &str| mainstream.iter().any(|(_, archs)| archs.contains(arch));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs().cast_signed());
+        for (row, manifest) in &mut decoded {
+            if !is_fork_lane(row) || manifest.architectures.is_empty() {
+                continue;
+            }
+            if !manifest.architectures.iter().all(|arch| covers(arch)) {
+                continue;
+            }
+            // Graduation target: the newest mainstream lane covering
+            // any of the fork's archs (mainstream is newest-first).
+            let Some(newest_coverer) = mainstream
+                .iter()
+                .find(|(_, archs)| manifest.architectures.iter().any(|a| archs.contains(a)))
+                .map(|(tag, _)| tag.clone())
+            else {
+                continue;
+            };
+            if manifest.superseded_by.as_deref() == Some(newest_coverer.as_str()) {
+                continue; // already stamped for this coverer
+            }
+            manifest.superseded_by = Some(newest_coverer.clone());
+            manifest.superseded_at_epoch = Some(now);
+            let encoded = serde_json::to_string(manifest).context("encode superseded manifest")?;
+            store.update_engine_manifest(&row.tag, &encoded)?;
+            tracing::warn!(
+                "fork lane {} superseded by {} — mainline now covers its architectures; model pins clear on next resolve",
+                row.tag,
+                newest_coverer
+            );
+        }
+        Ok(())
+    }
+
+    /// Supersede step (c): retirement sweep — curated fork lanes past
+    /// the grace period are deleted, EXCEPT rows that are active or
+    /// referenced by `pinned_tags` (user pins and in-flight rescue pins
+    /// override the lifecycle). User-built forks (trust User) outlive
+    /// everything but an explicit `engine rm`.
+    fn sweep_retired_lanes(
+        &self,
+        store: &Store,
+        fork_retire_days: u64,
+        pinned_tags: &[String],
+    ) -> Result<()> {
+        if fork_retire_days == 0 {
+            return Ok(()); // disabled: never auto-delete
+        }
+        let cutoff = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs().cast_signed())
+            .saturating_sub(
+                i64::try_from(fork_retire_days.saturating_mul(86_400)).unwrap_or(i64::MAX),
+            );
+        for row in store.list_engines()? {
+            let Ok(manifest) = serde_json::from_str::<Manifest>(&row.manifest) else {
+                continue;
+            };
+            if manifest.superseded_at_epoch.is_none_or(|at| at >= cutoff) {
+                continue;
+            }
+            if manifest.trust != manifest::TrustTier::Curated
+                || row.active
+                || pinned_tags.contains(&row.tag)
+            {
+                continue;
+            }
+            let dir = self.dirs.engines_dir().join(&row.tag);
+            let bytes = if dir.exists() {
+                engine_dir_bytes(&dir)
+            } else {
+                0
+            };
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir)
+                    .with_context(|| format!("retire engine dir {}", dir.display()))?;
+            }
+            store.delete_engine(&row.tag)?;
+            tracing::warn!(
+                "retired curated fork lane {} ({} bytes) — rebuild any time via the registry",
+                row.tag,
+                bytes
+            );
+            self.bus.publish(PallamaEvent::EngineRemoved {
+                tag: row.tag.clone(),
+            });
         }
         Ok(())
     }

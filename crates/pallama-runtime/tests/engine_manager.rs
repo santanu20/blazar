@@ -11,7 +11,7 @@ use pallama_core::config::UpdateChannel;
 use pallama_core::store::Store;
 use pallama_core::PallamaDirs;
 use pallama_runtime::engine::gh::GhClient;
-use pallama_runtime::engine::manifest::{EngineSource, LaneProvenance, Manifest};
+use pallama_runtime::engine::manifest::{EngineSource, LaneProvenance, Manifest, TrustTier};
 use pallama_runtime::engine::{EngineManager, KEEP_TAGS, LOCAL_TAG};
 use pallama_runtime::EventBus;
 use wiremock::matchers::{method, path};
@@ -749,6 +749,7 @@ async fn integration__register_engine_provenanced_bakes_source_and_architectures
             "cafebabe",
             pallama_core::engine_kind::EngineKind::LlamaCpp,
             &prov,
+            pallama_runtime::engine::manifest::TrustTier::default(),
         )
         .unwrap();
 
@@ -771,6 +772,235 @@ async fn integration__register_engine_provenanced_bakes_source_and_architectures
         label.contains("base b10980"),
         "label shows the merge target: {label}"
     );
+}
+
+/// Stage a mainstream (upstream-source) llamacpp row advertising
+/// `archs` — the coverage side of the supersede pins.
+fn stage_mainstream_row(store: &Store, dirs: &PallamaDirs, tag: &str, at: i64, archs: &[&str]) {
+    let dir = dirs.engines_dir().join(tag);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("marker"), tag).unwrap();
+    let manifest = Manifest {
+        tag: tag.to_string(),
+        source: EngineSource::Upstream,
+        architectures: archs.iter().map(|s| (*s).to_string()).collect(),
+        ..Default::default()
+    };
+    store
+        .upsert_engine(&pallama_core::EngineRow {
+            tag: tag.to_string(),
+            asset: "built-cpu".into(),
+            sha256: "x".into(),
+            installed_at: at,
+            active: false,
+            manifest: serde_json::to_string(&manifest).unwrap(),
+            kind: pallama_core::engine_kind::EngineKind::LlamaCpp,
+        })
+        .unwrap();
+}
+
+/// Stage a fork lane row with full lifecycle control (trust tier and
+/// supersede stamp) — the retirement-sweep fixture shape.
+fn stage_lane(
+    store: &Store,
+    dirs: &PallamaDirs,
+    tag: &str,
+    at: i64,
+    trust: pallama_runtime::engine::manifest::TrustTier,
+    archs: &[&str],
+    superseded_at_epoch: Option<i64>,
+) {
+    let dir = dirs.engines_dir().join(tag);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("marker"), tag).unwrap();
+    let manifest = Manifest {
+        tag: tag.to_string(),
+        source: EngineSource::Fork,
+        repo: Some("acme/llama.cpp".into()),
+        ref_pin: Some("7c81a9f0".repeat(5)),
+        architectures: archs.iter().map(|s| (*s).to_string()).collect(),
+        trust,
+        superseded_at_epoch,
+        ..Default::default()
+    };
+    store
+        .upsert_engine(&pallama_core::EngineRow {
+            tag: tag.to_string(),
+            asset: "built-fork".into(),
+            sha256: "x".into(),
+            installed_at: at,
+            active: false,
+            manifest: serde_json::to_string(&manifest).unwrap(),
+            kind: pallama_core::engine_kind::EngineKind::LlamaCpp,
+        })
+        .unwrap();
+}
+
+fn manifest_of(store: &Store, tag: &str) -> Manifest {
+    let row = store
+        .list_engines()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.tag == tag)
+        .unwrap_or_else(|| panic!("row {tag} must exist"));
+    serde_json::from_str(&row.manifest).unwrap()
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__supersede_stamps_fully_covered_fork_lanes() {
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    let store = Store::open(&dirs).unwrap();
+
+    // Mainline covers both of the fork's architectures; the fork rides
+    // along until the lifecycle pass stamps it.
+    stage_mainstream_row(
+        &store,
+        &dirs,
+        "b-main",
+        3000,
+        &["qwen35", "qwen35_moe", "llama"],
+    );
+    stage_lane(
+        &store,
+        &dirs,
+        "fork-acme_llama.cpp-7c81a9f0-cpu",
+        1000,
+        pallama_runtime::engine::manifest::TrustTier::User,
+        &["qwen35", "qwen35_moe"],
+        None,
+    );
+
+    // 0 = retirement sweep disabled; this pin only exercises stamping.
+    mgr.refresh_supersede_state(0, &[]).await.unwrap();
+
+    let m = manifest_of(&store, "fork-acme_llama.cpp-7c81a9f0-cpu");
+    assert_eq!(m.superseded_by.as_deref(), Some("b-main"));
+    assert!(m.superseded_at_epoch.is_some(), "stamp carries a clock");
+    // Idempotent: a second pass does not re-stamp or error.
+    mgr.refresh_supersede_state(0, &[]).await.unwrap();
+    let m2 = manifest_of(&store, "fork-acme_llama.cpp-7c81a9f0-cpu");
+    assert_eq!(m2.superseded_at_epoch, m.superseded_at_epoch);
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__supersede_skips_partially_covered_fork_lanes() {
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    let store = Store::open(&dirs).unwrap();
+
+    // Mainline absorbed qwen35 but NOT qwen35_moe: partial coverage must
+    // keep the fork unstamped — the rescue path still owns the gap.
+    stage_mainstream_row(&store, &dirs, "b-main", 3000, &["qwen35"]);
+    stage_lane(
+        &store,
+        &dirs,
+        "fork-acme_llama.cpp-7c81a9f0-cpu",
+        1000,
+        pallama_runtime::engine::manifest::TrustTier::User,
+        &["qwen35", "qwen35_moe"],
+        None,
+    );
+
+    mgr.refresh_supersede_state(0, &[]).await.unwrap();
+
+    let m = manifest_of(&store, "fork-acme_llama.cpp-7c81a9f0-cpu");
+    assert!(
+        m.superseded_by.is_none(),
+        "partial coverage must not graduate the fork"
+    );
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__retire_sweep_deletes_only_eligible_curated_lanes() {
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    let store = Store::open(&dirs).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .cast_signed();
+    let old = now - 10 * 86_400; // 10 days stale, 7-day grace
+
+    let doomed = "fork-curated_llama.cpp-11111111-cpu";
+    stage_lane(
+        &store,
+        &dirs,
+        doomed,
+        1000,
+        TrustTier::Curated,
+        &["x-arch"],
+        Some(old),
+    );
+    let user_old = "fork-acme_llama.cpp-7c81a9f0-cpu";
+    stage_lane(
+        &store,
+        &dirs,
+        user_old,
+        1001,
+        TrustTier::User,
+        &["x-arch"],
+        Some(old),
+    );
+    let active_curated = "fork-curated_llama.cpp-22222222-cpu";
+    stage_lane(
+        &store,
+        &dirs,
+        active_curated,
+        1002,
+        TrustTier::Curated,
+        &["x-arch"],
+        Some(old),
+    );
+    let pinned_curated = "fork-curated_llama.cpp-33333333-cpu";
+    stage_lane(
+        &store,
+        &dirs,
+        pinned_curated,
+        1003,
+        TrustTier::Curated,
+        &["x-arch"],
+        Some(old),
+    );
+    let fresh_curated = "fork-curated_llama.cpp-44444444-cpu";
+    stage_lane(
+        &store,
+        &dirs,
+        fresh_curated,
+        1004,
+        TrustTier::Curated,
+        &["x-arch"],
+        Some(now),
+    );
+    store.set_active_engine(active_curated).unwrap();
+
+    let pinned = vec![pinned_curated.to_string()];
+    mgr.refresh_supersede_state(7, &pinned).await.unwrap();
+
+    let tags: Vec<String> = store
+        .list_engines()
+        .unwrap()
+        .into_iter()
+        .map(|e| e.tag)
+        .collect();
+    assert!(
+        !tags.contains(&doomed.to_string()),
+        "eligible curated lane retired"
+    );
+    assert!(
+        !dirs.engines_dir().join(doomed).exists(),
+        "retired lane's directory is reclaimed"
+    );
+    for kept in [user_old, active_curated, pinned_curated, fresh_curated] {
+        assert!(tags.contains(&kept.to_string()), "{kept} must survive");
+    }
 }
 
 #[tokio::test]

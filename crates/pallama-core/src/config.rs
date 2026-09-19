@@ -296,6 +296,21 @@ pub struct Config {
     /// entirely (header ignored, zero overhead).
     #[serde(default = "default_session_keep_secs")]
     pub session_keep_secs: u64,
+    /// Capability-lane registry URL (curated fork lanes for GGUF
+    /// architectures mainline llama.cpp can't load yet). `None` = the
+    /// default registry; `Some("")` disables registry lookups entirely
+    /// (offline / air-gapped boxes; the fork-lane build itself keeps
+    /// working). The `PALLAMA_CAPABILITY_REGISTRY` env var overrides
+    /// the default when this is unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_registry_url: Option<String>,
+    /// Curated fork lanes this many days past supersede are deleted
+    /// automatically (mainline covers their architectures; the source
+    /// artifacts can always be rebuilt via the registry). 0 = never
+    /// auto-delete. User-pinned fork lanes (`engine build --fork`) are
+    /// NEVER auto-deleted regardless of this setting.
+    #[serde(default = "default_fork_retire_days")]
+    pub fork_retire_days: u64,
     /// R4: opt-in semantic cache for non-stream chat responses.
     /// Disabled by default — semantic similarity can serve a near-miss
     /// where an exact match was required; correctness-sensitive lanes
@@ -1613,6 +1628,10 @@ fn default_session_keep_secs() -> u64 {
     900
 }
 
+fn default_fork_retire_days() -> u64 {
+    7
+}
+
 fn default_semantic_ttl_secs() -> u64 {
     600
 }
@@ -1799,6 +1818,8 @@ impl Default for Config {
             router_max_models: 0,
             late_chunking_max_tokens: default_late_chunking_max_tokens(),
             session_keep_secs: default_session_keep_secs(),
+            capability_registry_url: None,
+            fork_retire_days: default_fork_retire_days(),
             semantic_cache: SemanticCacheConfig::default(),
             devices: Vec::new(),
             engine_check_secs: default_engine_check_secs(),

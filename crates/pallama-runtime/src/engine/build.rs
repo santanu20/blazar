@@ -161,6 +161,11 @@ pub struct BuildOpts {
     /// Where the source comes from: an upstream `bNNNN` tag (default)
     /// or an immutable `owner/repo@sha` fork pin.
     pub source: BuildSource,
+    /// Trust tier baked into the lane manifest: `Curated` marks a
+    /// registry-installed lane (`engine install --lane`), eligible for
+    /// auto-retirement once mainline covers it; the default `User`
+    /// tier never auto-deletes.
+    pub trust: super::manifest::TrustTier,
     /// Pre-fetched source tree (skips the clone entirely).
     pub source_dir: Option<PathBuf>,
     /// Git remote override (default: `github.com/<LLAMA_CPP_REPO>`).
@@ -187,6 +192,7 @@ impl BuildOpts {
             backend,
             tag: tag.into(),
             source: BuildSource::Upstream,
+            trust: super::manifest::TrustTier::default(),
             source_dir: None,
             clone_url: None,
             arch: None,
@@ -780,6 +786,7 @@ impl EngineManager {
             &digest,
             EngineKind::LlamaCpp,
             &lane.provenance,
+            opts.trust,
         ) {
             Ok(row) => {
                 discard_retired_engine(aside.as_deref());

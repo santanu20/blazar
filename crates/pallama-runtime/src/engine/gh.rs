@@ -97,6 +97,13 @@ pub fn same_build(a: &str, b: &str) -> bool {
     }
 }
 
+/// Raw llama-arch.cpp URL for an upstream tag. Pure so tests can pin
+/// the mapping (engine tag -> source location) without network.
+#[must_use]
+pub fn llama_arch_source_url(tag: &str) -> String {
+    format!("https://raw.githubusercontent.com/{LLAMA_CPP_REPO}/{tag}/src/llama-arch.cpp")
+}
+
 impl GhClient {
     pub fn new(token: Option<String>) -> Result<Self> {
         // PALLAMA_GH_BASE: mirrors/tests override the GitHub API base for
@@ -334,6 +341,26 @@ impl GhClient {
             ));
         }
         Ok(commit.sha)
+    }
+
+    /// Fetch the raw `src/llama-arch.cpp` at an upstream llama.cpp tag
+    /// — the one-time source for mining the architecture set of a
+    /// binary-installed lane (release assets carry no source manifest).
+    /// Any failure is the caller's fail-open signal: a missing tag or a
+    /// network hiccup must never block engine registration.
+    pub async fn fetch_llama_arch_source(&self, tag: &str) -> Result<String> {
+        let url = llama_arch_source_url(tag);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("fetch {url} failed"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("{url} answered HTTP {status}");
+        }
+        resp.text().await.with_context(|| format!("read {url}"))
     }
 
     /// Newest mistral.rs release by semver (`vtag_semver`, not string

@@ -568,10 +568,35 @@ enum EngineCmd {
     Install {
         /// Engine lane to install: mistralrs | sglang (required — bare
         /// `engine install` prints the lane chooser; llama.cpp installs
-        /// ride `engine update` / `engine build`)
+        /// ride `engine update` / `engine build`). With --lane: build a
+        /// curated capability lane from the registry by id (see
+        /// `pallama engine offers`).
         #[arg(long)]
         kind: Option<String>,
         tag: Option<String>,
+        /// Curated capability lane id from `pallama engine offers` —
+        /// builds that registry lane's pinned fork commit locally
+        /// (same immutable-pin rules as `engine build --fork`).
+        #[arg(long, conflicts_with_all = ["kind", "tag"])]
+        lane: Option<String>,
+        /// Backend for --lane builds: cuda | cpu (default cpu)
+        #[arg(long)]
+        backend: Option<String>,
+    },
+    /// List curated capability lanes from the registry (temporary
+    /// llama.cpp forks for architectures upstream hasn't merged)
+    ///
+    /// Answers "is there a known-good lane for architecture X?" —
+    /// `pallama engine offers --arch qwen35` filters to one
+    /// architecture. Install one with
+    /// `pallama engine install --lane <id>`.
+    Offers {
+        /// Filter to lanes advertising this architecture (e.g. qwen35)
+        #[arg(long)]
+        arch: Option<String>,
+        /// One JSON object per lane (JSONL); suppresses the table
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -3750,6 +3775,14 @@ async fn serve() -> Result<()> {
     ));
     for orphan in sup.sweep_orphans() {
         println!("swept orphan engine: {orphan}");
+    }
+    // Startup supersede pass: mine mainstream lanes that arrived as
+    // binaries (empty architecture sets), mark fork lanes whose
+    // architectures upstream now ships, and sweep retired curated
+    // lanes past their grace window. Maintenance only — never blocks
+    // the daemon on a bad network.
+    if let Ok(mgr) = local_engine_manager(&d) {
+        refresh_after_lane_change(&mgr, &cfg).await;
     }
     let _reaper = sup.spawn_reaper();
 
@@ -7269,13 +7302,15 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 // Provenance suffix from the row's manifest: fork lanes
                 // show their immutable pin, source builds their commit.
                 // v1 rows (pre-Manifest-v2) decode as plain upstream.
-                let prov = serde_json::from_str::<pallama_runtime::Manifest>(&e.manifest)
-                    .ok()
+                let m = serde_json::from_str::<pallama_runtime::Manifest>(&e.manifest).ok();
+                let prov = m
+                    .as_ref()
                     .map(|m| (m.provenance_label(), m.source.as_str().to_string()));
                 if json {
                     // Full sha256 (the table truncates to 12 chars) —
                     // scripts verifying assets want the whole digest.
-                    // `source`/`provenance` are additive keys.
+                    // `source`/`provenance`/`superseded_by` are additive
+                    // keys.
                     let mut obj = serde_json::json!({
                         "tag": e.tag,
                         "kind": e.kind.as_str(),
@@ -7289,6 +7324,9 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                             obj["provenance"] = serde_json::Value::String(label.clone());
                         }
                     }
+                    if let Some(by) = m.as_ref().and_then(|m| m.superseded_by.clone()) {
+                        obj["superseded_by"] = serde_json::Value::String(by);
+                    }
                     println!("{obj}");
                     continue;
                 }
@@ -7297,13 +7335,18 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                     Some((label, _)) if !label.is_empty() => format!("{} {}", e.asset, label),
                     _ => e.asset.clone(),
                 };
+                let superseded = match m.as_ref().and_then(|m| m.superseded_by.as_deref()) {
+                    Some(by) => format!(" (superseded by {by})"),
+                    None => String::new(),
+                };
                 println!(
-                    "{:<12} {:<9} {:<10} {} {}",
+                    "{:<12} {:<9} {:<10} {} {} {}",
                     e.tag,
                     e.kind.as_str(),
                     asset,
                     if e.active { "[active]" } else { "" },
-                    e.sha256.chars().take(12).collect::<String>()
+                    e.sha256.chars().take(12).collect::<String>(),
+                    superseded
                 );
             }
             if json {
@@ -7418,7 +7461,19 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 m.flags.len()
             );
         }
-        EngineCmd::Install { kind, tag } => {
+        EngineCmd::Install {
+            kind,
+            tag,
+            lane,
+            backend,
+        } => {
+            // Registry-curated capability lane: build the published
+            // fork pin locally (never a binary download — the trust
+            // banner below is the honest cost of that).
+            if let Some(lane_id) = lane {
+                engine_install_lane(&d, &lane_id, backend.as_deref()).await?;
+                return Ok(());
+            }
             // Bare `engine install` must never guess a lane: each lane
             // serves different model formats, and the old silent
             // mistralrs default started installs users did not ask for.
@@ -7428,6 +7483,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                      llama.cpp         GGUF files — pallama engine update (prebuilt) or pallama engine build cuda (source)\n  \
                      --kind mistralrs  HF safetensors dirs — prebuilt mistral.rs server\n  \
                      --kind sglang     HF safetensors dirs — pip venv (Linux + CUDA/ROCm)\n  \
+                     capability lane   pallama engine offers + install --lane <id> (fork builds)\n  \
                      voice (whisper)   pallama whisper --install (separate transcription lane)"
                 ));
             };
@@ -7445,6 +7501,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 }
             }
         }
+        EngineCmd::Offers { arch, json } => engine_offers(arch.as_deref(), json).await?,
     }
     Ok(())
 }
@@ -8098,7 +8155,7 @@ async fn engine_build(d: &PallamaDirs, a: BackendArg) -> Result<()> {
         dirs: d.clone(),
         gh,
         bus: EventBus::default(),
-        asset_override: cfg.engine_asset,
+        asset_override: cfg.engine_asset.clone(),
     };
     let row = mgr
         .build_and_install(&opts, &mut |line| println!("  {line}"))
@@ -8161,6 +8218,165 @@ async fn engine_build(d: &PallamaDirs, a: BackendArg) -> Result<()> {
             row.tag
         );
     }
+    // Post-install supersede pass (shared with install --lane and daemon
+    // startup): mine binary-installed mainstream lanes, re-check fork
+    // coverage, sweep retired curated lanes.
+    refresh_after_lane_change(&mgr, &cfg).await;
+    Ok(())
+}
+
+/// Shared post-install/startup supersede pass: mine mainstream lanes
+/// that arrived as binaries (empty architecture sets), re-check fork
+/// coverage, and sweep retired curated lanes past their grace window.
+/// Failures are maintenance noise — the triggering action already
+/// succeeded, so this never fails the caller.
+async fn refresh_after_lane_change(mgr: &EngineManager, cfg: &pallama_core::Config) {
+    let pinned: Vec<String> = cfg
+        .model_overrides
+        .values()
+        .filter_map(|o| o.engine.clone())
+        .collect();
+    if let Err(e) = mgr
+        .refresh_supersede_state(cfg.fork_retire_days, &pinned)
+        .await
+    {
+        eprintln!("supersede refresh skipped: {e}");
+    }
+}
+
+/// `pallama engine offers` — the curated-lane catalog from the
+/// capability registry, optionally filtered to one architecture.
+async fn engine_offers(arch: Option<&str>, json: bool) -> Result<()> {
+    use pallama_runtime::engine::capability_registry as reg;
+    let cfg = config()?;
+    let Some(url) = reg::resolve_registry_url(cfg.capability_registry_url.as_deref()) else {
+        return Err(anyhow!(
+            "capability registry is disabled (capability_registry_url = \"\" or \
+             PALLAMA_CAPABILITY_REGISTRY = \"\") — unset the knob to use the default registry"
+        ));
+    };
+    println!("querying capability registry {url}");
+    let lanes = reg::fetch(&reqwest::Client::new(), &url).await?;
+    let selected: Vec<&reg::RegistryLane> = match arch {
+        Some(a) => reg::offers_for_arch(&lanes, a),
+        None => lanes.iter().collect(),
+    };
+    if selected.is_empty() {
+        match arch {
+            Some(a) => println!("no active registry lane advertises architecture '{a}'"),
+            None => println!("registry catalog is empty"),
+        }
+        return Ok(());
+    }
+    if json {
+        for lane in &selected {
+            println!("{}", serde_json::to_string(lane)?);
+        }
+        return Ok(());
+    }
+    println!(
+        "{:<18} {:<24} {:<10} {:<6} {:<8} {:<14}",
+        "ID", "REPO", "PIN", "PRS", "STATUS", "ARCHITECTURES"
+    );
+    for lane in &selected {
+        let sha8: String = lane.ref_sha.chars().take(8).collect();
+        let prs = lane
+            .upstream_pr
+            .map_or_else(|| "-".into(), |p| p.to_string());
+        let archs = lane
+            .architectures
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "{:<18} {:<24} {:<10} {:<6} {:<8} {:<14}",
+            lane.id,
+            lane.repo,
+            sha8,
+            prs,
+            lane.status.as_str(),
+            archs
+        );
+    }
+    println!("install one: pallama engine install --lane <ID> --backend cpu|cuda");
+    Ok(())
+}
+
+/// `pallama engine install --lane <id>` — build a curated capability
+/// lane from the registry. Never a binary download: the registry
+/// publishes the pinned commit, the build happens locally, and the
+/// trust banner states exactly what that means.
+async fn engine_install_lane(d: &PallamaDirs, lane_id: &str, backend: Option<&str>) -> Result<()> {
+    use pallama_runtime::engine::capability_registry as reg;
+    let cfg = config()?;
+    let url = reg::resolve_registry_url(cfg.capability_registry_url.as_deref()).ok_or_else(
+        || anyhow!("capability registry is disabled — unset capability_registry_url / PALLAMA_CAPABILITY_REGISTRY"),
+    )?;
+    println!("querying capability registry {url}");
+    let lanes = reg::fetch(&reqwest::Client::new(), &url).await?;
+    let lane = lanes.iter().find(|l| l.id == lane_id).ok_or_else(|| {
+        anyhow!("no registry lane {lane_id:?} — `pallama engine offers` lists the catalog")
+    })?;
+    if lane.status == reg::LaneStatus::Retired {
+        return Err(anyhow!(
+            "registry lane {lane_id} is retired — upstream llama.cpp already ships this \
+             capability; `pallama engine update` serves it"
+        ));
+    }
+    // Defense in depth: registry data is remote input — it never
+    // bypasses the fork validators.
+    validate_repo_slug(&lane.repo)?;
+    validate_commit_sha(&lane.ref_sha)?;
+    let backend = match backend.unwrap_or("cpu") {
+        "cuda" => BuildBackend::Cuda,
+        "cpu" => BuildBackend::Cpu,
+        other => return Err(anyhow!("unknown backend {other:?} — supported: cuda, cpu")),
+    };
+    let sha8: String = lane.ref_sha.chars().take(8).collect();
+    println!(
+        "TRUST: building code from fork {}@{} (curated registry lane {}) — it compiles and \
+         runs on this machine with your privileges. Curated lanes are registry-published, \
+         not Pallama-audited; the pin is immutable (commit {}).",
+        lane.repo, sha8, lane.id, sha8
+    );
+    println!(
+        "building llama.cpp fork lane {lane_id} = {}@{} (backend {}, from source — this \
+         needs git + cmake + a C++ compiler)",
+        lane.repo,
+        sha8,
+        backend.as_str()
+    );
+    let gh = GhClient::new(std::env::var("GH_TOKEN").ok())?;
+    let mgr = EngineManager {
+        dirs: d.clone(),
+        gh,
+        bus: EventBus::default(),
+        asset_override: cfg.engine_asset.clone(),
+    };
+    let mut opts = BuildOpts::new(backend, &lane.ref_sha);
+    opts.source = BuildSource::Fork {
+        repo: lane.repo.clone(),
+        ref_sha: lane.ref_sha.clone(),
+        base_ref: None,
+    };
+    opts.trust = pallama_runtime::engine::manifest::TrustTier::Curated;
+    let row = mgr
+        .build_and_install(&opts, &mut |line| println!("  {line}"))
+        .await?;
+    let m: pallama_runtime::Manifest = serde_json::from_str(&row.manifest)?;
+    println!(
+        "engine {} installed; regression gate skipped (curated lane — outside the upstream \
+         b-tag currency)",
+        row.tag
+    );
+    print_fork_lane_howto(&row, &m);
+    println!(
+        "auto-retire: curated lanes are removed {} days after every architecture they serve \
+         ships upstream (fork_retire_days; 0 disables) — a model_overrides pin protects a lane",
+        cfg.fork_retire_days
+    );
+    refresh_after_lane_change(&mgr, &cfg).await;
     Ok(())
 }
 

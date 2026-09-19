@@ -274,6 +274,20 @@ impl Store {
         Ok(())
     }
 
+    /// Rewrite one engine row's manifest JSON (supersede marking,
+    /// lazy architecture-coverage mining). Fails when `tag` is unknown
+    /// so a stale caller can never invent a row.
+    pub fn update_engine_manifest(&self, tag: &str, manifest_json: &str) -> CoreResult<()> {
+        let changed = self.conn.execute(
+            "UPDATE engines SET manifest = ?2 WHERE tag = ?1",
+            params![tag, manifest_json],
+        )?;
+        if changed == 0 {
+            return Err(CoreError::Store(rusqlite::Error::QueryReturnedNoRows));
+        }
+        Ok(())
+    }
+
     pub fn active_engine(&self) -> CoreResult<Option<EngineRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT tag, asset, sha256, installed_at, active, manifest, kind FROM engines WHERE active = 1",

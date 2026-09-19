@@ -199,6 +199,7 @@ The advanced surface, grouped by job. `--json`/JSONL output on the inspection co
 |---|---|
 | `pallama engine update/use/rollback/build` | sha256-verified engines, side-by-side, regression-gated; CUDA source builds through the same flow |
 | `pallama engine build --fork owner/llama.cpp@<sha>` | Temporary capability lane for GGUF archs mainline can't load yet: immutable SHA pin, architecture set mined from the fork's source, provenance in `engine list`; a model that dies on `unknown model architecture` re-routes to an installed advertising lane exactly once and remembers the pin |
+| `pallama engine offers` + `engine install --lane <id>` | Curated capability-lane registry: catalog of community fork lanes per missing architecture (`--arch`, `--json`); one-command curated build with auto-retire — when every architecture a lane serves ships upstream, the lane is marked superseded (pins auto-clear, `engine list` shows it) and curated lanes are removed after `fork_retire_days` (user-built forks and pinned lanes are never auto-deleted) |
 | `pallama upgrade [--dry-run]` | Self-update the binary from GitHub Releases, sha256-verified |
 | `pallama keys` | API key lifecycle — list / add / rm / rotate against the daemon |
 | `pallama launch --warm <model> -- <cli>` | Pre-warm a model, exec a CLI, hand it a gateway key |

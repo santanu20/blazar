@@ -2248,7 +2248,27 @@ impl Supervisor {
                 .cloned();
             if let Some(tag) = pinned {
                 if let Some(row) = rows.iter().find(|r| r.tag == tag) {
-                    if let Some(adapter) = adapter_for(row) {
+                    // A lane the daemon itself marked superseded (every
+                    // rescued architecture now ships in a mainstream
+                    // lane) must not keep holding the model: drop the
+                    // learned pin and let the normal resolver prefer
+                    // the newer mainstream lane.
+                    let superseded =
+                        serde_json::from_str::<crate::engine::manifest::Manifest>(&row.manifest)
+                            .ok()
+                            .and_then(|m| m.superseded_by);
+                    if let Some(coverer) = superseded {
+                        self.capability_pins
+                            .lock()
+                            .expect("capability pins lock")
+                            .remove(&model.name);
+                        tracing::info!(
+                            model = %model.name,
+                            tag = %tag,
+                            coverer = %coverer,
+                            "capability pin dropped — the rescued architectures now ship in a mainstream lane; routing normally"
+                        );
+                    } else if let Some(adapter) = adapter_for(row) {
                         tracing::info!(
                             model = %model.name,
                             engine = %row.tag,
@@ -3175,6 +3195,12 @@ impl Supervisor {
                          fork may already support it: build a temporary capability lane with \
                          `pallama engine build --fork <owner>/llama.cpp@<commit-sha> --backend cpu`"
                     );
+                    // Registry offer (bounded, fail-open): a curated lane
+                    // published for exactly this architecture turns the
+                    // dead-end into an actionable install command.
+                    if let Some(offer) = self.registry_offer(&arch).await {
+                        let _ = write!(msg, "\n{offer}");
+                    }
                 }
                 return Err(SupervisionError::EngineCrashed(msg));
             }
@@ -3227,6 +3253,54 @@ impl Supervisor {
         let end = rest.find('\'')?;
         let name = &rest[..end];
         (!name.is_empty()).then(|| name.to_string())
+    }
+
+    /// Ask the capability registry for a curated lane serving `arch`
+    /// (bounded by the fetch's own timeout, fail-open on every error —
+    /// an unreachable registry must never delay or fail a spawn).
+    async fn registry_offer(&self, arch: &str) -> Option<String> {
+        let url = crate::engine::capability_registry::resolve_registry_url(
+            self.config.capability_registry_url.as_deref(),
+        )?;
+        let client = reqwest::Client::new();
+        let lanes = match crate::engine::capability_registry::fetch(&client, &url).await {
+            Ok(lanes) => lanes,
+            Err(e) => {
+                tracing::debug!(error = %e, "capability registry unreachable — skipping offer");
+                return None;
+            }
+        };
+        let lane = crate::engine::capability_registry::offers_for_arch(&lanes, arch)
+            .into_iter()
+            .next()?;
+        tracing::warn!(
+            architecture = %arch,
+            lane = %lane.id,
+            "capability registry offers a curated lane for this architecture"
+        );
+        Some(Self::format_lane_offer(lane))
+    }
+
+    /// Teaching line for a registry lane that advertises a missing
+    /// architecture: the exact install command plus the lane's identity
+    /// (repo, pinned commit, size of the architecture set, upstream PR
+    /// when known) so the user can decide before compiling third-party
+    /// code.
+    fn format_lane_offer(lane: &crate::engine::capability_registry::RegistryLane) -> String {
+        let sha8: String = lane.ref_sha.chars().take(8).collect();
+        let pr = lane
+            .upstream_pr
+            .map(|p| format!(", upstream PR #{p}"))
+            .unwrap_or_default();
+        format!(
+            "curated lane available: `pallama engine install --lane {}` ({}@{}, {} \
+             architectures{})",
+            lane.id,
+            lane.repo,
+            sha8,
+            lane.architectures.len(),
+            pr
+        )
     }
 
     /// Last few non-empty lines of a dead child's log tail, for the
@@ -5551,6 +5625,85 @@ mod routing_tests {
         assert!(
             !sup.capability_pins.lock().unwrap().contains_key("m"),
             "stale pin must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn unit__resolve_routed_engine__superseded_pin_clears_for_mainstream() {
+        let sup = routing_sup(1);
+        let store = Store::open(&sup.dirs).unwrap();
+        // Unique tag/arch: routing tests share one store, so this pin
+        // must not feed the advertising-lanes fixtures.
+        let fork_tag = "fork-superseded_llama.cpp-abcdef12-cpu";
+        // The rescued lane still exists but mainline has since absorbed
+        // its architectures: the learned pin must clear and normal
+        // auto-routing take over.
+        let mut row = lane_row(fork_tag, &["superseded-arch"], 1000);
+        let mut m: crate::engine::manifest::Manifest = serde_json::from_str(&row.manifest).unwrap();
+        m.superseded_by = Some("b9-mainstream".into());
+        row.manifest = serde_json::to_string(&m).unwrap();
+        store.upsert_engine(&row).unwrap();
+        let model = pallama_core::ModelRow {
+            name: "m".into(),
+            repo: "m".into(),
+            quant: "Q4_0".into(),
+            path: "/models/m-q4_0.gguf".into(),
+            bytes: 1,
+            sha256: None,
+            mmproj_path: None,
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+        };
+        sup.capability_pins
+            .lock()
+            .unwrap()
+            .insert("m".into(), fork_tag.into());
+
+        let overlay = pallama_core::config::ModelOverride::default();
+        // Normal auto-routing for this GGUF on a llamacpp-global daemon
+        // resolves to the global lane (serving_lane returns None when the
+        // routed kind matches the global engine kind) — the pin is gone
+        // and the resolver is back on its normal decision path.
+        assert!(sup
+            .resolve_routed_engine(&store, &overlay, &model)
+            .unwrap()
+            .is_none());
+        assert!(
+            !sup.capability_pins.lock().unwrap().contains_key("m"),
+            "superseded pin must be dropped"
+        );
+    }
+
+    #[test]
+    fn unit__format_lane_offer__names_the_exact_install_command() {
+        let lane = crate::engine::capability_registry::RegistryLane {
+            id: "qwen35-fork".into(),
+            repo: "acme/llama.cpp".into(),
+            ref_sha: "7c81a9f0".repeat(5),
+            upstream_pr: Some(18234),
+            architectures: std::collections::BTreeSet::from(["qwen35".to_string()]),
+            backends: std::collections::BTreeSet::from(["cpu".to_string()]),
+            status: crate::engine::capability_registry::LaneStatus::Active,
+            note: None,
+            added_at: 0,
+        };
+        assert_eq!(
+            Supervisor::format_lane_offer(&lane),
+            "curated lane available: `pallama engine install --lane qwen35-fork` \
+             (acme/llama.cpp@7c81a9f0, 1 architectures, upstream PR #18234)"
+        );
+        // No PR on record: the trailing clause disappears cleanly.
+        let bare = crate::engine::capability_registry::RegistryLane {
+            upstream_pr: None,
+            ..lane
+        };
+        assert_eq!(
+            Supervisor::format_lane_offer(&bare),
+            "curated lane available: `pallama engine install --lane qwen35-fork` \
+             (acme/llama.cpp@7c81a9f0, 1 architectures)"
         );
     }
 
