@@ -680,16 +680,24 @@ impl EngineManager {
             BuildSource::Fork { .. } => {}
         }
 
+        // GitHub's smart-HTTP fetch only accepts full 40-char object
+        // names as want-refs — an abbreviated pin (>= 4 hex, validated
+        // at the CLI) must be resolved to the full commit first.
+        let resolved;
+        let opts = match resolve_fork_pin(&self.gh, &opts.source, on_line).await? {
+            Some(source) => {
+                resolved = BuildOpts {
+                    source,
+                    ..opts.clone()
+                };
+                &resolved
+            }
+            None => opts,
+        };
+
         // CUDA specifics: architecture from the GPU (or override), host
         // compiler de-conflicted against nvcc's gcc support window.
-        let mut arch = opts.arch.clone();
-        let mut host_compiler = opts.cuda_host_compiler.clone();
-        if opts.backend == BuildBackend::Cuda && arch.is_none() {
-            arch = Some(query_compute_caps(&tc).await?);
-        }
-        if opts.backend == BuildBackend::Cuda && host_compiler.is_none() {
-            host_compiler = resolve_host_compiler(&tc).await?;
-        }
+        let (arch, host_compiler) = cuda_build_facts(&tc, opts).await?;
 
         // Build in a scoped tempfile so it is fully torn down BEFORE the
         // installed copy is probed. An absolute build-dir RPATH (the CMake
@@ -783,6 +791,55 @@ impl EngineManager {
             }
         }
     }
+}
+
+/// CUDA source builds need two live facts the CPU lane ignores: the
+/// GPU's compute capability (unless overridden) and a host compiler
+/// inside nvcc's gcc support window. Both come back as cmake-ready
+/// `Some(...)` only for the CUDA backend.
+async fn cuda_build_facts(
+    tc: &Toolchain,
+    opts: &BuildOpts,
+) -> Result<(Option<String>, Option<std::path::PathBuf>)> {
+    let mut arch = opts.arch.clone();
+    let mut host_compiler = opts.cuda_host_compiler.clone();
+    if opts.backend == BuildBackend::Cuda && arch.is_none() {
+        arch = Some(query_compute_caps(tc).await?);
+    }
+    if opts.backend == BuildBackend::Cuda && host_compiler.is_none() {
+        host_compiler = resolve_host_compiler(tc).await?;
+    }
+    Ok((arch, host_compiler))
+}
+
+/// Expand an abbreviated fork pin to the full commit SHA. GitHub's
+/// smart-HTTP fetch only accepts full 40-char object names as
+/// want-refs; the commits API happily resolves short forms. Returns
+/// `None` when the pin is already full-length (or not a fork at all),
+/// so the caller can keep borrowing the original `BuildOpts`.
+async fn resolve_fork_pin(
+    gh: &super::gh::GhClient,
+    source: &BuildSource,
+    on_line: &mut dyn FnMut(&str),
+) -> Result<Option<BuildSource>> {
+    let BuildSource::Fork {
+        repo,
+        ref_sha,
+        base_ref,
+    } = source
+    else {
+        return Ok(None);
+    };
+    if ref_sha.len() >= 40 {
+        return Ok(None);
+    }
+    let full = gh.resolve_commit(repo, ref_sha).await?;
+    (on_line)(&format!("resolved fork pin {ref_sha} to {full}"));
+    Ok(Some(BuildSource::Fork {
+        repo: repo.clone(),
+        ref_sha: full,
+        base_ref: base_ref.clone(),
+    }))
 }
 
 /// nvidia-smi compute-cap query -> cmake architectures token.

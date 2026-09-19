@@ -292,6 +292,50 @@ impl GhClient {
         }
     }
 
+    /// Resolve a commit ref (short SHA, full SHA, branch, or tag) to the
+    /// full 40-char commit SHA via the commits API. The git fetch
+    /// protocol only accepts full object names as want-refs, so
+    /// fork-lane pins given in abbreviated form must go through here
+    /// before `git fetch` is attempted.
+    pub async fn resolve_commit(&self, repo: &str, git_ref: &str) -> Result<String> {
+        #[derive(serde::Deserialize)]
+        struct CommitLookup {
+            sha: String,
+        }
+        let url = self
+            .base
+            .join(&format!("repos/{repo}/commits/{git_ref}"))
+            .unwrap();
+        let resp = self
+            .auth(self.http.get(url.clone()))
+            .send()
+            .await
+            .context("GitHub commit-lookup request failed")?;
+        match resp.status() {
+            reqwest::StatusCode::OK => {}
+            reqwest::StatusCode::NOT_FOUND => {
+                return Err(anyhow!("{repo} commit {git_ref} not found"));
+            }
+            reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                return Err(anyhow!(
+                    "GitHub API rate limited ({}). Set GH_TOKEN for 5000 req/hr",
+                    resp.status()
+                ));
+            }
+            other => {
+                return Err(anyhow!("GitHub API {other} for {repo} commit {git_ref}"));
+            }
+        }
+        let commit: CommitLookup = resp.json().await.context("decode commit-lookup response")?;
+        if commit.sha.len() != 40 || !commit.sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(anyhow!(
+                "{repo} commit lookup for {git_ref} returned a non-SHA answer ({})",
+                commit.sha
+            ));
+        }
+        Ok(commit.sha)
+    }
+
     /// Newest mistral.rs release by semver (`vtag_semver`, not string
     /// order — v0.10.0 > v0.9.3).
     pub async fn latest_mistralrs_release(&self) -> Result<GhRelease> {
