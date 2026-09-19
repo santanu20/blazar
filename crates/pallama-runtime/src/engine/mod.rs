@@ -10,7 +10,7 @@ pub mod sglang_install;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use pallama_core::config::UpdateChannel;
 use pallama_core::engine_kind::EngineKind;
@@ -391,19 +391,19 @@ impl EngineManager {
             .upstream_cuda_pick(release, &lane, exact_pin)
             .await
             .map(|(_, p)| p);
-        let overlay_tag = format!("b{number}-cuda");
-        out.overlay_tag = Some(overlay_tag.clone());
-        if let Ok(overlay) = self
-            .gh
-            .release_by_tag_repo(&gh::engine_overlay_repo(), &overlay_tag)
-            .await
-        {
-            out.cuda_asset = gh::resolve_cuda_asset(&overlay, dc, sm, arch);
-            out.newest_cuda = gh::newest_asset_cuda(&overlay);
+        // Overlay lanes are self-hosted-only (PALLAMA_ENGINE_REPO); with
+        // no overlay configured the report stops at the upstream pick.
+        if let Some(repo) = gh::engine_overlay_repo() {
+            let overlay_tag = format!("b{number}-cuda");
+            out.overlay_tag = Some(overlay_tag.clone());
+            if let Ok(overlay) = self.gh.release_by_tag_repo(&repo, &overlay_tag).await {
+                out.cuda_asset = gh::resolve_cuda_asset(&overlay, dc, sm, arch);
+                out.newest_cuda = gh::newest_asset_cuda(&overlay);
+            }
+            // A missing overlay release stays overlay_tag=Some + asset=None:
+            // the CLI reports the publish lag instead of pretending the
+            // lane was evaluated.
         }
-        // A missing overlay release stays overlay_tag=Some + asset=None:
-        // the CLI reports the hourly-cadence lag instead of pretending
-        // the lane was evaluated.
         Ok(out)
     }
 
@@ -461,7 +461,15 @@ impl EngineManager {
     /// Direct install of an overlay `bNNNN-cuda` tag the user pinned
     /// explicitly (`pallama engine install b10896-cuda`).
     async fn install_cuda_overlay_tag(&self, tag: &str) -> Result<EngineRow> {
-        let repo = gh::engine_overlay_repo();
+        let Some(repo) = gh::engine_overlay_repo() else {
+            bail!(
+                "{tag} looks like a self-hosted overlay tag, but no overlay \
+                 repo is configured — set {} to the repo publishing \
+                 bNNNN-cuda releases. The default channel serves upstream's \
+                 official CUDA assets via: pallama engine update",
+                gh::ENGINE_OVERLAY_REPO_ENV
+            );
+        };
         let release = self
             .gh
             .release_by_tag_repo(&repo, tag)
@@ -505,13 +513,14 @@ impl EngineManager {
     /// over the Vulkan asset (~4% decode uplift). Chain, first wins:
     /// (1) upstream official ubuntu-cuda asset from the SAME release
     /// (generic SASS + CPU dispatch — runs on nearly every box, needs
-    /// a system CUDA runtime or the cudart companion), (2) our CI's
-    /// `bNNNN-cuda` overlay for the same tag (sm-slim SASS, bundled
+    /// a system CUDA runtime or the cudart companion; falls back to a
+    /// scan-back for the newest release that ships one), (2) a
+    /// self-hosted `bNNNN-cuda` overlay for the same tag when
+    /// `PALLAMA_ENGINE_REPO` points at one (sm-slim SASS, bundled
     /// cudart), (3) the newest published overlay build (overlay-lag
     /// fallback), else the Vulkan universal fallback. Any miss — asset
-    /// absent, not runnable — is a quiet return to the next lane.
-    /// Zero-touch: the overlay repo defaults to the project home;
-    /// `PALLAMA_ENGINE_REPO` exists purely for forks.
+    /// absent, not runnable, overlay unset — is a quiet return to the
+    /// next lane; the project publishes no overlay of its own.
     async fn maybe_cuda_overlay(
         &self,
         release: &GhRelease,
@@ -575,6 +584,12 @@ impl EngineManager {
         {
             return Ok(Some(row));
         }
+        // Overlay lanes are self-hosted-only: with PALLAMA_ENGINE_REPO
+        // unset there is nothing to probe — the Vulkan lane follows
+        // (the caller narrates that drop).
+        let Some(repo) = repo else {
+            return Ok(None);
+        };
         let overlay_tag = format!("b{}-cuda", lane.number);
         let overlay = match self.gh.release_by_tag_repo(&repo, &overlay_tag).await {
             Ok(r) => r,
@@ -595,9 +610,8 @@ impl EngineManager {
                 }
                 tracing::warn!(
                     "overlay fallback found nothing runnable; using the \
-                     Vulkan lane this update (the overlay publishes on an \
-                     hourly cadence). Local CUDA for THIS driver: pallama \
-                     engine build cuda"
+                     Vulkan lane this update. Local CUDA for THIS driver: \
+                     pallama engine build cuda"
                 );
                 return Ok(None);
             }
@@ -762,11 +776,10 @@ impl EngineManager {
             LagOutcome::Installed(row) => Ok(Some(row)),
             LagOutcome::AlreadyActive(row) => {
                 tracing::warn!(
-                    "overlay hasn't published {overlay_tag} yet ({} drops hourly); \
+                    "overlay hasn't published {overlay_tag} yet; \
                      newest published CUDA build {} is already active — rerun \
-                     `pallama engine update` after the next overlay drop, or run \
+                     `pallama engine update` after the overlay publishes, or run \
                      `pallama engine build cuda` to compile {target_tag} locally now",
-                    gh::engine_overlay_repo(),
                     row.tag
                 );
                 Ok(Some(row))
@@ -776,7 +789,7 @@ impl EngineManager {
     }
 
     /// Lane 1 of the prebuilt chain: install the upstream release's
-    /// official ubuntu-cuda asset under the overlay's `bNNNN-cuda` tag
+    /// official ubuntu-cuda asset under a local `bNNNN-cuda` tag
     /// (same lane separation, keep-CUDA guard, and prune semantics).
     /// Skips (returns `Ok(None)`) when the system lacks the CUDA runtime
     /// for the pick's major AND the release ships no cudart companion —
@@ -846,7 +859,7 @@ impl EngineManager {
     /// overlay build the driver can run — never newer than the target,
     /// never the already-active tag (no reinstall churn). A
     /// minutes-class download beats the hour-class source lane while
-    /// the overlay's hourly freshness watcher catches up.
+    /// the overlay catches up.
     ///
     /// The outcome is tri-state so the caller narrates each arm
     /// distinctly: "newest published build is already active" used to
@@ -854,7 +867,9 @@ impl EngineManager {
     /// printing a Vulkan-lane switch the keep-CUDA guard then
     /// cancelled — three contradictory decisions in one run.
     async fn overlay_lag_fallback(&self, lane: &CudaLane) -> Result<LagOutcome> {
-        let repo = gh::engine_overlay_repo();
+        let Some(repo) = gh::engine_overlay_repo() else {
+            return Ok(LagOutcome::NothingRunnable);
+        };
         let releases = match self.gh.list_releases_repo(&repo).await {
             Ok(r) => r,
             Err(e) => {
@@ -889,7 +904,7 @@ impl EngineManager {
             .saturating_sub(gh::btag_number(&pick_rel.tag_name).unwrap_or(0));
         tracing::warn!(
             "overlay lags the channel target by {behind} build(s): installing \
-             published {} instead ({} asset; fresh overlay builds land hourly)",
+             published {} instead ({} asset)",
             pick_rel.tag_name,
             pick.label
         );

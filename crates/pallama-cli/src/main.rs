@@ -2648,24 +2648,27 @@ async fn doctor_engine(d: &PallamaDirs) -> Vec<Check> {
     }
     // CUDA-channel hint: an NVIDIA box serving the Vulkan asset is
     // leaving the measured ~4% Vulkan delta on the table. The channel
-    // is zero-touch (default repo, probed automatically at every
-    // `engine update`) — this row only tells the user the lane exists
-    // and where its assets come from.
+    // is zero-touch (upstream official CUDA assets, probed
+    // automatically at every `engine update`) — this row only tells
+    // the user the lane exists and where its assets come from.
     if std::env::consts::OS == "linux"
         && std::env::consts::ARCH == "x86_64"
         && pallama_runtime::engine::system_vendor_hint()
             == pallama_runtime::engine::manifest::Vendor::Nvidia
         && !active_asset_is_cuda(d, active_tag.as_deref())
     {
-        let repo = pallama_runtime::engine::gh::engine_overlay_repo();
-        checks.push(Check::ok(
-            "engine cuda channel",
-            format!(
+        let detail = match pallama_runtime::engine::gh::engine_overlay_repo() {
+            Some(repo) => format!(
                 "NVIDIA GPU on the Vulkan asset — prebuilt CUDA engines are preferred \
-                 automatically once {repo} publishes bNNNN-cuda releases (engine-cuda \
-                 workflow); set PALLAMA_ENGINE_REPO to use a fork"
+                 automatically from the overlay at {repo}; set PALLAMA_ENGINE_REPO to \
+                 change it"
             ),
-        ));
+            None => "NVIDIA GPU on the Vulkan asset — prebuilt CUDA engines are preferred \
+                 automatically from upstream llama.cpp releases (official ubuntu-cuda \
+                 assets); run: pallama engine update"
+                .to_string(),
+        };
+        checks.push(Check::ok("engine cuda channel", detail));
     }
     checks
 }
@@ -2762,16 +2765,16 @@ fn engine_update_command(active_tag: &str, asset: &str) -> &'static str {
     }
 }
 
-/// The active engine sits on the prebuilt CUDA overlay lane (not a
-/// local source build): those assets publish hourly from the overlay
-/// repo and can lag the channel target. The currency row must teach
-/// that divergence so doctor's "upgrade available" never contradicts
-/// `engine update`'s "nothing new installed" while the overlay catches
-/// up (live confusion: doctor said b10969, update installed nothing).
+/// The active engine sits on the prebuilt CUDA lane (not a local
+/// source build): prebuilt assets can lag the channel target while
+/// the publishing side catches up. The currency row must teach that
+/// divergence so doctor's "upgrade available" never contradicts
+/// `engine update`'s "nothing new installed" in the meantime
+/// (live confusion: doctor said b10969, update installed nothing).
 fn overlay_lag_note(active_tag: &str, asset: &str) -> &'static str {
     if active_tag.ends_with("-cuda") && !asset.starts_with("built-") {
-        " (CUDA prebuilts publish hourly from the overlay repo and may lag \
-         the newest build; when `pallama engine update` reports the overlay \
+        " (CUDA prebuilts may lag the newest build while the overlay repo \
+         catches up; when `pallama engine update` reports the prebuilt lane \
          is behind, `pallama engine build cuda` compiles the newest build \
          locally)"
     } else {
@@ -7791,14 +7794,20 @@ async fn engine_update(
                          locally for this driver"
                     ),
                     None => println!(
-                        "no CUDA overlay release {overlay} published yet (overlay drops \
-                         hourly) — rerun after the next drop, or `pallama engine build cuda`"
+                        "no CUDA overlay release {overlay} published yet — rerun after \
+                         the overlay publishes, or `pallama engine build cuda`"
                     ),
                 },
-                None => println!(
-                    "driver CUDA {maj}.{min} — the CUDA prebuilt lane does not apply; the \
-                     standard asset lane would serve this update"
-                ),
+                None => match lane.upstream_cuda {
+                    Some(_) => println!(
+                        "driver CUDA {maj}.{min} — no overlay repo configured; the \
+                         upstream official CUDA asset above serves this update"
+                    ),
+                    None => println!(
+                        "driver CUDA {maj}.{min} — no runnable prebuilt CUDA asset for \
+                         this box; the standard asset lane would serve this update"
+                    ),
+                },
             },
             (None, _) => println!("no NVIDIA driver detected — standard asset lane applies"),
         }
@@ -9985,7 +9994,7 @@ mod tests {
     }
 
     #[test]
-    fn unit__currency_verdict__overlay_lane_teaches_hourly_lag_and_local_escape() {
+    fn unit__currency_verdict__overlay_lane_teaches_lag_and_local_escape() {
         // Live incident: doctor said "b10969 available — run: pallama
         // engine update", update then installed nothing (overlay hadn't
         // published b10969-cuda yet). The row must explain the overlay
@@ -10030,7 +10039,7 @@ mod tests {
             "active": "b10955-cuda",
             "update_available": true,
         });
-        // Source-built CUDA: refreshes via local build, overlay cadence
+        // Source-built CUDA: refreshes via local build, overlay lag
         // is irrelevant to it.
         let c = currency_verdict(Some("b10955-cuda"), &pending, 2_000, "built-cuda").unwrap();
         assert!(

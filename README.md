@@ -299,7 +299,7 @@ pallama-cli       the `pallama` binary: clap commands, REPL, auto-start
 ### Design principles
 
 - **Capability manifest** — engines are probed after install; the profile compiler emits only flags the installed build supports. Engine drift becomes a data problem.
-- **Prebuilt CUDA overlay** — upstream sources compiled with `-DGGML_CUDA=ON`, bundled runtimes, no fork.
+- **Prebuilt CUDA, straight from upstream** — official llama.cpp ubuntu-cuda assets install automatically on Linux-NVIDIA boxes (same-release first, scan-back for the newest that ships one); `PALLAMA_ENGINE_REPO` opts into a self-hosted overlay for sm-slim builds.
 - **Bytes-based VRAM admission** — heterogeneous models co-reside by actual bytes, not a count heuristic.
 - **Eviction ladder** — child-native sleep at `idle_sleep_secs` → SIGTERM at `idle_timeout_secs`; nothing burns VRAM forever, nothing dies mid-request.
 - **Zero-tax proxy** — OpenAI traffic forwarded byte-for-byte; client disconnect aborts the upstream request and frees the slot.

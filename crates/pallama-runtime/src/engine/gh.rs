@@ -784,27 +784,26 @@ pub fn resolve_mistralrs_asset(release: &GhRelease, picks: &[AssetPick]) -> Opti
         .cloned()
 }
 
-/// Release repo for the prebuilt CUDA overlay channel (`bNNNN-cuda`
-/// releases of upstream llama.cpp). The channel home is the dedicated
-/// `pallama-engines` repo — never the product repo — and is populated
-/// only by explicit, manual builds; a missing or empty home costs one
-/// failed release probe per `engine update`, then Vulkan fallback.
-/// Self-hosted overlays point `PALLAMA_ENGINE_REPO` at their own repo.
+/// Release repo env var for the self-hosted CUDA overlay channel
+/// (`bNNNN-cuda` releases of upstream llama.cpp). The project builds
+/// and publishes no llama.cpp artifacts anywhere: the default prebuilt
+/// channel consumes upstream's official ubuntu-cuda assets directly,
+/// and this env exists purely for operators who publish their own
+/// overlay builds.
 pub const ENGINE_OVERLAY_REPO_ENV: &str = "PALLAMA_ENGINE_REPO";
 
-pub const ENGINE_OVERLAY_REPO_DEFAULT: &str = "santanu20/pallama-engines";
-
 /// Overlay repo for the prebuilt CUDA channel: `PALLAMA_ENGINE_REPO`
-/// (e.g. a private fork) when set to a non-empty value, else the
-/// default home. Never fails — the channel is zero-touch on
-/// Linux-NVIDIA and the env exists purely for overrides.
+/// (e.g. a fork publishing `bNNNN-cuda` releases) when set to a
+/// non-empty value, else `None`. The project publishes no llama.cpp
+/// artifacts of its own — the default channel consumes upstream's
+/// official ubuntu-cuda assets directly — so an unset or empty env
+/// means "no overlay lane" and callers skip it without a probe.
 #[must_use]
-pub fn engine_overlay_repo() -> String {
+pub fn engine_overlay_repo() -> Option<String> {
     std::env::var(ENGINE_OVERLAY_REPO_ENV)
         .ok()
         .map(|r| r.trim().to_string())
         .filter(|r| !r.is_empty())
-        .unwrap_or_else(|| ENGINE_OVERLAY_REPO_DEFAULT.to_string())
 }
 
 /// Pick the CUDA asset a driver can run from a release: the highest
@@ -1582,19 +1581,20 @@ mod tests {
     #[test]
     fn unit__engine_overlay_repo__env_override_and_default() {
         // Env-dependent: assert both states without assuming the ambient
-        // value by pinning it explicitly. The channel is default-ON —
-        // unset/empty env must fall back to the default home, not disable.
+        // value by pinning it explicitly. No default home exists — the
+        // channel is upstream-direct, so unset/empty env disables the
+        // overlay lanes rather than pointing them at a project repo.
         let saved = std::env::var(ENGINE_OVERLAY_REPO_ENV).ok();
         std::env::remove_var(ENGINE_OVERLAY_REPO_ENV);
-        assert_eq!(engine_overlay_repo(), ENGINE_OVERLAY_REPO_DEFAULT);
+        assert_eq!(engine_overlay_repo(), None);
         std::env::set_var(ENGINE_OVERLAY_REPO_ENV, "");
         assert_eq!(
             engine_overlay_repo(),
-            ENGINE_OVERLAY_REPO_DEFAULT,
-            "empty env falls back to the default home"
+            None,
+            "empty env means no overlay lane"
         );
         std::env::set_var(ENGINE_OVERLAY_REPO_ENV, "  acme/pallama  ");
-        assert_eq!(engine_overlay_repo(), "acme/pallama");
+        assert_eq!(engine_overlay_repo(), Some("acme/pallama".to_string()));
         match saved {
             Some(v) => std::env::set_var(ENGINE_OVERLAY_REPO_ENV, v),
             None => std::env::remove_var(ENGINE_OVERLAY_REPO_ENV),
