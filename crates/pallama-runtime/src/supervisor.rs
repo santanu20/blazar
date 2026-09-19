@@ -4506,6 +4506,114 @@ mod routing_tests {
         )
     }
 
+    /// Child-auth mint matrix: the manifest's parsed flag surface decides
+    /// the lane. `--api-key-file` (llama-server today) keeps the secret out
+    /// of argv entirely; an argv-only engine (sglang 0.5.19) gets the
+    /// warned fallback; gaining the file flag on an engine update flips
+    /// the lane with no pallama-side change.
+    #[allow(non_snake_case)]
+    #[test]
+    fn unit__mint_child_auth__keyfile_lane_argv_fallback_and_gates() {
+        let root = tempfile::TempDir::new().unwrap();
+        let dirs = PallamaDirs {
+            config_dir: root.path().join("cfg"),
+            data_dir: root.path().join("data"),
+        };
+        std::fs::create_dir_all(dirs.run_dir()).unwrap();
+        let manifest = |flags: &[&str]| Manifest {
+            tag: "fake".into(),
+            build_number: 1,
+            version_raw: "b1".into(),
+            devices: vec![],
+            flags: flags.iter().map(|s| (*s).to_string()).collect(),
+            spec_types: vec![],
+            server_path: String::new(),
+        };
+        let sup = |config: Config| {
+            Supervisor::new(
+                dirs.clone(),
+                config,
+                EventBus::default(),
+                Hardware {
+                    physical_cores: 1,
+                    total_ram_mib: 1024,
+                    gpus: vec![],
+                },
+                Arc::new(FakeEngine(manifest(&[]))),
+            )
+        };
+        let tcp = Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port: 1,
+        };
+        let auto = sup(Config::default());
+
+        // File lane: keyfile minted 0600, argv carries the path only.
+        let file_lane = auto
+            .mint_child_auth("m1", &tcp, &manifest(&["--api-key", "--api-key-file"]))
+            .unwrap()
+            .unwrap();
+        let keyfile = dirs.run_dir().join("m1.apikey");
+        assert_eq!(
+            file_lane.argv,
+            vec!["--api-key-file".to_string(), keyfile.display().to_string()]
+        );
+        assert_eq!(file_lane.keyfile.as_deref(), Some(keyfile.as_path()));
+        assert!(
+            file_lane.secret.starts_with("plm_") && file_lane.secret.len() == 52,
+            "plm_ + 24 bytes hex"
+        );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&keyfile).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "keyfile must be owner-only");
+        }
+
+        // Argv fallback (sglang today): secret rides argv, no keyfile.
+        let argv_lane = auto
+            .mint_child_auth("m2", &tcp, &manifest(&["--api-key"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(argv_lane.argv[0], "--api-key");
+        assert_eq!(argv_lane.argv[1], argv_lane.secret);
+        assert!(argv_lane.keyfile.is_none());
+
+        // Engine update gaining --api-key-file flips the lane on its own.
+        let flipped = auto
+            .mint_child_auth("m3", &tcp, &manifest(&["--api-key-file"]))
+            .unwrap()
+            .unwrap();
+        assert!(
+            flipped.keyfile.is_some(),
+            "file flag alone upgrades the lane"
+        );
+
+        // No auth flag surface: warn-skip, child stays open.
+        assert!(auto
+            .mint_child_auth("m4", &tcp, &manifest(&[]))
+            .unwrap()
+            .is_none());
+
+        // Unix socket: filesystem permissions already gate it (auto-off).
+        let uds = Endpoint::Unix {
+            socket: "/unused/pallama.sock".into(),
+        };
+        assert!(auto
+            .mint_child_auth("m5", &uds, &manifest(&["--api-key"]))
+            .unwrap()
+            .is_none());
+
+        // Explicit opt-out beats any manifest surface.
+        let off = pallama_core::Config {
+            child_auth: Some(false),
+            ..Config::default()
+        };
+        assert!(sup(off)
+            .mint_child_auth("m6", &tcp, &manifest(&["--api-key", "--api-key-file"]))
+            .unwrap()
+            .is_none());
+    }
+
     /// J2 harness: real temp dirs + store rows + a script posing as
     /// llama-server under engines/{tag}/llama-{tag}/.
     fn j2_sup(exit_code: i32) -> (Supervisor, tempfile::TempDir, EventBus) {
