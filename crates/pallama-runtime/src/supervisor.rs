@@ -4563,6 +4563,7 @@ mod routing_tests {
             file_lane.secret.starts_with("plm_") && file_lane.secret.len() == 52,
             "plm_ + 24 bytes hex"
         );
+        #[cfg(unix)] // PermissionsExt mode bits are unix-only
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&keyfile).unwrap().permissions().mode();
@@ -4614,6 +4615,7 @@ mod routing_tests {
             .is_none());
     }
 
+    #[cfg(unix)]
     /// J2 harness: real temp dirs + store rows + a script posing as
     /// llama-server under engines/{tag}/llama-{tag}/.
     fn j2_sup(exit_code: i32) -> (Supervisor, tempfile::TempDir, EventBus) {
@@ -4724,6 +4726,7 @@ mod routing_tests {
         assert!(w[0].contains("not visible"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn unit__j2__broken_binary_probe_rolls_back_immediately() {
         let (sup, _root, bus) = j2_sup(1); // --version exits 1: broken
@@ -4741,6 +4744,7 @@ mod routing_tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn unit__j2__healthy_binary_single_model_failure_no_rollback() {
         let (sup, _root, _bus) = j2_sup(0); // healthy probe
@@ -4753,6 +4757,7 @@ mod routing_tests {
         assert_eq!(active.tag, "b_bad"); // untouched: model-level failure
     }
 
+    #[cfg(unix)]
     #[test]
     fn unit__j2__healthy_binary_two_distinct_models_rolls_back() {
         let (sup, _root, _bus) = j2_sup(0);
@@ -5159,6 +5164,7 @@ mod routing_tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn unit__resolve_draft_path__untyped_typed_and_none() {
         // R2-2/R2-3: ONE resolver for serve, router and bench. The

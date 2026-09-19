@@ -2429,7 +2429,7 @@ fn doctor_service() -> Vec<Check> {
         };
         // Installer label: LaunchAgent (user) or LaunchDaemon (root).
         let label = if uid == "0" {
-            format!("system/dev.pallama")
+            "system/dev.pallama".to_string()
         } else {
             format!("gui/{uid}/dev.pallama")
         };
@@ -2438,9 +2438,9 @@ fn doctor_service() -> Vec<Check> {
             .output()
             .ok()
             .map(|o| o.status.success());
-        return service_verdict(Some(true), loaded, "launchd")
+        service_verdict(Some(true), loaded, "launchd")
             .into_iter()
-            .collect();
+            .collect()
     }
     #[cfg(not(target_os = "macos"))]
     Vec::new()
@@ -3544,7 +3544,8 @@ fn free_gib(path: &std::path::Path) -> Option<f64> {
     if rc != 0 {
         return None;
     }
-    #[allow(clippy::useless_conversion)] // field types vary across libcs
+    #[allow(clippy::useless_conversion, clippy::unnecessary_fallible_conversions)]
+    // field types vary across libcs
     let free: u64 = stat.f_bfree.try_into().ok()?;
     let bsize: u64 = stat.f_bsize;
     #[allow(clippy::cast_precision_loss)] // byte counts -> GiB display only
