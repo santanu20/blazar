@@ -338,6 +338,7 @@ mod tests {
 
     #[test]
     #[allow(non_snake_case)]
+    #[cfg(target_os = "linux")] // disk_avail_bytes shells linux df -B1 --output
     fn unit__disk_preflight__parses_df_output() {
         // The real df runs on the box; this pins the PARSER against the
         // exact shape `df -B1 --output=avail <path>` prints.

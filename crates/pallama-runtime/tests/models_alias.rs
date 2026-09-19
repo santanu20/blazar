@@ -1,3 +1,6 @@
+// Alias-never-destroys-source is pinned via inode identity of hardlink
+// twins — a unix filesystem concept.
+#![cfg(unix)]
 //! cp/rm alias semantics — an alias must NEVER be able to destroy its
 //! source. Regression for the 2026-09-05 incident: `copy_model` created the
 //! alias row pointing at the SOURCE file's path, so `rm <alias>` deleted

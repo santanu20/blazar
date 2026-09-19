@@ -4,7 +4,7 @@
 //! single-shot clients never observe the 502. The harness disables the
 //! reaper tick (1h interval), so any recovery observed here is the
 //! on-demand reap + in-band retry path alone.
-#![allow(unsafe_code)] // SAFETY: only libc::kill against our own child pid below
+#![allow(unsafe_code)] // SAFETY: only libc::kill against our own child pid below (unix)
 
 mod support;
 
@@ -40,8 +40,17 @@ async fn integration__crash__in_band_respawn_retry_serves_first_post_crash_reque
     assert_eq!(chat(&server.base, 0).await, 200);
 
     // Kill -9 the engine child by exact pid (simulates an engine crash).
+    // taskkill /T on Windows: TerminateProcess has no posix-signal
+    // equivalent, and the pid is owned by the server, not this test.
     let pid = server.state.sup.ps()[0].pid;
-    unsafe { libc::kill(i32::try_from(pid).unwrap_or(-1), libc::SIGKILL) };
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(i32::try_from(pid).unwrap_or(-1), libc::SIGKILL)
+    };
+    #[cfg(windows)]
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .status();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Contract (upgraded from bridging-502s): the FIRST request after

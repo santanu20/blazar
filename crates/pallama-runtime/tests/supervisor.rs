@@ -1,3 +1,7 @@
+// Crash/teardown pins send real signals (SIGKILL, signal-0 liveness) to
+// exact child pids — a unix contract; the gateway crash-retry suite
+// carries the portable taskkill variant.
+#![cfg(unix)]
 //! Supervisor integration tests against the REAL stub-llama-server:
 #![allow(unsafe_code)] // audited libc::kill(pid, SIG) on exact child pids
 //! ensure/health/argv, cold-start timeout, ladder timing, capacity+evict,
