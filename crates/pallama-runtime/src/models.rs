@@ -224,6 +224,7 @@ pub fn reconcile_models(dirs: &PallamaDirs, store: &Store) -> ReconcileReport {
         }
     }
     let mut attached_sidecars: HashSet<String> = HashSet::new();
+    #[cfg_attr(not(unix), allow(unused_mut))] // inode twins only tracked on unix
     let mut adopted_inodes: HashSet<(u64, u64)> = HashSet::new();
 
     // Safetensors dirs adopt BEFORE any GGUF: a dir's name minus `.d` is
@@ -315,6 +316,7 @@ pub fn reconcile_models(dirs: &PallamaDirs, store: &Store) -> ReconcileReport {
 /// different model by reconcile.
 fn ownership_set(store: &Store) -> (HashSet<PathBuf>, HashSet<(u64, u64)>) {
     let mut owned: HashSet<PathBuf> = HashSet::new();
+    #[cfg_attr(not(unix), allow(unused_mut))] // inode twins only tracked on unix
     let mut owned_inodes: HashSet<(u64, u64)> = HashSet::new();
     for row in store.list_models().unwrap_or_default() {
         for p in [
