@@ -185,6 +185,7 @@ fn host_asset_labels() -> &'static [&'static str] {
 }
 
 /// The CPU-tier label for the host platform (the last-resort candidate).
+#[cfg(not(target_os = "macos"))] // macos has no cpu-fallback tier
 fn host_cpu_asset_label() -> &'static str {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("windows", "x86_64") => "win-cpu-x64",
