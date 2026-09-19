@@ -4226,65 +4226,83 @@ fn model_type_label(path: &str) -> String {
 
 /// Char-safe truncation with a trailing ellipsis. Byte-slicing here (the
 /// old form) panicked on multibyte names; chars never split.
-fn trunc_ellipsis(s: &str, cap: usize) -> String {
-    if s.chars().count() <= cap {
-        return s.to_string();
-    }
-    let cut: String = s.chars().take(cap.saturating_sub(1)).collect();
-    format!("{cut}…")
-}
-
-/// Adaptive-width table: every column sizes to its widest cell (header
-/// included) so a value can never bleed into the next column — the old
-/// fixed ARCH width let `Qwen2ForCausalLM` overlap CTX. NAME and ARCH cap
-/// with an ellipsis; SIZE and CTX right-align; PATH (last) is uncapped.
+/// Two-band model table: band A carries the seven compact columns
+/// (widths size to content and NAME is never truncated — it anchors
+/// the row), band B gives ENGINE and PATH their own full-width lines
+/// per model so fork tags and long model paths never wrap, shard
+/// mid-word, or stretch the table. A blank line separates models.
 fn render_list_table(header: [&str; 9], rows: &[[String; 9]]) -> String {
-    const NAME_CAP: usize = 26;
-    const ARCH_CAP: usize = 18;
-    let mut cells: Vec<[String; 9]> = vec![header.map(str::to_string)];
+    let mut band: Vec<[String; 7]> = vec![[
+        header[0].to_string(),
+        header[1].to_string(),
+        header[2].to_string(),
+        header[3].to_string(),
+        header[4].to_string(),
+        header[5].to_string(),
+        header[6].to_string(),
+    ]];
     for r in rows {
-        cells.push([
-            trunc_ellipsis(&r[0], NAME_CAP),
+        band.push([
+            r[0].clone(),
             r[1].clone(),
             r[2].clone(),
             r[3].clone(),
-            trunc_ellipsis(&r[4], ARCH_CAP),
+            r[4].clone(),
             r[5].clone(),
             r[6].clone(),
-            r[7].clone(),
-            r[8].clone(),
         ]);
     }
     let width = |col: usize| {
-        cells
-            .iter()
-            .map(|r| r[col].chars().count())
+        band.iter()
+            .map(|row| row[col].chars().count())
             .max()
             .unwrap_or(0)
     };
+    let (name_w, quant_w, size_w, vision_w, arch_w, ctx_w, type_w) = (
+        width(0),
+        width(1),
+        width(2),
+        width(3),
+        width(4),
+        width(5),
+        width(6),
+    );
+
     let mut out = String::new();
-    for r in &cells {
-        let _ = writeln!(
-            out,
-            "{:<n$}  {:<q$}  {:>s$}  {:<v$}  {:<a$}  {:>c$}  {:<t$}  {:<e$}  {}",
-            r[0],
-            r[1],
-            r[2],
-            r[3],
-            r[4],
-            r[5],
-            r[6],
-            r[7],
-            r[8],
-            n = width(0),
-            q = width(1),
-            s = width(2),
-            v = width(3),
-            a = width(4),
-            c = width(5),
-            t = width(6),
-            e = width(7),
+    for (i, cells) in band.iter().enumerate() {
+        // Column padding would leave trailing blanks on the last cell;
+        // trimmed so copied output carries no hidden whitespace.
+        let mut line = format!(
+            "{:<name_w$}  {:<quant_w$}  {:>size_w$}  {:<vision_w$}  {:<arch_w$}  {:>ctx_w$}  {:<type_w$}",
+            cells[0],
+            cells[1],
+            cells[2],
+            cells[3],
+            cells[4],
+            cells[5],
+            cells[6],
+            name_w = name_w,
+            quant_w = quant_w,
+            size_w = size_w,
+            vision_w = vision_w,
+            arch_w = arch_w,
+            ctx_w = ctx_w,
+            type_w = type_w
         );
+        line.truncate(line.trim_end().len());
+        out.push_str(&line);
+        out.push('\n');
+        if i == 0 {
+            continue;
+        }
+        let r = &rows[i - 1];
+        // "ENGINE" (6) + 2 gaps and "PATH" (4) + 4 gaps align the two
+        // values at the same column.
+        let _ = writeln!(out, "    {}  {}", header[7], r[7]);
+        let _ = writeln!(out, "    {}    {}", header[8], r[8]);
+        if i < band.len() - 1 {
+            out.push('\n');
+        }
     }
     out.trim_end().to_string()
 }
@@ -10144,6 +10162,57 @@ mod tests {
     }
 
     #[test]
+    fn unit__render_list_table__name_never_truncated_bands_keep_values_whole() {
+        let long_tag = "fork-csabakecskemeti_llama.cpp-7a3c74eb-cuda";
+        let long_path = "/home/user/.local/share/pallama/models/amd.Instella-MoE-16B-A3B-Think.f16.gguf.Q2_K.gguf";
+        let rows = [
+            [
+                "amd.instella-moe-16b-a3b-think".to_string(),
+                "Q2_K".to_string(),
+                "6.1 GiB".to_string(),
+                "-".to_string(),
+                "instella-moe".to_string(),
+                "32768".to_string(),
+                "gguf".to_string(),
+                long_tag.to_string(),
+                long_path.to_string(),
+            ],
+            [
+                "m1".to_string(),
+                "Q4".to_string(),
+                "1 GiB".to_string(),
+                "-".to_string(),
+                "llama".to_string(),
+                "4096".to_string(),
+                "gguf".to_string(),
+                "b-test".to_string(),
+                "/m/a.gguf".to_string(),
+            ],
+        ];
+        let out = render_list_table(
+            [
+                "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "ENGINE", "PATH",
+            ],
+            &rows,
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        // header + (band A + engine + path) per model = 7 lines; models
+        // separated by one blank line.
+        assert_eq!(lines.len(), 8, "got: {out}");
+        assert_eq!(lines[4], "", "models separated by a blank line");
+        // NAME renders in full — no ellipsis anywhere in the table.
+        assert!(lines[1].contains("amd.instella-moe-16b-a3b-think"));
+        assert!(!out.contains('…'));
+        // ENGINE and PATH render verbatim on single dedicated lines,
+        // never wrapped or shattered mid-word.
+        assert_eq!(lines[2], format!("    ENGINE  {long_tag}"), "engine band");
+        assert_eq!(lines[3], format!("    PATH    {long_path}"), "path band");
+        // The short row gets the same band shape (consistent layout).
+        assert_eq!(lines[6], "    ENGINE  b-test");
+        assert!(lines[7].ends_with("/m/a.gguf"));
+    }
+
+    #[test]
     fn unit__render_list_table__columns_never_overlap() {
         let rows = [
             [
@@ -10177,10 +10246,8 @@ mod tests {
             &rows,
         );
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 3);
-        // Column-start proof: every cell begins exactly at its header's
-        // column offset on both data rows — a value overflowing its
-        // column would push itself or its right neighbour off offset.
+        // header + 3 bands x 2 models + separator blank = 8 lines.
+        assert_eq!(lines.len(), 8, "got: {out}");
         let col = |_l: &str, h: &str| out.lines().next().unwrap().find(h).unwrap();
         let at = |l: &str, v: &str, off: usize| {
             assert_eq!(l.find(v), Some(off), "{v} misaligned in: {l}");
@@ -10188,19 +10255,16 @@ mod tests {
         at(lines[1], "nanbeige4.2-3b", 0);
         at(lines[1], "Q4_K_M", col(lines[0], "QUANT"));
         at(lines[1], "gguf", col(lines[0], "TYPE"));
-        at(lines[1], "b-test", col(lines[0], "ENGINE"));
-        at(lines[2], "Qwen2ForCausalLM", col(lines[0], "ARCH"));
-        at(lines[2], "safetensors", col(lines[0], "TYPE"));
-        // Right-aligned CTX: all rows END at the same column offset
-        // (start offsets vary with digit count by design).
+        at(lines[5], "Qwen2ForCausalLM", col(lines[0], "ARCH"));
+        at(lines[5], "safetensors", col(lines[0], "TYPE"));
+        // Right-aligned CTX: all rows END at the header's CTX end.
         let cend = |l: &str, v: &str| l.find(v).unwrap() + v.len();
         let hctx = col(lines[0], "CTX") + "CTX".len();
         assert_eq!(cend(lines[1], "262144"), hctx);
-        assert_eq!(cend(lines[2], "32768"), hctx);
-        // Oversize arch beyond the cap truncates with an ellipsis, never
-        // panics on multibyte names.
+        assert_eq!(cend(lines[5], "32768"), hctx);
+        // Multibyte names render in full (no ellipsis truncation).
         let long = [[
-            "имя-модели-очень-длинное-больше-лимита".to_string(),
+            "имя-модели-очень-длинное".to_string(),
             "Q8_0".to_string(),
             "1 GiB".to_string(),
             "-".to_string(),
@@ -10216,7 +10280,12 @@ mod tests {
             ],
             &long,
         );
-        assert!(out2.lines().nth(1).unwrap().contains('…'));
+        assert!(out2
+            .lines()
+            .nth(1)
+            .unwrap()
+            .contains("имя-модели-очень-длинное"));
+        assert!(!out2.contains('…'));
     }
 
     #[test]
