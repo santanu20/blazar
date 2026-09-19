@@ -309,7 +309,7 @@ Full walkthrough: [docs/2.ARCHITECTURE](docs/2.ARCHITECTURE.md).
 
 ## Quality
 
-1070 tests (compiler tables, wiremock network suites, engine install cycles with a real stub engine, supervisor lifecycle integration, full gateway round-trips over both APIs incl. sentinel suites); `cargo clippy --workspace --all-targets -- -D warnings` clean; live E2E harnesses with a real engine (`scripts/validate.py`, `scripts/bench_matrix.py`); CI runs the suite plus shellcheck, ruff, installer e2e on x86_64 and arm64 Linux, dependency CVE audit, and repo hygiene gates. Details: [docs/7.SETUP](docs/7.SETUP.md).
+1099 tests (compiler tables, wiremock network suites, engine install cycles with a real stub engine, supervisor lifecycle integration, full gateway round-trips over both APIs incl. sentinel suites); `cargo clippy --workspace --all-targets -- -D warnings` clean; live E2E harnesses with a real engine (`scripts/validate.py`, `scripts/bench_matrix.py`); CI runs the suite plus shellcheck, ruff, installer e2e on x86_64 and arm64 Linux, dependency CVE audit, and repo hygiene gates. Details: [docs/7.SETUP](docs/7.SETUP.md).
 
 ## Documentation
 
