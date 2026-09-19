@@ -13,6 +13,7 @@
 | The pitch | The reality |
 |---|---|
 | **Every model** | Three engines, unmodified, side-by-side: [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server` (GGUF) · [mistral.rs](https://github.com/EricLBuehler/mistral.rs) (HF safetensors) · [SGLang](https://github.com/sgl-project/sglang) (safetensors + AWQ/GPTQ on CUDA/ROCm) |
+| **Day-one engines** | Official upstream llama.cpp releases install the day they ship — newest, or pinned to any tag. New models and features arrive with upstream, not on a vendor fork's catch-up schedule |
 | **Every API** | One gateway speaking the **OpenAI**, **Ollama** and **Anthropic** APIs simultaneously |
 | **Full speed** | Engines are probed, profiled and orchestrated — nothing reimplemented, nothing slowed down |
 | **One binary** | Port **11435** — pallama's own port, so it never collides with a running ollama; point existing clients at it with zero code changes |
@@ -261,6 +262,18 @@ Every row is a real, long-standing ollama complaint with pallama's root-cause re
 | Attribution dodging | Version, banner, and this README credit llama.cpp/ggml/ggerganov |
 
 ## How it works
+
+### The engine channel
+
+pallama never vendors a fork of anything. The llama.cpp channel consumes upstream's own release artifacts, which is why a model or feature merged upstream is usable the same day — there is no fork to re-vendor and no vendor release train to wait for (the ollama model).
+
+| Need | Command / behavior |
+|---|---|
+| Newest upstream build | `pallama engine update` — official llama.cpp release, sha256-verified, installed side-by-side (nothing existing is overwritten) |
+| Preview before switching | `pallama engine update --check` |
+| Stay on a known-good build | `pallama engine use <tag>` — any installed build, one command; `engine rollback` steps back |
+| "Can an update break me?" | Regression gate: a >10% decode drop auto-rolls the update back |
+| NVIDIA | Newest upstream ubuntu-cuda build your driver supports, CUDA runtimes bundled — no toolkit, no source build required (`engine build cuda` if you want one anyway) |
 
 ### Engine routing
 
