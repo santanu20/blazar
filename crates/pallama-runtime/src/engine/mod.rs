@@ -1491,7 +1491,17 @@ impl EngineManager {
                 .list_engines()?
                 .iter()
                 .any(|e| e.kind == EngineKind::LlamaCpp && is_cuda_engine(&e.tag, &e.asset));
-        let activated = !keep_cuda;
+        // Fork lanes are additive: installing one never dethrones the
+        // active engine of its kind. Routing picks the newest lane per
+        // spawn when the capability is actually needed, and
+        // `pallama engine use <tag>` stays the explicit switch. A fork
+        // lane only activates when it is the first of its kind.
+        let fork_additive = m.source == manifest::EngineSource::Fork
+            && store
+                .list_engines()?
+                .iter()
+                .any(|e| e.kind == row.kind && e.active);
+        let activated = !keep_cuda && !fork_additive;
         if activated {
             store.set_active_engine(tag)?;
         }
@@ -1504,6 +1514,13 @@ impl EngineManager {
                 "NVIDIA GPU present — registered engine {tag} ({asset_label}) but KEPT the \
                  installed CUDA engine active (Vulkan first-token is measurably slower); run \
                  `pallama engine use {tag}` to switch anyway"
+            );
+        }
+        if fork_additive {
+            tracing::info!(
+                "fork lane {tag} registered without activating — the active {} engine stays; \
+                 `pallama engine use {tag}` switches explicitly",
+                row.kind.as_str()
             );
         }
         // The flip above happened after `row` was built; the caller's

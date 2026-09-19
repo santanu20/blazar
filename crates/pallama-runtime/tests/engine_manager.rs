@@ -774,6 +774,67 @@ async fn integration__register_engine_provenanced_bakes_source_and_architectures
     );
 }
 
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__fork_lane_registration_never_dethrones_active_engine() {
+    use std::collections::BTreeSet;
+
+    // An active mainstream lane exists: the fork register must stay
+    // additive — inactive row, active tag untouched.
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    {
+        let store = Store::open(&dirs).unwrap();
+        stage_mainstream_row(&store, &dirs, "b1-cuda", 2000, &["llama"]);
+        store.set_active_engine("b1-cuda").unwrap();
+    }
+    let prov = LaneProvenance {
+        source: EngineSource::Fork,
+        repo: Some("acme/llama.cpp".into()),
+        ref_pin: Some("7c81a9f0".repeat(5)),
+        base_ref: None,
+        architectures: BTreeSet::from(["spark9".to_string()]),
+    };
+    let tag = "fork-acme_llama.cpp-7c81a9f0-cpu";
+    let (dir, _guard) = stub_engine_dir("additive");
+    let row = mgr
+        .register_engine_provenanced(
+            &dir,
+            tag,
+            "built-fork",
+            "cafebabe",
+            pallama_core::engine_kind::EngineKind::LlamaCpp,
+            &prov,
+            pallama_runtime::engine::manifest::TrustTier::default(),
+        )
+        .unwrap();
+    assert!(!row.active, "fork lane must not steal activation");
+    let store = Store::open(&dirs).unwrap();
+    assert_eq!(
+        store.active_engine().unwrap().map(|r| r.tag),
+        Some("b1-cuda".to_string()),
+        "active mainstream engine keeps the throne"
+    );
+
+    // First of its kind: nothing to keep, the fork lane activates.
+    let (_t2, dirs2) = tmp_dirs();
+    let mgr2 = manager(&dirs2, &api.uri());
+    let (dir2, _guard2) = stub_engine_dir("firstfork");
+    let row2 = mgr2
+        .register_engine_provenanced(
+            &dir2,
+            tag,
+            "built-fork",
+            "cafebabe",
+            pallama_core::engine_kind::EngineKind::LlamaCpp,
+            &prov,
+            pallama_runtime::engine::manifest::TrustTier::default(),
+        )
+        .unwrap();
+    assert!(row2.active, "first llamacpp lane activates");
+}
+
 /// Stage a mainstream (upstream-source) llamacpp row advertising
 /// `archs` — the coverage side of the supersede pins.
 fn stage_mainstream_row(store: &Store, dirs: &PallamaDirs, tag: &str, at: i64, archs: &[&str]) {
