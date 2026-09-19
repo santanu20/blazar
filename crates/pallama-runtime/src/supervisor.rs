@@ -5533,48 +5533,55 @@ mod routing_tests {
     fn unit__advertising_lanes__newest_llamacpp_advertiser_first() {
         let sup = routing_sup(1);
         let store = Store::open(&sup.dirs).unwrap();
-        // Two fork lanes advertise qwen35 (fork-b newer); the mainstream
-        // lane and a same-claim mistral.rs row do not count.
+        // Routing tests share one store: unique arch + tags so parallel
+        // fixtures never leak into each other's snapshots. Two fork
+        // lanes advertise adve9 (fork-b newer); the mainstream lane and
+        // a same-claim mistral.rs row do not count.
         store
-            .upsert_engine(&lane_row("fork-a/llama.cpp-1111-cpu", &["qwen35"], 1000))
+            .upsert_engine(&lane_row("fork-adv-a/llama.cpp-1111-cpu", &["adve9"], 1000))
             .unwrap();
         store
-            .upsert_engine(&lane_row("fork-b/llama.cpp-2222-cpu", &["qwen35"], 2000))
+            .upsert_engine(&lane_row("fork-adv-b/llama.cpp-2222-cpu", &["adve9"], 2000))
             .unwrap();
         store
-            .upsert_engine(&lane_row("b-main-cpu", &[], 3000))
+            .upsert_engine(&lane_row("b-adv-main-cpu", &[], 3000))
             .unwrap();
         store
             .upsert_engine(&pallama_core::EngineRow {
                 kind: pallama_core::engine_kind::EngineKind::MistralRs,
-                ..lane_row("m1", &["qwen35"], 4000)
+                ..lane_row("m-adv-1", &["adve9"], 4000)
             })
             .unwrap();
 
         // list_engines is newest-first: fork-b precedes fork-a.
-        let lanes = Supervisor::advertising_lanes("qwen35", &store, Some("b-main-cpu"));
+        let lanes = Supervisor::advertising_lanes("adve9", &store, Some("b-adv-main-cpu"));
         assert_eq!(
             lanes,
             vec![
-                "fork-b/llama.cpp-2222-cpu".to_string(),
-                "fork-a/llama.cpp-1111-cpu".to_string()
+                "fork-adv-b/llama.cpp-2222-cpu".to_string(),
+                "fork-adv-a/llama.cpp-1111-cpu".to_string()
             ]
         );
         // Unknown to every lane.
-        assert!(Supervisor::advertising_lanes("nope-arch", &store, None).is_empty());
+        assert!(
+            Supervisor::advertising_lanes("adve9-nope", &store, None).is_empty(),
+            "a fresh store has no advertisers"
+        );
     }
 
     #[tokio::test]
     async fn unit__resolve_routed_engine__capability_pin_priority() {
         let sup = routing_sup(1);
         let store = Store::open(&sup.dirs).unwrap();
-        let fork_tag = "fork-acme/llama.cpp-7c81a9f0-cpu";
+        // Routing tests share one store: unique tag/arch so parallel
+        // fixtures never leak into each other's snapshots.
+        let fork_tag = "fork-pinp/llama.cpp-7c81a9f0-cpu";
         // Mainstream lane is NEWER: plain auto-routing prefers it.
         store
-            .upsert_engine(&lane_row(fork_tag, &["qwen35"], 1000))
+            .upsert_engine(&lane_row(fork_tag, &["pinp9"], 1000))
             .unwrap();
         store
-            .upsert_engine(&lane_row("b1-cuda", &[], 2000))
+            .upsert_engine(&lane_row("b-pinp-cuda", &[], 2000))
             .unwrap();
         let model = pallama_core::ModelRow {
             name: "m".into(),
@@ -5604,7 +5611,7 @@ mod routing_tests {
 
         // User overlay pin ALWAYS outranks the learned pin.
         let user_pin = pallama_core::config::ModelOverride {
-            engine: Some("b1-cuda".into()),
+            engine: Some("b-pinp-cuda".into()),
             ..Default::default()
         };
         let Some((_, tag)) = sup
@@ -5613,7 +5620,7 @@ mod routing_tests {
         else {
             panic!("user pin must route");
         };
-        assert_eq!(tag, "b1-cuda");
+        assert_eq!(tag, "b-pinp-cuda");
 
         // Stale pin (lane deleted): dropped, normal routing resumes.
         store.delete_engine(fork_tag).unwrap();
