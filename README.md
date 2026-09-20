@@ -350,6 +350,8 @@ One active engine serves at a time (`pallama engine use`), but models come in fo
 
 `mode = "manual"` keeps one engine for everything (byte-identical to pre-routing behavior); a per-model `[model_overrides] engine = ...` pin wins over both modes. Both API dialects route identically; `pallama list`, `/v1/models`, and `/api/tags` all show the resolved engine per model; nothing-can-serve is a teaching error, never a guess. Details + decision table: [docs/2.ARCHITECTURE](docs/2.ARCHITECTURE.md) and [docs/10.SCIENTIFIC](docs/10.SCIENTIFIC.md).
 
+Within one lane, mainstream builds always beat fork lanes (newest-first inside each class): a capability fork serves only the architectures mainstream lacks, so it never shadows the official engine for shared models. Every live child reports the engine actually serving it (`pallama ps` engine column, `/api/ps` `pallama_engine`).
+
 ### Architecture
 
 ```
