@@ -322,7 +322,10 @@ pub fn keep_cuda_skip_pred(
         && active.kind == EngineKind::LlamaCpp
         && is_cuda_engine(&active.tag, &active.asset)
         && vendor == manifest::Vendor::Nvidia
-        && (os, arch) == ("linux", "x86_64")
+        // CUDA is served by locally built engines (`engine build cuda`)
+        // on both x64 desktop OSes; macOS has no CUDA (Metal lane) and
+        // aarch64 has no proven standard-lane conflict to guard yet.
+        && matches!((os, arch), ("linux" | "windows", "x86_64"))
         && (asset_override == "auto" || asset_override.is_empty())
 }
 

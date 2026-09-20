@@ -1711,8 +1711,12 @@ fn unit__keep_cuda_skip_pred__truth_table() {
         "non-NVIDIA box downloads normally"
     );
     assert!(
-        !keep_cuda_skip_pred(Some(&cuda), Vendor::Nvidia, "windows", "x86_64", "auto"),
-        "guard is linux-x86_64 scoped (mirrors overlay lane)"
+        keep_cuda_skip_pred(Some(&cuda), Vendor::Nvidia, "windows", "x86_64", "auto"),
+        "windows-x86_64 builds CUDA locally too — the dormant-download waste is identical"
+    );
+    assert!(
+        !keep_cuda_skip_pred(Some(&cuda), Vendor::Nvidia, "macos", "x86_64", "auto"),
+        "no CUDA on macOS (Metal lane)"
     );
     assert!(
         !keep_cuda_skip_pred(Some(&cuda), Vendor::Nvidia, "linux", "aarch64", "auto"),
