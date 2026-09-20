@@ -28,7 +28,25 @@
 
 ## The numbers
 
-Measured, not marketed. Same laptop, same model (Qwen3.5-9B Q4_K_M), reproducible with one command. Full methodology, raw artifacts and caveats: [BENCHMARK.md](BENCHMARK.md).
+Measured, not marketed. Same laptop, same weights, reproducible with one command. Full methodology, raw artifacts and caveats: [BENCHMARK.md](BENCHMARK.md).
+
+**Current campaign — pallama 0.9.0 vs ollama 0.34.0, identical weights** (plain Qwen3.5-9B Q4_K_M both sides; greedy parity: temp 0, seed 42, pinned sampler overrides; ollama 0.34.0, same box):
+
+| What you feel | pallama | ollama | Delta |
+|---|---:|---:|---:|
+| Quality suite overall (13 categories, 87 tests) | **0.874** | 0.868 | ahead, with **0 failed requests vs 2** |
+| Cold load to first token (s) | **4.70** | 6.27 | **1.33x** |
+| Warm TTFT median / p95 (s) | **.075 / .080** | .080 / .084 | faster and tighter |
+| Decode throughput (t/s) | **76.75** | 73.05 | **+5%** |
+| Long generation (t/s) | **41.2** | 40.2 | +2.5% |
+| 4-stream concurrent throughput (same-day, t/s) | ~36.7 | 36.0 | +2% honest (no cross-run cherry-pick) |
+
+In practice: **faster cold starts, faster first tokens, more decoded tokens per second — on the exact same weights — plus a request pipeline that no longer hangs, wedges, or silently drops streams under failure.** Every reliability fix in that pipeline was found, root-caused and pinned by this same benchmark harness.
+
+Quality detail: pallama leads HALLUCINATION (.95/.80), CONTEXT (1.0/.667), PERF (.8/.6); the tool-bearing categories (TOOLS/MULTITURN/TOOL_EFF) trail by a content class traced to ollama's Go-side prompt pre-render — the opt-in `ollama_compat` recipe lane with `decode_policy = "strict"` (grammar-whitelisted tool calls) is the named counter, not a mystery.
+
+<details>
+<summary><b>0.5.0-era campaign</b> (kept for provenance — different engine build and ollama 0.33.3)</summary>
 
 | What you feel | pallama | ollama 0.33.3 | Delta |
 |---|---:|---:|---:|
@@ -39,11 +57,9 @@ Measured, not marketed. Same laptop, same model (Qwen3.5-9B Q4_K_M), reproducibl
 | Gateway overhead vs direct engine (decode t/s) | 40.3 | 41.1 | **-1.9% (noise)** |
 | Daemon boot (s) | **0.54** | 4.13 | **7.7x** |
 
-In practice: **3x more concurrent streams from the GPU you already own**, agent loops that don't stall on tail latency, sessions that wake in a blink, and cached prefill that stops re-paying the long-context tax every turn.
-
 *Test bed:* i7-14650HX · RTX 4070 Laptop 8 GiB · Linux · pallama 0.5.0 gateway over llama.cpp b10903-cuda. Ratios travel across hardware; absolute numbers shift.
 
-*Honesty clause:* the table above is the 0.5.0-era campaign, kept for provenance. On the current build (0.9.0, weights-matched Qwen3.5-9B Q4_K_M vs ollama 0.34.0, same box) cold load is **4.7 s vs 6.3 s** — pallama now wins cold outright while still defaulting to a 16384 context where ollama silently truncates; you can't buy ollama's missing context at any price.
+</details>
 
 Reproduce it yourself:
 
