@@ -26,7 +26,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace -- --test-threads=1
+      # Linux/macOS: parallel (the same suite runs parallel green under
+      # cargo-nextest locally, per-test process isolation). Windows keeps
+      # serial execution: parallel has never been exercised on windows
+      # runners and the pin predates the matrix (born in ci.yml's first
+      # commit, not a fix for an observed race). Lift after one green
+      # parallel windows run.
+      - run: cargo test --workspace ${{ runner.os == 'Windows' && '-- --test-threads=1' || '' }}
 
   scripts:
     name: shellcheck + installer e2e (${{ matrix.os }})
