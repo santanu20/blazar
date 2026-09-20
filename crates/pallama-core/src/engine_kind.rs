@@ -182,6 +182,18 @@ impl fmt::Display for LaneError {
 /// `pin` = the per-model `engine = "…"` override (exact tag first, then
 /// kind), `global` = the daemon's active engine kind, `installed` =
 /// (tag, kind) rows newest-first. `Ok(None)` = serve on the global lane,
+/// Provenance class of an installed lane, used as the tiebreak when
+/// several lanes of the same [`EngineKind`] could serve a model: a
+/// `Fork` lane (llama.cpp fork built for an architecture mainline
+/// lacks) is a capability shim, never the default for architectures a
+/// `Mainstream` lane already serves.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LaneClass {
+    #[default]
+    Mainstream,
+    Fork,
+}
+
 /// no routed adapter needed; `Ok(Some((tag, kind)))` = route this spawn
 /// to a local adapter of that row; `Err(teaching)` = nothing installed
 /// can serve the model (or the pin names something absent).
@@ -192,7 +204,7 @@ pub fn serving_lane(
     safetensors: bool,
     quantized: bool,
     global: EngineKind,
-    installed: &[(String, EngineKind)],
+    installed: &[(String, EngineKind, LaneClass)],
 ) -> Result<Option<(String, EngineKind)>, String> {
     serving_lane_typed(mode, policy, pin, safetensors, quantized, global, installed)
         .map_err(|e| e.to_string())
@@ -208,23 +220,23 @@ pub fn serving_lane_typed(
     safetensors: bool,
     quantized: bool,
     global: EngineKind,
-    installed: &[(String, EngineKind)],
+    installed: &[(String, EngineKind, LaneClass)],
 ) -> Result<Option<(String, EngineKind)>, LaneError> {
     use crate::config::RoutingMode;
     let roster = || {
         installed
             .iter()
-            .map(|(t, k)| format!("{t} ({k})"))
+            .map(|(t, k, _)| format!("{t} ({k})"))
             .collect::<Vec<_>>()
             .join(", ")
     };
     if let Some(pin) = pin {
-        if let Some(row) = installed.iter().find(|(t, _)| t == pin) {
-            return Ok(Some(row.clone()));
+        if let Some(row) = installed.iter().find(|(t, _, _)| t == pin) {
+            return Ok(Some((row.0.clone(), row.1)));
         }
         if let Ok(kind) = pin.parse::<EngineKind>() {
-            if let Some(row) = installed.iter().find(|(_, k)| *k == kind) {
-                return Ok(Some(row.clone()));
+            if let Some((tag, _, _)) = installed.iter().find(|(_, k, _)| *k == kind) {
+                return Ok(Some((tag.clone(), kind)));
             }
             return Err(LaneError::PinKindMissing {
                 kind,
@@ -239,15 +251,21 @@ pub fn serving_lane_typed(
     if mode == RoutingMode::Manual {
         return Ok(None);
     }
-    let kinds: Vec<EngineKind> = installed.iter().map(|(_, k)| *k).collect();
+    let kinds: Vec<EngineKind> = installed.iter().map(|(_, k, _)| *k).collect();
     match EngineKind::route_format(safetensors, quantized, &kinds, policy) {
         Some(kind) if kind == global => Ok(None),
-        // `kinds` is built from `installed`, so the find always matches;
-        // the None arm is pure type-shape.
+        // `kinds` is built from `installed`, so a matching lane always
+        // exists; the None arm is pure type-shape. Among same-kind
+        // lanes a Mainstream build wins over a Fork shim — a fork
+        // exists to serve architectures mainline lacks, so overlaps
+        // (same arch in both) belong on the maintained build. Stable
+        // min_by_key keeps the caller's order (newest first) inside
+        // each class.
         Some(kind) => Ok(installed
             .iter()
-            .find(|(_, k)| *k == kind)
-            .map(|(tag, _)| (tag.clone(), kind))),
+            .filter(|(_, k, _)| *k == kind)
+            .min_by_key(|(_, _, class)| u8::from(*class == LaneClass::Fork))
+            .map(|(tag, _, _)| (tag.clone(), kind))),
         None => Err(LaneError::FormatUnserved {
             safetensors,
             quantized,
@@ -494,7 +512,7 @@ mod tests {
         use crate::config::{RoutingMode, RoutingPolicy};
         use EngineKind::LlamaCpp;
 
-        let installed = vec![("b1".to_string(), LlamaCpp)];
+        let installed = vec![("b1".to_string(), LlamaCpp, LaneClass::Mainstream)];
         let cases = [("sglang", true), ("bogus-tag", true), (":irrelevant", true)];
         for (pin, safetensors) in cases {
             let typed = serving_lane_typed(
@@ -536,5 +554,91 @@ mod tests {
             fmt_typed,
             "no installed engine serves the safetensors format — install one (sglang|mistralrs for safetensors, llamacpp for GGUF); installed: b1 (llamacpp)"
         );
+    }
+
+    /// A fork lane never shadows a mainstream lane of the same kind for
+    /// overlapping formats, even when the fork is newer (installed lists
+    /// arrive newest-first); a fork still serves when it is the only
+    /// lane of the kind, and a pin forces it explicitly.
+    #[test]
+    fn unit__serving_lane__mainstream_beats_newer_fork_same_kind() {
+        use crate::config::RoutingMode::Auto;
+        use crate::config::RoutingPolicy::Quality;
+        use EngineKind::LlamaCpp;
+        // Newest-first, exactly as `list_engines` yields rows: the fork
+        // was installed after the mainstream build.
+        let installed = vec![
+            (
+                "fork-acme_x-7c81a9f0-cuda".to_string(),
+                LlamaCpp,
+                LaneClass::Fork,
+            ),
+            ("b11026-cuda".to_string(), LlamaCpp, LaneClass::Mainstream),
+        ];
+        // GGUF model with a non-llamacpp global engine: mainstream wins.
+        let pick = serving_lane(
+            Auto,
+            Quality,
+            None,
+            false,
+            false,
+            EngineKind::Sglang,
+            &installed,
+        )
+        .unwrap();
+        assert_eq!(pick.map(|(t, _)| t), Some("b11026-cuda".to_string()));
+        // Pin still forces the fork when the user asks for it.
+        let pinned = serving_lane(
+            Auto,
+            Quality,
+            Some("fork-acme_x-7c81a9f0-cuda"),
+            false,
+            false,
+            EngineKind::Sglang,
+            &installed,
+        )
+        .unwrap();
+        assert_eq!(
+            pinned.map(|(t, _)| t),
+            Some("fork-acme_x-7c81a9f0-cuda".to_string())
+        );
+        // Fork-only roster: the fork serves (it is the shim of last
+        // resort, not a dead lane).
+        let fork_only = vec![(
+            "fork-acme_x-7c81a9f0-cuda".to_string(),
+            LlamaCpp,
+            LaneClass::Fork,
+        )];
+        let pick = serving_lane(
+            Auto,
+            Quality,
+            None,
+            false,
+            false,
+            EngineKind::Sglang,
+            &fork_only,
+        )
+        .unwrap();
+        assert_eq!(
+            pick.map(|(t, _)| t),
+            Some("fork-acme_x-7c81a9f0-cuda".to_string())
+        );
+        // Newest mainstream still wins over an OLDER mainstream (the
+        // pre-fork behavior is untouched on mainstream-only boxes).
+        let two_mainstream = vec![
+            ("b11100-cuda".to_string(), LlamaCpp, LaneClass::Mainstream),
+            ("b11026-cuda".to_string(), LlamaCpp, LaneClass::Mainstream),
+        ];
+        let pick = serving_lane(
+            Auto,
+            Quality,
+            None,
+            false,
+            false,
+            EngineKind::Sglang,
+            &two_mainstream,
+        )
+        .unwrap();
+        assert_eq!(pick.map(|(t, _)| t), Some("b11100-cuda".to_string()));
     }
 }

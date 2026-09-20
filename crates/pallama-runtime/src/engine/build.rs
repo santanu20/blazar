@@ -53,7 +53,12 @@ pub fn validate_repo_slug(repo: &str) -> Result<()> {
     let ok = parts.len() == 2
         && parts.iter().all(|p| {
             !p.is_empty()
-                // `repo.git` is a clone-URL spelling, not a slug — the
+                // "." and ".." are path-traversal segments: the host is
+                // fixed so they cannot escape github.com, but the
+                // constructed URL would silently normalize to a
+                // different repo than the user named.
+                && *p != "."
+                && *p != ".."                // `repo.git` is a clone-URL spelling, not a slug — the
                 // constructed github.com URL would double the suffix.
                 && !p.rsplit_once('.')
                     .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("git"))
@@ -657,6 +662,54 @@ fn lane_identity(
 }
 
 impl EngineManager {
+    /// Effective build source, resolved before any fetch:
+    ///
+    /// - GitHub's smart-HTTP fetch only accepts full 40-char object
+    ///   names as want-refs — an abbreviated pin (>= 4 hex, validated
+    ///   at the CLI) is resolved to the full commit first.
+    /// - Provenance honesty for caller-provided trees: a `source_dir`
+    ///   whose git origin is NOT upstream llama.cpp is a fork
+    ///   checkout, whatever the caller declared. Stamping it Upstream
+    ///   would let the lane be treated as mainstream currency
+    ///   (auto-retire windows, supersede mining) for code it is not.
+    ///   The tree's own remote is the truth; plain fixture trees (no
+    ///   .git) keep the declared source.
+    async fn resolve_effective_source(
+        &self,
+        tc: &Toolchain,
+        opts: &BuildOpts,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<BuildOpts> {
+        let resolved = match resolve_fork_pin(&self.gh, &opts.source, on_line).await? {
+            Some(source) => BuildOpts {
+                source,
+                ..opts.clone()
+            },
+            None => opts.clone(),
+        };
+        if let (Some(dir), BuildSource::Upstream) = (&resolved.source_dir, &resolved.source) {
+            let origin = git_remote_slug(tc, dir).await;
+            let head = git_rev_parse(tc, dir).await.ok();
+            if let (Some(slug), Some(sha)) = (origin, head) {
+                if slug != *LLAMA_CPP_REPO {
+                    (on_line)(&format!(
+                        "source tree origin is {slug} (not upstream llama.cpp) — \
+                         stamping this build as a fork lane"
+                    ));
+                    return Ok(BuildOpts {
+                        source: BuildSource::Fork {
+                            repo: slug,
+                            ref_sha: sha,
+                            base_ref: None,
+                        },
+                        ..resolved
+                    });
+                }
+            }
+        }
+        Ok(resolved)
+    }
+
     /// Clone (or take) the source tree, configure, build, install, probe,
     /// activate. The build tree is a tempfile — torn down on every exit
     /// path (Drop), success or failure.
@@ -686,20 +739,11 @@ impl EngineManager {
             BuildSource::Fork { .. } => {}
         }
 
-        // GitHub's smart-HTTP fetch only accepts full 40-char object
-        // names as want-refs — an abbreviated pin (>= 4 hex, validated
-        // at the CLI) must be resolved to the full commit first.
-        let resolved;
-        let opts = match resolve_fork_pin(&self.gh, &opts.source, on_line).await? {
-            Some(source) => {
-                resolved = BuildOpts {
-                    source,
-                    ..opts.clone()
-                };
-                &resolved
-            }
-            None => opts,
-        };
+        // Effective source resolution (pin expansion + tree-origin
+        // honesty) happens before the fetch: fetch, tag derivation,
+        // and asset labels all consume the resolved source.
+        let resolved = self.resolve_effective_source(&tc, opts, on_line).await?;
+        let opts = &resolved;
 
         // CUDA specifics: architecture from the GPU (or override), host
         // compiler de-conflicted against nvcc's gcc support window.
@@ -1125,10 +1169,39 @@ async fn git_rev_parse(tc: &Toolchain, dir: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Copy the built output into the standard engine layout — the same
-/// `llama-<tag>/` inner root as a release tarball, so the
-/// quantize/bench/perplexity discovery lanes see the siblings — and
-/// return the engine dir and the sha256 of the built server.
+/// `git remote get-url origin` of a tree, normalized to an `owner/repo`
+/// slug. `None` when the tree has no git history or no origin remote
+/// (plain fixture trees) or the URL does not name a GitHub-style slug —
+/// callers treat that as "origin unknown, keep the declared source".
+async fn git_remote_slug(tc: &Toolchain, dir: &Path) -> Option<String> {
+    let git = tc.git.as_ref()?;
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new(git)
+            .arg("-C")
+            .arg(dir)
+            .arg("remote")
+            .arg("get-url")
+            .arg("origin")
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // Both common remote forms: https://github.com/owner/repo.git and
+    // git@github.com:owner/repo.git. Anything else is not a slug we can
+    // vouch for.
+    let base = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("git@github.com:"))?;
+    let tail = base.strip_suffix(".git").unwrap_or(base);
+    validate_repo_slug(tail).ok()?;
+    Some(tail.to_string())
+}
 ///
 /// Upstream master links the tools against shared `libggml*/libllama*`
 /// siblings in `build/bin` (verified live: the 17 KiB thin binaries
@@ -1278,6 +1351,35 @@ async fn resolve_host_compiler(tc: &Toolchain) -> Result<Option<PathBuf>> {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__validate_repo_slug__rejects_traversal_and_degenerate_segments() {
+        // Path-traversal spellings: host-contained, but the constructed
+        // URL would silently normalize to a different repo than named.
+        for bad in [
+            "../evil",
+            "..",
+            ".",
+            "acme/..",
+            "acme/.",
+            "../acme/x",
+            "/acme/x",
+            "acme",
+            "acme/llama.cpp/extra",
+            "/",
+        ] {
+            assert!(
+                validate_repo_slug(bad).is_err(),
+                "slug {bad:?} must be rejected"
+            );
+        }
+        // Dots *inside* a segment remain legitimate repo characters.
+        for ok in ["acme/x..y", "acme/llama.cpp", "a-b_c/d.e-f"] {
+            assert!(validate_repo_slug(ok).is_ok(), "slug {ok:?} must pass");
+        }
+        // The clone-URL spelling stays rejected via the fork spec path.
+        assert!(parse_fork_spec("acme/llama.cpp.git@1234abcd").is_err());
+    }
 
     #[test]
     fn unit__parse_version_pair__nvidia_smi_banner_shapes() {
@@ -1480,5 +1582,74 @@ mod tests {
         let tc = detect_toolchain(&search);
         assert!(tc.git.is_none());
         assert!(tc.cmake.is_none());
+    }
+
+    /// Remote-origin provenance: both GitHub URL forms normalize to a
+    /// validated slug; foreign hosts and remote-less trees yield None
+    /// (caller keeps the declared source). Skips silently where no git
+    /// binary exists — the probe is about URL parsing, not the tool.
+    #[tokio::test]
+    async fn unit__git_remote_slug__parses_forms_and_ignores_foreign() {
+        let Some(git) = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|p| p.join("git"))
+                .find(|p| p.is_file())
+        }) else {
+            return;
+        };
+        let tc = Toolchain {
+            git: Some(git.clone()),
+            cmake: None,
+            cxx: None,
+            nvcc: None,
+            nvidia_smi: None,
+            compiler_cache: None,
+        };
+        let repo = tempfile::tempdir().unwrap();
+        std::process::Command::new(&git)
+            .arg("init")
+            .arg("-q")
+            .arg(repo.path())
+            .status()
+            .unwrap();
+        let remote = |url: &str| {
+            std::process::Command::new(&git)
+                .arg("-C")
+                .arg(repo.path())
+                .args(["remote", "add", "origin", url])
+                .status()
+                .unwrap();
+        };
+        let rm = || {
+            std::process::Command::new(&git)
+                .arg("-C")
+                .arg(repo.path())
+                .args(["remote", "remove", "origin"])
+                .status()
+                .unwrap();
+        };
+        assert_eq!(
+            git_remote_slug(&tc, repo.path()).await,
+            None,
+            "no remote configured"
+        );
+        remote("https://github.com/acme-forks/llama.cpp.git");
+        assert_eq!(
+            git_remote_slug(&tc, repo.path()).await,
+            Some("acme-forks/llama.cpp".to_string())
+        );
+        rm();
+        remote("git@github.com:acme-forks/llama.cpp.git");
+        assert_eq!(
+            git_remote_slug(&tc, repo.path()).await,
+            Some("acme-forks/llama.cpp".to_string())
+        );
+        rm();
+        remote("https://gitlab.com/acme/llama.cpp.git");
+        assert_eq!(
+            git_remote_slug(&tc, repo.path()).await,
+            None,
+            "foreign host"
+        );
     }
 }

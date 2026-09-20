@@ -90,6 +90,23 @@ pub struct EngineRow {
     pub kind: crate::engine_kind::EngineKind,
 }
 
+impl EngineRow {
+    /// Routing class of this lane, from the provenance stamped in its
+    /// manifest: forks (`"source": "fork"`) are capability shims and
+    /// lose same-kind ties to mainstream builds. Undecodable or legacy
+    /// manifests count as mainstream — the pre-fork default.
+    #[must_use]
+    pub fn lane_class(&self) -> crate::engine_kind::LaneClass {
+        let fork = serde_json::from_str::<serde_json::Value>(&self.manifest)
+            .is_ok_and(|m| m.get("source").is_some_and(|s| s.as_str() == Some("fork")));
+        if fork {
+            crate::engine_kind::LaneClass::Fork
+        } else {
+            crate::engine_kind::LaneClass::Mainstream
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ModelRow {
     pub name: String,
@@ -620,6 +637,33 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('engines','models','profiles','loras')", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn unit__lane_class__reads_manifest_source_field() {
+        use crate::engine_kind::LaneClass;
+        let row = |manifest: String| EngineRow {
+            tag: "t".into(),
+            asset: "a".into(),
+            sha256: "x".into(),
+            installed_at: 0,
+            active: false,
+            manifest,
+            kind: EngineKind::LlamaCpp,
+        };
+        // Fork provenance stamps Fork.
+        assert_eq!(
+            row(r#"{"source":"fork"}"#.into()).lane_class(),
+            LaneClass::Fork
+        );
+        // Legacy/missing field and other sources stay mainstream.
+        assert_eq!(row("{}".into()).lane_class(), LaneClass::Mainstream);
+        assert_eq!(
+            row(r#"{"source":"upstream"}"#.into()).lane_class(),
+            LaneClass::Mainstream
+        );
+        // Undecodable manifest: fail toward the pre-fork default.
+        assert_eq!(row("not json".into()).lane_class(), LaneClass::Mainstream);
     }
 
     #[test]

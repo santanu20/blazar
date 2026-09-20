@@ -29,6 +29,15 @@ use crate::events::{EventBus, InstanceState, PallamaEvent};
 /// preset, and the CLI bench/tune lanes so every spawn path resolves
 /// drafts identically — profile-compile still gates emission on the
 /// engine manifest and hard-errors on stale (missing) files.
+/// Shared pooled client for localhost control-plane calls (warm-peg
+/// probes, session-bank save/restore): one connection pool for the
+/// daemon's lifetime instead of a fresh client per call. Each call
+/// site keeps its own per-request `.timeout()` as the bounding clock.
+fn local_http() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
 pub fn resolve_draft_path(store: &Store, model: &str, spec_mode: &str) -> Option<String> {
     let pair = pallama_core::catalog::pair_for_spec_mode(model, spec_mode)?;
     let (repo_part, file_part) = pair
@@ -303,7 +312,7 @@ async fn warm_peg_child(
         "max_tokens": 4,
         "stream": false,
     });
-    let client = reqwest::Client::new();
+    let client = local_http();
     let started = std::time::Instant::now();
     // Single probe first: drains the residual warmup queue (up to ~30s
     // on a cold venv+torch boot; generous bound so a slow-but-healthy
@@ -2189,8 +2198,12 @@ impl Supervisor {
         // Shared decision (core `serving_lane`) — the gateway consults
         // the SAME function to predict the serving lane for per-child
         // protocol quirks, so supervisor and gateway can never disagree.
-        let installed: Vec<(String, EngineKind)> =
-            rows.iter().map(|r| (r.tag.clone(), r.kind)).collect();
+        // Lane class carries fork provenance so a capability shim never
+        // shadows a mainstream build for overlapping architectures.
+        let installed: Vec<(String, EngineKind, pallama_core::engine_kind::LaneClass)> = rows
+            .iter()
+            .map(|r| (r.tag.clone(), r.kind, r.lane_class()))
+            .collect();
         let safetensors = std::path::Path::new(&model.path).is_dir();
         let Some((tag, _kind)) = pallama_core::engine_kind::serving_lane(
             self.config.engine_routing.mode,
@@ -3089,15 +3102,25 @@ impl Supervisor {
         let Ok(rows) = store.list_engines() else {
             return Vec::new();
         };
-        rows.iter()
+        let mut lanes: Vec<(String, pallama_core::engine_kind::LaneClass)> = rows
+            .iter()
             .filter(|r| r.kind == pallama_core::engine_kind::EngineKind::LlamaCpp)
             .filter(|r| Some(r.tag.as_str()) != exclude)
             .filter(|r| {
                 serde_json::from_str::<crate::engine::manifest::Manifest>(&r.manifest)
                     .is_ok_and(|m| m.advertises_arch(arch))
             })
-            .map(|r| r.tag.clone())
-            .collect()
+            .map(|r| (r.tag.clone(), r.lane_class()))
+            .collect();
+        // Same preference rule as core `serving_lane`: a mainstream
+        // build that advertises the architecture beats a fork shim —
+        // the fork exists for architectures mainline lacks. Rows
+        // arrive newest-first; the stable sort keeps newest-first
+        // inside each class.
+        lanes.sort_by_key(|(_, class)| {
+            u8::from(*class == pallama_core::engine_kind::LaneClass::Fork)
+        });
+        lanes.into_iter().map(|(tag, _)| tag).collect()
     }
 
     /// Classify a dead child's log tail as llama.cpp's
@@ -3109,9 +3132,14 @@ impl Supervisor {
     /// — anything else classifies as None (conservative: a wrong
     /// rescue is worse than no rescue).
     fn classify_unknown_arch(tail: &str) -> Option<String> {
+        // Work entirely on the lowercased copy: mixing an offset from
+        // `lower` with a slice of `tail` panics on multi-byte case folds
+        // (U+0130, U+212A) that shift byte positions before the marker.
+        // Lowercase extraction is also the better key — advertised
+        // architecture names are lowercase by llama.cpp convention.
         let lower = tail.to_lowercase();
         let idx = lower.find("unknown model architecture")?;
-        let after = &tail[idx + "unknown model architecture".len()..];
+        let after = &lower[idx + "unknown model architecture".len()..];
         let start = after.find('\'')? + 1;
         let rest = &after[start..];
         let end = rest.find('\'')?;
@@ -3126,8 +3154,8 @@ impl Supervisor {
         let url = crate::engine::capability_registry::resolve_registry_url(
             self.config.capability_registry_url.as_deref(),
         )?;
-        let client = reqwest::Client::new();
-        let lanes = match crate::engine::capability_registry::fetch(&client, &url).await {
+        let client = crate::engine::capability_registry::http();
+        let lanes = match crate::engine::capability_registry::fetch(client, &url).await {
             Ok(lanes) => lanes,
             Err(e) => {
                 tracing::debug!(error = %e, "capability registry unreachable — skipping offer");
@@ -3478,7 +3506,7 @@ impl Supervisor {
         if self.config.router {
             body["model"] = serde_json::json!(key);
         }
-        let mut req = reqwest::Client::new()
+        let mut req = local_http()
             .post(&url)
             .json(&body)
             .timeout(std::time::Duration::from_secs(5));
@@ -3531,7 +3559,7 @@ impl Supervisor {
         } else {
             serde_json::json!({"filename": format!("_auto-{}", inst.profile_ctx)})
         };
-        let mut req = reqwest::Client::new()
+        let mut req = local_http()
             .post(&url)
             .json(&body)
             .timeout(std::time::Duration::from_secs(2));
@@ -5423,6 +5451,26 @@ mod routing_tests {
         }
     }
 
+    #[test]
+    fn unit__classify_unknown_arch__unicode_case_folds_do_not_panic() {
+        // Multi-byte case folds change byte positions between the
+        // original and lowercased tails (U+0130 grows 2->3 bytes,
+        // U+212A shrinks 3->1). The classifier must stay on one string.
+        let folds = "\u{0130}\u{212A} loading \u{0130}model\u{212A}";
+        let tail = format!("{folds}\nunknown model architecture: 'instella-moe'");
+        assert_eq!(
+            Supervisor::classify_unknown_arch(&tail).as_deref(),
+            Some("instella-moe")
+        );
+        // A mixed-case architecture name extracts as the lowercase key
+        // that advertised lane manifests carry.
+        let mixed = format!("{folds}\nunknown model architecture: 'Qwen2'");
+        assert_eq!(
+            Supervisor::classify_unknown_arch(&mixed).as_deref(),
+            Some("qwen2")
+        );
+    }
+
     /// Engine rows for capability-lane tests: fork rows carry the
     /// architecture set a real build would have mined.
     fn lane_row(tag: &str, archs: &[&str], at: i64) -> pallama_core::EngineRow {
@@ -5489,6 +5537,44 @@ mod routing_tests {
         assert!(
             Supervisor::advertising_lanes("adve9-nope", &store, None).is_empty(),
             "a fresh store has no advertisers"
+        );
+    }
+
+    #[test]
+    fn unit__advertising_lanes__mainstream_advertiser_beats_newer_fork() {
+        let sup = routing_sup(1);
+        let store = Store::open(&sup.dirs).unwrap();
+        // Same architecture advertised by a binary-mainstream lane
+        // (mined set, upstream provenance) and a NEWER fork lane: the
+        // mainstream build wins; the fork is the shim for architectures
+        // mainline lacks, never the preferred server of an overlap.
+        let mainstream = pallama_core::EngineRow {
+            tag: "b-advm-main-cpu".into(),
+            manifest: serde_json::to_string(&crate::engine::manifest::Manifest {
+                tag: "b-advm-main-cpu".into(),
+                source: crate::engine::manifest::EngineSource::Upstream,
+                architectures: ["advm8"].iter().map(|s| (*s).to_string()).collect(),
+                ..Default::default()
+            })
+            .unwrap(),
+            ..lane_row("b-advm-main-cpu", &[], 1000)
+        };
+        store.upsert_engine(&mainstream).unwrap();
+        store
+            .upsert_engine(&lane_row(
+                "fork-advm-f/llama.cpp-4444-cpu",
+                &["advm8"],
+                9000,
+            ))
+            .unwrap();
+
+        let lanes = Supervisor::advertising_lanes("advm8", &store, None);
+        assert_eq!(
+            lanes,
+            vec![
+                "b-advm-main-cpu".to_string(),
+                "fork-advm-f/llama.cpp-4444-cpu".to_string()
+            ]
         );
     }
 

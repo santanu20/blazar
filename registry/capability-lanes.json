@@ -1,0 +1,18 @@
+[
+  {
+    "id": "instella-moe",
+    "repo": "csabakecskemeti/llama.cpp",
+    "ref_sha": "7a3c74eb0b5e58bc8cc3949f416fbc2b3959774c",
+    "upstream_pr": 26467,
+    "architectures": [
+      "instella-moe"
+    ],
+    "backends": [
+      "cpu",
+      "cuda"
+    ],
+    "status": "active",
+    "note": "AMD Instella-MoE support ahead of mainline; architectures list the delta beyond the current upstream release, so graduation retires the lane automatically once upstream ships them.",
+    "added_at": 1789862400
+  }
+]

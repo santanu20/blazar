@@ -1353,7 +1353,11 @@ impl Check {
 fn routed_engine_lane(
     cfg: &pallama_core::Config,
     global: Option<&(String, pallama_core::engine_kind::EngineKind)>,
-    installed: &[(String, pallama_core::engine_kind::EngineKind)],
+    installed: &[(
+        String,
+        pallama_core::engine_kind::EngineKind,
+        pallama_core::engine_kind::LaneClass,
+    )],
     name: &str,
     path: &str,
 ) -> Result<String, String> {
@@ -1437,9 +1441,13 @@ fn lane_state_for(d: &PallamaDirs, row: &pallama_core::store::ModelRow) -> LaneS
     let Ok(engine_rows) = store.list_engines() else {
         return LaneState::Served;
     };
-    let installed: Vec<(String, EngineKind)> = engine_rows
+    let installed: Vec<(
+        String,
+        pallama_core::engine_kind::EngineKind,
+        pallama_core::engine_kind::LaneClass,
+    )> = engine_rows
         .iter()
-        .map(|r| (r.tag.clone(), r.kind))
+        .map(|r| (r.tag.clone(), r.kind, r.lane_class()))
         .collect();
     let cfg = pallama_core::Config::load(d).unwrap_or_default();
     // No engine at all: the product's default lane is llamacpp and
@@ -1742,9 +1750,13 @@ fn doctor_routing(d: &pallama_core::dirs::PallamaDirs) -> Vec<Check> {
     let Ok(engine_rows) = store.list_engines() else {
         return Vec::new();
     };
-    let installed: Vec<(String, pallama_core::engine_kind::EngineKind)> = engine_rows
+    let installed: Vec<(
+        String,
+        pallama_core::engine_kind::EngineKind,
+        pallama_core::engine_kind::LaneClass,
+    )> = engine_rows
         .iter()
-        .map(|r| (r.tag.clone(), r.kind))
+        .map(|r| (r.tag.clone(), r.kind, r.lane_class()))
         .collect();
     let global = engine_rows
         .iter()
@@ -4310,9 +4322,13 @@ fn list(json: bool) -> Result<()> {
     // lane; "-" = nothing installed serves the model).
     let cfg = pallama_core::Config::load(&dirs()).unwrap_or_default();
     let engine_rows = store.list_engines()?;
-    let installed: Vec<(String, pallama_core::engine_kind::EngineKind)> = engine_rows
+    let installed: Vec<(
+        String,
+        pallama_core::engine_kind::EngineKind,
+        pallama_core::engine_kind::LaneClass,
+    )> = engine_rows
         .iter()
-        .map(|r| (r.tag.clone(), r.kind))
+        .map(|r| (r.tag.clone(), r.kind, r.lane_class()))
         .collect();
     let global = engine_rows
         .iter()
@@ -8306,7 +8322,7 @@ async fn engine_offers(arch: Option<&str>, json: bool) -> Result<()> {
         ));
     };
     println!("querying capability registry {url}");
-    let lanes = reg::fetch(&reqwest::Client::new(), &url).await?;
+    let lanes = reg::fetch(reg::http(), &url).await?;
     let selected: Vec<&reg::RegistryLane> = match arch {
         Some(a) => reg::offers_for_arch(&lanes, a),
         None => lanes.iter().collect(),
@@ -8325,14 +8341,19 @@ async fn engine_offers(arch: Option<&str>, json: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<18} {:<24} {:<10} {:<6} {:<8} {:<14}",
-        "ID", "REPO", "PIN", "PRS", "STATUS", "ARCHITECTURES"
+        "{:<18} {:<24} {:<10} {:<6} {:<8} {:<10} {:<14}",
+        "ID", "REPO", "PIN", "PRS", "STATUS", "BACKENDS", "ARCHITECTURES"
     );
     for lane in &selected {
         let sha8: String = lane.ref_sha.chars().take(8).collect();
         let prs = lane
             .upstream_pr
             .map_or_else(|| "-".into(), |p| p.to_string());
+        let backends = if lane.backends.is_empty() {
+            "-".to_string()
+        } else {
+            lane.backends.iter().cloned().collect::<Vec<_>>().join(",")
+        };
         let archs = lane
             .architectures
             .iter()
@@ -8340,12 +8361,13 @@ async fn engine_offers(arch: Option<&str>, json: bool) -> Result<()> {
             .collect::<Vec<_>>()
             .join(",");
         println!(
-            "{:<18} {:<24} {:<10} {:<6} {:<8} {:<14}",
+            "{:<18} {:<24} {:<10} {:<6} {:<8} {:<10} {:<14}",
             lane.id,
             lane.repo,
             sha8,
             prs,
             lane.status.as_str(),
+            backends,
             archs
         );
     }
@@ -8364,7 +8386,7 @@ async fn engine_install_lane(d: &PallamaDirs, lane_id: &str, backend: Option<&st
         || anyhow!("capability registry is disabled — unset capability_registry_url / PALLAMA_CAPABILITY_REGISTRY"),
     )?;
     println!("querying capability registry {url}");
-    let lanes = reg::fetch(&reqwest::Client::new(), &url).await?;
+    let lanes = reg::fetch(reg::http(), &url).await?;
     let lane = lanes.iter().find(|l| l.id == lane_id).ok_or_else(|| {
         anyhow!("no registry lane {lane_id:?} — `pallama engine offers` lists the catalog")
     })?;
@@ -8378,7 +8400,20 @@ async fn engine_install_lane(d: &PallamaDirs, lane_id: &str, backend: Option<&st
     // bypasses the fork validators.
     validate_repo_slug(&lane.repo)?;
     validate_commit_sha(&lane.ref_sha)?;
-    let backend = match backend.unwrap_or("cpu") {
+    let backend_name = backend.unwrap_or("cpu");
+    // A lane that declares its backends is believed: building outside
+    // the advertised set dies deep in cmake with no teaching, so gate it
+    // here instead. An empty set makes no claim and builds anywhere.
+    if !lane.backends.is_empty() && !lane.backends.contains(backend_name) {
+        let advertised: Vec<String> = lane.backends.iter().cloned().collect();
+        return Err(anyhow!(
+            "registry lane {lane_id} does not advertise the {backend_name} backend \
+             (advertises: {}) — retry with --backend {}",
+            advertised.join(","),
+            advertised.first().map_or("cpu", String::as_str)
+        ));
+    }
+    let backend = match backend_name {
         "cuda" => BuildBackend::Cuda,
         "cpu" => BuildBackend::Cpu,
         other => return Err(anyhow!("unknown backend {other:?} — supported: cuda, cpu")),
@@ -10114,12 +10149,20 @@ mod tests {
 
     #[test]
     fn unit__routed_engine_lane__mirrors_serving_lane_contract() {
-        use pallama_core::engine_kind::EngineKind;
+        use pallama_core::engine_kind::{EngineKind, LaneClass};
 
         let cfg = pallama_core::Config::default();
         let installed = vec![
-            ("b-new".to_string(), EngineKind::LlamaCpp),
-            ("sg-1".to_string(), EngineKind::Sglang),
+            (
+                "b-new".to_string(),
+                EngineKind::LlamaCpp,
+                LaneClass::Mainstream,
+            ),
+            (
+                "sg-1".to_string(),
+                EngineKind::Sglang,
+                LaneClass::Mainstream,
+            ),
         ];
         let global = ("b-new".to_string(), EngineKind::LlamaCpp);
 

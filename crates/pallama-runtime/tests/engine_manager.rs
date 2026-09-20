@@ -1084,6 +1084,94 @@ async fn integration__retire_sweep_deletes_only_eligible_curated_lanes() {
     }
 }
 
+/// A lane whose directory cannot be reclaimed (here: no write
+/// permission inside it) must not block retirement of its siblings,
+/// and must still lose its row only once the dir is out of the way —
+/// the aside copy is left on disk for a human (a leak beats a ghost
+/// row: the row is gone, so nothing advertises the stranded dir).
+#[cfg(unix)]
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__retire_sweep_continues_past_undeletable_lane_dir() {
+    use std::os::unix::fs::PermissionsExt as _;
+    // DAC permissions do not stop root — the poison would silently
+    // succeed and the assertions below would be vacuous.
+    let uid = std::process::Command::new("id").arg("-u").output().unwrap();
+    if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
+        return;
+    }
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    let store = Store::open(&dirs).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .cast_signed();
+    let old = now - 10 * 86_400; // 10 days stale, 7-day grace
+
+    let poisoned = "fork-curated_llama.cpp-11111111-cpu";
+    stage_lane(
+        &store,
+        &dirs,
+        poisoned,
+        1000,
+        TrustTier::Curated,
+        &["x-arch"],
+        Some(old),
+    );
+    let sibling = "fork-curated_llama.cpp-55555555-cpu";
+    stage_lane(
+        &store,
+        &dirs,
+        sibling,
+        1001,
+        TrustTier::Curated,
+        &["x-arch"],
+        Some(old),
+    );
+
+    // The poison: the lane's contents cannot be unlinked (rename aside
+    // still works — it only needs write on the engines dir).
+    let poisoned_dir = dirs.engines_dir().join(poisoned);
+    let mut perms = std::fs::metadata(&poisoned_dir).unwrap().permissions();
+    perms.set_mode(0o500);
+    std::fs::set_permissions(&poisoned_dir, perms).unwrap();
+
+    mgr.refresh_supersede_state(7, &Vec::new()).await.unwrap();
+
+    // The sibling is fully retired despite its poisoned neighbor.
+    let tags: Vec<String> = store
+        .list_engines()
+        .unwrap()
+        .into_iter()
+        .map(|e| e.tag)
+        .collect();
+    assert!(!tags.contains(&sibling.to_string()), "sibling retired");
+    assert!(
+        !dirs.engines_dir().join(sibling).exists(),
+        "sibling dir reclaimed"
+    );
+    // The poisoned lane: row retired, dir leaked as exactly one aside.
+    assert!(
+        !tags.contains(&poisoned.to_string()),
+        "poisoned lane row retired"
+    );
+    let leaked: Vec<_> = std::fs::read_dir(dirs.engines_dir())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".retired-"))
+        .collect();
+    assert_eq!(leaked.len(), 1, "poisoned dir leaked as exactly one aside");
+    // Re-enable deletion so the tempdir cleanup can reclaim everything.
+    for aside in leaked {
+        let mut p = std::fs::metadata(aside.path()).unwrap().permissions();
+        p.set_mode(0o700);
+        std::fs::set_permissions(aside.path(), p).unwrap();
+    }
+}
+
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn integration__register_local_engine() {

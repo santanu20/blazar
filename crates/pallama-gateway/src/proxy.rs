@@ -1048,8 +1048,13 @@ pub(crate) fn resolve_serving(
     state
         .with_store(|s| {
             let rows = s.list_engines().unwrap_or_default();
-            let installed: Vec<(String, EngineKind)> =
-                rows.iter().map(|r| (r.tag.clone(), r.kind)).collect();
+            // Lane class carries fork provenance (core `serving_lane`
+            // prefers mainstream builds for overlapping formats).
+            #[allow(clippy::type_complexity)]
+            let installed: Vec<(String, EngineKind, engine_kind::LaneClass)> = rows
+                .iter()
+                .map(|r| (r.tag.clone(), r.kind, r.lane_class()))
+                .collect();
             let global_row = s.active_engine().ok().flatten();
             let global = global_row.as_ref().map_or(EngineKind::LlamaCpp, |r| r.kind);
             let lane = engine_kind::serving_lane(

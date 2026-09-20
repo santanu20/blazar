@@ -51,8 +51,10 @@ pub enum Vendor {
 
 /// Where an installed engine's code came from. `Fork` marks a
 /// capability lane built from an unmerged llama.cpp fork at a pinned
-/// commit (see `engine build --fork`); routing logic never branches on
-/// this — it only colors provenance display and retention policy.
+/// commit (see `engine build --fork`); routing treats forks as
+/// capability shims (they lose same-kind ties to mainstream builds,
+/// see `LaneClass`), and this field also colors provenance display and
+/// retention policy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EngineSource {

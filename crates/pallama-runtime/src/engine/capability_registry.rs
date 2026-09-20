@@ -73,25 +73,67 @@ pub const DEFAULT_REGISTRY_URL: &str =
 /// at a local fixture server).
 pub const REGISTRY_URL_ENV: &str = "PALLAMA_CAPABILITY_REGISTRY";
 
+/// Registry documents are a few KB of JSON; anything past this cap is a
+/// misconfigured or hostile mirror, not a catalog.
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Shared pooled client for registry access (the per-request timeout in
+/// [`fetch`] stays the bounding clock).
+#[must_use]
+pub fn http() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .expect("build capability registry client")
+    })
+}
+
 /// Bounded fetch of the registry file. Every entry is validated
 /// (non-empty id, repo slug shape, 4..=40-hex SHA); invalid entries are
 /// dropped with a warning — one bad row must not hide the good ones.
 pub async fn fetch(client: &reqwest::Client, url: &str) -> Result<Vec<RegistryLane>> {
-    let resp = client
+    let mut resp = client
         .get(url)
         .timeout(Duration::from_secs(5))
         .send()
         .await
         .with_context(|| format!("capability registry fetch failed: {url}"))?;
-    let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .context("capability registry: read response body")?;
-    if !status.is_success() {
-        anyhow::bail!("capability registry {url} answered HTTP {status}");
+    if !resp.status().is_success() {
+        anyhow::bail!("capability registry {url} answered HTTP {}", resp.status());
     }
+    let body = read_body_bounded(&mut resp, url, MAX_BODY_BYTES).await?;
     parse_registry(&body)
+}
+
+/// Read a response body capped at `cap` bytes: the registry URL is
+/// user-configurable input, so a hostile mirror must not be able to
+/// buffer unbounded memory behind the fetch timeout.
+async fn read_body_bounded(resp: &mut reqwest::Response, url: &str, cap: usize) -> Result<String> {
+    if let Some(len) = resp.content_length() {
+        if len > cap as u64 {
+            anyhow::bail!(
+                "capability registry {url} declares {len} bytes — over the {cap}-byte cap; \
+                 point capability_registry_url at a sane mirror"
+            );
+        }
+    }
+    let mut body = Vec::with_capacity(4096);
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .with_context(|| format!("capability registry {url}: read response body"))?
+    {
+        if body.len() + chunk.len() > cap {
+            anyhow::bail!(
+                "capability registry {url} exceeded the {cap}-byte body cap — refusing to \
+                 buffer a runaway mirror"
+            );
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).context("capability registry: response is not valid UTF-8")
 }
 
 /// Parse + validate a registry document. Public so tests (and curious
@@ -213,6 +255,65 @@ mod tests {
     fn unit__parse_registry__non_array_is_error() {
         assert!(parse_registry("{\"not\": \"array\"}").is_err());
         assert!(parse_registry("not json").is_err());
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__fetch__refuses_oversized_registry_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // 2 MiB of body against the 1 MiB cap: a hostile mirror must not
+        // be buffered whole behind the fetch timeout.
+        Mock::given(method("GET"))
+            .and(path("/reg.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 2 * MAX_BODY_BYTES]))
+            .mount(&server)
+            .await;
+        let url = format!("{}/reg.json", server.uri());
+        let err = fetch(http(), &url).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cap"), "unexpected error: {msg}");
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__fetch__parses_small_catalog_end_to_end() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/reg.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(active_lane_json()))
+            .mount(&server)
+            .await;
+        let url = format!("{}/reg.json", server.uri());
+        let lanes = fetch(http(), &url).await.unwrap();
+        let ids: Vec<_> = lanes.iter().map(|l| l.id.as_str()).collect();
+        assert_eq!(ids, vec!["qwen35-fork", "old-qwen35"]);
+    }
+
+    /// The shipped default registry document must parse clean through
+    /// the same validator the daemon uses — a malformed shipped file
+    /// would 404-and-fail-open silently otherwise. Reads the file from
+    /// the repo root relative to this crate, so it never depends on a
+    /// machine-specific path.
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__fetch__shipped_default_registry_parses() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../registry/capability-lanes.json"
+        );
+        let body = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let lanes = parse_registry(&body).expect("shipped registry parses");
+        assert!(
+            lanes.iter().any(|l| l.id == "instella-moe"),
+            "shipped registry carries the validated instella-moe lane"
+        );
+        for lane in &lanes {
+            assert_eq!(lane.status, LaneStatus::Active, "lane {} active", lane.id);
+        }
     }
 
     #[test]

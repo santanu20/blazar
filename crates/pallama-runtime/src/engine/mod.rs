@@ -1874,11 +1874,33 @@ impl EngineManager {
             } else {
                 0
             };
-            if dir.exists() {
-                std::fs::remove_dir_all(&dir)
-                    .with_context(|| format!("retire engine dir {}", dir.display()))?;
+            // Retire-to-aside, then row-delete, then discard — the row
+            // only disappears once the directory is safely out of the
+            // way, and any failure restores the previous state (no
+            // ghost row over a deleted dir). A lane that cannot be
+            // retired (locked dir, busy store) warns and frees the rest
+            // of the pass: one poisoned lane must not block retirement
+            // of its siblings on every sweep.
+            let aside = match retire_engine_dir(&dir) {
+                Ok(aside) => aside,
+                Err(e) => {
+                    tracing::warn!(
+                        "cannot retire curated fork lane {} dir {} ({e:#}) — skipped this pass",
+                        row.tag,
+                        dir.display()
+                    );
+                    continue;
+                }
+            };
+            if let Err(e) = store.delete_engine(&row.tag) {
+                restore_retired_engine(aside.as_deref(), &dir);
+                tracing::warn!(
+                    "cannot delete curated fork lane {} row ({e:#}) — skipped this pass",
+                    row.tag
+                );
+                continue;
             }
-            store.delete_engine(&row.tag)?;
+            discard_retired_engine(aside.as_deref());
             tracing::warn!(
                 "retired curated fork lane {} ({} bytes) — rebuild any time via the registry",
                 row.tag,

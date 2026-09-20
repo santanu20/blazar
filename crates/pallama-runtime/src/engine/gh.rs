@@ -353,6 +353,12 @@ impl GhClient {
         let resp = self
             .http
             .get(&url)
+            // A raw llama-arch.cpp is a few hundred KB — the client-wide
+            // release-asset timeouts (30s connect / 2min read) would let a
+            // blackholed route stall daemon startup; this lane only feeds
+            // best-effort architecture mining, so cap it tightly and let
+            // the next restart retry.
+            .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
             .with_context(|| format!("fetch {url} failed"))?;
