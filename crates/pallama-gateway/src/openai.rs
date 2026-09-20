@@ -27,6 +27,15 @@ use axum::Extension;
 
 /// GET /v1/models — synthesized from the local store (any pulled model is
 /// servable; the engine is hot-swapped underneath).
+/// Admission classification from the RAW request bytes: tool-bearing
+/// bodies carry a `"tools"` member. A substring scan (no re-parse of an
+/// already-validated body — the hot path parsed it once inside the
+/// preflight block); a prompt that merely MENTIONS `"tools"` only
+/// tightens its own admission class, never correctness.
+fn body_has_tools(bytes: &[u8]) -> bool {
+    bytes.windows(7).any(|w| w == b"\"tools\"")
+}
+
 pub async fn models(State(state): State<Arc<AppState>>) -> Response {
     let list = match state.with_store(pallama_core::Store::list_models) {
         Some(Ok(l)) => l,
@@ -105,6 +114,7 @@ pub async fn embeddings(
         &state,
         &model,
         crate::queue::Priority::Normal,
+        crate::queue::WorkClass::Interactive,
         None,
         false, // embeddings: text-only
     )
@@ -368,6 +378,7 @@ pub async fn openai_proxy(
         &state,
         &model,
         priority,
+        crate::queue::classify_work(body_has_tools(&body), false),
         prefix,
         parsed_body
             .as_ref()
@@ -414,6 +425,7 @@ pub async fn openai_proxy(
         &state,
         &model_name,
         priority,
+        crate::queue::classify_work(body_has_tools(&body), false),
         deadline_ms,
         body.len(),
         wfq_of(key_ext.as_ref()),
@@ -618,11 +630,12 @@ pub async fn scoped_proxy(
             .get("x-pallama-priority")
             .and_then(|v| v.to_str().ok()),
     );
-    let (engine, load_ms) = match ensure_with_admission(&state, &model, priority, None, false).await
-    {
-        Ok(ok) => ok,
-        Err(resp) => return *resp,
-    };
+    let class = crate::queue::classify_work(body_has_tools(&body), false);
+    let (engine, load_ms) =
+        match ensure_with_admission(&state, &model, priority, class, None, false).await {
+            Ok(ok) => ok,
+            Err(resp) => return *resp,
+        };
     let model_name = engine.name.clone();
     let deadline_ms = headers
         .get("x-pallama-deadline-ms")
@@ -632,6 +645,7 @@ pub async fn scoped_proxy(
         &state,
         &model_name,
         priority,
+        crate::queue::classify_work(body_has_tools(&body), false),
         deadline_ms,
         body.len(),
         wfq_of(key_ext.as_ref()),
@@ -772,6 +786,7 @@ pub async fn responses_api(
         &state,
         &model,
         priority,
+        crate::queue::classify_work(body_has_tools(&body), false),
         affinity_hash_bytes(&body),
         serde_json::from_slice::<serde_json::Value>(&body)
             .is_ok_and(|b| crate::proxy::body_needs_vision(&b, false)),
@@ -786,6 +801,7 @@ pub async fn responses_api(
         &state,
         &model_name,
         priority,
+        crate::queue::classify_work(body_has_tools(&body), false),
         None,
         0,
         wfq_of(key_ext.as_ref()),
@@ -1014,17 +1030,34 @@ pub async fn lora_adapters(
     let Some(m) = adapters_target(&live, store_first.as_deref()) else {
         return openai_error(404, "no models pulled; adapters apply to a running engine");
     };
-    let (engine, load_ms) =
-        match ensure_with_admission(&state, m, Priority::Normal, None, false).await {
-            Ok(ok) => ok,
-            Err(resp) => return *resp,
-        };
+    let (engine, load_ms) = match ensure_with_admission(
+        &state,
+        m,
+        Priority::Normal,
+        crate::queue::WorkClass::Interactive,
+        None,
+        false,
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(resp) => return *resp,
+    };
     let url = format!(
         "/lora-adapters{}",
         path_and_query(&uri).trim_start_matches("/v1/adapters")
     );
     let name = engine.name.clone();
-    let guard = admission_gate_slo(&state, &name, Priority::Normal, None, 0, None).await;
+    let guard = admission_gate_slo(
+        &state,
+        &name,
+        Priority::Normal,
+        crate::queue::WorkClass::Interactive,
+        None,
+        0,
+        None,
+    )
+    .await;
     match guard {
         Ok(g) => {
             proxy_request(

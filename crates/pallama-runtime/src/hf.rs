@@ -1010,10 +1010,25 @@ impl HfClient {
     /// Hub model search across every weight format (complaint #15:
     /// discovery beyond a registry; any community quant is findable).
     /// `format` picks the lane — see [`search_path`].
+    ///
+    /// With a query, the Hub's `sort=downloads` order is re-ranked for
+    /// relevance (`relevance_rank`): the 30-day download count is
+    /// bot-farmable (live: a derivative finetune sat at the exact same
+    /// 1.5M as the official mirror), so downloads only ever breaks ties.
+    /// Empty queries keep the Hub order verbatim (browse-most-popular
+    /// has no relevance signal to add).
     pub async fn search(&self, query: &str, format: &str, limit: u32) -> Result<Vec<SearchEntry>> {
+        let rerank = !query.trim().is_empty();
+        let fetch = if rerank {
+            // Overfetch so the local re-rank has candidates beyond the
+            // download-sorted head; cap at the Hub's 100/page anyway.
+            limit.saturating_mul(4).min(100).max(limit)
+        } else {
+            limit
+        };
         let url = self
             .api_base
-            .join(&search_path(query, format, limit))
+            .join(&search_path(query, format, fetch))
             .map_err(|e| anyhow!("bad search URL: {e}"))?;
         let resp = self
             .http
@@ -1024,8 +1039,102 @@ impl HfClient {
         if !resp.status().is_success() {
             return Err(anyhow!("HF search returned {}", resp.status()));
         }
-        resp.json().await.context("decode search results")
+        let entries: Vec<SearchEntry> = resp.json().await.context("decode search results")?;
+        Ok(if rerank {
+            let mut ranked = relevance_rank(&entries, query);
+            ranked.truncate(limit as usize);
+            ranked
+        } else {
+            entries
+        })
     }
+}
+
+/// Re-rank Hub search results by name relevance to the query.
+///
+/// Ordering is lexicographic over: (1) query-token coverage desc — a
+/// token matches when some repo-name segment contains it; (2) unmatched
+/// name-segment count ASC — derivative finetunes carry long advertising
+/// tails (`-The-Defiant-Fable-Uncensored-Heretic-NEO`) that clean
+/// mirrors (`Qwen3.5-9B-GGUF`) never have; (3) likes desc — the
+/// community-curated signal, far costlier to farm than downloads;
+/// (4) downloads desc — tiebreak only. Name evidence only: no owner
+/// lists, no heuristics about who "should" win.
+#[must_use]
+pub fn relevance_rank(entries: &[SearchEntry], query: &str) -> Vec<SearchEntry> {
+    let tokens: Vec<String> = query
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    if tokens.is_empty() {
+        // No tokens, no relevance signal: keep the caller's (Hub) order.
+        return entries.to_vec();
+    }
+    let mut scored: Vec<RankKey> = Vec::with_capacity(entries.len());
+    for (idx, e) in entries.iter().enumerate() {
+        let (coverage, unmatched) = name_match_stats(&e.id, &tokens);
+        scored.push((
+            std::cmp::Reverse(coverage),
+            unmatched,
+            std::cmp::Reverse(e.likes.unwrap_or(0)),
+            std::cmp::Reverse(e.downloads.unwrap_or(0)),
+            idx,
+            e.clone(),
+        ));
+    }
+    scored.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.cmp(&b.1))
+            .then(a.2.cmp(&b.2))
+            .then(a.3.cmp(&b.3))
+            .then(a.4.cmp(&b.4))
+    });
+    scored.into_iter().map(|(_, _, _, _, _, e)| e).collect()
+}
+
+/// Re-rank sort key: coverage desc, unmatched asc, likes desc, downloads
+/// desc, input index (determinism on identical keys).
+type RankKey = (
+    std::cmp::Reverse<u32>,
+    u32,
+    std::cmp::Reverse<u64>,
+    std::cmp::Reverse<u64>,
+    usize,
+    SearchEntry,
+);
+
+/// (query tokens matched by some name segment, name segments no token
+/// matched). The org prefix (`owner/`) is excluded from the penalty
+/// count — every repo has one and it is never a query target.
+fn name_match_stats(repo_id: &str, tokens: &[String]) -> (u32, u32) {
+    let lower = repo_id.to_ascii_lowercase();
+    let segments: Vec<&str> = lower
+        .split(['/', '-', '_', '.'])
+        .filter(|s| !s.is_empty())
+        .collect();
+    let name = lower.split_once('/').map_or(lower.as_str(), |(_, n)| n);
+    let name_segments: Vec<&str> = segments
+        .iter()
+        .copied()
+        .filter(|s| name.contains(s))
+        .collect();
+    let coverage = u32::try_from(
+        tokens
+            .iter()
+            .filter(|t| segments.iter().any(|s| s.contains(t.as_str())))
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    let unmatched = u32::try_from(
+        name_segments
+            .iter()
+            .filter(|s| !tokens.iter().any(|t| s.contains(t.as_str())))
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    (coverage, unmatched)
 }
 
 /// Build the `api/models` query for [`HfClient::search`]. `format` is a
@@ -2198,6 +2307,89 @@ mod tests {
         let p = search_path("mini cpm+", "a&b=c", 5);
         assert!(p.contains("search=mini%20cpm%2B"), "{p}");
         assert!(p.contains("filter=a%26b%3Dc"), "{p}");
+    }
+
+    /// Minimal `SearchEntry` — only the re-rank inputs matter.
+    fn se(id: &str, downloads: u64, likes: u64) -> SearchEntry {
+        SearchEntry {
+            id: id.to_string(),
+            downloads: Some(downloads),
+            likes: Some(likes),
+            siblings: Vec::new(),
+            gguf: None,
+            safetensors: None,
+            config: None,
+            tags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn unit__relevance_rank__bot_farmed_derivative_sinks_below_clean_mirrors() {
+        // Live incident, distilled: the derivative sat at the exact same
+        // 1.5M downloads as the official mirror (farmed 30-day count).
+        let entries = vec![
+            se("unsloth/Qwen3.5-9B-GGUF", 1_500_000, 925),
+            se(
+                "DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMAX-GGUF",
+                1_500_000,
+                729,
+            ),
+            se("Jackrong/Qwen3.5-9B-DeepSeek-V4-Flash-GGUF", 411_200, 321),
+        ];
+        let ranked = relevance_rank(&entries, "qwen 3.5 9b gguf");
+        assert_eq!(ranked[0].id, "unsloth/Qwen3.5-9B-GGUF");
+        assert_eq!(ranked[1].id, "Jackrong/Qwen3.5-9B-DeepSeek-V4-Flash-GGUF");
+        assert!(ranked[2].id.starts_with("DavidAU/"), "derivative last");
+    }
+
+    #[test]
+    fn unit__relevance_rank__mtp_variant_outranks_junk_despite_fewer_downloads() {
+        let entries = vec![
+            se(
+                "Jackrong/Qwen3.5-9B-Claude-4.6-Opus-Reasoning-Distilled-v2-GGUF",
+                24_900,
+                395,
+            ),
+            se(
+                "mradermacher/Qwen3.5-text-9B-NSFW-RP-RolePlay-i1-GGUF",
+                29_100,
+                7,
+            ),
+            se("unsloth/Qwen3.5-9B-MTP-GGUF", 70_300, 193),
+        ];
+        let ranked = relevance_rank(&entries, "qwen 3.5 9b gguf");
+        assert_eq!(ranked[0].id, "unsloth/Qwen3.5-9B-MTP-GGUF");
+    }
+
+    #[test]
+    fn unit__relevance_rank__exact_token_coverage_wins_over_likes() {
+        // Full coverage beats partial even when the partial entry is
+        // better liked: the user asked for THIS model, not a sibling.
+        let entries = vec![
+            se("someone/Qwen3.5-14B-GGUF", 900_000, 2_000), // misses "9b"
+            se("other/Qwen3.5-9B-GGUF", 5_000, 10),         // 5/5 tokens
+        ];
+        let ranked = relevance_rank(&entries, "qwen 3.5 9b gguf");
+        assert_eq!(ranked[0].id, "other/Qwen3.5-9B-GGUF");
+    }
+
+    #[test]
+    fn unit__relevance_rank__deterministic_on_identical_keys() {
+        let entries = vec![
+            se("a/Qwen3.5-9B-GGUF", 1_000, 5),
+            se("b/Qwen3.5-9B-GGUF", 1_000, 5),
+        ];
+        let ranked = relevance_rank(&entries, "qwen 3.5 9b gguf");
+        assert_eq!(ranked[0].id, "a/Qwen3.5-9B-GGUF"); // input order kept
+    }
+
+    #[test]
+    fn unit__relevance_rank__empty_query_is_identity() {
+        // Browse mode: search() keeps Hub order, but the fn must also
+        // degrade to input order if ever called without tokens.
+        let entries = vec![se("z/One-GGUF", 1, 1), se("a/Two-GGUF", 2, 2)];
+        let ranked = relevance_rank(&entries, "");
+        assert_eq!(ranked[0].id, "z/One-GGUF"); // all-zero keys keep order
     }
 
     #[test]

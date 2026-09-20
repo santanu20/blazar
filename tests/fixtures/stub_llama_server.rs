@@ -14,6 +14,7 @@
 //!   `STUB_DEVICES`     device lines to print for --list-devices (default: 1 GPU)
 //!   `STUB_BUILD`       build number for --version (default 9999)
 //!   `STUB_DELAY_MS`    extra latency before answering each request (default 0)
+//!   `STUB_HANG_ON`     park chat/completions whose text contains this marker (header-stall pin)
 
 use axum::extract::State;
 use axum::response::IntoResponse;
@@ -367,10 +368,74 @@ fn count_tokens(s: &str) -> i64 {
     }
 }
 
+/// Park forever when `STUB_HANG_ON` matches the request text: the
+/// header-stall pin wedges exactly the marked request mid-traffic while
+/// the supervisor's warm-peg probes (fixed tiny prompts) pass through.
+fn should_hang(text: &str) -> bool {
+    std::env::var("STUB_HANG_ON").is_ok_and(|marker| text.contains(&marker))
+}
+
+/// Marker-relevant request text (messages joined).
+fn request_text(req: &ChatRequest) -> String {
+    req.messages
+        .iter()
+        .map(|m| content_text(&m.content))
+        .collect()
+}
+
+/// Which marker-driven failure mode a request selects, if any.
+enum MarkerMode {
+    HeaderStall,
+    BodyStall,
+}
+
+fn marker_mode(req_text: &str) -> Option<MarkerMode> {
+    if !should_hang(req_text) {
+        return None;
+    }
+    Some(if env_flag("STUB_STALL_BODY") {
+        MarkerMode::BodyStall
+    } else {
+        MarkerMode::HeaderStall
+    })
+}
+
+/// The zero-progress wedge: ONE empty-delta event flushes the child's
+/// response headers while carrying no progress, then nothing — ever
+/// (the live shape: headers + keepalive-class frame, 600 s of silence).
+fn stall_body_response() -> axum::response::Response {
+    use futures::StreamExt as _;
+    let opening = futures::stream::iter(vec![Ok::<axum::body::Bytes, std::io::Error>(
+        axum::body::Bytes::from("data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\n"),
+    )]);
+    let then_silent: std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send>,
+    > = Box::pin(opening.chain(futures::stream::pending()));
+    axum::response::Response::builder()
+        .status(200)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(axum::body::Body::from_stream(then_silent))
+        .unwrap()
+}
+
+/// Response text after the sentinel test knobs (`STUB_EMPTY` /
+/// `STUB_SCHEMA_VIOLATION`) get their say.
+fn stub_knob_text(state: &AppState, messages: &[ChatMessage]) -> String {
+    if env_flag("STUB_EMPTY") {
+        String::new()
+    } else if env_flag("STUB_SCHEMA_VIOLATION") {
+        "not json at all".to_string()
+    } else {
+        reply_text(state, messages)
+    }
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
     axum::Json(req): axum::Json<ChatRequest>,
 ) -> axum::response::Response {
+    let req_text: String = request_text(&req);
     let delay_ms: u64 = std::env::var("STUB_DELAY_MS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -388,13 +453,7 @@ async fn chat_completions(
             .into_response();
     }
     // Sentinel test knobs: shape the response semantics, never the route.
-    let text = if env_flag("STUB_EMPTY") {
-        String::new()
-    } else if env_flag("STUB_SCHEMA_VIOLATION") {
-        "not json at all".to_string()
-    } else {
-        reply_text(&state, &req.messages)
-    };
+    let text = stub_knob_text(&state, &req.messages);
     let finish = std::env::var("STUB_FINISH").unwrap_or_else(|_| "stop".into());
     let prompt_tokens = count_tokens(
         &req.messages
@@ -442,6 +501,16 @@ async fn chat_completions(
         .and_then(|o| o.get("include_usage"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    // Body-stall knob: accept the request, open the SSE body, never
+    // deliver a byte — the zero-byte wedge shape (live evidence: two
+    // 600 s zero-chunk hangs, no tokens, no usage, no detection). The
+    // sentinel stall detector must catch it, evict, and close the
+    // client stream cleanly.
+    match marker_mode(&req_text) {
+        Some(MarkerMode::HeaderStall) => std::future::pending::<()>().await,
+        Some(MarkerMode::BodyStall) => return stall_body_response(),
+        None => {}
+    }
     let chunk_delay_ms: u64 = std::env::var("STUB_DELAY_CHUNK_MS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -564,6 +633,13 @@ async fn completions(
     State(state): State<AppState>,
     axum::Json(req): axum::Json<CompletionRequest>,
 ) -> axum::Json<serde_json::Value> {
+    let req_text = req
+        .prompt
+        .as_str()
+        .map_or_else(|| req.prompt.to_string(), str::to_string);
+    if should_hang(&req_text) {
+        std::future::pending::<()>().await;
+    }
     let prompt = match &req.prompt {
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),

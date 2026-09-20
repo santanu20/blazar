@@ -31,8 +31,80 @@ impl Priority {
     }
 }
 
+/// Semantic workload class riding ALONGSIDE priority: it selects the
+/// admission deadline tier and the reserved-capacity ceiling, never the
+/// EDF/WFQ mechanics below. `Tool` = tool-bearing chat (latency-critical:
+/// the user is waiting on a call round-trip); `RawLong` = raw completion
+/// lane (`ollama_compat` recipe) whose 2048-class generations hold a slot
+/// ~26 s on a single-slot child; `Interactive` = everything else.
+/// Background is deliberately absent: the gateway has no background
+/// traffic lane today (H24 — no dead values).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkClass {
+    Interactive,
+    Tool,
+    RawLong,
+}
+
+/// Admission ceiling for a `RawLong` request on a lane with
+/// `max_inflight` slots: while any Tool/Interactive waiter is parked,
+/// raw work cannot consume the reserved share, `max(1, ceil(N/4))`;
+/// with no protected waiter it borrows the full lane. N = 1 degenerates
+/// to no isolation (a single slot cannot separate classes).
+#[must_use]
+pub fn raw_ceiling(max_inflight: i64, has_non_raw_waiter: bool) -> i64 {
+    if !has_non_raw_waiter {
+        return max_inflight;
+    }
+    let reserved = i64::try_from(interactive_reserved(
+        usize::try_from(max_inflight.max(0)).unwrap_or(usize::MAX),
+    ))
+    .unwrap_or(i64::MAX);
+    max_inflight.saturating_sub(reserved).max(1)
+}
+
+impl WorkClass {
+    /// Ordering rank inside a priority tier: tool work jumps ahead of raw
+    /// long work at equal deadline (the MT4 shape: a 26 s raw generation
+    /// must not park a tool round-trip behind it).
+    #[must_use]
+    fn rank(self) -> u8 {
+        match self {
+            Self::Tool => 0,
+            Self::Interactive => 1,
+            Self::RawLong => 2,
+        }
+    }
+}
+
+/// Pure classification from request shape. `has_tools` = a non-empty
+/// `tools` array on the body; `raw_lane` = the `ollama_compat` recipe was
+/// taken (raw /v1/completions generation). Raw lane wins over tools: a
+/// raw completion is long by construction.
+#[must_use]
+pub fn classify_work(has_tools: bool, raw_lane: bool) -> WorkClass {
+    if raw_lane {
+        WorkClass::RawLong
+    } else if has_tools {
+        WorkClass::Tool
+    } else {
+        WorkClass::Interactive
+    }
+}
+
+/// Reserved-capacity arithmetic: interactive/tool work may always take
+/// the last `ceil(N/4)` slots; raw long work may not (unless it borrows
+/// while no interactive waiter is queued). `max(1, ..)` keeps the
+/// reservation meaningful on tiny shapes; on N = 1 the clamp makes the
+/// reservation degenerate — single-slot children cannot isolate classes
+/// (documented tradeoff, see docs/2.ARCHITECTURE.md admission section).
+#[must_use]
+pub fn interactive_reserved(slots: usize) -> usize {
+    slots.div_ceil(4).max(1)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct WaitKey(u8, u128, u64);
+struct WaitKey(u8, u8, u128, u64);
 // (inverted priority rank, deadline nanos, arrival seq): BTreeMap's
 // `next()` pops the SMALLEST key = highest priority, then EARLIEST
 // deadline (EDF within a class — SLO tiers), then earliest arrival (FIFO).
@@ -42,6 +114,7 @@ struct WaitKey(u8, u128, u64);
 struct Waiter {
     #[allow(dead_code)]
     model: String,
+    class: WorkClass,
     /// WFQ bucket: API key name. `None` (unauthenticated waiters) shares
     /// the anonymous `""` bucket with weight 1.
     wfq_name: Option<String>,
@@ -89,6 +162,10 @@ struct QueueInner {
 /// `x-pallama-deadline-ms` overrides; prefill-heavy bodies (large
 /// prompts) drop one class so interactive shorts jump ahead of a
 /// multi-thousand-token prefill hogging the next slot.
+/// Tool-class admission budget: a tool round-trip waits at most this
+/// long before its SLO is burned (tighter than NORMAL because the caller
+/// is mid-workflow; looser than HIGH which stays explicit-priority).
+const SLO_TOOL_SECS: u64 = 10;
 const SLO_HIGH_SECS: u64 = 2;
 const SLO_NORMAL_SECS: u64 = 30;
 const SLO_LOW_SECS: u64 = 120;
@@ -117,6 +194,9 @@ impl PriorityQueue {
         Self::default()
     }
 
+    // Seven parameters is the honest shape of one admission decision;
+    // bundling them (AdmissionKey) is the queued roadmap refinement.
+    #[allow(clippy::too_many_arguments)]
     /// Wait for admission at `priority`, at most `timeout`. Returns Err on
     /// timeout (maps to 503) or when the queue shuts down. `deadline_ms`
     /// (from `x-pallama-deadline-ms`) or class defaults order waiters
@@ -128,6 +208,7 @@ impl PriorityQueue {
         &self,
         model: &str,
         priority: Priority,
+        class: WorkClass,
         deadline_ms: Option<u64>,
         body_len: usize,
         timeout: Duration,
@@ -142,6 +223,15 @@ impl PriorityQueue {
                 Priority::High => (0u8, SLO_HIGH_SECS),
                 Priority::Normal => (1u8, SLO_NORMAL_SECS),
                 Priority::Low => (2u8, SLO_LOW_SECS),
+            };
+            // Class-aware urgency (explicit deadline stays sovereign
+            // below): tool work tightens to the tool budget, raw long
+            // work relaxes to the LOW floor — its class is structurally
+            // patient. Applies before prefill demotion.
+            let class_secs = match class {
+                WorkClass::Tool => class_secs.min(SLO_TOOL_SECS),
+                WorkClass::Interactive => class_secs,
+                WorkClass::RawLong => class_secs.max(SLO_LOW_SECS),
             };
             // Prefill-heavy: demote the deadline class one tier (the
             // request KEEPS its priority for ordering vs other classes —
@@ -164,12 +254,13 @@ impl PriorityQueue {
             // Deadline as nanos-from-epoch: later deadline = larger key =
             // admitted later among same-priority waiters (EDF).
             let deadline_key = deadline.saturating_duration_since(self.epoch).as_nanos();
-            let key = WaitKey(rank, deadline_key, q.seq);
+            let key = WaitKey(rank, class.rank(), deadline_key, q.seq);
             q.waiters.insert(key, tx);
             q.meta.insert(
                 key,
                 Waiter {
                     model: model.to_string(),
+                    class,
                     wfq_name: wfq.map(|(name, _)| name.to_string()),
                     weight: wfq.map_or(1, |(_, w)| w.max(1)),
                     tier_secs,
@@ -224,7 +315,7 @@ impl PriorityQueue {
                     let same_rank = q.waiters.iter().take_while(|(k, _)| k.0 == head_key.0);
                     let barrier = same_rank
                         .filter(|(k, _)| q.meta.get(*k).is_some_and(|m| m.tier_secs.is_none()))
-                        .map(|(k, _)| k.1)
+                        .map(|(k, _)| k.2)
                         .min()
                         .unwrap_or(u128::MAX);
                     // WFQ candidates: same rank + same tier + class-tier
@@ -234,7 +325,7 @@ impl PriorityQueue {
                     // the race (steady state = weight-proportional).
                     let mut best: Option<(f64, u64, WaitKey)> = None;
                     for (k, _) in q.waiters.iter().take_while(|(k, _)| k.0 == head_key.0) {
-                        if k.1 > barrier {
+                        if k.2 > barrier {
                             break; // deadline-sorted: nothing legal beyond.
                         }
                         let Some(m) = q.meta.get(k) else {
@@ -245,9 +336,9 @@ impl PriorityQueue {
                         }
                         let bucket = m.wfq_name.clone().unwrap_or_default();
                         let credit = q.credits.get(&bucket).copied().unwrap_or(0.0);
-                        let better = best.is_none_or(|(br, bseq, _)| (credit, k.2) < (br, bseq));
+                        let better = best.is_none_or(|(br, bseq, _)| (credit, k.3) < (br, bseq));
                         if better {
-                            best = Some((credit, k.2, *k));
+                            best = Some((credit, k.3, *k));
                         }
                     }
                     match best {
@@ -282,7 +373,7 @@ impl PriorityQueue {
             let now_ns: u128 = std::time::Instant::now()
                 .saturating_duration_since(self.epoch)
                 .as_nanos();
-            if now_ns > key.1 {
+            if now_ns > key.2 {
                 self.deadline_exceeded
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -296,6 +387,16 @@ impl PriorityQueue {
     pub fn slo_deadline_exceeded(&self) -> u64 {
         self.deadline_exceeded
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Borrowing check for reserved capacity: is any Tool/Interactive
+    /// waiter parked for this model right now? While one is, `RawLong`
+    /// admission is capped below the reserved slots.
+    pub fn has_non_raw_waiter(&self, model: &str) -> bool {
+        let q = self.inner.lock().expect("queue lock");
+        q.meta
+            .values()
+            .any(|w| w.model == model && w.class != WorkClass::RawLong)
     }
 
     pub fn depth(&self) -> usize {
@@ -317,13 +418,14 @@ mod tests {
         let _rx = {
             let mut inner = q.inner.lock().expect("queue lock");
             inner.seq += 1;
-            let key = WaitKey(0, 0u128, inner.seq);
+            let key = WaitKey(0, 1, 0u128, inner.seq);
             let (tx, rx) = oneshot::channel();
             inner.waiters.insert(key, tx);
             inner.meta.insert(
                 key,
                 Waiter {
                     model: "m".to_string(),
+                    class: WorkClass::Interactive,
                     wfq_name: None,
                     weight: 1,
                     tier_secs: None,
@@ -343,13 +445,14 @@ mod tests {
         {
             let mut inner = q.inner.lock().expect("queue lock");
             inner.seq += 1;
-            let key = WaitKey(0, key_deadline_far_future, inner.seq);
+            let key = WaitKey(0, 1, key_deadline_far_future, inner.seq);
             let (tx, _rx) = oneshot::channel();
             inner.waiters.insert(key, tx);
             inner.meta.insert(
                 key,
                 Waiter {
                     model: "m".to_string(),
+                    class: WorkClass::Interactive,
                     wfq_name: None,
                     weight: 1,
                     tier_secs: Some(SLO_NORMAL_SECS),
@@ -366,15 +469,31 @@ mod tests {
         let a = tokio::spawn({
             let q = q.clone();
             async move {
-                q.wait("m", Priority::Low, None, 0, Duration::from_secs(5), None)
-                    .await
+                q.wait(
+                    "m",
+                    Priority::Low,
+                    WorkClass::Interactive,
+                    None,
+                    0,
+                    Duration::from_secs(5),
+                    None,
+                )
+                .await
             }
         });
         let b = tokio::spawn({
             let q = q.clone();
             async move {
-                q.wait("m", Priority::High, None, 0, Duration::from_secs(5), None)
-                    .await
+                q.wait(
+                    "m",
+                    Priority::High,
+                    WorkClass::Interactive,
+                    None,
+                    0,
+                    Duration::from_secs(5),
+                    None,
+                )
+                .await
             }
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -404,6 +523,7 @@ mod tests {
                 q.wait(
                     "m",
                     Priority::Normal,
+                    WorkClass::Interactive,
                     None,
                     PREFILL_HEAVY_BYTES + 1,
                     Duration::from_secs(5),
@@ -418,6 +538,7 @@ mod tests {
                 q.wait(
                     "m",
                     Priority::Normal,
+                    WorkClass::Interactive,
                     None,
                     64,
                     Duration::from_secs(5),
@@ -442,6 +563,7 @@ mod tests {
                 q.wait(
                     "m",
                     Priority::Normal,
+                    WorkClass::Interactive,
                     Some(50),
                     0,
                     Duration::from_secs(5),
@@ -465,6 +587,7 @@ mod tests {
             .wait(
                 "m",
                 Priority::Normal,
+                WorkClass::Interactive,
                 None,
                 0,
                 Duration::from_millis(200),
@@ -492,6 +615,7 @@ mod tests {
                     .wait(
                         "m",
                         Priority::Normal,
+                        WorkClass::Interactive,
                         None,
                         0,
                         Duration::from_secs(10),
@@ -508,6 +632,7 @@ mod tests {
                     .wait(
                         "m",
                         Priority::Normal,
+                        WorkClass::Interactive,
                         None,
                         0,
                         Duration::from_secs(10),
@@ -562,6 +687,7 @@ mod tests {
                     .wait(
                         "m",
                         Priority::Normal,
+                        WorkClass::Interactive,
                         Some(60_000),
                         0,
                         Duration::from_secs(10),
@@ -584,6 +710,7 @@ mod tests {
                     .wait(
                         "m",
                         Priority::Normal,
+                        WorkClass::Interactive,
                         None,
                         0,
                         Duration::from_secs(10),
@@ -600,6 +727,7 @@ mod tests {
                     .wait(
                         "m",
                         Priority::Normal,
+                        WorkClass::Interactive,
                         Some(31_000),
                         0,
                         Duration::from_secs(10),
@@ -616,6 +744,7 @@ mod tests {
                     .wait(
                         "m",
                         Priority::Normal,
+                        WorkClass::Interactive,
                         None,
                         0,
                         Duration::from_secs(10),
@@ -659,6 +788,7 @@ mod tests {
                     .wait(
                         &format!("m{i}"),
                         Priority::Normal,
+                        WorkClass::Interactive,
                         None,
                         0,
                         Duration::from_secs(10),
@@ -684,5 +814,52 @@ mod tests {
         for h in handles {
             let _ = h.await;
         }
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__interactive_reserved__arithmetic_table() {
+        // max(1, ceil(N/4)): the reservation floor keeps one protected
+        // slot even where quartering rounds to zero.
+        assert_eq!(interactive_reserved(1), 1);
+        assert_eq!(interactive_reserved(2), 1);
+        assert_eq!(interactive_reserved(4), 1);
+        assert_eq!(interactive_reserved(5), 2);
+        assert_eq!(interactive_reserved(8), 2);
+        assert_eq!(interactive_reserved(16), 4);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__workclass__tool_outranks_raw_long_at_equal_deadline() {
+        // Class rank sits before the deadline key: a Tool waiter jumps
+        // an equal-deadline RawLong waiter in the admission order.
+        let tool = WaitKey(0, WorkClass::Tool.rank(), 100, 1);
+        let raw = WaitKey(0, WorkClass::RawLong.rank(), 100, 2);
+        assert!(tool < raw);
+        // Interactive sits between: tools first, raw last.
+        let inter = WaitKey(0, WorkClass::Interactive.rank(), 100, 3);
+        assert!(tool < inter && inter < raw);
+        // Explicit deadlines still dominate class at the tier boundary:
+        // an earlier RawLong deadline beats a later Tool one only when
+        // priorities differ — same priority, earlier deadline, raw still
+        // second (class first). Documented tradeoff, pinned.
+        let raw_early = WaitKey(0, WorkClass::RawLong.rank(), 50, 4);
+        assert!(tool < raw_early);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__raw_ceiling__reservation_and_borrow_table() {
+        // Borrow when idle: raw sees the full lane.
+        assert_eq!(raw_ceiling(4, false), 4);
+        assert_eq!(raw_ceiling(1, false), 1);
+        // Protected waiter parked: raw cannot consume the reserved
+        // quarter (min 1 raw slot stays admissible — starvation-free).
+        assert_eq!(raw_ceiling(4, true), 3);
+        assert_eq!(raw_ceiling(8, true), 6);
+        assert_eq!(raw_ceiling(2, true), 1);
+        // N = 1 degenerates to no isolation (documented tradeoff).
+        assert_eq!(raw_ceiling(1, true), 1);
     }
 }

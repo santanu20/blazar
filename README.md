@@ -43,7 +43,7 @@ In practice: **3x more concurrent streams from the GPU you already own**, agent 
 
 *Test bed:* i7-14650HX · RTX 4070 Laptop 8 GiB · Linux · pallama 0.5.0 gateway over llama.cpp b10903-cuda. Ratios travel across hardware; absolute numbers shift.
 
-*Honesty clause:* cold-load first token is slower (11.6 s vs 6.6 s) — pallama defaults to a 16384 context where ollama silently truncates at 2048. Set `ctx` lower and get ollama's load time back; you can't buy ollama's missing 14 Ki of context at any price.
+*Honesty clause:* the table above is the 0.5.0-era campaign, kept for provenance. On the current build (0.9.0, weights-matched Qwen3.5-9B Q4_K_M vs ollama 0.34.0, same box) cold load is **4.7 s vs 6.3 s** — pallama now wins cold outright while still defaulting to a 16384 context where ollama silently truncates; you can't buy ollama's missing context at any price.
 
 Reproduce it yourself:
 
@@ -204,7 +204,7 @@ The advanced surface, grouped by job. `--json`/JSONL output on the inspection co
 | `pallama quantize -t Q4_K_M [--imatrix calib.txt]` | New quants locally via the engine's own llama-quantize; imatrix calibration for better Q4 accuracy |
 | `pallama create` | Parameter aliases from a Modelfile (`FROM` + `PARAMETER`) — zero-copy, no blob duplication |
 | `pallama lora` / `pallama mmproj` | LoRA adapter management (`model+adapter` spawns a variant); vision projectors for any model |
-| `pallama search --format <tag>` | Search Hugging Face across every weight format |
+| `pallama search --format <tag>` | Search Hugging Face across every weight format — ranked by query-token coverage and name cleanliness (clean mirrors above derivative finetunes; likes/downloads only break ties) |
 | `pallama fit [--json]` | VRAM fit + quant alternatives *before* downloading |
 | `pallama coreside` | Which local models co-reside in VRAM (weights + f16 KV at each model's ctx) |
 
@@ -270,8 +270,8 @@ Registry wire detail (Docker-v2 manifests, 307 → presigned-CDN with allowliste
 
 Two of those resolutions deserve detail:
 
-- **Unified-KV `num_ctx` pins** are budget-validated *before* any spawn; a truly unhostable pin is one teaching 400 naming all four levers — lower `num_ctx` · smaller quant via `pallama fit` · `cache_type = "q8_0"` · `kv_unified = false`.
-- **sentinel checks** (surfaced via the `x-pallama-warnings` header): `finish_reason: length` with fix hints · tool-arg JSON, hallucinated-name and parameters-schema validation · `json_schema`/`json_object` conformance · empty-response and reasoning-with-no-answer detection · stalled-stream detection · pre-inference template-capability check.
+- **Unified-KV `num_ctx` pins** are budget-validated *before* any spawn, and the preflight ladders f16 → q8_0 → q4_0 exactly like the spawn compiler — a pin is refused only when no rung fits the card, and that teaching 400 still names all four levers: lower `num_ctx` · smaller quant via `pallama fit` · `cache_type` · `kv_unified = false`. No split brain between what the preflight admits and what the spawn hosts.
+- **sentinel checks** (surfaced via the `x-pallama-warnings` header): `finish_reason: length` with fix hints · tool-arg JSON, hallucinated-name and parameters-schema validation · `json_schema`/`json_object` conformance · empty-response and reasoning-with-no-answer detection · stalled-stream detection · pre-inference template-capability check · a header-phase bound (`child_header_timeout_secs`, 120 s default) so a wedged child can never park a request silently — it is evicted, the request retried once in-band, terminal 504.
 
 **Operations & diagnostics**
 

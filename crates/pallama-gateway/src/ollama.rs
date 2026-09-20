@@ -1025,10 +1025,21 @@ pub async fn chat(
         }
     }
 
+    // WorkClass: raw-lane classification follows the LANE the request
+    // will actually take — image requests fall back to the child lane
+    // even under ollama_compat, so they keep their interactive class
+    // (and are exactly the mixed traffic that makes reserved capacity
+    // reachable on a compat model).
+    let class = crate::queue::classify_work(
+        req.get("tools").is_some_and(serde_json::Value::is_array),
+        state.config.effective_prompt_recipe(&model_field) == crate::prompt_recipe::OLLAMA_COMPAT
+            && !crate::prompt_recipe::has_images(&req),
+    );
     let (engine, load_ms) = match ensure_with_admission(
         &state,
         &model_field,
         priority,
+        class,
         affinity_hash(&req),
         crate::proxy::body_needs_vision(&req, true),
     )
@@ -1362,22 +1373,46 @@ pub(crate) async fn apply_num_ctx(
             if let Ok(meta) = pallama_core::read_metadata_file(std::path::Path::new(&row.path)) {
                 let total_vram = state.sup.hardware.total_vram_mib();
                 if total_vram > 0 {
-                    let kv_bytes = scale_kv_by_cache_type(
-                        crate::preflight::kv_f16_mib(
-                            &meta,
-                            u64::try_from(want).unwrap_or(u64::MAX),
-                        ) * 1024
-                            * 1024,
-                        state.config.overlay_for(model).cache_type.as_deref(),
-                    );
-                    if let pallama_core::profile::UnifiedCtxVerdict::Refuse(msg) =
-                        pallama_core::profile::unified_ctx_verdict(
+                    // KV must be judged at the quant the spawn will run.
+                    // An EXPLICIT config/overlay cache_type is sovereign
+                    // (single shot, mirroring the compiler's
+                    // explicit-beats-ladder doctrine); an unpinned one
+                    // LADDERS f16 -> q8_0 -> q4_0 exactly like the
+                    // spawn compiler's kv_quant_ladder, so the preflight
+                    // never refuses a pin the spawn itself would host
+                    // (split-brain observed live: a 65536 vision pin
+                    // refused at f16 math while the spawn laddered to
+                    // q8_0 happily).
+                    let effective = state.config.effective_cache_type(model);
+                    let ladder: Vec<Option<&str>> = if effective.is_empty() {
+                        vec![None, Some("q8_0"), Some("q4_0")]
+                    } else {
+                        vec![Some(effective)]
+                    };
+                    let kv_f16 = crate::preflight::kv_f16_mib(
+                        &meta,
+                        u64::try_from(want).unwrap_or(u64::MAX),
+                    ) * 1024
+                        * 1024;
+                    let mut refuse: Option<String> = None;
+                    for quant in ladder {
+                        let kv_bytes = scale_kv_by_cache_type(kv_f16, quant);
+                        match pallama_core::profile::unified_ctx_verdict(
                             u64::try_from(row.bytes.max(0)).unwrap_or(u64::MAX),
                             kv_bytes,
                             total_vram * 1024 * 1024,
                             u32::try_from(want).unwrap_or(u32::MAX),
-                        )
-                    {
+                        ) {
+                            pallama_core::profile::UnifiedCtxVerdict::Fit => {
+                                refuse = None;
+                                break;
+                            }
+                            pallama_core::profile::UnifiedCtxVerdict::Refuse(msg) => {
+                                refuse = Some(msg);
+                            }
+                        }
+                    }
+                    if let Some(msg) = refuse {
                         return Err(Box::new(api_error(400, &msg)));
                     }
                 }
@@ -1469,7 +1504,37 @@ async fn proxy_core_chat(
     shape: OutputShape,
 ) -> Response {
     let base = child_base(&engine.endpoint);
-    let url = format!("{base}/v1/chat/completions");
+    // Pre-render recipe lane: the gateway owns the prompt (chatml wrap
+    // + JSON tool-call grammar) and drives the child through the raw
+    // completion lane, adapting the response back to chat shape at the
+    // two translation seams below. Image requests always ride the
+    // child's native multimodal template lane.
+    let ollama_compat = {
+        let parsed: Option<serde_json::Value> = serde_json::from_slice(&openai_body).ok();
+        state.config.effective_prompt_recipe(model) == crate::prompt_recipe::OLLAMA_COMPAT
+            && parsed
+                .as_ref()
+                .is_some_and(|v| !crate::prompt_recipe::has_images(v))
+    };
+    let openai_body: Vec<u8> = if ollama_compat {
+        let parsed = serde_json::from_slice::<serde_json::Value>(&openai_body)
+            .unwrap_or(serde_json::Value::Null);
+        let strict = state.config.effective_decode_policy(model) == "strict";
+        serde_json::to_vec(&crate::prompt_recipe::to_completion_request(
+            &parsed,
+            stream,
+            state.config.effective_raw_lane_max_tokens(&engine.name),
+            strict,
+        ))
+        .unwrap_or_default()
+    } else {
+        openai_body
+    };
+    let url = if ollama_compat {
+        format!("{base}/v1/completions")
+    } else {
+        format!("{base}/v1/chat/completions")
+    };
     let req = child_auth(
         state
             .http
@@ -1481,21 +1546,24 @@ async fn proxy_core_chat(
         // We translate the non-stream response into ollama shape.
         let t0 = std::time::Instant::now();
         let ttft_secs;
-        let resp = match req.body(openai_body.clone()).send().await {
-            Ok(r) => {
-                let s = t0.elapsed().as_secs_f64();
-                state.ttft.observe_secs(s);
-                ttft_secs = Some(s);
-                r
-            }
-            Err(e) => {
-                tracing::warn!(model, "nonstream upstream failed: {e:#}");
-                // Reap now so the NEXT request respawns instead of
-                // 502-looping until the periodic reaper notices (~10s).
-                state.sup.reap_dead_children().await;
-                return api_error(502, &format!("engine request failed: {e:#}"));
-            }
-        };
+        let resp =
+            match crate::proxy::child_send(state, engine, req.body(openai_body.clone()).send())
+                .await
+            {
+                Ok(r) => {
+                    let s = t0.elapsed().as_secs_f64();
+                    state.ttft.observe_secs(s);
+                    ttft_secs = Some(s);
+                    r
+                }
+                Err(e) => {
+                    tracing::warn!(model, "nonstream upstream failed: {e}");
+                    // Reap now so the NEXT request respawns instead of
+                    // 502-looping until the periodic reaper notices (~10s).
+                    state.sup.reap_dead_children().await;
+                    return api_error(e.status_u16(), &format!("engine request failed: {e}"));
+                }
+            };
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
@@ -1504,6 +1572,14 @@ async fn proxy_core_chat(
         let openai: Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => return api_error(502, &format!("bad engine response: {e}")),
+        };
+        // Raw-completion lane: adapt the text completion into the chat
+        // shape before every downstream concern (cache observability,
+        // enforce, translation) — they see a native chat response.
+        let openai = if ollama_compat {
+            crate::prompt_recipe::raw_json_to_chat(&openai)
+        } else {
+            openai
         };
         // Cache observability (R6): classify this completed response
         // warm/cold from its usage object before translation.
@@ -1596,22 +1672,26 @@ async fn proxy_core_chat(
     body_with_usage["stream"] = json!(true);
     body_with_usage["stream_options"] = json!({"include_usage": true});
     let openai_body = serde_json::to_vec(&body_with_usage).unwrap_or_default();
-    let resp = match child_auth(
-        state
-            .http
-            .post(&url)
-            .header("content-type", "application/json"),
+    let resp = match crate::proxy::child_send(
+        state,
         engine,
+        child_auth(
+            state
+                .http
+                .post(&url)
+                .header("content-type", "application/json"),
+            engine,
+        )
+        .body(openai_body.clone())
+        .send(),
     )
-    .body(openai_body.clone())
-    .send()
     .await
     {
         Ok(r) => r,
         Err(e) => {
             // Same crash-recovery contract as the OpenAI proxy path.
             state.sup.reap_dead_children().await;
-            return api_error(502, &format!("engine request failed: {e:#}"));
+            return api_error(e.status_u16(), &format!("engine request failed: {e}"));
         }
     };
     if !resp.status().is_success() {
@@ -1619,7 +1699,19 @@ async fn proxy_core_chat(
         let text = resp.text().await.unwrap_or_default();
         return api_error(status, &text);
     }
-    let upstream = resp.bytes_stream();
+    let upstream: std::pin::Pin<
+        Box<dyn futures::Stream<Item = std::io::Result<axum::body::Bytes>> + Send>,
+    > = if ollama_compat {
+        Box::pin(crate::prompt_recipe::raw_sse_to_chat_sse(
+            resp.bytes_stream()
+                .map(|chunk| chunk.map_err(|e| std::io::Error::other(e.to_string()))),
+        ))
+    } else {
+        Box::pin(
+            resp.bytes_stream()
+                .map(|chunk| chunk.map_err(|e| std::io::Error::other(e.to_string()))),
+        )
+    };
     let model_c = model.to_string();
     let load_hdr = load_ms > 100;
     // Sentinel: same side-channel tap as the OpenAI path — bytes cloned
@@ -1869,14 +1961,31 @@ async fn proxy_core_chat(
                         ));
                     }
                     Some(Err(e)) => {
+                        // Mid-body upstream failure (wedged child evicted
+                        // by the sentinel stall, conn churn, respawn
+                        // race): once headers are committed the only
+                        // legal close is a clean one. Surface the
+                        // truncation as a semantic terminal error line,
+                        // then let the done lane finish the stream —
+                        // an Err item here aborts the HTTP body and the
+                        // client eats a RemoteProtocolError instead.
+                        let line = serde_json::json!({
+                            "model": model,
+                            "error": {
+                                "code": "stream_truncated",
+                                "message": e.to_string(),
+                            },
+                        });
                         return Some((
-                            Err(std::io::Error::other(e.to_string())),
+                            Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from(
+                                line.to_string(),
+                            )),
                             (
                                 stream,
                                 buf,
                                 lines,
                                 model,
-                                done,
+                                true, // done: next poll emits the final chunk
                                 usage,
                                 finish,
                                 usage_sent,
@@ -1946,11 +2055,19 @@ pub async fn embeddings(
             state.keys.charge_request(&k.name);
         }
     }
-    let (engine, _) =
-        match ensure_with_admission(&state, &model, Priority::Normal, None, false).await {
-            Ok(ok) => ok,
-            Err(resp) => return *resp,
-        };
+    let (engine, _) = match ensure_with_admission(
+        &state,
+        &model,
+        Priority::Normal,
+        crate::queue::WorkClass::Interactive,
+        None,
+        false,
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(resp) => return *resp,
+    };
     crate::proxy::hold_body(
         crate::proxy::begin_accounting(&state, &engine.name),
         (async {
@@ -1979,13 +2096,17 @@ pub async fn embeddings(
             if crate::proxy::child_model_default(&engine) {
                 crate::proxy::set_child_model_default(&mut openai_req);
             }
-            let resp = match child_auth(state.http.post(&url), &engine)
-                .json(&openai_req)
-                .send()
-                .await
+            let resp = match crate::proxy::child_send(
+                &state,
+                &engine,
+                child_auth(state.http.post(&url), &engine)
+                    .json(&openai_req)
+                    .send(),
+            )
+            .await
             {
                 Ok(r) => r,
-                Err(e) => return api_error(502, &format!("engine request failed: {e:#}")),
+                Err(e) => return api_error(e.status_u16(), &format!("engine request failed: {e}")),
             };
             if !resp.status().is_success() {
                 let status = resp.status().as_u16();
@@ -2048,11 +2169,19 @@ pub async fn embed(
             state.keys.charge_request(&k.name);
         }
     }
-    let (engine, _) =
-        match ensure_with_admission(&state, &model, Priority::Normal, None, false).await {
-            Ok(ok) => ok,
-            Err(resp) => return *resp,
-        };
+    let (engine, _) = match ensure_with_admission(
+        &state,
+        &model,
+        Priority::Normal,
+        crate::queue::WorkClass::Interactive,
+        None,
+        false,
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(resp) => return *resp,
+    };
     crate::proxy::hold_body(
         crate::proxy::begin_accounting(&state, &engine.name),
         (async {
@@ -2092,13 +2221,17 @@ pub async fn embed(
             if crate::proxy::child_model_default(&engine) {
                 crate::proxy::set_child_model_default(&mut openai_req);
             }
-            let resp = match child_auth(state.http.post(&url), &engine)
-                .json(&openai_req)
-                .send()
-                .await
+            let resp = match crate::proxy::child_send(
+                &state,
+                &engine,
+                child_auth(state.http.post(&url), &engine)
+                    .json(&openai_req)
+                    .send(),
+            )
+            .await
             {
                 Ok(r) => r,
-                Err(e) => return api_error(502, &format!("engine request failed: {e:#}")),
+                Err(e) => return api_error(e.status_u16(), &format!("engine request failed: {e}")),
             };
             if !resp.status().is_success() {
                 let status = resp.status().as_u16();
@@ -2180,11 +2313,19 @@ pub async fn rerank(
             state.keys.charge_request(&k.name);
         }
     }
-    let (engine, _) =
-        match ensure_with_admission(&state, &model, Priority::Normal, None, false).await {
-            Ok(ok) => ok,
-            Err(resp) => return *resp,
-        };
+    let (engine, _) = match ensure_with_admission(
+        &state,
+        &model,
+        Priority::Normal,
+        crate::queue::WorkClass::Interactive,
+        None,
+        false,
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(resp) => return *resp,
+    };
     let mut forward = forward;
     crate::proxy::hold_body(
         crate::proxy::begin_accounting(&state, &engine.name),
@@ -2195,13 +2336,17 @@ pub async fn rerank(
             if crate::proxy::child_model_default(&engine) {
                 crate::proxy::set_child_model_default(&mut forward);
             }
-            let resp = match child_auth(state.http.post(&url), &engine)
-                .json(&forward)
-                .send()
-                .await
+            let resp = match crate::proxy::child_send(
+                &state,
+                &engine,
+                child_auth(state.http.post(&url), &engine)
+                    .json(&forward)
+                    .send(),
+            )
+            .await
             {
                 Ok(r) => r,
-                Err(e) => return api_error(502, &format!("engine request failed: {e:#}")),
+                Err(e) => return api_error(e.status_u16(), &format!("engine request failed: {e}")),
             };
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
@@ -2350,10 +2495,15 @@ pub async fn generate(
             return *resp;
         }
     }
+    let class = crate::queue::classify_work(
+        req.get("tools").is_some_and(serde_json::Value::is_array),
+        state.config.effective_prompt_recipe(&model) == crate::prompt_recipe::OLLAMA_COMPAT,
+    );
     let (engine, load_ms) = match ensure_with_admission(
         &state,
         &model,
         priority,
+        class,
         affinity_hash(&req),
         crate::proxy::body_needs_vision(&req, true),
     )
@@ -2574,11 +2724,19 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
         };
     }
 
-    let (engine, _load_ms) =
-        match ensure_with_admission(&state, model, Priority::Normal, None, false).await {
-            Ok(ok) => ok,
-            Err(resp) => return *resp,
-        };
+    let (engine, _load_ms) = match ensure_with_admission(
+        &state,
+        model,
+        Priority::Normal,
+        crate::queue::WorkClass::Interactive,
+        None,
+        false,
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(resp) => return *resp,
+    };
     // #20 identity: the LIVE instance ctx wins over config (tuned or
     // overridden instances — same precedence as the prompt-fit gate).
     let live_ctx = state

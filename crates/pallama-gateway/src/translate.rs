@@ -468,9 +468,15 @@ pub fn openai_chat_to_ollama(model: &str, openai: &Value) -> Value {
             .enumerate()
             .map(|(i, call)| {
                 let f = &call["function"];
-                let raw = f["arguments"].as_str().unwrap_or("");
-                let args =
-                    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
+                // The raw-lane adapters already hand over a parsed
+                // object; the child's native lane sends a JSON string.
+                let args = match f.get("arguments") {
+                    Some(Value::String(raw)) => {
+                        serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.clone()))
+                    }
+                    Some(other) => other.clone(),
+                    None => Value::Null,
+                };
                 json!({
                     "id": call["id"].clone(),
                     "function": {"index": i, "name": f["name"].clone(), "arguments": args},

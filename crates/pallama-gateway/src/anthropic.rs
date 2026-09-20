@@ -110,10 +110,17 @@ pub async fn messages(
     let prefix = crate::proxy::affinity_hash_bytes(
         &serde_json::to_vec(&openai_body).unwrap_or_else(|_| body.to_vec()),
     );
+    let class = crate::queue::classify_work(
+        openai_body
+            .get("tools")
+            .is_some_and(serde_json::Value::is_array),
+        false,
+    );
     let (engine, _load_ms) = match ensure_with_admission(
         &state,
         &model,
         priority,
+        class,
         prefix,
         crate::proxy::body_needs_vision(&openai_body, false),
     )
@@ -132,6 +139,7 @@ pub async fn messages(
         &state,
         &key_name,
         priority,
+        class,
         deadline_ms,
         body.len(),
         key_ext
@@ -260,11 +268,19 @@ pub async fn count_tokens(
             }
         }
     }
-    let (engine, _) =
-        match ensure_with_admission(&state, &model, Priority::Normal, None, false).await {
-            Ok(ok) => ok,
-            Err(resp) => return *resp,
-        };
+    let (engine, _) = match ensure_with_admission(
+        &state,
+        &model,
+        Priority::Normal,
+        crate::queue::WorkClass::Interactive,
+        None,
+        false,
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(resp) => return *resp,
+    };
     let url = format!("{}/tokenize", child_base(&engine.endpoint));
     // F44: pooled client — the old bare `Client::new()` had NO timeout,
     // so a dead child hung the count_tokens lane forever.

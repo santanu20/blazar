@@ -126,6 +126,30 @@ pub struct Detection {
     pub detail: String,
 }
 
+/// Does one parsed stream frame carry generation progress (content,
+/// text, or usage)? Keepalive-class frames — comments, empty deltas —
+/// do not: they keep the wire alive while the child produces nothing.
+fn event_shows_progress(v: &Value) -> bool {
+    if v.get("usage").is_some_and(|u| !u.is_null()) {
+        return true;
+    }
+    let Some(choices) = v.get("choices").and_then(Value::as_array) else {
+        return false;
+    };
+    choices.iter().any(|c| {
+        let delta = c.get("delta").or_else(|| c.get("message"));
+        delta.is_some_and(|d| {
+            d.get("content")
+                .or_else(|| d.get("text"))
+                .and_then(Value::as_str)
+                .is_some_and(|t| !t.is_empty())
+        }) || c
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|t| !t.is_empty())
+    })
+}
+
 /// One observed request: what the model returned and what was wrong with
 /// it. Bounded in-memory ring + bounded JSONL under `run/` (persistence:
 /// `pallama why` survives daemon restarts). Metadata only — never content.
@@ -804,6 +828,30 @@ impl Sentinel {
         Some(verdict)
     }
 
+    /// One silent stall window elapsed. J5 fires AT DETECTION for
+    /// progress-less streams: the commit-time eviction runs only after
+    /// the stream ends — for a wedged stream that is whenever the
+    /// CLIENT gives up. One grace window first: a slow first prefill
+    /// is indistinguishable from a wedge until the SECOND consecutive
+    /// silent window. Evicting there terminates the upstream body,
+    /// which bounds the very request that stalled.
+    fn note_silent_window(&self, ctx: &RequestCtx, saw_any: bool, silent_windows: &mut u32) {
+        if saw_any {
+            return;
+        }
+        *silent_windows += 1;
+        if *silent_windows == 2 {
+            if let Some(hook) = self.evict_hook.lock().clone() {
+                let _ = hook.0.send(ctx.model.clone());
+                tracing::info!(
+                    target: "pallama::sentinel",
+                    model = %ctx.model,
+                    "progress-less stalled child — eviction requested"
+                );
+            }
+        }
+    }
+
     /// Ring query for `/api/why` + `pallama why`: exact trace match, or
     /// the most recent `limit` records.
     #[must_use]
@@ -835,6 +883,14 @@ impl Sentinel {
         let mut lines = tr::LineBuffer::new();
         let mut json_buf: Vec<u8> = Vec::new();
         let mut stalled = false;
+        // "Ever produced a byte" separates a WEDGED child from a slow
+        // one: a stream that has delivered anything may legitimately gap
+        // past the stall window (slow prefill, chunked cadence) and must
+        // NEVER be evicted for it — only a zero-byte-since-open stream
+        // (live evidence: two 600 s hangs, prompt_tokens null, no chunks
+        // ever) is a wedge worth killing.
+        let mut saw_any = false;
+        let mut silent_windows = 0u32;
         loop {
             let ev = if self.stall.as_secs() > 0 {
                 let Ok(ev) = tokio::time::timeout(self.stall, rx.recv()).await else {
@@ -848,6 +904,7 @@ impl Sentinel {
                             "{}", Code::StalledStream.hint()
                         );
                     }
+                    self.note_silent_window(&ctx, saw_any, &mut silent_windows);
                     continue;
                 };
                 ev
@@ -865,6 +922,18 @@ impl Sentinel {
                         }
                         let (events, _done, consumed) = tr::parse_sse(&carry);
                         carry.drain(..consumed);
+                        // Wedge axis: PROGRESS events seen — frames
+                        // carrying content, text, or usage. A
+                        // keepalive-class frame (comment, empty delta)
+                        // flushes headers without progress: exactly the
+                        // live wedge shape (600 s open, finish null,
+                        // prompt_tokens null). Progress resets the
+                        // silent-window grace; only its total absence
+                        // can evict.
+                        if events.iter().any(event_shows_progress) {
+                            saw_any = true;
+                            silent_windows = 0;
+                        }
                         for ev in &events {
                             if responses {
                                 acc.apply_responses(ev);
@@ -873,6 +942,8 @@ impl Sentinel {
                             }
                         }
                     } else if json_buf.len() + b.len() <= MAX_ACCUM_BYTES {
+                        saw_any = true;
+                        silent_windows = 0;
                         json_buf.extend_from_slice(&b);
                     } else {
                         acc.degraded = true;

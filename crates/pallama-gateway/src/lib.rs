@@ -12,6 +12,7 @@ pub mod ollama;
 pub mod openai;
 pub mod otlp;
 pub mod preflight;
+pub mod prompt_recipe;
 pub mod proxy;
 pub mod queue;
 pub mod remotes;

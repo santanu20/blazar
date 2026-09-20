@@ -156,6 +156,10 @@ pub struct AppState {
     pub queue: Arc<PriorityQueue>,
     /// Loopback client for child traffic + metrics scrape.
     pub http: reqwest::Client,
+    /// J5 eviction lane sender (sentinel stall + proxy header-stall both
+    /// fire through it): the consumer task in `new` debounces (1/min per
+    /// model) and reaps the wedged child.
+    pub evict_tx: tokio::sync::mpsc::UnboundedSender<String>,
     /// vLLM-style evidence loop: measured at the proxy, owned by the gateway.
     pub ttft: Histogram,
     pub tpot: Histogram,
@@ -257,9 +261,11 @@ impl AppState {
         // J5: consume stall-eviction requests; a wedged child is reaped
         // (no bank — a stalled child may not answer a save request) and
         // the next request respawns it clean.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        // `tx` rides the AppState as `evict_tx`: the proxy lane fires
+        // the same debounced reap for header-stalled children.
+        sentinel.set_evict_channel(tx.clone());
         {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-            sentinel.set_evict_channel(tx);
             let sup = Arc::clone(&sup);
             tokio::spawn(async move {
                 let mut last_evict: std::collections::HashMap<String, std::time::Instant> =
@@ -294,6 +300,7 @@ impl AppState {
             bus,
             queue: Arc::new(PriorityQueue::new()),
             http,
+            evict_tx: tx,
             cache_bust: Arc::new(crate::cache_bust::CacheBustTracker::new()),
             ttft: crate::histogram::ttft(),
             tpot: crate::histogram::tpot(),

@@ -318,8 +318,10 @@ pub async fn embed_prompt(
         state,
         embed_model,
         crate::queue::Priority::Normal,
+        // Short, tool-free, never raw — interactive-class admission.
+        crate::queue::WorkClass::Interactive,
         None,
-        false, // semantic-cache embeds are text-only
+        false,
     )
     .await
     .map_err(|e| format!("embed model admission failed: {e:?}"))?;

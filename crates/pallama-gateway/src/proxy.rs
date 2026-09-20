@@ -230,6 +230,7 @@ pub async fn ensure_with_admission(
     state: &Arc<AppState>,
     model: &str,
     priority: Priority,
+    class: crate::queue::WorkClass,
     prefix: Option<PrefixKey>,
     needs_vision: bool,
 ) -> Result<(EngineRef, u128), Box<Response>> {
@@ -285,6 +286,7 @@ pub async fn ensure_with_admission(
                 .wait(
                     &row.name,
                     priority,
+                    class,
                     None,
                     0,
                     std::time::Duration::from_mins(2),
@@ -450,6 +452,67 @@ pub(crate) async fn ensure_key_detached(
         })
 }
 
+/// Child-bound send failure classes: transport errors mean the child is
+/// gone (crash-window semantics, 502); a header-phase stall means the
+/// child is ALIVE but wedged (504) — [`child_send`] has already queued
+/// it for eviction by the time this reaches a caller.
+pub(crate) enum ChildSendError {
+    Transport(reqwest::Error),
+    HeaderTimeout { secs: u64 },
+}
+
+impl ChildSendError {
+    /// Terminal status for the caller's error response.
+    pub(crate) fn status_u16(&self) -> u16 {
+        match self {
+            Self::Transport(_) => 502,
+            Self::HeaderTimeout { .. } => 504,
+        }
+    }
+}
+
+impl std::fmt::Display for ChildSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(e) => write!(f, "{e:#}"),
+            Self::HeaderTimeout { secs } => {
+                write!(f, "no response headers from child within {secs}s")
+            }
+        }
+    }
+}
+
+/// Bounded child-bound send — the transport choke point for EVERY
+/// user-facing child request (proxy lanes AND the ollama dialect's own
+/// sends). The header phase (request written -> first response byte)
+/// must not ride the blanket transport ceiling: a live-wedged child
+/// (observed live: a slot restore raced traffic and one /api/chat
+/// parked 300s+ pre-first-byte while the child served every later
+/// request) parks the client invisibly instead. On expiry the wedged
+/// child is queued on the J5 eviction lane (debounced reap) so later
+/// requests respawn clean. 0 disables the bound (legacy ceiling only).
+pub(crate) async fn child_send(
+    state: &Arc<AppState>,
+    engine: &EngineRef,
+    send: impl std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+) -> Result<reqwest::Response, ChildSendError> {
+    match state.config.child_header_timeout_secs {
+        0 => send.await.map_err(ChildSendError::Transport),
+        secs => match tokio::time::timeout(std::time::Duration::from_secs(secs), send).await {
+            Ok(result) => result.map_err(ChildSendError::Transport),
+            Err(_elapsed) => {
+                tracing::warn!(
+                    target: "pallama::proxy",
+                    model = %engine.key,
+                    "child produced no response headers in {secs}s — requesting eviction (child_header_timeout_secs)"
+                );
+                let _ = state.evict_tx.send(engine.key.clone());
+                Err(ChildSendError::HeaderTimeout { secs })
+            }
+        },
+    }
+}
+
 /// One child-engine transport attempt: child auth, hop-by-hop header
 /// filtering, send. The hot path and the crash-window retry both ride
 /// it, so a retry carries identical auth and header hygiene.
@@ -460,7 +523,7 @@ async fn forward_once(
     url: &str,
     headers: &HeaderMap,
     body: axum::body::Bytes,
-) -> Result<reqwest::Response, reqwest::Error> {
+) -> Result<reqwest::Response, ChildSendError> {
     let mut req = state.http.request(method.clone(), url);
     // Client `Authorization` was stripped above; the child secret is
     // stamped fresh here (never the caller's gateway key).
@@ -470,11 +533,12 @@ async fn forward_once(
             req = req.header(name, value);
         }
     }
-    req.body(reqwest::Body::wrap_stream(futures::stream::once(
-        async move { Ok::<_, std::io::Error>(body) },
-    )))
-    .send()
-    .await
+    let send = req
+        .body(reqwest::Body::wrap_stream(futures::stream::once(
+            async move { Ok::<_, std::io::Error>(body) },
+        )))
+        .send();
+    child_send(state, engine, send).await
 }
 
 /// Abort-safe finisher: `Drop` runs on clean drain AND client abort.
@@ -580,7 +644,28 @@ pub async fn proxy_request(
     let resp = match upstream {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!(model, "proxy {path_query}: {e:#}");
+            // Terminal status reflects the dominant failure: a wedged
+            // LIVE child is a gateway timeout (504); a dead child that
+            // could not be revived is a bad gateway (502).
+            let terminal = match &e {
+                ChildSendError::HeaderTimeout { secs } => {
+                    tracing::warn!(
+                        target: "pallama::proxy",
+                        model,
+                        trace = ?trace,
+                        "child produced no response headers in {secs}s — requesting eviction and retrying once in-band (child_header_timeout_secs)"
+                    );
+                    // reap_dead_children only touches DEAD pids; a wedged
+                    // child is alive — fire the J5 eviction lane (debounced
+                    // 1/min per model) so it does not poison later requests.
+                    let _ = state.evict_tx.send(engine.key.clone());
+                    StatusCode::GATEWAY_TIMEOUT
+                }
+                ChildSendError::Transport(_) => {
+                    tracing::error!(model, "proxy {path_query}: {e}");
+                    StatusCode::BAD_GATEWAY
+                }
+            };
             // The child died in the crash window between the health gate
             // and this forward. Reap, respawn the exact lane detached,
             // and retry ONCE in-band — single-shot clients (run
@@ -603,11 +688,15 @@ pub async fn proxy_request(
                     {
                         Ok(r) => r,
                         Err(e2) => {
+                            let status = match e2 {
+                                ChildSendError::HeaderTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
+                                ChildSendError::Transport(_) => terminal,
+                            };
                             drop(sf); // F31: Drop removes the singleflight entry
                             return openai_error(
-                                502,
+                                status.as_u16(),
                                 &format!(
-                                    "engine request failed: {e:#}; retry on respawned child: {e2:#}"
+                                    "engine request failed: {e}; retry on respawned child: {e2}"
                                 ),
                             );
                         }
@@ -616,8 +705,8 @@ pub async fn proxy_request(
                 Err(re) => {
                     drop(sf); // F31: Drop removes the singleflight entry
                     return openai_error(
-                        502,
-                        &format!("engine request failed: {e:#}; respawn: {re:#}"),
+                        terminal.as_u16(),
+                        &format!("engine request failed: {e}; respawn: {re:#}"),
                     );
                 }
             }
@@ -792,31 +881,58 @@ pub async fn proxy_request(
         chat: is_chat_route(path_query),
         model: model.to_string(),
     });
-    let stream = resp.bytes_stream().map(move |r| {
-        if r.is_ok() {
-            let now = std::time::Instant::now();
-            if first_chunk {
-                hist_state.ttft.observe_secs((now - start).as_secs_f64());
-                tap_first.store(
-                    u64::try_from((now - began).as_nanos()).unwrap_or(u64::MAX),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                first_chunk = false;
-            } else {
-                hist_state
-                    .tpot
-                    .observe_secs((now - last_chunk).as_secs_f64());
-            }
-            last_chunk = now;
-            if let Ok(bytes) = r.as_ref() {
+    let model_owned = model.to_string();
+    let path_owned = path_query.to_string();
+    let stream = resp.bytes_stream().flat_map(move |r| {
+        match r {
+            Ok(bytes) => {
+                let now = std::time::Instant::now();
+                if first_chunk {
+                    hist_state.ttft.observe_secs((now - start).as_secs_f64());
+                    tap_first.store(
+                        u64::try_from((now - began).as_nanos()).unwrap_or(u64::MAX),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    first_chunk = false;
+                } else {
+                    hist_state
+                        .tpot
+                        .observe_secs((now - last_chunk).as_secs_f64());
+                }
+                last_chunk = now;
                 sentinel_feed.bytes(bytes.as_ref());
                 tap_map.push(bytes.as_ref());
                 if let Some(s) = sniffer_finisher.lock().expect("sniffer").0.as_mut() {
                     s.push(bytes.as_ref());
                 }
+                futures::stream::iter(vec![Ok(bytes)])
+            }
+            // Mid-body upstream failure (sentinel-evicted wedged child,
+            // conn churn, respawn race): once headers are committed the
+            // only legal SSE close is a semantic one — an Err item here
+            // aborts the HTTP body and the client eats a protocol error
+            // instead of a readable terminal event.
+            Err(e) => {
+                tracing::warn!(
+                    model = model_owned.as_str(),
+                    "proxy {path_owned}: upstream body failed: {e:#}",
+                );
+                if sse {
+                    let frame = serde_json::json!({
+                        "error": {
+                            "code": "stream_truncated",
+                            "message": e.to_string(),
+                        }
+                    });
+                    futures::stream::iter(vec![
+                        Ok(axum::body::Bytes::from(format!("data: {frame}\n\n"))),
+                        Ok(axum::body::Bytes::from_static(b"data: [DONE]\n\n")),
+                    ])
+                } else {
+                    futures::stream::iter(vec![Err(std::io::Error::other(e.to_string()))])
+                }
             }
         }
-        r.map_err(|e| std::io::Error::other(e.to_string()))
     });
     // Hold in-flight accounting for the body's lifetime: the guard drops
     // when the client drains (or aborts) the stream.
@@ -1223,6 +1339,7 @@ pub async fn admission_gate_slo(
     state: &Arc<AppState>,
     model: &str,
     priority: Priority,
+    class: crate::queue::WorkClass,
     deadline_ms: Option<u64>,
     body_len: usize,
     wfq: Option<(&str, u32)>,
@@ -1262,7 +1379,19 @@ pub async fn admission_gate_slo(
             .into_iter()
             .find(|p| p.name == model)
             .map_or(0, |p| p.in_flight);
-        if busy < max_inflight {
+        // Reserved capacity (MT4): the last ceil(N/4) slots belong to
+        // interactive/tool work. RawLong may not take one while any
+        // non-raw waiter is queued for this model (borrowing keeps the
+        // reservation from idling when nobody needs it). On N = 1 the
+        // clamp degenerates to "no isolation possible" — a single-slot
+        // child cannot separate classes (documented tradeoff).
+        let ceiling = match class {
+            crate::queue::WorkClass::Interactive | crate::queue::WorkClass::Tool => max_inflight,
+            crate::queue::WorkClass::RawLong => {
+                crate::queue::raw_ceiling(max_inflight, state.queue.has_non_raw_waiter(model))
+            }
+        };
+        if busy < ceiling {
             return Ok(begin_accounting(state, model));
         }
         // The REAL same-model park: this request waits for a slot on the
@@ -1278,6 +1407,7 @@ pub async fn admission_gate_slo(
             .wait(
                 model,
                 priority,
+                class,
                 deadline_ms,
                 body_len,
                 std::time::Duration::from_mins(2),

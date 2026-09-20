@@ -165,6 +165,31 @@ pub struct Config {
     /// attention (always emitted when the engine supports it).
     #[serde(default)]
     pub cache_type: String,
+    /// Chat prompt recipe: `child` (default — the engine child renders
+    /// its own chat template) or `ollama_compat` (the gateway renders the
+    /// full prompt — chatml wrapping plus a JSON tool-call grammar
+    /// system block — and drives the child through the raw-completion
+    /// lane; the gateway then parses tool calls back out of the text).
+    /// `ollama_compat` measurably improves tool-calling on error-path and
+    /// multi-turn flows for chatml-family models (A/B pinned live);
+    /// image requests always ride the child lane.
+    #[serde(default = "default_prompt_recipe")]
+    pub prompt_recipe: String,
+    /// Decode constraint for tool-bearing generations on the
+    /// `ollama_compat` raw lane. `free` (default) lets the model choose
+    /// prose or a tool call; `strict` attaches a GBNF grammar that
+    /// confines the completion to one-or-more `<tool_call>` envelopes
+    /// whose `name` must be one of the request's tools — structurally
+    /// valid calls, impossible to hallucinate names or malformed JSON.
+    #[serde(default = "default_decode_policy")]
+    pub decode_policy: String,
+    /// Server-side ceiling on raw-lane (`ollama_compat`) generations,
+    /// in tokens. A raw completion without a caller `max_tokens` would
+    /// otherwise ramble to the context ceiling (~300s on a 9B-class
+    /// model, observed live). The effective cap is
+    /// min(caller `max_tokens`, this). 0 disables the ceiling.
+    #[serde(default = "default_raw_lane_max_tokens")]
+    pub raw_lane_max_tokens: u64,
     /// KV buffer layout: None = engine default (unified when slots are
     /// auto); Some(true) = `--kv-unified` (one shared buffer; K-shift
     /// prefix reuse across sequences — the cheap radix); Some(false) =
@@ -378,6 +403,18 @@ pub struct Config {
     /// detection specifically (other detections stay on).
     #[serde(default = "default_stall_secs")]
     pub sentinel_stall_secs: u64,
+    /// Ceiling in seconds for awaiting child response HEADERS
+    /// (pre-first-byte). A child that accepts a request but never answers
+    /// is a live wedge (observed live: a banked-session slot restore
+    /// raced traffic and parked one request 300s+ while the child served
+    /// every later request) — it gets evicted, the request retries once
+    /// in-band on the respawned lane, and a second stall fails 504
+    /// instead of parking until the blanket transport ceiling. Sized
+    /// above worst legitimate prefill (JIT-class first request ~30s;
+    /// 32k-token prefills ~40s on consumer GPUs). 0 disables (blanket
+    /// transport ceiling only).
+    #[serde(default = "default_child_header_timeout_secs")]
+    pub child_header_timeout_secs: u64,
     /// Sentinel enforce: hard violations (invalid tool args, unknown tool
     /// names, schema violations) become 422s on NON-STREAMING chat
     /// requests (streaming bytes are already on the wire — warn-only
@@ -661,7 +698,7 @@ pub struct Config {
     pub predictive_preload: bool,
     /// Adaptive slots (LC4): when a single-slot model sustains
     /// concurrent load for ~60s, adopt slots+1 (in-memory, capped at 4;
-    /// `tune --slots` remains the permanent path). Off by default.
+    /// `tune --slots` remains the permanent path). On by default.
     #[serde(default)]
     pub adaptive_slots: bool,
     /// Bypass host buffer for extra VRAM (upstream default false).
@@ -821,6 +858,14 @@ pub struct ModelOverride {
     pub extra_args: Option<Vec<String>>,
     /// Per-model KV cache type ("" or None = inherit the global ladder).
     pub cache_type: Option<String>,
+    /// Per-model chat prompt recipe (None = inherit global; see
+    /// `Config::prompt_recipe`).
+    pub prompt_recipe: Option<String>,
+    /// Decode constraint override (`Config::decode_policy`).
+    pub decode_policy: Option<String>,
+    /// Per-model raw-lane generation ceiling (None = inherit global).
+    #[serde(default)]
+    pub raw_lane_max_tokens: Option<u64>,
     /// Per-model unified-KV override (None = inherit).
     #[serde(default)]
     pub kv_unified: Option<bool>,
@@ -1843,6 +1888,7 @@ impl Default for Config {
             slot_prompt_similarity: 0.0,
             sentinel: true,
             sentinel_stall_secs: 30,
+            child_header_timeout_secs: 120,
             sentinel_enforce: false,
             audit_log: false,
             tls_cert: String::new(),
@@ -1852,6 +1898,9 @@ impl Default for Config {
             otlp_service: String::new(),
             remotes: Vec::new(),
             cache_type: String::new(),
+            prompt_recipe: default_prompt_recipe(),
+            decode_policy: default_decode_policy(),
+            raw_lane_max_tokens: 2048,
             kv_unified: None,
             kv_unified_per_slot: 0,
             swa_full: false,
@@ -2283,6 +2332,44 @@ impl Config {
         self.cache_type.as_str()
     }
 
+    /// Effective chat prompt recipe for a model; overlay wins over the
+    /// global. Anything unrecognized resolves to the default `child`
+    /// (validation rejects unknown values at load time; this accessor
+    /// stays total for callers handling hand-built configs).
+    #[must_use]
+    /// Effective raw-lane generation ceiling for a model (overlay wins
+    /// over global; 0 = no ceiling).
+    pub fn effective_raw_lane_max_tokens(&self, model: &str) -> u64 {
+        self.model_overrides
+            .get(model)
+            .and_then(|o| o.raw_lane_max_tokens)
+            .unwrap_or(self.raw_lane_max_tokens)
+    }
+
+    #[must_use]
+    pub fn effective_prompt_recipe(&self, model: &str) -> &str {
+        let recipe = self
+            .model_overrides
+            .get(model)
+            .and_then(|o| o.prompt_recipe.as_deref())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(self.prompt_recipe.as_str());
+        if recipe == "ollama_compat" {
+            "ollama_compat"
+        } else {
+            "child"
+        }
+    }
+    /// Overlay-wins decode constraint (`free` unless pinned).
+    #[must_use]
+    pub fn effective_decode_policy(&self, model: &str) -> &str {
+        self.model_overrides
+            .get(model)
+            .and_then(|o| o.decode_policy.as_deref())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(self.decode_policy.as_str())
+    }
+
     /// Effective `YaRN` context-extension factor; overlay wins over global.
     #[must_use]
     pub fn effective_ctx_extend(&self, model: &str) -> f64 {
@@ -2684,6 +2771,48 @@ impl Config {
                 "sentinel_stall_secs must be 0 (off) or 5..=600, got {}",
                 self.sentinel_stall_secs
             )));
+        }
+        if self.child_header_timeout_secs != 0
+            && !(5..=600).contains(&self.child_header_timeout_secs)
+        {
+            return Err(CoreError::Config(format!(
+                "child_header_timeout_secs must be 0 (off) or 5..=600, got {}",
+                self.child_header_timeout_secs
+            )));
+        }
+        if self.raw_lane_max_tokens != 0 && !(256..=100_000).contains(&self.raw_lane_max_tokens) {
+            return Err(CoreError::Config(format!(
+                "raw_lane_max_tokens must be 0 (off) or 256..=100000, got {}",
+                self.raw_lane_max_tokens
+            )));
+        }
+        if self.prompt_recipe != "child" && self.prompt_recipe != "ollama_compat" {
+            return Err(CoreError::Config(format!(
+                "prompt_recipe must be \"child\" or \"ollama_compat\", got {:?}",
+                self.prompt_recipe
+            )));
+        }
+        if self.decode_policy != "free" && self.decode_policy != "strict" {
+            return Err(CoreError::Config(format!(
+                "decode_policy must be \"free\" or \"strict\", got {:?}",
+                self.decode_policy
+            )));
+        }
+        for (name, o) in &self.model_overrides {
+            if let Some(r) = &o.prompt_recipe {
+                if r != "child" && r != "ollama_compat" {
+                    return Err(CoreError::Config(format!(
+                        "model_overrides.{name}.prompt_recipe must be \"child\" or \"ollama_compat\", got {r:?}"
+                    )));
+                }
+            }
+            if let Some(d) = &o.decode_policy {
+                if d != "free" && d != "strict" {
+                    return Err(CoreError::Config(format!(
+                        "model_overrides.{name}.decode_policy must be \"free\" or \"strict\", got {d:?}"
+                    )));
+                }
+            }
         }
         if !valid_cache_type(&self.cache_type) {
             return Err(CoreError::Config(format!(
@@ -3201,6 +3330,22 @@ fn parse_i32(key: &str, raw: &str) -> CoreResult<i32> {
 
 fn default_stall_secs() -> u64 {
     30
+}
+
+fn default_child_header_timeout_secs() -> u64 {
+    120
+}
+
+fn default_raw_lane_max_tokens() -> u64 {
+    2048
+}
+
+fn default_prompt_recipe() -> String {
+    "child".into()
+}
+
+fn default_decode_policy() -> String {
+    "free".into()
 }
 
 /// `lo-hi` decimal CPU range with lo <= hi (upstream `--cpu-range` syntax).

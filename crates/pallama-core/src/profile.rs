@@ -5141,6 +5141,9 @@ mod tests {
 
     static ALL_FLAGS: LazyLock<BTreeSet<String>> = LazyLock::new(full_flags);
     static DEFAULT_OVERLAY: ModelOverride = ModelOverride {
+        prompt_recipe: None,
+        decode_policy: None,
+        raw_lane_max_tokens: None,
         cpu_ffn_n: None,
         ctx: None,
         slots: None,

@@ -456,13 +456,44 @@ async fn e2e__num_ctx_restarts_instance_at_requested_size() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn e2e__num_ctx_refuses_oom_shape_with_q8_hint() {
-    // I5 preflight, classic (f16) lane: the stub manifest lacks
-    // --kv-unified, so the charge is full f16 KV — 500k ctx on the 24 GiB
-    // stub card cannot fit and must refuse with the q8_0 teaching hint.
+    // I5 preflight, beyond-the-ladder lane: the stub manifest lacks
+    // --kv-unified, so the charge is full f16 KV — 2M ctx on the 24 GiB
+    // stub card cannot fit at ANY ladder rung (f16/q8_0/q4_0) and must
+    // refuse with the q8_0 teaching hint. (The 500k shape one rung
+    // below now SERVES via the ladder — pinned in
+    // e2e__num_ctx_ladder_serves_q4_hostable_shape.)
     // (The unified 512 MiB-floor branch is pinned at the core level in
     // unit__kv_unified_for__truth_table_for_offline_callers: adding the
     // flag to the stub --help would cascade into every spawn-argv
     // battery.)
+    let ts = start(Config::default()).await;
+    let c = client();
+    let body = serde_json::json!({
+        "model": "m1", "stream": false,
+        "messages": [{"role": "user", "content": "a"}],
+        "options": {"num_ctx": 2_000_000},
+    });
+    let r = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let v: serde_json::Value = r.json().await.unwrap();
+    let msg = format!("{}", v["error"]);
+    assert!(msg.contains("num_ctx 2000000"), "{msg}");
+    assert!(msg.contains("q8_0"), "teaching hint present: {msg}");
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__num_ctx_ladder_serves_q4_hostable_shape() {
+    // Preflight ladder band: 500k ctx overflows f16 and q8_0 on the
+    // 24 GiB stub card but FITS at q4_0 — the unpinned cache_type
+    // ladders (mirroring the spawn compiler's kv_quant_ladder) and the
+    // request SERVES instead of refusing a shape the spawn itself
+    // would host.
     let ts = start(Config::default()).await;
     let c = client();
     let body = serde_json::json!({
@@ -476,11 +507,8 @@ async fn e2e__num_ctx_refuses_oom_shape_with_q8_hint() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 400);
-    let v: serde_json::Value = r.json().await.unwrap();
-    let msg = format!("{}", v["error"]);
-    assert!(msg.contains("num_ctx 500000"), "{msg}");
-    assert!(msg.contains("q8_0"), "teaching hint present: {msg}");
+    assert_eq!(r.status(), 200, "ladder must host the q4_0-fittable shape");
+    ts.state.sup.shutdown_all().await.unwrap();
 }
 
 #[tokio::test]
@@ -1557,6 +1585,157 @@ async fn e2e__client_disconnect_frees_slot() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn e2e__child_header_stall_bounded_evicted_and_504() {
+    // Pin (live evidence): a banked-session slot restore raced traffic
+    // and one request hung 300s PRE-FIRST-BYTE while the child served
+    // every later request — invisible to the request log and sentinel
+    // (both observe from response start) and unbounded up to the blanket
+    // transport ceiling. The header phase must instead be bounded,
+    // warned, evicted, and retried once; terminal failure is a 504.
+    let cfg = Config {
+        child_header_timeout_secs: 1,
+        ..Config::default()
+    };
+    let ts = start_with(cfg, vec![("STUB_HANG_ON".into(), "hang-token-9".into())]).await;
+    let c = client();
+    let began = std::time::Instant::now();
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "messages": [{"role": "user", "content": "hang-token-9"}],
+        }))
+        .send()
+        .await
+        .expect("bounded: the request must return, never park to the blanket ceiling");
+    let elapsed = began.elapsed();
+    let status = resp.status().as_u16();
+    // Two bounded attempts (1s each) + eviction/respawn overhead.
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "header-stall took {elapsed:?} — phase unbounded"
+    );
+    assert_eq!(
+        status, 504,
+        "terminal header-stall status, got {status} in {elapsed:?}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__ollama_compat_recipe_raw_completion_lane_round_trip() {
+    // prompt_recipe = "ollama_compat": the gateway renders the prompt
+    // (chatml + JSON tool grammar system block) and drives the child
+    // through /v1/completions, adapting text back to chat shape. The
+    // stub replies with a fixed completion; the response must arrive
+    // in ollama chat shape with the recipe's stop honored end-to-end.
+    let cfg = Config {
+        prompt_recipe: "ollama_compat".into(),
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let c = client();
+    let r = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "messages": [{"role": "system", "content": "be terse"},
+                         {"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {
+                "name": "compute", "description": "math",
+                "parameters": {"type": "object", "properties": {"x": {"type": "number"}}}}}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = r.json().await.unwrap();
+    let msg = &v["message"];
+    assert!(msg.is_object(), "chat shape preserved: {v}");
+    assert!(msg.get("role").is_some_and(|r| r == "assistant"));
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__sentinel__body_stall_fires_detection_and_bounded_close() {
+    // Pin (live evidence: two 600 s zero-chunk hangs finished with NO
+    // stall detection — finish null, detections [], prompt_tokens
+    // null): a child that opens the SSE body then never sends a byte
+    // must (1) fire the stall detector, (2) evict the wedged child
+    // (which terminates the upstream body), and (3) close the client
+    // stream within a bounded window instead of parking until the
+    // client gives up.
+    let cfg = Config {
+        sentinel_stall_secs: 5,
+        ..Config::default()
+    };
+    let ts = start_with(
+        cfg,
+        vec![
+            ("STUB_HANG_ON".into(), "stall-body-token".into()),
+            ("STUB_STALL_BODY".into(), "1".into()),
+        ],
+    )
+    .await;
+    let c = client();
+    let began = std::time::Instant::now();
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": true,
+            "messages": [{"role": "user", "content": "stall-body-token"}],
+        }))
+        .send()
+        .await
+        .expect("headers must arrive (body-stall, not header-stall)");
+    // Stall (5 s) + eviction grace + respawn overhead — never minutes.
+    let body = tokio::time::timeout(Duration::from_secs(25), resp.bytes())
+        .await
+        .expect("body must close within the stall+evict window")
+        .expect("body read");
+    let elapsed = began.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(25),
+        "body-stall closed in {elapsed:?}"
+    );
+    let _ = body;
+    // The record must carry the stall detection (answerable via why).
+    // Poll: the analyzer commits asynchronously once the dropped feed
+    // signals End — the record lands within moments, not instantly.
+    let mut stalled = false;
+    for _ in 0..25 {
+        let why: serde_json::Value = c
+            .get(format!("{}/api/why", ts.base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let records = why["records"].as_array().cloned().unwrap_or_default();
+        if records.iter().any(|r| {
+            r.get("detections")
+                .and_then(|d| d.as_array())
+                .is_some_and(|d| {
+                    d.iter()
+                        .any(|x| x.get("code").and_then(|c| c.as_str()) == Some("stalled_stream"))
+                })
+        }) {
+            stalled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(stalled, "no stalled_stream detection in why records");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn e2e__client_disconnect_frees_slot_ollama_lane() {
     // F29 pin: the ollama NDJSON lanes must hold accounting for the BODY
     // lifetime — dropping the response mid-stream frees the slot (the old
@@ -2393,5 +2572,64 @@ async fn e2e__llamacpp_only_gates__routed_lane_beats_active_row() {
         "m1 session save must bypass the gate: {v}"
     );
 
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__tool_wins_admission_over_earlier_queued_interactive() {
+    // Admission contract, wired end to end: with the single slot held,
+    // a Tool-class chat must be admitted before an Interactive chat
+    // that queued EARLIER — class rank (plus the Tool deadline
+    // tightening) decides, not arrival order. Order-based assertion:
+    // response completion instants, no duration guessing.
+    let mut cfg = Config::default();
+    cfg.model_overrides.insert(
+        "m1".into(),
+        pallama_core::ModelOverride {
+            slots: Some(1),
+            ..Default::default()
+        },
+    );
+    let ts = start_with(cfg, vec![("STUB_DELAY_MS".into(), "6000".into())]).await;
+    let chat = |tools: bool| {
+        let base = ts.base.clone();
+        async move {
+            let mut body = serde_json::json!({
+                "model": "m1", "stream": false,
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+            if tools {
+                body["tools"] = serde_json::json!([{
+                    "type": "function",
+                    "function": {"name": "t", "parameters": {"type": "object"}}
+                }]);
+            }
+            let began = std::time::Instant::now();
+            let r = client()
+                .post(format!("{base}/api/chat"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200);
+            began
+        }
+    };
+    // A: plain chat, admitted immediately, holds the slot ~6 s.
+    let a = tokio::spawn(chat(false));
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    // C: plain chat (Interactive) — queues FIRST.
+    let cc = tokio::spawn(chat(false));
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    // B: chat with tools (Tool class) — queues SECOND.
+    let b = tokio::spawn(chat(true));
+    let (ra, rb, rc) = tokio::join!(a, cc, b);
+    let (ra, rb, rc) = (ra.unwrap(), rb.unwrap(), rc.unwrap());
+    assert!(
+        rb < rc,
+        "tool request must admit before earlier-queued interactive"
+    );
+    assert!(ra < rb);
     ts.state.sup.shutdown_all().await.unwrap();
 }

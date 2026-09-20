@@ -242,16 +242,6 @@ fn store_aware_remedy(
     }
 }
 
-/// Drops one unit of ensure-window demand when the request's
-/// `ensure_routed` call ends (any exit path).
-struct PendingGuard(Arc<AtomicI64>);
-
-impl Drop for PendingGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
 /// Not-found payload with the flat-name teaching line for ollama
 /// `model:tag` input (reached only when BOTH forms missed, so the
 /// swapped spelling is a suggestion, never a promise).
@@ -270,85 +260,6 @@ fn not_found_name(name: &str) -> String {
 /// serial `bank_restore`): runs AFTER Ready publishes so fresh chats
 /// never wait for it; continuation requests land while it streams and
 /// the engine queues behind the restore slot. Identity was already
-/// verified by the (cheap, fs-only) preflight at the call site.
-async fn bank_restore_post(
-    name: String,
-    endpoint: pallama_core::Endpoint,
-    ctx: u32,
-    auth: Option<String>,
-    router: bool,
-    pend: Option<Arc<AtomicI64>>,
-    inst: Arc<Instance>,
-) {
-    // Defer while the triggering request is still in its ensure window
-    // or a generation holds slot 0: the restore POST serializes on
-    // slot 0 upstream, so posting into traffic queues the user behind
-    // cache priming (live A/B: the racing request paid ~1s). Bounded:
-    // busy for 30s means real traffic — leave the bank on disk for
-    // the next spawn. The gap between the guard dropping and the
-    // gateway's begin_request is microseconds; worst case one 1s
-    // queue, the pre-fix behavior.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        let pending = pend.as_ref().is_some_and(|p| p.load(Ordering::SeqCst) > 0);
-        let busy = inst.in_flight.load(Ordering::SeqCst) > 0;
-        if !pending && !busy {
-            break;
-        }
-        if std::time::Instant::now() > deadline {
-            tracing::debug!(
-                target: "pallama::bank",
-                model = %name,
-                "bank restore deferred out — instance busy; bank stays for the next spawn"
-            );
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    let (host, port) = match &endpoint {
-        pallama_core::Endpoint::Tcp { host, port } => (host, *port),
-        // UDS children keep their slot protocol on the socket; the
-        // REST restore endpoint is not reachable — same as before.
-        pallama_core::Endpoint::Unix { .. } => return,
-    };
-    let url = format!("http://{host}:{port}/slots/0?action=restore&filename=_auto-{ctx}");
-    let mut body = serde_json::json!({ "filename": format!("_auto-{ctx}") });
-    if router {
-        body["model"] = serde_json::json!(name);
-    }
-    let mut req = reqwest::Client::new()
-        .post(&url)
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(2));
-    if let Some(secret) = &auth {
-        req = req.bearer_auth(secret);
-    }
-    match req.send().await {
-        Ok(resp) if resp.status().is_success() => {
-            tracing::info!(
-                target: "pallama::bank",
-                model = %name,
-                "restored banked session _auto-{ctx}"
-            );
-        }
-        Ok(resp) => {
-            tracing::warn!(
-                target: "pallama::bank",
-                model = %name,
-                "bank restore HTTP {} — continuing cold",
-                resp.status()
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                target: "pallama::bank",
-                model = %name,
-                "bank restore failed: {e:#} — continuing cold"
-            );
-        }
-    }
-}
-
 /// Split an instance key into (model, replica index). `None` for plain
 /// model keys and malformed suffixes. A `@vision` suffix after the
 /// replica index is tolerated so `evict_model`-style filters match.
@@ -838,7 +749,6 @@ pub struct Supervisor {
     /// guard). The detached bank-restore defers while this is > 0: the
     /// triggering request is otherwise invisible to an in-flight poll
     /// (`begin_request` fires only after the instance exists).
-    ensure_pending: DashMap<String, Arc<AtomicI64>>,
     /// One-shot ctx override for the NEXT spawn of a model (per-request
     /// `options.num_ctx` — complaint #13). Consumed on use.
     pending_ctx: DashMap<String, u32>,
@@ -998,7 +908,6 @@ impl Supervisor {
             load_results: DashMap::new(),
             restarts: DashMap::new(),
             unclean_dead: DashMap::new(),
-            ensure_pending: DashMap::new(),
             pending_ctx: DashMap::new(),
             pending_spec: DashMap::new(),
             heat: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1185,19 +1094,6 @@ impl Supervisor {
             resolved.as_str()
         } else {
             name
-        };
-        // Request-in-window marker for the detached bank restore: the
-        // triggering request pays no cache-priming queue (see the defer
-        // loop in bank_restore_post). Guard decrements on every exit
-        // path via Drop.
-        let _pend_guard = {
-            let counter = self
-                .ensure_pending
-                .entry(name.to_string())
-                .or_default()
-                .clone();
-            counter.fetch_add(1, Ordering::SeqCst);
-            PendingGuard(counter)
         };
         // Router mode: every model name resolves to the ONE router child
         // (upstream autoloads the model on request, LRU-evicts at
@@ -2888,6 +2784,26 @@ impl Supervisor {
                         let _ = child.reap().await;
                         continue;
                     }
+                    // Bank restore, choke point #2 — SYNCHRONOUS and
+                    // BEFORE any generation touches the child (the
+                    // warm-peg below included): a slot restore that
+                    // races traffic wedges the racing request forever
+                    // on the child's slot-0 pipeline (observed live ×4:
+                    // a deferred restore posted ~100ms after a
+                    // generation completed; the next request never got
+                    // headers — 300s pre-fix, bounded 504 + eviction
+                    // post-fix, but the request still dies). On a
+                    // freshly spawned child nothing has generated yet,
+                    // so restore-then-serve is the only race-free
+                    // ordering. Bounded; failure continues cold.
+                    self.bank_restore_sync(
+                        key,
+                        &endpoint,
+                        profile.ctx,
+                        auth.as_ref().map(|a| a.secret.as_str()),
+                    )
+                    .await;
+
                     // Warm-peg (sglang + llamacpp): drain residual JIT
                     // warmup and peg concurrent batch shapes. sglang
                     // BLOCKS here — its health flips 200 before the
@@ -2998,58 +2914,6 @@ impl Supervisor {
                             slots,
                             total_ctx: slots * per_slot,
                         });
-                    }
-                    // Bank restore, choke point #2: warm KV for
-                    // conversation CONTINUATIONS (ctx-matched only,
-                    // per-replica key-scoped files). Preflight is cheap
-                    // (config gate + manifest verify, pure fs); the
-                    // ~1s slot-restore POST is DETACHED so the spawn
-                    // publishes Ready immediately — measured live, the
-                    // serial restore delayed EVERY cold spawn by ~1s,
-                    // and only continuations ever recoup it (fresh
-                    // chats waited for nothing). A racing first request
-                    // prefills normally; the engine queues behind the
-                    // restore slot when one does land.
-                    if self.config.session_bank {
-                        let file = self.bank_file(key, profile.ctx);
-                        if file.exists() {
-                            let diffs = match (
-                                pallama_core::session_identity::read_manifest(&file),
-                                pallama_core::session_identity::build(
-                                    &self.dirs,
-                                    &self.config,
-                                    key,
-                                ),
-                            ) {
-                                (Some(saved), Some(mut cur)) => {
-                                    cur.ctx = profile.ctx;
-                                    pallama_core::session_identity::verify(&saved, &cur)
-                                }
-                                _ => Vec::new(),
-                            };
-                            if diffs.is_empty() {
-                                let name = key.to_string();
-                                let ep = endpoint.clone();
-                                let ctx = profile.ctx;
-                                let secret = auth.as_ref().map(|a| a.secret.clone());
-                                let router = self.config.router;
-                                let inst_ref = inst.clone();
-                                let pend = self.ensure_pending.get(key).map(|e| e.value().clone());
-                                tokio::spawn(async move {
-                                    bank_restore_post(
-                                        name, ep, ctx, secret, router, pend, inst_ref,
-                                    )
-                                    .await;
-                                });
-                            } else {
-                                tracing::warn!(
-                                    target: "pallama::bank",
-                                    model = key,
-                                    "bank identity mismatch — SKIPPING restore ({}); continuing cold",
-                                    diffs.join("; ")
-                                );
-                            }
-                        }
                     }
                     let _ = std::fs::write(
                         self.dirs.run_dir().join(format!("{key}.pid")),
@@ -3558,6 +3422,94 @@ impl Supervisor {
             .join(format!("_auto-{ctx}"))
     }
 
+    /// Session-bank restore, IN-SPAWN and synchronous: warms the child's
+    /// slot-0 KV for conversation continuations (ctx-matched, per-key
+    /// bank files) BEFORE anything generates on the child. The previous
+    /// detached design posted the restore into live traffic after a
+    /// busy-poll race — a request arriving inside the restore window
+    /// wedged on the child's slot pipeline forever (observed ×4 live,
+    /// including two benchmark requests). Runs inside the spawn path
+    /// only; the trigger request and every later one find the bank
+    /// already applied. Bounded (5 s): a slow or dead endpoint continues
+    /// cold — the bank stays on disk for the next spawn.
+    async fn bank_restore_sync(
+        &self,
+        key: &str,
+        endpoint: &pallama_core::Endpoint,
+        ctx: u32,
+        auth: Option<&str>,
+    ) {
+        if !self.config.session_bank {
+            return;
+        }
+        let file = self.bank_file(key, ctx);
+        if !file.exists() {
+            return;
+        }
+        // Identity gate (config + weights + engine unchanged since the
+        // bank was written): a stale bank restores garbage prefixes.
+        let diffs = match (
+            pallama_core::session_identity::read_manifest(&file),
+            pallama_core::session_identity::build(&self.dirs, &self.config, key),
+        ) {
+            (Some(saved), Some(mut cur)) => {
+                cur.ctx = ctx;
+                pallama_core::session_identity::verify(&saved, &cur)
+            }
+            _ => Vec::new(),
+        };
+        if !diffs.is_empty() {
+            tracing::warn!(
+                target: "pallama::bank",
+                model = key,
+                "bank identity mismatch — SKIPPING restore ({}); continuing cold",
+                diffs.join("; ")
+            );
+            return;
+        }
+        let (host, port) = match endpoint {
+            pallama_core::Endpoint::Tcp { host, port } => (host, *port),
+            // UDS children keep their slot protocol on the socket; the
+            // REST restore endpoint is not reachable.
+            pallama_core::Endpoint::Unix { .. } => return,
+        };
+        let url = format!("http://{host}:{port}/slots/0?action=restore&filename=_auto-{ctx}");
+        let mut body = serde_json::json!({ "filename": format!("_auto-{ctx}") });
+        if self.config.router {
+            body["model"] = serde_json::json!(key);
+        }
+        let mut req = reqwest::Client::new()
+            .post(&url)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(5));
+        if let Some(secret) = auth {
+            req = req.bearer_auth(secret);
+        }
+        match req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::info!(
+                    target: "pallama::bank",
+                    model = key,
+                    "restored banked session _auto-{ctx}"
+                );
+            }
+            Ok(resp) => {
+                tracing::warn!(
+                    target: "pallama::bank",
+                    model = key,
+                    "bank restore HTTP {} — continuing cold",
+                    resp.status()
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "pallama::bank",
+                    model = key,
+                    "bank restore failed: {e:#} — continuing cold"
+                );
+            }
+        }
+    }
     /// Best-effort `_auto-<ctx>` save before termination. Bounded (2s);
     // failures cost a re-prefill, never the evict.
     async fn bank_save(&self, inst: &Arc<Instance>) {
@@ -4635,35 +4587,6 @@ mod routing_tests {
         assert!(remedy_suffix(&llama_only, K::LlamaCpp, true).is_none());
         // Same-kind rows never count as an alternative lane.
         assert!(remedy_suffix(&llama_only, K::LlamaCpp, false).is_none());
-    }
-
-    #[test]
-    fn unit__pending_guard__drops_one_unit_on_any_exit() {
-        // Early-return style drop (simulate `?` exiting ensure).
-        fn inner(c: &Arc<AtomicI64>) -> Option<()> {
-            let _g = {
-                c.fetch_add(1, Ordering::SeqCst);
-                PendingGuard(c.clone())
-            };
-            None? // early exit drops the guard
-        }
-        // The bank-restore defer loop polls this counter: +1 at
-        // ensure_routed entry, -1 via Drop on EVERY exit path (the ?
-        // operator included). Arithmetic pinned here because the
-        // restore deferral's correctness hangs on the pairing.
-        let c = Arc::new(AtomicI64::new(0));
-        {
-            let _g = {
-                c.fetch_add(1, Ordering::SeqCst);
-                PendingGuard(c.clone())
-            };
-            assert_eq!(c.load(Ordering::SeqCst), 1);
-        }
-        assert_eq!(c.load(Ordering::SeqCst), 0);
-        // Early-return style drop (simulate `?` exiting ensure).
-        let c2 = Arc::new(AtomicI64::new(0));
-        let _ = inner(&c2);
-        assert_eq!(c2.load(Ordering::SeqCst), 0);
     }
 
     /// Engine stub: routing never spawns, so every method is inert.
@@ -5854,9 +5777,11 @@ mod routing_tests {
         kill_all(&[ph]);
     }
 
+    /// Default-on must stay inert without sustained pressure: an idle
+    /// `Ready` instance never adopts, even with `adaptive_slots` enabled.
     #[tokio::test]
-    async fn unit__adaptive_slots__off_by_default_is_noop() {
-        let sup = routing_sup(1); // adaptive_slots defaults false
+    async fn unit__adaptive_slots__no_load_pressure_never_adopts() {
+        let sup = routing_sup(1); // routing_sup builds Config::default(): adaptive_slots = true
         let (inst, ph) = fake_instance("m", InstanceState::Ready, 2);
         sup.instances.insert("m".into(), inst);
         for _ in 0..(SLOTS_STREAK_TICKS * 2) {
