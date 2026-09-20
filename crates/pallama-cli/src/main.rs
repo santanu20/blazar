@@ -4564,6 +4564,7 @@ async fn ps(reset: bool, json: bool) -> Result<()> {
                 serde_json::json!({
                     "name": m["name"].as_str(),
                     "replica": m["pallama_replica"].as_i64(),
+                    "engine": m["pallama_engine"].as_str(),
                     "state": m["pallama_state"].as_str(),
                     "ctx": m["pallama_ctx"].as_i64().unwrap_or(0),
                     "gpu": m["pallama_gpu"].as_str().unwrap_or("-"),
@@ -7479,6 +7480,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
         }
         EngineCmd::Prune => engine_prune(&d)?,
         EngineCmd::Rm { tag } => {
+            refuse_if_engine_in_use(&d, &tag).await?;
             engine_rm(&d, &tag)?;
         }
         EngineCmd::Rollback => {
@@ -8669,40 +8671,88 @@ fn engine_rm(d: &PallamaDirs, tag: &str) -> Result<()> {
         );
     }
     let dir = d.engines_dir().join(tag);
-    let mut reclaimed: u64 = 0;
-    let had_dir = dir.is_dir();
-    if had_dir {
-        // std-only size walk (a walkdir dep for one cleanup is not worth
-        // the tree cost): iterative stack, files only.
-        let mut stack = vec![dir.clone()];
-        while let Some(p) = stack.pop() {
-            if let Ok(rd) = std::fs::read_dir(&p) {
-                for entry in rd.flatten() {
-                    let ep = entry.path();
-                    if let Ok(md) = entry.metadata() {
-                        if md.is_dir() {
-                            stack.push(ep);
-                        } else {
-                            reclaimed += md.len();
-                        }
-                    }
-                }
-            }
-        }
-        std::fs::remove_dir_all(&dir)
-            .with_context(|| format!("failed to remove {}", dir.display()))?;
-    }
-    store.delete_engine(tag)?;
+    let reclaimed = pallama_runtime::engine::remove_engine_row_and_tree(&store, tag, &dir)?;
     let mib = reclaimed / (1024 * 1024);
     println!(
         "removed engine {tag} ({} MiB reclaimed{})",
         mib,
-        if had_dir {
+        if reclaimed > 0 {
             ""
         } else {
             ", directory already gone"
         }
     );
+    Ok(())
+}
+
+/// Model names whose live child serves from `tag`, out of a daemon
+/// `/api/ps` document. Pure — unit-testable without a daemon.
+fn ps_rows_using_engine(ps: &serde_json::Value, tag: &str) -> Vec<String> {
+    ps["models"].as_array().map_or(Vec::new(), |rows| {
+        rows.iter()
+            .filter(|m| m["pallama_engine"].as_str() == Some(tag))
+            .filter_map(|m| m["name"].as_str().map(str::to_string))
+            .collect()
+    })
+}
+
+/// Any child pidfile (model-named `*.pid`; the daemon's own
+/// `pallama.pid` does not count). Pure over file names so the
+/// daemon-down guard is unit-testable.
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // operand pre-lowercased
+fn any_child_pidfile(names: impl IntoIterator<Item = String>) -> bool {
+    names.into_iter().any(|f| {
+        let pid = f.to_lowercase().ends_with(".pid");
+        pid && !f.eq_ignore_ascii_case("pallama.pid")
+    })
+}
+
+/// Refuse `engine rm` while a live child serves from the engine — the
+/// same contract as model rm. Exact answer from the daemon's `/api/ps`
+/// (`pallama_engine` per row); when the daemon is not answering, any
+/// leftover child pidfile means children may still run untracked
+/// (orphans of a killed daemon), so refuse and teach the one-boot
+/// sweep instead of deleting a binary out from under a server.
+async fn refuse_if_engine_in_use(d: &PallamaDirs, tag: &str) -> Result<()> {
+    let cfg = config()?;
+    let base = daemon_base(&cfg);
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+    let reachable = match http.get(format!("{base}/healthz")).send().await {
+        Ok(r) => r.status().is_success(),
+        Err(_) => false,
+    };
+    if reachable {
+        let ps: serde_json::Value = http
+            .get(format!("{base}/api/ps"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let users = ps_rows_using_engine(&ps, tag);
+        if !users.is_empty() {
+            anyhow::bail!(
+                "engine {tag} is serving: {} — stop it first \
+                 (`pallama stop <model>` or wait for idle eviction)",
+                users.join(", ")
+            );
+        }
+        return Ok(());
+    }
+    let child_pidfiles = std::fs::read_dir(d.run_dir()).is_ok_and(|rd| {
+        any_child_pidfile(
+            rd.flatten()
+                .filter_map(|e| e.file_name().to_str().map(str::to_string)),
+        )
+    });
+    if child_pidfiles {
+        anyhow::bail!(
+            "child pidfiles exist but the daemon is not answering — start the \
+             daemon once (its boot sweep terminates orphan children) and retry \
+             `engine rm {tag}`"
+        );
+    }
     Ok(())
 }
 
@@ -11274,5 +11324,36 @@ mod tests {
         });
         let c = currency_verdict(Some("b10857"), &fresh, now, "").unwrap();
         assert!(c.ok && !c.warn, "{}", c.detail);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__ps_rows_using_engine__matches_only_rows_of_that_engine() {
+        let ps = serde_json::json!({
+            "models": [
+                {"name": "qwen2.5-0.5b", "pallama_engine": "b11026-cuda"},
+                {"name": "amd.instella", "pallama_engine": "fork-acme_llama.cpp-7a3c74eb-cuda"},
+                {"name": "no-engine-row"}
+            ]
+        });
+        let users = ps_rows_using_engine(&ps, "fork-acme_llama.cpp-7a3c74eb-cuda");
+        assert_eq!(users, vec!["amd.instella".to_string()]);
+        assert!(ps_rows_using_engine(&ps, "absent-engine").is_empty());
+        assert!(
+            ps_rows_using_engine(&serde_json::json!({}), "any").is_empty(),
+            "missing models key is not a refusal"
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__any_child_pidfile__model_pidfiles_count_daemon_pid_does_not() {
+        assert!(any_child_pidfile([
+            "pallama.pid".to_string(),
+            "qwen2.5-0.5b.pid".to_string()
+        ]));
+        assert!(any_child_pidfile(["Model#2.PID".to_string()]));
+        assert!(!any_child_pidfile(["pallama.pid".to_string()]));
+        assert!(!any_child_pidfile(["qwen2.5-0.5b.apikey".to_string()]));
     }
 }

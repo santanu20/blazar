@@ -400,6 +400,7 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
                 "model": p.name,
                 "size": p.bytes,
                 "pallama_replica": p.replica,
+                "pallama_engine": p.engine,
                 "pallama_state": p.state,
                 "pallama_ctx": p.ctx,
                 "pallama_gpu": p.gpu,

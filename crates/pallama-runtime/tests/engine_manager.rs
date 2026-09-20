@@ -1790,3 +1790,89 @@ async fn integration__update_resolved__keep_cuda_skip_downloads_nothing() {
         .count();
     assert_eq!(downloads, 0, "skip must fetch zero asset bytes");
 }
+
+#[test]
+#[allow(non_snake_case)]
+fn unit__remove_engine_row_and_tree__happy_path_removes_dir_row_and_aside() {
+    let (_t, dirs) = tmp_dirs();
+    let store = Store::open(&dirs).unwrap();
+    stage_lane(
+        &store,
+        &dirs,
+        "fork-acme_llama.cpp-22222222-cpu",
+        1000,
+        TrustTier::Curated,
+        &["x-arch"],
+        None,
+    );
+    let dir = dirs.engines_dir().join("fork-acme_llama.cpp-22222222-cpu");
+    assert!(dir.join("marker").exists());
+
+    let bytes = pallama_runtime::engine::remove_engine_row_and_tree(
+        &store,
+        "fork-acme_llama.cpp-22222222-cpu",
+        &dir,
+    )
+    .unwrap();
+    assert!(bytes > 0, "marker bytes reclaimed");
+    assert!(!dir.exists(), "engine dir gone");
+    assert!(
+        !store
+            .list_engines()
+            .unwrap()
+            .iter()
+            .any(|e| e.tag == "fork-acme_llama.cpp-22222222-cpu"),
+        "engine row gone"
+    );
+    let asides: Vec<_> = std::fs::read_dir(dirs.engines_dir())
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(".retired-"))
+        })
+        .collect();
+    assert!(asides.is_empty(), "no aside leaked: {asides:?}");
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn unit__remove_engine_row_and_tree__restores_dir_when_row_delete_fails() {
+    let (_t, dirs) = tmp_dirs();
+    let store = Store::open(&dirs).unwrap();
+    let tag = "fork-acme_llama.cpp-33333333-cpu";
+    stage_lane(
+        &store,
+        &dirs,
+        tag,
+        1000,
+        TrustTier::Curated,
+        &["x-arch"],
+        None,
+    );
+    let dir = dirs.engines_dir().join(tag);
+
+    // Break the store's delete: a second connection drops the engines
+    // table so `DELETE FROM engines` errors immediately (no busy-wait).
+    let blocker = rusqlite::Connection::open(dirs.data_dir.join("pallama.db")).unwrap();
+    blocker.execute("DROP TABLE engines", []).unwrap();
+
+    let err = pallama_runtime::engine::remove_engine_row_and_tree(&store, tag, &dir)
+        .expect_err("row delete must fail");
+    assert!(
+        format!("{err:#}").contains("cannot delete engine row"),
+        "error names the failed step: {err:#}"
+    );
+    assert!(dir.join("marker").exists(), "dir restored in place");
+    let asides: Vec<_> = std::fs::read_dir(dirs.engines_dir())
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(".retired-"))
+        })
+        .collect();
+    assert!(asides.is_empty(), "aside rolled back: {asides:?}");
+}

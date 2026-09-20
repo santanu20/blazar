@@ -406,6 +406,11 @@ pub enum SupervisionError {
 #[derive(Debug)]
 pub struct Instance {
     pub name: String,
+    /// Store tag of the engine build THIS child runs from — the daemon
+    /// global row under manual routing, the routed adapter's row under
+    /// auto/pin. `ps` and the `engine rm` live-children guard key off
+    /// it: an engine must not be deleted while a child serves from it.
+    pub engine_tag: String,
     /// Kind of the engine THIS child was spawned through — under
     /// `[engine_routing]` auto/pin a routed adapter can differ from the
     /// daemon-global active row; the gateway keys per-child protocol
@@ -659,6 +664,9 @@ impl CacheHint {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PsRow {
     pub name: String,
+    /// Store tag of the engine build serving this row — feeds `ps` and
+    /// the `engine rm` live-children guard.
+    pub engine: String,
     /// Replica index when the model runs multi-instance (`model#N`,
     /// B1); `None` for plain single-instance models.
     pub replica: Option<u32>,
@@ -1877,7 +1885,9 @@ impl Supervisor {
                     }
                     let inst = Arc::new(Instance {
                         name: ROUTER_KEY.to_string(),
-                        // the router child IS a llama-server process
+                        // the router child IS a llama-server process of
+                        // the daemon-global engine build
+                        engine_tag: self.engine.capabilities().tag.clone(),
                         kind: pallama_core::engine_kind::EngineKind::LlamaCpp,
                         endpoint,
                         state: std::sync::RwLock::new(InstanceState::Ready),
@@ -2886,6 +2896,9 @@ impl Supervisor {
                     let autofit_model_name = model.name.clone();
                     let inst = Arc::new(Instance {
                         name: key.to_string(),
+                        // routed adapter or daemon global — whichever
+                        // build this child's binary came from
+                        engine_tag: engine.capabilities().tag.clone(),
                         kind: engine.kind(),
                         endpoint: endpoint.clone(),
                         state: std::sync::RwLock::new(InstanceState::Ready),
@@ -4171,6 +4184,7 @@ impl Supervisor {
                     // bank, and keep_alive matching use the plain model
                     // name via model_of_key elsewhere.
                     name: display_name_of_key(&i.name).to_string(),
+                    engine: i.engine_tag.clone(),
                     replica: split_replica(&i.name).map(|(_, idx)| idx),
                     state: i.state.read().expect("state lock").as_str(),
                     endpoint: match &i.endpoint {
@@ -4995,6 +5009,7 @@ mod routing_tests {
         };
         let inst = Instance {
             name: key.to_string(),
+            engine_tag: "test-engine".to_string(),
             kind: pallama_core::engine_kind::EngineKind::LlamaCpp,
             endpoint: endpoint.clone(),
             state: std::sync::RwLock::new(InstanceState::Ready),
@@ -5047,6 +5062,9 @@ mod routing_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].gpu, "full");
         assert_eq!(rows[0].device.as_deref(), Some("RTX 4070"));
+        // The serving engine tag rides every row — the `engine rm`
+        // live-children guard keys off it.
+        assert_eq!(rows[0].engine, "test-engine");
     }
 
     #[tokio::test]
@@ -5127,6 +5145,7 @@ mod routing_tests {
         };
         let inst = Instance {
             name: key.to_string(),
+            engine_tag: "test-engine".to_string(),
             kind: pallama_core::engine_kind::EngineKind::LlamaCpp,
             endpoint: endpoint.clone(),
             state: std::sync::RwLock::new(state),

@@ -40,6 +40,8 @@ tempfile = "3"
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
 wiremock = "0.6"
+# integration tests break the store on purpose (row-delete failure pin)
+rusqlite = { workspace = true }
 
 [lints]
 workspace = true

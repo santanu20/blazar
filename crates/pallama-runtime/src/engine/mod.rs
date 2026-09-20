@@ -178,6 +178,26 @@ fn discard_retired_engine(aside: Option<&Path>) {
     }
 }
 
+/// Delete an engine's directory AND its store row as one unit: retire the
+/// dir aside first, delete the row second, discard the aside last. Any
+/// failure restores the previous state — a row never survives over a
+/// deleted dir (ghost row), and a dir never disappears while its row
+/// lives. Returns the bytes reclaimed. Both retirement paths (the boot
+/// sweep and manual `engine rm`) go through here so the ordering
+/// invariant has a single owner.
+pub fn remove_engine_row_and_tree(store: &Store, tag: &str, dir: &Path) -> Result<u64> {
+    let bytes = engine_dir_bytes(dir);
+    let aside = retire_engine_dir(dir)?;
+    if let Err(e) = store.delete_engine(tag) {
+        restore_retired_engine(aside.as_deref(), dir);
+        return Err(anyhow!(e).context(format!(
+            "cannot delete engine row {tag} — the engine dir was restored"
+        )));
+    }
+    discard_retired_engine(aside.as_deref());
+    Ok(bytes)
+}
+
 pub struct EngineManager {
     pub dirs: PallamaDirs,
     pub gh: GhClient,
@@ -1869,46 +1889,32 @@ impl EngineManager {
                 continue;
             }
             let dir = self.dirs.engines_dir().join(&row.tag);
-            let bytes = if dir.exists() {
-                engine_dir_bytes(&dir)
-            } else {
-                0
-            };
             // Retire-to-aside, then row-delete, then discard — the row
             // only disappears once the directory is safely out of the
             // way, and any failure restores the previous state (no
             // ghost row over a deleted dir). A lane that cannot be
-            // retired (locked dir, busy store) warns and frees the rest
+            // removed (locked dir, busy store) warns and frees the rest
             // of the pass: one poisoned lane must not block retirement
             // of its siblings on every sweep.
-            let aside = match retire_engine_dir(&dir) {
-                Ok(aside) => aside,
+            match remove_engine_row_and_tree(store, &row.tag, &dir) {
+                Ok(bytes) => {
+                    tracing::warn!(
+                        "retired curated fork lane {} ({} bytes) — rebuild any time via the registry",
+                        row.tag,
+                        bytes
+                    );
+                    self.bus.publish(PallamaEvent::EngineRemoved {
+                        tag: row.tag.clone(),
+                    });
+                }
                 Err(e) => {
                     tracing::warn!(
                         "cannot retire curated fork lane {} dir {} ({e:#}) — skipped this pass",
                         row.tag,
                         dir.display()
                     );
-                    continue;
                 }
-            };
-            if let Err(e) = store.delete_engine(&row.tag) {
-                restore_retired_engine(aside.as_deref(), &dir);
-                tracing::warn!(
-                    "cannot delete curated fork lane {} row ({e:#}) — skipped this pass",
-                    row.tag
-                );
-                continue;
             }
-            discard_retired_engine(aside.as_deref());
-            tracing::warn!(
-                "retired curated fork lane {} ({} bytes) — rebuild any time via the registry",
-                row.tag,
-                bytes
-            );
-            self.bus.publish(PallamaEvent::EngineRemoved {
-                tag: row.tag.clone(),
-            });
         }
         Ok(())
     }

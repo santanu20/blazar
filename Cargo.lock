@@ -1730,6 +1730,7 @@ dependencies = [
  "libc",
  "pallama-core",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
