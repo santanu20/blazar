@@ -41,6 +41,20 @@ Measured, not marketed. Same laptop, same weights, reproducible with one command
 | Long generation (t/s) | **41.2** | 40.2 | +2.5% |
 | 4-stream concurrent throughput (same-day, t/s) | ~36.7 | 36.0 | +2% honest (no cross-run cherry-pick) |
 
+Honest framing: single-stream decode on identical weights is physics-bound — same GPU, same quant, same llama.cpp-class kernels means both servers converge within ~5% of the silicon ceiling. **The multiples that matter live around the matmuls**, each measured, each with its campaign noted:
+
+| Structural axis | Delta | Measured in |
+|---|---|---|
+| Sustained 4-stream concurrency | **3.1x** | 0.5.0 campaign vs ollama 0.33.3 (sustained-load harness; re-claim on the current pair pending) |
+| Idle wake (sleep vs full reload) | **3.4x** (2104 vs 7194 ms) | 0.5.0 campaign |
+| Daemon boot | **7.7x** (0.54 vs 4.13 s) | 0.5.0 campaign |
+| Prefill on session-bank cache hit | **~6x cheaper** (7332 vs ~1.2k t/s cold prefill) | 0.5.0 campaign; the bank now restores in-spawn, race-free |
+| Speculative decode (MTP head) | **+38% longgen** (55.5 vs 40.2 t/s, lossless at temp 0) | 0.9.0 same-box A/B; off by default for plain models without a compatible draft |
+| Failure latency | **unbounded → bounded** | 0.9.0: worst case ~2 min with legal closes; ollama runner wedges observed live (3x in one session: VRAM leaks, /api/ps split-brain, 600 s hangs) |
+| Context served by default | 16384 (honored) | ollama 0.34.0 silently truncates at 4096 unless asked — a quality axis no tok/s table shows |
+
+Where the decode gap can still widen: re-pull the MTP variant (+38%, proven), engine build updates (the daemon flags newer builds than the pinned fork), a vocab-compatible draft for your model, and a sustained-load rerun on the current pair.
+
 In practice: **faster cold starts, faster first tokens, more decoded tokens per second — on the exact same weights — plus a request pipeline that no longer hangs, wedges, or silently drops streams under failure.** Every reliability fix in that pipeline was found, root-caused and pinned by this same benchmark harness.
 
 Quality detail: pallama leads HALLUCINATION (.95/.80), CONTEXT (1.0/.667), PERF (.8/.6); the tool-bearing categories (TOOLS/MULTITURN/TOOL_EFF) trail by a content class traced to ollama's Go-side prompt pre-render — the opt-in `ollama_compat` recipe lane with `decode_policy = "strict"` (grammar-whitelisted tool calls) is the named counter, not a mystery.
