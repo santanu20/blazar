@@ -251,7 +251,7 @@ The advanced surface, grouped by job. `--json`/JSONL output on the inspection co
 | Command | What it does |
 |---|---|
 | `pallama engine update/use/rollback/build` | sha256-verified engines, side-by-side, regression-gated; CUDA source builds through the same flow |
-| `pallama engine build --fork owner/llama.cpp@<sha>` | Capability lane for GGUF archs mainline can't load yet — immutable SHA pin, arch set mined from the fork, provenance in `engine list` |
+| `pallama engine build --fork owner/llama.cpp@<sha>` | Temporary capability lane for GGUF archs mainline can't load yet — immutable SHA pin, arch set mined from the fork, provenance in `engine list` |
 | `pallama engine offers` / `install --lane <id>` | Curated registry of community fork lanes per missing architecture (`--arch`, `--json`); one-command build |
 | `pallama upgrade [--dry-run]` | Self-update the binary from GitHub Releases, sha256-verified |
 | `pallama keys` | API key lifecycle — list / add / rm / rotate against the daemon |
@@ -261,6 +261,8 @@ The advanced surface, grouped by job. `--json`/JSONL output on the inspection co
 | `pallama doctor` / `pallama why` / `pallama watch` | One-table diagnosis; post-hoc trace answers; live tail of sentinel detections |
 | `pallama whisper` | Audio transcription (wav/mp3/flac/…; `--install`/`--pull`/`--list` manage the model) |
 | `pallama tts` | Offline speech synthesis (piper): `--install`, `--pull <voice>`, `--list`; WAV to file or stdout |
+
+Capability forks are a temporary bridge by design: a model the mainstream engine cannot load yet (a GGUF architecture living only in an unmerged llama.cpp fork) runs today on a fork lane, routing flips back to mainstream automatically once your installed mainstream build learns the architecture, and models, names, and chats are untouched by the switch.
 
 Lane retirement is automatic: when every architecture a lane serves ships upstream, the lane is marked superseded (pins auto-clear, `engine list` shows it), and curated lanes are removed after `fork_retire_days` — user-built forks and pinned lanes are never auto-deleted. A model that dies on `unknown model architecture` re-routes to an installed advertising lane exactly once and remembers the pin.
 

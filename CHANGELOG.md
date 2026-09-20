@@ -6,6 +6,8 @@ tracked here.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-21
+
 ### Fixed
 
 - **The keep-CUDA update guard now covers windows-x86_64 (CI windows lane had been red since the OS matrix was restored).** `keep_cuda_skip_pred` was hardcoded to linux-x86_64, so a Windows box with an active locally built CUDA engine (`engine build cuda`) downloaded the standard Vulkan asset on every channel update and registered it dormant — the exact wasted-download the guard exists to prevent, and the platform where the dormant copy is largest. The skip now applies on both x64 desktop OSes (macOS stays excluded: no CUDA, Metal lane); surfaced by the windows CI job failing `integration__update_resolved__keep_cuda_skip_downloads_nothing` since commit 426a9d7 restored the full OS matrix after an ubuntu-only era.
