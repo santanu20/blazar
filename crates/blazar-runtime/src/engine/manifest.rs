@@ -672,6 +672,14 @@ pub(crate) fn parse_sd_devices(text: &str) -> Vec<DeviceDesc> {
             if name.is_empty() || description.is_empty() {
                 return None;
             }
+            // sd-server also lists a `CPU<TAB>...` row (its --backend
+            // accepts per-module cpu assignment). The host CPU is not an
+            // accelerator: kept rows feed the GPU census, where a CPU
+            // entry can only mislead placement (`--device CPU` won a
+            // free-MiB tie on a CUDA box and killed llama spawns).
+            if name.eq_ignore_ascii_case("cpu") {
+                return None;
+            }
             Some(DeviceDesc {
                 name: name.to_string(),
                 description: description.to_string(),
@@ -859,7 +867,7 @@ mod tests {
     fn unit__parse_sd_devices__tab_shape_drops_log_lines() {
         // Verified live against sd-server master-890-74988b2 on the
         // 2-GPU dev box: `NAME<TAB>description`, MiB columns absent.
-        let text = "ggml_vulkan: Found 2 Vulkan devices\nVulkan0\tIntel(R) Iris Xe Graphics\nVulkan1\tNVIDIA GeForce RTX 4070 Laptop GPU\n\nCPU\t\n";
+        let text = "ggml_vulkan: Found 2 Vulkan devices\nVulkan0\tIntel(R) Iris Xe Graphics\nVulkan1\tNVIDIA GeForce RTX 4070 Laptop GPU\n\nCPU\tIntel(R) Core(TM) i7-14650HX\nCPU\t\n";
         let devices = parse_sd_devices(text);
         assert_eq!(devices.len(), 2);
         assert_eq!(devices[0].name, "Vulkan0");
@@ -867,6 +875,8 @@ mod tests {
         assert_eq!(devices[1].name, "Vulkan1");
         assert!(devices[1].description.contains("4070"));
         assert_eq!(devices[0].total_mib, 0);
+        // The host-CPU row is not an accelerator even with a populated
+        // description (it won a placement tie and killed llama spawns);
         // backend log line carries no tab; empty-description line drops
     }
 
