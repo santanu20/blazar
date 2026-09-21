@@ -1585,10 +1585,23 @@ pub(crate) fn model_file_intact(row: &ModelRow) -> bool {
         let Ok(meta) = std::fs::metadata(path) else {
             return false;
         };
-        meta.len() == u64::try_from(row.bytes).unwrap_or(u64::MAX)
-            && gguf::read_metadata_file(path).is_ok()
+        meta.len() == u64::try_from(row.bytes).unwrap_or(u64::MAX) && gguf_container_ok(path)
     } else {
         gguf::read_metadata_file(path).is_ok()
+    }
+}
+
+/// Container-level GGUF check: header + KV section must parse.
+/// `read_metadata_file` additionally requires
+/// `general.architecture`, which diffusion component files (DiT /
+/// encoder splits — 0-KV GGUFs) never carry; for them that exact
+/// error still proves the container walked clean (magic, version,
+/// every KV entry). Same string-match precedent as the reconcile and
+/// read_model_meta guards. Any other parse error is real corruption.
+fn gguf_container_ok(path: &Path) -> bool {
+    match gguf::read_metadata_file(path) {
+        Ok(_) => true,
+        Err(e) => e.to_string().contains("missing general.architecture"),
     }
 }
 
@@ -3442,6 +3455,21 @@ mod tests {
         assert!(!model_file_intact(&row(
             bad.to_str().unwrap(),
             content.len() as u64,
+            1
+        )));
+        // Diffusion component GGUF (0 KVs, valid container): the
+        // "missing general.architecture" parse still proves the
+        // container walked clean — intact, or every re-pull would
+        // prune + redownload a sound 4.6 GiB DiT forever.
+        let mut kvless = b"GGUF".to_vec();
+        kvless.extend_from_slice(&3u32.to_le_bytes());
+        kvless.extend_from_slice(&297u64.to_le_bytes());
+        kvless.extend_from_slice(&0u64.to_le_bytes());
+        let dit = tmp.path().join("dit.gguf");
+        std::fs::write(&dit, &kvless).unwrap();
+        assert!(model_file_intact(&row(
+            dit.to_str().unwrap(),
+            kvless.len() as u64,
             1
         )));
         // Sharded: header-only check on the launch shard (bytes is a SUM
