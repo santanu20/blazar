@@ -28,6 +28,7 @@ pub mod registry;
 pub mod sessionreg;
 pub mod supervisor;
 pub mod upgrade;
+pub mod verify;
 pub mod whisper;
 
 pub use bench::{parse_bench_json, BenchRow, Tuner};
@@ -46,3 +47,4 @@ pub use probe::probe_hardware;
 pub use supervisor::{
     resolve_draft_path, EngineRef, PrefixKey, PsRow, SupervisionError, Supervisor, ROUTER_KEY,
 };
+pub use verify::{verify_model, VerifyReport};

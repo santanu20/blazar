@@ -22,6 +22,7 @@ use pallama_runtime::engine::gh::{btag_number, same_build, GhClient};
 use pallama_runtime::engine::EngineManager;
 use pallama_runtime::engine_impl::Engine;
 use pallama_runtime::EventBus;
+use pallama_runtime::VerifyReport;
 use pallama_runtime::{LlamaCppEngine, MistralRsEngine, Supervisor};
 
 #[derive(Parser)]
@@ -118,6 +119,11 @@ enum Cmd {
         /// files stay on disk and boot preflight re-adopts them.
         #[arg(long)]
         force: bool,
+        /// Verify the already-pulled model's sha256 instead of pulling:
+        /// re-hashes the file against the store row and exits non-zero on
+        /// a mismatch.
+        #[arg(long)]
+        verify: bool,
     },
     /// Import an existing GGUF file (hardlinks by default; --copy for a copy)
     Import {
@@ -1069,7 +1075,11 @@ async fn run(cmd: Cmd) -> Result<()> {
     match cmd {
         Cmd::Serve => serve().await,
         Cmd::Stop { model } => stop_cmd(model.map(|m| resolve_model_cli(&m))).await,
-        Cmd::Pull { target, force } => pull(&target, force).await,
+        Cmd::Pull {
+            target,
+            force,
+            verify,
+        } => pull(&target, force, verify).await,
         Cmd::Import {
             path,
             name,
@@ -3959,7 +3969,48 @@ mod signal_stop {
     }
 }
 
-async fn pull(target: &str, force: bool) -> Result<()> {
+async fn pull(target: &str, force: bool, verify: bool) -> Result<()> {
+    // Verify-only mode: no network, no pull lock — hash what is already
+    // on disk against the store row and exit non-zero on any bad answer.
+    if verify {
+        return match pallama_runtime::verify_model(&dirs(), target).await? {
+            VerifyReport::Verified {
+                name,
+                bytes,
+                sha256,
+            } => {
+                println!(
+                    "verified {name}: {} (sha256 {sha256})",
+                    humansize(bytes.cast_signed())
+                );
+                Ok(())
+            }
+            VerifyReport::Mismatch {
+                name,
+                path,
+                expected,
+                actual,
+                ..
+            } => Err(anyhow::anyhow!(
+                "sha256 mismatch for {name} at {} — expected {expected}, got {actual}; \
+                 re-pull to replace the corrupt file",
+                path.display()
+            )),
+            VerifyReport::NoDigest { name, path } => Err(anyhow::anyhow!(
+                "{name} ({}) has no recorded sha256 — nothing to verify against; \
+                 re-pull to record one",
+                path.display()
+            )),
+            VerifyReport::DirRowUnsupported { name, path } => Err(anyhow::anyhow!(
+                "{name} is a safetensors directory model ({}) — content verification \
+                 covers single-file GGUF rows only",
+                path.display()
+            )),
+            VerifyReport::NotFound { name } => Err(anyhow::anyhow!(
+                "model {name:?} not found in the local store — pull it first"
+            )),
+        };
+    }
     let (row, already_present) = pull_model(target, force).await?;
     // Banner only on success: an upgrade hint decorating a pull FAILURE
     // reads as noise (fit/mmproj already follow this order).
