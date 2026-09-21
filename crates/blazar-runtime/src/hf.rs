@@ -1690,9 +1690,15 @@ pub(crate) fn repull_gate(
 }
 
 /// A diffusion component row whose REQUIRED sidecar (`VAE` or text
-/// encoder) no longer exists on disk. The optional vision encoder is
-/// not a repair trigger — its loss only disables image edits.
+/// encoder) is absent — deleted from disk, or never attached because
+/// the row predates the component-set pull. Known-family rows must
+/// CARRY the set: `None` is as missing as a dead path. The optional
+/// vision encoder is not a repair trigger — its loss only disables
+/// image edits.
 pub(crate) fn required_component_missing(row: &ModelRow) -> bool {
+    if crate::diffusion::diffusion_family(&row.repo).is_some() {
+        return row.vae_path.is_none() || row.llm_path.is_none();
+    }
     [row.vae_path.as_deref(), row.llm_path.as_deref()]
         .into_iter()
         .flatten()
@@ -2308,8 +2314,9 @@ impl Puller {
         if let Repull::DeltaComponents = decision {
             // The `DiT` is intact (gate proved it); only the component set
             // needs fetching. Family comes from the row's own repo —
-            // the gate only reaches here on a same-repo re-pull.
-            if let Some(old) = existing.filter(|r| r.vae_path.is_some() || r.llm_path.is_some()) {
+            // the gate reaches here for never-attached rows (predating
+            // the component-set pull) and for dead-sidecar rows alike.
+            if let Some(old) = existing {
                 let family = crate::diffusion::diffusion_family(&old.repo).ok_or_else(|| {
                     anyhow!(
                         "component repair for {} has no known family (supported: {})",
@@ -3502,6 +3509,51 @@ mod tests {
         assert!(flip_guard("m", Some(&dir_row), true, false).is_ok());
         assert!(flip_guard("m", Some(&dir_row), false, true).is_ok());
         assert!(flip_guard("m", None, false, false).is_ok());
+    }
+
+    #[test]
+    fn unit__repull_gate__diffusion_family_row_without_set_is_a_component_repair() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Valid kvless component GGUF at the recorded size (the intact
+        // container shape from the truth-table pin).
+        let mut kvless = b"GGUF".to_vec();
+        kvless.extend_from_slice(&3u32.to_le_bytes());
+        kvless.extend_from_slice(&297u64.to_le_bytes());
+        kvless.extend_from_slice(&0u64.to_le_bytes());
+        let dit = tmp.path().join("dit.gguf");
+        std::fs::write(&dit, &kvless).unwrap();
+        let dit = dit.to_str().unwrap();
+
+        // Known family, set NEVER attached (row predates the
+        // component pull): Present would strand a 4.6 GiB DiT that can
+        // never boot — the gate must escalate to component repair.
+        let row = seed_row(
+            "qwen-image-2.1",
+            "abenzerps/Qwen-Image-2.1-GGUF",
+            "Q4_K_M",
+            dit,
+            kvless.len() as u64,
+            1,
+        );
+        assert!(matches!(
+            repull_gate(
+                Some(&row),
+                "qwen-image-2.1",
+                &row.repo,
+                "Q4_K_M",
+                None,
+                false
+            ),
+            Repull::DeltaComponents
+        ));
+
+        // Unknown-family GGUF with no set is a plain present model —
+        // no repair exists to run.
+        let text = seed_row("m", "some/repo", "Q4_K_M", dit, kvless.len() as u64, 1);
+        assert!(matches!(
+            repull_gate(Some(&text), "m", &text.repo, "Q4_K_M", None, false),
+            Repull::Present(_)
+        ));
     }
 
     #[test]
