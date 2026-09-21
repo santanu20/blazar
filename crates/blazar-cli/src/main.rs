@@ -1377,12 +1377,9 @@ impl Check {
 fn routed_engine_lane(
     cfg: &blazar_core::Config,
     global: Option<&(String, blazar_core::engine_kind::EngineKind)>,
-    installed: &[(
-        String,
-        blazar_core::engine_kind::EngineKind,
-        blazar_core::engine_kind::LaneClass,
-    )],
+    engine_rows: &[blazar_core::EngineRow],
     name: &str,
+    arch: Option<&str>,
     path: &str,
 ) -> Result<String, String> {
     let Some((g_tag, g_kind)) = global else {
@@ -1392,6 +1389,14 @@ fn routed_engine_lane(
     let pin = overlay.engine.as_deref();
     let safetensors = std::path::Path::new(path).is_dir();
     let quantized = blazar_core::store::quantized_safetensors_signal(name, "", path);
+    let installed: Vec<(
+        String,
+        blazar_core::engine_kind::EngineKind,
+        blazar_core::engine_kind::LaneClass,
+    )> = engine_rows
+        .iter()
+        .map(|r| (r.tag.clone(), r.kind, r.lane_class()))
+        .collect();
     match blazar_core::engine_kind::serving_lane(
         cfg.engine_routing.mode,
         cfg.engine_routing.policy,
@@ -1399,11 +1404,124 @@ fn routed_engine_lane(
         safetensors,
         quantized,
         *g_kind,
-        installed,
+        &installed,
     ) {
-        Ok(Some((tag, _))) => Ok(tag),
-        Ok(None) => Ok(g_tag.clone()),
+        Ok(Some((tag, kind))) => {
+            Ok(
+                blazar_runtime::predicted_rescue_lane(engine_rows, arch, pin, &tag, kind)
+                    .unwrap_or(tag),
+            )
+        }
+        Ok(None) => {
+            Ok(
+                blazar_runtime::predicted_rescue_lane(engine_rows, arch, pin, g_tag, *g_kind)
+                    .unwrap_or_else(|| g_tag.clone()),
+            )
+        }
         Err(teach) => Err(teach),
+    }
+}
+
+/// Architecture-gap marker for `list`'s ENGINE cell. The cell names the
+/// ROUTING lane (format/policy/pin — see `routed_engine_lane`), which
+/// says nothing about whether that engine's build knows the model's GGUF
+/// architecture: a gap crash-classifies at spawn (auto-routing then
+/// rescues via a fork lane when one is installed). Marks only when the
+/// answer is knowable: a GGUF model with a parsed arch routed onto a
+/// llamacpp lane whose manifest carries a non-empty mined arch set.
+/// Empty sets (pre-v2 rows, other kinds) stay unmarked — unknown is not
+/// missing.
+/// List/footer label for GGUF rows that registered with NO architecture
+/// at all (0-KV diffusion-component files) — a file-level fact: no
+/// llama.cpp lane can ever load them, whatever its advertised set.
+const NO_ARCH_METADATA: &str = "(no architecture metadata)";
+
+fn engine_arch_gap(
+    engine_rows: &[blazar_core::EngineRow],
+    lane_tag: &str,
+    model_arch: Option<&str>,
+    model_is_gguf: bool,
+) -> Option<String> {
+    if !model_is_gguf {
+        return None;
+    }
+    let row = engine_rows.iter().find(|r| r.tag == lane_tag)?;
+    if row.kind != blazar_core::engine_kind::EngineKind::LlamaCpp {
+        return None;
+    }
+    let Some(arch) = model_arch else {
+        return Some(NO_ARCH_METADATA.to_string());
+    };
+    match serde_json::from_str::<blazar_runtime::Manifest>(&row.manifest) {
+        Ok(m) if !m.architectures.is_empty() && !m.advertises_arch(arch) => Some(arch.to_string()),
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!(
+                "warn: engine {lane_tag} manifest undecodable ({e}) — arch gap check skipped"
+            );
+            None
+        }
+    }
+}
+
+/// Engine cell for one `list` table row: appends the dagger and records
+/// the (lane, arch) gap when the routed lane cannot load the model's
+/// GGUF arch (see [`engine_arch_gap`]).
+fn engine_cell_with_gap(
+    engine_rows: &[blazar_core::EngineRow],
+    engine: &str,
+    m: &blazar_core::store::ModelRow,
+    arch_gaps: &mut std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+) -> String {
+    match engine_arch_gap(
+        engine_rows,
+        engine,
+        m.arch.as_deref(),
+        !std::path::Path::new(&m.path).is_dir(),
+    ) {
+        Some(missing) => {
+            arch_gaps
+                .entry(engine.to_string())
+                .or_default()
+                .insert(missing);
+            format!("{engine}\u{2020}")
+        }
+        None => engine.to_string(),
+    }
+}
+
+/// Teaching footer under the `list` table: one line per lane that
+/// provably cannot load one of the routed models' architectures, and a
+/// dedicated line for lanes routed onto diffusion-component GGUFs (no
+/// architecture metadata at all).
+fn print_arch_gap_footer(
+    arch_gaps: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+) {
+    for (tag, missing) in arch_gaps {
+        let mut archs = Vec::new();
+        let mut component_files = false;
+        for m in missing {
+            if m == NO_ARCH_METADATA {
+                component_files = true;
+            } else {
+                archs.push(m.clone());
+            }
+        }
+        if !archs.is_empty() {
+            let archs = archs.join(", ");
+            println!(
+                "\u{2020} {tag} cannot load {archs} — the ENGINE column is the routing lane, not a \
+                 capability guarantee; spawn fails with teaching unless a covering fork lane is \
+                 installed (blazar engine offers)"
+            );
+        }
+        if component_files {
+            println!(
+                "\u{2020} {tag} is routed for GGUF(s) with {NO_ARCH_METADATA} — \
+                 diffusion/model-component files; no installed engine serves image components \
+                 (image lane unimplemented)"
+            );
+        }
     }
 }
 
@@ -1774,14 +1892,6 @@ fn doctor_routing(d: &blazar_core::dirs::BlazarDirs) -> Vec<Check> {
     let Ok(engine_rows) = store.list_engines() else {
         return Vec::new();
     };
-    let installed: Vec<(
-        String,
-        blazar_core::engine_kind::EngineKind,
-        blazar_core::engine_kind::LaneClass,
-    )> = engine_rows
-        .iter()
-        .map(|r| (r.tag.clone(), r.kind, r.lane_class()))
-        .collect();
     let global = engine_rows
         .iter()
         .find(|r| r.active)
@@ -1789,8 +1899,14 @@ fn doctor_routing(d: &blazar_core::dirs::BlazarDirs) -> Vec<Check> {
     let mut checks = Vec::new();
     let mut unservable = 0;
     for m in &models {
-        if let Err(teach) = routed_engine_lane(&cfg, global.as_ref(), &installed, &m.name, &m.path)
-        {
+        if let Err(teach) = routed_engine_lane(
+            &cfg,
+            global.as_ref(),
+            &engine_rows,
+            &m.name,
+            m.arch.as_deref(),
+            &m.path,
+        ) {
             unservable += 1;
             checks.push(Check::warn("routing", format!("{}: {teach}", m.name)));
         }
@@ -4419,6 +4535,55 @@ fn render_list_table(header: [&str; 8], rows: &[[String; 8]]) -> String {
     out.trim_end().to_string()
 }
 
+/// One `list --json` JSONL row: machine-typed mirror of the table
+/// (`mmproj_bytes` null = no projector configured, 0 = configured but
+/// missing on disk, `engine` null = nothing installed serves the model),
+/// plus the additive `engine_arch_gap` key when the routed llamacpp
+/// lane provably lacks this GGUF's arch (see [`engine_arch_gap`]).
+fn list_json_row(
+    cfg: &blazar_core::Config,
+    global: Option<&(String, blazar_core::engine_kind::EngineKind)>,
+    engine_rows: &[blazar_core::EngineRow],
+    m: &blazar_core::store::ModelRow,
+) -> serde_json::Value {
+    let mmproj_bytes = m
+        .mmproj_path
+        .as_ref()
+        .map(|p| std::fs::metadata(p).map_or(0, |md| md.len()));
+    let engine = routed_engine_lane(
+        cfg,
+        global,
+        engine_rows,
+        &m.name,
+        m.arch.as_deref(),
+        &m.path,
+    )
+    .ok()
+    .and_then(|lane| (!lane.is_empty()).then_some(lane));
+    let mut row = serde_json::json!({
+        "name": m.name,
+        "quant": m.quant,
+        "bytes": m.bytes,
+        "mmproj_bytes": mmproj_bytes,
+        "arch": m.arch,
+        "ctx_train": m.ctx_train,
+        "format": model_type_label(&m.path),
+        "engine": engine,
+        "path": m.path,
+    });
+    if let Some(arch) = engine.as_deref().and_then(|tag| {
+        engine_arch_gap(
+            engine_rows,
+            tag,
+            m.arch.as_deref(),
+            !std::path::Path::new(&m.path).is_dir(),
+        )
+    }) {
+        row["engine_arch_gap"] = serde_json::json!(arch);
+    }
+    row
+}
+
 fn list(json: bool) -> Result<()> {
     let store = Store::open(&dirs())?;
     let models = store.list_models()?;
@@ -4428,44 +4593,16 @@ fn list(json: bool) -> Result<()> {
     // lane; "-" = nothing installed serves the model).
     let cfg = blazar_core::Config::load(&dirs()).unwrap_or_default();
     let engine_rows = store.list_engines()?;
-    let installed: Vec<(
-        String,
-        blazar_core::engine_kind::EngineKind,
-        blazar_core::engine_kind::LaneClass,
-    )> = engine_rows
-        .iter()
-        .map(|r| (r.tag.clone(), r.kind, r.lane_class()))
-        .collect();
     let global = engine_rows
         .iter()
         .find(|r| r.active)
         .map(|r| (r.tag.clone(), r.kind));
     if json {
-        // Machine-typed mirror of the table: mmproj_bytes null = no
+        // Machine-typed mirror of the table: `mmproj_bytes` null = no
         // projector configured (0 = configured but missing on disk),
-        // engine null = nothing installed serves the model.
+        // `engine` null = nothing installed serves the model.
         for m in &models {
-            let mmproj_bytes = m
-                .mmproj_path
-                .as_ref()
-                .map(|p| std::fs::metadata(p).map_or(0, |md| md.len()));
-            let engine = routed_engine_lane(&cfg, global.as_ref(), &installed, &m.name, &m.path)
-                .ok()
-                .and_then(|lane| (!lane.is_empty()).then_some(lane));
-            println!(
-                "{}",
-                serde_json::json!({
-                    "name": m.name,
-                    "quant": m.quant,
-                    "bytes": m.bytes,
-                    "mmproj_bytes": mmproj_bytes,
-                    "arch": m.arch,
-                    "ctx_train": m.ctx_train,
-                    "format": model_type_label(&m.path),
-                    "engine": engine,
-                    "path": m.path,
-                })
-            );
+            println!("{}", list_json_row(&cfg, global.as_ref(), &engine_rows, m));
         }
         return Ok(());
     }
@@ -4473,6 +4610,8 @@ fn list(json: bool) -> Result<()> {
         println!("no models pulled");
         return Ok(());
     }
+    let mut arch_gaps: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
     let rows: Vec<[String; 8]> = models
         .iter()
         .map(|m| {
@@ -4491,8 +4630,19 @@ fn list(json: bool) -> Result<()> {
                     }
                 },
             );
-            let engine = routed_engine_lane(&cfg, global.as_ref(), &installed, &m.name, &m.path)
-                .unwrap_or_else(|_| "-".to_string());
+            let engine = routed_engine_lane(
+                &cfg,
+                global.as_ref(),
+                &engine_rows,
+                &m.name,
+                m.arch.as_deref(),
+                &m.path,
+            )
+            .unwrap_or_else(|_| "-".to_string());
+            // Same marker the JSON lane carries: the routing lane cannot
+            // load this arch — the cell gets a dagger and the footer
+            // teaches the fork-lane rescue.
+            let engine_cell = engine_cell_with_gap(&engine_rows, &engine, m, &mut arch_gaps);
             [
                 m.name.clone(),
                 m.quant.clone(),
@@ -4501,7 +4651,7 @@ fn list(json: bool) -> Result<()> {
                 m.arch.clone().unwrap_or_else(|| "?".to_string()),
                 m.ctx_train.map_or_else(String::new, |c| c.to_string()),
                 model_type_label(&m.path),
-                engine,
+                engine_cell,
             ]
         })
         .collect();
@@ -4512,6 +4662,7 @@ fn list(json: bool) -> Result<()> {
             &rows
         )
     );
+    print_arch_gap_footer(&arch_gaps);
     Ok(())
 }
 
@@ -9669,6 +9820,105 @@ async fn upgrade(version: Option<String>, dry_run: bool) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn gap_engine_row(tag: &str, kind: EngineKind, archs: &[&str]) -> blazar_core::EngineRow {
+        blazar_core::EngineRow {
+            tag: tag.to_string(),
+            asset: "asset".to_string(),
+            sha256: "0".to_string(),
+            installed_at: 0,
+            active: true,
+            manifest: serde_json::json!({
+                "tag": tag,
+                "build_number": 1,
+                "version_raw": "version: 1",
+                "devices": [],
+                "flags": [],
+                "spec_types": [],
+                "server_path": "/x/llama-server",
+                "architectures": archs,
+            })
+            .to_string(),
+            kind,
+        }
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
+    fn unit__engine_arch_gap__marks_gguf_arch_missing_from_nonempty_set() {
+        let rows = vec![gap_engine_row("b1-cuda", EngineKind::LlamaCpp, &["qwen2"])];
+        assert_eq!(
+            engine_arch_gap(&rows, "b1-cuda", Some("instella-moe"), true),
+            Some("instella-moe".to_string())
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__engine_arch_gap__silent_when_arch_advertised() {
+        let rows = vec![gap_engine_row(
+            "b1-cuda",
+            EngineKind::LlamaCpp,
+            &["qwen2", "qwen35"],
+        )];
+        assert_eq!(
+            engine_arch_gap(&rows, "b1-cuda", Some("qwen35"), true),
+            None
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__engine_arch_gap__silent_when_set_empty_honest_unknown() {
+        // Pre-v2 manifests advertise nothing — unknown is not missing.
+        let rows = vec![gap_engine_row("old-cuda", EngineKind::LlamaCpp, &[])];
+        assert_eq!(
+            engine_arch_gap(&rows, "old-cuda", Some("instella-moe"), true),
+            None
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__engine_arch_gap__silent_for_non_llamacpp_kind() {
+        // sglang/mistralrs arch strings are HF names in a different
+        // domain — the ggml arch-set check must not fire for them.
+        let rows = vec![gap_engine_row("sglang-1", EngineKind::Sglang, &["qwen2"])];
+        assert_eq!(
+            engine_arch_gap(&rows, "sglang-1", Some("Qwen2ForCausalLM"), false),
+            None
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__engine_arch_gap__marks_gguf_without_arch_metadata() {
+        // The diffusion-component shape: registered with no arch (0-KV
+        // GGUF) — a file-level fact, so the marker fires even when the
+        // lane's arch set is unknown (empty manifest set).
+        let rows = vec![gap_engine_row("b-old", EngineKind::LlamaCpp, &[])];
+        assert_eq!(
+            engine_arch_gap(&rows, "b-old", None, true),
+            Some("(no architecture metadata)".to_string())
+        );
+        // Non-GGUF rows never mark, whatever their arch state.
+        assert_eq!(engine_arch_gap(&rows, "b-old", None, false), None);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__engine_arch_gap__silent_when_arch_or_lane_unknown() {
+        let rows = vec![gap_engine_row("b1-cuda", EngineKind::LlamaCpp, &["qwen2"])];
+        assert_eq!(
+            engine_arch_gap(&rows, "missing-tag", Some("qwen2"), true),
+            None
+        );
+        // Non-GGUF rows (safetensors dirs) never mark even on llamacpp.
+        assert_eq!(
+            engine_arch_gap(&rows, "b1-cuda", Some("qwen2"), false),
+            None
+        );
+    }
+
     #[test]
     fn unit__run_no_draft__parses_before_prompt_only() {
         // Flags BEFORE the prompt parse (trailing_var_arg owns
@@ -10615,37 +10865,44 @@ mod tests {
 
     #[test]
     fn unit__routed_engine_lane__mirrors_serving_lane_contract() {
-        use blazar_core::engine_kind::{EngineKind, LaneClass};
+        use blazar_core::engine_kind::EngineKind;
 
         let cfg = blazar_core::Config::default();
-        let installed = vec![
-            (
-                "b-new".to_string(),
-                EngineKind::LlamaCpp,
-                LaneClass::Mainstream,
-            ),
-            (
-                "sg-1".to_string(),
-                EngineKind::Sglang,
-                LaneClass::Mainstream,
-            ),
+        let engine_rows = vec![
+            gap_engine_row("b-new", EngineKind::LlamaCpp, &["qwen2"]),
+            gap_engine_row("sg-1", EngineKind::Sglang, &[]),
         ];
         let global = ("b-new".to_string(), EngineKind::LlamaCpp);
 
-        // Manual mode: the global lane serves, tag echoed back.
+        // Manual mode: the global lane serves, tag echoed back (arch it
+        // advertises — no rescue prediction).
         assert_eq!(
-            routed_engine_lane(&cfg, Some(&global), &installed, "m", "/x/m.gguf"),
+            routed_engine_lane(
+                &cfg,
+                Some(&global),
+                &engine_rows,
+                "m",
+                Some("qwen2"),
+                "/x/m.gguf"
+            ),
             Ok("b-new".to_string())
         );
         // No engines at all: teaching error names the install command.
-        let err = routed_engine_lane(&cfg, None, &[], "m", "/x/m.gguf").unwrap_err();
+        let err = routed_engine_lane(&cfg, None, &[], "m", Some("qwen2"), "/x/m.gguf").unwrap_err();
         assert!(err.contains("blazar engine install"), "{err}");
         // A per-model pin to an uninstalled lane teaches with the roster.
         let pinned =
             blazar_core::Config::from_toml("[model_overrides.m]\nengine = \"mistralrs\"\n")
                 .unwrap();
-        let err =
-            routed_engine_lane(&pinned, Some(&global), &installed, "m", "/x/m.gguf").unwrap_err();
+        let err = routed_engine_lane(
+            &pinned,
+            Some(&global),
+            &engine_rows,
+            "m",
+            Some("qwen2"),
+            "/x/m.gguf",
+        )
+        .unwrap_err();
         assert!(err.contains("no mistralrs engine installed"), "{err}");
         // Auto mode routes safetensors away from the llamacpp global.
         // (is_dir() must see a REAL directory — the format signal.)
@@ -10655,11 +10912,76 @@ mod tests {
             routed_engine_lane(
                 &auto,
                 Some(&global),
-                &installed,
+                &engine_rows,
                 "m",
+                Some("Qwen2ForCausalLM"),
                 &dir.to_string_lossy()
             ),
             Ok("sg-1".to_string())
+        );
+    }
+
+    #[test]
+    fn unit__routed_engine_lane__predicts_capability_rescue_lane() {
+        // The picked lane provably lacks the model's arch and another
+        // installed lane advertises it: the preview shows the lane the
+        // spawn-time rescue will land on, not the one that would crash.
+        let engine_rows = vec![
+            gap_engine_row("b-main", EngineKind::LlamaCpp, &["qwen2"]),
+            gap_engine_row("b-adv", EngineKind::LlamaCpp, &["instella-moe"]),
+        ];
+        let global = ("b-main".to_string(), EngineKind::LlamaCpp);
+        let cfg = blazar_core::Config::default();
+        assert_eq!(
+            routed_engine_lane(
+                &cfg,
+                Some(&global),
+                &engine_rows,
+                "m",
+                Some("instella-moe"),
+                "/x/m.gguf"
+            ),
+            Ok("b-adv".to_string())
+        );
+        // Arch the picked lane advertises: no rescue, plain echo.
+        assert_eq!(
+            routed_engine_lane(
+                &cfg,
+                Some(&global),
+                &engine_rows,
+                "m",
+                Some("qwen2"),
+                "/x/m.gguf"
+            ),
+            Ok("b-main".to_string())
+        );
+        // A pin is the user's explicit choice: the rescue prediction
+        // never overrides it (same gate the spawn rescue has).
+        let pinned =
+            blazar_core::Config::from_toml("[model_overrides.m]\nengine = \"b-main\"\n").unwrap();
+        assert_eq!(
+            routed_engine_lane(
+                &pinned,
+                Some(&global),
+                &engine_rows,
+                "m",
+                Some("instella-moe"),
+                "/x/m.gguf"
+            ),
+            Ok("b-main".to_string())
+        );
+        // No advertiser: the picked lane stays (the list marker / spawn
+        // teaching take over from there).
+        assert_eq!(
+            routed_engine_lane(
+                &cfg,
+                Some(&global),
+                &engine_rows,
+                "m",
+                Some("mystery-arch"),
+                "/x/m.gguf"
+            ),
+            Ok("b-main".to_string())
         );
     }
 

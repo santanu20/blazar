@@ -37,7 +37,7 @@ pub use daemon::{
     LockHeld,
 };
 pub use engine::gh::GhClient;
-pub use engine::manifest::{probe as probe_manifest, Manifest, Vendor};
+pub use engine::manifest::{predicted_rescue_lane, probe as probe_manifest, Manifest, Vendor};
 pub use engine::{system_vendor_hint, EngineManager, LOCAL_TAG};
 pub use engine_impl::{ChildHandle, Engine, LlamaCppEngine, MistralRsEngine, SglangEngine};
 pub use events::{BlazarEvent, EventBus, InstanceState};

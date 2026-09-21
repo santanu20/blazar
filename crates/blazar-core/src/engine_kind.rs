@@ -274,6 +274,40 @@ pub fn serving_lane_typed(
     }
 }
 
+/// Borrowed lane view for [`advertising_lanes`]: (tag, routing class,
+/// mined GGUF arch set — `None` = nothing mined, advertises nothing).
+pub type LaneArchView<'a> = (
+    &'a str,
+    LaneClass,
+    Option<&'a std::collections::BTreeSet<String>>,
+);
+
+/// Lanes the spawn-time capability rescue considers for `arch` — the
+/// ONE preference rule shared by the supervisor's rescue and every
+/// listing preview (list ENGINE cell, /api/tags, /v1/models): among
+/// installed llama.cpp lanes whose mined arch set advertises the
+/// architecture, a Mainstream build beats a Fork shim, and the caller's
+/// (newest-first) order wins inside each class. `exclude` drops the
+/// lane that already failed (spawn) or the lane the router picked
+/// (preview prediction).
+#[must_use]
+pub fn advertising_lanes<'a>(
+    arch: &str,
+    exclude: Option<&str>,
+    lanes: &[LaneArchView<'a>],
+) -> Vec<&'a str> {
+    let mut hits: Vec<(&str, LaneClass)> = lanes
+        .iter()
+        .filter(|(t, _, _)| Some(*t) != exclude)
+        .filter(|(_, _, set)| set.is_some_and(|s| s.contains(arch)))
+        .map(|(t, class, _)| (*t, *class))
+        .collect();
+    // Stable sort: mainstream first, caller order preserved inside each
+    // class — byte-for-byte the supervisor's rescue pick.
+    hits.sort_by_key(|(_, class)| u8::from(*class == LaneClass::Fork));
+    hits.into_iter().map(|(tag, _)| tag).collect()
+}
+
 impl fmt::Display for EngineKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -314,6 +348,40 @@ impl FromSql for EngineKind {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
+    fn unit__advertising_lanes__mainstream_first_newest_within_class() {
+        use std::collections::BTreeSet;
+        let set = |archs: &[&str]| {
+            archs
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<BTreeSet<String>>()
+        };
+        let s = set(&["x-arch"]);
+        let lanes: Vec<LaneArchView> = vec![
+            ("fork-new", LaneClass::Fork, Some(&s)),
+            ("fork-old", LaneClass::Fork, Some(&s)),
+            ("main-old", LaneClass::Mainstream, Some(&s)),
+            ("main-none", LaneClass::Mainstream, None),
+        ];
+        // Mainstream beats fork regardless of order; caller order
+        // (newest-first) holds inside each class; a None set never
+        // advertises; exclude drops exactly the named lane.
+        assert_eq!(
+            advertising_lanes("x-arch", None, &lanes),
+            vec!["main-old", "fork-new", "fork-old"]
+        );
+        assert_eq!(
+            advertising_lanes("x-arch", Some("main-old"), &lanes),
+            vec!["fork-new", "fork-old"]
+        );
+        assert!(advertising_lanes("other-arch", None, &lanes).is_empty());
+        assert!(
+            advertising_lanes("x-arch", None, &[("m", LaneClass::Mainstream, None)]).is_empty()
+        );
+    }
 
     #[test]
     fn unit__engine_kind_roundtrip__db_and_serde() {
