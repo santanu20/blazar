@@ -5,6 +5,7 @@ __pycache__/
 # machine-local agent tool state
 .codegraph/
 .serena/
+.opencode/
 
 # stray runtime pidfiles
 *.pid
