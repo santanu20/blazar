@@ -6,6 +6,13 @@ tracked here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Parallel-lane pulls now resume at byte granularity instead of restarting from zero.** The parallel download lane (default ≥8 connections for files ≥32 MiB) split files into 8–128 MiB chunks but persisted its `.part.progress` resume ledger only when a whole chunk finished — with chunks spread across connections, none finished until the file was nearly complete, so any interrupt (Ctrl-C, network drop, daemon kill) left a full-length sparse `.part` with no ledger and the next pull hit the orphan heuristic and re-fetched every byte. The sidecar is now v2 with an aria2-style per-chunk ledger: it is seeded the moment the lane engages, workers count only bytes that survived a positional write (refunding counters when a retried attempt rewinds), and the coordinator snapshots every pending chunk's verified prefix on a 1s cadence plus immediately on each chunk completion. A re-pull continues each chunk exactly at its persisted prefix — verified live against registry.ollama.ai (three interrupted sessions of qwen3:0.6b, 523 MiB: 22 MiB → 246 MiB → 260 MiB, every chunk prefix strictly growing, zero orphan re-fetches). v1 sidecars (done-chunks only) load unchanged and keep their guarantees; the classic single-stream lane and the orphan path (full-length `.part` with no ledger at all — sparse holes are unresolvable) are untouched.
+
+### Added
+- **Ledger persistence is now crash-ordered.** `store_sidecar` fsyncs the `.part` data before writing the ledger, fsyncs the ledger tmp file, renames atomically, and fsyncs the parent directory — a power loss can no longer leave a sidecar claiming bytes the `.part` does not actually hold. The fsync steps degrade with a warning (never abort the download) on filesystems that refuse sync; a missing `.part` still gets its ledger written, which a regression test pins.
+
 ## [0.9.1] - 2026-09-21
 
 ### Fixed
