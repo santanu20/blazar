@@ -790,11 +790,15 @@ fn parse_help(help: &str) -> (BTreeSet<String>, Vec<String>) {
                     .next()
                     .unwrap_or(long)
                     .to_string();
-                // Reject value placeholders attached with spaces? Values are
-                // separate tokens; keep alphabetic-dash names only.
+                // Values are separate tokens; keep plain option names
+                // only. Underscores included: sd-server documents
+                // `--llm_vision`/`--clip_vision` style flags and the
+                // strict probed-flags gate later refuses any argv flag
+                // the manifest lacks — dropping them here disabled
+                // image edits at spawn (verified live).
                 if clean
                     .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
                     && !clean.is_empty()
                     && clean.len() > 1
                 {
@@ -959,6 +963,25 @@ mod tests {
     fn unit__parse_devices__none_case() {
         let d = parse_devices("Available devices:\n  (none)\n");
         assert!(d.is_empty());
+    }
+
+    #[test]
+    fn unit__parse_help__underscore_flags_survive_the_charset_filter() {
+        // sd-server documents `--llm_vision`/`--clip_vision` style flags.
+        // The strict probed-flags gate refuses argv flags the manifest
+        // lacks, so a charset filter that dropped '_' here disabled image
+        // edits at spawn (verified live on master-890-74988b2).
+        let help = "\
+sd-server [options]
+  --llm FNAME                text encoder
+  --llm_vision FNAME         vision encoder for image edits
+  --clip_vision FNAME        clip vision projector
+  --qwen2vl_vision FNAME     qwen2vl projector
+";
+        let (flags, _) = parse_help(help);
+        for expected in ["--llm", "--llm_vision", "--clip_vision", "--qwen2vl_vision"] {
+            assert!(flags.contains(expected), "missing {expected} in {flags:?}");
+        }
     }
 
     #[test]
