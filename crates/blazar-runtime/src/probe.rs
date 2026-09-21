@@ -174,13 +174,20 @@ pub fn probe_hardware(manifest: Option<&Manifest>) -> Hardware {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    if gpus.is_empty() {
+    if gpus.is_empty() || gpus.iter().all(|g| g.total_mib == 0) {
         // Engines without a --list-devices census (mistral.rs) leave the
         // manifest's device list empty too — a GPU the daemon cannot see
         // silently starves every capacity decision on that lane (measured:
         // "0 GPUs" banner on a 4070 box, paged-attn auto-fallback blind,
         // 502 loads). Fall back to a system-side NVIDIA census; non-NVIDIA
         // boxes without a census keep the empty list, same as before.
+        //
+        // A census that names devices but reports total_mib == 0 on every
+        // row (sd-server's --list-devices prints NAME<TAB>description only,
+        // no memory) is not a capacity census either: it fed the pool
+        // Vulkan-namespace names with zero free bytes — placement tied at
+        // 0 and picked nonsense for llama spawns. Treat it exactly like
+        // the empty census and let nvidia-smi speak when it can.
         gpus = nvidia_smi_gpus();
     }
     hardware_with(gpus)
@@ -407,6 +414,45 @@ mod tests {
         // asserting the sysinfo-only merge at the composition point.
         let cpu_only = hardware_with(Vec::new());
         assert!(cpu_only.gpus.is_empty());
+    }
+
+    #[test]
+    fn unit__probe_hardware__memoryless_census_never_reaches_the_pool() {
+        // sd-server's census names devices with total_mib == 0 (no memory
+        // column). Those rows must not ride into the GPU pool verbatim:
+        // placement tied at 0 free and picked a Vulkan/CPU name for llama
+        // spawns, which the CUDA llama-server rejects at boot. Whatever
+        // the box provides instead (nvidia-smi census, or nothing), the
+        // pool must never carry a zero-total GPU row.
+        let m = Manifest {
+            tag: "t".into(),
+            build_number: 1,
+            version_raw: "version: 1".into(),
+            devices: vec![
+                crate::engine::manifest::DeviceDesc {
+                    name: "Vulkan0".into(),
+                    description: "Intel(R) Graphics (RPL-S)".into(),
+                    total_mib: 0,
+                    free_mib: 0,
+                },
+                crate::engine::manifest::DeviceDesc {
+                    name: "Vulkan1".into(),
+                    description: "NVIDIA GeForce RTX 4070 Laptop GPU".into(),
+                    total_mib: 0,
+                    free_mib: 0,
+                },
+            ],
+            flags: std::collections::BTreeSet::default(),
+            spec_types: vec![],
+            server_path: "/x".into(),
+            ..Default::default()
+        };
+        let hw = probe_hardware(Some(&m));
+        assert!(
+            hw.gpus.iter().all(|g| g.total_mib > 0),
+            "zero-total census rows leaked into the pool: {:?}",
+            hw.gpus
+        );
     }
 
     #[test]
