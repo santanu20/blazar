@@ -350,6 +350,19 @@ enum Cmd {
             value_parser = clap::builder::NonEmptyStringValueParser::new()
         )]
         format: String,
+        /// Quant filter over each repo's real file set (client-side — the
+        /// Hub has no quant facet): `--quant q4` matches the whole Q4
+        /// family (`q4_0`, `q4_k_m`, `iq4_xs`, …), `--quant Q4_K_M` that exact
+        /// quant, comma-lists OR (`q4,q5`). Bare query tokens that are
+        /// themselves quants (`pallama search qwen gguf q4`) are lifted
+        /// into the filter too and OR-merged with any --quant values
+        /// (notices go to stderr).
+        #[arg(
+            long,
+            value_name = "QUANT",
+            value_parser = clap::builder::NonEmptyStringValueParser::new()
+        )]
+        quant: Option<String>,
         /// One JSON object per row (JSONL, like `doctor --json`) for
         /// scripting; suppresses the table, footers and hints.
         #[arg(long)]
@@ -1132,8 +1145,9 @@ async fn run(cmd: Cmd) -> Result<()> {
         Cmd::Search {
             query,
             format,
+            quant,
             json,
-        } => search(&query.join(" "), &format, json).await,
+        } => search(&query.join(" "), &format, quant.as_deref(), json).await,
         Cmd::Fit { target, json } => fit(&target, json).await,
         Cmd::Config { cmd } => config_cmd(cmd),
         Cmd::Upgrade { version, dry_run } => upgrade(version, dry_run).await,
@@ -8888,10 +8902,56 @@ fn human_count(n: u64) -> String {
 }
 
 #[allow(clippy::too_many_lines)] // result table renderer: header, rows, footer
-async fn search(query: &str, format: &str, json: bool) -> Result<()> {
+async fn search(query: &str, format: &str, quant: Option<&str>, json: bool) -> Result<()> {
+    // Quant filtering is client-side (the Hub exposes no quant facet):
+    // bare grammar-exact query tokens (`q4`, `Q4_K_M`) always leave the
+    // text query — they are dead weight in the Hub's full-text search
+    // whether or not --quant was given — and --quant filters merge in
+    // alongside them. Rows are retained on the same quant set the QUANTS
+    // column renders, so filter and table can never disagree.
+    let (query, mut filters) = split_quant_query(query);
+    if let Some(raw) = quant {
+        for f in parse_quant_filters(raw) {
+            if !filters.contains(&f) {
+                filters.push(f);
+            }
+        }
+    }
+    if !filters.is_empty() {
+        eprintln!(
+            "# quant filter: {} (client-side, matched against each repo's file quants)",
+            filters.join(", ")
+        );
+    }
     let token = std::env::var("HF_TOKEN").ok();
     let client = pallama_runtime::hf::HfClient::new(token)?;
-    let results = client.search(query, format, 20).await?;
+    let mut results = client.search(&query, format, 20).await?;
+    if !filters.is_empty() {
+        let candidates = results.len();
+        results.retain(|r| quant_filter_matches(&entry_quants(r), &filters));
+        if results.is_empty() {
+            // Distinct from the no-results message below: the Hub had
+            // candidates, none carried the requested quant(s). An
+            // all-quant query (every token lifted) browsed the popular
+            // head — dominated by safetensors repos with no quant files —
+            // so teach the model-query form instead of quoting "".
+            if !json {
+                let scope = if query.is_empty() {
+                    format!(
+                        "the popular browse (try a model query: pallama search llama {})",
+                        filters[0]
+                    )
+                } else {
+                    format!("{candidates} results for {query:?}")
+                };
+                println!(
+                    "no repos carry quant(s) {} among {scope} — try a broader query, another quant, or drop the filter",
+                    filters.join(", ")
+                );
+            }
+            return Ok(());
+        }
+    }
     let format = format.trim().to_ascii_lowercase();
     if results.is_empty() {
         // The Hub answers an unknown tag with 200 + [] — teach the valid
@@ -9023,6 +9083,63 @@ fn entry_quants(r: &pallama_runtime::hf::SearchEntry) -> Vec<String> {
     }
 }
 
+/// Parse a `--quant` list (or lifted bare tokens): comma-separated,
+/// trimmed, lowercased, deduped. Empty segments drop out so `q4,` is
+/// just `q4`.
+fn parse_quant_filters(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for f in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let f = f.to_ascii_lowercase();
+        if !out.contains(&f) {
+            out.push(f);
+        }
+    }
+    out
+}
+
+/// True when a row's quant set satisfies any filter. A filter matches by
+/// exact token or family prefix (`q4` covers `q4_0`, `q4_k_m`, …); the
+/// i-quant twin is folded in only for `q`-filters — `q4` also covers
+/// `iq4_xs`, but `iq4` never matches plain `q4_k_m`.
+fn quant_filter_matches(tokens: &[String], filters: &[String]) -> bool {
+    let hit = |tok: &str, f: &str| {
+        tok.strip_prefix(f)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('_'))
+    };
+    tokens.iter().any(|t| {
+        let t = t.to_ascii_lowercase();
+        filters.iter().any(|raw| {
+            let f = raw.to_ascii_lowercase();
+            hit(&t, &f)
+                || (!f.starts_with('i')
+                    && t.strip_prefix("iq")
+                        .filter(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+                        .is_some_and(|rest| hit(&format!("q{rest}"), &f)))
+        })
+    })
+}
+
+/// Split a text query into (query, quant filters): bare tokens that ARE
+/// quant names (`q4`, `Q4_K_M`) leave the text query and filter rows
+/// instead — the Hub cannot facet on quants, so such a token is dead
+/// weight in the full-text search. Non-quant tokens (`qwen`, `gguf`,
+/// `awq`) stay query text.
+fn split_quant_query(query: &str) -> (String, Vec<String>) {
+    let mut words = Vec::new();
+    let mut lifted = Vec::new();
+    for token in query.split_whitespace() {
+        if pallama_runtime::hf::is_quant_token(token) {
+            let f = token.to_ascii_lowercase();
+            if !lifted.contains(&f) {
+                lifted.push(f);
+            }
+        } else {
+            words.push(token);
+        }
+    }
+    (words.join(" "), lifted)
+}
+
 /// FORMAT column: the repo's weight format from Hub tags, most-specific
 /// first — an MLX repo also carries `safetensors`, an AWQ repo too, so the
 /// specific tag is the actionable one. `gguf` outranks `mlx` because GGUF
@@ -9051,6 +9168,8 @@ fn format_of(tags: &[String]) -> String {
 /// FORMAT for a search row: tag priority from [`format_of`], except MLX
 /// repos that never tagged themselves `mlx` (openbmb ships `-MLX`
 /// suffixed safetensors) — the id is the only honest signal there.
+/// Untagged repos (live: `ComfyUI` `diffusion-single-file` mirrors carry
+/// no format tag at all) fall back to their sibling file extensions.
 fn format_of_entry(r: &pallama_runtime::hf::SearchEntry) -> String {
     let model = r.id.rsplit('/').next().unwrap_or(&r.id);
     if model
@@ -9059,35 +9178,57 @@ fn format_of_entry(r: &pallama_runtime::hf::SearchEntry) -> String {
     {
         return "mlx".to_string();
     }
-    format_of(&r.tags)
+    let tagged = format_of(&r.tags);
+    if tagged != "?" {
+        return tagged;
+    }
+    format_of_siblings(&r.siblings)
 }
 
-/// SIZE for a search row: exact GGUF total when the Hub carries the
-/// free root metadata; otherwise the safetensors dtype-derived byte
-/// estimate (width × count — what `pull` actually downloads).
+/// FORMAT when tags carry none: first match over sibling extensions,
+/// same specificity order as [`format_of`] (an actionable payload beats
+/// its container — `.safetensors` is the payload of diffusers/pytorch
+/// repos alike, so the container distinction is left to the tags).
+fn format_of_siblings(siblings: &[pallama_runtime::hf::HfSibling]) -> String {
+    let ends_with_any =
+        |file: &str, exts: &[&str]| exts.iter().any(|e| file.to_ascii_lowercase().ends_with(e));
+    for (label, exts) in [
+        ("gguf", &[".gguf"][..]),
+        ("safetensors", &[".safetensors"][..]),
+        ("onnx", &[".onnx", ".ort"][..]),
+        ("pytorch", &[".bin", ".pt", ".pth", ".ckpt"][..]),
+    ] {
+        if siblings.iter().any(|s| ends_with_any(&s.rfilename, exts)) {
+            return label.to_string();
+        }
+    }
+    "?".to_string()
+}
+
+/// SIZE for a search row: exact GGUF bytes when the Hub carries
+/// `totalFileSize` (sum over the repo's `.gguf` files); otherwise the
+/// safetensors dtype-derived byte estimate (width × count — what `pull`
+/// actually downloads). `gguf.total` is the PARAMETER COUNT and is
+/// never a size — repos the Hub failed to index (MLX-packed,
+/// `ComfyUI` single-file) stay honestly empty.
 fn entry_size_bytes(r: &pallama_runtime::hf::SearchEntry) -> Option<u64> {
-    r.gguf.as_ref().and_then(|g| g.total).or_else(|| {
+    r.gguf.as_ref().and_then(|g| g.total_file_size).or_else(|| {
         r.safetensors
             .as_ref()
             .and_then(pallama_runtime::hf::HfSafetensorsInfo::byte_estimate)
     })
 }
 
-/// ARCH for a search row: gguf architecture > config `model_type` >
-/// first config architecture (lowercased) > None.
+/// ARCH for a search row: gguf architecture > config arch hint
+/// (`model_type` > architectures[0] > diffusers pipeline class).
 fn entry_arch(r: &pallama_runtime::hf::SearchEntry) -> Option<String> {
     r.gguf
         .as_ref()
         .and_then(|g| g.architecture.clone())
         .or_else(|| {
-            r.config.as_ref().and_then(|c| {
-                c.model_type.clone().or_else(|| {
-                    c.architectures
-                        .as_ref()
-                        .and_then(|a| a.first())
-                        .map(|a| a.to_ascii_lowercase())
-                })
-            })
+            r.config
+                .as_ref()
+                .and_then(pallama_runtime::hf::HfConfigSummary::arch_hint)
         })
 }
 
@@ -9111,7 +9252,10 @@ fn quant_markers(repo_id: &str) -> Vec<String> {
     // spellings (`8_bit`, `Int_4`) via the underscore-stripped form.
     for token in model.to_ascii_lowercase().split(['-', '.']) {
         let flat = token.replace('_', "");
-        let marker = if matches!(flat.as_str(), "awq" | "gptq" | "bf16" | "fp16" | "fp8") {
+        let marker = if matches!(
+            flat.as_str(),
+            "awq" | "gptq" | "bf16" | "fp16" | "fp8" | "fp6" | "fp4" | "nvfp4" | "mxfp4"
+        ) {
             flat.to_ascii_uppercase()
         } else if let Some(bits) = flat
             .strip_suffix("bit")
@@ -9631,43 +9775,174 @@ mod tests {
     fn unit__format_of_entry__untagged_mlx_detected_from_repo_id() {
         // openbmb ships -MLX safetensors WITHOUT the mlx tag — the id is
         // the only honest signal (live-verified against the Hub).
-        let entry = |id: &str, tags: &[&str]| pallama_runtime::hf::SearchEntry {
+        let entry = |id: &str, tags: &[&str], files: &[&str]| pallama_runtime::hf::SearchEntry {
             id: id.to_string(),
             downloads: None,
             likes: None,
-            siblings: Vec::new(),
+            siblings: files
+                .iter()
+                .map(|f| pallama_runtime::hf::HfSibling {
+                    rfilename: (*f).to_string(),
+                    size: None,
+                    lfs: None,
+                })
+                .collect(),
             gguf: None,
             safetensors: None,
             config: None,
             tags: tags.iter().map(std::string::ToString::to_string).collect(),
         };
         assert_eq!(
-            format_of_entry(&entry("openbmb/MiniCPM5-1B-MLX", &["safetensors"])),
+            format_of_entry(&entry("openbmb/MiniCPM5-1B-MLX", &["safetensors"], &[])),
             "mlx"
         );
         // mlx-community repos tag themselves — the tag path answers.
         assert_eq!(
             format_of_entry(&entry(
                 "mlx-community/Qwen3-8B-4bit",
-                &["safetensors", "mlx"]
+                &["safetensors", "mlx"],
+                &[]
             )),
             "mlx"
         );
         // Tagged rows keep the tag answer; untagged plain repos unaffected.
-        assert_eq!(format_of_entry(&entry("a/b", &["gguf"])), "gguf");
+        assert_eq!(format_of_entry(&entry("a/b", &["gguf"], &[])), "gguf");
         assert_eq!(
-            format_of_entry(&entry("a/b", &["safetensors"])),
+            format_of_entry(&entry("a/b", &["safetensors"], &[])),
             "safetensors"
         );
         // A repo merely MENTIONING mlx mid-name in a non-segment position
         // (e.g. "Silmax") must not trip the detector: split on -, ., _.
         assert_eq!(
-            format_of_entry(&entry("a/Silmax-Fusion", &["safetensors"])),
+            format_of_entry(&entry("a/Silmax-Fusion", &["safetensors"], &[])),
             "safetensors"
         );
+        // Untagged ComfyUI `diffusion-single-file` mirrors (live:
+        // Comfy-Org/Qwen-Image-2.1 — tags carry no format at all): the
+        // sibling extensions are the only honest signal.
+        assert_eq!(
+            format_of_entry(&entry(
+                "Comfy-Org/Qwen-Image-2.1",
+                &["diffusion-single-file", "comfyui"],
+                &[
+                    "README.md",
+                    "diffusion_models/qwen_image_2.1_bf16.safetensors",
+                    "text_encoders/qwen3.5_9b.safetensors",
+                ]
+            )),
+            "safetensors"
+        );
+        assert_eq!(
+            format_of_entry(&entry("a/b-gguf", &[], &["model-Q4_K_M.gguf"])),
+            "gguf"
+        );
+        // Docs-only repos with no weight files stay unknown.
+        assert_eq!(format_of_entry(&entry("a/b", &[], &["README.md"])), "?");
     }
 
     #[test]
+    fn unit__quant_markers__covers_fp4_family_word_markers() {
+        // Live gap: Rin247/Qwen-Image-2.1-FP4 showed an empty QUANTS cell
+        // because fp4/nvfp4 were missing from the word list.
+        assert_eq!(
+            quant_markers("Rin247/Qwen-Image-2.1-FP4"),
+            vec!["FP4".to_string()]
+        );
+        assert_eq!(
+            quant_markers("BennyDaBall/Qwen-Image-2.1-NVFP4"),
+            vec!["NVFP4".to_string()]
+        );
+        assert_eq!(
+            quant_markers("x/Model-MXFP4-8bit"),
+            vec!["8BIT".to_string(), "MXFP4".to_string()]
+        );
+        // Existing lanes keep their markers.
+        assert_eq!(quant_markers("x/Model-8bit"), vec!["8BIT".to_string()]);
+        assert_eq!(quant_markers("x/Model-AWQ"), vec!["AWQ".to_string()]);
+    }
+
+    #[test]
+    fn unit__quant_filter_matches__family_exact_and_marker_semantics() {
+        // `q4` family covers plain and i-quant Q4 varieties alike.
+        for tok in ["Q4_0", "Q4_K_M", "Q4_K_XL", "IQ4_XS", "IQ4_NL"] {
+            assert!(
+                quant_filter_matches(&[tok.to_string()], &["q4".to_string()]),
+                "{tok} should match q4"
+            );
+        }
+        assert!(!quant_filter_matches(
+            &["Q3_K_M".to_string(), "Q8_0".to_string()],
+            &["q4".to_string()]
+        ));
+        // Exact quant: only that token.
+        assert!(quant_filter_matches(
+            &["Q4_K_M".to_string()],
+            &["q4_k_m".to_string()]
+        ));
+        assert!(!quant_filter_matches(
+            &["Q4_K_S".to_string()],
+            &["q4_k_m".to_string()]
+        ));
+        // i-quant filters stay i-only; subfamilies compose.
+        assert!(quant_filter_matches(
+            &["IQ4_XS".to_string()],
+            &["iq4".to_string()]
+        ));
+        assert!(!quant_filter_matches(
+            &["Q4_K_M".to_string()],
+            &["iq4".to_string()]
+        ));
+        assert!(quant_filter_matches(
+            &["Q4_K_M".to_string()],
+            &["q4_k".to_string()]
+        ));
+        // Marker lanes (repo-id bit-widths) filter like file quants.
+        assert!(quant_filter_matches(
+            &["INT4".to_string()],
+            &["int4".to_string()]
+        ));
+        assert!(quant_filter_matches(
+            &["FP8".to_string(), "8BIT".to_string()],
+            &["fp8".to_string(), "8bit".to_string()]
+        ));
+        // Case-insensitive on both sides; token-less rows drop out.
+        assert!(quant_filter_matches(
+            &["Q5_K_M".to_string()],
+            &["Q5".to_string()]
+        ));
+        assert!(!quant_filter_matches(&[], &["q4".to_string()]));
+    }
+
+    #[test]
+    fn unit__parse_quant_filters__comma_trim_case_dedupe() {
+        assert_eq!(parse_quant_filters(" Q4, q5 ,q4 "), ["q4", "q5"]);
+        assert_eq!(parse_quant_filters("q4,,,"), ["q4"]);
+        assert_eq!(parse_quant_filters("  "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn unit__split_quant_query__lifts_bare_quant_tokens_only() {
+        let (q, f) = split_quant_query("qwen image 2.1 gguf q4");
+        assert_eq!(q, "qwen image 2.1 gguf");
+        assert_eq!(f, ["q4"]);
+        let (q, f) = split_quant_query("qwen Q4_K_M iq4");
+        assert_eq!(q, "qwen");
+        assert_eq!(f, ["q4_k_m", "iq4"]);
+        // Non-quant tokens stay query text — underscored model ids included.
+        let (q, f) = split_quant_query("qwen_image_2.1 gguf awq int4");
+        assert_eq!(q, "qwen_image_2.1 gguf awq int4");
+        assert!(f.is_empty());
+        // An all-quant query degrades to a filtered popular browse.
+        let (q, f) = split_quant_query("q4");
+        assert_eq!(q, "");
+        assert_eq!(f, ["q4"]);
+    }
+
+    #[test]
+    // Six metadata shapes (tagged MLX, dtype ladder, arch ladder, empty
+    // fallbacks) in one table — one assert per shape would orphan the
+    // fallback contracts from the shapes that trigger them.
+    #[allow(clippy::too_many_lines)]
     fn unit__entry_size_and_arch__safetensors_rows_carry_real_metadata() {
         use std::collections::BTreeMap;
         let hist = |pairs: &[(&str, u64)]| pallama_runtime::hf::HfSafetensorsInfo {
@@ -9693,18 +9968,37 @@ mod tests {
                 tags: vec!["safetensors".to_string()],
             }
         };
-        // GGUF total wins when present (exact bytes).
+        // GGUF size = totalFileSize (exact bytes over all quants), NOT
+        // `total` — that is the parameter count. Live shape:
+        // Abiray/Qwen-Image-2.1-GGUF has total=7115124736 (7.1B params)
+        // but totalFileSize=3185944736 (the real 2.97 GiB download).
         assert_eq!(
             entry_size_bytes(&base(
                 Some(pallama_runtime::hf::HfGgufInfo {
-                    total: Some(123),
-                    architecture: Some("llama".to_string()),
-                    context_length: Some(4096),
+                    total: Some(7_115_124_736),
+                    total_file_size: Some(3_185_944_736),
+                    architecture: Some("qwen_image".to_string()),
+                    context_length: None,
                 }),
                 Some(hist(&[("BF16", 1_000)])),
                 None,
             )),
-            Some(123)
+            Some(3_185_944_736)
+        );
+        // Parameter count alone must NEVER render as bytes — even when
+        // it is the only field the Hub filled in.
+        assert_eq!(
+            entry_size_bytes(&base(
+                Some(pallama_runtime::hf::HfGgufInfo {
+                    total: Some(630_167_424),
+                    total_file_size: None,
+                    architecture: Some("qwen2".to_string()),
+                    context_length: Some(32_768),
+                }),
+                None,
+                None,
+            )),
+            None
         );
         // Safetensors fallback: dtype math (2 bytes × 2.5B).
         assert_eq!(
@@ -9713,20 +10007,28 @@ mod tests {
         );
         // Nothing derivable: honest None.
         assert_eq!(entry_size_bytes(&base(None, None, None)), None);
-        // ARCH ladder: gguf > model_type > first architecture lowercased.
-        let cfg = |mt: Option<&str>, archs: Option<&[&str]>| pallama_runtime::hf::HfConfigSummary {
-            architectures: archs.map(|a| a.iter().map(std::string::ToString::to_string).collect()),
-            model_type: mt.map(str::to_string),
+        // ARCH ladder: gguf > model_type > first architecture lowercased
+        // > diffusers pipeline class.
+        let cfg = |mt: Option<&str>, archs: Option<&[&str]>, pipeline: Option<&str>| {
+            pallama_runtime::hf::HfConfigSummary {
+                architectures: archs
+                    .map(|a| a.iter().map(std::string::ToString::to_string).collect()),
+                model_type: mt.map(str::to_string),
+                diffusers: pipeline.map(|p| pallama_runtime::hf::HfDiffusersSummary {
+                    class_name: Some(p.to_string()),
+                }),
+            }
         };
         assert_eq!(
             entry_arch(&base(
                 Some(pallama_runtime::hf::HfGgufInfo {
                     total: None,
+                    total_file_size: None,
                     architecture: Some("qwen3".to_string()),
                     context_length: None,
                 }),
                 None,
-                Some(cfg(Some("llama"), Some(&["LlamaForCausalLM"]))),
+                Some(cfg(Some("llama"), Some(&["LlamaForCausalLM"]), None)),
             )),
             Some("qwen3".to_string())
         );
@@ -9734,7 +10036,7 @@ mod tests {
             entry_arch(&base(
                 None,
                 None,
-                Some(cfg(Some("llama"), Some(&["LlamaForCausalLM"])))
+                Some(cfg(Some("llama"), Some(&["LlamaForCausalLM"]), None))
             )),
             Some("llama".to_string())
         );
@@ -9742,11 +10044,36 @@ mod tests {
             entry_arch(&base(
                 None,
                 None,
-                Some(cfg(None, Some(&["MiniCPMV4_6ForConditionalGeneration"])))
+                Some(cfg(
+                    None,
+                    Some(&["MiniCPMV4_6ForConditionalGeneration"]),
+                    None
+                ))
             )),
             Some("minicpmv4_6forconditionalgeneration".to_string())
         );
-        assert_eq!(entry_arch(&base(None, None, Some(cfg(None, None)))), None);
+        // Diffusers repos: no root config.json — the pipeline class is
+        // the only arch signal (live: Qwen/Qwen-Image-2.1).
+        assert_eq!(
+            entry_arch(&base(
+                None,
+                None,
+                Some(cfg(None, None, Some("QwenImage21Pipeline")))
+            )),
+            Some("qwen_image21".to_string())
+        );
+        assert_eq!(
+            entry_arch(&base(
+                None,
+                None,
+                Some(cfg(None, None, Some("FluxPipeline")))
+            )),
+            Some("flux".to_string())
+        );
+        assert_eq!(
+            entry_arch(&base(None, None, Some(cfg(None, None, None)))),
+            None
+        );
     }
 
     #[test]

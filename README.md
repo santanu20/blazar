@@ -234,7 +234,7 @@ The advanced surface, grouped by job. `--json`/JSONL output on the inspection co
 | `pallama quantize -t Q4_K_M [--imatrix calib.txt]` | New quants locally via the engine's own llama-quantize; imatrix calibration for better Q4 accuracy |
 | `pallama create` | Parameter aliases from a Modelfile (`FROM` + `PARAMETER`) — zero-copy, no blob duplication |
 | `pallama lora` / `pallama mmproj` | LoRA adapter management (`model+adapter` spawns a variant); vision projectors for any model |
-| `pallama search --format <tag>` | Search Hugging Face across every weight format — ranked by query-token coverage and name cleanliness (clean mirrors above derivative finetunes; likes/downloads only break ties) |
+| `pallama search --format <tag> --quant q4` | Search Hugging Face across every weight format — ranked by query-token coverage and name cleanliness; `--quant q4` (or a bare `q4` query token) keeps only repos whose files carry that quant family |
 | `pallama fit [--json]` | VRAM fit + quant alternatives *before* downloading |
 | `pallama coreside` | Which local models co-reside in VRAM (weights + f16 KV at each model's ctx) |
 
