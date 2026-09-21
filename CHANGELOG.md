@@ -6,6 +6,10 @@ tracked here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`doctor` port check now verifies daemon identity, not just liveness.** A bound port answering `/healthz` used to be reported as "blazar daemon already answering" — during the rename window a pre-rename pallama daemon (same default port 11435) earned a false ok. The daemon's `/api/version` now advertises `name: blazar`; doctor reports ok only for a named blazar answer, warns with the observed version for a pre-rename/foreign daemon, and keeps the occupied-port hint otherwise.
+
 ## [0.10.0] - 2026-09-21
 
 ### Changed

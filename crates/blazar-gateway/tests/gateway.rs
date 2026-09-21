@@ -205,6 +205,8 @@ async fn e2e__healthz_version_tags_models() {
         .await
         .unwrap();
     assert!(v["version"].as_str().is_some_and(|s| !s.is_empty()));
+    // The name marker is doctor's port-identity signal — pin it.
+    assert_eq!(v["name"].as_str(), Some("blazar"));
     let t: serde_json::Value = c
         .get(format!("{}/api/tags", ts.base))
         .send()
