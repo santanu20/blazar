@@ -117,9 +117,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /tmp/ccache
-          key: ccache-cuda${{ matrix.cuda }}-sm${{ matrix.arch }}-${{ github.run_number }}
+          # v2: flag changes (GGML_NATIVE=OFF) alter compile command lines,
+          # but the explicit roll guarantees no pre-v2 native-ISA objects
+          # can leak back in through the restore-key prefix chain.
+          key: ccache-v2-cuda${{ matrix.cuda }}-sm${{ matrix.arch }}-${{ github.run_number }}
           restore-keys: |
-            ccache-cuda${{ matrix.cuda }}-sm${{ matrix.arch }}-
+            ccache-v2-cuda${{ matrix.cuda }}-sm${{ matrix.arch }}-
 
       - name: Fetch upstream source (${{ needs.resolve.outputs.tag }})
         env:
@@ -154,6 +157,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_CUDA=ON \
             -DGGML_RPC=ON \
+            -DGGML_NATIVE=OFF \
             -DCMAKE_CUDA_ARCHITECTURES="$arches" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -164,6 +168,15 @@ jobs:
             -DBUILD_SHARED_LIBS=ON \
             -DLLAMA_BUILD_NUMBER="${TAG#b}" \
             -DLLAMA_BUILD_COMMIT="$TAG"
+          # ^ GGML_NATIVE=OFF: default-ON tunes ggml-cpu with -march=native
+          # to the BUILD runner's CPU. ccache keys on the flag STRING, which
+          # is identical on every host, so a cache seeded on a newer-ISA
+          # runner serves wrong-ISA objects later (live case: smoke test
+          # SIGILL, exit 132, after the stub-driver fallback) — and the
+          # shipped asset would crash the same way on user CPUs missing
+          # those features. Baseline x86-64 keeps objects host-independent
+          # (ccache-safe) and assets portable; same tradeoff upstream's own
+          # CUDA CI makes (-DGGML_NATIVE=OFF in build-cuda-ubuntu.yml).
           # ^ Checkout-less tarball builds have no git context, so upstream
           # defaults the version banner to "build 0, commit unknown";
           # NOT-DEFINED guards make both overridable at configure time.
