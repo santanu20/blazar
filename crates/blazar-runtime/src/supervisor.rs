@@ -215,9 +215,10 @@ pub(crate) fn read_model_meta(
                 if e.to_string().contains("missing general.architecture") {
                     format!(
                         "{path}: GGUF has no architecture metadata — diffusion/model-component \
-                         file (image-repo DiT/encoder/VAE split), not a text model. No installed \
-                         engine serves image components; an sd.cpp image lane is not implemented \
-                         yet"
+                         file (image-repo DiT/encoder/VAE split), not a text model; text engines \
+                         cannot serve it. The sdcpp lane serves diffusion component sets (DiT + \
+                         VAE + text encoder): blazar engine install --kind sdcpp, then re-pull \
+                         the model to fetch the set (blazar pull <repo>:QUANT)"
                     )
                 } else {
                     format!("gguf metadata: {e}")
@@ -4638,7 +4639,9 @@ mod routing_tests {
             Err(e) => {
                 assert!(e.contains("diffusion/model-component"), "{e}");
                 assert!(e.contains("no architecture metadata"), "{e}");
-                assert!(e.contains("sd.cpp image lane"), "{e}");
+                assert!(e.contains("sdcpp"), "{e}");
+                assert!(e.contains("component set"), "{e}");
+                assert!(e.contains("blazar pull"), "{e}");
             }
         }
     }
