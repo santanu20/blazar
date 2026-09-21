@@ -2,7 +2,7 @@ name: overlay-freshness
 
 # Keeps the prebuilt CUDA overlay at most ~1 hour + one build behind
 # upstream llama.cpp. The user-facing contract (see engine-cuda.yml):
-# a pallama user on an NVIDIA box must get CUDA via DOWNLOAD in
+# a blazar user on an NVIDIA box must get CUDA via DOWNLOAD in
 # minutes — a stale overlay is what silently shunts them into the
 # hour-class source-build lane.
 #
@@ -26,11 +26,11 @@ permissions:
 
 env:
   UPSTREAM_REPO: ggml-org/llama.cpp
-  OVERLAY_REPO: santanu20/pallama
+  OVERLAY_REPO: santanu20/blazar
 
 jobs:
   check-and-dispatch:
-    if: github.repository == 'santanu20/pallama'
+    if: github.repository == 'santanu20/blazar'
     runs-on: ubuntu-latest
     steps:
       - name: Upstream vs overlay freshness

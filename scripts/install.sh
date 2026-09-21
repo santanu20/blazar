@@ -1,5 +1,5 @@
 #!/bin/sh
-# pallama installer — Linux and macOS. System-wide, like ollama:
+# blazar installer — Linux and macOS. System-wide, like ollama:
 # root-owned binary in /usr/local/bin + systemd unit (Linux) or launchd
 # service (macOS). There is NO user-path install mode; a second copy in
 # ~/.local/bin is how stale-binary daemon races happen (doctor flags them).
@@ -12,42 +12,42 @@
 # it automatically — announce-then-act, never silently.
 #
 # Verifies the asset sha256 from the GitHub release API (the same source
-# of truth as `pallama engine update`) before installing anything.
+# of truth as `blazar engine update`) before installing anything.
 #
 # Flags:
 #   --build           force the source path (no release channel contact;
 #                     bootstraps the toolchain when missing)
 #   --from <binary>   install a locally built binary (bootstrap/offline)
 #   --uninstall       remove binary + units (models/config are user data,
-#                     kept: ~/.local/share/pallama, ~/.config/pallama)
+#                     kept: ~/.local/share/blazar, ~/.config/blazar)
 #
 # Environment overrides:
-#   PALLAMA_VERSION            pin a release tag (e.g. v0.3.0)
-#   PALLAMA_REPO               GitHub owner/name hosting releases (unset:
+#   BLAZAR_VERSION            pin a release tag (e.g. v0.3.0)
+#   BLAZAR_REPO               GitHub owner/name hosting releases (unset:
 #                              derived from the enclosing checkout's git
 #                              origin when available)
-#   PALLAMA_BOOTSTRAP          override the bootstrap script path (default:
+#   BLAZAR_BOOTSTRAP          override the bootstrap script path (default:
 #                              <checkout>/scripts/bootstrap.sh)
-#   PALLAMA_AUTO_BOOTSTRAP     0 = never auto-install a toolchain; auto
+#   BLAZAR_AUTO_BOOTSTRAP     0 = never auto-install a toolchain; auto
 #                              mode falls back to the release channel
-#   PALLAMA_FORCE_BOOTSTRAP    1 = run the bootstrap even when a toolchain
-#                              exists (test knob, like PALLAMA_SUDO)
-#   PALLAMA_INSTALL_BASE_URL   replace the GitHub API base (mirrors, tests)
-#   PALLAMA_INSTALL_ENGINE     0 = skip the engine bootstrap (default: install
+#   BLAZAR_FORCE_BOOTSTRAP    1 = run the bootstrap even when a toolchain
+#                              exists (test knob, like BLAZAR_SUDO)
+#   BLAZAR_INSTALL_BASE_URL   replace the GitHub API base (mirrors, tests)
+#   BLAZAR_INSTALL_ENGINE     0 = skip the engine bootstrap (default: install
 #                              the llama.cpp engine so the box is infer-ready)
-#   PALLAMA_UNIT_MEMORY_HIGH  systemd soft memory ceiling for the daemon
+#   BLAZAR_UNIT_MEMORY_HIGH  systemd soft memory ceiling for the daemon
 #                              cgroup (default: 85% of RAM, recomputed by
 #                              systemd at every unit start — adapts to RAM
 #                              changes). Soft = reclaim/throttle only, never
 #                              an OOM kill. Set to an empty string to omit
 #                              the line entirely.
-#   PALLAMA_AUTO_DRIVER        0 = skip the GPU preflight (default: detect PCI
+#   BLAZAR_AUTO_DRIVER        0 = skip the GPU preflight (default: detect PCI
 #                              GPUs and, when the driver userspace is missing,
 #                              install it from FIRST-PARTY distro repos only)
-#   PALLAMA_INSTALL_MODEL      optional first model to pull (e.g.
+#   BLAZAR_INSTALL_MODEL      optional first model to pull (e.g.
 #                              qwen2.5:0.5b) — opt-in, never defaulted
-#   PALLAMA_SYSTEM_BIN_DIR     binary destination (default /usr/local/bin)
-#   PALLAMA_SERVICE_USER/GROUP unit user/group (default: invoking user)
+#   BLAZAR_SYSTEM_BIN_DIR     binary destination (default /usr/local/bin)
+#   BLAZAR_SERVICE_USER/GROUP unit user/group (default: invoking user)
 #   GITHUB_TOKEN               optional API token (rate limits, private repos)
 
 # Wrap everything in main() so a truncated partial download cannot execute
@@ -56,8 +56,8 @@ main() {
 
 set -eu
 
-REPO="${PALLAMA_REPO:-}"
-API_BASE="${PALLAMA_INSTALL_BASE_URL:-https://api.github.com/repos/${REPO}}"
+REPO="${BLAZAR_REPO:-}"
+API_BASE="${BLAZAR_INSTALL_BASE_URL:-https://api.github.com/repos/${REPO}}"
 
 status() { echo ">>> $*" >&2; }
 error() { echo "ERROR: $*" >&2; exit 1; }
@@ -97,7 +97,7 @@ pick_libc() {
     fi
 }
 
-# PALLAMA_REPO unset: derive owner/name from the enclosing checkout's
+# BLAZAR_REPO unset: derive owner/name from the enclosing checkout's
 # git origin so a one-liner run inside a clone (or from the README of a
 # fork) needs no exports. A git remote is the only trustworthy source —
 # there is no hardcoded canonical home, so forks keep installing from
@@ -123,7 +123,7 @@ derive_repo() {
 
 # ---- invoking-user scope (sudo one-click support) --------------------------
 # `curl | sudo sh install.sh` runs everything as root: user-keyed paths
-# (HOME, cargo/rustup, the pallama store) belong to the INVOKING user.
+# (HOME, cargo/rustup, the blazar store) belong to the INVOKING user.
 # Every user-environment action (toolchain probe, source build, migrate/
 # engine/pull CLIs) goes through as_user so nothing populates /root's
 # store or leaves root-owned files in the user's checkout.
@@ -153,16 +153,16 @@ as_user() {
 # Provision a missing compile toolchain (cc + rust) via bootstrap.sh
 # --minimal, announce-then-act. Returns 0 when a source build is
 # possible (already present, or bootstrapped now); 1 when declined
-# (PALLAMA_AUTO_BOOTSTRAP=0), impossible (no bootstrap script) or the
+# (BLAZAR_AUTO_BOOTSTRAP=0), impossible (no bootstrap script) or the
 # bootstrap itself failed — NEVER a silent path: the caller reports.
 # Probes and rustup land in the INVOKING user's environment (a root-run
 # probe used to miss ~/.cargo and re-install rustup into /root).
 ensure_toolchain() {
-    if [ "${PALLAMA_FORCE_BOOTSTRAP:-0}" != 1 ]; then
+    if [ "${BLAZAR_FORCE_BOOTSTRAP:-0}" != 1 ]; then
         as_user sh -c 'command -v cargo >/dev/null 2>&1 && command -v cc >/dev/null 2>&1' && return 0
     fi
-    [ "${PALLAMA_AUTO_BOOTSTRAP:-1}" = 1 ] || return 1
-    _bs="${PALLAMA_BOOTSTRAP:-}"
+    [ "${BLAZAR_AUTO_BOOTSTRAP:-1}" = 1 ] || return 1
+    _bs="${BLAZAR_BOOTSTRAP:-}"
     if [ -z "$_bs" ]; then
         _ck=$(find_checkout 2>/dev/null) && [ -f "$_ck/scripts/bootstrap.sh" ] && _bs="$_ck/scripts/bootstrap.sh"
     fi
@@ -196,19 +196,19 @@ ensure_toolchain() {
 # Third-party-only sources (RPMFusion on Fedora, NVIDIA's own repo on
 # openSUSE) are PRINTED with exact commands, never executed: adding a
 # third-party repository as root is a line this installer does not cross.
-# Opt out: PALLAMA_AUTO_DRIVER=0. CUDA asset choice stays in pallama
-# itself (`pallama engine update` picks the newest CUDA build the driver
+# Opt out: BLAZAR_AUTO_DRIVER=0. CUDA asset choice stays in blazar
+# itself (`blazar engine update` picks the newest CUDA build the driver
 # supports — resolve_cuda_asset; runtimes are bundled, no toolkit needed).
 gpu_preflight() {
     [ "$(uname -s)" = Linux ] || return 0
     # An explicit user opt-out is acknowledged before any internal-lane
-    # skip (e.g. PALLAMA_INSTALL_ENGINE=0) — the operator asked for silence
+    # skip (e.g. BLAZAR_INSTALL_ENGINE=0) — the operator asked for silence
     # by name and gets the confirmation line regardless of what else is on.
-    if [ "${PALLAMA_AUTO_DRIVER:-1}" != 1 ]; then
-        status "GPU preflight skipped (PALLAMA_AUTO_DRIVER=0)"
+    if [ "${BLAZAR_AUTO_DRIVER:-1}" != 1 ]; then
+        status "GPU preflight skipped (BLAZAR_AUTO_DRIVER=0)"
         return 0
     fi
-    [ "${PALLAMA_INSTALL_ENGINE:-1}" != 0 ] || return 0
+    [ "${BLAZAR_INSTALL_ENGINE:-1}" != 0 ] || return 0
     # Containers/WSL1 expose no PCI bus — nothing to detect.
     if [ ! -d /sys/bus/pci ]; then
         status "GPU preflight: no PCI bus (container/WSL?) — skipped"
@@ -283,19 +283,19 @@ gpu_preflight() {
                    mokutil --sb-state 2>/dev/null | grep -qi enabled; then
                     status "Secure Boot ON: distro-signed packages (Ubuntu) load as-is; locally built modules (Fedora akmods) may prompt a MokManager key enrollment at next boot"
                 fi
-                status "NVIDIA driver installed — REBOOT REQUIRED, then run: pallama engine update"
+                status "NVIDIA driver installed — REBOOT REQUIRED, then run: blazar engine update"
                 status "  (auto-picks the newest CUDA build this driver supports; CUDA runtimes are bundled — no toolkit install)"
             else
                 status "WARN: NVIDIA driver not auto-installed on this distro — manual lanes:"
                 status "  Ubuntu/Debian: sudo ubuntu-drivers autoinstall   (needs the 'universe' repo: sudo add-apt-repository universe)"
                 status "  Fedora/RHEL:  sudo dnf install https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora 2>/dev/null || echo VERSION).noarch.rpm && sudo dnf install akmod-nvidia"
                 status "  openSUSE:     add the NVIDIA repo (zypper ar -f https://download.nvidia.com/opensuse/leap nvidia) then zypper install nvidia-driver-G06"
-                status "  any distro:   https://www.nvidia.com/drivers — after install + reboot: pallama engine update"
+                status "  any distro:   https://www.nvidia.com/drivers — after install + reboot: blazar engine update"
             fi
         elif ! timeout 10 nvidia-smi -L >/dev/null 2>&1; then
-            status "NVIDIA driver installed but not communicating (module unloaded?) — a REBOOT usually brings it up; then: pallama engine update"
+            status "NVIDIA driver installed but not communicating (module unloaded?) — a REBOOT usually brings it up; then: blazar engine update"
         else
-            status "GPU preflight: NVIDIA driver present — CUDA engine lane eligible (pallama engine update picks the newest driver-compatible CUDA build)"
+            status "GPU preflight: NVIDIA driver present — CUDA engine lane eligible (blazar engine update picks the newest driver-compatible CUDA build)"
         fi
     fi
 
@@ -356,11 +356,11 @@ while [ $# -gt 0 ]; do
 done
 
 # ollama-style privilege: root runs plain, everyone else needs sudo.
-# There is no user-local fallback — a second pallama in ~/.local/bin is
+# There is no user-local fallback — a second blazar in ~/.local/bin is
 # precisely how stale-binary daemon races happen.
-# PALLAMA_SUDO is a test/mirror knob: a pass-through wrapper, or empty to
+# BLAZAR_SUDO is a test/mirror knob: a pass-through wrapper, or empty to
 # run everything unprivileged (unset-only default — sudo).
-SUDO="${PALLAMA_SUDO-sudo}"
+SUDO="${BLAZAR_SUDO-sudo}"
 [ "$(id -u)" -eq 0 ] && SUDO=
 
 # F151: under `sudo sh install.sh`, env_reset makes HOME=/root while the
@@ -378,47 +378,47 @@ SUDO="${PALLAMA_SUDO-sudo}"
 # --uninstall: remove what install.sh put here (binary + units).
 # NEVER touches models or config — those are user data.
 if [ "$UNINSTALL" = 1 ]; then
-    if command -v pallama >/dev/null 2>&1; then pallama stop >/dev/null 2>&1 || true; fi
-    for BIN in "${PALLAMA_SYSTEM_BIN_DIR:-/usr/local/bin}/pallama" "$USER_HOME/.local/bin/pallama"; do
+    if command -v blazar >/dev/null 2>&1; then blazar stop >/dev/null 2>&1 || true; fi
+    for BIN in "${BLAZAR_SYSTEM_BIN_DIR:-/usr/local/bin}/blazar" "$USER_HOME/.local/bin/blazar"; do
         if [ -e "$BIN" ]; then
             ([ -w "$(dirname "$BIN")" ] && rm -f "$BIN") || $SUDO rm -f "$BIN"
             status "removed $BIN"
         fi
     done
-    if [ -f /etc/systemd/system/pallama.service ]; then
-        $SUDO systemctl disable --now pallama 2>/dev/null || true
-        $SUDO rm -f /etc/systemd/system/pallama.service && status "removed system unit"
+    if [ -f /etc/systemd/system/blazar.service ]; then
+        $SUDO systemctl disable --now blazar 2>/dev/null || true
+        $SUDO rm -f /etc/systemd/system/blazar.service && status "removed system unit"
         $SUDO systemctl daemon-reload 2>/dev/null || true
     fi
-    if [ -f "$USER_HOME/.config/systemd/user/pallama.service" ]; then
-        systemctl --user disable --now pallama 2>/dev/null || true
-        rm -f "$USER_HOME/.config/systemd/user/pallama.service" && status "removed legacy user unit"
+    if [ -f "$USER_HOME/.config/systemd/user/blazar.service" ]; then
+        systemctl --user disable --now blazar 2>/dev/null || true
+        rm -f "$USER_HOME/.config/systemd/user/blazar.service" && status "removed legacy user unit"
         systemctl --user daemon-reload 2>/dev/null || true
     fi
     if [ "$(uname -s)" = Darwin ]; then
-        launchctl bootout "gui/$(id -u)/dev.pallama" 2>/dev/null ||
-            launchctl unload "$USER_HOME/Library/LaunchAgents/dev.pallama.plist" 2>/dev/null || true
-        if [ -f "$USER_HOME/Library/LaunchAgents/dev.pallama.plist" ]; then
-            rm -f "$USER_HOME/Library/LaunchAgents/dev.pallama.plist" && status "removed launch agent"
+        launchctl bootout "gui/$(id -u)/dev.blazar" 2>/dev/null ||
+            launchctl unload "$USER_HOME/Library/LaunchAgents/dev.blazar.plist" 2>/dev/null || true
+        if [ -f "$USER_HOME/Library/LaunchAgents/dev.blazar.plist" ]; then
+            rm -f "$USER_HOME/Library/LaunchAgents/dev.blazar.plist" && status "removed launch agent"
         fi
-        if [ -f /Library/LaunchDaemons/dev.pallama.plist ]; then
-            $SUDO launchctl bootout system/dev.pallama 2>/dev/null ||
-                $SUDO launchctl unload /Library/LaunchDaemons/dev.pallama.plist 2>/dev/null || true
-            $SUDO rm -f /Library/LaunchDaemons/dev.pallama.plist && status "removed launch daemon"
+        if [ -f /Library/LaunchDaemons/dev.blazar.plist ]; then
+            $SUDO launchctl bootout system/dev.blazar 2>/dev/null ||
+                $SUDO launchctl unload /Library/LaunchDaemons/dev.blazar.plist 2>/dev/null || true
+            $SUDO rm -f /Library/LaunchDaemons/dev.blazar.plist && status "removed launch daemon"
         fi
     fi
-    status "uninstalled. models/config kept at ~/.local/share/pallama and ~/.config/pallama (delete manually if desired)"
+    status "uninstalled. models/config kept at ~/.local/share/blazar and ~/.config/blazar (delete manually if desired)"
     exit 0
 fi
 
 find_checkout() {
-    if [ -n "${PALLAMA_CHECKOUT:-}" ]; then
-        [ -f "$PALLAMA_CHECKOUT/crates/pallama-cli/Cargo.toml" ] && { echo "$PALLAMA_CHECKOUT"; return 0; }
+    if [ -n "${BLAZAR_CHECKOUT:-}" ]; then
+        [ -f "$BLAZAR_CHECKOUT/crates/blazar-cli/Cargo.toml" ] && { echo "$BLAZAR_CHECKOUT"; return 0; }
         return 1
     fi
     d=$(cd "$(dirname "$0")" && pwd -P)
     while [ "$d" != "/" ]; do
-        [ -f "$d/crates/pallama-cli/Cargo.toml" ] && { echo "$d"; return 0; }
+        [ -f "$d/crates/blazar-cli/Cargo.toml" ] && { echo "$d"; return 0; }
         d=$(dirname "$d")
     done
     return 1
@@ -432,16 +432,16 @@ build_from_checkout() {
     # to the release channel.
     as_user sh -c 'command -v cargo >/dev/null 2>&1' || return 1
     CK=$(find_checkout) || return 1
-    status "building from source: cargo build --release -p pallama-cli (in ${CK})"
+    status "building from source: cargo build --release -p blazar-cli (in ${CK})"
     # Always build in the invoking user's environment: a root-run build
     # leaves root-owned artifacts in the user's target/ and breaks every
     # later user build.
-    if ! as_user sh -c "cd '$CK' && cargo build --release -p pallama-cli"; then
+    if ! as_user sh -c "cd '$CK' && cargo build --release -p blazar-cli"; then
         echo "ERROR: source build failed (cargo output above)" >&2
         return 1
     fi
-    [ -f "$CK/target/release/pallama" ] || { echo "ERROR: build produced no target/release/pallama" >&2; return 1; }
-    echo "$CK/target/release/pallama"
+    [ -f "$CK/target/release/blazar" ] || { echo "ERROR: build produced no target/release/blazar" >&2; return 1; }
+    echo "$CK/target/release/blazar"
 }
 
 # Zero-argument auto mode: a checkout present -> compile FRESH (never a
@@ -450,10 +450,10 @@ build_from_checkout() {
 # is bootstrapped first (announce-then-act); every failure falls back to
 # the release channel LOUD — never silently.
 if [ -z "$FROM_BIN" ] && [ "$FORCE_BUILD" = 0 ] &&
-   [ -z "${PALLAMA_REPO:-}" ] && [ -z "${PALLAMA_INSTALL_BASE_URL:-}" ]; then
+   [ -z "${BLAZAR_REPO:-}" ] && [ -z "${BLAZAR_INSTALL_BASE_URL:-}" ]; then
     if find_checkout >/dev/null 2>&1; then
         if ! ensure_toolchain; then
-            status "auto: toolchain unavailable (bootstrap failed or PALLAMA_AUTO_BOOTSTRAP=0) — falling back to the release channel"
+            status "auto: toolchain unavailable (bootstrap failed or BLAZAR_AUTO_BOOTSTRAP=0) — falling back to the release channel"
         elif FROM_BIN=$(build_from_checkout); then
             status "auto: installing the fresh build system-wide (binary + service)"
         else
@@ -476,25 +476,25 @@ fi
 # and a failed bootstrap is FATAL (explicit intent, no fallback).
 if [ "$FORCE_BUILD" = 1 ] && [ -z "${FROM_BIN:-}" ]; then
     ensure_toolchain ||
-        error "--build: no compile toolchain and bootstrap failed — install Rust (https://rustup.rs) + a C compiler, or set PALLAMA_BOOTSTRAP=<path to scripts/bootstrap.sh>"
+        error "--build: no compile toolchain and bootstrap failed — install Rust (https://rustup.rs) + a C compiler, or set BLAZAR_BOOTSTRAP=<path to scripts/bootstrap.sh>"
     FROM_BIN=$(build_from_checkout) ||
         error "--build: source build failed (cargo output above)"
     status "--build: source path forced (no release channel contact)"
 fi
 
 # Repo guard is release-channel only: --from bootstrap and mirror/test
-# base URLs never touch the GitHub release API. PALLAMA_REPO unset:
+# base URLs never touch the GitHub release API. BLAZAR_REPO unset:
 # derive owner/name from the checkout's git origin, else fall back to
 # the published repo (fresh curl|sh needs zero exports).
-if [ -z "${PALLAMA_INSTALL_BASE_URL:-}" ] && [ -z "${FROM_BIN:-}" ] && [ -z "$REPO" ]; then
+if [ -z "${BLAZAR_INSTALL_BASE_URL:-}" ] && [ -z "${FROM_BIN:-}" ] && [ -z "$REPO" ]; then
     REPO=$(derive_repo) || REPO=
     if [ -n "$REPO" ]; then
-        status "PALLAMA_REPO unset — derived from git origin: ${REPO}"
+        status "BLAZAR_REPO unset — derived from git origin: ${REPO}"
     else
-        REPO=santanu20/pallama
-        status "PALLAMA_REPO unset — using the published repo ${REPO}"
+        REPO=santanu20/blazar
+        status "BLAZAR_REPO unset — using the published repo ${REPO}"
     fi
-    API_BASE="${PALLAMA_INSTALL_BASE_URL:-https://api.github.com/repos/${REPO}}"
+    API_BASE="${BLAZAR_INSTALL_BASE_URL:-https://api.github.com/repos/${REPO}}"
 fi
 
 # macOS service via launchd (called from install_system when systemctl
@@ -503,7 +503,7 @@ fi
 # unprivileged — mirroring the systemd unit's User=. KeepAlive is the
 # launchd spelling of Restart=always.
 install_launchd() {
-    LABEL=dev.pallama
+    LABEL=dev.blazar
     if [ "$(id -u)" -eq 0 ]; then
         PLIST_DIR=/Library/LaunchDaemons
         USER_KEY="
@@ -523,7 +523,7 @@ install_launchd() {
     <string>${LABEL}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${BIN_DIR}/pallama</string>
+        <string>${BIN_DIR}/blazar</string>
         <string>serve</string>
     </array>
     <key>RunAtLoad</key>
@@ -549,7 +549,7 @@ EOF
         launchctl bootstrap "gui/$UID_N" "$PLIST_PATH" 2>/dev/null ||
             launchctl load "$PLIST_PATH" || error "loading $PLIST_PATH failed"
     fi
-    poll_healthz "logs: log show --predicate 'process == \"pallama\"' --last 5m"
+    poll_healthz "logs: log show --predicate 'process == \"blazar\"' --last 5m"
 }
 
 # Poll the configured host (quoted or bare TOML), not a hardcoded
@@ -557,10 +557,10 @@ EOF
 # Shared by the systemd and launchd install paths.
 poll_healthz() {
     # poll_healthz <log-hint>
-    HOST=$(sed -n 's/^host[[:space:]]*=[[:space:]]*//p' "$USER_HOME/.config/pallama/config.toml" 2>/dev/null | head -1 | tr -d '"')
-    PORT=$(sed -n 's/^port[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$USER_HOME/.config/pallama/config.toml" 2>/dev/null | head -1)
+    HOST=$(sed -n 's/^host[[:space:]]*=[[:space:]]*//p' "$USER_HOME/.config/blazar/config.toml" 2>/dev/null | head -1 | tr -d '"')
+    PORT=$(sed -n 's/^port[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$USER_HOME/.config/blazar/config.toml" 2>/dev/null | head -1)
     HOST=${HOST:-127.0.0.1}
-    # Pallama's own default port — NEVER 11434 (that is ollama's; a
+    # Blazar's own default port — NEVER 11434 (that is ollama's; a
     # fallback poll there would read a FOREIGN server's health).
     PORT=${PORT:-11435}
     i=0
@@ -569,7 +569,7 @@ poll_healthz() {
         sleep 1
     done
     if curl -s --max-time 2 "http://${HOST}:${PORT}/healthz" 2>/dev/null | grep -q ok; then
-        status "service active; pallama healthy on :${PORT} ($1)"
+        status "service active; blazar healthy on :${PORT} ($1)"
     else
         status "service enabled; healthz not answering on :${PORT} yet — check: $1"
     fi
@@ -582,18 +582,18 @@ poll_healthz() {
 # fights it for the port.
 install_system() {
     # install_system <binary>
-    BIN_DIR="${PALLAMA_SYSTEM_BIN_DIR:-/usr/local/bin}"
+    BIN_DIR="${BLAZAR_SYSTEM_BIN_DIR:-/usr/local/bin}"
     $SUDO mkdir -p "$BIN_DIR" || error "cannot create ${BIN_DIR} (need sudo?)"
     # Replace a possibly-running binary without ETXTBSY: temp file + rename
     # (the running process keeps its inode; new execs get the new binary).
     # Root-owned like ollama when we have root; plain install otherwise
     # (mirrors/tests run through a pass-through "sudo").
-    $SUDO install -o0 -g0 -m0755 "$1" "$BIN_DIR/pallama.new.$$" 2>/dev/null ||
-    $SUDO install -m0755 "$1" "$BIN_DIR/pallama.new.$$" ||
+    $SUDO install -o0 -g0 -m0755 "$1" "$BIN_DIR/blazar.new.$$" 2>/dev/null ||
+    $SUDO install -m0755 "$1" "$BIN_DIR/blazar.new.$$" ||
     error "install to ${BIN_DIR} failed"
-    $SUDO mv -f "$BIN_DIR/pallama.new.$$" "$BIN_DIR/pallama"
+    $SUDO mv -f "$BIN_DIR/blazar.new.$$" "$BIN_DIR/blazar"
     # A user-started daemon owns the port; the unit would crash-loop.
-    PIDFILE="$USER_HOME/.local/share/pallama/run/pallama.pid"
+    PIDFILE="$USER_HOME/.local/share/blazar/run/blazar.pid"
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
         kill -TERM "$(cat "$PIDFILE")" 2>/dev/null || true
         i=0
@@ -604,10 +604,10 @@ install_system() {
     # Under `sudo` the invoking user is SUDO_USER (id -un would say root);
     # the daemon must run as the data-owning user (engines/models live in
     # that home), so the unit never points at /root's empty store.
-    SVC_USER="${PALLAMA_SERVICE_USER:-${SUDO_USER:-$(id -un)}}"
-    SVC_GROUP="${PALLAMA_SERVICE_GROUP:-$(id -gn "$SVC_USER")}"
-    UNIT_PATH="${PALLAMA_UNIT_PATH:-/etc/systemd/system/pallama.service}"
-    SYSTEMCTL="${PALLAMA_SYSTEMCTL:-systemctl}"
+    SVC_USER="${BLAZAR_SERVICE_USER:-${SUDO_USER:-$(id -un)}}"
+    SVC_GROUP="${BLAZAR_SERVICE_GROUP:-$(id -gn "$SVC_USER")}"
+    UNIT_PATH="${BLAZAR_UNIT_PATH:-/etc/systemd/system/blazar.service}"
+    SYSTEMCTL="${BLAZAR_SYSTEMCTL:-systemctl}"
     if command -v "$SYSTEMCTL" >/dev/null 2>&1; then
         # SupplementaryGroups only for groups that exist on this box —
         # systemd rejects the whole unit when a listed group is missing
@@ -624,32 +624,32 @@ install_system() {
         # Soft memory ceiling for the daemon cgroup: protects the rest of
         # the box from runaway children without OOM-killing legit model
         # loads (mmap'd weights are reclaimable). Empty knob = no line.
-        MEMORY_HIGH="${PALLAMA_UNIT_MEMORY_HIGH-85%}"
+        MEMORY_HIGH="${BLAZAR_UNIT_MEMORY_HIGH-85%}"
         MH_LINE=
         [ -n "$MEMORY_HIGH" ] && MH_LINE="MemoryHigh=$MEMORY_HIGH"
         $SUDO mkdir -p "$(dirname "$UNIT_PATH")"
         UNIT=$(cat <<EOF
 [Unit]
-Description=Pallama daemon (llama.cpp orchestration)
+Description=Blazar daemon (llama.cpp orchestration)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=${BIN_DIR}/pallama serve
+ExecStart=${BIN_DIR}/blazar serve
 User=${SVC_USER}
 Group=${SVC_GROUP}
 ${SG_LINE}
 ${MH_LINE}
 Restart=always
 RestartSec=3
-# pallama serve exits 3 on hard singleton conflicts — another server
+# blazar serve exits 3 on hard singleton conflicts — another server
 # owns the port, or a live peer owns the daemon lock (e.g. a session
-# pallama serve while the unit is active). Neither is transient, so
+# blazar serve while the unit is active). Neither is transient, so
 # do not restart-loop them.
 # NOTE: no backticks and no literal dollar-parenthesis text anywhere in
 # this heredoc body — dash executes both while parsing the enclosing
 # command substitution at READ time (the installer hung for 40+ minutes
-# running "pallama serve" from a comment).
+# running "blazar serve" from a comment).
 RestartPreventExitStatus=3
 
 [Install]
@@ -664,11 +664,11 @@ EOF
         # installed", exit 1 + Restart=always) for the whole engine
         # download (measured: 86 restarts during a 28 MiB asset fetch).
         # The start is deferred to just after the engine exists.
-        if $SUDO "$SYSTEMCTL" is-active --quiet pallama 2>/dev/null; then
-            $SUDO "$SYSTEMCTL" restart pallama || error "restarting pallama.service failed"
-            poll_healthz "logs: journalctl -u pallama"
+        if $SUDO "$SYSTEMCTL" is-active --quiet blazar 2>/dev/null; then
+            $SUDO "$SYSTEMCTL" restart blazar || error "restarting blazar.service failed"
+            poll_healthz "logs: journalctl -u blazar"
         else
-            $SUDO "$SYSTEMCTL" enable pallama || error "enabling pallama.service failed"
+            $SUDO "$SYSTEMCTL" enable blazar || error "enabling blazar.service failed"
             DEFERRED_START=1
         fi
         SERVICE_DESC=" + systemd unit ${UNIT_PATH}"
@@ -676,10 +676,10 @@ EOF
         install_launchd
         SERVICE_DESC=" + launchd service ${PLIST_PATH}"
     else
-        status "no service manager found — binary installed at ${BIN_DIR}/pallama; start it manually: pallama serve"
+        status "no service manager found — binary installed at ${BIN_DIR}/blazar; start it manually: blazar serve"
     fi
-    VER=$("$BIN_DIR/pallama" --version 2>/dev/null || echo "(version check failed)")
-    status "Installed pallama ${VER} system-wide (${BIN_DIR}/pallama${SERVICE_DESC:-})"
+    VER=$("$BIN_DIR/blazar" --version 2>/dev/null || echo "(version check failed)")
+    status "Installed blazar ${VER} system-wide (${BIN_DIR}/blazar${SERVICE_DESC:-})"
     # The stale-copy race: a leftover user-path copy gets resurrected by
     # services with their own PATH. Remove it as part of every install.
     # -ef (same inode, symlinks followed) works where `readlink -f` does
@@ -687,35 +687,35 @@ EOF
     # shellcheck disable=SC3013 # XSI extension; dash/busybox/bash/BSD sh
     # all implement it, and the degraded path removes a copy policy wants
     # gone anyway.
-    if [ -e "$USER_HOME/.local/bin/pallama" ] &&
-       ! [ "$USER_HOME/.local/bin/pallama" -ef "$BIN_DIR/pallama" ]; then
-        rm -f "$USER_HOME/.local/bin/pallama" && status "removed stale user-path copy ~/.local/bin/pallama"
+    if [ -e "$USER_HOME/.local/bin/blazar" ] &&
+       ! [ "$USER_HOME/.local/bin/blazar" -ef "$BIN_DIR/blazar" ]; then
+        rm -f "$USER_HOME/.local/bin/blazar" && status "removed stale user-path copy ~/.local/bin/blazar"
     fi
     # One-click readiness: persist config migrations (legacy api_keys ->
-    # [[keys]] etc.) so the first `pallama` invocation never FAILs on an
+    # [[keys]] etc.) so the first `blazar` invocation never FAILs on an
     # old config. Best-effort: a missing config or an offline box must
     # not fail the install.
 # Run a user-store CLI (migrate, engine update, pull) as the DATA-OWNING
 # user — see the as_user block above for why a root-run installer must
 # never populate /root's store (engine-less crash-looping daemon).
-    if as_user "$BIN_DIR/pallama" migrate >/dev/null 2>&1; then
+    if as_user "$BIN_DIR/blazar" migrate >/dev/null 2>&1; then
         status "config migrated/verified (canonical form)"
     else
-        status "config migration skipped (no config or parse issue — run: pallama migrate)"
+        status "config migration skipped (no config or parse issue — run: blazar migrate)"
     fi
-    # One-click readiness: a pallama install without a llama.cpp engine
+    # One-click readiness: a blazar install without a llama.cpp engine
     # has ZERO inference capability. Bootstrap the engine now (the user
     # ran the installer — the download is sanctioned, never hidden).
-    # Opt out: PALLAMA_INSTALL_ENGINE=0. Optional first model:
-    # PALLAMA_INSTALL_MODEL=<repo> (pull lane, opt-in — model choice is
+    # Opt out: BLAZAR_INSTALL_ENGINE=0. Optional first model:
+    # BLAZAR_INSTALL_MODEL=<repo> (pull lane, opt-in — model choice is
     # the user's call, not the installer's).
-    if [ "${PALLAMA_INSTALL_ENGINE:-1}" != 0 ] &&
-       ! as_user "$BIN_DIR/pallama" engine list 2>/dev/null | grep -q '\[active\]'; then
-        status "bootstrapping llama.cpp engine (pallama engine update — largest download of this install)..."
-        if as_user "$BIN_DIR/pallama" engine update --no-gate; then
+    if [ "${BLAZAR_INSTALL_ENGINE:-1}" != 0 ] &&
+       ! as_user "$BIN_DIR/blazar" engine list 2>/dev/null | grep -q '\[active\]'; then
+        status "bootstrapping llama.cpp engine (blazar engine update — largest download of this install)..."
+        if as_user "$BIN_DIR/blazar" engine update --no-gate; then
             status "engine bootstrap complete"
         else
-            status "WARN: engine bootstrap failed (offline?) — inference NOT ready. Run: pallama engine update"
+            status "WARN: engine bootstrap failed (offline?) — inference NOT ready. Run: blazar engine update"
         fi
     else
         status "engine already active (or bootstrap disabled) — skipping engine download"
@@ -724,32 +724,32 @@ EOF
     # fastest cold start). The other engines are one command away — say
     # so, every install, so the choice is discoverable without docs.
     status "other engines, one command each:"
-    status "  pallama engine install --kind sglang     # SGLang: safetensors lane, best quality + batching (Linux + NVIDIA, ~6 GiB)"
-    status "  pallama engine install --kind mistralrs  # mistral.rs: GGUF + safetensors (~0.8 GiB)"
-    status "  pallama engine list                      # what is installed; pallama engine use <tag> switches the serving engine"
+    status "  blazar engine install --kind sglang     # SGLang: safetensors lane, best quality + batching (Linux + NVIDIA, ~6 GiB)"
+    status "  blazar engine install --kind mistralrs  # mistral.rs: GGUF + safetensors (~0.8 GiB)"
+    status "  blazar engine list                      # what is installed; blazar engine use <tag> switches the serving engine"
     # Fresh-install start, deferred until the engine exists (see the
     # enable block above). Started even when bootstrap failed: a running
     # crash-looping unit still answers `systemctl status` diagnostics
     # better than a silent inactive one.
     if [ "${DEFERRED_START:-0}" = 1 ]; then
-        $SUDO "$SYSTEMCTL" start pallama || error "starting pallama.service failed"
-        poll_healthz "logs: journalctl -u pallama"
+        $SUDO "$SYSTEMCTL" start blazar || error "starting blazar.service failed"
+        poll_healthz "logs: journalctl -u blazar"
     fi
-    if [ -n "${PALLAMA_INSTALL_MODEL:-}" ]; then
-        status "pulling first model: ${PALLAMA_INSTALL_MODEL}..."
-        if as_user "$BIN_DIR/pallama" pull "${PALLAMA_INSTALL_MODEL}"; then
-            status "model ready: ${PALLAMA_INSTALL_MODEL}"
+    if [ -n "${BLAZAR_INSTALL_MODEL:-}" ]; then
+        status "pulling first model: ${BLAZAR_INSTALL_MODEL}..."
+        if as_user "$BIN_DIR/blazar" pull "${BLAZAR_INSTALL_MODEL}"; then
+            status "model ready: ${BLAZAR_INSTALL_MODEL}"
         else
-            status "WARN: model pull failed — run: pallama pull ${PALLAMA_INSTALL_MODEL}"
+            status "WARN: model pull failed — run: blazar pull ${BLAZAR_INSTALL_MODEL}"
         fi
     fi
     status "system ready — next steps:"
-    if [ -n "${PALLAMA_INSTALL_MODEL:-}" ]; then
-        status "  pallama run ${PALLAMA_INSTALL_MODEL}   # chat REPL (model pulled above)"
+    if [ -n "${BLAZAR_INSTALL_MODEL:-}" ]; then
+        status "  blazar run ${BLAZAR_INSTALL_MODEL}   # chat REPL (model pulled above)"
     else
-        status "  pallama pull <model>    # e.g. pallama pull Qwen3-0.6B (find one: pallama search qwen3)"
+        status "  blazar pull <model>    # e.g. blazar pull Qwen3-0.6B (find one: blazar search qwen3)"
     fi
-    status "  pallama doctor          # health check with per-row hints"
+    status "  blazar doctor          # health check with per-row hints"
     status "engines: llamacpp serves by default; the menu above installs SGLang or mistral.rs"
     status "All inference is upstream llama.cpp, mistral.rs and SGLang — the engine authors did the hard parts."
 }
@@ -797,26 +797,26 @@ case "$OS" in
 esac
 
 STATUS_OS_ARCH="${STATUS_OS} ${RUST_ARCH} (${LIBC})"
-status "Looking for release ${PALLAMA_VERSION:-latest} for ${STATUS_OS_ARCH}..."
+status "Looking for release ${BLAZAR_VERSION:-latest} for ${STATUS_OS_ARCH}..."
 
 # Latest-or-pinned release metadata from the GitHub API.
-if [ -n "${PALLAMA_VERSION:-}" ]; then
-    RELEASE_PATH="releases/tags/${PALLAMA_VERSION}"
+if [ -n "${BLAZAR_VERSION:-}" ]; then
+    RELEASE_PATH="releases/tags/${BLAZAR_VERSION}"
 else
     RELEASE_PATH="releases/latest"
 fi
 RELEASE_JSON=$(fetch "${API_BASE}/${RELEASE_PATH}") ||
-    error "failed to look up release ${PALLAMA_VERSION:-latest} in ${API_BASE} (PALLAMA_REPO set? network up?)"
+    error "failed to look up release ${BLAZAR_VERSION:-latest} in ${API_BASE} (BLAZAR_REPO set? network up?)"
 
 TAG=$(printf '%s' "$RELEASE_JSON" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
 [ -n "$TAG" ] || error "could not parse tag_name from the release API response"
 
 # Asset lines: pick the one matching this OS/arch (release-workflow naming
-# contract: pallama-<tag>-<rust-triple>.tar.gz). Each sibling asset line
+# contract: blazar-<tag>-<rust-triple>.tar.gz). Each sibling asset line
 # carries its own digest, so a name/digest mix-up is impossible.
 # Quoted variable = literal case match; a raw expansion in a case pattern
 # would act as a glob (a hostile tag_name like "*" must not match).
-WANTED="pallama-${TAG}-${RUST_ARCH}-${ASSET_TRIPLE_SUFFIX}.tar.gz"
+WANTED="blazar-${TAG}-${RUST_ARCH}-${ASSET_TRIPLE_SUFFIX}.tar.gz"
 printf '%s' "$RELEASE_JSON" | tr ',' '\n' | grep -E '"(name|digest)": *"' | \
     sed -e 's/.*"name": *"\([^"]*\)".*/name \1/' -e 's/.*"digest": *"\([^"]*\)".*/digest \1/' | \
     while read -r KIND VAL; do
@@ -830,10 +830,10 @@ printf '%s' "$RELEASE_JSON" | tr ',' '\n' | grep -E '"(name|digest)": *"' | \
             # (only the pair emitted right after the matching name counts).
             ASSET=
         fi
-    done > "${TMPDIR:-/tmp}/pallama-asset.$$"
-read -r ASSET EXPECT < "${TMPDIR:-/tmp}/pallama-asset.$$" || true
-rm -f "${TMPDIR:-/tmp}/pallama-asset.$$"
-[ -n "$ASSET" ] || error "release ${TAG} has no asset matching pallama-${TAG}-${RUST_ARCH}-${ASSET_TRIPLE_SUFFIX}.tar.gz (available: $(printf '%s' "$RELEASE_JSON" | tr ',' '\n' | grep -o '"name": *"[^"]*"' | cut -d'"' -f4 | tr '\n' ' '))"
+    done > "${TMPDIR:-/tmp}/blazar-asset.$$"
+read -r ASSET EXPECT < "${TMPDIR:-/tmp}/blazar-asset.$$" || true
+rm -f "${TMPDIR:-/tmp}/blazar-asset.$$"
+[ -n "$ASSET" ] || error "release ${TAG} has no asset matching blazar-${TAG}-${RUST_ARCH}-${ASSET_TRIPLE_SUFFIX}.tar.gz (available: $(printf '%s' "$RELEASE_JSON" | tr ',' '\n' | grep -o '"name": *"[^"]*"' | cut -d'"' -f4 | tr '\n' ' '))"
 [ -n "$EXPECT" ] || error "release ${TAG} asset ${ASSET} carries no sha256 digest — refusing to install unverified"
 EXPECT=${EXPECT#sha256:}
 
@@ -862,9 +862,9 @@ status "sha256 verified"
 EXDIR="$TMP/extract"
 mkdir -p "$EXDIR"
 tar -xzf "$TARBALL" -C "$EXDIR" || error "failed to extract tarball"
-[ -f "$EXDIR/pallama" ] || error "tarball did not contain a 'pallama' binary at its root"
+[ -f "$EXDIR/blazar" ] || error "tarball did not contain a 'blazar' binary at its root"
 
-install_system "$EXDIR/pallama"
+install_system "$EXDIR/blazar"
 
 }
 

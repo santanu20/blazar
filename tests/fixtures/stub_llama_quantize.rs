@@ -1,5 +1,5 @@
 //! Test stub for `llama-quantize`: copies argv[1] to argv[2], printing
-//! a couple of progress lines. `PALLAMA_STUB_QUANTIZE_FAIL=1` makes it
+//! a couple of progress lines. `BLAZAR_STUB_QUANTIZE_FAIL=1` makes it
 //! exit 1 with an error line instead (failure-path tests).
 
 fn main() {
@@ -8,7 +8,7 @@ fn main() {
         eprintln!("usage: stub-llama-quantize <src> <dst> <type>");
         std::process::exit(2);
     }
-    if std::env::var("PALLAMA_STUB_QUANTIZE_FAIL").is_ok() {
+    if std::env::var("BLAZAR_STUB_QUANTIZE_FAIL").is_ok() {
         eprintln!("error: unknown quantization type");
         std::process::exit(1);
     }

@@ -4,11 +4,11 @@ name: engine-cuda
 # ggml-org/llama.cpp source at a b-tag with -DGGML_CUDA=ON against CUDA
 # 12 and CUDA 13 toolkit images, bundles the NVIDIA runtime libraries
 # (cudart/cublas/cublasLt) plus their EULAs, and publishes the archives
-# as `bNNNN-cuda` releases on THIS repository. Pallama's engine lane
+# as `bNNNN-cuda` releases on THIS repository. Blazar's engine lane
 # picks them up automatically on Linux-NVIDIA boxes whose driver can
 # run the toolkit version (zero-touch: the overlay home defaults to
-# santanu20/pallama — flip ENGINE_OVERLAY_REPO_DEFAULT in gh.rs if the
-# project repo moves; PALLAMA_ENGINE_REPO=owner/repo points at forks).
+# santanu20/blazar — flip ENGINE_OVERLAY_REPO_DEFAULT in gh.rs if the
+# project repo moves; BLAZAR_ENGINE_REPO=owner/repo points at forks).
 #
 # No source fork: every build checks out the pristine upstream tarball.
 
@@ -73,7 +73,7 @@ jobs:
           # and future GPUs JIT forward from it.
           # Arch floors: CUDA 13 dropped sm<75 (Turing); Blackwell
           # (sm_100/120) needs 12.8+. Datacenter 80/90/100 and Volta 70
-          # stay on the source lane (`pallama engine build cuda`).
+          # stay on the source lane (`blazar engine build cuda`).
           # The client resolver ranks: exact-sm slim > legacy fat asset
           # (transition releases) > sm120 PTX for GPUs newer than 120.
           # CMake grammar (verified 3.28.3): plain = SASS+PTX, -real =
@@ -239,7 +239,7 @@ jobs:
           [ -e "$1" ] || { echo "libcublas not bundled" >&2; exit 1; }
 
           # Devel-leak guard (nccl-class misses), run under the SAME
-          # loader contract as the pallama runtime: the engine dir is the
+          # loader contract as the blazar runtime: the engine dir is the
           # child's LD_LIBRARY_PATH root, so staged libs win resolution
           # exactly as they will on user machines. Bare `ldd` would use
           # only RUNPATH/ld.so.cache semantics and false-positive on
@@ -290,14 +290,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.resolve.outputs.tag }}
-          REPO: santanu20/pallama
+          REPO: santanu20/blazar
         run: |
           rel="${TAG}-cuda"
           # This job has NO checkout — every gh call needs --repo (gh
           # otherwise resolves context from git and dies). Notes ride in a
           # quoted heredoc: backticks inside a double-quoted shell string
-          # are COMMAND SUBSTITUTION (run 6: `pallama ...` executed and
-          # printed "pallama: command not found" into the notes).
+          # are COMMAND SUBSTITUTION (run 6: `blazar ...` executed and
+          # printed "blazar: command not found" into the notes).
           read -r -d '' notes <<EOF || true
           Prebuilt CUDA llama-server for upstream ${TAG}.
 
@@ -305,14 +305,14 @@ jobs:
           (-DGGML_CUDA=ON; one slim asset per consumer GPU arch
           (-smNN, SASS only), plus an sm120 build carrying PTX for
           forward JIT onto future GPUs; datacenter archs: build locally
-          via \`pallama engine build cuda\`). Bundles
+          via \`blazar engine build cuda\`). Bundles
           libcudart/libcublas/libcublasLt plus NVIDIA EULA texts — no
           CUDA toolkit install needed on the target machine; the NVIDIA
           driver alone must support the asset's CUDA version.
 
-          Install lane: pallama engine update prefers this channel
+          Install lane: blazar engine update prefers this channel
           automatically on Linux-NVIDIA (highest ubuntu-cuda-{X.Y}-x64
-          asset the local driver can run; PALLAMA_ENGINE_REPO overrides
+          asset the local driver can run; BLAZAR_ENGINE_REPO overrides
           the default home for forks).
           EOF
           # gh release create fails on an existing release — create only

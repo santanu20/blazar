@@ -1,0 +1,44 @@
+[package]
+name = "blazar-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "blazar binary: multi-engine local inference platform (llama.cpp, mistral.rs, SGLang) CLI and daemon"
+
+[[bin]]
+name = "blazar"
+path = "src/main.rs"
+
+[features]
+default = []
+test-util = []
+
+[dependencies]
+blazar-core = { workspace = true }
+blazar-runtime = { workspace = true }
+blazar-gateway = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+clap_complete = "4"
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+dirs = { workspace = true }
+rustyline = { workspace = true }
+indicatif = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+toml = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = "2"
+tempfile = "3"
+flate2 = { workspace = true }
+tar = { workspace = true }
+sha2 = { workspace = true }
+predicates = "3"
+
+[lints]
+workspace = true

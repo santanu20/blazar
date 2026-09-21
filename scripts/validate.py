@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""pallama exhaustive validation harness — REAL engine, REAL model, REAL config.
+"""blazar exhaustive validation harness — REAL engine, REAL model, REAL config.
 
 Dev tooling, not shipped: this script is the project's own e2e validator
-(excluded from release packaging); it exercises the installed/repo pallama
+(excluded from release packaging); it exercises the installed/repo blazar
 binary end-to-end so no command, flag, env knob, or route can silently rot.
 
 The Step-11 "god tier" validator as a permanent script: boots an ISOLATED
-pallama daemon (temp XDG dirs, copied store DB, symlinked real engine +
+blazar daemon (temp XDG dirs, copied store DB, symlinked real engine +
 model files, own random-free port) and walks every config knob, API route, CLI
 command, sentinel surface, and lifecycle behavior with real inference —
 printing evidence for every check.
 
 Isolation contract:
-  - never touches ollama (11434), the user's daemon, or ~/.config/pallama
+  - never touches ollama (11434), the user's daemon, or ~/.config/blazar
     (config.toml hash is verified unchanged at exit)
   - one engine child alive at a time; aborts a load if MemAvailable < 1.5 GiB
   - only ever signals pids it spawned (daemon) or that its daemon spawned
@@ -20,7 +20,7 @@ Isolation contract:
 
 Usage:
   scripts/validate.py                 # full run (~10-15 min with model loads)
-  PALLAMA_VALIDATE_FAST=1 scripts/validate.py   # skip long-wait phases
+  BLAZAR_VALIDATE_FAST=1 scripts/validate.py   # skip long-wait phases
   scripts/validate.py --phase config --phase api # only these phases
   scripts/validate.py --self-test     # inject one failure, expect exit 1
 
@@ -65,9 +65,9 @@ def _free_port() -> int:
 
 # Default to a random free port so two concurrent validate campaigns can
 # never collide on the main listener (live 2026-09-10 cross-run 502s);
-# PALLAMA_VALIDATE_PORT still pins an explicit port when set.
-PORT = int(os.environ.get("PALLAMA_VALIDATE_PORT") or _free_port())
-# Fast default: the 0.5B keeps every lane quick; PALLAMA_VALIDATE_MODEL
+# BLAZAR_VALIDATE_PORT still pins an explicit port when set.
+PORT = int(os.environ.get("BLAZAR_VALIDATE_PORT") or _free_port())
+# Fast default: the 0.5B keeps every lane quick; BLAZAR_VALIDATE_MODEL
 # overrides (e.g. release-grade runs pinning the 9B). The name is the
 # CANONICAL store row ("qwen2.5-0.5b" — rows are tagless; the display
 # form is name:quant). The earlier "qwen2.5-0.5b-instruct" fixture
@@ -77,30 +77,30 @@ PORT = int(os.environ.get("PALLAMA_VALIDATE_PORT") or _free_port())
 # names also key model_overrides and model_bytes_mib's SQL lookup
 # exactly. No phase depends on instruct-ness of the fixture
 # (think/template lanes pin their own models).
-MODEL = os.environ.get("PALLAMA_VALIDATE_MODEL", "qwen2.5-0.5b")
+MODEL = os.environ.get("BLAZAR_VALIDATE_MODEL", "qwen2.5-0.5b")
 # Second DISTINCT model for lanes that structurally need two models live at
 # once (wave battery B predictive preload, mmproj projector attach). Separate
 # from MODEL so the fast default stays small without collapsing those lanes.
-BIG = os.environ.get("PALLAMA_VALIDATE_BIG_MODEL", "qwen3.5-9b")
-FAST = os.environ.get("PALLAMA_VALIDATE_FAST", "") == "1"
+BIG = os.environ.get("BLAZAR_VALIDATE_BIG_MODEL", "qwen3.5-9b")
+FAST = os.environ.get("BLAZAR_VALIDATE_FAST", "") == "1"
 # Optional device pin for MODEL on mixed iGPU/dGPU boxes (e.g. "Vulkan1").
-VALIDATE_DEVICES = os.environ.get("PALLAMA_VALIDATE_DEVICES", "") or None
+VALIDATE_DEVICES = os.environ.get("BLAZAR_VALIDATE_DEVICES", "") or None
 # Prefer the checkout's release binary when present: the harness validates the
 # code under test, not whatever system copy happens to be installed.
 _REPO_BIN = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "target",
     "release",
-    "pallama",
+    "blazar",
 )
-if os.environ.get("PALLAMA_BIN"):
-    PAL = os.environ["PALLAMA_BIN"]
+if os.environ.get("BLAZAR_BIN"):
+    PAL = os.environ["BLAZAR_BIN"]
 elif os.path.exists(_REPO_BIN):
     PAL = _REPO_BIN
 else:
-    PAL = shutil.which("pallama") or "pallama"
-REAL_DATA = os.path.expanduser("~/.local/share/pallama")
-REAL_CONFIG = os.path.expanduser("~/.config/pallama/config.toml")
+    PAL = shutil.which("blazar") or "blazar"
+REAL_DATA = os.path.expanduser("~/.local/share/blazar")
+REAL_CONFIG = os.path.expanduser("~/.config/blazar/config.toml")
 MEM_FLOOR_MIB = 1536
 
 CHECKS: list[dict] = []
@@ -138,25 +138,25 @@ def cov(knob: str, expectation: str, evidence: str, ok: bool = True) -> None:
 # single source of truth for real-integration coverage manifests, kept as
 # one file with its consumer per the one-script-per-concern layout).
 # ---------------------------------------------------------------------------
-# Single source of truth for Pallama real-integration coverage manifests.
+# Single source of truth for Blazar real-integration coverage manifests.
 #
 # Everything validate.py enforces for 100% command + config coverage is
 # declared here, table-driven. Adding a CLI subcommand or a Config knob
 # WITHOUT extending this file makes the completeness gates fail loudly
 # (bidirectional set comparisons), so drift is impossible to miss.
 #
-# Field inventories verified against crates/pallama-core/src/config.rs:
+# Field inventories verified against crates/blazar-core/src/config.rs:
 #   Config          146 fields (19 Option, 4 containers: keys/remotes/engine_env/model_overrides)
 #   ModelOverride    25 fields (all Option)
 #   SamplerDefaults  18 fields (all Option, skip_serializing_if none)
 #   ApiKey            7 fields    Remote  3 fields
-# Command set verified against `pallama --help` (38 subcommands + help).
+# Command set verified against `blazar --help` (38 subcommands + help).
 #
 # Tier semantics (honest evidence classes):
 #   argv       knob value reaches child llama-server argv (child_argv assert)
 #   behavior   observable daemon/gateway behavior (HTTP probe / environ / nice / phase)
 #   existing   already covered by a pre-existing validate.py phase (cov row exists or added)
-#   tune       exercised via `pallama tune` lane
+#   tune       exercised via `blazar tune` lane
 #   roundtrip  set -> config list echo + full-manifest daemon boot (serde deny_unknown_fields proof)
 #   boundary   honest boundary with documented reason (needs 2nd box / RAM / unsupported transport)
 # """
@@ -269,7 +269,7 @@ def cov(knob: str, expectation: str, evidence: str, ok: bool = True) -> None:
 # ALIASES = {"ls": "list", "start": "serve"}
 #
 # # Top-level subcommand names (derived from paths, aliases excluded) + `help` —
-# # the set that `pallama --help` must advertise, exactly, in both directions.
+# # the set that `blazar --help` must advertise, exactly, in both directions.
 # TOPLEVEL_COMMANDS = sorted(
 #     ({p.split(".")[0] for p in _COMMAND_ATTRS} - set(ALIASES)) | {"help"}
 # )
@@ -779,7 +779,7 @@ def cov(knob: str, expectation: str, evidence: str, ok: bool = True) -> None:
 #         False,
 #         "roundtrip",
 #         None,
-#         "tracing filter (e.g. pallama=debug); set->list echo + full-manifest boot",
+#         "tracing filter (e.g. blazar=debug); set->list echo + full-manifest boot",
 #     ),
 #     (
 #         "late_chunking_max_tokens",
@@ -1032,7 +1032,7 @@ COMMANDS = [
 ALIASES = {"ls": "list", "start": "serve"}
 
 # Top-level subcommand names (derived from paths, aliases excluded) + `help` —
-# the set that `pallama --help` must advertise, exactly, in both directions.
+# the set that `blazar --help` must advertise, exactly, in both directions.
 TOPLEVEL_COMMANDS = sorted(
     ({p.split(".")[0] for p in _COMMAND_ATTRS} - set(ALIASES)) | {"help"}
 )
@@ -1052,7 +1052,7 @@ _K = [
         False,
         "behavior",
         None,
-        "binds 127.0.0.1:<port> (every daemon phase; random-free unless PALLAMA_VALIDATE_PORT pins one)",
+        "binds 127.0.0.1:<port> (every daemon phase; random-free unless BLAZAR_VALIDATE_PORT pins one)",
     ),
     (
         "port",
@@ -1060,7 +1060,7 @@ _K = [
         False,
         "behavior",
         None,
-        "binds 127.0.0.1:<port> (every daemon phase; random-free unless PALLAMA_VALIDATE_PORT pins one)",
+        "binds 127.0.0.1:<port> (every daemon phase; random-free unless BLAZAR_VALIDATE_PORT pins one)",
     ),
     ("default_ctx", False, False, "existing", None, "phase_config A: --ctx-size 8192"),
     ("idle_sleep_secs", False, False, "argv", "G1", "--sleep-idle-seconds 77"),
@@ -1647,7 +1647,7 @@ _K = [
         False,
         "roundtrip",
         None,
-        "tracing filter (e.g. pallama=debug); set->list echo + full-manifest boot",
+        "tracing filter (e.g. blazar=debug); set->list echo + full-manifest boot",
     ),
     (
         "late_chunking_max_tokens",
@@ -2054,7 +2054,7 @@ def model_bytes_mib(name: str = MODEL) -> int:
     # name:quant display form (tag stripped, then a unique-prefix
     # fallback) so a display-form override still sizes honestly.
     try:
-        db = sqlite3.connect(os.path.join(REAL_DATA, "pallama.db"))
+        db = sqlite3.connect(os.path.join(REAL_DATA, "blazar.db"))
         rows = db.execute("SELECT name, bytes FROM models").fetchall()
         db.close()
         by_name = {n: b for n, b in rows if b}
@@ -2151,11 +2151,11 @@ class Sandbox:
         # able to delete sandbox files (the 2026-09-05 incident).
         cache_root = os.path.expanduser("~/.cache")
         os.makedirs(cache_root, exist_ok=True)
-        self.root = tempfile.mkdtemp(prefix="pallama-validate-", dir=cache_root)
+        self.root = tempfile.mkdtemp(prefix="blazar-validate-", dir=cache_root)
         self.config_home = os.path.join(self.root, "config")
         self.data_home = os.path.join(self.root, "share")
-        self.config_dir = os.path.join(self.config_home, "pallama")
-        self.data_dir = os.path.join(self.data_home, "pallama")
+        self.config_dir = os.path.join(self.config_home, "blazar")
+        self.data_dir = os.path.join(self.data_home, "blazar")
         os.makedirs(self.config_dir)
         os.makedirs(os.path.join(self.data_dir, "models"))
         os.makedirs(os.path.join(self.data_dir, "run"))
@@ -2174,8 +2174,8 @@ class Sandbox:
             "engines copy crossed filesystems (hardlinks would become copies)"
         )
         # Live-safe DB copy (sqlite backup API, unlike shutil.copy).
-        src = sqlite3.connect(os.path.join(REAL_DATA, "pallama.db"))
-        dst = sqlite3.connect(os.path.join(self.data_dir, "pallama.db"))
+        src = sqlite3.connect(os.path.join(REAL_DATA, "blazar.db"))
+        dst = sqlite3.connect(os.path.join(self.data_dir, "blazar.db"))
         src.backup(dst)
         dst.close()
         src.close()
@@ -2187,9 +2187,9 @@ class Sandbox:
         e["XDG_DATA_HOME"] = self.data_home
         # Harness marker: identifies daemons WE spawned so orphan reaping
         # (Daemon.start pre-spawn sweep) can never signal a user daemon.
-        e["PALLAMA_VALIDATE"] = "1"
+        e["BLAZAR_VALIDATE"] = "1"
         for k in list(e):
-            if k.startswith("PALLAMA_") and not k.startswith("PALLAMA_VALIDATE"):
+            if k.startswith("BLAZAR_") and not k.startswith("BLAZAR_VALIDATE"):
                 del e[k]
         if extra:
             e.update(extra)
@@ -2278,7 +2278,7 @@ class Daemon:
             cfg.setdefault("port", PORT)
         # Mixed iGPU/dGPU boxes: the auto GPU pick maximizes free VRAM,
         # which strands big models on a slow integrated GPU (documented
-        # product caveat). PALLAMA_VALIDATE_DEVICES pins MODEL to one
+        # product caveat). BLAZAR_VALIDATE_DEVICES pins MODEL to one
         # explicit device for harness runs on such boxes.
         if VALIDATE_DEVICES:
             mo = cfg.setdefault("model_overrides", {})
@@ -2308,21 +2308,21 @@ class Daemon:
             raise RuntimeError(
                 f"MemAvailable {mem_available_mib()} MiB < needed ~{need} MiB "
                 f"(model {model_bytes_mib(floor_model)} MiB + headroom). A co-resident "
-                f"pallama/ollama engine is likely holding memory: stop it for the "
+                f"blazar/ollama engine is likely holding memory: stop it for the "
                 f"validation window."
             )
         self.sb.write_config(cfg)
 
         # Orphan reaping: a previous harness run that died without
-        # cleanup (timeout kill, crash) leaves a `pallama serve` holding
+        # cleanup (timeout kill, crash) leaves a `blazar serve` holding
         # PORT with a DESTROYED sandbox behind it (pidfile rmtree'd with
         # the sandbox). Such orphans carry our harness marker in their
         # environment — TERM them before spawning, or our own child
         # loses the bind race and every probe silently targets a daemon
         # whose store no longer exists (live leak 2026-09-09, pid
         # 1587661). NEVER signal by name/pgid — exact pids only, and
-        # only ones provably ours (PALLAMA_VALIDATE marker in environ).
-        # Random per-campaign ports (PALLAMA_VALIDATE_PORT) mean the
+        # only ones provably ours (BLAZAR_VALIDATE marker in environ).
+        # Random per-campaign ports (BLAZAR_VALIDATE_PORT) mean the
         # port check below misses most of them — the marker sweep is
         # the real net; a live non-us parent = concurrent run, untouched.
         marker_orphans = self._find_marker_orphans()
@@ -2387,13 +2387,13 @@ class Daemon:
         raise RuntimeError(f"daemon not healthy in 240s; log:\n{self.tail_log()}")
 
     def _find_port_orphan(self) -> int | None:
-        """A harness-marked `pallama serve` answering on PORT that this
+        """A harness-marked `blazar serve` answering on PORT that this
         Daemon object did not spawn. Fast path: port silent -> None.
 
         F136: the returned pid must actually HOLD the port (listening
         socket inode match), otherwise the /proc scan can TERM a
         concurrent validate run's daemon that merely shares the
-        PALLAMA_VALIDATE marker."""
+        BLAZAR_VALIDATE marker."""
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/healthz", timeout=1):
                 pass
@@ -2426,10 +2426,10 @@ class Daemon:
             try:
                 cmdline = (pid_dir / "cmdline").read_bytes().split(b"\0")
                 joined = b" ".join(cmdline)
-                if b"pallama" not in joined or b"serve" not in joined:
+                if b"blazar" not in joined or b"serve" not in joined:
                     continue
                 environ = (pid_dir / "environ").read_bytes()
-                if b"PALLAMA_VALIDATE=1" not in environ:
+                if b"BLAZAR_VALIDATE=1" not in environ:
                     continue  # never the user's real daemon
                 # port holder only: match via its listening socket inode
                 for fd in (pid_dir / "fd").iterdir():
@@ -2446,7 +2446,7 @@ class Daemon:
     def _sandbox_procs(self, exclude: int | None = None) -> list[int]:
         """Every live process belonging to THIS sandbox: the daemon plus
         its engine children (they inherit the daemon's environ, so both
-        carry PALLAMA_VALIDATE=1 AND this sandbox's XDG_DATA_HOME —
+        carry BLAZAR_VALIDATE=1 AND this sandbox's XDG_DATA_HOME —
         reparented grandchildren included, the user's real daemon never).
         Exact pids only; callers kill individually, never by group."""
         marker = self.sb.data_home.encode()
@@ -2462,12 +2462,12 @@ class Daemon:
                 environ = (pid_dir / "environ").read_bytes()
             except OSError:
                 continue
-            if b"PALLAMA_VALIDATE=1" in environ and marker in environ:
+            if b"BLAZAR_VALIDATE=1" in environ and marker in environ:
                 out.append(pid)
         return out
 
     def _find_marker_orphans(self) -> list[int]:
-        """Harness-marked pallama daemons from DEAD runs (parent exited,
+        """Harness-marked blazar daemons from DEAD runs (parent exited,
         process reparented to init) — the random-port leak class the port
         orphan check cannot see. Live-parented marker daemons are NEVER
         touched: our own deliberate spawns (Daemon instances, battery-F
@@ -2484,10 +2484,10 @@ class Daemon:
             try:
                 cmdline = (pid_dir / "cmdline").read_bytes().split(b"\0")
                 joined = b" ".join(cmdline)
-                if b"pallama" not in joined or b"serve" not in joined:
+                if b"blazar" not in joined or b"serve" not in joined:
                     continue
                 environ = (pid_dir / "environ").read_bytes()
-                if b"PALLAMA_VALIDATE=1" not in environ:
+                if b"BLAZAR_VALIDATE=1" not in environ:
                     continue
                 ppid = 0
                 for line in (pid_dir / "status").read_text().splitlines():
@@ -2532,7 +2532,7 @@ class Daemon:
                 pass
 
     def stop(self) -> None:
-        pidfile = os.path.join(self.sb.data_dir, "run", "pallama.pid")
+        pidfile = os.path.join(self.sb.data_dir, "run", "blazar.pid")
         pid = None
         try:
             with open(pidfile) as f:
@@ -2595,8 +2595,8 @@ class Daemon:
 
 def _reap_orphan_validate_engines() -> None:
     """Kill engine children this harness stranded: llama-server cmdline,
-    PALLAMA_VALIDATE=1 in their environ, and NOT parented by a live
-    pallama daemon (a validate engine's only legitimate parent). Reparent
+    BLAZAR_VALIDATE=1 in their environ, and NOT parented by a live
+    blazar daemon (a validate engine's only legitimate parent). Reparent
     targets include subreapers — init, a dead parent, or a shell wrapper
     all mean the owning daemon is gone; /api/evict owns live-daemon
     children, and a concurrent run's engines stay safe because their
@@ -2613,7 +2613,7 @@ def _reap_orphan_validate_engines() -> None:
                 continue
             with open(f"/proc/{pid}/environ", "rb") as f:
                 env = f.read().replace(b"\x00", b"\n").decode("utf-8", "replace")
-            if "PALLAMA_VALIDATE=1" not in env:
+            if "BLAZAR_VALIDATE=1" not in env:
                 continue
             ppid = 0
             with open(f"/proc/{pid}/status") as f:
@@ -2627,7 +2627,7 @@ def _reap_orphan_validate_engines() -> None:
                     parent_cmd = (
                         f.read().replace(b"\x00", b" ").decode("utf-8", "replace")
                     )
-            if ppid <= 1 or "pallama" not in parent_cmd:
+            if ppid <= 1 or "blazar" not in parent_cmd:
                 pids.append(pid)
         except (FileNotFoundError, PermissionError, ProcessLookupError):
             continue
@@ -2785,15 +2785,15 @@ def ps_field(row: dict, *names: str):
 
 
 def row_ctx(row: dict):
-    return ps_field(row, "pallama_ctx", "ctx", "context")
+    return ps_field(row, "blazar_ctx", "ctx", "context")
 
 
 def row_state(row: dict):
-    return ps_field(row, "pallama_state", "state", "status")
+    return ps_field(row, "blazar_state", "state", "status")
 
 
 def row_inflight(row: dict):
-    return ps_field(row, "pallama_in_flight", "in_flight", "inflight")
+    return ps_field(row, "blazar_in_flight", "in_flight", "inflight")
 
 
 def child_pid(model: str = MODEL) -> int | None:
@@ -2870,7 +2870,7 @@ def http_multipart(
     timeout: int = 60,
 ) -> tuple[int, bytes]:
     """Hand-rolled multipart POST (the harness has no requests dep)."""
-    boundary = "pallamaValidate7dF3k"
+    boundary = "blazarValidate7dF3k"
     parts = []
     for name, value in fields.items():
         parts.append(
@@ -2991,7 +2991,7 @@ def _help_command_names(help_stdout: str) -> list[str]:
     Options lines start with '-'; headings and the footer are not
     indented. Single parser shared by the commands registry check, the
     gates manifest cross-check and the goldens capture — keep in sync
-    with `render_grouped_help()` in crates/pallama-cli/src/main.rs.
+    with `render_grouped_help()` in crates/blazar-cli/src/main.rs.
     """
     return [
         ln.strip().split()[0]
@@ -3077,7 +3077,7 @@ def phase_baseline() -> None:
     # Boot the FIRST daemon through the `start` alias — the only lane where
     # the alias is the thing under test; every later boot uses `serve`.
     d.start({"port": PORT}, serve_cmd="start")
-    reg("start", True, "alias boot: `pallama start` -> healthz 200 (serve alias)")
+    reg("start", True, "alias boot: `blazar start` -> healthz 200 (serve alias)")
     st, _, v = http_json("GET", "/api/version")
     check(
         "baseline",
@@ -3102,7 +3102,7 @@ def phase_baseline() -> None:
         content = v["choices"][0]["message"]["content"] or ""
     except Exception:
         pass
-    trace = hdr.get("x-pallama-trace-id", "")
+    trace = hdr.get("x-blazar-trace-id", "")
     check(
         "baseline",
         "chat non-stream real inference",
@@ -3267,7 +3267,7 @@ def phase_config() -> None:
     # tried largest-VRAM first with fallthrough — iGPUs report shared
     # memory as VRAM, so the biggest number is not always loadable.
     mrow = (
-        sqlite3.connect(os.path.join(SANDBOX.data_dir, "pallama.db"))
+        sqlite3.connect(os.path.join(SANDBOX.data_dir, "blazar.db"))
         .execute("select manifest from engines where active=1")
         .fetchone()
     )
@@ -3386,14 +3386,14 @@ def phase_config() -> None:
     # ps rows carry the resolved GPU-offload label.
     chat("Say ok")
     rows = ps_rows()
-    gpu = rows and ps_field(rows[0], "pallama_gpu", "gpu")
+    gpu = rows and ps_field(rows[0], "blazar_gpu", "gpu")
     check(
         "config",
-        "ps row carries pallama_gpu label",
+        "ps row carries blazar_gpu label",
         gpu in ("full", "cpu", "partial", "auto", "router"),
-        f"pallama_gpu={gpu!r}",
+        f"blazar_gpu={gpu!r}",
     )
-    cov("gpu offload label", "ps pallama_gpu field", f"{gpu}")
+    cov("gpu offload label", "ps blazar_gpu field", f"{gpu}")
 
     # Group B: KV quant + spec + yarn + sessions.
     d.start(
@@ -3486,17 +3486,17 @@ def phase_config() -> None:
     )
     cov("cache_ram_mb clamp", f"--cache-ram {clamp_expected}", f"got {got}")
 
-    d.start({"default_ctx": 2048}, env_extra={"PALLAMA_DEFAULT_CTX": "4096"})
+    d.start({"default_ctx": 2048}, env_extra={"BLAZAR_DEFAULT_CTX": "4096"})
     chat("Say ok")
     row = wait_loaded()
     ctx_now = row_ctx(row or {})
     check(
         "config",
-        "PALLAMA_DEFAULT_CTX env beats file value 2048",
+        "BLAZAR_DEFAULT_CTX env beats file value 2048",
         str(ctx_now) == "4096",
         f"file=2048 env=4096 ps ctx={ctx_now}",
     )
-    cov("PALLAMA_* env overrides", "env wins over file", f"ps ctx={ctx_now}")
+    cov("BLAZAR_* env overrides", "env wins over file", f"ps ctx={ctx_now}")
 
     d.start({"default_ctx": 2048, "model_overrides": {MODEL: {"ctx": 3072}}})
     chat("Say ok")
@@ -3510,20 +3510,20 @@ def phase_config() -> None:
     )
     cov("model_overrides", "per-model ctx wins", f"ps ctx={ctx_now}")
 
-    d.start({"engine_env": {"PALLAMA_VALIDATE_PROBE": "xyz-marker"}})
+    d.start({"engine_env": {"BLAZAR_VALIDATE_PROBE": "xyz-marker"}})
     chat("Say ok")
     pid = child_pid()
     env = child_environ(pid) if pid else {}
     check(
         "config",
         "engine_env reaches the child process",
-        env.get("PALLAMA_VALIDATE_PROBE") == "xyz-marker",
-        f"PALLAMA_VALIDATE_PROBE={env.get('PALLAMA_VALIDATE_PROBE')!r}",
+        env.get("BLAZAR_VALIDATE_PROBE") == "xyz-marker",
+        f"BLAZAR_VALIDATE_PROBE={env.get('BLAZAR_VALIDATE_PROBE')!r}",
     )
     cov(
         "engine_env",
         "child environ carries key",
-        "ok" if env.get("PALLAMA_VALIDATE_PROBE") == "xyz-marker" else "MISSING",
+        "ok" if env.get("BLAZAR_VALIDATE_PROBE") == "xyz-marker" else "MISSING",
     )
 
     boundary(
@@ -3546,14 +3546,14 @@ def phase_config() -> None:
 def _gateway_route_paths() -> set[str]:
     """Literal route paths from the gateway's axum table, at runtime.
 
-    Source-anchored (crates/pallama-gateway/src/lib.rs) so a route added
+    Source-anchored (crates/blazar-gateway/src/lib.rs) so a route added
     upstream must gain probe coverage here or gate (e) goes red — routes
     never rot silently. Empty set when the source tree is absent.
     """
     src = os.path.join(
         dirname(dirname(abspath(__file__))),
         "crates",
-        "pallama-gateway",
+        "blazar-gateway",
         "src",
         "lib.rs",
     )
@@ -3727,7 +3727,7 @@ def phase_api() -> None:
         f"status={st} — generative models may refuse",
     )
 
-    # pallama-native — canonical contract: POST /api/session {"model",
+    # blazar-native — canonical contract: POST /api/session {"model",
     # "action": "save|restore|erase", "filename"} (the /api/session/save
     # sub-path form was retired; this check silently degraded to a boundary
     # for a whole session before the contract was re-verified 2026-09-06).
@@ -3893,33 +3893,33 @@ def phase_api() -> None:
         f"status={st_bogus} body={body[:60]}",
     )
 
-    # /slots/{id} POST (scoped_proxy): X-Pallama-Model header resolves the
+    # /slots/{id} POST (scoped_proxy): X-Blazar-Model header resolves the
     # target; routed evidence = JSON body from gateway/child, not empty 404.
     st, _, v = http_json(
         "POST",
         "/slots/0",
         {},
-        headers={"X-Pallama-Model": MODEL},
+        headers={"X-Blazar-Model": MODEL},
     )
     body = json.dumps(v) if not isinstance(v, str) else v
     check(
         "api",
-        "/slots/{id} POST routed via X-Pallama-Model",
+        "/slots/{id} POST routed via X-Blazar-Model",
         st in (200, 400, 404, 503) and bool(body.strip()),
         f"status={st} body={body[:60]}",
     )
 
-    # /.well-known/pallama discovery document.
-    st, _, v = http_json("GET", "/.well-known/pallama")
+    # /.well-known/blazar discovery document.
+    st, _, v = http_json("GET", "/.well-known/blazar")
     wk_ok = (
         isinstance(v, dict)
-        and v.get("name") == "pallama"
+        and v.get("name") == "blazar"
         and bool(v.get("version"))
         and isinstance(v.get("endpoints"), dict)
         and bool(v["endpoints"].get("openai"))
     )
     check(
-        "api", "/.well-known/pallama discovery doc", st == 200 and wk_ok, f"status={st}"
+        "api", "/.well-known/blazar discovery doc", st == 200 and wk_ok, f"status={st}"
     )
 
     # ---- batch API (F6): real files -> real batch -> real loopback chats --
@@ -4135,7 +4135,7 @@ def phase_api() -> None:
             )
         else:
             # Honest env gate: BIG is a full 9B-class load; a co-resident
-            # engine (e.g. ollama) squeezing VRAM/RAM makes pallama's
+            # engine (e.g. ollama) squeezing VRAM/RAM makes blazar's
             # spawn guard refuse pre-spawn (a 500 in ~100ms, by design).
             # Mirror the guard: free VRAM + MemAvailable vs BIG's bytes.
             # R2-28: clear OUR OWN residue first — earlier phases leave
@@ -4167,7 +4167,7 @@ def phase_api() -> None:
                     f"free VRAM {free_vram_mib} MiB / MemAvailable "
                     f"{mem_available_mib()} MiB vs {vision_model} ~{big_bytes_mib} MiB "
                     "after evicting this harness's engines and reaping "
-                    "orphans — pallama's spawn guard refuses the load by "
+                    "orphans — blazar's spawn guard refuses the load by "
                     "design; GPU holders now: "
                     + ("; ".join(holders) if holders else "none visible"),
                 )
@@ -4290,7 +4290,7 @@ def phase_sentinel() -> None:
     )
     # Normal request + why correlation.
     st, v, hdr = chat("Say ok")
-    trace = hdr.get("x-pallama-trace-id", "")
+    trace = hdr.get("x-blazar-trace-id", "")
     rec = wait_record(trace=trace)
     check(
         "sentinel",
@@ -4307,7 +4307,7 @@ def phase_sentinel() -> None:
     )
     # near-limit: ctx 2048, prompt ~1900 tokens.
     st, v, hdr = chat("word " * 1850)
-    rec = wait_record(trace=hdr.get("x-pallama-trace-id", ""))
+    rec = wait_record(trace=hdr.get("x-blazar-trace-id", ""))
     codes = [d0.get("code") for d0 in (rec or {}).get("detections", [])]
     check(
         "sentinel",
@@ -4316,12 +4316,12 @@ def phase_sentinel() -> None:
         f"status={st} codes={codes}",
     )
     # num-ctx header restart-once.
-    st, v, hdr = chat("Say ok", headers={"X-Pallama-Num-Ctx": "4096"})
+    st, v, hdr = chat("Say ok", headers={"X-Blazar-Num-Ctx": "4096"})
     row = wait_loaded()
     ctx_now = row_ctx(row or {})
     check(
         "sentinel",
-        "X-Pallama-Num-Ctx restarts instance at 4096",
+        "X-Blazar-Num-Ctx restarts instance at 4096",
         str(ctx_now) == "4096",
         f"ps ctx={ctx_now}",
     )
@@ -4343,7 +4343,7 @@ def phase_sentinel() -> None:
     st, v, hdr = chat(
         "What is the weather in Paris? Call get_weather.", extra={"tools": tools}
     )
-    rec = wait_record(trace=hdr.get("x-pallama-trace-id", ""))
+    rec = wait_record(trace=hdr.get("x-blazar-trace-id", ""))
     codes = [d0.get("code") for d0 in (rec or {}).get("detections", [])]
     tc = ""
     try:
@@ -4522,7 +4522,7 @@ def phase_sentinel() -> None:
             ],
             "response_format": {"type": "json_object"},
         },
-        headers={"X-Pallama-Enforce": "1"},
+        headers={"X-Blazar-Enforce": "1"},
     )
     check(
         "sentinel",
@@ -4770,7 +4770,7 @@ def phase_behavior() -> None:
         st, _, _ = chat(
             f"Say the word {tag}.",
             extra={"max_tokens": tokens},
-            headers={"x-pallama-priority": pri},
+            headers={"x-blazar-priority": pri},
             timeout=300,
         )
         order[tag] = (time.time(), st)
@@ -4841,7 +4841,7 @@ def phase_behavior() -> None:
     if not admitted.wait(30):
         boundary(
             "behavior",
-            "x-pallama-priority: high admitted before queued low",
+            "x-blazar-priority: high admitted before queued low",
             "holder never acquired the slot within 30s (engine unavailable)",
         )
         holder.join(timeout=300)
@@ -4860,7 +4860,7 @@ def phase_behavior() -> None:
         t_high.join(timeout=300)
         check(
             "behavior",
-            "x-pallama-priority: high admitted before queued low",
+            "x-blazar-priority: high admitted before queued low",
             order.get("low", (0.0, 0))[1] == 200
             and order.get("high", (0.0, 0))[1] == 200
             and order["high"][0] < order["low"][0],
@@ -4868,10 +4868,10 @@ def phase_behavior() -> None:
         )
 
     # deadline accounting: a request admitted past its deadline lands in
-    # pallama_slo_deadline_exceeded_total (or is 503-rejected — both honor SLO).
+    # blazar_slo_deadline_exceeded_total (or is 503-rejected — both honor SLO).
     def _slo_counter() -> int:
         _, _, raw = http("GET", "/metrics")
-        m = re.search(rb"^pallama_slo_deadline_exceeded_total (\d+)", raw, re.MULTILINE)
+        m = re.search(rb"^blazar_slo_deadline_exceeded_total (\d+)", raw, re.MULTILINE)
         return int(m.group(1)) if m else -1
 
     slo_before = _slo_counter()
@@ -4886,7 +4886,7 @@ def phase_behavior() -> None:
             # 1ms: any queue wait behind the holder deterministically breaches
             # the deadline (3000ms relied on the holder outlasting 3s — a
             # race; fast admission left the counter correctly static).
-            headers={"x-pallama-deadline-ms": "1"},
+            headers={"x-blazar-deadline-ms": "1"},
             timeout=300,
         )
         tight["st"] = st
@@ -4895,13 +4895,13 @@ def phase_behavior() -> None:
     if "st" not in tight:
         boundary(
             "behavior",
-            "x-pallama-deadline-ms: late admission accounted or rejected",
+            "x-blazar-deadline-ms: late admission accounted or rejected",
             "holder never acquired the slot within 30s (engine unavailable)",
         )
     else:
         check(
             "behavior",
-            "x-pallama-deadline-ms: late admission accounted or rejected",
+            "x-blazar-deadline-ms: late admission accounted or rejected",
             # 429 = predictive early-reject (frontier #28): when TTFT history
             # proves the deadline is unreachable, admission refuses BEFORE
             # queueing — the strongest form of honoring the SLO.
@@ -4941,22 +4941,22 @@ def phase_cli() -> None:
     ok = p.returncode == 0 and MODEL in p.stdout
     check(
         "cli",
-        "pallama ps",
+        "blazar ps",
         ok,
         p.stdout.strip().splitlines()[-1][:120] if p.stdout else "",
     )
     reg("ps", ok, "rc0 + model row")
     p = cli("list")
     ok = p.returncode == 0 and MODEL in p.stdout
-    check("cli", "pallama list", ok, "")
+    check("cli", "blazar list", ok, "")
     reg("list", ok, "rc0 + model listed")
     p = cli("show", MODEL)
     ok = p.returncode == 0
-    check("cli", "pallama show", ok, p.stdout.strip().splitlines()[:1])
+    check("cli", "blazar show", ok, p.stdout.strip().splitlines()[:1])
     reg("show", ok, "rc0")
     p = cli("why")
     ok = p.returncode == 0
-    check("cli", "pallama why runs", ok, p.stdout.strip().splitlines()[:1])
+    check("cli", "blazar why runs", ok, p.stdout.strip().splitlines()[:1])
     reg("why.default", ok, "rc0")
     p = cli("doctor")
     # Row-level FAIL only: WARN details may contain the word "failed"
@@ -4967,7 +4967,7 @@ def phase_cli() -> None:
     ok = p.returncode == 0 and not fail_rows
     check(
         "cli",
-        "pallama doctor passes",
+        "blazar doctor passes",
         ok,
         "all checks pass" if "all checks pass" in p.stdout else p.stdout[-200:],
     )
@@ -5145,7 +5145,7 @@ def wave_replica_rows(model: str) -> list[dict]:
 def phase_wave() -> None:
     print("\n== phase 8: wave battery (replicas/preload/keys/whisper/gauges) ==")
     d = DAEMON
-    small = MODEL  # fixture-drift fix: honor PALLAMA_VALIDATE_MODEL like every other phase (default is still qwen2.5-0.5b-instruct)
+    small = MODEL  # fixture-drift fix: honor BLAZAR_VALIDATE_MODEL like every other phase (default is still qwen2.5-0.5b-instruct)
     big = BIG  # second DISTINCT model (default qwen3.5-9b)
 
     # -- battery A: replicas + slots/pin/cache_idle_slots overlays ----------
@@ -5174,7 +5174,7 @@ def phase_wave() -> None:
     while time.time() < deadline:
         rows = wave_replica_rows(small)
         reps = sorted(
-            r.get("pallama_replica") for r in rows if r.get("pallama_replica")
+            r.get("blazar_replica") for r in rows if r.get("blazar_replica")
         )
         if len(rows) >= 2 and reps[:2] == [1, 2]:
             got_two = True
@@ -5184,7 +5184,7 @@ def phase_wave() -> None:
         "wave",
         "replicas: distinct prefixes -> two children (replica 1+2)",
         got_two,
-        f"rows={[(r.get('pallama_replica')) for r in wave_replica_rows(small)]}",
+        f"rows={[(r.get('blazar_replica')) for r in wave_replica_rows(small)]}",
     )
 
     p1 = replica_pid(small, 1)
@@ -5298,7 +5298,7 @@ def phase_wave() -> None:
         boundary(
             "wave",
             "predictive_preload battery (no distinct big model)",
-            f"PALLAMA_VALIDATE_BIG_MODEL={big!r} equals small or is not in the "
+            f"BLAZAR_VALIDATE_BIG_MODEL={big!r} equals small or is not in the "
             "store; pull it to enable this battery",
         )
     elif not pair_fits:
@@ -5310,7 +5310,7 @@ def phase_wave() -> None:
             "incoming floor <= budget) gates maybe_preload on this GPU, so "
             "small+big co-residency cannot happen (mirror of supervisor.rs "
             "resident_bytes/admission_floor_bytes); point "
-            "PALLAMA_VALIDATE_BIG_MODEL at a smaller model to exercise "
+            "BLAZAR_VALIDATE_BIG_MODEL at a smaller model to exercise "
             "the battery",
         )
     else:
@@ -5371,7 +5371,7 @@ def phase_wave() -> None:
     check(
         "wave",
         "whisper uninstalled -> 501 teaching (install/pull hints)",
-        # F166: the gateway teaches `pallama whisper --install` (dashed) —
+        # F166: the gateway teaches `blazar whisper --install` (dashed) —
         # match the real text, not the old never-matching prose.
         st == 501 and b"whisper --install" in raw,
         f"status={st}",
@@ -5391,24 +5391,24 @@ def phase_wave() -> None:
     check("wave", "/api/rerank reachable", st in (200, 501), f"status={st}")
 
     # Poller gauge: identical chats prime the prompt cache, then one 60s
-    # tick must publish pallama_prefix_cache_hit_rate.
+    # tick must publish blazar_prefix_cache_hit_rate.
     for _ in range(2):
         wave_chat(small, "You echo single words. Say OK.")
     time.sleep(68)
     st, _, raw = http("GET", "/metrics")
     check(
         "wave",
-        "poller gauge pallama_prefix_cache_hit_rate published",
-        st == 200 and b"pallama_prefix_cache_hit_rate" in raw,
-        f"status={st} found={b'pallama_prefix_cache_hit_rate' in raw}",
+        "poller gauge blazar_prefix_cache_hit_rate published",
+        st == 200 and b"blazar_prefix_cache_hit_rate" in raw,
+        f"status={st} found={b'blazar_prefix_cache_hit_rate' in raw}",
     )
     cov(
         "prefix-cache-hit gauge",
-        "chat traffic -> /metrics carries pallama_prefix_cache_hit_rate",
+        "chat traffic -> /metrics carries blazar_prefix_cache_hit_rate",
         "phase 8 battery C",
-        b"pallama_prefix_cache_hit_rate" in raw,
+        b"blazar_prefix_cache_hit_rate" in raw,
     )
-    hit_rate = _metric_value(raw, "pallama_prefix_cache_hit_rate")
+    hit_rate = _metric_value(raw, "blazar_prefix_cache_hit_rate")
     check(
         "wave",
         "prefix cache actually reuses: hit rate > 0 after repeated prompts",
@@ -5418,8 +5418,8 @@ def phase_wave() -> None:
     check(
         "wave",
         "TTFT/TPOT histograms rendered after chat traffic",
-        b"pallama_ttft_seconds_bucket" in raw and b"pallama_tpot_seconds_bucket" in raw,
-        f"ttft={b'pallama_ttft_seconds_bucket' in raw} tpot={b'pallama_tpot_seconds_bucket' in raw}",
+        b"blazar_ttft_seconds_bucket" in raw and b"blazar_tpot_seconds_bucket" in raw,
+        f"ttft={b'blazar_ttft_seconds_bucket' in raw} tpot={b'blazar_tpot_seconds_bucket' in raw}",
     )
 
     # -- battery D: admin-key round-trip incl. max_concurrent ---------------
@@ -5681,7 +5681,7 @@ def phase_wave() -> None:
 
     # F-deadline: 20 unique cold prompts feed ttft_cold (shared state.obs);
     # then an explicit 1ms deadline on the OPENAI lane (the only lane that
-    # parses x-pallama-deadline-ms into admission) must be predictively
+    # parses x-blazar-deadline-ms into admission) must be predictively
     # rejected 429 + Retry-After BEFORE queueing: real p90 TTFT is orders
     # of magnitude over 2ms.
     for i in range(20):
@@ -5704,7 +5704,7 @@ def phase_wave() -> None:
         },
         headers={
             "Authorization": "Bearer anvil-secret-3",
-            "x-pallama-deadline-ms": "1",
+            "x-blazar-deadline-ms": "1",
         },
     )
     retry_after = _hdr_get(hd_dl, "Retry-After")
@@ -5942,7 +5942,7 @@ def phase_wave() -> None:
 
     # F-remotes: two REAL secondary daemons as one "far" pool; prefix
     # stickiness binds a conversation to one backend and says so in the
-    # x-pallama-remote response header. Edge ports are kernel-assigned
+    # x-blazar-remote response header. Edge ports are kernel-assigned
     # free ports — the fixed 115xx defaults made two concurrent validate
     # runs bind each other's backends and 502 mid-battery (2026-09-10).
     edge_ports = (_free_port(), _free_port())
@@ -6005,11 +6005,11 @@ def phase_wave() -> None:
         )
         remote_model = f"far:{f_small}"
         st_r1, hd_r1, _ = _chat(remote_model, "You are the north edge.", "ping one")
-        hop1 = _hdr_get(hd_r1, "x-pallama-remote")
+        hop1 = _hdr_get(hd_r1, "x-blazar-remote")
         st_r2, hd_r2, _ = _chat(remote_model, "You are the north edge.", "ping two")
-        hop2 = _hdr_get(hd_r2, "x-pallama-remote")
+        hop2 = _hdr_get(hd_r2, "x-blazar-remote")
         st_r3, hd_r3, _ = _chat(remote_model, "You are the south edge.", "ping three")
-        hop3 = _hdr_get(hd_r3, "x-pallama-remote")
+        hop3 = _hdr_get(hd_r3, "x-blazar-remote")
         check(
             "wave",
             "remote pool: forward through real 2nd-level daemon + header",
@@ -6032,7 +6032,7 @@ def phase_wave() -> None:
         )
         cov(
             "remotes pool",
-            "prefix-sticky routing + x-pallama-remote across 2 live backends",
+            "prefix-sticky routing + x-blazar-remote across 2 live backends",
             "phase 8 battery F",
             st_r1 == 200 and hop2 == hop1,
         )
@@ -6072,7 +6072,7 @@ def phase_wave() -> None:
 def phase_parity() -> None:
     print("\n== phase 9: parity battery (templates/samplers/scoped surfaces) ==")
     d = DAEMON
-    small = MODEL  # fixture-drift fix: honor PALLAMA_VALIDATE_MODEL like every other phase (default is still qwen2.5-0.5b-instruct)
+    small = MODEL  # fixture-drift fix: honor BLAZAR_VALIDATE_MODEL like every other phase (default is still qwen2.5-0.5b-instruct)
 
     # -- battery A: overlay sampler_defaults + chat_template reach argv -----
     d.start(
@@ -6147,7 +6147,7 @@ def phase_parity() -> None:
     check(
         "parity",
         "/props with zero hot children -> 400 teaching error",
-        st == 400 and "X-Pallama-Model" in json.dumps(v),
+        st == 400 and "X-Blazar-Model" in json.dumps(v),
         f"status={st} body={json.dumps(v)[:200]}",
     )
 
@@ -6198,11 +6198,11 @@ def phase_parity() -> None:
         f"status={st} body={json.dumps(v)[:200]}",
     )
 
-    # Header disambiguation lane (X-Pallama-Model).
-    st, _, v = http_json("GET", "/props", headers={"X-Pallama-Model": small})
+    # Header disambiguation lane (X-Blazar-Model).
+    st, _, v = http_json("GET", "/props", headers={"X-Blazar-Model": small})
     check(
         "parity",
-        "/props X-Pallama-Model header resolves target",
+        "/props X-Blazar-Model header resolves target",
         st == 200,
         f"status={st} body={json.dumps(v)[:200]}",
     )
@@ -6463,7 +6463,7 @@ def run_input(
 
 def model_path(name: str = MODEL) -> str | None:
     try:
-        db = sqlite3.connect(os.path.join(REAL_DATA, "pallama.db"))
+        db = sqlite3.connect(os.path.join(REAL_DATA, "blazar.db"))
         row = db.execute("SELECT path FROM models WHERE name = ?", (name,)).fetchone()
         db.close()
         return row[0] if row else None
@@ -6472,7 +6472,7 @@ def model_path(name: str = MODEL) -> str | None:
 
 
 def _sandbox_db() -> sqlite3.Connection:
-    return sqlite3.connect(os.path.join(SANDBOX.data_dir, "pallama.db"))
+    return sqlite3.connect(os.path.join(SANDBOX.data_dir, "blazar.db"))
 
 
 def _active_engine_tag() -> str | None:
@@ -6514,7 +6514,7 @@ def _full_engine_tags() -> list[str]:
     returned no rows") — so intersect with the table.
     """
     try:
-        db = sqlite3.connect(os.path.join(REAL_DATA, "pallama.db"))
+        db = sqlite3.connect(os.path.join(REAL_DATA, "blazar.db"))
         rows = {r[0] for r in db.execute("SELECT tag FROM engines")}
         db.close()
     except Exception:
@@ -6543,7 +6543,7 @@ def _server_engine_tags() -> list[str]:
     assets ship server-only — no llama-quantize). Fallback pin when no
     full bundle exists on the box."""
     try:
-        db = sqlite3.connect(os.path.join(REAL_DATA, "pallama.db"))
+        db = sqlite3.connect(os.path.join(REAL_DATA, "blazar.db"))
         rows = {
             tag
             for tag, kind in db.execute("SELECT tag, kind FROM engines")
@@ -6575,7 +6575,7 @@ def _store_engine_tags() -> list[str]:
     excluded — it is a path registration, not a store lane.
     """
     try:
-        db = sqlite3.connect(os.path.join(REAL_DATA, "pallama.db"))
+        db = sqlite3.connect(os.path.join(REAL_DATA, "blazar.db"))
         rows = sorted(
             r[0] for r in db.execute("SELECT tag FROM engines") if r[0] != "local"
         )
@@ -6634,7 +6634,7 @@ def phase_commands() -> None:
     reg(
         "help",
         p.returncode == 0
-        and "Usage: pallama <COMMAND>" in p.stdout
+        and "Usage: blazar <COMMAND>" in p.stdout
         and bool(_help_command_names(p.stdout)),
         "rc0 + usage line + grouped command listing",
     )
@@ -6667,16 +6667,16 @@ def phase_commands() -> None:
     dev_rows = ps_rows()
     reg(
         "ps.device",
-        bool(dev_rows) and all("pallama_device" in r for r in dev_rows),
-        f"{len(dev_rows)} api ps rows carry pallama_device",
+        bool(dev_rows) and all("blazar_device" in r for r in dev_rows),
+        f"{len(dev_rows)} api ps rows carry blazar_device",
     )
 
     # ...and the profile-compile warnings array (may be empty; key must
     # exist so consumers can rely on the shape).
     reg(
         "ps.warnings",
-        bool(dev_rows) and all("pallama_warnings" in r for r in dev_rows),
-        f"{len(dev_rows)} api ps rows carry pallama_warnings",
+        bool(dev_rows) and all("blazar_warnings" in r for r in dev_rows),
+        f"{len(dev_rows)} api ps rows carry blazar_warnings",
     )
 
     # Gateway-side colon resolution: ollama-style model:tag must route
@@ -6728,13 +6728,13 @@ def phase_commands() -> None:
         )
         # multi-word query joins into one HF search; table carries the
         # SIZE/ARCH/CTX columns and a pull-hint footer (phrase-agnostic:
-        # the any/gguf/safetensors footers all say `pallama pull <REPO>`).
+        # the any/gguf/safetensors footers all say `blazar pull <REPO>`).
         p2 = cli("search", "qwen", "0.5b", "gguf", timeout=120)
         reg(
             "search.multi-word-columns",
             p2.returncode == 0
             and all(h in p2.stdout for h in ("SIZE", "ARCH", "CTX"))
-            and "pallama pull <REPO>" in p2.stdout,
+            and "blazar pull <REPO>" in p2.stdout,
             p2.stdout.strip().splitlines()[0][:100] if p2.stdout.strip() else "",
         )
         # --format maps to the Hub's server-side tag filter: the gguf lane
@@ -6790,7 +6790,7 @@ def phase_commands() -> None:
     reg(
         "serve",
         d.proc is not None and d.proc.poll() is None,
-        "daemon alive via `pallama serve` (healthz 200 + chat 200 above)",
+        "daemon alive via `blazar serve` (healthz 200 + chat 200 above)",
     )
     # watch: live SSE tail — timeout-kill after 6s, banner must appear
     w = subprocess.run(
@@ -7045,7 +7045,7 @@ def phase_commands() -> None:
     # --warm <model> pre-warms (loads) then execs: MODEL is pulled and
     # loaded here, so the warm path is exercised for real; under FAST there
     # is no pulled model, hence the boundary there.
-    if os.environ.get("PALLAMA_VALIDATE_FAST") == "1":
+    if os.environ.get("BLAZAR_VALIDATE_FAST") == "1":
         regb("launch", "FAST mode: --warm needs a pulled model")
     else:
         p = cli("launch", "--warm", MODEL, "printenv", "PATH")
@@ -7143,12 +7143,12 @@ def phase_commands() -> None:
         # Slim per-arch engine assets ship llama-server only — bench/tune
         # fail fast with a teaching that names the real remedy. That is an
         # environment boundary (build/register a bench-bearing engine to
-        # run these lanes), not a pallama regression.
+        # run these lanes), not a blazar regression.
         err = p.stderr + p.stdout
         if "no llama-bench found in any installed engine" in err:
             return (
                 "slim engine assets ship llama-server only — no llama-bench "
-                "on this box; `pallama engine build cuda` or `engine local` "
+                "on this box; `blazar engine build cuda` or `engine local` "
                 "a full bundle to run this lane"
             )
         return None
@@ -7434,7 +7434,7 @@ def phase_commands() -> None:
                 "<none pulled>" not in out,
                 out.strip()[:120],
             )
-        # Regression pin: whisper_cmd must resolve an admin bearer (PALLAMA_KEYS
+        # Regression pin: whisper_cmd must resolve an admin bearer (BLAZAR_KEYS
         # else first unscoped [[keys]]) so transcription keeps working once the
         # gateway is key-gated — same class as the keys_cmd bearer fix.
         if server_ok:
@@ -7575,7 +7575,7 @@ def phase_commands() -> None:
             update_pick.endswith("-cuda")
             and p.returncode != 0
             and "overlay release" in eout
-            and "PALLAMA_ENGINE_REPO" in eout
+            and "BLAZAR_ENGINE_REPO" in eout
         )
         if overlay_miss:
             regb(
@@ -7967,8 +7967,8 @@ def phase_commands() -> None:
         regb("pull.verify", f"disk free {disk_free_gb():.1f}G <= 8G")
 
     def _run_miss_pulls():
-        # `pallama run` on a missing model must auto-pull (same flow as
-        # `pallama pull`: progress, locks) and then run it — one-shot
+        # `blazar run` on a missing model must auto-pull (same flow as
+        # `blazar pull`: progress, locks) and then run it — one-shot
         # prompt mode proves the whole chain parse -> pull -> serve.
         before = set(cli("list").stdout.split())
         p = _pull_retry_cmd(
@@ -7993,17 +7993,17 @@ def phase_commands() -> None:
 
     def _upgrade():
         mtime_before = os.path.getmtime(PAL)
-        repo = os.environ.get("PALLAMA_VALIDATE_UPGRADE_REPO", "").strip()
+        repo = os.environ.get("BLAZAR_VALIDATE_UPGRADE_REPO", "").strip()
         if not repo:
             regb(
                 "upgrade.dry-run",
-                "no real pallama release repo configured for this checkout "
-                "(PALLAMA_REPO unset, no git origin); set "
-                "PALLAMA_VALIDATE_UPGRADE_REPO=owner/repo to run the real lane; "
+                "no real blazar release repo configured for this checkout "
+                "(BLAZAR_REPO unset, no git origin); set "
+                "BLAZAR_VALIDATE_UPGRADE_REPO=owner/repo to run the real lane; "
                 "Rust suite covers resolve/verify against a local release server",
             )
             return
-        env = {**SANDBOX.env(), "PALLAMA_REPO": repo}
+        env = {**SANDBOX.env(), "BLAZAR_REPO": repo}
         cur = (
             subprocess.run(
                 [PAL, "--version"],
@@ -8270,7 +8270,7 @@ def phase_knobs_behavior() -> None:
         {
             "port": PORT,
             "otlp_endpoint": f"http://127.0.0.1:{col_port}/v1/traces",
-            "otlp_service": "pallama-validate",
+            "otlp_service": "blazar-validate",
         }
     )
     chat("Say ok")
@@ -8278,7 +8278,7 @@ def phase_knobs_behavior() -> None:
     hit = None
     while time.time() < deadline and hit is None:
         for body in captured:
-            if b"pallama-validate" in body:
+            if b"blazar-validate" in body:
                 hit = body
                 break
         time.sleep(1)
@@ -8572,7 +8572,7 @@ def _full_toplevel() -> dict:
         "split_mode": "none",
         "tensor_split": "",
         "models_autoload": False,
-        "log_level": "pallama=info",
+        "log_level": "blazar=info",
         "update_channel": "stable",
         # post-v0.6.0 wave knobs (registry sweep): benign explicit values,
         # None = deliberately omitted (Option knobs that pair poorly).
@@ -8646,7 +8646,7 @@ def _overlay_b() -> dict:
 def _env_override_surface() -> tuple[set[str], dict[str, str]]:
     """(vars, types) parsed from config.rs `with_env_overrides` at runtime.
 
-    Source-anchored so a newly added PALLAMA_* knob that validate.py never
+    Source-anchored so a newly added BLAZAR_* knob that validate.py never
     exercises shows up as an unregistered row instead of silently passing.
     Returns empty set when the source file is absent (packaged runs) —
     callers must handle that honestly.
@@ -8654,7 +8654,7 @@ def _env_override_surface() -> tuple[set[str], dict[str, str]]:
     src = os.path.join(
         dirname(dirname(abspath(__file__))),
         "crates",
-        "pallama-core",
+        "blazar-core",
         "src",
         "config.rs",
     )
@@ -8662,11 +8662,11 @@ def _env_override_surface() -> tuple[set[str], dict[str, str]]:
         return set(), {}
     with open(src, encoding="utf-8") as f:
         text = f.read()
-    vars_ = set(re.findall(r'env\("PALLAMA_([A-Z0-9_]+)"\)', text))
-    # parse_u16("PALLAMA_PORT", &v) → PALLAMA_PORT: u16
+    vars_ = set(re.findall(r'env\("BLAZAR_([A-Z0-9_]+)"\)', text))
+    # parse_u16("BLAZAR_PORT", &v) → BLAZAR_PORT: u16
     types = {
         var: f"{fn}_"
-        for fn, var in re.findall(r'parse_(\w+)\("PALLAMA_([A-Z0-9_]+)"', text)
+        for fn, var in re.findall(r'parse_(\w+)\("BLAZAR_([A-Z0-9_]+)"', text)
     }
     return vars_, types
 
@@ -8726,13 +8726,13 @@ def _env_valid_value(var: str, rust_type: str | None) -> str:
 
 
 def phase_env_overrides() -> None:
-    print("\n== phase env: PALLAMA_* overrides (apply + fail-fast) ==")
+    print("\n== phase env: BLAZAR_* overrides (apply + fail-fast) ==")
     vars_, types = _env_override_surface()
     check(
         "env",
         "config.rs env surface parsed",
         bool(vars_),
-        f"{len(vars_)} PALLAMA_* vars" + ("" if vars_ else " — source file not found"),
+        f"{len(vars_)} BLAZAR_* vars" + ("" if vars_ else " — source file not found"),
     )
     for var in sorted(vars_):
         rust_type = types.get(var)
@@ -8740,15 +8740,15 @@ def phase_env_overrides() -> None:
         value = _env_valid_value(var, rust_type)
         # Cross-field rule: a tools runtime is meaningless without tools
         # enabled — the companion var must ride along (config.rs validate()).
-        extra = {f"PALLAMA_{var}": value}
+        extra = {f"BLAZAR_{var}": value}
         if var == "SERVER_TOOLS_RUNTIME":
-            extra["PALLAMA_SERVER_TOOLS"] = "validate"
+            extra["BLAZAR_SERVER_TOOLS"] = "validate"
         if var == "KEYS":
             # [[keys]] is a container: `get keys` cannot address it — the
             # machine-composition form is proven via `config list`.
-            p = cli("config", "list", extra_env={f"PALLAMA_{var}": value})
+            p = cli("config", "list", extra_env={f"BLAZAR_{var}": value})
             reg(
-                f"env.PALLAMA_{var}",
+                f"env.BLAZAR_{var}",
                 p.returncode == 0 and "envk" in p.stdout,
                 f"list shows key name envk ({value!r} form)",
             )
@@ -8757,27 +8757,27 @@ def phase_env_overrides() -> None:
         applied = p.returncode == 0
         echoed = value in p.stdout
         if applied and echoed:
-            reg(f"env.PALLAMA_{var}", True, f"get {field} == {value!r}")
+            reg(f"env.BLAZAR_{var}", True, f"get {field} == {value!r}")
         elif applied:
             # Accepted but `get` shows a different repr (tables like
             # [[keys]] render as multi-line TOML) — apply-proof only.
             reg(
-                f"env.PALLAMA_{var}",
+                f"env.BLAZAR_{var}",
                 True,
                 f"accepted rc0 (get renders non-scalar: {p.stdout.strip()[:60]!r})",
             )
         else:
             reg(
-                f"env.PALLAMA_{var}",
+                f"env.BLAZAR_{var}",
                 False,
                 f"rejected valid {var}={value!r}: {p.stderr.strip()[:120]}",
             )
         if rust_type is None:
             continue
         # Typed vars must fail fast on garbage AND name the var.
-        b = cli("config", "get", field, extra_env={f"PALLAMA_{var}": "bogus"})
+        b = cli("config", "get", field, extra_env={f"BLAZAR_{var}": "bogus"})
         reg(
-            f"env.PALLAMA_{var}.invalid",
+            f"env.BLAZAR_{var}.invalid",
             b.returncode != 0 and var in b.stderr,
             f"rc={b.returncode} stderr={b.stderr.strip()[:100]!r}",
         )
@@ -9293,7 +9293,7 @@ def _gold_items() -> dict:
     # (shared parser — see _help_command_names).
     cmds = _help_command_names(p.stdout)
     items["help.commands"] = "\n".join(sorted(cmds))
-    cfg_path = os.path.join(SANDBOX.root, "config", "pallama", "config.toml")
+    cfg_path = os.path.join(SANDBOX.root, "config", "blazar", "config.toml")
     backup = Path(cfg_path).read_bytes() if os.path.exists(cfg_path) else None
     try:
         SANDBOX.write_config({"port": PORT})
@@ -9342,7 +9342,7 @@ def _gold_items() -> dict:
         # Context-conditional doctor rows: they appear/differ based on
         # whether a whisper server is installed in the phase's sandbox
         # (commands installs one; a fresh golds-only run has none), on
-        # whether a systemd/launchd manager + pallama unit is probeable on
+        # whether a systemd/launchd manager + blazar unit is probeable on
         # the host (dev boxes/sandboxes without a unit emit no row), on
         # whether the host is Linux-NVIDIA serving a non-CUDA asset
         # (the cuda-channel hint row is vendor/asset-conditional), on
@@ -9351,7 +9351,7 @@ def _gold_items() -> dict:
         # and on PCI-vs-driver state (a driverless GPU box emits the
         # nvidia/vulkan driver rows; every drivered host omits them).
         # The doctor-regroup wave adds three more conditional rows:
-        # daemon uptime needs a systemd/launchd pallama unit (same class
+        # daemon uptime needs a systemd/launchd blazar unit (same class
         # as the "service" row), gpu fit needs VRAM plus at least one
         # pulled model, and gpu arch match needs an active CUDA asset
         # (CPU-only hosts and unit-less sandboxes emit neither).
@@ -9522,14 +9522,14 @@ def _pyspy_reexec_if_requested(args: list[str]) -> None:
     py-spy the PARENT (``py-spy record -- python3 validate.py ...``)
     traces its own child — no sudo, works everywhere py-spy does.
     """
-    if os.environ.get("PALLAMA_VALIDATE_PYSPY", "") != "1":
+    if os.environ.get("BLAZAR_VALIDATE_PYSPY", "") != "1":
         return
-    if os.environ.get("PALLAMA_VALIDATE_PYSPY_CHILD") == "1":
+    if os.environ.get("BLAZAR_VALIDATE_PYSPY_CHILD") == "1":
         return  # already under the recorder — never recurse
     bin_path = shutil.which("py-spy")
     if not bin_path:
         print(
-            "py-spy: PALLAMA_VALIDATE_PYSPY=1 but py-spy is not on PATH — "
+            "py-spy: BLAZAR_VALIDATE_PYSPY=1 but py-spy is not on PATH — "
             "install it first:  pip install py-spy",
             file=sys.stderr,
         )
@@ -9544,9 +9544,9 @@ def _pyspy_reexec_if_requested(args: list[str]) -> None:
             file=sys.stderr,
         )
         return
-    out = os.environ.get("PALLAMA_VALIDATE_PYSPY_OUT") or os.path.join(
+    out = os.environ.get("BLAZAR_VALIDATE_PYSPY_OUT") or os.path.join(
         os.path.expanduser("~/.cache"),
-        "pallama-pyspy",
+        "blazar-pyspy",
         f"validate-{time.strftime('%Y%m%dT%H%M%S')}.speedscope.json",
     )
     os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -9565,7 +9565,7 @@ def _pyspy_reexec_if_requested(args: list[str]) -> None:
         *args,
     ]
     print(f"py-spy: profiling this run -> {out} (parent tracer, no sudo)")
-    rc = subprocess.call(cmd, env={**os.environ, "PALLAMA_VALIDATE_PYSPY_CHILD": "1"})
+    rc = subprocess.call(cmd, env={**os.environ, "BLAZAR_VALIDATE_PYSPY_CHILD": "1"})
     print(f"py-spy: flame graph written -> {out}")
     sys.exit(rc)
 
@@ -9895,7 +9895,7 @@ def phase_coverage() -> None:
                 )
             elif (
                 PHASE_FILTER is not None
-                or os.environ.get("PALLAMA_VALIDATE_FAST") == "1"
+                or os.environ.get("BLAZAR_VALIDATE_FAST") == "1"
             ):
                 regb(
                     f"flag.{slug}.{flag}",
@@ -9917,7 +9917,7 @@ def main() -> int:
     wanted = {a.split("=", 1)[1] for a in phases_arg} or None
     PHASE_FILTER = wanted
     print(
-        f"pallama validation harness — engine+model REAL, isolation via temp XDG, port {PORT}"
+        f"blazar validation harness — engine+model REAL, isolation via temp XDG, port {PORT}"
     )
     print(f"binary={PAL} model={MODEL} fast={FAST}")
     # A dead GH_TOKEN is worse than none (401 "Bad credentials" on every

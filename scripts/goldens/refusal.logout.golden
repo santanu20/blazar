@@ -1,1 +1,1 @@
-pallama: pallama logout: refused — pallama is local-only by design (no registry, no cloud accounts). Pull models straight from Hugging Face: pallama pull <owner/repo:QUANT> · discover GGUFs first: pallama search <terms>
+blazar: blazar logout: refused — blazar is local-only by design (no registry, no cloud accounts). Pull models straight from Hugging Face: blazar pull <owner/repo:QUANT> · discover GGUFs first: blazar search <terms>

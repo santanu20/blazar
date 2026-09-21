@@ -10,19 +10,19 @@
 # diverged remote aborts loudly) -> remote-sha verification.
 #
 # Environment:
-#   PALLAMA_PUSH_REMOTE  remote name (default: origin)
-#   PALLAMA_PUSH_FROM    local branch to publish (default: master)
-#   PALLAMA_PUSH_TO      remote branch (default: main)
-#   PALLAMA_PUSH_FAST    set to 1 to skip the test suite (CI already
+#   BLAZAR_PUSH_REMOTE  remote name (default: origin)
+#   BLAZAR_PUSH_FROM    local branch to publish (default: master)
+#   BLAZAR_PUSH_TO      remote branch (default: main)
+#   BLAZAR_PUSH_FAST    set to 1 to skip the test suite (CI already
 #                          ran it; never for release pushes)
 #
 # Tags ride separately: git push <remote> --tags
 
 set -eu
 
-remote=${PALLAMA_PUSH_REMOTE:-origin}
-src_branch=${PALLAMA_PUSH_FROM:-master}
-dst_branch=${PALLAMA_PUSH_TO:-main}
+remote=${BLAZAR_PUSH_REMOTE:-origin}
+src_branch=${BLAZAR_PUSH_FROM:-master}
+dst_branch=${BLAZAR_PUSH_TO:-main}
 
 say() { printf 'push-export: %s\n' "$1"; }
 
@@ -50,7 +50,7 @@ fi
 sh scripts/check_hygiene.sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --quiet -- -D warnings
-if [ "${PALLAMA_PUSH_FAST:-0}" != "1" ]; then
+if [ "${BLAZAR_PUSH_FAST:-0}" != "1" ]; then
     cargo test --workspace -- --test-threads=1
 fi
 

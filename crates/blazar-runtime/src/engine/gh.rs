@@ -1,0 +1,1854 @@
+//! GitHub release client for upstream llama.cpp binaries.
+//! API truth verified live (2026-09-05): releases carry `bNNNNN` tags
+//! (prereleases, 27 assets) plus `vX.Y.Z` stable tags whose single asset
+//! `nightly-tag.txt` contains the current b-tag. Assets are named
+//! `llama-{tag}-bin-{asset}.tar.gz|.zip` and expose `digest:
+//! sha256:...` — verified before extraction.
+
+use anyhow::{anyhow, Context, Result};
+use blazar_core::config::UpdateChannel;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+
+use super::build::parse_version_pair;
+
+pub const LLAMA_CPP_REPO: &str = "ggml-org/llama.cpp";
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GhAsset {
+    pub name: String,
+    #[serde(default)]
+    pub digest: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default)]
+    pub browser_download_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GhRelease {
+    pub tag_name: String,
+    #[serde(default)]
+    pub prerelease: bool,
+    #[serde(default)]
+    pub assets: Vec<GhAsset>,
+    /// ISO-8601 publish time, e.g. "2026-09-07T06:49:18Z". GitHub serves
+    /// release metadata before assets finish uploading (~2 min stagger);
+    /// freshness decides whether a missing asset is worth waiting for.
+    #[serde(default)]
+    pub published_at: Option<String>,
+}
+
+impl GhRelease {
+    /// Publish time as unix seconds, if present and well-formed.
+    #[must_use]
+    pub fn published_epoch(&self) -> Option<i64> {
+        iso_to_epoch(self.published_at.as_deref()?)
+    }
+}
+
+/// Parse GitHub's Zulu ISO-8601 ("YYYY-MM-DDTHH:MM:SS[.fff]Z") to unix
+/// seconds. No datetime dependency: days-from-civil (Howard Hinnant).
+/// Names mirror the published algorithm.
+#[allow(clippy::many_single_char_names, clippy::unreadable_literal)]
+fn iso_to_epoch(iso: &str) -> Option<i64> {
+    let (date, rest) = iso.split_once('T')?;
+    let time = rest.trim_end_matches('Z');
+    let time = time.split('.').next().unwrap_or(time);
+    let mut d_parts = date.split('-');
+    let (y, m, d) = (d_parts.next()?, d_parts.next()?, d_parts.next()?);
+    let mut t_parts = time.split(':');
+    let (h, mi, s) = (t_parts.next()?, t_parts.next()?, t_parts.next()?);
+    let (y, m, d): (i64, i64, i64) = (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);
+    let (h, mi, s): (i64, i64, i64) = (h.parse().ok()?, mi.parse().ok()?, s.parse().ok()?);
+    let (y_adj, m_adj) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = if y_adj >= 0 { y_adj } else { y_adj - 399 } / 400;
+    let yoe = y_adj - era * 400;
+    let doy = (153 * m_adj + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86_400 + h * 3_600 + mi * 60 + s)
+}
+
+pub struct GhClient {
+    http: reqwest::Client,
+    base: reqwest::Url,
+    token: Option<String>,
+}
+
+#[must_use]
+pub fn btag_number(tag: &str) -> Option<u64> {
+    // Suffix-tolerant: source-built engines carry a provenance suffix
+    // (`b10816-cuda`) but compare by their leading upstream build number.
+    tag.strip_prefix('b')?
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Same-upstream-build comparison: b-tags compare by build number (so
+/// `b10816-cuda` == `b10816`); anything else falls back to equality.
+#[must_use]
+pub fn same_build(a: &str, b: &str) -> bool {
+    match (btag_number(a), btag_number(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// Raw llama-arch.cpp URL for an upstream tag. Pure so tests can pin
+/// the mapping (engine tag -> source location) without network.
+#[must_use]
+pub fn llama_arch_source_url(tag: &str) -> String {
+    format!("https://raw.githubusercontent.com/{LLAMA_CPP_REPO}/{tag}/src/llama-arch.cpp")
+}
+
+impl GhClient {
+    pub fn new(token: Option<String>) -> Result<Self> {
+        // BLAZAR_GH_BASE: mirrors/tests override the GitHub API base for
+        // the llama.cpp engine lane (same knob class as the installer's
+        // BLAZAR_INSTALL_BASE_URL). Unset = the real API.
+        let base =
+            std::env::var("BLAZAR_GH_BASE").unwrap_or_else(|_| "https://api.github.com".into());
+        Self::with_base(&base, token)
+    }
+
+    pub fn with_base(base: &str, token: Option<String>) -> Result<Self> {
+        // An empty env var (GH_TOKEN="") must degrade to anonymous —
+        // "Bearer " is an invalid credential and 401s where no-token
+        // would succeed.
+        let token = token.filter(|t| !t.trim().is_empty());
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("accept", "application/vnd.github+json".parse()?);
+        headers.insert("user-agent", "blazar (llama.cpp orchestrator)".parse()?);
+        if token.is_some() {
+            headers.insert("x-github-api-version", "2022-11-28".parse()?);
+        }
+        let http = reqwest::Client::builder()
+            .default_headers(headers)
+            // Release assets are 30-400 MB: connect/read timeouts, no total cap.
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .read_timeout(std::time::Duration::from_mins(2))
+            .build()
+            .context("build GitHub client")?;
+        Ok(Self {
+            http,
+            base: reqwest::Url::parse(base)?,
+            token,
+        })
+    }
+
+    fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.token {
+            Some(t) => rb.bearer_auth(t),
+            None => rb,
+        }
+    }
+
+    /// List recent releases (b-tags and v-tags together).
+    pub async fn list_releases(&self) -> Result<Vec<GhRelease>> {
+        self.list_releases_repo(LLAMA_CPP_REPO).await
+    }
+
+    /// `list_releases` for an arbitrary repo (whisper.cpp, blazar self, ...).
+    pub async fn list_releases_repo(&self, repo: &str) -> Result<Vec<GhRelease>> {
+        let url = self
+            .base
+            .join(&format!("repos/{repo}/releases?per_page=30"))
+            .unwrap();
+        let resp = self
+            .auth(self.http.get(url.clone()))
+            .send()
+            .await
+            .context("GitHub releases request failed")?;
+        match resp.status() {
+            reqwest::StatusCode::OK => {}
+            reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                return Err(anyhow!(
+                    "GitHub API rate limited ({}). Set GH_TOKEN for 5000 req/hr",
+                    resp.status()
+                ));
+            }
+            other => return Err(anyhow!("GitHub releases API {other}")),
+        }
+        let releases: Vec<GhRelease> = resp.json().await.context("decode releases JSON")?;
+        Ok(releases)
+    }
+
+    /// Single release for an arbitrary repo: `releases/latest` or
+    /// `releases/tags/{version}`. Used by `blazar upgrade` (self-update).
+    pub async fn release_by(&self, repo: &str, version: Option<&str>) -> Result<GhRelease> {
+        let path = match version {
+            Some(v) => format!("repos/{repo}/releases/tags/{v}"),
+            None => format!("repos/{repo}/releases/latest"),
+        };
+        let url = self.base.join(&path).unwrap();
+        let resp = self
+            .auth(self.http.get(url))
+            .send()
+            .await
+            .context("GitHub release request failed")?;
+        match resp.status() {
+            reqwest::StatusCode::OK => {}
+            reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                return Err(anyhow!(
+                    "GitHub API rate limited ({}). Set GH_TOKEN",
+                    resp.status()
+                ));
+            }
+            other => return Err(anyhow!("GitHub release API {other} for {path}")),
+        }
+        let release: GhRelease = resp.json().await.context("decode release JSON")?;
+        Ok(release)
+    }
+
+    /// Newest `bNNNNN` release by build number.
+    pub async fn latest_b_release(&self) -> Result<GhRelease> {
+        let releases = self.list_releases().await?;
+        releases
+            .into_iter()
+            .filter(|r| btag_number(&r.tag_name).is_some())
+            .max_by_key(|r| btag_number(&r.tag_name).unwrap_or(0))
+            .ok_or_else(|| anyhow!("no b-tagged llama.cpp releases found"))
+    }
+
+    /// Resolve the llama.cpp target for an update channel.
+    /// `Latest` = newest b-tag (the prerelease firehose); `Stable` = the
+    /// newest vX.Y.Z via `releases/latest`, dereferenced through its
+    /// `nightly-tag.txt` to the concrete b-tag it ships.
+    pub async fn channel_b_release(&self, channel: UpdateChannel) -> Result<GhRelease> {
+        match channel {
+            UpdateChannel::Latest => self.latest_b_release().await,
+            UpdateChannel::Stable => {
+                let stable = self.release_by(LLAMA_CPP_REPO, None).await?;
+                if stable.tag_name.starts_with('v') {
+                    self.resolve_tag(&stable.tag_name).await
+                } else {
+                    Ok(stable)
+                }
+            }
+        }
+    }
+
+    /// Resolve the target release of an arbitrary repo (whisper.cpp,
+    /// blazar self) for an update channel. These upstreams publish
+    /// through GitHub's `/releases/latest` only — no prerelease
+    /// firehose — so both channels coincide; the knob is meaningful for
+    /// the llama.cpp lane (`channel_b_release`).
+    pub async fn channel_repo_release(
+        &self,
+        repo: &str,
+        channel: UpdateChannel,
+    ) -> Result<GhRelease> {
+        let _ = channel;
+        self.release_by(repo, None).await
+    }
+
+    /// Resolve a user-provided tag: `bNNNN` verbatim; `vX.Y.Z` reads its
+    /// `nightly-tag.txt` asset to find the current b-tag.
+    pub async fn resolve_tag(&self, tag: &str) -> Result<GhRelease> {
+        if tag.starts_with('v') {
+            let url = self
+                .base
+                .join(&format!("repos/{LLAMA_CPP_REPO}/releases/tags/{tag}"))
+                .unwrap();
+            let resp = self
+                .auth(self.http.get(url.clone()))
+                .send()
+                .await
+                .context("GitHub release-by-tag request failed")?;
+            if !resp.status().is_success() {
+                return Err(anyhow!("release {tag} not found ({})", resp.status()));
+            }
+            let rel: GhRelease = resp.json().await.context("decode release")?;
+            let nightly = rel
+                .assets
+                .iter()
+                .find(|a| a.name == "nightly-tag.txt")
+                .ok_or_else(|| anyhow!("release {tag} has no nightly-tag.txt asset"))?;
+            let txt = self
+                .download_asset_bytes(nightly)
+                .await
+                .context("download nightly-tag.txt")?;
+            let inner = String::from_utf8_lossy(&txt).trim().to_string();
+            return self.release_by_tag(&inner).await;
+        }
+        self.release_by_tag(tag).await
+    }
+
+    pub async fn release_by_tag(&self, tag: &str) -> Result<GhRelease> {
+        self.release_by_tag_repo(LLAMA_CPP_REPO, tag).await
+    }
+
+    /// `release_by_tag` for an arbitrary repo (mistral.rs engine lane).
+    pub async fn release_by_tag_repo(&self, repo: &str, tag: &str) -> Result<GhRelease> {
+        let url = self
+            .base
+            .join(&format!("repos/{repo}/releases/tags/{tag}"))
+            .unwrap();
+        let resp = self
+            .auth(self.http.get(url.clone()))
+            .send()
+            .await
+            .context("GitHub release-by-tag request failed")?;
+        match resp.status() {
+            reqwest::StatusCode::OK => Ok(resp.json().await.context("decode release")?),
+            reqwest::StatusCode::NOT_FOUND => Err(anyhow!("{repo} release {tag} not found")),
+            other => Err(anyhow!("GitHub API {other} for {repo} tag {tag}")),
+        }
+    }
+
+    /// Resolve a commit ref (short SHA, full SHA, branch, or tag) to the
+    /// full 40-char commit SHA via the commits API. The git fetch
+    /// protocol only accepts full object names as want-refs, so
+    /// fork-lane pins given in abbreviated form must go through here
+    /// before `git fetch` is attempted.
+    pub async fn resolve_commit(&self, repo: &str, git_ref: &str) -> Result<String> {
+        #[derive(serde::Deserialize)]
+        struct CommitLookup {
+            sha: String,
+        }
+        let url = self
+            .base
+            .join(&format!("repos/{repo}/commits/{git_ref}"))
+            .unwrap();
+        let resp = self
+            .auth(self.http.get(url.clone()))
+            .send()
+            .await
+            .context("GitHub commit-lookup request failed")?;
+        match resp.status() {
+            reqwest::StatusCode::OK => {}
+            reqwest::StatusCode::NOT_FOUND => {
+                return Err(anyhow!("{repo} commit {git_ref} not found"));
+            }
+            reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                return Err(anyhow!(
+                    "GitHub API rate limited ({}). Set GH_TOKEN for 5000 req/hr",
+                    resp.status()
+                ));
+            }
+            other => {
+                return Err(anyhow!("GitHub API {other} for {repo} commit {git_ref}"));
+            }
+        }
+        let commit: CommitLookup = resp.json().await.context("decode commit-lookup response")?;
+        if commit.sha.len() != 40 || !commit.sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(anyhow!(
+                "{repo} commit lookup for {git_ref} returned a non-SHA answer ({})",
+                commit.sha
+            ));
+        }
+        Ok(commit.sha)
+    }
+
+    /// Fetch the raw `src/llama-arch.cpp` at an upstream llama.cpp tag
+    /// — the one-time source for mining the architecture set of a
+    /// binary-installed lane (release assets carry no source manifest).
+    /// Any failure is the caller's fail-open signal: a missing tag or a
+    /// network hiccup must never block engine registration.
+    pub async fn fetch_llama_arch_source(&self, tag: &str) -> Result<String> {
+        let url = llama_arch_source_url(tag);
+        let resp = self
+            .http
+            .get(&url)
+            // A raw llama-arch.cpp is a few hundred KB — the client-wide
+            // release-asset timeouts (30s connect / 2min read) would let a
+            // blackholed route stall daemon startup; this lane only feeds
+            // best-effort architecture mining, so cap it tightly and let
+            // the next restart retry.
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .with_context(|| format!("fetch {url} failed"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("{url} answered HTTP {status}");
+        }
+        resp.text().await.with_context(|| format!("read {url}"))
+    }
+
+    /// Newest mistral.rs release by semver (`vtag_semver`, not string
+    /// order — v0.10.0 > v0.9.3).
+    pub async fn latest_mistralrs_release(&self) -> Result<GhRelease> {
+        let releases = self.list_releases_repo(MISTRALRS_REPO).await?;
+        releases
+            .into_iter()
+            .filter(|r| vtag_semver(&r.tag_name).is_some())
+            .max_by_key(|r| vtag_semver(&r.tag_name).unwrap_or((0, 0, 0)))
+            .ok_or_else(|| anyhow!("no v-tagged mistral.rs releases found"))
+    }
+
+    /// Download an asset fully into memory, verifying its sha256 digest
+    /// when the release metadata provides one. Assets are ≤ ~400 MB.
+    pub async fn download_asset_bytes(&self, asset: &GhAsset) -> Result<Vec<u8>> {
+        let url = reqwest::Url::parse(&asset.browser_download_url)
+            .with_context(|| format!("asset url {:?}", asset.name))?;
+        let mut req = self.http.get(url.clone());
+        if url.host_str() == Some("api.github.com") {
+            req = self.auth(req);
+        }
+        let resp = req.send().await.context("asset download failed")?;
+        if !resp.status().is_success() {
+            return Err(anyhow!(
+                "asset download {} returned {}",
+                asset.name,
+                resp.status()
+            ));
+        }
+        let bytes = resp.bytes().await.context("read asset body")?;
+        // Truncation guard: a proxy or origin that closes the body early
+        // looks like a clean end-of-stream to reqwest — the digest check
+        // below only runs when GH published one, so a digest-less asset
+        // could install truncated (live case: 14 MiB of a 1+ GiB
+        // mistral.rs tarball accepted, gzip EOF mid-extract). The
+        // release-API size is authoritative; enforce it.
+        if let Some(size) = asset.size {
+            if bytes.len() as u64 != size {
+                return Err(anyhow!(
+                    "asset {} truncated: got {} bytes, release metadata says {size}",
+                    asset.name,
+                    bytes.len()
+                ));
+            }
+        }
+        if let Some(digest) = &asset.digest {
+            let expected = digest
+                .strip_prefix("sha256:")
+                .unwrap_or(digest)
+                .to_lowercase();
+            let got = format!("{:x}", Sha256::digest(&bytes));
+            if got != expected {
+                return Err(anyhow!(
+                    "sha256 mismatch for {}: expected {expected}, got {got}",
+                    asset.name
+                ));
+            }
+        } else {
+            tracing::warn!(
+                "asset {} has no digest in release metadata; skipping sha verify",
+                asset.name
+            );
+        }
+        Ok(bytes.to_vec())
+    }
+
+    /// Stream an asset to `dest` with incremental sha256 — for GiB-class
+    /// assets (mistral.rs CUDA prebuilts are 0.8-1.1 GiB) that must not
+    /// be buffered whole in memory. The client's read-timeout is an
+    /// idle-gap cap, not a total deadline, so slow links survive.
+    /// Returns bytes written.
+    pub async fn download_asset_file(
+        &self,
+        asset: &GhAsset,
+        dest: &std::path::Path,
+    ) -> Result<u64> {
+        let url = reqwest::Url::parse(&asset.browser_download_url)
+            .with_context(|| format!("asset url {:?}", asset.name))?;
+        let mut req = self.http.get(url.clone());
+        if url.host_str() == Some("api.github.com") {
+            req = self.auth(req);
+        }
+        let resp = req.send().await.context("asset download failed")?;
+        if !resp.status().is_success() {
+            return Err(anyhow!(
+                "asset download {} returned {}",
+                asset.name,
+                resp.status()
+            ));
+        }
+        if let Some(len) = resp.content_length() {
+            tracing::info!(
+                "downloading {} ({} MiB) to {}",
+                asset.name,
+                len / (1024 * 1024),
+                dest.display()
+            );
+        }
+        // tty-only progress bar, same style as the model pull lane.
+        // indicatif hides itself when stderr is not a terminal, so
+        // daemon-driven installs keep their log-only behavior.
+        let bar = match resp.content_length() {
+            Some(len) => {
+                let bar = indicatif::ProgressBar::new(len);
+                bar.set_style(
+                    indicatif::ProgressStyle::default_bar()
+                        .template("{msg} {bar:30} {bytes}/{total_bytes} ({eta})")
+                        .expect("valid template"),
+                );
+                bar
+            }
+            None => indicatif::ProgressBar::new_spinner(),
+        };
+        bar.set_message(format!("engine {}", asset.name));
+        let mut file =
+            std::fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
+        let mut hasher = Sha256::new();
+        let mut total: u64 = 0;
+        let declared_len = resp.content_length();
+        let mut resp = resp;
+        loop {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    use std::io::Write;
+                    if let Err(e) = file.write_all(&chunk) {
+                        drop(file);
+                        let _ = std::fs::remove_file(dest);
+                        return Err(anyhow!("write asset chunk: {e}"));
+                    }
+                    hasher.update(&chunk);
+                    total += chunk.len() as u64;
+                    bar.inc(chunk.len() as u64);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    // Mid-stream death: no partial file may survive —
+                    // a retry restarting onto a corrupt prefix is worse
+                    // than redownloading.
+                    drop(file);
+                    let _ = std::fs::remove_file(dest);
+                    return Err(anyhow!("asset {} read stream: {e:#}", asset.name));
+                }
+            }
+        }
+        bar.finish_and_clear();
+        Self::verify_streamed_asset(asset, dest, file, hasher, declared_len, total)?;
+        Ok(total)
+    }
+
+    /// Post-stream verification for `download_asset_file`: truncation
+    /// and digest. Truncation is checked against two sources — the
+    /// HTTP Content-Length header and the release-API size — because a
+    /// cleanly-closed-early body streams to a short total with NO
+    /// error; without this check a digest-less asset installs
+    /// truncated and dies later at extraction (live case: 14 MiB of a
+    /// 1+ GiB tarball accepted). Every failure path removes the
+    /// partial file so a retry starts clean instead of resuming onto
+    /// a corrupt prefix.
+    fn verify_streamed_asset(
+        asset: &GhAsset,
+        dest: &std::path::Path,
+        file: std::fs::File,
+        hasher: Sha256,
+        declared_len: Option<u64>,
+        total: u64,
+    ) -> Result<()> {
+        drop(file);
+        let truncated = |declared: Option<u64>, actual: u64| -> Option<String> {
+            match declared {
+                Some(len) if len != actual => {
+                    Some(format!("got {actual} bytes, Content-Length said {len}"))
+                }
+                _ => asset
+                    .size
+                    .filter(|s| *s != actual)
+                    .map(|s| format!("got {actual} bytes, release metadata said {s}")),
+            }
+        };
+        if let Some(why) = truncated(declared_len, total) {
+            let _ = std::fs::remove_file(dest);
+            return Err(anyhow!("asset {} truncated: {why}", asset.name));
+        }
+        if let Some(digest) = &asset.digest {
+            let expected = digest
+                .strip_prefix("sha256:")
+                .unwrap_or(digest)
+                .to_lowercase();
+            let got = format!("{:x}", hasher.finalize());
+            if got != expected {
+                let _ = std::fs::remove_file(dest);
+                return Err(anyhow!(
+                    "sha256 mismatch for {}: expected {expected}, got {got}",
+                    asset.name
+                ));
+            }
+        } else {
+            tracing::warn!(
+                "asset {} has no digest in release metadata; length-verified only",
+                asset.name
+            );
+        }
+        Ok(())
+    }
+}
+
+/// One asset preference entry. `Versioned` matches any
+/// `llama-{tag}-bin-{prefix}{X.Y}{suffix}.{ext}` and picks the highest
+/// version, so upstream bumps (cuda-13.3 -> 13.4, rocm-10.0 -> 11.0)
+/// keep working without a blazar release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Candidate {
+    Exact(&'static str),
+    Versioned {
+        prefix: &'static str,
+        suffix: &'static str,
+    },
+    Cpu(&'static str),
+}
+
+/// Ordered asset preference for this machine. `Cpu` entries are
+/// last-resort: they resolve only when every GPU variant is absent and
+/// the caller warns loudly (never a silent CPU fallback).
+#[must_use]
+pub fn pick_asset(
+    os: &str,
+    arch: &str,
+    vendor: Option<crate::engine::manifest::Vendor>,
+) -> Vec<Candidate> {
+    use crate::engine::manifest::Vendor;
+    use Candidate::{Cpu, Exact, Versioned};
+    match (os, arch) {
+        ("linux", "x86_64" | "x64" | "amd64") => match vendor {
+            Some(Vendor::Nvidia) => vec![Exact("ubuntu-vulkan-x64"), Cpu("ubuntu-x64")],
+            Some(Vendor::Amd) => vec![
+                Versioned {
+                    prefix: "ubuntu-rocm-",
+                    suffix: "-x64",
+                },
+                Exact("ubuntu-vulkan-x64"),
+                Cpu("ubuntu-x64"),
+            ],
+            Some(Vendor::Intel) => vec![
+                Exact("ubuntu-sycl-fp16-x64"),
+                Exact("ubuntu-vulkan-x64"),
+                Cpu("ubuntu-x64"),
+            ],
+            _ => vec![Cpu("ubuntu-x64")],
+        },
+        ("linux", "aarch64" | "arm64") => vec![Exact("ubuntu-vulkan-arm64"), Cpu("ubuntu-arm64")],
+        ("macos", _) => vec![Exact("macos-arm64"), Exact("macos-x64")],
+        ("windows", "x86_64" | "x64" | "amd64") => match vendor {
+            Some(Vendor::Nvidia) => vec![
+                Versioned {
+                    prefix: "win-cuda-",
+                    suffix: "-x64",
+                },
+                Exact("win-vulkan-x64"),
+                Cpu("win-cpu-x64"),
+            ],
+            Some(Vendor::Amd) => vec![
+                Versioned {
+                    prefix: "win-rocm-",
+                    suffix: "-x64",
+                },
+                Exact("win-vulkan-x64"),
+                Cpu("win-cpu-x64"),
+            ],
+            _ => vec![Exact("win-vulkan-x64"), Cpu("win-cpu-x64")],
+        },
+        ("windows", "aarch64" | "arm64") => vec![Cpu("win-cpu-arm64")],
+        _ => vec![Cpu("ubuntu-x64")],
+    }
+}
+
+/// A resolved asset: exact release-asset file name, the label stored in
+/// the engine row, and whether this is a CPU fallback behind missing
+/// GPU variants (caller must warn).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetPick {
+    pub name: String,
+    pub label: String,
+    pub cpu_fallback: bool,
+}
+
+/// Walk the candidate list against the release's actual assets and
+/// return the first match. `None` = nothing usable (not even CPU).
+///
+/// `driver_cuda` caps `Versioned` CUDA candidates (win-cuda): a
+/// prebuilt binary newer than the driver cannot start, so versions
+/// above the cap are skipped — when at least one exists — and the
+/// lane falls through to Vulkan with a warning instead of a
+/// guaranteed probe failure. `None` = cap unknown, pick the newest.
+#[must_use]
+pub fn resolve_asset(
+    release: &GhRelease,
+    os: &str,
+    arch: &str,
+    vendor: Option<crate::engine::manifest::Vendor>,
+    driver_cuda: Option<(u32, u32)>,
+) -> Option<AssetPick> {
+    let candidates = pick_asset(os, arch, vendor);
+    let wants_gpu = candidates.iter().any(|c| !matches!(c, Candidate::Cpu(_)));
+    let tag = &release.tag_name;
+    for candidate in &candidates {
+        match candidate {
+            Candidate::Exact(s) | Candidate::Cpu(s) => {
+                let name = asset_filename(tag, s);
+                if release.assets.iter().any(|a| a.name == name) {
+                    let cpu = matches!(candidate, Candidate::Cpu(_)) && wants_gpu;
+                    return Some(AssetPick {
+                        name,
+                        label: (*s).to_string(),
+                        cpu_fallback: cpu,
+                    });
+                }
+            }
+            Candidate::Versioned { prefix, suffix } => {
+                let ext = if prefix.starts_with("win-") {
+                    "zip"
+                } else {
+                    "tar.gz"
+                };
+                let head = format!("llama-{tag}-bin-{prefix}");
+                let tail = format!("{suffix}.{ext}");
+                let capped = prefix.contains("cuda");
+                let mut best: Option<(Vec<u32>, String)> = None;
+                let mut skipped_over_cap = 0usize;
+                for a in &release.assets {
+                    let Some(middle) = a.name.strip_prefix(&head) else {
+                        continue;
+                    };
+                    let Some(version) = middle.strip_suffix(&tail) else {
+                        continue;
+                    };
+                    let parts: Option<Vec<u32>> =
+                        version.split('.').map(|p| p.parse().ok()).collect();
+                    let Some(parts) = parts else { continue };
+                    if let (true, Some((dmin_maj, dmin_min))) = (capped, driver_cuda) {
+                        if parts > vec![dmin_maj, dmin_min] {
+                            skipped_over_cap += 1;
+                            continue;
+                        }
+                    }
+                    if best.as_ref().is_none_or(|(b, _)| parts > *b) {
+                        best = Some((parts, version.to_string()));
+                    }
+                }
+                if let Some((_, version)) = best {
+                    let label = format!("{prefix}{version}{suffix}");
+                    return Some(AssetPick {
+                        name: format!("llama-{tag}-bin-{label}.{ext}"),
+                        label,
+                        cpu_fallback: false,
+                    });
+                }
+                if skipped_over_cap > 0 {
+                    tracing::warn!(
+                        "release {tag} ships {skipped_over_cap} {prefix} asset(s) \
+                         but all exceed the driver's CUDA {}.{} — using the \
+                         next lane (Vulkan/CPU); update the NVIDIA driver or \
+                         pin an older release",
+                        driver_cuda.map_or(0, |d| d.0),
+                        driver_cuda.map_or(0, |d| d.1),
+                    );
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Asset file name for a release tag: `llama-{tag}-bin-{suffix}.tar.gz|zip`.
+#[must_use]
+pub fn asset_filename(tag: &str, suffix: &str) -> String {
+    let ext = if suffix.starts_with("win-") {
+        "zip"
+    } else {
+        "tar.gz"
+    };
+    format!("llama-{tag}-bin-{suffix}.{ext}")
+}
+
+pub const MISTRALRS_REPO: &str = "EricLBuehler/mistral.rs";
+
+/// CUDA toolkit variants mistral.rs publishes prebuilts for, as the
+/// digit-run used in asset names (12.8 -> 128). Ordered oldest-first;
+/// derivation walks it descending to find the newest the driver allows.
+pub const MISTRALRS_CUDAS: [u32; 6] = [128, 129, 130, 131, 132, 133];
+
+/// GPU compute caps (sm) mistral.rs publishes prebuilts for.
+pub const MISTRALRS_SMS: [u32; 7] = [80, 86, 89, 90, 100, 120, 121];
+
+/// Parse `vX.Y.Z` numerically: missing patch = 0, `-rc.N` style
+/// pre-release suffixes ignored. Currency for v-tagged repos (mistral.rs,
+/// blazar self) must compare numerically — lexicographic order calls
+/// v0.10.0 a "downgrade" from v0.9.3.
+#[must_use]
+pub fn vtag_semver(tag: &str) -> Option<(u64, u64, u64)> {
+    let core = tag.strip_prefix('v')?;
+    let core = core.split('-').next()?;
+    let mut it = core.split('.');
+    let maj: u64 = it.next()?.parse().ok()?;
+    let min: u64 = it.next()?.parse().ok()?;
+    let patch: u64 = it.next().map_or(0, |p| p.parse().unwrap_or(0));
+    Some((maj, min, patch))
+}
+
+/// Ordered mistral.rs asset preferences for this machine (exact names:
+/// mistral.rs asset names carry no tag component). The list is derived
+/// from live driver/GPU facts, never from a compat matrix:
+/// - Linux + Nvidia: `mistralrs-cuda{NNN}-sm{SM}-x86_64-unknown-linux-gnu`
+///   for every published NNN the driver supports (driver CUDA 13.0
+///   allows 130, not 131), newest first; a trailing CPU build marked
+///   `cpu_fallback` covers driver < 12.8. `sm` is the compute cap
+///   verbatim (8.9 -> 89); caps outside the published set are a
+///   teaching error, not a silent mismatch.
+/// - Everything else: the CPU/Metal build that exists for the platform.
+pub fn mistralrs_asset_picks(
+    os: &str,
+    arch: &str,
+    vendor: Option<crate::engine::manifest::Vendor>,
+    driver_cuda: Option<(u32, u32)>,
+    compute_cap: Option<(u32, u32)>,
+) -> Result<Vec<AssetPick>> {
+    use crate::engine::manifest::Vendor;
+    let cpu_linux = |a: &str, fallback: bool| AssetPick {
+        name: format!("mistralrs-cpu-{a}-unknown-linux-gnu.tar.gz"),
+        label: "cpu".into(),
+        cpu_fallback: fallback,
+    };
+    match (os, arch) {
+        ("macos", "aarch64" | "arm64") => Ok(vec![AssetPick {
+            name: "mistralrs-metal-aarch64-apple-darwin.tar.gz".into(),
+            label: "metal".into(),
+            cpu_fallback: false,
+        }]),
+        ("macos", _) => Err(anyhow!(
+            "mistral.rs publishes no prebuilt for macOS x86_64 (Metal/arm64 only)"
+        )),
+        ("windows", "x86_64" | "x64" | "amd64") => Ok(vec![AssetPick {
+            name: "mistralrs-cpu-x86_64-pc-windows-msvc.zip".into(),
+            label: "cpu".into(),
+            cpu_fallback: false,
+        }]),
+        ("windows", _) => Err(anyhow!(
+            "mistral.rs publishes no prebuilt for Windows ARM64"
+        )),
+        ("linux", "x86_64" | "x64" | "amd64") => {
+            if vendor == Some(Vendor::Nvidia) {
+                let Some((dmaj, dmin)) = driver_cuda else {
+                    return Ok(vec![cpu_linux("x86_64", true)]);
+                };
+                let Some((cmaj, cmin)) = compute_cap else {
+                    return Ok(vec![cpu_linux("x86_64", true)]);
+                };
+                let sm = cmaj * 10 + cmin;
+                if !MISTRALRS_SMS.contains(&sm) {
+                    return Err(anyhow!(
+                        "GPU compute cap {cmaj}.{cmin} (sm{sm}) is outside the mistral.rs \
+                         prebuilt set (sm{MISTRALRS_SMS:?}); install the CPU build or compile from source"
+                    ));
+                }
+                let floor = dmaj * 10 + dmin;
+                let mut picks: Vec<AssetPick> = MISTRALRS_CUDAS
+                    .iter()
+                    .rev()
+                    .filter(|&&nnn| nnn <= floor)
+                    .map(|&nnn| AssetPick {
+                        name: format!("mistralrs-cuda{nnn}-sm{sm}-x86_64-unknown-linux-gnu.tar.gz"),
+                        label: format!("cuda{nnn}-sm{sm}"),
+                        cpu_fallback: false,
+                    })
+                    .collect();
+                picks.push(cpu_linux("x86_64", true));
+                Ok(picks)
+            } else {
+                Ok(vec![cpu_linux("x86_64", false)])
+            }
+        }
+        ("linux", "aarch64" | "arm64") => Ok(vec![cpu_linux("aarch64", false)]),
+        _ => Err(anyhow!("mistral.rs publishes no prebuilt for {os}/{arch}")),
+    }
+}
+
+/// First preference whose exact asset name exists on the release.
+#[must_use]
+pub fn resolve_mistralrs_asset(release: &GhRelease, picks: &[AssetPick]) -> Option<AssetPick> {
+    picks
+        .iter()
+        .find(|p| release.assets.iter().any(|a| a.name == p.name))
+        .cloned()
+}
+
+/// Release repo env var for the self-hosted CUDA overlay channel
+/// (`bNNNN-cuda` releases of upstream llama.cpp). The project builds
+/// and publishes no llama.cpp artifacts anywhere: the default prebuilt
+/// channel consumes upstream's official ubuntu-cuda assets directly,
+/// and this env exists purely for operators who publish their own
+/// overlay builds.
+pub const ENGINE_OVERLAY_REPO_ENV: &str = "BLAZAR_ENGINE_REPO";
+
+/// Overlay repo for the prebuilt CUDA channel: `BLAZAR_ENGINE_REPO`
+/// (e.g. a fork publishing `bNNNN-cuda` releases) when set to a
+/// non-empty value, else `None`. The project publishes no llama.cpp
+/// artifacts of its own — the default channel consumes upstream's
+/// official ubuntu-cuda assets directly — so an unset or empty env
+/// means "no overlay lane" and callers skip it without a probe.
+#[must_use]
+pub fn engine_overlay_repo() -> Option<String> {
+    std::env::var(ENGINE_OVERLAY_REPO_ENV)
+        .ok()
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+}
+
+/// Pick the CUDA asset a driver can run from a release: the highest
+/// `ubuntu-cuda-{X.Y}[-smNN]-{arch}` variant whose toolkit version does
+/// not exceed the driver's reported CUDA version. Works unchanged on
+/// upstream `bNNNN` releases (official ubuntu-cuda assets since b10969)
+/// and overlay `bNNNN-cuda` releases — the tag's lane suffix is
+/// stripped before matching. `arch` is `x64` or `arm64`: an x64 box must
+/// never resolve the arm64 asset and vice versa. The bundled
+/// cudart/cublas minor-version compatibility is deliberately NOT
+/// trusted — a driver older than the asset stays on the Vulkan lane
+/// (today's behavior) instead of risking a child that cannot boot.
+#[must_use]
+pub fn resolve_cuda_asset(
+    release: &GhRelease,
+    driver_cuda: (u32, u32),
+    sm: Option<u32>,
+    arch: &str,
+) -> Option<AssetPick> {
+    // Release tag carries the lane suffix (`b10941-cuda`) but the ASSET
+    // name embeds the bare upstream tag (`llama-b10941-bin-...`) — match
+    // run-8+ reality, verified against the published overlay release.
+    let tag = release
+        .tag_name
+        .strip_suffix("-cuda")
+        .unwrap_or(&release.tag_name);
+    let head = format!("llama-{tag}-bin-ubuntu-cuda-");
+    let tail = format!("-{arch}.tar.gz");
+    // Per-arch channel: slim `-smNN` assets (SASS for exactly that arch)
+    // plus one `-sm120` build carrying SASS+PTX for forward JIT. Ranking:
+    // exact-GPU-arch slim beats the legacy fat (no -smNN) build; the
+    // PTX-carrying sm120 build only serves GPUs NEWER than every shipped
+    // SASS arch (PTX JITs forward, never backward).
+    let mut exact: Option<((u32, u32), String)> = None;
+    let mut fat: Option<((u32, u32), String)> = None;
+    let mut jit: Option<((u32, u32), String)> = None;
+    for a in &release.assets {
+        let Some(middle) = a.name.strip_prefix(&head) else {
+            continue;
+        };
+        let Some(version) = middle.strip_suffix(&tail) else {
+            continue;
+        };
+        let (base, asset_sm) = match version.split_once("-sm") {
+            Some((b, s)) => match s.parse::<u32>() {
+                Ok(n) => (b, Some(n)),
+                Err(_) => continue,
+            },
+            None => (version, None),
+        };
+        let Some(ver) = parse_version_pair(base) else {
+            continue;
+        };
+        if ver > driver_cuda {
+            continue; // driver cannot run this toolkit build
+        }
+        let slot = match asset_sm {
+            Some(a) if Some(a) == sm => &mut exact,
+            None => &mut fat,
+            Some(120) if sm.is_some_and(|s| s > 120) => &mut jit,
+            // SASS for a different arch, and its PTX (if any) cannot
+            // JIT backward onto this GPU.
+            Some(_) => continue,
+        };
+        if slot.as_ref().is_none_or(|(b, _)| ver > *b) {
+            *slot = Some((ver, version.to_string()));
+        }
+    }
+    exact.or(fat).or(jit).map(|(_, version)| AssetPick {
+        name: format!("llama-{tag}-bin-ubuntu-cuda-{version}-{arch}.tar.gz"),
+        label: format!("ubuntu-cuda-{version}-{arch}"),
+        cpu_fallback: false,
+    })
+}
+
+/// The cudart runtime companion for a picked CUDA asset: upstream splits
+/// the CUDA runtime out of the main tarball/zip. Name shapes (verified
+/// against b11011): linux embeds the tag
+/// (`llama-bN-bin-...` -> `cudart-llama-bN-bin-...`), windows does not
+/// (`llama-bN-bin-win-...zip` -> `cudart-llama-bin-win-...zip`).
+/// `None` when this release ships no companion.
+#[must_use]
+pub fn resolve_cudart_companion(release: &GhRelease, pick: &AssetPick) -> Option<GhAsset> {
+    let companion_name = if pick.name.to_ascii_lowercase().ends_with(".zip") {
+        // llama-{tag}-bin-{flavor}.zip -> cudart-llama-bin-{flavor}.zip
+        let after_tag = pick.name.strip_prefix("llama-")?.split_once("-bin-")?.1;
+        format!("cudart-llama-bin-{after_tag}")
+    } else {
+        pick.name.replacen("llama-", "cudart-llama-", 1)
+    };
+    release
+        .assets
+        .iter()
+        .find(|a| a.name == companion_name)
+        .cloned()
+}
+
+/// Newest CUDA toolkit an overlay release's assets were built with,
+/// ignoring any driver ceiling. Feeds the lane-drop warning so the
+/// operator learns exactly how far their driver is from the prebuilt
+/// lane ("needs CUDA 13.0, this driver runs 12.8").
+#[must_use]
+pub fn newest_asset_cuda(release: &GhRelease) -> Option<(u32, u32)> {
+    // Same lane-suffix contract as resolve_cuda_asset: tag carries
+    // `-cuda`, asset names embed the bare tag.
+    let tag = release
+        .tag_name
+        .strip_suffix("-cuda")
+        .unwrap_or(&release.tag_name);
+    let head = format!("llama-{tag}-bin-ubuntu-cuda-");
+    let tail = "-x64.tar.gz";
+    release
+        .assets
+        .iter()
+        .filter_map(|a| {
+            let middle = a.name.strip_prefix(&head)?;
+            let version = middle.strip_suffix(tail)?;
+            parse_version_pair(version)
+        })
+        .max()
+}
+
+/// Newest overlay release (`bNNNN-cuda`) at or below `target` whose
+/// release carries a driver-runnable CUDA asset. Pure selection over
+/// the overlay's release list — feeds the overlay-lag fallback (the
+/// channel target is not published yet, so take the newest build that
+/// IS). Never returns anything newer than `target` and never one whose
+/// every asset exceeds the driver (that would recreate the very
+/// Vulkan-lane demotion the caller is trying to avoid). `arch` matches
+/// the caller's CPU (`x64`/`arm64`) so the selection never picks a
+/// release whose only runnable asset is for the wrong architecture.
+#[must_use]
+pub fn newest_runnable_overlay<'a>(
+    releases: &'a [GhRelease],
+    driver_cuda: (u32, u32),
+    sm: Option<u32>,
+    target: u64,
+    arch: &str,
+) -> Option<&'a GhRelease> {
+    releases
+        .iter()
+        .filter(|r| r.tag_name.ends_with("-cuda"))
+        .filter_map(|r| btag_number(&r.tag_name).map(|n| (r, n)))
+        .filter(|(_, n)| *n <= target)
+        .filter(|(r, _)| resolve_cuda_asset(r, driver_cuda, sm, arch).is_some())
+        .max_by_key(|(_, n)| *n)
+        .map(|(r, _)| r)
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod tests {
+    use super::*;
+    use crate::engine::manifest::Vendor;
+    use Candidate::{Cpu, Exact, Versioned};
+
+    fn rel(tag: &str, assets: &[&str]) -> GhRelease {
+        GhRelease {
+            tag_name: tag.to_string(),
+            prerelease: true,
+            assets: assets
+                .iter()
+                .map(|n| GhAsset {
+                    name: (*n).to_string(),
+                    digest: None,
+                    size: None,
+                    browser_download_url: String::new(),
+                })
+                .collect(),
+            published_at: None,
+        }
+    }
+
+    #[test]
+    fn unit__btag_number__plain_and_suffixed() {
+        assert_eq!(btag_number("b10816"), Some(10816));
+        assert_eq!(btag_number("b10816-cuda"), Some(10816));
+        assert_eq!(btag_number("b10816-cpu"), Some(10816));
+        assert_eq!(btag_number("local"), None);
+        assert_eq!(btag_number("v0.1.0"), None);
+        assert_eq!(btag_number("b-cuda"), None);
+    }
+
+    #[test]
+    fn unit__same_build__number_first() {
+        assert!(same_build("b10816", "b10816-cuda"));
+        assert!(same_build("b10816-cuda", "b10816"));
+        assert!(!same_build("b10816", "b10817"));
+        assert!(same_build("local", "local"));
+        assert!(!same_build("local", "b10816"));
+    }
+
+    #[test]
+    fn unit__vtag_semver__numeric_order() {
+        assert_eq!(vtag_semver("v0.9.3"), Some((0, 9, 3)));
+        assert_eq!(vtag_semver("v0.10.0"), Some((0, 10, 0)));
+        assert_eq!(vtag_semver("v1.8"), Some((1, 8, 0)));
+        assert_eq!(vtag_semver("v2.0.0-rc.1"), Some((2, 0, 0)));
+        assert_eq!(vtag_semver("b10857"), None);
+        assert_eq!(vtag_semver("vx.y.z"), None);
+        assert!(vtag_semver("v0.10.0") > vtag_semver("v0.9.3"));
+    }
+
+    #[test]
+    fn unit__mistralrs_picks__nvidia_newest_allowed_cuda_first() {
+        let picks = mistralrs_asset_picks(
+            "linux",
+            "x86_64",
+            Some(Vendor::Nvidia),
+            Some((13, 0)),
+            Some((8, 9)),
+        )
+        .unwrap();
+        assert_eq!(
+            picks[0].name,
+            "mistralrs-cuda130-sm89-x86_64-unknown-linux-gnu.tar.gz"
+        );
+        assert_eq!(picks[0].label, "cuda130-sm89");
+        assert!(!picks[0].cpu_fallback);
+        // newer-than-driver variants excluded, older kept as fallbacks
+        assert!(picks.iter().take(3).map(|p| p.name.as_str()).eq([
+            "mistralrs-cuda130-sm89-x86_64-unknown-linux-gnu.tar.gz",
+            "mistralrs-cuda129-sm89-x86_64-unknown-linux-gnu.tar.gz",
+            "mistralrs-cuda128-sm89-x86_64-unknown-linux-gnu.tar.gz",
+        ]));
+        let cpu = picks.last().unwrap();
+        assert_eq!(cpu.label, "cpu");
+        assert!(cpu.cpu_fallback);
+    }
+
+    #[test]
+    fn unit__mistralrs_picks__old_driver_cpu_only_loud_fallback() {
+        let picks = mistralrs_asset_picks(
+            "linux",
+            "x86_64",
+            Some(Vendor::Nvidia),
+            Some((12, 2)),
+            Some((8, 9)),
+        )
+        .unwrap();
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].label, "cpu");
+        assert!(picks[0].cpu_fallback);
+    }
+
+    #[test]
+    fn unit__mistralrs_picks__unknown_driver_or_cap_falls_back() {
+        for driver in [None, Some((11, 0))] {
+            let picks = mistralrs_asset_picks(
+                "linux",
+                "x86_64",
+                Some(Vendor::Nvidia),
+                driver,
+                Some((8, 9)),
+            )
+            .unwrap();
+            assert_eq!(picks.len(), 1);
+            assert!(picks[0].cpu_fallback);
+        }
+        let picks =
+            mistralrs_asset_picks("linux", "x86_64", Some(Vendor::Nvidia), Some((13, 0)), None)
+                .unwrap();
+        assert_eq!(picks.len(), 1);
+        assert!(picks[0].cpu_fallback);
+    }
+
+    #[test]
+    fn unit__mistralrs_picks__unsupported_compute_cap_teaches() {
+        let err = mistralrs_asset_picks(
+            "linux",
+            "x86_64",
+            Some(Vendor::Nvidia),
+            Some((13, 0)),
+            Some((11, 0)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("sm110"), "err: {err}");
+        assert!(err.contains("CPU build"));
+    }
+
+    #[test]
+    fn unit__mistralrs_picks__non_nvidia_and_other_platforms() {
+        let picks =
+            mistralrs_asset_picks("linux", "x86_64", Some(Vendor::Amd), None, None).unwrap();
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].label, "cpu");
+        assert!(!picks[0].cpu_fallback);
+        let picks = mistralrs_asset_picks("macos", "arm64", None, None, None).unwrap();
+        assert_eq!(picks[0].name, "mistralrs-metal-aarch64-apple-darwin.tar.gz");
+        let picks =
+            mistralrs_asset_picks("windows", "x64", Some(Vendor::Nvidia), None, None).unwrap();
+        assert_eq!(picks[0].name, "mistralrs-cpu-x86_64-pc-windows-msvc.zip");
+        assert!(mistralrs_asset_picks("macos", "x86_64", None, None, None).is_err());
+    }
+
+    #[test]
+    fn unit__resolve_mistralrs_asset__first_present_wins() {
+        let picks = mistralrs_asset_picks(
+            "linux",
+            "x86_64",
+            Some(Vendor::Nvidia),
+            Some((13, 0)),
+            Some((8, 9)),
+        )
+        .unwrap();
+        // release carries only the cuda128 fallback variant
+        let release = rel(
+            "v0.9.3",
+            &["mistralrs-cuda128-sm89-x86_64-unknown-linux-gnu.tar.gz"],
+        );
+        let got = resolve_mistralrs_asset(&release, &picks).unwrap();
+        assert_eq!(got.label, "cuda128-sm89");
+        // nothing present -> None (caller teaching-errors)
+        let empty = rel("v0.9.3", &["some-other-asset.txt"]);
+        assert!(resolve_mistralrs_asset(&empty, &picks).is_none());
+    }
+
+    #[test]
+    fn unit__asset_matrix__linux_nvidia__vulkan_then_cpu_resort() {
+        assert_eq!(
+            pick_asset("linux", "x86_64", Some(Vendor::Nvidia)),
+            vec![Exact("ubuntu-vulkan-x64"), Cpu("ubuntu-x64")]
+        );
+    }
+
+    #[test]
+    fn unit__asset_matrix__linux_amd__rocm_glob_then_vulkan_then_cpu() {
+        assert_eq!(
+            pick_asset("linux", "x86_64", Some(Vendor::Amd)),
+            vec![
+                Versioned {
+                    prefix: "ubuntu-rocm-",
+                    suffix: "-x64"
+                },
+                Exact("ubuntu-vulkan-x64"),
+                Cpu("ubuntu-x64"),
+            ]
+        );
+    }
+
+    #[test]
+    fn unit__asset_matrix__linux_intel__sycl_then_vulkan_then_cpu() {
+        assert_eq!(
+            pick_asset("linux", "x86_64", Some(Vendor::Intel)),
+            vec![
+                Exact("ubuntu-sycl-fp16-x64"),
+                Exact("ubuntu-vulkan-x64"),
+                Cpu("ubuntu-x64"),
+            ]
+        );
+    }
+
+    #[test]
+    fn unit__asset_matrix__linux_cpu__plain() {
+        assert_eq!(pick_asset("linux", "x86_64", None), vec![Cpu("ubuntu-x64")]);
+        assert_eq!(
+            pick_asset("linux", "x86_64", Some(Vendor::Other)),
+            vec![Cpu("ubuntu-x64")]
+        );
+    }
+
+    #[test]
+    fn unit__asset_matrix__linux_arm__vulkan_then_cpu() {
+        assert_eq!(
+            pick_asset("linux", "aarch64", None),
+            vec![Exact("ubuntu-vulkan-arm64"), Cpu("ubuntu-arm64")]
+        );
+    }
+
+    #[test]
+    fn unit__asset_matrix__macos_arm_first() {
+        assert_eq!(
+            pick_asset("macos", "arm64", None),
+            vec![Exact("macos-arm64"), Exact("macos-x64")]
+        );
+    }
+
+    #[test]
+    fn unit__asset_matrix__windows_variants() {
+        assert_eq!(
+            pick_asset("windows", "x64", Some(Vendor::Nvidia)),
+            vec![
+                Versioned {
+                    prefix: "win-cuda-",
+                    suffix: "-x64"
+                },
+                Exact("win-vulkan-x64"),
+                Cpu("win-cpu-x64"),
+            ]
+        );
+        assert_eq!(
+            pick_asset("windows", "x64", Some(Vendor::Amd)),
+            vec![
+                Versioned {
+                    prefix: "win-rocm-",
+                    suffix: "-x64"
+                },
+                Exact("win-vulkan-x64"),
+                Cpu("win-cpu-x64"),
+            ]
+        );
+        assert_eq!(
+            pick_asset("windows", "x64", None),
+            vec![Exact("win-vulkan-x64"), Cpu("win-cpu-x64")]
+        );
+        assert_eq!(
+            pick_asset("windows", "arm64", None),
+            vec![Cpu("win-cpu-arm64")]
+        );
+    }
+
+    #[test]
+    fn unit__asset_filename__extension_by_platform() {
+        assert_eq!(
+            asset_filename("b10816", "ubuntu-vulkan-x64"),
+            "llama-b10816-bin-ubuntu-vulkan-x64.tar.gz"
+        );
+        assert_eq!(
+            asset_filename("b10816", "win-cuda-13.3-x64"),
+            "llama-b10816-bin-win-cuda-13.3-x64.zip"
+        );
+    }
+
+    #[test]
+    fn unit__resolve__version_bump__max_version_wins() {
+        let r = rel(
+            "b10833",
+            &[
+                "llama-b10833-bin-ubuntu-rocm-10.0-x64.tar.gz",
+                "llama-b10833-bin-ubuntu-rocm-11.2-x64.tar.gz",
+            ],
+        );
+        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Amd), None).unwrap();
+        assert_eq!(p.name, "llama-b10833-bin-ubuntu-rocm-11.2-x64.tar.gz");
+        assert_eq!(p.label, "ubuntu-rocm-11.2-x64");
+        assert!(!p.cpu_fallback);
+    }
+
+    #[test]
+    fn unit__resolve__cuda_major_minor__numeric_order_not_lexical() {
+        // 9.1 vs 10.0: lexical compare would call "9.1" bigger.
+        let r = rel(
+            "b1",
+            &[
+                "llama-b1-bin-win-cuda-9.1-x64.zip",
+                "llama-b1-bin-win-cuda-10.0-x64.zip",
+            ],
+        );
+        let p = resolve_asset(&r, "windows", "x86_64", Some(Vendor::Nvidia), None).unwrap();
+        assert_eq!(p.label, "win-cuda-10.0-x64");
+    }
+
+    #[test]
+    fn unit__resolve__upload_race__vulkan_missing_cpu_present__fallback_flagged() {
+        // The exact live b10833 scenario: nvidia box, vulkan asset not
+        // uploaded yet, CPU asset visible.
+        let r = rel("b10833", &["llama-b10833-bin-ubuntu-x64.tar.gz"]);
+        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Nvidia), None).unwrap();
+        assert_eq!(p.label, "ubuntu-x64");
+        assert!(p.cpu_fallback, "must be flagged, never silent");
+    }
+
+    #[test]
+    fn unit__resolve__no_assets__none() {
+        let r = rel("b10833", &[]);
+        assert!(resolve_asset(&r, "linux", "x86_64", Some(Vendor::Nvidia), None).is_none());
+    }
+
+    #[test]
+    fn unit__resolve__vendor_falls_through_to_vulkan() {
+        let r = rel(
+            "b1",
+            &[
+                "llama-b1-bin-ubuntu-sycl-fp32-x64.tar.gz",
+                "llama-b1-bin-ubuntu-vulkan-x64.tar.gz",
+            ],
+        );
+        // Intel: fp16 exact miss -> vulkan (sycl-fp32 is not a candidate).
+        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Intel), None).unwrap();
+        assert_eq!(p.label, "ubuntu-vulkan-x64");
+        assert!(!p.cpu_fallback);
+    }
+
+    #[test]
+    fn unit__resolve__non_numeric_version_ignored() {
+        let r = rel(
+            "b1",
+            &[
+                "llama-b1-bin-win-cuda-hipx-x64.zip",
+                "llama-b1-bin-win-vulkan-x64.zip",
+            ],
+        );
+        let p = resolve_asset(&r, "windows", "x86_64", Some(Vendor::Nvidia), None).unwrap();
+        assert_eq!(p.label, "win-vulkan-x64");
+    }
+
+    #[test]
+    fn unit__resolve_asset__win_cuda_driver_cap_picks_runnable_version() {
+        // Live shape from b11011-era releases: two win-cuda flavors ship
+        // side by side; the driver ceiling must select the older one.
+        let r = rel(
+            "b11011",
+            &[
+                "llama-b11011-bin-win-cuda-12.4-x64.zip",
+                "llama-b11011-bin-win-cuda-13.4-x64.zip",
+                "llama-b11011-bin-win-vulkan-x64.zip",
+            ],
+        );
+        let pick = |cap: Option<(u32, u32)>| {
+            resolve_asset(&r, "windows", "x86_64", Some(Vendor::Nvidia), cap).unwrap()
+        };
+        assert_eq!(pick(Some((12, 6))).label, "win-cuda-12.4-x64");
+        assert_eq!(pick(Some((13, 9))).label, "win-cuda-13.4-x64");
+        // Uncapped keeps today's newest-wins behavior.
+        assert_eq!(pick(None).label, "win-cuda-13.4-x64");
+    }
+
+    #[test]
+    fn unit__resolve_asset__win_cuda_all_over_cap_falls_to_vulkan() {
+        // Every cuda asset exceeds the driver: the Vulkan lane answers
+        // instead of a binary that cannot start.
+        let r = rel(
+            "b11011",
+            &[
+                "llama-b11011-bin-win-cuda-13.4-x64.zip",
+                "llama-b11011-bin-win-vulkan-x64.zip",
+            ],
+        );
+        let p =
+            resolve_asset(&r, "windows", "x86_64", Some(Vendor::Nvidia), Some((12, 4))).unwrap();
+        assert_eq!(p.label, "win-vulkan-x64");
+        assert!(!p.cpu_fallback);
+    }
+
+    #[test]
+    fn unit__resolve_asset__driver_cap_ignores_non_cuda_versioned_lanes() {
+        // The cap exists for CUDA only; a rocm Versioned lane must stay
+        // newest-wins regardless of the NVIDIA driver ceiling.
+        let r = rel(
+            "b11011",
+            &[
+                "llama-b11011-bin-ubuntu-rocm-10.0-x64.tar.gz",
+                "llama-b11011-bin-ubuntu-x64.tar.gz",
+            ],
+        );
+        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Amd), Some((12, 0))).unwrap();
+        assert_eq!(p.label, "ubuntu-rocm-10.0-x64");
+    }
+
+    #[test]
+    fn unit__iso_epoch__github_formats() {
+        // Pinned to the live b10833 publish time observed via the API.
+        assert_eq!(iso_to_epoch("2026-09-07T06:49:18Z"), Some(1_788_763_758));
+        assert_eq!(
+            iso_to_epoch("2026-09-07T06:49:18.123Z"),
+            Some(1_788_763_758)
+        );
+        assert_eq!(iso_to_epoch("bogus"), None);
+    }
+
+    #[test]
+    fn unit__published_epoch__field_routing() {
+        let mut r = rel("b1", &[]);
+        assert_eq!(r.published_epoch(), None);
+        r.published_at = Some("2026-09-07T06:49:18Z".into());
+        assert_eq!(r.published_epoch(), Some(1_788_763_758));
+    }
+
+    #[test]
+    fn unit__resolve_cuda_asset__ceiling_and_highest() {
+        let r = rel(
+            "b10896-cuda",
+            &[
+                "llama-b10896-bin-ubuntu-cuda-13.0-x64.tar.gz",
+                "llama-b10896-bin-ubuntu-cuda-12.8-x64.tar.gz",
+                "llama-b10896-bin-ubuntu-vulkan-x64.tar.gz",
+                "llama-b10896-bin-ubuntu-cuda-11.8-x64.tar.gz",
+            ],
+        );
+        // Driver 13.0: highest runnable is 13.0 itself.
+        let p = resolve_cuda_asset(&r, (13, 0), Some(89), "x64").unwrap();
+        assert_eq!(p.name, "llama-b10896-bin-ubuntu-cuda-13.0-x64.tar.gz");
+        assert_eq!(p.label, "ubuntu-cuda-13.0-x64");
+        assert!(!p.cpu_fallback);
+        // Driver 12.x: 13.0 filtered out, 12.8 wins.
+        let p = resolve_cuda_asset(&r, (12, 9), Some(89), "x64").unwrap();
+        assert_eq!(p.name, "llama-b10896-bin-ubuntu-cuda-12.8-x64.tar.gz");
+        // Old 12.0-only driver still has a runnable asset (11.8).
+        let p = resolve_cuda_asset(&r, (12, 0), Some(89), "x64").unwrap();
+        assert_eq!(p.label, "ubuntu-cuda-11.8-x64");
+    }
+
+    #[test]
+    fn unit__newest_asset_cuda__ignores_driver_ceiling() {
+        let r = rel(
+            "b10896-cuda",
+            &[
+                "llama-b10896-bin-ubuntu-cuda-12.8-x64.tar.gz",
+                "llama-b10896-bin-ubuntu-vulkan-x64.tar.gz",
+                "llama-b10896-bin-ubuntu-cuda-13.0-x64.tar.gz",
+            ],
+        );
+        // Names the newest toolkit regardless of any driver.
+        assert_eq!(newest_asset_cuda(&r), Some((13, 0)));
+        // Non-CUDA-only release: nothing to name.
+        let r = rel(
+            "b10896-cuda",
+            &["llama-b10896-bin-ubuntu-vulkan-x64.tar.gz"],
+        );
+        assert_eq!(newest_asset_cuda(&r), None);
+    }
+
+    #[test]
+    fn unit__resolve_cuda_asset__per_arch_ranking() {
+        let r = rel(
+            "b200-cuda",
+            &[
+                "llama-b200-bin-ubuntu-cuda-12.8-sm89-x64.tar.gz",
+                "llama-b200-bin-ubuntu-cuda-13.0-sm120-x64.tar.gz",
+                "llama-b200-bin-ubuntu-cuda-12.8-x64.tar.gz",
+                "llama-b200-bin-ubuntu-cuda-12.8-sm61-x64.tar.gz",
+            ],
+        );
+        // Exact-arch slim beats the fat build even at lower toolkit.
+        let p = resolve_cuda_asset(&r, (13, 0), Some(89), "x64").unwrap();
+        assert_eq!(p.name, "llama-b200-bin-ubuntu-cuda-12.8-sm89-x64.tar.gz");
+        // GPU newer than every SASS arch: the legacy fat build still
+        // serves via its embedded sm120 PTX (forward JIT).
+        let q = resolve_cuda_asset(&r, (13, 0), Some(121), "x64").unwrap();
+        assert_eq!(q.name, "llama-b200-bin-ubuntu-cuda-12.8-x64.tar.gz");
+        // Other-arch slim only: not runnable (PTX never JITs backward).
+        let only61 = rel(
+            "b201-cuda",
+            &["llama-b201-bin-ubuntu-cuda-12.8-sm61-x64.tar.gz"],
+        );
+        assert!(resolve_cuda_asset(&only61, (13, 0), Some(89), "x64").is_none());
+        // sm120-only release: serves newer GPUs, never older ones.
+        let only120 = rel(
+            "b202-cuda",
+            &["llama-b202-bin-ubuntu-cuda-13.0-sm120-x64.tar.gz"],
+        );
+        let j = resolve_cuda_asset(&only120, (13, 0), Some(121), "x64").unwrap();
+        assert_eq!(j.name, "llama-b202-bin-ubuntu-cuda-13.0-sm120-x64.tar.gz");
+        assert!(resolve_cuda_asset(&only120, (13, 0), Some(89), "x64").is_none());
+    }
+
+    #[test]
+    fn unit__newest_runnable_overlay__lag_target_skips_newer_and_unrunnable() {
+        // Fixture builder: release with one cuda asset (12.8 = runnable
+        // by a 12.8 driver; 13.0-only = unrunnable by it).
+        fn rel_cuda(tag: &str, ver: &str) -> GhRelease {
+            rel(
+                tag,
+                &[&format!(
+                    "llama-{}-bin-ubuntu-cuda-{ver}-x64.tar.gz",
+                    tag.strip_suffix("-cuda").unwrap_or(tag)
+                )],
+            )
+        }
+        let releases = vec![
+            rel_cuda("b100-cuda", "12.8"),
+            rel_cuda("b101-cuda", "13.0"), // newest <= target, unrunnable
+            rel_cuda("b102-cuda", "12.8"), // newer than target — excluded
+            rel_cuda("b99-cuda", "13.0"),  // unrunnable AND older
+            rel("b103", &[]),              // not an overlay tag
+        ];
+        let got = newest_runnable_overlay(&releases, (12, 8), Some(89), 101, "x64").unwrap();
+        assert_eq!(got.tag_name, "b100-cuda");
+        // Target itself runnable wins when present.
+        let got = newest_runnable_overlay(&releases, (13, 0), Some(89), 101, "x64").unwrap();
+        assert_eq!(got.tag_name, "b101-cuda");
+        // Nothing runnable at all: driver ceiling filters everything.
+        assert!(newest_runnable_overlay(&releases, (12, 0), Some(89), 101, "x64").is_none());
+    }
+
+    #[test]
+    fn unit__resolve_cuda_asset__no_runnable_asset_is_none() {
+        let r = rel(
+            "b10896-cuda",
+            &[
+                "llama-b10896-bin-ubuntu-cuda-13.0-x64.tar.gz",
+                "llama-b10896-bin-ubuntu-cuda-12.8-x64.tar.gz",
+            ],
+        );
+        assert_eq!(resolve_cuda_asset(&r, (11, 8), Some(89), "x64"), None);
+        // Vulkan-only release: nothing CUDA-shaped to pick.
+        let v = rel(
+            "b10896-cuda",
+            &["llama-b10896-bin-ubuntu-vulkan-x64.tar.gz"],
+        );
+        assert_eq!(resolve_cuda_asset(&v, (13, 0), Some(89), "x64"), None);
+        // Wrong shapes never match (prefix/suffix discipline).
+        let w = rel(
+            "b10896-cuda",
+            &[
+                "llama-b10896-bin-win-cuda-12.8-x64.zip",
+                "llama-b10896-bin-ubuntu-cuda-12.8-arm64.tar.gz",
+                "llama-b10896-bin-ubuntu-cuda-x64.tar.gz",
+            ],
+        );
+        assert_eq!(resolve_cuda_asset(&w, (13, 0), Some(89), "x64"), None);
+    }
+
+    #[test]
+    fn unit__resolve_cuda_asset__upstream_menu_and_arch_lanes() {
+        // Shape mirrors real upstream releases since b10969: multiple
+        // toolkit majors + an arm64 build for Grace-class boxes.
+        let r = rel(
+            "b11011",
+            &[
+                "llama-b11011-bin-ubuntu-cuda-12.8-x64.tar.gz",
+                "llama-b11011-bin-ubuntu-cuda-13.3-x64.tar.gz",
+                "llama-b11011-bin-ubuntu-cuda-13.3-arm64.tar.gz",
+                "llama-b11011-bin-ubuntu-vulkan-x64.tar.gz",
+            ],
+        );
+        // Driver 13.0 ceiling: 13.3 excluded, 12.8-x64 wins.
+        let p = resolve_cuda_asset(&r, (13, 0), Some(89), "x64").unwrap();
+        assert_eq!(p.name, "llama-b11011-bin-ubuntu-cuda-12.8-x64.tar.gz");
+        assert_eq!(p.label, "ubuntu-cuda-12.8-x64");
+        // Driver above every toolkit: newest (13.3) x64.
+        let p = resolve_cuda_asset(&r, (13, 5), Some(89), "x64").unwrap();
+        assert_eq!(p.label, "ubuntu-cuda-13.3-x64");
+        // arm64 box gets the arm64 asset, never an x64 one.
+        let p = resolve_cuda_asset(&r, (13, 5), Some(95), "arm64").unwrap();
+        assert_eq!(p.name, "llama-b11011-bin-ubuntu-cuda-13.3-arm64.tar.gz");
+        assert!(resolve_cuda_asset(&r, (13, 5), Some(89), "x64")
+            .is_none_or(|p| !p.name.ends_with("arm64.tar.gz")));
+        // Driver too old for every toolkit: lane declines.
+        assert!(resolve_cuda_asset(&r, (12, 4), Some(89), "x64").is_none());
+    }
+
+    #[test]
+    fn unit__resolve_cudart_companion__name_shapes() {
+        let linux = rel(
+            "b11011",
+            &[
+                "llama-b11011-bin-ubuntu-cuda-12.8-x64.tar.gz",
+                "cudart-llama-b11011-bin-ubuntu-cuda-12.8-x64.tar.gz",
+            ],
+        );
+        let pick = resolve_cuda_asset(&linux, (13, 0), Some(89), "x64").unwrap();
+        let c = resolve_cudart_companion(&linux, &pick).unwrap();
+        assert_eq!(
+            c.name,
+            "cudart-llama-b11011-bin-ubuntu-cuda-12.8-x64.tar.gz"
+        );
+        // Windows companion drops the tag: llama-bN-bin-win-cuda-X.zip
+        // -> cudart-llama-bin-win-cuda-X.zip (verified against b11011).
+        let win = rel(
+            "b11011",
+            &[
+                "llama-b11011-bin-win-cuda-12.4-x64.zip",
+                "cudart-llama-bin-win-cuda-12.4-x64.zip",
+            ],
+        );
+        let pick = AssetPick {
+            name: "llama-b11011-bin-win-cuda-12.4-x64.zip".into(),
+            label: "win-cuda-12.4-x64".into(),
+            cpu_fallback: false,
+        };
+        let c = resolve_cudart_companion(&win, &pick).unwrap();
+        assert_eq!(c.name, "cudart-llama-bin-win-cuda-12.4-x64.zip");
+        // Release without a companion (overlay ships its runtime
+        // inside the main tarball): None, never a guess.
+        let bare = rel(
+            "b11011-cuda",
+            &["llama-b11011-bin-ubuntu-cuda-12.8-x64.tar.gz"],
+        );
+        let pick = resolve_cuda_asset(&bare, (13, 0), Some(89), "x64").unwrap();
+        assert!(resolve_cudart_companion(&bare, &pick).is_none());
+    }
+
+    #[test]
+    fn unit__engine_overlay_repo__env_override_and_default() {
+        // Env-dependent: assert both states without assuming the ambient
+        // value by pinning it explicitly. No default home exists — the
+        // channel is upstream-direct, so unset/empty env disables the
+        // overlay lanes rather than pointing them at a project repo.
+        let saved = std::env::var(ENGINE_OVERLAY_REPO_ENV).ok();
+        std::env::remove_var(ENGINE_OVERLAY_REPO_ENV);
+        assert_eq!(engine_overlay_repo(), None);
+        std::env::set_var(ENGINE_OVERLAY_REPO_ENV, "");
+        assert_eq!(
+            engine_overlay_repo(),
+            None,
+            "empty env means no overlay lane"
+        );
+        std::env::set_var(ENGINE_OVERLAY_REPO_ENV, "  acme/blazar  ");
+        assert_eq!(engine_overlay_repo(), Some("acme/blazar".to_string()));
+        match saved {
+            Some(v) => std::env::set_var(ENGINE_OVERLAY_REPO_ENV, v),
+            None => std::env::remove_var(ENGINE_OVERLAY_REPO_ENV),
+        }
+    }
+
+    // Minimal one-shot HTTP/1.1 server on a loopback listener; serves
+    // `body` in two flushes so the client's chunk loop iterates more
+    // than once (progress bar increments ride the same path).
+    fn serve_once(body: &'static [u8]) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let url = format!("http://{addr}/asset.bin");
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 1024];
+            let mut seen = 0;
+            while seen < buf.len() {
+                let n = sock.read(&mut buf).expect("read request");
+                if n == 0 {
+                    break;
+                }
+                seen += n;
+                if buf[..seen].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            sock.write_all(head.as_bytes()).expect("write head");
+            let (a, b) = body.split_at(body.len() / 2);
+            sock.write_all(a).expect("write body a");
+            sock.flush().expect("flush a");
+            sock.write_all(b).expect("write body b");
+        });
+        url
+    }
+
+    fn asset(url: &str, digest: Option<&str>) -> GhAsset {
+        GhAsset {
+            name: "asset.bin".to_string(),
+            digest: digest.map(str::to_string),
+            size: None,
+            browser_download_url: url.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn unit__download_asset_file__streams_verifies_and_counts() {
+        let body: &'static [u8] = Box::leak(vec![7u8; 300_000].into_boxed_slice());
+        let url = serve_once(body);
+        let client = GhClient::with_base("http://127.0.0.1", None).expect("client");
+        let digest = format!("sha256:{:x}", Sha256::digest(body));
+        let dest = std::env::temp_dir().join("blazar-gh-dl-pin.bin");
+        let wrote = client
+            .download_asset_file(&asset(&url, Some(&digest)), &dest)
+            .await
+            .expect("download");
+        assert_eq!(wrote, body.len() as u64, "byte count");
+        let on_disk = std::fs::read(&dest).expect("read back");
+        assert_eq!(on_disk.len(), body.len(), "file length");
+        assert!(on_disk.iter().all(|&b| b == 7), "file content");
+    }
+
+    #[tokio::test]
+    async fn unit__download_asset_file__digest_mismatch_is_an_error() {
+        let body: &'static [u8] = b"tiny-but-hashed-wrong";
+        let url = serve_once(body);
+        let client = GhClient::with_base("http://127.0.0.1", None).expect("client");
+        let dest = std::env::temp_dir().join("blazar-gh-dl-pin-mismatch.bin");
+        let err = client
+            .download_asset_file(&asset(&url, Some("sha256:deadbeef")), &dest)
+            .await
+            .expect_err("mismatch must fail");
+        assert!(
+            err.to_string().contains("sha256 mismatch"),
+            "error names the mismatch: {err}"
+        );
+        assert!(
+            !dest.exists(),
+            "partial file removed on digest mismatch — a retry starts clean"
+        );
+    }
+
+    /// One-shot server that ADVERTISES a Content-Length larger than the
+    /// body it sends, then closes — the truncated-download failure shape
+    /// (live case: 14 MiB of a 1+ GiB mistral.rs tarball accepted).
+    fn serve_truncated(advertised_len: usize, send_len: usize) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let url = format!("http://{addr}/asset.bin");
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 1024];
+            let mut seen = 0;
+            while seen < buf.len() {
+                let n = sock.read(&mut buf).expect("read request");
+                if n == 0 {
+                    break;
+                }
+                seen += n;
+                if buf[..seen].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {advertised_len}\r\nConnection: close\r\n\r\n"
+            );
+            sock.write_all(head.as_bytes()).expect("write head");
+            sock.write_all(&vec![7u8; send_len])
+                .expect("write short body");
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn unit__download_asset_file__truncated_stream_is_an_error_and_partial_removed() {
+        // Digest-less asset (GH releases without digests). hyper itself
+        // rejects most header/body mismatches as a decode error; when the
+        // transport instead ends cleanly short (HTTP/2 END_STREAM, some
+        // proxies) the Content-Length guard fires. Either way the CONTRACT
+        // is: the download fails and no partial file survives.
+        let url = serve_truncated(1_000_000, 140_000);
+        let client = GhClient::with_base("http://127.0.0.1", None).expect("client");
+        let mut a = asset(&url, None);
+        a.size = None; // no API size either — header/stream guard is the only net
+        let dest = std::env::temp_dir().join("blazar-gh-dl-pin-trunc.bin");
+        let err = client
+            .download_asset_file(&a, &dest)
+            .await
+            .expect_err("truncation must fail");
+        assert!(
+            err.to_string().contains("read stream") || err.to_string().contains("truncated"),
+            "error names the failure: {err}"
+        );
+        assert!(!dest.exists(), "partial file removed");
+    }
+
+    #[tokio::test]
+    async fn unit__download_asset_file__api_size_mismatch_is_an_error() {
+        // Honest Content-Length but a LYING release-API size: the
+        // metadata cross-check catches it even when the header matches.
+        let body: &'static [u8] = b"complete-body-but-wrong-metadata-size";
+        let url = serve_once(body);
+        let client = GhClient::with_base("http://127.0.0.1", None).expect("client");
+        let mut a = asset(&url, None);
+        a.size = Some((body.len() as u64) + 999);
+        let dest = std::env::temp_dir().join("blazar-gh-dl-pin-size.bin");
+        let err = client
+            .download_asset_file(&a, &dest)
+            .await
+            .expect_err("size mismatch must fail");
+        assert!(
+            err.to_string().contains("release metadata"),
+            "error names the metadata source: {err}"
+        );
+        assert!(!dest.exists(), "partial file removed");
+    }
+
+    #[tokio::test]
+    async fn unit__download_asset_bytes__api_size_mismatch_is_an_error() {
+        let body: &'static [u8] = b"buffered-asset-wrong-size";
+        let url = serve_once(body);
+        let client = GhClient::with_base("http://127.0.0.1", None).expect("client");
+        let mut a = asset(&url, None);
+        a.size = Some((body.len() as u64) + 5);
+        let err = client
+            .download_asset_bytes(&a)
+            .await
+            .expect_err("size mismatch must fail");
+        assert!(
+            err.to_string().contains("truncated"),
+            "error names truncation: {err}"
+        );
+    }
+}

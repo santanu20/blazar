@@ -1,6 +1,6 @@
 //! stub-llama-server: test-double for the real llama-server child.
 //!
-//! Mirrors the observable surface Pallama depends on (verified against
+//! Mirrors the observable surface Blazar depends on (verified against
 //! ggml-org/llama.cpp upstream master):
 //!   - `--list-devices` prints PLAIN TEXT (not JSON):
 //!     "Available devices:\n  NAME: DESC (TOTAL MiB, FREE MiB free)\n"
@@ -239,7 +239,7 @@ async fn serve(host: String, port: u16, alias: String, api_key: Option<String>) 
                         "data": [{
                             "id": alias,
                             "object": "model",
-                            "owned_by": "pallama-stub",
+                            "owned_by": "blazar-stub",
                             "created": 0_u64,
                         }],
                     }))

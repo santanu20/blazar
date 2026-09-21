@@ -1,17 +1,17 @@
-# pallama bootstrap installer - Windows (PowerShell 5.1+ / pwsh).
+# blazar bootstrap installer - Windows (PowerShell 5.1+ / pwsh).
 #
 #   irm <raw-url-of-this-file> | iex
 #
 # Verifies the asset sha256 from the GitHub release API (the same source of
-# truth as `pallama engine update`) before installing anything. No admin:
-# installs to LOCALAPPDATA\Programs\pallama.
+# truth as `blazar engine update`) before installing anything. No admin:
+# installs to LOCALAPPDATA\Programs\blazar.
 #
 # Parameters / env overrides:
-#   -Version            pin a release tag (e.g. v0.1.0)   [env: PALLAMA_VERSION]
-#   -Repo               GitHub owner/name                 [env: PALLAMA_REPO]
+#   -Version            pin a release tag (e.g. v0.1.0)   [env: BLAZAR_VERSION]
+#   -Repo               GitHub owner/name                 [env: BLAZAR_REPO]
 #   -InstallDir         binary destination
 #   -WithService        ALSO register a start-at-logon scheduled task
-#                       ("pallama") running `pallama serve` (console
+#                       ("blazar") running `blazar serve` (console
 #                       binaries cannot be NT services without a shim;
 #                       a scheduled task is the dependency-free lane)
 #   -Build              compile from source instead of downloading a
@@ -23,18 +23,18 @@
 #   ARM64 Windows hosts pick the aarch64 asset automatically and fall
 #   back to the x86_64 one (emulated on Win11 ARM64) with a warning
 #   when a release has no native build.
-#   [env] PALLAMA_INSTALL_BASE_URL  replace the GitHub API base (mirrors, tests)
-#   [env] PALLAMA_AUTO_DRIVER        '0' skips the GPU driver preflight advisory
+#   [env] BLAZAR_INSTALL_BASE_URL  replace the GitHub API base (mirrors, tests)
+#   [env] BLAZAR_AUTO_DRIVER        '0' skips the GPU driver preflight advisory
 #   [env] GITHUB_TOKEN               optional API token
 #
 #   flags need a saved script: irm <url> -OutFile install.ps1; .\install.ps1 -Build
 
 [CmdletBinding()]
 param(
-    [string]$Version = $env:PALLAMA_VERSION,
-    [string]$Repo = $env:PALLAMA_REPO,
+    [string]$Version = $env:BLAZAR_VERSION,
+    [string]$Repo = $env:BLAZAR_REPO,
     [string]$InstallDir,
-    [string]$ApiBase = $env:PALLAMA_INSTALL_BASE_URL,
+    [string]$ApiBase = $env:BLAZAR_INSTALL_BASE_URL,
     [switch]$WithService,
     [switch]$Build,
     [switch]$Uninstall
@@ -45,10 +45,10 @@ Set-StrictMode -Version Latest
 
 function Fail([string]$Message) { Write-Host "ERROR: $Message" -ForegroundColor Red; exit 1 }
 
-$TaskName = 'pallama'
+$TaskName = 'blazar'
 
-function Stop-PallamaGraceful([string]$ExePath) {
-    # F155: drain in-flight requests first (`pallama stop` HTTP), then
+function Stop-BlazarGraceful([string]$ExePath) {
+    # F155: drain in-flight requests first (`blazar stop` HTTP), then
     # force-kill only survivors — install.sh:170 parity.
     try {
         if ($ExePath -and (Test-Path $ExePath)) {
@@ -56,19 +56,19 @@ function Stop-PallamaGraceful([string]$ExePath) {
             Start-Sleep -Milliseconds 800
         }
     } catch { }
-    Get-Process -Name pallama -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Get-Process -Name blazar -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
 if ($Uninstall) {
-    if (-not $InstallDir) { $InstallDir = Join-Path $env:LOCALAPPDATA 'Programs\pallama' }
+    if (-not $InstallDir) { $InstallDir = Join-Path $env:LOCALAPPDATA 'Programs\blazar' }
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($task) {
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
         Write-Host ">>> removed scheduled task $TaskName"
     }
     # F155: graceful drain before the hard kill.
-    Stop-PallamaGraceful (Join-Path $InstallDir 'pallama.exe')
-    if (Test-Path (Join-Path $InstallDir 'pallama.exe')) {
+    Stop-BlazarGraceful (Join-Path $InstallDir 'blazar.exe')
+    if (Test-Path (Join-Path $InstallDir 'blazar.exe')) {
         Remove-Item $InstallDir -Recurse -Force
         Write-Host ">>> removed $InstallDir"
     }
@@ -87,9 +87,9 @@ if ($Uninstall) {
     exit 0
 }
 
-function Register-PallamaTask([string]$ExePath) {
+function Register-BlazarTask([string]$ExePath) {
     # Start at logon (user scope, no admin). The task restarts the
-    # daemon only on CRASH (non-zero exit); `pallama stop` exits 0 and
+    # daemon only on CRASH (non-zero exit); `blazar stop` exits 0 and
     # is never undone. F156: restart settings explicit, not defaulted.
     $action = New-ScheduledTaskAction -Execute $ExePath -Argument 'serve'
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
@@ -103,7 +103,7 @@ function Register-PallamaTask([string]$ExePath) {
 }
 
 if (-not $Build -and -not $Repo -and -not $ApiBase) {
-    $Repo = 'santanu20/pallama'
+    $Repo = 'santanu20/blazar'
     Write-Host ">>> -Repo unset — using the published repo $Repo"
 }
 if (-not $ApiBase) { $ApiBase = "https://api.github.com/repos/$Repo" }
@@ -111,7 +111,7 @@ if (-not $ApiBase) { $ApiBase = "https://api.github.com/repos/$Repo" }
 $isArm64Host = $env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64'
 $Target = if ($isArm64Host) { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
 
-$headers = @{ 'User-Agent' = 'pallama-install' }
+$headers = @{ 'User-Agent' = 'blazar-install' }
 if ($env:GITHUB_TOKEN) { $headers['Authorization'] = "Bearer $($env:GITHUB_TOKEN)" }
 
 if (-not $Build) {
@@ -129,12 +129,12 @@ if (-not $Build) {
         Fail "could not fetch release metadata: $detail"
     }
 
-    $assetName = "pallama-$($release.tag_name)-$Target.zip"
+    $assetName = "blazar-$($release.tag_name)-$Target.zip"
     $asset = $release.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
     if (-not $asset -and $isArm64Host) {
         Write-Host ">>> WARN: release $($release.tag_name) has no native ARM64 asset - falling back to x86_64 (runs emulated on Windows 11 ARM64)"
         $Target = 'x86_64-pc-windows-msvc'
-        $assetName = "pallama-$($release.tag_name)-$Target.zip"
+        $assetName = "blazar-$($release.tag_name)-$Target.zip"
         $asset = $release.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
     }
     if (-not $asset) {
@@ -147,9 +147,9 @@ if (-not $Build) {
     $expected = $asset.digest -replace '^sha256:', ''
 }
 
-if (-not $InstallDir) { $InstallDir = Join-Path $env:LOCALAPPDATA 'Programs\pallama' }
+if (-not $InstallDir) { $InstallDir = Join-Path $env:LOCALAPPDATA 'Programs\blazar' }
 
-$tmp = Join-Path ([IO.Path]::GetTempPath()) ("pallama-install-" + [GUID]::NewGuid().ToString('N'))
+$tmp = Join-Path ([IO.Path]::GetTempPath()) ("blazar-install-" + [GUID]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 try {
     if ($Build) {
@@ -172,7 +172,7 @@ try {
                 Fail '-Build outside a checkout clones via git, but git is missing. Install it: winget install Git.Git'
             }
             if (-not $Repo) {
-                Fail '-Build outside a checkout needs -Repo owner/name (or set $env:PALLAMA_REPO) to clone the sources.'
+                Fail '-Build outside a checkout needs -Repo owner/name (or set $env:BLAZAR_REPO) to clone the sources.'
             }
             $srcRoot = Join-Path $tmp 'src'
             $cloneUrl = "https://github.com/$Repo.git"
@@ -186,8 +186,8 @@ try {
         if ($LASTEXITCODE -ne 0) {
             Fail 'cargo build failed (output above). If it mentions link.exe: winget install Microsoft.VisualStudio.2022.BuildTools --override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"'
         }
-        $exe = Join-Path $srcRoot 'target/release/pallama.exe'
-        if (-not (Test-Path $exe)) { Fail 'cargo build reported success but target\release\pallama.exe was not produced' }
+        $exe = Join-Path $srcRoot 'target/release/blazar.exe'
+        if (-not (Test-Path $exe)) { Fail 'cargo build reported success but target\release\blazar.exe was not produced' }
     } else {
         Write-Host ">>> Downloading $assetName ($($release.tag_name))..."
         $zip = Join-Path $tmp $assetName
@@ -201,19 +201,19 @@ try {
 
         $extract = Join-Path $tmp 'extract'
         Expand-Archive -Path $zip -DestinationPath $extract
-        $exe = Join-Path $extract 'pallama.exe'
-        if (-not (Test-Path $exe)) { Fail 'archive did not contain a pallama.exe at its root' }
+        $exe = Join-Path $extract 'blazar.exe'
+        if (-not (Test-Path $exe)) { Fail 'archive did not contain a blazar.exe at its root' }
     }
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     # Stop a running daemon so the exe file is not locked (F155: HTTP
     # drain first, force only for survivors).
     $taskExisted = [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
-    Stop-PallamaGraceful (Join-Path $InstallDir 'pallama.exe')
-    Copy-Item $exe (Join-Path $InstallDir 'pallama.exe') -Force
+    Stop-BlazarGraceful (Join-Path $InstallDir 'blazar.exe')
+    Copy-Item $exe (Join-Path $InstallDir 'blazar.exe') -Force
 
     # F155b: exact-entry PATH add — `-notlike "*dir*"` over-matched
-    # sibling directories (Programs\pallama vs Programs\pallama-old).
+    # sibling directories (Programs\blazar vs Programs\blazar-old).
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     if (-not $userPath) { $userPath = '' }
     $entries = @($userPath.Split(';') | Where-Object { $_ -ne '' })
@@ -222,25 +222,25 @@ try {
         Write-Host ">>> NOTE: added $InstallDir to your user PATH - open a new terminal for it to take effect"
     }
 
-    $installedExe = Join-Path $InstallDir 'pallama.exe'
+    $installedExe = Join-Path $InstallDir 'blazar.exe'
     $ver = & $installedExe --version
-    Write-Host ">>> Installed pallama $ver to $installedExe"
-    Write-Host ">>> Next: pallama pull <model> (find: pallama search qwen3) | pallama run <model> | pallama doctor"
+    Write-Host ">>> Installed blazar $ver to $installedExe"
+    Write-Host ">>> Next: blazar pull <model> (find: blazar search qwen3) | blazar run <model> | blazar doctor"
     # GPU preflight (advise-only; Windows drivers come from the vendor's
     # own installer — this script never installs kernel drivers). The
     # engine bootstrap below picks its asset by driver presence, so a
     # driverless NVIDIA box would silently serve on CPU: detect and say
-    # so instead. Opt out: PALLAMA_AUTO_DRIVER=0.
-    if ($env:PALLAMA_INSTALL_ENGINE -ne '0' -and $env:PALLAMA_AUTO_DRIVER -ne '0') {
+    # so instead. Opt out: BLAZAR_AUTO_DRIVER=0.
+    if ($env:BLAZAR_INSTALL_ENGINE -ne '0' -and $env:BLAZAR_AUTO_DRIVER -ne '0') {
         try { $gpus = @(Get-CimInstance Win32_VideoController -ErrorAction Stop) } catch { $gpus = @() }
         if ($gpus.Count -gt 0) {
             $nvidia = $gpus | Where-Object { $_.Name -match 'NVIDIA' }
             if ($nvidia -and -not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
                 Write-Host '>>> WARN: NVIDIA GPU detected but no NVIDIA driver (nvidia-smi missing) - the engine will serve on CPU/Vulkan.'
                 Write-Host '>>>       install the driver from https://www.nvidia.com/drivers (GeForce or Studio branch), reboot,'
-                Write-Host '>>>       then: pallama engine update  (auto-picks the newest CUDA build the driver supports; runtimes bundled)'
+                Write-Host '>>>       then: blazar engine update  (auto-picks the newest CUDA build the driver supports; runtimes bundled)'
             } elseif ($nvidia) {
-                Write-Host '>>> GPU preflight: NVIDIA driver present - CUDA engine lane eligible (pallama engine update picks the newest driver-compatible CUDA build)'
+                Write-Host '>>> GPU preflight: NVIDIA driver present - CUDA engine lane eligible (blazar engine update picks the newest driver-compatible CUDA build)'
             }
         }
     }
@@ -250,40 +250,40 @@ try {
     try {
         & $installedExe migrate *> $null
         if ($LASTEXITCODE -eq 0) { Write-Host '>>> config migrated/verified (canonical form)' }
-        else { Write-Host '>>> config migration skipped (run: pallama migrate)' }
-    } catch { Write-Host '>>> config migration skipped (run: pallama migrate)' }
+        else { Write-Host '>>> config migration skipped (run: blazar migrate)' }
+    } catch { Write-Host '>>> config migration skipped (run: blazar migrate)' }
     # One-click readiness: bootstrap the llama.cpp engine so the box is
-    # infer-ready (opt out: PALLAMA_INSTALL_ENGINE=0). Idempotent: an
+    # infer-ready (opt out: BLAZAR_INSTALL_ENGINE=0). Idempotent: an
     # already-active engine skips the download. Optional first model via
-    # PALLAMA_INSTALL_MODEL (opt-in).
+    # BLAZAR_INSTALL_MODEL (opt-in).
     $engineOk = $false
     try { $engineOk = -not [string]::IsNullOrEmpty((& $installedExe engine list 2>$null | Select-String '\[active\]')) } catch { }
-    if ($env:PALLAMA_INSTALL_ENGINE -ne '0' -and -not $engineOk) {
-        Write-Host ">>> bootstrapping llama.cpp engine (pallama engine update - largest download of this install)..."
+    if ($env:BLAZAR_INSTALL_ENGINE -ne '0' -and -not $engineOk) {
+        Write-Host ">>> bootstrapping llama.cpp engine (blazar engine update - largest download of this install)..."
         try {
             & $installedExe engine update --no-gate
             if ($LASTEXITCODE -eq 0) { Write-Host '>>> engine bootstrap complete' }
-            else { Write-Host ">>> WARN: engine bootstrap failed - inference NOT ready. Run: pallama engine update" }
-        } catch { Write-Host ">>> WARN: engine bootstrap failed - inference NOT ready. Run: pallama engine update" }
+            else { Write-Host ">>> WARN: engine bootstrap failed - inference NOT ready. Run: blazar engine update" }
+        } catch { Write-Host ">>> WARN: engine bootstrap failed - inference NOT ready. Run: blazar engine update" }
     } else {
         Write-Host '>>> engine already active (or bootstrap disabled) - skipping engine download'
     }
-    if ($env:PALLAMA_INSTALL_MODEL) {
-        Write-Host ">>> pulling first model: $env:PALLAMA_INSTALL_MODEL..."
+    if ($env:BLAZAR_INSTALL_MODEL) {
+        Write-Host ">>> pulling first model: $env:BLAZAR_INSTALL_MODEL..."
         try {
-            & $installedExe pull $env:PALLAMA_INSTALL_MODEL
-            if ($LASTEXITCODE -eq 0) { Write-Host ">>> model ready: $env:PALLAMA_INSTALL_MODEL" }
-            else { Write-Host ">>> WARN: model pull failed - run: pallama pull $env:PALLAMA_INSTALL_MODEL" }
-        } catch { Write-Host ">>> WARN: model pull failed - run: pallama pull $env:PALLAMA_INSTALL_MODEL" }
+            & $installedExe pull $env:BLAZAR_INSTALL_MODEL
+            if ($LASTEXITCODE -eq 0) { Write-Host ">>> model ready: $env:BLAZAR_INSTALL_MODEL" }
+            else { Write-Host ">>> WARN: model pull failed - run: blazar pull $env:BLAZAR_INSTALL_MODEL" }
+        } catch { Write-Host ">>> WARN: model pull failed - run: blazar pull $env:BLAZAR_INSTALL_MODEL" }
     }
-    if ($WithService) { Register-PallamaTask $installedExe }
+    if ($WithService) { Register-BlazarTask $installedExe }
     elseif ($taskExisted) {
         # F155b: binary was replaced under an existing task — bring the
         # daemon back up on the new build (Register path re-starts it).
         Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
         Write-Host ">>> restarted scheduled task '$TaskName' on the upgraded binary"
     }
-    Write-Host '>>> system ready - check health: pallama doctor'
+    Write-Host '>>> system ready - check health: blazar doctor'
     Write-Host '>>> All inference is upstream llama.cpp, mistral.rs and SGLang - the engine authors did the hard parts.'
 } finally {
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
