@@ -39,7 +39,9 @@ pub use daemon::{
 pub use engine::gh::GhClient;
 pub use engine::manifest::{predicted_rescue_lane, probe as probe_manifest, Manifest, Vendor};
 pub use engine::{system_vendor_hint, EngineManager, LOCAL_TAG};
-pub use engine_impl::{ChildHandle, Engine, LlamaCppEngine, MistralRsEngine, SglangEngine};
+pub use engine_impl::{
+    ChildHandle, Engine, LlamaCppEngine, MistralRsEngine, SdCppEngine, SglangEngine,
+};
 pub use events::{BlazarEvent, EventBus, InstanceState};
 pub use hf::{parse_pull_target, registry_name, PullOutcome, PullTarget, Puller};
 pub use models::{instance_running, remove_model};

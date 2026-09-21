@@ -380,6 +380,19 @@ impl GhClient {
             .ok_or_else(|| anyhow!("no v-tagged mistral.rs releases found"))
     }
 
+    /// Newest sd.cpp `master-NNN-<sha8>` release by build counter (the
+    /// repo cuts no semver tags; lexicographic max would fling on sha
+    /// ordering). List endpoint trims `assets`; callers re-fetch the
+    /// full release by tag.
+    pub async fn latest_sdcpp_release(&self) -> Result<GhRelease> {
+        let releases = self.list_releases_repo(SDCPP_REPO).await?;
+        releases
+            .into_iter()
+            .filter(|r| sdtag_counter(&r.tag_name).is_some())
+            .max_by_key(|r| sdtag_counter(&r.tag_name).unwrap_or(0))
+            .ok_or_else(|| anyhow!("no master-tagged stable-diffusion.cpp releases found"))
+    }
+
     /// Download an asset fully into memory, verifying its sha256 digest
     /// when the release metadata provides one. Assets are ≤ ~400 MB.
     pub async fn download_asset_bytes(&self, asset: &GhAsset) -> Result<Vec<u8>> {
@@ -752,6 +765,101 @@ pub fn asset_filename(tag: &str, suffix: &str) -> String {
 
 pub const MISTRALRS_REPO: &str = "EricLBuehler/mistral.rs";
 
+pub const SDCPP_REPO: &str = "leejet/stable-diffusion.cpp";
+
+/// Parse an sd.cpp `master-NNN-<sha8>` tag's build counter. sd.cpp does
+/// not cut semver releases; the counter is the currency, the sha is the
+/// identity (`--version` reports the sha, not a version word).
+#[must_use]
+pub fn sdtag_counter(tag: &str) -> Option<u32> {
+    tag.strip_prefix("master-")?.split('-').next()?.parse().ok()
+}
+
+/// One sd.cpp asset candidate: asset names embed the commit sha
+/// (`sd-master-<sha8>-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip`), so a
+/// pick is a substring predicate, not an exact name. `excludes` keeps
+/// the CPU pattern from matching the vulkan/rocm zips of the same build.
+#[derive(Clone, Copy, Debug)]
+pub struct SdAssetPattern {
+    pub includes: &'static [&'static str],
+    pub excludes: &'static [&'static str],
+    pub label: &'static str,
+    pub cpu_fallback: bool,
+}
+
+/// Ordered sd.cpp asset preferences for this machine. Vulkan first on
+/// every GPU platform: one backend covers NVIDIA/AMD/Intel, and no
+/// linux-cuda prebuilt exists upstream. `ROCm` zips stay unpicked (vendor
+/// lock; vulkan serves the same cards).
+pub fn sdcpp_asset_patterns(os: &str, arch: &str) -> Result<Vec<SdAssetPattern>> {
+    match (os, arch) {
+        ("linux", "x86_64" | "x64" | "amd64") => Ok(vec![
+            SdAssetPattern {
+                includes: &["bin-Linux", "x86_64", "vulkan"],
+                excludes: &[],
+                label: "vulkan",
+                cpu_fallback: false,
+            },
+            SdAssetPattern {
+                includes: &["bin-Linux", "x86_64"],
+                excludes: &["vulkan", "rocm"],
+                label: "cpu",
+                cpu_fallback: true,
+            },
+        ]),
+        ("macos", "aarch64" | "arm64") => Ok(vec![SdAssetPattern {
+            includes: &["bin-Darwin", "arm64"],
+            excludes: &[],
+            label: "metal",
+            cpu_fallback: false,
+        }]),
+        ("macos", _) => Err(anyhow!(
+            "stable-diffusion.cpp publishes no prebuilt for macOS x86_64 (Metal/arm64 only)"
+        )),
+        ("windows", "x86_64" | "x64" | "amd64") => Ok(vec![
+            SdAssetPattern {
+                includes: &["bin-win", "vulkan-x64"],
+                excludes: &[],
+                label: "vulkan",
+                cpu_fallback: false,
+            },
+            SdAssetPattern {
+                includes: &["bin-win", "cpu-x64"],
+                excludes: &[],
+                label: "cpu",
+                cpu_fallback: true,
+            },
+        ]),
+        ("windows", _) => Err(anyhow!(
+            "stable-diffusion.cpp publishes no prebuilt for Windows ARM64"
+        )),
+        (os, arch) => Err(anyhow!(
+            "stable-diffusion.cpp publishes no prebuilt for {os}/{arch} — build from source \
+             (cmake -DSD_BUILD_SERVER=ON) and place sd-server under the engines dir"
+        )),
+    }
+}
+
+/// Walk the pattern list against the release's actual assets, returning
+/// the first match with its pattern (label + fallback flag ride along).
+/// `None` = nothing usable (not even CPU).
+#[must_use]
+pub fn resolve_sdcpp_asset<'a, 'p>(
+    release: &'a GhRelease,
+    patterns: &'p [SdAssetPattern],
+) -> Option<(&'a GhAsset, &'p SdAssetPattern)> {
+    patterns.iter().find_map(|p| {
+        release
+            .assets
+            .iter()
+            .find(|a| {
+                p.includes.iter().all(|f| a.name.contains(f))
+                    && p.excludes.iter().all(|f| !a.name.contains(f))
+            })
+            .map(|a| (a, p))
+    })
+}
+
 /// CUDA toolkit variants mistral.rs publishes prebuilts for, as the
 /// digit-run used in asset names (12.8 -> 128). Ordered oldest-first;
 /// derivation walks it descending to find the newest the driver allows.
@@ -1082,6 +1190,83 @@ mod tests {
         assert_eq!(vtag_semver("b10857"), None);
         assert_eq!(vtag_semver("vx.y.z"), None);
         assert!(vtag_semver("v0.10.0") > vtag_semver("v0.9.3"));
+    }
+
+    #[test]
+    fn unit__sdtag_counter__master_tags_counter_not_lexical() {
+        assert_eq!(sdtag_counter("master-890-74988b2"), Some(890));
+        assert_eq!(sdtag_counter("master-1234-abcdef12"), Some(1234));
+        // counter is the currency: lexicographic max on these tags would
+        // fling on the sha half
+        assert!(sdtag_counter("master-1234-abcdef12") > sdtag_counter("master-890-74988b2"));
+        assert_eq!(sdtag_counter("local"), None);
+        assert_eq!(sdtag_counter("v0.1.0"), None);
+        assert_eq!(sdtag_counter("b10816"), None);
+        assert_eq!(sdtag_counter("master-x"), None);
+    }
+
+    #[test]
+    fn unit__sdcpp_asset_patterns__vulkan_first_cpu_resort_unsupported_teaches() {
+        let picks = sdcpp_asset_patterns("linux", "x86_64").unwrap();
+        assert_eq!(picks.len(), 2);
+        assert_eq!(picks[0].label, "vulkan");
+        assert!(!picks[0].cpu_fallback);
+        assert_eq!(picks[0].includes, &["bin-Linux", "x86_64", "vulkan"]);
+        assert_eq!(picks[1].label, "cpu");
+        assert!(picks[1].cpu_fallback);
+        // cpu pattern must not swallow the vulkan/rocm zips of the same build
+        assert_eq!(picks[1].excludes, &["vulkan", "rocm"]);
+
+        let mac = sdcpp_asset_patterns("macos", "aarch64").unwrap();
+        assert_eq!(mac.len(), 1);
+        assert_eq!(mac[0].label, "metal");
+        assert_eq!(mac[0].includes, &["bin-Darwin", "arm64"]);
+
+        let win = sdcpp_asset_patterns("windows", "x64").unwrap();
+        assert_eq!(win.len(), 2);
+        assert_eq!(win[0].label, "vulkan");
+        assert_eq!(win[1].label, "cpu");
+
+        assert!(sdcpp_asset_patterns("macos", "x86_64").is_err());
+        assert!(sdcpp_asset_patterns("windows", "aarch64").is_err());
+        let err = sdcpp_asset_patterns("freebsd", "x86_64")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("build from source"), "err: {err}");
+    }
+
+    #[test]
+    fn unit__resolve_sdcpp_asset__first_pattern_with_matching_zip_wins() {
+        let picks = sdcpp_asset_patterns("linux", "x86_64").unwrap();
+        let release = rel(
+            "master-890-74988b2",
+            &[
+                "sd-master-74988b2-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip",
+                "sd-master-74988b2-bin-Linux-Ubuntu-24.04-x86_64.zip",
+                "sd-master-74988b2-bin-Linux-Ubuntu-24.04-x86_64-rocm.zip",
+            ],
+        );
+        let (asset, pattern) = resolve_sdcpp_asset(&release, &picks).unwrap();
+        assert!(asset.name.ends_with("vulkan.zip"));
+        assert_eq!(pattern.label, "vulkan");
+
+        // vulkan zip missing from the release -> cpu resort, rocm must
+        // stay unpicked even though it matches every cpu include
+        let cpu_only = rel(
+            "master-890-74988b2",
+            &[
+                "sd-master-74988b2-bin-Linux-Ubuntu-24.04-x86_64.zip",
+                "sd-master-74988b2-bin-Linux-Ubuntu-24.04-x86_64-rocm.zip",
+            ],
+        );
+        let (asset, pattern) = resolve_sdcpp_asset(&cpu_only, &picks).unwrap();
+        assert!(!asset.name.contains("rocm"));
+        assert_eq!(pattern.label, "cpu");
+        assert!(pattern.cpu_fallback);
+
+        // nothing usable -> None (caller teaching-errors with wanted list)
+        let empty = rel("master-890-74988b2", &["source-code.tar.gz"]);
+        assert!(resolve_sdcpp_asset(&empty, &picks).is_none());
     }
 
     #[test]

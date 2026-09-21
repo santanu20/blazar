@@ -2154,6 +2154,9 @@ impl Supervisor {
                 EngineKind::LlamaCpp => {
                     Arc::new(crate::engine_impl::LlamaCppEngine::with_env(manifest, env))
                 }
+                EngineKind::SdCpp => {
+                    Arc::new(crate::engine_impl::SdCppEngine::with_env(manifest, env))
+                }
             })
         };
         let roster = || {

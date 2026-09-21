@@ -413,6 +413,7 @@ pub fn probe_kind(
         blazar_core::engine_kind::EngineKind::LlamaCpp => probe(server_path, tag),
         blazar_core::engine_kind::EngineKind::MistralRs => probe_mistralrs(server_path, tag),
         blazar_core::engine_kind::EngineKind::Sglang => probe_sglang(server_path, tag),
+        blazar_core::engine_kind::EngineKind::SdCpp => probe_sdcpp(server_path, tag),
     }
 }
 
@@ -577,8 +578,109 @@ fn probe_sglang(server_path: &Path, tag: &str) -> Result<Manifest> {
     })
 }
 
-/// Parse the version banner. Upstream shape (b10816, stderr):
-/// `version: 0.4.0-dev (build 10816, commit 427291b5b)`.
+/// Probe an sd.cpp `sd-server` binary. Divergences from llama-server
+/// (verified against stable-diffusion.cpp master-890-74988b2):
+/// - `--version` prints `stable-diffusion.cpp version unknown, commit
+///   74988b2` and exits 0, but the version word is literally "unknown"
+///   on rolling master builds — the banner is display-only; the commit
+///   hash in the INSTALL TAG (`master-890-74988b2`) is the identity.
+/// - `-h` prints the full usage to stdout and exits 0 (llama parity, so
+///   `parse_help` applies). NEVER probe with zero args: a bare
+///   `sd-server` demands `model_path/diffusion_model` and exits 1.
+/// - `--list-devices` prints `NAME<TAB>description` per line — a
+///   different shape from llama's `NAME: DESC (TOTAL MiB, FREE MiB
+///   free)`, so it gets its own parser and no MiB numbers (sd.cpp does
+///   not report VRAM there).
+fn probe_sdcpp(server_path: &Path, tag: &str) -> Result<Manifest> {
+    let server = server_path
+        .to_str()
+        .ok_or_else(|| anyhow!("non-UTF-8 engine path {}", server_path.display()))?;
+
+    // Best-effort banner; never fatal — the tag is authoritative.
+    let version_raw = match crate::probe::probe_output(Command::new(server).arg("--version"), 30) {
+        Some(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let text = if stdout.contains("stable-diffusion.cpp") {
+                stdout
+            } else {
+                stderr
+            };
+            text.lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("stable-diffusion.cpp")
+                .to_string()
+        }
+        _ => format!("stable-diffusion.cpp {tag}"),
+    };
+
+    // Display-only serial from the install tag (`master-890-74988b2` ->
+    // 890, the upstream build counter): keeps `engine list` sortable.
+    let build_number = tag
+        .strip_prefix("master-")
+        .and_then(|rest| rest.split('-').next())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    // Flags: `-h`/`--help` both exit 0 with usage on stdout (verified
+    // master-890). A zero-flag parse is an upstream format change —
+    // fail the probe loudly rather than degrading argv gating.
+    let help_out = crate::probe::probe_output(Command::new(server).arg("--help"), 30)
+        .with_context(|| format!("run {server} --help (timed out or failed to spawn)"))?;
+    let help = String::from_utf8_lossy(&help_out.stdout).to_string();
+    let (flags, _) = parse_help(&help);
+    if flags.is_empty() {
+        return Err(anyhow!(
+            "sd-server --help parsed to zero flags (output format changed upstream?): {}",
+            help.lines().take(3).collect::<Vec<_>>().join(" | ")
+        ));
+    }
+
+    let devices = run_sd_list_devices(Path::new(server));
+
+    Ok(Manifest {
+        tag: tag.to_string(),
+        build_number,
+        version_raw,
+        devices,
+        flags,
+        spec_types: Vec::new(),
+        server_path: server.to_string(),
+        ..Default::default()
+    })
+}
+
+/// `sd-server --list-devices` census. Failure-tolerant like
+/// [`run_list_devices`]: a missing binary or a hung run yields an empty
+/// list and callers fall back.
+fn run_sd_list_devices(server: &Path) -> Vec<DeviceDesc> {
+    let Some(out) = crate::probe::probe_output(Command::new(server).arg("--list-devices"), 30)
+    else {
+        return Vec::new();
+    };
+    parse_sd_devices(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse sd.cpp device lines: `NAME<TAB>description` (e.g.
+/// `Vulkan1<TAB>NVIDIA GeForce RTX 4070 Laptop GPU`). Backend log lines
+/// (`ggml_vulkan: Found 2 Vulkan devices`) carry no tab and drop out.
+pub(crate) fn parse_sd_devices(text: &str) -> Vec<DeviceDesc> {
+    text.lines()
+        .filter_map(|line| {
+            let (name, description) = line.trim().split_once('\t')?;
+            if name.is_empty() || description.is_empty() {
+                return None;
+            }
+            Some(DeviceDesc {
+                name: name.to_string(),
+                description: description.to_string(),
+                total_mib: 0,
+                free_mib: 0,
+            })
+        })
+        .collect()
+}
 /// The `build NNNN` token is authoritative; fall back to the first
 /// integer after `version:`.
 fn parse_version(text: &str) -> Result<(u64, String)> {
@@ -747,6 +849,21 @@ mod tests {
     #[test]
     fn unit__parse_version__missing__error() {
         assert!(parse_version("llama.server\n").is_err());
+    }
+
+    #[test]
+    fn unit__parse_sd_devices__tab_shape_drops_log_lines() {
+        // Verified live against sd-server master-890-74988b2 on the
+        // 2-GPU dev box: `NAME<TAB>description`, MiB columns absent.
+        let text = "ggml_vulkan: Found 2 Vulkan devices\nVulkan0\tIntel(R) Iris Xe Graphics\nVulkan1\tNVIDIA GeForce RTX 4070 Laptop GPU\n\nCPU\t\n";
+        let devices = parse_sd_devices(text);
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].name, "Vulkan0");
+        assert!(devices[0].description.contains("Iris Xe"));
+        assert_eq!(devices[1].name, "Vulkan1");
+        assert!(devices[1].description.contains("4070"));
+        assert_eq!(devices[0].total_mib, 0);
+        // backend log line carries no tab; empty-description line drops
     }
 
     #[test]

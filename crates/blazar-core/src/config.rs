@@ -1732,7 +1732,10 @@ impl WarmPeg {
         match kind {
             EngineKind::Sglang => self.sglang.unwrap_or(self.default),
             EngineKind::LlamaCpp => self.llamacpp.unwrap_or(self.default),
-            EngineKind::MistralRs => false,
+            // No peg lane exists for either server: readiness publishes
+            // when the health probe flips (mistralrs) or /v1/models first
+            // answers (sdcpp).
+            EngineKind::MistralRs | EngineKind::SdCpp => false,
         }
     }
 }

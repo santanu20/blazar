@@ -1550,6 +1550,11 @@ fn engine_offer_line(kind: blazar_core::engine_kind::EngineKind) -> String {
         EngineKind::LlamaCpp => {
             "llamacpp (~0.2-0.7 GiB via engine update) — the GGUF default lane".to_string()
         }
+        EngineKind::SdCpp => {
+            "sdcpp (~0.04-0.3 GiB, any GPU via Vulkan) — diffusion GGUF component \
+             sets (Qwen-Image, FLUX, SD3.5...)"
+                .to_string()
+        }
     }
 }
 
@@ -1561,6 +1566,7 @@ async fn install_missing_kind(
     match kind {
         EngineKind::Sglang => engine_install_sglang(d, None).await,
         EngineKind::MistralRs => engine_install_mistralrs(d, None).await,
+        EngineKind::SdCpp => engine_install_sdcpp(d, None).await,
         EngineKind::LlamaCpp => engine_update(d, None, false, false).await,
     }
 }
@@ -3995,6 +4001,9 @@ async fn serve() -> Result<()> {
         }
         blazar_core::engine_kind::EngineKind::LlamaCpp => {
             Arc::new(LlamaCppEngine::with_env(manifest, engine_env))
+        }
+        blazar_core::engine_kind::EngineKind::SdCpp => {
+            Arc::new(blazar_runtime::SdCppEngine::with_env(manifest, engine_env))
         }
     };
     let bus = EventBus::default();
@@ -7183,6 +7192,7 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
         EngineKind::LlamaCpp => "llama-server",
         EngineKind::MistralRs => "mistral.rs",
         EngineKind::Sglang => "sglang",
+        EngineKind::SdCpp => "sd-server",
     };
     out.push(format!("# engine lane: {lane} ({tag})"));
     out.push(
@@ -7246,6 +7256,10 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
                 ],
             ),
             EngineKind::LlamaCpp => unreachable!("llamacpp handled above"),
+            // Image lane: sd-server tuning rides request parameters
+            // (steps/cfg/sampler/seed per call), not config knobs —
+            // no model-scoped families yet. New knobs get a line here.
+            EngineKind::SdCpp => ("sdcpp", vec![]),
         };
         out.push(format!("# [model_overrides.\"{model}\".{table}]"));
         out.extend(families.into_iter().map(knob));
@@ -7611,6 +7625,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 EngineKind::LlamaCpp => engine_update(&d, tag, no_gate, check).await?,
                 EngineKind::Sglang => engine_update_sglang(&d, tag, check).await?,
                 EngineKind::MistralRs => engine_update_mistralrs(&d, tag, check).await?,
+                EngineKind::SdCpp => engine_update_sdcpp(&d, tag, check).await?,
             }
         }
         EngineCmd::List { json } => {
@@ -7805,6 +7820,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                      llama.cpp         GGUF files — blazar engine update (prebuilt) or blazar engine build cuda (source)\n  \
                      --kind mistralrs  HF safetensors dirs — prebuilt mistral.rs server\n  \
                      --kind sglang     HF safetensors dirs — pip venv (Linux + CUDA/ROCm)\n  \
+                     --kind sdcpp      diffusion GGUF component sets — prebuilt sd-server (Vulkan/CPU/Metal)\n  \
                      capability lane   blazar engine offers + install --lane <id> (fork builds)\n  \
                      voice (whisper)   blazar whisper --install (separate transcription lane)"
                 ));
@@ -7815,10 +7831,11 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             match engine_kind {
                 EngineKind::MistralRs => engine_install_mistralrs(&d, tag).await?,
                 EngineKind::Sglang => engine_install_sglang(&d, tag).await?,
+                EngineKind::SdCpp => engine_install_sdcpp(&d, tag).await?,
                 EngineKind::LlamaCpp => {
                     return Err(anyhow!(
                         "llama.cpp engines install via `blazar engine update` / `blazar engine \
-                         build` — `engine install --kind` serves mistralrs and sglang"
+                         build` — `engine install --kind` serves mistralrs, sglang and sdcpp"
                     ));
                 }
             }
@@ -7918,6 +7935,95 @@ async fn engine_update_mistralrs(d: &BlazarDirs, tag: Option<String>, check: boo
     engine_install_mistralrs(d, Some(target)).await
 }
 
+/// `blazar engine install --kind sdcpp [tag]` — prebuilt sd-server from
+/// leejet/stable-diffusion.cpp. Vulkan-first asset pick covers every
+/// GPU vendor; CPU fallback where no GPU build matched. The F7
+/// decode-regression gate is llama-server-only: skipped, and SAID so —
+/// llama-bench cannot drive an sd-server child.
+async fn engine_install_sdcpp(d: &BlazarDirs, tag: Option<String>) -> Result<()> {
+    let mgr = local_engine_manager(d)?;
+    let wanted = tag.clone().unwrap_or_else(|| "latest".to_string());
+    println!("installing sd.cpp {wanted} (prebuilt upstream sd-server)");
+    let row = mgr.update_sdcpp(tag.as_deref()).await?;
+    let m: blazar_runtime::Manifest = serde_json::from_str(&row.manifest)?;
+    println!(
+        "engine {} active ({} flags probed, build {})",
+        row.tag,
+        m.flags.len(),
+        m.build_number
+    );
+    println!("note: decode-regression gate is llama-server-only — skipped for sd.cpp engines");
+    // Same one-build-per-lane contract as the other engine lanes:
+    // superseded sd.cpp dirs free their space on a successful install.
+    for (tag, bytes) in mgr.prune_siblings(EngineKind::SdCpp.as_str(), &row.tag)? {
+        // fs sizes fit i64
+        #[allow(clippy::cast_possible_wrap)]
+        let freed = bytes as i64;
+        println!(
+            "removed superseded engine {tag} (freed {})",
+            humansize(freed)
+        );
+    }
+    Ok(())
+}
+
+/// `blazar engine update --kind sdcpp [tag]` — currency lane parity with
+/// mistral.rs: a bare call probes sd.cpp GitHub and installs the newest
+/// `master-NNN-<sha8>` release when one exists; an explicit tag
+/// force-installs it. sd.cpp cuts no semver — the tag counter is the
+/// ordering (see `sdtag_counter`). `--check` resolves and reports only.
+async fn engine_update_sdcpp(d: &BlazarDirs, tag: Option<String>, check: bool) -> Result<()> {
+    let store = Store::open(d)?;
+    let Some(installed) = newest_sdcpp_tag(&store)? else {
+        return Err(anyhow!(
+            "no sdcpp engine installed — `blazar engine install --kind sdcpp` first"
+        ));
+    };
+    let pinned = tag.is_some();
+    let target = if let Some(t) = tag {
+        t
+    } else {
+        // Currency probe: live 4s-capped latest-tag resolve (same cap
+        // as the mistral.rs row; sd.cpp releases are frequent — often
+        // several per day around new-model support).
+        let mgr = local_engine_manager(d)?;
+        let fetched = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            mgr.gh.latest_sdcpp_release(),
+        )
+        .await;
+        match fetched {
+            Ok(Ok(rel)) => rel.tag_name,
+            Ok(Err(e)) => anyhow::bail!(
+                "cannot check sd.cpp releases: {e:#} — offline? set GH_TOKEN if rate limited"
+            ),
+            Err(_) => anyhow::bail!("sd.cpp release check timed out after 4s"),
+        }
+    };
+    let newer = matches!(
+        (
+            blazar_runtime::engine::gh::sdtag_counter(&installed),
+            blazar_runtime::engine::gh::sdtag_counter(&target),
+        ),
+        (Some(a), Some(b)) if b > a
+    );
+    if check {
+        println!("dry-run: nothing installed, nothing written");
+        if newer {
+            println!("would update sd.cpp {installed} -> {target}");
+            println!("  blazar engine update --kind sdcpp {target}");
+        } else {
+            println!("sd.cpp {installed} stays (target: {target})");
+        }
+        return Ok(());
+    }
+    if !pinned && !newer {
+        println!("sd.cpp {installed} is current (upstream latest: {target}).");
+        return Ok(());
+    }
+    engine_install_sdcpp(d, Some(target)).await
+}
+
 /// Newest installed mistral.rs tag (`vX.Y.Z`), the currency baseline for
 /// the update lane. `list_engines` is newest-first, but the explicit
 /// version compare keeps the pick honest if row order ever changes.
@@ -7927,6 +8033,17 @@ fn newest_mistralrs_tag(store: &Store) -> Result<Option<String>> {
         .into_iter()
         .filter(|e| e.kind == EngineKind::MistralRs)
         .max_by_key(|e| mistralrs_version_tuple(&e.tag).unwrap_or((0, 0, 0)))
+        .map(|e| e.tag.clone()))
+}
+
+/// Newest installed sd.cpp tag (`master-NNN-<sha8>`) by tag counter —
+/// the same role `newest_mistralrs_tag` plays for the semver lane.
+fn newest_sdcpp_tag(store: &Store) -> Result<Option<String>> {
+    Ok(store
+        .list_engines()?
+        .into_iter()
+        .filter(|e| e.kind == EngineKind::SdCpp)
+        .max_by_key(|e| blazar_runtime::engine::gh::sdtag_counter(&e.tag).unwrap_or(0))
         .map(|e| e.tag.clone()))
 }
 
