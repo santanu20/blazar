@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/pallama-core",
-    "crates/pallama-runtime",
-    "crates/pallama-gateway",
-    "crates/pallama-cli",
+    "crates/blazar-core",
+    "crates/blazar-runtime",
+    "crates/blazar-gateway",
+    "crates/blazar-cli",
 ]
 
 [workspace.package]
@@ -14,9 +14,9 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 libc = "0.2.189"
-pallama-core = { path = "crates/pallama-core" }
-pallama-runtime = { path = "crates/pallama-runtime" }
-pallama-gateway = { path = "crates/pallama-gateway" }
+blazar-core = { path = "crates/blazar-core" }
+blazar-runtime = { path = "crates/blazar-runtime" }
+blazar-gateway = { path = "crates/blazar-gateway" }
 
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["json"] }

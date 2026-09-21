@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """Engine flag coverage audit: how much of each engine's CLI surface
-Pallama wires as first-class knobs vs leaves to passthrough.
+Blazar wires as first-class knobs vs leaves to passthrough.
 
 Method (reproducible evidence, not a static table):
-  1. Read each engine manifest's flag list from a pallama store DB
-     (`engines.manifest` JSON, as probed by `pallama engine install`).
+  1. Read each engine manifest's flag list from a blazar store DB
+     (`engines.manifest` JSON, as probed by `blazar engine install`).
   2. A flag is WIRED when the literal string appears in the profile
      compiler or the argv translators (profile.rs / engine_impl.rs) —
-     i.e. Pallama computes or passes it from a config knob.
+     i.e. Blazar computes or passes it from a config knob.
   3. Everything else is LONG-TAIL: reachable through per-model
      `extra_args` (verbatim on llamacpp/mistralrs, manifest-gated on
      sglang) and bucketed by keyword families for the coverage doc.
 
 Usage:
   python3 scripts/engine_coverage.py [store_db]
-  (default store: ~/.local/share/pallama/pallama.db)
+  (default store: ~/.local/share/blazar/blazar.db)
 """
 
 from __future__ import annotations
@@ -27,8 +27,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 EMISSION_SOURCES = [
-    REPO / "crates/pallama-core/src/profile.rs",
-    REPO / "crates/pallama-runtime/src/engine_impl.rs",
+    REPO / "crates/blazar-core/src/profile.rs",
+    REPO / "crates/blazar-runtime/src/engine_impl.rs",
 ]
 
 # Keyword families per engine kind. Order matters: first match wins.
@@ -126,7 +126,7 @@ def main() -> int:
     db = Path(
         sys.argv[1]
         if len(sys.argv) > 1
-        else Path.home() / ".local/share/pallama/pallama.db"
+        else Path.home() / ".local/share/blazar/blazar.db"
     )
     if not db.is_file():
         print(f"no store at {db}", file=sys.stderr)

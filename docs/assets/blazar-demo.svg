@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="467" role="img" aria-label="blazar run and blazar why terminal session">
+<rect width="880" height="467" rx="8" fill="#0d1117"/>
+<path d="M0,28 a8,8 0 0 1 8,-8 h864 a8,8 0 0 1 8,8 v16 h-880 z" fill="#161b22"/>
+<rect x="0.5" y="0.5" width="879" height="466" rx="8" fill="none" stroke="#30363d"/>
+<circle cx="18" cy="21" r="5.5" fill="#ff5f56"/><circle cx="38" cy="21" r="5.5" fill="#ffbd2e"/><circle cx="58" cy="21" r="5.5" fill="#27c93f"/>
+<text x="440.0" y="25" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11.5" fill="#8b949e">blazar — live captured session (qwen2.5-0.5b, llama.cpp b11026-cuda)</text>
+<text x="24" y="57" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#3fb950">$ </text>
+<text x="39.048" y="57" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#e6edf3">blazar run qwen2.5-0.5b</text>
+<text x="24" y="76" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#8b949e">blazar REPL — /help for commands</text>
+<text x="24" y="95" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#a5d6ff">&gt; In one short sentence: why is a local inference server better</text>
+<text x="24" y="114" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#a5d6ff">    than a cloud API for privacy?</text>
+<text x="24" y="152" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#e6edf3">A local inference server provides a more secure and consistent</text>
+<text x="24" y="171" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#e6edf3">privacy solution due to its decentralized architecture and local</text>
+<text x="24" y="190" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#e6edf3">processing capabilities, which can withstand cross-site scripting</text>
+<text x="24" y="209" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#e6edf3">(XSS) attacks and other types of malicious content.</text>
+<text x="24" y="247" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#d29922">[profile]</text>
+<text x="91.716" y="247" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#8b949e"> cache_ram_mb 8192 clamped to 4102 (30% of 13674 MiB RAM, hit-rate n/a);</text>
+<text x="24" y="266" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#d29922">[profile]</text>
+<text x="91.716" y="266" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#8b949e">           override via model_overrides extra_args --cache-ram or set 0 = unlimited</text>
+<text x="24" y="285" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#d29922">[profile]</text>
+<text x="91.716" y="285" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#8b949e"> slots auto: -np 2 with total ctx 32768 (per-slot 16384) — concurrent streams</text>
+<text x="24" y="304" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#d29922">[profile]</text>
+<text x="91.716" y="304" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#8b949e">           batch on the GPU instead of queueing; pin slots = 1 for single-client full-speed</text>
+<text x="24" y="323" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#d29922">[profile]</text>
+<text x="91.716" y="323" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#8b949e"> spec=auto but no draft pair for qwen2.5-0.5b in the catalog; running dense</text>
+<text x="24" y="342" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#d29922">[profile]</text>
+<text x="91.716" y="342" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#8b949e"> load-mode mlock auto: weights 379 MiB (+ 0 MiB resident) &lt;= 40% of 13674 MiB RAM —</text>
+<text x="24" y="361" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#d29922">[profile]</text>
+<text x="91.716" y="361" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#8b949e">           eager page-in measured ~0.7s faster to first token; set load_mode = "mmap" to opt out</text>
+<text x="24" y="399" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#3fb950">$ </text>
+<text x="39.048" y="399" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#e6edf3">blazar why</text>
+<text x="24" y="418" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#3fb950">ok</text>
+<text x="39.048" y="418" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#e6edf3">  plm-1a0b434d11c-7  ollama-chat  model=qwen2.5-0.5b status=200 finish=stop</text>
+<text x="24" y="437" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#e6edf3">    ctx=16384 prompt=48 completion=41 degraded=false 3805 ms</text>
+</svg>

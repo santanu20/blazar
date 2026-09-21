@@ -1,5 +1,5 @@
 #!/bin/sh
-# pallama environment bootstrap. Two consumers:
+# blazar environment bootstrap. Two consumers:
 #   1. CONTRIBUTORS (default mode): every dependency needed to build,
 #      test and lint from source.
 #   2. scripts/install.sh (--minimal): just the compile toolchain (cc,
@@ -18,7 +18,7 @@
 #   --minimal only cc + make + rust (the from-source install lane;
 #             skips git/python3/shellcheck/xz dev extras)
 #
-# Environment: PALLAMA_SUDO — pass-through wrapper, or empty to run
+# Environment: BLAZAR_SUDO — pass-through wrapper, or empty to run
 # unprivileged (unset-only default — sudo), same knob as install.sh.
 
 # Wrap everything in main() so a truncated partial download cannot execute
@@ -41,7 +41,7 @@ for arg in "$@"; do
     esac
 done
 
-SUDO="${PALLAMA_SUDO-sudo}"
+SUDO="${BLAZAR_SUDO-sudo}"
 [ "$(id -u)" -eq 0 ] && SUDO=
 
 OS=$(uname -s)

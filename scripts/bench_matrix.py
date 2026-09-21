@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Professional cross-engine, cross-provider benchmark matrix for Pallama.
+"""Professional cross-engine, cross-provider benchmark matrix for Blazar.
 
 Sweeps every installed engine (llama.cpp builds AND mistral.rs) across
-server providers (direct child spawn, pallama gateway, ollama reference),
+server providers (direct child spawn, blazar gateway, ollama reference),
 measuring:
 
   speed      TTFT p50/p90/p99, inter-token latency p50/p99, decode t/s,
@@ -13,7 +13,7 @@ measuring:
              (spawn->healthy), teardown-verified VRAM return
   serving    greedy-parity text quality vs the SAME-engine direct
              reference (backend numerics) AND gateway-transparency
-             parity (pallama path vs direct path, same engine),
+             parity (blazar path vs direct path, same engine),
              llama-perplexity parity on a fixed corpus
   features   capability matrix (grammar, slots, tokenize, embeddings,
              vision, spec-decode, ...) from --help probes + documented
@@ -25,7 +25,7 @@ v2 semantics (HARNESS_VERSION bump invalidates v1 cells):
     thinking phase as 76s "TTFT" on reasoning models)
   - prefill t/s is prompt_tokens / ttft on a token-targeted prompt
     (v1 printed ~4 generated tokens / wall — not a prefill number)
-  - pallama cells record the resolved child argv + a real GPU/RSS
+  - blazar cells record the resolved child argv + a real GPU/RSS
     sampler (v1 showed GPU 0)
   - greedy reference is per-engine; the gateway lane is the headline
     transparency test
@@ -38,7 +38,7 @@ Exit codes: 0 = all cells ok, 1 = some cells failed (recorded, campaign
 continued), 2 = environment abort (no model / no engines / corpus fetch
 failure).
 
-Never touches the user's daemon, config, or ollama service: pallama
+Never touches the user's daemon, config, or ollama service: blazar
 cells run inside the validate.py Sandbox (hardlinked engines + DB
 backup), direct cells spawn our own PIDs on probed free ports, the
 ollama cell is HTTP-only against an already-running service.
@@ -77,7 +77,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 
 HARNESS_VERSION = 2
-ARTIFACTS_ROOT = Path.home() / ".cache" / "pallama-bench-matrix"
+ARTIFACTS_ROOT = Path.home() / ".cache" / "blazar-bench-matrix"
 
 # Default sweep (C1: fixed, CLI-tunable, no config matrix).
 DIRECT_CTX_SWEEP = (4096, 16384)
@@ -275,7 +275,7 @@ class Engine:
 
 
 def load_engines(data_dir: Path) -> list[Engine]:
-    db = data_dir / "pallama.db"
+    db = data_dir / "blazar.db"
     kinds: dict[str, str] = {}
     if db.exists():
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
@@ -294,7 +294,7 @@ def load_engines(data_dir: Path) -> list[Engine]:
         tag = edir.name
         if tag not in kinds:
             # orphan dir without a store row (install debris): not a
-            # real engine — a pallama cell for it would flip NO row
+            # real engine — a blazar cell for it would flip NO row
             # active and the sandbox daemon exits "no engine installed"
             continue
         kind = kinds[tag]
@@ -399,7 +399,7 @@ class Sampler(threading.Thread):
 
     pid may be None (global GPU-only sampling — used when the serving
     process is not our child, e.g. the ollama host service or the
-    sandbox daemon's engine). pid may also be assigned LATE (pallama
+    sandbox daemon's engine). pid may also be assigned LATE (blazar
     cells discover the engine child after the first request): RSS
     tracking simply starts at the next tick.
     """
@@ -537,9 +537,9 @@ def sandbox_model_files(sb, model_name: str) -> tuple[Path | None, Path | None]:
     """(weights file, mmproj file) from the sandbox store row — the cold
     probe drops the page cache on BOTH: a cold VL spawn reads the
     projector (875 MiB on the 9B row) off disk too, and leaving it
-    cached would hand pallama a warmer cold start than the ollama lane
+    cached would hand blazar a warmer cold start than the ollama lane
     (which has no projector at all)."""
-    db = Path(sb.data_home) / "pallama" / "pallama.db"
+    db = Path(sb.data_home) / "blazar" / "blazar.db"
     if not db.exists():
         return None, None
     try:
@@ -582,7 +582,7 @@ def openai_stream_timed(port: int, body: dict, timeout: float = 300.0) -> dict:
     """POST /v1/chat/completions (stream) -> timing metrics.
 
     Token counts prefer the final `usage` (server-authoritative; the
-    pallama gateway injects usage into /v1 streams) with per-chunk
+    blazar gateway injects usage into /v1 streams) with per-chunk
     counting as fallback. Every chunk carrying content OR
     reasoning_content counts: throughput is token-speed regardless of
     which field carries them. ITLs come from chunk timestamps.
@@ -747,7 +747,7 @@ def count_tokens(port: int, text: str, ollama: bool, model: str) -> int | None:
     """Server-side tokenization; None when the route is unavailable.
 
     Body carries BOTH dialect keys (content for llama-server, prompt +
-    model for the ollama-compatible translation layer) — the pallama
+    model for the ollama-compatible translation layer) — the blazar
     gateway maps /tokenize to the child and needs the routed model."""
     body = {"content": text, "prompt": text, "model": model}
     try:
@@ -766,7 +766,7 @@ def _probe_prompt_tokens(port: int, text: str, ollama: bool, model: str) -> int 
     1-token generate, read the engine's prompt_eval_count. None when the
     lane can't answer (caller keeps its estimate)."""
     if not ollama:
-        return None  # pallama lanes tokenize server-side already
+        return None  # blazar lanes tokenize server-side already
     try:
         j = http_json(
             f"http://127.0.0.1:{port}/api/generate",
@@ -830,7 +830,7 @@ def sized_prompt(port: int, target_tokens: int, ollama: bool, model: str) -> str
             # ships no /api/tokenize): scale the char budget by the
             # engine's own prompt_eval_count from untimed 1-token
             # probes. Without this the char estimate left the ollama
-            # lane at 371 real tokens vs the pallama lane's 527 at the
+            # lane at 371 real tokens vs the blazar lane's 527 at the
             # same 512 target — cross-runtime prefill comparisons were
             # invalid (shorter prompt = lower amortized prefill t/s).
             need_chars = len(text)
@@ -963,7 +963,7 @@ def conc_suite(
 
     Unique prompt per stream (no shared prefix -> no cache collision,
     all streams pay real prefill). Exercises admission/queueing on the
-    pallama path (WFQ/slot leases/predictive reject) and llama-server
+    blazar path (WFQ/slot leases/predictive reject) and llama-server
     slot scheduling on the direct path.
 
     rounds > 1 = sustained load: sequential bursts with per-round and
@@ -1073,7 +1073,7 @@ def stage_mistralrs_view(
     """F3: mistral.rs scans the model's whole directory for projectors —
     a flat shared models dir poisons every text model. Stage a private
     view (symlinks) containing ONLY this model's files, exactly like the
-    Pallama serving lane does."""
+    Blazar serving lane does."""
     d = stage_root / re.sub(r"[^A-Za-z0-9_.-]", "_", model_path.stem)[:80]
     if d.exists():
         shutil.rmtree(d)
@@ -1273,7 +1273,7 @@ def run_direct_cell(
             return rec
         rec["load_s"] = round(time.perf_counter() - t_load0, 2)
         # mistral.rs children register the served model as "default";
-        # the pallama gateway rewrites at the proxy — we do it here.
+        # the blazar gateway rewrites at the proxy — we do it here.
         body_model = "default" if eng.kind == "mistralrs" else model_name
         rec.update(
             median_run_suite(port, body_model, cfg["runs"], cfg["pp"], cfg["tg"])
@@ -1343,7 +1343,7 @@ def run_direct_conc_cell(
 
 
 # ---------------------------------------------------------------------------
-# pallama provider (validate.py Sandbox; per-engine active flip)
+# blazar provider (validate.py Sandbox; per-engine active flip)
 
 
 def find_sandbox_engine_pid() -> int | None:
@@ -1351,7 +1351,7 @@ def find_sandbox_engine_pid() -> int | None:
 
     The sandbox DB carries REAL engine paths (the daemon resolves the
     binary from its manifest), so a path-prefix scan misses it. The
-    daemon is spawned with PALLAMA_VALIDATE=1 and the engine child
+    daemon is spawned with BLAZAR_VALIDATE=1 and the engine child
     inherits that environ — the same marker validate.py's orphan reaper
     trusts. Only our sandbox tree can carry it."""
     if not os.path.isdir("/proc"):
@@ -1371,7 +1371,7 @@ def find_sandbox_engine_pid() -> int | None:
                 environ = fh.read()
         except OSError:
             continue
-        if b"PALLAMA_VALIDATE=1" in environ:
+        if b"BLAZAR_VALIDATE=1" in environ:
             return int(pid_s)
     return None
 
@@ -1384,12 +1384,12 @@ def read_proc_argv(pid: int) -> list[str]:
         return []
 
 
-def run_pallama_cell(
+def run_blazar_cell(
     eng: Engine,
     model_name: str,
     cfg: dict,
     skip_ollama_note: str,
-    pallama_cfg: dict | None = None,
+    blazar_cfg: dict | None = None,
     soak_s: float = 0.0,
 ) -> dict:
     """Full-gateway cell inside the validate.py Sandbox.
@@ -1401,27 +1401,27 @@ def run_pallama_cell(
     spike) then to the discovered child pid (RSS from discovery on).
     """
     # per-campaign unique port BEFORE the lazy import: validate.py reads
-    # PALLAMA_VALIDATE_PORT once at import time — a shared fixed port is
+    # BLAZAR_VALIDATE_PORT once at import time — a shared fixed port is
     # exactly how orphaned sandbox daemons hijacked campaigns (leak class
     # fixed in validate.py; this makes collisions structurally impossible)
-    os.environ["PALLAMA_VALIDATE_PORT"] = str(free_port())
+    os.environ["BLAZAR_VALIDATE_PORT"] = str(free_port())
     V = importlib.import_module("validate")
     # F139: the module cache returns the FIRST import on later campaigns
     # — rebinding PORT on the module is what actually takes effect; the
     # env re-set above alone is inert past the first import.
-    V.PORT = int(os.environ["PALLAMA_VALIDATE_PORT"])
+    V.PORT = int(os.environ["BLAZAR_VALIDATE_PORT"])
 
     rec: dict = {}
     sb = V.Sandbox()
     sampler = Sampler(None)
     sampler.start()
     try:
-        con = sqlite3.connect(Path(sb.data_home) / "pallama" / "pallama.db")
+        con = sqlite3.connect(Path(sb.data_home) / "blazar" / "blazar.db")
         con.execute("UPDATE engines SET active = (tag = ?)", (eng.tag,))
         con.commit()
         con.close()
         daemon = V.Daemon(sb)
-        rec["gpu_busy_mib"] = warm_cell_gpu_guard("pallama cell")
+        rec["gpu_busy_mib"] = warm_cell_gpu_guard("blazar cell")
         t_boot0 = time.perf_counter()
         port: int | None = None
         try:
@@ -1429,7 +1429,7 @@ def run_pallama_cell(
             # (healthz timeout, liveness guard) used to leak a live
             # daemon whose sandbox got destroyed under it (2026-09-10).
             daemon.start(
-                cfg={"port": V.PORT, **(pallama_cfg or {})}, floor_model=model_name
+                cfg={"port": V.PORT, **(blazar_cfg or {})}, floor_model=model_name
             )
             port = V.PORT
             deadline = time.time() + 600
@@ -1564,31 +1564,31 @@ def run_pallama_cell(
     return rec
 
 
-def run_pallama_conc_cell(
+def run_blazar_conc_cell(
     eng: Engine, model_name: str, level: int, cfg: dict, rounds: int = 1
 ) -> dict:
     """Concurrency lane through the full gateway path (admission,
-    queueing, slot leases — Pallama's scheduling surface)."""
-    os.environ["PALLAMA_VALIDATE_PORT"] = str(free_port())
+    queueing, slot leases — Blazar's scheduling surface)."""
+    os.environ["BLAZAR_VALIDATE_PORT"] = str(free_port())
     V = importlib.import_module("validate")
     # F139: the module cache returns the FIRST import on later campaigns
     # — rebinding PORT on the module is what actually takes effect; the
     # env re-set above alone is inert past the first import.
-    V.PORT = int(os.environ["PALLAMA_VALIDATE_PORT"])
+    V.PORT = int(os.environ["BLAZAR_VALIDATE_PORT"])
 
     rec: dict = {}
     sb = V.Sandbox()
     sampler = Sampler(None)
     sampler.start()
     try:
-        con = sqlite3.connect(Path(sb.data_home) / "pallama" / "pallama.db")
+        con = sqlite3.connect(Path(sb.data_home) / "blazar" / "blazar.db")
         con.execute("UPDATE engines SET active = (tag = ?)", (eng.tag,))
         con.commit()
         con.close()
         daemon = V.Daemon(sb)
         port: int | None = None
         try:
-            # same ownership fix as run_pallama_cell: start() must be
+            # same ownership fix as run_blazar_cell: start() must be
             # covered by the finally that calls daemon.stop()
             daemon.start(floor_model=model_name)
             port = V.PORT
@@ -1650,16 +1650,16 @@ def run_pallama_conc_cell(
 
 
 # ---------------------------------------------------------------------------
-# idle-wake lane (sleep-vs-expiry semantics: pallama keeps weights in RAM
+# idle-wake lane (sleep-vs-expiry semantics: blazar keeps weights in RAM
 # and wakes cheap; ollama's keep_alive expiry unloads and pays a reload)
 
 
-def run_pallama_idle_cell(eng: Engine, model_name: str, cfg: dict) -> dict:
+def run_blazar_idle_cell(eng: Engine, model_name: str, cfg: dict) -> dict:
     """Warm the model, let the reaper ladder sleep it (idle_sleep_secs),
-    then measure the wake TTFT — pallama's structural idle advantage."""
-    os.environ["PALLAMA_VALIDATE_PORT"] = str(free_port())
+    then measure the wake TTFT — blazar's structural idle advantage."""
+    os.environ["BLAZAR_VALIDATE_PORT"] = str(free_port())
     V = importlib.import_module("validate")
-    V.PORT = int(os.environ["PALLAMA_VALIDATE_PORT"])
+    V.PORT = int(os.environ["BLAZAR_VALIDATE_PORT"])
 
     idle_sleep = 15
     rec: dict[str, Any] = {
@@ -1669,7 +1669,7 @@ def run_pallama_idle_cell(eng: Engine, model_name: str, cfg: dict) -> dict:
     sampler = Sampler(None)
     sampler.start()
     try:
-        con = sqlite3.connect(Path(sb.data_home) / "pallama" / "pallama.db")
+        con = sqlite3.connect(Path(sb.data_home) / "blazar" / "blazar.db")
         con.execute("UPDATE engines SET active = (tag = ?)", (eng.tag,))
         con.commit()
         con.close()
@@ -1706,7 +1706,7 @@ def run_pallama_idle_cell(eng: Engine, model_name: str, cfg: dict) -> dict:
                 timeout=600.0,
             )
             loaded_gpu_mib = gpu_used_mib()
-            # sleep detect: /api/ps pallama_state flips to Sleeping (the
+            # sleep detect: /api/ps blazar_state flips to Sleeping (the
             # child sleeps itself; weights stay RAM, VRAM released);
             # VRAM drop as fallback signal. Timeout must cover the idle
             # window + the 10s reaper tick + margin.
@@ -1716,7 +1716,7 @@ def run_pallama_idle_cell(eng: Engine, model_name: str, cfg: dict) -> dict:
                 try:
                     ps = http_json(f"http://127.0.0.1:{port}/api/ps", timeout=5.0)
                     states = [
-                        str(r.get("pallama_state", "")).lower()
+                        str(r.get("blazar_state", "")).lower()
                         for r in ps.get("models", [])
                     ]
                     if any("sleep" in s for s in states):
@@ -1781,7 +1781,7 @@ def run_pallama_idle_cell(eng: Engine, model_name: str, cfg: dict) -> dict:
 def run_ollama_idle_cell(cfg: dict, args_model: str | None) -> dict:
     """keep_alive expiry = ollama's idle policy: FULL unload. After the
     window the model row leaves /api/ps and the next request pays a
-    complete reload — measure that TTFT against pallama's sleep-wake."""
+    complete reload — measure that TTFT against blazar's sleep-wake."""
     try:
         tags = http_json(f"http://127.0.0.1:{OLLAMA_PORT}/api/tags", timeout=5.0)
     except (urllib.error.URLError, OSError):
@@ -1857,20 +1857,20 @@ def run_ollama_idle_cell(cfg: dict, args_model: str | None) -> dict:
 # long-context degradation curve (decode t/s + TTFT vs ctx on both runtimes)
 
 
-def run_pallama_ctx_cell(eng: Engine, model_name: str, ctx: int, cfg: dict) -> dict:
+def run_blazar_ctx_cell(eng: Engine, model_name: str, ctx: int, cfg: dict) -> dict:
     """One ctx point on the curve: sandbox daemon with the per-model ctx
     override, 3-run decode suite. The profile compiler resolves ctx into
     the child argv (recorded) so the exact allocation is in the artifact."""
-    os.environ["PALLAMA_VALIDATE_PORT"] = str(free_port())
+    os.environ["BLAZAR_VALIDATE_PORT"] = str(free_port())
     V = importlib.import_module("validate")
-    V.PORT = int(os.environ["PALLAMA_VALIDATE_PORT"])
+    V.PORT = int(os.environ["BLAZAR_VALIDATE_PORT"])
 
     rec: dict[str, Any] = {"ctx": ctx}
     sb = V.Sandbox()
     sampler = Sampler(None)
     sampler.start()
     try:
-        con = sqlite3.connect(Path(sb.data_home) / "pallama" / "pallama.db")
+        con = sqlite3.connect(Path(sb.data_home) / "blazar" / "blazar.db")
         con.execute("UPDATE engines SET active = (tag = ?)", (eng.tag,))
         con.commit()
         con.close()
@@ -2063,7 +2063,7 @@ def run_ollama_cold_cell(
     cfg: dict, args_model: str | None, service_restart: bool = False
 ) -> dict:
     """Cold-start parity lane: ollama daemon-boot → disk-cold model load
-    → first token. Mirrors the pallama cold probe exactly (fadvise'd
+    → first token. Mirrors the blazar cold probe exactly (fadvise'd
     blobs, GPU-idle assert, aligned num_ctx) so the coldstart table
     compares the same physical state on both runtimes."""
     try:
@@ -2123,7 +2123,7 @@ def run_ollama_cold_cell(
         if not ollama_evict(pick):
             rec["cold_gpu_busy_mib"] = round(gpu_used_mib(), 0)
         rec["cold_fadvise_files"] = fadvise_dontneed(ollama_blob_paths())
-        # num_ctx 16384 = the pallama gateway cell's resolved ctx for the
+        # num_ctx 16384 = the blazar gateway cell's resolved ctx for the
         # matrix model — identical KV allocation on both runtimes
         m = ollama_stream_timed(
             OLLAMA_PORT,
@@ -2431,17 +2431,17 @@ def run_greedy_gateway_cell(
     """HEADLINE transparency test: same engine, gateway path vs direct
     path, sampler-pinned. Anything short of 20/20 exact is a gateway
     translation defect (sampler remap, template drift, truncation)."""
-    os.environ["PALLAMA_VALIDATE_PORT"] = str(free_port())
+    os.environ["BLAZAR_VALIDATE_PORT"] = str(free_port())
     V = importlib.import_module("validate")
     # F139: the module cache returns the FIRST import on later campaigns
     # — rebinding PORT on the module is what actually takes effect; the
     # env re-set above alone is inert past the first import.
-    V.PORT = int(os.environ["PALLAMA_VALIDATE_PORT"])
+    V.PORT = int(os.environ["BLAZAR_VALIDATE_PORT"])
 
     rec: dict = {}
     sb = V.Sandbox()
     try:
-        con = sqlite3.connect(Path(sb.data_home) / "pallama" / "pallama.db")
+        con = sqlite3.connect(Path(sb.data_home) / "blazar" / "blazar.db")
         con.execute("UPDATE engines SET active = (tag = ?)", (eng.tag,))
         con.commit()
         con.close()
@@ -2589,7 +2589,7 @@ def _argv_flag(argv: list[str] | None, names: tuple[str, ...]) -> str | None:
 
 
 def _child_shape(r: dict) -> str:
-    """Resolved slot/context shape of a pallama row, from its recorded
+    """Resolved slot/context shape of a blazar row, from its recorded
     child argv — auto-slots means 'config=default' alone hides np/ctx."""
     argv = r.get("child_argv")
     np_ = _argv_flag(argv, ("-np", "--parallel", "--np"))
@@ -2640,7 +2640,7 @@ def _speed_row(r: dict) -> str:
 def _env_failure(err: str) -> bool:
     """Classify a cell error as ENVIRONMENT (harness/box conditions) vs
     PRODUCT (engine/gateway behavior) — the report must not present a
-    co-residency abort as a pallama defect."""
+    co-residency abort as a blazar defect."""
     return any(
         s in err
         for s in ("GPU memory floor", "MemAvailable", "mem_guard", "co-resident")
@@ -2666,7 +2666,7 @@ def _findings(records: list[dict]) -> list[str]:
     # gateway-vs-direct decode parity per engine
     for r in records:
         tag = r.get("tag")
-        if r.get("provider") != "pallama" or "decode_tps_p50" not in r or tag is None:
+        if r.get("provider") != "blazar" or "decode_tps_p50" not in r or tag is None:
             continue
         d = speed_ok("direct", tag)
         if d and d.get("decode_tps_p50"):
@@ -2683,7 +2683,7 @@ def _findings(records: list[dict]) -> list[str]:
     # concurrency: system throughput vs direct
     for r in records:
         tag = r.get("tag")
-        if r.get("provider") != "conc-pallama" or "sys_tps" not in r or tag is None:
+        if r.get("provider") != "conc-blazar" or "sys_tps" not in r or tag is None:
             continue
         for drec in records:
             if drec.get("provider") == "conc-direct" and drec.get("tag") == tag:
@@ -2764,12 +2764,12 @@ def write_markdown_report(
     feat_rows: dict[str, dict[str, bool]] | None,
     argv_summary: str,
     ref_tag: str | None,
-    pallama_version: str = "unknown",
+    blazar_version: str = "unknown",
 ) -> None:
     """Human-first markdown report: environment, speed, resources,
     concurrency, quality, features, failures."""
     md: list[str] = []
-    md.append("# Pallama benchmark matrix\n")
+    md.append("# Blazar benchmark matrix\n")
     md.append(f"- **date**: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     md.append(f"- **model**: `{model.name}` ({model.stat().st_size // (1 << 20)} MiB)")
     md.append(f"- **gpu**: {gpu_name()}")
@@ -2780,27 +2780,27 @@ def write_markdown_report(
     all_tags = sorted(set(seen_tags) | set(inv_tags)) or inv_tags
     md.append("- **engines**: " + ", ".join(all_tags))
     md.append(f"- **harness**: bench_matrix v{HARNESS_VERSION} — `{argv_summary}`")
-    md.append(f"- **pallama**: `{pallama_version}` (sandbox daemon binary)")
+    md.append(f"- **blazar**: `{blazar_version}` (sandbox daemon binary)")
     # provenance disclosure: resumed campaigns mix rows measured by
     # different binaries — enumerate the stamps actually in the records
-    pallama_owned = [
+    blazar_owned = [
         r
         for r in records
-        if r.get("provider") in ("pallama", "conc-pallama", "greedy_gw")
+        if r.get("provider") in ("blazar", "conc-blazar", "greedy_gw")
     ]
-    stamps = sorted({v for r in pallama_owned if (v := r.get("pallama_version"))})
-    unstamped = sum(1 for r in pallama_owned if not r.get("pallama_version"))
-    if len(stamps) > 1 or (stamps and stamps != [pallama_version]):
+    stamps = sorted({v for r in blazar_owned if (v := r.get("blazar_version"))})
+    unstamped = sum(1 for r in blazar_owned if not r.get("blazar_version"))
+    if len(stamps) > 1 or (stamps and stamps != [blazar_version]):
         md.append(
-            f"- ⚠ **mixed provenance**: pallama-owned rows were measured by "
+            f"- ⚠ **mixed provenance**: blazar-owned rows were measured by "
             f"{', '.join(f'`{s}`' for s in stamps)}; this invocation used "
-            f"`{pallama_version}`. Per-row `pallama_version` in cells.jsonl."
+            f"`{blazar_version}`. Per-row `blazar_version` in cells.jsonl."
         )
-    elif stamps == [pallama_version]:
-        md.append(f"- all pallama-owned rows measured by `{stamps[0]}`")
+    elif stamps == [blazar_version]:
+        md.append(f"- all blazar-owned rows measured by `{stamps[0]}`")
     if unstamped:
         md.append(
-            f"- {unstamped} pallama-owned row(s) predate version stamping "
+            f"- {unstamped} blazar-owned row(s) predate version stamping "
             "(harness v2 era) — binary provenance from the campaign log."
         )
     md.append("")
@@ -2940,7 +2940,7 @@ def write_markdown_report(
     gw = [r for r in records if r.get("provider") == "greedy_gw"]
     if gw:
         md.append(
-            "## Quality — gateway transparency (pallama path vs direct, same engine)\n"
+            "## Quality — gateway transparency (blazar path vs direct, same engine)\n"
         )
         md.append(
             "| engine | exact matches | ratio mean | ratio min | first divergence (median chars) |"
@@ -3002,7 +3002,7 @@ def write_markdown_report(
                 )
         if env:
             md.append(
-                "\n**environment** (box/co-residency guards — NOT pallama defects):\n"
+                "\n**environment** (box/co-residency guards — NOT blazar defects):\n"
             )
             for r in env:
                 md.append(
@@ -3014,7 +3014,7 @@ def write_markdown_report(
     md.append("## Reading this report\n")
     md.append("- `direct` = raw child spawn on a probed free port (no gateway).")
     md.append(
-        "- `pallama` = full gateway path inside a sandboxed daemon"
+        "- `blazar` = full gateway path inside a sandboxed daemon"
         " (profile compiler, routing, auth); `child_argv` in cells.jsonl"
         " holds the resolved engine argv."
     )
@@ -3031,7 +3031,7 @@ def write_markdown_report(
         " prefill reads high relative to the 512-token lanes."
     )
     md.append(
-        "- pallama speed rows show the resolved slot/context shape"
+        "- blazar speed rows show the resolved slot/context shape"
         " (`child: np=… ctx=…`) parsed from the recorded child argv —"
         " auto-slots may differ from the direct rows' explicit np."
     )
@@ -3108,14 +3108,14 @@ def write_speed_table(records: list[dict], path: Path) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
-    ap.add_argument("--data-dir", default=str(Path.home() / ".local/share/pallama"))
+    ap.add_argument("--data-dir", default=str(Path.home() / ".local/share/blazar"))
     ap.add_argument("--model", help="model name substring (default: largest .gguf)")
     ap.add_argument("--engines", nargs="*", help="engine tags (default: all)")
     ap.add_argument(
         "--providers",
         nargs="*",
-        default=["direct", "pallama", "ollama"],
-        choices=["direct", "pallama", "ollama"],
+        default=["direct", "blazar", "ollama"],
+        choices=["direct", "blazar", "ollama"],
     )
     ap.add_argument("--pp", type=int, default=DEFAULT_PP, help="prefill prompt tokens")
     ap.add_argument("--tg", type=int, default=DEFAULT_TG)
@@ -3129,7 +3129,7 @@ def main() -> int:
         help="concurrency levels for the parallel-streams lane",
     )
     ap.add_argument(
-        "--soak", type=float, default=0.0, help="pallama soak seconds (0=off)"
+        "--soak", type=float, default=0.0, help="blazar soak seconds (0=off)"
     )
     ap.add_argument("--skip-ppl", action="store_true")
     ap.add_argument("--skip-greedy", action="store_true")
@@ -3168,9 +3168,9 @@ def main() -> int:
     )
     ap.add_argument("--artifacts-dir", help="override artifacts location")
     ap.add_argument(
-        "--pallama-bin",
+        "--blazar-bin",
         help=(
-            "pallama binary for sandbox daemons (default: repo release build, "
+            "blazar binary for sandbox daemons (default: repo release build, "
             "then PATH) — stamp its --version in the report"
         ),
     )
@@ -3197,7 +3197,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.render_only:
-        cache = Path.home() / ".cache/pallama-bench-matrix"
+        cache = Path.home() / ".cache/blazar-bench-matrix"
         if args.artifacts_dir:
             ad = Path(args.artifacts_dir).expanduser()
         elif cache.exists():
@@ -3248,9 +3248,9 @@ def main() -> int:
     # stem-derived name 404s every sandbox daemon. Pick from rows whose
     # file exists; the row's name IS the gateway name (no stem fallback
     # to get wrong), and its mmproj column owns projector attachment.
-    db = data_dir / "pallama.db"
+    db = data_dir / "blazar.db"
     if not db.exists():
-        log(f"no pallama.db under {data_dir} — nothing servable")
+        log(f"no blazar.db under {data_dir} — nothing servable")
         return 2
     rows: list[tuple[Path, str, str | None]] = []
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
@@ -3327,26 +3327,26 @@ def main() -> int:
     log(f"providers: {', '.join(args.providers)}  artifacts: {art}")
 
     # Sandbox daemon binary: must be settled BEFORE the first lazy
-    # validate import (PAL resolves at import time from PALLAMA_BIN).
-    if args.pallama_bin:
-        pbin = Path(args.pallama_bin).resolve()
+    # validate import (PAL resolves at import time from BLAZAR_BIN).
+    if args.blazar_bin:
+        pbin = Path(args.blazar_bin).resolve()
         if not pbin.is_file() or not os.access(pbin, os.X_OK):
-            log(f"fatal: --pallama-bin {pbin} is not an executable file")
+            log(f"fatal: --blazar-bin {pbin} is not an executable file")
             return 2
-        os.environ["PALLAMA_BIN"] = str(pbin)
+        os.environ["BLAZAR_BIN"] = str(pbin)
     try:
         probe = subprocess.run(
-            [os.environ.get("PALLAMA_BIN", "pallama"), "--version"],
+            [os.environ.get("BLAZAR_BIN", "blazar"), "--version"],
             capture_output=True,
             text=True,
             timeout=30,
             check=False,
         )
         vout = (probe.stdout + probe.stderr).strip()
-        pallama_version = vout.splitlines()[0] if vout else "unknown"
+        blazar_version = vout.splitlines()[0] if vout else "unknown"
     except OSError:
-        pallama_version = "unknown"
-    log(f"pallama sandbox binary: {pallama_version}")
+        blazar_version = "unknown"
+    log(f"blazar sandbox binary: {blazar_version}")
 
     # variant axes are emitted only when the child binary supports the
     # flags (probed, not assumed)
@@ -3375,7 +3375,7 @@ def main() -> int:
             "model": model.name,
             # provenance stamps: rows survive across reruns in one
             # cells.jsonl — a row must carry WHICH binary measured it
-            "pallama_version": pallama_version,
+            "blazar_version": blazar_version,
             "measured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             # env stamp: 5-min loadavg covers the cell window; a contended
             # run (rust-analyzer, parallel builds) is diagnosable later
@@ -3476,78 +3476,78 @@ def main() -> int:
                     rec = {"error": f"direct cell crashed: {exc}"}
                 emit(eng.tag, eng.kind, "direct", params, key, rec)
 
-    # ---- pallama provider (default-config cell per engine + mistral.rs
+    # ---- blazar provider (default-config cell per engine + mistral.rs
     # paged-attn-off variant + soak)
-    if "pallama" in args.providers:
+    if "blazar" in args.providers:
         for eng in engines:
             params = {"config": "default"}
-            key = cell_key(eng.tag, "pallama", params, model.name)
+            key = cell_key(eng.tag, "blazar", params, model.name)
             if key in done:
-                log(f"[pallama {eng.tag}] resumed — skipping")
+                log(f"[blazar {eng.tag}] resumed — skipping")
                 continue
-            log(f"[pallama {eng.tag}] (sandbox, gateway, default profile)")
+            log(f"[blazar {eng.tag}] (sandbox, gateway, default profile)")
             # guard BEFORE the cell: a prior direct-sweep teardown can
             # still hold VRAM when the sandbox child spawns (live-caught
             # 2026-09-11: 502 right after the np4 direct cells)
-            if not mem_guard(2048.0, f"pre-pallama {eng.tag}"):
+            if not mem_guard(2048.0, f"pre-blazar {eng.tag}"):
                 emit(
                     eng.tag,
                     eng.kind,
-                    "pallama",
+                    "blazar",
                     params,
                     key,
                     {"error": "GPU memory floor exceeded before cell"},
                 )
                 continue
             try:
-                rec = run_pallama_cell(
+                rec = run_blazar_cell(
                     eng, gw_model_name, cfg, "sandboxed gateway cell", soak_s=args.soak
                 )
             except Exception as exc:
-                rec = {"error": f"pallama cell crashed: {exc}"}
-            emit(eng.tag, eng.kind, "pallama", params, key, rec)
+                rec = {"error": f"blazar cell crashed: {exc}"}
+            emit(eng.tag, eng.kind, "blazar", params, key, rec)
             if eng.kind == "mistralrs" and not args.skip_variants:
                 params = {"config": "paged_attn_off"}
-                key = cell_key(eng.tag, "pallama", params, model.name)
+                key = cell_key(eng.tag, "blazar", params, model.name)
                 if key in done:
                     continue
-                log(f"[pallama {eng.tag}] (sandbox, gateway, paged-attn off)")
+                log(f"[blazar {eng.tag}] (sandbox, gateway, paged-attn off)")
                 try:
-                    rec = run_pallama_cell(
+                    rec = run_blazar_cell(
                         eng,
                         gw_model_name,
                         cfg,
                         "sandboxed gateway cell, mistralrs_paged_attn=false",
-                        pallama_cfg={"mistralrs_paged_attn": False},
+                        blazar_cfg={"mistralrs_paged_attn": False},
                     )
                 except Exception as exc:
-                    rec = {"error": f"pallama cell crashed: {exc}"}
-                emit(eng.tag, eng.kind, "pallama", params, key, rec)
+                    rec = {"error": f"blazar cell crashed: {exc}"}
+                emit(eng.tag, eng.kind, "blazar", params, key, rec)
 
-        # ---- pallama single-stream variant (slots=1, classic in-VRAM
+        # ---- blazar single-stream variant (slots=1, classic in-VRAM
         # KV): the same-settings cell for the ollama parity question —
-        # ollama serves one slot with KV in VRAM; this pins pallama to
+        # ollama serves one slot with KV in VRAM; this pins blazar to
         # the identical layout so any remaining delta is orchestration,
         # not defaults policy.
         params = {"config": "single-stream"}
-        key = cell_key(eng.tag, "pallama", params, model.name)
+        key = cell_key(eng.tag, "blazar", params, model.name)
         if key in done:
-            log(f"[pallama {eng.tag} single-stream] resumed — skipping")
+            log(f"[blazar {eng.tag} single-stream] resumed — skipping")
         else:
             log(
-                f"[pallama {eng.tag} single-stream] (sandbox, slots=1, kv_unified=false)"
+                f"[blazar {eng.tag} single-stream] (sandbox, slots=1, kv_unified=false)"
             )
             try:
-                rec = run_pallama_cell(
+                rec = run_blazar_cell(
                     eng,
                     gw_model_name,
                     cfg,
                     "sandboxed gateway cell, slots=1 + kv_unified=false",
-                    pallama_cfg={"slots": 1, "kv_unified": False},
+                    blazar_cfg={"slots": 1, "kv_unified": False},
                 )
             except Exception as exc:
-                rec = {"error": f"pallama cell crashed: {exc}"}
-            emit(eng.tag, eng.kind, "pallama", params, key, rec)
+                rec = {"error": f"blazar cell crashed: {exc}"}
+            emit(eng.tag, eng.kind, "blazar", params, key, rec)
     if "ollama" in args.providers:
         params = {"reference": True}
         key = cell_key("ollama-host", "ollama", params, model.name)
@@ -3578,28 +3578,28 @@ def main() -> int:
 
     # ---- idle-wake lane (sleep-vs-expiry: the idle-policy headline)
     if not args.skip_idle:
-        if "pallama" in args.providers:
+        if "blazar" in args.providers:
             for eng in engines:
                 params = {"idle": True}
-                key = cell_key(eng.tag, "idle-pallama", params, model.name)
+                key = cell_key(eng.tag, "idle-blazar", params, model.name)
                 if key in done:
                     continue
-                log(f"[idle-wake pallama {eng.tag}]")
+                log(f"[idle-wake blazar {eng.tag}]")
                 if not mem_guard(2048.0, f"pre-idle {eng.tag}"):
                     emit(
                         eng.tag,
                         eng.kind,
-                        "idle-pallama",
+                        "idle-blazar",
                         params,
                         key,
                         {"error": "GPU memory floor exceeded before cell"},
                     )
                     continue
                 try:
-                    rec = run_pallama_idle_cell(eng, gw_model_name, cfg)
+                    rec = run_blazar_idle_cell(eng, gw_model_name, cfg)
                 except Exception as exc:
                     rec = {"error": f"idle cell crashed: {exc}"}
-                emit(eng.tag, eng.kind, "idle-pallama", params, key, rec)
+                emit(eng.tag, eng.kind, "idle-blazar", params, key, rec)
         if "ollama" in args.providers:
             params = {"idle": True}
             key = cell_key("ollama-host", "idle-ollama", params, model.name)
@@ -3618,29 +3618,29 @@ def main() -> int:
         ctxcurve = tuple(
             int(x) for x in str(args.ctxcurve_sweep).split(",") if x.strip()
         )
-        if "pallama" in args.providers:
+        if "blazar" in args.providers:
             for eng in engines:
                 for ctx in ctxcurve:
                     params = {"ctx": ctx}
-                    key = cell_key(eng.tag, "ctxcurve-pallama", params, model.name)
+                    key = cell_key(eng.tag, "ctxcurve-blazar", params, model.name)
                     if key in done:
                         continue
-                    log(f"[ctxcurve pallama {eng.tag} ctx={ctx}]")
+                    log(f"[ctxcurve blazar {eng.tag} ctx={ctx}]")
                     if not mem_guard(2048.0, f"pre-ctxcurve {eng.tag} {ctx}"):
                         emit(
                             eng.tag,
                             eng.kind,
-                            "ctxcurve-pallama",
+                            "ctxcurve-blazar",
                             params,
                             key,
                             {"error": "GPU memory floor exceeded before cell"},
                         )
                         continue
                     try:
-                        rec = run_pallama_ctx_cell(eng, gw_model_name, ctx, cfg)
+                        rec = run_blazar_ctx_cell(eng, gw_model_name, ctx, cfg)
                     except Exception as exc:
                         rec = {"error": f"ctxcurve cell crashed: {exc}"}
-                    emit(eng.tag, eng.kind, "ctxcurve-pallama", params, key, rec)
+                    emit(eng.tag, eng.kind, "ctxcurve-blazar", params, key, rec)
         if "ollama" in args.providers:
             for ctx in ctxcurve:
                 params = {"ctx": ctx}
@@ -3683,30 +3683,30 @@ def main() -> int:
                     except Exception as exc:
                         rec = {"error": f"conc cell crashed: {exc}"}
                     emit(eng.tag, eng.kind, "conc-direct", params, key, rec)
-            if "pallama" in args.providers:
+            if "blazar" in args.providers:
                 for eng in engines:
                     params = {"conc": level, "rounds": args.conc_rounds}
-                    key = cell_key(eng.tag, "conc-pallama", params, model.name)
+                    key = cell_key(eng.tag, "conc-blazar", params, model.name)
                     if key in done:
                         continue
-                    log(f"[conc pallama {eng.tag} x{level} x{args.conc_rounds}r]")
-                    if not mem_guard(2048.0, f"pre-conc-pallama {eng.tag}"):
+                    log(f"[conc blazar {eng.tag} x{level} x{args.conc_rounds}r]")
+                    if not mem_guard(2048.0, f"pre-conc-blazar {eng.tag}"):
                         emit(
                             eng.tag,
                             eng.kind,
-                            "conc-pallama",
+                            "conc-blazar",
                             params,
                             key,
                             {"error": "GPU memory floor exceeded before cell"},
                         )
                         continue
                     try:
-                        rec = run_pallama_conc_cell(
+                        rec = run_blazar_conc_cell(
                             eng, gw_model_name, level, cfg, rounds=args.conc_rounds
                         )
                     except Exception as exc:
                         rec = {"error": f"conc cell crashed: {exc}"}
-                    emit(eng.tag, eng.kind, "conc-pallama", params, key, rec)
+                    emit(eng.tag, eng.kind, "conc-blazar", params, key, rec)
             if "ollama" in args.providers:
                 params = {"conc": level, "rounds": args.conc_rounds}
                 key = cell_key("ollama-host", "conc-ollama", params, model.name)
@@ -3904,7 +3904,7 @@ def main() -> int:
         feat_rows,
         argv_summary,
         ref_tag,
-        pallama_version,
+        blazar_version,
     )
     log(f"report  -> {md_path}")
     if args.md:
@@ -3938,7 +3938,7 @@ TEST_BED = [
     ("OS", "Linux Mint 22.3, kernel 7.0.0-31-generic"),
     (
         "Runtimes compared",
-        "pallama 0.5.0 gateway - llama.cpp b10809 (Vulkan + CUDA builds) - mistral.rs 0.9.3 - ollama 0.33.3",
+        "blazar 0.5.0 gateway - llama.cpp b10809 (Vulkan + CUDA builds) - mistral.rs 0.9.3 - ollama 0.33.3",
     ),
     (
         "Model",
@@ -3953,15 +3953,15 @@ METHODOLOGY = [
     "Prefill: a token-targeted prompt (~512 tokens via engine /tokenize); run 1 is the cold (uncached) prefill, runs 2+ ride the prompt cache.",
     "Concurrency: 4 parallel streams x 128 generated tokens each; system t/s = total tokens / wall clock; sum-stream t/s = sum of per-stream rates (sum >> system indicates serialization).",
     "Greedy parity: 20 fixed prompts, greedy sampling, 256 tokens; exact-match count and text-similarity ratio vs a same-engine reference run.",
-    "Gateway transparency: a second greedy lane through the pallama gateway with identical sampling; any divergence vs the direct lane isolates translation overhead.",
+    "Gateway transparency: a second greedy lane through the blazar gateway with identical sampling; any divergence vs the direct lane isolates translation overhead.",
     "Perplexity: llama-perplexity on an offline ASCII corpus, ctx 2048.",
     "Cold-start parity: the model file's page cache is dropped (posix_fadvise DONTNEED) and the GPU asserted idle (<512 MiB) before every cold probe on every runtime — a cold load is disk-cold, not memory-warm.",
     "Cold TTFT = first-token latency of the cold probe itself (max_tokens 4, aligned num_ctx 16384 on both runtimes).",
     "ollama daemon boot is only measured with --ollama-service-restart (systemd restart, sudo password via BENCH_SUDO_PASSWORD env, stdin-only); without it the daemon stays warm and the row says so.",
-    "Idle-wake: pallama's reaper sleeps the child at idle_sleep_secs (weights stay RAM-resident, VRAM released) — wake TTFT is a sleep-wake; ollama's keep_alive expiry fully unloads — wake TTFT is a disk reload. The policy column names the semantic; both measured after the policy is observed via /api/ps.",
-    "Long-context curve: per-ctx cells (pallama model_overrides ctx / ollama num_ctx) x 3-run decode suites; each ollama point evicts first so the runner respawns at that ctx.",
+    "Idle-wake: blazar's reaper sleeps the child at idle_sleep_secs (weights stay RAM-resident, VRAM released) — wake TTFT is a sleep-wake; ollama's keep_alive expiry fully unloads — wake TTFT is a disk reload. The policy column names the semantic; both measured after the policy is observed via /api/ps.",
+    "Long-context curve: per-ctx cells (blazar model_overrides ctx / ollama num_ctx) x 3-run decode suites; each ollama point evicts first so the runner respawns at that ctx.",
     "Sustained concurrency: sequential bursts of the parallel-stream lane (default 3 rounds); TTFT p99 aggregates every stream of every round.",
-    "Every pallama row records the spawned engine's argv (slots/context shown in tables) and stamps pallama version, wall clock, 5-min load average, and AC/battery power state; GPU cells refuse to run on battery.",
+    "Every blazar row records the spawned engine's argv (slots/context shown in tables) and stamps blazar version, wall clock, 5-min load average, and AC/battery power state; GPU cells refuse to run on battery.",
 ]
 
 
@@ -3991,10 +3991,10 @@ def engine_label(tag: str) -> str:
 def speed_table(recs: list[dict]) -> str:
     rows = []
     for r in recs:
-        if r.get("provider") == "pallama" and "error" not in r:
+        if r.get("provider") == "blazar" and "error" not in r:
             rows.append(
                 (
-                    f"pallama gateway - {engine_label(r['tag'])}",
+                    f"blazar gateway - {engine_label(r['tag'])}",
                     child_shape(r) or "engine-scheduled",
                     r.get("decode_tps_p50"),
                     r.get("ttft_ms_p50"),
@@ -4063,10 +4063,10 @@ def conc_table(recs: list[dict]) -> str:
     rows = []
     for r in recs:
         prov = r.get("provider")
-        if prov not in ("conc-pallama", "conc-direct", "conc-ollama") or "error" in r:
+        if prov not in ("conc-blazar", "conc-direct", "conc-ollama") or "error" in r:
             continue
-        if prov == "conc-pallama":
-            name = f"pallama gateway - {engine_label(r['tag'])}"
+        if prov == "conc-blazar":
+            name = f"blazar gateway - {engine_label(r['tag'])}"
             shape = child_shape(r) or "engine-scheduled"
         elif prov == "conc-direct":
             name = f"direct engine - {engine_label(r['tag'])}"
@@ -4147,7 +4147,7 @@ def greedy_table(recs: list[dict]) -> str:
         if r.get("provider") == "greedy_gw":
             rows.append(
                 (
-                    f"{engine_label(r['tag'])} through pallama gateway vs direct",
+                    f"{engine_label(r['tag'])} through blazar gateway vs direct",
                     r.get("exact_matches"),
                     r.get("prompts"),
                     r.get("ratio_mean"),
@@ -4237,7 +4237,7 @@ def features_table(recs: list[dict]) -> str:
 def coldstart_table(recs: list[dict]) -> str:
     rows = [
         (
-            f"pallama gateway - {engine_label(r['tag'])}",
+            f"blazar gateway - {engine_label(r['tag'])}",
             r.get("daemon_boot_s"),
             r.get("cold_first_request_s"),
             r.get("cold_ttft_ms"),
@@ -4245,7 +4245,7 @@ def coldstart_table(recs: list[dict]) -> str:
             r.get("rss_peak_mib"),
         )
         for r in recs
-        if r.get("provider") == "pallama" and "error" not in r
+        if r.get("provider") == "blazar" and "error" not in r
     ]
     rows += [
         (
@@ -4292,10 +4292,10 @@ def idle_wake_table(recs: list[dict]) -> str:
     rows = []
     for r in recs:
         prov = r.get("provider")
-        if prov == "idle-pallama" and "error" not in r:
+        if prov == "idle-blazar" and "error" not in r:
             rows.append(
                 (
-                    f"pallama - {engine_label(r['tag'])}",
+                    f"blazar - {engine_label(r['tag'])}",
                     r.get("idle_policy", "sleep ladder"),
                     r.get("slept"),
                     r.get("idle_wake_ttft_ms"),
@@ -4333,10 +4333,10 @@ def ctxcurve_table(recs: list[dict]) -> str:
     rows = []
     for r in recs:
         prov = r.get("provider")
-        if prov == "ctxcurve-pallama" and "error" not in r:
+        if prov == "ctxcurve-blazar" and "error" not in r:
             rows.append(
                 (
-                    f"pallama - {engine_label(r['tag'])}",
+                    f"blazar - {engine_label(r['tag'])}",
                     r.get("ctx"),
                     r.get("decode_tps_p50"),
                     r.get("ttft_ms_p50"),
@@ -4362,7 +4362,7 @@ def ctxcurve_table(recs: list[dict]) -> str:
 
 def executive_summary(recs: list[dict]) -> str:
     gw = {
-        r["tag"]: r for r in recs if r.get("provider") == "pallama" and "error" not in r
+        r["tag"]: r for r in recs if r.get("provider") == "blazar" and "error" not in r
     }
     direct = {
         r["tag"]: r
@@ -4392,7 +4392,7 @@ def executive_summary(recs: list[dict]) -> str:
     conc = {
         r["tag"]: r
         for r in recs
-        if r.get("provider") == "conc-pallama" and "error" not in r
+        if r.get("provider") == "conc-blazar" and "error" not in r
     }
     if conc:
         bits = [
@@ -4422,7 +4422,7 @@ def executive_summary(recs: list[dict]) -> str:
         (
             r
             for r in recs
-            if r.get("provider") == "idle-pallama"
+            if r.get("provider") == "idle-blazar"
             and "error" not in r
             and r.get("slept")
             and r.get("idle_wake_ttft_ms")
@@ -4452,22 +4452,22 @@ def write_publication_report(
     recs: list[dict], artifacts_dir: Path, out_path: Path
 ) -> None:
     versions = {
-        r.get("pallama_version", "").strip().removeprefix("pallama ")
+        r.get("blazar_version", "").strip().removeprefix("blazar ")
         for r in recs
-        if r.get("pallama_version")
+        if r.get("blazar_version")
     }
-    pallama_ver = next(iter(versions)) if len(versions) == 1 else "mixed"
+    blazar_ver = next(iter(versions)) if len(versions) == 1 else "mixed"
     env_states = {
         r.get("power_state", "unstamped")
         for r in recs
-        if r.get("provider") == "pallama"
+        if r.get("provider") == "blazar"
     }
 
     L: list[str] = []
-    L.append("# Pallama inference benchmark")
+    L.append("# Blazar inference benchmark")
     L.append("")
     L.append(
-        f"_Rendered {artifacts_dir.name}; pallama {pallama_ver}; "
+        f"_Rendered {artifacts_dir.name}; blazar {blazar_ver}; "
         f"power state of gateway rows: {', '.join(sorted(env_states))}._"
     )
     L.append("")
@@ -4511,7 +4511,7 @@ def write_publication_report(
     L.append(
         "_Exact-match divergence across GPU backends is expected float nondeterminism "
         "(batch shape and backend kernels), not translation drift; bit-parity across "
-        "runs requires single-slot decoding (pallama `deterministic = true` pins it)._"
+        "runs requires single-slot decoding (blazar `deterministic = true` pins it)._"
     )
     L.append("")
     L.append("### Optimization axes (ctx 4096, single stream)")
@@ -4535,7 +4535,7 @@ def write_publication_report(
     L.append(idle_wake_table(recs))
     L.append("")
     L.append(
-        "_pallama sleeps with weights in RAM (wake = resume); ollama unloads at keep_alive expiry (wake = full disk reload). Policies differ by design — the table measures each runtime's own idle path after the policy verifiably fired._"
+        "_blazar sleeps with weights in RAM (wake = resume); ollama unloads at keep_alive expiry (wake = full disk reload). Policies differ by design — the table measures each runtime's own idle path after the policy verifiably fired._"
     )
     L.append("")
     L.append("### Long-context degradation curve")
@@ -4546,10 +4546,10 @@ def write_publication_report(
     L.append("")
     L += [
         "1. **Gateway overhead is within measurement noise.** Single-stream decode through "
-        "the pallama gateway matches direct engine spawns at the same slots/context (see "
+        "the blazar gateway matches direct engine spawns at the same slots/context (see "
         "speed table); the greedy gateway lane is byte-identical to the direct lane where "
         "sampling is single-slot.",
-        "2. **Capacity-aware slot auto-sizing.** pallama sizes engine slots from live "
+        "2. **Capacity-aware slot auto-sizing.** blazar sizes engine slots from live "
         "hardware census: the 8 GiB card with a vision projector attached spawns 1 slot "
         "(16 Ki context) on the Vulkan build and 4 slots (64 Ki total) on CUDA - measured "
         "oversubscription on Vulkan either fails to boot or degrades 2x, so the cap is "
@@ -4567,7 +4567,7 @@ def write_publication_report(
         "the one cold-prefill outlier below is a first-invocation pipeline-compile "
         "artifact (controlled re-probe measured full-rate steady state).",
         "7. **mistral.rs 0.9.3 with default paged attention cannot fit this model on an "
-        "8 GiB card** (upstream sizes KV as a fraction of total VRAM); pallama's profile "
+        "8 GiB card** (upstream sizes KV as a fraction of total VRAM); blazar's profile "
         "auto-disables paged attention on tight cards and the model then serves correctly.",
     ]
     L.append("")
@@ -4588,7 +4588,7 @@ def write_publication_report(
     L.append("")
     L.append("```bash")
     L.append(
-        "python3 scripts/bench_matrix.py --pallama-bin target/release/pallama --md BENCHMARK.md"
+        "python3 scripts/bench_matrix.py --blazar-bin target/release/blazar --md BENCHMARK.md"
     )
     L.append(
         "python3 scripts/bench_matrix.py --render-only --artifacts-dir <dir> --md BENCHMARK.md"

@@ -1,1 +1,1 @@
-expires_at,model,name,pallama_cache_hit,pallama_ctx,pallama_device,pallama_draft,pallama_endpoint,pallama_engine,pallama_gpu,pallama_heat,pallama_in_flight,pallama_replica,pallama_spec,pallama_state,pallama_warnings,size
+expires_at,model,name,blazar_cache_hit,blazar_ctx,blazar_device,blazar_draft,blazar_endpoint,blazar_engine,blazar_gpu,blazar_heat,blazar_in_flight,blazar_replica,blazar_spec,blazar_state,blazar_warnings,size

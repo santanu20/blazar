@@ -2,7 +2,7 @@
 # shellcheck disable=SC2086 # $SUDO is INTENTIONALLY unquoted throughout:
 # empty means "run unprivileged" (zero words); quoted it would become
 # argv[0]="". Same privilege convention as install.sh.
-# Pallama clean uninstall — removes EVERYTHING install.sh put here plus
+# Blazar clean uninstall — removes EVERYTHING install.sh put here plus
 # per-user state (config, store, engines, caches). Models are the one
 # exception: they are expensive re-downloads, so removal is ASKED, with
 # a safe keep-by-default. For the quick binary+units-only path use:
@@ -12,10 +12,10 @@
 #   1. services + processes   systemd system/user units, launchd plists,
 #                             the running daemon (exact pidfile pid —
 #                             NEVER pkill -f, which self-matches)
-#   2. system artifacts       binary (PALLAMA_SYSTEM_BIN_DIR), unit file,
+#   2. system artifacts       binary (BLAZAR_SYSTEM_BIN_DIR), unit file,
 #                             unit drop-ins, stale ~/.local/bin copy
-#   3. user state             ~/.local/share/pallama minus models;
-#                             ~/.config/pallama is KEPT by default (it
+#   3. user state             ~/.local/share/blazar minus models;
+#                             ~/.config/blazar is KEPT by default (it
 #                             holds your port pin, keys and settings —
 #                             losing it silently re-creates defaults on
 #                             the next install and can collide with
@@ -27,20 +27,20 @@
 #   --dry-run         print every action, remove nothing
 #   --remove-models   non-interactive full nuke (models deleted!)
 #   --keep-models     non-interactive, models explicitly kept
-#   --purge           also remove ~/.config/pallama (config + token)
+#   --purge           also remove ~/.config/blazar (config + token)
 #   --yes             skip prompts using SAFE defaults (models KEPT);
 #                     never implies --remove-models — data deletion is
 #                     opt-in only via the explicit flag
 #   --help            this text
 #
 # Env overrides (testing/mirrors; defaults match install.sh):
-#   PALLAMA_SYSTEM_BIN_DIR   binary location      (default /usr/local/bin)
-#   PALLAMA_UNIT_PATH        systemd unit path    (default
-#                             /etc/systemd/system/pallama.service)
-#   PALLAMA_SYSTEMCTL        systemctl binary     (default systemctl)
-#   PALLAMA_SUDO             sudo wrapper ("" = unprivileged; tests)
+#   BLAZAR_SYSTEM_BIN_DIR   binary location      (default /usr/local/bin)
+#   BLAZAR_UNIT_PATH        systemd unit path    (default
+#                             /etc/systemd/system/blazar.service)
+#   BLAZAR_SYSTEMCTL        systemctl binary     (default systemctl)
+#   BLAZAR_SUDO             sudo wrapper ("" = unprivileged; tests)
 #
-# NEVER touches: ~/.cache/pallama-validate-* (validation harness
+# NEVER touches: ~/.cache/blazar-validate-* (validation harness
 # sandboxes), anything outside the paths above.
 
 set -u
@@ -76,19 +76,19 @@ done
 }
 
 # ollama-style privilege: root runs plain, everyone else needs sudo.
-SUDO="${PALLAMA_SUDO-sudo}"
+SUDO="${BLAZAR_SUDO-sudo}"
 [ "$(id -u)" -eq 0 ] && SUDO=
 
 # Privilege preflight BEFORE any mutation: privileged actions (disable
 # unit, remove binary/unit) must be actionable or we refuse to start.
 # The split-brain alternative (system state kept, user state deleted
 # under a crash-looping restart) is far worse than a clean refusal.
-# Allowed: root; a tty (sudo can prompt); a non-default PALLAMA_SUDO
+# Allowed: root; a tty (sudo can prompt); a non-default BLAZAR_SUDO
 # wrapper (caller owns its auth). Refused: default sudo, no tty, no
 # cached credentials.
 if [ "$(id -u)" -ne 0 ] && [ "$SUDO" = sudo ] && [ "$DRY" != 1 ] &&
     [ ! -t 0 ] && ! sudo -n true 2>/dev/null; then
-    error "sudo cannot run non-interactively (no tty / no cached credentials) — refusing to start a partial uninstall. Re-run from a terminal for the password prompt, or pipe credentials to 'sudo -S', or set PALLAMA_SUDO for CI."
+    error "sudo cannot run non-interactively (no tty / no cached credentials) — refusing to start a partial uninstall. Re-run from a terminal for the password prompt, or pipe credentials to 'sudo -S', or set BLAZAR_SUDO for CI."
 fi
 
 # run <desc> <cmd...>: every mutation goes through here so --dry-run
@@ -112,9 +112,9 @@ run() {
     fi
 }
 
-BIN_DIR="${PALLAMA_SYSTEM_BIN_DIR:-/usr/local/bin}"
-UNIT_PATH="${PALLAMA_UNIT_PATH:-/etc/systemd/system/pallama.service}"
-SYSTEMCTL="${PALLAMA_SYSTEMCTL:-systemctl}"
+BIN_DIR="${BLAZAR_SYSTEM_BIN_DIR:-/usr/local/bin}"
+UNIT_PATH="${BLAZAR_UNIT_PATH:-/etc/systemd/system/blazar.service}"
+SYSTEMCTL="${BLAZAR_SYSTEMCTL:-systemctl}"
 # Run-as-root support (parity with install.sh): under `sudo sh
 # uninstall.sh` $HOME is /root — user-keyed state (config, data, models,
 # user unit) belongs to the INVOKING user, resolved via SUDO_USER.
@@ -125,11 +125,11 @@ if [ "$(id -u)" -eq 0 ] && [ "${SUDO_USER:-}" != "" ] && [ "$SUDO_USER" != "root
         _hm=$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory 2>/dev/null | awk '{print $NF}')
     [ -n "$_hm" ] && USER_HOME="$_hm"
 fi
-CONFIG_DIR="$USER_HOME/.config/pallama"
-DATA_DIR="$USER_HOME/.local/share/pallama"
+CONFIG_DIR="$USER_HOME/.config/blazar"
+DATA_DIR="$USER_HOME/.local/share/blazar"
 MODELS_DIR="$DATA_DIR/models"
 WHISPER_MODELS_DIR="$DATA_DIR/whisper/models"
-USER_UNIT="$USER_HOME/.config/systemd/user/pallama.service"
+USER_UNIT="$USER_HOME/.config/systemd/user/blazar.service"
 UNIT_DROPIN="$UNIT_PATH.d"
 
 # ---------------------------------------------------------------- 1. stop
@@ -137,32 +137,32 @@ status "stopping services and daemons"
 
 # Ask the CLI to stop engine children gracefully first (best-effort;
 # the pidfile TERM below still applies when the CLI is already gone).
-if [ "$DRY" != 1 ] && command -v "$BIN_DIR/pallama" >/dev/null 2>&1; then
-    "$BIN_DIR/pallama" stop >/dev/null 2>&1 || true
+if [ "$DRY" != 1 ] && command -v "$BIN_DIR/blazar" >/dev/null 2>&1; then
+    "$BIN_DIR/blazar" stop >/dev/null 2>&1 || true
 fi
 
 if command -v "$SYSTEMCTL" >/dev/null 2>&1; then
     if [ -e "$UNIT_PATH" ] || [ "$DRY" = 1 ]; then
-        run "systemctl disable --now pallama" $SUDO "$SYSTEMCTL" disable --now pallama
+        run "systemctl disable --now blazar" $SUDO "$SYSTEMCTL" disable --now blazar
         run "systemctl daemon-reload" $SUDO "$SYSTEMCTL" daemon-reload
     fi
     if [ -e "$USER_UNIT" ]; then
-        run "systemctl --user disable --now pallama" systemctl --user disable --now pallama
+        run "systemctl --user disable --now blazar" systemctl --user disable --now blazar
         run "systemctl --user daemon-reload" systemctl --user daemon-reload
     fi
 fi
 
 if [ "$(uname -s)" = Darwin ]; then
-    run "launchctl bootout gui/$(id -u)/dev.pallama" \
-        launchctl bootout "gui/$(id -u)/dev.pallama"
-    run "launchctl bootout system/dev.pallama" \
-        $SUDO launchctl bootout system/dev.pallama
+    run "launchctl bootout gui/$(id -u)/dev.blazar" \
+        launchctl bootout "gui/$(id -u)/dev.blazar"
+    run "launchctl bootout system/dev.blazar" \
+        $SUDO launchctl bootout system/dev.blazar
 fi
 
 # User-started daemon (not service-managed): TERM the exact pidfile pid.
 # NEVER pkill/pgrep -f — the pattern self-matches this script's own
 # invocation line (documented incident class).
-PIDFILE="$DATA_DIR/run/pallama.pid"
+PIDFILE="$DATA_DIR/run/blazar.pid"
 if [ -f "$PIDFILE" ]; then
     _pid=$(cat "$PIDFILE" 2>/dev/null || true)
     case "$_pid" in
@@ -183,14 +183,14 @@ if [ -f "$PIDFILE" ]; then
 fi
 
 # Stray sweep (Linux): any process whose EXECUTABLE is the system binary
-# itself — pidfile-less manual `pallama serve &`, a deleted-pidfile
+# itself — pidfile-less manual `blazar serve &`, a deleted-pidfile
 # daemon. Exact /proc/<pid>/exe match only (no name patterns to
 # self-match); foreign-XDG daemons running OTHER binaries are not ours
 # to kill.
-if [ "$(uname -s)" = Linux ] && [ -e "$BIN_DIR/pallama" ]; then
+if [ "$(uname -s)" = Linux ] && [ -e "$BIN_DIR/blazar" ]; then
     _strays=
     for _p in /proc/[0-9]*/exe; do
-        [ "$(readlink "$_p" 2>/dev/null)" = "$BIN_DIR/pallama" ] || continue
+        [ "$(readlink "$_p" 2>/dev/null)" = "$BIN_DIR/blazar" ] || continue
         _spid=${_p#/proc/}
         _spid=${_spid%/exe}
         [ "$_spid" = "$$" ] && continue
@@ -215,12 +215,12 @@ fi
 
 # ------------------------------------------------------- 2. system files
 status "removing system artifacts"
-if [ -e "$BIN_DIR/pallama" ] || [ "$DRY" = 1 ]; then
-    run "remove $BIN_DIR/pallama" $SUDO rm -f "$BIN_DIR/pallama"
+if [ -e "$BIN_DIR/blazar" ] || [ "$DRY" = 1 ]; then
+    run "remove $BIN_DIR/blazar" $SUDO rm -f "$BIN_DIR/blazar"
 fi
-if [ -e "$USER_HOME/.local/bin/pallama" ]; then
-    run "remove stale user-path copy ~/.local/bin/pallama" \
-        rm -f "$USER_HOME/.local/bin/pallama"
+if [ -e "$USER_HOME/.local/bin/blazar" ]; then
+    run "remove stale user-path copy ~/.local/bin/blazar" \
+        rm -f "$USER_HOME/.local/bin/blazar"
 fi
 if [ -e "$UNIT_PATH" ]; then
     run "remove unit $UNIT_PATH" $SUDO rm -f "$UNIT_PATH"
@@ -232,10 +232,10 @@ if [ -e "$USER_UNIT" ]; then
     run "remove legacy user unit $USER_UNIT" rm -f "$USER_UNIT"
 fi
 if [ "$(uname -s)" = Darwin ]; then
-    [ -e "$USER_HOME/Library/LaunchAgents/dev.pallama.plist" ] &&
-        run "remove launch agent plist" rm -f "$USER_HOME/Library/LaunchAgents/dev.pallama.plist"
-    [ -e /Library/LaunchDaemons/dev.pallama.plist ] &&
-        run "remove launch daemon plist" $SUDO rm -f /Library/LaunchDaemons/dev.pallama.plist
+    [ -e "$USER_HOME/Library/LaunchAgents/dev.blazar.plist" ] &&
+        run "remove launch agent plist" rm -f "$USER_HOME/Library/LaunchAgents/dev.blazar.plist"
+    [ -e /Library/LaunchDaemons/dev.blazar.plist ] &&
+        run "remove launch daemon plist" $SUDO rm -f /Library/LaunchDaemons/dev.blazar.plist
 fi
 
 # --------------------------------------------------------- 3. user state
@@ -253,9 +253,9 @@ status "removing regenerable user state (store + engines + caches)"
 # config snapshots, audit log, KV sessions, spec caches — all regenerable
 # or re-downloadable) so a declined model removal leaves the directory
 # itself intact.
-# pallama.db plus its SQLite WAL sidecars (-wal, -shm) that can outlive
+# blazar.db plus its SQLite WAL sidecars (-wal, -shm) that can outlive
 # the db file after a daemon shutdown — orphaned checkpoints, not data.
-for _sub in pallama.db pallama.db-wal pallama.db-shm engines run snapshots log sessions speccache; do
+for _sub in blazar.db blazar.db-wal blazar.db-shm engines run snapshots log sessions speccache; do
     [ -e "$DATA_DIR/$_sub" ] &&
         run "remove $DATA_DIR/$_sub" rm -rf "$DATA_DIR/$_sub"
 done
@@ -310,7 +310,7 @@ if [ "$FAILURES" -gt 0 ]; then
     status "INCOMPLETE: ${FAILURES} action(s) failed — re-run and investigate the [FAIL] lines above"
     exit 1
 fi
-status "done. pallama fully removed (validation sandboxes under ~/.cache untouched)"
+status "done. blazar fully removed (validation sandboxes under ~/.cache untouched)"
 # NOT `[ ... ] && status` as the last line: a false test there becomes the
 # script's exit status (POSIX footgun; --remove-models runs used to exit 1
 # after a flawless uninstall).

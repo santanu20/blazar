@@ -66,7 +66,7 @@ jobs:
         if: matrix.smoke == true
         shell: bash
         run: |
-          exe="target/${{ matrix.target }}/release/pallama"
+          exe="target/${{ matrix.target }}/release/blazar"
           if [ "${{ runner.os }}" = "Windows" ]; then exe="$exe.exe"; fi
           "$exe" --version
           "$exe" --help > /dev/null
@@ -79,10 +79,10 @@ jobs:
           target="${{ matrix.target }}"
           stage="$(mktemp -d)/stage"
           mkdir -p "$stage"
-          cp "target/$target/release/pallama" "$stage/"
+          cp "target/$target/release/blazar" "$stage/"
           cp LICENSE-MIT LICENSE-APACHE "$stage/"
-          # Flat root: pallama + LICENSE-* directly inside the archive.
-          tar -czf "pallama-$tag-$target.tar.gz" -C "$stage" .
+          # Flat root: blazar + LICENSE-* directly inside the archive.
+          tar -czf "blazar-$tag-$target.tar.gz" -C "$stage" .
 
       - name: Package (windows)
         if: runner.os == 'Windows'
@@ -90,16 +90,16 @@ jobs:
         run: |
           $tag = $env:GITHUB_REF_NAME
           $target = "${{ matrix.target }}"
-          $stage = Join-Path $env:RUNNER_TEMP "pallama-stage"
+          $stage = Join-Path $env:RUNNER_TEMP "blazar-stage"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item "target/$target/release/pallama.exe" $stage
+          Copy-Item "target/$target/release/blazar.exe" $stage
           Copy-Item LICENSE-MIT, LICENSE-APACHE $stage
-          Compress-Archive -Path "$stage/*" -DestinationPath "pallama-$tag-$target.zip"
+          Compress-Archive -Path "$stage/*" -DestinationPath "blazar-$tag-$target.zip"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pallama-${{ matrix.target }}
-          path: pallama-*.*
+          name: blazar-${{ matrix.target }}
+          path: blazar-*.*
           if-no-files-found: error
 
   release:
@@ -123,7 +123,7 @@ jobs:
 
           Linux / macOS (WSL included):
 
-              curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/$GITHUB_REF_NAME/scripts/install.sh | PALLAMA_REPO=${GITHUB_REPOSITORY} sh
+              curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/$GITHUB_REF_NAME/scripts/install.sh | BLAZAR_REPO=${GITHUB_REPOSITORY} sh
 
           (or clone and run \`sh scripts/install.sh --build\` to compile from source)
 
@@ -132,13 +132,13 @@ jobs:
               irm https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/$GITHUB_REF_NAME/scripts/install.ps1 | iex
 
           Installers verify each asset's sha256 against the GitHub release metadata
-          before installing (the same mechanism as \`pallama engine update\`).
+          before installing (the same mechanism as \`blazar engine update\`).
 
           ## What's inside
 
-          One static-or-gnu \`pallama\` binary per target plus license texts. The
+          One static-or-gnu \`blazar\` binary per target plus license texts. The
           inference engine (\`llama-server\`) is NOT bundled: run
-          \`pallama engine update\` after install to fetch the official upstream
+          \`blazar engine update\` after install to fetch the official upstream
           build for your GPU.
           EOF
           gh release create "$GITHUB_REF_NAME" dist/* \
@@ -148,7 +148,7 @@ jobs:
 
   # Real-OS validation of the just-published installers: download via the
   # GitHub API, sha256-verify, extract, PATH, service lane. Engine
-  # bootstrap stays off (PALLAMA_INSTALL_ENGINE=0): the engine vendor
+  # bootstrap stays off (BLAZAR_INSTALL_ENGINE=0): the engine vendor
   # matrix has its own coverage; this job proves the INSTALLER lanes.
   installer-smoke:
     name: installer smoke (${{ matrix.os }})
@@ -166,8 +166,8 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         env:
-          PALLAMA_REPO: ${{ github.repository }}
-          PALLAMA_INSTALL_ENGINE: '0'
+          BLAZAR_REPO: ${{ github.repository }}
+          BLAZAR_INSTALL_ENGINE: '0'
         run: |
           for i in 1 2 3 4; do
             if sh scripts/install.sh; then break; fi
@@ -178,13 +178,13 @@ jobs:
           # install.sh installs to /usr/local/bin (no user-local
           # fallback by policy — F161: the old ~/.local/bin PATH export
           # pointed at a location the installer no longer uses).
-          command -v pallama
-          pallama --version
+          command -v blazar
+          blazar --version
       - name: Install (ps1)
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          PALLAMA_INSTALL_ENGINE: '0'
+          BLAZAR_INSTALL_ENGINE: '0'
         run: |
           for ($i = 1; $i -le 4; $i++) {
             # Child pwsh: the installer's Fail() exits its session, a
@@ -195,4 +195,4 @@ jobs:
             Write-Host "retry $i/3 (asset digests may still be computing)"
             Start-Sleep -Seconds 30
           }
-          & "$env:LOCALAPPDATA\Programs\pallama\pallama.exe" --version
+          & "$env:LOCALAPPDATA\Programs\blazar\blazar.exe" --version

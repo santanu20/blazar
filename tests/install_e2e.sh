@@ -17,7 +17,7 @@
 # The fake release JSON puts a decoy asset with a WRONG digest first, so a
 # parser bug that grabs a sibling asset's digest fails this test.
 #
-# Requires: python3, curl, sha256sum, target/release/pallama (host build),
+# Requires: python3, curl, sha256sum, target/release/blazar (host build),
 # and target/release/stub-llama-server (cargo build --release --features
 # test-util --bin stub-llama-server) for case 4.
 
@@ -25,7 +25,7 @@ set -eu
 
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 INSTALL_SH="$ROOT/scripts/install.sh"
-BIN="$ROOT/target/release/pallama"
+BIN="$ROOT/target/release/blazar"
 
 [ -f "$BIN" ] || { echo "FAIL: $BIN not built — run: cargo build --release"; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "FAIL: python3 required"; exit 1; }
@@ -43,15 +43,15 @@ case "$LDD_OUT" in
 esac
 TARGET="${RUST_ARCH}-unknown-linux-${LIBC}"
 TAG=v0.1.0
-ASSET="pallama-${TAG}-${TARGET}.tar.gz"
-DECOY="pallama-${TAG}-aarch64-unknown-linux-gnu.tar.gz"
-[ "$RUST_ARCH" = aarch64 ] && DECOY="pallama-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
+ASSET="blazar-${TAG}-${TARGET}.tar.gz"
+DECOY="blazar-${TAG}-aarch64-unknown-linux-gnu.tar.gz"
+[ "$RUST_ARCH" = aarch64 ] && DECOY="blazar-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
 
 TMP=$(mktemp -d)
 SRV="$TMP/srv"
 mkdir -p "$SRV" "$TMP/home"
 
-# Hermetic HOME means hermetic XDG too: pallama resolves its config/data
+# Hermetic HOME means hermetic XDG too: blazar resolves its config/data
 # roots via the dirs crate, which prefers XDG_CONFIG_HOME/XDG_DATA_HOME
 # over $HOME/.config. CI images export XDG_CONFIG_HOME machine-wide
 # (GitHub runners: /etc/environment), so an unpinned XDG would point the
@@ -78,14 +78,14 @@ esac
 EOF
 chmod +x "$TMP/fakesystemctl"
 : > "$TMP/systemctl.log"
-UNIT_OUT="$TMP/pallama.service"
+UNIT_OUT="$TMP/blazar.service"
 SYSTEM_BIN="$TMP/system-bin"
 SERVER_PID=
 
 # Package the host binary exactly like the release workflow: flat root.
 STAGE="$TMP/stage"
 mkdir -p "$STAGE"
-cp "$BIN" "$STAGE/pallama"
+cp "$BIN" "$STAGE/blazar"
 cp "$ROOT/LICENSE-MIT" "$ROOT/LICENSE-APACHE" "$STAGE/"
 tar -czf "$SRV/$ASSET" -C "$STAGE" .
 SHA=$(sha256sum "$SRV/$ASSET" | cut -d' ' -f1)
@@ -110,7 +110,7 @@ class H(http.server.BaseHTTPRequestHandler):
             else:
                 self.send_error(404)
         elif self.path.startswith('/repos/ggml-org/llama.cpp/releases'):
-            # Engine lane (PALLAMA_GH_BASE points GhClient here): the
+            # Engine lane (BLAZAR_GH_BASE points GhClient here): the
             # releases list is all latest_b_release needs.
             meta = os.path.join(srv_dir, 'llama-releases.json')
             if os.path.exists(meta):
@@ -143,7 +143,7 @@ SERVER_PID=$!
 
 BASE="http://127.0.0.1:${PORT}"
 
-INSTALL_ENV="HOME=$TMP/home PALLAMA_INSTALL_BASE_URL=$BASE PALLAMA_SUDO=$TMP/fakesudo PALLAMA_SYSTEMCTL=$TMP/fakesystemctl PALLAMA_SYSTEM_BIN_DIR=$SYSTEM_BIN PALLAMA_UNIT_PATH=$UNIT_OUT PALLAMA_INSTALL_ENGINE=0"
+INSTALL_ENV="HOME=$TMP/home BLAZAR_INSTALL_BASE_URL=$BASE BLAZAR_SUDO=$TMP/fakesudo BLAZAR_SYSTEMCTL=$TMP/fakesystemctl BLAZAR_SYSTEM_BIN_DIR=$SYSTEM_BIN BLAZAR_UNIT_PATH=$UNIT_OUT BLAZAR_INSTALL_ENGINE=0"
 
 # Readiness probe: the decoy asset exists before the server starts; release
 # metadata is written per test case below.
@@ -163,20 +163,20 @@ printf '{"tag_name":"%s","assets":[{"name":"%s","digest":"sha256:0000","browser_
     "$TAG" "$DECOY" "$BASE" "$DECOY" "$ASSET" "$SHA" "$BASE" "$ASSET" > "$SRV/release.json"
 
 OUT=$(env $INSTALL_ENV sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
-if [ "$RC" = 0 ] && [ -x "$SYSTEM_BIN/pallama" ] && "$SYSTEM_BIN/pallama" --version >/dev/null 2>&1; then
+if [ "$RC" = 0 ] && [ -x "$SYSTEM_BIN/blazar" ] && "$SYSTEM_BIN/blazar" --version >/dev/null 2>&1; then
     ok "system install succeeded, binary runs ($TARGET)"
 else
     bad "install failed (rc=$RC)"; echo "$OUT" | sed 's/^/    /'
 fi
 [ -f "$UNIT_OUT" ] && ok "systemd unit written" || bad "no unit at $UNIT_OUT"
 grep -q "Restart=always" "$UNIT_OUT" 2>/dev/null && ok "unit Restart=always" || bad "unit lacks Restart=always"
-grep -q "ExecStart=$SYSTEM_BIN/pallama serve" "$UNIT_OUT" 2>/dev/null &&
+grep -q "ExecStart=$SYSTEM_BIN/blazar serve" "$UNIT_OUT" 2>/dev/null &&
     ok "unit ExecStart points at the installed binary" || bad "unit ExecStart wrong"
 grep -q '^MemoryHigh=85%$' "$UNIT_OUT" 2>/dev/null &&
     ok "unit MemoryHigh default 85%" || bad "unit lacks MemoryHigh=85%"
-# PALLAMA_UNIT_MEMORY_HIGH='' must omit the line (operator opt-out)
+# BLAZAR_UNIT_MEMORY_HIGH='' must omit the line (operator opt-out)
 rm -rf "$UNIT_OUT"
-OUT=$(env $INSTALL_ENV PALLAMA_UNIT_MEMORY_HIGH= sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
+OUT=$(env $INSTALL_ENV BLAZAR_UNIT_MEMORY_HIGH= sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
 if [ "$RC" = 0 ] && [ -f "$UNIT_OUT" ] && ! grep -q '^MemoryHigh=' "$UNIT_OUT"; then
     ok "empty memory knob omits MemoryHigh line"
 else
@@ -196,7 +196,7 @@ printf '{"tag_name":"%s","assets":[{"name":"%s","digest":"sha256:%s","browser_do
 
 rm -rf "$SYSTEM_BIN" "$UNIT_OUT"
 OUT=$(env $INSTALL_ENV sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
-if [ "$RC" != 0 ] && [ ! -e "$SYSTEM_BIN/pallama" ]; then
+if [ "$RC" != 0 ] && [ ! -e "$SYSTEM_BIN/blazar" ]; then
     ok "tampered digest rejected, nothing installed"
 else
     bad "tampered digest NOT rejected (rc=$RC)"
@@ -209,7 +209,7 @@ printf '{"tag_name":"%s","assets":[{"name":"%s","digest":"sha256:0000","browser_
 
 rm -rf "$SYSTEM_BIN" "$UNIT_OUT"
 OUT=$(env $INSTALL_ENV sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
-if [ "$RC" != 0 ] && [ ! -e "$SYSTEM_BIN/pallama" ]; then
+if [ "$RC" != 0 ] && [ ! -e "$SYSTEM_BIN/blazar" ]; then
     ok "missing-asset release rejected, nothing installed"
 else
     bad "missing asset NOT rejected (rc=$RC)"
@@ -241,17 +241,17 @@ if [ "$(uname -m)" = x86_64 ] && [ -x "$STUB" ]; then
         "$ETAG" "$EASSET" "$ESA" "$ESZ" "$BASE" "$EASSET" > "$SRV/llama-releases.json"
     # Pin the asset pick (config engine_asset = Exact candidate) and a
     # port that cannot clash with any real daemon.
-    mkdir -p "$TMP/home/.config/pallama"
-    printf 'engine_asset = "ubuntu-x86_64"\nport = 11499\n' > "$TMP/home/.config/pallama/config.toml"
+    mkdir -p "$TMP/home/.config/blazar"
+    printf 'engine_asset = "ubuntu-x86_64"\nport = 11499\n' > "$TMP/home/.config/blazar/config.toml"
 
-    ENGINE_ENV="HOME=$TMP/home PALLAMA_INSTALL_BASE_URL=$BASE PALLAMA_GH_BASE=$BASE PALLAMA_SUDO=$TMP/fakesudo PALLAMA_SYSTEMCTL=$TMP/fakesystemctl PALLAMA_SYSTEM_BIN_DIR=$SYSTEM_BIN PALLAMA_UNIT_PATH=$UNIT_OUT"
+    ENGINE_ENV="HOME=$TMP/home BLAZAR_INSTALL_BASE_URL=$BASE BLAZAR_GH_BASE=$BASE BLAZAR_SUDO=$TMP/fakesudo BLAZAR_SYSTEMCTL=$TMP/fakesystemctl BLAZAR_SYSTEM_BIN_DIR=$SYSTEM_BIN BLAZAR_UNIT_PATH=$UNIT_OUT"
     OUT=$(env $ENGINE_ENV sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
     if [ "$RC" = 0 ] && echo "$OUT" | grep -q "engine bootstrap complete"; then
         ok "one-click: engine bootstrapped during install"
     else
         bad "engine bootstrap did not complete (rc=$RC)"; echo "$OUT" | sed 's/^/    /'
     fi
-    LIST=$(env HOME=$TMP/home PALLAMA_GH_BASE= "$SYSTEM_BIN/pallama" engine list 2>/dev/null) || LIST=
+    LIST=$(env HOME=$TMP/home BLAZAR_GH_BASE= "$SYSTEM_BIN/blazar" engine list 2>/dev/null) || LIST=
     echo "$LIST" | grep -q "$ETAG.*\[active\]" &&
         ok "engine ${ETAG} installed and ACTIVE (persisted in store)" ||
         bad "engine not active after install: $LIST"
@@ -273,7 +273,7 @@ printf '%s\n' "\$*" > "$MARKER"
 exit 1
 EOF
 chmod +x "$TMP/fake-bootstrap"
-BUILD_ENV="HOME=$TMP/home PALLAMA_SUDO=$TMP/fakesudo PALLAMA_SYSTEMCTL=$TMP/fakesystemctl PALLAMA_SYSTEM_BIN_DIR=$SYSTEM_BIN PALLAMA_UNIT_PATH=$UNIT_OUT PALLAMA_INSTALL_ENGINE=0 PALLAMA_CHECKOUT=$ROOT PALLAMA_BOOTSTRAP=$TMP/fake-bootstrap PALLAMA_FORCE_BOOTSTRAP=1"
+BUILD_ENV="HOME=$TMP/home BLAZAR_SUDO=$TMP/fakesudo BLAZAR_SYSTEMCTL=$TMP/fakesystemctl BLAZAR_SYSTEM_BIN_DIR=$SYSTEM_BIN BLAZAR_UNIT_PATH=$UNIT_OUT BLAZAR_INSTALL_ENGINE=0 BLAZAR_CHECKOUT=$ROOT BLAZAR_BOOTSTRAP=$TMP/fake-bootstrap BLAZAR_FORCE_BOOTSTRAP=1"
 OUT=$(env $BUILD_ENV sh "$INSTALL_SH" --build 2>&1) && RC=0 || RC=$?
 if [ "$RC" != 0 ] && [ "$(cat "$MARKER" 2>/dev/null)" = "--minimal" ]; then
     ok "--build ran the bootstrap (--minimal) and failed hard"
@@ -281,7 +281,7 @@ else
     bad "--build bootstrap not run/not fatal (rc=$RC, argv=$(cat "$MARKER" 2>/dev/null))"
 fi
 echo "$OUT" | grep -q "toolchain bootstrap failed" && ok "bootstrap failure reported loudly" || bad "no bootstrap-failure warning"
-[ ! -e "$SYSTEM_BIN/pallama" ] && ok "nothing installed after failed --build" || bad "binary installed despite failed --build"
+[ ! -e "$SYSTEM_BIN/blazar" ] && ok "nothing installed after failed --build" || bad "binary installed despite failed --build"
 
 # --- 6. unit SupplementaryGroups only for groups that exist ------------------
 # install.sh filters render/video through /etc/group; the generated unit
@@ -312,7 +312,7 @@ fi
 
 # --- 7. armv7 host mapping: picks the static musleabihf asset -----------------
 # A fake uname (first on PATH) reports armv7l/Linux; the release lane must
-# derive pallama-<tag>-armv7-unknown-linux-musleabihf.tar.gz. The staged
+# derive blazar-<tag>-armv7-unknown-linux-musleabihf.tar.gz. The staged
 # tarball carries the host binary so the install completes; the point is
 # the asset-name mapping. x86_64 host only (binary must still run).
 if [ "$(uname -m)" = x86_64 ]; then
@@ -326,7 +326,7 @@ case "$1" in
 esac
 EOF
     chmod +x "$TMP/fakebin/uname"
-    ARM_ASSET="pallama-${TAG}-armv7-unknown-linux-musleabihf.tar.gz"
+    ARM_ASSET="blazar-${TAG}-armv7-unknown-linux-musleabihf.tar.gz"
     tar -czf "$SRV/$ARM_ASSET" -C "$STAGE" .
     ARM_SHA=$(sha256sum "$SRV/$ARM_ASSET" | cut -d' ' -f1)
     printf '{"tag_name":"%s","assets":[{"name":"%s","digest":"sha256:%s","browser_download_url":"%s/download/%s"}]}' \
@@ -345,7 +345,7 @@ else
 fi
 
 # --- 8. GPU preflight: wiring, opt-out, driverless-NVIDIA lane ----------------
-# (a) full-flow wiring: PALLAMA_AUTO_DRIVER=0 reaches the preflight and
+# (a) full-flow wiring: BLAZAR_AUTO_DRIVER=0 reaches the preflight and
 #     skips it; (b) function-level: a driverless NVIDIA PCI census drives
 #     the apt driver lane (fake apt-get records its argv) with the REBOOT
 #     + engine-update messaging — no real package is touched.
@@ -353,8 +353,8 @@ rm -rf "$SYSTEM_BIN" "$UNIT_OUT" "${TMP:?}/home"
 mkdir -p "$TMP/home"
 printf '{"tag_name":"%s","assets":[{"name":"%s","digest":"sha256:%s","browser_download_url":"%s/download/%s"}]}' \
     "$TAG" "$ASSET" "$SHA" "$BASE" "$ASSET" > "$SRV/release.json"
-OUT=$(env $INSTALL_ENV PALLAMA_AUTO_DRIVER=0 sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "GPU preflight skipped (PALLAMA_AUTO_DRIVER=0)"; then
+OUT=$(env $INSTALL_ENV BLAZAR_AUTO_DRIVER=0 sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "GPU preflight skipped (BLAZAR_AUTO_DRIVER=0)"; then
     ok "full flow: GPU preflight wired and opt-out honored"
 else
     bad "GPU preflight opt-out not observed in full flow (rc=$RC)"
@@ -397,7 +397,7 @@ if echo "$OUT" | grep -q "NVIDIA GPU detected (PCI 10de:) but no NVIDIA driver u
 else
     bad "driverless NVIDIA lane did not fire"; echo "$OUT" | sed 's/^/    /'
 fi
-echo "$OUT" | grep -q "REBOOT REQUIRED, then run: pallama engine update" &&
+echo "$OUT" | grep -q "REBOOT REQUIRED, then run: blazar engine update" &&
     ok "driverless NVIDIA: REBOOT + engine-update chain in message" ||
     bad "missing REBOOT/engine-update guidance"
 echo "$OUT" | grep -q "newest CUDA build this driver supports" &&
@@ -409,7 +409,7 @@ cat > "$GPDIR/run.sh" <<EOF
 status() { echo ">>> \$*"; }
 SUDO="$TMP/fakesudo"
 PATH="$GPDIR/scratch"
-PALLAMA_AUTO_DRIVER=0
+BLAZAR_AUTO_DRIVER=0
 . "$GPDIR/fn.sh"
 gpu_preflight
 EOF
@@ -424,23 +424,23 @@ echo
 # --- 9. uninstall.sh flag matrix + install deferred-start ordering ---------
 
 UNINSTALL="$ROOT/scripts/uninstall.sh"
-UENV="HOME=$TMP/home PALLAMA_SUDO=$TMP/fakesudo PALLAMA_SYSTEMCTL=$TMP/fakesystemctl PALLAMA_SYSTEM_BIN_DIR=$SYSTEM_BIN PALLAMA_UNIT_PATH=$UNIT_OUT"
+UENV="HOME=$TMP/home BLAZAR_SUDO=$TMP/fakesudo BLAZAR_SYSTEMCTL=$TMP/fakesystemctl BLAZAR_SYSTEM_BIN_DIR=$SYSTEM_BIN BLAZAR_UNIT_PATH=$UNIT_OUT"
 
 stage_installed() {
     rm -rf "${TMP:?}/home" "${SYSTEM_BIN:?}" ; mkdir -p "$TMP/home"
-    D="$TMP/home/.local/share/pallama"
+    D="$TMP/home/.local/share/blazar"
     mkdir -p "$D/models" "$D/engines/b1" "$D/whisper/models" "$D/whisper/bin" "$D/run" \
-             "$TMP/home/.config/pallama" "$SYSTEM_BIN"
+             "$TMP/home/.config/blazar" "$SYSTEM_BIN"
     echo gguf > "$D/models/qwen3-0.6b-q4_0.gguf"
     echo ggml > "$D/whisper/models/ggml-base.bin"
     echo bin  > "$D/whisper/bin/whisper-server"
-    echo db   > "$D/pallama.db"
-    echo wal  > "$D/pallama.db-wal"
-    echo shm  > "$D/pallama.db-shm"
-    echo pid  > "$D/run/pallama.pid"
-    echo cfg  > "$TMP/home/.config/pallama/config.toml"
-    printf '#!/bin/sh\nexit 0\n' > "$SYSTEM_BIN/pallama"
-    chmod +x "$SYSTEM_BIN/pallama"
+    echo db   > "$D/blazar.db"
+    echo wal  > "$D/blazar.db-wal"
+    echo shm  > "$D/blazar.db-shm"
+    echo pid  > "$D/run/blazar.pid"
+    echo cfg  > "$TMP/home/.config/blazar/config.toml"
+    printf '#!/bin/sh\nexit 0\n' > "$SYSTEM_BIN/blazar"
+    chmod +x "$SYSTEM_BIN/blazar"
     printf '[Unit]\n' > "$UNIT_OUT"
 }
 
@@ -448,33 +448,33 @@ stage_installed() {
 stage_installed
 env $UENV sh "$UNINSTALL" --dry-run --keep-models >/dev/null 2>&1 </dev/null
 [ $? -eq 0 ] && ok "uninstall --dry-run exits 0" || bad "uninstall --dry-run exits 0"
-[ -f "$SYSTEM_BIN/pallama" ] && [ -f "$TMP/home/.local/share/pallama/pallama.db" ] \
+[ -f "$SYSTEM_BIN/blazar" ] && [ -f "$TMP/home/.local/share/blazar/blazar.db" ] \
     && ok "uninstall --dry-run removed nothing" || bad "uninstall --dry-run removed nothing"
 
 # 9b. --keep-models --yes (the once-destructive combo): models KEPT, all
 # regenerable state + WAL sidecars gone, config kept.
 stage_installed
 env $UENV sh "$UNINSTALL" --keep-models --yes >/dev/null 2>&1 </dev/null
-D="$TMP/home/.local/share/pallama"
+D="$TMP/home/.local/share/blazar"
 [ -f "$D/models/qwen3-0.6b-q4_0.gguf" ] && ok "uninstall --yes keeps gguf models" || bad "uninstall --yes keeps gguf models"
 [ -f "$D/whisper/models/ggml-base.bin" ] && ok "uninstall --yes keeps whisper models" || bad "uninstall --yes keeps whisper models"
-[ ! -e "$D/pallama.db" ] && [ ! -e "$D/pallama.db-wal" ] && [ ! -e "$D/pallama.db-shm" ] \
+[ ! -e "$D/blazar.db" ] && [ ! -e "$D/blazar.db-wal" ] && [ ! -e "$D/blazar.db-shm" ] \
     && ok "uninstall removes db + WAL sidecars" || bad "uninstall removes db + WAL sidecars"
-[ ! -d "$D/engines" ] && [ ! -d "$D/whisper/bin" ] && [ ! -e "$SYSTEM_BIN/pallama" ] && [ ! -e "$UNIT_OUT" ] \
+[ ! -d "$D/engines" ] && [ ! -d "$D/whisper/bin" ] && [ ! -e "$SYSTEM_BIN/blazar" ] && [ ! -e "$UNIT_OUT" ] \
     && ok "uninstall removes engines, whisper bins, system binary, unit" || bad "uninstall removes engines, whisper bins, system binary, unit"
-[ -f "$TMP/home/.config/pallama/config.toml" ] && ok "uninstall keeps config (no --purge)" || bad "uninstall keeps config (no --purge)"
+[ -f "$TMP/home/.config/blazar/config.toml" ] && ok "uninstall keeps config (no --purge)" || bad "uninstall keeps config (no --purge)"
 
 # 9c. --yes --remove-models conflicts hard BEFORE any mutation.
 stage_installed
 env $UENV sh "$UNINSTALL" --yes --remove-models >/dev/null 2>&1 </dev/null && RC=0 || RC=$?
 [ "$RC" -ne 0 ] && ok "uninstall --yes --remove-models refused" || bad "uninstall --yes --remove-models refused"
-[ -f "$TMP/home/.local/share/pallama/models/qwen3-0.6b-q4_0.gguf" ] && [ -f "$SYSTEM_BIN/pallama" ] \
+[ -f "$TMP/home/.local/share/blazar/models/qwen3-0.6b-q4_0.gguf" ] && [ -f "$SYSTEM_BIN/blazar" ] \
     && ok "refused uninstall mutated nothing" || bad "refused uninstall mutated nothing"
 
 # 9d. --remove-models alone is the explicit full nuke.
 stage_installed
 env $UENV sh "$UNINSTALL" --remove-models >/dev/null 2>&1 </dev/null && RC=0 || RC=$?
-D="$TMP/home/.local/share/pallama"
+D="$TMP/home/.local/share/blazar"
 [ "$RC" = 0 ] && ok "uninstall --remove-models completes" || bad "uninstall --remove-models completes (rc=$RC)"
 [ ! -e "$D/models/qwen3-0.6b-q4_0.gguf" ] && ok "uninstall --remove-models removes gguf models" || bad "uninstall --remove-models removes gguf models"
 [ ! -e "$D/whisper/models/ggml-base.bin" ] && ok "uninstall --remove-models removes whisper models" || bad "uninstall --remove-models removes whisper models"
@@ -488,12 +488,12 @@ env $UENV sh "$UNINSTALL" --remove-models --yes >/dev/null 2>&1 </dev/null && RC
 stage_installed
 mkdir -p "$TMP/fakesbin"
 printf '#!/bin/sh\nexit 1\n' > "$TMP/fakesbin/sudo"; chmod +x "$TMP/fakesbin/sudo"
-env -u PALLAMA_SUDO HOME="$TMP/home" PATH="$TMP/fakesbin:$PATH" \
-    PALLAMA_SYSTEMCTL="$TMP/fakesystemctl" PALLAMA_SYSTEM_BIN_DIR="$SYSTEM_BIN" \
-    PALLAMA_UNIT_PATH="$UNIT_OUT" \
+env -u BLAZAR_SUDO HOME="$TMP/home" PATH="$TMP/fakesbin:$PATH" \
+    BLAZAR_SYSTEMCTL="$TMP/fakesystemctl" BLAZAR_SYSTEM_BIN_DIR="$SYSTEM_BIN" \
+    BLAZAR_UNIT_PATH="$UNIT_OUT" \
     sh "$UNINSTALL" --keep-models >/dev/null 2>&1 </dev/null && RC=0 || RC=$?
 [ "$RC" -ne 0 ] && ok "uninstall preflight refuses non-tty default sudo" || bad "uninstall preflight refuses non-tty default sudo"
-[ -f "$SYSTEM_BIN/pallama" ] && [ -f "$TMP/home/.local/share/pallama/pallama.db" ] \
+[ -f "$SYSTEM_BIN/blazar" ] && [ -f "$TMP/home/.local/share/blazar/blazar.db" ] \
     && ok "preflight refusal mutated nothing" || bad "preflight refusal mutated nothing"
 
 # 9f. install deferred-start ordering: fresh install enables WITHOUT --now,
@@ -503,25 +503,25 @@ printf '{"tag_name":"%s","assets":[{"name":"%s","digest":"sha256:%s","browser_do
     "$TAG" "$ASSET" "$SHA" "$BASE" "$ASSET" > "$SRV/release.json"
 : > "$TMP/systemctl.log"
 OUT=$(env $INSTALL_ENV sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
-if grep -qx 'enable pallama' "$TMP/systemctl.log" && ! grep -q 'enable --now pallama' "$TMP/systemctl.log"; then
+if grep -qx 'enable blazar' "$TMP/systemctl.log" && ! grep -q 'enable --now blazar' "$TMP/systemctl.log"; then
     ok "fresh install enables without --now"
 else
     bad "fresh install enables without --now"
 fi
-if grep -qx 'start pallama' "$TMP/systemctl.log"; then
+if grep -qx 'start blazar' "$TMP/systemctl.log"; then
     ok "fresh install explicitly starts the unit"
 else
     bad "fresh install explicitly starts the unit"
 fi
-if [ "$(grep -nx 'enable pallama\|start pallama' "$TMP/systemctl.log" | head -1 | cut -d: -f1)" \
-     -lt "$(grep -nx 'start pallama' "$TMP/systemctl.log" | head -1 | cut -d: -f1)" ]; then
+if [ "$(grep -nx 'enable blazar\|start blazar' "$TMP/systemctl.log" | head -1 | cut -d: -f1)" \
+     -lt "$(grep -nx 'start blazar' "$TMP/systemctl.log" | head -1 | cut -d: -f1)" ]; then
     ok "enable precedes start"
 else
     bad "enable precedes start"
 fi
 
-# 9g. health poll target pin: the fallback port must be pallama's 11435,
-# never ollama's 11434 (it answers green while pallama is dead). Comments
+# 9g. health poll target pin: the fallback port must be blazar's 11435,
+# never ollama's 11434 (it answers green while blazar is dead). Comments
 # may name 11434 to document the hazard; functional code may not.
 sed 's/#.*$//' "$ROOT/scripts/install.sh" | grep -q 11434 &&
     bad "install.sh functionally references 11434" ||

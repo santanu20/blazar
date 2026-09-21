@@ -1,0 +1,31 @@
+{
+  "version": "VERSION",
+  "description": "Multi-engine local inference server: OpenAI, ollama and Anthropic APIs",
+  "homepage": "https://github.com/santanu20/blazar",
+  "license": "MIT OR Apache-2.0",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/santanu20/blazar/releases/download/VERSION/blazar-VERSION-x86_64-pc-windows-msvc.zip",
+      "hash": "FILL_PER_RELEASE"
+    },
+    "arm64": {
+      "url": "https://github.com/santanu20/blazar/releases/download/VERSION/blazar-VERSION-aarch64-pc-windows-msvc.zip",
+      "hash": "FILL_PER_RELEASE"
+    }
+  },
+  "bin": "blazar.exe",
+  "checkver": {
+    "github": "https://github.com/santanu20/blazar"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/santanu20/blazar/releases/download/$version/blazar-$version-x86_64-pc-windows-msvc.zip"
+      },
+      "arm64": {
+        "url": "https://github.com/santanu20/blazar/releases/download/$version/blazar-$version-aarch64-pc-windows-msvc.zip"
+      }
+    }
+  },
+  "notes": "Run 'blazar doctor' after install to verify config, engine, and hardware."
+}

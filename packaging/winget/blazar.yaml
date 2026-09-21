@@ -1,0 +1,23 @@
+# winget manifest template for blazar.
+# Publishing: winget-pkgs PR (or your own repo). Fill Version
+# + InstallerSha256 per release; the asset is the same Windows zip the
+# install.ps1 channel uses.
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.singleton.1.6.0.schema.json
+PackageIdentifier: santanu20.blazar
+PackageVersion: VERSION
+PackageName: blazar
+Publisher: santanu20
+License: MIT OR Apache-2.0
+ShortDescription: Multi-engine local inference server (OpenAI, ollama, Anthropic APIs)
+PackageUrl: https://github.com/santanu20/blazar
+Installers:
+  - Architecture: x64
+    InstallerType: zip
+    InstallerUrl: https://github.com/santanu20/blazar/releases/download/VERSION/blazar-VERSION-x86_64-pc-windows-msvc.zip
+    InstallerSha256: FILL_PER_RELEASE
+    NestedInstallerType: portable
+    NestedInstallerFiles:
+      - RelativeFilePath: blazar.exe
+        PortableCommandAlias: blazar
+ManifestType: singleton
+ManifestVersion: 1.6.0
