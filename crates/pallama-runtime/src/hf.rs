@@ -139,10 +139,18 @@ pub struct HfSibling {
     pub lfs: Option<HfLfs>,
 }
 
+/// `expand[]=gguf` aggregate over a repo's GGUF files. `total` is the
+/// PARAMETER COUNT (not bytes — never render it as a size); the actual
+/// on-disk bytes live in `totalFileSize` (sum over every `.gguf`, all
+/// quants). `architecture`/`context_length` are read from the first
+/// GGUF's header metadata and may be absent when the Hub could not
+/// parse a file (live: leejet/* image GGUFs carry no architecture).
 #[derive(Debug, Clone, Deserialize)]
 pub struct HfGgufInfo {
     #[serde(default)]
     pub total: Option<u64>,
+    #[serde(default, rename = "totalFileSize")]
+    pub total_file_size: Option<u64>,
     #[serde(default)]
     pub architecture: Option<String>,
     #[serde(default)]
@@ -194,13 +202,63 @@ fn dtype_width_bytes(dtype: &str) -> Option<u64> {
 
 /// `expand[]=config` summary — enough to label ARCH without pulling
 /// `config.json` per repo (`max_position_embeddings` is NOT part of the
-/// search expansion, so context stays a GGUF-only column).
+/// search expansion, so context stays a GGUF-only column). Diffusers
+/// repos have no root `config.json`; their pipeline class arrives under
+/// `diffusers._class_name` (live: `QwenImage21Pipeline`) and is the only
+/// arch signal the search response carries for them.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct HfConfigSummary {
     #[serde(default)]
     pub architectures: Option<Vec<String>>,
     #[serde(default)]
     pub model_type: Option<String>,
+    #[serde(default)]
+    pub diffusers: Option<HfDiffusersSummary>,
+}
+
+/// The `config.diffusers` sub-object of the search expansion.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct HfDiffusersSummary {
+    #[serde(default, rename = "_class_name")]
+    pub class_name: Option<String>,
+}
+
+impl HfConfigSummary {
+    /// ARCH ladder for one repo: `model_type` > first `architectures`
+    /// entry (lowercased) > diffusers pipeline class as a snake-case
+    /// token (`QwenImage21Pipeline` → `qwen_image21`, `FluxPipeline`
+    /// → `flux`). `None` when the Hub carried none of the three.
+    #[must_use]
+    pub fn arch_hint(&self) -> Option<String> {
+        if let Some(mt) = self.model_type.as_ref().filter(|m| !m.is_empty()) {
+            return Some(mt.clone());
+        }
+        if let Some(first) = self.architectures.as_ref().and_then(|a| a.first()) {
+            return Some(first.to_ascii_lowercase());
+        }
+        self.diffusers
+            .as_ref()
+            .and_then(|d| d.class_name.as_deref())
+            .and_then(pipeline_class_to_arch)
+    }
+}
+
+/// `QwenImage21Pipeline` → `qwen_image21`: strip the trailing
+/// `Pipeline`, split camel-case words, lowercase, join with `_`.
+/// Digits stay glued to the preceding word (`Image21` → `image21`).
+fn pipeline_class_to_arch(class: &str) -> Option<String> {
+    let stem = class.strip_suffix("Pipeline").unwrap_or(class);
+    if stem.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(stem.len() + 4);
+    for (i, ch) in stem.chars().enumerate() {
+        if i > 0 && ch.is_uppercase() {
+            out.push('_');
+        }
+        out.push(ch.to_ascii_lowercase());
+    }
+    Some(out)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -923,29 +981,71 @@ pub struct SearchEntry {
 /// - a trailing `-NNNNN-of-NNNNN` shard marker is stripped first;
 /// - the token is the last `.`/`-`-separated segment, matching either
 ///   the literal `fp16` or an `iq`/`tq`/`bf`/`q`/`f` prefix followed by
-///   a required ASCII digit and `[A-Za-z0-9_]*`.
+///   a required ASCII digit and `[A-Za-z0-9_]*`;
+/// - segments are scanned right-to-left, so the trailing segment stays
+///   authoritative (`model.q4` is q4) and a double extension
+///   (`Q4_K_M.GGUF.gguf`) still finds the quant past the `gguf` noise
+///   segment;
+/// - when a whole segment carries a leading release token glued with `_`
+///   (live: `qwen_image_2.1_Q5_K_M` — the version dot ends the
+///   `-`/`.`-segment at `1_Q5_K_M`), the longest `_`-separated suffix
+///   tail that matches the grammar is the token;
+/// - when the leaf carries no token at all, the parent folder is tried
+///   (`Q4_K_M/model.gguf` layouts name the quant in the folder).
 ///
 /// `q4_k_m`, `iq4_xs`, `f16`, `bf16`, `f32` match; model-size tags
 /// (`3b`), dates (`2511`) and finetune words (`heretic`) don't — the
 /// required digit after the prefix is what separates them.
 fn quant_token_of(fname: &str) -> Option<String> {
     let lower = fname.to_ascii_lowercase();
-    let leaf = lower.rsplit('/').next().unwrap_or(&lower);
+    let mut path = lower.rsplit('/');
+    let leaf = path.next().unwrap_or(&lower);
     if leaf.starts_with("mmproj") {
         return None;
     }
     let stem = strip_shard_tail(leaf.strip_suffix(".gguf").unwrap_or(leaf));
-    let last = stem.rsplit(['.', '-']).next()?;
-    if last == "fp16" {
-        return Some(last.to_string());
+    if let Some(token) = quant_token_in_stem(stem) {
+        return Some(token);
+    }
+    let parent = path.next()?;
+    if parent.starts_with("mmproj") {
+        return None;
+    }
+    quant_token_in_stem(parent)
+}
+
+/// First quant token in one file stem: `.`/`-` segments right-to-left,
+/// each tried whole then as `_`-suffix tails. Right-to-left keeps the
+/// trailing segment authoritative; earlier segments only fire when the
+/// last one carries no token (double-extension `Q4_K_M.GGUF` shapes).
+fn quant_token_in_stem(stem: &str) -> Option<String> {
+    for seg in stem.rsplit(['.', '-']) {
+        if let Some(token) = quant_prefix_match(seg) {
+            return Some(token);
+        }
+        let parts: Vec<&str> = seg.split('_').collect();
+        if let Some(token) =
+            (1..parts.len()).find_map(|k| quant_prefix_match(&parts[k..].join("_")))
+        {
+            return Some(token);
+        }
+    }
+    None
+}
+
+/// One grammar atom: `fp16` verbatim, or an `iq`/`tq`/`bf`/`q`/`f`
+/// prefix followed by a required ASCII digit and `[A-Za-z0-9_]*`.
+fn quant_prefix_match(seg: &str) -> Option<String> {
+    if seg == "fp16" {
+        return Some(seg.to_string());
     }
     for prefix in ["iq", "tq", "bf", "q", "f"] {
-        if let Some(rest) = last.strip_prefix(prefix) {
+        if let Some(rest) = seg.strip_prefix(prefix) {
             let mut chars = rest.chars();
             if matches!(chars.next(), Some(d) if d.is_ascii_digit())
                 && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
             {
-                return Some(last.to_string());
+                return Some(seg.to_string());
             }
         }
     }
@@ -1004,6 +1104,15 @@ fn quant_token(filename: &str) -> Option<String> {
         return None;
     }
     quant_token_of(filename).map(|t| t.to_ascii_uppercase())
+}
+
+/// True when a bare search token IS a quant name (`q4`, `Q4_K_M`,
+/// `iq4_xs`, `f16`) — the CLI lifts such tokens out of the text query
+/// into its client-side quant filter. Strict by construction: `qwen`,
+/// `gguf`, `awq`, `int4` fail the grammar and stay query text.
+#[must_use]
+pub fn is_quant_token(token: &str) -> bool {
+    quant_prefix_match(&token.to_ascii_lowercase()).is_some()
 }
 
 impl HfClient {
@@ -2309,6 +2418,59 @@ mod tests {
         assert!(p.contains("filter=a%26b%3Dc"), "{p}");
     }
 
+    #[test]
+    fn unit__search_entry__decodes_live_hub_expand_shapes() {
+        // Byte-for-byte shapes from a live `api/models?expand[]=…`
+        // response (Qwen-Image-2.1 search, trimmed to the fields under
+        // test): `totalFileSize` beside the parameter-count `total`, the
+        // diffusers pipeline class, and repos where the Hub simply lacks
+        // a field (leejet/* gguf carries no architecture).
+        let decode = |body: &str| serde_json::from_str::<SearchEntry>(body).unwrap();
+        let gguf_row = decode(
+            r#"{"id":"Abiray/Qwen-Image-2.1-GGUF","gguf":{"total":7115124736,
+                "architecture":"qwen_image","totalFileSize":3185944736}}"#,
+        );
+        assert_eq!(gguf_row.gguf.as_ref().unwrap().total, Some(7_115_124_736));
+        assert_eq!(
+            gguf_row.gguf.as_ref().unwrap().total_file_size,
+            Some(3_185_944_736)
+        );
+        let no_arch_row = decode(
+            r#"{"id":"leejet/Qwen-Image-2.1-GGUF","gguf":{"total":7115124736,
+                "totalFileSize":2561716256}}"#,
+        );
+        assert_eq!(no_arch_row.gguf.as_ref().unwrap().architecture, None);
+        let diffusers_row = decode(
+            r#"{"id":"Qwen/Qwen-Image-2.1","config":{"diffusers":
+                {"_class_name":"QwenImage21Pipeline"}}}"#,
+        );
+        assert_eq!(
+            diffusers_row.config.as_ref().unwrap().arch_hint(),
+            Some("qwen_image21".to_string())
+        );
+    }
+
+    #[test]
+    fn unit__pipeline_class_to_arch__camel_split_and_edge_cases() {
+        // Pipeline classes → snake-case arch tokens; digits glue to the
+        // preceding word.
+        assert_eq!(
+            pipeline_class_to_arch("QwenImage21Pipeline"),
+            Some("qwen_image21".to_string())
+        );
+        assert_eq!(
+            pipeline_class_to_arch("FluxPipeline"),
+            Some("flux".to_string())
+        );
+        assert_eq!(
+            pipeline_class_to_arch("StableDiffusion3Pipeline"),
+            Some("stable_diffusion3".to_string())
+        );
+        // Degenerate inputs: nothing to show, no panic.
+        assert_eq!(pipeline_class_to_arch("Pipeline"), None);
+        assert_eq!(pipeline_class_to_arch(""), None);
+    }
+
     /// Minimal `SearchEntry` — only the re-rank inputs matter.
     fn se(id: &str, downloads: u64, likes: u64) -> SearchEntry {
         SearchEntry {
@@ -2512,9 +2674,105 @@ mod tests {
     }
 
     #[test]
+    fn unit__quant_tokens__version_glued_quant_after_underscore() {
+        // Live shape (Abiray/AlperKTS Qwen-Image GGUFs): the version dot
+        // ends the `.`/`-`-segment at `1_Q5_K_M`, so the quant only
+        // parses as a `_`-suffix tail. Before this grammar extension the
+        // QUANTS column showed `-` and `pull :Q5_K_M` fell back to the
+        // smallest file.
+        assert_eq!(
+            quant_tokens([
+                "qwen_image_2.1_Q3_K_M.gguf",
+                "qwen_image_2.1_Q5_K_M.gguf",
+                "qwen_image_2.1_Q8_0.gguf",
+            ]),
+            ["Q3_K_M", "Q5_K_M", "Q8_0"]
+        );
+        // Release-glued fp16 also parses; dates still don't.
+        assert_eq!(
+            quant_tokens(["model_2.1_fp16.gguf", "Nanbeige4-3B-2511.gguf"]),
+            ["FP16"]
+        );
+    }
+
+    #[test]
+    fn unit__select_files__version_glued_quant_matches_request() {
+        // Same repo shape as above, through the real pull path: the
+        // requested quant must select its file, not the smallest
+        // fallback.
+        let sib = |name: &str| HfSibling {
+            rfilename: name.to_string(),
+            size: Some(1_000_000),
+            lfs: None,
+        };
+        let siblings = [
+            sib("qwen_image_2.1_Q5_K_M.gguf"),
+            sib("qwen_image_2.1_Q8_0.gguf"),
+            sib("README.md"),
+        ];
+        let picked = select_files(&siblings, "q5_k_m").unwrap();
+        assert_eq!(picked.shards.len(), 1);
+        assert_eq!(picked.shards[0].filename, "qwen_image_2.1_Q5_K_M.gguf");
+        assert_eq!(picked.quant, "q5_k_m");
+        assert!(!picked.quant_fallback);
+    }
+
+    #[test]
     fn unit__quant_tokens__dedups_case_insensitively() {
         let files = ["m.Q8_0.gguf", "m-q8_0.gguf"];
         assert_eq!(quant_tokens(files), ["Q8_0"]);
+    }
+
+    #[test]
+    fn unit__quant_tokens__double_extension_and_folder_layouts() {
+        // Double extension (live: ~200/4346 scanned GGUFs, e.g. Q3_K_S.GGUF.gguf
+        // mirror shapes): the trailing `gguf` segment is noise, the segment
+        // before it names the quant.
+        assert_eq!(
+            quant_tokens(["Q4_K_M.GGUF.gguf", "Q3_K_S.GGUF.gguf"]),
+            ["Q3_K_S", "Q4_K_M"]
+        );
+        // Quant named in the parent folder, plain leaf (live: 5/4346 files).
+        assert_eq!(quant_tokens(["Q4_K_M/model.gguf"]), ["Q4_K_M"]);
+        assert_eq!(quant_tokens(["Q8_0/ggml-model.gguf"]), ["Q8_0"]);
+        // Projector folders stay excluded exactly like mmproj leaves.
+        assert_eq!(
+            quant_tokens(["mmproj/model.gguf", "mmproj-f16.gguf"]),
+            Vec::<String>::new()
+        );
+        // Non-quant folders and tag-tail leaves stay empty.
+        assert_eq!(
+            quant_tokens([
+                "docs/qwen2.5.gguf",
+                "model.gguf",
+                "Nanbeige4-3B-Thinking.gguf"
+            ]),
+            Vec::<String>::new()
+        );
+        // Right-to-left order keeps the trailing segment authoritative.
+        assert_eq!(quant_tokens(["model.q4.gguf"]), ["Q4"]);
+    }
+
+    #[test]
+    fn unit__is_quant_token__grammar_exact_bare_tokens_only() {
+        for yes in [
+            "q4", "Q4_K_M", "iq4_xs", "f16", "BF16", "fp16", "q8_0_v2", "q4_0_4_4", "tq1_0",
+        ] {
+            assert!(is_quant_token(yes), "{yes}");
+        }
+        for no in [
+            "qwen",
+            "gguf",
+            "awq",
+            "gptq",
+            "int4",
+            "8bit",
+            "q4.5",
+            "qwen_image_2.1",
+            "",
+        ] {
+            assert!(!is_quant_token(no), "{no}");
+        }
     }
 
     #[test]
