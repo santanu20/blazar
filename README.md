@@ -1,5 +1,9 @@
 # blazar
 
+> **Renamed:** this project shipped as **pallama** until v0.10.0 — same
+> binary, new name. Old links redirect; point installs at `blazar` from
+> now on.
+
 [![CI](https://github.com/santanu20/blazar/actions/workflows/ci.yml/badge.svg)](https://github.com/santanu20/blazar/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/santanu20/blazar?include_prereleases)](https://github.com/santanu20/blazar/releases)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue)](#license)
