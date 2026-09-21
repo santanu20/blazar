@@ -6,6 +6,13 @@ tracked here.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-21
+
+### Changed
+
+- **Project renamed: `pallama` → `blazar`.** Crates (`blazar-core`, `blazar-runtime`, `blazar-gateway`, `blazar-cli`), the binary, the `BLAZAR_*` env prefix, XDG dirs (`~/.config/blazar`, `~/.local/share/blazar`) and every install URL now carry the new name. Pre-1.0 break, no migration: existing installs should re-run the install script and re-pull models from their plain `.gguf` files. The repo rename keeps old GitHub links redirecting; this changelog keeps the historical name in older entries.
+- **The product repo no longer hosts llama.cpp builds.** The legacy `engine-cuda` + `overlay-freshness` workflows (hourly cron) published upstream llama.cpp CUDA builds as `bNNNN-cuda` releases here — third-party binaries on the product release page, consumed by no default code path. Deleted outright. The prebuilt CUDA channel consumes upstream `ggml-org/llama.cpp` official ubuntu-cuda assets directly (same-release first, then scan-back); `BLAZAR_ENGINE_REPO` remains the supported opt-in for operators who publish their own overlay builds.
+
 ### Fixed
 
 - **Parallel-lane pulls now resume at byte granularity instead of restarting from zero.** The parallel download lane (default ≥8 connections for files ≥32 MiB) split files into 8–128 MiB chunks but persisted its `.part.progress` resume ledger only when a whole chunk finished — with chunks spread across connections, none finished until the file was nearly complete, so any interrupt (Ctrl-C, network drop, daemon kill) left a full-length sparse `.part` with no ledger and the next pull hit the orphan heuristic and re-fetched every byte. The sidecar is now v2 with an aria2-style per-chunk ledger: it is seeded the moment the lane engages, workers count only bytes that survived a positional write (refunding counters when a retried attempt rewinds), and the coordinator snapshots every pending chunk's verified prefix on a 1s cadence plus immediately on each chunk completion. A re-pull continues each chunk exactly at its persisted prefix — verified live against registry.ollama.ai (three interrupted sessions of qwen3:0.6b, 523 MiB: 22 MiB → 246 MiB → 260 MiB, every chunk prefix strictly growing, zero orphan re-fetches). v1 sidecars (done-chunks only) load unchanged and keep their guarantees; the classic single-stream lane and the orphan path (full-length `.part` with no ledger at all — sparse holes are unresolvable) are untouched.
