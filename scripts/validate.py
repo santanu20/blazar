@@ -3559,7 +3559,8 @@ def _gateway_route_paths() -> set[str]:
     )
     if not os.path.exists(src):
         return set()
-    text = open(src, encoding="utf-8").read()
+    with open(src, encoding="utf-8") as f:
+        text = f.read()
     return set(re.findall(r'\.route\(\s*"([^"]+)"', text))
 
 
@@ -6742,20 +6743,20 @@ def phase_commands() -> None:
         reg(
             "search.format",
             p3.returncode == 0 and "REPO" in p3.stdout and "FORMAT" in p3.stdout,
-            f"rc={p3.returncode} rows={len([l for l in p3.stdout.splitlines() if '/' in l])}",
+            f"rc={p3.returncode} rows={len([line for line in p3.stdout.splitlines() if '/' in line])}",
         )
         # --quant post-filters rows on real file quants; bare q4 token is
         # lifted out of the text query (stderr carries the filter notice,
         # stdout stays clean).
         p4 = cli("search", "qwen", "0.5b", "q4", timeout=120)
-        rows4 = [l for l in p4.stdout.splitlines() if "/" in l]
+        rows4 = [line for line in p4.stdout.splitlines() if "/" in line]
         reg(
             "search.quant",
             p4.returncode == 0 and bool(rows4) and "quant filter: q4" in p4.stderr,
             f"rc={p4.returncode} rows={len(rows4)} notice={'quant filter: q4' in p4.stderr}",
         )
         p5 = cli("search", "qwen", "0.5b", "--quant", "q4", "--json", timeout=120)
-        jrows = [json.loads(l) for l in p5.stdout.splitlines() if l.strip()]
+        jrows = [json.loads(line) for line in p5.stdout.splitlines() if line.strip()]
         # full per-row quants (the table's +N collapse can hide the Q4
         # family), so family correctness is pinned here.
         reg(
@@ -7680,9 +7681,9 @@ def phase_commands() -> None:
         # EDITOR=cat turns the $EDITOR spawn into a harmless print: rc0,
         # config bytes untouched — proves the spawn path without a UI.
         cfgp2 = os.path.join(SANDBOX.config_dir, "config.toml")
-        before = open(cfgp2, "rb").read() if os.path.exists(cfgp2) else b""
+        before = Path(cfgp2).read_bytes() if os.path.exists(cfgp2) else b""
         p = cli("config", "edit", extra_env={"EDITOR": "cat"})
-        after = open(cfgp2, "rb").read() if os.path.exists(cfgp2) else b""
+        after = Path(cfgp2).read_bytes() if os.path.exists(cfgp2) else b""
         reg(
             "config.edit",
             p.returncode == 0 and before == after,
@@ -7715,9 +7716,9 @@ def phase_commands() -> None:
         rows = []
         try:
             rows = [
-                json.loads(l)
-                for l in p.stdout.splitlines()
-                if l.strip().startswith("{")
+                json.loads(line)
+                for line in p.stdout.splitlines()
+                if line.strip().startswith("{")
             ]
         except Exception:
             rows = []
@@ -7749,9 +7750,9 @@ def phase_commands() -> None:
                 filtered = []
                 try:
                     filtered = [
-                        json.loads(l)
-                        for l in q.stdout.splitlines()
-                        if l.strip().startswith("{")
+                        json.loads(line)
+                        for line in q.stdout.splitlines()
+                        if line.strip().startswith("{")
                     ]
                 except Exception:
                     filtered = []
@@ -7950,7 +7951,7 @@ def phase_commands() -> None:
         # --verify: re-hash the just-pulled model against its store row —
         # must pass while the model is still in the store (pre-rm).
         if new and not transient:
-            v = _pull_retry("pull", sorted(new)[0], "--verify", timeout=240)
+            v = _pull_retry("pull", min(new), "--verify", timeout=240)
             reg(
                 "pull.verify",
                 v.returncode == 0,
@@ -8659,7 +8660,8 @@ def _env_override_surface() -> tuple[set[str], dict[str, str]]:
     )
     if not os.path.exists(src):
         return set(), {}
-    text = open(src, encoding="utf-8").read()
+    with open(src, encoding="utf-8") as f:
+        text = f.read()
     vars_ = set(re.findall(r'env\("PALLAMA_([A-Z0-9_]+)"\)', text))
     # parse_u16("PALLAMA_PORT", &v) → PALLAMA_PORT: u16
     types = {
@@ -9571,7 +9573,7 @@ def _pyspy_reexec_if_requested(args: list[str]) -> None:
 def _jsonl(stdout: str) -> list:
     """Parse JSONL output (one object per line); unparseable -> empty."""
     try:
-        return [json.loads(l) for l in stdout.splitlines() if l.strip()]
+        return [json.loads(line) for line in stdout.splitlines() if line.strip()]
     except json.JSONDecodeError:
         return []
 
@@ -9620,7 +9622,6 @@ _FLAG_EVIDENCE: dict[str, dict[str, str]] = {
         "--slots": "tune.slots",
         "--ngram": "tune.ngram",
         "--load": "tune.load",
-        "--replicas": "tune.replicas",
         "--replicas": "tune.replicas",
         "--cache-reuse": "tune.cache-reuse",
     },
