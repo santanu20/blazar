@@ -787,6 +787,154 @@ impl Engine for MistralRsEngine {
     }
 }
 
+/// sd.cpp engine (`sd-server` from leejet/stable-diffusion.cpp). Dialect
+/// differences that shaped this impl (verified against
+/// stable-diffusion.cpp master-890-74988b2):
+/// - the server refuses to boot without model arguments (`model_path/
+///   diffusion_model` required) and binds its port only after the model
+///   set loads — connection-refused during a health poll is the normal
+///   loading phase, not a crash signal.
+/// - no `/health` route (404): readiness is `GET /v1/models` answering
+///   200 with an OpenAI-shaped `{"data":[...]}` body (a single synthetic
+///   `sd-cpp-local` entry), and `POST /v1/images/generations` speaks the
+///   `OpenAI` images dialect (`{"created", "data":[{"b64_json"}],
+///   "output_format":"png"}`) with only `prompt` required.
+/// - `--list-devices` prints `NAME<TAB>description` lines (no MiB), a
+///   different shape from llama's — parsed by `parse_sd_devices`.
+/// - release binaries carry RUNPATH `$ORIGIN` (verified via readelf),
+///   so sibling `libggml*.so` resolve with no env wiring.
+/// - no unix-socket transport: `--listen-ip`/`--listen-port` only.
+pub struct SdCppEngine {
+    pub manifest: crate::engine::manifest::Manifest,
+    /// HTTP client for health polls (children are loopback).
+    http: reqwest::Client,
+    /// Extra env injected into children (config `engine_env`).
+    pub child_env: Vec<(String, String)>,
+}
+
+impl SdCppEngine {
+    #[must_use]
+    pub fn new(manifest: crate::engine::manifest::Manifest) -> Self {
+        Self::with_env(manifest, Vec::new())
+    }
+
+    #[must_use]
+    pub fn with_env(
+        manifest: crate::engine::manifest::Manifest,
+        env: Vec<(String, String)>,
+    ) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("health client");
+        Self {
+            manifest,
+            http,
+            child_env: env,
+        }
+    }
+
+    fn base_url(endpoint: &Endpoint) -> String {
+        match endpoint {
+            Endpoint::Tcp { host, port } => format!("http://{host}:{port}"),
+            Endpoint::Unix { .. } => String::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl Engine for SdCppEngine {
+    fn kind(&self) -> blazar_core::engine_kind::EngineKind {
+        blazar_core::engine_kind::EngineKind::SdCpp
+    }
+
+    fn capabilities(&self) -> &crate::engine::manifest::Manifest {
+        &self.manifest
+    }
+
+    fn build_argv(
+        &self,
+        _model: &blazar_core::ModelRow,
+        profile: &Profile,
+        endpoint: &Endpoint,
+    ) -> Vec<String> {
+        let _ = endpoint;
+        profile.argv.clone()
+    }
+
+    async fn spawn(&self, argv: &[String], endpoint: &Endpoint) -> Result<ChildHandle> {
+        if matches!(endpoint, Endpoint::Unix { .. }) {
+            return Err(anyhow!(
+                "sdcpp engines have no unix-socket transport; set \
+                 child_transport = \"tcp\" in the blazar config"
+            ));
+        }
+        spawn_child(&self.manifest.server_path, argv, endpoint, &self.child_env)
+    }
+
+    async fn enumerate_devices(&self) -> Result<Option<Vec<crate::engine::manifest::DeviceDesc>>> {
+        if !self.manifest.flags.iter().any(|f| f == "--list-devices") {
+            return Ok(None);
+        }
+        let mut cmd = tokio::process::Command::new(&self.manifest.server_path);
+        cmd.arg("--list-devices")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        for (k, v) in &self.child_env {
+            cmd.env(k, v);
+        }
+        let listed = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output()).await;
+        match listed {
+            Ok(Ok(out)) => {
+                let text = String::from_utf8_lossy(&out.stdout).to_string();
+                let devs = crate::engine::manifest::parse_sd_devices(&text);
+                if devs.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(devs))
+                }
+            }
+            // Listing failure must never block serving: skip validation.
+            Ok(Err(_)) | Err(_) => Ok(None),
+        }
+    }
+
+    async fn health_check(&self, endpoint: &Endpoint, timeout: std::time::Duration) -> Result<()> {
+        let url = Self::base_url(endpoint);
+        if url.is_empty() {
+            return Ok(());
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        let started = std::time::Instant::now();
+        let mut poll = std::time::Duration::from_millis(25);
+        loop {
+            // sd-server has no /health route (404 — verified against
+            // master-890-74988b2); the port binds only after the model set
+            // loads, and GET /v1/models answers 200 with an OpenAI-shaped
+            // {"data":[...]} once it does. That 200 IS the ready signal.
+            match self.http.get(format!("{url}/v1/models")).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                    if body["data"].as_array().is_some() {
+                        tracing::debug!("sdcpp healthy at {url} after {:?}", started.elapsed());
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "sdcpp at {url} did not list models on /v1/models within {timeout:?} \
+                     (model_load_timeout)"
+                ));
+            }
+            tokio::time::sleep(poll).await;
+            poll = std::cmp::min(poll.mul_f64(1.6), std::time::Duration::from_millis(150));
+        }
+    }
+}
+
 /// sglang engine (`python -m sglang.launch_server` behind an executable
 /// shim). Dialect differences that shaped this impl (verified against
 /// sglang v0.5.19 `http_server.py` + `server_args.py`):
@@ -1212,6 +1360,155 @@ mod tests {
             .await
             .expect_err("dead port must fail");
         assert!(err.to_string().contains("model_load_timeout"), "{err:#}");
+    }
+
+    fn sdcpp_engine() -> SdCppEngine {
+        SdCppEngine::new(crate::engine::manifest::Manifest {
+            tag: "master-890-74988b2".into(),
+            build_number: 890,
+            version_raw: "stable-diffusion.cpp".into(),
+            devices: vec![],
+            flags: std::collections::BTreeSet::new(),
+            spec_types: vec![],
+            server_path: String::new(),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn unit__sdcpp_spawn__unix_endpoint_rejected_with_teaching() {
+        let engine = sdcpp_engine();
+        let err = engine
+            .spawn(
+                &["sd-server".to_string()],
+                &Endpoint::Unix {
+                    socket: "/run/blazar/sdcpp.sock".into(),
+                },
+            )
+            .await
+            .expect_err("unix endpoint must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("no unix-socket transport"), "{msg}");
+        assert!(msg.contains("child_transport"), "{msg}");
+    }
+
+    /// Minimal sd-server dialect stub: `/v1/models` answers the `OpenAI`
+    /// shape, every other route (notably `/health`) 404s — the live
+    /// master-890 contract.
+    async fn sdcpp_dialect_stub() -> u16 {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let head = String::from_utf8_lossy(&buf).to_string();
+                    let (status, body) = if head.starts_with("GET /v1/models") {
+                        (
+                            "200 OK",
+                            r#"{"data":[{"id":"sd-cpp-local","object":"model","owned_by":"local"}]}"#,
+                        )
+                    } else {
+                        ("404 Not Found", r#"{"error":"no route"}"#)
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn unit__sdcpp_health__v1_models_200_is_the_ready_signal() {
+        // sd-server has no /health route: readiness = GET /v1/models 200
+        // with a {"data":[...]} body. A plain TCP/HTTP listener whose
+        // /v1/models 404s (the llama dialect) must NOT pass.
+        let port = sdcpp_dialect_stub().await;
+        let engine = sdcpp_engine();
+        let endpoint = Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port,
+        };
+        engine
+            .health_check(&endpoint, std::time::Duration::from_secs(5))
+            .await
+            .expect("sd dialect stub must read healthy");
+    }
+
+    #[tokio::test]
+    async fn unit__sdcpp_health__llama_health_route_alone_is_not_ready() {
+        // The probe-latency stub answers 200 to everything EXCEPT it is
+        // not used here: craft the inverse — /health 200 exists but
+        // /v1/models does not. That is a llama-server, not an sd-server.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let head = String::from_utf8_lossy(&buf).to_string();
+                    let (status, body) = if head.starts_with("GET /health") {
+                        ("200 OK", r#"{"status":"ok"}"#)
+                    } else {
+                        ("404 Not Found", "{}")
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let engine = sdcpp_engine();
+        let endpoint = Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port,
+        };
+        let err = engine
+            .health_check(&endpoint, std::time::Duration::from_secs(1))
+            .await
+            .expect_err("llama /health dialect must not satisfy sdcpp readiness");
+        assert!(
+            err.to_string()
+                .contains("did not list models on /v1/models"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unit__sdcpp_health__deadline_still_bounded() {
+        let port = dead_port().await;
+        let engine = sdcpp_engine();
+        let endpoint = Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port,
+        };
+        let err = engine
+            .health_check(&endpoint, std::time::Duration::from_secs(1))
+            .await
+            .expect_err("dead port must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("/v1/models"), "{msg}");
+        assert!(msg.contains("model_load_timeout"), "{msg}");
     }
 
     fn mistralrs_row(path: &str) -> blazar_core::ModelRow {

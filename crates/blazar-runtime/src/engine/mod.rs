@@ -1200,6 +1200,9 @@ impl EngineManager {
     /// Install one mistralrs release asset. Same shape as
     /// `install_picked` but file-streamed (CUDA assets are GiB-class)
     /// and registered as the mistralrs engine kind.
+    /// Install a release asset already resolved by name (mistral.rs
+    /// picks carry exact names; sd.cpp resolves by sha-embedding
+    /// patterns and calls [`Self::install_picked_asset`] directly).
     pub async fn install_picked_mistralrs(
         &self,
         release: &GhRelease,
@@ -1216,37 +1219,50 @@ impl EngineManager {
                     release.tag_name
                 )
             })?;
+        self.install_picked_asset(
+            release,
+            asset,
+            &pick.label,
+            pick.cpu_fallback,
+            EngineKind::MistralRs,
+        )
+        .await
+    }
+
+    /// Shared download-extract-register tail for prebuilt release
+    /// assets (mistral.rs tarballs, sd.cpp zips). Digest comes from the
+    /// release metadata when GitHub publishes one; rollback and the
+    /// register/probe tail are [`Self::install_with_rollback`]'s.
+    pub async fn install_picked_asset(
+        &self,
+        release: &GhRelease,
+        asset: &gh::GhAsset,
+        label: &str,
+        cpu_fallback: bool,
+        kind: EngineKind,
+    ) -> Result<EngineRow> {
         let digest = asset
             .digest
             .clone()
             .and_then(|d| d.strip_prefix("sha256:").map(str::to_string))
             .unwrap_or_else(|| "unverified".into());
         let tag = release.tag_name.clone();
-        let pick_name = pick.name.clone();
-        let pick_label = pick.label.clone();
-        let cpu_fallback = pick.cpu_fallback;
-        self.install_with_rollback(
-            &tag,
-            &pick_label,
-            &digest,
-            EngineKind::MistralRs,
-            |dir| async move {
-                std::fs::create_dir_all(&dir)?;
-                let archive = dir.join(&pick_name);
-                self.gh.download_asset_file(asset, &archive).await?;
-                let extracted = extract_archive_file(&archive, &dir, &pick_name);
-                std::fs::remove_file(&archive).context("remove downloaded archive")?;
-                extracted?;
-                if cpu_fallback {
-                    tracing::warn!(
-                        "installed the CPU mistralrs asset {} — this machine's driver/GPU \
-                         does not qualify for a CUDA prebuilt; expect CPU-only speed",
-                        pick_name
-                    );
-                }
-                Ok(())
-            },
-        )
+        let asset_name = asset.name.clone();
+        self.install_with_rollback(&tag, label, &digest, kind, |dir| async move {
+            std::fs::create_dir_all(&dir)?;
+            let archive = dir.join(&asset_name);
+            self.gh.download_asset_file(asset, &archive).await?;
+            let extracted = extract_archive_file(&archive, &dir, &asset_name);
+            std::fs::remove_file(&archive).context("remove downloaded archive")?;
+            extracted?;
+            if cpu_fallback {
+                tracing::warn!(
+                    "installed the CPU fallback asset {asset_name} — no GPU-qualified \
+                     prebuilt matched this machine; expect CPU-only speed",
+                );
+            }
+            Ok(())
+        })
         .await
     }
 
@@ -1355,6 +1371,71 @@ impl EngineManager {
         ))
     }
 
+    /// Resolve and install an sd.cpp release: explicit `master-NNN-<sha>`
+    /// tag or latest by build counter. Assets are matched by pattern
+    /// (names embed the commit sha) with vulkan preferred — one backend
+    /// covers NVIDIA/AMD/Intel and no linux-cuda prebuilt exists
+    /// upstream. Same fresh-release retry cadence as the other lanes.
+    /// A CUDA-from-source build is deliberately not wired here: the
+    /// vulkan prebuilt serves every GPU this daemon runs on.
+    pub async fn update_sdcpp(&self, tag: Option<&str>) -> Result<EngineRow> {
+        let release = if let Some(t) = tag {
+            self.gh.release_by_tag_repo(gh::SDCPP_REPO, t).await?
+        } else {
+            let latest = self.gh.latest_sdcpp_release().await?;
+            self.gh
+                .release_by_tag_repo(gh::SDCPP_REPO, &latest.tag_name)
+                .await?
+        };
+        let patterns = gh::sdcpp_asset_patterns(std::env::consts::OS, std::env::consts::ARCH)?;
+
+        let mut last_missing: Option<Vec<gh::SdAssetPattern>> = None;
+        for attempt in 0..=ASSET_UPLOAD_RETRY_ATTEMPTS {
+            if let Some((asset, pattern)) = gh::resolve_sdcpp_asset(&release, &patterns) {
+                tracing::debug!(tag = %release.tag_name, asset = %asset.name, "sdcpp asset resolved");
+                return self
+                    .install_picked_asset(
+                        &release,
+                        asset,
+                        pattern.label,
+                        pattern.cpu_fallback,
+                        EngineKind::SdCpp,
+                    )
+                    .await;
+            }
+            last_missing = Some(patterns.clone());
+            if !release_is_fresh(&release) || attempt == ASSET_UPLOAD_RETRY_ATTEMPTS {
+                break;
+            }
+            tracing::info!(
+                "sd.cpp {} assets still uploading; retry {}/{} in {:?}",
+                release.tag_name,
+                attempt + 1,
+                ASSET_UPLOAD_RETRY_ATTEMPTS,
+                ASSET_UPLOAD_RETRY_DELAY
+            );
+            tokio::time::sleep(ASSET_UPLOAD_RETRY_DELAY).await;
+        }
+        Err(anyhow!(
+            "no usable sd.cpp asset in release {} (wanted one of: {}; available: {})",
+            release.tag_name,
+            last_missing.map_or_else(
+                || "n/a".into(),
+                |p| {
+                    p.iter()
+                        .map(|x| x.includes.join("+"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                },
+            ),
+            release
+                .assets
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
     /// Shared install tail for every engine source (release asset,
     /// source build): probe the binary, warn on GPU-asset-sees-no-GPU,
     /// store the row, activate it, publish, prune old tags.
@@ -1453,6 +1534,7 @@ impl EngineManager {
             // The install lane writes the shim; anything else is a
             // hand-copied dir, and the shim name is the contract.
             EngineKind::Sglang => find_engine_binary(dir, &["sglang-server"]),
+            EngineKind::SdCpp => find_engine_binary(dir, &["sd-server", "sd-server.exe"]),
         }
         .map_err(|e| e.context(ENGINE_PROBE_FAILED))?;
         make_executable(&server);
@@ -1487,6 +1569,12 @@ impl EngineManager {
             }
             EngineKind::Sglang => {
                 tracing::debug!(target: "blazar::engine", "registered sglang {tag} ({asset_label})");
+            }
+            // sd.cpp CAN enumerate devices (Vulkan0/CUDA0/CPU rows, no
+            // MiB numbers), so the llama GPU-count crosscheck does not
+            // apply — an unusable build fails at spawn, loudly.
+            EngineKind::SdCpp => {
+                tracing::debug!(target: "blazar::engine", "registered sdcpp {tag} ({asset_label})");
             }
         }
         let row = EngineRow {
@@ -2246,6 +2334,13 @@ pub fn verify_engine_binary(
             })
         }
         EngineKind::MistralRs => manifest
+            .map(|m| PathBuf::from(m.server_path))
+            .is_some_and(|b| {
+                exec_version_probe(&b, &["--version"], std::time::Duration::from_secs(15))
+            }),
+        // sd-server --version exits 0 with the banner (verified
+        // master-890) — the cheap liveness probe for the image lane.
+        EngineKind::SdCpp => manifest
             .map(|m| PathBuf::from(m.server_path))
             .is_some_and(|b| {
                 exec_version_probe(&b, &["--version"], std::time::Duration::from_secs(15))

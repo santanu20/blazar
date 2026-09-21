@@ -23,6 +23,9 @@ pub enum EngineKind {
     /// sgl-project/sglang `python -m sglang.launch_server` (pip venv;
     /// HF safetensors models, Linux CUDA/ROCm upstream).
     Sglang,
+    /// leejet/stable-diffusion.cpp `sd-server` (prebuilt assets +
+    /// source build; diffusion/image component sets — never text).
+    SdCpp,
 }
 
 impl EngineKind {
@@ -32,6 +35,7 @@ impl EngineKind {
             EngineKind::LlamaCpp => "llamacpp",
             EngineKind::MistralRs => "mistralrs",
             EngineKind::Sglang => "sglang",
+            EngineKind::SdCpp => "sdcpp",
         }
     }
 
@@ -59,6 +63,13 @@ impl EngineKind {
     /// tokens) while the same lanes serve BF16 dirs perfectly — so a
     /// quantized dir routes sglang-only, and an absent sglang teaches
     /// instead of routing into a known-broken lane.
+    ///
+    /// This is the TEXT routing table: `SdCpp` is invisible to it by
+    /// construction (no preference order names it), so a text model on
+    /// a box with only an sd.cpp lane teaches `FormatUnserved` instead of
+    /// spawning an image server against a text request. The reverse
+    /// gate (diffusion component sets require the sdcpp kind) lives at
+    /// the model-domain layer where the component paths are known.
     #[must_use]
     pub fn route_format(
         safetensors: bool,
@@ -322,8 +333,9 @@ impl FromStr for EngineKind {
             "llamacpp" => Ok(EngineKind::LlamaCpp),
             "mistralrs" => Ok(EngineKind::MistralRs),
             "sglang" => Ok(EngineKind::Sglang),
+            "sdcpp" => Ok(EngineKind::SdCpp),
             other => Err(format!(
-                "unknown engine kind {other:?} (supported: llamacpp, mistralrs, sglang)"
+                "unknown engine kind {other:?} (supported: llamacpp, mistralrs, sglang, sdcpp)"
             )),
         }
     }
@@ -394,6 +406,7 @@ mod tests {
             EngineKind::LlamaCpp,
             EngineKind::MistralRs,
             EngineKind::Sglang,
+            EngineKind::SdCpp,
         ] {
             assert_eq!(EngineKind::from_str(k.as_str()), Ok(k));
             let json = serde_json::to_string(&k).unwrap();
@@ -401,7 +414,7 @@ mod tests {
         }
         assert_eq!(
             EngineKind::from_str("vllm").unwrap_err(),
-            "unknown engine kind \"vllm\" (supported: llamacpp, mistralrs, sglang)"
+            "unknown engine kind \"vllm\" (supported: llamacpp, mistralrs, sglang, sdcpp)"
         );
         // serde default on missing field = llamacpp (old rows).
         assert_eq!(
@@ -492,6 +505,26 @@ mod tests {
         );
         assert_eq!(
             EngineKind::route_format(false, false, &[Sglang], Quality),
+            None
+        );
+
+        // Domain gate (sd.cpp lane): text formats never route onto the
+        // image engine — an sdcpp-only box teaches FormatUnserved, and
+        // an installed sdcpp lane is invisible beside text kinds.
+        assert_eq!(
+            EngineKind::route_format(false, false, &[EngineKind::SdCpp], Quality),
+            None,
+            "GGUF with only an sdcpp lane = unservable (teach), never the image engine"
+        );
+        // Beside text kinds the image lane is invisible: GGUF still picks
+        // llamacpp, and a text-safetensors roster that lacks sglang and
+        // mistral.rs teaches unserved rather than touching sdcpp.
+        assert_eq!(
+            EngineKind::route_format(false, false, &[EngineKind::SdCpp, LlamaCpp], Quality),
+            Some(LlamaCpp)
+        );
+        assert_eq!(
+            EngineKind::route_format(true, false, &[EngineKind::SdCpp, LlamaCpp], Quality),
             None
         );
     }
