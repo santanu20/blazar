@@ -36,7 +36,14 @@ fn api_error(status: u16, message: &str) -> Response {
 
 /// GET /api/version
 pub async fn version() -> Response {
-    axum::Json(json!({"version": env!("CARGO_PKG_VERSION")})).into_response()
+    // `name` is the daemon's identity marker: doctor (and anything else
+    // probing a bound port) must distinguish a blazar daemon from a
+    // pre-rename one or a foreign server that happens to answer HTTP.
+    axum::Json(json!({
+        "name": "blazar",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+    .into_response()
 }
 
 /// GET /api/watch — live SSE tail of sentinel records (`blazar watch`).

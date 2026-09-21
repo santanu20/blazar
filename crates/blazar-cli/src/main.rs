@@ -3402,29 +3402,73 @@ async fn doctor_port() -> Vec<Check> {
             format!("{}:{} free (daemon not running)", cfg.host, cfg.port),
         )];
     }
-    let is_blazar = cli_http()
+    let healthz_ok = cli_http()
         .get(format!("http://{}:{}/healthz", cfg.host, cfg.port))
         .send()
         .await
         .is_ok_and(|r| r.status().is_success());
-    if is_blazar {
-        vec![Check::ok(
-            "port",
-            format!(
-                "{}:{} — blazar daemon already answering",
-                cfg.host, cfg.port
-            ),
-        )]
+    let version_body: Option<String> = if healthz_ok {
+        match cli_http()
+            .get(format!("http://{}:{}/api/version", cfg.host, cfg.port))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r.text().await.ok(),
+            _ => None,
+        }
     } else {
-        vec![Check::warn(
+        None
+    };
+    vec![port_holder_verdict(
+        &cfg.host,
+        cfg.port,
+        healthz_ok,
+        version_body.as_deref(),
+    )]
+}
+
+/// Identity, not just liveness: a bound port that answers /healthz
+/// proves nothing about WHO holds it. During the pallama→blazar rename
+/// this check reported any /healthz-200 stranger as "blazar daemon
+/// already answering" — a pre-rename daemon on the same default port
+/// was indistinguishable from ours. The ladder: our daemon advertises
+/// `name: blazar` on /api/version; JSON with a version but no name is a
+/// pre-rename or foreign daemon; /healthz-200 with no JSON endpoint at
+/// all is a foreign server. Only a named blazar answer earns the ok.
+fn port_holder_verdict(
+    host: &str,
+    port: u16,
+    healthz_ok: bool,
+    version_body: Option<&str>,
+) -> Check {
+    let at = format!("{host}:{port}");
+    if !healthz_ok {
+        return Check::warn(
             "port",
             format!(
-                "{}:{} occupied by another process (ollama lives on 11434; pick another port in config.toml if this blocks startup)",
-                cfg.host,
-                cfg.port
+                "{at} occupied by another process (ollama lives on 11434; pick another port in config.toml if this blocks startup)"
             ),
-        )]
+        );
     }
+    let foreign = |detail: String| Check::warn("port", detail);
+    let Some(body) = version_body else {
+        return foreign(format!(
+            "{at} answers /healthz but carries no /api/version — a foreign server holds the port, not the blazar daemon"
+        ));
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return foreign(format!(
+            "{at} answers /healthz with a non-JSON /api/version — a foreign server holds the port, not the blazar daemon"
+        ));
+    };
+    if v["name"].as_str() == Some("blazar") {
+        let ver = v["version"].as_str().unwrap_or("?");
+        return Check::ok("port", format!("{at} — blazar daemon v{ver} answering"));
+    }
+    let ver = v["version"].as_str().unwrap_or("?");
+    foreign(format!(
+        "{at} — the answering daemon is not blazar (reports version {ver:?} without the blazar name; a pre-rename pallama or a foreign server) — stop it or move blazar to another port"
+    ))
 }
 
 #[cfg(unix)]
@@ -11160,6 +11204,59 @@ mod tests {
         assert!(c.ok && !c.warn, "{}", c.detail);
         assert!(c.detail.contains("2 key(s)"), "{}", c.detail);
         assert!(c.detail.contains("TLS"), "{}", c.detail);
+    }
+
+    #[test]
+    fn unit__port_holder_verdict__named_blazar_is_ok() {
+        let c = port_holder_verdict(
+            "127.0.0.1",
+            11435,
+            true,
+            Some(r#"{"name":"blazar","version":"0.10.0"}"#),
+        );
+        assert!(c.ok && !c.warn, "{}", c.detail);
+        assert!(c.detail.contains("blazar daemon v0.10.0"), "{}", c.detail);
+    }
+
+    #[test]
+    fn unit__port_holder_verdict__unnamed_version_is_not_ours() {
+        // A pre-rename pallama daemon answers exactly like this.
+        let c = port_holder_verdict("127.0.0.1", 11435, true, Some(r#"{"version":"0.9.1"}"#));
+        assert!(c.warn, "{}", c.detail);
+        assert!(c.detail.contains("0.9.1"), "{}", c.detail);
+        assert!(c.detail.contains("not blazar"), "{}", c.detail);
+    }
+
+    #[test]
+    fn unit__port_holder_verdict__foreign_name_is_not_ours() {
+        let c = port_holder_verdict(
+            "127.0.0.1",
+            11435,
+            true,
+            Some(r#"{"name":"ollama","version":"0.5.7"}"#),
+        );
+        assert!(c.warn, "{}", c.detail);
+    }
+
+    #[test]
+    fn unit__port_holder_verdict__healthz_without_version_is_foreign() {
+        let c = port_holder_verdict("127.0.0.1", 11435, true, None);
+        assert!(c.warn, "{}", c.detail);
+        assert!(c.detail.contains("foreign"), "{}", c.detail);
+    }
+
+    #[test]
+    fn unit__port_holder_verdict__non_json_version_is_foreign() {
+        let c = port_holder_verdict("127.0.0.1", 11435, true, Some("gateway timeout"));
+        assert!(c.warn, "{}", c.detail);
+        assert!(c.detail.contains("foreign"), "{}", c.detail);
+    }
+
+    #[test]
+    fn unit__port_holder_verdict__no_healthz_keeps_occupied_hint() {
+        let c = port_holder_verdict("127.0.0.1", 11435, false, None);
+        assert!(c.warn, "{}", c.detail);
+        assert!(c.detail.contains("another process"), "{}", c.detail);
     }
 
     #[test]
