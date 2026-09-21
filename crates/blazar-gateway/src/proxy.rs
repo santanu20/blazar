@@ -1062,7 +1062,8 @@ pub(crate) fn resolve_serving(
             // routing can never disagree. Never fires under a user pin
             // (the spawn rescue has the same gate) or when the picked
             // lane's arch set is unknown (honest unknown).
-            let arch = s.get_model(model_name).ok().flatten().and_then(|r| r.arch);
+            let model_row = s.get_model(model_name).ok().flatten();
+            let arch = model_row.as_ref().and_then(|r| r.arch.clone());
             let rescue_preview = |tag: &str, kind: EngineKind| -> Option<String> {
                 blazar_runtime::predicted_rescue_lane(
                     &rows,
@@ -1076,6 +1077,7 @@ pub(crate) fn resolve_serving(
                 state.config.engine_routing.mode,
                 state.config.engine_routing.policy,
                 overlay.engine.as_deref(),
+                model_row.as_ref().is_some_and(|r| r.vae_path.is_some()),
                 std::path::Path::new(model_path).is_dir(),
                 blazar_core::store::quantized_safetensors_signal(model_name, "", model_path),
                 global,
@@ -1947,6 +1949,9 @@ mod resolve_model_tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
+            vae_path: None,
+            llm_path: None,
+            llm_vision_path: None,
             shards: 1,
             arch: None,
             params: None,

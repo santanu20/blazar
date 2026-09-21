@@ -58,6 +58,13 @@ pub struct ProfileInput<'a> {
     /// Emitted as `-mm` when the engine supports it; the store's
     /// `mmproj_path` feeds this (rule 19).
     pub mmproj_path: Option<&'a str>,
+    /// Diffusion component set (sdcpp lane): VAE weights, text encoder,
+    /// and optional vision encoder for image edits. The sdcpp argv
+    /// builder emits `--vae`/`--llm`/`--llm_vision` from these; `None`
+    /// on every text model (the routing gate keys on exactly that).
+    pub vae_path: Option<&'a str>,
+    pub llm_path: Option<&'a str>,
+    pub llm_vision_path: Option<&'a str>,
     /// Caller-mandated projector attach that overrides the mmproj policy
     /// (Attach/Skip/Lazy). Set by `ensure_vision`'s `@vision` respawn so
     /// a Lazy-spawned text-only instance comes back WITH the projector,
@@ -185,6 +192,14 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // this profile owns the numbers (ctx ladder, VRAM tiers, concurrency).
     if input.engine_kind == crate::engine_kind::EngineKind::Sglang {
         return compile_sglang(input, tuning);
+    }
+    // Dialect fork: sd-server has no llama grammar either — no ctx/KV
+    // ladder, no slots; the argv IS the component set (DiT+VAE+TE) plus
+    // the listen pair and a threads/offload heuristic. All request-side
+    // tuning (steps/cfg/seed/size) rides the HTTP parameters of
+    // /v1/images/generations, not the launch line.
+    if input.engine_kind == crate::engine_kind::EngineKind::SdCpp {
+        return compile_sdcpp(input, tuning);
     }
     // The llama-server grammar below is GGUF-only: every rule reads GGUF
     // tensor metadata. A safetensors row on a GGUF engine is a routing
@@ -2771,6 +2786,209 @@ fn compile_mistralrs(
 /// class upstream warns about in their own memory guide).
 const SGLANG_RUNTIME_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Compile the sd-server launch line (sdcpp dialect).
+///
+/// Verified dialect facts (live probe, sd.cpp master-890-74988b2): the
+/// server binds `--listen-ip`/`--listen-port` only AFTER the component
+/// set loads (connection-refused during poll is normal loading, not a
+/// crash); `--diffusion-model` takes the `DiT` GGUF, `--vae` the VAE
+/// safetensors, `--llm` the text-encoder GGUF (streamed from system RAM
+/// under `--offload-to-cpu`, which is how a Q4 `DiT` + 8B TE fits an
+/// 8 GiB card); `--llm_vision` attaches the mmproj for image edits.
+/// There is no ctx/KV concept: request-side tuning (steps, cfg, seed,
+/// size) rides the `/v1/images/generations` HTTP parameters, so the
+/// profile's ctx/kv fields report the neutral 0/None.
+fn compile_sdcpp(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Profile, String> {
+    let (vae, llm) = sdcpp_components(input)?;
+    // No unix-socket transport on this dialect (spawn enforces it too;
+    // failing at compile keeps the error ahead of any child boot).
+    let Endpoint::Tcp { host, port } = &input.endpoint else {
+        return Err(
+            "sdcpp engines have no unix-socket transport; set child_transport = \"tcp\" \
+             on the model override"
+                .to_string(),
+        );
+    };
+    let mut argv: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    argv.push("--diffusion-model".into());
+    argv.push(input.model_path.to_string());
+    argv.push("--vae".into());
+    argv.push(vae.to_string());
+    argv.push("--llm".into());
+    argv.push(llm.to_string());
+    if let Some(vision) = input.llm_vision_path {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "model_overrides.llm_vision_path",
+            "--llm_vision",
+            &[vision.to_string()],
+        );
+    }
+    argv.push("--listen-ip".into());
+    argv.push(host.clone());
+    argv.push("--listen-port".into());
+    argv.push(port.to_string());
+
+    if let Some(n) = tuning.threads {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "threads",
+            "-t",
+            &[n.to_string()],
+        );
+    }
+    if tuning.fa == Some(true) {
+        push_gated(input, &mut argv, &mut warnings, "fa", "--diffusion-fa", &[]);
+    }
+    for knob in ["ctx", "kv_quant", "batch", "ubatch"] {
+        let set = match knob {
+            "ctx" => tuning.ctx.is_some(),
+            "kv_quant" => tuning.kv_quant.is_some(),
+            "batch" => tuning.batch.is_some(),
+            _ => tuning.ubatch.is_some(),
+        };
+        if set {
+            warnings.push(format!(
+                "tuning {knob} ignored on the sdcpp engine — it is a text-engine \
+                 knob; diffusion tuning rides request parameters (steps/cfg/seed/size)"
+            ));
+        }
+    }
+
+    // Offload heuristic (the 75% precedent from the mistralrs paged-attn
+    // arm): weights(DiT)+VAE beyond three quarters of VRAM means the
+    // load would OOM — sd-server's --offload-to-cpu keeps params in
+    // system RAM and streams compute, the proven Q4-DiT+8B-TE-on-8GiB
+    // posture. A VRAM-less box is CPU-only by construction.
+    let vram_bytes = capacity_bytes(input.hardware);
+    let vae_bytes = std::fs::metadata(vae).map_or(0, |m| m.len());
+    let resident = input.model_bytes.saturating_add(vae_bytes);
+    let offload = sdcpp_offload_decision(vram_bytes, resident);
+    if let Some(flag) = offload.flag {
+        argv.push(flag.into());
+    }
+    if let Some(w) = offload.warning {
+        warnings.push(w);
+    }
+
+    // extra_args: strict manifest-gated passthrough, same contract as the
+    // other dialects — blazar-owned launch pins refuse rather than
+    // double-set the component/listen pair.
+    argv.extend(sdcpp_extra_args(input)?);
+    Ok(Profile {
+        argv,
+        warnings,
+        ctx: 0,
+        gpu: offload.gpu,
+        kv_est_bytes: None,
+        ctx_autofit: None,
+    })
+}
+
+/// Component-set gates shared by every sdcpp compile: a diffusion `DiT`
+/// is unservable alone. Missing paths in the store row mean either a
+/// family-blinded pull (older row) or deleted files — both repair the
+/// same way: re-pull.
+fn sdcpp_components<'a>(input: &'a ProfileInput<'_>) -> Result<(&'a str, &'a str), String> {
+    let (Some(vae), Some(llm)) = (input.vae_path, input.llm_path) else {
+        return Err(format!(
+            "model {} has no diffusion component set (VAE/text encoder) — the DiT \
+             GGUF alone cannot boot; re-pull the model to fetch the set: blazar pull {}",
+            input.model_name, input.model_name
+        ));
+    };
+    for (label, path) in [("VAE", vae), ("text encoder", llm)] {
+        if !std::path::Path::new(path).is_file() {
+            return Err(format!(
+                "{label} file for {} is missing at {path} — the store row is stale; \
+                 re-pull the model to repair the component set",
+                input.model_name
+            ));
+        }
+    }
+    Ok((vae, llm))
+}
+
+/// One offload decision: whether the resident set (DiT+VAE bytes) fits
+/// VRAM outright, streams via `--offload-to-cpu`, or the box is CPU-only.
+struct SdOffload {
+    gpu: &'static str,
+    flag: Option<&'static str>,
+    warning: Option<String>,
+}
+
+fn sdcpp_offload_decision(vram_bytes: u64, resident: u64) -> SdOffload {
+    const MIB: u64 = 1024 * 1024;
+    if vram_bytes == 0 {
+        return SdOffload {
+            gpu: "cpu",
+            flag: None,
+            warning: None,
+        };
+    }
+    if resident > vram_bytes * 75 / 100 {
+        return SdOffload {
+            gpu: "partial",
+            flag: Some("--offload-to-cpu"),
+            warning: Some(format!(
+                "offload-to-cpu: DiT+VAE ~{} MiB vs {} MiB VRAM — params stay in system \
+                 RAM and stream to the GPU (the Q4-DiT + 8B-TE posture); an explicit \
+                 extra_args choice would own this flag",
+                resident / MIB,
+                vram_bytes / MIB
+            )),
+        };
+    }
+    SdOffload {
+        gpu: "full",
+        flag: None,
+        warning: None,
+    }
+}
+
+/// Strict manifest-gated `extra_args` passthrough for the sdcpp dialect:
+/// reserved launch pins refuse rather than double-set the component/listen
+/// pair; anything else must appear in the engine's probed flags.
+fn sdcpp_extra_args(input: &ProfileInput<'_>) -> Result<Vec<String>, String> {
+    const RESERVED: &[&str] = &[
+        "--listen-ip",
+        "--listen-port",
+        "--diffusion-model",
+        "--vae",
+        "--llm",
+        "--llm_vision",
+        "-t",
+    ];
+    let Some(extra) = &input.overlay.extra_args else {
+        return Ok(Vec::new());
+    };
+    for tok in extra {
+        if !tok.starts_with('-') {
+            continue; // value token riding its preceding flag
+        }
+        if RESERVED.contains(&tok.as_str()) {
+            return Err(format!(
+                "extra_args {tok} is reserved — blazar owns it on the sdcpp \
+                 engine (component set + listen pins); remove it from the override"
+            ));
+        }
+        if !input.supported_flags.contains(tok.as_str()) {
+            return Err(format!(
+                "extra_args {tok} is not in this sdcpp engine's probed manifest \
+                 (blazar engine list) — drop it, or blazar engine update refreshes \
+                 the probe"
+            ));
+        }
+    }
+    Ok(extra.clone())
+}
+
 /// Share of measured free VRAM the ladder is allowed to promise to
 /// weights+KV (torch reserves the rest for activations/workspace).
 const SGLANG_VRAM_USABLE_PCT: u64 = 92;
@@ -5096,6 +5314,9 @@ mod tests {
             draft_path: None,
             draft_gguf: None,
             mmproj_path: None,
+            vae_path: None,
+            llm_path: None,
+            llm_vision_path: None,
             mmproj_force: false,
             engine_tag: "b-test",
             supported_flags: flags,
@@ -7790,6 +8011,9 @@ mod tests {
             draft_path: None,
             draft_gguf: None,
             mmproj_path: None,
+            vae_path: None,
+            llm_path: None,
+            llm_vision_path: None,
             mmproj_force: false,
             engine_tag: "v0.9.3",
             supported_flags: flags,
@@ -9937,6 +10161,149 @@ mod tests {
     }
 
     #[test]
+    fn unit__compile_sdcpp__component_set_listen_pair_and_offload_ladder() {
+        // The argv IS the component set: DiT+VAE+TE plus the listen
+        // pair; ctx/kv report the neutral 0/None (request-side tuning
+        // rides HTTP parameters, not the launch line). The offload
+        // heuristic mirrors the mistralrs 75% precedent.
+        let g = meta();
+        let empty: BTreeSet<String> = BTreeSet::new();
+        let cfg = Config::default();
+        let dir = std::env::temp_dir().join(format!("blazar-sdcpp-profile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let vae = dir.join("vae.safetensors");
+        let llm = dir.join("te.gguf");
+        std::fs::write(&vae, b"v").unwrap();
+        std::fs::write(&llm, b"t").unwrap();
+
+        // Roomy GPU: everything resident, no offload flag.
+        let hw = gpu_hw(16_384, 32_000, 8);
+        let mut inp = input(&g, &hw, &cfg, &empty);
+        inp.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        inp.vae_path = Some(vae.to_str().unwrap());
+        inp.llm_path = Some(llm.to_str().unwrap());
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        let at = |flag: &str| {
+            p.argv
+                .iter()
+                .position(|a| a == flag)
+                .unwrap_or_else(|| panic!("{flag} missing: {:?}", p.argv))
+        };
+        for (flag, val) in [
+            ("--diffusion-model", "/models/qwen3-8b.gguf"),
+            ("--vae", vae.to_str().unwrap()),
+            ("--llm", llm.to_str().unwrap()),
+            ("--listen-ip", "127.0.0.1"),
+            ("--listen-port", "12345"),
+        ] {
+            let i = at(flag);
+            assert_eq!(p.argv[i + 1], val, "{flag}");
+        }
+        assert!(!p.argv.iter().any(|a| a == "--offload-to-cpu"));
+        assert_eq!(p.gpu, "full");
+        assert_eq!(p.ctx, 0);
+        assert_eq!(p.kv_est_bytes, None);
+        assert_eq!(p.ctx_autofit, None);
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+
+        // Tight GPU (fixture model = 5000 MiB vs 75% of 6000): params
+        // offload to RAM and the profile says partial, with numbers.
+        let hw_tight = gpu_hw(6_000, 32_000, 8);
+        let mut inp2 = input(&g, &hw_tight, &cfg, &empty);
+        inp2.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        inp2.vae_path = Some(vae.to_str().unwrap());
+        inp2.llm_path = Some(llm.to_str().unwrap());
+        let p2 = compile(&inp2, &TuningOverrides::default()).unwrap();
+        assert!(p2.argv.iter().any(|a| a == "--offload-to-cpu"));
+        assert_eq!(p2.gpu, "partial");
+        assert!(
+            p2.warnings.iter().any(|w| w.contains("offload-to-cpu")),
+            "{:?}",
+            p2.warnings
+        );
+
+        // No GPU at all: CPU-only by construction.
+        let hw_cpu = gpu_hw(0, 32_000, 8);
+        let mut inp3 = input(&g, &hw_cpu, &cfg, &empty);
+        inp3.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        inp3.vae_path = Some(vae.to_str().unwrap());
+        inp3.llm_path = Some(llm.to_str().unwrap());
+        let p3 = compile(&inp3, &TuningOverrides::default()).unwrap();
+        assert_eq!(p3.gpu, "cpu");
+        assert!(!p3.argv.iter().any(|a| a == "--offload-to-cpu"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unit__compile_sdcpp__missing_or_stale_component_set_teaches_repull() {
+        // Gate both ways: no set in the row (older pull) and a set whose
+        // files vanished both repair the same way — re-pull.
+        let g = meta();
+        let hw = gpu_hw(16_384, 32_000, 8);
+        let empty: BTreeSet<String> = BTreeSet::new();
+        let cfg = Config::default();
+        let mut inp = input(&g, &hw, &cfg, &empty);
+        inp.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+        assert!(err.contains("re-pull"), "{err}");
+        assert!(err.contains("component set"), "{err}");
+
+        inp.vae_path = Some("/nonexistent/vae.safetensors");
+        inp.llm_path = Some("/nonexistent/te.gguf");
+        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+        assert!(
+            err.contains("missing at /nonexistent/vae.safetensors"),
+            "{err}"
+        );
+        assert!(err.contains("re-pull"), "{err}");
+    }
+
+    #[test]
+    fn unit__compile_sdcpp__unix_endpoint_and_text_knobs_refused() {
+        // No unix-socket transport on the dialect (same teaching the
+        // spawn-side gate emits); text-engine tuning knobs warn instead
+        // of silently doing nothing.
+        let g = meta();
+        let hw = gpu_hw(16_384, 32_000, 8);
+        let empty: BTreeSet<String> = BTreeSet::new();
+        let cfg = Config::default();
+        let mut inp = input(&g, &hw, &cfg, &empty);
+        inp.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        inp.endpoint = Endpoint::Unix {
+            socket: "/tmp/sd.sock".into(),
+        };
+        // Real files: the component gate must pass so the transport
+        // refusal is the one that surfaces.
+        let dir = std::env::temp_dir().join(format!("blazar-sdcpp-unix-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let vae = dir.join("vae.safetensors");
+        let llm = dir.join("te.gguf");
+        std::fs::write(&vae, b"v").unwrap();
+        std::fs::write(&llm, b"t").unwrap();
+        inp.vae_path = Some(vae.to_str().unwrap());
+        inp.llm_path = Some(llm.to_str().unwrap());
+        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+        assert!(err.contains("unix-socket"), "{err}");
+        assert!(err.contains("child_transport"), "{err}");
+
+        let mut inp2 = input(&g, &hw, &cfg, &empty);
+        inp2.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        inp2.vae_path = Some(vae.to_str().unwrap());
+        inp2.llm_path = Some(llm.to_str().unwrap());
+        let tun = TuningOverrides {
+            ctx: Some(4096),
+            ..Default::default()
+        };
+        let p = compile(&inp2, &tun).unwrap();
+        assert!(
+            p.warnings.iter().any(|w| w.contains("ctx ignored")),
+            "{:?}",
+            p.warnings
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn unit__compile__safetensors_on_llamacpp_teaches_working_remedy() {
         // audit GAP-1: the wrong-lane teaching once pointed at
         // `blazar run <model> --engine sglang` — a flag the Run command
@@ -10247,6 +10614,9 @@ mod tests {
             draft_path: None,
             draft_gguf: None,
             mmproj_path: None,
+            vae_path: None,
+            llm_path: None,
+            llm_vision_path: None,
             mmproj_force: false,
             engine_tag: "sglang-test",
             supported_flags: &SGLANG_FLAGS,

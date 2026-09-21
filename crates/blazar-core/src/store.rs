@@ -16,7 +16,7 @@ pub struct Store {
     conn: Connection,
 }
 
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -36,6 +36,9 @@ CREATE TABLE IF NOT EXISTS models (
     bytes      INTEGER NOT NULL,
     sha256     TEXT,
     mmproj_path TEXT,
+    vae_path     TEXT,
+    llm_path     TEXT,
+    llm_vision_path TEXT,
     shards     INTEGER NOT NULL DEFAULT 1,
     arch       TEXT,
     params     REAL,
@@ -118,6 +121,15 @@ pub struct ModelRow {
     pub sha256: Option<String>,
     #[serde(default)]
     pub mmproj_path: Option<String>,
+    /// Diffusion component set (sdcpp lane): the `DiT` `path` above is
+    /// unservable alone — the VAE and text encoder complete the model.
+    /// `None` on every text model.
+    #[serde(default)]
+    pub vae_path: Option<String>,
+    #[serde(default)]
+    pub llm_path: Option<String>,
+    #[serde(default)]
+    pub llm_vision_path: Option<String>,
     #[serde(default = "default_shards")]
     pub shards: i64,
     #[serde(default)]
@@ -212,6 +224,18 @@ impl Store {
         Ok(())
     }
 
+    /// Column names of `table` — the source of truth for additive
+    /// migrations deciding whether an ALTER is still owed.
+    fn table_columns(&self, table: &str) -> CoreResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut cols = stmt.query([])?;
+        let mut names = Vec::new();
+        while let Some(r) = cols.next()? {
+            names.push(r.get(1)?);
+        }
+        Ok(names)
+    }
+
     fn migrate(&self) -> CoreResult<()> {
         let version: i32 = self
             .conn
@@ -220,23 +244,25 @@ impl Store {
             self.conn.execute_batch(SCHEMA_SQL)?;
             // v4 added engines.kind. CREATE TABLE IF NOT EXISTS covers
             // fresh databases; existing ones need the explicit ALTER.
-            let has_kind: bool = {
-                let mut stmt = self.conn.prepare("PRAGMA table_info(engines)")?;
-                let mut cols = stmt.query([])?;
-                let mut found = false;
-                while let Some(r) = cols.next()? {
-                    let name: String = r.get(1)?;
-                    if name == "kind" {
-                        found = true;
-                    }
-                }
-                found
-            };
-            if !has_kind {
+            if !self.table_columns("engines")?.contains(&"kind".to_string()) {
                 self.conn.execute(
                     "ALTER TABLE engines ADD COLUMN kind TEXT NOT NULL DEFAULT 'llamacpp'",
                     [],
                 )?;
+            }
+            // v5 added the diffusion component-set columns. Same additive
+            // pattern: fresh databases get them from SCHEMA_SQL; existing
+            // ones need one ALTER per missing column.
+            let model_cols = self.table_columns("models")?;
+            for (col, decl) in [
+                ("vae_path", "TEXT"),
+                ("llm_path", "TEXT"),
+                ("llm_vision_path", "TEXT"),
+            ] {
+                if !model_cols.contains(&col.to_string()) {
+                    self.conn
+                        .execute(&format!("ALTER TABLE models ADD COLUMN {col} {decl}"), [])?;
+                }
             }
             self.conn
                 .pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -349,13 +375,16 @@ impl Store {
             )));
         }
         self.conn.execute(
-            "INSERT INTO models (name, repo, quant, path, bytes, sha256, mmproj_path, shards,
-                                 arch, params, ctx_train, pulled_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+            "INSERT INTO models (name, repo, quant, path, bytes, sha256, mmproj_path, vae_path,
+                                 llm_path, llm_vision_path, shards, arch, params, ctx_train,
+                                 pulled_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
              ON CONFLICT(name) DO UPDATE SET
                repo = excluded.repo, quant = excluded.quant, path = excluded.path,
                bytes = excluded.bytes, sha256 = excluded.sha256,
-               mmproj_path = excluded.mmproj_path, shards = excluded.shards,
+               mmproj_path = excluded.mmproj_path, vae_path = excluded.vae_path,
+               llm_path = excluded.llm_path, llm_vision_path = excluded.llm_vision_path,
+               shards = excluded.shards,
                arch = excluded.arch, params = excluded.params,
                ctx_train = excluded.ctx_train, pulled_at = excluded.pulled_at",
             params![
@@ -366,6 +395,9 @@ impl Store {
                 m.bytes,
                 m.sha256,
                 m.mmproj_path,
+                m.vae_path,
+                m.llm_path,
+                m.llm_vision_path,
                 m.shards,
                 m.arch,
                 m.params,
@@ -378,7 +410,7 @@ impl Store {
 
     pub fn get_model(&self, name: &str) -> CoreResult<Option<ModelRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, repo, quant, path, bytes, sha256, mmproj_path, shards, arch, params,
+            "SELECT name, repo, quant, path, bytes, sha256, mmproj_path, vae_path, llm_path, llm_vision_path, shards, arch, params,
                     ctx_train, pulled_at
              FROM models WHERE name = ?1",
         )?;
@@ -391,7 +423,7 @@ impl Store {
 
     pub fn list_models(&self) -> CoreResult<Vec<ModelRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, repo, quant, path, bytes, sha256, mmproj_path, shards, arch, params,
+            "SELECT name, repo, quant, path, bytes, sha256, mmproj_path, vae_path, llm_path, llm_vision_path, shards, arch, params,
                     ctx_train, pulled_at
              FROM models ORDER BY name",
         )?;
@@ -605,11 +637,14 @@ fn model_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRow> {
         bytes: r.get(4)?,
         sha256: r.get(5)?,
         mmproj_path: r.get(6)?,
-        shards: r.get(7)?,
-        arch: r.get(8)?,
-        params: r.get(9)?,
-        ctx_train: r.get(10)?,
-        pulled_at: r.get(11)?,
+        vae_path: r.get(7)?,
+        llm_path: r.get(8)?,
+        llm_vision_path: r.get(9)?,
+        shards: r.get(10)?,
+        arch: r.get(11)?,
+        params: r.get(12)?,
+        ctx_train: r.get(13)?,
+        pulled_at: r.get(14)?,
     })
 }
 
@@ -687,6 +722,9 @@ mod tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
+            vae_path: None,
+            llm_path: None,
+            llm_vision_path: None,
             shards: 1,
             arch: None,
             params: None,
@@ -751,6 +789,9 @@ mod tests {
             bytes: 500_000_000,
             sha256: Some("abc".into()),
             mmproj_path: None,
+            vae_path: None,
+            llm_path: None,
+            llm_vision_path: None,
             shards: 2,
             arch: Some("qwen3".into()),
             params: Some(0.6),
@@ -812,6 +853,9 @@ mod tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
+            vae_path: None,
+            llm_path: None,
+            llm_vision_path: None,
             shards: 1,
             arch: None,
             params: None,
@@ -864,6 +908,9 @@ mod tests {
                 bytes: 1,
                 sha256: None,
                 mmproj_path: None,
+                vae_path: None,
+                llm_path: None,
+                llm_vision_path: None,
                 shards: 1,
                 arch: None,
                 params: None,
@@ -880,5 +927,82 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn unit__migrate_v4_db__adds_component_cols_and_keeps_rows() {
+        // A database last written by a v4 daemon: models table without
+        // the diffusion component-set columns. Opening it must add the
+        // columns in place, keep every existing row, and read the new
+        // fields as None.
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(&dirs.data_dir).unwrap();
+        {
+            let conn = Connection::open(dirs.db_file()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE models (
+                    name       TEXT PRIMARY KEY,
+                    repo       TEXT NOT NULL,
+                    quant      TEXT NOT NULL,
+                    path       TEXT NOT NULL,
+                    bytes      INTEGER NOT NULL,
+                    sha256     TEXT,
+                    mmproj_path TEXT,
+                    shards     INTEGER NOT NULL DEFAULT 1,
+                    arch       TEXT,
+                    params     REAL,
+                    ctx_train  INTEGER,
+                    pulled_at  INTEGER NOT NULL
+                );
+                INSERT INTO models (name, repo, quant, path, bytes, shards, pulled_at)
+                VALUES ('old-m', 'r', 'Q4_K_M', 'p', 7, 1, 1);
+                PRAGMA user_version = 4;",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&dirs).unwrap();
+        let mut cols = s.conn().prepare("PRAGMA table_info(models)").unwrap();
+        let mut rows = cols.query([]).unwrap();
+        let mut names: Vec<String> = Vec::new();
+        while let Some(r) = rows.next().unwrap() {
+            names.push(r.get::<_, String>(1).unwrap());
+        }
+        names.sort_unstable();
+        for col in ["llm_path", "llm_vision_path", "vae_path"] {
+            assert!(names.iter().any(|n| n == col), "missing {col}: {names:?}");
+        }
+        let old = s.get_model("old-m").unwrap().unwrap();
+        assert_eq!(old.bytes, 7);
+        assert_eq!(old.vae_path, None);
+        assert_eq!(old.llm_path, None);
+        assert_eq!(old.llm_vision_path, None);
+        // And the new fields roundtrip through the migrated table.
+        s.upsert_model(&ModelRow {
+            name: "qwen-image-2.1".into(),
+            repo: "abenzerps/Qwen-Image-2.1-GGUF".into(),
+            quant: "Q4_K_M".into(),
+            path: "p.gguf".into(),
+            bytes: 4_608_000_000,
+            sha256: None,
+            mmproj_path: None,
+            vae_path: Some("vae.safetensors".into()),
+            llm_path: Some("te.gguf".into()),
+            llm_vision_path: None,
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 2,
+        })
+        .unwrap();
+        let set = s.get_model("qwen-image-2.1").unwrap().unwrap();
+        assert_eq!(set.vae_path.as_deref(), Some("vae.safetensors"));
+        assert_eq!(set.llm_path.as_deref(), Some("te.gguf"));
+        assert_eq!(set.llm_vision_path, None);
+        assert_eq!(s.list_models().unwrap().len(), 2);
     }
 }

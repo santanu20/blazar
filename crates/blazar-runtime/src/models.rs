@@ -85,6 +85,14 @@ pub fn remove_model(dirs: &BlazarDirs, name: &str) -> Result<()> {
     if let Some(mm) = &row.mmproj_path {
         files.push(PathBuf::from(mm));
     }
+    // Diffusion component set (sdcpp lane): VAE / text-encoder / vision
+    // files ride the row exactly like the mmproj sidecar does.
+    for component in [&row.vae_path, &row.llm_path, &row.llm_vision_path]
+        .into_iter()
+        .flatten()
+    {
+        files.push(PathBuf::from(component));
+    }
 
     // Shared-asset guard: aliases reference the SAME mmproj (and are
     // hardlinks of the same weights). Deleting this row must never
@@ -99,6 +107,11 @@ pub fn remove_model(dirs: &BlazarDirs, name: &str) -> Result<()> {
             if let Some(mm) = m.mmproj_path {
                 v.push(mm);
             }
+            v.extend(
+                [m.vae_path, m.llm_path, m.llm_vision_path]
+                    .into_iter()
+                    .flatten(),
+            );
             v
         })
         .collect();
@@ -406,9 +419,16 @@ fn adopt_gguf(
     let meta = match blazar_core::read_metadata_file(&path) {
         Ok(m) => m,
         Err(e) => {
-            report
-                .skipped
-                .push((label, format!("not a readable GGUF: {e}")));
+            // 0-KV GGUFs are diffusion/model-component files (image-repo
+            // DiT/VAE/encoder splits). Adopting them as text models would
+            // mint rows no engine can serve; the honest outcome is a skip
+            // whose reason names the lane they actually belong to.
+            let reason = if e.to_string().contains("missing general.architecture") {
+                "diffusion/model-component GGUF (no architecture metadata) — pull it through a diffusion family instead: blazar pull <qwen-image-repo>:QUANT (sdcpp lane)".to_string()
+            } else {
+                format!("not a readable GGUF: {e}")
+            };
+            report.skipped.push((label, reason));
             return;
         }
     };
@@ -451,6 +471,11 @@ fn adopt_gguf(
         // Re-linked deterministically from the pull-convention prefix
         // when possible; bare projectors are never guessed.
         mmproj_path,
+        // Reconcile adopts parsed GGUFs only; diffusion component sets
+        // (0-metadata files) never reach here — they arrive via pull.
+        vae_path: None,
+        llm_path: None,
+        llm_vision_path: None,
         shards: i64::try_from(leaves.len()).unwrap_or(i64::MAX),
         arch: Some(meta.architecture.clone()),
         params: Some(crate::hf::est_params(bytes, &quant)),
@@ -552,6 +577,9 @@ fn adopt_dir(
         bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
         sha256: None,
         mmproj_path: None,
+        vae_path: None,
+        llm_path: None,
+        llm_vision_path: None,
         shards: i64::try_from(weights.len()).unwrap_or(i64::MAX),
         arch: (!meta.architecture.is_empty()).then(|| meta.architecture.clone()),
         params: Some(crate::hf::est_params(bytes, &quant)),
@@ -708,6 +736,12 @@ pub fn copy_model(dirs: &BlazarDirs, src: &str, dst: &str) -> Result<()> {
         bytes: row.bytes,
         sha256: row.sha256.clone(),
         mmproj_path: row.mmproj_path.clone(),
+        // Component-set assets are shared references (read-only weights,
+        // hardlink-friendly), not per-row copies: the duplicate points at
+        // the same VAE/TE files.
+        vae_path: row.vae_path.clone(),
+        llm_path: row.llm_path.clone(),
+        llm_vision_path: row.llm_vision_path.clone(),
         shards: row.shards,
         arch: row.arch.clone(),
         params: row.params,
@@ -763,6 +797,9 @@ mod tests {
                 bytes: 2,
                 sha256: None,
                 mmproj_path: Some(d.join("mmproj-m.gguf").display().to_string()),
+                vae_path: None,
+                llm_path: None,
+                llm_vision_path: None,
                 shards: 2,
                 arch: None,
                 params: None,
@@ -776,6 +813,76 @@ mod tests {
         assert!(!d.join("m-q4_k_m-00001-of-00002.gguf").exists());
         assert!(!d.join("m-q4_k_m-00002-of-00002.gguf").exists());
         assert!(!d.join("mmproj-m.gguf").exists());
+    }
+
+    #[test]
+    fn unit__remove_model__component_set_deleted_unless_shared() {
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        std::fs::write(d.join("dit.gguf"), b"dit").unwrap();
+        std::fs::write(d.join("alias-dit.gguf"), b"dit2").unwrap();
+        std::fs::write(d.join("vae.safetensors"), b"vae").unwrap();
+        std::fs::write(d.join("te.gguf"), b"te").unwrap();
+        std::fs::write(d.join("vis.gguf"), b"vis").unwrap();
+        let store = Store::open(&dirs).unwrap();
+        let row = |name: &str, path: &str, vae: Option<String>| blazar_core::ModelRow {
+            name: name.into(),
+            repo: "o/qwen-image".into(),
+            quant: "Q4_K_M".into(),
+            path: path.into(),
+            bytes: 3,
+            sha256: None,
+            mmproj_path: None,
+            vae_path: vae,
+            llm_path: Some(d.join("te.gguf").display().to_string()),
+            llm_vision_path: Some(d.join("vis.gguf").display().to_string()),
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 1,
+        };
+        store
+            .upsert_model(&row(
+                "m",
+                &d.join("dit.gguf").display().to_string(),
+                Some(d.join("vae.safetensors").display().to_string()),
+            ))
+            .unwrap();
+        // The alias shares ONLY the VAE; its own TE/vision slots are empty.
+        store
+            .upsert_model(&blazar_core::ModelRow {
+                name: "alias".into(),
+                repo: "o/qwen-image".into(),
+                quant: "Q4_K_M".into(),
+                path: d.join("alias-dit.gguf").display().to_string(),
+                bytes: 4,
+                sha256: None,
+                mmproj_path: None,
+                vae_path: Some(d.join("vae.safetensors").display().to_string()),
+                llm_path: None,
+                llm_vision_path: None,
+                shards: 1,
+                arch: None,
+                params: None,
+                ctx_train: None,
+                pulled_at: 1,
+            })
+            .unwrap();
+
+        remove_model(&dirs, "m").unwrap();
+        assert!(!d.join("dit.gguf").exists(), "DiT goes with its row");
+        assert!(!d.join("te.gguf").exists(), "unshared TE goes");
+        assert!(!d.join("vis.gguf").exists(), "unshared vision goes");
+        assert!(
+            d.join("vae.safetensors").exists(),
+            "VAE still referenced by `alias` must survive"
+        );
+        remove_model(&dirs, "alias").unwrap();
+        assert!(
+            !d.join("vae.safetensors").exists(),
+            "last ref owns the delete"
+        );
     }
 
     #[test]
@@ -795,6 +902,9 @@ mod tests {
                 bytes: 9,
                 sha256: None,
                 mmproj_path: None,
+                vae_path: None,
+                llm_path: None,
+                llm_vision_path: None,
                 shards: 1,
                 arch: None,
                 params: None,
@@ -825,6 +935,9 @@ mod tests {
                     bytes: 2,
                     sha256: None,
                     mmproj_path: None,
+                    vae_path: None,
+                    llm_path: None,
+                    llm_vision_path: None,
                     shards: 1,
                     arch: None,
                     params: None,
@@ -853,6 +966,9 @@ mod tests {
             bytes: 2,
             sha256: None,
             mmproj_path: None,
+            vae_path: None,
+            llm_path: None,
+            llm_vision_path: None,
             shards: 1,
             arch: None,
             params: None,
@@ -893,6 +1009,9 @@ mod tests {
             bytes: 10,
             sha256: None,
             mmproj_path: None,
+            vae_path: None,
+            llm_path: None,
+            llm_vision_path: None,
             shards: 1,
             arch: None,
             params: None,
@@ -954,6 +1073,9 @@ mod tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
+            vae_path: None,
+            llm_path: None,
+            llm_vision_path: None,
             shards: 1,
             arch: None,
             params: None,
@@ -1136,6 +1258,33 @@ mod tests {
         assert!(
             r.skipped.iter().all(|(f, _)| !f.contains("mmproj")),
             "clip sidecars are silent (not model candidates): {:?}",
+            r.skipped
+        );
+    }
+
+    #[test]
+    fn unit__reconcile__kvless_component_gguf_skips_with_lane_teaching() {
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        // 0-metadata-KV GGUF: the diffusion DiT shape (0 KVs, N tensors).
+        let mut gguf = b"GGUF".to_vec();
+        gguf.extend_from_slice(&3u32.to_le_bytes());
+        gguf.extend_from_slice(&297u64.to_le_bytes());
+        gguf.extend_from_slice(&0u64.to_le_bytes());
+        std::fs::write(d.join("dit-q4_k_m.gguf"), &gguf).unwrap();
+        let store = Store::open(&dirs).unwrap();
+
+        let r = reconcile_models(&dirs, &store);
+        assert!(
+            r.adopted.is_empty(),
+            "component GGUF must not adopt: {:?}",
+            r.adopted
+        );
+        assert!(
+            r.skipped.iter().any(|(f, why)| f == "dit-q4_k_m.gguf"
+                && why.contains("diffusion/model-component")
+                && why.contains("sdcpp")),
+            "{:?}",
             r.skipped
         );
     }

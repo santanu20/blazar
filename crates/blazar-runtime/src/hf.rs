@@ -1546,6 +1546,9 @@ pub(crate) enum Repull {
     /// Model file intact but the mmproj sidecar differs — download (or
     /// drop) ONLY the sidecar instead of the multi-GiB model.
     DeltaMmproj { expected: bool },
+    /// Diffusion row with an intact `DiT` but a dead required component
+    /// (`VAE` / text encoder) — re-fetch the component set only.
+    DeltaComponents,
     /// Full download (any dead leaves were already pruned where safe).
     Full,
 }
@@ -1650,23 +1653,37 @@ pub(crate) fn repull_gate(
         return Repull::Full;
     }
     if model_file_intact(row) {
-        if mmproj_matches(row, expects_mmproj) {
-            tracing::info!(
-                model = %name,
-                "already present ({}, {} shards) — skipping download",
-                row.quant,
-                row.shards
-            );
-            Repull::Present(Box::new(row.clone()))
-        } else {
-            Repull::DeltaMmproj {
+        if !mmproj_matches(row, expects_mmproj) {
+            return Repull::DeltaMmproj {
                 expected: expects_mmproj,
-            }
+            };
         }
+        // Component rows: an intact `DiT` with a dead component file is a
+        // component-only repair — never a multi-GiB `DiT` redownload.
+        if required_component_missing(row) {
+            return Repull::DeltaComponents;
+        }
+        tracing::info!(
+            model = %name,
+            "already present ({}, {} shards) — skipping download",
+            row.quant,
+            row.shards
+        );
+        Repull::Present(Box::new(row.clone()))
     } else {
         prune_replaced(name, row, &[], "integrity check failed");
         Repull::Full
     }
+}
+
+/// A diffusion component row whose REQUIRED sidecar (`VAE` or text
+/// encoder) no longer exists on disk. The optional vision encoder is
+/// not a repair trigger — its loss only disables image edits.
+pub(crate) fn required_component_missing(row: &ModelRow) -> bool {
+    [row.vae_path.as_deref(), row.llm_path.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|p| !Path::new(p).is_file())
 }
 
 /// Assemble the store row for a fully-downloaded safetensors dir:
@@ -1692,6 +1709,9 @@ fn safetensors_model_row(
         bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
         sha256: Some(digest),
         mmproj_path: None,
+        vae_path: None,
+        llm_path: None,
+        llm_vision_path: None,
         shards: i64::try_from(sel.shard_count).unwrap_or(i64::MAX),
         arch: (!meta.architecture.is_empty()).then(|| meta.architecture.clone()),
         params: Some(est_params(bytes, &quant)),
@@ -1781,7 +1801,7 @@ impl Puller {
             .download_full_selection(name, target, &selected)
             .await?;
 
-        let (row, pull_warning) = build_model_row(
+        let (mut row, pull_warning) = build_model_row(
             name,
             target,
             &info,
@@ -1789,6 +1809,15 @@ impl Puller {
             &shard_paths,
             mmproj_dest.as_ref(),
         )?;
+        let mut pull_warning = pull_warning;
+        // Kvless GGUF = a diffusion `DiT` component (no text-model
+        // architecture inside). A known family pulls the `VAE`/`TE` set the
+        // sdcpp engine needs to boot; an unknown one keeps the
+        // existing kvless teaching at spawn time.
+        if row.arch.is_none() && shard_paths.len() == 1 {
+            self.attach_diffusion_set(target, name, &selected.quant, &mut row, &mut pull_warning)
+                .await?;
+        }
         if let Some(w) = &pull_warning {
             tracing::warn!(model = %name, "{w}");
         }
@@ -2044,6 +2073,192 @@ impl Puller {
         Ok((shard_paths, mmproj_dest))
     }
 
+    /// Fetch the diffusion component set for a kvless `DiT` pull: `VAE` and
+    /// text encoder are required (missing files fail the pull loudly);
+    /// the vision encoder for edits is best-effort. Component files are
+    /// shared, read-only weights: an intact file at the canonical dest
+    /// is re-used byte-for-byte, never re-downloaded.
+    ///
+    /// Complete a kvless `DiT` pull with its component set: a known
+    /// diffusion family fetches the `VAE`/`TE` files (vision optional)
+    /// onto the row; an unknown family keeps the file but records the
+    /// boot-blocking warning that spawn time will teach verbatim.
+    async fn attach_diffusion_set(
+        &self,
+        target: &PullTarget,
+        name: &str,
+        quant: &str,
+        row: &mut blazar_core::ModelRow,
+        pull_warning: &mut Option<String>,
+    ) -> Result<()> {
+        let Some(family) = crate::diffusion::diffusion_family(&target.repo) else {
+            let note = format!(
+                "diffusion component GGUF with no known model family (supported: {}); \
+                 pulled the `DiT` file only — it cannot boot without its VAE/text encoder",
+                crate::diffusion::supported_families().join(", ")
+            );
+            tracing::warn!(model = %name, "{note}");
+            pull_warning.get_or_insert(note);
+            return Ok(());
+        };
+        let (vae, llm, llm_vision) = self.pull_diffusion_components(name, family, quant).await?;
+        row.vae_path = Some(vae);
+        row.llm_path = Some(llm);
+        row.llm_vision_path = llm_vision;
+        Ok(())
+    }
+
+    async fn pull_diffusion_components(
+        &self,
+        name: &str,
+        family: &crate::diffusion::DiffusionFamily,
+        quant: &str,
+    ) -> Result<(String, String, Option<String>)> {
+        let models_dir = self.dirs.models_dir();
+        std::fs::create_dir_all(&models_dir)?;
+
+        let vae_info = self.client.model_info(family.vae.repo).await?;
+        let vae_plan =
+            crate::diffusion::component_plan(&vae_info, &family.vae, quant).ok_or_else(|| {
+                anyhow!(
+                    "VAE {} not found in {}",
+                    family.vae.repo_path,
+                    family.vae.repo
+                )
+            })?;
+
+        let te_info = self.client.model_info(family.text_encoder.repo).await?;
+        let (te_plan, te_note) = if let Some(p) =
+            crate::diffusion::component_plan(&te_info, &family.text_encoder, quant)
+        {
+            (p, None)
+        } else {
+            let fallback_quant = family.text_encoder_fallback_quant;
+            let fallback =
+                crate::diffusion::component_plan(&te_info, &family.text_encoder, fallback_quant)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "text encoder for quant {quant} (and fallback {fallback_quant}) \
+                             not found in {}",
+                            family.text_encoder.repo
+                        )
+                    })?;
+            let note =
+                format!("text encoder quant {quant} unavailable; pulled {fallback_quant} instead");
+            (fallback, Some(note))
+        };
+
+        // Vision encoder is optional: absent upstream (or a dead listing)
+        // downgrades to a warning, never a failed pull.
+        let mut vision_plan = None;
+        if let Some(src) = &family.vision_encoder {
+            vision_plan = match self.client.model_info(src.repo).await {
+                Ok(info) => crate::diffusion::component_plan(&info, src, quant),
+                Err(e) => {
+                    tracing::warn!(model = %name, "vision encoder listing failed ({e}); edits disabled for this set");
+                    None
+                }
+            };
+        }
+
+        let mut plans = vec![
+            (family.vae.repo, &vae_plan, true),
+            (family.text_encoder.repo, &te_plan, true),
+        ];
+        if let (Some(src), Some(plan)) = (&family.vision_encoder, &vision_plan) {
+            plans.push((src.repo, plan, false));
+        }
+        let total_bytes: u64 = plans.iter().map(|(_, p, _)| p.bytes).sum();
+        let bar = indicatif::ProgressBar::new(total_bytes);
+        bar.set_style(
+            indicatif::ProgressStyle::default_bar()
+                .template("{msg} {bar:30} {bytes}/{total_bytes} ({eta})")
+                .expect("valid template"),
+        );
+        bar.set_message(format!("pull {name}: components"));
+
+        let mut done: u64 = 0;
+        let mut paths: Vec<(bool, PathBuf)> = Vec::new();
+        for (repo, plan, required) in &plans {
+            let fetched = self
+                .fetch_component_file(name, repo, plan, *required, &bar, &mut done)
+                .await?;
+            if let Some(dest) = fetched {
+                paths.push((*required, dest));
+            }
+        }
+        bar.finish_and_clear();
+
+        let vae = paths[0].1.display().to_string();
+        let llm = paths[1].1.display().to_string();
+        let llm_vision = paths.get(2).map(|p| p.1.display().to_string());
+        if let Some(note) = te_note {
+            tracing::warn!(model = %name, "{note}");
+        }
+        Ok((vae, llm, llm_vision))
+    }
+
+    /// Fetch one component file with the shared progress bar. Returns
+    /// the destination when the file is on disk (fetched now, or
+    /// re-used intact from an earlier pull); `None` for an optional
+    /// component that failed (warned, set continues without it).
+    async fn fetch_component_file(
+        &self,
+        name: &str,
+        repo: &str,
+        plan: &FilePlan,
+        required: bool,
+        bar: &indicatif::ProgressBar,
+        done: &mut u64,
+    ) -> Result<Option<PathBuf>> {
+        let models_dir = self.dirs.models_dir();
+        let leaf = Path::new(&plan.filename).file_name().map_or_else(
+            || plan.filename.clone(),
+            |f| f.to_string_lossy().into_owned(),
+        );
+        let dest = unique_dest(&models_dir, &leaf, repo);
+        // Re-use contract: an intact file (exact size; the download lane
+        // itself sha-verifies on fetch) is NEVER re-fetched.
+        if dest.is_file() {
+            let size_ok = std::fs::metadata(&dest).is_ok_and(|m| m.len() == plan.bytes);
+            if size_ok && plan.bytes > 0 {
+                tracing::info!(model = %name, "component {} already on disk — reusing", leaf);
+                *done += plan.bytes;
+                bar.set_position(*done);
+                return Ok(Some(dest));
+            }
+        }
+        let before = *done;
+        let mut progress = |d: u64, t: u64| {
+            bar.set_position(before + d.min(t));
+        };
+        let fetched = self
+            .client
+            .download_file(repo, plan, &dest, &mut progress)
+            .await
+            .inspect_err(|e| {
+                self.bus.publish(BlazarEvent::PullFailed {
+                    name: name.to_string(),
+                    error: format!("component {}: {e}", plan.filename),
+                });
+            });
+        match fetched {
+            Ok(bytes) => {
+                *done += bytes.max(plan.bytes);
+                Ok(Some(dest))
+            }
+            Err(e) if !required => {
+                tracing::warn!(model = %name, "optional component {} failed ({e}) — skipped", plan.filename);
+                Ok(None)
+            }
+            Err(e) => Err(anyhow!(
+                "component set incomplete: {}/{} failed: {e}; re-run the pull to resume",
+                repo,
+                plan.filename
+            )),
+        }
+    }
+
     /// Act on the gate's decision. `Some(outcome)` = the pull is already
     /// finished (no-op or delta); `None` = proceed with the full download
     /// (any pre-download pruning is done here).
@@ -2072,6 +2287,37 @@ impl Puller {
                 row: *row,
                 already_present: true,
             }));
+        }
+        if let Repull::DeltaComponents = decision {
+            // The `DiT` is intact (gate proved it); only the component set
+            // needs fetching. Family comes from the row's own repo —
+            // the gate only reaches here on a same-repo re-pull.
+            if let Some(old) = existing.filter(|r| r.vae_path.is_some() || r.llm_path.is_some()) {
+                let family = crate::diffusion::diffusion_family(&old.repo).ok_or_else(|| {
+                    anyhow!(
+                        "component repair for {} has no known family (supported: {})",
+                        old.repo,
+                        crate::diffusion::supported_families().join(", ")
+                    )
+                })?;
+                let (vae, llm, llm_vision) = self
+                    .pull_diffusion_components(name, family, &old.quant)
+                    .await?;
+                let mut row = old.clone();
+                row.vae_path = Some(vae);
+                row.llm_path = Some(llm);
+                row.llm_vision_path = llm_vision;
+                Store::open(&self.dirs)?.upsert_model(&row)?;
+                tracing::info!(model = %name, "component set repaired — DiT untouched");
+                self.bus.publish(BlazarEvent::ModelPulled {
+                    name: name.to_string(),
+                    warning: None,
+                });
+                return Ok(Some(PullOutcome {
+                    row,
+                    already_present: false,
+                }));
+            }
         }
         if let Repull::DeltaMmproj { expected } = decision {
             // Shard paths are only fully known for single-shard rows
@@ -2260,6 +2506,9 @@ fn build_model_row(
             bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
             sha256: selected.shards[0].sha256.clone(),
             mmproj_path: mmproj_dest.as_ref().map(|d| d.display().to_string()),
+            vae_path: None,
+            llm_path: None,
+            llm_vision_path: None,
             shards: i64::try_from(selected.shards.len()).unwrap_or(i64::MAX),
             arch,
             params: Some(est_params(bytes, &selected.quant)),
@@ -3127,6 +3376,9 @@ mod tests {
             bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
             sha256: None,
             mmproj_path: None,
+            vae_path: None,
+            llm_path: None,
+            llm_vision_path: None,
             shards,
             arch: None,
             params: None,

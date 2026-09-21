@@ -1380,6 +1380,7 @@ fn routed_engine_lane(
     engine_rows: &[blazar_core::EngineRow],
     name: &str,
     arch: Option<&str>,
+    diffusion: bool,
     path: &str,
 ) -> Result<String, String> {
     let Some((g_tag, g_kind)) = global else {
@@ -1401,6 +1402,7 @@ fn routed_engine_lane(
         cfg.engine_routing.mode,
         cfg.engine_routing.policy,
         pin,
+        diffusion,
         safetensors,
         quantized,
         *g_kind,
@@ -1613,15 +1615,18 @@ fn lane_state_for(d: &BlazarDirs, row: &blazar_core::store::ModelRow) -> LaneSta
                 cfg.engine_routing.mode,
                 cfg.engine_routing.policy,
                 pin,
+                row.vae_path.is_some(),
                 safetensors,
                 row.is_quantized_safetensors(),
                 active.kind,
                 &installed,
             ) {
                 Ok(_) => LaneState::Served,
-                Err(e @ (LaneError::PinKindMissing { .. } | LaneError::FormatUnserved { .. })) => {
-                    LaneState::Missing(e.missing_kinds(cfg.engine_routing.policy), e.to_string())
-                }
+                Err(
+                    e @ (LaneError::PinKindMissing { .. }
+                    | LaneError::FormatUnserved { .. }
+                    | LaneError::DiffusionUnserved { .. }),
+                ) => LaneState::Missing(e.missing_kinds(cfg.engine_routing.policy), e.to_string()),
                 Err(e) => LaneState::Missing(Vec::new(), e.to_string()),
             }
         }
@@ -1911,6 +1916,7 @@ fn doctor_routing(d: &blazar_core::dirs::BlazarDirs) -> Vec<Check> {
             &engine_rows,
             &m.name,
             m.arch.as_deref(),
+            m.vae_path.is_some(),
             &m.path,
         ) {
             unservable += 1;
@@ -4416,6 +4422,9 @@ fn import(
         bytes,
         sha256: None,
         mmproj_path: mmproj_dest.map(|p| p.display().to_string()),
+        vae_path: None,
+        llm_path: None,
+        llm_vision_path: None,
         shards: 1,
         arch: Some(meta.architecture.clone()),
         params: Some(blazar_runtime::hf::est_params(size, &derived_quant)),
@@ -4565,6 +4574,7 @@ fn list_json_row(
         engine_rows,
         &m.name,
         m.arch.as_deref(),
+        m.vae_path.is_some(),
         &m.path,
     )
     .ok()
@@ -4645,6 +4655,7 @@ fn list(json: bool) -> Result<()> {
                 &engine_rows,
                 &m.name,
                 m.arch.as_deref(),
+                m.vae_path.is_some(),
                 &m.path,
             )
             .unwrap_or_else(|_| "-".to_string());
@@ -5595,6 +5606,11 @@ fn quantize_cmd(
         bytes,
         sha256: None,
         mmproj_path: row.mmproj_path.clone(),
+        // Quantize runs on parsed text GGUFs; a diffusion DiT never
+        // reaches the llama-quantizer this wraps.
+        vae_path: None,
+        llm_path: None,
+        llm_vision_path: None,
         shards: 1,
         arch: Some(meta.architecture.clone()),
         params: Some(blazar_runtime::hf::est_params(out_bytes, qtype)),
@@ -10077,6 +10093,9 @@ mod tests {
             bytes: 0,
             sha256: None,
             mmproj_path: None,
+            vae_path: None,
+            llm_path: None,
+            llm_vision_path: None,
             shards: 1,
             arch: None,
             params: None,
@@ -11000,12 +11019,14 @@ mod tests {
                 &engine_rows,
                 "m",
                 Some("qwen2"),
+                false,
                 "/x/m.gguf"
             ),
             Ok("b-new".to_string())
         );
         // No engines at all: teaching error names the install command.
-        let err = routed_engine_lane(&cfg, None, &[], "m", Some("qwen2"), "/x/m.gguf").unwrap_err();
+        let err = routed_engine_lane(&cfg, None, &[], "m", Some("qwen2"), false, "/x/m.gguf")
+            .unwrap_err();
         assert!(err.contains("blazar engine install"), "{err}");
         // A per-model pin to an uninstalled lane teaches with the roster.
         let pinned =
@@ -11017,6 +11038,7 @@ mod tests {
             &engine_rows,
             "m",
             Some("qwen2"),
+            false,
             "/x/m.gguf",
         )
         .unwrap_err();
@@ -11032,6 +11054,7 @@ mod tests {
                 &engine_rows,
                 "m",
                 Some("Qwen2ForCausalLM"),
+                false,
                 &dir.to_string_lossy()
             ),
             Ok("sg-1".to_string())
@@ -11056,6 +11079,7 @@ mod tests {
                 &engine_rows,
                 "m",
                 Some("instella-moe"),
+                false,
                 "/x/m.gguf"
             ),
             Ok("b-adv".to_string())
@@ -11068,6 +11092,7 @@ mod tests {
                 &engine_rows,
                 "m",
                 Some("qwen2"),
+                false,
                 "/x/m.gguf"
             ),
             Ok("b-main".to_string())
@@ -11083,6 +11108,7 @@ mod tests {
                 &engine_rows,
                 "m",
                 Some("instella-moe"),
+                false,
                 "/x/m.gguf"
             ),
             Ok("b-main".to_string())
@@ -11096,6 +11122,7 @@ mod tests {
                 &engine_rows,
                 "m",
                 Some("mystery-arch"),
+                false,
                 "/x/m.gguf"
             ),
             Ok("b-main".to_string())
@@ -11836,6 +11863,9 @@ mod tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
+            vae_path: None,
+            llm_path: None,
+            llm_vision_path: None,
             shards: 1,
             arch: None,
             params: None,
