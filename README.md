@@ -184,6 +184,8 @@ Typical policy:
 - **Plain safetensors** → SGLang or mistral.rs according to routing policy.
 - `engine_routing.mode = "manual"` pins a single active engine when you explicitly want that behavior.
 - A per-model engine override wins over automatic routing.
+- The ENGINE column in `blazar list` is the routing lane, not a capability guarantee; a `†` cell (plus a footer line, or the `engine_arch_gap` field in `--json`) marks a GGUF architecture the routed llama.cpp build provably cannot load — spawn fails with teaching unless a covering fork lane is installed.
+- When an installed lane (e.g. a fork build) advertises an architecture the picked lane provably lacks, all three listings (`list`, `/api/tags`, `/v1/models`) show that lane — the same one the spawn-time capability rescue lands on — so previews never advertise a lane that would crash first.
 
 For model fit and engine choice:
 

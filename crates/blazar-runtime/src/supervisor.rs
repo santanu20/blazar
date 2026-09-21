@@ -197,7 +197,22 @@ pub(crate) fn read_model_meta(
             .map_err(|e| format!("hf config: {e}")),
         (_, false) => blazar_core::read_metadata_file(std::path::Path::new(path))
             .map(|m| MetaBox::Gguf(Box::new(m)))
-            .map_err(|e| format!("gguf metadata: {e}")),
+            .map_err(|e| {
+                // Diffusion/model-component GGUFs (image-repo DiT /
+                // encoder / VAE splits) carry no general.architecture —
+                // the raw parse error teaches nothing. Same guard
+                // pattern as the wrong-lane shape guards above.
+                if e.to_string().contains("missing general.architecture") {
+                    format!(
+                        "{path}: GGUF has no architecture metadata — diffusion/model-component \
+                         file (image-repo DiT/encoder/VAE split), not a text model. No installed \
+                         engine serves image components; an sd.cpp image lane is not implemented \
+                         yet"
+                    )
+                } else {
+                    format!("gguf metadata: {e}")
+                }
+            }),
     }
 }
 
@@ -3109,30 +3124,31 @@ impl Supervisor {
     /// that already failed. The manifest's architecture set is mined
     /// from the source's `llama-arch.cpp` at build time — advertisement
     /// is a candidate filter; the actual load on the fork lane is the
-    /// verification.
+    /// verification. The preference itself lives in core
+    /// `advertising_lanes` so the listing previews can predict this very
+    /// rescue through the same rule.
     fn advertising_lanes(arch: &str, store: &Store, exclude: Option<&str>) -> Vec<String> {
         let Ok(rows) = store.list_engines() else {
             return Vec::new();
         };
-        let mut lanes: Vec<(String, blazar_core::engine_kind::LaneClass)> = rows
+        // Decoded manifests must outlive the borrowed lane views below.
+        let decoded: Vec<(&blazar_core::EngineRow, crate::engine::manifest::Manifest)> = rows
             .iter()
             .filter(|r| r.kind == blazar_core::engine_kind::EngineKind::LlamaCpp)
-            .filter(|r| Some(r.tag.as_str()) != exclude)
-            .filter(|r| {
+            .filter_map(|r| {
                 serde_json::from_str::<crate::engine::manifest::Manifest>(&r.manifest)
-                    .is_ok_and(|m| m.advertises_arch(arch))
+                    .ok()
+                    .map(|m| (r, m))
             })
-            .map(|r| (r.tag.clone(), r.lane_class()))
             .collect();
-        // Same preference rule as core `serving_lane`: a mainstream
-        // build that advertises the architecture beats a fork shim —
-        // the fork exists for architectures mainline lacks. Rows
-        // arrive newest-first; the stable sort keeps newest-first
-        // inside each class.
-        lanes.sort_by_key(|(_, class)| {
-            u8::from(*class == blazar_core::engine_kind::LaneClass::Fork)
-        });
-        lanes.into_iter().map(|(tag, _)| tag).collect()
+        let lanes: Vec<blazar_core::engine_kind::LaneArchView> = decoded
+            .iter()
+            .map(|(r, m)| (r.tag.as_str(), r.lane_class(), m.advertised_archs()))
+            .collect();
+        blazar_core::engine_kind::advertising_lanes(arch, exclude, &lanes)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
     }
 
     /// Classify a dead child's log tail as llama.cpp's
@@ -4564,6 +4580,30 @@ mod routing_tests {
                 Supervisor::resolved_load_timeout(Some(45), kind),
                 D::from_secs(45)
             );
+        }
+    }
+
+    #[test]
+    fn unit__read_model_meta__kvless_component_gguf_teaches_diffusion() {
+        use blazar_core::engine_kind::EngineKind as K;
+        // Minimal valid-header GGUF with ZERO metadata KVs — the
+        // diffusion-component shape (qwen-image DiT: 0 KVs, 297
+        // tensors). The raw parse error ("missing
+        // general.architecture") taught nothing; the guard must name
+        // the component nature and the missing lane.
+        let mut gguf = b"GGUF".to_vec();
+        gguf.extend_from_slice(&3u32.to_le_bytes());
+        gguf.extend_from_slice(&297u64.to_le_bytes());
+        gguf.extend_from_slice(&0u64.to_le_bytes());
+        let file = std::env::temp_dir().join("blazar-kvless-component.gguf");
+        std::fs::write(&file, &gguf).expect("write fixture");
+        match read_model_meta(file.to_str().unwrap(), K::LlamaCpp) {
+            Ok(_) => panic!("kvless GGUF must not parse as a text model"),
+            Err(e) => {
+                assert!(e.contains("diffusion/model-component"), "{e}");
+                assert!(e.contains("no architecture metadata"), "{e}");
+                assert!(e.contains("sd.cpp image lane"), "{e}");
+            }
         }
     }
 

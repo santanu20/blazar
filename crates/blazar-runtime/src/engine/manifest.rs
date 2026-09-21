@@ -182,6 +182,55 @@ pub struct Manifest {
     pub superseded_at_epoch: Option<i64>,
 }
 
+/// Preview of the spawn-time capability rescue (the re-route in
+/// `spawn_instance` after a lane dies rejecting an architecture): when
+/// the lane the router picked provably cannot load this GGUF's arch —
+/// its mined arch set is known and lacks it — the spawn path crashes
+/// once, then re-routes to the installed lane that advertises the
+/// architecture. Previews (list ENGINE cell, /api/tags, /v1/models)
+/// call this so they show the lane that will ULTIMATELY serve. No
+/// prediction under a user pin (the spawn rescue has the same gate),
+/// for non-llama.cpp picked kinds, or when the picked lane's arch set
+/// is unknown (honest unknown — the crash-time rescue still fires at
+/// spawn, it just cannot be predicted here).
+#[must_use]
+pub fn predicted_rescue_lane(
+    engine_rows: &[blazar_core::EngineRow],
+    arch: Option<&str>,
+    pin: Option<&str>,
+    picked_tag: &str,
+    picked_kind: blazar_core::engine_kind::EngineKind,
+) -> Option<String> {
+    let arch = arch?;
+    if pin.is_some() || picked_kind != blazar_core::engine_kind::EngineKind::LlamaCpp {
+        return None;
+    }
+    // Decoded manifests must outlive the borrowed lane views below.
+    let decoded: Vec<(&blazar_core::EngineRow, Manifest)> = engine_rows
+        .iter()
+        .filter(|r| r.kind == blazar_core::engine_kind::EngineKind::LlamaCpp)
+        .filter_map(|r| {
+            serde_json::from_str::<Manifest>(&r.manifest)
+                .ok()
+                .map(|m| (r, m))
+        })
+        .collect();
+    let lanes: Vec<blazar_core::engine_kind::LaneArchView> = decoded
+        .iter()
+        .map(|(r, m)| (r.tag.as_str(), r.lane_class(), m.advertised_archs()))
+        .collect();
+    let picked_lacks = lanes
+        .iter()
+        .find(|(t, _, _)| *t == picked_tag)
+        .is_some_and(|(_, _, set)| set.is_some_and(|s| !s.contains(arch)));
+    if !picked_lacks {
+        return None;
+    }
+    blazar_core::engine_kind::advertising_lanes(arch, Some(picked_tag), &lanes)
+        .first()
+        .map(|t| (*t).to_string())
+}
+
 impl Manifest {
     #[must_use]
     pub fn has_flag(&self, flag: &str) -> bool {
@@ -194,6 +243,14 @@ impl Manifest {
     #[must_use]
     pub fn advertises_arch(&self, arch: &str) -> bool {
         self.architectures.contains(arch)
+    }
+
+    /// The mined arch set, `None` when nothing was mined (pre-v2 rows,
+    /// non-llama.cpp kinds) — callers treat `None` as "advertises
+    /// nothing" and "cannot be proven to lack" (honest unknown).
+    #[must_use]
+    pub fn advertised_archs(&self) -> Option<&std::collections::BTreeSet<String>> {
+        (!self.architectures.is_empty()).then_some(&self.architectures)
     }
 
     /// Merge build-time provenance into a probed manifest (source
@@ -821,6 +878,98 @@ options:
                 "draft-eagle3".to_string(),
                 "ngram-simple".to_string()
             ]
+        );
+    }
+
+    fn rescue_row(tag: &str, archs: &[&str]) -> blazar_core::EngineRow {
+        blazar_core::EngineRow {
+            tag: tag.to_string(),
+            asset: "asset".to_string(),
+            sha256: "0".to_string(),
+            installed_at: 0,
+            active: false,
+            manifest: serde_json::json!({
+                "tag": tag,
+                "build_number": 1,
+                "version_raw": "version: 1",
+                "devices": [],
+                "flags": [],
+                "spec_types": [],
+                "server_path": "/x/llama-server",
+                "architectures": archs,
+            })
+            .to_string(),
+            kind: blazar_core::engine_kind::EngineKind::LlamaCpp,
+        }
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
+    fn unit__predicted_rescue_lane__marks_rescue_only_when_provable() {
+        let rows = vec![
+            rescue_row("b-main", &["qwen2"]),
+            rescue_row("b-adv", &["instella-moe"]),
+        ];
+        let llama = blazar_core::engine_kind::EngineKind::LlamaCpp;
+        // Picked provably lacks the arch, an advertiser exists.
+        assert_eq!(
+            predicted_rescue_lane(&rows, Some("instella-moe"), None, "b-main", llama),
+            Some("b-adv".to_string())
+        );
+        // Arch advertised by the picked lane: no rescue.
+        assert_eq!(
+            predicted_rescue_lane(&rows, Some("qwen2"), None, "b-main", llama),
+            None
+        );
+        // User pin blocks the prediction (spawn-rescue gate parity).
+        assert_eq!(
+            predicted_rescue_lane(&rows, Some("instella-moe"), Some("b-main"), "b-main", llama),
+            None
+        );
+        // No advertiser for the arch.
+        assert_eq!(
+            predicted_rescue_lane(&rows, Some("mystery"), None, "b-main", llama),
+            None
+        );
+        // Honest unknown: a v1 row (no architectures key) cannot prove a
+        // lack, so it never triggers a prediction.
+        let v1 = blazar_core::EngineRow {
+            manifest: serde_json::json!({
+                "tag": "b-v1",
+                "build_number": 1,
+                "version_raw": "version: 1",
+                "devices": [],
+                "flags": [],
+                "spec_types": [],
+                "server_path": "/x/llama-server"
+            })
+            .to_string(),
+            ..rescue_row("b-v1", &[])
+        };
+        assert_eq!(
+            predicted_rescue_lane(
+                &[v1, rows[1].clone()],
+                Some("instella-moe"),
+                None,
+                "b-v1",
+                llama
+            ),
+            None
+        );
+        // Unknown model arch, and non-llamacpp picked kinds.
+        assert_eq!(
+            predicted_rescue_lane(&rows, None, None, "b-main", llama),
+            None
+        );
+        assert_eq!(
+            predicted_rescue_lane(
+                &rows,
+                Some("Qwen2ForCausalLM"),
+                None,
+                "b-main",
+                blazar_core::engine_kind::EngineKind::Sglang
+            ),
+            None
         );
     }
 

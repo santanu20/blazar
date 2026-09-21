@@ -1055,6 +1055,23 @@ pub(crate) fn resolve_serving(
                 .collect();
             let global_row = s.active_engine().ok().flatten();
             let global = global_row.as_ref().map_or(EngineKind::LlamaCpp, |r| r.kind);
+            // Capability-rescue preview: when the picked lane provably
+            // cannot load the model's GGUF arch and another installed
+            // lane advertises it, spawn re-routes after one bounded
+            // crash — predict that end-state lane here so listings and
+            // routing can never disagree. Never fires under a user pin
+            // (the spawn rescue has the same gate) or when the picked
+            // lane's arch set is unknown (honest unknown).
+            let arch = s.get_model(model_name).ok().flatten().and_then(|r| r.arch);
+            let rescue_preview = |tag: &str, kind: EngineKind| -> Option<String> {
+                blazar_runtime::predicted_rescue_lane(
+                    &rows,
+                    arch.as_deref(),
+                    overlay.engine.as_deref(),
+                    tag,
+                    kind,
+                )
+            };
             let lane = engine_kind::serving_lane(
                 state.config.engine_routing.mode,
                 state.config.engine_routing.policy,
@@ -1065,18 +1082,22 @@ pub(crate) fn resolve_serving(
                 &installed,
             );
             match lane {
-                // Routed lane: its row is the answer.
+                // Routed lane: its row is the answer, unless the
+                // rescue preview sees a provably-unservable arch.
                 Ok(Some((tag, kind))) => Some(LaneResolution {
-                    tag: Some(tag),
+                    tag: rescue_preview(&tag, kind).or(Some(tag)),
                     kind,
                 }),
                 // Manual mode (or a pin resolving to the global engine): the
                 // GLOBAL engine serves — same contract the pre-routing
-                // daemon-lifetime cache had.
-                Ok(None) => Some(LaneResolution {
-                    tag: global_row.map(|r| r.tag),
-                    kind: global,
-                }),
+                // daemon-lifetime cache had (rescue preview applies here
+                // too: spawn's re-route is not mode-gated).
+                Ok(None) => {
+                    let tag = global_row.as_ref().and_then(|g| {
+                        rescue_preview(&g.tag, g.kind).or_else(|| Some(g.tag.clone()))
+                    });
+                    Some(LaneResolution { tag, kind: global })
+                }
                 // Nothing can serve (or a bad pin): no tag to advertise; the
                 // spawn path delivers the teaching error on use.
                 Err(_) => Some(LaneResolution {
