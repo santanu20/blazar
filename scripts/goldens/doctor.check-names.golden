@@ -2,6 +2,7 @@ app currency
 bench baseline
 binary
 ccache
+chunking
 config
 cuda toolchain
 disk
