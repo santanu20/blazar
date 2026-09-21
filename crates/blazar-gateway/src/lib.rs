@@ -6,6 +6,7 @@ pub mod audit;
 pub mod batch;
 pub mod cache_bust;
 pub mod histogram;
+pub mod images;
 pub mod keys;
 pub mod latechunk;
 pub mod ollama;
@@ -279,6 +280,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(whisper::audio_transcriptions),
         )
         .route("/v1/audio/speech", post(tts::audio_speech))
+        .route("/v1/images/generations", post(images::generations))
+        .route("/v1/images/edits", post(images::edits))
         .route("/audio/transcriptions", post(whisper::audio_transcriptions))
         .route("/infill", post(openai::openai_proxy))
         .route("/v1/chat/completions/control", post(openai::openai_proxy))

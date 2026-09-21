@@ -949,7 +949,7 @@ pub async fn responses_api(
 /// transcriptions upload audio bytes; the JSON path cannot apply).
 /// Boundary-aware: only scans part HEADERS (bounded window after each
 /// boundary), never audio payload bytes.
-fn extract_model_multipart(body: &[u8], content_type: &str) -> Option<String> {
+pub(crate) fn extract_model_multipart(body: &[u8], content_type: &str) -> Option<String> {
     let boundary = content_type
         .split(';')
         .map(str::trim)
