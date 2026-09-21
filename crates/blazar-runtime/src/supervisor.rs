@@ -192,6 +192,16 @@ pub(crate) fn read_model_meta(
              — run: blazar engine install --kind mistralrs, \
              or blazar engine use <llamacpp-tag> for the GGUF lane"
         )),
+        // sdcpp rows are diffusion component sets: the DiT GGUF carries
+        // no text-model metadata by design, and compile_sdcpp compiles
+        // from the component set (VAE/TE paths + file sizes), never from
+        // GgufMeta. A default meta keeps the shared ProfileInput shape
+        // without pretending the DiT is a text model.
+        (K::SdCpp, false) => Ok(MetaBox::Gguf(Box::default())),
+        (K::SdCpp, true) => Err(format!(
+            "sdcpp serves GGUF DiT files from a component set; {path} is a \
+             directory — re-pull the model so the DiT lands as a file"
+        )),
         (_, true) => blazar_core::read_hf_config(std::path::Path::new(path))
             .map(MetaBox::Hf)
             .map_err(|e| format!("hf config: {e}")),
@@ -1591,6 +1601,7 @@ impl Supervisor {
         key: &str,
         endpoint: &Endpoint,
         manifest: &crate::engine::manifest::Manifest,
+        kind: blazar_core::engine_kind::EngineKind,
     ) -> Result<Option<ChildAuth>, SupervisionError> {
         let enabled = match self.config.child_auth {
             Some(v) => v,
@@ -1602,18 +1613,22 @@ impl Supervisor {
             return Ok(None);
         }
         if !manifest.flags.contains("--api-key-file") && !manifest.flags.contains("--api-key") {
-            // Kind-forked remedy: mistral.rs has no update lane (its engine
-            // update command itself teaches `engine install`), so name the
-            // install lane directly instead.
-            let remedy = if self.engine.kind() == blazar_core::engine_kind::EngineKind::MistralRs {
-                "blazar engine install --kind mistralrs"
-            } else {
-                "blazar engine update"
+            // The remedy belongs to the CHILD's engine (a routed spawn may
+            // differ from the daemon's global lane), hence the explicit
+            // `kind` parameter.
+            let remedy = match kind {
+                blazar_core::engine_kind::EngineKind::MistralRs => {
+                    "; run: blazar engine install --kind mistralrs"
+                }
+                blazar_core::engine_kind::EngineKind::SdCpp => {
+                    "; sd-server ships no auth flag upstream — the child is loopback-only"
+                }
+                _ => "; run: blazar engine update",
             };
             tracing::warn!(
                 model = key,
                 "child_auth: engine {} lacks --api-key/--api-key-file; child stays \
-                 unauthenticated (run: {remedy})",
+                 unauthenticated{remedy}",
                 manifest.tag
             );
             return Ok(None);
@@ -1734,6 +1749,9 @@ impl Supervisor {
                 draft_path: draft_path.as_deref(),
                 draft_gguf: None, // router preset: one child, no co-residency planning
                 mmproj_path: m.mmproj_path.as_deref(),
+                vae_path: m.vae_path.as_deref(),
+                llm_path: m.llm_path.as_deref(),
+                llm_vision_path: m.llm_vision_path.as_deref(),
                 // router preset: every pulled model rides one child incl
                 // VL rows — force the projector on regardless of policy
                 mmproj_force: true,
@@ -1792,6 +1810,9 @@ impl Supervisor {
             bytes: 0,
             sha256: None,
             mmproj_path: None,
+            vae_path: None,
+            llm_path: None,
+            llm_vision_path: None,
             shards: 1,
             arch: None,
             params: None,
@@ -1808,7 +1829,12 @@ impl Supervisor {
             // Child auth dies with the child: minted per attempt (same
             // keyfile path, so retries overwrite), removed when this
             // attempt or the whole spawn fails.
-            let auth = match self.mint_child_auth(ROUTER_KEY, &endpoint, manifest) {
+            let auth = match self.mint_child_auth(
+                ROUTER_KEY,
+                &endpoint,
+                manifest,
+                blazar_core::engine_kind::EngineKind::LlamaCpp,
+            ) {
                 Ok(a) => a,
                 Err(e) => {
                     if let Some(p) = &auth_keyfile {
@@ -2236,6 +2262,7 @@ impl Supervisor {
             self.config.engine_routing.mode,
             self.config.engine_routing.policy,
             overlay.engine.as_deref(),
+            model.vae_path.is_some(),
             safetensors,
             model.is_quantized_safetensors(),
             self.engine.kind(),
@@ -2565,6 +2592,9 @@ impl Supervisor {
                 draft_path: draft_path.as_deref(),
                 draft_gguf: draft_gguf.as_ref(),
                 mmproj_path: model.mmproj_path.as_deref(),
+                vae_path: model.vae_path.as_deref(),
+                llm_path: model.llm_path.as_deref(),
+                llm_vision_path: model.llm_vision_path.as_deref(),
                 // KV-estimate probe: policy-neutral (mirror the spawn's
                 // own key-derived force below for estimate honesty)
                 mmproj_force: key.ends_with("@vision"),
@@ -2695,7 +2725,7 @@ impl Supervisor {
             // Child auth dies with the child: minted per attempt (same
             // keyfile path, so retries overwrite), removed when this
             // attempt or the whole spawn fails.
-            let auth = match self.mint_child_auth(key, &endpoint, manifest) {
+            let auth = match self.mint_child_auth(key, &endpoint, manifest, engine.kind()) {
                 Ok(a) => a,
                 Err(e) => {
                     if let Some(p) = &auth_keyfile {
@@ -2734,6 +2764,9 @@ impl Supervisor {
                 draft_path: draft_path.as_deref(),
                 draft_gguf: draft_gguf.as_ref(),
                 mmproj_path: model.mmproj_path.as_deref(),
+                vae_path: model.vae_path.as_deref(),
+                llm_path: model.llm_path.as_deref(),
+                llm_vision_path: model.llm_vision_path.as_deref(),
                 // @vision respawn = caller demanded a projector-carrying
                 // child (ensure_vision); every other spawn honors policy
                 mmproj_force: key.ends_with("@vision"),
@@ -4611,6 +4644,37 @@ mod routing_tests {
     }
 
     #[test]
+    fn unit__read_model_meta__sdcpp_diT_parses_as_component_not_text() {
+        use blazar_core::engine_kind::EngineKind as K;
+        // Same 0-KV component GGUF as the teaching pin above — under the
+        // sdcpp lane it must NOT teach (the DiT is expected there): the
+        // meta is a placeholder and compile_sdcpp drives off the
+        // component set, never off GgufMeta.
+        let mut gguf = b"GGUF".to_vec();
+        gguf.extend_from_slice(&3u32.to_le_bytes());
+        gguf.extend_from_slice(&297u64.to_le_bytes());
+        gguf.extend_from_slice(&0u64.to_le_bytes());
+        let file = std::env::temp_dir().join("blazar-kvless-sdcpp.gguf");
+        std::fs::write(&file, &gguf).expect("write fixture");
+        let meta = read_model_meta(file.to_str().unwrap(), K::SdCpp)
+            .expect("sdcpp accepts its component DiT");
+        match meta.borrow_meta() {
+            blazar_core::hfmeta::ModelMeta::Gguf(g) => assert_eq!(g.architecture, ""),
+            other @ blazar_core::hfmeta::ModelMeta::Hf(_) => {
+                panic!("sdcpp meta must be the placeholder GGUF shape, got {other:?}")
+            }
+        }
+        // A directory under the sdcpp lane is a shape error with a
+        // re-pull remedy, never an hf-config parse attempt.
+        let dir = std::env::temp_dir().join("blazar-sdcpp-dir-probe");
+        std::fs::create_dir_all(&dir).expect("mkdir fixture");
+        match read_model_meta(dir.to_str().unwrap(), K::SdCpp) {
+            Ok(_) => panic!("dir under sdcpp must error"),
+            Err(e) => assert!(e.contains("DiT"), "{e}"),
+        }
+    }
+
+    #[test]
     fn unit__read_model_meta__wrong_lane_pairs_teach_the_engine_remedy() {
         use blazar_core::engine_kind::EngineKind as K;
         // MetaBox is not Debug, so expect_err cannot be used — take the
@@ -4742,6 +4806,7 @@ mod routing_tests {
     #[allow(non_snake_case)]
     #[test]
     fn unit__mint_child_auth__keyfile_lane_argv_fallback_and_gates() {
+        use blazar_core::engine_kind::EngineKind as K;
         let root = tempfile::TempDir::new().unwrap();
         let dirs = BlazarDirs {
             config_dir: root.path().join("cfg"),
@@ -4779,7 +4844,12 @@ mod routing_tests {
 
         // File lane: keyfile minted 0600, argv carries the path only.
         let file_lane = auto
-            .mint_child_auth("m1", &tcp, &manifest(&["--api-key", "--api-key-file"]))
+            .mint_child_auth(
+                "m1",
+                &tcp,
+                &manifest(&["--api-key", "--api-key-file"]),
+                K::LlamaCpp,
+            )
             .unwrap()
             .unwrap();
         let keyfile = dirs.run_dir().join("m1.apikey");
@@ -4801,7 +4871,7 @@ mod routing_tests {
 
         // Argv fallback (sglang today): secret rides argv, no keyfile.
         let argv_lane = auto
-            .mint_child_auth("m2", &tcp, &manifest(&["--api-key"]))
+            .mint_child_auth("m2", &tcp, &manifest(&["--api-key"]), K::LlamaCpp)
             .unwrap()
             .unwrap();
         assert_eq!(argv_lane.argv[0], "--api-key");
@@ -4810,7 +4880,7 @@ mod routing_tests {
 
         // Engine update gaining --api-key-file flips the lane on its own.
         let flipped = auto
-            .mint_child_auth("m3", &tcp, &manifest(&["--api-key-file"]))
+            .mint_child_auth("m3", &tcp, &manifest(&["--api-key-file"]), K::LlamaCpp)
             .unwrap()
             .unwrap();
         assert!(
@@ -4820,7 +4890,7 @@ mod routing_tests {
 
         // No auth flag surface: warn-skip, child stays open.
         assert!(auto
-            .mint_child_auth("m4", &tcp, &manifest(&[]))
+            .mint_child_auth("m4", &tcp, &manifest(&[]), K::LlamaCpp)
             .unwrap()
             .is_none());
 
@@ -4829,7 +4899,7 @@ mod routing_tests {
             socket: "/unused/blazar.sock".into(),
         };
         assert!(auto
-            .mint_child_auth("m5", &uds, &manifest(&["--api-key"]))
+            .mint_child_auth("m5", &uds, &manifest(&["--api-key"]), K::LlamaCpp)
             .unwrap()
             .is_none());
 
@@ -4839,7 +4909,12 @@ mod routing_tests {
             ..Config::default()
         };
         assert!(sup(off)
-            .mint_child_auth("m6", &tcp, &manifest(&["--api-key", "--api-key-file"]))
+            .mint_child_auth(
+                "m6",
+                &tcp,
+                &manifest(&["--api-key", "--api-key-file"]),
+                K::LlamaCpp
+            )
             .unwrap()
             .is_none());
     }
@@ -5069,6 +5144,9 @@ mod routing_tests {
                 bytes: weights_bytes,
                 sha256: None,
                 mmproj_path: None,
+                vae_path: None,
+                llm_path: None,
+                llm_vision_path: None,
                 shards: 1,
                 arch: None,
                 params: None,
@@ -5205,6 +5283,9 @@ mod routing_tests {
                 bytes: 1,
                 sha256: None,
                 mmproj_path: None,
+                vae_path: None,
+                llm_path: None,
+                llm_vision_path: None,
                 shards: 1,
                 arch: None,
                 params: None,
@@ -5428,6 +5509,9 @@ mod routing_tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
+            vae_path: None,
+            llm_path: None,
+            llm_vision_path: None,
             shards: 1,
             arch: None,
             params: None,
@@ -5661,6 +5745,9 @@ mod routing_tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
+            vae_path: None,
+            llm_path: None,
+            llm_vision_path: None,
             shards: 1,
             arch: None,
             params: None,
@@ -5728,6 +5815,9 @@ mod routing_tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
+            vae_path: None,
+            llm_path: None,
+            llm_vision_path: None,
             shards: 1,
             arch: None,
             params: None,

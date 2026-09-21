@@ -881,7 +881,10 @@ pub fn build_input<'a>(
         draft_path,
         // bench scores one argv in isolation; no co-residency planning
         draft_gguf: None,
-        mmproj_path: None, // vision is irrelevant to llama-bench scoring
+        mmproj_path: None,
+        vae_path: None,
+        llm_path: None,
+        llm_vision_path: None,
         mmproj_force: false,
         engine_tag,
         supported_flags,
