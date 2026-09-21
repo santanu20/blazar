@@ -2030,8 +2030,11 @@ impl fmt::Display for Config {
 ///   kept, older pruned) — an uninstall/reinstall cycle or operator
 ///   mistake is recoverable;
 /// - write is temp-file + atomic rename (a crash mid-write never leaves
-///   a truncated config behind).
+///   a truncated config behind);
+/// - the temp name is unique per writer, so concurrent writers (CLI vs
+///   daemon, parallel CLIs) never steal each other's rename.
 pub fn persist_config(path: &std::path::Path, body: &str) -> CoreResult<()> {
+    static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if path.exists() {
         let ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2054,7 +2057,19 @@ pub fn persist_config(path: &std::path::Path, body: &str) -> CoreResult<()> {
         let bak = path.with_file_name(format!("config.toml.bak-{ms}"));
         std::fs::copy(path, &bak)?;
     }
-    let tmp = path.with_file_name("config.toml.tmp-write");
+    // Unique-per-writer temp name. A FIXED name makes two concurrent
+    // writers race on write+rename — the loser's rename finds the temp
+    // already consumed and dies with a spurious io ENOENT (live case:
+    // three parallel `pallama upgrade` CLIs creating the config on a
+    // fresh HOME, e.g. CI; also CLI-vs-daemon key rotation). The pid
+    // separates processes, the counter separates writers inside one.
+    // A crashed writer can orphan its temp; the residue is bounded and
+    // a later same-pid writer harmlessly overwrites it.
+    let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .map_or_else(|| "config".into(), |n| n.to_string_lossy().into_owned());
+    let tmp = path.with_file_name(format!("{name}.tmp-write.{}.{seq}", std::process::id()));
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
@@ -4863,6 +4878,40 @@ mod persist_tests {
     use super::persist_config;
 
     #[test]
+    fn unit__persist_config__concurrent_writers_all_succeed() {
+        // Pin: a FIXED temp name made concurrent writers race write→rename;
+        // the loser died with a spurious io ENOENT (live case: three
+        // parallel `pallama upgrade` CLIs on a fresh HOME crashed one CLI
+        // before it could print its result). Every writer must succeed and
+        // the final file must be one complete body — never torn, never
+        // missing.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::thread::scope(|s| {
+            for t in 0..8 {
+                let path = &path;
+                s.spawn(move || {
+                    for i in 0..25 {
+                        persist_config(path, &format!("port = {t}{i:02}\n")).unwrap();
+                    }
+                });
+            }
+        });
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.starts_with("port = "), "final body intact: {body}");
+        let tmp_residue = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("config.toml.tmp-write")
+            })
+            .count();
+        assert_eq!(tmp_residue, 0, "no orphaned temps after clean runs");
+    }
+
+    #[test]
     fn unit__persist_config__backs_up_keeps_five_atomic() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -4871,10 +4920,16 @@ mod persist_tests {
         }
         // Final body wins atomically; no temp residue.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "port = 11436\n");
-        assert!(
-            !path.with_file_name("config.toml.tmp-write").exists(),
-            "temp file must be renamed away"
-        );
+        let tmp_residue = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("config.toml.tmp-write")
+            })
+            .count();
+        assert_eq!(tmp_residue, 0, "temp files must be renamed away");
         // Backups exist and never exceed keep-5 (same-ms writes may
         // collapse onto one name, so only bound the range).
         let baks = std::fs::read_dir(dir.path())
