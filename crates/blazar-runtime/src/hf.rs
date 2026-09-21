@@ -1593,11 +1593,11 @@ pub(crate) fn model_file_intact(row: &ModelRow) -> bool {
 
 /// Container-level GGUF check: header + KV section must parse.
 /// `read_metadata_file` additionally requires
-/// `general.architecture`, which diffusion component files (DiT /
+/// `general.architecture`, which diffusion component files (`DiT` /
 /// encoder splits — 0-KV GGUFs) never carry; for them that exact
 /// error still proves the container walked clean (magic, version,
 /// every KV entry). Same string-match precedent as the reconcile and
-/// read_model_meta guards. Any other parse error is real corruption.
+/// `read_model_meta` guards. Any other parse error is real corruption.
 fn gguf_container_ok(path: &Path) -> bool {
     match gguf::read_metadata_file(path) {
         Ok(_) => true,
@@ -2229,16 +2229,20 @@ impl Puller {
             || plan.filename.clone(),
             |f| f.to_string_lossy().into_owned(),
         );
+        // Content-first reuse: a byte-exact file may already sit under
+        // the bare leaf (hand-placed, or left by an earlier install) —
+        // `unique_dest` disambiguates NAME collisions before content is
+        // considered, which once re-downloaded a 5 GiB text encoder
+        // right next to its own byte-exact copy. Both the bare leaf
+        // and the collision-resolved dest are content-checked.
+        let bare = models_dir.join(&leaf);
         let dest = unique_dest(&models_dir, &leaf, repo);
-        // Re-use contract: an intact file (exact size; the download lane
-        // itself sha-verifies on fetch) is NEVER re-fetched.
-        if dest.is_file() {
-            let size_ok = std::fs::metadata(&dest).is_ok_and(|m| m.len() == plan.bytes);
-            if size_ok && plan.bytes > 0 {
-                tracing::info!(model = %name, "component {} already on disk — reusing", leaf);
+        for candidate in [&bare, &dest] {
+            if let Some(reused) = reuse_byte_exact(candidate, plan) {
+                tracing::info!(model = %name, "component {} already on disk (byte-exact) — reusing", leaf);
                 *done += plan.bytes;
                 bar.set_position(*done);
-                return Ok(Some(dest));
+                return Ok(Some(reused));
             }
         }
         let before = *done;
@@ -2587,12 +2591,87 @@ pub(crate) fn unique_dest(dir: &Path, filename: &str, repo: &str) -> PathBuf {
     dir.join(format!("{repo_slug}--{}", leaf.to_string_lossy()))
 }
 
+/// A file at `candidate` that is byte-exact for `plan`: size gates a
+/// full sha256 (hashing only runs on a size match, so the common miss
+/// costs one stat — the rare hit is a multi-second multi-GiB read that
+/// beats re-downloading the same bytes). Unknown published sha falls
+/// back to size-only, matching the download lane's own verification
+/// trust level.
+fn reuse_byte_exact(candidate: &Path, plan: &FilePlan) -> Option<PathBuf> {
+    let meta = std::fs::metadata(candidate).ok()?;
+    if !meta.is_file() || meta.len() != plan.bytes || plan.bytes == 0 {
+        return None;
+    }
+    match plan.sha256.as_deref() {
+        Some(expected) if !expected.is_empty() => {
+            let mut f = std::fs::File::open(candidate).ok()?;
+            let mut h = Sha256::new();
+            std::io::copy(&mut f, &mut h).ok()?;
+            if format!("{:x}", h.finalize()).eq_ignore_ascii_case(expected) {
+                Some(candidate.to_path_buf())
+            } else {
+                None
+            }
+        }
+        _ => Some(candidate.to_path_buf()),
+    }
+}
+
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn unit__reuse_byte_exact__truth_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = b"component-bytes".to_vec();
+        let f = tmp.path().join("te.gguf");
+        std::fs::write(&f, &body).unwrap();
+        let sha = {
+            use sha2::Digest;
+            let mut h = sha2::Sha256::new();
+            h.update(&body);
+            format!("{:x}", h.finalize())
+        };
+        let plan = |bytes: u64, sha: Option<&str>| FilePlan {
+            filename: "te.gguf".into(),
+            bytes,
+            sha256: sha.map(str::to_string),
+        };
+        // Byte-exact (size + sha) reuses.
+        assert_eq!(
+            reuse_byte_exact(&f, &plan(body.len() as u64, Some(&sha))),
+            Some(f.clone())
+        );
+        // Same size, different sha (hand-placed imposter) never reuses.
+        let wrong = {
+            use sha2::Digest;
+            let mut h = sha2::Sha256::new();
+            h.update(b"other");
+            format!("{:x}", h.finalize())
+        };
+        assert_eq!(
+            reuse_byte_exact(&f, &plan(body.len() as u64, Some(&wrong))),
+            None
+        );
+        // Size mismatch short-circuits before any hashing.
+        assert_eq!(reuse_byte_exact(&f, &plan(5, Some(&sha))), None);
+        // Unknown published sha falls back to size-only (download-lane
+        // verification trust level).
+        assert_eq!(
+            reuse_byte_exact(&f, &plan(body.len() as u64, None)),
+            Some(f.clone())
+        );
+        // Missing file / zero-byte plan never reuse.
+        assert_eq!(
+            reuse_byte_exact(&tmp.path().join("nope"), &plan(1, Some(&sha))),
+            None
+        );
+        assert_eq!(reuse_byte_exact(&f, &plan(0, None)), None);
+    }
 
     #[test]
     fn unit__safetensors_byte_estimate__dtype_math_and_unknown_refusal() {
