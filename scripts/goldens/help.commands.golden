@@ -32,6 +32,7 @@ signin
 signout
 snapshot
 stop
+tts
 tune
 upgrade
 watch

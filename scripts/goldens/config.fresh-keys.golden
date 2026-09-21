@@ -9,6 +9,7 @@ cache_ram_mb
 cache_reuse
 cache_type
 check_tensors
+child_header_timeout_secs
 child_transport
 context_shift
 control_vector_layer_range
@@ -21,6 +22,7 @@ cpu_range
 cpu_strict
 ctx_checkpoints
 ctx_extend
+decode_policy
 default_ctx
 deterministic
 devices
@@ -30,6 +32,7 @@ engine_asset
 engine_check_secs
 engine_env
 engine_routing
+fork_retire_days
 host
 idle_sleep_secs
 idle_timeout_secs
@@ -70,6 +73,8 @@ predictive_preload
 prio
 prio_batch
 prompt_preflight
+prompt_recipe
+raw_lane_max_tokens
 reasoning
 reasoning_budget
 reasoning_budget_message
@@ -95,6 +100,7 @@ slot_prompt_similarity
 slots
 spawn_mem_guard
 spec
+spec_autopull
 spec_cache
 spec_draft_backend_sampling
 spec_draft_cpu_moe

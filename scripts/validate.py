@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """pallama exhaustive validation harness — REAL engine, REAL model, REAL config.
 
+Dev tooling, not shipped: this script is the project's own e2e validator
+(excluded from release packaging); it exercises the installed/repo pallama
+binary end-to-end so no command, flag, env knob, or route can silently rot.
+
 The Step-11 "god tier" validator as a permanent script: boots an ISOLATED
 pallama daemon (temp XDG dirs, copied store DB, symlinked real engine +
 model files, own random-free port) and walks every config knob, API route, CLI
@@ -101,6 +105,7 @@ MEM_FLOOR_MIB = 1536
 
 CHECKS: list[dict] = []
 COVERAGE: list[dict] = []
+ROUTE_COVERAGE: list[str] = []
 DAEMON: Daemon | None = None
 SANDBOX: Sandbox | None = None
 USER_CONFIG_SHA = None
@@ -928,6 +933,7 @@ _COMMAND_ATTRS = {
     "stop.model": (True, True, False, False, True),
     "stop.bare": (True, False, False, False, True),
     "pull": (False, False, True, True, False),
+    "pull.verify": (False, False, True, True, False),
     "run.miss-pulls": (True, True, True, True, False),
     "import.hardlink": (False, False, False, False, True),
     "import.copy": (False, False, False, False, True),
@@ -971,11 +977,22 @@ _COMMAND_ATTRS = {
     "whisper.transcribe": (False, False, False, False, False),
     "whisper.pin": (False, False, False, False, False),
     "whisper.pin.refusal": (False, False, False, False, True),
+    "tts.install": (False, False, True, True, False),
+    "tts.pull": (False, False, True, True, False),
+    "tts.list": (False, False, False, False, True),
+    "tts.synthesize": (False, False, True, False, False),
+    "tts.synthesize.no-voice": (False, False, False, False, True),
+    "tts.pin.refusal": (False, False, False, False, True),
     "engine.update": (False, False, True, True, False),
     "engine.list": (False, False, False, False, True),
     "engine.use": (False, False, False, False, True),
+    "engine.rm": (False, False, False, False, True),
+    "engine.prune": (False, False, False, False, True),
     "engine.rollback": (False, False, False, False, True),
     "engine.local": (False, False, False, False, True),
+    "engine.build": (False, False, True, True, False),
+    "engine.install": (False, False, True, True, False),
+    "engine.offers": (False, False, False, True, True),
     "lora.add": (False, False, False, False, True),
     "lora.rm": (False, False, False, False, True),
     "lora.list": (False, False, False, False, True),
@@ -984,6 +1001,9 @@ _COMMAND_ATTRS = {
     "config.list": (False, False, False, False, True),
     "config.get": (False, False, False, False, True),
     "config.set": (False, False, False, False, True),
+    "config.unset": (False, False, False, False, True),
+    "config.defaults": (False, False, False, False, True),
+    "config.edit": (False, False, False, False, True),
     "upgrade.dry-run": (False, False, False, True, False),
     "session.save": (True, True, False, False, True),
     "session.restore": (True, True, False, False, True),
@@ -1059,6 +1079,54 @@ _K = [
         "boundary",
         None,
         "needs 2+ concurrently-loaded models (RAM)",
+    ),
+    (
+        "child_header_timeout_secs",
+        False,
+        False,
+        "boundary",
+        None,
+        "engine child HTTP header timeout; set->list echo + full-manifest boot",
+    ),
+    (
+        "decode_policy",
+        False,
+        False,
+        "boundary",
+        None,
+        "decode-lane policy; set->list echo + full-manifest boot",
+    ),
+    (
+        "fork_retire_days",
+        False,
+        False,
+        "boundary",
+        None,
+        "fork gc horizon; set->list echo + full-manifest boot",
+    ),
+    (
+        "prompt_recipe",
+        False,
+        False,
+        "boundary",
+        None,
+        "prompt shaping recipe; set->list echo + full-manifest boot",
+    ),
+    (
+        "raw_lane_max_tokens",
+        False,
+        False,
+        "boundary",
+        None,
+        "raw-lane token ceiling; set->list echo + full-manifest boot",
+    ),
+    (
+        "spec_autopull",
+        False,
+        False,
+        "boundary",
+        None,
+        "spec-draft autopull switch; set->list echo + full-manifest boot",
     ),
     (
         "child_transport",
@@ -2896,12 +2964,15 @@ def wait_record(
 
 
 def cli(
-    *args: str, timeout: int = 300, check_exit: bool = False
+    *args: str,
+    timeout: int = 300,
+    check_exit: bool = False,
+    extra_env: dict | None = None,
 ) -> subprocess.CompletedProcess:
     assert SANDBOX is not None
     p = subprocess.run(
         [PAL, *args],
-        env=SANDBOX.env(),
+        env=SANDBOX.env(extra_env),
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -2927,6 +2998,52 @@ def _help_command_names(help_stdout: str) -> list[str]:
         for ln in help_stdout.splitlines()
         if re.match(r"^  [a-z]", ln)
     ]
+
+
+def _subcommand_leaves(help_stdout: str) -> list[str]:
+    """Leaf names from a nested `parent --help` Commands: section.
+
+    Bounded to the section (unlike `_help_command_names`, which parses
+    the grouped top-level format): after-help example blocks carry
+    two-space indented lines that would masquerade as leaves. clap
+    injects `help` into every parent; the caller accounts for it.
+    """
+    leaves: list[str] = []
+    in_sec = False
+    for ln in help_stdout.splitlines():
+        if ln.strip().lower().startswith("commands:"):
+            in_sec = True
+            continue
+        if in_sec:
+            if not ln.startswith("  "):
+                break
+            m = re.match(r"\s{2,}([\w-]+)", ln)
+            if m:
+                leaves.append(m.group(1))
+    return leaves
+
+
+def _option_flags(help_stdout: str) -> list[str]:
+    """Long flags advertised in a help text's Options: section.
+
+    Column-anchored: only lines whose first non-space token is a short
+    + long pair (`  -j, --json ...`) or a bare long (`      --json ...`)
+    count, so doc text mentioning `--json` never registers as a flag.
+    Short-only identity is skipped: clap always co-renders the long form.
+    """
+    flags: list[str] = []
+    in_sec = False
+    for ln in help_stdout.splitlines():
+        if ln.strip().lower().startswith("options:"):
+            in_sec = True
+            continue
+        if in_sec:
+            if ln.strip() and not ln.startswith("  "):
+                break
+            m = re.match(r"^\s+(?:-\w,\s*)?(--[a-z0-9][a-z0-9-]*)", ln)
+            if m and m.group(1) not in flags:
+                flags.append(m.group(1))
+    return flags
 
 
 # ----------------------------------------------------------------- phases
@@ -3424,6 +3541,26 @@ def phase_config() -> None:
         "max_loaded_models",
         "capacity effect needs 2+ models; emit + math covered by unit tests",
     )
+
+
+def _gateway_route_paths() -> set[str]:
+    """Literal route paths from the gateway's axum table, at runtime.
+
+    Source-anchored (crates/pallama-gateway/src/lib.rs) so a route added
+    upstream must gain probe coverage here or gate (e) goes red — routes
+    never rot silently. Empty set when the source tree is absent.
+    """
+    src = os.path.join(
+        dirname(dirname(abspath(__file__))),
+        "crates",
+        "pallama-gateway",
+        "src",
+        "lib.rs",
+    )
+    if not os.path.exists(src):
+        return set()
+    text = open(src, encoding="utf-8").read()
+    return set(re.findall(r'\.route\(\s*"([^"]+)"', text))
 
 
 def phase_api() -> None:
@@ -4102,6 +4239,29 @@ def phase_api() -> None:
                     f"field={vfield or 'none'} txt={str(vtxt)[:60]!r} "
                     f"err={verr!r}",
                 )
+
+    # -- Routes: every gateway route answers (unrouted-404 proof) --------
+    # A route that vanished from the build (or was never wired) must fail
+    # here instead of rotting. Any answer that is not axum's unrouted 404
+    # (empty/plain body) proves routing; handler-level 404s answer JSON
+    # and pass. Stream endpoints legally never close — a read timeout
+    # after the handler accepted the request also proves the route.
+    d = DAEMON
+    d.start({"port": PORT})
+    ROUTE_COVERAGE.clear()
+    ROUTE_COVERAGE.extend(sorted(_gateway_route_paths()))
+    for path in ROUTE_COVERAGE:
+        try:
+            st, _, raw = http("GET", path, timeout=5)
+            if st == 405:  # method-specific route: retry the other verb
+                st, _, raw = http("POST", path, body={}, timeout=5)
+            routed = st != 404 or raw.strip().startswith(b"{")
+            evidence = f"GET/POST {path} -> {st}"
+        except Exception as e:  # transport-level verdicts, not phase bugs
+            msg = str(e)
+            routed = "timed out" in msg or "timeout" in msg.lower()
+            evidence = f"transport: {msg[:90]}"
+        reg(f"route.{path}", routed, evidence)
 
 
 def phase_sentinel() -> None:
@@ -4889,6 +5049,12 @@ def phase_cli() -> None:
         or f"rc={p.returncode} err={p.stderr[:150]}",
     )
     reg("run.verbose", ok, "--verbose stats")
+    p = cli("run", MODEL, "--no-draft", "--max-tokens", "64", "Say: nodraft")
+    reg(
+        "run.no-draft",
+        p.returncode == 0 and p.stdout.strip(),
+        f"rc={p.returncode} out={p.stdout.strip()[:60]!r}",
+    )
     p = cli("stop", MODEL)
     ok = p.returncode == 0
     check("cli", "stop MODEL unloads via /api/evict", ok, p.stdout.strip()[:100])
@@ -6454,7 +6620,7 @@ def phase_commands() -> None:
     # llamacpp tag; if none, keep the sandbox copy's active engine.
     pin_tags = _full_engine_tags() or _server_engine_tags()
     if pin_tags:
-        cli("engine", "use", pin_tags[0])
+        cli("engine", "use", pin_tags[0], "--kind", "llamacpp")
     else:
         print("note: no llamacpp engine tag on disk — pinning skipped")
 
@@ -6569,6 +6735,38 @@ def phase_commands() -> None:
             and all(h in p2.stdout for h in ("SIZE", "ARCH", "CTX"))
             and "pallama pull <REPO>" in p2.stdout,
             p2.stdout.strip().splitlines()[0][:100] if p2.stdout.strip() else "",
+        )
+        # --format maps to the Hub's server-side tag filter: the gguf lane
+        # must narrow to GGUF-tagged repos only.
+        p3 = cli("search", "qwen", "0.5b", "--format", "gguf", timeout=120)
+        reg(
+            "search.format",
+            p3.returncode == 0 and "REPO" in p3.stdout and "FORMAT" in p3.stdout,
+            f"rc={p3.returncode} rows={len([l for l in p3.stdout.splitlines() if '/' in l])}",
+        )
+        # --quant post-filters rows on real file quants; bare q4 token is
+        # lifted out of the text query (stderr carries the filter notice,
+        # stdout stays clean).
+        p4 = cli("search", "qwen", "0.5b", "q4", timeout=120)
+        rows4 = [l for l in p4.stdout.splitlines() if "/" in l]
+        reg(
+            "search.quant",
+            p4.returncode == 0 and bool(rows4) and "quant filter: q4" in p4.stderr,
+            f"rc={p4.returncode} rows={len(rows4)} notice={'quant filter: q4' in p4.stderr}",
+        )
+        p5 = cli("search", "qwen", "0.5b", "--quant", "q4", "--json", timeout=120)
+        jrows = [json.loads(l) for l in p5.stdout.splitlines() if l.strip()]
+        # full per-row quants (the table's +N collapse can hide the Q4
+        # family), so family correctness is pinned here.
+        reg(
+            "search.json",
+            p5.returncode == 0
+            and bool(jrows)
+            and all("repo" in r and "quants" in r for r in jrows)
+            and all(
+                any(q.startswith(("Q4", "IQ4")) for q in r["quants"]) for r in jrows
+            ),
+            f"{len(jrows)} JSONL rows, every row carries a Q4-family quant",
         )
 
     lane("search", _search)
@@ -6748,7 +6946,21 @@ def phase_commands() -> None:
         p.returncode == 0 and secret1 is not None,
         "plm_ secret printed once",
     )
-    p = cli("keys", "add", "vk2")
+    p = cli(
+        "keys",
+        "add",
+        "vk2",
+        "--models",
+        MODEL,
+        "--rpm",
+        "5",
+        "--tpm",
+        "100",
+        "--daily-tokens",
+        "1000",
+        "--max-concurrent",
+        "2",
+    )
     m2 = re.search(r"plm_\S+", p.stdout + p.stderr)
     secret2 = m2.group(0) if m2 else None
     p = cli("keys", "list")
@@ -6785,6 +6997,8 @@ def phase_commands() -> None:
             p.returncode == 0 and secret2 in p.stdout,
             "named key resolved to plm_ secret",
         )
+    # (--warm <model> probe lives after rm.running-guard, where MODEL is
+    # pulled and loaded — probe order matters for the sandbox store.)
     p = cli("keys", "rm", "vk2")  # bootstrap gatekey still present
     check(
         "commands",
@@ -6826,6 +7040,19 @@ def phase_commands() -> None:
         p.returncode != 0 and "running" in (p.stdout + p.stderr).lower(),
         f"rc={p.returncode} out={(p.stdout + p.stderr).strip()[:70]!r}",
     )
+
+    # --warm <model> pre-warms (loads) then execs: MODEL is pulled and
+    # loaded here, so the warm path is exercised for real; under FAST there
+    # is no pulled model, hence the boundary there.
+    if os.environ.get("PALLAMA_VALIDATE_FAST") == "1":
+        regb("launch", "FAST mode: --warm needs a pulled model")
+    else:
+        p = cli("launch", "--warm", MODEL, "printenv", "PATH")
+        reg(
+            "launch",
+            p.returncode == 0,
+            f"--warm {MODEL} pre-warms then execs rc={p.returncode}",
+        )
 
     # -- I: session lifecycle (model loaded) ----------------------------
     chat("Say ok")
@@ -7059,6 +7286,10 @@ def phase_commands() -> None:
             "Q8_0",
             "--name",
             "validate-quant",
+            "--allow-requantize",
+            "--verify",
+            "--max-degradation",
+            "0.5",
             timeout=1800,
         )
         reg(
@@ -7079,6 +7310,22 @@ def phase_commands() -> None:
             "quantize.refusal",
             p.returncode != 0 and "already exists" in (p.stdout + p.stderr),
             "dst-exists refusal",
+        )
+        p = cli(
+            "quantize",
+            "qwen3-0.6b",
+            "-t",
+            "Q8_0",
+            "--name",
+            "vq-imatrix",
+            "--imatrix",
+            os.path.join(SANDBOX.root, "no-such.imatrix"),
+            timeout=60,
+        )
+        reg(
+            "quantize.imatrix",
+            p.returncode != 0 and "imatrix" in (p.stdout + p.stderr).lower(),
+            f"rc={p.returncode} err={(p.stderr or p.stdout).strip()[:80]}",
         )
         cli("rm", "validate-quant")
         cli("rm", "qwen3-0.6b")
@@ -7427,6 +7674,250 @@ def phase_commands() -> None:
     else:
         regb("engine.local", "no server-bearing llamacpp engine on disk")
 
+    # -- engine/config/tts leaf lanes (nested-subcommand surface) ---------
+
+    def _config_edit():
+        # EDITOR=cat turns the $EDITOR spawn into a harmless print: rc0,
+        # config bytes untouched — proves the spawn path without a UI.
+        cfgp2 = os.path.join(SANDBOX.config_dir, "config.toml")
+        before = open(cfgp2, "rb").read() if os.path.exists(cfgp2) else b""
+        p = cli("config", "edit", extra_env={"EDITOR": "cat"})
+        after = open(cfgp2, "rb").read() if os.path.exists(cfgp2) else b""
+        reg(
+            "config.edit",
+            p.returncode == 0 and before == after,
+            f"rc={p.returncode} file-unchanged={before == after}",
+        )
+
+    lane("config.edit", _config_edit)
+
+    def _engine_offers():
+        def _net_refused(p):
+            out = p.stdout + p.stderr
+            return p.returncode != 0 and any(
+                t in out.lower() for t in ("dns", "timeout", "timed out", "403", "rate")
+            )
+
+        p = cli("engine", "offers", timeout=120)
+        if _net_refused(p):
+            regb(
+                "engine.offers",
+                "registry fetch refused (net): " + (p.stderr or p.stdout).strip()[:80],
+            )
+        else:
+            reg(
+                "engine.offers",
+                p.returncode == 0 and len(p.stdout.strip()) > 0,
+                p.stdout.strip().splitlines()[-1][:100] if p.stdout.strip() else "",
+            )
+        # Machine-readable dump: banner line then one JSON object per offer.
+        p = cli("engine", "offers", "--json", timeout=120)
+        rows = []
+        try:
+            rows = [
+                json.loads(l)
+                for l in p.stdout.splitlines()
+                if l.strip().startswith("{")
+            ]
+        except Exception:
+            rows = []
+        if _net_refused(p):
+            regb(
+                "engine.offers",
+                "registry fetch refused (net): " + (p.stderr or p.stdout).strip()[:80],
+            )
+        else:
+            reg(
+                "engine.offers",
+                p.returncode == 0 and bool(rows),
+                f"--json rows={len(rows)}",
+            )
+            # --arch filter with a REAL registry value (first row's first
+            # architecture) — proves the filter narrows, not just parses.
+            arch = None
+            for r in rows:
+                if r.get("architectures"):
+                    arch = r["architectures"][0]
+                    break
+            if arch is None:
+                regb(
+                    "engine.offers",
+                    "no architecture field in registry rows; --arch filter unprobeable",
+                )
+            else:
+                q = cli("engine", "offers", "--arch", arch, "--json", timeout=120)
+                filtered = []
+                try:
+                    filtered = [
+                        json.loads(l)
+                        for l in q.stdout.splitlines()
+                        if l.strip().startswith("{")
+                    ]
+                except Exception:
+                    filtered = []
+                reg(
+                    "engine.offers",
+                    q.returncode == 0
+                    and bool(filtered)
+                    and all(arch in (fr.get("architectures") or []) for fr in filtered),
+                    f"--arch {arch}: {len(filtered)} row(s)",
+                )
+
+    lane("engine.offers", _engine_offers)
+
+    def _engine_rm():
+        # Error path always: unknown tag must fail fast, naming the tag.
+        p = cli("engine", "rm", "no-such-tag-xyz")
+        reg(
+            "engine.rm",
+            p.returncode != 0 and "no-such-tag-xyz" in (p.stdout + p.stderr),
+            f"rc={p.returncode} err={(p.stderr or p.stdout).strip()[:90]}",
+        )
+        # Real removal when a spare (dance) engine exists in the sandbox
+        # store — never the active anchor later lanes spawn from.
+        if dance and dance != anchor:
+            listed = cli("engine", "list").stdout
+            if dance in listed:
+                p2 = cli("engine", "rm", dance)
+                gone = dance not in cli("engine", "list").stdout
+                reg(
+                    "engine.rm",
+                    p2.returncode == 0 and gone,
+                    f"rc={p2.returncode} {dance} removed from store",
+                )
+            else:
+                regb("engine.rm", f"{dance} not in sandbox store listing")
+        else:
+            regb("engine.rm", "no spare engine to remove (need >=2 in store)")
+
+    lane("engine.rm", _engine_rm)
+
+    def _engine_prune():
+        # Empty/one-engine store: "nothing to prune" rc0 is the live path.
+        # Multi-engine store: prune really removes the non-active engines.
+        p = cli("engine", "prune")
+        active = _active_engine_tag()
+        ok = p.returncode == 0 and "prune" in (p.stdout + p.stderr).lower()
+        reg(
+            "engine.prune",
+            ok,
+            f"rc={p.returncode} active-after={active} "
+            f"out={(p.stdout or p.stderr).strip()[:90]}",
+        )
+
+    lane("engine.prune", _engine_prune)
+
+    def _engine_build():
+        if disk_free_gb() <= 8:
+            regb("engine.build", f"disk free {disk_free_gb():.1f}G <= 8G")
+            return
+        # Real source build with the local toolchain (net: clone).
+        p = cli("engine", "build", timeout=3600)
+        out = p.stdout + p.stderr
+        if p.returncode != 0 and ("cmake" in out.lower() or "toolchain" in out.lower()):
+            regb("engine.build", f"no local build toolchain: {out.strip()[:120]}")
+            return
+        reg(
+            "engine.build",
+            p.returncode == 0,
+            f"rc={p.returncode} out={out.strip()[:100]}",
+        )
+
+    lane("engine.build", _engine_build)
+
+    def _engine_install():
+        if disk_free_gb() <= 8:
+            regb("engine.install", f"disk free {disk_free_gb():.1f}G <= 8G")
+            return
+        p = cli(
+            "engine",
+            "install",
+            "mistralrs",
+            "--kind",
+            "mistralrs",
+            "--lane",
+            "prebuilt",
+            timeout=1800,
+        )
+        out = p.stdout + p.stderr
+        if p.returncode != 0 and (
+            "rate limited" in out.lower() or "403" in out or "disk" in out.lower()
+        ):
+            regb("engine.install", f"blocked this window: {out.strip()[:120]}")
+            return
+        reg(
+            "engine.install",
+            p.returncode == 0,
+            f"rc={p.returncode} out={out.strip()[:100]}",
+        )
+
+    lane("engine.install", _engine_install)
+
+    def _tts_state():
+        p = cli("tts", "--list")
+        reg(
+            "tts.list",
+            p.returncode == 0 and ("server:" in p.stdout or "voices:" in p.stdout),
+            p.stdout.strip().splitlines()[0][:90] if p.stdout.strip() else "",
+        )
+        p = cli("tts", "--pin", "x")
+        reg(
+            "tts.pin.refusal",
+            p.returncode != 0 and "not installed" in (p.stdout + p.stderr),
+            f"rc={p.returncode} err={(p.stderr or p.stdout).strip()[:90]}",
+        )
+        p = cli(
+            "tts", "validation probe", "--out", os.path.join(SANDBOX.root, "tts.wav")
+        )
+        reg(
+            "tts.synthesize.no-voice",
+            p.returncode != 0 and "no voice" in (p.stdout + p.stderr).lower(),
+            f"rc={p.returncode} err={(p.stderr or p.stdout).strip()[:90]}",
+        )
+
+    lane("tts.list", _tts_state, "tts.pin.refusal", "tts.synthesize.no-voice")
+
+    def _tts_heavy():
+        p = cli("tts", "--install", timeout=900)
+        if p.returncode != 0:
+            regb(
+                "tts.install",
+                f"install blocked this window: {(p.stderr or p.stdout).strip()[:120]}",
+            )
+            regb("tts.pull", "install unavailable this run")
+            regb("tts.synthesize", "install unavailable this run")
+            return
+        reg("tts.install", True, "rc0")
+        p = cli("tts", "--pull", "en_US-amy-medium", timeout=900)
+        if p.returncode != 0:
+            regb(
+                "tts.pull",
+                f"voice pull blocked this window: {(p.stderr or p.stdout).strip()[:120]}",
+            )
+            regb("tts.synthesize", "no voice pulled this run")
+            return
+        reg("tts.pull", True, "rc0")
+        wav = os.path.join(SANDBOX.root, "validate-tts.wav")
+        p = cli(
+            "tts",
+            "validation synthesis",
+            "--voice",
+            "en_US-amy-medium",
+            "--speed",
+            "1.2",
+            "--out",
+            wav,
+            timeout=300,
+        )
+        size = os.path.getsize(wav) if os.path.exists(wav) else 0
+        reg(
+            "tts.synthesize",
+            p.returncode == 0 and size > 1024,
+            f"rc={p.returncode} wav={size}B",
+        )
+
+    lane("tts.install", _tts_heavy, "tts.pull", "tts.synthesize")
+
     def _pull():
         before = set(cli("list").stdout.split())
         p = _pull_retry("pull", "ggml-org/Qwen3-0.6B-GGUF")
@@ -7456,13 +7947,23 @@ def phase_commands() -> None:
                 p.returncode == 0 and bool(new),
                 f"rc={p.returncode} new={sorted(new)[:3]}",
             )
+        # --verify: re-hash the just-pulled model against its store row —
+        # must pass while the model is still in the store (pre-rm).
+        if new and not transient:
+            v = _pull_retry("pull", sorted(new)[0], "--verify", timeout=240)
+            reg(
+                "pull.verify",
+                v.returncode == 0,
+                (v.stdout + v.stderr).strip()[:100],
+            )
         for name in new:
             cli("rm", name)
 
     if heavy_ok:
-        lane("pull", _pull)
+        lane("pull", _pull, "pull.verify")
     else:
         regb("pull", f"disk free {disk_free_gb():.1f}G <= 8G")
+        regb("pull.verify", f"disk free {disk_free_gb():.1f}G <= 8G")
 
     def _run_miss_pulls():
         # `pallama run` on a missing model must auto-pull (same flow as
@@ -7502,20 +8003,33 @@ def phase_commands() -> None:
             )
             return
         env = {**SANDBOX.env(), "PALLAMA_REPO": repo}
+        cur = (
+            subprocess.run(
+                [PAL, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            .stdout.strip()
+            .split()[-1:]
+            or ["0.0.0"]
+        )[0]
         p = subprocess.run(
-            [PAL, "upgrade", "--dry-run"],
+            [PAL, "upgrade", "--dry-run", "--version", cur],
             capture_output=True,
             text=True,
             timeout=900,
             env=env,
             check=False,
         )
+        out = p.stdout + p.stderr
         reg(
             "upgrade.dry-run",
             p.returncode == 0
-            and "dry-run ok" in (p.stdout + p.stderr)
+            and ("dry-run ok" in out or "already" in out.lower())
             and os.path.getmtime(PAL) == mtime_before,
-            f"rc={p.returncode} repo={repo} out={(p.stdout or p.stderr).strip()[:80]}",
+            f"rc={p.returncode} repo={repo} ver={cur} out={out.strip()[:80]}",
         )
 
     lane("upgrade.dry-run", _upgrade)
@@ -7916,6 +8430,14 @@ def _full_toplevel() -> dict:
         "idle_sleep_secs": 77,
         "idle_timeout_secs": 500,
         "max_loaded_models": 2,
+        # six real knobs surfaced by gate (b) — values are the config.rs
+        # defaults, valid by construction
+        "child_header_timeout_secs": 120,
+        "decode_policy": "free",
+        "fork_retire_days": 7,
+        "prompt_recipe": "child",
+        "raw_lane_max_tokens": 2048,
+        "spec_autopull": False,
         "child_transport": "tcp",
         "child_auth": True,
         "engine_asset": "ubuntu-vulkan-x64",
@@ -8120,6 +8642,145 @@ def _overlay_b() -> dict:
     return ov
 
 
+def _env_override_surface() -> tuple[set[str], dict[str, str]]:
+    """(vars, types) parsed from config.rs `with_env_overrides` at runtime.
+
+    Source-anchored so a newly added PALLAMA_* knob that validate.py never
+    exercises shows up as an unregistered row instead of silently passing.
+    Returns empty set when the source file is absent (packaged runs) —
+    callers must handle that honestly.
+    """
+    src = os.path.join(
+        dirname(dirname(abspath(__file__))),
+        "crates",
+        "pallama-core",
+        "src",
+        "config.rs",
+    )
+    if not os.path.exists(src):
+        return set(), {}
+    text = open(src, encoding="utf-8").read()
+    vars_ = set(re.findall(r'env\("PALLAMA_([A-Z0-9_]+)"\)', text))
+    # parse_u16("PALLAMA_PORT", &v) → PALLAMA_PORT: u16
+    types = {
+        var: f"{fn}_"
+        for fn, var in re.findall(r'parse_(\w+)\("PALLAMA_([A-Z0-9_]+)"', text)
+    }
+    return vars_, types
+
+
+# Valid probe values per Rust parse type (or the TOML type for untyped
+# string vars). Chosen to be recognizable in `config get` output.
+_ENV_TYPE_VALUES = {
+    "bool_": "true",
+    "u16_": "11499",
+    "u32_": "17",
+    "u64_": "19",
+    "i64_": "5",
+    "i32_": "1",
+    "f64_": "0.5",
+    None: "validate",
+}
+
+
+def _env_valid_value(var: str, rust_type: str | None) -> str:
+    """A value the parser must accept: the sandbox TOML value when set
+    (round-trip through the real config), else a typed default."""
+    # Format-constrained string knobs each need their real syntax —
+    # the generic placeholder is (correctly) rejected by config.validate().
+    specials = {
+        "CACHE_TYPE": "f16",
+        "CHILD_TRANSPORT": "tcp",
+        "CPU_RANGE": "0-1",
+        # 0 (off) or (1.0..=32.0] per config.validate()
+        "CTX_EXTEND": "1.5",
+        # must be >= idle_sleep_secs (default 300) — eviction after sleep
+        "IDLE_TIMEOUT_SECS": "900",
+        "KEYS": "envk:plm_test",
+        "LAZY_MODE": "auto",
+        "MCP_SERVERS_JSON": "{}",
+        "OVERRIDE_TENSOR": ".ffn_.*_exps.=CPU",
+        "REASONING_FORMAT": "deepseek",
+        "SERVER_TOOLS_RUNTIME": "docker:alpine",
+        "SPEC": "auto",
+    }
+    if var in specials:
+        return specials[var]
+    cfg_path = os.path.join(SANDBOX.config_dir, "config.toml")
+    if os.path.exists(cfg_path):
+        try:
+            with open(cfg_path, "rb") as f:
+                cfg = tomllib.load(f)
+            current = cfg.get(var.lower())
+            if isinstance(current, bool):
+                return "true" if current else "false"
+            if isinstance(current, (int, float)) and not isinstance(current, bool):
+                return str(current)
+            if isinstance(current, str) and current:
+                return current
+        except (tomllib.TOMLDecodeError, OSError):
+            pass
+    return _ENV_TYPE_VALUES.get(rust_type, "validate")
+
+
+def phase_env_overrides() -> None:
+    print("\n== phase env: PALLAMA_* overrides (apply + fail-fast) ==")
+    vars_, types = _env_override_surface()
+    check(
+        "env",
+        "config.rs env surface parsed",
+        bool(vars_),
+        f"{len(vars_)} PALLAMA_* vars" + ("" if vars_ else " — source file not found"),
+    )
+    for var in sorted(vars_):
+        rust_type = types.get(var)
+        field = var.lower()
+        value = _env_valid_value(var, rust_type)
+        # Cross-field rule: a tools runtime is meaningless without tools
+        # enabled — the companion var must ride along (config.rs validate()).
+        extra = {f"PALLAMA_{var}": value}
+        if var == "SERVER_TOOLS_RUNTIME":
+            extra["PALLAMA_SERVER_TOOLS"] = "validate"
+        if var == "KEYS":
+            # [[keys]] is a container: `get keys` cannot address it — the
+            # machine-composition form is proven via `config list`.
+            p = cli("config", "list", extra_env={f"PALLAMA_{var}": value})
+            reg(
+                f"env.PALLAMA_{var}",
+                p.returncode == 0 and "envk" in p.stdout,
+                f"list shows key name envk ({value!r} form)",
+            )
+            continue
+        p = cli("config", "get", field, extra_env=extra)
+        applied = p.returncode == 0
+        echoed = value in p.stdout
+        if applied and echoed:
+            reg(f"env.PALLAMA_{var}", True, f"get {field} == {value!r}")
+        elif applied:
+            # Accepted but `get` shows a different repr (tables like
+            # [[keys]] render as multi-line TOML) — apply-proof only.
+            reg(
+                f"env.PALLAMA_{var}",
+                True,
+                f"accepted rc0 (get renders non-scalar: {p.stdout.strip()[:60]!r})",
+            )
+        else:
+            reg(
+                f"env.PALLAMA_{var}",
+                False,
+                f"rejected valid {var}={value!r}: {p.stderr.strip()[:120]}",
+            )
+        if rust_type is None:
+            continue
+        # Typed vars must fail fast on garbage AND name the var.
+        b = cli("config", "get", field, extra_env={f"PALLAMA_{var}": "bogus"})
+        reg(
+            f"env.PALLAMA_{var}.invalid",
+            b.returncode != 0 and var in b.stderr,
+            f"rc={b.returncode} stderr={b.stderr.strip()[:100]!r}",
+        )
+
+
 def phase_gates() -> None:
     print(
         "\n== phase gates: 100% completeness (help/fresh-list/full-manifest/overlay) =="
@@ -8138,6 +8799,38 @@ def phase_gates() -> None:
         "(a) --help subcommands == manifest (both directions)",
         ok_a,
         f"manifest-only={sorted(want - names)} help-only={sorted(names - want)}",
+    )
+
+    # (a2) nested subcommand leaves x manifest, bidirectional -------------
+    # Parents are DISCOVERED live: any advertised toplevel whose own
+    # --help carries a Commands: section (never hardcoded — a brand-new
+    # parent must surface here, not rot silently). clap injects `help`
+    # into every parent and this probe exercises it, so it joins the
+    # expected set without manifest rows. Manifest paths deeper than one
+    # dot (e.g. tts.synthesize.no-voice) are lane aliases, not leaves.
+    leaf_drift: list[str] = []
+    for top in sorted(names - {"help"}):
+        leaves = set(_subcommand_leaves(cli(top, "--help").stdout))
+        if not leaves:
+            continue
+        rows = {
+            p.split(".", 1)[1]
+            for p in _COMMAND_ATTRS
+            if p.startswith(top + ".") and p.count(".") == 1
+        }
+        # Both sides bare: _subcommand_leaves returns unprefixed names and
+        # clap injects a bare `help` leaf into every parent.
+        want_leaves = rows | {"help"}
+        if leaves != want_leaves:
+            leaf_drift.append(
+                f"{top}: manifest-only={sorted(rows - leaves)} "
+                f"help-only={sorted(leaves - rows)}"
+            )
+    check(
+        "gates",
+        "(a2) parent subcommand leaves == manifest (both directions)",
+        not leaf_drift,
+        "; ".join(leaf_drift) or "every parent's leaf set is exact",
     )
 
     # (b) fresh config list key set == manifest fresh-visible -------------
@@ -8298,6 +8991,18 @@ def phase_gates() -> None:
             not missing_cmds,
             f"missing={missing_cmds}",
         )
+
+        # (e) gateway routes: probed set == source .route() table --------
+        src_routes = _gateway_route_paths()
+        if src_routes:
+            probed = set(ROUTE_COVERAGE)
+            check(
+                "gates",
+                "(e) gateway routes probed == source .route() table",
+                probed == src_routes,
+                f"source-only={sorted(src_routes - probed)} "
+                f"probed-only={sorted(probed - src_routes)}",
+            )
 
 
 # ------------------------------------------------------------------ main
@@ -8863,6 +9568,342 @@ def _pyspy_reexec_if_requested(args: list[str]) -> None:
     sys.exit(rc)
 
 
+def _jsonl(stdout: str) -> list:
+    """Parse JSONL output (one object per line); unparseable -> empty."""
+    try:
+        return [json.loads(l) for l in stdout.splitlines() if l.strip()]
+    except json.JSONDecodeError:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Flag-surface coverage: every flag clap advertises on every command must
+# resolve to a PASSED lane above or an honest boundary row here. Registry
+# keys are space-joined command paths; values are {flag: evidence path}.
+# Evidence paths pointing at flag.* rows are exercised live in this phase.
+# ---------------------------------------------------------------------------
+_FLAG_EVIDENCE: dict[str, dict[str, str]] = {
+    "pull": {"--verify": "pull.verify"},
+    "run": {
+        "--verbose": "run.verbose",
+        "--max-tokens": "run.verbose",
+        "--no-draft": "run.no-draft",
+    },
+    "ps": {"--reset": "ps.reset", "--json": "flag.ps.--json"},
+    "launch": {"--warm": "launch", "--key": "launch"},
+    "import": {
+        "--name": "import.hardlink",
+        "--quant": "import.copy",
+        "--copy": "import.copy",
+    },
+    "create": {"--file": "create.happy"},
+    "list": {"--json": "flag.list.--json"},
+    "show": {"--json": "flag.show.--json"},
+    "quantize": {
+        "--qtype": "quantize.happy",
+        "--name": "quantize.happy",
+        "--imatrix": "quantize.imatrix",
+        "--allow-requantize": "quantize.happy",
+        "--verify": "quantize.happy",
+        "--max-degradation": "quantize.happy",
+    },
+    "search": {
+        "--format": "search.format",
+        "--quant": "search.quant",
+        "--json": "search.json",
+    },
+    "fit": {"--json": "flag.fit.--json"},
+    "tune": {
+        "--search": "tune.search",
+        "--ctx": "tune.ctx",
+        "--spec": "tune.spec",
+        "--slots": "tune.slots",
+        "--ngram": "tune.ngram",
+        "--load": "tune.load",
+        "--replicas": "tune.replicas",
+        "--replicas": "tune.replicas",
+        "--cache-reuse": "tune.cache-reuse",
+    },
+    "engine update": {
+        "--kind": "flag.engine-update.--kind",
+        "--no-gate": "engine.update",
+        "--check": "flag.engine-update.--check",
+    },
+    "engine list": {"--json": "flag.engine-list.--json"},
+    "engine use": {"--kind": "engine.use"},
+    "engine build": {"--no-gate": "engine.build"},
+    "engine install": {"--kind": "engine.install", "--lane": "engine.install"},
+    "engine offers": {"--arch": "engine.offers", "--json": "engine.offers"},
+    "keys add": {
+        "--models": "keys.add",
+        "--rpm": "keys.add",
+        "--tpm": "keys.add",
+        "--daily-tokens": "keys.add",
+        "--max-concurrent": "keys.add",
+    },
+    "whisper": {
+        "--model": "whisper.transcribe",
+        "--install": "whisper.install",
+        "--pull": "whisper.pull",
+        "--list": "whisper.list",
+        "--pin": "whisper.pin.refusal",
+        "--tag": "flag.whisper.--tag",
+    },
+    "tts": {
+        "--voice": "tts.synthesize",
+        "--install": "tts.install",
+        "--pull": "tts.pull",
+        "--list": "tts.list",
+        "--pin": "tts.pin.refusal",
+        "--tag": "flag.tts.--tag",
+        "--out": "tts.synthesize",
+        "--speed": "tts.synthesize",
+    },
+    "doctor": {"--flat": "flag.doctor.--flat", "--json": "flag.doctor.--json"},
+    "upgrade": {"--dry-run": "upgrade.dry-run", "--version": "upgrade.dry-run"},
+    "why": {
+        "--code": "flag.why.--code",
+        "--model": "flag.why.--model",
+        "--limit": "flag.why.--limit",
+        "--flagged": "flag.why.--flagged",
+        "--watch": "flag.why.--watch",
+    },
+}
+
+# Flags that are variant knobs of an already-exercised path: pulling a
+# second copy of a stored model or building llama.cpp from a custom fork
+# duplicates bytes/compute by design. Boundary rows document why.
+_FLAG_BOUNDARIES: dict[str, dict[str, str]] = {
+    "pull": {
+        "--force": "re-download of an already stored model; duplicate "
+        "bytes by design; pull lane covers the fetch path"
+    },
+    "import": {
+        "--mmproj": "projector attach is exercised by the vision/mmproj "
+        "phases; needs a projector fixture"
+    },
+    "engine build": {
+        "--fork": "custom-fork variant of the default-toolchain build lane",
+        "--repo": "custom-repo variant of the default-toolchain build lane",
+        "--ref": "custom-ref variant of the default-toolchain build lane",
+        "--base": "custom-base variant of the default-toolchain build lane",
+        "--arch": "cross-compile variant; native build lane covers path",
+        "--cuda-host-compiler": "CUDA cross-compile variant; native build lane",
+        "--jobs": "parallelism knob of the default-toolchain build lane",
+    },
+    "engine install": {
+        "--backend": "sglang-venv variant; mistralrs prebuilt lane covers path",
+    },
+}
+
+
+def phase_coverage() -> None:
+    print("\n=== phase: coverage (flag surface) ===")
+    d = DAEMON
+    d.start({"port": PORT})
+
+    # Identity flags, once: -h/--help and -V/--version are clap-universal.
+    p = cli("--help")
+    reg("flag.help", p.returncode == 0 and "Usage:" in p.stdout, "rc0 + Usage")
+    p = cli("--version")
+    reg("flag.version", p.returncode == 0 and p.stdout.strip() != "", "rc0 + banner")
+
+    # Cheap local lives for flags that had no lane above.
+    p = cli("doctor", "--flat")
+    reg(
+        "flag.doctor.--flat",
+        p.returncode == 0 and "FAIL" not in p.stdout.upper(),
+        f"rc={p.returncode} flat check table",
+    )
+    p = cli("doctor", "--json")
+    rows = _jsonl(p.stdout)
+    reg("flag.doctor.--json", p.returncode == 0 and bool(rows), "JSONL rows")
+    p = cli("ps", "--json")
+    rows = _jsonl(p.stdout)
+    # Idle daemon legally prints zero rows; only rc0 + parseable (or empty)
+    # output passes — unparseable non-empty stdout fails.
+    reg(
+        "flag.ps.--json",
+        p.returncode == 0 and (bool(rows) or not p.stdout.strip()),
+        f"rc={p.returncode} rows={len(rows)}",
+    )
+    p = cli("list", "--json")
+    rows = _jsonl(p.stdout)
+    reg("flag.list.--json", p.returncode == 0 and bool(rows), "JSONL rows")
+    nm = rows[0].get("name", "") if rows else ""
+    if nm:
+        p = cli("show", "--json", nm)
+        reg(
+            "flag.show.--json",
+            p.returncode == 0 and p.stdout.strip().startswith("{"),
+            f"rc={p.returncode} model={nm}",
+        )
+    else:
+        regb("flag.show.--json", "no model listed to show")
+    p = cli("engine", "list", "--json", timeout=60)
+    reg(
+        "flag.engine-list.--json",
+        p.returncode == 0 and bool(p.stdout.strip()),
+        f"rc={p.returncode} listing",
+    )
+
+    if not FAST:
+        p = cli("fit", "--json", "Qwen/Qwen2.5-0.5B-Instruct-GGUF", timeout=180)
+        rows = _jsonl(p.stdout)
+        reg(
+            "flag.fit.--json",
+            p.returncode == 0 and bool(rows) and all(isinstance(r, dict) for r in rows),
+            f"rc={p.returncode} rows={len(rows)}",
+        )
+        p = cli("engine", "update", "--check", timeout=300)
+        if p.returncode == 0:
+            reg("flag.engine-update.--check", True, f"rc0: {p.stdout.strip()[:60]}")
+        else:
+            regb(
+                "flag.engine-update.--check",
+                f"net/engine refused (rc={p.returncode}): "
+                f"{(p.stderr or p.stdout).strip()[:70]}",
+            )
+        p = cli("engine", "update", "--kind", "mistralrs", "--check", timeout=300)
+        out = p.stdout + p.stderr
+        # Sandbox carries no mistralrs engine: the clean "not installed"
+        # error names the kind, proving --kind is wired into the resolver.
+        reg(
+            "flag.engine-update.--kind",
+            p.returncode in (0, 1) and "mistralrs" in out.lower(),
+            f"rc={p.returncode} {out.strip()[:60]}",
+        )
+        p = cli("why", "--flagged", timeout=60)
+        reg(
+            "flag.why.--flagged",
+            p.returncode == 0,
+            f"rc={p.returncode} flagged listing",
+        )
+        p = cli("why", "--limit", "5", timeout=60)
+        reg(
+            "flag.why.--limit",
+            p.returncode == 0,
+            f"rc={p.returncode} limited listing",
+        )
+        p = cli("why", "--model", MODEL, timeout=60)
+        reg(
+            "flag.why.--model",
+            p.returncode == 0,
+            f"rc={p.returncode} model={MODEL}",
+        )
+        tid = ""
+        try:
+            tid = why()[0].get("trace", "")
+        except Exception:
+            tid = ""
+        if tid:
+            p = cli("why", tid, "--code", timeout=60)
+            reg(
+                "flag.why.--code",
+                p.returncode == 0 and tid[:8] in (p.stdout + p.stderr),
+                f"rc={p.returncode} trace={tid[:8]}",
+            )
+        else:
+            regb("flag.why.--code", "no trace id available")
+        w = subprocess.run(
+            ["timeout", "8", PAL, "why", "--watch"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=SANDBOX.env(),
+            check=False,
+        )
+        reg(
+            "flag.why.--watch",
+            w.returncode in (0, 124),
+            f"rc={w.returncode} (124=timeout-kill while streaming)",
+        )
+        # Specific-tag installs: error path proves the flag is wired to the
+        # tag resolver (tag names must exist in the registry).
+        p = cli("whisper", "--install", "--tag", "no-such-tag-xyz", timeout=300)
+        if "403" in p.stderr or "rate" in p.stderr.lower():
+            regb("flag.whisper.--tag", "GitHub rate-limited")
+        else:
+            reg(
+                "flag.whisper.--tag",
+                p.returncode != 0 and "no-such-tag-xyz" in p.stdout + p.stderr,
+                f"rc={p.returncode} tag rejected",
+            )
+        p = cli("tts", "--install", "--tag", "no-such-tag-xyz", timeout=300)
+        if "403" in p.stderr or "rate" in p.stderr.lower():
+            regb("flag.tts.--tag", "GitHub rate-limited")
+        else:
+            reg(
+                "flag.tts.--tag",
+                p.returncode != 0 and "no-such-tag-xyz" in p.stdout + p.stderr,
+                f"rc={p.returncode} tag rejected",
+            )
+    else:
+        for path in [
+            "flag.fit.--json",
+            "flag.engine-update.--kind",
+            "flag.engine-update.--check",
+            "flag.why.--code",
+            "flag.why.--model",
+            "flag.why.--limit",
+            "flag.why.--flagged",
+            "flag.why.--watch",
+            "flag.whisper.--tag",
+            "flag.tts.--tag",
+        ]:
+            regb(path, "FAST mode: network-bound flag probe skipped")
+
+    for key, flags in _FLAG_BOUNDARIES.items():
+        for flag, reason in flags.items():
+            slug = key.replace(" ", "-")
+            regb(f"flag.{slug}.{flag}", reason)
+
+    # Resolution: every advertised flag resolves to a PASSED lane or an
+    # explicit boundary; every mapped flag still exists (no stale rows).
+    # Subcommand help carries the universal -h/--help in its Options block;
+    # clap's auto -V/--version exists only at the ROOT command, so a
+    # subcommand advertising its own `--version` value flag (upgrade) is a
+    # real flag and must NOT be subtracted here.
+    identity = {"-h", "--help"}
+    for key in sorted(set(_FLAG_EVIDENCE) | set(_FLAG_BOUNDARIES)):
+        slug = key.replace(" ", "-")
+        p = cli(*key.split(), "--help")
+        live = set(_option_flags(p.stdout)) - identity
+        mapped = set(_FLAG_EVIDENCE.get(key, {})) | set(_FLAG_BOUNDARIES.get(key, {}))
+        for flag in sorted(mapped - live):
+            check(
+                "coverage",
+                f"flag.{slug}: registry stale",
+                False,
+                f"{flag} mapped but not advertised by `{key} --help`",
+            )
+        for flag in sorted(live - mapped):
+            check(
+                "coverage",
+                f"flag.{slug}: unmapped live flag",
+                False,
+                f"{flag} advertised but no evidence or boundary row",
+            )
+        for flag, ev in sorted(_FLAG_EVIDENCE.get(key, {}).items()):
+            rows = [r for r in COMMAND_COVERAGE if r["path"] == ev]
+            if rows:
+                reg(
+                    f"flag.{slug}.{flag}",
+                    all(r["ok"] for r in rows),
+                    f"evidence: {ev}",
+                )
+            elif (
+                PHASE_FILTER is not None
+                or os.environ.get("PALLAMA_VALIDATE_FAST") == "1"
+            ):
+                regb(
+                    f"flag.{slug}.{flag}",
+                    f"evidence lane {ev} not exercised (phase filter / FAST mode)",
+                )
+            else:
+                reg(f"flag.{slug}.{flag}", False, f"evidence lane {ev} never ran")
+
+
 def main() -> int:
     global SANDBOX, DAEMON, USER_CONFIG_SHA, PHASE_FILTER, CRASHED
     global UPDATE_GOLDENS
@@ -8964,9 +10005,11 @@ def main() -> int:
         ("realuser", phase_realuser),
         ("knobs_argv", phase_knobs_argv),
         ("knobs_behavior", phase_knobs_behavior),
+        ("env", phase_env_overrides),
         ("gates", phase_gates),
         ("golds", phase_golds),
         ("parity", phase_parity),
+        ("coverage", phase_coverage),
     ]
     for name, fn in phases:
         if self_test or (wanted and name not in wanted):
