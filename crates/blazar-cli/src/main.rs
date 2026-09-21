@@ -981,6 +981,20 @@ async fn ensure_run_model(name: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
+/// `run` is a chat REPL; diffusion component sets have no chat surface.
+/// Refuse at the CLI boundary — spawning the sdcpp child would 404
+/// every REPL send.
+fn diffusion_repl_refusal(row: &blazar_core::store::ModelRow) -> Option<String> {
+    row.vae_path.is_some().then(|| {
+        format!(
+            "\"{}\" is a diffusion component set (sdcpp lane) — the chat REPL cannot drive \
+             image generation; start the daemon (blazar serve) and POST \
+             /v1/images/generations {{\"model\": \"{}\", \"prompt\": \"...\"}}",
+            row.name, row.name
+        )
+    })
+}
+
 /// Not-found error with the flat-name teaching line for ollama
 /// `model:tag` input (reached only when BOTH forms missed, so the
 /// swapped spelling is a suggestion, never a promise).
@@ -1116,6 +1130,13 @@ async fn run(cmd: Cmd) -> Result<()> {
             no_draft,
         } => {
             let model = ensure_run_model(&model).await?;
+            // Diffusion rows refuse here rather than in the REPL: the
+            // sdcpp child has no chat routes at all.
+            if let Ok(Some(row)) = Store::open(&dirs()).and_then(|s| s.get_model(&model)) {
+                if let Some(refusal) = diffusion_repl_refusal(&row) {
+                    return Err(anyhow::Error::msg(refusal));
+                }
+            }
             run_dispatch(&model, &prompt, verbose, max_tokens, no_draft).await
         }
         Cmd::Bench { model } => bench(&resolve_model_cli(&model)),
@@ -1520,8 +1541,10 @@ fn print_arch_gap_footer(
         if component_files {
             println!(
                 "\u{2020} {tag} is routed for GGUF(s) with {NO_ARCH_METADATA} — \
-                 diffusion/model-component files; no installed engine serves image components \
-                 (image lane unimplemented)"
+                 diffusion/model-component files; the sdcpp lane serves them from a \
+                 component set (DiT + VAE + text encoder): install it if absent \
+                 (blazar engine install --kind sdcpp) and re-pull the model to fetch \
+                 the set"
             );
         }
     }
@@ -10035,6 +10058,40 @@ mod tests {
         );
         // Non-GGUF rows never mark, whatever their arch state.
         assert_eq!(engine_arch_gap(&rows, "b-old", None, false), None);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__diffusion_repl_refusal__teaches_images_api_over_chat_repl() {
+        let base = || blazar_core::store::ModelRow {
+            name: "qwen-image-2.1".into(),
+            repo: "abenzerps/Qwen-Image-2.1-GGUF".into(),
+            quant: "Q4_K_M".into(),
+            path: "/models/qwen-image-2.1-Q4_K_M.gguf".into(),
+            bytes: 4_294_967_296,
+            sha256: None,
+            mmproj_path: None,
+            vae_path: None,
+            llm_path: None,
+            llm_vision_path: None,
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+        };
+        // Text rows (no component set) pass through untouched.
+        assert_eq!(diffusion_repl_refusal(&base()), None);
+        // Diffusion rows refuse at the boundary and name the API that
+        // CAN drive them.
+        let mut row = base();
+        row.vae_path = Some("/models/vae.safetensors".into());
+        row.llm_path = Some("/models/te.gguf".into());
+        let refusal =
+            diffusion_repl_refusal(&row).expect("component set must refuse the chat REPL");
+        assert!(refusal.contains("qwen-image-2.1"), "{refusal}");
+        assert!(refusal.contains("/v1/images/generations"), "{refusal}");
+        assert!(refusal.contains("blazar serve"), "{refusal}");
     }
 
     #[test]
