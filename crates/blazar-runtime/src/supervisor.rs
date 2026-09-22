@@ -900,6 +900,15 @@ struct ChildAuth {
     keyfile: Option<std::path::PathBuf>,
 }
 
+/// Token count llama-server reports in slot save/restore responses
+/// (`n_saved` / `n_restored`). `Some(0)` is a real answer — HTTP 200 with
+/// zero tokens is the silent re-prefill bug class (the restore
+/// "succeeds", the slot stays cold), not a warm start. Missing or
+/// non-numeric fields are `None`: unverifiable, not zero.
+fn slot_reported_tokens(body: &serde_json::Value, field: &str) -> Option<u64> {
+    body.get(field).and_then(serde_json::Value::as_u64)
+}
+
 impl Supervisor {
     /// Health-gate budget for a spawning child when the user leaves
     /// `model_load_timeout_secs` unset. Fits precompiled loaders
@@ -3567,6 +3576,12 @@ impl Supervisor {
             // REST restore endpoint is not reachable.
             blazar_core::Endpoint::Unix { .. } => return,
         };
+        // Restore truth-check: HTTP 200 alone does not prove KV injection
+        // (upstream has a restored-then-empty re-prefill bug class). The
+        // response's `n_restored` is the injection count; the first
+        // request's cached-token counter (gateway A9) backstops the
+        // lookup-miss variant. Live-probed on b11070: restore of 31 saved
+        // tokens -> next same-prefix completion ran cache_n=23, prompt_n=1.
         let url = format!("http://{host}:{port}/slots/0?action=restore&filename=_auto-{ctx}");
         let mut body = serde_json::json!({ "filename": format!("_auto-{ctx}") });
         if self.config.router {
@@ -3581,11 +3596,29 @@ impl Supervisor {
         }
         match req.send().await {
             Ok(resp) if resp.status().is_success() => {
-                tracing::info!(
-                    target: "blazar::bank",
-                    model = key,
-                    "restored banked session _auto-{ctx}"
-                );
+                let restored = resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .as_ref()
+                    .and_then(|v| slot_reported_tokens(v, "n_restored"));
+                match restored {
+                    Some(0) => tracing::warn!(
+                        target: "blazar::bank",
+                        model = key,
+                        "bank restore returned ok but restored 0 tokens — empty or incompatible checkpoint; continuing cold"
+                    ),
+                    Some(n) => tracing::info!(
+                        target: "blazar::bank",
+                        model = key,
+                        "restored banked session _auto-{ctx} ({n} tokens into slot KV)"
+                    ),
+                    None => tracing::info!(
+                        target: "blazar::bank",
+                        model = key,
+                        "restored banked session _auto-{ctx} (no token count in response)"
+                    ),
+                }
             }
             Ok(resp) => {
                 tracing::warn!(
@@ -3632,8 +3665,33 @@ impl Supervisor {
         if let Some(secret) = &inst.auth {
             req = req.bearer_auth(secret);
         }
-        let ok = req.send().await.is_ok_and(|r| r.status().is_success());
+        let mut saved = None;
+        let ok = match req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                saved = resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .as_ref()
+                    .and_then(|v| slot_reported_tokens(v, "n_saved"));
+                true
+            }
+            _ => false,
+        };
         if ok {
+            match saved {
+                Some(0) => tracing::warn!(
+                    target: "blazar::bank",
+                    model = %inst.name,
+                    "bank save returned ok but wrote 0 tokens — the slot held no cached prefix to bank"
+                ),
+                Some(n) => tracing::debug!(
+                    target: "blazar::bank",
+                    model = %inst.name,
+                    "banked _auto-{} checkpoint: {n} tokens", inst.profile_ctx
+                ),
+                None => {}
+            }
             // Hoard guard: a per-model bank over 512 MiB is storage
             // abuse, not a cache — drop it and say so once.
             if let Ok(md) = std::fs::metadata(&file) {
@@ -4592,6 +4650,27 @@ mod routing_tests {
     use super::*;
     use crate::engine::manifest::Manifest;
     use blazar_core::{ModelOverride, Profile};
+
+    #[test]
+    fn unit__slot_reported_tokens__distinguishes_zero_from_missing() {
+        // Live shape from b11070 (probed 2026-09-22): save -> {"id_slot":3,
+        // "n_saved":31,...}; restore -> {"n_restored":31,...}. Zero is a
+        // legitimate answer (200 with an empty/incompatible checkpoint) and
+        // must NOT be conflated with a missing field.
+        let saved = serde_json::json!({"id_slot": 3, "n_saved": 31, "n_written": 382_044});
+        assert_eq!(slot_reported_tokens(&saved, "n_saved"), Some(31));
+        let empty = serde_json::json!({"id_slot": 0, "n_saved": 0});
+        assert_eq!(slot_reported_tokens(&empty, "n_saved"), Some(0));
+        // Missing field / wrong type / empty body: unverifiable, not zero.
+        let no_field = serde_json::json!({"id_slot": 0});
+        assert_eq!(slot_reported_tokens(&no_field, "n_saved"), None);
+        let wrong_type = serde_json::json!({"n_saved": "31"});
+        assert_eq!(slot_reported_tokens(&wrong_type, "n_saved"), None);
+        assert_eq!(
+            slot_reported_tokens(&serde_json::json!({}), "n_restored"),
+            None
+        );
+    }
 
     #[test]
     fn unit__resolved_load_timeout__per_kind_default_and_user_pin() {
