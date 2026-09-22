@@ -26,6 +26,10 @@ pub enum EngineKind {
     /// leejet/stable-diffusion.cpp `sd-server` (prebuilt assets +
     /// source build; diffusion/image component sets — never text).
     SdCpp,
+    /// ggerganov/whisper.cpp `whisper-server` (prebuilt assets; lazy
+    /// audio lane for transcription/translation — serves no model rows,
+    /// so it never appears in format routing in either direction).
+    Whisper,
 }
 
 impl EngineKind {
@@ -36,6 +40,7 @@ impl EngineKind {
             EngineKind::MistralRs => "mistralrs",
             EngineKind::Sglang => "sglang",
             EngineKind::SdCpp => "sdcpp",
+            EngineKind::Whisper => "whisper",
         }
     }
 
@@ -371,8 +376,9 @@ impl FromStr for EngineKind {
             "mistralrs" => Ok(EngineKind::MistralRs),
             "sglang" => Ok(EngineKind::Sglang),
             "sdcpp" => Ok(EngineKind::SdCpp),
+            "whisper" => Ok(EngineKind::Whisper),
             other => Err(format!(
-                "unknown engine kind {other:?} (supported: llamacpp, mistralrs, sglang, sdcpp)"
+                "unknown engine kind {other:?} (supported: llamacpp, mistralrs, sglang, sdcpp, whisper)"
             )),
         }
     }
@@ -444,6 +450,7 @@ mod tests {
             EngineKind::MistralRs,
             EngineKind::Sglang,
             EngineKind::SdCpp,
+            EngineKind::Whisper,
         ] {
             assert_eq!(EngineKind::from_str(k.as_str()), Ok(k));
             let json = serde_json::to_string(&k).unwrap();
@@ -451,7 +458,7 @@ mod tests {
         }
         assert_eq!(
             EngineKind::from_str("vllm").unwrap_err(),
-            "unknown engine kind \"vllm\" (supported: llamacpp, mistralrs, sglang, sdcpp)"
+            "unknown engine kind \"vllm\" (supported: llamacpp, mistralrs, sglang, sdcpp, whisper)"
         );
         // serde default on missing field = llamacpp (old rows).
         assert_eq!(

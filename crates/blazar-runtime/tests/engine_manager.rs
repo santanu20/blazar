@@ -1211,6 +1211,43 @@ fn stub_engine_dir(tag: &str) -> (PathBuf, tempfile::TempDir) {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn integration__lazy_whisper_lane_never_claims_serving_active() {
+    // A whisper install must stay additive like fork lanes: `serve`
+    // picks its adapter off the ACTIVE row, so a whisper row stealing
+    // activation left the daemon unable to boot (live bug 2026-09-22).
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    {
+        let store = Store::open(&dirs).unwrap();
+        stage_mainstream_row(&store, &dirs, "b1-cuda", 2000, &["llama"]);
+        store.set_active_engine("b1-cuda").unwrap();
+    }
+    let dir = tempfile::Builder::new()
+        .prefix("blazar-engine-test-lazywhisper-")
+        .tempdir()
+        .expect("staging tempdir");
+    std::fs::copy(stub_server_bin(), dir.path().join("whisper-server")).expect("copy stub");
+    let row = mgr
+        .register_engine(
+            dir.path(),
+            "b5130",
+            "whisper-bin-ubuntu-x64.tar.gz",
+            "cafebabe",
+            blazar_core::engine_kind::EngineKind::Whisper,
+        )
+        .unwrap();
+    assert!(!row.active, "lazy audio lane must not steal activation");
+    let store = Store::open(&dirs).unwrap();
+    assert_eq!(
+        store.active_engine().unwrap().map(|r| r.tag),
+        Some("b1-cuda".to_string()),
+        "the serving engine keeps the throne across a whisper install"
+    );
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn integration__vulkan_never_dethrones_cuda_on_nvidia() {
     let (_t, dirs) = tmp_dirs();
     let api = MockServer::start().await;

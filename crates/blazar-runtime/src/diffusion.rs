@@ -45,6 +45,16 @@ pub struct ComponentSpec {
     pub fallback_quant: Option<&'static str>,
 }
 
+/// What a family generates. sd-server derives its serving mode from the
+/// LOADED model (capabilities advertises `supported_modes` per boot) —
+/// there is no boot-time mode flag in current builds — so the gateway
+/// uses this field to teach the right surface (`/v1/videos` vs
+/// `/v1/images`) before any child exists.
+pub enum FamilyMode {
+    Img,
+    Vid,
+}
+
 /// A diffusion model family: detection token plus the component specs
 /// sd-server needs to boot it.
 pub struct DiffusionFamily {
@@ -63,6 +73,7 @@ pub struct DiffusionFamily {
     /// family; the pull picks the `DiT` by quant as usual.
     pub standalone_files: Option<&'static [&'static str]>,
     pub components: &'static [ComponentSpec],
+    pub mode: FamilyMode,
 }
 
 /// Verified families. Keep this list honest: an entry asserts the
@@ -102,6 +113,7 @@ const FAMILIES: &[DiffusionFamily] = &[
                 fallback_quant: None,
             },
         ],
+        mode: FamilyMode::Img,
     },
     DiffusionFamily {
         // Qwen-Image v1 (upstream docs/qwen_image.md): the DiT pairs
@@ -135,6 +147,7 @@ const FAMILIES: &[DiffusionFamily] = &[
                 fallback_quant: Some("Q4_K_M"),
             },
         ],
+        mode: FamilyMode::Img,
     },
     DiffusionFamily {
         // Covers FLUX.1-dev, FLUX.1-schnell and their GGUF mirrors;
@@ -176,6 +189,7 @@ const FAMILIES: &[DiffusionFamily] = &[
                 fallback_quant: None,
             },
         ],
+        mode: FamilyMode::Img,
     },
     DiffusionFamily {
         // Z-Image-Turbo and Z-Image base share one component set
@@ -211,6 +225,7 @@ const FAMILIES: &[DiffusionFamily] = &[
                 fallback_quant: Some("Q4_K_M"),
             },
         ],
+        mode: FamilyMode::Img,
     },
     DiffusionFamily {
         // Curated to the Chroma1-HD line, the current head of
@@ -247,6 +262,7 @@ const FAMILIES: &[DiffusionFamily] = &[
                 fallback_quant: None,
             },
         ],
+        mode: FamilyMode::Img,
     },
     DiffusionFamily {
         // Token "flux.2-dev" deliberately excludes the klein variants:
@@ -281,6 +297,7 @@ const FAMILIES: &[DiffusionFamily] = &[
                 fallback_quant: Some("Q4_K_M"),
             },
         ],
+        mode: FamilyMode::Img,
     },
     DiffusionFamily {
         // SDXL: the most-downloaded image model on HF. A STANDALONE
@@ -295,6 +312,7 @@ const FAMILIES: &[DiffusionFamily] = &[
         excludes: &[],
         standalone_files: Some(&["sd_xl_base_1.0.safetensors"]),
         components: &[],
+        mode: FamilyMode::Img,
     },
     DiffusionFamily {
         // SD 1.x: second most-downloaded family on HF, same standalone
@@ -307,6 +325,52 @@ const FAMILIES: &[DiffusionFamily] = &[
         excludes: &[],
         standalone_files: Some(&["v1-5-pruned-emaonly.safetensors", "sd-v1-4.ckpt"]),
         components: &[],
+        mode: FamilyMode::Img,
+    },
+    DiffusionFamily {
+        // Wan 2.1 T2V 1.3B (upstream docs/wan.md): a video diffusion
+        // model — the DiT is a standalone safetensors that still needs
+        // its VAE and the umt5-xxl text encoder attached. NOTE: the
+        // doc's `-M vid_gen` is the sd-cli/library interface; sd-server
+        // has no mode flag (verified live on master-890: `-m` is short
+        // for `--model`) — it derives the serving mode from the loaded
+        // model, and video parameters (frames/fps) ride requests.
+        // Sibling variants (fun/vace/i2v/flf2v) pair different or
+        // extra components and stay out; Wan 2.2 A14B needs a second
+        // high-noise DiT and is deferred with it.
+        token: "wan",
+        display: "Wan 2.1 T2V",
+        // Broad token on purpose: the two real housings spell it
+        // differently (official `Wan2.1-T2V-1.3B`, Comfy-Org
+        // `Wan_2.1_ComfyUI_repackaged`) — "wan_2.1" alone would miss
+        // the official repos. "2.2" vetoes both Wan 2.2 spellings;
+        // the variant suffixes pair different component contracts.
+        excludes: &["2.2", "fun", "vace", "i2v", "flf2v"],
+        standalone_files: Some(&[
+            "split_files/diffusion_models/wan2.1_t2v_1.3B_fp16.safetensors",
+            "split_files/diffusion_models/wan2.1_t2v_1.3B_bf16.safetensors",
+        ]),
+        components: &[
+            ComponentSpec {
+                flag: "--vae",
+                source: ComponentSource {
+                    repo: "Comfy-Org/Wan_2.1_ComfyUI_repackaged",
+                    repo_path: "split_files/vae/wan_2.1_vae.safetensors",
+                },
+                required: true,
+                fallback_quant: None,
+            },
+            ComponentSpec {
+                flag: "--t5xxl",
+                source: ComponentSource {
+                    repo: "city96/umt5-xxl-encoder-gguf",
+                    repo_path: "umt5-xxl-encoder-{quant}.gguf",
+                },
+                required: true,
+                fallback_quant: Some("Q4_K_M"),
+            },
+        ],
+        mode: FamilyMode::Vid,
     },
 ];
 
@@ -348,6 +412,13 @@ pub fn supported_families() -> Vec<&'static str> {
 #[must_use]
 pub fn family_supports_edits(repo: &str) -> Option<bool> {
     diffusion_family(repo).map(|f| f.components.iter().any(|c| c.flag == "--llm_vision"))
+}
+
+/// The serving surface a repo's family targets, for pre-boot teaching.
+/// `None` = not a diffusion family repo (or an uncurated one).
+#[must_use]
+pub fn family_mode(repo: &str) -> Option<&'static FamilyMode> {
+    diffusion_family(repo).map(|f| &f.mode)
 }
 
 /// Resolve one component against its repo listing: the exact
@@ -461,9 +532,18 @@ mod tests {
                 "Chroma",
                 "FLUX.2-dev",
                 "SDXL",
-                "SD 1.5"
+                "SD 1.5",
+                "Wan 2.1 T2V"
             ]
         );
+        // Wan 2.1 T2V: the repackaged tree and GGUF-style housings
+        // match; sibling variants with different component contracts
+        // are vetoed, and Wan 2.2 needs a second DiT (deferred).
+        assert!(diffusion_family("Comfy-Org/Wan_2.1_ComfyUI_repackaged").is_some());
+        assert!(diffusion_family("Wan-AI/Wan2.1-T2V-1.3B").is_some());
+        assert!(diffusion_family("Comfy-Org/Wan2.1-Fun-1.3B-InP").is_none());
+        assert!(diffusion_family("Wan-AI/Wan2.2-T2V-A14B-GGUF").is_none());
+        assert!(diffusion_family("QuantStack/Wan2.2-T2V-A14B-GGUF").is_none());
     }
 
     #[test]
@@ -573,6 +653,30 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
+    fn unit__family_mode__vid_families_and_img_families_partition() {
+        use crate::diffusion::FamilyMode;
+        // Wan is the video lane; every curated image family reports Img.
+        assert!(matches!(
+            family_mode("Comfy-Org/Wan_2.1_ComfyUI_repackaged"),
+            Some(&FamilyMode::Vid)
+        ));
+        for repo in [
+            "abenzerps/Qwen-Image-2.1-GGUF",
+            "city96/FLUX.1-dev-gguf",
+            "stabilityai/stable-diffusion-xl-base-1.0",
+        ] {
+            assert!(
+                matches!(family_mode(repo), Some(&FamilyMode::Img)),
+                "{repo} must be an image family"
+            );
+        }
+        // Not a diffusion repo (and not a curated one): no mode claim.
+        assert!(family_mode("Qwen/Qwen2.5-0.5B-Instruct-GGUF").is_none());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
     fn unit__family_supports_edits__vision_flag_decides() {
         assert_eq!(family_supports_edits("x/Qwen-Image-2.1-GGUF"), Some(true));
         assert_eq!(family_supports_edits("city96/FLUX.1-dev-gguf"), Some(false));

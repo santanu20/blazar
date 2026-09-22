@@ -393,6 +393,19 @@ impl GhClient {
             .ok_or_else(|| anyhow!("no master-tagged stable-diffusion.cpp releases found"))
     }
 
+    /// Newest whisper.cpp `bNNNN` release. The repo's `vX.Y.Z` tags are
+    /// source-only (zero assets — verified v1.9.4); the b-tags carry the
+    /// prebuilt binaries, so the b-counter is the currency. List trims
+    /// `assets`; callers re-fetch the full release by tag.
+    pub async fn latest_whisper_release(&self) -> Result<GhRelease> {
+        let releases = self.list_releases_repo(WHISPER_REPO).await?;
+        releases
+            .into_iter()
+            .filter(|r| btag_number(&r.tag_name).is_some())
+            .max_by_key(|r| btag_number(&r.tag_name).unwrap_or(0))
+            .ok_or_else(|| anyhow!("no b-tagged whisper.cpp releases found"))
+    }
+
     /// Download an asset fully into memory, verifying its sha256 digest
     /// when the release metadata provides one. Assets are ≤ ~400 MB.
     pub async fn download_asset_bytes(&self, asset: &GhAsset) -> Result<Vec<u8>> {
@@ -767,6 +780,8 @@ pub const MISTRALRS_REPO: &str = "EricLBuehler/mistral.rs";
 
 pub const SDCPP_REPO: &str = "leejet/stable-diffusion.cpp";
 
+pub const WHISPER_REPO: &str = "ggml-org/whisper.cpp";
+
 /// Parse an sd.cpp `master-NNN-<sha8>` tag's build counter. sd.cpp does
 /// not cut semver releases; the counter is the currency, the sha is the
 /// identity (`--version` reports the sha, not a version word).
@@ -863,6 +878,55 @@ pub fn sdcpp_asset_patterns(os: &str, arch: &str, nvidia: bool) -> Result<Vec<Sd
         (os, arch) => Err(anyhow!(
             "stable-diffusion.cpp publishes no prebuilt for {os}/{arch} — build from source \
              (cmake -DSD_BUILD_SERVER=ON) and place sd-server under the engines dir"
+        )),
+    }
+}
+
+/// Ordered whisper.cpp asset preferences for this machine. whisper
+/// serving is a CPU contract (verified b5130: no `--list-devices`, CPU
+/// dispatch libs ship in the tar), so the pick is platform-shaped, not
+/// GPU-shaped. Names verified against the b5130 asset list:
+/// `whisper-bin-ubuntu-x64.tar.gz`, `whisper-bin-ubuntu-arm64.tar.gz`,
+/// Windows cpu/cuda/opencl zips. macOS ships an xcframework library
+/// only — no server binary.
+pub fn whisper_asset_patterns(os: &str, arch: &str) -> Result<Vec<SdAssetPattern>> {
+    match (os, arch) {
+        ("linux", "x86_64" | "x64" | "amd64") => Ok(vec![SdAssetPattern {
+            includes: &["whisper-bin-ubuntu-x64"],
+            excludes: &[],
+            label: "cpu",
+            cpu_fallback: false,
+        }]),
+        ("linux", "aarch64" | "arm64") => Ok(vec![SdAssetPattern {
+            includes: &["whisper-bin-ubuntu-arm64"],
+            excludes: &[],
+            label: "cpu",
+            cpu_fallback: false,
+        }]),
+        // Windows zips: the plain cpu build first; the cublas build as
+        // the labeled GPU fallback. `blas` excludes keep the cpu pick
+        // off the cublas/opencl zips of the same release.
+        ("windows", "x86_64" | "x64" | "amd64") => Ok(vec![
+            SdAssetPattern {
+                includes: &["win", "x64", "cpu"],
+                excludes: &["cuda", "opencl", "blas"],
+                label: "cpu",
+                cpu_fallback: false,
+            },
+            SdAssetPattern {
+                includes: &["win", "x64", "cublas"],
+                excludes: &[],
+                label: "cublas",
+                cpu_fallback: true,
+            },
+        ]),
+        ("macos", _) => Err(anyhow!(
+            "whisper.cpp publishes no server binary for macOS (xcframework library only) — \
+             build whisper-server from source and place it under the engines dir"
+        )),
+        (os, arch) => Err(anyhow!(
+            "whisper.cpp publishes no prebuilt for {os}/{arch} — build whisper-server \
+             from source and place it under the engines dir"
         )),
     }
 }
@@ -1376,6 +1440,39 @@ mod tests {
         let (asset, pattern) = resolve_sdcpp_asset(&win_rel, &win_nv).unwrap();
         assert_eq!(asset.name, "sd-master-74988b2-bin-win-cuda12-x64.zip");
         assert_eq!(pattern.label, "cuda");
+    }
+
+    #[test]
+    fn unit__whisper_asset_patterns__single_linux_tar_cpu_first_windows_no_mislabel() {
+        // Linux x86_64 has exactly one asset family (the ubuntu tar) —
+        // no fallback tier exists upstream.
+        let lin = whisper_asset_patterns("linux", "x86_64").unwrap();
+        assert_eq!(lin.len(), 1);
+        assert!(lin[0].includes.iter().all(|i| i.contains("ubuntu-x64")));
+        assert!(!lin[0].cpu_fallback);
+
+        // Windows: plain cpu first (accelerated variants excluded so the
+        // cpu pattern can never wear a cublas/opencl zip), cublas as the
+        // labeled fallback.
+        let win = whisper_asset_patterns("windows", "x86_64").unwrap();
+        assert_eq!(win.len(), 2);
+        assert!(win[0].includes.contains(&"cpu"));
+        for excl in win[0].excludes {
+            assert!(
+                excl.contains("cuda") || excl.contains("opencl") || excl.contains("blas"),
+                "cpu pattern must exclude accelerated zips: {excl}"
+            );
+        }
+        assert!(win[1].includes.contains(&"cublas"));
+        assert!(win[1].cpu_fallback);
+
+        // macOS upstream ships an xcframework library only: the lane
+        // must teach a source build instead of pretending.
+        let err = whisper_asset_patterns("macos", "aarch64").unwrap_err();
+        assert!(
+            err.to_string().contains("source"),
+            "mac must teach build-from-source: {err}"
+        );
     }
 
     #[test]

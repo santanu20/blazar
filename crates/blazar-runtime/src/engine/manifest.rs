@@ -414,6 +414,7 @@ pub fn probe_kind(
         blazar_core::engine_kind::EngineKind::MistralRs => probe_mistralrs(server_path, tag),
         blazar_core::engine_kind::EngineKind::Sglang => probe_sglang(server_path, tag),
         blazar_core::engine_kind::EngineKind::SdCpp => probe_sdcpp(server_path, tag),
+        blazar_core::engine_kind::EngineKind::Whisper => probe_whisper(server_path, tag),
     }
 }
 
@@ -689,6 +690,60 @@ pub(crate) fn parse_sd_devices(text: &str) -> Vec<DeviceDesc> {
         })
         .collect()
 }
+/// Probe a whisper-server binary. Divergences from llama-server
+/// (verified against ggerganov/whisper.cpp b5130): no `--version` flag
+/// at all (`error: unknown argument: --version`) — the b-tag is the
+/// identity; `-h`/`--help` exit 0 with usage on stdout in the same
+/// shape llama parses; no `--list-devices` (CPU-only serving contract).
+fn probe_whisper(server_path: &Path, tag: &str) -> Result<Manifest> {
+    let server = server_path
+        .to_str()
+        .ok_or_else(|| anyhow!("non-UTF-8 engine path {}", server_path.display()))?;
+
+    // Tags are b-tags (`b5130`) — the upstream build counter is the
+    // sortable identity, exactly like the llama lane.
+    let build_number = super::gh::btag_number(tag).unwrap_or(0);
+    let version_raw = format!("whisper.cpp {tag}");
+
+    // Flags: `--help` exits 0 — but whisper.cpp prints its usage to
+    // STDERR (live-verified b5130: 0 bytes stdout, ~4.8 KiB stderr),
+    // unlike the llama lanes. Parse stderr first, stdout as fallback.
+    // A zero-flag parse is an upstream format change — fail the probe
+    // loudly rather than degrading argv gating.
+    let help_out = crate::probe::probe_output(Command::new(server).arg("--help"), 30)
+        .with_context(|| format!("run {server} --help (timed out or failed to spawn)"))?;
+    let err_help = String::from_utf8_lossy(&help_out.stderr).to_string();
+    let out_help = String::from_utf8_lossy(&help_out.stdout).to_string();
+    let help_text = if err_help.trim().is_empty() {
+        &out_help
+    } else {
+        &err_help
+    };
+    let (flags, _) = parse_help(help_text);
+    if flags.is_empty() {
+        return Err(anyhow!(
+            "whisper-server --help parsed to zero flags (output format changed upstream?): {}",
+            err_help
+                .lines()
+                .chain(out_help.lines())
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
+    }
+
+    Ok(Manifest {
+        tag: tag.to_string(),
+        build_number,
+        version_raw,
+        devices: Vec::new(),
+        flags,
+        spec_types: Vec::new(),
+        server_path: server.to_string(),
+        ..Default::default()
+    })
+}
+
 /// The `build NNNN` token is authoritative; fall back to the first
 /// integer after `version:`.
 fn parse_version(text: &str) -> Result<(u64, String)> {

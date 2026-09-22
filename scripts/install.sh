@@ -726,7 +726,7 @@ EOF
     status "other engines, one command each:"
     status "  blazar engine install --kind sglang     # SGLang: safetensors lane, best quality + batching (Linux + NVIDIA, ~6 GiB)"
     status "  blazar engine install --kind mistralrs  # mistral.rs: GGUF + safetensors (~0.8 GiB)"
-    status "  blazar engine install --kind sdcpp      # sd.cpp: diffusion checkpoints — Qwen-Image/FLUX/Z-Image/Chroma/SDXL/SD1.5 (any GPU via Vulkan, ~0.04-0.3 GiB)"
+    status "  blazar engine install --kind sdcpp      # sd.cpp: diffusion + video checkpoints — Qwen-Image/FLUX/Z-Image/Chroma/SDXL/SD1.5/Wan 2.1 T2V (any GPU via Vulkan, ~0.04-0.3 GiB)"
     status "  blazar engine list                      # what is installed; blazar engine use <tag> switches the serving engine"
     # Fresh-install start, deferred until the engine exists (see the
     # enable block above). Started even when bootstrap failed: a running
