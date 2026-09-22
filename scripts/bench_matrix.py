@@ -298,6 +298,11 @@ def load_engines(data_dir: Path) -> list[Engine]:
             # active and the sandbox daemon exits "no engine installed"
             continue
         kind = kinds[tag]
+        if kind not in ("llamacpp", "mistralrs"):
+            # Text-bench lanes only. sdcpp (sd-server) has no chat
+            # surface — its /v1/images endpoints belong to the image
+            # lane, not this harness.
+            continue
         if kind == "mistralrs":
             server = edir / "mistralrs"
             if not server.exists():
@@ -4458,9 +4463,7 @@ def write_publication_report(
     }
     blazar_ver = next(iter(versions)) if len(versions) == 1 else "mixed"
     env_states = {
-        r.get("power_state", "unstamped")
-        for r in recs
-        if r.get("provider") == "blazar"
+        r.get("power_state", "unstamped") for r in recs if r.get("provider") == "blazar"
     }
 
     L: list[str] = []
