@@ -169,8 +169,10 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Chat REPL against a model (streams; /exit /clear /model /sysinfo /profile);
-    /// with an inline PROMPT: single-shot generation, prints and exits
+    /// Interactive loop against a model, by kind: text chats (streams;
+    /// /exit /clear /model /sysinfo /profile), diffusion sets generate
+    /// images or video, pulled piper voices speak text aloud; with an
+    /// inline PROMPT: single-shot, prints and exits
     Run {
         model: String,
         /// Prompt words (joined); flags go BEFORE the prompt — a leading
@@ -892,6 +894,16 @@ fn cli_http() -> reqwest::Client {
         .unwrap_or_default()
 }
 
+/// Diffusion sync turns and speech renders run minutes, not the 10s
+/// ops budget of `cli_http` — the generation loops need a patient
+/// client (job polls stay on `cli_http`: each roundtrip is fast).
+fn gen_http() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()
+        .unwrap_or_default()
+}
+
 fn dirs() -> BlazarDirs {
     BlazarDirs::from_env()
 }
@@ -981,28 +993,38 @@ async fn ensure_run_model(name: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
-/// `run` is a chat REPL; diffusion component sets have no chat surface.
-/// Refuse at the CLI boundary — spawning the sdcpp child would 404
-/// every REPL send.
-fn diffusion_repl_refusal(row: &blazar_core::store::ModelRow) -> Option<String> {
-    row.has_component_set().then(|| {
-        // Video families (Wan) teach the videos route; everything else
-        // is an image family.
-        let route = if matches!(
-            blazar_runtime::diffusion::family_mode(&row.repo),
-            Some(blazar_runtime::diffusion::FamilyMode::Vid)
-        ) {
-            "/v1/videos/generations"
-        } else {
-            "/v1/images/generations"
-        };
-        format!(
-            "\"{}\" is a diffusion model (sdcpp lane) — the chat REPL cannot drive \
-             generation; start the daemon (blazar serve) and POST \
-             {route} {{\"model\": \"{}\", \"prompt\": \"...\"}}",
-            row.name, row.name
-        )
-    })
+/// `blazar run` lane routing: the interactive surface a model drives.
+/// Diffusion sets and standalone checkpoints have no chat surface —
+/// image families loop on /v1/images/generations, video families on
+/// /v1/videos/generations; everything else is the chat REPL.
+enum RunLane {
+    Text,
+    Image,
+    Video,
+}
+
+fn run_lane(row: &blazar_core::store::ModelRow) -> RunLane {
+    if !row.has_component_set() {
+        return RunLane::Text;
+    }
+    match blazar_runtime::diffusion::family_mode(&row.repo) {
+        Some(blazar_runtime::diffusion::FamilyMode::Vid) => RunLane::Video,
+        _ => RunLane::Image,
+    }
+}
+
+/// Piper voices are files, not store rows: a `run` argument naming a
+/// pulled voice (or the bare words "tts"/"piper" when one is installed)
+/// drives the speech loop. Rows always win — a name that is both is a
+/// model row, never a voice.
+fn tts_voice_target<'a>(name: &str, voices: &'a [String]) -> Option<&'a String> {
+    if voices.is_empty() {
+        return None;
+    }
+    if let Some(v) = voices.iter().find(|v| v.as_str() == name) {
+        return Some(v);
+    }
+    matches!(name, "tts" | "piper").then(|| &voices[0])
 }
 
 /// Not-found error with the flat-name teaching line for ollama
@@ -1140,12 +1162,30 @@ async fn run(cmd: Cmd) -> Result<()> {
             no_draft,
         } => {
             let model = ensure_run_model(&model).await?;
-            // Diffusion rows refuse here rather than in the REPL: the
-            // sdcpp child has no chat routes at all.
+            let inline: Option<String> = {
+                let joined = prompt.join(" ");
+                (!joined.is_empty()).then_some(joined)
+            };
+            // Lane routing: diffusion rows and piper voices never reach
+            // the chat REPL — each drives its own generation loop (an
+            // inline prompt runs a single shot, no loop).
             if let Ok(Some(row)) = Store::open(&dirs()).and_then(|s| s.get_model(&model)) {
-                if let Some(refusal) = diffusion_repl_refusal(&row) {
-                    return Err(anyhow::Error::msg(refusal));
+                match run_lane(&row) {
+                    RunLane::Image => {
+                        let base = ensure_daemon().await?;
+                        return image_repl(&base, &model, inline.as_deref()).await;
+                    }
+                    RunLane::Video => {
+                        let base = ensure_daemon().await?;
+                        return video_repl(&base, &model, inline.as_deref()).await;
+                    }
+                    RunLane::Text => {}
                 }
+            } else if let Some(voice) =
+                tts_voice_target(&model, &blazar_runtime::piper::list_voices(&dirs()))
+            {
+                let base = ensure_daemon().await?;
+                return tts_repl(&base, voice, inline.as_deref()).await;
             }
             run_dispatch(&model, &prompt, verbose, max_tokens, no_draft).await
         }
@@ -6116,40 +6156,8 @@ async fn tts_speak(
             .ok_or_else(|| anyhow!("no voice pulled — run: blazar tts --pull en_US-amy-medium"))?
     };
     let base = ensure_daemon().await?;
-    let bearer = admin_bearer();
-    let mut body = serde_json::json!({ "model": voice, "input": text });
-    if let Some(speed) = speed {
-        body["speed"] = serde_json::json!(speed);
-    }
-    let mut req = cli_http()
-        .post(format!("{base}/v1/audio/speech"))
-        .json(&body);
-    if let Some(b) = bearer {
-        req = req.bearer_auth(b);
-    }
-    let resp = req.send().await?;
-    let status = resp.status();
-    if !status.is_success() {
-        let msg = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("speech failed ({status}): {}", msg.trim()));
-    }
-    let wav = resp.bytes().await?;
-    if out == Some(Path::new("-")) {
-        use std::io::Write as _;
-        std::io::stdout().write_all(&wav)?;
-    } else {
-        let path = out.map_or_else(
-            || format!("{}-{}.wav", voice, chrono_now_compact()),
-            |p| p.display().to_string(),
-        );
-        std::fs::write(&path, &wav).with_context(|| format!("write {path}"))?;
-        println!(
-            "wrote {path} ({} bytes, {} s audio)",
-            wav.len(),
-            wav_duration_secs(&wav)
-        );
-    }
-    Ok(())
+    let wav = speech_post(&base, &voice, text, speed).await?;
+    write_speech_out(&voice, &wav, out)
 }
 
 /// Compact timestamp for default output names (no chrono dep needed for
@@ -6574,6 +6582,503 @@ async fn run_repl(model: &str, no_draft: bool) -> Result<()> {
     #[cfg(unix)]
     restore_repl_sigint();
     Ok(())
+}
+
+/// One readline for the generation loops: empty lines skip a turn,
+/// Ctrl-C nudges (session stays), Ctrl-D/EOF ends the loop.
+fn gen_line(rl: &mut rustyline::DefaultEditor, prompt: &str) -> Option<String> {
+    use rustyline::error::ReadlineError;
+    match rl.readline(prompt) {
+        Ok(l) => {
+            let t = l.trim().to_string();
+            Some(t).filter(|t| !t.is_empty())
+        }
+        Err(ReadlineError::Interrupted) => {
+            println!("^C (use /exit or Ctrl-D to quit)");
+            Some(String::new())
+        }
+        Err(_) => None,
+    }
+}
+
+/// `WxH` with digits on both sides (no `x` multiplier trickery).
+fn parse_gen_size(v: &str) -> Option<String> {
+    let (w, h) = v.split_once('x')?;
+    (!w.is_empty()
+        && !h.is_empty()
+        && w.bytes().all(|b| b.is_ascii_digit())
+        && h.bytes().all(|b| b.is_ascii_digit()))
+    .then(|| v.to_string())
+}
+
+/// Step counts the upstream diffusion servers accept (1..=100).
+fn parse_gen_steps(v: &str) -> Option<u64> {
+    v.parse::<u64>().ok().filter(|n| (1..=100).contains(n))
+}
+
+/// Video duration in seconds, capped where patience ends.
+fn parse_gen_duration(v: &str) -> Option<u64> {
+    v.parse::<u64>().ok().filter(|n| (1..=60).contains(n))
+}
+
+/// Piper speaking rate (upstream range 0.1..=4.0, 1.0 = native).
+fn parse_gen_speed(v: &str) -> Option<f64> {
+    v.parse::<f64>().ok().filter(|f| (0.1..=4.0).contains(f))
+}
+
+/// POST one sync image request; returns the raw response so the caller
+/// can branch on status without re-sending.
+async fn image_post(
+    base: &str,
+    model: &str,
+    prompt: &str,
+    size: Option<&str>,
+    steps: Option<u64>,
+) -> Result<reqwest::Response> {
+    let mut body = serde_json::json!({"model": model, "prompt": prompt});
+    if let Some(s) = size {
+        body["size"] = serde_json::json!(s);
+    }
+    if let Some(n) = steps {
+        body["steps"] = serde_json::json!(n);
+    }
+    let mut req = gen_http()
+        .post(format!("{base}/v1/images/generations"))
+        .json(&body);
+    if let Some(b) = admin_bearer() {
+        req = req.bearer_auth(b);
+    }
+    req.send().await.map_err(Into::into)
+}
+
+/// Decode a finished generations response into (bytes, extension) —
+/// the payload rides `data[0].b64_json`, the extension follows the
+/// response's declared output format (defaulting to png).
+fn image_payload(resp: &serde_json::Value) -> Option<(Vec<u8>, String)> {
+    use base64::Engine as _;
+    let b64 = resp.get("data")?.get(0)?.get("b64_json")?.as_str()?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let ext = resp
+        .get("output_format")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("png")
+        .to_string();
+    Some((bytes, ext))
+}
+
+/// Write one generated artifact under a stable name; returns the path
+/// written (for the loop's receipt line).
+fn write_gen_out(model: &str, bytes: &[u8], ext: &str) -> Result<String> {
+    let path = format!("{model}-{}.{ext}", chrono_now_compact());
+    std::fs::write(&path, bytes).with_context(|| format!("write {path}"))?;
+    Ok(path)
+}
+
+/// One image turn: sync request, PNG (or family format) to the working
+/// directory. Returns Ok even on server rejections — a bad prompt must
+/// not kill the loop; the error line teaches and the next turn waits.
+async fn image_turn(base: &str, model: &str, prompt: &str, size: Option<&str>, steps: Option<u64>) {
+    let started = std::time::Instant::now();
+    match image_post(base, model, prompt, size, steps).await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(v) => match image_payload(&v) {
+                Some((bytes, ext)) => match write_gen_out(model, &bytes, &ext) {
+                    Ok(path) => println!(
+                        "wrote {path} ({}, {:.1}s)",
+                        humansize(i64::try_from(bytes.len()).unwrap_or(i64::MAX)),
+                        started.elapsed().as_secs_f64()
+                    ),
+                    Err(e) => println!("error: {e}"),
+                },
+                None => println!("error: response carried no image data — daemon logs explain"),
+            },
+            Err(e) => println!("error: unreadable response: {e}"),
+        },
+        Ok(resp) => {
+            let msg = resp.text().await.unwrap_or_default();
+            println!("error: {}", msg.trim());
+        }
+        Err(e) => println!("error: {e}"),
+    }
+}
+
+/// Image loop for diffusion component sets and standalone checkpoints:
+/// every line is a prompt, every answer an image in the working
+/// directory. Knobs override the server's family defaults; omitted
+/// knobs let the daemon size the request (the same defaults the HTTP
+/// API applies).
+async fn image_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()> {
+    if let Some(prompt) = inline {
+        image_turn(base, model, prompt, None, None).await;
+        return Ok(());
+    }
+    let mut rl = rustyline::DefaultEditor::new()?;
+    let mut size: Option<String> = None;
+    let mut steps: Option<u64> = None;
+    #[cfg(unix)]
+    install_repl_sigint();
+    println!("blazar image REPL — {model} (a prompt generates; /help; /exit)");
+    while let Some(line) = gen_line(&mut rl, "img> ") {
+        if line.is_empty() {
+            continue;
+        }
+        rl.add_history_entry(&line).ok();
+        match line.as_str() {
+            "/exit" | "/bye" => break,
+            "/help" => {
+                println!("commands: /exit /bye /size <WxH> /steps <n>");
+                println!(
+                    "input:   plain text prompts; a turn answers with an image file \
+                     in the working directory"
+                );
+            }
+            _ if line.starts_with("/size ") => {
+                match parse_gen_size(line["/size ".len()..].trim()) {
+                    Some(s) => {
+                        size = Some(s.clone());
+                        println!("(size {s})");
+                    }
+                    None => println!("(usage: /size 1024x1024 — digits on both sides)"),
+                }
+            }
+            _ if line.starts_with("/steps ") => {
+                match parse_gen_steps(line["/steps ".len()..].trim()) {
+                    Some(n) => {
+                        steps = Some(n);
+                        println!("(steps {n})");
+                    }
+                    None => println!("(usage: /steps 24 — 1..=100)"),
+                }
+            }
+            _ if line.starts_with('/') => {
+                println!("(unknown command — /help)");
+            }
+            _ => {
+                image_turn(base, model, &line, size.as_deref(), steps).await;
+            }
+        }
+    }
+    #[cfg(unix)]
+    restore_repl_sigint();
+    Ok(())
+}
+
+/// Submit one video job (`"async": true` — video turns run minutes, a
+/// sync POST would hold the socket hostage) and return its id.
+async fn video_submit(
+    base: &str,
+    model: &str,
+    prompt: &str,
+    size: Option<&str>,
+    duration: Option<u64>,
+) -> Result<String> {
+    let mut body = serde_json::json!({"model": model, "prompt": prompt, "async": true});
+    if let Some(s) = size {
+        body["size"] = serde_json::json!(s);
+    }
+    if let Some(d) = duration {
+        body["duration"] = serde_json::json!(d);
+    }
+    let mut req = gen_http()
+        .post(format!("{base}/v1/videos/generations"))
+        .json(&body);
+    if let Some(b) = admin_bearer() {
+        req = req.bearer_auth(b);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    if !status.is_success() {
+        anyhow::bail!("submit failed ({status}): {}", text.trim());
+    }
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| {
+            v.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from)
+        })
+        .ok_or_else(|| anyhow!("submit succeeded but carried no job id: {text}"))
+}
+
+/// Poll a video job to completion and write the clip; prints status
+/// transitions and a heartbeat so minutes-long renders never look hung.
+async fn video_wait(base: &str, model: &str, job: &str) {
+    let started = std::time::Instant::now();
+    let mut last_status = String::new();
+    loop {
+        let mut req = cli_http().get(format!("{base}/v1/videos/jobs/{job}"));
+        if let Some(b) = admin_bearer() {
+            req = req.bearer_auth(b);
+        }
+        let v = match req.send().await {
+            Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+                Ok(v) => v,
+                Err(e) => {
+                    println!("error: unreadable job status: {e}");
+                    return;
+                }
+            },
+            Ok(r) => {
+                let msg = r.text().await.unwrap_or_default();
+                println!("error: {}", msg.trim());
+                return;
+            }
+            Err(e) => {
+                println!("error: {e}");
+                return;
+            }
+        };
+        let status = v
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        if status != last_status {
+            if !last_status.is_empty() {
+                println!();
+            }
+            print!("{status}");
+            last_status = status.clone();
+        } else if started.elapsed().as_secs().is_multiple_of(15) {
+            print!(".");
+        }
+        match status.as_str() {
+            "completed" => {
+                println!();
+                match image_payload(&v) {
+                    Some((bytes, ext)) => match write_gen_out(model, &bytes, &ext) {
+                        Ok(path) => println!(
+                            "wrote {path} ({}, {:.1}s)",
+                            humansize(i64::try_from(bytes.len()).unwrap_or(i64::MAX)),
+                            started.elapsed().as_secs_f64()
+                        ),
+                        Err(e) => println!("error: {e}"),
+                    },
+                    None => println!("error: completed job carried no video data"),
+                }
+                return;
+            }
+            "failed" | "cancelled" => {
+                println!();
+                let why = v
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("daemon logs explain (journalctl -u blazar)");
+                println!("error: {status} — {why}");
+                return;
+            }
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
+
+/// Video loop for Wan-family component sets: every line submits a job,
+/// polls it to completion, and writes the clip. Generation cannot be
+/// interrupted from the REPL — Ctrl-C at the prompt stays a nudge; a
+/// running job is daemon-owned and finishes server-side.
+async fn video_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()> {
+    let run_turn = |prompt: String, size: Option<String>, duration: Option<u64>| {
+        let base = base.to_string();
+        let model = model.to_string();
+        async move {
+            match video_submit(&base, &model, &prompt, size.as_deref(), duration).await {
+                Ok(job) => {
+                    println!("job {job}");
+                    video_wait(&base, &model, &job).await;
+                }
+                Err(e) => println!("error: {e}"),
+            }
+        }
+    };
+    if let Some(prompt) = inline {
+        run_turn(prompt.to_string(), None, None).await;
+        return Ok(());
+    }
+    let mut rl = rustyline::DefaultEditor::new()?;
+    let mut size: Option<String> = None;
+    let mut duration: Option<u64> = None;
+    #[cfg(unix)]
+    install_repl_sigint();
+    println!("blazar video REPL — {model} (a prompt renders a clip; /help; /exit)");
+    while let Some(line) = gen_line(&mut rl, "vid> ") {
+        if line.is_empty() {
+            continue;
+        }
+        rl.add_history_entry(&line).ok();
+        match line.as_str() {
+            "/exit" | "/bye" => break,
+            "/help" => {
+                println!("commands: /exit /bye /size <WxH> /duration <secs>");
+                println!(
+                    "input:   plain text prompts; turns run minutes and poll \
+                     server-side jobs — check progress in another terminal with \
+                     `curl {base}/v1/videos/jobs/<id>`"
+                );
+            }
+            _ if line.starts_with("/size ") => {
+                match parse_gen_size(line["/size ".len()..].trim()) {
+                    Some(s) => {
+                        size = Some(s.clone());
+                        println!("(size {s})");
+                    }
+                    None => println!("(usage: /size 960x480 — digits on both sides)"),
+                }
+            }
+            _ if line.starts_with("/duration ") => {
+                match parse_gen_duration(line["/duration ".len()..].trim()) {
+                    Some(d) => {
+                        duration = Some(d);
+                        println!("(duration {d}s)");
+                    }
+                    None => println!("(usage: /duration 5 — 1..=60 seconds)"),
+                }
+            }
+            _ if line.starts_with('/') => {
+                println!("(unknown command — /help)");
+            }
+            _ => {
+                run_turn(line.clone(), size.clone(), duration).await;
+            }
+        }
+    }
+    #[cfg(unix)]
+    restore_repl_sigint();
+    Ok(())
+}
+
+/// POST /v1/audio/speech for one utterance; the daemon spawns piper
+/// per request (same key-gating as every route).
+async fn speech_post(base: &str, voice: &str, text: &str, speed: Option<f64>) -> Result<Vec<u8>> {
+    let mut body = serde_json::json!({ "model": voice, "input": text });
+    if let Some(speed) = speed {
+        body["speed"] = serde_json::json!(speed);
+    }
+    let mut req = gen_http()
+        .post(format!("{base}/v1/audio/speech"))
+        .json(&body);
+    if let Some(b) = admin_bearer() {
+        req = req.bearer_auth(b);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let msg = resp.text().await.unwrap_or_default();
+        anyhow::bail!("speech failed ({status}): {}", msg.trim());
+    }
+    Ok(resp.bytes().await?.to_vec())
+}
+
+/// Write synthesized audio: `-` streams to stdout, anything else lands
+/// as a WAV under the given path (or a voice-stamped default).
+fn write_speech_out(voice: &str, wav: &[u8], out: Option<&Path>) -> Result<()> {
+    if out == Some(Path::new("-")) {
+        use std::io::Write as _;
+        std::io::stdout().write_all(wav)?;
+    } else {
+        let path = out.map_or_else(
+            || format!("{}-{}.wav", voice, chrono_now_compact()),
+            |p| p.display().to_string(),
+        );
+        std::fs::write(&path, wav).with_context(|| format!("write {path}"))?;
+        println!(
+            "wrote {path} ({} bytes, {} s audio)",
+            wav.len(),
+            wav_duration_secs(wav)
+        );
+    }
+    Ok(())
+}
+
+/// Speech loop over pulled piper voices: every line is spoken to a WAV
+/// in the working directory. `/voice` switches among installed voices
+/// (pulling a new one stays with `blazar tts --pull <voice>`).
+async fn tts_repl(base: &str, voice: &str, inline: Option<&str>) -> Result<()> {
+    let run_turn = |voice: String, text: String, speed: Option<f64>, out: Option<PathBuf>| {
+        let base = base.to_string();
+        async move {
+            let started = std::time::Instant::now();
+            match speech_post(&base, &voice, &text, speed).await {
+                Ok(wav) => {
+                    if let Err(e) = write_speech_out(&voice, &wav, out.as_deref()) {
+                        println!("error: {e}");
+                    } else {
+                        println!("({:.1}s)", started.elapsed().as_secs_f64());
+                    }
+                }
+                Err(e) => println!("error: {e}"),
+            }
+        }
+    };
+    if let Some(text) = inline {
+        run_turn(voice.to_string(), text.to_string(), None, None).await;
+        return Ok(());
+    }
+    let mut rl = rustyline::DefaultEditor::new()?;
+    let mut voice = voice.to_string();
+    let mut speed: Option<f64> = None;
+    let mut out: Option<PathBuf> = None;
+    #[cfg(unix)]
+    install_repl_sigint();
+    println!("blazar speech REPL — {voice} (a line is spoken aloud; /help; /exit)");
+    while let Some(line) = gen_line(&mut rl, "tts> ") {
+        if line.is_empty() {
+            continue;
+        }
+        rl.add_history_entry(&line).ok();
+        match line.as_str() {
+            "/exit" | "/bye" => break,
+            "/help" => {
+                println!("commands: /exit /bye /voice <name> /speed <0.1-4> /out <path>");
+                println!(
+                    "input:   plain text; each line writes a WAV in the working \
+                     directory (voices: blazar tts --list, new ones: blazar tts --pull)"
+                );
+            }
+            _ if line.starts_with("/voice ") => {
+                let v = line["/voice ".len()..].trim().to_string();
+                if piper_voice_exists(&v) {
+                    voice.clone_from(&v);
+                    println!("(voice {voice})");
+                } else {
+                    println!("(voice {v} not pulled — blazar tts --pull {v})");
+                }
+            }
+            _ if line.starts_with("/speed ") => {
+                match parse_gen_speed(line["/speed ".len()..].trim()) {
+                    Some(f) => {
+                        speed = Some(f);
+                        println!("(speed {f}x)");
+                    }
+                    None => println!("(usage: /speed 1.2 — 0.1..=4.0, 1.0 = native)"),
+                }
+            }
+            _ if line.starts_with("/out ") => {
+                let p = line["/out ".len()..].trim().to_string();
+                out = Some(PathBuf::from(p));
+                println!(
+                    "(out {})",
+                    out.as_deref().unwrap_or(Path::new("?")).display()
+                );
+            }
+            _ if line.starts_with('/') => {
+                println!("(unknown command — /help)");
+            }
+            _ => {
+                run_turn(voice.clone(), line.clone(), speed, out.clone()).await;
+            }
+        }
+    }
+    #[cfg(unix)]
+    restore_repl_sigint();
+    Ok(())
+}
+
+/// Pulled-voice check the speech loop teaches with (a dir scan, not a
+/// store query — voices are files).
+fn piper_voice_exists(voice: &str) -> bool {
+    blazar_runtime::piper::voice_file(&dirs(), voice).is_some()
 }
 
 /// The daemon's teaching refusal for `think: true` on a template without
@@ -10296,7 +10801,7 @@ mod tests {
 
     #[test]
     #[allow(non_snake_case)]
-    fn unit__diffusion_repl_refusal__teaches_images_api_over_chat_repl() {
+    fn unit__run_lane__component_sets_and_standalone_route_by_family() {
         let base = || blazar_core::store::ModelRow {
             name: "qwen-image-2.1".into(),
             repo: "abenzerps/Qwen-Image-2.1-GGUF".into(),
@@ -10312,43 +10817,87 @@ mod tests {
             ctx_train: None,
             pulled_at: 0,
         };
-        // Text rows (no component set) pass through untouched.
-        assert_eq!(diffusion_repl_refusal(&base()), None);
-        // Diffusion rows refuse at the boundary and name the API that
-        // CAN drive them.
+        // Text rows (no component set) stay on the chat REPL.
+        assert!(matches!(run_lane(&base()), RunLane::Text));
+        // Image component sets route to the image loop.
         let mut row = base();
         row.components = vec![
             blazar_core::store::ComponentFile::new("--vae", "/models/vae.safetensors"),
             blazar_core::store::ComponentFile::new("--llm", "/models/te.gguf"),
         ];
-        let refusal =
-            diffusion_repl_refusal(&row).expect("component set must refuse the chat REPL");
-        assert!(refusal.contains("qwen-image-2.1"), "{refusal}");
-        assert!(refusal.contains("/v1/images/generations"), "{refusal}");
-        assert!(refusal.contains("blazar serve"), "{refusal}");
-        // Video families name the videos route instead.
+        assert!(matches!(run_lane(&row), RunLane::Image));
+        // Wan-family sets route to the video loop instead.
         let mut wan = base();
         wan.repo = "Comfy-Org/Wan_2.1_ComfyUI_repackaged".into();
         wan.components = vec![
             blazar_core::store::ComponentFile::new("--vae", "/models/wan_2.1_vae.safetensors"),
             blazar_core::store::ComponentFile::new("--t5xxl", "/models/umt5.gguf"),
         ];
-        let refusal =
-            diffusion_repl_refusal(&wan).expect("video component set must refuse the chat REPL");
-        assert!(refusal.contains("/v1/videos/generations"), "{refusal}");
-        assert!(!refusal.contains("/v1/images/generations"), "{refusal}");
-        // Standalone checkpoints (SDXL-style --model self-reference) refuse
-        // with the same wording — "diffusion model", not "component set".
+        assert!(matches!(run_lane(&wan), RunLane::Video));
+        // Standalone checkpoints (SDXL-style --model self-reference) are
+        // image rows too.
         let mut sdxl = base();
         sdxl.repo = "stabilityai/stable-diffusion-xl-base-1.0".into();
         sdxl.components = vec![blazar_core::store::ComponentFile::new(
             "--model",
             "/models/sd_xl_base_1.0.safetensors",
         )];
-        let refusal =
-            diffusion_repl_refusal(&sdxl).expect("standalone checkpoint must refuse the chat REPL");
-        assert!(refusal.contains("diffusion model"), "{refusal}");
-        assert!(refusal.contains("/v1/images/generations"), "{refusal}");
+        assert!(matches!(run_lane(&sdxl), RunLane::Image));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__tts_voice_target__matches_voice_and_alias_takes_first() {
+        let voices: Vec<String> = ["en_US-amy-medium", "en_GB-alan-low"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        // Exact voice name wins.
+        assert_eq!(
+            tts_voice_target("en_GB-alan-low", &voices).map(String::as_str),
+            Some("en_GB-alan-low")
+        );
+        // The generic aliases pick the first installed voice.
+        assert_eq!(
+            tts_voice_target("tts", &voices).map(String::as_str),
+            Some("en_US-amy-medium")
+        );
+        assert_eq!(
+            tts_voice_target("piper", &voices).map(String::as_str),
+            Some("en_US-amy-medium")
+        );
+        // Anything else (and an empty voice set) is not a speech lane.
+        assert!(tts_voice_target("qwen2.5-0.5b", &voices).is_none());
+        assert!(tts_voice_target("tts", &[]).is_none());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__gen_knobs__parse_and_reject() {
+        assert_eq!(
+            parse_gen_size("1024x1024").as_deref(),
+            Some("1024x1024"),
+            "square size parses"
+        );
+        assert_eq!(parse_gen_size("960x480").as_deref(), Some("960x480"));
+        assert!(parse_gen_size("1024").is_none(), "no x separator");
+        assert!(parse_gen_size("1024xx768").is_none(), "double separator");
+        assert!(parse_gen_size("-1x768").is_none(), "negative width");
+        assert!(parse_gen_size("1024x").is_none(), "empty height");
+        assert_eq!(parse_gen_steps("24"), Some(24));
+        assert_eq!(parse_gen_steps("1"), Some(1), "lower bound inclusive");
+        assert_eq!(parse_gen_steps("100"), Some(100), "upper bound inclusive");
+        assert!(parse_gen_steps("0").is_none(), "zero steps");
+        assert!(parse_gen_steps("101").is_none(), "past upper bound");
+        assert!(parse_gen_steps("many").is_none(), "non-numeric");
+        assert_eq!(parse_gen_duration("5"), Some(5));
+        assert!(parse_gen_duration("0").is_none(), "zero duration");
+        assert!(parse_gen_duration("61").is_none(), "past the patience cap");
+        assert_eq!(parse_gen_speed("1.0"), Some(1.0));
+        assert_eq!(parse_gen_speed("0.1"), Some(0.1), "lower bound inclusive");
+        assert_eq!(parse_gen_speed("4.0"), Some(4.0), "upper bound inclusive");
+        assert!(parse_gen_speed("0.05").is_none(), "under the range");
+        assert!(parse_gen_speed("fast").is_none(), "non-numeric");
     }
 
     #[test]
