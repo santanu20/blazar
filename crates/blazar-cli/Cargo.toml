@@ -20,6 +20,7 @@ blazar-gateway = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 clap_complete = "4"
+base64 = "0.22"
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
