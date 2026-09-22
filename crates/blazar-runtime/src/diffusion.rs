@@ -13,6 +13,13 @@
 //! flag: Qwen-Image pairs `--vae`/`--llm` (a Qwen3-VL encoder), FLUX
 //! pairs `--vae`/`--t5xxl`/`--clip_l` (T5-XXL + CLIP-L, upstream
 //! `docs/flux.md`). The store keeps one flag-keyed set per row.
+//!
+//! A second family shape exists: STANDALONE checkpoints (SD 1.5, SDXL)
+//! carry their `VAE` and text encoders inside the single `.safetensors`
+//! file, so sd-server boots them with `-m/--model <file>` alone. Those
+//! families carry no component specs — the pull pins the model file
+//! itself and the row stores a self-referencing `--model` component
+//! that marks it for diffusion routing.
 
 use crate::hf::{FilePlan, HfModelInfo};
 use std::path::Path;
@@ -46,6 +53,15 @@ pub struct DiffusionFamily {
     /// family name in the repo, so the token is stable across mirrors.
     pub token: &'static str,
     pub display: &'static str,
+    /// Substrings that veto an otherwise-matching repo. Tokens are
+    /// broad by design (`qwen-image` must survive any mirror name), so
+    /// siblings sharing the prefix but pairing DIFFERENT components
+    /// (2.1, 2512, Edit) are kept out until curated for real.
+    pub excludes: &'static [&'static str],
+    /// Standalone-checkpoint families name the exact repo files that
+    /// ARE the model (`sd_xl_base_1.0.safetensors`). `None` = component
+    /// family; the pull picks the `DiT` by quant as usual.
+    pub standalone_files: Option<&'static [&'static str]>,
     pub components: &'static [ComponentSpec],
 }
 
@@ -55,6 +71,8 @@ const FAMILIES: &[DiffusionFamily] = &[
     DiffusionFamily {
         token: "qwen-image-2.1",
         display: "Qwen-Image-2.1",
+        excludes: &[],
+        standalone_files: None,
         components: &[
             ComponentSpec {
                 flag: "--vae",
@@ -86,12 +104,47 @@ const FAMILIES: &[DiffusionFamily] = &[
         ],
     },
     DiffusionFamily {
+        // Qwen-Image v1 (upstream docs/qwen_image.md): the DiT pairs
+        // the v1 qwen_image_vae — NOT the 2.1 one — and a Qwen2.5-VL-7B
+        // text encoder. The broad token needs excludes: 2.1 has its own
+        // entry above, 2512's VAE pairing is unverified here, and Edit
+        // is a separate instruction-tuned DiT with its own set.
+        token: "qwen-image",
+        display: "Qwen-Image",
+        excludes: &["qwen-image-2.1", "qwen-image-2512", "qwen-image-edit"],
+        standalone_files: None,
+        components: &[
+            ComponentSpec {
+                flag: "--vae",
+                source: ComponentSource {
+                    repo: "Comfy-Org/Qwen-Image_ComfyUI",
+                    repo_path: "split_files/vae/qwen_image_vae.safetensors",
+                },
+                required: true,
+                fallback_quant: None,
+            },
+            ComponentSpec {
+                flag: "--llm",
+                source: ComponentSource {
+                    // Dot-separated quants in this repo; fallback Q4_K_M
+                    // verified live (4683072512 bytes).
+                    repo: "mradermacher/Qwen2.5-VL-7B-Instruct-GGUF",
+                    repo_path: "Qwen2.5-VL-7B-Instruct.{quant}.gguf",
+                },
+                required: true,
+                fallback_quant: Some("Q4_K_M"),
+            },
+        ],
+    },
+    DiffusionFamily {
         // Covers FLUX.1-dev, FLUX.1-schnell and their GGUF mirrors;
         // FLUX.1-Kontext rides the same component set (upstream
-        // docs/flux.md + docs/kontext.md). FLUX.2 is a different family
-        // (Mistral text encoder) and stays unmatched until curated.
+        // docs/flux.md + docs/kontext.md). FLUX.2 has its own curated
+        // entry below (Mistral text encoder).
         token: "flux.1",
         display: "FLUX.1",
+        excludes: &[],
+        standalone_files: None,
         components: &[
             ComponentSpec {
                 flag: "--vae",
@@ -124,13 +177,164 @@ const FAMILIES: &[DiffusionFamily] = &[
             },
         ],
     },
+    DiffusionFamily {
+        // Z-Image-Turbo and Z-Image base share one component set
+        // (upstream docs/z_image.md): the FLUX.1 autoencoder plus a
+        // Qwen3-4B text encoder. The token cannot collide with
+        // Qwen-Image ("qwen-image" never contains "z-image").
+        token: "z-image",
+        display: "Z-Image",
+        excludes: &[],
+        standalone_files: None,
+        components: &[
+            ComponentSpec {
+                flag: "--vae",
+                source: ComponentSource {
+                    // Same file the FLUX.1 family pulls — byte-exact
+                    // reuse kicks in when both families live on one
+                    // box. BFL repos are gated:auto: the pull surfaces
+                    // the HF_TOKEN teaching until the license is
+                    // accepted.
+                    repo: "black-forest-labs/FLUX.1-schnell",
+                    repo_path: "ae.safetensors",
+                },
+                required: true,
+                fallback_quant: None,
+            },
+            ComponentSpec {
+                flag: "--llm",
+                source: ComponentSource {
+                    repo: "unsloth/Qwen3-4B-Instruct-2507-GGUF",
+                    repo_path: "Qwen3-4B-Instruct-2507-{quant}.gguf",
+                },
+                required: true,
+                fallback_quant: Some("Q4_K_M"),
+            },
+        ],
+    },
+    DiffusionFamily {
+        // Curated to the Chroma1-HD line, the current head of
+        // silveroxides/Chroma-GGUF (the repo also carries 50+
+        // chroma-unlocked-v* variants under the same t5xxl + FLUX.1
+        // VAE contract; HD quants verified: Q4_0/Q8_0/BF16 — the
+        // fallback lands on Q4_0 for K-quants the repo never cut).
+        // Upstream docs/chroma.md.
+        token: "chroma",
+        display: "Chroma",
+        excludes: &[],
+        standalone_files: None,
+        components: &[
+            ComponentSpec {
+                flag: "--vae",
+                source: ComponentSource {
+                    // docs/chroma.md names the FLUX.1-dev autoencoder;
+                    // BFL repo, gated:auto (see the Z-Image note).
+                    repo: "black-forest-labs/FLUX.1-dev",
+                    repo_path: "ae.safetensors",
+                },
+                required: true,
+                fallback_quant: None,
+            },
+            ComponentSpec {
+                flag: "--t5xxl",
+                source: ComponentSource {
+                    // The doc-proven fp16 encoder; no quant variants
+                    // exist for this safetensors file.
+                    repo: "comfyanonymous/flux_text_encoders",
+                    repo_path: "t5xxl_fp16.safetensors",
+                },
+                required: true,
+                fallback_quant: None,
+            },
+        ],
+    },
+    DiffusionFamily {
+        // Token "flux.2-dev" deliberately excludes the klein variants:
+        // klein pairs Qwen3 text encoders while dev pairs
+        // Mistral-Small (upstream docs/flux2.md) — a shared token
+        // would mis-attach the 24B Mistral encoder to klein pulls.
+        // Klein stays unmatched until curated separately.
+        token: "flux.2-dev",
+        display: "FLUX.2-dev",
+        excludes: &[],
+        standalone_files: None,
+        components: &[
+            ComponentSpec {
+                flag: "--vae",
+                source: ComponentSource {
+                    // Repo filename is ae.safetensors (the
+                    // flux2_ae.safetensors in doc commands is a local
+                    // rename). BFL repo, gated:auto.
+                    repo: "black-forest-labs/FLUX.2-dev",
+                    repo_path: "ae.safetensors",
+                },
+                required: true,
+                fallback_quant: None,
+            },
+            ComponentSpec {
+                flag: "--llm",
+                source: ComponentSource {
+                    repo: "unsloth/Mistral-Small-3.2-24B-Instruct-2506-GGUF",
+                    repo_path: "Mistral-Small-3.2-24B-Instruct-2506-{quant}.gguf",
+                },
+                required: true,
+                fallback_quant: Some("Q4_K_M"),
+            },
+        ],
+    },
+    DiffusionFamily {
+        // SDXL: the most-downloaded image model on HF. A STANDALONE
+        // checkpoint — sd_xl_base_1.0.safetensors embeds the VAE and
+        // both CLIP text encoders, so sd-server boots it with
+        // `-m/--model` alone (upstream docs/sd.md txt2img example). The
+        // token also catches sdxl-turbo housings; finetune checkpoints
+        // (Juggernaut, RealVis, Pony...) live in repos whose names
+        // carry no family token and stay uncurated by design.
+        token: "stable-diffusion-xl",
+        display: "SDXL",
+        excludes: &[],
+        standalone_files: Some(&["sd_xl_base_1.0.safetensors"]),
+        components: &[],
+    },
+    DiffusionFamily {
+        // SD 1.x: second most-downloaded family on HF, same standalone
+        // contract as SDXL (v1-5-pruned-emaonly embeds VAE+CLIP). The
+        // v1 token cannot collide with SDXL or SD3.5 repos (neither
+        // contains "stable-diffusion-v1"). SD3/3.5 pair a different
+        // component set (clip_l+clip_g+t5xxl) and stay uncurated.
+        token: "stable-diffusion-v1",
+        display: "SD 1.5",
+        excludes: &[],
+        standalone_files: Some(&["v1-5-pruned-emaonly.safetensors", "sd-v1-4.ckpt"]),
+        components: &[],
+    },
 ];
 
 /// Family for a pull repo, if the repo carries a known family token.
+/// Table order matters: narrower tokens (qwen-image-2.1) are listed
+/// before broader ones (qwen-image), and `excludes` veto the rest.
 #[must_use]
 pub fn diffusion_family(repo: &str) -> Option<&'static DiffusionFamily> {
     let lower = repo.to_lowercase();
-    FAMILIES.iter().find(|f| lower.contains(f.token))
+    FAMILIES
+        .iter()
+        .find(|f| lower.contains(f.token) && !f.excludes.iter().any(|x| lower.contains(x)))
+}
+
+/// The exact repo file a standalone family pulls (first listed name
+/// the repo actually hosts wins: SD 1.5 repos ship either the v1-5
+/// single file or the v1-4 ckpt, never both).
+#[must_use]
+pub fn standalone_file_plan(info: &HfModelInfo, family: &DiffusionFamily) -> Option<FilePlan> {
+    let wanted = family.standalone_files?;
+    info.siblings
+        .iter()
+        .find(|s| wanted.iter().any(|w| s.rfilename.eq_ignore_ascii_case(w)))
+        .map(|s| FilePlan {
+            filename: s.rfilename.clone(),
+            bytes: s.lfs.as_ref().and_then(|l| l.size).or(s.size).unwrap_or(0),
+            sha256: s.lfs.as_ref().map(|l| l.sha256.clone()),
+        })
 }
 
 /// Every family display name, for teaching messages.
@@ -194,6 +398,7 @@ pub fn required_component_missing(row: &blazar_core::ModelRow, family: &Diffusio
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+    use crate::hf::{HfLfs, HfSibling};
     use blazar_core::store::ComponentFile;
 
     fn row_with(components: &[(&str, &str)]) -> blazar_core::ModelRow {
@@ -223,9 +428,8 @@ mod tests {
         assert_eq!(f.display, "Qwen-Image-2.1");
         assert!(diffusion_family("leejet/qwen-image-2.1-gguf").is_some());
         assert!(diffusion_family("Comfy-Org/Qwen-Image-2.1").is_some());
-        // v1 (different model) and unrelated repos stay unmatched —
-        // their `VAE` pairing is NOT interchangeable with 2.1.
-        assert!(diffusion_family("cppee/Qwen-Image-GGUF").is_none());
+        // v1 and unrelated repos stay unmatched by 2.1 — their `VAE`
+        // pairing is NOT interchangeable with 2.1.
         assert!(diffusion_family("qwen/qwen3-8b-gguf").is_none());
         // FLUX.1 in all its housings: official dev/schnell, GGUF mirrors,
         // Kontext (same component set).
@@ -233,16 +437,167 @@ mod tests {
         assert!(diffusion_family("city96/FLUX.1-schnell-gguf").is_some());
         assert!(diffusion_family("black-forest-labs/FLUX.1-Kontext-dev").is_some());
         assert!(diffusion_family("QuantStack/FLUX.1-dev-GGUF").is_some());
-        // FLUX.2 is a different family (Mistral TE) — not curatable by
-        // reusing the FLUX.1 set.
-        assert!(diffusion_family("black-forest-labs/FLUX.2-dev").is_none());
-        assert_eq!(supported_families(), vec!["Qwen-Image-2.1", "FLUX.1"]);
+        // Z-Image: turbo + base conversions share the set; the token
+        // never collides with Qwen-Image.
+        assert!(diffusion_family("leejet/Z-Image-Turbo-GGUF").is_some());
+        assert!(diffusion_family("leejet/Z-Image-GGUF").is_some());
+        assert!(diffusion_family("unsloth/Z-Image-GGUF").is_some());
+        // Chroma: the preconverted GGUF repo and the safetensors origin.
+        assert!(diffusion_family("silveroxides/Chroma-GGUF").is_some());
+        assert!(diffusion_family("lodestones/Chroma").is_some());
+        // FLUX.2-dev has its own Mistral-TE set; the klein variants
+        // pair Qwen3 encoders and must NOT match it.
+        assert!(diffusion_family("city96/FLUX.2-dev-gguf").is_some());
+        assert!(diffusion_family("black-forest-labs/FLUX.2-dev").is_some());
+        assert!(diffusion_family("leejet/FLUX.2-klein-9B-GGUF").is_none());
+        assert!(diffusion_family("leejet/FLUX.2-klein-base-4B-GGUF").is_none());
+        assert_eq!(
+            supported_families(),
+            vec![
+                "Qwen-Image-2.1",
+                "Qwen-Image",
+                "FLUX.1",
+                "Z-Image",
+                "Chroma",
+                "FLUX.2-dev",
+                "SDXL",
+                "SD 1.5"
+            ]
+        );
+    }
+
+    #[test]
+    fn unit__diffusion_family__v1_token_matches_and_excludes_vetoes() {
+        // v1 repos ride the v1 set (2.1 entry listed first never
+        // catches them: no "2.1" in the repo name).
+        let f = diffusion_family("QuantStack/Qwen-Image-GGUF").unwrap();
+        assert_eq!(f.display, "Qwen-Image");
+        assert!(diffusion_family("cppee/Qwen-Image-GGUF").is_some());
+        assert!(diffusion_family("Qwen/Qwen-Image").is_some());
+        // 2.1 repos resolve to the 2.1 entry even though the v1 token
+        // substring-matches too (table order + excludes both guard).
+        assert_eq!(
+            diffusion_family("abenzerps/Qwen-Image-2.1-GGUF")
+                .unwrap()
+                .display,
+            "Qwen-Image-2.1"
+        );
+        // Excluded siblings stay uncurated until verified for real.
+        assert!(diffusion_family("unsloth/Qwen-Image-2512-GGUF").is_none());
+        assert!(diffusion_family("Qwen/Qwen-Image-Edit-2509").is_none());
+        // Standalone families.
+        assert_eq!(
+            diffusion_family("stabilityai/stable-diffusion-xl-base-1.0")
+                .unwrap()
+                .display,
+            "SDXL"
+        );
+        assert!(diffusion_family("stabilityai/sdxl-turbo").is_none());
+        assert_eq!(
+            diffusion_family("stable-diffusion-v1-5/stable-diffusion-v1-5")
+                .unwrap()
+                .display,
+            "SD 1.5"
+        );
+        assert!(diffusion_family("CompVis/stable-diffusion-v1-4").is_some());
+        // SD3.5 pairs clip_l+clip_g+t5xxl — different contract, not
+        // curated, and neither standalone token matches it.
+        assert!(diffusion_family("stabilityai/stable-diffusion-3.5-medium").is_none());
+    }
+
+    #[test]
+    fn unit__standalone_file_plan__first_listed_file_the_repo_hosts_wins() {
+        let sdxl = diffusion_family("stabilityai/stable-diffusion-xl-base-1.0").unwrap();
+        // Repo hosts the base file: exact plan with size + sha.
+        let info = HfModelInfo {
+            id: "stabilityai/stable-diffusion-xl-base-1.0".into(),
+            siblings: vec![
+                HfSibling {
+                    rfilename: "sd_xl_base_1.0.safetensors".into(),
+                    size: Some(6_938_078_334),
+                    lfs: Some(HfLfs {
+                        size: Some(6_938_078_334),
+                        sha256: "aa".into(),
+                    }),
+                },
+                HfSibling {
+                    rfilename: "unet/diffusion_pytorch_model.fp16.safetensors".into(),
+                    size: Some(5_135_149_760),
+                    lfs: None,
+                },
+            ],
+            gguf: None,
+        };
+        let plan = standalone_file_plan(&info, sdxl).unwrap();
+        assert_eq!(plan.filename, "sd_xl_base_1.0.safetensors");
+        assert_eq!(plan.bytes, 6_938_078_334);
+        assert_eq!(plan.sha256.as_deref(), Some("aa"));
+        // SD 1.5: repo without the v1-5 file but WITH v1-4 ckpt picks
+        // the second listed name.
+        let sd15 = diffusion_family("CompVis/stable-diffusion-v1-4").unwrap();
+        let info2 = HfModelInfo {
+            id: "CompVis/stable-diffusion-v1-4".into(),
+            siblings: vec![HfSibling {
+                rfilename: "sd-v1-4.ckpt".into(),
+                size: Some(4_265_383_744),
+                lfs: None,
+            }],
+            gguf: None,
+        };
+        assert_eq!(
+            standalone_file_plan(&info2, sd15).unwrap().filename,
+            "sd-v1-4.ckpt"
+        );
+        // Component families never standalone-plan.
+        let flux = diffusion_family("city96/FLUX.1-dev-gguf").unwrap();
+        assert!(standalone_file_plan(&info, flux).is_none());
+        // Repo hosting none of the listed names = no plan (caller
+        // teaches instead of guessing a shard).
+        let info3 = HfModelInfo {
+            siblings: vec![HfSibling {
+                rfilename: "something-else.safetensors".into(),
+                size: Some(1),
+                lfs: None,
+            }],
+            ..fake_info()
+        };
+        assert!(standalone_file_plan(&info3, sdxl).is_none());
+    }
+
+    fn fake_info() -> HfModelInfo {
+        HfModelInfo {
+            id: "x/y".into(),
+            siblings: vec![],
+            gguf: None,
+        }
     }
 
     #[test]
     fn unit__family_supports_edits__vision_flag_decides() {
         assert_eq!(family_supports_edits("x/Qwen-Image-2.1-GGUF"), Some(true));
         assert_eq!(family_supports_edits("city96/FLUX.1-dev-gguf"), Some(false));
+        assert_eq!(
+            family_supports_edits("leejet/Z-Image-Turbo-GGUF"),
+            Some(false)
+        );
+        assert_eq!(
+            family_supports_edits("silveroxides/Chroma-GGUF"),
+            Some(false)
+        );
+        // v1 pairs no vision encoder (Edit is a separate DiT); the
+        // standalone families have no components at all.
+        assert_eq!(
+            family_supports_edits("QuantStack/Qwen-Image-GGUF"),
+            Some(false)
+        );
+        assert_eq!(
+            family_supports_edits("stabilityai/stable-diffusion-xl-base-1.0"),
+            Some(false)
+        );
+        assert_eq!(
+            family_supports_edits("stable-diffusion-v1-5/stable-diffusion-v1-5"),
+            Some(false)
+        );
         assert_eq!(family_supports_edits("qwen/qwen3-8b-gguf"), None);
     }
 

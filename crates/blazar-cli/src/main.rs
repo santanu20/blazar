@@ -1575,11 +1575,9 @@ fn engine_offer_line(kind: blazar_core::engine_kind::EngineKind) -> String {
         EngineKind::LlamaCpp => {
             "llamacpp (~0.2-0.7 GiB via engine update) — the GGUF default lane".to_string()
         }
-        EngineKind::SdCpp => {
-            "sdcpp (~0.04-0.3 GiB, any GPU via Vulkan) — diffusion GGUF component \
-             sets (Qwen-Image, FLUX, SD3.5...)"
-                .to_string()
-        }
+        EngineKind::SdCpp => "sdcpp (~0.04-0.3 GiB, any GPU via Vulkan) — diffusion checkpoints: \
+             Qwen-Image-2.1/v1, FLUX.1/2-dev, Z-Image, Chroma, SDXL, SD1.5"
+            .to_string(),
     }
 }
 
@@ -7772,7 +7770,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             }
             if !seen.contains(&"sdcpp") {
                 println!(
-                    "sdcpp:      not installed — blazar engine install --kind sdcpp (diffusion GGUF sets: Qwen-Image-2.1, FLUX.1; any GPU via Vulkan)"
+                    "sdcpp:      not installed — blazar engine install --kind sdcpp (diffusion checkpoints: Qwen-Image-2.1/v1, FLUX.1/2-dev, Z-Image, Chroma, SDXL, SD1.5; any GPU via Vulkan)"
                 );
             }
             match blazar_runtime::whisper::installed_tags(&d).first() {

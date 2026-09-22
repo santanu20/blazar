@@ -2828,8 +2828,14 @@ fn compile_sdcpp(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<P
     let mut argv: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
-    argv.push("--diffusion-model".into());
-    argv.push(input.model_path.to_string());
+    // Standalone checkpoints (SD 1.5, SDXL) boot on `-m/--model` alone:
+    // the row's single self-referencing component IS the model file.
+    // Component families keep the `--diffusion-model` + per-flag layout.
+    let standalone = input.components.iter().any(|c| c.flag == "--model");
+    if !standalone {
+        argv.push("--diffusion-model".into());
+        argv.push(input.model_path.to_string());
+    }
     for component in input.components {
         push_gated(
             input,
@@ -2880,9 +2886,12 @@ fn compile_sdcpp(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<P
     // Q4-DiT+8B-TE-on-8GiB posture. A VRAM-less box is CPU-only by
     // construction.
     let vram_bytes = capacity_bytes(input.hardware);
+    // The standalone `--model` component self-references the model
+    // file — counting it would double the resident estimate.
     let component_bytes = input
         .components
         .iter()
+        .filter(|c| c.path != input.model_path)
         .map(|c| std::fs::metadata(c.path).map_or(0, |m| m.len()))
         .sum::<u64>();
     let resident = input.model_bytes.saturating_add(component_bytes);
@@ -2909,11 +2918,16 @@ fn compile_sdcpp(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<P
 }
 
 /// Component-set gates shared by every sdcpp compile: a diffusion `DiT`
-/// is unservable alone. An empty set (or one missing its `--VAE`) means
-/// a family-blinded pull (older row); dead paths mean deleted files.
-/// Both repair the same way: re-pull.
+/// is unservable alone. An empty set — or one with neither a `--vae`
+/// (component families) nor a `--model` self-reference (standalone
+/// checkpoints) — means a family-blinded pull (older row); dead paths
+/// mean deleted files. Both repair the same way: re-pull.
 fn sdcpp_components(input: &ProfileInput<'_>) -> Result<(), String> {
-    if input.components.is_empty() || !input.components.iter().any(|c| c.flag == "--vae") {
+    let serves = input
+        .components
+        .iter()
+        .any(|c| c.flag == "--vae" || c.flag == "--model");
+    if input.components.is_empty() || !serves {
         return Err(format!(
             "model {} has no diffusion component set (VAE/text encoder) — the DiT \
              GGUF alone cannot boot; re-pull the model to fetch the set: blazar pull {}",
@@ -2977,6 +2991,7 @@ fn sdcpp_extra_args(input: &ProfileInput<'_>) -> Result<Vec<String>, String> {
         "--listen-ip",
         "--listen-port",
         "--diffusion-model",
+        "--model",
         "--vae",
         "--llm",
         "--llm_vision",
@@ -10176,6 +10191,62 @@ mod tests {
         inp2.overlay = &ov_empty;
         let p2 = compile(&inp2, &TuningOverrides::default()).unwrap();
         assert!(p2.warnings.is_empty(), "{:?}", p2.warnings);
+    }
+
+    #[test]
+    fn unit__compile_sdcpp__standalone_checkpoint_boots_on_model_flag_alone() {
+        // SD 1.5/SDXL rows carry one self-referencing --model component:
+        // argv must NOT carry --diffusion-model (sd-server would see two
+        // model paths), and the offload ladder counts the file ONCE.
+        let g = meta();
+        let sd_flags: BTreeSet<String> = ["--model", "--diffusion-model"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let cfg = Config::default();
+        let dir =
+            std::env::temp_dir().join(format!("blazar-sdcpp-standalone-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ckpt = dir.join("sd_xl_base_1.0.safetensors");
+        std::fs::write(&ckpt, b"x").unwrap();
+
+        let hw = gpu_hw(16_384, 32_000, 8);
+        let mut inp = input(&g, &hw, &cfg, &sd_flags);
+        inp.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        inp.model_path = ckpt.to_str().unwrap();
+        let standalone = [ComponentArg::new("--model", ckpt.to_str().unwrap())];
+        inp.components = &standalone;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.iter().any(|a| a == "--diffusion-model"),
+            "{:?}",
+            p.argv
+        );
+        let i = p
+            .argv
+            .iter()
+            .position(|a| a == "--model")
+            .unwrap_or_else(|| panic!("--model missing: {:?}", p.argv));
+        assert_eq!(p.argv[i + 1], ckpt.to_str().unwrap());
+        assert!(p.argv.contains(&"--listen-ip".to_string()));
+        assert!(p.argv.contains(&"--listen-port".to_string()));
+        assert_eq!(p.gpu, "full");
+
+        // Tight GPU: resident = model bytes ONCE (deduped self-reference),
+        // so the fixture's 5000 MiB model vs 75% of 6000 MiB still trips
+        // the offload ladder — but counting it twice would too; the dedupe
+        // is proven by the roomy case above not double-summing to partial.
+        let hw_tight = gpu_hw(6_000, 32_000, 8);
+        let mut inp2 = input(&g, &hw_tight, &cfg, &sd_flags);
+        inp2.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        inp2.model_path = ckpt.to_str().unwrap();
+        let standalone2 = [ComponentArg::new("--model", ckpt.to_str().unwrap())];
+        inp2.components = &standalone2;
+        let p2 = compile(&inp2, &TuningOverrides::default()).unwrap();
+        assert!(p2.argv.iter().any(|a| a == "--offload-to-cpu"));
+        assert_eq!(p2.gpu, "partial");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

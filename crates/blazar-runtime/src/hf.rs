@@ -1752,6 +1752,13 @@ impl Puller {
 
     async fn pull_locked(&self, target: &PullTarget, name: &str) -> Result<PullOutcome> {
         let info = self.client.model_info(&target.repo).await?;
+        // Standalone diffusion checkpoints (SD 1.5, SDXL) take their own
+        // lane BEFORE the gguf/safetensors fork: these repos also carry
+        // diffusers shards, which the safetensors lane would register as
+        // a text model no engine can serve.
+        if let Some(outcome) = self.pull_standalone_lane(target, name, &info).await {
+            return outcome;
+        }
         // Lane fork: GGUF files (llamacpp/mistralrs engines) vs a
         // safetensors model directory (sglang engine). A repo with BOTH
         // keeps the GGUF lane — existing behavior unchanged; the log
@@ -2099,6 +2106,106 @@ impl Puller {
     /// diffusion family fetches the `VAE`/`TE` files (vision optional)
     /// onto the row; an unknown family keeps the file but records the
     /// boot-blocking warning that spawn time will teach verbatim.
+    /// Standalone-checkpoint pull (SD 1.5, SDXL): the family's pinned
+    /// file IS the whole model — `VAE` and text encoders live inside
+    /// the checkpoint, so the row stores a single self-referencing
+    /// `--model` component that routes it to the sdcpp lane and emits
+    /// `-m/--model <file>` at compile. Quant tags are meaningless here
+    /// (there is exactly one file); the pull ignores them.
+    /// `Some(outcome)` when `target.repo` belongs to a standalone-checkpoint
+    /// diffusion family (SD 1.5, SDXL): the pull is fully served on that
+    /// lane. `None` falls through to the gguf/safetensors lanes. The family
+    /// table pins the exact single checkpoint file sd-server boots with
+    /// `-m/--model`.
+    async fn pull_standalone_lane(
+        &self,
+        target: &PullTarget,
+        name: &str,
+        info: &HfModelInfo,
+    ) -> Option<Result<PullOutcome>> {
+        let family = crate::diffusion::diffusion_family(&target.repo)?;
+        family.standalone_files?;
+        Some(
+            self.pull_standalone_checkpoint(target, name, info, family)
+                .await,
+        )
+    }
+
+    async fn pull_standalone_checkpoint(
+        &self,
+        target: &PullTarget,
+        name: &str,
+        info: &HfModelInfo,
+        family: &crate::diffusion::DiffusionFamily,
+    ) -> Result<PullOutcome> {
+        let plan = crate::diffusion::standalone_file_plan(info, family).ok_or_else(|| {
+            anyhow!(
+                "repo {} hosts none of the {} checkpoint files ({}) — a \
+                 diffusers shard is not the standalone model",
+                target.repo,
+                family.display,
+                family.standalone_files.unwrap_or(&[]).join(", ")
+            )
+        })?;
+        let store = Store::open(&self.dirs)?;
+        let existing = store.get_model(name)?;
+        flip_guard(name, existing.as_ref(), false, self.force)?;
+        // Present = same repo with its checkpoint alive on disk. A dead
+        // path (deleted file, stale row) falls through to re-download —
+        // byte-exact reuse keeps that repair cheap.
+        if let Some(row) = existing.as_ref() {
+            if row.repo == target.repo
+                && Path::new(&row.path).is_file()
+                && row.component("--model").is_some()
+            {
+                return Ok(PullOutcome {
+                    row: row.clone(),
+                    already_present: true,
+                });
+            }
+        }
+        let bar = indicatif::ProgressBar::new(plan.bytes);
+        bar.set_style(
+            indicatif::ProgressStyle::default_bar()
+                .template("{msg} {bar:30} {bytes}/{total_bytes} ({eta})")
+                .expect("valid template"),
+        );
+        bar.set_message(format!("pull {name}"));
+        let mut done = 0u64;
+        // required=true: without the checkpoint there is no model.
+        let dest = self
+            .fetch_component_file(name, &target.repo, &plan, true, &bar, &mut done)
+            .await?
+            .ok_or_else(|| anyhow!("checkpoint {} failed without an error", plan.filename))?;
+        bar.finish_and_clear();
+        let dest_str = dest.display().to_string();
+        let row = blazar_core::ModelRow {
+            name: name.to_string(),
+            repo: target.repo.clone(),
+            quant: "-".to_string(),
+            path: dest_str.clone(),
+            bytes: i64::try_from(plan.bytes).unwrap_or(i64::MAX),
+            sha256: plan.sha256.clone(),
+            mmproj_path: None,
+            components: vec![blazar_core::store::ComponentFile::new("--model", &dest_str)],
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+                .unwrap_or(i64::MAX),
+        };
+        store.upsert_model(&row)?;
+        self.bus.publish(BlazarEvent::ModelPulled {
+            name: name.to_string(),
+            warning: None,
+        });
+        Ok(PullOutcome {
+            row,
+            already_present: false,
+        })
+    }
+
     async fn attach_diffusion_set(
         &self,
         target: &PullTarget,
@@ -2243,6 +2350,26 @@ impl Puller {
                 *done += plan.bytes;
                 bar.set_position(*done);
                 return Ok(Some(reused));
+            }
+        }
+        // Third reuse source: the huggingface hub cache (diffusers
+        // pipelines, ComfyUI installs, `hf download` runs). The hit is
+        // hardlinked into the models dir so the row never points at the
+        // user's cache and `blazar rm` stays scoped to blazar's files.
+        for candidate in hf_hub_candidates(repo, &plan.filename) {
+            if reuse_byte_exact(&candidate, plan).is_some() {
+                match materialize_hub_hit(&candidate, &dest) {
+                    Ok(()) => {
+                        tracing::info!(model = %name, "component {} found in the huggingface hub cache — hardlinked", leaf);
+                        *done += plan.bytes;
+                        bar.set_position(*done);
+                        return Ok(Some(dest));
+                    }
+                    Err(e) => {
+                        tracing::warn!(model = %name, "hub cache hit for {} but linking failed ({e}) — downloading", leaf);
+                        break;
+                    }
+                }
             }
         }
         let before = *done;
@@ -2617,6 +2744,62 @@ fn reuse_byte_exact(candidate: &Path, plan: &FilePlan) -> Option<PathBuf> {
     }
 }
 
+/// Hugging Face hub cache root, honoring the same environment overrides
+/// as `huggingface_hub` itself: `HF_HUB_CACHE`, then `HF_HOME/hub`, then the
+/// per-user default `~/.cache/huggingface/hub`.
+fn hf_hub_root() -> Option<PathBuf> {
+    if let Some(root) = std::env::var_os("HF_HUB_CACHE") {
+        if !root.is_empty() {
+            return Some(PathBuf::from(root));
+        }
+    }
+    if let Some(home) = std::env::var_os("HF_HOME") {
+        if !home.is_empty() {
+            return Some(Path::new(&home).join("hub"));
+        }
+    }
+    let home = dirs::home_dir()?;
+    Some(home.join(".cache").join("huggingface").join("hub"))
+}
+
+/// Every hub-cache copy of `repo/filename`, newest-agnostic: snapshots are
+/// per-revision directories mirroring the repo's internal layout, so the
+/// candidate for `vae/ae.safetensors` in repo `black-forest-labs/FLUX.1-schnell`
+/// is `.../models--black-forest-labs--FLUX.1-schnell/snapshots/<rev>/vae/ae.safetensors`.
+/// Content is NOT checked here — `reuse_byte_exact` gates on size + sha256.
+pub(crate) fn hf_hub_candidates_at(root: &Path, repo: &str, filename: &str) -> Vec<PathBuf> {
+    let model_dir = format!("models--{}", repo.replace(['/', '\\'], "--"));
+    let snapshots = root.join(model_dir).join("snapshots");
+    let Ok(revs) = std::fs::read_dir(&snapshots) else {
+        return Vec::new();
+    };
+    revs.filter_map(std::result::Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path().join(filename))
+        .collect()
+}
+
+fn hf_hub_candidates(repo: &str, filename: &str) -> Vec<PathBuf> {
+    hf_hub_root()
+        .map(|root| hf_hub_candidates_at(&root, repo, filename))
+        .unwrap_or_default()
+}
+
+/// Bring a hub-cache hit into the models dir under its own name so the
+/// store row never points into the user's hub cache (a later `blazar rm`
+/// must unlink blazar's file, not the hub blob). Hardlink first — same
+/// filesystem, zero bytes copied — then a real copy when the cache lives
+/// on another filesystem, still far cheaper than re-downloading GiB.
+fn materialize_hub_hit(src: &Path, dest: &Path) -> std::io::Result<()> {
+    if std::fs::hard_link(src, dest).is_ok() {
+        return Ok(());
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(src, dest).map(|_| ())
+}
+
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
@@ -2671,6 +2854,68 @@ mod tests {
             None
         );
         assert_eq!(reuse_byte_exact(&f, &plan(0, None)), None);
+    }
+
+    #[test]
+    fn unit__hf_hub_candidates_at__mirrors_repo_layout_across_revisions() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Two revisions of black-forest-labs/FLUX.1-schnell, one carrying
+        // the VAE at its repo-relative path.
+        let snap_a = tmp
+            .path()
+            .join("models--black-forest-labs--FLUX.1-schnell")
+            .join("snapshots")
+            .join("aaaa1111");
+        let snap_b = snap_a.parent().unwrap().join("bbbb2222");
+        std::fs::create_dir_all(snap_a.join("vae")).unwrap();
+        std::fs::create_dir_all(&snap_b).unwrap();
+        std::fs::write(snap_a.join("vae").join("ae.safetensors"), b"ae").unwrap();
+        let got = hf_hub_candidates_at(
+            tmp.path(),
+            "black-forest-labs/FLUX.1-schnell",
+            "vae/ae.safetensors",
+        );
+        // Both revision paths are candidates — content gating is
+        // reuse_byte_exact's job; a missing file in one revision must not
+        // hide the copy another revision holds.
+        assert_eq!(got.len(), 2);
+        assert!(got.contains(&snap_a.join("vae").join("ae.safetensors")));
+        assert!(got.contains(&snap_b.join("vae").join("ae.safetensors")));
+        // Unknown repo → no candidates, no error.
+        assert!(hf_hub_candidates_at(tmp.path(), "org/never-pulled", "x.bin").is_empty());
+        // Backslashes in a Windows-style repo slug normalize to the same
+        // hub dir naming as forward slashes.
+        assert_eq!(
+            hf_hub_candidates_at(
+                tmp.path(),
+                "black-forest-labs\\FLUX.1-schnell",
+                "vae/ae.safetensors"
+            )
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn unit__materialize_hub_hit__hardlink_keeps_cache_blob_and_row_file_independent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_blob = tmp.path().join("blob");
+        std::fs::write(&cache_blob, b"weights").unwrap();
+        let dest = tmp.path().join("models").join("ae.safetensors");
+        materialize_hub_hit(&cache_blob, &dest).unwrap();
+        // The materialized file carries the content...
+        assert_eq!(std::fs::read(&dest).unwrap(), b"weights");
+        // ...and removing blazar's copy never touches the cache blob
+        // (the rm-safety contract that forces materialization instead of
+        // registering the cache path directly).
+        std::fs::remove_file(&dest).unwrap();
+        assert_eq!(std::fs::read(&cache_blob).unwrap(), b"weights");
+        // Re-materializing after a delete works (fresh link or copy —
+        // either way the row file comes back with the right bytes).
+        let src2 = tmp.path().join("blob2");
+        std::fs::write(&src2, b"weights2").unwrap();
+        materialize_hub_hit(&src2, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"weights2");
     }
 
     #[test]

@@ -200,11 +200,14 @@ impl ModelRow {
             .map(|c| c.path.as_str())
     }
 
-    /// Diffusion-domain routing marker: a row with a `--vae` component
-    /// serves on the sdcpp lane; every text row carries no set at all.
+    /// Diffusion-domain routing marker: a row carrying any component
+    /// set serves on the sdcpp lane — component families carry
+    /// `--vae`/text-encoder files, standalone checkpoints (SD 1.5,
+    /// SDXL) carry a self-referencing `--model` entry. Every text row
+    /// has no set at all.
     #[must_use]
     pub fn has_component_set(&self) -> bool {
-        self.component("--vae").is_some()
+        !self.components.is_empty()
     }
 
     /// Image edits (`/v1/images/edits`) need the vision-encoder
