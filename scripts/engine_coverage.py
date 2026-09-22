@@ -115,6 +115,11 @@ BUCKETS: dict[str, list[tuple[str, str]]] = {
         ("gateway-owned transport", r"listen|host|port|webui|static|api-key"),
         ("input/output files", r"init-img|mask|output|prompt|control|ref|format|type"),
     ],
+    "whisper": [
+        ("transcription/translation", r"translat|language|detect|prompt"),
+        ("decoding quality", r"beam|best|temperature|entropy|logprob|fallback"),
+        ("segmentation/timing", r"timestamp|offset|duration|split|context|max.len|word"),
+    ],
 }
 
 

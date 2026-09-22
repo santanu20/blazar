@@ -1209,6 +1209,36 @@ fn stub_engine_dir(tag: &str) -> (PathBuf, tempfile::TempDir) {
     (dir.path().to_path_buf(), dir)
 }
 
+/// A row-less engine dir is disk debris (interrupted install, pre-rollback
+/// upgrade): the sweep must remove it while every dir a row points into
+/// survives — including nested server_path references and empty-path
+/// default manifests.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__orphan_engine_dirs__swept_while_referenced_survive() {
+    let (_t, dirs) = tmp_dirs();
+    // No mocks mounted: the sweep is a local-disk pass, never network.
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    let store = Store::open(&dirs).unwrap();
+    stage_mainstream_row(&store, &dirs, "b1-cuda", 2, &["qwen2"]);
+    // A dir the store has NO row for (the b11064-cuda class).
+    let orphan = dirs.engines_dir().join("b0-ghost");
+    std::fs::create_dir_all(&orphan).unwrap();
+    std::fs::write(orphan.join("marker"), "ghost").unwrap();
+    // A regular FILE in the engines dir is not engine debris — untouched.
+    std::fs::write(dirs.engines_dir().join("README"), "n/a").unwrap();
+
+    let freed = mgr.prune_orphan_dirs().unwrap();
+    assert_eq!(freed.len(), 1, "exactly the ghost dir goes: {freed:?}");
+    assert_eq!(freed[0].0, "b0-ghost");
+    assert!(!orphan.exists(), "orphan dir removed");
+    assert!(dirs.engines_dir().join("b1-cuda").exists(), "row-backed dir stays");
+    assert!(dirs.engines_dir().join("README").exists(), "plain file untouched");
+    // Idempotent: a second sweep finds nothing.
+    assert!(mgr.prune_orphan_dirs().unwrap().is_empty());
+}
+
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn integration__lazy_whisper_lane_never_claims_serving_active() {
