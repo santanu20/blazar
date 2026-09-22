@@ -997,7 +997,7 @@ fn diffusion_repl_refusal(row: &blazar_core::store::ModelRow) -> Option<String> 
             "/v1/images/generations"
         };
         format!(
-            "\"{}\" is a diffusion component set (sdcpp lane) — the chat REPL cannot drive \
+            "\"{}\" is a diffusion model (sdcpp lane) — the chat REPL cannot drive \
              generation; start the daemon (blazar serve) and POST \
              {route} {{\"model\": \"{}\", \"prompt\": \"...\"}}",
             row.name, row.name
@@ -10300,6 +10300,18 @@ mod tests {
             diffusion_repl_refusal(&wan).expect("video component set must refuse the chat REPL");
         assert!(refusal.contains("/v1/videos/generations"), "{refusal}");
         assert!(!refusal.contains("/v1/images/generations"), "{refusal}");
+        // Standalone checkpoints (SDXL-style --model self-reference) refuse
+        // with the same wording — "diffusion model", not "component set".
+        let mut sdxl = base();
+        sdxl.repo = "stabilityai/stable-diffusion-xl-base-1.0".into();
+        sdxl.components = vec![blazar_core::store::ComponentFile::new(
+            "--model",
+            "/models/sd_xl_base_1.0.safetensors",
+        )];
+        let refusal =
+            diffusion_repl_refusal(&sdxl).expect("standalone checkpoint must refuse the chat REPL");
+        assert!(refusal.contains("diffusion model"), "{refusal}");
+        assert!(refusal.contains("/v1/images/generations"), "{refusal}");
     }
 
     #[test]
