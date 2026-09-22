@@ -15,9 +15,18 @@ use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use tokio::sync::Notify;
 
-use blazar_core::profile::{self, Endpoint, ProfileInput};
+use blazar_core::profile::{self, ComponentArg, Endpoint, ProfileInput};
 use blazar_core::store::Store;
 use blazar_core::{BlazarDirs, Config, GpuInfo, Hardware, ModelRow};
+
+/// Borrow a store row's diffusion component set for `ProfileInput` (the
+/// spawn sites own the Vec; the input borrows it).
+fn component_args(components: &[blazar_core::store::ComponentFile]) -> Vec<ComponentArg<'_>> {
+    components
+        .iter()
+        .map(|c| ComponentArg::new(&c.flag, &c.path))
+        .collect()
+}
 
 use crate::events::{BlazarEvent, EventBus, InstanceState};
 
@@ -1750,9 +1759,7 @@ impl Supervisor {
                 draft_path: draft_path.as_deref(),
                 draft_gguf: None, // router preset: one child, no co-residency planning
                 mmproj_path: m.mmproj_path.as_deref(),
-                vae_path: m.vae_path.as_deref(),
-                llm_path: m.llm_path.as_deref(),
-                llm_vision_path: m.llm_vision_path.as_deref(),
+                components: &component_args(&m.components),
                 // router preset: every pulled model rides one child incl
                 // VL rows — force the projector on regardless of policy
                 mmproj_force: true,
@@ -1811,9 +1818,7 @@ impl Supervisor {
             bytes: 0,
             sha256: None,
             mmproj_path: None,
-            vae_path: None,
-            llm_path: None,
-            llm_vision_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,
@@ -2263,7 +2268,7 @@ impl Supervisor {
             self.config.engine_routing.mode,
             self.config.engine_routing.policy,
             overlay.engine.as_deref(),
-            model.vae_path.is_some(),
+            model.has_component_set(),
             safetensors,
             model.is_quantized_safetensors(),
             self.engine.kind(),
@@ -2593,9 +2598,7 @@ impl Supervisor {
                 draft_path: draft_path.as_deref(),
                 draft_gguf: draft_gguf.as_ref(),
                 mmproj_path: model.mmproj_path.as_deref(),
-                vae_path: model.vae_path.as_deref(),
-                llm_path: model.llm_path.as_deref(),
-                llm_vision_path: model.llm_vision_path.as_deref(),
+                components: &component_args(&model.components),
                 // KV-estimate probe: policy-neutral (mirror the spawn's
                 // own key-derived force below for estimate honesty)
                 mmproj_force: key.ends_with("@vision"),
@@ -2765,9 +2768,7 @@ impl Supervisor {
                 draft_path: draft_path.as_deref(),
                 draft_gguf: draft_gguf.as_ref(),
                 mmproj_path: model.mmproj_path.as_deref(),
-                vae_path: model.vae_path.as_deref(),
-                llm_path: model.llm_path.as_deref(),
-                llm_vision_path: model.llm_vision_path.as_deref(),
+                components: &component_args(&model.components),
                 // @vision respawn = caller demanded a projector-carrying
                 // child (ensure_vision); every other spawn honors policy
                 mmproj_force: key.ends_with("@vision"),
@@ -5147,9 +5148,7 @@ mod routing_tests {
                 bytes: weights_bytes,
                 sha256: None,
                 mmproj_path: None,
-                vae_path: None,
-                llm_path: None,
-                llm_vision_path: None,
+                components: vec![],
                 shards: 1,
                 arch: None,
                 params: None,
@@ -5286,9 +5285,7 @@ mod routing_tests {
                 bytes: 1,
                 sha256: None,
                 mmproj_path: None,
-                vae_path: None,
-                llm_path: None,
-                llm_vision_path: None,
+                components: vec![],
                 shards: 1,
                 arch: None,
                 params: None,
@@ -5512,9 +5509,7 @@ mod routing_tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
-            vae_path: None,
-            llm_path: None,
-            llm_vision_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,
@@ -5748,9 +5743,7 @@ mod routing_tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
-            vae_path: None,
-            llm_path: None,
-            llm_vision_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,
@@ -5818,9 +5811,7 @@ mod routing_tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
-            vae_path: None,
-            llm_path: None,
-            llm_vision_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,

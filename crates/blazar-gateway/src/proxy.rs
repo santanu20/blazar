@@ -1077,7 +1077,9 @@ pub(crate) fn resolve_serving(
                 state.config.engine_routing.mode,
                 state.config.engine_routing.policy,
                 overlay.engine.as_deref(),
-                model_row.as_ref().is_some_and(|r| r.vae_path.is_some()),
+                model_row
+                    .as_ref()
+                    .is_some_and(blazar_core::ModelRow::has_component_set),
                 std::path::Path::new(model_path).is_dir(),
                 blazar_core::store::quantized_safetensors_signal(model_name, "", model_path),
                 global,
@@ -1949,9 +1951,7 @@ mod resolve_model_tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
-            vae_path: None,
-            llm_path: None,
-            llm_vision_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,

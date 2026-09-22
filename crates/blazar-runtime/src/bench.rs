@@ -882,9 +882,7 @@ pub fn build_input<'a>(
         // bench scores one argv in isolation; no co-residency planning
         draft_gguf: None,
         mmproj_path: None,
-        vae_path: None,
-        llm_path: None,
-        llm_vision_path: None,
+        components: &[],
         mmproj_force: false,
         engine_tag,
         supported_flags,

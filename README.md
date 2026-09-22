@@ -174,7 +174,7 @@ Blazar currently orchestrates four engine families:
 | **llama.cpp** | GGUF; default mainstream lane for quantized GGUF serving |
 | **mistral.rs** | GGUF and safetensors paths supported by the runtime |
 | **SGLang** | Safetensors; especially AWQ / GPTQ / FP8 on supported accelerators |
-| **sd.cpp** | Diffusion GGUF component sets (DiT + VAE + text encoder) — Qwen-Image, FLUX, SD3.5 and friends via a prebuilt `sd-server` (Vulkan/CPU/Metal) |
+| **sd.cpp** | Diffusion GGUF component sets — Qwen-Image-2.1 (DiT + VAE + Qwen3VL text encoder, optional vision encoder for edits) and FLUX.1 (DiT + VAE + T5-XXL + CLIP-L; dev/schnell/mirrors) via a prebuilt `sd-server` (Vulkan/CPU/Metal) |
 
 Routing is capability-driven rather than a blind global switch.
 
@@ -183,7 +183,7 @@ Typical policy:
 - **GGUF** → llama.cpp, with mistral.rs available as an alternate lane.
 - **Quantized safetensors (AWQ/GPTQ/FP8)** → SGLang.
 - **Plain safetensors** → SGLang or mistral.rs according to routing policy.
-- **Diffusion component sets** → sd.cpp (`blazar engine install --kind sdcpp`); the domain gate is bidirectional — text engines never receive component rows and sd.cpp never receives text models. Pulling a known diffusion family (e.g. `Qwen-Image-2.1-GGUF`) fetches the full set (DiT + VAE + text encoder) as one model; generation rides `POST /v1/images/generations` (and `/v1/images/edits` when the vision encoder is present).
+- **Diffusion component sets** → sd.cpp (`blazar engine install --kind sdcpp`); the domain gate is bidirectional — text engines never receive component rows and sd.cpp never receives text models. Pulling a known diffusion family (`Qwen-Image-2.1-GGUF`, FLUX.1 GGUF repos) fetches the full flag-keyed component set (e.g. `--vae` + `--t5xxl` + `--clip_l` for FLUX.1) as one model, re-using byte-exact files already on disk; generation rides `POST /v1/images/generations` (and `/v1/images/edits` when the family ships a vision encoder).
 - `engine_routing.mode = "manual"` pins a single active engine when you explicitly want that behavior.
 - A per-model engine override wins over automatic routing.
 - The ENGINE column in `blazar list` is the routing lane, not a capability guarantee; a `†` cell (plus a footer line, or the `engine_arch_gap` field in `--json`) marks a GGUF architecture the routed llama.cpp build provably cannot load — spawn fails with teaching unless a covering fork lane is installed.

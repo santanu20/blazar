@@ -16,7 +16,7 @@ pub struct Store {
     conn: Connection,
 }
 
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -36,9 +36,7 @@ CREATE TABLE IF NOT EXISTS models (
     bytes      INTEGER NOT NULL,
     sha256     TEXT,
     mmproj_path TEXT,
-    vae_path     TEXT,
-    llm_path     TEXT,
-    llm_vision_path TEXT,
+    components  TEXT NOT NULL DEFAULT '[]',
     shards     INTEGER NOT NULL DEFAULT 1,
     arch       TEXT,
     params     REAL,
@@ -122,14 +120,13 @@ pub struct ModelRow {
     #[serde(default)]
     pub mmproj_path: Option<String>,
     /// Diffusion component set (sdcpp lane): the `DiT` `path` above is
-    /// unservable alone — the VAE and text encoder complete the model.
-    /// `None` on every text model.
+    /// unservable alone — the VAE and text encoder(s) complete the model.
+    /// Flag-keyed because families differ in dialect: Qwen-Image pairs
+    /// `--vae`/`--llm`, FLUX pairs `--vae`/`--t5xxl`/`--clip_l`. Empty on
+    /// every text model (that emptiness IS the text/diffusion routing
+    /// domain marker).
     #[serde(default)]
-    pub vae_path: Option<String>,
-    #[serde(default)]
-    pub llm_path: Option<String>,
-    #[serde(default)]
-    pub llm_vision_path: Option<String>,
+    pub components: Vec<ComponentFile>,
     #[serde(default = "default_shards")]
     pub shards: i64,
     #[serde(default)]
@@ -139,6 +136,24 @@ pub struct ModelRow {
     #[serde(default)]
     pub ctx_train: Option<i64>,
     pub pulled_at: i64,
+}
+
+/// One diffusion component: the sd-server flag it rides and the local
+/// file that satisfies it (`--vae` → VAE, `--t5xxl` → T5 encoder, ...).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ComponentFile {
+    pub flag: String,
+    pub path: String,
+}
+
+impl ComponentFile {
+    #[must_use]
+    pub fn new(flag: &str, path: &str) -> Self {
+        Self {
+            flag: flag.to_string(),
+            path: path.to_string(),
+        }
+    }
 }
 
 /// Quantization-method tokens that mark a safetensors checkpoint as
@@ -174,6 +189,29 @@ impl ModelRow {
     #[must_use]
     pub fn is_quantized_safetensors(&self) -> bool {
         quantized_safetensors_signal(&self.name, &self.repo, &self.path)
+    }
+
+    /// Local path for a component flag, if the set carries it.
+    #[must_use]
+    pub fn component(&self, flag: &str) -> Option<&str> {
+        self.components
+            .iter()
+            .find(|c| c.flag == flag)
+            .map(|c| c.path.as_str())
+    }
+
+    /// Diffusion-domain routing marker: a row with a `--vae` component
+    /// serves on the sdcpp lane; every text row carries no set at all.
+    #[must_use]
+    pub fn has_component_set(&self) -> bool {
+        self.component("--vae").is_some()
+    }
+
+    /// Image edits (`/v1/images/edits`) need the vision-encoder
+    /// companion; families without one teach instead of re-pull-looping.
+    #[must_use]
+    pub fn serves_image_edits(&self) -> bool {
+        self.component("--llm_vision").is_some()
     }
 }
 
@@ -250,18 +288,43 @@ impl Store {
                     [],
                 )?;
             }
-            // v5 added the diffusion component-set columns. Same additive
-            // pattern: fresh databases get them from SCHEMA_SQL; existing
-            // ones need one ALTER per missing column.
+            // v5→v6: the three fixed diffusion columns became one
+            // flag-keyed `components` JSON column (families differ in
+            // dialect: Qwen pairs --vae/--llm, FLUX pairs --t5xxl/
+            // --clip_l). Fresh databases get it from SCHEMA_SQL; v5
+            // databases fold their legacy columns into it and drop them.
             let model_cols = self.table_columns("models")?;
-            for (col, decl) in [
-                ("vae_path", "TEXT"),
-                ("llm_path", "TEXT"),
-                ("llm_vision_path", "TEXT"),
-            ] {
-                if !model_cols.contains(&col.to_string()) {
+            if !model_cols.contains(&"components".to_string()) {
+                self.conn.execute(
+                    "ALTER TABLE models ADD COLUMN components TEXT NOT NULL DEFAULT '[]'",
+                    [],
+                )?;
+            }
+            if model_cols.iter().any(|c| c.starts_with("vae_path")) {
+                // Collected up front: rewriting rows while the SELECT
+                // cursor is still open on the same table is undefined.
+                type LegacyComponentCols = (String, Option<String>, Option<String>, Option<String>);
+                let legacy: Vec<LegacyComponentCols> = self
+                    .conn
+                    .prepare("SELECT name, vae_path, llm_path, llm_vision_path FROM models")?
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                for (name, vae, llm, vision) in legacy {
+                    let folded: Vec<ComponentFile> =
+                        [("--vae", vae), ("--llm", llm), ("--llm_vision", vision)]
+                            .into_iter()
+                            .filter_map(|(flag, path)| path.map(|p| ComponentFile::new(flag, &p)))
+                            .collect();
+                    let folded_json = serde_json::to_string(&folded)
+                        .map_err(|e| CoreError::Catalog(e.to_string()))?;
+                    self.conn.execute(
+                        "UPDATE models SET components = ?1 WHERE name = ?2",
+                        params![folded_json, name],
+                    )?;
+                }
+                for col in ["vae_path", "llm_path", "llm_vision_path"] {
                     self.conn
-                        .execute(&format!("ALTER TABLE models ADD COLUMN {col} {decl}"), [])?;
+                        .execute(&format!("ALTER TABLE models DROP COLUMN {col}"), [])?;
                 }
             }
             self.conn
@@ -375,15 +438,13 @@ impl Store {
             )));
         }
         self.conn.execute(
-            "INSERT INTO models (name, repo, quant, path, bytes, sha256, mmproj_path, vae_path,
-                                 llm_path, llm_vision_path, shards, arch, params, ctx_train,
-                                 pulled_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+            "INSERT INTO models (name, repo, quant, path, bytes, sha256, mmproj_path, components,
+                                 shards, arch, params, ctx_train, pulled_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
              ON CONFLICT(name) DO UPDATE SET
                repo = excluded.repo, quant = excluded.quant, path = excluded.path,
                bytes = excluded.bytes, sha256 = excluded.sha256,
-               mmproj_path = excluded.mmproj_path, vae_path = excluded.vae_path,
-               llm_path = excluded.llm_path, llm_vision_path = excluded.llm_vision_path,
+               mmproj_path = excluded.mmproj_path, components = excluded.components,
                shards = excluded.shards,
                arch = excluded.arch, params = excluded.params,
                ctx_train = excluded.ctx_train, pulled_at = excluded.pulled_at",
@@ -395,9 +456,8 @@ impl Store {
                 m.bytes,
                 m.sha256,
                 m.mmproj_path,
-                m.vae_path,
-                m.llm_path,
-                m.llm_vision_path,
+                serde_json::to_string(&m.components)
+                    .map_err(|e| CoreError::Catalog(e.to_string()))?,
                 m.shards,
                 m.arch,
                 m.params,
@@ -410,8 +470,8 @@ impl Store {
 
     pub fn get_model(&self, name: &str) -> CoreResult<Option<ModelRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, repo, quant, path, bytes, sha256, mmproj_path, vae_path, llm_path, llm_vision_path, shards, arch, params,
-                    ctx_train, pulled_at
+            "SELECT name, repo, quant, path, bytes, sha256, mmproj_path, components, shards, arch,
+                    params, ctx_train, pulled_at
              FROM models WHERE name = ?1",
         )?;
         let mut rows = stmt.query(params![name])?;
@@ -423,8 +483,8 @@ impl Store {
 
     pub fn list_models(&self) -> CoreResult<Vec<ModelRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, repo, quant, path, bytes, sha256, mmproj_path, vae_path, llm_path, llm_vision_path, shards, arch, params,
-                    ctx_train, pulled_at
+            "SELECT name, repo, quant, path, bytes, sha256, mmproj_path, components, shards, arch,
+                    params, ctx_train, pulled_at
              FROM models ORDER BY name",
         )?;
         let rows = stmt.query_map([], model_from_row)?;
@@ -629,6 +689,16 @@ fn engine_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<EngineRow> {
 }
 
 fn model_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRow> {
+    let raw_components: Option<String> = r.get(7)?;
+    let components = match raw_components.as_deref() {
+        // Empty/NULL predates a pull ever attaching a set; anything else
+        // must decode — a silently-dropped set would re-route the row to
+        // the text lanes and die at spawn with a confusing crash.
+        None | Some("") => Vec::new(),
+        Some(raw) => serde_json::from_str(raw).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+    };
     Ok(ModelRow {
         name: r.get(0)?,
         repo: r.get(1)?,
@@ -637,14 +707,12 @@ fn model_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRow> {
         bytes: r.get(4)?,
         sha256: r.get(5)?,
         mmproj_path: r.get(6)?,
-        vae_path: r.get(7)?,
-        llm_path: r.get(8)?,
-        llm_vision_path: r.get(9)?,
-        shards: r.get(10)?,
-        arch: r.get(11)?,
-        params: r.get(12)?,
-        ctx_train: r.get(13)?,
-        pulled_at: r.get(14)?,
+        components,
+        shards: r.get(8)?,
+        arch: r.get(9)?,
+        params: r.get(10)?,
+        ctx_train: r.get(11)?,
+        pulled_at: r.get(12)?,
     })
 }
 
@@ -722,9 +790,7 @@ mod tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
-            vae_path: None,
-            llm_path: None,
-            llm_vision_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,
@@ -789,9 +855,7 @@ mod tests {
             bytes: 500_000_000,
             sha256: Some("abc".into()),
             mmproj_path: None,
-            vae_path: None,
-            llm_path: None,
-            llm_vision_path: None,
+            components: vec![],
             shards: 2,
             arch: Some("qwen3".into()),
             params: Some(0.6),
@@ -853,9 +917,7 @@ mod tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
-            vae_path: None,
-            llm_path: None,
-            llm_vision_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,
@@ -908,9 +970,7 @@ mod tests {
                 bytes: 1,
                 sha256: None,
                 mmproj_path: None,
-                vae_path: None,
-                llm_path: None,
-                llm_vision_path: None,
+                components: vec![],
                 shards: 1,
                 arch: None,
                 params: None,
@@ -930,11 +990,11 @@ mod tests {
     }
 
     #[test]
-    fn unit__migrate_v4_db__adds_component_cols_and_keeps_rows() {
+    fn unit__migrate_v4_db__adds_components_col_and_keeps_rows() {
         // A database last written by a v4 daemon: models table without
-        // the diffusion component-set columns. Opening it must add the
-        // columns in place, keep every existing row, and read the new
-        // fields as None.
+        // any diffusion columns. Opening it must add the components
+        // column in place, keep every existing row, and read the set as
+        // empty (that emptiness is the text-model domain marker).
         let tmp = tempfile::tempdir().unwrap();
         let dirs = BlazarDirs {
             config_dir: tmp.path().join("cfg"),
@@ -972,15 +1032,15 @@ mod tests {
             names.push(r.get::<_, String>(1).unwrap());
         }
         names.sort_unstable();
-        for col in ["llm_path", "llm_vision_path", "vae_path"] {
-            assert!(names.iter().any(|n| n == col), "missing {col}: {names:?}");
-        }
+        assert!(
+            names.iter().any(|n| n == "components"),
+            "missing components: {names:?}"
+        );
         let old = s.get_model("old-m").unwrap().unwrap();
         assert_eq!(old.bytes, 7);
-        assert_eq!(old.vae_path, None);
-        assert_eq!(old.llm_path, None);
-        assert_eq!(old.llm_vision_path, None);
-        // And the new fields roundtrip through the migrated table.
+        assert!(old.components.is_empty());
+        assert!(!old.has_component_set());
+        // And the new field roundtrips through the migrated table.
         s.upsert_model(&ModelRow {
             name: "qwen-image-2.1".into(),
             repo: "abenzerps/Qwen-Image-2.1-GGUF".into(),
@@ -989,9 +1049,10 @@ mod tests {
             bytes: 4_608_000_000,
             sha256: None,
             mmproj_path: None,
-            vae_path: Some("vae.safetensors".into()),
-            llm_path: Some("te.gguf".into()),
-            llm_vision_path: None,
+            components: vec![
+                ComponentFile::new("--vae", "vae.safetensors"),
+                ComponentFile::new("--llm", "te.gguf"),
+            ],
             shards: 1,
             arch: None,
             params: None,
@@ -1000,9 +1061,75 @@ mod tests {
         })
         .unwrap();
         let set = s.get_model("qwen-image-2.1").unwrap().unwrap();
-        assert_eq!(set.vae_path.as_deref(), Some("vae.safetensors"));
-        assert_eq!(set.llm_path.as_deref(), Some("te.gguf"));
-        assert_eq!(set.llm_vision_path, None);
+        assert_eq!(set.component("--vae"), Some("vae.safetensors"));
+        assert_eq!(set.component("--llm"), Some("te.gguf"));
+        assert!(set.has_component_set());
+        assert!(!set.serves_image_edits());
         assert_eq!(s.list_models().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn unit__migrate_v5_db__folds_legacy_component_cols_and_drops_them() {
+        // v5 wrote three fixed columns (--vae/--llm/--llm_vision paths).
+        // v6 folds them into the flag-keyed components JSON and drops
+        // the legacy columns — FLUX needs --t5xxl/--clip_l, which the
+        // fixed shape could never carry.
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(&dirs.data_dir).unwrap();
+        {
+            let conn = Connection::open(dirs.db_file()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE models (
+                    name       TEXT PRIMARY KEY,
+                    repo       TEXT NOT NULL,
+                    quant      TEXT NOT NULL,
+                    path       TEXT NOT NULL,
+                    bytes      INTEGER NOT NULL,
+                    sha256     TEXT,
+                    mmproj_path TEXT,
+                    vae_path     TEXT,
+                    llm_path     TEXT,
+                    llm_vision_path TEXT,
+                    shards     INTEGER NOT NULL DEFAULT 1,
+                    arch       TEXT,
+                    params     REAL,
+                    ctx_train  INTEGER,
+                    pulled_at  INTEGER NOT NULL
+                );
+                INSERT INTO models (name, repo, quant, path, bytes, shards, pulled_at,
+                                    vae_path, llm_path, llm_vision_path)
+                VALUES ('qwen', 'r', 'Q4_K_M', 'p', 7, 1, 1,
+                        'vae.safetensors', 'te.gguf', 'vis.gguf'),
+                       ('text-m', 'r', 'Q4_K_M', 't', 8, 1, 1, NULL, NULL, NULL);
+                PRAGMA user_version = 5;",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&dirs).unwrap();
+        let qwen = s.get_model("qwen").unwrap().unwrap();
+        assert_eq!(
+            qwen.components,
+            vec![
+                ComponentFile::new("--vae", "vae.safetensors"),
+                ComponentFile::new("--llm", "te.gguf"),
+                ComponentFile::new("--llm_vision", "vis.gguf"),
+            ]
+        );
+        assert!(qwen.serves_image_edits());
+        let text = s.get_model("text-m").unwrap().unwrap();
+        assert!(text.components.is_empty());
+        let mut cols = s.conn().prepare("PRAGMA table_info(models)").unwrap();
+        let mut rows = cols.query([]).unwrap();
+        while let Some(r) = rows.next().unwrap() {
+            let name: String = r.get(1).unwrap();
+            assert!(
+                !name.ends_with("_path") || name == "mmproj_path",
+                "legacy column {name} survived the fold"
+            );
+        }
     }
 }
