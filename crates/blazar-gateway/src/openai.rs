@@ -117,6 +117,7 @@ pub async fn embeddings(
         crate::queue::WorkClass::Interactive,
         None,
         false, // embeddings: text-only
+        false, // text surface: diffusion rows teach the images lane
     )
     .await
     {
@@ -383,6 +384,7 @@ pub async fn openai_proxy(
         parsed_body
             .as_ref()
             .is_some_and(|b| crate::proxy::body_needs_vision(b, false)),
+        false, // text surface: diffusion rows teach the images lane
     )
     .await
     {
@@ -632,7 +634,7 @@ pub async fn scoped_proxy(
     );
     let class = crate::queue::classify_work(body_has_tools(&body), false);
     let (engine, load_ms) =
-        match ensure_with_admission(&state, &model, priority, class, None, false).await {
+        match ensure_with_admission(&state, &model, priority, class, None, false, false).await {
             Ok(ok) => ok,
             Err(resp) => return *resp,
         };
@@ -790,6 +792,7 @@ pub async fn responses_api(
         affinity_hash_bytes(&body),
         serde_json::from_slice::<serde_json::Value>(&body)
             .is_ok_and(|b| crate::proxy::body_needs_vision(&b, false)),
+        false, // text surface: diffusion rows teach the images lane
     )
     .await
     {
@@ -1037,6 +1040,7 @@ pub async fn lora_adapters(
         crate::queue::WorkClass::Interactive,
         None,
         false,
+        false, // text surface: diffusion rows teach the images lane
     )
     .await
     {

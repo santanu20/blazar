@@ -123,6 +123,7 @@ pub async fn messages(
         class,
         prefix,
         crate::proxy::body_needs_vision(&openai_body, false),
+        false, // text surface: diffusion rows teach the images lane
     )
     .await
     {
@@ -275,6 +276,7 @@ pub async fn count_tokens(
         crate::queue::WorkClass::Interactive,
         None,
         false,
+        false, // text surface: diffusion rows teach the images lane
     )
     .await
     {
