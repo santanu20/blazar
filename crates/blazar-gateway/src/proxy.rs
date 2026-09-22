@@ -444,6 +444,48 @@ pub fn child_auth(rb: reqwest::RequestBuilder, engine: &EngineRef) -> reqwest::R
     clippy::too_many_lines,
     clippy::items_after_statements
 )] // one cohesive forwarding path: headers -> sentinel/enforce -> stream
+/// Child-bound send with the crash-window retry the text-lane forward
+/// has: a transport failure means the child died between the health
+/// gate and this send (capacity eviction, warm-up crash under VRAM
+/// pressure). Reap, respawn the EXACT lane detached, retry ONCE
+/// in-band (H16); the circuit breaker inside `ensure_key` bounds
+/// crash-looping. `build` receives the (possibly fresh) engine ref so
+/// bodied/multipart requests are rebuilt per attempt — reqwest
+/// builders are single-use.
+pub(crate) async fn send_with_child_retry(
+    state: &AppState,
+    engine: &EngineRef,
+    build: impl Fn(&EngineRef) -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response, String> {
+    let first = match build(engine).send().await {
+        Ok(r) => return Ok(r),
+        Err(e) => e,
+    };
+    tracing::warn!(
+        model = %engine.key,
+        "child transport failure ({first:#}); reaping and retrying once on a respawned lane"
+    );
+    state.sup.reap_dead_children().await;
+    // A WEDGED child — process alive, HTTP listener dead (observed
+    // live: transport-refused while the reaper sees the process
+    // running) — survives the reap, and `ensure_key`'s fast path would
+    // hand the retry the SAME dead endpoint. Evict the key outright:
+    // state flips to Evicted, terminate_group (TERM, then KILL) cleans
+    // the process, the map entry drops. An already-reaped key evicts
+    // as a no-op; a healthy replica that took the slot meanwhile is
+    // ptr-guarded and survives.
+    let _ = state.sup.evict(&engine.key).await;
+    match ensure_key_detached(&state.sup, &engine.key).await {
+        Ok(fresh) => match build(&fresh).send().await {
+            Ok(r) => Ok(r),
+            Err(e2) => Err(format!(
+                "engine request failed: {first:#}; retry on respawned child: {e2:#}"
+            )),
+        },
+        Err(re) => Err(format!("engine request failed: {first:#}; respawn: {re:#}")),
+    }
+}
+
 /// Crash-window variant of [`ensure_detached`]: re-ensures the exact
 /// INSTANCE lane that died (`model`, replica `model#N`, projector
 /// `model@vision`) instead of re-resolving the model name, which

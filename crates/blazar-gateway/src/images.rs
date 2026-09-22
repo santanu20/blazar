@@ -263,18 +263,23 @@ async fn forward_images(
     body: &[u8],
     load_ms: u128,
 ) -> Response {
-    let url = format!("{}{path}", child_base(&engine.endpoint));
-    let mut rb = state.http.post(&url);
-    if let Some(ct) = content_type {
-        rb = rb.header(header::CONTENT_TYPE, ct);
-    }
-    let upstream = child_auth(rb, engine).body(body.to_vec()).send().await;
+    // Crash-window retry: a dead child (capacity eviction, warm-up
+    // crash) surfaces here as a transport error — respawn + one retry
+    // instead of a 502 the client never caused. Same contract as the
+    // proxy text-lane forward.
+    let upstream = crate::proxy::send_with_child_retry(state, engine, |eng| {
+        let mut rb = state
+            .http
+            .post(format!("{}{path}", child_base(&eng.endpoint)));
+        if let Some(ct) = content_type {
+            rb = rb.header(header::CONTENT_TYPE, ct);
+        }
+        child_auth(rb, eng).body(body.to_vec())
+    })
+    .await;
     let resp = match upstream {
         Ok(r) => r,
-        Err(e) => {
-            state.sup.reap_dead_children().await;
-            return openai_error(502, &format!("engine request failed: {e:#}"));
-        }
+        Err(msg) => return openai_error(502, &msg),
     };
     let status = resp.status().as_u16();
     if !resp.status().is_success() {
@@ -574,17 +579,16 @@ async fn submit_native_job(
     native_path: &str,
     native: &serde_json::Value,
 ) -> Result<serde_json::Value, Box<Response>> {
-    let url = format!("{}{native_path}", child_base(&engine.endpoint));
-    let rb = state.http.post(&url).json(native);
-    let resp = match child_auth(rb, engine).send().await {
+    // Crash-window retry — same contract as forward_images above: a
+    // dead child surfaces as transport error, respawn + one retry.
+    let resp = match crate::proxy::send_with_child_retry(state, engine, |eng| {
+        let url = format!("{}{native_path}", child_base(&eng.endpoint));
+        child_auth(state.http.post(&url).json(native), eng)
+    })
+    .await
+    {
         Ok(r) => r,
-        Err(e) => {
-            state.sup.reap_dead_children().await;
-            return Err(Box::new(openai_error(
-                502,
-                &format!("engine request failed: {e:#}"),
-            )));
-        }
+        Err(msg) => return Err(Box::new(openai_error(502, &msg))),
     };
     let status = resp.status().as_u16();
     let body_text = resp.text().await.unwrap_or_default();
