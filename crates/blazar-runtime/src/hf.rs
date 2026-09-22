@@ -1937,6 +1937,12 @@ impl Puller {
             let before: u64 = sel.files[..i].iter().map(|f| f.bytes).sum();
             let mut progress_one = |d: u64, t: u64| progress(before + d.min(t), total_bytes);
             let dest = dir.join(&file.filename);
+            // Dir-scoped lane: no bare-leaf candidate (shards never lived
+            // in the models dir root) — dest + hub cache only.
+            if let Some(_reused) = reuse_on_disk(name, &target.repo, file, &dest, None) {
+                bar.set_position(before + file.bytes);
+                continue;
+            }
             self.client
                 .download_file(&target.repo, file, &dest, &mut progress_one)
                 .await
@@ -2064,6 +2070,17 @@ impl Puller {
                 progress(before + d.min(t), total_bytes);
             };
             let dest = unique_dest(&models_dir, &shard.filename, &target.repo);
+            // Bare-leaf adoption only for single-file pulls: the shard
+            // set is derived from the first shard's recorded path, so a
+            // bare hit must never strand the set at the disambiguated
+            // dest (or vice versa).
+            let bare =
+                (selected.shards.len() == 1).then(|| models_dir.join(leaf_of(&shard.filename)));
+            if let Some(reused) = reuse_on_disk(name, &target.repo, shard, &dest, bare.as_deref()) {
+                bar.set_position(bar.position() + shard.bytes);
+                shard_paths.push(reused);
+                continue;
+            }
             self.client
                 .download_file(&target.repo, shard, &dest, &mut progress_one)
                 .await
@@ -2075,23 +2092,29 @@ impl Puller {
                 })?;
             shard_paths.push(dest);
         }
-        let mmproj_dest = selected
-            .mmproj
-            .as_ref()
-            .map(|mm| unique_dest(&models_dir, &mm.filename, &target.repo));
-        if let (Some(mm), Some(dest)) = (&selected.mmproj, &mmproj_dest) {
-            self.client
-                .download_file(&target.repo, mm, dest, &mut progress)
-                .await
-                .inspect_err(|e| {
-                    // F104: mmproj failure must reach /api/pull watchers
-                    // like a shard failure does, not vanish via `?`.
-                    self.bus.publish(BlazarEvent::PullFailed {
-                        name: name.to_string(),
-                        error: format!("mmproj: {e}"),
-                    });
-                })?;
-        }
+        let mmproj_dest = if let Some(mm) = selected.mmproj.as_ref() {
+            let dest = unique_dest(&models_dir, &mm.filename, &target.repo);
+            let bare = models_dir.join(leaf_of(&mm.filename));
+            if let Some(reused) = reuse_on_disk(name, &target.repo, mm, &dest, Some(&bare)) {
+                bar.set_position(bar.position() + mm.bytes);
+                Some(reused)
+            } else {
+                self.client
+                    .download_file(&target.repo, mm, &dest, &mut progress)
+                    .await
+                    .inspect_err(|e| {
+                        // F104: mmproj failure must reach /api/pull watchers
+                        // like a shard failure does, not vanish via `?`.
+                        self.bus.publish(BlazarEvent::PullFailed {
+                            name: name.to_string(),
+                            error: format!("mmproj: {e}"),
+                        });
+                    })?;
+                Some(dest)
+            }
+        } else {
+            None
+        };
         bar.finish_and_clear();
         Ok((shard_paths, mmproj_dest))
     }
@@ -2332,45 +2355,12 @@ impl Puller {
         done: &mut u64,
     ) -> Result<Option<PathBuf>> {
         let models_dir = self.dirs.models_dir();
-        let leaf = Path::new(&plan.filename).file_name().map_or_else(
-            || plan.filename.clone(),
-            |f| f.to_string_lossy().into_owned(),
-        );
-        // Content-first reuse: a byte-exact file may already sit under
-        // the bare leaf (hand-placed, or left by an earlier install) —
-        // `unique_dest` disambiguates NAME collisions before content is
-        // considered, which once re-downloaded a 5 GiB text encoder
-        // right next to its own byte-exact copy. Both the bare leaf
-        // and the collision-resolved dest are content-checked.
-        let bare = models_dir.join(&leaf);
-        let dest = unique_dest(&models_dir, &leaf, repo);
-        for candidate in [&bare, &dest] {
-            if let Some(reused) = reuse_byte_exact(candidate, plan) {
-                tracing::info!(model = %name, "component {} already on disk (byte-exact) — reusing", leaf);
-                *done += plan.bytes;
-                bar.set_position(*done);
-                return Ok(Some(reused));
-            }
-        }
-        // Third reuse source: the huggingface hub cache (diffusers
-        // pipelines, ComfyUI installs, `hf download` runs). The hit is
-        // hardlinked into the models dir so the row never points at the
-        // user's cache and `blazar rm` stays scoped to blazar's files.
-        for candidate in hf_hub_candidates(repo, &plan.filename) {
-            if reuse_byte_exact(&candidate, plan).is_some() {
-                match materialize_hub_hit(&candidate, &dest) {
-                    Ok(()) => {
-                        tracing::info!(model = %name, "component {} found in the huggingface hub cache — hardlinked", leaf);
-                        *done += plan.bytes;
-                        bar.set_position(*done);
-                        return Ok(Some(dest));
-                    }
-                    Err(e) => {
-                        tracing::warn!(model = %name, "hub cache hit for {} but linking failed ({e}) — downloading", leaf);
-                        break;
-                    }
-                }
-            }
+        let bare = models_dir.join(leaf_of(&plan.filename));
+        let dest = unique_dest(&models_dir, &leaf_of(&plan.filename), repo);
+        if let Some(reused) = reuse_on_disk(name, repo, plan, &dest, Some(&bare)) {
+            *done += plan.bytes;
+            bar.set_position(*done);
+            return Ok(Some(reused));
         }
         let before = *done;
         let mut progress = |d: u64, t: u64| {
@@ -2531,6 +2521,18 @@ impl Puller {
                 anyhow!("delta pull requested a projector but the selection has none")
             })?;
             let dest = unique_dest(&models_dir, &mm.filename, &target.repo);
+            let bare = models_dir.join(leaf_of(&mm.filename));
+            if let Some(reused) = reuse_on_disk(name, &target.repo, mm, &dest, Some(&bare)) {
+                mmproj_dest = Some(reused);
+                return build_model_row(
+                    name,
+                    target,
+                    info,
+                    selected,
+                    &[PathBuf::from(&old.path)],
+                    mmproj_dest.as_ref(),
+                );
+            }
             let bar = indicatif::ProgressBar::new(mm.bytes);
             bar.set_style(
                 indicatif::ProgressStyle::default_bar()
@@ -2718,6 +2720,15 @@ pub(crate) fn unique_dest(dir: &Path, filename: &str, repo: &str) -> PathBuf {
     dir.join(format!("{repo_slug}--{}", leaf.to_string_lossy()))
 }
 
+/// Final path component of a repo-side filename (subdirs flattened by
+/// the download lanes; a bare name is its own leaf).
+fn leaf_of(filename: &str) -> String {
+    Path::new(filename).file_name().map_or_else(
+        || filename.to_string(),
+        |f| f.to_string_lossy().into_owned(),
+    )
+}
+
 /// A file at `candidate` that is byte-exact for `plan`: size gates a
 /// full sha256 (hashing only runs on a size match, so the common miss
 /// costs one stat — the rare hit is a multi-second multi-GiB read that
@@ -2800,6 +2811,56 @@ fn materialize_hub_hit(src: &Path, dest: &Path) -> std::io::Result<()> {
     std::fs::copy(src, dest).map(|_| ())
 }
 
+/// Content-first reuse decision shared by EVERY pull lane (gguf shards,
+/// mmproj sidecars, safetensors shards, diffusion components): before
+/// downloading, look for a byte-exact copy of `plan` at the bare leaf,
+/// the collision-resolved dest, or the huggingface hub cache (hardlinked
+/// in). `bare` is the pre-collision leaf path for lanes that download
+/// into the models dir root — pass `None` when the dest is dir-scoped
+/// (safetensors shards) or when adopting a bare leaf would strand a
+/// multi-shard set whose siblings sit at the disambiguated dest.
+/// A hit also sweeps a stale `dest.part` from an interrupted attempt
+/// (the disk-eating orphan class). Returns the path the row should
+/// record; `None` = download.
+fn reuse_on_disk(
+    name: &str,
+    repo: &str,
+    plan: &FilePlan,
+    dest: &Path,
+    bare: Option<&Path>,
+) -> Option<PathBuf> {
+    for candidate in bare.into_iter().chain(std::iter::once(dest)) {
+        if let Some(reused) = reuse_byte_exact(candidate, plan) {
+            tracing::info!(model = %name, "file {} already on disk (byte-exact) — reusing", plan.filename);
+            if let Some(bare) = bare {
+                sweep_stale_part(&bare.display().to_string());
+            }
+            sweep_stale_part(&dest.display().to_string());
+            return Some(reused);
+        }
+    }
+    // Third reuse source: the huggingface hub cache (diffusers
+    // pipelines, ComfyUI installs, `hf download` runs). The hit is
+    // hardlinked into the models dir so the row never points at the
+    // user's cache and `blazar rm` stays scoped to blazar's files.
+    for candidate in hf_hub_candidates(repo, &plan.filename) {
+        if reuse_byte_exact(&candidate, plan).is_some() {
+            return match materialize_hub_hit(&candidate, dest) {
+                Ok(()) => {
+                    tracing::info!(model = %name, "file {} found in the huggingface hub cache — hardlinked", plan.filename);
+                    sweep_stale_part(&dest.display().to_string());
+                    Some(dest.to_path_buf())
+                }
+                Err(e) => {
+                    tracing::warn!(model = %name, "hub cache hit for {} but linking failed ({e}) — downloading", plan.filename);
+                    None
+                }
+            };
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
@@ -2854,6 +2915,59 @@ mod tests {
             None
         );
         assert_eq!(reuse_byte_exact(&f, &plan(0, None)), None);
+    }
+
+    #[test]
+    fn unit__reuse_on_disk__bare_dest_miss_and_part_sweep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let body = b"row-less-reuse-bytes".to_vec();
+        let sha = payload(&body);
+        let plan = |bytes: u64, sha: Option<&str>| FilePlan {
+            filename: "m-q4_k_m.gguf".into(),
+            bytes,
+            sha256: sha.map(str::to_string),
+        };
+        let p = plan(body.len() as u64, Some(&sha));
+
+        // Miss: nothing on disk, no hub cache.
+        std::env::set_var("HF_HUB_CACHE", tmp.path().join("absent-hub"));
+        let dest = models.join("m-q4_k_m.gguf");
+        assert_eq!(reuse_on_disk("m", "o/r", &p, &dest, None), None);
+
+        // Bare-leaf hit: byte-exact file under the bare leaf wins, and a
+        // stale `dest.part` from an interrupted attempt is swept.
+        let bare = models.join("m-q4_k_m.gguf");
+        std::fs::write(&bare, &body).unwrap();
+        let slug_dest = models.join("o--r--m-q4_k_m.gguf");
+        std::fs::write(models.join("o--r--m-q4_k_m.gguf.part"), b"junk").unwrap();
+        assert_eq!(
+            reuse_on_disk("m", "o/r", &p, &slug_dest, Some(&bare)),
+            Some(bare.clone())
+        );
+        assert!(!models.join("o--r--m-q4_k_m.gguf.part").exists());
+
+        // Collision-named hit: the disambiguated dest is byte-exact.
+        std::fs::remove_file(&bare).unwrap();
+        std::fs::write(&slug_dest, &body).unwrap();
+        assert_eq!(
+            reuse_on_disk("m", "o/r", &p, &slug_dest, Some(&bare)),
+            Some(slug_dest.clone())
+        );
+
+        // Hub hit: hardlinked into dest, row never points at the cache.
+        std::fs::remove_file(&slug_dest).unwrap();
+        let hub = tmp.path().join("hub");
+        let snap = hub.join("models--o--r").join("snapshots").join("rev1");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::write(snap.join("m-q4_k_m.gguf"), &body).unwrap();
+        std::env::set_var("HF_HUB_CACHE", &hub);
+        assert_eq!(
+            reuse_on_disk("m", "o/r", &p, &dest, Some(&bare)),
+            Some(dest.clone())
+        );
+        assert!(dest.is_file());
     }
 
     #[test]
@@ -4312,6 +4426,78 @@ mod tests {
 
         let store = Store::open(&dirs).unwrap();
         assert_eq!(store.get_model("m-repo").unwrap().unwrap().quant, "Q4_K_M");
+    }
+
+    #[tokio::test]
+    async fn integration__pull_rowless_repull__reuses_byte_exact_leaf_without_download() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        dirs.ensure().unwrap();
+
+        let content = b"gguf-bytes-here".to_vec();
+        let sha = payload(&content);
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/models/owner/m-repo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "owner/m-repo",
+                "siblings": [ sibling_json("m-repo-q4_k_m.gguf", content.len() as u64, &sha) ]
+            })))
+            .mount(&api)
+            .await;
+        let dl = MockServer::start().await;
+        // Exactly ONE blob transfer serves both pulls: the row-less
+        // re-pull must reuse the byte-exact leaf, not re-download it
+        // (the 4.6 GiB incident class).
+        let dl_guard = Mock::given(method("GET"))
+            .and(path("/owner/m-repo/resolve/main/m-repo-q4_k_m.gguf"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(content.clone()))
+            .expect(1)
+            .mount_as_scoped(&dl)
+            .await;
+
+        let client = HfClient::with_bases(
+            &api.uri(),
+            &dl.uri(),
+            None,
+            vec![
+                api.uri().trim_start_matches("http://").to_string(),
+                dl.uri().trim_start_matches("http://").to_string(),
+            ],
+        )
+        .unwrap();
+        let puller = Puller {
+            dirs: dirs.clone(),
+            client,
+            bus: EventBus::default(),
+            force: false,
+        };
+        let first = puller.pull("owner/m-repo:Q4_K_M").await.unwrap().row;
+        let leaf = PathBuf::from(&first.path);
+
+        // Row-less re-pull: the store forgets the model (the gate's
+        // Present-branch is unreachable) but the file stays byte-exact
+        // on disk — the main download path must adopt it.
+        Store::open(&dirs).unwrap().delete_model("m-repo").unwrap();
+        let stale_part = dirs
+            .models_dir()
+            .join(leaf.file_name().unwrap().to_string_lossy().as_ref());
+        let stale_part = stale_part.with_extension("gguf.part");
+        std::fs::write(&stale_part, b"stale-interrupted-attempt").unwrap();
+        let second = puller.pull("owner/m-repo:Q4_K_M").await.unwrap().row;
+
+        assert_eq!(second.path, first.path, "row re-records the same leaf");
+        assert_eq!(std::fs::read(&leaf).unwrap(), content);
+        assert!(
+            !Path::new(&format!("{}.part", leaf.display())).exists(),
+            "stale partial swept on reuse"
+        );
+        // The scoped guard asserts `expect(1)` when dropped — exactly one
+        // blob transfer across BOTH pulls.
+        drop(dl_guard);
     }
 
     #[tokio::test]
