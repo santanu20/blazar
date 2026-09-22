@@ -1387,7 +1387,11 @@ impl EngineManager {
                 .release_by_tag_repo(gh::SDCPP_REPO, &latest.tag_name)
                 .await?
         };
-        let patterns = gh::sdcpp_asset_patterns(std::env::consts::OS, std::env::consts::ARCH)?;
+        // Vendor-native first: an NVIDIA box prefers a CUDA prebuilt the
+        // day upstream ships one; every other GPU rides Vulkan.
+        let nvidia = build::nvidia_gpu_facts().await.0.is_some();
+        let patterns =
+            gh::sdcpp_asset_patterns(std::env::consts::OS, std::env::consts::ARCH, nvidia)?;
 
         let mut last_missing: Option<Vec<gh::SdAssetPattern>> = None;
         for attempt in 0..=ASSET_UPLOAD_RETRY_ATTEMPTS {
