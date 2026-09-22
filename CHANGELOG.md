@@ -7,6 +7,9 @@ tracked here.
 ## [Unreleased]
 
 ### Fixed
+
+- Video generation through the gateway returned an empty `data` array: the native vid_gen job answers with a flat `b64_json`/`fps`/`frame_count` payload instead of the nested `images[]` list the image path uses. The job-to-OpenAI mapper now folds the flat video bytes into the same `data[0]` envelope, so `/v1/videos/generations` (sync, `"async": true`, and `"stream": true`) all return playable WebM bytes.
+
 - **Diffusion families with architecture tags now pull their component set.** city96 FLUX.1 DiT GGUFs carry `general.architecture: flux`, which slipped past the kvless-only attach gate and landed as a pseudo-text model; family membership (not metadata absence) now decides the diffusion domain.
 - **Gated downloads teach the license wall.** A 401/403 on a component download (Black Forest Labs VAE and friends) now says to accept the repo license on huggingface.co and set `HF_TOKEN`, instead of a bare `403 Forbidden`.
 

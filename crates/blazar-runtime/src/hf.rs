@@ -1703,8 +1703,8 @@ pub(crate) fn repull_gate(
 
 /// Whether a pulled single-shard GGUF belongs to the diffusion domain and
 /// must carry its component set. A curated family repo is diffusion
-/// regardless of GGUF metadata: city96 FLUX DiTs ship a proper `flux`
-/// architecture tag while QuantStack Qwen-Image DiTs are kvless — both
+/// regardless of GGUF metadata: `city96` `FLUX` `DiTs` ship a proper `flux`
+/// architecture tag while `QuantStack` `Qwen-Image` `DiTs` are kvless — both
 /// boot on the sdcpp lane only with their `VAE`/TE sidecars. Kvless
 /// files from unknown families also route here so the attach path can
 /// emit its teaching note; text-model repos (architecture known, no
@@ -2974,7 +2974,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     #[allow(non_snake_case)]
     fn unit__should_attach_diffusion_set__arch_tag_does_not_escape_the_family_domain() {
         // city96 FLUX DiTs carry general.architecture=flux — still diffusion.
@@ -2999,6 +2998,8 @@ mod tests {
         ));
     }
 
+    #[test]
+    #[allow(non_snake_case)]
     fn unit__reuse_on_disk__bare_dest_miss_and_part_sweep() {
         let tmp = tempfile::tempdir().unwrap();
         let models = tmp.path().join("models");
