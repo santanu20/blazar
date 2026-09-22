@@ -846,11 +846,23 @@ impl HfClient {
         let mut resp = req.send().await.context("download request failed")?;
         let status = resp.status();
         if !status.is_success() && status.as_u16() != 206 {
+            // 401/403 on the resolve URL is the gated-repo wall (BFL FLUX
+            // VAE and friends): name the license step instead of a bare
+            // Forbidden, mirroring the model_info mapping above.
+            let gated = matches!(
+                status,
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            )
+            .then(
+                || " — the repo is gated or private: accept its license on huggingface.co and set HF_TOKEN if you have access",
+            )
+            .unwrap_or("");
             return Err(anyhow!(
-                "download {} failed: {} {}",
+                "download {} failed: {} {}{}",
                 plan.filename,
                 status.as_str(),
-                status.canonical_reason().unwrap_or("")
+                status.canonical_reason().unwrap_or(""),
+                gated
             ));
         }
         // Server ignored the Range: restart from zero.
@@ -1689,6 +1701,18 @@ pub(crate) fn repull_gate(
     }
 }
 
+/// Whether a pulled single-shard GGUF belongs to the diffusion domain and
+/// must carry its component set. A curated family repo is diffusion
+/// regardless of GGUF metadata: city96 FLUX DiTs ship a proper `flux`
+/// architecture tag while QuantStack Qwen-Image DiTs are kvless — both
+/// boot on the sdcpp lane only with their `VAE`/TE sidecars. Kvless
+/// files from unknown families also route here so the attach path can
+/// emit its teaching note; text-model repos (architecture known, no
+/// family) never do.
+fn should_attach_diffusion_set(arch_known: bool, repo: &str) -> bool {
+    !arch_known || crate::diffusion::diffusion_family(repo).is_some()
+}
+
 /// A diffusion component row whose REQUIRED sidecar (`VAE` or text
 /// encoder) is absent — deleted from disk, or never attached because
 /// the row predates the component-set pull. Known-family rows must
@@ -1833,11 +1857,7 @@ impl Puller {
             mmproj_dest.as_ref(),
         )?;
         let mut pull_warning = pull_warning;
-        // Kvless GGUF = a diffusion `DiT` component (no text-model
-        // architecture inside). A known family pulls the `VAE`/`TE` set the
-        // sdcpp engine needs to boot; an unknown one keeps the
-        // existing kvless teaching at spawn time.
-        if row.arch.is_none() && shard_paths.len() == 1 {
+        if should_attach_diffusion_set(row.arch.is_some(), &target.repo) && shard_paths.len() == 1 {
             self.attach_diffusion_set(target, name, &selected.quant, &mut row, &mut pull_warning)
                 .await?;
         }
@@ -2954,6 +2974,31 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__should_attach_diffusion_set__arch_tag_does_not_escape_the_family_domain() {
+        // city96 FLUX DiTs carry general.architecture=flux — still diffusion.
+        assert!(should_attach_diffusion_set(true, "city96/FLUX.1-dev-gguf"));
+        assert!(should_attach_diffusion_set(
+            true,
+            "silveroxides/Chroma-GGUF"
+        ));
+        // Kvless DiTs (QuantStack Qwen-Image) attach via the kvless arm.
+        assert!(should_attach_diffusion_set(
+            false,
+            "QuantStack/Qwen-Image-GGUF"
+        ));
+        assert!(should_attach_diffusion_set(
+            false,
+            "unknown-orphan/diT-only"
+        ));
+        // A text model with known architecture never enters the diffusion path.
+        assert!(!should_attach_diffusion_set(
+            true,
+            "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+        ));
+    }
+
     fn unit__reuse_on_disk__bare_dest_miss_and_part_sweep() {
         let tmp = tempfile::tempdir().unwrap();
         let models = tmp.path().join("models");
@@ -4792,6 +4837,49 @@ mod tests {
         assert!(
             cdn_req.headers.get("authorization").is_none(),
             "token must NEVER reach a CDN host"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn integration__gated_download__teaches_the_license_wall() {
+        // A 403 on the resolve URL must name the license + HF_TOKEN step,
+        // not a bare Forbidden (BFL FLUX VAE class).
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = blazar_core::BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let client = super::HfClient::with_bases(
+            &server.uri(),
+            &server.uri(),
+            None,
+            vec![super::tests::host_of(&server.uri())],
+        )
+        .unwrap();
+        let plan = super::FilePlan {
+            filename: "ae.safetensors".into(),
+            bytes: 8,
+            sha256: Some("deadbeef".into()),
+        };
+        let err = client
+            .download_file(
+                "o/gated",
+                &plan,
+                &dirs.models_dir().join("probe.bin"),
+                |_, _| {},
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gated or private") && msg.contains("HF_TOKEN"),
+            "gated download must teach the license wall, got: {msg}"
         );
     }
 

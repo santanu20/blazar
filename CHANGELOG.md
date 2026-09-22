@@ -6,6 +6,10 @@ tracked here.
 
 ## [Unreleased]
 
+### Fixed
+- **Diffusion families with architecture tags now pull their component set.** city96 FLUX.1 DiT GGUFs carry `general.architecture: flux`, which slipped past the kvless-only attach gate and landed as a pseudo-text model; family membership (not metadata absence) now decides the diffusion domain.
+- **Gated downloads teach the license wall.** A 401/403 on a component download (Black Forest Labs VAE and friends) now says to accept the repo license on huggingface.co and set `HF_TOKEN`, instead of a bare `403 Forbidden`.
+
 ### Added
 - **Whisper as a first-class engine lane (`--kind whisper`).** `whisper-server` now registers in the engines table like every other lane (kind `whisper`, 54-flag `--help` probe — usage prints to stderr, handled), installs/updates via `blazar engine install/update --kind whisper` (ggml-org/whisper.cpp prebuilt tars, CPU), and NEVER claims the serving-active flag: lazy audio lanes serve from the gateway on demand, so `serve` keeps its serving adapter. `POST /v1/audio/translations` joins transcriptions as a first-class OpenAI route (forced `translate=true` onto the native `/inference`); both routes forward a live-verified 21-field whitelist (beam_size, no_timestamps, temperature_inc, best_of, offsets, thresholds, audio_ctx, ...). Model names accept `ggml-<size>` (HF naming) beside `whisper-*`. Currency hints (engine list, doctor, boot-time check) are per-lane now — the llama.cpp channel verdict never leaks onto foreign lanes; doctor folds whisper into the standard inventory/retention/currency loops. The legacy `blazar whisper --install` tree still resolves (engines lane wins) and `blazar whisper --list/--pull` keep managing ggml models. Proven live end-to-end: JFK sample transcription = exact upstream ground-truth text, translation 200 `task=translate`.
 
