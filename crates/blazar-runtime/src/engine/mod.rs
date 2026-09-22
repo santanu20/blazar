@@ -2169,6 +2169,63 @@ impl EngineManager {
         Ok(freed)
     }
 
+    /// Remove engine directories the store has no row for. Rows are the
+    /// source of truth: a dir without one is debris from an interrupted
+    /// install or a pre-rollback-era upgrade, invisible to `engine list`
+    /// yet still eating disk (a 1 GiB `b11064-cuda` survived this way).
+    /// A dir is NEVER an orphan while some row's manifest points into it.
+    pub fn prune_orphan_dirs(&self) -> Result<Vec<(String, u64)>> {
+        let store = Store::open(&self.dirs)?;
+        let engines = store.list_engines()?;
+        let mut referenced: std::collections::HashSet<PathBuf> = engines
+            .iter()
+            .filter_map(|e| serde_json::from_str::<Manifest>(&e.manifest).ok())
+            .map(|m| PathBuf::from(m.server_path))
+            // A default/empty server_path would match every dir (all paths
+            // start_with the empty component list) and disable the sweep.
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect();
+        for e in &engines {
+            referenced.insert(self.dirs.engines_dir().join(&e.tag));
+        }
+        let mut freed = Vec::new();
+        let mut entries = std::fs::read_dir(self.dirs.engines_dir())
+            .with_context(|| format!("list {}", self.dirs.engines_dir().display()))?;
+        while let Some(entry) = entries.next().transpose()? {
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let dir = entry.path();
+            if referenced
+                .iter()
+                .any(|r| r == &dir || dir.starts_with(r) || r.starts_with(&dir))
+            {
+                continue;
+            }
+            let bytes = engine_dir_bytes(&dir);
+            // Best-effort: a busy dir (child running from it) is skipped,
+            // not fatal — the next sweep catches it.
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "orphan engine dir {} could not be removed: {e}",
+                        dir.display()
+                    );
+                    continue;
+                }
+            }
+            let tag = entry.file_name().to_string_lossy().into_owned();
+            tracing::info!(
+                "pruned orphan engine dir {} ({} bytes, no store row)",
+                tag,
+                bytes
+            );
+            freed.push((tag, bytes));
+        }
+        Ok(freed)
+    }
+
     /// Register a locally built llama-server (`BLAZAR_ENGINE_PATH`) under the
     /// pseudo-tag `local`. Never pruned; activation follows `use_tag`.
     pub fn register_local(

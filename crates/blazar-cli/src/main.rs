@@ -2166,6 +2166,25 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
             over.push(format!("{kind}: {n} > {keep}"));
         }
     }
+    // Row-less dirs: invisible to the counts above yet still on disk
+    // (interrupted installs, pre-rollback upgrades). Advisory only —
+    // `blazar engine prune` reclaims them.
+    let tags: std::collections::HashSet<&str> = engines.iter().map(|e| e.tag.as_str()).collect();
+    let orphaned: Vec<String> = std::fs::read_dir(d.engines_dir())
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| !tags.contains(name.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !orphaned.is_empty() {
+        over.push(format!(
+            "orphan dirs (no store row): {}",
+            orphaned.join(", ")
+        ));
+    }
     if over.is_empty() {
         out.push(Check::ok(
             "engine retention",
@@ -9246,20 +9265,38 @@ fn engine_prune(d: &BlazarDirs) -> Result<()> {
     let before: Vec<String> = store.list_engines()?.into_iter().map(|e| e.tag).collect();
     let mgr = local_engine_manager(d)?;
     mgr.prune(&store)?;
+    // Row-less dirs are invisible to the table sweep above yet eat disk;
+    // reclaim them in the same manual pass.
+    let orphans = mgr.prune_orphan_dirs()?;
     let after: Vec<String> = store.list_engines()?.into_iter().map(|e| e.tag).collect();
     let removed: Vec<&str> = before
         .iter()
         .map(String::as_str)
         .filter(|t| !after.iter().any(|kept| kept == t))
         .collect();
-    if removed.is_empty() {
+    if removed.is_empty() && orphans.is_empty() {
         println!(
             "nothing to prune — {} engines kept: {}",
             after.len(),
             after.join(", ")
         );
     } else {
-        println!("pruned {} (kept: {})", removed.join(", "), after.join(", "));
+        let mut parts = Vec::new();
+        if !removed.is_empty() {
+            parts.push(format!(
+                "pruned {} (kept: {})",
+                removed.join(", "),
+                after.join(", ")
+            ));
+        }
+        for (tag, bytes) in &orphans {
+            #[allow(clippy::cast_precision_loss)] // MiB display
+            let mib = *bytes as f64 / (1024.0 * 1024.0);
+            parts.push(format!(
+                "removed orphan engine dir {tag} ({mib:.0} MiB, no store row)"
+            ));
+        }
+        println!("{}", parts.join("; "));
     }
     Ok(())
 }
