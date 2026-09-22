@@ -1735,10 +1735,11 @@ impl WarmPeg {
         match kind {
             EngineKind::Sglang => self.sglang.unwrap_or(self.default),
             EngineKind::LlamaCpp => self.llamacpp.unwrap_or(self.default),
-            // No peg lane exists for either server: readiness publishes
-            // when the health probe flips (mistralrs) or /v1/models first
-            // answers (sdcpp).
-            EngineKind::MistralRs | EngineKind::SdCpp => false,
+            // No peg lane exists for these servers: readiness publishes
+            // when the health probe flips (mistralrs), /v1/models first
+            // answers (sdcpp), or the lazy child first boots (whisper —
+            // never supervised at all).
+            EngineKind::MistralRs | EngineKind::SdCpp | EngineKind::Whisper => false,
         }
     }
 }

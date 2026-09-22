@@ -2177,10 +2177,14 @@ impl Puller {
         // path (deleted file, stale row) falls through to re-download —
         // byte-exact reuse keeps that repair cheap.
         if let Some(row) = existing.as_ref() {
-            if row.repo == target.repo
+            let intact = row.repo == target.repo
                 && Path::new(&row.path).is_file()
-                && row.component("--model").is_some()
-            {
+                && if family.components.is_empty() {
+                    row.component("--model").is_some()
+                } else {
+                    !crate::diffusion::required_component_missing(row, family)
+                };
+            if intact {
                 return Ok(PullOutcome {
                     row: row.clone(),
                     already_present: true,
@@ -2202,6 +2206,38 @@ impl Puller {
             .ok_or_else(|| anyhow!("checkpoint {} failed without an error", plan.filename))?;
         bar.finish_and_clear();
         let dest_str = dest.display().to_string();
+        // Standalone-with-components families (Wan video): the exact
+        // checkpoint is the DiT, booted via `--diffusion-model` with its
+        // VAE/text encoder attached. Bare standalone families (SDXL,
+        // SD 1.5) embed everything and self-reference through
+        // `--model` — that path is preserved verbatim below.
+        let mut components = if family.components.is_empty() {
+            vec![blazar_core::store::ComponentFile::new("--model", &dest_str)]
+        } else {
+            let mut pull_warning = None;
+            let mut row = blazar_core::ModelRow {
+                name: name.to_string(),
+                repo: String::new(),
+                quant: String::new(),
+                path: String::new(),
+                bytes: 0,
+                sha256: None,
+                mmproj_path: None,
+                components: vec![],
+                shards: 1,
+                arch: None,
+                params: None,
+                ctx_train: None,
+                pulled_at: 0,
+            };
+            self.attach_diffusion_set(target, name, &target.quant, &mut row, &mut pull_warning)
+                .await?;
+            if let Some(w) = pull_warning {
+                tracing::warn!(model = %name, "{w}");
+            }
+            row.components
+        };
+        components.sort_by(|a, b| a.flag.cmp(&b.flag));
         let row = blazar_core::ModelRow {
             name: name.to_string(),
             repo: target.repo.clone(),
@@ -2210,7 +2246,7 @@ impl Puller {
             bytes: i64::try_from(plan.bytes).unwrap_or(i64::MAX),
             sha256: plan.sha256.clone(),
             mmproj_path: None,
-            components: vec![blazar_core::store::ComponentFile::new("--model", &dest_str)],
+            components,
             shards: 1,
             arch: None,
             params: None,

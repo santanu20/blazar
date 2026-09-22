@@ -1440,6 +1440,69 @@ impl EngineManager {
                 .join(", ")
         ))
     }
+
+    /// Install/refresh the whisper lane (prebuilt `whisper-server`).
+    /// Mirrors [`Self::update_sdcpp`]: tag pins, latest resolves the
+    /// newest b-tag, the platform pick is CPU-shaped (whisper serving
+    /// is a CPU contract), and the same asset-upload retry applies.
+    pub async fn update_whisper(&self, tag: Option<&str>) -> Result<EngineRow> {
+        let release = if let Some(t) = tag {
+            self.gh.release_by_tag_repo(gh::WHISPER_REPO, t).await?
+        } else {
+            let latest = self.gh.latest_whisper_release().await?;
+            self.gh
+                .release_by_tag_repo(gh::WHISPER_REPO, &latest.tag_name)
+                .await?
+        };
+        let patterns = gh::whisper_asset_patterns(std::env::consts::OS, std::env::consts::ARCH)?;
+
+        let mut last_missing: Option<Vec<gh::SdAssetPattern>> = None;
+        for attempt in 0..=ASSET_UPLOAD_RETRY_ATTEMPTS {
+            if let Some((asset, pattern)) = gh::resolve_sdcpp_asset(&release, &patterns) {
+                tracing::debug!(tag = %release.tag_name, asset = %asset.name, "whisper asset resolved");
+                return self
+                    .install_picked_asset(
+                        &release,
+                        asset,
+                        pattern.label,
+                        pattern.cpu_fallback,
+                        EngineKind::Whisper,
+                    )
+                    .await;
+            }
+            last_missing = Some(patterns.clone());
+            if !release_is_fresh(&release) || attempt == ASSET_UPLOAD_RETRY_ATTEMPTS {
+                break;
+            }
+            tracing::info!(
+                "whisper.cpp {} assets still uploading; retry {}/{} in {:?}",
+                release.tag_name,
+                attempt + 1,
+                ASSET_UPLOAD_RETRY_ATTEMPTS,
+                ASSET_UPLOAD_RETRY_DELAY
+            );
+            tokio::time::sleep(ASSET_UPLOAD_RETRY_DELAY).await;
+        }
+        Err(anyhow!(
+            "no usable whisper.cpp asset in release {} (wanted one of: {}; available: {})",
+            release.tag_name,
+            last_missing.map_or_else(
+                || "n/a".into(),
+                |p| {
+                    p.iter()
+                        .map(|x| x.includes.join("+"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                },
+            ),
+            release
+                .assets
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
     /// Shared install tail for every engine source (release asset,
     /// source build): probe the binary, warn on GPU-asset-sees-no-GPU,
     /// store the row, activate it, publish, prune old tags.
@@ -1518,6 +1581,46 @@ impl EngineManager {
         )
     }
 
+    /// Post-registration advisories: why an engine did (or did not) become
+    /// the serving-active row. Kept beside `register_engine_inner` so the
+    /// activation triad (`keep_cuda` / `fork_additive` / `lazy_lane`) reads
+    /// as one decision with its consequences.
+    fn registration_notes(
+        store: &Store,
+        tag: &str,
+        asset_label: &str,
+        new_kind: &str,
+        keep_cuda: bool,
+        fork_additive: bool,
+        lazy_lane: bool,
+    ) {
+        if keep_cuda {
+            tracing::warn!(
+                "NVIDIA GPU present — registered engine {tag} ({asset_label}) but KEPT the \
+             installed CUDA engine active (Vulkan first-token is measurably slower); run \
+             `blazar engine use {tag}` to switch anyway"
+            );
+        }
+        if fork_additive {
+            tracing::info!(
+                "fork lane {tag} registered without activating — the active {} engine stays; \
+             `blazar engine use {tag}` switches explicitly",
+                new_kind
+            );
+        }
+        if lazy_lane {
+            tracing::info!(
+                "lazy lane {tag} registered without activating — it serves from the gateway \
+             on demand; the active {} engine stays",
+                store
+                    .active_engine()
+                    .ok()
+                    .flatten()
+                    .map_or("serving", |e| e.kind.as_str())
+            );
+        }
+    }
+
     // Argument list maps 1:1 onto the public register_* API; bundling
     // into a seed struct would hide that correspondence.
     #[allow(clippy::too_many_arguments)]
@@ -1539,6 +1642,9 @@ impl EngineManager {
             // hand-copied dir, and the shim name is the contract.
             EngineKind::Sglang => find_engine_binary(dir, &["sglang-server"]),
             EngineKind::SdCpp => find_engine_binary(dir, &["sd-server", "sd-server.exe"]),
+            EngineKind::Whisper => {
+                find_engine_binary(dir, &["whisper-server", "whisper-server.exe"])
+            }
         }
         .map_err(|e| e.context(ENGINE_PROBE_FAILED))?;
         make_executable(&server);
@@ -1580,6 +1686,12 @@ impl EngineManager {
             EngineKind::SdCpp => {
                 tracing::debug!(target: "blazar::engine", "registered sdcpp {tag} ({asset_label})");
             }
+            // whisper serving is CPU-contract (no --list-devices flag);
+            // the lane boots lazily from the gateway audio handler, so
+            // there is no supervised spawn to cross-check either.
+            EngineKind::Whisper => {
+                tracing::debug!(target: "blazar::engine", "registered whisper {tag} ({asset_label})");
+            }
         }
         let row = EngineRow {
             tag: tag.to_string(),
@@ -1616,7 +1728,13 @@ impl EngineManager {
                 .list_engines()?
                 .iter()
                 .any(|e| e.kind == row.kind && e.active);
-        let activated = !keep_cuda && !fork_additive;
+        // Lazy lanes never claim the serving-active flag either: the
+        // supervisor adapter backs model serving, while the audio lane
+        // boots on demand from the gateway. `serve` picks its adapter
+        // off the ACTIVE row, so a whisper install dethroning the
+        // serving engine left the daemon unable to boot at all.
+        let lazy_lane = row.kind == EngineKind::Whisper;
+        let activated = !keep_cuda && !fork_additive && !lazy_lane;
         if activated {
             store.set_active_engine(tag)?;
         }
@@ -1624,20 +1742,15 @@ impl EngineManager {
             tag: tag.to_string(),
         });
         self.prune(&store)?;
-        if keep_cuda {
-            tracing::warn!(
-                "NVIDIA GPU present — registered engine {tag} ({asset_label}) but KEPT the \
-                 installed CUDA engine active (Vulkan first-token is measurably slower); run \
-                 `blazar engine use {tag}` to switch anyway"
-            );
-        }
-        if fork_additive {
-            tracing::info!(
-                "fork lane {tag} registered without activating — the active {} engine stays; \
-                 `blazar engine use {tag}` switches explicitly",
-                row.kind.as_str()
-            );
-        }
+        Self::registration_notes(
+            &store,
+            tag,
+            asset_label,
+            row.kind.as_str(),
+            keep_cuda,
+            fork_additive,
+            lazy_lane,
+        );
         // The flip above happened after `row` was built; the caller's
         // contract expects the returned row to reflect the post-install
         // store state.
@@ -2348,6 +2461,14 @@ pub fn verify_engine_binary(
             .map(|m| PathBuf::from(m.server_path))
             .is_some_and(|b| {
                 exec_version_probe(&b, &["--version"], std::time::Duration::from_secs(15))
+            }),
+        // whisper-server has no --version flag (unknown argument,
+        // verified b5130) — its cheap liveness probe is --help, which
+        // exits 0 with usage exactly like llama's.
+        EngineKind::Whisper => manifest
+            .map(|m| PathBuf::from(m.server_path))
+            .is_some_and(|b| {
+                exec_version_probe(&b, &["--help"], std::time::Duration::from_secs(15))
             }),
     }
 }

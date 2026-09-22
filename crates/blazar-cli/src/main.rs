@@ -986,10 +986,20 @@ async fn ensure_run_model(name: &str) -> Result<String> {
 /// every REPL send.
 fn diffusion_repl_refusal(row: &blazar_core::store::ModelRow) -> Option<String> {
     row.has_component_set().then(|| {
+        // Video families (Wan) teach the videos route; everything else
+        // is an image family.
+        let route = if matches!(
+            blazar_runtime::diffusion::family_mode(&row.repo),
+            Some(blazar_runtime::diffusion::FamilyMode::Vid)
+        ) {
+            "/v1/videos/generations"
+        } else {
+            "/v1/images/generations"
+        };
         format!(
             "\"{}\" is a diffusion component set (sdcpp lane) — the chat REPL cannot drive \
-             image generation; start the daemon (blazar serve) and POST \
-             /v1/images/generations {{\"model\": \"{}\", \"prompt\": \"...\"}}",
+             generation; start the daemon (blazar serve) and POST \
+             {route} {{\"model\": \"{}\", \"prompt\": \"...\"}}",
             row.name, row.name
         )
     })
@@ -1576,8 +1586,11 @@ fn engine_offer_line(kind: blazar_core::engine_kind::EngineKind) -> String {
             "llamacpp (~0.2-0.7 GiB via engine update) — the GGUF default lane".to_string()
         }
         EngineKind::SdCpp => "sdcpp (~0.04-0.3 GiB, any GPU via Vulkan) — diffusion checkpoints: \
-             Qwen-Image-2.1/v1, FLUX.1/2-dev, Z-Image, Chroma, SDXL, SD1.5"
+             Qwen-Image-2.1/v1, FLUX.1/2-dev, Z-Image, Chroma, SDXL, SD1.5; Wan 2.1 video"
             .to_string(),
+        EngineKind::Whisper => {
+            "whisper (~10 MiB, CPU) — audio transcription + translation (ggml models)".to_string()
+        }
     }
 }
 
@@ -1590,6 +1603,7 @@ async fn install_missing_kind(
         EngineKind::Sglang => engine_install_sglang(d, None).await,
         EngineKind::MistralRs => engine_install_mistralrs(d, None).await,
         EngineKind::SdCpp => engine_install_sdcpp(d, None).await,
+        EngineKind::Whisper => engine_install_whisper(d, None).await,
         EngineKind::LlamaCpp => engine_update(d, None, false, false).await,
     }
 }
@@ -2109,6 +2123,7 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
         ("mistralrs", "inventory mistralrs"),
         ("sglang", "inventory sglang"),
         ("sdcpp", "inventory sdcpp"),
+        ("whisper", "inventory whisper"),
     ] {
         let rows: Vec<&blazar_core::store::EngineRow> =
             engines.iter().filter(|e| e.kind.as_str() == kind).collect();
@@ -2145,7 +2160,7 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
     // on top; prune runs on the next install).
     let keep = blazar_runtime::engine::KEEP_TAGS;
     let mut over: Vec<String> = Vec::new();
-    for kind in ["llamacpp", "mistralrs", "sglang", "sdcpp"] {
+    for kind in ["llamacpp", "mistralrs", "sglang", "sdcpp", "whisper"] {
         let n = engines.iter().filter(|e| e.kind.as_str() == kind).count();
         if n > keep {
             over.push(format!("{kind}: {n} > {keep}"));
@@ -2880,6 +2895,17 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
             ));
             return checks;
         }
+        Some(EngineKind::Whisper) => {
+            let active = active_tag.as_deref().unwrap_or("?");
+            checks.push(Check::ok(
+                "engine currency",
+                format!(
+                    "{active} (whisper prebuilt lane, lazy audio serving) — update with: \
+                     blazar engine update --kind whisper"
+                ),
+            ));
+            return checks;
+        }
         _ => {}
     }
     let mut currency: Option<Check> = None;
@@ -3348,11 +3374,12 @@ async fn doctor_app_currency() -> Vec<Check> {
     }
 }
 
-/// Whisper.cpp currency: installs are versioned by tag dir under
-/// `data/whisper/bin/<tag>/`; compare the newest against the latest
-/// upstream release (`WHISPER_REPO`). Optional component — not installed
-/// means no row (same policy as remotes). Warn-only; `blazar whisper
-/// --install` stays a human action.
+/// Whisper.cpp currency: engines-table row (`blazar engine install
+/// --kind whisper`) or the legacy versioned tree under
+/// `data/whisper/bin/<tag>/`; compare the resolved install against the
+/// latest upstream release (`WHISPER_REPO`). Optional component — not
+/// installed means no row (same policy as remotes). Warn-only; installs
+/// stay a human action.
 async fn doctor_whisper_currency(d: &BlazarDirs) -> Vec<Check> {
     let Some((_, tag_dir)) = blazar_runtime::whisper::server_bin(d) else {
         // Optional lane absent: say so instead of silently omitting the
@@ -3360,8 +3387,9 @@ async fn doctor_whisper_currency(d: &BlazarDirs) -> Vec<Check> {
         // live: all-green doctor while transcription had no backend).
         return vec![Check::warn(
             "whisper lane",
-            "not installed — optional: `blazar whisper --install` enables \
-             local /v1/audio/transcriptions",
+            "not installed — optional: `blazar engine install --kind whisper` \
+             (legacy: `blazar whisper --install`) enables local \
+             /v1/audio/transcriptions + /v1/audio/translations",
         )];
     };
     let installed = tag_dir
@@ -4059,6 +4087,16 @@ async fn serve() -> Result<()> {
         }
         blazar_core::engine_kind::EngineKind::SdCpp => {
             Arc::new(blazar_runtime::SdCppEngine::with_env(manifest, engine_env))
+        }
+        // Defense: a lazy audio lane can never back the supervisor (it
+        // has no model-serving surface). Installs never activate it, so
+        // reaching this arm means a hand-edited store — name recovery.
+        blazar_core::engine_kind::EngineKind::Whisper => {
+            anyhow::bail!(
+                "the active engine row is the whisper audio lane — it serves only \
+                 POST /v1/audio/transcriptions and cannot back model serving; run \
+                 `blazar engine use <tag>` on a serving engine (see `blazar engine list`)"
+            )
         }
     };
     let bus = EventBus::default();
@@ -6166,14 +6204,18 @@ async fn whisper_cmd(
                     .and_then(|p| p.parent())
                     .and_then(|p| p.file_name())
                     .map_or_else(|| "?".into(), |t| t.to_string_lossy().into_owned());
-                let pin = if blazar_runtime::whisper::pinned_tag(&d).is_some() {
+                let pin = if blazar_runtime::whisper::pinned_tag(&d).is_some()
+                    && blazar_runtime::whisper::is_legacy_bin(&d, &bin)
+                {
                     " (pinned)"
                 } else {
                     ""
                 };
                 println!("server: {tag}{pin} ({})", bin.display());
             }
-            None => println!("server: not installed (blazar whisper --install)"),
+            None => println!(
+                "server: not installed (blazar engine install --kind whisper; legacy: blazar whisper --install)"
+            ),
         }
         let installed = blazar_runtime::whisper::installed_tags(&d);
         if installed.len() > 1 {
@@ -7254,6 +7296,7 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
         EngineKind::MistralRs => "mistral.rs",
         EngineKind::Sglang => "sglang",
         EngineKind::SdCpp => "sd-server",
+        EngineKind::Whisper => "whisper-server",
     };
     out.push(format!("# engine lane: {lane} ({tag})"));
     out.push(
@@ -7321,6 +7364,11 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
             // (steps/cfg/sampler/seed per call), not config knobs —
             // no model-scoped families yet. New knobs get a line here.
             EngineKind::SdCpp => ("sdcpp", vec![]),
+            // Audio lane: whisper-server rides per-request fields
+            // (language/temperature/prompt/beam_size on the multipart
+            // call), not config knobs — same discipline as the image
+            // lane.
+            EngineKind::Whisper => ("whisper", vec![]),
         };
         out.push(format!("# [model_overrides.\"{model}\".{table}]"));
         out.extend(families.into_iter().map(knob));
@@ -7687,6 +7735,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 EngineKind::Sglang => engine_update_sglang(&d, tag, check).await?,
                 EngineKind::MistralRs => engine_update_mistralrs(&d, tag, check).await?,
                 EngineKind::SdCpp => engine_update_sdcpp(&d, tag, check).await?,
+                EngineKind::Whisper => engine_update_whisper(&d, tag, check).await?,
             }
         }
         EngineCmd::List { json } => {
@@ -7751,8 +7800,10 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             }
             // Point-of-need catalog: `engine list` is where users look
             // for "what can I install" — every lane this blazar can
-            // run but doesn't have yet gets one discoverability line,
-            // and the separate voice lane is always named.
+            // run but doesn't have yet gets one discoverability line.
+            // The whisper lane reports through the generic table when
+            // installed as an engine row; only the legacy voice tree
+            // needs its own line.
             if !seen.contains(&"llamacpp") {
                 println!(
                     "llama.cpp:  not installed — blazar engine update (prebuilt) / blazar engine build cuda (source; GGUF lane)"
@@ -7770,13 +7821,22 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             }
             if !seen.contains(&"sdcpp") {
                 println!(
-                    "sdcpp:      not installed — blazar engine install --kind sdcpp (diffusion checkpoints: Qwen-Image-2.1/v1, FLUX.1/2-dev, Z-Image, Chroma, SDXL, SD1.5; any GPU via Vulkan)"
+                    "sdcpp:      not installed — blazar engine install --kind sdcpp (diffusion checkpoints: Qwen-Image-2.1/v1, FLUX.1/2-dev, Z-Image, Chroma, SDXL, SD1.5, Wan 2.1 video; any GPU via Vulkan)"
                 );
             }
-            match blazar_runtime::whisper::installed_tags(&d).first() {
-                Some(tag) => println!("whisper:    {tag} (voice lane) — blazar whisper --list"),
-                None => {
-                    println!("whisper:    not installed (voice lane) — blazar whisper --install");
+            match (
+                seen.contains(&"whisper"),
+                blazar_runtime::whisper::installed_tags(&d).first(),
+            ) {
+                // Engine row already printed by the table above.
+                (true, _) => {}
+                (false, Some(tag)) => {
+                    println!("whisper:    {tag} (legacy voice lane) — blazar whisper --list");
+                }
+                (false, None) => {
+                    println!(
+                        "whisper:    not installed — blazar engine install --kind whisper (audio transcription/translation; legacy: blazar whisper --install)"
+                    );
                 }
             }
         }
@@ -7887,8 +7947,8 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                      --kind mistralrs  HF safetensors dirs — prebuilt mistral.rs server\n  \
                      --kind sglang     HF safetensors dirs — pip venv (Linux + CUDA/ROCm)\n  \
                      --kind sdcpp      diffusion GGUF component sets — prebuilt sd-server (Vulkan/CPU/Metal)\n  \
-                     capability lane   blazar engine offers + install --lane <id> (fork builds)\n  \
-                     voice (whisper)   blazar whisper --install (separate transcription lane)"
+                     --kind whisper    audio transcription/translation — prebuilt whisper-server (CPU)\n  \
+                     capability lane   blazar engine offers + install --lane <id> (fork builds)"
                 ));
             };
             let engine_kind: EngineKind = kind
@@ -7898,10 +7958,12 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 EngineKind::MistralRs => engine_install_mistralrs(&d, tag).await?,
                 EngineKind::Sglang => engine_install_sglang(&d, tag).await?,
                 EngineKind::SdCpp => engine_install_sdcpp(&d, tag).await?,
+                EngineKind::Whisper => engine_install_whisper(&d, tag).await?,
                 EngineKind::LlamaCpp => {
                     return Err(anyhow!(
-                        "llama.cpp engines install via `blazar engine update` / `blazar engine \
-                         build` — `engine install --kind` serves mistralrs, sglang and sdcpp"
+                        "llama.cpp engines install via `blazar engine update` / `blazar \
+                         engine build` — `engine install --kind` serves mistralrs, sglang, \
+                         sdcpp and whisper"
                     ));
                 }
             }
@@ -8090,6 +8152,93 @@ async fn engine_update_sdcpp(d: &BlazarDirs, tag: Option<String>, check: bool) -
     engine_install_sdcpp(d, Some(target)).await
 }
 
+/// `blazar engine install --kind whisper [tag]` — prebuilt
+/// whisper-server from ggerganov/whisper.cpp (b-tag releases; the v-tags
+/// are source-only). Serving is CPU-contract, so the asset pick is
+/// platform-shaped. The F7 decode-regression gate is llama-server-only:
+/// skipped, and SAID so.
+async fn engine_install_whisper(d: &BlazarDirs, tag: Option<String>) -> Result<()> {
+    let mgr = local_engine_manager(d)?;
+    let wanted = tag.clone().unwrap_or_else(|| "latest".to_string());
+    println!("installing whisper.cpp {wanted} (prebuilt upstream whisper-server)");
+    let row = mgr.update_whisper(tag.as_deref()).await?;
+    let m: blazar_runtime::Manifest = serde_json::from_str(&row.manifest)?;
+    println!(
+        "engine {} active ({} flags probed, build {})",
+        row.tag,
+        m.flags.len(),
+        m.build_number
+    );
+    println!("note: decode-regression gate is llama-server-only — skipped for whisper engines");
+    // Same one-build-per-lane contract as the other engine lanes.
+    for (tag, bytes) in mgr.prune_siblings(EngineKind::Whisper.as_str(), &row.tag)? {
+        // fs sizes fit i64
+        #[allow(clippy::cast_possible_wrap)]
+        let freed = bytes as i64;
+        println!(
+            "removed superseded engine {tag} (freed {})",
+            humansize(freed)
+        );
+    }
+    Ok(())
+}
+
+/// `blazar engine update --kind whisper [tag]` — currency lane parity:
+/// a bare call probes whisper.cpp GitHub and installs the newest `bNNNN`
+/// release when one exists; an explicit tag force-installs it. The
+/// b-counter is the ordering (see `btag_number`). `--check` resolves and
+/// reports only.
+async fn engine_update_whisper(d: &BlazarDirs, tag: Option<String>, check: bool) -> Result<()> {
+    let store = Store::open(d)?;
+    let Some(installed) = newest_whisper_tag(&store)? else {
+        return Err(anyhow!(
+            "no whisper engine installed — `blazar engine install --kind whisper` first"
+        ));
+    };
+    let pinned = tag.is_some();
+    let target = if let Some(t) = tag {
+        t
+    } else {
+        // Currency probe: live 4s-capped latest-tag resolve (same cap as
+        // the mistral.rs/sd.cpp rows).
+        let mgr = local_engine_manager(d)?;
+        let fetched = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            mgr.gh.latest_whisper_release(),
+        )
+        .await;
+        match fetched {
+            Ok(Ok(rel)) => rel.tag_name,
+            Ok(Err(e)) => anyhow::bail!(
+                "cannot check whisper.cpp releases: {e:#} — offline? set GH_TOKEN if rate limited"
+            ),
+            Err(_) => anyhow::bail!("whisper.cpp release check timed out after 4s"),
+        }
+    };
+    let newer = matches!(
+        (
+            blazar_runtime::engine::gh::btag_number(&installed),
+            blazar_runtime::engine::gh::btag_number(&target),
+        ),
+        (Some(a), Some(b)) if b > a
+    );
+    if check {
+        println!("dry-run: nothing installed, nothing written");
+        if newer {
+            println!("would update whisper.cpp {installed} -> {target}");
+            println!("  blazar engine update --kind whisper {target}");
+        } else {
+            println!("whisper.cpp {installed} stays (target: {target})");
+        }
+        return Ok(());
+    }
+    if !pinned && !newer {
+        println!("whisper.cpp {installed} is current (upstream latest: {target}).");
+        return Ok(());
+    }
+    engine_install_whisper(d, Some(target)).await
+}
+
 /// Newest installed mistral.rs tag (`vX.Y.Z`), the currency baseline for
 /// the update lane. `list_engines` is newest-first, but the explicit
 /// version compare keeps the pick honest if row order ever changes.
@@ -8110,6 +8259,17 @@ fn newest_sdcpp_tag(store: &Store) -> Result<Option<String>> {
         .into_iter()
         .filter(|e| e.kind == EngineKind::SdCpp)
         .max_by_key(|e| blazar_runtime::engine::gh::sdtag_counter(&e.tag).unwrap_or(0))
+        .map(|e| e.tag.clone()))
+}
+
+/// Newest installed whisper tag (`bNNNN`) by build counter — mirrors
+/// `newest_sdcpp_tag` for the b-tag lane (v-tags ship source only).
+fn newest_whisper_tag(store: &Store) -> Result<Option<String>> {
+    Ok(store
+        .list_engines()?
+        .into_iter()
+        .filter(|e| e.kind == EngineKind::Whisper)
+        .max_by_key(|e| blazar_runtime::engine::gh::btag_number(&e.tag).unwrap_or(0))
         .map(|e| e.tag.clone()))
 }
 
@@ -8906,13 +9066,22 @@ async fn engine_install_lane(d: &BlazarDirs, lane_id: &str, backend: Option<&str
 
 /// Best-effort upstream check (user-invoked only, ~4s budget, silent on
 /// failure): prints an update hint when a newer b-tag exists.
+/// The engine-list/install currency hint reads the llama.cpp b-release
+/// channel, so it only speaks for a llamacpp active row. Foreign lanes
+/// (whisper, sdcpp, mistral.rs, sglang) carry their own per-lane update
+/// paths; comparing their tags against llama.cpp build numbers produces
+/// nonsense verdicts (whisper b5130 vs llama b11102).
+fn llama_channel_hint_applies(tag: &str, kind: blazar_core::engine_kind::EngineKind) -> bool {
+    tag != "local" && kind == blazar_core::engine_kind::EngineKind::LlamaCpp
+}
+
 async fn upstream_update_hint(dirs: &BlazarDirs) {
     let Ok(store) = Store::open(dirs) else { return };
     let Ok(Some(active)) = store.active_engine() else {
         return;
     };
-    if active.tag == "local" {
-        return; // local build: upstream currency is the user's concern
+    if !llama_channel_hint_applies(&active.tag, active.kind) {
+        return; // local build or a foreign lane: the llama.cpp channel speaks for neither
     }
     let Ok(cfg) = Config::load(dirs) else { return };
     let token = std::env::var("GH_TOKEN").ok();
@@ -8973,13 +9142,14 @@ fn spawn_engine_check_task(
                 delay = full_delay;
                 continue; // local build: currency is the user's concern
             }
-            if matches!(active.kind, EngineKind::MistralRs | EngineKind::Sglang) {
+            if !llama_channel_hint_applies(&active.tag, active.kind) {
                 delay = full_delay;
                 continue; // the llamacpp channel survey is meaningless
-                          // against non-llamacpp tags (it would nag
+                          // against non-llamacpp lanes (it would nag
                           // "update available: bNNNN" cross-kind);
-                          // mistral.rs currency lives in `blazar doctor`,
-                          // sglang is a pinned pip lane
+                          // each lane carries its own update path
+                          // (mistral.rs/sdcpp/whisper: `engine update
+                          // --kind`, sglang: pinned pip lane)
             }
             let Ok(cfg) = Config::load(&dirs) else {
                 delay = retry_delay;
@@ -10119,6 +10289,17 @@ mod tests {
         assert!(refusal.contains("qwen-image-2.1"), "{refusal}");
         assert!(refusal.contains("/v1/images/generations"), "{refusal}");
         assert!(refusal.contains("blazar serve"), "{refusal}");
+        // Video families name the videos route instead.
+        let mut wan = base();
+        wan.repo = "Comfy-Org/Wan_2.1_ComfyUI_repackaged".into();
+        wan.components = vec![
+            blazar_core::store::ComponentFile::new("--vae", "/models/wan_2.1_vae.safetensors"),
+            blazar_core::store::ComponentFile::new("--t5xxl", "/models/umt5.gguf"),
+        ];
+        let refusal =
+            diffusion_repl_refusal(&wan).expect("video component set must refuse the chat REPL");
+        assert!(refusal.contains("/v1/videos/generations"), "{refusal}");
+        assert!(!refusal.contains("/v1/images/generations"), "{refusal}");
     }
 
     #[test]
@@ -12267,6 +12448,19 @@ mod tests {
             true
         )
         .is_empty());
+    }
+
+    #[test]
+    fn unit__llama_channel_hint_applies__foreign_lanes_never_hint_llama_channel() {
+        use blazar_core::engine_kind::EngineKind as K;
+        // Local builds and foreign-lane actives are outside the channel's
+        // authority; only a llamacpp row may be compared against it.
+        assert!(!llama_channel_hint_applies("local", K::LlamaCpp));
+        assert!(llama_channel_hint_applies("b11070-cuda", K::LlamaCpp));
+        assert!(!llama_channel_hint_applies("b5130", K::Whisper));
+        assert!(!llama_channel_hint_applies("master-890-74988b2", K::SdCpp));
+        assert!(!llama_channel_hint_applies("v0.9.3", K::MistralRs));
+        assert!(!llama_channel_hint_applies("sglang-0.5.19", K::Sglang));
     }
 
     #[test]

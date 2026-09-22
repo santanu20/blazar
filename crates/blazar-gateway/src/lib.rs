@@ -279,12 +279,19 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v1/audio/transcriptions",
             post(whisper::audio_transcriptions),
         )
+        .route("/v1/audio/translations", post(whisper::audio_translations))
         .route("/v1/audio/speech", post(tts::audio_speech))
         .route("/v1/images/generations", post(images::generations))
         .route("/v1/images/edits", post(images::edits))
         .route("/v1/images/jobs/{id}", get(images::jobs_get))
         .route("/v1/images/jobs/{id}/cancel", post(images::jobs_cancel))
         .route("/v1/images/capabilities", get(images::capabilities))
+        .route("/v1/videos/generations", post(images::video_generations))
+        // Jobs and capabilities are surface-agnostic upstream (one
+        // queue, `kind` distinguishes) — same handlers on both mounts.
+        .route("/v1/videos/jobs/{id}", get(images::jobs_get))
+        .route("/v1/videos/jobs/{id}/cancel", post(images::jobs_cancel))
+        .route("/v1/videos/capabilities", get(images::capabilities))
         .route("/audio/transcriptions", post(whisper::audio_transcriptions))
         .route("/infill", post(openai::openai_proxy))
         .route("/v1/chat/completions/control", post(openai::openai_proxy))
@@ -764,7 +771,8 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
                        "/v1/adapters", "/v1/batches", "/v1/batches/{id}",
                        "/v1/batches/{id}/cancel", "/v1/files", "/v1/files/{id}",
                        "/v1/files/{id}/content", "/v1/streams/lookup",
-                       "/v1/audio/transcriptions", "/infill", "/tokenize", "/detokenize",
+                       "/v1/audio/transcriptions", "/v1/audio/translations",
+                       "/infill", "/tokenize", "/detokenize",
                        "/apply-template", "/slots", "/slots/{id}", "/responses",
                        "/responses/input_tokens"],
             "ollama": ["/api/chat", "/api/generate", "/api/tags", "/api/ps", "/api/show",

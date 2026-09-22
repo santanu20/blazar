@@ -174,7 +174,7 @@ Blazar currently orchestrates four engine families:
 | **llama.cpp** | GGUF; default mainstream lane for quantized GGUF serving |
 | **mistral.rs** | GGUF and safetensors paths supported by the runtime |
 | **SGLang** | Safetensors; especially AWQ / GPTQ / FP8 on supported accelerators |
-| **sd.cpp** | Diffusion checkpoints via a prebuilt `sd-server` (CUDA on NVIDIA when upstream ships it, Vulkan on every GPU, CPU/Metal otherwise). Eight curated families — Qwen-Image-2.1, Qwen-Image (v1), FLUX.1, Z-Image, Chroma, FLUX.2-dev (component sets with flag-keyed VAE/text-encoder pulls) and SDXL, SD 1.5 (single self-contained checkpoints) — plus async jobs, SSE progress, native-dialect translation and huggingface hub-cache reuse |
+| **sd.cpp** | Diffusion + video checkpoints via a prebuilt `sd-server` (CUDA on NVIDIA when upstream ships it, Vulkan on every GPU, CPU/Metal otherwise). Nine curated families — Qwen-Image-2.1, Qwen-Image (v1), FLUX.1, Z-Image, Chroma, FLUX.2-dev (component sets with flag-keyed VAE/text-encoder pulls), SDXL, SD 1.5 (single self-contained checkpoints) and Wan 2.1 T2V (video: DiT + `--vae` + `--t5xxl`) — plus async jobs, SSE progress, native-dialect translation and huggingface hub-cache reuse |
 
 Routing is capability-driven rather than a blind global switch.
 
@@ -183,7 +183,7 @@ Typical policy:
 - **GGUF** → llama.cpp, with mistral.rs available as an alternate lane.
 - **Quantized safetensors (AWQ/GPTQ/FP8)** → SGLang.
 - **Plain safetensors** → SGLang or mistral.rs according to routing policy.
-- **Diffusion component sets** → sd.cpp (`blazar engine install --kind sdcpp`); the domain gate is bidirectional — text engines never receive component rows and sd.cpp never receives text models. Pulling a known diffusion family (`Qwen-Image-2.1-GGUF`, FLUX.1 GGUF repos) fetches the full flag-keyed component set (e.g. `--vae` + `--t5xxl` + `--clip_l` for FLUX.1) as one model, re-using byte-exact files already on disk; generation rides `POST /v1/images/generations` (and `/v1/images/edits` when the family ships a vision encoder), with opt-in `"async": true`/`"stream": true` job modes (`GET /v1/images/jobs/{id}`, `POST /v1/images/jobs/{id}/cancel`, `GET /v1/images/capabilities`) and rich native fields (cache engines, LoRA, guidance) shallow-translated automatically. Component pulls reuse byte-exact files from the local huggingface hub cache (hardlinked, `rm`-safe).
+- **Diffusion component sets** → sd.cpp (`blazar engine install --kind sdcpp`); the domain gate is bidirectional — text engines never receive component rows and sd.cpp never receives text models. Pulling a known diffusion family (`Qwen-Image-2.1-GGUF`, FLUX.1 GGUF repos) fetches the full flag-keyed component set (e.g. `--vae` + `--t5xxl` + `--clip_l` for FLUX.1) as one model, re-using byte-exact files already on disk; generation rides `POST /v1/images/generations` (and `/v1/images/edits` when the family ships a vision encoder), with opt-in `"async": true`/`"stream": true` job modes (`GET /v1/images/jobs/{id}`, `POST /v1/images/jobs/{id}/cancel`, `GET /v1/images/capabilities`) and rich native fields (cache engines, LoRA, guidance) shallow-translated automatically. Component pulls reuse byte-exact files from the local huggingface hub cache (hardlinked, `rm`-safe). Video families (Wan 2.1 T2V) serve `POST /v1/videos/generations` with the same job modes at `/v1/videos/jobs/*` — the gateway refuses a video family on the images route and vice versa.
 - `engine_routing.mode = "manual"` pins a single active engine when you explicitly want that behavior.
 - A per-model engine override wins over automatic routing.
 - The ENGINE column in `blazar list` is the routing lane, not a capability guarantee; a `†` cell (plus a footer line, or the `engine_arch_gap` field in `--json`) marks a GGUF architecture the routed llama.cpp build provably cannot load — spawn fails with teaching unless a covering fork lane is installed.
@@ -215,9 +215,11 @@ Common surfaces include:
 /v1/batches
 /v1/files
 /v1/audio/transcriptions
+/v1/audio/translations
 /v1/audio/speech
 /v1/images/generations
 /v1/images/edits
+/v1/videos/generations
 ```
 
 ### Ollama-compatible

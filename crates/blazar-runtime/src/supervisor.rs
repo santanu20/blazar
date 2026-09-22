@@ -2172,6 +2172,16 @@ impl Supervisor {
         // routed spawn behaves exactly like a daemon booted on that
         // row.
         let adapter_for = |row: &blazar_core::store::EngineRow| -> Option<Arc<dyn Engine>> {
+            // The audio lane is gateway-owned and lazy: it never enters
+            // the supervised model-serving roster. A whisper row reaching
+            // here means routing surfaced it — log the surface bug
+            // loudly and treat the row as non-serving.
+            if row.kind == EngineKind::Whisper {
+                tracing::error!(
+                    "whisper engine row reached the supervised-adapter path — the audio lane serves lazily through /v1/audio/transcriptions; treating it as non-serving"
+                );
+                return None;
+            }
             let mut manifest: crate::engine::manifest::Manifest =
                 serde_json::from_str(&row.manifest).ok()?;
             manifest.re_root_server_path(&self.dirs.engines_dir());
@@ -2198,6 +2208,8 @@ impl Supervisor {
                 EngineKind::SdCpp => {
                     Arc::new(crate::engine_impl::SdCppEngine::with_env(manifest, env))
                 }
+                // Unreachable: the whisper guard above returns early.
+                EngineKind::Whisper => return None,
             })
         };
         let roster = || {

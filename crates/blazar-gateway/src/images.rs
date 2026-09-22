@@ -72,7 +72,7 @@ fn is_plain_generation_request(v: &serde_json::Value) -> bool {
 /// control keys drop; every other key — including whole subtrees like
 /// `guidance`, `cache`, `lora`, `vae_tiling_params` — rides verbatim,
 /// so upstream-additive fields need no translator change.
-fn translate_to_native(v: &serde_json::Value) -> serde_json::Value {
+fn translate_to_native(v: &serde_json::Value, video: bool) -> serde_json::Value {
     let mut out = serde_json::Map::new();
     let Some(obj) = v.as_object() else {
         return v.clone();
@@ -80,7 +80,9 @@ fn translate_to_native(v: &serde_json::Value) -> serde_json::Value {
     for (k, val) in obj {
         match k.as_str() {
             "model" | "user" | "async" | "stream" => {}
-            "n" => {
+            // `img_gen` batches through `batch_count`; the `vid_gen`
+            // shape has no such field, so the key rides untouched.
+            "n" if !video => {
                 out.insert("batch_count".into(), val.clone());
             }
             "steps" => {
@@ -139,6 +141,26 @@ pub(crate) enum ImagesGate {
     Reject(String),
 }
 
+/// Which diffusion surface a request arrived on. The family table
+/// decides the match before any child exists: image families teach the
+/// videos route and vice versa, so a caller never boots a model that
+/// would 404 one hop later.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Surface {
+    ImgGen,
+    ImgEdits,
+    VidGen,
+}
+
+/// Family mode of a stored row: `false` when the repo is not a curated
+/// video family (image family or unknown — both serve image surfaces).
+fn row_is_video(row: &blazar_core::store::ModelRow) -> bool {
+    matches!(
+        blazar_runtime::diffusion::family_mode(&row.repo),
+        Some(blazar_runtime::diffusion::FamilyMode::Vid)
+    )
+}
+
 /// Teaching text for a diffusion component set hit through a text or
 /// embedding surface (chat/completions, generate, embeddings, messages,
 /// rerank...). Mirror of the `images_gate` rejection above: one gate per
@@ -155,18 +177,43 @@ pub(crate) fn diffusion_text_refusal(name: &str) -> String {
 /// here would boot a text engine that 404s the forward one hop later.
 /// Edits additionally need the vision-encoder companion (`--llm_vision`
 /// rides the spawn argv only when the row carries it).
-pub(crate) fn images_gate(row: Option<&blazar_core::store::ModelRow>, edits: bool) -> ImagesGate {
+pub(crate) fn images_gate(
+    row: Option<&blazar_core::store::ModelRow>,
+    surface: Surface,
+) -> ImagesGate {
     let Some(row) = row else {
         return ImagesGate::Serve;
     };
     if !row.has_component_set() {
         return ImagesGate::Reject(format!(
-            "\"{}\" is not a diffusion model — /v1/images serves diffusion component sets \
-             (DiT + VAE + text encoder, sdcpp lane); chat models serve /v1/chat/completions",
+            "\"{}\" is not a diffusion model — /v1/images and /v1/videos serve diffusion \
+             component sets (DiT + VAE + text encoder, sdcpp lane); chat models serve \
+             /v1/chat/completions",
             row.name
         ));
     }
-    if edits && !row.serves_image_edits() {
+    match surface {
+        Surface::VidGen => {
+            if !row_is_video(row) {
+                return ImagesGate::Reject(format!(
+                    "\"{}\" is an image diffusion family — video generation serves \
+                     /v1/videos/generations on video families (Wan)",
+                    row.name
+                ));
+            }
+        }
+        Surface::ImgGen => {
+            if row_is_video(row) {
+                return ImagesGate::Reject(format!(
+                    "\"{}\" is a video diffusion family — image generation serves \
+                     /v1/images/generations; video serves POST /v1/videos/generations",
+                    row.name
+                ));
+            }
+        }
+        Surface::ImgEdits => {}
+    }
+    if surface == Surface::ImgEdits && !row.serves_image_edits() {
         // Family-aware refusal: a vision-less family (FLUX) would loop
         // forever on re-pull teaching — its set is already complete.
         if blazar_runtime::diffusion::family_supports_edits(&row.repo) == Some(false) {
@@ -275,7 +322,7 @@ pub async fn generations(
     let row = state
         .with_store(|s| resolve_model(s, &model).ok())
         .flatten();
-    match images_gate(row.as_ref(), false) {
+    match images_gate(row.as_ref(), Surface::ImgGen) {
         ImagesGate::Serve => {}
         ImagesGate::Reject(msg) => return openai_error(400, &msg),
     }
@@ -306,7 +353,18 @@ pub async fn generations(
             )
             .await
         }
-        mode => deliver_native(state, engine, &parsed, mode, load_ms).await,
+        mode => {
+            deliver_native(
+                state,
+                engine,
+                &parsed,
+                mode,
+                "/sdcpp/v1/img_gen",
+                false,
+                load_ms,
+            )
+            .await
+        }
     }
 }
 
@@ -318,9 +376,18 @@ async fn deliver_native(
     engine: blazar_runtime::EngineRef,
     parsed: &serde_json::Value,
     mode: DeliveryMode,
+    native_path: &str,
+    video: bool,
     load_ms: u128,
 ) -> Response {
-    let submitted = match submit_native_job(&state, &engine, &translate_to_native(parsed)).await {
+    let submitted = match submit_native_job(
+        &state,
+        &engine,
+        native_path,
+        &translate_to_native(parsed, video),
+    )
+    .await
+    {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
@@ -362,6 +429,72 @@ async fn deliver_native(
     }
 }
 
+/// POST /v1/videos/generations — text-to-video on a video family
+/// (Wan). Same contract as image generations with two differences:
+/// the gate demands a curated video family, and there is no compat
+/// forward — sd-server's OpenAI-compat route serves images only, so
+/// every request rides the native `vid_gen` dialect.
+pub async fn video_generations(
+    State(state): State<Arc<AppState>>,
+    key_ext: Option<axum::Extension<crate::keys::KeyCtx>>,
+    body: Bytes,
+) -> Response {
+    let Some(model) = crate::audit::extract_model(&body) else {
+        return openai_error(400, "\"model\" is required (video diffusion model name)");
+    };
+    if let Err(resp) = admit_or_respond(&state, key_ext.as_ref(), &model) {
+        return *resp;
+    }
+    let parsed: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return openai_error(400, &format!("invalid JSON: {e}")),
+    };
+    if parsed
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return openai_error(400, "\"prompt\" must be a non-empty string");
+    }
+    let row = state
+        .with_store(|s| resolve_model(s, &model).ok())
+        .flatten();
+    match images_gate(row.as_ref(), Surface::VidGen) {
+        ImagesGate::Serve => {}
+        ImagesGate::Reject(msg) => return openai_error(400, &msg),
+    }
+    let (engine, load_ms) = match ensure_with_admission(
+        &state,
+        &model,
+        Priority::Normal,
+        WorkClass::Interactive,
+        None,
+        false,
+        true, // videos lane: component sets are its cargo
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(resp) => return *resp,
+    };
+    let mode = match delivery_mode(&parsed) {
+        // No compat route exists for video — plain requests also ride
+        // the native dialect and come back mapped OpenAI-style.
+        DeliveryMode::SyncPlain | DeliveryMode::SyncNative => DeliveryMode::SyncNative,
+        mode => mode,
+    };
+    deliver_native(
+        state,
+        engine,
+        &parsed,
+        mode,
+        "/sdcpp/v1/vid_gen",
+        true,
+        load_ms,
+    )
+    .await
+}
+
 /// POST /v1/images/edits — image-to-image; multipart body forwarded
 /// byte-for-byte (the boundary is the child's contract, never rebuilt).
 pub async fn edits(
@@ -389,7 +522,7 @@ pub async fn edits(
     let row = state
         .with_store(|s| resolve_model(s, &model).ok())
         .flatten();
-    match images_gate(row.as_ref(), true) {
+    match images_gate(row.as_ref(), Surface::ImgEdits) {
         ImagesGate::Serve => {}
         ImagesGate::Reject(msg) => return openai_error(400, &msg),
     }
@@ -438,9 +571,10 @@ fn live_sdcpp_children(state: &AppState, model: Option<&str>) -> Vec<blazar_runt
 async fn submit_native_job(
     state: &AppState,
     engine: &blazar_runtime::EngineRef,
+    native_path: &str,
     native: &serde_json::Value,
 ) -> Result<serde_json::Value, Box<Response>> {
-    let url = format!("{}/sdcpp/v1/img_gen", child_base(&engine.endpoint));
+    let url = format!("{}{native_path}", child_base(&engine.endpoint));
     let rb = state.http.post(&url).json(native);
     let resp = match child_auth(rb, engine).send().await {
         Ok(r) => r,
@@ -845,7 +979,7 @@ mod tests {
 
     #[test]
     fn unit__images_gate__text_model_teaches_chat_route() {
-        let gate = images_gate(Some(&row(None, None)), false);
+        let gate = images_gate(Some(&row(None, None)), Surface::ImgGen);
         let ImagesGate::Reject(msg) = gate else {
             panic!("text model must be rejected");
         };
@@ -863,16 +997,63 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
+    fn unit__images_gate__video_surface_partition_teaches_both_directions() {
+        let mut wan = row(Some("wan_2.1_vae.safetensors"), None);
+        wan.repo = "Comfy-Org/Wan_2.1_ComfyUI_repackaged".into();
+        wan.components.push(blazar_core::store::ComponentFile::new(
+            "--t5xxl",
+            "/models/umt5-xxl-encoder-Q4_K_M.gguf",
+        ));
+        // Wan on the image surface teaches the videos route.
+        let ImagesGate::Reject(msg) = images_gate(Some(&wan), Surface::ImgGen) else {
+            panic!("video family on the image surface must be rejected");
+        };
+        assert!(msg.contains("/v1/videos/generations"), "{msg}");
+        // Wan serves the video surface.
+        assert!(matches!(
+            images_gate(Some(&wan), Surface::VidGen),
+            ImagesGate::Serve
+        ));
+        // An image family on the video surface is refused with the
+        // image route named.
+        let qwen = row(Some("vae.safetensors"), None);
+        let ImagesGate::Reject(msg) = images_gate(Some(&qwen), Surface::VidGen) else {
+            panic!("image family on the video surface must be rejected");
+        };
+        assert!(msg.contains("image diffusion family"), "{msg}");
+        assert!(msg.contains("/v1/videos/generations"), "{msg}");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__translate_to_native__video_keeps_n_verbatim() {
+        let req = serde_json::json!({"model": "wan", "prompt": "p", "n": 2, "steps": 4});
+        let native = translate_to_native(&req, true);
+        assert_eq!(native["n"], serde_json::json!(2));
+        assert!(native.get("batch_count").is_none());
+        assert_eq!(
+            native["sample_params"]["sample_steps"],
+            serde_json::json!(4)
+        );
+        // Image dialect still batches.
+        let img = translate_to_native(&req, false);
+        assert_eq!(img["batch_count"], serde_json::json!(2));
+        assert!(img.get("n").is_none());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
     fn unit__images_gate__diffusion_row_serves_generations() {
         assert!(matches!(
-            images_gate(Some(&row(Some("vae.safetensors"), None)), false),
+            images_gate(Some(&row(Some("vae.safetensors"), None)), Surface::ImgGen),
             ImagesGate::Serve
         ));
     }
 
     #[test]
     fn unit__images_gate__edits_without_vision_encoder_teaches_repull() {
-        let gate = images_gate(Some(&row(Some("vae.safetensors"), None)), true);
+        let gate = images_gate(Some(&row(Some("vae.safetensors"), None)), Surface::ImgEdits);
         let ImagesGate::Reject(msg) = gate else {
             panic!("edits without the vision encoder must be rejected");
         };
@@ -884,7 +1065,7 @@ mod tests {
     fn unit__images_gate__visionless_family_edits_refuse_without_repull_loop() {
         // FLUX has no vision encoder to re-pull: the teaching must say
         // edits are unsupported, not send the user in a re-pull circle.
-        let gate = images_gate(Some(&flux_row()), true);
+        let gate = images_gate(Some(&flux_row()), Surface::ImgEdits);
         let ImagesGate::Reject(msg) = gate else {
             panic!("edits on a vision-less family must be rejected");
         };
@@ -895,7 +1076,7 @@ mod tests {
         );
         // Generations still serve for the same row.
         assert!(matches!(
-            images_gate(Some(&flux_row()), false),
+            images_gate(Some(&flux_row()), Surface::ImgGen),
             ImagesGate::Serve
         ));
     }
@@ -905,7 +1086,7 @@ mod tests {
         assert!(matches!(
             images_gate(
                 Some(&row(Some("vae.safetensors"), Some("mmproj.gguf"))),
-                true
+                Surface::ImgEdits
             ),
             ImagesGate::Serve
         ));
@@ -914,7 +1095,10 @@ mod tests {
     #[test]
     fn unit__images_gate__unknown_row_defers_to_ensure() {
         // Unknown model is not the gate's call — ensure owns the 404.
-        assert!(matches!(images_gate(None, true), ImagesGate::Serve));
+        assert!(matches!(
+            images_gate(None, Surface::ImgEdits),
+            ImagesGate::Serve
+        ));
     }
 
     #[test]
@@ -957,7 +1141,7 @@ mod tests {
             "guidance": guidance.clone(),
             "cache": cache.clone(),
         });
-        let native = translate_to_native(&req);
+        let native = translate_to_native(&req, false);
         assert_eq!(native["batch_count"], serde_json::json!(2));
         assert_eq!(native["width"], serde_json::json!(512));
         assert_eq!(native["height"], serde_json::json!(768));
@@ -983,7 +1167,7 @@ mod tests {
             "steps": 8,
             "sample_params": {"sample_method": "euler"}
         });
-        let native = translate_to_native(&req);
+        let native = translate_to_native(&req, false);
         assert_eq!(
             native["sample_params"]["sample_method"],
             serde_json::json!("euler")
@@ -997,7 +1181,7 @@ mod tests {
     #[test]
     fn unit__translate_to_native__unparseable_size_passes_through() {
         let req = serde_json::json!({ "model": "m", "prompt": "p", "size": "big" });
-        let native = translate_to_native(&req);
+        let native = translate_to_native(&req, false);
         assert_eq!(native["size"], serde_json::json!("big"));
         assert!(native.get("width").is_none());
     }

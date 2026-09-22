@@ -1,4 +1,5 @@
-//! `/v1/audio/transcriptions`: local whisper.cpp lane (H8).
+//! `/v1/audio/transcriptions` + `/v1/audio/translations`: local
+//! whisper.cpp lane (H8).
 //!
 //! Decision order:
 //! (1) explicit remote intent (`name:model`) always forwards — the user
@@ -9,6 +10,12 @@
 //!
 //! Multipart is parsed binary-safe: parts split ONLY on the exact random
 //! boundary — audio bytes cannot forge one.
+//!
+//! The local lane REBUILDS the multipart from a verified field
+//! whitelist (upstream has no OpenAI-compatible audio route — `/inference`
+//! is the whole surface), so transcription/translation ride the same
+//! lazy child. `/v1/audio/translations` forces `translate=true` on the
+//! rebuilt request; upstream reports `"task": "translate"` back.
 
 use std::sync::Arc;
 
@@ -143,9 +150,64 @@ fn field(parts: &[Part], key: &str) -> Option<String> {
         .map(|p| String::from_utf8_lossy(&p.data).into_owned())
 }
 
+/// whisper-server `/inference` fields we forward, live-verified on
+/// master b5130 (probe + binary strings). Everything else a client
+/// sends (OpenAI-only concepts like `timestamp_granularities` included)
+/// is dropped rather than relayed into an upstream 400.
+const FORWARDED_FIELDS: &[&str] = &[
+    "response_format",
+    "language",
+    "temperature",
+    "prompt",
+    "beam_size",
+    "no_timestamps",
+    "temperature_inc",
+    "best_of",
+    "offset_t",
+    "offset_n",
+    "duration",
+    "max_context",
+    "max_len",
+    "split_on_word",
+    "word_thold",
+    "entropy_thold",
+    "logprob_thold",
+    "no_fallback",
+    "carry_initial_prompt",
+    "detect_language",
+    "audio_ctx",
+    // `translate` is handled by the caller: the transcriptions route
+    // relays it as sent; the translations route owns it (always true).
+];
+
+/// Rebuilt `/inference` form fields (pure): whitelisted client fields
+/// verbatim, `translate` per the route (`force_translate` overrides any
+/// client value — a translations request always translates), and the
+/// `response_format=json` default that keeps non-verbose clients on the
+/// machine-readable shape (observed live: no default upstream).
+fn forwarded_fields(parts: &[Part], force_translate: bool) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for key in FORWARDED_FIELDS {
+        if let Some(v) = field(parts, key) {
+            out.push(((*key).to_string(), v));
+        }
+    }
+    let translate = if force_translate {
+        "true".to_string()
+    } else {
+        field(parts, "translate").unwrap_or_else(|| "false".to_string())
+    };
+    out.push(("translate".to_string(), translate));
+    if field(parts, "response_format").is_none() {
+        out.push(("response_format".to_string(), "json".to_string()));
+    }
+    out
+}
+
 /// Local lane body: ensure the lazy child (hot model swap on size
 /// change), forward the multipart fields whisper-server understands,
-/// pass the upstream status/body through verbatim.
+/// pass the upstream status/body through verbatim. `force_translate`
+/// marks the caller as the translations route.
 async fn forward_local(
     state: &Arc<AppState>,
     parts: &[Part],
@@ -153,6 +215,7 @@ async fn forward_local(
     size: &str,
     bin: &std::path::Path,
     lib_dir: &std::path::Path,
+    force_translate: bool,
 ) -> Response {
     let Some(model_path) = whisper::model_file(&state.dirs, size) else {
         return openai_error(500, &format!("whisper model ggml-{size}.bin vanished"));
@@ -182,13 +245,8 @@ async fn forward_local(
             .mime_str(&mime)
             .unwrap_or_else(|_| reqwest::multipart::Part::bytes(file.data.clone())),
     );
-    for key in ["response_format", "language", "temperature", "prompt"] {
-        if let Some(v) = field(parts, key) {
-            form = form.text(key, v);
-        }
-    }
-    if field(parts, "response_format").is_none() {
-        form = form.text("response_format", "json");
+    for (key, v) in forwarded_fields(parts, force_translate) {
+        form = form.text(key, v);
     }
     let url = format!("http://127.0.0.1:{port}/inference");
     let resp = match state.http.post(&url).multipart(form).send().await {
@@ -274,7 +332,82 @@ pub async fn audio_transcriptions(
         .as_ref()
         .and_then(|_| whisper::resolve_model(requested, &available));
     if let (Some((bin, lib_dir)), Some(size)) = (&server, size) {
-        return forward_local(&state, &parts, file, &size, bin, lib_dir).await;
+        return forward_local(&state, &parts, file, &size, bin, lib_dir, false).await;
+    }
+
+    // (3) Teaching error: no local lane and no remote intent.
+    openai_error(
+        501,
+        &teaching_detail(
+            server.is_some(),
+            requested.unwrap_or("whisper-1"),
+            &available,
+        ),
+    )
+}
+
+/// `/v1/audio/translations`: same decision order as transcriptions,
+/// same lazy child — the only difference is `translate=true` forced on
+/// the rebuilt `/inference` request (upstream has no separate route).
+pub async fn audio_translations(
+    State(state): State<Arc<AppState>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
+    uri: Uri,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let Some(parts) = parse_multipart(&body, content_type) else {
+        return openai_error(400, "malformed multipart body (no parseable boundary)");
+    };
+    let Some(file) = parts
+        .iter()
+        .find(|p| p.name == "file" && p.filename.is_some())
+    else {
+        return openai_error(400, "missing file part in multipart body");
+    };
+    let model = field(&parts, "model");
+
+    // (1) Explicit remote intent wins (F11 admission, same as
+    // transcriptions — request counts are the charge unit here).
+    if let Some(model) = model.as_deref() {
+        if split_remote(model, &state.config).is_some() {
+            if let Some(Extension(k)) = &key_ext {
+                if let Some(entry) = state.keys.entry(&k.name) {
+                    if let Err(rej) = state.keys.check(&entry, model) {
+                        return rej.to_response();
+                    }
+                    state.keys.charge_request(&k.name);
+                }
+            }
+            return crate::remotes::forward_with_health(
+                &state,
+                model,
+                &method,
+                uri.path_and_query().map_or(
+                    "/v1/audio/translations",
+                    axum::http::uri::PathAndQuery::as_str,
+                ),
+                &headers,
+                body,
+            )
+            .await;
+        }
+    }
+
+    // (2) Local lane, forced translation.
+    let available = whisper::list_models(&state.dirs);
+    let requested = model.as_deref().or(Some("whisper-1"));
+    let server = whisper::server_bin(&state.dirs);
+    let size = server
+        .as_ref()
+        .and_then(|_| whisper::resolve_model(requested, &available));
+    if let (Some((bin, lib_dir)), Some(size)) = (&server, size) {
+        return forward_local(&state, &parts, file, &size, bin, lib_dir, true).await;
     }
 
     // (3) Teaching error: no local lane and no remote intent.
@@ -306,7 +439,8 @@ fn teaching_detail(has_server: bool, requested: &str, available: &[String]) -> S
     } else {
         format!(
             "no transcription backend: whisper server not installed \
-             (`blazar whisper --install`) and the request does not name a \
+             (`blazar engine install --kind whisper`; legacy: \
+             `blazar whisper --install`) and the request does not name a \
              remote (`whisper:<model>` with a [[remotes]] entry). \
              Available local models: {avail}."
         )
@@ -418,5 +552,104 @@ mod tests {
         let d = teaching_detail(true, "large-v3", &avail);
         assert!(d.contains("\"large-v3\""), "got: {d}");
         assert!(d.contains("base, small"), "got: {d}");
+    }
+
+    /// Form body where `fields` are plain value parts (no filename —
+    /// what `field()` matches) plus one file part.
+    fn mixed_body(
+        boundary: &str,
+        fields: &[(&str, &[u8])],
+        file: (&str, &[u8]),
+    ) -> (Vec<u8>, String) {
+        let mut b = Vec::new();
+        for (name, data) in fields {
+            b.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            b.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+            );
+            b.extend_from_slice(data);
+            b.extend_from_slice(b"\r\n");
+        }
+        b.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        b.extend_from_slice(
+            format!(
+                "Content-Disposition: form-data; name=\"file\"; \
+                 filename=\"{}\"\r\n\r\n",
+                file.0
+            )
+            .as_bytes(),
+        );
+        b.extend_from_slice(file.1);
+        b.extend_from_slice(b"\r\n");
+        b.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        let ct = format!("multipart/form-data; boundary={boundary}");
+        (b, ct)
+    }
+
+    #[test]
+    fn unit__forwarded_fields__whitelist_forwards_verified_and_drops_unknowns() {
+        // Verified fields ride the rebuilt form; OpenAI-only concepts and
+        // the model knob (resolved earlier, upstream has no such field)
+        // are dropped; response_format defaults to json; translate
+        // defaults to false on the transcriptions route.
+        let (b, ct) = mixed_body(
+            "XbOuNdArY",
+            &[
+                ("model", b"whisper-1"),
+                ("language", b"en"),
+                ("beam_size", b"2"),
+                ("timestamp_granularities[]", b"word"),
+            ],
+            ("audio.wav", b"RIFF"),
+        );
+        let parts = parse_multipart(&b, &ct).expect("parses");
+        let fields = forwarded_fields(&parts, false);
+        let get = |k: &str| fields.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("language"), Some("en"));
+        assert_eq!(get("beam_size"), Some("2"));
+        assert_eq!(get("response_format"), Some("json"), "default injected");
+        assert_eq!(get("translate"), Some("false"), "default injected");
+        assert!(
+            fields
+                .iter()
+                .all(|(n, _)| n != "timestamp_granularities[]" && n != "model"),
+            "unknowns dropped: {fields:?}"
+        );
+    }
+
+    #[test]
+    fn unit__forwarded_fields__force_translate_overrides_client_value() {
+        // The translations route OWNS translate — even an explicit
+        // client "false" must not disable it, and a client "true" must
+        // not duplicate the part.
+        let (b, ct) = mixed_body("XbOuNdArY", &[("translate", b"false")], ("a.wav", b"RIFF"));
+        let parts = parse_multipart(&b, &ct).expect("parses");
+        let fields = forwarded_fields(&parts, true);
+        let translates: Vec<&str> = fields
+            .iter()
+            .filter(|(n, _)| n == "translate")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(translates, vec!["true"], "forced + no duplicate");
+    }
+
+    #[test]
+    fn unit__forwarded_fields__explicit_response_format_wins_over_default() {
+        let (b, ct) = mixed_body(
+            "XbOuNdArY",
+            &[("response_format", b"verbose_json")],
+            ("a.wav", b"RIFF"),
+        );
+        let parts = parse_multipart(&b, &ct).expect("parses");
+        let fields = forwarded_fields(&parts, false);
+        let n = fields
+            .iter()
+            .filter(|(name, _)| name == "response_format")
+            .count();
+        assert_eq!(n, 1, "exactly one response_format: {fields:?}");
+        assert!(
+            fields.contains(&("response_format".to_string(), "verbose_json".to_string())),
+            "client value kept: {fields:?}"
+        );
     }
 }
