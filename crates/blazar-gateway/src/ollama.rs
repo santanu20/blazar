@@ -1050,6 +1050,7 @@ pub async fn chat(
         class,
         affinity_hash(&req),
         crate::proxy::body_needs_vision(&req, true),
+        false, // text surface: diffusion rows teach the images lane
     )
     .await
     {
@@ -2070,6 +2071,7 @@ pub async fn embeddings(
         crate::queue::WorkClass::Interactive,
         None,
         false,
+        false, // text surface: diffusion rows teach the images lane
     )
     .await
     {
@@ -2184,6 +2186,7 @@ pub async fn embed(
         crate::queue::WorkClass::Interactive,
         None,
         false,
+        false, // text surface: diffusion rows teach the images lane
     )
     .await
     {
@@ -2328,6 +2331,7 @@ pub async fn rerank(
         crate::queue::WorkClass::Interactive,
         None,
         false,
+        false, // text surface: diffusion rows teach the images lane
     )
     .await
     {
@@ -2514,6 +2518,7 @@ pub async fn generate(
         class,
         affinity_hash(&req),
         crate::proxy::body_needs_vision(&req, true),
+        false, // text surface: diffusion rows teach the images lane
     )
     .await
     {
@@ -2739,6 +2744,7 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
         crate::queue::WorkClass::Interactive,
         None,
         false,
+        false, // text surface: diffusion rows teach the images lane
     )
     .await
     {

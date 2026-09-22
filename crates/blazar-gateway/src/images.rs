@@ -27,6 +27,18 @@ pub(crate) enum ImagesGate {
     Reject(String),
 }
 
+/// Teaching text for a diffusion component set hit through a text or
+/// embedding surface (chat/completions, generate, embeddings, messages,
+/// rerank...). Mirror of the `images_gate` rejection above: one gate per
+/// direction, same vocabulary both ways.
+pub(crate) fn diffusion_text_refusal(name: &str) -> String {
+    format!(
+        "\"{name}\" is a diffusion component set — text endpoints cannot drive it; \
+         image generation serves POST /v1/images/generations \
+         (instruction edits: POST /v1/images/edits)"
+    )
+}
+
 /// Only diffusion component rows reach an sdcpp child: a chat model
 /// here would boot a text engine that 404s the forward one hop later.
 /// Edits additionally need the vision-encoder companion (`--llm_vision`
@@ -162,6 +174,7 @@ pub async fn generations(
         WorkClass::Interactive,
         None,
         false, // images: no mmproj lane — the vision encoder rides argv
+        true,  // images lane: component sets are its cargo
     )
     .await
     {
@@ -217,6 +230,7 @@ pub async fn edits(
         WorkClass::Interactive,
         None,
         false,
+        true, // images lane: component sets are its cargo
     )
     .await
     {
@@ -289,6 +303,15 @@ mod tests {
         };
         assert!(msg.contains("not a diffusion model"));
         assert!(msg.contains("/v1/chat/completions"), "{msg}");
+    }
+
+    #[test]
+    fn unit__diffusion_text_refusal__teaches_images_api_on_text_surfaces() {
+        let msg = diffusion_text_refusal("qwen-image-2.1");
+        assert!(msg.contains("\"qwen-image-2.1\""), "{msg}");
+        assert!(msg.contains("text endpoints cannot drive"), "{msg}");
+        assert!(msg.contains("/v1/images/generations"), "{msg}");
+        assert!(msg.contains("/v1/images/edits"), "{msg}");
     }
 
     #[test]

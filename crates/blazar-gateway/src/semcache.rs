@@ -322,6 +322,7 @@ pub async fn embed_prompt(
         crate::queue::WorkClass::Interactive,
         None,
         false,
+        false, // text surface: diffusion rows teach the images lane
     )
     .await
     .map_err(|e| format!("embed model admission failed: {e:?}"))?;

@@ -224,7 +224,10 @@ pub(crate) async fn ensure_router_detached(
 /// passes `None`. `needs_vision` routes the first ensure through the
 /// lazy-attach path (projector respawn) — chat callers derive it from
 /// the single-parsed body via [`body_needs_vision`]; every other lane
-/// passes `false`.
+/// passes `false`. `allow_diffusion` mirrors [`crate::images::images_gate`]:
+/// the images handlers pass `true` (component sets are their cargo);
+/// every text/embedding surface passes `false` and gets a teaching 400
+/// instead of an sd-server child that 404s every chat-shaped route.
 #[allow(clippy::duration_suboptimal_units)] // 120s admission bound per plan
 pub async fn ensure_with_admission(
     state: &Arc<AppState>,
@@ -233,6 +236,7 @@ pub async fn ensure_with_admission(
     class: crate::queue::WorkClass,
     prefix: Option<PrefixKey>,
     needs_vision: bool,
+    allow_diffusion: bool,
 ) -> Result<(EngineRef, u128), Box<Response>> {
     let started = Instant::now();
     // Model resolution is the only store need; it completes inside the
@@ -246,6 +250,16 @@ pub async fn ensure_with_admission(
             }
             msg => Box::new(openai_error(500, msg)),
         })?;
+    // Domain mirror of images::images_gate: a diffusion component set on a
+    // text/embedding surface must teach the images lane up front. Spawning
+    // sd-server for it would "succeed" and then 404 every chat-shaped
+    // route the caller could possibly use.
+    if row.has_component_set() && !allow_diffusion {
+        return Err(Box::new(openai_error(
+            StatusCode::BAD_REQUEST.as_u16(),
+            &crate::images::diffusion_text_refusal(&row.name),
+        )));
+    }
     // On-demand LoRA variant (`model+adapter`): re-attach the stem to
     // the CANONICAL base row so the supervisor spawns/looks up the
     // variant lane (`base+adapter`) regardless of how the caller spelled
