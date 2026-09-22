@@ -174,7 +174,7 @@ Blazar currently orchestrates four engine families:
 | **llama.cpp** | GGUF; default mainstream lane for quantized GGUF serving |
 | **mistral.rs** | GGUF and safetensors paths supported by the runtime |
 | **SGLang** | Safetensors; especially AWQ / GPTQ / FP8 on supported accelerators |
-| **sd.cpp** | Diffusion GGUF component sets — Qwen-Image-2.1 (DiT + VAE + Qwen3VL text encoder, optional vision encoder for edits) and FLUX.1 (DiT + VAE + T5-XXL + CLIP-L; dev/schnell/mirrors) via a prebuilt `sd-server` (Vulkan/CPU/Metal) |
+| **sd.cpp** | Diffusion GGUF component sets — Qwen-Image-2.1 (DiT + VAE + Qwen3VL text encoder, optional vision encoder for edits) and FLUX.1 (DiT + VAE + T5-XXL + CLIP-L; dev/schnell/mirrors) via a prebuilt `sd-server` (CUDA on NVIDIA when upstream ships it, Vulkan on every GPU, CPU/Metal otherwise) |
 
 Routing is capability-driven rather than a blind global switch.
 

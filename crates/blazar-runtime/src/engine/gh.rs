@@ -791,22 +791,39 @@ pub struct SdAssetPattern {
 /// every GPU platform: one backend covers NVIDIA/AMD/Intel, and no
 /// linux-cuda prebuilt exists upstream. `ROCm` zips stay unpicked (vendor
 /// lock; vulkan serves the same cards).
-pub fn sdcpp_asset_patterns(os: &str, arch: &str) -> Result<Vec<SdAssetPattern>> {
+pub fn sdcpp_asset_patterns(os: &str, arch: &str, nvidia: bool) -> Result<Vec<SdAssetPattern>> {
+    // Ordering policy: the vendor-native compute backend first when the
+    // box is NVIDIA (a CUDA prebuilt outruns the Vulkan build the day
+    // upstream ships one — picked up with no code change, pinned by
+    // unit__sdcpp_asset_patterns__future_cuda_prebuilt_is_picked_same_day),
+    // then Vulkan (one backend covers every GPU vendor), then CPU as the
+    // labeled last resort. The cudart zip (CUDA runtime stripped for
+    // size) is always excluded in favor of the self-contained build.
     match (os, arch) {
-        ("linux", "x86_64" | "x64" | "amd64") => Ok(vec![
-            SdAssetPattern {
+        ("linux", "x86_64" | "x64" | "amd64") => {
+            let mut picks = Vec::new();
+            if nvidia {
+                picks.push(SdAssetPattern {
+                    includes: &["bin-Linux", "x86_64", "cuda"],
+                    excludes: &["cudart"],
+                    label: "cuda",
+                    cpu_fallback: false,
+                });
+            }
+            picks.push(SdAssetPattern {
                 includes: &["bin-Linux", "x86_64", "vulkan"],
                 excludes: &[],
                 label: "vulkan",
                 cpu_fallback: false,
-            },
-            SdAssetPattern {
+            });
+            picks.push(SdAssetPattern {
                 includes: &["bin-Linux", "x86_64"],
-                excludes: &["vulkan", "rocm"],
+                excludes: &["vulkan", "rocm", "cuda"],
                 label: "cpu",
                 cpu_fallback: true,
-            },
-        ]),
+            });
+            Ok(picks)
+        }
         ("macos", "aarch64" | "arm64") => Ok(vec![SdAssetPattern {
             includes: &["bin-Darwin", "arm64"],
             excludes: &[],
@@ -816,20 +833,30 @@ pub fn sdcpp_asset_patterns(os: &str, arch: &str) -> Result<Vec<SdAssetPattern>>
         ("macos", _) => Err(anyhow!(
             "stable-diffusion.cpp publishes no prebuilt for macOS x86_64 (Metal/arm64 only)"
         )),
-        ("windows", "x86_64" | "x64" | "amd64") => Ok(vec![
-            SdAssetPattern {
+        ("windows", "x86_64" | "x64" | "amd64") => {
+            let mut picks = Vec::new();
+            if nvidia {
+                picks.push(SdAssetPattern {
+                    includes: &["bin-win", "cuda"],
+                    excludes: &["cudart"],
+                    label: "cuda",
+                    cpu_fallback: false,
+                });
+            }
+            picks.push(SdAssetPattern {
                 includes: &["bin-win", "vulkan-x64"],
                 excludes: &[],
                 label: "vulkan",
                 cpu_fallback: false,
-            },
-            SdAssetPattern {
+            });
+            picks.push(SdAssetPattern {
                 includes: &["bin-win", "cpu-x64"],
                 excludes: &[],
                 label: "cpu",
                 cpu_fallback: true,
-            },
-        ]),
+            });
+            Ok(picks)
+        }
         ("windows", _) => Err(anyhow!(
             "stable-diffusion.cpp publishes no prebuilt for Windows ARM64"
         )),
@@ -1207,29 +1234,41 @@ mod tests {
 
     #[test]
     fn unit__sdcpp_asset_patterns__vulkan_first_cpu_resort_unsupported_teaches() {
-        let picks = sdcpp_asset_patterns("linux", "x86_64").unwrap();
+        // non-NVIDIA keeps the universal lanes; cpu pattern must not
+        // swallow the vulkan/rocm/cuda zips of the same build
+        let picks = sdcpp_asset_patterns("linux", "x86_64", false).unwrap();
         assert_eq!(picks.len(), 2);
         assert_eq!(picks[0].label, "vulkan");
         assert!(!picks[0].cpu_fallback);
         assert_eq!(picks[0].includes, &["bin-Linux", "x86_64", "vulkan"]);
         assert_eq!(picks[1].label, "cpu");
         assert!(picks[1].cpu_fallback);
-        // cpu pattern must not swallow the vulkan/rocm zips of the same build
-        assert_eq!(picks[1].excludes, &["vulkan", "rocm"]);
+        assert_eq!(picks[1].excludes, &["vulkan", "rocm", "cuda"]);
 
-        let mac = sdcpp_asset_patterns("macos", "aarch64").unwrap();
+        // NVIDIA gains the cuda lane ahead of vulkan
+        let nv = sdcpp_asset_patterns("linux", "x86_64", true).unwrap();
+        assert_eq!(nv.len(), 3);
+        assert_eq!(nv[0].label, "cuda");
+        assert_eq!(nv[0].includes, &["bin-Linux", "x86_64", "cuda"]);
+        assert_eq!(nv[0].excludes, &["cudart"]);
+        assert_eq!(nv[1].label, "vulkan");
+
+        let mac = sdcpp_asset_patterns("macos", "aarch64", true).unwrap();
         assert_eq!(mac.len(), 1);
         assert_eq!(mac[0].label, "metal");
         assert_eq!(mac[0].includes, &["bin-Darwin", "arm64"]);
 
-        let win = sdcpp_asset_patterns("windows", "x64").unwrap();
+        let win = sdcpp_asset_patterns("windows", "x64", false).unwrap();
         assert_eq!(win.len(), 2);
         assert_eq!(win[0].label, "vulkan");
         assert_eq!(win[1].label, "cpu");
+        let win_nv = sdcpp_asset_patterns("windows", "x64", true).unwrap();
+        assert_eq!(win_nv[0].label, "cuda");
+        assert_eq!(win_nv[0].includes, &["bin-win", "cuda"]);
 
-        assert!(sdcpp_asset_patterns("macos", "x86_64").is_err());
-        assert!(sdcpp_asset_patterns("windows", "aarch64").is_err());
-        let err = sdcpp_asset_patterns("freebsd", "x86_64")
+        assert!(sdcpp_asset_patterns("macos", "x86_64", false).is_err());
+        assert!(sdcpp_asset_patterns("windows", "aarch64", false).is_err());
+        let err = sdcpp_asset_patterns("freebsd", "x86_64", false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("build from source"), "err: {err}");
@@ -1237,7 +1276,7 @@ mod tests {
 
     #[test]
     fn unit__resolve_sdcpp_asset__first_pattern_with_matching_zip_wins() {
-        let picks = sdcpp_asset_patterns("linux", "x86_64").unwrap();
+        let picks = sdcpp_asset_patterns("linux", "x86_64", false).unwrap();
         let release = rel(
             "master-890-74988b2",
             &[
@@ -1267,6 +1306,76 @@ mod tests {
         // nothing usable -> None (caller teaching-errors with wanted list)
         let empty = rel("master-890-74988b2", &["source-code.tar.gz"]);
         assert!(resolve_sdcpp_asset(&empty, &picks).is_none());
+    }
+
+    #[test]
+    fn unit__sdcpp_asset_patterns__future_cuda_prebuilt_is_picked_same_day() {
+        // The day upstream publishes a linux CUDA zip, an NVIDIA box must
+        // pick it with no code change here; the cudart (runtime-stripped)
+        // variant stays excluded, non-NVIDIA keeps vulkan, and the cpu
+        // pattern must never wear a cuda zip as a fallback.
+        let nv = sdcpp_asset_patterns("linux", "x86_64", true).unwrap();
+        let amd = sdcpp_asset_patterns("linux", "x86_64", false).unwrap();
+        let future = rel(
+            "master-891-ffffffff",
+            &[
+                "sd-master-ffffffff-bin-Linux-Ubuntu-24.04-x86_64-cuda12.zip",
+                "sd-master-ffffffff-bin-Linux-Ubuntu-24.04-x86_64-cuda12-cudart.zip",
+                "sd-master-ffffffff-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip",
+                "sd-master-ffffffff-bin-Linux-Ubuntu-24.04-x86_64.zip",
+            ],
+        );
+        let (asset, pattern) = resolve_sdcpp_asset(&future, &nv).unwrap();
+        assert_eq!(
+            asset.name,
+            "sd-master-ffffffff-bin-Linux-Ubuntu-24.04-x86_64-cuda12.zip"
+        );
+        assert_eq!(pattern.label, "cuda");
+        assert!(!pattern.cpu_fallback);
+
+        let (asset, pattern) = resolve_sdcpp_asset(&future, &amd).unwrap();
+        assert!(asset.name.ends_with("vulkan.zip"));
+        assert_eq!(pattern.label, "vulkan");
+
+        // today's release (no CUDA zip yet) on an NVIDIA box: vulkan
+        // wins by absence — no error, no cpu mislabel
+        let today = rel(
+            "master-890-74988b2",
+            &[
+                "sd-master-74988b2-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip",
+                "sd-master-74988b2-bin-Linux-Ubuntu-24.04-x86_64.zip",
+            ],
+        );
+        let (asset, pattern) = resolve_sdcpp_asset(&today, &nv).unwrap();
+        assert!(asset.name.ends_with("vulkan.zip"));
+        assert_eq!(pattern.label, "vulkan");
+
+        // cuda-only release on a non-NVIDIA box: no cuda-as-cpu mislabel
+        let cuda_only = rel(
+            "master-891-ffffffff",
+            &[
+                "sd-master-ffffffff-bin-Linux-Ubuntu-24.04-x86_64-cuda12.zip",
+                "sd-master-ffffffff-bin-Linux-Ubuntu-24.04-x86_64.zip",
+            ],
+        );
+        let (asset, pattern) = resolve_sdcpp_asset(&cuda_only, &amd).unwrap();
+        assert!(!asset.name.contains("cuda"), "cpu fallback must stay cpu");
+        assert_eq!(pattern.label, "cpu");
+        assert!(pattern.cpu_fallback);
+
+        // Windows ships CUDA builds TODAY: same same-day pickup contract
+        let win_nv = sdcpp_asset_patterns("windows", "x86_64", true).unwrap();
+        let win_rel = rel(
+            "master-890-74988b2",
+            &[
+                "sd-master-74988b2-bin-win-cuda12-x64.zip",
+                "sd-master-74988b2-bin-win-vulkan-x64.zip",
+                "sd-master-74988b2-bin-win-cpu-x64.zip",
+            ],
+        );
+        let (asset, pattern) = resolve_sdcpp_asset(&win_rel, &win_nv).unwrap();
+        assert_eq!(asset.name, "sd-master-74988b2-bin-win-cuda12-x64.zip");
+        assert_eq!(pattern.label, "cuda");
     }
 
     #[test]
