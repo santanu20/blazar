@@ -631,13 +631,32 @@ fn native_job_to_openai(job: &serde_json::Value) -> serde_json::Value {
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // vid_gen answers with a FLAT payload (b64_json + fps + frame_count +
+    // mime_type at the result root — verified against sd-server master-890);
+    // img_gen nests per-image objects under images[]. Map the flat video
+    // bytes into the same data[] envelope so clients read one shape.
+    let data = if images.is_empty() {
+        job.pointer("/result/b64_json")
+            .filter(|v| !v.is_null())
+            .map(|b64| {
+                vec![serde_json::json!({
+                    "b64_json": b64,
+                    "fps": job.pointer("/result/fps").cloned().unwrap_or(serde_json::Value::Null),
+                    "frame_count": job.pointer("/result/frame_count").cloned().unwrap_or(serde_json::Value::Null),
+                    "mime_type": job.pointer("/result/mime_type").cloned().unwrap_or(serde_json::Value::Null),
+                })]
+            })
+            .unwrap_or_default()
+    } else {
+        images
+    };
     let output_format = job
         .pointer("/result/output_format")
         .cloned()
         .unwrap_or_else(|| serde_json::json!("png"));
     serde_json::json!({
         "created": job.get("created").cloned().unwrap_or_else(|| serde_json::json!(0)),
-        "data": images,
+        "data": data,
         "output_format": output_format,
     })
 }
@@ -1215,6 +1234,58 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
+    fn unit__native_job_to_openai__flat_video_payload_maps_to_data() {
+        // vid_gen answers with a FLAT result (b64_json + fps + frame_count +
+        // mime_type at the root, no images[]); the video bytes must land in
+        // data[0] with their metadata, never silently dropped.
+        let job = serde_json::json!({
+            "created": 1_690_000_000i64,
+            "status": "completed",
+            "result": {
+                "b64_json": "R2tY", // "GkX" EBML magic, base64
+                "fps": 16,
+                "frame_count": 5,
+                "mime_type": "video/webm",
+                "output_format": "webm"
+            }
+        });
+        let out = native_job_to_openai(&job);
+        let data = out.get("data").and_then(|d| d.as_array()).unwrap();
+        assert_eq!(
+            data.len(),
+            1,
+            "flat video payload must map to one data entry: {out}"
+        );
+        assert_eq!(data[0]["b64_json"], "R2tY");
+        assert_eq!(data[0]["fps"], 16);
+        assert_eq!(data[0]["frame_count"], 5);
+        assert_eq!(data[0]["mime_type"], "video/webm");
+        assert_eq!(out["output_format"], "webm");
+
+        // img_gen keeps its nested images[] shape untouched.
+        let img = serde_json::json!({
+            "created": 1_690_000_000i64,
+            "result": {"images": [{"b64_json": "AAAA", "index": 0}], "output_format": "png"}
+        });
+        let out = native_job_to_openai(&img);
+        let data = out.get("data").and_then(|d| d.as_array()).unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["b64_json"], "AAAA");
+        assert!(
+            data[0].get("fps").is_none(),
+            "image entries carry no video metadata"
+        );
+
+        // A failed/empty job never invents data.
+        let failed =
+            serde_json::json!({"created": 1i64, "status": "failed", "error": {"message": "x"}});
+        let out = native_job_to_openai(&failed);
+        assert!(out["data"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
     fn unit__native_job_to_openai__maps_result_shape() {
         let job = serde_json::json!({
             "id": "job_1", "status": "completed", "created": 123,
