@@ -586,12 +586,17 @@ install_system() {
     $SUDO mkdir -p "$BIN_DIR" || error "cannot create ${BIN_DIR} (need sudo?)"
     # Replace a possibly-running binary without ETXTBSY: temp file + rename
     # (the running process keeps its inode; new execs get the new binary).
+    # Unique temp name per run (mktemp): a leftover temp from an earlier
+    # failed install (pid-recycled $$.suffix, or a full-disk partial copy)
+    # must never be renamed into place as the installed binary.
     # Root-owned like ollama when we have root; plain install otherwise
     # (mirrors/tests run through a pass-through "sudo").
-    $SUDO install -o0 -g0 -m0755 "$1" "$BIN_DIR/blazar.new.$$" 2>/dev/null ||
-    $SUDO install -m0755 "$1" "$BIN_DIR/blazar.new.$$" ||
-    error "install to ${BIN_DIR} failed"
-    $SUDO mv -f "$BIN_DIR/blazar.new.$$" "$BIN_DIR/blazar"
+    NEW_BIN=$($SUDO mktemp "$BIN_DIR/blazar.new.XXXXXX") ||
+        error "cannot create temp file in ${BIN_DIR} (disk full?)"
+    $SUDO install -o0 -g0 -m0755 "$1" "$NEW_BIN" 2>/dev/null ||
+    $SUDO install -m0755 "$1" "$NEW_BIN" ||
+        { $SUDO rm -f "$NEW_BIN"; error "install to ${BIN_DIR} failed"; }
+    $SUDO mv -f "$NEW_BIN" "$BIN_DIR/blazar"
     # A user-started daemon owns the port; the unit would crash-loop.
     PIDFILE="$USER_HOME/.local/share/blazar/run/blazar.pid"
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
@@ -627,6 +632,9 @@ install_system() {
         MEMORY_HIGH="${BLAZAR_UNIT_MEMORY_HIGH-85%}"
         MH_LINE=
         [ -n "$MEMORY_HIGH" ] && MH_LINE="MemoryHigh=$MEMORY_HIGH"
+        SVC_HOME=$(getent passwd "$SVC_USER" | cut -d: -f6)
+        SVC_DATA_DIR=${SVC_HOME}/.local/share/blazar
+        $SUDO mkdir -p "$SVC_DATA_DIR"
         $SUDO mkdir -p "$(dirname "$UNIT_PATH")"
         UNIT=$(cat <<EOF
 [Unit]
@@ -638,6 +646,10 @@ Wants=network-online.target
 ExecStart=${BIN_DIR}/blazar serve
 User=${SVC_USER}
 Group=${SVC_GROUP}
+# Engine children inherit the daemon cwd; upstream binaries that walk
+# relative paths must never start at the filesystem root (symlink
+# loops under /run).
+WorkingDirectory=${SVC_DATA_DIR}
 ${SG_LINE}
 ${MH_LINE}
 Restart=always
