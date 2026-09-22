@@ -311,6 +311,20 @@ async fn probe_rpc_endpoints(argv: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Anchor directory for engine children. Upstream binaries resolve
+/// relative paths against the inherited cwd (sd.cpp's video handler walks
+/// "./" directories); a service daemon started at `/` sends those walks
+/// into /run symlink loops (`Too many levels of symbolic links`). Seating
+/// every child in its engine's install dir keeps relative lookups inside
+/// blazar-owned territory. Bare binary names (no directory component)
+/// keep the inherited cwd — same behavior as before this anchor existed.
+fn child_cwd(server_path: &str) -> Option<std::path::PathBuf> {
+    std::path::Path::new(server_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty() && p.as_os_str() != ".")
+        .map(std::path::Path::to_path_buf)
+}
+
 /// Shared child-process mechanics for every engine kind: null stdin,
 /// piped stdio into tracing + the log tail, kill-on-drop, own process
 /// group (§5 H19: acquired = released by construction).
@@ -328,6 +342,9 @@ fn spawn_child(
         // If the owning process dies without teardown, the child must
         // not linger (test leakage, daemon crash).
         .kill_on_drop(true);
+    if let Some(dir) = child_cwd(server_path) {
+        cmd.current_dir(dir);
+    }
     #[cfg(unix)]
     {
         // Own process group: Ctrl-C on the daemon never reaches the
@@ -1117,6 +1134,19 @@ async fn pipe_logs<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
 #[allow(non_snake_case)] // repo convention: unit__scenario__expected
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__child_cwd__anchors_to_engine_dir_and_skips_bare_names() {
+        assert_eq!(
+            child_cwd("/opt/blazar/engines/master-890/sd-server"),
+            Some("/opt/blazar/engines/master-890".into())
+        );
+        // A bare name resolves via PATH; no owned dir exists, so the
+        // child keeps the inherited cwd (pre-anchor behavior).
+        assert_eq!(child_cwd("sd-server"), None);
+        // "./sd-server" has an empty parent — same inherit rule.
+        assert_eq!(child_cwd("./sd-server"), None);
+    }
 
     fn rpc_argv(value: &str) -> Vec<String> {
         vec![
