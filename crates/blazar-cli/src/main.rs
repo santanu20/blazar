@@ -478,7 +478,7 @@ enum EngineCmd {
     /// `blazar engine build cuda`. Activates the installed tag;
     /// restart the daemon so running spawns pick it up.
     Update {
-        /// Engine lane to update: llamacpp (default) | sglang | mistralrs
+        /// Engine lane to update: llamacpp (default) | sglang | mistralrs | sdcpp
         #[arg(long, default_value = "llamacpp")]
         kind: String,
         tag: Option<String>,
@@ -585,10 +585,10 @@ enum EngineCmd {
     /// install, `engine use` the tag and restart the daemon to serve
     /// safetensors models.
     Install {
-        /// Engine lane to install: mistralrs | sglang (required — bare
-        /// `engine install` prints the lane chooser; llama.cpp installs
-        /// ride `engine update` / `engine build`). With --lane: build a
-        /// curated capability lane from the registry by id (see
+        /// Engine lane to install: mistralrs | sglang | sdcpp (required —
+        /// bare `engine install` prints the lane chooser; llama.cpp
+        /// installs ride `engine update` / `engine build`). With --lane:
+        /// build a curated capability lane from the registry by id (see
         /// `blazar engine offers`).
         #[arg(long)]
         kind: Option<String>,
@@ -2110,6 +2110,7 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
         ("llamacpp", "inventory llamacpp"),
         ("mistralrs", "inventory mistralrs"),
         ("sglang", "inventory sglang"),
+        ("sdcpp", "inventory sdcpp"),
     ] {
         let rows: Vec<&blazar_core::store::EngineRow> =
             engines.iter().filter(|e| e.kind.as_str() == kind).collect();
@@ -2146,7 +2147,7 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
     // on top; prune runs on the next install).
     let keep = blazar_runtime::engine::KEEP_TAGS;
     let mut over: Vec<String> = Vec::new();
-    for kind in ["llamacpp", "mistralrs", "sglang"] {
+    for kind in ["llamacpp", "mistralrs", "sglang", "sdcpp"] {
         let n = engines.iter().filter(|e| e.kind.as_str() == kind).count();
         if n > keep {
             over.push(format!("{kind}: {n} > {keep}"));
@@ -2842,19 +2843,46 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
         }
         return checks;
     }
-    // sglang is a pinned pip lane (no rolling channel to survey): teach
-    // the version in place and the one-command refresh path instead of
-    // nagging with the llama.cpp channel.
-    if active_kind == Some(EngineKind::Sglang) {
-        let active = active_tag.as_deref().unwrap_or("?");
-        checks.push(Check::ok(
-            "engine currency",
-            format!(
-                "{active} (sglang pip lane, version pinned at install) — update with: \
-                 blazar engine update --kind sglang [version]"
-            ),
-        ));
-        return checks;
+    // Non-llamacpp active lanes have no b-tag channel to survey against:
+    // teach the lane's own refresh command instead of keying the llama.cpp
+    // channel checks (currency, CUDA-asset hint) on a foreign tag/asset.
+    // (validate.py's llamacpp channel survey skips the same way when the
+    // active engine is not llamacpp.)
+    match active_kind {
+        Some(EngineKind::Sglang) => {
+            let active = active_tag.as_deref().unwrap_or("?");
+            checks.push(Check::ok(
+                "engine currency",
+                format!(
+                    "{active} (sglang pip lane, version pinned at install) — update with: \
+                     blazar engine update --kind sglang [version]"
+                ),
+            ));
+            return checks;
+        }
+        Some(EngineKind::MistralRs) => {
+            let active = active_tag.as_deref().unwrap_or("?");
+            checks.push(Check::ok(
+                "engine currency",
+                format!(
+                    "{active} (mistral.rs prebuilt lane) — update with: \
+                     blazar engine update --kind mistralrs"
+                ),
+            ));
+            return checks;
+        }
+        Some(EngineKind::SdCpp) => {
+            let active = active_tag.as_deref().unwrap_or("?");
+            checks.push(Check::ok(
+                "engine currency",
+                format!(
+                    "{active} (sdcpp prebuilt lane) — update with: \
+                     blazar engine update --kind sdcpp"
+                ),
+            ));
+            return checks;
+        }
+        _ => {}
     }
     let mut currency: Option<Check> = None;
     let mut marker_usable = false;
@@ -7740,6 +7768,11 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             if !seen.contains(&"sglang") {
                 println!(
                     "sglang:     not installed — blazar engine install --kind sglang (safetensors; Linux + CUDA/ROCm)"
+                );
+            }
+            if !seen.contains(&"sdcpp") {
+                println!(
+                    "sdcpp:      not installed — blazar engine install --kind sdcpp (diffusion GGUF sets: Qwen-Image-2.1, FLUX.1; any GPU via Vulkan)"
                 );
             }
             match blazar_runtime::whisper::installed_tags(&d).first() {
