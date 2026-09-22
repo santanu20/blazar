@@ -149,3 +149,36 @@ python3 scripts/bench_matrix.py --render-only --artifacts-dir <dir> --md BENCHMA
 ```
 
 _Raw per-cell records (argv, per-run lists, daemon logs): `/home/santanu/.cache/blazar-bench-matrix/20260922-174339/cells.jsonl`._
+
+## Media models audit (rendered 20260923, manual section)
+
+_Image / video / TTS quality + perf; same test bed as above; blazar 0.10.0 @ feature/sdcpp-lane eceaf29; serial single-GPU; timing is API-level wall clock._
+
+### Perf
+
+| Model | Resolution | Cold | Warm | Notes |
+|---|---|---|---|---|
+| flux.1-dev Q2_K (4 steps) | 512x512 | 17.8 s | 13.0-13.1 s | fastest per gen |
+| stable-diffusion-xl-base-1.0 | 1024x1024 native | 51.2 s | 44.1 s x2 | 4x pixels of the 512 lane in less time than qwen |
+| qwen-image-2.1 Q4_K_M | 512x512 default | 127.3 s | 64-83 s | 1024x1024 forced = 273.6 s |
+| wan_2.1 (T2V) | default clip | - | 28.1-32.0 s | valid WebM (EBML), seed-diverse |
+| piper en_US-amy-medium | 22050 Hz mono | - | 0.62-0.75 s | 11.7-11.9 s audio -> RTF 0.053-0.064 (15-19x realtime) |
+
+### Quality (structural, offline: PIL + wave; no CLIP/FID scorers on box)
+
+| Model | Contrast (std) | Detail (edges) | Color div (uniq/16384) | Seed-deterministic | Seed-diverse |
+|---|---|---|---|---|---|
+| flux.1-dev Q2_K | 88.4 | 2.1 | 11913 | yes (byte-exact) | yes |
+| sdxl-base-1.0 | 66.6 | 7.3 | 13160 | yes (byte-exact) | yes |
+| qwen-image-2.1 | 62.6 | 5.1 | 11990 | yes (byte-exact) | yes |
+| piper amy | rms 3980, silence 10.3% (natural pauses) | peak 32767/32767 = full-scale | - | no (~2% duration jitter) | - |
+
+### Findings
+
+- SDXL is the speed/quality balance king on this box (native 1024p, richest detail+color, byte-deterministic).
+- FLUX Q2_K @ 4 steps is fastest but soft (edges 2.1): quality knob = raise steps (8-12) when latency allows; Q2_K is the floor quant.
+- qwen-image-2.1 pays the DiT + Qwen3VL-8B prompt-rewriter + mmproj stack: ~4.5x SDXL per pixel, but it alone offers /v1/images/edits and the strongest prompt adherence via VL rewriting.
+- TTS runs at 15-19x realtime; peak touches full scale (clipping ceiling) - a -1 dBFS limiter/headroom tweak in the piper path is the one actionable audio finding.
+- Robustness: after a client-abandoned in-flight job, the next 2 requests can 502 (warmup race: child died / no results) and the 3rd self-recovers; failures surface honestly, nothing silent.
+
+_Artifacts: /tmp/opencode/media-audit/ (per-gen json/png/webm/wav + audit_summary.json)._
