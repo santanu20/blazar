@@ -85,13 +85,10 @@ pub fn remove_model(dirs: &BlazarDirs, name: &str) -> Result<()> {
     if let Some(mm) = &row.mmproj_path {
         files.push(PathBuf::from(mm));
     }
-    // Diffusion component set (sdcpp lane): VAE / text-encoder / vision
-    // files ride the row exactly like the mmproj sidecar does.
-    for component in [&row.vae_path, &row.llm_path, &row.llm_vision_path]
-        .into_iter()
-        .flatten()
-    {
-        files.push(PathBuf::from(component));
+    // Diffusion component set (sdcpp lane): VAE / text-encoder(s) /
+    // vision files ride the row exactly like the mmproj sidecar does.
+    for component in &row.components {
+        files.push(PathBuf::from(&component.path));
     }
 
     // Shared-asset guard: aliases reference the SAME mmproj (and are
@@ -107,11 +104,7 @@ pub fn remove_model(dirs: &BlazarDirs, name: &str) -> Result<()> {
             if let Some(mm) = m.mmproj_path {
                 v.push(mm);
             }
-            v.extend(
-                [m.vae_path, m.llm_path, m.llm_vision_path]
-                    .into_iter()
-                    .flatten(),
-            );
+            v.extend(m.components.iter().map(|c| c.path.clone()));
             v
         })
         .collect();
@@ -473,9 +466,7 @@ fn adopt_gguf(
         mmproj_path,
         // Reconcile adopts parsed GGUFs only; diffusion component sets
         // (0-metadata files) never reach here — they arrive via pull.
-        vae_path: None,
-        llm_path: None,
-        llm_vision_path: None,
+        components: vec![],
         shards: i64::try_from(leaves.len()).unwrap_or(i64::MAX),
         arch: Some(meta.architecture.clone()),
         params: Some(crate::hf::est_params(bytes, &quant)),
@@ -577,9 +568,7 @@ fn adopt_dir(
         bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
         sha256: None,
         mmproj_path: None,
-        vae_path: None,
-        llm_path: None,
-        llm_vision_path: None,
+        components: vec![],
         shards: i64::try_from(weights.len()).unwrap_or(i64::MAX),
         arch: (!meta.architecture.is_empty()).then(|| meta.architecture.clone()),
         params: Some(crate::hf::est_params(bytes, &quant)),
@@ -739,9 +728,7 @@ pub fn copy_model(dirs: &BlazarDirs, src: &str, dst: &str) -> Result<()> {
         // Component-set assets are shared references (read-only weights,
         // hardlink-friendly), not per-row copies: the duplicate points at
         // the same VAE/TE files.
-        vae_path: row.vae_path.clone(),
-        llm_path: row.llm_path.clone(),
-        llm_vision_path: row.llm_vision_path.clone(),
+        components: row.components.clone(),
         shards: row.shards,
         arch: row.arch.clone(),
         params: row.params,
@@ -797,9 +784,7 @@ mod tests {
                 bytes: 2,
                 sha256: None,
                 mmproj_path: Some(d.join("mmproj-m.gguf").display().to_string()),
-                vae_path: None,
-                llm_path: None,
-                llm_vision_path: None,
+                components: vec![],
                 shards: 2,
                 arch: None,
                 params: None,
@@ -825,7 +810,7 @@ mod tests {
         std::fs::write(d.join("te.gguf"), b"te").unwrap();
         std::fs::write(d.join("vis.gguf"), b"vis").unwrap();
         let store = Store::open(&dirs).unwrap();
-        let row = |name: &str, path: &str, vae: Option<String>| blazar_core::ModelRow {
+        let row = |name: &str, path: &str| blazar_core::ModelRow {
             name: name.into(),
             repo: "o/qwen-image".into(),
             quant: "Q4_K_M".into(),
@@ -833,9 +818,20 @@ mod tests {
             bytes: 3,
             sha256: None,
             mmproj_path: None,
-            vae_path: vae,
-            llm_path: Some(d.join("te.gguf").display().to_string()),
-            llm_vision_path: Some(d.join("vis.gguf").display().to_string()),
+            components: vec![
+                blazar_core::store::ComponentFile::new(
+                    "--vae",
+                    &d.join("vae.safetensors").display().to_string(),
+                ),
+                blazar_core::store::ComponentFile::new(
+                    "--llm",
+                    &d.join("te.gguf").display().to_string(),
+                ),
+                blazar_core::store::ComponentFile::new(
+                    "--llm_vision",
+                    &d.join("vis.gguf").display().to_string(),
+                ),
+            ],
             shards: 1,
             arch: None,
             params: None,
@@ -843,11 +839,7 @@ mod tests {
             pulled_at: 1,
         };
         store
-            .upsert_model(&row(
-                "m",
-                &d.join("dit.gguf").display().to_string(),
-                Some(d.join("vae.safetensors").display().to_string()),
-            ))
+            .upsert_model(&row("m", &d.join("dit.gguf").display().to_string()))
             .unwrap();
         // The alias shares ONLY the VAE; its own TE/vision slots are empty.
         store
@@ -859,9 +851,10 @@ mod tests {
                 bytes: 4,
                 sha256: None,
                 mmproj_path: None,
-                vae_path: Some(d.join("vae.safetensors").display().to_string()),
-                llm_path: None,
-                llm_vision_path: None,
+                components: vec![blazar_core::store::ComponentFile::new(
+                    "--vae",
+                    &d.join("vae.safetensors").display().to_string(),
+                )],
                 shards: 1,
                 arch: None,
                 params: None,
@@ -902,9 +895,7 @@ mod tests {
                 bytes: 9,
                 sha256: None,
                 mmproj_path: None,
-                vae_path: None,
-                llm_path: None,
-                llm_vision_path: None,
+                components: vec![],
                 shards: 1,
                 arch: None,
                 params: None,
@@ -935,9 +926,7 @@ mod tests {
                     bytes: 2,
                     sha256: None,
                     mmproj_path: None,
-                    vae_path: None,
-                    llm_path: None,
-                    llm_vision_path: None,
+                    components: vec![],
                     shards: 1,
                     arch: None,
                     params: None,
@@ -966,9 +955,7 @@ mod tests {
             bytes: 2,
             sha256: None,
             mmproj_path: None,
-            vae_path: None,
-            llm_path: None,
-            llm_vision_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,
@@ -1009,9 +996,7 @@ mod tests {
             bytes: 10,
             sha256: None,
             mmproj_path: None,
-            vae_path: None,
-            llm_path: None,
-            llm_vision_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,
@@ -1073,9 +1058,7 @@ mod tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
-            vae_path: None,
-            llm_path: None,
-            llm_vision_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,

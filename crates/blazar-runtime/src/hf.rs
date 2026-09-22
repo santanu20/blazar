@@ -1696,13 +1696,12 @@ pub(crate) fn repull_gate(
 /// vision encoder is not a repair trigger — its loss only disables
 /// image edits.
 pub(crate) fn required_component_missing(row: &ModelRow) -> bool {
-    if crate::diffusion::diffusion_family(&row.repo).is_some() {
-        return row.vae_path.is_none() || row.llm_path.is_none();
+    match crate::diffusion::diffusion_family(&row.repo) {
+        Some(family) => crate::diffusion::required_component_missing(row, family),
+        // A set recorded without a curated family (hand-attached): every
+        // recorded component must still be alive.
+        None => row.components.iter().any(|c| !Path::new(&c.path).is_file()),
     }
-    [row.vae_path.as_deref(), row.llm_path.as_deref()]
-        .into_iter()
-        .flatten()
-        .any(|p| !Path::new(p).is_file())
 }
 
 /// Assemble the store row for a fully-downloaded safetensors dir:
@@ -1728,9 +1727,7 @@ fn safetensors_model_row(
         bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
         sha256: Some(digest),
         mmproj_path: None,
-        vae_path: None,
-        llm_path: None,
-        llm_vision_path: None,
+        components: vec![],
         shards: i64::try_from(sel.shard_count).unwrap_or(i64::MAX),
         arch: (!meta.architecture.is_empty()).then(|| meta.architecture.clone()),
         params: Some(est_params(bytes, &quant)),
@@ -2120,10 +2117,12 @@ impl Puller {
             pull_warning.get_or_insert(note);
             return Ok(());
         };
-        let (vae, llm, llm_vision) = self.pull_diffusion_components(name, family, quant).await?;
-        row.vae_path = Some(vae);
-        row.llm_path = Some(llm);
-        row.llm_vision_path = llm_vision;
+        row.components = self
+            .pull_diffusion_components(name, family, quant)
+            .await?
+            .into_iter()
+            .map(|(flag, path)| blazar_core::store::ComponentFile::new(&flag, &path))
+            .collect();
         Ok(())
     }
 
@@ -2132,61 +2131,60 @@ impl Puller {
         name: &str,
         family: &crate::diffusion::DiffusionFamily,
         quant: &str,
-    ) -> Result<(String, String, Option<String>)> {
+    ) -> Result<Vec<(String, String)>> {
         let models_dir = self.dirs.models_dir();
         std::fs::create_dir_all(&models_dir)?;
 
-        let vae_info = self.client.model_info(family.vae.repo).await?;
-        let vae_plan =
-            crate::diffusion::component_plan(&vae_info, &family.vae, quant).ok_or_else(|| {
-                anyhow!(
-                    "VAE {} not found in {}",
-                    family.vae.repo_path,
-                    family.vae.repo
-                )
-            })?;
-
-        let te_info = self.client.model_info(family.text_encoder.repo).await?;
-        let (te_plan, te_note) = if let Some(p) =
-            crate::diffusion::component_plan(&te_info, &family.text_encoder, quant)
-        {
-            (p, None)
-        } else {
-            let fallback_quant = family.text_encoder_fallback_quant;
-            let fallback =
-                crate::diffusion::component_plan(&te_info, &family.text_encoder, fallback_quant)
+        // Per-spec plans: exact quant first, else the spec's fallback
+        // quant (component repos publish fewer quants than `DiT`
+        // converters cut). Optional components that are absent upstream
+        // skip with a warning — the set still boots, edits just disable.
+        let mut plans: Vec<(&crate::diffusion::ComponentSpec, FilePlan, Option<String>)> =
+            Vec::new();
+        for spec in family.components {
+            let info = match self.client.model_info(spec.source.repo).await {
+                Ok(info) => info,
+                Err(e) if !spec.required => {
+                    tracing::warn!(model = %name,
+                        "optional {} listing failed ({e}); skipping", spec.flag);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            if let Some(plan) = crate::diffusion::component_plan(&info, &spec.source, quant) {
+                plans.push((spec, plan, None));
+                continue;
+            }
+            if let Some(fallback_quant) = spec.fallback_quant {
+                let plan = crate::diffusion::component_plan(&info, &spec.source, fallback_quant)
                     .ok_or_else(|| {
                         anyhow!(
-                            "text encoder for quant {quant} (and fallback {fallback_quant}) \
-                             not found in {}",
-                            family.text_encoder.repo
+                            "component {} for quant {quant} (and fallback \
+                                 {fallback_quant}) not found in {}",
+                            spec.flag,
+                            spec.source.repo
                         )
                     })?;
-            let note =
-                format!("text encoder quant {quant} unavailable; pulled {fallback_quant} instead");
-            (fallback, Some(note))
-        };
-
-        // Vision encoder is optional: absent upstream (or a dead listing)
-        // downgrades to a warning, never a failed pull.
-        let mut vision_plan = None;
-        if let Some(src) = &family.vision_encoder {
-            vision_plan = match self.client.model_info(src.repo).await {
-                Ok(info) => crate::diffusion::component_plan(&info, src, quant),
-                Err(e) => {
-                    tracing::warn!(model = %name, "vision encoder listing failed ({e}); edits disabled for this set");
-                    None
-                }
-            };
+                let note = format!(
+                    "component {} quant {quant} unavailable; pulled {fallback_quant} instead",
+                    spec.flag
+                );
+                plans.push((spec, plan, Some(note)));
+                continue;
+            }
+            if spec.required {
+                return Err(anyhow!(
+                    "{} {} not found in {}",
+                    spec.flag,
+                    spec.source.repo_path,
+                    spec.source.repo
+                ));
+            }
+            tracing::warn!(model = %name,
+                "optional {} has no {} in {}; skipping", spec.flag,
+                spec.source.repo_path, spec.source.repo);
         }
 
-        let mut plans = vec![
-            (family.vae.repo, &vae_plan, true),
-            (family.text_encoder.repo, &te_plan, true),
-        ];
-        if let (Some(src), Some(plan)) = (&family.vision_encoder, &vision_plan) {
-            plans.push((src.repo, plan, false));
-        }
         let total_bytes: u64 = plans.iter().map(|(_, p, _)| p.bytes).sum();
         let bar = indicatif::ProgressBar::new(total_bytes);
         bar.set_style(
@@ -2197,24 +2195,20 @@ impl Puller {
         bar.set_message(format!("pull {name}: components"));
 
         let mut done: u64 = 0;
-        let mut paths: Vec<(bool, PathBuf)> = Vec::new();
-        for (repo, plan, required) in &plans {
-            let fetched = self
-                .fetch_component_file(name, repo, plan, *required, &bar, &mut done)
-                .await?;
-            if let Some(dest) = fetched {
-                paths.push((*required, dest));
+        let mut components: Vec<(String, String)> = Vec::new();
+        for (spec, plan, note) in &plans {
+            if let Some(dest) = self
+                .fetch_component_file(name, spec.source.repo, plan, spec.required, &bar, &mut done)
+                .await?
+            {
+                components.push((spec.flag.to_string(), dest.display().to_string()));
+            }
+            if let Some(note) = note {
+                tracing::warn!(model = %name, "{note}");
             }
         }
         bar.finish_and_clear();
-
-        let vae = paths[0].1.display().to_string();
-        let llm = paths[1].1.display().to_string();
-        let llm_vision = paths.get(2).map(|p| p.1.display().to_string());
-        if let Some(note) = te_note {
-            tracing::warn!(model = %name, "{note}");
-        }
-        Ok((vae, llm, llm_vision))
+        Ok(components)
     }
 
     /// Fetch one component file with the shared progress bar. Returns
@@ -2324,13 +2318,14 @@ impl Puller {
                         crate::diffusion::supported_families().join(", ")
                     )
                 })?;
-                let (vae, llm, llm_vision) = self
+                let components = self
                     .pull_diffusion_components(name, family, &old.quant)
                     .await?;
                 let mut row = old.clone();
-                row.vae_path = Some(vae);
-                row.llm_path = Some(llm);
-                row.llm_vision_path = llm_vision;
+                row.components = components
+                    .into_iter()
+                    .map(|(flag, path)| blazar_core::store::ComponentFile::new(&flag, &path))
+                    .collect();
                 Store::open(&self.dirs)?.upsert_model(&row)?;
                 tracing::info!(model = %name, "component set repaired — DiT untouched");
                 self.bus.publish(BlazarEvent::ModelPulled {
@@ -2530,9 +2525,7 @@ fn build_model_row(
             bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
             sha256: selected.shards[0].sha256.clone(),
             mmproj_path: mmproj_dest.as_ref().map(|d| d.display().to_string()),
-            vae_path: None,
-            llm_path: None,
-            llm_vision_path: None,
+            components: vec![],
             shards: i64::try_from(selected.shards.len()).unwrap_or(i64::MAX),
             arch,
             params: Some(est_params(bytes, &selected.quant)),
@@ -3475,9 +3468,7 @@ mod tests {
             bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
             sha256: None,
             mmproj_path: None,
-            vae_path: None,
-            llm_path: None,
-            llm_vision_path: None,
+            components: vec![],
             shards,
             arch: None,
             params: None,

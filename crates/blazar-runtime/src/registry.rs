@@ -648,9 +648,7 @@ fn registry_model_row(
         mmproj_path: mmproj_dest.map(|d| d.display().to_string()),
         // ollama-registry blobs are single-file text models; diffusion
         // component sets exist only on the HF pull lane.
-        vae_path: None,
-        llm_path: None,
-        llm_vision_path: None,
+        components: vec![],
         shards: 1,
         arch,
         params: Some(est_params(model_plan.bytes, quant)),
@@ -994,9 +992,7 @@ mod tests {
             bytes: i64::try_from(content.len()).unwrap(),
             sha256: Some(strip_digest_prefix(&model.digest)),
             mmproj_path: None,
-            vae_path: None,
-            llm_path: None,
-            llm_vision_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,

@@ -985,7 +985,7 @@ async fn ensure_run_model(name: &str) -> Result<String> {
 /// Refuse at the CLI boundary — spawning the sdcpp child would 404
 /// every REPL send.
 fn diffusion_repl_refusal(row: &blazar_core::store::ModelRow) -> Option<String> {
-    row.vae_path.is_some().then(|| {
+    row.has_component_set().then(|| {
         format!(
             "\"{}\" is a diffusion component set (sdcpp lane) — the chat REPL cannot drive \
              image generation; start the daemon (blazar serve) and POST \
@@ -1638,7 +1638,7 @@ fn lane_state_for(d: &BlazarDirs, row: &blazar_core::store::ModelRow) -> LaneSta
                 cfg.engine_routing.mode,
                 cfg.engine_routing.policy,
                 pin,
-                row.vae_path.is_some(),
+                row.has_component_set(),
                 safetensors,
                 row.is_quantized_safetensors(),
                 active.kind,
@@ -1939,7 +1939,7 @@ fn doctor_routing(d: &blazar_core::dirs::BlazarDirs) -> Vec<Check> {
             &engine_rows,
             &m.name,
             m.arch.as_deref(),
-            m.vae_path.is_some(),
+            m.has_component_set(),
             &m.path,
         ) {
             unservable += 1;
@@ -4445,9 +4445,7 @@ fn import(
         bytes,
         sha256: None,
         mmproj_path: mmproj_dest.map(|p| p.display().to_string()),
-        vae_path: None,
-        llm_path: None,
-        llm_vision_path: None,
+        components: vec![],
         shards: 1,
         arch: Some(meta.architecture.clone()),
         params: Some(blazar_runtime::hf::est_params(size, &derived_quant)),
@@ -4597,7 +4595,7 @@ fn list_json_row(
         engine_rows,
         &m.name,
         m.arch.as_deref(),
-        m.vae_path.is_some(),
+        m.has_component_set(),
         &m.path,
     )
     .ok()
@@ -4678,7 +4676,7 @@ fn list(json: bool) -> Result<()> {
                 &engine_rows,
                 &m.name,
                 m.arch.as_deref(),
-                m.vae_path.is_some(),
+                m.has_component_set(),
                 &m.path,
             )
             .unwrap_or_else(|_| "-".to_string());
@@ -5631,9 +5629,7 @@ fn quantize_cmd(
         mmproj_path: row.mmproj_path.clone(),
         // Quantize runs on parsed text GGUFs; a diffusion DiT never
         // reaches the llama-quantizer this wraps.
-        vae_path: None,
-        llm_path: None,
-        llm_vision_path: None,
+        components: vec![],
         shards: 1,
         arch: Some(meta.architecture.clone()),
         params: Some(blazar_runtime::hf::est_params(out_bytes, qtype)),
@@ -10071,9 +10067,7 @@ mod tests {
             bytes: 4_294_967_296,
             sha256: None,
             mmproj_path: None,
-            vae_path: None,
-            llm_path: None,
-            llm_vision_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,
@@ -10085,8 +10079,10 @@ mod tests {
         // Diffusion rows refuse at the boundary and name the API that
         // CAN drive them.
         let mut row = base();
-        row.vae_path = Some("/models/vae.safetensors".into());
-        row.llm_path = Some("/models/te.gguf".into());
+        row.components = vec![
+            blazar_core::store::ComponentFile::new("--vae", "/models/vae.safetensors"),
+            blazar_core::store::ComponentFile::new("--llm", "/models/te.gguf"),
+        ];
         let refusal =
             diffusion_repl_refusal(&row).expect("component set must refuse the chat REPL");
         assert!(refusal.contains("qwen-image-2.1"), "{refusal}");
@@ -10150,9 +10146,7 @@ mod tests {
             bytes: 0,
             sha256: None,
             mmproj_path: None,
-            vae_path: None,
-            llm_path: None,
-            llm_vision_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,
@@ -11920,9 +11914,7 @@ mod tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
-            vae_path: None,
-            llm_path: None,
-            llm_vision_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,

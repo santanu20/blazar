@@ -35,14 +35,23 @@ pub(crate) fn images_gate(row: Option<&blazar_core::store::ModelRow>, edits: boo
     let Some(row) = row else {
         return ImagesGate::Serve;
     };
-    if row.vae_path.is_none() {
+    if !row.has_component_set() {
         return ImagesGate::Reject(format!(
             "\"{}\" is not a diffusion model — /v1/images serves diffusion component sets \
              (DiT + VAE + text encoder, sdcpp lane); chat models serve /v1/chat/completions",
             row.name
         ));
     }
-    if edits && row.llm_vision_path.is_none() {
+    if edits && !row.serves_image_edits() {
+        // Family-aware refusal: a vision-less family (FLUX) would loop
+        // forever on re-pull teaching — its set is already complete.
+        if blazar_runtime::diffusion::family_supports_edits(&row.repo) == Some(false) {
+            return ImagesGate::Reject(format!(
+                "\"{}\" belongs to a diffusion family without a vision encoder — \
+                 instruction edits are not supported; use /v1/images/generations",
+                row.name
+            ));
+        }
         return ImagesGate::Reject(format!(
             "image edits need the vision-encoder companion — \"{}\" was pulled without one; \
              re-pull it to fetch the set: blazar pull {}",
@@ -231,6 +240,17 @@ mod tests {
     use super::*;
 
     fn row(vae: Option<&str>, vision: Option<&str>) -> blazar_core::store::ModelRow {
+        let mut components = Vec::new();
+        if let Some(vae) = vae {
+            components.push(blazar_core::store::ComponentFile::new("--vae", vae));
+        }
+        components.push(blazar_core::store::ComponentFile::new("--llm", "te.gguf"));
+        if let Some(vision) = vision {
+            components.push(blazar_core::store::ComponentFile::new(
+                "--llm_vision",
+                vision,
+            ));
+        }
         blazar_core::store::ModelRow {
             name: "qwen-image-2.1".into(),
             repo: "abenzerps/Qwen-Image-2.1-GGUF".into(),
@@ -239,15 +259,26 @@ mod tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
-            vae_path: vae.map(str::to_string),
-            llm_path: Some("te.gguf".into()),
-            llm_vision_path: vision.map(str::to_string),
+            components,
             shards: 1,
             arch: None,
             params: None,
             ctx_train: None,
             pulled_at: 1,
         }
+    }
+
+    /// FLUX row: full component set, no vision encoder in the family.
+    fn flux_row() -> blazar_core::store::ModelRow {
+        let mut row = row(Some("ae.safetensors"), None);
+        row.name = "flux.1-dev".into();
+        row.repo = "city96/FLUX.1-dev-gguf".into();
+        row.components = vec![
+            blazar_core::store::ComponentFile::new("--vae", "ae.safetensors"),
+            blazar_core::store::ComponentFile::new("--t5xxl", "t5.gguf"),
+            blazar_core::store::ComponentFile::new("--clip_l", "clip_l.safetensors"),
+        ];
+        row
     }
 
     #[test]
@@ -276,6 +307,26 @@ mod tests {
         };
         assert!(msg.contains("vision-encoder"), "{msg}");
         assert!(msg.contains("blazar pull"), "{msg}");
+    }
+
+    #[test]
+    fn unit__images_gate__visionless_family_edits_refuse_without_repull_loop() {
+        // FLUX has no vision encoder to re-pull: the teaching must say
+        // edits are unsupported, not send the user in a re-pull circle.
+        let gate = images_gate(Some(&flux_row()), true);
+        let ImagesGate::Reject(msg) = gate else {
+            panic!("edits on a vision-less family must be rejected");
+        };
+        assert!(msg.contains("without a vision encoder"), "{msg}");
+        assert!(
+            !msg.contains("blazar pull"),
+            "re-pull teaching on a complete set loops forever: {msg}"
+        );
+        // Generations still serve for the same row.
+        assert!(matches!(
+            images_gate(Some(&flux_row()), false),
+            ImagesGate::Serve
+        ));
     }
 
     #[test]
