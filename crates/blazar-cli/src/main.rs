@@ -1161,15 +1161,23 @@ async fn run(cmd: Cmd) -> Result<()> {
             max_tokens,
             no_draft,
         } => {
-            let model = ensure_run_model(&model).await?;
             let inline: Option<String> = {
                 let joined = prompt.join(" ");
                 (!joined.is_empty()).then_some(joined)
             };
             // Lane routing: diffusion rows and piper voices never reach
             // the chat REPL — each drives its own generation loop (an
-            // inline prompt runs a single shot, no loop).
-            if let Ok(Some(row)) = Store::open(&dirs()).and_then(|s| s.get_model(&model)) {
+            // inline prompt runs a single shot, no loop). Resolution
+            // stays soft here: a name that matches neither a row nor a
+            // pulled voice falls through to run_dispatch, which owns
+            // the pull-teaching error.
+            let ensured = ensure_run_model(&model).await;
+            let model_ref: &str = ensured.as_deref().unwrap_or(&model);
+            let row = Store::open(&dirs())
+                .ok()
+                .and_then(|s| s.get_model(model_ref).ok().flatten());
+            if let Some(row) = row {
+                let model = model_ref.to_string();
                 match run_lane(&row) {
                     RunLane::Image => {
                         let base = ensure_daemon().await?;
@@ -1182,11 +1190,12 @@ async fn run(cmd: Cmd) -> Result<()> {
                     RunLane::Text => {}
                 }
             } else if let Some(voice) =
-                tts_voice_target(&model, &blazar_runtime::piper::list_voices(&dirs()))
+                tts_voice_target(model_ref, &blazar_runtime::piper::list_voices(&dirs()))
             {
                 let base = ensure_daemon().await?;
                 return tts_repl(&base, voice, inline.as_deref()).await;
             }
+            let model = ensured?;
             run_dispatch(&model, &prompt, verbose, max_tokens, no_draft).await
         }
         Cmd::Bench { model } => bench(&resolve_model_cli(&model)),
@@ -6666,6 +6675,21 @@ fn image_payload(resp: &serde_json::Value) -> Option<(Vec<u8>, String)> {
     Some((bytes, ext))
 }
 
+/// Async job envelope: `{status, error, result: {b64_json, ...}}` — the
+/// payload rides under `result`, unlike the sync `{data: [...]}` shape.
+fn job_payload(job: &serde_json::Value, default_ext: &str) -> Option<(Vec<u8>, String)> {
+    use base64::Engine as _;
+    let b64 = job.get("result")?.get("b64_json")?.as_str()?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let ext = job
+        .get("result")
+        .and_then(|r| r.get("output_format"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(default_ext)
+        .to_string();
+    Some((bytes, ext))
+}
+
 /// Write one generated artifact under a stable name; returns the path
 /// written (for the loop's receipt line).
 fn write_gen_out(model: &str, bytes: &[u8], ext: &str) -> Result<String> {
@@ -6846,7 +6870,7 @@ async fn video_wait(base: &str, model: &str, job: &str) {
         match status.as_str() {
             "completed" => {
                 println!();
-                match image_payload(&v) {
+                match job_payload(&v, "webm") {
                     Some((bytes, ext)) => match write_gen_out(model, &bytes, &ext) {
                         Ok(path) => println!(
                             "wrote {path} ({}, {:.1}s)",
@@ -10843,6 +10867,33 @@ mod tests {
             "/models/sd_xl_base_1.0.safetensors",
         )];
         assert!(matches!(run_lane(&sdxl), RunLane::Image));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__job_payload__reads_result_envelope_not_sync_shape() {
+        use base64::Engine as _;
+        let raw = base64::engine::general_purpose::STANDARD.encode(b"payload");
+        // Async job envelope: payload rides under `result`.
+        let job = serde_json::json!({
+            "id": "job_1", "status": "completed",
+            "result": {"b64_json": raw}
+        });
+        let (bytes, ext) = job_payload(&job, "webm").expect("result envelope must parse");
+        assert_eq!(bytes, b"payload");
+        assert_eq!(ext, "webm");
+        // output_format inside result overrides the default.
+        let job2 = serde_json::json!({
+            "status": "completed",
+            "result": {"b64_json": raw, "output_format": "mp4"}
+        });
+        assert_eq!(
+            job_payload(&job2, "webm").map(|(_, e)| e),
+            Some("mp4".into())
+        );
+        // The sync {data:[...]} shape is NOT a job envelope.
+        let sync = serde_json::json!({"data": [{"b64_json": raw}], "output_format": "png"});
+        assert!(job_payload(&sync, "webm").is_none());
     }
 
     #[test]
