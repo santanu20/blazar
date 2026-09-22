@@ -3935,21 +3935,28 @@ ENGINE_LABELS = {
     "v0.9.3": "mistral.rs 0.9.3 (CUDA sm89)",
 }
 
+# Hardware rows describe the measuring host (this repo's reference box);
+# the volatile rows (runtimes, model) are DERIVED from the cells at render
+# time so a re-render can never publish a stale context next to fresh
+# numbers.
 TEST_BED = [
     ("CPU", "Intel Core i7-14650HX, 24 hardware threads"),
     ("Discrete GPU", "NVIDIA GeForce RTX 4070 Laptop, 8 GiB, driver 580.173.02"),
     ("Integrated GPU", "Intel Graphics (RPL-S), Vulkan device"),
     ("RAM", "16 GiB (13.3 GiB usable)"),
     ("OS", "Linux Mint 22.3, kernel 7.0.0-31-generic"),
-    (
-        "Runtimes compared",
-        "blazar 0.5.0 gateway - llama.cpp b10809 (Vulkan + CUDA builds) - mistral.rs 0.9.3 - ollama 0.33.3",
-    ),
-    (
-        "Model",
-        "Qwen3.5-9B, Q4_K_M GGUF (5.4 GiB) + vision projector mmproj-F16 (876 MiB)",
-    ),
 ]
+
+
+def derived_test_bed_rows(recs: list[dict], blazar_ver: str) -> list[tuple[str, str]]:
+    """Runtimes and model come from the cells themselves, never hardcoded."""
+    engines = sorted({engine_label(r.get("tag", "?")) for r in recs if r.get("tag")})
+    models = sorted({r.get("model", "?") for r in recs if r.get("model")})
+    return [
+        ("Runtimes compared", f"blazar {blazar_ver} gateway - " + " - ".join(engines)),
+        ("Model", ", ".join(models)),
+    ]
+
 
 METHODOLOGY = [
     "All lanes speak the OpenAI-compatible streaming API; tokens are counted from usage chunks (engine-injected at the gateway), never estimated from chunk counts.",
@@ -4482,7 +4489,9 @@ def write_publication_report(
     L.append("")
     L.append("| Component | Value |")
     L.append("|---|---|")
-    L += [f"| {k} | {v} |" for k, v in TEST_BED]
+    L += [
+        f"| {k} | {v} |" for k, v in TEST_BED + derived_test_bed_rows(recs, blazar_ver)
+    ]
     L.append("")
     L.append("## Methodology")
     L.append("")

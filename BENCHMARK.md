@@ -1,10 +1,10 @@
 # Blazar inference benchmark
 
-_Rendered 20260911-223054; blazar 0.5.0; power state of gateway rows: ac._
+_Rendered 20260922-174339; blazar 0.10.0; power state of gateway rows: ac._
 
 ## Executive summary
 
-b10903-cuda: gateway 40.3 vs direct 41.1 t/s (-1.9%); b10903-cuda prompt-cache prefill 7332 vs 1207 t/s cold; 4-stream concurrency: 104.2 t/s system (4x65536 shape); gateway cold boot 0.54 s; cold TTFT 11577 ms vs ollama 6566 ms (0.6x); idle wake 2104 ms (sleep) vs ollama 7194 ms (full reload).
+b11070-cuda: gateway 347.6 vs direct 333.0 t/s (+4.4%); b11070-cuda prompt-cache prefill 51806 vs 17747 t/s cold; 4-stream concurrency: 447.9 t/s system (2x32768 shape); gateway cold boot 0.52 s.
 
 ## Test bed
 
@@ -15,8 +15,8 @@ b10903-cuda: gateway 40.3 vs direct 41.1 t/s (-1.9%); b10903-cuda prompt-cache p
 | Integrated GPU | Intel Graphics (RPL-S), Vulkan device |
 | RAM | 16 GiB (13.3 GiB usable) |
 | OS | Linux Mint 22.3, kernel 7.0.0-31-generic |
-| Runtimes compared | blazar 0.5.0 gateway - llama.cpp b10809 (Vulkan + CUDA builds) - mistral.rs 0.9.3 - ollama 0.33.3 |
-| Model | Qwen3.5-9B, Q4_K_M GGUF (5.4 GiB) + vision projector mmproj-F16 (876 MiB) |
+| Runtimes compared | blazar 0.10.0 gateway - b11070-cuda |
+| Model | qwen2.5-0.5b.gguf |
 
 ## Methodology
 
@@ -32,7 +32,7 @@ b10903-cuda: gateway 40.3 vs direct 41.1 t/s (-1.9%); b10903-cuda prompt-cache p
 - Cold TTFT = first-token latency of the cold probe itself (max_tokens 4, aligned num_ctx 16384 on both runtimes).
 - ollama daemon boot is only measured with --ollama-service-restart (systemd restart, sudo password via BENCH_SUDO_PASSWORD env, stdin-only); without it the daemon stays warm and the row says so.
 - Idle-wake: blazar's reaper sleeps the child at idle_sleep_secs (weights stay RAM-resident, VRAM released) — wake TTFT is a sleep-wake; ollama's keep_alive expiry fully unloads — wake TTFT is a disk reload. The policy column names the semantic; both measured after the policy is observed via /api/ps.
-- Long-context curve: per-ctx cells (blazar model_overrides ctx / ollama num_ctx) × 3-run decode suites; each ollama point evicts first so the runner respawns at that ctx.
+- Long-context curve: per-ctx cells (blazar model_overrides ctx / ollama num_ctx) x 3-run decode suites; each ollama point evicts first so the runner respawns at that ctx.
 - Sustained concurrency: sequential bursts of the parallel-stream lane (default 3 rounds); TTFT p99 aggregates every stream of every round.
 - Every blazar row records the spawned engine's argv (slots/context shown in tables) and stamps blazar version, wall clock, 5-min load average, and AC/battery power state; GPU cells refuse to run on battery.
 
@@ -42,17 +42,16 @@ b10903-cuda: gateway 40.3 vs direct 41.1 t/s (-1.9%); b10903-cuda prompt-cache p
 
 | Runtime | slots x ctx | decode t/s | TTFT p50 ms | TTFT p99 ms | ITL p50 ms | ITL p99 ms | prefill cold t/s | prefill cached t/s | GPU peak MiB | GPU power W |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| blazar gateway - b10903-cuda | 4x65536 | 40.3 | 119.3 | 123.1 | 24.7 | 27.4 | 1207.3 | 7332.2 | 6329 | 56.5 |
-| direct engine - b10903-cuda | 1x16384 | 41.1 | 120.9 | 125.2 | 24.3 | 25.4 | 1300.1 | 7658.4 | 5716 | 56.0 |
-| ollama 0.33.3 - qwen3.5:9b | service | 40.4 | 141.1 | 148.0 | 25.0 | 75.1 | 1641.6 | 5611.2 | 6446 | 57.3 |
+| blazar gateway - b11070-cuda | 2x32768 | 338.7 | 10.3 | 14.1 | 3.0 | 4.2 | 18039.0 | 49490.6 | 1021 | 54.1 |
+| blazar gateway - b11070-cuda | 1x16384 | 347.6 | 10.2 | 13.7 | 2.9 | 4.1 | 17747.0 | 51806.2 | 788 | 51.7 |
+| direct engine - b11070-cuda | 1x16384 | 333.0 | 9.5 | 11.9 | 3.0 | 3.6 | 17776.7 | 54712.8 | 788 | 54.2 |
 
 ### Concurrency (4 parallel streams x 128 tokens)
 
 | Runtime | slots | ok streams | rounds | system t/s | sum-stream t/s | wall s | TTFT max ms | TTFT p99 ms | ITL p99 ms |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| direct engine - b10903-cuda | 4 | 4/4 | 1 | 108.8 | 113.8 | 4.71 | 251 | - | 38.8 |
-| blazar gateway - b10903-cuda | 4x65536 | 12/4 | 3 | 104.2 | 338.7 | 14.73 | 529 | 529 | 37.9 |
-| ollama - qwen3.5:9b | service | 12/4 | 3 | 33.4 | 482.4 | 46.02 | 16306 | 15943 | 75.5 |
+| blazar gateway - b11070-cuda | 2x32768 | 12/4 | 3 | 447.9 | 3287.4 | 2.26 | 512 | 501 | 5.7 |
+| direct engine - b11070-cuda | 4 | 4/4 | 1 | 477.8 | 674.4 | 0.72 | 32 | - | 11.8 |
 
 _sum-stream >> system t/s means streams serialize on one slot; roughly equal means genuinely parallel._
 
@@ -60,14 +59,14 @@ _sum-stream >> system t/s means streams serialize on one slot; roughly equal mea
 
 | Engine | perplexity (ctx 2048, offline ASCII corpus) |
 |---|---:|
-| b10903-cuda | 16.75 ± 0.88 |
+| b11070-cuda | 43.86 ± 2.54 |
 
 ### Greedy parity and gateway transparency (20 prompts, 256 tokens)
 
 | Comparison | exact / total | ratio mean | ratio min |
 |---|---:|---:|---:|
-| b10903-cuda vs same-engine reference (direct) | 20/20 | 1.000 | 1.000 |
-| b10903-cuda through blazar gateway vs direct | 5/20 | 0.559 | 0.027 |
+| b11070-cuda vs same-engine reference (direct) | 20/20 | 1.000 | 1.000 |
+| b11070-cuda through blazar gateway vs direct | 19/20 | 0.967 | 0.332 |
 
 _Exact-match divergence across GPU backends is expected float nondeterminism (batch shape and backend kernels), not translation drift; bit-parity across runs requires single-slot decoding (blazar `deterministic = true` pins it)._
 
@@ -75,13 +74,12 @@ _Exact-match divergence across GPU backends is expected float nondeterminism (ba
 
 | Engine | axis | setting | decode t/s | delta vs dense | prefill cold t/s | delta |
 |---|---|---|---:|---:|---:|---:|
-| b10903-cuda | kv | q8_0 | 40.6 | -0.7 | 1301.7 | 62.5 |
-| b10903-cuda | spec | ngram-simple | 40.7 | -0.5 | 1327.7 | 88.5 |
-| b10903-cuda | mmproj | True | 41.1 | -0.1 | 1290.8 | 51.6 |
+| b11070-cuda | kv | q8_0 | 321.7 | -30.7 | 16941.3 | 742.3 |
+| b11070-cuda | spec | ngram-simple | 327.5 | -24.8 | 18061.0 | 1861.9 |
 
 ### Engine capability matrix
 
-| Capability | b10903-cuda |
+| Capability | b11070-cuda |
 |---|---:|
 | anthropic-api | no |
 | ctx-override | yes |
@@ -104,9 +102,9 @@ _Exact-match divergence across GPU backends is expected float nondeterminism (ba
 
 | Runtime | daemon boot s | first request (cold engine load) s | cold TTFT ms | engine load s | RSS peak MiB |
 |---|---:|---:|---:|---:|---:|
-| blazar gateway - b10903-cuda | 0.54 | 11.66 | 11577 | - | 2181 |
-| direct engine - b10903-cuda | - | - | - | 2.51 | 5705 |
-| ollama - qwen3.5:9b | 4.13 | 6.65 | 6566 | 6.36 | - |
+| blazar gateway - b11070-cuda | 0.52 | 1.74 | 1719 | - | 584 |
+| blazar gateway - b11070-cuda | 0.52 | 1.90 | 1891 | - | 568 |
+| direct engine - b11070-cuda | - | - | - | 1.00 | 564 |
 
 _Every cold probe runs page-cache-dropped and GPU-idle-asserted on both runtimes; ollama rows without --ollama-service-restart leave the daemon warm (note in the artifact)._
 
@@ -114,8 +112,7 @@ _Every cold probe runs page-cache-dropped and GPU-idle-asserted on both runtimes
 
 | Runtime | idle policy | policy observed | wake TTFT ms | reload s | note |
 |---|---|---|---:|---:|---|
-| blazar - b10903-cuda | sleep at 15s (weights stay RAM-resident) | yes | 2104 | - |  |
-| ollama - qwen3.5:9b | keep_alive 20s -> full unload | yes | 7194 | 7.00 |  |
+| blazar - b11070-cuda | sleep at 15s (weights stay RAM-resident) | yes | 641 | - |  |
 
 _blazar sleeps with weights in RAM (wake = resume); ollama unloads at keep_alive expiry (wake = full disk reload). Policies differ by design — the table measures each runtime's own idle path after the policy verifiably fired._
 
@@ -123,12 +120,9 @@ _blazar sleeps with weights in RAM (wake = resume); ollama unloads at keep_alive
 
 | Runtime | ctx | decode t/s | TTFT p50 ms |
 |---|---:|---:|---:|
-| ollama - qwen3.5:9b | 2048 | 40.1 | 146 |
-| ollama - qwen3.5:9b | 8192 | 40.3 | 147 |
-| ollama - qwen3.5:9b | 16384 | 40.3 | 149 |
-| blazar - b10903-cuda | 2048 | 40.8 | 117 |
-| blazar - b10903-cuda | 8192 | 40.5 | 122 |
-| blazar - b10903-cuda | 16384 | 40.4 | 121 |
+| blazar - b11070-cuda | 2048 | 333.1 | 15 |
+| blazar - b11070-cuda | 8192 | 327.6 | 11 |
+| blazar - b11070-cuda | 16384 | 342.6 | 13 |
 
 ## Findings
 
@@ -154,4 +148,4 @@ python3 scripts/bench_matrix.py --blazar-bin target/release/blazar --md BENCHMAR
 python3 scripts/bench_matrix.py --render-only --artifacts-dir <dir> --md BENCHMARK.md
 ```
 
-_Raw per-cell records (argv, per-run lists, daemon logs): `~/.cache/blazar-bench-matrix/<run-id>/cells.jsonl`._
+_Raw per-cell records (argv, per-run lists, daemon logs): `/home/santanu/.cache/blazar-bench-matrix/20260922-174339/cells.jsonl`._
