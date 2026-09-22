@@ -117,7 +117,10 @@ pub struct Config {
     /// the engine's native slot prompt-cache already covers identical
     /// prefixes (16x on re-ask, measured) at zero cost, while the
     /// `--cache-reuse` path measured ~0.6s SLOWER cold loads (elim
-    /// sweep 2026-09-12). Opt back in for cross-slot prefix sharing.
+    /// sweep 2026-09-12). Opt back in for within-child prefix reuse:
+    /// `--cache-reuse N` reuses KV chunks from that child's own slot
+    /// cache (per-process; never cross-replica — each replica is a
+    /// separate llama-server with its own cache).
     pub cache_reuse: u32,
     /// API keys (virtual keys): empty = no auth (loopback default).
     /// Each entry scopes a bearer key to models + rate/token budgets
