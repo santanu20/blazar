@@ -2056,6 +2056,41 @@ fn doctor_group(name: &str) -> &'static str {
 /// census, largest-model fit, and active-asset arch match (the per-arch
 /// channel makes this actionable — a wrong-arch slim asset would run
 /// but JIT or miss SASS).
+/// Parse the parent PID out of a `/proc/<pid>/stat` line. Field 4 is
+/// ppid, but `comm` (field 2) may contain spaces and parentheses, so
+/// everything before the LAST `)` is skipped first.
+fn ppid_from_stat(stat: &str) -> Option<u32> {
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// True when `pid` is a blazar-owned process (the daemon itself or any
+/// engine child descended from one). Walks `/proc` ancestry with a hop
+/// bound; unknown ancestry (pid exited mid-walk) reads as foreign — the
+/// advisory would rather name a ghost than hide a real tenant.
+fn pid_is_blazar_descendant(pid: u32) -> bool {
+    let mut cur = pid;
+    for _ in 0..16 {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{cur}/stat")) else {
+            return false;
+        };
+        let comm = stat
+            .split_once('(')
+            .and_then(|(_, rest)| rest.rsplit_once(')'))
+            .map(|(name, _)| name.to_string())
+            .unwrap_or_default();
+        if comm == "blazar" {
+            return true;
+        }
+        match ppid_from_stat(&stat) {
+            Some(1) | None => return false,
+            Some(next) if next == cur => return false,
+            Some(next) => cur = next,
+        }
+    }
+    false
+}
+
 async fn doctor_gpu(d: &BlazarDirs) -> Vec<Check> {
     let mut out = Vec::new();
     let (driver_cuda, cc) = blazar_runtime::engine::build::nvidia_gpu_facts().await;
@@ -2109,6 +2144,34 @@ async fn doctor_gpu(d: &BlazarDirs) -> Vec<Check> {
                         ));
                     }
                 }
+            }
+        }
+    }
+    // Foreign VRAM tenants (advisory): compute processes that are NOT
+    // descended from a blazar server. Co-residency is legal, but an
+    // invisible foreign holder is the #1 cause of opaque mid-job OOM —
+    // the gate estimates against free VRAM, so name what eats it.
+    if vram > 0 {
+        if let Some(tenants) = blazar_runtime::probe::gpu_compute_tenants() {
+            let foreign: Vec<String> = tenants
+                .iter()
+                .filter(|t| !pid_is_blazar_descendant(t.pid))
+                .map(|t| format!("{} ({} MiB)", t.process_name, t.used_mib))
+                .collect();
+            if !foreign.is_empty() {
+                let held: u64 = tenants
+                    .iter()
+                    .filter(|t| !pid_is_blazar_descendant(t.pid))
+                    .map(|t| t.used_mib)
+                    .sum();
+                out.push(Check::warn(
+                    "gpu co-tenants",
+                    format!(
+                        "non-blazar processes hold ~{held} MiB of GPU memory: {} — \
+                         blazar budgets against FREE VRAM, so these reduce what fits",
+                        foreign.join(", ")
+                    ),
+                ));
             }
         }
     }
