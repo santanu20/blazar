@@ -313,6 +313,10 @@ enum Cmd {
         /// Playback speed (0.25..=4.0, 1.0 = native)
         #[arg(long, requires = "text")]
         speed: Option<f64>,
+        /// Write the WAV without local playback (for scripts; playing
+        /// requires a terminal and an audio player anyway)
+        #[arg(long, requires = "text")]
+        no_play: bool,
     },
     /// Engine management: llama.cpp releases, mistral.rs lane, source
     /// builds (`build cuda|cpu`), rollback + update channels
@@ -1277,6 +1281,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             pin,
             out,
             speed,
+            no_play,
         } => {
             tts_cmd(
                 text,
@@ -1288,6 +1293,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                 pin,
                 out,
                 speed,
+                no_play,
             )
             .await
         }
@@ -6077,6 +6083,7 @@ async fn tts_cmd(
     pin: Option<String>,
     out: Option<PathBuf>,
     speed: Option<f64>,
+    no_play: bool,
 ) -> Result<()> {
     let d = dirs();
     if let Some(value) = pin {
@@ -6144,17 +6151,20 @@ async fn tts_cmd(
             "no text given — pass text to synthesize, or use --install/--pull/--list"
         ));
     };
-    tts_speak(&d, &text, voice, out.as_deref(), speed).await
+    let play = !no_play && std::io::IsTerminal::is_terminal(&std::io::stdout());
+    tts_speak(&d, &text, voice, out.as_deref(), speed, play).await
 }
 
 /// Synthesis arm of `blazar tts`: resolve the voice (default: first
 /// pulled), POST the daemon's `/v1/audio/speech`, write the WAV.
+#[allow(clippy::too_many_arguments)]
 async fn tts_speak(
     d: &BlazarDirs,
     text: &str,
     voice: Option<&str>,
     out: Option<&Path>,
     speed: Option<f64>,
+    play: bool,
 ) -> Result<()> {
     let voice = if let Some(v) = voice {
         v.to_string()
@@ -6166,7 +6176,7 @@ async fn tts_speak(
     };
     let base = ensure_daemon().await?;
     let wav = speech_post(&base, &voice, text, speed).await?;
-    write_speech_out(&voice, &wav, out)
+    write_speech_out(&voice, &wav, out, play)
 }
 
 /// Compact timestamp for default output names (no chrono dep needed for
@@ -6698,20 +6708,69 @@ fn write_gen_out(model: &str, bytes: &[u8], ext: &str) -> Result<String> {
     Ok(path)
 }
 
+/// Preview width: terminal columns when attached, else a stable 64 for
+/// piped runs (deterministic renders for scripts and tests).
+fn preview_width() -> u32 {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        return 64;
+    }
+    let (cols, _) = viuer::terminal_size();
+    if cols > 10 {
+        u32::from(cols - 2)
+    } else {
+        64
+    }
+}
+
+/// Inline image render right after the artifact lands on disk. viuer
+/// picks the best protocol the terminal offers (kitty/iTerm when
+/// present, halfblocks everywhere else), so this is one call on our
+/// side; a decode or render failure is one teaching line, never a
+/// failed turn — the file is already written.
+fn render_preview(bytes: &[u8]) {
+    let config = viuer::Config {
+        width: Some(preview_width()),
+        ..viuer::Config::default()
+    };
+    let outcome = image::load_from_memory(bytes)
+        .map_err(|e| e.to_string())
+        .and_then(|img| {
+            viuer::print(&img, &config)
+                .map(|_dims| ())
+                .map_err(|e| e.to_string())
+        });
+    if let Err(e) = outcome {
+        println!("(preview unavailable: {e})");
+    }
+}
+
 /// One image turn: sync request, PNG (or family format) to the working
-/// directory. Returns Ok even on server rejections — a bad prompt must
-/// not kill the loop; the error line teaches and the next turn waits.
-async fn image_turn(base: &str, model: &str, prompt: &str, size: Option<&str>, steps: Option<u64>) {
+/// directory, then an inline preview when asked. Returns Ok even on
+/// server rejections — a bad prompt must not kill the loop; the error
+/// line teaches and the next turn waits.
+async fn image_turn(
+    base: &str,
+    model: &str,
+    prompt: &str,
+    size: Option<&str>,
+    steps: Option<u64>,
+    preview: bool,
+) {
     let started = std::time::Instant::now();
     match image_post(base, model, prompt, size, steps).await {
         Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
             Ok(v) => match image_payload(&v) {
                 Some((bytes, ext)) => match write_gen_out(model, &bytes, &ext) {
-                    Ok(path) => println!(
-                        "wrote {path} ({}, {:.1}s)",
-                        humansize(i64::try_from(bytes.len()).unwrap_or(i64::MAX)),
-                        started.elapsed().as_secs_f64()
-                    ),
+                    Ok(path) => {
+                        println!(
+                            "wrote {path} ({}, {:.1}s)",
+                            humansize(i64::try_from(bytes.len()).unwrap_or(i64::MAX)),
+                            started.elapsed().as_secs_f64()
+                        );
+                        if preview {
+                            render_preview(&bytes);
+                        }
+                    }
                     Err(e) => println!("error: {e}"),
                 },
                 None => println!("error: response carried no image data — daemon logs explain"),
@@ -6728,17 +6787,19 @@ async fn image_turn(base: &str, model: &str, prompt: &str, size: Option<&str>, s
 
 /// Image loop for diffusion component sets and standalone checkpoints:
 /// every line is a prompt, every answer an image in the working
-/// directory. Knobs override the server's family defaults; omitted
-/// knobs let the daemon size the request (the same defaults the HTTP
-/// API applies).
+/// directory (previewed inline when the terminal can render). Knobs
+/// override the server's family defaults; omitted knobs let the daemon
+/// size the request (the same defaults the HTTP API applies).
 async fn image_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()> {
     if let Some(prompt) = inline {
-        image_turn(base, model, prompt, None, None).await;
+        let preview = std::io::IsTerminal::is_terminal(&std::io::stdout());
+        image_turn(base, model, prompt, None, None, preview).await;
         return Ok(());
     }
     let mut rl = rustyline::DefaultEditor::new()?;
     let mut size: Option<String> = None;
     let mut steps: Option<u64> = None;
+    let mut preview = std::io::IsTerminal::is_terminal(&std::io::stdout());
     #[cfg(unix)]
     install_repl_sigint();
     println!("blazar image REPL — {model} (a prompt generates; /help; /exit)");
@@ -6750,10 +6811,10 @@ async fn image_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()>
         match line.as_str() {
             "/exit" | "/bye" => break,
             "/help" => {
-                println!("commands: /exit /bye /size <WxH> /steps <n>");
+                println!("commands: /exit /bye /size <WxH> /steps <n> /preview on|off");
                 println!(
                     "input:   plain text prompts; a turn answers with an image file \
-                     in the working directory"
+                     in the working directory (rendered inline when /preview is on)"
                 );
             }
             _ if line.starts_with("/size ") => {
@@ -6774,11 +6835,22 @@ async fn image_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()>
                     None => println!("(usage: /steps 24 — 1..=100)"),
                 }
             }
+            _ if line.starts_with("/preview ") => match line["/preview ".len()..].trim() {
+                "on" | "true" => {
+                    preview = true;
+                    println!("(preview on — images render after writing)");
+                }
+                "off" | "false" => {
+                    preview = false;
+                    println!("(preview off — files land silently)");
+                }
+                _ => println!("(usage: /preview on|off)"),
+            },
             _ if line.starts_with('/') => {
                 println!("(unknown command — /help)");
             }
             _ => {
-                image_turn(base, model, &line, size.as_deref(), steps).await;
+                image_turn(base, model, &line, size.as_deref(), steps, preview).await;
             }
         }
     }
@@ -6995,8 +7067,9 @@ async fn speech_post(base: &str, voice: &str, text: &str, speed: Option<f64>) ->
 }
 
 /// Write synthesized audio: `-` streams to stdout, anything else lands
-/// as a WAV under the given path (or a voice-stamped default).
-fn write_speech_out(voice: &str, wav: &[u8], out: Option<&Path>) -> Result<()> {
+/// as a WAV under the given path (or a voice-stamped default); a file
+/// write can then hand the clip to local playback.
+fn write_speech_out(voice: &str, wav: &[u8], out: Option<&Path>, play: bool) -> Result<()> {
     if out == Some(Path::new("-")) {
         use std::io::Write as _;
         std::io::stdout().write_all(wav)?;
@@ -7011,38 +7084,88 @@ fn write_speech_out(voice: &str, wav: &[u8], out: Option<&Path>) -> Result<()> {
             wav.len(),
             wav_duration_secs(wav)
         );
+        if play {
+            play_wav_detached(&path);
+        }
     }
     Ok(())
 }
 
-/// Speech loop over pulled piper voices: every line is spoken to a WAV
-/// in the working directory. `/voice` switches among installed voices
-/// (pulling a new one stays with `blazar tts --pull <voice>`).
-async fn tts_repl(base: &str, voice: &str, inline: Option<&str>) -> Result<()> {
-    let run_turn = |voice: String, text: String, speed: Option<f64>, out: Option<PathBuf>| {
-        let base = base.to_string();
-        async move {
-            let started = std::time::Instant::now();
-            match speech_post(&base, &voice, &text, speed).await {
-                Ok(wav) => {
-                    if let Err(e) = write_speech_out(&voice, &wav, out.as_deref()) {
-                        println!("error: {e}");
-                    } else {
-                        println!("({:.1}s)", started.elapsed().as_secs_f64());
-                    }
-                }
-                Err(e) => println!("error: {e}"),
-            }
-        }
+/// Player probe order: first name resolvable on PATH wins. Argument
+/// shapes differ per player (ffplay needs flags to exit when the clip
+/// ends), so the argv prefix is built per player.
+const WAV_PLAYERS: [&str; 4] = ["paplay", "aplay", "afplay", "ffplay"];
+
+fn player_argv(player: &str, path: &str) -> Vec<String> {
+    match player {
+        "ffplay" => vec![
+            "-autoexit".to_string(),
+            "-loglevel".to_string(),
+            "quiet".to_string(),
+            path.to_string(),
+        ],
+        _ => vec![path.to_string()],
+    }
+}
+
+fn player_on_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+}
+
+/// Hand a written WAV to the first available system player on a
+/// detached thread — an 11 s clip must never block the REPL's next
+/// turn. No player on the box is a teaching line, not an error: the
+/// WAV is already safely on disk.
+fn play_wav_detached(path: &str) {
+    let Some(player) = WAV_PLAYERS.iter().find(|p| player_on_path(p)) else {
+        println!(
+            "(no audio player on PATH — install paplay or aplay to hear clips; the WAV is on disk)"
+        );
+        return;
     };
+    let argv = player_argv(player, path);
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    });
+}
+
+/// Speech loop over pulled piper voices: every line is spoken to a WAV
+/// in the working directory (and played aloud when a player exists).
+/// `/voice` switches among installed voices (pulling a new one stays
+/// with `blazar tts --pull <voice>`).
+async fn tts_repl(base: &str, voice: &str, inline: Option<&str>) -> Result<()> {
+    let run_turn =
+        |voice: String, text: String, speed: Option<f64>, out: Option<PathBuf>, play: bool| {
+            let base = base.to_string();
+            async move {
+                let started = std::time::Instant::now();
+                match speech_post(&base, &voice, &text, speed).await {
+                    Ok(wav) => {
+                        if let Err(e) = write_speech_out(&voice, &wav, out.as_deref(), play) {
+                            println!("error: {e}");
+                        } else {
+                            println!("({:.1}s)", started.elapsed().as_secs_f64());
+                        }
+                    }
+                    Err(e) => println!("error: {e}"),
+                }
+            }
+        };
     if let Some(text) = inline {
-        run_turn(voice.to_string(), text.to_string(), None, None).await;
+        let play = std::io::IsTerminal::is_terminal(&std::io::stdout());
+        run_turn(voice.to_string(), text.to_string(), None, None, play).await;
         return Ok(());
     }
     let mut rl = rustyline::DefaultEditor::new()?;
     let mut voice = voice.to_string();
     let mut speed: Option<f64> = None;
     let mut out: Option<PathBuf> = None;
+    let mut play = std::io::IsTerminal::is_terminal(&std::io::stdout());
     #[cfg(unix)]
     install_repl_sigint();
     println!("blazar speech REPL — {voice} (a line is spoken aloud; /help; /exit)");
@@ -7054,10 +7177,13 @@ async fn tts_repl(base: &str, voice: &str, inline: Option<&str>) -> Result<()> {
         match line.as_str() {
             "/exit" | "/bye" => break,
             "/help" => {
-                println!("commands: /exit /bye /voice <name> /speed <0.1-4> /out <path>");
+                println!(
+                    "commands: /exit /bye /voice <name> /speed <0.1-4> /out <path> /play on|off"
+                );
                 println!(
                     "input:   plain text; each line writes a WAV in the working \
-                     directory (voices: blazar tts --list, new ones: blazar tts --pull)"
+                     directory (and plays it when a player exists; voices: blazar \
+                     tts --list, new ones: blazar tts --pull)"
                 );
             }
             _ if line.starts_with("/voice ") => {
@@ -7078,6 +7204,17 @@ async fn tts_repl(base: &str, voice: &str, inline: Option<&str>) -> Result<()> {
                     None => println!("(usage: /speed 1.2 — 0.1..=4.0, 1.0 = native)"),
                 }
             }
+            _ if line.starts_with("/play ") => match line["/play ".len()..].trim() {
+                "on" | "true" => {
+                    play = true;
+                    println!("(play on — each turn plays after writing)");
+                }
+                "off" | "false" => {
+                    play = false;
+                    println!("(play off — WAVs are written silently)");
+                }
+                _ => println!("(usage: /play on|off)"),
+            },
             _ if line.starts_with("/out ") => {
                 let p = line["/out ".len()..].trim().to_string();
                 out = Some(PathBuf::from(p));
@@ -7090,7 +7227,7 @@ async fn tts_repl(base: &str, voice: &str, inline: Option<&str>) -> Result<()> {
                 println!("(unknown command — /help)");
             }
             _ => {
-                run_turn(voice.clone(), line.clone(), speed, out.clone()).await;
+                run_turn(voice.clone(), line.clone(), speed, out.clone(), play).await;
             }
         }
     }
