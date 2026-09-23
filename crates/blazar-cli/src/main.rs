@@ -2170,94 +2170,103 @@ async fn doctor_gpu(d: &BlazarDirs) -> Vec<Check> {
             "no GPUs visible to the probe — CPU-only serving".to_string(),
         ));
     }
-    // Fit: largest registered model vs total VRAM (weights only; KV
-    // cache needs headroom on top).
+    // Fit + co-tenants only matter when there IS a GPU; arch match
+    // applies whenever an active CUDA asset exists.
     if vram > 0 {
-        if let Ok(store) = Store::open(d) {
-            if let Ok(models) = store.list_models() {
-                if let Some(big) = models.iter().max_by_key(|m| m.bytes) {
-                    // display + MiB-fit heuristic: precision/sign loss is irrelevant here
-                    #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
-                    let fits = (big.bytes as u64 / 1_048_576) < vram as u64;
-                    #[allow(clippy::cast_precision_loss)]
-                    let gib = big.bytes as f64 / 1_073_741_824.0;
-                    #[allow(clippy::cast_precision_loss)]
-                    let vram_gib = vram as f64 / 1024.0;
-                    if fits {
-                        out.push(Check::ok(
-                            "gpu fit",
-                            format!("largest model {} ({gib:.1} GiB) fits VRAM ({vram_gib:.1} GiB) — KV cache has headroom", big.name),
-                        ));
-                    } else {
-                        out.push(Check::warn(
-                            "gpu fit",
-                            format!("largest model {} ({gib:.1} GiB) exceeds VRAM ({vram_gib:.1} GiB) — layers will offload to RAM", big.name),
-                        ));
-                    }
-                }
-            }
-        }
+        out.extend(gpu_fit_check(d, vram));
+        out.extend(gpu_cotenants_check());
     }
-    // Foreign VRAM tenants (advisory): compute processes that are NOT
-    // descended from a blazar server. Co-residency is legal, but an
-    // invisible foreign holder is the #1 cause of opaque mid-job OOM —
-    // the gate estimates against free VRAM, so name what eats it.
-    if vram > 0 {
-        if let Some(tenants) = blazar_runtime::probe::gpu_compute_tenants() {
-            let foreign: Vec<String> = tenants
-                .iter()
-                .filter(|t| !pid_is_blazar_descendant(t.pid))
-                .map(|t| format!("{} ({} MiB)", t.process_name, t.used_mib))
-                .collect();
-            if !foreign.is_empty() {
-                let held: u64 = tenants
-                    .iter()
-                    .filter(|t| !pid_is_blazar_descendant(t.pid))
-                    .map(|t| t.used_mib)
-                    .sum();
-                out.push(Check::warn(
-                    "gpu co-tenants",
-                    format!(
-                        "non-blazar processes hold ~{held} MiB of GPU memory: {} — \
-                         blazar budgets against FREE VRAM, so these reduce what fits",
-                        foreign.join(", ")
-                    ),
-                ));
-            }
-        }
-    }
-    // Arch match: the active engine asset's -smNN vs the GPU's sm.
-    if let Ok(store) = Store::open(d) {
-        if let Ok(Some(active)) = store.active_engine() {
-            let asset = active.asset.as_str();
-            if asset.contains("cuda") {
-                let asset_sm = asset
-                    .split_once("-sm")
-                    .and_then(|(_, rest)| rest.split('-').next())
-                    .and_then(|n| n.parse::<u32>().ok());
-                match (asset_sm, sm) {
-                    (Some(a), Some(g)) if a == g => out.push(Check::ok(
-                        "gpu arch match",
-                        format!("active asset targets sm{a} == GPU sm{g} (exact SASS)"),
-                    )),
-                    (Some(a), Some(g)) if a == 120 && g > 120 => out.push(Check::ok(
-                        "gpu arch match",
-                        format!("sm120 PTX asset JITs forward to GPU sm{g}"),
-                    )),
-                    (Some(a), Some(g)) => out.push(Check::warn(
-                        "gpu arch match",
-                        format!("active asset targets sm{a} but GPU is sm{g} — `blazar engine update` should pick the right per-arch asset"),
-                    )),
-                    (None, Some(_)) => out.push(Check::ok(
-                        "gpu arch match",
-                        "active CUDA asset is multi-arch (fat) — runs on any sm".to_string(),
-                    )),
-                    _ => {}
-                }
-            }
-        }
-    }
+    out.extend(gpu_arch_match_check(d, sm));
     out
+}
+
+/// Fit: largest registered model vs total VRAM (weights only; KV
+/// cache needs headroom on top).
+fn gpu_fit_check(d: &BlazarDirs, vram: u64) -> Option<Check> {
+    let store = Store::open(d).ok()?;
+    let models = store.list_models().ok()?;
+    let big = models.iter().max_by_key(|m| m.bytes)?;
+    // MiB-fit heuristic for display; bytes are signed in the row, the
+    // cast is lossless for any real file size.
+    #[allow(clippy::cast_sign_loss)]
+    let fits = (big.bytes as u64 / 1_048_576) < vram;
+    #[allow(clippy::cast_precision_loss)]
+    let gib = big.bytes as f64 / 1_073_741_824.0;
+    #[allow(clippy::cast_precision_loss)]
+    let vram_gib = vram as f64 / 1024.0;
+    Some(if fits {
+        Check::ok(
+            "gpu fit",
+            format!("largest model {} ({gib:.1} GiB) fits VRAM ({vram_gib:.1} GiB) — KV cache has headroom", big.name),
+        )
+    } else {
+        Check::warn(
+            "gpu fit",
+            format!("largest model {} ({gib:.1} GiB) exceeds VRAM ({vram_gib:.1} GiB) — layers will offload to RAM", big.name),
+        )
+    })
+}
+
+/// Foreign VRAM tenants (advisory): compute processes that are NOT
+/// descended from a blazar server. Co-residency is legal, but an
+/// invisible foreign holder is the #1 cause of opaque mid-job OOM —
+/// the gate estimates against free VRAM, so name what eats it.
+fn gpu_cotenants_check() -> Option<Check> {
+    let tenants = blazar_runtime::probe::gpu_compute_tenants()?;
+    let foreign: Vec<String> = tenants
+        .iter()
+        .filter(|t| !pid_is_blazar_descendant(t.pid))
+        .map(|t| format!("{} ({} MiB)", t.process_name, t.used_mib))
+        .collect();
+    if foreign.is_empty() {
+        return None;
+    }
+    let held: u64 = tenants
+        .iter()
+        .filter(|t| !pid_is_blazar_descendant(t.pid))
+        .map(|t| t.used_mib)
+        .sum();
+    Some(Check::warn(
+        "gpu co-tenants",
+        format!(
+            "non-blazar processes hold ~{held} MiB of GPU memory: {} — \
+             blazar budgets against FREE VRAM, so these reduce what fits",
+            foreign.join(", ")
+        ),
+    ))
+}
+
+/// Arch match: the active engine asset's -smNN vs the GPU's sm.
+fn gpu_arch_match_check(d: &BlazarDirs, sm: Option<u32>) -> Option<Check> {
+    let store = Store::open(d).ok()?;
+    let active = store.active_engine().ok()??;
+    let asset = active.asset.as_str();
+    if !asset.contains("cuda") {
+        return None;
+    }
+    let asset_sm = asset
+        .split_once("-sm")
+        .and_then(|(_, rest)| rest.split('-').next())
+        .and_then(|n| n.parse::<u32>().ok());
+    Some(match (asset_sm, sm) {
+        (Some(a), Some(g)) if a == g => Check::ok(
+            "gpu arch match",
+            format!("active asset targets sm{a} == GPU sm{g} (exact SASS)"),
+        ),
+        (Some(a), Some(g)) if a == 120 && g > 120 => Check::ok(
+            "gpu arch match",
+            format!("sm120 PTX asset JITs forward to GPU sm{g}"),
+        ),
+        (Some(a), Some(g)) => Check::warn(
+            "gpu arch match",
+            format!("active asset targets sm{a} but GPU is sm{g} — `blazar engine update` should pick the right per-arch asset"),
+        ),
+        (None, Some(_)) => Check::ok(
+            "gpu arch match",
+            "active CUDA asset is multi-arch (fat) — runs on any sm".to_string(),
+        ),
+        _ => return None,
+    })
 }
 
 /// Recursive on-disk size of an engine directory (tarball included
