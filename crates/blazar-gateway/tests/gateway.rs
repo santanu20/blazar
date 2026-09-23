@@ -1286,6 +1286,100 @@ async fn e2e__audio_transcriptions_no_backend_teaching_501() {
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
+/// The async knob never bypasses the lane checks: with no whisper lane
+/// installed an `async=true` submit gets the SAME teaching 501 as the
+/// sync path (the job machinery only runs on the local lane).
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__audio_transcriptions_async_without_lane_teaching_501() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let boundary = "blazar-test-boundary";
+    let mp = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\nRIFF\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nm1\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"async\"\r\n\r\ntrue\r\n--{boundary}--\r\n"
+    );
+    let resp = c
+        .post(format!("{}/v1/audio/transcriptions", ts.base))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(mp)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 501);
+    let r: serde_json::Value = resp.json().await.unwrap();
+    let msg = r["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("blazar whisper --install"),
+        "async submit teaches the same fix: {r}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Capabilities are gateway-derived: on an empty install the route 200s
+/// with engine.installed=false, no models, no child — and boots nothing.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__audio_capabilities__empty_install_reports_gaps_without_booting() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let resp = c
+        .get(format!("{}/v1/audio/capabilities", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let r: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(r["object"], "whisper.capabilities");
+    assert_eq!(r["engine"]["kind"], "whisper");
+    assert_eq!(r["engine"]["installed"], false);
+    assert_eq!(r["models"], serde_json::json!([]));
+    assert!(r["child"].is_null(), "no child on an empty install: {r}");
+    assert_eq!(r["async"]["field"], "async");
+    assert!(
+        r["endpoints"]
+            .as_array()
+            .expect("endpoints array")
+            .iter()
+            .any(|e| e == "/v1/audio/jobs/{id}"),
+        "job endpoints advertised: {r}"
+    );
+    assert_eq!(r["idle_timeout_secs"], 900, "config default shows up");
+    // Boots nothing: the lane stays absent after the read.
+    assert!(ts.state.whisper.status().await.is_none());
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Job routes: unknown id 404s with the gateway-owned lifetime truth;
+/// a hostile id (path/meta characters) 400s before any lookup.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__audio_jobs__unknown_404_and_invalid_id_400() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let resp = c
+        .get(format!("{}/v1/audio/jobs/aj-does-not-exist", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let r: serde_json::Value = resp.json().await.unwrap();
+    let msg = r["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("die with the gateway process"),
+        "lifetime truth in the 404: {r}"
+    );
+    let resp = c
+        .post(format!("{}/v1/audio/jobs/..%2Fetc/cancel", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "encoded traversal is an invalid id");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn e2e__infill_control_tokenize_proxied() {

@@ -546,6 +546,9 @@ struct WhisperChild {
     child: tokio::process::Child,
     port: u16,
     loaded: String,
+    /// Last instant the lane served (or swapped) a request — the idle
+    /// reaper's clock. Refreshed on every `ensure` hit, never elsewhere.
+    last_used: tokio::time::Instant,
 }
 
 impl WhisperRuntime {
@@ -570,6 +573,7 @@ impl WhisperRuntime {
         let mut slot = self.child.lock().await;
         if let Some(live) = slot.as_mut() {
             if tcp_alive(live.port).await {
+                live.last_used = tokio::time::Instant::now();
                 if live.loaded != size {
                     // Upstream /load: hot model swap without respawn.
                     let url = format!("http://127.0.0.1:{}/load", live.port);
@@ -644,6 +648,7 @@ impl WhisperRuntime {
             child,
             port,
             loaded: size.to_string(),
+            last_used: tokio::time::Instant::now(),
         });
         Ok(port)
     }
@@ -655,6 +660,36 @@ impl WhisperRuntime {
             let _ = live.child.kill().await;
             let _ = live.child.wait().await;
             tracing::info!(port = live.port, model = %live.loaded, "whisper-server stopped");
+        }
+    }
+
+    /// Idle reaper: kill the child when it has served no request for
+    /// `max_idle`. Serialized against `ensure` by the same mutex, so a
+    /// request racing the reap simply respawns the child (the lazy-lane
+    /// contract; the loser pays one model load). A dead child is
+    /// reaped here too — same hygiene `ensure` does on its next hit,
+    /// just sooner. No-op when no child exists.
+    pub async fn reap_idle(&self, max_idle: std::time::Duration) {
+        let mut slot = self.child.lock().await;
+        let Some(live) = slot.as_ref() else { return };
+        let dead = !tcp_alive(live.port).await;
+        let idle = live.last_used.elapsed() >= max_idle;
+        if !dead && !idle {
+            return;
+        }
+        let mut live = slot.take().expect("checked Some above");
+        let idle_secs = live.last_used.elapsed().as_secs();
+        let _ = live.child.kill().await;
+        let _ = live.child.wait().await;
+        if dead {
+            tracing::info!(port = live.port, model = %live.loaded, "whisper-server had died; reaped the slot");
+        } else {
+            tracing::info!(
+                port = live.port,
+                model = %live.loaded,
+                idle_secs,
+                "whisper-server idle-reaped (respawns on next request)"
+            );
         }
     }
 
@@ -868,12 +903,96 @@ mod tests {
             child,
             port: 1,
             loaded: "base".into(),
+            last_used: tokio::time::Instant::now(),
         });
         rt.shutdown().await;
         assert!(rt.status().await.is_none());
         // Reaped = wait resolved; process truly gone.
         let alive = std::path::Path::new(&format!("/proc/{pid}")).exists();
         assert!(!alive, "whisper child {pid} leaked past shutdown");
+    }
+
+    /// The idle reaper kills a child whose last serve is older than the
+    /// budget, keeps a fresh one, and cleans a dead child's slot. Uses
+    /// the same injected-fake-child pattern as the shutdown lifecycle
+    /// test above (`sleep` stands in for whisper-server; port 1 never
+    /// answers, which the reaper must treat as dead).
+    #[tokio::test]
+    async fn lifecycle__whisper_runtime__reap_idle_budget_and_dead_child() {
+        if !cfg!(unix) {
+            return;
+        }
+        let rt = WhisperRuntime::new();
+        // Fresh child on an unreachable port: "dead" wins even though
+        // last_used is now — a corpse must not squat the lane until the
+        // idle budget also expires.
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("pid");
+        *rt.child.lock().await = Some(WhisperChild {
+            child,
+            port: 1,
+            loaded: "base".into(),
+            last_used: tokio::time::Instant::now(),
+        });
+        rt.reap_idle(std::time::Duration::from_hours(1)).await;
+        assert!(rt.status().await.is_none(), "dead child reaped");
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "dead child {pid} leaked past reap"
+        );
+
+        // Idle budget path: reachable port + stale last_used → reaped.
+        // A port that answers TCP: bind our own listener.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep 2");
+        let pid2 = child.id().expect("pid2");
+        *rt.child.lock().await = Some(WhisperChild {
+            child,
+            port,
+            loaded: "base".into(),
+            last_used: tokio::time::Instant::now() - std::time::Duration::from_mins(10),
+        });
+        rt.reap_idle(std::time::Duration::from_mins(5)).await;
+        assert!(rt.status().await.is_none(), "idle child reaped");
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid2}")).exists(),
+            "idle child {pid2} leaked past reap"
+        );
+
+        // Fresh child on a reachable port survives the same budget.
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep 3");
+        let pid3 = child.id().expect("pid3");
+        *rt.child.lock().await = Some(WhisperChild {
+            child,
+            port,
+            loaded: "base".into(),
+            last_used: tokio::time::Instant::now(),
+        });
+        rt.reap_idle(std::time::Duration::from_mins(5)).await;
+        assert!(rt.status().await.is_some(), "fresh child untouched");
+        rt.shutdown().await;
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid3}")).exists(),
+            "child {pid3} leaked past shutdown"
+        );
     }
 
     /// Stage a fake installed tag dir containing a whisper-server file.

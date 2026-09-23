@@ -22,6 +22,10 @@ use crate::state::AppState;
 /// get a 400 before any spawn.
 const MAX_INPUT_CHARS: usize = 10_000;
 
+// One handler owns the buffered-WAV vs streamed-PCM split end to end;
+// extracting sub-fns would separate the format decision from the
+// admission/path checks it guards.
+#[allow(clippy::too_many_lines)]
 pub async fn audio_speech(
     State(state): State<Arc<AppState>>,
     key_ext: Option<Extension<crate::keys::KeyCtx>>,
@@ -114,7 +118,7 @@ pub async fn audio_speech(
         .await;
         let first_wav = match first {
             Ok(w) => w,
-            Err(e) => return tts_error(e),
+            Err(e) => return tts_error(&e),
         };
         let first_wav = limit_wav_peak(first_wav);
         let layout = match locate_pcm16(&first_wav) {
@@ -207,14 +211,14 @@ pub async fn audio_speech(
                 .body(axum::body::Body::from(wav))
                 .unwrap_or_else(|_| openai_error(500, "response build").into_response())
         }
-        Err(e) => return tts_error(e),
+        Err(e) => tts_error(&e),
     }
 }
 
 /// Map a piper synthesis error to its teaching response (404 for a
 /// missing lane/voice, 400 otherwise). Shared by the buffered WAV path
 /// and the PCM stream's eager first chunk.
-fn tts_error(e: anyhow::Error) -> Response {
+fn tts_error(e: &anyhow::Error) -> Response {
     let msg = format!("{e:#}");
     let status = if msg.contains("not installed") || msg.contains("is not pulled") {
         StatusCode::NOT_FOUND
@@ -281,7 +285,12 @@ fn locate_pcm16(wav: &[u8]) -> Result<WavLayout, String> {
                 fmt = Some((
                     read_u16(wav, body),
                     read_u16(wav, body + 2),
-                    u32::from_le_bytes([wav[body + 4], wav[body + 5], wav[body + 6], wav[body + 7]]),
+                    u32::from_le_bytes([
+                        wav[body + 4],
+                        wav[body + 5],
+                        wav[body + 6],
+                        wav[body + 7],
+                    ]),
                     read_u16(wav, body + 14),
                 ));
             }
@@ -294,9 +303,7 @@ fn locate_pcm16(wav: &[u8]) -> Result<WavLayout, String> {
         return Err("missing fmt or data chunk".to_string());
     };
     if (audio_format, bits) != (1, 16) {
-        return Err(format!(
-            "not PCM16LE (format {audio_format}, {bits} bits)"
-        ));
+        return Err(format!("not PCM16LE (format {audio_format}, {bits} bits)"));
     }
     if data.len() % 2 != 0 {
         return Err("odd-length PCM16 data chunk".to_string());
@@ -344,11 +351,11 @@ fn split_streaming_chunks(text: &str) -> Vec<String> {
             // Oversized sentence: fall back to clause breaks, then hard
             // slices, so chunk sizes stay bounded.
             let mut piece = String::new();
-            for clause in sentence.split_inclusive(|c| matches!(c, ';' | ':' | ',')) {
-                if piece.chars().count() + clause.chars().count() > STREAM_MAX_CHUNK_CHARS {
-                    if !piece.is_empty() {
-                        chunks.push(std::mem::take(&mut piece));
-                    }
+            for clause in sentence.split_inclusive([';', ':', ',']) {
+                if piece.chars().count() + clause.chars().count() > STREAM_MAX_CHUNK_CHARS
+                    && !piece.is_empty()
+                {
+                    chunks.push(std::mem::take(&mut piece));
                 }
                 piece.push_str(clause);
                 while piece.chars().count() > STREAM_MAX_CHUNK_CHARS {
@@ -563,7 +570,9 @@ mod tests {
         let chunks = split_streaming_chunks(&blob);
         assert!(chunks.len() >= 3, "1500 chars must not be one chunk");
         assert!(
-            chunks.iter().all(|c| c.chars().count() <= STREAM_MAX_CHUNK_CHARS),
+            chunks
+                .iter()
+                .all(|c| c.chars().count() <= STREAM_MAX_CHUNK_CHARS),
             "every chunk must be bounded"
         );
         assert_eq!(chunks.concat(), blob, "hard split must be lossless");

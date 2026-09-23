@@ -1211,7 +1211,7 @@ fn stub_engine_dir(tag: &str) -> (PathBuf, tempfile::TempDir) {
 
 /// A row-less engine dir is disk debris (interrupted install, pre-rollback
 /// upgrade): the sweep must remove it while every dir a row points into
-/// survives — including nested server_path references and empty-path
+/// survives — including nested `server_path` references and empty-path
 /// default manifests.
 #[tokio::test]
 #[allow(non_snake_case)]
@@ -1233,8 +1233,14 @@ async fn integration__orphan_engine_dirs__swept_while_referenced_survive() {
     assert_eq!(freed.len(), 1, "exactly the ghost dir goes: {freed:?}");
     assert_eq!(freed[0].0, "b0-ghost");
     assert!(!orphan.exists(), "orphan dir removed");
-    assert!(dirs.engines_dir().join("b1-cuda").exists(), "row-backed dir stays");
-    assert!(dirs.engines_dir().join("README").exists(), "plain file untouched");
+    assert!(
+        dirs.engines_dir().join("b1-cuda").exists(),
+        "row-backed dir stays"
+    );
+    assert!(
+        dirs.engines_dir().join("README").exists(),
+        "plain file untouched"
+    );
     // Idempotent: a second sweep finds nothing.
     assert!(mgr.prune_orphan_dirs().unwrap().is_empty());
 }

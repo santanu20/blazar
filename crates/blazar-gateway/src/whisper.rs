@@ -16,7 +16,16 @@
 //! is the whole surface), so transcription/translation ride the same
 //! lazy child. `/v1/audio/translations` forces `translate=true` on the
 //! rebuilt request; upstream reports `"task": "translate"` back.
+//!
+//! Async: upstream `/inference` is sync-only (no job surface to relay,
+//! unlike the sd-server image lane), so `"async": "true"` as a form
+//! field runs the same forward inside a spawned task and hands back a
+//! gateway-owned job handle — `/v1/audio/jobs/{id}` polls it,
+//! `/v1/audio/jobs/{id}/cancel` aborts the wait. Jobs die with the
+//! gateway process, the same lifetime truth the image lane attaches to
+//! its children.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -30,7 +39,9 @@ use crate::proxy::openai_error;
 use crate::remotes::split_remote;
 use crate::state::AppState;
 
-/// One parsed multipart part.
+/// One parsed multipart part (cloned into async job tasks, which
+/// outlive the request that received the bytes).
+#[derive(Clone)]
 pub(crate) struct Part {
     pub(crate) name: String,
     pub(crate) filename: Option<String>,
@@ -204,11 +215,12 @@ fn forwarded_fields(parts: &[Part], force_translate: bool) -> Vec<(String, Strin
     out
 }
 
-/// Local lane body: ensure the lazy child (hot model swap on size
+/// Local lane transport: ensure the lazy child (hot model swap on size
 /// change), forward the multipart fields whisper-server understands,
-/// pass the upstream status/body through verbatim. `force_translate`
-/// marks the caller as the translations route.
-async fn forward_local(
+/// and return the raw upstream triple. Shared by the sync path and the
+/// async job task — the Err codes/messages are the sync route's exact
+/// error surface, so both lanes fail identically.
+async fn forward_local_raw(
     state: &Arc<AppState>,
     parts: &[Part],
     file: &Part,
@@ -216,9 +228,9 @@ async fn forward_local(
     bin: &std::path::Path,
     lib_dir: &std::path::Path,
     force_translate: bool,
-) -> Response {
+) -> Result<(StatusCode, String, Bytes), (u16, String)> {
     let Some(model_path) = whisper::model_file(&state.dirs, size) else {
-        return openai_error(500, &format!("whisper model ggml-{size}.bin vanished"));
+        return Err((500, format!("whisper model ggml-{size}.bin vanished")));
     };
     let port = match state
         .whisper
@@ -232,7 +244,7 @@ async fn forward_local(
         .await
     {
         Ok(p) => p,
-        Err(e) => return openai_error(502, &format!("whisper-server: {e:#}")),
+        Err(e) => return Err((502, format!("whisper-server: {e:#}"))),
     };
     let mime = file
         .content_type
@@ -251,7 +263,7 @@ async fn forward_local(
     let url = format!("http://127.0.0.1:{port}/inference");
     let resp = match state.http.post(&url).multipart(form).send().await {
         Ok(r) => r,
-        Err(e) => return openai_error(502, &format!("whisper inference: {e:#}")),
+        Err(e) => return Err((502, format!("whisper inference: {e:#}"))),
     };
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let ct = resp
@@ -261,10 +273,411 @@ async fn forward_local(
         .unwrap_or("application/json")
         .to_string();
     let bytes = resp.bytes().await.unwrap_or_default();
+    Ok((status, ct, bytes))
+}
+
+/// Sync local lane: same contract as before the async split — the raw
+/// triple rendered as a verbatim passthrough, errors as `openai_error`
+/// with the historical codes and messages.
+async fn forward_local(
+    state: &Arc<AppState>,
+    parts: &[Part],
+    file: &Part,
+    size: &str,
+    bin: &std::path::Path,
+    lib_dir: &std::path::Path,
+    force_translate: bool,
+) -> Response {
+    match forward_local_raw(state, parts, file, size, bin, lib_dir, force_translate).await {
+        Ok((status, ct, bytes)) => Response::builder()
+            .status(status)
+            .header(axum::http::header::CONTENT_TYPE, ct)
+            .body(axum::body::Body::from(bytes))
+            .unwrap_or_else(|_| openai_error(500, "response build").into_response()),
+        Err((code, msg)) => openai_error(code, &msg),
+    }
+}
+
+/// Registry ceiling: abandoned handles must not grow the map forever.
+/// At the cap the oldest terminal job is evicted first (nobody polls
+/// those anymore); if all are live, the oldest overall goes — its task
+/// is aborted, the same as an explicit cancel.
+const MAX_AUDIO_JOBS: usize = 256;
+
+/// One job's lifecycle. `Queued` exists only between handle reservation
+/// and the task's first instruction; `Completed` carries the upstream
+/// triple verbatim so the poll response is the sync response, replayed.
+#[derive(Clone)]
+enum AudioJobState {
+    Queued,
+    Running,
+    Completed {
+        status: u16,
+        content_type: String,
+        body: Arc<Vec<u8>>,
+    },
+    Failed(String),
+    Cancelled,
+}
+
+impl AudioJobState {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed { .. } => "completed",
+            Self::Failed(_) => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    fn terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Completed { .. } | Self::Failed(_) | Self::Cancelled
+        )
+    }
+}
+
+struct AudioJobEntry {
+    state: AudioJobState,
+    handle: Option<tokio::task::JoinHandle<()>>,
+    seq: u64,
+    created_at: u64,
+}
+
+/// Gateway-owned async audio jobs. Every method takes the inner lock
+/// briefly and never across an await — job tasks re-enter the registry
+/// to update their own state, so a held lock would deadlock the lane.
+#[derive(Default)]
+pub struct AudioJobs {
+    inner: std::sync::Mutex<AudioJobStore>,
+}
+
+#[derive(Default)]
+struct AudioJobStore {
+    jobs: HashMap<String, AudioJobEntry>,
+    seq: u64,
+    boot_nanos: u64,
+}
+
+impl AudioJobs {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(AudioJobStore {
+                boot_nanos: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(0)),
+                ..AudioJobStore::default()
+            }),
+        }
+    }
+
+    /// Reserve a job id and Queued slot. Called just before the task
+    /// spawns; `set_handle` attaches the `JoinHandle` right after.
+    fn reserve(&self) -> String {
+        let mut store = self.inner.lock().expect("audio jobs lock");
+        store.seq += 1;
+        let id = format!("aj{}-{}", store.boot_nanos, store.seq);
+        let seq = store.seq;
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        if store.jobs.len() >= MAX_AUDIO_JOBS {
+            evict_one(&mut store);
+        }
+        store.jobs.insert(
+            id.clone(),
+            AudioJobEntry {
+                state: AudioJobState::Queued,
+                handle: None,
+                seq,
+                created_at,
+            },
+        );
+        id
+    }
+
+    fn set_handle(&self, id: &str, handle: tokio::task::JoinHandle<()>) {
+        let mut store = self.inner.lock().expect("audio jobs lock");
+        if let Some(entry) = store.jobs.get_mut(id) {
+            // A cancel that fired before the handle landed already
+            // marked the job terminal — keep the handle anyway so a
+            // later drop can still abort the straggler.
+            entry.handle = Some(handle);
+        }
+    }
+
+    fn mark_running(&self, id: &str) {
+        let mut store = self.inner.lock().expect("audio jobs lock");
+        if let Some(entry) = store.jobs.get_mut(id) {
+            if matches!(entry.state, AudioJobState::Queued) {
+                entry.state = AudioJobState::Running;
+            }
+        }
+    }
+
+    fn finish(&self, id: &str, status: u16, content_type: &str, body: Vec<u8>) {
+        let mut store = self.inner.lock().expect("audio jobs lock");
+        if let Some(entry) = store.jobs.get_mut(id) {
+            if matches!(entry.state, AudioJobState::Queued | AudioJobState::Running) {
+                entry.state = AudioJobState::Completed {
+                    status,
+                    content_type: content_type.to_string(),
+                    body: Arc::new(body),
+                };
+            }
+        }
+    }
+
+    fn fail(&self, id: &str, message: String) {
+        let mut store = self.inner.lock().expect("audio jobs lock");
+        if let Some(entry) = store.jobs.get_mut(id) {
+            if matches!(entry.state, AudioJobState::Queued | AudioJobState::Running) {
+                entry.state = AudioJobState::Failed(message);
+            }
+        }
+    }
+
+    /// Cancel a queued/running job: abort its task, mark Cancelled.
+    /// `None` = unknown id; `Some(false)` = already terminal (idempotent
+    /// poll-friendly no-op).
+    fn cancel(&self, id: &str) -> Option<bool> {
+        let handle = {
+            let mut store = self.inner.lock().expect("audio jobs lock");
+            let entry = store.jobs.get_mut(id)?;
+            if entry.state.terminal() {
+                return Some(false);
+            }
+            entry.state = AudioJobState::Cancelled;
+            entry.handle.take()
+        };
+        // Abort outside the lock: abort schedules onto the runtime and
+        // can run arbitrary Drop code in the aborted future.
+        if let Some(handle) = handle {
+            handle.abort();
+        }
+        Some(true)
+    }
+
+    /// Poll payload for `/v1/audio/jobs/{id}`: status plus the upstream
+    /// triple on completion (body parsed as JSON when possible, raw
+    /// text otherwise — transcription bodies are JSON in practice).
+    fn payload(&self, id: &str) -> Option<serde_json::Value> {
+        let store = self.inner.lock().expect("audio jobs lock");
+        let entry = store.jobs.get(id)?;
+        let mut payload = serde_json::json!({
+            "id": id,
+            "object": "whisper.job",
+            "status": entry.state.as_str(),
+            "created_at": entry.created_at,
+        });
+        match &entry.state {
+            AudioJobState::Completed {
+                status,
+                content_type,
+                body,
+            } => {
+                payload["status_code"] = serde_json::json!(status);
+                payload["content_type"] = serde_json::json!(content_type);
+                payload["result"] = serde_json::from_slice::<serde_json::Value>(body)
+                    .unwrap_or_else(|_| {
+                        serde_json::Value::String(String::from_utf8_lossy(body).into_owned())
+                    });
+            }
+            AudioJobState::Failed(message) => {
+                payload["error"] = serde_json::json!(message);
+            }
+            _ => {}
+        }
+        Some(payload)
+    }
+}
+
+/// Registry eviction: oldest terminal job first; if everything is live,
+/// the oldest overall (aborted — an implicit cancel).
+fn evict_one(store: &mut AudioJobStore) {
+    let victim = store
+        .jobs
+        .iter()
+        .min_by_key(|(_, e)| (u64::from(!e.state.terminal()), e.seq))
+        .map(|(id, _)| id.clone());
+    if let Some(id) = victim {
+        if let Some(entry) = store.jobs.remove(&id) {
+            if let Some(handle) = entry.handle {
+                handle.abort();
+            }
+        }
+    }
+}
+
+/// The gateway-only `async` knob: a plain form field (the audio routes
+/// are multipart; images uses the same knob as a JSON field). Honored
+/// on the local lane only — a remote forward streams the client's body
+/// untouched, remotes keep their own sync contracts.
+fn wants_async(parts: &[Part]) -> bool {
+    field(parts, "async").is_some_and(|v| {
+        let v = v.trim();
+        v.eq_ignore_ascii_case("true") || v == "1"
+    })
+}
+
+/// Submit an async job: reserve the handle, spawn the forward task,
+/// answer with the gateway-owned job envelope (same shape vocabulary as
+/// the images lane's `async` handles). No awaits — the spawned task owns
+/// all the waiting.
+fn submit_async(
+    state: &Arc<AppState>,
+    parts: Vec<Part>,
+    file: Part,
+    size: String,
+    bin: &std::path::Path,
+    lib_dir: &std::path::Path,
+    force_translate: bool,
+) -> Response {
+    let id = state.audio_jobs.reserve();
+    let task_id = id.clone();
+    let task_state = Arc::clone(state);
+    let bin = bin.to_path_buf();
+    let lib_dir = lib_dir.to_path_buf();
+    let task = tokio::spawn(async move {
+        task_state.audio_jobs.mark_running(&task_id);
+        match forward_local_raw(
+            &task_state,
+            &parts,
+            &file,
+            &size,
+            &bin,
+            &lib_dir,
+            force_translate,
+        )
+        .await
+        {
+            Ok((status, ct, bytes)) => {
+                task_state
+                    .audio_jobs
+                    .finish(&task_id, status.as_u16(), &ct, bytes.to_vec());
+            }
+            Err((_code, msg)) => task_state.audio_jobs.fail(&task_id, msg),
+        }
+    });
+    state.audio_jobs.set_handle(&id, task);
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let body = serde_json::json!({
+        "id": id,
+        "object": "whisper.job",
+        "status": "queued",
+        "created_at": created_at,
+        "poll_url": format!("/v1/audio/jobs/{id}"),
+        "cancel_url": format!("/v1/audio/jobs/{id}/cancel"),
+    });
     Response::builder()
-        .status(status)
-        .header(axum::http::header::CONTENT_TYPE, ct)
-        .body(axum::body::Body::from(bytes))
+        .status(200)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(
+            serde_json::to_vec(&body).unwrap_or_default(),
+        ))
+        .unwrap_or_else(|_| openai_error(500, "response build").into_response())
+}
+
+/// GET /v1/audio/jobs/{id} — poll a gateway-owned async audio job.
+#[allow(clippy::unused_async)] // axum's Handler trait requires async fns
+pub async fn audio_jobs_get(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> Response {
+    if !job_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return openai_error(400, "invalid job id");
+    }
+    match state.audio_jobs.payload(&job_id) {
+        Some(payload) => Response::builder()
+            .status(200)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&payload).unwrap_or_default(),
+            ))
+            .unwrap_or_else(|_| openai_error(500, "response build").into_response()),
+        None => openai_error(
+            404,
+            "job not found — audio jobs are gateway-owned and die with the gateway process",
+        ),
+    }
+}
+
+/// POST /v1/audio/jobs/{id}/cancel — abort a queued/running job. The
+/// wait stops immediately; an in-flight upstream inference runs to
+/// completion inside the child (whisper-server has no cancel surface —
+/// the result is simply discarded). Terminal jobs answer with their
+/// final state (idempotent).
+#[allow(clippy::unused_async)] // axum's Handler trait requires async fns
+pub async fn audio_jobs_cancel(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> Response {
+    if !job_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return openai_error(400, "invalid job id");
+    }
+    // cancel() performs the abort side effect (a terminal/unknown job is
+    // a no-op); either way the answer is the job's current state — 200
+    // with the payload, 404 when no such job exists.
+    let _ = state.audio_jobs.cancel(&job_id);
+    match state.audio_jobs.payload(&job_id) {
+        Some(payload) => Response::builder()
+            .status(200)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&payload).unwrap_or_default(),
+            ))
+            .unwrap_or_else(|_| openai_error(500, "response build").into_response()),
+        None => openai_error(
+            404,
+            "job not found — audio jobs are gateway-owned and die with the gateway process",
+        ),
+    }
+}
+
+/// GET /v1/audio/capabilities — the audio lane's gateway-derived menu.
+/// Unlike `/v1/images/capabilities` (a relay of the child's sampler
+/// menu), whisper-server has no capabilities route, so this reads local
+/// truth only: engine presence, pulled models, live child state, and
+/// the async/idle knobs. Boots nothing.
+pub async fn audio_capabilities(State(state): State<Arc<AppState>>) -> Response {
+    let installed = whisper::server_bin(&state.dirs).is_some();
+    let models = whisper::list_models(&state.dirs);
+    let child = state
+        .whisper
+        .status()
+        .await
+        .map(|(_port, loaded)| serde_json::json!({ "alive": true, "loaded": loaded }));
+    let body = serde_json::json!({
+        "object": "whisper.capabilities",
+        "engine": { "kind": "whisper", "installed": installed },
+        "models": models,
+        "child": child,
+        "endpoints": [
+            "/v1/audio/transcriptions",
+            "/v1/audio/translations",
+            "/v1/audio/jobs/{id}",
+            "/v1/audio/jobs/{id}/cancel"
+        ],
+        "async": { "field": "async", "values": ["true", "1"], "local_lane_only": true },
+        "idle_timeout_secs": state.config.whisper_idle_secs,
+    });
+    Response::builder()
+        .status(200)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(
+            serde_json::to_vec(&body).unwrap_or_default(),
+        ))
         .unwrap_or_else(|_| openai_error(500, "response build").into_response())
 }
 
@@ -332,6 +745,10 @@ pub async fn audio_transcriptions(
         .as_ref()
         .and_then(|_| whisper::resolve_model(requested, &available));
     if let (Some((bin, lib_dir)), Some(size)) = (&server, size) {
+        if wants_async(&parts) {
+            let file_part = file.clone();
+            return submit_async(&state, parts, file_part, size.clone(), bin, lib_dir, false);
+        }
         return forward_local(&state, &parts, file, &size, bin, lib_dir, false).await;
     }
 
@@ -407,6 +824,10 @@ pub async fn audio_translations(
         .as_ref()
         .and_then(|_| whisper::resolve_model(requested, &available));
     if let (Some((bin, lib_dir)), Some(size)) = (&server, size) {
+        if wants_async(&parts) {
+            let file_part = file.clone();
+            return submit_async(&state, parts, file_part, size.clone(), bin, lib_dir, true);
+        }
         return forward_local(&state, &parts, file, &size, bin, lib_dir, true).await;
     }
 
@@ -650,6 +1071,104 @@ mod tests {
         assert!(
             fields.contains(&("response_format".to_string(), "verbose_json".to_string())),
             "client value kept: {fields:?}"
+        );
+    }
+
+    #[test]
+    fn unit__wants_async__accepts_true_and_1_rejects_rest() {
+        let mk = |v: &str| mixed_body("XbOuNdArY", &[("async", v.as_bytes())], ("a.wav", b"RIFF"));
+        for yes in ["true", "TRUE", "1", " true "] {
+            let (b, ct) = mk(yes);
+            let parts = parse_multipart(&b, &ct).expect("parses");
+            assert!(wants_async(&parts), "{yes:?} must request async");
+        }
+        for no in ["false", "0", "yes", ""] {
+            let (b, ct) = mk(no);
+            let parts = parse_multipart(&b, &ct).expect("parses");
+            assert!(!wants_async(&parts), "{no:?} must stay sync");
+        }
+        // Absent field = sync, the default every existing client gets.
+        let (b, ct) = mixed_body("XbOuNdArY", &[], ("a.wav", b"RIFF"));
+        let parts = parse_multipart(&b, &ct).expect("parses");
+        assert!(!wants_async(&parts));
+    }
+
+    /// Registry lifecycle: reserve → running → completed carries the
+    /// upstream triple into the poll payload; fail and cancel are
+    /// terminal and idempotent; unknown ids 404 (payload None).
+    #[test]
+    fn unit__audio_jobs__lifecycle_and_payload_shapes() {
+        let jobs = AudioJobs::new();
+        let id = jobs.reserve();
+        assert_eq!(
+            jobs.payload(&id).unwrap()["status"],
+            "queued",
+            "fresh reservation is queued"
+        );
+        jobs.mark_running(&id);
+        assert_eq!(jobs.payload(&id).unwrap()["status"], "running");
+        jobs.finish(&id, 200, "application/json", br#"{"text":"hi"}"#.to_vec());
+        let done = jobs.payload(&id).unwrap();
+        assert_eq!(done["status"], "completed");
+        assert_eq!(done["status_code"], 200);
+        assert_eq!(done["result"]["text"], "hi", "body parsed as JSON");
+        // Terminal stays terminal: late finish/cancel never overwrite.
+        jobs.fail(&id, "late failure".into());
+        jobs.cancel(&id);
+        assert_eq!(jobs.payload(&id).unwrap()["status"], "completed");
+
+        // Non-JSON body replays as a raw string under "result".
+        let id2 = jobs.reserve();
+        jobs.mark_running(&id2);
+        jobs.finish(&id2, 200, "text/plain", b"plain text".to_vec());
+        assert_eq!(
+            jobs.payload(&id2).unwrap()["result"],
+            serde_json::json!("plain text")
+        );
+
+        // Failed jobs surface the sync lane's error message verbatim.
+        let id3 = jobs.reserve();
+        jobs.mark_running(&id3);
+        jobs.fail(&id3, "whisper-server: boom".into());
+        let failed = jobs.payload(&id3).unwrap();
+        assert_eq!(failed["status"], "failed");
+        assert_eq!(failed["error"], "whisper-server: boom");
+
+        // Cancel of a live job flips it to cancelled, second cancel is
+        // a no-op, and unknown ids have no payload.
+        let id4 = jobs.reserve();
+        jobs.mark_running(&id4);
+        assert_eq!(jobs.cancel(&id4), Some(true));
+        assert_eq!(jobs.cancel(&id4), Some(false), "terminal cancel idempotent");
+        assert_eq!(jobs.payload(&id4).unwrap()["status"], "cancelled");
+        assert!(jobs.payload("aj-nonexistent").is_none());
+        assert_eq!(jobs.cancel("aj-nonexistent"), None);
+    }
+
+    /// At the cap the registry evicts the oldest TERMINAL job first and
+    /// keeps live ones; ids stay unique across evictions.
+    #[test]
+    fn unit__audio_jobs__eviction_oldest_terminal_first() {
+        let jobs = AudioJobs::new();
+        // One live job reserved early, then a wave of terminal jobs past
+        // the cap — the early live one must survive every eviction.
+        let live = jobs.reserve();
+        jobs.mark_running(&live);
+        let mut first_terminal = String::new();
+        for i in 0..=MAX_AUDIO_JOBS {
+            let id = jobs.reserve();
+            if i == 0 {
+                first_terminal = id.clone();
+            }
+            jobs.finish(&id, 200, "application/json", Vec::new());
+        }
+        assert!(
+            jobs.payload(&live).is_some(),
+            "live job must not be evicted while terminal victims exist"
+        );
+        assert!(
+            jobs.payload(&first_terminal).is_none(),
+            "oldest terminal job is the eviction victim"
         );
     }
 }

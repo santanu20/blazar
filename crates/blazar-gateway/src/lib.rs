@@ -284,6 +284,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/v1/audio/translations", post(whisper::audio_translations))
         .route("/v1/audio/speech", post(tts::audio_speech))
+        .route("/v1/audio/jobs/{id}", get(whisper::audio_jobs_get))
+        .route(
+            "/v1/audio/jobs/{id}/cancel",
+            post(whisper::audio_jobs_cancel),
+        )
+        .route("/v1/audio/capabilities", get(whisper::audio_capabilities))
         .route("/v1/images/generations", post(images::generations))
         .route("/v1/images/edits", post(images::edits))
         .route("/v1/images/jobs/{id}", get(images::jobs_get))

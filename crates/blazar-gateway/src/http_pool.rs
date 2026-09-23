@@ -19,7 +19,6 @@ const POOL_MAX_IDLE_PER_HOST: usize = 16;
 const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 
 /// Apply the shared pool policy to a client builder.
-#[must_use]
 pub fn tuned(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     builder
         .pool_idle_timeout(POOL_IDLE_TIMEOUT)

@@ -67,12 +67,6 @@ fn is_plain_generation_request(v: &serde_json::Value) -> bool {
     })
 }
 
-/// `n`→`batch_count`, `size "WxH"`→`width`/`height`, `steps`→
-/// `sample_params.sample_steps` (merged into an existing subtree);
-/// control keys drop; every other key — including whole subtrees like
-/// `guidance`, `cache`, `lora`, `vae_tiling_params` — rides verbatim,
-/// so upstream-additive fields need no translator change.
-
 // ---- video scratch budget (submit-time VRAM gate) ---------------------
 //
 // Calibrated 2026-09-23 on a quiet 8 GiB box (wan2.1 1.3B bf16 trio,
@@ -128,6 +122,14 @@ struct VideoScratchEstimate {
     aligned_frames: u64,
 }
 
+// MiB-scale calibrated math: u64->f64 precision loss starts above
+// 2^52 MiB and f64->u64 truncation never lands mid-MiB on values this
+// small, so the plain casts are exact for every reachable input.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn estimate_video_scratch(
     frames: u64,
     width: u64,
@@ -146,17 +148,20 @@ fn estimate_video_scratch(
     // linearly; only the measured-scratch terms carry the uncertainty safety
     // multiplier — stacking safety on weights over-rejects cold spawns that
     // demonstrably fit (live 5f@320 on an 8 GiB box).
-    let weights = if cold_child { VIDEO_CHILD_WEIGHTS_STAGED_MIB } else { 0 };
-    let raw = VIDEO_SCRATCH_FLOOR_MIB as f64 * frame_scale
-        + area_term
-        + VIDEO_SCRATCH_HEDGE_MIB as f64;
+    let weights = if cold_child {
+        VIDEO_CHILD_WEIGHTS_STAGED_MIB
+    } else {
+        0
+    };
+    let raw =
+        VIDEO_SCRATCH_FLOOR_MIB as f64 * frame_scale + area_term + VIDEO_SCRATCH_HEDGE_MIB as f64;
     VideoScratchEstimate {
         estimate_mib: (raw * VIDEO_SCRATCH_SAFETY).ceil() as u64 + weights,
         aligned_frames: aligned,
     }
 }
 
-/// Parse `size` ("WxH") for the gate; absent or unparseable sizes take
+/// Parse `size` (``WxH``) for the gate; absent or unparseable sizes take
 /// the child's 512x512 default — the conservative side of the estimate.
 fn gate_size(v: &serde_json::Value) -> (u64, u64) {
     v.get("size")
@@ -177,8 +182,21 @@ fn gate_size(v: &serde_json::Value) -> (u64, u64) {
 /// when the request may proceed — including on boxes without an
 /// nvidia-smi census, where the runtime's spawn heuristic still guards
 /// weights and the request rides through.
-fn video_scratch_gate(parsed: &serde_json::Value, model: &str, state: &AppState) -> Result<(), String> {
-    if parsed.get("vram_overcommit").and_then(|v| v.as_bool()) == Some(true) {
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn video_scratch_gate(
+    parsed: &serde_json::Value,
+    model: &str,
+    state: &AppState,
+) -> Result<(), String> {
+    if parsed
+        .get("vram_overcommit")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
         // Operator's explicit call: attempt it anyway; the child's own
         // failure (or success) answers. No silent path — the audit log
         // carries the request that used the lever.
@@ -190,7 +208,7 @@ fn video_scratch_gate(parsed: &serde_json::Value, model: &str, state: &AppState)
     let (w, h) = gate_size(parsed);
     let frames = parsed
         .get("video_frames")
-        .and_then(|f| f.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .unwrap_or(1);
     let cold = live_sdcpp_children(state, Some(model)).is_empty();
     let est = estimate_video_scratch(frames, w, h, cold);
@@ -223,6 +241,14 @@ fn video_scratch_gate(parsed: &serde_json::Value, model: &str, state: &AppState)
 /// has no duration field, so an untranslated knob is the same silent
 /// one-frame no-op. Contradictory specs fail loud instead of picking a
 /// silent winner.
+/// Canonicalize the frame-count vocabulary (`frames`/`num_frames`/
+/// `duration`) onto sd-server's native `video_frames` before relay.
+/// Conflicting spellings are named in the error rather than racing.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn canonicalize_video_frames(v: &mut serde_json::Value) -> Result<(), String> {
     const NATIVE: &str = "video_frames";
     const SYNONYMS: [&str; 2] = ["frames", "num_frames"];
@@ -254,13 +280,13 @@ fn canonicalize_video_frames(v: &mut serde_json::Value) -> Result<(), String> {
             .get("fps")
             .and_then(|f| f.as_u64().filter(|f| *f >= 1))
             .unwrap_or(DEFAULT_FPS);
-        let secs = val
+        let dur_secs = val
             .as_f64()
             .filter(|s| s.is_finite() && *s > 0.0)
             .ok_or_else(|| format!("duration must be a positive number of seconds (got {val})"))?;
         obj.remove("duration");
-        let frames = ((secs * fps as f64).round() as u64).max(1);
-        specs.push(("duration", frames));
+        let dur_frames = ((dur_secs * fps as f64).round() as u64).max(1);
+        specs.push(("duration", dur_frames));
     }
 
     if specs.is_empty() {
@@ -285,6 +311,11 @@ fn canonicalize_video_frames(v: &mut serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+/// `n`→`batch_count`, `size "WxH"`→`width`/`height`, `steps`→
+/// `sample_params.sample_steps` (merged into an existing subtree);
+/// control keys drop; every other key — including whole subtrees like
+/// `guidance`, `cache`, `lora`, `vae_tiling_params` — rides verbatim,
+/// so upstream-additive fields need no translator change.
 fn translate_to_native(v: &serde_json::Value, video: bool) -> serde_json::Value {
     let mut out = serde_json::Map::new();
     let Some(obj) = v.as_object() else {
@@ -1303,7 +1334,11 @@ mod tests {
         let mut v = serde_json::json!({"duration": 2, "fps": 8});
         canonicalize_video_frames(&mut v).unwrap();
         assert_eq!(v["video_frames"], serde_json::json!(16));
-        assert_eq!(v["fps"], serde_json::json!(8), "fps is a real child field — it rides");
+        assert_eq!(
+            v["fps"],
+            serde_json::json!(8),
+            "fps is a real child field — it rides"
+        );
 
         // Fractional seconds round; sub-frame durations clamp to one.
         let mut v = serde_json::json!({"duration": 0.5});
@@ -1339,7 +1374,10 @@ mod tests {
     fn unit__canonicalize_video_frames__conflict_and_type_errors_teach() {
         let mut v = serde_json::json!({"frames": 33, "video_frames": 16});
         let err = canonicalize_video_frames(&mut v).unwrap_err();
-        assert!(err.contains("frames=33") && err.contains("video_frames=16"), "{err}");
+        assert!(
+            err.contains("frames=33") && err.contains("video_frames=16"),
+            "{err}"
+        );
 
         let mut v = serde_json::json!({"frames": "33"});
         assert!(canonicalize_video_frames(&mut v)
@@ -1354,7 +1392,10 @@ mod tests {
         // duration joins the conflict vocabulary; fps itself stays.
         let mut v = serde_json::json!({"frames": 33, "duration": 1});
         let err = canonicalize_video_frames(&mut v).unwrap_err();
-        assert!(err.contains("frames=33") && err.contains("duration=16"), "{err}");
+        assert!(
+            err.contains("frames=33") && err.contains("duration=16"),
+            "{err}"
+        );
 
         let mut v = serde_json::json!({"duration": -1});
         assert!(canonicalize_video_frames(&mut v)
@@ -1417,15 +1458,15 @@ mod tests {
         // Beyond the 33-frame calibration horizon the floor scales: a
         // 60-second /duration default-fps request (961 aligned frames)
         // must price out of any 8 GiB card, cold or warm.
-        let long = estimate_video_scratch(960, 320, 320, false);  // 957 aligned after floor
+        let long = estimate_video_scratch(960, 320, 320, false); // 957 aligned after floor
         assert!(long.estimate_mib > 100_000, "got {}", long.estimate_mib);
 
         // A cold spawn charges the staged weights on top — exactly the
         // deterministic weight size, unscaled by the scratch safety factor.
         let cold = estimate_video_scratch(5, 320, 320, true);
         let warm = estimate_video_scratch(5, 320, 320, false);
-        let delta = cold.estimate_mib as f64 - warm.estimate_mib as f64;
-        assert!((2_700.0..=2_900.0).contains(&delta), "cold delta {delta}");
+        let delta = cold.estimate_mib - warm.estimate_mib;
+        assert!((2_700..=2_900).contains(&delta), "cold delta {delta}");
         // And the live regression that motivated the split: 5f@320 cold
         // must fit a quiet 8 GiB card's 95% budget (~7.4 GiB).
         assert!(cold.estimate_mib <= 7_400, "got {}", cold.estimate_mib);
@@ -1434,8 +1475,14 @@ mod tests {
     #[test]
     #[allow(non_snake_case)]
     fn unit__gate_size__parses_and_defaults_conservatively() {
-        assert_eq!(gate_size(&serde_json::json!({"size": "320x320"})), (320, 320));
-        assert_eq!(gate_size(&serde_json::json!({"size": "640x480"})), (640, 480));
+        assert_eq!(
+            gate_size(&serde_json::json!({"size": "320x320"})),
+            (320, 320)
+        );
+        assert_eq!(
+            gate_size(&serde_json::json!({"size": "640x480"})),
+            (640, 480)
+        );
         // Absent / malformed / zero dims fall back to the child's own
         // default — the bigger, conservative side.
         assert_eq!(gate_size(&serde_json::json!({})), (512, 512));
