@@ -2638,3 +2638,41 @@ async fn e2e__tool_wins_admission_over_earlier_queued_interactive() {
     assert!(ra < rb);
     ts.state.sup.shutdown_all().await.unwrap();
 }
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__unknown_route__404_json_envelope_with_teaching_pointer() {
+    let ts = start(Config::default()).await;
+    // A route no router arm matches must still answer in the standard
+    // error envelope (not axum's empty body), name method + path, and
+    // point at the /.well-known/blazar census.
+    let resp = client()
+        .post(format!("{}/definitely/not/mounted", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let err = body
+        .get("error")
+        .and_then(|e| e.as_object())
+        .unwrap_or_else(|| panic!("expected error envelope, got {body}"));
+    assert_eq!(
+        err.get("type").and_then(|t| t.as_str()),
+        Some("blazar_error")
+    );
+    assert_eq!(
+        err.get("code").and_then(serde_json::Value::as_u64),
+        Some(404)
+    );
+    let msg = err.get("message").and_then(|m| m.as_str()).unwrap();
+    assert!(
+        msg.contains("POST") && msg.contains("/definitely/not/mounted"),
+        "message names method+path: {msg}"
+    );
+    assert!(
+        msg.contains("/.well-known/blazar"),
+        "message teaches the census: {msg}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}

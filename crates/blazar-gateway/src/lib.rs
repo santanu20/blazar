@@ -367,6 +367,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .merge(openai_any)
         .merge(api)
+        // Unknown routes answer in the standard error envelope with the
+        // offending method + path and a pointer at the route census,
+        // instead of axum's empty-body 404. Inside the layer stack, so
+        // auth/CORS/access-log still apply to 404s.
+        .fallback(unknown_route)
         // Session pins (R3): innermost layer — auth/CORS/logging/body
         // limit have already run; only header-carrying requests buffer.
         .layer(middleware::from_fn_with_state(
@@ -470,6 +475,20 @@ fn error_response(code: u16, msg: &str) -> Response {
         ),
     )
         .into_response()
+}
+
+/// Router fallback: every unmatched method+path lands here. The message
+/// names what was asked and where the full mounted-route census lives —
+/// `GET /.well-known/blazar` is kept in lockstep with the router table.
+async fn unknown_route(method: axum::http::Method, uri: axum::http::Uri) -> Response {
+    error_response(
+        404,
+        &format!(
+            "unknown route: {} {} — GET /.well-known/blazar lists every mounted route",
+            method,
+            uri.path()
+        ),
+    )
 }
 
 /// Redacted secret for listings: enough to recognize, not enough to use.
