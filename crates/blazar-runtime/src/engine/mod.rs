@@ -1903,15 +1903,20 @@ impl EngineManager {
     /// Phase-3 supersede lifecycle, run at daemon start and after any
     /// roster change:
     ///
-    /// (a) one-time architecture mining for binary-installed upstream
+    /// (a) persist re-rooted engine paths — rows installed under a
+    ///     different data dir carry a stale absolute server path that
+    ///     load-time adoption fixes in memory on every access; writing
+    ///     the adopted path back once heals the row instead of warning
+    ///     on every boot;
+    /// (b) one-time architecture mining for binary-installed upstream
     ///     lanes (release assets ship no manifest architectures; the
     ///     raw `src/llama-arch.cpp` at the lane's tag is fetched once
     ///     and the mined set persisted — never refetched);
-    /// (b) supersede marking — a fork lane whose advertised architecture
+    /// (c) supersede marking — a fork lane whose advertised architecture
     ///     set is fully covered by mainstream lanes gets
     ///     `superseded_by`/`superseded_at` stamped, so `engine list` can
     ///     show the graduation and the supervisor can drop learned pins;
-    /// (c) retirement sweep — curated fork lanes past
+    /// (d) retirement sweep — curated fork lanes past
     ///     `fork_retire_days` (0 = never) are deleted, EXCEPT rows that
     ///     are active or referenced by `pinned_tags` (user pins and
     ///     in-flight rescue pins override the lifecycle; user-built
@@ -1925,13 +1930,48 @@ impl EngineManager {
         pinned_tags: &[String],
     ) -> Result<()> {
         let store = Store::open(&self.dirs)?;
+        self.re_root_engine_rows(&store);
         self.mine_missing_architectures(&store).await;
         Self::mark_superseded_lanes(&store)?;
         self.sweep_retired_lanes(&store, fork_retire_days, pinned_tags)?;
         Ok(())
     }
 
-    /// Supersede step (a): one-time architecture mining for
+    /// Supersede step (a): heal relocated engine rows in place. The
+    /// manifest's re-root logic only mutates the decoded copy, so a row
+    /// whose recorded data dir is gone would re-warn on every boot;
+    /// persisting the adopted path makes the relocation stick. No
+    /// network, no spawn — just an `exists` walk and, for stale rows
+    /// only, one manifest rewrite.
+    fn re_root_engine_rows(&self, store: &Store) {
+        let rows = store.list_engines().unwrap_or_default();
+        for row in &rows {
+            let Ok(mut manifest) = serde_json::from_str::<Manifest>(&row.manifest) else {
+                continue;
+            };
+            if !manifest.re_root_server_path(&self.dirs.engines_dir()) {
+                continue;
+            }
+            match serde_json::to_string(&manifest)
+                .context("encode re-rooted manifest")
+                .and_then(|encoded| {
+                    store
+                        .update_engine_manifest(&row.tag, &encoded)
+                        .context("persist re-rooted engine path")
+                }) {
+                Ok(()) => tracing::info!(
+                    "engine {} server path re-rooted and persisted (one-time)",
+                    row.tag
+                ),
+                Err(e) => tracing::warn!(
+                    "engine {} re-rooted in memory but not persisted ({e:#})",
+                    row.tag
+                ),
+            }
+        }
+    }
+
+    /// Supersede step (b): one-time architecture mining for
     /// binary-installed upstream lanes (release assets ship no manifest
     /// architectures; source builds mine at build time). Fetch failures
     /// warn and move on — supersede coverage catches up on the next
@@ -1999,7 +2039,7 @@ impl EngineManager {
         }
     }
 
-    /// Supersede step (b): stamp fork lanes whose advertised
+    /// Supersede step (c): stamp fork lanes whose advertised
     /// architecture set is fully covered by mainstream lanes. Partial
     /// coverage keeps the fork active — partial mainstream support is
     /// exactly the self-correcting case (unknown-arch rescue re-pins
@@ -2063,7 +2103,7 @@ impl EngineManager {
         Ok(())
     }
 
-    /// Supersede step (c): retirement sweep — curated fork lanes past
+    /// Supersede step (d): retirement sweep — curated fork lanes past
     /// the grace period are deleted, EXCEPT rows that are active or
     /// referenced by `pinned_tags` (user pins and in-flight rescue pins
     /// override the lifecycle). User-built forks (trust User) outlive
