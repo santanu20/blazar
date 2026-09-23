@@ -1,10 +1,10 @@
 # Blazar inference benchmark
 
-_Rendered 20260922-174339; blazar 0.10.0; power state of gateway rows: ac._
+_Rendered 20260923-media-v2; blazar 0.10.0; power state of gateway rows: ._
 
 ## Executive summary
 
-b11070-cuda: gateway 347.6 vs direct 333.0 t/s (+4.4%); b11070-cuda prompt-cache prefill 51806 vs 17747 t/s cold; 4-stream concurrency: 447.9 t/s system (2x32768 shape); gateway cold boot 0.52 s.
+_No complete rows._
 
 ## Test bed
 
@@ -15,8 +15,8 @@ b11070-cuda: gateway 347.6 vs direct 333.0 t/s (+4.4%); b11070-cuda prompt-cache
 | Integrated GPU | Intel Graphics (RPL-S), Vulkan device |
 | RAM | 16 GiB (13.3 GiB usable) |
 | OS | Linux Mint 22.3, kernel 7.0.0-31-generic |
-| Runtimes compared | blazar 0.10.0 gateway - b11070-cuda |
-| Model | qwen2.5-0.5b.gguf |
+| Runtimes compared | blazar 0.10.0 gateway - piper (gateway TTS lane) - stable-diffusion.cpp master-890 (Vulkan) - whisper.cpp b5130 |
+| Model | en_US-amy-medium, ggml-base, qwen-image-2.1, wan_2.1_comfyui_repackaged |
 
 ## Methodology
 
@@ -35,6 +35,14 @@ b11070-cuda: gateway 347.6 vs direct 333.0 t/s (+4.4%); b11070-cuda prompt-cache
 - Long-context curve: per-ctx cells (blazar model_overrides ctx / ollama num_ctx) x 3-run decode suites; each ollama point evicts first so the runner respawns at that ctx.
 - Sustained concurrency: sequential bursts of the parallel-stream lane (default 3 rounds); TTFT p99 aggregates every stream of every round.
 - Every blazar row records the spawned engine's argv (slots/context shown in tables) and stamps blazar version, wall clock, 5-min load average, and AC/battery power state; GPU cells refuse to run on battery.
+- Media lanes run in isolated sandbox daemons (same protocol as text blazar cells); the engine child spawns lazily, so each family's first request is the COLD number (spawn + weights + first artifact), labeled cold_request_s.
+- Media TTFB = time to first BODY byte (first audio sample for streamed PCM, not response headers); buffered WAV TTFB equals its total by construction and the table says so.
+- Video frame counts are container ground truth: the response webm is parsed for lacing-aware SimpleBlock counts and asserted against the Wan 4k+1 temporal grid (a mismatch is recorded loudly, never averaged away).
+- The video scratch-gate probe sends one expected-rejected monster (duration 60s -> 960 aligned frames) and times the 400; the legit 5-frame pass rides the same warm child, so axis-row vs probe deltas price the gate itself.
+- Media cells stamp GPU-busy and RAM-available at entry instead of asserting an idle GPU: a warm child from the previous family is the normal media workflow, and the receipt carries the occupancy rather than hiding it.
+- TTS RTF = synthesis wall / audio seconds, audio duration parsed from the RIFF data-chunk length (not estimated from characters); whisper transcribes a WAV synthesized by the same campaign's piper voice, so the input is reproducible from the receipt.
+- Image quality stamps are PIL-gated luma-domain metrics (rms contrast = luma stddev, entropy in bits, unique colors on a 256x256 downsample); when PIL is absent the row carries an honest 'skipped' note instead of a fake number, and one audit PNG per steps point is saved beside the cells for offline re-measurement.
+- TTS concurrency probe: N parallel streamed-PCM requests through one sandboxed gateway; wall clock vs sum of per-stream totals yields an efficiency ratio (sum/wall ~ 1 means serialized, -> N means perfectly parallel), and the probe fails loudly if any stream errors or truncates.
 
 ## Results
 
@@ -42,87 +50,62 @@ b11070-cuda: gateway 347.6 vs direct 333.0 t/s (+4.4%); b11070-cuda prompt-cache
 
 | Runtime | slots x ctx | decode t/s | TTFT p50 ms | TTFT p99 ms | ITL p50 ms | ITL p99 ms | prefill cold t/s | prefill cached t/s | GPU peak MiB | GPU power W |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| blazar gateway - b11070-cuda | 2x32768 | 338.7 | 10.3 | 14.1 | 3.0 | 4.2 | 18039.0 | 49490.6 | 1021 | 54.1 |
-| blazar gateway - b11070-cuda | 1x16384 | 347.6 | 10.2 | 13.7 | 2.9 | 4.1 | 17747.0 | 51806.2 | 788 | 51.7 |
-| direct engine - b11070-cuda | 1x16384 | 333.0 | 9.5 | 11.9 | 3.0 | 3.6 | 17776.7 | 54712.8 | 788 | 54.2 |
 
 ### Concurrency (4 parallel streams x 128 tokens)
 
 | Runtime | slots | ok streams | rounds | system t/s | sum-stream t/s | wall s | TTFT max ms | TTFT p99 ms | ITL p99 ms |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| blazar gateway - b11070-cuda | 2x32768 | 12/4 | 3 | 447.9 | 3287.4 | 2.26 | 512 | 501 | 5.7 |
-| direct engine - b11070-cuda | 4 | 4/4 | 1 | 477.8 | 674.4 | 0.72 | 32 | - | 11.8 |
 
 _sum-stream >> system t/s means streams serialize on one slot; roughly equal means genuinely parallel._
 
 ### Perplexity
 
-| Engine | perplexity (ctx 2048, offline ASCII corpus) |
-|---|---:|
-| b11070-cuda | 43.86 ± 2.54 |
+_Not measured._
 
 ### Greedy parity and gateway transparency (20 prompts, 256 tokens)
 
 | Comparison | exact / total | ratio mean | ratio min |
 |---|---:|---:|---:|
-| b11070-cuda vs same-engine reference (direct) | 20/20 | 1.000 | 1.000 |
-| b11070-cuda through blazar gateway vs direct | 19/20 | 0.967 | 0.332 |
 
 _Exact-match divergence across GPU backends is expected float nondeterminism (batch shape and backend kernels), not translation drift; bit-parity across runs requires single-slot decoding (blazar `deterministic = true` pins it)._
 
 ### Optimization axes (ctx 4096, single stream)
 
-| Engine | axis | setting | decode t/s | delta vs dense | prefill cold t/s | delta |
-|---|---|---|---:|---:|---:|---:|
-| b11070-cuda | kv | q8_0 | 321.7 | -30.7 | 16941.3 | 742.3 |
-| b11070-cuda | spec | ngram-simple | 327.5 | -24.8 | 18061.0 | 1861.9 |
+_Not measured._
 
 ### Engine capability matrix
 
-| Capability | b11070-cuda |
-|---|---:|
-| anthropic-api | no |
-| ctx-override | yes |
-| embeddings | yes |
-| grammar-gbnf | yes |
-| json-schema | yes |
-| kv-quant | yes |
-| lora-adapter | yes |
-| metrics-endpoint | yes |
-| paged-attn | yes |
-| parallel-np | yes |
-| quant-on-load | yes |
-| rerank | yes |
-| slots-sessions | yes |
-| spec-decode | yes |
-| tokenize-endpoint | yes |
-| vision-mmproj | yes |
+_Not measured._
 
 ### Cold start and footprint
 
-| Runtime | daemon boot s | first request (cold engine load) s | cold TTFT ms | engine load s | RSS peak MiB |
-|---|---:|---:|---:|---:|---:|
-| blazar gateway - b11070-cuda | 0.52 | 1.74 | 1719 | - | 584 |
-| blazar gateway - b11070-cuda | 0.52 | 1.90 | 1891 | - | 568 |
-| direct engine - b11070-cuda | - | - | - | 1.00 | 564 |
+_Not measured._
 
 _Every cold probe runs page-cache-dropped and GPU-idle-asserted on both runtimes; ollama rows without --ollama-service-restart leave the daemon warm (note in the artifact)._
 
 ### Idle wake (sleep vs keep_alive expiry)
 
-| Runtime | idle policy | policy observed | wake TTFT ms | reload s | note |
-|---|---|---|---:|---:|---|
-| blazar - b11070-cuda | sleep at 15s (weights stay RAM-resident) | yes | 641 | - |  |
+_Not measured._
 
 _blazar sleeps with weights in RAM (wake = resume); ollama unloads at keep_alive expiry (wake = full disk reload). Policies differ by design — the table measures each runtime's own idle path after the policy verifiably fired._
 
 ### Long-context degradation curve
 
-| Runtime | ctx | decode t/s | TTFT p50 ms |
-|---|---:|---:|---:|
-| blazar - b11070-cuda | 2048 | 333.1 | 15 |
-| blazar - b11070-cuda | 8192 | 327.6 | 11 |
-| blazar - b11070-cuda | 16384 | 342.6 | 13 |
+_Not measured._
+
+### Media lanes (image / video / TTS / whisper)
+
+| Lane | cold s | median s | min s | max s | ground truth | gate reject s | TTFB speedup |
+|---|---:|---:|---:|---:|---|---:|---:|
+| image - qwen-image-2.1 (512x512, steps=[4]) | 59.06 | 71.18 | 64.13 | 71.52 | 512x512 PNG, entropy 6.6 bits, contrast 54.6 |  |  |
+| tts - en_US-amy-medium (840 chars, wav+pcm) | - | 2.16 | - | 3.49 | RTF wav 0.036 / pcm 0.058 (61s audio) |  | 4.18x |
+| tts-conc - en_US-amy-medium (400 chars x4 pcm) | - | 5.01 | 5.12 | - | efficiency 3.90 of 4 streams |  | 1813ms max TTFB |
+| video - wan_2.1_comfyui_repackaged (320x320, steps=8) | 17.19 | 13.09 | 13.08 | 14.09 | 5f: mux==reported==aligned | 0.001 |  |
+| video - wan_2.1_comfyui_repackaged (320x320, steps=8) | - | 26.12 | 26.12 | 26.14 | 13f: mux==reported==aligned |  |  |
+| video - wan_2.1_comfyui_repackaged (320x320, steps=8) | - | 60.19 | 60.18 | 60.19 | 33f: mux==reported==aligned |  |  |
+| whisper - ggml-base (transcribes piper wav) | 2.46 | 2.14 | - | - | RTF 0.070 |  |  |
+
+_Media cells run through the same sandboxed gateway as text lanes but do not assert GPU-idle: a warm engine child is the normal serving shape, so each row stamps gpu_busy_mib / ram_avail_mib / loadavg instead. 3 runs (not 5) — media variance is dominated by the model, not the scheduler. Video frame counts are read from the EBML container (lacing-aware), never from an API field; the VRAM gate probe times how fast an over-budget request is rejected with a teaching error._
 
 ## Findings
 
@@ -133,6 +116,10 @@ _blazar sleeps with weights in RAM (wake = resume); ollama unloads at keep_alive
 5. **Speculative n-gram decoding is a net loss for this 9B model** (no draft model; acceptance too low to pay the verification overhead) - documented so the flag is not cargo-culted.
 6. **KV q8_0 quantization is decode-neutral and prefill-neutral steady-state**; the one cold-prefill outlier below is a first-invocation pipeline-compile artifact (controlled re-probe measured full-rate steady state).
 7. **mistral.rs 0.9.3 with default paged attention cannot fit this model on an 8 GiB card** (upstream sizes KV as a fraction of total VRAM); blazar's profile auto-disables paged attention on tight cards and the model then serves correctly.
+8. **Image quality stamps (PIL, luma domain): entropy 6.61 bits, rms contrast 54.6, 29393 unique colors @256x256** on qwen-image-2.1 - perceptual baseline for cross-run comparisons; audit PNG saved beside the cells.
+9. **Streamed PCM cuts time-to-first-audio 4.18x vs buffered WAV** (piper lane, first audio 0.52s vs 2.16s full synthesis) - total wall time is slightly higher (per-chunk synthesis), the win is interactivity.
+10. **4 parallel PCM streams through one gateway: perfectly parallel** (efficiency 3.90 = sum of per-stream totals / 5.12s wall, max TTFB 1813 ms, NON-uniform stream outputs - flagged) - the scalability receipt for the TTS lane.
+11. **Video VRAM gate rejects an over-budget request in 1 ms** with the full estimate math and override levers in the error body - instead of an opaque child abort minutes later.
 
 ## Caveats
 
@@ -148,37 +135,4 @@ python3 scripts/bench_matrix.py --blazar-bin target/release/blazar --md BENCHMAR
 python3 scripts/bench_matrix.py --render-only --artifacts-dir <dir> --md BENCHMARK.md
 ```
 
-_Raw per-cell records (argv, per-run lists, daemon logs): `/home/santanu/.cache/blazar-bench-matrix/20260922-174339/cells.jsonl`._
-
-## Media models audit (rendered 20260923, manual section)
-
-_Image / video / TTS quality + perf; same test bed as above; blazar 0.10.0 @ feature/sdcpp-lane eceaf29; serial single-GPU; timing is API-level wall clock._
-
-### Perf
-
-| Model | Resolution | Cold | Warm | Notes |
-|---|---|---|---|---|
-| flux.1-dev Q2_K (4 steps) | 512x512 | 17.8 s | 13.0-13.1 s | fastest per gen |
-| stable-diffusion-xl-base-1.0 | 1024x1024 native | 51.2 s | 44.1 s x2 | 4x pixels of the 512 lane in less time than qwen |
-| qwen-image-2.1 Q4_K_M | 512x512 default | 127.3 s | 64-83 s | 1024x1024 forced = 273.6 s |
-| wan_2.1 (T2V) | default clip | - | 28.1-32.0 s | valid WebM (EBML), seed-diverse |
-| piper en_US-amy-medium | 22050 Hz mono | - | 0.62-0.75 s | 11.7-11.9 s audio -> RTF 0.053-0.064 (15-19x realtime) |
-
-### Quality (structural, offline: PIL + wave; no CLIP/FID scorers on box)
-
-| Model | Contrast (std) | Detail (edges) | Color div (uniq/16384) | Seed-deterministic | Seed-diverse |
-|---|---|---|---|---|---|
-| flux.1-dev Q2_K | 88.4 | 2.1 | 11913 | yes (byte-exact) | yes |
-| sdxl-base-1.0 | 66.6 | 7.3 | 13160 | yes (byte-exact) | yes |
-| qwen-image-2.1 | 62.6 | 5.1 | 11990 | yes (byte-exact) | yes |
-| piper amy | rms 3980, silence 10.3% (natural pauses) | peak 32767/32767 = full-scale | - | no (~2% duration jitter) | - |
-
-### Findings
-
-- SDXL is the speed/quality balance king on this box (native 1024p, richest detail+color, byte-deterministic).
-- FLUX Q2_K @ 4 steps is fastest but soft (edges 2.1): quality knob = raise steps (8-12) when latency allows; Q2_K is the floor quant.
-- qwen-image-2.1 pays the DiT + Qwen3VL-8B prompt-rewriter + mmproj stack: ~4.5x SDXL per pixel, but it alone offers /v1/images/edits and the strongest prompt adherence via VL rewriting.
-- TTS runs at 15-19x realtime; peak touches full scale (clipping ceiling) - a -1 dBFS limiter/headroom tweak in the piper path is the one actionable audio finding.
-- Robustness: after a client-abandoned in-flight job, the next 2 requests can 502 (warmup race: child died / no results) and the 3rd self-recovers; failures surface honestly, nothing silent.
-
-_Artifacts: /tmp/opencode/media-audit/ (per-gen json/png/webm/wav + audit_summary.json)._
+_Raw per-cell records (argv, per-run lists, daemon logs): `bench-artifacts/20260923-media-v2/cells.jsonl`._

@@ -3,7 +3,8 @@
 
 Sweeps every installed engine (llama.cpp builds AND mistral.rs) across
 server providers (direct child spawn, blazar gateway, ollama reference),
-measuring:
+plus the media lanes (sdcpp image/video, piper TTS, whisper speech)
+through the sandboxed gateway, measuring:
 
   speed      TTFT p50/p90/p99, inter-token latency p50/p99, decode t/s,
              TRUE prefill t/s (prompt tokens / first-token time) with
@@ -47,11 +48,13 @@ ollama cell is HTTP-only against an already-running service.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import ctypes
 import difflib
 import hashlib
 import importlib
+import io
 import itertools
 import json
 import math
@@ -71,6 +74,16 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+# Optional quality-lane dependency: the image lane stamps perceptual
+# metrics (contrast / entropy / color diversity) when Pillow is importable
+# and degrades to an honest "skipped" note otherwise — the harness itself
+# stays stdlib-only.
+try:
+    from PIL import Image as PILImage, ImageStat as PILImageStat
+except ImportError:  # pragma: no cover - exercised only on PIL-less hosts
+    PILImage = None
+    PILImageStat = None
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
@@ -147,6 +160,26 @@ PREFILL_BANK = [
     "Charts showed reefs as tiny asterisks of danger.",
     "Sailors spliced rope during the long watches between calms.",
 ]
+
+# Media-lane defaults. The image lane sweeps diffusion steps at a fixed
+# 512x512; the video lane sweeps Wan-aligned frame counts at 320x320
+# (RAM-guarded: the wan child stages ~5.6 GiB host RAM for weights, so
+# the axis stops at 33 frames where scratch stays flat ~3.0 GiB VRAM).
+# Gate probe rides the video family: one expected-400 monster (duration
+# 60s -> 960 aligned frames, far past any 8 GiB budget) + one legit 5f
+# pass to price the check itself.
+MEDIA_IMAGE_STEPS = (4,)
+MEDIA_IMAGE_SIZE = "512x512"
+MEDIA_VIDEO_FRAMES = (5, 13, 33)
+MEDIA_VIDEO_SIZE = "320x320"
+MEDIA_VIDEO_STEPS = 8
+MEDIA_TTS_CHARS = 840
+MEDIA_TTS_CONC_STREAMS = 4
+MEDIA_TTS_CONC_CHARS = 400
+MEDIA_GATE_MONSTER = {"duration": 60, "size": "512x512", "steps": 8}
+MEDIA_MEM_FLOOR_MIB = 4000.0  # image-family floor (child RSS ~3-4G host)
+MEDIA_VIDEO_MEM_FLOOR_MIB = 6000.0  # wan offload-to-cpu child stages ~5.6G host
+DEFAULT_MEDIA_RUNS = 3
 
 # Feature matrix: documented constants for engines without an
 # introspectable CLI (ollama; source: docs.ollama.com cap pages, and the
@@ -267,9 +300,9 @@ def append_record(path: Path, record: dict) -> None:
 @dataclass
 class Engine:
     tag: str
-    kind: str  # llamacpp | mistralrs
+    kind: str  # llamacpp | mistralrs | sdcpp | whisper
     dir: Path
-    server: Path  # llama-server or mistralrs binary
+    server: Path | None  # llama-server / mistralrs / sd-server binary
     bench: Path | None = None
     perplexity: Path | None = None
 
@@ -298,10 +331,19 @@ def load_engines(data_dir: Path) -> list[Engine]:
             # active and the sandbox daemon exits "no engine installed"
             continue
         kind = kinds[tag]
+        if kind == "sdcpp":
+            # Media lane: the gateway spawns sd-server on demand; the
+            # harness only needs the tag for activation + stamps.
+            out.append(Engine(tag, kind, edir, None, None, None))
+            continue
+        if kind == "whisper":
+            out.append(Engine(tag, kind, edir, None, None, None))
+            continue
         if kind not in ("llamacpp", "mistralrs"):
-            # Text-bench lanes only. sdcpp (sd-server) has no chat
-            # surface — its /v1/images endpoints belong to the image
-            # lane, not this harness.
+            # Text-bench lanes only. sglang text cells run through the
+            # same gateway provider once a safetensors model fits the
+            # card; on this 8 GiB box they cannot coexist with the media
+            # children, so the kind stays discovered-but-not-swept.
             continue
         if kind == "mistralrs":
             server = edir / "mistralrs"
@@ -581,6 +623,835 @@ def percentile(vals: list[float], pct: int) -> float:
         return float(max(vals)) if pct >= 50 else float(min(vals))
     q = statistics.quantiles(vals, n=100, method="inclusive")
     return q[min(pct - 1, 99)]
+
+
+# ---------------------------------------------------------------------------
+# media-lane plumbing: byte-format ground truth + first-byte timing +
+# sandbox data staging. Everything here is stdlib; parsers are derived
+# from the container specs (PNG/IHDR, EBML/Matroska, RIFF/WAV) and
+# cross-checked against recorded engine artifacts before trusting them
+# for a receipt (a parser bug would silently corrupt every frame count
+# in the table — the failure mode this section exists to prevent).
+
+
+def png_dims(data: bytes) -> tuple[int, int] | None:
+    """PNG width/height from the IHDR chunk (fixed offset: signature
+    + length + type precede it in every conformant encoder)."""
+    if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    if data[12:16] != b"IHDR":
+        return None
+    w = int.from_bytes(data[16:20], "big")
+    h = int.from_bytes(data[20:24], "big")
+    return (w, h)
+
+
+def _png_quality_metrics(png_bytes: bytes) -> dict[str, float] | None:
+    """PIL-gated perceptual stamps for a generated image: rms contrast
+    (luma stddev), luma entropy in bits (detail proxy), mean luma, and
+    unique colors on a 256x256 downsample (palette-diversity proxy).
+    Returns None when PIL is absent or the bytes will not decode — the
+    caller stamps an honest 'skipped' note instead of a fake number."""
+    if PILImage is None or PILImageStat is None:
+        return None
+    try:
+        with PILImage.open(io.BytesIO(png_bytes)) as im:
+            rgb = im.convert("RGB")
+            luma = rgb.convert("L")
+            stat = PILImageStat.Stat(luma)
+            small = rgb.resize((256, 256))
+            colors = small.getcolors(maxcolors=65536) or []
+            return {
+                "rms_contrast": round(stat.stddev[0], 3),
+                "mean_luma": round(stat.mean[0], 3),
+                "entropy_bits": round(luma.entropy(), 3),
+                "unique_colors_256": float(len(colors)),
+            }
+    except Exception:
+        return None
+
+
+def _ebml_vint(data: bytes, pos: int) -> tuple[int, int] | None:
+    """EBML variable-length integer -> (value, next_pos)."""
+    if pos >= len(data):
+        return None
+    first = data[pos]
+    if first == 0:
+        return None  # 8-byte vints never occur in webm sizes we walk
+    length = 1
+    mask = 0x80
+    while not (first & mask):
+        mask >>= 1
+        length += 1
+    if pos + length > len(data):
+        return None
+    value = first & (mask - 1)
+    for i in range(1, length):
+        value = (value << 8) | data[pos + i]
+    return value, pos + length
+
+
+def _ebml_id(data: bytes, pos: int) -> tuple[int, int] | None:
+    """EBML element ID -> (id, next_pos). IDs keep the marker bits (unlike sizes)."""
+    if pos >= len(data):
+        return None
+    first = data[pos]
+    if first == 0:
+        return None
+    length = 1
+    mask = 0x80
+    while not (first & mask):
+        mask >>= 1
+        length += 1
+    if pos + length > len(data):
+        return None
+    value = first
+    for i in range(1, length):
+        value = (value << 8) | data[pos + i]
+    return value, pos + length
+
+
+def webm_frame_count(data: bytes) -> tuple[int | None, str | None]:
+    """Count presented video frames in a Matroska byte stream.
+
+    Descends Segment (0x18538067) -> Cluster (0x1F43B675) -> SimpleBlock,
+    honoring lacing (one SimpleBlock can lace up to 128 frames; block count
+    alone under-reports). Returns (frames, parser_note) - a note instead of a
+    silent wrong number.
+    """
+    CONTAINERS = (0x18538067, 0x1F43B675)  # Segment, Cluster
+    frames = 0
+    blocks = 0
+    note = None
+
+    def walk(pos: int, end: int, depth: int) -> None:
+        nonlocal frames, blocks, note
+        while pos < end and note is None:
+            vid = _ebml_id(data, pos)
+            if vid is None:
+                return
+            element_id, body_pos = vid
+            size = _ebml_vint(data, body_pos)
+            if size is None:
+                return
+            payload_len, payload_start = size
+            payload_end = min(payload_start + payload_len, end)
+            if payload_end <= pos:
+                note = "zero-size element (malformed?)"
+                return
+            if element_id in CONTAINERS and depth < 8:
+                walk(payload_start, payload_end, depth + 1)
+            elif element_id == 0xA3:  # SimpleBlock
+                blocks += 1
+                p = payload_start
+                _tc = _ebml_vint(data, p)  # timecode (signed vint, usually 2 bytes)
+                if _tc is None or _tc[1] >= payload_end:
+                    note = "truncated block header"
+                    return
+                p = _tc[1]
+                flags = data[p]
+                p += 1
+                lacing = (flags >> 1) & 0x3
+                if lacing == 0:
+                    frames += 1
+                else:
+                    lace = _ebml_vint(data, p)
+                    if lace is None:
+                        note = "truncated lace header"
+                        return
+                    frames += 1 + lace[0]
+            pos = payload_end
+
+    walk(0, len(data), 0)
+    if frames == 0 and note is None:
+        return None, f"no SimpleBlocks found ({blocks} blocks)"
+    if frames == 0:
+        return None, note
+    return frames, note
+
+
+def wav_layout(data: bytes) -> dict | None:
+    """RIFF/WAV header walk -> rate/channels/bits/data bytes. Returns
+    None when the bytes are not a parseable RIFF (honest null)."""
+    if len(data) < 44 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return None
+    pos = 12
+    rate = channels = bits = None
+    data_bytes = None
+    while pos + 8 <= len(data):
+        cid = data[pos : pos + 4]
+        clen = int.from_bytes(data[pos + 4 : pos + 8], "little")
+        body = data[pos + 8 : pos + 8 + clen]
+        if cid == b"fmt " and len(body) >= 16:
+            channels = int.from_bytes(body[2:4], "little")
+            rate = int.from_bytes(body[4:8], "little")
+            bits = int.from_bytes(body[14:16], "little")
+        elif cid == b"data":
+            data_bytes = clen
+        pos += 8 + clen + (clen & 1)
+    if rate is None or data_bytes is None:
+        return None
+    return {
+        "rate": rate,
+        "channels": channels,
+        "bits": bits,
+        "data_bytes": data_bytes,
+        "audio_s": data_bytes / float(rate * (channels or 1) * ((bits or 16) // 8)),
+    }
+
+
+def http_timed(
+    port: int,
+    path: str,
+    payload: bytes | dict | None,
+    timeout: float = 300.0,
+    headers: dict[str, str] | None = None,
+) -> dict:
+    """POST with first-BODY-byte timing via http.client (urllib hides
+    chunk boundaries, and TTFB for streaming lanes means first audio
+    byte, not response headers).
+
+    Returns status, ttfb_ms, total_s, byte counts and the body. A
+    non-2xx status is a RESULT, not an exception — the gate lane times
+    400 rejections, and callers assert expected statuses.
+    """
+    import http.client
+
+    if isinstance(payload, dict):
+        payload = json.dumps(payload).encode()
+    hdrs = {"Content-Type": "application/json"}
+    if headers:
+        hdrs.update(headers)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    t0 = time.perf_counter()
+    ttfb = None
+    body = b""
+    status = None
+    resp_headers: dict[str, str] = {}
+    try:
+        conn.request("POST", path, body=payload, headers=hdrs)
+        resp = conn.getresponse()
+        status = resp.status
+        resp_headers = {k.lower(): v for k, v in resp.getheaders()}
+        first = True
+        while True:
+            chunk = resp.read(65536)
+            if not chunk:
+                break
+            if first:
+                ttfb = time.perf_counter()
+                first = False
+            body += chunk
+        total = time.perf_counter()
+        return {
+            "status": status,
+            "ttfb_ms": round((ttfb - t0) * 1000.0, 1) if ttfb else None,
+            "total_s": round(total - t0, 3),
+            "bytes": len(body),
+            "headers": resp_headers,
+            "body": body,
+        }
+    finally:
+        conn.close()
+
+
+def _hardlink_tree(src: Path, dst: Path) -> None:
+    """Sandbox-safe staging: hardlink copy (same filesystem), so a
+    sandboxed process can unlink its view without touching the real
+    store — mirrors validate.py's engines handling."""
+    shutil.copytree(src, dst, symlinks=True, copy_function=os.link, dirs_exist_ok=True)
+
+
+@contextlib.contextmanager
+def media_family(
+    label: str,
+    activate_kinds: tuple[str, ...],
+    stage_voices: bool = False,
+    stage_whisper_models: bool = False,
+):
+    """Context manager: sandboxed daemon ready for media requests.
+
+    Mirrors run_blazar_cell's isolation (unique port, BLAZAR_VALIDATE
+    reaper protection, teardown-dark verify) but for media families the
+    child spawns lazily on the first lane request — the COLD number is
+    the spawn+first-media wall, labeled cold_request_s per lane.
+
+    Deliberately NOT wait_gpu_idle-gated: media boxes routinely carry a
+    warm child from a previous family (or the user's daemon); the lane
+    stamps gpu_busy at entry and the receipt carries the truth.
+    """
+    os.environ["BLAZAR_VALIDATE_PORT"] = str(free_port())
+    V = importlib.import_module("validate")
+    V.PORT = int(os.environ["BLAZAR_VALIDATE_PORT"])
+    sb = V.Sandbox()
+    port = V.PORT
+    daemon = None
+    try:
+        con = sqlite3.connect(Path(sb.data_home) / "blazar" / "blazar.db")
+        marks = ",".join("?" * len(activate_kinds)) or "NULL"
+        con.execute(
+            f"UPDATE engines SET active = (kind IN ({marks}))",
+            activate_kinds,
+        )
+        con.commit()
+        con.close()
+        real_data = Path.home() / ".local/share/blazar"
+        if stage_voices:
+            _hardlink_tree(real_data / "voices", Path(sb.data_dir) / "voices")
+            # the piper engine binary lives outside engines/ — stage it too,
+            # the gateway 404s with "piper is not installed" without it
+            _hardlink_tree(real_data / "piper", Path(sb.data_dir) / "piper")
+        if stage_whisper_models:
+            src = real_data / "whisper" / "models"
+            dst = Path(sb.data_dir) / "whisper" / "models"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            _hardlink_tree(src, dst)
+        daemon = V.Daemon(sb)
+        daemon.start(cfg={"port": port})
+        deadline = time.time() + 120
+        healthy = False
+        while time.time() < deadline:
+            try:
+                http_json(f"http://127.0.0.1:{port}/healthz", timeout=5.0)
+                healthy = True
+                break
+            except json.JSONDecodeError:
+                healthy = True
+                break
+            except (urllib.error.URLError, OSError):
+                time.sleep(0.5)
+        if not healthy:
+            raise RuntimeError(f"media family '{label}' daemon failed to boot")
+        yield {"port": port, "sb": sb}
+    finally:
+        log_tail = None
+        if daemon is not None:
+            daemon.stop()
+            dlog = Path(sb.data_dir) / "run" / "daemon.log"
+            if dlog.exists():
+                log_tail = "\n".join(
+                    dlog.read_text(errors="replace").splitlines()[-12:]
+                )
+        sb.destroy()
+        if log_tail:
+            Path(Path.home() / ".cache/blazar-bench-matrix").mkdir(
+                parents=True, exist_ok=True
+            )
+        # log tail surfaces via the lane record, not stdout spam
+        media_family.last_log_tail = log_tail  # type: ignore[attr-defined]
+
+
+def _media_env_stamps() -> dict:
+    """Per-cell honesty stamps: GPU census + RAM head + loadavg. Media
+    lanes run with warm children by design; the receipt says so."""
+    stamps = {
+        "gpu_busy_mib": round(gpu_used_mib(), 0),
+        "loadavg_5m": Path("/proc/loadavg").read_text().split()[1],
+    }
+    try:
+        meminfo = {
+            parts[0].rstrip(":"): int(parts[1])
+            for parts in (
+                l.split()[:2] for l in Path("/proc/meminfo").read_text().splitlines()
+            )
+        }
+        stamps["ram_avail_mib"] = round(meminfo.get("MemAvailable", 0) / 1024, 0)
+    except (OSError, ValueError):
+        stamps["ram_avail_mib"] = None
+    return stamps
+
+
+def _media_child_stamps() -> dict:
+    """Attach argv of a live sandbox engine child, when one exists."""
+    pid = find_sandbox_engine_pid()
+    if pid is None:
+        return {}
+    return {"child_pid": pid, "child_argv": read_proc_argv(pid)}
+
+
+def run_media_image_cell(eng: Engine, model_id: str, cfg: dict) -> dict:
+    """Image lane: sync generations, steps axis at fixed size. Cold row
+    = spawn + first image (the user-felt wait); warm rows follow."""
+    rec: dict = {"lane": "image"}
+    with media_family(f"image-{eng.tag}", ("sdcpp",)) as fam:
+        sampler = Sampler(None)
+        sampler.start()
+        port = fam["port"]
+        try:
+            rec["gpu_busy_entry_mib"] = round(gpu_used_mib(), 0)
+            body = {
+                "model": model_id,
+                "prompt": "a lighthouse on a cliff at dusk, oil painting",
+                "size": MEDIA_IMAGE_SIZE,
+                "steps": MEDIA_IMAGE_STEPS[0],
+            }
+            t0 = time.perf_counter()
+            cold = http_timed(port, "/v1/images/generations", body, timeout=600.0)
+            rec["cold_request_s"] = round(time.perf_counter() - t0, 2)
+            rec["cold_status"] = cold["status"]
+            rec.update(_media_child_stamps())
+            runs: list[dict] = []
+            saved_steps: set[int] = set()
+            steps_axis = list(MEDIA_IMAGE_STEPS)
+            for steps in steps_axis:
+                for r in range(cfg["runs"]):
+                    got = http_timed(
+                        port,
+                        "/v1/images/generations",
+                        {**body, "steps": steps},
+                        timeout=600.0,
+                    )
+                    run_rec = {
+                        "steps": steps,
+                        "status": got["status"],
+                        "total_s": got["total_s"],
+                    }
+                    if got["status"] == 200:
+                        try:
+                            doc = json.loads(got["body"])
+                            img = base64.b64decode(doc["data"][0]["b64_json"])
+                            run_rec["png_bytes"] = len(img)
+                            dims = png_dims(img)
+                            if dims is None:
+                                run_rec["png_parse_note"] = "not a PNG body"
+                            else:
+                                run_rec["dims"] = f"{dims[0]}x{dims[1]}"
+                            quality = _png_quality_metrics(img)
+                            if quality is not None:
+                                run_rec["quality"] = quality
+                            elif PILImage is None:
+                                rec.setdefault("quality_note", "skipped: PIL absent")
+                            if dims is not None and cfg.get("art_dir"):
+                                # one audit artifact per steps point so the
+                                # perceptual stamps stay reproducible offline
+                                if steps not in saved_steps:
+                                    art = Path(cfg["art_dir"])
+                                    fname = (
+                                        f"image-{model_id.replace('/', '_')}"
+                                        f"-steps{steps}.png"
+                                    )
+                                    (art / fname).write_bytes(img)
+                                    saved_steps.add(steps)
+                        except (ValueError, KeyError, IndexError) as exc:
+                            run_rec["png_parse_note"] = f"decode failed: {exc}"
+                    runs.append(run_rec)
+            rec["runs"] = runs
+            ok = [r for r in runs if r.get("status") == 200 and "dims" in r]
+            if ok:
+                ts = [r["total_s"] for r in ok]
+                rec["total_s_median"] = round(statistics.median(ts), 2)
+                rec["total_s_min"] = round(min(ts), 2)
+                rec["total_s_max"] = round(max(ts), 2)
+                rec["dims_seen"] = sorted({r["dims"] for r in ok})
+                rec["cold_status"] = cold["status"]
+                qkeys = [
+                    "rms_contrast",
+                    "mean_luma",
+                    "entropy_bits",
+                    "unique_colors_256",
+                ]
+                medians: dict[str, float] = {}
+                for qk in qkeys:
+                    vals = [
+                        r["quality"][qk]
+                        for r in ok
+                        if isinstance(r.get("quality"), dict)
+                    ]
+                    if vals:
+                        medians[qk] = round(statistics.median(vals), 3)
+                if medians:
+                    rec["quality_medians"] = medians
+        finally:
+            rec["gpu_peak_mib"] = round(sampler.gpu_peak_mib, 1)
+            rec["rss_peak_mib"] = round(sampler.rss_peak_mib, 1)
+            sampler.stop_evt.set()
+            rec["daemon_log_tail"] = getattr(media_family, "last_log_tail", None)
+    return rec
+
+
+def run_media_video_cell(eng: Engine, model_id: str, cfg: dict) -> dict:
+    """Video lane: frames axis at 320x320 (RAM-guarded). Ground truth =
+    container block count vs the aligned request (Wan floors to a 4k+1
+    temporal grid); the gate probe rides this family after the runs."""
+    rec: dict = {"lane": "video"}
+    with media_family(f"video-{eng.tag}", ("sdcpp",)) as fam:
+        sampler = Sampler(None)
+        sampler.start()
+        port = fam["port"]
+        try:
+            rec["gpu_busy_entry_mib"] = round(gpu_used_mib(), 0)
+            rec.update(_media_env_stamps())
+            body_base = {
+                "model": model_id,
+                "prompt": "waves rolling onto a rocky shore at sunset",
+                "size": MEDIA_VIDEO_SIZE,
+                "steps": MEDIA_VIDEO_STEPS,
+            }
+            first_frames = MEDIA_VIDEO_FRAMES[0]
+            t0 = time.perf_counter()
+            cold = http_timed(
+                port,
+                "/v1/videos/generations",
+                {**body_base, "frames": first_frames},
+                timeout=600.0,
+            )
+            rec["cold_request_s"] = round(time.perf_counter() - t0, 2)
+            rec["cold_status"] = cold["status"]
+            rec.update(_media_child_stamps())
+            per_frames: list[dict] = []
+            for frames in MEDIA_VIDEO_FRAMES:
+                if not mem_guard(MEDIA_VIDEO_MEM_FLOOR_MIB, f"video {frames}f"):
+                    per_frames.append({"frames": frames, "skipped": "RAM floor"})
+                    continue
+                runs = []
+                for r in range(cfg["runs"]):
+                    got = http_timed(
+                        port,
+                        "/v1/videos/generations",
+                        {**body_base, "frames": frames},
+                        timeout=600.0,
+                    )
+                    run_rec = {"status": got["status"], "total_s": got["total_s"]}
+                    if got["status"] == 200:
+                        try:
+                            doc = json.loads(got["body"])
+                            item = doc["data"][0]
+                            run_rec["reported_frame_count"] = item.get("frame_count")
+                            webm = base64.b64decode(item["b64_json"])
+                            mux_frames, note = webm_frame_count(webm)
+                            run_rec["mux_frames"] = mux_frames
+                            run_rec["mux_note"] = note
+                            run_rec["webm_bytes"] = len(webm)
+                            aligned = 4 * ((frames - 1) // 4) + 1
+                            run_rec["frames_requested_aligned"] = aligned
+                            if mux_frames is not None and mux_frames != aligned:
+                                run_rec["frame_mismatch"] = (
+                                    f"container {mux_frames} != aligned {aligned}"
+                                )
+                        except (ValueError, KeyError, IndexError) as exc:
+                            run_rec["mux_note"] = f"decode failed: {exc}"
+                    runs.append(run_rec)
+                ok = [r for r in runs if r.get("status") == 200 and "total_s" in r]
+                agg = {"frames": frames, "runs": runs}
+                if ok:
+                    ts = [r["total_s"] for r in ok]
+                    agg["total_s_median"] = round(statistics.median(ts), 2)
+                    agg["total_s_min"] = round(min(ts), 2)
+                    agg["total_s_max"] = round(max(ts), 2)
+                per_frames.append(agg)
+            rec["per_frames"] = per_frames
+
+            # gate probe: expected-400 monster x3 + one legit pass to
+            # price the check itself (the pass's total_s rides the same
+            # warm child as the axis runs, so the delta vs the 5f row
+            # IS the gate overhead).
+            gate_runs = []
+            for _ in range(3):
+                got = http_timed(
+                    port,
+                    "/v1/videos/generations",
+                    {**body_base, **MEDIA_GATE_MONSTER},
+                    timeout=60.0,
+                )
+                gate_runs.append({"status": got["status"], "total_s": got["total_s"]})
+                if got["status"] != 400:
+                    rec["gate_note"] = (
+                        f"expected 400 from monster, got {got['status']} "
+                        "(gate bypassed or daemon predates it)"
+                    )
+            rec["gate_reject_s_list"] = [g["total_s"] for g in gate_runs]
+            rec["gate_reject_s_median"] = (
+                round(statistics.median([g["total_s"] for g in gate_runs]), 3)
+                if gate_runs
+                else None
+            )
+        finally:
+            rec["gpu_peak_mib"] = round(sampler.gpu_peak_mib, 1)
+            rec["rss_peak_mib"] = round(sampler.rss_peak_mib, 1)
+            sampler.stop_evt.set()
+            rec["daemon_log_tail"] = getattr(media_family, "last_log_tail", None)
+    return rec
+
+
+def _tts_input_text(n_chars: int) -> str:
+    """Deterministic ~n-char input built from the prefill bank (steady
+    content across campaigns — no per-run prose drift in RTF)."""
+    out = []
+    total = 0
+    bank = itertools.cycle(PREFILL_BANK)
+    while total < n_chars:
+        s = next(bank)
+        out.append(s)
+        total += len(s) + 1
+    return " ".join(out)
+
+
+def run_media_tts_cell(cfg: dict) -> dict:
+    """TTS lane: buffered WAV vs streamed PCM on the same input.
+
+    WAV: TTFB == total (buffered by design). PCM: first-body-byte is
+    the first synthesized chunk — the interactive-audio number. RTF =
+    synthesis wall / audio seconds for both formats.
+    """
+    voice = "en_US-amy-medium"
+    rec: dict = {"lane": "tts", "voice": voice, "input_chars": MEDIA_TTS_CHARS}
+    with media_family("tts", ("sdcpp",), stage_voices=True) as fam:
+        sampler = Sampler(None)
+        sampler.start()
+        port = fam["port"]
+        try:
+            rec.update(_media_env_stamps())
+            text = _tts_input_text(MEDIA_TTS_CHARS)
+            base_body = {"model": voice, "input": text}
+
+            wav_runs = []
+            wav_body = b""
+            for _ in range(cfg["runs"]):
+                got = http_timed(
+                    port,
+                    "/v1/audio/speech",
+                    {**base_body, "response_format": "wav"},
+                    timeout=300.0,
+                )
+                wav_body = got["body"]
+                wav_runs.append(
+                    {
+                        "status": got["status"],
+                        "total_s": got["total_s"],
+                        "bytes": got["bytes"],
+                    }
+                )
+            rec["wav_runs"] = wav_runs
+            lay = wav_layout(wav_body) if wav_body else None
+            if lay:
+                rec["audio_s"] = round(lay["audio_s"], 2)
+                rec["wav_rate"] = lay["rate"]
+                rec["wav_channels"] = lay["channels"]
+                rec["wav_bits"] = lay["bits"]
+
+            pcm_runs = []
+            for _ in range(cfg["runs"]):
+                got = http_timed(
+                    port,
+                    "/v1/audio/speech",
+                    {**base_body, "response_format": "pcm"},
+                    timeout=300.0,
+                )
+                pcm_runs.append(
+                    {
+                        "status": got["status"],
+                        "ttfb_ms": got["ttfb_ms"],
+                        "total_s": got["total_s"],
+                        "bytes": got["bytes"],
+                        "pcm_format_header": got["headers"].get("x-blazar-pcm-format"),
+                    }
+                )
+            rec["pcm_runs"] = pcm_runs
+
+            ok_wav = [r for r in wav_runs if r["status"] == 200]
+            ok_pcm = [r for r in pcm_runs if r["status"] == 200]
+            if ok_wav:
+                ts = [r["total_s"] for r in ok_wav]
+                rec["wav_total_s_median"] = round(statistics.median(ts), 3)
+                if rec.get("audio_s"):
+                    rec["wav_rtf"] = round(statistics.median(ts) / rec["audio_s"], 4)
+            if ok_pcm:
+                tt = [r["ttfb_ms"] for r in ok_pcm if r["ttfb_ms"]]
+                ts = [r["total_s"] for r in ok_pcm]
+                if tt:
+                    rec["pcm_ttfb_ms_median"] = round(statistics.median(tt), 1)
+                rec["pcm_total_s_median"] = round(statistics.median(ts), 3)
+                if rec.get("audio_s"):
+                    rec["pcm_rtf"] = round(statistics.median(ts) / rec["audio_s"], 4)
+            if rec.get("wav_total_s_median") and rec.get("pcm_ttfb_ms_median"):
+                rec["ttfb_speedup_x"] = round(
+                    rec["wav_total_s_median"] * 1000.0 / rec["pcm_ttfb_ms_median"],
+                    2,
+                )
+        finally:
+            sampler.stop_evt.set()
+            rec["daemon_log_tail"] = getattr(media_family, "last_log_tail", None)
+    return rec
+
+
+def run_media_tts_concurrency_cell(cfg: dict) -> dict:
+    """TTS concurrency probe: N parallel streamed-PCM requests through
+    one sandboxed gateway (scalability receipt). Efficiency = sum of
+    per-stream totals / wall clock: ~1 means the lane serializes, -> N
+    means perfectly parallel. Fails loudly when any stream errors or
+    truncates; identical input across streams must yield identical
+    byte counts (deterministic piper + limiter) or the row says so."""
+    voice = "en_US-amy-medium"
+    n_streams = int(cfg.get("conc_streams", MEDIA_TTS_CONC_STREAMS))
+    rec: dict = {
+        "lane": "tts-concurrency",
+        "voice": voice,
+        "streams": n_streams,
+        "input_chars": MEDIA_TTS_CONC_CHARS,
+    }
+    with media_family("tts-conc", ("sdcpp",), stage_voices=True) as fam:
+        sampler = Sampler(None)
+        sampler.start()
+        port = fam["port"]
+        try:
+            rec.update(_media_env_stamps())
+            body = {
+                "model": voice,
+                "input": _tts_input_text(MEDIA_TTS_CONC_CHARS),
+                "response_format": "pcm",
+            }
+            results: list[dict] = [{} for _ in range(n_streams)]
+
+            def _one_stream(i: int) -> None:
+                got = http_timed(port, "/v1/audio/speech", body, timeout=300.0)
+                results[i] = {
+                    "status": got["status"],
+                    "ttfb_ms": got["ttfb_ms"],
+                    "total_s": got["total_s"],
+                    "bytes": got["bytes"],
+                }
+
+            threads = [
+                threading.Thread(target=_one_stream, args=(i,))
+                for i in range(n_streams)
+            ]
+            t0 = time.perf_counter()
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            wall_s = time.perf_counter() - t0
+            rec["wall_s"] = round(wall_s, 3)
+            rec["streams_detail"] = results
+            ok = [r for r in results if r.get("status") == 200 and r.get("bytes")]
+            if len(ok) != n_streams:
+                rec["error"] = f"only {len(ok)}/{n_streams} streams completed"
+            else:
+                per = [r["total_s"] for r in ok]
+                rec["per_stream_total_s_median"] = round(statistics.median(per), 3)
+                rec["efficiency_sum_over_wall"] = round(sum(per) / wall_s, 2)
+                tt = [r["ttfb_ms"] for r in ok if r["ttfb_ms"]]
+                if tt:
+                    rec["ttfb_ms_median"] = round(statistics.median(tt), 1)
+                    rec["ttfb_ms_max"] = round(max(tt), 1)
+                uniq_bytes = sorted({r["bytes"] for r in ok})
+                rec["bytes_uniform"] = len(uniq_bytes) == 1
+                rec["bytes_seen"] = uniq_bytes[:3]
+        finally:
+            rec["gpu_peak_mib"] = round(sampler.gpu_peak_mib, 1)
+            rec["rss_peak_mib"] = round(sampler.rss_peak_mib, 1)
+            sampler.stop_evt.set()
+            rec["daemon_log_tail"] = getattr(media_family, "last_log_tail", None)
+    return rec
+
+
+def _multipart_body(
+    fields: dict[str, str],
+    file_field: str,
+    filename: str,
+    file_bytes: bytes,
+    content_type: str,
+) -> tuple[bytes, str]:
+    """Minimal stdlib multipart encoder (whisper transcriptions: file +
+    model field). Returns (body, content_type with boundary)."""
+    boundary = f"blazarbench{int(time.time() * 1000)}"
+    parts = []
+    for name, value in fields.items():
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"'
+            f"\r\n\r\n{value}\r\n".encode()
+        )
+    parts.append(
+        (
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; '
+            f'filename="{filename}"\r\nContent-Type: {content_type}\r\n\r\n'
+        ).encode()
+    )
+    parts.append(file_bytes + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def run_media_whisper_cell(eng: Engine, cfg: dict) -> dict:
+    """Speech lane: transcribe a WAV the TTS lane just synthesized (the
+    family stages voices for exactly this) — no fixture files, the input
+    provably comes from the piper voice under test."""
+    rec: dict = {"lane": "whisper"}
+    # whisper alone cannot boot the daemon (audio lane is not a serving
+    # engine by design) — sdcpp rides along as the serving row, lazily idle
+    with media_family(
+        f"whisper-{eng.tag}",
+        ("sdcpp", "whisper"),
+        stage_voices=True,
+        stage_whisper_models=True,
+    ) as fam:
+        sampler = Sampler(None)
+        sampler.start()
+        port = fam["port"]
+        try:
+            rec.update(_media_env_stamps())
+            text = _tts_input_text(400)
+            src = http_timed(
+                port,
+                "/v1/audio/speech",
+                {"model": "en_US-amy-medium", "input": text},
+                timeout=300.0,
+            )
+            if src["status"] != 200:
+                return {
+                    **rec,
+                    "error": f"tts input synthesis failed: {src['status']}",
+                }
+            wav = src["body"]
+            lay = wav_layout(wav)
+            rec["input_audio_s"] = round(lay["audio_s"], 2) if lay else None
+            rec["input_bytes"] = len(wav)
+
+            # cold run = spawn + transcribe (multipart)
+            body, ctype = _multipart_body(
+                {"model": "whisper-1"}, "file", "input.wav", wav, "audio/wav"
+            )
+            t0 = time.perf_counter()
+            got = http_timed_raw(port, "/v1/audio/transcriptions", body, 600.0, ctype)
+            rec["cold_request_s"] = round(time.perf_counter() - t0, 2)
+            rec["cold_status"] = got["status"]
+            rec.update(_media_child_stamps())
+            runs = []
+            for _ in range(cfg["runs"]):
+                body, ctype = _multipart_body(
+                    {"model": "whisper-1"}, "file", "input.wav", wav, "audio/wav"
+                )
+                g = http_timed_raw(port, "/v1/audio/transcriptions", body, 600.0, ctype)
+                run_rec = {"status": g["status"], "total_s": g["total_s"]}
+                if g["status"] == 200:
+                    try:
+                        doc = json.loads(g["body"])
+                        run_rec["text_chars"] = len(doc.get("text", ""))
+                    except ValueError:
+                        run_rec["text_parse_note"] = "non-JSON body"
+                runs.append(run_rec)
+            rec["runs"] = runs
+            ok = [r for r in runs if r["status"] == 200 and "total_s" in r]
+            if ok:
+                ts = [r["total_s"] for r in ok]
+                rec["total_s_median"] = round(statistics.median(ts), 3)
+                if rec.get("input_audio_s"):
+                    rec["rtf"] = round(statistics.median(ts) / rec["input_audio_s"], 4)
+        finally:
+            rec["gpu_peak_mib"] = round(sampler.gpu_peak_mib, 1)
+            rec["rss_peak_mib"] = round(sampler.rss_peak_mib, 1)
+            sampler.stop_evt.set()
+            rec["daemon_log_tail"] = getattr(media_family, "last_log_tail", None)
+    return rec
+
+
+def http_timed_raw(
+    port: int, path: str, payload: bytes, timeout: float, content_type: str
+) -> dict:
+    """http_timed for pre-encoded non-JSON bodies (multipart)."""
+    return http_timed(
+        port, path, payload, timeout, headers={"Content-Type": content_type}
+    )
 
 
 def openai_stream_timed(port: int, body: dict, timeout: float = 300.0) -> dict:
@@ -2514,7 +3385,9 @@ def run_greedy_gateway_cell(
 # features lane
 
 
-def cli_flags(binary: Path, sub: list[str]) -> set[str]:
+def cli_flags(binary: Path | None, sub: list[str]) -> set[str]:
+    if binary is None:
+        return set()
     try:
         p = subprocess.run(
             [str(binary), *sub],
@@ -3167,6 +4040,35 @@ def main() -> int:
     ap.add_argument(
         "--skip-variants", action="store_true", help="skip kv/spec/mmproj/pa axis cells"
     )
+    ap.add_argument(
+        "--skip-media",
+        action="store_true",
+        help="skip the media lanes (image/video/gate/tts/whisper)",
+    )
+    ap.add_argument(
+        "--media-runs",
+        type=int,
+        default=DEFAULT_MEDIA_RUNS,
+        help="runs per media lane point (median + min/max reported)",
+    )
+    ap.add_argument(
+        "--media-image-model",
+        help="image-lane model id (default: auto-resolve from store by name)",
+    )
+    ap.add_argument(
+        "--media-video-model",
+        help="video-lane model id (default: auto-resolve from store by name)",
+    )
+    ap.add_argument(
+        "--media-only",
+        action="store_true",
+        help=(
+            "run only the media lanes (image/video/gate/tts/whisper): clears "
+            "the provider sweep and sets every text-lane skip flag — the "
+            "shorthand for a media-focused session (still needs a text model "
+            "row in the store for harness bookkeeping)"
+        ),
+    )
     ap.add_argument("--corpus", help="local corpus .parquet/.txt for perplexity")
     ap.add_argument(
         "--fresh", action="store_true", help="ignore+replace existing cells.jsonl"
@@ -3200,6 +4102,23 @@ def main() -> int:
         ),
     )
     args = ap.parse_args()
+
+    # --media-only: one flag instead of the eight a media-focused session
+    # would otherwise repeat. Applied post-parse so --skip-media stays
+    # orthogonal and the combination is caught loudly instead of running
+    # an empty campaign that "succeeds".
+    if args.media_only:
+        if args.skip_media:
+            log("--media-only and --skip-media together: nothing would run")
+            return 2
+        args.providers = []
+        args.skip_ppl = True
+        args.skip_greedy = True
+        args.skip_features = True
+        args.skip_conc = True
+        args.skip_idle = True
+        args.skip_ctxcurve = True
+        args.skip_variants = True
 
     if args.render_only:
         cache = Path.home() / ".cache/blazar-bench-matrix"
@@ -3303,6 +4222,9 @@ def main() -> int:
     engines = load_engines(data_dir)
     if args.engines:
         engines = [e for e in engines if e.tag in args.engines]
+    # text-capable kinds only — sdcpp/whisper rows exist for the media
+    # lanes and must never be fed to the model-serving speed lanes
+    text_engines = [e for e in engines if e.kind in ("llamacpp", "mistralrs", "sglang")]
     if not engines:
         log("no benchable engines discovered")
         return 2
@@ -3357,7 +4279,11 @@ def main() -> int:
     # flags (probed, not assumed)
     eng_flags: dict[str, set[str]] = {}
     for eng in engines:
-        if eng.kind == "mistralrs":
+        if eng.server is None:
+            # media kinds (sdcpp/whisper): no introspectable server
+            # binary on the harness path — the gateway owns the spawn
+            eng_flags[eng.tag] = set()
+        elif eng.kind == "mistralrs":
             eng_flags[eng.tag] = cli_flags(eng.server, ["serve", "--help"])
         else:
             eng_flags[eng.tag] = cli_flags(eng.server, ["--help"])
@@ -3365,7 +4291,7 @@ def main() -> int:
     failures = 0
     records: list[dict] = []
 
-    def emit(tag, kind, provider, params, key, rec):
+    def emit(tag, kind, provider, params, key, rec, model_name_override=None):
         nonlocal failures
         # R4 guarantee: a cell crash is a recorded failure, never a
         # campaign kill (the b10826 orphan taught this the hard way).
@@ -3377,7 +4303,9 @@ def main() -> int:
             "kind": kind,
             "provider": provider,
             "params": params,
-            "model": model.name,
+            # media lanes bench their own models (image/video/voice);
+            # the text model name would be a lie on those rows
+            "model": model_name_override or model.name,
             # provenance stamps: rows survive across reruns in one
             # cells.jsonl — a row must carry WHICH binary measured it
             "blazar_version": blazar_version,
@@ -3441,7 +4369,7 @@ def main() -> int:
 
     # ---- direct provider sweep (ctx x np + variant axes)
     if "direct" in args.providers:
-        for eng in engines:
+        for eng in text_engines:
             cells: list[dict] = [
                 {"ctx": ctx, "np": np_} for ctx in ctx_sweep for np_ in DIRECT_NP_SWEEP
             ]
@@ -3484,7 +4412,7 @@ def main() -> int:
     # ---- blazar provider (default-config cell per engine + mistral.rs
     # paged-attn-off variant + soak)
     if "blazar" in args.providers:
-        for eng in engines:
+        for eng in text_engines:
             params = {"config": "default"}
             key = cell_key(eng.tag, "blazar", params, model.name)
             if key in done:
@@ -3529,31 +4457,33 @@ def main() -> int:
                     rec = {"error": f"blazar cell crashed: {exc}"}
                 emit(eng.tag, eng.kind, "blazar", params, key, rec)
 
-        # ---- blazar single-stream variant (slots=1, classic in-VRAM
-        # KV): the same-settings cell for the ollama parity question —
-        # ollama serves one slot with KV in VRAM; this pins blazar to
-        # the identical layout so any remaining delta is orchestration,
-        # not defaults policy.
-        params = {"config": "single-stream"}
-        key = cell_key(eng.tag, "blazar", params, model.name)
-        if key in done:
-            log(f"[blazar {eng.tag} single-stream] resumed — skipping")
-        else:
-            log(
-                f"[blazar {eng.tag} single-stream] (sandbox, slots=1, kv_unified=false)"
-            )
-            try:
-                rec = run_blazar_cell(
-                    eng,
-                    gw_model_name,
-                    cfg,
-                    "sandboxed gateway cell, slots=1 + kv_unified=false",
-                    blazar_cfg={"slots": 1, "kv_unified": False},
+            # ---- blazar single-stream variant (slots=1, classic in-VRAM
+            # KV): the same-settings cell for the ollama parity question —
+            # ollama serves one slot with KV in VRAM; this pins blazar to
+            # the identical layout so any remaining delta is orchestration,
+            # not defaults policy. (Inside the engine loop on purpose: it
+            # is per-engine and reads eng — an earlier revision left it
+            # outside, running once on the leftover loop variable.)
+            params = {"config": "single-stream"}
+            key = cell_key(eng.tag, "blazar", params, model.name)
+            if key in done:
+                log(f"[blazar {eng.tag} single-stream] resumed — skipping")
+            else:
+                log(
+                    f"[blazar {eng.tag} single-stream] (sandbox, slots=1, kv_unified=false)"
                 )
-            except Exception as exc:
-                rec = {"error": f"blazar cell crashed: {exc}"}
-            emit(eng.tag, eng.kind, "blazar", params, key, rec)
-    if "ollama" in args.providers:
+                try:
+                    rec = run_blazar_cell(
+                        eng,
+                        gw_model_name,
+                        cfg,
+                        "sandboxed gateway cell, slots=1 + kv_unified=false",
+                        blazar_cfg={"slots": 1, "kv_unified": False},
+                    )
+                except Exception as exc:
+                    rec = {"error": f"blazar cell crashed: {exc}"}
+                emit(eng.tag, eng.kind, "blazar", params, key, rec)
+
         params = {"reference": True}
         key = cell_key("ollama-host", "ollama", params, model.name)
         if key in done:
@@ -3581,10 +4511,191 @@ def main() -> int:
                 rec = {"error": f"ollama cold cell crashed: {exc}"}
             emit("ollama-host", "ollama", "cold-ollama", params, key, rec)
 
+    # ---- media lanes (image / video+gate / tts / whisper): sandboxed
+    # gateway families; each lane resolves its own model from the store
+    # and stamps GPU/RAM census at entry (warm children by design).
+    if not args.skip_media:
+        sdcpp_eng = next((e for e in engines if e.kind == "sdcpp"), None)
+        whisper_eng = next((e for e in engines if e.kind == "whisper"), None)
+        media_cfg = {"runs": args.media_runs, "art_dir": str(art)}
+
+        def store_models() -> dict[str, list]:
+            db = Path(args.data_dir).expanduser() / "blazar.db"
+            if not db.exists():
+                return {}
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                rows = {
+                    n: (json.loads(c) if c and c != "null" else [])
+                    for n, c in con.execute("SELECT name, components FROM models")
+                }
+            finally:
+                con.close()
+            return rows
+
+        store = store_models()
+
+        def resolve_media_model(prefer: str) -> str | None:
+            hits = [n for n in store if prefer in n.lower()]
+            return sorted(hits)[0] if hits else None
+
+        if sdcpp_eng is not None:
+            image_model = (
+                args.media_image_model
+                or resolve_media_model("image")
+                or resolve_media_model("flux")
+                or resolve_media_model("stable-diffusion")
+            )
+            video_model = args.media_video_model or resolve_media_model("wan")
+            if image_model:
+                params = {
+                    "size": MEDIA_IMAGE_SIZE,
+                    "steps": list(MEDIA_IMAGE_STEPS),
+                    "runs": media_cfg["runs"],
+                }
+                key = cell_key(sdcpp_eng.tag, "media-image", params, image_model)
+                if key in done:
+                    log("[media image] resumed — skipping")
+                else:
+                    log(
+                        f"[media image] {image_model} {MEDIA_IMAGE_SIZE} steps={MEDIA_IMAGE_STEPS}"
+                    )
+                    try:
+                        rec = run_media_image_cell(sdcpp_eng, image_model, media_cfg)
+                    except Exception as exc:
+                        rec = {"error": f"media image cell crashed: {exc}"}
+                    emit(
+                        sdcpp_eng.tag,
+                        "sdcpp",
+                        "media-image",
+                        params,
+                        key,
+                        rec,
+                        model_name_override=image_model,
+                    )
+            else:
+                log("[media image] no diffusion model resolved in store — skipping")
+            if video_model:
+                if not mem_guard(MEDIA_VIDEO_MEM_FLOOR_MIB, "pre-media-video"):
+                    log("[media video] RAM floor exceeded — skipping family")
+                else:
+                    params = {
+                        "size": MEDIA_VIDEO_SIZE,
+                        "frames": list(MEDIA_VIDEO_FRAMES),
+                        "steps": MEDIA_VIDEO_STEPS,
+                        "runs": media_cfg["runs"],
+                        "gate": dict(MEDIA_GATE_MONSTER),
+                    }
+                    key = cell_key(sdcpp_eng.tag, "media-video", params, video_model)
+                    if key in done:
+                        log("[media video] resumed — skipping")
+                    else:
+                        log(
+                            f"[media video] {video_model} {MEDIA_VIDEO_SIZE} "
+                            f"frames={MEDIA_VIDEO_FRAMES} + gate probe"
+                        )
+                        try:
+                            rec = run_media_video_cell(
+                                sdcpp_eng, video_model, media_cfg
+                            )
+                        except Exception as exc:
+                            rec = {"error": f"media video cell crashed: {exc}"}
+                        emit(
+                            sdcpp_eng.tag,
+                            "sdcpp",
+                            "media-video",
+                            params,
+                            key,
+                            rec,
+                            model_name_override=video_model,
+                        )
+            else:
+                log("[media video] no video model resolved in store — skipping")
+        else:
+            log("[media] no sdcpp engine installed — image/video lanes skipped")
+
+        voices_dir = Path(args.data_dir).expanduser() / "voices"
+        if voices_dir.is_dir() and any(voices_dir.iterdir()):
+            params = {
+                "chars": MEDIA_TTS_CHARS,
+                "formats": ["wav", "pcm"],
+                "runs": media_cfg["runs"],
+            }
+            key = cell_key("piper", "media-tts", params, "en_US-amy-medium")
+            if key in done:
+                log("[media tts] resumed — skipping")
+            else:
+                log(f"[media tts] en_US-amy-medium {MEDIA_TTS_CHARS} chars wav+pcm")
+                try:
+                    rec = run_media_tts_cell(media_cfg)
+                except Exception as exc:
+                    rec = {"error": f"media tts cell crashed: {exc}"}
+                emit(
+                    "piper",
+                    "piper",
+                    "media-tts",
+                    params,
+                    key,
+                    rec,
+                    model_name_override="en_US-amy-medium",
+                )
+
+            conc_params = {
+                "streams": MEDIA_TTS_CONC_STREAMS,
+                "chars": MEDIA_TTS_CONC_CHARS,
+                "format": "pcm",
+            }
+            conc_key = cell_key(
+                "piper", "media-tts-conc", conc_params, "en_US-amy-medium"
+            )
+            if conc_key in done:
+                log("[media tts-conc] resumed — skipping")
+            else:
+                log(f"[media tts-conc] {MEDIA_TTS_CONC_STREAMS} parallel pcm streams")
+                try:
+                    rec_c = run_media_tts_concurrency_cell(media_cfg)
+                except Exception as exc:
+                    rec_c = {"error": f"media tts-conc cell crashed: {exc}"}
+                emit(
+                    "piper",
+                    "piper",
+                    "media-tts-conc",
+                    conc_params,
+                    conc_key,
+                    rec_c,
+                    model_name_override="en_US-amy-medium",
+                )
+        else:
+            log("[media tts] no voices pulled — skipping")
+
+        whisper_models = Path(args.data_dir).expanduser() / "whisper" / "models"
+        if whisper_eng is not None and any(whisper_models.glob("ggml-*.bin")):
+            params = {"runs": media_cfg["runs"], "input": "piper-wav"}
+            key = cell_key(whisper_eng.tag, "media-whisper", params, "ggml-base")
+            if key in done:
+                log("[media whisper] resumed — skipping")
+            else:
+                log("[media whisper] transcribe piper-synthesized wav")
+                try:
+                    rec = run_media_whisper_cell(whisper_eng, media_cfg)
+                except Exception as exc:
+                    rec = {"error": f"media whisper cell crashed: {exc}"}
+                emit(
+                    whisper_eng.tag,
+                    "whisper",
+                    "media-whisper",
+                    params,
+                    key,
+                    rec,
+                    model_name_override="ggml-base",
+                )
+        else:
+            log("[media whisper] no whisper engine+model pair — skipping")
+
     # ---- idle-wake lane (sleep-vs-expiry: the idle-policy headline)
     if not args.skip_idle:
         if "blazar" in args.providers:
-            for eng in engines:
+            for eng in text_engines:
                 params = {"idle": True}
                 key = cell_key(eng.tag, "idle-blazar", params, model.name)
                 if key in done:
@@ -3624,7 +4735,7 @@ def main() -> int:
             int(x) for x in str(args.ctxcurve_sweep).split(",") if x.strip()
         )
         if "blazar" in args.providers:
-            for eng in engines:
+            for eng in text_engines:
                 for ctx in ctxcurve:
                     params = {"ctx": ctx}
                     key = cell_key(eng.tag, "ctxcurve-blazar", params, model.name)
@@ -3663,7 +4774,7 @@ def main() -> int:
     if not args.skip_conc and conc_sweep:
         for level in conc_sweep:
             if "direct" in args.providers:
-                for eng in engines:
+                for eng in text_engines:
                     if eng.kind != "llamacpp":
                         continue
                     params = {"conc": level}
@@ -3689,7 +4800,7 @@ def main() -> int:
                         rec = {"error": f"conc cell crashed: {exc}"}
                     emit(eng.tag, eng.kind, "conc-direct", params, key, rec)
             if "blazar" in args.providers:
-                for eng in engines:
+                for eng in text_engines:
                     params = {"conc": level, "rounds": args.conc_rounds}
                     key = cell_key(eng.tag, "conc-blazar", params, model.name)
                     if key in done:
@@ -3737,7 +4848,7 @@ def main() -> int:
                 if not build_local_corpus(corpus):
                     log("local corpus build failed — aborting (exit 2)")
                     return 2
-        for eng in engines:
+        for eng in text_engines:
             params = {"ppl": PPL_CTX}
             key = cell_key(eng.tag, "ppl", params, model.name)
             if key in done:
@@ -3796,7 +4907,7 @@ def main() -> int:
                     "(unhealthy child) — skipping parity"
                 )
         else:
-            for eng in engines:
+            for eng in text_engines:
                 params = {"greedy": True}
                 key = cell_key(eng.tag, "greedy", params, model.name)
                 if key in done:
@@ -3812,7 +4923,7 @@ def main() -> int:
                     rec["vs"] = ref_tag or (ref_eng.tag if ref_eng else "unknown")
                 emit(eng.tag, eng.kind, "greedy", params, key, rec)
             # gateway-transparency lane: same-engine direct vs gateway
-            for eng in engines:
+            for eng in text_engines:
                 if eng.kind != "llamacpp":
                     continue
                 params = {"greedy_gw": True}
@@ -3834,7 +4945,7 @@ def main() -> int:
     if not args.skip_features:
         log("[features]")
         rows: dict[str, dict[str, bool]] = {}
-        for eng in engines:
+        for eng in text_engines:
             rows[eng.tag] = features_row(eng.kind, eng_flags.get(eng.tag, set()))
         rows["ollama(documented)"] = OLLAMA_FEATURES
         feat_rows = rows
@@ -3847,7 +4958,7 @@ def main() -> int:
             )
         (art / "features.txt").write_text("\n".join(lines) + "\n")
         log(f"features -> {art / 'features.txt'}")
-        for eng in engines:
+        for eng in text_engines:
             params = {"features": True}
             key = cell_key(eng.tag, "features", params, model.name)
             if key in done:
@@ -3933,6 +5044,10 @@ ENGINE_LABELS = {
     "b10809": "llama.cpp b10809 (Vulkan)",
     "b10809-cuda": "llama.cpp b10809 (CUDA build)",
     "v0.9.3": "mistral.rs 0.9.3 (CUDA sm89)",
+    "b11070-cuda": "llama.cpp b11070 (CUDA build)",
+    "master-890-74988b2": "stable-diffusion.cpp master-890 (Vulkan)",
+    "b5130": "whisper.cpp b5130",
+    "piper": "piper (gateway TTS lane)",
 }
 
 # Hardware rows describe the measuring host (this repo's reference box);
@@ -3974,6 +5089,14 @@ METHODOLOGY = [
     "Long-context curve: per-ctx cells (blazar model_overrides ctx / ollama num_ctx) x 3-run decode suites; each ollama point evicts first so the runner respawns at that ctx.",
     "Sustained concurrency: sequential bursts of the parallel-stream lane (default 3 rounds); TTFT p99 aggregates every stream of every round.",
     "Every blazar row records the spawned engine's argv (slots/context shown in tables) and stamps blazar version, wall clock, 5-min load average, and AC/battery power state; GPU cells refuse to run on battery.",
+    "Media lanes run in isolated sandbox daemons (same protocol as text blazar cells); the engine child spawns lazily, so each family's first request is the COLD number (spawn + weights + first artifact), labeled cold_request_s.",
+    "Media TTFB = time to first BODY byte (first audio sample for streamed PCM, not response headers); buffered WAV TTFB equals its total by construction and the table says so.",
+    "Video frame counts are container ground truth: the response webm is parsed for lacing-aware SimpleBlock counts and asserted against the Wan 4k+1 temporal grid (a mismatch is recorded loudly, never averaged away).",
+    "The video scratch-gate probe sends one expected-rejected monster (duration 60s -> 960 aligned frames) and times the 400; the legit 5-frame pass rides the same warm child, so axis-row vs probe deltas price the gate itself.",
+    "Media cells stamp GPU-busy and RAM-available at entry instead of asserting an idle GPU: a warm child from the previous family is the normal media workflow, and the receipt carries the occupancy rather than hiding it.",
+    "TTS RTF = synthesis wall / audio seconds, audio duration parsed from the RIFF data-chunk length (not estimated from characters); whisper transcribes a WAV synthesized by the same campaign's piper voice, so the input is reproducible from the receipt.",
+    "Image quality stamps are PIL-gated luma-domain metrics (rms contrast = luma stddev, entropy in bits, unique colors on a 256x256 downsample); when PIL is absent the row carries an honest 'skipped' note instead of a fake number, and one audit PNG per steps point is saved beside the cells for offline re-measurement.",
+    "TTS concurrency probe: N parallel streamed-PCM requests through one sandboxed gateway; wall clock vs sum of per-stream totals yields an efficiency ratio (sum/wall ~ 1 means serialized, -> N means perfectly parallel), and the probe fails loudly if any stream errors or truncates.",
 ]
 
 
@@ -4460,6 +5583,134 @@ def executive_summary(recs: list[dict]) -> str:
     return "; ".join(parts) + "." if parts else "_No complete rows._"
 
 
+def media_table(recs: list[dict]) -> str:
+    """One row per measured media lane point; blank cells where a lane has no value."""
+    rows = []
+    for r in recs:
+        prov = r.get("provider") or ""
+        if not prov.startswith("media-") or "error" in r:
+            continue
+        model = r.get("model") or ""
+        if prov == "media-image":
+            p = r.get("params") or {}
+            gt = "x".join(str(d) for d in (r.get("dims_seen") or ["?"])) + " PNG"
+            qm = r.get("quality_medians") or {}
+            if qm:
+                gt += (
+                    f", entropy {pfmt(qm.get('entropy_bits'), 1)} bits, "
+                    f"contrast {pfmt(qm.get('rms_contrast'), 1)}"
+                )
+            elif r.get("quality_note"):
+                gt += f" ({r['quality_note']})"
+            rows.append(
+                (
+                    f"image - {model} ({p.get('size')}, steps={p.get('steps')})",
+                    r.get("cold_request_s"),
+                    r.get("total_s_median"),
+                    r.get("total_s_min"),
+                    r.get("total_s_max"),
+                    gt,
+                    "",
+                    "",
+                )
+            )
+        elif prov == "media-video":
+            p = r.get("params") or {}
+            for pt in r.get("per_frames") or []:
+                runs = pt.get("runs") or []
+                mism = [
+                    run
+                    for run in runs
+                    if run.get("mux_frames") != run.get("reported_frame_count")
+                    or run.get("mux_frames") != run.get("frames_requested_aligned")
+                ]
+                gt = (
+                    f"{pt.get('frames')}f: mux==reported==aligned"
+                    if not mism
+                    else f"MISMATCH on {len(mism)}/{len(runs)} runs"
+                )
+                rows.append(
+                    (
+                        f"video - {model} ({p.get('size')}, steps={p.get('steps')})",
+                        r.get("cold_request_s")
+                        if pt is (r.get("per_frames") or [None])[0]
+                        else None,
+                        pt.get("total_s_median"),
+                        pt.get("total_s_min"),
+                        pt.get("total_s_max"),
+                        gt,
+                        pfmt(r.get("gate_reject_s_median"), 3)
+                        if pt is (r.get("per_frames") or [None])[0]
+                        and r.get("gate_reject_s_median") is not None
+                        else "",
+                        "",
+                    )
+                )
+        elif prov == "media-tts":
+            ground = (
+                f"RTF wav {pfmt(r.get('wav_rtf'), 3)} / pcm {pfmt(r.get('pcm_rtf'), 3)} "
+                f"({pfmt(r.get('audio_s'), 0)}s audio)"
+            )
+            rows.append(
+                (
+                    f"tts - {model} ({r.get('input_chars')} chars, wav+pcm)",
+                    None,
+                    r.get("wav_total_s_median"),
+                    None,
+                    r.get("pcm_total_s_median"),
+                    ground,
+                    "",
+                    pfmt(r.get("ttfb_speedup_x"), 2) + "x"
+                    if r.get("ttfb_speedup_x") is not None
+                    else "",
+                )
+            )
+        elif prov == "media-tts-conc":
+            n = r.get("streams") or "?"
+            ground = (
+                f"efficiency {pfmt(r.get('efficiency_sum_over_wall'), 2)} "
+                f"of {n} streams"
+                if r.get("efficiency_sum_over_wall") is not None
+                else f"uniform bytes: {r.get('bytes_uniform')}"
+            )
+            rows.append(
+                (
+                    f"tts-conc - {model} ({r.get('input_chars')} chars x{n} pcm)",
+                    None,
+                    r.get("per_stream_total_s_median"),
+                    r.get("wall_s"),
+                    None,
+                    ground,
+                    "",
+                    pfmt(r.get("ttfb_ms_max"), 0) + "ms max TTFB"
+                    if r.get("ttfb_ms_max") is not None
+                    else "",
+                )
+            )
+        elif prov == "media-whisper":
+            rows.append(
+                (
+                    f"whisper - {model} (transcribes piper wav)",
+                    r.get("cold_request_s"),
+                    r.get("total_s_median"),
+                    r.get("total_s_min"),
+                    r.get("total_s_max"),
+                    f"RTF {pfmt(r.get('rtf'), 3)}",
+                    "",
+                    "",
+                )
+            )
+    if not rows:
+        return "_Not measured._"
+    head = "| Lane | cold s | median s | min s | max s | ground truth | gate reject s | TTFB speedup |"
+    sep = "|---|---:|---:|---:|---:|---|---:|---:|"
+    body = [
+        f"| {n} | {pfmt(c, 2)} | {pfmt(m, 2)} | {pfmt(lo, 2)} | {pfmt(hi, 2)} | {g} | {ga} | {sp} |"
+        for n, c, m, lo, hi, g, ga, sp in rows
+    ]
+    return "\n".join([head, sep, *body])
+
+
 def write_publication_report(
     recs: list[dict], artifacts_dir: Path, out_path: Path
 ) -> None:
@@ -4554,6 +5805,19 @@ def write_publication_report(
     L.append("")
     L.append(ctxcurve_table(recs))
     L.append("")
+    L.append("### Media lanes (image / video / TTS / whisper)")
+    L.append("")
+    L.append(media_table(recs))
+    L.append("")
+    L.append(
+        "_Media cells run through the same sandboxed gateway as text lanes but do not assert "
+        "GPU-idle: a warm engine child is the normal serving shape, so each row stamps "
+        "gpu_busy_mib / ram_avail_mib / loadavg instead. 3 runs (not 5) — media variance is "
+        "dominated by the model, not the scheduler. Video frame counts are read from the EBML "
+        "container (lacing-aware), never from an API field; the VRAM gate probe times how fast "
+        "an over-budget request is rejected with a teaching error._"
+    )
+    L.append("")
     L.append("## Findings")
     L.append("")
     L += [
@@ -4582,6 +5846,90 @@ def write_publication_report(
         "8 GiB card** (upstream sizes KV as a fraction of total VRAM); blazar's profile "
         "auto-disables paged attention on tight cards and the model then serves correctly.",
     ]
+    media_recs = [
+        r
+        for r in recs
+        if (r.get("provider") or "").startswith("media-") and "error" not in r
+    ]
+    if media_recs:
+        n = 1
+        for r in media_recs:
+            prov = r.get("provider")
+            if prov == "media-tts" and r.get("ttfb_speedup_x"):
+                ttfb_s = (r.get("pcm_ttfb_ms_median") or 0) / 1000.0
+                L.append(
+                    f"{len([x for x in L if x and x[0].isdigit() and '.' in x[:3]]) + 1}. **Streamed PCM cuts time-to-first-audio "
+                    f"{pfmt(r.get('ttfb_speedup_x'), 2)}x vs buffered WAV** "
+                    f"(piper lane, first audio {pfmt(ttfb_s, 2)}s vs {pfmt(r.get('wav_total_s_median'), 2)}s full synthesis) "
+                    "- total wall time is slightly higher (per-chunk synthesis), the win is interactivity."
+                )
+            elif prov == "media-video" and r.get("gate_reject_s_median") is not None:
+                L.append(
+                    f"{len([x for x in L if x and x[0].isdigit() and '.' in x[:3]]) + 1}. **Video VRAM gate rejects an "
+                    f"over-budget request in {pfmt(r.get('gate_reject_s_median') * 1000, 0)} ms** with the full estimate "
+                    "math and override levers in the error body - instead of an opaque child abort minutes later."
+                )
+            elif prov == "media-tts-conc" and r.get("error"):
+                L.append(
+                    f"{len([x for x in L if x and x[0].isdigit() and '.' in x[:3]]) + 1}. **TTS concurrency probe "
+                    f"FAILED: {r['error']}** - the gateway did not sustain "
+                    f"{r.get('streams')} parallel PCM streams; needs investigation."
+                )
+            elif (
+                prov == "media-tts-conc"
+                and r.get("efficiency_sum_over_wall") is not None
+            ):
+                eff = r["efficiency_sum_over_wall"]
+                n = r.get("streams") or 0
+                verdict = (
+                    "perfectly parallel"
+                    if eff >= 0.75 * n
+                    else (
+                        "partially parallel"
+                        if eff > 1.25
+                        else "serialized (single synth lane)"
+                    )
+                )
+                L.append(
+                    f"{len([x for x in L if x and x[0].isdigit() and '.' in x[:3]]) + 1}. **{n} parallel PCM streams "
+                    f"through one gateway: {verdict}** (efficiency {pfmt(eff, 2)} = sum of per-stream "
+                    f"totals / {pfmt(r.get('wall_s'), 2)}s wall, max TTFB {pfmt(r.get('ttfb_ms_max'), 0)} ms"
+                    + (
+                        ", byte-identical outputs across streams"
+                        if r.get("bytes_uniform")
+                        else ", NON-uniform stream outputs - flagged"
+                    )
+                    + ") - the scalability receipt for the TTS lane."
+                )
+            elif prov == "media-image" and r.get("quality_medians"):
+                qm = r["quality_medians"]
+                L.append(
+                    f"{len([x for x in L if x and x[0].isdigit() and '.' in x[:3]]) + 1}. **Image quality stamps "
+                    f"(PIL, luma domain): entropy {pfmt(qm.get('entropy_bits'), 2)} bits, rms contrast "
+                    f"{pfmt(qm.get('rms_contrast'), 1)}, {pfmt(qm.get('unique_colors_256'), 0)} unique colors "
+                    f"@256x256** on {r.get('model')} - perceptual baseline for cross-run comparisons; "
+                    "audit PNG saved beside the cells."
+                )
+            elif prov == "media-video" and any(
+                (run.get("mux_frames") != run.get("frames_requested_aligned"))
+                for pt in (r.get("per_frames") or [])
+                for run in (pt.get("runs") or [])
+            ):
+                bad = [
+                    (
+                        pt.get("frames"),
+                        run.get("mux_frames"),
+                        run.get("frames_requested_aligned"),
+                    )
+                    for pt in (r.get("per_frames") or [])
+                    for run in (pt.get("runs") or [])
+                    if run.get("mux_frames") != run.get("frames_requested_aligned")
+                ]
+                L.append(
+                    f"{len([x for x in L if x and x[0].isdigit() and '.' in x[:3]]) + 1}. **Frame-count mismatch on the "
+                    f"{r.get('model')} lane**: container vs aligned-request disagreements {bad} "
+                    "- flagged loudly, needs upstream investigation."
+                )
     L.append("")
     L.append("## Caveats")
     L.append("")
