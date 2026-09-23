@@ -2896,12 +2896,7 @@ fn compile_sdcpp(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<P
         .sum::<u64>();
     let resident = input.model_bytes.saturating_add(component_bytes);
     let offload = sdcpp_offload_decision(vram_bytes, resident);
-    if let Some(flag) = offload.flag {
-        argv.push(flag.into());
-    }
-    if let Some(w) = offload.warning {
-        warnings.push(w);
-    }
+    apply_sdcpp_offload(input, &offload, vram_bytes, &mut argv, &mut warnings);
 
     // extra_args: strict manifest-gated passthrough, same contract as the
     // other dialects — blazar-owned launch pins refuse rather than
@@ -2980,6 +2975,86 @@ fn sdcpp_offload_decision(vram_bytes: u64, resident: u64) -> SdOffload {
         gpu: "full",
         flag: None,
         warning: None,
+    }
+}
+
+/// Apply the offload decision to the argv. Between the blanket posture
+/// (everything streams from RAM) and full-GPU sits a third shape the
+/// qwen-image family made common: the DiT+VAE pair fits the card while
+/// the LLM text encoder (8B-class, several GiB) does not. sd-server's
+/// `--backend` assigns modules per name — `te` is the `--llm` module
+/// (live-verified on master-890) — so the planner splits exactly that:
+/// diffusion+VAE resident on the auto-picked card, TE streaming from
+/// system RAM one-shot per prompt (live posture: 49.5s warm vs 60s
+/// blanket on an 8 GiB card). Fences: only the `--llm` family (other
+/// families' module names are unverified), only when the GPU pair fits
+/// 75% of VRAM (the same ladder the blanket arm trips on), never when
+/// `extra_args` already owns `--backend` (last-wins would silently
+/// clobber the user's posture), and the flag itself rides the manifest
+/// gate — an engine without `--backend` degrades to the blanket posture
+/// instead of dying on an unknown flag.
+fn apply_sdcpp_offload(
+    input: &ProfileInput<'_>,
+    offload: &SdOffload,
+    vram_bytes: u64,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    const MIB: u64 = 1024 * 1024;
+    let component_bytes = |flag: &str| {
+        input
+            .components
+            .iter()
+            .filter(|c| c.flag == flag && c.path != input.model_path)
+            .map(|c| std::fs::metadata(c.path).map_or(0, |m| m.len()))
+            .sum::<u64>()
+    };
+    let user_owns_backend = input.overlay.extra_args.as_ref().is_some_and(|args| {
+        args.iter()
+            .any(|t| t == "--backend" || t.starts_with("--backend="))
+    });
+    // A user-set --backend owns the posture outright — neither the split
+    // nor the blanket flag stacks underneath it (last-wins confusion).
+    if user_owns_backend {
+        return;
+    }
+    let llm_family = input.components.iter().any(|c| c.flag == "--llm");
+    let dit_vae = input.model_bytes.saturating_add(component_bytes("--vae"));
+    let te = component_bytes("--llm").saturating_add(component_bytes("--llm_vision"));
+    if offload.flag.is_some()
+        && input.device_hint.is_some()
+        && llm_family
+        && dit_vae <= vram_bytes * 75 / 100
+    {
+        let dev = input.device_hint.unwrap_or_default();
+        let before = argv.len();
+        push_gated(
+            input,
+            argv,
+            warnings,
+            "backend",
+            "--backend",
+            &[format!("diffusion={dev},vae={dev},te=cpu")],
+        );
+        if argv.len() > before {
+            warnings.push(format!(
+                "backend split: DiT+VAE ~{} MiB on {dev}, text encoder ~{} MiB streams \
+                 from system RAM (one-shot per prompt) — the pair fits the card while \
+                 the full set does not; extra_args --backend owns this flag for a \
+                 custom posture",
+                dit_vae / MIB,
+                te / MIB
+            ));
+            return;
+        }
+        // Manifest refused --backend (old engine): the gate warning above
+        // explains; fall through to the blanket posture.
+    }
+    if let Some(flag) = offload.flag {
+        argv.push(flag.into());
+    }
+    if let Some(w) = &offload.warning {
+        warnings.push(w.clone());
     }
 }
 
@@ -10340,6 +10415,127 @@ mod tests {
         let p3 = compile(&inp3, &TuningOverrides::default()).unwrap();
         assert_eq!(p3.gpu, "cpu");
         assert!(!p3.argv.iter().any(|a| a == "--offload-to-cpu"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unit__compile_sdcpp__backend_split_llm_family() {
+        // The qwen-image posture: blanket offload would trip (full set
+        // over the 75% ladder) but the DiT+VAE pair fits — the planner
+        // splits modules instead: diffusion+VAE on the hinted card, the
+        // TE streaming from RAM. Sparse component files carry real
+        // metadata sizes without writing gigabytes.
+        let g = meta();
+        let sd_flags: BTreeSet<String> = [
+            "--diffusion-model",
+            "--vae",
+            "--llm",
+            "--llm_vision",
+            "--model",
+            "--backend",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let cfg = Config::default();
+        let dir = std::env::temp_dir().join(format!("blazar-sdcpp-split-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sparse = |name: &str, mib: u64| {
+            let p = dir.join(name);
+            std::fs::File::create(&p)
+                .unwrap()
+                .set_len(mib * 1024 * 1024)
+                .unwrap();
+            p
+        };
+        let vae = sparse("vae.safetensors", 650);
+        let vae_big = sparse("vae-big.safetensors", 2_000);
+        let llm = sparse("te.gguf", 5_400);
+        let llm_vision = sparse("mmproj.gguf", 400);
+        let ckpt = sparse("ckpt.safetensors", 5_000);
+        let hw = gpu_hw(8_192, 32_000, 8); // 75% ladder = 6144 MiB
+
+        let components = [
+            ComponentArg::new("--vae", vae.to_str().unwrap()),
+            ComponentArg::new("--llm", llm.to_str().unwrap()),
+            ComponentArg::new("--llm_vision", llm_vision.to_str().unwrap()),
+        ];
+        // resident 5000+650+5400+400 > 6144 trips the blanket ladder;
+        // DiT+VAE 5650 <= 6144 fits → split fires.
+        let mut inp = input(&g, &hw, &cfg, &sd_flags);
+        inp.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        inp.components = &components;
+        inp.device_hint = Some("Vulkan1");
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w == ["--backend", "diffusion=Vulkan1,vae=Vulkan1,te=cpu"]),
+            "{:?}",
+            p.argv
+        );
+        assert!(!p.argv.iter().any(|a| a == "--offload-to-cpu"));
+        assert_eq!(p.gpu, "partial");
+        assert!(
+            p.warnings.iter().any(|w| w.contains("backend split")),
+            "{:?}",
+            p.warnings
+        );
+
+        // GPU pair itself too big (7000 > 6144): blanket posture.
+        let big_components = [
+            ComponentArg::new("--vae", vae_big.to_str().unwrap()),
+            ComponentArg::new("--llm", llm.to_str().unwrap()),
+        ];
+        let mut inp2 = input(&g, &hw, &cfg, &sd_flags);
+        inp2.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        inp2.components = &big_components;
+        inp2.device_hint = Some("Vulkan1");
+        let p2 = compile(&inp2, &TuningOverrides::default()).unwrap();
+        assert!(p2.argv.iter().any(|a| a == "--offload-to-cpu"));
+        assert!(!p2.argv.iter().any(|a| a == "--backend"));
+        assert_eq!(p2.gpu, "partial");
+
+        // User-owned --backend: the planner abstains entirely (no silent
+        // double-set under last-wins); the user's value passes through
+        // exactly once.
+        let user_overlay = ModelOverride {
+            extra_args: Some(vec!["--backend".into(), "diffusion=cpu".into()]),
+            ..Default::default()
+        };
+        let mut inp3 = input(&g, &hw, &cfg, &sd_flags);
+        inp3.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        inp3.components = &components;
+        inp3.device_hint = Some("Vulkan1");
+        inp3.overlay = &user_overlay;
+        let p3 = compile(&inp3, &TuningOverrides::default()).unwrap();
+        let pairs: Vec<&[String]> = p3.argv.windows(2).collect();
+        let backend_pairs: Vec<&&[String]> = pairs.iter().filter(|w| w[0] == "--backend").collect();
+        assert_eq!(backend_pairs.len(), 1, "{:?}", p3.argv);
+        assert_eq!(backend_pairs[0][1], "diffusion=cpu");
+        assert!(!p3.argv.iter().any(|a| a == "--offload-to-cpu"));
+
+        // No device hint (engine census unprobed): blanket posture.
+        let mut inp4 = input(&g, &hw, &cfg, &sd_flags);
+        inp4.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        inp4.components = &components;
+        let p4 = compile(&inp4, &TuningOverrides::default()).unwrap();
+        assert!(p4.argv.iter().any(|a| a == "--offload-to-cpu"));
+        assert!(!p4.argv.iter().any(|a| a == "--backend"));
+
+        // Non-llm family (standalone --model checkpoint): module names
+        // unverified — stays blanket even with a hint.
+        let hw_tight = gpu_hw(6_000, 32_000, 8); // 75% = 4500 < 5000 model
+        let standalone = [ComponentArg::new("--model", ckpt.to_str().unwrap())];
+        let mut inp5 = input(&g, &hw_tight, &cfg, &sd_flags);
+        inp5.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        inp5.model_path = ckpt.to_str().unwrap();
+        inp5.components = &standalone;
+        inp5.device_hint = Some("Vulkan1");
+        let p5 = compile(&inp5, &TuningOverrides::default()).unwrap();
+        assert!(p5.argv.iter().any(|a| a == "--offload-to-cpu"));
+        assert!(!p5.argv.iter().any(|a| a == "--backend"));
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
