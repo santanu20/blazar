@@ -4,7 +4,7 @@
 //! adapters later implement the same trait — gateway, supervisor and
 //! lifecycle stay engine-agnostic.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use blazar_core::profile::{Endpoint, Profile};
@@ -355,9 +355,16 @@ fn spawn_child(
     for (k, v) in child_env {
         cmd.env(k, v);
     }
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("spawn {server_path}"))?;
+    // Inline the io source (ENOENT/EACCES...) into the context: callers
+    // that render only `Display` — the gateway's 500 body — would
+    // otherwise show a bare `spawn <path>` with no reason for it.
+    let mut child = cmd.spawn().map_err(|e| {
+        anyhow!(
+            "spawn {server_path}: {e} — engine binary missing or not executable; \
+                 re-rooted engines adopt the live data dir, so this usually means \
+                 `blazar engine update` is needed"
+        )
+    })?;
 
     // Pipe child logs into tracing; the shared tail keeps the last lines
     // around for death diagnostics.
