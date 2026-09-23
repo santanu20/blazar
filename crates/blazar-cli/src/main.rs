@@ -13714,6 +13714,92 @@ mod tests {
 
     #[test]
     #[allow(non_snake_case)]
+    fn unit__render_table__golden_bytes_exact() {
+        // Byte-exact golden: adaptive widths size to the widest cell,
+        // right indexes align numerics on their last digit, the last
+        // column rides open, and an empty last cell trims the dangling
+        // separator instead of leaving trailing blanks. Any column-width
+        // or alignment regression changes one of these bytes.
+        let rows = vec![
+            vec![
+                "qwen/qwen2.5-0.5b".to_string(),
+                "1234".to_string(),
+                "567".to_string(),
+                "644.4 MiB".to_string(),
+                "qwen2".to_string(),
+            ],
+            vec![
+                "meta/llama-3.2-1b".to_string(),
+                "9".to_string(),
+                "1".to_string(),
+                "1.2 GiB".to_string(),
+                "llama".to_string(),
+            ],
+            vec![
+                "tiny/bert".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                "440.0 MiB".to_string(),
+                String::new(),
+            ],
+        ];
+        let golden = concat!(
+            "REPO               DL    LIKES       SIZE  ARCH\n",
+            "qwen/qwen2.5-0.5b  1234    567  644.4 MiB  qwen2\n",
+            "meta/llama-3.2-1b  9         1    1.2 GiB  llama\n",
+            "tiny/bert          0         0  440.0 MiB\n",
+        );
+        assert_eq!(
+            render_table(&["REPO", "DL", "LIKES", "SIZE", "ARCH"], &rows, &[2, 3]),
+            golden
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__render_list_table__golden_bytes_exact() {
+        // Byte-exact golden: ARCH caps at 18 chars with an ellipsis,
+        // SIZE and CTX right-align, empty VISION/CTX cells keep their
+        // column spacing, and the whole table carries no trailing
+        // newline and no trailing blanks on any line.
+        let rows = [
+            [
+                "qwen2.5-0.5b".to_string(),
+                "q4_0".to_string(),
+                "644 MiB".to_string(),
+                "mmproj: 224 MiB".to_string(),
+                "Qwen2ForCausalLM".to_string(),
+                "32768".to_string(),
+                "text".to_string(),
+                "llama.cpp".to_string(),
+            ],
+            [
+                "whisper-b5130".to_string(),
+                "-".to_string(),
+                "151 MiB".to_string(),
+                String::new(),
+                "WhisperForConditionalGeneration".to_string(),
+                String::new(),
+                "voice".to_string(),
+                "whisper".to_string(),
+            ],
+        ];
+        let golden = concat!(
+            "NAME           QUANT     SIZE  VISION           ARCH                  CTX  TYPE   ENGINE\n",
+            "qwen2.5-0.5b   q4_0   644 MiB  mmproj: 224 MiB  Qwen2ForCausalLM    32768  text   llama.cpp\n",
+            "whisper-b5130  -      151 MiB                   WhisperForConditi…         voice  whisper",
+        );
+        assert_eq!(
+            render_list_table(
+                ["NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "ENGINE"],
+                &rows
+            ),
+            golden
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
     fn unit__status_word__lowercase_ok_warn_fail() {
         assert_eq!(Check::ok("n", "d").status_word(), "ok");
         assert_eq!(Check::warn("n", "d").status_word(), "warn");
