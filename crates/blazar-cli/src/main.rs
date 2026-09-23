@@ -1406,6 +1406,7 @@ async fn session_cmd(cmd: SessionCmd) -> Result<()> {
 }
 
 /// One doctor check row: name, status word, detail line.
+#[derive(Debug)]
 struct Check {
     name: &'static str,
     ok: bool,
@@ -1440,12 +1441,36 @@ impl Check {
     }
     fn status_word(&self) -> &'static str {
         if !self.ok {
-            "FAIL"
+            "fail"
         } else if self.warn {
-            "WARN"
+            "warn"
         } else {
             "ok"
         }
+    }
+}
+
+/// Status word with a terminal-only ANSI accent (plain when piped or
+/// `NO_COLOR`): ok=green, warn=yellow, fail=red. Pad BEFORE coloring so
+/// escapes never skew the column width.
+fn colored_status(padded: String) -> String {
+    if !cli_colors() {
+        return padded;
+    }
+    let code = match padded.trim() {
+        "ok" => "32",
+        "warn" => "33",
+        _ => "31",
+    };
+    format!("\x1b[{code}m{padded}\x1b[0m")
+}
+
+/// Bold group/table headings on terminals only (see [`cli_colors`]).
+fn bold_heading(text: &str) -> String {
+    if cli_colors() {
+        format!("\x1b[1m{text}\x1b[0m")
+    } else {
+        text.to_string()
     }
 }
 
@@ -1927,9 +1952,18 @@ async fn doctor(flat: bool, json: bool) -> Result<()> {
         return Ok(());
     }
     if flat {
-        println!("{:<26} {:<5} DETAIL", "CHECK", "ST");
+        println!(
+            "{}  {:<5} DETAIL",
+            bold_heading(&format!("{:<26}", "CHECK")),
+            "ST"
+        );
         for c in &checks {
-            println!("{:<26} {:<5} {}", c.name, c.status_word(), c.detail);
+            println!(
+                "{:<26} {} {}",
+                c.name,
+                colored_status(format!("{:<5}", c.status_word())),
+                c.detail
+            );
         }
     } else {
         for group in GROUPS {
@@ -1940,11 +1974,16 @@ async fn doctor(flat: bool, json: bool) -> Result<()> {
             if rows.is_empty() {
                 continue;
             }
-            println!("{group}");
+            println!("{}", bold_heading(group));
             for c in &rows {
-                println!("  {:<24} {:<5} {}", c.name, c.status_word(), c.detail);
+                println!(
+                    "  {:<24} {} {}",
+                    c.name,
+                    colored_status(format!("{:<5}", c.status_word())),
+                    c.detail
+                );
             }
-            let ok_n = rows.iter().filter(|c| c.ok).count();
+            let ok_n = rows.iter().filter(|c| c.ok && !c.warn).count();
             let warn_n = rows.iter().filter(|c| c.warn).count();
             let fail_n = rows.iter().filter(|c| !c.ok).count();
             let mut rollup = format!("{ok_n} ok");
@@ -1952,24 +1991,36 @@ async fn doctor(flat: bool, json: bool) -> Result<()> {
                 let _ = write!(rollup, ", {warn_n} warn");
             }
             if fail_n > 0 {
-                let _ = write!(rollup, ", {fail_n} FAIL");
+                let _ = write!(rollup, ", {fail_n} fail");
             }
             println!("  ({rollup})\n");
         }
     }
-    if fails > 0 {
-        println!("{fails} failing check(s) — fix the FAIL rows above");
-    } else {
-        if warns > 0 {
-            println!("all checks pass; {warns} warning(s)");
-        } else {
-            println!("all checks pass");
-        }
+    println!("{}", doctor_footer(&checks));
+    if fails == 0 {
         for step in doctor_next_steps(&checks) {
             println!("next: {step}");
         }
     }
     Ok(())
+}
+
+/// Final doctor line: failing checks announce themselves, warnings get
+/// an honest count ("N ok, M warning(s) — no failures"), and only a
+/// truly clean board says "all checks pass". Counts instead of
+/// "all checks pass + warnings" — the old pairing contradicted itself
+/// whenever a warning existed.
+fn doctor_footer(checks: &[Check]) -> String {
+    let warns = checks.iter().filter(|c| c.warn).count();
+    let fails = checks.iter().filter(|c| !c.ok).count();
+    if fails > 0 {
+        format!("{fails} failing check(s) — fix the fail rows above")
+    } else if warns > 0 {
+        let ok_n = checks.len() - warns;
+        format!("{ok_n} ok, {warns} warning(s) — no failures")
+    } else {
+        "all checks pass".to_string()
+    }
 }
 
 /// Section order for the grouped doctor render. SYSTEM also catches
@@ -2044,7 +2095,7 @@ fn doctor_group(name: &str) -> &'static str {
         | "whisper lane"
         | "whisper currency"
         | "whisper models" => "ENGINES",
-        "models" | "model types" => "MODELS",
+        "models" | "unmanaged files" | "model types" => "MODELS",
         "ccache" => "CHANNELS",
         "disk" | "store" | "sentinel" | "daemon uptime" | "tempdir hygiene" | "bench baseline"
         | "chunking" => "RUNTIME",
@@ -4015,24 +4066,32 @@ fn doctor_models(d: &BlazarDirs) -> Vec<Check> {
         s
     };
     let suffix = orphan_suffix(&report);
-    if bad.is_empty() && suffix.is_empty() {
-        vec![Check::ok(
+    // Two separate checks instead of one mega-detail: unreadable rows
+    // and unmanaged files are different problems with different fixes,
+    // and a single line wrapping three issues drowned all of them.
+    let mut out = Vec::new();
+    if bad.is_empty() {
+        out.push(Check::ok(
             "models",
             format!("{} pulled, all parse", models.len()),
-        )]
+        ));
     } else {
-        let mut detail = if bad.is_empty() {
-            format!("{} pulled, all parse", models.len())
-        } else {
+        out.push(Check::warn(
+            "models",
             format!(
                 "{} pulled; metadata unreadable: {} (re-pull or rm)",
                 models.len(),
                 bad.join(", ")
-            )
-        };
-        detail.push_str(&suffix);
-        vec![Check::warn("models", detail)]
+            ),
+        ));
     }
+    if !suffix.is_empty() {
+        out.push(Check::warn(
+            "unmanaged files",
+            suffix.trim_start_matches(';').trim().to_string(),
+        ));
+    }
+    out
 }
 
 /// One audited libc call (mirrors the runtime's signal-0 precedent):
@@ -4121,7 +4180,7 @@ async fn serve() -> Result<()> {
         );
     }
     for (what, why) in &reconcile.skipped {
-        println!("WARNING: preflight skipped {what}: {why}");
+        println!("warning: preflight skipped {what}: {why}");
     }
     // BLAZAR_ENGINE_PATH: register/refresh the local build and prefer it
     // for this run (plan C: pseudo-tag "local", never pruned).
@@ -4491,13 +4550,13 @@ async fn pull_model(target: &str, force: bool) -> Result<(blazar_core::store::Mo
             warning: Some(w), ..
         } = ev
         {
-            println!("WARNING: {w}");
+            println!("warning: {w}");
         }
     }
     // Structural GGUF lint (H4): warn-only, explains degraded sizing.
     if let Ok(m) = blazar_core::read_metadata_file(std::path::Path::new(&row.path)) {
         for w in m.lint() {
-            println!("WARNING: {w}");
+            println!("warning: {w}");
         }
     }
     Ok((row, already_present))
@@ -4585,7 +4644,7 @@ fn import(
         .map_err(|e| anyhow!("not a readable GGUF ({}): {e}", path.display()))?;
     // Structural GGUF lint (H4): warn-only, explains degraded sizing.
     for w in meta.lint() {
-        println!("WARNING: {w}");
+        println!("warning: {w}");
     }
     let file_name = path
         .file_name()
@@ -4775,6 +4834,65 @@ fn render_list_table(header: [&str; 8], rows: &[[String; 8]]) -> String {
     out.trim_end().to_string()
 }
 
+/// ANSI accents for interactive use only: piped/redirected output stays
+/// byte-stable for scripts, and `NO_COLOR` / `TERM=dumb` disable the codes.
+fn cli_colors() -> bool {
+    use std::io::IsTerminal as _;
+    std::io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("TERM")
+            .as_deref()
+            .is_ok_and(|t| !t.eq_ignore_ascii_case("dumb"))
+}
+
+/// Adaptive-width table shared by `search` and `engine list` — the same
+/// sizing philosophy as [`render_list_table`]: every column sizes to its
+/// widest cell (header included) so a value can never bleed into the
+/// next column; `right` indexes right-align (numbers line up on their
+/// least-significant digit); the last column is left open with no
+/// trailing blanks so copied output stays clean. Headers render bold on
+/// interactive terminals.
+fn render_table(header: &[&str], rows: &[Vec<String>], right: &[usize]) -> String {
+    use std::fmt::Write as _;
+    let cols = header.len();
+    let mut widths: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();
+    for cells in rows {
+        for (c, cell) in cells.iter().enumerate().take(cols) {
+            widths[c] = widths[c].max(cell.chars().count());
+        }
+    }
+    let row_line = |cells: &[String], bold: bool| -> String {
+        let mut s = String::new();
+        for (c, &w) in widths.iter().enumerate() {
+            if c > 0 {
+                s.push_str("  ");
+            }
+            let text = cells.get(c).map_or("", String::as_str);
+            if c + 1 == cols {
+                s.push_str(text);
+            } else if right.contains(&c) {
+                let _ = write!(s, "{text:>w$}");
+            } else {
+                let _ = write!(s, "{text:<w$}");
+            }
+        }
+        if bold {
+            format!("\x1b[1m{s}\x1b[0m")
+        } else {
+            // An empty last cell must not leave the column separator
+            // dangling as trailing whitespace.
+            s.trim_end().to_string()
+        }
+    };
+    let header_cells: Vec<String> = header.iter().map(|h| (*h).to_string()).collect();
+    let mut out = String::new();
+    let _ = writeln!(out, "{}", row_line(&header_cells, cli_colors()));
+    for cells in rows {
+        let _ = writeln!(out, "{}", row_line(cells, false));
+    }
+    out
+}
+
 /// One `list --json` JSONL row: machine-typed mirror of the table
 /// (`mmproj_bytes` null = no projector configured, 0 = configured but
 /// missing on disk, `engine` null = nothing installed serves the model),
@@ -4960,29 +5078,40 @@ fn show(model: &str, json: bool) -> Result<()> {
         );
         return Ok(());
     }
-    println!("name:    {}", row.name);
-    println!("repo:    {}", row.repo);
-    println!("quant:   {}", row.quant);
-    println!("path:    {}", row.path);
-    println!("size:    {}", humansize(row.bytes));
-    println!("shards:  {}", row.shards);
+    // Field list first, then one aligned pass: the key column sizes to
+    // the longest key, and optional metadata prints its value or "-" —
+    // never the Rust Debug form (Some(24)/None leaked here once).
+    let mut fields: Vec<(&str, String)> = vec![
+        ("name", row.name.clone()),
+        ("repo", row.repo.clone()),
+        ("quant", row.quant.clone()),
+        ("path", row.path.clone()),
+        ("size", humansize(row.bytes)),
+        ("shards", row.shards.to_string()),
+    ];
     if let Some(mm) = &row.mmproj_path {
-        println!("mmproj:  {mm}");
+        fields.push(("mmproj", mm.clone()));
     }
     if let Some(m) = &meta {
-        println!("arch:    {}", m.architecture);
-        println!("blocks:  {:?}", m.block_count);
-        println!("ctx_train: {:?}", m.context_length);
-        println!("experts: {:?}", m.expert_count);
+        fields.push(("arch", m.architecture.clone()));
+        fields.push(("blocks", opt_or_dash(m.block_count)));
+        fields.push(("ctx_train", opt_or_dash(m.context_length)));
+        fields.push(("experts", opt_or_dash(m.expert_count)));
         if let Some(q) = &m.quantized_by {
-            println!("quantized_by: {q}");
+            fields.push(("quantized_by", q.clone()));
         }
         if let Some(v) = &m.general_version {
-            println!("version: {v}");
+            fields.push(("version", v.clone()));
         }
+    }
+    let key_w = fields.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    for (k, v) in &fields {
+        println!("{k:<key_w$}  {v}");
+    }
+    if let Some(m) = &meta {
         // Structural GGUF lint (H4): warn-only, explains degraded sizing.
         for w in m.lint() {
-            println!("WARNING: {w}");
+            println!("warning: {w}");
         }
     }
     if let Some((tag, p)) = profile {
@@ -4993,6 +5122,13 @@ fn show(model: &str, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Optional GGUF metadata as a show-field value: the number, or "-"
+/// for absent — never the Rust Debug form (`Some(24)`/`None` leaked
+/// into `blazar show` output once).
+fn opt_or_dash(v: Option<u64>) -> String {
+    v.map_or_else(|| "-".to_string(), |n| n.to_string())
 }
 
 /// Stored JSON text (argv/benchmark columns) embedded as a real value;
@@ -5267,7 +5403,7 @@ fn print_record(r: &serde_json::Value) {
         _ => String::new(),
     };
     println!(
-        "{flag}  {}  {}  model={} status={} finish={} ctx={} prompt={} completion={} degraded={} {ms}{conf}",
+        "{flag}  {}  {}  model={} status={} finish={} ctx={} prompt={} completion={} degraded={} ms={ms}{conf}",
         r["trace"].as_str().unwrap_or("?"),
         r["route"].as_str().unwrap_or("?"),
         r["model"].as_str().unwrap_or("?"),
@@ -5939,7 +6075,7 @@ async fn drafts_cmd(model: &str) -> Result<()> {
         format!("{family} 0.6b gguf"),
     ];
     let mut seen = std::collections::HashSet::new();
-    println!("draft candidates for {model:?} (verify with `blazar tune {model} --spec`):");
+    println!("draft candidates for {model} (verify with `blazar tune {model} --spec`):");
     let mut any = false;
     for q in &queries {
         for e in client.search(q, "gguf", 5).await? {
@@ -6202,7 +6338,12 @@ async fn tts_cmd(
             .with_download_connections(config()?.download_connections);
         let dest = blazar_runtime::piper::pull_voice(&hf, &d, &voice, |done, total| {
             use std::io::Write as _;
-            print!("\rpulling {voice}.onnx: {done}/{total} bytes");
+            let pct = (done * 100).checked_div(total).unwrap_or(0);
+            print!(
+                "\rpulling {voice}.onnx: {}/{} ({pct}%)",
+                humansize(i64::try_from(done).unwrap_or(i64::MAX)),
+                humansize(i64::try_from(total).unwrap_or(i64::MAX))
+            );
             let _ = std::io::stdout().flush();
         })
         .await?;
@@ -6372,7 +6513,12 @@ async fn whisper_cmd(
             .with_download_connections(config()?.download_connections);
         let dest = blazar_runtime::whisper::pull(&hf, &d, &size, |done, total| {
             use std::io::Write as _;
-            print!("\rpulling ggml-{size}.bin: {done}/{total} bytes");
+            let pct = (done * 100).checked_div(total).unwrap_or(0);
+            print!(
+                "\rpulling ggml-{size}.bin: {}/{} ({pct}%)",
+                humansize(i64::try_from(done).unwrap_or(i64::MAX)),
+                humansize(i64::try_from(total).unwrap_or(i64::MAX))
+            );
             let _ = std::io::stdout().flush();
         })
         .await?;
@@ -6680,7 +6826,7 @@ fn gen_line(rl: &mut rustyline::DefaultEditor, prompt: &str) -> Option<String> {
             Some(t).filter(|t| !t.is_empty())
         }
         Err(ReadlineError::Interrupted) => {
-            println!("^C (use /exit or Ctrl-D to quit)");
+            println!("^C (use /exit or Ctrl+D to quit)");
             Some(String::new())
         }
         Err(_) => None,
@@ -8496,6 +8642,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             }
             let store = Store::open(&d)?;
             let mut seen: Vec<&str> = Vec::new();
+            let mut table: Vec<Vec<String>> = Vec::new();
             for e in store.list_engines()? {
                 // Provenance suffix from the row's manifest: fork lanes
                 // show their immutable pin, source builds their commit.
@@ -8534,46 +8681,65 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                     _ => e.asset.clone(),
                 };
                 let superseded = match m.as_ref().and_then(|m| m.superseded_by.as_deref()) {
-                    Some(by) => format!(" (superseded by {by})"),
+                    Some(by) => format!("superseded by {by}"),
                     None => String::new(),
                 };
-                println!(
-                    "{:<12} {:<9} {:<10} {} {} {}",
-                    e.tag,
-                    e.kind.as_str(),
+                table.push(vec![
+                    e.tag.clone(),
+                    e.kind.as_str().to_string(),
                     asset,
-                    if e.active { "[active]" } else { "" },
+                    if e.active {
+                        "active".to_string()
+                    } else {
+                        "-".to_string()
+                    },
                     e.sha256.chars().take(12).collect::<String>(),
-                    superseded
-                );
+                    superseded,
+                ]);
             }
             if json {
                 return Ok(());
+            }
+            if !table.is_empty() {
+                print!(
+                    "{}",
+                    render_table(
+                        &["TAG", "KIND", "ASSET", "STATE", "SHA256", "NOTES"],
+                        &table,
+                        &[]
+                    )
+                );
             }
             // Point-of-need catalog: `engine list` is where users look
             // for "what can I install" — every lane this blazar can
             // run but doesn't have yet gets one discoverability line.
             // The whisper lane reports through the generic table when
             // installed as an engine row; only the legacy voice tree
-            // needs its own line.
+            // needs its own line. Lane labels share one width so the
+            // teaching lines align under the table.
+            let lane = |name: &str, rest: &str| println!("{name:<10} not installed — {rest}");
             if !seen.contains(&"llamacpp") {
-                println!(
-                    "llama.cpp:  not installed — blazar engine update (prebuilt) / blazar engine build cuda (source; GGUF lane)"
+                lane(
+                    "llama.cpp",
+                    "blazar engine update (prebuilt) / blazar engine build cuda (source; GGUF lane)",
                 );
             }
             if !seen.contains(&"mistralrs") {
-                println!(
-                    "mistral.rs: not installed — blazar engine install --kind mistralrs (safetensors)"
+                lane(
+                    "mistral.rs",
+                    "blazar engine install --kind mistralrs (safetensors)",
                 );
             }
             if !seen.contains(&"sglang") {
-                println!(
-                    "sglang:     not installed — blazar engine install --kind sglang (safetensors; Linux + CUDA/ROCm)"
+                lane(
+                    "sglang",
+                    "blazar engine install --kind sglang (safetensors; Linux + CUDA/ROCm)",
                 );
             }
             if !seen.contains(&"sdcpp") {
-                println!(
-                    "sdcpp:      not installed — blazar engine install --kind sdcpp (diffusion checkpoints: Qwen-Image-2.1/v1, FLUX.1/2-dev, Z-Image, Chroma, SDXL, SD1.5, Wan 2.1 video; any GPU via Vulkan)"
+                lane(
+                    "sdcpp",
+                    "blazar engine install --kind sdcpp (diffusion checkpoints: Qwen-Image-2.1/v1, FLUX.1/2-dev, Z-Image, Chroma, SDXL, SD1.5, Wan 2.1 video; any GPU via Vulkan)",
                 );
             }
             match (
@@ -8583,11 +8749,15 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 // Engine row already printed by the table above.
                 (true, _) => {}
                 (false, Some(tag)) => {
-                    println!("whisper:    {tag} (legacy voice lane) — blazar whisper --list");
+                    println!(
+                        "{:<10} {tag} (legacy voice lane) — blazar whisper --list",
+                        "whisper"
+                    );
                 }
                 (false, None) => {
-                    println!(
-                        "whisper:    not installed — blazar engine install --kind whisper (audio transcription/translation; legacy: blazar whisper --install)"
+                    lane(
+                        "whisper",
+                        "blazar engine install --kind whisper (audio transcription/translation; legacy: blazar whisper --install)",
                     );
                 }
             }
@@ -10215,6 +10385,10 @@ fn human_count(n: u64) -> String {
 
 #[allow(clippy::too_many_lines)] // result table renderer: header, rows, footer
 async fn search(query: &str, format: &str, quant: Option<&str>, json: bool) -> Result<()> {
+    // Table-only cap on the ARCH column: long architecture ids
+    // (xlm-roberta, nomic_bert) once bled into CTX under a fixed width;
+    // 18 keeps every known arch whole and ellipsizes runaways.
+    const ARCH_CAP: usize = 18;
     // Quant filtering is client-side (the Hub exposes no quant facet):
     // bare grammar-exact query tokens (`q4`, `Q4_K_M`) always leave the
     // text query — they are dead weight in the Hub's full-text search
@@ -10302,16 +10476,10 @@ async fn search(query: &str, format: &str, quant: Option<&str>, json: bool) -> R
         }
         return Ok(());
     }
-    // Column width adapts to the longest repo id (capped) so numbers never
-    // drift out of alignment; oversize ids shrink the owner, keeping the
-    // model name — the pull discriminator — fully visible.
+    // Oversize ids shrink the owner (cap), keeping the model name — the
+    // pull discriminator — fully visible; column widths adapt inside
+    // render_table.
     let cap = 64usize;
-    let width = results
-        .iter()
-        .map(|r| r.id.len().min(cap))
-        .max()
-        .unwrap_or(0)
-        .max("REPO".len());
     let human_ctx = |c: u64| {
         if c >= 1024 * 1024 {
             format!("{}M", c / (1024 * 1024))
@@ -10321,48 +10489,44 @@ async fn search(query: &str, format: &str, quant: Option<&str>, json: bool) -> R
             c.to_string()
         }
     };
-    println!(
-        "{:<width$}  {:>10}  {:>6}  {:<11}  {:<10}  {:<7}  {:>5}  {:<22}",
-        "REPO",
-        "DOWNLOADS",
-        "LIKES",
-        "FORMAT",
-        "SIZE",
-        "ARCH",
-        "CTX",
-        "QUANTS",
-        width = width
-    );
+    let mut table: Vec<Vec<String>> = Vec::new();
     for r in results {
         let id = truncate_repo_id(&r.id, cap);
-        let (size, arch, ctx) = (
+        let arch = entry_arch(&r).map_or_else(|| "-".to_string(), |a| trunc_ellipsis(&a, ARCH_CAP));
+        table.push(vec![
+            id,
+            human_count(r.downloads.unwrap_or(0)),
+            r.likes.unwrap_or(0).to_string(),
+            format_of_entry(&r),
             entry_size_bytes(&r).map_or_else(
                 || "-".to_string(),
                 |b| humansize(i64::try_from(b).unwrap_or(i64::MAX)),
             ),
-            entry_arch(&r).unwrap_or_else(|| "?".to_string()),
+            arch,
             r.gguf
                 .as_ref()
                 .and_then(|g| g.context_length)
                 .map_or_else(|| "-".to_string(), &human_ctx),
-        );
-        let names = entry_quants(&r);
-        // GGUF rows carry real per-file quants; MLX/AWQ/GPTQ/FP8 rows only
-        // name their bit-width in the repo id.
-        let quants = collapse_tokens(&names);
-        println!(
-            "{:<width$}  {:>10}  {:>6}  {:<11}  {:<10}  {:<7}  {:>5}  {:<22}",
-            id,
-            human_count(r.downloads.unwrap_or(0)),
-            r.likes.unwrap_or(0),
-            format_of_entry(&r),
-            size,
-            arch,
-            ctx,
-            quants,
-            width = width
-        );
+            collapse_tokens(&entry_quants(&r)),
+        ]);
     }
+    print!(
+        "{}",
+        render_table(
+            &[
+                "REPO",
+                "DOWNLOADS",
+                "LIKES",
+                "FORMAT",
+                "SIZE",
+                "ARCH",
+                "CTX",
+                "QUANTS"
+            ],
+            &table,
+            &[1, 2, 4, 6]
+        )
+    );
     match format.as_str() {
         "any" | "all" => println!(
             "\n# pull: blazar pull <REPO>[:quant] (GGUF → llamacpp) or blazar pull <REPO> (safetensors/AWQ/GPTQ/FP8 → sglang/mistralrs)\n# MLX repos are Apple-silicon-only — pull the same model's GGUF or safetensors repo instead"
@@ -13090,13 +13254,24 @@ mod tests {
                 .unwrap();
         }
         let checks = doctor_models(&d);
-        assert_eq!(checks.len(), 1, "{:?}", checks.len());
+        // Since the MODELS mega-line split: metadata health ("models")
+        // and orphan files ("unmanaged files") are separate rows. The
+        // fixture's 1-byte placeholder makes both warn.
+        assert_eq!(checks.len(), 2, "{checks:?}");
+        assert_eq!(checks[0].name, "models");
         assert!(checks[0].warn && checks[0].ok, "{}", checks[0].detail);
         assert!(
-            checks[0].detail.contains("orphan.gguf")
-                && checks[0].detail.contains("blazar import <file> --name <n>"),
+            checks[0].detail.contains("metadata unreadable"),
             "{}",
             checks[0].detail
+        );
+        assert_eq!(checks[1].name, "unmanaged files");
+        assert!(checks[1].warn && checks[1].ok, "{}", checks[1].detail);
+        assert!(
+            checks[1].detail.contains("orphan.gguf")
+                && checks[1].detail.contains("blazar import <file> --name <n>"),
+            "{}",
+            checks[1].detail
         );
     }
 
@@ -13444,5 +13619,92 @@ mod tests {
         assert!(any_child_pidfile(["Model#2.PID".to_string()]));
         assert!(!any_child_pidfile(["blazar.pid".to_string()]));
         assert!(!any_child_pidfile(["qwen2.5-0.5b.apikey".to_string()]));
+    }
+
+    // Output-format pins (W1-W4 wave): these lock the rendered shapes
+    // the audit fixed — adaptive table alignment, lowercase status
+    // words, no ANSI when piped, no Option-Debug leaks, honest doctor
+    // footer wording.
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__render_table__sizes_columns_to_widest_cell_rightaligns_indexes() {
+        let rows = vec![
+            vec!["qwen2.5".into(), "1_234".to_string(), "llama".to_string()],
+            vec!["tiny".into(), "89".to_string(), "xlm-roberta".to_string()],
+        ];
+        let out = render_table(&["REPO", "DOWNLOADS", "ARCH"], &rows, &[1]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "REPO     DOWNLOADS  ARCH");
+        // Right-aligned numbers share their right edge with the header.
+        let edge = |l: &str, needle: &str| l.find(needle).map(|i| i + needle.len());
+        let dl_edge = lines[0].find("DOWNLOADS").map(|i| i + "DOWNLOADS".len());
+        assert_eq!(edge(&lines[1], "1_234"), dl_edge);
+        assert_eq!(edge(&lines[2], "89"), dl_edge);
+        // A too-narrow cell once bled columns; the widest cell wins.
+        assert_eq!(out.lines().nth(2), Some("tiny            89  xlm-roberta"));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__render_table__last_column_is_open_no_trailing_blanks() {
+        let rows = vec![vec!["m".into(), "short".to_string()]];
+        let out = render_table(&["REPO", "QUANTS"], &rows, &[]);
+        for line in out.lines() {
+            assert_eq!(line, line.trim_end(), "no trailing blanks anywhere");
+        }
+        assert_eq!(out.lines().nth(1), Some("m     short"));
+        // An EMPTY last cell leaves no dangling column separator.
+        let empty = render_table(
+            &["TAG", "NOTES"],
+            &[vec!["b5130".into(), String::new()]],
+            &[],
+        );
+        assert_eq!(empty.lines().nth(1), Some("b5130"));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__render_table__piped_output_carries_no_ansi_escapes() {
+        // Under `cargo test` stdout is a pipe, not a terminal, so the
+        // header renders plain — scripts see byte-stable text.
+        let out = render_table(&["A", "B"], &[vec!["1".into(), "2".to_string()]], &[]);
+        assert!(!out.contains('\x1b'), "no escapes when piped: {out:?}");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__status_word__lowercase_ok_warn_fail() {
+        assert_eq!(Check::ok("n", "d").status_word(), "ok");
+        assert_eq!(Check::warn("n", "d").status_word(), "warn");
+        assert_eq!(Check::fail("n", "d").status_word(), "fail");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__opt_or_dash__value_or_dash_never_option_debug() {
+        assert_eq!(opt_or_dash(Some(24)), "24");
+        assert_eq!(opt_or_dash(None), "-");
+        for v in [opt_or_dash(Some(24)), opt_or_dash(None)] {
+            assert!(!v.contains("Some(") && !v.contains("None"));
+        }
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__doctor_footer__wording_matches_board_state() {
+        let ok = || Check::ok("n", "d");
+        let warn = || Check::warn("n", "d");
+        let fail = || Check::fail("n", "d");
+        // The old bug: warnings coexisted with "all checks pass".
+        assert_eq!(
+            doctor_footer(&[ok(), warn(), warn()]),
+            "1 ok, 2 warning(s) — no failures"
+        );
+        assert_eq!(doctor_footer(&[ok(), ok()]), "all checks pass");
+        assert_eq!(
+            doctor_footer(&[ok(), warn(), fail()]),
+            "1 failing check(s) — fix the fail rows above"
+        );
     }
 }
