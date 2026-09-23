@@ -438,6 +438,36 @@ pub enum SupervisionError {
     Internal(#[from] anyhow::Error),
 }
 
+/// Admission-loop verdict when a spawn is blocked (see
+/// [`Supervisor::blocked_action`]).
+#[derive(Debug, PartialEq, Eq)]
+enum BlockedAction {
+    Evict(String),
+    Refuse,
+}
+
+/// RAII release for a per-device spawn reservation: dropping subtracts
+/// the reserved bytes back out of the ledger. Every failure path between
+/// `reserve_device` and the instance insert releases through this Drop
+/// alone — a reservation can never outlive its spawn.
+struct DeviceReservation {
+    device: String,
+    bytes: u64,
+    map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
+}
+
+impl Drop for DeviceReservation {
+    fn drop(&mut self) {
+        let mut map = self.map.lock().expect("reservation ledger lock");
+        if let Some(v) = map.get_mut(&self.device) {
+            *v = v.saturating_sub(self.bytes);
+            if *v == 0 {
+                map.remove(&self.device);
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Instance {
     pub name: String,
@@ -469,10 +499,18 @@ pub struct Instance {
     /// "partial" | "auto") — what `ps` shows so silent CPU fallback is
     /// never silent.
     pub gpu: String,
-    /// Auto-picked GPU card name (LC2 discrete-first pick); `None` when
-    /// placement was manual (devices config) or unknown. Feeds the
-    /// card-scoped co-residency planner.
+    /// Display label of the placement card (`full@<card>` in `ps`) —
+    /// the census description when one exists. Pure presentation: the
+    /// card-scoped co-residency planner and the per-device VRAM ledger
+    /// match on [`Instance::device_id`] (the census backend id), never
+    /// on this label — two cards can share a description, ids cannot.
     pub device: Option<String>,
+    /// Census backend id (`GpuInfo.name`, e.g. `CUDA0`) of the card this
+    /// child was placed on: the auto-pick's id, the single manual
+    /// `devices` pin, or the lone card of a single-GPU box. `None` for
+    /// CPU spawns, tensor splits, multi-card manual pins, or unknown
+    /// placement (those fall back to the aggregate admission belt).
+    pub device_id: Option<String>,
     /// Post-quantization KV-cache estimate from the compiled profile —
     /// feeds the co-residency planner (A15).
     pub kv_est_bytes: Option<u64>,
@@ -845,6 +883,13 @@ pub struct Supervisor {
     /// is the only reachable saturation indicator; live-proven
     /// 2026-09-12 when a 6-stream load left `in_flight` pinned at slots).
     slot_pressure: DashMap<String, u32>,
+    /// Per-device VRAM reservation ledger: census card id → bytes held
+    /// by spawns between placement and instance insert (the settle-lag
+    /// window). A std Mutex is correct here — taken only for short map
+    /// edits on the spawn path, never held across an await. RAII
+    /// [`DeviceReservation`] releases; admission reads it through
+    /// `device_load_bytes`.
+    device_reservations: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
     /// Session pins (R3): sessions that recently carried
     /// `x-blazar-session` per model. The idle ladder and capacity
     /// pressure consult this before evicting; force stop releases.
@@ -981,6 +1026,9 @@ impl Supervisor {
             adopted_slots: DashMap::new(),
             reshape_queue: DashMap::new(),
             slot_pressure: DashMap::new(),
+            device_reservations: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             sessions: crate::sessionreg::SessionRegistry::new(),
         }
     }
@@ -1040,6 +1088,77 @@ impl Supervisor {
         blazar_core::Hardware::bytes(self.hardware.total_vram_mib())
     }
 
+    /// Resident + reserved bytes against ONE card (census id keyed) —
+    /// the per-device admission arithmetic. Instances with unknown
+    /// placement never count here; the aggregate belt catches them.
+    fn device_load_bytes(&self, device: &str) -> u64 {
+        use std::sync::atomic::Ordering;
+        let resident: u64 = self
+            .instances
+            .iter()
+            .filter(|e| e.value().gpu != "cpu" && e.value().device_id.as_deref() == Some(device))
+            .map(|e| {
+                let measured =
+                    blazar_core::Hardware::bytes(e.value().settled_mib.load(Ordering::Relaxed));
+                let weights = u64::try_from(e.value().model.bytes.max(0)).unwrap_or(u64::MAX);
+                measured.max(weights)
+            })
+            .sum();
+        let reserved = self
+            .device_reservations
+            .lock()
+            .expect("reservation ledger lock")
+            .get(device)
+            .copied()
+            .unwrap_or(0);
+        resident.saturating_add(reserved)
+    }
+
+    /// Census capacity of one card; `None` when the id is unknown to the
+    /// boot snapshot (probed placements can appear transiently).
+    fn device_budget_bytes(&self, device: &str) -> Option<u64> {
+        self.hardware
+            .gpus
+            .iter()
+            .find(|g| g.name == device)
+            .map(|g| blazar_core::Hardware::bytes(g.total_mib))
+    }
+
+    /// GPU-resident bytes with no known card (tensor splits, multi-card
+    /// manual pins, placements from before the id was recorded) — the
+    /// population the aggregate budget belt still guards.
+    fn unplaced_gpu_bytes(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.instances
+            .iter()
+            .filter(|e| e.value().gpu != "cpu" && e.value().device_id.is_none())
+            .map(|e| {
+                let measured =
+                    blazar_core::Hardware::bytes(e.value().settled_mib.load(Ordering::Relaxed));
+                let weights = u64::try_from(e.value().model.bytes.max(0)).unwrap_or(u64::MAX);
+                measured.max(weights)
+            })
+            .sum()
+    }
+
+    /// Hold `bytes` against a card for the pick→insert window. The
+    /// returned guard releases on drop; insert converts the reservation
+    /// into a counted resident.
+    fn reserve_device(&self, device: &str, bytes: u64) -> DeviceReservation {
+        let mut map = self
+            .device_reservations
+            .lock()
+            .expect("reservation ledger lock");
+        let entry = map.entry(device.to_string()).or_insert(0);
+        *entry = entry.saturating_add(bytes);
+        drop(map);
+        DeviceReservation {
+            device: device.to_string(),
+            bytes,
+            map: std::sync::Arc::clone(&self.device_reservations),
+        }
+    }
+
     /// Capacity-eviction victim: the coldest evictable instance — zero
     /// in-flight, not the incoming key, and not pinned (overlay
     /// `pin = true`, A13). Ordering: session-pinned models LAST (R3 —
@@ -1069,6 +1188,75 @@ impl Supervisor {
             .map(|e| e.key().clone())
     }
 
+    /// What the admission loop does when blocked: evict the coldest
+    /// victim, or refuse. Captive loads (the semantic-cache embed
+    /// model) always refuse — a cache probe must never decide which
+    /// generation models stay resident.
+    fn blocked_action(&self, key: &str, captive: bool) -> BlockedAction {
+        if captive {
+            return BlockedAction::Refuse;
+        }
+        match self.victim_key(key) {
+            Some(v) => BlockedAction::Evict(v),
+            None => BlockedAction::Refuse,
+        }
+    }
+
+    /// Admission arithmetic for an incoming spawn: instance cap, or the
+    /// per-card VRAM ledger exceeded (an empty GPU box always admits one
+    /// model — the J3 spawn guard owns refusal for loads that cannot fit
+    /// at all). Per-device: candidates are the manual `devices` pins, or
+    /// every discrete card in auto mode; the spawn fits when ANY
+    /// candidate card holds resident + reserved + floor within its OWN
+    /// census budget — the old aggregate-pool admission let two models
+    /// each fit "the summed VRAM" while colliding on one physical card.
+    /// Tensor splits and unknown placements carry no card id, so the
+    /// legacy aggregate belt still applies whenever they are resident.
+    fn admission_blocked(&self, name: &str, incoming_bytes: u64) -> bool {
+        if self
+            .instance_cap()
+            .is_some_and(|cap| self.instances.len() >= cap)
+        {
+            return true;
+        }
+        if !self.bytes_admission_active() || self.instances.is_empty() {
+            return false;
+        }
+        let manual = self.config.effective_devices(name).to_vec();
+        let candidates: Vec<&str> = if manual.is_empty() {
+            let discrete: Vec<&str> = self
+                .hardware
+                .gpus
+                .iter()
+                .filter(|g| !g.is_integrated())
+                .map(|g| g.name.as_str())
+                .collect();
+            if discrete.is_empty() {
+                self.hardware.gpus.iter().map(|g| g.name.as_str()).collect()
+            } else {
+                discrete
+            }
+        } else {
+            manual.iter().map(String::as_str).collect()
+        };
+        if candidates.is_empty() {
+            return self.resident_bytes().saturating_add(incoming_bytes) > self.vram_budget_bytes();
+        }
+        // A card missing from the census cannot be judged — fail open on
+        // it (J3 owns the honest spawn-time refusal), never strand the
+        // spawn on an unprobeable id.
+        let any_card_fits = candidates.iter().any(|c| {
+            self.device_budget_bytes(c).is_some_and(|budget| {
+                self.device_load_bytes(c).saturating_add(incoming_bytes) <= budget
+            })
+        }) || candidates
+            .iter()
+            .any(|c| self.device_budget_bytes(c).is_none());
+        let aggregate_exceeded = self.unplaced_gpu_bytes() > 0
+            && self.resident_bytes().saturating_add(incoming_bytes) > self.vram_budget_bytes();
+        !any_card_fits || aggregate_exceeded
+    }
+
     /// Session-pin window (R3); zero = feature off.
     fn session_ttl(&self) -> Duration {
         Duration::from_secs(self.config.session_keep_secs)
@@ -1091,14 +1279,16 @@ impl Supervisor {
         };
         // Card-scoped: LC2 picks ONE card per spawn, so pressure must be
         // computed against that card only — a summed-all-GPUs denominator
-        // fires late (or never) on mixed iGPU+dGPU boxes.
+        // fires late (or never) on mixed iGPU+dGPU boxes. Residents key
+        // on the census backend id (`device_id`): the display label two
+        // cards can share would under-count pressure silently.
         let residents: Vec<(Option<String>, u64, u64, bool)> = self
             .instances
             .iter()
             .map(|inst| {
                 let weights = u64::try_from(inst.model.bytes.max(0)).unwrap_or(u64::MAX);
                 (
-                    inst.device.clone(),
+                    inst.device_id.clone(),
                     weights,
                     inst.kv_est_bytes.unwrap_or(0),
                     !matches!(inst.gpu.as_str(), "cpu" | "partial"),
@@ -1142,6 +1332,23 @@ impl Supervisor {
         name: &str,
         prefix: Option<PrefixKey>,
     ) -> Result<EngineRef, SupervisionError> {
+        self.ensure_routed_opts(name, prefix, false).await
+    }
+
+    /// Captive variant for side loads (semantic-cache embed model):
+    /// routes exactly like [`Self::ensure_routed`], but the underlying
+    /// spawn refuses under admission pressure instead of evicting
+    /// residents.
+    pub async fn ensure_routed_captive(&self, name: &str) -> Result<EngineRef, SupervisionError> {
+        self.ensure_routed_opts(name, None, true).await
+    }
+
+    async fn ensure_routed_opts(
+        &self,
+        name: &str,
+        prefix: Option<PrefixKey>,
+        captive: bool,
+    ) -> Result<EngineRef, SupervisionError> {
         // ollama API clients send `model:tag`; blazar rows are flat.
         // Same rule as the CLI boundary (`Store::resolve_model_name`),
         // colon-gated so the per-request hot path pays nothing for
@@ -1180,7 +1387,7 @@ impl Supervisor {
         }
 
         let key = self.replica_key(name, prefix);
-        let result = self.ensure_key(&key).await;
+        let result = self.ensure_key_opts(&key, captive).await;
         // Best-effort affinity record: pin this prefix to the replica
         // that served it, so the next turn hits its warm cache.
         if let Some(pk) = prefix {
@@ -1440,6 +1647,24 @@ impl Supervisor {
     /// future MUST detach (`tokio::spawn` + await) — see the
     /// `ensure_detached` contract in `crate::proxy`.
     pub async fn ensure_key(&self, key: &str) -> Result<EngineRef, SupervisionError> {
+        self.ensure_key_opts(key, false).await
+    }
+
+    /// Captive ensure: a load that must never evict resident models to
+    /// make room for itself. Under admission pressure the spawn refuses
+    /// (`AllSlotsBusy`) instead of selecting a victim — callers treat
+    /// that as "side load skipped", not a hard failure. The fast paths
+    /// (resident instance, in-flight load join) are identical to
+    /// [`Self::ensure_key`].
+    pub async fn ensure_key_captive(&self, key: &str) -> Result<EngineRef, SupervisionError> {
+        self.ensure_key_opts(key, true).await
+    }
+
+    async fn ensure_key_opts(
+        &self,
+        key: &str,
+        captive: bool,
+    ) -> Result<EngineRef, SupervisionError> {
         // Fast path: running (or sleeping — the child wakes on traffic).
         if let Some(inst) = self.instances.get(key) {
             let snapshot = (
@@ -1514,6 +1739,8 @@ impl Supervisor {
         };
         let result = if self.config.router && key == ROUTER_KEY {
             self.spawn_router_instance().await
+        } else if captive {
+            self.spawn_instance_captive(key).await
         } else {
             self.spawn_instance(key).await
         };
@@ -1958,6 +2185,7 @@ impl Supervisor {
                         profile_ctx: 0,
                         gpu: "router".to_string(),
                         device: None,
+                        device_id: None,
                         kv_est_bytes: None,
                         warnings: Vec::new(),
                         // router: no single spec mode (per-section drafts)
@@ -2357,7 +2585,16 @@ impl Supervisor {
     // Full child lifecycle in one pass: argv build, spawn, settle, health
     // gate, registration. Splitting it would scatter the invariants.
     async fn spawn_instance(&self, key: &str) -> Result<EngineRef, SupervisionError> {
-        self.spawn_instance_forced(key, false).await
+        self.spawn_instance_forced(key, false, false).await
+    }
+
+    /// Captive spawn: identical to [`Self::spawn_instance`] except the
+    /// admission loop refuses instead of evicting residents when the
+    /// budget is full. Used by non-generation side loads (the semantic
+    /// cache's embed model) that must never perturb generation
+    /// residency.
+    async fn spawn_instance_captive(&self, key: &str) -> Result<EngineRef, SupervisionError> {
+        self.spawn_instance_forced(key, false, true).await
     }
 
     /// `spawn_instance` with the capability-rescue bound: `true` means
@@ -2370,6 +2607,7 @@ impl Supervisor {
         &self,
         key: &str,
         forced_lane: bool,
+        captive: bool,
     ) -> Result<EngineRef, SupervisionError> {
         let name = model_of_key(key);
         let store =
@@ -2495,22 +2733,16 @@ impl Supervisor {
             )
         };
         loop {
-            let count_blocked = self
-                .instance_cap()
-                .is_some_and(|cap| self.instances.len() >= cap);
-            let bytes_blocked = self.bytes_admission_active()
-                && !self.instances.is_empty()
-                && self.resident_bytes().saturating_add(incoming_bytes) > self.vram_budget_bytes();
-            if !count_blocked && !bytes_blocked {
+            if !self.admission_blocked(name, incoming_bytes) {
                 break;
             }
-            match self.victim_key(key) {
-                Some(v) => {
+            match self.blocked_action(key, captive) {
+                BlockedAction::Evict(v) => {
                     self.evict(&v)
                         .await
                         .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
                 }
-                None => return Err(SupervisionError::AllSlotsBusy),
+                BlockedAction::Refuse => return Err(SupervisionError::AllSlotsBusy),
             }
         }
 
@@ -2728,6 +2960,42 @@ impl Supervisor {
                         .join("+")
                 })
             });
+        // Census-keyed placement id (the ledger + co-residency key):
+        // auto-pick's backend id, a single manual `devices` pin, or the
+        // lone card of a single-GPU box. Multi-card pins and tensor
+        // splits span devices — None routes them to the aggregate belt.
+        let placement_device_id = picked_device
+            .clone()
+            .or_else(|| {
+                let manual = self.config.effective_devices(name).to_vec();
+                (manual.len() == 1).then(|| manual[0].clone())
+            })
+            .or_else(|| {
+                let hw = fresh.as_ref().unwrap_or(&self.hardware);
+                (hw.gpus.len() == 1).then(|| hw.gpus[0].name.clone())
+            });
+        // Reservation ledger (per-device admission): hold the incoming
+        // floor against the picked card from placement to insert — a
+        // concurrent spawn for another model must see this footprint in
+        // admission BEFORE the child settles enough to join the resident
+        // sum. The insert converts the reservation into a counted
+        // resident; every failure path releases through the guard's Drop.
+        let reservation = placement_device_id
+            .as_ref()
+            .map(|d| self.reserve_device(d, incoming_bytes));
+        // Re-check under the reservation: a concurrent spawn may have
+        // reserved or inserted between the admission loop and the pick.
+        // Same contract as the loop above — evict coldest, else refuse.
+        while reservation.is_some() && self.admission_blocked(name, incoming_bytes) {
+            match self.blocked_action(key, captive) {
+                BlockedAction::Evict(v) => {
+                    self.evict(&v)
+                        .await
+                        .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
+                }
+                BlockedAction::Refuse => return Err(SupervisionError::AllSlotsBusy),
+            }
+        }
         // Cache-file dirs (speccache/, sessions/) must exist before the
         // child opens them; profile emission names these paths. Upstream
         // validates --slot-save-path IS a directory, so the per-model
@@ -2989,6 +3257,11 @@ impl Supervisor {
                         } else {
                             card_label.clone()
                         },
+                        device_id: if profile.gpu == "cpu" {
+                            None
+                        } else {
+                            placement_device_id.clone()
+                        },
                         kv_est_bytes: profile.kv_est_bytes,
                         warnings: profile.warnings.clone(),
                         spec_mode: spec_mode.clone(),
@@ -3019,6 +3292,10 @@ impl Supervisor {
                         pid.to_string(),
                     );
                     self.instances.insert(key.to_string(), inst);
+                    // The instance now counts as a resident on its card —
+                    // convert the reservation into that resident and stop
+                    // double-charging the ledger.
+                    drop(reservation);
                     // A restart only counts when it follows an unclean
                     // death — churn (stop→run) is a cold start, not a
                     // crash loop (live-repro'd: 4 clean churns in 60s
@@ -3138,7 +3415,7 @@ impl Supervisor {
                         .lock()
                         .expect("capability pins lock")
                         .insert(name.to_string(), tag.clone());
-                    return Box::pin(self.spawn_instance_forced(key, true)).await;
+                    return Box::pin(self.spawn_instance_forced(key, true, false)).await;
                 }
             }
             // No rescue available (no advertiser, already re-routed, or
@@ -5249,6 +5526,7 @@ mod routing_tests {
             profile_ctx: 8,
             gpu: "full".into(),
             device: None,
+            device_id: None,
             kv_est_bytes: None,
             warnings: Vec::new(),
             spec_mode: "off".into(),
@@ -5299,6 +5577,225 @@ mod routing_tests {
             started.elapsed() < std::time::Duration::from_millis(100),
             "unix guard returns without HTTP"
         );
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__blocked_action__captive_never_selects_a_victim() {
+        // Captive contract: under the same pressure that would evict
+        // the resident for a generation spawn, the captive verdict is a
+        // flat refusal — the semantic-cache embed model must never
+        // decide which generation models stay resident.
+        let (sup, _root) = gpu_sup();
+        let (big, pid) = gpu_instance("big", 5_800 * 1024 * 1024, 7_302);
+        sup.instances.insert("big".to_string(), big);
+        let floor = blazar_core::profile::admission_floor_bytes(500 * 1024 * 1024, 0);
+        assert!(
+            sup.admission_blocked("other", floor),
+            "precondition: the small model does not fit alongside big"
+        );
+        assert_eq!(
+            sup.blocked_action("other", false),
+            BlockedAction::Evict("big".to_string()),
+            "generation spawn under pressure evicts the coldest resident"
+        );
+        assert_eq!(
+            sup.blocked_action("other", true),
+            BlockedAction::Refuse,
+            "captive spawn must refuse instead of naming a victim"
+        );
+        // The refusal left the resident untouched.
+        assert!(sup.instances.contains_key("big"));
+        sup.evict("big").await.unwrap();
+        let _ = pid;
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__admission_blocked__cold_box_admits_one_model() {
+        let (sup, _root) = gpu_sup();
+        let floor = blazar_core::profile::admission_floor_bytes(8_000 * 1024 * 1024, 0);
+        // Empty GPU box: any single model admits (J3 owns honest refusal).
+        assert!(!sup.admission_blocked("big", floor));
+        // Occupied and over budget: blocked.
+        let (big, _pid) = gpu_instance("big", 5_800 * 1024 * 1024, 6_000);
+        sup.instances.insert("big".to_string(), big);
+        assert!(sup.admission_blocked("other", floor));
+        // Occupied but within budget: not blocked. The tiny floor
+        // carries the fixed KV (512 MiB) + spawn overhead (700 MiB)
+        // charge, so "fits" means weights + 1212 MiB under headroom.
+        let tiny_floor = blazar_core::profile::admission_floor_bytes(50 * 1024 * 1024, 0);
+        assert_eq!(
+            tiny_floor,
+            (50 + 512 + 700) * 1024 * 1024,
+            "floor arithmetic this test relies on"
+        );
+        assert!(!sup.admission_blocked("other", tiny_floor));
+    }
+
+    /// Two-card fake box whose descriptions differ from the census ids —
+    /// the display-label/id split real censuses exhibit. The per-device
+    /// ledger and the card-scoped co-residency planner must key on the
+    /// id, never on the label.
+    fn dual_gpu_sup() -> (Supervisor, tempfile::TempDir) {
+        let bus = EventBus::default();
+        let root = tempfile::TempDir::new().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: root.path().join("cfg"),
+            data_dir: root.path().join("data"),
+        };
+        std::fs::create_dir_all(&dirs.config_dir).unwrap();
+        let sup = Supervisor::new(
+            dirs,
+            Config::default(),
+            bus,
+            Hardware {
+                physical_cores: 1,
+                total_ram_mib: 32_000,
+                gpus: vec![
+                    gpu("GPU0", "NVIDIA GeForce RTX 4070", 8_188, 8_188),
+                    gpu("GPU1", "NVIDIA GeForce RTX 5070", 8_188, 8_188),
+                ],
+            },
+            Arc::new(FakeEngine(Manifest {
+                tag: "fake".into(),
+                build_number: 1,
+                version_raw: "b1".into(),
+                devices: vec![],
+                flags: std::collections::BTreeSet::new(),
+                spec_types: vec![],
+                server_path: String::new(),
+                ..Default::default()
+            })),
+        );
+        (sup, root)
+    }
+
+    /// `gpu_instance` twin that records its census card placement the way
+    /// a real spawn does: display label in `device`, backend id in
+    /// `device_id`.
+    fn placed_gpu_instance(
+        key: &str,
+        weights_bytes: i64,
+        settled_mib: u64,
+        card: &str,
+        label: &str,
+    ) -> (Arc<Instance>, u32) {
+        let (mut inst, pid) = gpu_instance(key, weights_bytes, settled_mib);
+        if let Some(i) = Arc::get_mut(&mut inst) {
+            i.device = Some(label.to_string());
+            i.device_id = Some(card.to_string());
+        }
+        (inst, pid)
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__admission_blocked__per_device_two_cards() {
+        let mib = |m: u64| m * 1024 * 1024;
+        let (sup, _root) = dual_gpu_sup();
+        let (big0, _p0) = placed_gpu_instance(
+            "big0",
+            mib(100).cast_signed(),
+            6_000,
+            "GPU0",
+            "NVIDIA GeForce RTX 4070",
+        );
+        sup.instances.insert("big0".to_string(), big0);
+        // One card loaded: a 5000 MiB floor still fits the EMPTY card —
+        // per-device and the old aggregate pool agree here.
+        assert!(!sup.admission_blocked("other", mib(5_000)));
+        let (big1, _p1) = placed_gpu_instance(
+            "big1",
+            mib(100).cast_signed(),
+            6_000,
+            "GPU1",
+            "NVIDIA GeForce RTX 5070",
+        );
+        sup.instances.insert("big1".to_string(), big1);
+        // Both cards loaded: 6000 + 3000 > 8188 on EACH card → blocked,
+        // even though the summed pool (12_000 resident + 3000 floor <=
+        // 16_376) still says room — the exact one-card collision the
+        // aggregate admission used to wave through.
+        assert!(sup.admission_blocked("other", mib(3_000)));
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__device_reservation__blocks_concurrent_second_spawn() {
+        let mib = |m: u64| m * 1024 * 1024;
+        let (sup, _root) = dual_gpu_sup();
+        let (a, _pa) = placed_gpu_instance(
+            "a",
+            mib(100).cast_signed(),
+            6_000,
+            "GPU0",
+            "NVIDIA GeForce RTX 4070",
+        );
+        sup.instances.insert("a".to_string(), a);
+        let (b, _pb) = placed_gpu_instance(
+            "b",
+            mib(100).cast_signed(),
+            5_000,
+            "GPU1",
+            "NVIDIA GeForce RTX 5070",
+        );
+        sup.instances.insert("b".to_string(), b);
+        // GPU0 6000+3000 over; GPU1 5000+3000 = 8000 <= 8188 → fits; the
+        // only fitting card is GPU1.
+        assert!(!sup.admission_blocked("other", mib(3_000)));
+        // A concurrent spawn holds GPU1's remaining headroom for its
+        // pick→insert window (the settling child is not yet a counted
+        // resident): 5000 + 200 reserved + 3000 floor > 8188 → the next
+        // admission must see the collision the resident sum alone misses.
+        let r = sup.reserve_device("GPU1", mib(200));
+        assert!(sup.admission_blocked("other", mib(3_000)));
+        // Releasing the reservation reopens the card — Drop is the only
+        // release path, so the guard's lifetime IS the spawn window.
+        drop(r);
+        assert!(!sup.admission_blocked("other", mib(3_000)));
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__device_reservation__drop_releases_exact_bytes() {
+        let mib = |m: u64| m * 1024 * 1024;
+        let (sup, _root) = dual_gpu_sup();
+        let baseline = sup.device_load_bytes("GPU0");
+        let r = sup.reserve_device("GPU0", mib(1_234));
+        assert_eq!(sup.device_load_bytes("GPU0"), baseline + mib(1_234));
+        drop(r);
+        assert_eq!(sup.device_load_bytes("GPU0"), baseline);
+        // Stacked reservations accumulate; releasing the inner one leaves
+        // the outer charged (no over-release, no under-release).
+        let outer = sup.reserve_device("GPU0", mib(100));
+        {
+            let inner = sup.reserve_device("GPU0", mib(50));
+            assert_eq!(sup.device_load_bytes("GPU0"), baseline + mib(150));
+            drop(inner);
+            assert_eq!(sup.device_load_bytes("GPU0"), baseline + mib(100));
+        }
+        drop(outer);
+        assert_eq!(sup.device_load_bytes("GPU0"), baseline);
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__coresidency__counts_resident_by_backend_id_not_label() {
+        let mib = |m: u64| m * 1024 * 1024;
+        let (sup, _root) = dual_gpu_sup();
+        let (mut big0, _p) = gpu_instance("big0", mib(6_000).cast_signed(), 0);
+        if let Some(i) = Arc::get_mut(&mut big0) {
+            i.device = Some("NVIDIA GeForce RTX 4070".into());
+            i.device_id = Some("GPU0".into());
+            i.kv_est_bytes = Some(mib(1_000));
+        }
+        sup.instances.insert("big0".to_string(), big0);
+        // 6000 weights + 1000 KV resident + 1000 weights + 1000 KV
+        // candidate = 9000 MiB > 95% of the 8188 card → downgrade fires.
+        assert!(sup.coresidency_needs_kv_quant(Some("GPU0"), mib(1_000), Some(mib(1_000))));
+        // Targeting GPU1: the GPU0 resident does not count → 2000 fits.
+        assert!(!sup.coresidency_needs_kv_quant(Some("GPU1"), mib(1_000), Some(mib(1_000))));
     }
 
     #[tokio::test]
@@ -5386,6 +5883,7 @@ mod routing_tests {
             profile_ctx: 8,
             gpu: "cpu".into(),
             device: None,
+            device_id: None,
             kv_est_bytes: None,
             warnings: Vec::new(),
             spec_mode: "off".into(),

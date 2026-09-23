@@ -454,7 +454,9 @@ pub fn template_has_tools(template: &str) -> bool {
 
 enum FeedEvent {
     /// Raw response bytes (SSE or JSON body; grammar fixed at `begin`).
-    Bytes(Vec<u8>),
+    /// Refcounted handle to the proxied chunk — no per-chunk copy on the
+    /// token hot path.
+    Bytes(axum::body::Bytes),
     /// Pre-parsed OpenAI-shaped chunk/response (ollama-compat path).
     Value(Value),
     End,
@@ -469,9 +471,9 @@ pub struct SentinelFeed {
 }
 
 impl SentinelFeed {
-    pub fn bytes(&self, b: &[u8]) {
+    pub fn bytes(&self, b: axum::body::Bytes) {
         if let Some(tx) = &self.tx {
-            if tx.try_send(FeedEvent::Bytes(b.to_vec())).is_err() {
+            if tx.try_send(FeedEvent::Bytes(b)).is_err() {
                 self.degraded.store(true, Ordering::Relaxed);
             }
         }
@@ -2554,10 +2556,10 @@ mod tests {
             ..RequestCtx::default()
         };
         let feed = s.begin(ctx, 200, true);
-        feed.bytes(b"data: {\"choices\":[{\"delta\":{\"content\":\"he\"},\"logprobs\":{\"content\":[{\"logprob\":-0.2}]}}]}\n\n");
-        feed.bytes(b"data: {\"choices\":[{\"delta\":{\"content\":\"llo\"},\"logprobs\":{\"content\":[{\"logprob\":-3.1}]}}]}\n\n");
-        feed.bytes(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n");
-        feed.bytes(b"data: [DONE]\n\n");
+        feed.bytes(axum::body::Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"he\"},\"logprobs\":{\"content\":[{\"logprob\":-0.2}]}}]}\n\n"));
+        feed.bytes(axum::body::Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"llo\"},\"logprobs\":{\"content\":[{\"logprob\":-3.1}]}}]}\n\n"));
+        feed.bytes(axum::body::Bytes::from_static(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n"));
+        feed.bytes(axum::body::Bytes::from_static(b"data: [DONE]\n\n"));
         feed.end();
         for _ in 0..50 {
             if !s.why(None, 10).is_empty() {
@@ -2610,7 +2612,7 @@ mod tests {
         let s = Sentinel::new(false, 0, None);
         let feed = s.begin(RequestCtx::default(), 200, true);
         assert!(!feed.is_observing());
-        feed.bytes(b"data: {}\n\n");
+        feed.bytes(axum::body::Bytes::from_static(b"data: {}\n\n"));
         feed.end();
         assert!(s.why(None, 10).is_empty());
     }
@@ -2626,9 +2628,11 @@ mod tests {
             ..RequestCtx::default()
         };
         let feed = s.begin(ctx, 200, true);
-        feed.bytes(b"data: {\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n");
-        feed.bytes(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":80,\"completion_tokens\":2}}\n\n");
-        feed.bytes(b"data: [DONE]\n\n");
+        feed.bytes(axum::body::Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n",
+        ));
+        feed.bytes(axum::body::Bytes::from_static(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":80,\"completion_tokens\":2}}\n\n"));
+        feed.bytes(axum::body::Bytes::from_static(b"data: [DONE]\n\n"));
         feed.end();
         // Analyzer runs async; poll the ring briefly.
         for _ in 0..50 {
@@ -2658,9 +2662,9 @@ mod tests {
             ..RequestCtx::default()
         };
         let feed = s.begin(ctx, 200, true);
-        feed.bytes(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking hard about the answer\"}}]}\n\n");
-        feed.bytes(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":19,\"completion_tokens\":64}}\n\n");
-        feed.bytes(b"data: [DONE]\n\n");
+        feed.bytes(axum::body::Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking hard about the answer\"}}]}\n\n"));
+        feed.bytes(axum::body::Bytes::from_static(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":19,\"completion_tokens\":64}}\n\n"));
+        feed.bytes(axum::body::Bytes::from_static(b"data: [DONE]\n\n"));
         feed.end();
         for _ in 0..50 {
             if !s.why(None, 10).is_empty() {
@@ -2689,9 +2693,13 @@ mod tests {
             ..RequestCtx::default()
         };
         let feed = s.begin(ctx, 200, true);
-        feed.bytes(b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n");
-        feed.bytes(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n");
-        feed.bytes(b"data: [DONE]\n\n");
+        feed.bytes(axum::body::Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        ));
+        feed.bytes(axum::body::Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+        ));
+        feed.bytes(axum::body::Bytes::from_static(b"data: [DONE]\n\n"));
         feed.end();
         for _ in 0..50 {
             if !s.why(None, 10).is_empty() {

@@ -91,12 +91,7 @@ pub async fn messages(
             &format!("invalid tools: {err}"),
         );
     }
-    let eff = state
-        .sup
-        .ps()
-        .into_iter()
-        .find(|p| p.name == model)
-        .map_or_else(|| state.config.effective_ctx(&model), |p| p.ctx);
+    let eff = crate::preflight::admission_ctx(&state, &model);
     if let Err(resp) =
         crate::preflight::enforce_prompt_fits(&state, &model, &openai_body, eff).await
     {
@@ -124,6 +119,7 @@ pub async fn messages(
         prefix,
         crate::proxy::body_needs_vision(&openai_body, false),
         false, // text surface: diffusion rows teach the images lane
+        false,
     )
     .await
     {
@@ -277,6 +273,7 @@ pub async fn count_tokens(
         None,
         false,
         false, // text surface: diffusion rows teach the images lane
+        false,
     )
     .await
     {

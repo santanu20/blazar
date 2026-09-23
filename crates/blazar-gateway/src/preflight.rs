@@ -37,6 +37,22 @@ pub fn prompt_tokens_est(body: &serde_json::Value) -> u64 {
     (bytes / 4).max(1)
 }
 
+/// Context bound for prompt-fit admission: the LIVE per-slot ctx of a
+/// resident instance when one exists (auto-fit or explicit slots may
+/// have traded the configured depth for width — e.g. 16K configured,
+/// 4x4096 compiled — and preflight must bound against what a single
+/// slot actually holds), the configured effective ctx otherwise
+/// (cold-spawn estimate). Rows whose profile has not compiled yet
+/// (ctx == 0) fall back to the config estimate.
+pub fn admission_ctx(state: &crate::state::AppState, model: &str) -> u32 {
+    state
+        .sup
+        .ps()
+        .into_iter()
+        .find(|p| p.name == model && p.ctx > 0)
+        .map_or_else(|| state.config.effective_ctx(model), |p| p.ctx)
+}
+
 /// Prompt-fit admission (K1): refuse requests that cannot fit the
 /// effective context BEFORE the kernel silently truncates them (the
 /// sentinel's most common post-hoc detection, moved to pre-hoc).

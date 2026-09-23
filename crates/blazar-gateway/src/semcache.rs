@@ -33,6 +33,9 @@ struct Entry {
     model: String,
     /// API key name that produced the entry (None = authless loopback).
     key: Option<String>,
+    /// Generation-equivalence class (see [`serving_fingerprint`]).
+    /// Similarity never crosses this boundary.
+    fingerprint: u64,
     emb: Vec<f32>,
     /// Stored response, always in `OpenAI` shape; the ollama lane
     /// re-translates on hit (same code path as a live response).
@@ -61,9 +64,9 @@ impl SemanticCache {
         map.retain(|_, e| e.expires > now);
     }
 
-    /// Best-match lookup: exact (lane, model, key) filter, then cosine
-    /// similarity ≥ threshold. Returns `(cache_id, similarity, response)`
-    /// of the best entry.
+    /// Best-match lookup: exact (lane, model, key, fingerprint) filter,
+    /// then cosine similarity ≥ threshold within that class. Returns
+    /// `(cache_id, similarity, response)` of the best entry.
     pub fn lookup(
         &self,
         lane: u8,
@@ -71,6 +74,7 @@ impl SemanticCache {
         key: Option<&str>,
         emb: &[f32],
         threshold: f32,
+        fingerprint: u64,
     ) -> Option<(u64, f32, Value)> {
         let mut map = self
             .inner
@@ -79,7 +83,11 @@ impl SemanticCache {
         Self::sweep_locked(&mut map);
         let mut best: Option<(u64, f32, f32)> = None; // (id, sim, -unused rank)
         for (id, e) in map.iter() {
-            if e.lane != lane || e.model != model || e.key.as_deref() != key {
+            if e.lane != lane
+                || e.model != model
+                || e.key.as_deref() != key
+                || e.fingerprint != fingerprint
+            {
                 continue;
             }
             let sim = cosine(emb, &e.emb);
@@ -106,6 +114,7 @@ impl SemanticCache {
         response: Value,
         ttl: Duration,
         max_entries: usize,
+        fingerprint: u64,
     ) -> u64 {
         let mut map = self
             .inner
@@ -126,6 +135,7 @@ impl SemanticCache {
                 lane,
                 model: model.to_string(),
                 key: key.map(str::to_string),
+                fingerprint,
                 emb,
                 response,
                 expires: Instant::now() + ttl,
@@ -191,6 +201,38 @@ pub struct SemCtx {
     pub directive: Directive,
     /// API key name that produced the response (None = authless loopback).
     pub key: Option<String>,
+    /// Generation-equivalence class computed from the request — must be
+    /// presented unchanged at store time so lookup and store bucket
+    /// identically.
+    pub fingerprint: u64,
+}
+
+/// Generation-equivalence fingerprint: the class key consulted BEFORE
+/// any cosine comparison. Similarity decides whether two prompts are
+/// "the same question"; this hash decides whether two requests are even
+/// the same generation problem. Requests differing in sampling options,
+/// tool schemas, tool choice, thinking directives, or the system prompt
+/// must never see each other's responses no matter how similar the
+/// prompt text is, so all of those fold into one 64-bit key.
+///
+/// Hashed from the ollama-shaped request (`options`, `tools`,
+/// `tool_choice`, `think`, `system`); the message payload itself stays
+/// out — that is what
+/// the embedding compares semantically. In-process only: entries die
+/// with the gateway, so no engine-build or version field is needed.
+#[must_use]
+pub fn serving_fingerprint(model: &str, req: &Value) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    model.hash(&mut h);
+    for field in ["options", "tools", "tool_choice", "think", "system"] {
+        req.get(field)
+            .unwrap_or(&Value::Null)
+            .to_string()
+            .hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Header names (also advertised in `/.well-known/blazar`).
@@ -323,6 +365,8 @@ pub async fn embed_prompt(
         None,
         false,
         false, // text surface: diffusion rows teach the images lane
+        true,  // captive: the cache probe must never evict generation
+               // residents; under pressure this lookup bypasses instead
     )
     .await
     .map_err(|e| format!("embed model admission failed: {e:?}"))?;
@@ -433,6 +477,9 @@ mod tests {
         assert!(directive(true, true, 600, 0.9, bad_thr).is_err());
     }
 
+    /// Shared class key for direct store/lookup calls below.
+    const FP: u64 = 7;
+
     #[test]
     fn unit__store_lookup__exact_filters_and_threshold() {
         let sc = SemanticCache::new();
@@ -445,27 +492,83 @@ mod tests {
             serde_json::json!({"a": 1}),
             Duration::from_secs(60),
             16,
+            FP,
         );
-        // exact lane+model+key, sim 1.0
+        // exact lane+model+key+class, sim 1.0
         let hit = sc
-            .lookup(LANE_OLLAMA, "m1", Some("k1"), &emb, 0.99)
+            .lookup(LANE_OLLAMA, "m1", Some("k1"), &emb, 0.99, FP)
             .unwrap();
         assert_eq!(hit.0, id);
         assert!((hit.1 - 1.0).abs() < 1e-6);
         assert_eq!(hit.2, serde_json::json!({"a": 1}));
         // different model / key / lane -> miss
         assert!(sc
-            .lookup(LANE_OLLAMA, "m2", Some("k1"), &emb, 0.5)
+            .lookup(LANE_OLLAMA, "m2", Some("k1"), &emb, 0.5, FP)
             .is_none());
         assert!(sc
-            .lookup(LANE_OLLAMA, "m1", Some("k2"), &emb, 0.5)
+            .lookup(LANE_OLLAMA, "m1", Some("k2"), &emb, 0.5, FP)
             .is_none());
-        assert!(sc.lookup(LANE_OLLAMA, "m1", None, &emb, 0.5).is_none());
+        assert!(sc.lookup(LANE_OLLAMA, "m1", None, &emb, 0.5, FP).is_none());
         // below threshold -> miss
         let orth = [0.0f32, 1.0];
         assert!(sc
-            .lookup(LANE_OLLAMA, "m1", Some("k1"), &orth, 0.5)
+            .lookup(LANE_OLLAMA, "m1", Some("k1"), &orth, 0.5, FP)
             .is_none());
+    }
+
+    #[test]
+    fn unit__store_lookup__different_class_never_hits_same_embedding() {
+        // The class gate is the whole point of the fingerprint: identical
+        // prompt text (same embedding), different generation problem ->
+        // hard miss regardless of similarity.
+        let sc = SemanticCache::new();
+        let emb = vec![1.0f32, 0.0];
+        sc.store(
+            LANE_OLLAMA,
+            "m1",
+            None,
+            emb.clone(),
+            serde_json::json!({"temp": 0}),
+            Duration::from_secs(60),
+            16,
+            FP,
+        );
+        assert!(sc
+            .lookup(LANE_OLLAMA, "m1", None, &emb, 0.0, FP + 1)
+            .is_none());
+    }
+
+    #[test]
+    fn unit__serving_fingerprint__equivalence_classes() {
+        let base = serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let fp = serving_fingerprint("m1", &base);
+        // Identical request -> identical class.
+        assert_eq!(fp, serving_fingerprint("m1", &base));
+        // Same text, different generation knobs -> different classes.
+        let mut hotter = base.clone();
+        hotter["options"] = serde_json::json!({"temperature": 0.9});
+        assert_ne!(fp, serving_fingerprint("m1", &hotter));
+        // Tools schema, thinking directive, system prompt, model: each
+        // alone must move the class key.
+        let mut tools = base.clone();
+        tools["tools"] = serde_json::json!([{"type": "function", "function": {"name": "f"}}]);
+        assert_ne!(fp, serving_fingerprint("m1", &tools));
+        let mut think = base.clone();
+        think["think"] = serde_json::json!(true);
+        assert_ne!(fp, serving_fingerprint("m1", &think));
+        let mut sys = base.clone();
+        sys["system"] = serde_json::json!("you are terse");
+        assert_ne!(fp, serving_fingerprint("m1", &sys));
+        assert_ne!(fp, serving_fingerprint("m2", &base));
+        // Message payload is deliberately outside the class key — that
+        // is the embedding's job.
+        let mut other_text = base.clone();
+        other_text["messages"] = serde_json::json!([{"role": "user", "content": "other"}]);
+        assert_eq!(fp, serving_fingerprint("m1", &other_text));
     }
 
     #[test]
@@ -480,9 +583,10 @@ mod tests {
             serde_json::json!({}),
             Duration::from_millis(0),
             16,
+            FP,
         );
         std::thread::sleep(Duration::from_millis(2));
-        assert!(sc.lookup(LANE_OLLAMA, "m", None, &emb, 0.1).is_none());
+        assert!(sc.lookup(LANE_OLLAMA, "m", None, &emb, 0.1, FP).is_none());
         assert_eq!(sc.live_len(), 0);
         // LRU: cap 2, third store evicts the least-recently-hit. Each
         // entry gets a distinct orthogonal embedding so lookups touch a
@@ -498,6 +602,7 @@ mod tests {
             json_v(1),
             Duration::from_secs(60),
             2,
+            FP,
         );
         let _e2 = sc2.store(
             1,
@@ -507,9 +612,10 @@ mod tests {
             json_v(2),
             Duration::from_secs(60),
             2,
+            FP,
         );
         std::thread::sleep(Duration::from_micros(200));
-        let _ = sc2.lookup(1, "m", None, &a, 0.99); // touches e1 only (cos(a,b)=0)
+        let _ = sc2.lookup(1, "m", None, &a, 0.99, FP); // touches e1 only (cos(a,b)=0)
         std::thread::sleep(Duration::from_micros(200));
         let _e3 = sc2.store(
             1,
@@ -519,12 +625,13 @@ mod tests {
             json_v(3),
             Duration::from_secs(60),
             2,
+            FP,
         );
-        let hit = sc2.lookup(1, "m", None, &a, 0.99).unwrap();
+        let hit = sc2.lookup(1, "m", None, &a, 0.99, FP).unwrap();
         assert_eq!(hit.2, json_v(1)); // e2 evicted (least-recently-hit)
         assert_eq!(hit.0, e1);
         // And the newest (e3, embedding b) is retrievable too.
-        let hit3 = sc2.lookup(1, "m", None, &b, 0.99).unwrap();
+        let hit3 = sc2.lookup(1, "m", None, &b, 0.99, FP).unwrap();
         assert_eq!(hit3.2, json_v(3));
     }
 
