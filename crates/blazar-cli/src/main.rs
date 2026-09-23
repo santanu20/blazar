@@ -4148,7 +4148,7 @@ async fn serve() -> Result<()> {
         Ok(lock) => lock,
         Err(e) if e.downcast_ref::<blazar_runtime::LockHeld>().is_some() => {
             eprintln!(
-                "blazar: {e:#} — another daemon owns the lock; if this is wrong, remove {}",
+                "blazar: {e:#} — if this is wrong, remove {}",
                 d.run_dir().join("blazar.pid").display()
             );
             std::process::exit(blazar_gateway::EXIT_BIND_CONFLICT);
