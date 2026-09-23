@@ -7,7 +7,7 @@
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
 
-**Current release: `0.10.0`**
+**Current release: `0.11.0`**
 
 Blazar was previously named **Pallama**. The project, binary, crates, environment variables, install paths, and public URLs now use the `blazar` name.
 
@@ -62,18 +62,18 @@ Blazar is intentionally an **orchestrator** rather than a reimplementation of mo
 
 #### Linux / macOS
 
-For the current `0.10.0` release:
+For the current `0.11.0` release:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/santanu20/blazar/v0.10.0/scripts/install.sh \
+  https://raw.githubusercontent.com/santanu20/blazar/v0.11.0/scripts/install.sh \
   | BLAZAR_REPO=santanu20/blazar sh
 ```
 
 #### Windows PowerShell
 
 ```powershell
-irm https://raw.githubusercontent.com/santanu20/blazar/v0.10.0/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/santanu20/blazar/v0.11.0/scripts/install.ps1 | iex
 ```
 
 The release binary does **not** bundle an inference engine. Install/update the engine separately:
