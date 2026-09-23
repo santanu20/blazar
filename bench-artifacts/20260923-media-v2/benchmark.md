@@ -4,7 +4,7 @@
 - **model**: `sd_xl_base_1.0.safetensors` (6616 MiB)
 - **gpu**: NVIDIA GeForce RTX 4070 Laptop GPU / driver 580.178.04
 - **engines**: b11070-cuda, b5130, master-890-74988b2, piper, v0.9.3
-- **harness**: bench_matrix v2 — `--media-only --artifacts-dir bench-artifacts/20260923-media-v2 --md /tmp/opencode/bench-media-v2.md`
+- **harness**: bench_matrix v2 — `--media-only --artifacts-dir bench-artifacts/20260923-media-v2 --md bench-artifacts/20260923-media-v2/benchmark.md`
 - **blazar**: `blazar 0.10.0` (sandbox daemon binary)
 
 ## Feature matrix
