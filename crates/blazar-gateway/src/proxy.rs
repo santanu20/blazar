@@ -146,6 +146,24 @@ pub(crate) async fn ensure_vision_detached(
         })
 }
 
+/// Captive variant of [`ensure_detached`]: the load refuses under
+/// admission pressure instead of evicting resident models. Same detach
+/// contract — the spawn (or its refusal) always runs to completion.
+pub(crate) async fn ensure_detached_captive(
+    sup: &std::sync::Arc<blazar_runtime::Supervisor>,
+    name: &str,
+) -> Result<EngineRef, SupervisionError> {
+    let sup = std::sync::Arc::clone(sup);
+    let name = name.to_string();
+    tokio::spawn(async move { sup.ensure_routed_captive(&name).await })
+        .await
+        .unwrap_or_else(|e| {
+            Err(SupervisionError::Internal(anyhow::anyhow!(
+                "captive load task panicked: {e}"
+            )))
+        })
+}
+
 /// Does this parsed chat body carry images? Shapes covered:
 ///
 /// - `OpenAI` chat: `messages[].content[]` items with an `image`-prefixed
@@ -229,6 +247,7 @@ pub(crate) async fn ensure_router_detached(
 /// every text/embedding surface passes `false` and gets a teaching 400
 /// instead of an sd-server child that 404s every chat-shaped route.
 #[allow(clippy::duration_suboptimal_units)] // 120s admission bound per plan
+#[allow(clippy::too_many_arguments)] // mirrors proxy_request: flat call params, one seam
 pub async fn ensure_with_admission(
     state: &Arc<AppState>,
     model: &str,
@@ -237,6 +256,7 @@ pub async fn ensure_with_admission(
     prefix: Option<PrefixKey>,
     needs_vision: bool,
     allow_diffusion: bool,
+    no_evict: bool,
 ) -> Result<(EngineRef, u128), Box<Response>> {
     let started = Instant::now();
     // Model resolution is the only store need; it completes inside the
@@ -275,6 +295,8 @@ pub async fn ensure_with_admission(
     > {
         if needs {
             Box::pin(ensure_vision_detached(&state.sup, lane, prefix))
+        } else if no_evict {
+            Box::pin(ensure_detached_captive(&state.sup, lane))
         } else {
             Box::pin(ensure_detached(&state.sup, lane, prefix))
         }
@@ -283,6 +305,17 @@ pub async fn ensure_with_admission(
     // (Bank restore happens inside the supervisor at spawn-readiness.)
     let engine = match first {
         Ok(ep) => ep,
+        Err(SupervisionError::AllSlotsBusy) if no_evict => {
+            // Captive loads never queue for capacity: waiting two
+            // minutes for the right to evict a generation model is
+            // exactly the side-effect a cache probe must not have.
+            // Fail fast — callers treat this as "side load skipped".
+            return Err(Box::new(openai_error(
+                503,
+                "load refused: model would need to evict resident models \
+                 (no-evict admission); retry when capacity frees up",
+            )));
+        }
         Err(SupervisionError::AllSlotsBusy) => {
             // Capacity exhausted: queue at our priority, bounded wait.
             // Report the pressure — sustained queueing is the demand
@@ -451,19 +484,21 @@ pub fn child_auth(rb: reqwest::RequestBuilder, engine: &EngineRef) -> reqwest::R
 /// in-band (H16); the circuit breaker inside `ensure_key` bounds
 /// crash-looping. `build` receives the (possibly fresh) engine ref so
 /// bodied/multipart requests are rebuilt per attempt — reqwest
-/// builders are single-use.
+/// builders are single-use. Rides [`child_send`], so the header-phase
+/// bound (and its synchronous wedged-child eviction) covers the image
+/// lanes exactly as it covers every text lane.
 pub(crate) async fn send_with_child_retry(
     state: &AppState,
     engine: &EngineRef,
     build: impl Fn(&EngineRef) -> reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, String> {
-    let first = match build(engine).send().await {
+    let first = match child_send(state, engine, build(engine).send()).await {
         Ok(r) => return Ok(r),
         Err(e) => e,
     };
     tracing::warn!(
         model = %engine.key,
-        "child transport failure ({first:#}); reaping and retrying once on a respawned lane"
+        "child send failure ({first}); reaping and retrying once on a respawned lane"
     );
     state.sup.reap_dead_children().await;
     // A WEDGED child — process alive, HTTP listener dead (observed
@@ -471,19 +506,34 @@ pub(crate) async fn send_with_child_retry(
     // running) — survives the reap, and `ensure_key`'s fast path would
     // hand the retry the SAME dead endpoint. Evict the key outright:
     // state flips to Evicted, terminate_group (TERM, then KILL) cleans
-    // the process, the map entry drops. An already-reaped key evicts
-    // as a no-op; a healthy replica that took the slot meanwhile is
-    // ptr-guarded and survives.
+    // the process, the map entry drops. A header-stall child is
+    // already gone (`child_send` evicted it synchronously) — this is
+    // the idempotent no-op side of the same guard. An already-reaped
+    // key evicts as a no-op; a healthy replica that took the slot
+    // meanwhile is ptr-guarded and survives.
     let _ = state.sup.evict(&engine.key).await;
     match ensure_key_detached(&state.sup, &engine.key).await {
-        Ok(fresh) => match build(&fresh).send().await {
+        Ok(fresh) => match child_send(state, &fresh, build(&fresh).send()).await {
             Ok(r) => Ok(r),
             Err(e2) => Err(format!(
-                "engine request failed: {first:#}; retry on respawned child: {e2:#}"
+                "engine request failed: {first}; retry on respawned child: {e2}"
             )),
         },
-        Err(re) => Err(format!("engine request failed: {first:#}; respawn: {re:#}")),
+        Err(re) => Err(format!("engine request failed: {first}; respawn: {re:#}")),
     }
+}
+
+/// Reconnect after a failed child send: reap the dead, then respawn the
+/// exact instance lane. The failing child is already gone by the time
+/// this runs — `child_send` evicts header-stalls synchronously, and
+/// transport errors mean the process died — so this is purely
+/// re-establishment, shared by every in-band retry arm.
+pub(crate) async fn respawn_lane(
+    state: &AppState,
+    key: &str,
+) -> Result<EngineRef, SupervisionError> {
+    state.sup.reap_dead_children().await;
+    ensure_key_detached(&state.sup, key).await
 }
 
 /// Crash-window variant of [`ensure_detached`]: re-ensures the exact
@@ -508,8 +558,8 @@ pub(crate) async fn ensure_key_detached(
 
 /// Child-bound send failure classes: transport errors mean the child is
 /// gone (crash-window semantics, 502); a header-phase stall means the
-/// child is ALIVE but wedged (504) — [`child_send`] has already queued
-/// it for eviction by the time this reaches a caller.
+/// child is ALIVE but wedged (504) — [`child_send`] has already evicted
+/// it synchronously by the time this reaches a caller.
 pub(crate) enum ChildSendError {
     Transport(reqwest::Error),
     HeaderTimeout { secs: u64 },
@@ -543,10 +593,14 @@ impl std::fmt::Display for ChildSendError {
 /// (observed live: a slot restore raced traffic and one /api/chat
 /// parked 300s+ pre-first-byte while the child served every later
 /// request) parks the client invisibly instead. On expiry the wedged
-/// child is queued on the J5 eviction lane (debounced reap) so later
-/// requests respawn clean. 0 disables the bound (legacy ceiling only).
+/// child is evicted SYNCHRONOUSLY here — state flip, TERM then KILL,
+/// map entry drop — because every caller that retries in-band needs the
+/// respawn to be guaranteed fresh: `ensure_key`'s fast path would hand
+/// the retry the same wedged endpoint (the async J5 eviction lane
+/// debounces 1/min per model, far too slow to gate a retry). 0 disables
+/// the bound (legacy ceiling only).
 pub(crate) async fn child_send(
-    state: &Arc<AppState>,
+    state: &AppState,
     engine: &EngineRef,
     send: impl std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
 ) -> Result<reqwest::Response, ChildSendError> {
@@ -558,9 +612,9 @@ pub(crate) async fn child_send(
                 tracing::warn!(
                     target: "blazar::proxy",
                     model = %engine.key,
-                    "child produced no response headers in {secs}s — requesting eviction (child_header_timeout_secs)"
+                    "child produced no response headers in {secs}s — evicting synchronously (child_header_timeout_secs)"
                 );
-                let _ = state.evict_tx.send(engine.key.clone());
+                let _ = state.sup.evict(&engine.key).await;
                 Err(ChildSendError::HeaderTimeout { secs })
             }
         },
@@ -628,6 +682,9 @@ pub async fn proxy_request(
     // = caller had no parse; consumers that need JSON fall back to
     // parsing `body` themselves (legacy behavior).
     parsed: Option<serde_json::Value>,
+    // Pre-admission single-flight phase (chat lanes with a parsed body
+    // acquire BEFORE slot admission so duplicates wait guard-free).
+    sf_gate: SfGate,
 ) -> Response {
     let base = child_base(&engine.endpoint);
     if base.is_empty() {
@@ -648,44 +705,58 @@ pub async fn proxy_request(
     let body = rewrite_child_model(engine, body, parsed.as_ref());
 
     // Single-flight (B8, FIX2): identical NON-STREAM chat requests
-    // coalesce AT THE CHILD-CALL BOUNDARY (admission already happened:
-    // queued duplicates are not serialized behind queue waits). Stream
-    // detection rides the same pre-parsed Value — prompt text containing
-    // `{"stream":true}` cannot fool it (real JSON, not a sniff). Neither
-    // mutation above touches the `stream` field, so the pre-parse stays
-    // authoritative for it. Bounded wait: after 5s the twin proceeds
-    // uncoalesced (long generations never serialize their duplicates
-    // indefinitely).
+    // coalesce AT THE CHILD-CALL BOUNDARY. Two acquisition phases:
+    // chat lanes that pre-acquired in `sf_gate_before_admission` (held
+    // BEFORE slot admission — duplicates wait without occupying
+    // in_flight capacity) arrive as `Held`/`TimedOut` and skip this
+    // block; everyone else takes the legacy in-function acquire after
+    // admission (queued duplicates are not serialized behind queue
+    // waits). Stream detection rides the pre-parsed Value — prompt
+    // text containing `{"stream":true}` cannot fool it (real JSON, not
+    // a sniff). Neither mutation above touches the `stream` field, so
+    // the pre-parse stays authoritative for it. Bounded wait: after 5s
+    // the twin proceeds uncoalesced (long generations never serialize
+    // their duplicates indefinitely).
     let mut sf: Option<SingleFlight> = None;
-    if state.config.singleflight && is_chat_route(path_query) && body.len() <= 32 * 1024 {
-        let asks_stream = parsed
-            .as_ref()
-            .and_then(|v| v.get("stream").and_then(serde_json::Value::as_bool))
-            .unwrap_or(false);
-        if !asks_stream {
-            let key = sentinel::singleflight_key(model, &body, false);
-            let lock = {
-                let mut map = state
-                    .singleflight
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if map.len() > 256 {
-                    map.clear(); // bounded; a cleared key elects a new leader
-                }
-                std::sync::Arc::clone(
-                    map.entry(key)
-                        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(()))),
-                )
-            };
-            if let Ok(guard) =
-                tokio::time::timeout(std::time::Duration::from_secs(5), lock.clone().lock_owned())
+    match sf_gate {
+        SfGate::Held(g) => sf = Some(g),
+        // The bounded wait already ran pre-admission; proceeding
+        // uncoalesced matches the legacy timeout outcome.
+        SfGate::TimedOut => {}
+        SfGate::Ineligible => {
+            if state.config.singleflight && is_chat_route(path_query) && body.len() <= 32 * 1024 {
+                let asks_stream = parsed
+                    .as_ref()
+                    .and_then(|v| v.get("stream").and_then(serde_json::Value::as_bool))
+                    .unwrap_or(false);
+                if !asks_stream {
+                    let key = sentinel::singleflight_key(model, &body, false);
+                    let lock =
+                        {
+                            let mut map = state
+                                .singleflight
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if map.len() > 256 {
+                                map.clear(); // bounded; a cleared key elects a new leader
+                            }
+                            std::sync::Arc::clone(map.entry(key).or_insert_with(|| {
+                                std::sync::Arc::new(tokio::sync::Mutex::new(()))
+                            }))
+                        };
+                    if let Ok(guard) = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        lock.clone().lock_owned(),
+                    )
                     .await
-            {
-                sf = Some(SingleFlight {
-                    key,
-                    map: std::sync::Arc::clone(&state.singleflight),
-                    _guard: guard,
-                });
+                    {
+                        sf = Some(SingleFlight {
+                            key,
+                            map: std::sync::Arc::clone(&state.singleflight),
+                            _guard: guard,
+                        });
+                    }
+                }
             }
         }
     }
@@ -707,12 +778,8 @@ pub async fn proxy_request(
                         target: "blazar::proxy",
                         model,
                         trace = ?trace,
-                        "child produced no response headers in {secs}s — requesting eviction and retrying once in-band (child_header_timeout_secs)"
+                        "child produced no response headers in {secs}s — evicting synchronously, retrying once in-band (child_header_timeout_secs)"
                     );
-                    // reap_dead_children only touches DEAD pids; a wedged
-                    // child is alive — fire the J5 eviction lane (debounced
-                    // 1/min per model) so it does not poison later requests.
-                    let _ = state.evict_tx.send(engine.key.clone());
                     StatusCode::GATEWAY_TIMEOUT
                 }
                 ChildSendError::Transport(_) => {
@@ -725,9 +792,11 @@ pub async fn proxy_request(
             // and retry ONCE in-band — single-shot clients (run
             // --verbose) otherwise eat a 502 for a child they never
             // got to talk to. The circuit breaker inside `ensure_key`
-            // bounds crash-looping; exactly one retry (H16).
-            state.sup.reap_dead_children().await;
-            match ensure_key_detached(&state.sup, &engine.key).await {
+            // bounds crash-looping; exactly one retry (H16). A WEDGED
+            // child — process alive, HTTP listener silent — was already
+            // evicted synchronously inside `child_send` before this
+            // error surfaced; the respawn is guaranteed a fresh lane.
+            match respawn_lane(state, &engine.key).await {
                 Ok(fresh) => {
                     let fresh_url = format!("{}{path_query}", child_base(&fresh.endpoint));
                     tracing::warn!(
@@ -954,7 +1023,7 @@ pub async fn proxy_request(
                         .observe_secs((now - last_chunk).as_secs_f64());
                 }
                 last_chunk = now;
-                sentinel_feed.bytes(bytes.as_ref());
+                sentinel_feed.bytes(bytes.clone());
                 tap_map.push(bytes.as_ref());
                 if let Some(s) = sniffer_finisher.lock().expect("sniffer").0.as_mut() {
                     s.push(bytes.as_ref());
@@ -1009,12 +1078,82 @@ pub async fn proxy_request(
 /// Single-flight token: held from child-call to response-stream end
 /// (FIX2 — the guard rides the SAME drop chain as the in-flight guard,
 /// so clean drains, client aborts, and early errors all release it).
-struct SingleFlight {
+pub struct SingleFlight {
     key: u64,
     map: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<u64, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     >,
     _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+/// Result of the pre-admission single-flight phase (see
+/// `sf_gate_before_admission`). Handed straight to `proxy_request`,
+/// which skips its internal acquire for `Held`/`TimedOut` — re-locking
+/// the same entry from the same task would deadlock (tokio mutexes are
+/// not reentrant), and a timed-out waiter must not pay a second 5s.
+pub enum SfGate {
+    /// Not eligible (config off / non-chat route / stream / oversized
+    /// body): `proxy_request`'s legacy internal block stays the owner.
+    Ineligible,
+    /// Waited (bounded) and now holding the single-flight: the caller
+    /// may proceed to slot admission; duplicates coalesce behind this.
+    Held(SingleFlight),
+    /// Eligible but the bounded wait expired while the leader was still
+    /// generating: proceed uncoalesced, exactly as the legacy in-function
+    /// path does after its own 5s timeout.
+    TimedOut,
+}
+
+/// Single-flight BEFORE slot admission: the bounded coalescing wait
+/// runs while the caller holds NO `InFlightGuard`, so identical
+/// duplicates do not occupy gateway slots (`in_flight` capacity, queue
+/// headroom) while merely waiting for the leader. Eligibility mirrors
+/// `proxy_request`'s internal block exactly — same route check, size
+/// cap, stream bit, and key material — so the two phases always agree
+/// on ownership. The key folds the pre-mutation body here (the handler
+/// runs before `inject_include_usage`/`rewrite_child_model`); the
+/// legacy block folds the post-mutation body. Twins hashing identically
+/// within their own phase is what matters — the two key spaces never
+/// mix for one request because `Held`/`TimedOut` bypass the internal
+/// acquire.
+pub(crate) async fn sf_gate_before_admission(
+    state: &Arc<AppState>,
+    model: &str,
+    path_query: &str,
+    body: &[u8],
+    parsed: Option<&serde_json::Value>,
+) -> SfGate {
+    if !(state.config.singleflight && is_chat_route(path_query) && body.len() <= 32 * 1024) {
+        return SfGate::Ineligible;
+    }
+    let asks_stream = parsed
+        .and_then(|v| v.get("stream").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false);
+    if asks_stream {
+        return SfGate::Ineligible;
+    }
+    let key = sentinel::singleflight_key(model, body, false);
+    let lock = {
+        let mut map = state
+            .singleflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.len() > 256 {
+            map.clear(); // bounded; a cleared key elects a new leader
+        }
+        std::sync::Arc::clone(
+            map.entry(key)
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(5), lock.lock_owned()).await {
+        Ok(guard) => SfGate::Held(SingleFlight {
+            key,
+            map: std::sync::Arc::clone(&state.singleflight),
+            _guard: guard,
+        }),
+        Err(_) => SfGate::TimedOut,
+    }
 }
 
 // F31: Drop-safe release — client aborts drop the unfold future before
