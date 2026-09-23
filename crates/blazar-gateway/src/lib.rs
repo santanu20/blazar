@@ -25,6 +25,8 @@ pub mod sentinel;
 pub mod sessions;
 pub mod state;
 pub mod translate;
+pub mod vram;
+
 pub mod tts;
 pub mod whisper;
 

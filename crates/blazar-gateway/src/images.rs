@@ -72,6 +72,219 @@ fn is_plain_generation_request(v: &serde_json::Value) -> bool {
 /// control keys drop; every other key — including whole subtrees like
 /// `guidance`, `cache`, `lora`, `vae_tiling_params` — rides verbatim,
 /// so upstream-additive fields need no translator change.
+
+// ---- video scratch budget (submit-time VRAM gate) ---------------------
+//
+// Calibrated 2026-09-23 on a quiet 8 GiB box (wan2.1 1.3B bf16 trio,
+// --offload-to-cpu, steps=8, warm child): child peak minus warm baseline
+// is FLAT ≈ 3.0 GiB from 5 to 33 frames at 320x320 (DiT token count
+// 800 -> 3600) and ≈ 3.5 GiB at 512x512 — the constant is the umt5-xxl
+// staging pass plus the VAE working set, not attention matrices. A 13
+// frame 512x512 request dies deterministically upstream at that same
+// 3.0 GiB ("generate_video returned no results", child alive) — NOT a
+// VRAM signature, so the gate lets it through and the child's own
+// failure answers. Beyond the 33-frame calibration horizon the floor
+// scales linearly with frames: conservative on purpose, and the 400 it
+// produces names every lever.
+
+/// Measured warm-child scratch floor at or below the 320x320 reference.
+const VIDEO_SCRATCH_FLOOR_MIB: u64 = 3_050;
+/// Extra scratch per pixel of frame area beyond the reference — fit
+/// from the 512x512 point (+510 MiB over 161k px²).
+const VIDEO_SCRATCH_AREA_MIB_PER_PX2: f64 = 3.17e-3;
+const VIDEO_SCRATCH_REF_AREA_PX2: u64 = 320 * 320;
+/// Unmodeled working set (driver, allocator granularity, first-touch).
+const VIDEO_SCRATCH_HEDGE_MIB: u64 = 192;
+/// The measured numbers are pass/fail lower bounds; the gate sells
+/// estimates, so it never undersells the measured failure edge.
+const VIDEO_SCRATCH_SAFETY: f64 = 1.25;
+/// Highest frame count with a measured pass; the floor scales linearly
+/// past it instead of pretending flatness holds forever.
+const VIDEO_SCRATCH_CALIBRATED_FRAMES: u64 = 33;
+/// Warm wan-trio residency (child idle, weights staged) — charged only
+/// when no warm child exists yet, because a cold spawn lands on the
+/// same card the scratch will claim.
+const VIDEO_CHILD_WEIGHTS_STAGED_MIB: u64 = 2_800;
+/// Leave the driver and desktop a slice; foreign tenants grow too.
+const VIDEO_VRAM_HEADROOM_FRACTION: f64 = 0.95;
+/// Default frame geometry when the request names none — the child's own
+/// 512x512 default, which is also the conservative estimate.
+const VIDEO_DEFAULT_SIZE: (u64, u64) = (512, 512);
+
+/// Wan's temporal grid: the engine aligns DOWN to 4k+1 frames (1, 5,
+/// 9, 13, ...) before generating — verified live: a `video_frames:4`
+/// request renders one frame and a 16-frame duration render delivered
+/// 13. The gate prices what the child will actually render.
+fn align_wan_frames(frames: u64) -> u64 {
+    if frames <= 1 {
+        1
+    } else {
+        4 * ((frames - 1) / 4) + 1
+    }
+}
+
+struct VideoScratchEstimate {
+    estimate_mib: u64,
+    aligned_frames: u64,
+}
+
+fn estimate_video_scratch(
+    frames: u64,
+    width: u64,
+    height: u64,
+    cold_child: bool,
+) -> VideoScratchEstimate {
+    let aligned = align_wan_frames(frames);
+    let frame_scale = (aligned as f64 / VIDEO_SCRATCH_CALIBRATED_FRAMES as f64).max(1.0);
+    let area = width * height;
+    let area_term = if area > VIDEO_SCRATCH_REF_AREA_PX2 {
+        ((area - VIDEO_SCRATCH_REF_AREA_PX2) as f64) * VIDEO_SCRATCH_AREA_MIB_PER_PX2
+    } else {
+        0.0
+    };
+    // Weights residency is deterministic (known model files), so it is added
+    // linearly; only the measured-scratch terms carry the uncertainty safety
+    // multiplier — stacking safety on weights over-rejects cold spawns that
+    // demonstrably fit (live 5f@320 on an 8 GiB box).
+    let weights = if cold_child { VIDEO_CHILD_WEIGHTS_STAGED_MIB } else { 0 };
+    let raw = VIDEO_SCRATCH_FLOOR_MIB as f64 * frame_scale
+        + area_term
+        + VIDEO_SCRATCH_HEDGE_MIB as f64;
+    VideoScratchEstimate {
+        estimate_mib: (raw * VIDEO_SCRATCH_SAFETY).ceil() as u64 + weights,
+        aligned_frames: aligned,
+    }
+}
+
+/// Parse `size` ("WxH") for the gate; absent or unparseable sizes take
+/// the child's 512x512 default — the conservative side of the estimate.
+fn gate_size(v: &serde_json::Value) -> (u64, u64) {
+    v.get("size")
+        .and_then(|s| s.as_str())
+        .and_then(|s| s.split_once('x'))
+        .and_then(|(w, h)| {
+            let w = w.trim().parse::<u64>().ok()?;
+            let h = h.trim().parse::<u64>().ok()?;
+            Some((w, h))
+        })
+        .filter(|(w, h)| *w > 0 && *h > 0)
+        .unwrap_or(VIDEO_DEFAULT_SIZE)
+}
+
+/// Submit-time gate: refuse video requests whose measured scratch
+/// envelope cannot fit the card's FREE memory right now (a warm child's
+/// weights are already inside "used", a cold spawn's are not). `Ok(())`
+/// when the request may proceed — including on boxes without an
+/// nvidia-smi census, where the runtime's spawn heuristic still guards
+/// weights and the request rides through.
+fn video_scratch_gate(parsed: &serde_json::Value, model: &str, state: &AppState) -> Result<(), String> {
+    if parsed.get("vram_overcommit").and_then(|v| v.as_bool()) == Some(true) {
+        // Operator's explicit call: attempt it anyway; the child's own
+        // failure (or success) answers. No silent path — the audit log
+        // carries the request that used the lever.
+        return Ok(());
+    }
+    let Some(free) = crate::vram::free_vram_mib(std::time::Duration::from_secs(5)) else {
+        return Ok(());
+    };
+    let (w, h) = gate_size(parsed);
+    let frames = parsed
+        .get("video_frames")
+        .and_then(|f| f.as_u64())
+        .unwrap_or(1);
+    let cold = live_sdcpp_children(state, Some(model)).is_empty();
+    let est = estimate_video_scratch(frames, w, h, cold);
+    let budget = (free as f64 * VIDEO_VRAM_HEADROOM_FRACTION) as u64;
+    if est.estimate_mib > budget {
+        let spawn_note = if cold {
+            format!(" + ~{VIDEO_CHILD_WEIGHTS_STAGED_MIB} MiB weights (cold spawn)")
+        } else {
+            String::new()
+        };
+        return Err(format!(
+            "video request would exceed free VRAM: scratch ≈ {} MiB ({} aligned frames at \
+             {w}x{h}{spawn_note}, safety ×{VIDEO_SCRATCH_SAFETY}) vs {budget} MiB free of \
+             {free} (95% headroom rule). Levers: fewer frames (video_frames/duration), \
+             smaller size, free GPU memory held by other processes, or \
+             \"vram_overcommit\": true to force the attempt",
+            est.estimate_mib, est.aligned_frames,
+        ));
+    }
+    Ok(())
+}
+
+/// Canonicalize the video frame-count vocabulary onto the child's
+/// native knob. sd-server's `vid_gen` field is `video_frames`; clients
+/// raised on OpenAI-ish surfaces reach for `frames` or `num_frames`,
+/// and the verbatim passthrough below would let those ride past the
+/// child unheard (one-frame videos, no error — verified live against
+/// sd-server master-890). `duration` seconds (the REPL's `/duration`
+/// knob) joins the vocabulary as `duration` × `fps` frames — sd-server
+/// has no duration field, so an untranslated knob is the same silent
+/// one-frame no-op. Contradictory specs fail loud instead of picking a
+/// silent winner.
+fn canonicalize_video_frames(v: &mut serde_json::Value) -> Result<(), String> {
+    const NATIVE: &str = "video_frames";
+    const SYNONYMS: [&str; 2] = ["frames", "num_frames"];
+    // sd-server's vid_gen default sample rate: every live job answered
+    // `fps: 16` and the server's own defaults catalog carries 16.
+    const DEFAULT_FPS: u64 = 16;
+
+    let Some(obj) = v.as_object_mut() else {
+        return Ok(());
+    };
+
+    let mut specs: Vec<(&str, u64)> = Vec::new();
+    for key in SYNONYMS.iter().copied().chain(std::iter::once(NATIVE)) {
+        if let Some(val) = obj.get(key).cloned() {
+            let n = val
+                .as_u64()
+                .filter(|n| *n >= 1)
+                .ok_or_else(|| format!("{key} must be a positive integer (got {val})"))?;
+            specs.push((key, n));
+        }
+    }
+
+    // `duration` seconds (the REPL's `/duration` knob): sd-server has no
+    // duration field, so the knob translates to `duration` x `fps`
+    // frames here — an untranslated ride past the child is the same
+    // silent one-frame no-op the synonyms above would suffer.
+    if let Some(val) = obj.get("duration").cloned() {
+        let fps = obj
+            .get("fps")
+            .and_then(|f| f.as_u64().filter(|f| *f >= 1))
+            .unwrap_or(DEFAULT_FPS);
+        let secs = val
+            .as_f64()
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .ok_or_else(|| format!("duration must be a positive number of seconds (got {val})"))?;
+        obj.remove("duration");
+        let frames = ((secs * fps as f64).round() as u64).max(1);
+        specs.push(("duration", frames));
+    }
+
+    if specs.is_empty() {
+        return Ok(());
+    }
+    let values: std::collections::BTreeSet<u64> = specs.iter().map(|s| s.1).collect();
+    if values.len() > 1 {
+        let named = specs
+            .iter()
+            .map(|(k, n)| format!("{k}={n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "conflicting frame specs ({named}): send one — the native field is {NATIVE}"
+        ));
+    }
+    let n = specs[0].1;
+    for key in SYNONYMS.iter().copied().chain(std::iter::once(NATIVE)) {
+        obj.remove(key);
+    }
+    obj.insert(NATIVE.to_string(), serde_json::json!(n));
+    Ok(())
+}
+
 fn translate_to_native(v: &serde_json::Value, video: bool) -> serde_json::Value {
     let mut out = serde_json::Map::new();
     let Some(obj) = v.as_object() else {
@@ -339,6 +552,7 @@ pub async fn generations(
         None,
         false, // images: no mmproj lane — the vision encoder rides argv
         true,  // images lane: component sets are its cargo
+        false,
     )
     .await
     {
@@ -450,7 +664,7 @@ pub async fn video_generations(
     if let Err(resp) = admit_or_respond(&state, key_ext.as_ref(), &model) {
         return *resp;
     }
-    let parsed: serde_json::Value = match serde_json::from_slice(&body) {
+    let mut parsed: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return openai_error(400, &format!("invalid JSON: {e}")),
     };
@@ -460,6 +674,16 @@ pub async fn video_generations(
         .is_none_or(str::is_empty)
     {
         return openai_error(400, "\"prompt\" must be a non-empty string");
+    }
+    if let Err(msg) = canonicalize_video_frames(&mut parsed) {
+        return openai_error(400, &msg);
+    }
+    if let Err(msg) = video_scratch_gate(&parsed, &model, &state) {
+        return openai_error(400, &msg);
+    }
+    // The lever is gateway-only vocabulary; it never rides to the child.
+    if let Some(obj) = parsed.as_object_mut() {
+        obj.remove("vram_overcommit");
     }
     let row = state
         .with_store(|s| resolve_model(s, &model).ok())
@@ -476,6 +700,7 @@ pub async fn video_generations(
         None,
         false,
         true, // videos lane: component sets are its cargo
+        false,
     )
     .await
     {
@@ -539,6 +764,7 @@ pub async fn edits(
         None,
         false,
         true, // images lane: component sets are its cargo
+        false,
     )
     .await
     {
@@ -1046,6 +1272,175 @@ mod tests {
         };
         assert!(msg.contains("image diffusion family"), "{msg}");
         assert!(msg.contains("/v1/videos/generations"), "{msg}");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__canonicalize_video_frames__synonyms_map_to_native() {
+        let mut v = serde_json::json!({"model": "wan", "frames": 33, "fps": 16});
+        canonicalize_video_frames(&mut v).unwrap();
+        assert_eq!(v["video_frames"], serde_json::json!(33));
+        assert!(v.get("frames").is_none());
+
+        let mut v = serde_json::json!({"num_frames": 16});
+        canonicalize_video_frames(&mut v).unwrap();
+        assert_eq!(v["video_frames"], serde_json::json!(16));
+        assert!(v.get("num_frames").is_none());
+
+        // Agreeing duplicates collapse; disagreeing ones never get here.
+        let mut v = serde_json::json!({"frames": 8, "num_frames": 8});
+        canonicalize_video_frames(&mut v).unwrap();
+        assert_eq!(v["video_frames"], serde_json::json!(8));
+        assert!(v.get("frames").is_none() && v.get("num_frames").is_none());
+
+        // The REPL's /duration knob: seconds x fps -> video_frames. The
+        // child's default fps is 16 when the request carries none.
+        let mut v = serde_json::json!({"duration": 2});
+        canonicalize_video_frames(&mut v).unwrap();
+        assert_eq!(v["video_frames"], serde_json::json!(32));
+        assert!(v.get("duration").is_none());
+
+        let mut v = serde_json::json!({"duration": 2, "fps": 8});
+        canonicalize_video_frames(&mut v).unwrap();
+        assert_eq!(v["video_frames"], serde_json::json!(16));
+        assert_eq!(v["fps"], serde_json::json!(8), "fps is a real child field — it rides");
+
+        // Fractional seconds round; sub-frame durations clamp to one.
+        let mut v = serde_json::json!({"duration": 0.5});
+        canonicalize_video_frames(&mut v).unwrap();
+        assert_eq!(v["video_frames"], serde_json::json!(8));
+        let mut v = serde_json::json!({"duration": 0.01});
+        canonicalize_video_frames(&mut v).unwrap();
+        assert_eq!(v["video_frames"], serde_json::json!(1));
+
+        // A duration that agrees with an explicit spec collapses.
+        let mut v = serde_json::json!({"frames": 32, "duration": 2});
+        canonicalize_video_frames(&mut v).unwrap();
+        assert_eq!(v["video_frames"], serde_json::json!(32));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__canonicalize_video_frames__native_verbatim_and_absent_ok() {
+        let mut v = serde_json::json!({"video_frames": 33});
+        canonicalize_video_frames(&mut v).unwrap();
+        assert_eq!(v["video_frames"], serde_json::json!(33));
+
+        let mut v = serde_json::json!({"model": "wan", "prompt": "p"});
+        canonicalize_video_frames(&mut v).unwrap();
+        assert!(v.get("video_frames").is_none());
+
+        let mut v = serde_json::json!(["not", "an", "object"]);
+        canonicalize_video_frames(&mut v).unwrap();
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__canonicalize_video_frames__conflict_and_type_errors_teach() {
+        let mut v = serde_json::json!({"frames": 33, "video_frames": 16});
+        let err = canonicalize_video_frames(&mut v).unwrap_err();
+        assert!(err.contains("frames=33") && err.contains("video_frames=16"), "{err}");
+
+        let mut v = serde_json::json!({"frames": "33"});
+        assert!(canonicalize_video_frames(&mut v)
+            .unwrap_err()
+            .contains("positive integer"));
+
+        let mut v = serde_json::json!({"frames": 0});
+        assert!(canonicalize_video_frames(&mut v)
+            .unwrap_err()
+            .contains("positive integer"));
+
+        // duration joins the conflict vocabulary; fps itself stays.
+        let mut v = serde_json::json!({"frames": 33, "duration": 1});
+        let err = canonicalize_video_frames(&mut v).unwrap_err();
+        assert!(err.contains("frames=33") && err.contains("duration=16"), "{err}");
+
+        let mut v = serde_json::json!({"duration": -1});
+        assert!(canonicalize_video_frames(&mut v)
+            .unwrap_err()
+            .contains("positive number of seconds"));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__align_wan_frames__temporal_grid() {
+        // 4k+1 grid, aligned DOWN (live: 4 renders 1; a 16-frame
+        // duration render delivered 13).
+        for (asked, aligned) in [
+            (1, 1),
+            (2, 1),
+            (4, 1),
+            (5, 5),
+            (13, 13),
+            (16, 13),
+            (33, 33),
+            (34, 33),
+            (960, 957),
+        ] {
+            assert_eq!(align_wan_frames(asked), aligned, "asked={asked}");
+        }
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__estimate_video_scratch__matches_measured_envelope() {
+        // Warm 320x320 points (5/13/33 frames) all measured ≈ 3017 MiB
+        // scratch; the gate's estimate must sit above the pass floor and
+        // below the 5.3 GiB that was free when they passed.
+        let warm_320 = estimate_video_scratch(33, 320, 320, false);
+        assert_eq!(warm_320.aligned_frames, 33);
+        assert!(
+            (3_900..=4_200).contains(&warm_320.estimate_mib),
+            "got {}",
+            warm_320.estimate_mib
+        );
+
+        // Warm 512x512: 5-frame pass measured 3527 MiB; 13f@512 is an
+        // upstream no-results bug at the same memory, not VRAM — the
+        // estimate must stay under a quiet box's ~5.3 GiB so the gate
+        // does not steal blame from the child's own failure.
+        let warm_512 = estimate_video_scratch(13, 512, 512, false);
+        assert!(
+            (4_400..=4_900).contains(&warm_512.estimate_mib),
+            "got {}",
+            warm_512.estimate_mib
+        );
+
+        // The original hard-OOM repro lane: 16 frames at 512 against
+        // ~3.8 GiB free (a foreign tenant holding 4.1 of 8 GiB). Aligned
+        // down to 13 the estimate must still exceed that budget.
+        let sixteen = estimate_video_scratch(16, 512, 512, false);
+        assert_eq!(sixteen.aligned_frames, 13);
+        assert!(sixteen.estimate_mib > 3_800, "got {}", sixteen.estimate_mib);
+
+        // Beyond the 33-frame calibration horizon the floor scales: a
+        // 60-second /duration default-fps request (961 aligned frames)
+        // must price out of any 8 GiB card, cold or warm.
+        let long = estimate_video_scratch(960, 320, 320, false);  // 957 aligned after floor
+        assert!(long.estimate_mib > 100_000, "got {}", long.estimate_mib);
+
+        // A cold spawn charges the staged weights on top — exactly the
+        // deterministic weight size, unscaled by the scratch safety factor.
+        let cold = estimate_video_scratch(5, 320, 320, true);
+        let warm = estimate_video_scratch(5, 320, 320, false);
+        let delta = cold.estimate_mib as f64 - warm.estimate_mib as f64;
+        assert!((2_700.0..=2_900.0).contains(&delta), "cold delta {delta}");
+        // And the live regression that motivated the split: 5f@320 cold
+        // must fit a quiet 8 GiB card's 95% budget (~7.4 GiB).
+        assert!(cold.estimate_mib <= 7_400, "got {}", cold.estimate_mib);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__gate_size__parses_and_defaults_conservatively() {
+        assert_eq!(gate_size(&serde_json::json!({"size": "320x320"})), (320, 320));
+        assert_eq!(gate_size(&serde_json::json!({"size": "640x480"})), (640, 480));
+        // Absent / malformed / zero dims fall back to the child's own
+        // default — the bigger, conservative side.
+        assert_eq!(gate_size(&serde_json::json!({})), (512, 512));
+        assert_eq!(gate_size(&serde_json::json!({"size": "big"})), (512, 512));
+        assert_eq!(gate_size(&serde_json::json!({"size": "0x0"})), (512, 512));
     }
 
     #[test]

@@ -289,6 +289,35 @@ pub fn gpu_compute_tenants() -> Option<Vec<GpuTenant>> {
     Some(parse_gpu_tenants(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// Pure parser for the single-column `memory.free` census (MiB per line,
+/// one per GPU). Empty/unparseable output is `None` — never a guessed 0.
+fn sum_free_mib_csv(text: &str) -> Option<u64> {
+    let total = text
+        .lines()
+        .filter_map(|ln| ln.trim().parse::<u64>().ok())
+        .sum::<u64>();
+    (total > 0).then_some(total)
+}
+
+/// Fresh free VRAM (MiB, summed across NVIDIA cards — matching
+/// `Hardware::free_vram_mib` semantics on single-card boxes). Used by the
+/// gateway's submit-time scratch gate, where a spawn-time snapshot is too
+/// stale: a foreign tenant (another product's server) can grab the card
+/// between spawn and submit. `None` when the tool is absent or fails —
+/// callers treat that as "no gate data", never as zero headroom.
+#[must_use]
+pub fn nvidia_free_vram_mib() -> Option<u64> {
+    let out = probe_output(
+        std::process::Command::new("nvidia-smi")
+            .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"]),
+        5,
+    )?;
+    if !out.status.success() {
+        return None;
+    }
+    sum_free_mib_csv(&String::from_utf8_lossy(&out.stdout))
+}
+
 /// sysinfo half + caller-supplied GPU list: the composition point for a
 /// LIVE `--list-devices` census (see `engine::manifest::run_list_devices`).
 #[must_use]
@@ -386,6 +415,14 @@ pub fn pci_gpu_vendors() -> Vec<String> {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__sum_free_mib_csv__sums_and_rejects_empty() {
+        assert_eq!(sum_free_mib_csv("7790\n"), Some(7_790));
+        assert_eq!(sum_free_mib_csv("100\n200\n"), Some(300));
+        assert_eq!(sum_free_mib_csv(""), None);
+        assert_eq!(sum_free_mib_csv("not-a-number\n"), None);
+    }
 
     #[test]
     fn unit__probe_hardware__merges_sysinfo_and_devices() {
