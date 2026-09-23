@@ -35,6 +35,13 @@ use blazar_runtime::{LlamaCppEngine, MistralRsEngine, Supervisor};
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+
+    /// When to emit ANSI accents: `auto` colors only interactive
+    /// terminals (honoring `NO_COLOR` and `TERM=dumb`), `always` forces
+    /// color on, `never` forces plain bytes for scripted consumption
+    /// [default: auto]
+    #[arg(long, value_enum, default_value_t = ColorWhen::Auto, global = true)]
+    color: ColorWhen,
 }
 
 #[derive(Subcommand)]
@@ -868,6 +875,7 @@ fn main() {
         return;
     }
     let cli = Cli::parse();
+    set_color_override(cli.color);
     // Peek log_level from the config file WITHOUT creating it
     // (Config::load writes a fresh file when absent; a plain read must not).
     let log_level = std::fs::read_to_string(dirs().config_file())
@@ -4843,15 +4851,38 @@ fn render_list_table(header: [&str; 8], rows: &[[String; 8]]) -> String {
     out.trim_end().to_string()
 }
 
+/// `--color` policy: `Auto` keeps the terminal detection in
+/// [`cli_colors`], `Always`/`Never` are explicit user overrides
+/// (`Always` deliberately beats `NO_COLOR` — the user just asked).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+enum ColorWhen {
+    Auto,
+    Always,
+    Never,
+}
+
+static COLOR_OVERRIDE: std::sync::OnceLock<ColorWhen> = std::sync::OnceLock::new();
+
+fn set_color_override(when: ColorWhen) {
+    let _ = COLOR_OVERRIDE.set(when);
+}
+
 /// ANSI accents for interactive use only: piped/redirected output stays
-/// byte-stable for scripts, and `NO_COLOR` / `TERM=dumb` disable the codes.
+/// byte-stable for scripts, and `NO_COLOR` / `TERM=dumb` disable the
+/// codes. An explicit `--color` flag overrides all of it.
 fn cli_colors() -> bool {
     use std::io::IsTerminal as _;
-    std::io::stdout().is_terminal()
-        && std::env::var_os("NO_COLOR").is_none()
-        && std::env::var("TERM")
-            .as_deref()
-            .is_ok_and(|t| !t.eq_ignore_ascii_case("dumb"))
+    match COLOR_OVERRIDE.get() {
+        Some(ColorWhen::Always) => true,
+        Some(ColorWhen::Never) => false,
+        _ => {
+            std::io::stdout().is_terminal()
+                && std::env::var_os("NO_COLOR").is_none()
+                && std::env::var("TERM")
+                    .as_deref()
+                    .is_ok_and(|t| !t.eq_ignore_ascii_case("dumb"))
+        }
+    }
 }
 
 /// Adaptive-width table shared by `search` and `engine list` — the same
