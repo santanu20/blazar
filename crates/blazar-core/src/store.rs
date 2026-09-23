@@ -16,7 +16,7 @@ pub struct Store {
     conn: Connection,
 }
 
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 7;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -72,7 +72,13 @@ CREATE TABLE IF NOT EXISTS bench_history (
     model TEXT NOT NULL,
     tg_tokens_per_sec REAL NOT NULL, -- llama-bench tg128 median
     pp_tokens_per_sec REAL NOT NULL DEFAULT 0,
-    ctx   INTEGER NOT NULL DEFAULT 0
+    ctx   INTEGER NOT NULL DEFAULT 0,
+    kind  TEXT NOT NULL DEFAULT 'llamacpp', -- lane that produced the row
+    ttft_ms REAL,                    -- HTTP lane: first-token latency
+    gen_tps REAL,                    -- HTTP lane: generation t/s (usage)
+    prompt_tps REAL,                 -- HTTP lane: prompt t/s (usage)
+    images_per_sec REAL,             -- HTTP image lane: images/s
+    detail TEXT                      -- HTTP lane: probe params JSON
 );
 ";
 
@@ -89,6 +95,26 @@ pub struct EngineRow {
     /// the column existed deserialize as `llamacpp` (serde default).
     #[serde(default)]
     pub kind: crate::engine_kind::EngineKind,
+}
+
+/// One HTTP-lane bench measurement (non-llamacpp engines: prompt/tg via
+/// streaming + usage stats, images via time-to-image). Fields the lane
+/// did not measure stay `None` — the image lane has no TTFT, the text
+/// lane has no images/s.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HttpBenchRecord {
+    /// Serving kind that produced the row (schema default `llamacpp`
+    /// keeps legacy rows readable without a join).
+    pub kind: String,
+    pub engine_tag: String,
+    pub model: String,
+    pub ttft_ms: Option<f64>,
+    pub gen_tps: Option<f64>,
+    pub prompt_tps: Option<f64>,
+    pub images_per_sec: Option<f64>,
+    /// Probe parameters (reps, `max_tokens`, size/steps) so a stored row
+    /// is reproducible without reading the code that wrote it.
+    pub detail_json: Option<String>,
 }
 
 impl EngineRow {
@@ -328,6 +354,30 @@ impl Store {
                 for col in ["vae_path", "llm_path", "llm_vision_path"] {
                     self.conn
                         .execute(&format!("ALTER TABLE models DROP COLUMN {col}"), [])?;
+                }
+            }
+            // v6→v7: bench_history grew HTTP-lane columns (kind + probe
+            // metrics). Fresh databases get them from SCHEMA_SQL; v6
+            // databases take additive ALTERs and keep every legacy row
+            // (NULL metrics mark rows the llama-bench lane wrote).
+            let bench_cols = self.table_columns("bench_history")?;
+            if !bench_cols.contains(&"kind".to_string()) {
+                self.conn.execute(
+                    "ALTER TABLE bench_history ADD COLUMN kind TEXT NOT NULL DEFAULT 'llamacpp'",
+                    [],
+                )?;
+                for col in [
+                    "ttft_ms REAL",
+                    "gen_tps REAL",
+                    "prompt_tps REAL",
+                    "images_per_sec REAL",
+                    "detail TEXT",
+                ] {
+                    let (name, ty) = col.split_once(' ').unwrap_or((col, "TEXT"));
+                    self.conn.execute(
+                        &format!("ALTER TABLE bench_history ADD COLUMN {name} {ty}"),
+                        [],
+                    )?;
                 }
             }
             self.conn
@@ -621,6 +671,31 @@ impl Store {
             "INSERT INTO bench_history (ts, engine_tag, model, tg_tokens_per_sec, pp_tokens_per_sec, ctx) \
              VALUES (unixepoch(), ?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![engine_tag, model, tg, pp, ctx],
+        )?;
+        Ok(())
+    }
+
+    /// One HTTP-lane probe outcome. `tg_tokens_per_sec` mirrors
+    /// `gen_tps` so the latest-bench readers stay meaningful across
+    /// lanes; the kind + detail columns carry what the llama-bench row
+    /// never had (dialect, probe parameters, TTFT).
+    pub fn record_http_bench(&self, rec: &HttpBenchRecord) -> CoreResult<()> {
+        self.conn.execute(
+            "INSERT INTO bench_history \
+             (ts, engine_tag, model, tg_tokens_per_sec, pp_tokens_per_sec, ctx, \
+              kind, ttft_ms, gen_tps, prompt_tps, images_per_sec, detail) \
+             VALUES (unixepoch(), ?1, ?2, ?3, 0, 0, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                rec.engine_tag,
+                rec.model,
+                rec.gen_tps.unwrap_or(0.0),
+                rec.kind,
+                rec.ttft_ms,
+                rec.gen_tps,
+                rec.prompt_tps,
+                rec.images_per_sec,
+                rec.detail_json,
+            ],
         )?;
         Ok(())
     }

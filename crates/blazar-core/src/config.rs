@@ -324,6 +324,13 @@ pub struct Config {
     /// entirely (header ignored, zero overhead).
     #[serde(default = "default_session_keep_secs")]
     pub session_keep_secs: u64,
+    /// Audio lane (H8): seconds of no transcription traffic before the
+    /// lazily-spawned whisper-server child is reaped. The child respawns
+    /// on the next request (plus a model load), so this trades a small
+    /// warm-up for freeing the CPU/RAM the idle child holds. 0 keeps
+    /// the child alive until daemon teardown (the pre-reaper behavior).
+    #[serde(default = "default_whisper_idle_secs")]
+    pub whisper_idle_secs: u64,
     /// Capability-lane registry URL (curated fork lanes for GGUF
     /// architectures mainline llama.cpp can't load yet). `None` = the
     /// default registry; `Some("")` disables registry lookups entirely
@@ -1676,6 +1683,10 @@ fn default_session_keep_secs() -> u64 {
     900
 }
 
+fn default_whisper_idle_secs() -> u64 {
+    900
+}
+
 fn default_fork_retire_days() -> u64 {
     7
 }
@@ -1870,6 +1881,7 @@ impl Default for Config {
             router_max_models: 0,
             late_chunking_max_tokens: default_late_chunking_max_tokens(),
             session_keep_secs: default_session_keep_secs(),
+            whisper_idle_secs: default_whisper_idle_secs(),
             capability_registry_url: None,
             fork_retire_days: default_fork_retire_days(),
             semantic_cache: SemanticCacheConfig::default(),

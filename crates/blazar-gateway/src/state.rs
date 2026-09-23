@@ -156,9 +156,10 @@ pub struct AppState {
     pub queue: Arc<PriorityQueue>,
     /// Loopback client for child traffic + metrics scrape.
     pub http: reqwest::Client,
-    /// J5 eviction lane sender (sentinel stall + proxy header-stall both
-    /// fire through it): the consumer task in `new` debounces (1/min per
-    /// model) and reaps the wedged child.
+    /// J5 eviction lane sender (sentinel body-stall fires through it):
+    /// the consumer task in `new` debounces (1/min per model) and reaps
+    /// the wedged child. Proxy header-stall evicts synchronously in-band
+    /// instead — a debounce is too slow to gate an in-band retry.
     pub evict_tx: tokio::sync::mpsc::UnboundedSender<String>,
     /// vLLM-style evidence loop: measured at the proxy, owned by the gateway.
     pub ttft: Histogram,
@@ -185,8 +186,15 @@ pub struct AppState {
     /// chaining; bounded LRU — upstream has no storage of its own).
     pub responses: std::sync::Mutex<crate::responses::ResponsesRegistry>,
     /// Local whisper.cpp lane (H8): lazily-spawned whisper-server child
-    /// for /v1/audio/transcriptions; killed at serve teardown.
-    pub whisper: blazar_runtime::whisper::WhisperRuntime,
+    /// for /v1/audio/transcriptions; killed at serve teardown or by the
+    /// idle reaper (`whisper_idle_secs`). Arc so the reaper task shares
+    /// the same child slot every request path uses.
+    pub whisper: std::sync::Arc<blazar_runtime::whisper::WhisperRuntime>,
+    /// Gateway-owned async audio jobs (`"async": true` on the audio
+    /// routes): upstream /inference is sync-only, so long files run as
+    /// spawned tasks polled at /v1/audio/jobs/{id}. Bounded registry;
+    /// jobs die with the gateway process.
+    pub audio_jobs: crate::whisper::AudioJobs,
     /// Single-flight for identical NON-STREAM requests (model + body
     /// hash): concurrent duplicates wait for the leader, then ride the
     /// leader's warm prefix instead of double-prefilling. Bounded. The
@@ -257,6 +265,20 @@ impl AppState {
         // handle seeds the per-request cache below instead of dropping.
         let store = blazar_core::Store::open(&dirs).ok();
         let keys = KeysLimiter::loaded(store.as_ref(), config.keys.clone());
+        // Audio lane: one child slot shared by request paths and the
+        // idle reaper. 0 disables the reaper (child lives until
+        // teardown — the pre-reaper behavior).
+        let whisper = std::sync::Arc::new(blazar_runtime::whisper::WhisperRuntime::new());
+        if config.whisper_idle_secs > 0 {
+            let reaper = std::sync::Arc::clone(&whisper);
+            let max_idle = std::time::Duration::from_secs(config.whisper_idle_secs);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    reaper.reap_idle(max_idle).await;
+                }
+            });
+        }
         let otlp = Arc::new(Otlp::new(&config));
         // J5: consume stall-eviction requests; a wedged child is reaped
         // (no bank — a stalled child may not answer a save request) and
@@ -311,7 +333,8 @@ impl AppState {
             keys: Arc::new(keys),
             otlp,
             responses: std::sync::Mutex::new(crate::responses::ResponsesRegistry::new()),
-            whisper: blazar_runtime::whisper::WhisperRuntime::new(),
+            whisper,
+            audio_jobs: crate::whisper::AudioJobs::new(),
             http_addr: std::sync::OnceLock::new(),
             remote_health: std::sync::Arc::default(),
             remote_affinity: std::sync::Arc::default(),
