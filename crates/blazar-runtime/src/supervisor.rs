@@ -584,6 +584,28 @@ fn pick_gpu(gpus: &[blazar_core::GpuInfo]) -> Option<(usize, bool)> {
     }
 }
 
+/// sdcpp twin of [`pick_gpu`]: choose the card from the ENGINE's own
+/// device census (registration-time `--list-devices`) and return its
+/// `--backend` token plus the display description. The CPU entry the
+/// census lists is not a placement candidate; `None` (empty census,
+/// CPU-only) leaves the profile on the blanket offload posture.
+fn pick_sd_backend_device(
+    devices: &[crate::engine::manifest::DeviceDesc],
+) -> Option<(String, String)> {
+    let gpus: Vec<blazar_core::GpuInfo> = devices
+        .iter()
+        .filter(|d| !d.name.eq_ignore_ascii_case("cpu"))
+        .map(|d| blazar_core::GpuInfo {
+            name: d.name.clone(),
+            description: d.description.clone(),
+            total_mib: d.total_mib,
+            free_mib: d.free_mib,
+        })
+        .collect();
+    let (idx, _) = pick_gpu(&gpus)?;
+    Some((gpus[idx].name.clone(), gpus[idx].description.clone()))
+}
+
 /// Last-resort auto tensor-split planning (#28c): when weights+KV exceed
 /// the best single discrete card's MEASURED free VRAM but fit the
 /// discrete cards COMBINED, return a `--tensor-split` ratio string
@@ -2838,6 +2860,11 @@ impl Supervisor {
         let mut picked_display: Option<String> = None;
         let mut sibling_devices: Vec<String> = Vec::new();
         let mut auto_split: Option<String> = None;
+        // sdcpp placement token (`--backend` module target, e.g.
+        // `Vulkan1`): deliberately NOT `picked_device` — that drives the
+        // census-keyed ledger id, and the engine's token vocabulary is a
+        // different namespace from the system census names.
+        let mut sd_backend_token: Option<String> = None;
         // Tuning overrides are consumed exactly once, ABOVE the endpoint
         // retry loop (a retry attempt used to re-read an already-removed
         // `pending_ctx` entry), because the auto-split decision below
@@ -2955,6 +2982,30 @@ impl Supervisor {
                         "integrated GPU {igpu} reported more free memory but was skipped (shared-RAM bandwidth); pin it explicitly with `devices` if intended"
                     );
                 }
+            }
+        }
+        // sdcpp placement vocabulary: sd-server has no --device flag —
+        // its `--backend` names engine-side module assignments using the
+        // engine's OWN device tokens (registration-time --list-devices
+        // census, e.g. `Vulkan1` on a vulkan build). Resolve the token
+        // with the same policy as the llamacpp pick: best free VRAM
+        // among discrete devices. Registration free bytes only ORDER the
+        // choice (which card); capacity math above stays on the system
+        // census. CPU-only censuses and unprobed manifests keep the
+        // blanket posture (profile-side fence).
+        if picked_device.is_none()
+            && sd_backend_token.is_none()
+            && engine.kind() == blazar_core::engine_kind::EngineKind::SdCpp
+            && self.config.effective_devices(name).is_empty()
+        {
+            if let Some((token, display)) = pick_sd_backend_device(&manifest.devices) {
+                tracing::info!(
+                    model = name,
+                    device = %token,
+                    "sdcpp backend token: engine census pick for the --backend module split"
+                );
+                sd_backend_token = Some(token);
+                picked_display = Some(display);
             }
         }
         // Placement label for `ps` (`full@<card>`): auto-pick names its
@@ -3105,7 +3156,7 @@ impl Supervisor {
                     .map(|e| u64::try_from(e.value().model.bytes.max(0)).unwrap_or(0))
                     .sum::<u64>()
                     / (1024 * 1024),
-                device_hint: picked_device.as_deref(),
+                device_hint: sd_backend_token.as_deref().or(picked_device.as_deref()),
                 // Build-class detection reads the FULL census: scoped
                 // `hardware` above sizes capacity against the picked
                 // card, but whether the engine binary is vulkan-class
@@ -5677,6 +5728,43 @@ mod routing_tests {
     /// the display-label/id split real censuses exhibit. The per-device
     /// ledger and the card-scoped co-residency planner must key on the
     /// id, never on the label.
+    #[test]
+    fn unit__pick_sd_backend_device__census_token_discrete_and_cpu_skipped() {
+        let devs = vec![
+            // Huge-free CPU entry: a placement candidate for nobody.
+            crate::engine::manifest::DeviceDesc {
+                name: "CPU".into(),
+                description: "CPU".into(),
+                total_mib: 64_000,
+                free_mib: 60_000,
+            },
+            crate::engine::manifest::DeviceDesc {
+                name: "Vulkan0".into(),
+                description: "Intel(R) Graphics (RPL-S)".into(),
+                total_mib: 16_384,
+                free_mib: 16_000,
+            },
+            crate::engine::manifest::DeviceDesc {
+                name: "Vulkan1".into(),
+                description: "NVIDIA GeForce RTX 4070 Laptop GPU".into(),
+                total_mib: 8_188,
+                free_mib: 7_790,
+            },
+        ];
+        let (token, display) = pick_sd_backend_device(&devs).unwrap();
+        assert_eq!(token, "Vulkan1");
+        assert!(display.contains("4070"), "{display}");
+
+        let cpu_only = vec![crate::engine::manifest::DeviceDesc {
+            name: "CPU".into(),
+            description: "CPU".into(),
+            total_mib: 1,
+            free_mib: 1,
+        }];
+        assert!(pick_sd_backend_device(&cpu_only).is_none());
+        assert!(pick_sd_backend_device(&[]).is_none());
+    }
+
     fn dual_gpu_sup() -> (Supervisor, tempfile::TempDir) {
         let bus = EventBus::default();
         let root = tempfile::TempDir::new().unwrap();
