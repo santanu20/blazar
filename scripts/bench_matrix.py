@@ -5580,7 +5580,21 @@ def executive_summary(recs: list[dict]) -> str:
             f"idle wake {pfmt(idle_p['idle_wake_ttft_ms'], 0)} ms (sleep) vs ollama "
             f"{pfmt(idle_o['idle_wake_ttft_ms'], 0)} ms (full reload)"
         )
-    return "; ".join(parts) + "." if parts else "_No complete rows._"
+    if parts:
+        return "; ".join(parts) + "."
+    # Media-only campaigns have no text rows to rank — say that instead
+    # of a bare "no complete rows" that reads like a failed campaign.
+    media = [
+        r
+        for r in recs
+        if (r.get("provider") or "").startswith("media-") and "error" not in r
+    ]
+    if media:
+        return (
+            f"_No complete text rows — {len(media)} media measurement(s) "
+            "in the sections below._"
+        )
+    return "_No complete rows._"
 
 
 def media_table(recs: list[dict]) -> str:
@@ -5727,10 +5741,13 @@ def write_publication_report(
     L: list[str] = []
     L.append("# Blazar inference benchmark")
     L.append("")
-    L.append(
-        f"_Rendered {artifacts_dir.name}; blazar {blazar_ver}; "
-        f"power state of gateway rows: {', '.join(sorted(env_states))}._"
-    )
+    # Byline slot is built from what exists: media-only campaigns have no
+    # gateway power states, and an empty slot rendered as dangling
+    # punctuation ("power state of gateway rows: .").
+    byline = f"blazar {blazar_ver}"
+    if env_states:
+        byline += f"; power state of gateway rows: {', '.join(sorted(env_states))}"
+    L.append(f"_Rendered {artifacts_dir.name}; {byline}._")
     L.append("")
     L.append("## Executive summary")
     L.append("")
