@@ -6,6 +6,7 @@ pub mod audit;
 pub mod batch;
 pub mod cache_bust;
 pub mod histogram;
+pub mod http_pool;
 pub mod images;
 pub mod keys;
 pub mod latechunk;
@@ -956,7 +957,7 @@ pub async fn serve(
         let otlp = Arc::clone(&state.otlp);
         // F81: bounded POSTs — a black-hole collector used to wedge the
         // flusher forever (the 5s select only bounds the first-span wait).
-        let http = reqwest::Client::builder()
+        let http = http_pool::tuned(reqwest::Client::builder())
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_default();

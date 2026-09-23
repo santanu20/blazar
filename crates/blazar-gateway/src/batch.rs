@@ -359,7 +359,7 @@ async fn run_batch(dirs: BlazarDirs, job: BatchJob, input: String) {
     if let Some(d) = out_path.parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    let client = reqwest::Client::builder()
+    let client = crate::http_pool::tuned(reqwest::Client::builder())
         .timeout(std::time::Duration::from_mins(10))
         .build()
         .unwrap_or_default();
