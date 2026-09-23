@@ -13679,8 +13679,8 @@ mod tests {
         // Right-aligned numbers share their right edge with the header.
         let edge = |l: &str, needle: &str| l.find(needle).map(|i| i + needle.len());
         let dl_edge = lines[0].find("DOWNLOADS").map(|i| i + "DOWNLOADS".len());
-        assert_eq!(edge(&lines[1], "1_234"), dl_edge);
-        assert_eq!(edge(&lines[2], "89"), dl_edge);
+        assert_eq!(edge(lines[1], "1_234"), dl_edge);
+        assert_eq!(edge(lines[2], "89"), dl_edge);
         // A too-narrow cell once bled columns; the widest cell wins.
         assert_eq!(out.lines().nth(2), Some("tiny            89  xlm-roberta"));
     }
