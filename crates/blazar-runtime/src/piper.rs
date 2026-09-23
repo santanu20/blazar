@@ -337,6 +337,88 @@ fn valid_voice(voice: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// One voice in the upstream index (`rhasspy/piper-voices`), with its
+/// on-disk byte size — the searchable remote catalog behind
+/// `tts --search`.
+#[derive(Debug, Clone)]
+pub struct RemoteVoice {
+    pub id: String,
+    pub quality: String,
+    pub bytes: u64,
+}
+
+/// Voice id + quality from a tree path like
+/// `en/en_US/amy/medium/en_US-amy-medium.onnx`. `None` for the `.json`
+/// config halves and any stem that lacks the pullable
+/// `<locale>-<name>-<quality>` shape — every listed voice must resolve
+/// through [`voice_repo_path`] later or the row is a dead end.
+#[must_use]
+pub fn voice_from_tree_path(path: &str) -> Option<(String, String)> {
+    let base = path.rsplit('/').next()?;
+    let id = base.strip_suffix(".onnx")?;
+    let quality = id.rsplit('-').next()?.to_string();
+    parse_voice_id(id)?;
+    Some((id.to_string(), quality))
+}
+
+/// Language directories to walk for a query: a language-prefix query
+/// (`en`) lists that language tree only; anything else (`amy`,
+/// `en_GB-northern`) walks every language. Pure so the routing is
+/// pinnable without a network.
+#[must_use]
+fn voice_lang_scope(root: &[crate::hf::HfTreeEntry], query: &str) -> Vec<String> {
+    let langs: Vec<String> = root
+        .iter()
+        .filter(|e| e.is_dir())
+        .map(|e| e.path.clone())
+        .collect();
+    let scoped: Vec<String> = langs
+        .iter()
+        .filter(|l| l.starts_with(query))
+        .cloned()
+        .collect();
+    if scoped.is_empty() {
+        langs
+    } else {
+        scoped
+    }
+}
+
+/// Search `rhasspy/piper-voices` for voices whose id contains `query`
+/// (case-insensitive). The Hub siblings expansion truncates this repo
+/// (live: 3301 of thousands of files), so the tree API with cursor
+/// pagination is the only complete index.
+pub async fn search_voices(hf: &crate::hf::HfClient, query: &str) -> Result<Vec<RemoteVoice>> {
+    let root = hf.list_tree(VOICES_REPO, "", false).await?;
+    let needle = query.to_lowercase();
+    // One language subtree per request, all in flight at once — each is
+    // an independent paginated walk (futures is already a workspace dep).
+    // The async block owns its `lang` because `list_tree` borrows the
+    // path for the whole paginated future.
+    let walks = futures::future::join_all(
+        voice_lang_scope(&root, &needle)
+            .into_iter()
+            .map(|lang| async move { hf.list_tree(VOICES_REPO, &lang, true).await }),
+    )
+    .await;
+    let mut out: Vec<RemoteVoice> = Vec::new();
+    for page in walks {
+        for entry in page?.into_iter().filter(crate::hf::HfTreeEntry::is_file) {
+            if let Some((id, quality)) = voice_from_tree_path(&entry.path) {
+                if id.to_lowercase().contains(&needle) {
+                    out.push(RemoteVoice {
+                        id,
+                        quality,
+                        bytes: entry.size.unwrap_or(0),
+                    });
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(out)
+}
+
 /// Download a voice (`.onnx` + `.onnx.json`) from
 /// `rhasspy/piper-voices`. Fails fast on a non-onnx payload instead of
 /// installing a corrupt voice.
@@ -541,6 +623,15 @@ async fn synthesize_inner(
 mod tests {
     use super::*;
 
+    /// Tree-API entry for scope tests (kind: "file" | "directory").
+    fn tree_entry(path: &str, kind: &str) -> crate::hf::HfTreeEntry {
+        crate::hf::HfTreeEntry {
+            path: path.to_string(),
+            kind: kind.to_string(),
+            size: None,
+        }
+    }
+
     #[test]
     fn unit__asset_name__six_platforms() {
         assert_eq!(
@@ -589,6 +680,37 @@ mod tests {
         assert_eq!(voice_repo_path("en_US-amy"), None);
         assert_eq!(voice_repo_path("amy-medium"), None);
         assert_eq!(voice_repo_path(""), None);
+    }
+
+    #[test]
+    fn unit__voice_from_tree_path__onnx_halves_with_pullable_shape() {
+        let (id, quality) =
+            voice_from_tree_path("en/en_US/amy/medium/en_US-amy-medium.onnx").unwrap();
+        assert_eq!(id, "en_US-amy-medium");
+        assert_eq!(quality, "medium");
+        // Config halves never surface as voices.
+        assert!(voice_from_tree_path("en/en_US/amy/medium/en_US-amy-medium.onnx.json").is_none());
+        // A stem without the <locale>-<name>-<quality> shape cannot round-trip
+        // through voice_repo_path later — a listed dead end.
+        assert!(voice_from_tree_path("en/stray/voice.onnx").is_none());
+    }
+
+    #[test]
+    fn unit__voice_lang_scope__language_prefix_scopes_else_walks_all() {
+        let root = vec![
+            tree_entry("de", "directory"),
+            tree_entry("en", "directory"),
+            tree_entry("eo", "directory"),
+            tree_entry("es", "directory"),
+            tree_entry("README.md", "file"),
+        ];
+        // A language prefix narrows the walk to matching roots.
+        assert_eq!(voice_lang_scope(&root, "en"), vec!["en"]);
+        assert_eq!(voice_lang_scope(&root, "e"), vec!["en", "eo", "es"]);
+        // Name/quality queries match no language root: walk everything.
+        let mut all = voice_lang_scope(&root, "amy");
+        all.sort();
+        assert_eq!(all, vec!["de", "en", "eo", "es"]);
     }
 
     #[test]

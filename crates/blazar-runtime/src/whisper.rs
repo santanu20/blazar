@@ -423,27 +423,56 @@ pub(crate) fn walk_for_file(dir: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Size stem of a `ggml-<size>.bin` filename, or `None` for anything
+/// else (the repo also ships `ggml-*-encoder.mlmodelc.zip` `CoreML`
+/// sidecars that must not surface as pullable models).
+#[must_use]
+pub fn ggml_size_from_path(filename: &str) -> Option<String> {
+    let base = filename.rsplit('/').next().unwrap_or(filename);
+    base.strip_prefix("ggml-")?
+        .strip_suffix(".bin")
+        .map(str::to_string)
+}
+
 /// Pulled model sizes (stems of `ggml-*.bin`), sorted.
 pub fn list_models(dirs: &BlazarDirs) -> Vec<String> {
     let mut out: Vec<String> = std::fs::read_dir(models_dir(dirs))
         .into_iter()
         .flatten()
         .filter_map(std::result::Result::ok)
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| {
-            n.starts_with("ggml-")
-                && std::path::Path::new(n)
-                    .extension()
-                    .is_some_and(|e| e == "bin")
-        })
-        .map(|n| {
-            n.trim_start_matches("ggml-")
-                .trim_end_matches(".bin")
-                .to_string()
-        })
+        .filter_map(|e| ggml_size_from_path(&e.file_name().to_string_lossy()))
         .collect();
     out.sort();
     out
+}
+
+/// One ggml model in the upstream index (`ggerganov/whisper.cpp`),
+/// with its on-disk byte size — the searchable remote catalog behind
+/// `whisper --search`.
+#[derive(Debug, Clone)]
+pub struct RemoteModel {
+    pub size: String,
+    pub bytes: u64,
+}
+
+/// Every ggml model the upstream repo currently ships, sorted by size
+/// stem. One non-recursive tree listing (the models live at the repo
+/// root); verified live 2026-09-23: 33 models spanning tiny..large-v3
+/// including `.en` variants and q5/q8 quantized builds.
+pub async fn remote_models(hf: &HfClient) -> Result<Vec<RemoteModel>> {
+    let entries = hf.list_tree(WHISPER_MODEL_REPO, "", false).await?;
+    let mut out: Vec<RemoteModel> = entries
+        .into_iter()
+        .filter(crate::hf::HfTreeEntry::is_file)
+        .filter_map(|e| {
+            Some(RemoteModel {
+                size: ggml_size_from_path(&e.path)?,
+                bytes: e.size.unwrap_or(0),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.size.cmp(&b.size));
+    Ok(out)
 }
 
 #[must_use]
@@ -884,6 +913,23 @@ mod tests {
         assert_eq!(listed, vec!["base".to_string(), "tiny.en".to_string()]);
         assert_eq!(model_file(&models, "base"), Some(dir.join("ggml-base.bin")));
         assert_eq!(model_file(&models, "medium"), None);
+    }
+
+    #[test]
+    fn unit__ggml_size_from_path__ggml_bins_only() {
+        // Full tree paths reduce to the size stem (basename, ggml-/.bin).
+        assert_eq!(
+            ggml_size_from_path("ggml-large-v3-turbo-q5_0.bin").as_deref(),
+            Some("large-v3-turbo-q5_0")
+        );
+        assert_eq!(
+            ggml_size_from_path("ggml-base.bin").as_deref(),
+            Some("base")
+        );
+        // CoreML sidecars and foreign files are not pullable models.
+        assert!(ggml_size_from_path("ggml-small-encoder.mlmodelc.zip").is_none());
+        assert!(ggml_size_from_path("README.md").is_none());
+        assert!(ggml_size_from_path("ggml-naked").is_none());
     }
 
     #[tokio::test]

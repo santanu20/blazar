@@ -276,12 +276,23 @@ enum Cmd {
         /// List installed whisper server tag + local models
         #[arg(long)]
         list: bool,
+        /// Search the upstream model catalog (ggerganov/whisper.cpp);
+        /// bare --search lists every size, a substring filters (turbo,
+        /// .en, q5). Sizes marked "pulled" are local already.
+        #[arg(
+            long,
+            value_name = "SUBSTR",
+            num_args = 0..=1,
+            default_missing_value = "",
+            conflicts_with_all = ["install", "tag", "pull", "list", "file", "model", "pin"]
+        )]
+        search: Option<String>,
         /// Pin the whisper server to an installed tag ("none" unpins —
         /// tracks the newest installed tag). No download involved.
         #[arg(
             long,
             value_name = "TAG|none",
-            conflicts_with_all = ["install", "tag", "pull", "list", "file"]
+            conflicts_with_all = ["install", "tag", "pull", "list", "file", "search"]
         )]
         pin: Option<String>,
     },
@@ -306,12 +317,21 @@ enum Cmd {
         /// List installed piper tag + pulled voices
         #[arg(long)]
         list: bool,
+        /// Search the upstream voice catalog (rhasspy/piper-voices) by
+        /// substring — a voice id (en_US-amy), a language (en, de) or a
+        /// quality (medium). Voices marked "pulled" are local already.
+        #[arg(
+            long,
+            value_name = "SUBSTR",
+            conflicts_with_all = ["install", "tag", "pull", "list", "text", "pin"]
+        )]
+        search: Option<String>,
         /// Pin piper to an installed tag ("none" unpins — tracks the
         /// newest installed tag). No download involved.
         #[arg(
             long,
             value_name = "TAG|none",
-            conflicts_with_all = ["install", "tag", "pull", "list", "text"]
+            conflicts_with_all = ["install", "tag", "pull", "list", "text", "search"]
         )]
         pin: Option<String>,
         /// Output WAV path ("-" for stdout); default: <voice>-<n>.wav
@@ -1277,8 +1297,9 @@ async fn run(cmd: Cmd) -> Result<()> {
             tag,
             pull,
             list,
+            search,
             pin,
-        } => whisper_cmd(file.as_ref(), model, install, tag, pull, list, pin).await,
+        } => whisper_cmd(file.as_ref(), model, install, tag, pull, list, search, pin).await,
         Cmd::Tts {
             text,
             voice,
@@ -1286,6 +1307,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             tag,
             pull,
             list,
+            search,
             pin,
             out,
             speed,
@@ -1298,6 +1320,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                 tag,
                 pull,
                 list,
+                search,
                 pin,
                 out,
                 speed,
@@ -4892,6 +4915,13 @@ fn cli_colors() -> bool {
 /// least-significant digit); the last column is left open with no
 /// trailing blanks so copied output stays clean. Headers render bold on
 /// interactive terminals.
+/// STATE cell for remote-catalog tables: "pulled" when the local lane
+/// already holds the artifact, "-" otherwise (same placeholder the
+/// search/engine tables use for absent facts).
+fn pulled_or_dash(pulled: bool) -> String {
+    if pulled { "pulled" } else { "-" }.to_string()
+}
+
 fn render_table(header: &[&str], rows: &[Vec<String>], right: &[usize]) -> String {
     use std::fmt::Write as _;
     let cols = header.len();
@@ -6311,7 +6341,7 @@ fn coreside_cmd() -> Result<()> {
 
 /// `blazar tts` — piper lane management + local synthesis through the
 /// daemon's `/v1/audio/speech` (same key-gating as every route).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn tts_cmd(
     text: Option<String>,
     voice: Option<&str>,
@@ -6319,6 +6349,7 @@ async fn tts_cmd(
     tag: Option<String>,
     pull: Option<String>,
     list: bool,
+    search: Option<String>,
     pin: Option<String>,
     out: Option<PathBuf>,
     speed: Option<f64>,
@@ -6335,6 +6366,9 @@ async fn tts_cmd(
             println!("piper pinned to {}", value.trim());
         }
         return Ok(());
+    }
+    if let Some(query) = search {
+        return tts_search(&d, &query).await;
     }
     if list {
         match blazar_runtime::piper::server_bin(&d) {
@@ -6397,6 +6431,40 @@ async fn tts_cmd(
     };
     let play = !no_play && std::io::IsTerminal::is_terminal(&std::io::stdout());
     tts_speak(&d, &text, voice, out.as_deref(), speed, play).await
+}
+
+/// Catalog arm of `blazar tts --search <substr>`: the full
+/// `rhasspy/piper-voices` tree (the Hub siblings listing truncates it),
+/// filtered by voice id substring, with pulled state per row.
+async fn tts_search(d: &BlazarDirs, query: &str) -> Result<()> {
+    let token = std::env::var("HF_TOKEN").ok();
+    let hf = blazar_runtime::hf::HfClient::new(token)?
+        .with_download_connections(config()?.download_connections);
+    let voices = blazar_runtime::piper::search_voices(&hf, query).await?;
+    if voices.is_empty() {
+        return Err(anyhow!(
+            "no piper voice matches {query:?} — try a language (en), a locale \
+             (en_GB) or a name (amy)"
+        ));
+    }
+    let total = voices.len();
+    let rows: Vec<Vec<String>> = voices
+        .iter()
+        .take(40)
+        .map(|v| {
+            vec![
+                v.id.clone(),
+                humansize(i64::try_from(v.bytes).unwrap_or(i64::MAX)),
+                pulled_or_dash(blazar_runtime::piper::voice_file(d, &v.id).is_some()),
+            ]
+        })
+        .collect();
+    println!("{}", render_table(&["VOICE", "DISK", "STATE"], &rows, &[1]));
+    if total > 40 {
+        println!("# showing 40 of {total} — refine the substring to narrow the list");
+    }
+    println!("# pull: blazar tts --pull <voice>");
+    Ok(())
 }
 
 /// Synthesis arm of `blazar tts`: resolve the voice (default: first
@@ -6468,7 +6536,7 @@ fn wav_duration_secs(wav: &[u8]) -> f64 {
 /// `blazar whisper file.mp3` — STT via the `whisper` [[remotes]] entry.
 /// The gateway already forwards `/v1/audio/transcriptions`; this is the
 /// local CLI convenience for it (no separate engine lane to manage).
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn whisper_cmd(
     file: Option<&PathBuf>,
     model: Option<String>,
@@ -6476,6 +6544,7 @@ async fn whisper_cmd(
     tag: Option<String>,
     pull: Option<String>,
     list: bool,
+    search: Option<String>,
     pin: Option<String>,
 ) -> Result<()> {
     let d = dirs();
@@ -6489,6 +6558,9 @@ async fn whisper_cmd(
             println!("whisper server pinned to {}", value.trim());
         }
         return Ok(());
+    }
+    if let Some(query) = search {
+        return whisper_search(&d, &query).await;
     }
     if list {
         match blazar_runtime::whisper::server_bin(&d) {
@@ -6610,6 +6682,36 @@ async fn whisper_cmd(
         }
         None => Err(anyhow!("no \"text\" field in response: {v}")),
     }
+}
+
+/// Catalog arm of `blazar whisper --search [substr]`: every ggml size
+/// the upstream `ggerganov/whisper.cpp` repo ships, filtered by size
+/// substring, with pulled state per row.
+async fn whisper_search(d: &BlazarDirs, query: &str) -> Result<()> {
+    let token = std::env::var("HF_TOKEN").ok();
+    let hf = blazar_runtime::hf::HfClient::new(token)?
+        .with_download_connections(config()?.download_connections);
+    let needle = query.to_lowercase();
+    let rows: Vec<Vec<String>> = blazar_runtime::whisper::remote_models(&hf)
+        .await?
+        .iter()
+        .filter(|m| needle.is_empty() || m.size.to_lowercase().contains(&needle))
+        .map(|m| {
+            vec![
+                m.size.clone(),
+                humansize(i64::try_from(m.bytes).unwrap_or(i64::MAX)),
+                pulled_or_dash(blazar_runtime::whisper::model_file(d, &m.size).is_some()),
+            ]
+        })
+        .collect();
+    if rows.is_empty() {
+        return Err(anyhow!(
+            "no upstream whisper model matches {query:?} — bare --search lists every size"
+        ));
+    }
+    println!("{}", render_table(&["SIZE", "DISK", "STATE"], &rows, &[1]));
+    println!("# pull: blazar whisper --pull <size>");
+    Ok(())
 }
 
 /// `blazar stop` (daemon) vs `blazar stop MODEL` (unload now).
