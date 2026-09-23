@@ -1182,19 +1182,6 @@ fn is_chat_route(path_query: &str) -> bool {
 /// mistral.rs children register models under derived ids ("default" +
 /// the staging dir path — verified against v0.9.3), not Blazar names;
 /// their CLI has no `--alias` equivalent. The gateway owns the facade,
-/// so the outbound `model` field is rewritten to the child's stable
-/// `default` id for mistral.rs engines. llama-server keeps receiving
-/// Blazar names (its `--alias` lane matches them natively). Non-JSON
-/// bodies and store failures pass through untouched — the child then
-/// answers its own clear not-found error.
-/// mistral.rs derives /v1 model ids from the `-f` path (no --alias
-/// equivalent); Blazar spawns one model per child, so their stable
-/// `default` id is the unambiguous target. Shared by every child-bound
-/// body site (proxy lane + ollama translation lanes).
-pub(crate) fn child_model_default(engine: &EngineRef) -> bool {
-    engine.kind == blazar_core::engine_kind::EngineKind::MistralRs
-}
-
 /// Per-model serving resolution for sites that must answer BEFORE a
 /// spawn exists (request translation + model listings). `tag` is the
 /// engine row that WOULD serve this model right now — the routed lane's
@@ -1308,29 +1295,53 @@ pub(crate) fn resolve_serving(
         .flatten()
 }
 
-/// Pre-spawn prediction of [`child_model_default`] for sites that mutate
+/// Pre-spawn prediction of [`child_model_stamp`] for sites that mutate
 /// the request BEFORE the engine exists (ollama chat translation).
 /// Consults the SAME core `serving_lane` the supervisor routes by, so
 /// the prediction and the actual spawn can never disagree — the
 /// daemon-global kind cache this replaces was wrong under
 /// `[engine_routing]` (routed mistral.rs children kept the caller's
 /// model name and answered `model ... was not found`).
-pub(crate) fn child_model_default_predicted(
+pub(crate) fn child_model_stamp_predicted(
     state: &Arc<AppState>,
     model_name: &str,
     model_path: &str,
-) -> bool {
+) -> Option<String> {
     use blazar_core::engine_kind::EngineKind;
     // `tag: None` = nothing can serve (or a bad pin) — the spawn path
     // delivers the teaching error, so no rewrite fires; matching the
-    // pre-refactor contract where every Err predicted `false`.
-    resolve_serving(state, model_name, model_path)
-        .is_some_and(|lane| lane.tag.is_some() && lane.kind == EngineKind::MistralRs)
+    // pre-refactor contract where every Err predicted "no rewrite".
+    let lane = resolve_serving(state, model_name, model_path)?;
+    lane.tag.as_ref()?;
+    match lane.kind {
+        EngineKind::MistralRs => Some("default".to_string()),
+        EngineKind::Sglang => Some(model_name.to_string()),
+        _ => None,
+    }
 }
 
-pub(crate) fn set_child_model_default(v: &mut serde_json::Value) {
+pub(crate) fn set_child_model(v: &mut serde_json::Value, stamp: &str) {
     if v.get("model").and_then(serde_json::Value::as_str).is_some() {
-        v["model"] = serde_json::Value::String("default".to_string());
+        v["model"] = serde_json::Value::String(stamp.to_string());
+    }
+}
+
+/// The model string each child engine must see in request bodies.
+/// mistral.rs derives /v1 model ids from the `-f` path (no --alias
+/// equivalent); Blazar spawns one model per child, so their stable
+/// `default` id is the unambiguous target. sglang parses `model:tail`
+/// as ITS lora-suffix convention, so the caller's quant tag
+/// (`m:4bit`) would request a phantom adapter — it must see the exact
+/// name `--served-model-name` registered (= the row name). llamacpp is
+/// indifferent (a single-model server answers any model string), so
+/// the caller's own spelling survives for response-echo fidelity on
+/// the raw passthrough lanes. `None` = no rewrite.
+pub(crate) fn child_model_stamp(engine: &EngineRef) -> Option<&str> {
+    use blazar_core::engine_kind::EngineKind;
+    match engine.kind {
+        EngineKind::MistralRs => Some("default"),
+        EngineKind::Sglang => Some(&engine.name),
+        _ => None,
     }
 }
 
@@ -1342,9 +1353,12 @@ fn rewrite_child_model(
     body: axum::body::Bytes,
     parsed: Option<&serde_json::Value>,
 ) -> axum::body::Bytes {
-    if body.is_empty() || !child_model_default(engine) {
+    if body.is_empty() {
         return body;
     }
+    let Some(stamp) = child_model_stamp(engine) else {
+        return body;
+    };
     let maybe_owned = parsed.cloned().map_or_else(
         || serde_json::from_slice::<serde_json::Value>(&body).ok(),
         Some,
@@ -1353,7 +1367,7 @@ fn rewrite_child_model(
         return body;
     };
     let mut v = v.clone();
-    set_child_model_default(&mut v);
+    set_child_model(&mut v, stamp);
     match serde_json::to_vec(&v) {
         Ok(bytes) => bytes.into(),
         Err(_) => body,
@@ -2237,5 +2251,43 @@ mod resolve_model_tests {
         let err = resolve_model(&store, "qwen2.5-0.5c").unwrap_err();
         assert!(err.contains("did you mean"), "err: {err}");
         assert!(err.contains("qwen2.5-0.5b"), "err: {err}");
+    }
+
+    #[test]
+    fn unit__child_model_stamp__per_engine_contract() {
+        use blazar_core::engine_kind::EngineKind;
+        use blazar_core::profile::Endpoint;
+        let ref_for = |kind: EngineKind| blazar_runtime::EngineRef {
+            name: "qwen2.5-0.5b-instruct-awq".to_string(),
+            key: "qwen2.5-0.5b-instruct-awq".to_string(),
+            kind,
+            endpoint: Endpoint::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: 1,
+            },
+            auth: None,
+        };
+        // mistral.rs: stable per-child id, never the row name.
+        assert_eq!(
+            child_model_stamp(&ref_for(EngineKind::MistralRs)),
+            Some("default")
+        );
+        // sglang: the exact --served-model-name — its `model:tail`
+        // parsing turns a forwarded quant tag into a phantom LoRA ask.
+        assert_eq!(
+            child_model_stamp(&ref_for(EngineKind::Sglang)),
+            Some("qwen2.5-0.5b-instruct-awq")
+        );
+        // llamacpp (and anything else): indifferent single-model server,
+        // the caller's spelling survives for response-echo fidelity.
+        assert_eq!(child_model_stamp(&ref_for(EngineKind::LlamaCpp)), None);
+
+        // The setter never invents a model field (absent stays absent).
+        let mut v = serde_json::json!({"input": "x"});
+        set_child_model(&mut v, "default");
+        assert!(v.get("model").is_none());
+        let mut v = serde_json::json!({"model": "caller-spelling"});
+        set_child_model(&mut v, "default");
+        assert_eq!(v["model"], "default");
     }
 }

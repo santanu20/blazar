@@ -44,6 +44,16 @@ tracked here.
 
 - **`/v1/responses` buffered requests share the crash-recovery contract.** The non-stream + `store` arm sends through `child_send` with one respawn-and-retry: a child killed mid-request no longer surfaces a bare 502 but completes on the respawned child (response id and stored round-trip preserved).
 
+- **Every eviction is attributable in serve logs.** Two info lines now name the mechanics: the admission loop says which victim it is evicting for which incoming spawn (`admission evict: making room for the blocked spawn`), and `evict()` itself logs the model and pid it terminated — whichever path pulled the trigger (admission capacity, header-timeout wedge, idle ladder, user stop), a resident that vanished can always be traced.
+
+- **`/api/ps` rows name the census device id.** Each row now carries `blazar_device_id` (the probe backend's identifier, e.g. `CUDA0`) alongside the existing human-readable `blazar_device` label — the exact key the per-device VRAM ledger accounts by, so operators can correlate admission decisions with `nvidia-smi` output.
+
+- **sglang no longer mistakes an Ollama quant tag for a LoRA adapter.** sglang parses `model:suffix` as its LoRA grammar, so forwarding the user's spelling (`qwen2.5-0.5b-instruct-awq:4bit`) made it demand adapter `4bit` and 400. The relay now stamps the child-side model per engine: sglang children receive the bare row name, mistral.rs receives `default` (its single served alias), and llama.cpp keeps the caller's spelling for echo fidelity — the phantom-adapter 400 is gone (live-validated end to end on the awq row).
+
+- **Engine spawn failures carry the io detail.** A failed `spawn()` of an engine wrapper surfaced as a bare 500; the error now names the exact path, the io error, and the remedy hint (re-rooted engines adopt the live data dir, so this usually means `blazar engine update`).
+
+- **The spawn-window reservation no longer double-counts the incoming floor.** The post-reservation admission re-check re-added the incoming model's floor on top of the reservation already holding those bytes, so a load that genuinely coexisted (6.3 GiB floor beside a 0.7 GiB resident on an 8 GiB card) wrongly evicted the resident. The re-check now tests whether the device's load (reservation included) fits the budget — live-validated: the 9b load now settles beside the resident instead of evicting it.
+
 - **Video requests now carry a frame-count knob across the compat vocabulary.**
  `/v1/videos/generations` accepted only sd-server's native `video_frames` key — the OpenAI-style `frames`/`num_frames` synonyms and the REPL's `/duration` seconds knob passed through unvalidated and unmapd, so those callers silently got whatever frame count the child defaulted to. The video handler now canonicalizes the whole vocabulary onto `video_frames` before relay: `frames`/`num_frames` map directly, `duration` translates through the request `fps` (default 16, the child's own), values below 1 are refused with a teaching 400, and conflicting spellings (`frames: 4` + `video_frames: 8`, or a `duration` that disagrees with an explicit count) are named in the error instead of racing. Wan-family alignment (4k+1 temporal grid) still belongs to the engine — a request for 4 frames arrives as `video_frames: 4` and the child aligns it; the gateway teaches the vocabulary, not the model's math.
 

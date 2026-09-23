@@ -754,6 +754,10 @@ pub struct PsRow {
     /// `None` for router mode / unknown placement. `ps` renders it as
     /// `full@<card>`.
     pub device: Option<String>,
+    /// Census backend id of the placement card (e.g. `CUDA0`) — the key
+    /// the per-device VRAM ledger accounts by. `None` for CPU instances
+    /// and card-spanning (tensor-split) placements.
+    pub device_id: Option<String>,
     /// Profile-compile warnings for this instance (see Instance.warnings).
     pub warnings: Vec<String>,
     /// Effective spec mode of this spawn + draft file name (see
@@ -1122,6 +1126,20 @@ impl Supervisor {
             .iter()
             .find(|g| g.name == device)
             .map(|g| blazar_core::Hardware::bytes(g.total_mib))
+    }
+
+    /// Post-reservation admission invariant for the picked card: the
+    /// device load already carries this spawn's reservation, so the
+    /// incoming floor must NOT be added again — that double-count
+    /// evicted coexisting residents a placement actually fits (seen
+    /// live: a 6.6 GiB floor evicting a 0.7 GiB neighbor on a
+    /// 7.6 GiB card that held both). Unknown device budget = fail-open;
+    /// the spawn-time free-VRAM guard owns the honest refuse.
+    fn reservation_fits_device(&self, device: &str) -> bool {
+        match self.device_budget_bytes(device) {
+            Some(budget) => self.device_load_bytes(device) <= budget,
+            None => true,
+        }
     }
 
     /// GPU-resident bytes with no known card (tensor splits, multi-card
@@ -2738,6 +2756,11 @@ impl Supervisor {
             }
             match self.blocked_action(key, captive) {
                 BlockedAction::Evict(v) => {
+                    tracing::info!(
+                        victim = %v,
+                        incoming = name,
+                        "admission evict: making room for the blocked spawn"
+                    );
                     self.evict(&v)
                         .await
                         .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
@@ -2985,8 +3008,16 @@ impl Supervisor {
             .map(|d| self.reserve_device(d, incoming_bytes));
         // Re-check under the reservation: a concurrent spawn may have
         // reserved or inserted between the admission loop and the pick.
-        // Same contract as the loop above — evict coldest, else refuse.
-        while reservation.is_some() && self.admission_blocked(name, incoming_bytes) {
+        // The device load already carries this spawn's reservation —
+        // re-adding the incoming floor here would double-count it and
+        // evict residents the placement actually fits (seen live: a
+        // 6.6 GiB floor evicted a coexisting 0.7 GiB neighbor on a
+        // 7.6 GiB card that held both). Same evict-coldest / refuse
+        // contract as the loop above.
+        while placement_device_id
+            .as_ref()
+            .is_some_and(|d| !self.reservation_fits_device(d))
+        {
             match self.blocked_action(key, captive) {
                 BlockedAction::Evict(v) => {
                     self.evict(&v)
@@ -3716,6 +3747,14 @@ impl Supervisor {
         let Some(inst) = self.instances.get(name).map(|i| i.clone()) else {
             return Ok(());
         };
+        // Every eviction path funnels through here (admission capacity,
+        // header-timeout wedge, idle ladder, user stop) — one line so a
+        // vanished resident is always attributable in serve logs.
+        tracing::info!(
+            model = name,
+            pid = inst.pid,
+            "evict: terminating child and releasing the slot"
+        );
         // F1: mark the name as being torn down for the whole evict; a
         // concurrent spawn retries instead of inserting a fresh child
         // that our cleanup would then race (map remove + pidfile/apikey
@@ -4596,6 +4635,7 @@ impl Supervisor {
                     ctx: i.profile_ctx,
                     gpu: i.gpu.clone(),
                     device: i.device.clone(),
+                    device_id: i.device_id.clone(),
                     warnings: i.warnings.clone(),
                     spec_mode: i.spec_mode.clone(),
                     draft: i.draft.clone(),
@@ -5718,6 +5758,42 @@ mod routing_tests {
         // 16_376) still says room — the exact one-card collision the
         // aggregate admission used to wave through.
         assert!(sup.admission_blocked("other", mib(3_000)));
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__reservation_fits_device__reservation_replaces_incoming_not_adds() {
+        let mib = |m: u64| m * 1024 * 1024;
+        let (sup, _root) = dual_gpu_sup();
+        // The live over-eviction scenario: a 0.7 GiB resident coexists
+        // with a 6.6 GiB incoming floor on an 8 GiB card (697 + 6630 =
+        // 7327 <= 8188) — under the reservation the load already speaks
+        // for the incoming spawn, so the placement fits.
+        let (small, _ps) = placed_gpu_instance(
+            "small",
+            mib(100).cast_signed(),
+            697,
+            "GPU0",
+            "NVIDIA GeForce RTX 4070",
+        );
+        sup.instances.insert("small".to_string(), small);
+        let r = sup.reserve_device("GPU0", mib(6_630));
+        assert!(sup.reservation_fits_device("GPU0"));
+        // One more resident tips it over (697 + 900 + 6630 > 8188): the
+        // re-check must evict, not wave through.
+        let (extra, _pe) = placed_gpu_instance(
+            "extra",
+            mib(100).cast_signed(),
+            900,
+            "GPU0",
+            "NVIDIA GeForce RTX 4070",
+        );
+        sup.instances.insert("extra".to_string(), extra);
+        assert!(!sup.reservation_fits_device("GPU0"));
+        drop(r);
+        // Unknown device budget fails open (spawn-time probe owns the
+        // honest refuse).
+        assert!(sup.reservation_fits_device("CUDA9"));
     }
 
     #[tokio::test]

@@ -412,6 +412,7 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
                 "blazar_ctx": p.ctx,
                 "blazar_gpu": p.gpu,
                 "blazar_device": p.device,
+                "blazar_device_id": p.device_id,
                 "blazar_warnings": p.warnings,
                 "blazar_spec": p.spec_mode,
                 "blazar_draft": p.draft,
@@ -867,10 +868,14 @@ pub async fn chat(
         Ok(r) => r,
         Err(e) => return api_error(400, &e),
     };
-    // mistral.rs children register models as `default` (see proxy.rs).
-    // Pre-spawn: predict the routed lane (engine not resolved yet).
-    if crate::proxy::child_model_default_predicted(&state, &row.name, &row.path) {
-        crate::proxy::set_child_model_default(&mut openai_req);
+    // Per-engine child model contract (see proxy.rs): mistral.rs
+    // children answer `default`, sglang children need the exact
+    // `--served-model-name` (its `model:tail` parsing would turn a
+    // quant tag into a phantom LoRA ask), llamacpp keeps the caller's
+    // spelling. Pre-spawn: predict the routed lane (engine not
+    // resolved yet).
+    if let Some(stamp) = crate::proxy::child_model_stamp_predicted(&state, &row.name, &row.path) {
+        crate::proxy::set_child_model(&mut openai_req, &stamp);
     }
     // Strict tool-def lint (tools arrive in OpenAI shape after translate).
     if let Some(err) = state.sentinel.strict_tool_def_error_cached(&req) {
@@ -2208,8 +2213,8 @@ pub async fn embeddings(
             }
             let url = format!("{}/v1/embeddings", child_base(&engine.endpoint));
             // mistral.rs children register models as `default` (see proxy.rs).
-            if crate::proxy::child_model_default(&engine) {
-                crate::proxy::set_child_model_default(&mut openai_req);
+            if let Some(stamp) = crate::proxy::child_model_stamp(&engine) {
+                crate::proxy::set_child_model(&mut openai_req, stamp);
             }
             let resp = match crate::proxy::child_send(
                 &state,
@@ -2335,8 +2340,8 @@ pub async fn embed(
             let url = format!("{}/v1/embeddings", child_base(&engine.endpoint));
             let mut openai_req = json!({"model": model, "input": inputs});
             // mistral.rs children register models as `default` (see proxy.rs).
-            if crate::proxy::child_model_default(&engine) {
-                crate::proxy::set_child_model_default(&mut openai_req);
+            if let Some(stamp) = crate::proxy::child_model_stamp(&engine) {
+                crate::proxy::set_child_model(&mut openai_req, stamp);
             }
             let resp = match crate::proxy::child_send(
                 &state,
@@ -2452,8 +2457,8 @@ pub async fn rerank(
             let url = format!("{}/v1/rerank", child_base(&engine.endpoint));
             // mistral.rs children register models as `default` (see
             // proxy.rs) — F28: rerank lane now rewrites like every other.
-            if crate::proxy::child_model_default(&engine) {
-                crate::proxy::set_child_model_default(&mut forward);
+            if let Some(stamp) = crate::proxy::child_model_stamp(&engine) {
+                crate::proxy::set_child_model(&mut forward, stamp);
             }
             let resp = match crate::proxy::child_send(
                 &state,
@@ -2641,8 +2646,8 @@ pub async fn generate(
     state.sup.note_prefix_hit(&engine.name);
     let model_name = row.name.clone();
     // mistral.rs children register models as `default` (see proxy.rs).
-    if crate::proxy::child_model_default(&engine) {
-        crate::proxy::set_child_model_default(&mut openai_req);
+    if let Some(stamp) = crate::proxy::child_model_stamp(&engine) {
+        crate::proxy::set_child_model(&mut openai_req, stamp);
     }
     let openai_bytes = serde_json::to_vec(&openai_req).unwrap_or_default();
     // ollama defaults stream=true on generate; the chat bus mirrors it.
