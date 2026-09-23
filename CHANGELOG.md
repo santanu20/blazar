@@ -4,6 +4,12 @@ All notable changes to Pallama are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
+## [Unreleased]
+
+### Added
+
+- **Whisper models and piper voices are searchable before pulling.** `blazar whisper --search [substr]` lists every ggml size the upstream `ggerganov/whisper.cpp` repo ships (tiny..large-v3-turbo, `.en` variants, q5/q8 builds — 33 models today) with DISK bytes and a `pulled` marker on what is local; `blazar tts --search <substr>` does the same for the `rhasspy/piper-voices` catalog — search by language (`en`), locale (`en_GB`), or name (`amy`), top 40 rows with a showing-N-of-M note. Both ride the Hub tree API with cursor pagination (the siblings listing the old code path used truncates this repo at ~3300 files, hiding most voices), a language-prefix query narrows the walk to that language subtree, and any other substring walks all languages in parallel. Every row resolves through the same id grammar `--pull` accepts, so nothing listed can dead-end.
+
 ## [0.11.0] - 2026-09-23
 
 ### Added

@@ -139,6 +139,33 @@ pub struct HfSibling {
     pub lfs: Option<HfLfs>,
 }
 
+/// One entry of the Hub tree API (`api/models/{repo}/tree/main/...`):
+/// files carry `size`; directories do not. Unlike the siblings
+/// expansion — which the Hub truncates on big repos (live:
+/// `rhasspy/piper-voices` returned 3301 of thousands of files) — the
+/// tree endpoint lists everything through cursor pagination.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HfTreeEntry {
+    #[serde(default)]
+    pub path: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub size: Option<u64>,
+}
+
+impl HfTreeEntry {
+    #[must_use]
+    pub fn is_file(&self) -> bool {
+        self.kind == "file"
+    }
+
+    #[must_use]
+    pub fn is_dir(&self) -> bool {
+        self.kind == "directory"
+    }
+}
+
 /// `expand[]=gguf` aggregate over a repo's GGUF files. `total` is the
 /// PARAMETER COUNT (not bytes — never render it as a size); the actual
 /// on-disk bytes live in `totalFileSize` (sum over every `.gguf`, all
@@ -1128,6 +1155,56 @@ pub fn is_quant_token(token: &str) -> bool {
 }
 
 impl HfClient {
+    /// List a repo subtree via the Hub tree API, following cursor
+    /// pagination (`Link: rel="next"`, 1000 entries/page) to
+    /// exhaustion. `recursive` walks the whole subtree in one walk —
+    /// the piper voice index hides thousands of files below a single
+    /// locale root. `path` is relative to the repo root ("" = root).
+    pub async fn list_tree(
+        &self,
+        repo: &str,
+        path: &str,
+        recursive: bool,
+    ) -> Result<Vec<HfTreeEntry>> {
+        let recursive_param = if recursive { "&recursive=true" } else { "" };
+        let mut url = self
+            .api_base
+            .join(&format!(
+                "api/models/{repo}/tree/main/{path}?expand=false&limit=1000{recursive_param}"
+            ))
+            .map_err(|e| anyhow!("bad tree URL: {e}"))?;
+        let mut out = Vec::new();
+        loop {
+            let resp = self
+                .http
+                .get(url.clone())
+                .send()
+                .await
+                .context("HF tree request")?;
+            if !resp.status().is_success() {
+                return Err(anyhow!("HF tree returned {}", resp.status()));
+            }
+            // The next page rides the Link header; no rel="next" means
+            // the listing is complete. Captured before `json()` — that
+            // call consumes the response.
+            let next = resp
+                .headers()
+                .get(reqwest::header::LINK)
+                .and_then(|v| v.to_str().ok())
+                .and_then(next_link)
+                .map(str::to_string);
+            let page: Vec<HfTreeEntry> = resp.json().await.context("decode tree entries")?;
+            out.extend(page);
+            match next {
+                Some(target) => {
+                    url = reqwest::Url::parse(&target)
+                        .map_err(|e| anyhow!("bad tree next page: {e}"))?;
+                }
+                None => return Ok(out),
+            }
+        }
+    }
+
     /// Hub model search across every weight format (complaint #15:
     /// discovery beyond a registry; any community quant is findable).
     /// `format` picks the lane — see [`search_path`].
@@ -1256,6 +1333,20 @@ fn name_match_stats(repo_id: &str, tokens: &[String]) -> (u32, u32) {
     )
     .unwrap_or(u32::MAX);
     (coverage, unmatched)
+}
+
+/// `rel="next"` target from a Link header, or `None` when this is the
+/// last page. Comma-split is safe: Hub cursor URLs never carry commas.
+fn next_link(link: &str) -> Option<&str> {
+    link.split(',').find_map(|part| {
+        let part = part.trim();
+        part.ends_with(r#"rel="next""#).then(|| {
+            part.trim_start_matches('<')
+                .split('>')
+                .next()
+                .unwrap_or_default()
+        })
+    })
 }
 
 /// Build the `api/models` query for [`HfClient::search`]. `format` is a
@@ -2923,6 +3014,19 @@ mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn unit__next_link__rel_next_target_or_none() {
+        // Real Hub shape: cursor URL + rel="next", prev/first alongside.
+        let link = r#"<https://huggingface.co/api/models/rhasspy/piper-voices/tree/main/en?limit=1000&cursor=abc>; rel="next", <https://huggingface.co/first>; rel="first""#;
+        assert_eq!(
+            next_link(link),
+            Some("https://huggingface.co/api/models/rhasspy/piper-voices/tree/main/en?limit=1000&cursor=abc")
+        );
+        // Last page: other rels but no next.
+        assert_eq!(next_link(r#"<https://huggingface.co/x>; rel="prev""#), None);
+        assert_eq!(next_link(""), None);
+    }
 
     #[test]
     fn unit__reuse_byte_exact__truth_table() {
