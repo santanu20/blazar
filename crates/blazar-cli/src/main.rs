@@ -6243,12 +6243,16 @@ async fn tts_speak(
 }
 
 /// Compact timestamp for default output names (no chrono dep needed for
-/// a stamp this simple).
+/// a stamp this simple). Millisecond resolution plus a per-process sequence
+/// counter: two one-shots in the same millisecond still get distinct files
+/// instead of silently overwriting each other.
 fn chrono_now_compact() -> String {
-    let secs = std::time::SystemTime::now()
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    secs.to_string()
+        .map_or(0, |d| d.as_millis());
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{millis}-{seq:03}")
 }
 
 /// WAV duration from the RIFF header: walks the chunk list for `fmt `
@@ -10938,6 +10942,32 @@ async fn upgrade(version: Option<String>, dry_run: bool) -> Result<()> {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__chrono_now_compact__same_millisecond_calls_stay_distinct() {
+        let a = chrono_now_compact();
+        let b = chrono_now_compact();
+        // Sequence counter must keep back-to-back stamps distinct even when
+        // the clock has not ticked: distinct names = no silent overwrite.
+        assert_ne!(a, b);
+        // Millisecond resolution: 13-digit epoch-ms prefix, then "-<seq>".
+        let (ms, seq) = b.split_once('-').expect("millis-seq format");
+        assert!(ms.len() >= 13, "millisecond epoch prefix: {ms}");
+        assert!(!seq.is_empty() && seq.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn unit__ppid_from_stat__parses_past_spaces_in_comm() {
+        // comm with spaces and parens (kernel threads, java-style names)
+        let stat = "42 (sd-server (child)) S 41 0 0 0 -1 4194560";
+        assert_eq!(ppid_from_stat(stat), Some(41));
+        // Plain comm, pid == 1 style root
+        let stat = "1 (systemd) S 0 1 1 0 -1";
+        assert_eq!(ppid_from_stat(stat), Some(0));
+        // Garbage: no closing paren, no numbers — None, never a guess.
+        assert_eq!(ppid_from_stat("garbage"), None);
+        assert_eq!(ppid_from_stat(""), None);
+    }
 
     fn gap_engine_row(tag: &str, kind: EngineKind, archs: &[&str]) -> blazar_core::EngineRow {
         blazar_core::EngineRow {
