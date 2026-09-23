@@ -228,7 +228,7 @@ impl AppState {
     #[must_use]
     #[allow(clippy::duration_suboptimal_units)] // 10-minute ceiling mirrors long generations
     pub fn new(dirs: BlazarDirs, config: Config, sup: Arc<Supervisor>, bus: EventBus) -> Self {
-        let http = reqwest::Client::builder()
+        let http = crate::http_pool::tuned(reqwest::Client::builder())
             .timeout(std::time::Duration::from_secs(10 * 60))
             .build()
             .expect("gateway http client");
