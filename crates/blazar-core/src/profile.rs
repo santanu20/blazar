@@ -3001,6 +3001,12 @@ fn apply_sdcpp_offload(
     warnings: &mut Vec<String>,
 ) {
     const MIB: u64 = 1024 * 1024;
+    // `te` is the engine's universal text-encoder module: upstream maps
+    // the old `--clip-on-cpu` to `--backend te=cpu` (examples/common/
+    // common.cpp), so every external text-encoder stack splits the same
+    // way — the Qwen-image `--llm` family (live-verified) and the
+    // flux/SD3 `--t5xxl`/`--clip_l`/`--clip_g` family.
+    const TE_FLAGS: &[&str] = &["--llm", "--llm_vision", "--t5xxl", "--clip_l", "--clip_g"];
     let component_bytes = |flag: &str| {
         input
             .components
@@ -3018,12 +3024,12 @@ fn apply_sdcpp_offload(
     if user_owns_backend {
         return;
     }
-    let llm_family = input.components.iter().any(|c| c.flag == "--llm");
+    let te_family = input.components.iter().any(|c| TE_FLAGS.contains(&c.flag));
     let dit_vae = input.model_bytes.saturating_add(component_bytes("--vae"));
-    let te = component_bytes("--llm").saturating_add(component_bytes("--llm_vision"));
+    let te: u64 = TE_FLAGS.iter().map(|f| component_bytes(f)).sum();
     if offload.flag.is_some()
         && input.device_hint.is_some()
-        && llm_family
+        && te_family
         && dit_vae <= vram_bytes * 75 / 100
     {
         let dev = input.device_hint.unwrap_or_default();
@@ -10537,6 +10543,70 @@ mod tests {
         assert!(!p5.argv.iter().any(|a| a == "--backend"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unit__compile_sdcpp__backend_split_te_family_flux() {
+        // The flux posture: same `te` module, different flag family.
+        // Upstream maps the old --clip-on-cpu to `--backend te=cpu`, so
+        // --t5xxl/--clip_l rows split exactly like the --llm rows.
+        let g = meta();
+        let sd_flags: BTreeSet<String> = [
+            "--diffusion-model",
+            "--vae",
+            "--t5xxl",
+            "--clip_l",
+            "--clip_g",
+            "--model",
+            "--backend",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let cfg = Config::default();
+        let dir = std::env::temp_dir().join(format!("blazar-sdcpp-flux-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sparse = |name: &str, mib: u64| {
+            let p = dir.join(name);
+            std::fs::File::create(&p)
+                .unwrap()
+                .set_len(mib * 1024 * 1024)
+                .unwrap();
+            p
+        };
+        let vae = sparse("flux-vae.safetensors", 650);
+        let t5 = sparse("t5xxl.safetensors", 4_000);
+        let clip = sparse("clip_l.safetensors", 250);
+        let hw = gpu_hw(8_192, 32_000, 8); // 75% ladder = 6144 MiB
+
+        // resident 5000+650+4000+250 > 6144 trips the ladder; the
+        // DiT+VAE pair 5650 <= 6144 fits → split fires for this family
+        // too, TE (t5xxl+clip_l ~4250) streaming from RAM.
+        let components = [
+            ComponentArg::new("--vae", vae.to_str().unwrap()),
+            ComponentArg::new("--t5xxl", t5.to_str().unwrap()),
+            ComponentArg::new("--clip_l", clip.to_str().unwrap()),
+        ];
+        let mut inp = input(&g, &hw, &cfg, &sd_flags);
+        inp.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        inp.components = &components;
+        inp.device_hint = Some("Vulkan1");
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w == ["--backend", "diffusion=Vulkan1,vae=Vulkan1,te=cpu"]),
+            "{:?}",
+            p.argv
+        );
+        assert!(!p.argv.iter().any(|a| a == "--offload-to-cpu"));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("backend split") && w.contains("~4250")),
+            "{:?}",
+            p.warnings
+        );
     }
 
     #[test]
