@@ -966,6 +966,61 @@ async fn integration__supersede_stamps_fully_covered_fork_lanes() {
     assert_eq!(m2.superseded_at_epoch, m.superseded_at_epoch);
 }
 
+/// A row installed under a pre-rename data dir heals permanently: the
+/// supersede pass adopts the live engines dir and PERSISTS it, so the
+/// relocation warning fires once ever instead of on every boot, and a
+/// second pass leaves the healed row untouched.
+#[allow(non_snake_case)]
+#[tokio::test]
+async fn integration__re_root_heal_persists_stale_engine_row() {
+    let (_tmp, dirs) = tmp_dirs();
+    let mgr = manager(&dirs, "http://127.0.0.1:1");
+
+    // The install tree exists under the live data dir...
+    let live_dir = dirs.engines_dir().join("sglang-0.5.19");
+    std::fs::create_dir_all(&live_dir).unwrap();
+    std::fs::write(live_dir.join("sglang-server"), "#!/bin/sh\n").unwrap();
+
+    // ...but the row records a root that no longer exists (pre-rename
+    // install). Only the serde-required manifest fields are needed.
+    let manifest = serde_json::json!({
+        "tag": "sglang-0.5.19",
+        "build_number": 0,
+        "version_raw": "",
+        "devices": [],
+        "flags": [],
+        "spec_types": [],
+        "server_path": "/nonexistent-old-root/engines/sglang-0.5.19/sglang-server",
+    });
+    let store = Store::open(&dirs).unwrap();
+    store
+        .upsert_engine(&blazar_core::EngineRow {
+            tag: "sglang-0.5.19".into(),
+            asset: "pip:sglang==0.5.19".into(),
+            sha256: "x".into(),
+            installed_at: 1,
+            active: false,
+            manifest: manifest.to_string(),
+            kind: blazar_core::engine_kind::EngineKind::Sglang,
+        })
+        .unwrap();
+
+    mgr.refresh_supersede_state(0, &[]).await.unwrap();
+
+    let healed = manifest_of(&store, "sglang-0.5.19");
+    assert_eq!(
+        healed.server_path,
+        live_dir.join("sglang-server").display().to_string(),
+        "adopted path must point at the live engines dir"
+    );
+
+    // Idempotent: the healed row decodes, the recorded path exists, and
+    // the pass leaves it byte-identical.
+    mgr.refresh_supersede_state(0, &[]).await.unwrap();
+    let again = manifest_of(&store, "sglang-0.5.19");
+    assert_eq!(again.server_path, healed.server_path);
+}
+
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn integration__supersede_skips_partially_covered_fork_lanes() {

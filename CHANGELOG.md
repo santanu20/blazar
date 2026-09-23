@@ -52,6 +52,8 @@ tracked here.
 
 - **Engine spawn failures carry the io detail.** A failed `spawn()` of an engine wrapper surfaced as a bare 500; the error now names the exact path, the io error, and the remedy hint (re-rooted engines adopt the live data dir, so this usually means `blazar engine update`).
 
+- **Relocated engine rows heal permanently instead of warning forever.** A row installed under a different data dir (say, before the pallama-to-blazar rename) carried a stale absolute server path that load-time adoption fixed only in memory — so the relocation warning fired on every daemon boot. The startup supersede pass now persists the adopted path once: boot one warns and heals, every later boot is silent.
+
 - **The spawn-window reservation no longer double-counts the incoming floor.** The post-reservation admission re-check re-added the incoming model's floor on top of the reservation already holding those bytes, so a load that genuinely coexisted (6.3 GiB floor beside a 0.7 GiB resident on an 8 GiB card) wrongly evicted the resident. The re-check now tests whether the device's load (reservation included) fits the budget — live-validated: the 9b load now settles beside the resident instead of evicting it.
 
 - **Video requests now carry a frame-count knob across the compat vocabulary.**
