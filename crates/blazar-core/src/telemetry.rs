@@ -23,9 +23,18 @@ pub fn init_tracing(verbosity: u8, log_level: Option<&str>) {
             None => EnvFilter::new(default),
         },
     };
-    tracing_subscriber::fmt()
+    let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
-        .with_writer(std::io::stderr)
-        .init();
+        .with_writer(std::io::stderr);
+    // journald already stamps every line (with the machine's local time);
+    // a second RFC3339 UTC stamp from tracing only adds noise and a
+    // timezone mismatch. Foreground terminals have no outer stamper, so
+    // they keep the tracing timestamp. JOURNAL_STREAM is systemd's
+    // documented marker for journald-attached stdio.
+    if std::env::var_os("JOURNAL_STREAM").is_some() {
+        builder.without_time().init();
+    } else {
+        builder.init();
+    }
 }
