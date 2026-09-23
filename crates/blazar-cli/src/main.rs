@@ -4060,6 +4060,55 @@ fn orphan_scan(models: &[blazar_core::store::ModelRow], dir: &Path) -> OrphanRep
     out
 }
 
+/// Disk-truth check per artifact lane. GGUF rows get the full metadata
+/// parse (the GGUF header IS the metadata). Every other lane gets the
+/// existence check its format honestly supports: single-file rows
+/// (safetensors weights, diffusion `DiT` files) must exist non-empty;
+/// HF-style dirs must hold at least one safetensors shard or a
+/// diffusers `model_index.json` (diffusers layouts keep the shards in
+/// subdirs, so a root-only scan would miss them); diffusion rows
+/// additionally need every recorded component on disk. Running the
+/// GGUF parser on these rows is what produced the old false
+/// "metadata unreadable (re-pull or rm)" warnings on healthy pulls.
+fn model_artifact_readable(m: &blazar_core::store::ModelRow) -> bool {
+    // Diffusion rows pair the path (the DiT) with component files
+    // (VAE, text encoders); the DiT alone is unservable, so every
+    // lane checks its components before the artifact-shape check.
+    let components_ok = m
+        .components
+        .iter()
+        .all(|c| std::path::Path::new(&c.path).exists());
+    let path = std::path::Path::new(&m.path);
+    if path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+    {
+        // LLM-lane GGUFs carry their architecture in metadata. DiT
+        // (diffusion) exports legitimately ship zero metadata KVs — the
+        // architecture comes from the row's component set — so component
+        // rows get the structural container check instead.
+        return if m.components.is_empty() {
+            blazar_core::read_metadata_file(path).is_ok()
+        } else {
+            components_ok && blazar_core::is_gguf_container(path)
+        };
+    }
+    if path.is_file() {
+        return components_ok && path.metadata().is_ok_and(|md| md.len() > 0);
+    }
+    if !path.is_dir() {
+        return false;
+    }
+    let has_payload = std::fs::read_dir(path).is_ok_and(|entries| {
+        entries.filter_map(Result::ok).any(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.ends_with(".safetensors") || name == "model_index.json"
+        })
+    });
+    has_payload && components_ok
+}
+
 fn doctor_models(d: &BlazarDirs) -> Vec<Check> {
     let Ok(store) = blazar_core::store::Store::open(d) else {
         return vec![Check::fail("models", "store open failed")];
@@ -4069,7 +4118,7 @@ fn doctor_models(d: &BlazarDirs) -> Vec<Check> {
     };
     let bad: Vec<String> = models
         .iter()
-        .filter(|m| blazar_core::read_metadata_file(std::path::Path::new(&m.path)).is_err())
+        .filter(|m| !model_artifact_readable(m))
         .map(|m| m.name.clone())
         .collect();
     let report = orphan_scan(&models, &d.models_dir());
@@ -4113,13 +4162,13 @@ fn doctor_models(d: &BlazarDirs) -> Vec<Check> {
     if bad.is_empty() {
         out.push(Check::ok(
             "models",
-            format!("{} pulled, all parse", models.len()),
+            format!("{} pulled, all readable", models.len()),
         ));
     } else {
         out.push(Check::warn(
             "models",
             format!(
-                "{} pulled; metadata unreadable: {} (re-pull or rm)",
+                "{} pulled; unreadable or incomplete: {} (re-pull or rm)",
                 models.len(),
                 bad.join(", ")
             ),
@@ -13403,7 +13452,7 @@ mod tests {
         assert_eq!(checks[0].name, "models");
         assert!(checks[0].warn && checks[0].ok, "{}", checks[0].detail);
         assert!(
-            checks[0].detail.contains("metadata unreadable"),
+            checks[0].detail.contains("unreadable or incomplete"),
             "{}",
             checks[0].detail
         );
@@ -13414,6 +13463,137 @@ mod tests {
                 && checks[1].detail.contains("blazar import <file> --name <n>"),
             "{}",
             checks[1].detail
+        );
+    }
+
+    #[test]
+    fn unit__doctor_models__safetensors_dir_row_not_flagged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.models_dir()).unwrap();
+        drop(blazar_core::store::Store::open(&d).unwrap());
+        // HF-style pull: a directory of shards, no GGUF anywhere. The
+        // old check ran the GGUF parser on this row and warned.
+        let dir = d.models_dir().join("qwen-awq");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model-00001-of-00002.safetensors"), b"shard").unwrap();
+        {
+            let store = blazar_core::store::Store::open(&d).unwrap();
+            store.upsert_model(&row_with_path(&dir)).unwrap();
+        }
+        let checks = doctor_models(&d);
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert!(checks[0].ok && !checks[0].warn, "{}", checks[0].detail);
+        assert!(
+            checks[0].detail.contains("1 pulled, all readable"),
+            "{}",
+            checks[0].detail
+        );
+    }
+
+    #[test]
+    fn unit__doctor_models__diffusers_layout_dir_row_not_flagged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.models_dir()).unwrap();
+        drop(blazar_core::store::Store::open(&d).unwrap());
+        // Diffusers layout: shards live in subdirs, the root only
+        // carries model_index.json — a root-only *.safetensors scan
+        // would false-flag this row.
+        let dir = d.models_dir().join("sdxl");
+        std::fs::create_dir_all(dir.join("unet")).unwrap();
+        std::fs::write(dir.join("model_index.json"), b"{}").unwrap();
+        std::fs::write(
+            dir.join("unet/diffusion_pytorch_model.safetensors"),
+            b"shard",
+        )
+        .unwrap();
+        {
+            let store = blazar_core::store::Store::open(&d).unwrap();
+            store.upsert_model(&row_with_path(&dir)).unwrap();
+        }
+        let checks = doctor_models(&d);
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert!(checks[0].ok && !checks[0].warn, "{}", checks[0].detail);
+    }
+
+    #[test]
+    fn unit__doctor_models__dit_gguf_zero_metadata_row_not_flagged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.models_dir()).unwrap();
+        drop(blazar_core::store::Store::open(&d).unwrap());
+        // DiT export: GGUF container with zero metadata KVs (header jumps
+        // straight to tensor infos) plus an external VAE component. The
+        // old check demanded LLM-style metadata and warned on it.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        let dit = d.models_dir().join("qwen-image.gguf");
+        std::fs::write(&dit, &buf).unwrap();
+        let vae = d.models_dir().join("vae.safetensors");
+        std::fs::write(&vae, b"vae").unwrap();
+        let mut row = row_with_path(&dit);
+        row.components = vec![blazar_core::store::ComponentFile {
+            flag: "vae".into(),
+            path: vae.display().to_string(),
+        }];
+        {
+            let store = blazar_core::store::Store::open(&d).unwrap();
+            store.upsert_model(&row).unwrap();
+        }
+        let checks = doctor_models(&d);
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert!(checks[0].ok && !checks[0].warn, "{}", checks[0].detail);
+        assert!(
+            checks[0].detail.contains("1 pulled, all readable"),
+            "{}",
+            checks[0].detail
+        );
+    }
+
+    #[test]
+    fn unit__doctor_models__diffusion_row_missing_component_flagged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.models_dir()).unwrap();
+        drop(blazar_core::store::Store::open(&d).unwrap());
+        let dit = d.models_dir().join("dit.safetensors");
+        std::fs::write(&dit, b"weights").unwrap();
+        let mut row = row_with_path(&dit);
+        row.components = vec![blazar_core::store::ComponentFile {
+            flag: "vae".into(),
+            path: d
+                .models_dir()
+                .join("missing-vae.safetensors")
+                .display()
+                .to_string(),
+        }];
+        {
+            let store = blazar_core::store::Store::open(&d).unwrap();
+            store.upsert_model(&row).unwrap();
+        }
+        let checks = doctor_models(&d);
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert!(checks[0].warn && checks[0].ok, "{}", checks[0].detail);
+        assert!(
+            checks[0].detail.contains("unreadable or incomplete"),
+            "{}",
+            checks[0].detail
         );
     }
 

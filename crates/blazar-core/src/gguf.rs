@@ -730,6 +730,34 @@ fn is_truncated(e: &CoreError) -> bool {
     e.to_string().contains("unexpected end of GGUF metadata")
 }
 
+/// Structural GGUF check: valid magic, a supported version, and at least
+/// one tensor. Diffusion-lane `.gguf` exports (`DiT` weights paired with
+/// `--vae`/`--llm` components) legitimately carry zero metadata KVs — the
+/// architecture is supplied by the row's component set, not the file — so
+/// they can never satisfy [`read_metadata_file`]'s `general.architecture`
+/// requirement. This answers the narrower question: is this a GGUF
+/// container at all?
+#[must_use]
+pub fn is_gguf_container(path: &Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    // 24 bytes = magic(4) + version(4) + tensor_count(8) + kv_count(8).
+    let mut head = [0u8; 24];
+    let mut read = 0;
+    while read < head.len() {
+        match file.read(&mut head[read..]) {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => read += n,
+        }
+    }
+    &head[..4] == GGUF_MAGIC
+        && (2..=3).contains(&u32::from_le_bytes(
+            head[4..8].try_into().expect("4-byte slice"),
+        ))
+        && u64::from_le_bytes(head[8..16].try_into().expect("8-byte slice")) >= 1
+}
+
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
@@ -1203,6 +1231,29 @@ mod tests {
         std::fs::write(&p, build_gguf(&qwen_like())).unwrap();
         let meta = read_metadata_file(&p).unwrap();
         assert_eq!(meta.architecture, "qwen3");
+    }
+
+    #[test]
+    fn unit__gguf_container__metadataless_dit_file_passes() {
+        // DiT (diffusion) exports ship zero KVs: header then tensor infos.
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes()); // tensor count
+        b.extend_from_slice(&0u64.to_le_bytes()); // kv count — by design
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("dit.gguf");
+        std::fs::write(&p, &b).unwrap();
+        assert!(is_gguf_container(&p));
+        // The LLM-lane reader must still refuse it: that distinction is
+        // exactly why the container check exists.
+        assert!(read_metadata_file(&p).is_err());
+
+        let mut junk = b.clone();
+        junk[..4].copy_from_slice(b"JUNK");
+        let jp = tmp.path().join("junk.gguf");
+        std::fs::write(&jp, &junk).unwrap();
+        assert!(!is_gguf_container(&jp));
     }
 
     // --- R8: hybrid-linear / recurrent KV awareness ---
