@@ -4,7 +4,7 @@ All notable changes to Pallama are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
-## [Unreleased]
+## [0.11.0] - 2026-09-23
 
 ### Added
 
