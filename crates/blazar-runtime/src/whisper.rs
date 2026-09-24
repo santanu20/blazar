@@ -681,10 +681,20 @@ impl WhisperRuntime {
             let _ = slot.take();
         }
         let port = ephemeral_port()?;
-        let mut cmd = tokio::process::Command::new(bin);
-        cmd.args(server_args(port, model_path))
+        let mut std_cmd = std::process::Command::new(bin);
+        std_cmd
+            .args(server_args(port, model_path))
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
+        #[cfg(unix)]
+        {
+            // Kernel lifetime tie: the whisper-server must not outlive
+            // the process that spawned it (crash/SIGKILL/terminal
+            // close would otherwise leak a VRAM-holding child).
+            crate::probe::parent_death_tie(&mut std_cmd);
+        }
+        let mut cmd = tokio::process::Command::from(std_cmd);
+        cmd.kill_on_drop(true);
         if cfg!(unix) {
             // The binary dlopens sibling libggml*.so; the loader does not
             // search the executable's own directory.

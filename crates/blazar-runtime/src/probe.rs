@@ -73,6 +73,48 @@ pub(crate) fn with_spawn_retry<T>(
     }
 }
 
+/// Tie a spawned child's lifetime to the spawning PROCESS: when the
+/// parent dies for any reason — crash, SIGKILL, terminal close, runtime
+/// teardown — the kernel delivers SIGTERM to the child. This is the
+/// guarantee `kill_on_drop` cannot give: drop handlers only run while
+/// the owning runtime is still alive, so an owner killed mid-flight
+/// would otherwise leak VRAM-holding engine children (live-verified:
+/// an orphaned llama-server held 5.3 GiB after its parent serve died
+/// in a terminal scope).
+///
+/// The pre-fork parent pid is captured up front and re-checked inside
+/// the child: if the parent died between fork and prctl, the signal
+/// would never arm — the child exits instead of lingering. Note the
+/// kernel granularity is the forking THREAD; tokio worker threads only
+/// exit at runtime shutdown (when children should die anyway), so this
+/// is precisely the desired semantics.
+///
+/// Windows has no prctl equivalent reachable through std; there the
+/// children stay tied to the runtime's `kill_on_drop` plus the
+/// supervisor's graceful terminate lane.
+#[cfg(unix)]
+#[allow(unsafe_code)] // one prctl flag arm + one ppid read in the forked child
+pub(crate) fn parent_death_tie(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+    let parent = std::process::id();
+    // SAFETY: closure body is async-signal-safe (prctl + _exit only);
+    // it runs in the forked child before exec, per the pre_exec
+    // contract.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent as libc::pid_t {
+                // Parent died in the fork->prctl window; arming is too
+                // late. Exit before exec instead of becoming an orphan.
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Run a short-lived probe command (`--version`/`--help`/census class)
 /// under a hard deadline. A hung probe binary must fail fast instead of
 /// wedging the caller forever (F85); on timeout the child is killed and
