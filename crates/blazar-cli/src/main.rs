@@ -2625,6 +2625,39 @@ mod doctor_tests {
             ["SYSTEM", "GPU", "ENGINES", "MODELS", "CHANNELS", "RUNTIME"]
         );
     }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__whisper_pin_verdict__unpinned_clears_when_current_and_names_the_lane() {
+        // No pin file and no legacy tree under these dirs: the unpinned
+        // verdict path, with a lane-aware update command.
+        let dirs = BlazarDirs {
+            config_dir: std::env::temp_dir().join("blazar-doctor-test-cfg"),
+            data_dir: std::env::temp_dir().join("blazar-doctor-test-data"),
+        };
+        let ok = whisper_pin_verdict(
+            &dirs,
+            "b5130",
+            "b5130",
+            "blazar engine update --kind whisper",
+        );
+        assert!(ok.ok, "installed == latest clears the warning");
+        assert!(ok.detail.contains("up to date (b5130)"), "{}", ok.detail);
+
+        let warn = whisper_pin_verdict(
+            &dirs,
+            "b5130",
+            "b5131",
+            "blazar engine update --kind whisper",
+        );
+        assert!(warn.warn, "newer upstream still warns");
+        assert!(
+            warn.detail.contains("blazar engine update --kind whisper"),
+            "hint names the lane that updates the serving binary: {}",
+            warn.detail
+        );
+        assert!(warn.detail.contains("(running: b5130)"), "{}", warn.detail);
+    }
 }
 
 /// Adaptive "what to do next" footer for `blazar doctor`. Reuses the
@@ -3609,7 +3642,7 @@ async fn doctor_app_currency() -> Vec<Check> {
 /// installed means no row (same policy as remotes). Warn-only; installs
 /// stay a human action.
 async fn doctor_whisper_currency(d: &BlazarDirs) -> Vec<Check> {
-    let Some((_, tag_dir)) = blazar_runtime::whisper::server_bin(d) else {
+    if blazar_runtime::whisper::server_bin(d).is_none() {
         // Optional lane absent: say so instead of silently omitting the
         // row — doctor is where users discover the lane exists (observed
         // live: all-green doctor while transcription had no backend).
@@ -3619,10 +3652,19 @@ async fn doctor_whisper_currency(d: &BlazarDirs) -> Vec<Check> {
              (legacy: `blazar whisper --install`) enables local \
              /v1/audio/transcriptions + /v1/audio/translations",
         )];
+    }
+    // The verdict compares TAGS, never the binary's lib dir: the extract
+    // subdir name leaked in here once and the warning could not clear
+    // through any update (live: "running: whisper-bin-ubuntu-x64").
+    let installed = blazar_runtime::whisper::installed_tag(d).unwrap_or_else(|| "?".into());
+    // Update hints name the lane that actually updates the serving
+    // binary: while an engines row backs the lane, the legacy
+    // `whisper --install` tree is never picked by server_bin.
+    let action = if blazar_runtime::whisper::engines_lane_installed(d) {
+        "blazar engine update --kind whisper"
+    } else {
+        "blazar whisper --install"
     };
-    let installed = tag_dir
-        .file_name()
-        .map_or_else(|| "?".into(), |t| t.to_string_lossy().into_owned());
     let token = std::env::var("GH_TOKEN")
         .or_else(|_| std::env::var("GITHUB_TOKEN"))
         .ok();
@@ -3642,7 +3684,7 @@ async fn doctor_whisper_currency(d: &BlazarDirs) -> Vec<Check> {
     )
     .await;
     match fetched {
-        Ok(Ok(latest)) => vec![whisper_pin_verdict(d, &installed, &latest)],
+        Ok(Ok(latest)) => vec![whisper_pin_verdict(d, &installed, &latest, action)],
         Ok(Err(e)) => vec![Check::warn(
             "whisper currency",
             format!("check failed ({e:#}) — offline? set GH_TOKEN if rate limited"),
@@ -3656,8 +3698,9 @@ async fn doctor_whisper_currency(d: &BlazarDirs) -> Vec<Check> {
 
 /// Pinned-whisper currency verdict (pure): deliberate pin named as such —
 /// plain --install silently unpins, so updates point at the
-/// pin-preserving --tag form.
-fn whisper_pin_verdict(d: &BlazarDirs, installed: &str, latest: &str) -> Check {
+/// pin-preserving --tag form. `action` is the lane-aware update command
+/// for the unpinned verdict (pins are a legacy-tree concept).
+fn whisper_pin_verdict(d: &BlazarDirs, installed: &str, latest: &str, action: &str) -> Check {
     match blazar_runtime::whisper::pinned_tag(d) {
         Some(pin) if pin == latest => {
             Check::ok("whisper currency", format!("pinned to {pin} (up to date)"))
@@ -3680,12 +3723,7 @@ fn whisper_pin_verdict(d: &BlazarDirs, installed: &str, latest: &str) -> Check {
                 )
             }
         }
-        None => version_currency_verdict(
-            "whisper currency",
-            installed,
-            latest,
-            "blazar whisper --install",
-        ),
+        None => version_currency_verdict("whisper currency", installed, latest, action),
     }
 }
 
