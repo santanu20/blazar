@@ -22,7 +22,10 @@ use blazar_core::BlazarDirs;
 
 use super::gh::LLAMA_CPP_REPO;
 use super::manifest::{EngineSource, LaneProvenance};
-use super::{discard_retired_engine, restore_retired_engine, retire_engine_dir, EngineManager};
+use super::{
+    discard_retired_engine, restore_retired_engine, retire_engine_dir, CancelledInstallGuard,
+    EngineManager,
+};
 
 /// Where `engine build` compiles from. Upstream = a `bNNNN` tag of
 /// `ggml-org/llama.cpp`; Fork = an immutable `owner/repo@sha` pin of a
@@ -798,7 +801,20 @@ impl EngineManager {
             // merge into a live dir.
             let engine_dir = self.dirs.engines_dir().join(&engine_tag);
             let aside = retire_engine_dir(&engine_dir)?;
-            match install_built_binaries(&self.dirs, &bld, &engine_tag, on_line) {
+            // Panic safety for the extract below (future cancellation
+            // cannot strike here — the region from retire to register is
+            // await-free; the guard is what keeps that invariant honest
+            // if an await ever sneaks in).
+            let mut guard = CancelledInstallGuard {
+                dir: engine_dir.clone(),
+                aside: aside.clone(),
+                armed: true,
+            };
+            let installed = install_built_binaries(&self.dirs, &bld, &engine_tag, on_line);
+            // Registration owns the dir from here; a unwind past this
+            // point must not delete a dir the store may reference.
+            guard.disarm();
+            match installed {
                 Ok((_, digest)) => Ok((
                     digest,
                     aside,
