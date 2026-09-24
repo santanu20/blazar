@@ -763,8 +763,9 @@ pub struct Config {
     /// default: DISABLED — emits `--context-shift` only when true).
     #[serde(default)]
     pub context_shift: bool,
-    /// Default sampler chain, semicolon-separated as upstream takes it
-    /// ("" = engine default; e.g. `"top_k;top_p;typical"`). The char-encoded
+    /// Default sampler chain, comma-separated (`""` = engine default; e.g.
+    /// `"top_k,top_p,typical"`); translated to the upstream `;`-joined
+    /// `--samplers` form at argv compile. The char-encoded
     /// `--sampler-seq` alias is deliberately not a knob: it writes the same
     /// upstream param this knob controls.
     #[serde(default)]
@@ -2989,10 +2990,9 @@ impl Config {
             )));
         }
         if !self.samplers.is_empty()
-            && self.samplers.split(',').any(|s| {
-                !s.trim()
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !self.samplers.split(',').all(|s| {
+                let s = s.trim();
+                !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             })
         {
             return Err(CoreError::Config(format!(
@@ -3534,6 +3534,31 @@ mod tests {
         let _ = std::fs::write(&good, b"ggml");
         assert!(cfg.validate().is_ok());
         let _ = std::fs::remove_file(&d);
+    }
+
+    #[test]
+    fn unit__samplers_validation__comma_parts_trimmed_empty_rejected() {
+        // Comma-separated names, trimmed; empty parts are user typos that
+        // would otherwise land in the engine chain as unmatched names.
+        Config {
+            samplers: "top_k, top_p,typ_p".into(),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
+        Config {
+            samplers: "top_k;top_p".into(),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        for bad in [",,", "top_k,,top_p", "top_k,-bad"] {
+            let cfg = Config {
+                samplers: bad.into(),
+                ..Default::default()
+            };
+            assert!(cfg.validate().is_err(), "{bad:?} must be rejected");
+        }
     }
 
     #[test]
