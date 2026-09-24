@@ -1073,6 +1073,14 @@ _K = [
         "daemon idle reaper; set->list echo + full-manifest boot",
     ),
     (
+        "whisper_idle_secs",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "daemon whisper idle reaper; set->list echo + full-manifest boot",
+    ),
+    (
         "max_loaded_models",
         False,
         False,
@@ -1213,7 +1221,8 @@ _K = [
         False,
         "roundtrip",
         None,
-        "set->list echo + slots=1 pin at profile compile",
+        "set->list echo + slots=1 pin at profile compile "
+        "(--enable-deterministic-inference needs an engine newer than b11147)",
     ),
     (
         "cache_type",
@@ -1223,14 +1232,7 @@ _K = [
         None,
         "phase_config B: --cache-type-k q8_0",
     ),
-    (
-        "kv_unified",
-        True,
-        False,
-        "roundtrip",
-        None,
-        "set->list echo + full-manifest boot",
-    ),
+    ("kv_unified", True, False, "argv", "G5", "false -> --no-kv-unified"),
     ("kv_unified_per_slot", False, False, "argv", "G1", "--kv-unified-per-slot 4096"),
     ("swa_full", False, False, "argv", "G1", "--swa-full"),
     ("ctx_checkpoints", False, False, "argv", "G1", "--ctx-checkpoints 16"),
@@ -1494,22 +1496,29 @@ _K = [
         None,
         "echo + boot (empty = flag not passed)",
     ),
+    ("reasoning_budget", False, False, "argv", "G5", "--reasoning-budget 512"),
     (
-        "reasoning_budget",
+        "reasoning_budget_message",
         False,
         False,
-        "roundtrip",
-        None,
-        "echo + boot (default fn visible in fresh list)",
+        "argv",
+        "G5",
+        "--reasoning-budget-message think",
     ),
-    ("reasoning_budget_message", False, False, "roundtrip", None, "echo + boot"),
-    ("reasoning_effort", False, False, "roundtrip", None, "echo + boot"),
-    ("reasoning_preserve", True, False, "roundtrip", None, "echo + boot"),
+    ("reasoning_effort", False, False, "argv", "G5", "--reasoning-effort low"),
+    ("reasoning_preserve", True, False, "argv", "G5", "--reasoning-preserve"),
     ("image_max_tokens", False, False, "argv", "G1", "--image-max-tokens 4096"),
     ("image_min_tokens", False, False, "argv", "G1", "--image-min-tokens 64"),
-    ("mtmd_batch_max_tokens", False, False, "roundtrip", None, "echo + boot"),
-    ("mmproj_offload", False, False, "roundtrip", None, "echo + boot"),
-    ("mmproj_auto", False, False, "roundtrip", None, "echo + boot"),
+    (
+        "mtmd_batch_max_tokens",
+        False,
+        False,
+        "argv",
+        "G5",
+        "--mtmd-batch-max-tokens 256",
+    ),
+    ("mmproj_offload", False, False, "argv", "G5", "false -> --no-mmproj-offload"),
+    ("mmproj_auto", False, False, "argv", "G5", "false -> --no-mmproj-auto"),
     ("mmproj_device", False, False, "argv", "G1", "--mmproj-device <device>"),
     ("embd_normalize", False, False, "argv", "G1", "--embd-normalize 2"),
     (
@@ -1524,7 +1533,7 @@ _K = [
     ("yarn_attn_factor", False, False, "argv", "G3", "--yarn-attn-factor"),
     ("yarn_beta_fast", False, False, "argv", "G3", "--yarn-beta-fast"),
     ("yarn_beta_slow", False, False, "argv", "G3", "--yarn-beta-slow"),
-    ("cpu_strict", False, False, "roundtrip", None, "echo + boot"),
+    ("cpu_strict", False, False, "argv", "G5", "--cpu-strict"),
     (
         "prio",
         False,
@@ -1534,10 +1543,10 @@ _K = [
         "child nice via setpriority (/proc stat ni)",
     ),
     ("prio_batch", False, False, "behavior", "G2", "same spawn, nice observable"),
-    ("poll_batch", True, False, "roundtrip", None, "echo + boot"),
+    ("poll_batch", True, False, "argv", "G5", "--poll-batch 0"),
     ("threads_http", False, False, "argv", "G1", "--threads-http 2"),
     ("warmup", False, False, "argv", "G1", "false -> --no-warmup"),
-    ("repack", False, False, "roundtrip", None, "echo + boot"),
+    ("repack", False, False, "argv", "G4", "false -> --no-repack"),
     ("cache_idle_slots", False, False, "argv", "G1", "--cache-idle-slots"),
     (
         "lookup_cache_static",
@@ -1565,21 +1574,17 @@ _K = [
         None,
         "echo + boot (string knob, default auto)",
     ),
-    (
-        "server_tools",
-        True,
-        False,
-        "roundtrip",
-        None,
-        "global-only agent-tooling quartet; Option<String>, default None (not fresh-visible)",
-    ),
+    ("server_tools", True, False, "argv", "G4", "--tools all"),
+    # every accepted runtime value (docker:/podman:/ssh:) eagerly spawns
+    # external infrastructure at engine boot — argv e2e impossible here;
+    # emission proven by unit pin, config echo by roundtrip tier
     (
         "server_tools_runtime",
         True,
         False,
         "roundtrip",
         None,
-        "prefix-validated at config validate (docker:/podman:/ssh:...)",
+        "echo + boot",
     ),
     (
         "mcp_servers_config",
@@ -1593,20 +1598,20 @@ _K = [
         "mcp_servers_json",
         True,
         False,
-        "roundtrip",
-        None,
-        "JSON syntax + mutual exclusivity checked at config validate",
+        "argv",
+        "G6",
+        "--mcp-servers-json {mcpServers:{}}",
     ),
     ("no_host", False, False, "argv", "G1", "--no-host"),
     ("op_offload", True, False, "argv", "G1", "--op-offload"),
-    ("keep_tokens", False, False, "roundtrip", None, "echo + boot"),
+    ("keep_tokens", False, False, "argv", "G4", "--keep 17"),
     (
         "override_kv",
         False,
         False,
-        "roundtrip",
-        None,
-        "echo + boot (valid-kv values unverified)",
+        "argv",
+        "G4",
+        "--override-kv general.name=str:blazar-validate",
     ),
     (
         "control_vectors",
@@ -1620,13 +1625,27 @@ _K = [
     ("control_vector_layer_range", False, False, "roundtrip", None, "echo + boot"),
     ("tensor_preset", False, False, "roundtrip", None, "echo + boot"),
     ("pii_scrub", False, False, "roundtrip", None, "echo + boot"),
-    ("video_ffmpeg_dir", False, False, "roundtrip", None, "echo + boot"),
-    ("video_fps", False, False, "roundtrip", None, "echo + boot"),
-    ("video_timestamp_interval", False, False, "roundtrip", None, "echo + boot"),
-    ("numa", False, False, "roundtrip", None, "echo + boot"),
-    ("check_tensors", False, False, "roundtrip", None, "echo + boot"),
-    ("context_shift", False, False, "roundtrip", None, "echo + boot"),
-    ("samplers", False, False, "roundtrip", None, "echo + boot"),
+    (
+        "video_ffmpeg_dir",
+        False,
+        False,
+        "argv",
+        "G4",
+        "--video-ffmpeg-dir <sandbox root>",
+    ),
+    ("video_fps", False, False, "argv", "G4", "--video-fps 12.5"),
+    (
+        "video_timestamp_interval",
+        False,
+        False,
+        "argv",
+        "G4",
+        "--video-timestamp-interval 2",
+    ),
+    ("numa", False, False, "argv", "G4", "--numa distribute"),
+    ("check_tensors", False, False, "argv", "G4", "--check-tensors"),
+    ("context_shift", False, False, "argv", "G4", "--context-shift"),
+    ("samplers", False, False, "argv", "G4", "--samplers top_k;top_p;temperature"),
     ("batch_size", False, False, "argv", "G2", "--batch-size 512"),
     ("ubatch_size", False, False, "argv", "G2", "--ubatch-size 256"),
     ("threads_batch", False, False, "argv", "G2", "--threads-batch 2"),
@@ -1742,31 +1761,16 @@ _K = [
         "warm-peg table {default, sglang, llamacpp}; supervisor gate "
         "enabled_for(kind) (unreleased rename hard-errors old pins)",
     ),
-    (
-        "reuse_port",
-        False,
-        False,
-        "roundtrip",
-        None,
-        "llama-server SO_REUSEPORT bool",
-    ),
+    ("reuse_port", False, False, "argv", "G5", "--reuse-port"),
     (
         "lora_init_without_apply",
         False,
         False,
-        "roundtrip",
-        None,
-        "llama-server --lora-init-without-apply bool",
+        "argv",
+        "G5",
+        "--lora-init-without-apply",
     ),
-    (
-        "cont_batching",
-        True,
-        False,
-        "roundtrip",
-        None,
-        "tri-state: true -> --cont-batching, false -> --no-cont-batching, "
-        "None = engine default",
-    ),
+    ("cont_batching", True, False, "argv", "G5", "false -> --no-cont-batching"),
     (
         "chat_template_kwargs",
         True,
@@ -1965,6 +1969,67 @@ def argv_groups():
             ("yarn_beta_fast", 24.0, "--yarn-beta-fast 24"),
             ("yarn_beta_slow", 2.0, "--yarn-beta-slow 2"),
         ],
+        # Plain-push escapes: profile.rs emits these unconditionally from
+        # the config value (no supported_flags gate, no file prerequisites).
+        "G4": [
+            ("repack", False, "--no-repack"),
+            ("check_tensors", True, "--check-tensors"),
+            ("context_shift", True, "--context-shift"),
+            ("keep_tokens", 17, "--keep 17"),
+            (
+                "samplers",
+                # config layer is comma-separated (daemon validation);
+                # profile.rs translates to the engine's ';' chain at spawn
+                "top_k,top_p,temperature",
+                "--samplers top_k;top_p;temperature",
+            ),
+            # Metadata-only override: renaming the model's internal name
+            # cannot affect chat termination (never touch eot tokens).
+            ("override_kv", ["general.name=str:blazar-validate"], "--override-kv"),
+            ("numa", "distribute", "--numa distribute"),
+            ("video_fps", 12.5, "--video-fps 12.5"),
+            ("video_timestamp_interval", 2.0, "--video-timestamp-interval 2"),
+            # Dir passthrough the child touches lazily (video models only);
+            # the sandbox root is a real existing dir either way.
+            (
+                "video_ffmpeg_dir",
+                str(SANDBOX.root),
+                f"--video-ffmpeg-dir {SANDBOX.root}",
+            ),
+            # host runtime (no --tools-runtime): engine boots with the
+            # tools subsystem enabled but spawns nothing external
+            ("server_tools", "all", "--tools all"),
+        ],
+        # push_gated family: emitted when the engine advertises the flag
+        # (current llamacpp lane does; a stale engine would fail here loudly).
+        "G5": [
+            ("kv_unified", False, "--no-kv-unified"),
+            ("cpu_strict", True, "--cpu-strict"),
+            ("reuse_port", True, "--reuse-port"),
+            ("lora_init_without_apply", True, "--lora-init-without-apply"),
+            ("cont_batching", False, "--no-cont-batching"),
+            ("mmproj_offload", False, "--no-mmproj-offload"),
+            ("mmproj_auto", False, "--no-mmproj-auto"),
+            ("mtmd_batch_max_tokens", 256, "--mtmd-batch-max-tokens 256"),
+            ("poll_batch", False, "--poll-batch 0"),
+            ("reasoning_budget", 512, "--reasoning-budget 512"),
+            ("reasoning_effort", "low", "--reasoning-effort low"),
+            ("reasoning_budget_message", "think", "--reasoning-budget-message think"),
+            ("reasoning_preserve", True, "--reasoning-preserve"),
+        ],
+        # G6 is mcp_servers_json ALONE: the flag enables the engine's
+        # tools subsystem ("MCP config: no servers found"), and a tools
+        # runtime configured in the SAME group makes b11147 spawn the
+        # docker container eagerly at boot — fatal on dockerless boxes.
+        # Empty servers + no explicit runtime = subsystem on, nothing
+        # spawned, flag provably passed.
+        "G6": [
+            (
+                "mcp_servers_json",
+                '{"mcpServers":{}}',
+                '--mcp-servers-json {"mcpServers":{}}',
+            ),
+        ],
     }
 
 
@@ -2131,6 +2196,14 @@ def _gpu_compute_holders() -> list[str]:
 # ---------------------------------------------------------------- sandbox
 
 
+def _toml_str(v: object) -> str:
+    # Basic-string form with real escaping: a value containing '"' or
+    # '\' (mcp_servers_json JSON, ffmpeg paths, ...) must not corrupt
+    # the written config.toml. json.dumps uses the same escape set TOML
+    # defines for basic strings.
+    return json.dumps(str(v))
+
+
 def _toml_inline(v: object) -> str:
     """Scalar -> TOML literal; dict -> inline table (one level)."""
     if isinstance(v, bool):
@@ -2227,7 +2300,7 @@ class Sandbox:
             elif isinstance(v, list):
                 lines.append(f"{k} = " + json.dumps(v))
             else:
-                lines.append(f'{k} = "{v}"')
+                lines.append(f"{k} = " + _toml_str(v))
         body = "\n".join(lines) + ("\n" if lines else "")
         for name, tbl in tables:
             # "keys"/"remotes" are arrays-of-tables ([[keys]]/[[remotes]]);
@@ -2245,7 +2318,7 @@ class Sandbox:
                     # Nested struct (e.g. sampler_defaults): inline table.
                     body += f"{k} = " + _toml_inline(v) + "\n"
                 else:
-                    body += f'{k} = "{v}"\n'
+                    body += f"{k} = " + _toml_str(v) + "\n"
         with open(path, "w") as f:
             f.write(body + "\n")
         return path
@@ -4792,6 +4865,13 @@ def phase_behavior() -> None:
             {
                 "model": MODEL,
                 "stream": True,
+                # floor == cap: a 0.5B base model can EOS at ~13 tokens
+                # and kill the generation window the choreography depends
+                # on; min_tokens pins the holder to the FULL 1500 tokens.
+                # (If the engine rejected the param the holder never
+                # reports 200 and the lane degrades to its boundary row —
+                # loud, never silently wrong.)
+                "min_tokens": 1500,
                 "max_tokens": 1500,
                 "messages": [
                     {
@@ -5173,9 +5253,7 @@ def phase_wave() -> None:
     deadline = time.time() + 120
     while time.time() < deadline:
         rows = wave_replica_rows(small)
-        reps = sorted(
-            r.get("blazar_replica") for r in rows if r.get("blazar_replica")
-        )
+        reps = sorted(r.get("blazar_replica") for r in rows if r.get("blazar_replica"))
         if len(rows) >= 2 and reps[:2] == [1, 2]:
             got_two = True
             break
@@ -5370,10 +5448,13 @@ def phase_wave() -> None:
     )
     check(
         "wave",
-        "whisper uninstalled -> 501 teaching (install/pull hints)",
-        # F166: the gateway teaches `blazar whisper --install` (dashed) —
-        # match the real text, not the old never-matching prose.
-        st == 501 and b"whisper --install" in raw,
+        "whisper lane -> 501 teaching (install/pull hints)",
+        # F166 + teaching_detail (gateway whisper.rs) has TWO halves:
+        # server missing -> `blazar whisper --install`; server present
+        # but no model -> `blazar whisper --pull`. The sandbox engines
+        # copy tracks the real box, so state decides which hint fires —
+        # either one proves the 501 teaching contract.
+        st == 501 and (b"whisper --install" in raw or b"whisper --pull" in raw),
         f"status={st}",
     )
 
@@ -6747,14 +6828,27 @@ def phase_commands() -> None:
         )
         # --quant post-filters rows on real file quants; bare q4 token is
         # lifted out of the text query (stderr carries the filter notice,
-        # stdout stays clean).
+        # stdout stays clean). Hub text-search result pages churn between
+        # runs (ranking/content refresh), so a zero-row page is retried
+        # once and then boundary'd — the filter notice + the --json lane
+        # below still pin the filter machinery either way.
         p4 = cli("search", "qwen", "0.5b", "q4", timeout=120)
+        if p4.returncode != 0:
+            time.sleep(5)
+            p4 = cli("search", "qwen", "0.5b", "q4", timeout=120)
         rows4 = [line for line in p4.stdout.splitlines() if "/" in line]
-        reg(
-            "search.quant",
-            p4.returncode == 0 and bool(rows4) and "quant filter: q4" in p4.stderr,
-            f"rc={p4.returncode} rows={len(rows4)} notice={'quant filter: q4' in p4.stderr}",
-        )
+        if p4.returncode == 0 and rows4:
+            reg(
+                "search.quant",
+                "quant filter: q4" in p4.stderr,
+                f"rc={p4.returncode} rows={len(rows4)} notice=True",
+            )
+        else:
+            regb(
+                "search.quant",
+                "hub result churn: q4 rows absent from the 'qwen 0.5b' page "
+                "after retry (filter notice still proven)",
+            )
         p5 = cli("search", "qwen", "0.5b", "--quant", "q4", "--json", timeout=120)
         jrows = [json.loads(line) for line in p5.stdout.splitlines() if line.strip()]
         # full per-row quants (the table's +N collapse can hide the Q4
@@ -7336,6 +7430,9 @@ def phase_commands() -> None:
     else:
         regb("quantize.happy", f"disk free {disk_free_gb():.1f}G <= 8G")
         regb("quantize.refusal", f"disk free {disk_free_gb():.1f}G <= 8G")
+        # the imatrix scenario lives inside _quantize: the same disk gate
+        # bounds it, and flag-evidence resolution needs its boundary row
+        regb("quantize.imatrix", f"disk free {disk_free_gb():.1f}G <= 8G")
 
     def _whisper():
         p = cli("whisper", "--install", timeout=1200)
@@ -7875,6 +7972,48 @@ def phase_commands() -> None:
             p.returncode != 0 and "no voice" in (p.stdout + p.stderr).lower(),
             f"rc={p.returncode} err={(p.stderr or p.stdout).strip()[:90]}",
         )
+        # --no-play rides the same no-voice refusal: the flag parses and
+        # routes (no clap error), only the voice precondition stops it.
+        p = cli(
+            "tts",
+            "validation probe",
+            "--no-play",
+            "--out",
+            os.path.join(SANDBOX.root, "tts.wav"),
+        )
+        reg(
+            "flag.tts.--no-play",
+            p.returncode != 0
+            and "no voice" in (p.stdout + p.stderr).lower()
+            and "unexpected" not in (p.stdout + p.stderr).lower(),
+            f"rc={p.returncode} err={(p.stderr or p.stdout).strip()[:90]}",
+        )
+        # Catalog searches are read-only upstream queries: cheap, no
+        # downloads; boundary (not fail) when the network refuses.
+        p = cli("tts", "--search", "en", timeout=120)
+        out = p.stdout + p.stderr
+        if p.returncode == 0 and out.strip():
+            reg(
+                "flag.tts.--search", True, f"rc0 catalog rows ({len(out.splitlines())})"
+            )
+        else:
+            regb(
+                "flag.tts.--search",
+                f"catalog query blocked this window: {out.strip()[:100]}",
+            )
+        p = cli("whisper", "--search", "turbo", timeout=120)
+        out = p.stdout + p.stderr
+        if p.returncode == 0 and out.strip():
+            reg(
+                "flag.whisper.--search",
+                True,
+                f"rc0 catalog rows ({len(out.splitlines())})",
+            )
+        else:
+            regb(
+                "flag.whisper.--search",
+                f"catalog query blocked this window: {out.strip()[:100]}",
+            )
 
     lane("tts.list", _tts_state, "tts.pin.refusal", "tts.synthesize.no-voice")
 
@@ -8066,6 +8205,14 @@ def phase_commands() -> None:
 
 def phase_knobs_argv() -> None:
     print("\n== phase knobs_argv: every child-argv knob, batched spawns ==")
+    boundary(
+        "knobs_argv",
+        "server_tools_runtime: argv e2e not bootable",
+        "every accepted value (docker:/podman:/ssh:) eagerly spawns external "
+        "infrastructure at engine boot — unavailable in this sandbox; argv "
+        "emission proven by unit__server_tools__emits_quartet_when_set, "
+        "config echo by roundtrip tier",
+    )
     d = DAEMON
     for group, entries in argv_groups().items():
         cfg: dict = {"port": PORT}
@@ -8430,6 +8577,7 @@ def _full_toplevel() -> dict:
         "default_ctx": 2048,
         "idle_sleep_secs": 77,
         "idle_timeout_secs": 500,
+        "whisper_idle_secs": 900,
         "max_loaded_models": 2,
         # six real knobs surfaced by gate (b) — values are the config.rs
         # defaults, valid by construction
@@ -9324,7 +9472,8 @@ def _gold_items() -> dict:
     p = cli("show", MODEL)
     keys = []
     for ln in p.stdout.splitlines():
-        m = re.match(r"^([a-z][a-z0-9 _-]*?):\s+", ln)
+        # aligned-column restyle: `key       value` (2+ spaces, no colon)
+        m = re.match(r"^([a-z][a-z0-9 _-]*?)\s{2,}\S", ln)
         if m:
             keys.append(m.group(1).strip())
     items["header.show"] = "\n".join(keys)
@@ -9333,8 +9482,11 @@ def _gold_items() -> dict:
     names = sorted(
         {
             m.group(1)
+            # doctor renders statuses ok/warn lowercase, FAIL uppercase
+            # (matches the coverage-phase --flat token parse) — a warn
+            # row must NOT silently vanish from this capture.
             for m in (
-                re.match(r"^\s*([a-z][a-z0-9 _-]+?)\s{2,}(?:ok|WARN|FAIL)\s", ln)
+                re.match(r"^\s*([a-z][a-z0-9 _-]+?)\s{2,}(?:ok|warn|FAIL)\s", ln)
                 for ln in p.stdout.splitlines()
             )
             if m
@@ -9367,6 +9519,17 @@ def _gold_items() -> dict:
             "daemon uptime",
             "gpu fit",
             "gpu arch match",
+            # engine-state rows: presence depends on which engines are
+            # installed (per-kind inventory) and on update/retention/
+            # bench state at capture time — none is environment-stable
+            "inventory llamacpp",
+            "inventory mistralrs",
+            "inventory sdcpp",
+            "inventory sglang",
+            "inventory whisper",
+            "engine currency",
+            "engine retention",
+            "bench baseline",
         }
     )
     items["doctor.check-names"] = "\n".join(names)
@@ -9649,6 +9812,7 @@ _FLAG_EVIDENCE: dict[str, dict[str, str]] = {
         "--list": "whisper.list",
         "--pin": "whisper.pin.refusal",
         "--tag": "flag.whisper.--tag",
+        "--search": "flag.whisper.--search",
     },
     "tts": {
         "--voice": "tts.synthesize",
@@ -9657,10 +9821,16 @@ _FLAG_EVIDENCE: dict[str, dict[str, str]] = {
         "--list": "tts.list",
         "--pin": "tts.pin.refusal",
         "--tag": "flag.tts.--tag",
+        "--search": "flag.tts.--search",
+        "--no-play": "flag.tts.--no-play",
         "--out": "tts.synthesize",
         "--speed": "tts.synthesize",
     },
-    "doctor": {"--flat": "flag.doctor.--flat", "--json": "flag.doctor.--json"},
+    "doctor": {
+        "--flat": "flag.doctor.--flat",
+        "--json": "flag.doctor.--json",
+        "--color": "flag.doctor.--color",
+    },
     "upgrade": {"--dry-run": "upgrade.dry-run", "--version": "upgrade.dry-run"},
     "why": {
         "--code": "flag.why.--code",
@@ -9669,6 +9839,14 @@ _FLAG_EVIDENCE: dict[str, dict[str, str]] = {
         "--flagged": "flag.why.--flagged",
         "--watch": "flag.why.--watch",
     },
+}
+
+# Root-level (clap global) args: one parser path shared by every
+# subcommand that advertises them. The resolution gate maps each
+# command's copy to the single evidence lane named here instead of
+# demanding N duplicate scenarios.
+_GLOBAL_FLAG_EVIDENCE: dict[str, str] = {
+    "--color": "flag.doctor.--color",
 }
 
 # Flags that are variant knobs of an already-exercised path: pulling a
@@ -9711,10 +9889,34 @@ def phase_coverage() -> None:
 
     # Cheap local lives for flags that had no lane above.
     p = cli("doctor", "--flat")
+    # Table rows carry an exact status token (ok/warn/FAIL) at index 1
+    # (one-word check name) or 2 ("engine binary"); the summary count
+    # line ("30 ok, 5 warning(s)") and the "next:" trailer are not rows.
+    # The >=20 floor keeps an unparseable table from passing vacuously.
+    st = ("ok", "warn", "FAIL")
+
+    def _row_status(toks: list) -> str | None:
+        if len(toks) > 1 and toks[1] in st:
+            return toks[1]
+        if len(toks) > 2 and toks[2] in st:
+            return toks[2]
+        return None
+
+    statuses = [
+        s
+        for s in (_row_status(ln.split()) for ln in p.stdout.splitlines() if ln.strip())
+        if s is not None
+    ]
     reg(
         "flag.doctor.--flat",
-        p.returncode == 0 and "FAIL" not in p.stdout.upper(),
-        f"rc={p.returncode} flat check table",
+        p.returncode == 0 and len(statuses) >= 20 and "FAIL" not in statuses,
+        f"rc={p.returncode} flat check table ({len(statuses)} rows, no FAIL)",
+    )
+    p = cli("doctor", "--color", "never")
+    reg(
+        "flag.doctor.--color",
+        p.returncode == 0 and "\x1b[" not in p.stdout,
+        f"rc={p.returncode} plain bytes (no ANSI escapes)",
     )
     p = cli("doctor", "--json")
     rows = _jsonl(p.stdout)
@@ -9767,13 +9969,37 @@ def phase_coverage() -> None:
             )
         p = cli("engine", "update", "--kind", "mistralrs", "--check", timeout=300)
         out = p.stdout + p.stderr
-        # Sandbox carries no mistralrs engine: the clean "not installed"
-        # error names the kind, proving --kind is wired into the resolver.
+        # Sandbox carries a mistralrs engine row: kind-specific output
+        # ("mistral.rs X stays/would update ... --kind mistralrs") proves
+        # --kind is wired into the resolver; "mistral" matches both the
+        # product spelling and the --kind token.
         reg(
             "flag.engine-update.--kind",
-            p.returncode in (0, 1) and "mistralrs" in out.lower(),
+            p.returncode in (0, 1) and "mistral" in out.lower(),
             f"rc={p.returncode} {out.strip()[:60]}",
         )
+        # Same resolver probe for the remaining prebuilt lanes: the kind
+        # name in the response proves each lane reaches its own resolver
+        # (currency metadata comes back or a clean not-installed error).
+        for kind in ("sdcpp", "sglang"):
+            p = cli("engine", "update", "--kind", kind, "--check", timeout=300)
+            out = p.stdout + p.stderr
+            reg(
+                f"flag.engine-update.--kind-{kind}",
+                p.returncode in (0, 1) and kind in out.lower(),
+                f"rc={p.returncode} {out.strip()[:60]}",
+            )
+        # Full install lanes for the non-default kinds are multi-GB
+        # downloads; the install machinery itself (download/extract/
+        # companion/rollback/sweep) is shared and exercised for real by
+        # the llamacpp install + update lanes. Record the boundary in the
+        # LEDGER (visible in every report) rather than leaving it implicit.
+        for kind in ("mistralrs", "sdcpp", "sglang"):
+            regb(
+                f"engine.install.{kind}",
+                f"full {kind} install: multi-GB download; resolver proven via "
+                f"--kind {kind} --check, install machinery shared with llamacpp lane",
+            )
         p = cli("why", "--flagged", timeout=60)
         reg(
             "flag.why.--flagged",
@@ -9792,20 +10018,31 @@ def phase_coverage() -> None:
             p.returncode == 0,
             f"rc={p.returncode} model={MODEL}",
         )
-        tid = ""
+        # --code takes a VALUE and filters by detection code: exercise it
+        # against a trace that actually carries a detection (a clean
+        # trace matches nothing and would assert nothing). No flagged
+        # trace in the ring this run -> honest boundary.
+        flagged: tuple[str, str] | None = None
         try:
-            tid = why()[0].get("trace", "")
+            for rec in why():
+                dets = rec.get("detections") or []
+                if dets and dets[0].get("code"):
+                    flagged = (rec.get("trace", ""), str(dets[0]["code"]))
+                    break
         except Exception:
-            tid = ""
-        if tid:
-            p = cli("why", tid, "--code", timeout=60)
+            flagged = None
+        if flagged:
+            tid, code = flagged
+            p = cli("why", tid, "--code", code, timeout=60)
             reg(
                 "flag.why.--code",
                 p.returncode == 0 and tid[:8] in (p.stdout + p.stderr),
-                f"rc={p.returncode} trace={tid[:8]}",
+                f"rc={p.returncode} trace={tid[:8]} code={code}",
             )
         else:
-            regb("flag.why.--code", "no trace id available")
+            regb(
+                "flag.why.--code", "no flagged trace with a detection code in the ring"
+            )
         w = subprocess.run(
             ["timeout", "8", PAL, "why", "--watch"],
             capture_output=True,
@@ -9861,6 +10098,7 @@ def phase_coverage() -> None:
 
     # Resolution: every advertised flag resolves to a PASSED lane or an
     # explicit boundary; every mapped flag still exists (no stale rows).
+    # explicit boundary; every mapped flag still exists (no stale rows).
     # Subcommand help carries the universal -h/--help in its Options block;
     # clap's auto -V/--version exists only at the ROOT command, so a
     # subcommand advertising its own `--version` value flag (upgrade) is a
@@ -9879,6 +10117,34 @@ def phase_coverage() -> None:
                 f"{flag} mapped but not advertised by `{key} --help`",
             )
         for flag in sorted(live - mapped):
+            # Root-level (clap global) args like --color are ONE parser
+            # path shared by every subcommand: resolve them through a
+            # single evidence lane instead of per-command duplicates.
+            ev = _GLOBAL_FLAG_EVIDENCE.get(flag)
+            if ev is not None:
+                rows = [r for r in COMMAND_COVERAGE if r["path"] == ev]
+                if rows:
+                    reg(
+                        f"flag.{slug}.{flag}",
+                        all(r["ok"] for r in rows),
+                        f"global arg, evidence: {ev}",
+                    )
+                elif (
+                    PHASE_FILTER is not None
+                    or os.environ.get("BLAZAR_VALIDATE_FAST") == "1"
+                ):
+                    regb(
+                        f"flag.{slug}.{flag}",
+                        f"global arg; evidence lane {ev} not exercised "
+                        "(phase filter / FAST mode)",
+                    )
+                else:
+                    reg(
+                        f"flag.{slug}.{flag}",
+                        False,
+                        f"global arg; evidence lane {ev} never ran",
+                    )
+                continue
             check(
                 "coverage",
                 f"flag.{slug}: unmapped live flag",

@@ -132,6 +132,7 @@ video_fps
 video_timestamp_interval
 warm_peg
 warmup
+whisper_idle_secs
 yarn_attn_factor
 yarn_beta_fast
 yarn_beta_slow
