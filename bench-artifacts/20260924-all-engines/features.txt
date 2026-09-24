@@ -1,0 +1,18 @@
+feature | b11147-cuda | v0.9.3 | ollama(documented)
+------------------------------------------------------------------------------------------
+anthropic-api | - | Y | -
+ctx-override | Y | Y | Y
+embeddings | Y | - | Y
+grammar-gbnf | Y | - | -
+json-schema | Y | Y | Y
+kv-quant | Y | Y | -
+lora-adapter | Y | Y | Y
+metrics-endpoint | Y | Y | -
+paged-attn | Y | Y | -
+parallel-np | Y | Y | Y
+quant-on-load | Y | Y | -
+rerank | Y | - | -
+slots-sessions | Y | - | -
+spec-decode | Y | Y | -
+tokenize-endpoint | Y | - | Y
+vision-mmproj | Y | Y | Y

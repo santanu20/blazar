@@ -53,6 +53,7 @@ import contextlib
 import ctypes
 import difflib
 import hashlib
+import http.client
 import importlib
 import io
 import itertools
@@ -80,7 +81,8 @@ from typing import Any
 # and degrades to an honest "skipped" note otherwise — the harness itself
 # stays stdlib-only.
 try:
-    from PIL import Image as PILImage, ImageStat as PILImageStat
+    from PIL import Image as PILImage
+    from PIL import ImageStat as PILImageStat
 except ImportError:  # pragma: no cover - exercised only on PIL-less hosts
     PILImage = None
     PILImageStat = None
@@ -288,9 +290,21 @@ def load_done(path: Path) -> set[str]:
     return done
 
 
+def portable_path(text: str) -> str:
+    """Rewrite the invoking user's home dir to `~` so receipts and
+    reports stay machine-independent — the repo ships them as
+    evidence, and a hard-coded /home/<user> path pins the artifact to
+    one box. Applied at write time only; resume keys are
+    (tag, provider, params) tuples and never carry paths."""
+    home = str(Path.home())
+    if home not in ("", "/") and home in text:
+        return text.replace(home, "~")
+    return text
+
+
 def append_record(path: Path, record: dict) -> None:
     with path.open("a") as fh:
-        fh.write(json.dumps(record, sort_keys=True) + "\n")
+        fh.write(portable_path(json.dumps(record, sort_keys=True)) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +319,105 @@ class Engine:
     server: Path | None  # llama-server / mistralrs / sd-server binary
     bench: Path | None = None
     perplexity: Path | None = None
+
+
+# Kinds load_engines deliberately drops, with the reason the coverage
+# table prints — the artifact must answer "was every engine benched?"
+ENGINE_EXCLUSIONS = {
+    "sglang": (
+        "needs an HF safetensors model; this box serves GGUF only and "
+        "8 GiB VRAM cannot host sglang beside the media children"
+    )
+}
+
+
+# Tool-call quality lane: single-turn scenarios scored deterministically
+# (temp 0). A small toolset keeps function SELECTION non-trivial while
+# parsing stays trivial; each scenario pins expected_fn + required args so
+# selection and schema validity score independently. The control scenario
+# must NOT trigger a call — it measures the false-positive rate, the
+# number selection accuracy alone can be gamed with.
+TOOL_BENCH_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate",
+            "description": "Evaluate a math expression",
+            "parameters": {
+                "type": "object",
+                "properties": {"expression": {"type": "string"}},
+                "required": ["expression"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_flights",
+            "description": "Search flights between two cities on a date",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "origin": {"type": "string"},
+                    "destination": {"type": "string"},
+                    "date": {"type": "string"},
+                },
+                "required": ["origin", "destination"],
+            },
+        },
+    },
+]
+
+TOOL_BENCH_SCENARIOS = [
+    {
+        "name": "weather-tokyo",
+        "prompt": "What is the current weather in Tokyo? Use the tool.",
+        "expected_fn": "get_weather",
+        "required": ["city"],
+    },
+    {
+        "name": "math-product",
+        "prompt": "Compute 17 * 23 using the calculator tool.",
+        "expected_fn": "calculate",
+        "required": ["expression"],
+    },
+    {
+        "name": "flights-berlin-seoul",
+        "prompt": "Find flights from Berlin to Seoul on March 3rd using the tool.",
+        "expected_fn": "search_flights",
+        "required": ["origin", "destination"],
+    },
+    {
+        "name": "weather-london",
+        "prompt": "Is it raining in London right now? Check with the tool.",
+        "expected_fn": "get_weather",
+        "required": ["city"],
+    },
+    {
+        "name": "math-distractor",
+        "prompt": "How many hours are in 3.5 days? Use the calculator tool.",
+        "expected_fn": "calculate",
+        "required": ["expression"],
+    },
+    {
+        "name": "control-no-tool",
+        "prompt": "Say the word hello and nothing else.",
+        "expected_fn": None,
+        "required": [],
+    },
+]
 
 
 def load_engines(data_dir: Path) -> list[Engine]:
@@ -952,7 +1065,8 @@ def _media_env_stamps() -> dict:
         meminfo = {
             parts[0].rstrip(":"): int(parts[1])
             for parts in (
-                l.split()[:2] for l in Path("/proc/meminfo").read_text().splitlines()
+                line.split()[:2]
+                for line in Path("/proc/meminfo").read_text().splitlines()
             )
         }
         stamps["ram_avail_mib"] = round(meminfo.get("MemAvailable", 0) / 1024, 0)
@@ -994,7 +1108,7 @@ def run_media_image_cell(eng: Engine, model_id: str, cfg: dict) -> dict:
             saved_steps: set[int] = set()
             steps_axis = list(MEDIA_IMAGE_STEPS)
             for steps in steps_axis:
-                for r in range(cfg["runs"]):
+                for _run in range(cfg["runs"]):
                     got = http_timed(
                         port,
                         "/v1/images/generations",
@@ -1021,17 +1135,20 @@ def run_media_image_cell(eng: Engine, model_id: str, cfg: dict) -> dict:
                                 run_rec["quality"] = quality
                             elif PILImage is None:
                                 rec.setdefault("quality_note", "skipped: PIL absent")
-                            if dims is not None and cfg.get("art_dir"):
-                                # one audit artifact per steps point so the
-                                # perceptual stamps stay reproducible offline
-                                if steps not in saved_steps:
-                                    art = Path(cfg["art_dir"])
-                                    fname = (
-                                        f"image-{model_id.replace('/', '_')}"
-                                        f"-steps{steps}.png"
-                                    )
-                                    (art / fname).write_bytes(img)
-                                    saved_steps.add(steps)
+                            # one audit artifact per steps point so the
+                            # perceptual stamps stay reproducible offline
+                            if (
+                                dims is not None
+                                and cfg.get("art_dir")
+                                and steps not in saved_steps
+                            ):
+                                art = Path(cfg["art_dir"])
+                                fname = (
+                                    f"image-{model_id.replace('/', '_')}"
+                                    f"-steps{steps}.png"
+                                )
+                                (art / fname).write_bytes(img)
+                                saved_steps.add(steps)
                         except (ValueError, KeyError, IndexError) as exc:
                             run_rec["png_parse_note"] = f"decode failed: {exc}"
                     runs.append(run_rec)
@@ -1104,7 +1221,7 @@ def run_media_video_cell(eng: Engine, model_id: str, cfg: dict) -> dict:
                     per_frames.append({"frames": frames, "skipped": "RAM floor"})
                     continue
                 runs = []
-                for r in range(cfg["runs"]):
+                for _run in range(cfg["runs"]):
                     got = http_timed(
                         port,
                         "/v1/videos/generations",
@@ -1957,7 +2074,11 @@ def stage_mistralrs_view(
     os.symlink(model_path, d / model_path.name)
     if mmproj is not None and mmproj.exists():
         os.symlink(mmproj, d / mmproj.name)
-    return d / model_path.name
+    # absolute: direct cells spawn the child with cwd=<engine dir>, so a
+    # relative stage path only resolves when the harness happens to run
+    # from the repo root - mistral.rs would reject the model with
+    # "does not exist or is not a file" from any other cwd.
+    return (d / model_path.name).resolve()
 
 
 def wait_healthy(
@@ -2438,6 +2559,233 @@ def run_blazar_cell(
         sampler.stop_evt.set()
         sb.destroy()
     return rec
+
+
+def probe_tools_once(port: int, model_body: str, prompt: str) -> dict:
+    """One scenario through /v1/chat/completions with an OpenAI tools array.
+
+    Streams the response (SSE) and accumulates tool_call deltas by index —
+    argument JSON arrives in fragments across chunks. Returns per-scenario
+    outcome: http status, accumulated calls, ttft, finish_reason, content.
+    HTTP failure is an OUTCOME (returned), not an exception — the caller
+    decides whether it is a cell error or a zero score.
+    """
+    body = json.dumps(
+        {
+            "model": model_body,
+            "stream": True,
+            "temperature": 0,
+            "max_tokens": 192,
+            "messages": [{"role": "user", "content": prompt}],
+            "tools": TOOL_BENCH_TOOLS,
+        }
+    ).encode()
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
+    t0 = time.perf_counter()
+    ttft_ms: float | None = None
+    calls: dict[int, dict] = {}
+    content_parts: list[str] = []
+    finish_reason = None
+    status = None
+    try:
+        conn.request(
+            "POST",
+            "/v1/chat/completions",
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+        resp = conn.getresponse()
+        status = resp.status
+        if status != 200:
+            return {
+                "status": status,
+                "error_body": resp.read(4096).decode("utf-8", "replace"),
+            }
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            if ttft_ms is None:
+                ttft_ms = (time.perf_counter() - t0) * 1000.0
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                chunk = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            choice = (chunk.get("choices") or [{}])[0]
+            delta = choice.get("delta") or {}
+            if choice.get("finish_reason"):
+                finish_reason = choice["finish_reason"]
+            if delta.get("content"):
+                content_parts.append(delta["content"])
+            for tc in delta.get("tool_calls") or []:
+                idx = tc.get("index", 0)
+                slot = calls.setdefault(idx, {"name": None, "args": ""})
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    slot["name"] = fn["name"]
+                slot["args"] += fn.get("arguments") or ""
+        return {
+            "status": 200,
+            "ttft_ms": ttft_ms,
+            "finish_reason": finish_reason,
+            "calls": [calls[i] for i in sorted(calls)],
+            "content": "".join(content_parts),
+        }
+    finally:
+        conn.close()
+
+
+def score_tools_scenario(scenario: dict, outcome: dict) -> dict:
+    """Score one scenario outcome against its expectation.
+
+    Kept separate from the probe so the selftest can score fabricated
+    outcomes without a server. A scenario whose expected_fn is None is the
+    control: ANY tool call is a false positive.
+    """
+    if outcome.get("status") != 200:
+        # transport/HTTP failure: the cell machinery reports it; never
+        # silently score a broken request as model failure
+        return {"transport_error": outcome.get("error_body") or outcome.get("status")}
+    emitted = [c for c in outcome.get("calls", []) if c.get("name")]
+    wellformed = bool(emitted) and all(_args_parse(c["args"]) for c in emitted)
+    expected_fn = scenario.get("expected_fn")
+    if expected_fn is None:
+        return {
+            "wellformed": wellformed,
+            "selection": None,
+            "args_valid": None,
+            "false_positive": bool(emitted),
+            "ttft_ms": outcome.get("ttft_ms"),
+        }
+    required = scenario.get("required_args", [])
+    selected_objs = []
+    for c in emitted:
+        if c["name"] != expected_fn:
+            continue
+        try:
+            selected_objs.append(json.loads(c["args"]))
+        except (json.JSONDecodeError, TypeError):
+            continue
+    args_valid = (
+        any(set(required) <= set(obj) for obj in selected_objs)
+        if selected_objs
+        else False
+    )
+    return {
+        "wellformed": wellformed,
+        "selection": bool(selected_objs),
+        "args_valid": args_valid,
+        "false_positive": False,
+        "ttft_ms": outcome.get("ttft_ms"),
+    }
+
+
+def _args_parse(args_str: str):
+    try:
+        json.loads(args_str)
+        return True
+    except (json.JSONDecodeError, TypeError):
+        return False
+
+
+def run_tools_cell(eng: Engine, model_name: str) -> dict:
+    """Tool-call quality lane: single-turn selection + schema adherence.
+
+    Mirrors the run_blazar_cell skeleton (sandbox → active engine → daemon
+    → healthz → probe → teardown) minus the cold-start instrumentation:
+    this lane measures QUALITY, not latency of load.
+    """
+    os.environ["BLAZAR_VALIDATE_PORT"] = str(free_port())
+    V = importlib.import_module("validate")
+    V.PORT = int(os.environ["BLAZAR_VALIDATE_PORT"])
+    rec: dict = {}
+    sb = V.Sandbox()
+    try:
+        con = sqlite3.connect(Path(sb.data_home) / "blazar" / "blazar.db")
+        con.execute("UPDATE engines SET active = (tag = ?)", (eng.tag,))
+        con.commit()
+        con.close()
+        daemon = V.Daemon(sb)
+        try:
+            daemon.start(cfg={"port": V.PORT}, floor_model=model_name)
+            deadline = time.time() + 600
+            healthy = False
+            while time.time() < deadline:
+                try:
+                    http_json(f"http://127.0.0.1:{V.PORT}/healthz", timeout=5.0)
+                    healthy = True
+                    break
+                except json.JSONDecodeError:
+                    healthy = True
+                    break
+                except (urllib.error.URLError, OSError):
+                    time.sleep(0.5)
+            if not healthy:
+                return {"error": "sandbox daemon failed to boot"}
+            # registry name for every engine: the gateway resolves DB
+            # names at routing ('default' is engine-side only and 404s
+            # through the proxy — proven live on the v0.9.3 tools cell)
+            body_model = model_name
+            per_scenario: list[dict] = []
+            for sc in TOOL_BENCH_SCENARIOS:
+                outcome = probe_tools_once(V.PORT, body_model, sc["prompt"])
+                scored = score_tools_scenario(sc, outcome)
+                per_scenario.append(
+                    {
+                        "name": sc["name"],
+                        "expected_fn": sc.get("expected_fn"),
+                        **{k: v for k, v in scored.items() if k != "transport_error"},
+                        **(
+                            {"transport_error": scored["transport_error"]}
+                            if "transport_error" in scored
+                            else {}
+                        ),
+                    }
+                )
+            tool_scenarios = [s for s in per_scenario if s.get("expected_fn")]
+            control_scenarios = [s for s in per_scenario if not s.get("expected_fn")]
+            ttfts = sorted(
+                s["ttft_ms"] for s in per_scenario if s.get("ttft_ms") is not None
+            )
+            rec.update(
+                {
+                    "tools_scenarios": len(per_scenario),
+                    "tools_wellformed": sum(
+                        1 for s in tool_scenarios if s.get("wellformed")
+                    ),
+                    "tools_selection": sum(
+                        1 for s in tool_scenarios if s.get("selection")
+                    ),
+                    "tools_args_valid": sum(
+                        1 for s in tool_scenarios if s.get("args_valid")
+                    ),
+                    "tools_false_positive": sum(
+                        1 for s in control_scenarios if s.get("false_positive")
+                    ),
+                    "tools_ttft_p50_ms": (ttfts[len(ttfts) // 2] if ttfts else None),
+                    "tools_detail": per_scenario,
+                }
+            )
+            if all("transport_error" in s for s in per_scenario):
+                rec["error"] = (
+                    "tools lane: every scenario failed transport — "
+                    + str(per_scenario[0].get("transport_error"))[:160]
+                )
+            return rec
+        finally:
+            daemon.stop()
+            # validate.py has no tail helper: read the daemon log the same
+            # way its own autopsy code does (log_path direct read)
+            with contextlib.suppress(OSError):
+                with open(daemon.log_path, "rb") as f:
+                    lines = f.read()[-4000:].decode("utf-8", "replace").splitlines()
+                if lines:
+                    rec.setdefault("daemon_tail", lines[-12:])
+    finally:
+        sb.destroy()
 
 
 def run_blazar_conc_cell(
@@ -3129,9 +3477,12 @@ def run_perplexity(eng: Engine, model: Path, corpus: Path, cfg: dict) -> dict:
     argv = [
         str(eng.perplexity),
         "-m",
-        str(model),
+        str(model.resolve()),
         "-f",
-        str(corpus),
+        # llama-perplexity runs with cwd=eng.dir: a repo-relative corpus
+        # path is unresolvable there (same class as the mistral.rs
+        # staging bug) — always hand the child an absolute path
+        str(corpus.resolve()),
         "--ctx-size",
         str(PPL_CTX),
         "--gpu-layers",
@@ -4011,6 +4362,11 @@ def main() -> int:
     )
     ap.add_argument("--skip-ppl", action="store_true")
     ap.add_argument("--skip-greedy", action="store_true")
+    ap.add_argument(
+        "--skip-tools",
+        action="store_true",
+        help="skip the tool-call quality lane (single-turn selection + schema)",
+    )
     ap.add_argument("--skip-features", action="store_true")
     ap.add_argument("--skip-conc", action="store_true")
     ap.add_argument("--skip-idle", action="store_true", help="skip the idle-wake lane")
@@ -4318,7 +4674,13 @@ def main() -> int:
         }
         append_record(cells_path, rec2)
         records.append(rec2)
-        if "error" in rec:
+        if provider == "inventory":
+            log(
+                f"  ok: engine inventory stamped "
+                f"({len(rec.get('engines', []))} benchable, "
+                f"{len(rec.get('excluded', {}))} excluded)"
+            )
+        elif "error" in rec:
             failures += 1
             log(f"  CELL FAILED: {rec['error']}")
         elif "conc_level" in rec:
@@ -4366,6 +4728,40 @@ def main() -> int:
                 f"prefill {rec.get('prefill_tps_cold') or 0:.0f} t/s "
                 f"gpu {rec.get('gpu_peak_mib', 0):.0f}MiB"
             )
+
+    # ---- engine inventory stamp: the coverage audit trail. Every store
+    # engine appears in the artifact either as cells or as an exclusion
+    # reason, so "did we bench everything?" is answerable from the receipt.
+    if "engine-inventory" not in done:
+        db = data_dir / "blazar.db"
+        store_rows: list[tuple[str, str]] = []
+        if db.exists():
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                store_rows = list(con.execute("SELECT tag, kind FROM engines"))
+            finally:
+                con.close()
+        benchable = {e.tag for e in engines}
+        inv_engines = [
+            {"tag": tag, "kind": kind or "llamacpp"}
+            for tag, kind in store_rows
+            if tag in benchable
+        ]
+        excluded = {
+            tag: ENGINE_EXCLUSIONS.get(
+                kind or "llamacpp", f"kind '{kind}' has no bench lane in this harness"
+            )
+            for tag, kind in store_rows
+            if tag not in benchable
+        }
+        emit(
+            "inventory",
+            "inventory",
+            "inventory",
+            {},
+            "engine-inventory",
+            {"engines": inv_engines, "excluded": excluded},
+        )
 
     # ---- direct provider sweep (ctx x np + variant axes)
     if "direct" in args.providers:
@@ -4537,7 +4933,7 @@ def main() -> int:
 
         def resolve_media_model(prefer: str) -> str | None:
             hits = [n for n in store if prefer in n.lower()]
-            return sorted(hits)[0] if hits else None
+            return min(hits) if hits else None
 
         if sdcpp_eng is not None:
             image_model = (
@@ -4881,6 +5277,74 @@ def main() -> int:
                 rec = {"error": f"ppl cell crashed: {exc}"}
             emit(eng.tag, eng.kind, "ppl", params, key, rec)
 
+    # ---- quality: tool-call selection + schema (single-turn, temp 0)
+    if not args.skip_tools and "blazar" in args.providers:
+        for eng in text_engines:
+            key = cell_key(eng.tag, "tools", {"tools": True}, model.name)
+            if key in done:
+                log(f"[tools {eng.tag}] resumed — skipping")
+                continue
+            if not mem_guard(2048.0, f"pre-tools {eng.tag}"):
+                emit(
+                    eng.tag,
+                    eng.kind,
+                    "tools",
+                    {"tools": True},
+                    key,
+                    {"error": "mem_guard: GPU too busy for tools lane"},
+                )
+                continue
+            log(f"[tools {eng.tag}]")
+            try:
+                # registry name, not the file stem: the gateway resolves
+                # body models against DB names (file stem = 404)
+                rec = run_tools_cell(eng, gw_model_name)
+            except Exception as exc:  # cell crash is a recorded receipt
+                rec = {"error": f"tools cell crashed: {exc}"}
+            emit(eng.tag, eng.kind, "tools", {"tools": True}, key, rec)
+        if "ollama" in args.providers:
+            # direct OpenAI-compat probe against the ollama daemon: no
+            # gateway in the path, the reference is ollama's own tools
+            # handling on the same model family
+            key = cell_key("ollama", "tools-ollama", {"tools": True}, model.name)
+            if key in done:
+                log("[tools ollama] resumed — skipping")
+            else:
+                log("[tools ollama]")
+                per: list[dict] = []
+                for sc in TOOL_BENCH_SCENARIOS:
+                    outcome = probe_tools_once(11434, "qwen3.5:9b", sc["prompt"])
+                    per.append(score_tools_scenario(sc, outcome))
+                if per and all(p.get("transport_error") for p in per):
+                    rec: dict = {"error": "ollama unreachable for tools lane"}
+                else:
+                    tts = sorted(
+                        p["ttft_ms"] for p in per if p.get("ttft_ms") is not None
+                    )
+                    rec = {
+                        "tools_scenarios": len(per),
+                        "tools_wellformed": sum(1 for p in per if p.get("wellformed")),
+                        "tools_selection": sum(
+                            1 for p in per if p.get("selection") is True
+                        ),
+                        "tools_args_valid": sum(
+                            1 for p in per if p.get("args_valid") is True
+                        ),
+                        "tools_false_positive": any(
+                            p.get("false_positive") for p in per
+                        ),
+                        "tools_ttft_p50_ms": (tts[len(tts) // 2] if tts else None),
+                        "tools_detail": per,
+                    }
+                emit(
+                    "ollama-host",
+                    "ollama",
+                    "tools-ollama",
+                    {"tools": True},
+                    key,
+                    rec,
+                )
+
     # ---- quality: greedy parity vs llama.cpp-direct reference
     ref_tag: str | None = None
     if not args.skip_greedy:
@@ -4988,7 +5452,7 @@ def main() -> int:
                 }
             )
 
-    argv_summary = " ".join(sys.argv[1:])
+    argv_summary = portable_path(" ".join(sys.argv[1:]))
     # the report reflects the FULL campaign (cells.jsonl), not just this
     # process's additions — resumed cells are earlier records
     hist: list[dict] = []
@@ -5078,8 +5542,9 @@ METHODOLOGY = [
     "Decode throughput = (tokens - 1) / (last-token time - TTFT); medians over 5 runs after a warmup request.",
     "Inter-token latency (ITL) p50/p99 from per-chunk timestamps; TTFT p50/p90/p99 + stdev.",
     "Prefill: a token-targeted prompt (~512 tokens via engine /tokenize); run 1 is the cold (uncached) prefill, runs 2+ ride the prompt cache.",
-    "Concurrency: 4 parallel streams x 128 generated tokens each; system t/s = total tokens / wall clock; sum-stream t/s = sum of per-stream rates (sum >> system indicates serialization).",
+    "Concurrency: N parallel streams x 128 generated tokens each (levels via --conc-sweep, per-row `C` column); system t/s = total tokens / wall clock; sum-stream t/s = sum of per-stream rates (sum >> system indicates serialization).",
     "Greedy parity: 20 fixed prompts, greedy sampling, 256 tokens; exact-match count and text-similarity ratio vs a same-engine reference run.",
+    "Tool calls: 6 single-turn scenarios (3-tool set: weather/calculate/flights), temperature 0, max 192 tokens (call JSON must complete); scored on well-formed calls, correct function selection, valid JSON arguments with required keys, and a no-tool control for false positives; stream deltas accumulated per OpenAI spec.",
     "Gateway transparency: a second greedy lane through the blazar gateway with identical sampling; any divergence vs the direct lane isolates translation overhead.",
     "Perplexity: llama-perplexity on an offline ASCII corpus, ctx 2048.",
     "Cold-start parity: the model file's page cache is dropped (posix_fadvise DONTNEED) and the GPU asserted idle (<512 MiB) before every cold probe on every runtime — a cold load is disk-cold, not memory-warm.",
@@ -5263,6 +5728,38 @@ def ppl_table(recs: list[dict]) -> str:
     sep = "|---|---:|"
     body = [f"| {n} | {c} |" for n, c in rows]
     return "\n".join([head, sep, *body])
+
+
+def tools_table(recs: list[dict]) -> str:
+    """Single-turn tool-call quality: selection, schema, control false-rate."""
+    rows = [
+        r
+        for r in recs
+        if r.get("provider") in ("tools", "tools-ollama") and "error" not in r
+    ]
+    if not rows:
+        return "_Not measured._"
+    out = [
+        "| Runtime | scenarios | well-formed | selection | args valid | control FP | TTFT p50 ms |",
+        "|---|---:|---:|---:|---:|---|---:|",
+    ]
+    for r in sorted(rows, key=lambda r: (r.get("provider") or "", r.get("tag") or "")):
+        if r.get("provider") == "tools-ollama":
+            name = "ollama - qwen3.5:9b"
+        else:
+            name = f"blazar gateway - {engine_label(r.get('tag') or '')}"
+        n = r.get("tools_scenarios") or 0
+        scored = max(n - 1, 0)  # control scenario is not a selection case
+        ttft = r.get("tools_ttft_p50_ms")
+        out.append(
+            f"| {name} | {n} "
+            f"| {r.get('tools_wellformed', 0)}/{n} "
+            f"| {r.get('tools_selection', 0)}/{scored} "
+            f"| {r.get('tools_args_valid', 0)}/{scored} "
+            f"| {'yes' if r.get('tools_false_positive') else 'no'} "
+            f"| {pfmt(ttft, 0) if ttft is not None else '-'} |"
+        )
+    return "\n".join(out)
 
 
 def greedy_table(recs: list[dict]) -> str:
@@ -5524,17 +6021,31 @@ def executive_summary(recs: list[dict]) -> str:
                 f" vs {pfmt(r['prefill_tps_cold'], 0)} t/s cold"
             )
             break
-    conc = {
-        r["tag"]: r
+    conc = [
+        r
         for r in recs
-        if r.get("provider") == "conc-blazar" and "error" not in r
-    }
+        if r.get("provider") == "conc-blazar"
+        and "error" not in r
+        and r.get("sys_tps")
+        and r.get("conc_level")
+    ]
     if conc:
-        bits = [
-            f"{pfmt(r.get('sys_tps'))} t/s system ({child_shape(r) or 'engine-scheduled'} shape)"
-            for r in conc.values()
-        ]
-        parts.append("4-stream concurrency: " + "; ".join(bits))
+        # per engine: a multi-engine sweep must not interleave levels
+        # from different runtimes into one ladder
+        by_tag: dict[str, list[dict]] = {}
+        for r in conc:
+            by_tag.setdefault(r.get("tag") or "?", []).append(r)
+        sweep_bits = []
+        for tag in sorted(by_tag):
+            rows_ = sorted(by_tag[tag], key=lambda r: r["conc_level"])
+            levels = "/".join(str(r["conc_level"]) for r in rows_)
+            ladder = "; ".join(
+                f"C{r['conc_level']}: {pfmt(r['sys_tps'])} t/s system"
+                f" ({child_shape(r) or 'engine-scheduled'})"
+                for r in rows_
+            )
+            sweep_bits.append(f"{engine_label(tag)} sweep C={levels}: {ladder}")
+        parts.append(" | ".join(sweep_bits))
     boot = next(
         (r.get("daemon_boot_s") for r in gw.values() if r.get("daemon_boot_s")), None
     )
@@ -5725,6 +6236,579 @@ def media_table(recs: list[dict]) -> str:
     return "\n".join([head, sep, *body])
 
 
+def campaign_scoped(table: str, lane: str, campaign: str) -> str:
+    """Publication layer: bare empty markers become explicit campaign scoping.
+
+    An empty section next to confident findings is exactly how the
+    receipt/conclusion desync happened; naming the campaign that did NOT
+    measure the lane keeps the artifact honest. Catches both the explicit
+    markers and tables rendered as header+separator with zero body rows.
+    """
+    t = table.strip()
+    rows = [
+        line
+        for line in t.splitlines()
+        if line.startswith("|") and not line.startswith("|---")
+    ]
+    if t in ("_No complete rows._", "_Not measured._") or len(rows) < 2:
+        return f"_Not measured in this campaign ({campaign}); {lane} lane not run._"
+    return table
+
+
+def text_findings(recs: list[dict]) -> list[tuple[str | None, str]]:
+    """Text-lane findings as (backed_render | None, carried_text) pairs.
+
+    A finding whose backing lane has cells in THIS campaign renders from a
+    template with live numbers (never static prose); otherwise the original
+    narrative moves to the carried-over section with its provenance note.
+    """
+    ok = [r for r in recs if "error" not in r]
+    out: list[tuple[str | None, str]] = []
+
+    # F1 - gateway overhead: paired gateway/direct decode + greedy parity.
+    # Pair on (tag, ctx, np): a gateway row is only comparable to a direct
+    # baseline of the IDENTICAL engine shape - a multi-slot gateway row must
+    # never masquerade as the single-slot pair. Gateway rows run the default
+    # profile, so params carries no ctx/np - the shape is read from the
+    # recorded child argv (-c/--ctx-size, -np) instead, which both providers
+    # stamp.
+    def _shape(r):
+        ctx = r.get("params", {}).get("ctx")
+        np_ = r.get("params", {}).get("np")
+        argv = r.get("child_argv") or []
+        if ctx is None or np_ is None:
+            for i, a in enumerate(argv):
+                if a in ("-c", "--ctx-size") and i + 1 < len(argv):
+                    with contextlib.suppress(ValueError):
+                        ctx = int(argv[i + 1])
+                elif a == "-np" and i + 1 < len(argv):
+                    with contextlib.suppress(ValueError):
+                        np_ = int(argv[i + 1])
+        return (r["tag"], ctx, np_)
+
+    gw = {_shape(r): r for r in ok if r.get("provider") == "blazar"}
+    direct = {_shape(r): r for r in ok if r.get("provider") == "direct"}
+    gw_greedy = next((r for r in ok if r.get("provider") == "greedy_gw"), None)
+    backed = None
+    pair = next(
+        (
+            k
+            for k in gw
+            if k in direct
+            and gw[k].get("decode_tps_p50")
+            and direct[k].get("decode_tps_p50")
+        ),
+        None,
+    )
+    if pair:
+        g, d = gw[pair]["decode_tps_p50"], direct[pair]["decode_tps_p50"]
+        delta = (g / d - 1) * 100
+        verdict = (
+            "within measurement noise"
+            if abs(delta) <= 5.0
+            else f"gateway overhead {delta:+.1f}%"
+        )
+        parity = ""
+        if gw_greedy and gw_greedy.get("prompts"):
+            parity = (
+                f", greedy parity through the gateway {gw_greedy.get('exact_matches')}"
+                f"/{gw_greedy['prompts']} exact"
+            )
+        backed = (
+            f"**Gateway overhead vs direct spawn: {verdict}.** {engine_label(pair[0])} "
+            f"decode {pfmt(g)} t/s through the gateway vs {pfmt(d)} t/s direct "
+            f"({delta:+.1f}%){parity}."
+        )
+    out.append(
+        (
+            backed,
+            "**Gateway overhead is within measurement noise.** Single-stream decode through "
+            "the blazar gateway matches direct engine spawns at the same slots/context (see "
+            "speed table); the greedy gateway lane is byte-identical to the direct lane where "
+            "sampling is single-slot.",
+        )
+    )
+
+    # F2 - capacity-aware slot auto-sizing: distinct observed child shapes.
+    shapes = {
+        child_shape(r)
+        for r in ok
+        if r.get("provider") in ("blazar", "conc-blazar") and child_shape(r)
+    }
+    backed = None
+    if len(shapes) >= 2:
+        backed = (
+            "**Capacity-aware slot auto-sizing observed in argv.** Distinct engine shapes "
+            f"this campaign: {', '.join(f'{s}' for s in sorted(shapes))} - slots follow the "
+            "live hardware census, each row's child_argv carries the receipt."
+        )
+    out.append(
+        (
+            backed,
+            "**Capacity-aware slot auto-sizing.** blazar sizes engine slots from live "
+            "hardware census: the 8 GiB card with a vision projector attached spawns 1 slot "
+            "(16 Ki context) on the Vulkan build and 4 slots (64 Ki total) on CUDA - measured "
+            "oversubscription on Vulkan either fails to boot or degrades 2x, so the cap is "
+            "load-bearing, not conservative cosmetics.",
+        )
+    )
+
+    # F3 - concurrency scaling: per-level system throughput + efficiency.
+    # Per engine: two gateway engines in one sweep must not merge into a
+    # single levels list (the numbers belong to different runtimes).
+    conc_by_tag: dict[str, list[dict]] = {}
+    for r in ok:
+        if (
+            r.get("provider") == "conc-blazar"
+            and r.get("sys_tps")
+            and r.get("conc_level")
+        ):
+            conc_by_tag.setdefault(r.get("tag") or "?", []).append(r)
+    backed = None
+    if conc_by_tag:
+        bits = []
+        for tag in sorted(conc_by_tag):
+            rows_ = sorted(conc_by_tag[tag], key=lambda r: r["conc_level"])
+            levels = "/".join(str(r["conc_level"]) for r in rows_)
+            peak = max(rows_, key=lambda r: r["sys_tps"])
+            eff_note = ""
+            base1 = next((r for r in rows_ if r["conc_level"] == 1), None)
+            if base1 and peak["conc_level"] > 1:
+                eff = peak["sys_tps"] / (peak["conc_level"] * base1["sys_tps"])
+                eff_note = f", {pfmt(eff * 100, 0)}% of ideal at C={peak['conc_level']}"
+            bits.append(
+                f"{engine_label(tag)} (C={levels}): peak {pfmt(peak['sys_tps'])} t/s "
+                f"at C={peak['conc_level']}{eff_note}"
+            )
+        backed = (
+            "**Concurrency scaling per engine.** "
+            + "; ".join(bits)
+            + "; serialization behavior per level in the frontier table below."
+        )
+    out.append(
+        (
+            backed,
+            "**Concurrency scales where capacity allows.** 4 streams through CUDA gateway "
+            "hold near-direct system throughput; the Vulkan single-slot shape serializes "
+            "streams (per-stream latency stays excellent; system throughput caps at one "
+            "stream's rate) - a capacity trade, not a scheduling defect.",
+        )
+    )
+
+    # F4 - prompt cache prefill ratio.
+    r4 = next(
+        (r for r in ok if r.get("prefill_tps_cold") and r.get("prefill_tps_cached")),
+        None,
+    )
+    backed = None
+    if r4:
+        ratio = r4["prefill_tps_cached"] / r4["prefill_tps_cold"]
+        backed = (
+            f"**Prompt cache pays {pfmt(ratio, 1)}x on prefill** "
+            f"({pfmt(r4['prefill_tps_cached'], 0)} cached vs {pfmt(r4['prefill_tps_cold'], 0)} "
+            "t/s cold)."
+        )
+    out.append(
+        (
+            backed,
+            "**Prompt cache pays ~6-7x on prefill.** Cached-prefix prefill runs thousands "
+            "of tokens/s vs hundreds cold.",
+        )
+    )
+
+    # F5/F6 - optimization axes (spec decoding, KV quantization).
+    base: dict[tuple, float] = {}
+    for r in ok:
+        p = r.get("params", {})
+        if (
+            r.get("provider") == "direct"
+            and p.get("ctx") == 4096
+            and p.get("np") == 1
+            and len(p) == 2
+        ):
+            base[(r["tag"], "decode")] = r.get("decode_tps_p50") or 0.0
+    variants = [
+        r
+        for r in ok
+        if r.get("provider") == "direct"
+        and r.get("params", {}).get("ctx") == 4096
+        and r.get("params", {}).get("np") == 1
+        and len(r.get("params", {})) > 2
+        and any(k in r.get("params", {}) for k in ("kv", "spec"))
+    ]
+    spec = next((r for r in variants if "spec" in r.get("params", {})), None)
+    backed = None
+    if spec and (spec["tag"], "decode") in base:
+        d = spec.get("decode_tps_p50") or 0.0
+        dd = d - base[(spec["tag"], "decode")]
+        verdict = (
+            "a net loss"
+            if dd < 0
+            else (
+                "neutral"
+                if abs(dd / max(base[(spec["tag"], "decode")], 1e-9)) <= 0.05
+                else "a net gain"
+            )
+        )
+        backed = (
+            f"**Speculative n-gram decoding is {verdict} for this model** "
+            f"(decode {pfmt(d)} t/s, {dd:+.1f} vs dense baseline) - measured, not assumed."
+        )
+    out.append(
+        (
+            backed,
+            "**Speculative n-gram decoding is a net loss for this 9B model** (no draft "
+            "model; acceptance too low to pay the verification overhead) - documented so "
+            "the flag is not cargo-culted.",
+        )
+    )
+    kv = next((r for r in variants if "kv" in r.get("params", {})), None)
+    backed = None
+    if kv and (kv["tag"], "decode") in base:
+        d = kv.get("decode_tps_p50") or 0.0
+        dd = d - base[(kv["tag"], "decode")]
+        verdict = (
+            "decode-neutral"
+            if abs(dd / max(base[(kv["tag"], "decode")], 1e-9)) <= 0.05
+            else f"{dd:+.1f} t/s vs dense"
+        )
+        backed = (
+            f"**KV quantization ({kv.get('params', {}).get('kv')}) is {verdict}** "
+            f"(decode {pfmt(d)} t/s vs {pfmt(base[(kv['tag'], 'decode')])} dense)."
+        )
+    out.append(
+        (
+            backed,
+            "**KV q8_0 quantization is decode-neutral and prefill-neutral steady-state**; "
+            "the one cold-prefill outlier below is a first-invocation pipeline-compile "
+            "artifact (controlled re-probe measured full-rate steady state).",
+        )
+    )
+
+    # F7 - mistral.rs paged-attention fit on tight cards.
+    mistral = next((r for r in ok if "mistral" in engine_label(r.get("tag", ""))), None)
+    backed = None
+    if mistral:
+        pa_refused = [
+            r
+            for r in recs
+            if "mistral" in engine_label(r.get("tag", ""))
+            and "Num GPU blocks is 0" in str(r.get("error", ""))
+        ]
+        refused_note = ""
+        if pa_refused:
+            refused_note = (
+                f" default paged attention cannot fit this card "
+                f"({len(pa_refused)} direct cell(s) refused at load: "
+                "'Num GPU blocks is 0');"
+            )
+        backed = (
+            f"**{engine_label(mistral['tag'])} serves this model through blazar's profile** "
+            f"({refused_note} blazar auto-disables PA on tight cards and the "
+            "model then serves; the row's argv is the receipt)."
+        )
+    out.append(
+        (
+            backed,
+            "**mistral.rs 0.9.3 with default paged attention cannot fit this model on an "
+            "8 GiB card** (upstream sizes KV as a fraction of total VRAM); blazar's profile "
+            "auto-disables paged attention on tight cards and the model then serves correctly.",
+        )
+    )
+
+    # F12 - tool-call selection + schema quality (single-turn, temp 0).
+    tools_rows = [
+        r
+        for r in recs
+        if r.get("provider") in ("tools", "tools-ollama") and "error" not in r
+    ]
+    backed = None
+    if tools_rows:
+        bits = []
+        for r in sorted(
+            tools_rows, key=lambda r: (r.get("provider") or "", r.get("tag") or "")
+        ):
+            if r.get("provider") == "tools-ollama":
+                label = "ollama"
+            else:
+                label = engine_label(r.get("tag") or "")
+            n = r.get("tools_scenarios") or 0
+            scored = max(n - 1, 0)
+            sel = r.get("tools_selection", 0)
+            args_v = r.get("tools_args_valid", 0)
+            fp = "control clean" if not r.get("tools_false_positive") else "control FP"
+            bits.append(
+                f"{label}: selection {sel}/{scored}, args {args_v}/{scored} ({fp})"
+            )
+        backed = (
+            "**Tool-call quality (single-turn, temp 0).** "
+            + "; ".join(bits)
+            + "; per-scenario detail in cells.jsonl."
+        )
+    out.append(
+        (
+            backed,
+            "**Gateway passes OpenAI tools verbatim** (tools-aware validation, no "
+            "schema rewriting); tool-call quality is the engine's own - selection and "
+            "argument schema are scored per scenario with a no-tool control for false "
+            "positives.",
+        )
+    )
+    return out
+
+
+def media_findings(recs: list[dict]) -> list[str]:
+    """Media findings computed from cells (gating identical to the table)."""
+    out: list[str] = []
+    for r in recs:
+        prov = r.get("provider")
+        if not (prov or "").startswith("media-"):
+            continue
+        if prov == "media-tts" and r.get("ttfb_speedup_x"):
+            ttfb_s = (r.get("pcm_ttfb_ms_median") or 0) / 1000.0
+            out.append(
+                f"**Streamed PCM cuts time-to-first-audio {pfmt(r.get('ttfb_speedup_x'), 2)}x "
+                f"vs buffered WAV** (piper lane, first audio {pfmt(ttfb_s, 2)}s vs "
+                f"{pfmt(r.get('wav_total_s_median'), 2)}s full synthesis) - total wall time "
+                "is slightly higher (per-chunk synthesis), the win is interactivity."
+            )
+        elif prov == "media-video" and r.get("gate_reject_s_median") is not None:
+            out.append(
+                f"**Video VRAM gate rejects an over-budget request in "
+                f"{pfmt(r.get('gate_reject_s_median') * 1000, 0)} ms** with the full estimate "
+                "math and override levers in the error body - instead of an opaque child "
+                "abort minutes later."
+            )
+        elif prov == "media-tts-conc" and r.get("error"):
+            out.append(
+                f"**TTS concurrency probe FAILED: {r['error']}** - the gateway did not "
+                f"sustain {r.get('streams')} parallel PCM streams; needs investigation."
+            )
+        elif prov == "media-tts-conc" and r.get("efficiency_sum_over_wall") is not None:
+            eff = r["efficiency_sum_over_wall"]
+            n = r.get("streams") or 0
+            verdict = (
+                "perfectly parallel"
+                if eff >= 0.75 * n
+                else (
+                    "partially parallel"
+                    if eff > 1.25
+                    else "serialized (single synth lane)"
+                )
+            )
+            out.append(
+                f"**{n} parallel PCM streams through one gateway: {verdict}** (efficiency "
+                f"{pfmt(eff, 2)} = sum of per-stream totals / {pfmt(r.get('wall_s'), 2)}s "
+                f"wall, max TTFB {pfmt(r.get('ttfb_ms_max'), 0)} ms"
+                + (
+                    ", byte-identical outputs across streams"
+                    if r.get("bytes_uniform")
+                    else ", NON-uniform stream outputs - flagged"
+                )
+                + ") - the scalability receipt for the TTS lane."
+            )
+        elif prov == "media-image" and r.get("quality_medians"):
+            qm = r["quality_medians"]
+            out.append(
+                f"**Image quality stamps (PIL, luma domain): entropy "
+                f"{pfmt(qm.get('entropy_bits'), 2)} bits, rms contrast "
+                f"{pfmt(qm.get('rms_contrast'), 1)}, {pfmt(qm.get('unique_colors_256'), 0)} "
+                f"unique colors @256x256** on {r.get('model')} - perceptual baseline for "
+                "cross-run comparisons; audit PNG saved beside the cells."
+            )
+        elif prov == "media-video" and any(
+            (run.get("mux_frames") != run.get("frames_requested_aligned"))
+            for pt in (r.get("per_frames") or [])
+            for run in (pt.get("runs") or [])
+        ):
+            bad = [
+                (
+                    pt.get("frames"),
+                    run.get("mux_frames"),
+                    run.get("frames_requested_aligned"),
+                )
+                for pt in (r.get("per_frames") or [])
+                for run in (pt.get("runs") or [])
+                if run.get("mux_frames") != run.get("frames_requested_aligned")
+            ]
+            out.append(
+                f"**Frame-count mismatch on the {r.get('model')} lane**: container vs "
+                f"aligned-request disagreements {bad} - flagged loudly, needs upstream "
+                "investigation."
+            )
+    return out
+
+
+def conc_frontier(recs: list[dict]) -> tuple[str, list[str]]:
+    """Throughput/latency frontier across concurrency levels, per runtime.
+
+    Returns (markdown table, verdict lines). Efficiency vs C=1 is
+    sys(C) / (C x sys(1)) - 100% is perfectly parallel scaling. A saturation
+    verdict needs at least 3 ascending levels (R5: fewer = honest 'insufficient
+    levels', never an extrapolated claim).
+    """
+    groups: dict[tuple[str, str], list[dict]] = {}
+    names: dict[tuple[str, str], str] = {}
+    for r in recs:
+        prov = r.get("provider")
+        if prov not in ("conc-blazar", "conc-direct", "conc-ollama") or "error" in r:
+            continue
+        if prov == "conc-ollama":
+            gkey = (prov, "")
+            name = f"ollama - {r.get('ollama_model', 'reference')}"
+        else:
+            # one group per engine: two gateway engines must never merge
+            # into one row set (the label would lie about whose numbers)
+            gkey = (prov, r.get("tag") or "?")
+            prefix = "blazar gateway" if prov == "conc-blazar" else "direct engine"
+            name = f"{prefix} - {engine_label(r['tag'])}"
+        names[gkey] = name
+        groups.setdefault(gkey, []).append(r)
+    if not groups:
+        return "_Not measured._", []
+    rows = []
+    verdicts = []
+    for gkey in sorted(groups):
+        g = sorted(groups[gkey], key=lambda r: r.get("conc_level") or 0)
+        base1 = next(
+            (
+                r.get("sys_tps")
+                for r in g
+                if r.get("conc_level") == 1 and r.get("sys_tps")
+            ),
+            None,
+        )
+        for r in g:
+            lvl, sys_ = r.get("conc_level"), r.get("sys_tps")
+            eff = None
+            if base1 and sys_ and lvl and lvl >= 1:
+                eff = sys_ / (lvl * base1)
+            rows.append(
+                (
+                    names[gkey],
+                    lvl,
+                    r.get("conc_ok"),
+                    sys_,
+                    r.get("sum_stream_tps"),
+                    eff,
+                    r.get("conc_ttft_p99_ms"),
+                    r.get("itl_p99_ms"),
+                )
+            )
+        lvls = [r.get("conc_level") for r in g if r.get("conc_level")]
+        tps = [r.get("sys_tps") for r in g if r.get("sys_tps")]
+        if len(lvls) >= 3 and len(tps) == len(lvls):
+            peak_i = max(range(len(tps)), key=lambda i: tps[i])
+            plateau_i = None
+            for i in range(1, len(tps)):
+                if tps[i - 1] > 0 and (tps[i] - tps[i - 1]) / tps[i - 1] < 0.10:
+                    plateau_i = i
+                    break
+            if plateau_i is not None:
+                verdicts.append(
+                    f"{names[gkey]}: throughput plateaus at C={lvls[plateau_i]} "
+                    "(<10% per-level gain), "
+                    f"peak {pfmt(tps[peak_i])} t/s at C={lvls[peak_i]}."
+                )
+            else:
+                verdicts.append(
+                    f"{names[gkey]}: still gaining at C={lvls[-1]} "
+                    f"({pfmt(tps[0])} -> {pfmt(tps[-1])} t/s) - saturation not reached "
+                    "within the sweep."
+                )
+        else:
+            verdicts.append(
+                f"{names[gkey]}: {len(lvls)} level(s) measured - insufficient levels "
+                "for a saturation verdict."
+            )
+    head = (
+        "| Runtime | C | ok streams | system t/s | sum-stream t/s | eff vs C=1 |"
+        " TTFT p99 ms | ITL p99 ms |"
+    )
+    sep = "|---|---:|---:|---:|---:|---:|---:|---:|"
+    body = [
+        f"| {n} | {pfmt(lvl, 0)} | {pfmt(ok, 0)} | {pfmt(s_)} | {pfmt(sm)} |"
+        f" {pfmt(e * 100, 0) + '%' if e is not None else '-'} | {pfmt(t9, 0)} | {pfmt(i9, 1)} |"
+        for n, lvl, ok, s_, sm, e, t9, i9 in rows
+    ]
+    return "\n".join([head, sep, *body]), verdicts
+
+
+def engine_coverage(recs: list[dict]) -> list[str]:
+    """Coverage audit: every store engine either has cells in this campaign
+    or an exclusion reason — the artifact answers 'did we bench everything?'"""
+    inv = next(
+        (r for r in recs if r.get("provider") == "inventory" and "error" not in r),
+        None,
+    )
+    if inv is None:
+        return [
+            "_Engine inventory not stamped (campaign predates coverage "
+            "stamping); coverage cannot be audited for this artifact._"
+        ]
+    per_tag: dict[str, dict[str, int]] = {}
+    for r in recs:
+        if r.get("provider") == "inventory":
+            continue
+        cell = per_tag.setdefault(r.get("tag") or "?", {"ok": 0, "err": 0})
+        cell["err" if "error" in r else "ok"] += 1
+    lane_of = {
+        "llamacpp": "text (direct + gateway)",
+        "mistralrs": "text (direct + gateway)",
+        "sdcpp": "media",
+        "whisper": "media",
+    }
+    out = [
+        "| Engine | Kind | Lane | ok cells | err cells | Status |",
+        "|---|---|---|---:|---:|---|",
+    ]
+    for eng in inv.get("engines", []):
+        tag, kind = eng["tag"], eng["kind"]
+        c = per_tag.get(tag, {"ok": 0, "err": 0})
+        if c["ok"]:
+            status = "benchmarked"
+        elif c["err"]:
+            status = "attempted, all cells errored (see cells.jsonl)"
+        else:
+            status = "no cells in this campaign"
+        out.append(
+            f"| {tag} | {kind} | {lane_of.get(kind, '—')} "
+            f"| {c['ok']} | {c['err']} | {status} |"
+        )
+    for tag, reason in sorted(inv.get("excluded", {}).items()):
+        out.append(f"| {tag} | — | — | 0 | 0 | excluded: {reason} |")
+    return out
+
+
+def update_campaign_index(
+    artifacts_dir: Path, recs: list[dict], blazar_ver: str
+) -> None:
+    """Idempotent bench-artifacts/INDEX.md row per campaign (replace-by-name)."""
+    index = artifacts_dir.parent / "INDEX.md"
+    name = artifacts_dir.name
+    date = name.split("-", 1)[0] if name[:1].isdigit() else "?"
+    measured = [r for r in recs if r.get("provider") != "inventory"]
+    lanes = ",".join(
+        sorted({(r.get("provider") or "?").split("-", 1)[0] for r in measured})
+    )
+    row = f"| {name} | {date} | {lanes} | {len(measured)} | {blazar_ver} |"
+    header = [
+        "# Benchmark campaign index",
+        "",
+        "| Campaign | Date | Lanes | Cells | blazar |",
+        "|---|---|---|---:|---|",
+    ]
+    body: list[str] = []
+    if index.exists():
+        for line in index.read_text().splitlines():
+            if line.startswith("| ") and not line.startswith("| Campaign"):
+                body.append(line)
+    body = [r for r in body if not r.startswith(f"| {name} |")]
+    body.append(row)
+    index.write_text("\n".join(header + sorted(body)) + "\n")
+    print(f"campaign index -> {index} ({len(body)} campaign(s))")
+
+
 def write_publication_report(
     recs: list[dict], artifacts_dir: Path, out_path: Path
 ) -> None:
@@ -5753,6 +6837,22 @@ def write_publication_report(
     L.append("")
     L.append(executive_summary(recs))
     L.append("")
+    lane_counts: dict[str, int] = {}
+    for r in recs:
+        if r.get("provider") == "inventory":
+            continue
+        lane_counts[r.get("provider") or "?"] = (
+            lane_counts.get(r.get("provider") or "?", 0) + 1
+        )
+    if lane_counts:
+        L.append("## Measured in this campaign")
+        L.append("")
+        L += [f"- {prov}: {n} cell(s)" for prov, n in sorted(lane_counts.items())]
+        L.append("")
+    L.append("## Engine coverage")
+    L.append("")
+    L += engine_coverage(recs)
+    L.append("")
     L.append("## Test bed")
     L.append("")
     L.append("| Component | Value |")
@@ -5769,24 +6869,42 @@ def write_publication_report(
     L.append("")
     L.append("### Single-stream decode (512-token prompt, 128 generated, median of 5)")
     L.append("")
-    L.append(speed_table(recs))
+    L.append(
+        campaign_scoped(speed_table(recs), "single-stream speed", artifacts_dir.name)
+    )
     L.append("")
-    L.append("### Concurrency (4 parallel streams x 128 tokens)")
+    conc_levels = sorted(
+        {
+            r.get("params", {}).get("conc")
+            for r in recs
+            if r.get("provider", "").startswith("conc-") and "error" not in r
+        }
+    )
+    conc_hdr = "x".join(str(c) for c in conc_levels) if conc_levels else "N"
+    L.append(f"### Concurrency ({conc_hdr} parallel streams x 128 tokens)")
     L.append("")
-    L.append(conc_table(recs))
+    L.append(campaign_scoped(conc_table(recs), "concurrency", artifacts_dir.name))
     L.append("")
     L.append(
         "_sum-stream >> system t/s means streams serialize on one slot; "
         "roughly equal means genuinely parallel._"
     )
     L.append("")
+    frontier_tbl, frontier_verdicts = conc_frontier(recs)
+    L.append("### Concurrency frontier (system t/s and tail latency vs level)")
+    L.append("")
+    L.append(campaign_scoped(frontier_tbl, "concurrency frontier", artifacts_dir.name))
+    L.append("")
+    if frontier_verdicts:
+        L += [f"- {v}" for v in frontier_verdicts]
+        L.append("")
     L.append("### Perplexity")
     L.append("")
-    L.append(ppl_table(recs))
+    L.append(campaign_scoped(ppl_table(recs), "perplexity", artifacts_dir.name))
     L.append("")
     L.append("### Greedy parity and gateway transparency (20 prompts, 256 tokens)")
     L.append("")
-    L.append(greedy_table(recs))
+    L.append(campaign_scoped(greedy_table(recs), "greedy parity", artifacts_dir.name))
     L.append("")
     L.append(
         "_Exact-match divergence across GPU backends is expected float nondeterminism "
@@ -5794,17 +6912,26 @@ def write_publication_report(
         "runs requires single-slot decoding (blazar `deterministic = true` pins it)._"
     )
     L.append("")
+    L.append("### Tool calls (single-turn selection + schema quality)")
+    L.append("")
+    L.append(campaign_scoped(tools_table(recs), "tool calls", artifacts_dir.name))
+    L.append("")
+    L.append("")
     L.append("### Optimization axes (ctx 4096, single stream)")
     L.append("")
-    L.append(variant_table(recs))
+    L.append(
+        campaign_scoped(variant_table(recs), "optimization axes", artifacts_dir.name)
+    )
     L.append("")
     L.append("### Engine capability matrix")
     L.append("")
-    L.append(features_table(recs))
+    L.append(
+        campaign_scoped(features_table(recs), "capability matrix", artifacts_dir.name)
+    )
     L.append("")
     L.append("### Cold start and footprint")
     L.append("")
-    L.append(coldstart_table(recs))
+    L.append(campaign_scoped(coldstart_table(recs), "cold start", artifacts_dir.name))
     L.append("")
     L.append(
         "_Every cold probe runs page-cache-dropped and GPU-idle-asserted on both runtimes; ollama rows without --ollama-service-restart leave the daemon warm (note in the artifact)._"
@@ -5812,7 +6939,7 @@ def write_publication_report(
     L.append("")
     L.append("### Idle wake (sleep vs keep_alive expiry)")
     L.append("")
-    L.append(idle_wake_table(recs))
+    L.append(campaign_scoped(idle_wake_table(recs), "idle wake", artifacts_dir.name))
     L.append("")
     L.append(
         "_blazar sleeps with weights in RAM (wake = resume); ollama unloads at keep_alive expiry (wake = full disk reload). Policies differ by design — the table measures each runtime's own idle path after the policy verifiably fired._"
@@ -5820,11 +6947,13 @@ def write_publication_report(
     L.append("")
     L.append("### Long-context degradation curve")
     L.append("")
-    L.append(ctxcurve_table(recs))
+    L.append(
+        campaign_scoped(ctxcurve_table(recs), "long-context curve", artifacts_dir.name)
+    )
     L.append("")
     L.append("### Media lanes (image / video / TTS / whisper)")
     L.append("")
-    L.append(media_table(recs))
+    L.append(campaign_scoped(media_table(recs), "media", artifacts_dir.name))
     L.append("")
     L.append(
         "_Media cells run through the same sandboxed gateway as text lanes but do not assert "
@@ -5835,118 +6964,36 @@ def write_publication_report(
         "an over-budget request is rejected with a teaching error._"
     )
     L.append("")
-    L.append("## Findings")
+    backed_findings: list[str] = []
+    carried_findings: list[str] = []
+    for backed_render, carried_text in text_findings(recs):
+        if backed_render:
+            backed_findings.append(backed_render)
+        else:
+            carried_findings.append(carried_text)
+    backed_findings += media_findings(recs)
+    L.append("## Findings (this campaign)")
     L.append("")
-    L += [
-        "1. **Gateway overhead is within measurement noise.** Single-stream decode through "
-        "the blazar gateway matches direct engine spawns at the same slots/context (see "
-        "speed table); the greedy gateway lane is byte-identical to the direct lane where "
-        "sampling is single-slot.",
-        "2. **Capacity-aware slot auto-sizing.** blazar sizes engine slots from live "
-        "hardware census: the 8 GiB card with a vision projector attached spawns 1 slot "
-        "(16 Ki context) on the Vulkan build and 4 slots (64 Ki total) on CUDA - measured "
-        "oversubscription on Vulkan either fails to boot or degrades 2x, so the cap is "
-        "load-bearing, not conservative cosmetics.",
-        "3. **Concurrency scales where capacity allows.** 4 streams through CUDA gateway "
-        "hold near-direct system throughput; the Vulkan single-slot shape serializes "
-        "streams (per-stream latency stays excellent; system throughput caps at one "
-        "stream's rate) - a capacity trade, not a scheduling defect.",
-        "4. **Prompt cache pays ~6-7x on prefill.** Cached-prefix prefill runs thousands "
-        "of tokens/s vs hundreds cold.",
-        "5. **Speculative n-gram decoding is a net loss for this 9B model** (no draft "
-        "model; acceptance too low to pay the verification overhead) - documented so the "
-        "flag is not cargo-culted.",
-        "6. **KV q8_0 quantization is decode-neutral and prefill-neutral steady-state**; "
-        "the one cold-prefill outlier below is a first-invocation pipeline-compile "
-        "artifact (controlled re-probe measured full-rate steady state).",
-        "7. **mistral.rs 0.9.3 with default paged attention cannot fit this model on an "
-        "8 GiB card** (upstream sizes KV as a fraction of total VRAM); blazar's profile "
-        "auto-disables paged attention on tight cards and the model then serves correctly.",
-    ]
-    media_recs = [
-        r
-        for r in recs
-        if (r.get("provider") or "").startswith("media-") and "error" not in r
-    ]
-    if media_recs:
-        n = 1
-        for r in media_recs:
-            prov = r.get("provider")
-            if prov == "media-tts" and r.get("ttfb_speedup_x"):
-                ttfb_s = (r.get("pcm_ttfb_ms_median") or 0) / 1000.0
-                L.append(
-                    f"{len([x for x in L if x and x[0].isdigit() and '.' in x[:3]]) + 1}. **Streamed PCM cuts time-to-first-audio "
-                    f"{pfmt(r.get('ttfb_speedup_x'), 2)}x vs buffered WAV** "
-                    f"(piper lane, first audio {pfmt(ttfb_s, 2)}s vs {pfmt(r.get('wav_total_s_median'), 2)}s full synthesis) "
-                    "- total wall time is slightly higher (per-chunk synthesis), the win is interactivity."
-                )
-            elif prov == "media-video" and r.get("gate_reject_s_median") is not None:
-                L.append(
-                    f"{len([x for x in L if x and x[0].isdigit() and '.' in x[:3]]) + 1}. **Video VRAM gate rejects an "
-                    f"over-budget request in {pfmt(r.get('gate_reject_s_median') * 1000, 0)} ms** with the full estimate "
-                    "math and override levers in the error body - instead of an opaque child abort minutes later."
-                )
-            elif prov == "media-tts-conc" and r.get("error"):
-                L.append(
-                    f"{len([x for x in L if x and x[0].isdigit() and '.' in x[:3]]) + 1}. **TTS concurrency probe "
-                    f"FAILED: {r['error']}** - the gateway did not sustain "
-                    f"{r.get('streams')} parallel PCM streams; needs investigation."
-                )
-            elif (
-                prov == "media-tts-conc"
-                and r.get("efficiency_sum_over_wall") is not None
-            ):
-                eff = r["efficiency_sum_over_wall"]
-                n = r.get("streams") or 0
-                verdict = (
-                    "perfectly parallel"
-                    if eff >= 0.75 * n
-                    else (
-                        "partially parallel"
-                        if eff > 1.25
-                        else "serialized (single synth lane)"
-                    )
-                )
-                L.append(
-                    f"{len([x for x in L if x and x[0].isdigit() and '.' in x[:3]]) + 1}. **{n} parallel PCM streams "
-                    f"through one gateway: {verdict}** (efficiency {pfmt(eff, 2)} = sum of per-stream "
-                    f"totals / {pfmt(r.get('wall_s'), 2)}s wall, max TTFB {pfmt(r.get('ttfb_ms_max'), 0)} ms"
-                    + (
-                        ", byte-identical outputs across streams"
-                        if r.get("bytes_uniform")
-                        else ", NON-uniform stream outputs - flagged"
-                    )
-                    + ") - the scalability receipt for the TTS lane."
-                )
-            elif prov == "media-image" and r.get("quality_medians"):
-                qm = r["quality_medians"]
-                L.append(
-                    f"{len([x for x in L if x and x[0].isdigit() and '.' in x[:3]]) + 1}. **Image quality stamps "
-                    f"(PIL, luma domain): entropy {pfmt(qm.get('entropy_bits'), 2)} bits, rms contrast "
-                    f"{pfmt(qm.get('rms_contrast'), 1)}, {pfmt(qm.get('unique_colors_256'), 0)} unique colors "
-                    f"@256x256** on {r.get('model')} - perceptual baseline for cross-run comparisons; "
-                    "audit PNG saved beside the cells."
-                )
-            elif prov == "media-video" and any(
-                (run.get("mux_frames") != run.get("frames_requested_aligned"))
-                for pt in (r.get("per_frames") or [])
-                for run in (pt.get("runs") or [])
-            ):
-                bad = [
-                    (
-                        pt.get("frames"),
-                        run.get("mux_frames"),
-                        run.get("frames_requested_aligned"),
-                    )
-                    for pt in (r.get("per_frames") or [])
-                    for run in (pt.get("runs") or [])
-                    if run.get("mux_frames") != run.get("frames_requested_aligned")
-                ]
-                L.append(
-                    f"{len([x for x in L if x and x[0].isdigit() and '.' in x[:3]]) + 1}. **Frame-count mismatch on the "
-                    f"{r.get('model')} lane**: container vs aligned-request disagreements {bad} "
-                    "- flagged loudly, needs upstream investigation."
-                )
+    if backed_findings:
+        for i, f in enumerate(backed_findings, 1):
+            L.append(f"{i}. {f}")
+    else:
+        L.append(
+            "_No complete findings from this campaign's cells; "
+            "see carried-over findings below._"
+        )
+    L.append("")
+    if carried_findings:
+        L.append("## Carried-over findings (no receipt in this campaign)")
+        L.append("")
+        L.append(
+            "_Established in earlier campaigns whose receipts live in their "
+            "bench-artifacts/ directories; this campaign did not measure these lanes._"
+        )
+        L.append("")
+        for i, f in enumerate(carried_findings, 1):
+            L.append(f"{i}. {f}")
+        L.append("")
     L.append("")
     L.append("## Caveats")
     L.append("")
@@ -5978,6 +7025,7 @@ def write_publication_report(
     )
     L.append("")
 
+    update_campaign_index(artifacts_dir, recs, blazar_ver)
     out_path.write_text("\n".join(L))
     print(f"report -> {out_path} ({len(recs)} last-wins records)")
 

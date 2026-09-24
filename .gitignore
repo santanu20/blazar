@@ -17,3 +17,11 @@ __pycache__/
 
 # nuclear-audit working ledgers
 /.audit/
+
+# bench campaign scratch: staging symlinks point at user-local models,
+# stderr logs are debugging-only — receipts are cells.jsonl/summary/png.
+# corpus.txt is regenerable harness output (deterministic repo-text ppl
+# corpus) that captures working-tree prose incl. machine paths.
+bench-artifacts/*/staging/
+bench-artifacts/*/cells-stderr/
+bench-artifacts/*/corpus.txt
