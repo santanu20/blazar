@@ -251,11 +251,35 @@ if [ "$(uname -m)" = x86_64 ] && [ -x "$STUB" ]; then
     else
         bad "engine bootstrap did not complete (rc=$RC)"; echo "$OUT" | sed 's/^/    /'
     fi
-    LIST=$(env HOME=$TMP/home BLAZAR_GH_BASE= "$SYSTEM_BIN/blazar" engine list 2>/dev/null) || LIST=
-    echo "$LIST" | grep -q "$ETAG.*\[active\]" &&
+    LIST=$(env HOME=$TMP/home BLAZAR_GH_BASE= "$SYSTEM_BIN/blazar" engine list --json 2>/dev/null) || LIST=
+    # Rows are compact JSON objects (alphabetical keys): scope the
+    # active check to the installed tag's row, order-proof.
+    ROW=$(printf '%s\n' "$LIST" | grep "\"tag\":\"$ETAG\"")
+    printf '%s\n' "$ROW" | grep -q '"active": *true' &&
         ok "engine ${ETAG} installed and ACTIVE (persisted in store)" ||
         bad "engine not active after install: $LIST"
     echo "$OUT" | grep -q "system ready" && ok "final readiness status printed" || bad "no readiness status"
+
+    # --- 4b. rerun with an active engine: bootstrap lane never entered ------
+    # The engine tarball is now GONE from the fake server. If the rerun's
+    # already-active guard regressed, the bootstrap would run and die on
+    # the 404 (loud WARN) — a clean skip proves the guard matched and no
+    # engine bytes were requested.
+    rm -f "$SRV/$EASSET"
+    OUT2=$(env $ENGINE_ENV sh "$INSTALL_SH" 2>&1) && RC2=0 || RC2=$?
+    [ "$RC2" = 0 ] &&
+        ok "rerun completes with an active engine present" ||
+        bad "rerun failed (rc=$RC2)"; echo "$OUT2" | sed 's/^/    /'
+    echo "$OUT2" | grep -q "skipping engine download" &&
+        ok "rerun skipped the engine download (guard matched)" ||
+        bad "rerun did not skip engine bootstrap"
+    echo "$OUT2" | grep -q "WARN: engine bootstrap failed" &&
+        bad "rerun entered the engine lane (404 on the deleted tarball)" ||
+        ok "rerun never entered the engine bootstrap lane"
+    LIST2=$(env HOME=$TMP/home BLAZAR_GH_BASE= "$SYSTEM_BIN/blazar" engine list --json 2>/dev/null) || LIST2=
+    printf '%s\n' "$LIST2" | grep "\"tag\":\"$ETAG\"" | grep -q '"active": *true' &&
+        ok "engine ${ETAG} still active after rerun (store untouched)" ||
+        bad "engine store churned by rerun: $LIST2"
 else
     echo "SKIP: case 4 needs x86_64 host + $STUB"
 fi

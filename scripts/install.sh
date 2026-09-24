@@ -722,7 +722,7 @@ EOF
     # BLAZAR_INSTALL_MODEL=<repo> (pull lane, opt-in — model choice is
     # the user's call, not the installer's).
     if [ "${BLAZAR_INSTALL_ENGINE:-1}" != 0 ] &&
-       ! as_user "$BIN_DIR/blazar" engine list 2>/dev/null | grep -q '\[active\]'; then
+       ! as_user "$BIN_DIR/blazar" engine list --json 2>/dev/null | grep -q '"active": *true'; then
         status "bootstrapping llama.cpp engine (blazar engine update — largest download of this install)..."
         if as_user "$BIN_DIR/blazar" engine update --no-gate; then
             status "engine bootstrap complete"
