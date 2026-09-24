@@ -1608,15 +1608,60 @@ fn engine_arch_gap(
     }
 }
 
+/// Human label for the ENGINE cell: the engine's kind plus its version
+/// tail, stripping only the redundant `kind-` prefix when the tag
+/// carries one (`sglang-0.5.19` -> `sglang 0.5.19`; `b11147-cuda`,
+/// `master-890-74988b2`, `v0.9.3` keep the full tag as the version —
+/// the release tag IS the version). Lanes without a matching engine
+/// row ("-") keep the raw tag — it IS the identity.
+fn engine_cell_label(engine_rows: &[blazar_core::EngineRow], tag: &str) -> String {
+    let Some(row) = engine_rows.iter().find(|r| r.tag == tag) else {
+        return tag.to_string();
+    };
+    let kind = row.kind.as_str();
+    if tag == kind {
+        return kind.to_string();
+    }
+    let version = tag.strip_prefix(&format!("{kind}-")).unwrap_or(tag);
+    format!("{kind} {version}")
+}
+
+/// Serving-modality class for the CATEGORY column. Component sets are
+/// diffusion pulls (the curated family table says image vs video; an
+/// uncurated set stays "diffusion" — sets only originate from curated
+/// pulls, so the fallback is a near-impossible edge). The projector
+/// marks vision-capable VLMs, trailing-encoder archs are pipeline
+/// encoders (t5/umt5), everything else is text. Whisper STT/TTS models
+/// live in their own store and never appear in this listing.
+fn model_category(m: &blazar_core::store::ModelRow) -> &'static str {
+    if m.has_component_set() {
+        return match blazar_runtime::diffusion::family_mode(&m.repo) {
+            Some(blazar_runtime::diffusion::FamilyMode::Vid) => "video",
+            Some(blazar_runtime::diffusion::FamilyMode::Img) => "image",
+            None => "diffusion",
+        };
+    }
+    if m.mmproj_path.is_some() {
+        return "vision";
+    }
+    if m.arch.as_deref().is_some_and(|a| a.ends_with("encoder")) {
+        return "encoder";
+    }
+    "text"
+}
+
 /// Engine cell for one `list` table row: appends the dagger and records
 /// the (lane, arch) gap when the routed lane cannot load the model's
-/// GGUF arch (see [`engine_arch_gap`]).
+/// GGUF arch (see [`engine_arch_gap`]). Both the cell and the footer
+/// key carry the decorated label ([`engine_cell_label`]) — the footer
+/// receives only the map, so the human-readable name must land here.
 fn engine_cell_with_gap(
     engine_rows: &[blazar_core::EngineRow],
     engine: &str,
     m: &blazar_core::store::ModelRow,
     arch_gaps: &mut std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
 ) -> String {
+    let label = engine_cell_label(engine_rows, engine);
     match engine_arch_gap(
         engine_rows,
         engine,
@@ -1624,13 +1669,10 @@ fn engine_cell_with_gap(
         !std::path::Path::new(&m.path).is_dir(),
     ) {
         Some(missing) => {
-            arch_gaps
-                .entry(engine.to_string())
-                .or_default()
-                .insert(missing);
-            format!("{engine}\u{2020}")
+            arch_gaps.entry(label.clone()).or_default().insert(missing);
+            format!("{label}\u{2020}")
         }
-        None => engine.to_string(),
+        None => label,
     }
 }
 
@@ -4900,9 +4942,9 @@ fn trunc_ellipsis(s: &str, cap: usize) -> String {
 /// truncated; ARCH caps with an ellipsis; SIZE and CTX right-align; the
 /// last column (ENGINE) is uncapped. The storage path is deliberately
 /// not shown — `blazar show <model>` carries it.
-fn render_list_table(header: [&str; 8], rows: &[[String; 8]]) -> String {
+fn render_list_table(header: [&str; 9], rows: &[[String; 9]]) -> String {
     const ARCH_CAP: usize = 18;
-    let mut table: Vec<[String; 8]> = vec![header.map(str::to_string)];
+    let mut table: Vec<[String; 9]> = vec![header.map(str::to_string)];
     for r in rows {
         table.push([
             r[0].clone(),
@@ -4913,6 +4955,7 @@ fn render_list_table(header: [&str; 8], rows: &[[String; 8]]) -> String {
             r[5].clone(),
             r[6].clone(),
             r[7].clone(),
+            r[8].clone(),
         ]);
     }
     let width = |col: usize| {
@@ -4922,7 +4965,7 @@ fn render_list_table(header: [&str; 8], rows: &[[String; 8]]) -> String {
             .max()
             .unwrap_or(0)
     };
-    let (name_w, quant_w, size_w, vision_w, arch_w, ctx_w, type_w) = (
+    let (name_w, quant_w, size_w, vision_w, arch_w, ctx_w, type_w, cat_w) = (
         width(0),
         width(1),
         width(2),
@@ -4930,6 +4973,7 @@ fn render_list_table(header: [&str; 8], rows: &[[String; 8]]) -> String {
         width(4),
         width(5),
         width(6),
+        width(7),
     );
 
     let mut out = String::new();
@@ -4937,7 +4981,7 @@ fn render_list_table(header: [&str; 8], rows: &[[String; 8]]) -> String {
         // Trimmed line end: the last column is uncapped, so padding
         // would only leave trailing blanks on copied output.
         let mut line = format!(
-            "{:<name_w$}  {:<quant_w$}  {:>size_w$}  {:<vision_w$}  {:<arch_w$}  {:>ctx_w$}  {:<type_w$}  {}",
+            "{:<name_w$}  {:<quant_w$}  {:>size_w$}  {:<vision_w$}  {:<arch_w$}  {:>ctx_w$}  {:<type_w$}  {:<cat_w$}  {}",
             cells[0],
             cells[1],
             cells[2],
@@ -4946,13 +4990,15 @@ fn render_list_table(header: [&str; 8], rows: &[[String; 8]]) -> String {
             cells[5],
             cells[6],
             cells[7],
+            cells[8],
             name_w = name_w,
             quant_w = quant_w,
             size_w = size_w,
             vision_w = vision_w,
             arch_w = arch_w,
             ctx_w = ctx_w,
-            type_w = type_w
+            type_w = type_w,
+            cat_w = cat_w
         );
         line.truncate(line.trim_end().len());
         out.push_str(&line);
@@ -5076,6 +5122,13 @@ fn list_json_row(
     )
     .ok()
     .and_then(|lane| (!lane.is_empty()).then_some(lane));
+    // Machine companion of the table's decorated ENGINE cell: the raw
+    // tag stays the routing identity (gateway-consistent); `engine_kind`
+    // is its typed form, no tag-prefix parsing required downstream.
+    let engine_kind = engine
+        .as_deref()
+        .and_then(|tag| engine_rows.iter().find(|r| r.tag == tag))
+        .map(|r| r.kind.as_str());
     let mut row = serde_json::json!({
         "name": m.name,
         "quant": m.quant,
@@ -5084,7 +5137,9 @@ fn list_json_row(
         "arch": m.arch,
         "ctx_train": m.ctx_train,
         "format": model_type_label(&m.path),
+        "category": model_category(m),
         "engine": engine,
+        "engine_kind": engine_kind,
         "path": m.path,
     });
     if let Some(arch) = engine.as_deref().and_then(|tag| {
@@ -5128,7 +5183,7 @@ fn list(json: bool) -> Result<()> {
     }
     let mut arch_gaps: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
         std::collections::BTreeMap::new();
-    let rows: Vec<[String; 8]> = models
+    let rows: Vec<[String; 9]> = models
         .iter()
         .map(|m| {
             // Multimodal visibility: the projector is a real on-disk cost
@@ -5168,6 +5223,7 @@ fn list(json: bool) -> Result<()> {
                 m.arch.clone().unwrap_or_else(|| "?".to_string()),
                 m.ctx_train.map_or_else(String::new, |c| c.to_string()),
                 model_type_label(&m.path),
+                model_category(m).to_string(),
                 engine_cell,
             ]
         })
@@ -5175,7 +5231,7 @@ fn list(json: bool) -> Result<()> {
     println!(
         "{}",
         render_list_table(
-            ["NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "ENGINE"],
+            ["NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "CATEGORY", "ENGINE"],
             &rows
         )
     );
@@ -12692,6 +12748,7 @@ mod tests {
                 "instella-moe".to_string(),
                 "32768".to_string(),
                 "gguf".to_string(),
+                "text".to_string(),
                 long_tag.to_string(),
             ],
             [
@@ -12702,12 +12759,13 @@ mod tests {
                 "llama".to_string(),
                 "4096".to_string(),
                 "gguf".to_string(),
+                "text".to_string(),
                 "b-test".to_string(),
             ],
         ];
         let out = render_list_table(
             [
-                "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "ENGINE",
+                "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "CATEGORY", "ENGINE",
             ],
             &rows,
         );
@@ -12735,6 +12793,7 @@ mod tests {
                 "nanbeige".to_string(),
                 "262144".to_string(),
                 "gguf".to_string(),
+                "text".to_string(),
                 "b-test".to_string(),
             ],
             [
@@ -12746,12 +12805,13 @@ mod tests {
                 "Qwen2ForCausalLM".to_string(),
                 "32768".to_string(),
                 "safetensors".to_string(),
+                "text".to_string(),
                 "b-test".to_string(),
             ],
         ];
         let out = render_list_table(
             [
-                "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "ENGINE",
+                "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "CATEGORY", "ENGINE",
             ],
             &rows,
         );
@@ -12783,11 +12843,12 @@ mod tests {
             "Qwen2VLForConditionalGeneration".to_string(),
             "4096".to_string(),
             "gguf".to_string(),
+            "vision".to_string(),
             "sg-test".to_string(),
         ]];
         let out2 = render_list_table(
             [
-                "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "ENGINE",
+                "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "CATEGORY", "ENGINE",
             ],
             &long,
         );
@@ -14096,8 +14157,9 @@ mod tests {
     fn unit__render_list_table__golden_bytes_exact() {
         // Byte-exact golden: ARCH caps at 18 chars with an ellipsis,
         // SIZE and CTX right-align, empty VISION/CTX cells keep their
-        // column spacing, and the whole table carries no trailing
-        // newline and no trailing blanks on any line.
+        // column spacing, CATEGORY rides before ENGINE, and the whole
+        // table carries no trailing newline and no trailing blanks on
+        // any line.
         let rows = [
             [
                 "qwen2.5-0.5b".to_string(),
@@ -14106,6 +14168,7 @@ mod tests {
                 "mmproj: 224 MiB".to_string(),
                 "Qwen2ForCausalLM".to_string(),
                 "32768".to_string(),
+                "text".to_string(),
                 "text".to_string(),
                 "llama.cpp".to_string(),
             ],
@@ -14117,21 +14180,110 @@ mod tests {
                 "WhisperForConditionalGeneration".to_string(),
                 String::new(),
                 "voice".to_string(),
+                "-".to_string(),
                 "whisper".to_string(),
             ],
         ];
         let golden = concat!(
-            "NAME           QUANT     SIZE  VISION           ARCH                  CTX  TYPE   ENGINE\n",
-            "qwen2.5-0.5b   q4_0   644 MiB  mmproj: 224 MiB  Qwen2ForCausalLM    32768  text   llama.cpp\n",
-            "whisper-b5130  -      151 MiB                   WhisperForConditi…         voice  whisper",
+            "NAME           QUANT     SIZE  VISION           ARCH                  CTX  TYPE   CATEGORY  ENGINE\n",
+            "qwen2.5-0.5b   q4_0   644 MiB  mmproj: 224 MiB  Qwen2ForCausalLM    32768  text   text      llama.cpp\n",
+            "whisper-b5130  -      151 MiB                   WhisperForConditi…         voice  -         whisper",
         );
         assert_eq!(
             render_list_table(
-                ["NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "ENGINE"],
-                &rows
+                ["NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "CATEGORY", "ENGINE",],
+                &rows,
             ),
             golden
         );
+    }
+
+    /// Bare-minimum model row for CATEGORY classification tests; each
+    /// test mutates only the fields its class derives from.
+    fn category_row(name: &str, repo: &str) -> blazar_core::store::ModelRow {
+        blazar_core::store::ModelRow {
+            name: name.to_string(),
+            repo: repo.to_string(),
+            quant: "-".to_string(),
+            path: format!("models/{name}.gguf"),
+            bytes: 1,
+            sha256: None,
+            mmproj_path: None,
+            components: Vec::new(),
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+        }
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__engine_cell_label__kind_plus_version_all_tag_shapes() {
+        use blazar_core::engine_kind::EngineKind as K;
+        // kind-prefixed tag: the prefix is redundant, strip it.
+        let rows = vec![gap_engine_row("sglang-0.5.19", K::Sglang, &[])];
+        assert_eq!(engine_cell_label(&rows, "sglang-0.5.19"), "sglang 0.5.19");
+        // kind-less tags: the whole release tag is the version.
+        let rows = vec![gap_engine_row("b11147-cuda", K::LlamaCpp, &[])];
+        assert_eq!(
+            engine_cell_label(&rows, "b11147-cuda"),
+            "llamacpp b11147-cuda"
+        );
+        let rows = vec![gap_engine_row("master-890-74988b2", K::SdCpp, &[])];
+        assert_eq!(
+            engine_cell_label(&rows, "master-890-74988b2"),
+            "sdcpp master-890-74988b2"
+        );
+        let rows = vec![gap_engine_row("v0.9.3", K::MistralRs, &[])];
+        assert_eq!(engine_cell_label(&rows, "v0.9.3"), "mistralrs v0.9.3");
+        // tag == kind: no version tail to append.
+        let rows = vec![gap_engine_row("sglang", K::Sglang, &[])];
+        assert_eq!(engine_cell_label(&rows, "sglang"), "sglang");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__engine_cell_label__raw_tag_when_no_row_matches() {
+        let rows: Vec<blazar_core::EngineRow> = Vec::new();
+        assert_eq!(engine_cell_label(&rows, "-"), "-");
+        assert_eq!(engine_cell_label(&rows, "b-missing"), "b-missing");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__model_category__diffusion_families_image_and_video() {
+        // Component sets are the diffusion marker; the curated family
+        // table splits image from video.
+        let mut flux = category_row("flux.1-dev", "black-forest-labs/FLUX.1-dev");
+        flux.components = vec![blazar_core::store::ComponentFile::new(
+            "--vae",
+            "models/flux-vae.safetensors",
+        )];
+        assert_eq!(model_category(&flux), "image");
+        let mut wan = category_row("wan_2.1_comfyui_repackaged", "ComfyUI/wan_2.1_repackaged");
+        wan.components = vec![blazar_core::store::ComponentFile::new(
+            "--model",
+            "models/wan_2.1_comfyui_repackaged.gguf",
+        )];
+        assert_eq!(model_category(&wan), "video");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__model_category__vision_encoder_text_ordering() {
+        // Projector beats encoder/text: a VLM row is vision-class.
+        let mut vlm = category_row("qwen3vl-8b-instruct", "Qwen/Qwen3-VL-8B-Instruct");
+        vlm.mmproj_path = Some("models/qwen3vl-mmproj.gguf".to_string());
+        assert_eq!(model_category(&vlm), "vision");
+        // Trailing-encoder archs are pipeline encoders, not chat models.
+        let mut t5 = category_row("t5-v1_1-xxl", "city96/t5-v1_1-xxl-encoder-gguf");
+        t5.arch = Some("t5encoder".to_string());
+        assert_eq!(model_category(&t5), "encoder");
+        // Everything else is a text model.
+        let qwen = category_row("qwen2.5-0.5b", "Qwen/Qwen2.5-0.5B-Instruct-GGUF");
+        assert_eq!(model_category(&qwen), "text");
     }
 
     #[test]
