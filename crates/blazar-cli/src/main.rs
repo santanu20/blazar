@@ -19,7 +19,7 @@ use blazar_runtime::engine::build::{
     validate_commit_sha, validate_repo_slug, BuildBackend, BuildOpts, BuildSource, Toolchain,
 };
 use blazar_runtime::engine::gh::{btag_number, same_build, GhClient};
-use blazar_runtime::engine::EngineManager;
+use blazar_runtime::engine::{EngineManager, STALLED_INSTALL_GRACE};
 use blazar_runtime::engine_impl::Engine;
 use blazar_runtime::EventBus;
 use blazar_runtime::VerifyReport;
@@ -8830,6 +8830,22 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
         EngineCmd::List { json } => {
             if !json {
                 upstream_update_hint(&d).await;
+            }
+            // Point-of-need convergence: `engine list` is where install
+            // debris becomes visible to a user, so the same grace-gated
+            // sweep the daemon boot runs converges here too (fail-open).
+            // Notices go to stderr — the table and JSONL stdout bytes are
+            // scripted (install e2e, validate) and must not shift.
+            if let Ok(mgr) = local_engine_manager(&d) {
+                for (name, bytes) in mgr.sweep_install_debris(STALLED_INSTALL_GRACE) {
+                    // i64::try_from mirrors the table's byte cells: a
+                    // u64 overflow here is impossible (dir sizes).
+                    let bytes = i64::try_from(bytes).unwrap_or(i64::MAX);
+                    eprintln!(
+                        "swept stalled install debris: {name} ({}) reclaimed",
+                        humansize(bytes)
+                    );
+                }
             }
             let store = Store::open(&d)?;
             let mut seen: Vec<&str> = Vec::new();
