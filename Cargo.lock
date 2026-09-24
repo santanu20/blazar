@@ -385,6 +385,7 @@ dependencies = [
  "blazar-core",
  "dashmap",
  "dirs",
+ "filetime",
  "flate2",
  "futures",
  "getrandom 0.3.4",

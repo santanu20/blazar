@@ -28,6 +28,14 @@ use manifest::Manifest;
 /// active tag are always kept on top of this.
 pub const KEEP_TAGS: usize = 2;
 
+/// How long an engine dir must stay quiet before the automatic debris
+/// sweep may reclaim it. Installs write continuously (each download
+/// refreshes the archive file's mtime, venv builds create files), so a
+/// live install never looks stale; anything untouched this long is
+/// debris from a killed process. Manual `blazar engine prune` bypasses
+/// the gate entirely — an explicit user order needs no grace.
+pub const STALLED_INSTALL_GRACE: std::time::Duration = std::time::Duration::from_hours(6);
+
 /// Recursive byte size of an engine dir (for the update-prune summary).
 fn engine_dir_bytes(p: &Path) -> u64 {
     let Ok(rd) = std::fs::read_dir(p) else {
@@ -43,6 +51,52 @@ fn engine_dir_bytes(p: &Path) -> u64 {
     }
     n
 }
+fn mtime_secs(p: &Path) -> Option<u64> {
+    std::fs::metadata(p)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// Does anything in `dir` (the dir itself included) carry an mtime newer
+/// than `grace`? A single long download leaves the parent dir mtime
+/// alone but keeps the archive file fresh, so activity detection has to
+/// walk the tree. Anything unreadable reads as RECENT: the debris sweep
+/// treats what it cannot verify as protected, never as garbage. A
+/// missing dir also reads as recent (callers gate on existence when the
+/// distinction matters).
+fn dir_recent(dir: &Path, grace: std::time::Duration) -> bool {
+    let now = now_secs();
+    let grace = grace.as_secs().cast_signed();
+    // Absurd future mtimes clamp to "recent": unverifiable stays protected.
+    let recent = |p: &Path| match mtime_secs(p) {
+        Some(t) => now.saturating_sub(i64::try_from(t).unwrap_or(i64::MAX)) < grace,
+        None => true,
+    };
+    if recent(dir) || !dir.is_dir() {
+        return true;
+    }
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            return true;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if recent(&p) {
+                return true;
+            }
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                stack.push(p);
+            }
+        }
+    }
+    false
+}
+
 pub const LOCAL_TAG: &str = "local";
 
 /// Error-context marker for the PROBE phase of engine registration
@@ -174,6 +228,41 @@ fn discard_retired_engine(aside: Option<&Path>) {
         tracing::warn!(
             "leaked retired engine dir {} ({e}): remove it to reclaim disk",
             aside.display()
+        );
+    }
+}
+
+/// Cancellation-safe rollback for in-flight installs. The Err arm of
+/// [`EngineManager::install_with_rollback`] restores state, but a
+/// dropped future (task abort, runtime shutdown, panic unwind) never
+/// reaches any match arm — the guard runs the same recovery from Drop.
+/// Hard kills (SIGKILL, power loss) still run no code; the boot debris
+/// sweep converges those. Disarmed the moment the build future resolves:
+/// registration may then write the store row, and deleting a
+/// row-referenced dir on a late cancel would desync dir and row (a
+/// stranded dir is reclaimed by the sweep instead — never a ghost row).
+struct CancelledInstallGuard {
+    dir: PathBuf,
+    aside: Option<PathBuf>,
+    armed: bool,
+}
+
+impl CancelledInstallGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelledInstallGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        restore_retired_engine(self.aside.as_deref(), &self.dir);
+        tracing::warn!(
+            "install into {} was cancelled — rolled back (half-built dir removed, \
+             previous engine restored when one was retired)",
+            self.dir.display()
         );
     }
 }
@@ -356,6 +445,18 @@ impl EngineManager {
             Some(t) => self.gh.resolve_tag(t).await?,
             None => self.gh.channel_b_release(channel).await?,
         };
+        // Channel updates are idempotent: a channel target that is
+        // already the active engine has nothing to fetch or retire.
+        // Explicit tag pins keep their install semantics (repair lane).
+        if tag.is_none() {
+            if let Some(row) = self.active_row_if_tag(&release.tag_name)? {
+                tracing::info!(
+                    "channel target {} is already the active engine — skipping the download",
+                    release.tag_name
+                );
+                return Ok(row);
+            }
+        }
         if let Some(row) = self.maybe_cuda_overlay(&release, tag.is_some()).await? {
             return Ok(row);
         }
@@ -458,6 +559,18 @@ impl EngineManager {
         vendor_hint: manifest::Vendor,
         exact_pin: bool,
     ) -> Result<EngineRow> {
+        // Same-tag idempotency: an update that resolved to the
+        // already-active engine must not retire + re-download it. Exact
+        // pins stay on the install path — re-install is the point.
+        if !exact_pin {
+            if let Some(row) = self.active_row_if_tag(&release.tag_name)? {
+                tracing::info!(
+                    "target {} is already the active engine — skipping the download",
+                    release.tag_name
+                );
+                return Ok(row);
+            }
+        }
         if let Some(row) = self.maybe_cuda_overlay(&release, exact_pin).await? {
             return Ok(row);
         }
@@ -496,6 +609,18 @@ impl EngineManager {
             active.tag
         );
         Ok(Some(active))
+    }
+
+    /// Same-tag idempotency for the update lanes: when the release an
+    /// update resolved to is ALREADY the active engine, return it
+    /// instead of retiring and re-downloading the identical build.
+    /// Exact tag pins are exempt — they are the repair lane
+    /// (`blazar engine install <tag>` re-installs on purpose).
+    fn active_row_if_tag(&self, tag: &str) -> Result<Option<EngineRow>> {
+        let Some(active) = Store::open(&self.dirs)?.active_engine()? else {
+            return Ok(None);
+        };
+        Ok((active.tag == tag).then_some(active))
     }
 
     /// Direct install of an overlay `bNNNN-cuda` tag the user pinned
@@ -876,6 +1001,15 @@ impl EngineManager {
         let mut cuda_release = release.clone();
         if !cuda_release.tag_name.ends_with("-cuda") {
             cuda_release.tag_name = format!("{}-cuda", cuda_release.tag_name);
+        }
+        // Same-tag idempotency: the derived overlay tag is already the
+        // active engine — this update resolved to what is running.
+        if let Some(row) = self.active_row_if_tag(&cuda_release.tag_name)? {
+            tracing::info!(
+                "upstream CUDA target {} is already the active engine — skipping the download",
+                cuda_release.tag_name
+            );
+            return Ok(Some(row));
         }
         tracing::info!(
             "installing upstream CUDA engine {} ({}){}",
@@ -1786,8 +1920,20 @@ impl EngineManager {
     {
         let dir = self.dirs.engines_dir().join(tag);
         let aside = retire_engine_dir(&dir)?;
-        let outcome = build(dir.clone())
-            .await
+        // Armed across the await: a dropped build future (abort, runtime
+        // shutdown, unwind) rolls back exactly like a returned Err.
+        let mut guard = CancelledInstallGuard {
+            dir: dir.clone(),
+            aside: aside.clone(),
+            armed: true,
+        };
+        let build_outcome = build(dir.clone()).await;
+        // Past this point the closure's dir may be handed to registration
+        // (which can write the store row) — a late cancel must not rip a
+        // row-referenced dir out; stranded state converges via the boot
+        // debris sweep instead.
+        guard.disarm();
+        let outcome = build_outcome
             .and_then(|()| self.register_or_clean(&dir, tag, asset_label, sha256, kind));
         match outcome {
             Ok(row) => {
@@ -1934,6 +2080,10 @@ impl EngineManager {
         self.mine_missing_architectures(&store).await;
         Self::mark_superseded_lanes(&store)?;
         self.sweep_retired_lanes(&store, fork_retire_days, pinned_tags)?;
+        // (e) Interrupted-install debris: rollback asides stranded by a
+        // kill and row-less half-built dirs, grace-gated. Fail-open like
+        // every step above — hygiene never fails the triggering boot.
+        self.sweep_install_debris(STALLED_INSTALL_GRACE);
         Ok(())
     }
 
@@ -2214,7 +2364,18 @@ impl EngineManager {
     /// install or a pre-rollback-era upgrade, invisible to `engine list`
     /// yet still eating disk (a 1 GiB `b11064-cuda` survived this way).
     /// A dir is NEVER an orphan while some row's manifest points into it.
+    /// The manual pass is ungated — the user asked. The automatic pass
+    /// (see [`Self::sweep_install_debris`]) applies the same rules plus
+    /// a quiet-period grace so a concurrently running install is never
+    /// reaped mid-build.
     pub fn prune_orphan_dirs(&self) -> Result<Vec<(String, u64)>> {
+        self.prune_orphan_dirs_inner(None)
+    }
+
+    fn prune_orphan_dirs_inner(
+        &self,
+        grace: Option<std::time::Duration>,
+    ) -> Result<Vec<(String, u64)>> {
         let store = Store::open(&self.dirs)?;
         let engines = store.list_engines()?;
         let mut referenced: std::collections::HashSet<PathBuf> = engines
@@ -2242,6 +2403,25 @@ impl EngineManager {
             {
                 continue;
             }
+            // Automatic pass: rollback asides belong to the stale-aside
+            // sweep, which gates on the replacement's final-dir freshness
+            // (an aside's own mtime is preserved from its previous life
+            // and always looks old). The manual pass keeps removing them
+            // directly, as it always has.
+            if grace.is_some()
+                && dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(RETIRED_ENGINE_PREFIX))
+            {
+                continue;
+            }
+            // Automatic pass only: no row AND recently written to — this
+            // is very likely an install building right now in another
+            // process; the next sweep converges once it goes quiet.
+            if grace.is_some_and(|g| dir_recent(&dir, g)) {
+                continue;
+            }
             let bytes = engine_dir_bytes(&dir);
             // Best-effort: a busy dir (child running from it) is skipped,
             // not fatal — the next sweep catches it.
@@ -2264,6 +2444,71 @@ impl EngineManager {
             freed.push((tag, bytes));
         }
         Ok(freed)
+    }
+
+    /// Remove `.retired-` rollback asides left by installs that died
+    /// before any outcome arm ran (SIGKILL, power loss, OOM). An aside is
+    /// stale unless its tag's final dir looks like a replacement still
+    /// building (fresh mtimes anywhere in the tree): every build runs at
+    /// the final path, so a quiet or absent final dir means nobody is
+    /// coming back for the aside. The retire-to-create_dir_all gap is
+    /// microseconds wide and same-tag concurrent installs are already
+    /// undefined (see [`retire_engine_dir`]).
+    fn sweep_stale_retired_asides(&self, grace: std::time::Duration) -> Vec<(String, u64)> {
+        let engines = self.dirs.engines_dir();
+        let Ok(entries) = std::fs::read_dir(&engines) else {
+            return Vec::new();
+        };
+        let mut freed = Vec::new();
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // `.retired-<tag>-<pid>` — tags themselves contain hyphens
+            // (b11139-cuda), so split the trailing pid once from the right
+            // and refuse anything that does not decode cleanly.
+            let Some(rest) = name.strip_prefix(RETIRED_ENGINE_PREFIX) else {
+                continue;
+            };
+            let Some((tag, pid)) = rest.rsplit_once('-') else {
+                tracing::warn!("skipping unrecognized retired engine dir {name}");
+                continue;
+            };
+            if tag.is_empty() || pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+                tracing::warn!("skipping unrecognized retired engine dir {name}");
+                continue;
+            }
+            // Only the aside entry itself is ever removed; the final-dir
+            // path reconstructed here feeds a read-only freshness gate.
+            let final_dir = engines.join(tag);
+            if final_dir.exists() && dir_recent(&final_dir, grace) {
+                continue;
+            }
+            let bytes = engine_dir_bytes(&entry.path());
+            if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                tracing::warn!("cannot remove stale retired engine {name}: {e}");
+                continue;
+            }
+            tracing::info!("swept stale retired engine {name} ({} bytes)", bytes);
+            freed.push((name, bytes));
+        }
+        freed
+    }
+
+    /// Interrupted-install debris convergence, run at daemon start and
+    /// after installs: stale rollback asides plus row-less dirs, both
+    /// grace-gated so a concurrently running install is never reaped.
+    /// Fail-open by construction — every step logs and skips on error;
+    /// hygiene must never fail the boot that triggered it. Returns what
+    /// was reclaimed (tag, bytes) for callers that surface it.
+    pub fn sweep_install_debris(&self, grace: std::time::Duration) -> Vec<(String, u64)> {
+        let mut freed = self.sweep_stale_retired_asides(grace);
+        match self.prune_orphan_dirs_inner(Some(grace)) {
+            Ok(mut orphans) => freed.append(&mut orphans),
+            Err(e) => tracing::warn!("orphan engine dir sweep skipped: {e:#}"),
+        }
+        freed
     }
 
     /// Register a locally built llama-server (`BLAZAR_ENGINE_PATH`) under the
@@ -3032,5 +3277,90 @@ mod verify_tests {
                 .expect("13.3-only release is skipped, 12.8 picked");
             assert_eq!(hit.tag_name, "b11020");
         }
+    }
+}
+
+#[cfg(test)]
+mod debris_tests {
+    #![allow(non_snake_case)]
+    use super::*;
+
+    #[test]
+    fn unit__cancelled_install_guard__drop_while_armed_restores_previous_engine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engines = tmp.path().join("engines");
+        let dir = engines.join("b1-cuda");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("server"), "previous").unwrap();
+        let aside = engines.join(".retired-b1-cuda-999999");
+        std::fs::create_dir_all(&aside).unwrap();
+        std::fs::write(aside.join("server"), "saved-copy").unwrap();
+        // The half-built replacement's debris at the final path.
+        std::fs::write(dir.join("partial-download"), "new").unwrap();
+
+        drop(CancelledInstallGuard {
+            dir: dir.clone(),
+            aside: Some(aside.clone()),
+            armed: true,
+        });
+
+        assert!(dir.join("server").exists(), "previous engine restored");
+        assert!(
+            !dir.join("partial-download").exists(),
+            "half-built debris removed"
+        );
+        assert!(!aside.exists(), "aside consumed by the restore");
+    }
+
+    #[test]
+    fn unit__cancelled_install_guard__disarmed_drop_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engines = tmp.path().join("engines");
+        let dir = engines.join("b1-cuda");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("partial-download"), "new").unwrap();
+        let aside = engines.join(".retired-b1-cuda-999999");
+        std::fs::create_dir_all(&aside).unwrap();
+
+        let mut guard = CancelledInstallGuard {
+            dir: dir.clone(),
+            aside: Some(aside.clone()),
+            armed: true,
+        };
+        guard.disarm();
+        drop(guard);
+
+        assert!(
+            dir.join("partial-download").exists(),
+            "disarmed: the dir is registration's to own"
+        );
+        assert!(aside.exists(), "disarmed: aside untouched");
+    }
+
+    #[test]
+    fn unit__dir_recent__fresh_tree_recent_old_and_missing_protected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tree = tmp.path().join("eng");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("payload.bin"), "x").unwrap();
+
+        let hour = std::time::Duration::from_secs(3600);
+        assert!(dir_recent(&tree, hour), "just-written tree is recent");
+        // Aged past the cutoff: the whole tree (dir + payload) is old.
+        let stale = filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() - std::time::Duration::from_hours(2),
+        );
+        filetime::set_file_mtime(&tree, stale).unwrap();
+        filetime::set_file_mtime(tree.join("payload.bin"), stale).unwrap();
+        assert!(!dir_recent(&tree, hour), "fully aged tree is not recent");
+        // Zero grace: nothing can be younger than the cutoff.
+        assert!(
+            !dir_recent(&tree, std::time::Duration::ZERO),
+            "zero grace makes everything old"
+        );
+        assert!(
+            dir_recent(&tmp.path().join("nope"), hour),
+            "missing dir reads as recent (protected)"
+        );
     }
 }
