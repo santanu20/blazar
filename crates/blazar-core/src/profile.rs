@@ -1904,7 +1904,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         let chain = config
             .samplers
             .split(',')
-            .map(|s| s.trim())
+            .map(str::trim)
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join(";");
@@ -5696,8 +5696,10 @@ mod tests {
     #[test]
     fn unit__kv_layout__explicit_and_auto_unified() {
         let hw = gpu_hw(24_000, 64_000, 8);
-        let mut cfg = Config::default();
-        cfg.kv_unified = Some(true);
+        let cfg = Config {
+            kv_unified: Some(true),
+            ..Config::default()
+        };
         let p = compile(
             &input(&GgufMeta::default(), &hw, &cfg, &ALL_FLAGS),
             &TuningOverrides::default(),
@@ -5706,8 +5708,10 @@ mod tests {
         assert!(p.argv.contains(&"--kv-unified".to_string()));
         assert!(!p.argv.contains(&"--no-kv-unified".to_string()));
 
-        let mut cfg = Config::default();
-        cfg.kv_unified = Some(false);
+        let cfg = Config {
+            kv_unified: Some(false),
+            ..Config::default()
+        };
         let p = compile(
             &input(&GgufMeta::default(), &hw, &cfg, &ALL_FLAGS),
             &TuningOverrides::default(),
