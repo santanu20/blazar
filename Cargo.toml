@@ -49,6 +49,7 @@ async-trait = "0.1"
 dashmap = "6"
 http-body = "1"
 tokio-stream = { version = "0.1", features = ["sync"] }
+iai-callgrind = "0.16.1"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
