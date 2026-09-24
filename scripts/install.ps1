@@ -257,7 +257,7 @@ try {
     # already-active engine skips the download. Optional first model via
     # BLAZAR_INSTALL_MODEL (opt-in).
     $engineOk = $false
-    try { $engineOk = -not [string]::IsNullOrEmpty((& $installedExe engine list 2>$null | Select-String '\[active\]')) } catch { }
+    try { $engineOk = -not [string]::IsNullOrEmpty((& $installedExe engine list --json 2>$null | Select-String '"active":\s*true')) } catch { }
     if ($env:BLAZAR_INSTALL_ENGINE -ne '0' -and -not $engineOk) {
         Write-Host ">>> bootstrapping llama.cpp engine (blazar engine update - largest download of this install)..."
         try {
