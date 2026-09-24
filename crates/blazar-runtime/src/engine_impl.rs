@@ -334,27 +334,34 @@ fn spawn_child(
     endpoint: &Endpoint,
     child_env: &[(String, String)],
 ) -> Result<ChildHandle> {
-    let mut cmd = tokio::process::Command::new(server_path);
+    let mut cmd = std::process::Command::new(server_path);
     cmd.args(argv)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        // If the owning process dies without teardown, the child must
-        // not linger (test leakage, daemon crash).
-        .kill_on_drop(true);
+        .stderr(std::process::Stdio::piped());
     if let Some(dir) = child_cwd(server_path) {
         cmd.current_dir(dir);
     }
     #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt as _;
         // Own process group: Ctrl-C on the daemon never reaches the
         // child. Termination is single-pid by design (terminate()
         // signals only this pid; never a group signal).
         cmd.process_group(0);
+        // Kernel lifetime tie: if the owning PROCESS dies without
+        // teardown (crash, SIGKILL, terminal-scope death), the child
+        // gets SIGTERM from the kernel. kill_on_drop only covers
+        // runtime teardown inside a still-living process.
+        crate::probe::parent_death_tie(&mut cmd);
     }
     for (k, v) in child_env {
         cmd.env(k, v);
     }
+    let mut cmd = tokio::process::Command::from(cmd);
+    // Runtime teardown in a live process (tests, graceful shutdown)
+    // still drops the child.
+    cmd.kill_on_drop(true);
     // Inline the io source (ENOENT/EACCES...) into the context: callers
     // that render only `Display` — the gateway's 500 body — would
     // otherwise show a bare `spawn <path>` with no reason for it.

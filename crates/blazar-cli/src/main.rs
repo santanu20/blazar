@@ -1099,6 +1099,16 @@ fn daemon_base(cfg: &Config) -> String {
     format!("http://{}:{}", cfg.host, cfg.port)
 }
 
+/// systemctl lanes tried, in order, to hand the daemon its own scope.
+/// The user unit needs no privileges; the system unit may (hence the
+/// no-ask-password flag — failure stays fast and non-interactive).
+fn systemd_start_attempts() -> Vec<Vec<&'static str>> {
+    vec![
+        vec!["--user", "start", "blazar"],
+        vec!["start", "blazar", "--no-ask-password"],
+    ]
+}
+
 /// Auto-start (plan G): 1s probe; on refusal, detached self-exec `serve`
 /// (own session, logs to run/daemon.log), then poll /healthz ≤30s.
 async fn ensure_daemon() -> Result<String> {
@@ -1112,7 +1122,29 @@ async fn ensure_daemon() -> Result<String> {
             return Ok(base);
         }
     }
-    // Not running: self-exec detached.
+    // Not running: prefer the service manager so the daemon lands in
+    // its OWN scope (survives the invoking terminal, logs to journald)
+    // instead of the caller's login session. Absent systemctl fails
+    // fast (3s cap per attempt); unhealthy units fall through too.
+    for args in systemd_start_attempts() {
+        let mut attempt = tokio::process::Command::new("systemctl");
+        attempt.args(&args);
+        match tokio::time::timeout(Duration::from_secs(3), attempt.output()).await {
+            Ok(Ok(out)) if out.status.success() => {}
+            _ => continue,
+        }
+        let deadline = tokio_deadline(Duration::from_secs(15));
+        while std::time::Instant::now() < deadline {
+            if let Ok(r) = http.get(format!("{base}/healthz")).send().await {
+                if r.status().is_success() {
+                    return Ok(base);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+    eprintln!("no healthy systemd unit — falling back to a detached daemon");
+    // Self-exec detached.
     let log = dirs().run_dir().join("daemon.log");
     let log_file = std::fs::OpenOptions::new()
         .create(true)
@@ -2247,7 +2279,7 @@ async fn doctor_gpu(d: &BlazarDirs) -> Vec<Check> {
     // applies whenever an active CUDA asset exists.
     if vram > 0 {
         out.extend(gpu_fit_check(d, vram));
-        out.extend(gpu_cotenants_check());
+        out.extend(gpu_cotenants_check(d));
     }
     out.extend(gpu_arch_match_check(d, sm));
     out
@@ -2280,34 +2312,160 @@ fn gpu_fit_check(d: &BlazarDirs, vram: u64) -> Option<Check> {
     })
 }
 
+/// What a GPU compute tenant is, relative to blazar.
+enum GpuTenantClass {
+    /// Under a live blazar server's supervision — none of our business.
+    Owned,
+    /// A blazar engine server whose supervisor died. The kernel
+    /// PDEATHSIG tie now reaps these at spawn time, but servers
+    /// orphaned before that fix (or by `kill -9` of the daemon) can
+    /// linger with GPU bytes pinned.
+    OrphanedEngine,
+    /// Not blazar at all (user apps, other runtimes).
+    Foreign,
+}
+
+/// Pure classification (testable): a live blazar descendant is owned;
+/// a non-descendant running a binary from the engines dir is an
+/// orphaned engine server; anything else is foreign.
+fn classify_gpu_tenant(
+    process_name: &str,
+    engines_dir: &Path,
+    is_descendant: bool,
+) -> GpuTenantClass {
+    if is_descendant {
+        GpuTenantClass::Owned
+    } else if Path::new(process_name).starts_with(engines_dir) {
+        GpuTenantClass::OrphanedEngine
+    } else {
+        GpuTenantClass::Foreign
+    }
+}
+
 /// Foreign VRAM tenants (advisory): compute processes that are NOT
 /// descended from a blazar server. Co-residency is legal, but an
 /// invisible foreign holder is the #1 cause of opaque mid-job OOM —
 /// the gate estimates against free VRAM, so name what eats it.
-fn gpu_cotenants_check() -> Option<Check> {
+fn gpu_cotenants_check(d: &BlazarDirs) -> Option<Check> {
     let tenants = blazar_runtime::probe::gpu_compute_tenants()?;
-    let foreign: Vec<String> = tenants
-        .iter()
-        .filter(|t| !pid_is_blazar_descendant(t.pid))
-        .map(|t| format!("{} ({} MiB)", t.process_name, t.used_mib))
-        .collect();
-    if foreign.is_empty() {
+    let engines_dir = d.engines_dir();
+    let mut orphans: Vec<String> = Vec::new();
+    let mut foreign: Vec<String> = Vec::new();
+    let mut orphan_mib = 0u64;
+    let mut held = 0u64;
+    for t in &tenants {
+        match classify_gpu_tenant(
+            &t.process_name,
+            &engines_dir,
+            pid_is_blazar_descendant(t.pid),
+        ) {
+            GpuTenantClass::Owned => {}
+            GpuTenantClass::OrphanedEngine => {
+                let name = Path::new(&t.process_name).file_name().map_or_else(
+                    || t.process_name.clone(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
+                orphans.push(format!(
+                    "{name} ({} MiB, pid {}) — kill {} to reclaim",
+                    t.used_mib, t.pid, t.pid
+                ));
+                orphan_mib += t.used_mib;
+            }
+            GpuTenantClass::Foreign => {
+                foreign.push(format!("{} ({} MiB)", t.process_name, t.used_mib));
+                held += t.used_mib;
+            }
+        }
+    }
+    if orphans.is_empty() && foreign.is_empty() {
         return None;
     }
-    let held: u64 = tenants
-        .iter()
-        .filter(|t| !pid_is_blazar_descendant(t.pid))
-        .map(|t| t.used_mib)
-        .sum();
-    Some(Check::warn(
-        "gpu co-tenants",
-        format!(
+    let mut sentences: Vec<String> = Vec::new();
+    if !orphans.is_empty() {
+        sentences.push(format!(
+            "orphaned blazar engine server(s) (parent exited, ~{orphan_mib} MiB): {}",
+            orphans.join(", ")
+        ));
+    }
+    if !foreign.is_empty() {
+        sentences.push(format!(
             "non-blazar processes hold ~{held} MiB of GPU memory: {} — \
              blazar budgets against FREE VRAM, so these reduce what fits",
             foreign.join(", ")
-        ),
-    ))
+        ));
+    }
+    Some(Check::warn("gpu co-tenants", sentences.join("; ")))
 }
+
+/// Pure selection for the boot sweep (testable without /proc): keep
+/// only the tenants that classify as orphaned engine servers. The
+/// boolean is the pre-walked `is_descendant` so tests inject ancestry
+/// instead of depending on the live process table.
+fn orphaned_gpu_tenants<'a>(
+    tenants: &[(&'a blazar_runtime::probe::GpuTenant, bool)],
+    engines_dir: &Path,
+) -> Vec<&'a blazar_runtime::probe::GpuTenant> {
+    tenants
+        .iter()
+        .filter(|(t, is_descendant)| {
+            matches!(
+                classify_gpu_tenant(&t.process_name, engines_dir, *is_descendant),
+                GpuTenantClass::OrphanedEngine
+            )
+        })
+        .map(|(t, _)| *t)
+        .collect()
+}
+
+/// Boot preflight (2/2): reclaim VRAM from engine servers whose
+/// supervisor died (pre-PDEATHSIG orphans, or a `kill -9` that raced
+/// the tie). SIGTERM — the same graceful signal the kernel tie sends —
+/// after re-verifying the exe still lives in the engines dir so a
+/// recycled pid can never be hit. Best-effort: failures log, boot
+/// continues. Unix-only: the ancestry check needs /proc.
+#[cfg(unix)]
+#[allow(unsafe_code)] // one kill(2) arm, pid re-verified via /proc/<pid>/exe first
+fn sweep_orphaned_gpu_engines(d: &BlazarDirs) {
+    let Some(tenants) = blazar_runtime::probe::gpu_compute_tenants() else {
+        return;
+    };
+    let engines_dir = std::fs::canonicalize(d.engines_dir()).unwrap_or_else(|_| d.engines_dir());
+    let candidates: Vec<(&_, bool)> = tenants
+        .iter()
+        .map(|t| (t, pid_is_blazar_descendant(t.pid)))
+        .collect();
+    let orphaned = orphaned_gpu_tenants(&candidates, &engines_dir);
+    let mut reaped: Vec<String> = Vec::new();
+    let mut mib = 0u64;
+    for t in orphaned {
+        // Pid-recycling guard: the classification snapshot can be stale
+        // by one syscall — confirm the exe is still ours before the
+        // irreversible step.
+        let Ok(exe) = std::fs::read_link(format!("/proc/{}/exe", t.pid)) else {
+            continue;
+        };
+        if !exe.starts_with(&engines_dir) {
+            continue;
+        }
+        if unsafe { libc::kill(t.pid as libc::pid_t, libc::SIGTERM) } == 0 {
+            reaped.push(format!(
+                "{} (pid {}, {} MiB)",
+                t.process_name, t.pid, t.used_mib
+            ));
+            mib += t.used_mib;
+        }
+    }
+    if !reaped.is_empty() {
+        println!(
+            "preflight: SIGTERM to {} orphaned engine server(s) holding ~{mib} MiB of VRAM: {}",
+            reaped.len(),
+            reaped.join(", ")
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn sweep_orphaned_gpu_engines(_d: &BlazarDirs) {}
 
 /// Arch match: the active engine asset's -smNN vs the GPU's sm.
 fn gpu_arch_match_check(d: &BlazarDirs, sm: Option<u32>) -> Option<Check> {
@@ -4351,6 +4509,9 @@ async fn serve() -> Result<()> {
     for (what, why) in &reconcile.skipped {
         println!("warning: preflight skipped {what}: {why}");
     }
+    // Boot preflight (2/2): reap engine servers orphaned by a dead
+    // supervisor so their VRAM is free for this run.
+    sweep_orphaned_gpu_engines(&d);
     // BLAZAR_ENGINE_PATH: register/refresh the local build and prefer it
     // for this run (plan C: pseudo-tag "local", never pruned).
     let local_override = std::env::var("BLAZAR_ENGINE_PATH").ok();
@@ -13578,6 +13739,70 @@ mod tests {
                 && checks[1].detail.contains("blazar import <file> --name <n>"),
             "{}",
             checks[1].detail
+        );
+    }
+
+    #[test]
+    fn unit__classify_gpu_tenant__owned_orphaned_foreign() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engines = tmp.path().join("engines");
+        let server = engines.join("b11147-cuda/llama-server");
+        // A live daemon's engine: owned, even though it lives in the
+        // engines dir.
+        assert!(matches!(
+            classify_gpu_tenant(server.to_str().unwrap(), &engines, true),
+            GpuTenantClass::Owned
+        ));
+        // Same binary, supervisor dead: orphaned engine server.
+        assert!(matches!(
+            classify_gpu_tenant(server.to_str().unwrap(), &engines, false),
+            GpuTenantClass::OrphanedEngine
+        ));
+        // Anything else outside blazar's engines dir: foreign.
+        assert!(matches!(
+            classify_gpu_tenant("/usr/bin/python3", &engines, false),
+            GpuTenantClass::Foreign
+        ));
+    }
+
+    #[test]
+    fn unit__orphaned_gpu_tenants__selects_only_orphaned_engines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engines = tmp.path().join("engines");
+        let server = engines.join("b1/llama-server");
+        let orphan = blazar_runtime::probe::GpuTenant {
+            pid: 10,
+            process_name: server.display().to_string(),
+            used_mib: 5288,
+        };
+        // Same binary, but a live blazar process owns it.
+        let owned = blazar_runtime::probe::GpuTenant {
+            pid: 11,
+            process_name: server.display().to_string(),
+            used_mib: 972,
+        };
+        let foreign = blazar_runtime::probe::GpuTenant {
+            pid: 12,
+            process_name: "/usr/bin/python3".to_string(),
+            used_mib: 512,
+        };
+        let tenants = [(&orphan, false), (&owned, true), (&foreign, false)];
+        let picked = orphaned_gpu_tenants(&tenants, &engines);
+        assert_eq!(picked.len(), 1, "only the parentless engine is selected");
+        assert_eq!(picked[0].pid, orphan.pid);
+        assert_eq!(picked[0].used_mib, 5288);
+    }
+
+    #[test]
+    fn unit__systemd_start_attempts__user_unit_first_then_system() {
+        let attempts = systemd_start_attempts();
+        assert_eq!(
+            attempts,
+            vec![
+                vec!["--user", "start", "blazar"],
+                vec!["start", "blazar", "--no-ask-password"],
+            ],
+            "unprivileged user unit first; system attempt must not prompt"
         );
     }
 
