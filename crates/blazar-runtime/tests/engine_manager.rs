@@ -482,6 +482,44 @@ async fn integration__prune_keeps_newest_keep_tags_and_local() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn integration__prune_reports_freed_tag_bytes() {
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    let store = Store::open(&dirs).unwrap();
+    // Oldest lane past retention carries a known dir size; the two
+    // newest slots survive. No active row, no local row — pure policy.
+    for (i, (tag, file_bytes)) in [("b1", 512u64), ("b2", 128), ("b3", 64)].iter().enumerate() {
+        let dir = dirs.engines_dir().join(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("weights"),
+            vec![0u8; usize::try_from(*file_bytes).unwrap()],
+        )
+        .unwrap();
+        store
+            .upsert_engine(&blazar_core::EngineRow {
+                tag: tag.to_string(),
+                asset: "x".into(),
+                sha256: "x".into(),
+                installed_at: 1000 + i64::try_from(i).unwrap_or(0),
+                active: false,
+                manifest: "{}".into(),
+                kind: blazar_core::engine_kind::EngineKind::default(),
+            })
+            .unwrap();
+    }
+    let freed = mgr.prune(&store).unwrap();
+    assert_eq!(
+        freed,
+        vec![("b1".to_string(), 512)],
+        "only the oldest tag is freed, with its measured dir bytes"
+    );
+    assert!(!dirs.engines_dir().join("b1").exists());
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn integration__prune_retention_is_scoped_per_kind() {
     use blazar_core::engine_kind::EngineKind;
     let (_t, dirs) = tmp_dirs();

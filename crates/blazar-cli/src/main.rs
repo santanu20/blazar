@@ -2577,14 +2577,25 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
     }
     // Row-less dirs: invisible to the counts above yet still on disk
     // (interrupted installs, pre-rollback upgrades). Advisory only —
-    // `blazar engine prune` reclaims them.
+    // `blazar engine prune` reclaims them. Each dir is size-annotated
+    // so the reclaim teaching says how much is at stake; sorted for a
+    // deterministic listing (read_dir order is filesystem whim).
     let tags: std::collections::HashSet<&str> = engines.iter().map(|e| e.tag.as_str()).collect();
     let orphaned: Vec<String> = std::fs::read_dir(d.engines_dir())
         .map(|rd| {
-            rd.filter_map(Result::ok)
+            let mut dirs: Vec<(String, u64)> = rd
+                .filter_map(Result::ok)
                 .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
                 .map(|e| e.file_name().to_string_lossy().into_owned())
                 .filter(|name| !tags.contains(name.as_str()))
+                .map(|name| {
+                    let bytes = dir_bytes_deep(&d.engines_dir().join(&name));
+                    (name, bytes)
+                })
+                .collect();
+            dirs.sort_by(|a, b| a.0.cmp(&b.0));
+            dirs.into_iter()
+                .map(|(name, bytes)| format!("{name} ({})", humansize(bytes.cast_signed())))
                 .collect()
         })
         .unwrap_or_default();
@@ -4227,8 +4238,68 @@ fn doctor_sentinel(d: &BlazarDirs) -> Vec<Check> {
 /// inode), so teaching "delete the orphans" without the twin split
 /// would promise disk back that never comes.
 struct OrphanReport {
-    orphans: Vec<String>,
+    orphans: Vec<OrphanFile>,
     twins: usize,
+}
+
+/// One unreferenced GGUF on disk: name for display, bytes so the
+/// "delete to reclaim" teaching can say how much is actually at stake.
+/// `twin_of` names the registered file with identical content, when
+/// one exists — those are manual-download duplicates, not data.
+#[derive(Debug)]
+struct OrphanFile {
+    name: String,
+    bytes: u64,
+    twin_of: Option<String>,
+}
+
+/// Content hash for orphan-twin detection (advisory display only; the
+/// store keeps authoritative hashes — this is a read-only comparison
+/// against files the rows already own).
+fn file_sha256(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read as _;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = f.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+/// Size-indexed referenced files with model attribution, for
+/// content-twin detection: an orphan whose bytes hash-identical to a
+/// registered file is manual-download debris — safe to delete, and
+/// saying so changes the advice from "register or reclaim" to just
+/// "reclaim". Values: (canonical path, model name, file leaf).
+fn referenced_by_size(
+    models: &[blazar_core::store::ModelRow],
+) -> std::collections::HashMap<u64, Vec<(std::path::PathBuf, String, String)>> {
+    let mut out: std::collections::HashMap<u64, Vec<(std::path::PathBuf, String, String)>> =
+        std::collections::HashMap::new();
+    for m in models {
+        let sources =
+            std::iter::once(&m.path).chain(m.mmproj_path.iter().filter(|s| !s.is_empty()));
+        for source in sources {
+            let canon = std::fs::canonicalize(source).unwrap_or_else(|_| PathBuf::from(source));
+            let Ok(md) = std::fs::metadata(&canon) else {
+                continue;
+            };
+            let leaf = canon.file_name().map_or_else(
+                || canon.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            out.entry(md.len())
+                .or_default()
+                .push((canon, m.name.clone(), leaf));
+        }
+    }
+    out
 }
 
 /// Pure dir-vs-rows diff (testable; no store access). `dir` missing or
@@ -4254,6 +4325,8 @@ fn orphan_scan(models: &[blazar_core::store::ModelRow], dir: &Path) -> OrphanRep
             .map(|m| (m.dev(), m.ino()))
             .collect()
     };
+    // Content-twin detection index (see `referenced_by_size`).
+    let referenced_by_size = referenced_by_size(models);
     let mut out = OrphanReport {
         orphans: Vec::new(),
         twins: 0,
@@ -4288,13 +4361,39 @@ fn orphan_scan(models: &[blazar_core::store::ModelRow], dir: &Path) -> OrphanRep
         }
         // Windows: no std inode access — every unreferenced GGUF is
         // reported as an orphan (twin split unavailable, still correct
-        // about which files blazar does not manage).
-        out.orphans.push(path.file_name().map_or_else(
-            || path.display().to_string(),
-            |n| n.to_string_lossy().into_owned(),
-        ));
+        // about which files blazar does not manage). Size comes from
+        // the same entry we just stat'd; unreadable metadata reports 0
+        // (the name still teaches, a wrong size would mislead).
+        let name = || {
+            path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            )
+        };
+        let bytes = entry.metadata().map_or(0, |m| m.len());
+        // Content twin: same size as a registered file AND same sha256
+        // (the size gate keeps hashing off the hot path; the hash gate
+        // keeps same-size siblings from being libelled as duplicates).
+        let mut twin_of = None;
+        if bytes > 0 {
+            if let Some(cands) = referenced_by_size.get(&bytes) {
+                if let Some(orphan_hash) = file_sha256(&path) {
+                    if let Some((_, model, leaf)) = cands
+                        .iter()
+                        .find(|(c, _, _)| file_sha256(c).as_deref() == Some(orphan_hash.as_str()))
+                    {
+                        twin_of = Some(format!("{leaf} — linked to {model}"));
+                    }
+                }
+            }
+        }
+        out.orphans.push(OrphanFile {
+            name: name(),
+            bytes,
+            twin_of,
+        });
     }
-    out.orphans.sort();
+    out.orphans.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
 
@@ -4366,7 +4465,18 @@ fn doctor_models(d: &BlazarDirs) -> Vec<Check> {
         use std::fmt::Write as _;
         let mut s = String::new();
         if !r.orphans.is_empty() {
-            let shown: Vec<&str> = r.orphans.iter().take(3).map(String::as_str).collect();
+            let shown: Vec<String> = r
+                .orphans
+                .iter()
+                .take(3)
+                .map(|o| {
+                    let mut s = format!("{} ({})", o.name, humansize(o.bytes.cast_signed()));
+                    if let Some(t) = o.twin_of.as_ref() {
+                        let _ = write!(s, " [byte-identical to {t} — safe to delete]");
+                    }
+                    s
+                })
+                .collect();
             let more = r.orphans.len().saturating_sub(shown.len());
             let extra = if more > 0 {
                 format!(" (+{more} more)")
@@ -10626,44 +10736,54 @@ fn rotate_daemon_log(d: &BlazarDirs) {
 /// after every install): newest `KEEP_TAGS` engines plus `local` and the
 /// active tag survive, everything older is removed.
 fn engine_prune(d: &BlazarDirs) -> Result<()> {
+    let summary = engine_prune_summary(d)?;
+    println!("{summary}");
+    Ok(())
+}
+
+/// The prune report as a single line: per-tag reclaimed sizes for both
+/// retention-pruned engines and row-less dirs, closed by the total —
+/// the doctor warnings promise "reclaims disk", this says how much.
+fn engine_prune_summary(d: &BlazarDirs) -> Result<String> {
     let store = Store::open(d)?;
-    let before: Vec<String> = store.list_engines()?.into_iter().map(|e| e.tag).collect();
     let mgr = local_engine_manager(d)?;
-    mgr.prune(&store)?;
+    let freed = mgr.prune(&store)?;
     // Row-less dirs are invisible to the table sweep above yet eat disk;
     // reclaim them in the same manual pass.
     let orphans = mgr.prune_orphan_dirs()?;
-    let after: Vec<String> = store.list_engines()?.into_iter().map(|e| e.tag).collect();
-    let removed: Vec<&str> = before
-        .iter()
-        .map(String::as_str)
-        .filter(|t| !after.iter().any(|kept| kept == t))
-        .collect();
-    if removed.is_empty() && orphans.is_empty() {
-        println!(
+    let kept: Vec<String> = store.list_engines()?.into_iter().map(|e| e.tag).collect();
+    if freed.is_empty() && orphans.is_empty() {
+        return Ok(format!(
             "nothing to prune — {} engines kept: {}",
-            after.len(),
-            after.join(", ")
-        );
-    } else {
-        let mut parts = Vec::new();
-        if !removed.is_empty() {
-            parts.push(format!(
-                "pruned {} (kept: {})",
-                removed.join(", "),
-                after.join(", ")
-            ));
-        }
-        for (tag, bytes) in &orphans {
-            #[allow(clippy::cast_precision_loss)] // MiB display
-            let mib = *bytes as f64 / (1024.0 * 1024.0);
-            parts.push(format!(
-                "removed orphan engine dir {tag} ({mib:.0} MiB, no store row)"
-            ));
-        }
-        println!("{}", parts.join("; "));
+            kept.len(),
+            kept.join(", ")
+        ));
     }
-    Ok(())
+    let mut parts = Vec::new();
+    if !freed.is_empty() {
+        let removed: Vec<String> = freed
+            .iter()
+            .map(|(tag, bytes)| format!("{tag} ({})", humansize(bytes.cast_signed())))
+            .collect();
+        parts.push(format!(
+            "pruned {} (kept: {})",
+            removed.join(", "),
+            kept.join(", ")
+        ));
+    }
+    let mut total: u64 = freed.iter().map(|(_, b)| b).sum();
+    for (tag, bytes) in &orphans {
+        total += bytes;
+        parts.push(format!(
+            "removed orphan engine dir {tag} ({}, no store row)",
+            humansize(bytes.cast_signed())
+        ));
+    }
+    Ok(format!(
+        "{} — reclaimed {} in total",
+        parts.join("; "),
+        humansize(total.cast_signed())
+    ))
 }
 
 fn engine_rm(d: &BlazarDirs, tag: &str) -> Result<()> {
@@ -13663,11 +13783,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("owned.gguf"), b"x").unwrap();
         std::fs::write(dir.join("sidecar.gguf"), b"x").unwrap();
-        std::fs::write(dir.join("stray.gguf"), b"x").unwrap();
+        std::fs::write(dir.join("stray.gguf"), vec![0u8; 2048]).unwrap();
         let mut row = row_with_path(&dir.join("owned.gguf"));
         row.mmproj_path = Some(dir.join("sidecar.gguf").display().to_string());
         let r = orphan_scan(&[row], &dir);
-        assert_eq!(r.orphans, vec!["stray.gguf".to_string()]);
+        let names: Vec<&str> = r.orphans.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, vec!["stray.gguf"]);
+        assert_eq!(r.orphans[0].bytes, 2048, "size captured from disk");
         assert_eq!(r.twins, 0);
     }
 
@@ -13699,7 +13821,8 @@ mod tests {
         std::fs::write(dir.join("notes.txt"), b"x").unwrap();
         std::fs::write(dir.join("UPPER.GGUF"), b"x").unwrap();
         let r = orphan_scan(&[], &dir);
-        assert_eq!(r.orphans, vec!["UPPER.GGUF".to_string()]); // case-insensitive ext
+        let names: Vec<&str> = r.orphans.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, vec!["UPPER.GGUF"]); // case-insensitive ext
     }
 
     #[test]
@@ -13712,7 +13835,7 @@ mod tests {
         std::fs::create_dir_all(d.models_dir()).unwrap();
         drop(blazar_core::store::Store::open(&d).unwrap());
         std::fs::write(d.models_dir().join("registered.gguf"), b"x").unwrap();
-        std::fs::write(d.models_dir().join("orphan.gguf"), b"x").unwrap();
+        std::fs::write(d.models_dir().join("orphan.gguf"), vec![0u8; 512]).unwrap();
         // Register by direct insert: doctor_models reads the real store.
         {
             let store = blazar_core::store::Store::open(&d).unwrap();
@@ -13735,10 +13858,70 @@ mod tests {
         assert_eq!(checks[1].name, "unmanaged files");
         assert!(checks[1].warn && checks[1].ok, "{}", checks[1].detail);
         assert!(
-            checks[1].detail.contains("orphan.gguf")
+            checks[1].detail.contains("orphan.gguf (512 B)")
                 && checks[1].detail.contains("blazar import <file> --name <n>"),
             "{}",
             checks[1].detail
+        );
+    }
+
+    #[test]
+    fn unit__orphan_scan__content_twin_flagged_byte_identical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("models");
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload = vec![7u8; 4096];
+        std::fs::write(dir.join("registered.gguf"), &payload).unwrap();
+        // Manual-download duplicate: same bytes, different name.
+        std::fs::write(dir.join("duplicate.gguf"), &payload).unwrap();
+        // Same SIZE, different content — the sha256 gate must not
+        // libel it as a twin.
+        let mut sibling = payload.clone();
+        sibling[0] ^= 0xff;
+        std::fs::write(dir.join("same-size.gguf"), &sibling).unwrap();
+        let models = vec![row_with_path(&dir.join("registered.gguf"))];
+        let r = orphan_scan(&models, &dir);
+        let by_name = |n: &str| r.orphans.iter().find(|o| o.name == n).unwrap();
+        assert_eq!(
+            by_name("duplicate.gguf").twin_of.as_deref(),
+            Some("registered.gguf — linked to m"),
+            "byte-identical duplicate flagged with its registered twin"
+        );
+        assert!(
+            by_name("same-size.gguf").twin_of.is_none(),
+            "same-size different-content file must NOT be flagged (sha256 gate)"
+        );
+    }
+
+    #[test]
+    fn unit__doctor_models__orphan_twin_marked_safe_to_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.models_dir()).unwrap();
+        drop(blazar_core::store::Store::open(&d).unwrap());
+        let payload = vec![3u8; 256];
+        std::fs::write(d.models_dir().join("registered.gguf"), &payload).unwrap();
+        std::fs::write(d.models_dir().join("dupe.gguf"), &payload).unwrap();
+        {
+            let store = blazar_core::store::Store::open(&d).unwrap();
+            store
+                .upsert_model(&row_with_path(&d.models_dir().join("registered.gguf")))
+                .unwrap();
+        }
+        let checks = doctor_models(&d);
+        let orphan_check = checks
+            .iter()
+            .find(|c| c.name == "unmanaged files")
+            .expect("unmanaged files row present");
+        assert!(
+            orphan_check
+                .detail
+                .contains("dupe.gguf (256 B) [byte-identical to registered.gguf — linked to m — safe to delete]"),
+            "{}",
+            orphan_check.detail
         );
     }
 
@@ -13804,6 +13987,90 @@ mod tests {
             ],
             "unprivileged user unit first; system attempt must not prompt"
         );
+    }
+
+    #[test]
+    fn unit__doctor_engines__orphan_dirs_sized_and_sorted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.engines_dir()).unwrap();
+        drop(blazar_core::store::Store::open(&d).unwrap());
+        // One registered engine (store row) + two row-less dirs of
+        // known sizes: only the orphans may appear, annotated + sorted.
+        {
+            let store = blazar_core::store::Store::open(&d).unwrap();
+            store
+                .upsert_engine(&gap_engine_row("b1-cuda", EngineKind::LlamaCpp, &[]))
+                .unwrap();
+        }
+        std::fs::create_dir_all(d.engines_dir().join("b9-old")).unwrap();
+        std::fs::write(d.engines_dir().join("b9-old").join("bin"), vec![0u8; 512]).unwrap();
+        std::fs::create_dir_all(d.engines_dir().join("b2-old")).unwrap();
+        std::fs::write(d.engines_dir().join("b2-old").join("bin"), b"x").unwrap();
+        let checks = doctor_engines(&d);
+        let ret = checks
+            .iter()
+            .find(|c| c.name == "engine retention")
+            .expect("retention check present");
+        assert!(ret.warn && ret.ok, "{}", ret.detail);
+        assert!(
+            ret.detail
+                .contains("orphan dirs (no store row): b2-old (1 B), b9-old (512 B)"),
+            "{}",
+            ret.detail
+        );
+        assert!(
+            ret.detail.contains("`blazar engine prune` reclaims disk"),
+            "{}",
+            ret.detail
+        );
+    }
+
+    #[test]
+    fn unit__engine_prune__summary_reports_sizes_and_total() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.engines_dir()).unwrap();
+        // Three inactive llamacpp lanes, oldest past retention with a
+        // 512 B dir; plus a 256 B row-less dir for the orphan sweep.
+        let mut seeded: Vec<String> = Vec::new();
+        {
+            let store = blazar_core::store::Store::open(&d).unwrap();
+            for (i, (tag, file_bytes)) in [("b1", 512usize), ("b2", 64), ("b3", 64)]
+                .iter()
+                .enumerate()
+            {
+                let dir = d.engines_dir().join(tag);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("bin"), vec![0u8; *file_bytes]).unwrap();
+                let mut row = gap_engine_row(tag, EngineKind::LlamaCpp, &[]);
+                row.active = false;
+                row.installed_at = i64::try_from(i).unwrap();
+                store.upsert_engine(&row).unwrap();
+                seeded.push(tag.to_string());
+            }
+        }
+        std::fs::create_dir_all(d.engines_dir().join("straydir")).unwrap();
+        std::fs::write(d.engines_dir().join("straydir").join("bin"), vec![0u8; 256]).unwrap();
+        let summary = engine_prune_summary(&d).unwrap();
+        assert!(
+            summary.contains("pruned b1 (512 B) (kept: b3, b2)"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("removed orphan engine dir straydir (256 B, no store row)"),
+            "{summary}"
+        );
+        assert!(summary.ends_with("— reclaimed 768 B in total"), "{summary}");
+        // Idempotent: a second pass has nothing left to say.
+        let again = engine_prune_summary(&d).unwrap();
+        assert!(again.starts_with("nothing to prune"), "{again}");
     }
 
     #[test]
