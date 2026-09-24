@@ -487,28 +487,51 @@ fn adopt_gguf(
 
 /// Adopt a safetensors model dir (`<name>.d`) at its existing location,
 /// mirroring the pull lane's row dialect.
-/// Pick the projector sidecar belonging to a pull-convention GGUF.
+/// Pick the projector sidecar belonging to a GGUF, in two rungs:
 ///
-/// Pull stores model and projector under the same `owner--repo--` prefix;
-/// that shared prefix is the only disk-surviving proof of the pairing, so
-/// it is the only one reconcile trusts. Bare names (`mmproj-F16.gguf`)
-/// carry no repo signal and stay unattached (import `--mmproj` is the
-/// manual path for those).
+/// 1. Pull convention: model and projector stored under the same
+///    `owner--repo--` prefix — the only disk-surviving proof of the
+///    pairing for that dialect.
+/// 2. Publisher filenames: the projector names the model verbatim
+///    (`mmproj-Qwen3VL-8B-Instruct-F16` beside
+///    `Qwen3VL-8B-Instruct-Q4_K_M`). The model stem minus its quant
+///    tail token is the identity; a UNIQUE unattached sidecar whose
+///    name contains it links. Two or more candidates (or a stem too
+///    short to be an identity) attach none — the same never-guessed
+///    rule bare sidecars without any stem signal already follow.
+///
+/// A sidecar attaches to at most one row (`attached`); quant siblings
+/// sharing one projector resolve to the first row in list order.
 fn match_sidecar_for(
     leaf: &str,
     sidecars: &[String],
     attached: &mut HashSet<String>,
 ) -> Option<String> {
     let parts: Vec<&str> = leaf.split("--").collect();
-    if parts.len() < 3 {
-        return None; // bare or non-pull name — no repo prefix to match
+    if parts.len() >= 3 {
+        let prefix = format!("{}--{}--", parts[0], parts[1]);
+        if let Some(hit) = sidecars
+            .iter()
+            .find(|s| s.starts_with(&prefix) && !attached.contains(*s))
+        {
+            attached.insert(hit.clone());
+            return Some(hit.clone());
+        }
     }
-    let prefix = format!("{}--{}--", parts[0], parts[1]);
-    let hit = sidecars
+    let stem = leaf.strip_suffix(".gguf").unwrap_or(leaf);
+    let core = stem
+        .rsplit_once('-')
+        .map_or(stem, |(head, _)| head)
+        .to_lowercase();
+    if core.len() < 4 {
+        return None; // too short to be an identity, only a coincidence
+    }
+    let mut hits = sidecars
         .iter()
-        .find(|s| s.starts_with(&prefix) && !attached.contains(*s))?;
+        .filter(|s| !attached.contains(*s) && s.to_lowercase().contains(&core));
+    let hit = hits.next().filter(|_| hits.next().is_none())?.clone();
     attached.insert(hit.clone());
-    Some(hit.clone())
+    Some(hit)
 }
 
 fn adopt_dir(
@@ -1436,6 +1459,136 @@ mod tests {
         assert!(
             m.mmproj_path.is_none(),
             "bare sidecar has no repo signal — never guessed"
+        );
+    }
+
+    #[test]
+    fn unit__reconcile__stem_named_sidecar_links_bare_model() {
+        // Live shape from the 09-24 store audit: a publisher-filename
+        // GGUF adopted beside a projector that names the model verbatim.
+        // The stem minus its quant tail is the identity — that dialect
+        // must link at adopt time, not only via backfill.
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        write_gguf(
+            &d.join("Qwen3VL-8B-Instruct-Q4_K_M.gguf"),
+            "qwen3vl",
+            Some("Qwen3VL 8B Instruct"),
+        );
+        write_gguf(&d.join("mmproj-Qwen3VL-8B-Instruct-F16.gguf"), "clip", None);
+        let store = Store::open(&dirs).unwrap();
+
+        let r = reconcile_models(&dirs, &store);
+        assert_eq!(r.adopted.len(), 1, "{:?}", r.skipped);
+        let m = store.get_model("qwen3vl-8b-instruct").unwrap().unwrap();
+        assert_eq!(
+            m.mmproj_path.as_deref(),
+            Some(
+                d.join("mmproj-Qwen3VL-8B-Instruct-F16.gguf")
+                    .display()
+                    .to_string()
+                    .as_str()
+            ),
+            "stem-named sidecar links to the bare-named model"
+        );
+        // Second boot: stable, no reassignment churn.
+        let r2 = reconcile_models(&dirs, &store);
+        assert!(r2.adopted.is_empty() && r2.relinked.is_empty(), "{r2:?}");
+    }
+
+    #[test]
+    fn unit__reconcile__backfill_stem_sidecar_heals_bare_adopted_row() {
+        // The 09-24 live box: rows adopted as bare filenames years before
+        // the slugged sidecar landed beside them. The backfill pass must
+        // heal them through the stem dialect, not only the slug prefix.
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        write_gguf(
+            &d.join("Qwen3.5-9B-Q4_K_M.gguf"),
+            "qwen35",
+            Some("Qwen3.5 9B"),
+        );
+        write_gguf(
+            &d.join("unsloth--Qwen3.5-9B-GGUF--mmproj-F16.gguf"),
+            "clip",
+            None,
+        );
+        let store = Store::open(&dirs).unwrap();
+        let mut old = row(&d.join("Qwen3.5-9B-Q4_K_M.gguf"), "qwen3.5-9b");
+        old.repo = format!("adopted:{}", d.join("Qwen3.5-9B-Q4_K_M.gguf").display());
+        store.upsert_model(&old).unwrap();
+
+        let r = reconcile_models(&dirs, &store);
+        assert!(r.adopted.is_empty(), "{:?}", r.adopted);
+        assert_eq!(r.relinked, ["qwen3.5-9b"]);
+        let m = store.get_model("qwen3.5-9b").unwrap().unwrap();
+        assert_eq!(
+            m.mmproj_path.as_deref(),
+            Some(
+                d.join("unsloth--Qwen3.5-9B-GGUF--mmproj-F16.gguf")
+                    .display()
+                    .to_string()
+                    .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn unit__reconcile__ambiguous_stem_sidecars_attach_none() {
+        // Two projectors carry the same stem (F16 + Q8 variants): the
+        // stem dialect cannot pick between them, so it must pick neither.
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        write_gguf(
+            &d.join("Qwen2.5-VL-7B-Q4_K_M.gguf"),
+            "qwen2vl",
+            Some("Qwen2.5 VL 7B"),
+        );
+        write_gguf(&d.join("mmproj-Qwen2.5-VL-7B-F16.gguf"), "clip", None);
+        write_gguf(&d.join("mmproj-Qwen2.5-VL-7B-Q8_0.gguf"), "clip", None);
+        let store = Store::open(&dirs).unwrap();
+
+        let r = reconcile_models(&dirs, &store);
+        assert_eq!(r.adopted.len(), 1, "{:?}", r.skipped);
+        let m = store.get_model("qwen2.5-vl-7b").unwrap().unwrap();
+        assert!(
+            m.mmproj_path.is_none(),
+            "ambiguous stem candidates — neither is guessed"
+        );
+    }
+
+    #[test]
+    fn unit__reconcile__stem_sidecar_single_owner_across_quant_siblings() {
+        // Two quants of one base, one shared projector: exactly one row
+        // claims it (deterministic list order), the other stays bare,
+        // and later boots never reassign it.
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        write_gguf(
+            &d.join("Qwen3VL-8B-Q4_K_M.gguf"),
+            "qwen3vl",
+            Some("Qwen3VL 8B"),
+        );
+        write_gguf(
+            &d.join("Qwen3VL-8B-Q8_0.gguf"),
+            "qwen3vl",
+            Some("Qwen3VL 8B"),
+        );
+        write_gguf(&d.join("mmproj-Qwen3VL-8B-F16.gguf"), "clip", None);
+        let store = Store::open(&dirs).unwrap();
+
+        let r = reconcile_models(&dirs, &store);
+        assert_eq!(r.adopted.len(), 2, "{:?}", r.skipped);
+        let all = store.list_models().unwrap();
+        let with_mmproj: Vec<&_> = all.iter().filter(|m| m.mmproj_path.is_some()).collect();
+        assert_eq!(with_mmproj.len(), 1, "exactly one sibling owns the sidecar");
+        let r2 = reconcile_models(&dirs, &store);
+        assert!(r2.adopted.is_empty() && r2.relinked.is_empty(), "{r2:?}");
+        let all2 = store.list_models().unwrap();
+        assert_eq!(
+            all2.iter().filter(|m| m.mmproj_path.is_some()).count(),
+            1,
+            "ownership stable across boots"
         );
     }
 
