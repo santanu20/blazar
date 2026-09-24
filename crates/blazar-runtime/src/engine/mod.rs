@@ -2009,8 +2009,9 @@ impl EngineManager {
 
     /// Keep the newest `KEEP_TAGS` engines; `local` and the active tag are
     /// never pruned. Fork capability lanes are exempt entirely — see
-    /// [`is_fork_lane`].
-    pub fn prune(&self, store: &Store) -> Result<()> {
+    /// [`is_fork_lane`]. Returns the freed (tag, bytes) pairs for the
+    /// summary, mirroring [`Self::prune_siblings`].
+    pub fn prune(&self, store: &Store) -> Result<Vec<(String, u64)>> {
         let engines = store.list_engines()?; // newest first
         let active = engines.iter().find(|e| e.active).map(|e| e.tag.clone());
         // Retention is scoped per engine KIND: a mistral.rs build is never
@@ -2021,6 +2022,7 @@ impl EngineManager {
         // reinstall then pruned sglang).
         let mut kept_per_kind: std::collections::BTreeMap<&str, usize> =
             std::collections::BTreeMap::new();
+        let mut freed = Vec::new();
         for e in &engines {
             // A user-installed fork lane never consumes a mainstream
             // retention slot: skipping BEFORE the count keeps KEEP_TAGS
@@ -2034,16 +2036,19 @@ impl EngineManager {
                 continue;
             }
             let dir = self.dirs.engines_dir().join(&e.tag);
+            let mut bytes = 0u64;
             if dir.exists() {
+                bytes = engine_dir_bytes(&dir);
                 std::fs::remove_dir_all(&dir)
                     .with_context(|| format!("prune engine dir {}", dir.display()))?;
             }
             store.delete_engine(&e.tag)?;
-            tracing::info!("pruned old engine {}", e.tag);
+            tracing::info!("pruned old engine {} ({} bytes)", e.tag, bytes);
             self.bus
                 .publish(BlazarEvent::EngineRemoved { tag: e.tag.clone() });
+            freed.push((e.tag.clone(), bytes));
         }
-        Ok(())
+        Ok(freed)
     }
 
     /// Phase-3 supersede lifecycle, run at daemon start and after any
