@@ -1898,8 +1898,20 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         argv.push("--context-shift".into());
     }
     if !config.samplers.is_empty() {
-        argv.push("--samplers".into());
-        argv.push(config.samplers.clone());
+        // Config syntax is comma-separated (validated in config.rs); the
+        // engine splits --samplers on ';' only — a comma chain reaches it
+        // as one unmatched name and silently degrades the sampler order.
+        let chain = config
+            .samplers
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(";");
+        if !chain.is_empty() {
+            argv.push("--samplers".into());
+            argv.push(chain);
+        }
     }
     if !config.video_ffmpeg_dir.is_empty() {
         argv.push("--video-ffmpeg-dir".into());
@@ -5641,6 +5653,47 @@ mod tests {
 
     #[test]
     #[allow(clippy::field_reassign_with_default)]
+    fn unit__samplers__comma_config_emits_engine_semicolon_chain() {
+        // The engine splits --samplers on ';' only; a comma chain reaches
+        // it as one unmatched name and silently degrades the sampler order.
+        let cfg = Config {
+            samplers: "top_k, top_p,temperature".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--samplers" && w[1] == "top_k;top_p;temperature"));
+        assert!(
+            !p.argv.iter().any(|a| a.contains(',')),
+            "no comma form may reach the engine: {:?}",
+            p.argv
+                .iter()
+                .filter(|a| a.contains("top_k"))
+                .collect::<Vec<_>>()
+        );
+
+        // All-blank parts emit nothing rather than a degenerate ";" chain.
+        let cfg = Config {
+            samplers: " , , ".into(),
+            ..Config::default()
+        };
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(!p.argv.contains(&"--samplers".to_string()));
+    }
+
+    #[test]
     fn unit__kv_layout__explicit_and_auto_unified() {
         let hw = gpu_hw(24_000, 64_000, 8);
         let mut cfg = Config::default();
