@@ -652,6 +652,11 @@ Group=${SVC_GROUP}
 WorkingDirectory=${SVC_DATA_DIR}
 ${SG_LINE}
 ${MH_LINE}
+# Tag the journal stream so `journalctl -t blazar` keeps matching after
+# a journal rotation strands the original stream fd. The daemon's
+# durable log is run/daemon.log (owned + rotated by the daemon itself);
+# journald is the secondary sink.
+SyslogIdentifier=blazar
 Restart=always
 RestartSec=3
 # blazar serve exits 3 on hard singleton conflicts — another server

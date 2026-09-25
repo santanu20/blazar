@@ -902,7 +902,15 @@ fn main() {
         .ok()
         .and_then(|raw| Config::from_toml(&raw).ok())
         .and_then(|c| c.log_level);
-    blazar_core::telemetry::init_tracing(0, log_level.as_deref());
+    // The serve path owns a durable daemon log: under systemd the
+    // journal stream is secondary (rotation can strand it); every other
+    // command logs to stderr only (their output is interactive).
+    let log_file = if matches!(cli.cmd, Cmd::Serve) {
+        Some(dirs().run_dir().join("daemon.log"))
+    } else {
+        None
+    };
+    blazar_core::telemetry::init_tracing(0, log_level.as_deref(), log_file.as_deref());
     if let Err(e) = run(cli.cmd) {
         eprintln!("blazar: {e:#}");
         std::process::exit(1);
