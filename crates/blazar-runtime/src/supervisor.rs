@@ -3816,11 +3816,7 @@ drop them from rpc_servers in config.toml",
             return true;
         };
         advise_cuda_build(&store, &row);
-        crate::engine::verify_engine_binary(
-            &row.kind,
-            &self.dirs.engines_dir(),
-            Some(&row.manifest),
-        )
+        crate::engine::verify_engine_binary(&row.kind, &self.dirs.data_dir, Some(&row.manifest))
     }
 
     /// Switch the active engine to the previous install (same ordering as

@@ -314,7 +314,8 @@ fn engines_lane_server_bin(
     dirs: &BlazarDirs,
     row: &blazar_core::store::EngineRow,
 ) -> Option<PathBuf> {
-    if let Ok(m) = serde_json::from_str::<crate::engine::manifest::Manifest>(&row.manifest) {
+    if let Ok(mut m) = serde_json::from_str::<crate::engine::manifest::Manifest>(&row.manifest) {
+        m.anchor_server_path(&dirs.data_dir);
         let probed = PathBuf::from(&m.server_path);
         if probed.is_file() {
             return Some(probed);
@@ -1155,6 +1156,52 @@ mod tests {
         std::fs::write(pin_path(&dirs), "  \n").expect("pin");
         let (_, dir) = server_bin(&dirs).expect("server");
         assert_eq!(dir, newest);
+    }
+
+    #[test]
+    fn unit__server_bin__relative_row_anchors_to_data_dir() {
+        // Storage-invariant rows carry `engines/<tag>/...` server paths —
+        // the lane resolver must anchor them against the live data dir
+        // instead of missing the file and falling through to a directory
+        // search (or worse, the legacy tree).
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let lane_dir = dirs.engines_dir().join("b5130/whisper-bin-ubuntu-x64");
+        std::fs::create_dir_all(&lane_dir).expect("lane");
+        std::fs::write(lane_dir.join("whisper-server"), b"stub").expect("bin");
+        let manifest = serde_json::json!({
+            "tag": "b5130",
+            "build_number": 5130,
+            "version_raw": "v",
+            "devices": [],
+            "flags": [],
+            "spec_types": [],
+            "server_path": "engines/b5130/whisper-bin-ubuntu-x64/whisper-server",
+        })
+        .to_string();
+        let store = blazar_core::Store::open(&dirs).expect("store");
+        store
+            .upsert_engine(&blazar_core::store::EngineRow {
+                tag: "b5130".to_string(),
+                asset: "whisper-bin-ubuntu-x64.tar.gz".to_string(),
+                sha256: "unverified".to_string(),
+                installed_at: 1,
+                active: true,
+                manifest,
+                kind: blazar_core::engine_kind::EngineKind::Whisper,
+            })
+            .expect("row");
+        let row = store
+            .list_engines()
+            .expect("rows")
+            .into_iter()
+            .find(|r| r.tag == "b5130")
+            .expect("row");
+        let bin = engines_lane_server_bin(&dirs, &row).expect("anchored bin");
+        assert_eq!(bin, lane_dir.join("whisper-server"));
     }
 
     #[test]

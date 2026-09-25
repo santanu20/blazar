@@ -8,6 +8,7 @@ tracked here.
 
 ### Added
 
+- **Engine rows store data-dir-relative server paths.** Manifests recorded the absolute binary path at install time, which made rows non-relocatable (a moved/copied data dir needed a re-root workaround on every load) and baked machine-specific paths into the db. Rows now persist `engines/<tag>/...` relative to the data dir (the out-of-tree `local` lane keeps its user-given path), anchored back to an absolute live path at every decode — spawns, probes, and the orphan sweep see the same absolute paths as before, and the boot pass migrates legacy absolute rows in place.
 - **Whisper models and piper voices are searchable before pulling.** `blazar whisper --search [substr]` lists every ggml size the upstream `ggerganov/whisper.cpp` repo ships (tiny..large-v3-turbo, `.en` variants, q5/q8 builds — 33 models today) with DISK bytes and a `pulled` marker on what is local; `blazar tts --search <substr>` does the same for the `rhasspy/piper-voices` catalog — search by language (`en`), locale (`en_GB`), or name (`amy`), top 40 rows with a showing-N-of-M note. Both ride the Hub tree API with cursor pagination (the siblings listing the old code path used truncates this repo at ~3300 files, hiding most voices), a language-prefix query narrows the walk to that language subtree, and any other substring walks all languages in parallel. Every row resolves through the same id grammar `--pull` accepts, so nothing listed can dead-end.
 
 ## [0.11.0] - 2026-09-23
