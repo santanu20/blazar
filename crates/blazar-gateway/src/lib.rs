@@ -892,6 +892,31 @@ pub async fn serve(
     // rate and EWMA it into the supervisor's CacheHints — the adaptive
     // --cache-ram clamp's input and the spec gauge's source. Bounded
     // (2 s) fetches; failures just skip a window.
+    // Wake admission waiters when a child swap changes slot capacity:
+    // a completed adaptive reshape (SlotsReshaped) or an engine
+    // update/rollback replaced the child while requests were parked on
+    // the admission queue — only stream completions signal otherwise,
+    // so these waiters would sit until the 2-min park timeout.
+    let reshape_wake_task = {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut rx = state.bus.subscribe();
+            loop {
+                match rx.recv().await {
+                    Ok(
+                        blazar_runtime::events::BlazarEvent::SlotsReshaped { .. }
+                        | blazar_runtime::events::BlazarEvent::EngineUpdated { .. }
+                        | blazar_runtime::events::BlazarEvent::EngineRolledBack { .. },
+                    ) => state.queue.signal_free(),
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "reshape wake subscriber lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+    };
     let hint_task = {
         let state = Arc::clone(&state);
         tokio::spawn(async move {
@@ -1070,6 +1095,7 @@ pub async fn serve(
     }
     otlp_task.abort();
     hint_task.abort();
+    reshape_wake_task.abort();
     // H8: the lazy whisper-server child (if any request spawned one).
     state.whisper.shutdown().await;
     state.sup.shutdown_all().await?;

@@ -1644,6 +1644,28 @@ pub async fn admission_gate_slo(
             }
         };
         if busy < ceiling {
+            // A reshape is draining this model: hold new admissions so
+            // in-flight can only fall and the respawn lands this window.
+            // Parks ride the same queue/pressure machinery as a full
+            // ceiling; the SlotsReshaped event wakes every waiter.
+            if state.sup.is_reshaping(model) {
+                state.sup.note_slot_pressure(model);
+                let waited = state
+                    .queue
+                    .wait(
+                        model,
+                        priority,
+                        class,
+                        deadline_ms,
+                        body_len,
+                        std::time::Duration::from_mins(2),
+                        wfq,
+                    )
+                    .await;
+                state.sup.note_slot_pressure_release(model);
+                waited.map_err(|e| Box::new(openai_error(503, &e)))?;
+                continue;
+            }
             return Ok(begin_accounting(state, model));
         }
         // The REAL same-model park: this request waits for a slot on the
