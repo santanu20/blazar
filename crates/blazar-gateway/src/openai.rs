@@ -874,8 +874,7 @@ pub async fn responses_api(
         crate::proxy::child_base(&engine.endpoint)
     );
     let req = crate::proxy::child_auth(
-        state
-            .http
+        crate::state::child_client(&state, &engine.endpoint)
             .post(&url)
             .header("content-type", "application/json"),
         &engine,
@@ -896,8 +895,7 @@ pub async fn responses_api(
                     let fresh_url =
                         format!("{}/v1/responses", crate::proxy::child_base(&fresh.endpoint));
                     let fresh_req = crate::proxy::child_auth(
-                        state
-                            .http
+                        crate::state::child_client(&state, &fresh.endpoint)
                             .post(&fresh_url)
                             .header("content-type", "application/json"),
                         &fresh,

@@ -512,8 +512,7 @@ async fn forward_images(
     // instead of a 502 the client never caused. Same contract as the
     // proxy text-lane forward.
     let upstream = crate::proxy::send_with_child_retry(state, engine, |eng| {
-        let mut rb = state
-            .http
+        let mut rb = crate::state::child_client(state, &eng.endpoint)
             .post(format!("{}{path}", child_base(&eng.endpoint)));
         if let Some(ct) = content_type {
             rb = rb.header(header::CONTENT_TYPE, ct);
@@ -840,7 +839,12 @@ async fn submit_native_job(
     // dead child surfaces as transport error, respawn + one retry.
     let resp = match crate::proxy::send_with_child_retry(state, engine, |eng| {
         let url = format!("{}{native_path}", child_base(&eng.endpoint));
-        child_auth(state.http.post(&url).json(native), eng)
+        child_auth(
+            crate::state::child_client(state, &eng.endpoint)
+                .post(&url)
+                .json(native),
+            eng,
+        )
     })
     .await
     {
@@ -868,10 +872,13 @@ async fn poll_child_job(
     job_id: &str,
 ) -> Result<Option<serde_json::Value>, ()> {
     let url = format!("{}/sdcpp/v1/jobs/{job_id}", child_base(&engine.endpoint));
-    let resp = child_auth(state.http.get(&url), engine)
-        .send()
-        .await
-        .map_err(|_| ())?;
+    let resp = child_auth(
+        crate::state::child_client(state, &engine.endpoint).get(&url),
+        engine,
+    )
+    .send()
+    .await
+    .map_err(|_| ())?;
     if resp.status() == axum::http::StatusCode::NOT_FOUND {
         return Ok(None);
     }
@@ -1142,10 +1149,13 @@ pub async fn jobs_cancel(
     // "job is currently generating and cannot be interrupted yet" — this
     // build only cancels queued jobs. Relay that truth instead of
     // answering a fake-optimistic 200.
-    let sent = child_auth(state.http.post(&url), &engine)
-        .json(&serde_json::json!({}))
-        .send()
-        .await;
+    let sent = child_auth(
+        crate::state::child_client(&state, &engine.endpoint).post(&url),
+        &engine,
+    )
+    .json(&serde_json::json!({}))
+    .send()
+    .await;
     if let Ok(resp) = sent {
         if resp.status().as_u16() == 409 {
             let upstream_msg = resp
@@ -1189,7 +1199,13 @@ pub async fn capabilities(State(state): State<Arc<AppState>>) -> Response {
         );
     };
     let url = format!("{}/sdcpp/v1/capabilities", child_base(&engine.endpoint));
-    match child_auth(state.http.get(&url), engine).send().await {
+    match child_auth(
+        crate::state::child_client(&state, &engine.endpoint).get(&url),
+        engine,
+    )
+    .send()
+    .await
+    {
         Ok(resp) if resp.status().is_success() => match resp.bytes().await {
             Ok(bytes) => Response::builder()
                 .status(200)

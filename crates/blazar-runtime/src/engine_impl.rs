@@ -151,13 +151,6 @@ impl LlamaCppEngine {
             child_env: env,
         }
     }
-
-    fn base_url(endpoint: &Endpoint) -> String {
-        match endpoint {
-            Endpoint::Tcp { host, port } => format!("http://{host}:{port}"),
-            Endpoint::Unix { .. } => String::new(), // unix sockets: probe skipped
-        }
-    }
 }
 
 #[async_trait]
@@ -231,10 +224,16 @@ impl Engine for LlamaCppEngine {
     }
 
     async fn health_check(&self, endpoint: &Endpoint, timeout: std::time::Duration) -> Result<()> {
-        let url = Self::base_url(endpoint);
-        if url.is_empty() {
-            return Ok(()); // unix transport: health via socket handled by caller
-        }
+        // TCP probes ride the shared pool client; unix probes use an
+        // ephemeral client pinned to the socket (probes run once per
+        // spawn — no pool to warm) with a placeholder host the
+        // connector ignores.
+        let (client, url) = match endpoint {
+            Endpoint::Tcp { host, port } => (self.http.clone(), format!("http://{host}:{port}")),
+            Endpoint::Unix { socket } => {
+                (crate::uds::client(socket), "http://localhost".to_string())
+            }
+        };
         let deadline = tokio::time::Instant::now() + timeout;
         let started = std::time::Instant::now();
         // Adaptive poll: fast at first (the child usually turns healthy
@@ -243,7 +242,7 @@ impl Engine for LlamaCppEngine {
         // post-ready overshoot from ~75ms to ~12ms on cold first token.
         let mut poll = std::time::Duration::from_millis(25);
         loop {
-            match self.http.get(format!("{url}/health")).send().await {
+            match client.get(format!("{url}/health")).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     let body: serde_json::Value = resp.json().await.unwrap_or_default();
                     if body["status"] == "ok" {

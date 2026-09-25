@@ -906,16 +906,14 @@ pub async fn serve(
                 let mut totals = (0u64, 0u64);
                 let mut spec_totals = (0u64, 0u64);
                 for e in state.sup.live_http_endpoints() {
-                    let blazar_core::profile::Endpoint::Tcp { host, port } = &e.endpoint else {
-                        continue;
-                    };
                     // Child Prometheus text: aggregate counters (the /slots
                     // per-slot stats are short-lived and unreliable — the
-                    // metrics counters are the durable truth).
-                    let url = format!("http://{host}:{port}/metrics");
+                    // metrics counters are the durable truth). Both
+                    // transports serve /metrics; child_client picks the
+                    // socket-pinned client for unix children.
+                    let url = format!("{}/metrics", crate::proxy::child_base(&e.endpoint));
                     let Ok(resp) = crate::proxy::child_auth(
-                        state
-                            .http
+                        crate::state::child_client(&state, &e.endpoint)
                             .get(&url)
                             .timeout(std::time::Duration::from_secs(2)),
                         &e,

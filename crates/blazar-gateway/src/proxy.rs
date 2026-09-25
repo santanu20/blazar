@@ -46,7 +46,12 @@ pub(crate) const STRIP_RESPONSE: &[&str] = &[
 pub fn child_base(ep: &blazar_core::Endpoint) -> String {
     match ep {
         blazar_core::Endpoint::Tcp { host, port } => format!("http://{host}:{port}"),
-        blazar_core::Endpoint::Unix { .. } => String::new(),
+        // The unix connector dials the socket path pinned on the client
+        // and ignores the URL host; the base exists only so
+        // `{base}{path}` formatting keeps producing parseable URLs.
+        // Dial through [`crate::state::child_client`], not the shared
+        // TCP pool, or the request lands on a phantom localhost port.
+        blazar_core::Endpoint::Unix { .. } => "http://localhost".to_string(),
     }
 }
 
@@ -164,11 +169,15 @@ pub(crate) async fn ensure_detached_captive(
         })
 }
 
-/// Does this parsed chat body carry images? Shapes covered:
+/// Does this parsed chat body carry visual media? Shapes covered:
 ///
-/// - `OpenAI` chat: `messages[].content[]` items with an `image`-prefixed
-///   [`type`] (or a bare `image_url` key — some clients omit the tag)
-/// - `OpenAI` responses: `input[]` items with an `image`-prefixed [`type`]
+/// - `OpenAI` chat: `messages[].content[]` items with an `image`/`video`-
+///   prefixed [`type`] (or a bare `image_url`/`video_url` key — some
+///   clients omit the tag; `input_video` is the responses-lane alias)
+/// - `OpenAI` responses: `input[]` items with an `image`/`video`-prefixed
+///   [`type`], plus nested `function_call_output.output[]` items — a tool
+///   result may return an image (`{type: "input_image", image_url: ...}`),
+///   which the child renders as an image part on the tool message
 /// - Anthropic messages: `messages[].content[]` items `type: "image"`
 ///   (the prefix check covers it)
 /// - Ollama chat/generate: `messages[].images` non-empty or a
@@ -644,7 +653,7 @@ async fn forward_once(
     headers: &HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<reqwest::Response, ChildSendError> {
-    let mut req = state.http.request(method.clone(), url);
+    let mut req = crate::state::child_client(state, &engine.endpoint).request(method.clone(), url);
     // Client `Authorization` was stripped above; the child secret is
     // stamped fresh here (never the caller's gateway key).
     req = child_auth(req, engine);
@@ -699,12 +708,6 @@ pub async fn proxy_request(
     sf_gate: SfGate,
 ) -> Response {
     let base = child_base(&engine.endpoint);
-    if base.is_empty() {
-        return openai_error(
-            500,
-            "unix-socket child transport not supported by this proxy path yet",
-        );
-    }
     let url = format!("{base}{path_query}");
     let began = std::time::Instant::now();
 

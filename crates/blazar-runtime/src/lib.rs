@@ -28,6 +28,7 @@ pub mod quantize;
 pub mod registry;
 pub mod sessionreg;
 pub mod supervisor;
+pub mod uds;
 pub mod upgrade;
 pub mod verify;
 pub mod whisper;
