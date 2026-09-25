@@ -8,6 +8,8 @@ tracked here.
 
 ### Added
 
+- **`serve` self-heals a zero-active engine store.** An engine update interrupted before its activation step used to leave every installed engine behind one stale `active` flag — installed but unusable until a manual `engine use`. On boot, when no row holds the active flag, serve activates the best candidate (llama.cpp preferred, then mistral.rs/sglang, newest install wins; lazy lanes — whisper, sdcpp — never claim the slot) and says so on stdout.
+
 - **Engine rows store data-dir-relative server paths.** Manifests recorded the absolute binary path at install time, which made rows non-relocatable (a moved/copied data dir needed a re-root workaround on every load) and baked machine-specific paths into the db. Rows now persist `engines/<tag>/...` relative to the data dir (the out-of-tree `local` lane keeps its user-given path), anchored back to an absolute live path at every decode — spawns, probes, and the orphan sweep see the same absolute paths as before, and the boot pass migrates legacy absolute rows in place.
 
 - **The daemon owns a durable log file under every launcher.** `blazar serve` now tees its tracing output to `run/daemon.log` directly (rotated at 10 MiB to `daemon.log.1`), not only when auto-started by the CLI wrapper — under systemd the journald stream was the sole sink and a journal rotation stranded it, leaving zero daemon logs for post-mortems. Non-serve commands keep stderr-only logging.
