@@ -180,11 +180,23 @@ pub(crate) async fn ensure_detached_captive(
 /// noted, not silently hot-pathed).
 #[must_use]
 pub fn body_needs_vision(parsed: &serde_json::Value, ollama_shape: bool) -> bool {
-    fn image_item(it: &serde_json::Value) -> bool {
+    fn media_item(it: &serde_json::Value) -> bool {
         it.get("type")
             .and_then(|t| t.as_str())
-            .is_some_and(|t| t.starts_with("image"))
+            .is_some_and(|t| t.starts_with("image") || t.starts_with("video"))
             || it.get("image_url").is_some()
+            || it.get("video_url").is_some()
+            || it.get("input_video").is_some()
+    }
+    // Responses-lane tool results: `function_call_output.output[]` can
+    // carry `input_image` items (#22575) — the child converts them to
+    // image parts, so they need a projector replica like user images.
+    fn tool_media(it: &serde_json::Value) -> bool {
+        it.get("type").and_then(|t| t.as_str()) == Some("function_call_output")
+            && it
+                .get("output")
+                .and_then(|o| o.as_array())
+                .is_some_and(|outs| outs.iter().any(media_item))
     }
     if ollama_shape {
         let msgs = parsed
@@ -210,13 +222,13 @@ pub fn body_needs_vision(parsed: &serde_json::Value, ollama_shape: bool) -> bool
             ms.iter().any(|msg| {
                 msg.get("content")
                     .and_then(|c| c.as_array())
-                    .is_some_and(|items| items.iter().any(image_item))
+                    .is_some_and(|items| items.iter().any(media_item))
             })
         });
     let input = parsed
         .get("input")
         .and_then(|i| i.as_array())
-        .is_some_and(|items| items.iter().any(image_item));
+        .is_some_and(|items| items.iter().any(|it| media_item(it) || tool_media(it)));
     msgs || input
 }
 
@@ -2142,6 +2154,112 @@ mod cache_obs_tests {
         assert_eq!(obs.prompt_tokens.load(Ordering::Relaxed), 120, "usage wins");
         assert_eq!(obs.cached_tokens.load(Ordering::Relaxed), 96, "usage wins");
         assert_eq!(obs.unclassified.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod body_needs_vision_tests {
+    use super::body_needs_vision;
+
+    #[test]
+    fn unit__body_needs_vision__chat_image_tag__detected() {
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+                ]
+            }]
+        });
+        assert!(body_needs_vision(&body, false));
+    }
+
+    #[test]
+    fn unit__body_needs_vision__chat_bare_image_url_key__detected() {
+        // Some clients omit the type tag; the bare key is the signal.
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [{"image_url": {"url": "https://example.test/cat.png"}}]
+            }]
+        });
+        assert!(body_needs_vision(&body, false));
+    }
+
+    #[test]
+    fn unit__body_needs_vision__chat_video_tag_variants__detected() {
+        // b11147 #27921: chat accepts input_video/video_url aliases and
+        // data:video/* URIs — every spelling needs a projector replica.
+        for tag in ["input_video", "video_url"] {
+            let body = serde_json::json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{"type": tag, tag: "data:video/mp4;base64,AAAA"}]
+                }]
+            });
+            assert!(body_needs_vision(&body, false), "type tag {tag}");
+        }
+    }
+
+    #[test]
+    fn unit__body_needs_vision__chat_bare_video_key__detected() {
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [{"video_url": "https://example.test/clip.mp4"}]
+            }]
+        });
+        assert!(body_needs_vision(&body, false));
+    }
+
+    #[test]
+    fn unit__body_needs_vision__responses_function_call_output_image__detected() {
+        // b11147 #22575: a tool result may return an image — the child
+        // renders it as an image part on the tool message.
+        let body = serde_json::json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "inspect the frame"},
+                {"type": "function_call", "call_id": "c1", "name": "grab", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1",
+                 "output": [{"type": "input_image", "image_url": "data:image/png;base64,AAAA"}]}
+            ]
+        });
+        assert!(body_needs_vision(&body, false));
+    }
+
+    #[test]
+    fn unit__body_needs_vision__responses_function_call_output_text_only__not_detected() {
+        let body = serde_json::json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "summarize"},
+                {"type": "function_call_output", "call_id": "c1", "output": [{"type": "input_text", "text": "42"}]}
+            ]
+        });
+        assert!(!body_needs_vision(&body, false));
+    }
+
+    #[test]
+    fn unit__body_needs_vision__text_only_chat__not_detected() {
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+        });
+        assert!(!body_needs_vision(&body, false));
+    }
+
+    #[test]
+    fn unit__body_needs_vision__ollama_images__detected_and_video_absent__not_detected() {
+        let with_images = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi", "images": ["AAAA"]}]
+        });
+        assert!(body_needs_vision(&with_images, true));
+        // The ollama wire shape has no video field (api.md): a video URL
+        // riding messages[].content must NOT trip the ollama detector.
+        let text_only = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert!(!body_needs_vision(&text_only, true));
     }
 }
 
