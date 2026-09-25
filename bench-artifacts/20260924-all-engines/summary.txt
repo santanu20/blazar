@@ -63,3 +63,5 @@ b11147-cuda | llamacpp | ppl | {'ppl': 2048} | - | - | - | - | - | - | - | - | 0
 b11147-cuda | llamacpp | tools | {'tools': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
 v0.9.3 | mistralrs | tools | {'tools': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
 ollama-host | ollama | tools-ollama | {'tools': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+b11147-cuda | llamacpp | reshape | {'reshape': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+v0.9.3 | mistralrs | reshape | {'reshape': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -

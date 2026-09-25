@@ -436,7 +436,9 @@ Treat the installer, downloaded engines, third-party forks, and model files acco
 
 ## Performance
 
-Blazar ships a reproducible benchmark harness and keeps benchmark methodology and raw-artifact guidance in [`BENCHMARK.md`](BENCHMARK.md).
+Blazar ships a reproducible benchmark harness; [`BENCHMARK.md`](BENCHMARK.md) holds the methodology and the latest campaign results. Measured lanes: single-stream speed, concurrency sweep (per-level system throughput, efficiency vs C=1, saturation verdicts), greedy parity against the raw engine, perplexity, long-context TTFT curve, tool-call selection/schema quality, adaptive slot reshape under sustained load, cold start, idle wake, and media (image/video/TTS/whisper).
+
+Every campaign writes its receipts to `bench-artifacts/` (see `bench-artifacts/INDEX.md` for the campaign ledger), and the report's engine-coverage table accounts for every installed engine as measured or excluded-with-reason.
 
 Run a benchmark with:
 

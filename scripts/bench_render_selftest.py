@@ -259,8 +259,46 @@ print(
     "tools_table + F12: rows, ollama compare, error exclusion, empty marker, carried OK"
 )
 
+# --- reshape lane: table + F13 backing + scoped marker
+reshape_ok = rec(
+    "reshape",
+    {"reshape": True},
+    reshape_observed=True,
+    slots_from=1,
+    slots_to=8,
+    time_to_reshape_s=142.0,
+    requests_before=180,
+    requests_after=95,
+    ttft_p50_before_ms=11800.0,
+    ttft_p50_after_ms=940.0,
+    sys_tps_before=39.4,
+    sys_tps_after=91.2,
+    requests_failed=0,
+    timeline_samples=150,
+)
+reshape_no = rec("reshape", {"reshape": True}, tag="v0.9.3",
+                 reshape_observed=False, slots_from=2, slots_to=None,
+                 requests_before=210, requests_after=0, requests_failed=0,
+                 timeline_samples=150)
+rtab = bm.reshape_table([reshape_ok, reshape_no])
+assert "| Runtime | reshape | slots |" in rtab and "1→8" in rtab and "142" in rtab, rtab
+assert "11800→940" in rtab and "39→91" in rtab and "| 0 |" in rtab, rtab
+assert "NO" in rtab, "unobserved reshape must render NO"
+assert bm.reshape_table([]) == "_Not measured._"
+out_r = bm.text_findings([reshape_ok])
+backed_r = [b for b, _ in out_r if b]
+assert any("Adaptive reshape" in b and "1->8" in b and "0 dropped" in b for b in backed_r), (
+    backed_r
+)
+sparse_r = bm.text_findings([])
+assert any(c and "reshape under sustained concurrency" in c for b, c in sparse_r if not b), (
+    "reshape carried text missing"
+)
+print("reshape_table + F13: transition row, NO case, empty marker, carried OK")
+
 
 recs = [
+    reshape_ok,
     gw,
     gw4,
     d16,
@@ -277,7 +315,7 @@ out = bm.text_findings(recs)
 backed = [b for b, _ in out if b]
 carried = [c for b, c in out if not b]
 print(f"text_findings full: backed={len(backed)} carried={len(carried)} (expect 8/0)")
-assert len(backed) == 8 and len(carried) == 0, [x[:60] for x in backed]
+assert len(backed) == 9 and len(carried) == 0, [x[:60] for x in backed]
 assert any("noise" in b for b in backed), backed
 assert any("mistral" in b.lower() for b in backed), backed
 assert any("net loss" in b.lower() for b in backed), backed
