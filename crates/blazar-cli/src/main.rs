@@ -4664,6 +4664,13 @@ async fn serve() -> Result<()> {
         mgr.use_tag(&row.tag)?;
         println!("BLAZAR_ENGINE_PATH: engine local active ({})", p.display());
     }
+    // Self-heal the zero-active state (update interrupted before its
+    // activation step): an installed serving engine must never sit
+    // unusable behind one stale flag — activate the best candidate and
+    // say so. Runs for router and non-router paths alike.
+    if let Some(tag) = store.heal_active_engine()? {
+        println!("serve: no active engine row found; activated newest serving engine {tag}");
+    }
     // Router mode is a llama-server feature (`--models-preset`): serve
     // with the llamacpp lane even when another kind holds the active
     // slot, so a JIT mistral.rs install (or any `engine use`) never

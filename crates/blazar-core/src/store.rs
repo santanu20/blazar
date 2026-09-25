@@ -433,6 +433,39 @@ impl Store {
         Ok(())
     }
 
+    /// Boot-time self-heal for the zero-active state (the class F120's
+    /// transaction fixed mid-write; an update interrupted before its
+    /// activation step lands here): when no row holds the active flag
+    /// but serving-capable engines are installed, activate the best one
+    /// — llamacpp lanes first (router mode's native lane), newest
+    /// within the kind — so one stale flag can never brick `serve`
+    /// while good engines sit installed. Returns the activated tag, or
+    /// None when the store needs no healing. Lazy lanes (whisper,
+    /// sdcpp) never claim the slot: the active row is the serving
+    /// adapter and must stay a text lane.
+    pub fn heal_active_engine(&self) -> CoreResult<Option<String>> {
+        if self.active_engine()?.is_some() {
+            return Ok(None);
+        }
+        let rank = |k: crate::engine_kind::EngineKind| match k {
+            crate::engine_kind::EngineKind::LlamaCpp => 2,
+            crate::engine_kind::EngineKind::MistralRs | crate::engine_kind::EngineKind::Sglang => 1,
+            _ => 0,
+        };
+        let pick = self
+            .list_engines()?
+            .into_iter()
+            .filter(|r| rank(r.kind) > 0)
+            .max_by_key(|r| (rank(r.kind), r.installed_at));
+        match pick {
+            Some(row) => {
+                self.set_active_engine(&row.tag)?;
+                Ok(Some(row.tag))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Rewrite one engine row's manifest JSON (supersede marking,
     /// lazy architecture-coverage mining). Fails when `tag` is unknown
     /// so a stale caller can never invent a row.
@@ -920,6 +953,72 @@ mod tests {
             "failed activation must not clear the active engine"
         );
         assert_eq!(s.list_engines().unwrap().len(), 2);
+    }
+
+    fn engine_row_of(tag: &str, kind: EngineKind, installed_at: i64) -> EngineRow {
+        EngineRow {
+            tag: tag.into(),
+            asset: "ubuntu-vulkan-x64".into(),
+            sha256: format!("{tag}deadbeef"),
+            installed_at,
+            active: false,
+            manifest: "{}".into(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn unit__heal_active_engine__zero_active_prefers_llamacpp_then_newest() {
+        let (_t, s) = tmp_store();
+        // llamacpp older than mistral.rs, whisper newest of all: kind
+        // preference beats recency, and the lazy whisper lane never
+        // claims the serving slot.
+        s.upsert_engine(&engine_row_of("v0.9.3", EngineKind::MistralRs, 20))
+            .unwrap();
+        s.upsert_engine(&engine_row_of("b5130", EngineKind::Whisper, 30))
+            .unwrap();
+        s.upsert_engine(&engine_row_of("b100", EngineKind::LlamaCpp, 10))
+            .unwrap();
+        let healed = s.heal_active_engine().unwrap();
+        assert_eq!(healed.as_deref(), Some("b100"));
+        assert_eq!(s.active_engine().unwrap().unwrap().tag, "b100");
+        // Without a llamacpp lane the newest serving engine wins; the
+        // lazy whisper row still never does.
+        let (_t2, s2) = tmp_store();
+        s2.upsert_engine(&engine_row_of("v0.9.3", EngineKind::MistralRs, 20))
+            .unwrap();
+        s2.upsert_engine(&engine_row_of("sglang-0.5", EngineKind::Sglang, 40))
+            .unwrap();
+        s2.upsert_engine(&engine_row_of("b5130", EngineKind::Whisper, 60))
+            .unwrap();
+        assert_eq!(
+            s2.heal_active_engine().unwrap().as_deref(),
+            Some("sglang-0.5")
+        );
+    }
+
+    #[test]
+    fn unit__heal_active_engine__active_present_is_noop() {
+        let (_t, s) = tmp_store();
+        s.upsert_engine(&engine_row_of("b100", EngineKind::LlamaCpp, 10))
+            .unwrap();
+        s.set_active_engine("b100").unwrap();
+        assert_eq!(s.heal_active_engine().unwrap(), None);
+        assert_eq!(s.active_engine().unwrap().unwrap().tag, "b100");
+    }
+
+    #[test]
+    fn unit__heal_active_engine__lazy_only_store_stays_unhealed() {
+        // Only lazy lanes installed: the serving error path must stay
+        // honest (activating whisper as the serving adapter would
+        // regress the whisper-dethroning bug this store already fixed).
+        let (_t, s) = tmp_store();
+        s.upsert_engine(&engine_row_of("b5130", EngineKind::Whisper, 30))
+            .unwrap();
+        s.upsert_engine(&engine_row_of("master-890", EngineKind::SdCpp, 40))
+            .unwrap();
+        assert_eq!(s.heal_active_engine().unwrap(), None);
+        assert!(s.active_engine().unwrap().is_none());
     }
 
     #[test]
