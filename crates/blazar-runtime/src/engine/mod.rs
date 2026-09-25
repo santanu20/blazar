@@ -2589,6 +2589,32 @@ impl EngineManager {
         Ok(Some(m))
     }
 
+    /// Rows whose engine binary is gone while the row survives (dir
+    /// deleted underneath the db — manual removal, disk cleanup).
+    /// Returns `(tag, kind, anchored path)`; the doctor surface renders
+    /// these with the heal command so a ghost row is named instead of
+    /// failing spawn/verify silently.
+    #[must_use]
+    pub fn ghost_engine_rows(&self) -> Vec<(String, EngineKind, String)> {
+        let Ok(store) = Store::open(&self.dirs) else {
+            return Vec::new();
+        };
+        let Ok(rows) = store.list_engines() else {
+            return Vec::new();
+        };
+        rows.into_iter()
+            .filter_map(|row| {
+                let mut m: Manifest = serde_json::from_str(&row.manifest).ok()?;
+                m.anchor_server_path(&self.dirs.data_dir);
+                let anchored = PathBuf::from(&m.server_path);
+                if anchored.is_file() {
+                    None
+                } else {
+                    Some((row.tag, row.kind, m.server_path))
+                }
+            })
+            .collect()
+    }
 }
 
 fn now_secs() -> i64 {
@@ -2770,28 +2796,27 @@ fn exec_version_probe(bin: &Path, args: &[&str], budget: std::time::Duration) ->
 /// - mistral.rs: `mistralrs --version` (clap, native exec, 15 s)
 ///
 /// `manifest_json` is the engine row's manifest; its `server_path`
-/// names the lane binary. llamacpp falls back to a name walk for
-/// manifest-less rows; the venv lanes cannot (their layout is the
-/// install contract).
+/// names the lane binary (relative rows resolve against `data_dir`).
+/// llamacpp falls back to a name walk for manifest-less rows; the venv
+/// lanes cannot (their layout is the install contract).
 #[must_use]
 pub fn verify_engine_binary(
     kind: &EngineKind,
-    engines_dir: &Path,
+    data_dir: &Path,
     manifest_json: Option<&str>,
 ) -> bool {
     let mut manifest: Option<crate::engine::manifest::Manifest> = manifest_json
         .and_then(|raw| serde_json::from_str::<crate::engine::manifest::Manifest>(raw).ok());
-    // Rows written before re-rooting carry stale absolute paths;
-    // `re_root_server_path` adopts the live engines dir when the
-    // recorded one is gone.
+    // Relative rows resolve against the live data dir; legacy absolute
+    // rows heal via the anchor when their recorded root is gone.
     if let Some(m) = manifest.as_mut() {
-        m.re_root_server_path(engines_dir);
+        m.anchor_server_path(data_dir);
     }
     match kind {
         EngineKind::LlamaCpp => {
             let bin = manifest
                 .map(|m| PathBuf::from(m.server_path))
-                .or_else(|| find_server(engines_dir).ok());
+                .or_else(|| find_server(&data_dir.join("engines")).ok());
             bin.is_some_and(|b| {
                 exec_version_probe(&b, &["--version"], std::time::Duration::from_secs(5))
             })
@@ -2884,6 +2909,31 @@ mod verify_tests {
             &EngineKind::LlamaCpp,
             tmp.path(),
             Some(&manifest_for(&bad))
+        ));
+    }
+
+    #[test]
+    // Storage-invariant rows carry a data-dir-relative server_path — the
+    // probe must anchor them before spawning the binary.
+    #[cfg(unix)]
+    fn unit__verify_engine_binary__relative_row_anchors_to_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        fake_bin(&data, "engines/b1-cuda/llama-server", "exit 0");
+        let manifest = serde_json::json!({
+            "tag": "b1-cuda",
+            "build_number": 1,
+            "version_raw": "t",
+            "devices": [],
+            "flags": [],
+            "spec_types": [],
+            "server_path": "engines/b1-cuda/llama-server",
+        })
+        .to_string();
+        assert!(verify_engine_binary(
+            &EngineKind::LlamaCpp,
+            &data,
+            Some(&manifest)
         ));
     }
 

@@ -3242,48 +3242,72 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
     // Install-time (manifest) GPU names — what auto-pick derives from.
     let mut frozen_gpu_names: Vec<String> = Vec::new();
     match local_engine_manager(d) {
-        Ok(mgr) => match mgr.active_manifest() {
-            Ok(Some(m)) => {
-                active_tag = Some(m.tag.clone());
-                frozen_gpu_names = m.devices.iter().map(|dev| dev.name.clone()).collect();
-                checks.push(Check::ok(
-                    "engine",
-                    format!(
-                        "{} active ({} device{}, {} flags) at {}",
-                        m.tag,
-                        m.devices.len(),
-                        if m.devices.len() == 1 { "" } else { "s" },
-                        m.flags.len(),
-                        m.server_path
-                    ),
-                ));
-                let hw = blazar_runtime::probe_hardware(Some(&m));
-                let note = format!(
-                    "RAM {} GiB, VRAM {} MiB across {} GPU{}",
-                    hw.total_ram_mib / 1024,
-                    hw.total_vram_mib(),
-                    hw.gpus.len(),
-                    if hw.gpus.len() == 1 { "" } else { "s" },
-                );
-                if hw.total_vram_mib() == 0 {
-                    checks.push(Check::warn(
-                        "hardware",
-                        format!("{note} — CPU-only inference; expect token/s in the single digits"),
+        Ok(mgr) => {
+            match mgr.active_manifest() {
+                Ok(Some(m)) => {
+                    active_tag = Some(m.tag.clone());
+                    frozen_gpu_names = m.devices.iter().map(|dev| dev.name.clone()).collect();
+                    checks.push(Check::ok(
+                        "engine",
+                        format!(
+                            "{} active ({} device{}, {} flags) at {}",
+                            m.tag,
+                            m.devices.len(),
+                            if m.devices.len() == 1 { "" } else { "s" },
+                            m.flags.len(),
+                            m.server_path
+                        ),
                     ));
-                } else {
-                    checks.push(Check::ok("hardware", note));
+                    let hw = blazar_runtime::probe_hardware(Some(&m));
+                    let note = format!(
+                        "RAM {} GiB, VRAM {} MiB across {} GPU{}",
+                        hw.total_ram_mib / 1024,
+                        hw.total_vram_mib(),
+                        hw.gpus.len(),
+                        if hw.gpus.len() == 1 { "" } else { "s" },
+                    );
+                    if hw.total_vram_mib() == 0 {
+                        checks.push(Check::warn(
+                            "hardware",
+                            format!(
+                                "{note} — CPU-only inference; expect token/s in the single digits"
+                            ),
+                        ));
+                    } else {
+                        checks.push(Check::ok("hardware", note));
+                    }
+                    checks.push(engine_smoke_check(&m.server_path));
                 }
-                checks.push(engine_smoke_check(&m.server_path));
+                Ok(None) => checks.push(Check::fail(
+                    "engine",
+                    "none installed — run: blazar engine update",
+                )),
+                Err(e) => checks.push(Check::fail(
+                    "engine",
+                    format!("{e} — run: blazar engine update"),
+                )),
             }
-            Ok(None) => checks.push(Check::fail(
+            // Ghost rows: the db row outlived its engine dir (manual
+            // deletion, disk cleanup). Spawn/verify cannot see these —
+            // name them with the heal command instead of failing silently
+            // doctor run after doctor run.
+            for (tag, kind, path) in mgr.ghost_engine_rows() {
+                let heal = if tag == blazar_runtime::engine::LOCAL_TAG {
+                    "point BLAZAR_ENGINE_PATH at a build, or `blazar engine use <tag>` on a serving engine".to_string()
+                } else {
+                    format!("blazar engine update --kind {kind}")
+                };
+                let whisper_note = if matches!(kind, EngineKind::Whisper) {
+                    " (audio transcription still serves from the legacy whisper tree)"
+                } else {
+                    ""
+                };
+                checks.push(Check::warn(
                 "engine",
-                "none installed — run: blazar engine update",
-            )),
-            Err(e) => checks.push(Check::fail(
-                "engine",
-                format!("{e} — run: blazar engine update"),
-            )),
-        },
+                format!("row {tag} ({kind}) has no engine binary at {path} — heal: {heal}{whisper_note}"),
+            ));
+            }
+        }
         Err(e) => checks.push(Check::fail("engine", format!("{e}"))),
     }
     // The engines row carries the kind (the manifest does not — single
@@ -10719,10 +10743,24 @@ fn spawn_engine_check_task(
                 "update_available": newer,
                 "devices": devices,
             });
-            let _ = std::fs::write(dirs.run_dir().join("engine-check.json"), marker.to_string());
+            write_engine_check_marker(&dirs, &marker);
             delay = full_delay;
         }
     });
+}
+
+/// Persist the engine-check marker atomically (tmp + rename): a plain
+/// write racing a reader — or a second daemon generation during a
+/// restart — once left two concatenated JSON objects in the file.
+/// Readers see either the old or the new marker, never a mix.
+fn write_engine_check_marker(dirs: &BlazarDirs, marker: &serde_json::Value) {
+    let path = dirs.run_dir().join("engine-check.json");
+    let tmp = dirs.run_dir().join("engine-check.json.tmp");
+    if let Err(e) =
+        std::fs::write(&tmp, marker.to_string()).and_then(|()| std::fs::rename(&tmp, &path))
+    {
+        tracing::debug!(target: "blazar::engine", "engine-check marker write failed: {e}");
+    }
 }
 
 /// Rotate daemon.log when it exceeds ~10 MiB (best-effort, at start).
@@ -11697,6 +11735,24 @@ async fn upgrade(version: Option<String>, dry_run: bool) -> Result<()> {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__write_engine_check_marker__replaces_whole_file_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(dirs.run_dir()).unwrap();
+        write_engine_check_marker(&dirs, &serde_json::json!({"latest": "b1", "n": 1}));
+        write_engine_check_marker(&dirs, &serde_json::json!({"latest": "b2", "n": 2}));
+        let raw = std::fs::read_to_string(dirs.run_dir().join("engine-check.json")).unwrap();
+        // Exactly one JSON object — the double-write bug this pins left
+        // two concatenated objects in the file.
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["latest"], "b2");
+        assert!(!dirs.run_dir().join("engine-check.json.tmp").exists());
+    }
 
     #[test]
     fn unit__chrono_now_compact__same_millisecond_calls_stay_distinct() {
