@@ -1061,6 +1061,53 @@ async fn integration__re_root_heal_persists_stale_engine_row() {
     assert_eq!(again.server_path, healed.server_path);
 }
 
+/// Ghost rows surface by tag: a db row whose engine dir was deleted
+/// underneath it (manual removal) must be listed with its anchored
+/// path, while healthy rows stay off the list.
+#[allow(non_snake_case)]
+#[tokio::test]
+async fn integration__ghost_engine_rows__names_rows_with_missing_binaries() {
+    let (_tmp, dirs) = tmp_dirs();
+    let mgr = manager(&dirs, "http://127.0.0.1:1");
+
+    // Healthy lane: binary exists under the live data dir.
+    let live_dir = dirs.engines_dir().join("b1-cuda");
+    std::fs::create_dir_all(&live_dir).unwrap();
+    std::fs::write(live_dir.join("llama-server"), "#!/bin/sh\n").unwrap();
+    // Ghost lane: relative row pointing at a dir that is NOT there.
+    let store = Store::open(&dirs).unwrap();
+    for (tag, server_path) in [
+        ("b1-cuda", "engines/b1-cuda/llama-server"),
+        ("b-gone", "engines/b-gone/llama-server"),
+    ] {
+        let manifest = serde_json::json!({
+            "tag": tag,
+            "build_number": 1,
+            "version_raw": "",
+            "devices": [],
+            "flags": [],
+            "spec_types": [],
+            "server_path": server_path,
+        });
+        store
+            .upsert_engine(&blazar_core::EngineRow {
+                tag: tag.into(),
+                asset: "a".into(),
+                sha256: "x".into(),
+                installed_at: 1,
+                active: false,
+                manifest: manifest.to_string(),
+                kind: blazar_core::engine_kind::EngineKind::LlamaCpp,
+            })
+            .unwrap();
+    }
+
+    let ghosts = mgr.ghost_engine_rows();
+    assert_eq!(ghosts.len(), 1, "only the missing-binary row: {ghosts:?}");
+    assert_eq!(ghosts[0].0, "b-gone");
+    assert!(ghosts[0].2.ends_with("engines/b-gone/llama-server"));
+}
+
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn integration__supersede_skips_partially_covered_fork_lanes() {
@@ -1582,7 +1629,8 @@ async fn integration__zip_asset_extracted_and_probed() {
         .update(Some("b100"), UpdateChannel::Latest)
         .await
         .unwrap();
-    let m: Manifest = serde_json::from_str(&row.manifest).unwrap();
+    let mut m: Manifest = serde_json::from_str(&row.manifest).unwrap();
+    m.anchor_server_path(&dirs.data_dir);
     assert!(m.server_path.ends_with("llama-server.exe"));
     assert!(Path::new(&m.server_path).exists());
 }
