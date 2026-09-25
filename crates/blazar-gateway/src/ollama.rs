@@ -700,7 +700,7 @@ fn event_kind(e: &blazar_runtime::BlazarEvent) -> &'static str {
     use blazar_runtime::BlazarEvent::{
         BenchmarkDone, EngineRemoved, EngineRolledBack, EngineUpdated, InstanceStateChanged,
         ModelPreloaded, ModelPulled, ModelRemoved, PullFailed, PullProgress, QueueDepth,
-        SlotsAutoAdopted, SlotsCtxAutoFit,
+        SlotsAutoAdopted, SlotsCtxAutoFit, SlotsReshaped,
     };
     match e {
         EngineUpdated { .. } => "engine_updated",
@@ -709,6 +709,7 @@ fn event_kind(e: &blazar_runtime::BlazarEvent) -> &'static str {
         ModelPreloaded { .. } => "model_preloaded",
         SlotsAutoAdopted { .. } => "slots_auto_adopted",
         SlotsCtxAutoFit { .. } => "slots_ctx_auto_fit",
+        SlotsReshaped { .. } => "slots_reshaped",
         ModelPulled { .. } => "model_pulled",
         ModelRemoved { .. } => "model_removed",
         PullProgress { .. } => "pull_progress",

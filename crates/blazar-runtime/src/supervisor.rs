@@ -902,6 +902,12 @@ pub struct Supervisor {
     /// Consecutive reaper ticks with concurrent in-flight load on a
     /// single-slot model (LC4 adaptive slots).
     busy_streak: DashMap<String, u32>,
+    /// Models whose adopted reshape is being drained right now (mark set
+    /// the moment the drain decides to hold admissions). The admission
+    /// gate parks new requests while a model key is present, so in-flight
+    /// can only fall — a sustained-load stream set reaches zero in one
+    /// max-stream duration instead of never.
+    reshape_draining: DashMap<String, std::time::Instant>,
     /// Consecutive fully-quiet ticks per instance key (no admission
     /// pressure, zero in-flight) feeding the adoption decay rule.
     idle_streak: DashMap<String, u32>,
@@ -1063,6 +1069,7 @@ impl Supervisor {
             last_requested: std::sync::Mutex::new(None),
             preload_failures: DashMap::new(),
             busy_streak: DashMap::new(),
+            reshape_draining: DashMap::new(),
             idle_streak: DashMap::new(),
             adopted_slots: DashMap::new(),
             reshape_queue: DashMap::new(),
@@ -1360,14 +1367,15 @@ impl Supervisor {
         .unwrap_or(false)
     }
 
-    /// Live (non-evicted) TCP children as [`EngineRef`]s (endpoint +
-    /// child auth) — the cache-hint poller's and metrics merger's fetch
-    /// list. UDS children are skipped (no HTTP lane).
+    /// Children resident in the instance map as [`EngineRef`]s
+    /// (endpoint + child auth) — the cache-hint poller's and metrics
+    /// merger's fetch list. Both transports serve the same REST
+    /// surface; TCP-only engines (mistralrs/sdcpp/sglang) never carry
+    /// unix endpoints, so no engine-kind filter is needed here.
     #[must_use]
     pub fn live_http_endpoints(&self) -> Vec<EngineRef> {
         self.instances
             .iter()
-            .filter(|i| matches!(i.endpoint, Endpoint::Tcp { .. }))
             .map(|i| self.engine_ref(i.key(), i.value()))
             .collect()
     }
@@ -4568,6 +4576,13 @@ drop them from rpc_servers in config.toml",
             // on every tick in the window (an event-drain resets the
             // streak after one tick — live-caught 2026-09-12)
             let pressure = self.slot_pressure.get(&model).map_or(0, |v| *v);
+            tracing::debug!(
+                model = %model,
+                pressure,
+                in_flight,
+                effective,
+                "adaptive tick probe"
+            );
             let saturated = pressure > 0 || (effective > 0 && in_flight > i64::from(effective));
             if saturated {
                 // Saturation cancels any pending decay count.
@@ -4581,7 +4596,14 @@ drop them from rpc_servers in config.toml",
                 };
                 if hit_threshold {
                     let from = effective;
-                    let to = (from + 1).min(SLOTS_ADOPT_CAP);
+                    // Demand-sized step: parked-waiter count is the
+                    // demand signal (C=8 on 1 slot parks 7), so one
+                    // adoption can reach the demanded shape instead of
+                    // climbing +1 per 60s streak. Fit-safe: the spawn
+                    // re-spends the same total-ctx budget across slots
+                    // and the profile walk caps what the card hosts.
+                    let step = pressure.max(1);
+                    let to = (from + step).min(SLOTS_ADOPT_CAP);
                     self.busy_streak.remove(&key);
                     if to > from {
                         self.adopted_slots.insert(model.clone(), to);
@@ -4594,7 +4616,14 @@ drop them from rpc_servers in config.toml",
                             .publish(BlazarEvent::SlotsAutoAdopted { model, from, to });
                     }
                 }
-            } else if in_flight == 0 && self.adopted_slots.contains_key(&model) {
+            } else if in_flight == 0
+                && self.adopted_slots.contains_key(&model)
+                // Never decay while a reshape is pending/draining: parked
+                // waiters keep in_flight at 0 and would let the decay
+                // reshape back to the natural shape mid-drain (thrash).
+                && !self.reshape_queue.contains_key(&model)
+                && !self.reshape_draining.contains_key(&model)
+            {
                 // Decay: the adopted shape buys queue-latency under load
                 // and costs per-stream ITL (np8 ITL 60ms vs np4 37ms,
                 // flagprobe 2026-09-12) — after a long
@@ -4632,10 +4661,24 @@ drop them from rpc_servers in config.toml",
         self.drain_reshape_queue().await;
     }
 
-    /// Respawn adopted models whose streams have drained. An entry
-    /// whose instance is still busy stays queued for the next tick
-    /// (sustained 24/7 load defers the reshape to the natural
-    /// idle-evict respawn — honest, never disruptive).
+    /// True while the model's queued reshape is draining: new admissions
+    /// park so the live-stream count can only fall. The admission gate
+    /// consults this on every pass through its re-check loop.
+    pub fn is_reshaping(&self, model: &str) -> bool {
+        self.reshape_draining.contains_key(model)
+    }
+
+    /// Respawn adopted models once their streams drain. A busy instance
+    /// gets its drain mark set: the admission gate then parks NEW
+    /// requests for the model, so in-flight falls as streams complete
+    /// and the reshape lands in one max-stream duration — the pre-drain
+    /// behavior (skip while busy) deferred the reshape forever under
+    /// sustained 24/7 load, leaving the system saturated exactly when
+    /// capacity mattered most (live receipt: 20260924-all-engines
+    /// campaign, flat 39 t/s at C=8 with TTFT p99 23s for ~2min).
+    /// Residual race (a request admitted in the instant between the
+    /// mark and the gate noticing) self-heals via the existing
+    /// child-send retry path, which respawns and retries once.
     async fn drain_reshape_queue(&self) {
         let entries: Vec<(String, String)> = self
             .reshape_queue
@@ -4648,20 +4691,49 @@ drop them from rpc_servers in config.toml",
                 .get(&key)
                 .is_some_and(|i| i.in_flight.load(Ordering::SeqCst) > 0);
             if busy {
+                if self
+                    .reshape_draining
+                    .insert(model.clone(), std::time::Instant::now())
+                    .is_none()
+                {
+                    tracing::info!(
+                        model = %model,
+                        "adaptive slots: holding admissions to drain live streams for the reshape"
+                    );
+                }
                 continue;
             }
-            self.reshape_queue.remove(&model);
+            // The draining mark and the queue entry stay held THROUGH the
+            // respawn: the admission gate must keep parking requests while
+            // the lane is child-less (evict -> spawn -> healthy takes a
+            // model-load of wall time), not just while streams drain.
+            let slots = self
+                .adopted_slots
+                .get(&model)
+                .map_or(self.config.slots, |v| *v.value());
             tracing::warn!(
                 model = %model,
-                "adaptive slots: respawning with the adopted slot count \
+                slots,
+                "adaptive slots: respawning with the new slot count \
                  (the KV bank carries conversations across the reshape)"
             );
             if let Err(e) = self.evict(&key).await {
+                // keep the queue entry + mark: retry the reshape next tick
                 tracing::warn!(model = %model, "adaptive reshape evict: {e:#}");
                 continue;
             }
-            if let Err(e) = self.ensure(&model).await {
-                tracing::warn!(model = %model, "adaptive reshape respawn: {e:#}");
+            match self.ensure(&model).await {
+                Ok(_) => {
+                    self.reshape_draining.remove(&model);
+                    self.reshape_queue.remove(&model);
+                    self.bus
+                        .publish(BlazarEvent::SlotsReshaped { model, slots });
+                }
+                Err(e) => {
+                    // Respawn failed: hold admissions one more tick and
+                    // retry — never publish completion for a dead lane.
+                    tracing::warn!(model = %model, "adaptive reshape respawn: {e:#}");
+                }
             }
         }
     }
@@ -5317,8 +5389,11 @@ mod routing_tests {
         ) -> Vec<String> {
             vec![]
         }
-        async fn spawn(&self, _argv: &[String], _endpoint: &Endpoint) -> Result<ChildHandle> {
-            Err(anyhow!("FakeEngine never spawns"))
+        async fn spawn(&self, _argv: &[String], endpoint: &Endpoint) -> Result<ChildHandle> {
+            // Real sleeper child: the drain/reshape tests run the full
+            // evict -> respawn path, and every other routing test never
+            // reaches spawn.
+            Ok(ChildHandle::new(endpoint.clone(), dummy_process()))
         }
         async fn health_check(&self, _endpoint: &Endpoint, _timeout: Duration) -> Result<()> {
             Ok(())
@@ -5326,12 +5401,53 @@ mod routing_tests {
     }
 
     fn routing_sup(replicas: u32) -> Supervisor {
+        // Full llamacpp-style flag surface: the drain/reshape respawn
+        // runs the real profile builder, which validates every emitted
+        // argv flag against the manifest. Other routing tests never
+        // reach spawn, so the richer surface is inert for them.
+        let flags: std::collections::BTreeSet<String> = [
+            "-m",
+            "--host",
+            "--port",
+            "--alias",
+            "--jinja",
+            "--metrics",
+            "--flash-attn",
+            "--ctx-size",
+            "--threads",
+            "--gpu-layers",
+            "--cache-reuse",
+            "--cache-type-k",
+            "--cache-type-v",
+            "--cpu-moe",
+            "--sleep-idle-seconds",
+            "-np",
+            "--rpc",
+            "--lora",
+            "--lora-scaled",
+            "--spec-type",
+            "--spec-draft-model",
+            "--spec-draft-n-max",
+            "--cache-ram",
+            "-mm",
+            "--mmproj",
+            "-p",
+            "-n",
+            "-r",
+            "-c",
+            "-t",
+            "-ctk",
+            "-ctv",
+        ]
+        .iter()
+        .map(|f| (*f).into())
+        .collect();
         let manifest = Manifest {
             tag: "fake".into(),
             build_number: 1,
             version_raw: "b1".into(),
             devices: vec![],
-            flags: std::collections::BTreeSet::new(),
+            flags,
             spec_types: vec![],
             server_path: String::new(),
             ..Default::default()
@@ -7137,7 +7253,10 @@ mod routing_tests {
         for _ in 0..SLOTS_STREAK_TICKS {
             sup.adaptive_slots_tick();
         }
-        assert_eq!(sup.adopted_slots.get("m").map(|v| *v), Some(5));
+        // Demand-sized adoption (2026-09-24): the parked-waiter gauge is
+        // the step, so two parked requests move the shape 4 -> 6 directly
+        // instead of the old fixed +1 (which needed one streak per slot).
+        assert_eq!(sup.adopted_slots.get("m").map(|v| *v), Some(6));
         assert_eq!(
             sup.reshape_queue.get("m").map(|v| v.value().clone()),
             Some("m".to_string())
@@ -7146,6 +7265,205 @@ mod routing_tests {
         sup.note_slot_pressure_release("m");
         sup.note_slot_pressure_release("m");
         assert!(sup.slot_pressure.get("m").is_none());
+        kill_all(&[ph]);
+    }
+
+    /// Minimal valid GGUF v3 the reshape-respawn path can parse: a
+    /// qwen3 text model with the fields the profile builder reads
+    /// (same KV set the gateway e2e harness proves against the full
+    /// spawn pipeline). Zero tensors, header KVs only.
+    fn write_minimal_qwen3_gguf(path: &std::path::Path) {
+        let pstr = |s: &str| -> Vec<u8> {
+            let mut v = (s.len() as u64).to_le_bytes().to_vec();
+            v.extend_from_slice(s.as_bytes());
+            v
+        };
+        let mut b: Vec<u8> = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        let kvs: Vec<(&str, u32, Vec<u8>)> = vec![
+            ("general.architecture", 8, pstr("qwen3")),
+            ("qwen3.block_count", 4, 28u32.to_le_bytes().to_vec()),
+            ("qwen3.context_length", 4, 40_960u32.to_le_bytes().to_vec()),
+            ("qwen3.head_count", 4, 16u32.to_le_bytes().to_vec()),
+            ("qwen3.head_count_kv", 4, 8u32.to_le_bytes().to_vec()),
+            ("qwen3.embedding_length", 4, 1024u32.to_le_bytes().to_vec()),
+        ];
+        b.extend_from_slice(&(kvs.len() as u64).to_le_bytes());
+        for (k, t, v) in kvs {
+            b.extend_from_slice(&(k.len() as u64).to_le_bytes());
+            b.extend_from_slice(k.as_bytes());
+            b.extend_from_slice(&t.to_le_bytes());
+            b.extend_from_slice(&v);
+        }
+        std::fs::write(path, b).expect("write gguf fixture");
+    }
+
+    /// 2026-09-24 graceful drain: the reshape must not kill live streams,
+    /// but it must also not wait for a GLOBAL idle that sustained load
+    /// never produces (live receipt: 20260924-all-engines, flat 39 t/s
+    /// at C=8 for the whole campaign because the drain skipped every
+    /// tick). Busy tick sets the draining mark (the admission gate then
+    /// parks new requests); once in-flight reaches 0 the drain reshapes,
+    /// clears the mark, and publishes `SlotsReshaped`.
+    #[tokio::test]
+    async fn unit__adaptive_slots__drain_holds_while_busy_then_reshapes_at_idle() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        // The reshape respawns through the real spawn path, which
+        // resolves the model row from the store and reads its GGUF
+        // metadata (FakeEngine supplies the child itself): seed a
+        // minimal valid qwen3 GGUF so read_model_meta parses.
+        let model_path = sup.dirs.data_dir.join("models").join("m-q4_0.gguf");
+        std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+        write_minimal_qwen3_gguf(&model_path);
+        blazar_core::Store::open(&sup.dirs)
+            .unwrap()
+            .upsert_model(&blazar_core::ModelRow {
+                name: "m".into(),
+                repo: "m".into(),
+                quant: "Q4_0".into(),
+                path: model_path.to_string_lossy().into_owned(),
+                bytes: 1,
+                sha256: None,
+                mmproj_path: None,
+                components: vec![],
+                shards: 1,
+                arch: None,
+                params: None,
+                ctx_train: None,
+                pulled_at: 0,
+            })
+            .unwrap();
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 2);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "1".into()];
+        sup.instances.insert("m".into(), inst);
+        sup.adopted_slots.insert("m".to_string(), 4);
+        sup.reshape_queue.insert("m".to_string(), "m".to_string());
+        let mut rx = sup.bus.subscribe();
+        // busy: hold admissions, keep the queue entry, keep the adoption
+        sup.drain_reshape_queue().await;
+        assert!(sup.is_reshaping("m"));
+        assert!(sup.reshape_queue.get("m").is_some());
+        assert_eq!(sup.adopted_slots.get("m").map(|v| *v), Some(4));
+        // streams finish: the very next drain tick must reshape
+        sup.instances
+            .get("m")
+            .expect("instance")
+            .in_flight
+            .store(0, Ordering::SeqCst);
+        sup.drain_reshape_queue().await;
+        assert!(!sup.is_reshaping("m"));
+        assert!(sup.reshape_queue.get("m").is_none());
+        assert_eq!(
+            sup.adopted_slots.get("m").map(|v| *v),
+            Some(4),
+            "the drain reshapes; decay still owns un-adopting"
+        );
+        // evict publishes InstanceStateChanged first; SlotsReshaped follows
+        let mut reshaped = None;
+        for _ in 0..4 {
+            match rx.try_recv() {
+                Ok(BlazarEvent::SlotsReshaped { model, slots }) => {
+                    reshaped = Some((model, slots));
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        match reshaped {
+            Some((model, slots)) => {
+                assert_eq!(model, "m");
+                assert_eq!(slots, 4);
+            }
+            None => panic!("expected SlotsReshaped after the idle drain"),
+        }
+        // The reshape ran the real respawn path: the live instance now
+        // owns a fresh sleeper child. Reap it so the test leaves no
+        // orphan behind (kill_all covers only fabricated originals).
+        sup.instances
+            .get("m")
+            .expect("respawned instance")
+            .child
+            .lock()
+            .await
+            .kill()
+            .await
+            .expect("kill respawned child");
+        kill_all(&[ph]);
+    }
+
+    /// 2026-09-24 anti-thrash: parked waiters hold in-flight at 0 for the
+    /// whole drain window, which the pre-guard decay would have read as
+    /// sustained quiet and reshaped BACK to the natural shape while the
+    /// demand was still queued. With the guard, the quiet streak cannot
+    /// fire while the reshape is pending or draining.
+    #[tokio::test]
+    async fn unit__adaptive_slots__decay_blocked_while_reshape_pending_or_draining() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        let (inst, ph) = fake_instance("m", InstanceState::Ready, 0);
+        sup.instances.insert("m".into(), inst);
+        sup.adopted_slots.insert("m".to_string(), 6);
+        // pending entry (never drained)
+        sup.reshape_queue.insert("m".to_string(), "m".to_string());
+        for _ in 0..(SLOTS_DECAY_TICKS + 5) {
+            sup.adaptive_slots_tick();
+        }
+        assert_eq!(
+            sup.adopted_slots.get("m").map(|v| *v),
+            Some(6),
+            "quiet streak must not decay while a reshape is pending"
+        );
+        // draining mark alone (queue already consumed) blocks too
+        sup.reshape_queue.remove("m");
+        sup.reshape_draining
+            .insert("m".to_string(), std::time::Instant::now());
+        for _ in 0..(SLOTS_DECAY_TICKS + 5) {
+            sup.adaptive_slots_tick();
+        }
+        assert_eq!(
+            sup.adopted_slots.get("m").map(|v| *v),
+            Some(6),
+            "quiet streak must not decay mid-drain"
+        );
+        // clear both: a full fresh quiet streak may decay again (the
+        // guarded ticks above never entered the decay branch, so the
+        // streak counter starts from zero here)
+        sup.reshape_draining.remove("m");
+        for _ in 0..(SLOTS_DECAY_TICKS + 2) {
+            sup.adaptive_slots_tick();
+        }
+        assert!(sup.adopted_slots.get("m").is_none());
+        kill_all(&[ph]);
+    }
+
+    /// 2026-09-24 demand sizing: the parked-waiter gauge sizes the
+    /// adoption step so one streak reaches the demanded shape (C=8 on a
+    /// 1-slot child parks 7) — and the adoption cap bounds it.
+    #[tokio::test]
+    async fn unit__adaptive_slots__demand_sized_adoption_capped_at_ceiling() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        sup.config.slots = 0;
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 1);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "1".into()];
+        sup.instances.insert("m".into(), inst);
+        for _ in 0..10 {
+            sup.note_slot_pressure("m");
+        }
+        for _ in 0..SLOTS_STREAK_TICKS {
+            sup.adaptive_slots_tick();
+        }
+        assert_eq!(
+            sup.adopted_slots.get("m").map(|v| *v),
+            Some(SLOTS_ADOPT_CAP),
+            "10 parked waiters on a 1-slot child must adopt straight to the cap"
+        );
         kill_all(&[ph]);
     }
 

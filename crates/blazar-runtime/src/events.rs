@@ -45,6 +45,14 @@ pub enum BlazarEvent {
         slots: u32,
         total_ctx: u32,
     },
+    /// LC4 adaptive capacity: a queued reshape (adoption or decay) landed —
+    /// the child respawned with the new slot count and parked admission
+    /// waiters were woken. Emitted when the drain completes, not when the
+    /// adoption fires (adoption only queues; the drain performs it).
+    SlotsReshaped {
+        model: String,
+        slots: u32,
+    },
     ModelPulled {
         name: String,
         /// Post-download GGUF health check: set when the header did not
