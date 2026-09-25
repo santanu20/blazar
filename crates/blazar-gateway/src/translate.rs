@@ -191,7 +191,7 @@ fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
 /// fixture images 400'd as "Failed to load image or audio file" while
 /// ollama accepted the same payload). Strip it once here so both the
 /// magic sniff and the forwarded URL see clean base64.
-fn image_data_url(b64: &str) -> Result<String, String> {
+pub(crate) fn image_data_url(b64: &str) -> Result<String, String> {
     let clean: std::borrow::Cow<'_, str> = if b64.contains(char::is_whitespace) {
         std::borrow::Cow::Owned(b64.chars().filter(|c| !c.is_whitespace()).collect())
     } else {

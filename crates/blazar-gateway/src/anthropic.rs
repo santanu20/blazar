@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use crate::proxy::{admission_gate_slo, child_base, ensure_with_admission};
 use crate::queue::Priority;
+use crate::translate::image_data_url;
 
 /// POST /v1/messages — full Anthropic Messages API translate.
 #[allow(clippy::too_many_lines)]
@@ -437,6 +438,7 @@ fn translate_message(role: &str, content: &Value, out: &mut Vec<Value>) -> Resul
         .as_array()
         .ok_or_else(|| "message.content must be a string or block array".to_string())?;
     let mut text_parts: Vec<String> = Vec::new();
+    let mut image_parts: Vec<Value> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut tool_results: Vec<Value> = Vec::new();
     let mut thinking: Vec<String> = Vec::new();
@@ -448,19 +450,16 @@ fn translate_message(role: &str, content: &Value, out: &mut Vec<Value>) -> Resul
                 }
             }
             "image" => {
-                let src = b.get("source").unwrap_or(&Value::Null);
-                if src.get("type").and_then(Value::as_str) == Some("base64") {
-                    let mt = src
-                        .get("media_type")
-                        .and_then(Value::as_str)
-                        .unwrap_or("image/png");
-                    let data = src.get("data").and_then(Value::as_str).unwrap_or_default();
-                    text_parts.push(format!("[image: {mt}, {} bytes]", data.len()));
-                    // vision rides the engine's multimodal lane; the URL
-                    // form is preserved for engines that honor it via a
-                    // follow-up content part (kept minimal: text marker
-                    // only — mmproj models receive the marker today).
-                }
+                // Real multimodal ingress: base64 sources become data
+                // URLs (mime sniffed from the bytes, whitespace-wrapped
+                // base64 tolerated — same lane the ollama images field
+                // uses); url sources pass through verbatim. Anything
+                // else is a malformed source — reject the request
+                // instead of silently degrading to a text marker.
+                let src = b
+                    .get("source")
+                    .ok_or_else(|| "image block requires a source".to_string())?;
+                image_parts.push(image_part(src)?);
             }
             "tool_use" => {
                 let id = b.get("id").and_then(Value::as_str).unwrap_or_default();
@@ -476,7 +475,15 @@ fn translate_message(role: &str, content: &Value, out: &mut Vec<Value>) -> Resul
                     .get("tool_use_id")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let inner = b.get("content").map(content_to_text).unwrap_or_default();
+                // Tool results may carry image blocks: the child renders
+                // them as image parts on the tool message (verified on
+                // b11147: server-chat builds exactly that shape from its
+                // own anthropic ingress). Text-only results keep the
+                // joined-string form — byte-identical to prior traffic.
+                let inner = match b.get("content") {
+                    Some(c) => tool_result_content(c)?,
+                    None => Value::String(String::new()),
+                };
                 tool_results.push(json!({"role": "tool", "tool_call_id": id, "content": inner}));
             }
             // F47: preserve prior-turn reasoning — `thinking` text rides
@@ -494,9 +501,25 @@ fn translate_message(role: &str, content: &Value, out: &mut Vec<Value>) -> Resul
         }
     }
     let mut pushed_text = false;
-    if !text_parts.is_empty() || (tool_calls.is_empty() && tool_results.is_empty()) {
-        let text = text_parts.join("");
-        out.push(json!({"role": role, "content": text}));
+    if !text_parts.is_empty()
+        || !image_parts.is_empty()
+        || (tool_calls.is_empty() && tool_results.is_empty())
+    {
+        // Images present: content must be a parts array (text part
+        // first when present). Text-only keeps the plain string —
+        // byte-identical to pre-multimodal traffic.
+        let content = if image_parts.is_empty() {
+            json!(text_parts.join(""))
+        } else {
+            let mut parts =
+                Vec::with_capacity(usize::from(!text_parts.is_empty()) + image_parts.len());
+            if !text_parts.is_empty() {
+                parts.push(json!({"type": "text", "text": text_parts.join("")}));
+            }
+            parts.extend(image_parts.iter().cloned());
+            json!(parts)
+        };
+        out.push(json!({"role": role, "content": content}));
         pushed_text = true;
     }
     if !tool_calls.is_empty() {
@@ -527,6 +550,8 @@ fn translate_message(role: &str, content: &Value, out: &mut Vec<Value>) -> Resul
     Ok(())
 }
 
+/// Flatten content to plain text (token-estimate lane): block text is
+/// concatenated, non-text blocks contribute nothing.
 fn content_to_text(content: &Value) -> String {
     match content {
         Value::String(s) => s.clone(),
@@ -535,6 +560,81 @@ fn content_to_text(content: &Value) -> String {
             .map(|b| b.get("text").and_then(Value::as_str).unwrap_or_default())
             .collect::<String>(),
         _ => String::new(),
+    }
+}
+
+/// One Anthropic image `source` → one `OpenAI` `image_url` content part.
+/// Base64 rides the shared data-URL lane (mime sniffed from the bytes);
+/// `url` sources pass through verbatim. Malformed sources are errors,
+/// not silent text markers.
+fn image_part(src: &Value) -> Result<Value, String> {
+    match src.get("type").and_then(Value::as_str) {
+        Some("base64") => {
+            let data = src
+                .get("data")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "base64 image source requires data".to_string())?;
+            Ok(json!({
+                "type": "image_url",
+                "image_url": {"url": image_data_url(data)?}
+            }))
+        }
+        Some("url") => {
+            let url = src
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "url image source requires url".to_string())?;
+            Ok(json!({"type": "image_url", "image_url": {"url": url}}))
+        }
+        other => Err(format!(
+            "unsupported image source type: {}",
+            other.unwrap_or("missing")
+        )),
+    }
+}
+
+/// Tool-result content: text-only keeps the plain joined string (the
+/// child and every log diff stay byte-identical); anything with an
+/// image becomes an `OpenAI` parts array on the `tool` message.
+fn tool_result_content(content: &Value) -> Result<Value, String> {
+    match content {
+        Value::String(s) => Ok(Value::String(s.clone())),
+        Value::Array(blocks) => {
+            let mut text = String::new();
+            let mut parts: Vec<Value> = Vec::new();
+            for b in blocks {
+                match b.get("type").and_then(Value::as_str).unwrap_or("text") {
+                    "text" => {
+                        text.push_str(b.get("text").and_then(Value::as_str).unwrap_or_default());
+                    }
+                    "image" => {
+                        let src = b
+                            .get("source")
+                            .ok_or_else(|| "image block requires a source".to_string())?;
+                        // Flush accumulated text as a part so parts keep
+                        // their arrival order (text, then image).
+                        if !text.is_empty() {
+                            parts.push(json!({"type": "text", "text": text.clone()}));
+                            text.clear();
+                        }
+                        parts.push(image_part(src)?);
+                    }
+                    // Non-text, non-image blocks in tool results have no
+                    // OpenAI part form — omit them (same treatment the
+                    // top-level message lane gives `document` blocks).
+                    _ => {}
+                }
+            }
+            if parts.is_empty() {
+                Ok(Value::String(text))
+            } else {
+                if !text.is_empty() {
+                    parts.push(json!({"type": "text", "text": text}));
+                }
+                Ok(Value::Array(parts))
+            }
+        }
+        _ => Ok(Value::String(String::new())),
     }
 }
 
@@ -909,6 +1009,117 @@ fn unique_suffix() -> String {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__translate_message__image_base64_becomes_image_url_part() {
+        // Pin (2026-09-25 multimodal ingress): image blocks previously
+        // collapsed to a "[image: …]" text marker — images never reached
+        // the engine. They must now ride real image_url parts.
+        let content = json!([
+            {"type": "text", "text": "what is this"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo"}}
+        ]);
+        let mut out = Vec::new();
+        translate_message("user", &content, &mut out).unwrap();
+        assert_eq!(out.len(), 1);
+        let parts = out[0]["content"].as_array().expect("parts array content");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "what is this");
+        assert_eq!(parts[1]["type"], "image_url");
+        let url = parts[1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"), "{url}");
+    }
+
+    #[test]
+    fn unit__translate_message__image_url_source_passes_through() {
+        let content = json!([
+            {"type": "image", "source": {"type": "url", "url": "https://example.test/frame.png"}}
+        ]);
+        let mut out = Vec::new();
+        translate_message("user", &content, &mut out).unwrap();
+        let parts = out[0]["content"].as_array().expect("parts array");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts[0]["image_url"]["url"],
+            "https://example.test/frame.png"
+        );
+    }
+
+    #[test]
+    fn unit__translate_message__malformed_image_source_rejected() {
+        for src in [
+            json!({"type": "file", "file_id": "f_1"}),
+            serde_json::Value::Null,
+        ] {
+            let block = json!([{"type": "image", "source": src}]);
+            let mut out = Vec::new();
+            let err = translate_message("user", &block, &mut out).unwrap_err();
+            assert!(
+                err.contains("image"),
+                "error should name the image source: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unit__translate_message__text_only_content_stays_string() {
+        // Pin: the pre-multimodal wire form must stay byte-identical.
+        let content = json!([
+            {"type": "text", "text": "hello "},
+            {"type": "text", "text": "world"}
+        ]);
+        let mut out = Vec::new();
+        translate_message("user", &content, &mut out).unwrap();
+        assert_eq!(out[0]["content"], json!("hello world"));
+    }
+
+    #[test]
+    fn unit__translate_message__tool_result_text_only_stays_string() {
+        let content = json!([
+            {"type": "tool_use", "id": "t1", "name": "f", "input": {}},
+        ]);
+        let mut out = Vec::new();
+        translate_message("assistant", &content, &mut out).unwrap();
+        let tool_result = json!({
+            "type": "tool_result", "tool_use_id": "t1",
+            "content": [{"type": "text", "text": "42"}]
+        });
+        let mut out2 = Vec::new();
+        translate_message("user", &json!([tool_result]), &mut out2).unwrap();
+        let tool_msg = out2
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("tool message emitted");
+        assert_eq!(tool_msg["content"], json!("42"));
+    }
+
+    #[test]
+    fn unit__translate_message__tool_result_image_becomes_parts_array() {
+        // b11147 child-verified: role:tool content accepts image parts
+        // (server-chat.cpp builds this exact shape from its own
+        // anthropic ingress) — tool-returned images must survive.
+        let content = json!([
+            {"type": "tool_result", "tool_use_id": "t1",
+             "content": [
+                {"type": "text", "text": "frame captured"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo"}}
+             ]}
+        ]);
+        let mut out = Vec::new();
+        translate_message("user", &content, &mut out).unwrap();
+        let tool_msg = out
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("tool message emitted");
+        let parts = tool_msg["content"].as_array().expect("parts array");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "frame captured");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert!(parts[1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+    }
 
     fn anthropic_req() -> Value {
         serde_json::from_str(

@@ -1002,3 +1002,5 @@ Behavior-changing release: spawn-time concurrency, honest capacity math.
 - `--cache-reuse` is no longer emitted on multimodal spawns (upstream
   silently disables the combination; the dead flag misled profile
   readers).
+- **Anthropic image blocks reach the engine.** `translate_message` used to collapse every `image` block into a `[image: …, N bytes]` text marker — the vision model never saw the picture. Base64 sources now re-serialize as data-URL `image_url` parts (format-sniffed: png/jpeg/gif/webp), URL sources pass verbatim, tool-result images become `role:"tool"` content parts (upstream accepts image parts there), and a malformed source is a 400 `invalid_request_error` instead of a silent marker.
+- **Vision routing covers video and tool-image parts.** `body_needs_vision` now recognizes `input_video`/`video_url` parts (llama.cpp ≥ b11147 surface) and media nested inside responses-lane `function_call_output.output[]` items, so those requests land on projector-bearing replicas instead of failing child-side.
