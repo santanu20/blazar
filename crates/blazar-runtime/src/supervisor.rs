@@ -3110,6 +3110,11 @@ impl Supervisor {
         // when a spawn fails (upstream's own error, e.g. "failed to
         // create context") — carried into the EngineCrashed payload.
         let mut last_load_tail = String::new();
+        // Whether any spawn attempt's argv dialed RPC backends
+        // (`--rpc`): gates the handshake-failure classification at the
+        // failure exit so a generic "failed to connect" tail from a
+        // non-RPC child can never trip it.
+        let mut argv_dialed_rpc = false;
         for _attempt in 0..2 {
             let endpoint = self.pick_endpoint(key)?;
             // Child auth dies with the child: minted per attempt (same
@@ -3210,6 +3215,7 @@ impl Supervisor {
                 argv.extend(a.argv.iter().cloned());
             }
             self.remap_device_argv(&mut argv, name).await;
+            argv_dialed_rpc |= argv.iter().any(|flag| flag == "--rpc");
             let mut child = engine.spawn(&argv, &endpoint).await.map_err(|e| {
                 if let Some(p) = &auth_keyfile {
                     let _ = std::fs::remove_file(p);
@@ -3542,6 +3548,20 @@ impl Supervisor {
                 return Err(SupervisionError::EngineCrashed(msg));
             }
         }
+        // RPC handshake failure teaching: the spawn preflight only
+        // proves TCP reachability — a worker on a mismatched ggml
+        // build passes it and aborts the child at the first
+        // handshake. Classified only when this spawn's argv actually
+        // dialed RPC backends, so unrelated connect errors stay raw.
+        if child_died_during_load && argv_dialed_rpc {
+            if let Some(teach) = Self::classify_rpc_handshake_failure(&last_load_tail) {
+                return Err(SupervisionError::EngineCrashed(format!(
+                    "{key} [{}]: {} — {teach}",
+                    manifest.tag,
+                    Self::tail_excerpt(&last_load_tail)
+                )));
+            }
+        }
         Err(if child_died_during_load {
             SupervisionError::EngineCrashed(format!(
                 "{key}: {}",
@@ -3606,6 +3626,67 @@ impl Supervisor {
         let end = rest.find('\'')?;
         let name = &rest[..end];
         (!name.is_empty()).then(|| name.to_string())
+    }
+
+    /// Classify a dead child's log tail as a ggml-RPC backend
+    /// handshake failure. Upstream ggml-rpc.cpp emits three fatal
+    /// shapes: `RPC server version mismatch: %d.%d.%d` (the worker
+    /// answers TCP but speaks an incompatible RPC protocol),
+    /// `RPC handshake failed for %s`, and the connect abort
+    /// `Failed to connect to %s`. The spawn preflight only proves
+    /// TCP reachability, so a stale worker passes it and kills the
+    /// child here instead. Extracts the worker addresses from the
+    /// `%s` shapes so the operator sees WHICH worker is stale;
+    /// `None` when none of the markers appear (the caller keeps
+    /// the raw tail excerpt).
+    fn classify_rpc_handshake_failure(tail: &str) -> Option<String> {
+        const VERSION_MISMATCH: &str = "rpc server version mismatch";
+        const HANDSHAKE_FAILED: &str = "rpc handshake failed for ";
+        const CONNECT_ABORT: &str = "failed to connect to ";
+        // Lowercase once, extract on the same copy (multi-byte case
+        // folds shift byte positions — same discipline as
+        // classify_unknown_arch).
+        let lower = tail.to_lowercase();
+        let mut version_mismatch = false;
+        let mut workers: Vec<&str> = Vec::new();
+        for line in lower.lines() {
+            if line.contains(VERSION_MISMATCH) {
+                version_mismatch = true;
+            }
+            if line.contains(HANDSHAKE_FAILED)
+                || (line.contains(CONNECT_ABORT) && line.contains("ggml"))
+            {
+                for marker in [HANDSHAKE_FAILED, CONNECT_ABORT] {
+                    if let Some(idx) = line.find(marker) {
+                        let after = line[idx + marker.len()..]
+                            .trim_end_matches(['\'', '"', ',', ')', ';', '.']);
+                        if !after.is_empty() {
+                            workers.push(after);
+                        }
+                    }
+                }
+            }
+        }
+        if !version_mismatch && workers.is_empty() {
+            return None;
+        }
+        let mut teach = String::from("RPC worker handshake failure");
+        if version_mismatch {
+            teach.push_str(
+                ": an RPC worker answers TCP but speaks a different ggml-RPC \
+protocol version",
+            );
+        }
+        if !workers.is_empty() {
+            let _ = write!(teach, " — worker(s): {}", workers.join(", "));
+        }
+        teach.push_str(
+            ". Every --rpc worker must run a ggml-rpc build from the same era as the \
+engine build named above (a stale worker passes the TCP preflight and aborts the \
+child at the handshake); restart the listed worker(s) from a matching build, or \
+drop them from rpc_servers in config.toml",
+        );
+        Some(teach)
     }
 
     /// Ask the capability registry for a curated lane serving `arch`
@@ -6527,6 +6608,50 @@ mod routing_tests {
             Supervisor::classify_unknown_arch(&mixed).as_deref(),
             Some("qwen2")
         );
+    }
+
+    #[test]
+    fn unit__classify_rpc_handshake__version_mismatch_and_worker_extraction() {
+        // ggml-rpc.cpp fatal shapes; addresses ride into the teaching.
+        let teach = Supervisor::classify_rpc_handshake_failure(
+            "loading model\nRPC server version mismatch: 6.3.1 != 7.0.0\n",
+        )
+        .expect("version mismatch classifies");
+        assert!(
+            teach.contains("different ggml-RPC protocol version"),
+            "{teach}"
+        );
+        let teach = Supervisor::classify_rpc_handshake_failure(
+            "RPC handshake failed for 192.168.1.4:50052; closing connection\n",
+        )
+        .expect("handshake failure classifies");
+        assert!(teach.contains("192.168.1.4:50052"), "{teach}");
+        let teach = Supervisor::classify_rpc_handshake_failure(
+            "GGML_ABORT: Failed to connect to rpc0:50052",
+        )
+        .expect("connect abort classifies");
+        assert!(teach.contains("rpc0:50052"), "{teach}");
+        // Every classified tail teaches the same-era remedy.
+        assert!(teach.contains("rpc_servers"), "{teach}");
+    }
+
+    #[test]
+    fn unit__classify_rpc_handshake__unrelated_tails_are_none() {
+        // A non-RPC child's generic connect error must never classify
+        // (the argv gate at the call site is the second guard, but the
+        // classifier itself stays conservative too).
+        for tail in [
+            "failed to create context",
+            "error: failed to connect to model.db",
+            "rpc: 0 backends registered",
+            "",
+        ] {
+            assert_eq!(
+                Supervisor::classify_rpc_handshake_failure(tail),
+                None,
+                "{tail:?}"
+            );
+        }
     }
 
     /// Engine rows for capability-lane tests: fork rows carry the
