@@ -47,6 +47,22 @@ fn local_http() -> &'static reqwest::Client {
     CLIENT.get_or_init(reqwest::Client::new)
 }
 
+/// Cold-lane child dialing (warm-peg probes, session-bank save/restore):
+/// TCP rides the shared loopback pool; unix builds an ephemeral
+/// socket-pinned client — these calls run once per spawn or idle
+/// transition, so there is no pool worth warming. The unix base's host
+/// is a placeholder the connector ignores; only the path is dialed.
+fn child_dial(endpoint: &blazar_core::Endpoint) -> (reqwest::Client, String) {
+    match endpoint {
+        blazar_core::Endpoint::Tcp { host, port } => {
+            (local_http().clone(), format!("http://{host}:{port}"))
+        }
+        blazar_core::Endpoint::Unix { socket } => {
+            (crate::uds::client(socket), "http://localhost".to_string())
+        }
+    }
+}
+
 pub fn resolve_draft_path(store: &Store, model: &str, spec_mode: &str) -> Option<String> {
     let pair = blazar_core::catalog::pair_for_spec_mode(model, spec_mode)?;
     let (repo_part, file_part) = pair
@@ -333,21 +349,17 @@ async fn warm_peg_child(
     auth: Option<&str>,
     concurrency: usize,
 ) {
-    let (host, port) = match endpoint {
-        blazar_core::Endpoint::Tcp { host, port } => (host, *port),
-        // Pegged engines are TCP-only (sglang and llama-server both
-        // reject unix sockets here); same guard as bank_restore_post
-        // for symmetry.
-        blazar_core::Endpoint::Unix { .. } => return,
-    };
-    let url = format!("http://{host}:{port}/v1/chat/completions");
+    // llama.cpp children serve the same REST surface on either
+    // transport; sglang spawns never carry unix endpoints (its engine
+    // guard rejects them), so dialing here is always well-formed.
+    let (client, base) = child_dial(endpoint);
+    let url = format!("{base}/v1/chat/completions");
     let body = serde_json::json!({
         "model": model,
         "messages": [{ "role": "user", "content": "Reply with: OK" }],
         "max_tokens": 4,
         "stream": false,
     });
-    let client = local_http();
     let started = std::time::Instant::now();
     // Single probe first: drains the residual warmup queue (up to ~30s
     // on a cold venv+torch boot; generous bound so a slow-but-healthy
@@ -1015,6 +1027,9 @@ impl Supervisor {
         hardware: Hardware,
         engine: Arc<dyn Engine>,
     ) -> Self {
+        // Reap child sockets orphaned by an unclean previous exit
+        // BEFORE any spawn reuses their deterministic per-name paths.
+        crate::uds::sweep_stale(&dirs.run_dir());
         Self {
             evictions: std::sync::atomic::AtomicU64::new(0),
             cache_hint: std::sync::Arc::new(CacheHint::default()),
@@ -2107,7 +2122,7 @@ impl Supervisor {
         // Dying router child's log tail (see spawn_instance for rationale).
         let mut last_load_tail = String::new();
         for _attempt in 0..2 {
-            let endpoint = self.pick_endpoint(ROUTER_KEY);
+            let endpoint = self.pick_endpoint(ROUTER_KEY)?;
             // Child auth dies with the child: minted per attempt (same
             // keyfile path, so retries overwrite), removed when this
             // attempt or the whole spawn fails.
@@ -3096,7 +3111,7 @@ impl Supervisor {
         // create context") — carried into the EngineCrashed payload.
         let mut last_load_tail = String::new();
         for _attempt in 0..2 {
-            let endpoint = self.pick_endpoint(key);
+            let endpoint = self.pick_endpoint(key)?;
             // Child auth dies with the child: minted per attempt (same
             // keyfile path, so retries overwrite), removed when this
             // attempt or the whole spawn fails.
@@ -3760,24 +3775,30 @@ impl Supervisor {
     }
 
     /// Free TCP port (bind 0, read, drop) or a unix socket path.
-    fn pick_endpoint(&self, name: &str) -> Endpoint {
+    /// Socket names ride the shared `path_safe` sanitizer (a key like
+    /// `llava@vision` keeps its `@`; hostile separators collapse) and
+    /// must fit `sun_path` — an over-budget path fails the spawn with a
+    /// teaching error instead of dying inside the child's `bind`.
+    fn pick_endpoint(&self, name: &str) -> Result<Endpoint, SupervisionError> {
         if self.config.child_transport == "unix" {
-            return Endpoint::Unix {
-                socket: self
-                    .dirs
-                    .run_dir()
-                    .join(format!("{name}.sock"))
-                    .display()
-                    .to_string(),
-            };
+            let socket = self
+                .dirs
+                .run_dir()
+                .join(format!("{}.sock", blazar_core::profile::path_safe(name)))
+                .display()
+                .to_string();
+            crate::uds::validate_socket_path(&socket).map_err(|e| {
+                SupervisionError::Internal(anyhow::anyhow!("child socket for {name}: {e}"))
+            })?;
+            return Ok(Endpoint::Unix { socket });
         }
         let port = std::net::TcpListener::bind(("127.0.0.1", 0))
             .and_then(|l| l.local_addr())
             .map_or(0, |a| a.port());
-        Endpoint::Tcp {
+        Ok(Endpoint::Tcp {
             host: "127.0.0.1".into(),
             port,
-        }
+        })
     }
 
     fn record_restart(&self, name: &str) {
@@ -3858,6 +3879,13 @@ impl Supervisor {
             let _ = std::fs::remove_file(self.dirs.run_dir().join(format!("{name}.pid")));
             // Child-auth keyfile dies with the child (its secret too).
             let _ = std::fs::remove_file(self.dirs.run_dir().join(format!("{name}.apikey")));
+            // Unix-transport socket dies with the child — under the same
+            // ptr-identity guard: a respawn that won the race rebound
+            // this exact path, and unlinking it would pull the live
+            // child's transport out from under it.
+            if let Endpoint::Unix { socket } = &inst.endpoint {
+                let _ = std::fs::remove_file(socket);
+            }
         } else {
             tracing::info!(
                 model = name,
@@ -3949,24 +3977,22 @@ impl Supervisor {
             );
             return;
         }
-        let (host, port) = match endpoint {
-            blazar_core::Endpoint::Tcp { host, port } => (host, *port),
-            // UDS children keep their slot protocol on the socket; the
-            // REST restore endpoint is not reachable.
-            blazar_core::Endpoint::Unix { .. } => return,
-        };
+        // Same REST surface on both transports (b11147 llama-server
+        // binds .sock paths via --host); the dial helper picks the
+        // client, the slot endpoints are unchanged.
+        let (client, base) = child_dial(endpoint);
         // Restore truth-check: HTTP 200 alone does not prove KV injection
         // (upstream has a restored-then-empty re-prefill bug class). The
         // response's `n_restored` is the injection count; the first
         // request's cached-token counter (gateway A9) backstops the
         // lookup-miss variant. Live-probed on b11070: restore of 31 saved
         // tokens -> next same-prefix completion ran cache_n=23, prompt_n=1.
-        let url = format!("http://{host}:{port}/slots/0?action=restore&filename=_auto-{ctx}");
+        let url = format!("{base}/slots/0?action=restore&filename=_auto-{ctx}");
         let mut body = serde_json::json!({ "filename": format!("_auto-{ctx}") });
         if self.config.router {
             body["model"] = serde_json::json!(key);
         }
-        let mut req = local_http()
+        let mut req = client
             .post(&url)
             .json(&body)
             .timeout(std::time::Duration::from_secs(5));
@@ -4023,21 +4049,17 @@ impl Supervisor {
             return;
         }
         let file = self.bank_file(&inst.name, inst.profile_ctx);
-        let url = match &inst.endpoint {
-            Endpoint::Tcp { host, port } => {
-                format!(
-                    "http://{host}:{port}/slots/0?action=save&filename=_auto-{}",
-                    inst.profile_ctx
-                )
-            }
-            Endpoint::Unix { .. } => return, // no HTTP lane on UDS children
-        };
+        let (client, base) = child_dial(&inst.endpoint);
+        let url = format!(
+            "{base}/slots/0?action=save&filename=_auto-{}",
+            inst.profile_ctx
+        );
         let body = if self.config.router {
             serde_json::json!({"filename": format!("_auto-{}", inst.profile_ctx), "model": inst.name})
         } else {
             serde_json::json!({"filename": format!("_auto-{}", inst.profile_ctx)})
         };
-        let mut req = local_http()
+        let mut req = client
             .post(&url)
             .json(&body)
             .timeout(std::time::Duration::from_secs(2));
@@ -5383,6 +5405,131 @@ mod routing_tests {
     }
 
     #[cfg(unix)]
+    fn uds_sup(dirs: &BlazarDirs, config: Config) -> Supervisor {
+        let manifest = Manifest {
+            tag: "fake".into(),
+            build_number: 1,
+            version_raw: "b1".into(),
+            devices: vec![],
+            flags: std::collections::BTreeSet::new(),
+            spec_types: vec![],
+            server_path: String::new(),
+            ..Default::default()
+        };
+        Supervisor::new(
+            dirs.clone(),
+            config,
+            EventBus::default(),
+            Hardware {
+                physical_cores: 1,
+                total_ram_mib: 1024,
+                gpus: vec![],
+            },
+            Arc::new(FakeEngine(manifest)),
+        )
+    }
+
+    #[cfg(unix)]
+    #[allow(non_snake_case)]
+    #[test]
+    fn unit__pick_endpoint__unix_transport_shape_and_determinism() {
+        let root = tempfile::TempDir::new().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: root.path().join("cfg"),
+            data_dir: root.path().join("data"),
+        };
+        let config = Config {
+            child_transport: "unix".into(),
+            ..Config::default()
+        };
+        let sup = uds_sup(&dirs, config);
+
+        // Sanitized, .sock-suffixed, deterministic (a respawn rebinds the
+        // same path — the boot sweep relies on this).
+        let key = "llava@vision";
+        let first = sup.pick_endpoint(key).unwrap();
+        let second = sup.pick_endpoint(key).unwrap();
+        let Endpoint::Unix { socket } = &first else {
+            panic!("unix transport must carry a socket endpoint, got {first:?}");
+        };
+        assert_eq!(first, second, "per-name socket path is deterministic");
+        let file = socket.rsplit('/').next().unwrap_or(socket);
+        assert!(
+            file.starts_with("llava")
+                && std::path::Path::new(file)
+                    .extension()
+                    .is_some_and(|e| e == std::ffi::OsStr::new("sock")),
+            "sanitized stem in {socket}"
+        );
+        assert!(socket.starts_with(dirs.run_dir().display().to_string().as_str()));
+        assert!(socket.len() <= crate::uds::MAX_SOCKET_PATH_BYTES);
+
+        // A distinct name never collides.
+        assert_ne!(
+            sup.pick_endpoint("llava@vision#1").unwrap(),
+            first,
+            "replica keys get their own socket"
+        );
+    }
+
+    #[cfg(unix)]
+    #[allow(non_snake_case)]
+    #[test]
+    fn unit__pick_endpoint__unix_over_budget_path_fails_with_teaching_error() {
+        let root = tempfile::TempDir::new().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: root.path().join("cfg"),
+            data_dir: root.path().join("x".repeat(120)),
+        };
+        let config = Config {
+            child_transport: "unix".into(),
+            ..Config::default()
+        };
+        let sup = uds_sup(&dirs, config);
+        let err = sup.pick_endpoint("m").unwrap_err().to_string();
+        assert!(
+            err.contains("sun_path") && err.contains("child socket for m"),
+            "teaching error, got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[allow(non_snake_case)]
+    #[tokio::test]
+    async fn unit__evict__unix_endpoint_unlinks_socket_file() {
+        let root = tempfile::TempDir::new().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: root.path().join("cfg"),
+            data_dir: root.path().join("data"),
+        };
+        std::fs::create_dir_all(dirs.run_dir()).unwrap();
+        let sup = uds_sup(&dirs, Config::default());
+
+        // A REAL bound socket: proves teardown unlinks an actual
+        // filesystem node, not just a fabricated path string.
+        let socket_path = dirs.run_dir().join("unixx.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        assert!(socket_path.exists());
+
+        let (inst, _pid) = fake_instance_at(
+            "unixx",
+            InstanceState::Ready,
+            0,
+            Endpoint::Unix {
+                socket: socket_path.display().to_string(),
+            },
+        );
+        sup.instances.insert("unixx".to_string(), inst);
+        sup.evict("unixx").await.unwrap();
+
+        assert!(
+            !socket_path.exists(),
+            "evict must unlink the child's socket alongside pidfile/apikey"
+        );
+        drop(listener);
+    }
+
+    #[cfg(unix)]
     /// J2 harness: real temp dirs + store rows + a script posing as
     /// llama-server under engines/{tag}/llama-{tag}/.
     fn j2_sup(exit_code: i32) -> (Supervisor, tempfile::TempDir, EventBus) {
@@ -6011,12 +6158,27 @@ mod routing_tests {
     /// Fabricated map entry: real child (so teardown paths stay honest),
     /// throwaway argv/profile. Caller owns the pid for cleanup.
     fn fake_instance(key: &str, state: InstanceState, load: i64) -> (Arc<Instance>, u32) {
+        fake_instance_at(
+            key,
+            state,
+            load,
+            Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 0,
+            },
+        )
+    }
+
+    /// Same fabricated child as [`fake_instance`], with a caller-chosen
+    /// transport (unix-socket lifecycle tests need `Endpoint::Unix`).
+    fn fake_instance_at(
+        key: &str,
+        state: InstanceState,
+        load: i64,
+        endpoint: Endpoint,
+    ) -> (Arc<Instance>, u32) {
         let proc = dummy_process();
         let pid = proc.id().expect("fabricated child pid");
-        let endpoint = Endpoint::Tcp {
-            host: "127.0.0.1".into(),
-            port: 0,
-        };
         let inst = Instance {
             name: key.to_string(),
             engine_tag: "test-engine".to_string(),

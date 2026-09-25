@@ -373,8 +373,7 @@ pub async fn embed_prompt(
     let base = crate::proxy::child_base(&engine.endpoint);
     // Tokenize exactly (no BOS so ids map 1:1 to child tokens).
     let ids: Vec<u64> = crate::proxy::child_auth(
-        state
-            .http
+        crate::state::child_client(state, &engine.endpoint)
             .post(format!("{base}/tokenize"))
             .json(&serde_json::json!({"content": text, "add_special": false})),
         &engine,
@@ -394,8 +393,7 @@ pub async fn embed_prompt(
         return Err("empty prompt embedding".into());
     }
     let resp = crate::proxy::child_auth(
-        state
-            .http
+        crate::state::child_client(state, &engine.endpoint)
             .post(format!("{base}/embedding"))
             .json(&serde_json::json!({"content": ids})),
         &engine,

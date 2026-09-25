@@ -277,6 +277,55 @@ async fn e2e__openai_chat_nonstream_and_stream() {
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
+/// `child_transport = "unix"` (upstream #28690 surface): the whole lane —
+/// spawn argv (`--host <path>.sock`, no --port), stub bind, readiness,
+/// proxy forward, reply — rides the socket, and teardown reaps the file.
+#[tokio::test]
+#[cfg(unix)]
+#[allow(non_snake_case)]
+async fn e2e__openai_chat_over_unix_socket_transport() {
+    let config = Config {
+        child_transport: "unix".into(),
+        ..Config::default()
+    };
+    let ts = start(config).await;
+    let c = client();
+
+    let r: serde_json::Value = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "messages": [{"role": "user", "content": "unix lane"}],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["choices"][0]["message"]["content"], "stub:m1:unix lane");
+
+    // The child really is socket-backed: exactly one live .sock in the
+    // run dir, named for the sanitized instance key.
+    let live_socks = |dir: &std::path::Path| -> Vec<std::fs::DirEntry> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "sock"))
+            .collect()
+    };
+    let socks = live_socks(&ts.dirs.run_dir());
+    assert_eq!(socks.len(), 1, "one socket per live child");
+    assert!(socks[0].path().to_string_lossy().contains("m1"));
+
+    // Teardown unlinks the socket with the child (H19: acquire/release).
+    ts.state.sup.shutdown_all().await.unwrap();
+    assert!(
+        live_socks(&ts.dirs.run_dir()).is_empty(),
+        "socket must die with the child"
+    );
+}
+
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn e2e__ollama_chat_nonstream_translation() {

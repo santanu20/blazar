@@ -151,8 +151,9 @@ pub async fn messages(
     };
     let url = format!("{}/v1/chat/completions", child_base(&engine.endpoint));
     // F44: pooled client (10-min total timeout) instead of a per-request
-    // build — same transport every other child lane uses.
-    let client = state.http.clone();
+    // build — same transport every other child lane uses (socket-pinned
+    // for unix children).
+    let client = crate::state::child_client(&state, &engine.endpoint);
     let send = crate::proxy::child_auth(
         client
             .post(&url)
@@ -283,8 +284,9 @@ pub async fn count_tokens(
     };
     let url = format!("{}/tokenize", child_base(&engine.endpoint));
     // F44: pooled client — the old bare `Client::new()` had NO timeout,
-    // so a dead child hung the count_tokens lane forever.
-    let client = state.http.clone();
+    // so a dead child hung the count_tokens lane forever (socket-pinned
+    // for unix children).
+    let client = crate::state::child_client(&state, &engine.endpoint);
     let resp = match crate::proxy::child_auth(client.post(&url), &engine)
         .json(&json!({"content": text}))
         .send()

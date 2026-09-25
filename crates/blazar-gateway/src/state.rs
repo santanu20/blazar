@@ -156,6 +156,11 @@ pub struct AppState {
     pub queue: Arc<PriorityQueue>,
     /// Loopback client for child traffic + metrics scrape.
     pub http: reqwest::Client,
+    /// Cached per-socket clients for unix-transport children
+    /// (`child_transport = "unix"`): reqwest pins one socket path per
+    /// client, so each unix child gets its own entry here. Empty and
+    /// untouched in the default TCP mode.
+    pub uds_http: blazar_runtime::uds::UdsClients,
     /// J5 eviction lane sender (sentinel body-stall fires through it):
     /// the consumer task in `new` debounces (1/min per model) and reaps
     /// the wedged child. Proxy header-stall evicts synchronously in-band
@@ -230,6 +235,18 @@ pub struct AppState {
     /// CONNECTION, not data: WAL + per-call queries keep CLI-side
     /// writes immediately visible cross-process.
     pub store: std::sync::Mutex<Option<blazar_core::Store>>,
+}
+
+/// Client for dialing ONE child endpoint: the shared TCP pool, or the
+/// cached socket-pinned client when the endpoint rides the unix
+/// transport. Pair with `proxy::child_base` — that base names a
+/// placeholder host the unix connector ignores, only the path is dialed.
+#[must_use]
+pub fn child_client(state: &AppState, ep: &blazar_core::profile::Endpoint) -> reqwest::Client {
+    match ep {
+        blazar_core::profile::Endpoint::Tcp { .. } => state.http.clone(),
+        blazar_core::profile::Endpoint::Unix { socket } => state.uds_http.get(socket),
+    }
 }
 
 impl AppState {
@@ -322,6 +339,7 @@ impl AppState {
             bus,
             queue: Arc::new(PriorityQueue::new()),
             http,
+            uds_http: blazar_runtime::uds::UdsClients::new(),
             evict_tx: tx,
             cache_bust: Arc::new(crate::cache_bust::CacheBustTracker::new()),
             ttft: crate::histogram::ttft(),

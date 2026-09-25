@@ -2567,14 +2567,23 @@ impl Config {
             )));
         }
         match self.child_transport.as_str() {
-            // F35: "unix" was accepted by validation but no lane dials a
-            // UDS — every request would 500. Fail loud at config load
-            // instead of at first request.
             "tcp" => {}
+            // F35 lifted: the unix lane is implemented end-to-end
+            // (llama.cpp children via --host <sock>, reqwest unix_socket
+            // dialing, evict-time socket unlink). Non-llama engines
+            // reject unix endpoints at their own spawn guards.
             "unix" => {
-                return Err(CoreError::Config(
-                    "child_transport = \"unix\" is not implemented yet — use \"tcp\"".to_string(),
-                ));
+                #[cfg(not(unix))]
+                {
+                    return Err(CoreError::Config(
+                        "child_transport = \"unix\" requires a unix platform — use \"tcp\""
+                            .to_string(),
+                    ));
+                }
+                #[cfg(unix)]
+                {
+                    // Implemented end-to-end; nothing further to check.
+                }
             }
             other => {
                 return Err(CoreError::Config(format!(
@@ -3427,6 +3436,26 @@ fn valid_override_tensor(s: &str) -> bool {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__child_transport__unix_validates_and_garbage_rejects() {
+        // F35 lift pin: the unix lane is a first-class transport now.
+        let unix_cfg = Config {
+            child_transport: "unix".into(),
+            ..Config::default()
+        };
+        unix_cfg.validate().expect("unix transport must validate");
+        // Garbage still fails fast with the enum spelled out.
+        let grpc_cfg = Config {
+            child_transport: "grpc".into(),
+            ..Config::default()
+        };
+        let err = grpc_cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("tcp") && err.contains("unix") && err.contains("grpc"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn unit__retired_pins__default_config_has_none() {

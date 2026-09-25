@@ -458,7 +458,12 @@ async fn ps_router(state: &Arc<AppState>) -> Response {
         Err(e) => return api_error(503, &e.to_string()),
     };
     let url = format!("{}/models", child_base(&engine.endpoint));
-    let resp = child_auth(state.http.get(&url), &engine).send().await;
+    let resp = child_auth(
+        crate::state::child_client(state, &engine.endpoint).get(&url),
+        &engine,
+    )
+    .send()
+    .await;
     let Ok(resp) = resp else {
         return api_error(502, "router /models unreachable");
     };
@@ -1558,8 +1563,7 @@ async fn proxy_core_chat(
         format!("{base}/v1/chat/completions")
     };
     let req = child_auth(
-        state
-            .http
+        crate::state::child_client(state, &engine.endpoint)
             .post(&url)
             .header("content-type", "application/json"),
         engine,
@@ -1599,8 +1603,7 @@ async fn proxy_core_chat(
                             format!("{}/v1/chat/completions", child_base(&fresh.endpoint))
                         };
                         let fresh_req = child_auth(
-                            state
-                                .http
+                            crate::state::child_client(state, &fresh.endpoint)
                                 .post(&fresh_url)
                                 .header("content-type", "application/json"),
                             &fresh,
@@ -1750,8 +1753,7 @@ async fn proxy_core_chat(
         state,
         engine,
         child_auth(
-            state
-                .http
+            crate::state::child_client(state, &engine.endpoint)
                 .post(&url)
                 .header("content-type", "application/json"),
             engine,
@@ -1781,8 +1783,7 @@ async fn proxy_core_chat(
                         state,
                         &fresh,
                         child_auth(
-                            state
-                                .http
+                            crate::state::child_client(state, &fresh.endpoint)
                                 .post(&fresh_url)
                                 .header("content-type", "application/json"),
                             &fresh,
@@ -2219,9 +2220,12 @@ pub async fn embeddings(
             let resp = match crate::proxy::child_send(
                 &state,
                 &engine,
-                child_auth(state.http.post(&url), &engine)
-                    .json(&openai_req)
-                    .send(),
+                child_auth(
+                    crate::state::child_client(&state, &engine.endpoint).post(&url),
+                    &engine,
+                )
+                .json(&openai_req)
+                .send(),
             )
             .await
             {
@@ -2346,9 +2350,12 @@ pub async fn embed(
             let resp = match crate::proxy::child_send(
                 &state,
                 &engine,
-                child_auth(state.http.post(&url), &engine)
-                    .json(&openai_req)
-                    .send(),
+                child_auth(
+                    crate::state::child_client(&state, &engine.endpoint).post(&url),
+                    &engine,
+                )
+                .json(&openai_req)
+                .send(),
             )
             .await
             {
@@ -2379,6 +2386,16 @@ pub async fn embed(
 /// /v1/rerank. Accepts `documents` as strings or {text} objects
 /// (normalizes to the `OpenAI` string shape); response passes through
 /// verbatim (results + usage).
+/// `{text: "..."}` documents normalize to plain strings (the `OpenAI`
+/// rerank shape); strings and other values pass through untouched.
+fn rerank_doc_text(doc: &Value) -> Value {
+    match doc {
+        Value::String(s) => Value::String(s.clone()),
+        Value::Object(_) => Value::String(doc["text"].as_str().unwrap_or_default().to_string()),
+        other => other.clone(),
+    }
+}
+
 pub async fn rerank(
     State(state): State<Arc<AppState>>,
     key_ext: Option<Extension<crate::keys::KeyCtx>>,
@@ -2404,14 +2421,7 @@ pub async fn rerank(
         return api_error(400, "\"documents\" must be an array");
     };
     // {text: "..."} objects -> plain strings.
-    let normalized: Vec<Value> = docs
-        .iter()
-        .map(|d| match d {
-            Value::String(s) => Value::String(s.clone()),
-            Value::Object(_) => Value::String(d["text"].as_str().unwrap_or_default().to_string()),
-            other => other.clone(),
-        })
-        .collect();
+    let normalized: Vec<Value> = docs.iter().map(rerank_doc_text).collect();
     let forward = json!({
         "model": model,
         "query": req["query"],
@@ -2463,9 +2473,12 @@ pub async fn rerank(
             let resp = match crate::proxy::child_send(
                 &state,
                 &engine,
-                child_auth(state.http.post(&url), &engine)
-                    .json(&forward)
-                    .send(),
+                child_auth(
+                    crate::state::child_client(&state, &engine.endpoint).post(&url),
+                    &engine,
+                )
+                .json(&forward)
+                .send(),
             )
             .await
             {
@@ -2714,10 +2727,13 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
             Err(e) => return api_error(503, &e.to_string()),
         };
         let url = format!("{}/models/unload", child_base(&engine.endpoint));
-        return match child_auth(state.http.post(&url), &engine)
-            .json(&json!({"model": model}))
-            .send()
-            .await
+        return match child_auth(
+            crate::state::child_client(&state, &engine.endpoint).post(&url),
+            &engine,
+        )
+        .json(&json!({"model": model}))
+        .send()
+        .await
         {
             Ok(r) if r.status().is_success() => axum::Json(json!({"status": "ok"})).into_response(),
             Ok(r) => {
@@ -2930,7 +2946,7 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
         } else {
             json!({"filename": filename})
         };
-        let resp = child_auth(state.http.post(&url), &engine)
+        let resp = child_auth(crate::state::child_client(&state, &engine.endpoint).post(&url), &engine)
             .json(&body_json)
             .send()
             .await;
@@ -3119,11 +3135,14 @@ fn engine_build_gauge(state: &AppState, out: &mut String) {
 pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     let mut merged = String::new();
     for e in state.sup.live_http_endpoints() {
-        let blazar_core::profile::Endpoint::Tcp { host, port } = &e.endpoint else {
-            continue;
-        };
-        let url = format!("http://{host}:{port}/metrics");
-        if let Ok(resp) = child_auth(state.http.get(&url), &e).send().await {
+        let url = format!("{}/metrics", crate::proxy::child_base(&e.endpoint));
+        if let Ok(resp) = child_auth(
+            crate::state::child_client(&state, &e.endpoint).get(&url),
+            &e,
+        )
+        .send()
+        .await
+        {
             if resp.status().is_success() {
                 if let Ok(text) = resp.text().await {
                     merged.push_str(&text);
@@ -3142,7 +3161,13 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         match crate::proxy::ensure_router_detached(&state.sup).await {
             Ok(engine) => {
                 let url = format!("{}/models", child_base(&engine.endpoint));
-                match child_auth(state.http.get(&url), &engine).send().await {
+                match child_auth(
+                    crate::state::child_client(&state, &engine.endpoint).get(&url),
+                    &engine,
+                )
+                .send()
+                .await
+                {
                     Ok(r) if r.status().is_success() => match r.json::<Value>().await {
                         Ok(v) => v["data"].as_array().map_or_else(
                             || state.sup.ps().len(),
