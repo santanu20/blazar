@@ -4668,9 +4668,9 @@ async fn serve() -> Result<()> {
         engine_row.ok_or_else(|| anyhow!("no engine installed; run: blazar engine update"))?;
     let mut manifest: blazar_runtime::Manifest = serde_json::from_str(&engine_row.manifest)
         .with_context(|| format!("decode engine manifest {}", engine_row.tag))?;
-    // Rows installed under a different data dir still resolve: adopt the
-    // live engines root when the recorded absolute path is gone.
-    manifest.re_root_server_path(&d.engines_dir());
+    // Relative rows (storage invariant) resolve against the live data
+    // dir; legacy absolute rows heal via the same anchor.
+    manifest.anchor_server_path(&d.data_dir);
     println!(
         "engine: {} (build {})",
         engine_row.tag, manifest.build_number
@@ -8283,7 +8283,8 @@ fn tune_full(
     let engine_row = store
         .active_engine()?
         .ok_or_else(|| anyhow!("no engine installed; run: blazar engine update"))?;
-    let manifest: blazar_runtime::Manifest = serde_json::from_str(&engine_row.manifest)?;
+    let mut manifest: blazar_runtime::Manifest = serde_json::from_str(&engine_row.manifest)?;
+    manifest.anchor_server_path(&d.data_dir);
     let bench_bin = blazar_runtime::bench::find_bench_bin(&d)?;
     let mut cfg = config()?;
     // Persist --spec BEFORE building the profile input so the compiled

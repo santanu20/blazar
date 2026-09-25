@@ -141,8 +141,11 @@ pub struct Manifest {
     pub flags: BTreeSet<String>,
     /// Speculative-decoding types accepted by `--spec-type`, when advertised.
     pub spec_types: Vec<String>,
-    /// Absolute path to the engine's server binary, as probed at install
-    /// time. Relocatable on load: see [`Manifest::re_root_server_path`].
+    /// Path to the engine's server binary as recorded at install time.
+    /// Stored RELATIVE to the data dir (`engines/<tag>/...`) so rows stay
+    /// relocatable; the out-of-tree `local` lane (`BLAZAR_ENGINE_PATH`)
+    /// keeps its user-given absolute path. Anchored to an absolute live
+    /// path on load: see [`Manifest::anchor_server_path`].
     pub server_path: String,
     /// Where this build's code came from (v2; defaults to upstream for
     /// pre-v2 manifests).
@@ -341,6 +344,52 @@ impl Manifest {
             live.display()
         );
         self.server_path = live.display().to_string();
+        true
+    }
+
+    /// Anchor a stored (possibly relative) `server_path` to an absolute
+    /// live path — call at EVERY row decode before the manifest reaches
+    /// consumers (spawns expect an executable path). Relative rows
+    /// (`engines/<tag>/...`, the storage invariant) resolve against the
+    /// live data dir; absolute rows are legacy installs or the
+    /// out-of-tree `local` lane — legacy ones heal via
+    /// [`Manifest::re_root_server_path`] when their recorded root moved,
+    /// user-given local paths stay untouched. An empty path stays empty
+    /// (guards the orphan sweep against a match-everything reference).
+    pub fn anchor_server_path(&mut self, data_dir: &Path) {
+        if self.server_path.is_empty() {
+            return;
+        }
+        let recorded = Path::new(&self.server_path);
+        if recorded.is_relative() {
+            self.server_path = data_dir.join(recorded).display().to_string();
+        } else {
+            self.re_root_server_path(&data_dir.join("engines"));
+        }
+    }
+
+    /// Fold an absolute in-tree `server_path` into its data-dir-relative
+    /// storage form (`engines/<tag>/...`). Returns whether the manifest
+    /// changed. Out-of-tree paths (the `local` lane's `BLAZAR_ENGINE_PATH`
+    /// binary) and already-relative paths stay untouched.
+    pub fn relativize_server_path(&mut self, data_dir: &Path) -> bool {
+        let recorded = Path::new(&self.server_path);
+        if !recorded.is_absolute() {
+            return false;
+        }
+        let Ok(rel) = recorded.strip_prefix(data_dir) else {
+            return false;
+        };
+        let folded = rel.display().to_string();
+        if folded.is_empty() {
+            return false;
+        }
+        tracing::debug!(
+            "engine {} server path stored relative: {}",
+            self.tag,
+            folded
+        );
+        self.server_path = folded;
         true
     }
 }
@@ -1010,6 +1059,96 @@ mod tests {
         };
         assert!(!m.re_root_server_path(&engines));
         assert_eq!(m.server_path, "/gone/custom/llama-server");
+    }
+
+    fn bare_manifest(server_path: &str) -> Manifest {
+        Manifest {
+            tag: "b1-cuda".into(),
+            build_number: 1,
+            version_raw: "version: b1".into(),
+            devices: Vec::new(),
+            flags: BTreeSet::new(),
+            spec_types: Vec::new(),
+            server_path: server_path.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unit__relativize_server_path__in_tree_folds_to_data_dir_relative() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data/blazar");
+        let mut m = bare_manifest(
+            &data
+                .join("engines/b1-cuda/llama-b1-cuda/llama-server")
+                .display()
+                .to_string(),
+        );
+        assert!(m.relativize_server_path(&data));
+        assert_eq!(m.server_path, "engines/b1-cuda/llama-b1-cuda/llama-server");
+        // Already-relative is a no-op (idempotent).
+        assert!(!m.relativize_server_path(&data));
+    }
+
+    #[test]
+    fn unit__relativize_server_path__out_of_tree_stays_absolute() {
+        // The `local` lane's BLAZAR_ENGINE_PATH binary never lives under
+        // the data dir — relativizing it would corrupt a user-owned path.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data/blazar");
+        let mut m = bare_manifest("/home/user/build/llama.cpp/llama-server");
+        assert!(!m.relativize_server_path(&data));
+        assert_eq!(m.server_path, "/home/user/build/llama.cpp/llama-server");
+    }
+
+    #[test]
+    fn unit__anchor_server_path__relative_row_round_trips_to_absolute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data/blazar");
+        let mut m = bare_manifest("engines/b1-cuda/llama-b1-cuda/llama-server");
+        m.anchor_server_path(&data);
+        assert_eq!(
+            m.server_path,
+            data.join("engines/b1-cuda/llama-b1-cuda/llama-server")
+                .display()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn unit__anchor_server_path__legacy_absolute_row_heals_to_live_engines_dir() {
+        // A row recorded before the relative invariant, installed under a
+        // data dir that has since moved: anchor adopts the live tail.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data/blazar");
+        let live_bin = data.join("engines/b1-cuda/llama-server");
+        std::fs::create_dir_all(live_bin.parent().unwrap()).unwrap();
+        std::fs::write(&live_bin, b"#!/bin/sh\n").unwrap();
+
+        let mut m = bare_manifest("/old/root/.local/share/blazar/engines/b1-cuda/llama-server");
+        m.anchor_server_path(&data);
+        assert_eq!(m.server_path, live_bin.display().to_string());
+    }
+
+    #[test]
+    fn unit__anchor_server_path__external_absolute_path_left_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data/blazar");
+        std::fs::create_dir_all(&data).unwrap();
+        let mut m = bare_manifest("/gone/custom/llama-server");
+        m.anchor_server_path(&data);
+        // No live tail anywhere: stays as recorded so spawn fails loudly
+        // with ENOENT (the local-lane contract).
+        assert_eq!(m.server_path, "/gone/custom/llama-server");
+    }
+
+    #[test]
+    fn unit__anchor_server_path__empty_path_stays_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data/blazar");
+        let mut m = bare_manifest("");
+        m.anchor_server_path(&data);
+        assert_eq!(m.server_path, "");
     }
 
     #[test]

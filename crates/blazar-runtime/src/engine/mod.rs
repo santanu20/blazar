@@ -1827,6 +1827,9 @@ impl EngineManager {
                 tracing::debug!(target: "blazar::engine", "registered whisper {tag} ({asset_label})");
             }
         }
+        // Storage invariant: rows carry data-dir-relative server paths
+        // (out-of-tree paths pass through untouched).
+        m.relativize_server_path(&self.dirs.data_dir);
         let row = EngineRow {
             tag: tag.to_string(),
             asset: asset_label.to_string(),
@@ -2093,33 +2096,36 @@ impl EngineManager {
     }
 
     /// Supersede step (a): heal relocated engine rows in place. The
-    /// manifest's re-root logic only mutates the decoded copy, so a row
+    /// manifest's re-anchor logic only mutates the decoded copy, so a row
     /// whose recorded data dir is gone would re-warn on every boot;
-    /// persisting the adopted path makes the relocation stick. No
-    /// network, no spawn — just an `exists` walk and, for stale rows
-    /// only, one manifest rewrite.
+    /// persisting the adopted path makes the relocation stick. Rows from
+    /// before the relative-storage invariant are folded to
+    /// `engines/<tag>/...` in the same pass. No network, no spawn — just
+    /// an `exists` walk and, for stale rows only, one manifest rewrite.
     fn re_root_engine_rows(&self, store: &Store) {
         let rows = store.list_engines().unwrap_or_default();
         for row in &rows {
             let Ok(mut manifest) = serde_json::from_str::<Manifest>(&row.manifest) else {
                 continue;
             };
-            if !manifest.re_root_server_path(&self.dirs.engines_dir()) {
+            let mut dirty = manifest.re_root_server_path(&self.dirs.engines_dir());
+            dirty |= manifest.relativize_server_path(&self.dirs.data_dir);
+            if !dirty {
                 continue;
             }
             match serde_json::to_string(&manifest)
-                .context("encode re-rooted manifest")
+                .context("encode re-anchored manifest")
                 .and_then(|encoded| {
                     store
                         .update_engine_manifest(&row.tag, &encoded)
-                        .context("persist re-rooted engine path")
+                        .context("persist re-anchored engine path")
                 }) {
                 Ok(()) => tracing::info!(
-                    "engine {} server path re-rooted and persisted (one-time)",
+                    "engine {} server path normalized and persisted (one-time)",
                     row.tag
                 ),
                 Err(e) => tracing::warn!(
-                    "engine {} re-rooted in memory but not persisted ({e:#})",
+                    "engine {} re-anchored in memory but not persisted ({e:#})",
                     row.tag
                 ),
             }
@@ -2386,7 +2392,13 @@ impl EngineManager {
         let mut referenced: std::collections::HashSet<PathBuf> = engines
             .iter()
             .filter_map(|e| serde_json::from_str::<Manifest>(&e.manifest).ok())
-            .map(|m| PathBuf::from(m.server_path))
+            .map(|mut m| {
+                // Relative storage form resolves against the live data
+                // dir before it joins the referenced set; legacy absolute
+                // paths heal via the same anchor.
+                m.anchor_server_path(&self.dirs.data_dir);
+                PathBuf::from(m.server_path)
+            })
             // A default/empty server_path would match every dir (all paths
             // start_with the empty component list) and disable the sweep.
             .filter(|p| !p.as_os_str().is_empty())
@@ -2531,7 +2543,7 @@ impl EngineManager {
         }
         // Probe under the configured engine env (e.g. GGML_BACKEND_PATH so
         // a CUDA build actually discovers its GPU).
-        let m = {
+        let mut m = {
             let prev: Vec<(String, String)> = extra_env
                 .iter()
                 .filter(|(k, _)| std::env::var_os(k).is_none())
@@ -2546,6 +2558,9 @@ impl EngineManager {
             }
             r?
         };
+        // Local lane: BLAZAR_ENGINE_PATH is user-owned and usually
+        // out-of-tree — relativize is a no-op there by design.
+        m.relativize_server_path(&self.dirs.data_dir);
         let row = EngineRow {
             tag: LOCAL_TAG.to_string(),
             asset: "local".into(),
@@ -2570,9 +2585,10 @@ impl EngineManager {
         };
         let mut m: Manifest = serde_json::from_str(&row.manifest)
             .with_context(|| format!("decode manifest for {}", row.tag))?;
-        m.re_root_server_path(&self.dirs.engines_dir());
+        m.anchor_server_path(&self.dirs.data_dir);
         Ok(Some(m))
     }
+
 }
 
 fn now_secs() -> i64 {

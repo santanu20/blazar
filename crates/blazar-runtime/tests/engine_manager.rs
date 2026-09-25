@@ -258,7 +258,8 @@ async fn integration__install_probe_activate_rollback_cycle() {
     // The stub banner reports STUB_BUILD 9999, but the install tag (b100)
     // is the authoritative build identity — same rule that overrides the
     // shallow-clone "build 1" artifact on source-built engines.
-    let m: Manifest = serde_json::from_str(&row.manifest).unwrap();
+    let mut m: Manifest = serde_json::from_str(&row.manifest).unwrap();
+    m.anchor_server_path(&dirs.data_dir);
     assert_eq!(m.build_number, 100, "tag build number is authoritative");
     assert_eq!(m.devices.len(), 1, "stub --list-devices GPU fixture");
     assert!(m.has_flag("--ctx-size"));
@@ -1046,14 +1047,15 @@ async fn integration__re_root_heal_persists_stale_engine_row() {
     mgr.refresh_supersede_state(0, &[]).await.unwrap();
 
     let healed = manifest_of(&store, "sglang-0.5.19");
+    // The walk heals to the live engines dir, then persists in the
+    // storage-invariant form: data-dir-relative.
     assert_eq!(
-        healed.server_path,
-        live_dir.join("sglang-server").display().to_string(),
-        "adopted path must point at the live engines dir"
+        healed.server_path, "engines/sglang-0.5.19/sglang-server",
+        "healed row must persist relative to the data dir"
     );
 
-    // Idempotent: the healed row decodes, the recorded path exists, and
-    // the pass leaves it byte-identical.
+    // Idempotent: the healed row decodes, anchors back to the live
+    // binary, and the pass leaves it byte-identical.
     mgr.refresh_supersede_state(0, &[]).await.unwrap();
     let again = manifest_of(&store, "sglang-0.5.19");
     assert_eq!(again.server_path, healed.server_path);
