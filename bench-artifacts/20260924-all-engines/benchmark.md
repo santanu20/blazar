@@ -1,10 +1,10 @@
 # Blazar benchmark matrix
 
-- **date**: 2026-09-24 23:21:17
+- **date**: 2026-09-25 01:25:35
 - **model**: `Qwen3.5-9B-Q4_K_M.gguf` (5417 MiB)
 - **gpu**: NVIDIA GeForce RTX 4070 Laptop GPU / driver 580.178.04
 - **engines**: b11147-cuda, b5130, inventory, master-890-74988b2, ollama-host, piper, v0.9.3
-- **harness**: bench_matrix v2 — `--blazar-bin target/release/blazar --model Qwen3.5-9B --providers direct blazar ollama --conc-sweep 1,2,4,8 --conc-rounds 3 --skip-media --artifacts-dir bench-artifacts/20260924-all-engines --md BENCHMARK.md`
+- **harness**: bench_matrix v2 — `--blazar-bin target/release/blazar --model Qwen3.5-9B --providers blazar --skip-media --skip-ppl --skip-ctxcurve --skip-tools --skip-greedy --artifacts-dir bench-artifacts/20260924-all-engines --md BENCHMARK.md`
 - **blazar**: `blazar 0.11.0` (sandbox daemon binary)
 - all blazar-owned rows measured by `blazar 0.11.0`
 
@@ -23,6 +23,7 @@
 - spec=ngram-simple (`b11147-cuda`): decode -2.4% vs baseline
 - mmproj=True (`b11147-cuda`): decode -1.7% vs baseline
 - gateway greedy transparency (`b11147-cuda`): 20/20 exact vs same-engine direct — transparent.
+- 1 cell(s) aborted on ENVIRONMENT guards (GPU/RAM co-residency), not product behavior — see Failed cells.
 
 ## Speed (serving, streaming)
 
@@ -154,6 +155,10 @@
 - `v0.9.3` / direct / {'ctx': 16384, 'np': 1}: child exited rc=1 during load; last output: Error: Num GPU blocks is 0. This means there is not enough memory. Either reduce the memory amount/utilization/context size or disable PagedAttention. | 
 - `v0.9.3` / direct / {'ctx': 16384, 'np': 4}: child exited rc=1 during load; last output: Error: Num GPU blocks is 0. This means there is not enough memory. Either reduce the memory amount/utilization/context size or disable PagedAttention. | 
 - `v0.9.3` / ppl / {'ppl': 2048}: llama-perplexity is llama-server-family only
+
+**environment** (box/co-residency guards — NOT blazar defects):
+
+- `v0.9.3` / reshape / {'reshape': True}: reshape cell crashed: MemAvailable 6986 MiB < needed ~7795 MiB (model 5417 MiB + headroom). A co-resident blazar/ollama engine is likely holding memory: stop it for the validation window.
 
 ## Reading this report
 

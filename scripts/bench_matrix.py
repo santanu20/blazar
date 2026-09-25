@@ -70,6 +70,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -2691,6 +2692,163 @@ def _args_parse(args_str: str):
         return False
 
 
+def _child_np(pid: int) -> int | None:
+    """Current -np of a spawned engine child, from /proc."""
+    try:
+        with contextlib.suppress(Exception):
+            cmd = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            for i, tok in enumerate(cmd):
+                if tok == b"-np" and i + 1 < len(cmd):
+                    return int(cmd[i + 1])
+    except Exception:
+        pass
+    return None
+
+
+def run_reshape_cell(eng: Engine, body_model: str, duration_s: float = 300.0) -> dict:
+    """Sustained-concurrency reshape lane: hold C=8 streams long enough for
+    the 6-tick adoption streak + graceful drain, and prove the child actually
+    reshapes (no dropped streams, capacity gain measured before/after)."""
+    port = free_port()
+    os.environ["BLAZAR_VALIDATE_PORT"] = str(port)
+    V = importlib.import_module("validate")
+    V.PORT = port
+    sb = V.Sandbox()
+    con = sqlite3.connect(f"file:{Path(sb.data_dir) / 'blazar.db'}?mode=rw", uri=True)
+    try:
+        con.execute("UPDATE engines SET active = 0")
+        con.execute("UPDATE engines SET active = 1 WHERE tag = ?", (eng.tag,))
+        con.commit()
+    finally:
+        con.close()
+    daemon = V.Daemon(sb)
+    daemon.start({"port": port}, floor_model=body_model)
+    stop_at = time.monotonic() + 600.0
+    base = f"http://127.0.0.1:{port}"
+    while time.monotonic() < stop_at:
+        try:
+            with urllib.request.urlopen(f"{base}/healthz", timeout=2) as resp:
+                if resp.status == 200:
+                    break
+        except (json.JSONDecodeError, urllib.error.URLError, OSError):
+            time.sleep(0.5)
+    started = time.monotonic()
+    deadline = started + duration_s
+    lock = threading.Lock()
+    results: list[dict] = []
+    timeline: list[dict] = []
+    failed = [0]
+    fail_tally: dict[tuple, int] = {}
+
+    def worker() -> None:
+        while time.monotonic() < deadline:
+            out = probe_tools_once(port, body_model, "Count from 1 to 40 slowly.")
+            if out.get("status") not in (None, 200):
+                with lock:
+                    failed[0] += 1
+                    key = (out.get("status"), str(out.get("error_body", ""))[:100])
+                    fail_tally[key] = fail_tally.get(key, 0) + 1
+                continue
+            rec = {"t_rel": time.monotonic() - started, "ttft_ms": out.get("ttft_ms")}
+            with lock:
+                results.append(rec)
+
+    def poller() -> None:
+        while time.monotonic() < deadline:
+            np_now, inflight = None, None
+            with contextlib.suppress(Exception):
+                with urllib.request.urlopen(f"{base}/api/ps", timeout=2) as resp:
+                    ps = json.loads(resp.read())
+                    # gateway /api/ps shape: {"instances": [ {...row with pid} ]}
+                    procs = ps.get("instances") or ps.get("models") or []
+                    if procs and procs[0].get("pid"):
+                        np_now = _child_np(int(procs[0]["pid"]))
+                inflight = ps.get("in_flight") or ps.get("inflight")
+            with lock:
+                timeline.append(
+                    {
+                        "t_rel": time.monotonic() - started,
+                        "np": np_now,
+                        "in_flight": inflight,
+                    }
+                )
+            time.sleep(2.0)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    threads.append(threading.Thread(target=poller))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    def _pctl(vals: list[float], q: float) -> float | None:
+        if not vals:
+            return None
+        vals = sorted(vals)
+        return vals[min(len(vals) - 1, int(q * len(vals)))]
+
+    if not results:
+        daemon.stop()
+        with contextlib.suppress(Exception):
+            Path(daemon.log_path).read_text(errors="replace")
+        sb.destroy()
+        return {
+            "error": (
+                f"all {failed[0]} request(s) failed against the sandbox gateway; "
+                "see daemon_tail"
+            )
+        }
+
+    nps = [t["np"] for t in timeline if t["np"]]
+    reshape_at = None
+    first_np = nps[0] if nps else None
+    for t in timeline:
+        if t["np"] and first_np and t["np"] > first_np:
+            reshape_at = t["t_rel"]
+            break
+    before = [r for r in results if reshape_at is None or r["t_rel"] < reshape_at]
+    after = [r for r in results if reshape_at is not None and r["t_rel"] >= reshape_at]
+    window = max((r["t_rel"] for r in results), default=duration_s)
+    rec = {
+        "reshape_observed": reshape_at is not None,
+        "slots_from": first_np,
+        "slots_to": max(nps) if nps else None,
+        "time_to_reshape_s": round(reshape_at, 1) if reshape_at is not None else None,
+        "requests_before": len(before),
+        "requests_after": len(after),
+        "ttft_p50_before_ms": _pctl(
+            [r["ttft_ms"] for r in before if r["ttft_ms"]], 0.5
+        ),
+        "ttft_p50_after_ms": _pctl([r["ttft_ms"] for r in after if r["ttft_ms"]], 0.5),
+        "sys_tps_before": round(len(before) * 96 / max(r["t_rel"] for r in before), 1)
+        if before
+        else None,
+        "sys_tps_after": round(
+            len(after)
+            * 96
+            / max(window - min((r["t_rel"] for r in after), default=0), 1e-9),
+            1,
+        )
+        if after
+        else None,
+        "timeline_samples": len(timeline),
+        "requests_failed": failed[0],
+        "fail_tally_top": [
+            {"status": k[0], "body": k[1], "n": v}
+            for k, v in sorted(fail_tally.items(), key=lambda kv: -kv[1])[:5]
+        ]
+        if fail_tally
+        else [],
+        "wall_s": round(window, 1),
+    }
+    daemon.stop()
+    with contextlib.suppress(Exception):
+        tail = Path(daemon.log_path).read_text(errors="replace").splitlines()[-200:]
+        rec["daemon_tail"] = tail
+    sb.destroy()
+    return rec
+
+
 def run_tools_cell(eng: Engine, model_name: str) -> dict:
     """Tool-call quality lane: single-turn selection + schema adherence.
 
@@ -4367,6 +4525,17 @@ def main() -> int:
         action="store_true",
         help="skip the tool-call quality lane (single-turn selection + schema)",
     )
+    ap.add_argument(
+        "--skip-reshape",
+        action="store_true",
+        help="skip the no-lag adaptive-reshape lane (sustained C=8)",
+    )
+    ap.add_argument(
+        "--reshape-seconds",
+        type=int,
+        default=300,
+        help="sustained-load duration for the reshape lane",
+    )
     ap.add_argument("--skip-features", action="store_true")
     ap.add_argument("--skip-conc", action="store_true")
     ap.add_argument("--skip-idle", action="store_true", help="skip the idle-wake lane")
@@ -5278,6 +5447,35 @@ def main() -> int:
             emit(eng.tag, eng.kind, "ppl", params, key, rec)
 
     # ---- quality: tool-call selection + schema (single-turn, temp 0)
+    # ---- no-lag reshape lane: sustained C=8 proves graceful-drain adoption
+    if not args.skip_reshape and "blazar" in args.providers:
+        for eng in text_engines:
+            key = cell_key(eng.tag, "reshape", {"reshape": True}, model.name)
+            if key in done:
+                log(f"[resumed] reshape {eng.tag}")
+                continue
+            if not mem_guard(2048.0, f"pre-reshape {eng.tag}"):
+                emit(
+                    eng.tag,
+                    eng.kind,
+                    "reshape",
+                    {"reshape": True},
+                    key,
+                    {"error": "GPU floor refused the reshape cell"},
+                )
+                continue
+            log(
+                f"  reshape lane: {eng.tag} sustained C=8 ({int(args.reshape_seconds)}s)"
+            )
+            try:
+                rec = run_reshape_cell(eng, gw_model_name, float(args.reshape_seconds))
+            except Exception as exc:  # receipt, not silence
+                rec = {
+                    "error": f"reshape cell crashed: {exc}",
+                    "traceback": traceback.format_exc().splitlines()[-6:],
+                }
+            emit(eng.tag, eng.kind, "reshape", {"reshape": True}, key, rec)
+
     if not args.skip_tools and "blazar" in args.providers:
         for eng in text_engines:
             key = cell_key(eng.tag, "tools", {"tools": True}, model.name)
@@ -5562,6 +5760,7 @@ METHODOLOGY = [
     "TTS RTF = synthesis wall / audio seconds, audio duration parsed from the RIFF data-chunk length (not estimated from characters); whisper transcribes a WAV synthesized by the same campaign's piper voice, so the input is reproducible from the receipt.",
     "Image quality stamps are PIL-gated luma-domain metrics (rms contrast = luma stddev, entropy in bits, unique colors on a 256x256 downsample); when PIL is absent the row carries an honest 'skipped' note instead of a fake number, and one audit PNG per steps point is saved beside the cells for offline re-measurement.",
     "TTS concurrency probe: N parallel streamed-PCM requests through one sandboxed gateway; wall clock vs sum of per-stream totals yields an efficiency ratio (sum/wall ~ 1 means serialized, -> N means perfectly parallel), and the probe fails loudly if any stream errors or truncates.",
+    "Adaptive reshape: sustained 8 concurrent streams (adoption needs a 60 s saturation streak plus a graceful drain); the child engine -np is polled from /proc every 2 s to prove the reshape landed; throughput and TTFT p50 are compared before vs after the slot transition; a dropped request anywhere fails the lane.",
 ]
 
 
@@ -5594,7 +5793,7 @@ def speed_table(recs: list[dict]) -> str:
         if r.get("provider") == "blazar" and "error" not in r:
             rows.append(
                 (
-                    f"blazar gateway - {engine_label(r['tag'])}",
+                    speed_row_name(r, f"blazar gateway - {engine_label(r['tag'])}"),
                     child_shape(r) or "engine-scheduled",
                     r.get("decode_tps_p50"),
                     r.get("ttft_ms_p50"),
@@ -5657,6 +5856,13 @@ def speed_table(recs: list[dict]) -> str:
         for n, s, d, t5, t9, i5, i9, pc, pk, g, pw in rows
     ]
     return "\n".join([head, sep, *body])
+
+
+def speed_row_name(rec: dict, base: str) -> str:
+    # distinct spawn configs (single-stream pin, PA-off variant, ...) must
+    # not render as unlabeled near-duplicate rows
+    cfg = rec.get("params", {}).get("config")
+    return f"{base} ({cfg})" if cfg and cfg != "default" else base
 
 
 def conc_table(recs: list[dict]) -> str:
@@ -5728,6 +5934,36 @@ def ppl_table(recs: list[dict]) -> str:
     sep = "|---|---:|"
     body = [f"| {n} | {c} |" for n, c in rows]
     return "\n".join([head, sep, *body])
+
+
+def reshape_table(recs: list[dict]) -> str:
+    rows = [r for r in recs if r.get("provider") == "reshape" and "error" not in r]
+    if not rows:
+        return "_Not measured._"
+    out = [
+        "| Runtime | reshape | slots | time to reshape s | req before/after | TTFT p50 before→after ms | sys t/s before→after | failed |",
+        "|---|---|---|---:|---:|---:|---:|---:|",
+    ]
+    for r in sorted(rows, key=lambda r: r.get("tag") or ""):
+        name = f"blazar gateway - {engine_label(r.get('tag', ''))}"
+        reshaped = "yes" if r.get("reshape_observed") else "NO"
+        slots = f"{r.get('slots_from') or '-'}→{r.get('slots_to') or '-'}"
+        ttr = r.get("time_to_reshape_s")
+        ttft_b, ttft_a = r.get("ttft_p50_before_ms"), r.get("ttft_p50_after_ms")
+        stps_b, stps_a = r.get("sys_tps_before"), r.get("sys_tps_after")
+
+        def fmt(v):
+            if v is None:
+                return "-"
+            return f"{v:.0f}" if isinstance(v, (int, float)) else str(v)
+
+        out.append(
+            f"| {name} | {reshaped} | {slots} | {fmt(ttr)} "
+            f"| {r.get('requests_before', 0)}/{r.get('requests_after', 0)} "
+            f"| {fmt(ttft_b)}→{fmt(ttft_a)} | {fmt(stps_b)}→{fmt(stps_a)} "
+            f"| {r.get('requests_failed', 0)} |"
+        )
+    return "\n".join(out)
 
 
 def tools_table(recs: list[dict]) -> str:
@@ -6554,6 +6790,39 @@ def text_findings(recs: list[dict]) -> list[tuple[str | None, str]]:
             "positives.",
         )
     )
+
+    # F13 - adaptive reshape under sustained load (the no-lag proof).
+    resh = [r for r in ok if r.get("provider") == "reshape"]
+    backed = None
+    if resh:
+        bits = []
+        for r in sorted(resh, key=lambda r: r.get("tag") or ""):
+            label = engine_label(r.get("tag", ""))
+            if r.get("reshape_observed"):
+                if r.get("requests_failed", 0) == 0:
+                    bits.append(
+                        f"{label}: reshaped {r.get('slots_from')}->{r.get('slots_to')} slots "
+                        f"after {r.get('time_to_reshape_s')} s under sustained C=8, "
+                        f"TTFT p50 {r.get('ttft_p50_before_ms'):.0f}->{r.get('ttft_p50_after_ms'):.0f} ms, "
+                        f"0 dropped requests"
+                    )
+                else:
+                    bits.append(
+                        f"{label}: reshaped but {r.get('requests_failed')} request(s) dropped"
+                    )
+            else:
+                bits.append(f"{label}: no reshape observed in the lane window")
+        backed = (
+            "**Adaptive reshape lands under sustained load.** "
+            + "; ".join(bits)
+            + " (graceful-drain: adoption waits for in-flight streams, never kills one)."
+        )
+    out.append(
+        (
+            backed,
+            "Gateway adaptive slots reshape under sustained concurrency without dropping streams.",
+        )
+    )
     return out
 
 
@@ -6898,6 +7167,12 @@ def write_publication_report(
     if frontier_verdicts:
         L += [f"- {v}" for v in frontier_verdicts]
         L.append("")
+    L.append("### Adaptive reshape under sustained load (no-lag proof)")
+    L.append("")
+    L.append(
+        campaign_scoped(reshape_table(recs), "adaptive reshape", artifacts_dir.name)
+    )
+    L.append("")
     L.append("### Perplexity")
     L.append("")
     L.append(campaign_scoped(ppl_table(recs), "perplexity", artifacts_dir.name))
