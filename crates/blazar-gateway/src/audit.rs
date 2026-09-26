@@ -1,5 +1,6 @@
-//! E4 audit log: one JSON line per GENERATION request (chat lanes only)
-//! appended to `<data>/log/audit.jsonl` when `audit_log = true`.
+//! E4 audit log: one JSON line per GENERATION request (all generation
+//! lanes — text chat, images, video, audio) appended to
+//! `<data>/log/audit.jsonl` when `audit_log = true`.
 //!
 //! Compliance-shaped (who/what/how-long), not a prompt dumper: the line
 //! records identity and outcome — key name, model, status, latency,
@@ -16,14 +17,26 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 /// Generation lanes audited. Management, health, key and metric routes
-/// are deliberately excluded — they carry no tokens.
-pub const AUDITED_PATHS: [&str; 6] = [
+/// are deliberately excluded — they carry no tokens. Media lanes carry
+/// no tokens either, but they ARE generation lanes, so they audit too
+/// (multipart bodies just record `model: null` — `extract_model` is
+/// JSON-only; the non-`/v1` `/audio/*` routes are aliases of the same
+/// lanes). (Audit MM2: previously chat-only.)
+pub const AUDITED_PATHS: [&str; 14] = [
     "/api/chat",
     "/api/generate",
     "/v1/chat/completions",
     "/v1/completions",
     "/v1/messages",
     "/v1/responses",
+    "/v1/images/generations",
+    "/v1/images/edits",
+    "/v1/videos/generations",
+    "/v1/audio/transcriptions",
+    "/audio/transcriptions",
+    "/v1/audio/translations",
+    "/audio/translations",
+    "/v1/audio/speech",
 ];
 
 /// Bodies above this size skip the `model` extraction buffer (the line
@@ -186,6 +199,34 @@ mod tests {
             Some(AUDIT_BODY_SNIFF_LIMIT as u64 + 1)
         ));
         assert!(should_sniff(&post, "/v1/messages", None)); // chunked: unknown
+    }
+
+    #[test]
+    fn unit__audit__generation_lanes_all_audited() {
+        // Audit MM2: every generation lane — text AND media — must be in
+        // the audited set. A lane missing here = invisible in audit.jsonl.
+        for path in [
+            "/v1/images/generations",
+            "/v1/images/edits",
+            "/v1/videos/generations",
+            "/v1/audio/transcriptions",
+            "/audio/transcriptions", // non-/v1 alias
+            "/v1/audio/translations",
+            "/audio/translations", // non-/v1 alias (audit MM16)
+            "/v1/audio/speech",
+        ] {
+            assert!(
+                AUDITED_PATHS.contains(&path),
+                "generation lane {path} missing from AUDITED_PATHS"
+            );
+            assert!(
+                should_sniff(&axum::http::Method::POST, path, Some(128)),
+                "{path} must sniff"
+            );
+        }
+        // Read-only surfaces stay out.
+        assert!(!AUDITED_PATHS.contains(&"/v1/images/capabilities"));
+        assert!(!AUDITED_PATHS.contains(&"/v1/audio/jobs/{id}"));
     }
 
     #[test]

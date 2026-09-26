@@ -48,6 +48,10 @@
 #                              qwen2.5:0.5b) — opt-in, never defaulted
 #   BLAZAR_SYSTEM_BIN_DIR     binary destination (default /usr/local/bin)
 #   BLAZAR_SERVICE_USER/GROUP unit user/group (default: invoking user)
+#   BLAZAR_SERVICE_DATA_DIR   unit WorkingDirectory + ownership-heal
+#                              target (default: the service user's
+#                              ~/.local/share/blazar; test redirection
+#                              knob, like BLAZAR_UNIT_PATH)
 #   GITHUB_TOKEN               optional API token (rate limits, private repos)
 
 # Wrap everything in main() so a truncated partial download cannot execute
@@ -586,12 +590,17 @@ install_system() {
     $SUDO mkdir -p "$BIN_DIR" || error "cannot create ${BIN_DIR} (need sudo?)"
     # Replace a possibly-running binary without ETXTBSY: temp file + rename
     # (the running process keeps its inode; new execs get the new binary).
+    # Unique temp name per run (mktemp): a leftover temp from an earlier
+    # failed install (pid-recycled $$.suffix, or a full-disk partial copy)
+    # must never be renamed into place as the installed binary.
     # Root-owned like ollama when we have root; plain install otherwise
     # (mirrors/tests run through a pass-through "sudo").
-    $SUDO install -o0 -g0 -m0755 "$1" "$BIN_DIR/blazar.new.$$" 2>/dev/null ||
-    $SUDO install -m0755 "$1" "$BIN_DIR/blazar.new.$$" ||
-    error "install to ${BIN_DIR} failed"
-    $SUDO mv -f "$BIN_DIR/blazar.new.$$" "$BIN_DIR/blazar"
+    NEW_BIN=$($SUDO mktemp "$BIN_DIR/blazar.new.XXXXXX") ||
+        error "cannot create temp file in ${BIN_DIR} (disk full?)"
+    $SUDO install -o0 -g0 -m0755 "$1" "$NEW_BIN" 2>/dev/null ||
+    $SUDO install -m0755 "$1" "$NEW_BIN" ||
+        { $SUDO rm -f "$NEW_BIN"; error "install to ${BIN_DIR} failed"; }
+    $SUDO mv -f "$NEW_BIN" "$BIN_DIR/blazar"
     # A user-started daemon owns the port; the unit would crash-loop.
     PIDFILE="$USER_HOME/.local/share/blazar/run/blazar.pid"
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
@@ -627,6 +636,19 @@ install_system() {
         MEMORY_HIGH="${BLAZAR_UNIT_MEMORY_HIGH-85%}"
         MH_LINE=
         [ -n "$MEMORY_HIGH" ] && MH_LINE="MemoryHigh=$MEMORY_HIGH"
+        SVC_HOME=$(getent passwd "$SVC_USER" | cut -d: -f6)
+        # Knob mirrors BLAZAR_UNIT_PATH/BLAZAR_SYSTEM_BIN_DIR: hermetic
+        # tests redirect the service data dir away from the real home.
+        SVC_DATA_DIR="${BLAZAR_SERVICE_DATA_DIR:-${SVC_HOME}/.local/share/blazar}"
+        $SUDO mkdir -p "$SVC_DATA_DIR"
+        # The unit runs unprivileged as SVC_USER, and the daemon must
+        # create run/, locks and pull models inside this tree. The mkdir
+        # above ran as root — and past sudo-run daemons may have left
+        # root-owned files deeper down — so hand the whole tree to the
+        # service user unconditionally (metadata-only, cheap even on
+        # large model stores). Without this the daemon dies with EACCES
+        # on its first write and systemd restart-loops it.
+        $SUDO chown -R "$SVC_USER:$SVC_GROUP" "$SVC_DATA_DIR"
         $SUDO mkdir -p "$(dirname "$UNIT_PATH")"
         UNIT=$(cat <<EOF
 [Unit]
@@ -638,8 +660,17 @@ Wants=network-online.target
 ExecStart=${BIN_DIR}/blazar serve
 User=${SVC_USER}
 Group=${SVC_GROUP}
+# Engine children inherit the daemon cwd; upstream binaries that walk
+# relative paths must never start at the filesystem root (symlink
+# loops under /run).
+WorkingDirectory=${SVC_DATA_DIR}
 ${SG_LINE}
 ${MH_LINE}
+# Tag the journal stream so `journalctl -t blazar` keeps matching after
+# a journal rotation strands the original stream fd. The daemon's
+# durable log is run/daemon.log (owned + rotated by the daemon itself);
+# journald is the secondary sink.
+SyslogIdentifier=blazar
 Restart=always
 RestartSec=3
 # blazar serve exits 3 on hard singleton conflicts — another server
@@ -710,7 +741,7 @@ EOF
     # BLAZAR_INSTALL_MODEL=<repo> (pull lane, opt-in — model choice is
     # the user's call, not the installer's).
     if [ "${BLAZAR_INSTALL_ENGINE:-1}" != 0 ] &&
-       ! as_user "$BIN_DIR/blazar" engine list 2>/dev/null | grep -q '\[active\]'; then
+       ! as_user "$BIN_DIR/blazar" engine list --json 2>/dev/null | grep -q '"active": *true'; then
         status "bootstrapping llama.cpp engine (blazar engine update — largest download of this install)..."
         if as_user "$BIN_DIR/blazar" engine update --no-gate; then
             status "engine bootstrap complete"
@@ -726,6 +757,8 @@ EOF
     status "other engines, one command each:"
     status "  blazar engine install --kind sglang     # SGLang: safetensors lane, best quality + batching (Linux + NVIDIA, ~6 GiB)"
     status "  blazar engine install --kind mistralrs  # mistral.rs: GGUF + safetensors (~0.8 GiB)"
+    status "  blazar engine install --kind sdcpp      # sd.cpp: diffusion + video checkpoints — Qwen-Image/FLUX/Z-Image/Chroma/SDXL/SD1.5/Wan 2.1 T2V (any GPU via Vulkan, ~0.04-0.3 GiB)"
+    status "  blazar engine install --kind whisper    # whisper: audio transcription + translation (CPU, ~10 MiB; ggml models)"
     status "  blazar engine list                      # what is installed; blazar engine use <tag> switches the serving engine"
     # Fresh-install start, deferred until the engine exists (see the
     # enable block above). Started even when bootstrap failed: a running

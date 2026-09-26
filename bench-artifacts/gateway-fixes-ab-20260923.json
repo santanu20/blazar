@@ -1,0 +1,23 @@
+{
+  "what": "gateway review-fixes A/B \u2014 installed 0.10.0 release daemon vs HEAD+8-fixes debug build",
+  "date": "2026-09-23",
+  "box": "RTX 4070 Laptop 8GB, 16 cores, qwen2.5-0.5b GGUF, num_predict=200, temp=0, 3 runs after 1 warmup, /api/chat non-stream",
+  "installed_0_10_0_11435": {
+    "runs_tps": [
+      325.2,
+      340.8,
+      353.9
+    ],
+    "median": 340.8
+  },
+  "head_8fixes_21435": {
+    "runs_tps": [
+      352.4,
+      353.5,
+      359.2
+    ],
+    "median": 353.5,
+    "delta_pct": 3.7
+  },
+  "verdict": "no regression; floor improved (min run 325.2 -> 352.4); prefill identical (~3ms)"
+}

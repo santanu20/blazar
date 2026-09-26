@@ -85,6 +85,11 @@ pub fn remove_model(dirs: &BlazarDirs, name: &str) -> Result<()> {
     if let Some(mm) = &row.mmproj_path {
         files.push(PathBuf::from(mm));
     }
+    // Diffusion component set (sdcpp lane): VAE / text-encoder(s) /
+    // vision files ride the row exactly like the mmproj sidecar does.
+    for component in &row.components {
+        files.push(PathBuf::from(&component.path));
+    }
 
     // Shared-asset guard: aliases reference the SAME mmproj (and are
     // hardlinks of the same weights). Deleting this row must never
@@ -99,6 +104,7 @@ pub fn remove_model(dirs: &BlazarDirs, name: &str) -> Result<()> {
             if let Some(mm) = m.mmproj_path {
                 v.push(mm);
             }
+            v.extend(m.components.iter().map(|c| c.path.clone()));
             v
         })
         .collect();
@@ -406,9 +412,16 @@ fn adopt_gguf(
     let meta = match blazar_core::read_metadata_file(&path) {
         Ok(m) => m,
         Err(e) => {
-            report
-                .skipped
-                .push((label, format!("not a readable GGUF: {e}")));
+            // 0-KV GGUFs are diffusion/model-component files (image-repo
+            // DiT/VAE/encoder splits). Adopting them as text models would
+            // mint rows no engine can serve; the honest outcome is a skip
+            // whose reason names the lane they actually belong to.
+            let reason = if e.to_string().contains("missing general.architecture") {
+                "diffusion/model-component GGUF (no architecture metadata) — pull it through a diffusion family instead: blazar pull <qwen-image-repo>:QUANT (sdcpp lane)".to_string()
+            } else {
+                format!("not a readable GGUF: {e}")
+            };
+            report.skipped.push((label, reason));
             return;
         }
     };
@@ -451,6 +464,9 @@ fn adopt_gguf(
         // Re-linked deterministically from the pull-convention prefix
         // when possible; bare projectors are never guessed.
         mmproj_path,
+        // Reconcile adopts parsed GGUFs only; diffusion component sets
+        // (0-metadata files) never reach here — they arrive via pull.
+        components: vec![],
         shards: i64::try_from(leaves.len()).unwrap_or(i64::MAX),
         arch: Some(meta.architecture.clone()),
         params: Some(crate::hf::est_params(bytes, &quant)),
@@ -471,28 +487,51 @@ fn adopt_gguf(
 
 /// Adopt a safetensors model dir (`<name>.d`) at its existing location,
 /// mirroring the pull lane's row dialect.
-/// Pick the projector sidecar belonging to a pull-convention GGUF.
+/// Pick the projector sidecar belonging to a GGUF, in two rungs:
 ///
-/// Pull stores model and projector under the same `owner--repo--` prefix;
-/// that shared prefix is the only disk-surviving proof of the pairing, so
-/// it is the only one reconcile trusts. Bare names (`mmproj-F16.gguf`)
-/// carry no repo signal and stay unattached (import `--mmproj` is the
-/// manual path for those).
+/// 1. Pull convention: model and projector stored under the same
+///    `owner--repo--` prefix — the only disk-surviving proof of the
+///    pairing for that dialect.
+/// 2. Publisher filenames: the projector names the model verbatim
+///    (`mmproj-Qwen3VL-8B-Instruct-F16` beside
+///    `Qwen3VL-8B-Instruct-Q4_K_M`). The model stem minus its quant
+///    tail token is the identity; a UNIQUE unattached sidecar whose
+///    name contains it links. Two or more candidates (or a stem too
+///    short to be an identity) attach none — the same never-guessed
+///    rule bare sidecars without any stem signal already follow.
+///
+/// A sidecar attaches to at most one row (`attached`); quant siblings
+/// sharing one projector resolve to the first row in list order.
 fn match_sidecar_for(
     leaf: &str,
     sidecars: &[String],
     attached: &mut HashSet<String>,
 ) -> Option<String> {
     let parts: Vec<&str> = leaf.split("--").collect();
-    if parts.len() < 3 {
-        return None; // bare or non-pull name — no repo prefix to match
+    if parts.len() >= 3 {
+        let prefix = format!("{}--{}--", parts[0], parts[1]);
+        if let Some(hit) = sidecars
+            .iter()
+            .find(|s| s.starts_with(&prefix) && !attached.contains(*s))
+        {
+            attached.insert(hit.clone());
+            return Some(hit.clone());
+        }
     }
-    let prefix = format!("{}--{}--", parts[0], parts[1]);
-    let hit = sidecars
+    let stem = leaf.strip_suffix(".gguf").unwrap_or(leaf);
+    let core = stem
+        .rsplit_once('-')
+        .map_or(stem, |(head, _)| head)
+        .to_lowercase();
+    if core.len() < 4 {
+        return None; // too short to be an identity, only a coincidence
+    }
+    let mut hits = sidecars
         .iter()
-        .find(|s| s.starts_with(&prefix) && !attached.contains(*s))?;
+        .filter(|s| !attached.contains(*s) && s.to_lowercase().contains(&core));
+    let hit = hits.next().filter(|_| hits.next().is_none())?.clone();
     attached.insert(hit.clone());
-    Some(hit.clone())
+    Some(hit)
 }
 
 fn adopt_dir(
@@ -552,6 +591,7 @@ fn adopt_dir(
         bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
         sha256: None,
         mmproj_path: None,
+        components: vec![],
         shards: i64::try_from(weights.len()).unwrap_or(i64::MAX),
         arch: (!meta.architecture.is_empty()).then(|| meta.architecture.clone()),
         params: Some(crate::hf::est_params(bytes, &quant)),
@@ -708,6 +748,10 @@ pub fn copy_model(dirs: &BlazarDirs, src: &str, dst: &str) -> Result<()> {
         bytes: row.bytes,
         sha256: row.sha256.clone(),
         mmproj_path: row.mmproj_path.clone(),
+        // Component-set assets are shared references (read-only weights,
+        // hardlink-friendly), not per-row copies: the duplicate points at
+        // the same VAE/TE files.
+        components: row.components.clone(),
         shards: row.shards,
         arch: row.arch.clone(),
         params: row.params,
@@ -763,6 +807,7 @@ mod tests {
                 bytes: 2,
                 sha256: None,
                 mmproj_path: Some(d.join("mmproj-m.gguf").display().to_string()),
+                components: vec![],
                 shards: 2,
                 arch: None,
                 params: None,
@@ -776,6 +821,84 @@ mod tests {
         assert!(!d.join("m-q4_k_m-00001-of-00002.gguf").exists());
         assert!(!d.join("m-q4_k_m-00002-of-00002.gguf").exists());
         assert!(!d.join("mmproj-m.gguf").exists());
+    }
+
+    #[test]
+    fn unit__remove_model__component_set_deleted_unless_shared() {
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        std::fs::write(d.join("dit.gguf"), b"dit").unwrap();
+        std::fs::write(d.join("alias-dit.gguf"), b"dit2").unwrap();
+        std::fs::write(d.join("vae.safetensors"), b"vae").unwrap();
+        std::fs::write(d.join("te.gguf"), b"te").unwrap();
+        std::fs::write(d.join("vis.gguf"), b"vis").unwrap();
+        let store = Store::open(&dirs).unwrap();
+        let row = |name: &str, path: &str| blazar_core::ModelRow {
+            name: name.into(),
+            repo: "o/qwen-image".into(),
+            quant: "Q4_K_M".into(),
+            path: path.into(),
+            bytes: 3,
+            sha256: None,
+            mmproj_path: None,
+            components: vec![
+                blazar_core::store::ComponentFile::new(
+                    "--vae",
+                    &d.join("vae.safetensors").display().to_string(),
+                ),
+                blazar_core::store::ComponentFile::new(
+                    "--llm",
+                    &d.join("te.gguf").display().to_string(),
+                ),
+                blazar_core::store::ComponentFile::new(
+                    "--llm_vision",
+                    &d.join("vis.gguf").display().to_string(),
+                ),
+            ],
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 1,
+        };
+        store
+            .upsert_model(&row("m", &d.join("dit.gguf").display().to_string()))
+            .unwrap();
+        // The alias shares ONLY the VAE; its own TE/vision slots are empty.
+        store
+            .upsert_model(&blazar_core::ModelRow {
+                name: "alias".into(),
+                repo: "o/qwen-image".into(),
+                quant: "Q4_K_M".into(),
+                path: d.join("alias-dit.gguf").display().to_string(),
+                bytes: 4,
+                sha256: None,
+                mmproj_path: None,
+                components: vec![blazar_core::store::ComponentFile::new(
+                    "--vae",
+                    &d.join("vae.safetensors").display().to_string(),
+                )],
+                shards: 1,
+                arch: None,
+                params: None,
+                ctx_train: None,
+                pulled_at: 1,
+            })
+            .unwrap();
+
+        remove_model(&dirs, "m").unwrap();
+        assert!(!d.join("dit.gguf").exists(), "DiT goes with its row");
+        assert!(!d.join("te.gguf").exists(), "unshared TE goes");
+        assert!(!d.join("vis.gguf").exists(), "unshared vision goes");
+        assert!(
+            d.join("vae.safetensors").exists(),
+            "VAE still referenced by `alias` must survive"
+        );
+        remove_model(&dirs, "alias").unwrap();
+        assert!(
+            !d.join("vae.safetensors").exists(),
+            "last ref owns the delete"
+        );
     }
 
     #[test]
@@ -795,6 +918,7 @@ mod tests {
                 bytes: 9,
                 sha256: None,
                 mmproj_path: None,
+                components: vec![],
                 shards: 1,
                 arch: None,
                 params: None,
@@ -825,6 +949,7 @@ mod tests {
                     bytes: 2,
                     sha256: None,
                     mmproj_path: None,
+                    components: vec![],
                     shards: 1,
                     arch: None,
                     params: None,
@@ -853,6 +978,7 @@ mod tests {
             bytes: 2,
             sha256: None,
             mmproj_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,
@@ -893,6 +1019,7 @@ mod tests {
             bytes: 10,
             sha256: None,
             mmproj_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,
@@ -954,6 +1081,7 @@ mod tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,
@@ -1141,6 +1269,33 @@ mod tests {
     }
 
     #[test]
+    fn unit__reconcile__kvless_component_gguf_skips_with_lane_teaching() {
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        // 0-metadata-KV GGUF: the diffusion DiT shape (0 KVs, N tensors).
+        let mut gguf = b"GGUF".to_vec();
+        gguf.extend_from_slice(&3u32.to_le_bytes());
+        gguf.extend_from_slice(&297u64.to_le_bytes());
+        gguf.extend_from_slice(&0u64.to_le_bytes());
+        std::fs::write(d.join("dit-q4_k_m.gguf"), &gguf).unwrap();
+        let store = Store::open(&dirs).unwrap();
+
+        let r = reconcile_models(&dirs, &store);
+        assert!(
+            r.adopted.is_empty(),
+            "component GGUF must not adopt: {:?}",
+            r.adopted
+        );
+        assert!(
+            r.skipped.iter().any(|(f, why)| f == "dit-q4_k_m.gguf"
+                && why.contains("diffusion/model-component")
+                && why.contains("sdcpp")),
+            "{:?}",
+            r.skipped
+        );
+    }
+
+    #[test]
     fn unit__reconcile__taken_name_falls_through_candidates_never_shadows() {
         let (_t, dirs) = setup();
         let d = dirs.models_dir();
@@ -1304,6 +1459,136 @@ mod tests {
         assert!(
             m.mmproj_path.is_none(),
             "bare sidecar has no repo signal — never guessed"
+        );
+    }
+
+    #[test]
+    fn unit__reconcile__stem_named_sidecar_links_bare_model() {
+        // Live shape from the 09-24 store audit: a publisher-filename
+        // GGUF adopted beside a projector that names the model verbatim.
+        // The stem minus its quant tail is the identity — that dialect
+        // must link at adopt time, not only via backfill.
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        write_gguf(
+            &d.join("Qwen3VL-8B-Instruct-Q4_K_M.gguf"),
+            "qwen3vl",
+            Some("Qwen3VL 8B Instruct"),
+        );
+        write_gguf(&d.join("mmproj-Qwen3VL-8B-Instruct-F16.gguf"), "clip", None);
+        let store = Store::open(&dirs).unwrap();
+
+        let r = reconcile_models(&dirs, &store);
+        assert_eq!(r.adopted.len(), 1, "{:?}", r.skipped);
+        let m = store.get_model("qwen3vl-8b-instruct").unwrap().unwrap();
+        assert_eq!(
+            m.mmproj_path.as_deref(),
+            Some(
+                d.join("mmproj-Qwen3VL-8B-Instruct-F16.gguf")
+                    .display()
+                    .to_string()
+                    .as_str()
+            ),
+            "stem-named sidecar links to the bare-named model"
+        );
+        // Second boot: stable, no reassignment churn.
+        let r2 = reconcile_models(&dirs, &store);
+        assert!(r2.adopted.is_empty() && r2.relinked.is_empty(), "{r2:?}");
+    }
+
+    #[test]
+    fn unit__reconcile__backfill_stem_sidecar_heals_bare_adopted_row() {
+        // The 09-24 live box: rows adopted as bare filenames years before
+        // the slugged sidecar landed beside them. The backfill pass must
+        // heal them through the stem dialect, not only the slug prefix.
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        write_gguf(
+            &d.join("Qwen3.5-9B-Q4_K_M.gguf"),
+            "qwen35",
+            Some("Qwen3.5 9B"),
+        );
+        write_gguf(
+            &d.join("unsloth--Qwen3.5-9B-GGUF--mmproj-F16.gguf"),
+            "clip",
+            None,
+        );
+        let store = Store::open(&dirs).unwrap();
+        let mut old = row(&d.join("Qwen3.5-9B-Q4_K_M.gguf"), "qwen3.5-9b");
+        old.repo = format!("adopted:{}", d.join("Qwen3.5-9B-Q4_K_M.gguf").display());
+        store.upsert_model(&old).unwrap();
+
+        let r = reconcile_models(&dirs, &store);
+        assert!(r.adopted.is_empty(), "{:?}", r.adopted);
+        assert_eq!(r.relinked, ["qwen3.5-9b"]);
+        let m = store.get_model("qwen3.5-9b").unwrap().unwrap();
+        assert_eq!(
+            m.mmproj_path.as_deref(),
+            Some(
+                d.join("unsloth--Qwen3.5-9B-GGUF--mmproj-F16.gguf")
+                    .display()
+                    .to_string()
+                    .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn unit__reconcile__ambiguous_stem_sidecars_attach_none() {
+        // Two projectors carry the same stem (F16 + Q8 variants): the
+        // stem dialect cannot pick between them, so it must pick neither.
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        write_gguf(
+            &d.join("Qwen2.5-VL-7B-Q4_K_M.gguf"),
+            "qwen2vl",
+            Some("Qwen2.5 VL 7B"),
+        );
+        write_gguf(&d.join("mmproj-Qwen2.5-VL-7B-F16.gguf"), "clip", None);
+        write_gguf(&d.join("mmproj-Qwen2.5-VL-7B-Q8_0.gguf"), "clip", None);
+        let store = Store::open(&dirs).unwrap();
+
+        let r = reconcile_models(&dirs, &store);
+        assert_eq!(r.adopted.len(), 1, "{:?}", r.skipped);
+        let m = store.get_model("qwen2.5-vl-7b").unwrap().unwrap();
+        assert!(
+            m.mmproj_path.is_none(),
+            "ambiguous stem candidates — neither is guessed"
+        );
+    }
+
+    #[test]
+    fn unit__reconcile__stem_sidecar_single_owner_across_quant_siblings() {
+        // Two quants of one base, one shared projector: exactly one row
+        // claims it (deterministic list order), the other stays bare,
+        // and later boots never reassign it.
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        write_gguf(
+            &d.join("Qwen3VL-8B-Q4_K_M.gguf"),
+            "qwen3vl",
+            Some("Qwen3VL 8B"),
+        );
+        write_gguf(
+            &d.join("Qwen3VL-8B-Q8_0.gguf"),
+            "qwen3vl",
+            Some("Qwen3VL 8B"),
+        );
+        write_gguf(&d.join("mmproj-Qwen3VL-8B-F16.gguf"), "clip", None);
+        let store = Store::open(&dirs).unwrap();
+
+        let r = reconcile_models(&dirs, &store);
+        assert_eq!(r.adopted.len(), 2, "{:?}", r.skipped);
+        let all = store.list_models().unwrap();
+        let with_mmproj: Vec<&_> = all.iter().filter(|m| m.mmproj_path.is_some()).collect();
+        assert_eq!(with_mmproj.len(), 1, "exactly one sibling owns the sidecar");
+        let r2 = reconcile_models(&dirs, &store);
+        assert!(r2.adopted.is_empty() && r2.relinked.is_empty(), "{r2:?}");
+        let all2 = store.list_models().unwrap();
+        assert_eq!(
+            all2.iter().filter(|m| m.mmproj_path.is_some()).count(),
+            1,
+            "ownership stable across boots"
         );
     }
 

@@ -56,6 +56,15 @@ pub async fn models(State(state): State<Arc<AppState>>) -> Response {
                 "owned_by": "blazar",
                 "created": m.pulled_at,
                 "engine": engine,
+                // Blazar-native modality discovery (audit MM13): mirrors
+                // the /api/show "vision" convention rather than guessing
+                // an upstream /v1/models field shape (upstream documents
+                // the capability in prose only, not a fixed schema).
+                "capabilities": if m.mmproj_path.is_some() {
+                    json!(["vision"])
+                } else {
+                    json!([])
+                },
             })
         })
         .collect();
@@ -117,6 +126,8 @@ pub async fn embeddings(
         crate::queue::WorkClass::Interactive,
         None,
         false, // embeddings: text-only
+        false, // text surface: diffusion rows teach the images lane
+        false,
     )
     .await
     {
@@ -321,12 +332,7 @@ pub async fn openai_proxy(
             if let Some(err) = state.sentinel.strict_tool_def_error_cached(&v) {
                 return openai_error(400, &format!("invalid tools: {err}"));
             }
-            let eff = state
-                .sup
-                .ps()
-                .into_iter()
-                .find(|p| p.name == model)
-                .map_or_else(|| state.config.effective_ctx(&model), |p| p.ctx);
+            let eff = crate::preflight::admission_ctx(&state, &model);
             if let Err(resp) = crate::preflight::enforce_prompt_fits(&state, &model, &v, eff).await
             {
                 return *resp;
@@ -383,6 +389,8 @@ pub async fn openai_proxy(
         parsed_body
             .as_ref()
             .is_some_and(|b| crate::proxy::body_needs_vision(b, false)),
+        false, // text surface: diffusion rows teach the images lane
+        false,
     )
     .await
     {
@@ -415,6 +423,19 @@ pub async fn openai_proxy(
         }
     }
 
+    // Single-flight BEFORE slot admission (chat lane): the bounded
+    // coalescing wait runs with NO InFlightGuard held, so identical
+    // duplicates don't occupy in_flight capacity while merely waiting
+    // for the leader. Followers take their slot after the leader
+    // finishes and ride the warm prefix.
+    let sf_gate = crate::proxy::sf_gate_before_admission(
+        &state,
+        &model_name,
+        &path_and_query(&uri),
+        &body,
+        parsed_body.as_ref(),
+    )
+    .await;
     // SLO: explicit deadline header + prefill-heavy body demotion feed
     // the EDF queue (same-priority shorts beat giant prefills).
     let deadline_ms = headers
@@ -448,6 +469,7 @@ pub async fn openai_proxy(
         Some(guard),
         key_ext.map(|Extension(k)| k),
         parsed_body,
+        sf_gate,
     )
     .await
 }
@@ -632,7 +654,9 @@ pub async fn scoped_proxy(
     );
     let class = crate::queue::classify_work(body_has_tools(&body), false);
     let (engine, load_ms) =
-        match ensure_with_admission(&state, &model, priority, class, None, false).await {
+        match ensure_with_admission(&state, &model, priority, class, None, false, false, false)
+            .await
+        {
             Ok(ok) => ok,
             Err(resp) => return *resp,
         };
@@ -668,6 +692,7 @@ pub async fn scoped_proxy(
         Some(guard),
         key_ext.map(|Extension(k)| k),
         None,
+        crate::proxy::SfGate::Ineligible,
     )
     .await
 }
@@ -790,6 +815,8 @@ pub async fn responses_api(
         affinity_hash_bytes(&body),
         serde_json::from_slice::<serde_json::Value>(&body)
             .is_ok_and(|b| crate::proxy::body_needs_vision(&b, false)),
+        false, // text surface: diffusion rows teach the images lane
+        false,
     )
     .await
     {
@@ -831,6 +858,7 @@ pub async fn responses_api(
             Some(guard),
             key_ext.map(|Extension(k)| k),
             None,
+            crate::proxy::SfGate::Ineligible,
         )
         .await;
         if stream && store {
@@ -844,26 +872,66 @@ pub async fn responses_api(
         return r;
     }
 
-    // Non-stream + store: buffered forward, store, re-id, return.
+    // Non-stream + store: buffered forward, store, re-id, return. Same
+    // crash-recovery contract as every other child lane: bounded send
+    // (child_send owns the header-timeout evict), then exactly one
+    // in-band retry on a respawned child so single-shot clients don't
+    // eat a 502/504 for a child that died mid-request.
+    let t0 = std::time::Instant::now();
     let url = format!(
         "{}/v1/responses",
         crate::proxy::child_base(&engine.endpoint)
     );
-    let upstream = crate::proxy::child_auth(
-        state
-            .http
+    let req = crate::proxy::child_auth(
+        crate::state::child_client(&state, &engine.endpoint)
             .post(&url)
             .header("content-type", "application/json"),
         &engine,
     )
-    .body(new_body.clone())
-    .send()
-    .await;
-    let resp = match upstream {
-        Ok(r) => r,
+    .body(new_body.clone());
+    let resp = match crate::proxy::child_send(&state, &engine, req.send()).await {
+        Ok(r) => {
+            state.ttft.observe_secs(t0.elapsed().as_secs_f64());
+            r
+        }
         Err(e) => {
-            state.sup.reap_dead_children().await;
-            return openai_error(502, &format!("engine request failed: {e:#}"));
+            tracing::warn!(
+                model = %model_name,
+                "responses buffered upstream failed: {e} — respawning lane, retrying once in-band"
+            );
+            match crate::proxy::respawn_lane(&state, &engine.key).await {
+                Ok(fresh) => {
+                    let fresh_url =
+                        format!("{}/v1/responses", crate::proxy::child_base(&fresh.endpoint));
+                    let fresh_req = crate::proxy::child_auth(
+                        crate::state::child_client(&state, &fresh.endpoint)
+                            .post(&fresh_url)
+                            .header("content-type", "application/json"),
+                        &fresh,
+                    )
+                    .body(new_body.clone());
+                    match crate::proxy::child_send(&state, &fresh, fresh_req.send()).await {
+                        Ok(r) => {
+                            state.ttft.observe_secs(t0.elapsed().as_secs_f64());
+                            r
+                        }
+                        Err(e2) => {
+                            return openai_error(
+                                e2.status_u16(),
+                                &format!(
+                                    "engine request failed: {e}; retry on respawned child: {e2}"
+                                ),
+                            );
+                        }
+                    }
+                }
+                Err(re) => {
+                    return openai_error(
+                        e.status_u16(),
+                        &format!("engine request failed: {e}; respawn: {re:#}"),
+                    );
+                }
+            }
         }
     };
     let status = resp.status().as_u16();
@@ -949,7 +1017,7 @@ pub async fn responses_api(
 /// transcriptions upload audio bytes; the JSON path cannot apply).
 /// Boundary-aware: only scans part HEADERS (bounded window after each
 /// boundary), never audio payload bytes.
-fn extract_model_multipart(body: &[u8], content_type: &str) -> Option<String> {
+pub(crate) fn extract_model_multipart(body: &[u8], content_type: &str) -> Option<String> {
     let boundary = content_type
         .split(';')
         .map(str::trim)
@@ -1037,6 +1105,8 @@ pub async fn lora_adapters(
         crate::queue::WorkClass::Interactive,
         None,
         false,
+        false, // text surface: diffusion rows teach the images lane
+        false,
     )
     .await
     {
@@ -1073,6 +1143,7 @@ pub async fn lora_adapters(
                 Some(g),
                 None,
                 None,
+                crate::proxy::SfGate::Ineligible,
             )
             .await
         }

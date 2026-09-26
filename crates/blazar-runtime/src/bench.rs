@@ -255,12 +255,7 @@ impl Tuner<'_> {
                 "-np".to_string(),
                 np.to_string(),
             ]);
-            let mut child = std::process::Command::new(&server_bin)
-                .args(&argv)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .with_context(|| format!("spawn {}", server_bin.display()))?;
+            let mut child = spawn_search_server(&server_bin, &argv)?;
             let ok = wait_ready(&mut child, port, 120.0);
             let tps = if ok {
                 drive_concurrent(port, clients).ok()
@@ -350,12 +345,7 @@ impl Tuner<'_> {
                 "--spec-ngram-simple-min-hits".to_string(),
                 h.to_string(),
             ]);
-            let mut child = std::process::Command::new(&server_bin)
-                .args(&argv)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .with_context(|| format!("spawn {}", server_bin.display()))?;
+            let mut child = spawn_search_server(&server_bin, &argv)?;
             let ok = wait_ready(&mut child, port, 120.0);
             let tps = if ok {
                 drive_concurrent(port, 1).ok()
@@ -431,12 +421,7 @@ impl Tuner<'_> {
             if n > 0 {
                 argv.extend(["--cache-reuse".to_string(), n.to_string()]);
             }
-            let mut child = std::process::Command::new(&server_bin)
-                .args(&argv)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .with_context(|| format!("spawn {}", server_bin.display()))?;
+            let mut child = spawn_search_server(&server_bin, &argv)?;
             let warm_secs = if wait_ready(&mut child, port, 180.0) {
                 // Prime, then measure the warm pass (the cache-hit lane).
                 chat_secs(port, &long_prompt)
@@ -495,12 +480,7 @@ impl Tuner<'_> {
                 argv.push("--no-warmup".to_string());
             }
             let t0 = std::time::Instant::now();
-            let mut child = std::process::Command::new(&server_bin)
-                .args(&argv)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .with_context(|| format!("spawn {}", server_bin.display()))?;
+            let mut child = spawn_search_server(&server_bin, &argv)?;
             let total = if let (true, Ok(first)) =
                 (wait_ready(&mut child, port, 180.0), first_chat_secs(port))
             {
@@ -542,12 +522,7 @@ impl Tuner<'_> {
                 "--port".to_string(),
                 port.to_string(),
             ]);
-            std::process::Command::new(&server_bin)
-                .args(&argv)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .with_context(|| format!("spawn {}", server_bin.display()))
+            spawn_search_server(&server_bin, &argv)
         };
 
         // Run A: single child.
@@ -881,7 +856,8 @@ pub fn build_input<'a>(
         draft_path,
         // bench scores one argv in isolation; no co-residency planning
         draft_gguf: None,
-        mmproj_path: None, // vision is irrelevant to llama-bench scoring
+        mmproj_path: None,
+        components: &[],
         mmproj_force: false,
         engine_tag,
         supported_flags,
@@ -905,6 +881,23 @@ fn ephemeral_port() -> Result<u16> {
     use std::net::TcpListener;
     let l = TcpListener::bind(("127.0.0.1", 0)).context("bind ephemeral")?;
     Ok(l.local_addr().context("local addr")?.port())
+}
+
+/// Spawn a search-lane llama-server: stdio-silent and tied to THIS
+/// process's lifetime. Every normal loop path kills the child it
+/// spawned; the kernel tie covers the abnormal ones — the CLI dying
+/// mid-search (terminal close, kill) must not leak a VRAM-holding
+/// server (live-verified failure mode: an orphaned llama-server held
+/// 5.3 GiB after its owner died).
+fn spawn_search_server(
+    server_bin: &std::path::Path,
+    argv: &[String],
+) -> Result<std::process::Child> {
+    let mut cmd = std::process::Command::new(server_bin);
+    cmd.args(argv).stdout(Stdio::null()).stderr(Stdio::null());
+    crate::probe::parent_death_tie(&mut cmd);
+    cmd.spawn()
+        .with_context(|| format!("spawn {}", server_bin.display()))
 }
 
 /// Poll GET /health until 200 or timeout.

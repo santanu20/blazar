@@ -103,6 +103,7 @@ async fn start_with(config: Config, child_env: Vec<(String, String)>) -> TestSer
             bytes: 500_000_000,
             sha256: None,
             mmproj_path: None,
+            components: vec![],
             shards: 1,
             arch: Some("qwen3".into()),
             params: Some(0.5),
@@ -122,6 +123,7 @@ async fn start_with(config: Config, child_env: Vec<(String, String)>) -> TestSer
             bytes: 500_000_000,
             sha256: None,
             mmproj_path: None,
+            components: vec![],
             shards: 1,
             arch: Some("qwen3".into()),
             params: Some(0.5),
@@ -273,6 +275,55 @@ async fn e2e__openai_chat_nonstream_and_stream() {
     assert!(chunks >= 3, "expected role+content+finish chunks: {chunks}");
     assert!(text.contains("[DONE]"));
     ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// `child_transport = "unix"` (upstream #28690 surface): the whole lane —
+/// spawn argv (`--host <path>.sock`, no --port), stub bind, readiness,
+/// proxy forward, reply — rides the socket, and teardown reaps the file.
+#[tokio::test]
+#[cfg(unix)]
+#[allow(non_snake_case)]
+async fn e2e__openai_chat_over_unix_socket_transport() {
+    let config = Config {
+        child_transport: "unix".into(),
+        ..Config::default()
+    };
+    let ts = start(config).await;
+    let c = client();
+
+    let r: serde_json::Value = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "messages": [{"role": "user", "content": "unix lane"}],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["choices"][0]["message"]["content"], "stub:m1:unix lane");
+
+    // The child really is socket-backed: exactly one live .sock in the
+    // run dir, named for the sanitized instance key.
+    let live_socks = |dir: &std::path::Path| -> Vec<std::fs::DirEntry> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "sock"))
+            .collect()
+    };
+    let socks = live_socks(&ts.dirs.run_dir());
+    assert_eq!(socks.len(), 1, "one socket per live child");
+    assert!(socks[0].path().to_string_lossy().contains("m1"));
+
+    // Teardown unlinks the socket with the child (H19: acquire/release).
+    ts.state.sup.shutdown_all().await.unwrap();
+    assert!(
+        live_socks(&ts.dirs.run_dir()).is_empty(),
+        "socket must die with the child"
+    );
 }
 
 #[tokio::test]
@@ -657,6 +708,130 @@ async fn e2e__keys_scoped_rate_and_accounting() {
         .await
         .unwrap();
     assert_eq!(refused.status(), 403);
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__local_tts_charges_key_admission() {
+    use blazar_core::ApiKey;
+    // Audit MM1: the LOCAL piper lane must pass key admission BEFORE its
+    // not-installed teaching — the first request charges rpm, the second
+    // within the window exhausts it, and a wrongly-scoped key never
+    // reaches the lane at all.
+    let cfg = Config {
+        keys: vec![ApiKey {
+            name: "ci".into(),
+            key: "plm_tts".into(),
+            rpm: 1,
+            ..ApiKey::default()
+        }],
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let c = client();
+    let speech = serde_json::json!({
+        "model": "en_US-amy-medium",
+        "input": "hello from the local lane",
+    });
+    // 404 = tts_error not-installed teaching — admission PASSED (a
+    // bypassed lane would 404 twice without ever exhausting rpm).
+    let first = c
+        .post(format!("{}/v1/audio/speech", ts.base))
+        .bearer_auth("plm_tts")
+        .json(&speech)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 404, "teaching error, not a crash");
+    let second = c
+        .post(format!("{}/v1/audio/speech", ts.base))
+        .bearer_auth("plm_tts")
+        .json(&speech)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 429, "rpm=1 exhausted by the local lane");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__local_whisper_charges_key_admission() {
+    use blazar_core::ApiKey;
+    // Audit MM1: local whisper transcriptions admit through the key
+    // store like every other generation lane (501 teaching below proves
+    // the request reached the lane AFTER admission charged it).
+    let cfg = Config {
+        keys: vec![ApiKey {
+            name: "ci".into(),
+            key: "plm_whisper".into(),
+            rpm: 1,
+            ..ApiKey::default()
+        }],
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let c = client();
+    let boundary = "X-BLAZAR-AUDIT-MM1";
+    let multipart = format!(
+        "--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; \
+         filename=\"clip.wav\"\r\ncontent-type: audio/wav\r\n\r\nAAAA\r\n--{boundary}--\r\n"
+    );
+    let post_multipart = |key: &'static str| {
+        let c = c.clone();
+        let url = format!("{}/v1/audio/transcriptions", ts.base);
+        let body = multipart.clone();
+        async move {
+            c.post(url)
+                .bearer_auth(key)
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    // First: 501 teaching (no whisper engine/model in the test dirs) —
+    // admission already charged the request.
+    let first = post_multipart("plm_whisper").await;
+    assert_eq!(first.status(), 501, "half-missing teaching");
+    let second = post_multipart("plm_whisper").await;
+    assert_eq!(second.status(), 429, "rpm=1 exhausted by the local lane");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__models_capabilities_field_matches_mmproj() {
+    // Audit MM13: /v1/models rows carry a capabilities array (blazar-
+    // native shape mirroring /api/show) — [] for text-only rows.
+    let ts = start(Config::default()).await;
+    let c = client();
+    let listed: serde_json::Value = c
+        .get(format!("{}/v1/models", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let data = listed["data"].as_array().cloned().unwrap_or_default();
+    assert!(!data.is_empty(), "harness model m1 present");
+    for row in &data {
+        assert!(
+            row.get("capabilities")
+                .is_some_and(serde_json::Value::is_array),
+            "every row carries a capabilities array: {row}"
+        );
+    }
+    // The harness rows have no mmproj attached.
+    assert!(data
+        .iter()
+        .all(|r| r["capabilities"].as_array().is_some_and(Vec::is_empty)));
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
@@ -1281,6 +1456,100 @@ async fn e2e__audio_transcriptions_no_backend_teaching_501() {
         msg.contains("blazar whisper --install"),
         "teaching error should name the fix: {r}"
     );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// The async knob never bypasses the lane checks: with no whisper lane
+/// installed an `async=true` submit gets the SAME teaching 501 as the
+/// sync path (the job machinery only runs on the local lane).
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__audio_transcriptions_async_without_lane_teaching_501() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let boundary = "blazar-test-boundary";
+    let mp = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\nRIFF\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nm1\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"async\"\r\n\r\ntrue\r\n--{boundary}--\r\n"
+    );
+    let resp = c
+        .post(format!("{}/v1/audio/transcriptions", ts.base))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(mp)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 501);
+    let r: serde_json::Value = resp.json().await.unwrap();
+    let msg = r["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("blazar whisper --install"),
+        "async submit teaches the same fix: {r}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Capabilities are gateway-derived: on an empty install the route 200s
+/// with engine.installed=false, no models, no child — and boots nothing.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__audio_capabilities__empty_install_reports_gaps_without_booting() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let resp = c
+        .get(format!("{}/v1/audio/capabilities", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let r: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(r["object"], "whisper.capabilities");
+    assert_eq!(r["engine"]["kind"], "whisper");
+    assert_eq!(r["engine"]["installed"], false);
+    assert_eq!(r["models"], serde_json::json!([]));
+    assert!(r["child"].is_null(), "no child on an empty install: {r}");
+    assert_eq!(r["async"]["field"], "async");
+    assert!(
+        r["endpoints"]
+            .as_array()
+            .expect("endpoints array")
+            .iter()
+            .any(|e| e == "/v1/audio/jobs/{id}"),
+        "job endpoints advertised: {r}"
+    );
+    assert_eq!(r["idle_timeout_secs"], 900, "config default shows up");
+    // Boots nothing: the lane stays absent after the read.
+    assert!(ts.state.whisper.status().await.is_none());
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Job routes: unknown id 404s with the gateway-owned lifetime truth;
+/// a hostile id (path/meta characters) 400s before any lookup.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__audio_jobs__unknown_404_and_invalid_id_400() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let resp = c
+        .get(format!("{}/v1/audio/jobs/aj-does-not-exist", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let r: serde_json::Value = resp.json().await.unwrap();
+    let msg = r["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("die with the gateway process"),
+        "lifetime truth in the 404: {r}"
+    );
+    let resp = c
+        .post(format!("{}/v1/audio/jobs/..%2Fetc/cancel", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "encoded traversal is an invalid id");
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
@@ -2506,6 +2775,7 @@ async fn e2e__llamacpp_only_gates__routed_lane_beats_active_row() {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,
@@ -2633,5 +2903,43 @@ async fn e2e__tool_wins_admission_over_earlier_queued_interactive() {
         "tool request must admit before earlier-queued interactive"
     );
     assert!(ra < rb);
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__unknown_route__404_json_envelope_with_teaching_pointer() {
+    let ts = start(Config::default()).await;
+    // A route no router arm matches must still answer in the standard
+    // error envelope (not axum's empty body), name method + path, and
+    // point at the /.well-known/blazar census.
+    let resp = client()
+        .post(format!("{}/definitely/not/mounted", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let err = body
+        .get("error")
+        .and_then(|e| e.as_object())
+        .unwrap_or_else(|| panic!("expected error envelope, got {body}"));
+    assert_eq!(
+        err.get("type").and_then(|t| t.as_str()),
+        Some("blazar_error")
+    );
+    assert_eq!(
+        err.get("code").and_then(serde_json::Value::as_u64),
+        Some(404)
+    );
+    let msg = err.get("message").and_then(|m| m.as_str()).unwrap();
+    assert!(
+        msg.contains("POST") && msg.contains("/definitely/not/mounted"),
+        "message names method+path: {msg}"
+    );
+    assert!(
+        msg.contains("/.well-known/blazar"),
+        "message teaches the census: {msg}"
+    );
     ts.state.sup.shutdown_all().await.unwrap();
 }

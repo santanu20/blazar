@@ -154,6 +154,7 @@ mod tests {
             bytes: 4,
             sha256,
             mmproj_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,

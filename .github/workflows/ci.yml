@@ -70,6 +70,9 @@ jobs:
       - run: python3 -m pip install ruff==0.16.8
       - run: ruff check scripts/
       - run: python3 -m py_compile scripts/*.py
+      # Renderer self-test: campaign-scoped findings/frontier/index paths a
+      # media-only artifact cannot reach; pure-fixture, no GPU needed.
+      - run: python3 scripts/bench_render_selftest.py
 
   audit:
     name: cargo audit (dep CVEs)

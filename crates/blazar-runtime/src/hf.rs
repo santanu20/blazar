@@ -139,6 +139,33 @@ pub struct HfSibling {
     pub lfs: Option<HfLfs>,
 }
 
+/// One entry of the Hub tree API (`api/models/{repo}/tree/main/...`):
+/// files carry `size`; directories do not. Unlike the siblings
+/// expansion — which the Hub truncates on big repos (live:
+/// `rhasspy/piper-voices` returned 3301 of thousands of files) — the
+/// tree endpoint lists everything through cursor pagination.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HfTreeEntry {
+    #[serde(default)]
+    pub path: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub size: Option<u64>,
+}
+
+impl HfTreeEntry {
+    #[must_use]
+    pub fn is_file(&self) -> bool {
+        self.kind == "file"
+    }
+
+    #[must_use]
+    pub fn is_dir(&self) -> bool {
+        self.kind == "directory"
+    }
+}
+
 /// `expand[]=gguf` aggregate over a repo's GGUF files. `total` is the
 /// PARAMETER COUNT (not bytes — never render it as a size); the actual
 /// on-disk bytes live in `totalFileSize` (sum over every `.gguf`, all
@@ -846,11 +873,23 @@ impl HfClient {
         let mut resp = req.send().await.context("download request failed")?;
         let status = resp.status();
         if !status.is_success() && status.as_u16() != 206 {
+            // 401/403 on the resolve URL is the gated-repo wall (BFL FLUX
+            // VAE and friends): name the license step instead of a bare
+            // Forbidden, mirroring the model_info mapping above.
+            let gated = matches!(
+                status,
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            )
+            .then(
+                || " — the repo is gated or private: accept its license on huggingface.co and set HF_TOKEN if you have access",
+            )
+            .unwrap_or("");
             return Err(anyhow!(
-                "download {} failed: {} {}",
+                "download {} failed: {} {}{}",
                 plan.filename,
                 status.as_str(),
-                status.canonical_reason().unwrap_or("")
+                status.canonical_reason().unwrap_or(""),
+                gated
             ));
         }
         // Server ignored the Range: restart from zero.
@@ -1116,6 +1155,56 @@ pub fn is_quant_token(token: &str) -> bool {
 }
 
 impl HfClient {
+    /// List a repo subtree via the Hub tree API, following cursor
+    /// pagination (`Link: rel="next"`, 1000 entries/page) to
+    /// exhaustion. `recursive` walks the whole subtree in one walk —
+    /// the piper voice index hides thousands of files below a single
+    /// locale root. `path` is relative to the repo root ("" = root).
+    pub async fn list_tree(
+        &self,
+        repo: &str,
+        path: &str,
+        recursive: bool,
+    ) -> Result<Vec<HfTreeEntry>> {
+        let recursive_param = if recursive { "&recursive=true" } else { "" };
+        let mut url = self
+            .api_base
+            .join(&format!(
+                "api/models/{repo}/tree/main/{path}?expand=false&limit=1000{recursive_param}"
+            ))
+            .map_err(|e| anyhow!("bad tree URL: {e}"))?;
+        let mut out = Vec::new();
+        loop {
+            let resp = self
+                .http
+                .get(url.clone())
+                .send()
+                .await
+                .context("HF tree request")?;
+            if !resp.status().is_success() {
+                return Err(anyhow!("HF tree returned {}", resp.status()));
+            }
+            // The next page rides the Link header; no rel="next" means
+            // the listing is complete. Captured before `json()` — that
+            // call consumes the response.
+            let next = resp
+                .headers()
+                .get(reqwest::header::LINK)
+                .and_then(|v| v.to_str().ok())
+                .and_then(next_link)
+                .map(str::to_string);
+            let page: Vec<HfTreeEntry> = resp.json().await.context("decode tree entries")?;
+            out.extend(page);
+            match next {
+                Some(target) => {
+                    url = reqwest::Url::parse(&target)
+                        .map_err(|e| anyhow!("bad tree next page: {e}"))?;
+                }
+                None => return Ok(out),
+            }
+        }
+    }
+
     /// Hub model search across every weight format (complaint #15:
     /// discovery beyond a registry; any community quant is findable).
     /// `format` picks the lane — see [`search_path`].
@@ -1244,6 +1333,20 @@ fn name_match_stats(repo_id: &str, tokens: &[String]) -> (u32, u32) {
     )
     .unwrap_or(u32::MAX);
     (coverage, unmatched)
+}
+
+/// `rel="next"` target from a Link header, or `None` when this is the
+/// last page. Comma-split is safe: Hub cursor URLs never carry commas.
+fn next_link(link: &str) -> Option<&str> {
+    link.split(',').find_map(|part| {
+        let part = part.trim();
+        part.ends_with(r#"rel="next""#).then(|| {
+            part.trim_start_matches('<')
+                .split('>')
+                .next()
+                .unwrap_or_default()
+        })
+    })
 }
 
 /// Build the `api/models` query for [`HfClient::search`]. `format` is a
@@ -1546,6 +1649,9 @@ pub(crate) enum Repull {
     /// Model file intact but the mmproj sidecar differs — download (or
     /// drop) ONLY the sidecar instead of the multi-GiB model.
     DeltaMmproj { expected: bool },
+    /// Diffusion row with an intact `DiT` but a dead required component
+    /// (`VAE` / text encoder) — re-fetch the component set only.
+    DeltaComponents,
     /// Full download (any dead leaves were already pruned where safe).
     Full,
 }
@@ -1582,10 +1688,23 @@ pub(crate) fn model_file_intact(row: &ModelRow) -> bool {
         let Ok(meta) = std::fs::metadata(path) else {
             return false;
         };
-        meta.len() == u64::try_from(row.bytes).unwrap_or(u64::MAX)
-            && gguf::read_metadata_file(path).is_ok()
+        meta.len() == u64::try_from(row.bytes).unwrap_or(u64::MAX) && gguf_container_ok(path)
     } else {
         gguf::read_metadata_file(path).is_ok()
+    }
+}
+
+/// Container-level GGUF check: header + KV section must parse.
+/// `read_metadata_file` additionally requires
+/// `general.architecture`, which diffusion component files (`DiT` /
+/// encoder splits — 0-KV GGUFs) never carry; for them that exact
+/// error still proves the container walked clean (magic, version,
+/// every KV entry). Same string-match precedent as the reconcile and
+/// `read_model_meta` guards. Any other parse error is real corruption.
+fn gguf_container_ok(path: &Path) -> bool {
+    match gguf::read_metadata_file(path) {
+        Ok(_) => true,
+        Err(e) => e.to_string().contains("missing general.architecture"),
     }
 }
 
@@ -1650,22 +1769,53 @@ pub(crate) fn repull_gate(
         return Repull::Full;
     }
     if model_file_intact(row) {
-        if mmproj_matches(row, expects_mmproj) {
-            tracing::info!(
-                model = %name,
-                "already present ({}, {} shards) — skipping download",
-                row.quant,
-                row.shards
-            );
-            Repull::Present(Box::new(row.clone()))
-        } else {
-            Repull::DeltaMmproj {
+        if !mmproj_matches(row, expects_mmproj) {
+            return Repull::DeltaMmproj {
                 expected: expects_mmproj,
-            }
+            };
         }
+        // Component rows: an intact `DiT` with a dead component file is a
+        // component-only repair — never a multi-GiB `DiT` redownload.
+        if required_component_missing(row) {
+            return Repull::DeltaComponents;
+        }
+        tracing::info!(
+            model = %name,
+            "already present ({}, {} shards) — skipping download",
+            row.quant,
+            row.shards
+        );
+        Repull::Present(Box::new(row.clone()))
     } else {
         prune_replaced(name, row, &[], "integrity check failed");
         Repull::Full
+    }
+}
+
+/// Whether a pulled single-shard GGUF belongs to the diffusion domain and
+/// must carry its component set. A curated family repo is diffusion
+/// regardless of GGUF metadata: `city96` `FLUX` `DiTs` ship a proper `flux`
+/// architecture tag while `QuantStack` `Qwen-Image` `DiTs` are kvless — both
+/// boot on the sdcpp lane only with their `VAE`/TE sidecars. Kvless
+/// files from unknown families also route here so the attach path can
+/// emit its teaching note; text-model repos (architecture known, no
+/// family) never do.
+fn should_attach_diffusion_set(arch_known: bool, repo: &str) -> bool {
+    !arch_known || crate::diffusion::diffusion_family(repo).is_some()
+}
+
+/// A diffusion component row whose REQUIRED sidecar (`VAE` or text
+/// encoder) is absent — deleted from disk, or never attached because
+/// the row predates the component-set pull. Known-family rows must
+/// CARRY the set: `None` is as missing as a dead path. The optional
+/// vision encoder is not a repair trigger — its loss only disables
+/// image edits.
+pub(crate) fn required_component_missing(row: &ModelRow) -> bool {
+    match crate::diffusion::diffusion_family(&row.repo) {
+        Some(family) => crate::diffusion::required_component_missing(row, family),
+        // A set recorded without a curated family (hand-attached): every
+        // recorded component must still be alive.
+        None => row.components.iter().any(|c| !Path::new(&c.path).is_file()),
     }
 }
 
@@ -1692,6 +1842,7 @@ fn safetensors_model_row(
         bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
         sha256: Some(digest),
         mmproj_path: None,
+        components: vec![],
         shards: i64::try_from(sel.shard_count).unwrap_or(i64::MAX),
         arch: (!meta.architecture.is_empty()).then(|| meta.architecture.clone()),
         params: Some(est_params(bytes, &quant)),
@@ -1716,6 +1867,13 @@ impl Puller {
 
     async fn pull_locked(&self, target: &PullTarget, name: &str) -> Result<PullOutcome> {
         let info = self.client.model_info(&target.repo).await?;
+        // Standalone diffusion checkpoints (SD 1.5, SDXL) take their own
+        // lane BEFORE the gguf/safetensors fork: these repos also carry
+        // diffusers shards, which the safetensors lane would register as
+        // a text model no engine can serve.
+        if let Some(outcome) = self.pull_standalone_lane(target, name, &info).await {
+            return outcome;
+        }
         // Lane fork: GGUF files (llamacpp/mistralrs engines) vs a
         // safetensors model directory (sglang engine). A repo with BOTH
         // keeps the GGUF lane — existing behavior unchanged; the log
@@ -1781,7 +1939,7 @@ impl Puller {
             .download_full_selection(name, target, &selected)
             .await?;
 
-        let (row, pull_warning) = build_model_row(
+        let (mut row, pull_warning) = build_model_row(
             name,
             target,
             &info,
@@ -1789,6 +1947,11 @@ impl Puller {
             &shard_paths,
             mmproj_dest.as_ref(),
         )?;
+        let mut pull_warning = pull_warning;
+        if should_attach_diffusion_set(row.arch.is_some(), &target.repo) && shard_paths.len() == 1 {
+            self.attach_diffusion_set(target, name, &selected.quant, &mut row, &mut pull_warning)
+                .await?;
+        }
         if let Some(w) = &pull_warning {
             tracing::warn!(model = %name, "{w}");
         }
@@ -1885,6 +2048,12 @@ impl Puller {
             let before: u64 = sel.files[..i].iter().map(|f| f.bytes).sum();
             let mut progress_one = |d: u64, t: u64| progress(before + d.min(t), total_bytes);
             let dest = dir.join(&file.filename);
+            // Dir-scoped lane: no bare-leaf candidate (shards never lived
+            // in the models dir root) — dest + hub cache only.
+            if let Some(_reused) = reuse_on_disk(name, &target.repo, file, &dest, None) {
+                bar.set_position(before + file.bytes);
+                continue;
+            }
             self.client
                 .download_file(&target.repo, file, &dest, &mut progress_one)
                 .await
@@ -2012,6 +2181,17 @@ impl Puller {
                 progress(before + d.min(t), total_bytes);
             };
             let dest = unique_dest(&models_dir, &shard.filename, &target.repo);
+            // Bare-leaf adoption only for single-file pulls: the shard
+            // set is derived from the first shard's recorded path, so a
+            // bare hit must never strand the set at the disambiguated
+            // dest (or vice versa).
+            let bare =
+                (selected.shards.len() == 1).then(|| models_dir.join(leaf_of(&shard.filename)));
+            if let Some(reused) = reuse_on_disk(name, &target.repo, shard, &dest, bare.as_deref()) {
+                bar.set_position(bar.position() + shard.bytes);
+                shard_paths.push(reused);
+                continue;
+            }
             self.client
                 .download_file(&target.repo, shard, &dest, &mut progress_one)
                 .await
@@ -2023,25 +2203,341 @@ impl Puller {
                 })?;
             shard_paths.push(dest);
         }
-        let mmproj_dest = selected
-            .mmproj
-            .as_ref()
-            .map(|mm| unique_dest(&models_dir, &mm.filename, &target.repo));
-        if let (Some(mm), Some(dest)) = (&selected.mmproj, &mmproj_dest) {
-            self.client
-                .download_file(&target.repo, mm, dest, &mut progress)
-                .await
-                .inspect_err(|e| {
-                    // F104: mmproj failure must reach /api/pull watchers
-                    // like a shard failure does, not vanish via `?`.
-                    self.bus.publish(BlazarEvent::PullFailed {
-                        name: name.to_string(),
-                        error: format!("mmproj: {e}"),
-                    });
-                })?;
-        }
+        let mmproj_dest = if let Some(mm) = selected.mmproj.as_ref() {
+            let dest = unique_dest(&models_dir, &mm.filename, &target.repo);
+            let bare = models_dir.join(leaf_of(&mm.filename));
+            if let Some(reused) = reuse_on_disk(name, &target.repo, mm, &dest, Some(&bare)) {
+                bar.set_position(bar.position() + mm.bytes);
+                Some(reused)
+            } else {
+                self.client
+                    .download_file(&target.repo, mm, &dest, &mut progress)
+                    .await
+                    .inspect_err(|e| {
+                        // F104: mmproj failure must reach /api/pull watchers
+                        // like a shard failure does, not vanish via `?`.
+                        self.bus.publish(BlazarEvent::PullFailed {
+                            name: name.to_string(),
+                            error: format!("mmproj: {e}"),
+                        });
+                    })?;
+                Some(dest)
+            }
+        } else {
+            None
+        };
         bar.finish_and_clear();
         Ok((shard_paths, mmproj_dest))
+    }
+
+    /// Fetch the diffusion component set for a kvless `DiT` pull: `VAE` and
+    /// text encoder are required (missing files fail the pull loudly);
+    /// the vision encoder for edits is best-effort. Component files are
+    /// shared, read-only weights: an intact file at the canonical dest
+    /// is re-used byte-for-byte, never re-downloaded.
+    ///
+    /// Complete a kvless `DiT` pull with its component set: a known
+    /// diffusion family fetches the `VAE`/`TE` files (vision optional)
+    /// onto the row; an unknown family keeps the file but records the
+    /// boot-blocking warning that spawn time will teach verbatim.
+    /// Standalone-checkpoint pull (SD 1.5, SDXL): the family's pinned
+    /// file IS the whole model — `VAE` and text encoders live inside
+    /// the checkpoint, so the row stores a single self-referencing
+    /// `--model` component that routes it to the sdcpp lane and emits
+    /// `-m/--model <file>` at compile. Quant tags are meaningless here
+    /// (there is exactly one file); the pull ignores them.
+    /// `Some(outcome)` when `target.repo` belongs to a standalone-checkpoint
+    /// diffusion family (SD 1.5, SDXL): the pull is fully served on that
+    /// lane. `None` falls through to the gguf/safetensors lanes. The family
+    /// table pins the exact single checkpoint file sd-server boots with
+    /// `-m/--model`.
+    async fn pull_standalone_lane(
+        &self,
+        target: &PullTarget,
+        name: &str,
+        info: &HfModelInfo,
+    ) -> Option<Result<PullOutcome>> {
+        let family = crate::diffusion::diffusion_family(&target.repo)?;
+        family.standalone_files?;
+        Some(
+            self.pull_standalone_checkpoint(target, name, info, family)
+                .await,
+        )
+    }
+
+    async fn pull_standalone_checkpoint(
+        &self,
+        target: &PullTarget,
+        name: &str,
+        info: &HfModelInfo,
+        family: &crate::diffusion::DiffusionFamily,
+    ) -> Result<PullOutcome> {
+        let plan = crate::diffusion::standalone_file_plan(info, family).ok_or_else(|| {
+            anyhow!(
+                "repo {} hosts none of the {} checkpoint files ({}) — a \
+                 diffusers shard is not the standalone model",
+                target.repo,
+                family.display,
+                family.standalone_files.unwrap_or(&[]).join(", ")
+            )
+        })?;
+        let store = Store::open(&self.dirs)?;
+        let existing = store.get_model(name)?;
+        flip_guard(name, existing.as_ref(), false, self.force)?;
+        // Present = same repo with its checkpoint alive on disk. A dead
+        // path (deleted file, stale row) falls through to re-download —
+        // byte-exact reuse keeps that repair cheap.
+        if let Some(row) = existing.as_ref() {
+            let intact = row.repo == target.repo
+                && Path::new(&row.path).is_file()
+                && if family.components.is_empty() {
+                    row.component("--model").is_some()
+                } else {
+                    !crate::diffusion::required_component_missing(row, family)
+                };
+            if intact {
+                return Ok(PullOutcome {
+                    row: row.clone(),
+                    already_present: true,
+                });
+            }
+        }
+        let bar = indicatif::ProgressBar::new(plan.bytes);
+        bar.set_style(
+            indicatif::ProgressStyle::default_bar()
+                .template("{msg} {bar:30} {bytes}/{total_bytes} ({eta})")
+                .expect("valid template"),
+        );
+        bar.set_message(format!("pull {name}"));
+        let mut done = 0u64;
+        // required=true: without the checkpoint there is no model.
+        let dest = self
+            .fetch_component_file(name, &target.repo, &plan, true, &bar, &mut done)
+            .await?
+            .ok_or_else(|| anyhow!("checkpoint {} failed without an error", plan.filename))?;
+        bar.finish_and_clear();
+        let dest_str = dest.display().to_string();
+        // Standalone-with-components families (Wan video): the exact
+        // checkpoint is the DiT, booted via `--diffusion-model` with its
+        // VAE/text encoder attached. Bare standalone families (SDXL,
+        // SD 1.5) embed everything and self-reference through
+        // `--model` — that path is preserved verbatim below.
+        let mut components = if family.components.is_empty() {
+            vec![blazar_core::store::ComponentFile::new("--model", &dest_str)]
+        } else {
+            let mut pull_warning = None;
+            let mut row = blazar_core::ModelRow {
+                name: name.to_string(),
+                repo: String::new(),
+                quant: String::new(),
+                path: String::new(),
+                bytes: 0,
+                sha256: None,
+                mmproj_path: None,
+                components: vec![],
+                shards: 1,
+                arch: None,
+                params: None,
+                ctx_train: None,
+                pulled_at: 0,
+            };
+            self.attach_diffusion_set(target, name, &target.quant, &mut row, &mut pull_warning)
+                .await?;
+            if let Some(w) = pull_warning {
+                tracing::warn!(model = %name, "{w}");
+            }
+            row.components
+        };
+        components.sort_by(|a, b| a.flag.cmp(&b.flag));
+        let row = blazar_core::ModelRow {
+            name: name.to_string(),
+            repo: target.repo.clone(),
+            quant: "-".to_string(),
+            path: dest_str.clone(),
+            bytes: i64::try_from(plan.bytes).unwrap_or(i64::MAX),
+            sha256: plan.sha256.clone(),
+            mmproj_path: None,
+            components,
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+                .unwrap_or(i64::MAX),
+        };
+        store.upsert_model(&row)?;
+        self.bus.publish(BlazarEvent::ModelPulled {
+            name: name.to_string(),
+            warning: None,
+        });
+        Ok(PullOutcome {
+            row,
+            already_present: false,
+        })
+    }
+
+    async fn attach_diffusion_set(
+        &self,
+        target: &PullTarget,
+        name: &str,
+        quant: &str,
+        row: &mut blazar_core::ModelRow,
+        pull_warning: &mut Option<String>,
+    ) -> Result<()> {
+        let Some(family) = crate::diffusion::diffusion_family(&target.repo) else {
+            let note = format!(
+                "diffusion component GGUF with no known model family (supported: {}); \
+                 pulled the `DiT` file only — it cannot boot without its VAE/text encoder",
+                crate::diffusion::supported_families().join(", ")
+            );
+            tracing::warn!(model = %name, "{note}");
+            pull_warning.get_or_insert(note);
+            return Ok(());
+        };
+        row.components = self
+            .pull_diffusion_components(name, family, quant)
+            .await?
+            .into_iter()
+            .map(|(flag, path)| blazar_core::store::ComponentFile::new(&flag, &path))
+            .collect();
+        Ok(())
+    }
+
+    async fn pull_diffusion_components(
+        &self,
+        name: &str,
+        family: &crate::diffusion::DiffusionFamily,
+        quant: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let models_dir = self.dirs.models_dir();
+        std::fs::create_dir_all(&models_dir)?;
+
+        // Per-spec plans: exact quant first, else the spec's fallback
+        // quant (component repos publish fewer quants than `DiT`
+        // converters cut). Optional components that are absent upstream
+        // skip with a warning — the set still boots, edits just disable.
+        let mut plans: Vec<(&crate::diffusion::ComponentSpec, FilePlan, Option<String>)> =
+            Vec::new();
+        for spec in family.components {
+            let info = match self.client.model_info(spec.source.repo).await {
+                Ok(info) => info,
+                Err(e) if !spec.required => {
+                    tracing::warn!(model = %name,
+                        "optional {} listing failed ({e}); skipping", spec.flag);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            if let Some(plan) = crate::diffusion::component_plan(&info, &spec.source, quant) {
+                plans.push((spec, plan, None));
+                continue;
+            }
+            if let Some(fallback_quant) = spec.fallback_quant {
+                let plan = crate::diffusion::component_plan(&info, &spec.source, fallback_quant)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "component {} for quant {quant} (and fallback \
+                                 {fallback_quant}) not found in {}",
+                            spec.flag,
+                            spec.source.repo
+                        )
+                    })?;
+                let note = format!(
+                    "component {} quant {quant} unavailable; pulled {fallback_quant} instead",
+                    spec.flag
+                );
+                plans.push((spec, plan, Some(note)));
+                continue;
+            }
+            if spec.required {
+                return Err(anyhow!(
+                    "{} {} not found in {}",
+                    spec.flag,
+                    spec.source.repo_path,
+                    spec.source.repo
+                ));
+            }
+            tracing::warn!(model = %name,
+                "optional {} has no {} in {}; skipping", spec.flag,
+                spec.source.repo_path, spec.source.repo);
+        }
+
+        let total_bytes: u64 = plans.iter().map(|(_, p, _)| p.bytes).sum();
+        let bar = indicatif::ProgressBar::new(total_bytes);
+        bar.set_style(
+            indicatif::ProgressStyle::default_bar()
+                .template("{msg} {bar:30} {bytes}/{total_bytes} ({eta})")
+                .expect("valid template"),
+        );
+        bar.set_message(format!("pull {name}: components"));
+
+        let mut done: u64 = 0;
+        let mut components: Vec<(String, String)> = Vec::new();
+        for (spec, plan, note) in &plans {
+            if let Some(dest) = self
+                .fetch_component_file(name, spec.source.repo, plan, spec.required, &bar, &mut done)
+                .await?
+            {
+                components.push((spec.flag.to_string(), dest.display().to_string()));
+            }
+            if let Some(note) = note {
+                tracing::warn!(model = %name, "{note}");
+            }
+        }
+        bar.finish_and_clear();
+        Ok(components)
+    }
+
+    /// Fetch one component file with the shared progress bar. Returns
+    /// the destination when the file is on disk (fetched now, or
+    /// re-used intact from an earlier pull); `None` for an optional
+    /// component that failed (warned, set continues without it).
+    async fn fetch_component_file(
+        &self,
+        name: &str,
+        repo: &str,
+        plan: &FilePlan,
+        required: bool,
+        bar: &indicatif::ProgressBar,
+        done: &mut u64,
+    ) -> Result<Option<PathBuf>> {
+        let models_dir = self.dirs.models_dir();
+        let bare = models_dir.join(leaf_of(&plan.filename));
+        let dest = unique_dest(&models_dir, &leaf_of(&plan.filename), repo);
+        if let Some(reused) = reuse_on_disk(name, repo, plan, &dest, Some(&bare)) {
+            *done += plan.bytes;
+            bar.set_position(*done);
+            return Ok(Some(reused));
+        }
+        let before = *done;
+        let mut progress = |d: u64, t: u64| {
+            bar.set_position(before + d.min(t));
+        };
+        let fetched = self
+            .client
+            .download_file(repo, plan, &dest, &mut progress)
+            .await
+            .inspect_err(|e| {
+                self.bus.publish(BlazarEvent::PullFailed {
+                    name: name.to_string(),
+                    error: format!("component {}: {e}", plan.filename),
+                });
+            });
+        match fetched {
+            Ok(bytes) => {
+                *done += bytes.max(plan.bytes);
+                Ok(Some(dest))
+            }
+            Err(e) if !required => {
+                tracing::warn!(model = %name, "optional component {} failed ({e}) — skipped", plan.filename);
+                Ok(None)
+            }
+            Err(e) => Err(anyhow!(
+                "component set incomplete: {}/{} failed: {e}; re-run the pull to resume",
+                repo,
+                plan.filename
+            )),
+        }
     }
 
     /// Act on the gate's decision. `Some(outcome)` = the pull is already
@@ -2072,6 +2568,39 @@ impl Puller {
                 row: *row,
                 already_present: true,
             }));
+        }
+        if let Repull::DeltaComponents = decision {
+            // The `DiT` is intact (gate proved it); only the component set
+            // needs fetching. Family comes from the row's own repo —
+            // the gate reaches here for never-attached rows (predating
+            // the component-set pull) and for dead-sidecar rows alike.
+            if let Some(old) = existing {
+                let family = crate::diffusion::diffusion_family(&old.repo).ok_or_else(|| {
+                    anyhow!(
+                        "component repair for {} has no known family (supported: {})",
+                        old.repo,
+                        crate::diffusion::supported_families().join(", ")
+                    )
+                })?;
+                let components = self
+                    .pull_diffusion_components(name, family, &old.quant)
+                    .await?;
+                let mut row = old.clone();
+                row.components = components
+                    .into_iter()
+                    .map(|(flag, path)| blazar_core::store::ComponentFile::new(&flag, &path))
+                    .collect();
+                Store::open(&self.dirs)?.upsert_model(&row)?;
+                tracing::info!(model = %name, "component set repaired — DiT untouched");
+                self.bus.publish(BlazarEvent::ModelPulled {
+                    name: name.to_string(),
+                    warning: None,
+                });
+                return Ok(Some(PullOutcome {
+                    row,
+                    already_present: false,
+                }));
+            }
         }
         if let Repull::DeltaMmproj { expected } = decision {
             // Shard paths are only fully known for single-shard rows
@@ -2139,6 +2668,18 @@ impl Puller {
                 anyhow!("delta pull requested a projector but the selection has none")
             })?;
             let dest = unique_dest(&models_dir, &mm.filename, &target.repo);
+            let bare = models_dir.join(leaf_of(&mm.filename));
+            if let Some(reused) = reuse_on_disk(name, &target.repo, mm, &dest, Some(&bare)) {
+                mmproj_dest = Some(reused);
+                return build_model_row(
+                    name,
+                    target,
+                    info,
+                    selected,
+                    &[PathBuf::from(&old.path)],
+                    mmproj_dest.as_ref(),
+                );
+            }
             let bar = indicatif::ProgressBar::new(mm.bytes);
             bar.set_style(
                 indicatif::ProgressStyle::default_bar()
@@ -2260,6 +2801,7 @@ fn build_model_row(
             bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
             sha256: selected.shards[0].sha256.clone(),
             mmproj_path: mmproj_dest.as_ref().map(|d| d.display().to_string()),
+            components: vec![],
             shards: i64::try_from(selected.shards.len()).unwrap_or(i64::MAX),
             arch,
             params: Some(est_params(bytes, &selected.quant)),
@@ -2325,12 +2867,356 @@ pub(crate) fn unique_dest(dir: &Path, filename: &str, repo: &str) -> PathBuf {
     dir.join(format!("{repo_slug}--{}", leaf.to_string_lossy()))
 }
 
+/// Final path component of a repo-side filename (subdirs flattened by
+/// the download lanes; a bare name is its own leaf).
+fn leaf_of(filename: &str) -> String {
+    Path::new(filename).file_name().map_or_else(
+        || filename.to_string(),
+        |f| f.to_string_lossy().into_owned(),
+    )
+}
+
+/// A file at `candidate` that is byte-exact for `plan`: size gates a
+/// full sha256 (hashing only runs on a size match, so the common miss
+/// costs one stat — the rare hit is a multi-second multi-GiB read that
+/// beats re-downloading the same bytes). Unknown published sha falls
+/// back to size-only, matching the download lane's own verification
+/// trust level.
+fn reuse_byte_exact(candidate: &Path, plan: &FilePlan) -> Option<PathBuf> {
+    let meta = std::fs::metadata(candidate).ok()?;
+    if !meta.is_file() || meta.len() != plan.bytes || plan.bytes == 0 {
+        return None;
+    }
+    match plan.sha256.as_deref() {
+        Some(expected) if !expected.is_empty() => {
+            let mut f = std::fs::File::open(candidate).ok()?;
+            let mut h = Sha256::new();
+            std::io::copy(&mut f, &mut h).ok()?;
+            if format!("{:x}", h.finalize()).eq_ignore_ascii_case(expected) {
+                Some(candidate.to_path_buf())
+            } else {
+                None
+            }
+        }
+        _ => Some(candidate.to_path_buf()),
+    }
+}
+
+/// Hugging Face hub cache root, honoring the same environment overrides
+/// as `huggingface_hub` itself: `HF_HUB_CACHE`, then `HF_HOME/hub`, then the
+/// per-user default `~/.cache/huggingface/hub`.
+fn hf_hub_root() -> Option<PathBuf> {
+    if let Some(root) = std::env::var_os("HF_HUB_CACHE") {
+        if !root.is_empty() {
+            return Some(PathBuf::from(root));
+        }
+    }
+    if let Some(home) = std::env::var_os("HF_HOME") {
+        if !home.is_empty() {
+            return Some(Path::new(&home).join("hub"));
+        }
+    }
+    let home = dirs::home_dir()?;
+    Some(home.join(".cache").join("huggingface").join("hub"))
+}
+
+/// Every hub-cache copy of `repo/filename`, newest-agnostic: snapshots are
+/// per-revision directories mirroring the repo's internal layout, so the
+/// candidate for `vae/ae.safetensors` in repo `black-forest-labs/FLUX.1-schnell`
+/// is `.../models--black-forest-labs--FLUX.1-schnell/snapshots/<rev>/vae/ae.safetensors`.
+/// Content is NOT checked here — `reuse_byte_exact` gates on size + sha256.
+pub(crate) fn hf_hub_candidates_at(root: &Path, repo: &str, filename: &str) -> Vec<PathBuf> {
+    let model_dir = format!("models--{}", repo.replace(['/', '\\'], "--"));
+    let snapshots = root.join(model_dir).join("snapshots");
+    let Ok(revs) = std::fs::read_dir(&snapshots) else {
+        return Vec::new();
+    };
+    revs.filter_map(std::result::Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path().join(filename))
+        .collect()
+}
+
+fn hf_hub_candidates(repo: &str, filename: &str) -> Vec<PathBuf> {
+    hf_hub_root()
+        .map(|root| hf_hub_candidates_at(&root, repo, filename))
+        .unwrap_or_default()
+}
+
+/// Bring a hub-cache hit into the models dir under its own name so the
+/// store row never points into the user's hub cache (a later `blazar rm`
+/// must unlink blazar's file, not the hub blob). Hardlink first — same
+/// filesystem, zero bytes copied — then a real copy when the cache lives
+/// on another filesystem, still far cheaper than re-downloading GiB.
+fn materialize_hub_hit(src: &Path, dest: &Path) -> std::io::Result<()> {
+    if std::fs::hard_link(src, dest).is_ok() {
+        return Ok(());
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(src, dest).map(|_| ())
+}
+
+/// Content-first reuse decision shared by EVERY pull lane (gguf shards,
+/// mmproj sidecars, safetensors shards, diffusion components): before
+/// downloading, look for a byte-exact copy of `plan` at the bare leaf,
+/// the collision-resolved dest, or the huggingface hub cache (hardlinked
+/// in). `bare` is the pre-collision leaf path for lanes that download
+/// into the models dir root — pass `None` when the dest is dir-scoped
+/// (safetensors shards) or when adopting a bare leaf would strand a
+/// multi-shard set whose siblings sit at the disambiguated dest.
+/// A hit also sweeps a stale `dest.part` from an interrupted attempt
+/// (the disk-eating orphan class). Returns the path the row should
+/// record; `None` = download.
+fn reuse_on_disk(
+    name: &str,
+    repo: &str,
+    plan: &FilePlan,
+    dest: &Path,
+    bare: Option<&Path>,
+) -> Option<PathBuf> {
+    for candidate in bare.into_iter().chain(std::iter::once(dest)) {
+        if let Some(reused) = reuse_byte_exact(candidate, plan) {
+            tracing::info!(model = %name, "file {} already on disk (byte-exact) — reusing", plan.filename);
+            if let Some(bare) = bare {
+                sweep_stale_part(&bare.display().to_string());
+            }
+            sweep_stale_part(&dest.display().to_string());
+            return Some(reused);
+        }
+    }
+    // Third reuse source: the huggingface hub cache (diffusers
+    // pipelines, ComfyUI installs, `hf download` runs). The hit is
+    // hardlinked into the models dir so the row never points at the
+    // user's cache and `blazar rm` stays scoped to blazar's files.
+    for candidate in hf_hub_candidates(repo, &plan.filename) {
+        if reuse_byte_exact(&candidate, plan).is_some() {
+            return match materialize_hub_hit(&candidate, dest) {
+                Ok(()) => {
+                    tracing::info!(model = %name, "file {} found in the huggingface hub cache — hardlinked", plan.filename);
+                    sweep_stale_part(&dest.display().to_string());
+                    Some(dest.to_path_buf())
+                }
+                Err(e) => {
+                    tracing::warn!(model = %name, "hub cache hit for {} but linking failed ({e}) — downloading", plan.filename);
+                    None
+                }
+            };
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn unit__next_link__rel_next_target_or_none() {
+        // Real Hub shape: cursor URL + rel="next", prev/first alongside.
+        let link = r#"<https://huggingface.co/api/models/rhasspy/piper-voices/tree/main/en?limit=1000&cursor=abc>; rel="next", <https://huggingface.co/first>; rel="first""#;
+        assert_eq!(
+            next_link(link),
+            Some("https://huggingface.co/api/models/rhasspy/piper-voices/tree/main/en?limit=1000&cursor=abc")
+        );
+        // Last page: other rels but no next.
+        assert_eq!(next_link(r#"<https://huggingface.co/x>; rel="prev""#), None);
+        assert_eq!(next_link(""), None);
+    }
+
+    #[test]
+    fn unit__reuse_byte_exact__truth_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = b"component-bytes".to_vec();
+        let f = tmp.path().join("te.gguf");
+        std::fs::write(&f, &body).unwrap();
+        let sha = {
+            use sha2::Digest;
+            let mut h = sha2::Sha256::new();
+            h.update(&body);
+            format!("{:x}", h.finalize())
+        };
+        let plan = |bytes: u64, sha: Option<&str>| FilePlan {
+            filename: "te.gguf".into(),
+            bytes,
+            sha256: sha.map(str::to_string),
+        };
+        // Byte-exact (size + sha) reuses.
+        assert_eq!(
+            reuse_byte_exact(&f, &plan(body.len() as u64, Some(&sha))),
+            Some(f.clone())
+        );
+        // Same size, different sha (hand-placed imposter) never reuses.
+        let wrong = {
+            use sha2::Digest;
+            let mut h = sha2::Sha256::new();
+            h.update(b"other");
+            format!("{:x}", h.finalize())
+        };
+        assert_eq!(
+            reuse_byte_exact(&f, &plan(body.len() as u64, Some(&wrong))),
+            None
+        );
+        // Size mismatch short-circuits before any hashing.
+        assert_eq!(reuse_byte_exact(&f, &plan(5, Some(&sha))), None);
+        // Unknown published sha falls back to size-only (download-lane
+        // verification trust level).
+        assert_eq!(
+            reuse_byte_exact(&f, &plan(body.len() as u64, None)),
+            Some(f.clone())
+        );
+        // Missing file / zero-byte plan never reuse.
+        assert_eq!(
+            reuse_byte_exact(&tmp.path().join("nope"), &plan(1, Some(&sha))),
+            None
+        );
+        assert_eq!(reuse_byte_exact(&f, &plan(0, None)), None);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__should_attach_diffusion_set__arch_tag_does_not_escape_the_family_domain() {
+        // city96 FLUX DiTs carry general.architecture=flux — still diffusion.
+        assert!(should_attach_diffusion_set(true, "city96/FLUX.1-dev-gguf"));
+        assert!(should_attach_diffusion_set(
+            true,
+            "silveroxides/Chroma-GGUF"
+        ));
+        // Kvless DiTs (QuantStack Qwen-Image) attach via the kvless arm.
+        assert!(should_attach_diffusion_set(
+            false,
+            "QuantStack/Qwen-Image-GGUF"
+        ));
+        assert!(should_attach_diffusion_set(
+            false,
+            "unknown-orphan/diT-only"
+        ));
+        // A text model with known architecture never enters the diffusion path.
+        assert!(!should_attach_diffusion_set(
+            true,
+            "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+        ));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__reuse_on_disk__bare_dest_miss_and_part_sweep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let body = b"row-less-reuse-bytes".to_vec();
+        let sha = payload(&body);
+        let plan = |bytes: u64, sha: Option<&str>| FilePlan {
+            filename: "m-q4_k_m.gguf".into(),
+            bytes,
+            sha256: sha.map(str::to_string),
+        };
+        let p = plan(body.len() as u64, Some(&sha));
+
+        // Miss: nothing on disk, no hub cache.
+        std::env::set_var("HF_HUB_CACHE", tmp.path().join("absent-hub"));
+        let dest = models.join("m-q4_k_m.gguf");
+        assert_eq!(reuse_on_disk("m", "o/r", &p, &dest, None), None);
+
+        // Bare-leaf hit: byte-exact file under the bare leaf wins, and a
+        // stale `dest.part` from an interrupted attempt is swept.
+        let bare = models.join("m-q4_k_m.gguf");
+        std::fs::write(&bare, &body).unwrap();
+        let slug_dest = models.join("o--r--m-q4_k_m.gguf");
+        std::fs::write(models.join("o--r--m-q4_k_m.gguf.part"), b"junk").unwrap();
+        assert_eq!(
+            reuse_on_disk("m", "o/r", &p, &slug_dest, Some(&bare)),
+            Some(bare.clone())
+        );
+        assert!(!models.join("o--r--m-q4_k_m.gguf.part").exists());
+
+        // Collision-named hit: the disambiguated dest is byte-exact.
+        std::fs::remove_file(&bare).unwrap();
+        std::fs::write(&slug_dest, &body).unwrap();
+        assert_eq!(
+            reuse_on_disk("m", "o/r", &p, &slug_dest, Some(&bare)),
+            Some(slug_dest.clone())
+        );
+
+        // Hub hit: hardlinked into dest, row never points at the cache.
+        std::fs::remove_file(&slug_dest).unwrap();
+        let hub = tmp.path().join("hub");
+        let snap = hub.join("models--o--r").join("snapshots").join("rev1");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::write(snap.join("m-q4_k_m.gguf"), &body).unwrap();
+        std::env::set_var("HF_HUB_CACHE", &hub);
+        assert_eq!(
+            reuse_on_disk("m", "o/r", &p, &dest, Some(&bare)),
+            Some(dest.clone())
+        );
+        assert!(dest.is_file());
+    }
+
+    #[test]
+    fn unit__hf_hub_candidates_at__mirrors_repo_layout_across_revisions() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Two revisions of black-forest-labs/FLUX.1-schnell, one carrying
+        // the VAE at its repo-relative path.
+        let snap_a = tmp
+            .path()
+            .join("models--black-forest-labs--FLUX.1-schnell")
+            .join("snapshots")
+            .join("aaaa1111");
+        let snap_b = snap_a.parent().unwrap().join("bbbb2222");
+        std::fs::create_dir_all(snap_a.join("vae")).unwrap();
+        std::fs::create_dir_all(&snap_b).unwrap();
+        std::fs::write(snap_a.join("vae").join("ae.safetensors"), b"ae").unwrap();
+        let got = hf_hub_candidates_at(
+            tmp.path(),
+            "black-forest-labs/FLUX.1-schnell",
+            "vae/ae.safetensors",
+        );
+        // Both revision paths are candidates — content gating is
+        // reuse_byte_exact's job; a missing file in one revision must not
+        // hide the copy another revision holds.
+        assert_eq!(got.len(), 2);
+        assert!(got.contains(&snap_a.join("vae").join("ae.safetensors")));
+        assert!(got.contains(&snap_b.join("vae").join("ae.safetensors")));
+        // Unknown repo → no candidates, no error.
+        assert!(hf_hub_candidates_at(tmp.path(), "org/never-pulled", "x.bin").is_empty());
+        // Backslashes in a Windows-style repo slug normalize to the same
+        // hub dir naming as forward slashes.
+        assert_eq!(
+            hf_hub_candidates_at(
+                tmp.path(),
+                "black-forest-labs\\FLUX.1-schnell",
+                "vae/ae.safetensors"
+            )
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn unit__materialize_hub_hit__hardlink_keeps_cache_blob_and_row_file_independent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_blob = tmp.path().join("blob");
+        std::fs::write(&cache_blob, b"weights").unwrap();
+        let dest = tmp.path().join("models").join("ae.safetensors");
+        materialize_hub_hit(&cache_blob, &dest).unwrap();
+        // The materialized file carries the content...
+        assert_eq!(std::fs::read(&dest).unwrap(), b"weights");
+        // ...and removing blazar's copy never touches the cache blob
+        // (the rm-safety contract that forces materialization instead of
+        // registering the cache path directly).
+        std::fs::remove_file(&dest).unwrap();
+        assert_eq!(std::fs::read(&cache_blob).unwrap(), b"weights");
+        // Re-materializing after a delete works (fresh link or copy —
+        // either way the row file comes back with the right bytes).
+        let src2 = tmp.path().join("blob2");
+        std::fs::write(&src2, b"weights2").unwrap();
+        materialize_hub_hit(&src2, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"weights2");
+    }
 
     #[test]
     fn unit__safetensors_byte_estimate__dtype_math_and_unknown_refusal() {
@@ -3127,6 +4013,7 @@ mod tests {
             bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
             sha256: None,
             mmproj_path: None,
+            components: vec![],
             shards,
             arch: None,
             params: None,
@@ -3161,6 +4048,51 @@ mod tests {
     }
 
     #[test]
+    fn unit__repull_gate__diffusion_family_row_without_set_is_a_component_repair() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Valid kvless component GGUF at the recorded size (the intact
+        // container shape from the truth-table pin).
+        let mut kvless = b"GGUF".to_vec();
+        kvless.extend_from_slice(&3u32.to_le_bytes());
+        kvless.extend_from_slice(&297u64.to_le_bytes());
+        kvless.extend_from_slice(&0u64.to_le_bytes());
+        let dit = tmp.path().join("dit.gguf");
+        std::fs::write(&dit, &kvless).unwrap();
+        let dit = dit.to_str().unwrap();
+
+        // Known family, set NEVER attached (row predates the
+        // component pull): Present would strand a 4.6 GiB DiT that can
+        // never boot — the gate must escalate to component repair.
+        let row = seed_row(
+            "qwen-image-2.1",
+            "abenzerps/Qwen-Image-2.1-GGUF",
+            "Q4_K_M",
+            dit,
+            kvless.len() as u64,
+            1,
+        );
+        assert!(matches!(
+            repull_gate(
+                Some(&row),
+                "qwen-image-2.1",
+                &row.repo,
+                "Q4_K_M",
+                None,
+                false
+            ),
+            Repull::DeltaComponents
+        ));
+
+        // Unknown-family GGUF with no set is a plain present model —
+        // no repair exists to run.
+        let text = seed_row("m", "some/repo", "Q4_K_M", dit, kvless.len() as u64, 1);
+        assert!(matches!(
+            repull_gate(Some(&text), "m", &text.repo, "Q4_K_M", None, false),
+            Repull::Present(_)
+        ));
+    }
+
+    #[test]
     fn unit__model_file_intact__truth_table() {
         let tmp = tempfile::tempdir().unwrap();
         let good = tmp.path().join("good.gguf");
@@ -3190,6 +4122,21 @@ mod tests {
         assert!(!model_file_intact(&row(
             bad.to_str().unwrap(),
             content.len() as u64,
+            1
+        )));
+        // Diffusion component GGUF (0 KVs, valid container): the
+        // "missing general.architecture" parse still proves the
+        // container walked clean — intact, or every re-pull would
+        // prune + redownload a sound 4.6 GiB DiT forever.
+        let mut kvless = b"GGUF".to_vec();
+        kvless.extend_from_slice(&3u32.to_le_bytes());
+        kvless.extend_from_slice(&297u64.to_le_bytes());
+        kvless.extend_from_slice(&0u64.to_le_bytes());
+        let dit = tmp.path().join("dit.gguf");
+        std::fs::write(&dit, &kvless).unwrap();
+        assert!(model_file_intact(&row(
+            dit.to_str().unwrap(),
+            kvless.len() as u64,
             1
         )));
         // Sharded: header-only check on the launch shard (bytes is a SUM
@@ -3668,6 +4615,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn integration__pull_rowless_repull__reuses_byte_exact_leaf_without_download() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        dirs.ensure().unwrap();
+
+        let content = b"gguf-bytes-here".to_vec();
+        let sha = payload(&content);
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/models/owner/m-repo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "owner/m-repo",
+                "siblings": [ sibling_json("m-repo-q4_k_m.gguf", content.len() as u64, &sha) ]
+            })))
+            .mount(&api)
+            .await;
+        let dl = MockServer::start().await;
+        // Exactly ONE blob transfer serves both pulls: the row-less
+        // re-pull must reuse the byte-exact leaf, not re-download it
+        // (the 4.6 GiB incident class).
+        let dl_guard = Mock::given(method("GET"))
+            .and(path("/owner/m-repo/resolve/main/m-repo-q4_k_m.gguf"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(content.clone()))
+            .expect(1)
+            .mount_as_scoped(&dl)
+            .await;
+
+        let client = HfClient::with_bases(
+            &api.uri(),
+            &dl.uri(),
+            None,
+            vec![
+                api.uri().trim_start_matches("http://").to_string(),
+                dl.uri().trim_start_matches("http://").to_string(),
+            ],
+        )
+        .unwrap();
+        let puller = Puller {
+            dirs: dirs.clone(),
+            client,
+            bus: EventBus::default(),
+            force: false,
+        };
+        let first = puller.pull("owner/m-repo:Q4_K_M").await.unwrap().row;
+        let leaf = PathBuf::from(&first.path);
+
+        // Row-less re-pull: the store forgets the model (the gate's
+        // Present-branch is unreachable) but the file stays byte-exact
+        // on disk — the main download path must adopt it.
+        Store::open(&dirs).unwrap().delete_model("m-repo").unwrap();
+        let stale_part = dirs
+            .models_dir()
+            .join(leaf.file_name().unwrap().to_string_lossy().as_ref());
+        let stale_part = stale_part.with_extension("gguf.part");
+        std::fs::write(&stale_part, b"stale-interrupted-attempt").unwrap();
+        let second = puller.pull("owner/m-repo:Q4_K_M").await.unwrap().row;
+
+        assert_eq!(second.path, first.path, "row re-records the same leaf");
+        assert_eq!(std::fs::read(&leaf).unwrap(), content);
+        assert!(
+            !Path::new(&format!("{}.part", leaf.display())).exists(),
+            "stale partial swept on reuse"
+        );
+        // The scoped guard asserts `expect(1)` when dropped — exactly one
+        // blob transfer across BOTH pulls.
+        drop(dl_guard);
+    }
+
+    #[tokio::test]
     async fn integration__pull_sha_mismatch__partial_deleted_and_error() {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = BlazarDirs {
@@ -3923,6 +4942,49 @@ mod tests {
         assert!(
             cdn_req.headers.get("authorization").is_none(),
             "token must NEVER reach a CDN host"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn integration__gated_download__teaches_the_license_wall() {
+        // A 403 on the resolve URL must name the license + HF_TOKEN step,
+        // not a bare Forbidden (BFL FLUX VAE class).
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = blazar_core::BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let client = super::HfClient::with_bases(
+            &server.uri(),
+            &server.uri(),
+            None,
+            vec![super::tests::host_of(&server.uri())],
+        )
+        .unwrap();
+        let plan = super::FilePlan {
+            filename: "ae.safetensors".into(),
+            bytes: 8,
+            sha256: Some("deadbeef".into()),
+        };
+        let err = client
+            .download_file(
+                "o/gated",
+                &plan,
+                &dirs.models_dir().join("probe.bin"),
+                |_, _| {},
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gated or private") && msg.contains("HF_TOKEN"),
+            "gated download must teach the license wall, got: {msg}"
         );
     }
 

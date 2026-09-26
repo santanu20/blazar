@@ -32,6 +32,7 @@ fn model(path: &str, mmproj: Option<&str>) -> ModelRow {
         bytes: 1000,
         sha256: None,
         mmproj_path: mmproj.map(str::to_string),
+        components: vec![],
         shards: 1,
         arch: None,
         params: None,

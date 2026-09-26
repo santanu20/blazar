@@ -23,6 +23,7 @@ fn row(name: &str, path: &str) -> ModelRow {
         bytes: 42,
         sha256: None,
         mmproj_path: None,
+        components: vec![],
         shards: 1,
         arch: Some("qwen3".into()),
         params: Some(0.5),

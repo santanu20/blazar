@@ -6,6 +6,8 @@ pub mod audit;
 pub mod batch;
 pub mod cache_bust;
 pub mod histogram;
+pub mod http_pool;
+pub mod images;
 pub mod keys;
 pub mod latechunk;
 pub mod ollama;
@@ -23,6 +25,8 @@ pub mod sentinel;
 pub mod sessions;
 pub mod state;
 pub mod translate;
+pub mod vram;
+
 pub mod tts;
 pub mod whisper;
 
@@ -278,8 +282,29 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v1/audio/transcriptions",
             post(whisper::audio_transcriptions),
         )
+        .route("/v1/audio/translations", post(whisper::audio_translations))
         .route("/v1/audio/speech", post(tts::audio_speech))
+        .route("/v1/audio/jobs/{id}", get(whisper::audio_jobs_get))
+        .route(
+            "/v1/audio/jobs/{id}/cancel",
+            post(whisper::audio_jobs_cancel),
+        )
+        .route("/v1/audio/capabilities", get(whisper::audio_capabilities))
+        .route("/v1/images/generations", post(images::generations))
+        .route("/v1/images/edits", post(images::edits))
+        .route("/v1/images/jobs/{id}", get(images::jobs_get))
+        .route("/v1/images/jobs/{id}/cancel", post(images::jobs_cancel))
+        .route("/v1/images/capabilities", get(images::capabilities))
+        .route("/v1/videos/generations", post(images::video_generations))
+        // Jobs and capabilities are surface-agnostic upstream (one
+        // queue, `kind` distinguishes) — same handlers on both mounts.
+        .route("/v1/videos/jobs/{id}", get(images::jobs_get))
+        .route("/v1/videos/jobs/{id}/cancel", post(images::jobs_cancel))
+        .route("/v1/videos/capabilities", get(images::capabilities))
         .route("/audio/transcriptions", post(whisper::audio_transcriptions))
+        // Non-`/v1` alias for older OpenAI clients (docs promise the
+        // same alias symmetry as transcriptions).
+        .route("/audio/translations", post(whisper::audio_translations))
         .route("/infill", post(openai::openai_proxy))
         .route("/v1/chat/completions/control", post(openai::openai_proxy))
         .route(
@@ -351,6 +376,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .merge(openai_any)
         .merge(api)
+        // Unknown routes answer in the standard error envelope with the
+        // offending method + path and a pointer at the route census,
+        // instead of axum's empty-body 404. Inside the layer stack, so
+        // auth/CORS/access-log still apply to 404s.
+        .fallback(unknown_route)
         // Session pins (R3): innermost layer — auth/CORS/logging/body
         // limit have already run; only header-carrying requests buffer.
         .layer(middleware::from_fn_with_state(
@@ -454,6 +484,20 @@ fn error_response(code: u16, msg: &str) -> Response {
         ),
     )
         .into_response()
+}
+
+/// Router fallback: every unmatched method+path lands here. The message
+/// names what was asked and where the full mounted-route census lives —
+/// `GET /.well-known/blazar` is kept in lockstep with the router table.
+async fn unknown_route(method: axum::http::Method, uri: axum::http::Uri) -> Response {
+    error_response(
+        404,
+        &format!(
+            "unknown route: {} {} — GET /.well-known/blazar lists every mounted route",
+            method,
+            uri.path()
+        ),
+    )
 }
 
 /// Redacted secret for listings: enough to recognize, not enough to use.
@@ -750,17 +794,30 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
         // the label must not advertise passthrough semantics.
         "apis": ["openai", "ollama", "anthropic"],
         // F69: full route census (verified against the router table).
+        // Audit MM15: extended to the media generation lanes and the
+        // engine-scoped surfaces — the census is the machine-readable
+        // discovery contract and must not lag the router.
         "endpoints": {
             "openai": ["/v1/chat/completions", "/v1/chat/completions/control",
+                       "/v1/chat/completions/input_tokens",
                        "/v1/completions", "/v1/embeddings", "/v1/rerank", "/v1/reranking",
                        "/v1/responses", "/v1/responses/{id}", "/v1/responses/input_tokens",
                        "/v1/messages", "/v1/messages/count_tokens", "/v1/models",
                        "/v1/adapters", "/v1/batches", "/v1/batches/{id}",
                        "/v1/batches/{id}/cancel", "/v1/files", "/v1/files/{id}",
-                       "/v1/files/{id}/content", "/v1/streams/lookup",
-                       "/v1/audio/transcriptions", "/infill", "/tokenize", "/detokenize",
+                       "/v1/files/{id}/content", "/v1/streams/lookup", "/v1/stream",
+                       "/props", "/infill", "/tokenize", "/detokenize",
                        "/apply-template", "/slots", "/slots/{id}", "/responses",
-                       "/responses/input_tokens"],
+                       "/responses/input_tokens",
+                       "/v1/images/generations", "/v1/images/edits",
+                       "/v1/images/jobs/{id}", "/v1/images/jobs/{id}/cancel",
+                       "/v1/images/capabilities",
+                       "/v1/videos/generations", "/v1/videos/jobs/{id}",
+                       "/v1/videos/jobs/{id}/cancel", "/v1/videos/capabilities",
+                       "/v1/audio/transcriptions", "/v1/audio/translations",
+                       "/v1/audio/speech", "/v1/audio/jobs/{id}",
+                       "/v1/audio/jobs/{id}/cancel", "/v1/audio/capabilities",
+                       "/audio/transcriptions", "/audio/translations"],
             "ollama": ["/api/chat", "/api/generate", "/api/tags", "/api/ps", "/api/show",
                        "/api/embeddings", "/api/embed", "/api/rerank", "/api/pull",
                        "/api/delete", "/api/events", "/api/version"],
@@ -850,6 +907,31 @@ pub async fn serve(
     // rate and EWMA it into the supervisor's CacheHints — the adaptive
     // --cache-ram clamp's input and the spec gauge's source. Bounded
     // (2 s) fetches; failures just skip a window.
+    // Wake admission waiters when a child swap changes slot capacity:
+    // a completed adaptive reshape (SlotsReshaped) or an engine
+    // update/rollback replaced the child while requests were parked on
+    // the admission queue — only stream completions signal otherwise,
+    // so these waiters would sit until the 2-min park timeout.
+    let reshape_wake_task = {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut rx = state.bus.subscribe();
+            loop {
+                match rx.recv().await {
+                    Ok(
+                        blazar_runtime::events::BlazarEvent::SlotsReshaped { .. }
+                        | blazar_runtime::events::BlazarEvent::EngineUpdated { .. }
+                        | blazar_runtime::events::BlazarEvent::EngineRolledBack { .. },
+                    ) => state.queue.signal_free(),
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "reshape wake subscriber lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+    };
     let hint_task = {
         let state = Arc::clone(&state);
         tokio::spawn(async move {
@@ -864,16 +946,14 @@ pub async fn serve(
                 let mut totals = (0u64, 0u64);
                 let mut spec_totals = (0u64, 0u64);
                 for e in state.sup.live_http_endpoints() {
-                    let blazar_core::profile::Endpoint::Tcp { host, port } = &e.endpoint else {
-                        continue;
-                    };
                     // Child Prometheus text: aggregate counters (the /slots
                     // per-slot stats are short-lived and unreliable — the
-                    // metrics counters are the durable truth).
-                    let url = format!("http://{host}:{port}/metrics");
+                    // metrics counters are the durable truth). Both
+                    // transports serve /metrics; child_client picks the
+                    // socket-pinned client for unix children.
+                    let url = format!("{}/metrics", crate::proxy::child_base(&e.endpoint));
                     let Ok(resp) = crate::proxy::child_auth(
-                        state
-                            .http
+                        crate::state::child_client(&state, &e.endpoint)
                             .get(&url)
                             .timeout(std::time::Duration::from_secs(2)),
                         &e,
@@ -942,7 +1022,7 @@ pub async fn serve(
         let otlp = Arc::clone(&state.otlp);
         // F81: bounded POSTs — a black-hole collector used to wedge the
         // flusher forever (the 5s select only bounds the first-span wait).
-        let http = reqwest::Client::builder()
+        let http = http_pool::tuned(reqwest::Client::builder())
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_default();
@@ -1030,6 +1110,7 @@ pub async fn serve(
     }
     otlp_task.abort();
     hint_task.abort();
+    reshape_wake_task.abort();
     // H8: the lazy whisper-server child (if any request spawned one).
     state.whisper.shutdown().await;
     state.sup.shutdown_all().await?;

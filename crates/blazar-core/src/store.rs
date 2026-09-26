@@ -16,7 +16,7 @@ pub struct Store {
     conn: Connection,
 }
 
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 7;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS models (
     bytes      INTEGER NOT NULL,
     sha256     TEXT,
     mmproj_path TEXT,
+    components  TEXT NOT NULL DEFAULT '[]',
     shards     INTEGER NOT NULL DEFAULT 1,
     arch       TEXT,
     params     REAL,
@@ -71,7 +72,13 @@ CREATE TABLE IF NOT EXISTS bench_history (
     model TEXT NOT NULL,
     tg_tokens_per_sec REAL NOT NULL, -- llama-bench tg128 median
     pp_tokens_per_sec REAL NOT NULL DEFAULT 0,
-    ctx   INTEGER NOT NULL DEFAULT 0
+    ctx   INTEGER NOT NULL DEFAULT 0,
+    kind  TEXT NOT NULL DEFAULT 'llamacpp', -- lane that produced the row
+    ttft_ms REAL,                    -- HTTP lane: first-token latency
+    gen_tps REAL,                    -- HTTP lane: generation t/s (usage)
+    prompt_tps REAL,                 -- HTTP lane: prompt t/s (usage)
+    images_per_sec REAL,             -- HTTP image lane: images/s
+    detail TEXT                      -- HTTP lane: probe params JSON
 );
 ";
 
@@ -88,6 +95,26 @@ pub struct EngineRow {
     /// the column existed deserialize as `llamacpp` (serde default).
     #[serde(default)]
     pub kind: crate::engine_kind::EngineKind,
+}
+
+/// One HTTP-lane bench measurement (non-llamacpp engines: prompt/tg via
+/// streaming + usage stats, images via time-to-image). Fields the lane
+/// did not measure stay `None` — the image lane has no TTFT, the text
+/// lane has no images/s.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HttpBenchRecord {
+    /// Serving kind that produced the row (schema default `llamacpp`
+    /// keeps legacy rows readable without a join).
+    pub kind: String,
+    pub engine_tag: String,
+    pub model: String,
+    pub ttft_ms: Option<f64>,
+    pub gen_tps: Option<f64>,
+    pub prompt_tps: Option<f64>,
+    pub images_per_sec: Option<f64>,
+    /// Probe parameters (reps, `max_tokens`, size/steps) so a stored row
+    /// is reproducible without reading the code that wrote it.
+    pub detail_json: Option<String>,
 }
 
 impl EngineRow {
@@ -118,6 +145,14 @@ pub struct ModelRow {
     pub sha256: Option<String>,
     #[serde(default)]
     pub mmproj_path: Option<String>,
+    /// Diffusion component set (sdcpp lane): the `DiT` `path` above is
+    /// unservable alone — the VAE and text encoder(s) complete the model.
+    /// Flag-keyed because families differ in dialect: Qwen-Image pairs
+    /// `--vae`/`--llm`, FLUX pairs `--vae`/`--t5xxl`/`--clip_l`. Empty on
+    /// every text model (that emptiness IS the text/diffusion routing
+    /// domain marker).
+    #[serde(default)]
+    pub components: Vec<ComponentFile>,
     #[serde(default = "default_shards")]
     pub shards: i64,
     #[serde(default)]
@@ -127,6 +162,24 @@ pub struct ModelRow {
     #[serde(default)]
     pub ctx_train: Option<i64>,
     pub pulled_at: i64,
+}
+
+/// One diffusion component: the sd-server flag it rides and the local
+/// file that satisfies it (`--vae` → VAE, `--t5xxl` → T5 encoder, ...).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ComponentFile {
+    pub flag: String,
+    pub path: String,
+}
+
+impl ComponentFile {
+    #[must_use]
+    pub fn new(flag: &str, path: &str) -> Self {
+        Self {
+            flag: flag.to_string(),
+            path: path.to_string(),
+        }
+    }
 }
 
 /// Quantization-method tokens that mark a safetensors checkpoint as
@@ -162,6 +215,32 @@ impl ModelRow {
     #[must_use]
     pub fn is_quantized_safetensors(&self) -> bool {
         quantized_safetensors_signal(&self.name, &self.repo, &self.path)
+    }
+
+    /// Local path for a component flag, if the set carries it.
+    #[must_use]
+    pub fn component(&self, flag: &str) -> Option<&str> {
+        self.components
+            .iter()
+            .find(|c| c.flag == flag)
+            .map(|c| c.path.as_str())
+    }
+
+    /// Diffusion-domain routing marker: a row carrying any component
+    /// set serves on the sdcpp lane — component families carry
+    /// `--vae`/text-encoder files, standalone checkpoints (SD 1.5,
+    /// SDXL) carry a self-referencing `--model` entry. Every text row
+    /// has no set at all.
+    #[must_use]
+    pub fn has_component_set(&self) -> bool {
+        !self.components.is_empty()
+    }
+
+    /// Image edits (`/v1/images/edits`) need the vision-encoder
+    /// companion; families without one teach instead of re-pull-looping.
+    #[must_use]
+    pub fn serves_image_edits(&self) -> bool {
+        self.component("--llm_vision").is_some()
     }
 }
 
@@ -212,6 +291,18 @@ impl Store {
         Ok(())
     }
 
+    /// Column names of `table` — the source of truth for additive
+    /// migrations deciding whether an ALTER is still owed.
+    fn table_columns(&self, table: &str) -> CoreResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut cols = stmt.query([])?;
+        let mut names = Vec::new();
+        while let Some(r) = cols.next()? {
+            names.push(r.get(1)?);
+        }
+        Ok(names)
+    }
+
     fn migrate(&self) -> CoreResult<()> {
         let version: i32 = self
             .conn
@@ -220,23 +311,74 @@ impl Store {
             self.conn.execute_batch(SCHEMA_SQL)?;
             // v4 added engines.kind. CREATE TABLE IF NOT EXISTS covers
             // fresh databases; existing ones need the explicit ALTER.
-            let has_kind: bool = {
-                let mut stmt = self.conn.prepare("PRAGMA table_info(engines)")?;
-                let mut cols = stmt.query([])?;
-                let mut found = false;
-                while let Some(r) = cols.next()? {
-                    let name: String = r.get(1)?;
-                    if name == "kind" {
-                        found = true;
-                    }
-                }
-                found
-            };
-            if !has_kind {
+            if !self.table_columns("engines")?.contains(&"kind".to_string()) {
                 self.conn.execute(
                     "ALTER TABLE engines ADD COLUMN kind TEXT NOT NULL DEFAULT 'llamacpp'",
                     [],
                 )?;
+            }
+            // v5→v6: the three fixed diffusion columns became one
+            // flag-keyed `components` JSON column (families differ in
+            // dialect: Qwen pairs --vae/--llm, FLUX pairs --t5xxl/
+            // --clip_l). Fresh databases get it from SCHEMA_SQL; v5
+            // databases fold their legacy columns into it and drop them.
+            let model_cols = self.table_columns("models")?;
+            if !model_cols.contains(&"components".to_string()) {
+                self.conn.execute(
+                    "ALTER TABLE models ADD COLUMN components TEXT NOT NULL DEFAULT '[]'",
+                    [],
+                )?;
+            }
+            if model_cols.iter().any(|c| c.starts_with("vae_path")) {
+                // Collected up front: rewriting rows while the SELECT
+                // cursor is still open on the same table is undefined.
+                type LegacyComponentCols = (String, Option<String>, Option<String>, Option<String>);
+                let legacy: Vec<LegacyComponentCols> = self
+                    .conn
+                    .prepare("SELECT name, vae_path, llm_path, llm_vision_path FROM models")?
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                for (name, vae, llm, vision) in legacy {
+                    let folded: Vec<ComponentFile> =
+                        [("--vae", vae), ("--llm", llm), ("--llm_vision", vision)]
+                            .into_iter()
+                            .filter_map(|(flag, path)| path.map(|p| ComponentFile::new(flag, &p)))
+                            .collect();
+                    let folded_json = serde_json::to_string(&folded)
+                        .map_err(|e| CoreError::Catalog(e.to_string()))?;
+                    self.conn.execute(
+                        "UPDATE models SET components = ?1 WHERE name = ?2",
+                        params![folded_json, name],
+                    )?;
+                }
+                for col in ["vae_path", "llm_path", "llm_vision_path"] {
+                    self.conn
+                        .execute(&format!("ALTER TABLE models DROP COLUMN {col}"), [])?;
+                }
+            }
+            // v6→v7: bench_history grew HTTP-lane columns (kind + probe
+            // metrics). Fresh databases get them from SCHEMA_SQL; v6
+            // databases take additive ALTERs and keep every legacy row
+            // (NULL metrics mark rows the llama-bench lane wrote).
+            let bench_cols = self.table_columns("bench_history")?;
+            if !bench_cols.contains(&"kind".to_string()) {
+                self.conn.execute(
+                    "ALTER TABLE bench_history ADD COLUMN kind TEXT NOT NULL DEFAULT 'llamacpp'",
+                    [],
+                )?;
+                for col in [
+                    "ttft_ms REAL",
+                    "gen_tps REAL",
+                    "prompt_tps REAL",
+                    "images_per_sec REAL",
+                    "detail TEXT",
+                ] {
+                    let (name, ty) = col.split_once(' ').unwrap_or((col, "TEXT"));
+                    self.conn.execute(
+                        &format!("ALTER TABLE bench_history ADD COLUMN {name} {ty}"),
+                        [],
+                    )?;
+                }
             }
             self.conn
                 .pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -289,6 +431,39 @@ impl Store {
         tx.execute("UPDATE engines SET active = 1 WHERE tag = ?1", params![tag])?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Boot-time self-heal for the zero-active state (the class F120's
+    /// transaction fixed mid-write; an update interrupted before its
+    /// activation step lands here): when no row holds the active flag
+    /// but serving-capable engines are installed, activate the best one
+    /// — llamacpp lanes first (router mode's native lane), newest
+    /// within the kind — so one stale flag can never brick `serve`
+    /// while good engines sit installed. Returns the activated tag, or
+    /// None when the store needs no healing. Lazy lanes (whisper,
+    /// sdcpp) never claim the slot: the active row is the serving
+    /// adapter and must stay a text lane.
+    pub fn heal_active_engine(&self) -> CoreResult<Option<String>> {
+        if self.active_engine()?.is_some() {
+            return Ok(None);
+        }
+        let rank = |k: crate::engine_kind::EngineKind| match k {
+            crate::engine_kind::EngineKind::LlamaCpp => 2,
+            crate::engine_kind::EngineKind::MistralRs | crate::engine_kind::EngineKind::Sglang => 1,
+            _ => 0,
+        };
+        let pick = self
+            .list_engines()?
+            .into_iter()
+            .filter(|r| rank(r.kind) > 0)
+            .max_by_key(|r| (rank(r.kind), r.installed_at));
+        match pick {
+            Some(row) => {
+                self.set_active_engine(&row.tag)?;
+                Ok(Some(row.tag))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Rewrite one engine row's manifest JSON (supersede marking,
@@ -349,13 +524,14 @@ impl Store {
             )));
         }
         self.conn.execute(
-            "INSERT INTO models (name, repo, quant, path, bytes, sha256, mmproj_path, shards,
-                                 arch, params, ctx_train, pulled_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+            "INSERT INTO models (name, repo, quant, path, bytes, sha256, mmproj_path, components,
+                                 shards, arch, params, ctx_train, pulled_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
              ON CONFLICT(name) DO UPDATE SET
                repo = excluded.repo, quant = excluded.quant, path = excluded.path,
                bytes = excluded.bytes, sha256 = excluded.sha256,
-               mmproj_path = excluded.mmproj_path, shards = excluded.shards,
+               mmproj_path = excluded.mmproj_path, components = excluded.components,
+               shards = excluded.shards,
                arch = excluded.arch, params = excluded.params,
                ctx_train = excluded.ctx_train, pulled_at = excluded.pulled_at",
             params![
@@ -366,6 +542,8 @@ impl Store {
                 m.bytes,
                 m.sha256,
                 m.mmproj_path,
+                serde_json::to_string(&m.components)
+                    .map_err(|e| CoreError::Catalog(e.to_string()))?,
                 m.shards,
                 m.arch,
                 m.params,
@@ -378,8 +556,8 @@ impl Store {
 
     pub fn get_model(&self, name: &str) -> CoreResult<Option<ModelRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, repo, quant, path, bytes, sha256, mmproj_path, shards, arch, params,
-                    ctx_train, pulled_at
+            "SELECT name, repo, quant, path, bytes, sha256, mmproj_path, components, shards, arch,
+                    params, ctx_train, pulled_at
              FROM models WHERE name = ?1",
         )?;
         let mut rows = stmt.query(params![name])?;
@@ -391,8 +569,8 @@ impl Store {
 
     pub fn list_models(&self) -> CoreResult<Vec<ModelRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, repo, quant, path, bytes, sha256, mmproj_path, shards, arch, params,
-                    ctx_train, pulled_at
+            "SELECT name, repo, quant, path, bytes, sha256, mmproj_path, components, shards, arch,
+                    params, ctx_train, pulled_at
              FROM models ORDER BY name",
         )?;
         let rows = stmt.query_map([], model_from_row)?;
@@ -530,6 +708,31 @@ impl Store {
         Ok(())
     }
 
+    /// One HTTP-lane probe outcome. `tg_tokens_per_sec` mirrors
+    /// `gen_tps` so the latest-bench readers stay meaningful across
+    /// lanes; the kind + detail columns carry what the llama-bench row
+    /// never had (dialect, probe parameters, TTFT).
+    pub fn record_http_bench(&self, rec: &HttpBenchRecord) -> CoreResult<()> {
+        self.conn.execute(
+            "INSERT INTO bench_history \
+             (ts, engine_tag, model, tg_tokens_per_sec, pp_tokens_per_sec, ctx, \
+              kind, ttft_ms, gen_tps, prompt_tps, images_per_sec, detail) \
+             VALUES (unixepoch(), ?1, ?2, ?3, 0, 0, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                rec.engine_tag,
+                rec.model,
+                rec.gen_tps.unwrap_or(0.0),
+                rec.kind,
+                rec.ttft_ms,
+                rec.gen_tps,
+                rec.prompt_tps,
+                rec.images_per_sec,
+                rec.detail_json,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// The single most recent bench row overall (engine gate baseline).
     pub fn latest_bench_by_time(&self) -> CoreResult<Option<(String, f64, String)>> {
         let mut stmt = self
@@ -597,6 +800,16 @@ fn engine_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<EngineRow> {
 }
 
 fn model_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRow> {
+    let raw_components: Option<String> = r.get(7)?;
+    let components = match raw_components.as_deref() {
+        // Empty/NULL predates a pull ever attaching a set; anything else
+        // must decode — a silently-dropped set would re-route the row to
+        // the text lanes and die at spawn with a confusing crash.
+        None | Some("") => Vec::new(),
+        Some(raw) => serde_json::from_str(raw).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+    };
     Ok(ModelRow {
         name: r.get(0)?,
         repo: r.get(1)?,
@@ -605,11 +818,12 @@ fn model_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRow> {
         bytes: r.get(4)?,
         sha256: r.get(5)?,
         mmproj_path: r.get(6)?,
-        shards: r.get(7)?,
-        arch: r.get(8)?,
-        params: r.get(9)?,
-        ctx_train: r.get(10)?,
-        pulled_at: r.get(11)?,
+        components,
+        shards: r.get(8)?,
+        arch: r.get(9)?,
+        params: r.get(10)?,
+        ctx_train: r.get(11)?,
+        pulled_at: r.get(12)?,
     })
 }
 
@@ -687,6 +901,7 @@ mod tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,
@@ -740,6 +955,72 @@ mod tests {
         assert_eq!(s.list_engines().unwrap().len(), 2);
     }
 
+    fn engine_row_of(tag: &str, kind: EngineKind, installed_at: i64) -> EngineRow {
+        EngineRow {
+            tag: tag.into(),
+            asset: "ubuntu-vulkan-x64".into(),
+            sha256: format!("{tag}deadbeef"),
+            installed_at,
+            active: false,
+            manifest: "{}".into(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn unit__heal_active_engine__zero_active_prefers_llamacpp_then_newest() {
+        let (_t, s) = tmp_store();
+        // llamacpp older than mistral.rs, whisper newest of all: kind
+        // preference beats recency, and the lazy whisper lane never
+        // claims the serving slot.
+        s.upsert_engine(&engine_row_of("v0.9.3", EngineKind::MistralRs, 20))
+            .unwrap();
+        s.upsert_engine(&engine_row_of("b5130", EngineKind::Whisper, 30))
+            .unwrap();
+        s.upsert_engine(&engine_row_of("b100", EngineKind::LlamaCpp, 10))
+            .unwrap();
+        let healed = s.heal_active_engine().unwrap();
+        assert_eq!(healed.as_deref(), Some("b100"));
+        assert_eq!(s.active_engine().unwrap().unwrap().tag, "b100");
+        // Without a llamacpp lane the newest serving engine wins; the
+        // lazy whisper row still never does.
+        let (_t2, s2) = tmp_store();
+        s2.upsert_engine(&engine_row_of("v0.9.3", EngineKind::MistralRs, 20))
+            .unwrap();
+        s2.upsert_engine(&engine_row_of("sglang-0.5", EngineKind::Sglang, 40))
+            .unwrap();
+        s2.upsert_engine(&engine_row_of("b5130", EngineKind::Whisper, 60))
+            .unwrap();
+        assert_eq!(
+            s2.heal_active_engine().unwrap().as_deref(),
+            Some("sglang-0.5")
+        );
+    }
+
+    #[test]
+    fn unit__heal_active_engine__active_present_is_noop() {
+        let (_t, s) = tmp_store();
+        s.upsert_engine(&engine_row_of("b100", EngineKind::LlamaCpp, 10))
+            .unwrap();
+        s.set_active_engine("b100").unwrap();
+        assert_eq!(s.heal_active_engine().unwrap(), None);
+        assert_eq!(s.active_engine().unwrap().unwrap().tag, "b100");
+    }
+
+    #[test]
+    fn unit__heal_active_engine__lazy_only_store_stays_unhealed() {
+        // Only lazy lanes installed: the serving error path must stay
+        // honest (activating whisper as the serving adapter would
+        // regress the whisper-dethroning bug this store already fixed).
+        let (_t, s) = tmp_store();
+        s.upsert_engine(&engine_row_of("b5130", EngineKind::Whisper, 30))
+            .unwrap();
+        s.upsert_engine(&engine_row_of("master-890", EngineKind::SdCpp, 40))
+            .unwrap();
+        assert_eq!(s.heal_active_engine().unwrap(), None);
+        assert!(s.active_engine().unwrap().is_none());
+    }
+
     #[test]
     fn unit__model_roundtrip_and_delete() {
         let (_t, s) = tmp_store();
@@ -751,6 +1032,7 @@ mod tests {
             bytes: 500_000_000,
             sha256: Some("abc".into()),
             mmproj_path: None,
+            components: vec![],
             shards: 2,
             arch: Some("qwen3".into()),
             params: Some(0.6),
@@ -812,6 +1094,7 @@ mod tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,
@@ -864,6 +1147,7 @@ mod tests {
                 bytes: 1,
                 sha256: None,
                 mmproj_path: None,
+                components: vec![],
                 shards: 1,
                 arch: None,
                 params: None,
@@ -880,5 +1164,149 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn unit__migrate_v4_db__adds_components_col_and_keeps_rows() {
+        // A database last written by a v4 daemon: models table without
+        // any diffusion columns. Opening it must add the components
+        // column in place, keep every existing row, and read the set as
+        // empty (that emptiness is the text-model domain marker).
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(&dirs.data_dir).unwrap();
+        {
+            let conn = Connection::open(dirs.db_file()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE models (
+                    name       TEXT PRIMARY KEY,
+                    repo       TEXT NOT NULL,
+                    quant      TEXT NOT NULL,
+                    path       TEXT NOT NULL,
+                    bytes      INTEGER NOT NULL,
+                    sha256     TEXT,
+                    mmproj_path TEXT,
+                    shards     INTEGER NOT NULL DEFAULT 1,
+                    arch       TEXT,
+                    params     REAL,
+                    ctx_train  INTEGER,
+                    pulled_at  INTEGER NOT NULL
+                );
+                INSERT INTO models (name, repo, quant, path, bytes, shards, pulled_at)
+                VALUES ('old-m', 'r', 'Q4_K_M', 'p', 7, 1, 1);
+                PRAGMA user_version = 4;",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&dirs).unwrap();
+        let mut cols = s.conn().prepare("PRAGMA table_info(models)").unwrap();
+        let mut rows = cols.query([]).unwrap();
+        let mut names: Vec<String> = Vec::new();
+        while let Some(r) = rows.next().unwrap() {
+            names.push(r.get::<_, String>(1).unwrap());
+        }
+        names.sort_unstable();
+        assert!(
+            names.iter().any(|n| n == "components"),
+            "missing components: {names:?}"
+        );
+        let old = s.get_model("old-m").unwrap().unwrap();
+        assert_eq!(old.bytes, 7);
+        assert!(old.components.is_empty());
+        assert!(!old.has_component_set());
+        // And the new field roundtrips through the migrated table.
+        s.upsert_model(&ModelRow {
+            name: "qwen-image-2.1".into(),
+            repo: "abenzerps/Qwen-Image-2.1-GGUF".into(),
+            quant: "Q4_K_M".into(),
+            path: "p.gguf".into(),
+            bytes: 4_608_000_000,
+            sha256: None,
+            mmproj_path: None,
+            components: vec![
+                ComponentFile::new("--vae", "vae.safetensors"),
+                ComponentFile::new("--llm", "te.gguf"),
+            ],
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 2,
+        })
+        .unwrap();
+        let set = s.get_model("qwen-image-2.1").unwrap().unwrap();
+        assert_eq!(set.component("--vae"), Some("vae.safetensors"));
+        assert_eq!(set.component("--llm"), Some("te.gguf"));
+        assert!(set.has_component_set());
+        assert!(!set.serves_image_edits());
+        assert_eq!(s.list_models().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn unit__migrate_v5_db__folds_legacy_component_cols_and_drops_them() {
+        // v5 wrote three fixed columns (--vae/--llm/--llm_vision paths).
+        // v6 folds them into the flag-keyed components JSON and drops
+        // the legacy columns — FLUX needs --t5xxl/--clip_l, which the
+        // fixed shape could never carry.
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(&dirs.data_dir).unwrap();
+        {
+            let conn = Connection::open(dirs.db_file()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE models (
+                    name       TEXT PRIMARY KEY,
+                    repo       TEXT NOT NULL,
+                    quant      TEXT NOT NULL,
+                    path       TEXT NOT NULL,
+                    bytes      INTEGER NOT NULL,
+                    sha256     TEXT,
+                    mmproj_path TEXT,
+                    vae_path     TEXT,
+                    llm_path     TEXT,
+                    llm_vision_path TEXT,
+                    shards     INTEGER NOT NULL DEFAULT 1,
+                    arch       TEXT,
+                    params     REAL,
+                    ctx_train  INTEGER,
+                    pulled_at  INTEGER NOT NULL
+                );
+                INSERT INTO models (name, repo, quant, path, bytes, shards, pulled_at,
+                                    vae_path, llm_path, llm_vision_path)
+                VALUES ('qwen', 'r', 'Q4_K_M', 'p', 7, 1, 1,
+                        'vae.safetensors', 'te.gguf', 'vis.gguf'),
+                       ('text-m', 'r', 'Q4_K_M', 't', 8, 1, 1, NULL, NULL, NULL);
+                PRAGMA user_version = 5;",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&dirs).unwrap();
+        let qwen = s.get_model("qwen").unwrap().unwrap();
+        assert_eq!(
+            qwen.components,
+            vec![
+                ComponentFile::new("--vae", "vae.safetensors"),
+                ComponentFile::new("--llm", "te.gguf"),
+                ComponentFile::new("--llm_vision", "vis.gguf"),
+            ]
+        );
+        assert!(qwen.serves_image_edits());
+        let text = s.get_model("text-m").unwrap().unwrap();
+        assert!(text.components.is_empty());
+        let mut cols = s.conn().prepare("PRAGMA table_info(models)").unwrap();
+        let mut rows = cols.query([]).unwrap();
+        while let Some(r) = rows.next().unwrap() {
+            let name: String = r.get(1).unwrap();
+            assert!(
+                !name.ends_with("_path") || name == "mmproj_path",
+                "legacy column {name} survived the fold"
+            );
+        }
     }
 }

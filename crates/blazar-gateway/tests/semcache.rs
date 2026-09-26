@@ -95,6 +95,71 @@ async fn integration__semcache__miss_store_then_hit_full_stack() {
 }
 
 #[tokio::test]
+async fn integration__semcache__same_prompt_different_sampling_class_misses() {
+    let ts = start(sem_config()).await;
+    let c = client();
+    let mut cold = chat_body("hello semantic cache world");
+    cold["options"] = serde_json::json!({"temperature": 0.1});
+    let r: serde_json::Value = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&cold)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["cache_debug"]["cache_hit"], false);
+
+    // Same prompt text, different generation problem (temperature): the
+    // similarity is 1.0 but the class key differs — must be served live.
+    let mut hot = chat_body("hello semantic cache world");
+    hot["options"] = serde_json::json!({"temperature": 0.9});
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&hot)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("x-blazar-cache")
+            .and_then(|v| v.to_str().ok()),
+        Some("miss")
+    );
+    let r: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(r["cache_debug"]["cache_hit"], false);
+    assert_eq!(
+        ts.state
+            .sem
+            .misses
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+    assert_eq!(
+        ts.state.sem.hits.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+
+    // Class isolation is bidirectional: the original class still hits
+    // over the now-two stored entries of identical prompt text.
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&cold)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("x-blazar-cache")
+            .and_then(|v| v.to_str().ok()),
+        Some("hit; similarity=1.000")
+    );
+}
+
+#[tokio::test]
 async fn integration__semcache__header_off_bypasses() {
     let ts = start(sem_config()).await;
     let c = client();

@@ -4,7 +4,7 @@
 //! adapters later implement the same trait — gateway, supervisor and
 //! lifecycle stay engine-agnostic.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use blazar_core::profile::{Endpoint, Profile};
@@ -151,13 +151,6 @@ impl LlamaCppEngine {
             child_env: env,
         }
     }
-
-    fn base_url(endpoint: &Endpoint) -> String {
-        match endpoint {
-            Endpoint::Tcp { host, port } => format!("http://{host}:{port}"),
-            Endpoint::Unix { .. } => String::new(), // unix sockets: probe skipped
-        }
-    }
 }
 
 #[async_trait]
@@ -231,10 +224,16 @@ impl Engine for LlamaCppEngine {
     }
 
     async fn health_check(&self, endpoint: &Endpoint, timeout: std::time::Duration) -> Result<()> {
-        let url = Self::base_url(endpoint);
-        if url.is_empty() {
-            return Ok(()); // unix transport: health via socket handled by caller
-        }
+        // TCP probes ride the shared pool client; unix probes use an
+        // ephemeral client pinned to the socket (probes run once per
+        // spawn — no pool to warm) with a placeholder host the
+        // connector ignores.
+        let (client, url) = match endpoint {
+            Endpoint::Tcp { host, port } => (self.http.clone(), format!("http://{host}:{port}")),
+            Endpoint::Unix { socket } => {
+                (crate::uds::client(socket), "http://localhost".to_string())
+            }
+        };
         let deadline = tokio::time::Instant::now() + timeout;
         let started = std::time::Instant::now();
         // Adaptive poll: fast at first (the child usually turns healthy
@@ -243,7 +242,7 @@ impl Engine for LlamaCppEngine {
         // post-ready overshoot from ~75ms to ~12ms on cold first token.
         let mut poll = std::time::Duration::from_millis(25);
         loop {
-            match self.http.get(format!("{url}/health")).send().await {
+            match client.get(format!("{url}/health")).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     let body: serde_json::Value = resp.json().await.unwrap_or_default();
                     if body["status"] == "ok" {
@@ -311,6 +310,20 @@ async fn probe_rpc_endpoints(argv: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Anchor directory for engine children. Upstream binaries resolve
+/// relative paths against the inherited cwd (sd.cpp's video handler walks
+/// "./" directories); a service daemon started at `/` sends those walks
+/// into /run symlink loops (`Too many levels of symbolic links`). Seating
+/// every child in its engine's install dir keeps relative lookups inside
+/// blazar-owned territory. Bare binary names (no directory component)
+/// keep the inherited cwd — same behavior as before this anchor existed.
+fn child_cwd(server_path: &str) -> Option<std::path::PathBuf> {
+    std::path::Path::new(server_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty() && p.as_os_str() != ".")
+        .map(std::path::Path::to_path_buf)
+}
+
 /// Shared child-process mechanics for every engine kind: null stdin,
 /// piped stdio into tracing + the log tail, kill-on-drop, own process
 /// group (§5 H19: acquired = released by construction).
@@ -320,27 +333,44 @@ fn spawn_child(
     endpoint: &Endpoint,
     child_env: &[(String, String)],
 ) -> Result<ChildHandle> {
-    let mut cmd = tokio::process::Command::new(server_path);
+    let mut cmd = std::process::Command::new(server_path);
     cmd.args(argv)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        // If the owning process dies without teardown, the child must
-        // not linger (test leakage, daemon crash).
-        .kill_on_drop(true);
+        .stderr(std::process::Stdio::piped());
+    if let Some(dir) = child_cwd(server_path) {
+        cmd.current_dir(dir);
+    }
     #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt as _;
         // Own process group: Ctrl-C on the daemon never reaches the
         // child. Termination is single-pid by design (terminate()
         // signals only this pid; never a group signal).
         cmd.process_group(0);
+        // Kernel lifetime tie: if the owning PROCESS dies without
+        // teardown (crash, SIGKILL, terminal-scope death), the child
+        // gets SIGTERM from the kernel. kill_on_drop only covers
+        // runtime teardown inside a still-living process.
+        crate::probe::parent_death_tie(&mut cmd);
     }
     for (k, v) in child_env {
         cmd.env(k, v);
     }
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("spawn {server_path}"))?;
+    let mut cmd = tokio::process::Command::from(cmd);
+    // Runtime teardown in a live process (tests, graceful shutdown)
+    // still drops the child.
+    cmd.kill_on_drop(true);
+    // Inline the io source (ENOENT/EACCES...) into the context: callers
+    // that render only `Display` — the gateway's 500 body — would
+    // otherwise show a bare `spawn <path>` with no reason for it.
+    let mut child = cmd.spawn().map_err(|e| {
+        anyhow!(
+            "spawn {server_path}: {e} — engine binary missing or not executable; \
+                 re-rooted engines adopt the live data dir, so this usually means \
+                 `blazar engine update` is needed"
+        )
+    })?;
 
     // Pipe child logs into tracing; the shared tail keeps the last lines
     // around for death diagnostics.
@@ -787,6 +817,154 @@ impl Engine for MistralRsEngine {
     }
 }
 
+/// sd.cpp engine (`sd-server` from leejet/stable-diffusion.cpp). Dialect
+/// differences that shaped this impl (verified against
+/// stable-diffusion.cpp master-890-74988b2):
+/// - the server refuses to boot without model arguments (`model_path/
+///   diffusion_model` required) and binds its port only after the model
+///   set loads — connection-refused during a health poll is the normal
+///   loading phase, not a crash signal.
+/// - no `/health` route (404): readiness is `GET /v1/models` answering
+///   200 with an OpenAI-shaped `{"data":[...]}` body (a single synthetic
+///   `sd-cpp-local` entry), and `POST /v1/images/generations` speaks the
+///   `OpenAI` images dialect (`{"created", "data":[{"b64_json"}],
+///   "output_format":"png"}`) with only `prompt` required.
+/// - `--list-devices` prints `NAME<TAB>description` lines (no MiB), a
+///   different shape from llama's — parsed by `parse_sd_devices`.
+/// - release binaries carry RUNPATH `$ORIGIN` (verified via readelf),
+///   so sibling `libggml*.so` resolve with no env wiring.
+/// - no unix-socket transport: `--listen-ip`/`--listen-port` only.
+pub struct SdCppEngine {
+    pub manifest: crate::engine::manifest::Manifest,
+    /// HTTP client for health polls (children are loopback).
+    http: reqwest::Client,
+    /// Extra env injected into children (config `engine_env`).
+    pub child_env: Vec<(String, String)>,
+}
+
+impl SdCppEngine {
+    #[must_use]
+    pub fn new(manifest: crate::engine::manifest::Manifest) -> Self {
+        Self::with_env(manifest, Vec::new())
+    }
+
+    #[must_use]
+    pub fn with_env(
+        manifest: crate::engine::manifest::Manifest,
+        env: Vec<(String, String)>,
+    ) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("health client");
+        Self {
+            manifest,
+            http,
+            child_env: env,
+        }
+    }
+
+    fn base_url(endpoint: &Endpoint) -> String {
+        match endpoint {
+            Endpoint::Tcp { host, port } => format!("http://{host}:{port}"),
+            Endpoint::Unix { .. } => String::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl Engine for SdCppEngine {
+    fn kind(&self) -> blazar_core::engine_kind::EngineKind {
+        blazar_core::engine_kind::EngineKind::SdCpp
+    }
+
+    fn capabilities(&self) -> &crate::engine::manifest::Manifest {
+        &self.manifest
+    }
+
+    fn build_argv(
+        &self,
+        _model: &blazar_core::ModelRow,
+        profile: &Profile,
+        endpoint: &Endpoint,
+    ) -> Vec<String> {
+        let _ = endpoint;
+        profile.argv.clone()
+    }
+
+    async fn spawn(&self, argv: &[String], endpoint: &Endpoint) -> Result<ChildHandle> {
+        if matches!(endpoint, Endpoint::Unix { .. }) {
+            return Err(anyhow!(
+                "sdcpp engines have no unix-socket transport; set \
+                 child_transport = \"tcp\" in the blazar config"
+            ));
+        }
+        spawn_child(&self.manifest.server_path, argv, endpoint, &self.child_env)
+    }
+
+    async fn enumerate_devices(&self) -> Result<Option<Vec<crate::engine::manifest::DeviceDesc>>> {
+        if !self.manifest.flags.iter().any(|f| f == "--list-devices") {
+            return Ok(None);
+        }
+        let mut cmd = tokio::process::Command::new(&self.manifest.server_path);
+        cmd.arg("--list-devices")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        for (k, v) in &self.child_env {
+            cmd.env(k, v);
+        }
+        let listed = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output()).await;
+        match listed {
+            Ok(Ok(out)) => {
+                let text = String::from_utf8_lossy(&out.stdout).to_string();
+                let devs = crate::engine::manifest::parse_sd_devices(&text);
+                if devs.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(devs))
+                }
+            }
+            // Listing failure must never block serving: skip validation.
+            Ok(Err(_)) | Err(_) => Ok(None),
+        }
+    }
+
+    async fn health_check(&self, endpoint: &Endpoint, timeout: std::time::Duration) -> Result<()> {
+        let url = Self::base_url(endpoint);
+        if url.is_empty() {
+            return Ok(());
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        let started = std::time::Instant::now();
+        let mut poll = std::time::Duration::from_millis(25);
+        loop {
+            // sd-server has no /health route (404 — verified against
+            // master-890-74988b2); the port binds only after the model set
+            // loads, and GET /v1/models answers 200 with an OpenAI-shaped
+            // {"data":[...]} once it does. That 200 IS the ready signal.
+            match self.http.get(format!("{url}/v1/models")).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                    if body["data"].as_array().is_some() {
+                        tracing::debug!("sdcpp healthy at {url} after {:?}", started.elapsed());
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "sdcpp at {url} did not list models on /v1/models within {timeout:?} \
+                     (model_load_timeout)"
+                ));
+            }
+            tokio::time::sleep(poll).await;
+            poll = std::cmp::min(poll.mul_f64(1.6), std::time::Duration::from_millis(150));
+        }
+    }
+}
+
 /// sglang engine (`python -m sglang.launch_server` behind an executable
 /// shim). Dialect differences that shaped this impl (verified against
 /// sglang v0.5.19 `http_server.py` + `server_args.py`):
@@ -969,6 +1147,19 @@ async fn pipe_logs<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
 #[allow(non_snake_case)] // repo convention: unit__scenario__expected
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__child_cwd__anchors_to_engine_dir_and_skips_bare_names() {
+        assert_eq!(
+            child_cwd("/opt/blazar/engines/master-890/sd-server"),
+            Some("/opt/blazar/engines/master-890".into())
+        );
+        // A bare name resolves via PATH; no owned dir exists, so the
+        // child keeps the inherited cwd (pre-anchor behavior).
+        assert_eq!(child_cwd("sd-server"), None);
+        // "./sd-server" has an empty parent — same inherit rule.
+        assert_eq!(child_cwd("./sd-server"), None);
+    }
 
     fn rpc_argv(value: &str) -> Vec<String> {
         vec![
@@ -1214,6 +1405,155 @@ mod tests {
         assert!(err.to_string().contains("model_load_timeout"), "{err:#}");
     }
 
+    fn sdcpp_engine() -> SdCppEngine {
+        SdCppEngine::new(crate::engine::manifest::Manifest {
+            tag: "master-890-74988b2".into(),
+            build_number: 890,
+            version_raw: "stable-diffusion.cpp".into(),
+            devices: vec![],
+            flags: std::collections::BTreeSet::new(),
+            spec_types: vec![],
+            server_path: String::new(),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn unit__sdcpp_spawn__unix_endpoint_rejected_with_teaching() {
+        let engine = sdcpp_engine();
+        let err = engine
+            .spawn(
+                &["sd-server".to_string()],
+                &Endpoint::Unix {
+                    socket: "/run/blazar/sdcpp.sock".into(),
+                },
+            )
+            .await
+            .expect_err("unix endpoint must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("no unix-socket transport"), "{msg}");
+        assert!(msg.contains("child_transport"), "{msg}");
+    }
+
+    /// Minimal sd-server dialect stub: `/v1/models` answers the `OpenAI`
+    /// shape, every other route (notably `/health`) 404s — the live
+    /// master-890 contract.
+    async fn sdcpp_dialect_stub() -> u16 {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let head = String::from_utf8_lossy(&buf).to_string();
+                    let (status, body) = if head.starts_with("GET /v1/models") {
+                        (
+                            "200 OK",
+                            r#"{"data":[{"id":"sd-cpp-local","object":"model","owned_by":"local"}]}"#,
+                        )
+                    } else {
+                        ("404 Not Found", r#"{"error":"no route"}"#)
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn unit__sdcpp_health__v1_models_200_is_the_ready_signal() {
+        // sd-server has no /health route: readiness = GET /v1/models 200
+        // with a {"data":[...]} body. A plain TCP/HTTP listener whose
+        // /v1/models 404s (the llama dialect) must NOT pass.
+        let port = sdcpp_dialect_stub().await;
+        let engine = sdcpp_engine();
+        let endpoint = Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port,
+        };
+        engine
+            .health_check(&endpoint, std::time::Duration::from_secs(5))
+            .await
+            .expect("sd dialect stub must read healthy");
+    }
+
+    #[tokio::test]
+    async fn unit__sdcpp_health__llama_health_route_alone_is_not_ready() {
+        // The probe-latency stub answers 200 to everything EXCEPT it is
+        // not used here: craft the inverse — /health 200 exists but
+        // /v1/models does not. That is a llama-server, not an sd-server.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let head = String::from_utf8_lossy(&buf).to_string();
+                    let (status, body) = if head.starts_with("GET /health") {
+                        ("200 OK", r#"{"status":"ok"}"#)
+                    } else {
+                        ("404 Not Found", "{}")
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let engine = sdcpp_engine();
+        let endpoint = Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port,
+        };
+        let err = engine
+            .health_check(&endpoint, std::time::Duration::from_secs(1))
+            .await
+            .expect_err("llama /health dialect must not satisfy sdcpp readiness");
+        assert!(
+            err.to_string()
+                .contains("did not list models on /v1/models"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unit__sdcpp_health__deadline_still_bounded() {
+        let port = dead_port().await;
+        let engine = sdcpp_engine();
+        let endpoint = Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port,
+        };
+        let err = engine
+            .health_check(&endpoint, std::time::Duration::from_secs(1))
+            .await
+            .expect_err("dead port must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("/v1/models"), "{msg}");
+        assert!(msg.contains("model_load_timeout"), "{msg}");
+    }
+
     fn mistralrs_row(path: &str) -> blazar_core::ModelRow {
         blazar_core::ModelRow {
             name: "qwen2.5-0.5b-instruct".into(),
@@ -1223,6 +1563,7 @@ mod tests {
             bytes: 988_000_000,
             sha256: None,
             mmproj_path: None,
+            components: vec![],
             shards: 1,
             arch: Some("Qwen2ForCausalLM".into()),
             params: None,

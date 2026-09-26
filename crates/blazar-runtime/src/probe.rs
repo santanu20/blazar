@@ -73,6 +73,48 @@ pub(crate) fn with_spawn_retry<T>(
     }
 }
 
+/// Tie a spawned child's lifetime to the spawning PROCESS: when the
+/// parent dies for any reason — crash, SIGKILL, terminal close, runtime
+/// teardown — the kernel delivers SIGTERM to the child. This is the
+/// guarantee `kill_on_drop` cannot give: drop handlers only run while
+/// the owning runtime is still alive, so an owner killed mid-flight
+/// would otherwise leak VRAM-holding engine children (live-verified:
+/// an orphaned llama-server held 5.3 GiB after its parent serve died
+/// in a terminal scope).
+///
+/// The pre-fork parent pid is captured up front and re-checked inside
+/// the child: if the parent died between fork and prctl, the signal
+/// would never arm — the child exits instead of lingering. Note the
+/// kernel granularity is the forking THREAD; tokio worker threads only
+/// exit at runtime shutdown (when children should die anyway), so this
+/// is precisely the desired semantics.
+///
+/// Windows has no prctl equivalent reachable through std; there the
+/// children stay tied to the runtime's `kill_on_drop` plus the
+/// supervisor's graceful terminate lane.
+#[cfg(unix)]
+#[allow(unsafe_code)] // one prctl flag arm + one ppid read in the forked child
+pub(crate) fn parent_death_tie(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+    let parent = std::process::id();
+    // SAFETY: closure body is async-signal-safe (prctl + _exit only);
+    // it runs in the forked child before exec, per the pre_exec
+    // contract.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent as libc::pid_t {
+                // Parent died in the fork->prctl window; arming is too
+                // late. Exit before exec instead of becoming an orphan.
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Run a short-lived probe command (`--version`/`--help`/census class)
 /// under a hard deadline. A hung probe binary must fail fast instead of
 /// wedging the caller forever (F85); on timeout the child is killed and
@@ -174,13 +216,20 @@ pub fn probe_hardware(manifest: Option<&Manifest>) -> Hardware {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    if gpus.is_empty() {
+    if gpus.is_empty() || gpus.iter().all(|g| g.total_mib == 0) {
         // Engines without a --list-devices census (mistral.rs) leave the
         // manifest's device list empty too — a GPU the daemon cannot see
         // silently starves every capacity decision on that lane (measured:
         // "0 GPUs" banner on a 4070 box, paged-attn auto-fallback blind,
         // 502 loads). Fall back to a system-side NVIDIA census; non-NVIDIA
         // boxes without a census keep the empty list, same as before.
+        //
+        // A census that names devices but reports total_mib == 0 on every
+        // row (sd-server's --list-devices prints NAME<TAB>description only,
+        // no memory) is not a capacity census either: it fed the pool
+        // Vulkan-namespace names with zero free bytes — placement tied at
+        // 0 and picked nonsense for llama spawns. Treat it exactly like
+        // the empty census and let nvidia-smi speak when it can.
         gpus = nvidia_smi_gpus();
     }
     hardware_with(gpus)
@@ -282,6 +331,35 @@ pub fn gpu_compute_tenants() -> Option<Vec<GpuTenant>> {
     Some(parse_gpu_tenants(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// Pure parser for the single-column `memory.free` census (MiB per line,
+/// one per GPU). Empty/unparseable output is `None` — never a guessed 0.
+fn sum_free_mib_csv(text: &str) -> Option<u64> {
+    let total = text
+        .lines()
+        .filter_map(|ln| ln.trim().parse::<u64>().ok())
+        .sum::<u64>();
+    (total > 0).then_some(total)
+}
+
+/// Fresh free VRAM (MiB, summed across NVIDIA cards — matching
+/// `Hardware::free_vram_mib` semantics on single-card boxes). Used by the
+/// gateway's submit-time scratch gate, where a spawn-time snapshot is too
+/// stale: a foreign tenant (another product's server) can grab the card
+/// between spawn and submit. `None` when the tool is absent or fails —
+/// callers treat that as "no gate data", never as zero headroom.
+#[must_use]
+pub fn nvidia_free_vram_mib() -> Option<u64> {
+    let out = probe_output(
+        std::process::Command::new("nvidia-smi")
+            .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"]),
+        5,
+    )?;
+    if !out.status.success() {
+        return None;
+    }
+    sum_free_mib_csv(&String::from_utf8_lossy(&out.stdout))
+}
+
 /// sysinfo half + caller-supplied GPU list: the composition point for a
 /// LIVE `--list-devices` census (see `engine::manifest::run_list_devices`).
 #[must_use]
@@ -381,6 +459,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unit__sum_free_mib_csv__sums_and_rejects_empty() {
+        assert_eq!(sum_free_mib_csv("7790\n"), Some(7_790));
+        assert_eq!(sum_free_mib_csv("100\n200\n"), Some(300));
+        assert_eq!(sum_free_mib_csv(""), None);
+        assert_eq!(sum_free_mib_csv("not-a-number\n"), None);
+    }
+
+    #[test]
     fn unit__probe_hardware__merges_sysinfo_and_devices() {
         let m = Manifest {
             tag: "t".into(),
@@ -407,6 +493,45 @@ mod tests {
         // asserting the sysinfo-only merge at the composition point.
         let cpu_only = hardware_with(Vec::new());
         assert!(cpu_only.gpus.is_empty());
+    }
+
+    #[test]
+    fn unit__probe_hardware__memoryless_census_never_reaches_the_pool() {
+        // sd-server's census names devices with total_mib == 0 (no memory
+        // column). Those rows must not ride into the GPU pool verbatim:
+        // placement tied at 0 free and picked a Vulkan/CPU name for llama
+        // spawns, which the CUDA llama-server rejects at boot. Whatever
+        // the box provides instead (nvidia-smi census, or nothing), the
+        // pool must never carry a zero-total GPU row.
+        let m = Manifest {
+            tag: "t".into(),
+            build_number: 1,
+            version_raw: "version: 1".into(),
+            devices: vec![
+                crate::engine::manifest::DeviceDesc {
+                    name: "Vulkan0".into(),
+                    description: "Intel(R) Graphics (RPL-S)".into(),
+                    total_mib: 0,
+                    free_mib: 0,
+                },
+                crate::engine::manifest::DeviceDesc {
+                    name: "Vulkan1".into(),
+                    description: "NVIDIA GeForce RTX 4070 Laptop GPU".into(),
+                    total_mib: 0,
+                    free_mib: 0,
+                },
+            ],
+            flags: std::collections::BTreeSet::default(),
+            spec_types: vec![],
+            server_path: "/x".into(),
+            ..Default::default()
+        };
+        let hw = probe_hardware(Some(&m));
+        assert!(
+            hw.gpus.iter().all(|g| g.total_mib > 0),
+            "zero-total census rows leaked into the pool: {:?}",
+            hw.gpus
+        );
     }
 
     #[test]

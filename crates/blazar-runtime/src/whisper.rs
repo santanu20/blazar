@@ -205,16 +205,34 @@ pub async fn install(
 
 /// Active whisper-server binary plus its directory (needed as
 /// `LD_LIBRARY_PATH` on Linux: the binary dlopens sibling libggml*.so).
-/// A valid pin selects its tag; otherwise the newest installed tag wins.
+/// Resolution order: the engines-table lane (`blazar engine install
+/// --kind whisper`) first, then the legacy `data/whisper/bin` tree —
+/// both stay working installs.
 #[must_use]
 pub fn server_bin(dirs: &BlazarDirs) -> Option<(PathBuf, PathBuf)> {
+    // A pin is lane-agnostic (the user has ONE --pin flag and cannot be
+    // expected to know which install channel holds the tag): honor it
+    // against the engines table first, then the legacy tree. `--pin`
+    // used to succeed while the engines lane silently ignored it —
+    // live incident 2026-09-26.
     if let Some(tag) = pinned_tag(dirs) {
+        if let Some(row) = engines_lane_row(dirs) {
+            if row.tag == tag {
+                if let Some(bin) = engines_lane_server_bin(dirs, &row) {
+                    let lib = bin.parent()?.to_path_buf();
+                    return Some((bin, lib));
+                }
+            }
+        }
         let dir = bin_root(dirs).join(&tag);
         if let Some(bin) = server_bin_in(&dir) {
             return Some((bin, dir));
         }
-        // Dangling pin (dir pruned or deleted): fall through to newest.
+        // Dangling pin (no row, no dir): fall through to the lanes' pick.
         tracing::warn!("whisper pin {tag} has no binary; using newest installed tag");
+    }
+    if let Some(hit) = engines_lane_bin(dirs) {
+        return Some(hit);
     }
     for tag_dir in sorted_tag_dirs(dirs) {
         if let Some(bin) = server_bin_in(&tag_dir) {
@@ -222,6 +240,119 @@ pub fn server_bin(dirs: &BlazarDirs) -> Option<(PathBuf, PathBuf)> {
         }
     }
     None
+}
+
+/// Whether `bin` was served by the legacy `data/whisper/bin` tree (lane
+/// provenance for display and tests; the pin itself is lane-agnostic).
+#[must_use]
+pub fn is_legacy_bin(dirs: &BlazarDirs, bin: &Path) -> bool {
+    bin.starts_with(bin_root(dirs))
+}
+
+/// The engines-table lane's whisper row: a row matching the pin (see
+/// [`server_bin`] — pins are lane-agnostic) first, else the active row
+/// when one is flagged, else the newest installed. `None` when no
+/// whisper row exists (the legacy tree decides) or the store cannot be
+/// read (warn, never mask).
+fn engines_lane_row(dirs: &BlazarDirs) -> Option<blazar_core::store::EngineRow> {
+    let store = match blazar_core::Store::open(dirs) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("whisper engines-lane lookup could not open the store: {e:#}");
+            return None;
+        }
+    };
+    let rows = match store.list_engines() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("whisper engines-lane listing failed: {e:#}");
+            return None;
+        }
+    };
+    if let Some(tag) = pinned_tag(dirs) {
+        if let Some(row) = rows
+            .iter()
+            .find(|r| r.kind == blazar_core::engine_kind::EngineKind::Whisper && r.tag == tag)
+        {
+            return Some(row.clone());
+        }
+    }
+    // `list_engines` orders newest-installed first; the active row (if
+    // any) still wins so a flagged lane is honored. `installed_at`
+    // breaks ties explicitly — max_by_key on the active flag alone
+    // returns the LAST row among equal keys, i.e. the OLDEST.
+    rows.into_iter()
+        .filter(|r| r.kind == blazar_core::engine_kind::EngineKind::Whisper)
+        .max_by_key(|r| (i64::from(r.active), r.installed_at))
+}
+
+/// The engines-table lane: resolve the whisper row's binary the same way
+/// register did. `None` when no whisper row exists (legacy tree decides)
+/// or the store cannot be read (warn, never mask).
+fn engines_lane_bin(dirs: &BlazarDirs) -> Option<(PathBuf, PathBuf)> {
+    let row = engines_lane_row(dirs)?;
+    let bin = engines_lane_server_bin(dirs, &row)?;
+    let lib = bin.parent()?.to_path_buf();
+    Some((bin, lib))
+}
+
+/// Whether the serving whisper lane is engines-table backed — update
+/// hints must name the lane that can actually update the serving binary
+/// (`blazar whisper --install` writes the legacy tree, which
+/// [`server_bin`] never picks while a row exists).
+#[must_use]
+pub fn engines_lane_installed(dirs: &BlazarDirs) -> bool {
+    engines_lane_row(dirs).is_some_and(|row| engines_lane_server_bin(dirs, &row).is_some())
+}
+
+/// The tag currency verdicts must compare against upstream: a mirror of
+/// [`server_bin`]'s pick (pin first — either lane — then the engines
+/// row, then the legacy newest). The binary's LIB DIRECTORY is not a tag
+/// source — the extract subdir name leaked into the verdict once and
+/// produced an update warning that no update could clear (live:
+/// "update available: b5130 (running: whisper-bin-ubuntu-x64)").
+#[must_use]
+pub fn installed_tag(dirs: &BlazarDirs) -> Option<String> {
+    if let Some(tag) = pinned_tag(dirs) {
+        let row_hit = engines_lane_row(dirs)
+            .filter(|r| r.tag == tag)
+            .is_some_and(|r| engines_lane_server_bin(dirs, &r).is_some());
+        let legacy_hit = server_bin_in(&bin_root(dirs).join(&tag)).is_some();
+        if row_hit || legacy_hit {
+            return Some(tag);
+        }
+        // Dangling pin (no row with a binary, no dir): fall through.
+    }
+    if let Some(row) = engines_lane_row(dirs) {
+        if engines_lane_server_bin(dirs, &row).is_some() {
+            return Some(row.tag);
+        }
+    }
+    sorted_tag_dirs(dirs)
+        .into_iter()
+        .next()
+        .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+}
+
+/// Row's binary: the install-time probed path when it still exists,
+/// otherwise re-derived from the tag dir (a relocated data dir must not
+/// brick the lane — same recovery register performs).
+fn engines_lane_server_bin(
+    dirs: &BlazarDirs,
+    row: &blazar_core::store::EngineRow,
+) -> Option<PathBuf> {
+    if let Ok(mut m) = serde_json::from_str::<crate::engine::manifest::Manifest>(&row.manifest) {
+        m.anchor_server_path(&dirs.data_dir);
+        let probed = PathBuf::from(&m.server_path);
+        if probed.is_file() {
+            return Some(probed);
+        }
+    }
+    crate::engine::find_engine_binary(
+        &dirs.engines_dir().join(&row.tag),
+        &["whisper-server", "whisper-server.exe"],
+    )
+    .ok()
 }
 
 /// Sort key for a whisper.cpp tag: `vX.Y.Z` numeric components (missing
@@ -288,10 +419,12 @@ pub fn installed_tags(dirs: &BlazarDirs) -> Vec<String> {
 
 /// Pin the active whisper server to an already-installed tag, or unpin
 /// (`None`) to track the newest installed tag. The tag must pass the
-/// shared sanitizer AND exist on disk — pinning something uninstalled
-/// would just dangle at selection time. The prune pass keeps the pinned
-/// dir regardless of retention, so re-run it after unpinning to drop a
-/// formerly-protected old tag.
+/// shared sanitizer AND be installed in EITHER lane — the legacy
+/// `data/whisper/bin` tree or the engines table (`kind = whisper`) —
+/// because [`server_bin`] honors the pin across both; accepting only
+/// legacy tags would let the pin succeed while serving ignores it. The
+/// prune pass keeps the pinned dir regardless of retention, so re-run
+/// it after unpinning to drop a formerly-protected old tag.
 pub fn set_pin(dirs: &BlazarDirs, tag: Option<&str>) -> Result<()> {
     match tag {
         Some(t) => {
@@ -299,10 +432,14 @@ pub fn set_pin(dirs: &BlazarDirs, tag: Option<&str>) -> Result<()> {
             if !valid_tag(t) {
                 anyhow::bail!("invalid tag {t:?}: must be a plain tag name (no path separators)");
             }
-            if !installed_tags(dirs).iter().any(|installed| installed == t) {
+            let mut known = installed_tags(dirs);
+            known.extend(whisper_engine_tags(dirs)?);
+            known.sort();
+            known.dedup();
+            if !known.iter().any(|installed| installed == t) {
                 anyhow::bail!(
                     "tag {t} is not installed (installed: {}) — run: blazar whisper --install --tag {t}",
-                    installed_tags(dirs).join(", ")
+                    known.join(", ")
                 );
             }
             std::fs::write(pin_path(dirs), format!("{t}\n"))
@@ -314,6 +451,22 @@ pub fn set_pin(dirs: &BlazarDirs, tag: Option<&str>) -> Result<()> {
     }
     prune(dirs)?;
     Ok(())
+}
+
+/// Whisper-kind engine row tags (the engines-table lane's install set),
+/// for `--pin` validation. Unlike the lane lookups this propagates a
+/// store failure: refusing a valid pin because the store could not be
+/// read would be a silent no-op of the user's explicit intent.
+fn whisper_engine_tags(dirs: &BlazarDirs) -> Result<Vec<String>> {
+    let store =
+        blazar_core::Store::open(dirs).with_context(|| "open store to list whisper engine tags")?;
+    let tags = store
+        .list_engines()?
+        .into_iter()
+        .filter(|r| r.kind == blazar_core::engine_kind::EngineKind::Whisper)
+        .map(|r| r.tag)
+        .collect();
+    Ok(tags)
 }
 
 /// Keep the newest `KEEP_TAGS` server dirs; the pinned dir (if any) is
@@ -362,27 +515,56 @@ pub(crate) fn walk_for_file(dir: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Size stem of a `ggml-<size>.bin` filename, or `None` for anything
+/// else (the repo also ships `ggml-*-encoder.mlmodelc.zip` `CoreML`
+/// sidecars that must not surface as pullable models).
+#[must_use]
+pub fn ggml_size_from_path(filename: &str) -> Option<String> {
+    let base = filename.rsplit('/').next().unwrap_or(filename);
+    base.strip_prefix("ggml-")?
+        .strip_suffix(".bin")
+        .map(str::to_string)
+}
+
 /// Pulled model sizes (stems of `ggml-*.bin`), sorted.
 pub fn list_models(dirs: &BlazarDirs) -> Vec<String> {
     let mut out: Vec<String> = std::fs::read_dir(models_dir(dirs))
         .into_iter()
         .flatten()
         .filter_map(std::result::Result::ok)
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| {
-            n.starts_with("ggml-")
-                && std::path::Path::new(n)
-                    .extension()
-                    .is_some_and(|e| e == "bin")
-        })
-        .map(|n| {
-            n.trim_start_matches("ggml-")
-                .trim_end_matches(".bin")
-                .to_string()
-        })
+        .filter_map(|e| ggml_size_from_path(&e.file_name().to_string_lossy()))
         .collect();
     out.sort();
     out
+}
+
+/// One ggml model in the upstream index (`ggerganov/whisper.cpp`),
+/// with its on-disk byte size — the searchable remote catalog behind
+/// `whisper --search`.
+#[derive(Debug, Clone)]
+pub struct RemoteModel {
+    pub size: String,
+    pub bytes: u64,
+}
+
+/// Every ggml model the upstream repo currently ships, sorted by size
+/// stem. One non-recursive tree listing (the models live at the repo
+/// root); verified live 2026-09-23: 33 models spanning tiny..large-v3
+/// including `.en` variants and q5/q8 quantized builds.
+pub async fn remote_models(hf: &HfClient) -> Result<Vec<RemoteModel>> {
+    let entries = hf.list_tree(WHISPER_MODEL_REPO, "", false).await?;
+    let mut out: Vec<RemoteModel> = entries
+        .into_iter()
+        .filter(crate::hf::HfTreeEntry::is_file)
+        .filter_map(|e| {
+            Some(RemoteModel {
+                size: ggml_size_from_path(&e.path)?,
+                bytes: e.size.unwrap_or(0),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.size.cmp(&b.size));
+    Ok(out)
 }
 
 #[must_use]
@@ -392,8 +574,9 @@ pub fn model_file(dirs: &BlazarDirs, size: &str) -> Option<PathBuf> {
 }
 
 /// Map the request's `model` field to a pulled size. `whisper-1` /
-/// `whisper-1-latest` / absent → preference order; `whisper-<size>` or a
-/// bare size → exact match; unknown → None (caller 400s with the list).
+/// `whisper-1-latest` / absent → preference order; `whisper-<size>`,
+/// `ggml-<size>` (the HF file naming) or a bare size → exact match;
+/// unknown → None (caller 400s with the list).
 #[must_use]
 pub fn resolve_model(requested: Option<&str>, available: &[String]) -> Option<String> {
     if available.is_empty() {
@@ -402,6 +585,7 @@ pub fn resolve_model(requested: Option<&str>, available: &[String]) -> Option<St
     let norm = requested.map(|m| {
         m.trim()
             .trim_start_matches("whisper-")
+            .trim_start_matches("ggml-")
             .trim_end_matches("-latest")
             .to_string()
     });
@@ -483,6 +667,9 @@ struct WhisperChild {
     child: tokio::process::Child,
     port: u16,
     loaded: String,
+    /// Last instant the lane served (or swapped) a request — the idle
+    /// reaper's clock. Refreshed on every `ensure` hit, never elsewhere.
+    last_used: tokio::time::Instant,
 }
 
 impl WhisperRuntime {
@@ -507,6 +694,7 @@ impl WhisperRuntime {
         let mut slot = self.child.lock().await;
         if let Some(live) = slot.as_mut() {
             if tcp_alive(live.port).await {
+                live.last_used = tokio::time::Instant::now();
                 if live.loaded != size {
                     // Upstream /load: hot model swap without respawn.
                     let url = format!("http://127.0.0.1:{}/load", live.port);
@@ -543,10 +731,20 @@ impl WhisperRuntime {
             let _ = slot.take();
         }
         let port = ephemeral_port()?;
-        let mut cmd = tokio::process::Command::new(bin);
-        cmd.args(server_args(port, model_path))
+        let mut std_cmd = std::process::Command::new(bin);
+        std_cmd
+            .args(server_args(port, model_path))
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
+        #[cfg(unix)]
+        {
+            // Kernel lifetime tie: the whisper-server must not outlive
+            // the process that spawned it (crash/SIGKILL/terminal
+            // close would otherwise leak a VRAM-holding child).
+            crate::probe::parent_death_tie(&mut std_cmd);
+        }
+        let mut cmd = tokio::process::Command::from(std_cmd);
+        cmd.kill_on_drop(true);
         if cfg!(unix) {
             // The binary dlopens sibling libggml*.so; the loader does not
             // search the executable's own directory.
@@ -581,6 +779,7 @@ impl WhisperRuntime {
             child,
             port,
             loaded: size.to_string(),
+            last_used: tokio::time::Instant::now(),
         });
         Ok(port)
     }
@@ -592,6 +791,36 @@ impl WhisperRuntime {
             let _ = live.child.kill().await;
             let _ = live.child.wait().await;
             tracing::info!(port = live.port, model = %live.loaded, "whisper-server stopped");
+        }
+    }
+
+    /// Idle reaper: kill the child when it has served no request for
+    /// `max_idle`. Serialized against `ensure` by the same mutex, so a
+    /// request racing the reap simply respawns the child (the lazy-lane
+    /// contract; the loser pays one model load). A dead child is
+    /// reaped here too — same hygiene `ensure` does on its next hit,
+    /// just sooner. No-op when no child exists.
+    pub async fn reap_idle(&self, max_idle: std::time::Duration) {
+        let mut slot = self.child.lock().await;
+        let Some(live) = slot.as_ref() else { return };
+        let dead = !tcp_alive(live.port).await;
+        let idle = live.last_used.elapsed() >= max_idle;
+        if !dead && !idle {
+            return;
+        }
+        let mut live = slot.take().expect("checked Some above");
+        let idle_secs = live.last_used.elapsed().as_secs();
+        let _ = live.child.kill().await;
+        let _ = live.child.wait().await;
+        if dead {
+            tracing::info!(port = live.port, model = %live.loaded, "whisper-server had died; reaped the slot");
+        } else {
+            tracing::info!(
+                port = live.port,
+                model = %live.loaded,
+                idle_secs,
+                "whisper-server idle-reaped (respawns on next request)"
+            );
         }
     }
 
@@ -741,6 +970,13 @@ mod tests {
             resolve_model(Some("whisper-small-latest"), &avail),
             Some("small".into())
         );
+        // normalized: ggml- prefix (HF file naming) resolves to the bare size
+        assert_eq!(resolve_model(Some("ggml-base"), &avail), None);
+        let with_base: Vec<String> = ["base", "small"].iter().map(|s| (*s).to_string()).collect();
+        assert_eq!(
+            resolve_model(Some("ggml-base"), &with_base),
+            Some("base".into())
+        );
         // unnamed: preference order picks base* first (variant suffix ok)
         assert_eq!(resolve_model(None, &avail), Some("base.en".into()));
         // OpenAI alias whisper-1 = unnamed
@@ -781,6 +1017,23 @@ mod tests {
         assert_eq!(model_file(&models, "medium"), None);
     }
 
+    #[test]
+    fn unit__ggml_size_from_path__ggml_bins_only() {
+        // Full tree paths reduce to the size stem (basename, ggml-/.bin).
+        assert_eq!(
+            ggml_size_from_path("ggml-large-v3-turbo-q5_0.bin").as_deref(),
+            Some("large-v3-turbo-q5_0")
+        );
+        assert_eq!(
+            ggml_size_from_path("ggml-base.bin").as_deref(),
+            Some("base")
+        );
+        // CoreML sidecars and foreign files are not pullable models.
+        assert!(ggml_size_from_path("ggml-small-encoder.mlmodelc.zip").is_none());
+        assert!(ggml_size_from_path("README.md").is_none());
+        assert!(ggml_size_from_path("ggml-naked").is_none());
+    }
+
     #[tokio::test]
     async fn lifecycle__whisper_runtime__shutdown_kills_child() {
         if !cfg!(unix) {
@@ -798,12 +1051,96 @@ mod tests {
             child,
             port: 1,
             loaded: "base".into(),
+            last_used: tokio::time::Instant::now(),
         });
         rt.shutdown().await;
         assert!(rt.status().await.is_none());
         // Reaped = wait resolved; process truly gone.
         let alive = std::path::Path::new(&format!("/proc/{pid}")).exists();
         assert!(!alive, "whisper child {pid} leaked past shutdown");
+    }
+
+    /// The idle reaper kills a child whose last serve is older than the
+    /// budget, keeps a fresh one, and cleans a dead child's slot. Uses
+    /// the same injected-fake-child pattern as the shutdown lifecycle
+    /// test above (`sleep` stands in for whisper-server; port 1 never
+    /// answers, which the reaper must treat as dead).
+    #[tokio::test]
+    async fn lifecycle__whisper_runtime__reap_idle_budget_and_dead_child() {
+        if !cfg!(unix) {
+            return;
+        }
+        let rt = WhisperRuntime::new();
+        // Fresh child on an unreachable port: "dead" wins even though
+        // last_used is now — a corpse must not squat the lane until the
+        // idle budget also expires.
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("pid");
+        *rt.child.lock().await = Some(WhisperChild {
+            child,
+            port: 1,
+            loaded: "base".into(),
+            last_used: tokio::time::Instant::now(),
+        });
+        rt.reap_idle(std::time::Duration::from_hours(1)).await;
+        assert!(rt.status().await.is_none(), "dead child reaped");
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "dead child {pid} leaked past reap"
+        );
+
+        // Idle budget path: reachable port + stale last_used → reaped.
+        // A port that answers TCP: bind our own listener.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep 2");
+        let pid2 = child.id().expect("pid2");
+        *rt.child.lock().await = Some(WhisperChild {
+            child,
+            port,
+            loaded: "base".into(),
+            last_used: tokio::time::Instant::now() - std::time::Duration::from_mins(10),
+        });
+        rt.reap_idle(std::time::Duration::from_mins(5)).await;
+        assert!(rt.status().await.is_none(), "idle child reaped");
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid2}")).exists(),
+            "idle child {pid2} leaked past reap"
+        );
+
+        // Fresh child on a reachable port survives the same budget.
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep 3");
+        let pid3 = child.id().expect("pid3");
+        *rt.child.lock().await = Some(WhisperChild {
+            child,
+            port,
+            loaded: "base".into(),
+            last_used: tokio::time::Instant::now(),
+        });
+        rt.reap_idle(std::time::Duration::from_mins(5)).await;
+        assert!(rt.status().await.is_some(), "fresh child untouched");
+        rt.shutdown().await;
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid3}")).exists(),
+            "child {pid3} leaked past shutdown"
+        );
     }
 
     /// Stage a fake installed tag dir containing a whisper-server file.
@@ -868,6 +1205,184 @@ mod tests {
         std::fs::write(pin_path(&dirs), "  \n").expect("pin");
         let (_, dir) = server_bin(&dirs).expect("server");
         assert_eq!(dir, newest);
+    }
+
+    #[test]
+    fn unit__server_bin__relative_row_anchors_to_data_dir() {
+        // Storage-invariant rows carry `engines/<tag>/...` server paths —
+        // the lane resolver must anchor them against the live data dir
+        // instead of missing the file and falling through to a directory
+        // search (or worse, the legacy tree).
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let lane_dir = dirs.engines_dir().join("b5130/whisper-bin-ubuntu-x64");
+        std::fs::create_dir_all(&lane_dir).expect("lane");
+        std::fs::write(lane_dir.join("whisper-server"), b"stub").expect("bin");
+        let manifest = serde_json::json!({
+            "tag": "b5130",
+            "build_number": 5130,
+            "version_raw": "v",
+            "devices": [],
+            "flags": [],
+            "spec_types": [],
+            "server_path": "engines/b5130/whisper-bin-ubuntu-x64/whisper-server",
+        })
+        .to_string();
+        let store = blazar_core::Store::open(&dirs).expect("store");
+        store
+            .upsert_engine(&blazar_core::store::EngineRow {
+                tag: "b5130".to_string(),
+                asset: "whisper-bin-ubuntu-x64.tar.gz".to_string(),
+                sha256: "unverified".to_string(),
+                installed_at: 1,
+                active: true,
+                manifest,
+                kind: blazar_core::engine_kind::EngineKind::Whisper,
+            })
+            .expect("row");
+        let row = store
+            .list_engines()
+            .expect("rows")
+            .into_iter()
+            .find(|r| r.tag == "b5130")
+            .expect("row");
+        let bin = engines_lane_server_bin(&dirs, &row).expect("anchored bin");
+        assert_eq!(bin, lane_dir.join("whisper-server"));
+    }
+
+    #[test]
+    fn unit__server_bin__pin_wins_on_both_lanes_and_dangling_pin_falls_through() {
+        // Pins are lane-agnostic (ONE --pin flag, two install channels):
+        // a pin naming an engines row's tag serves that row even when a
+        // newer row exists; a pin naming a legacy dir serves the legacy
+        // tree even when engines rows exist; a pin naming nothing falls
+        // through to the engines lane's newest. The superseded contract
+        // — the engines lane silently beating a live pin — is the
+        // 2026-09-26 incident this test pins closed.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let (newer, older, legacy) = stage_two_lane_store(&dirs);
+        // (1) Pin names the OLDER engines row: it beats the newer row.
+        std::fs::write(pin_path(&dirs), "b5130\n").expect("pin");
+        let (bin, dir) = server_bin(&dirs).expect("server");
+        assert_eq!(dir, older);
+        assert!(bin.starts_with(&older));
+        // (2) Pin names the legacy dir: it beats BOTH engines rows.
+        std::fs::write(pin_path(&dirs), "v1.0.0\n").expect("pin");
+        let (bin, dir) = server_bin(&dirs).expect("server");
+        assert_eq!(dir, legacy);
+        assert!(is_legacy_bin(&dirs, &bin));
+        // (3) Dangling pin: the engines lane's newest row wins.
+        std::fs::write(pin_path(&dirs), "b4999\n").expect("pin");
+        let (_bin, dir) = server_bin(&dirs).expect("server");
+        assert_eq!(dir, newer);
+    }
+
+    #[test]
+    fn unit__installed_tag__mirrors_server_bin_pick() {
+        // Verdicts must compare upstream against whatever server_bin is
+        // actually about to serve — pin first, then engines lane, then
+        // legacy newest. Also pins the tie-break: with no pin and no
+        // active row, the NEWEST whisper row wins (a max_by_key on the
+        // active flag alone used to return the oldest).
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let (_newer, _older, _legacy) = stage_two_lane_store(&dirs);
+        std::fs::write(pin_path(&dirs), "b5130\n").expect("pin");
+        assert_eq!(installed_tag(&dirs).as_deref(), Some("b5130"));
+        std::fs::write(pin_path(&dirs), "v1.0.0\n").expect("pin");
+        assert_eq!(installed_tag(&dirs).as_deref(), Some("v1.0.0"));
+        std::fs::write(pin_path(&dirs), "b4999\n").expect("pin");
+        assert_eq!(installed_tag(&dirs).as_deref(), Some("b5131"));
+        let _ = std::fs::remove_file(pin_path(&dirs));
+        assert_eq!(installed_tag(&dirs).as_deref(), Some("b5131"));
+    }
+
+    #[test]
+    fn unit__set_pin__accepts_engines_lane_tag_and_serves_it() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let (_newer, older, _legacy) = stage_two_lane_store(&dirs);
+        // No legacy dir carries b5130: only the engines row does. The
+        // pin must be accepted AND change the serving pick.
+        set_pin(&dirs, Some("b5130")).expect("pin engines-lane tag");
+        assert_eq!(pinned_tag(&dirs), Some("b5130".to_string()));
+        let (_bin, dir) = server_bin(&dirs).expect("server");
+        assert_eq!(dir, older);
+        set_pin(&dirs, None).expect("unpin");
+        assert_eq!(pinned_tag(&dirs), None);
+    }
+
+    /// Two whisper lanes fully staged: legacy `v1.0.0` dir plus engines
+    /// rows `b5131` (newer) and `b5130` (older), none active. Returns
+    /// (newer lane dir, older lane dir, legacy tag dir).
+    fn stage_two_lane_store(
+        dirs: &BlazarDirs,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let legacy = stage_server(dirs, "v1.0.0");
+        std::fs::create_dir_all(bin_root(dirs)).expect("root");
+        let newer = dirs.engines_dir().join("b5131/whisper-bin-ubuntu-x64");
+        let older = dirs.engines_dir().join("b5130/whisper-bin-ubuntu-x64");
+        std::fs::create_dir_all(&newer).expect("lane newer");
+        std::fs::create_dir_all(&older).expect("lane older");
+        std::fs::write(newer.join("whisper-server"), b"stub").expect("bin");
+        std::fs::write(older.join("whisper-server"), b"stub").expect("bin");
+        let store = blazar_core::Store::open(dirs).expect("store");
+        for (tag, installed_at) in [("b5131", 2), ("b5130", 1)] {
+            store
+                .upsert_engine(&blazar_core::store::EngineRow {
+                    tag: tag.to_string(),
+                    asset: "whisper-bin-ubuntu-x64.tar.gz".to_string(),
+                    sha256: "unverified".to_string(),
+                    installed_at,
+                    active: false,
+                    manifest: "not-json".to_string(),
+                    kind: blazar_core::engine_kind::EngineKind::Whisper,
+                })
+                .expect("row");
+        }
+        (newer, older, legacy)
+    }
+
+    #[test]
+    fn unit__server_bin__degenerate_engines_row_falls_back_to_legacy() {
+        // A row whose binary vanished must never brick the audio lane:
+        // resolution falls through to the legacy tree.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let newest = stage_server(&dirs, "v2.0.0");
+        std::fs::create_dir_all(bin_root(&dirs)).expect("root");
+        let store = blazar_core::Store::open(&dirs).expect("store");
+        store
+            .upsert_engine(&blazar_core::store::EngineRow {
+                tag: "b0001".to_string(),
+                asset: "whisper-bin-ubuntu-x64.tar.gz".to_string(),
+                sha256: "unverified".to_string(),
+                installed_at: 1,
+                active: true,
+                manifest: "not-json".to_string(),
+                kind: blazar_core::engine_kind::EngineKind::Whisper,
+            })
+            .expect("row");
+        // No engines-tree dir staged: the row resolves to nothing.
+        let (bin, dir) = server_bin(&dirs).expect("server");
+        assert_eq!(dir, newest);
+        assert!(is_legacy_bin(&dirs, &bin));
     }
 
     #[test]
@@ -1125,5 +1640,55 @@ mod tests {
             .map(String::from)
             .collect();
         assert_eq!(installed_tags(&dirs), expected);
+    }
+
+    #[test]
+    fn unit__installed_tag__engines_row_tag_never_leaks_lib_dir_name() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        // Engines-lane row with a nested extract subdir — the subdir name
+        // (whisper-bin-ubuntu-x64) is exactly what must never reach a
+        // currency verdict (live: an unclearable "update available").
+        let nested = dirs.engines_dir().join("b5130/whisper-bin-ubuntu-x64");
+        std::fs::create_dir_all(&nested).expect("nested");
+        std::fs::write(nested.join("whisper-server"), "#!/bin/sh\n").expect("bin");
+        let store = blazar_core::Store::open(&dirs).expect("store");
+        store
+            .upsert_engine(&blazar_core::store::EngineRow {
+                tag: "b5130".into(),
+                asset: "cpu".into(),
+                sha256: "unverified".into(),
+                installed_at: 1,
+                active: true,
+                manifest: "{}".into(),
+                kind: blazar_core::engine_kind::EngineKind::Whisper,
+            })
+            .expect("row");
+
+        assert_eq!(installed_tag(&dirs).as_deref(), Some("b5130"));
+        assert!(engines_lane_installed(&dirs));
+        // The serving binary's dir really is the nested one — the tag
+        // derivation must not simply mirror server_bin's second element.
+        let (bin, lib) = server_bin(&dirs).expect("serving");
+        assert!(bin.ends_with("whisper-server"));
+        assert!(lib.ends_with("whisper-bin-ubuntu-x64"));
+    }
+
+    #[test]
+    fn unit__installed_tag__legacy_tree_without_rows_falls_back_to_tag_dirs() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let legacy = bin_root(&dirs).join("v1.2.0");
+        std::fs::create_dir_all(&legacy).expect("legacy dir");
+        std::fs::write(legacy.join("whisper-server"), "#!/bin/sh\n").expect("bin");
+
+        assert_eq!(installed_tag(&dirs).as_deref(), Some("v1.2.0"));
+        assert!(!engines_lane_installed(&dirs));
     }
 }

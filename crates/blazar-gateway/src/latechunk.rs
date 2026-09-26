@@ -317,11 +317,14 @@ async fn tokenize_with_pieces(
 ) -> Result<Vec<(u64, Vec<u8>)>, (u16, String)> {
     let url = format!("{}/tokenize", child_base(&engine.endpoint));
     let body = json!({"content": content, "add_special": false, "with_pieces": true});
-    let resp = child_auth(state.http.post(&url), engine)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| (502u16, format!("tokenize request failed: {e:#}")))?;
+    let resp = child_auth(
+        crate::state::child_client(state, &engine.endpoint).post(&url),
+        engine,
+    )
+    .json(&body)
+    .send()
+    .await
+    .map_err(|e| (502u16, format!("tokenize request failed: {e:#}")))?;
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
@@ -362,11 +365,14 @@ async fn fetch_matrix(
 ) -> Result<Vec<Vec<f64>>, (u16, String)> {
     let url = format!("{}/embedding", child_base(&engine.endpoint));
     let body = json!({"content": ids});
-    let resp = child_auth(state.http.post(&url), engine)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| (502u16, format!("embedding request failed: {e:#}")))?;
+    let resp = child_auth(
+        crate::state::child_client(state, &engine.endpoint).post(&url),
+        engine,
+    )
+    .json(&body)
+    .send()
+    .await
+    .map_err(|e| (502u16, format!("embedding request failed: {e:#}")))?;
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();

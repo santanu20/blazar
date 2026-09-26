@@ -15,6 +15,8 @@
 //!   `STUB_BUILD`       build number for --version (default 9999)
 //!   `STUB_DELAY_MS`    extra latency before answering each request (default 0)
 //!   `STUB_HANG_ON`     park chat/completions whose text contains this marker (header-stall pin)
+//!   `STUB_HANG_ONCE_FILE` when set, only the FIRST child to claim this path hangs;
+//!                       respawned children serve the retry (evict-and-retry pins)
 
 use axum::extract::State;
 use axum::response::IntoResponse;
@@ -148,10 +150,19 @@ fn main() {
             .cloned()
     };
     let host = flag("--host").unwrap_or_else(|| "127.0.0.1".into());
-    let port: u16 = flag("--port")
-        .unwrap_or_else(|| "8080".into())
-        .parse()
-        .expect("--port must be numeric");
+    // A `--host` value with a `.sock` extension is a unix-socket path
+    // (upstream #28690): `--port` is absent in that mode, mirroring
+    // llama-server.
+    let port: Option<u16> = if is_sock_path(&host) {
+        None
+    } else {
+        Some(
+            flag("--port")
+                .unwrap_or_else(|| "8080".into())
+                .parse()
+                .expect("--port must be numeric"),
+        )
+    };
     let alias = flag("--alias").unwrap_or_else(|| "stub-model".into());
     // Child-auth hardening: --api-key wins, else --api-key-file content
     // (trimmed) — mirrors upstream's two intake paths.
@@ -212,7 +223,26 @@ fn main() {
     rt.block_on(serve(host, port, alias, api_key));
 }
 
-async fn serve(host: String, port: u16, alias: String, api_key: Option<String>) {
+/// `--host <path>.sock` argv shape (upstream #28690): a `.sock`
+/// extension means unix-socket transport and `--port` is absent.
+fn is_sock_path(host: &str) -> bool {
+    std::path::Path::new(host)
+        .extension()
+        .is_some_and(|e| e == std::ffi::OsStr::new("sock"))
+}
+
+/// Bind the identical axum app over a unix socket: unlink a stale
+/// file from a previous run first (same contract as the supervisor's
+/// boot sweep).
+async fn serve_unix(host: &str, app: axum::routing::Router) {
+    let _ = std::fs::remove_file(host);
+    let listener = tokio::net::UnixListener::bind(host)
+        .unwrap_or_else(|e| panic!("stub-llama-server: bind {host}: {e}"));
+    eprintln!("stub-llama-server: listening on {host}");
+    axum::serve(listener, app).await.expect("stub server error");
+}
+
+async fn serve(host: String, port: Option<u16>, alias: String, api_key: Option<String>) {
     use axum::routing::{get, post};
     let alias_for_routes = alias.clone();
     let app = axum::Router::new()
@@ -311,7 +341,13 @@ async fn serve(host: String, port: u16, alias: String, api_key: Option<String>) 
             },
         ));
 
-    let addr = format!("{host}:{port}");
+    // A `--host <path>.sock` argv (upstream #28690 shape, no --port)
+    // binds a unix socket instead of TCP.
+    if is_sock_path(&host) && port.is_none() {
+        serve_unix(&host, app).await;
+        return;
+    }
+    let addr = format!("{host}:{}", port.unwrap_or(8080));
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| panic!("stub-llama-server: bind {addr}: {e}"));
@@ -371,8 +407,44 @@ fn count_tokens(s: &str) -> i64 {
 /// Park forever when `STUB_HANG_ON` matches the request text: the
 /// header-stall pin wedges exactly the marked request mid-traffic while
 /// the supervisor's warm-peg probes (fixed tiny prompts) pass through.
+///
+/// `STUB_HANG_ONCE_FILE` narrows the hang to the FIRST child process
+/// that claims the marker (atomic `O_EXCL` create): respawned children
+/// see the claim and serve the request. This is what lets the
+/// evict-and-retry pins discriminate — a 200 proves the retry landed on
+/// a fresh child, a 504 proves it hit the same wedged endpoint.
 fn should_hang(text: &str) -> bool {
-    std::env::var("STUB_HANG_ON").is_ok_and(|marker| text.contains(&marker))
+    let Ok(marker) = std::env::var("STUB_HANG_ON") else {
+        return false;
+    };
+    if !text.contains(&marker) {
+        return false;
+    }
+    // Claim only when the marker actually hits: an unconditional claim
+    // here would let an earlier marker-free request burn the one-shot.
+    let once = match std::env::var("STUB_HANG_ONCE_FILE") {
+        Ok(path) => std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .is_ok(),
+        Err(_) => true,
+    };
+    if let Ok(diag) = std::env::var("STUB_DIAG_FILE") {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&diag)
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                "[pid {}] should_hang marker_hit=true once_claimed={once}",
+                std::process::id()
+            );
+        }
+    }
+    once
 }
 
 /// Marker-relevant request text (messages joined).

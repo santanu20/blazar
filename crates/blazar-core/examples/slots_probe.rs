@@ -77,6 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         draft_path: None,
         draft_gguf: None,
         mmproj_path: Some(&mmproj),
+        components: &[],
         engine_tag: "b10809",
         supported_flags: &flags,
         spec_types: &[],

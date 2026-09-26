@@ -67,17 +67,73 @@ def _free_port() -> int:
 # never collide on the main listener (live 2026-09-10 cross-run 502s);
 # BLAZAR_VALIDATE_PORT still pins an explicit port when set.
 PORT = int(os.environ.get("BLAZAR_VALIDATE_PORT") or _free_port())
+REAL_DATA = os.path.expanduser("~/.local/share/blazar")
+REAL_CONFIG = os.path.expanduser("~/.config/blazar/config.toml")
+MEM_FLOOR_MIB = 1536
+
+
+def _store_model_rows() -> list[str]:
+    """Names in the REAL store (the sandbox copies this DB verbatim)."""
+    try:
+        db = sqlite3.connect(os.path.join(REAL_DATA, "blazar.db"))
+        try:
+            return [r[0] for r in db.execute("SELECT name FROM models")]
+        finally:
+            db.close()
+    except Exception:
+        return []
+
+
+def _listed_model_names(list_stdout: str) -> set[str]:
+    """NAME column of `blazar list` output (header skipped).
+
+    The listing is columnar (NAME QUANT SIZE VISION ARCH CTX TYPE
+    CATEGORY ENGINE); a raw whitespace-token diff leaks other columns'
+    words (the ARCH column once fed `pull qwen3 --verify` a name that
+    resolves to no store row). Store names never contain spaces.
+    """
+    names = set()
+    for line in list_stdout.splitlines()[1:]:
+        parts = line.split()
+        if parts:
+            names.add(parts[0])
+    return names
+
+
+def _resolve_store_row(name: str) -> tuple[str, str]:
+    """Map a requested model name to the store row that will serve it.
+
+    The gateway resolves request names exact -> unique bare prefix
+    (proxy.rs ladder) and keys the INSTANCE (pidfile, /api/ps row name)
+    by the resolved row. The harness must probe that row name or every
+    instance-keyed check misses while serving still passes — the fixture
+    inventory drifts (rows get re-pulled under fuller names), so a
+    hardcoded default rots. Mirrors the product ladder: exact match
+    wins, one prefix match adopts the row name, ambiguity/miss keeps
+    the raw name (phases fail loudly with the store listing).
+    """
+    rows = _store_model_rows()
+    if name in rows or not rows:
+        return name, ""
+    prefixed = [r for r in rows if r.startswith(name)]
+    if len(prefixed) == 1:
+        return prefixed[0], f"{name} -> store row {prefixed[0]} (unique prefix)"
+    return name, (
+        f"no exact store row '{name}' (candidates: {', '.join(sorted(rows))})"
+        if not prefixed
+        else f"'{name}' is an ambiguous prefix of {prefixed} (pass BLAZAR_VALIDATE_MODEL)"
+    )
+
+
 # Fast default: the 0.5B keeps every lane quick; BLAZAR_VALIDATE_MODEL
-# overrides (e.g. release-grade runs pinning the 9B). The name is the
-# CANONICAL store row ("qwen2.5-0.5b" — rows are tagless; the display
-# form is name:quant). The earlier "qwen2.5-0.5b-instruct" fixture
-# silently drifted when the sglang wave re-pulled that row as a bf16
-# safetensors DIRECTORY (no GGUF twin exists locally), making every
-# llamacpp chat lane 500 on "gguf metadata: Is a directory". Canonical
-# names also key model_overrides and model_bytes_mib's SQL lookup
-# exactly. No phase depends on instruct-ness of the fixture
-# (think/template lanes pin their own models).
-MODEL = os.environ.get("BLAZAR_VALIDATE_MODEL", "qwen2.5-0.5b")
+# overrides (e.g. release-grade runs pinning the 9B). The default is
+# resolved against the store at import so def-time default args
+# (child_pid/wait_loaded bind MODEL at definition) carry the ROW name;
+# the raw request dialect keeps its own coverage via the explicit
+# prefix-alias routing check in phase 3.
+MODEL, _MODEL_NOTE = _resolve_store_row(
+    os.environ.get("BLAZAR_VALIDATE_MODEL", "qwen2.5-0.5b")
+)
 # Second DISTINCT model for lanes that structurally need two models live at
 # once (wave battery B predictive preload, mmproj projector attach). Separate
 # from MODEL so the fast default stays small without collapsing those lanes.
@@ -99,9 +155,6 @@ elif os.path.exists(_REPO_BIN):
     PAL = _REPO_BIN
 else:
     PAL = shutil.which("blazar") or "blazar"
-REAL_DATA = os.path.expanduser("~/.local/share/blazar")
-REAL_CONFIG = os.path.expanduser("~/.config/blazar/config.toml")
-MEM_FLOOR_MIB = 1536
 
 CHECKS: list[dict] = []
 COVERAGE: list[dict] = []
@@ -1038,7 +1091,7 @@ TOPLEVEL_COMMANDS = sorted(
 )
 
 # ---------------------------------------------------------------------------
-# TOPLEVEL_KNOBS manifest: all 145 Config fields.
+# TOPLEVEL_KNOBS manifest: all 171 Config fields.
 # option=True  -> Option<T>, absent from fresh `config list` until set
 # container=True -> keys / remotes / engine_env / model_overrides section
 # tier  -> evidence class (see module docstring); group -> knobs_argv batch
@@ -1071,6 +1124,65 @@ _K = [
         "roundtrip",
         None,
         "daemon idle reaper; set->list echo + full-manifest boot",
+    ),
+    (
+        "whisper_idle_secs",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "daemon whisper idle reaper; set->list echo + full-manifest boot",
+    ),
+    # sdcpp parity knobs (stable-diffusion.cpp lane): accepted at boot and
+    # echoed by config list; child-argv proof lives in the media phase where
+    # the sdcpp model runs.
+    (
+        "media_job_wait_secs",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "media job settle window; set->list echo + full-manifest boot",
+    ),
+    (
+        "sdcpp_child_header_timeout_secs",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "sdcpp child HTTP header timeout; set->list echo + full-manifest boot",
+    ),
+    (
+        "sdcpp_flash_attention",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "sdcpp FA toggle (default on); set->list echo + full-manifest boot",
+    ),
+    (
+        "sdcpp_rpc_servers",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "sdcpp rpc offload endpoints; set->list echo + full-manifest boot",
+    ),
+    (
+        "sdcpp_sage_attn",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "sdcpp SageAttention toggle; set->list echo + full-manifest boot",
+    ),
+    (
+        "sdcpp_vae_tiling",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "sdcpp VAE tiling toggle; set->list echo + full-manifest boot",
     ),
     (
         "max_loaded_models",
@@ -1213,7 +1325,8 @@ _K = [
         False,
         "roundtrip",
         None,
-        "set->list echo + slots=1 pin at profile compile",
+        "set->list echo + slots=1 pin at profile compile "
+        "(--enable-deterministic-inference needs an engine newer than b11147)",
     ),
     (
         "cache_type",
@@ -1223,14 +1336,7 @@ _K = [
         None,
         "phase_config B: --cache-type-k q8_0",
     ),
-    (
-        "kv_unified",
-        True,
-        False,
-        "roundtrip",
-        None,
-        "set->list echo + full-manifest boot",
-    ),
+    ("kv_unified", True, False, "argv", "G5", "false -> --no-kv-unified"),
     ("kv_unified_per_slot", False, False, "argv", "G1", "--kv-unified-per-slot 4096"),
     ("swa_full", False, False, "argv", "G1", "--swa-full"),
     ("ctx_checkpoints", False, False, "argv", "G1", "--ctx-checkpoints 16"),
@@ -1494,22 +1600,29 @@ _K = [
         None,
         "echo + boot (empty = flag not passed)",
     ),
+    ("reasoning_budget", False, False, "argv", "G5", "--reasoning-budget 512"),
     (
-        "reasoning_budget",
+        "reasoning_budget_message",
         False,
         False,
-        "roundtrip",
-        None,
-        "echo + boot (default fn visible in fresh list)",
+        "argv",
+        "G5",
+        "--reasoning-budget-message think",
     ),
-    ("reasoning_budget_message", False, False, "roundtrip", None, "echo + boot"),
-    ("reasoning_effort", False, False, "roundtrip", None, "echo + boot"),
-    ("reasoning_preserve", True, False, "roundtrip", None, "echo + boot"),
+    ("reasoning_effort", False, False, "argv", "G5", "--reasoning-effort low"),
+    ("reasoning_preserve", True, False, "argv", "G5", "--reasoning-preserve"),
     ("image_max_tokens", False, False, "argv", "G1", "--image-max-tokens 4096"),
     ("image_min_tokens", False, False, "argv", "G1", "--image-min-tokens 64"),
-    ("mtmd_batch_max_tokens", False, False, "roundtrip", None, "echo + boot"),
-    ("mmproj_offload", False, False, "roundtrip", None, "echo + boot"),
-    ("mmproj_auto", False, False, "roundtrip", None, "echo + boot"),
+    (
+        "mtmd_batch_max_tokens",
+        False,
+        False,
+        "argv",
+        "G5",
+        "--mtmd-batch-max-tokens 256",
+    ),
+    ("mmproj_offload", False, False, "argv", "G5", "false -> --no-mmproj-offload"),
+    ("mmproj_auto", False, False, "argv", "G5", "false -> --no-mmproj-auto"),
     ("mmproj_device", False, False, "argv", "G1", "--mmproj-device <device>"),
     ("embd_normalize", False, False, "argv", "G1", "--embd-normalize 2"),
     (
@@ -1524,7 +1637,7 @@ _K = [
     ("yarn_attn_factor", False, False, "argv", "G3", "--yarn-attn-factor"),
     ("yarn_beta_fast", False, False, "argv", "G3", "--yarn-beta-fast"),
     ("yarn_beta_slow", False, False, "argv", "G3", "--yarn-beta-slow"),
-    ("cpu_strict", False, False, "roundtrip", None, "echo + boot"),
+    ("cpu_strict", False, False, "argv", "G5", "--cpu-strict"),
     (
         "prio",
         False,
@@ -1534,10 +1647,10 @@ _K = [
         "child nice via setpriority (/proc stat ni)",
     ),
     ("prio_batch", False, False, "behavior", "G2", "same spawn, nice observable"),
-    ("poll_batch", True, False, "roundtrip", None, "echo + boot"),
+    ("poll_batch", True, False, "argv", "G5", "--poll-batch 0"),
     ("threads_http", False, False, "argv", "G1", "--threads-http 2"),
     ("warmup", False, False, "argv", "G1", "false -> --no-warmup"),
-    ("repack", False, False, "roundtrip", None, "echo + boot"),
+    ("repack", False, False, "argv", "G4", "false -> --no-repack"),
     ("cache_idle_slots", False, False, "argv", "G1", "--cache-idle-slots"),
     (
         "lookup_cache_static",
@@ -1565,21 +1678,17 @@ _K = [
         None,
         "echo + boot (string knob, default auto)",
     ),
-    (
-        "server_tools",
-        True,
-        False,
-        "roundtrip",
-        None,
-        "global-only agent-tooling quartet; Option<String>, default None (not fresh-visible)",
-    ),
+    ("server_tools", True, False, "argv", "G4", "--tools all"),
+    # every accepted runtime value (docker:/podman:/ssh:) eagerly spawns
+    # external infrastructure at engine boot — argv e2e impossible here;
+    # emission proven by unit pin, config echo by roundtrip tier
     (
         "server_tools_runtime",
         True,
         False,
         "roundtrip",
         None,
-        "prefix-validated at config validate (docker:/podman:/ssh:...)",
+        "echo + boot",
     ),
     (
         "mcp_servers_config",
@@ -1593,20 +1702,20 @@ _K = [
         "mcp_servers_json",
         True,
         False,
-        "roundtrip",
-        None,
-        "JSON syntax + mutual exclusivity checked at config validate",
+        "argv",
+        "G6",
+        "--mcp-servers-json {mcpServers:{}}",
     ),
     ("no_host", False, False, "argv", "G1", "--no-host"),
     ("op_offload", True, False, "argv", "G1", "--op-offload"),
-    ("keep_tokens", False, False, "roundtrip", None, "echo + boot"),
+    ("keep_tokens", False, False, "argv", "G4", "--keep 17"),
     (
         "override_kv",
         False,
         False,
-        "roundtrip",
-        None,
-        "echo + boot (valid-kv values unverified)",
+        "argv",
+        "G4",
+        "--override-kv general.name=str:blazar-validate",
     ),
     (
         "control_vectors",
@@ -1620,13 +1729,27 @@ _K = [
     ("control_vector_layer_range", False, False, "roundtrip", None, "echo + boot"),
     ("tensor_preset", False, False, "roundtrip", None, "echo + boot"),
     ("pii_scrub", False, False, "roundtrip", None, "echo + boot"),
-    ("video_ffmpeg_dir", False, False, "roundtrip", None, "echo + boot"),
-    ("video_fps", False, False, "roundtrip", None, "echo + boot"),
-    ("video_timestamp_interval", False, False, "roundtrip", None, "echo + boot"),
-    ("numa", False, False, "roundtrip", None, "echo + boot"),
-    ("check_tensors", False, False, "roundtrip", None, "echo + boot"),
-    ("context_shift", False, False, "roundtrip", None, "echo + boot"),
-    ("samplers", False, False, "roundtrip", None, "echo + boot"),
+    (
+        "video_ffmpeg_dir",
+        False,
+        False,
+        "argv",
+        "G4",
+        "--video-ffmpeg-dir <sandbox root>",
+    ),
+    ("video_fps", False, False, "argv", "G4", "--video-fps 12.5"),
+    (
+        "video_timestamp_interval",
+        False,
+        False,
+        "argv",
+        "G4",
+        "--video-timestamp-interval 2",
+    ),
+    ("numa", False, False, "argv", "G4", "--numa distribute"),
+    ("check_tensors", False, False, "argv", "G4", "--check-tensors"),
+    ("context_shift", False, False, "argv", "G4", "--context-shift"),
+    ("samplers", False, False, "argv", "G4", "--samplers top_k;top_p;temperature"),
     ("batch_size", False, False, "argv", "G2", "--batch-size 512"),
     ("ubatch_size", False, False, "argv", "G2", "--ubatch-size 256"),
     ("threads_batch", False, False, "argv", "G2", "--threads-batch 2"),
@@ -1700,14 +1823,6 @@ _K = [
         None,
         "sglang engine tuning section (all-Option leaves; covered by profile ladder units + live matrix)",
     ),
-    (
-        "reasoning",
-        False,
-        False,
-        "boundary",
-        None,
-        "server-side reasoning switch string ('' = auto-detect; overlay roundtrip)",
-    ),
     # Post-v0.6.0 wave knobs that landed after the last registry sweep:
     # 5 fresh-visible (gate (b) went RED on the first fresh-config-list
     # diff: engine_routing/mistralrs/warm_peg tables always serialize,
@@ -1742,31 +1857,16 @@ _K = [
         "warm-peg table {default, sglang, llamacpp}; supervisor gate "
         "enabled_for(kind) (unreleased rename hard-errors old pins)",
     ),
-    (
-        "reuse_port",
-        False,
-        False,
-        "roundtrip",
-        None,
-        "llama-server SO_REUSEPORT bool",
-    ),
+    ("reuse_port", False, False, "argv", "G5", "--reuse-port"),
     (
         "lora_init_without_apply",
         False,
         False,
-        "roundtrip",
-        None,
-        "llama-server --lora-init-without-apply bool",
+        "argv",
+        "G5",
+        "--lora-init-without-apply",
     ),
-    (
-        "cont_batching",
-        True,
-        False,
-        "roundtrip",
-        None,
-        "tri-state: true -> --cont-batching, false -> --no-cont-batching, "
-        "None = engine default",
-    ),
+    ("cont_batching", True, False, "argv", "G5", "false -> --no-cont-batching"),
     (
         "chat_template_kwargs",
         True,
@@ -1965,6 +2065,67 @@ def argv_groups():
             ("yarn_beta_fast", 24.0, "--yarn-beta-fast 24"),
             ("yarn_beta_slow", 2.0, "--yarn-beta-slow 2"),
         ],
+        # Plain-push escapes: profile.rs emits these unconditionally from
+        # the config value (no supported_flags gate, no file prerequisites).
+        "G4": [
+            ("repack", False, "--no-repack"),
+            ("check_tensors", True, "--check-tensors"),
+            ("context_shift", True, "--context-shift"),
+            ("keep_tokens", 17, "--keep 17"),
+            (
+                "samplers",
+                # config layer is comma-separated (daemon validation);
+                # profile.rs translates to the engine's ';' chain at spawn
+                "top_k,top_p,temperature",
+                "--samplers top_k;top_p;temperature",
+            ),
+            # Metadata-only override: renaming the model's internal name
+            # cannot affect chat termination (never touch eot tokens).
+            ("override_kv", ["general.name=str:blazar-validate"], "--override-kv"),
+            ("numa", "distribute", "--numa distribute"),
+            ("video_fps", 12.5, "--video-fps 12.5"),
+            ("video_timestamp_interval", 2.0, "--video-timestamp-interval 2"),
+            # Dir passthrough the child touches lazily (video models only);
+            # the sandbox root is a real existing dir either way.
+            (
+                "video_ffmpeg_dir",
+                str(SANDBOX.root),
+                f"--video-ffmpeg-dir {SANDBOX.root}",
+            ),
+            # host runtime (no --tools-runtime): engine boots with the
+            # tools subsystem enabled but spawns nothing external
+            ("server_tools", "all", "--tools all"),
+        ],
+        # push_gated family: emitted when the engine advertises the flag
+        # (current llamacpp lane does; a stale engine would fail here loudly).
+        "G5": [
+            ("kv_unified", False, "--no-kv-unified"),
+            ("cpu_strict", True, "--cpu-strict"),
+            ("reuse_port", True, "--reuse-port"),
+            ("lora_init_without_apply", True, "--lora-init-without-apply"),
+            ("cont_batching", False, "--no-cont-batching"),
+            ("mmproj_offload", False, "--no-mmproj-offload"),
+            ("mmproj_auto", False, "--no-mmproj-auto"),
+            ("mtmd_batch_max_tokens", 256, "--mtmd-batch-max-tokens 256"),
+            ("poll_batch", False, "--poll-batch 0"),
+            ("reasoning_budget", 512, "--reasoning-budget 512"),
+            ("reasoning_effort", "low", "--reasoning-effort low"),
+            ("reasoning_budget_message", "think", "--reasoning-budget-message think"),
+            ("reasoning_preserve", True, "--reasoning-preserve"),
+        ],
+        # G6 is mcp_servers_json ALONE: the flag enables the engine's
+        # tools subsystem ("MCP config: no servers found"), and a tools
+        # runtime configured in the SAME group makes b11147 spawn the
+        # docker container eagerly at boot — fatal on dockerless boxes.
+        # Empty servers + no explicit runtime = subsystem on, nothing
+        # spawned, flag provably passed.
+        "G6": [
+            (
+                "mcp_servers_json",
+                '{"mcpServers":{}}',
+                '--mcp-servers-json {"mcpServers":{}}',
+            ),
+        ],
     }
 
 
@@ -2131,6 +2292,14 @@ def _gpu_compute_holders() -> list[str]:
 # ---------------------------------------------------------------- sandbox
 
 
+def _toml_str(v: object) -> str:
+    # Basic-string form with real escaping: a value containing '"' or
+    # '\' (mcp_servers_json JSON, ffmpeg paths, ...) must not corrupt
+    # the written config.toml. json.dumps uses the same escape set TOML
+    # defines for basic strings.
+    return json.dumps(str(v))
+
+
 def _toml_inline(v: object) -> str:
     """Scalar -> TOML literal; dict -> inline table (one level)."""
     if isinstance(v, bool):
@@ -2227,7 +2396,7 @@ class Sandbox:
             elif isinstance(v, list):
                 lines.append(f"{k} = " + json.dumps(v))
             else:
-                lines.append(f'{k} = "{v}"')
+                lines.append(f"{k} = " + _toml_str(v))
         body = "\n".join(lines) + ("\n" if lines else "")
         for name, tbl in tables:
             # "keys"/"remotes" are arrays-of-tables ([[keys]]/[[remotes]]);
@@ -2245,7 +2414,7 @@ class Sandbox:
                     # Nested struct (e.g. sampler_defaults): inline table.
                     body += f"{k} = " + _toml_inline(v) + "\n"
                 else:
-                    body += f'{k} = "{v}"\n'
+                    body += f"{k} = " + _toml_str(v) + "\n"
         with open(path, "w") as f:
             f.write(body + "\n")
         return path
@@ -3576,6 +3745,33 @@ def phase_api() -> None:
         st == 200 and isinstance(v, dict) and v.get("choices"),
         f"status={st}",
     )
+    # The request-name ladder (exact -> unique bare prefix, proxy.rs) is a
+    # product lane: clients say "qwen2.5-0.5b" for the -instruct row. MODEL
+    # now probes the resolved ROW name, so exercise the alias dialect
+    # explicitly — this coverage used to ride the drifting default.
+    alias = ""
+    cand = MODEL.rsplit("-", 1)[0] if "-" in MODEL else ""
+    while cand and not alias:
+        if sum(r.startswith(cand) for r in _store_model_rows()) == 1:
+            alias = cand
+        elif "-" in cand:
+            cand = cand.rsplit("-", 1)[0]
+        else:
+            cand = ""
+    if alias:
+        st_a, v_a, _ = chat("Say ok", extra={"model": alias})
+        check(
+            "api",
+            "bare-prefix alias request resolves to the same row",
+            st_a == 200 and isinstance(v_a, dict) and v_a.get("choices"),
+            f"alias={alias} status={st_a}",
+        )
+    else:
+        boundary(
+            "api",
+            "bare-prefix alias routing",
+            "no derivable unique prefix for the fixture row",
+        )
     ok, collected = sse_collect(
         "/v1/chat/completions",
         "[DONE]",
@@ -4792,6 +4988,13 @@ def phase_behavior() -> None:
             {
                 "model": MODEL,
                 "stream": True,
+                # floor == cap: a 0.5B base model can EOS at ~13 tokens
+                # and kill the generation window the choreography depends
+                # on; min_tokens pins the holder to the FULL 1500 tokens.
+                # (If the engine rejected the param the holder never
+                # reports 200 and the lane degrades to its boundary row —
+                # loud, never silently wrong.)
+                "min_tokens": 1500,
                 "max_tokens": 1500,
                 "messages": [
                     {
@@ -4848,24 +5051,52 @@ def phase_behavior() -> None:
     else:
         t_low = threading.Thread(target=_pri_track, args=("low", "low", 512))
         t_high = threading.Thread(target=_pri_track, args=("high", "high", 5))
+
         # Near-zero gap: with the holder confirmed generating, BOTH requests
         # must land in the gateway queue together for priority to reorder
         # them. A long gap lets the fast holder finish first, low starts
-        # running, and a running request can never be reordered.
+        # running, and a running request can never be reordered. A fixed
+        # sleep cannot guarantee that: observed live (2026-09-26 run 7,
+        # daemon log plm-1a0dd31d215/8) the low thread reached the
+        # gateway ~1s AFTER the holder's stream had already ended —
+        # thread-start latency under load ate the whole generation
+        # window and low was admitted to a free slot before high
+        # arrived. Gate high's launch on the gateway's own queue gauge
+        # instead of the clock.
+        def _queue_depth() -> int:
+            _, _, raw = http("GET", "/metrics")
+            m = re.search(rb"^blazar_queue_depth (\d+)", raw, re.MULTILINE)
+            return int(m.group(1)) if m else -1
+
         t_low.start()
-        time.sleep(0.05)
-        t_high.start()
+        low_queued = False
+        gate_deadline = time.time() + 15
+        while time.time() < gate_deadline:
+            if _queue_depth() >= 1:
+                low_queued = True
+                break
+            time.sleep(0.05)
+        if low_queued:
+            t_high.start()
         holder.join(timeout=300)
         t_low.join(timeout=300)
         t_high.join(timeout=300)
-        check(
-            "behavior",
-            "x-blazar-priority: high admitted before queued low",
-            order.get("low", (0.0, 0))[1] == 200
-            and order.get("high", (0.0, 0))[1] == 200
-            and order["high"][0] < order["low"][0],
-            f"low={order.get('low')} high={order.get('high')}",
-        )
+        if low_queued:
+            check(
+                "behavior",
+                "x-blazar-priority: high admitted before queued low",
+                order.get("low", (0.0, 0))[1] == 200
+                and order.get("high", (0.0, 0))[1] == 200
+                and order["high"][0] < order["low"][0],
+                f"low={order.get('low')} high={order.get('high')}",
+            )
+        else:
+            boundary(
+                "behavior",
+                "x-blazar-priority: high admitted before queued low",
+                "low never registered in the gateway queue behind the "
+                "holder within 15s (holder window too short this boot)",
+            )
 
     # deadline accounting: a request admitted past its deadline lands in
     # blazar_slo_deadline_exceeded_total (or is 503-rejected — both honor SLO).
@@ -5173,9 +5404,7 @@ def phase_wave() -> None:
     deadline = time.time() + 120
     while time.time() < deadline:
         rows = wave_replica_rows(small)
-        reps = sorted(
-            r.get("blazar_replica") for r in rows if r.get("blazar_replica")
-        )
+        reps = sorted(r.get("blazar_replica") for r in rows if r.get("blazar_replica"))
         if len(rows) >= 2 and reps[:2] == [1, 2]:
             got_two = True
             break
@@ -5370,10 +5599,13 @@ def phase_wave() -> None:
     )
     check(
         "wave",
-        "whisper uninstalled -> 501 teaching (install/pull hints)",
-        # F166: the gateway teaches `blazar whisper --install` (dashed) —
-        # match the real text, not the old never-matching prose.
-        st == 501 and b"whisper --install" in raw,
+        "whisper lane -> 501 teaching (install/pull hints)",
+        # F166 + teaching_detail (gateway whisper.rs) has TWO halves:
+        # server missing -> `blazar whisper --install`; server present
+        # but no model -> `blazar whisper --pull`. The sandbox engines
+        # copy tracks the real box, so state decides which hint fires —
+        # either one proves the 501 teaching contract.
+        st == 501 and (b"whisper --install" in raw or b"whisper --pull" in raw),
         f"status={st}",
     )
 
@@ -6482,6 +6714,32 @@ def _active_engine_tag() -> str | None:
     return row[0] if row else None
 
 
+def _sandbox_engine_tags() -> list[str]:
+    """Tags currently registered in the SANDBOX store's engines table."""
+    db = _sandbox_db()
+    rows = sorted(r[0] for r in db.execute("SELECT tag FROM engines"))
+    db.close()
+    return rows
+
+
+def _rollback_expectation(anchor: str) -> str | None:
+    """The tag `engine rollback` must step to: the next-older row of the
+    anchor's kind in the sandbox store (product `list_engines` order:
+    newest first). `None` when no same-kind row sits below the anchor —
+    rollback is kind-scoped (a text-lane step once crossed onto the
+    whisper voice lane, 2026-09-26) and must refuse by design."""
+    db = _sandbox_db()
+    rows = db.execute(
+        "SELECT tag, kind FROM engines ORDER BY installed_at DESC, rowid DESC"
+    ).fetchall()
+    db.close()
+    idx = next((i for i, r in enumerate(rows) if r[0] == anchor), None)
+    if idx is None:
+        return None
+    kind = rows[idx][1]
+    return next((r[0] for r in rows[idx + 1 :] if r[1] == kind), None)
+
+
 def _llamacpp_engine_tag() -> str | None:
     """Tag of the engine dir that carries llama.cpp binaries.
 
@@ -6566,18 +6824,26 @@ def _server_engine_tags() -> list[str]:
 
 
 def _store_engine_tags() -> list[str]:
-    """Real engine rows of ANY kind (llamacpp + sglang + mistral.rs).
+    """Real engine rows fit for the switch dance (llamacpp + sglang +
+    mistral.rs + sdcpp).
 
-    `engine use`/`rollback` switch across kinds via activation history
-    (verified live on 2026-09-17: rollback off a freshly built llamacpp
-    engine steps to the sglang row, rc=0), so any real row is a valid
-    dance partner for the switch lanes. The `local` pseudo-tag is
-    excluded — it is a path registration, not a store lane.
+    `engine use` switches across kinds via activation history, so any
+    real row is a valid dance partner for the use lanes; `engine
+    rollback` is kind-scoped (2026-09-26 fix) and derives its own
+    expectation from the sandbox store. The `local` pseudo-tag is
+    excluded — it is a path registration, not a store lane. Voice-lane
+    rows (kind whisper/piper) are excluded too: live-observed 2026-09-26
+    they dance and update-refuse ("release b5130 not found" — whisper
+    builds live in ggml-org/whisper.cpp, invisible to the llamacpp
+    updater), and `engine rm` of the whisper row breaks the later
+    transcribe lanes' "(pinned)" bookkeeping.
     """
     try:
         db = sqlite3.connect(os.path.join(REAL_DATA, "blazar.db"))
         rows = sorted(
-            r[0] for r in db.execute("SELECT tag FROM engines") if r[0] != "local"
+            tag
+            for tag, kind in db.execute("SELECT tag, kind FROM engines")
+            if tag != "local" and kind not in ("whisper", "piper")
         )
         db.close()
         return rows
@@ -6747,14 +7013,27 @@ def phase_commands() -> None:
         )
         # --quant post-filters rows on real file quants; bare q4 token is
         # lifted out of the text query (stderr carries the filter notice,
-        # stdout stays clean).
+        # stdout stays clean). Hub text-search result pages churn between
+        # runs (ranking/content refresh), so a zero-row page is retried
+        # once and then boundary'd — the filter notice + the --json lane
+        # below still pin the filter machinery either way.
         p4 = cli("search", "qwen", "0.5b", "q4", timeout=120)
+        if p4.returncode != 0:
+            time.sleep(5)
+            p4 = cli("search", "qwen", "0.5b", "q4", timeout=120)
         rows4 = [line for line in p4.stdout.splitlines() if "/" in line]
-        reg(
-            "search.quant",
-            p4.returncode == 0 and bool(rows4) and "quant filter: q4" in p4.stderr,
-            f"rc={p4.returncode} rows={len(rows4)} notice={'quant filter: q4' in p4.stderr}",
-        )
+        if p4.returncode == 0 and rows4:
+            reg(
+                "search.quant",
+                "quant filter: q4" in p4.stderr,
+                f"rc={p4.returncode} rows={len(rows4)} notice=True",
+            )
+        else:
+            regb(
+                "search.quant",
+                "hub result churn: q4 rows absent from the 'qwen 0.5b' page "
+                "after retry (filter notice still proven)",
+            )
         p5 = cli("search", "qwen", "0.5b", "--quant", "q4", "--json", timeout=120)
         jrows = [json.loads(line) for line in p5.stdout.splitlines() if line.strip()]
         # full per-row quants (the table's +N collapse can hide the Q4
@@ -6898,7 +7177,7 @@ def phase_commands() -> None:
     # Target BIG: attaching a projector is model-agnostic but the happy lane
     # was proven on the 9B — keep it pinned there even when MODEL is small.
     if src:
-        target = BIG if BIG != MODEL else MODEL
+        target = BIG or MODEL
         # mmproj refuses while the model is loaded; release it first and
         # wait out the async drain (stop returns before unload completes).
         cli("stop", target, check_exit=False)
@@ -6912,6 +7191,8 @@ def phase_commands() -> None:
             p.returncode != 0 and "not a vision projector" in (p.stdout + p.stderr),
             f"rc={p.returncode} err={p.stderr.strip()[:100]}",
         )
+    else:
+        regb("mmproj.refusal", "model path unavailable in store DB")
 
     def _mmproj_happy():
         try:
@@ -6920,7 +7201,7 @@ def phase_commands() -> None:
             url = f"https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct-GGUF/resolve/main/{fname}"
             with urllib.request.urlopen(url, timeout=600) as r, open(dst, "wb") as f:
                 shutil.copyfileobj(r, f)
-            target = BIG if BIG != MODEL else MODEL
+            target = BIG or MODEL
             p = cli("mmproj", target, dst, timeout=300)
             reg(
                 "mmproj.happy",
@@ -7336,6 +7617,9 @@ def phase_commands() -> None:
     else:
         regb("quantize.happy", f"disk free {disk_free_gb():.1f}G <= 8G")
         regb("quantize.refusal", f"disk free {disk_free_gb():.1f}G <= 8G")
+        # the imatrix scenario lives inside _quantize: the same disk gate
+        # bounds it, and flag-evidence resolution needs its boundary row
+        regb("quantize.imatrix", f"disk free {disk_free_gb():.1f}G <= 8G")
 
     def _whisper():
         p = cli("whisper", "--install", timeout=1200)
@@ -7508,10 +7792,11 @@ def phase_commands() -> None:
         # ONE llamacpp build — the >=2-llamacpp dance is only reachable on
         # pre-dedaceb legacy stores. The designed switch dance on a modern
         # store pairs the llamacpp anchor with a real cross-kind engine
-        # row (sglang/mistralrs). `engine rollback` steps to the
-        # NEXT-OLDER row in the install-time list (newest-first), which
-        # crosses kinds naturally — verified live: rollback off a fresh
-        # llamacpp build steps to the sglang row, rc=0.
+        # row (sglang/mistralrs) for the `engine use` lanes. `engine
+        # rollback` itself is KIND-SCOPED (2026-09-26 fix: a text-lane
+        # step once crossed onto the whisper voice lane) — its expected
+        # target is derived independently from the sandbox store in
+        # _engine_full below, not from this dance partner.
         dance = next((t for t in _store_engine_tags() if t != anchor), None)
     # Prefer a plain upstream tag for the pin-update dance so the lane
     # exercises the standard asset path whenever the store has one; a
@@ -7531,13 +7816,11 @@ def phase_commands() -> None:
 
     def _engine_full():
         # Dance order fits rollback's real semantics: `engine rollback`
-        # activates engines[active_idx + 1] in the NEWEST-FIRST install
-        # list, so it must run while the NEWER anchor is active — it then
-        # lands on dance deterministically (anchor is always the newer
-        # row: full/server tags sort by build number desc, and a
-        # cross-kind dance partner is an older install). The historical
-        # order (use dance -> rollback) only worked on 3+-row stores
-        # where another row sat below dance in the list.
+        # activates the next-older SAME-KIND row below the active one in
+        # the newest-first install list (kind-scoped since the
+        # 2026-09-26 whisper-lane incident fix), so it must run while
+        # the anchor is active and its expected target is derived from
+        # the sandbox store — not from the cross-kind dance partner.
         p = cli("engine", "use", dance)
         ok_use = p.returncode == 0 and _active_engine_tag() == dance
         reg("engine.use", ok_use, f"active={_active_engine_tag()}")
@@ -7547,6 +7830,7 @@ def phase_commands() -> None:
             p.returncode == 0 and _active_engine_tag() == anchor,
             f"active={_active_engine_tag()}",
         )
+        expected_rollback = _rollback_expectation(anchor)
         p = cli("engine", "rollback")
         stepped = _active_engine_tag()
         rout = p.stdout + p.stderr
@@ -7556,12 +7840,20 @@ def phase_commands() -> None:
                 "GH API rate limited (403): rollback metadata blocked this "
                 f"window; engine.use dance proves the switch path; err={rout.strip()[:80]}",
             )
+        elif expected_rollback is None:
+            # Designed refusal: no older same-kind engine below the
+            # anchor — the product must say so, never cross kinds.
+            regb(
+                "engine.rollback",
+                f"no older same-kind engine below {anchor}: {rout.strip()[:80]}",
+            )
         else:
             reg(
                 "engine.rollback",
-                p.returncode == 0 and stepped == dance,
+                p.returncode == 0 and stepped == expected_rollback,
                 f"rc={p.returncode} stepped to {stepped} "
-                f"(expected next-older {dance}) out={rout.strip()[:60]}",
+                f"(expected next-older same-kind {expected_rollback}) "
+                f"out={rout.strip()[:60]}",
             )
         p = cli("engine", "use", anchor)
         reg(
@@ -7571,20 +7863,25 @@ def phase_commands() -> None:
         )
         p = cli("engine", "update", update_pick, "--no-gate", timeout=1800)
         eout = p.stdout + p.stderr
+        # Designed teaching refusal: an overlay-shaped tag (-cuda,
+        # self-hosted builds) without BLAZAR_ENGINE_REPO configured
+        # must refuse — the error names the env var and the overlay
+        # repo. Any such refusal is the documented boundary, whatever
+        # the exact phrasing ("overlay repo is not configured", "no
+        # overlay release ...").
         overlay_miss = (
-            update_pick.endswith("-cuda")
-            and p.returncode != 0
-            and "overlay release" in eout
+            p.returncode != 0
             and "BLAZAR_ENGINE_REPO" in eout
+            and "overlay" in eout.lower()
         )
         if overlay_miss:
             regb(
                 "engine.update",
-                "CUDA overlay channel not live yet (no bNNNN-cuda release "
-                f"published in the overlay repo); "
-                f"tag-pinned update to {update_pick} needs a published bNNNN-cuda "
-                "release there — the switch path is proven by engine.use above and "
-                "the channel-update path by live engine-update runs",
+                "overlay-tag update refused by design (no overlay repo "
+                "configured via BLAZAR_ENGINE_REPO); the switch path is "
+                "proven by engine.use above and the channel-update path "
+                f"by live engine-update runs; pick={update_pick} "
+                f"err={eout.strip()[:80]}",
             )
             p = cli("engine", "use", anchor)
             reg(
@@ -7780,7 +8077,10 @@ def phase_commands() -> None:
             listed = cli("engine", "list").stdout
             if dance in listed:
                 p2 = cli("engine", "rm", dance)
-                gone = dance not in cli("engine", "list").stdout
+                # `engine list` prints voice-lane rows too (whisper b-tags
+                # share the engine namespace), so presence must be judged
+                # on the store table, not on raw substring matches.
+                gone = dance not in _sandbox_engine_tags()
                 reg(
                     "engine.rm",
                     p2.returncode == 0 and gone,
@@ -7809,11 +8109,19 @@ def phase_commands() -> None:
     lane("engine.prune", _engine_prune)
 
     def _engine_build():
+        nonlocal anchor
         if disk_free_gb() <= 8:
             regb("engine.build", f"disk free {disk_free_gb():.1f}G <= 8G")
             return
-        # Real source build with the local toolchain (net: clone).
-        p = cli("engine", "build", timeout=3600)
+        # Real source build with the local toolchain (net: clone). CPU
+        # backend: this box has cmake+gcc but no nvcc, and the lane's
+        # job is proving the build path, not the fastest artifacts.
+        # One-build-per-lane contract: build ACTIVATES its tag and
+        # prune_siblings deletes the previous llamacpp builds (the old
+        # anchor included) — "engine update should clean the old
+        # builds". The anchor therefore rolls FORWARD to the built tag,
+        # not back to a tag the prune just deleted.
+        p = cli("engine", "build", "cpu", timeout=3600)
         out = p.stdout + p.stderr
         if p.returncode != 0 and ("cmake" in out.lower() or "toolchain" in out.lower()):
             regb("engine.build", f"no local build toolchain: {out.strip()[:120]}")
@@ -7823,6 +8131,11 @@ def phase_commands() -> None:
             p.returncode == 0,
             f"rc={p.returncode} out={out.strip()[:100]}",
         )
+        if p.returncode == 0:
+            anchor = _active_engine_tag() or anchor
+            print(f"  [engine.build] anchor rolled: {anchor}", flush=True)
+        elif anchor and _active_engine_tag() != anchor:
+            cli("engine", "use", anchor)
 
     lane("engine.build", _engine_build)
 
@@ -7830,14 +8143,21 @@ def phase_commands() -> None:
         if disk_free_gb() <= 8:
             regb("engine.install", f"disk free {disk_free_gb():.1f}G <= 8G")
             return
+        # Prebuilt mistral.rs lane. TAG + --kind only: clap forbids TAG
+        # together with --lane (curated-lane installs are lane-id driven).
+        # v0.9.3 is a real published release (v0.9.4 may already be in
+        # the sandbox store — a re-install of the same tag would skip the
+        # download path this lane exists to exercise). Install ACTIVATES
+        # its tag and prunes same-kind siblings; the anchor here is the
+        # SURVIVING llamacpp build (the built tag after the build lane's
+        # one-per-lane prune) — restoring it keeps later phases spawning
+        # llama-server children, not mistral.rs ones.
         p = cli(
             "engine",
             "install",
-            "mistralrs",
+            "v0.9.3",
             "--kind",
             "mistralrs",
-            "--lane",
-            "prebuilt",
             timeout=1800,
         )
         out = p.stdout + p.stderr
@@ -7851,6 +8171,19 @@ def phase_commands() -> None:
             p.returncode == 0,
             f"rc={p.returncode} out={out.strip()[:100]}",
         )
+        if anchor and _active_engine_tag() != anchor:
+            pu = cli("engine", "use", anchor)
+            print(
+                f"  [engine.install restore] anchor={anchor} "
+                f"active={_active_engine_tag()} use_rc={pu.returncode}",
+                flush=True,
+            )
+        else:
+            print(
+                f"  [engine.install restore SKIPPED] anchor={anchor} "
+                f"active={_active_engine_tag()}",
+                flush=True,
+            )
 
     lane("engine.install", _engine_install)
 
@@ -7875,6 +8208,34 @@ def phase_commands() -> None:
             p.returncode != 0 and "no voice" in (p.stdout + p.stderr).lower(),
             f"rc={p.returncode} err={(p.stderr or p.stdout).strip()[:90]}",
         )
+        # --no-play was removed from the product surface (clap rejects it);
+        # the registry entry went with it — see _FLAG_EVIDENCE['tts'].
+        # Catalog searches are read-only upstream queries: cheap, no
+        # downloads; boundary (not fail) when the network refuses.
+        p = cli("tts", "--search", "en", timeout=120)
+        out = p.stdout + p.stderr
+        if p.returncode == 0 and out.strip():
+            reg(
+                "flag.tts.--search", True, f"rc0 catalog rows ({len(out.splitlines())})"
+            )
+        else:
+            regb(
+                "flag.tts.--search",
+                f"catalog query blocked this window: {out.strip()[:100]}",
+            )
+        p = cli("whisper", "--search", "turbo", timeout=120)
+        out = p.stdout + p.stderr
+        if p.returncode == 0 and out.strip():
+            reg(
+                "flag.whisper.--search",
+                True,
+                f"rc0 catalog rows ({len(out.splitlines())})",
+            )
+        else:
+            regb(
+                "flag.whisper.--search",
+                f"catalog query blocked this window: {out.strip()[:100]}",
+            )
 
     lane("tts.list", _tts_state, "tts.pin.refusal", "tts.synthesize.no-voice")
 
@@ -7920,9 +8281,9 @@ def phase_commands() -> None:
     lane("tts.install", _tts_heavy, "tts.pull", "tts.synthesize")
 
     def _pull():
-        before = set(cli("list").stdout.split())
+        before = _listed_model_names(cli("list").stdout)
         p = _pull_retry("pull", "ggml-org/Qwen3-0.6B-GGUF")
-        after = set(cli("list").stdout.split())
+        after = _listed_model_names(cli("list").stdout)
         new = {w for w in after - before if "qwen3" in w.lower()}
         err = (p.stderr or "").lower()
         # A double HF-side failure (429/5xx on both attempts) is a transient
@@ -7957,6 +8318,11 @@ def phase_commands() -> None:
                 v.returncode == 0,
                 (v.stdout + v.stderr).strip()[:100],
             )
+        else:
+            regb(
+                "pull.verify",
+                "no fresh row to re-hash this run (pull transient/blocked)",
+            )
         for name in new:
             cli("rm", name)
 
@@ -7970,7 +8336,7 @@ def phase_commands() -> None:
         # `blazar run` on a missing model must auto-pull (same flow as
         # `blazar pull`: progress, locks) and then run it — one-shot
         # prompt mode proves the whole chain parse -> pull -> serve.
-        before = set(cli("list").stdout.split())
+        before = _listed_model_names(cli("list").stdout)
         p = _pull_retry_cmd(
             ["run", "ggml-org/Qwen3-0.6B-GGUF", "Say ok", "--max-tokens", "8"],
             timeout=2400,
@@ -8066,6 +8432,14 @@ def phase_commands() -> None:
 
 def phase_knobs_argv() -> None:
     print("\n== phase knobs_argv: every child-argv knob, batched spawns ==")
+    boundary(
+        "knobs_argv",
+        "server_tools_runtime: argv e2e not bootable",
+        "every accepted value (docker:/podman:/ssh:) eagerly spawns external "
+        "infrastructure at engine boot — unavailable in this sandbox; argv "
+        "emission proven by unit__server_tools__emits_quartet_when_set, "
+        "config echo by roundtrip tier",
+    )
     d = DAEMON
     for group, entries in argv_groups().items():
         cfg: dict = {"port": PORT}
@@ -8393,7 +8767,7 @@ def phase_knobs_behavior() -> None:
 
 
 def _full_toplevel() -> dict:
-    """All 146 manifest knobs with benign explicit values (full-manifest boot).
+    """All 171 manifest knobs with benign explicit values (full-manifest boot).
 
     None values = deliberately omitted from the serialized boot config
     (XOR partners / pairing-gated knobs that cannot co-exist): the key
@@ -8430,6 +8804,14 @@ def _full_toplevel() -> dict:
         "default_ctx": 2048,
         "idle_sleep_secs": 77,
         "idle_timeout_secs": 500,
+        "whisper_idle_secs": 900,
+        # sdcpp parity knobs: config.rs defaults, valid by construction
+        "media_job_wait_secs": 900,
+        "sdcpp_child_header_timeout_secs": 900,
+        "sdcpp_flash_attention": True,
+        "sdcpp_rpc_servers": [],
+        "sdcpp_sage_attn": False,
+        "sdcpp_vae_tiling": False,
         "max_loaded_models": 2,
         # six real knobs surfaced by gate (b) — values are the config.rs
         # defaults, valid by construction
@@ -9324,7 +9706,8 @@ def _gold_items() -> dict:
     p = cli("show", MODEL)
     keys = []
     for ln in p.stdout.splitlines():
-        m = re.match(r"^([a-z][a-z0-9 _-]*?):\s+", ln)
+        # aligned-column restyle: `key       value` (2+ spaces, no colon)
+        m = re.match(r"^([a-z][a-z0-9 _-]*?)\s{2,}\S", ln)
         if m:
             keys.append(m.group(1).strip())
     items["header.show"] = "\n".join(keys)
@@ -9333,8 +9716,11 @@ def _gold_items() -> dict:
     names = sorted(
         {
             m.group(1)
+            # doctor renders statuses ok/warn lowercase, FAIL uppercase
+            # (matches the coverage-phase --flat token parse) — a warn
+            # row must NOT silently vanish from this capture.
             for m in (
-                re.match(r"^\s*([a-z][a-z0-9 _-]+?)\s{2,}(?:ok|WARN|FAIL)\s", ln)
+                re.match(r"^\s*([a-z][a-z0-9 _-]+?)\s{2,}(?:ok|warn|FAIL)\s", ln)
                 for ln in p.stdout.splitlines()
             )
             if m
@@ -9367,6 +9753,17 @@ def _gold_items() -> dict:
             "daemon uptime",
             "gpu fit",
             "gpu arch match",
+            # engine-state rows: presence depends on which engines are
+            # installed (per-kind inventory) and on update/retention/
+            # bench state at capture time — none is environment-stable
+            "inventory llamacpp",
+            "inventory mistralrs",
+            "inventory sdcpp",
+            "inventory sglang",
+            "inventory whisper",
+            "engine currency",
+            "engine retention",
+            "bench baseline",
         }
     )
     items["doctor.check-names"] = "\n".join(names)
@@ -9649,6 +10046,7 @@ _FLAG_EVIDENCE: dict[str, dict[str, str]] = {
         "--list": "whisper.list",
         "--pin": "whisper.pin.refusal",
         "--tag": "flag.whisper.--tag",
+        "--search": "flag.whisper.--search",
     },
     "tts": {
         "--voice": "tts.synthesize",
@@ -9657,10 +10055,15 @@ _FLAG_EVIDENCE: dict[str, dict[str, str]] = {
         "--list": "tts.list",
         "--pin": "tts.pin.refusal",
         "--tag": "flag.tts.--tag",
+        "--search": "flag.tts.--search",
         "--out": "tts.synthesize",
         "--speed": "tts.synthesize",
     },
-    "doctor": {"--flat": "flag.doctor.--flat", "--json": "flag.doctor.--json"},
+    "doctor": {
+        "--flat": "flag.doctor.--flat",
+        "--json": "flag.doctor.--json",
+        "--color": "flag.doctor.--color",
+    },
     "upgrade": {"--dry-run": "upgrade.dry-run", "--version": "upgrade.dry-run"},
     "why": {
         "--code": "flag.why.--code",
@@ -9669,6 +10072,14 @@ _FLAG_EVIDENCE: dict[str, dict[str, str]] = {
         "--flagged": "flag.why.--flagged",
         "--watch": "flag.why.--watch",
     },
+}
+
+# Root-level (clap global) args: one parser path shared by every
+# subcommand that advertises them. The resolution gate maps each
+# command's copy to the single evidence lane named here instead of
+# demanding N duplicate scenarios.
+_GLOBAL_FLAG_EVIDENCE: dict[str, str] = {
+    "--color": "flag.doctor.--color",
 }
 
 # Flags that are variant knobs of an already-exercised path: pulling a
@@ -9711,10 +10122,34 @@ def phase_coverage() -> None:
 
     # Cheap local lives for flags that had no lane above.
     p = cli("doctor", "--flat")
+    # Table rows carry an exact status token (ok/warn/FAIL) at index 1
+    # (one-word check name) or 2 ("engine binary"); the summary count
+    # line ("30 ok, 5 warning(s)") and the "next:" trailer are not rows.
+    # The >=20 floor keeps an unparseable table from passing vacuously.
+    st = ("ok", "warn", "FAIL")
+
+    def _row_status(toks: list) -> str | None:
+        if len(toks) > 1 and toks[1] in st:
+            return toks[1]
+        if len(toks) > 2 and toks[2] in st:
+            return toks[2]
+        return None
+
+    statuses = [
+        s
+        for s in (_row_status(ln.split()) for ln in p.stdout.splitlines() if ln.strip())
+        if s is not None
+    ]
     reg(
         "flag.doctor.--flat",
-        p.returncode == 0 and "FAIL" not in p.stdout.upper(),
-        f"rc={p.returncode} flat check table",
+        p.returncode == 0 and len(statuses) >= 20 and "FAIL" not in statuses,
+        f"rc={p.returncode} flat check table ({len(statuses)} rows, no FAIL)",
+    )
+    p = cli("doctor", "--color", "never")
+    reg(
+        "flag.doctor.--color",
+        p.returncode == 0 and "\x1b[" not in p.stdout,
+        f"rc={p.returncode} plain bytes (no ANSI escapes)",
     )
     p = cli("doctor", "--json")
     rows = _jsonl(p.stdout)
@@ -9767,13 +10202,37 @@ def phase_coverage() -> None:
             )
         p = cli("engine", "update", "--kind", "mistralrs", "--check", timeout=300)
         out = p.stdout + p.stderr
-        # Sandbox carries no mistralrs engine: the clean "not installed"
-        # error names the kind, proving --kind is wired into the resolver.
+        # Sandbox carries a mistralrs engine row: kind-specific output
+        # ("mistral.rs X stays/would update ... --kind mistralrs") proves
+        # --kind is wired into the resolver; "mistral" matches both the
+        # product spelling and the --kind token.
         reg(
             "flag.engine-update.--kind",
-            p.returncode in (0, 1) and "mistralrs" in out.lower(),
+            p.returncode in (0, 1) and "mistral" in out.lower(),
             f"rc={p.returncode} {out.strip()[:60]}",
         )
+        # Same resolver probe for the remaining prebuilt lanes: the kind
+        # name in the response proves each lane reaches its own resolver
+        # (currency metadata comes back or a clean not-installed error).
+        for kind in ("sdcpp", "sglang"):
+            p = cli("engine", "update", "--kind", kind, "--check", timeout=300)
+            out = p.stdout + p.stderr
+            reg(
+                f"flag.engine-update.--kind-{kind}",
+                p.returncode in (0, 1) and kind in out.lower(),
+                f"rc={p.returncode} {out.strip()[:60]}",
+            )
+        # Full install lanes for the non-default kinds are multi-GB
+        # downloads; the install machinery itself (download/extract/
+        # companion/rollback/sweep) is shared and exercised for real by
+        # the llamacpp install + update lanes. Record the boundary in the
+        # LEDGER (visible in every report) rather than leaving it implicit.
+        for kind in ("mistralrs", "sdcpp", "sglang"):
+            regb(
+                f"engine.install.{kind}",
+                f"full {kind} install: multi-GB download; resolver proven via "
+                f"--kind {kind} --check, install machinery shared with llamacpp lane",
+            )
         p = cli("why", "--flagged", timeout=60)
         reg(
             "flag.why.--flagged",
@@ -9792,20 +10251,31 @@ def phase_coverage() -> None:
             p.returncode == 0,
             f"rc={p.returncode} model={MODEL}",
         )
-        tid = ""
+        # --code takes a VALUE and filters by detection code: exercise it
+        # against a trace that actually carries a detection (a clean
+        # trace matches nothing and would assert nothing). No flagged
+        # trace in the ring this run -> honest boundary.
+        flagged: tuple[str, str] | None = None
         try:
-            tid = why()[0].get("trace", "")
+            for rec in why():
+                dets = rec.get("detections") or []
+                if dets and dets[0].get("code"):
+                    flagged = (rec.get("trace", ""), str(dets[0]["code"]))
+                    break
         except Exception:
-            tid = ""
-        if tid:
-            p = cli("why", tid, "--code", timeout=60)
+            flagged = None
+        if flagged:
+            tid, code = flagged
+            p = cli("why", tid, "--code", code, timeout=60)
             reg(
                 "flag.why.--code",
                 p.returncode == 0 and tid[:8] in (p.stdout + p.stderr),
-                f"rc={p.returncode} trace={tid[:8]}",
+                f"rc={p.returncode} trace={tid[:8]} code={code}",
             )
         else:
-            regb("flag.why.--code", "no trace id available")
+            regb(
+                "flag.why.--code", "no flagged trace with a detection code in the ring"
+            )
         w = subprocess.run(
             ["timeout", "8", PAL, "why", "--watch"],
             capture_output=True,
@@ -9861,6 +10331,7 @@ def phase_coverage() -> None:
 
     # Resolution: every advertised flag resolves to a PASSED lane or an
     # explicit boundary; every mapped flag still exists (no stale rows).
+    # explicit boundary; every mapped flag still exists (no stale rows).
     # Subcommand help carries the universal -h/--help in its Options block;
     # clap's auto -V/--version exists only at the ROOT command, so a
     # subcommand advertising its own `--version` value flag (upgrade) is a
@@ -9879,6 +10350,34 @@ def phase_coverage() -> None:
                 f"{flag} mapped but not advertised by `{key} --help`",
             )
         for flag in sorted(live - mapped):
+            # Root-level (clap global) args like --color are ONE parser
+            # path shared by every subcommand: resolve them through a
+            # single evidence lane instead of per-command duplicates.
+            ev = _GLOBAL_FLAG_EVIDENCE.get(flag)
+            if ev is not None:
+                rows = [r for r in COMMAND_COVERAGE if r["path"] == ev]
+                if rows:
+                    reg(
+                        f"flag.{slug}.{flag}",
+                        all(r["ok"] for r in rows),
+                        f"global arg, evidence: {ev}",
+                    )
+                elif (
+                    PHASE_FILTER is not None
+                    or os.environ.get("BLAZAR_VALIDATE_FAST") == "1"
+                ):
+                    regb(
+                        f"flag.{slug}.{flag}",
+                        f"global arg; evidence lane {ev} not exercised "
+                        "(phase filter / FAST mode)",
+                    )
+                else:
+                    reg(
+                        f"flag.{slug}.{flag}",
+                        False,
+                        f"global arg; evidence lane {ev} never ran",
+                    )
+                continue
             check(
                 "coverage",
                 f"flag.{slug}: unmapped live flag",
@@ -9920,6 +10419,8 @@ def main() -> int:
         f"blazar validation harness — engine+model REAL, isolation via temp XDG, port {PORT}"
     )
     print(f"binary={PAL} model={MODEL} fast={FAST}")
+    if _MODEL_NOTE:
+        print(f"model resolution: {_MODEL_NOTE}")
     # A dead GH_TOKEN is worse than none (401 "Bad credentials" on every
     # authed call: engine-check marker, whisper install, engine update,
     # doctor currency probes). Validate once up front; drop it if invalid

@@ -156,9 +156,21 @@ pub struct AppState {
     pub queue: Arc<PriorityQueue>,
     /// Loopback client for child traffic + metrics scrape.
     pub http: reqwest::Client,
-    /// J5 eviction lane sender (sentinel stall + proxy header-stall both
-    /// fire through it): the consumer task in `new` debounces (1/min per
-    /// model) and reaps the wedged child.
+    /// Timeout-less client for media forwards: a sync image/video
+    /// request holds the connection for the WHOLE render — minutes,
+    /// past any total timeout. Liveness comes from the loopback
+    /// socket itself (a dead child closes it immediately) plus the
+    /// child header/evict lanes, not from a client deadline.
+    pub media_http: reqwest::Client,
+    /// Cached per-socket clients for unix-transport children
+    /// (`child_transport = "unix"`): reqwest pins one socket path per
+    /// client, so each unix child gets its own entry here. Empty and
+    /// untouched in the default TCP mode.
+    pub uds_http: blazar_runtime::uds::UdsClients,
+    /// J5 eviction lane sender (sentinel body-stall fires through it):
+    /// the consumer task in `new` debounces (1/min per model) and reaps
+    /// the wedged child. Proxy header-stall evicts synchronously in-band
+    /// instead — a debounce is too slow to gate an in-band retry.
     pub evict_tx: tokio::sync::mpsc::UnboundedSender<String>,
     /// vLLM-style evidence loop: measured at the proxy, owned by the gateway.
     pub ttft: Histogram,
@@ -185,8 +197,15 @@ pub struct AppState {
     /// chaining; bounded LRU — upstream has no storage of its own).
     pub responses: std::sync::Mutex<crate::responses::ResponsesRegistry>,
     /// Local whisper.cpp lane (H8): lazily-spawned whisper-server child
-    /// for /v1/audio/transcriptions; killed at serve teardown.
-    pub whisper: blazar_runtime::whisper::WhisperRuntime,
+    /// for /v1/audio/transcriptions; killed at serve teardown or by the
+    /// idle reaper (`whisper_idle_secs`). Arc so the reaper task shares
+    /// the same child slot every request path uses.
+    pub whisper: std::sync::Arc<blazar_runtime::whisper::WhisperRuntime>,
+    /// Gateway-owned async audio jobs (`"async": true` on the audio
+    /// routes): upstream /inference is sync-only, so long files run as
+    /// spawned tasks polled at /v1/audio/jobs/{id}. Bounded registry;
+    /// jobs die with the gateway process.
+    pub audio_jobs: crate::whisper::AudioJobs,
     /// Single-flight for identical NON-STREAM requests (model + body
     /// hash): concurrent duplicates wait for the leader, then ride the
     /// leader's warm prefix instead of double-prefilling. Bounded. The
@@ -224,14 +243,70 @@ pub struct AppState {
     pub store: std::sync::Mutex<Option<blazar_core::Store>>,
 }
 
+/// Client for dialing ONE child endpoint: the shared TCP pool, or the
+/// cached socket-pinned client when the endpoint rides the unix
+/// transport. Pair with `proxy::child_base` — that base names a
+/// placeholder host the unix connector ignores, only the path is dialed.
+#[must_use]
+pub fn child_client(state: &AppState, ep: &blazar_core::profile::Endpoint) -> reqwest::Client {
+    match ep {
+        blazar_core::profile::Endpoint::Tcp { .. } => state.http.clone(),
+        blazar_core::profile::Endpoint::Unix { socket } => state.uds_http.get(socket),
+    }
+}
+
+/// Client for media forwards that hold one request open across the
+/// whole generation — the timeout-less media client on TCP, the
+/// (already deadline-free) per-socket pool on unix transport.
+pub fn media_child_client(
+    state: &AppState,
+    ep: &blazar_core::profile::Endpoint,
+) -> reqwest::Client {
+    match ep {
+        blazar_core::profile::Endpoint::Tcp { .. } => state.media_http.clone(),
+        blazar_core::profile::Endpoint::Unix { socket } => state.uds_http.get(socket),
+    }
+}
+
 impl AppState {
+    /// Key admission for the gated lanes that live outside the proxy
+    /// (images, videos, local whisper, local TTS): scope + rpm/tpm/daily
+    /// check, then the request charge — the exact bracket the text lanes
+    /// run inline. Local compute is not a free lane on an authed gateway
+    /// (audit MM1). No-op when no key context rode the request (open
+    /// gateway) or the key is unknown (the auth middleware already
+    /// rejected those before any handler ran).
+    pub fn admit_or_respond(
+        &self,
+        key_ext: Option<&axum::Extension<crate::keys::KeyCtx>>,
+        model: &str,
+    ) -> Result<(), Box<axum::response::Response>> {
+        let Some(axum::Extension(k)) = key_ext else {
+            return Ok(());
+        };
+        let Some(entry) = self.keys.entry(&k.name) else {
+            return Ok(());
+        };
+        self.keys
+            .check(&entry, model)
+            .map_err(|rej| Box::new(rej.to_response()))?;
+        self.keys.charge_request(&k.name);
+        Ok(())
+    }
+
     #[must_use]
     #[allow(clippy::duration_suboptimal_units)] // 10-minute ceiling mirrors long generations
     pub fn new(dirs: BlazarDirs, config: Config, sup: Arc<Supervisor>, bus: EventBus) -> Self {
-        let http = reqwest::Client::builder()
+        let http = crate::http_pool::tuned(reqwest::Client::builder())
             .timeout(std::time::Duration::from_secs(10 * 60))
             .build()
             .expect("gateway http client");
+        // No total timeout on purpose (see the field doc); connect
+        // stays bounded so a wedged child endpoint fails to connect.
+        let media_http = crate::http_pool::tuned(reqwest::Client::builder())
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .build()
+            .expect("gateway media http client");
         let run_dir = dirs.run_dir();
         let sentinel = Sentinel::new(config.sentinel, config.sentinel_stall_secs, Some(&run_dir));
         // E4 audit: spawn the file writer when the knob is on; the
@@ -257,6 +332,20 @@ impl AppState {
         // handle seeds the per-request cache below instead of dropping.
         let store = blazar_core::Store::open(&dirs).ok();
         let keys = KeysLimiter::loaded(store.as_ref(), config.keys.clone());
+        // Audio lane: one child slot shared by request paths and the
+        // idle reaper. 0 disables the reaper (child lives until
+        // teardown — the pre-reaper behavior).
+        let whisper = std::sync::Arc::new(blazar_runtime::whisper::WhisperRuntime::new());
+        if config.whisper_idle_secs > 0 {
+            let reaper = std::sync::Arc::clone(&whisper);
+            let max_idle = std::time::Duration::from_secs(config.whisper_idle_secs);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    reaper.reap_idle(max_idle).await;
+                }
+            });
+        }
         let otlp = Arc::new(Otlp::new(&config));
         // J5: consume stall-eviction requests; a wedged child is reaped
         // (no bank — a stalled child may not answer a save request) and
@@ -300,6 +389,8 @@ impl AppState {
             bus,
             queue: Arc::new(PriorityQueue::new()),
             http,
+            media_http,
+            uds_http: blazar_runtime::uds::UdsClients::new(),
             evict_tx: tx,
             cache_bust: Arc::new(crate::cache_bust::CacheBustTracker::new()),
             ttft: crate::histogram::ttft(),
@@ -311,7 +402,8 @@ impl AppState {
             keys: Arc::new(keys),
             otlp,
             responses: std::sync::Mutex::new(crate::responses::ResponsesRegistry::new()),
-            whisper: blazar_runtime::whisper::WhisperRuntime::new(),
+            whisper,
+            audio_jobs: crate::whisper::AudioJobs::new(),
             http_addr: std::sync::OnceLock::new(),
             remote_health: std::sync::Arc::default(),
             remote_affinity: std::sync::Arc::default(),
