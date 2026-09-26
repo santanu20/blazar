@@ -1,0 +1,55 @@
+engine | kind | provider | params | ttft_ms_p50 | ttft_ms_p99 | itl_p50_ms | itl_p99_ms | decode_tps | prefill_tps_cold | prefill_tps_cached | load_s | gpu_peak_mib | gpu_power_peak_w | rss_peak_mib | tokens_source
+--------------------------------------------------------------------------------------------------------------------------------------------
+inventory | inventory | inventory | {} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+b11193-cuda | llamacpp | direct | {'ctx': 4096, 'np': 1} | 127 | 129 | 24.08 | 25.23 | 41.49 | 1306.9 | 7275.9 | 6.05 | 5270 | 55.1 | 5413 | chunks
+b11193-cuda | llamacpp | direct | {'ctx': 4096, 'np': 4} | 124 | 127 | 24.11 | 25.42 | 41.43 | 1305.4 | 7442.9 | 2.55 | 5416 | 56.3 | 5719 | chunks
+b11193-cuda | llamacpp | direct | {'ctx': 16384, 'np': 1} | 122 | 126 | 24.15 | 25.09 | 41.37 | 1366.8 | 7344.0 | 2.51 | 5666 | 56.7 | 5714 | chunks
+b11193-cuda | llamacpp | direct | {'ctx': 16384, 'np': 4} | 128 | 131 | 24.21 | 25.47 | 41.24 | 1308.6 | 7331.7 | 2.51 | 5804 | 56.4 | 5716 | chunks
+b11193-cuda | llamacpp | direct | {'ctx': 4096, 'kv': 'q8_0', 'np': 1} | 120 | 125 | 24.34 | 25.8 | 40.99 | 1363.0 | 7546.7 | 2.51 | 5210 | 56.7 | 5717 | chunks
+b11193-cuda | llamacpp | direct | {'ctx': 4096, 'np': 1, 'spec': 'ngram-simple'} | 123 | 125 | 24.35 | 25.8 | 40.99 | 1327.2 | 7591.7 | 2.11 | 5270 | 55.4 | 5709 | chunks
+b11193-cuda | llamacpp | direct | {'ctx': 4096, 'mmproj': True, 'np': 1} | 123 | 125 | 23.98 | 25.07 | 41.67 | 1345.7 | 7517.1 | 3.01 | 6400 | 56.4 | 5721 | chunks
+v0.9.4 | mistralrs | direct | {'ctx': 4096, 'np': 1} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+v0.9.4 | mistralrs | direct | {'ctx': 4096, 'np': 4} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+v0.9.4 | mistralrs | direct | {'ctx': 16384, 'np': 1} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+v0.9.4 | mistralrs | direct | {'ctx': 16384, 'np': 4} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+v0.9.4 | mistralrs | direct | {'ctx': 4096, 'np': 1, 'pa': 'off'} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+b11193-cuda | llamacpp | blazar | {'config': 'default'} | 122 | 126 | 24.11 | 25.28 | 41.42 | 1319.0 | 7328.5 | - | 5452 | 55.4 | 1983 | chunks
+b11193-cuda | llamacpp | blazar | {'config': 'single-stream'} | 123 | 125 | 24.09 | 25.22 | 41.46 | 1302.0 | 7304.5 | - | 5666 | 55.8 | 1987 | chunks
+v0.9.4 | mistralrs | blazar | {'config': 'default'} | 125 | 126 | 24.12 | 25.25 | 41.4 | 1327.5 | 7166.5 | - | 5458 | 55.8 | 1984 | chunks
+v0.9.4 | mistralrs | blazar | {'config': 'paged_attn_off'} | 124 | 127 | 24.1 | 24.98 | 41.45 | 1322.9 | 7136.9 | - | 5458 | 56.3 | 1984 | chunks
+v0.9.4 | mistralrs | blazar | {'config': 'single-stream'} | 123 | 126 | 24.1 | 25.38 | 41.45 | 1329.3 | 7240.1 | - | 5672 | 55.3 | 1987 | chunks
+ollama-host | ollama | ollama | {'reference': True} | 125 | 127 | 24.93 | 74.97 | 40.46 | 1442.4 | 7701.3 | - | 6566 | 55.2 | 0 | engine_counters
+ollama-host | ollama | cold-ollama | {'cold': True} | - | - | - | - | - | - | - | - | 5554 | 22.2 | 0 | -
+master-919-19bbbca | sdcpp | media-image | {'runs': 3, 'size': '512x512', 'steps': [4]} | - | - | - | - | - | - | - | - | 6119 | - | 0 | -
+master-919-19bbbca | sdcpp | media-video | {'frames': [5, 13, 33], 'gate': {'duration': 60, 'size': '512x512', 'steps': 8}, 'runs': 3, 'size': '320x320', 'steps': 8} | - | - | - | - | - | - | - | - | 4644 | - | 0 | -
+piper | piper | media-tts | {'chars': 840, 'formats': ['wav', 'pcm'], 'runs': 3} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+piper | piper | media-tts-conc | {'chars': 400, 'format': 'pcm', 'streams': 4} | - | - | - | - | - | - | - | - | 16 | - | 0 | -
+b5130 | whisper | media-whisper | {'input': 'piper-wav', 'runs': 3} | - | - | - | - | - | - | - | - | 16 | - | 0 | -
+b11193-cuda | llamacpp | idle-blazar | {'idle': True} | - | - | - | - | - | - | - | - | 5444 | - | 0 | -
+v0.9.4 | mistralrs | idle-blazar | {'idle': True} | - | - | - | - | - | - | - | - | 5444 | - | 0 | -
+ollama-host | ollama | idle-ollama | {'idle': True} | - | - | - | - | - | - | - | - | 6562 | - | 0 | -
+b11193-cuda | llamacpp | ctxcurve-blazar | {'ctx': 2048} | 110 | 163 | 23.93 | 24.86 | 41.75 | 1394.4 | 8074.2 | - | 5546 | - | 0 | chunks
+b11193-cuda | llamacpp | ctxcurve-blazar | {'ctx': 8192} | 110 | 295 | 23.98 | 24.95 | 41.67 | 1376.4 | 8172.7 | - | 5396 | - | 0 | chunks
+b11193-cuda | llamacpp | ctxcurve-blazar | {'ctx': 16384} | 108 | 300 | 23.92 | 24.75 | 41.77 | 1363.5 | 8146.3 | - | 5660 | - | 0 | chunks
+v0.9.4 | mistralrs | ctxcurve-blazar | {'ctx': 2048} | 110 | 160 | 23.97 | 24.91 | 41.68 | 1363.0 | 8145.9 | - | 5546 | - | 0 | chunks
+v0.9.4 | mistralrs | ctxcurve-blazar | {'ctx': 8192} | 108 | 301 | 23.96 | 24.71 | 41.7 | 1358.7 | 8107.7 | - | 5402 | - | 0 | chunks
+v0.9.4 | mistralrs | ctxcurve-blazar | {'ctx': 16384} | 113 | 294 | 23.95 | 24.89 | 41.76 | 1374.0 | 8133.3 | - | 5666 | - | 0 | chunks
+ollama-host | ollama | ctxcurve-ollama | {'ctx': 2048} | 111 | - | - | - | 40.86 | - | - | 4.76 | 6368 | - | 0 | -
+ollama-host | ollama | ctxcurve-ollama | {'ctx': 8192} | 118 | - | - | - | 40.84 | - | - | 4.5 | 6566 | - | 0 | -
+ollama-host | ollama | ctxcurve-ollama | {'ctx': 16384} | 110 | - | - | - | 40.88 | - | - | 4.49 | 6830 | - | 0 | -
+b11193-cuda | llamacpp | conc-direct | {'conc': 4} | - | - | - | 35.96 | - | - | - | 3.52 | 0 | - | 0 | -
+b11193-cuda | llamacpp | conc-blazar | {'conc': 4, 'rounds': 3} | - | - | - | 28.49 | - | - | - | - | 5458 | - | 0 | -
+v0.9.4 | mistralrs | conc-blazar | {'conc': 4, 'rounds': 3} | - | - | - | 28.4 | - | - | - | - | 5458 | - | 0 | -
+ollama-host | ollama | conc-ollama | {'conc': 4, 'rounds': 3} | - | - | - | 74.35 | - | - | - | - | 6576 | - | 0 | -
+b11193-cuda | llamacpp | ppl | {'ppl': 2048} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+v0.9.4 | mistralrs | ppl | {'ppl': 2048} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+b11193-cuda | llamacpp | reshape | {'reshape': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+v0.9.4 | mistralrs | reshape | {'reshape': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+b11193-cuda | llamacpp | tools | {'tools': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+v0.9.4 | mistralrs | tools | {'tools': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+ollama-host | ollama | tools-ollama | {'tools': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+b11193-cuda | llamacpp | features | {'features': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+v0.9.4 | mistralrs | features | {'features': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+b11193-cuda | llamacpp | greedy | {'greedy': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+v0.9.4 | mistralrs | greedy | {'greedy': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+b11193-cuda | llamacpp | greedy_gw | {'greedy_gw': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
