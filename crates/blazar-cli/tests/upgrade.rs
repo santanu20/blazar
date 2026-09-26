@@ -49,14 +49,30 @@ fn preferred_asset(tag: &str) -> String {
 }
 
 /// Bind first (so the release JSON can embed the real URL), then serve
-/// one-request-at-a-time on that SAME listener: `/releases/latest` and
-/// `/download/<asset>`.
+/// one-request-per-connection on that SAME listener: `/releases/latest`
+/// and `/download/<asset>`.
 fn serve_loop(listener: &TcpListener, release_json: &[u8], asset: &[u8]) {
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { break };
-        let mut buf = [0u8; 4096];
-        let n = stream.read(&mut buf).unwrap_or(0);
-        let path = String::from_utf8_lossy(&buf[..n])
+        // Read until end-of-headers: a request fragmented across TCP
+        // segments must not be parsed from its first fragment. The old
+        // single read() parsed partial requests as garbage routes and
+        // intermittently reset reqwest's follow-up download fetch.
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    let headers_done = buf.windows(4).any(|w| w == b"\r\n\r\n");
+                    if headers_done || buf.len() > 64 * 1024 {
+                        break;
+                    }
+                }
+            }
+        }
+        let path = String::from_utf8_lossy(&buf)
             .split_whitespace()
             .nth(1)
             .unwrap_or_default()
@@ -66,11 +82,16 @@ fn serve_loop(listener: &TcpListener, release_json: &[u8], asset: &[u8]) {
         } else if path.contains("/download/") {
             (asset.to_vec(), "application/octet-stream")
         } else {
-            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+            let _ = stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
             continue;
         };
+        // `Connection: close` keeps the shim honest: the client opens a
+        // fresh connection per request instead of pooling onto a socket
+        // this loop has already served.
         let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
         let _ = stream.write_all(resp.as_bytes());
