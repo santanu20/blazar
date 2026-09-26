@@ -349,6 +349,19 @@ async fn warm_peg_child(
     auth: Option<&str>,
     concurrency: usize,
 ) {
+    // Unix-endpoint warm-peg is a no-op where UDS transport does not
+    // exist: config validation already rejects unix child_transport
+    // there, so no live child can ever answer — return before any
+    // dial machinery touches the network with a bogus localhost base.
+    #[cfg(not(unix))]
+    if matches!(endpoint, blazar_core::Endpoint::Unix { .. }) {
+        tracing::debug!(
+            target: "blazar::warmpeg",
+            model,
+            "unix endpoint warm-peg skipped — no UDS transport on this platform"
+        );
+        return;
+    }
     // llama.cpp children serve the same REST surface on either
     // transport; sglang spawns never carry unix endpoints (its engine
     // guard rejects them), so dialing here is always well-formed.
