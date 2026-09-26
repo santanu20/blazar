@@ -12,6 +12,9 @@
 //! an unclean daemon exit.
 
 use std::collections::HashMap;
+// Unix-only consumer (the `client()` unix-socket builder); cfg'd so the
+// import does not go unused on Windows builds.
+#[cfg(unix)]
 use std::path::PathBuf;
 
 /// Filesystem-socket path budget. `sockaddr_un.sun_path` is 108 bytes

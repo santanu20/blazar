@@ -1096,9 +1096,9 @@ mod tests {
         // the data dir — relativizing it would corrupt a user-owned path.
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data/blazar");
-        let mut m = bare_manifest("/home/user/build/llama.cpp/llama-server");
+        let mut m = bare_manifest("/opt/llama.cpp/llama-server");
         assert!(!m.relativize_server_path(&data));
-        assert_eq!(m.server_path, "/home/user/build/llama.cpp/llama-server");
+        assert_eq!(m.server_path, "/opt/llama.cpp/llama-server");
     }
 
     #[test]
@@ -1125,7 +1125,7 @@ mod tests {
         std::fs::create_dir_all(live_bin.parent().unwrap()).unwrap();
         std::fs::write(&live_bin, b"#!/bin/sh\n").unwrap();
 
-        let mut m = bare_manifest("/old/root/.local/share/blazar/engines/b1-cuda/llama-server");
+        let mut m = bare_manifest("/opt/old-root/.local/share/blazar/engines/b1-cuda/llama-server");
         m.anchor_server_path(&data);
         assert_eq!(m.server_path, live_bin.display().to_string());
     }

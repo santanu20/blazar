@@ -662,32 +662,18 @@ pub fn parse_metadata(buf: &[u8]) -> CoreResult<(GgufMeta, usize)> {
         .filter(|items| !items.is_empty());
     let recurrent_layers = recurrent_layer_array(&kvs, &arch);
 
+    let find_str = |field: &str| -> Option<String> {
+        kvs.iter()
+            .find(|(k, _)| k == field)
+            .and_then(|(_, v)| v.as_str())
+            .map(str::to_string)
+    };
     let meta = GgufMeta {
-        name: kvs
-            .iter()
-            .find(|(k, _)| k == "general.name")
-            .and_then(|(_, v)| v.as_str())
-            .map(str::to_string),
-        basename: kvs
-            .iter()
-            .find(|(k, _)| k == "general.basename")
-            .and_then(|(_, v)| v.as_str())
-            .map(str::to_string),
-        size_label: kvs
-            .iter()
-            .find(|(k, _)| k == "general.size_label")
-            .and_then(|(_, v)| v.as_str())
-            .map(str::to_string),
-        quantized_by: kvs
-            .iter()
-            .find(|(k, _)| k == "general.quantized_by")
-            .and_then(|(_, v)| v.as_str())
-            .map(str::to_string),
-        general_version: kvs
-            .iter()
-            .find(|(k, _)| k == "general.version")
-            .and_then(|(_, v)| v.as_str())
-            .map(str::to_string),
+        name: find_str("general.name"),
+        basename: find_str("general.basename"),
+        size_label: find_str("general.size_label"),
+        quantized_by: find_str("general.quantized_by"),
+        general_version: find_str("general.version"),
         block_count: get(format!("{arch}.block_count")),
         context_length: get(format!("{arch}.context_length")),
         expert_count: get(format!("{arch}.expert_count")),
