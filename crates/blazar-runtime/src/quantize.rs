@@ -502,7 +502,11 @@ mod tests {
             .join("b5130")
             .join("whisper-bin-ubuntu-x64");
         std::fs::create_dir_all(&whisper_dir).unwrap();
-        std::fs::write(whisper_dir.join("whisper-quantize"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(
+            whisper_dir.join(crate::tool_file_name("whisper-quantize")),
+            b"#!/bin/sh\n",
+        )
+        .unwrap();
         // CUDA overlay shape: tag suffix does not match the inner dir.
         let nested = dirs
             .data_dir
@@ -510,7 +514,11 @@ mod tests {
             .join("b11193-cuda")
             .join("llama-b11193");
         std::fs::create_dir_all(&nested).unwrap();
-        std::fs::write(nested.join("llama-quantize"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(
+            nested.join(crate::tool_file_name("llama-quantize")),
+            b"#!/bin/sh\n",
+        )
+        .unwrap();
 
         let store = Store::open(&dirs).unwrap();
         store
@@ -539,11 +547,15 @@ mod tests {
         let bin = find_quantize_bin(&dirs).unwrap();
         assert_eq!(
             bin,
-            nested.join("llama-quantize"),
+            nested.join(crate::tool_file_name("llama-quantize")),
             "walk must find the tool under the versioned inner dir"
         );
         // Same contract for the sibling tools of the tarball family.
-        std::fs::write(nested.join("llama-imatrix"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(
+            nested.join(crate::tool_file_name("llama-imatrix")),
+            b"#!/bin/sh\n",
+        )
+        .unwrap();
         assert!(find_imatrix_bin(&dirs).is_ok());
     }
 }

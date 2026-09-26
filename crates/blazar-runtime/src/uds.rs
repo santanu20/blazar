@@ -147,6 +147,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(unix)] // the sockaddr_un budget is an AF_UNIX-platform concept
     fn unit__validate_socket_path__short_path_accepted_long_rejected() {
         assert!(validate_socket_path("/run/blazar/llava.sock").is_ok());
         let long = format!("/tmp/{}.sock", "x".repeat(200));

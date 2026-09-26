@@ -1119,13 +1119,19 @@ mod tests {
     fn unit__anchor_server_path__legacy_absolute_row_heals_to_live_engines_dir() {
         // A row recorded before the relative invariant, installed under a
         // data dir that has since moved: anchor adopts the live tail.
+        // The legacy root derives from the tempdir so the row is a REAL
+        // absolute path on every platform (a "/opt/..." literal is not
+        // absolute on windows and never enters the heal path there).
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data/blazar");
         let live_bin = data.join("engines/b1-cuda/llama-server");
         std::fs::create_dir_all(live_bin.parent().unwrap()).unwrap();
         std::fs::write(&live_bin, b"#!/bin/sh\n").unwrap();
 
-        let mut m = bare_manifest("/opt/old-root/.local/share/blazar/engines/b1-cuda/llama-server");
+        let legacy = tmp
+            .path()
+            .join("old-root/.local/share/blazar/engines/b1-cuda/llama-server");
+        let mut m = bare_manifest(&legacy.display().to_string());
         m.anchor_server_path(&data);
         assert_eq!(m.server_path, live_bin.display().to_string());
     }
@@ -1135,11 +1141,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data/blazar");
         std::fs::create_dir_all(&data).unwrap();
-        let mut m = bare_manifest("/gone/custom/llama-server");
+        // Absolute on the platform under test ("/gone/..." is not
+        // absolute on windows and would take the re-rooting path).
+        let external = if cfg!(windows) {
+            "C:/gone/custom/llama-server"
+        } else {
+            "/gone/custom/llama-server"
+        };
+        let mut m = bare_manifest(external);
         m.anchor_server_path(&data);
         // No live tail anywhere: stays as recorded so spawn fails loudly
         // with ENOENT (the local-lane contract).
-        assert_eq!(m.server_path, "/gone/custom/llama-server");
+        assert_eq!(m.server_path, external);
     }
 
     #[test]
