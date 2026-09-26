@@ -73,6 +73,14 @@ pub(crate) fn with_spawn_retry<T>(
     }
 }
 
+/// Non-Linux platforms have no reachable PDEATHSIG equivalent (macOS
+/// libc ships no `prctl`; Windows has nothing through std) — there the
+/// children stay tied to the runtime's `kill_on_drop` plus the
+/// supervisor's graceful terminate lane, same net the doc above
+/// describes for Windows.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn parent_death_tie(_cmd: &mut Command) {}
+
 /// Tie a spawned child's lifetime to the spawning PROCESS: when the
 /// parent dies for any reason — crash, SIGKILL, terminal close, runtime
 /// teardown — the kernel delivers SIGTERM to the child. This is the
@@ -89,10 +97,9 @@ pub(crate) fn with_spawn_retry<T>(
 /// exit at runtime shutdown (when children should die anyway), so this
 /// is precisely the desired semantics.
 ///
-/// Windows has no prctl equivalent reachable through std; there the
-/// children stay tied to the runtime's `kill_on_drop` plus the
-/// supervisor's graceful terminate lane.
-#[cfg(unix)]
+/// Linux-only: `PR_SET_PDEATHSIG` is a Linux prctl (the libc crate has
+/// neither symbol on macOS); other platforms compile the no-op above.
+#[cfg(target_os = "linux")]
 #[allow(unsafe_code)] // one prctl flag arm + one ppid read in the forked child
 pub(crate) fn parent_death_tie(cmd: &mut Command) {
     use std::os::unix::process::CommandExt as _;
