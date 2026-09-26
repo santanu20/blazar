@@ -22,6 +22,7 @@ OpenAI SDK ───────┐
 Ollama clients ───┼──► blazar gateway ──► llama.cpp
 Anthropic SDK ────┘          │            mistral.rs
                               │            SGLang
+                              │            sd.cpp (images / video)
                               │
                               ├── model store
                               ├── VRAM / KV fit
@@ -43,7 +44,7 @@ You get one local port, three API dialects, multiple engine backends, and one op
 | Problem | Blazar's approach |
 |---|---|
 | Multiple clients speak different APIs | One gateway supports **OpenAI + Ollama + Anthropic** APIs |
-| Different model families need different runtimes | Capability-driven **engine routing** across llama.cpp, mistral.rs, and SGLang |
+| Different model families need different runtimes | Capability-driven **engine routing** across llama.cpp, mistral.rs, SGLang, and sd.cpp (diffusion/video) |
 | GPU memory is easy to oversubscribe | `blazar fit`, capacity-aware profiles, KV-cache controls, and model co-residency planning |
 | Engine upgrades can break working installs | Verified, side-by-side engine installs with **rollback and regression gates** |
 | Model stores become opaque and tool-specific | Local model files remain ordinary **GGUF / safetensors** files |
@@ -161,6 +162,15 @@ Blazar keeps model weights as ordinary local files rather than requiring an opaq
 
 Existing GGUF files can be registered with `blazar import`; imports use hardlinks by default, so registration does not duplicate the model data.
 
+### Launch agent CLIs preconfigured
+
+`blazar launch` wraps any AI CLI: it exports the OpenAI/Anthropic/Ollama base-URL environment for the local daemon, ensures the daemon is up, then execs the command unchanged.
+
+```sh
+blazar launch claude    # or any tool that reads ANTHROPIC_BASE_URL / OPENAI_BASE_URL / OLLAMA_HOST
+blazar launch dsh
+```
+
 ---
 
 ## Engines and model formats
@@ -186,6 +196,7 @@ Typical policy:
 - A per-model engine override wins over automatic routing.
 - The ENGINE column in `blazar list` is the routing lane, not a capability guarantee; a `†` cell (plus a footer line, or the `engine_arch_gap` field in `--json`) marks a GGUF architecture the routed llama.cpp build provably cannot load — spawn fails with teaching unless a covering fork lane is installed.
 - When an installed lane (e.g. a fork build) advertises an architecture the picked lane provably lacks, all three listings (`list`, `/api/tags`, `/v1/models`) show that lane — the same one the spawn-time capability rescue lands on — so previews never advertise a lane that would crash first.
+- Multi-node offload: per-model `rpc_servers` overrides spawn text engines with `--rpc gpu:node...` against your own `ggml-rpc-server` workers; a user-run RPC server is treated as a foreign co-tenant (reported by `doctor`, never swept by the orphan cleaner).
 
 For model fit and engine choice:
 
@@ -315,14 +326,27 @@ blazar lora list
 blazar mmproj ...
 ```
 
-### Audio
+### Images, video, and speech
 
-The local serving surface includes Whisper transcription and offline TTS via the Blazar CLI/API lanes:
+`blazar run` is multimodal by model kind: text models open a streaming chat loop, diffusion sets generate images or video, and pulled piper voices write WAV clips — with an inline `PROMPT` every lane runs single-shot and exits. The same media lanes are served over HTTP on the routes listed above.
 
 ```sh
+# image generation (sd.cpp lane)
+blazar pull Qwen-Image-2.1-GGUF
+blazar run qwen-image-2.1
+
+# text-to-video (Wan 2.1 via sd.cpp)
+blazar pull Comfy-Org/Wan_2.1_ComfyUI_repackaged
+blazar run wan_2.1_comfyui_repackaged
+
+# speech: install the lanes, pull assets, generate
+blazar tts --install && blazar tts --pull en_US-amy-medium
+blazar tts "hello" --out hello.wav
+blazar whisper --install && blazar whisper --pull base
 blazar whisper file.wav
-blazar tts "hello"
 ```
+
+Both voice lanes are fully managed: `--list` inventories what is installed, `--pin <tag>`/`--pin none` freezes (or frees) the exact binary version served — the pin is honored across both the engines lane and the legacy tree. Whisper can also transparently use a remote `whisper: [[remotes]]` entry when one is configured.
 
 ---
 
@@ -400,8 +424,9 @@ Common configuration areas include:
 | Speculation | `spec`, draft behavior |
 | Routing | `engine_routing`, per-model engine overrides, replicas |
 | Access | `[[keys]]`, TLS, CORS |
-| Observability | `audit_log`, `otlp_endpoint`, `otlp_service` |
+| Observability | `audit_log`, `pii_scrub`, `otlp_endpoint`, `otlp_service` |
 | Model behavior | `chat_template`, samplers, LoRA, mmproj, warmup |
+| Media lanes | `sdcpp_flash_attention`, `sdcpp_vae_tiling`, `sdcpp_rpc_servers`, `media_job_wait_secs`, `whisper_idle_secs` |
 
 Inspect or change settings through the CLI instead of hand-editing whenever practical:
 
@@ -477,20 +502,33 @@ The test surface includes unit/integration coverage for the gateway, lifecycle/s
 |---|---|
 | Start server | `blazar serve` |
 | Chat | `blazar run <model>` |
+| Generate an image / video / voice clip | `blazar run <diffusion-or-voice-model>` |
+| Launch an agent CLI against the daemon | `blazar launch <command>` |
+| Unload one model now | `blazar stop <model>` |
 | Pull model | `blazar pull <target>` |
 | Import local GGUF | `blazar import <file> --name <name>` |
+| Derive another quantization | `blazar quantize <model> ...` |
+| Attach a vision projector | `blazar mmproj <model> <file>` |
+| Alias / copy a model | `blazar cp` / `blazar create` |
 | Inspect models | `blazar list` / `blazar show <model>` |
 | Inspect running models | `blazar ps` |
 | Check hardware / configuration | `blazar doctor` |
 | Explain a request | `blazar why` |
 | Live diagnostics | `blazar watch` |
 | Preview VRAM fit | `blazar fit <target>` |
+| Co-residency plan | `blazar coreside` |
 | Benchmark | `blazar bench <model>` |
 | Tune | `blazar tune <model>` |
-| Manage engines | `blazar engine update|list|use|rollback` |
+| Draft-model candidates | `blazar drafts <model>` |
+| Manage engines | `blazar engine update|list|use|rollback|build|local|offers|prune` |
+| Transcribe audio | `blazar whisper <file>` |
+| Text-to-speech | `blazar tts "<text>"` |
+| Manage API keys | `blazar keys list|add|rm|rotate` |
 | Save / restore sessions | `blazar session save|restore ...` |
 | Manage LoRA | `blazar lora add|rm|list ...` |
 | Search Hugging Face | `blazar search ...` |
+| Backup state | `blazar snapshot` |
+| Shell completions | `blazar completions bash|zsh|fish|powershell` |
 | Self-update | `blazar upgrade` |
 
 Run `blazar --help` for the command tree and `docs/4.API_SPEC.md` for the full reference.
@@ -556,6 +594,9 @@ Blazar is an orchestration layer built on upstream inference projects including:
 - [llama.cpp](https://github.com/ggml-org/llama.cpp)
 - [mistral.rs](https://github.com/EricLBuehler/mistral.rs)
 - [SGLang](https://github.com/sgl-project/sglang)
+- [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) — the sd.cpp image/video lane
+- [whisper.cpp](https://github.com/ggml-org/whisper.cpp) — the transcription lane
+- [piper](https://github.com/rhasspy/piper) — the offline TTS lane
 
 Those projects provide the underlying inference engines. Model weights remain the property and responsibility of their publishers.
 
