@@ -41,6 +41,8 @@ fn gpu_hw(cores: u32, vram_mib: u64, ram_mib: u64) -> Hardware {
 static META: std::sync::LazyLock<GgufMeta> = std::sync::LazyLock::new(|| GgufMeta {
     architecture: "qwen3".into(),
     name: None,
+    basename: None,
+    size_label: None,
     block_count: Some(28),
     context_length: Some(40_960),
     expert_count: None,

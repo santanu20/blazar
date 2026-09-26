@@ -210,6 +210,80 @@ fn unit__mistralrs_argv__unix_endpoint_port_placeholder() {
     assert_eq!(argv[i + 1], "0");
 }
 
+/// Minimal GGUF v3 header with string `general.*` KVs (0 tensors, no
+/// tensor data — `parse_metadata` only walks the KV section).
+fn gguf_bytes(kvs: &[(&str, &str)]) -> Vec<u8> {
+    let mut b: Vec<u8> = Vec::new();
+    b.extend_from_slice(b"GGUF");
+    b.extend_from_slice(&3u32.to_le_bytes());
+    b.extend_from_slice(&0u64.to_le_bytes());
+    b.extend_from_slice(&(kvs.len() as u64).to_le_bytes());
+    for (k, v) in kvs {
+        b.extend_from_slice(&(k.len() as u64).to_le_bytes());
+        b.extend_from_slice(k.as_bytes());
+        b.extend_from_slice(&8u32.to_le_bytes());
+        b.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        b.extend_from_slice(v.as_bytes());
+    }
+    b
+}
+
+#[test]
+fn unit__mistralrs_argv__multimodal_gguf_rides_derived_tok_model_id() {
+    let dir = std::env::temp_dir().join(format!("blazar-mrs-tokid-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let gguf = dir.join("model.gguf");
+    std::fs::write(
+        &gguf,
+        gguf_bytes(&[
+            ("general.architecture", "qwen35"),
+            ("general.basename", "Qwen_Qwen3.5"),
+            ("general.size_label", "9B"),
+        ]),
+    )
+    .expect("gguf fixture");
+    let mut f = flags(false);
+    f.insert("--tok-model-id".to_string());
+    let m = model(gguf.to_str().unwrap_or(""), Some("/store/mmproj.gguf"));
+    let argv = mistralrs_argv(
+        &m,
+        &profile(0, &[]),
+        &Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port: 8123,
+        },
+        &f,
+    );
+    let i = argv
+        .iter()
+        .position(|a| a == "--tok-model-id")
+        .expect("derived id rides the multimodal GGUF argv");
+    assert_eq!(argv[i + 1], "Qwen/Qwen3.5-9B");
+
+    // Underivable metadata (no org separator) emits nothing: the engine's
+    // own teaching refusal stays the user-facing surface.
+    std::fs::write(
+        &gguf,
+        gguf_bytes(&[
+            ("general.architecture", "qwen35"),
+            ("general.basename", "Qwen3.5-9B"),
+            ("general.size_label", "9B"),
+        ]),
+    )
+    .expect("gguf fixture");
+    let argv = mistralrs_argv(
+        &m,
+        &profile(0, &[]),
+        &Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port: 8123,
+        },
+        &f,
+    );
+    assert!(!argv.contains(&"--tok-model-id".to_string()));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[tokio::test]
 async fn integration__mistralrs_health__waits_for_models_loaded() {
     let api = MockServer::start().await;
