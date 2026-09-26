@@ -1,0 +1,7 @@
+engine | kind | provider | params | ttft_ms_p50 | ttft_ms_p99 | itl_p50_ms | itl_p99_ms | decode_tps | prefill_tps_cold | prefill_tps_cached | load_s | gpu_peak_mib | gpu_power_peak_w | rss_peak_mib | tokens_source
+--------------------------------------------------------------------------------------------------------------------------------------------
+master-890-74988b2 | sdcpp | blazar | {'config': 'single-stream'} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+master-890-74988b2 | sdcpp | media-image | {'size': '512x512', 'steps': [4], 'runs': 3} | - | - | - | - | - | - | - | - | 4652 | - | 0 | -
+master-890-74988b2 | sdcpp | media-video | {'size': '320x320', 'frames': [5, 13, 33], 'steps': 8, 'runs': 3, 'gate': {'duration': 60, 'size': '512x512', 'steps': 8}} | - | - | - | - | - | - | - | - | 5839 | - | 0 | -
+piper | piper | media-tts | {'chars': 840, 'formats': ['wav', 'pcm'], 'runs': 3} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+b5130 | whisper | media-whisper | {'runs': 3, 'input': 'piper-wav'} | - | - | - | - | - | - | - | - | 16 | - | 0 | -

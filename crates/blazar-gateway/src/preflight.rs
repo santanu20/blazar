@@ -37,11 +37,67 @@ pub fn prompt_tokens_est(body: &serde_json::Value) -> u64 {
     (bytes / 4).max(1)
 }
 
+/// Context bound for prompt-fit admission: the LIVE per-slot ctx of a
+/// resident instance when one exists (auto-fit or explicit slots may
+/// have traded the configured depth for width — e.g. 16K configured,
+/// 4x4096 compiled — and preflight must bound against what a single
+/// slot actually holds), the configured effective ctx otherwise
+/// (cold-spawn estimate). Rows whose profile has not compiled yet
+/// (ctx == 0) fall back to the config estimate.
+pub fn admission_ctx(state: &crate::state::AppState, model: &str) -> u32 {
+    state
+        .sup
+        .ps()
+        .into_iter()
+        .find(|p| p.name == model && p.ctx > 0)
+        .map_or_else(|| state.config.effective_ctx(model), |p| p.ctx)
+}
+
 /// Prompt-fit admission (K1): refuse requests that cannot fit the
 /// effective context BEFORE the kernel silently truncates them (the
 /// sentinel's most common post-hoc detection, moved to pre-hoc).
 /// Byte-estimate first (hot path, ~free); exact `/tokenize` only when
 /// the estimate crosses the 90% threshold AND the child is running.
+/// F82: multimodal bodies — collect text fields AND count image parts
+/// (arrays used to tokenize as empty text and bypass the fit check
+/// entirely). `/api/generate` bodies carry the prompt under `prompt`
+/// (F13 — the exact count must not silently see "").
+fn prompt_text_and_images(body: &serde_json::Value) -> (String, u64) {
+    body.pointer("/messages")
+        .and_then(|m| m.as_array())
+        .map(|a| {
+            let mut parts: Vec<String> = Vec::new();
+            let mut images = 0u64;
+            for m in a {
+                match m.get("content") {
+                    Some(serde_json::Value::String(s)) => parts.push(s.clone()),
+                    Some(serde_json::Value::Array(blocks)) => {
+                        for b in blocks {
+                            match b.get("type").and_then(|v| v.as_str()) {
+                                Some("text") => {
+                                    if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
+                                        parts.push(t.to_string());
+                                    }
+                                }
+                                Some("image_url" | "image") => images += 1,
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (parts.join("\n"), images)
+        })
+        .or_else(|| {
+            body.get("prompt")
+                .and_then(|p| p.as_str())
+                .map(str::to_string)
+                .map(|p| (p, 0u64))
+        })
+        .unwrap_or_default()
+}
+
 pub async fn enforce_prompt_fits(
     state: &crate::state::AppState,
     model: &str,
@@ -65,50 +121,15 @@ pub async fn enforce_prompt_fits(
         .map(|e| (crate::proxy::child_base(&e.endpoint), e));
     let exact = match running {
         Some((base, engine)) => {
-            // F82: multimodal bodies — collect text fields AND count
-            // image parts (arrays used to tokenize as empty text and
-            // bypass the fit check entirely).
-            let (text, images) = body
-                .pointer("/messages")
-                .and_then(|m| m.as_array())
-                .map(|a| {
-                    let mut parts: Vec<String> = Vec::new();
-                    let mut images = 0u64;
-                    for m in a {
-                        match m.get("content") {
-                            Some(serde_json::Value::String(s)) => parts.push(s.clone()),
-                            Some(serde_json::Value::Array(blocks)) => {
-                                for b in blocks {
-                                    match b.get("type").and_then(|v| v.as_str()) {
-                                        Some("text") => {
-                                            if let Some(t) = b.get("text").and_then(|v| v.as_str())
-                                            {
-                                                parts.push(t.to_string());
-                                            }
-                                        }
-                                        Some("image_url" | "image") => images += 1,
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    (parts.join("\n"), images)
-                })
-                // /api/generate bodies carry the prompt under "prompt"
-                // (F13 — the exact count must not silently see "").
-                .or_else(|| {
-                    body.get("prompt")
-                        .and_then(|p| p.as_str())
-                        .map(str::to_string)
-                        .map(|p| (p, 0u64))
-                })
-                .unwrap_or_default();
-            match crate::proxy::child_auth(state.http.post(format!("{base}/tokenize")), &engine)
-                .json(&serde_json::json!({"content": text}))
-                .send()
-                .await
+            let (text, images) = prompt_text_and_images(body);
+            match crate::proxy::child_auth(
+                crate::state::child_client(state, &engine.endpoint)
+                    .post(format!("{base}/tokenize")),
+                &engine,
+            )
+            .json(&serde_json::json!({"content": text}))
+            .send()
+            .await
             {
                 Ok(r) => r.json::<serde_json::Value>().await.ok().and_then(|v| {
                     v.get("tokens")

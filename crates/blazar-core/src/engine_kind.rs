@@ -23,6 +23,13 @@ pub enum EngineKind {
     /// sgl-project/sglang `python -m sglang.launch_server` (pip venv;
     /// HF safetensors models, Linux CUDA/ROCm upstream).
     Sglang,
+    /// leejet/stable-diffusion.cpp `sd-server` (prebuilt assets +
+    /// source build; diffusion/image component sets — never text).
+    SdCpp,
+    /// ggerganov/whisper.cpp `whisper-server` (prebuilt assets; lazy
+    /// audio lane for transcription/translation — serves no model rows,
+    /// so it never appears in format routing in either direction).
+    Whisper,
 }
 
 impl EngineKind {
@@ -32,6 +39,8 @@ impl EngineKind {
             EngineKind::LlamaCpp => "llamacpp",
             EngineKind::MistralRs => "mistralrs",
             EngineKind::Sglang => "sglang",
+            EngineKind::SdCpp => "sdcpp",
+            EngineKind::Whisper => "whisper",
         }
     }
 
@@ -59,8 +68,16 @@ impl EngineKind {
     /// tokens) while the same lanes serve BF16 dirs perfectly — so a
     /// quantized dir routes sglang-only, and an absent sglang teaches
     /// instead of routing into a known-broken lane.
+    ///
+    /// This is the TEXT routing table: `SdCpp` is invisible to it by
+    /// construction (no preference order names it), so a text model on
+    /// a box with only an sd.cpp lane teaches `FormatUnserved` instead of
+    /// spawning an image server against a text request. The reverse
+    /// gate (diffusion component sets require the sdcpp kind) lives at
+    /// the model-domain layer where the component paths are known.
     #[must_use]
     pub fn route_format(
+        diffusion: bool,
         safetensors: bool,
         quantized: bool,
         installed: &[EngineKind],
@@ -73,6 +90,14 @@ impl EngineKind {
                 .find(|k| *k == primary)
                 .or_else(|| installed.iter().copied().find(|k| *k == fallback))
         };
+        // Domain gate (bidirectional by construction): a diffusion
+        // component set (DiT+VAE+TE) has exactly one serving kind, and
+        // the text lanes never see those rows; conversely the preference
+        // orders below never name SdCpp, so text models can never land
+        // on the image engine.
+        if diffusion {
+            return installed.iter().copied().find(|k| *k == EngineKind::SdCpp);
+        }
         if safetensors && quantized {
             return installed.iter().copied().find(|k| *k == EngineKind::Sglang);
         }
@@ -120,6 +145,10 @@ pub enum LaneError {
         quantized: bool,
         roster: String,
     },
+    /// A diffusion component set (DiT+VAE+TE) with no sdcpp engine
+    /// installed — text lanes cannot serve it, so the teaching narrows
+    /// to the one lane that can.
+    DiffusionUnserved { roster: String },
 }
 
 impl LaneError {
@@ -130,6 +159,7 @@ impl LaneError {
         match self {
             Self::PinKindMissing { kind, .. } => vec![*kind],
             Self::PinUnknown { .. } => Vec::new(),
+            Self::DiffusionUnserved { .. } => vec![EngineKind::SdCpp],
             Self::FormatUnserved {
                 safetensors,
                 quantized,
@@ -171,6 +201,12 @@ impl fmt::Display for LaneError {
                 "no installed engine serves the {} format — install one (sglang|mistralrs for safetensors, llamacpp for GGUF); installed: {roster}",
                 if *safetensors { "safetensors" } else { "GGUF" }
             ),
+            Self::DiffusionUnserved { roster } => write!(
+                f,
+                "no installed engine serves diffusion component sets (DiT+VAE+text-encoder) \
+                 — sdcpp is the lane for those; blazar engine install --kind sdcpp \
+                 (installed: {roster})"
+            ),
         }
     }
 }
@@ -197,26 +233,42 @@ pub enum LaneClass {
 /// no routed adapter needed; `Ok(Some((tag, kind)))` = route this spawn
 /// to a local adapter of that row; `Err(teaching)` = nothing installed
 /// can serve the model (or the pin names something absent).
+// Eight scalars, every one a routing axis (the diffusion domain gate
+// joined the set with the sdcpp lane) — same shape allowance as the
+// gateway proxy spawn helpers.
+#[allow(clippy::too_many_arguments)]
 pub fn serving_lane(
     mode: crate::config::RoutingMode,
     policy: crate::config::RoutingPolicy,
     pin: Option<&str>,
+    diffusion: bool,
     safetensors: bool,
     quantized: bool,
     global: EngineKind,
     installed: &[(String, EngineKind, LaneClass)],
 ) -> Result<Option<(String, EngineKind)>, String> {
-    serving_lane_typed(mode, policy, pin, safetensors, quantized, global, installed)
-        .map_err(|e| e.to_string())
+    serving_lane_typed(
+        mode,
+        policy,
+        pin,
+        diffusion,
+        safetensors,
+        quantized,
+        global,
+        installed,
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// [`serving_lane`] with the failure reason typed — callers that act on
 /// the reason (CLI just-in-time install offer) read the variant; every
 /// other caller keeps the string form.
+#[allow(clippy::too_many_arguments)] // see serving_lane: routing axes, not sprawl
 pub fn serving_lane_typed(
     mode: crate::config::RoutingMode,
     policy: crate::config::RoutingPolicy,
     pin: Option<&str>,
+    diffusion: bool,
     safetensors: bool,
     quantized: bool,
     global: EngineKind,
@@ -252,7 +304,7 @@ pub fn serving_lane_typed(
         return Ok(None);
     }
     let kinds: Vec<EngineKind> = installed.iter().map(|(_, k, _)| *k).collect();
-    match EngineKind::route_format(safetensors, quantized, &kinds, policy) {
+    match EngineKind::route_format(diffusion, safetensors, quantized, &kinds, policy) {
         Some(kind) if kind == global => Ok(None),
         // `kinds` is built from `installed`, so a matching lane always
         // exists; the None arm is pure type-shape. Among same-kind
@@ -266,6 +318,7 @@ pub fn serving_lane_typed(
             .filter(|(_, k, _)| *k == kind)
             .min_by_key(|(_, _, class)| u8::from(*class == LaneClass::Fork))
             .map(|(tag, _, _)| (tag.clone(), kind))),
+        None if diffusion => Err(LaneError::DiffusionUnserved { roster: roster() }),
         None => Err(LaneError::FormatUnserved {
             safetensors,
             quantized,
@@ -322,8 +375,10 @@ impl FromStr for EngineKind {
             "llamacpp" => Ok(EngineKind::LlamaCpp),
             "mistralrs" => Ok(EngineKind::MistralRs),
             "sglang" => Ok(EngineKind::Sglang),
+            "sdcpp" => Ok(EngineKind::SdCpp),
+            "whisper" => Ok(EngineKind::Whisper),
             other => Err(format!(
-                "unknown engine kind {other:?} (supported: llamacpp, mistralrs, sglang)"
+                "unknown engine kind {other:?} (supported: llamacpp, mistralrs, sglang, sdcpp, whisper)"
             )),
         }
     }
@@ -394,6 +449,8 @@ mod tests {
             EngineKind::LlamaCpp,
             EngineKind::MistralRs,
             EngineKind::Sglang,
+            EngineKind::SdCpp,
+            EngineKind::Whisper,
         ] {
             assert_eq!(EngineKind::from_str(k.as_str()), Ok(k));
             let json = serde_json::to_string(&k).unwrap();
@@ -401,7 +458,7 @@ mod tests {
         }
         assert_eq!(
             EngineKind::from_str("vllm").unwrap_err(),
-            "unknown engine kind \"vllm\" (supported: llamacpp, mistralrs, sglang)"
+            "unknown engine kind \"vllm\" (supported: llamacpp, mistralrs, sglang, sdcpp, whisper)"
         );
         // serde default on missing field = llamacpp (old rows).
         assert_eq!(
@@ -423,25 +480,25 @@ mod tests {
 
         let all = [LlamaCpp, MistralRs, Sglang];
         assert_eq!(
-            EngineKind::route_format(false, false, &all, Quality),
+            EngineKind::route_format(false, false, false, &all, Quality),
             Some(LlamaCpp)
         );
         assert_eq!(
-            EngineKind::route_format(true, false, &all, Quality),
+            EngineKind::route_format(false, true, false, &all, Quality),
             Some(Sglang)
         );
         assert_eq!(
-            EngineKind::route_format(true, false, &all, Throughput),
+            EngineKind::route_format(false, true, false, &all, Throughput),
             Some(Sglang)
         );
         // Latency flips safetensors to mistral.rs on TTFT/cold evidence;
         // GGUF stays on llamacpp quant kernels regardless.
         assert_eq!(
-            EngineKind::route_format(true, false, &all, Latency),
+            EngineKind::route_format(false, true, false, &all, Latency),
             Some(MistralRs)
         );
         assert_eq!(
-            EngineKind::route_format(false, false, &all, Latency),
+            EngineKind::route_format(false, false, false, &all, Latency),
             Some(LlamaCpp)
         );
 
@@ -450,48 +507,68 @@ mod tests {
         // (live-proven v0.9.3), so it must never be the fallback, and
         // a latency policy must not flip a quantized dir onto it.
         assert_eq!(
-            EngineKind::route_format(true, true, &all, Quality),
+            EngineKind::route_format(false, true, true, &all, Quality),
             Some(Sglang)
         );
         assert_eq!(
-            EngineKind::route_format(true, true, &all, Latency),
+            EngineKind::route_format(false, true, true, &all, Latency),
             Some(Sglang)
         );
         assert_eq!(
-            EngineKind::route_format(true, true, &[LlamaCpp, MistralRs], Quality),
+            EngineKind::route_format(false, true, true, &[LlamaCpp, MistralRs], Quality),
             None,
             "quantized dir with no sglang = unservable (teach), never mistral.rs"
         );
         // GGUF ignores the quantized flag — GGUF quants are their own
         // well-served lane.
         assert_eq!(
-            EngineKind::route_format(false, true, &all, Quality),
+            EngineKind::route_format(false, false, true, &all, Quality),
             Some(LlamaCpp)
         );
 
         // Overlap fallbacks: GGUF without llamacpp, safetensors without
         // sglang — both land on mistral.rs.
         assert_eq!(
-            EngineKind::route_format(false, false, &[MistralRs, Sglang], Quality),
+            EngineKind::route_format(false, false, false, &[MistralRs, Sglang], Quality),
             Some(MistralRs)
         );
         assert_eq!(
-            EngineKind::route_format(true, false, &[LlamaCpp, MistralRs], Quality),
+            EngineKind::route_format(false, true, false, &[LlamaCpp, MistralRs], Quality),
             Some(MistralRs)
         );
         // Latency without mistral.rs falls back to sglang.
         assert_eq!(
-            EngineKind::route_format(true, false, &[LlamaCpp, Sglang], Latency),
+            EngineKind::route_format(false, true, false, &[LlamaCpp, Sglang], Latency),
             Some(Sglang)
         );
 
         // Unserved formats teach instead of guessing.
         assert_eq!(
-            EngineKind::route_format(true, false, &[LlamaCpp], Quality),
+            EngineKind::route_format(false, true, false, &[LlamaCpp], Quality),
             None
         );
         assert_eq!(
-            EngineKind::route_format(false, false, &[Sglang], Quality),
+            EngineKind::route_format(false, false, false, &[Sglang], Quality),
+            None
+        );
+
+        // Domain gate (sd.cpp lane): text formats never route onto the
+        // image engine — an sdcpp-only box teaches FormatUnserved, and
+        // an installed sdcpp lane is invisible beside text kinds.
+        assert_eq!(
+            EngineKind::route_format(false, false, false, &[EngineKind::SdCpp], Quality),
+            None,
+            "GGUF with only an sdcpp lane = unservable (teach), never the image engine"
+        );
+        // Beside text kinds the image lane is invisible: GGUF still picks
+        // llamacpp, and a text-safetensors roster that lacks sglang and
+        // mistral.rs teaches unserved rather than touching sdcpp.
+        assert_eq!(
+            EngineKind::route_format(false, false, false, &[EngineKind::SdCpp, LlamaCpp], Quality),
+            Some(LlamaCpp)
+        );
+        assert_eq!(
+            EngineKind::route_format(false, true, false, &[EngineKind::SdCpp, LlamaCpp], Quality),
             None
         );
     }
@@ -500,9 +577,41 @@ mod tests {
     /// pin-to-missing-kind offers exactly that kind, format-missing
     /// offers the policy-ordered candidates, unknown pins offer nothing.
     #[test]
+    fn unit__route_format__domain_gate_is_bidirectional() {
+        use crate::config::RoutingPolicy::Quality;
+        use EngineKind::{LlamaCpp, SdCpp, Sglang};
+
+        // A diffusion component set routes to sdcpp and ONLY sdcpp —
+        // every text lane is unroutable for the row, whatever else is
+        // installed (GGUF-format DiT would otherwise prefer llamacpp).
+        let mixed = [SdCpp, LlamaCpp, Sglang];
+        assert_eq!(
+            EngineKind::route_format(true, false, false, &mixed, Quality),
+            Some(SdCpp)
+        );
+        assert_eq!(
+            EngineKind::route_format(true, true, false, &mixed, Quality),
+            Some(SdCpp)
+        );
+        // Reverse gate: text rows can never land on the image engine —
+        // the preference orders do not name it (pinned in the sibling
+        // test via [SdCpp, LlamaCpp] GGUF→LlamaCpp and safetensors→None).
+        assert_eq!(
+            EngineKind::route_format(false, false, false, &[SdCpp], Quality),
+            None
+        );
+        // No sdcpp installed: the set is unservable (caller teaches via
+        // LaneError::DiffusionUnserved, not a silent text-lane fallback).
+        assert_eq!(
+            EngineKind::route_format(true, false, false, &[LlamaCpp, Sglang], Quality),
+            None
+        );
+    }
+
+    #[test]
     fn unit__lane_error__missing_kinds_per_class() {
         use crate::config::RoutingPolicy::{Latency, Quality};
-        use EngineKind::{LlamaCpp, MistralRs, Sglang};
+        use EngineKind::{LlamaCpp, MistralRs, SdCpp, Sglang};
 
         let roster = "b1 (llamacpp)".to_string();
         assert_eq!(
@@ -521,6 +630,18 @@ mod tests {
             .missing_kinds(Quality),
             Vec::<EngineKind>::new()
         );
+        // A diffusion set has exactly one unblocking kind — and its
+        // teaching names the install command for it.
+        let diff = LaneError::DiffusionUnserved {
+            roster: roster.clone(),
+        };
+        assert_eq!(diff.missing_kinds(Quality), vec![SdCpp]);
+        let text = diff.to_string();
+        assert!(
+            text.contains("blazar engine install --kind sdcpp"),
+            "{text}"
+        );
+        assert!(text.contains("diffusion component sets"), "{text}");
         // Policy orders the format candidates: quality wants sglang
         // first, latency wants mistral.rs first; GGUF is fixed.
         assert_eq!(
@@ -587,6 +708,7 @@ mod tests {
                 RoutingMode::Auto,
                 RoutingPolicy::Quality,
                 Some(pin),
+                false,
                 safetensors,
                 false,
                 LlamaCpp,
@@ -598,6 +720,7 @@ mod tests {
                 RoutingMode::Auto,
                 RoutingPolicy::Quality,
                 Some(pin),
+                false,
                 safetensors,
                 false,
                 LlamaCpp,
@@ -611,6 +734,7 @@ mod tests {
             RoutingMode::Auto,
             RoutingPolicy::Quality,
             None,
+            false,
             true,
             false,
             LlamaCpp,
@@ -650,6 +774,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             EngineKind::Sglang,
             &installed,
         )
@@ -660,6 +785,7 @@ mod tests {
             Auto,
             Quality,
             Some("fork-acme_x-7c81a9f0-cuda"),
+            false,
             false,
             false,
             EngineKind::Sglang,
@@ -683,6 +809,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             EngineKind::Sglang,
             &fork_only,
         )
@@ -701,6 +828,7 @@ mod tests {
             Auto,
             Quality,
             None,
+            false,
             false,
             false,
             EngineKind::Sglang,

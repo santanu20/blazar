@@ -14,6 +14,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 
+use blazar_core::engine_kind::EngineKind;
 use blazar_core::store::Store;
 use blazar_core::ModelRow;
 
@@ -46,7 +47,12 @@ pub(crate) const STRIP_RESPONSE: &[&str] = &[
 pub fn child_base(ep: &blazar_core::Endpoint) -> String {
     match ep {
         blazar_core::Endpoint::Tcp { host, port } => format!("http://{host}:{port}"),
-        blazar_core::Endpoint::Unix { .. } => String::new(),
+        // The unix connector dials the socket path pinned on the client
+        // and ignores the URL host; the base exists only so
+        // `{base}{path}` formatting keeps producing parseable URLs.
+        // Dial through [`crate::state::child_client`], not the shared
+        // TCP pool, or the request lands on a phantom localhost port.
+        blazar_core::Endpoint::Unix { .. } => "http://localhost".to_string(),
     }
 }
 
@@ -146,11 +152,37 @@ pub(crate) async fn ensure_vision_detached(
         })
 }
 
-/// Does this parsed chat body carry images? Shapes covered:
+/// Captive variant of [`ensure_detached`]: the load refuses under
+/// admission pressure instead of evicting resident models. Same detach
+/// contract — the spawn (or its refusal) always runs to completion.
+pub(crate) async fn ensure_detached_captive(
+    sup: &std::sync::Arc<blazar_runtime::Supervisor>,
+    name: &str,
+) -> Result<EngineRef, SupervisionError> {
+    let sup = std::sync::Arc::clone(sup);
+    let name = name.to_string();
+    tokio::spawn(async move { sup.ensure_routed_captive(&name).await })
+        .await
+        .unwrap_or_else(|e| {
+            Err(SupervisionError::Internal(anyhow::anyhow!(
+                "captive load task panicked: {e}"
+            )))
+        })
+}
+
+/// Does this parsed chat body carry non-text media? Shapes covered:
 ///
-/// - `OpenAI` chat: `messages[].content[]` items with an `image`-prefixed
-///   [`type`] (or a bare `image_url` key — some clients omit the tag)
-/// - `OpenAI` responses: `input[]` items with an `image`-prefixed [`type`]
+/// - `OpenAI` chat: `messages[].content[]` items with an `image`/`video`-
+///   prefixed [`type`] (or a bare `image_url`/`video_url` key — some
+///   clients omit the tag; `input_video` is the responses-lane alias)
+/// - `OpenAI` chat/responses: `input_audio` items (typed, bare key, or
+///   the Anthropic `type: "audio"` block) — upstream accepts data or a
+///   URL (raw base64 / remote / local file path), so audio rides the
+///   same projector-replica lane as images (audit MM6)
+/// - `OpenAI` responses: `input[]` items with an `image`/`video`-prefixed
+///   [`type`], plus nested `function_call_output.output[]` items — a tool
+///   result may return an image (`{type: "input_image", image_url: ...}`),
+///   which the child renders as an image part on the tool message
 /// - Anthropic messages: `messages[].content[]` items `type: "image"`
 ///   (the prefix check covers it)
 /// - Ollama chat/generate: `messages[].images` non-empty or a
@@ -162,11 +194,23 @@ pub(crate) async fn ensure_vision_detached(
 /// noted, not silently hot-pathed).
 #[must_use]
 pub fn body_needs_vision(parsed: &serde_json::Value, ollama_shape: bool) -> bool {
-    fn image_item(it: &serde_json::Value) -> bool {
-        it.get("type")
-            .and_then(|t| t.as_str())
-            .is_some_and(|t| t.starts_with("image"))
-            || it.get("image_url").is_some()
+    fn media_item(it: &serde_json::Value) -> bool {
+        it.get("type").and_then(|t| t.as_str()).is_some_and(|t| {
+            t.starts_with("image") || t.starts_with("video") || t == "input_audio" || t == "audio"
+        }) || it.get("image_url").is_some()
+            || it.get("video_url").is_some()
+            || it.get("input_video").is_some()
+            || it.get("input_audio").is_some()
+    }
+    // Responses-lane tool results: `function_call_output.output[]` can
+    // carry `input_image` items (#22575) — the child converts them to
+    // image parts, so they need a projector replica like user images.
+    fn tool_media(it: &serde_json::Value) -> bool {
+        it.get("type").and_then(|t| t.as_str()) == Some("function_call_output")
+            && it
+                .get("output")
+                .and_then(|o| o.as_array())
+                .is_some_and(|outs| outs.iter().any(media_item))
     }
     if ollama_shape {
         let msgs = parsed
@@ -192,13 +236,13 @@ pub fn body_needs_vision(parsed: &serde_json::Value, ollama_shape: bool) -> bool
             ms.iter().any(|msg| {
                 msg.get("content")
                     .and_then(|c| c.as_array())
-                    .is_some_and(|items| items.iter().any(image_item))
+                    .is_some_and(|items| items.iter().any(media_item))
             })
         });
     let input = parsed
         .get("input")
         .and_then(|i| i.as_array())
-        .is_some_and(|items| items.iter().any(image_item));
+        .is_some_and(|items| items.iter().any(|it| media_item(it) || tool_media(it)));
     msgs || input
 }
 
@@ -224,8 +268,12 @@ pub(crate) async fn ensure_router_detached(
 /// passes `None`. `needs_vision` routes the first ensure through the
 /// lazy-attach path (projector respawn) — chat callers derive it from
 /// the single-parsed body via [`body_needs_vision`]; every other lane
-/// passes `false`.
+/// passes `false`. `allow_diffusion` mirrors [`crate::images::images_gate`]:
+/// the images handlers pass `true` (component sets are their cargo);
+/// every text/embedding surface passes `false` and gets a teaching 400
+/// instead of an sd-server child that 404s every chat-shaped route.
 #[allow(clippy::duration_suboptimal_units)] // 120s admission bound per plan
+#[allow(clippy::too_many_arguments)] // mirrors proxy_request: flat call params, one seam
 pub async fn ensure_with_admission(
     state: &Arc<AppState>,
     model: &str,
@@ -233,6 +281,8 @@ pub async fn ensure_with_admission(
     class: crate::queue::WorkClass,
     prefix: Option<PrefixKey>,
     needs_vision: bool,
+    allow_diffusion: bool,
+    no_evict: bool,
 ) -> Result<(EngineRef, u128), Box<Response>> {
     let started = Instant::now();
     // Model resolution is the only store need; it completes inside the
@@ -246,6 +296,16 @@ pub async fn ensure_with_admission(
             }
             msg => Box::new(openai_error(500, msg)),
         })?;
+    // Domain mirror of images::images_gate: a diffusion component set on a
+    // text/embedding surface must teach the images lane up front. Spawning
+    // sd-server for it would "succeed" and then 404 every chat-shaped
+    // route the caller could possibly use.
+    if row.has_component_set() && !allow_diffusion {
+        return Err(Box::new(openai_error(
+            StatusCode::BAD_REQUEST.as_u16(),
+            &crate::images::diffusion_text_refusal(&row.name),
+        )));
+    }
     // On-demand LoRA variant (`model+adapter`): re-attach the stem to
     // the CANONICAL base row so the supervisor spawns/looks up the
     // variant lane (`base+adapter`) regardless of how the caller spelled
@@ -261,6 +321,8 @@ pub async fn ensure_with_admission(
     > {
         if needs {
             Box::pin(ensure_vision_detached(&state.sup, lane, prefix))
+        } else if no_evict {
+            Box::pin(ensure_detached_captive(&state.sup, lane))
         } else {
             Box::pin(ensure_detached(&state.sup, lane, prefix))
         }
@@ -269,6 +331,17 @@ pub async fn ensure_with_admission(
     // (Bank restore happens inside the supervisor at spawn-readiness.)
     let engine = match first {
         Ok(ep) => ep,
+        Err(SupervisionError::AllSlotsBusy) if no_evict => {
+            // Captive loads never queue for capacity: waiting two
+            // minutes for the right to evict a generation model is
+            // exactly the side-effect a cache probe must not have.
+            // Fail fast — callers treat this as "side load skipped".
+            return Err(Box::new(openai_error(
+                503,
+                "load refused: model would need to evict resident models \
+                 (no-evict admission); retry when capacity frees up",
+            )));
+        }
         Err(SupervisionError::AllSlotsBusy) => {
             // Capacity exhausted: queue at our priority, bounded wait.
             // Report the pressure — sustained queueing is the demand
@@ -430,6 +503,65 @@ pub fn child_auth(rb: reqwest::RequestBuilder, engine: &EngineRef) -> reqwest::R
     clippy::too_many_lines,
     clippy::items_after_statements
 )] // one cohesive forwarding path: headers -> sentinel/enforce -> stream
+/// Child-bound send with the crash-window retry the text-lane forward
+/// has: a transport failure means the child died between the health
+/// gate and this send (capacity eviction, warm-up crash under VRAM
+/// pressure). Reap, respawn the EXACT lane detached, retry ONCE
+/// in-band (H16); the circuit breaker inside `ensure_key` bounds
+/// crash-looping. `build` receives the (possibly fresh) engine ref so
+/// bodied/multipart requests are rebuilt per attempt — reqwest
+/// builders are single-use. Rides [`child_send`], so the header-phase
+/// bound (and its synchronous wedged-child eviction) covers the image
+/// lanes exactly as it covers every text lane.
+pub(crate) async fn send_with_child_retry(
+    state: &AppState,
+    engine: &EngineRef,
+    build: impl Fn(&EngineRef) -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response, String> {
+    let first = match child_send(state, engine, build(engine).send()).await {
+        Ok(r) => return Ok(r),
+        Err(e) => e,
+    };
+    tracing::warn!(
+        model = %engine.key,
+        "child send failure ({first}); reaping and retrying once on a respawned lane"
+    );
+    state.sup.reap_dead_children().await;
+    // A WEDGED child — process alive, HTTP listener dead (observed
+    // live: transport-refused while the reaper sees the process
+    // running) — survives the reap, and `ensure_key`'s fast path would
+    // hand the retry the SAME dead endpoint. Evict the key outright:
+    // state flips to Evicted, terminate_group (TERM, then KILL) cleans
+    // the process, the map entry drops. A header-stall child is
+    // already gone (`child_send` evicted it synchronously) — this is
+    // the idempotent no-op side of the same guard. An already-reaped
+    // key evicts as a no-op; a healthy replica that took the slot
+    // meanwhile is ptr-guarded and survives.
+    let _ = state.sup.evict(&engine.key).await;
+    match ensure_key_detached(&state.sup, &engine.key).await {
+        Ok(fresh) => match child_send(state, &fresh, build(&fresh).send()).await {
+            Ok(r) => Ok(r),
+            Err(e2) => Err(format!(
+                "engine request failed: {first}; retry on respawned child: {e2}"
+            )),
+        },
+        Err(re) => Err(format!("engine request failed: {first}; respawn: {re:#}")),
+    }
+}
+
+/// Reconnect after a failed child send: reap the dead, then respawn the
+/// exact instance lane. The failing child is already gone by the time
+/// this runs — `child_send` evicts header-stalls synchronously, and
+/// transport errors mean the process died — so this is purely
+/// re-establishment, shared by every in-band retry arm.
+pub(crate) async fn respawn_lane(
+    state: &AppState,
+    key: &str,
+) -> Result<EngineRef, SupervisionError> {
+    state.sup.reap_dead_children().await;
+    ensure_key_detached(&state.sup, key).await
+}
+
 /// Crash-window variant of [`ensure_detached`]: re-ensures the exact
 /// INSTANCE lane that died (`model`, replica `model#N`, projector
 /// `model@vision`) instead of re-resolving the model name, which
@@ -452,8 +584,8 @@ pub(crate) async fn ensure_key_detached(
 
 /// Child-bound send failure classes: transport errors mean the child is
 /// gone (crash-window semantics, 502); a header-phase stall means the
-/// child is ALIVE but wedged (504) — [`child_send`] has already queued
-/// it for eviction by the time this reaches a caller.
+/// child is ALIVE but wedged (504) — [`child_send`] has already evicted
+/// it synchronously by the time this reaches a caller.
 pub(crate) enum ChildSendError {
     Transport(reqwest::Error),
     HeaderTimeout { secs: u64 },
@@ -487,14 +619,34 @@ impl std::fmt::Display for ChildSendError {
 /// (observed live: a slot restore raced traffic and one /api/chat
 /// parked 300s+ pre-first-byte while the child served every later
 /// request) parks the client invisibly instead. On expiry the wedged
-/// child is queued on the J5 eviction lane (debounced reap) so later
-/// requests respawn clean. 0 disables the bound (legacy ceiling only).
+/// child is evicted SYNCHRONOUSLY here — state flip, TERM then KILL,
+/// map entry drop — because every caller that retries in-band needs the
+/// respawn to be guaranteed fresh: `ensure_key`'s fast path would hand
+/// the retry the same wedged endpoint (the async J5 eviction lane
+/// debounces 1/min per model, far too slow to gate a retry). 0 disables
+/// the bound (legacy ceiling only). The ceiling is lane-aware: a
+/// diffusion child answers with the finished artifact, so time to first
+/// header IS the full generation time (minutes at 1024px on an
+/// offloaded box, longer for video) — the text-lane ceiling would evict
+/// healthy generations mid-flight. `SdCpp` children therefore ride
+/// `sdcpp_child_header_timeout_secs`.
 pub(crate) async fn child_send(
-    state: &Arc<AppState>,
+    state: &AppState,
     engine: &EngineRef,
     send: impl std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
 ) -> Result<reqwest::Response, ChildSendError> {
-    match state.config.child_header_timeout_secs {
+    let (ceiling, knob) = if engine.kind == EngineKind::SdCpp {
+        (
+            state.config.sdcpp_child_header_timeout_secs,
+            "sdcpp_child_header_timeout_secs",
+        )
+    } else {
+        (
+            state.config.child_header_timeout_secs,
+            "child_header_timeout_secs",
+        )
+    };
+    match ceiling {
         0 => send.await.map_err(ChildSendError::Transport),
         secs => match tokio::time::timeout(std::time::Duration::from_secs(secs), send).await {
             Ok(result) => result.map_err(ChildSendError::Transport),
@@ -502,9 +654,9 @@ pub(crate) async fn child_send(
                 tracing::warn!(
                     target: "blazar::proxy",
                     model = %engine.key,
-                    "child produced no response headers in {secs}s — requesting eviction (child_header_timeout_secs)"
+                    "child produced no response headers in {secs}s — evicting synchronously ({knob})"
                 );
-                let _ = state.evict_tx.send(engine.key.clone());
+                let _ = state.sup.evict(&engine.key).await;
                 Err(ChildSendError::HeaderTimeout { secs })
             }
         },
@@ -522,7 +674,7 @@ async fn forward_once(
     headers: &HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<reqwest::Response, ChildSendError> {
-    let mut req = state.http.request(method.clone(), url);
+    let mut req = crate::state::child_client(state, &engine.endpoint).request(method.clone(), url);
     // Client `Authorization` was stripped above; the child secret is
     // stamped fresh here (never the caller's gateway key).
     req = child_auth(req, engine);
@@ -572,14 +724,11 @@ pub async fn proxy_request(
     // = caller had no parse; consumers that need JSON fall back to
     // parsing `body` themselves (legacy behavior).
     parsed: Option<serde_json::Value>,
+    // Pre-admission single-flight phase (chat lanes with a parsed body
+    // acquire BEFORE slot admission so duplicates wait guard-free).
+    sf_gate: SfGate,
 ) -> Response {
     let base = child_base(&engine.endpoint);
-    if base.is_empty() {
-        return openai_error(
-            500,
-            "unix-socket child transport not supported by this proxy path yet",
-        );
-    }
     let url = format!("{base}{path_query}");
     let began = std::time::Instant::now();
 
@@ -592,44 +741,58 @@ pub async fn proxy_request(
     let body = rewrite_child_model(engine, body, parsed.as_ref());
 
     // Single-flight (B8, FIX2): identical NON-STREAM chat requests
-    // coalesce AT THE CHILD-CALL BOUNDARY (admission already happened:
-    // queued duplicates are not serialized behind queue waits). Stream
-    // detection rides the same pre-parsed Value — prompt text containing
-    // `{"stream":true}` cannot fool it (real JSON, not a sniff). Neither
-    // mutation above touches the `stream` field, so the pre-parse stays
-    // authoritative for it. Bounded wait: after 5s the twin proceeds
-    // uncoalesced (long generations never serialize their duplicates
-    // indefinitely).
+    // coalesce AT THE CHILD-CALL BOUNDARY. Two acquisition phases:
+    // chat lanes that pre-acquired in `sf_gate_before_admission` (held
+    // BEFORE slot admission — duplicates wait without occupying
+    // in_flight capacity) arrive as `Held`/`TimedOut` and skip this
+    // block; everyone else takes the legacy in-function acquire after
+    // admission (queued duplicates are not serialized behind queue
+    // waits). Stream detection rides the pre-parsed Value — prompt
+    // text containing `{"stream":true}` cannot fool it (real JSON, not
+    // a sniff). Neither mutation above touches the `stream` field, so
+    // the pre-parse stays authoritative for it. Bounded wait: after 5s
+    // the twin proceeds uncoalesced (long generations never serialize
+    // their duplicates indefinitely).
     let mut sf: Option<SingleFlight> = None;
-    if state.config.singleflight && is_chat_route(path_query) && body.len() <= 32 * 1024 {
-        let asks_stream = parsed
-            .as_ref()
-            .and_then(|v| v.get("stream").and_then(serde_json::Value::as_bool))
-            .unwrap_or(false);
-        if !asks_stream {
-            let key = sentinel::singleflight_key(model, &body, false);
-            let lock = {
-                let mut map = state
-                    .singleflight
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if map.len() > 256 {
-                    map.clear(); // bounded; a cleared key elects a new leader
-                }
-                std::sync::Arc::clone(
-                    map.entry(key)
-                        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(()))),
-                )
-            };
-            if let Ok(guard) =
-                tokio::time::timeout(std::time::Duration::from_secs(5), lock.clone().lock_owned())
+    match sf_gate {
+        SfGate::Held(g) => sf = Some(g),
+        // The bounded wait already ran pre-admission; proceeding
+        // uncoalesced matches the legacy timeout outcome.
+        SfGate::TimedOut => {}
+        SfGate::Ineligible => {
+            if state.config.singleflight && is_chat_route(path_query) && body.len() <= 32 * 1024 {
+                let asks_stream = parsed
+                    .as_ref()
+                    .and_then(|v| v.get("stream").and_then(serde_json::Value::as_bool))
+                    .unwrap_or(false);
+                if !asks_stream {
+                    let key = sentinel::singleflight_key(model, &body, false);
+                    let lock =
+                        {
+                            let mut map = state
+                                .singleflight
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if map.len() > 256 {
+                                map.clear(); // bounded; a cleared key elects a new leader
+                            }
+                            std::sync::Arc::clone(map.entry(key).or_insert_with(|| {
+                                std::sync::Arc::new(tokio::sync::Mutex::new(()))
+                            }))
+                        };
+                    if let Ok(guard) = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        lock.clone().lock_owned(),
+                    )
                     .await
-            {
-                sf = Some(SingleFlight {
-                    key,
-                    map: std::sync::Arc::clone(&state.singleflight),
-                    _guard: guard,
-                });
+                    {
+                        sf = Some(SingleFlight {
+                            key,
+                            map: std::sync::Arc::clone(&state.singleflight),
+                            _guard: guard,
+                        });
+                    }
+                }
             }
         }
     }
@@ -651,12 +814,8 @@ pub async fn proxy_request(
                         target: "blazar::proxy",
                         model,
                         trace = ?trace,
-                        "child produced no response headers in {secs}s — requesting eviction and retrying once in-band (child_header_timeout_secs)"
+                        "child produced no response headers in {secs}s — evicting synchronously, retrying once in-band (child_header_timeout_secs)"
                     );
-                    // reap_dead_children only touches DEAD pids; a wedged
-                    // child is alive — fire the J5 eviction lane (debounced
-                    // 1/min per model) so it does not poison later requests.
-                    let _ = state.evict_tx.send(engine.key.clone());
                     StatusCode::GATEWAY_TIMEOUT
                 }
                 ChildSendError::Transport(_) => {
@@ -669,9 +828,11 @@ pub async fn proxy_request(
             // and retry ONCE in-band — single-shot clients (run
             // --verbose) otherwise eat a 502 for a child they never
             // got to talk to. The circuit breaker inside `ensure_key`
-            // bounds crash-looping; exactly one retry (H16).
-            state.sup.reap_dead_children().await;
-            match ensure_key_detached(&state.sup, &engine.key).await {
+            // bounds crash-looping; exactly one retry (H16). A WEDGED
+            // child — process alive, HTTP listener silent — was already
+            // evicted synchronously inside `child_send` before this
+            // error surfaced; the respawn is guaranteed a fresh lane.
+            match respawn_lane(state, &engine.key).await {
                 Ok(fresh) => {
                     let fresh_url = format!("{}{path_query}", child_base(&fresh.endpoint));
                     tracing::warn!(
@@ -898,7 +1059,7 @@ pub async fn proxy_request(
                         .observe_secs((now - last_chunk).as_secs_f64());
                 }
                 last_chunk = now;
-                sentinel_feed.bytes(bytes.as_ref());
+                sentinel_feed.bytes(bytes.clone());
                 tap_map.push(bytes.as_ref());
                 if let Some(s) = sniffer_finisher.lock().expect("sniffer").0.as_mut() {
                     s.push(bytes.as_ref());
@@ -953,12 +1114,82 @@ pub async fn proxy_request(
 /// Single-flight token: held from child-call to response-stream end
 /// (FIX2 — the guard rides the SAME drop chain as the in-flight guard,
 /// so clean drains, client aborts, and early errors all release it).
-struct SingleFlight {
+pub struct SingleFlight {
     key: u64,
     map: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<u64, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     >,
     _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+/// Result of the pre-admission single-flight phase (see
+/// `sf_gate_before_admission`). Handed straight to `proxy_request`,
+/// which skips its internal acquire for `Held`/`TimedOut` — re-locking
+/// the same entry from the same task would deadlock (tokio mutexes are
+/// not reentrant), and a timed-out waiter must not pay a second 5s.
+pub enum SfGate {
+    /// Not eligible (config off / non-chat route / stream / oversized
+    /// body): `proxy_request`'s legacy internal block stays the owner.
+    Ineligible,
+    /// Waited (bounded) and now holding the single-flight: the caller
+    /// may proceed to slot admission; duplicates coalesce behind this.
+    Held(SingleFlight),
+    /// Eligible but the bounded wait expired while the leader was still
+    /// generating: proceed uncoalesced, exactly as the legacy in-function
+    /// path does after its own 5s timeout.
+    TimedOut,
+}
+
+/// Single-flight BEFORE slot admission: the bounded coalescing wait
+/// runs while the caller holds NO `InFlightGuard`, so identical
+/// duplicates do not occupy gateway slots (`in_flight` capacity, queue
+/// headroom) while merely waiting for the leader. Eligibility mirrors
+/// `proxy_request`'s internal block exactly — same route check, size
+/// cap, stream bit, and key material — so the two phases always agree
+/// on ownership. The key folds the pre-mutation body here (the handler
+/// runs before `inject_include_usage`/`rewrite_child_model`); the
+/// legacy block folds the post-mutation body. Twins hashing identically
+/// within their own phase is what matters — the two key spaces never
+/// mix for one request because `Held`/`TimedOut` bypass the internal
+/// acquire.
+pub(crate) async fn sf_gate_before_admission(
+    state: &Arc<AppState>,
+    model: &str,
+    path_query: &str,
+    body: &[u8],
+    parsed: Option<&serde_json::Value>,
+) -> SfGate {
+    if !(state.config.singleflight && is_chat_route(path_query) && body.len() <= 32 * 1024) {
+        return SfGate::Ineligible;
+    }
+    let asks_stream = parsed
+        .and_then(|v| v.get("stream").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false);
+    if asks_stream {
+        return SfGate::Ineligible;
+    }
+    let key = sentinel::singleflight_key(model, body, false);
+    let lock = {
+        let mut map = state
+            .singleflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.len() > 256 {
+            map.clear(); // bounded; a cleared key elects a new leader
+        }
+        std::sync::Arc::clone(
+            map.entry(key)
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(5), lock.lock_owned()).await {
+        Ok(guard) => SfGate::Held(SingleFlight {
+            key,
+            map: std::sync::Arc::clone(&state.singleflight),
+            _guard: guard,
+        }),
+        Err(_) => SfGate::TimedOut,
+    }
 }
 
 // F31: Drop-safe release — client aborts drop the unfold future before
@@ -987,19 +1218,6 @@ fn is_chat_route(path_query: &str) -> bool {
 /// mistral.rs children register models under derived ids ("default" +
 /// the staging dir path — verified against v0.9.3), not Blazar names;
 /// their CLI has no `--alias` equivalent. The gateway owns the facade,
-/// so the outbound `model` field is rewritten to the child's stable
-/// `default` id for mistral.rs engines. llama-server keeps receiving
-/// Blazar names (its `--alias` lane matches them natively). Non-JSON
-/// bodies and store failures pass through untouched — the child then
-/// answers its own clear not-found error.
-/// mistral.rs derives /v1 model ids from the `-f` path (no --alias
-/// equivalent); Blazar spawns one model per child, so their stable
-/// `default` id is the unambiguous target. Shared by every child-bound
-/// body site (proxy lane + ollama translation lanes).
-pub(crate) fn child_model_default(engine: &EngineRef) -> bool {
-    engine.kind == blazar_core::engine_kind::EngineKind::MistralRs
-}
-
 /// Per-model serving resolution for sites that must answer BEFORE a
 /// spawn exists (request translation + model listings). `tag` is the
 /// engine row that WOULD serve this model right now — the routed lane's
@@ -1062,7 +1280,8 @@ pub(crate) fn resolve_serving(
             // routing can never disagree. Never fires under a user pin
             // (the spawn rescue has the same gate) or when the picked
             // lane's arch set is unknown (honest unknown).
-            let arch = s.get_model(model_name).ok().flatten().and_then(|r| r.arch);
+            let model_row = s.get_model(model_name).ok().flatten();
+            let arch = model_row.as_ref().and_then(|r| r.arch.clone());
             let rescue_preview = |tag: &str, kind: EngineKind| -> Option<String> {
                 blazar_runtime::predicted_rescue_lane(
                     &rows,
@@ -1076,6 +1295,9 @@ pub(crate) fn resolve_serving(
                 state.config.engine_routing.mode,
                 state.config.engine_routing.policy,
                 overlay.engine.as_deref(),
+                model_row
+                    .as_ref()
+                    .is_some_and(blazar_core::ModelRow::has_component_set),
                 std::path::Path::new(model_path).is_dir(),
                 blazar_core::store::quantized_safetensors_signal(model_name, "", model_path),
                 global,
@@ -1109,29 +1331,53 @@ pub(crate) fn resolve_serving(
         .flatten()
 }
 
-/// Pre-spawn prediction of [`child_model_default`] for sites that mutate
+/// Pre-spawn prediction of [`child_model_stamp`] for sites that mutate
 /// the request BEFORE the engine exists (ollama chat translation).
 /// Consults the SAME core `serving_lane` the supervisor routes by, so
 /// the prediction and the actual spawn can never disagree — the
 /// daemon-global kind cache this replaces was wrong under
 /// `[engine_routing]` (routed mistral.rs children kept the caller's
 /// model name and answered `model ... was not found`).
-pub(crate) fn child_model_default_predicted(
+pub(crate) fn child_model_stamp_predicted(
     state: &Arc<AppState>,
     model_name: &str,
     model_path: &str,
-) -> bool {
+) -> Option<String> {
     use blazar_core::engine_kind::EngineKind;
     // `tag: None` = nothing can serve (or a bad pin) — the spawn path
     // delivers the teaching error, so no rewrite fires; matching the
-    // pre-refactor contract where every Err predicted `false`.
-    resolve_serving(state, model_name, model_path)
-        .is_some_and(|lane| lane.tag.is_some() && lane.kind == EngineKind::MistralRs)
+    // pre-refactor contract where every Err predicted "no rewrite".
+    let lane = resolve_serving(state, model_name, model_path)?;
+    lane.tag.as_ref()?;
+    match lane.kind {
+        EngineKind::MistralRs => Some("default".to_string()),
+        EngineKind::Sglang => Some(model_name.to_string()),
+        _ => None,
+    }
 }
 
-pub(crate) fn set_child_model_default(v: &mut serde_json::Value) {
+pub(crate) fn set_child_model(v: &mut serde_json::Value, stamp: &str) {
     if v.get("model").and_then(serde_json::Value::as_str).is_some() {
-        v["model"] = serde_json::Value::String("default".to_string());
+        v["model"] = serde_json::Value::String(stamp.to_string());
+    }
+}
+
+/// The model string each child engine must see in request bodies.
+/// mistral.rs derives /v1 model ids from the `-f` path (no --alias
+/// equivalent); Blazar spawns one model per child, so their stable
+/// `default` id is the unambiguous target. sglang parses `model:tail`
+/// as ITS lora-suffix convention, so the caller's quant tag
+/// (`m:4bit`) would request a phantom adapter — it must see the exact
+/// name `--served-model-name` registered (= the row name). llamacpp is
+/// indifferent (a single-model server answers any model string), so
+/// the caller's own spelling survives for response-echo fidelity on
+/// the raw passthrough lanes. `None` = no rewrite.
+pub(crate) fn child_model_stamp(engine: &EngineRef) -> Option<&str> {
+    use blazar_core::engine_kind::EngineKind;
+    match engine.kind {
+        EngineKind::MistralRs => Some("default"),
+        EngineKind::Sglang => Some(&engine.name),
+        _ => None,
     }
 }
 
@@ -1143,9 +1389,12 @@ fn rewrite_child_model(
     body: axum::body::Bytes,
     parsed: Option<&serde_json::Value>,
 ) -> axum::body::Bytes {
-    if body.is_empty() || !child_model_default(engine) {
+    if body.is_empty() {
         return body;
     }
+    let Some(stamp) = child_model_stamp(engine) else {
+        return body;
+    };
     let maybe_owned = parsed.cloned().map_or_else(
         || serde_json::from_slice::<serde_json::Value>(&body).ok(),
         Some,
@@ -1154,7 +1403,7 @@ fn rewrite_child_model(
         return body;
     };
     let mut v = v.clone();
-    set_child_model_default(&mut v);
+    set_child_model(&mut v, stamp);
     match serde_json::to_vec(&v) {
         Ok(bytes) => bytes.into(),
         Err(_) => body,
@@ -1416,6 +1665,28 @@ pub async fn admission_gate_slo(
             }
         };
         if busy < ceiling {
+            // A reshape is draining this model: hold new admissions so
+            // in-flight can only fall and the respawn lands this window.
+            // Parks ride the same queue/pressure machinery as a full
+            // ceiling; the SlotsReshaped event wakes every waiter.
+            if state.sup.is_reshaping(model) {
+                state.sup.note_slot_pressure(model);
+                let waited = state
+                    .queue
+                    .wait(
+                        model,
+                        priority,
+                        class,
+                        deadline_ms,
+                        body_len,
+                        std::time::Duration::from_mins(2),
+                        wfq,
+                    )
+                    .await;
+                state.sup.note_slot_pressure_release(model);
+                waited.map_err(|e| Box::new(openai_error(503, &e)))?;
+                continue;
+            }
             return Ok(begin_accounting(state, model));
         }
         // The REAL same-model park: this request waits for a slot on the
@@ -1934,6 +2205,154 @@ mod cache_obs_tests {
 
 #[cfg(test)]
 #[allow(non_snake_case)]
+mod body_needs_vision_tests {
+    use super::body_needs_vision;
+
+    #[test]
+    fn unit__body_needs_vision__chat_image_tag__detected() {
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+                ]
+            }]
+        });
+        assert!(body_needs_vision(&body, false));
+    }
+
+    #[test]
+    fn unit__body_needs_vision__chat_bare_image_url_key__detected() {
+        // Some clients omit the type tag; the bare key is the signal.
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [{"image_url": {"url": "https://example.test/cat.png"}}]
+            }]
+        });
+        assert!(body_needs_vision(&body, false));
+    }
+
+    #[test]
+    fn unit__body_needs_vision__chat_video_tag_variants__detected() {
+        // b11147 #27921: chat accepts input_video/video_url aliases and
+        // data:video/* URIs — every spelling needs a projector replica.
+        for tag in ["input_video", "video_url"] {
+            let body = serde_json::json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{"type": tag, tag: "data:video/mp4;base64,AAAA"}]
+                }]
+            });
+            assert!(body_needs_vision(&body, false), "type tag {tag}");
+        }
+    }
+
+    #[test]
+    fn unit__body_needs_vision__chat_bare_video_key__detected() {
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [{"video_url": "https://example.test/clip.mp4"}]
+            }]
+        });
+        assert!(body_needs_vision(&body, false));
+    }
+
+    #[test]
+    fn unit__body_needs_vision__chat_input_audio_tag__detected() {
+        // Audit MM6: upstream server accepts input_audio items (data or
+        // URL) — they ride the projector lane like images.
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "transcribe this"},
+                    {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}
+                ]
+            }]
+        });
+        assert!(body_needs_vision(&body, false));
+    }
+
+    #[test]
+    fn unit__body_needs_vision__chat_bare_input_audio_key__detected() {
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [{"input_audio": {"data": "AAAA", "format": "wav"}}]
+            }]
+        });
+        assert!(body_needs_vision(&body, false));
+    }
+
+    #[test]
+    fn unit__body_needs_vision__anthropic_audio_block__detected() {
+        // Anthropic shape: {type: "audio", source: {...}}.
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what does it say"},
+                    {"type": "audio", "source": {"type": "base64", "media_type": "audio/wav", "data": "AAAA"}}
+                ]
+            }]
+        });
+        assert!(body_needs_vision(&body, false));
+    }
+
+    #[test]
+    fn unit__body_needs_vision__responses_function_call_output_image__detected() {
+        // b11147 #22575: a tool result may return an image — the child
+        // renders it as an image part on the tool message.
+        let body = serde_json::json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "inspect the frame"},
+                {"type": "function_call", "call_id": "c1", "name": "grab", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1",
+                 "output": [{"type": "input_image", "image_url": "data:image/png;base64,AAAA"}]}
+            ]
+        });
+        assert!(body_needs_vision(&body, false));
+    }
+
+    #[test]
+    fn unit__body_needs_vision__responses_function_call_output_text_only__not_detected() {
+        let body = serde_json::json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "summarize"},
+                {"type": "function_call_output", "call_id": "c1", "output": [{"type": "input_text", "text": "42"}]}
+            ]
+        });
+        assert!(!body_needs_vision(&body, false));
+    }
+
+    #[test]
+    fn unit__body_needs_vision__text_only_chat__not_detected() {
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+        });
+        assert!(!body_needs_vision(&body, false));
+    }
+
+    #[test]
+    fn unit__body_needs_vision__ollama_images__detected_and_video_absent__not_detected() {
+        let with_images = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi", "images": ["AAAA"]}]
+        });
+        assert!(body_needs_vision(&with_images, true));
+        // The ollama wire shape has no video field (api.md): a video URL
+        // riding messages[].content must NOT trip the ollama detector.
+        let text_only = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert!(!body_needs_vision(&text_only, true));
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
 mod resolve_model_tests {
     use super::*;
     use blazar_core::{BlazarDirs, ModelRow, Store};
@@ -1947,6 +2366,7 @@ mod resolve_model_tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,
@@ -2037,5 +2457,43 @@ mod resolve_model_tests {
         let err = resolve_model(&store, "qwen2.5-0.5c").unwrap_err();
         assert!(err.contains("did you mean"), "err: {err}");
         assert!(err.contains("qwen2.5-0.5b"), "err: {err}");
+    }
+
+    #[test]
+    fn unit__child_model_stamp__per_engine_contract() {
+        use blazar_core::engine_kind::EngineKind;
+        use blazar_core::profile::Endpoint;
+        let ref_for = |kind: EngineKind| blazar_runtime::EngineRef {
+            name: "qwen2.5-0.5b-instruct-awq".to_string(),
+            key: "qwen2.5-0.5b-instruct-awq".to_string(),
+            kind,
+            endpoint: Endpoint::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: 1,
+            },
+            auth: None,
+        };
+        // mistral.rs: stable per-child id, never the row name.
+        assert_eq!(
+            child_model_stamp(&ref_for(EngineKind::MistralRs)),
+            Some("default")
+        );
+        // sglang: the exact --served-model-name — its `model:tail`
+        // parsing turns a forwarded quant tag into a phantom LoRA ask.
+        assert_eq!(
+            child_model_stamp(&ref_for(EngineKind::Sglang)),
+            Some("qwen2.5-0.5b-instruct-awq")
+        );
+        // llamacpp (and anything else): indifferent single-model server,
+        // the caller's spelling survives for response-echo fidelity.
+        assert_eq!(child_model_stamp(&ref_for(EngineKind::LlamaCpp)), None);
+
+        // The setter never invents a model field (absent stays absent).
+        let mut v = serde_json::json!({"input": "x"});
+        set_child_model(&mut v, "default");
+        assert!(v.get("model").is_none());
+        let mut v = serde_json::json!({"model": "caller-spelling"});
+        set_child_model(&mut v, "default");
+        assert_eq!(v["model"], "default");
     }
 }

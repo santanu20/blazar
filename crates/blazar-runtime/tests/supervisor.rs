@@ -48,6 +48,7 @@ fn setup(models: &[(&str, u64)]) -> (tempfile::TempDir, BlazarDirs) {
                 bytes: i64::try_from(*bytes).unwrap_or(i64::MAX),
                 sha256: None,
                 mmproj_path: None,
+                components: vec![],
                 shards: 1,
                 arch: Some("qwen3".into()),
                 params: None,

@@ -47,6 +47,7 @@ load_mode
 lora_init_without_apply
 main_gpu
 max_loaded_models
+media_job_wait_secs
 mistralrs
 mmproj_auto
 mmproj_device
@@ -87,6 +88,11 @@ router
 router_max_models
 rpc_servers
 samplers
+sdcpp_child_header_timeout_secs
+sdcpp_flash_attention
+sdcpp_rpc_servers
+sdcpp_sage_attn
+sdcpp_vae_tiling
 semantic_cache
 sentinel
 sentinel_enforce
@@ -132,6 +138,7 @@ video_fps
 video_timestamp_interval
 warm_peg
 warmup
+whisper_idle_secs
 yarn_attn_factor
 yarn_beta_fast
 yarn_beta_slow

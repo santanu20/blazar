@@ -14,6 +14,10 @@ use super::build::parse_version_pair;
 
 pub const LLAMA_CPP_REPO: &str = "ggml-org/llama.cpp";
 
+/// Parallel byte-range connections for release-asset downloads — the
+/// same lane and default the model-pull client uses (see `hf_parallel`).
+const ASSET_DOWNLOAD_CONNECTIONS: u32 = 8;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct GhAsset {
     pub name: String,
@@ -380,6 +384,32 @@ impl GhClient {
             .ok_or_else(|| anyhow!("no v-tagged mistral.rs releases found"))
     }
 
+    /// Newest sd.cpp `master-NNN-<sha8>` release by build counter (the
+    /// repo cuts no semver tags; lexicographic max would fling on sha
+    /// ordering). List endpoint trims `assets`; callers re-fetch the
+    /// full release by tag.
+    pub async fn latest_sdcpp_release(&self) -> Result<GhRelease> {
+        let releases = self.list_releases_repo(SDCPP_REPO).await?;
+        releases
+            .into_iter()
+            .filter(|r| sdtag_counter(&r.tag_name).is_some())
+            .max_by_key(|r| sdtag_counter(&r.tag_name).unwrap_or(0))
+            .ok_or_else(|| anyhow!("no master-tagged stable-diffusion.cpp releases found"))
+    }
+
+    /// Newest whisper.cpp `bNNNN` release. The repo's `vX.Y.Z` tags are
+    /// source-only (zero assets — verified v1.9.4); the b-tags carry the
+    /// prebuilt binaries, so the b-counter is the currency. List trims
+    /// `assets`; callers re-fetch the full release by tag.
+    pub async fn latest_whisper_release(&self) -> Result<GhRelease> {
+        let releases = self.list_releases_repo(WHISPER_REPO).await?;
+        releases
+            .into_iter()
+            .filter(|r| btag_number(&r.tag_name).is_some())
+            .max_by_key(|r| btag_number(&r.tag_name).unwrap_or(0))
+            .ok_or_else(|| anyhow!("no b-tagged whisper.cpp releases found"))
+    }
+
     /// Download an asset fully into memory, verifying its sha256 digest
     /// when the release metadata provides one. Assets are ≤ ~400 MB.
     pub async fn download_asset_bytes(&self, asset: &GhAsset) -> Result<Vec<u8>> {
@@ -446,6 +476,22 @@ impl GhClient {
     ) -> Result<u64> {
         let url = reqwest::Url::parse(&asset.browser_download_url)
             .with_context(|| format!("asset url {:?}", asset.name))?;
+        // Parallel byte-range lane first (the model-pull machinery):
+        // engages only for size-known assets big enough to pay for chunk
+        // setup and hosts that prove Range support on a strict-206 probe.
+        // Everything else falls through to the classic single stream
+        // below, byte-identical to before.
+        if let Some(size) = asset
+            .size
+            .filter(|s| *s >= crate::hf_parallel::MIN_PARALLEL_BYTES)
+        {
+            if let Some(n) = self
+                .download_asset_file_parallel(asset, &url, dest, size)
+                .await?
+            {
+                return Ok(n);
+            }
+        }
         let mut req = self.http.get(url.clone());
         if url.host_str() == Some("api.github.com") {
             req = self.auth(req);
@@ -515,6 +561,73 @@ impl GhClient {
         bar.finish_and_clear();
         Self::verify_streamed_asset(asset, dest, file, hasher, declared_len, total)?;
         Ok(total)
+    }
+
+    /// Parallel byte-range attempt for [`Self::download_asset_file`]:
+    /// `Ok(Some(n))` = downloaded and verified through the chunk lane
+    /// (resume sidecar, per-chunk retries, atomic finalize with sha256);
+    /// `Ok(None)` = the host proved Range-incapable on the probe, the
+    /// classic single stream takes over. The truncation contract matches
+    /// the classic tail exactly: the CDN's Content-Range total must equal
+    /// the release-API size or the asset fails loudly with no partial
+    /// file surviving.
+    async fn download_asset_file_parallel(
+        &self,
+        asset: &GhAsset,
+        url: &reqwest::Url,
+        dest: &std::path::Path,
+        size: u64,
+    ) -> Result<Option<u64>> {
+        let plan = crate::hf::FilePlan {
+            filename: asset.name.clone(),
+            bytes: size,
+            sha256: asset
+                .digest
+                .as_deref()
+                .map(|d| d.strip_prefix("sha256:").unwrap_or(d).to_lowercase()),
+        };
+        // Token rides only api.github.com-hosted URLs, exactly like the
+        // classic branch (public release assets redirect to a CDN that
+        // must never see credentials).
+        let token = if url.host_str() == Some("api.github.com") {
+            self.token.clone()
+        } else {
+            None
+        };
+        let bar = indicatif::ProgressBar::new_spinner();
+        bar.set_message(format!("engine {} (parallel)", asset.name));
+        let mut progress = |done: u64, total: u64| {
+            bar.set_length(total);
+            bar.set_position(done);
+        };
+        let Some(got) = crate::hf_parallel::try_parallel(
+            &self.http,
+            token.as_deref(),
+            url,
+            &plan,
+            dest,
+            ASSET_DOWNLOAD_CONNECTIONS,
+            &mut progress,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        bar.finish_and_clear();
+        if got != size {
+            let _ = std::fs::remove_file(dest);
+            return Err(anyhow!(
+                "asset {} truncated: got {got} bytes, release metadata said {size}",
+                asset.name
+            ));
+        }
+        if plan.sha256.is_none() {
+            tracing::warn!(
+                "asset {} has no digest in release metadata; length-verified only",
+                asset.name
+            );
+        }
+        Ok(Some(got))
     }
 
     /// Post-stream verification for `download_asset_file`: truncation
@@ -751,6 +864,179 @@ pub fn asset_filename(tag: &str, suffix: &str) -> String {
 }
 
 pub const MISTRALRS_REPO: &str = "EricLBuehler/mistral.rs";
+
+pub const SDCPP_REPO: &str = "leejet/stable-diffusion.cpp";
+
+pub const WHISPER_REPO: &str = "ggml-org/whisper.cpp";
+
+/// Parse an sd.cpp `master-NNN-<sha8>` tag's build counter. sd.cpp does
+/// not cut semver releases; the counter is the currency, the sha is the
+/// identity (`--version` reports the sha, not a version word).
+#[must_use]
+pub fn sdtag_counter(tag: &str) -> Option<u32> {
+    tag.strip_prefix("master-")?.split('-').next()?.parse().ok()
+}
+
+/// One sd.cpp asset candidate: asset names embed the commit sha
+/// (`sd-master-<sha8>-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip`), so a
+/// pick is a substring predicate, not an exact name. `excludes` keeps
+/// the CPU pattern from matching the vulkan/rocm zips of the same build.
+#[derive(Clone, Copy, Debug)]
+pub struct SdAssetPattern {
+    pub includes: &'static [&'static str],
+    pub excludes: &'static [&'static str],
+    pub label: &'static str,
+    pub cpu_fallback: bool,
+}
+
+/// Ordered sd.cpp asset preferences for this machine. Vulkan first on
+/// every GPU platform: one backend covers NVIDIA/AMD/Intel, and no
+/// linux-cuda prebuilt exists upstream. `ROCm` zips stay unpicked (vendor
+/// lock; vulkan serves the same cards).
+pub fn sdcpp_asset_patterns(os: &str, arch: &str, nvidia: bool) -> Result<Vec<SdAssetPattern>> {
+    // Ordering policy: the vendor-native compute backend first when the
+    // box is NVIDIA (a CUDA prebuilt outruns the Vulkan build the day
+    // upstream ships one — picked up with no code change, pinned by
+    // unit__sdcpp_asset_patterns__future_cuda_prebuilt_is_picked_same_day),
+    // then Vulkan (one backend covers every GPU vendor), then CPU as the
+    // labeled last resort. The cudart zip (CUDA runtime stripped for
+    // size) is always excluded in favor of the self-contained build.
+    match (os, arch) {
+        ("linux", "x86_64" | "x64" | "amd64") => {
+            let mut picks = Vec::new();
+            if nvidia {
+                picks.push(SdAssetPattern {
+                    includes: &["bin-Linux", "x86_64", "cuda"],
+                    excludes: &["cudart"],
+                    label: "cuda",
+                    cpu_fallback: false,
+                });
+            }
+            picks.push(SdAssetPattern {
+                includes: &["bin-Linux", "x86_64", "vulkan"],
+                excludes: &[],
+                label: "vulkan",
+                cpu_fallback: false,
+            });
+            picks.push(SdAssetPattern {
+                includes: &["bin-Linux", "x86_64"],
+                excludes: &["vulkan", "rocm", "cuda"],
+                label: "cpu",
+                cpu_fallback: true,
+            });
+            Ok(picks)
+        }
+        ("macos", "aarch64" | "arm64") => Ok(vec![SdAssetPattern {
+            includes: &["bin-Darwin", "arm64"],
+            excludes: &[],
+            label: "metal",
+            cpu_fallback: false,
+        }]),
+        ("macos", _) => Err(anyhow!(
+            "stable-diffusion.cpp publishes no prebuilt for macOS x86_64 (Metal/arm64 only)"
+        )),
+        ("windows", "x86_64" | "x64" | "amd64") => {
+            let mut picks = Vec::new();
+            if nvidia {
+                picks.push(SdAssetPattern {
+                    includes: &["bin-win", "cuda"],
+                    excludes: &["cudart"],
+                    label: "cuda",
+                    cpu_fallback: false,
+                });
+            }
+            picks.push(SdAssetPattern {
+                includes: &["bin-win", "vulkan-x64"],
+                excludes: &[],
+                label: "vulkan",
+                cpu_fallback: false,
+            });
+            picks.push(SdAssetPattern {
+                includes: &["bin-win", "cpu-x64"],
+                excludes: &[],
+                label: "cpu",
+                cpu_fallback: true,
+            });
+            Ok(picks)
+        }
+        ("windows", _) => Err(anyhow!(
+            "stable-diffusion.cpp publishes no prebuilt for Windows ARM64"
+        )),
+        (os, arch) => Err(anyhow!(
+            "stable-diffusion.cpp publishes no prebuilt for {os}/{arch} — build from source \
+             (cmake -DSD_BUILD_SERVER=ON) and place sd-server under the engines dir"
+        )),
+    }
+}
+
+/// Ordered whisper.cpp asset preferences for this machine. whisper
+/// serving is a CPU contract (verified b5130: no `--list-devices`, CPU
+/// dispatch libs ship in the tar), so the pick is platform-shaped, not
+/// GPU-shaped. Names verified against the b5130 asset list:
+/// `whisper-bin-ubuntu-x64.tar.gz`, `whisper-bin-ubuntu-arm64.tar.gz`,
+/// Windows cpu/cuda/opencl zips. macOS ships an xcframework library
+/// only — no server binary.
+pub fn whisper_asset_patterns(os: &str, arch: &str) -> Result<Vec<SdAssetPattern>> {
+    match (os, arch) {
+        ("linux", "x86_64" | "x64" | "amd64") => Ok(vec![SdAssetPattern {
+            includes: &["whisper-bin-ubuntu-x64"],
+            excludes: &[],
+            label: "cpu",
+            cpu_fallback: false,
+        }]),
+        ("linux", "aarch64" | "arm64") => Ok(vec![SdAssetPattern {
+            includes: &["whisper-bin-ubuntu-arm64"],
+            excludes: &[],
+            label: "cpu",
+            cpu_fallback: false,
+        }]),
+        // Windows zips: the plain cpu build first; the cublas build as
+        // the labeled GPU fallback. `blas` excludes keep the cpu pick
+        // off the cublas/opencl zips of the same release.
+        ("windows", "x86_64" | "x64" | "amd64") => Ok(vec![
+            SdAssetPattern {
+                includes: &["win", "x64", "cpu"],
+                excludes: &["cuda", "opencl", "blas"],
+                label: "cpu",
+                cpu_fallback: false,
+            },
+            SdAssetPattern {
+                includes: &["win", "x64", "cublas"],
+                excludes: &[],
+                label: "cublas",
+                cpu_fallback: true,
+            },
+        ]),
+        ("macos", _) => Err(anyhow!(
+            "whisper.cpp publishes no server binary for macOS (xcframework library only) — \
+             build whisper-server from source and place it under the engines dir"
+        )),
+        (os, arch) => Err(anyhow!(
+            "whisper.cpp publishes no prebuilt for {os}/{arch} — build whisper-server \
+             from source and place it under the engines dir"
+        )),
+    }
+}
+
+/// Walk the pattern list against the release's actual assets, returning
+/// the first match with its pattern (label + fallback flag ride along).
+/// `None` = nothing usable (not even CPU).
+#[must_use]
+pub fn resolve_sdcpp_asset<'a, 'p>(
+    release: &'a GhRelease,
+    patterns: &'p [SdAssetPattern],
+) -> Option<(&'a GhAsset, &'p SdAssetPattern)> {
+    patterns.iter().find_map(|p| {
+        release
+            .assets
+            .iter()
+            .find(|a| {
+                p.includes.iter().all(|f| a.name.contains(f))
+                    && p.excludes.iter().all(|f| !a.name.contains(f))
+            })
+            .map(|a| (a, p))
+    })
+}
 
 /// CUDA toolkit variants mistral.rs publishes prebuilts for, as the
 /// digit-run used in asset names (12.8 -> 128). Ordered oldest-first;
@@ -1035,6 +1321,7 @@ pub fn newest_runnable_overlay<'a>(
 mod tests {
     use super::*;
     use crate::engine::manifest::Vendor;
+    use std::sync::{Arc, Mutex};
     use Candidate::{Cpu, Exact, Versioned};
 
     fn rel(tag: &str, assets: &[&str]) -> GhRelease {
@@ -1082,6 +1369,198 @@ mod tests {
         assert_eq!(vtag_semver("b10857"), None);
         assert_eq!(vtag_semver("vx.y.z"), None);
         assert!(vtag_semver("v0.10.0") > vtag_semver("v0.9.3"));
+    }
+
+    #[test]
+    fn unit__sdtag_counter__master_tags_counter_not_lexical() {
+        assert_eq!(sdtag_counter("master-890-74988b2"), Some(890));
+        assert_eq!(sdtag_counter("master-1234-abcdef12"), Some(1234));
+        // counter is the currency: lexicographic max on these tags would
+        // fling on the sha half
+        assert!(sdtag_counter("master-1234-abcdef12") > sdtag_counter("master-890-74988b2"));
+        assert_eq!(sdtag_counter("local"), None);
+        assert_eq!(sdtag_counter("v0.1.0"), None);
+        assert_eq!(sdtag_counter("b10816"), None);
+        assert_eq!(sdtag_counter("master-x"), None);
+    }
+
+    #[test]
+    fn unit__sdcpp_asset_patterns__vulkan_first_cpu_resort_unsupported_teaches() {
+        // non-NVIDIA keeps the universal lanes; cpu pattern must not
+        // swallow the vulkan/rocm/cuda zips of the same build
+        let picks = sdcpp_asset_patterns("linux", "x86_64", false).unwrap();
+        assert_eq!(picks.len(), 2);
+        assert_eq!(picks[0].label, "vulkan");
+        assert!(!picks[0].cpu_fallback);
+        assert_eq!(picks[0].includes, &["bin-Linux", "x86_64", "vulkan"]);
+        assert_eq!(picks[1].label, "cpu");
+        assert!(picks[1].cpu_fallback);
+        assert_eq!(picks[1].excludes, &["vulkan", "rocm", "cuda"]);
+
+        // NVIDIA gains the cuda lane ahead of vulkan
+        let nv = sdcpp_asset_patterns("linux", "x86_64", true).unwrap();
+        assert_eq!(nv.len(), 3);
+        assert_eq!(nv[0].label, "cuda");
+        assert_eq!(nv[0].includes, &["bin-Linux", "x86_64", "cuda"]);
+        assert_eq!(nv[0].excludes, &["cudart"]);
+        assert_eq!(nv[1].label, "vulkan");
+
+        let mac = sdcpp_asset_patterns("macos", "aarch64", true).unwrap();
+        assert_eq!(mac.len(), 1);
+        assert_eq!(mac[0].label, "metal");
+        assert_eq!(mac[0].includes, &["bin-Darwin", "arm64"]);
+
+        let win = sdcpp_asset_patterns("windows", "x64", false).unwrap();
+        assert_eq!(win.len(), 2);
+        assert_eq!(win[0].label, "vulkan");
+        assert_eq!(win[1].label, "cpu");
+        let win_nv = sdcpp_asset_patterns("windows", "x64", true).unwrap();
+        assert_eq!(win_nv[0].label, "cuda");
+        assert_eq!(win_nv[0].includes, &["bin-win", "cuda"]);
+
+        assert!(sdcpp_asset_patterns("macos", "x86_64", false).is_err());
+        assert!(sdcpp_asset_patterns("windows", "aarch64", false).is_err());
+        let err = sdcpp_asset_patterns("freebsd", "x86_64", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("build from source"), "err: {err}");
+    }
+
+    #[test]
+    fn unit__resolve_sdcpp_asset__first_pattern_with_matching_zip_wins() {
+        let picks = sdcpp_asset_patterns("linux", "x86_64", false).unwrap();
+        let release = rel(
+            "master-890-74988b2",
+            &[
+                "sd-master-74988b2-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip",
+                "sd-master-74988b2-bin-Linux-Ubuntu-24.04-x86_64.zip",
+                "sd-master-74988b2-bin-Linux-Ubuntu-24.04-x86_64-rocm.zip",
+            ],
+        );
+        let (asset, pattern) = resolve_sdcpp_asset(&release, &picks).unwrap();
+        assert!(asset.name.ends_with("vulkan.zip"));
+        assert_eq!(pattern.label, "vulkan");
+
+        // vulkan zip missing from the release -> cpu resort, rocm must
+        // stay unpicked even though it matches every cpu include
+        let cpu_only = rel(
+            "master-890-74988b2",
+            &[
+                "sd-master-74988b2-bin-Linux-Ubuntu-24.04-x86_64.zip",
+                "sd-master-74988b2-bin-Linux-Ubuntu-24.04-x86_64-rocm.zip",
+            ],
+        );
+        let (asset, pattern) = resolve_sdcpp_asset(&cpu_only, &picks).unwrap();
+        assert!(!asset.name.contains("rocm"));
+        assert_eq!(pattern.label, "cpu");
+        assert!(pattern.cpu_fallback);
+
+        // nothing usable -> None (caller teaching-errors with wanted list)
+        let empty = rel("master-890-74988b2", &["source-code.tar.gz"]);
+        assert!(resolve_sdcpp_asset(&empty, &picks).is_none());
+    }
+
+    #[test]
+    fn unit__sdcpp_asset_patterns__future_cuda_prebuilt_is_picked_same_day() {
+        // The day upstream publishes a linux CUDA zip, an NVIDIA box must
+        // pick it with no code change here; the cudart (runtime-stripped)
+        // variant stays excluded, non-NVIDIA keeps vulkan, and the cpu
+        // pattern must never wear a cuda zip as a fallback.
+        let nv = sdcpp_asset_patterns("linux", "x86_64", true).unwrap();
+        let amd = sdcpp_asset_patterns("linux", "x86_64", false).unwrap();
+        let future = rel(
+            "master-891-ffffffff",
+            &[
+                "sd-master-ffffffff-bin-Linux-Ubuntu-24.04-x86_64-cuda12.zip",
+                "sd-master-ffffffff-bin-Linux-Ubuntu-24.04-x86_64-cuda12-cudart.zip",
+                "sd-master-ffffffff-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip",
+                "sd-master-ffffffff-bin-Linux-Ubuntu-24.04-x86_64.zip",
+            ],
+        );
+        let (asset, pattern) = resolve_sdcpp_asset(&future, &nv).unwrap();
+        assert_eq!(
+            asset.name,
+            "sd-master-ffffffff-bin-Linux-Ubuntu-24.04-x86_64-cuda12.zip"
+        );
+        assert_eq!(pattern.label, "cuda");
+        assert!(!pattern.cpu_fallback);
+
+        let (asset, pattern) = resolve_sdcpp_asset(&future, &amd).unwrap();
+        assert!(asset.name.ends_with("vulkan.zip"));
+        assert_eq!(pattern.label, "vulkan");
+
+        // today's release (no CUDA zip yet) on an NVIDIA box: vulkan
+        // wins by absence — no error, no cpu mislabel
+        let today = rel(
+            "master-890-74988b2",
+            &[
+                "sd-master-74988b2-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip",
+                "sd-master-74988b2-bin-Linux-Ubuntu-24.04-x86_64.zip",
+            ],
+        );
+        let (asset, pattern) = resolve_sdcpp_asset(&today, &nv).unwrap();
+        assert!(asset.name.ends_with("vulkan.zip"));
+        assert_eq!(pattern.label, "vulkan");
+
+        // cuda-only release on a non-NVIDIA box: no cuda-as-cpu mislabel
+        let cuda_only = rel(
+            "master-891-ffffffff",
+            &[
+                "sd-master-ffffffff-bin-Linux-Ubuntu-24.04-x86_64-cuda12.zip",
+                "sd-master-ffffffff-bin-Linux-Ubuntu-24.04-x86_64.zip",
+            ],
+        );
+        let (asset, pattern) = resolve_sdcpp_asset(&cuda_only, &amd).unwrap();
+        assert!(!asset.name.contains("cuda"), "cpu fallback must stay cpu");
+        assert_eq!(pattern.label, "cpu");
+        assert!(pattern.cpu_fallback);
+
+        // Windows ships CUDA builds TODAY: same same-day pickup contract
+        let win_nv = sdcpp_asset_patterns("windows", "x86_64", true).unwrap();
+        let win_rel = rel(
+            "master-890-74988b2",
+            &[
+                "sd-master-74988b2-bin-win-cuda12-x64.zip",
+                "sd-master-74988b2-bin-win-vulkan-x64.zip",
+                "sd-master-74988b2-bin-win-cpu-x64.zip",
+            ],
+        );
+        let (asset, pattern) = resolve_sdcpp_asset(&win_rel, &win_nv).unwrap();
+        assert_eq!(asset.name, "sd-master-74988b2-bin-win-cuda12-x64.zip");
+        assert_eq!(pattern.label, "cuda");
+    }
+
+    #[test]
+    fn unit__whisper_asset_patterns__single_linux_tar_cpu_first_windows_no_mislabel() {
+        // Linux x86_64 has exactly one asset family (the ubuntu tar) —
+        // no fallback tier exists upstream.
+        let lin = whisper_asset_patterns("linux", "x86_64").unwrap();
+        assert_eq!(lin.len(), 1);
+        assert!(lin[0].includes.iter().all(|i| i.contains("ubuntu-x64")));
+        assert!(!lin[0].cpu_fallback);
+
+        // Windows: plain cpu first (accelerated variants excluded so the
+        // cpu pattern can never wear a cublas/opencl zip), cublas as the
+        // labeled fallback.
+        let win = whisper_asset_patterns("windows", "x86_64").unwrap();
+        assert_eq!(win.len(), 2);
+        assert!(win[0].includes.contains(&"cpu"));
+        for excl in win[0].excludes {
+            assert!(
+                excl.contains("cuda") || excl.contains("opencl") || excl.contains("blas"),
+                "cpu pattern must exclude accelerated zips: {excl}"
+            );
+        }
+        assert!(win[1].includes.contains(&"cublas"));
+        assert!(win[1].cpu_fallback);
+
+        // macOS upstream ships an xcframework library only: the lane
+        // must teach a source build instead of pretending.
+        let err = whisper_asset_patterns("macos", "aarch64").unwrap_err();
+        assert!(
+            err.to_string().contains("source"),
+            "mac must teach build-from-source: {err}"
+        );
     }
 
     #[test]
@@ -1850,5 +2329,233 @@ mod tests {
             err.to_string().contains("truncated"),
             "error names truncation: {err}"
         );
+    }
+
+    // Deterministic pseudo-random body (LCG): every 8 MiB chunk differs,
+    // so a chunk written to the wrong offset cannot pass the final sha.
+    fn patterned(len: usize) -> &'static [u8] {
+        let mut v = Vec::with_capacity(len);
+        let mut x: u64 = 0x243F_6A88_85A3_08D3;
+        for _ in 0..len {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            v.push(u8::try_from(x >> 56).expect("top byte always fits"));
+        }
+        Box::leak(v.into_boxed_slice())
+    }
+
+    const PARALLEL_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+    /// Loopback HTTP/1.1 server that honors `Range` requests with strict
+    /// 206 + `Content-Range` semantics (keep-alive, multiple connections)
+    /// and records every served range so a test can pin the wire shape:
+    /// one `bytes=0-0` probe, then the exact chunk set. Range-less GETs
+    /// get the full 200 body.
+    fn serve_ranges(body: &'static [u8]) -> (String, Arc<Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let url = format!("http://{addr}/asset.bin");
+        let logger = Arc::clone(&log);
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut sock) = conn else { break };
+                let logger = Arc::clone(&logger);
+                std::thread::spawn(move || loop {
+                    let mut buf = Vec::with_capacity(2048);
+                    loop {
+                        let mut byte = [0u8; 1024];
+                        let n = match sock.read(&mut byte) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&byte[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+                    let range = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("range:"))
+                        .map(str::trim)
+                        .map(str::to_string);
+                    let resp = match range.as_deref() {
+                        Some(spec) => {
+                            let spec = spec
+                                .strip_prefix("bytes=")
+                                .expect("probe/chunks send byte ranges");
+                            let (a, b) = spec.split_once('-').expect("A-B form");
+                            let a: usize = a.parse().expect("range start");
+                            let b: usize = b.parse().expect("range end");
+                            logger
+                                .lock()
+                                .expect("log lock")
+                                .push(format!("bytes={spec}"));
+                            format!(
+                                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\n\r\n",
+                                    a,
+                                    b,
+                                    body.len(),
+                                    b - a + 1
+                                )
+                        }
+                        None => {
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())
+                        }
+                    };
+                    if sock.write_all(resp.as_bytes()).is_err() {
+                        return;
+                    }
+                    let slice_start = range.as_deref().and_then(|r| {
+                        r.strip_prefix("bytes=")
+                            .and_then(|s| s.split_once('-'))
+                            .and_then(|(a, _)| a.parse::<usize>().ok())
+                    });
+                    let payload = match slice_start {
+                        Some(start) => {
+                            let end = start
+                                + resp
+                                    .lines()
+                                    .find_map(|l| {
+                                        l.strip_prefix("Content-Length: ")
+                                            .map(str::trim)
+                                            .and_then(|v| v.parse::<usize>().ok())
+                                    })
+                                    .expect("length known");
+                            &body[start..end]
+                        }
+                        None => body,
+                    };
+                    if sock.write_all(payload).is_err() {
+                        return;
+                    }
+                });
+            }
+        });
+        (url, log)
+    }
+
+    /// Loopback server that ALWAYS answers 200 with the full body, even
+    /// to Range requests — the Range-incapable host shape. Serves any
+    /// number of requests across connections.
+    fn serve_200_loop(body: &'static [u8]) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let url = format!("http://{addr}/asset.bin");
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut sock) = conn else { break };
+                std::thread::spawn(move || loop {
+                    let mut buf = Vec::with_capacity(2048);
+                    loop {
+                        let mut byte = [0u8; 1024];
+                        let n = match sock.read(&mut byte) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&byte[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                    if sock.write_all(head.as_bytes()).is_err() {
+                        return;
+                    }
+                    if sock.write_all(body).is_err() {
+                        return;
+                    }
+                });
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn unit__download_asset_file__parallel_ranges_complete_with_probe_shape() {
+        // Size-known asset >= MIN_PARALLEL_BYTES from a Range-capable
+        // host: the chunk lane engages (probe + 8 MiB chunks on the wire)
+        // and the finalized file passes the full sha256.
+        let body = patterned(PARALLEL_BODY_BYTES);
+        let (url, ranges) = serve_ranges(body);
+        let client = GhClient::with_base("http://127.0.0.1", None).expect("client");
+        let digest = format!("sha256:{:x}", Sha256::digest(body));
+        let mut a = asset(&url, Some(&digest));
+        a.size = Some(body.len() as u64);
+        let dest = std::env::temp_dir().join("blazar-gh-dl-pin-parallel.bin");
+        let wrote = client
+            .download_asset_file(&a, &dest)
+            .await
+            .expect("parallel download");
+        assert_eq!(wrote, body.len() as u64, "byte count");
+        let on_disk = std::fs::read(&dest).expect("read back");
+        assert_eq!(on_disk.len(), body.len(), "file length");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&on_disk)),
+            digest.strip_prefix("sha256:").unwrap(),
+            "finalized file hashes to the release digest"
+        );
+        let served = ranges.lock().expect("log lock").clone();
+        assert!(
+            served.contains(&"bytes=0-0".to_string()),
+            "strict-206 probe on the wire: {served:?}"
+        );
+        for chunk in [
+            "bytes=0-8388607",
+            "bytes=8388608-16777215",
+            "bytes=16777216-25165823",
+            "bytes=25165824-33554431",
+        ] {
+            assert!(
+                served.contains(&chunk.to_string()),
+                "8 MiB chunk {chunk} on the wire: {served:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unit__download_asset_file__rangeless_host_falls_back_to_classic_stream() {
+        // The host ignores Range (plain 200 to the probe): the parallel
+        // attempt steps aside and the classic single stream completes.
+        let body = patterned(PARALLEL_BODY_BYTES);
+        let url = serve_200_loop(body);
+        let client = GhClient::with_base("http://127.0.0.1", None).expect("client");
+        let digest = format!("sha256:{:x}", Sha256::digest(body));
+        let mut a = asset(&url, Some(&digest));
+        a.size = Some(body.len() as u64);
+        let dest = std::env::temp_dir().join("blazar-gh-dl-pin-fallback.bin");
+        let wrote = client
+            .download_asset_file(&a, &dest)
+            .await
+            .expect("classic fallback download");
+        assert_eq!(wrote, body.len() as u64, "byte count");
+        let on_disk = std::fs::read(&dest).expect("read back");
+        assert_eq!(on_disk.len(), body.len(), "file length");
+    }
+
+    #[tokio::test]
+    async fn unit__download_asset_file__parallel_size_mismatch_is_an_error_and_partial_removed() {
+        // Range-capable host, honest Content-Range total, but a LYING
+        // release-API size: the metadata cross-check fires after the
+        // chunk lane finishes and no partial file survives.
+        let body = patterned(PARALLEL_BODY_BYTES);
+        let (url, _ranges) = serve_ranges(body);
+        let client = GhClient::with_base("http://127.0.0.1", None).expect("client");
+        let mut a = asset(&url, None);
+        a.size = Some((body.len() as u64) + 999);
+        let dest = std::env::temp_dir().join("blazar-gh-dl-pin-par-size.bin");
+        let err = client
+            .download_asset_file(&a, &dest)
+            .await
+            .expect_err("size mismatch must fail");
+        assert!(
+            err.to_string().contains("release metadata"),
+            "error names the metadata source: {err}"
+        );
+        assert!(!dest.exists(), "partial file removed");
     }
 }

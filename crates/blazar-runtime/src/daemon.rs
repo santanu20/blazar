@@ -49,10 +49,11 @@ impl DaemonLock {
                     .and_then(|s| s.trim().parse().ok())
                     .unwrap_or(0);
                 if existing > 1 && process_alive(existing) {
-                    return Err(anyhow::Error::new(LockHeld).context(format!(
-                        "blazar already running (pid {existing}); if this is wrong, remove {}",
-                        path.display()
-                    )));
+                    // Remedy lives at the CLI boundary (one place, user-
+                    // facing); the chain stays fact-only so composed
+                    // output never repeats the instruction.
+                    return Err(anyhow::Error::new(LockHeld)
+                        .context(format!("blazar already running (pid {existing})")));
                 }
                 // Stale lock from a dead daemon: take over. F90: loop
                 // back through `create_new` instead of remove+plain-write

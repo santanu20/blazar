@@ -415,6 +415,49 @@ async fn client__well_known__capability_discovery() {
         .unwrap()
         .iter()
         .any(|e| e == "/v1/chat/completions"));
+    // Audit MM15: the census must advertise EVERY media generation
+    // route (plus the engine-scoped surfaces) — a client discovering
+    // capabilities needs them as much as the text lanes.
+    let openai_eps: Vec<&str> = v["endpoints"]["openai"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e.as_str())
+        .collect();
+    for path in [
+        "/v1/images/generations",
+        "/v1/images/edits",
+        "/v1/images/jobs/{id}",
+        "/v1/images/jobs/{id}/cancel",
+        "/v1/images/capabilities",
+        "/v1/videos/generations",
+        "/v1/videos/jobs/{id}",
+        "/v1/videos/jobs/{id}/cancel",
+        "/v1/videos/capabilities",
+        "/v1/audio/transcriptions",
+        "/v1/audio/translations",
+        "/v1/audio/speech",
+        "/v1/audio/jobs/{id}",
+        "/v1/audio/jobs/{id}/cancel",
+        "/v1/audio/capabilities",
+        "/audio/transcriptions",
+        "/audio/translations",
+        "/props",
+        "/v1/stream",
+        "/v1/chat/completions/input_tokens",
+    ] {
+        assert!(openai_eps.contains(&path), "census missing {path}");
+    }
+    // Audit MM16: the non-/v1 audio aliases are real routes, not just
+    // census entries — they must route (auth refusal, not 404).
+    for path in ["/audio/transcriptions", "/audio/translations"] {
+        let r = reqwest::Client::new()
+            .post(format!("{}{}", ts.base, path))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401, "{path} must be a mounted route");
+    }
     assert!(v["headers"]
         .as_array()
         .unwrap()

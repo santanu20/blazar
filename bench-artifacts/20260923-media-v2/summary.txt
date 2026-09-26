@@ -1,0 +1,7 @@
+engine | kind | provider | params | ttft_ms_p50 | ttft_ms_p99 | itl_p50_ms | itl_p99_ms | decode_tps | prefill_tps_cold | prefill_tps_cached | load_s | gpu_peak_mib | gpu_power_peak_w | rss_peak_mib | tokens_source
+--------------------------------------------------------------------------------------------------------------------------------------------
+master-890-74988b2 | sdcpp | media-video | {'frames': [5, 13, 33], 'gate': {'duration': 60, 'size': '512x512', 'steps': 8}, 'runs': 3, 'size': '320x320', 'steps': 8} | - | - | - | - | - | - | - | - | 5839 | - | 0 | -
+piper | piper | media-tts | {'chars': 840, 'formats': ['wav', 'pcm'], 'runs': 3} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+b5130 | whisper | media-whisper | {'input': 'piper-wav', 'runs': 3} | - | - | - | - | - | - | - | - | 16 | - | 0 | -
+master-890-74988b2 | sdcpp | media-image | {'size': '512x512', 'steps': [4], 'runs': 3} | - | - | - | - | - | - | - | - | 4652 | - | 0 | -
+piper | piper | media-tts-conc | {'streams': 4, 'chars': 400, 'format': 'pcm'} | - | - | - | - | - | - | - | - | 16 | - | 0 | -

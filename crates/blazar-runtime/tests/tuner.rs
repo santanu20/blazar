@@ -74,6 +74,7 @@ fn test_input<'a>(
         sibling_devices: Vec::new(),
         auto_tensor_split: None,
         mmproj_path: None,
+        components: &[],
         model_name: "qwen3-8b",
         instance_key: "qwen3-8b",
         model_path,

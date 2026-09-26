@@ -412,6 +412,7 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
                 "blazar_ctx": p.ctx,
                 "blazar_gpu": p.gpu,
                 "blazar_device": p.device,
+                "blazar_device_id": p.device_id,
                 "blazar_warnings": p.warnings,
                 "blazar_spec": p.spec_mode,
                 "blazar_draft": p.draft,
@@ -457,7 +458,12 @@ async fn ps_router(state: &Arc<AppState>) -> Response {
         Err(e) => return api_error(503, &e.to_string()),
     };
     let url = format!("{}/models", child_base(&engine.endpoint));
-    let resp = child_auth(state.http.get(&url), &engine).send().await;
+    let resp = child_auth(
+        crate::state::child_client(state, &engine.endpoint).get(&url),
+        &engine,
+    )
+    .send()
+    .await;
     let Ok(resp) = resp else {
         return api_error(502, "router /models unreachable");
     };
@@ -694,7 +700,7 @@ fn event_kind(e: &blazar_runtime::BlazarEvent) -> &'static str {
     use blazar_runtime::BlazarEvent::{
         BenchmarkDone, EngineRemoved, EngineRolledBack, EngineUpdated, InstanceStateChanged,
         ModelPreloaded, ModelPulled, ModelRemoved, PullFailed, PullProgress, QueueDepth,
-        SlotsAutoAdopted, SlotsCtxAutoFit,
+        SlotsAutoAdopted, SlotsCtxAutoFit, SlotsReshaped,
     };
     match e {
         EngineUpdated { .. } => "engine_updated",
@@ -703,6 +709,7 @@ fn event_kind(e: &blazar_runtime::BlazarEvent) -> &'static str {
         ModelPreloaded { .. } => "model_preloaded",
         SlotsAutoAdopted { .. } => "slots_auto_adopted",
         SlotsCtxAutoFit { .. } => "slots_ctx_auto_fit",
+        SlotsReshaped { .. } => "slots_reshaped",
         ModelPulled { .. } => "model_pulled",
         ModelRemoved { .. } => "model_removed",
         PullProgress { .. } => "pull_progress",
@@ -867,10 +874,14 @@ pub async fn chat(
         Ok(r) => r,
         Err(e) => return api_error(400, &e),
     };
-    // mistral.rs children register models as `default` (see proxy.rs).
-    // Pre-spawn: predict the routed lane (engine not resolved yet).
-    if crate::proxy::child_model_default_predicted(&state, &row.name, &row.path) {
-        crate::proxy::set_child_model_default(&mut openai_req);
+    // Per-engine child model contract (see proxy.rs): mistral.rs
+    // children answer `default`, sglang children need the exact
+    // `--served-model-name` (its `model:tail` parsing would turn a
+    // quant tag into a phantom LoRA ask), llamacpp keeps the caller's
+    // spelling. Pre-spawn: predict the routed lane (engine not
+    // resolved yet).
+    if let Some(stamp) = crate::proxy::child_model_stamp_predicted(&state, &row.name, &row.path) {
+        crate::proxy::set_child_model(&mut openai_req, &stamp);
     }
     // Strict tool-def lint (tools arrive in OpenAI shape after translate).
     if let Some(err) = state.sentinel.strict_tool_def_error_cached(&req) {
@@ -888,7 +899,9 @@ pub async fn chat(
             .and_then(serde_json::Value::as_u64)
         {
             Some(v) => v,
-            None => u64::from(state.config.effective_ctx(&row.name)),
+            // Live per-slot ctx when resident (auto-fit may have
+            // narrowed it); config estimate only for cold lanes.
+            None => u64::from(crate::preflight::admission_ctx(&state, &row.name)),
         };
         if let Err(resp) = crate::preflight::enforce_prompt_fits(
             &state,
@@ -948,6 +961,9 @@ pub async fn chat(
                     .is_none_or(|(_, e)| e.models.is_empty() || e.models.contains(&embed_model));
                 if scope_ok {
                     let prompt_text = emb_prompt_text(&req);
+                    // Class key: sampling/tools/think/system differences
+                    // must not see this prompt's cached responses.
+                    let fingerprint = semcache::serving_fingerprint(&row.name, &req);
                     match semcache::embed_prompt(&state, &embed_model, &prompt_text).await {
                         Ok(emb) => {
                             let key_name = key_entry.as_ref().map(|(n, _)| n.clone());
@@ -957,6 +973,7 @@ pub async fn chat(
                                 key_name.as_deref(),
                                 &emb,
                                 directive.threshold,
+                                fingerprint,
                             ) {
                                 state
                                     .sem
@@ -972,6 +989,7 @@ pub async fn chat(
                                 emb,
                                 directive,
                                 key: key_name,
+                                fingerprint,
                             });
                         }
                         Err(_) => {
@@ -1050,6 +1068,8 @@ pub async fn chat(
         class,
         affinity_hash(&req),
         crate::proxy::body_needs_vision(&req, true),
+        false, // text surface: diffusion rows teach the images lane
+        false,
     )
     .await
     {
@@ -1544,8 +1564,7 @@ async fn proxy_core_chat(
         format!("{base}/v1/chat/completions")
     };
     let req = child_auth(
-        state
-            .http
+        crate::state::child_client(state, &engine.endpoint)
             .post(&url)
             .header("content-type", "application/json"),
         engine,
@@ -1554,24 +1573,74 @@ async fn proxy_core_chat(
         // We translate the non-stream response into ollama shape.
         let t0 = std::time::Instant::now();
         let ttft_secs;
-        let resp =
-            match crate::proxy::child_send(state, engine, req.body(openai_body.clone()).send())
-                .await
-            {
-                Ok(r) => {
-                    let s = t0.elapsed().as_secs_f64();
-                    state.ttft.observe_secs(s);
-                    ttft_secs = Some(s);
-                    r
+        let resp = match crate::proxy::child_send(
+            state,
+            engine,
+            req.body(openai_body.clone()).send(),
+        )
+        .await
+        {
+            Ok(r) => {
+                let s = t0.elapsed().as_secs_f64();
+                state.ttft.observe_secs(s);
+                ttft_secs = Some(s);
+                r
+            }
+            Err(e) => {
+                tracing::warn!(
+                    model,
+                    "nonstream upstream failed: {e} — respawning lane, retrying once in-band"
+                );
+                // Same crash-recovery contract as the proxy path:
+                // `child_send` already evicted a wedged child; the
+                // respawn reaps the dead ones. Exactly one in-band
+                // retry so single-shot clients don't eat the 502/504
+                // for a child they never got to talk to.
+                match crate::proxy::respawn_lane(state, &engine.key).await {
+                    Ok(fresh) => {
+                        let fresh_url = if ollama_compat {
+                            format!("{}/v1/completions", child_base(&fresh.endpoint))
+                        } else {
+                            format!("{}/v1/chat/completions", child_base(&fresh.endpoint))
+                        };
+                        let fresh_req = child_auth(
+                            crate::state::child_client(state, &fresh.endpoint)
+                                .post(&fresh_url)
+                                .header("content-type", "application/json"),
+                            &fresh,
+                        );
+                        match crate::proxy::child_send(
+                            state,
+                            &fresh,
+                            fresh_req.body(openai_body.clone()).send(),
+                        )
+                        .await
+                        {
+                            Ok(r) => {
+                                let s = t0.elapsed().as_secs_f64();
+                                state.ttft.observe_secs(s);
+                                ttft_secs = Some(s);
+                                r
+                            }
+                            Err(e2) => {
+                                return api_error(
+                                        e2.status_u16(),
+                                        &format!(
+                                            "engine request failed: {e}; retry on respawned child: {e2}"
+                                        ),
+                                    );
+                            }
+                        }
+                    }
+                    Err(re) => {
+                        return api_error(
+                            e.status_u16(),
+                            &format!("engine request failed: {e}; respawn: {re:#}"),
+                        );
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(model, "nonstream upstream failed: {e}");
-                    // Reap now so the NEXT request respawns instead of
-                    // 502-looping until the periodic reaper notices (~10s).
-                    state.sup.reap_dead_children().await;
-                    return api_error(e.status_u16(), &format!("engine request failed: {e}"));
-                }
-            };
+            }
+        };
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
@@ -1661,6 +1730,7 @@ async fn proxy_core_chat(
                 openai,
                 sem.directive.ttl,
                 state.config.semantic_cache.max_entries,
+                sem.fingerprint,
             );
             state
                 .sem
@@ -1684,8 +1754,7 @@ async fn proxy_core_chat(
         state,
         engine,
         child_auth(
-            state
-                .http
+            crate::state::child_client(state, &engine.endpoint)
                 .post(&url)
                 .header("content-type", "application/json"),
             engine,
@@ -1697,9 +1766,52 @@ async fn proxy_core_chat(
     {
         Ok(r) => r,
         Err(e) => {
-            // Same crash-recovery contract as the OpenAI proxy path.
-            state.sup.reap_dead_children().await;
-            return api_error(e.status_u16(), &format!("engine request failed: {e}"));
+            // Same crash-recovery contract as the OpenAI proxy path; the
+            // in-band retry is safe here because no client bytes have
+            // been sent yet (headers are built only after this match).
+            tracing::warn!(
+                model,
+                "stream upstream failed: {e} — respawning lane, retrying once in-band"
+            );
+            match crate::proxy::respawn_lane(state, &engine.key).await {
+                Ok(fresh) => {
+                    let fresh_url = if ollama_compat {
+                        format!("{}/v1/completions", child_base(&fresh.endpoint))
+                    } else {
+                        format!("{}/v1/chat/completions", child_base(&fresh.endpoint))
+                    };
+                    match crate::proxy::child_send(
+                        state,
+                        &fresh,
+                        child_auth(
+                            crate::state::child_client(state, &fresh.endpoint)
+                                .post(&fresh_url)
+                                .header("content-type", "application/json"),
+                            &fresh,
+                        )
+                        .body(openai_body.clone())
+                        .send(),
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(e2) => {
+                            return api_error(
+                                e2.status_u16(),
+                                &format!(
+                                    "engine request failed: {e}; retry on respawned child: {e2}"
+                                ),
+                            );
+                        }
+                    }
+                }
+                Err(re) => {
+                    return api_error(
+                        e.status_u16(),
+                        &format!("engine request failed: {e}; respawn: {re:#}"),
+                    );
+                }
+            }
         }
     };
     if !resp.status().is_success() {
@@ -1761,7 +1873,7 @@ async fn proxy_core_chat(
             c.1 = elapsed;
         }
         if let Ok(bytes) = chunk.as_ref() {
-            sentinel_feed.bytes(bytes.as_ref());
+            sentinel_feed.bytes(bytes.clone());
         }
         chunk.map_err(|e| std::io::Error::other(e.to_string()))
     });
@@ -2070,6 +2182,8 @@ pub async fn embeddings(
         crate::queue::WorkClass::Interactive,
         None,
         false,
+        false, // text surface: diffusion rows teach the images lane
+        false,
     )
     .await
     {
@@ -2101,15 +2215,18 @@ pub async fn embeddings(
             }
             let url = format!("{}/v1/embeddings", child_base(&engine.endpoint));
             // mistral.rs children register models as `default` (see proxy.rs).
-            if crate::proxy::child_model_default(&engine) {
-                crate::proxy::set_child_model_default(&mut openai_req);
+            if let Some(stamp) = crate::proxy::child_model_stamp(&engine) {
+                crate::proxy::set_child_model(&mut openai_req, stamp);
             }
             let resp = match crate::proxy::child_send(
                 &state,
                 &engine,
-                child_auth(state.http.post(&url), &engine)
-                    .json(&openai_req)
-                    .send(),
+                child_auth(
+                    crate::state::child_client(&state, &engine.endpoint).post(&url),
+                    &engine,
+                )
+                .json(&openai_req)
+                .send(),
             )
             .await
             {
@@ -2184,6 +2301,8 @@ pub async fn embed(
         crate::queue::WorkClass::Interactive,
         None,
         false,
+        false, // text surface: diffusion rows teach the images lane
+        false,
     )
     .await
     {
@@ -2226,15 +2345,18 @@ pub async fn embed(
             let url = format!("{}/v1/embeddings", child_base(&engine.endpoint));
             let mut openai_req = json!({"model": model, "input": inputs});
             // mistral.rs children register models as `default` (see proxy.rs).
-            if crate::proxy::child_model_default(&engine) {
-                crate::proxy::set_child_model_default(&mut openai_req);
+            if let Some(stamp) = crate::proxy::child_model_stamp(&engine) {
+                crate::proxy::set_child_model(&mut openai_req, stamp);
             }
             let resp = match crate::proxy::child_send(
                 &state,
                 &engine,
-                child_auth(state.http.post(&url), &engine)
-                    .json(&openai_req)
-                    .send(),
+                child_auth(
+                    crate::state::child_client(&state, &engine.endpoint).post(&url),
+                    &engine,
+                )
+                .json(&openai_req)
+                .send(),
             )
             .await
             {
@@ -2265,6 +2387,16 @@ pub async fn embed(
 /// /v1/rerank. Accepts `documents` as strings or {text} objects
 /// (normalizes to the `OpenAI` string shape); response passes through
 /// verbatim (results + usage).
+/// `{text: "..."}` documents normalize to plain strings (the `OpenAI`
+/// rerank shape); strings and other values pass through untouched.
+fn rerank_doc_text(doc: &Value) -> Value {
+    match doc {
+        Value::String(s) => Value::String(s.clone()),
+        Value::Object(_) => Value::String(doc["text"].as_str().unwrap_or_default().to_string()),
+        other => other.clone(),
+    }
+}
+
 pub async fn rerank(
     State(state): State<Arc<AppState>>,
     key_ext: Option<Extension<crate::keys::KeyCtx>>,
@@ -2290,14 +2422,7 @@ pub async fn rerank(
         return api_error(400, "\"documents\" must be an array");
     };
     // {text: "..."} objects -> plain strings.
-    let normalized: Vec<Value> = docs
-        .iter()
-        .map(|d| match d {
-            Value::String(s) => Value::String(s.clone()),
-            Value::Object(_) => Value::String(d["text"].as_str().unwrap_or_default().to_string()),
-            other => other.clone(),
-        })
-        .collect();
+    let normalized: Vec<Value> = docs.iter().map(rerank_doc_text).collect();
     let forward = json!({
         "model": model,
         "query": req["query"],
@@ -2328,6 +2453,8 @@ pub async fn rerank(
         crate::queue::WorkClass::Interactive,
         None,
         false,
+        false, // text surface: diffusion rows teach the images lane
+        false,
     )
     .await
     {
@@ -2341,15 +2468,18 @@ pub async fn rerank(
             let url = format!("{}/v1/rerank", child_base(&engine.endpoint));
             // mistral.rs children register models as `default` (see
             // proxy.rs) — F28: rerank lane now rewrites like every other.
-            if crate::proxy::child_model_default(&engine) {
-                crate::proxy::set_child_model_default(&mut forward);
+            if let Some(stamp) = crate::proxy::child_model_stamp(&engine) {
+                crate::proxy::set_child_model(&mut forward, stamp);
             }
             let resp = match crate::proxy::child_send(
                 &state,
                 &engine,
-                child_auth(state.http.post(&url), &engine)
-                    .json(&forward)
-                    .send(),
+                child_auth(
+                    crate::state::child_client(&state, &engine.endpoint).post(&url),
+                    &engine,
+                )
+                .json(&forward)
+                .send(),
             )
             .await
             {
@@ -2451,7 +2581,7 @@ pub async fn generate(
         let eff = req
             .pointer("/options/num_ctx")
             .and_then(serde_json::Value::as_u64)
-            .unwrap_or(u64::from(state.config.effective_ctx(&row.name)));
+            .unwrap_or_else(|| u64::from(crate::preflight::admission_ctx(&state, &row.name)));
         if let Err(resp) = crate::preflight::enforce_prompt_fits(
             &state,
             &row.name,
@@ -2514,6 +2644,8 @@ pub async fn generate(
         class,
         affinity_hash(&req),
         crate::proxy::body_needs_vision(&req, true),
+        false, // text surface: diffusion rows teach the images lane
+        false,
     )
     .await
     {
@@ -2528,8 +2660,8 @@ pub async fn generate(
     state.sup.note_prefix_hit(&engine.name);
     let model_name = row.name.clone();
     // mistral.rs children register models as `default` (see proxy.rs).
-    if crate::proxy::child_model_default(&engine) {
-        crate::proxy::set_child_model_default(&mut openai_req);
+    if let Some(stamp) = crate::proxy::child_model_stamp(&engine) {
+        crate::proxy::set_child_model(&mut openai_req, stamp);
     }
     let openai_bytes = serde_json::to_vec(&openai_req).unwrap_or_default();
     // ollama defaults stream=true on generate; the chat bus mirrors it.
@@ -2596,10 +2728,13 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
             Err(e) => return api_error(503, &e.to_string()),
         };
         let url = format!("{}/models/unload", child_base(&engine.endpoint));
-        return match child_auth(state.http.post(&url), &engine)
-            .json(&json!({"model": model}))
-            .send()
-            .await
+        return match child_auth(
+            crate::state::child_client(&state, &engine.endpoint).post(&url),
+            &engine,
+        )
+        .json(&json!({"model": model}))
+        .send()
+        .await
         {
             Ok(r) if r.status().is_success() => axum::Json(json!({"status": "ok"})).into_response(),
             Ok(r) => {
@@ -2739,6 +2874,8 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
         crate::queue::WorkClass::Interactive,
         None,
         false,
+        false, // text surface: diffusion rows teach the images lane
+        false,
     )
     .await
     {
@@ -2810,7 +2947,7 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
         } else {
             json!({"filename": filename})
         };
-        let resp = child_auth(state.http.post(&url), &engine)
+        let resp = child_auth(crate::state::child_client(&state, &engine.endpoint).post(&url), &engine)
             .json(&body_json)
             .send()
             .await;
@@ -2999,11 +3136,14 @@ fn engine_build_gauge(state: &AppState, out: &mut String) {
 pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     let mut merged = String::new();
     for e in state.sup.live_http_endpoints() {
-        let blazar_core::profile::Endpoint::Tcp { host, port } = &e.endpoint else {
-            continue;
-        };
-        let url = format!("http://{host}:{port}/metrics");
-        if let Ok(resp) = child_auth(state.http.get(&url), &e).send().await {
+        let url = format!("{}/metrics", crate::proxy::child_base(&e.endpoint));
+        if let Ok(resp) = child_auth(
+            crate::state::child_client(&state, &e.endpoint).get(&url),
+            &e,
+        )
+        .send()
+        .await
+        {
             if resp.status().is_success() {
                 if let Ok(text) = resp.text().await {
                     merged.push_str(&text);
@@ -3022,7 +3162,13 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         match crate::proxy::ensure_router_detached(&state.sup).await {
             Ok(engine) => {
                 let url = format!("{}/models", child_base(&engine.endpoint));
-                match child_auth(state.http.get(&url), &engine).send().await {
+                match child_auth(
+                    crate::state::child_client(&state, &engine.endpoint).get(&url),
+                    &engine,
+                )
+                .send()
+                .await
+                {
                     Ok(r) if r.status().is_success() => match r.json::<Value>().await {
                         Ok(v) => v["data"].as_array().map_or_else(
                             || state.sup.ps().len(),
@@ -3055,6 +3201,14 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         merged,
         "# HELP blazar_queue_depth Waiting requests\n# TYPE blazar_queue_depth gauge\nblazar_queue_depth {}\n",
         state.queue.depth()
+    );
+    // Audit MM9: the local audio lane (transcriptions/translations async
+    // jobs) has no queue of its own — this gauge is its only footprint
+    // in /metrics.
+    let _ = write!(
+        merged,
+        "# HELP blazar_audio_jobs_active Local audio transcription jobs (queued+running)\n# TYPE blazar_audio_jobs_active gauge\nblazar_audio_jobs_active {}\n",
+        state.audio_jobs.active_count()
     );
     let _ = write!(
         merged,
@@ -3202,6 +3356,7 @@ mod tests {
             bytes: 500,
             sha256: None,
             mmproj_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,

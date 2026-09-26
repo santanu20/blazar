@@ -15,6 +15,7 @@ pub fn tool_file_name(base: &str) -> String {
 
 pub mod bench;
 pub mod daemon;
+pub mod diffusion;
 pub mod engine;
 pub mod engine_impl;
 pub mod events;
@@ -27,6 +28,7 @@ pub mod quantize;
 pub mod registry;
 pub mod sessionreg;
 pub mod supervisor;
+pub mod uds;
 pub mod upgrade;
 pub mod verify;
 pub mod whisper;
@@ -39,7 +41,9 @@ pub use daemon::{
 pub use engine::gh::GhClient;
 pub use engine::manifest::{predicted_rescue_lane, probe as probe_manifest, Manifest, Vendor};
 pub use engine::{system_vendor_hint, EngineManager, LOCAL_TAG};
-pub use engine_impl::{ChildHandle, Engine, LlamaCppEngine, MistralRsEngine, SglangEngine};
+pub use engine_impl::{
+    ChildHandle, Engine, LlamaCppEngine, MistralRsEngine, SdCppEngine, SglangEngine,
+};
 pub use events::{BlazarEvent, EventBus, InstanceState};
 pub use hf::{parse_pull_target, registry_name, PullOutcome, PullTarget, Puller};
 pub use models::{instance_running, remove_model};

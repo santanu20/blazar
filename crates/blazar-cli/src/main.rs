@@ -19,7 +19,7 @@ use blazar_runtime::engine::build::{
     validate_commit_sha, validate_repo_slug, BuildBackend, BuildOpts, BuildSource, Toolchain,
 };
 use blazar_runtime::engine::gh::{btag_number, same_build, GhClient};
-use blazar_runtime::engine::EngineManager;
+use blazar_runtime::engine::{EngineManager, STALLED_INSTALL_GRACE};
 use blazar_runtime::engine_impl::Engine;
 use blazar_runtime::EventBus;
 use blazar_runtime::VerifyReport;
@@ -35,6 +35,13 @@ use blazar_runtime::{LlamaCppEngine, MistralRsEngine, Supervisor};
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+
+    /// When to emit ANSI accents: `auto` colors only interactive
+    /// terminals (honoring `NO_COLOR` and `TERM=dumb`), `always` forces
+    /// color on, `never` forces plain bytes for scripted consumption
+    /// [default: auto]
+    #[arg(long, value_enum, default_value_t = ColorWhen::Auto, global = true)]
+    color: ColorWhen,
 }
 
 #[derive(Subcommand)]
@@ -169,8 +176,10 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Chat REPL against a model (streams; /exit /clear /model /sysinfo /profile);
-    /// with an inline PROMPT: single-shot generation, prints and exits
+    /// Interactive loop against a model, by kind: text chats (streams;
+    /// /exit /clear /model /sysinfo /profile), diffusion sets generate
+    /// images or video, pulled piper voices write WAV clips; with an
+    /// inline PROMPT: single-shot, prints and exits
     Run {
         model: String,
         /// Prompt words (joined); flags go BEFORE the prompt — a leading
@@ -267,12 +276,23 @@ enum Cmd {
         /// List installed whisper server tag + local models
         #[arg(long)]
         list: bool,
+        /// Search the upstream model catalog (ggerganov/whisper.cpp);
+        /// bare --search lists every size, a substring filters (turbo,
+        /// .en, q5). Sizes marked "pulled" are local already.
+        #[arg(
+            long,
+            value_name = "SUBSTR",
+            num_args = 0..=1,
+            default_missing_value = "",
+            conflicts_with_all = ["install", "tag", "pull", "list", "file", "model", "pin"]
+        )]
+        search: Option<String>,
         /// Pin the whisper server to an installed tag ("none" unpins —
         /// tracks the newest installed tag). No download involved.
         #[arg(
             long,
             value_name = "TAG|none",
-            conflicts_with_all = ["install", "tag", "pull", "list", "file"]
+            conflicts_with_all = ["install", "tag", "pull", "list", "file", "search"]
         )]
         pin: Option<String>,
     },
@@ -297,12 +317,21 @@ enum Cmd {
         /// List installed piper tag + pulled voices
         #[arg(long)]
         list: bool,
+        /// Search the upstream voice catalog (rhasspy/piper-voices) by
+        /// substring — a voice id (en_US-amy), a language (en, de) or a
+        /// quality (medium). Voices marked "pulled" are local already.
+        #[arg(
+            long,
+            value_name = "SUBSTR",
+            conflicts_with_all = ["install", "tag", "pull", "list", "text", "pin"]
+        )]
+        search: Option<String>,
         /// Pin piper to an installed tag ("none" unpins — tracks the
         /// newest installed tag). No download involved.
         #[arg(
             long,
             value_name = "TAG|none",
-            conflicts_with_all = ["install", "tag", "pull", "list", "text"]
+            conflicts_with_all = ["install", "tag", "pull", "list", "text", "search"]
         )]
         pin: Option<String>,
         /// Output WAV path ("-" for stdout); default: <voice>-<n>.wav
@@ -478,7 +507,7 @@ enum EngineCmd {
     /// `blazar engine build cuda`. Activates the installed tag;
     /// restart the daemon so running spawns pick it up.
     Update {
-        /// Engine lane to update: llamacpp (default) | sglang | mistralrs
+        /// Engine lane to update: llamacpp (default) | sglang | mistralrs | sdcpp
         #[arg(long, default_value = "llamacpp")]
         kind: String,
         tag: Option<String>,
@@ -585,10 +614,10 @@ enum EngineCmd {
     /// install, `engine use` the tag and restart the daemon to serve
     /// safetensors models.
     Install {
-        /// Engine lane to install: mistralrs | sglang (required — bare
-        /// `engine install` prints the lane chooser; llama.cpp installs
-        /// ride `engine update` / `engine build`). With --lane: build a
-        /// curated capability lane from the registry by id (see
+        /// Engine lane to install: mistralrs | sglang | sdcpp (required —
+        /// bare `engine install` prints the lane chooser; llama.cpp
+        /// installs ride `engine update` / `engine build`). With --lane:
+        /// build a curated capability lane from the registry by id (see
         /// `blazar engine offers`).
         #[arg(long)]
         kind: Option<String>,
@@ -862,13 +891,22 @@ fn main() {
         return;
     }
     let cli = Cli::parse();
+    set_color_override(cli.color);
     // Peek log_level from the config file WITHOUT creating it
     // (Config::load writes a fresh file when absent; a plain read must not).
     let log_level = std::fs::read_to_string(dirs().config_file())
         .ok()
         .and_then(|raw| Config::from_toml(&raw).ok())
         .and_then(|c| c.log_level);
-    blazar_core::telemetry::init_tracing(0, log_level.as_deref());
+    // The serve path owns a durable daemon log: under systemd the
+    // journal stream is secondary (rotation can strand it); every other
+    // command logs to stderr only (their output is interactive).
+    let log_file = if matches!(cli.cmd, Cmd::Serve) {
+        Some(dirs().run_dir().join("daemon.log"))
+    } else {
+        None
+    };
+    blazar_core::telemetry::init_tracing(0, log_level.as_deref(), log_file.as_deref());
     if let Err(e) = run(cli.cmd) {
         eprintln!("blazar: {e:#}");
         std::process::exit(1);
@@ -888,6 +926,29 @@ fn banner() {
 fn cli_http() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_default()
+}
+
+/// Diffusion sync turns and speech renders run minutes, not the 10s
+/// ops budget of `cli_http` — the generation loops need a patient
+/// client (job polls stay on `cli_http`: each roundtrip is fast).
+fn gen_http() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()
+        .unwrap_or_default()
+}
+
+/// Sync image turns hold one request across the WHOLE render, which can
+/// outlast `gen_http`'s 10-minute ceiling on offloaded hardware. The
+/// bound stays generous-but-finite (unlike the gateway's loopback media
+/// client) because the CLI may talk to a remote daemon over a real
+/// network, where a vanished peer must not hang the turn forever.
+fn media_http() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(7_200))
         .build()
         .unwrap_or_default()
 }
@@ -981,6 +1042,40 @@ async fn ensure_run_model(name: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
+/// `blazar run` lane routing: the interactive surface a model drives.
+/// Diffusion sets and standalone checkpoints have no chat surface —
+/// image families loop on /v1/images/generations, video families on
+/// /v1/videos/generations; everything else is the chat REPL.
+enum RunLane {
+    Text,
+    Image,
+    Video,
+}
+
+fn run_lane(row: &blazar_core::store::ModelRow) -> RunLane {
+    if !row.has_component_set() {
+        return RunLane::Text;
+    }
+    match blazar_runtime::diffusion::family_mode(&row.repo) {
+        Some(blazar_runtime::diffusion::FamilyMode::Vid) => RunLane::Video,
+        _ => RunLane::Image,
+    }
+}
+
+/// Piper voices are files, not store rows: a `run` argument naming a
+/// pulled voice (or the bare words "tts"/"piper" when one is installed)
+/// drives the speech loop. Rows always win — a name that is both is a
+/// model row, never a voice.
+fn tts_voice_target<'a>(name: &str, voices: &'a [String]) -> Option<&'a String> {
+    if voices.is_empty() {
+        return None;
+    }
+    if let Some(v) = voices.iter().find(|v| v.as_str() == name) {
+        return Some(v);
+    }
+    matches!(name, "tts" | "piper").then(|| &voices[0])
+}
+
 /// Not-found error with the flat-name teaching line for ollama
 /// `model:tag` input (reached only when BOTH forms missed, so the
 /// swapped spelling is a suggestion, never a promise).
@@ -1021,6 +1116,16 @@ fn daemon_base(cfg: &Config) -> String {
     format!("http://{}:{}", cfg.host, cfg.port)
 }
 
+/// systemctl lanes tried, in order, to hand the daemon its own scope.
+/// The user unit needs no privileges; the system unit may (hence the
+/// no-ask-password flag — failure stays fast and non-interactive).
+fn systemd_start_attempts() -> Vec<Vec<&'static str>> {
+    vec![
+        vec!["--user", "start", "blazar"],
+        vec!["start", "blazar", "--no-ask-password"],
+    ]
+}
+
 /// Auto-start (plan G): 1s probe; on refusal, detached self-exec `serve`
 /// (own session, logs to run/daemon.log), then poll /healthz ≤30s.
 async fn ensure_daemon() -> Result<String> {
@@ -1034,7 +1139,29 @@ async fn ensure_daemon() -> Result<String> {
             return Ok(base);
         }
     }
-    // Not running: self-exec detached.
+    // Not running: prefer the service manager so the daemon lands in
+    // its OWN scope (survives the invoking terminal, logs to journald)
+    // instead of the caller's login session. Absent systemctl fails
+    // fast (3s cap per attempt); unhealthy units fall through too.
+    for args in systemd_start_attempts() {
+        let mut attempt = tokio::process::Command::new("systemctl");
+        attempt.args(&args);
+        match tokio::time::timeout(Duration::from_secs(3), attempt.output()).await {
+            Ok(Ok(out)) if out.status.success() => {}
+            _ => continue,
+        }
+        let deadline = tokio_deadline(Duration::from_secs(15));
+        while std::time::Instant::now() < deadline {
+            if let Ok(r) = http.get(format!("{base}/healthz")).send().await {
+                if r.status().is_success() {
+                    return Ok(base);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+    eprintln!("no healthy systemd unit — falling back to a detached daemon");
+    // Self-exec detached.
     let log = dirs().run_dir().join("daemon.log");
     let log_file = std::fs::OpenOptions::new()
         .create(true)
@@ -1080,6 +1207,223 @@ fn tokio_deadline(d: Duration) -> std::time::Instant {
     std::time::Instant::now() + d
 }
 
+async fn daemon_healthy(base: &str, http: &reqwest::Client) -> bool {
+    matches!(
+        http.get(format!("{base}/healthz")).send().await,
+        Ok(r) if r.status().is_success()
+    )
+}
+
+async fn wait_healthz(base: &str, http: &reqwest::Client, deadline: std::time::Instant) -> bool {
+    while std::time::Instant::now() < deadline {
+        if daemon_healthy(base, http).await {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    false
+}
+
+async fn wait_healthz_down(
+    base: &str,
+    http: &reqwest::Client,
+    deadline: std::time::Instant,
+) -> bool {
+    while std::time::Instant::now() < deadline {
+        if !daemon_healthy(base, http).await {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    false
+}
+
+/// Pid of the daemon named by `pidfile`, if present and parseable.
+fn pidfile_pid(pidfile: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(pidfile)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
+/// Wait for the daemon PROCESS named by `pidfile` to exit — not just
+/// its listener. `stop()` delivers a drain-and-exit signal: the daemon
+/// finishes in-flight work (an image generation can run for minutes)
+/// while still holding the daemon lock, and a successor spawn refuses
+/// to start until the owner is gone. The daemon removes its pidfile on
+/// clean exit (RAII); the pid-vanishes-from-the-process-table check
+/// covers the crash path.
+fn wait_daemon_exit(pidfile: &std::path::Path, deadline: std::time::Instant) -> bool {
+    let mut noted = false;
+    loop {
+        let exited =
+            pidfile_pid(pidfile).is_none_or(|pid| !blazar_runtime::process_alive_by_pid(pid));
+        if exited {
+            return true;
+        }
+        if !noted {
+            noted = true;
+            println!("waiting for the daemon to finish in-flight work (draining)…");
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// `systemctl is-active --quiet blazar` under a 3s cap: an unresponsive
+/// systemctl (hung D-Bus, NFS automount) must not stall the command that
+/// asked for the restart.
+async fn systemd_unit_is_active() -> bool {
+    let mut cmd = tokio::process::Command::new("systemctl");
+    cmd.args(["is-active", "--quiet", "blazar"]);
+    matches!(
+        tokio::time::timeout(Duration::from_secs(3), cmd.output()).await,
+        Ok(Ok(out)) if out.status.success()
+    )
+}
+
+async fn run_systemctl(args: &[&str]) -> bool {
+    let mut cmd = tokio::process::Command::new("systemctl");
+    cmd.args(args);
+    matches!(
+        tokio::time::timeout(Duration::from_secs(15), cmd.output()).await,
+        Ok(Ok(out)) if out.status.success()
+    )
+}
+
+/// `launchctl kickstart -k` cycles the agent in place (macOS lane).
+async fn launchd_kickstart() -> bool {
+    #[cfg(unix)]
+    {
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        let Some(uid) = uid else {
+            return false;
+        };
+        let system_target = uid == "0";
+        let user_target = format!("gui/{uid}/dev.blazar");
+        let target = if system_target {
+            "system/dev.blazar"
+        } else {
+            user_target.as_str()
+        };
+        let mut cmd = tokio::process::Command::new("launchctl");
+        cmd.args(["kickstart", "-k", target]);
+        matches!(
+            tokio::time::timeout(Duration::from_secs(15), cmd.output()).await,
+            Ok(Ok(out)) if out.status.success()
+        )
+    }
+    #[cfg(not(unix))]
+    false
+}
+
+/// Restart a running daemon so a just-landed change (binary swap,
+/// engine switch, tuning adoption) takes effect NOW instead of on the
+/// next manual stop. Silent no-op when no daemon is up — updates must
+/// not grow a daemon-start side effect. Returns true only when a fresh
+/// daemon is provably healthy again.
+///
+/// Boxed: this future drags in `stop`/`ensure_daemon` frames (~16 KB),
+/// and every command path that can auto-install an engine embeds it —
+/// inlining it tipped the `run` handler over clippy's future-size limit.
+fn restart_daemon() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
+    Box::pin(restart_daemon_impl())
+}
+
+async fn restart_daemon_impl() -> bool {
+    let Ok(cfg) = config() else {
+        return false;
+    };
+    let base = daemon_base(&cfg);
+    let Ok(http) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    else {
+        return false;
+    };
+    if !daemon_healthy(&base, &http).await {
+        return false;
+    }
+    let up_deadline = tokio_deadline(Duration::from_secs(30));
+    // Lane 1 — systemd. Gated on is-active: `restart` on an inactive
+    // unit would START it. A plain user without polkit rights falls
+    // through to the stop lane, which needs no privileges at all.
+    if systemd_unit_is_active().await
+        && run_systemctl(&["restart", "blazar", "--no-ask-password"]).await
+        && wait_healthz(&base, &http, up_deadline).await
+    {
+        println!("daemon restarted — the update is live");
+        return true;
+    }
+    // Lane 2 — launchd kickstart.
+    if launchd_kickstart().await && wait_healthz(&base, &http, up_deadline).await {
+        println!("daemon restarted — the update is live");
+        return true;
+    }
+    // Lane 3 — no manager (or no rights): stop must SUCCEED, the
+    // listener must go DOWN, and the draining process must fully EXIT
+    // before any start attempt — the successor spawn refuses to take
+    // the daemon lock while the old owner is still finishing in-flight
+    // work. A false "restarted" receipt here would be worse than an
+    // honest warning.
+    if stop().is_ok()
+        && wait_healthz_down(&base, &http, tokio_deadline(Duration::from_secs(10))).await
+    {
+        // The drain wait can outlast any reasonable inline poll (image
+        // generations run minutes) — run it OFF the async worker and
+        // keep this future small.
+        let pidfile = dirs().run_dir().join("blazar.pid");
+        let exited = tokio::task::spawn_blocking(move || {
+            wait_daemon_exit(&pidfile, tokio_deadline(Duration::from_secs(180)))
+        })
+        .await
+        .unwrap_or(false);
+        if !exited {
+            eprintln!(
+                "warning: the daemon is still finishing in-flight work; it \
+                 restarts itself once done (systemd Restart=always) or on the \
+                 next blazar command"
+            );
+            return false;
+        }
+        match ensure_daemon().await {
+            Ok(_) => {
+                println!("daemon restarted — the update is live");
+                return true;
+            }
+            Err(e) => {
+                eprintln!("warning: could not restart the daemon: {e:#}");
+                return false;
+            }
+        }
+    }
+    eprintln!(
+        "warning: the daemon still serves the previous state — restart it \
+         manually (`systemctl restart blazar`, or `blazar stop` + any command)"
+    );
+    false
+}
+
+/// Restart the daemon only when the ACTIVE engine actually changed under
+/// it: running children keep executing the old engine's binary until a
+/// restart sweeps them. Sibling installs (fork lanes, keep-CUDA guards,
+/// lazy whisper lanes) pass `new_active = None` and are a no-op, as is a
+/// re-activation of the same tag.
+async fn restart_daemon_if_active_changed(prior: Option<String>, new_active: Option<String>) {
+    if new_active.is_none() || prior == new_active {
+        return;
+    }
+    restart_daemon().await;
+}
+
 #[tokio::main]
 // Pure one-call-per-arm dispatch over 30+ commands; splitting arms into
 // helpers would add indirection without lowering complexity.
@@ -1115,7 +1459,41 @@ async fn run(cmd: Cmd) -> Result<()> {
             max_tokens,
             no_draft,
         } => {
-            let model = ensure_run_model(&model).await?;
+            let inline: Option<String> = {
+                let joined = prompt.join(" ");
+                (!joined.is_empty()).then_some(joined)
+            };
+            // Lane routing: diffusion rows and piper voices never reach
+            // the chat REPL — each drives its own generation loop (an
+            // inline prompt runs a single shot, no loop). Resolution
+            // stays soft here: a name that matches neither a row nor a
+            // pulled voice falls through to run_dispatch, which owns
+            // the pull-teaching error.
+            let ensured = ensure_run_model(&model).await;
+            let model_ref: &str = ensured.as_deref().unwrap_or(&model);
+            let row = Store::open(&dirs())
+                .ok()
+                .and_then(|s| s.get_model(model_ref).ok().flatten());
+            if let Some(row) = row {
+                let model = model_ref.to_string();
+                match run_lane(&row) {
+                    RunLane::Image => {
+                        let base = ensure_daemon().await?;
+                        return image_repl(&base, &model, inline.as_deref()).await;
+                    }
+                    RunLane::Video => {
+                        let base = ensure_daemon().await?;
+                        return video_repl(&base, &model, inline.as_deref()).await;
+                    }
+                    RunLane::Text => {}
+                }
+            } else if let Some(voice) =
+                tts_voice_target(model_ref, &blazar_runtime::piper::list_voices(&dirs()))
+            {
+                let base = ensure_daemon().await?;
+                return tts_repl(&base, voice, inline.as_deref()).await;
+            }
+            let model = ensured?;
             run_dispatch(&model, &prompt, verbose, max_tokens, no_draft).await
         }
         Cmd::Bench { model } => bench(&resolve_model_cli(&model)),
@@ -1129,17 +1507,20 @@ async fn run(cmd: Cmd) -> Result<()> {
             load,
             replicas,
             cache_reuse,
-        } => tune_full(
-            &resolve_model_cli(&model),
-            search,
-            ctx,
-            spec,
-            slots,
-            ngram,
-            load,
-            replicas,
-            cache_reuse,
-        ),
+        } => {
+            tune_full(
+                &resolve_model_cli(&model),
+                search,
+                ctx,
+                spec,
+                slots,
+                ngram,
+                load,
+                replicas,
+                cache_reuse,
+            )
+            .await
+        }
         Cmd::Engine { cmd } => engine_cmd(cmd).await,
         Cmd::Lora { cmd } => lora_cmd(cmd),
         Cmd::Search {
@@ -1185,8 +1566,9 @@ async fn run(cmd: Cmd) -> Result<()> {
             tag,
             pull,
             list,
+            search,
             pin,
-        } => whisper_cmd(file.as_ref(), model, install, tag, pull, list, pin).await,
+        } => whisper_cmd(file.as_ref(), model, install, tag, pull, list, search, pin).await,
         Cmd::Tts {
             text,
             voice,
@@ -1194,6 +1576,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             tag,
             pull,
             list,
+            search,
             pin,
             out,
             speed,
@@ -1205,6 +1588,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                 tag,
                 pull,
                 list,
+                search,
                 pin,
                 out,
                 speed,
@@ -1320,6 +1704,7 @@ async fn session_cmd(cmd: SessionCmd) -> Result<()> {
 }
 
 /// One doctor check row: name, status word, detail line.
+#[derive(Debug)]
 struct Check {
     name: &'static str,
     ok: bool,
@@ -1354,12 +1739,36 @@ impl Check {
     }
     fn status_word(&self) -> &'static str {
         if !self.ok {
-            "FAIL"
+            "fail"
         } else if self.warn {
-            "WARN"
+            "warn"
         } else {
             "ok"
         }
+    }
+}
+
+/// Status word with a terminal-only ANSI accent (plain when piped or
+/// `NO_COLOR`): ok=green, warn=yellow, fail=red. Pad BEFORE coloring so
+/// escapes never skew the column width.
+fn colored_status(padded: String) -> String {
+    if !cli_colors() {
+        return padded;
+    }
+    let code = match padded.trim() {
+        "ok" => "32",
+        "warn" => "33",
+        _ => "31",
+    };
+    format!("\x1b[{code}m{padded}\x1b[0m")
+}
+
+/// Bold group/table headings on terminals only (see [`cli_colors`]).
+fn bold_heading(text: &str) -> String {
+    if cli_colors() {
+        format!("\x1b[1m{text}\x1b[0m")
+    } else {
+        text.to_string()
     }
 }
 
@@ -1380,6 +1789,7 @@ fn routed_engine_lane(
     engine_rows: &[blazar_core::EngineRow],
     name: &str,
     arch: Option<&str>,
+    diffusion: bool,
     path: &str,
 ) -> Result<String, String> {
     let Some((g_tag, g_kind)) = global else {
@@ -1401,6 +1811,7 @@ fn routed_engine_lane(
         cfg.engine_routing.mode,
         cfg.engine_routing.policy,
         pin,
+        diffusion,
         safetensors,
         quantized,
         *g_kind,
@@ -1464,15 +1875,60 @@ fn engine_arch_gap(
     }
 }
 
+/// Human label for the ENGINE cell: the engine's kind plus its version
+/// tail, stripping only the redundant `kind-` prefix when the tag
+/// carries one (`sglang-0.5.19` -> `sglang 0.5.19`; `b11147-cuda`,
+/// `master-890-74988b2`, `v0.9.3` keep the full tag as the version —
+/// the release tag IS the version). Lanes without a matching engine
+/// row ("-") keep the raw tag — it IS the identity.
+fn engine_cell_label(engine_rows: &[blazar_core::EngineRow], tag: &str) -> String {
+    let Some(row) = engine_rows.iter().find(|r| r.tag == tag) else {
+        return tag.to_string();
+    };
+    let kind = row.kind.as_str();
+    if tag == kind {
+        return kind.to_string();
+    }
+    let version = tag.strip_prefix(&format!("{kind}-")).unwrap_or(tag);
+    format!("{kind} {version}")
+}
+
+/// Serving-modality class for the CATEGORY column. Component sets are
+/// diffusion pulls (the curated family table says image vs video; an
+/// uncurated set stays "diffusion" — sets only originate from curated
+/// pulls, so the fallback is a near-impossible edge). The projector
+/// marks vision-capable VLMs, trailing-encoder archs are pipeline
+/// encoders (t5/umt5), everything else is text. Whisper STT/TTS models
+/// live in their own store and never appear in this listing.
+fn model_category(m: &blazar_core::store::ModelRow) -> &'static str {
+    if m.has_component_set() {
+        return match blazar_runtime::diffusion::family_mode(&m.repo) {
+            Some(blazar_runtime::diffusion::FamilyMode::Vid) => "video",
+            Some(blazar_runtime::diffusion::FamilyMode::Img) => "image",
+            None => "diffusion",
+        };
+    }
+    if m.mmproj_path.is_some() {
+        return "vision";
+    }
+    if m.arch.as_deref().is_some_and(|a| a.ends_with("encoder")) {
+        return "encoder";
+    }
+    "text"
+}
+
 /// Engine cell for one `list` table row: appends the dagger and records
 /// the (lane, arch) gap when the routed lane cannot load the model's
-/// GGUF arch (see [`engine_arch_gap`]).
+/// GGUF arch (see [`engine_arch_gap`]). Both the cell and the footer
+/// key carry the decorated label ([`engine_cell_label`]) — the footer
+/// receives only the map, so the human-readable name must land here.
 fn engine_cell_with_gap(
     engine_rows: &[blazar_core::EngineRow],
     engine: &str,
     m: &blazar_core::store::ModelRow,
     arch_gaps: &mut std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
 ) -> String {
+    let label = engine_cell_label(engine_rows, engine);
     match engine_arch_gap(
         engine_rows,
         engine,
@@ -1480,13 +1936,10 @@ fn engine_cell_with_gap(
         !std::path::Path::new(&m.path).is_dir(),
     ) {
         Some(missing) => {
-            arch_gaps
-                .entry(engine.to_string())
-                .or_default()
-                .insert(missing);
-            format!("{engine}\u{2020}")
+            arch_gaps.entry(label.clone()).or_default().insert(missing);
+            format!("{label}\u{2020}")
         }
-        None => engine.to_string(),
+        None => label,
     }
 }
 
@@ -1518,8 +1971,10 @@ fn print_arch_gap_footer(
         if component_files {
             println!(
                 "\u{2020} {tag} is routed for GGUF(s) with {NO_ARCH_METADATA} — \
-                 diffusion/model-component files; no installed engine serves image components \
-                 (image lane unimplemented)"
+                 diffusion/model-component files; the sdcpp lane serves them from a \
+                 component set (DiT + VAE + text encoder): install it if absent \
+                 (blazar engine install --kind sdcpp) and re-pull the model to fetch \
+                 the set"
             );
         }
     }
@@ -1550,6 +2005,12 @@ fn engine_offer_line(kind: blazar_core::engine_kind::EngineKind) -> String {
         EngineKind::LlamaCpp => {
             "llamacpp (~0.2-0.7 GiB via engine update) — the GGUF default lane".to_string()
         }
+        EngineKind::SdCpp => "sdcpp (~0.04-0.3 GiB, any GPU via Vulkan) — diffusion checkpoints: \
+             Qwen-Image-2.1/v1, FLUX.1/2-dev, Z-Image, Chroma, SDXL, SD1.5; Wan 2.1 video"
+            .to_string(),
+        EngineKind::Whisper => {
+            "whisper (~10 MiB, CPU) — audio transcription + translation (ggml models)".to_string()
+        }
     }
 }
 
@@ -1561,6 +2022,8 @@ async fn install_missing_kind(
     match kind {
         EngineKind::Sglang => engine_install_sglang(d, None).await,
         EngineKind::MistralRs => engine_install_mistralrs(d, None).await,
+        EngineKind::SdCpp => engine_install_sdcpp(d, None).await,
+        EngineKind::Whisper => engine_install_whisper(d, None).await,
         EngineKind::LlamaCpp => engine_update(d, None, false, false).await,
     }
 }
@@ -1607,15 +2070,18 @@ fn lane_state_for(d: &BlazarDirs, row: &blazar_core::store::ModelRow) -> LaneSta
                 cfg.engine_routing.mode,
                 cfg.engine_routing.policy,
                 pin,
+                row.has_component_set(),
                 safetensors,
                 row.is_quantized_safetensors(),
                 active.kind,
                 &installed,
             ) {
                 Ok(_) => LaneState::Served,
-                Err(e @ (LaneError::PinKindMissing { .. } | LaneError::FormatUnserved { .. })) => {
-                    LaneState::Missing(e.missing_kinds(cfg.engine_routing.policy), e.to_string())
-                }
+                Err(
+                    e @ (LaneError::PinKindMissing { .. }
+                    | LaneError::FormatUnserved { .. }
+                    | LaneError::DiffusionUnserved { .. }),
+                ) => LaneState::Missing(e.missing_kinds(cfg.engine_routing.policy), e.to_string()),
                 Err(e) => LaneState::Missing(Vec::new(), e.to_string()),
             }
         }
@@ -1826,9 +2292,18 @@ async fn doctor(flat: bool, json: bool) -> Result<()> {
         return Ok(());
     }
     if flat {
-        println!("{:<26} {:<5} DETAIL", "CHECK", "ST");
+        println!(
+            "{}  {:<5} DETAIL",
+            bold_heading(&format!("{:<26}", "CHECK")),
+            "ST"
+        );
         for c in &checks {
-            println!("{:<26} {:<5} {}", c.name, c.status_word(), c.detail);
+            println!(
+                "{:<26} {} {}",
+                c.name,
+                colored_status(format!("{:<5}", c.status_word())),
+                c.detail
+            );
         }
     } else {
         for group in GROUPS {
@@ -1839,11 +2314,16 @@ async fn doctor(flat: bool, json: bool) -> Result<()> {
             if rows.is_empty() {
                 continue;
             }
-            println!("{group}");
+            println!("{}", bold_heading(group));
             for c in &rows {
-                println!("  {:<24} {:<5} {}", c.name, c.status_word(), c.detail);
+                println!(
+                    "  {:<24} {} {}",
+                    c.name,
+                    colored_status(format!("{:<5}", c.status_word())),
+                    c.detail
+                );
             }
-            let ok_n = rows.iter().filter(|c| c.ok).count();
+            let ok_n = rows.iter().filter(|c| c.ok && !c.warn).count();
             let warn_n = rows.iter().filter(|c| c.warn).count();
             let fail_n = rows.iter().filter(|c| !c.ok).count();
             let mut rollup = format!("{ok_n} ok");
@@ -1851,24 +2331,36 @@ async fn doctor(flat: bool, json: bool) -> Result<()> {
                 let _ = write!(rollup, ", {warn_n} warn");
             }
             if fail_n > 0 {
-                let _ = write!(rollup, ", {fail_n} FAIL");
+                let _ = write!(rollup, ", {fail_n} fail");
             }
             println!("  ({rollup})\n");
         }
     }
-    if fails > 0 {
-        println!("{fails} failing check(s) — fix the FAIL rows above");
-    } else {
-        if warns > 0 {
-            println!("all checks pass; {warns} warning(s)");
-        } else {
-            println!("all checks pass");
-        }
+    println!("{}", doctor_footer(&checks));
+    if fails == 0 {
         for step in doctor_next_steps(&checks) {
             println!("next: {step}");
         }
     }
     Ok(())
+}
+
+/// Final doctor line: failing checks announce themselves, warnings get
+/// an honest count ("N ok, M warning(s) — no failures"), and only a
+/// truly clean board says "all checks pass". Counts instead of
+/// "all checks pass + warnings" — the old pairing contradicted itself
+/// whenever a warning existed.
+fn doctor_footer(checks: &[Check]) -> String {
+    let warns = checks.iter().filter(|c| c.warn).count();
+    let fails = checks.iter().filter(|c| !c.ok).count();
+    if fails > 0 {
+        format!("{fails} failing check(s) — fix the fail rows above")
+    } else if warns > 0 {
+        let ok_n = checks.len() - warns;
+        format!("{ok_n} ok, {warns} warning(s) — no failures")
+    } else {
+        "all checks pass".to_string()
+    }
 }
 
 /// Section order for the grouped doctor render. SYSTEM also catches
@@ -1905,6 +2397,7 @@ fn doctor_routing(d: &blazar_core::dirs::BlazarDirs) -> Vec<Check> {
             &engine_rows,
             &m.name,
             m.arch.as_deref(),
+            m.has_component_set(),
             &m.path,
         ) {
             unservable += 1;
@@ -1942,7 +2435,7 @@ fn doctor_group(name: &str) -> &'static str {
         | "whisper lane"
         | "whisper currency"
         | "whisper models" => "ENGINES",
-        "models" | "model types" => "MODELS",
+        "models" | "unmanaged files" | "model types" => "MODELS",
         "ccache" => "CHANNELS",
         "disk" | "store" | "sentinel" | "daemon uptime" | "tempdir hygiene" | "bench baseline"
         | "chunking" => "RUNTIME",
@@ -1954,6 +2447,41 @@ fn doctor_group(name: &str) -> &'static str {
 /// census, largest-model fit, and active-asset arch match (the per-arch
 /// channel makes this actionable — a wrong-arch slim asset would run
 /// but JIT or miss SASS).
+/// Parse the parent PID out of a `/proc/<pid>/stat` line. Field 4 is
+/// ppid, but `comm` (field 2) may contain spaces and parentheses, so
+/// everything before the LAST `)` is skipped first.
+fn ppid_from_stat(stat: &str) -> Option<u32> {
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// True when `pid` is a blazar-owned process (the daemon itself or any
+/// engine child descended from one). Walks `/proc` ancestry with a hop
+/// bound; unknown ancestry (pid exited mid-walk) reads as foreign — the
+/// advisory would rather name a ghost than hide a real tenant.
+fn pid_is_blazar_descendant(pid: u32) -> bool {
+    let mut cur = pid;
+    for _ in 0..16 {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{cur}/stat")) else {
+            return false;
+        };
+        let comm = stat
+            .split_once('(')
+            .and_then(|(_, rest)| rest.rsplit_once(')'))
+            .map(|(name, _)| name.to_string())
+            .unwrap_or_default();
+        if comm == "blazar" {
+            return true;
+        }
+        match ppid_from_stat(&stat) {
+            Some(1) | None => return false,
+            Some(next) if next == cur => return false,
+            Some(next) => cur = next,
+        }
+    }
+    false
+}
+
 async fn doctor_gpu(d: &BlazarDirs) -> Vec<Check> {
     let mut out = Vec::new();
     let (driver_cuda, cc) = blazar_runtime::engine::build::nvidia_gpu_facts().await;
@@ -1982,66 +2510,235 @@ async fn doctor_gpu(d: &BlazarDirs) -> Vec<Check> {
             "no GPUs visible to the probe — CPU-only serving".to_string(),
         ));
     }
-    // Fit: largest registered model vs total VRAM (weights only; KV
-    // cache needs headroom on top).
+    // Fit + co-tenants only matter when there IS a GPU; arch match
+    // applies whenever an active CUDA asset exists.
     if vram > 0 {
-        if let Ok(store) = Store::open(d) {
-            if let Ok(models) = store.list_models() {
-                if let Some(big) = models.iter().max_by_key(|m| m.bytes) {
-                    // display + MiB-fit heuristic: precision/sign loss is irrelevant here
-                    #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
-                    let fits = (big.bytes as u64 / 1_048_576) < vram as u64;
-                    #[allow(clippy::cast_precision_loss)]
-                    let gib = big.bytes as f64 / 1_073_741_824.0;
-                    #[allow(clippy::cast_precision_loss)]
-                    let vram_gib = vram as f64 / 1024.0;
-                    if fits {
-                        out.push(Check::ok(
-                            "gpu fit",
-                            format!("largest model {} ({gib:.1} GiB) fits VRAM ({vram_gib:.1} GiB) — KV cache has headroom", big.name),
-                        ));
-                    } else {
-                        out.push(Check::warn(
-                            "gpu fit",
-                            format!("largest model {} ({gib:.1} GiB) exceeds VRAM ({vram_gib:.1} GiB) — layers will offload to RAM", big.name),
-                        ));
-                    }
-                }
-            }
-        }
+        out.extend(gpu_fit_check(d, vram));
+        out.extend(gpu_cotenants_check(d));
     }
-    // Arch match: the active engine asset's -smNN vs the GPU's sm.
-    if let Ok(store) = Store::open(d) {
-        if let Ok(Some(active)) = store.active_engine() {
-            let asset = active.asset.as_str();
-            if asset.contains("cuda") {
-                let asset_sm = asset
-                    .split_once("-sm")
-                    .and_then(|(_, rest)| rest.split('-').next())
-                    .and_then(|n| n.parse::<u32>().ok());
-                match (asset_sm, sm) {
-                    (Some(a), Some(g)) if a == g => out.push(Check::ok(
-                        "gpu arch match",
-                        format!("active asset targets sm{a} == GPU sm{g} (exact SASS)"),
-                    )),
-                    (Some(a), Some(g)) if a == 120 && g > 120 => out.push(Check::ok(
-                        "gpu arch match",
-                        format!("sm120 PTX asset JITs forward to GPU sm{g}"),
-                    )),
-                    (Some(a), Some(g)) => out.push(Check::warn(
-                        "gpu arch match",
-                        format!("active asset targets sm{a} but GPU is sm{g} — `blazar engine update` should pick the right per-arch asset"),
-                    )),
-                    (None, Some(_)) => out.push(Check::ok(
-                        "gpu arch match",
-                        "active CUDA asset is multi-arch (fat) — runs on any sm".to_string(),
-                    )),
-                    _ => {}
-                }
-            }
-        }
-    }
+    out.extend(gpu_arch_match_check(d, sm));
     out
+}
+
+/// Fit: largest registered model vs total VRAM (weights only; KV
+/// cache needs headroom on top).
+fn gpu_fit_check(d: &BlazarDirs, vram: u64) -> Option<Check> {
+    let store = Store::open(d).ok()?;
+    let models = store.list_models().ok()?;
+    let big = models.iter().max_by_key(|m| m.bytes)?;
+    // MiB-fit heuristic for display; bytes are signed in the row, the
+    // cast is lossless for any real file size.
+    #[allow(clippy::cast_sign_loss)]
+    let fits = (big.bytes as u64 / 1_048_576) < vram;
+    #[allow(clippy::cast_precision_loss)]
+    let gib = big.bytes as f64 / 1_073_741_824.0;
+    #[allow(clippy::cast_precision_loss)]
+    let vram_gib = vram as f64 / 1024.0;
+    Some(if fits {
+        Check::ok(
+            "gpu fit",
+            format!("largest model {} ({gib:.1} GiB) fits VRAM ({vram_gib:.1} GiB) — KV cache has headroom", big.name),
+        )
+    } else {
+        Check::warn(
+            "gpu fit",
+            format!("largest model {} ({gib:.1} GiB) exceeds VRAM ({vram_gib:.1} GiB) — layers will offload to RAM", big.name),
+        )
+    })
+}
+
+/// What a GPU compute tenant is, relative to blazar.
+enum GpuTenantClass {
+    /// Under a live blazar server's supervision — none of our business.
+    Owned,
+    /// A blazar engine server whose supervisor died. The kernel
+    /// PDEATHSIG tie now reaps these at spawn time, but servers
+    /// orphaned before that fix (or by `kill -9` of the daemon) can
+    /// linger with GPU bytes pinned.
+    OrphanedEngine,
+    /// Not blazar at all (user apps, other runtimes).
+    Foreign,
+}
+
+/// Pure classification (testable): a live blazar descendant is owned;
+/// a non-descendant running a binary from the engines dir is an
+/// orphaned engine server — EXCEPT ggml-rpc-server, the one engines-dir
+/// binary blazar never execs (users run it by hand for `--rpc`
+/// offload; `rpc_servers` points at it), so a live one is a deliberate
+/// co-tenant, never a boot sweep target; anything else is foreign.
+fn classify_gpu_tenant(
+    process_name: &str,
+    engines_dir: &Path,
+    is_descendant: bool,
+) -> GpuTenantClass {
+    if is_descendant {
+        GpuTenantClass::Owned
+    } else if !Path::new(process_name).starts_with(engines_dir) {
+        GpuTenantClass::Foreign
+    } else {
+        match Path::new(process_name).file_name().and_then(|n| n.to_str()) {
+            Some("ggml-rpc-server") => GpuTenantClass::Foreign,
+            _ => GpuTenantClass::OrphanedEngine,
+        }
+    }
+}
+
+/// Foreign VRAM tenants (advisory): compute processes that are NOT
+/// descended from a blazar server. Co-residency is legal, but an
+/// invisible foreign holder is the #1 cause of opaque mid-job OOM —
+/// the gate estimates against free VRAM, so name what eats it.
+fn gpu_cotenants_check(d: &BlazarDirs) -> Option<Check> {
+    let tenants = blazar_runtime::probe::gpu_compute_tenants()?;
+    let engines_dir = d.engines_dir();
+    let mut orphans: Vec<String> = Vec::new();
+    let mut foreign: Vec<String> = Vec::new();
+    let mut orphan_mib = 0u64;
+    let mut held = 0u64;
+    for t in &tenants {
+        match classify_gpu_tenant(
+            &t.process_name,
+            &engines_dir,
+            pid_is_blazar_descendant(t.pid),
+        ) {
+            GpuTenantClass::Owned => {}
+            GpuTenantClass::OrphanedEngine => {
+                let name = Path::new(&t.process_name).file_name().map_or_else(
+                    || t.process_name.clone(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
+                orphans.push(format!(
+                    "{name} ({} MiB, pid {}) — kill {} to reclaim",
+                    t.used_mib, t.pid, t.pid
+                ));
+                orphan_mib += t.used_mib;
+            }
+            GpuTenantClass::Foreign => {
+                foreign.push(format!("{} ({} MiB)", t.process_name, t.used_mib));
+                held += t.used_mib;
+            }
+        }
+    }
+    if orphans.is_empty() && foreign.is_empty() {
+        return None;
+    }
+    let mut sentences: Vec<String> = Vec::new();
+    if !orphans.is_empty() {
+        sentences.push(format!(
+            "orphaned blazar engine server(s) (parent exited, ~{orphan_mib} MiB): {}",
+            orphans.join(", ")
+        ));
+    }
+    if !foreign.is_empty() {
+        sentences.push(format!(
+            "non-blazar processes hold ~{held} MiB of GPU memory: {} — \
+             blazar budgets against FREE VRAM, so these reduce what fits",
+            foreign.join(", ")
+        ));
+    }
+    Some(Check::warn("gpu co-tenants", sentences.join("; ")))
+}
+
+/// Pure selection for the boot sweep (testable without /proc): keep
+/// only the tenants that classify as orphaned engine servers. The
+/// boolean is the pre-walked `is_descendant` so tests inject ancestry
+/// instead of depending on the live process table.
+fn orphaned_gpu_tenants<'a>(
+    tenants: &[(&'a blazar_runtime::probe::GpuTenant, bool)],
+    engines_dir: &Path,
+) -> Vec<&'a blazar_runtime::probe::GpuTenant> {
+    tenants
+        .iter()
+        .filter(|(t, is_descendant)| {
+            matches!(
+                classify_gpu_tenant(&t.process_name, engines_dir, *is_descendant),
+                GpuTenantClass::OrphanedEngine
+            )
+        })
+        .map(|(t, _)| *t)
+        .collect()
+}
+
+/// Boot preflight (2/2): reclaim VRAM from engine servers whose
+/// supervisor died (pre-PDEATHSIG orphans, or a `kill -9` that raced
+/// the tie). SIGTERM — the same graceful signal the kernel tie sends —
+/// after re-verifying the exe still lives in the engines dir so a
+/// recycled pid can never be hit. Best-effort: failures log, boot
+/// continues. Unix-only: the ancestry check needs /proc.
+#[cfg(unix)]
+#[allow(unsafe_code)] // one kill(2) arm, pid re-verified via /proc/<pid>/exe first
+fn sweep_orphaned_gpu_engines(d: &BlazarDirs) {
+    let Some(tenants) = blazar_runtime::probe::gpu_compute_tenants() else {
+        return;
+    };
+    let engines_dir = std::fs::canonicalize(d.engines_dir()).unwrap_or_else(|_| d.engines_dir());
+    let candidates: Vec<(&_, bool)> = tenants
+        .iter()
+        .map(|t| (t, pid_is_blazar_descendant(t.pid)))
+        .collect();
+    let orphaned = orphaned_gpu_tenants(&candidates, &engines_dir);
+    let mut reaped: Vec<String> = Vec::new();
+    let mut mib = 0u64;
+    for t in orphaned {
+        // Pid-recycling guard: the classification snapshot can be stale
+        // by one syscall — confirm the exe is still ours before the
+        // irreversible step.
+        let Ok(exe) = std::fs::read_link(format!("/proc/{}/exe", t.pid)) else {
+            continue;
+        };
+        if !exe.starts_with(&engines_dir) {
+            continue;
+        }
+        if unsafe { libc::kill(t.pid as libc::pid_t, libc::SIGTERM) } == 0 {
+            reaped.push(format!(
+                "{} (pid {}, {} MiB)",
+                t.process_name, t.pid, t.used_mib
+            ));
+            mib += t.used_mib;
+        }
+    }
+    if !reaped.is_empty() {
+        println!(
+            "preflight: SIGTERM to {} orphaned engine server(s) holding ~{mib} MiB of VRAM: {}",
+            reaped.len(),
+            reaped.join(", ")
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn sweep_orphaned_gpu_engines(_d: &BlazarDirs) {}
+
+/// Arch match: the active engine asset's -smNN vs the GPU's sm.
+fn gpu_arch_match_check(d: &BlazarDirs, sm: Option<u32>) -> Option<Check> {
+    let store = Store::open(d).ok()?;
+    let active = store.active_engine().ok()??;
+    let asset = active.asset.as_str();
+    if !asset.contains("cuda") {
+        return None;
+    }
+    let asset_sm = asset
+        .split_once("-sm")
+        .and_then(|(_, rest)| rest.split('-').next())
+        .and_then(|n| n.parse::<u32>().ok());
+    Some(match (asset_sm, sm) {
+        (Some(a), Some(g)) if a == g => Check::ok(
+            "gpu arch match",
+            format!("active asset targets sm{a} == GPU sm{g} (exact SASS)"),
+        ),
+        (Some(a), Some(g)) if a == 120 && g > 120 => Check::ok(
+            "gpu arch match",
+            format!("sm120 PTX asset JITs forward to GPU sm{g}"),
+        ),
+        (Some(a), Some(g)) => Check::warn(
+            "gpu arch match",
+            format!("active asset targets sm{a} but GPU is sm{g} — `blazar engine update` should pick the right per-arch asset"),
+        ),
+        (None, Some(_)) => Check::ok(
+            "gpu arch match",
+            "active CUDA asset is multi-arch (fat) — runs on any sm".to_string(),
+        ),
+        _ => return None,
+    })
 }
 
 /// Recursive on-disk size of an engine directory (tarball included
@@ -2075,6 +2772,8 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
         ("llamacpp", "inventory llamacpp"),
         ("mistralrs", "inventory mistralrs"),
         ("sglang", "inventory sglang"),
+        ("sdcpp", "inventory sdcpp"),
+        ("whisper", "inventory whisper"),
     ] {
         let rows: Vec<&blazar_core::store::EngineRow> =
             engines.iter().filter(|e| e.kind.as_str() == kind).collect();
@@ -2111,11 +2810,41 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
     // on top; prune runs on the next install).
     let keep = blazar_runtime::engine::KEEP_TAGS;
     let mut over: Vec<String> = Vec::new();
-    for kind in ["llamacpp", "mistralrs", "sglang"] {
+    for kind in ["llamacpp", "mistralrs", "sglang", "sdcpp", "whisper"] {
         let n = engines.iter().filter(|e| e.kind.as_str() == kind).count();
         if n > keep {
             over.push(format!("{kind}: {n} > {keep}"));
         }
+    }
+    // Row-less dirs: invisible to the counts above yet still on disk
+    // (interrupted installs, pre-rollback upgrades). Advisory only —
+    // `blazar engine prune` reclaims them. Each dir is size-annotated
+    // so the reclaim teaching says how much is at stake; sorted for a
+    // deterministic listing (read_dir order is filesystem whim).
+    let tags: std::collections::HashSet<&str> = engines.iter().map(|e| e.tag.as_str()).collect();
+    let orphaned: Vec<String> = std::fs::read_dir(d.engines_dir())
+        .map(|rd| {
+            let mut dirs: Vec<(String, u64)> = rd
+                .filter_map(Result::ok)
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| !tags.contains(name.as_str()))
+                .map(|name| {
+                    let bytes = dir_bytes_deep(&d.engines_dir().join(&name));
+                    (name, bytes)
+                })
+                .collect();
+            dirs.sort_by(|a, b| a.0.cmp(&b.0));
+            dirs.into_iter()
+                .map(|(name, bytes)| format!("{name} ({})", humansize(bytes.cast_signed())))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !orphaned.is_empty() {
+        over.push(format!(
+            "orphan dirs (no store row): {}",
+            orphaned.join(", ")
+        ));
     }
     if over.is_empty() {
         out.push(Check::ok(
@@ -2347,6 +3076,39 @@ mod doctor_tests {
             GROUPS,
             ["SYSTEM", "GPU", "ENGINES", "MODELS", "CHANNELS", "RUNTIME"]
         );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__whisper_pin_verdict__unpinned_clears_when_current_and_names_the_lane() {
+        // No pin file and no legacy tree under these dirs: the unpinned
+        // verdict path, with a lane-aware update command.
+        let dirs = BlazarDirs {
+            config_dir: std::env::temp_dir().join("blazar-doctor-test-cfg"),
+            data_dir: std::env::temp_dir().join("blazar-doctor-test-data"),
+        };
+        let ok = whisper_pin_verdict(
+            &dirs,
+            "b5130",
+            "b5130",
+            "blazar engine update --kind whisper",
+        );
+        assert!(ok.ok, "installed == latest clears the warning");
+        assert!(ok.detail.contains("up to date (b5130)"), "{}", ok.detail);
+
+        let warn = whisper_pin_verdict(
+            &dirs,
+            "b5130",
+            "b5131",
+            "blazar engine update --kind whisper",
+        );
+        assert!(warn.warn, "newer upstream still warns");
+        assert!(
+            warn.detail.contains("blazar engine update --kind whisper"),
+            "hint names the lane that updates the serving binary: {}",
+            warn.detail
+        );
+        assert!(warn.detail.contains("(running: b5130)"), "{}", warn.detail);
     }
 }
 
@@ -2713,48 +3475,72 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
     // Install-time (manifest) GPU names — what auto-pick derives from.
     let mut frozen_gpu_names: Vec<String> = Vec::new();
     match local_engine_manager(d) {
-        Ok(mgr) => match mgr.active_manifest() {
-            Ok(Some(m)) => {
-                active_tag = Some(m.tag.clone());
-                frozen_gpu_names = m.devices.iter().map(|dev| dev.name.clone()).collect();
-                checks.push(Check::ok(
-                    "engine",
-                    format!(
-                        "{} active ({} device{}, {} flags) at {}",
-                        m.tag,
-                        m.devices.len(),
-                        if m.devices.len() == 1 { "" } else { "s" },
-                        m.flags.len(),
-                        m.server_path
-                    ),
-                ));
-                let hw = blazar_runtime::probe_hardware(Some(&m));
-                let note = format!(
-                    "RAM {} GiB, VRAM {} MiB across {} GPU{}",
-                    hw.total_ram_mib / 1024,
-                    hw.total_vram_mib(),
-                    hw.gpus.len(),
-                    if hw.gpus.len() == 1 { "" } else { "s" },
-                );
-                if hw.total_vram_mib() == 0 {
-                    checks.push(Check::warn(
-                        "hardware",
-                        format!("{note} — CPU-only inference; expect token/s in the single digits"),
+        Ok(mgr) => {
+            match mgr.active_manifest() {
+                Ok(Some(m)) => {
+                    active_tag = Some(m.tag.clone());
+                    frozen_gpu_names = m.devices.iter().map(|dev| dev.name.clone()).collect();
+                    checks.push(Check::ok(
+                        "engine",
+                        format!(
+                            "{} active ({} device{}, {} flags) at {}",
+                            m.tag,
+                            m.devices.len(),
+                            if m.devices.len() == 1 { "" } else { "s" },
+                            m.flags.len(),
+                            m.server_path
+                        ),
                     ));
-                } else {
-                    checks.push(Check::ok("hardware", note));
+                    let hw = blazar_runtime::probe_hardware(Some(&m));
+                    let note = format!(
+                        "RAM {} GiB, VRAM {} MiB across {} GPU{}",
+                        hw.total_ram_mib / 1024,
+                        hw.total_vram_mib(),
+                        hw.gpus.len(),
+                        if hw.gpus.len() == 1 { "" } else { "s" },
+                    );
+                    if hw.total_vram_mib() == 0 {
+                        checks.push(Check::warn(
+                            "hardware",
+                            format!(
+                                "{note} — CPU-only inference; expect token/s in the single digits"
+                            ),
+                        ));
+                    } else {
+                        checks.push(Check::ok("hardware", note));
+                    }
+                    checks.push(engine_smoke_check(&m.server_path));
                 }
-                checks.push(engine_smoke_check(&m.server_path));
+                Ok(None) => checks.push(Check::fail(
+                    "engine",
+                    "none installed — run: blazar engine update",
+                )),
+                Err(e) => checks.push(Check::fail(
+                    "engine",
+                    format!("{e} — run: blazar engine update"),
+                )),
             }
-            Ok(None) => checks.push(Check::fail(
+            // Ghost rows: the db row outlived its engine dir (manual
+            // deletion, disk cleanup). Spawn/verify cannot see these —
+            // name them with the heal command instead of failing silently
+            // doctor run after doctor run.
+            for (tag, kind, path) in mgr.ghost_engine_rows() {
+                let heal = if tag == blazar_runtime::engine::LOCAL_TAG {
+                    "point BLAZAR_ENGINE_PATH at a build, or `blazar engine use <tag>` on a serving engine".to_string()
+                } else {
+                    format!("blazar engine update --kind {kind}")
+                };
+                let whisper_note = if matches!(kind, EngineKind::Whisper) {
+                    " (audio transcription still serves from the legacy whisper tree)"
+                } else {
+                    ""
+                };
+                checks.push(Check::warn(
                 "engine",
-                "none installed — run: blazar engine update",
-            )),
-            Err(e) => checks.push(Check::fail(
-                "engine",
-                format!("{e} — run: blazar engine update"),
-            )),
-        },
+                format!("row {tag} ({kind}) has no engine binary at {path} — heal: {heal}{whisper_note}"),
+            ));
+            }
+        }
         Err(e) => checks.push(Check::fail("engine", format!("{e}"))),
     }
     // The engines row carries the kind (the manifest does not — single
@@ -2807,19 +3593,57 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
         }
         return checks;
     }
-    // sglang is a pinned pip lane (no rolling channel to survey): teach
-    // the version in place and the one-command refresh path instead of
-    // nagging with the llama.cpp channel.
-    if active_kind == Some(EngineKind::Sglang) {
-        let active = active_tag.as_deref().unwrap_or("?");
-        checks.push(Check::ok(
-            "engine currency",
-            format!(
-                "{active} (sglang pip lane, version pinned at install) — update with: \
-                 blazar engine update --kind sglang [version]"
-            ),
-        ));
-        return checks;
+    // Non-llamacpp active lanes have no b-tag channel to survey against:
+    // teach the lane's own refresh command instead of keying the llama.cpp
+    // channel checks (currency, CUDA-asset hint) on a foreign tag/asset.
+    // (validate.py's llamacpp channel survey skips the same way when the
+    // active engine is not llamacpp.)
+    match active_kind {
+        Some(EngineKind::Sglang) => {
+            let active = active_tag.as_deref().unwrap_or("?");
+            checks.push(Check::ok(
+                "engine currency",
+                format!(
+                    "{active} (sglang pip lane, version pinned at install) — update with: \
+                     blazar engine update --kind sglang [version]"
+                ),
+            ));
+            return checks;
+        }
+        Some(EngineKind::MistralRs) => {
+            let active = active_tag.as_deref().unwrap_or("?");
+            checks.push(Check::ok(
+                "engine currency",
+                format!(
+                    "{active} (mistral.rs prebuilt lane) — update with: \
+                     blazar engine update --kind mistralrs"
+                ),
+            ));
+            return checks;
+        }
+        Some(EngineKind::SdCpp) => {
+            let active = active_tag.as_deref().unwrap_or("?");
+            checks.push(Check::ok(
+                "engine currency",
+                format!(
+                    "{active} (sdcpp prebuilt lane) — update with: \
+                     blazar engine update --kind sdcpp"
+                ),
+            ));
+            return checks;
+        }
+        Some(EngineKind::Whisper) => {
+            let active = active_tag.as_deref().unwrap_or("?");
+            checks.push(Check::ok(
+                "engine currency",
+                format!(
+                    "{active} (whisper prebuilt lane, lazy audio serving) — update with: \
+                     blazar engine update --kind whisper"
+                ),
+            ));
+            return checks;
+        }
+        _ => {}
     }
     let mut currency: Option<Check> = None;
     let mut marker_usable = false;
@@ -3287,25 +4111,36 @@ async fn doctor_app_currency() -> Vec<Check> {
     }
 }
 
-/// Whisper.cpp currency: installs are versioned by tag dir under
-/// `data/whisper/bin/<tag>/`; compare the newest against the latest
-/// upstream release (`WHISPER_REPO`). Optional component — not installed
-/// means no row (same policy as remotes). Warn-only; `blazar whisper
-/// --install` stays a human action.
+/// Whisper.cpp currency: engines-table row (`blazar engine install
+/// --kind whisper`) or the legacy versioned tree under
+/// `data/whisper/bin/<tag>/`; compare the resolved install against the
+/// latest upstream release (`WHISPER_REPO`). Optional component — not
+/// installed means no row (same policy as remotes). Warn-only; installs
+/// stay a human action.
 async fn doctor_whisper_currency(d: &BlazarDirs) -> Vec<Check> {
-    let Some((_, tag_dir)) = blazar_runtime::whisper::server_bin(d) else {
+    if blazar_runtime::whisper::server_bin(d).is_none() {
         // Optional lane absent: say so instead of silently omitting the
         // row — doctor is where users discover the lane exists (observed
         // live: all-green doctor while transcription had no backend).
         return vec![Check::warn(
             "whisper lane",
-            "not installed — optional: `blazar whisper --install` enables \
-             local /v1/audio/transcriptions",
+            "not installed — optional: `blazar engine install --kind whisper` \
+             (legacy: `blazar whisper --install`) enables local \
+             /v1/audio/transcriptions + /v1/audio/translations",
         )];
+    }
+    // The verdict compares TAGS, never the binary's lib dir: the extract
+    // subdir name leaked in here once and the warning could not clear
+    // through any update (live: "running: whisper-bin-ubuntu-x64").
+    let installed = blazar_runtime::whisper::installed_tag(d).unwrap_or_else(|| "?".into());
+    // Update hints name the lane that actually updates the serving
+    // binary: while an engines row backs the lane, the legacy
+    // `whisper --install` tree is never picked by server_bin.
+    let action = if blazar_runtime::whisper::engines_lane_installed(d) {
+        "blazar engine update --kind whisper"
+    } else {
+        "blazar whisper --install"
     };
-    let installed = tag_dir
-        .file_name()
-        .map_or_else(|| "?".into(), |t| t.to_string_lossy().into_owned());
     let token = std::env::var("GH_TOKEN")
         .or_else(|_| std::env::var("GITHUB_TOKEN"))
         .ok();
@@ -3325,7 +4160,7 @@ async fn doctor_whisper_currency(d: &BlazarDirs) -> Vec<Check> {
     )
     .await;
     match fetched {
-        Ok(Ok(latest)) => vec![whisper_pin_verdict(d, &installed, &latest)],
+        Ok(Ok(latest)) => vec![whisper_pin_verdict(d, &installed, &latest, action)],
         Ok(Err(e)) => vec![Check::warn(
             "whisper currency",
             format!("check failed ({e:#}) — offline? set GH_TOKEN if rate limited"),
@@ -3339,8 +4174,9 @@ async fn doctor_whisper_currency(d: &BlazarDirs) -> Vec<Check> {
 
 /// Pinned-whisper currency verdict (pure): deliberate pin named as such —
 /// plain --install silently unpins, so updates point at the
-/// pin-preserving --tag form.
-fn whisper_pin_verdict(d: &BlazarDirs, installed: &str, latest: &str) -> Check {
+/// pin-preserving --tag form. `action` is the lane-aware update command
+/// for the unpinned verdict (pins are a legacy-tree concept).
+fn whisper_pin_verdict(d: &BlazarDirs, installed: &str, latest: &str, action: &str) -> Check {
     match blazar_runtime::whisper::pinned_tag(d) {
         Some(pin) if pin == latest => {
             Check::ok("whisper currency", format!("pinned to {pin} (up to date)"))
@@ -3363,12 +4199,7 @@ fn whisper_pin_verdict(d: &BlazarDirs, installed: &str, latest: &str) -> Check {
                 )
             }
         }
-        None => version_currency_verdict(
-            "whisper currency",
-            installed,
-            latest,
-            "blazar whisper --install",
-        ),
+        None => version_currency_verdict("whisper currency", installed, latest, action),
     }
 }
 
@@ -3672,8 +4503,68 @@ fn doctor_sentinel(d: &BlazarDirs) -> Vec<Check> {
 /// inode), so teaching "delete the orphans" without the twin split
 /// would promise disk back that never comes.
 struct OrphanReport {
-    orphans: Vec<String>,
+    orphans: Vec<OrphanFile>,
     twins: usize,
+}
+
+/// One unreferenced GGUF on disk: name for display, bytes so the
+/// "delete to reclaim" teaching can say how much is actually at stake.
+/// `twin_of` names the registered file with identical content, when
+/// one exists — those are manual-download duplicates, not data.
+#[derive(Debug)]
+struct OrphanFile {
+    name: String,
+    bytes: u64,
+    twin_of: Option<String>,
+}
+
+/// Content hash for orphan-twin detection (advisory display only; the
+/// store keeps authoritative hashes — this is a read-only comparison
+/// against files the rows already own).
+fn file_sha256(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read as _;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = f.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+/// Size-indexed referenced files with model attribution, for
+/// content-twin detection: an orphan whose bytes hash-identical to a
+/// registered file is manual-download debris — safe to delete, and
+/// saying so changes the advice from "register or reclaim" to just
+/// "reclaim". Values: (canonical path, model name, file leaf).
+fn referenced_by_size(
+    models: &[blazar_core::store::ModelRow],
+) -> std::collections::HashMap<u64, Vec<(std::path::PathBuf, String, String)>> {
+    let mut out: std::collections::HashMap<u64, Vec<(std::path::PathBuf, String, String)>> =
+        std::collections::HashMap::new();
+    for m in models {
+        let sources =
+            std::iter::once(&m.path).chain(m.mmproj_path.iter().filter(|s| !s.is_empty()));
+        for source in sources {
+            let canon = std::fs::canonicalize(source).unwrap_or_else(|_| PathBuf::from(source));
+            let Ok(md) = std::fs::metadata(&canon) else {
+                continue;
+            };
+            let leaf = canon.file_name().map_or_else(
+                || canon.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            out.entry(md.len())
+                .or_default()
+                .push((canon, m.name.clone(), leaf));
+        }
+    }
+    out
 }
 
 /// Pure dir-vs-rows diff (testable; no store access). `dir` missing or
@@ -3699,6 +4590,8 @@ fn orphan_scan(models: &[blazar_core::store::ModelRow], dir: &Path) -> OrphanRep
             .map(|m| (m.dev(), m.ino()))
             .collect()
     };
+    // Content-twin detection index (see `referenced_by_size`).
+    let referenced_by_size = referenced_by_size(models);
     let mut out = OrphanReport {
         orphans: Vec::new(),
         twins: 0,
@@ -3733,14 +4626,89 @@ fn orphan_scan(models: &[blazar_core::store::ModelRow], dir: &Path) -> OrphanRep
         }
         // Windows: no std inode access — every unreferenced GGUF is
         // reported as an orphan (twin split unavailable, still correct
-        // about which files blazar does not manage).
-        out.orphans.push(path.file_name().map_or_else(
-            || path.display().to_string(),
-            |n| n.to_string_lossy().into_owned(),
-        ));
+        // about which files blazar does not manage). Size comes from
+        // the same entry we just stat'd; unreadable metadata reports 0
+        // (the name still teaches, a wrong size would mislead).
+        let name = || {
+            path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            )
+        };
+        let bytes = entry.metadata().map_or(0, |m| m.len());
+        // Content twin: same size as a registered file AND same sha256
+        // (the size gate keeps hashing off the hot path; the hash gate
+        // keeps same-size siblings from being libelled as duplicates).
+        let mut twin_of = None;
+        if bytes > 0 {
+            if let Some(cands) = referenced_by_size.get(&bytes) {
+                if let Some(orphan_hash) = file_sha256(&path) {
+                    if let Some((_, model, leaf)) = cands
+                        .iter()
+                        .find(|(c, _, _)| file_sha256(c).as_deref() == Some(orphan_hash.as_str()))
+                    {
+                        twin_of = Some(format!("{leaf} — linked to {model}"));
+                    }
+                }
+            }
+        }
+        out.orphans.push(OrphanFile {
+            name: name(),
+            bytes,
+            twin_of,
+        });
     }
-    out.orphans.sort();
+    out.orphans.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// Disk-truth check per artifact lane. GGUF rows get the full metadata
+/// parse (the GGUF header IS the metadata). Every other lane gets the
+/// existence check its format honestly supports: single-file rows
+/// (safetensors weights, diffusion `DiT` files) must exist non-empty;
+/// HF-style dirs must hold at least one safetensors shard or a
+/// diffusers `model_index.json` (diffusers layouts keep the shards in
+/// subdirs, so a root-only scan would miss them); diffusion rows
+/// additionally need every recorded component on disk. Running the
+/// GGUF parser on these rows is what produced the old false
+/// "metadata unreadable (re-pull or rm)" warnings on healthy pulls.
+fn model_artifact_readable(m: &blazar_core::store::ModelRow) -> bool {
+    // Diffusion rows pair the path (the DiT) with component files
+    // (VAE, text encoders); the DiT alone is unservable, so every
+    // lane checks its components before the artifact-shape check.
+    let components_ok = m
+        .components
+        .iter()
+        .all(|c| std::path::Path::new(&c.path).exists());
+    let path = std::path::Path::new(&m.path);
+    if path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+    {
+        // LLM-lane GGUFs carry their architecture in metadata. DiT
+        // (diffusion) exports legitimately ship zero metadata KVs — the
+        // architecture comes from the row's component set — so component
+        // rows get the structural container check instead.
+        return if m.components.is_empty() {
+            blazar_core::read_metadata_file(path).is_ok()
+        } else {
+            components_ok && blazar_core::is_gguf_container(path)
+        };
+    }
+    if path.is_file() {
+        return components_ok && path.metadata().is_ok_and(|md| md.len() > 0);
+    }
+    if !path.is_dir() {
+        return false;
+    }
+    let has_payload = std::fs::read_dir(path).is_ok_and(|entries| {
+        entries.filter_map(Result::ok).any(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.ends_with(".safetensors") || name == "model_index.json"
+        })
+    });
+    has_payload && components_ok
 }
 
 fn doctor_models(d: &BlazarDirs) -> Vec<Check> {
@@ -3752,7 +4720,7 @@ fn doctor_models(d: &BlazarDirs) -> Vec<Check> {
     };
     let bad: Vec<String> = models
         .iter()
-        .filter(|m| blazar_core::read_metadata_file(std::path::Path::new(&m.path)).is_err())
+        .filter(|m| !model_artifact_readable(m))
         .map(|m| m.name.clone())
         .collect();
     let report = orphan_scan(&models, &d.models_dir());
@@ -3762,7 +4730,18 @@ fn doctor_models(d: &BlazarDirs) -> Vec<Check> {
         use std::fmt::Write as _;
         let mut s = String::new();
         if !r.orphans.is_empty() {
-            let shown: Vec<&str> = r.orphans.iter().take(3).map(String::as_str).collect();
+            let shown: Vec<String> = r
+                .orphans
+                .iter()
+                .take(3)
+                .map(|o| {
+                    let mut s = format!("{} ({})", o.name, humansize(o.bytes.cast_signed()));
+                    if let Some(t) = o.twin_of.as_ref() {
+                        let _ = write!(s, " [byte-identical to {t} — safe to delete]");
+                    }
+                    s
+                })
+                .collect();
             let more = r.orphans.len().saturating_sub(shown.len());
             let extra = if more > 0 {
                 format!(" (+{more} more)")
@@ -3789,24 +4768,32 @@ fn doctor_models(d: &BlazarDirs) -> Vec<Check> {
         s
     };
     let suffix = orphan_suffix(&report);
-    if bad.is_empty() && suffix.is_empty() {
-        vec![Check::ok(
+    // Two separate checks instead of one mega-detail: unreadable rows
+    // and unmanaged files are different problems with different fixes,
+    // and a single line wrapping three issues drowned all of them.
+    let mut out = Vec::new();
+    if bad.is_empty() {
+        out.push(Check::ok(
             "models",
-            format!("{} pulled, all parse", models.len()),
-        )]
+            format!("{} pulled, all readable", models.len()),
+        ));
     } else {
-        let mut detail = if bad.is_empty() {
-            format!("{} pulled, all parse", models.len())
-        } else {
+        out.push(Check::warn(
+            "models",
             format!(
-                "{} pulled; metadata unreadable: {} (re-pull or rm)",
+                "{} pulled; unreadable or incomplete: {} (re-pull or rm)",
                 models.len(),
                 bad.join(", ")
-            )
-        };
-        detail.push_str(&suffix);
-        vec![Check::warn("models", detail)]
+            ),
+        ));
     }
+    if !suffix.is_empty() {
+        out.push(Check::warn(
+            "unmanaged files",
+            suffix.trim_start_matches(';').trim().to_string(),
+        ));
+    }
+    out
 }
 
 /// One audited libc call (mirrors the runtime's signal-0 precedent):
@@ -3863,7 +4850,7 @@ async fn serve() -> Result<()> {
         Ok(lock) => lock,
         Err(e) if e.downcast_ref::<blazar_runtime::LockHeld>().is_some() => {
             eprintln!(
-                "blazar: {e:#} — another daemon owns the lock; if this is wrong, remove {}",
+                "blazar: {e:#} — if this is wrong, remove {}",
                 d.run_dir().join("blazar.pid").display()
             );
             std::process::exit(blazar_gateway::EXIT_BIND_CONFLICT);
@@ -3895,8 +4882,11 @@ async fn serve() -> Result<()> {
         );
     }
     for (what, why) in &reconcile.skipped {
-        println!("WARNING: preflight skipped {what}: {why}");
+        println!("warning: preflight skipped {what}: {why}");
     }
+    // Boot preflight (2/2): reap engine servers orphaned by a dead
+    // supervisor so their VRAM is free for this run.
+    sweep_orphaned_gpu_engines(&d);
     // BLAZAR_ENGINE_PATH: register/refresh the local build and prefer it
     // for this run (plan C: pseudo-tag "local", never pruned).
     let local_override = std::env::var("BLAZAR_ENGINE_PATH").ok();
@@ -3906,6 +4896,13 @@ async fn serve() -> Result<()> {
         let row = mgr.register_local(&p, &cfg.engine_env)?;
         mgr.use_tag(&row.tag)?;
         println!("BLAZAR_ENGINE_PATH: engine local active ({})", p.display());
+    }
+    // Self-heal the zero-active state (update interrupted before its
+    // activation step): an installed serving engine must never sit
+    // unusable behind one stale flag — activate the best candidate and
+    // say so. Runs for router and non-router paths alike.
+    if let Some(tag) = store.heal_active_engine()? {
+        println!("serve: no active engine row found; activated newest serving engine {tag}");
     }
     // Router mode is a llama-server feature (`--models-preset`): serve
     // with the llamacpp lane even when another kind holds the active
@@ -3943,9 +4940,9 @@ async fn serve() -> Result<()> {
         engine_row.ok_or_else(|| anyhow!("no engine installed; run: blazar engine update"))?;
     let mut manifest: blazar_runtime::Manifest = serde_json::from_str(&engine_row.manifest)
         .with_context(|| format!("decode engine manifest {}", engine_row.tag))?;
-    // Rows installed under a different data dir still resolve: adopt the
-    // live engines root when the recorded absolute path is gone.
-    manifest.re_root_server_path(&d.engines_dir());
+    // Relative rows (storage invariant) resolve against the live data
+    // dir; legacy absolute rows heal via the same anchor.
+    manifest.anchor_server_path(&d.data_dir);
     println!(
         "engine: {} (build {})",
         engine_row.tag, manifest.build_number
@@ -3995,6 +4992,19 @@ async fn serve() -> Result<()> {
         }
         blazar_core::engine_kind::EngineKind::LlamaCpp => {
             Arc::new(LlamaCppEngine::with_env(manifest, engine_env))
+        }
+        blazar_core::engine_kind::EngineKind::SdCpp => {
+            Arc::new(blazar_runtime::SdCppEngine::with_env(manifest, engine_env))
+        }
+        // Defense: a lazy audio lane can never back the supervisor (it
+        // has no model-serving surface). Installs never activate it, so
+        // reaching this arm means a hand-edited store — name recovery.
+        blazar_core::engine_kind::EngineKind::Whisper => {
+            anyhow::bail!(
+                "the active engine row is the whisper audio lane — it serves only \
+                 POST /v1/audio/transcriptions and cannot back model serving; run \
+                 `blazar engine use <tag>` on a serving engine (see `blazar engine list`)"
+            )
         }
     };
     let bus = EventBus::default();
@@ -4252,13 +5262,13 @@ async fn pull_model(target: &str, force: bool) -> Result<(blazar_core::store::Mo
             warning: Some(w), ..
         } = ev
         {
-            println!("WARNING: {w}");
+            println!("warning: {w}");
         }
     }
     // Structural GGUF lint (H4): warn-only, explains degraded sizing.
     if let Ok(m) = blazar_core::read_metadata_file(std::path::Path::new(&row.path)) {
         for w in m.lint() {
-            println!("WARNING: {w}");
+            println!("warning: {w}");
         }
     }
     Ok((row, already_present))
@@ -4346,7 +5356,7 @@ fn import(
         .map_err(|e| anyhow!("not a readable GGUF ({}): {e}", path.display()))?;
     // Structural GGUF lint (H4): warn-only, explains degraded sizing.
     for w in meta.lint() {
-        println!("WARNING: {w}");
+        println!("warning: {w}");
     }
     let file_name = path
         .file_name()
@@ -4407,6 +5417,7 @@ fn import(
         bytes,
         sha256: None,
         mmproj_path: mmproj_dest.map(|p| p.display().to_string()),
+        components: vec![],
         shards: 1,
         arch: Some(meta.architecture.clone()),
         params: Some(blazar_runtime::hf::est_params(size, &derived_quant)),
@@ -4474,9 +5485,9 @@ fn trunc_ellipsis(s: &str, cap: usize) -> String {
 /// truncated; ARCH caps with an ellipsis; SIZE and CTX right-align; the
 /// last column (ENGINE) is uncapped. The storage path is deliberately
 /// not shown — `blazar show <model>` carries it.
-fn render_list_table(header: [&str; 8], rows: &[[String; 8]]) -> String {
+fn render_list_table(header: [&str; 9], rows: &[[String; 9]]) -> String {
     const ARCH_CAP: usize = 18;
-    let mut table: Vec<[String; 8]> = vec![header.map(str::to_string)];
+    let mut table: Vec<[String; 9]> = vec![header.map(str::to_string)];
     for r in rows {
         table.push([
             r[0].clone(),
@@ -4487,6 +5498,7 @@ fn render_list_table(header: [&str; 8], rows: &[[String; 8]]) -> String {
             r[5].clone(),
             r[6].clone(),
             r[7].clone(),
+            r[8].clone(),
         ]);
     }
     let width = |col: usize| {
@@ -4496,7 +5508,7 @@ fn render_list_table(header: [&str; 8], rows: &[[String; 8]]) -> String {
             .max()
             .unwrap_or(0)
     };
-    let (name_w, quant_w, size_w, vision_w, arch_w, ctx_w, type_w) = (
+    let (name_w, quant_w, size_w, vision_w, arch_w, ctx_w, type_w, cat_w) = (
         width(0),
         width(1),
         width(2),
@@ -4504,6 +5516,7 @@ fn render_list_table(header: [&str; 8], rows: &[[String; 8]]) -> String {
         width(4),
         width(5),
         width(6),
+        width(7),
     );
 
     let mut out = String::new();
@@ -4511,7 +5524,7 @@ fn render_list_table(header: [&str; 8], rows: &[[String; 8]]) -> String {
         // Trimmed line end: the last column is uncapped, so padding
         // would only leave trailing blanks on copied output.
         let mut line = format!(
-            "{:<name_w$}  {:<quant_w$}  {:>size_w$}  {:<vision_w$}  {:<arch_w$}  {:>ctx_w$}  {:<type_w$}  {}",
+            "{:<name_w$}  {:<quant_w$}  {:>size_w$}  {:<vision_w$}  {:<arch_w$}  {:>ctx_w$}  {:<type_w$}  {:<cat_w$}  {}",
             cells[0],
             cells[1],
             cells[2],
@@ -4520,19 +5533,110 @@ fn render_list_table(header: [&str; 8], rows: &[[String; 8]]) -> String {
             cells[5],
             cells[6],
             cells[7],
+            cells[8],
             name_w = name_w,
             quant_w = quant_w,
             size_w = size_w,
             vision_w = vision_w,
             arch_w = arch_w,
             ctx_w = ctx_w,
-            type_w = type_w
+            type_w = type_w,
+            cat_w = cat_w
         );
         line.truncate(line.trim_end().len());
         out.push_str(&line);
         out.push('\n');
     }
     out.trim_end().to_string()
+}
+
+/// `--color` policy: `Auto` keeps the terminal detection in
+/// [`cli_colors`], `Always`/`Never` are explicit user overrides
+/// (`Always` deliberately beats `NO_COLOR` — the user just asked).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+enum ColorWhen {
+    Auto,
+    Always,
+    Never,
+}
+
+static COLOR_OVERRIDE: std::sync::OnceLock<ColorWhen> = std::sync::OnceLock::new();
+
+fn set_color_override(when: ColorWhen) {
+    let _ = COLOR_OVERRIDE.set(when);
+}
+
+/// ANSI accents for interactive use only: piped/redirected output stays
+/// byte-stable for scripts, and `NO_COLOR` / `TERM=dumb` disable the
+/// codes. An explicit `--color` flag overrides all of it.
+fn cli_colors() -> bool {
+    use std::io::IsTerminal as _;
+    match COLOR_OVERRIDE.get() {
+        Some(ColorWhen::Always) => true,
+        Some(ColorWhen::Never) => false,
+        _ => {
+            std::io::stdout().is_terminal()
+                && std::env::var_os("NO_COLOR").is_none()
+                && std::env::var("TERM")
+                    .as_deref()
+                    .is_ok_and(|t| !t.eq_ignore_ascii_case("dumb"))
+        }
+    }
+}
+
+/// Adaptive-width table shared by `search` and `engine list` — the same
+/// sizing philosophy as [`render_list_table`]: every column sizes to its
+/// widest cell (header included) so a value can never bleed into the
+/// next column; `right` indexes right-align (numbers line up on their
+/// least-significant digit); the last column is left open with no
+/// trailing blanks so copied output stays clean. Headers render bold on
+/// interactive terminals.
+/// STATE cell for remote-catalog tables: "pulled" when the local lane
+/// already holds the artifact, "-" otherwise (same placeholder the
+/// search/engine tables use for absent facts).
+fn pulled_or_dash(pulled: bool) -> String {
+    if pulled { "pulled" } else { "-" }.to_string()
+}
+
+fn render_table(header: &[&str], rows: &[Vec<String>], right: &[usize]) -> String {
+    use std::fmt::Write as _;
+    let cols = header.len();
+    let mut widths: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();
+    for cells in rows {
+        for (c, cell) in cells.iter().enumerate().take(cols) {
+            widths[c] = widths[c].max(cell.chars().count());
+        }
+    }
+    let row_line = |cells: &[String], bold: bool| -> String {
+        let mut s = String::new();
+        for (c, &w) in widths.iter().enumerate() {
+            if c > 0 {
+                s.push_str("  ");
+            }
+            let text = cells.get(c).map_or("", String::as_str);
+            if c + 1 == cols {
+                s.push_str(text);
+            } else if right.contains(&c) {
+                let _ = write!(s, "{text:>w$}");
+            } else {
+                let _ = write!(s, "{text:<w$}");
+            }
+        }
+        if bold {
+            format!("\x1b[1m{s}\x1b[0m")
+        } else {
+            // An empty last cell must not leave the column separator
+            // dangling as trailing whitespace.
+            s.trim_end().to_string()
+        }
+    };
+    let header_cells: Vec<String> = header.iter().map(|h| (*h).to_string()).collect();
+    let mut out = String::new();
+    let _ = writeln!(out, "{}", row_line(&header_cells, cli_colors()));
+    for cells in rows {
+        let _ = writeln!(out, "{}", row_line(cells, false));
+    }
+    out
 }
 
 /// One `list --json` JSONL row: machine-typed mirror of the table
@@ -4556,10 +5660,18 @@ fn list_json_row(
         engine_rows,
         &m.name,
         m.arch.as_deref(),
+        m.has_component_set(),
         &m.path,
     )
     .ok()
     .and_then(|lane| (!lane.is_empty()).then_some(lane));
+    // Machine companion of the table's decorated ENGINE cell: the raw
+    // tag stays the routing identity (gateway-consistent); `engine_kind`
+    // is its typed form, no tag-prefix parsing required downstream.
+    let engine_kind = engine
+        .as_deref()
+        .and_then(|tag| engine_rows.iter().find(|r| r.tag == tag))
+        .map(|r| r.kind.as_str());
     let mut row = serde_json::json!({
         "name": m.name,
         "quant": m.quant,
@@ -4568,7 +5680,9 @@ fn list_json_row(
         "arch": m.arch,
         "ctx_train": m.ctx_train,
         "format": model_type_label(&m.path),
+        "category": model_category(m),
         "engine": engine,
+        "engine_kind": engine_kind,
         "path": m.path,
     });
     if let Some(arch) = engine.as_deref().and_then(|tag| {
@@ -4612,7 +5726,7 @@ fn list(json: bool) -> Result<()> {
     }
     let mut arch_gaps: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
         std::collections::BTreeMap::new();
-    let rows: Vec<[String; 8]> = models
+    let rows: Vec<[String; 9]> = models
         .iter()
         .map(|m| {
             // Multimodal visibility: the projector is a real on-disk cost
@@ -4636,6 +5750,7 @@ fn list(json: bool) -> Result<()> {
                 &engine_rows,
                 &m.name,
                 m.arch.as_deref(),
+                m.has_component_set(),
                 &m.path,
             )
             .unwrap_or_else(|_| "-".to_string());
@@ -4651,6 +5766,7 @@ fn list(json: bool) -> Result<()> {
                 m.arch.clone().unwrap_or_else(|| "?".to_string()),
                 m.ctx_train.map_or_else(String::new, |c| c.to_string()),
                 model_type_label(&m.path),
+                model_category(m).to_string(),
                 engine_cell,
             ]
         })
@@ -4658,7 +5774,7 @@ fn list(json: bool) -> Result<()> {
     println!(
         "{}",
         render_list_table(
-            ["NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "ENGINE"],
+            ["NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "CATEGORY", "ENGINE"],
             &rows
         )
     );
@@ -4718,29 +5834,40 @@ fn show(model: &str, json: bool) -> Result<()> {
         );
         return Ok(());
     }
-    println!("name:    {}", row.name);
-    println!("repo:    {}", row.repo);
-    println!("quant:   {}", row.quant);
-    println!("path:    {}", row.path);
-    println!("size:    {}", humansize(row.bytes));
-    println!("shards:  {}", row.shards);
+    // Field list first, then one aligned pass: the key column sizes to
+    // the longest key, and optional metadata prints its value or "-" —
+    // never the Rust Debug form (Some(24)/None leaked here once).
+    let mut fields: Vec<(&str, String)> = vec![
+        ("name", row.name.clone()),
+        ("repo", row.repo.clone()),
+        ("quant", row.quant.clone()),
+        ("path", row.path.clone()),
+        ("size", humansize(row.bytes)),
+        ("shards", row.shards.to_string()),
+    ];
     if let Some(mm) = &row.mmproj_path {
-        println!("mmproj:  {mm}");
+        fields.push(("mmproj", mm.clone()));
     }
     if let Some(m) = &meta {
-        println!("arch:    {}", m.architecture);
-        println!("blocks:  {:?}", m.block_count);
-        println!("ctx_train: {:?}", m.context_length);
-        println!("experts: {:?}", m.expert_count);
+        fields.push(("arch", m.architecture.clone()));
+        fields.push(("blocks", opt_or_dash(m.block_count)));
+        fields.push(("ctx_train", opt_or_dash(m.context_length)));
+        fields.push(("experts", opt_or_dash(m.expert_count)));
         if let Some(q) = &m.quantized_by {
-            println!("quantized_by: {q}");
+            fields.push(("quantized_by", q.clone()));
         }
         if let Some(v) = &m.general_version {
-            println!("version: {v}");
+            fields.push(("version", v.clone()));
         }
+    }
+    let key_w = fields.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    for (k, v) in &fields {
+        println!("{k:<key_w$}  {v}");
+    }
+    if let Some(m) = &meta {
         // Structural GGUF lint (H4): warn-only, explains degraded sizing.
         for w in m.lint() {
-            println!("WARNING: {w}");
+            println!("warning: {w}");
         }
     }
     if let Some((tag, p)) = profile {
@@ -4751,6 +5878,13 @@ fn show(model: &str, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Optional GGUF metadata as a show-field value: the number, or "-"
+/// for absent — never the Rust Debug form (`Some(24)`/`None` leaked
+/// into `blazar show` output once).
+fn opt_or_dash(v: Option<u64>) -> String {
+    v.map_or_else(|| "-".to_string(), |n| n.to_string())
 }
 
 /// Stored JSON text (argv/benchmark columns) embedded as a real value;
@@ -5025,7 +6159,7 @@ fn print_record(r: &serde_json::Value) {
         _ => String::new(),
     };
     println!(
-        "{flag}  {}  {}  model={} status={} finish={} ctx={} prompt={} completion={} degraded={} {ms}{conf}",
+        "{flag}  {}  {}  model={} status={} finish={} ctx={} prompt={} completion={} degraded={} ms={ms}{conf}",
         r["trace"].as_str().unwrap_or("?"),
         r["route"].as_str().unwrap_or("?"),
         r["model"].as_str().unwrap_or("?"),
@@ -5586,6 +6720,9 @@ fn quantize_cmd(
         bytes,
         sha256: None,
         mmproj_path: row.mmproj_path.clone(),
+        // Quantize runs on parsed text GGUFs; a diffusion DiT never
+        // reaches the llama-quantizer this wraps.
+        components: vec![],
         shards: 1,
         arch: Some(meta.architecture.clone()),
         params: Some(blazar_runtime::hf::est_params(out_bytes, qtype)),
@@ -5694,7 +6831,7 @@ async fn drafts_cmd(model: &str) -> Result<()> {
         format!("{family} 0.6b gguf"),
     ];
     let mut seen = std::collections::HashSet::new();
-    println!("draft candidates for {model:?} (verify with `blazar tune {model} --spec`):");
+    println!("draft candidates for {model} (verify with `blazar tune {model} --spec`):");
     let mut any = false;
     for q in &queries {
         for e in client.search(q, "gguf", 5).await? {
@@ -5890,7 +7027,7 @@ fn coreside_cmd() -> Result<()> {
 
 /// `blazar tts` — piper lane management + local synthesis through the
 /// daemon's `/v1/audio/speech` (same key-gating as every route).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn tts_cmd(
     text: Option<String>,
     voice: Option<&str>,
@@ -5898,6 +7035,7 @@ async fn tts_cmd(
     tag: Option<String>,
     pull: Option<String>,
     list: bool,
+    search: Option<String>,
     pin: Option<String>,
     out: Option<PathBuf>,
     speed: Option<f64>,
@@ -5913,6 +7051,9 @@ async fn tts_cmd(
             println!("piper pinned to {}", value.trim());
         }
         return Ok(());
+    }
+    if let Some(query) = search {
+        return tts_search(&d, &query).await;
     }
     if list {
         match blazar_runtime::piper::server_bin(&d) {
@@ -5956,7 +7097,12 @@ async fn tts_cmd(
             .with_download_connections(config()?.download_connections);
         let dest = blazar_runtime::piper::pull_voice(&hf, &d, &voice, |done, total| {
             use std::io::Write as _;
-            print!("\rpulling {voice}.onnx: {done}/{total} bytes");
+            let pct = (done * 100).checked_div(total).unwrap_or(0);
+            print!(
+                "\rpulling {voice}.onnx: {}/{} ({pct}%)",
+                humansize(i64::try_from(done).unwrap_or(i64::MAX)),
+                humansize(i64::try_from(total).unwrap_or(i64::MAX))
+            );
             let _ = std::io::stdout().flush();
         })
         .await?;
@@ -5971,8 +7117,43 @@ async fn tts_cmd(
     tts_speak(&d, &text, voice, out.as_deref(), speed).await
 }
 
+/// Catalog arm of `blazar tts --search <substr>`: the full
+/// `rhasspy/piper-voices` tree (the Hub siblings listing truncates it),
+/// filtered by voice id substring, with pulled state per row.
+async fn tts_search(d: &BlazarDirs, query: &str) -> Result<()> {
+    let token = std::env::var("HF_TOKEN").ok();
+    let hf = blazar_runtime::hf::HfClient::new(token)?
+        .with_download_connections(config()?.download_connections);
+    let voices = blazar_runtime::piper::search_voices(&hf, query).await?;
+    if voices.is_empty() {
+        return Err(anyhow!(
+            "no piper voice matches {query:?} — try a language (en), a locale \
+             (en_GB) or a name (amy)"
+        ));
+    }
+    let total = voices.len();
+    let rows: Vec<Vec<String>> = voices
+        .iter()
+        .take(40)
+        .map(|v| {
+            vec![
+                v.id.clone(),
+                humansize(i64::try_from(v.bytes).unwrap_or(i64::MAX)),
+                pulled_or_dash(blazar_runtime::piper::voice_file(d, &v.id).is_some()),
+            ]
+        })
+        .collect();
+    println!("{}", render_table(&["VOICE", "DISK", "STATE"], &rows, &[1]));
+    if total > 40 {
+        println!("# showing 40 of {total} — refine the substring to narrow the list");
+    }
+    println!("# pull: blazar tts --pull <voice>");
+    Ok(())
+}
+
 /// Synthesis arm of `blazar tts`: resolve the voice (default: first
 /// pulled), POST the daemon's `/v1/audio/speech`, write the WAV.
+#[allow(clippy::too_many_arguments)]
 async fn tts_speak(
     d: &BlazarDirs,
     text: &str,
@@ -5989,49 +7170,21 @@ async fn tts_speak(
             .ok_or_else(|| anyhow!("no voice pulled — run: blazar tts --pull en_US-amy-medium"))?
     };
     let base = ensure_daemon().await?;
-    let bearer = admin_bearer();
-    let mut body = serde_json::json!({ "model": voice, "input": text });
-    if let Some(speed) = speed {
-        body["speed"] = serde_json::json!(speed);
-    }
-    let mut req = cli_http()
-        .post(format!("{base}/v1/audio/speech"))
-        .json(&body);
-    if let Some(b) = bearer {
-        req = req.bearer_auth(b);
-    }
-    let resp = req.send().await?;
-    let status = resp.status();
-    if !status.is_success() {
-        let msg = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("speech failed ({status}): {}", msg.trim()));
-    }
-    let wav = resp.bytes().await?;
-    if out == Some(Path::new("-")) {
-        use std::io::Write as _;
-        std::io::stdout().write_all(&wav)?;
-    } else {
-        let path = out.map_or_else(
-            || format!("{}-{}.wav", voice, chrono_now_compact()),
-            |p| p.display().to_string(),
-        );
-        std::fs::write(&path, &wav).with_context(|| format!("write {path}"))?;
-        println!(
-            "wrote {path} ({} bytes, {} s audio)",
-            wav.len(),
-            wav_duration_secs(&wav)
-        );
-    }
-    Ok(())
+    let wav = speech_post(&base, &voice, text, speed).await?;
+    write_speech_out(&voice, &wav, out)
 }
 
 /// Compact timestamp for default output names (no chrono dep needed for
-/// a stamp this simple).
+/// a stamp this simple). Millisecond resolution plus a per-process sequence
+/// counter: two one-shots in the same millisecond still get distinct files
+/// instead of silently overwriting each other.
 fn chrono_now_compact() -> String {
-    let secs = std::time::SystemTime::now()
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    secs.to_string()
+        .map_or(0, |d| d.as_millis());
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{millis}-{seq:03}")
 }
 
 /// WAV duration from the RIFF header: walks the chunk list for `fmt `
@@ -6066,7 +7219,7 @@ fn wav_duration_secs(wav: &[u8]) -> f64 {
 /// `blazar whisper file.mp3` — STT via the `whisper` [[remotes]] entry.
 /// The gateway already forwards `/v1/audio/transcriptions`; this is the
 /// local CLI convenience for it (no separate engine lane to manage).
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn whisper_cmd(
     file: Option<&PathBuf>,
     model: Option<String>,
@@ -6074,6 +7227,7 @@ async fn whisper_cmd(
     tag: Option<String>,
     pull: Option<String>,
     list: bool,
+    search: Option<String>,
     pin: Option<String>,
 ) -> Result<()> {
     let d = dirs();
@@ -6088,6 +7242,9 @@ async fn whisper_cmd(
         }
         return Ok(());
     }
+    if let Some(query) = search {
+        return whisper_search(&d, &query).await;
+    }
     if list {
         match blazar_runtime::whisper::server_bin(&d) {
             Some((bin, _)) => {
@@ -6096,14 +7253,22 @@ async fn whisper_cmd(
                     .and_then(|p| p.parent())
                     .and_then(|p| p.file_name())
                     .map_or_else(|| "?".into(), |t| t.to_string_lossy().into_owned());
-                let pin = if blazar_runtime::whisper::pinned_tag(&d).is_some() {
+                // The (pinned) marker follows the serving pick, whichever
+                // lane holds it: pinned==serving tag means the pin is
+                // live (installed_tag mirrors server_bin's resolution).
+                let pinned = blazar_runtime::whisper::pinned_tag(&d);
+                let pin = if pinned.is_some()
+                    && pinned == blazar_runtime::whisper::installed_tag(&d)
+                {
                     " (pinned)"
                 } else {
                     ""
                 };
                 println!("server: {tag}{pin} ({})", bin.display());
             }
-            None => println!("server: not installed (blazar whisper --install)"),
+            None => println!(
+                "server: not installed (blazar engine install --kind whisper; legacy: blazar whisper --install)"
+            ),
         }
         let installed = blazar_runtime::whisper::installed_tags(&d);
         if installed.len() > 1 {
@@ -6147,7 +7312,12 @@ async fn whisper_cmd(
             .with_download_connections(config()?.download_connections);
         let dest = blazar_runtime::whisper::pull(&hf, &d, &size, |done, total| {
             use std::io::Write as _;
-            print!("\rpulling ggml-{size}.bin: {done}/{total} bytes");
+            let pct = (done * 100).checked_div(total).unwrap_or(0);
+            print!(
+                "\rpulling ggml-{size}.bin: {}/{} ({pct}%)",
+                humansize(i64::try_from(done).unwrap_or(i64::MAX)),
+                humansize(i64::try_from(total).unwrap_or(i64::MAX))
+            );
             let _ = std::io::stdout().flush();
         })
         .await?;
@@ -6199,6 +7369,36 @@ async fn whisper_cmd(
         }
         None => Err(anyhow!("no \"text\" field in response: {v}")),
     }
+}
+
+/// Catalog arm of `blazar whisper --search [substr]`: every ggml size
+/// the upstream `ggerganov/whisper.cpp` repo ships, filtered by size
+/// substring, with pulled state per row.
+async fn whisper_search(d: &BlazarDirs, query: &str) -> Result<()> {
+    let token = std::env::var("HF_TOKEN").ok();
+    let hf = blazar_runtime::hf::HfClient::new(token)?
+        .with_download_connections(config()?.download_connections);
+    let needle = query.to_lowercase();
+    let rows: Vec<Vec<String>> = blazar_runtime::whisper::remote_models(&hf)
+        .await?
+        .iter()
+        .filter(|m| needle.is_empty() || m.size.to_lowercase().contains(&needle))
+        .map(|m| {
+            vec![
+                m.size.clone(),
+                humansize(i64::try_from(m.bytes).unwrap_or(i64::MAX)),
+                pulled_or_dash(blazar_runtime::whisper::model_file(d, &m.size).is_some()),
+            ]
+        })
+        .collect();
+    if rows.is_empty() {
+        return Err(anyhow!(
+            "no upstream whisper model matches {query:?} — bare --search lists every size"
+        ));
+    }
+    println!("{}", render_table(&["SIZE", "DISK", "STATE"], &rows, &[1]));
+    println!("# pull: blazar whisper --pull <size>");
+    Ok(())
 }
 
 /// `blazar stop` (daemon) vs `blazar stop MODEL` (unload now).
@@ -6443,6 +7643,672 @@ async fn run_repl(model: &str, no_draft: bool) -> Result<()> {
     #[cfg(unix)]
     restore_repl_sigint();
     Ok(())
+}
+
+/// One readline for the generation loops: empty lines skip a turn,
+/// Ctrl-C nudges (session stays), Ctrl-D/EOF ends the loop.
+fn gen_line(rl: &mut rustyline::DefaultEditor, prompt: &str) -> Option<String> {
+    use rustyline::error::ReadlineError;
+    match rl.readline(prompt) {
+        Ok(l) => {
+            let t = l.trim().to_string();
+            Some(t).filter(|t| !t.is_empty())
+        }
+        Err(ReadlineError::Interrupted) => {
+            println!("^C (use /exit or Ctrl+D to quit)");
+            Some(String::new())
+        }
+        Err(_) => None,
+    }
+}
+
+/// `WxH` with digits on both sides (no `x` multiplier trickery).
+fn parse_gen_size(v: &str) -> Option<String> {
+    let (w, h) = v.split_once('x')?;
+    (!w.is_empty()
+        && !h.is_empty()
+        && w.bytes().all(|b| b.is_ascii_digit())
+        && h.bytes().all(|b| b.is_ascii_digit()))
+    .then(|| v.to_string())
+}
+
+/// Step counts the upstream diffusion servers accept (1..=100).
+fn parse_gen_steps(v: &str) -> Option<u64> {
+    v.parse::<u64>().ok().filter(|n| (1..=100).contains(n))
+}
+
+/// Generation seed — signed because upstream treats negatives as
+/// re-roll-per-request; a pinned non-negative seed reproduces exactly.
+fn parse_gen_seed(v: &str) -> Option<i64> {
+    v.parse::<i64>().ok()
+}
+
+/// Video frame counts: any positive count the engine can align (wan
+/// rounds DOWN to 4k+1); the cap keeps a fat-finger from asking for
+/// hour-scale renders the box cannot hold.
+fn parse_gen_frames(v: &str) -> Option<u64> {
+    v.parse::<u64>().ok().filter(|n| (1..=201).contains(n))
+}
+
+/// Video duration in seconds, capped where patience ends.
+fn parse_gen_duration(v: &str) -> Option<u64> {
+    v.parse::<u64>().ok().filter(|n| (1..=60).contains(n))
+}
+
+/// Piper speaking rate (upstream range 0.1..=4.0, 1.0 = native).
+fn parse_gen_speed(v: &str) -> Option<f64> {
+    v.parse::<f64>().ok().filter(|f| (0.1..=4.0).contains(f))
+}
+
+/// POST one sync image request; returns the raw response so the caller
+/// can branch on status without re-sending. `seed`/`negative_prompt`
+/// ride only when set: the body stays in the plain compat dialect when
+/// both are None (byte-identical legacy path) and switches to the
+/// full native dialect, which honors them, when either is present.
+#[allow(clippy::too_many_arguments)]
+async fn image_post(
+    base: &str,
+    model: &str,
+    prompt: &str,
+    size: Option<&str>,
+    steps: Option<u64>,
+    seed: Option<i64>,
+    negative_prompt: Option<&str>,
+) -> Result<reqwest::Response> {
+    let mut body = serde_json::json!({"model": model, "prompt": prompt});
+    if let Some(s) = size {
+        body["size"] = serde_json::json!(s);
+    }
+    if let Some(n) = steps {
+        body["steps"] = serde_json::json!(n);
+    }
+    if let Some(s) = seed {
+        body["seed"] = serde_json::json!(s);
+    }
+    if let Some(n) = negative_prompt {
+        body["negative_prompt"] = serde_json::json!(n);
+    }
+    let mut req = media_http()
+        .post(format!("{base}/v1/images/generations"))
+        .json(&body);
+    if let Some(b) = admin_bearer() {
+        req = req.bearer_auth(b);
+    }
+    req.send().await.map_err(Into::into)
+}
+
+/// Decode a finished generations response into (bytes, extension) —
+/// the payload rides `data[0].b64_json`, the extension follows the
+/// response's declared output format (defaulting to png).
+fn image_payload(resp: &serde_json::Value) -> Option<(Vec<u8>, String)> {
+    use base64::Engine as _;
+    let b64 = resp.get("data")?.get(0)?.get("b64_json")?.as_str()?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let ext = resp
+        .get("output_format")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("png")
+        .to_string();
+    Some((bytes, ext))
+}
+
+/// Async job envelope: `{status, error, result: {b64_json, ...}}` — the
+/// payload rides under `result`, unlike the sync `{data: [...]}` shape.
+fn job_payload(job: &serde_json::Value, default_ext: &str) -> Option<(Vec<u8>, String)> {
+    use base64::Engine as _;
+    let b64 = job.get("result")?.get("b64_json")?.as_str()?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let ext = job
+        .get("result")
+        .and_then(|r| r.get("output_format"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(default_ext)
+        .to_string();
+    Some((bytes, ext))
+}
+
+/// Write one generated artifact under a stable name; returns the path
+/// written (for the loop's receipt line).
+fn write_gen_out(model: &str, bytes: &[u8], ext: &str) -> Result<String> {
+    let path = format!("{model}-{}.{ext}", chrono_now_compact());
+    std::fs::write(&path, bytes).with_context(|| format!("write {path}"))?;
+    Ok(path)
+}
+
+/// One image turn: sync request, PNG (or family format) to the working
+/// directory. Returns Ok even on server rejections — a bad prompt must
+/// not kill the loop; the error line teaches and the next turn waits.
+#[allow(clippy::too_many_arguments)]
+async fn image_turn(
+    base: &str,
+    model: &str,
+    prompt: &str,
+    size: Option<&str>,
+    steps: Option<u64>,
+    seed: Option<i64>,
+    negative_prompt: Option<&str>,
+) {
+    let started = std::time::Instant::now();
+    match image_post(base, model, prompt, size, steps, seed, negative_prompt).await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(v) => match image_payload(&v) {
+                Some((bytes, ext)) => match write_gen_out(model, &bytes, &ext) {
+                    Ok(path) => {
+                        println!(
+                            "wrote {path} ({}, {:.1}s)",
+                            humansize(i64::try_from(bytes.len()).unwrap_or(i64::MAX)),
+                            started.elapsed().as_secs_f64()
+                        );
+                    }
+                    Err(e) => println!("error: {e}"),
+                },
+                None => println!("error: response carried no image data — daemon logs explain"),
+            },
+            Err(e) => println!("error: unreadable response: {e}"),
+        },
+        Ok(resp) => {
+            let msg = resp.text().await.unwrap_or_default();
+            println!("error: {}", msg.trim());
+        }
+        Err(e) => println!("error: {e}"),
+    }
+}
+
+/// Image loop for diffusion component sets and standalone checkpoints:
+/// every line is a prompt, every answer an image in the working
+/// directory. Knobs override the server's family defaults; omitted
+/// knobs let the daemon size the request (the same defaults the HTTP
+/// API applies).
+async fn image_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()> {
+    if let Some(prompt) = inline {
+        image_turn(base, model, prompt, None, None, None, None).await;
+        return Ok(());
+    }
+    let mut rl = rustyline::DefaultEditor::new()?;
+    let mut size: Option<String> = None;
+    let mut steps: Option<u64> = None;
+    let mut seed: Option<i64> = None;
+    let mut negative: Option<String> = None;
+    #[cfg(unix)]
+    install_repl_sigint();
+    println!("blazar image REPL — {model} (a prompt generates; /help; /exit)");
+    while let Some(line) = gen_line(&mut rl, "img> ") {
+        if line.is_empty() {
+            continue;
+        }
+        rl.add_history_entry(&line).ok();
+        match line.as_str() {
+            "/exit" | "/bye" => break,
+            "/help" => {
+                println!(
+                    "commands: /exit /bye /size <WxH> /steps <n> /seed <n> \
+                     /negative <text> (bare /negative clears)"
+                );
+                println!(
+                    "input:   plain text prompts; a turn answers with an image file \
+                     in the working directory"
+                );
+            }
+            _ if line.starts_with("/size ") => {
+                match parse_gen_size(line["/size ".len()..].trim()) {
+                    Some(s) => {
+                        size = Some(s.clone());
+                        println!("(size {s})");
+                    }
+                    None => println!("(usage: /size 1024x1024 — digits on both sides)"),
+                }
+            }
+            _ if line.starts_with("/steps ") => {
+                match parse_gen_steps(line["/steps ".len()..].trim()) {
+                    Some(n) => {
+                        steps = Some(n);
+                        println!("(steps {n})");
+                    }
+                    None => println!("(usage: /steps 24 — 1..=100)"),
+                }
+            }
+            _ if line.starts_with("/seed ") => {
+                match parse_gen_seed(line["/seed ".len()..].trim()) {
+                    Some(s) => {
+                        seed = Some(s);
+                        println!("(seed {s})");
+                    }
+                    None => println!("(usage: /seed 42 — an integer; -1 re-rolls per turn)"),
+                }
+            }
+            "/negative" => {
+                negative = None;
+                println!("(negative prompt cleared)");
+            }
+            _ if line.starts_with("/negative ") => {
+                let text = line["/negative ".len()..].trim().to_string();
+                if text.is_empty() {
+                    negative = None;
+                    println!("(negative prompt cleared)");
+                } else {
+                    println!("(negative: {text})");
+                    negative = Some(text);
+                }
+            }
+            _ if line.starts_with('/') => {
+                println!("(unknown command — /help)");
+            }
+            _ => {
+                image_turn(
+                    base,
+                    model,
+                    &line,
+                    size.as_deref(),
+                    steps,
+                    seed,
+                    negative.as_deref(),
+                )
+                .await;
+            }
+        }
+    }
+    #[cfg(unix)]
+    restore_repl_sigint();
+    Ok(())
+}
+
+/// Submit one video job (`"async": true` — video turns run minutes, a
+/// sync POST would hold the socket hostage) and return its id.
+/// `frames`/`seed`/`negative_prompt` ride only when set (gateway
+/// canonicalizes `frames` onto the native `video_frames`).
+#[allow(clippy::too_many_arguments)]
+async fn video_submit(
+    base: &str,
+    model: &str,
+    prompt: &str,
+    size: Option<&str>,
+    duration: Option<u64>,
+    frames: Option<u64>,
+    seed: Option<i64>,
+    negative_prompt: Option<&str>,
+) -> Result<String> {
+    let mut body = serde_json::json!({"model": model, "prompt": prompt, "async": true});
+    if let Some(s) = size {
+        body["size"] = serde_json::json!(s);
+    }
+    if let Some(d) = duration {
+        body["duration"] = serde_json::json!(d);
+    }
+    if let Some(f) = frames {
+        body["frames"] = serde_json::json!(f);
+    }
+    if let Some(s) = seed {
+        body["seed"] = serde_json::json!(s);
+    }
+    if let Some(n) = negative_prompt {
+        body["negative_prompt"] = serde_json::json!(n);
+    }
+    let mut req = gen_http()
+        .post(format!("{base}/v1/videos/generations"))
+        .json(&body);
+    if let Some(b) = admin_bearer() {
+        req = req.bearer_auth(b);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    if !status.is_success() {
+        anyhow::bail!("submit failed ({status}): {}", text.trim());
+    }
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| {
+            v.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from)
+        })
+        .ok_or_else(|| anyhow!("submit succeeded but carried no job id: {text}"))
+}
+
+/// Poll a video job to completion and write the clip; prints status
+/// transitions and a heartbeat so minutes-long renders never look hung.
+async fn video_wait(base: &str, model: &str, job: &str) {
+    let started = std::time::Instant::now();
+    let mut last_status = String::new();
+    loop {
+        let mut req = cli_http().get(format!("{base}/v1/videos/jobs/{job}"));
+        if let Some(b) = admin_bearer() {
+            req = req.bearer_auth(b);
+        }
+        let v = match req.send().await {
+            Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+                Ok(v) => v,
+                Err(e) => {
+                    println!("error: unreadable job status: {e}");
+                    return;
+                }
+            },
+            Ok(r) => {
+                let msg = r.text().await.unwrap_or_default();
+                println!("error: {}", msg.trim());
+                return;
+            }
+            Err(e) => {
+                println!("error: {e}");
+                return;
+            }
+        };
+        let status = v
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        if status != last_status {
+            if !last_status.is_empty() {
+                println!();
+            }
+            print!("{status}");
+            last_status = status.clone();
+        } else if started.elapsed().as_secs().is_multiple_of(15) {
+            print!(".");
+        }
+        match status.as_str() {
+            "completed" => {
+                println!();
+                match job_payload(&v, "webm") {
+                    Some((bytes, ext)) => match write_gen_out(model, &bytes, &ext) {
+                        Ok(path) => println!(
+                            "wrote {path} ({}, {:.1}s)",
+                            humansize(i64::try_from(bytes.len()).unwrap_or(i64::MAX)),
+                            started.elapsed().as_secs_f64()
+                        ),
+                        Err(e) => println!("error: {e}"),
+                    },
+                    None => println!("error: completed job carried no video data"),
+                }
+                return;
+            }
+            "failed" | "cancelled" => {
+                println!();
+                let why = v
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("daemon logs explain (journalctl -u blazar)");
+                println!("error: {status} — {why}");
+                return;
+            }
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
+
+/// Video loop for Wan-family component sets: every line submits a job,
+/// polls it to completion, and writes the clip. Generation cannot be
+/// interrupted from the REPL — Ctrl-C at the prompt stays a nudge; a
+/// running job is daemon-owned and finishes server-side.
+// Knob-table REPL: one match arm per knob, mutating local state;
+// extracting the arms would trade a linear table for a state struct
+// without removing a line of real logic.
+#[allow(clippy::too_many_lines)]
+async fn video_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()> {
+    let run_turn = |prompt: String,
+                    size: Option<String>,
+                    duration: Option<u64>,
+                    frames: Option<u64>,
+                    seed: Option<i64>,
+                    negative: Option<String>| {
+        let base = base.to_string();
+        let model = model.to_string();
+        async move {
+            match video_submit(
+                &base,
+                &model,
+                &prompt,
+                size.as_deref(),
+                duration,
+                frames,
+                seed,
+                negative.as_deref(),
+            )
+            .await
+            {
+                Ok(job) => {
+                    println!("job {job}");
+                    video_wait(&base, &model, &job).await;
+                }
+                Err(e) => println!("error: {e}"),
+            }
+        }
+    };
+    if let Some(prompt) = inline {
+        run_turn(prompt.to_string(), None, None, None, None, None).await;
+        return Ok(());
+    }
+    let mut rl = rustyline::DefaultEditor::new()?;
+    let mut size: Option<String> = None;
+    let mut duration: Option<u64> = None;
+    let mut frames: Option<u64> = None;
+    let mut seed: Option<i64> = None;
+    let mut negative: Option<String> = None;
+    #[cfg(unix)]
+    install_repl_sigint();
+    println!("blazar video REPL — {model} (a prompt renders a clip; /help; /exit)");
+    while let Some(line) = gen_line(&mut rl, "vid> ") {
+        if line.is_empty() {
+            continue;
+        }
+        rl.add_history_entry(&line).ok();
+        match line.as_str() {
+            "/exit" | "/bye" => break,
+            "/help" => {
+                println!(
+                    "commands: /exit /bye /size <WxH> /duration <secs> /frames <n> \
+                     /seed <n> /negative <text> (bare /negative clears)"
+                );
+                println!(
+                    "input:   plain text prompts; turns run minutes and poll \
+                     server-side jobs — check progress in another terminal with \
+                     `curl {base}/v1/videos/jobs/<id>`"
+                );
+            }
+            _ if line.starts_with("/size ") => {
+                match parse_gen_size(line["/size ".len()..].trim()) {
+                    Some(s) => {
+                        size = Some(s.clone());
+                        println!("(size {s})");
+                    }
+                    None => println!("(usage: /size 960x480 — digits on both sides)"),
+                }
+            }
+            _ if line.starts_with("/duration ") => {
+                match parse_gen_duration(line["/duration ".len()..].trim()) {
+                    Some(d) => {
+                        duration = Some(d);
+                        println!("(duration {d}s)");
+                    }
+                    None => println!("(usage: /duration 5 — 1..=60 seconds)"),
+                }
+            }
+            _ if line.starts_with("/frames ") => {
+                match parse_gen_frames(line["/frames ".len()..].trim()) {
+                    Some(f) => {
+                        frames = Some(f);
+                        println!("(frames {f} — wan aligns down to 4k+1)");
+                    }
+                    None => println!("(usage: /frames 33 — 1..=201)"),
+                }
+            }
+            _ if line.starts_with("/seed ") => {
+                match parse_gen_seed(line["/seed ".len()..].trim()) {
+                    Some(s) => {
+                        seed = Some(s);
+                        println!("(seed {s})");
+                    }
+                    None => println!("(usage: /seed 42 — an integer; -1 re-rolls per turn)"),
+                }
+            }
+            "/negative" => {
+                negative = None;
+                println!("(negative prompt cleared)");
+            }
+            _ if line.starts_with("/negative ") => {
+                let text = line["/negative ".len()..].trim().to_string();
+                if text.is_empty() {
+                    negative = None;
+                    println!("(negative prompt cleared)");
+                } else {
+                    println!("(negative: {text})");
+                    negative = Some(text);
+                }
+            }
+            _ if line.starts_with('/') => {
+                println!("(unknown command — /help)");
+            }
+            _ => {
+                run_turn(
+                    line.clone(),
+                    size.clone(),
+                    duration,
+                    frames,
+                    seed,
+                    negative.clone(),
+                )
+                .await;
+            }
+        }
+    }
+    #[cfg(unix)]
+    restore_repl_sigint();
+    Ok(())
+}
+
+/// POST /v1/audio/speech for one utterance; the daemon spawns piper
+/// per request (same key-gating as every route).
+async fn speech_post(base: &str, voice: &str, text: &str, speed: Option<f64>) -> Result<Vec<u8>> {
+    let mut body = serde_json::json!({ "model": voice, "input": text });
+    if let Some(speed) = speed {
+        body["speed"] = serde_json::json!(speed);
+    }
+    let mut req = gen_http()
+        .post(format!("{base}/v1/audio/speech"))
+        .json(&body);
+    if let Some(b) = admin_bearer() {
+        req = req.bearer_auth(b);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let msg = resp.text().await.unwrap_or_default();
+        anyhow::bail!("speech failed ({status}): {}", msg.trim());
+    }
+    Ok(resp.bytes().await?.to_vec())
+}
+
+/// Write synthesized audio: `-` streams to stdout, anything else lands
+/// as a WAV under the given path (or a voice-stamped default).
+fn write_speech_out(voice: &str, wav: &[u8], out: Option<&Path>) -> Result<()> {
+    if out == Some(Path::new("-")) {
+        use std::io::Write as _;
+        std::io::stdout().write_all(wav)?;
+    } else {
+        let path = out.map_or_else(
+            || format!("{}-{}.wav", voice, chrono_now_compact()),
+            |p| p.display().to_string(),
+        );
+        std::fs::write(&path, wav).with_context(|| format!("write {path}"))?;
+        println!(
+            "wrote {path} ({} bytes, {} s audio)",
+            wav.len(),
+            wav_duration_secs(wav)
+        );
+    }
+    Ok(())
+}
+
+/// Speech loop over pulled piper voices: every line is spoken to a WAV
+/// in the working directory. `/voice` switches among installed voices
+/// (pulling a new one stays with `blazar tts --pull <voice>`).
+async fn tts_repl(base: &str, voice: &str, inline: Option<&str>) -> Result<()> {
+    let run_turn = |voice: String, text: String, speed: Option<f64>, out: Option<PathBuf>| {
+        let base = base.to_string();
+        async move {
+            let started = std::time::Instant::now();
+            match speech_post(&base, &voice, &text, speed).await {
+                Ok(wav) => {
+                    if let Err(e) = write_speech_out(&voice, &wav, out.as_deref()) {
+                        println!("error: {e}");
+                    } else {
+                        println!("({:.1}s)", started.elapsed().as_secs_f64());
+                    }
+                }
+                Err(e) => println!("error: {e}"),
+            }
+        }
+    };
+    if let Some(text) = inline {
+        run_turn(voice.to_string(), text.to_string(), None, None).await;
+        return Ok(());
+    }
+    let mut rl = rustyline::DefaultEditor::new()?;
+    let mut voice = voice.to_string();
+    let mut speed: Option<f64> = None;
+    let mut out: Option<PathBuf> = None;
+    #[cfg(unix)]
+    install_repl_sigint();
+    println!("blazar speech REPL — {voice} (a line writes a WAV; /help; /exit)");
+    while let Some(line) = gen_line(&mut rl, "tts> ") {
+        if line.is_empty() {
+            continue;
+        }
+        rl.add_history_entry(&line).ok();
+        match line.as_str() {
+            "/exit" | "/bye" => break,
+            "/help" => {
+                println!("commands: /exit /bye /voice <name> /speed <0.1-4> /out <path>");
+                println!(
+                    "input:   plain text; each line writes a WAV in the working \
+                     directory (voices: blazar tts --list, new ones: blazar tts --pull)"
+                );
+            }
+            _ if line.starts_with("/voice ") => {
+                let v = line["/voice ".len()..].trim().to_string();
+                if piper_voice_exists(&v) {
+                    voice.clone_from(&v);
+                    println!("(voice {voice})");
+                } else {
+                    println!("(voice {v} not pulled — blazar tts --pull {v})");
+                }
+            }
+            _ if line.starts_with("/speed ") => {
+                match parse_gen_speed(line["/speed ".len()..].trim()) {
+                    Some(f) => {
+                        speed = Some(f);
+                        println!("(speed {f}x)");
+                    }
+                    None => println!("(usage: /speed 1.2 — 0.1..=4.0, 1.0 = native)"),
+                }
+            }
+            _ if line.starts_with("/out ") => {
+                let p = line["/out ".len()..].trim().to_string();
+                out = Some(PathBuf::from(p));
+                println!(
+                    "(out {})",
+                    out.as_deref().unwrap_or(Path::new("?")).display()
+                );
+            }
+            _ if line.starts_with('/') => {
+                println!("(unknown command — /help)");
+            }
+            _ => {
+                run_turn(voice.clone(), line.clone(), speed, out.clone()).await;
+            }
+        }
+    }
+    #[cfg(unix)]
+    restore_repl_sigint();
+    Ok(())
+}
+
+/// Pulled-voice check the speech loop teaches with (a dir scan, not a
+/// store query — voices are files).
+fn piper_voice_exists(voice: &str) -> bool {
+    blazar_runtime::piper::voice_file(&dirs(), voice).is_some()
 }
 
 /// The daemon's teaching refusal for `think: true` on a template without
@@ -6698,7 +8564,7 @@ fn bench(model: &str) -> Result<()> {
 // Lane switches mirroring the clap flags one-to-one; a flags struct would
 // just re-spell the same four booleans.
 #[allow(clippy::fn_params_excessive_bools)]
-fn tune_full(
+async fn tune_full(
     model: &str,
     search: bool,
     ctx: Option<u32>,
@@ -6717,9 +8583,13 @@ fn tune_full(
     let engine_row = store
         .active_engine()?
         .ok_or_else(|| anyhow!("no engine installed; run: blazar engine update"))?;
-    let manifest: blazar_runtime::Manifest = serde_json::from_str(&engine_row.manifest)?;
+    let mut manifest: blazar_runtime::Manifest = serde_json::from_str(&engine_row.manifest)?;
+    manifest.anchor_server_path(&d.data_dir);
     let bench_bin = blazar_runtime::bench::find_bench_bin(&d)?;
     let mut cfg = config()?;
+    // Any adoption below flips this: the fn tail then restarts a running
+    // daemon so the adopted knobs are live instead of hinting at one.
+    let mut adopted_any = false;
     // Persist --spec BEFORE building the profile input so the compiled
     // argv (and its draft resolution) matches what the daemon will
     // serve on the next run — mirrors the --ngram lane's
@@ -6852,8 +8722,9 @@ fn tune_full(
             let mut cfg2 = config()?;
             cfg2.slots = best_np;
             blazar_core::persist_config(&d.config_file(), &cfg2.to_toml()?)?;
+            adopted_any = true;
             println!(
-                "adopted slots = {best_np} ({best_tps:.1} tok/s, +{:.0}% over runner-up) — restart the daemon to apply",
+                "adopted slots = {best_np} ({best_tps:.1} tok/s, +{:.0}% over runner-up)",
                 (best_tps / second - 1.0) * 100.0
             );
         } else {
@@ -6920,9 +8791,8 @@ fn tune_full(
             cfg2.ngram_size_m = bm;
             cfg2.ngram_min_hits = bh;
             blazar_core::persist_config(&d.config_file(), &cfg2.to_toml()?)?;
-            println!(
-                "adopted ngram_size_m = {bm}, ngram_min_hits = {bh} — restart the daemon to apply"
-            );
+            adopted_any = true;
+            println!("adopted ngram_size_m = {bm}, ngram_min_hits = {bh}");
         } else {
             println!("no clear winner (best {best_tps:.1} vs {second:.1}) — engine defaults stay");
         }
@@ -6964,8 +8834,9 @@ fn tune_full(
             println!("warmup off: {:>6.1}s", probe.no_warmup_secs);
             if probe.no_warmup_secs < probe.warmup_secs * 0.95 {
                 set_model_override(model, "warmup", "false")?;
+                adopted_any = true;
                 println!(
-                    "adopted model_overrides.{model}.warmup = false ({:.0}% faster to first token) — restart the daemon to apply",
+                    "adopted model_overrides.{model}.warmup = false ({:.0}% faster to first token)",
                     (1.0 - probe.no_warmup_secs / probe.warmup_secs) * 100.0
                 );
             } else {
@@ -6984,9 +8855,8 @@ fn tune_full(
             println!("2 children: {:>6.1} tok/s ({ratio:.2}x)", probe.r2_tps);
             if probe.r2_tps > probe.r1_tps * 1.3 {
                 set_model_override(model, "replicas", "2")?;
-                println!(
-                    "adopted model_overrides.{model}.replicas = 2 — restart the daemon to apply"
-                );
+                adopted_any = true;
+                println!("adopted model_overrides.{model}.replicas = 2");
             } else {
                 println!("keep replicas = 1 (2 children not >1.3x aggregate)");
             }
@@ -7021,14 +8891,17 @@ fn tune_full(
                 let mut cfg2 = config()?;
                 cfg2.cache_reuse = probe.best;
                 blazar_core::persist_config(&d.config_file(), &cfg2.to_toml()?)?;
-                println!(
-                    "adopted cache_reuse = {} — restart the daemon to apply",
-                    probe.best
-                );
+                adopted_any = true;
+                println!("adopted cache_reuse = {}", probe.best);
             } else {
                 println!("keep cache_reuse = 256 (no candidate >5% faster and >50 ms >5% faster)");
             }
         }
+    }
+    if adopted_any {
+        // The persisted knobs only reach a RUNNING daemon through a
+        // restart; a daemon that is down reads them at its next start.
+        restart_daemon().await;
     }
     Ok(())
 }
@@ -7183,6 +9056,8 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
         EngineKind::LlamaCpp => "llama-server",
         EngineKind::MistralRs => "mistral.rs",
         EngineKind::Sglang => "sglang",
+        EngineKind::SdCpp => "sd-server",
+        EngineKind::Whisper => "whisper-server",
     };
     out.push(format!("# engine lane: {lane} ({tag})"));
     out.push(
@@ -7246,6 +9121,15 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
                 ],
             ),
             EngineKind::LlamaCpp => unreachable!("llamacpp handled above"),
+            // Image lane: sd-server tuning rides request parameters
+            // (steps/cfg/sampler/seed per call), not config knobs —
+            // no model-scoped families yet. New knobs get a line here.
+            EngineKind::SdCpp => ("sdcpp", vec![]),
+            // Audio lane: whisper-server rides per-request fields
+            // (language/temperature/prompt/beam_size on the multipart
+            // call), not config knobs — same discipline as the image
+            // lane.
+            EngineKind::Whisper => ("whisper", vec![]),
         };
         out.push(format!("# [model_overrides.\"{model}\".{table}]"));
         out.extend(families.into_iter().map(knob));
@@ -7611,14 +9495,33 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 EngineKind::LlamaCpp => engine_update(&d, tag, no_gate, check).await?,
                 EngineKind::Sglang => engine_update_sglang(&d, tag, check).await?,
                 EngineKind::MistralRs => engine_update_mistralrs(&d, tag, check).await?,
+                EngineKind::SdCpp => engine_update_sdcpp(&d, tag, check).await?,
+                EngineKind::Whisper => engine_update_whisper(&d, tag, check).await?,
             }
         }
         EngineCmd::List { json } => {
             if !json {
                 upstream_update_hint(&d).await;
             }
+            // Point-of-need convergence: `engine list` is where install
+            // debris becomes visible to a user, so the same grace-gated
+            // sweep the daemon boot runs converges here too (fail-open).
+            // Notices go to stderr — the table and JSONL stdout bytes are
+            // scripted (install e2e, validate) and must not shift.
+            if let Ok(mgr) = local_engine_manager(&d) {
+                for (name, bytes) in mgr.sweep_install_debris(STALLED_INSTALL_GRACE) {
+                    // i64::try_from mirrors the table's byte cells: a
+                    // u64 overflow here is impossible (dir sizes).
+                    let bytes = i64::try_from(bytes).unwrap_or(i64::MAX);
+                    eprintln!(
+                        "swept stalled install debris: {name} ({}) reclaimed",
+                        humansize(bytes)
+                    );
+                }
+            }
             let store = Store::open(&d)?;
             let mut seen: Vec<&str> = Vec::new();
+            let mut table: Vec<Vec<String>> = Vec::new();
             for e in store.list_engines()? {
                 // Provenance suffix from the row's manifest: fork lanes
                 // show their immutable pin, source builds their commit.
@@ -7657,45 +9560,84 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                     _ => e.asset.clone(),
                 };
                 let superseded = match m.as_ref().and_then(|m| m.superseded_by.as_deref()) {
-                    Some(by) => format!(" (superseded by {by})"),
+                    Some(by) => format!("superseded by {by}"),
                     None => String::new(),
                 };
-                println!(
-                    "{:<12} {:<9} {:<10} {} {} {}",
-                    e.tag,
-                    e.kind.as_str(),
+                table.push(vec![
+                    e.tag.clone(),
+                    e.kind.as_str().to_string(),
                     asset,
-                    if e.active { "[active]" } else { "" },
+                    if e.active {
+                        "active".to_string()
+                    } else {
+                        "-".to_string()
+                    },
                     e.sha256.chars().take(12).collect::<String>(),
-                    superseded
-                );
+                    superseded,
+                ]);
             }
             if json {
                 return Ok(());
             }
+            if !table.is_empty() {
+                print!(
+                    "{}",
+                    render_table(
+                        &["TAG", "KIND", "ASSET", "STATE", "SHA256", "NOTES"],
+                        &table,
+                        &[]
+                    )
+                );
+            }
             // Point-of-need catalog: `engine list` is where users look
             // for "what can I install" — every lane this blazar can
-            // run but doesn't have yet gets one discoverability line,
-            // and the separate voice lane is always named.
+            // run but doesn't have yet gets one discoverability line.
+            // The whisper lane reports through the generic table when
+            // installed as an engine row; only the legacy voice tree
+            // needs its own line. Lane labels share one width so the
+            // teaching lines align under the table.
+            let lane = |name: &str, rest: &str| println!("{name:<10} not installed — {rest}");
             if !seen.contains(&"llamacpp") {
-                println!(
-                    "llama.cpp:  not installed — blazar engine update (prebuilt) / blazar engine build cuda (source; GGUF lane)"
+                lane(
+                    "llama.cpp",
+                    "blazar engine update (prebuilt) / blazar engine build cuda (source; GGUF lane)",
                 );
             }
             if !seen.contains(&"mistralrs") {
-                println!(
-                    "mistral.rs: not installed — blazar engine install --kind mistralrs (safetensors)"
+                lane(
+                    "mistral.rs",
+                    "blazar engine install --kind mistralrs (safetensors)",
                 );
             }
             if !seen.contains(&"sglang") {
-                println!(
-                    "sglang:     not installed — blazar engine install --kind sglang (safetensors; Linux + CUDA/ROCm)"
+                lane(
+                    "sglang",
+                    "blazar engine install --kind sglang (safetensors; Linux + CUDA/ROCm)",
                 );
             }
-            match blazar_runtime::whisper::installed_tags(&d).first() {
-                Some(tag) => println!("whisper:    {tag} (voice lane) — blazar whisper --list"),
-                None => {
-                    println!("whisper:    not installed (voice lane) — blazar whisper --install");
+            if !seen.contains(&"sdcpp") {
+                lane(
+                    "sdcpp",
+                    "blazar engine install --kind sdcpp (diffusion checkpoints: Qwen-Image-2.1/v1, FLUX.1/2-dev, Z-Image, Chroma, SDXL, SD1.5, Wan 2.1 video; any GPU via Vulkan)",
+                );
+            }
+            match (
+                seen.contains(&"whisper"),
+                blazar_runtime::whisper::installed_tags(&d).first(),
+            ) {
+                // Engine row already printed by the table above.
+                (true, _) => {}
+                (false, Some(tag)) => {
+                    println!(
+                        "{:<10} {tag} (legacy voice lane) — blazar whisper --list",
+                        "whisper"
+                    );
+                }
+                (false, None) => {
+                    lane(
+                        "whisper",
+                        "blazar engine install --kind whisper (audio transcription/translation; legacy: blazar whisper --install)",
+                    );
                 }
             }
         }
@@ -7729,8 +9671,12 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 }
             };
             let mgr = local_engine_manager(&d)?;
+            let prior = blazar_core::store::Store::open(&d)?
+                .active_engine()?
+                .map(|r| r.tag);
             let row = mgr.use_tag(&resolved_tag)?;
             println!("active engine: {}", row.tag);
+            restart_daemon_if_active_changed(prior, Some(row.tag.clone())).await;
         }
         EngineCmd::Prune => engine_prune(&d)?,
         EngineCmd::Rm { tag } => {
@@ -7739,8 +9685,12 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
         }
         EngineCmd::Rollback => {
             let mgr = local_engine_manager(&d)?;
+            let prior = blazar_core::store::Store::open(&d)?
+                .active_engine()?
+                .map(|r| r.tag);
             let row = mgr.rollback()?;
             println!("rolled back to: {}", row.tag);
+            restart_daemon_if_active_changed(prior, Some(row.tag.clone())).await;
         }
         EngineCmd::Build {
             backend,
@@ -7773,6 +9723,9 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
         }
         EngineCmd::Local { path } => {
             let mgr = local_engine_manager(&d)?;
+            let prior = blazar_core::store::Store::open(&d)?
+                .active_engine()?
+                .map(|r| r.tag);
             let row = mgr.register_local(&path, &config()?.engine_env)?;
             let m: blazar_runtime::Manifest = serde_json::from_str(&row.manifest)?;
             mgr.use_tag(&row.tag)?;
@@ -7782,6 +9735,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 m.devices.len(),
                 m.flags.len()
             );
+            restart_daemon_if_active_changed(prior, Some(row.tag.clone())).await;
         }
         EngineCmd::Install {
             kind,
@@ -7805,8 +9759,9 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                      llama.cpp         GGUF files — blazar engine update (prebuilt) or blazar engine build cuda (source)\n  \
                      --kind mistralrs  HF safetensors dirs — prebuilt mistral.rs server\n  \
                      --kind sglang     HF safetensors dirs — pip venv (Linux + CUDA/ROCm)\n  \
-                     capability lane   blazar engine offers + install --lane <id> (fork builds)\n  \
-                     voice (whisper)   blazar whisper --install (separate transcription lane)"
+                     --kind sdcpp      diffusion GGUF component sets — prebuilt sd-server (Vulkan/CPU/Metal)\n  \
+                     --kind whisper    audio transcription/translation — prebuilt whisper-server (CPU)\n  \
+                     capability lane   blazar engine offers + install --lane <id> (fork builds)"
                 ));
             };
             let engine_kind: EngineKind = kind
@@ -7815,10 +9770,13 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             match engine_kind {
                 EngineKind::MistralRs => engine_install_mistralrs(&d, tag).await?,
                 EngineKind::Sglang => engine_install_sglang(&d, tag).await?,
+                EngineKind::SdCpp => engine_install_sdcpp(&d, tag).await?,
+                EngineKind::Whisper => engine_install_whisper(&d, tag).await?,
                 EngineKind::LlamaCpp => {
                     return Err(anyhow!(
-                        "llama.cpp engines install via `blazar engine update` / `blazar engine \
-                         build` — `engine install --kind` serves mistralrs and sglang"
+                        "llama.cpp engines install via `blazar engine update` / `blazar \
+                         engine build` — `engine install --kind` serves mistralrs, sglang, \
+                         sdcpp and whisper"
                     ));
                 }
             }
@@ -7834,6 +9792,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
 /// (never silently) — llama-bench cannot drive a mistral.rs child.
 async fn engine_install_mistralrs(d: &BlazarDirs, tag: Option<String>) -> Result<()> {
     let mgr = local_engine_manager(d)?;
+    let prior_active = Store::open(d)?.active_engine()?.map(|r| r.tag);
     let wanted = tag.clone().unwrap_or_else(|| "latest".to_string());
     println!("installing mistral.rs {wanted} (prebuilt upstream binary)");
     let row = mgr.update_mistralrs(tag.as_deref()).await?;
@@ -7857,6 +9816,7 @@ async fn engine_install_mistralrs(d: &BlazarDirs, tag: Option<String>) -> Result
             humansize(freed)
         );
     }
+    restart_daemon_if_active_changed(prior_active, row.active.then(|| row.tag.clone())).await;
     Ok(())
 }
 
@@ -7918,6 +9878,184 @@ async fn engine_update_mistralrs(d: &BlazarDirs, tag: Option<String>, check: boo
     engine_install_mistralrs(d, Some(target)).await
 }
 
+/// `blazar engine install --kind sdcpp [tag]` — prebuilt sd-server from
+/// leejet/stable-diffusion.cpp. Vulkan-first asset pick covers every
+/// GPU vendor; CPU fallback where no GPU build matched. The F7
+/// decode-regression gate is llama-server-only: skipped, and SAID so —
+/// llama-bench cannot drive an sd-server child.
+async fn engine_install_sdcpp(d: &BlazarDirs, tag: Option<String>) -> Result<()> {
+    let mgr = local_engine_manager(d)?;
+    let prior_active = Store::open(d)?.active_engine()?.map(|r| r.tag);
+    let wanted = tag.clone().unwrap_or_else(|| "latest".to_string());
+    println!("installing sd.cpp {wanted} (prebuilt upstream sd-server)");
+    let row = mgr.update_sdcpp(tag.as_deref()).await?;
+    let m: blazar_runtime::Manifest = serde_json::from_str(&row.manifest)?;
+    println!(
+        "engine {} active ({} flags probed, build {})",
+        row.tag,
+        m.flags.len(),
+        m.build_number
+    );
+    println!("note: decode-regression gate is llama-server-only — skipped for sd.cpp engines");
+    // Same one-build-per-lane contract as the other engine lanes:
+    // superseded sd.cpp dirs free their space on a successful install.
+    for (tag, bytes) in mgr.prune_siblings(EngineKind::SdCpp.as_str(), &row.tag)? {
+        // fs sizes fit i64
+        #[allow(clippy::cast_possible_wrap)]
+        let freed = bytes as i64;
+        println!(
+            "removed superseded engine {tag} (freed {})",
+            humansize(freed)
+        );
+    }
+    restart_daemon_if_active_changed(prior_active, row.active.then(|| row.tag.clone())).await;
+    Ok(())
+}
+
+/// `blazar engine update --kind sdcpp [tag]` — currency lane parity with
+/// mistral.rs: a bare call probes sd.cpp GitHub and installs the newest
+/// `master-NNN-<sha8>` release when one exists; an explicit tag
+/// force-installs it. sd.cpp cuts no semver — the tag counter is the
+/// ordering (see `sdtag_counter`). `--check` resolves and reports only.
+async fn engine_update_sdcpp(d: &BlazarDirs, tag: Option<String>, check: bool) -> Result<()> {
+    let store = Store::open(d)?;
+    let Some(installed) = newest_sdcpp_tag(&store)? else {
+        return Err(anyhow!(
+            "no sdcpp engine installed — `blazar engine install --kind sdcpp` first"
+        ));
+    };
+    let pinned = tag.is_some();
+    let target = if let Some(t) = tag {
+        t
+    } else {
+        // Currency probe: live 4s-capped latest-tag resolve (same cap
+        // as the mistral.rs row; sd.cpp releases are frequent — often
+        // several per day around new-model support).
+        let mgr = local_engine_manager(d)?;
+        let fetched = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            mgr.gh.latest_sdcpp_release(),
+        )
+        .await;
+        match fetched {
+            Ok(Ok(rel)) => rel.tag_name,
+            Ok(Err(e)) => anyhow::bail!(
+                "cannot check sd.cpp releases: {e:#} — offline? set GH_TOKEN if rate limited"
+            ),
+            Err(_) => anyhow::bail!("sd.cpp release check timed out after 4s"),
+        }
+    };
+    let newer = matches!(
+        (
+            blazar_runtime::engine::gh::sdtag_counter(&installed),
+            blazar_runtime::engine::gh::sdtag_counter(&target),
+        ),
+        (Some(a), Some(b)) if b > a
+    );
+    if check {
+        println!("dry-run: nothing installed, nothing written");
+        if newer {
+            println!("would update sd.cpp {installed} -> {target}");
+            println!("  blazar engine update --kind sdcpp {target}");
+        } else {
+            println!("sd.cpp {installed} stays (target: {target})");
+        }
+        return Ok(());
+    }
+    if !pinned && !newer {
+        println!("sd.cpp {installed} is current (upstream latest: {target}).");
+        return Ok(());
+    }
+    engine_install_sdcpp(d, Some(target)).await
+}
+
+/// `blazar engine install --kind whisper [tag]` — prebuilt
+/// whisper-server from ggerganov/whisper.cpp (b-tag releases; the v-tags
+/// are source-only). Serving is CPU-contract, so the asset pick is
+/// platform-shaped. The F7 decode-regression gate is llama-server-only:
+/// skipped, and SAID so.
+async fn engine_install_whisper(d: &BlazarDirs, tag: Option<String>) -> Result<()> {
+    let mgr = local_engine_manager(d)?;
+    let wanted = tag.clone().unwrap_or_else(|| "latest".to_string());
+    println!("installing whisper.cpp {wanted} (prebuilt upstream whisper-server)");
+    let row = mgr.update_whisper(tag.as_deref()).await?;
+    let m: blazar_runtime::Manifest = serde_json::from_str(&row.manifest)?;
+    println!(
+        "engine {} active ({} flags probed, build {})",
+        row.tag,
+        m.flags.len(),
+        m.build_number
+    );
+    println!("note: decode-regression gate is llama-server-only — skipped for whisper engines");
+    // Same one-build-per-lane contract as the other engine lanes.
+    for (tag, bytes) in mgr.prune_siblings(EngineKind::Whisper.as_str(), &row.tag)? {
+        // fs sizes fit i64
+        #[allow(clippy::cast_possible_wrap)]
+        let freed = bytes as i64;
+        println!(
+            "removed superseded engine {tag} (freed {})",
+            humansize(freed)
+        );
+    }
+    Ok(())
+}
+
+/// `blazar engine update --kind whisper [tag]` — currency lane parity:
+/// a bare call probes whisper.cpp GitHub and installs the newest `bNNNN`
+/// release when one exists; an explicit tag force-installs it. The
+/// b-counter is the ordering (see `btag_number`). `--check` resolves and
+/// reports only.
+async fn engine_update_whisper(d: &BlazarDirs, tag: Option<String>, check: bool) -> Result<()> {
+    let store = Store::open(d)?;
+    let Some(installed) = newest_whisper_tag(&store)? else {
+        return Err(anyhow!(
+            "no whisper engine installed — `blazar engine install --kind whisper` first"
+        ));
+    };
+    let pinned = tag.is_some();
+    let target = if let Some(t) = tag {
+        t
+    } else {
+        // Currency probe: live 4s-capped latest-tag resolve (same cap as
+        // the mistral.rs/sd.cpp rows).
+        let mgr = local_engine_manager(d)?;
+        let fetched = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            mgr.gh.latest_whisper_release(),
+        )
+        .await;
+        match fetched {
+            Ok(Ok(rel)) => rel.tag_name,
+            Ok(Err(e)) => anyhow::bail!(
+                "cannot check whisper.cpp releases: {e:#} — offline? set GH_TOKEN if rate limited"
+            ),
+            Err(_) => anyhow::bail!("whisper.cpp release check timed out after 4s"),
+        }
+    };
+    let newer = matches!(
+        (
+            blazar_runtime::engine::gh::btag_number(&installed),
+            blazar_runtime::engine::gh::btag_number(&target),
+        ),
+        (Some(a), Some(b)) if b > a
+    );
+    if check {
+        println!("dry-run: nothing installed, nothing written");
+        if newer {
+            println!("would update whisper.cpp {installed} -> {target}");
+            println!("  blazar engine update --kind whisper {target}");
+        } else {
+            println!("whisper.cpp {installed} stays (target: {target})");
+        }
+        return Ok(());
+    }
+    if !pinned && !newer {
+        println!("whisper.cpp {installed} is current (upstream latest: {target}).");
+        return Ok(());
+    }
+    engine_install_whisper(d, Some(target)).await
+}
+
 /// Newest installed mistral.rs tag (`vX.Y.Z`), the currency baseline for
 /// the update lane. `list_engines` is newest-first, but the explicit
 /// version compare keeps the pick honest if row order ever changes.
@@ -7927,6 +10065,28 @@ fn newest_mistralrs_tag(store: &Store) -> Result<Option<String>> {
         .into_iter()
         .filter(|e| e.kind == EngineKind::MistralRs)
         .max_by_key(|e| mistralrs_version_tuple(&e.tag).unwrap_or((0, 0, 0)))
+        .map(|e| e.tag.clone()))
+}
+
+/// Newest installed sd.cpp tag (`master-NNN-<sha8>`) by tag counter —
+/// the same role `newest_mistralrs_tag` plays for the semver lane.
+fn newest_sdcpp_tag(store: &Store) -> Result<Option<String>> {
+    Ok(store
+        .list_engines()?
+        .into_iter()
+        .filter(|e| e.kind == EngineKind::SdCpp)
+        .max_by_key(|e| blazar_runtime::engine::gh::sdtag_counter(&e.tag).unwrap_or(0))
+        .map(|e| e.tag.clone()))
+}
+
+/// Newest installed whisper tag (`bNNNN`) by build counter — mirrors
+/// `newest_sdcpp_tag` for the b-tag lane (v-tags ship source only).
+fn newest_whisper_tag(store: &Store) -> Result<Option<String>> {
+    Ok(store
+        .list_engines()?
+        .into_iter()
+        .filter(|e| e.kind == EngineKind::Whisper)
+        .max_by_key(|e| blazar_runtime::engine::gh::btag_number(&e.tag).unwrap_or(0))
         .map(|e| e.tag.clone()))
 }
 
@@ -7951,6 +10111,7 @@ fn mistralrs_version_tuple(tag: &str) -> Option<(u64, u64, u64)> {
 /// so — llama-bench cannot drive an sglang child.
 async fn engine_install_sglang(d: &BlazarDirs, version: Option<String>) -> Result<()> {
     let mgr = local_engine_manager(d)?;
+    let prior_active = Store::open(d)?.active_engine()?.map(|r| r.tag);
     if let Some(v) = &version {
         println!("installing sglang {v} (pip venv lane — multi-GB download incl. torch)");
     } else {
@@ -7979,6 +10140,7 @@ async fn engine_install_sglang(d: &BlazarDirs, version: Option<String>) -> Resul
         );
     }
     println!("next: pull a safetensors model (e.g. blazar pull Qwen/Qwen2.5-0.5B-Instruct)");
+    restart_daemon_if_active_changed(prior_active, row.active.then(|| row.tag.clone())).await;
     Ok(())
 }
 
@@ -8333,6 +10495,7 @@ async fn engine_update(
             row.tag
         );
     }
+    restart_daemon_if_active_changed(active_tag, row.active.then(|| row.tag.clone())).await;
 
     Ok(())
 }
@@ -8449,6 +10612,11 @@ async fn engine_build(d: &BlazarDirs, a: BackendArg) -> Result<()> {
     let token = std::env::var("GH_TOKEN").ok();
     let gh = GhClient::new(token)?;
     let cfg = config()?;
+    // Prior active tag: the post-build restart hook needs to know
+    // whether THIS build actually dethroned the serving engine.
+    let prior_active = blazar_core::store::Store::open(d)?
+        .active_engine()?
+        .map(|r| r.tag);
     let resolved = resolve_build_label(&gh, cfg.update_channel, &a, &source).await?;
     if !fork && btag_number(&resolved).is_none() {
         return Err(anyhow!(
@@ -8544,6 +10712,7 @@ async fn engine_build(d: &BlazarDirs, a: BackendArg) -> Result<()> {
     // startup): mine binary-installed mainstream lanes, re-check fork
     // coverage, sweep retired curated lanes.
     refresh_after_lane_change(&mgr, &cfg).await;
+    restart_daemon_if_active_changed(prior_active, row.active.then(|| row.tag.clone())).await;
     Ok(())
 }
 
@@ -8695,6 +10864,9 @@ async fn engine_install_lane(d: &BlazarDirs, lane_id: &str, backend: Option<&str
         bus: EventBus::default(),
         asset_override: cfg.engine_asset.clone(),
     };
+    // First-of-its-kind fork lanes activate; additive siblings do not —
+    // the restart hook decides from the returned row, not the lane type.
+    let prior_active = Store::open(d)?.active_engine()?.map(|r| r.tag);
     let mut opts = BuildOpts::new(backend, &lane.ref_sha);
     opts.source = BuildSource::Fork {
         repo: lane.repo.clone(),
@@ -8718,18 +10890,28 @@ async fn engine_install_lane(d: &BlazarDirs, lane_id: &str, backend: Option<&str
         cfg.fork_retire_days
     );
     refresh_after_lane_change(&mgr, &cfg).await;
+    restart_daemon_if_active_changed(prior_active, row.active.then(|| row.tag.clone())).await;
     Ok(())
 }
 
 /// Best-effort upstream check (user-invoked only, ~4s budget, silent on
 /// failure): prints an update hint when a newer b-tag exists.
+/// The engine-list/install currency hint reads the llama.cpp b-release
+/// channel, so it only speaks for a llamacpp active row. Foreign lanes
+/// (whisper, sdcpp, mistral.rs, sglang) carry their own per-lane update
+/// paths; comparing their tags against llama.cpp build numbers produces
+/// nonsense verdicts (whisper b5130 vs llama b11102).
+fn llama_channel_hint_applies(tag: &str, kind: blazar_core::engine_kind::EngineKind) -> bool {
+    tag != "local" && kind == blazar_core::engine_kind::EngineKind::LlamaCpp
+}
+
 async fn upstream_update_hint(dirs: &BlazarDirs) {
     let Ok(store) = Store::open(dirs) else { return };
     let Ok(Some(active)) = store.active_engine() else {
         return;
     };
-    if active.tag == "local" {
-        return; // local build: upstream currency is the user's concern
+    if !llama_channel_hint_applies(&active.tag, active.kind) {
+        return; // local build or a foreign lane: the llama.cpp channel speaks for neither
     }
     let Ok(cfg) = Config::load(dirs) else { return };
     let token = std::env::var("GH_TOKEN").ok();
@@ -8790,13 +10972,14 @@ fn spawn_engine_check_task(
                 delay = full_delay;
                 continue; // local build: currency is the user's concern
             }
-            if matches!(active.kind, EngineKind::MistralRs | EngineKind::Sglang) {
+            if !llama_channel_hint_applies(&active.tag, active.kind) {
                 delay = full_delay;
                 continue; // the llamacpp channel survey is meaningless
-                          // against non-llamacpp tags (it would nag
+                          // against non-llamacpp lanes (it would nag
                           // "update available: bNNNN" cross-kind);
-                          // mistral.rs currency lives in `blazar doctor`,
-                          // sglang is a pinned pip lane
+                          // each lane carries its own update path
+                          // (mistral.rs/sdcpp/whisper: `engine update
+                          // --kind`, sglang: pinned pip lane)
             }
             let Ok(cfg) = Config::load(&dirs) else {
                 delay = retry_delay;
@@ -8863,10 +11046,24 @@ fn spawn_engine_check_task(
                 "update_available": newer,
                 "devices": devices,
             });
-            let _ = std::fs::write(dirs.run_dir().join("engine-check.json"), marker.to_string());
+            write_engine_check_marker(&dirs, &marker);
             delay = full_delay;
         }
     });
+}
+
+/// Persist the engine-check marker atomically (tmp + rename): a plain
+/// write racing a reader — or a second daemon generation during a
+/// restart — once left two concatenated JSON objects in the file.
+/// Readers see either the old or the new marker, never a mix.
+fn write_engine_check_marker(dirs: &BlazarDirs, marker: &serde_json::Value) {
+    let path = dirs.run_dir().join("engine-check.json");
+    let tmp = dirs.run_dir().join("engine-check.json.tmp");
+    if let Err(e) =
+        std::fs::write(&tmp, marker.to_string()).and_then(|()| std::fs::rename(&tmp, &path))
+    {
+        tracing::debug!(target: "blazar::engine", "engine-check marker write failed: {e}");
+    }
 }
 
 /// Rotate daemon.log when it exceeds ~10 MiB (best-effort, at start).
@@ -8889,26 +11086,54 @@ fn rotate_daemon_log(d: &BlazarDirs) {
 /// after every install): newest `KEEP_TAGS` engines plus `local` and the
 /// active tag survive, everything older is removed.
 fn engine_prune(d: &BlazarDirs) -> Result<()> {
-    let store = Store::open(d)?;
-    let before: Vec<String> = store.list_engines()?.into_iter().map(|e| e.tag).collect();
-    let mgr = local_engine_manager(d)?;
-    mgr.prune(&store)?;
-    let after: Vec<String> = store.list_engines()?.into_iter().map(|e| e.tag).collect();
-    let removed: Vec<&str> = before
-        .iter()
-        .map(String::as_str)
-        .filter(|t| !after.iter().any(|kept| kept == t))
-        .collect();
-    if removed.is_empty() {
-        println!(
-            "nothing to prune — {} engines kept: {}",
-            after.len(),
-            after.join(", ")
-        );
-    } else {
-        println!("pruned {} (kept: {})", removed.join(", "), after.join(", "));
-    }
+    let summary = engine_prune_summary(d)?;
+    println!("{summary}");
     Ok(())
+}
+
+/// The prune report as a single line: per-tag reclaimed sizes for both
+/// retention-pruned engines and row-less dirs, closed by the total —
+/// the doctor warnings promise "reclaims disk", this says how much.
+fn engine_prune_summary(d: &BlazarDirs) -> Result<String> {
+    let store = Store::open(d)?;
+    let mgr = local_engine_manager(d)?;
+    let freed = mgr.prune(&store, None)?;
+    // Row-less dirs are invisible to the table sweep above yet eat disk;
+    // reclaim them in the same manual pass.
+    let orphans = mgr.prune_orphan_dirs()?;
+    let kept: Vec<String> = store.list_engines()?.into_iter().map(|e| e.tag).collect();
+    if freed.is_empty() && orphans.is_empty() {
+        return Ok(format!(
+            "nothing to prune — {} engines kept: {}",
+            kept.len(),
+            kept.join(", ")
+        ));
+    }
+    let mut parts = Vec::new();
+    if !freed.is_empty() {
+        let removed: Vec<String> = freed
+            .iter()
+            .map(|(tag, bytes)| format!("{tag} ({})", humansize(bytes.cast_signed())))
+            .collect();
+        parts.push(format!(
+            "pruned {} (kept: {})",
+            removed.join(", "),
+            kept.join(", ")
+        ));
+    }
+    let mut total: u64 = freed.iter().map(|(_, b)| b).sum();
+    for (tag, bytes) in &orphans {
+        total += bytes;
+        parts.push(format!(
+            "removed orphan engine dir {tag} ({}, no store row)",
+            humansize(bytes.cast_signed())
+        ));
+    }
+    Ok(format!(
+        "{} — reclaimed {} in total",
+        parts.join("; "),
+        humansize(total.cast_signed())
+    ))
 }
 
 fn engine_rm(d: &BlazarDirs, tag: &str) -> Result<()> {
@@ -9092,6 +11317,10 @@ fn human_count(n: u64) -> String {
 
 #[allow(clippy::too_many_lines)] // result table renderer: header, rows, footer
 async fn search(query: &str, format: &str, quant: Option<&str>, json: bool) -> Result<()> {
+    // Table-only cap on the ARCH column: long architecture ids
+    // (xlm-roberta, nomic_bert) once bled into CTX under a fixed width;
+    // 18 keeps every known arch whole and ellipsizes runaways.
+    const ARCH_CAP: usize = 18;
     // Quant filtering is client-side (the Hub exposes no quant facet):
     // bare grammar-exact query tokens (`q4`, `Q4_K_M`) always leave the
     // text query — they are dead weight in the Hub's full-text search
@@ -9179,16 +11408,10 @@ async fn search(query: &str, format: &str, quant: Option<&str>, json: bool) -> R
         }
         return Ok(());
     }
-    // Column width adapts to the longest repo id (capped) so numbers never
-    // drift out of alignment; oversize ids shrink the owner, keeping the
-    // model name — the pull discriminator — fully visible.
+    // Oversize ids shrink the owner (cap), keeping the model name — the
+    // pull discriminator — fully visible; column widths adapt inside
+    // render_table.
     let cap = 64usize;
-    let width = results
-        .iter()
-        .map(|r| r.id.len().min(cap))
-        .max()
-        .unwrap_or(0)
-        .max("REPO".len());
     let human_ctx = |c: u64| {
         if c >= 1024 * 1024 {
             format!("{}M", c / (1024 * 1024))
@@ -9198,48 +11421,44 @@ async fn search(query: &str, format: &str, quant: Option<&str>, json: bool) -> R
             c.to_string()
         }
     };
-    println!(
-        "{:<width$}  {:>10}  {:>6}  {:<11}  {:<10}  {:<7}  {:>5}  {:<22}",
-        "REPO",
-        "DOWNLOADS",
-        "LIKES",
-        "FORMAT",
-        "SIZE",
-        "ARCH",
-        "CTX",
-        "QUANTS",
-        width = width
-    );
+    let mut table: Vec<Vec<String>> = Vec::new();
     for r in results {
         let id = truncate_repo_id(&r.id, cap);
-        let (size, arch, ctx) = (
+        let arch = entry_arch(&r).map_or_else(|| "-".to_string(), |a| trunc_ellipsis(&a, ARCH_CAP));
+        table.push(vec![
+            id,
+            human_count(r.downloads.unwrap_or(0)),
+            r.likes.unwrap_or(0).to_string(),
+            format_of_entry(&r),
             entry_size_bytes(&r).map_or_else(
                 || "-".to_string(),
                 |b| humansize(i64::try_from(b).unwrap_or(i64::MAX)),
             ),
-            entry_arch(&r).unwrap_or_else(|| "?".to_string()),
+            arch,
             r.gguf
                 .as_ref()
                 .and_then(|g| g.context_length)
                 .map_or_else(|| "-".to_string(), &human_ctx),
-        );
-        let names = entry_quants(&r);
-        // GGUF rows carry real per-file quants; MLX/AWQ/GPTQ/FP8 rows only
-        // name their bit-width in the repo id.
-        let quants = collapse_tokens(&names);
-        println!(
-            "{:<width$}  {:>10}  {:>6}  {:<11}  {:<10}  {:<7}  {:>5}  {:<22}",
-            id,
-            human_count(r.downloads.unwrap_or(0)),
-            r.likes.unwrap_or(0),
-            format_of_entry(&r),
-            size,
-            arch,
-            ctx,
-            quants,
-            width = width
-        );
+            collapse_tokens(&entry_quants(&r)),
+        ]);
     }
+    print!(
+        "{}",
+        render_table(
+            &[
+                "REPO",
+                "DOWNLOADS",
+                "LIKES",
+                "FORMAT",
+                "SIZE",
+                "ARCH",
+                "CTX",
+                "QUANTS"
+            ],
+            &table,
+            &[1, 2, 4, 6]
+        )
+    );
     match format.as_str() {
         "any" | "all" => println!(
             "\n# pull: blazar pull <REPO>[:quant] (GGUF → llamacpp) or blazar pull <REPO> (safetensors/AWQ/GPTQ/FP8 → sglang/mistralrs)\n# MLX repos are Apple-silicon-only — pull the same model's GGUF or safetensors repo instead"
@@ -9812,6 +12031,12 @@ async fn upgrade(version: Option<String>, dry_run: bool) -> Result<()> {
     if summary.starts_with("upgrade failed") {
         return Err(anyhow!("upgrade failed"));
     }
+    // The binary swap only helps a running daemon once it re-execs;
+    // a no-op restart keeps `blazar upgrade` start-free when no daemon
+    // is up.
+    if !dry_run {
+        restart_daemon().await;
+    }
     Ok(())
 }
 
@@ -9819,6 +12044,50 @@ async fn upgrade(version: Option<String>, dry_run: bool) -> Result<()> {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__write_engine_check_marker__replaces_whole_file_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(dirs.run_dir()).unwrap();
+        write_engine_check_marker(&dirs, &serde_json::json!({"latest": "b1", "n": 1}));
+        write_engine_check_marker(&dirs, &serde_json::json!({"latest": "b2", "n": 2}));
+        let raw = std::fs::read_to_string(dirs.run_dir().join("engine-check.json")).unwrap();
+        // Exactly one JSON object — the double-write bug this pins left
+        // two concatenated objects in the file.
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["latest"], "b2");
+        assert!(!dirs.run_dir().join("engine-check.json.tmp").exists());
+    }
+
+    #[test]
+    fn unit__chrono_now_compact__same_millisecond_calls_stay_distinct() {
+        let a = chrono_now_compact();
+        let b = chrono_now_compact();
+        // Sequence counter must keep back-to-back stamps distinct even when
+        // the clock has not ticked: distinct names = no silent overwrite.
+        assert_ne!(a, b);
+        // Millisecond resolution: 13-digit epoch-ms prefix, then "-<seq>".
+        let (ms, seq) = b.split_once('-').expect("millis-seq format");
+        assert!(ms.len() >= 13, "millisecond epoch prefix: {ms}");
+        assert!(!seq.is_empty() && seq.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn unit__ppid_from_stat__parses_past_spaces_in_comm() {
+        // comm with spaces and parens (kernel threads, java-style names)
+        let stat = "42 (sd-server (child)) S 41 0 0 0 -1 4194560";
+        assert_eq!(ppid_from_stat(stat), Some(41));
+        // Plain comm, pid == 1 style root
+        let stat = "1 (systemd) S 0 1 1 0 -1";
+        assert_eq!(ppid_from_stat(stat), Some(0));
+        // Garbage: no closing paren, no numbers — None, never a guess.
+        assert_eq!(ppid_from_stat("garbage"), None);
+        assert_eq!(ppid_from_stat(""), None);
+    }
 
     fn gap_engine_row(tag: &str, kind: EngineKind, archs: &[&str]) -> blazar_core::EngineRow {
         blazar_core::EngineRow {
@@ -9906,6 +12175,143 @@ mod tests {
 
     #[test]
     #[allow(non_snake_case)]
+    fn unit__run_lane__component_sets_and_standalone_route_by_family() {
+        let base = || blazar_core::store::ModelRow {
+            name: "qwen-image-2.1".into(),
+            repo: "abenzerps/Qwen-Image-2.1-GGUF".into(),
+            quant: "Q4_K_M".into(),
+            path: "/models/qwen-image-2.1-Q4_K_M.gguf".into(),
+            bytes: 4_294_967_296,
+            sha256: None,
+            mmproj_path: None,
+            components: vec![],
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+        };
+        // Text rows (no component set) stay on the chat REPL.
+        assert!(matches!(run_lane(&base()), RunLane::Text));
+        // Image component sets route to the image loop.
+        let mut row = base();
+        row.components = vec![
+            blazar_core::store::ComponentFile::new("--vae", "/models/vae.safetensors"),
+            blazar_core::store::ComponentFile::new("--llm", "/models/te.gguf"),
+        ];
+        assert!(matches!(run_lane(&row), RunLane::Image));
+        // Wan-family sets route to the video loop instead.
+        let mut wan = base();
+        wan.repo = "Comfy-Org/Wan_2.1_ComfyUI_repackaged".into();
+        wan.components = vec![
+            blazar_core::store::ComponentFile::new("--vae", "/models/wan_2.1_vae.safetensors"),
+            blazar_core::store::ComponentFile::new("--t5xxl", "/models/umt5.gguf"),
+        ];
+        assert!(matches!(run_lane(&wan), RunLane::Video));
+        // Standalone checkpoints (SDXL-style --model self-reference) are
+        // image rows too.
+        let mut sdxl = base();
+        sdxl.repo = "stabilityai/stable-diffusion-xl-base-1.0".into();
+        sdxl.components = vec![blazar_core::store::ComponentFile::new(
+            "--model",
+            "/models/sd_xl_base_1.0.safetensors",
+        )];
+        assert!(matches!(run_lane(&sdxl), RunLane::Image));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__job_payload__reads_result_envelope_not_sync_shape() {
+        use base64::Engine as _;
+        let raw = base64::engine::general_purpose::STANDARD.encode(b"payload");
+        // Async job envelope: payload rides under `result`.
+        let job = serde_json::json!({
+            "id": "job_1", "status": "completed",
+            "result": {"b64_json": raw}
+        });
+        let (bytes, ext) = job_payload(&job, "webm").expect("result envelope must parse");
+        assert_eq!(bytes, b"payload");
+        assert_eq!(ext, "webm");
+        // output_format inside result overrides the default.
+        let job2 = serde_json::json!({
+            "status": "completed",
+            "result": {"b64_json": raw, "output_format": "mp4"}
+        });
+        assert_eq!(
+            job_payload(&job2, "webm").map(|(_, e)| e),
+            Some("mp4".into())
+        );
+        // The sync {data:[...]} shape is NOT a job envelope.
+        let sync = serde_json::json!({"data": [{"b64_json": raw}], "output_format": "png"});
+        assert!(job_payload(&sync, "webm").is_none());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__tts_voice_target__matches_voice_and_alias_takes_first() {
+        let voices: Vec<String> = ["en_US-amy-medium", "en_GB-alan-low"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        // Exact voice name wins.
+        assert_eq!(
+            tts_voice_target("en_GB-alan-low", &voices).map(String::as_str),
+            Some("en_GB-alan-low")
+        );
+        // The generic aliases pick the first installed voice.
+        assert_eq!(
+            tts_voice_target("tts", &voices).map(String::as_str),
+            Some("en_US-amy-medium")
+        );
+        assert_eq!(
+            tts_voice_target("piper", &voices).map(String::as_str),
+            Some("en_US-amy-medium")
+        );
+        // Anything else (and an empty voice set) is not a speech lane.
+        assert!(tts_voice_target("qwen2.5-0.5b", &voices).is_none());
+        assert!(tts_voice_target("tts", &[]).is_none());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__gen_knobs__parse_and_reject() {
+        assert_eq!(
+            parse_gen_size("1024x1024").as_deref(),
+            Some("1024x1024"),
+            "square size parses"
+        );
+        assert_eq!(parse_gen_size("960x480").as_deref(), Some("960x480"));
+        assert!(parse_gen_size("1024").is_none(), "no x separator");
+        assert!(parse_gen_size("1024xx768").is_none(), "double separator");
+        assert!(parse_gen_size("-1x768").is_none(), "negative width");
+        assert!(parse_gen_size("1024x").is_none(), "empty height");
+        assert_eq!(parse_gen_steps("24"), Some(24));
+        assert_eq!(parse_gen_steps("1"), Some(1), "lower bound inclusive");
+        assert_eq!(parse_gen_steps("100"), Some(100), "upper bound inclusive");
+        assert!(parse_gen_steps("0").is_none(), "zero steps");
+        assert!(parse_gen_steps("101").is_none(), "past upper bound");
+        assert!(parse_gen_steps("many").is_none(), "non-numeric");
+        assert_eq!(parse_gen_duration("5"), Some(5));
+        assert!(parse_gen_duration("0").is_none(), "zero duration");
+        assert!(parse_gen_duration("61").is_none(), "past the patience cap");
+        assert_eq!(parse_gen_speed("1.0"), Some(1.0));
+        assert_eq!(parse_gen_speed("0.1"), Some(0.1), "lower bound inclusive");
+        assert_eq!(parse_gen_speed("4.0"), Some(4.0), "upper bound inclusive");
+        assert!(parse_gen_speed("0.05").is_none(), "under the range");
+        assert!(parse_gen_speed("fast").is_none(), "non-numeric");
+        // Seeds are signed: negatives re-roll per request upstream.
+        assert_eq!(parse_gen_seed("42"), Some(42));
+        assert_eq!(parse_gen_seed("-1"), Some(-1), "negative = re-roll");
+        assert!(parse_gen_seed("soon").is_none(), "non-numeric");
+        // Frames: 1..=201, wan aligns down to 4k+1 engine-side.
+        assert_eq!(parse_gen_frames("33"), Some(33));
+        assert!(parse_gen_frames("0").is_none(), "zero frames");
+        assert!(parse_gen_frames("202").is_none(), "past the cap");
+        assert!(parse_gen_frames("many").is_none(), "non-numeric");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
     fn unit__engine_arch_gap__silent_when_arch_or_lane_unknown() {
         let rows = vec![gap_engine_row("b1-cuda", EngineKind::LlamaCpp, &["qwen2"])];
         assert_eq!(
@@ -9960,6 +12366,7 @@ mod tests {
             bytes: 0,
             sha256: None,
             mmproj_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,
@@ -10883,12 +13290,14 @@ mod tests {
                 &engine_rows,
                 "m",
                 Some("qwen2"),
+                false,
                 "/x/m.gguf"
             ),
             Ok("b-new".to_string())
         );
         // No engines at all: teaching error names the install command.
-        let err = routed_engine_lane(&cfg, None, &[], "m", Some("qwen2"), "/x/m.gguf").unwrap_err();
+        let err = routed_engine_lane(&cfg, None, &[], "m", Some("qwen2"), false, "/x/m.gguf")
+            .unwrap_err();
         assert!(err.contains("blazar engine install"), "{err}");
         // A per-model pin to an uninstalled lane teaches with the roster.
         let pinned =
@@ -10900,6 +13309,7 @@ mod tests {
             &engine_rows,
             "m",
             Some("qwen2"),
+            false,
             "/x/m.gguf",
         )
         .unwrap_err();
@@ -10915,6 +13325,7 @@ mod tests {
                 &engine_rows,
                 "m",
                 Some("Qwen2ForCausalLM"),
+                false,
                 &dir.to_string_lossy()
             ),
             Ok("sg-1".to_string())
@@ -10939,6 +13350,7 @@ mod tests {
                 &engine_rows,
                 "m",
                 Some("instella-moe"),
+                false,
                 "/x/m.gguf"
             ),
             Ok("b-adv".to_string())
@@ -10951,6 +13363,7 @@ mod tests {
                 &engine_rows,
                 "m",
                 Some("qwen2"),
+                false,
                 "/x/m.gguf"
             ),
             Ok("b-main".to_string())
@@ -10966,6 +13379,7 @@ mod tests {
                 &engine_rows,
                 "m",
                 Some("instella-moe"),
+                false,
                 "/x/m.gguf"
             ),
             Ok("b-main".to_string())
@@ -10979,6 +13393,7 @@ mod tests {
                 &engine_rows,
                 "m",
                 Some("mystery-arch"),
+                false,
                 "/x/m.gguf"
             ),
             Ok("b-main".to_string())
@@ -10997,6 +13412,7 @@ mod tests {
                 "instella-moe".to_string(),
                 "32768".to_string(),
                 "gguf".to_string(),
+                "text".to_string(),
                 long_tag.to_string(),
             ],
             [
@@ -11007,12 +13423,13 @@ mod tests {
                 "llama".to_string(),
                 "4096".to_string(),
                 "gguf".to_string(),
+                "text".to_string(),
                 "b-test".to_string(),
             ],
         ];
         let out = render_list_table(
             [
-                "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "ENGINE",
+                "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "CATEGORY", "ENGINE",
             ],
             &rows,
         );
@@ -11040,6 +13457,7 @@ mod tests {
                 "nanbeige".to_string(),
                 "262144".to_string(),
                 "gguf".to_string(),
+                "text".to_string(),
                 "b-test".to_string(),
             ],
             [
@@ -11051,12 +13469,13 @@ mod tests {
                 "Qwen2ForCausalLM".to_string(),
                 "32768".to_string(),
                 "safetensors".to_string(),
+                "text".to_string(),
                 "b-test".to_string(),
             ],
         ];
         let out = render_list_table(
             [
-                "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "ENGINE",
+                "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "CATEGORY", "ENGINE",
             ],
             &rows,
         );
@@ -11088,11 +13507,12 @@ mod tests {
             "Qwen2VLForConditionalGeneration".to_string(),
             "4096".to_string(),
             "gguf".to_string(),
+            "vision".to_string(),
             "sg-test".to_string(),
         ]];
         let out2 = render_list_table(
             [
-                "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "ENGINE",
+                "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "CATEGORY", "ENGINE",
             ],
             &long,
         );
@@ -11719,6 +14139,7 @@ mod tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,
@@ -11745,11 +14166,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("owned.gguf"), b"x").unwrap();
         std::fs::write(dir.join("sidecar.gguf"), b"x").unwrap();
-        std::fs::write(dir.join("stray.gguf"), b"x").unwrap();
+        std::fs::write(dir.join("stray.gguf"), vec![0u8; 2048]).unwrap();
         let mut row = row_with_path(&dir.join("owned.gguf"));
         row.mmproj_path = Some(dir.join("sidecar.gguf").display().to_string());
         let r = orphan_scan(&[row], &dir);
-        assert_eq!(r.orphans, vec!["stray.gguf".to_string()]);
+        let names: Vec<&str> = r.orphans.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, vec!["stray.gguf"]);
+        assert_eq!(r.orphans[0].bytes, 2048, "size captured from disk");
         assert_eq!(r.twins, 0);
     }
 
@@ -11781,7 +14204,8 @@ mod tests {
         std::fs::write(dir.join("notes.txt"), b"x").unwrap();
         std::fs::write(dir.join("UPPER.GGUF"), b"x").unwrap();
         let r = orphan_scan(&[], &dir);
-        assert_eq!(r.orphans, vec!["UPPER.GGUF".to_string()]); // case-insensitive ext
+        let names: Vec<&str> = r.orphans.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, vec!["UPPER.GGUF"]); // case-insensitive ext
     }
 
     #[test]
@@ -11794,7 +14218,7 @@ mod tests {
         std::fs::create_dir_all(d.models_dir()).unwrap();
         drop(blazar_core::store::Store::open(&d).unwrap());
         std::fs::write(d.models_dir().join("registered.gguf"), b"x").unwrap();
-        std::fs::write(d.models_dir().join("orphan.gguf"), b"x").unwrap();
+        std::fs::write(d.models_dir().join("orphan.gguf"), vec![0u8; 512]).unwrap();
         // Register by direct insert: doctor_models reads the real store.
         {
             let store = blazar_core::store::Store::open(&d).unwrap();
@@ -11803,11 +14227,383 @@ mod tests {
                 .unwrap();
         }
         let checks = doctor_models(&d);
-        assert_eq!(checks.len(), 1, "{:?}", checks.len());
+        // Since the MODELS mega-line split: metadata health ("models")
+        // and orphan files ("unmanaged files") are separate rows. The
+        // fixture's 1-byte placeholder makes both warn.
+        assert_eq!(checks.len(), 2, "{checks:?}");
+        assert_eq!(checks[0].name, "models");
         assert!(checks[0].warn && checks[0].ok, "{}", checks[0].detail);
         assert!(
-            checks[0].detail.contains("orphan.gguf")
-                && checks[0].detail.contains("blazar import <file> --name <n>"),
+            checks[0].detail.contains("unreadable or incomplete"),
+            "{}",
+            checks[0].detail
+        );
+        assert_eq!(checks[1].name, "unmanaged files");
+        assert!(checks[1].warn && checks[1].ok, "{}", checks[1].detail);
+        assert!(
+            checks[1].detail.contains("orphan.gguf (512 B)")
+                && checks[1].detail.contains("blazar import <file> --name <n>"),
+            "{}",
+            checks[1].detail
+        );
+    }
+
+    #[test]
+    fn unit__orphan_scan__content_twin_flagged_byte_identical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("models");
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload = vec![7u8; 4096];
+        std::fs::write(dir.join("registered.gguf"), &payload).unwrap();
+        // Manual-download duplicate: same bytes, different name.
+        std::fs::write(dir.join("duplicate.gguf"), &payload).unwrap();
+        // Same SIZE, different content — the sha256 gate must not
+        // libel it as a twin.
+        let mut sibling = payload.clone();
+        sibling[0] ^= 0xff;
+        std::fs::write(dir.join("same-size.gguf"), &sibling).unwrap();
+        let models = vec![row_with_path(&dir.join("registered.gguf"))];
+        let r = orphan_scan(&models, &dir);
+        let by_name = |n: &str| r.orphans.iter().find(|o| o.name == n).unwrap();
+        assert_eq!(
+            by_name("duplicate.gguf").twin_of.as_deref(),
+            Some("registered.gguf — linked to m"),
+            "byte-identical duplicate flagged with its registered twin"
+        );
+        assert!(
+            by_name("same-size.gguf").twin_of.is_none(),
+            "same-size different-content file must NOT be flagged (sha256 gate)"
+        );
+    }
+
+    #[test]
+    fn unit__doctor_models__orphan_twin_marked_safe_to_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.models_dir()).unwrap();
+        drop(blazar_core::store::Store::open(&d).unwrap());
+        let payload = vec![3u8; 256];
+        std::fs::write(d.models_dir().join("registered.gguf"), &payload).unwrap();
+        std::fs::write(d.models_dir().join("dupe.gguf"), &payload).unwrap();
+        {
+            let store = blazar_core::store::Store::open(&d).unwrap();
+            store
+                .upsert_model(&row_with_path(&d.models_dir().join("registered.gguf")))
+                .unwrap();
+        }
+        let checks = doctor_models(&d);
+        let orphan_check = checks
+            .iter()
+            .find(|c| c.name == "unmanaged files")
+            .expect("unmanaged files row present");
+        assert!(
+            orphan_check
+                .detail
+                .contains("dupe.gguf (256 B) [byte-identical to registered.gguf — linked to m — safe to delete]"),
+            "{}",
+            orphan_check.detail
+        );
+    }
+
+    #[test]
+    fn unit__classify_gpu_tenant__owned_orphaned_foreign() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engines = tmp.path().join("engines");
+        let server = engines.join("b11147-cuda/llama-server");
+        // A live daemon's engine: owned, even though it lives in the
+        // engines dir.
+        assert!(matches!(
+            classify_gpu_tenant(server.to_str().unwrap(), &engines, true),
+            GpuTenantClass::Owned
+        ));
+        // Same binary, supervisor dead: orphaned engine server.
+        assert!(matches!(
+            classify_gpu_tenant(server.to_str().unwrap(), &engines, false),
+            GpuTenantClass::OrphanedEngine
+        ));
+        // Anything else outside blazar's engines dir: foreign.
+        assert!(matches!(
+            classify_gpu_tenant("/usr/bin/python3", &engines, false),
+            GpuTenantClass::Foreign
+        ));
+    }
+
+    #[test]
+    fn unit__classify_gpu_tenant__user_run_rpc_server_is_foreign_never_swept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engines = tmp.path().join("engines");
+        let rpc = engines.join("b11147-cuda/llama-b11147/ggml-rpc-server");
+        // The boot sweep used to reap a user-run ggml-rpc-server as an
+        // "orphaned engine" (engines-dir exe, no blazar parent), killing
+        // the endpoint `rpc_servers` depends on at every daemon start.
+        // blazar never execs this binary — a live one is a deliberate
+        // co-tenant: advisory in doctor, never SIGTERMed.
+        assert!(matches!(
+            classify_gpu_tenant(rpc.to_str().unwrap(), &engines, false),
+            GpuTenantClass::Foreign
+        ));
+        // Under a live blazar descendant it is still Owned (not our
+        // business either way).
+        assert!(matches!(
+            classify_gpu_tenant(rpc.to_str().unwrap(), &engines, true),
+            GpuTenantClass::Owned
+        ));
+    }
+
+    #[test]
+    fn unit__orphaned_gpu_tenants__selects_only_orphaned_engines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engines = tmp.path().join("engines");
+        let server = engines.join("b1/llama-server");
+        let orphan = blazar_runtime::probe::GpuTenant {
+            pid: 10,
+            process_name: server.display().to_string(),
+            used_mib: 5288,
+        };
+        // Same binary, but a live blazar process owns it.
+        let owned = blazar_runtime::probe::GpuTenant {
+            pid: 11,
+            process_name: server.display().to_string(),
+            used_mib: 972,
+        };
+        let foreign = blazar_runtime::probe::GpuTenant {
+            pid: 12,
+            process_name: "/usr/bin/python3".to_string(),
+            used_mib: 512,
+        };
+        let tenants = [(&orphan, false), (&owned, true), (&foreign, false)];
+        let picked = orphaned_gpu_tenants(&tenants, &engines);
+        assert_eq!(picked.len(), 1, "only the parentless engine is selected");
+        assert_eq!(picked[0].pid, orphan.pid);
+        assert_eq!(picked[0].used_mib, 5288);
+    }
+
+    #[test]
+    fn unit__systemd_start_attempts__user_unit_first_then_system() {
+        let attempts = systemd_start_attempts();
+        assert_eq!(
+            attempts,
+            vec![
+                vec!["--user", "start", "blazar"],
+                vec!["start", "blazar", "--no-ask-password"],
+            ],
+            "unprivileged user unit first; system attempt must not prompt"
+        );
+    }
+
+    #[test]
+    fn unit__doctor_engines__orphan_dirs_sized_and_sorted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.engines_dir()).unwrap();
+        drop(blazar_core::store::Store::open(&d).unwrap());
+        // One registered engine (store row) + two row-less dirs of
+        // known sizes: only the orphans may appear, annotated + sorted.
+        {
+            let store = blazar_core::store::Store::open(&d).unwrap();
+            store
+                .upsert_engine(&gap_engine_row("b1-cuda", EngineKind::LlamaCpp, &[]))
+                .unwrap();
+        }
+        std::fs::create_dir_all(d.engines_dir().join("b9-old")).unwrap();
+        std::fs::write(d.engines_dir().join("b9-old").join("bin"), vec![0u8; 512]).unwrap();
+        std::fs::create_dir_all(d.engines_dir().join("b2-old")).unwrap();
+        std::fs::write(d.engines_dir().join("b2-old").join("bin"), b"x").unwrap();
+        let checks = doctor_engines(&d);
+        let ret = checks
+            .iter()
+            .find(|c| c.name == "engine retention")
+            .expect("retention check present");
+        assert!(ret.warn && ret.ok, "{}", ret.detail);
+        assert!(
+            ret.detail
+                .contains("orphan dirs (no store row): b2-old (1 B), b9-old (512 B)"),
+            "{}",
+            ret.detail
+        );
+        assert!(
+            ret.detail.contains("`blazar engine prune` reclaims disk"),
+            "{}",
+            ret.detail
+        );
+    }
+
+    #[test]
+    fn unit__engine_prune__summary_reports_sizes_and_total() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.engines_dir()).unwrap();
+        // Three inactive llamacpp lanes, oldest past retention with a
+        // 512 B dir; plus a 256 B row-less dir for the orphan sweep.
+        let mut seeded: Vec<String> = Vec::new();
+        {
+            let store = blazar_core::store::Store::open(&d).unwrap();
+            for (i, (tag, file_bytes)) in [("b1", 512usize), ("b2", 64), ("b3", 64)]
+                .iter()
+                .enumerate()
+            {
+                let dir = d.engines_dir().join(tag);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("bin"), vec![0u8; *file_bytes]).unwrap();
+                let mut row = gap_engine_row(tag, EngineKind::LlamaCpp, &[]);
+                row.active = false;
+                row.installed_at = i64::try_from(i).unwrap();
+                store.upsert_engine(&row).unwrap();
+                seeded.push(tag.to_string());
+            }
+        }
+        std::fs::create_dir_all(d.engines_dir().join("straydir")).unwrap();
+        std::fs::write(d.engines_dir().join("straydir").join("bin"), vec![0u8; 256]).unwrap();
+        let summary = engine_prune_summary(&d).unwrap();
+        assert!(
+            summary.contains("pruned b1 (512 B) (kept: b3, b2)"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("removed orphan engine dir straydir (256 B, no store row)"),
+            "{summary}"
+        );
+        assert!(summary.ends_with("— reclaimed 768 B in total"), "{summary}");
+        // Idempotent: a second pass has nothing left to say.
+        let again = engine_prune_summary(&d).unwrap();
+        assert!(again.starts_with("nothing to prune"), "{again}");
+    }
+
+    #[test]
+    fn unit__doctor_models__safetensors_dir_row_not_flagged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.models_dir()).unwrap();
+        drop(blazar_core::store::Store::open(&d).unwrap());
+        // HF-style pull: a directory of shards, no GGUF anywhere. The
+        // old check ran the GGUF parser on this row and warned.
+        let dir = d.models_dir().join("qwen-awq");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model-00001-of-00002.safetensors"), b"shard").unwrap();
+        {
+            let store = blazar_core::store::Store::open(&d).unwrap();
+            store.upsert_model(&row_with_path(&dir)).unwrap();
+        }
+        let checks = doctor_models(&d);
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert!(checks[0].ok && !checks[0].warn, "{}", checks[0].detail);
+        assert!(
+            checks[0].detail.contains("1 pulled, all readable"),
+            "{}",
+            checks[0].detail
+        );
+    }
+
+    #[test]
+    fn unit__doctor_models__diffusers_layout_dir_row_not_flagged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.models_dir()).unwrap();
+        drop(blazar_core::store::Store::open(&d).unwrap());
+        // Diffusers layout: shards live in subdirs, the root only
+        // carries model_index.json — a root-only *.safetensors scan
+        // would false-flag this row.
+        let dir = d.models_dir().join("sdxl");
+        std::fs::create_dir_all(dir.join("unet")).unwrap();
+        std::fs::write(dir.join("model_index.json"), b"{}").unwrap();
+        std::fs::write(
+            dir.join("unet/diffusion_pytorch_model.safetensors"),
+            b"shard",
+        )
+        .unwrap();
+        {
+            let store = blazar_core::store::Store::open(&d).unwrap();
+            store.upsert_model(&row_with_path(&dir)).unwrap();
+        }
+        let checks = doctor_models(&d);
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert!(checks[0].ok && !checks[0].warn, "{}", checks[0].detail);
+    }
+
+    #[test]
+    fn unit__doctor_models__dit_gguf_zero_metadata_row_not_flagged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.models_dir()).unwrap();
+        drop(blazar_core::store::Store::open(&d).unwrap());
+        // DiT export: GGUF container with zero metadata KVs (header jumps
+        // straight to tensor infos) plus an external VAE component. The
+        // old check demanded LLM-style metadata and warned on it.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        let dit = d.models_dir().join("qwen-image.gguf");
+        std::fs::write(&dit, &buf).unwrap();
+        let vae = d.models_dir().join("vae.safetensors");
+        std::fs::write(&vae, b"vae").unwrap();
+        let mut row = row_with_path(&dit);
+        row.components = vec![blazar_core::store::ComponentFile {
+            flag: "vae".into(),
+            path: vae.display().to_string(),
+        }];
+        {
+            let store = blazar_core::store::Store::open(&d).unwrap();
+            store.upsert_model(&row).unwrap();
+        }
+        let checks = doctor_models(&d);
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert!(checks[0].ok && !checks[0].warn, "{}", checks[0].detail);
+        assert!(
+            checks[0].detail.contains("1 pulled, all readable"),
+            "{}",
+            checks[0].detail
+        );
+    }
+
+    #[test]
+    fn unit__doctor_models__diffusion_row_missing_component_flagged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.models_dir()).unwrap();
+        drop(blazar_core::store::Store::open(&d).unwrap());
+        let dit = d.models_dir().join("dit.safetensors");
+        std::fs::write(&dit, b"weights").unwrap();
+        let mut row = row_with_path(&dit);
+        row.components = vec![blazar_core::store::ComponentFile {
+            flag: "vae".into(),
+            path: d
+                .models_dir()
+                .join("missing-vae.safetensors")
+                .display()
+                .to_string(),
+        }];
+        {
+            let store = blazar_core::store::Store::open(&d).unwrap();
+            store.upsert_model(&row).unwrap();
+        }
+        let checks = doctor_models(&d);
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert!(checks[0].warn && checks[0].ok, "{}", checks[0].detail);
+        assert!(
+            checks[0].detail.contains("unreadable or incomplete"),
             "{}",
             checks[0].detail
         );
@@ -12043,6 +14839,19 @@ mod tests {
     }
 
     #[test]
+    fn unit__llama_channel_hint_applies__foreign_lanes_never_hint_llama_channel() {
+        use blazar_core::engine_kind::EngineKind as K;
+        // Local builds and foreign-lane actives are outside the channel's
+        // authority; only a llamacpp row may be compared against it.
+        assert!(!llama_channel_hint_applies("local", K::LlamaCpp));
+        assert!(llama_channel_hint_applies("b11070-cuda", K::LlamaCpp));
+        assert!(!llama_channel_hint_applies("b5130", K::Whisper));
+        assert!(!llama_channel_hint_applies("master-890-74988b2", K::SdCpp));
+        assert!(!llama_channel_hint_applies("v0.9.3", K::MistralRs));
+        assert!(!llama_channel_hint_applies("sglang-0.5.19", K::Sglang));
+    }
+
+    #[test]
     fn unit__channel_word__btag_direction() {
         assert_eq!(channel_word("b10857", "b10865"), "upgrade");
         assert_eq!(channel_word("b10857", "b10780"), "downgrade");
@@ -12136,6 +14945,63 @@ mod tests {
 
     #[test]
     #[allow(non_snake_case)]
+    fn unit__wait_daemon_exit__missing_or_unreadable_pidfile_counts_as_exited() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No pidfile at all: the daemon already exited (or never ran).
+        assert!(wait_daemon_exit(
+            tmp.path().join("blazar.pid").as_path(),
+            tokio_deadline(Duration::from_secs(1))
+        ));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__wait_daemon_exit__garbage_and_dead_pids_count_as_exited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("blazar.pid");
+        // Same "certainly does not exist" pid the runtime's own lock
+        // tests use; also covers the crash path (owner dead, file left).
+        std::fs::write(&pidfile, "4194303\n").unwrap();
+        assert!(wait_daemon_exit(
+            &pidfile,
+            tokio_deadline(Duration::from_secs(1))
+        ));
+        // Corrupt pidfile: unreadable owner, treat as exited so the
+        // successor can take over the stale lock.
+        std::fs::write(&pidfile, "not-a-pid\n").unwrap();
+        assert!(wait_daemon_exit(
+            &pidfile,
+            tokio_deadline(Duration::from_secs(1))
+        ));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    #[cfg(unix)]
+    fn unit__wait_daemon_exit__blocks_while_owner_alive_unblocks_on_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("blazar.pid");
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::fs::write(&pidfile, format!("{}\n", sleeper.id())).unwrap();
+        // Owner alive: a tight deadline must time out, not report exit.
+        assert!(!wait_daemon_exit(
+            &pidfile,
+            tokio_deadline(Duration::from_millis(150))
+        ));
+        // Owner exits: the wait observes it well within a second.
+        sleeper.kill().unwrap();
+        let _ = sleeper.wait();
+        assert!(wait_daemon_exit(
+            &pidfile,
+            tokio_deadline(Duration::from_secs(2))
+        ));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
     fn unit__any_child_pidfile__model_pidfiles_count_daemon_pid_does_not() {
         assert!(any_child_pidfile([
             "blazar.pid".to_string(),
@@ -12144,5 +15010,269 @@ mod tests {
         assert!(any_child_pidfile(["Model#2.PID".to_string()]));
         assert!(!any_child_pidfile(["blazar.pid".to_string()]));
         assert!(!any_child_pidfile(["qwen2.5-0.5b.apikey".to_string()]));
+    }
+
+    // Output-format pins (W1-W4 wave): these lock the rendered shapes
+    // the audit fixed — adaptive table alignment, lowercase status
+    // words, no ANSI when piped, no Option-Debug leaks, honest doctor
+    // footer wording.
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__render_table__sizes_columns_to_widest_cell_rightaligns_indexes() {
+        let rows = vec![
+            vec!["qwen2.5".into(), "1_234".to_string(), "llama".to_string()],
+            vec!["tiny".into(), "89".to_string(), "xlm-roberta".to_string()],
+        ];
+        let out = render_table(&["REPO", "DOWNLOADS", "ARCH"], &rows, &[1]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "REPO     DOWNLOADS  ARCH");
+        // Right-aligned numbers share their right edge with the header.
+        let edge = |l: &str, needle: &str| l.find(needle).map(|i| i + needle.len());
+        let dl_edge = lines[0].find("DOWNLOADS").map(|i| i + "DOWNLOADS".len());
+        assert_eq!(edge(lines[1], "1_234"), dl_edge);
+        assert_eq!(edge(lines[2], "89"), dl_edge);
+        // A too-narrow cell once bled columns; the widest cell wins.
+        assert_eq!(out.lines().nth(2), Some("tiny            89  xlm-roberta"));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__render_table__last_column_is_open_no_trailing_blanks() {
+        let rows = vec![vec!["m".into(), "short".to_string()]];
+        let out = render_table(&["REPO", "QUANTS"], &rows, &[]);
+        for line in out.lines() {
+            assert_eq!(line, line.trim_end(), "no trailing blanks anywhere");
+        }
+        assert_eq!(out.lines().nth(1), Some("m     short"));
+        // An EMPTY last cell leaves no dangling column separator.
+        let empty = render_table(
+            &["TAG", "NOTES"],
+            &[vec!["b5130".into(), String::new()]],
+            &[],
+        );
+        assert_eq!(empty.lines().nth(1), Some("b5130"));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__render_table__piped_output_carries_no_ansi_escapes() {
+        // Under `cargo test` stdout is a pipe, not a terminal, so the
+        // header renders plain — scripts see byte-stable text.
+        let out = render_table(&["A", "B"], &[vec!["1".into(), "2".to_string()]], &[]);
+        assert!(!out.contains('\x1b'), "no escapes when piped: {out:?}");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__render_table__golden_bytes_exact() {
+        // Byte-exact golden: adaptive widths size to the widest cell,
+        // right indexes align numerics on their last digit, the last
+        // column rides open, and an empty last cell trims the dangling
+        // separator instead of leaving trailing blanks. Any column-width
+        // or alignment regression changes one of these bytes.
+        let rows = vec![
+            vec![
+                "qwen/qwen2.5-0.5b".to_string(),
+                "1234".to_string(),
+                "567".to_string(),
+                "644.4 MiB".to_string(),
+                "qwen2".to_string(),
+            ],
+            vec![
+                "meta/llama-3.2-1b".to_string(),
+                "9".to_string(),
+                "1".to_string(),
+                "1.2 GiB".to_string(),
+                "llama".to_string(),
+            ],
+            vec![
+                "tiny/bert".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                "440.0 MiB".to_string(),
+                String::new(),
+            ],
+        ];
+        let golden = concat!(
+            "REPO               DL    LIKES       SIZE  ARCH\n",
+            "qwen/qwen2.5-0.5b  1234    567  644.4 MiB  qwen2\n",
+            "meta/llama-3.2-1b  9         1    1.2 GiB  llama\n",
+            "tiny/bert          0         0  440.0 MiB\n",
+        );
+        assert_eq!(
+            render_table(&["REPO", "DL", "LIKES", "SIZE", "ARCH"], &rows, &[2, 3]),
+            golden
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__render_list_table__golden_bytes_exact() {
+        // Byte-exact golden: ARCH caps at 18 chars with an ellipsis,
+        // SIZE and CTX right-align, empty VISION/CTX cells keep their
+        // column spacing, CATEGORY rides before ENGINE, and the whole
+        // table carries no trailing newline and no trailing blanks on
+        // any line.
+        let rows = [
+            [
+                "qwen2.5-0.5b".to_string(),
+                "q4_0".to_string(),
+                "644 MiB".to_string(),
+                "mmproj: 224 MiB".to_string(),
+                "Qwen2ForCausalLM".to_string(),
+                "32768".to_string(),
+                "text".to_string(),
+                "text".to_string(),
+                "llama.cpp".to_string(),
+            ],
+            [
+                "whisper-b5130".to_string(),
+                "-".to_string(),
+                "151 MiB".to_string(),
+                String::new(),
+                "WhisperForConditionalGeneration".to_string(),
+                String::new(),
+                "voice".to_string(),
+                "-".to_string(),
+                "whisper".to_string(),
+            ],
+        ];
+        let golden = concat!(
+            "NAME           QUANT     SIZE  VISION           ARCH                  CTX  TYPE   CATEGORY  ENGINE\n",
+            "qwen2.5-0.5b   q4_0   644 MiB  mmproj: 224 MiB  Qwen2ForCausalLM    32768  text   text      llama.cpp\n",
+            "whisper-b5130  -      151 MiB                   WhisperForConditi…         voice  -         whisper",
+        );
+        assert_eq!(
+            render_list_table(
+                ["NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "CATEGORY", "ENGINE",],
+                &rows,
+            ),
+            golden
+        );
+    }
+
+    /// Bare-minimum model row for CATEGORY classification tests; each
+    /// test mutates only the fields its class derives from.
+    fn category_row(name: &str, repo: &str) -> blazar_core::store::ModelRow {
+        blazar_core::store::ModelRow {
+            name: name.to_string(),
+            repo: repo.to_string(),
+            quant: "-".to_string(),
+            path: format!("models/{name}.gguf"),
+            bytes: 1,
+            sha256: None,
+            mmproj_path: None,
+            components: Vec::new(),
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+        }
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__engine_cell_label__kind_plus_version_all_tag_shapes() {
+        use blazar_core::engine_kind::EngineKind as K;
+        // kind-prefixed tag: the prefix is redundant, strip it.
+        let rows = vec![gap_engine_row("sglang-0.5.19", K::Sglang, &[])];
+        assert_eq!(engine_cell_label(&rows, "sglang-0.5.19"), "sglang 0.5.19");
+        // kind-less tags: the whole release tag is the version.
+        let rows = vec![gap_engine_row("b11147-cuda", K::LlamaCpp, &[])];
+        assert_eq!(
+            engine_cell_label(&rows, "b11147-cuda"),
+            "llamacpp b11147-cuda"
+        );
+        let rows = vec![gap_engine_row("master-890-74988b2", K::SdCpp, &[])];
+        assert_eq!(
+            engine_cell_label(&rows, "master-890-74988b2"),
+            "sdcpp master-890-74988b2"
+        );
+        let rows = vec![gap_engine_row("v0.9.3", K::MistralRs, &[])];
+        assert_eq!(engine_cell_label(&rows, "v0.9.3"), "mistralrs v0.9.3");
+        // tag == kind: no version tail to append.
+        let rows = vec![gap_engine_row("sglang", K::Sglang, &[])];
+        assert_eq!(engine_cell_label(&rows, "sglang"), "sglang");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__engine_cell_label__raw_tag_when_no_row_matches() {
+        let rows: Vec<blazar_core::EngineRow> = Vec::new();
+        assert_eq!(engine_cell_label(&rows, "-"), "-");
+        assert_eq!(engine_cell_label(&rows, "b-missing"), "b-missing");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__model_category__diffusion_families_image_and_video() {
+        // Component sets are the diffusion marker; the curated family
+        // table splits image from video.
+        let mut flux = category_row("flux.1-dev", "black-forest-labs/FLUX.1-dev");
+        flux.components = vec![blazar_core::store::ComponentFile::new(
+            "--vae",
+            "models/flux-vae.safetensors",
+        )];
+        assert_eq!(model_category(&flux), "image");
+        let mut wan = category_row("wan_2.1_comfyui_repackaged", "ComfyUI/wan_2.1_repackaged");
+        wan.components = vec![blazar_core::store::ComponentFile::new(
+            "--model",
+            "models/wan_2.1_comfyui_repackaged.gguf",
+        )];
+        assert_eq!(model_category(&wan), "video");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__model_category__vision_encoder_text_ordering() {
+        // Projector beats encoder/text: a VLM row is vision-class.
+        let mut vlm = category_row("qwen3vl-8b-instruct", "Qwen/Qwen3-VL-8B-Instruct");
+        vlm.mmproj_path = Some("models/qwen3vl-mmproj.gguf".to_string());
+        assert_eq!(model_category(&vlm), "vision");
+        // Trailing-encoder archs are pipeline encoders, not chat models.
+        let mut t5 = category_row("t5-v1_1-xxl", "city96/t5-v1_1-xxl-encoder-gguf");
+        t5.arch = Some("t5encoder".to_string());
+        assert_eq!(model_category(&t5), "encoder");
+        // Everything else is a text model.
+        let qwen = category_row("qwen2.5-0.5b", "Qwen/Qwen2.5-0.5B-Instruct-GGUF");
+        assert_eq!(model_category(&qwen), "text");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__status_word__lowercase_ok_warn_fail() {
+        assert_eq!(Check::ok("n", "d").status_word(), "ok");
+        assert_eq!(Check::warn("n", "d").status_word(), "warn");
+        assert_eq!(Check::fail("n", "d").status_word(), "fail");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__opt_or_dash__value_or_dash_never_option_debug() {
+        assert_eq!(opt_or_dash(Some(24)), "24");
+        assert_eq!(opt_or_dash(None), "-");
+        for v in [opt_or_dash(Some(24)), opt_or_dash(None)] {
+            assert!(!v.contains("Some(") && !v.contains("None"));
+        }
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__doctor_footer__wording_matches_board_state() {
+        let ok = || Check::ok("n", "d");
+        let warn = || Check::warn("n", "d");
+        let fail = || Check::fail("n", "d");
+        // The old bug: warnings coexisted with "all checks pass".
+        assert_eq!(
+            doctor_footer(&[ok(), warn(), warn()]),
+            "1 ok, 2 warning(s) — no failures"
+        );
+        assert_eq!(doctor_footer(&[ok(), ok()]), "all checks pass");
+        assert_eq!(
+            doctor_footer(&[ok(), warn(), fail()]),
+            "1 failing check(s) — fix the fail rows above"
+        );
     }
 }

@@ -10,7 +10,7 @@ Method (reproducible evidence, not a static table):
      i.e. Blazar computes or passes it from a config knob.
   3. Everything else is LONG-TAIL: reachable through per-model
      `extra_args` (verbatim on llamacpp/mistralrs, manifest-gated on
-     sglang) and bucketed by keyword families for the coverage doc.
+     sglang/sdcpp) and bucketed by keyword families for the coverage doc.
 
 Usage:
   python3 scripts/engine_coverage.py [store_db]
@@ -98,6 +98,27 @@ BUCKETS: dict[str, list[tuple[str, str]]] = {
             "serving detail",
             r"batch|prefill|decode|cache|seq|ctx|model-len|num-|device|layer|lora|pa-|mtp|encoder|image|vision|prefix|max-|paged|memory|fraction",
         ),
+    ],
+    "sdcpp": [
+        (
+            "component set (blazar-owned)",
+            r"diffusion-model|vae|llm|clip|t5xxl|qwen2vl|vision|mmproj|te-",
+        ),
+        (
+            "sampling/generation",
+            r"cfg|step|seed|sampl|schedul|strength|guidance|shift|img|size|count",
+        ),
+        (
+            "memory/backend placement",
+            r"offload|vram|backend|device|thread|fa$|flash|cpu",
+        ),
+        ("gateway-owned transport", r"listen|host|port|webui|static|api-key"),
+        ("input/output files", r"init-img|mask|output|prompt|control|ref|format|type"),
+    ],
+    "whisper": [
+        ("transcription/translation", r"translat|language|detect|prompt"),
+        ("decoding quality", r"beam|best|temperature|entropy|logprob|fallback"),
+        ("segmentation/timing", r"timestamp|offset|duration|split|context|max.len|word"),
     ],
 }
 

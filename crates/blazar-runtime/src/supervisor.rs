@@ -15,9 +15,18 @@ use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use tokio::sync::Notify;
 
-use blazar_core::profile::{self, Endpoint, ProfileInput};
+use blazar_core::profile::{self, ComponentArg, Endpoint, ProfileInput};
 use blazar_core::store::Store;
 use blazar_core::{BlazarDirs, Config, GpuInfo, Hardware, ModelRow};
+
+/// Borrow a store row's diffusion component set for `ProfileInput` (the
+/// spawn sites own the Vec; the input borrows it).
+fn component_args(components: &[blazar_core::store::ComponentFile]) -> Vec<ComponentArg<'_>> {
+    components
+        .iter()
+        .map(|c| ComponentArg::new(&c.flag, &c.path))
+        .collect()
+}
 
 use crate::events::{BlazarEvent, EventBus, InstanceState};
 
@@ -36,6 +45,22 @@ use crate::events::{BlazarEvent, EventBus, InstanceState};
 fn local_http() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(reqwest::Client::new)
+}
+
+/// Cold-lane child dialing (warm-peg probes, session-bank save/restore):
+/// TCP rides the shared loopback pool; unix builds an ephemeral
+/// socket-pinned client — these calls run once per spawn or idle
+/// transition, so there is no pool worth warming. The unix base's host
+/// is a placeholder the connector ignores; only the path is dialed.
+fn child_dial(endpoint: &blazar_core::Endpoint) -> (reqwest::Client, String) {
+    match endpoint {
+        blazar_core::Endpoint::Tcp { host, port } => {
+            (local_http().clone(), format!("http://{host}:{port}"))
+        }
+        blazar_core::Endpoint::Unix { socket } => {
+            (crate::uds::client(socket), "http://localhost".to_string())
+        }
+    }
 }
 
 pub fn resolve_draft_path(store: &Store, model: &str, spec_mode: &str) -> Option<String> {
@@ -192,6 +217,16 @@ pub(crate) fn read_model_meta(
              — run: blazar engine install --kind mistralrs, \
              or blazar engine use <llamacpp-tag> for the GGUF lane"
         )),
+        // sdcpp rows are diffusion component sets: the DiT GGUF carries
+        // no text-model metadata by design, and compile_sdcpp compiles
+        // from the component set (VAE/TE paths + file sizes), never from
+        // GgufMeta. A default meta keeps the shared ProfileInput shape
+        // without pretending the DiT is a text model.
+        (K::SdCpp, false) => Ok(MetaBox::Gguf(Box::default())),
+        (K::SdCpp, true) => Err(format!(
+            "sdcpp serves GGUF DiT files from a component set; {path} is a \
+             directory — re-pull the model so the DiT lands as a file"
+        )),
         (_, true) => blazar_core::read_hf_config(std::path::Path::new(path))
             .map(MetaBox::Hf)
             .map_err(|e| format!("hf config: {e}")),
@@ -205,9 +240,10 @@ pub(crate) fn read_model_meta(
                 if e.to_string().contains("missing general.architecture") {
                     format!(
                         "{path}: GGUF has no architecture metadata — diffusion/model-component \
-                         file (image-repo DiT/encoder/VAE split), not a text model. No installed \
-                         engine serves image components; an sd.cpp image lane is not implemented \
-                         yet"
+                         file (image-repo DiT/encoder/VAE split), not a text model; text engines \
+                         cannot serve it. The sdcpp lane serves diffusion component sets (DiT + \
+                         VAE + text encoder): blazar engine install --kind sdcpp, then re-pull \
+                         the model to fetch the set (blazar pull <repo>:QUANT)"
                     )
                 } else {
                     format!("gguf metadata: {e}")
@@ -313,21 +349,17 @@ async fn warm_peg_child(
     auth: Option<&str>,
     concurrency: usize,
 ) {
-    let (host, port) = match endpoint {
-        blazar_core::Endpoint::Tcp { host, port } => (host, *port),
-        // Pegged engines are TCP-only (sglang and llama-server both
-        // reject unix sockets here); same guard as bank_restore_post
-        // for symmetry.
-        blazar_core::Endpoint::Unix { .. } => return,
-    };
-    let url = format!("http://{host}:{port}/v1/chat/completions");
+    // llama.cpp children serve the same REST surface on either
+    // transport; sglang spawns never carry unix endpoints (its engine
+    // guard rejects them), so dialing here is always well-formed.
+    let (client, base) = child_dial(endpoint);
+    let url = format!("{base}/v1/chat/completions");
     let body = serde_json::json!({
         "model": model,
         "messages": [{ "role": "user", "content": "Reply with: OK" }],
         "max_tokens": 4,
         "stream": false,
     });
-    let client = local_http();
     let started = std::time::Instant::now();
     // Single probe first: drains the residual warmup queue (up to ~30s
     // on a cold venv+torch boot; generous bound so a slow-but-healthy
@@ -418,6 +450,36 @@ pub enum SupervisionError {
     Internal(#[from] anyhow::Error),
 }
 
+/// Admission-loop verdict when a spawn is blocked (see
+/// [`Supervisor::blocked_action`]).
+#[derive(Debug, PartialEq, Eq)]
+enum BlockedAction {
+    Evict(String),
+    Refuse,
+}
+
+/// RAII release for a per-device spawn reservation: dropping subtracts
+/// the reserved bytes back out of the ledger. Every failure path between
+/// `reserve_device` and the instance insert releases through this Drop
+/// alone — a reservation can never outlive its spawn.
+struct DeviceReservation {
+    device: String,
+    bytes: u64,
+    map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
+}
+
+impl Drop for DeviceReservation {
+    fn drop(&mut self) {
+        let mut map = self.map.lock().expect("reservation ledger lock");
+        if let Some(v) = map.get_mut(&self.device) {
+            *v = v.saturating_sub(self.bytes);
+            if *v == 0 {
+                map.remove(&self.device);
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Instance {
     pub name: String,
@@ -449,10 +511,18 @@ pub struct Instance {
     /// "partial" | "auto") — what `ps` shows so silent CPU fallback is
     /// never silent.
     pub gpu: String,
-    /// Auto-picked GPU card name (LC2 discrete-first pick); `None` when
-    /// placement was manual (devices config) or unknown. Feeds the
-    /// card-scoped co-residency planner.
+    /// Display label of the placement card (`full@<card>` in `ps`) —
+    /// the census description when one exists. Pure presentation: the
+    /// card-scoped co-residency planner and the per-device VRAM ledger
+    /// match on [`Instance::device_id`] (the census backend id), never
+    /// on this label — two cards can share a description, ids cannot.
     pub device: Option<String>,
+    /// Census backend id (`GpuInfo.name`, e.g. `CUDA0`) of the card this
+    /// child was placed on: the auto-pick's id, the single manual
+    /// `devices` pin, or the lone card of a single-GPU box. `None` for
+    /// CPU spawns, tensor splits, multi-card manual pins, or unknown
+    /// placement (those fall back to the aggregate admission belt).
+    pub device_id: Option<String>,
     /// Post-quantization KV-cache estimate from the compiled profile —
     /// feeds the co-residency planner (A15).
     pub kv_est_bytes: Option<u64>,
@@ -524,6 +594,28 @@ fn pick_gpu(gpus: &[blazar_core::GpuInfo]) -> Option<(usize, bool)> {
         // Integrated-only box: serve anyway (laptop iGPU is still a GPU).
         None => Some((top_free, false)),
     }
+}
+
+/// sdcpp twin of [`pick_gpu`]: choose the card from the ENGINE's own
+/// device census (registration-time `--list-devices`) and return its
+/// `--backend` token plus the display description. The CPU entry the
+/// census lists is not a placement candidate; `None` (empty census,
+/// CPU-only) leaves the profile on the blanket offload posture.
+fn pick_sd_backend_device(
+    devices: &[crate::engine::manifest::DeviceDesc],
+) -> Option<(String, String)> {
+    let gpus: Vec<blazar_core::GpuInfo> = devices
+        .iter()
+        .filter(|d| !d.name.eq_ignore_ascii_case("cpu"))
+        .map(|d| blazar_core::GpuInfo {
+            name: d.name.clone(),
+            description: d.description.clone(),
+            total_mib: d.total_mib,
+            free_mib: d.free_mib,
+        })
+        .collect();
+    let (idx, _) = pick_gpu(&gpus)?;
+    Some((gpus[idx].name.clone(), gpus[idx].description.clone()))
 }
 
 /// Last-resort auto tensor-split planning (#28c): when weights+KV exceed
@@ -696,6 +788,10 @@ pub struct PsRow {
     /// `None` for router mode / unknown placement. `ps` renders it as
     /// `full@<card>`.
     pub device: Option<String>,
+    /// Census backend id of the placement card (e.g. `CUDA0`) — the key
+    /// the per-device VRAM ledger accounts by. `None` for CPU instances
+    /// and card-spanning (tensor-split) placements.
+    pub device_id: Option<String>,
     /// Profile-compile warnings for this instance (see Instance.warnings).
     pub warnings: Vec<String>,
     /// Effective spec mode of this spawn + draft file name (see
@@ -806,6 +902,12 @@ pub struct Supervisor {
     /// Consecutive reaper ticks with concurrent in-flight load on a
     /// single-slot model (LC4 adaptive slots).
     busy_streak: DashMap<String, u32>,
+    /// Models whose adopted reshape is being drained right now (mark set
+    /// the moment the drain decides to hold admissions). The admission
+    /// gate parks new requests while a model key is present, so in-flight
+    /// can only fall — a sustained-load stream set reaches zero in one
+    /// max-stream duration instead of never.
+    reshape_draining: DashMap<String, std::time::Instant>,
     /// Consecutive fully-quiet ticks per instance key (no admission
     /// pressure, zero in-flight) feeding the adoption decay rule.
     idle_streak: DashMap<String, u32>,
@@ -825,6 +927,13 @@ pub struct Supervisor {
     /// is the only reachable saturation indicator; live-proven
     /// 2026-09-12 when a 6-stream load left `in_flight` pinned at slots).
     slot_pressure: DashMap<String, u32>,
+    /// Per-device VRAM reservation ledger: census card id → bytes held
+    /// by spawns between placement and instance insert (the settle-lag
+    /// window). A std Mutex is correct here — taken only for short map
+    /// edits on the spawn path, never held across an await. RAII
+    /// [`DeviceReservation`] releases; admission reads it through
+    /// `device_load_bytes`.
+    device_reservations: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
     /// Session pins (R3): sessions that recently carried
     /// `x-blazar-session` per model. The idle ladder and capacity
     /// pressure consult this before evicting; force stop releases.
@@ -880,6 +989,15 @@ struct ChildAuth {
     keyfile: Option<std::path::PathBuf>,
 }
 
+/// Token count llama-server reports in slot save/restore responses
+/// (`n_saved` / `n_restored`). `Some(0)` is a real answer — HTTP 200 with
+/// zero tokens is the silent re-prefill bug class (the restore
+/// "succeeds", the slot stays cold), not a warm start. Missing or
+/// non-numeric fields are `None`: unverifiable, not zero.
+fn slot_reported_tokens(body: &serde_json::Value, field: &str) -> Option<u64> {
+    body.get(field).and_then(serde_json::Value::as_u64)
+}
+
 impl Supervisor {
     /// Health-gate budget for a spawning child when the user leaves
     /// `model_load_timeout_secs` unset. Fits precompiled loaders
@@ -915,6 +1033,9 @@ impl Supervisor {
         hardware: Hardware,
         engine: Arc<dyn Engine>,
     ) -> Self {
+        // Reap child sockets orphaned by an unclean previous exit
+        // BEFORE any spawn reuses their deterministic per-name paths.
+        crate::uds::sweep_stale(&dirs.run_dir());
         Self {
             evictions: std::sync::atomic::AtomicU64::new(0),
             cache_hint: std::sync::Arc::new(CacheHint::default()),
@@ -948,10 +1069,14 @@ impl Supervisor {
             last_requested: std::sync::Mutex::new(None),
             preload_failures: DashMap::new(),
             busy_streak: DashMap::new(),
+            reshape_draining: DashMap::new(),
             idle_streak: DashMap::new(),
             adopted_slots: DashMap::new(),
             reshape_queue: DashMap::new(),
             slot_pressure: DashMap::new(),
+            device_reservations: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             sessions: crate::sessionreg::SessionRegistry::new(),
         }
     }
@@ -1011,6 +1136,91 @@ impl Supervisor {
         blazar_core::Hardware::bytes(self.hardware.total_vram_mib())
     }
 
+    /// Resident + reserved bytes against ONE card (census id keyed) —
+    /// the per-device admission arithmetic. Instances with unknown
+    /// placement never count here; the aggregate belt catches them.
+    fn device_load_bytes(&self, device: &str) -> u64 {
+        use std::sync::atomic::Ordering;
+        let resident: u64 = self
+            .instances
+            .iter()
+            .filter(|e| e.value().gpu != "cpu" && e.value().device_id.as_deref() == Some(device))
+            .map(|e| {
+                let measured =
+                    blazar_core::Hardware::bytes(e.value().settled_mib.load(Ordering::Relaxed));
+                let weights = u64::try_from(e.value().model.bytes.max(0)).unwrap_or(u64::MAX);
+                measured.max(weights)
+            })
+            .sum();
+        let reserved = self
+            .device_reservations
+            .lock()
+            .expect("reservation ledger lock")
+            .get(device)
+            .copied()
+            .unwrap_or(0);
+        resident.saturating_add(reserved)
+    }
+
+    /// Census capacity of one card; `None` when the id is unknown to the
+    /// boot snapshot (probed placements can appear transiently).
+    fn device_budget_bytes(&self, device: &str) -> Option<u64> {
+        self.hardware
+            .gpus
+            .iter()
+            .find(|g| g.name == device)
+            .map(|g| blazar_core::Hardware::bytes(g.total_mib))
+    }
+
+    /// Post-reservation admission invariant for the picked card: the
+    /// device load already carries this spawn's reservation, so the
+    /// incoming floor must NOT be added again — that double-count
+    /// evicted coexisting residents a placement actually fits (seen
+    /// live: a 6.6 GiB floor evicting a 0.7 GiB neighbor on a
+    /// 7.6 GiB card that held both). Unknown device budget = fail-open;
+    /// the spawn-time free-VRAM guard owns the honest refuse.
+    fn reservation_fits_device(&self, device: &str) -> bool {
+        match self.device_budget_bytes(device) {
+            Some(budget) => self.device_load_bytes(device) <= budget,
+            None => true,
+        }
+    }
+
+    /// GPU-resident bytes with no known card (tensor splits, multi-card
+    /// manual pins, placements from before the id was recorded) — the
+    /// population the aggregate budget belt still guards.
+    fn unplaced_gpu_bytes(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.instances
+            .iter()
+            .filter(|e| e.value().gpu != "cpu" && e.value().device_id.is_none())
+            .map(|e| {
+                let measured =
+                    blazar_core::Hardware::bytes(e.value().settled_mib.load(Ordering::Relaxed));
+                let weights = u64::try_from(e.value().model.bytes.max(0)).unwrap_or(u64::MAX);
+                measured.max(weights)
+            })
+            .sum()
+    }
+
+    /// Hold `bytes` against a card for the pick→insert window. The
+    /// returned guard releases on drop; insert converts the reservation
+    /// into a counted resident.
+    fn reserve_device(&self, device: &str, bytes: u64) -> DeviceReservation {
+        let mut map = self
+            .device_reservations
+            .lock()
+            .expect("reservation ledger lock");
+        let entry = map.entry(device.to_string()).or_insert(0);
+        *entry = entry.saturating_add(bytes);
+        drop(map);
+        DeviceReservation {
+            device: device.to_string(),
+            bytes,
+            map: std::sync::Arc::clone(&self.device_reservations),
+        }
+    }
+
     /// Capacity-eviction victim: the coldest evictable instance — zero
     /// in-flight, not the incoming key, and not pinned (overlay
     /// `pin = true`, A13). Ordering: session-pinned models LAST (R3 —
@@ -1040,6 +1250,75 @@ impl Supervisor {
             .map(|e| e.key().clone())
     }
 
+    /// What the admission loop does when blocked: evict the coldest
+    /// victim, or refuse. Captive loads (the semantic-cache embed
+    /// model) always refuse — a cache probe must never decide which
+    /// generation models stay resident.
+    fn blocked_action(&self, key: &str, captive: bool) -> BlockedAction {
+        if captive {
+            return BlockedAction::Refuse;
+        }
+        match self.victim_key(key) {
+            Some(v) => BlockedAction::Evict(v),
+            None => BlockedAction::Refuse,
+        }
+    }
+
+    /// Admission arithmetic for an incoming spawn: instance cap, or the
+    /// per-card VRAM ledger exceeded (an empty GPU box always admits one
+    /// model — the J3 spawn guard owns refusal for loads that cannot fit
+    /// at all). Per-device: candidates are the manual `devices` pins, or
+    /// every discrete card in auto mode; the spawn fits when ANY
+    /// candidate card holds resident + reserved + floor within its OWN
+    /// census budget — the old aggregate-pool admission let two models
+    /// each fit "the summed VRAM" while colliding on one physical card.
+    /// Tensor splits and unknown placements carry no card id, so the
+    /// legacy aggregate belt still applies whenever they are resident.
+    fn admission_blocked(&self, name: &str, incoming_bytes: u64) -> bool {
+        if self
+            .instance_cap()
+            .is_some_and(|cap| self.instances.len() >= cap)
+        {
+            return true;
+        }
+        if !self.bytes_admission_active() || self.instances.is_empty() {
+            return false;
+        }
+        let manual = self.config.effective_devices(name).to_vec();
+        let candidates: Vec<&str> = if manual.is_empty() {
+            let discrete: Vec<&str> = self
+                .hardware
+                .gpus
+                .iter()
+                .filter(|g| !g.is_integrated())
+                .map(|g| g.name.as_str())
+                .collect();
+            if discrete.is_empty() {
+                self.hardware.gpus.iter().map(|g| g.name.as_str()).collect()
+            } else {
+                discrete
+            }
+        } else {
+            manual.iter().map(String::as_str).collect()
+        };
+        if candidates.is_empty() {
+            return self.resident_bytes().saturating_add(incoming_bytes) > self.vram_budget_bytes();
+        }
+        // A card missing from the census cannot be judged — fail open on
+        // it (J3 owns the honest spawn-time refusal), never strand the
+        // spawn on an unprobeable id.
+        let any_card_fits = candidates.iter().any(|c| {
+            self.device_budget_bytes(c).is_some_and(|budget| {
+                self.device_load_bytes(c).saturating_add(incoming_bytes) <= budget
+            })
+        }) || candidates
+            .iter()
+            .any(|c| self.device_budget_bytes(c).is_none());
+        let aggregate_exceeded = self.unplaced_gpu_bytes() > 0
+            && self.resident_bytes().saturating_add(incoming_bytes) > self.vram_budget_bytes();
+        !any_card_fits || aggregate_exceeded
+    }
+
     /// Session-pin window (R3); zero = feature off.
     fn session_ttl(&self) -> Duration {
         Duration::from_secs(self.config.session_keep_secs)
@@ -1062,14 +1341,16 @@ impl Supervisor {
         };
         // Card-scoped: LC2 picks ONE card per spawn, so pressure must be
         // computed against that card only — a summed-all-GPUs denominator
-        // fires late (or never) on mixed iGPU+dGPU boxes.
+        // fires late (or never) on mixed iGPU+dGPU boxes. Residents key
+        // on the census backend id (`device_id`): the display label two
+        // cards can share would under-count pressure silently.
         let residents: Vec<(Option<String>, u64, u64, bool)> = self
             .instances
             .iter()
             .map(|inst| {
                 let weights = u64::try_from(inst.model.bytes.max(0)).unwrap_or(u64::MAX);
                 (
-                    inst.device.clone(),
+                    inst.device_id.clone(),
                     weights,
                     inst.kv_est_bytes.unwrap_or(0),
                     !matches!(inst.gpu.as_str(), "cpu" | "partial"),
@@ -1086,14 +1367,15 @@ impl Supervisor {
         .unwrap_or(false)
     }
 
-    /// Live (non-evicted) TCP children as [`EngineRef`]s (endpoint +
-    /// child auth) — the cache-hint poller's and metrics merger's fetch
-    /// list. UDS children are skipped (no HTTP lane).
+    /// Children resident in the instance map as [`EngineRef`]s
+    /// (endpoint + child auth) — the cache-hint poller's and metrics
+    /// merger's fetch list. Both transports serve the same REST
+    /// surface; TCP-only engines (mistralrs/sdcpp/sglang) never carry
+    /// unix endpoints, so no engine-kind filter is needed here.
     #[must_use]
     pub fn live_http_endpoints(&self) -> Vec<EngineRef> {
         self.instances
             .iter()
-            .filter(|i| matches!(i.endpoint, Endpoint::Tcp { .. }))
             .map(|i| self.engine_ref(i.key(), i.value()))
             .collect()
     }
@@ -1112,6 +1394,23 @@ impl Supervisor {
         &self,
         name: &str,
         prefix: Option<PrefixKey>,
+    ) -> Result<EngineRef, SupervisionError> {
+        self.ensure_routed_opts(name, prefix, false).await
+    }
+
+    /// Captive variant for side loads (semantic-cache embed model):
+    /// routes exactly like [`Self::ensure_routed`], but the underlying
+    /// spawn refuses under admission pressure instead of evicting
+    /// residents.
+    pub async fn ensure_routed_captive(&self, name: &str) -> Result<EngineRef, SupervisionError> {
+        self.ensure_routed_opts(name, None, true).await
+    }
+
+    async fn ensure_routed_opts(
+        &self,
+        name: &str,
+        prefix: Option<PrefixKey>,
+        captive: bool,
     ) -> Result<EngineRef, SupervisionError> {
         // ollama API clients send `model:tag`; blazar rows are flat.
         // Same rule as the CLI boundary (`Store::resolve_model_name`),
@@ -1151,7 +1450,7 @@ impl Supervisor {
         }
 
         let key = self.replica_key(name, prefix);
-        let result = self.ensure_key(&key).await;
+        let result = self.ensure_key_opts(&key, captive).await;
         // Best-effort affinity record: pin this prefix to the replica
         // that served it, so the next turn hits its warm cache.
         if let Some(pk) = prefix {
@@ -1411,6 +1710,24 @@ impl Supervisor {
     /// future MUST detach (`tokio::spawn` + await) — see the
     /// `ensure_detached` contract in `crate::proxy`.
     pub async fn ensure_key(&self, key: &str) -> Result<EngineRef, SupervisionError> {
+        self.ensure_key_opts(key, false).await
+    }
+
+    /// Captive ensure: a load that must never evict resident models to
+    /// make room for itself. Under admission pressure the spawn refuses
+    /// (`AllSlotsBusy`) instead of selecting a victim — callers treat
+    /// that as "side load skipped", not a hard failure. The fast paths
+    /// (resident instance, in-flight load join) are identical to
+    /// [`Self::ensure_key`].
+    pub async fn ensure_key_captive(&self, key: &str) -> Result<EngineRef, SupervisionError> {
+        self.ensure_key_opts(key, true).await
+    }
+
+    async fn ensure_key_opts(
+        &self,
+        key: &str,
+        captive: bool,
+    ) -> Result<EngineRef, SupervisionError> {
         // Fast path: running (or sleeping — the child wakes on traffic).
         if let Some(inst) = self.instances.get(key) {
             let snapshot = (
@@ -1485,6 +1802,8 @@ impl Supervisor {
         };
         let result = if self.config.router && key == ROUTER_KEY {
             self.spawn_router_instance().await
+        } else if captive {
+            self.spawn_instance_captive(key).await
         } else {
             self.spawn_instance(key).await
         };
@@ -1591,6 +1910,7 @@ impl Supervisor {
         key: &str,
         endpoint: &Endpoint,
         manifest: &crate::engine::manifest::Manifest,
+        kind: blazar_core::engine_kind::EngineKind,
     ) -> Result<Option<ChildAuth>, SupervisionError> {
         let enabled = match self.config.child_auth {
             Some(v) => v,
@@ -1602,18 +1922,22 @@ impl Supervisor {
             return Ok(None);
         }
         if !manifest.flags.contains("--api-key-file") && !manifest.flags.contains("--api-key") {
-            // Kind-forked remedy: mistral.rs has no update lane (its engine
-            // update command itself teaches `engine install`), so name the
-            // install lane directly instead.
-            let remedy = if self.engine.kind() == blazar_core::engine_kind::EngineKind::MistralRs {
-                "blazar engine install --kind mistralrs"
-            } else {
-                "blazar engine update"
+            // The remedy belongs to the CHILD's engine (a routed spawn may
+            // differ from the daemon's global lane), hence the explicit
+            // `kind` parameter.
+            let remedy = match kind {
+                blazar_core::engine_kind::EngineKind::MistralRs => {
+                    "; run: blazar engine install --kind mistralrs"
+                }
+                blazar_core::engine_kind::EngineKind::SdCpp => {
+                    "; sd-server ships no auth flag upstream — the child is loopback-only"
+                }
+                _ => "; run: blazar engine update",
             };
             tracing::warn!(
                 model = key,
                 "child_auth: engine {} lacks --api-key/--api-key-file; child stays \
-                 unauthenticated (run: {remedy})",
+                 unauthenticated{remedy}",
                 manifest.tag
             );
             return Ok(None);
@@ -1734,6 +2058,7 @@ impl Supervisor {
                 draft_path: draft_path.as_deref(),
                 draft_gguf: None, // router preset: one child, no co-residency planning
                 mmproj_path: m.mmproj_path.as_deref(),
+                components: &component_args(&m.components),
                 // router preset: every pulled model rides one child incl
                 // VL rows — force the projector on regardless of policy
                 mmproj_force: true,
@@ -1792,6 +2117,7 @@ impl Supervisor {
             bytes: 0,
             sha256: None,
             mmproj_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,
@@ -1804,11 +2130,16 @@ impl Supervisor {
         // Dying router child's log tail (see spawn_instance for rationale).
         let mut last_load_tail = String::new();
         for _attempt in 0..2 {
-            let endpoint = self.pick_endpoint(ROUTER_KEY);
+            let endpoint = self.pick_endpoint(ROUTER_KEY)?;
             // Child auth dies with the child: minted per attempt (same
             // keyfile path, so retries overwrite), removed when this
             // attempt or the whole spawn fails.
-            let auth = match self.mint_child_auth(ROUTER_KEY, &endpoint, manifest) {
+            let auth = match self.mint_child_auth(
+                ROUTER_KEY,
+                &endpoint,
+                manifest,
+                blazar_core::engine_kind::EngineKind::LlamaCpp,
+            ) {
                 Ok(a) => a,
                 Err(e) => {
                     if let Some(p) = &auth_keyfile {
@@ -1917,6 +2248,7 @@ impl Supervisor {
                         profile_ctx: 0,
                         gpu: "router".to_string(),
                         device: None,
+                        device_id: None,
                         kv_est_bytes: None,
                         warnings: Vec::new(),
                         // router: no single spec mode (per-section drafts)
@@ -2131,9 +2463,23 @@ impl Supervisor {
         // routed spawn behaves exactly like a daemon booted on that
         // row.
         let adapter_for = |row: &blazar_core::store::EngineRow| -> Option<Arc<dyn Engine>> {
+            // The audio lane is gateway-owned and lazy: it never enters
+            // the supervised model-serving roster. A whisper row reaching
+            // here means routing surfaced it — log the surface bug
+            // loudly and treat the row as non-serving.
+            if row.kind == EngineKind::Whisper {
+                tracing::error!(
+                    "whisper engine row reached the supervised-adapter path — the audio lane serves lazily through /v1/audio/transcriptions; treating it as non-serving"
+                );
+                return None;
+            }
             let mut manifest: crate::engine::manifest::Manifest =
                 serde_json::from_str(&row.manifest).ok()?;
-            manifest.re_root_server_path(&self.dirs.engines_dir());
+            // Rows store data-dir-relative server paths: anchor back to
+            // an absolute live path (legacy absolute rows re-root, the
+            // relative invariant joins the data dir) so the spawn never
+            // execs the storage form raw.
+            manifest.anchor_server_path(&self.dirs.data_dir);
             let env: Vec<(String, String)> = self
                 .config
                 .engine_env
@@ -2154,6 +2500,11 @@ impl Supervisor {
                 EngineKind::LlamaCpp => {
                     Arc::new(crate::engine_impl::LlamaCppEngine::with_env(manifest, env))
                 }
+                EngineKind::SdCpp => {
+                    Arc::new(crate::engine_impl::SdCppEngine::with_env(manifest, env))
+                }
+                // Unreachable: the whisper guard above returns early.
+                EngineKind::Whisper => return None,
             })
         };
         let roster = || {
@@ -2233,6 +2584,7 @@ impl Supervisor {
             self.config.engine_routing.mode,
             self.config.engine_routing.policy,
             overlay.engine.as_deref(),
+            model.has_component_set(),
             safetensors,
             model.is_quantized_safetensors(),
             self.engine.kind(),
@@ -2300,7 +2652,16 @@ impl Supervisor {
     // Full child lifecycle in one pass: argv build, spawn, settle, health
     // gate, registration. Splitting it would scatter the invariants.
     async fn spawn_instance(&self, key: &str) -> Result<EngineRef, SupervisionError> {
-        self.spawn_instance_forced(key, false).await
+        self.spawn_instance_forced(key, false, false).await
+    }
+
+    /// Captive spawn: identical to [`Self::spawn_instance`] except the
+    /// admission loop refuses instead of evicting residents when the
+    /// budget is full. Used by non-generation side loads (the semantic
+    /// cache's embed model) that must never perturb generation
+    /// residency.
+    async fn spawn_instance_captive(&self, key: &str) -> Result<EngineRef, SupervisionError> {
+        self.spawn_instance_forced(key, false, true).await
     }
 
     /// `spawn_instance` with the capability-rescue bound: `true` means
@@ -2313,6 +2674,7 @@ impl Supervisor {
         &self,
         key: &str,
         forced_lane: bool,
+        captive: bool,
     ) -> Result<EngineRef, SupervisionError> {
         let name = model_of_key(key);
         let store =
@@ -2438,22 +2800,21 @@ impl Supervisor {
             )
         };
         loop {
-            let count_blocked = self
-                .instance_cap()
-                .is_some_and(|cap| self.instances.len() >= cap);
-            let bytes_blocked = self.bytes_admission_active()
-                && !self.instances.is_empty()
-                && self.resident_bytes().saturating_add(incoming_bytes) > self.vram_budget_bytes();
-            if !count_blocked && !bytes_blocked {
+            if !self.admission_blocked(name, incoming_bytes) {
                 break;
             }
-            match self.victim_key(key) {
-                Some(v) => {
+            match self.blocked_action(key, captive) {
+                BlockedAction::Evict(v) => {
+                    tracing::info!(
+                        victim = %v,
+                        incoming = name,
+                        "admission evict: making room for the blocked spawn"
+                    );
                     self.evict(&v)
                         .await
                         .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
                 }
-                None => return Err(SupervisionError::AllSlotsBusy),
+                BlockedAction::Refuse => return Err(SupervisionError::AllSlotsBusy),
             }
         }
 
@@ -2526,6 +2887,11 @@ impl Supervisor {
         let mut picked_display: Option<String> = None;
         let mut sibling_devices: Vec<String> = Vec::new();
         let mut auto_split: Option<String> = None;
+        // sdcpp placement token (`--backend` module target, e.g.
+        // `Vulkan1`): deliberately NOT `picked_device` — that drives the
+        // census-keyed ledger id, and the engine's token vocabulary is a
+        // different namespace from the system census names.
+        let mut sd_backend_token: Option<String> = None;
         // Tuning overrides are consumed exactly once, ABOVE the endpoint
         // retry loop (a retry attempt used to re-read an already-removed
         // `pending_ctx` entry), because the auto-split decision below
@@ -2562,6 +2928,7 @@ impl Supervisor {
                 draft_path: draft_path.as_deref(),
                 draft_gguf: draft_gguf.as_ref(),
                 mmproj_path: model.mmproj_path.as_deref(),
+                components: &component_args(&model.components),
                 // KV-estimate probe: policy-neutral (mirror the spawn's
                 // own key-derived force below for estimate honesty)
                 mmproj_force: key.ends_with("@vision"),
@@ -2644,6 +3011,30 @@ impl Supervisor {
                 }
             }
         }
+        // sdcpp placement vocabulary: sd-server has no --device flag —
+        // its `--backend` names engine-side module assignments using the
+        // engine's OWN device tokens (registration-time --list-devices
+        // census, e.g. `Vulkan1` on a vulkan build). Resolve the token
+        // with the same policy as the llamacpp pick: best free VRAM
+        // among discrete devices. Registration free bytes only ORDER the
+        // choice (which card); capacity math above stays on the system
+        // census. CPU-only censuses and unprobed manifests keep the
+        // blanket posture (profile-side fence).
+        if picked_device.is_none()
+            && sd_backend_token.is_none()
+            && engine.kind() == blazar_core::engine_kind::EngineKind::SdCpp
+            && self.config.effective_devices(name).is_empty()
+        {
+            if let Some((token, display)) = pick_sd_backend_device(&manifest.devices) {
+                tracing::info!(
+                    model = name,
+                    device = %token,
+                    "sdcpp backend token: engine census pick for the --backend module split"
+                );
+                sd_backend_token = Some(token);
+                picked_display = Some(display);
+            }
+        }
         // Placement label for `ps` (`full@<card>`): auto-pick names its
         // card above; cover the other placements — manual `devices`
         // (joined, a multi-card pin spans cards), single-GPU boxes (the
@@ -2670,6 +3061,50 @@ impl Supervisor {
                         .join("+")
                 })
             });
+        // Census-keyed placement id (the ledger + co-residency key):
+        // auto-pick's backend id, a single manual `devices` pin, or the
+        // lone card of a single-GPU box. Multi-card pins and tensor
+        // splits span devices — None routes them to the aggregate belt.
+        let placement_device_id = picked_device
+            .clone()
+            .or_else(|| {
+                let manual = self.config.effective_devices(name).to_vec();
+                (manual.len() == 1).then(|| manual[0].clone())
+            })
+            .or_else(|| {
+                let hw = fresh.as_ref().unwrap_or(&self.hardware);
+                (hw.gpus.len() == 1).then(|| hw.gpus[0].name.clone())
+            });
+        // Reservation ledger (per-device admission): hold the incoming
+        // floor against the picked card from placement to insert — a
+        // concurrent spawn for another model must see this footprint in
+        // admission BEFORE the child settles enough to join the resident
+        // sum. The insert converts the reservation into a counted
+        // resident; every failure path releases through the guard's Drop.
+        let reservation = placement_device_id
+            .as_ref()
+            .map(|d| self.reserve_device(d, incoming_bytes));
+        // Re-check under the reservation: a concurrent spawn may have
+        // reserved or inserted between the admission loop and the pick.
+        // The device load already carries this spawn's reservation —
+        // re-adding the incoming floor here would double-count it and
+        // evict residents the placement actually fits (seen live: a
+        // 6.6 GiB floor evicted a coexisting 0.7 GiB neighbor on a
+        // 7.6 GiB card that held both). Same evict-coldest / refuse
+        // contract as the loop above.
+        while placement_device_id
+            .as_ref()
+            .is_some_and(|d| !self.reservation_fits_device(d))
+        {
+            match self.blocked_action(key, captive) {
+                BlockedAction::Evict(v) => {
+                    self.evict(&v)
+                        .await
+                        .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
+                }
+                BlockedAction::Refuse => return Err(SupervisionError::AllSlotsBusy),
+            }
+        }
         // Cache-file dirs (speccache/, sessions/) must exist before the
         // child opens them; profile emission names these paths. Upstream
         // validates --slot-save-path IS a directory, so the per-model
@@ -2687,12 +3122,17 @@ impl Supervisor {
         // when a spawn fails (upstream's own error, e.g. "failed to
         // create context") — carried into the EngineCrashed payload.
         let mut last_load_tail = String::new();
+        // Whether any spawn attempt's argv dialed RPC backends
+        // (`--rpc`): gates the handshake-failure classification at the
+        // failure exit so a generic "failed to connect" tail from a
+        // non-RPC child can never trip it.
+        let mut argv_dialed_rpc = false;
         for _attempt in 0..2 {
-            let endpoint = self.pick_endpoint(key);
+            let endpoint = self.pick_endpoint(key)?;
             // Child auth dies with the child: minted per attempt (same
             // keyfile path, so retries overwrite), removed when this
             // attempt or the whole spawn fails.
-            let auth = match self.mint_child_auth(key, &endpoint, manifest) {
+            let auth = match self.mint_child_auth(key, &endpoint, manifest, engine.kind()) {
                 Ok(a) => a,
                 Err(e) => {
                     if let Some(p) = &auth_keyfile {
@@ -2731,6 +3171,7 @@ impl Supervisor {
                 draft_path: draft_path.as_deref(),
                 draft_gguf: draft_gguf.as_ref(),
                 mmproj_path: model.mmproj_path.as_deref(),
+                components: &component_args(&model.components),
                 // @vision respawn = caller demanded a projector-carrying
                 // child (ensure_vision); every other spawn honors policy
                 mmproj_force: key.ends_with("@vision"),
@@ -2747,7 +3188,7 @@ impl Supervisor {
                     .map(|e| u64::try_from(e.value().model.bytes.max(0)).unwrap_or(0))
                     .sum::<u64>()
                     / (1024 * 1024),
-                device_hint: picked_device.as_deref(),
+                device_hint: sd_backend_token.as_deref().or(picked_device.as_deref()),
                 // Build-class detection reads the FULL census: scoped
                 // `hardware` above sizes capacity against the picked
                 // card, but whether the engine binary is vulkan-class
@@ -2786,6 +3227,7 @@ impl Supervisor {
                 argv.extend(a.argv.iter().cloned());
             }
             self.remap_device_argv(&mut argv, name).await;
+            argv_dialed_rpc |= argv.iter().any(|flag| flag == "--rpc");
             let mut child = engine.spawn(&argv, &endpoint).await.map_err(|e| {
                 if let Some(p) = &auth_keyfile {
                     let _ = std::fs::remove_file(p);
@@ -2930,6 +3372,11 @@ impl Supervisor {
                         } else {
                             card_label.clone()
                         },
+                        device_id: if profile.gpu == "cpu" {
+                            None
+                        } else {
+                            placement_device_id.clone()
+                        },
                         kv_est_bytes: profile.kv_est_bytes,
                         warnings: profile.warnings.clone(),
                         spec_mode: spec_mode.clone(),
@@ -2960,6 +3407,10 @@ impl Supervisor {
                         pid.to_string(),
                     );
                     self.instances.insert(key.to_string(), inst);
+                    // The instance now counts as a resident on its card —
+                    // convert the reservation into that resident and stop
+                    // double-charging the ledger.
+                    drop(reservation);
                     // A restart only counts when it follows an unclean
                     // death — churn (stop→run) is a cold start, not a
                     // crash loop (live-repro'd: 4 clean churns in 60s
@@ -3079,7 +3530,7 @@ impl Supervisor {
                         .lock()
                         .expect("capability pins lock")
                         .insert(name.to_string(), tag.clone());
-                    return Box::pin(self.spawn_instance_forced(key, true)).await;
+                    return Box::pin(self.spawn_instance_forced(key, true, false)).await;
                 }
             }
             // No rescue available (no advertiser, already re-routed, or
@@ -3107,6 +3558,20 @@ impl Supervisor {
                     }
                 }
                 return Err(SupervisionError::EngineCrashed(msg));
+            }
+        }
+        // RPC handshake failure teaching: the spawn preflight only
+        // proves TCP reachability — a worker on a mismatched ggml
+        // build passes it and aborts the child at the first
+        // handshake. Classified only when this spawn's argv actually
+        // dialed RPC backends, so unrelated connect errors stay raw.
+        if child_died_during_load && argv_dialed_rpc {
+            if let Some(teach) = Self::classify_rpc_handshake_failure(&last_load_tail) {
+                return Err(SupervisionError::EngineCrashed(format!(
+                    "{key} [{}]: {} — {teach}",
+                    manifest.tag,
+                    Self::tail_excerpt(&last_load_tail)
+                )));
             }
         }
         Err(if child_died_during_load {
@@ -3173,6 +3638,67 @@ impl Supervisor {
         let end = rest.find('\'')?;
         let name = &rest[..end];
         (!name.is_empty()).then(|| name.to_string())
+    }
+
+    /// Classify a dead child's log tail as a ggml-RPC backend
+    /// handshake failure. Upstream ggml-rpc.cpp emits three fatal
+    /// shapes: `RPC server version mismatch: %d.%d.%d` (the worker
+    /// answers TCP but speaks an incompatible RPC protocol),
+    /// `RPC handshake failed for %s`, and the connect abort
+    /// `Failed to connect to %s`. The spawn preflight only proves
+    /// TCP reachability, so a stale worker passes it and kills the
+    /// child here instead. Extracts the worker addresses from the
+    /// `%s` shapes so the operator sees WHICH worker is stale;
+    /// `None` when none of the markers appear (the caller keeps
+    /// the raw tail excerpt).
+    fn classify_rpc_handshake_failure(tail: &str) -> Option<String> {
+        const VERSION_MISMATCH: &str = "rpc server version mismatch";
+        const HANDSHAKE_FAILED: &str = "rpc handshake failed for ";
+        const CONNECT_ABORT: &str = "failed to connect to ";
+        // Lowercase once, extract on the same copy (multi-byte case
+        // folds shift byte positions — same discipline as
+        // classify_unknown_arch).
+        let lower = tail.to_lowercase();
+        let mut version_mismatch = false;
+        let mut workers: Vec<&str> = Vec::new();
+        for line in lower.lines() {
+            if line.contains(VERSION_MISMATCH) {
+                version_mismatch = true;
+            }
+            if line.contains(HANDSHAKE_FAILED)
+                || (line.contains(CONNECT_ABORT) && line.contains("ggml"))
+            {
+                for marker in [HANDSHAKE_FAILED, CONNECT_ABORT] {
+                    if let Some(idx) = line.find(marker) {
+                        let after = line[idx + marker.len()..]
+                            .trim_end_matches(['\'', '"', ',', ')', ';', '.']);
+                        if !after.is_empty() {
+                            workers.push(after);
+                        }
+                    }
+                }
+            }
+        }
+        if !version_mismatch && workers.is_empty() {
+            return None;
+        }
+        let mut teach = String::from("RPC worker handshake failure");
+        if version_mismatch {
+            teach.push_str(
+                ": an RPC worker answers TCP but speaks a different ggml-RPC \
+protocol version",
+            );
+        }
+        if !workers.is_empty() {
+            let _ = write!(teach, " — worker(s): {}", workers.join(", "));
+        }
+        teach.push_str(
+            ". Every --rpc worker must run a ggml-rpc build from the same era as the \
+engine build named above (a stale worker passes the TCP preflight and aborts the \
+child at the handshake); restart the listed worker(s) from a matching build, or \
+drop them from rpc_servers in config.toml",
+        );
+        Some(teach)
     }
 
     /// Ask the capability registry for a curated lane serving `arch`
@@ -3302,15 +3828,12 @@ impl Supervisor {
             return true;
         };
         advise_cuda_build(&store, &row);
-        crate::engine::verify_engine_binary(
-            &row.kind,
-            &self.dirs.engines_dir(),
-            Some(&row.manifest),
-        )
+        crate::engine::verify_engine_binary(&row.kind, &self.dirs.data_dir, Some(&row.manifest))
     }
 
     /// Switch the active engine to the previous install (same ordering as
-    /// `EngineManager::rollback`: next entry after active = older). Leaves
+    /// `EngineManager::rollback`: next same-kind entry after the active =
+    /// older — voice lanes and other kinds are never targets). Leaves
     /// the tracker armed for a fresh verdict on the new engine.
     fn rollback_active_engine(&self, reason: &str) -> Result<(String, String)> {
         let store = Store::open(&self.dirs)?;
@@ -3320,12 +3843,14 @@ impl Supervisor {
             .find(|e| e.active)
             .ok_or_else(|| anyhow!("no active engine to roll back from"))?;
         let from = active.tag.clone();
-        let target = engines
-            .iter()
-            .position(|e| e.active)
-            .and_then(|idx| engines.get(idx + 1))
+        let target = crate::engine::rollback_candidate(&engines)
             .map(|e| e.tag.clone())
-            .ok_or_else(|| anyhow!("no older engine to roll back to (active: {from})"))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "no older {} engine to roll back to (active: {from})",
+                    active.kind
+                )
+            })?;
         drop(store);
         Store::open(&self.dirs)?.set_active_engine(&target)?;
         self.engine_failures.lock().unwrap().clear();
@@ -3342,24 +3867,30 @@ impl Supervisor {
     }
 
     /// Free TCP port (bind 0, read, drop) or a unix socket path.
-    fn pick_endpoint(&self, name: &str) -> Endpoint {
+    /// Socket names ride the shared `path_safe` sanitizer (a key like
+    /// `llava@vision` keeps its `@`; hostile separators collapse) and
+    /// must fit `sun_path` — an over-budget path fails the spawn with a
+    /// teaching error instead of dying inside the child's `bind`.
+    fn pick_endpoint(&self, name: &str) -> Result<Endpoint, SupervisionError> {
         if self.config.child_transport == "unix" {
-            return Endpoint::Unix {
-                socket: self
-                    .dirs
-                    .run_dir()
-                    .join(format!("{name}.sock"))
-                    .display()
-                    .to_string(),
-            };
+            let socket = self
+                .dirs
+                .run_dir()
+                .join(format!("{}.sock", blazar_core::profile::path_safe(name)))
+                .display()
+                .to_string();
+            crate::uds::validate_socket_path(&socket).map_err(|e| {
+                SupervisionError::Internal(anyhow::anyhow!("child socket for {name}: {e}"))
+            })?;
+            return Ok(Endpoint::Unix { socket });
         }
         let port = std::net::TcpListener::bind(("127.0.0.1", 0))
             .and_then(|l| l.local_addr())
             .map_or(0, |a| a.port());
-        Endpoint::Tcp {
+        Ok(Endpoint::Tcp {
             host: "127.0.0.1".into(),
             port,
-        }
+        })
     }
 
     fn record_restart(&self, name: &str) {
@@ -3380,6 +3911,14 @@ impl Supervisor {
         let Some(inst) = self.instances.get(name).map(|i| i.clone()) else {
             return Ok(());
         };
+        // Every eviction path funnels through here (admission capacity,
+        // header-timeout wedge, idle ladder, user stop) — one line so a
+        // vanished resident is always attributable in serve logs.
+        tracing::info!(
+            model = name,
+            pid = inst.pid,
+            "evict: terminating child and releasing the slot"
+        );
         // F1: mark the name as being torn down for the whole evict; a
         // concurrent spawn retries instead of inserting a fresh child
         // that our cleanup would then race (map remove + pidfile/apikey
@@ -3432,6 +3971,13 @@ impl Supervisor {
             let _ = std::fs::remove_file(self.dirs.run_dir().join(format!("{name}.pid")));
             // Child-auth keyfile dies with the child (its secret too).
             let _ = std::fs::remove_file(self.dirs.run_dir().join(format!("{name}.apikey")));
+            // Unix-transport socket dies with the child — under the same
+            // ptr-identity guard: a respawn that won the race rebound
+            // this exact path, and unlinking it would pull the live
+            // child's transport out from under it.
+            if let Endpoint::Unix { socket } = &inst.endpoint {
+                let _ = std::fs::remove_file(socket);
+            }
         } else {
             tracing::info!(
                 model = name,
@@ -3523,18 +4069,22 @@ impl Supervisor {
             );
             return;
         }
-        let (host, port) = match endpoint {
-            blazar_core::Endpoint::Tcp { host, port } => (host, *port),
-            // UDS children keep their slot protocol on the socket; the
-            // REST restore endpoint is not reachable.
-            blazar_core::Endpoint::Unix { .. } => return,
-        };
-        let url = format!("http://{host}:{port}/slots/0?action=restore&filename=_auto-{ctx}");
+        // Same REST surface on both transports (b11147 llama-server
+        // binds .sock paths via --host); the dial helper picks the
+        // client, the slot endpoints are unchanged.
+        let (client, base) = child_dial(endpoint);
+        // Restore truth-check: HTTP 200 alone does not prove KV injection
+        // (upstream has a restored-then-empty re-prefill bug class). The
+        // response's `n_restored` is the injection count; the first
+        // request's cached-token counter (gateway A9) backstops the
+        // lookup-miss variant. Live-probed on b11070: restore of 31 saved
+        // tokens -> next same-prefix completion ran cache_n=23, prompt_n=1.
+        let url = format!("{base}/slots/0?action=restore&filename=_auto-{ctx}");
         let mut body = serde_json::json!({ "filename": format!("_auto-{ctx}") });
         if self.config.router {
             body["model"] = serde_json::json!(key);
         }
-        let mut req = local_http()
+        let mut req = client
             .post(&url)
             .json(&body)
             .timeout(std::time::Duration::from_secs(5));
@@ -3543,11 +4093,29 @@ impl Supervisor {
         }
         match req.send().await {
             Ok(resp) if resp.status().is_success() => {
-                tracing::info!(
-                    target: "blazar::bank",
-                    model = key,
-                    "restored banked session _auto-{ctx}"
-                );
+                let restored = resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .as_ref()
+                    .and_then(|v| slot_reported_tokens(v, "n_restored"));
+                match restored {
+                    Some(0) => tracing::warn!(
+                        target: "blazar::bank",
+                        model = key,
+                        "bank restore returned ok but restored 0 tokens — empty or incompatible checkpoint; continuing cold"
+                    ),
+                    Some(n) => tracing::info!(
+                        target: "blazar::bank",
+                        model = key,
+                        "restored banked session _auto-{ctx} ({n} tokens into slot KV)"
+                    ),
+                    None => tracing::info!(
+                        target: "blazar::bank",
+                        model = key,
+                        "restored banked session _auto-{ctx} (no token count in response)"
+                    ),
+                }
             }
             Ok(resp) => {
                 tracing::warn!(
@@ -3573,29 +4141,50 @@ impl Supervisor {
             return;
         }
         let file = self.bank_file(&inst.name, inst.profile_ctx);
-        let url = match &inst.endpoint {
-            Endpoint::Tcp { host, port } => {
-                format!(
-                    "http://{host}:{port}/slots/0?action=save&filename=_auto-{}",
-                    inst.profile_ctx
-                )
-            }
-            Endpoint::Unix { .. } => return, // no HTTP lane on UDS children
-        };
+        let (client, base) = child_dial(&inst.endpoint);
+        let url = format!(
+            "{base}/slots/0?action=save&filename=_auto-{}",
+            inst.profile_ctx
+        );
         let body = if self.config.router {
             serde_json::json!({"filename": format!("_auto-{}", inst.profile_ctx), "model": inst.name})
         } else {
             serde_json::json!({"filename": format!("_auto-{}", inst.profile_ctx)})
         };
-        let mut req = local_http()
+        let mut req = client
             .post(&url)
             .json(&body)
             .timeout(std::time::Duration::from_secs(2));
         if let Some(secret) = &inst.auth {
             req = req.bearer_auth(secret);
         }
-        let ok = req.send().await.is_ok_and(|r| r.status().is_success());
+        let mut saved = None;
+        let ok = match req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                saved = resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .as_ref()
+                    .and_then(|v| slot_reported_tokens(v, "n_saved"));
+                true
+            }
+            _ => false,
+        };
         if ok {
+            match saved {
+                Some(0) => tracing::warn!(
+                    target: "blazar::bank",
+                    model = %inst.name,
+                    "bank save returned ok but wrote 0 tokens — the slot held no cached prefix to bank"
+                ),
+                Some(n) => tracing::debug!(
+                    target: "blazar::bank",
+                    model = %inst.name,
+                    "banked _auto-{} checkpoint: {n} tokens", inst.profile_ctx
+                ),
+                None => {}
+            }
             // Hoard guard: a per-model bank over 512 MiB is storage
             // abuse, not a cache — drop it and say so once.
             if let Ok(md) = std::fs::metadata(&file) {
@@ -3994,6 +4583,13 @@ impl Supervisor {
             // on every tick in the window (an event-drain resets the
             // streak after one tick — live-caught 2026-09-12)
             let pressure = self.slot_pressure.get(&model).map_or(0, |v| *v);
+            tracing::debug!(
+                model = %model,
+                pressure,
+                in_flight,
+                effective,
+                "adaptive tick probe"
+            );
             let saturated = pressure > 0 || (effective > 0 && in_flight > i64::from(effective));
             if saturated {
                 // Saturation cancels any pending decay count.
@@ -4007,7 +4603,14 @@ impl Supervisor {
                 };
                 if hit_threshold {
                     let from = effective;
-                    let to = (from + 1).min(SLOTS_ADOPT_CAP);
+                    // Demand-sized step: parked-waiter count is the
+                    // demand signal (C=8 on 1 slot parks 7), so one
+                    // adoption can reach the demanded shape instead of
+                    // climbing +1 per 60s streak. Fit-safe: the spawn
+                    // re-spends the same total-ctx budget across slots
+                    // and the profile walk caps what the card hosts.
+                    let step = pressure.max(1);
+                    let to = (from + step).min(SLOTS_ADOPT_CAP);
                     self.busy_streak.remove(&key);
                     if to > from {
                         self.adopted_slots.insert(model.clone(), to);
@@ -4020,7 +4623,14 @@ impl Supervisor {
                             .publish(BlazarEvent::SlotsAutoAdopted { model, from, to });
                     }
                 }
-            } else if in_flight == 0 && self.adopted_slots.contains_key(&model) {
+            } else if in_flight == 0
+                && self.adopted_slots.contains_key(&model)
+                // Never decay while a reshape is pending/draining: parked
+                // waiters keep in_flight at 0 and would let the decay
+                // reshape back to the natural shape mid-drain (thrash).
+                && !self.reshape_queue.contains_key(&model)
+                && !self.reshape_draining.contains_key(&model)
+            {
                 // Decay: the adopted shape buys queue-latency under load
                 // and costs per-stream ITL (np8 ITL 60ms vs np4 37ms,
                 // flagprobe 2026-09-12) — after a long
@@ -4058,10 +4668,24 @@ impl Supervisor {
         self.drain_reshape_queue().await;
     }
 
-    /// Respawn adopted models whose streams have drained. An entry
-    /// whose instance is still busy stays queued for the next tick
-    /// (sustained 24/7 load defers the reshape to the natural
-    /// idle-evict respawn — honest, never disruptive).
+    /// True while the model's queued reshape is draining: new admissions
+    /// park so the live-stream count can only fall. The admission gate
+    /// consults this on every pass through its re-check loop.
+    pub fn is_reshaping(&self, model: &str) -> bool {
+        self.reshape_draining.contains_key(model)
+    }
+
+    /// Respawn adopted models once their streams drain. A busy instance
+    /// gets its drain mark set: the admission gate then parks NEW
+    /// requests for the model, so in-flight falls as streams complete
+    /// and the reshape lands in one max-stream duration — the pre-drain
+    /// behavior (skip while busy) deferred the reshape forever under
+    /// sustained 24/7 load, leaving the system saturated exactly when
+    /// capacity mattered most (live receipt: 20260924-all-engines
+    /// campaign, flat 39 t/s at C=8 with TTFT p99 23s for ~2min).
+    /// Residual race (a request admitted in the instant between the
+    /// mark and the gate noticing) self-heals via the existing
+    /// child-send retry path, which respawns and retries once.
     async fn drain_reshape_queue(&self) {
         let entries: Vec<(String, String)> = self
             .reshape_queue
@@ -4074,20 +4698,49 @@ impl Supervisor {
                 .get(&key)
                 .is_some_and(|i| i.in_flight.load(Ordering::SeqCst) > 0);
             if busy {
+                if self
+                    .reshape_draining
+                    .insert(model.clone(), std::time::Instant::now())
+                    .is_none()
+                {
+                    tracing::info!(
+                        model = %model,
+                        "adaptive slots: holding admissions to drain live streams for the reshape"
+                    );
+                }
                 continue;
             }
-            self.reshape_queue.remove(&model);
+            // The draining mark and the queue entry stay held THROUGH the
+            // respawn: the admission gate must keep parking requests while
+            // the lane is child-less (evict -> spawn -> healthy takes a
+            // model-load of wall time), not just while streams drain.
+            let slots = self
+                .adopted_slots
+                .get(&model)
+                .map_or(self.config.slots, |v| *v.value());
             tracing::warn!(
                 model = %model,
-                "adaptive slots: respawning with the adopted slot count \
+                slots,
+                "adaptive slots: respawning with the new slot count \
                  (the KV bank carries conversations across the reshape)"
             );
             if let Err(e) = self.evict(&key).await {
+                // keep the queue entry + mark: retry the reshape next tick
                 tracing::warn!(model = %model, "adaptive reshape evict: {e:#}");
                 continue;
             }
-            if let Err(e) = self.ensure(&model).await {
-                tracing::warn!(model = %model, "adaptive reshape respawn: {e:#}");
+            match self.ensure(&model).await {
+                Ok(_) => {
+                    self.reshape_draining.remove(&model);
+                    self.reshape_queue.remove(&model);
+                    self.bus
+                        .publish(BlazarEvent::SlotsReshaped { model, slots });
+                }
+                Err(e) => {
+                    // Respawn failed: hold admissions one more tick and
+                    // retry — never publish completion for a dead lane.
+                    tracing::warn!(model = %model, "adaptive reshape respawn: {e:#}");
+                }
             }
         }
     }
@@ -4211,6 +4864,7 @@ impl Supervisor {
                     ctx: i.profile_ctx,
                     gpu: i.gpu.clone(),
                     device: i.device.clone(),
+                    device_id: i.device_id.clone(),
                     warnings: i.warnings.clone(),
                     spec_mode: i.spec_mode.clone(),
                     draft: i.draft.clone(),
@@ -4556,6 +5210,27 @@ mod routing_tests {
     use blazar_core::{ModelOverride, Profile};
 
     #[test]
+    fn unit__slot_reported_tokens__distinguishes_zero_from_missing() {
+        // Live shape from b11070 (probed 2026-09-22): save -> {"id_slot":3,
+        // "n_saved":31,...}; restore -> {"n_restored":31,...}. Zero is a
+        // legitimate answer (200 with an empty/incompatible checkpoint) and
+        // must NOT be conflated with a missing field.
+        let saved = serde_json::json!({"id_slot": 3, "n_saved": 31, "n_written": 382_044});
+        assert_eq!(slot_reported_tokens(&saved, "n_saved"), Some(31));
+        let empty = serde_json::json!({"id_slot": 0, "n_saved": 0});
+        assert_eq!(slot_reported_tokens(&empty, "n_saved"), Some(0));
+        // Missing field / wrong type / empty body: unverifiable, not zero.
+        let no_field = serde_json::json!({"id_slot": 0});
+        assert_eq!(slot_reported_tokens(&no_field, "n_saved"), None);
+        let wrong_type = serde_json::json!({"n_saved": "31"});
+        assert_eq!(slot_reported_tokens(&wrong_type, "n_saved"), None);
+        assert_eq!(
+            slot_reported_tokens(&serde_json::json!({}), "n_restored"),
+            None
+        );
+    }
+
+    #[test]
     fn unit__resolved_load_timeout__per_kind_default_and_user_pin() {
         use blazar_core::engine_kind::EngineKind as K;
         use std::time::Duration as D;
@@ -4602,8 +5277,41 @@ mod routing_tests {
             Err(e) => {
                 assert!(e.contains("diffusion/model-component"), "{e}");
                 assert!(e.contains("no architecture metadata"), "{e}");
-                assert!(e.contains("sd.cpp image lane"), "{e}");
+                assert!(e.contains("sdcpp"), "{e}");
+                assert!(e.contains("component set"), "{e}");
+                assert!(e.contains("blazar pull"), "{e}");
             }
+        }
+    }
+
+    #[test]
+    fn unit__read_model_meta__sdcpp_diT_parses_as_component_not_text() {
+        use blazar_core::engine_kind::EngineKind as K;
+        // Same 0-KV component GGUF as the teaching pin above — under the
+        // sdcpp lane it must NOT teach (the DiT is expected there): the
+        // meta is a placeholder and compile_sdcpp drives off the
+        // component set, never off GgufMeta.
+        let mut gguf = b"GGUF".to_vec();
+        gguf.extend_from_slice(&3u32.to_le_bytes());
+        gguf.extend_from_slice(&297u64.to_le_bytes());
+        gguf.extend_from_slice(&0u64.to_le_bytes());
+        let file = std::env::temp_dir().join("blazar-kvless-sdcpp.gguf");
+        std::fs::write(&file, &gguf).expect("write fixture");
+        let meta = read_model_meta(file.to_str().unwrap(), K::SdCpp)
+            .expect("sdcpp accepts its component DiT");
+        match meta.borrow_meta() {
+            blazar_core::hfmeta::ModelMeta::Gguf(g) => assert_eq!(g.architecture, ""),
+            other @ blazar_core::hfmeta::ModelMeta::Hf(_) => {
+                panic!("sdcpp meta must be the placeholder GGUF shape, got {other:?}")
+            }
+        }
+        // A directory under the sdcpp lane is a shape error with a
+        // re-pull remedy, never an hf-config parse attempt.
+        let dir = std::env::temp_dir().join("blazar-sdcpp-dir-probe");
+        std::fs::create_dir_all(&dir).expect("mkdir fixture");
+        match read_model_meta(dir.to_str().unwrap(), K::SdCpp) {
+            Ok(_) => panic!("dir under sdcpp must error"),
+            Err(e) => assert!(e.contains("DiT"), "{e}"),
         }
     }
 
@@ -4688,8 +5396,11 @@ mod routing_tests {
         ) -> Vec<String> {
             vec![]
         }
-        async fn spawn(&self, _argv: &[String], _endpoint: &Endpoint) -> Result<ChildHandle> {
-            Err(anyhow!("FakeEngine never spawns"))
+        async fn spawn(&self, _argv: &[String], endpoint: &Endpoint) -> Result<ChildHandle> {
+            // Real sleeper child: the drain/reshape tests run the full
+            // evict -> respawn path, and every other routing test never
+            // reaches spawn.
+            Ok(ChildHandle::new(endpoint.clone(), dummy_process()))
         }
         async fn health_check(&self, _endpoint: &Endpoint, _timeout: Duration) -> Result<()> {
             Ok(())
@@ -4697,12 +5408,53 @@ mod routing_tests {
     }
 
     fn routing_sup(replicas: u32) -> Supervisor {
+        // Full llamacpp-style flag surface: the drain/reshape respawn
+        // runs the real profile builder, which validates every emitted
+        // argv flag against the manifest. Other routing tests never
+        // reach spawn, so the richer surface is inert for them.
+        let flags: std::collections::BTreeSet<String> = [
+            "-m",
+            "--host",
+            "--port",
+            "--alias",
+            "--jinja",
+            "--metrics",
+            "--flash-attn",
+            "--ctx-size",
+            "--threads",
+            "--gpu-layers",
+            "--cache-reuse",
+            "--cache-type-k",
+            "--cache-type-v",
+            "--cpu-moe",
+            "--sleep-idle-seconds",
+            "-np",
+            "--rpc",
+            "--lora",
+            "--lora-scaled",
+            "--spec-type",
+            "--spec-draft-model",
+            "--spec-draft-n-max",
+            "--cache-ram",
+            "-mm",
+            "--mmproj",
+            "-p",
+            "-n",
+            "-r",
+            "-c",
+            "-t",
+            "-ctk",
+            "-ctv",
+        ]
+        .iter()
+        .map(|f| (*f).into())
+        .collect();
         let manifest = Manifest {
             tag: "fake".into(),
             build_number: 1,
             version_raw: "b1".into(),
             devices: vec![],
-            flags: std::collections::BTreeSet::new(),
+            flags,
             spec_types: vec![],
             server_path: String::new(),
             ..Default::default()
@@ -4739,6 +5491,7 @@ mod routing_tests {
     #[allow(non_snake_case)]
     #[test]
     fn unit__mint_child_auth__keyfile_lane_argv_fallback_and_gates() {
+        use blazar_core::engine_kind::EngineKind as K;
         let root = tempfile::TempDir::new().unwrap();
         let dirs = BlazarDirs {
             config_dir: root.path().join("cfg"),
@@ -4776,7 +5529,12 @@ mod routing_tests {
 
         // File lane: keyfile minted 0600, argv carries the path only.
         let file_lane = auto
-            .mint_child_auth("m1", &tcp, &manifest(&["--api-key", "--api-key-file"]))
+            .mint_child_auth(
+                "m1",
+                &tcp,
+                &manifest(&["--api-key", "--api-key-file"]),
+                K::LlamaCpp,
+            )
             .unwrap()
             .unwrap();
         let keyfile = dirs.run_dir().join("m1.apikey");
@@ -4798,7 +5556,7 @@ mod routing_tests {
 
         // Argv fallback (sglang today): secret rides argv, no keyfile.
         let argv_lane = auto
-            .mint_child_auth("m2", &tcp, &manifest(&["--api-key"]))
+            .mint_child_auth("m2", &tcp, &manifest(&["--api-key"]), K::LlamaCpp)
             .unwrap()
             .unwrap();
         assert_eq!(argv_lane.argv[0], "--api-key");
@@ -4807,7 +5565,7 @@ mod routing_tests {
 
         // Engine update gaining --api-key-file flips the lane on its own.
         let flipped = auto
-            .mint_child_auth("m3", &tcp, &manifest(&["--api-key-file"]))
+            .mint_child_auth("m3", &tcp, &manifest(&["--api-key-file"]), K::LlamaCpp)
             .unwrap()
             .unwrap();
         assert!(
@@ -4817,7 +5575,7 @@ mod routing_tests {
 
         // No auth flag surface: warn-skip, child stays open.
         assert!(auto
-            .mint_child_auth("m4", &tcp, &manifest(&[]))
+            .mint_child_auth("m4", &tcp, &manifest(&[]), K::LlamaCpp)
             .unwrap()
             .is_none());
 
@@ -4826,7 +5584,7 @@ mod routing_tests {
             socket: "/unused/blazar.sock".into(),
         };
         assert!(auto
-            .mint_child_auth("m5", &uds, &manifest(&["--api-key"]))
+            .mint_child_auth("m5", &uds, &manifest(&["--api-key"]), K::LlamaCpp)
             .unwrap()
             .is_none());
 
@@ -4836,9 +5594,139 @@ mod routing_tests {
             ..Config::default()
         };
         assert!(sup(off)
-            .mint_child_auth("m6", &tcp, &manifest(&["--api-key", "--api-key-file"]))
+            .mint_child_auth(
+                "m6",
+                &tcp,
+                &manifest(&["--api-key", "--api-key-file"]),
+                K::LlamaCpp
+            )
             .unwrap()
             .is_none());
+    }
+
+    #[cfg(unix)]
+    fn uds_sup(dirs: &BlazarDirs, config: Config) -> Supervisor {
+        let manifest = Manifest {
+            tag: "fake".into(),
+            build_number: 1,
+            version_raw: "b1".into(),
+            devices: vec![],
+            flags: std::collections::BTreeSet::new(),
+            spec_types: vec![],
+            server_path: String::new(),
+            ..Default::default()
+        };
+        Supervisor::new(
+            dirs.clone(),
+            config,
+            EventBus::default(),
+            Hardware {
+                physical_cores: 1,
+                total_ram_mib: 1024,
+                gpus: vec![],
+            },
+            Arc::new(FakeEngine(manifest)),
+        )
+    }
+
+    #[cfg(unix)]
+    #[allow(non_snake_case)]
+    #[test]
+    fn unit__pick_endpoint__unix_transport_shape_and_determinism() {
+        let root = tempfile::TempDir::new().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: root.path().join("cfg"),
+            data_dir: root.path().join("data"),
+        };
+        let config = Config {
+            child_transport: "unix".into(),
+            ..Config::default()
+        };
+        let sup = uds_sup(&dirs, config);
+
+        // Sanitized, .sock-suffixed, deterministic (a respawn rebinds the
+        // same path — the boot sweep relies on this).
+        let key = "llava@vision";
+        let first = sup.pick_endpoint(key).unwrap();
+        let second = sup.pick_endpoint(key).unwrap();
+        let Endpoint::Unix { socket } = &first else {
+            panic!("unix transport must carry a socket endpoint, got {first:?}");
+        };
+        assert_eq!(first, second, "per-name socket path is deterministic");
+        let file = socket.rsplit('/').next().unwrap_or(socket);
+        assert!(
+            file.starts_with("llava")
+                && std::path::Path::new(file)
+                    .extension()
+                    .is_some_and(|e| e == std::ffi::OsStr::new("sock")),
+            "sanitized stem in {socket}"
+        );
+        assert!(socket.starts_with(dirs.run_dir().display().to_string().as_str()));
+        assert!(socket.len() <= crate::uds::MAX_SOCKET_PATH_BYTES);
+
+        // A distinct name never collides.
+        assert_ne!(
+            sup.pick_endpoint("llava@vision#1").unwrap(),
+            first,
+            "replica keys get their own socket"
+        );
+    }
+
+    #[cfg(unix)]
+    #[allow(non_snake_case)]
+    #[test]
+    fn unit__pick_endpoint__unix_over_budget_path_fails_with_teaching_error() {
+        let root = tempfile::TempDir::new().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: root.path().join("cfg"),
+            data_dir: root.path().join("x".repeat(120)),
+        };
+        let config = Config {
+            child_transport: "unix".into(),
+            ..Config::default()
+        };
+        let sup = uds_sup(&dirs, config);
+        let err = sup.pick_endpoint("m").unwrap_err().to_string();
+        assert!(
+            err.contains("sun_path") && err.contains("child socket for m"),
+            "teaching error, got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[allow(non_snake_case)]
+    #[tokio::test]
+    async fn unit__evict__unix_endpoint_unlinks_socket_file() {
+        let root = tempfile::TempDir::new().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: root.path().join("cfg"),
+            data_dir: root.path().join("data"),
+        };
+        std::fs::create_dir_all(dirs.run_dir()).unwrap();
+        let sup = uds_sup(&dirs, Config::default());
+
+        // A REAL bound socket: proves teardown unlinks an actual
+        // filesystem node, not just a fabricated path string.
+        let socket_path = dirs.run_dir().join("unixx.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        assert!(socket_path.exists());
+
+        let (inst, _pid) = fake_instance_at(
+            "unixx",
+            InstanceState::Ready,
+            0,
+            Endpoint::Unix {
+                socket: socket_path.display().to_string(),
+            },
+        );
+        sup.instances.insert("unixx".to_string(), inst);
+        sup.evict("unixx").await.unwrap();
+
+        assert!(
+            !socket_path.exists(),
+            "evict must unlink the child's socket alongside pidfile/apikey"
+        );
+        drop(listener);
     }
 
     #[cfg(unix)]
@@ -5066,6 +5954,7 @@ mod routing_tests {
                 bytes: weights_bytes,
                 sha256: None,
                 mmproj_path: None,
+                components: vec![],
                 shards: 1,
                 arch: None,
                 params: None,
@@ -5075,6 +5964,7 @@ mod routing_tests {
             profile_ctx: 8,
             gpu: "full".into(),
             device: None,
+            device_id: None,
             kv_est_bytes: None,
             warnings: Vec::new(),
             spec_mode: "off".into(),
@@ -5106,6 +5996,46 @@ mod routing_tests {
         assert_eq!(rows[0].engine, "test-engine");
     }
 
+    /// Audit MM5 regression: media-job polls bracket via
+    /// `begin_request`/`end_request` — the bracket must bump `in_flight`
+    /// (holds the child against idle eviction) and refresh `last_used`
+    /// on BOTH ends, and end must clamp at zero (a request outliving a
+    /// respawn must never read the shared counter negative).
+    #[tokio::test]
+    async fn unit__request_accounting__bracket_touches_activity_and_clamps() {
+        let (sup, _root) = gpu_sup();
+        let (inst, _pid) = gpu_instance("m", 1000, 0);
+        sup.instances.insert("m".to_string(), inst);
+        let i = sup.instances.get("m").expect("inserted");
+        let stale = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(600))
+            .expect("600s fits any monotonic clock");
+        *i.last_used.write().expect("idle lock") = stale;
+
+        sup.begin_request("m");
+        assert_eq!(i.in_flight.load(Ordering::SeqCst), 1, "begin bumps");
+        assert!(
+            *i.last_used.read().expect("idle lock") > stale,
+            "begin refreshes last_used (reaper must not idle-evict mid-job)"
+        );
+
+        sup.end_request("m");
+        assert_eq!(i.in_flight.load(Ordering::SeqCst), 0, "end decrements");
+        assert!(
+            *i.last_used.read().expect("idle lock") > stale,
+            "end refreshes last_used too"
+        );
+
+        // Over-end (request began on a previous generation of the name):
+        // the CAS loop must leave the counter at zero, not negative.
+        sup.end_request("m");
+        assert_eq!(i.in_flight.load(Ordering::SeqCst), 0, "end clamps at zero");
+
+        // Unknown names are a silent no-op (instance already gone).
+        sup.begin_request("ghost");
+        sup.end_request("ghost");
+    }
+
     #[tokio::test]
     async fn unit__warm_peg_sglang__unix_endpoint_noop_fast() {
         // sglang is TCP-only; a unix endpoint must return instantly
@@ -5125,6 +6055,298 @@ mod routing_tests {
             started.elapsed() < std::time::Duration::from_millis(100),
             "unix guard returns without HTTP"
         );
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__blocked_action__captive_never_selects_a_victim() {
+        // Captive contract: under the same pressure that would evict
+        // the resident for a generation spawn, the captive verdict is a
+        // flat refusal — the semantic-cache embed model must never
+        // decide which generation models stay resident.
+        let (sup, _root) = gpu_sup();
+        let (big, pid) = gpu_instance("big", 5_800 * 1024 * 1024, 7_302);
+        sup.instances.insert("big".to_string(), big);
+        let floor = blazar_core::profile::admission_floor_bytes(500 * 1024 * 1024, 0);
+        assert!(
+            sup.admission_blocked("other", floor),
+            "precondition: the small model does not fit alongside big"
+        );
+        assert_eq!(
+            sup.blocked_action("other", false),
+            BlockedAction::Evict("big".to_string()),
+            "generation spawn under pressure evicts the coldest resident"
+        );
+        assert_eq!(
+            sup.blocked_action("other", true),
+            BlockedAction::Refuse,
+            "captive spawn must refuse instead of naming a victim"
+        );
+        // The refusal left the resident untouched.
+        assert!(sup.instances.contains_key("big"));
+        sup.evict("big").await.unwrap();
+        let _ = pid;
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__admission_blocked__cold_box_admits_one_model() {
+        let (sup, _root) = gpu_sup();
+        let floor = blazar_core::profile::admission_floor_bytes(8_000 * 1024 * 1024, 0);
+        // Empty GPU box: any single model admits (J3 owns honest refusal).
+        assert!(!sup.admission_blocked("big", floor));
+        // Occupied and over budget: blocked.
+        let (big, _pid) = gpu_instance("big", 5_800 * 1024 * 1024, 6_000);
+        sup.instances.insert("big".to_string(), big);
+        assert!(sup.admission_blocked("other", floor));
+        // Occupied but within budget: not blocked. The tiny floor
+        // carries the fixed KV (512 MiB) + spawn overhead (700 MiB)
+        // charge, so "fits" means weights + 1212 MiB under headroom.
+        let tiny_floor = blazar_core::profile::admission_floor_bytes(50 * 1024 * 1024, 0);
+        assert_eq!(
+            tiny_floor,
+            (50 + 512 + 700) * 1024 * 1024,
+            "floor arithmetic this test relies on"
+        );
+        assert!(!sup.admission_blocked("other", tiny_floor));
+    }
+
+    /// Two-card fake box whose descriptions differ from the census ids —
+    /// the display-label/id split real censuses exhibit. The per-device
+    /// ledger and the card-scoped co-residency planner must key on the
+    /// id, never on the label.
+    #[test]
+    fn unit__pick_sd_backend_device__census_token_discrete_and_cpu_skipped() {
+        let devs = vec![
+            // Huge-free CPU entry: a placement candidate for nobody.
+            crate::engine::manifest::DeviceDesc {
+                name: "CPU".into(),
+                description: "CPU".into(),
+                total_mib: 64_000,
+                free_mib: 60_000,
+            },
+            crate::engine::manifest::DeviceDesc {
+                name: "Vulkan0".into(),
+                description: "Intel(R) Graphics (RPL-S)".into(),
+                total_mib: 16_384,
+                free_mib: 16_000,
+            },
+            crate::engine::manifest::DeviceDesc {
+                name: "Vulkan1".into(),
+                description: "NVIDIA GeForce RTX 4070 Laptop GPU".into(),
+                total_mib: 8_188,
+                free_mib: 7_790,
+            },
+        ];
+        let (token, display) = pick_sd_backend_device(&devs).unwrap();
+        assert_eq!(token, "Vulkan1");
+        assert!(display.contains("4070"), "{display}");
+
+        let cpu_only = vec![crate::engine::manifest::DeviceDesc {
+            name: "CPU".into(),
+            description: "CPU".into(),
+            total_mib: 1,
+            free_mib: 1,
+        }];
+        assert!(pick_sd_backend_device(&cpu_only).is_none());
+        assert!(pick_sd_backend_device(&[]).is_none());
+    }
+
+    fn dual_gpu_sup() -> (Supervisor, tempfile::TempDir) {
+        let bus = EventBus::default();
+        let root = tempfile::TempDir::new().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: root.path().join("cfg"),
+            data_dir: root.path().join("data"),
+        };
+        std::fs::create_dir_all(&dirs.config_dir).unwrap();
+        let sup = Supervisor::new(
+            dirs,
+            Config::default(),
+            bus,
+            Hardware {
+                physical_cores: 1,
+                total_ram_mib: 32_000,
+                gpus: vec![
+                    gpu("GPU0", "NVIDIA GeForce RTX 4070", 8_188, 8_188),
+                    gpu("GPU1", "NVIDIA GeForce RTX 5070", 8_188, 8_188),
+                ],
+            },
+            Arc::new(FakeEngine(Manifest {
+                tag: "fake".into(),
+                build_number: 1,
+                version_raw: "b1".into(),
+                devices: vec![],
+                flags: std::collections::BTreeSet::new(),
+                spec_types: vec![],
+                server_path: String::new(),
+                ..Default::default()
+            })),
+        );
+        (sup, root)
+    }
+
+    /// `gpu_instance` twin that records its census card placement the way
+    /// a real spawn does: display label in `device`, backend id in
+    /// `device_id`.
+    fn placed_gpu_instance(
+        key: &str,
+        weights_bytes: i64,
+        settled_mib: u64,
+        card: &str,
+        label: &str,
+    ) -> (Arc<Instance>, u32) {
+        let (mut inst, pid) = gpu_instance(key, weights_bytes, settled_mib);
+        if let Some(i) = Arc::get_mut(&mut inst) {
+            i.device = Some(label.to_string());
+            i.device_id = Some(card.to_string());
+        }
+        (inst, pid)
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__admission_blocked__per_device_two_cards() {
+        let mib = |m: u64| m * 1024 * 1024;
+        let (sup, _root) = dual_gpu_sup();
+        let (big0, _p0) = placed_gpu_instance(
+            "big0",
+            mib(100).cast_signed(),
+            6_000,
+            "GPU0",
+            "NVIDIA GeForce RTX 4070",
+        );
+        sup.instances.insert("big0".to_string(), big0);
+        // One card loaded: a 5000 MiB floor still fits the EMPTY card —
+        // per-device and the old aggregate pool agree here.
+        assert!(!sup.admission_blocked("other", mib(5_000)));
+        let (big1, _p1) = placed_gpu_instance(
+            "big1",
+            mib(100).cast_signed(),
+            6_000,
+            "GPU1",
+            "NVIDIA GeForce RTX 5070",
+        );
+        sup.instances.insert("big1".to_string(), big1);
+        // Both cards loaded: 6000 + 3000 > 8188 on EACH card → blocked,
+        // even though the summed pool (12_000 resident + 3000 floor <=
+        // 16_376) still says room — the exact one-card collision the
+        // aggregate admission used to wave through.
+        assert!(sup.admission_blocked("other", mib(3_000)));
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__reservation_fits_device__reservation_replaces_incoming_not_adds() {
+        let mib = |m: u64| m * 1024 * 1024;
+        let (sup, _root) = dual_gpu_sup();
+        // The live over-eviction scenario: a 0.7 GiB resident coexists
+        // with a 6.6 GiB incoming floor on an 8 GiB card (697 + 6630 =
+        // 7327 <= 8188) — under the reservation the load already speaks
+        // for the incoming spawn, so the placement fits.
+        let (small, _ps) = placed_gpu_instance(
+            "small",
+            mib(100).cast_signed(),
+            697,
+            "GPU0",
+            "NVIDIA GeForce RTX 4070",
+        );
+        sup.instances.insert("small".to_string(), small);
+        let r = sup.reserve_device("GPU0", mib(6_630));
+        assert!(sup.reservation_fits_device("GPU0"));
+        // One more resident tips it over (697 + 900 + 6630 > 8188): the
+        // re-check must evict, not wave through.
+        let (extra, _pe) = placed_gpu_instance(
+            "extra",
+            mib(100).cast_signed(),
+            900,
+            "GPU0",
+            "NVIDIA GeForce RTX 4070",
+        );
+        sup.instances.insert("extra".to_string(), extra);
+        assert!(!sup.reservation_fits_device("GPU0"));
+        drop(r);
+        // Unknown device budget fails open (spawn-time probe owns the
+        // honest refuse).
+        assert!(sup.reservation_fits_device("CUDA9"));
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__device_reservation__blocks_concurrent_second_spawn() {
+        let mib = |m: u64| m * 1024 * 1024;
+        let (sup, _root) = dual_gpu_sup();
+        let (a, _pa) = placed_gpu_instance(
+            "a",
+            mib(100).cast_signed(),
+            6_000,
+            "GPU0",
+            "NVIDIA GeForce RTX 4070",
+        );
+        sup.instances.insert("a".to_string(), a);
+        let (b, _pb) = placed_gpu_instance(
+            "b",
+            mib(100).cast_signed(),
+            5_000,
+            "GPU1",
+            "NVIDIA GeForce RTX 5070",
+        );
+        sup.instances.insert("b".to_string(), b);
+        // GPU0 6000+3000 over; GPU1 5000+3000 = 8000 <= 8188 → fits; the
+        // only fitting card is GPU1.
+        assert!(!sup.admission_blocked("other", mib(3_000)));
+        // A concurrent spawn holds GPU1's remaining headroom for its
+        // pick→insert window (the settling child is not yet a counted
+        // resident): 5000 + 200 reserved + 3000 floor > 8188 → the next
+        // admission must see the collision the resident sum alone misses.
+        let r = sup.reserve_device("GPU1", mib(200));
+        assert!(sup.admission_blocked("other", mib(3_000)));
+        // Releasing the reservation reopens the card — Drop is the only
+        // release path, so the guard's lifetime IS the spawn window.
+        drop(r);
+        assert!(!sup.admission_blocked("other", mib(3_000)));
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__device_reservation__drop_releases_exact_bytes() {
+        let mib = |m: u64| m * 1024 * 1024;
+        let (sup, _root) = dual_gpu_sup();
+        let baseline = sup.device_load_bytes("GPU0");
+        let r = sup.reserve_device("GPU0", mib(1_234));
+        assert_eq!(sup.device_load_bytes("GPU0"), baseline + mib(1_234));
+        drop(r);
+        assert_eq!(sup.device_load_bytes("GPU0"), baseline);
+        // Stacked reservations accumulate; releasing the inner one leaves
+        // the outer charged (no over-release, no under-release).
+        let outer = sup.reserve_device("GPU0", mib(100));
+        {
+            let inner = sup.reserve_device("GPU0", mib(50));
+            assert_eq!(sup.device_load_bytes("GPU0"), baseline + mib(150));
+            drop(inner);
+            assert_eq!(sup.device_load_bytes("GPU0"), baseline + mib(100));
+        }
+        drop(outer);
+        assert_eq!(sup.device_load_bytes("GPU0"), baseline);
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__coresidency__counts_resident_by_backend_id_not_label() {
+        let mib = |m: u64| m * 1024 * 1024;
+        let (sup, _root) = dual_gpu_sup();
+        let (mut big0, _p) = gpu_instance("big0", mib(6_000).cast_signed(), 0);
+        if let Some(i) = Arc::get_mut(&mut big0) {
+            i.device = Some("NVIDIA GeForce RTX 4070".into());
+            i.device_id = Some("GPU0".into());
+            i.kv_est_bytes = Some(mib(1_000));
+        }
+        sup.instances.insert("big0".to_string(), big0);
+        // 6000 weights + 1000 KV resident + 1000 weights + 1000 KV
+        // candidate = 9000 MiB > 95% of the 8188 card → downgrade fires.
+        assert!(sup.coresidency_needs_kv_quant(Some("GPU0"), mib(1_000), Some(mib(1_000))));
+        // Targeting GPU1: the GPU0 resident does not count → 2000 fits.
+        assert!(!sup.coresidency_needs_kv_quant(Some("GPU1"), mib(1_000), Some(mib(1_000))));
     }
 
     #[tokio::test]
@@ -5176,12 +6398,27 @@ mod routing_tests {
     /// Fabricated map entry: real child (so teardown paths stay honest),
     /// throwaway argv/profile. Caller owns the pid for cleanup.
     fn fake_instance(key: &str, state: InstanceState, load: i64) -> (Arc<Instance>, u32) {
+        fake_instance_at(
+            key,
+            state,
+            load,
+            Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 0,
+            },
+        )
+    }
+
+    /// Same fabricated child as [`fake_instance`], with a caller-chosen
+    /// transport (unix-socket lifecycle tests need `Endpoint::Unix`).
+    fn fake_instance_at(
+        key: &str,
+        state: InstanceState,
+        load: i64,
+        endpoint: Endpoint,
+    ) -> (Arc<Instance>, u32) {
         let proc = dummy_process();
         let pid = proc.id().expect("fabricated child pid");
-        let endpoint = Endpoint::Tcp {
-            host: "127.0.0.1".into(),
-            port: 0,
-        };
         let inst = Instance {
             name: key.to_string(),
             engine_tag: "test-engine".to_string(),
@@ -5202,6 +6439,7 @@ mod routing_tests {
                 bytes: 1,
                 sha256: None,
                 mmproj_path: None,
+                components: vec![],
                 shards: 1,
                 arch: None,
                 params: None,
@@ -5211,6 +6449,7 @@ mod routing_tests {
             profile_ctx: 8,
             gpu: "cpu".into(),
             device: None,
+            device_id: None,
             kv_est_bytes: None,
             warnings: Vec::new(),
             spec_mode: "off".into(),
@@ -5425,6 +6664,7 @@ mod routing_tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,
@@ -5527,6 +6767,50 @@ mod routing_tests {
             Supervisor::classify_unknown_arch(&mixed).as_deref(),
             Some("qwen2")
         );
+    }
+
+    #[test]
+    fn unit__classify_rpc_handshake__version_mismatch_and_worker_extraction() {
+        // ggml-rpc.cpp fatal shapes; addresses ride into the teaching.
+        let teach = Supervisor::classify_rpc_handshake_failure(
+            "loading model\nRPC server version mismatch: 6.3.1 != 7.0.0\n",
+        )
+        .expect("version mismatch classifies");
+        assert!(
+            teach.contains("different ggml-RPC protocol version"),
+            "{teach}"
+        );
+        let teach = Supervisor::classify_rpc_handshake_failure(
+            "RPC handshake failed for 192.168.1.4:50052; closing connection\n",
+        )
+        .expect("handshake failure classifies");
+        assert!(teach.contains("192.168.1.4:50052"), "{teach}");
+        let teach = Supervisor::classify_rpc_handshake_failure(
+            "GGML_ABORT: Failed to connect to rpc0:50052",
+        )
+        .expect("connect abort classifies");
+        assert!(teach.contains("rpc0:50052"), "{teach}");
+        // Every classified tail teaches the same-era remedy.
+        assert!(teach.contains("rpc_servers"), "{teach}");
+    }
+
+    #[test]
+    fn unit__classify_rpc_handshake__unrelated_tails_are_none() {
+        // A non-RPC child's generic connect error must never classify
+        // (the argv gate at the call site is the second guard, but the
+        // classifier itself stays conservative too).
+        for tail in [
+            "failed to create context",
+            "error: failed to connect to model.db",
+            "rpc: 0 backends registered",
+            "",
+        ] {
+            assert_eq!(
+                Supervisor::classify_rpc_handshake_failure(tail),
+                None,
+                "{tail:?}"
+            );
+        }
     }
 
     /// Engine rows for capability-lane tests: fork rows carry the
@@ -5658,6 +6942,7 @@ mod routing_tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,
@@ -5725,6 +7010,7 @@ mod routing_tests {
             bytes: 1,
             sha256: None,
             mmproj_path: None,
+            components: vec![],
             shards: 1,
             arch: None,
             params: None,
@@ -6014,7 +7300,10 @@ mod routing_tests {
         for _ in 0..SLOTS_STREAK_TICKS {
             sup.adaptive_slots_tick();
         }
-        assert_eq!(sup.adopted_slots.get("m").map(|v| *v), Some(5));
+        // Demand-sized adoption (2026-09-24): the parked-waiter gauge is
+        // the step, so two parked requests move the shape 4 -> 6 directly
+        // instead of the old fixed +1 (which needed one streak per slot).
+        assert_eq!(sup.adopted_slots.get("m").map(|v| *v), Some(6));
         assert_eq!(
             sup.reshape_queue.get("m").map(|v| v.value().clone()),
             Some("m".to_string())
@@ -6023,6 +7312,205 @@ mod routing_tests {
         sup.note_slot_pressure_release("m");
         sup.note_slot_pressure_release("m");
         assert!(sup.slot_pressure.get("m").is_none());
+        kill_all(&[ph]);
+    }
+
+    /// Minimal valid GGUF v3 the reshape-respawn path can parse: a
+    /// qwen3 text model with the fields the profile builder reads
+    /// (same KV set the gateway e2e harness proves against the full
+    /// spawn pipeline). Zero tensors, header KVs only.
+    fn write_minimal_qwen3_gguf(path: &std::path::Path) {
+        let pstr = |s: &str| -> Vec<u8> {
+            let mut v = (s.len() as u64).to_le_bytes().to_vec();
+            v.extend_from_slice(s.as_bytes());
+            v
+        };
+        let mut b: Vec<u8> = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        let kvs: Vec<(&str, u32, Vec<u8>)> = vec![
+            ("general.architecture", 8, pstr("qwen3")),
+            ("qwen3.block_count", 4, 28u32.to_le_bytes().to_vec()),
+            ("qwen3.context_length", 4, 40_960u32.to_le_bytes().to_vec()),
+            ("qwen3.head_count", 4, 16u32.to_le_bytes().to_vec()),
+            ("qwen3.head_count_kv", 4, 8u32.to_le_bytes().to_vec()),
+            ("qwen3.embedding_length", 4, 1024u32.to_le_bytes().to_vec()),
+        ];
+        b.extend_from_slice(&(kvs.len() as u64).to_le_bytes());
+        for (k, t, v) in kvs {
+            b.extend_from_slice(&(k.len() as u64).to_le_bytes());
+            b.extend_from_slice(k.as_bytes());
+            b.extend_from_slice(&t.to_le_bytes());
+            b.extend_from_slice(&v);
+        }
+        std::fs::write(path, b).expect("write gguf fixture");
+    }
+
+    /// 2026-09-24 graceful drain: the reshape must not kill live streams,
+    /// but it must also not wait for a GLOBAL idle that sustained load
+    /// never produces (live receipt: 20260924-all-engines, flat 39 t/s
+    /// at C=8 for the whole campaign because the drain skipped every
+    /// tick). Busy tick sets the draining mark (the admission gate then
+    /// parks new requests); once in-flight reaches 0 the drain reshapes,
+    /// clears the mark, and publishes `SlotsReshaped`.
+    #[tokio::test]
+    async fn unit__adaptive_slots__drain_holds_while_busy_then_reshapes_at_idle() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        // The reshape respawns through the real spawn path, which
+        // resolves the model row from the store and reads its GGUF
+        // metadata (FakeEngine supplies the child itself): seed a
+        // minimal valid qwen3 GGUF so read_model_meta parses.
+        let model_path = sup.dirs.data_dir.join("models").join("m-q4_0.gguf");
+        std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+        write_minimal_qwen3_gguf(&model_path);
+        blazar_core::Store::open(&sup.dirs)
+            .unwrap()
+            .upsert_model(&blazar_core::ModelRow {
+                name: "m".into(),
+                repo: "m".into(),
+                quant: "Q4_0".into(),
+                path: model_path.to_string_lossy().into_owned(),
+                bytes: 1,
+                sha256: None,
+                mmproj_path: None,
+                components: vec![],
+                shards: 1,
+                arch: None,
+                params: None,
+                ctx_train: None,
+                pulled_at: 0,
+            })
+            .unwrap();
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 2);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "1".into()];
+        sup.instances.insert("m".into(), inst);
+        sup.adopted_slots.insert("m".to_string(), 4);
+        sup.reshape_queue.insert("m".to_string(), "m".to_string());
+        let mut rx = sup.bus.subscribe();
+        // busy: hold admissions, keep the queue entry, keep the adoption
+        sup.drain_reshape_queue().await;
+        assert!(sup.is_reshaping("m"));
+        assert!(sup.reshape_queue.get("m").is_some());
+        assert_eq!(sup.adopted_slots.get("m").map(|v| *v), Some(4));
+        // streams finish: the very next drain tick must reshape
+        sup.instances
+            .get("m")
+            .expect("instance")
+            .in_flight
+            .store(0, Ordering::SeqCst);
+        sup.drain_reshape_queue().await;
+        assert!(!sup.is_reshaping("m"));
+        assert!(sup.reshape_queue.get("m").is_none());
+        assert_eq!(
+            sup.adopted_slots.get("m").map(|v| *v),
+            Some(4),
+            "the drain reshapes; decay still owns un-adopting"
+        );
+        // evict publishes InstanceStateChanged first; SlotsReshaped follows
+        let mut reshaped = None;
+        for _ in 0..4 {
+            match rx.try_recv() {
+                Ok(BlazarEvent::SlotsReshaped { model, slots }) => {
+                    reshaped = Some((model, slots));
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        match reshaped {
+            Some((model, slots)) => {
+                assert_eq!(model, "m");
+                assert_eq!(slots, 4);
+            }
+            None => panic!("expected SlotsReshaped after the idle drain"),
+        }
+        // The reshape ran the real respawn path: the live instance now
+        // owns a fresh sleeper child. Reap it so the test leaves no
+        // orphan behind (kill_all covers only fabricated originals).
+        sup.instances
+            .get("m")
+            .expect("respawned instance")
+            .child
+            .lock()
+            .await
+            .kill()
+            .await
+            .expect("kill respawned child");
+        kill_all(&[ph]);
+    }
+
+    /// 2026-09-24 anti-thrash: parked waiters hold in-flight at 0 for the
+    /// whole drain window, which the pre-guard decay would have read as
+    /// sustained quiet and reshaped BACK to the natural shape while the
+    /// demand was still queued. With the guard, the quiet streak cannot
+    /// fire while the reshape is pending or draining.
+    #[tokio::test]
+    async fn unit__adaptive_slots__decay_blocked_while_reshape_pending_or_draining() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        let (inst, ph) = fake_instance("m", InstanceState::Ready, 0);
+        sup.instances.insert("m".into(), inst);
+        sup.adopted_slots.insert("m".to_string(), 6);
+        // pending entry (never drained)
+        sup.reshape_queue.insert("m".to_string(), "m".to_string());
+        for _ in 0..(SLOTS_DECAY_TICKS + 5) {
+            sup.adaptive_slots_tick();
+        }
+        assert_eq!(
+            sup.adopted_slots.get("m").map(|v| *v),
+            Some(6),
+            "quiet streak must not decay while a reshape is pending"
+        );
+        // draining mark alone (queue already consumed) blocks too
+        sup.reshape_queue.remove("m");
+        sup.reshape_draining
+            .insert("m".to_string(), std::time::Instant::now());
+        for _ in 0..(SLOTS_DECAY_TICKS + 5) {
+            sup.adaptive_slots_tick();
+        }
+        assert_eq!(
+            sup.adopted_slots.get("m").map(|v| *v),
+            Some(6),
+            "quiet streak must not decay mid-drain"
+        );
+        // clear both: a full fresh quiet streak may decay again (the
+        // guarded ticks above never entered the decay branch, so the
+        // streak counter starts from zero here)
+        sup.reshape_draining.remove("m");
+        for _ in 0..(SLOTS_DECAY_TICKS + 2) {
+            sup.adaptive_slots_tick();
+        }
+        assert!(sup.adopted_slots.get("m").is_none());
+        kill_all(&[ph]);
+    }
+
+    /// 2026-09-24 demand sizing: the parked-waiter gauge sizes the
+    /// adoption step so one streak reaches the demanded shape (C=8 on a
+    /// 1-slot child parks 7) — and the adoption cap bounds it.
+    #[tokio::test]
+    async fn unit__adaptive_slots__demand_sized_adoption_capped_at_ceiling() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        sup.config.slots = 0;
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 1);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "1".into()];
+        sup.instances.insert("m".into(), inst);
+        for _ in 0..10 {
+            sup.note_slot_pressure("m");
+        }
+        for _ in 0..SLOTS_STREAK_TICKS {
+            sup.adaptive_slots_tick();
+        }
+        assert_eq!(
+            sup.adopted_slots.get("m").map(|v| *v),
+            Some(SLOTS_ADOPT_CAP),
+            "10 parked waiters on a 1-slot child must adopt straight to the cap"
+        );
         kill_all(&[ph]);
     }
 

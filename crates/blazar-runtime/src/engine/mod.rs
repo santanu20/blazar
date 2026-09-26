@@ -28,6 +28,14 @@ use manifest::Manifest;
 /// active tag are always kept on top of this.
 pub const KEEP_TAGS: usize = 2;
 
+/// How long an engine dir must stay quiet before the automatic debris
+/// sweep may reclaim it. Installs write continuously (each download
+/// refreshes the archive file's mtime, venv builds create files), so a
+/// live install never looks stale; anything untouched this long is
+/// debris from a killed process. Manual `blazar engine prune` bypasses
+/// the gate entirely — an explicit user order needs no grace.
+pub const STALLED_INSTALL_GRACE: std::time::Duration = std::time::Duration::from_hours(6);
+
 /// Recursive byte size of an engine dir (for the update-prune summary).
 fn engine_dir_bytes(p: &Path) -> u64 {
     let Ok(rd) = std::fs::read_dir(p) else {
@@ -43,6 +51,52 @@ fn engine_dir_bytes(p: &Path) -> u64 {
     }
     n
 }
+fn mtime_secs(p: &Path) -> Option<u64> {
+    std::fs::metadata(p)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// Does anything in `dir` (the dir itself included) carry an mtime newer
+/// than `grace`? A single long download leaves the parent dir mtime
+/// alone but keeps the archive file fresh, so activity detection has to
+/// walk the tree. Anything unreadable reads as RECENT: the debris sweep
+/// treats what it cannot verify as protected, never as garbage. A
+/// missing dir also reads as recent (callers gate on existence when the
+/// distinction matters).
+fn dir_recent(dir: &Path, grace: std::time::Duration) -> bool {
+    let now = now_secs();
+    let grace = grace.as_secs().cast_signed();
+    // Absurd future mtimes clamp to "recent": unverifiable stays protected.
+    let recent = |p: &Path| match mtime_secs(p) {
+        Some(t) => now.saturating_sub(i64::try_from(t).unwrap_or(i64::MAX)) < grace,
+        None => true,
+    };
+    if recent(dir) || !dir.is_dir() {
+        return true;
+    }
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            return true;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if recent(&p) {
+                return true;
+            }
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                stack.push(p);
+            }
+        }
+    }
+    false
+}
+
 pub const LOCAL_TAG: &str = "local";
 
 /// Error-context marker for the PROBE phase of engine registration
@@ -174,6 +228,41 @@ fn discard_retired_engine(aside: Option<&Path>) {
         tracing::warn!(
             "leaked retired engine dir {} ({e}): remove it to reclaim disk",
             aside.display()
+        );
+    }
+}
+
+/// Cancellation-safe rollback for in-flight installs. The Err arm of
+/// [`EngineManager::install_with_rollback`] restores state, but a
+/// dropped future (task abort, runtime shutdown, panic unwind) never
+/// reaches any match arm — the guard runs the same recovery from Drop.
+/// Hard kills (SIGKILL, power loss) still run no code; the boot debris
+/// sweep converges those. Disarmed the moment the build future resolves:
+/// registration may then write the store row, and deleting a
+/// row-referenced dir on a late cancel would desync dir and row (a
+/// stranded dir is reclaimed by the sweep instead — never a ghost row).
+struct CancelledInstallGuard {
+    dir: PathBuf,
+    aside: Option<PathBuf>,
+    armed: bool,
+}
+
+impl CancelledInstallGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelledInstallGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        restore_retired_engine(self.aside.as_deref(), &self.dir);
+        tracing::warn!(
+            "install into {} was cancelled — rolled back (half-built dir removed, \
+             previous engine restored when one was retired)",
+            self.dir.display()
         );
     }
 }
@@ -356,6 +445,18 @@ impl EngineManager {
             Some(t) => self.gh.resolve_tag(t).await?,
             None => self.gh.channel_b_release(channel).await?,
         };
+        // Channel updates are idempotent: a channel target that is
+        // already the active engine has nothing to fetch or retire.
+        // Explicit tag pins keep their install semantics (repair lane).
+        if tag.is_none() {
+            if let Some(row) = self.active_row_if_tag(&release.tag_name)? {
+                tracing::info!(
+                    "channel target {} is already the active engine — skipping the download",
+                    release.tag_name
+                );
+                return Ok(row);
+            }
+        }
         if let Some(row) = self.maybe_cuda_overlay(&release, tag.is_some()).await? {
             return Ok(row);
         }
@@ -458,6 +559,18 @@ impl EngineManager {
         vendor_hint: manifest::Vendor,
         exact_pin: bool,
     ) -> Result<EngineRow> {
+        // Same-tag idempotency: an update that resolved to the
+        // already-active engine must not retire + re-download it. Exact
+        // pins stay on the install path — re-install is the point.
+        if !exact_pin {
+            if let Some(row) = self.active_row_if_tag(&release.tag_name)? {
+                tracing::info!(
+                    "target {} is already the active engine — skipping the download",
+                    release.tag_name
+                );
+                return Ok(row);
+            }
+        }
         if let Some(row) = self.maybe_cuda_overlay(&release, exact_pin).await? {
             return Ok(row);
         }
@@ -496,6 +609,18 @@ impl EngineManager {
             active.tag
         );
         Ok(Some(active))
+    }
+
+    /// Same-tag idempotency for the update lanes: when the release an
+    /// update resolved to is ALREADY the active engine, return it
+    /// instead of retiring and re-downloading the identical build.
+    /// Exact tag pins are exempt — they are the repair lane
+    /// (`blazar engine install <tag>` re-installs on purpose).
+    fn active_row_if_tag(&self, tag: &str) -> Result<Option<EngineRow>> {
+        let Some(active) = Store::open(&self.dirs)?.active_engine()? else {
+            return Ok(None);
+        };
+        Ok((active.tag == tag).then_some(active))
     }
 
     /// Direct install of an overlay `bNNNN-cuda` tag the user pinned
@@ -877,6 +1002,15 @@ impl EngineManager {
         if !cuda_release.tag_name.ends_with("-cuda") {
             cuda_release.tag_name = format!("{}-cuda", cuda_release.tag_name);
         }
+        // Same-tag idempotency: the derived overlay tag is already the
+        // active engine — this update resolved to what is running.
+        if let Some(row) = self.active_row_if_tag(&cuda_release.tag_name)? {
+            tracing::info!(
+                "upstream CUDA target {} is already the active engine — skipping the download",
+                cuda_release.tag_name
+            );
+            return Ok(Some(row));
+        }
         tracing::info!(
             "installing upstream CUDA engine {} ({}){}",
             cuda_release.tag_name,
@@ -1200,6 +1334,9 @@ impl EngineManager {
     /// Install one mistralrs release asset. Same shape as
     /// `install_picked` but file-streamed (CUDA assets are GiB-class)
     /// and registered as the mistralrs engine kind.
+    /// Install a release asset already resolved by name (mistral.rs
+    /// picks carry exact names; sd.cpp resolves by sha-embedding
+    /// patterns and calls [`Self::install_picked_asset`] directly).
     pub async fn install_picked_mistralrs(
         &self,
         release: &GhRelease,
@@ -1216,37 +1353,50 @@ impl EngineManager {
                     release.tag_name
                 )
             })?;
+        self.install_picked_asset(
+            release,
+            asset,
+            &pick.label,
+            pick.cpu_fallback,
+            EngineKind::MistralRs,
+        )
+        .await
+    }
+
+    /// Shared download-extract-register tail for prebuilt release
+    /// assets (mistral.rs tarballs, sd.cpp zips). Digest comes from the
+    /// release metadata when GitHub publishes one; rollback and the
+    /// register/probe tail are [`Self::install_with_rollback`]'s.
+    pub async fn install_picked_asset(
+        &self,
+        release: &GhRelease,
+        asset: &gh::GhAsset,
+        label: &str,
+        cpu_fallback: bool,
+        kind: EngineKind,
+    ) -> Result<EngineRow> {
         let digest = asset
             .digest
             .clone()
             .and_then(|d| d.strip_prefix("sha256:").map(str::to_string))
             .unwrap_or_else(|| "unverified".into());
         let tag = release.tag_name.clone();
-        let pick_name = pick.name.clone();
-        let pick_label = pick.label.clone();
-        let cpu_fallback = pick.cpu_fallback;
-        self.install_with_rollback(
-            &tag,
-            &pick_label,
-            &digest,
-            EngineKind::MistralRs,
-            |dir| async move {
-                std::fs::create_dir_all(&dir)?;
-                let archive = dir.join(&pick_name);
-                self.gh.download_asset_file(asset, &archive).await?;
-                let extracted = extract_archive_file(&archive, &dir, &pick_name);
-                std::fs::remove_file(&archive).context("remove downloaded archive")?;
-                extracted?;
-                if cpu_fallback {
-                    tracing::warn!(
-                        "installed the CPU mistralrs asset {} — this machine's driver/GPU \
-                         does not qualify for a CUDA prebuilt; expect CPU-only speed",
-                        pick_name
-                    );
-                }
-                Ok(())
-            },
-        )
+        let asset_name = asset.name.clone();
+        self.install_with_rollback(&tag, label, &digest, kind, |dir| async move {
+            std::fs::create_dir_all(&dir)?;
+            let archive = dir.join(&asset_name);
+            self.gh.download_asset_file(asset, &archive).await?;
+            let extracted = extract_archive_file(&archive, &dir, &asset_name);
+            std::fs::remove_file(&archive).context("remove downloaded archive")?;
+            extracted?;
+            if cpu_fallback {
+                tracing::warn!(
+                    "installed the CPU fallback asset {asset_name} — no GPU-qualified \
+                     prebuilt matched this machine; expect CPU-only speed",
+                );
+            }
+            Ok(())
+        })
         .await
     }
 
@@ -1355,6 +1505,138 @@ impl EngineManager {
         ))
     }
 
+    /// Resolve and install an sd.cpp release: explicit `master-NNN-<sha>`
+    /// tag or latest by build counter. Assets are matched by pattern
+    /// (names embed the commit sha) with vulkan preferred — one backend
+    /// covers NVIDIA/AMD/Intel and no linux-cuda prebuilt exists
+    /// upstream. Same fresh-release retry cadence as the other lanes.
+    /// A CUDA-from-source build is deliberately not wired here: the
+    /// vulkan prebuilt serves every GPU this daemon runs on.
+    pub async fn update_sdcpp(&self, tag: Option<&str>) -> Result<EngineRow> {
+        let release = if let Some(t) = tag {
+            self.gh.release_by_tag_repo(gh::SDCPP_REPO, t).await?
+        } else {
+            let latest = self.gh.latest_sdcpp_release().await?;
+            self.gh
+                .release_by_tag_repo(gh::SDCPP_REPO, &latest.tag_name)
+                .await?
+        };
+        // Vendor-native first: an NVIDIA box prefers a CUDA prebuilt the
+        // day upstream ships one; every other GPU rides Vulkan.
+        let nvidia = build::nvidia_gpu_facts().await.0.is_some();
+        let patterns =
+            gh::sdcpp_asset_patterns(std::env::consts::OS, std::env::consts::ARCH, nvidia)?;
+
+        let mut last_missing: Option<Vec<gh::SdAssetPattern>> = None;
+        for attempt in 0..=ASSET_UPLOAD_RETRY_ATTEMPTS {
+            if let Some((asset, pattern)) = gh::resolve_sdcpp_asset(&release, &patterns) {
+                tracing::debug!(tag = %release.tag_name, asset = %asset.name, "sdcpp asset resolved");
+                return self
+                    .install_picked_asset(
+                        &release,
+                        asset,
+                        pattern.label,
+                        pattern.cpu_fallback,
+                        EngineKind::SdCpp,
+                    )
+                    .await;
+            }
+            last_missing = Some(patterns.clone());
+            if !release_is_fresh(&release) || attempt == ASSET_UPLOAD_RETRY_ATTEMPTS {
+                break;
+            }
+            tracing::info!(
+                "sd.cpp {} assets still uploading; retry {}/{} in {:?}",
+                release.tag_name,
+                attempt + 1,
+                ASSET_UPLOAD_RETRY_ATTEMPTS,
+                ASSET_UPLOAD_RETRY_DELAY
+            );
+            tokio::time::sleep(ASSET_UPLOAD_RETRY_DELAY).await;
+        }
+        Err(anyhow!(
+            "no usable sd.cpp asset in release {} (wanted one of: {}; available: {})",
+            release.tag_name,
+            last_missing.map_or_else(
+                || "n/a".into(),
+                |p| {
+                    p.iter()
+                        .map(|x| x.includes.join("+"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                },
+            ),
+            release
+                .assets
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+
+    /// Install/refresh the whisper lane (prebuilt `whisper-server`).
+    /// Mirrors [`Self::update_sdcpp`]: tag pins, latest resolves the
+    /// newest b-tag, the platform pick is CPU-shaped (whisper serving
+    /// is a CPU contract), and the same asset-upload retry applies.
+    pub async fn update_whisper(&self, tag: Option<&str>) -> Result<EngineRow> {
+        let release = if let Some(t) = tag {
+            self.gh.release_by_tag_repo(gh::WHISPER_REPO, t).await?
+        } else {
+            let latest = self.gh.latest_whisper_release().await?;
+            self.gh
+                .release_by_tag_repo(gh::WHISPER_REPO, &latest.tag_name)
+                .await?
+        };
+        let patterns = gh::whisper_asset_patterns(std::env::consts::OS, std::env::consts::ARCH)?;
+
+        let mut last_missing: Option<Vec<gh::SdAssetPattern>> = None;
+        for attempt in 0..=ASSET_UPLOAD_RETRY_ATTEMPTS {
+            if let Some((asset, pattern)) = gh::resolve_sdcpp_asset(&release, &patterns) {
+                tracing::debug!(tag = %release.tag_name, asset = %asset.name, "whisper asset resolved");
+                return self
+                    .install_picked_asset(
+                        &release,
+                        asset,
+                        pattern.label,
+                        pattern.cpu_fallback,
+                        EngineKind::Whisper,
+                    )
+                    .await;
+            }
+            last_missing = Some(patterns.clone());
+            if !release_is_fresh(&release) || attempt == ASSET_UPLOAD_RETRY_ATTEMPTS {
+                break;
+            }
+            tracing::info!(
+                "whisper.cpp {} assets still uploading; retry {}/{} in {:?}",
+                release.tag_name,
+                attempt + 1,
+                ASSET_UPLOAD_RETRY_ATTEMPTS,
+                ASSET_UPLOAD_RETRY_DELAY
+            );
+            tokio::time::sleep(ASSET_UPLOAD_RETRY_DELAY).await;
+        }
+        Err(anyhow!(
+            "no usable whisper.cpp asset in release {} (wanted one of: {}; available: {})",
+            release.tag_name,
+            last_missing.map_or_else(
+                || "n/a".into(),
+                |p| {
+                    p.iter()
+                        .map(|x| x.includes.join("+"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                },
+            ),
+            release
+                .assets
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
     /// Shared install tail for every engine source (release asset,
     /// source build): probe the binary, warn on GPU-asset-sees-no-GPU,
     /// store the row, activate it, publish, prune old tags.
@@ -1433,6 +1715,46 @@ impl EngineManager {
         )
     }
 
+    /// Post-registration advisories: why an engine did (or did not) become
+    /// the serving-active row. Kept beside `register_engine_inner` so the
+    /// activation triad (`keep_cuda` / `fork_additive` / `lazy_lane`) reads
+    /// as one decision with its consequences.
+    fn registration_notes(
+        store: &Store,
+        tag: &str,
+        asset_label: &str,
+        new_kind: &str,
+        keep_cuda: bool,
+        fork_additive: bool,
+        lazy_lane: bool,
+    ) {
+        if keep_cuda {
+            tracing::warn!(
+                "NVIDIA GPU present — registered engine {tag} ({asset_label}) but KEPT the \
+             installed CUDA engine active (Vulkan first-token is measurably slower); run \
+             `blazar engine use {tag}` to switch anyway"
+            );
+        }
+        if fork_additive {
+            tracing::info!(
+                "fork lane {tag} registered without activating — the active {} engine stays; \
+             `blazar engine use {tag}` switches explicitly",
+                new_kind
+            );
+        }
+        if lazy_lane {
+            tracing::info!(
+                "lazy lane {tag} registered without activating — it serves from the gateway \
+             on demand; the active {} engine stays",
+                store
+                    .active_engine()
+                    .ok()
+                    .flatten()
+                    .map_or("serving", |e| e.kind.as_str())
+            );
+        }
+    }
+
     // Argument list maps 1:1 onto the public register_* API; bundling
     // into a seed struct would hide that correspondence.
     #[allow(clippy::too_many_arguments)]
@@ -1453,6 +1775,10 @@ impl EngineManager {
             // The install lane writes the shim; anything else is a
             // hand-copied dir, and the shim name is the contract.
             EngineKind::Sglang => find_engine_binary(dir, &["sglang-server"]),
+            EngineKind::SdCpp => find_engine_binary(dir, &["sd-server", "sd-server.exe"]),
+            EngineKind::Whisper => {
+                find_engine_binary(dir, &["whisper-server", "whisper-server.exe"])
+            }
         }
         .map_err(|e| e.context(ENGINE_PROBE_FAILED))?;
         make_executable(&server);
@@ -1488,7 +1814,22 @@ impl EngineManager {
             EngineKind::Sglang => {
                 tracing::debug!(target: "blazar::engine", "registered sglang {tag} ({asset_label})");
             }
+            // sd.cpp CAN enumerate devices (Vulkan0/CUDA0/CPU rows, no
+            // MiB numbers), so the llama GPU-count crosscheck does not
+            // apply — an unusable build fails at spawn, loudly.
+            EngineKind::SdCpp => {
+                tracing::debug!(target: "blazar::engine", "registered sdcpp {tag} ({asset_label})");
+            }
+            // whisper serving is CPU-contract (no --list-devices flag);
+            // the lane boots lazily from the gateway audio handler, so
+            // there is no supervised spawn to cross-check either.
+            EngineKind::Whisper => {
+                tracing::debug!(target: "blazar::engine", "registered whisper {tag} ({asset_label})");
+            }
         }
+        // Storage invariant: rows carry data-dir-relative server paths
+        // (out-of-tree paths pass through untouched).
+        m.relativize_server_path(&self.dirs.data_dir);
         let row = EngineRow {
             tag: tag.to_string(),
             asset: asset_label.to_string(),
@@ -1524,28 +1865,29 @@ impl EngineManager {
                 .list_engines()?
                 .iter()
                 .any(|e| e.kind == row.kind && e.active);
-        let activated = !keep_cuda && !fork_additive;
+        // Lazy lanes never claim the serving-active flag either: the
+        // supervisor adapter backs model serving, while the audio lane
+        // boots on demand from the gateway. `serve` picks its adapter
+        // off the ACTIVE row, so a whisper install dethroning the
+        // serving engine left the daemon unable to boot at all.
+        let lazy_lane = row.kind == EngineKind::Whisper;
+        let activated = !keep_cuda && !fork_additive && !lazy_lane;
         if activated {
             store.set_active_engine(tag)?;
         }
         self.bus.publish(BlazarEvent::EngineUpdated {
             tag: tag.to_string(),
         });
-        self.prune(&store)?;
-        if keep_cuda {
-            tracing::warn!(
-                "NVIDIA GPU present — registered engine {tag} ({asset_label}) but KEPT the \
-                 installed CUDA engine active (Vulkan first-token is measurably slower); run \
-                 `blazar engine use {tag}` to switch anyway"
-            );
-        }
-        if fork_additive {
-            tracing::info!(
-                "fork lane {tag} registered without activating — the active {} engine stays; \
-                 `blazar engine use {tag}` switches explicitly",
-                row.kind.as_str()
-            );
-        }
+        self.prune(&store, Some(row.kind.as_str()))?;
+        Self::registration_notes(
+            &store,
+            tag,
+            asset_label,
+            row.kind.as_str(),
+            keep_cuda,
+            fork_additive,
+            lazy_lane,
+        );
         // The flip above happened after `row` was built; the caller's
         // contract expects the returned row to reflect the post-install
         // store state.
@@ -1581,8 +1923,20 @@ impl EngineManager {
     {
         let dir = self.dirs.engines_dir().join(tag);
         let aside = retire_engine_dir(&dir)?;
-        let outcome = build(dir.clone())
-            .await
+        // Armed across the await: a dropped build future (abort, runtime
+        // shutdown, unwind) rolls back exactly like a returned Err.
+        let mut guard = CancelledInstallGuard {
+            dir: dir.clone(),
+            aside: aside.clone(),
+            armed: true,
+        };
+        let build_outcome = build(dir.clone()).await;
+        // Past this point the closure's dir may be handed to registration
+        // (which can write the store row) — a late cancel must not rip a
+        // row-referenced dir out; stranded state converges via the boot
+        // debris sweep instead.
+        guard.disarm();
+        let outcome = build_outcome
             .and_then(|()| self.register_or_clean(&dir, tag, asset_label, sha256, kind));
         match outcome {
             Ok(row) => {
@@ -1637,29 +1991,46 @@ impl EngineManager {
             .ok_or_else(|| anyhow!("tag {tag} vanished"))
     }
 
-    /// Step back to the previous tag by install time.
+    /// Step back to the previous tag by install time, staying on the
+    /// active engine's kind — see [`rollback_candidate`] for why other
+    /// kinds are never targets.
     pub fn rollback(&self) -> Result<EngineRow> {
         let store = Store::open(&self.dirs)?;
         let engines = store.list_engines()?;
-        let active_idx = engines
+        let active = engines
             .iter()
-            .position(|e| e.active)
+            .find(|e| e.active)
             .ok_or_else(|| anyhow!("no active engine to roll back from"))?;
-        if active_idx + 1 >= engines.len() {
-            return Err(anyhow!(
-                "no older engine to roll back to (active: {})",
-                engines[active_idx].tag
-            ));
-        }
-        let target = engines[active_idx + 1].tag.clone();
+        let target = rollback_candidate(&engines)
+            .map(|e| e.tag.clone())
+            .ok_or_else(|| {
+                anyhow!(
+                    "no older {} engine to roll back to (active: {})",
+                    active.kind,
+                    active.tag
+                )
+            })?;
         drop(store);
         self.use_tag(&target)
     }
 
     /// Keep the newest `KEEP_TAGS` engines; `local` and the active tag are
     /// never pruned. Fork capability lanes are exempt entirely — see
-    /// [`is_fork_lane`].
-    pub fn prune(&self, store: &Store) -> Result<()> {
+    /// [`is_fork_lane`]. Returns the freed (tag, bytes) pairs for the
+    /// summary, mirroring [`Self::prune_siblings`].
+    ///
+    /// `changed_kind` scopes the sweep: `Some(kind)` (registration-time
+    /// auto path) only retires rows of the lane that just changed, while
+    /// `None` (manual `engine prune`) sweeps every lane as before. The
+    /// active flag is a GLOBAL single slot, so the moment lane B
+    /// registers and claims it, lane A's newest rows lose their only
+    /// cross-kind protection — a mistralrs install could then retire the
+    /// CUDA llama.cpp anchor purely because it happened to be lane A's
+    /// third-newest row (live incident 2026-09-26: `engine install
+    /// v0.9.3 --kind mistralrs` pruned the active b11193-cuda). Other
+    /// lanes keep their own retention moment: their next own-lane
+    /// registration or a manual prune.
+    pub fn prune(&self, store: &Store, changed_kind: Option<&str>) -> Result<Vec<(String, u64)>> {
         let engines = store.list_engines()?; // newest first
         let active = engines.iter().find(|e| e.active).map(|e| e.tag.clone());
         // Retention is scoped per engine KIND: a mistral.rs build is never
@@ -1670,7 +2041,16 @@ impl EngineManager {
         // reinstall then pruned sglang).
         let mut kept_per_kind: std::collections::BTreeMap<&str, usize> =
             std::collections::BTreeMap::new();
+        let mut freed = Vec::new();
         for e in &engines {
+            // Registration-time retention only touches the lane that just
+            // changed; rows of other lanes are skipped before slot
+            // counting so an away-lane active flag cannot strand them.
+            if let Some(kind) = changed_kind {
+                if e.kind.as_str() != kind {
+                    continue;
+                }
+            }
             // A user-installed fork lane never consumes a mainstream
             // retention slot: skipping BEFORE the count keeps KEEP_TAGS
             // reserved for upstream currency.
@@ -1683,30 +2063,38 @@ impl EngineManager {
                 continue;
             }
             let dir = self.dirs.engines_dir().join(&e.tag);
+            let mut bytes = 0u64;
             if dir.exists() {
+                bytes = engine_dir_bytes(&dir);
                 std::fs::remove_dir_all(&dir)
                     .with_context(|| format!("prune engine dir {}", dir.display()))?;
             }
             store.delete_engine(&e.tag)?;
-            tracing::info!("pruned old engine {}", e.tag);
+            tracing::info!("pruned old engine {} ({} bytes)", e.tag, bytes);
             self.bus
                 .publish(BlazarEvent::EngineRemoved { tag: e.tag.clone() });
+            freed.push((e.tag.clone(), bytes));
         }
-        Ok(())
+        Ok(freed)
     }
 
     /// Phase-3 supersede lifecycle, run at daemon start and after any
     /// roster change:
     ///
-    /// (a) one-time architecture mining for binary-installed upstream
+    /// (a) persist re-rooted engine paths — rows installed under a
+    ///     different data dir carry a stale absolute server path that
+    ///     load-time adoption fixes in memory on every access; writing
+    ///     the adopted path back once heals the row instead of warning
+    ///     on every boot;
+    /// (b) one-time architecture mining for binary-installed upstream
     ///     lanes (release assets ship no manifest architectures; the
     ///     raw `src/llama-arch.cpp` at the lane's tag is fetched once
     ///     and the mined set persisted — never refetched);
-    /// (b) supersede marking — a fork lane whose advertised architecture
+    /// (c) supersede marking — a fork lane whose advertised architecture
     ///     set is fully covered by mainstream lanes gets
     ///     `superseded_by`/`superseded_at` stamped, so `engine list` can
     ///     show the graduation and the supervisor can drop learned pins;
-    /// (c) retirement sweep — curated fork lanes past
+    /// (d) retirement sweep — curated fork lanes past
     ///     `fork_retire_days` (0 = never) are deleted, EXCEPT rows that
     ///     are active or referenced by `pinned_tags` (user pins and
     ///     in-flight rescue pins override the lifecycle; user-built
@@ -1720,13 +2108,55 @@ impl EngineManager {
         pinned_tags: &[String],
     ) -> Result<()> {
         let store = Store::open(&self.dirs)?;
+        self.re_root_engine_rows(&store);
         self.mine_missing_architectures(&store).await;
         Self::mark_superseded_lanes(&store)?;
         self.sweep_retired_lanes(&store, fork_retire_days, pinned_tags)?;
+        // (e) Interrupted-install debris: rollback asides stranded by a
+        // kill and row-less half-built dirs, grace-gated. Fail-open like
+        // every step above — hygiene never fails the triggering boot.
+        self.sweep_install_debris(STALLED_INSTALL_GRACE);
         Ok(())
     }
 
-    /// Supersede step (a): one-time architecture mining for
+    /// Supersede step (a): heal relocated engine rows in place. The
+    /// manifest's re-anchor logic only mutates the decoded copy, so a row
+    /// whose recorded data dir is gone would re-warn on every boot;
+    /// persisting the adopted path makes the relocation stick. Rows from
+    /// before the relative-storage invariant are folded to
+    /// `engines/<tag>/...` in the same pass. No network, no spawn — just
+    /// an `exists` walk and, for stale rows only, one manifest rewrite.
+    fn re_root_engine_rows(&self, store: &Store) {
+        let rows = store.list_engines().unwrap_or_default();
+        for row in &rows {
+            let Ok(mut manifest) = serde_json::from_str::<Manifest>(&row.manifest) else {
+                continue;
+            };
+            let mut dirty = manifest.re_root_server_path(&self.dirs.engines_dir());
+            dirty |= manifest.relativize_server_path(&self.dirs.data_dir);
+            if !dirty {
+                continue;
+            }
+            match serde_json::to_string(&manifest)
+                .context("encode re-anchored manifest")
+                .and_then(|encoded| {
+                    store
+                        .update_engine_manifest(&row.tag, &encoded)
+                        .context("persist re-anchored engine path")
+                }) {
+                Ok(()) => tracing::info!(
+                    "engine {} server path normalized and persisted (one-time)",
+                    row.tag
+                ),
+                Err(e) => tracing::warn!(
+                    "engine {} re-anchored in memory but not persisted ({e:#})",
+                    row.tag
+                ),
+            }
+        }
+    }
+
+    /// Supersede step (b): one-time architecture mining for
     /// binary-installed upstream lanes (release assets ship no manifest
     /// architectures; source builds mine at build time). Fetch failures
     /// warn and move on — supersede coverage catches up on the next
@@ -1794,7 +2224,7 @@ impl EngineManager {
         }
     }
 
-    /// Supersede step (b): stamp fork lanes whose advertised
+    /// Supersede step (c): stamp fork lanes whose advertised
     /// architecture set is fully covered by mainstream lanes. Partial
     /// coverage keeps the fork active — partial mainstream support is
     /// exactly the self-correcting case (unknown-arch rescue re-pins
@@ -1858,7 +2288,7 @@ impl EngineManager {
         Ok(())
     }
 
-    /// Supersede step (c): retirement sweep — curated fork lanes past
+    /// Supersede step (d): retirement sweep — curated fork lanes past
     /// the grace period are deleted, EXCEPT rows that are active or
     /// referenced by `pinned_tags` (user pins and in-flight rescue pins
     /// override the lifecycle). User-built forks (trust User) outlive
@@ -1964,6 +2394,164 @@ impl EngineManager {
         Ok(freed)
     }
 
+    /// Remove engine directories the store has no row for. Rows are the
+    /// source of truth: a dir without one is debris from an interrupted
+    /// install or a pre-rollback-era upgrade, invisible to `engine list`
+    /// yet still eating disk (a 1 GiB `b11064-cuda` survived this way).
+    /// A dir is NEVER an orphan while some row's manifest points into it.
+    /// The manual pass is ungated — the user asked. The automatic pass
+    /// (see [`Self::sweep_install_debris`]) applies the same rules plus
+    /// a quiet-period grace so a concurrently running install is never
+    /// reaped mid-build.
+    pub fn prune_orphan_dirs(&self) -> Result<Vec<(String, u64)>> {
+        self.prune_orphan_dirs_inner(None)
+    }
+
+    fn prune_orphan_dirs_inner(
+        &self,
+        grace: Option<std::time::Duration>,
+    ) -> Result<Vec<(String, u64)>> {
+        let store = Store::open(&self.dirs)?;
+        let engines = store.list_engines()?;
+        let mut referenced: std::collections::HashSet<PathBuf> = engines
+            .iter()
+            .filter_map(|e| serde_json::from_str::<Manifest>(&e.manifest).ok())
+            .map(|mut m| {
+                // Relative storage form resolves against the live data
+                // dir before it joins the referenced set; legacy absolute
+                // paths heal via the same anchor.
+                m.anchor_server_path(&self.dirs.data_dir);
+                PathBuf::from(m.server_path)
+            })
+            // A default/empty server_path would match every dir (all paths
+            // start_with the empty component list) and disable the sweep.
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect();
+        for e in &engines {
+            referenced.insert(self.dirs.engines_dir().join(&e.tag));
+        }
+        let mut freed = Vec::new();
+        let mut entries = std::fs::read_dir(self.dirs.engines_dir())
+            .with_context(|| format!("list {}", self.dirs.engines_dir().display()))?;
+        while let Some(entry) = entries.next().transpose()? {
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let dir = entry.path();
+            if referenced
+                .iter()
+                .any(|r| r == &dir || dir.starts_with(r) || r.starts_with(&dir))
+            {
+                continue;
+            }
+            // Automatic pass: rollback asides belong to the stale-aside
+            // sweep, which gates on the replacement's final-dir freshness
+            // (an aside's own mtime is preserved from its previous life
+            // and always looks old). The manual pass keeps removing them
+            // directly, as it always has.
+            if grace.is_some()
+                && dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(RETIRED_ENGINE_PREFIX))
+            {
+                continue;
+            }
+            // Automatic pass only: no row AND recently written to — this
+            // is very likely an install building right now in another
+            // process; the next sweep converges once it goes quiet.
+            if grace.is_some_and(|g| dir_recent(&dir, g)) {
+                continue;
+            }
+            let bytes = engine_dir_bytes(&dir);
+            // Best-effort: a busy dir (child running from it) is skipped,
+            // not fatal — the next sweep catches it.
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "orphan engine dir {} could not be removed: {e}",
+                        dir.display()
+                    );
+                    continue;
+                }
+            }
+            let tag = entry.file_name().to_string_lossy().into_owned();
+            tracing::info!(
+                "pruned orphan engine dir {} ({} bytes, no store row)",
+                tag,
+                bytes
+            );
+            freed.push((tag, bytes));
+        }
+        Ok(freed)
+    }
+
+    /// Remove `.retired-` rollback asides left by installs that died
+    /// before any outcome arm ran (SIGKILL, power loss, OOM). An aside is
+    /// stale unless its tag's final dir looks like a replacement still
+    /// building (fresh mtimes anywhere in the tree): every build runs at
+    /// the final path, so a quiet or absent final dir means nobody is
+    /// coming back for the aside. The retire-to-create_dir_all gap is
+    /// microseconds wide and same-tag concurrent installs are already
+    /// undefined (see [`retire_engine_dir`]).
+    fn sweep_stale_retired_asides(&self, grace: std::time::Duration) -> Vec<(String, u64)> {
+        let engines = self.dirs.engines_dir();
+        let Ok(entries) = std::fs::read_dir(&engines) else {
+            return Vec::new();
+        };
+        let mut freed = Vec::new();
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // `.retired-<tag>-<pid>` — tags themselves contain hyphens
+            // (b11139-cuda), so split the trailing pid once from the right
+            // and refuse anything that does not decode cleanly.
+            let Some(rest) = name.strip_prefix(RETIRED_ENGINE_PREFIX) else {
+                continue;
+            };
+            let Some((tag, pid)) = rest.rsplit_once('-') else {
+                tracing::warn!("skipping unrecognized retired engine dir {name}");
+                continue;
+            };
+            if tag.is_empty() || pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+                tracing::warn!("skipping unrecognized retired engine dir {name}");
+                continue;
+            }
+            // Only the aside entry itself is ever removed; the final-dir
+            // path reconstructed here feeds a read-only freshness gate.
+            let final_dir = engines.join(tag);
+            if final_dir.exists() && dir_recent(&final_dir, grace) {
+                continue;
+            }
+            let bytes = engine_dir_bytes(&entry.path());
+            if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                tracing::warn!("cannot remove stale retired engine {name}: {e}");
+                continue;
+            }
+            tracing::info!("swept stale retired engine {name} ({} bytes)", bytes);
+            freed.push((name, bytes));
+        }
+        freed
+    }
+
+    /// Interrupted-install debris convergence, run at daemon start and
+    /// after installs: stale rollback asides plus row-less dirs, both
+    /// grace-gated so a concurrently running install is never reaped.
+    /// Fail-open by construction — every step logs and skips on error;
+    /// hygiene must never fail the boot that triggered it. Returns what
+    /// was reclaimed (tag, bytes) for callers that surface it.
+    pub fn sweep_install_debris(&self, grace: std::time::Duration) -> Vec<(String, u64)> {
+        let mut freed = self.sweep_stale_retired_asides(grace);
+        match self.prune_orphan_dirs_inner(Some(grace)) {
+            Ok(mut orphans) => freed.append(&mut orphans),
+            Err(e) => tracing::warn!("orphan engine dir sweep skipped: {e:#}"),
+        }
+        freed
+    }
+
     /// Register a locally built llama-server (`BLAZAR_ENGINE_PATH`) under the
     /// pseudo-tag `local`. Never pruned; activation follows `use_tag`.
     pub fn register_local(
@@ -1979,7 +2567,7 @@ impl EngineManager {
         }
         // Probe under the configured engine env (e.g. GGML_BACKEND_PATH so
         // a CUDA build actually discovers its GPU).
-        let m = {
+        let mut m = {
             let prev: Vec<(String, String)> = extra_env
                 .iter()
                 .filter(|(k, _)| std::env::var_os(k).is_none())
@@ -1994,6 +2582,9 @@ impl EngineManager {
             }
             r?
         };
+        // Local lane: BLAZAR_ENGINE_PATH is user-owned and usually
+        // out-of-tree — relativize is a no-op there by design.
+        m.relativize_server_path(&self.dirs.data_dir);
         let row = EngineRow {
             tag: LOCAL_TAG.to_string(),
             asset: "local".into(),
@@ -2018,8 +2609,35 @@ impl EngineManager {
         };
         let mut m: Manifest = serde_json::from_str(&row.manifest)
             .with_context(|| format!("decode manifest for {}", row.tag))?;
-        m.re_root_server_path(&self.dirs.engines_dir());
+        m.anchor_server_path(&self.dirs.data_dir);
         Ok(Some(m))
+    }
+
+    /// Rows whose engine binary is gone while the row survives (dir
+    /// deleted underneath the db — manual removal, disk cleanup).
+    /// Returns `(tag, kind, anchored path)`; the doctor surface renders
+    /// these with the heal command so a ghost row is named instead of
+    /// failing spawn/verify silently.
+    #[must_use]
+    pub fn ghost_engine_rows(&self) -> Vec<(String, EngineKind, String)> {
+        let Ok(store) = Store::open(&self.dirs) else {
+            return Vec::new();
+        };
+        let Ok(rows) = store.list_engines() else {
+            return Vec::new();
+        };
+        rows.into_iter()
+            .filter_map(|row| {
+                let mut m: Manifest = serde_json::from_str(&row.manifest).ok()?;
+                m.anchor_server_path(&self.dirs.data_dir);
+                let anchored = PathBuf::from(&m.server_path);
+                if anchored.is_file() {
+                    None
+                } else {
+                    Some((row.tag, row.kind, m.server_path))
+                }
+            })
+            .collect()
     }
 }
 
@@ -2202,28 +2820,27 @@ fn exec_version_probe(bin: &Path, args: &[&str], budget: std::time::Duration) ->
 /// - mistral.rs: `mistralrs --version` (clap, native exec, 15 s)
 ///
 /// `manifest_json` is the engine row's manifest; its `server_path`
-/// names the lane binary. llamacpp falls back to a name walk for
-/// manifest-less rows; the venv lanes cannot (their layout is the
-/// install contract).
+/// names the lane binary (relative rows resolve against `data_dir`).
+/// llamacpp falls back to a name walk for manifest-less rows; the venv
+/// lanes cannot (their layout is the install contract).
 #[must_use]
 pub fn verify_engine_binary(
     kind: &EngineKind,
-    engines_dir: &Path,
+    data_dir: &Path,
     manifest_json: Option<&str>,
 ) -> bool {
     let mut manifest: Option<crate::engine::manifest::Manifest> = manifest_json
         .and_then(|raw| serde_json::from_str::<crate::engine::manifest::Manifest>(raw).ok());
-    // Rows written before re-rooting carry stale absolute paths;
-    // `re_root_server_path` adopts the live engines dir when the
-    // recorded one is gone.
+    // Relative rows resolve against the live data dir; legacy absolute
+    // rows heal via the anchor when their recorded root is gone.
     if let Some(m) = manifest.as_mut() {
-        m.re_root_server_path(engines_dir);
+        m.anchor_server_path(data_dir);
     }
     match kind {
         EngineKind::LlamaCpp => {
             let bin = manifest
                 .map(|m| PathBuf::from(m.server_path))
-                .or_else(|| find_server(engines_dir).ok());
+                .or_else(|| find_server(&data_dir.join("engines")).ok());
             bin.is_some_and(|b| {
                 exec_version_probe(&b, &["--version"], std::time::Duration::from_secs(5))
             })
@@ -2250,6 +2867,85 @@ pub fn verify_engine_binary(
             .is_some_and(|b| {
                 exec_version_probe(&b, &["--version"], std::time::Duration::from_secs(15))
             }),
+        // sd-server --version exits 0 with the banner (verified
+        // master-890) — the cheap liveness probe for the image lane.
+        EngineKind::SdCpp => manifest
+            .map(|m| PathBuf::from(m.server_path))
+            .is_some_and(|b| {
+                exec_version_probe(&b, &["--version"], std::time::Duration::from_secs(15))
+            }),
+        // whisper-server has no --version flag (unknown argument,
+        // verified b5130) — its cheap liveness probe is --help, which
+        // exits 0 with usage exactly like llama's.
+        EngineKind::Whisper => manifest
+            .map(|m| PathBuf::from(m.server_path))
+            .is_some_and(|b| {
+                exec_version_probe(&b, &["--help"], std::time::Duration::from_secs(15))
+            }),
+    }
+}
+
+/// The rollback target for a newest-first engine list (the order
+/// [`Store::list_engines`] returns): the next-older row of the ACTIVE
+/// row's kind. Kinds are separate universes — a text-lane rollback once
+/// stepped onto the whisper voice-lane row and silently deactivated
+/// serving (live incident 2026-09-26: `engine rollback` crossed into
+/// `b5130/whisper` while the user expected a llama.cpp step).
+#[must_use]
+pub fn rollback_candidate(engines: &[EngineRow]) -> Option<&EngineRow> {
+    let active = engines.iter().find(|e| e.active)?;
+    engines
+        .iter()
+        .filter(|e| e.kind == active.kind)
+        .skip_while(|e| !e.active)
+        .nth(1)
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    #![allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    use super::*;
+
+    fn row(tag: &str, installed_at: i64, active: bool, kind: EngineKind) -> EngineRow {
+        EngineRow {
+            tag: tag.to_string(),
+            asset: String::new(),
+            sha256: String::new(),
+            installed_at,
+            active,
+            manifest: String::new(),
+            kind,
+        }
+    }
+
+    /// 2026-09-26 incident pin: a text-lane rollback stepped onto the
+    /// whisper voice-lane row (b5130) and silently deactivated text
+    /// serving. Cross-kind rows must be skipped, never targeted.
+    #[test]
+    fn unit__rollback_candidate__cross_kind_rows_are_never_targets() {
+        // Newest-first, exactly the order list_engines returns.
+        let engines = vec![
+            row("b11193-cuda", 400, true, EngineKind::LlamaCpp),
+            row("b5130", 350, false, EngineKind::Whisper),
+            row("master-919", 300, false, EngineKind::SdCpp),
+            row("local", 200, false, EngineKind::LlamaCpp),
+        ];
+        assert_eq!(
+            rollback_candidate(&engines).map(|e| e.tag.as_str()),
+            Some("local")
+        );
+
+        // Only cross-kind rows below the active one: no same-kind
+        // target exists — the caller must refuse, not cross kinds.
+        let voice_only_below = vec![
+            row("b11193-cuda", 400, true, EngineKind::LlamaCpp),
+            row("b5130", 350, false, EngineKind::Whisper),
+        ];
+        assert!(rollback_candidate(&voice_only_below).is_none());
+
+        // No active row: nothing to roll back from.
+        let no_active = vec![row("b11193-cuda", 400, false, EngineKind::LlamaCpp)];
+        assert!(rollback_candidate(&no_active).is_none());
     }
 }
 
@@ -2301,6 +2997,31 @@ mod verify_tests {
             &EngineKind::LlamaCpp,
             tmp.path(),
             Some(&manifest_for(&bad))
+        ));
+    }
+
+    #[test]
+    // Storage-invariant rows carry a data-dir-relative server_path — the
+    // probe must anchor them before spawning the binary.
+    #[cfg(unix)]
+    fn unit__verify_engine_binary__relative_row_anchors_to_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        fake_bin(&data, "engines/b1-cuda/llama-server", "exit 0");
+        let manifest = serde_json::json!({
+            "tag": "b1-cuda",
+            "build_number": 1,
+            "version_raw": "t",
+            "devices": [],
+            "flags": [],
+            "spec_types": [],
+            "server_path": "engines/b1-cuda/llama-server",
+        })
+        .to_string();
+        assert!(verify_engine_binary(
+            &EngineKind::LlamaCpp,
+            &data,
+            Some(&manifest)
         ));
     }
 
@@ -2715,5 +3436,90 @@ mod verify_tests {
                 .expect("13.3-only release is skipped, 12.8 picked");
             assert_eq!(hit.tag_name, "b11020");
         }
+    }
+}
+
+#[cfg(test)]
+mod debris_tests {
+    #![allow(non_snake_case)]
+    use super::*;
+
+    #[test]
+    fn unit__cancelled_install_guard__drop_while_armed_restores_previous_engine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engines = tmp.path().join("engines");
+        let dir = engines.join("b1-cuda");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("server"), "previous").unwrap();
+        let aside = engines.join(".retired-b1-cuda-999999");
+        std::fs::create_dir_all(&aside).unwrap();
+        std::fs::write(aside.join("server"), "saved-copy").unwrap();
+        // The half-built replacement's debris at the final path.
+        std::fs::write(dir.join("partial-download"), "new").unwrap();
+
+        drop(CancelledInstallGuard {
+            dir: dir.clone(),
+            aside: Some(aside.clone()),
+            armed: true,
+        });
+
+        assert!(dir.join("server").exists(), "previous engine restored");
+        assert!(
+            !dir.join("partial-download").exists(),
+            "half-built debris removed"
+        );
+        assert!(!aside.exists(), "aside consumed by the restore");
+    }
+
+    #[test]
+    fn unit__cancelled_install_guard__disarmed_drop_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engines = tmp.path().join("engines");
+        let dir = engines.join("b1-cuda");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("partial-download"), "new").unwrap();
+        let aside = engines.join(".retired-b1-cuda-999999");
+        std::fs::create_dir_all(&aside).unwrap();
+
+        let mut guard = CancelledInstallGuard {
+            dir: dir.clone(),
+            aside: Some(aside.clone()),
+            armed: true,
+        };
+        guard.disarm();
+        drop(guard);
+
+        assert!(
+            dir.join("partial-download").exists(),
+            "disarmed: the dir is registration's to own"
+        );
+        assert!(aside.exists(), "disarmed: aside untouched");
+    }
+
+    #[test]
+    fn unit__dir_recent__fresh_tree_recent_old_and_missing_protected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tree = tmp.path().join("eng");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("payload.bin"), "x").unwrap();
+
+        let hour = std::time::Duration::from_secs(3600);
+        assert!(dir_recent(&tree, hour), "just-written tree is recent");
+        // Aged past the cutoff: the whole tree (dir + payload) is old.
+        let stale = filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() - std::time::Duration::from_hours(2),
+        );
+        filetime::set_file_mtime(&tree, stale).unwrap();
+        filetime::set_file_mtime(tree.join("payload.bin"), stale).unwrap();
+        assert!(!dir_recent(&tree, hour), "fully aged tree is not recent");
+        // Zero grace: nothing can be younger than the cutoff.
+        assert!(
+            !dir_recent(&tree, std::time::Duration::ZERO),
+            "zero grace makes everything old"
+        );
+        assert!(
+            dir_recent(&tmp.path().join("nope"), hour),
+            "missing dir reads as recent (protected)"
+        );
     }
 }

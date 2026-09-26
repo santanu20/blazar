@@ -8,24 +8,41 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use blazar_core::{BlazarDirs, Store};
 
-/// Locate `llama-imatrix` the same way (same release tarball family).
-pub fn find_imatrix_bin(dirs: &BlazarDirs) -> Result<PathBuf> {
+/// Locate an engine tool binary (`llama-quantize`, `llama-imatrix`,
+/// `llama-perplexity`) in an installed engine directory. Same discovery
+/// contract as `find_bench_bin`: llamacpp engines only, active engine
+/// first, and the engine module's symlink-safe walk (F86) finds the
+/// binary under any unpack layout — release tarballs nest tools in
+/// versioned dirs (`llama-b11193/`) and CUDA overlay assets in
+/// vendor-suffixed dirs (`llama-b11193-cuda-bin-ubuntu-12-x64/`), so
+/// deriving the inner dir from the tag misses both.
+fn find_engine_tool(dirs: &BlazarDirs, tool_base: &str) -> Result<PathBuf> {
     let store = Store::open(dirs)?;
     let engines = store.list_engines()?;
-    engines
+    let tool_name = crate::tool_file_name(tool_base);
+    let ordered: Vec<_> = engines
+        .iter()
+        .filter(|e| e.kind == blazar_core::engine_kind::EngineKind::LlamaCpp)
+        .collect();
+    let ordered: Vec<_> = ordered
         .iter()
         .filter(|e| e.active)
-        .chain(engines.iter().filter(|e| !e.active))
-        .map(|e| {
-            dirs.engines_dir()
-                .join(&e.tag)
-                .join(format!("llama-{}", e.tag))
-                .join(crate::tool_file_name("llama-imatrix"))
-        })
-        .find(|p| p.exists())
-        .ok_or_else(|| {
-            anyhow!("no llama-imatrix found in any installed engine; run `blazar engine update`")
-        })
+        .chain(ordered.iter().filter(|e| !e.active))
+        .collect();
+    for e in ordered {
+        let engine_dir = dirs.engines_dir().join(&e.tag);
+        if let Ok(tool) = crate::engine::find_engine_binary(&engine_dir, &[tool_name.as_str()]) {
+            return Ok(tool);
+        }
+    }
+    Err(anyhow!(
+        "no {tool_base} found in any installed engine; run `blazar engine update`"
+    ))
+}
+
+/// Locate `llama-imatrix` the same way (same release tarball family).
+pub fn find_imatrix_bin(dirs: &BlazarDirs) -> Result<PathBuf> {
+    find_engine_tool(dirs, "llama-imatrix")
 }
 
 /// Run llama-imatrix over a calibration file, producing `out.imatrix`
@@ -87,42 +104,12 @@ where
 /// Locate `llama-quantize` in an installed engine directory (active
 /// engine first — same discovery order as `find_bench_bin`).
 pub fn find_quantize_bin(dirs: &BlazarDirs) -> Result<PathBuf> {
-    let store = Store::open(dirs)?;
-    let engines = store.list_engines()?;
-    engines
-        .iter()
-        .filter(|e| e.active)
-        .chain(engines.iter().filter(|e| !e.active))
-        .map(|e| {
-            dirs.engines_dir()
-                .join(&e.tag)
-                .join(format!("llama-{}", e.tag))
-                .join(crate::tool_file_name("llama-quantize"))
-        })
-        .find(|p| p.exists())
-        .ok_or_else(|| {
-            anyhow!("no llama-quantize found in any installed engine; run `blazar engine update`")
-        })
+    find_engine_tool(dirs, "llama-quantize")
 }
 
 /// Locate `llama-perplexity` (same release tarball as llama-quantize).
 pub fn find_perplexity_bin(dirs: &BlazarDirs) -> Result<PathBuf> {
-    let store = Store::open(dirs)?;
-    let engines = store.list_engines()?;
-    engines
-        .iter()
-        .filter(|e| e.active)
-        .chain(engines.iter().filter(|e| !e.active))
-        .map(|e| {
-            dirs.engines_dir()
-                .join(&e.tag)
-                .join(format!("llama-{}", e.tag))
-                .join(crate::tool_file_name("llama-perplexity"))
-        })
-        .find(|p| p.exists())
-        .ok_or_else(|| {
-            anyhow!("no llama-perplexity found in any installed engine; run `blazar engine update`")
-        })
+    find_engine_tool(dirs, "llama-perplexity")
 }
 
 /// Fixed calibration corpus for the `--verify` gate: ~8.5KB of DIVERSE
@@ -488,5 +475,75 @@ mod tests {
         assert!(a.len() > 8_000, "probe too small: {}", a.len());
         let b = std::fs::read_to_string(write_verify_probe(&dirs).unwrap()).unwrap();
         assert_eq!(a, b, "probe must be deterministic");
+    }
+
+    /// Regression pin (live-observed 2026-09-26): CUDA overlay tags carry
+    /// a `-cuda` suffix while the tarball nests tools in a versioned
+    /// `llama-bNNNN/` dir — deriving the inner dir from the tag
+    /// (`engines/b11193-cuda/llama-b11193-cuda/...`) missed the binary
+    /// and quantize refused with "no llama-quantize found" on a store
+    /// that had it. Discovery must walk the actual layout (F86), and a
+    /// whisper voice-lane row must never satisfy an llamacpp tool probe.
+    #[test]
+    fn unit__find_quantize_bin__nested_and_suffixed_layouts_walked() {
+        use blazar_core::engine_kind::EngineKind;
+        use blazar_core::store::EngineRow;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("c"),
+            data_dir: tmp.path().join("d"),
+        };
+        // Whisper voice lane: first in the table, carries a same-family
+        // tool name that must NOT be picked for llamacpp quantize.
+        let whisper_dir = dirs
+            .data_dir
+            .join("engines")
+            .join("b5130")
+            .join("whisper-bin-ubuntu-x64");
+        std::fs::create_dir_all(&whisper_dir).unwrap();
+        std::fs::write(whisper_dir.join("whisper-quantize"), b"#!/bin/sh\n").unwrap();
+        // CUDA overlay shape: tag suffix does not match the inner dir.
+        let nested = dirs
+            .data_dir
+            .join("engines")
+            .join("b11193-cuda")
+            .join("llama-b11193");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("llama-quantize"), b"#!/bin/sh\n").unwrap();
+
+        let store = Store::open(&dirs).unwrap();
+        store
+            .upsert_engine(&EngineRow {
+                tag: "b5130".into(),
+                asset: String::new(),
+                sha256: String::new(),
+                installed_at: 30,
+                active: false,
+                manifest: "{}".into(),
+                kind: EngineKind::Whisper,
+            })
+            .unwrap();
+        store
+            .upsert_engine(&EngineRow {
+                tag: "b11193-cuda".into(),
+                asset: String::new(),
+                sha256: String::new(),
+                installed_at: 10,
+                active: true,
+                manifest: "{}".into(),
+                kind: EngineKind::LlamaCpp,
+            })
+            .unwrap();
+
+        let bin = find_quantize_bin(&dirs).unwrap();
+        assert_eq!(
+            bin,
+            nested.join("llama-quantize"),
+            "walk must find the tool under the versioned inner dir"
+        );
+        // Same contract for the sibling tools of the tarball family.
+        std::fs::write(nested.join("llama-imatrix"), b"#!/bin/sh\n").unwrap();
+        assert!(find_imatrix_bin(&dirs).is_ok());
     }
 }

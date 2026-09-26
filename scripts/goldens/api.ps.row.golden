@@ -1,1 +1,1 @@
-expires_at,model,name,blazar_cache_hit,blazar_ctx,blazar_device,blazar_draft,blazar_endpoint,blazar_engine,blazar_gpu,blazar_heat,blazar_in_flight,blazar_replica,blazar_spec,blazar_state,blazar_warnings,size
+blazar_cache_hit,blazar_ctx,blazar_device,blazar_device_id,blazar_draft,blazar_endpoint,blazar_engine,blazar_gpu,blazar_heat,blazar_in_flight,blazar_replica,blazar_spec,blazar_state,blazar_warnings,expires_at,model,name,size

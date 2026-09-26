@@ -141,8 +141,11 @@ pub struct Manifest {
     pub flags: BTreeSet<String>,
     /// Speculative-decoding types accepted by `--spec-type`, when advertised.
     pub spec_types: Vec<String>,
-    /// Absolute path to the engine's server binary, as probed at install
-    /// time. Relocatable on load: see [`Manifest::re_root_server_path`].
+    /// Path to the engine's server binary as recorded at install time.
+    /// Stored RELATIVE to the data dir (`engines/<tag>/...`) so rows stay
+    /// relocatable; the out-of-tree `local` lane (`BLAZAR_ENGINE_PATH`)
+    /// keeps its user-given absolute path. Anchored to an absolute live
+    /// path on load: see [`Manifest::anchor_server_path`].
     pub server_path: String,
     /// Where this build's code came from (v2; defaults to upstream for
     /// pre-v2 manifests).
@@ -343,6 +346,52 @@ impl Manifest {
         self.server_path = live.display().to_string();
         true
     }
+
+    /// Anchor a stored (possibly relative) `server_path` to an absolute
+    /// live path — call at EVERY row decode before the manifest reaches
+    /// consumers (spawns expect an executable path). Relative rows
+    /// (`engines/<tag>/...`, the storage invariant) resolve against the
+    /// live data dir; absolute rows are legacy installs or the
+    /// out-of-tree `local` lane — legacy ones heal via
+    /// [`Manifest::re_root_server_path`] when their recorded root moved,
+    /// user-given local paths stay untouched. An empty path stays empty
+    /// (guards the orphan sweep against a match-everything reference).
+    pub fn anchor_server_path(&mut self, data_dir: &Path) {
+        if self.server_path.is_empty() {
+            return;
+        }
+        let recorded = Path::new(&self.server_path);
+        if recorded.is_relative() {
+            self.server_path = data_dir.join(recorded).display().to_string();
+        } else {
+            self.re_root_server_path(&data_dir.join("engines"));
+        }
+    }
+
+    /// Fold an absolute in-tree `server_path` into its data-dir-relative
+    /// storage form (`engines/<tag>/...`). Returns whether the manifest
+    /// changed. Out-of-tree paths (the `local` lane's `BLAZAR_ENGINE_PATH`
+    /// binary) and already-relative paths stay untouched.
+    pub fn relativize_server_path(&mut self, data_dir: &Path) -> bool {
+        let recorded = Path::new(&self.server_path);
+        if !recorded.is_absolute() {
+            return false;
+        }
+        let Ok(rel) = recorded.strip_prefix(data_dir) else {
+            return false;
+        };
+        let folded = rel.display().to_string();
+        if folded.is_empty() {
+            return false;
+        }
+        tracing::debug!(
+            "engine {} server path stored relative: {}",
+            self.tag,
+            folded
+        );
+        self.server_path = folded;
+        true
+    }
 }
 
 /// Probe a llama-server binary: version, devices, flags.
@@ -413,6 +462,8 @@ pub fn probe_kind(
         blazar_core::engine_kind::EngineKind::LlamaCpp => probe(server_path, tag),
         blazar_core::engine_kind::EngineKind::MistralRs => probe_mistralrs(server_path, tag),
         blazar_core::engine_kind::EngineKind::Sglang => probe_sglang(server_path, tag),
+        blazar_core::engine_kind::EngineKind::SdCpp => probe_sdcpp(server_path, tag),
+        blazar_core::engine_kind::EngineKind::Whisper => probe_whisper(server_path, tag),
     }
 }
 
@@ -577,8 +628,171 @@ fn probe_sglang(server_path: &Path, tag: &str) -> Result<Manifest> {
     })
 }
 
-/// Parse the version banner. Upstream shape (b10816, stderr):
-/// `version: 0.4.0-dev (build 10816, commit 427291b5b)`.
+/// Probe an sd.cpp `sd-server` binary. Divergences from llama-server
+/// (verified against stable-diffusion.cpp master-890-74988b2):
+/// - `--version` prints `stable-diffusion.cpp version unknown, commit
+///   74988b2` and exits 0, but the version word is literally "unknown"
+///   on rolling master builds — the banner is display-only; the commit
+///   hash in the INSTALL TAG (`master-890-74988b2`) is the identity.
+/// - `-h` prints the full usage to stdout and exits 0 (llama parity, so
+///   `parse_help` applies). NEVER probe with zero args: a bare
+///   `sd-server` demands `model_path/diffusion_model` and exits 1.
+/// - `--list-devices` prints `NAME<TAB>description` per line — a
+///   different shape from llama's `NAME: DESC (TOTAL MiB, FREE MiB
+///   free)`, so it gets its own parser and no MiB numbers (sd.cpp does
+///   not report VRAM there).
+fn probe_sdcpp(server_path: &Path, tag: &str) -> Result<Manifest> {
+    let server = server_path
+        .to_str()
+        .ok_or_else(|| anyhow!("non-UTF-8 engine path {}", server_path.display()))?;
+
+    // Best-effort banner; never fatal — the tag is authoritative.
+    let version_raw = match crate::probe::probe_output(Command::new(server).arg("--version"), 30) {
+        Some(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let text = if stdout.contains("stable-diffusion.cpp") {
+                stdout
+            } else {
+                stderr
+            };
+            text.lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("stable-diffusion.cpp")
+                .to_string()
+        }
+        _ => format!("stable-diffusion.cpp {tag}"),
+    };
+
+    // Display-only serial from the install tag (`master-890-74988b2` ->
+    // 890, the upstream build counter): keeps `engine list` sortable.
+    let build_number = tag
+        .strip_prefix("master-")
+        .and_then(|rest| rest.split('-').next())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    // Flags: `-h`/`--help` both exit 0 with usage on stdout (verified
+    // master-890). A zero-flag parse is an upstream format change —
+    // fail the probe loudly rather than degrading argv gating.
+    let help_out = crate::probe::probe_output(Command::new(server).arg("--help"), 30)
+        .with_context(|| format!("run {server} --help (timed out or failed to spawn)"))?;
+    let help = String::from_utf8_lossy(&help_out.stdout).to_string();
+    let (flags, _) = parse_help(&help);
+    if flags.is_empty() {
+        return Err(anyhow!(
+            "sd-server --help parsed to zero flags (output format changed upstream?): {}",
+            help.lines().take(3).collect::<Vec<_>>().join(" | ")
+        ));
+    }
+
+    let devices = run_sd_list_devices(Path::new(server));
+
+    Ok(Manifest {
+        tag: tag.to_string(),
+        build_number,
+        version_raw,
+        devices,
+        flags,
+        spec_types: Vec::new(),
+        server_path: server.to_string(),
+        ..Default::default()
+    })
+}
+
+/// `sd-server --list-devices` census. Failure-tolerant like
+/// [`run_list_devices`]: a missing binary or a hung run yields an empty
+/// list and callers fall back.
+fn run_sd_list_devices(server: &Path) -> Vec<DeviceDesc> {
+    let Some(out) = crate::probe::probe_output(Command::new(server).arg("--list-devices"), 30)
+    else {
+        return Vec::new();
+    };
+    parse_sd_devices(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse sd.cpp device lines: `NAME<TAB>description` (e.g.
+/// `Vulkan1<TAB>NVIDIA GeForce RTX 4070 Laptop GPU`). Backend log lines
+/// (`ggml_vulkan: Found 2 Vulkan devices`) carry no tab and drop out.
+pub(crate) fn parse_sd_devices(text: &str) -> Vec<DeviceDesc> {
+    text.lines()
+        .filter_map(|line| {
+            let (name, description) = line.trim().split_once('\t')?;
+            if name.is_empty() || description.is_empty() {
+                return None;
+            }
+            // sd-server also lists a `CPU<TAB>...` row (its --backend
+            // accepts per-module cpu assignment). The host CPU is not an
+            // accelerator: kept rows feed the GPU census, where a CPU
+            // entry can only mislead placement (`--device CPU` won a
+            // free-MiB tie on a CUDA box and killed llama spawns).
+            if name.eq_ignore_ascii_case("cpu") {
+                return None;
+            }
+            Some(DeviceDesc {
+                name: name.to_string(),
+                description: description.to_string(),
+                total_mib: 0,
+                free_mib: 0,
+            })
+        })
+        .collect()
+}
+/// Probe a whisper-server binary. Divergences from llama-server
+/// (verified against ggerganov/whisper.cpp b5130): no `--version` flag
+/// at all (`error: unknown argument: --version`) — the b-tag is the
+/// identity; `-h`/`--help` exit 0 with usage on stdout in the same
+/// shape llama parses; no `--list-devices` (CPU-only serving contract).
+fn probe_whisper(server_path: &Path, tag: &str) -> Result<Manifest> {
+    let server = server_path
+        .to_str()
+        .ok_or_else(|| anyhow!("non-UTF-8 engine path {}", server_path.display()))?;
+
+    // Tags are b-tags (`b5130`) — the upstream build counter is the
+    // sortable identity, exactly like the llama lane.
+    let build_number = super::gh::btag_number(tag).unwrap_or(0);
+    let version_raw = format!("whisper.cpp {tag}");
+
+    // Flags: `--help` exits 0 — but whisper.cpp prints its usage to
+    // STDERR (live-verified b5130: 0 bytes stdout, ~4.8 KiB stderr),
+    // unlike the llama lanes. Parse stderr first, stdout as fallback.
+    // A zero-flag parse is an upstream format change — fail the probe
+    // loudly rather than degrading argv gating.
+    let help_out = crate::probe::probe_output(Command::new(server).arg("--help"), 30)
+        .with_context(|| format!("run {server} --help (timed out or failed to spawn)"))?;
+    let err_help = String::from_utf8_lossy(&help_out.stderr).to_string();
+    let out_help = String::from_utf8_lossy(&help_out.stdout).to_string();
+    let help_text = if err_help.trim().is_empty() {
+        &out_help
+    } else {
+        &err_help
+    };
+    let (flags, _) = parse_help(help_text);
+    if flags.is_empty() {
+        return Err(anyhow!(
+            "whisper-server --help parsed to zero flags (output format changed upstream?): {}",
+            err_help
+                .lines()
+                .chain(out_help.lines())
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
+    }
+
+    Ok(Manifest {
+        tag: tag.to_string(),
+        build_number,
+        version_raw,
+        devices: Vec::new(),
+        flags,
+        spec_types: Vec::new(),
+        server_path: server.to_string(),
+        ..Default::default()
+    })
+}
+
 /// The `build NNNN` token is authoritative; fall back to the first
 /// integer after `version:`.
 fn parse_version(text: &str) -> Result<(u64, String)> {
@@ -688,11 +902,15 @@ fn parse_help(help: &str) -> (BTreeSet<String>, Vec<String>) {
                     .next()
                     .unwrap_or(long)
                     .to_string();
-                // Reject value placeholders attached with spaces? Values are
-                // separate tokens; keep alphabetic-dash names only.
+                // Values are separate tokens; keep plain option names
+                // only. Underscores included: sd-server documents
+                // `--llm_vision`/`--clip_vision` style flags and the
+                // strict probed-flags gate later refuses any argv flag
+                // the manifest lacks — dropping them here disabled
+                // image edits at spawn (verified live).
                 if clean
                     .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
                     && !clean.is_empty()
                     && clean.len() > 1
                 {
@@ -747,6 +965,23 @@ mod tests {
     #[test]
     fn unit__parse_version__missing__error() {
         assert!(parse_version("llama.server\n").is_err());
+    }
+
+    #[test]
+    fn unit__parse_sd_devices__tab_shape_drops_log_lines() {
+        // Verified live against sd-server master-890-74988b2 on the
+        // 2-GPU dev box: `NAME<TAB>description`, MiB columns absent.
+        let text = "ggml_vulkan: Found 2 Vulkan devices\nVulkan0\tIntel(R) Iris Xe Graphics\nVulkan1\tNVIDIA GeForce RTX 4070 Laptop GPU\n\nCPU\tIntel(R) Core(TM) i7-14650HX\nCPU\t\n";
+        let devices = parse_sd_devices(text);
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].name, "Vulkan0");
+        assert!(devices[0].description.contains("Iris Xe"));
+        assert_eq!(devices[1].name, "Vulkan1");
+        assert!(devices[1].description.contains("4070"));
+        assert_eq!(devices[0].total_mib, 0);
+        // The host-CPU row is not an accelerator even with a populated
+        // description (it won a placement tie and killed llama spawns);
+        // backend log line carries no tab; empty-description line drops
     }
 
     #[test]
@@ -826,6 +1061,96 @@ mod tests {
         assert_eq!(m.server_path, "/gone/custom/llama-server");
     }
 
+    fn bare_manifest(server_path: &str) -> Manifest {
+        Manifest {
+            tag: "b1-cuda".into(),
+            build_number: 1,
+            version_raw: "version: b1".into(),
+            devices: Vec::new(),
+            flags: BTreeSet::new(),
+            spec_types: Vec::new(),
+            server_path: server_path.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unit__relativize_server_path__in_tree_folds_to_data_dir_relative() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data/blazar");
+        let mut m = bare_manifest(
+            &data
+                .join("engines/b1-cuda/llama-b1-cuda/llama-server")
+                .display()
+                .to_string(),
+        );
+        assert!(m.relativize_server_path(&data));
+        assert_eq!(m.server_path, "engines/b1-cuda/llama-b1-cuda/llama-server");
+        // Already-relative is a no-op (idempotent).
+        assert!(!m.relativize_server_path(&data));
+    }
+
+    #[test]
+    fn unit__relativize_server_path__out_of_tree_stays_absolute() {
+        // The `local` lane's BLAZAR_ENGINE_PATH binary never lives under
+        // the data dir — relativizing it would corrupt a user-owned path.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data/blazar");
+        let mut m = bare_manifest("/home/user/build/llama.cpp/llama-server");
+        assert!(!m.relativize_server_path(&data));
+        assert_eq!(m.server_path, "/home/user/build/llama.cpp/llama-server");
+    }
+
+    #[test]
+    fn unit__anchor_server_path__relative_row_round_trips_to_absolute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data/blazar");
+        let mut m = bare_manifest("engines/b1-cuda/llama-b1-cuda/llama-server");
+        m.anchor_server_path(&data);
+        assert_eq!(
+            m.server_path,
+            data.join("engines/b1-cuda/llama-b1-cuda/llama-server")
+                .display()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn unit__anchor_server_path__legacy_absolute_row_heals_to_live_engines_dir() {
+        // A row recorded before the relative invariant, installed under a
+        // data dir that has since moved: anchor adopts the live tail.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data/blazar");
+        let live_bin = data.join("engines/b1-cuda/llama-server");
+        std::fs::create_dir_all(live_bin.parent().unwrap()).unwrap();
+        std::fs::write(&live_bin, b"#!/bin/sh\n").unwrap();
+
+        let mut m = bare_manifest("/old/root/.local/share/blazar/engines/b1-cuda/llama-server");
+        m.anchor_server_path(&data);
+        assert_eq!(m.server_path, live_bin.display().to_string());
+    }
+
+    #[test]
+    fn unit__anchor_server_path__external_absolute_path_left_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data/blazar");
+        std::fs::create_dir_all(&data).unwrap();
+        let mut m = bare_manifest("/gone/custom/llama-server");
+        m.anchor_server_path(&data);
+        // No live tail anywhere: stays as recorded so spawn fails loudly
+        // with ENOENT (the local-lane contract).
+        assert_eq!(m.server_path, "/gone/custom/llama-server");
+    }
+
+    #[test]
+    fn unit__anchor_server_path__empty_path_stays_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data/blazar");
+        let mut m = bare_manifest("");
+        m.anchor_server_path(&data);
+        assert_eq!(m.server_path, "");
+    }
+
     #[test]
     fn unit__parse_devices__upstream_shape() {
         let text = "Available devices:\n  NVIDIA GeForce RTX 4070: NVIDIA CUDA (8188 MiB, 7000 MiB free)\n  Intel iGPU: Vulkan (32768 MiB, 24000 MiB free)\n";
@@ -842,6 +1167,25 @@ mod tests {
     fn unit__parse_devices__none_case() {
         let d = parse_devices("Available devices:\n  (none)\n");
         assert!(d.is_empty());
+    }
+
+    #[test]
+    fn unit__parse_help__underscore_flags_survive_the_charset_filter() {
+        // sd-server documents `--llm_vision`/`--clip_vision` style flags.
+        // The strict probed-flags gate refuses argv flags the manifest
+        // lacks, so a charset filter that dropped '_' here disabled image
+        // edits at spawn (verified live on master-890-74988b2).
+        let help = "\
+sd-server [options]
+  --llm FNAME                text encoder
+  --llm_vision FNAME         vision encoder for image edits
+  --clip_vision FNAME        clip vision projector
+  --qwen2vl_vision FNAME     qwen2vl projector
+";
+        let (flags, _) = parse_help(help);
+        for expected in ["--llm", "--llm_vision", "--clip_vision", "--qwen2vl_vision"] {
+            assert!(flags.contains(expected), "missing {expected} in {flags:?}");
+        }
     }
 
     #[test]

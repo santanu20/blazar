@@ -263,6 +263,7 @@ mod tests {
                 bytes: 1,
                 sha256: Some("cafe".into()),
                 mmproj_path: None,
+                components: vec![],
                 shards: 1,
                 arch: None,
                 params: None,

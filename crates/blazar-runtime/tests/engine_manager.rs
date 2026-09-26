@@ -258,7 +258,8 @@ async fn integration__install_probe_activate_rollback_cycle() {
     // The stub banner reports STUB_BUILD 9999, but the install tag (b100)
     // is the authoritative build identity — same rule that overrides the
     // shallow-clone "build 1" artifact on source-built engines.
-    let m: Manifest = serde_json::from_str(&row.manifest).unwrap();
+    let mut m: Manifest = serde_json::from_str(&row.manifest).unwrap();
+    m.anchor_server_path(&dirs.data_dir);
     assert_eq!(m.build_number, 100, "tag build number is authoritative");
     assert_eq!(m.devices.len(), 1, "stub --list-devices GPU fixture");
     assert!(m.has_flag("--ctx-size"));
@@ -446,7 +447,7 @@ async fn integration__prune_keeps_newest_keep_tags_and_local() {
     // b2 marked active (old but active -> kept).
     store.set_active_engine("b2").unwrap();
 
-    mgr.prune(&store).unwrap();
+    mgr.prune(&store, None).unwrap();
     let remaining: Vec<String> = store
         .list_engines()
         .unwrap()
@@ -478,6 +479,44 @@ async fn integration__prune_keeps_newest_keep_tags_and_local() {
     }
     // Pruned count matches KEEP_TAGS policy.
     assert_eq!(remaining.len(), KEEP_TAGS + 2);
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__prune_reports_freed_tag_bytes() {
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    let store = Store::open(&dirs).unwrap();
+    // Oldest lane past retention carries a known dir size; the two
+    // newest slots survive. No active row, no local row — pure policy.
+    for (i, (tag, file_bytes)) in [("b1", 512u64), ("b2", 128), ("b3", 64)].iter().enumerate() {
+        let dir = dirs.engines_dir().join(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("weights"),
+            vec![0u8; usize::try_from(*file_bytes).unwrap()],
+        )
+        .unwrap();
+        store
+            .upsert_engine(&blazar_core::EngineRow {
+                tag: tag.to_string(),
+                asset: "x".into(),
+                sha256: "x".into(),
+                installed_at: 1000 + i64::try_from(i).unwrap_or(0),
+                active: false,
+                manifest: "{}".into(),
+                kind: blazar_core::engine_kind::EngineKind::default(),
+            })
+            .unwrap();
+    }
+    let freed = mgr.prune(&store, None).unwrap();
+    assert_eq!(
+        freed,
+        vec![("b1".to_string(), 512)],
+        "only the oldest tag is freed, with its measured dir bytes"
+    );
+    assert!(!dirs.engines_dir().join("b1").exists());
 }
 
 #[tokio::test]
@@ -517,7 +556,7 @@ async fn integration__prune_retention_is_scoped_per_kind() {
     stage("s1", EngineKind::Sglang, 1005);
     store.set_active_engine("b2").unwrap();
 
-    mgr.prune(&store).unwrap();
+    mgr.prune(&store, None).unwrap();
     let mut remaining: Vec<String> = store
         .list_engines()
         .unwrap()
@@ -538,6 +577,81 @@ async fn integration__prune_retention_is_scoped_per_kind() {
     for kept in ["b2", "b3", "m1", "m2", "s1"] {
         assert!(dirs.engines_dir().join(kept).exists(), "{kept} dir gone");
     }
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__prune_registration_scoped_to_changed_lane() {
+    use blazar_core::engine_kind::EngineKind;
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    let store = Store::open(&dirs).unwrap();
+
+    let stage = |tag: &str, kind: EngineKind, at: i64| {
+        let dir = dirs.engines_dir().join(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("marker"), tag).unwrap();
+        store
+            .upsert_engine(&blazar_core::EngineRow {
+                tag: tag.to_string(),
+                asset: "x".into(),
+                sha256: "x".into(),
+                installed_at: at,
+                active: false,
+                manifest: "{}".into(),
+                kind,
+            })
+            .unwrap();
+    };
+
+    // Incident shape (2026-09-26): `engine local` registered a fresh row
+    // AFTER the CUDA engine was installed, so the llamacpp lane held 3
+    // mainstream rows newest-first (fresh cpu build, local, b11193-cuda)
+    // while a mistralrs install claimed the GLOBAL active slot. The
+    // registration-time prune then counted the away lane and retired
+    // b11193-cuda, stranding the `engine use` restore with no row to
+    // return to.
+    stage("b11193-cuda", EngineKind::LlamaCpp, 1000);
+    stage(LOCAL_TAG, EngineKind::LlamaCpp, 1001);
+    stage("b11195-cpu", EngineKind::LlamaCpp, 1002);
+    stage("v0.9.3", EngineKind::MistralRs, 1003);
+    store.set_active_engine("v0.9.3").unwrap();
+
+    // Registration-time retention is scoped to the lane that just
+    // changed: the mistralrs registration must not touch any llamacpp
+    // row, even though the active flag is away from that lane.
+    let freed = mgr
+        .prune(&store, Some(EngineKind::MistralRs.as_str()))
+        .unwrap();
+    assert!(freed.is_empty(), "away-lane retention freed {freed:?}");
+    let mut remaining: Vec<String> = store
+        .list_engines()
+        .unwrap()
+        .into_iter()
+        .map(|e| e.tag)
+        .collect();
+    remaining.sort();
+    let mut expected = vec![
+        "b11193-cuda".to_string(),
+        "b11195-cpu".to_string(),
+        LOCAL_TAG.to_string(),
+        "v0.9.3".to_string(),
+    ];
+    expected.sort();
+    assert_eq!(
+        remaining, expected,
+        "registration-time prune crossed into an away lane"
+    );
+    assert!(dirs.engines_dir().join("b11193-cuda").exists());
+
+    // Manual `engine prune` keeps full-scope semantics: with the active
+    // slot still on mistralrs, llamacpp retention applies on its own
+    // sweep and the third-newest mainstream row (b11193-cuda) retires.
+    let freed = mgr.prune(&store, None).unwrap();
+    assert_eq!(freed.len(), 1, "manual sweep retired {freed:?}");
+    assert_eq!(freed[0].0, "b11193-cuda");
+    assert!(!dirs.engines_dir().join("b11193-cuda").exists());
 }
 
 #[tokio::test]
@@ -664,7 +778,7 @@ async fn integration__prune_never_removes_fork_lanes() {
     stage_fork_row(&store, &dirs, fork_tag, 1);
     store.set_active_engine("b5").unwrap();
 
-    mgr.prune(&store).unwrap();
+    mgr.prune(&store, None).unwrap();
     let mut remaining: Vec<String> = store
         .list_engines()
         .unwrap()
@@ -966,6 +1080,109 @@ async fn integration__supersede_stamps_fully_covered_fork_lanes() {
     assert_eq!(m2.superseded_at_epoch, m.superseded_at_epoch);
 }
 
+/// A row installed under a pre-rename data dir heals permanently: the
+/// supersede pass adopts the live engines dir and PERSISTS it, so the
+/// relocation warning fires once ever instead of on every boot, and a
+/// second pass leaves the healed row untouched.
+#[allow(non_snake_case)]
+#[tokio::test]
+async fn integration__re_root_heal_persists_stale_engine_row() {
+    let (_tmp, dirs) = tmp_dirs();
+    let mgr = manager(&dirs, "http://127.0.0.1:1");
+
+    // The install tree exists under the live data dir...
+    let live_dir = dirs.engines_dir().join("sglang-0.5.19");
+    std::fs::create_dir_all(&live_dir).unwrap();
+    std::fs::write(live_dir.join("sglang-server"), "#!/bin/sh\n").unwrap();
+
+    // ...but the row records a root that no longer exists (pre-rename
+    // install). Only the serde-required manifest fields are needed.
+    let manifest = serde_json::json!({
+        "tag": "sglang-0.5.19",
+        "build_number": 0,
+        "version_raw": "",
+        "devices": [],
+        "flags": [],
+        "spec_types": [],
+        "server_path": "/nonexistent-old-root/engines/sglang-0.5.19/sglang-server",
+    });
+    let store = Store::open(&dirs).unwrap();
+    store
+        .upsert_engine(&blazar_core::EngineRow {
+            tag: "sglang-0.5.19".into(),
+            asset: "pip:sglang==0.5.19".into(),
+            sha256: "x".into(),
+            installed_at: 1,
+            active: false,
+            manifest: manifest.to_string(),
+            kind: blazar_core::engine_kind::EngineKind::Sglang,
+        })
+        .unwrap();
+
+    mgr.refresh_supersede_state(0, &[]).await.unwrap();
+
+    let healed = manifest_of(&store, "sglang-0.5.19");
+    // The walk heals to the live engines dir, then persists in the
+    // storage-invariant form: data-dir-relative.
+    assert_eq!(
+        healed.server_path, "engines/sglang-0.5.19/sglang-server",
+        "healed row must persist relative to the data dir"
+    );
+
+    // Idempotent: the healed row decodes, anchors back to the live
+    // binary, and the pass leaves it byte-identical.
+    mgr.refresh_supersede_state(0, &[]).await.unwrap();
+    let again = manifest_of(&store, "sglang-0.5.19");
+    assert_eq!(again.server_path, healed.server_path);
+}
+
+/// Ghost rows surface by tag: a db row whose engine dir was deleted
+/// underneath it (manual removal) must be listed with its anchored
+/// path, while healthy rows stay off the list.
+#[allow(non_snake_case)]
+#[tokio::test]
+async fn integration__ghost_engine_rows__names_rows_with_missing_binaries() {
+    let (_tmp, dirs) = tmp_dirs();
+    let mgr = manager(&dirs, "http://127.0.0.1:1");
+
+    // Healthy lane: binary exists under the live data dir.
+    let live_dir = dirs.engines_dir().join("b1-cuda");
+    std::fs::create_dir_all(&live_dir).unwrap();
+    std::fs::write(live_dir.join("llama-server"), "#!/bin/sh\n").unwrap();
+    // Ghost lane: relative row pointing at a dir that is NOT there.
+    let store = Store::open(&dirs).unwrap();
+    for (tag, server_path) in [
+        ("b1-cuda", "engines/b1-cuda/llama-server"),
+        ("b-gone", "engines/b-gone/llama-server"),
+    ] {
+        let manifest = serde_json::json!({
+            "tag": tag,
+            "build_number": 1,
+            "version_raw": "",
+            "devices": [],
+            "flags": [],
+            "spec_types": [],
+            "server_path": server_path,
+        });
+        store
+            .upsert_engine(&blazar_core::EngineRow {
+                tag: tag.into(),
+                asset: "a".into(),
+                sha256: "x".into(),
+                installed_at: 1,
+                active: false,
+                manifest: manifest.to_string(),
+                kind: blazar_core::engine_kind::EngineKind::LlamaCpp,
+            })
+            .unwrap();
+    }
+
+    let ghosts = mgr.ghost_engine_rows();
+    assert_eq!(ghosts.len(), 1, "only the missing-binary row: {ghosts:?}");
+    assert_eq!(ghosts[0].0, "b-gone");
+    assert!(ghosts[0].2.ends_with("engines/b-gone/llama-server"));
+}
+
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn integration__supersede_skips_partially_covered_fork_lanes() {
@@ -1209,6 +1426,183 @@ fn stub_engine_dir(tag: &str) -> (PathBuf, tempfile::TempDir) {
     (dir.path().to_path_buf(), dir)
 }
 
+/// A row-less engine dir is disk debris (interrupted install, pre-rollback
+/// upgrade): the sweep must remove it while every dir a row points into
+/// survives — including nested `server_path` references and empty-path
+/// default manifests.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__orphan_engine_dirs__swept_while_referenced_survive() {
+    let (_t, dirs) = tmp_dirs();
+    // No mocks mounted: the sweep is a local-disk pass, never network.
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    let store = Store::open(&dirs).unwrap();
+    stage_mainstream_row(&store, &dirs, "b1-cuda", 2, &["qwen2"]);
+    // A dir the store has NO row for (the b11064-cuda class).
+    let orphan = dirs.engines_dir().join("b0-ghost");
+    std::fs::create_dir_all(&orphan).unwrap();
+    std::fs::write(orphan.join("marker"), "ghost").unwrap();
+    // A regular FILE in the engines dir is not engine debris — untouched.
+    std::fs::write(dirs.engines_dir().join("README"), "n/a").unwrap();
+
+    let freed = mgr.prune_orphan_dirs().unwrap();
+    assert_eq!(freed.len(), 1, "exactly the ghost dir goes: {freed:?}");
+    assert_eq!(freed[0].0, "b0-ghost");
+    assert!(!orphan.exists(), "orphan dir removed");
+    assert!(
+        dirs.engines_dir().join("b1-cuda").exists(),
+        "row-backed dir stays"
+    );
+    assert!(
+        dirs.engines_dir().join("README").exists(),
+        "plain file untouched"
+    );
+    // Idempotent: a second sweep finds nothing.
+    assert!(mgr.prune_orphan_dirs().unwrap().is_empty());
+}
+
+/// The automatic debris sweep converges interrupted-install state: stale
+/// row-less dirs go, rollback asides go when no live replacement is
+/// building, and everything referenced, fresh, or unclassifiable stays.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__sweep_install_debris__gated_matrix() {
+    let (_t, dirs) = tmp_dirs();
+    // No mocks mounted: the sweep is a local-disk pass, never network.
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    let store = Store::open(&dirs).unwrap();
+    stage_mainstream_row(&store, &dirs, "b1-cuda", 2, &["qwen2"]);
+    // Fresh row-less dir: indistinguishable from an install building
+    // right now — protected by the grace gate.
+    let fresh_orphan = dirs.engines_dir().join("b2-building");
+    std::fs::create_dir_all(&fresh_orphan).unwrap();
+    std::fs::write(fresh_orphan.join("archive.tar.gz"), "x").unwrap();
+    // Stale row-less dir (interrupted-install debris, the b11064 class):
+    // aged past the grace cutoff so the sweep can tell it from a build
+    // in flight.
+    let stale_orphan = dirs.engines_dir().join("b3-ghost");
+    std::fs::create_dir_all(&stale_orphan).unwrap();
+    std::fs::write(stale_orphan.join("marker"), "ghost").unwrap();
+    let aged = filetime::FileTime::from_system_time(
+        std::time::SystemTime::now() - std::time::Duration::from_hours(2),
+    );
+    filetime::set_file_mtime(&stale_orphan, aged).unwrap();
+    filetime::set_file_mtime(stale_orphan.join("marker"), aged).unwrap();
+    // Stranded aside: the replacement died before its final dir existed.
+    let stranded_aside = dirs.engines_dir().join(".retired-b9-dead-424242");
+    std::fs::create_dir_all(&stranded_aside).unwrap();
+    std::fs::write(stranded_aside.join("server"), "old").unwrap();
+    // Aside of a replacement that looks live: fresh final dir building.
+    let live_aside = dirs.engines_dir().join(".retired-b4-cuda-424243");
+    std::fs::create_dir_all(&live_aside).unwrap();
+    let live_final = dirs.engines_dir().join("b4-cuda");
+    std::fs::create_dir_all(&live_final).unwrap();
+    std::fs::write(live_final.join("partial"), "building").unwrap();
+    // Malformed aside name: unclassifiable is never deleted.
+    let malformed = dirs.engines_dir().join(".retired-garbage");
+    std::fs::create_dir_all(&malformed).unwrap();
+
+    let freed = mgr.sweep_install_debris(std::time::Duration::from_secs(3600));
+    let names: Vec<&str> = freed.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(freed.len(), 2, "exactly the two stale pieces go: {names:?}");
+    assert!(names.contains(&"b3-ghost"), "stale orphan swept");
+    assert!(
+        names.contains(&".retired-b9-dead-424242"),
+        "stranded aside swept"
+    );
+    assert!(
+        fresh_orphan.exists(),
+        "fresh orphan protected (maybe installing)"
+    );
+    assert!(
+        dirs.engines_dir().join("b1-cuda").exists(),
+        "row-backed dir stays"
+    );
+    assert!(live_aside.exists(), "aside of a building replacement stays");
+    assert!(malformed.exists(), "unclassifiable name never deleted");
+
+    // Zero grace collapses the quiet window: the once-fresh orphan goes,
+    // and the building-looking aside's final dir is no longer "recent"
+    // either — the grace window is its only protection, by design.
+    let freed0 = mgr.sweep_install_debris(std::time::Duration::ZERO);
+    let names0: Vec<&str> = freed0.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        names0.contains(&"b2-building"),
+        "fresh orphan goes at zero grace"
+    );
+    assert!(
+        names0.contains(&".retired-b4-cuda-424243"),
+        "live-looking aside goes once its final dir is not recent"
+    );
+    assert!(malformed.exists(), "unclassifiable still never deleted");
+}
+
+/// The supersede refresh (daemon boot + post-install) carries the debris
+/// convergence: a stranded aside disappears while a fresh-looking
+/// row-less dir survives the default grace window.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__refresh_supersede_state__sweeps_install_debris() {
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    let store = Store::open(&dirs).unwrap();
+    stage_mainstream_row(&store, &dirs, "b1-cuda", 2, &["qwen2"]);
+    let aside = dirs.engines_dir().join(".retired-bX-absent-777");
+    std::fs::create_dir_all(&aside).unwrap();
+    std::fs::write(aside.join("server"), "old").unwrap();
+    let fresh = dirs.engines_dir().join("bY-building");
+    std::fs::create_dir_all(&fresh).unwrap();
+    std::fs::write(fresh.join("partial"), "downloading").unwrap();
+
+    mgr.refresh_supersede_state(0, &[]).await.unwrap();
+
+    assert!(!aside.exists(), "stranded aside swept by the refresh pass");
+    assert!(
+        fresh.exists(),
+        "fresh row-less dir protected by the default grace"
+    );
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__lazy_whisper_lane_never_claims_serving_active() {
+    // A whisper install must stay additive like fork lanes: `serve`
+    // picks its adapter off the ACTIVE row, so a whisper row stealing
+    // activation left the daemon unable to boot (live bug 2026-09-22).
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    {
+        let store = Store::open(&dirs).unwrap();
+        stage_mainstream_row(&store, &dirs, "b1-cuda", 2000, &["llama"]);
+        store.set_active_engine("b1-cuda").unwrap();
+    }
+    let dir = tempfile::Builder::new()
+        .prefix("blazar-engine-test-lazywhisper-")
+        .tempdir()
+        .expect("staging tempdir");
+    std::fs::copy(stub_server_bin(), dir.path().join("whisper-server")).expect("copy stub");
+    let row = mgr
+        .register_engine(
+            dir.path(),
+            "b5130",
+            "whisper-bin-ubuntu-x64.tar.gz",
+            "cafebabe",
+            blazar_core::engine_kind::EngineKind::Whisper,
+        )
+        .unwrap();
+    assert!(!row.active, "lazy audio lane must not steal activation");
+    let store = Store::open(&dirs).unwrap();
+    assert_eq!(
+        store.active_engine().unwrap().map(|r| r.tag),
+        Some("b1-cuda".to_string()),
+        "the serving engine keeps the throne across a whisper install"
+    );
+}
+
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn integration__vulkan_never_dethrones_cuda_on_nvidia() {
@@ -1310,7 +1704,8 @@ async fn integration__zip_asset_extracted_and_probed() {
         .update(Some("b100"), UpdateChannel::Latest)
         .await
         .unwrap();
-    let m: Manifest = serde_json::from_str(&row.manifest).unwrap();
+    let mut m: Manifest = serde_json::from_str(&row.manifest).unwrap();
+    m.anchor_server_path(&dirs.data_dir);
     assert!(m.server_path.ends_with("llama-server.exe"));
     assert!(Path::new(&m.server_path).exists());
 }
@@ -1793,6 +2188,116 @@ async fn integration__update_resolved__keep_cuda_skip_downloads_nothing() {
         .filter(|r| r.url.path().starts_with("/download/"))
         .count();
     assert_eq!(downloads, 0, "skip must fetch zero asset bytes");
+}
+
+/// Same-tag idempotency (channel lane): a channel update resolving to
+/// the ALREADY-ACTIVE build must return the active row without touching
+/// the network asset lane — the update used to retire + re-download the
+/// exact archive the box already held. No /download mock is mounted:
+/// any fetch attempt 404s and fails the test. The vendor hint is Nvidia
+/// so the skip must fire BEFORE the CUDA lane machinery too.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__update_resolved__same_tag_returns_active_no_download() {
+    use blazar_runtime::engine::gh::GhRelease;
+    use blazar_runtime::engine::manifest::Vendor;
+
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager_auto(&dirs, &api.uri());
+
+    // Active engine seeded first (vendor Other: no guard interference).
+    let seeded = mgr
+        .register_engine_with_vendor(
+            &stub_engine_dir("b10900").0,
+            "b10900",
+            "built-cpu",
+            "aa",
+            blazar_core::engine_kind::EngineKind::LlamaCpp,
+            Vendor::Other,
+        )
+        .unwrap();
+    assert!(seeded.active);
+
+    // Channel target resolves to the SAME tag.
+    let release: GhRelease = serde_json::from_value(serde_json::json!({
+        "tag_name": "b10900",
+        "prerelease": true,
+        "assets": [{
+            "name": "llama-b10900-bin-ubuntu-vulkan-x64.tar.gz",
+            "size": 1,
+            "browser_download_url": format!(
+                "{}/download/b10900/llama-b10900-bin-ubuntu-vulkan-x64.tar.gz",
+                api.uri()
+            )
+        }]
+    }))
+    .unwrap();
+
+    let row = mgr
+        .update_resolved_with_vendor(release, Vendor::Nvidia, false)
+        .await
+        .unwrap();
+    assert_eq!(row.tag, "b10900", "active row returned unchanged");
+    assert!(row.active);
+    assert_eq!(
+        row.installed_at, seeded.installed_at,
+        "the active engine was never retired/re-registered"
+    );
+
+    let downloads = api
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path().starts_with("/download/"))
+        .count();
+    assert_eq!(downloads, 0, "same-tag update must fetch zero asset bytes");
+}
+
+/// Same-tag idempotency (full `update(None, channel)` lane): the channel
+/// list resolves to the active build -> the active row comes back and no
+/// asset download happens. Pin for the installer bootstrap contract
+/// (install.sh reruns must be no-ops once an engine is active).
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__channel_update_same_tag__no_reinstall() {
+    use blazar_runtime::engine::manifest::Vendor;
+
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    mount_releases_list(&api, &["b100"]).await;
+    let mgr = manager_auto(&dirs, &api.uri());
+
+    let seeded = mgr
+        .register_engine_with_vendor(
+            &stub_engine_dir("b100").0,
+            "b100",
+            "built-cpu",
+            "aa",
+            blazar_core::engine_kind::EngineKind::LlamaCpp,
+            Vendor::Other,
+        )
+        .unwrap();
+    assert!(seeded.active);
+
+    let row = mgr.update(None, UpdateChannel::Latest).await.unwrap();
+    assert_eq!(row.tag, "b100", "active row returned unchanged");
+    assert!(row.active);
+
+    let downloads = api
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path().starts_with("/download/"))
+        .count();
+    assert_eq!(
+        downloads, 0,
+        "channel no-op update must fetch zero asset bytes"
+    );
+    let engines = Store::open(&dirs).unwrap().list_engines().unwrap();
+    assert_eq!(engines.len(), 1, "no second row registered");
 }
 
 #[test]
