@@ -233,7 +233,9 @@ fn is_sock_path(host: &str) -> bool {
 
 /// Bind the identical axum app over a unix socket: unlink a stale
 /// file from a previous run first (same contract as the supervisor's
-/// boot sweep).
+/// boot sweep). Unix-only by nature — `tokio::net::UnixListener` does
+/// not exist on Windows.
+#[cfg(unix)]
 async fn serve_unix(host: &str, app: axum::routing::Router) {
     let _ = std::fs::remove_file(host);
     let listener = tokio::net::UnixListener::bind(host)
@@ -242,9 +244,13 @@ async fn serve_unix(host: &str, app: axum::routing::Router) {
     axum::serve(listener, app).await.expect("stub server error");
 }
 
-async fn serve(host: String, port: Option<u16>, alias: String, api_key: Option<String>) {
+/// One router with every stub route — shared by the TCP and
+/// unix-socket transports so both serve byte-identical API surface.
+fn build_app(alias: &str, api_key: Option<&str>) -> axum::routing::Router {
     use axum::routing::{get, post};
-    let alias_for_routes = alias.clone();
+    let alias_for_routes = alias.to_string();
+    // Owned up front: the auth middleware must capture 'static data.
+    let secret = api_key.map(str::to_string);
     let app = axum::Router::new()
         .route(
             "/health",
@@ -305,13 +311,13 @@ async fn serve(host: String, port: Option<u16>, alias: String, api_key: Option<S
         .route("/v1/reranking", post(reranking))
         .route("/models", get(router_models))
         .route("/models/unload", post(models_unload))
-        .with_state(alias.clone())
+        .with_state(alias.to_string())
         // Child-auth middleware (upstream server-http.cpp contract):
         // every route requires the secret EXCEPT the public set
         // (/health). Authorization: Bearer or X-Api-Key both accepted.
         .layer(axum::middleware::from_fn(
             move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
-                let secret = api_key.clone();
+                let secret = secret.clone();
                 async move {
                     if let Some(sec) = secret {
                         let path = req.uri().path();
@@ -340,12 +346,26 @@ async fn serve(host: String, port: Option<u16>, alias: String, api_key: Option<S
                 }
             },
         ));
+    app
+}
 
+async fn serve(host: String, port: Option<u16>, alias: String, api_key: Option<String>) {
+    let app = build_app(&alias, api_key.as_deref());
     // A `--host <path>.sock` argv (upstream #28690 shape, no --port)
     // binds a unix socket instead of TCP.
     if is_sock_path(&host) && port.is_none() {
-        serve_unix(&host, app).await;
-        return;
+        #[cfg(unix)]
+        {
+            serve_unix(&host, app).await;
+            return;
+        }
+        #[cfg(not(unix))]
+        {
+            // Same refusal as the supervisor's transport validation:
+            // unix sockets are a unix-platform feature. Loud, not
+            // silent — never quietly fall back to TCP.
+            panic!("stub-llama-server: unix sockets require a unix platform");
+        }
     }
     let addr = format!("{host}:{}", port.unwrap_or(8080));
     let listener = tokio::net::TcpListener::bind(&addr)
