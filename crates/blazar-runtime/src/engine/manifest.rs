@@ -1133,7 +1133,10 @@ mod tests {
             .join("old-root/.local/share/blazar/engines/b1-cuda/llama-server");
         let mut m = bare_manifest(&legacy.display().to_string());
         m.anchor_server_path(&data);
-        assert_eq!(m.server_path, live_bin.display().to_string());
+        // Compare component-wise: the healer rebuilds the tail with the
+        // platform separator while the staged literal keeps its forward
+        // slashes — same file, different spelling on windows.
+        assert_eq!(Path::new(&m.server_path), live_bin.as_path());
     }
 
     #[test]
