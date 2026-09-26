@@ -16,6 +16,7 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use blazar_core::config::UpdateChannel;
 use blazar_core::engine_kind::EngineKind;
+use blazar_core::fs_safety::{path_is_within, remove_dir_within, GuardedRemoval};
 use blazar_core::store::{EngineRow, Store};
 use blazar_core::BlazarDirs;
 
@@ -165,7 +166,7 @@ const RETIRED_ENGINE_PREFIX: &str = ".retired-";
 /// of the same tag are swept here: nothing else references them and
 /// they would leak GiB. Returns `None` when no installed dir existed
 /// (fresh install — nothing to preserve).
-fn retire_engine_dir(dir: &Path) -> Result<Option<PathBuf>> {
+fn retire_engine_dir(data_dir: &Path, dir: &Path) -> Result<Option<PathBuf>> {
     if !dir.exists() {
         return Ok(None);
     }
@@ -187,9 +188,17 @@ fn retire_engine_dir(dir: &Path) -> Result<Option<PathBuf>> {
             // A crashed run's rollback copy: the replacement about to
             // run supersedes anything it held. (Concurrent installs of
             // the same tag are already undefined — both write this same
-            // final dir.)
-            std::fs::remove_dir_all(entry.path())
-                .with_context(|| format!("sweep stale aside {}", entry.path().display()))?;
+            // final dir.) Containment: an aside resolving outside the
+            // data root is skipped, not deleted through the link.
+            if matches!(
+                remove_dir_within(data_dir, &entry.path()),
+                Ok(GuardedRemoval::Removed)
+            ) {
+                tracing::warn!(
+                    "skipped stale aside {} — resolves outside the data root",
+                    entry.path().display()
+                );
+            }
         }
     }
     let aside = engines.join(format!("{aside_prefix}{}", std::process::id()));
@@ -203,9 +212,9 @@ fn retire_engine_dir(dir: &Path) -> Result<Option<PathBuf>> {
 /// rename). A restore failure means both copies are stranded: logged at
 /// error level with the aside left on disk for the next same-tag
 /// install (or a human) to recover — never silently dropped.
-fn restore_retired_engine(aside: Option<&Path>, dir: &Path) {
+fn restore_retired_engine(data_dir: &Path, aside: Option<&Path>, dir: &Path) {
     if dir.exists() {
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = remove_dir_within(data_dir, dir);
     }
     let Some(aside) = aside else { return };
     if let Err(e) = std::fs::rename(aside, dir) {
@@ -222,13 +231,23 @@ fn restore_retired_engine(aside: Option<&Path>, dir: &Path) {
 /// Delete the superseded engine copy after its replacement registered.
 /// A leak here wastes disk but breaks nothing — warn, never fail the
 /// install that already succeeded.
-fn discard_retired_engine(aside: Option<&Path>) {
+fn discard_retired_engine(data_dir: &Path, aside: Option<&Path>) {
     let Some(aside) = aside else { return };
-    if let Err(e) = std::fs::remove_dir_all(aside) {
-        tracing::warn!(
-            "leaked retired engine dir {} ({e}): remove it to reclaim disk",
-            aside.display()
-        );
+    match remove_dir_within(data_dir, aside) {
+        Ok(GuardedRemoval::Removed | GuardedRemoval::Absent) => {}
+        Ok(GuardedRemoval::Escaped) => {
+            tracing::warn!(
+                "leaked retired engine dir {} (resolves outside the data root): \
+                 remove it to reclaim disk",
+                aside.display()
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "leaked retired engine dir {} ({e}): remove it to reclaim disk",
+                aside.display()
+            );
+        }
     }
 }
 
@@ -242,6 +261,7 @@ fn discard_retired_engine(aside: Option<&Path>) {
 /// row-referenced dir on a late cancel would desync dir and row (a
 /// stranded dir is reclaimed by the sweep instead — never a ghost row).
 struct CancelledInstallGuard {
+    data_dir: PathBuf,
     dir: PathBuf,
     aside: Option<PathBuf>,
     armed: bool,
@@ -258,7 +278,7 @@ impl Drop for CancelledInstallGuard {
         if !self.armed {
             return;
         }
-        restore_retired_engine(self.aside.as_deref(), &self.dir);
+        restore_retired_engine(self.data_dir.as_path(), self.aside.as_deref(), &self.dir);
         tracing::warn!(
             "install into {} was cancelled — rolled back (half-built dir removed, \
              previous engine restored when one was retired)",
@@ -274,16 +294,31 @@ impl Drop for CancelledInstallGuard {
 /// lives. Returns the bytes reclaimed. Both retirement paths (the boot
 /// sweep and manual `engine rm`) go through here so the ordering
 /// invariant has a single owner.
-pub fn remove_engine_row_and_tree(store: &Store, tag: &str, dir: &Path) -> Result<u64> {
+pub fn remove_engine_row_and_tree(
+    store: &Store,
+    tag: &str,
+    dir: &Path,
+    data_dir: &Path,
+) -> Result<u64> {
+    // An explicit `engine rm` must not delete through a symlinked
+    // engines root either — refuse loudly instead of leaving a ghost
+    // row over a dir that still exists wherever the link points.
+    if dir.exists() && !path_is_within(data_dir, dir) {
+        return Err(anyhow!(
+            "engine dir {} resolves outside the data root (symlinked engines \
+             dir?) — unhook the link or remove the dir manually, then retry",
+            dir.display()
+        ));
+    }
     let bytes = engine_dir_bytes(dir);
-    let aside = retire_engine_dir(dir)?;
+    let aside = retire_engine_dir(data_dir, dir)?;
     if let Err(e) = store.delete_engine(tag) {
-        restore_retired_engine(aside.as_deref(), dir);
+        restore_retired_engine(data_dir, aside.as_deref(), dir);
         return Err(anyhow!(e).context(format!(
             "cannot delete engine row {tag} — the engine dir was restored"
         )));
     }
-    discard_retired_engine(aside.as_deref());
+    discard_retired_engine(data_dir, aside.as_deref());
     Ok(bytes)
 }
 
@@ -1922,10 +1957,11 @@ impl EngineManager {
         F: std::future::Future<Output = Result<()>>,
     {
         let dir = self.dirs.engines_dir().join(tag);
-        let aside = retire_engine_dir(&dir)?;
+        let aside = retire_engine_dir(&self.dirs.data_dir, &dir)?;
         // Armed across the await: a dropped build future (abort, runtime
         // shutdown, unwind) rolls back exactly like a returned Err.
         let mut guard = CancelledInstallGuard {
+            data_dir: self.dirs.data_dir.clone(),
             dir: dir.clone(),
             aside: aside.clone(),
             armed: true,
@@ -1940,11 +1976,11 @@ impl EngineManager {
             .and_then(|()| self.register_or_clean(&dir, tag, asset_label, sha256, kind));
         match outcome {
             Ok(row) => {
-                discard_retired_engine(aside.as_deref());
+                discard_retired_engine(&self.dirs.data_dir, aside.as_deref());
                 Ok(row)
             }
             Err(e) => {
-                restore_retired_engine(aside.as_deref(), &dir);
+                restore_retired_engine(&self.dirs.data_dir, aside.as_deref(), &dir);
                 Err(e)
             }
         }
@@ -1970,7 +2006,25 @@ impl EngineManager {
                     .chain()
                     .any(|c| c.to_string().contains(ENGINE_PROBE_FAILED));
                 if probe_class {
-                    let _ = std::fs::remove_dir_all(dir);
+                    // Containment-guarded: a probe-rejected dir behind a
+                    // symlinked root is warned about, not deleted through
+                    // the link (the store never learned about it anyway).
+                    match remove_dir_within(&self.dirs.data_dir, dir) {
+                        Ok(GuardedRemoval::Removed | GuardedRemoval::Absent) => {}
+                        Ok(GuardedRemoval::Escaped) => {
+                            tracing::warn!(
+                                "probe-rejected engine dir {} resolves outside the \
+                                 data root — left in place",
+                                dir.display()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "cannot remove rejected engine dir {}: {e}",
+                                dir.display()
+                            );
+                        }
+                    }
                 }
                 Err(e)
             }
@@ -2066,8 +2120,22 @@ impl EngineManager {
             let mut bytes = 0u64;
             if dir.exists() {
                 bytes = engine_dir_bytes(&dir);
-                std::fs::remove_dir_all(&dir)
-                    .with_context(|| format!("prune engine dir {}", dir.display()))?;
+                match remove_dir_within(&self.dirs.data_dir, &dir) {
+                    Ok(GuardedRemoval::Removed | GuardedRemoval::Absent) => {}
+                    Ok(GuardedRemoval::Escaped) => {
+                        // Keep the row: the dir lives wherever the user's
+                        // symlinked root points, and `engine list` must
+                        // stay truthful about what still exists.
+                        tracing::warn!(
+                            "kept engine {} — its dir resolves outside the data root",
+                            e.tag
+                        );
+                        continue;
+                    }
+                    Err(err) => {
+                        return Err(anyhow!("prune engine dir {}: {err}", dir.display()));
+                    }
+                }
             }
             store.delete_engine(&e.tag)?;
             tracing::info!("pruned old engine {} ({} bytes)", e.tag, bytes);
@@ -2329,7 +2397,7 @@ impl EngineManager {
             // removed (locked dir, busy store) warns and frees the rest
             // of the pass: one poisoned lane must not block retirement
             // of its siblings on every sweep.
-            match remove_engine_row_and_tree(store, &row.tag, &dir) {
+            match remove_engine_row_and_tree(store, &row.tag, &dir, &self.dirs.data_dir) {
                 Ok(bytes) => {
                     tracing::warn!(
                         "retired curated fork lane {} ({} bytes) — rebuild any time via the registry",
@@ -2377,8 +2445,22 @@ impl EngineManager {
             let mut bytes = 0u64;
             if dir.exists() {
                 bytes = engine_dir_bytes(&dir);
-                std::fs::remove_dir_all(&dir)
-                    .with_context(|| format!("prune engine dir {}", dir.display()))?;
+                match remove_dir_within(&self.dirs.data_dir, &dir) {
+                    Ok(GuardedRemoval::Removed | GuardedRemoval::Absent) => {}
+                    Ok(GuardedRemoval::Escaped) => {
+                        // Same pairing rule as `prune`: a dir outside the
+                        // data root keeps its row — no ghost either way.
+                        tracing::warn!(
+                            "kept superseded engine {} — its dir resolves outside \
+                             the data root",
+                            e.tag
+                        );
+                        continue;
+                    }
+                    Err(err) => {
+                        return Err(anyhow!("prune engine dir {}: {err}", dir.display()));
+                    }
+                }
             }
             store.delete_engine(&e.tag)?;
             tracing::info!(
@@ -2465,9 +2547,12 @@ impl EngineManager {
             }
             let bytes = engine_dir_bytes(&dir);
             // Best-effort: a busy dir (child running from it) is skipped,
-            // not fatal — the next sweep catches it.
-            match std::fs::remove_dir_all(&dir) {
-                Ok(()) => {}
+            // not fatal — the next sweep catches it. A dir resolving
+            // outside the data root (symlinked engines dir) is skipped
+            // entirely: it is not this store's to reclaim.
+            match remove_dir_within(&self.dirs.data_dir, &dir) {
+                Ok(GuardedRemoval::Removed) => {}
+                Ok(GuardedRemoval::Absent | GuardedRemoval::Escaped) => continue,
                 Err(e) => {
                     tracing::warn!(
                         "orphan engine dir {} could not be removed: {e}",
@@ -2527,9 +2612,19 @@ impl EngineManager {
                 continue;
             }
             let bytes = engine_dir_bytes(&entry.path());
-            if let Err(e) = std::fs::remove_dir_all(entry.path()) {
-                tracing::warn!("cannot remove stale retired engine {name}: {e}");
-                continue;
+            match remove_dir_within(&self.dirs.data_dir, &entry.path()) {
+                Ok(GuardedRemoval::Removed) => {}
+                Ok(GuardedRemoval::Absent | GuardedRemoval::Escaped) => {
+                    tracing::warn!(
+                        "skipped stale retired engine {name} — absent or outside \
+                         the data root"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!("cannot remove stale retired engine {name}: {e}");
+                    continue;
+                }
             }
             tracing::info!("swept stale retired engine {name} ({} bytes)", bytes);
             freed.push((name, bytes));
@@ -3458,6 +3553,7 @@ mod debris_tests {
         std::fs::write(dir.join("partial-download"), "new").unwrap();
 
         drop(CancelledInstallGuard {
+            data_dir: tmp.path().to_path_buf(),
             dir: dir.clone(),
             aside: Some(aside.clone()),
             armed: true,
@@ -3482,6 +3578,7 @@ mod debris_tests {
         std::fs::create_dir_all(&aside).unwrap();
 
         let mut guard = CancelledInstallGuard {
+            data_dir: tmp.path().to_path_buf(),
             dir: dir.clone(),
             aside: Some(aside.clone()),
             armed: true,

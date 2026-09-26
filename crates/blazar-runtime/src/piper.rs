@@ -177,9 +177,24 @@ pub async fn install(
     let bytes = gh.download_asset_bytes(asset).await?;
     let dir = bin_root(dirs).join(&release.tag_name);
     // Replace, don't merge — a re-install over an existing tag dir must
-    // not leave stale binaries from the old extract behind.
+    // not leave stale binaries from the old extract behind. A dir that
+    // resolves outside the data root (symlinked bin root) cannot be
+    // replaced in place, so the install refuses instead of merging.
     if dir.exists() {
-        std::fs::remove_dir_all(&dir).with_context(|| format!("replace {}", dir.display()))?;
+        match blazar_core::fs_safety::remove_dir_within(&dirs.data_dir, &dir) {
+            Ok(
+                blazar_core::fs_safety::GuardedRemoval::Removed
+                | blazar_core::fs_safety::GuardedRemoval::Absent,
+            ) => {}
+            Ok(blazar_core::fs_safety::GuardedRemoval::Escaped) => {
+                return Err(anyhow!(
+                    "piper dir {} resolves outside the data root (symlinked \
+                     piper bin dir?) — unhook the link, then retry",
+                    dir.display()
+                ));
+            }
+            Err(e) => return Err(anyhow!("replace {}: {e}", dir.display())),
+        }
     }
     std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
     crate::engine::extract_archive(&bytes, &dir, &asset.name)?;
@@ -243,8 +258,17 @@ fn prune(dirs: &BlazarDirs) -> Result<()> {
         if Some(&name) == pin.as_ref() {
             continue;
         }
-        std::fs::remove_dir_all(&dir)
-            .with_context(|| format!("prune piper dir {}", dir.display()))?;
+        match blazar_core::fs_safety::remove_dir_within(&dirs.data_dir, &dir) {
+            Ok(
+                blazar_core::fs_safety::GuardedRemoval::Removed
+                | blazar_core::fs_safety::GuardedRemoval::Absent,
+            ) => {}
+            Ok(blazar_core::fs_safety::GuardedRemoval::Escaped) => {
+                // Not this store's dir — skip, keep the pass moving.
+                continue;
+            }
+            Err(e) => return Err(anyhow!("prune piper dir {}: {e}", dir.display())),
+        }
         tracing::info!("pruned old piper {name}");
     }
     Ok(())
@@ -469,7 +493,7 @@ pub async fn pull_voice(
     // is not. The config half must parse as JSON.
     let onnx_len = std::fs::metadata(&dest).map_or(0, |m| m.len());
     if onnx_len < 1_000_000 {
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = blazar_core::fs_safety::remove_dir_within(&dirs.data_dir, &dir);
         return Err(anyhow!(
             "{VOICES_REPO}/{voice}: payload is not a piper voice ({onnx_len} bytes, expected a \
              multi-MB onnx) — removed"
@@ -478,7 +502,7 @@ pub async fn pull_voice(
     let json_raw = std::fs::read_to_string(dir.join(format!("{voice}.onnx.json")))
         .with_context(|| format!("read {voice} config"))?;
     if serde_json::from_str::<serde_json::Value>(&json_raw).is_err() {
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = blazar_core::fs_safety::remove_dir_within(&dirs.data_dir, &dir);
         return Err(anyhow!(
             "{VOICES_REPO}/{voice}: config half is not JSON — removed"
         ));

@@ -4,6 +4,12 @@ All notable changes to Blazar are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
+## [Unreleased]
+
+### Fixed
+
+- **Managed-dir deletion can no longer escape the data root through a symlink.** Every engine/piper/whisper tree-removal path (`engine rm`, retention pruning, orphan sweeps, install rollback) called `remove_dir_all` on a path derived from a directory entry — if the engines dir (or any engine subdir) was a symlink into somewhere else, the sweep deleted the *target's* contents (live incident: a scratch XDG root with a symlinked `engines/` and an empty scratch store booted the daemon, classified all five real engine dirs as orphans, and deleted ~13 GiB of installed engines through the link). All tree removals now go through one guarded primitive in `blazar-core::fs_safety`: the path is canonicalized and must sit inside the data root before `remove_dir_all` runs; a final-component symlink is unlinked as a link (never followed), and anything that resolves outside the anchor is refused with a warning that names both paths. Refusals fail safe per site: `engine rm` errors with a teaching message and keeps the row, retention pruning keeps the row (the engine list stays truthful), orphan/aside sweeps skip the dir, and piper/whisper replace-sites refuse the reinstall outright (replace-don't-merge cannot be honored through a link). Model rows keep their long-standing behavior of deleting user-recorded external dirs on explicit `blazar rm` — that is the user's own path, recorded as such. Pinned by integration tests replaying the incident shape: a symlinked engines root with a populated target survives an orphan sweep with an empty store, a prune-eligible engine behind a link keeps its row and its files, and `remove_engine_row_and_tree` refuses with the teaching error.
+
 ## [0.12.0] - 2026-09-26
 
 ### Fixed

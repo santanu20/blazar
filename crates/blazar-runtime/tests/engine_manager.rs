@@ -2321,6 +2321,7 @@ fn unit__remove_engine_row_and_tree__happy_path_removes_dir_row_and_aside() {
         &store,
         "fork-acme_llama.cpp-22222222-cpu",
         &dir,
+        &dirs.data_dir,
     )
     .unwrap();
     assert!(bytes > 0, "marker bytes reclaimed");
@@ -2367,7 +2368,7 @@ fn unit__remove_engine_row_and_tree__restores_dir_when_row_delete_fails() {
     let blocker = rusqlite::Connection::open(dirs.data_dir.join("blazar.db")).unwrap();
     blocker.execute("DROP TABLE engines", []).unwrap();
 
-    let err = blazar_runtime::engine::remove_engine_row_and_tree(&store, tag, &dir)
+    let err = blazar_runtime::engine::remove_engine_row_and_tree(&store, tag, &dir, &dirs.data_dir)
         .expect_err("row delete must fail");
     assert!(
         format!("{err:#}").contains("cannot delete engine row"),
@@ -2384,4 +2385,124 @@ fn unit__remove_engine_row_and_tree__restores_dir_when_row_delete_fails() {
         })
         .collect();
     assert!(asides.is_empty(), "aside rolled back: {asides:?}");
+}
+
+/// Live incident 2026-09-26 pin: a scratch XDG data dir whose engines
+/// root was a symlink into the real store lost five engine installs to
+/// the orphan sweep — the old `remove_dir_all` followed the link and
+/// reclaimed ~13 GiB of foreign content. The containment guard must
+/// refuse to delete anything that resolves outside the data root.
+#[cfg(unix)]
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__orphan_sweep__symlinked_engines_root_spares_target() {
+    let (tmp, dirs) = tmp_dirs();
+    // The "real store" the symlink points at — outside dirs.data_dir.
+    let real_root = tmp.path().join("real-store/engines");
+    let victim = real_root.join("b11193-cuda");
+    std::fs::create_dir_all(&victim).unwrap();
+    std::fs::write(victim.join("llama-server"), "binary").unwrap();
+    // Swap the scratch engines dir for a symlink to the real one, then
+    // run the manual orphan pass with an empty store: every dir behind
+    // the link looks like an orphan to THIS store.
+    std::fs::remove_dir_all(dirs.engines_dir()).unwrap();
+    std::os::unix::fs::symlink(&real_root, dirs.engines_dir()).unwrap();
+
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    let freed = mgr.prune_orphan_dirs().unwrap();
+    assert!(
+        freed.is_empty(),
+        "nothing reclaimed through the link: {freed:?}"
+    );
+    assert!(
+        victim.join("llama-server").is_file(),
+        "content behind the symlinked root survives"
+    );
+}
+
+/// Retention through a symlinked engines root keeps row AND dir: the
+/// dir lives wherever the user's link points, so the row must stay
+/// truthful (`engine list`) instead of vanishing over a live dir.
+#[cfg(unix)]
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__prune__escaped_dir_keeps_row_and_target() {
+    let (tmp, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    let store = Store::open(&dirs).unwrap();
+    // Three same-kind rows: KEEP_TAGS (2) keep their slots, the oldest
+    // is prune-eligible — but its dir sits behind a symlinked root.
+    stage_mainstream_row(&store, &dirs, "b3-cuda", 3, &["qwen2"]);
+    stage_mainstream_row(&store, &dirs, "b2-cuda", 2, &["qwen2"]);
+    stage_mainstream_row(&store, &dirs, "b1-cuda", 1, &["qwen2"]);
+    let real_root = tmp.path().join("real-store/engines");
+    let escaped = real_root.join("b1-cuda");
+    std::fs::create_dir_all(&escaped).unwrap();
+    std::fs::write(escaped.join("marker"), "precious").unwrap();
+    std::fs::remove_dir_all(dirs.engines_dir()).unwrap();
+    std::os::unix::fs::symlink(&real_root, dirs.engines_dir()).unwrap();
+
+    let freed = mgr.prune(&store, None).unwrap();
+    assert!(
+        freed.iter().all(|(tag, _)| tag != "b1-cuda"),
+        "the escaped dir is not reclaimed: {freed:?}"
+    );
+    assert!(
+        store
+            .list_engines()
+            .unwrap()
+            .iter()
+            .any(|e| e.tag == "b1-cuda"),
+        "row kept so engine list stays truthful"
+    );
+    assert!(escaped.join("marker").is_file(), "target content survives");
+}
+
+/// An explicit `engine rm` against a dir behind a symlinked engines
+/// root refuses with a teaching error instead of deleting through the
+/// link — no ghost row over a dir that still exists.
+#[cfg(unix)]
+#[test]
+#[allow(non_snake_case)]
+fn unit__remove_engine_row_and_tree__escaped_dir_refused() {
+    let (tmp, dirs) = tmp_dirs();
+    let store = Store::open(&dirs).unwrap();
+    stage_lane(
+        &store,
+        &dirs,
+        "fork-acme_llama.cpp-44444444-cpu",
+        1000,
+        TrustTier::Curated,
+        &["x-arch"],
+        None,
+    );
+    let real_root = tmp.path().join("real-store/engines");
+    let target = real_root.join("fork-acme_llama.cpp-44444444-cpu");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("marker"), "precious").unwrap();
+    std::fs::remove_dir_all(dirs.engines_dir()).unwrap();
+    std::os::unix::fs::symlink(&real_root, dirs.engines_dir()).unwrap();
+
+    let err = blazar_runtime::engine::remove_engine_row_and_tree(
+        &store,
+        "fork-acme_llama.cpp-44444444-cpu",
+        &dirs.engines_dir().join("fork-acme_llama.cpp-44444444-cpu"),
+        &dirs.data_dir,
+    )
+    .expect_err("escaped dir must be refused");
+    assert!(
+        format!("{err:#}").contains("outside the data root"),
+        "error teaches the escape: {err:#}"
+    );
+    assert!(target.join("marker").is_file(), "target content survives");
+    assert!(
+        store
+            .list_engines()
+            .unwrap()
+            .iter()
+            .any(|e| e.tag == "fork-acme_llama.cpp-44444444-cpu"),
+        "row kept — no ghost either way"
+    );
 }

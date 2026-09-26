@@ -800,12 +800,13 @@ impl EngineManager {
             // precede the extraction: install_built_binaries refuses to
             // merge into a live dir.
             let engine_dir = self.dirs.engines_dir().join(&engine_tag);
-            let aside = retire_engine_dir(&engine_dir)?;
+            let aside = retire_engine_dir(&self.dirs.data_dir, &engine_dir)?;
             // Panic safety for the extract below (future cancellation
             // cannot strike here — the region from retire to register is
             // await-free; the guard is what keeps that invariant honest
             // if an await ever sneaks in).
             let mut guard = CancelledInstallGuard {
+                data_dir: self.dirs.data_dir.clone(),
                 dir: engine_dir.clone(),
                 aside: aside.clone(),
                 armed: true,
@@ -825,7 +826,7 @@ impl EngineManager {
                     },
                 )),
                 Err(e) => {
-                    restore_retired_engine(aside.as_deref(), &engine_dir);
+                    restore_retired_engine(&self.dirs.data_dir, aside.as_deref(), &engine_dir);
                     Err(e)
                 }
             }
@@ -849,11 +850,11 @@ impl EngineManager {
             opts.trust,
         ) {
             Ok(row) => {
-                discard_retired_engine(aside.as_deref());
+                discard_retired_engine(&self.dirs.data_dir, aside.as_deref());
                 Ok(row)
             }
             Err(e) => {
-                restore_retired_engine(aside.as_deref(), &lane.dir);
+                restore_retired_engine(&self.dirs.data_dir, aside.as_deref(), &lane.dir);
                 Err(e)
             }
         }

@@ -6948,7 +6948,10 @@ fn prune_snapshots(d: &BlazarDirs, keep: usize) {
     stamps.sort_unstable();
     while stamps.len() > keep {
         let oldest = stamps.remove(0);
-        let _ = std::fs::remove_dir_all(d.data_dir.join("snapshots").join(oldest.to_string()));
+        let _ = blazar_core::fs_safety::remove_dir_within(
+            &d.data_dir,
+            &d.data_dir.join("snapshots").join(oldest.to_string()),
+        );
     }
 }
 
@@ -11154,7 +11157,8 @@ fn engine_rm(d: &BlazarDirs, tag: &str) -> Result<()> {
         );
     }
     let dir = d.engines_dir().join(tag);
-    let reclaimed = blazar_runtime::engine::remove_engine_row_and_tree(&store, tag, &dir)?;
+    let reclaimed =
+        blazar_runtime::engine::remove_engine_row_and_tree(&store, tag, &dir, &d.data_dir)?;
     let mib = reclaimed / (1024 * 1024);
     println!(
         "removed engine {tag} ({} MiB reclaimed{})",
