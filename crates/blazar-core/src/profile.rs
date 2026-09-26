@@ -10869,7 +10869,11 @@ mod tests {
                 .map(str::to_string)
                 .collect();
         let cfg = Config::default();
-        let dir = std::env::temp_dir().join(format!("blazar-sdcpp-flux-{}", std::process::id()));
+        // Unique dir name: the sibling te-family flux test stages its own
+        // clip_l at a different sparse size — sharing one dir let the later
+        // truncate win the metadata race and flip the warning arithmetic.
+        let dir =
+            std::env::temp_dir().join(format!("blazar-sdcpp-flux-roomy-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let vae = dir.join("ae.safetensors");
         let t5 = dir.join("t5.gguf");
