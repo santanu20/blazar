@@ -659,6 +659,22 @@ pub fn mistralrs_argv(
             argv.push(mm.to_string());
         }
     }
+    // Repackaged multimodal GGUFs (lmstudio-community style) carry no
+    // base-model identity mistral.rs can read: the child aborts with
+    // "multimodal GGUF requires its original config.json ... pass
+    // --tok-model-id". Derive the HF id from the GGUF's own `general.*`
+    // metadata so the forced-mistral.rs lane boots (live-proven on
+    // v0.9.4 with Qwen3.5-9B-Q4_K_M: config refusal gone, server
+    // healthy). Un-derivable files emit nothing and keep the engine's
+    // teaching error.
+    if !is_hf_dir && model.mmproj_path.is_some() && flags.contains("--tok-model-id") {
+        if let Ok(meta) = blazar_core::gguf::read_metadata_file(std::path::Path::new(&model.path)) {
+            if let Some(id) = meta.hf_base_model_id() {
+                argv.push("--tok-model-id".into());
+                argv.push(id);
+            }
+        }
+    }
     // Engine-tuning passthrough: the mistral.rs profile dialect emits
     // tuning flags (pa-memory-fraction, paged-attn, scheduler/MTP/
     // vision/LoRA knobs, --lora pairs); forward them verbatim when the
@@ -688,6 +704,7 @@ pub fn mistralrs_argv(
         "--max-num-batched-tokens",
         "--max-seqs",
         "--mmproj",
+        "--tok-model-id",
         "-np",
         "--paged-attn",
         "--pa-memory-fraction",

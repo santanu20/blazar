@@ -18,6 +18,13 @@ use crate::error::{CoreError, CoreResult};
 pub struct GgufMeta {
     pub architecture: String,
     pub name: Option<String>,
+    /// `general.basename` — upstream repo id with the size suffix stripped
+    /// (`Qwen/Qwen3.5` written as `Qwen_Qwen3.5`). Sole source for the
+    /// mistral.rs `--tok-model-id` derivation on repackaged multimodal
+    /// GGUFs.
+    pub basename: Option<String>,
+    /// `general.size_label` — size tag (`9B`) recombined with `basename`.
+    pub size_label: Option<String>,
     pub block_count: Option<u64>,
     pub context_length: Option<u64>,
     pub expert_count: Option<u64>,
@@ -355,6 +362,34 @@ impl GgufMeta {
         }
         out
     }
+
+    /// Hugging Face base-model id for the mistral.rs `--tok-model-id`
+    /// fallback: repackaged multimodal GGUFs (lmstudio-community style)
+    /// embed no adapter identity mistral.rs can read, so a forced
+    /// mistral.rs lane aborts with "multimodal GGUF requires its original
+    /// config.json". `general.basename` carries the upstream repo as
+    /// `org_model` (slash flattened to `_`) and `general.size_label` the
+    /// size tag; `Qwen_Qwen3.5` + `9B` recombine to `Qwen/Qwen3.5-9B`.
+    /// Only derivable when the org separator is present — single-segment
+    /// basenames (`unsloth` style) stay `None` and the engine's own
+    /// teaching error surfaces unchanged.
+    #[must_use]
+    pub fn hf_base_model_id(&self) -> Option<String> {
+        let base = self.basename.as_deref()?.trim();
+        let sep = base.find('_')?;
+        let (org, repo) = (&base[..sep], &base[sep + 1..]);
+        if org.is_empty() || repo.is_empty() {
+            return None;
+        }
+        let mut id = format!("{org}/{repo}");
+        if let Some(size) = self.size_label.as_deref().map(str::trim) {
+            if !size.is_empty() && !id.ends_with(size) {
+                id.push('-');
+                id.push_str(size);
+            }
+        }
+        Some(id)
+    }
 }
 
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
@@ -633,6 +668,16 @@ pub fn parse_metadata(buf: &[u8]) -> CoreResult<(GgufMeta, usize)> {
             .find(|(k, _)| k == "general.name")
             .and_then(|(_, v)| v.as_str())
             .map(str::to_string),
+        basename: kvs
+            .iter()
+            .find(|(k, _)| k == "general.basename")
+            .and_then(|(_, v)| v.as_str())
+            .map(str::to_string),
+        size_label: kvs
+            .iter()
+            .find(|(k, _)| k == "general.size_label")
+            .and_then(|(_, v)| v.as_str())
+            .map(str::to_string),
         quantized_by: kvs
             .iter()
             .find(|(k, _)| k == "general.quantized_by")
@@ -815,6 +860,62 @@ mod tests {
         let plain = build_gguf(&[("general.architecture", GgufValue::String("qwen35".into()))]);
         let (m, _) = parse_metadata(&plain).unwrap();
         assert_eq!(m.mtp_layers, None);
+    }
+
+    #[test]
+    fn unit__hf_base_model_id__recombines_lmstudio_convention() {
+        let buf = build_gguf(&[
+            ("general.architecture", GgufValue::String("qwen35".into())),
+            ("general.basename", GgufValue::String("Qwen_Qwen3.5".into())),
+            ("general.size_label", GgufValue::String("9B".into())),
+        ]);
+        let (m, _) = parse_metadata(&buf).unwrap();
+        assert_eq!(m.basename.as_deref(), Some("Qwen_Qwen3.5"));
+        assert_eq!(m.size_label.as_deref(), Some("9B"));
+        assert_eq!(m.hf_base_model_id().as_deref(), Some("Qwen/Qwen3.5-9B"));
+    }
+
+    #[test]
+    fn unit__hf_base_model_id__size_suffix_not_doubled() {
+        let buf = build_gguf(&[
+            ("general.architecture", GgufValue::String("qwen35".into())),
+            (
+                "general.basename",
+                GgufValue::String("Qwen_Qwen3.5-9B".into()),
+            ),
+            ("general.size_label", GgufValue::String("9B".into())),
+        ]);
+        let (m, _) = parse_metadata(&buf).unwrap();
+        assert_eq!(m.hf_base_model_id().as_deref(), Some("Qwen/Qwen3.5-9B"));
+    }
+
+    #[test]
+    fn unit__hf_base_model_id__underivable_shapes_stay_none() {
+        // Single-segment basenames (unsloth style) have no org separator;
+        // missing basename or empty org/repo halves are equally
+        // underivable — the engine's teaching error stays the surface.
+        for base in ["Qwen3.5-9B", "_repo", "org_", ""] {
+            let buf = build_gguf(&[
+                ("general.architecture", GgufValue::String("qwen35".into())),
+                ("general.basename", GgufValue::String(base.into())),
+                ("general.size_label", GgufValue::String("9B".into())),
+            ]);
+            let (m, _) = parse_metadata(&buf).unwrap();
+            assert!(m.hf_base_model_id().is_none(), "{base} must not derive");
+        }
+        let bare = build_gguf(&[("general.architecture", GgufValue::String("q".into()))]);
+        let (m, _) = parse_metadata(&bare).unwrap();
+        assert!(m.hf_base_model_id().is_none());
+    }
+
+    #[test]
+    fn unit__hf_base_model_id__missing_size_label_keeps_org_repo() {
+        let buf = build_gguf(&[
+            ("general.architecture", GgufValue::String("qwen35".into())),
+            ("general.basename", GgufValue::String("Qwen_Qwen3.5".into())),
+        ]);
+        let (m, _) = parse_metadata(&buf).unwrap();
+        assert_eq!(m.hf_base_model_id().as_deref(), Some("Qwen/Qwen3.5"));
     }
 
     fn put_str(b: &mut Vec<u8>, s: &str) {

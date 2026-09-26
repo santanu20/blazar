@@ -5514,6 +5514,8 @@ mod tests {
         GgufMeta {
             architecture: "qwen3".into(),
             name: Some("x".into()),
+            basename: None,
+            size_label: None,
             block_count: Some(28),
             context_length: Some(40_960),
             expert_count: None,
