@@ -60,11 +60,13 @@ mkdir -p "$SRV" "$TMP/home"
 export XDG_CONFIG_HOME="$TMP/home/.config"
 export XDG_DATA_HOME="$TMP/home/.local/share"
 
-# Fake privileged environment: "sudo" executes plainly, "systemctl" says
+# Fake privileged environment: "sudo" executes plainly (recording its
+# argv so tests can assert privileged-call wiring), "systemctl" says
 # the unit is inactive (so the enable path runs) and accepts everything.
-cat > "$TMP/fakesudo" <<'EOF'
+cat > "$TMP/fakesudo" <<EOF
 #!/bin/sh
-exec "$@"
+printf '%s\n' "\$*" >> "$TMP/sudo.log"
+exec "\$@"
 EOF
 chmod +x "$TMP/fakesudo"
 cat > "$TMP/fakesystemctl" <<EOF
@@ -143,7 +145,7 @@ SERVER_PID=$!
 
 BASE="http://127.0.0.1:${PORT}"
 
-INSTALL_ENV="HOME=$TMP/home BLAZAR_INSTALL_BASE_URL=$BASE BLAZAR_SUDO=$TMP/fakesudo BLAZAR_SYSTEMCTL=$TMP/fakesystemctl BLAZAR_SYSTEM_BIN_DIR=$SYSTEM_BIN BLAZAR_UNIT_PATH=$UNIT_OUT BLAZAR_INSTALL_ENGINE=0"
+INSTALL_ENV="HOME=$TMP/home BLAZAR_INSTALL_BASE_URL=$BASE BLAZAR_SUDO=$TMP/fakesudo BLAZAR_SYSTEMCTL=$TMP/fakesystemctl BLAZAR_SYSTEM_BIN_DIR=$SYSTEM_BIN BLAZAR_UNIT_PATH=$UNIT_OUT BLAZAR_SERVICE_DATA_DIR=$TMP/home/.local/share/blazar BLAZAR_INSTALL_ENGINE=0"
 
 # Readiness probe: the decoy asset exists before the server starts; release
 # metadata is written per test case below.
@@ -244,7 +246,7 @@ if [ "$(uname -m)" = x86_64 ] && [ -x "$STUB" ]; then
     mkdir -p "$TMP/home/.config/blazar"
     printf 'engine_asset = "ubuntu-x86_64"\nport = 11499\n' > "$TMP/home/.config/blazar/config.toml"
 
-    ENGINE_ENV="HOME=$TMP/home BLAZAR_INSTALL_BASE_URL=$BASE BLAZAR_GH_BASE=$BASE BLAZAR_SUDO=$TMP/fakesudo BLAZAR_SYSTEMCTL=$TMP/fakesystemctl BLAZAR_SYSTEM_BIN_DIR=$SYSTEM_BIN BLAZAR_UNIT_PATH=$UNIT_OUT"
+    ENGINE_ENV="HOME=$TMP/home BLAZAR_INSTALL_BASE_URL=$BASE BLAZAR_GH_BASE=$BASE BLAZAR_SUDO=$TMP/fakesudo BLAZAR_SYSTEMCTL=$TMP/fakesystemctl BLAZAR_SYSTEM_BIN_DIR=$SYSTEM_BIN BLAZAR_UNIT_PATH=$UNIT_OUT BLAZAR_SERVICE_DATA_DIR=$TMP/home/.local/share/blazar"
     OUT=$(env $ENGINE_ENV sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
     if [ "$RC" = 0 ] && echo "$OUT" | grep -q "engine bootstrap complete"; then
         ok "one-click: engine bootstrapped during install"
@@ -297,7 +299,7 @@ printf '%s\n' "\$*" > "$MARKER"
 exit 1
 EOF
 chmod +x "$TMP/fake-bootstrap"
-BUILD_ENV="HOME=$TMP/home BLAZAR_SUDO=$TMP/fakesudo BLAZAR_SYSTEMCTL=$TMP/fakesystemctl BLAZAR_SYSTEM_BIN_DIR=$SYSTEM_BIN BLAZAR_UNIT_PATH=$UNIT_OUT BLAZAR_INSTALL_ENGINE=0 BLAZAR_CHECKOUT=$ROOT BLAZAR_BOOTSTRAP=$TMP/fake-bootstrap BLAZAR_FORCE_BOOTSTRAP=1"
+BUILD_ENV="HOME=$TMP/home BLAZAR_SUDO=$TMP/fakesudo BLAZAR_SYSTEMCTL=$TMP/fakesystemctl BLAZAR_SYSTEM_BIN_DIR=$SYSTEM_BIN BLAZAR_UNIT_PATH=$UNIT_OUT BLAZAR_SERVICE_DATA_DIR=$TMP/home/.local/share/blazar BLAZAR_INSTALL_ENGINE=0 BLAZAR_CHECKOUT=$ROOT BLAZAR_BOOTSTRAP=$TMP/fake-bootstrap BLAZAR_FORCE_BOOTSTRAP=1"
 OUT=$(env $BUILD_ENV sh "$INSTALL_SH" --build 2>&1) && RC=0 || RC=$?
 if [ "$RC" != 0 ] && [ "$(cat "$MARKER" 2>/dev/null)" = "--minimal" ]; then
     ok "--build ran the bootstrap (--minimal) and failed hard"
@@ -550,6 +552,34 @@ fi
 sed 's/#.*$//' "$ROOT/scripts/install.sh" | grep -q 11434 &&
     bad "install.sh functionally references 11434" ||
     ok "install.sh polls 11435, never 11434"
+
+# --- 10. data-dir ownership: the unit runs unprivileged ---------------------
+# The service-user data dir is created through sudo, so without an
+# explicit ownership hand-off it lands root-owned and the daemon dies
+# with EACCES on its first write (run/, locks) while systemd
+# restart-loops it. The installer must chown -R the tree to the
+# service user unconditionally — healing both fresh installs and
+# legacy trees with root-owned files left by past sudo-run daemons.
+rm -rf "$SYSTEM_BIN" "$UNIT_OUT" "${TMP:?}/home"
+mkdir -p "$TMP/home"
+printf '{"tag_name":"%s","assets":[{"name":"%s","digest":"sha256:%s","browser_download_url":"%s/download/%s"}]}' \
+    "$TAG" "$ASSET" "$SHA" "$BASE" "$ASSET" > "$SRV/release.json"
+: > "$TMP/sudo.log"
+OUT=$(env $INSTALL_ENV sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
+SVC_DATA="$TMP/home/.local/share/blazar"
+CUR_USER=$(id -un)
+CUR_GROUP=$(id -gn "$CUR_USER")
+if grep -qx "chown -R ${CUR_USER}:${CUR_GROUP} $SVC_DATA" "$TMP/sudo.log" 2>/dev/null; then
+    ok "data dir ownership handed to service user (sudo chown -R)"
+else
+    bad "no 'sudo chown -R user:group <data-dir>' call recorded"
+fi
+# Ownership verified numerically (stat -c is GNU-only; python3 is
+# already a hard prerequisite of this suite).
+OWN=$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(f"{s.st_uid}:{s.st_gid}")' "$SVC_DATA" 2>/dev/null) || OWN=
+[ "$OWN" = "$(id -u):$(id -g)" ] &&
+    ok "data dir owned by invoking user after install" ||
+    bad "data dir ownership wrong after install: '${OWN:-missing}'"
 
 echo "install e2e: $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

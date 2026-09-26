@@ -14,6 +14,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 
+use blazar_core::engine_kind::EngineKind;
 use blazar_core::store::Store;
 use blazar_core::ModelRow;
 
@@ -169,11 +170,15 @@ pub(crate) async fn ensure_detached_captive(
         })
 }
 
-/// Does this parsed chat body carry visual media? Shapes covered:
+/// Does this parsed chat body carry non-text media? Shapes covered:
 ///
 /// - `OpenAI` chat: `messages[].content[]` items with an `image`/`video`-
 ///   prefixed [`type`] (or a bare `image_url`/`video_url` key — some
 ///   clients omit the tag; `input_video` is the responses-lane alias)
+/// - `OpenAI` chat/responses: `input_audio` items (typed, bare key, or
+///   the Anthropic `type: "audio"` block) — upstream accepts data or a
+///   URL (raw base64 / remote / local file path), so audio rides the
+///   same projector-replica lane as images (audit MM6)
 /// - `OpenAI` responses: `input[]` items with an `image`/`video`-prefixed
 ///   [`type`], plus nested `function_call_output.output[]` items — a tool
 ///   result may return an image (`{type: "input_image", image_url: ...}`),
@@ -190,12 +195,12 @@ pub(crate) async fn ensure_detached_captive(
 #[must_use]
 pub fn body_needs_vision(parsed: &serde_json::Value, ollama_shape: bool) -> bool {
     fn media_item(it: &serde_json::Value) -> bool {
-        it.get("type")
-            .and_then(|t| t.as_str())
-            .is_some_and(|t| t.starts_with("image") || t.starts_with("video"))
-            || it.get("image_url").is_some()
+        it.get("type").and_then(|t| t.as_str()).is_some_and(|t| {
+            t.starts_with("image") || t.starts_with("video") || t == "input_audio" || t == "audio"
+        }) || it.get("image_url").is_some()
             || it.get("video_url").is_some()
             || it.get("input_video").is_some()
+            || it.get("input_audio").is_some()
     }
     // Responses-lane tool results: `function_call_output.output[]` can
     // carry `input_image` items (#22575) — the child converts them to
@@ -619,13 +624,29 @@ impl std::fmt::Display for ChildSendError {
 /// respawn to be guaranteed fresh: `ensure_key`'s fast path would hand
 /// the retry the same wedged endpoint (the async J5 eviction lane
 /// debounces 1/min per model, far too slow to gate a retry). 0 disables
-/// the bound (legacy ceiling only).
+/// the bound (legacy ceiling only). The ceiling is lane-aware: a
+/// diffusion child answers with the finished artifact, so time to first
+/// header IS the full generation time (minutes at 1024px on an
+/// offloaded box, longer for video) — the text-lane ceiling would evict
+/// healthy generations mid-flight. `SdCpp` children therefore ride
+/// `sdcpp_child_header_timeout_secs`.
 pub(crate) async fn child_send(
     state: &AppState,
     engine: &EngineRef,
     send: impl std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
 ) -> Result<reqwest::Response, ChildSendError> {
-    match state.config.child_header_timeout_secs {
+    let (ceiling, knob) = if engine.kind == EngineKind::SdCpp {
+        (
+            state.config.sdcpp_child_header_timeout_secs,
+            "sdcpp_child_header_timeout_secs",
+        )
+    } else {
+        (
+            state.config.child_header_timeout_secs,
+            "child_header_timeout_secs",
+        )
+    };
+    match ceiling {
         0 => send.await.map_err(ChildSendError::Transport),
         secs => match tokio::time::timeout(std::time::Duration::from_secs(secs), send).await {
             Ok(result) => result.map_err(ChildSendError::Transport),
@@ -633,7 +654,7 @@ pub(crate) async fn child_send(
                 tracing::warn!(
                     target: "blazar::proxy",
                     model = %engine.key,
-                    "child produced no response headers in {secs}s — evicting synchronously (child_header_timeout_secs)"
+                    "child produced no response headers in {secs}s — evicting synchronously ({knob})"
                 );
                 let _ = state.sup.evict(&engine.key).await;
                 Err(ChildSendError::HeaderTimeout { secs })
@@ -2234,6 +2255,48 @@ mod body_needs_vision_tests {
             "messages": [{
                 "role": "user",
                 "content": [{"video_url": "https://example.test/clip.mp4"}]
+            }]
+        });
+        assert!(body_needs_vision(&body, false));
+    }
+
+    #[test]
+    fn unit__body_needs_vision__chat_input_audio_tag__detected() {
+        // Audit MM6: upstream server accepts input_audio items (data or
+        // URL) — they ride the projector lane like images.
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "transcribe this"},
+                    {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}
+                ]
+            }]
+        });
+        assert!(body_needs_vision(&body, false));
+    }
+
+    #[test]
+    fn unit__body_needs_vision__chat_bare_input_audio_key__detected() {
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [{"input_audio": {"data": "AAAA", "format": "wav"}}]
+            }]
+        });
+        assert!(body_needs_vision(&body, false));
+    }
+
+    #[test]
+    fn unit__body_needs_vision__anthropic_audio_block__detected() {
+        // Anthropic shape: {type: "audio", source: {...}}.
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what does it say"},
+                    {"type": "audio", "source": {"type": "base64", "media_type": "audio/wav", "data": "AAAA"}}
+                ]
             }]
         });
         assert!(body_needs_vision(&body, false));

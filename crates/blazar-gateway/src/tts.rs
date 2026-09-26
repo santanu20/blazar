@@ -101,6 +101,13 @@ pub async fn audio_speech(
         .await;
     }
 
+    // Local lane — same admission the remote branch just paid (audit
+    // MM1): scope on the voice id (this lane's "model") + rpm/tpm/daily
+    // + request charge. Local synthesis is not a free lane.
+    if let Err(resp) = state.admit_or_respond(key_ext.as_ref(), voice) {
+        return *resp;
+    }
+
     // Local lane. WAV: one buffered synthesis (existing contract). PCM:
     // synthesize the first sentence eagerly — a missing voice or lane
     // still maps to its teaching status before any bytes flow — then
@@ -500,7 +507,11 @@ mod tests {
         let wav = wav_bytes(&samples, Some((b"LIST", b"INFOblazar-test")));
         let scaled = limit_wav_peak(wav.clone());
         let peak = f32::from(peak_of(&scaled));
-        let target = PEAK_CEILING * f32::from(i16::MAX);
+        // -1 dBFS as a LITERAL, deliberately not PEAK_CEILING: pinning
+        // the ceiling against its own constant is circular and let a
+        // mutation of the constant to 1.0 pass green (audit MM11).
+        // 10^(-1/20) = 0.8912509...
+        let target = 0.891_250_9_f32 * f32::from(i16::MAX);
         assert!(
             (target - peak).abs() <= 1.0,
             "peak {peak} vs target {target}"

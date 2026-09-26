@@ -2864,12 +2864,15 @@ fn compile_sdcpp(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<P
     argv.push(port.to_string());
 
     if let Some(n) = tuning.threads {
+        // The manifest probe keeps long forms only, so the `-t` spelling
+        // could never clear the gate — threads tuning silently vanished
+        // from the launch line (live-verified on the spawned child).
         push_gated(
             input,
             &mut argv,
             &mut warnings,
             "threads",
-            "-t",
+            "--threads",
             &[n.to_string()],
         );
     }
@@ -2909,6 +2912,8 @@ fn compile_sdcpp(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<P
     let resident = input.model_bytes.saturating_add(component_bytes);
     let offload = sdcpp_offload_decision(vram_bytes, resident);
     apply_sdcpp_offload(input, &offload, vram_bytes, &mut argv, &mut warnings);
+    push_generation_defaults(input, &mut argv, &mut warnings);
+    push_sdcpp_tuning(input, &mut argv, &mut warnings);
 
     // extra_args: strict manifest-gated passthrough, same contract as the
     // other dialects — blazar-owned launch pins refuse rather than
@@ -2922,6 +2927,139 @@ fn compile_sdcpp(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<P
         kv_est_bytes: None,
         ctx_autofit: None,
     })
+}
+
+/// Generation defaults for the launch line: sd-server's built-ins are
+/// SD1.5-era (seed 42, cfg 7.0, `euler_a`, 512x512) and the OpenAI-compat
+/// image route parses prompt/n/size only — every request without
+/// explicit parameters inherits the argv, so this IS the effective
+/// default. `--seed -1` re-rolls every generation (upstream: random
+/// seed for values < 0) instead of returning byte-identical frames. The
+/// qwen-image flow-matching `DiT` family additionally needs its documented
+/// posture (model card `true_cfg` 4.0; upstream `qwen_image.md` demo:
+/// `euler` + flow-shift 3 at the native 1024) — cfg 7.0/`euler_a`/512
+/// washes those frames out. Wan video and flux keep their engine
+/// model-type defaults (seed only). Every flag rides the manifest gate;
+/// user `extra_args` extend after these (last-wins override), and
+/// explicit request parameters still win over both at runtime.
+fn push_generation_defaults(
+    input: &ProfileInput<'_>,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    push_gated(input, argv, warnings, "seed", "--seed", &["-1".to_string()]);
+    let qwen_dit = input.components.iter().any(|c| c.flag == "--llm");
+    if qwen_dit {
+        for (key, flag, value) in [
+            ("cfg", "--cfg-scale", "4.0"),
+            ("sampler", "--sampling-method", "euler"),
+            ("flow_shift", "--flow-shift", "3.0"),
+            ("width", "--width", "1024"),
+            ("height", "--height", "1024"),
+        ] {
+            push_gated(input, argv, warnings, key, flag, &[value.to_string()]);
+        }
+    }
+}
+
+/// First-class config surface for sd-server's high-value perf knobs
+/// (`sdcpp_cache_mode` & friends in config.rs). Emitted manifest-gated
+/// BEFORE user `extra_args`, so an explicit user flag still wins
+/// last-wins. Every default is off — unset knobs compile byte-identical
+/// argv to before this surface existed.
+fn push_sdcpp_tuning(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings: &mut Vec<String>) {
+    let cfg = input.config;
+    if let Some(mode) = cfg.sdcpp_cache_mode.as_ref() {
+        push_gated(
+            input,
+            argv,
+            warnings,
+            "cache_mode",
+            "--cache-mode",
+            std::slice::from_ref(mode),
+        );
+    }
+    if cfg.sdcpp_flash_attention {
+        push_gated(input, argv, warnings, "flash_attention", "--fa", &[]);
+    }
+    if cfg.sdcpp_vae_tiling {
+        push_gated(input, argv, warnings, "vae_tiling", "--vae-tiling", &[]);
+    }
+    if !cfg.sdcpp_rpc_servers.is_empty() {
+        let joined = cfg.sdcpp_rpc_servers.join(",");
+        push_gated(
+            input,
+            argv,
+            warnings,
+            "rpc_servers",
+            "--rpc-servers",
+            &[joined],
+        );
+    }
+    if cfg.sdcpp_sage_attn {
+        // SageAttention kernels are CUDA-only (patched GGML, SM80+); the
+        // engine treats the flag as FATAL on Vulkan/Metal/CPU builds
+        // (live-verified master-919: new_sd_ctx_t refuses to boot). Emit
+        // it only when the auto-picked device is CUDA-class; an explicit
+        // extra_args --sage-attn stays the escape hatch for user-owned
+        // --backend postures.
+        let cuda_device = input
+            .device_hint
+            .is_some_and(|d| d.to_ascii_uppercase().starts_with("CUDA"));
+        if cuda_device {
+            push_gated(input, argv, warnings, "sage_attn", "--sage-attn", &[]);
+        } else {
+            warnings.push(format!(
+                "sage_attn skipped: SageAttention requires a CUDA device (SM80+, CUDA \
+                 build) and the child dies during load otherwise; active device {} — \
+                 extra_args --sage-attn overrides for custom postures",
+                input.device_hint.unwrap_or("none (CPU-only)")
+            ));
+        }
+    }
+    for (key, flag, value) in [
+        (
+            "cache_option",
+            "--cache-option",
+            cfg.sdcpp_cache_option.as_deref(),
+        ),
+        ("max_vram", "--max-vram", cfg.sdcpp_max_vram.as_deref()),
+        (
+            "params_backend",
+            "--params-backend",
+            cfg.sdcpp_params_backend.as_deref(),
+        ),
+        (
+            "split_mode",
+            "--split-mode",
+            cfg.sdcpp_split_mode.as_deref(),
+        ),
+        ("tae", "--tae", cfg.sdcpp_tae.as_deref()),
+        (
+            "model_args",
+            "--model-args",
+            cfg.sdcpp_model_args.as_deref(),
+        ),
+        (
+            "tensor_type_rules",
+            "--tensor-type-rules",
+            cfg.sdcpp_tensor_type_rules.as_deref(),
+        ),
+    ] {
+        if let Some(v) = value.filter(|v| !v.trim().is_empty()) {
+            push_gated(input, argv, warnings, key, flag, &[v.trim().to_string()]);
+        }
+    }
+    if let Some(n) = cfg.sdcpp_conditioning_cache_size {
+        push_gated(
+            input,
+            argv,
+            warnings,
+            "conditioning_cache_size",
+            "--conditioning-cache-size",
+            &[n.to_string()],
+        );
+    }
 }
 
 /// Component-set gates shared by every sdcpp compile: a diffusion `DiT`
@@ -3094,6 +3232,7 @@ fn sdcpp_extra_args(input: &ProfileInput<'_>) -> Result<Vec<String>, String> {
         "--clip_vision",
         "--qwen2vl_vision",
         "-t",
+        "--threads",
     ];
     let Some(extra) = &input.overlay.extra_args else {
         return Ok(Vec::new());
@@ -10337,7 +10476,7 @@ mod tests {
         // argv must NOT carry --diffusion-model (sd-server would see two
         // model paths), and the offload ladder counts the file ONCE.
         let g = meta();
-        let sd_flags: BTreeSet<String> = ["--model", "--diffusion-model"]
+        let sd_flags: BTreeSet<String> = ["--model", "--diffusion-model", "--seed"]
             .into_iter()
             .map(str::to_string)
             .collect();
@@ -10360,6 +10499,14 @@ mod tests {
             "{:?}",
             p.argv
         );
+        // Standalone checkpoints are not the qwen DiT family: the seed
+        // re-roll rides, the family posture does not.
+        assert!(
+            p.argv.windows(2).any(|w| w == ["--seed", "-1"]),
+            "{:?}",
+            p.argv
+        );
+        assert!(!p.argv.iter().any(|a| a == "--cfg-scale"), "{:?}", p.argv);
         let i = p
             .argv
             .iter()
@@ -10402,6 +10549,14 @@ mod tests {
             "--llm_vision",
             "--t5xxl",
             "--clip_l",
+            "--seed",
+            "--cfg-scale",
+            "--sampling-method",
+            "--flow-shift",
+            "--width",
+            "--height",
+            "--threads",
+            "--fa",
         ]
         .into_iter()
         .map(str::to_string)
@@ -10436,6 +10591,13 @@ mod tests {
             ("--llm", llm.to_str().unwrap()),
             ("--listen-ip", "127.0.0.1"),
             ("--listen-port", "12345"),
+            // The qwen (`--llm`) family posture rides the launch line.
+            ("--seed", "-1"),
+            ("--cfg-scale", "4.0"),
+            ("--sampling-method", "euler"),
+            ("--flow-shift", "3.0"),
+            ("--width", "1024"),
+            ("--height", "1024"),
         ] {
             let i = at(flag);
             assert_eq!(p.argv[i + 1], val, "{flag}");
@@ -10776,6 +10938,414 @@ mod tests {
             "{:?}",
             p2.warnings
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unit__compile_sdcpp__generation_defaults_family_scoped_and_gated() {
+        // The seed re-roll rides every spawn; the qwen posture only the
+        // `--llm` family; flux keeps engine model-type defaults; an
+        // old-engine manifest degrades to a warning instead of dying.
+        let g = meta();
+        let empty: BTreeSet<String> = BTreeSet::new();
+        let sd_flags: BTreeSet<String> = [
+            "--diffusion-model",
+            "--vae",
+            "--llm",
+            "--t5xxl",
+            "--clip_l",
+            "--seed",
+            "--cfg-scale",
+            "--sampling-method",
+            "--flow-shift",
+            "--width",
+            "--height",
+            "--threads",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let cfg = Config::default();
+        let dir =
+            std::env::temp_dir().join(format!("blazar-sdcpp-gen-defaults-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let vae = dir.join("vae.safetensors");
+        let llm = dir.join("te.gguf");
+        let t5 = dir.join("t5.gguf");
+        let clip = dir.join("clip_l.safetensors");
+        for (p, b) in [(&vae, b"v"), (&llm, b"t"), (&t5, b"5"), (&clip, b"c")] {
+            std::fs::write(p, b).unwrap();
+        }
+        let hw = gpu_hw(16_384, 32_000, 8);
+
+        let qwen_set = [
+            ComponentArg::new("--vae", vae.to_str().unwrap()),
+            ComponentArg::new("--llm", llm.to_str().unwrap()),
+        ];
+        let mut inp = input(&g, &hw, &cfg, &sd_flags);
+        inp.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        inp.components = &qwen_set;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        for pair in [
+            ["--seed", "-1"],
+            ["--cfg-scale", "4.0"],
+            ["--sampling-method", "euler"],
+            ["--flow-shift", "3.0"],
+            ["--width", "1024"],
+            ["--height", "1024"],
+        ] {
+            assert!(
+                p.argv.windows(2).any(|w| w == pair),
+                "{pair:?} in {:?}",
+                p.argv
+            );
+        }
+
+        // Flux family (no --llm): seed re-roll only.
+        let flux_set = [
+            ComponentArg::new("--vae", vae.to_str().unwrap()),
+            ComponentArg::new("--t5xxl", t5.to_str().unwrap()),
+            ComponentArg::new("--clip_l", clip.to_str().unwrap()),
+        ];
+        let mut inp2 = input(&g, &hw, &cfg, &sd_flags);
+        inp2.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        inp2.components = &flux_set;
+        let p2 = compile(&inp2, &TuningOverrides::default()).unwrap();
+        assert!(
+            p2.argv.windows(2).any(|w| w == ["--seed", "-1"]),
+            "{:?}",
+            p2.argv
+        );
+        for absent in [
+            "--cfg-scale",
+            "--sampling-method",
+            "--flow-shift",
+            "--width",
+            "--height",
+        ] {
+            assert!(
+                !p2.argv.iter().any(|a| a == absent),
+                "{absent} in {:?}",
+                p2.argv
+            );
+        }
+
+        // Old engine (empty manifest): the defaults degrade to warnings,
+        // never a dead child.
+        let mut inp3 = input(&g, &hw, &cfg, &empty);
+        inp3.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        inp3.components = &qwen_set;
+        let p3 = compile(&inp3, &TuningOverrides::default()).unwrap();
+        assert!(!p3.argv.iter().any(|a| a == "--seed"), "{:?}", p3.argv);
+        assert!(
+            p3.warnings.iter().any(|w| w.contains("lacks --seed")),
+            "{:?}",
+            p3.warnings
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn sd_tuning_flags() -> BTreeSet<String> {
+        [
+            "--diffusion-model",
+            "--vae",
+            "--llm",
+            "--seed",
+            "--cfg-scale",
+            "--sampling-method",
+            "--flow-shift",
+            "--width",
+            "--height",
+            "--cache-mode",
+            "--fa",
+            "--vae-tiling",
+            "--rpc-servers",
+            "--sage-attn",
+            "--cache-option",
+            "--max-vram",
+            "--params-backend",
+            "--split-mode",
+            "--tae",
+            "--conditioning-cache-size",
+            "--model-args",
+            "--tensor-type-rules",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    /// Placeholder VAE/TE component files in a per-test temp dir (tests
+    /// run in parallel, so each caller tags its own dir). Returns owned
+    /// paths; callers build `ComponentArg`s borrowing them.
+    fn sdcpp_tuning_fixture(
+        tag: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("blazar-sdcpp-tuning-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let vae = dir.join("vae.safetensors");
+        let llm = dir.join("te.gguf");
+        std::fs::write(&vae, b"v").unwrap();
+        std::fs::write(&llm, b"t").unwrap();
+        (dir, vae, llm)
+    }
+
+    #[test]
+    fn unit__compile_sdcpp__tuning_knobs_defaults_emit_fa_only() {
+        // Flash attention ships on by default (measured 25% faster at
+        // identical quality); every other knob stays opt-in — an unset
+        // cache mode / vae-tiling / rpc keeps the argv free of its flag.
+        let (dir, vae, llm) = sdcpp_tuning_fixture("off");
+        let g = meta();
+        let hw = gpu_hw(16_384, 32_000, 8);
+        let set = [
+            ComponentArg::new("--vae", vae.to_str().unwrap()),
+            ComponentArg::new("--llm", llm.to_str().unwrap()),
+        ];
+        let cfg = Config::default();
+        let sd_flags = sd_tuning_flags();
+        let mut inp = input(&g, &hw, &cfg, &sd_flags);
+        inp.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        inp.components = &set;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv.iter().any(|a| a == "--fa"),
+            "--fa missing from defaults: {:?}",
+            p.argv
+        );
+        for absent in [
+            "--cache-mode",
+            "--vae-tiling",
+            "--rpc-servers",
+            "--sage-attn",
+            "--cache-option",
+            "--max-vram",
+            "--params-backend",
+            "--split-mode",
+            "--tae",
+            "--conditioning-cache-size",
+            "--model-args",
+            "--tensor-type-rules",
+        ] {
+            assert!(
+                !p.argv.iter().any(|a| a == absent),
+                "{absent} in {:?}",
+                p.argv
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unit__compile_sdcpp__tuning_knobs_emitted_and_gated() {
+        // Every set knob lands on the argv manifest-gated, and an engine
+        // lacking a flag degrades to a warning instead of dying.
+        let (dir, vae, llm) = sdcpp_tuning_fixture("set");
+        let g = meta();
+        let hw = gpu_hw(16_384, 32_000, 8);
+        let set = [
+            ComponentArg::new("--vae", vae.to_str().unwrap()),
+            ComponentArg::new("--llm", llm.to_str().unwrap()),
+        ];
+        let cfg = Config {
+            sdcpp_cache_mode: Some("easycache".to_string()),
+            sdcpp_flash_attention: true,
+            sdcpp_vae_tiling: true,
+            sdcpp_rpc_servers: vec!["10.0.0.2:50052".to_string(), "10.0.0.3:50052".to_string()],
+            sdcpp_sage_attn: true,
+            sdcpp_cache_option: Some("threshold=0.25,reset=0".to_string()),
+            sdcpp_max_vram: Some("cuda0=8".to_string()),
+            sdcpp_params_backend: Some("diffusion=disk,clip=cpu".to_string()),
+            sdcpp_split_mode: Some("row".to_string()),
+            sdcpp_tae: Some("/models/tae.gguf".to_string()),
+            sdcpp_conditioning_cache_size: Some(8),
+            sdcpp_model_args: Some("qwen_image_2_1_prefix_cache=true".to_string()),
+            sdcpp_tensor_type_rules: Some("model.=q6_k".to_string()),
+            ..Config::default()
+        };
+        let sd_flags = sd_tuning_flags();
+        let mut inp = input(&g, &hw, &cfg, &sd_flags);
+        inp.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        inp.components = &set;
+        inp.device_hint = Some("CUDA0");
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        for pair in [
+            ["--cache-mode", "easycache"],
+            ["--rpc-servers", "10.0.0.2:50052,10.0.0.3:50052"],
+            ["--cache-option", "threshold=0.25,reset=0"],
+            ["--max-vram", "cuda0=8"],
+            ["--params-backend", "diffusion=disk,clip=cpu"],
+            ["--split-mode", "row"],
+            ["--tae", "/models/tae.gguf"],
+            ["--conditioning-cache-size", "8"],
+            ["--model-args", "qwen_image_2_1_prefix_cache=true"],
+            ["--tensor-type-rules", "model.=q6_k"],
+        ] {
+            assert!(
+                p.argv.windows(2).any(|w| w == pair),
+                "{pair:?} in {:?}",
+                p.argv
+            );
+        }
+        for flag in ["--fa", "--vae-tiling", "--sage-attn"] {
+            assert!(p.argv.iter().any(|a| a == flag), "{flag} in {:?}", p.argv);
+        }
+
+        // Engine without --fa/--sage-attn: warning, not death; the rest still lands.
+        let no_fa: BTreeSet<String> = sd_flags
+            .iter()
+            .filter(|f| **f != "--fa" && **f != "--sage-attn")
+            .cloned()
+            .collect();
+        let mut inp = input(&g, &hw, &cfg, &no_fa);
+        inp.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        inp.components = &set;
+        inp.device_hint = Some("CUDA0");
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.iter().any(|a| a == "--fa"), "{:?}", p.argv);
+        assert!(!p.argv.iter().any(|a| a == "--sage-attn"), "{:?}", p.argv);
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("flash_attention skipped: engine")),
+            "{:?}",
+            p.warnings
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("sage_attn skipped: engine")),
+            "{:?}",
+            p.warnings
+        );
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w == ["--cache-mode", "easycache"]));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unit__compile_sdcpp__sage_attn_skipped_on_non_cuda_device() {
+        // Live-verified posture: the engine treats --sage-attn as FATAL
+        // on Vulkan/Metal/CPU builds (new_sd_ctx_t refuses to boot), so
+        // the knob degrades to a teaching warning off CUDA devices.
+        let (dir, vae, llm) = sdcpp_tuning_fixture("nosage");
+        let g = meta();
+        let hw = gpu_hw(16_384, 32_000, 8);
+        let set = [
+            ComponentArg::new("--vae", vae.to_str().unwrap()),
+            ComponentArg::new("--llm", llm.to_str().unwrap()),
+        ];
+        let cfg = Config {
+            sdcpp_sage_attn: true,
+            ..Config::default()
+        };
+        for hint in [Some("Vulkan1"), Some("Metal"), None] {
+            let sd_flags = sd_tuning_flags();
+            let mut inp = input(&g, &hw, &cfg, &sd_flags);
+            inp.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+            inp.components = &set;
+            inp.device_hint = hint;
+            let p = compile(&inp, &TuningOverrides::default()).unwrap();
+            assert!(
+                !p.argv.iter().any(|a| a == "--sage-attn"),
+                "{hint:?}: {:?}",
+                p.argv
+            );
+            assert!(
+                p.warnings
+                    .iter()
+                    .any(|w| w.contains("sage_attn skipped") && w.contains("CUDA")),
+                "{hint:?}: {:?}",
+                p.warnings
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unit__compile_sdcpp__generation_knobs_user_override_and_threads() {
+        // User extra_args land after the family defaults (sd-server's
+        // last-one-wins parsing takes the user's value); --threads stays
+        // a reserved launch pin in the long spelling; threads tuning
+        // finally reaches the line (the manifest is long-flag-only).
+        let g = meta();
+        let sd_flags: BTreeSet<String> = [
+            "--diffusion-model",
+            "--vae",
+            "--llm",
+            "--seed",
+            "--cfg-scale",
+            "--threads",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let cfg = Config::default();
+        let dir =
+            std::env::temp_dir().join(format!("blazar-sdcpp-gen-knobs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let vae = dir.join("vae.safetensors");
+        let llm = dir.join("te.gguf");
+        std::fs::write(&vae, b"v").unwrap();
+        std::fs::write(&llm, b"t").unwrap();
+        let hw = gpu_hw(16_384, 32_000, 8);
+        let qwen_set = [
+            ComponentArg::new("--vae", vae.to_str().unwrap()),
+            ComponentArg::new("--llm", llm.to_str().unwrap()),
+        ];
+
+        let user_overlay = ModelOverride {
+            extra_args: Some(vec!["--cfg-scale".into(), "2.5".into()]),
+            ..Default::default()
+        };
+        let mut inp = input(&g, &hw, &cfg, &sd_flags);
+        inp.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        inp.components = &qwen_set;
+        inp.overlay = &user_overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        let cfg_positions: Vec<usize> = p
+            .argv
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.as_str() == "--cfg-scale")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(cfg_positions.len(), 2, "{:?}", p.argv);
+        assert_eq!(p.argv[cfg_positions[0] + 1], "4.0", "family default first");
+        assert_eq!(p.argv[cfg_positions[1] + 1], "2.5", "user extra_args last");
+
+        // --threads is a reserved launch pin in the long spelling too.
+        let reserved_overlay = ModelOverride {
+            extra_args: Some(vec!["--threads".into(), "6".into()]),
+            ..Default::default()
+        };
+        let mut inp2 = input(&g, &hw, &cfg, &sd_flags);
+        inp2.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        inp2.components = &qwen_set;
+        inp2.overlay = &reserved_overlay;
+        let err = compile(&inp2, &TuningOverrides::default()).unwrap_err();
+        assert!(err.contains("reserved"), "{err}");
+
+        // Tuning emits the long spelling the manifest actually carries.
+        let tun = TuningOverrides {
+            threads: Some(7),
+            ..Default::default()
+        };
+        let mut inp3 = input(&g, &hw, &cfg, &sd_flags);
+        inp3.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        inp3.components = &qwen_set;
+        let p3 = compile(&inp3, &tun).unwrap();
+        assert!(
+            p3.argv.windows(2).any(|w| w == ["--threads", "7"]),
+            "{:?}",
+            p3.argv
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -1878,7 +1878,7 @@ impl EngineManager {
         self.bus.publish(BlazarEvent::EngineUpdated {
             tag: tag.to_string(),
         });
-        self.prune(&store)?;
+        self.prune(&store, Some(row.kind.as_str()))?;
         Self::registration_notes(
             &store,
             tag,
@@ -1991,21 +1991,25 @@ impl EngineManager {
             .ok_or_else(|| anyhow!("tag {tag} vanished"))
     }
 
-    /// Step back to the previous tag by install time.
+    /// Step back to the previous tag by install time, staying on the
+    /// active engine's kind — see [`rollback_candidate`] for why other
+    /// kinds are never targets.
     pub fn rollback(&self) -> Result<EngineRow> {
         let store = Store::open(&self.dirs)?;
         let engines = store.list_engines()?;
-        let active_idx = engines
+        let active = engines
             .iter()
-            .position(|e| e.active)
+            .find(|e| e.active)
             .ok_or_else(|| anyhow!("no active engine to roll back from"))?;
-        if active_idx + 1 >= engines.len() {
-            return Err(anyhow!(
-                "no older engine to roll back to (active: {})",
-                engines[active_idx].tag
-            ));
-        }
-        let target = engines[active_idx + 1].tag.clone();
+        let target = rollback_candidate(&engines)
+            .map(|e| e.tag.clone())
+            .ok_or_else(|| {
+                anyhow!(
+                    "no older {} engine to roll back to (active: {})",
+                    active.kind,
+                    active.tag
+                )
+            })?;
         drop(store);
         self.use_tag(&target)
     }
@@ -2014,7 +2018,19 @@ impl EngineManager {
     /// never pruned. Fork capability lanes are exempt entirely — see
     /// [`is_fork_lane`]. Returns the freed (tag, bytes) pairs for the
     /// summary, mirroring [`Self::prune_siblings`].
-    pub fn prune(&self, store: &Store) -> Result<Vec<(String, u64)>> {
+    ///
+    /// `changed_kind` scopes the sweep: `Some(kind)` (registration-time
+    /// auto path) only retires rows of the lane that just changed, while
+    /// `None` (manual `engine prune`) sweeps every lane as before. The
+    /// active flag is a GLOBAL single slot, so the moment lane B
+    /// registers and claims it, lane A's newest rows lose their only
+    /// cross-kind protection — a mistralrs install could then retire the
+    /// CUDA llama.cpp anchor purely because it happened to be lane A's
+    /// third-newest row (live incident 2026-09-26: `engine install
+    /// v0.9.3 --kind mistralrs` pruned the active b11193-cuda). Other
+    /// lanes keep their own retention moment: their next own-lane
+    /// registration or a manual prune.
+    pub fn prune(&self, store: &Store, changed_kind: Option<&str>) -> Result<Vec<(String, u64)>> {
         let engines = store.list_engines()?; // newest first
         let active = engines.iter().find(|e| e.active).map(|e| e.tag.clone());
         // Retention is scoped per engine KIND: a mistral.rs build is never
@@ -2027,6 +2043,14 @@ impl EngineManager {
             std::collections::BTreeMap::new();
         let mut freed = Vec::new();
         for e in &engines {
+            // Registration-time retention only touches the lane that just
+            // changed; rows of other lanes are skipped before slot
+            // counting so an away-lane active flag cannot strand them.
+            if let Some(kind) = changed_kind {
+                if e.kind.as_str() != kind {
+                    continue;
+                }
+            }
             // A user-installed fork lane never consumes a mainstream
             // retention slot: skipping BEFORE the count keeps KEEP_TAGS
             // reserved for upstream currency.
@@ -2858,6 +2882,70 @@ pub fn verify_engine_binary(
             .is_some_and(|b| {
                 exec_version_probe(&b, &["--help"], std::time::Duration::from_secs(15))
             }),
+    }
+}
+
+/// The rollback target for a newest-first engine list (the order
+/// [`Store::list_engines`] returns): the next-older row of the ACTIVE
+/// row's kind. Kinds are separate universes — a text-lane rollback once
+/// stepped onto the whisper voice-lane row and silently deactivated
+/// serving (live incident 2026-09-26: `engine rollback` crossed into
+/// `b5130/whisper` while the user expected a llama.cpp step).
+#[must_use]
+pub fn rollback_candidate(engines: &[EngineRow]) -> Option<&EngineRow> {
+    let active = engines.iter().find(|e| e.active)?;
+    engines
+        .iter()
+        .filter(|e| e.kind == active.kind)
+        .skip_while(|e| !e.active)
+        .nth(1)
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    #![allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    use super::*;
+
+    fn row(tag: &str, installed_at: i64, active: bool, kind: EngineKind) -> EngineRow {
+        EngineRow {
+            tag: tag.to_string(),
+            asset: String::new(),
+            sha256: String::new(),
+            installed_at,
+            active,
+            manifest: String::new(),
+            kind,
+        }
+    }
+
+    /// 2026-09-26 incident pin: a text-lane rollback stepped onto the
+    /// whisper voice-lane row (b5130) and silently deactivated text
+    /// serving. Cross-kind rows must be skipped, never targeted.
+    #[test]
+    fn unit__rollback_candidate__cross_kind_rows_are_never_targets() {
+        // Newest-first, exactly the order list_engines returns.
+        let engines = vec![
+            row("b11193-cuda", 400, true, EngineKind::LlamaCpp),
+            row("b5130", 350, false, EngineKind::Whisper),
+            row("master-919", 300, false, EngineKind::SdCpp),
+            row("local", 200, false, EngineKind::LlamaCpp),
+        ];
+        assert_eq!(
+            rollback_candidate(&engines).map(|e| e.tag.as_str()),
+            Some("local")
+        );
+
+        // Only cross-kind rows below the active one: no same-kind
+        // target exists — the caller must refuse, not cross kinds.
+        let voice_only_below = vec![
+            row("b11193-cuda", 400, true, EngineKind::LlamaCpp),
+            row("b5130", 350, false, EngineKind::Whisper),
+        ];
+        assert!(rollback_candidate(&voice_only_below).is_none());
+
+        // No active row: nothing to roll back from.
+        let no_active = vec![row("b11193-cuda", 400, false, EngineKind::LlamaCpp)];
+        assert!(rollback_candidate(&no_active).is_none());
     }
 }
 

@@ -48,6 +48,10 @@
 #                              qwen2.5:0.5b) — opt-in, never defaulted
 #   BLAZAR_SYSTEM_BIN_DIR     binary destination (default /usr/local/bin)
 #   BLAZAR_SERVICE_USER/GROUP unit user/group (default: invoking user)
+#   BLAZAR_SERVICE_DATA_DIR   unit WorkingDirectory + ownership-heal
+#                              target (default: the service user's
+#                              ~/.local/share/blazar; test redirection
+#                              knob, like BLAZAR_UNIT_PATH)
 #   GITHUB_TOKEN               optional API token (rate limits, private repos)
 
 # Wrap everything in main() so a truncated partial download cannot execute
@@ -633,8 +637,18 @@ install_system() {
         MH_LINE=
         [ -n "$MEMORY_HIGH" ] && MH_LINE="MemoryHigh=$MEMORY_HIGH"
         SVC_HOME=$(getent passwd "$SVC_USER" | cut -d: -f6)
-        SVC_DATA_DIR=${SVC_HOME}/.local/share/blazar
+        # Knob mirrors BLAZAR_UNIT_PATH/BLAZAR_SYSTEM_BIN_DIR: hermetic
+        # tests redirect the service data dir away from the real home.
+        SVC_DATA_DIR="${BLAZAR_SERVICE_DATA_DIR:-${SVC_HOME}/.local/share/blazar}"
         $SUDO mkdir -p "$SVC_DATA_DIR"
+        # The unit runs unprivileged as SVC_USER, and the daemon must
+        # create run/, locks and pull models inside this tree. The mkdir
+        # above ran as root — and past sudo-run daemons may have left
+        # root-owned files deeper down — so hand the whole tree to the
+        # service user unconditionally (metadata-only, cheap even on
+        # large model stores). Without this the daemon dies with EACCES
+        # on its first write and systemd restart-loops it.
+        $SUDO chown -R "$SVC_USER:$SVC_GROUP" "$SVC_DATA_DIR"
         $SUDO mkdir -p "$(dirname "$UNIT_PATH")"
         UNIT=$(cat <<EOF
 [Unit]

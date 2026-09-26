@@ -55,10 +55,11 @@ const PLAIN_GENERATION_KEYS: [&str; 8] = [
     "model", "prompt", "size", "steps", "n", "user", "async", "stream",
 ];
 
-/// One `SSE` poll per second; 900 polls ≈ 15 minutes of relay before
-/// the gateway gives up (the state client bounds each poll itself).
+/// One `SSE` poll per second. A single failed poll is a transport
+/// hiccup, not child death — three CONSECUTIVE failures (≈3s) declare
+/// it, matching the evict-and-retry-once tolerance of the header lane.
 const JOB_POLL_INTERVAL_MS: u64 = 1_000;
-const JOB_POLL_MAX: u32 = 900;
+const JOB_POLL_TRANSPORT_RETRIES: u32 = 3;
 
 fn is_plain_generation_request(v: &serde_json::Value) -> bool {
     v.as_object().is_some_and(|o| {
@@ -176,6 +177,19 @@ fn gate_size(v: &serde_json::Value) -> (u64, u64) {
         .unwrap_or(VIDEO_DEFAULT_SIZE)
 }
 
+/// Frame count the gate prices: the request's own `video_frames` when
+/// it names one (`frames`/`num_frames`/`duration`×fps were canonicalized
+/// onto it upstream), else the calibration horizon. The child's default
+/// for a fully unspecified `vid_gen` is not contracted anywhere — its CLI
+/// flag says 1, but bare live renders have delivered multi-frame video —
+/// and a safety gate must not undersell the one dimension it cannot
+/// know. Naming frames explicitly prices exactly that count.
+fn gate_frames(v: &serde_json::Value) -> u64 {
+    v.get("video_frames")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(VIDEO_SCRATCH_CALIBRATED_FRAMES)
+}
+
 /// Submit-time gate: refuse video requests whose measured scratch
 /// envelope cannot fit the card's FREE memory right now (a warm child's
 /// weights are already inside "used", a cold spawn's are not). `Ok(())`
@@ -206,10 +220,7 @@ fn video_scratch_gate(
         return Ok(());
     };
     let (w, h) = gate_size(parsed);
-    let frames = parsed
-        .get("video_frames")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(1);
+    let frames = gate_frames(parsed);
     let cold = live_sdcpp_children(state, Some(model)).is_empty();
     let est = estimate_video_scratch(frames, w, h, cold);
     let budget = (free as f64 * VIDEO_VRAM_HEADROOM_FRACTION) as u64;
@@ -476,25 +487,6 @@ pub(crate) fn images_gate(
     ImagesGate::Serve
 }
 
-/// Per-key admission + shape checks shared by both routes; `Err` is a
-/// ready response. Shape gates run BEFORE admission so malformed input
-/// never loads a model.
-fn admit_or_respond(
-    state: &AppState,
-    key_ext: Option<&axum::Extension<crate::keys::KeyCtx>>,
-    model: &str,
-) -> Result<(), Box<Response>> {
-    if let Some(axum::Extension(k)) = key_ext {
-        if let Some(entry) = state.keys.entry(&k.name) {
-            if let Err(rej) = state.keys.check(&entry, model) {
-                return Err(Box::new(rej.to_response()));
-            }
-            state.keys.charge_request(&k.name);
-        }
-    }
-    Ok(())
-}
-
 /// Forward the (already gated) request bytes to the child's same-named
 /// OpenAI-compat route and relay the JSON answer. Errors mirror the
 /// responses-lane shapes: transport failure reaps, non-2xx relays the
@@ -512,7 +504,10 @@ async fn forward_images(
     // instead of a 502 the client never caused. Same contract as the
     // proxy text-lane forward.
     let upstream = crate::proxy::send_with_child_retry(state, engine, |eng| {
-        let mut rb = crate::state::child_client(state, &eng.endpoint)
+        // Media client: this forward holds the request open for the
+        // whole render — a total timeout here is the binding ceiling
+        // long before the child's own lanes fire.
+        let mut rb = crate::state::media_child_client(state, &eng.endpoint)
             .post(format!("{}{path}", child_base(&eng.endpoint)));
         if let Some(ct) = content_type {
             rb = rb.header(header::CONTENT_TYPE, ct);
@@ -553,7 +548,7 @@ pub async fn generations(
     let Some(model) = crate::audit::extract_model(&body) else {
         return openai_error(400, "\"model\" is required (diffusion model name)");
     };
-    if let Err(resp) = admit_or_respond(&state, key_ext.as_ref(), &model) {
+    if let Err(resp) = state.admit_or_respond(key_ext.as_ref(), &model) {
         return *resp;
     }
     let parsed: serde_json::Value = match serde_json::from_slice(&body) {
@@ -647,6 +642,11 @@ async fn deliver_native(
         DeliveryMode::AsyncNative => async_handle_response(submitted, load_ms),
         DeliveryMode::StreamNative => stream_native_job(state, engine, job_id.to_string()),
         DeliveryMode::SyncNative => {
+            // Keep the child non-idle for the whole await (audit MM5):
+            // the poll loop below bypasses `ensure`, so this bracket is
+            // the only thing telling the reaper a render is in flight.
+            let _activity =
+                ChildActivityGuard::begin(std::sync::Arc::clone(&state.sup), &engine.name);
             let job = match await_native_job(&state, &engine, job_id).await {
                 Ok(j) => j,
                 Err(resp) => return *resp,
@@ -691,7 +691,7 @@ pub async fn video_generations(
     let Some(model) = crate::audit::extract_model(&body) else {
         return openai_error(400, "\"model\" is required (video diffusion model name)");
     };
-    if let Err(resp) = admit_or_respond(&state, key_ext.as_ref(), &model) {
+    if let Err(resp) = state.admit_or_respond(key_ext.as_ref(), &model) {
         return *resp;
     }
     let mut parsed: serde_json::Value = match serde_json::from_slice(&body) {
@@ -708,19 +708,23 @@ pub async fn video_generations(
     if let Err(msg) = canonicalize_video_frames(&mut parsed) {
         return openai_error(400, &msg);
     }
-    if let Err(msg) = video_scratch_gate(&parsed, &model, &state) {
-        return openai_error(400, &msg);
-    }
-    // The lever is gateway-only vocabulary; it never rides to the child.
-    if let Some(obj) = parsed.as_object_mut() {
-        obj.remove("vram_overcommit");
-    }
+    // Family gate BEFORE the VRAM scratch gate (audit MM10): a wrong-
+    // family request (image set on the video route) must hear the lane
+    // teaching first — complying with VRAM levers (fewer frames, smaller
+    // size) could never fix a family mismatch, so that error order lied.
     let row = state
         .with_store(|s| resolve_model(s, &model).ok())
         .flatten();
     match images_gate(row.as_ref(), Surface::VidGen) {
         ImagesGate::Serve => {}
         ImagesGate::Reject(msg) => return openai_error(400, &msg),
+    }
+    if let Err(msg) = video_scratch_gate(&parsed, &model, &state) {
+        return openai_error(400, &msg);
+    }
+    // The lever is gateway-only vocabulary; it never rides to the child.
+    if let Some(obj) = parsed.as_object_mut() {
+        obj.remove("vram_overcommit");
     }
     let (engine, load_ms) = match ensure_with_admission(
         &state,
@@ -776,7 +780,7 @@ pub async fn edits(
             "\"model\" form field is required (diffusion model name)",
         );
     };
-    if let Err(resp) = admit_or_respond(&state, key_ext.as_ref(), &model) {
+    if let Err(resp) = state.admit_or_respond(key_ext.as_ref(), &model) {
         return *resp;
     }
     let row = state
@@ -863,6 +867,34 @@ async fn submit_native_job(
         .map_err(|e| Box::new(openai_error(502, &format!("bad engine response: {e}"))))
 }
 
+/// Holds supervision activity for a native job's poll lifetime. Sync
+/// and stream renders poll the child DIRECTLY (not through `ensure`),
+/// so the supervisor's idle clock never sees them: without this bracket
+/// the reaper can evict the child mid-render once `media_job_wait_secs`
+/// outruns `idle_timeout_secs` (audit MM5). Same begin/end bracket the
+/// text lanes hold via `InFlightGuard` — begin marks in-flight (the
+/// reaper never evicts under load) and both ends refresh `last_used`.
+struct ChildActivityGuard {
+    sup: std::sync::Arc<blazar_runtime::Supervisor>,
+    name: String,
+}
+
+impl ChildActivityGuard {
+    fn begin(sup: std::sync::Arc<blazar_runtime::Supervisor>, name: &str) -> Self {
+        sup.begin_request(name);
+        Self {
+            sup,
+            name: name.to_string(),
+        }
+    }
+}
+
+impl Drop for ChildActivityGuard {
+    fn drop(&mut self) {
+        self.sup.end_request(&self.name);
+    }
+}
+
 /// One poll of the child's job state; `Err` = transport/decode
 /// failure (child died mid-poll), `Ok(None)` = HTTP 404 from the
 /// child (job unknown there).
@@ -888,6 +920,23 @@ async fn poll_child_job(
         return Err(());
     }
     serde_json::from_str(&text).map_err(|_| ())
+}
+
+/// Best-effort child-side cancel (stream disconnect). The upstream
+/// endpoint resets the connection after the cancel lands (probe
+/// 2026-09-22, see `jobs_cancel`) — any transport failure here is
+/// treated as taken-effect, never worth surfacing.
+async fn cancel_child_job(state: &AppState, engine: &blazar_runtime::EngineRef, job_id: &str) {
+    let url = format!(
+        "{}/sdcpp/v1/jobs/{job_id}/cancel",
+        child_base(&engine.endpoint)
+    );
+    let _ = child_auth(
+        crate::state::child_client(state, &engine.endpoint).post(&url),
+        engine,
+    )
+    .send()
+    .await;
 }
 
 /// Map a completed native job to the `OpenAI` images shape the sync
@@ -930,17 +979,37 @@ fn native_job_to_openai(job: &serde_json::Value) -> serde_json::Value {
 }
 
 /// Wait for a submitted job until terminal (completed/failed/
-/// cancelled) or the poll budget is spent. `Ok(job)` = terminal job;
-/// `Err` = child died or budget exhausted (ready 502/504 response).
+/// cancelled) or the configured wait budget (`media_job_wait_secs`;
+/// 0 = no gateway cap) is spent. `Ok(job)` = terminal job; `Err` =
+/// child died or budget exhausted (ready 502/504 response).
 async fn await_native_job(
     state: &AppState,
     engine: &blazar_runtime::EngineRef,
     job_id: &str,
 ) -> Result<serde_json::Value, Box<Response>> {
-    for _ in 0..JOB_POLL_MAX {
+    let budget_secs = state.config.media_job_wait_secs;
+    let mut polled = 0_u64;
+    let mut transport_fails = 0_u32;
+    loop {
+        if budget_secs != 0 && polled >= budget_secs {
+            // The client walk away at the budget, but the child keeps
+            // rendering — cancel it instead of burning the GPU on an
+            // answer nobody will read (best-effort; upstream reset
+            // probe 2026-09-22).
+            cancel_child_job(state, engine, job_id).await;
+            return Err(Box::new(openai_error(
+                504,
+                &format!(
+                    "generation did not finish within {budget_secs}s — raise media_job_wait_secs \
+                     or use \"async\": true and poll the job handle"
+                ),
+            )));
+        }
         tokio::time::sleep(std::time::Duration::from_millis(JOB_POLL_INTERVAL_MS)).await;
+        polled += 1;
         match poll_child_job(state, engine, job_id).await {
             Ok(Some(job)) => {
+                transport_fails = 0;
                 let status = job.get("status").and_then(serde_json::Value::as_str);
                 if matches!(status, Some("completed" | "failed" | "cancelled")) {
                     return Ok(job);
@@ -953,23 +1022,24 @@ async fn await_native_job(
                 )));
             }
             Err(()) => {
-                state.sup.reap_dead_children().await;
-                return Err(Box::new(openai_error(
-                    502,
-                    "engine child died mid-generation",
-                )));
+                transport_fails += 1;
+                if transport_fails >= JOB_POLL_TRANSPORT_RETRIES {
+                    state.sup.reap_dead_children().await;
+                    return Err(Box::new(openai_error(
+                        502,
+                        "engine child died mid-generation",
+                    )));
+                }
+                // One failed poll is a hiccup, not death — keep polling.
             }
         }
     }
-    Err(Box::new(openai_error(
-        504,
-        &format!("generation did not finish within {JOB_POLL_MAX} polls"),
-    )))
 }
 
 /// `SSE` relay: progress events every poll, one terminal event, then
-/// close. The spawned task stops on client disconnect (send fails)
-/// or child death.
+/// close. The spawned task stops on client disconnect (send fails —
+/// and cancels the child job so nobody pays GPU for an uncollected
+/// render), child death, or the `media_job_wait_secs` budget.
 fn stream_native_job(
     state: Arc<AppState>,
     engine: blazar_runtime::EngineRef,
@@ -977,10 +1047,64 @@ fn stream_native_job(
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     tokio::spawn(async move {
-        for _ in 0..JOB_POLL_MAX {
-            tokio::time::sleep(std::time::Duration::from_millis(JOB_POLL_INTERVAL_MS)).await;
-            let Ok(Some(job)) = poll_child_job(&state, &engine, &job_id).await else {
+        // Same bracket as the sync arm (audit MM5): the relay's poll
+        // loop must read as activity for as long as it runs, or the
+        // reaper can idle-evict the child under a long stream.
+        let _activity = ChildActivityGuard::begin(std::sync::Arc::clone(&state.sup), &engine.name);
+        let budget_secs = state.config.media_job_wait_secs;
+        let mut polled = 0_u64;
+        let mut transport_fails = 0_u32;
+        loop {
+            if budget_secs != 0 && polled >= budget_secs {
+                // Same policy as the sync await path: the client is
+                // gone at budget expiry, so stop the render instead of
+                // burning the GPU to completion (best-effort cancel).
+                cancel_child_job(&state, &engine, &job_id).await;
+                let msg = format!(
+                    "generation did not finish within {budget_secs}s — raise \
+                     media_job_wait_secs or use \"async\": true"
+                );
+                let frame = format!(
+                    "event: error\ndata: {}\n\n",
+                    serde_json::json!({"status": "error", "error": {"message": msg}})
+                );
+                let _ = tx.send(Ok(Bytes::from(frame))).await;
                 break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(JOB_POLL_INTERVAL_MS)).await;
+            polled += 1;
+            let job = match poll_child_job(&state, &engine, &job_id).await {
+                Ok(Some(job)) => {
+                    transport_fails = 0;
+                    job
+                }
+                Ok(None) => {
+                    let frame = format!(
+                        "event: error\ndata: {}\n\n",
+                        serde_json::json!({
+                            "status": "error",
+                            "error": {"message": "job vanished from the engine child mid-generation"}
+                        })
+                    );
+                    let _ = tx.send(Ok(Bytes::from(frame))).await;
+                    break;
+                }
+                Err(()) => {
+                    transport_fails += 1;
+                    if transport_fails >= JOB_POLL_TRANSPORT_RETRIES {
+                        let frame = format!(
+                            "event: error\ndata: {}\n\n",
+                            serde_json::json!({
+                                "status": "error",
+                                "error": {"message": "engine child died mid-generation"}
+                            })
+                        );
+                        let _ = tx.send(Ok(Bytes::from(frame))).await;
+                        break;
+                    }
+                    // One failed poll is a hiccup, not death — keep polling.
+                    continue;
+                }
             };
             let status = job.get("status").and_then(serde_json::Value::as_str);
             let terminal = matches!(status, Some("completed" | "failed" | "cancelled"));
@@ -1001,7 +1125,10 @@ fn stream_native_job(
             };
             let frame = format!("event: {event}\ndata: {payload}\n\n");
             if tx.send(Ok(Bytes::from(frame))).await.is_err() {
-                break; // client went away
+                // Client went away mid-render: stop paying GPU for a
+                // clip nobody will collect.
+                cancel_child_job(&state, &engine, &job_id).await;
+                break;
             }
             if terminal {
                 break;
@@ -1073,7 +1200,14 @@ pub async fn jobs_get(
         );
     }
     for engine in &children {
-        if let Ok(Some(job)) = poll_child_job(&state, engine, &job_id).await {
+        // Every client poll counts as activity (audit MM5): async jobs
+        // have no gateway-side bracket, so an actively-polled job keeps
+        // its child warm; once the client stops polling, normal idle
+        // eviction applies (the documented die-with-child contract).
+        state.sup.begin_request(&engine.name);
+        let polled = poll_child_job(&state, engine, &job_id).await;
+        state.sup.end_request(&engine.name);
+        if let Ok(Some(job)) = polled {
             return Response::builder()
                 .status(200)
                 .header(header::CONTENT_TYPE, "application/json")
@@ -1187,15 +1321,20 @@ pub async fn jobs_cancel(
     }
 }
 
-/// GET /v1/images/capabilities — the live child's sampler/cache/LoRA
-/// menu. Read-only: boots nothing; no live child teaches instead.
-pub async fn capabilities(State(state): State<Arc<AppState>>) -> Response {
-    let children = live_sdcpp_children(&state, None);
+/// GET /v1/images/capabilities?model=NAME — the live child's sampler/
+/// cache/LoRA menu. Read-only: boots nothing; no live child teaches
+/// instead. `?model=` narrows to that family's child — on a multi-family
+/// box the first live child is otherwise an arbitrary pick (audit MM3).
+pub async fn capabilities(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<JobQuery>,
+) -> Response {
+    let children = live_sdcpp_children(&state, params.model.as_deref());
     let Some(engine) = children.first() else {
         return openai_error(
             400,
             "no live diffusion child — POST /v1/images/generations boots one, \
-             then capabilities serve",
+             then capabilities serve (pass ?model=NAME to pick a family's child)",
         );
     };
     let url = format!("{}/sdcpp/v1/capabilities", child_base(&engine.endpoint));
@@ -1504,6 +1643,27 @@ mod tests {
         assert_eq!(gate_size(&serde_json::json!({})), (512, 512));
         assert_eq!(gate_size(&serde_json::json!({"size": "big"})), (512, 512));
         assert_eq!(gate_size(&serde_json::json!({"size": "0x0"})), (512, 512));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__gate_frames__absent_priced_at_calibration_horizon() {
+        // The child's default for an unspecified vid_gen is not
+        // contracted (CLI flag says 1, live bare renders delivered
+        // multi-frame) — a safety gate must not undersell what it
+        // cannot know. Explicit counts price exactly what was asked.
+        assert_eq!(gate_frames(&serde_json::json!({})), 33);
+        assert_eq!(
+            gate_frames(&serde_json::json!({"video_frames": 1})),
+            1,
+            "explicit 1 is the user's call, priced as asked"
+        );
+        assert_eq!(gate_frames(&serde_json::json!({"video_frames": 81})), 81);
+        assert_eq!(
+            gate_frames(&serde_json::json!({"video_frames": "33"})),
+            33,
+            "string numerals are not u64 — priced at the horizon"
+        );
     }
 
     #[test]

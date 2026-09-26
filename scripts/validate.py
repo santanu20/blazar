@@ -67,17 +67,73 @@ def _free_port() -> int:
 # never collide on the main listener (live 2026-09-10 cross-run 502s);
 # BLAZAR_VALIDATE_PORT still pins an explicit port when set.
 PORT = int(os.environ.get("BLAZAR_VALIDATE_PORT") or _free_port())
+REAL_DATA = os.path.expanduser("~/.local/share/blazar")
+REAL_CONFIG = os.path.expanduser("~/.config/blazar/config.toml")
+MEM_FLOOR_MIB = 1536
+
+
+def _store_model_rows() -> list[str]:
+    """Names in the REAL store (the sandbox copies this DB verbatim)."""
+    try:
+        db = sqlite3.connect(os.path.join(REAL_DATA, "blazar.db"))
+        try:
+            return [r[0] for r in db.execute("SELECT name FROM models")]
+        finally:
+            db.close()
+    except Exception:
+        return []
+
+
+def _listed_model_names(list_stdout: str) -> set[str]:
+    """NAME column of `blazar list` output (header skipped).
+
+    The listing is columnar (NAME QUANT SIZE VISION ARCH CTX TYPE
+    CATEGORY ENGINE); a raw whitespace-token diff leaks other columns'
+    words (the ARCH column once fed `pull qwen3 --verify` a name that
+    resolves to no store row). Store names never contain spaces.
+    """
+    names = set()
+    for line in list_stdout.splitlines()[1:]:
+        parts = line.split()
+        if parts:
+            names.add(parts[0])
+    return names
+
+
+def _resolve_store_row(name: str) -> tuple[str, str]:
+    """Map a requested model name to the store row that will serve it.
+
+    The gateway resolves request names exact -> unique bare prefix
+    (proxy.rs ladder) and keys the INSTANCE (pidfile, /api/ps row name)
+    by the resolved row. The harness must probe that row name or every
+    instance-keyed check misses while serving still passes — the fixture
+    inventory drifts (rows get re-pulled under fuller names), so a
+    hardcoded default rots. Mirrors the product ladder: exact match
+    wins, one prefix match adopts the row name, ambiguity/miss keeps
+    the raw name (phases fail loudly with the store listing).
+    """
+    rows = _store_model_rows()
+    if name in rows or not rows:
+        return name, ""
+    prefixed = [r for r in rows if r.startswith(name)]
+    if len(prefixed) == 1:
+        return prefixed[0], f"{name} -> store row {prefixed[0]} (unique prefix)"
+    return name, (
+        f"no exact store row '{name}' (candidates: {', '.join(sorted(rows))})"
+        if not prefixed
+        else f"'{name}' is an ambiguous prefix of {prefixed} (pass BLAZAR_VALIDATE_MODEL)"
+    )
+
+
 # Fast default: the 0.5B keeps every lane quick; BLAZAR_VALIDATE_MODEL
-# overrides (e.g. release-grade runs pinning the 9B). The name is the
-# CANONICAL store row ("qwen2.5-0.5b" — rows are tagless; the display
-# form is name:quant). The earlier "qwen2.5-0.5b-instruct" fixture
-# silently drifted when the sglang wave re-pulled that row as a bf16
-# safetensors DIRECTORY (no GGUF twin exists locally), making every
-# llamacpp chat lane 500 on "gguf metadata: Is a directory". Canonical
-# names also key model_overrides and model_bytes_mib's SQL lookup
-# exactly. No phase depends on instruct-ness of the fixture
-# (think/template lanes pin their own models).
-MODEL = os.environ.get("BLAZAR_VALIDATE_MODEL", "qwen2.5-0.5b")
+# overrides (e.g. release-grade runs pinning the 9B). The default is
+# resolved against the store at import so def-time default args
+# (child_pid/wait_loaded bind MODEL at definition) carry the ROW name;
+# the raw request dialect keeps its own coverage via the explicit
+# prefix-alias routing check in phase 3.
+MODEL, _MODEL_NOTE = _resolve_store_row(
+    os.environ.get("BLAZAR_VALIDATE_MODEL", "qwen2.5-0.5b")
+)
 # Second DISTINCT model for lanes that structurally need two models live at
 # once (wave battery B predictive preload, mmproj projector attach). Separate
 # from MODEL so the fast default stays small without collapsing those lanes.
@@ -99,9 +155,6 @@ elif os.path.exists(_REPO_BIN):
     PAL = _REPO_BIN
 else:
     PAL = shutil.which("blazar") or "blazar"
-REAL_DATA = os.path.expanduser("~/.local/share/blazar")
-REAL_CONFIG = os.path.expanduser("~/.config/blazar/config.toml")
-MEM_FLOOR_MIB = 1536
 
 CHECKS: list[dict] = []
 COVERAGE: list[dict] = []
@@ -1038,7 +1091,7 @@ TOPLEVEL_COMMANDS = sorted(
 )
 
 # ---------------------------------------------------------------------------
-# TOPLEVEL_KNOBS manifest: all 145 Config fields.
+# TOPLEVEL_KNOBS manifest: all 171 Config fields.
 # option=True  -> Option<T>, absent from fresh `config list` until set
 # container=True -> keys / remotes / engine_env / model_overrides section
 # tier  -> evidence class (see module docstring); group -> knobs_argv batch
@@ -1079,6 +1132,57 @@ _K = [
         "roundtrip",
         None,
         "daemon whisper idle reaper; set->list echo + full-manifest boot",
+    ),
+    # sdcpp parity knobs (stable-diffusion.cpp lane): accepted at boot and
+    # echoed by config list; child-argv proof lives in the media phase where
+    # the sdcpp model runs.
+    (
+        "media_job_wait_secs",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "media job settle window; set->list echo + full-manifest boot",
+    ),
+    (
+        "sdcpp_child_header_timeout_secs",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "sdcpp child HTTP header timeout; set->list echo + full-manifest boot",
+    ),
+    (
+        "sdcpp_flash_attention",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "sdcpp FA toggle (default on); set->list echo + full-manifest boot",
+    ),
+    (
+        "sdcpp_rpc_servers",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "sdcpp rpc offload endpoints; set->list echo + full-manifest boot",
+    ),
+    (
+        "sdcpp_sage_attn",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "sdcpp SageAttention toggle; set->list echo + full-manifest boot",
+    ),
+    (
+        "sdcpp_vae_tiling",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "sdcpp VAE tiling toggle; set->list echo + full-manifest boot",
     ),
     (
         "max_loaded_models",
@@ -1718,14 +1822,6 @@ _K = [
         "boundary",
         None,
         "sglang engine tuning section (all-Option leaves; covered by profile ladder units + live matrix)",
-    ),
-    (
-        "reasoning",
-        False,
-        False,
-        "boundary",
-        None,
-        "server-side reasoning switch string ('' = auto-detect; overlay roundtrip)",
     ),
     # Post-v0.6.0 wave knobs that landed after the last registry sweep:
     # 5 fresh-visible (gate (b) went RED on the first fresh-config-list
@@ -3649,6 +3745,33 @@ def phase_api() -> None:
         st == 200 and isinstance(v, dict) and v.get("choices"),
         f"status={st}",
     )
+    # The request-name ladder (exact -> unique bare prefix, proxy.rs) is a
+    # product lane: clients say "qwen2.5-0.5b" for the -instruct row. MODEL
+    # now probes the resolved ROW name, so exercise the alias dialect
+    # explicitly — this coverage used to ride the drifting default.
+    alias = ""
+    cand = MODEL.rsplit("-", 1)[0] if "-" in MODEL else ""
+    while cand and not alias:
+        if sum(r.startswith(cand) for r in _store_model_rows()) == 1:
+            alias = cand
+        elif "-" in cand:
+            cand = cand.rsplit("-", 1)[0]
+        else:
+            cand = ""
+    if alias:
+        st_a, v_a, _ = chat("Say ok", extra={"model": alias})
+        check(
+            "api",
+            "bare-prefix alias request resolves to the same row",
+            st_a == 200 and isinstance(v_a, dict) and v_a.get("choices"),
+            f"alias={alias} status={st_a}",
+        )
+    else:
+        boundary(
+            "api",
+            "bare-prefix alias routing",
+            "no derivable unique prefix for the fixture row",
+        )
     ok, collected = sse_collect(
         "/v1/chat/completions",
         "[DONE]",
@@ -4928,24 +5051,52 @@ def phase_behavior() -> None:
     else:
         t_low = threading.Thread(target=_pri_track, args=("low", "low", 512))
         t_high = threading.Thread(target=_pri_track, args=("high", "high", 5))
+
         # Near-zero gap: with the holder confirmed generating, BOTH requests
         # must land in the gateway queue together for priority to reorder
         # them. A long gap lets the fast holder finish first, low starts
-        # running, and a running request can never be reordered.
+        # running, and a running request can never be reordered. A fixed
+        # sleep cannot guarantee that: observed live (2026-09-26 run 7,
+        # daemon log plm-1a0dd31d215/8) the low thread reached the
+        # gateway ~1s AFTER the holder's stream had already ended —
+        # thread-start latency under load ate the whole generation
+        # window and low was admitted to a free slot before high
+        # arrived. Gate high's launch on the gateway's own queue gauge
+        # instead of the clock.
+        def _queue_depth() -> int:
+            _, _, raw = http("GET", "/metrics")
+            m = re.search(rb"^blazar_queue_depth (\d+)", raw, re.MULTILINE)
+            return int(m.group(1)) if m else -1
+
         t_low.start()
-        time.sleep(0.05)
-        t_high.start()
+        low_queued = False
+        gate_deadline = time.time() + 15
+        while time.time() < gate_deadline:
+            if _queue_depth() >= 1:
+                low_queued = True
+                break
+            time.sleep(0.05)
+        if low_queued:
+            t_high.start()
         holder.join(timeout=300)
         t_low.join(timeout=300)
         t_high.join(timeout=300)
-        check(
-            "behavior",
-            "x-blazar-priority: high admitted before queued low",
-            order.get("low", (0.0, 0))[1] == 200
-            and order.get("high", (0.0, 0))[1] == 200
-            and order["high"][0] < order["low"][0],
-            f"low={order.get('low')} high={order.get('high')}",
-        )
+        if low_queued:
+            check(
+                "behavior",
+                "x-blazar-priority: high admitted before queued low",
+                order.get("low", (0.0, 0))[1] == 200
+                and order.get("high", (0.0, 0))[1] == 200
+                and order["high"][0] < order["low"][0],
+                f"low={order.get('low')} high={order.get('high')}",
+            )
+        else:
+            boundary(
+                "behavior",
+                "x-blazar-priority: high admitted before queued low",
+                "low never registered in the gateway queue behind the "
+                "holder within 15s (holder window too short this boot)",
+            )
 
     # deadline accounting: a request admitted past its deadline lands in
     # blazar_slo_deadline_exceeded_total (or is 503-rejected — both honor SLO).
@@ -6563,6 +6714,32 @@ def _active_engine_tag() -> str | None:
     return row[0] if row else None
 
 
+def _sandbox_engine_tags() -> list[str]:
+    """Tags currently registered in the SANDBOX store's engines table."""
+    db = _sandbox_db()
+    rows = sorted(r[0] for r in db.execute("SELECT tag FROM engines"))
+    db.close()
+    return rows
+
+
+def _rollback_expectation(anchor: str) -> str | None:
+    """The tag `engine rollback` must step to: the next-older row of the
+    anchor's kind in the sandbox store (product `list_engines` order:
+    newest first). `None` when no same-kind row sits below the anchor —
+    rollback is kind-scoped (a text-lane step once crossed onto the
+    whisper voice lane, 2026-09-26) and must refuse by design."""
+    db = _sandbox_db()
+    rows = db.execute(
+        "SELECT tag, kind FROM engines ORDER BY installed_at DESC, rowid DESC"
+    ).fetchall()
+    db.close()
+    idx = next((i for i, r in enumerate(rows) if r[0] == anchor), None)
+    if idx is None:
+        return None
+    kind = rows[idx][1]
+    return next((r[0] for r in rows[idx + 1 :] if r[1] == kind), None)
+
+
 def _llamacpp_engine_tag() -> str | None:
     """Tag of the engine dir that carries llama.cpp binaries.
 
@@ -6647,18 +6824,26 @@ def _server_engine_tags() -> list[str]:
 
 
 def _store_engine_tags() -> list[str]:
-    """Real engine rows of ANY kind (llamacpp + sglang + mistral.rs).
+    """Real engine rows fit for the switch dance (llamacpp + sglang +
+    mistral.rs + sdcpp).
 
-    `engine use`/`rollback` switch across kinds via activation history
-    (verified live on 2026-09-17: rollback off a freshly built llamacpp
-    engine steps to the sglang row, rc=0), so any real row is a valid
-    dance partner for the switch lanes. The `local` pseudo-tag is
-    excluded — it is a path registration, not a store lane.
+    `engine use` switches across kinds via activation history, so any
+    real row is a valid dance partner for the use lanes; `engine
+    rollback` is kind-scoped (2026-09-26 fix) and derives its own
+    expectation from the sandbox store. The `local` pseudo-tag is
+    excluded — it is a path registration, not a store lane. Voice-lane
+    rows (kind whisper/piper) are excluded too: live-observed 2026-09-26
+    they dance and update-refuse ("release b5130 not found" — whisper
+    builds live in ggml-org/whisper.cpp, invisible to the llamacpp
+    updater), and `engine rm` of the whisper row breaks the later
+    transcribe lanes' "(pinned)" bookkeeping.
     """
     try:
         db = sqlite3.connect(os.path.join(REAL_DATA, "blazar.db"))
         rows = sorted(
-            r[0] for r in db.execute("SELECT tag FROM engines") if r[0] != "local"
+            tag
+            for tag, kind in db.execute("SELECT tag, kind FROM engines")
+            if tag != "local" and kind not in ("whisper", "piper")
         )
         db.close()
         return rows
@@ -6992,7 +7177,7 @@ def phase_commands() -> None:
     # Target BIG: attaching a projector is model-agnostic but the happy lane
     # was proven on the 9B — keep it pinned there even when MODEL is small.
     if src:
-        target = BIG if BIG != MODEL else MODEL
+        target = BIG or MODEL
         # mmproj refuses while the model is loaded; release it first and
         # wait out the async drain (stop returns before unload completes).
         cli("stop", target, check_exit=False)
@@ -7006,6 +7191,8 @@ def phase_commands() -> None:
             p.returncode != 0 and "not a vision projector" in (p.stdout + p.stderr),
             f"rc={p.returncode} err={p.stderr.strip()[:100]}",
         )
+    else:
+        regb("mmproj.refusal", "model path unavailable in store DB")
 
     def _mmproj_happy():
         try:
@@ -7014,7 +7201,7 @@ def phase_commands() -> None:
             url = f"https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct-GGUF/resolve/main/{fname}"
             with urllib.request.urlopen(url, timeout=600) as r, open(dst, "wb") as f:
                 shutil.copyfileobj(r, f)
-            target = BIG if BIG != MODEL else MODEL
+            target = BIG or MODEL
             p = cli("mmproj", target, dst, timeout=300)
             reg(
                 "mmproj.happy",
@@ -7605,10 +7792,11 @@ def phase_commands() -> None:
         # ONE llamacpp build — the >=2-llamacpp dance is only reachable on
         # pre-dedaceb legacy stores. The designed switch dance on a modern
         # store pairs the llamacpp anchor with a real cross-kind engine
-        # row (sglang/mistralrs). `engine rollback` steps to the
-        # NEXT-OLDER row in the install-time list (newest-first), which
-        # crosses kinds naturally — verified live: rollback off a fresh
-        # llamacpp build steps to the sglang row, rc=0.
+        # row (sglang/mistralrs) for the `engine use` lanes. `engine
+        # rollback` itself is KIND-SCOPED (2026-09-26 fix: a text-lane
+        # step once crossed onto the whisper voice lane) — its expected
+        # target is derived independently from the sandbox store in
+        # _engine_full below, not from this dance partner.
         dance = next((t for t in _store_engine_tags() if t != anchor), None)
     # Prefer a plain upstream tag for the pin-update dance so the lane
     # exercises the standard asset path whenever the store has one; a
@@ -7628,13 +7816,11 @@ def phase_commands() -> None:
 
     def _engine_full():
         # Dance order fits rollback's real semantics: `engine rollback`
-        # activates engines[active_idx + 1] in the NEWEST-FIRST install
-        # list, so it must run while the NEWER anchor is active — it then
-        # lands on dance deterministically (anchor is always the newer
-        # row: full/server tags sort by build number desc, and a
-        # cross-kind dance partner is an older install). The historical
-        # order (use dance -> rollback) only worked on 3+-row stores
-        # where another row sat below dance in the list.
+        # activates the next-older SAME-KIND row below the active one in
+        # the newest-first install list (kind-scoped since the
+        # 2026-09-26 whisper-lane incident fix), so it must run while
+        # the anchor is active and its expected target is derived from
+        # the sandbox store — not from the cross-kind dance partner.
         p = cli("engine", "use", dance)
         ok_use = p.returncode == 0 and _active_engine_tag() == dance
         reg("engine.use", ok_use, f"active={_active_engine_tag()}")
@@ -7644,6 +7830,7 @@ def phase_commands() -> None:
             p.returncode == 0 and _active_engine_tag() == anchor,
             f"active={_active_engine_tag()}",
         )
+        expected_rollback = _rollback_expectation(anchor)
         p = cli("engine", "rollback")
         stepped = _active_engine_tag()
         rout = p.stdout + p.stderr
@@ -7653,12 +7840,20 @@ def phase_commands() -> None:
                 "GH API rate limited (403): rollback metadata blocked this "
                 f"window; engine.use dance proves the switch path; err={rout.strip()[:80]}",
             )
+        elif expected_rollback is None:
+            # Designed refusal: no older same-kind engine below the
+            # anchor — the product must say so, never cross kinds.
+            regb(
+                "engine.rollback",
+                f"no older same-kind engine below {anchor}: {rout.strip()[:80]}",
+            )
         else:
             reg(
                 "engine.rollback",
-                p.returncode == 0 and stepped == dance,
+                p.returncode == 0 and stepped == expected_rollback,
                 f"rc={p.returncode} stepped to {stepped} "
-                f"(expected next-older {dance}) out={rout.strip()[:60]}",
+                f"(expected next-older same-kind {expected_rollback}) "
+                f"out={rout.strip()[:60]}",
             )
         p = cli("engine", "use", anchor)
         reg(
@@ -7668,20 +7863,25 @@ def phase_commands() -> None:
         )
         p = cli("engine", "update", update_pick, "--no-gate", timeout=1800)
         eout = p.stdout + p.stderr
+        # Designed teaching refusal: an overlay-shaped tag (-cuda,
+        # self-hosted builds) without BLAZAR_ENGINE_REPO configured
+        # must refuse — the error names the env var and the overlay
+        # repo. Any such refusal is the documented boundary, whatever
+        # the exact phrasing ("overlay repo is not configured", "no
+        # overlay release ...").
         overlay_miss = (
-            update_pick.endswith("-cuda")
-            and p.returncode != 0
-            and "overlay release" in eout
+            p.returncode != 0
             and "BLAZAR_ENGINE_REPO" in eout
+            and "overlay" in eout.lower()
         )
         if overlay_miss:
             regb(
                 "engine.update",
-                "CUDA overlay channel not live yet (no bNNNN-cuda release "
-                f"published in the overlay repo); "
-                f"tag-pinned update to {update_pick} needs a published bNNNN-cuda "
-                "release there — the switch path is proven by engine.use above and "
-                "the channel-update path by live engine-update runs",
+                "overlay-tag update refused by design (no overlay repo "
+                "configured via BLAZAR_ENGINE_REPO); the switch path is "
+                "proven by engine.use above and the channel-update path "
+                f"by live engine-update runs; pick={update_pick} "
+                f"err={eout.strip()[:80]}",
             )
             p = cli("engine", "use", anchor)
             reg(
@@ -7877,7 +8077,10 @@ def phase_commands() -> None:
             listed = cli("engine", "list").stdout
             if dance in listed:
                 p2 = cli("engine", "rm", dance)
-                gone = dance not in cli("engine", "list").stdout
+                # `engine list` prints voice-lane rows too (whisper b-tags
+                # share the engine namespace), so presence must be judged
+                # on the store table, not on raw substring matches.
+                gone = dance not in _sandbox_engine_tags()
                 reg(
                     "engine.rm",
                     p2.returncode == 0 and gone,
@@ -7906,11 +8109,19 @@ def phase_commands() -> None:
     lane("engine.prune", _engine_prune)
 
     def _engine_build():
+        nonlocal anchor
         if disk_free_gb() <= 8:
             regb("engine.build", f"disk free {disk_free_gb():.1f}G <= 8G")
             return
-        # Real source build with the local toolchain (net: clone).
-        p = cli("engine", "build", timeout=3600)
+        # Real source build with the local toolchain (net: clone). CPU
+        # backend: this box has cmake+gcc but no nvcc, and the lane's
+        # job is proving the build path, not the fastest artifacts.
+        # One-build-per-lane contract: build ACTIVATES its tag and
+        # prune_siblings deletes the previous llamacpp builds (the old
+        # anchor included) — "engine update should clean the old
+        # builds". The anchor therefore rolls FORWARD to the built tag,
+        # not back to a tag the prune just deleted.
+        p = cli("engine", "build", "cpu", timeout=3600)
         out = p.stdout + p.stderr
         if p.returncode != 0 and ("cmake" in out.lower() or "toolchain" in out.lower()):
             regb("engine.build", f"no local build toolchain: {out.strip()[:120]}")
@@ -7920,6 +8131,11 @@ def phase_commands() -> None:
             p.returncode == 0,
             f"rc={p.returncode} out={out.strip()[:100]}",
         )
+        if p.returncode == 0:
+            anchor = _active_engine_tag() or anchor
+            print(f"  [engine.build] anchor rolled: {anchor}", flush=True)
+        elif anchor and _active_engine_tag() != anchor:
+            cli("engine", "use", anchor)
 
     lane("engine.build", _engine_build)
 
@@ -7927,14 +8143,21 @@ def phase_commands() -> None:
         if disk_free_gb() <= 8:
             regb("engine.install", f"disk free {disk_free_gb():.1f}G <= 8G")
             return
+        # Prebuilt mistral.rs lane. TAG + --kind only: clap forbids TAG
+        # together with --lane (curated-lane installs are lane-id driven).
+        # v0.9.3 is a real published release (v0.9.4 may already be in
+        # the sandbox store — a re-install of the same tag would skip the
+        # download path this lane exists to exercise). Install ACTIVATES
+        # its tag and prunes same-kind siblings; the anchor here is the
+        # SURVIVING llamacpp build (the built tag after the build lane's
+        # one-per-lane prune) — restoring it keeps later phases spawning
+        # llama-server children, not mistral.rs ones.
         p = cli(
             "engine",
             "install",
-            "mistralrs",
+            "v0.9.3",
             "--kind",
             "mistralrs",
-            "--lane",
-            "prebuilt",
             timeout=1800,
         )
         out = p.stdout + p.stderr
@@ -7948,6 +8171,19 @@ def phase_commands() -> None:
             p.returncode == 0,
             f"rc={p.returncode} out={out.strip()[:100]}",
         )
+        if anchor and _active_engine_tag() != anchor:
+            pu = cli("engine", "use", anchor)
+            print(
+                f"  [engine.install restore] anchor={anchor} "
+                f"active={_active_engine_tag()} use_rc={pu.returncode}",
+                flush=True,
+            )
+        else:
+            print(
+                f"  [engine.install restore SKIPPED] anchor={anchor} "
+                f"active={_active_engine_tag()}",
+                flush=True,
+            )
 
     lane("engine.install", _engine_install)
 
@@ -7972,22 +8208,8 @@ def phase_commands() -> None:
             p.returncode != 0 and "no voice" in (p.stdout + p.stderr).lower(),
             f"rc={p.returncode} err={(p.stderr or p.stdout).strip()[:90]}",
         )
-        # --no-play rides the same no-voice refusal: the flag parses and
-        # routes (no clap error), only the voice precondition stops it.
-        p = cli(
-            "tts",
-            "validation probe",
-            "--no-play",
-            "--out",
-            os.path.join(SANDBOX.root, "tts.wav"),
-        )
-        reg(
-            "flag.tts.--no-play",
-            p.returncode != 0
-            and "no voice" in (p.stdout + p.stderr).lower()
-            and "unexpected" not in (p.stdout + p.stderr).lower(),
-            f"rc={p.returncode} err={(p.stderr or p.stdout).strip()[:90]}",
-        )
+        # --no-play was removed from the product surface (clap rejects it);
+        # the registry entry went with it — see _FLAG_EVIDENCE['tts'].
         # Catalog searches are read-only upstream queries: cheap, no
         # downloads; boundary (not fail) when the network refuses.
         p = cli("tts", "--search", "en", timeout=120)
@@ -8059,9 +8281,9 @@ def phase_commands() -> None:
     lane("tts.install", _tts_heavy, "tts.pull", "tts.synthesize")
 
     def _pull():
-        before = set(cli("list").stdout.split())
+        before = _listed_model_names(cli("list").stdout)
         p = _pull_retry("pull", "ggml-org/Qwen3-0.6B-GGUF")
-        after = set(cli("list").stdout.split())
+        after = _listed_model_names(cli("list").stdout)
         new = {w for w in after - before if "qwen3" in w.lower()}
         err = (p.stderr or "").lower()
         # A double HF-side failure (429/5xx on both attempts) is a transient
@@ -8096,6 +8318,11 @@ def phase_commands() -> None:
                 v.returncode == 0,
                 (v.stdout + v.stderr).strip()[:100],
             )
+        else:
+            regb(
+                "pull.verify",
+                "no fresh row to re-hash this run (pull transient/blocked)",
+            )
         for name in new:
             cli("rm", name)
 
@@ -8109,7 +8336,7 @@ def phase_commands() -> None:
         # `blazar run` on a missing model must auto-pull (same flow as
         # `blazar pull`: progress, locks) and then run it — one-shot
         # prompt mode proves the whole chain parse -> pull -> serve.
-        before = set(cli("list").stdout.split())
+        before = _listed_model_names(cli("list").stdout)
         p = _pull_retry_cmd(
             ["run", "ggml-org/Qwen3-0.6B-GGUF", "Say ok", "--max-tokens", "8"],
             timeout=2400,
@@ -8540,7 +8767,7 @@ def phase_knobs_behavior() -> None:
 
 
 def _full_toplevel() -> dict:
-    """All 146 manifest knobs with benign explicit values (full-manifest boot).
+    """All 171 manifest knobs with benign explicit values (full-manifest boot).
 
     None values = deliberately omitted from the serialized boot config
     (XOR partners / pairing-gated knobs that cannot co-exist): the key
@@ -8578,6 +8805,13 @@ def _full_toplevel() -> dict:
         "idle_sleep_secs": 77,
         "idle_timeout_secs": 500,
         "whisper_idle_secs": 900,
+        # sdcpp parity knobs: config.rs defaults, valid by construction
+        "media_job_wait_secs": 900,
+        "sdcpp_child_header_timeout_secs": 900,
+        "sdcpp_flash_attention": True,
+        "sdcpp_rpc_servers": [],
+        "sdcpp_sage_attn": False,
+        "sdcpp_vae_tiling": False,
         "max_loaded_models": 2,
         # six real knobs surfaced by gate (b) — values are the config.rs
         # defaults, valid by construction
@@ -9822,7 +10056,6 @@ _FLAG_EVIDENCE: dict[str, dict[str, str]] = {
         "--pin": "tts.pin.refusal",
         "--tag": "flag.tts.--tag",
         "--search": "flag.tts.--search",
-        "--no-play": "flag.tts.--no-play",
         "--out": "tts.synthesize",
         "--speed": "tts.synthesize",
     },
@@ -10186,6 +10419,8 @@ def main() -> int:
         f"blazar validation harness — engine+model REAL, isolation via temp XDG, port {PORT}"
     )
     print(f"binary={PAL} model={MODEL} fast={FAST}")
+    if _MODEL_NOTE:
+        print(f"model resolution: {_MODEL_NOTE}")
     # A dead GH_TOKEN is worse than none (401 "Bad credentials" on every
     # authed call: engine-check marker, whisper install, engine update,
     # doctor currency probes). Validate once up front; drop it if invalid

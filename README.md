@@ -9,8 +9,6 @@
 
 **Current release: `0.11.0`**
 
-Blazar was previously named **Pallama**. The project, binary, crates, environment variables, install paths, and public URLs now use the `blazar` name.
-
 ---
 
 ## What is Blazar?

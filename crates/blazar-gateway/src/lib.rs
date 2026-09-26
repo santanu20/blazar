@@ -302,6 +302,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/videos/jobs/{id}/cancel", post(images::jobs_cancel))
         .route("/v1/videos/capabilities", get(images::capabilities))
         .route("/audio/transcriptions", post(whisper::audio_transcriptions))
+        // Non-`/v1` alias for older OpenAI clients (docs promise the
+        // same alias symmetry as transcriptions).
+        .route("/audio/translations", post(whisper::audio_translations))
         .route("/infill", post(openai::openai_proxy))
         .route("/v1/chat/completions/control", post(openai::openai_proxy))
         .route(
@@ -791,18 +794,30 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
         // the label must not advertise passthrough semantics.
         "apis": ["openai", "ollama", "anthropic"],
         // F69: full route census (verified against the router table).
+        // Audit MM15: extended to the media generation lanes and the
+        // engine-scoped surfaces — the census is the machine-readable
+        // discovery contract and must not lag the router.
         "endpoints": {
             "openai": ["/v1/chat/completions", "/v1/chat/completions/control",
+                       "/v1/chat/completions/input_tokens",
                        "/v1/completions", "/v1/embeddings", "/v1/rerank", "/v1/reranking",
                        "/v1/responses", "/v1/responses/{id}", "/v1/responses/input_tokens",
                        "/v1/messages", "/v1/messages/count_tokens", "/v1/models",
                        "/v1/adapters", "/v1/batches", "/v1/batches/{id}",
                        "/v1/batches/{id}/cancel", "/v1/files", "/v1/files/{id}",
-                       "/v1/files/{id}/content", "/v1/streams/lookup",
-                       "/v1/audio/transcriptions", "/v1/audio/translations",
-                       "/infill", "/tokenize", "/detokenize",
+                       "/v1/files/{id}/content", "/v1/streams/lookup", "/v1/stream",
+                       "/props", "/infill", "/tokenize", "/detokenize",
                        "/apply-template", "/slots", "/slots/{id}", "/responses",
-                       "/responses/input_tokens"],
+                       "/responses/input_tokens",
+                       "/v1/images/generations", "/v1/images/edits",
+                       "/v1/images/jobs/{id}", "/v1/images/jobs/{id}/cancel",
+                       "/v1/images/capabilities",
+                       "/v1/videos/generations", "/v1/videos/jobs/{id}",
+                       "/v1/videos/jobs/{id}/cancel", "/v1/videos/capabilities",
+                       "/v1/audio/transcriptions", "/v1/audio/translations",
+                       "/v1/audio/speech", "/v1/audio/jobs/{id}",
+                       "/v1/audio/jobs/{id}/cancel", "/v1/audio/capabilities",
+                       "/audio/transcriptions", "/audio/translations"],
             "ollama": ["/api/chat", "/api/generate", "/api/tags", "/api/ps", "/api/show",
                        "/api/embeddings", "/api/embed", "/api/rerank", "/api/pull",
                        "/api/delete", "/api/events", "/api/version"],

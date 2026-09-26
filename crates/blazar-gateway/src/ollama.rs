@@ -3202,6 +3202,14 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         "# HELP blazar_queue_depth Waiting requests\n# TYPE blazar_queue_depth gauge\nblazar_queue_depth {}\n",
         state.queue.depth()
     );
+    // Audit MM9: the local audio lane (transcriptions/translations async
+    // jobs) has no queue of its own — this gauge is its only footprint
+    // in /metrics.
+    let _ = write!(
+        merged,
+        "# HELP blazar_audio_jobs_active Local audio transcription jobs (queued+running)\n# TYPE blazar_audio_jobs_active gauge\nblazar_audio_jobs_active {}\n",
+        state.audio_jobs.active_count()
+    );
     let _ = write!(
         merged,
         "# HELP blazar_evictions_total Total instance evictions\n# TYPE blazar_evictions_total counter\nblazar_evictions_total {}\n",

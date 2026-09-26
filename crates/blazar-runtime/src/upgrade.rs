@@ -50,7 +50,7 @@ async fn run_inner(
     }
     let exe = replace_current_exe(&binary)?;
     Ok(format!(
-        "upgraded to {} ({}); daemon note: a running daemon keeps the old binary until 'blazar stop' + any command",
+        "upgraded to {} ({}); daemon note: the CLI restarts a running daemon onto the new binary",
         plan.tag,
         exe.display()
     ))
