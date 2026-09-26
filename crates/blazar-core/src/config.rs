@@ -3709,12 +3709,20 @@ mod tests {
 
     #[test]
     fn unit__child_transport__unix_validates_and_garbage_rejects() {
-        // F35 lift pin: the unix lane is a first-class transport now.
+        // F35 lift pin: the unix lane is a first-class transport now —
+        // on unix it validates; on every other platform the validator
+        // teaches the boundary instead of silently accepting.
         let unix_cfg = Config {
             child_transport: "unix".into(),
             ..Config::default()
         };
+        #[cfg(unix)]
         unix_cfg.validate().expect("unix transport must validate");
+        #[cfg(not(unix))]
+        {
+            let err = unix_cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("requires a unix platform"), "{err}");
+        }
         // Garbage still fails fast with the enum spelled out.
         let grpc_cfg = Config {
             child_transport: "grpc".into(),
