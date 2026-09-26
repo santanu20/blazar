@@ -42,8 +42,17 @@ jobs:
       # serial execution: parallel has never been exercised on windows
       # runners and the pin predates the matrix (born in ci.yml's first
       # commit, not a fix for an observed race). Lift after one green
-      # parallel windows run.
-      - run: cargo test --workspace ${{ runner.os == 'Windows' && '-- --test-threads=1' || '' }}
+      # parallel windows run. Tee'd for the same reason as clippy above:
+      # a flaky cell leaves its exact panic behind in the artifact.
+      - run: cargo test --workspace ${{ runner.os == 'Windows' && '-- --test-threads=1' || '' }} 2>&1 | tee test.log
+        shell: bash
+      - name: upload test log (always, for diagnosis)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-${{ matrix.os }}
+          path: test.log
+          if-no-files-found: ignore
 
   scripts:
     name: shellcheck + installer e2e (${{ matrix.os }})

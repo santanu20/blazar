@@ -244,6 +244,16 @@ async fn serve_unix(host: &str, app: axum::routing::Router) {
     axum::serve(listener, app).await.expect("stub server error");
 }
 
+/// Windows refusal for a `.sock` argv — same contract as the
+/// supervisor's transport validation: loud, never a silent TCP
+/// fallback. A separate diverging function (not a panic! inline in
+/// the if-branch) because clippy's `if_then_panic` lint fires on the
+/// windows build where that branch is the whole statement body.
+#[cfg(not(unix))]
+fn refuse_unix_transport() -> ! {
+    panic!("stub-llama-server: unix sockets require a unix platform");
+}
+
 /// One router with every stub route — shared by the TCP and
 /// unix-socket transports so both serve byte-identical API surface.
 fn build_app(alias: &str, api_key: Option<&str>) -> axum::routing::Router {
@@ -361,10 +371,7 @@ async fn serve(host: String, port: Option<u16>, alias: String, api_key: Option<S
         }
         #[cfg(not(unix))]
         {
-            // Same refusal as the supervisor's transport validation:
-            // unix sockets are a unix-platform feature. Loud, not
-            // silent — never quietly fall back to TCP.
-            panic!("stub-llama-server: unix sockets require a unix platform");
+            refuse_unix_transport();
         }
     }
     let addr = format!("{host}:{}", port.unwrap_or(8080));
