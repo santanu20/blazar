@@ -25,7 +25,18 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Tee the lint so a red matrix cell can be diagnosed from the
+      # uploaded log instead of the truncated console (the API log
+      # download needs admin rights fine-grained tokens don't carry).
+      - run: cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee clippy.log
+        shell: bash
+      - name: upload clippy log (always, for diagnosis)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clippy-${{ matrix.os }}
+          path: clippy.log
+          if-no-files-found: ignore
       # Linux/macOS: parallel (the same suite runs parallel green under
       # cargo-nextest locally, per-test process isolation). Windows keeps
       # serial execution: parallel has never been exercised on windows
