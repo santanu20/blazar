@@ -4,9 +4,19 @@ All notable changes to Blazar are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
-## [Unreleased]
+## [0.12.0] - 2026-09-26
 
 ### Fixed
+
+- **Registration-time engine retention is scoped to the lane that changed.** The per-kind retention counter still walked every row in the table, and the global active flag protects a row only while it sits on it — so a mistral.rs install (which activates its own row) could retire a perfectly healthy CUDA llama.cpp build at the instant that build's only protection lived on the mistral.rs row (live incident: `engine install` of a mistral.rs tag printed `pruned old engine b11193-cuda` and deleted the active CUDA engine). An automatic prune after a registration now counts retention within the changed engine's kind only; a manual `blazar engine prune` keeps the full-table sweep it always had.
+
+- **`engine rollback` steps to the next-older engine of the same kind.** Rollback used to walk the installed-at ordering across every engine row, so it could land the daemon on a whisper voice-lane row (live incident: an llamacpp rollback printed `rolled back to: b5130` — the whisper binary lane) or any other cross-kind row that merely happened to be older. Candidates are now filtered to the active engine's kind; when no same-kind older row exists the command refuses with a teaching error instead of guessing.
+
+- **`whisper --pin` is honored on both serving lanes.** The pin wrote only the legacy tree's pin file while the serving resolution preferred the engines-table lane whenever a whisper row existed — a pin that printed success but changed nothing. Pinning now marks the matching engines row active (and writes the legacy pin, so the old tree obeys it too), `--pin none` clears both, a tag that exists in neither place is refused with the list of valid tags, and `whisper --list` shows the `(pinned)` marker on a tag match regardless of which lane serves it. A dangling pin (tag uninstalled since) falls through to the newest lane with a warning instead of failing transcription.
+
+- **`quantize`, `imatrix`, and `perplexity` find their binaries in nested and suffixed engine layouts.** The probe hand-built `engines/<tag>/llama-<tag>/<tool>` and missed real layouts — the CUDA overlay tag `b11193-cuda` unpacks to an inner `llama-b11193` directory, so every tool invocation died with `no llama-quantize found` while the binary sat one directory away. All three now share the engine walk the bench binary already used (active-first, symlink-safe, shallowest match wins).
+
+- **The boot orphan sweep never kills a user-run `ggml-rpc-server`.** Any GPU process whose binary lived in the engines dir but was not a daemon descendant was classified orphaned and SIGTERMed at boot — including the one engines-dir binary users deliberately run themselves for RPC weight offload (killing it took down every `--rpc` model with `endpoint(s) unreachable`). That process is now classified a foreign co-tenant: never swept, advisory in `blazar doctor` only.
 
 - **Long media generations no longer truncate at a 600 s ceiling.** Both the CLI's media client and the gateway's forward to the engine child capped requests at 10 minutes — a 1024² qwen-image render on offloaded hardware easily outlives that, so the client ate a timeout while the child kept rendering (wasted GPU, and a retry doubled the waste). The gateway now uses a deadline-free media client for image/video forwards (liveness comes from the loopback socket and the lane-aware child header/evict ceilings) and the CLI gives media requests an honest 2-hour bound that exists only to catch a dead remote daemon, not to police render time.
 
