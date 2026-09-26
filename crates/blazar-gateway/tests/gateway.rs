@@ -1881,9 +1881,14 @@ async fn e2e__child_header_stall_bounded_evicted_and_504() {
         .expect("bounded: the request must return, never park to the blanket ceiling");
     let elapsed = began.elapsed();
     let status = resp.status().as_u16();
-    // Two bounded attempts (1s each) + eviction/respawn overhead.
+    // Two bounded attempts (1s each) + eviction/respawn overhead. The
+    // spawn overhead is platform-dependent: windows CI runners pay a
+    // multi-second real-time-scanning tax per child process spawn
+    // (measured 23.3s end-to-end on windows-latest vs ~3s locally).
+    // 60s still pins the contract — bounded far below the ~300s
+    // blanket transport ceiling this test exists to guard against.
     assert!(
-        elapsed < Duration::from_secs(20),
+        elapsed < Duration::from_secs(60),
         "header-stall took {elapsed:?} — phase unbounded"
     );
     assert_eq!(
@@ -1964,13 +1969,17 @@ async fn e2e__sentinel__body_stall_fires_detection_and_bounded_close() {
         .await
         .expect("headers must arrive (body-stall, not header-stall)");
     // Stall (5 s) + eviction grace + respawn overhead — never minutes.
-    let body = tokio::time::timeout(Duration::from_secs(25), resp.bytes())
+    // Same windows spawn-tax note as the header-stall pin above: child
+    // respawn costs seconds per spawn on windows CI runners, so the
+    // ceiling guards "bounded, not parked until client give-up" rather
+    // than raw platform speed.
+    let body = tokio::time::timeout(Duration::from_secs(60), resp.bytes())
         .await
         .expect("body must close within the stall+evict window")
         .expect("body read");
     let elapsed = began.elapsed();
     assert!(
-        elapsed < Duration::from_secs(25),
+        elapsed < Duration::from_secs(60),
         "body-stall closed in {elapsed:?}"
     );
     let _ = body;
