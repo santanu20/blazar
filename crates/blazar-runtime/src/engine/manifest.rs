@@ -380,7 +380,15 @@ impl Manifest {
         let Ok(rel) = recorded.strip_prefix(data_dir) else {
             return false;
         };
-        let folded = rel.display().to_string();
+        // Storage invariant: relative rows persist with forward slashes
+        // (data dirs move between operating systems; a PathBuf stringify
+        // would bake windows separators into the row). Rebuild from
+        // components so the spelling is canonical everywhere.
+        let folded = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
         if folded.is_empty() {
             return false;
         }
