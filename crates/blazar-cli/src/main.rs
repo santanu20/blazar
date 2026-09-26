@@ -1295,6 +1295,9 @@ async fn run_systemctl(args: &[&str]) -> bool {
 }
 
 /// `launchctl kickstart -k` cycles the agent in place (macOS lane).
+// The unix body awaits; every other platform compiles a plain false —
+// nothing to await there by design.
+#[cfg_attr(not(unix), allow(clippy::unused_async))]
 async fn launchd_kickstart() -> bool {
     #[cfg(unix)]
     {
@@ -2642,6 +2645,7 @@ fn gpu_cotenants_check(d: &BlazarDirs) -> Option<Check> {
 /// only the tenants that classify as orphaned engine servers. The
 /// boolean is the pre-walked `is_descendant` so tests inject ancestry
 /// instead of depending on the live process table.
+#[cfg(unix)]
 fn orphaned_gpu_tenants<'a>(
     tenants: &[(&'a blazar_runtime::probe::GpuTenant, bool)],
     engines_dir: &Path,
@@ -14353,6 +14357,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn unit__orphaned_gpu_tenants__selects_only_orphaned_engines() {
         let tmp = tempfile::tempdir().unwrap();

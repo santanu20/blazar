@@ -5633,7 +5633,16 @@ mod routing_tests {
     #[allow(non_snake_case)]
     #[test]
     fn unit__pick_endpoint__unix_transport_shape_and_determinism() {
-        let root = tempfile::TempDir::new().unwrap();
+        // The sockaddr_un.sun_path budget is 100 bytes and the teaching
+        // error fires by design — but macOS runners get a deep default
+        // TMPDIR (/var/folders/...), which made this test unwrap the
+        // budget error instead of the shape assertions. Anchor the run
+        // dir under a shallow root so every unix host exercises the
+        // shape, not the platform's temp-dir depth.
+        let root = tempfile::Builder::new()
+            .prefix("bz-uds-")
+            .tempdir_in("/tmp")
+            .expect("shallow temp root for the sockaddr budget");
         let dirs = BlazarDirs {
             config_dir: root.path().join("cfg"),
             data_dir: root.path().join("data"),
