@@ -4704,14 +4704,22 @@ def main() -> int:
     rows: list[tuple[Path, str, str | None]] = []
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
-        for path, name, mmproj in con.execute(
-            "SELECT path, name, mmproj_path FROM models"
+        # Component-set pulls (VAE/text-encoder GGUF bundles) are diffusion
+        # models served by the sdcpp lane — llama-server/mistral.rs/sglang
+        # can never load them. Mirror the product's model_category()
+        # classifier: has_component_set() ⇒ media lane, never a text pick.
+        # Live incident 2026-09-26: the size-sorted default picked the 5.9G
+        # qwen-image Q6_K over the 5.6G text 9B by a 300 MiB margin and fed
+        # a diffusion GGUF to every text lane (all cells failed at load).
+        for path, name, mmproj, components in con.execute(
+            "SELECT path, name, mmproj_path, components FROM models"
         ):
             p = Path(path)
             if (
                 not p.exists()
                 or "mmproj" in p.name
                 or p.name.startswith(("imx-", "r5-"))
+                or (components is not None and components.strip() not in ("", "[]"))
             ):
                 continue
             rows.append((p, name, mmproj))
@@ -4978,16 +4986,19 @@ def main() -> int:
     # paged-attn-off variant + soak)
     if "blazar" in args.providers:
         for eng in text_engines:
+            # Each variant below owns its done-check: an early `continue`
+            # here used to orphan the paged-attn-off and single-stream
+            # cells on resume when only the default cell was done
+            # (live-caught 2026-09-26: an errored single-stream cell never
+            # retried because the resumed default skipped the loop body).
             params = {"config": "default"}
             key = cell_key(eng.tag, "blazar", params, model.name)
             if key in done:
                 log(f"[blazar {eng.tag}] resumed — skipping")
-                continue
-            log(f"[blazar {eng.tag}] (sandbox, gateway, default profile)")
-            # guard BEFORE the cell: a prior direct-sweep teardown can
-            # still hold VRAM when the sandbox child spawns (live-caught
-            # 2026-09-11: 502 right after the np4 direct cells)
-            if not mem_guard(2048.0, f"pre-blazar {eng.tag}"):
+            elif not mem_guard(2048.0, f"pre-blazar {eng.tag}"):
+                # guard BEFORE the cell: a prior direct-sweep teardown can
+                # still hold VRAM when the sandbox child spawns (live-caught
+                # 2026-09-11: 502 right after the np4 direct cells)
                 emit(
                     eng.tag,
                     eng.kind,
@@ -4996,31 +5007,35 @@ def main() -> int:
                     key,
                     {"error": "GPU memory floor exceeded before cell"},
                 )
-                continue
-            try:
-                rec = run_blazar_cell(
-                    eng, gw_model_name, cfg, "sandboxed gateway cell", soak_s=args.soak
-                )
-            except Exception as exc:
-                rec = {"error": f"blazar cell crashed: {exc}"}
-            emit(eng.tag, eng.kind, "blazar", params, key, rec)
-            if eng.kind == "mistralrs" and not args.skip_variants:
-                params = {"config": "paged_attn_off"}
-                key = cell_key(eng.tag, "blazar", params, model.name)
-                if key in done:
-                    continue
-                log(f"[blazar {eng.tag}] (sandbox, gateway, paged-attn off)")
+            else:
+                log(f"[blazar {eng.tag}] (sandbox, gateway, default profile)")
                 try:
                     rec = run_blazar_cell(
                         eng,
                         gw_model_name,
                         cfg,
-                        "sandboxed gateway cell, mistralrs_paged_attn=false",
-                        blazar_cfg={"mistralrs_paged_attn": False},
+                        "sandboxed gateway cell",
+                        soak_s=args.soak,
                     )
                 except Exception as exc:
                     rec = {"error": f"blazar cell crashed: {exc}"}
                 emit(eng.tag, eng.kind, "blazar", params, key, rec)
+            if eng.kind == "mistralrs" and not args.skip_variants:
+                params = {"config": "paged_attn_off"}
+                key = cell_key(eng.tag, "blazar", params, model.name)
+                if key not in done:
+                    log(f"[blazar {eng.tag}] (sandbox, gateway, paged-attn off)")
+                    try:
+                        rec = run_blazar_cell(
+                            eng,
+                            gw_model_name,
+                            cfg,
+                            "sandboxed gateway cell, mistralrs_paged_attn=false",
+                            blazar_cfg={"mistralrs_paged_attn": False},
+                        )
+                    except Exception as exc:
+                        rec = {"error": f"blazar cell crashed: {exc}"}
+                    emit(eng.tag, eng.kind, "blazar", params, key, rec)
 
             # ---- blazar single-stream variant (slots=1, classic in-VRAM
             # KV): the same-settings cell for the ollama parity question —

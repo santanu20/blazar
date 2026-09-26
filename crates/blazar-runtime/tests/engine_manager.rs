@@ -447,7 +447,7 @@ async fn integration__prune_keeps_newest_keep_tags_and_local() {
     // b2 marked active (old but active -> kept).
     store.set_active_engine("b2").unwrap();
 
-    mgr.prune(&store).unwrap();
+    mgr.prune(&store, None).unwrap();
     let remaining: Vec<String> = store
         .list_engines()
         .unwrap()
@@ -510,7 +510,7 @@ async fn integration__prune_reports_freed_tag_bytes() {
             })
             .unwrap();
     }
-    let freed = mgr.prune(&store).unwrap();
+    let freed = mgr.prune(&store, None).unwrap();
     assert_eq!(
         freed,
         vec![("b1".to_string(), 512)],
@@ -556,7 +556,7 @@ async fn integration__prune_retention_is_scoped_per_kind() {
     stage("s1", EngineKind::Sglang, 1005);
     store.set_active_engine("b2").unwrap();
 
-    mgr.prune(&store).unwrap();
+    mgr.prune(&store, None).unwrap();
     let mut remaining: Vec<String> = store
         .list_engines()
         .unwrap()
@@ -577,6 +577,81 @@ async fn integration__prune_retention_is_scoped_per_kind() {
     for kept in ["b2", "b3", "m1", "m2", "s1"] {
         assert!(dirs.engines_dir().join(kept).exists(), "{kept} dir gone");
     }
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__prune_registration_scoped_to_changed_lane() {
+    use blazar_core::engine_kind::EngineKind;
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    let store = Store::open(&dirs).unwrap();
+
+    let stage = |tag: &str, kind: EngineKind, at: i64| {
+        let dir = dirs.engines_dir().join(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("marker"), tag).unwrap();
+        store
+            .upsert_engine(&blazar_core::EngineRow {
+                tag: tag.to_string(),
+                asset: "x".into(),
+                sha256: "x".into(),
+                installed_at: at,
+                active: false,
+                manifest: "{}".into(),
+                kind,
+            })
+            .unwrap();
+    };
+
+    // Incident shape (2026-09-26): `engine local` registered a fresh row
+    // AFTER the CUDA engine was installed, so the llamacpp lane held 3
+    // mainstream rows newest-first (fresh cpu build, local, b11193-cuda)
+    // while a mistralrs install claimed the GLOBAL active slot. The
+    // registration-time prune then counted the away lane and retired
+    // b11193-cuda, stranding the `engine use` restore with no row to
+    // return to.
+    stage("b11193-cuda", EngineKind::LlamaCpp, 1000);
+    stage(LOCAL_TAG, EngineKind::LlamaCpp, 1001);
+    stage("b11195-cpu", EngineKind::LlamaCpp, 1002);
+    stage("v0.9.3", EngineKind::MistralRs, 1003);
+    store.set_active_engine("v0.9.3").unwrap();
+
+    // Registration-time retention is scoped to the lane that just
+    // changed: the mistralrs registration must not touch any llamacpp
+    // row, even though the active flag is away from that lane.
+    let freed = mgr
+        .prune(&store, Some(EngineKind::MistralRs.as_str()))
+        .unwrap();
+    assert!(freed.is_empty(), "away-lane retention freed {freed:?}");
+    let mut remaining: Vec<String> = store
+        .list_engines()
+        .unwrap()
+        .into_iter()
+        .map(|e| e.tag)
+        .collect();
+    remaining.sort();
+    let mut expected = vec![
+        "b11193-cuda".to_string(),
+        "b11195-cpu".to_string(),
+        LOCAL_TAG.to_string(),
+        "v0.9.3".to_string(),
+    ];
+    expected.sort();
+    assert_eq!(
+        remaining, expected,
+        "registration-time prune crossed into an away lane"
+    );
+    assert!(dirs.engines_dir().join("b11193-cuda").exists());
+
+    // Manual `engine prune` keeps full-scope semantics: with the active
+    // slot still on mistralrs, llamacpp retention applies on its own
+    // sweep and the third-newest mainstream row (b11193-cuda) retires.
+    let freed = mgr.prune(&store, None).unwrap();
+    assert_eq!(freed.len(), 1, "manual sweep retired {freed:?}");
+    assert_eq!(freed[0].0, "b11193-cuda");
+    assert!(!dirs.engines_dir().join("b11193-cuda").exists());
 }
 
 #[tokio::test]
@@ -703,7 +778,7 @@ async fn integration__prune_never_removes_fork_lanes() {
     stage_fork_row(&store, &dirs, fork_tag, 1);
     store.set_active_engine("b5").unwrap();
 
-    mgr.prune(&store).unwrap();
+    mgr.prune(&store, None).unwrap();
     let mut remaining: Vec<String> = store
         .list_engines()
         .unwrap()

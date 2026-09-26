@@ -2475,7 +2475,11 @@ impl Supervisor {
             }
             let mut manifest: crate::engine::manifest::Manifest =
                 serde_json::from_str(&row.manifest).ok()?;
-            manifest.re_root_server_path(&self.dirs.engines_dir());
+            // Rows store data-dir-relative server paths: anchor back to
+            // an absolute live path (legacy absolute rows re-root, the
+            // relative invariant joins the data dir) so the spawn never
+            // execs the storage form raw.
+            manifest.anchor_server_path(&self.dirs.data_dir);
             let env: Vec<(String, String)> = self
                 .config
                 .engine_env
@@ -3828,7 +3832,8 @@ drop them from rpc_servers in config.toml",
     }
 
     /// Switch the active engine to the previous install (same ordering as
-    /// `EngineManager::rollback`: next entry after active = older). Leaves
+    /// `EngineManager::rollback`: next same-kind entry after the active =
+    /// older — voice lanes and other kinds are never targets). Leaves
     /// the tracker armed for a fresh verdict on the new engine.
     fn rollback_active_engine(&self, reason: &str) -> Result<(String, String)> {
         let store = Store::open(&self.dirs)?;
@@ -3838,12 +3843,14 @@ drop them from rpc_servers in config.toml",
             .find(|e| e.active)
             .ok_or_else(|| anyhow!("no active engine to roll back from"))?;
         let from = active.tag.clone();
-        let target = engines
-            .iter()
-            .position(|e| e.active)
-            .and_then(|idx| engines.get(idx + 1))
+        let target = crate::engine::rollback_candidate(&engines)
             .map(|e| e.tag.clone())
-            .ok_or_else(|| anyhow!("no older engine to roll back to (active: {from})"))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "no older {} engine to roll back to (active: {from})",
+                    active.kind
+                )
+            })?;
         drop(store);
         Store::open(&self.dirs)?.set_active_engine(&target)?;
         self.engine_failures.lock().unwrap().clear();
@@ -5987,6 +5994,46 @@ mod routing_tests {
         // The serving engine tag rides every row — the `engine rm`
         // live-children guard keys off it.
         assert_eq!(rows[0].engine, "test-engine");
+    }
+
+    /// Audit MM5 regression: media-job polls bracket via
+    /// `begin_request`/`end_request` — the bracket must bump `in_flight`
+    /// (holds the child against idle eviction) and refresh `last_used`
+    /// on BOTH ends, and end must clamp at zero (a request outliving a
+    /// respawn must never read the shared counter negative).
+    #[tokio::test]
+    async fn unit__request_accounting__bracket_touches_activity_and_clamps() {
+        let (sup, _root) = gpu_sup();
+        let (inst, _pid) = gpu_instance("m", 1000, 0);
+        sup.instances.insert("m".to_string(), inst);
+        let i = sup.instances.get("m").expect("inserted");
+        let stale = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(600))
+            .expect("600s fits any monotonic clock");
+        *i.last_used.write().expect("idle lock") = stale;
+
+        sup.begin_request("m");
+        assert_eq!(i.in_flight.load(Ordering::SeqCst), 1, "begin bumps");
+        assert!(
+            *i.last_used.read().expect("idle lock") > stale,
+            "begin refreshes last_used (reaper must not idle-evict mid-job)"
+        );
+
+        sup.end_request("m");
+        assert_eq!(i.in_flight.load(Ordering::SeqCst), 0, "end decrements");
+        assert!(
+            *i.last_used.read().expect("idle lock") > stale,
+            "end refreshes last_used too"
+        );
+
+        // Over-end (request began on a previous generation of the name):
+        // the CAS loop must leave the counter at zero, not negative.
+        sup.end_request("m");
+        assert_eq!(i.in_flight.load(Ordering::SeqCst), 0, "end clamps at zero");
+
+        // Unknown names are a silent no-op (instance already gone).
+        sup.begin_request("ghost");
+        sup.end_request("ghost");
     }
 
     #[tokio::test]

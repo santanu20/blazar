@@ -210,16 +210,29 @@ pub async fn install(
 /// both stay working installs.
 #[must_use]
 pub fn server_bin(dirs: &BlazarDirs) -> Option<(PathBuf, PathBuf)> {
-    if let Some(hit) = engines_lane_bin(dirs) {
-        return Some(hit);
-    }
+    // A pin is lane-agnostic (the user has ONE --pin flag and cannot be
+    // expected to know which install channel holds the tag): honor it
+    // against the engines table first, then the legacy tree. `--pin`
+    // used to succeed while the engines lane silently ignored it —
+    // live incident 2026-09-26.
     if let Some(tag) = pinned_tag(dirs) {
+        if let Some(row) = engines_lane_row(dirs) {
+            if row.tag == tag {
+                if let Some(bin) = engines_lane_server_bin(dirs, &row) {
+                    let lib = bin.parent()?.to_path_buf();
+                    return Some((bin, lib));
+                }
+            }
+        }
         let dir = bin_root(dirs).join(&tag);
         if let Some(bin) = server_bin_in(&dir) {
             return Some((bin, dir));
         }
-        // Dangling pin (dir pruned or deleted): fall through to newest.
+        // Dangling pin (no row, no dir): fall through to the lanes' pick.
         tracing::warn!("whisper pin {tag} has no binary; using newest installed tag");
+    }
+    if let Some(hit) = engines_lane_bin(dirs) {
+        return Some(hit);
     }
     for tag_dir in sorted_tag_dirs(dirs) {
         if let Some(bin) = server_bin_in(&tag_dir) {
@@ -229,17 +242,18 @@ pub fn server_bin(dirs: &BlazarDirs) -> Option<(PathBuf, PathBuf)> {
     None
 }
 
-/// Whether `bin` was served by the legacy `data/whisper/bin` tree (used
-/// to scope the legacy pin display to the lane that honors it).
+/// Whether `bin` was served by the legacy `data/whisper/bin` tree (lane
+/// provenance for display and tests; the pin itself is lane-agnostic).
 #[must_use]
 pub fn is_legacy_bin(dirs: &BlazarDirs, bin: &Path) -> bool {
     bin.starts_with(bin_root(dirs))
 }
 
-/// The engines-table lane's whisper row: the active row when one is
-/// flagged, else the newest installed (mirror of the serving pick in
-/// [`engines_lane_bin`]). `None` when no whisper row exists (the legacy
-/// tree decides) or the store cannot be read (warn, never mask).
+/// The engines-table lane's whisper row: a row matching the pin (see
+/// [`server_bin`] — pins are lane-agnostic) first, else the active row
+/// when one is flagged, else the newest installed. `None` when no
+/// whisper row exists (the legacy tree decides) or the store cannot be
+/// read (warn, never mask).
 fn engines_lane_row(dirs: &BlazarDirs) -> Option<blazar_core::store::EngineRow> {
     let store = match blazar_core::Store::open(dirs) {
         Ok(s) => s,
@@ -255,11 +269,21 @@ fn engines_lane_row(dirs: &BlazarDirs) -> Option<blazar_core::store::EngineRow> 
             return None;
         }
     };
+    if let Some(tag) = pinned_tag(dirs) {
+        if let Some(row) = rows
+            .iter()
+            .find(|r| r.kind == blazar_core::engine_kind::EngineKind::Whisper && r.tag == tag)
+        {
+            return Some(row.clone());
+        }
+    }
     // `list_engines` orders newest-installed first; the active row (if
-    // any) still wins so a pinned older lane is honored.
+    // any) still wins so a flagged lane is honored. `installed_at`
+    // breaks ties explicitly — max_by_key on the active flag alone
+    // returns the LAST row among equal keys, i.e. the OLDEST.
     rows.into_iter()
         .filter(|r| r.kind == blazar_core::engine_kind::EngineKind::Whisper)
-        .max_by_key(|r| i64::from(r.active))
+        .max_by_key(|r| (i64::from(r.active), r.installed_at))
 }
 
 /// The engines-table lane: resolve the whisper row's binary the same way
@@ -281,24 +305,27 @@ pub fn engines_lane_installed(dirs: &BlazarDirs) -> bool {
     engines_lane_row(dirs).is_some_and(|row| engines_lane_server_bin(dirs, &row).is_some())
 }
 
-/// The tag currency verdicts must compare against upstream: the engines
-/// row's tag when that lane is serving, else the legacy tree's effective
-/// tag (pin, else newest). The binary's LIB DIRECTORY is not a tag
+/// The tag currency verdicts must compare against upstream: a mirror of
+/// [`server_bin`]'s pick (pin first — either lane — then the engines
+/// row, then the legacy newest). The binary's LIB DIRECTORY is not a tag
 /// source — the extract subdir name leaked into the verdict once and
 /// produced an update warning that no update could clear (live:
 /// "update available: b5130 (running: whisper-bin-ubuntu-x64)").
 #[must_use]
 pub fn installed_tag(dirs: &BlazarDirs) -> Option<String> {
+    if let Some(tag) = pinned_tag(dirs) {
+        let row_hit = engines_lane_row(dirs)
+            .filter(|r| r.tag == tag)
+            .is_some_and(|r| engines_lane_server_bin(dirs, &r).is_some());
+        let legacy_hit = server_bin_in(&bin_root(dirs).join(&tag)).is_some();
+        if row_hit || legacy_hit {
+            return Some(tag);
+        }
+        // Dangling pin (no row with a binary, no dir): fall through.
+    }
     if let Some(row) = engines_lane_row(dirs) {
         if engines_lane_server_bin(dirs, &row).is_some() {
             return Some(row.tag);
-        }
-    }
-    // Legacy tree, mirroring server_bin's resolution: a pin whose dir
-    // still holds a binary wins (dangling pins fall through to newest).
-    if let Some(tag) = pinned_tag(dirs) {
-        if server_bin_in(&bin_root(dirs).join(&tag)).is_some() {
-            return Some(tag);
         }
     }
     sorted_tag_dirs(dirs)
@@ -392,10 +419,12 @@ pub fn installed_tags(dirs: &BlazarDirs) -> Vec<String> {
 
 /// Pin the active whisper server to an already-installed tag, or unpin
 /// (`None`) to track the newest installed tag. The tag must pass the
-/// shared sanitizer AND exist on disk — pinning something uninstalled
-/// would just dangle at selection time. The prune pass keeps the pinned
-/// dir regardless of retention, so re-run it after unpinning to drop a
-/// formerly-protected old tag.
+/// shared sanitizer AND be installed in EITHER lane — the legacy
+/// `data/whisper/bin` tree or the engines table (`kind = whisper`) —
+/// because [`server_bin`] honors the pin across both; accepting only
+/// legacy tags would let the pin succeed while serving ignores it. The
+/// prune pass keeps the pinned dir regardless of retention, so re-run
+/// it after unpinning to drop a formerly-protected old tag.
 pub fn set_pin(dirs: &BlazarDirs, tag: Option<&str>) -> Result<()> {
     match tag {
         Some(t) => {
@@ -403,10 +432,14 @@ pub fn set_pin(dirs: &BlazarDirs, tag: Option<&str>) -> Result<()> {
             if !valid_tag(t) {
                 anyhow::bail!("invalid tag {t:?}: must be a plain tag name (no path separators)");
             }
-            if !installed_tags(dirs).iter().any(|installed| installed == t) {
+            let mut known = installed_tags(dirs);
+            known.extend(whisper_engine_tags(dirs)?);
+            known.sort();
+            known.dedup();
+            if !known.iter().any(|installed| installed == t) {
                 anyhow::bail!(
                     "tag {t} is not installed (installed: {}) — run: blazar whisper --install --tag {t}",
-                    installed_tags(dirs).join(", ")
+                    known.join(", ")
                 );
             }
             std::fs::write(pin_path(dirs), format!("{t}\n"))
@@ -418,6 +451,22 @@ pub fn set_pin(dirs: &BlazarDirs, tag: Option<&str>) -> Result<()> {
     }
     prune(dirs)?;
     Ok(())
+}
+
+/// Whisper-kind engine row tags (the engines-table lane's install set),
+/// for `--pin` validation. Unlike the lane lookups this propagates a
+/// store failure: refusing a valid pin because the store could not be
+/// read would be a silent no-op of the user's explicit intent.
+fn whisper_engine_tags(dirs: &BlazarDirs) -> Result<Vec<String>> {
+    let store =
+        blazar_core::Store::open(dirs).with_context(|| "open store to list whisper engine tags")?;
+    let tags = store
+        .list_engines()?
+        .into_iter()
+        .filter(|r| r.kind == blazar_core::engine_kind::EngineKind::Whisper)
+        .map(|r| r.tag)
+        .collect();
+    Ok(tags)
 }
 
 /// Keep the newest `KEEP_TAGS` server dirs; the pinned dir (if any) is
@@ -1205,41 +1254,106 @@ mod tests {
     }
 
     #[test]
-    fn unit__server_bin__engines_lane_row_beats_legacy_pin() {
-        // The engines table is the primary lane once a whisper row
-        // exists: even a legacy PIN must not shadow it (the pin belongs
-        // to the legacy tree, a different install channel).
+    fn unit__server_bin__pin_wins_on_both_lanes_and_dangling_pin_falls_through() {
+        // Pins are lane-agnostic (ONE --pin flag, two install channels):
+        // a pin naming an engines row's tag serves that row even when a
+        // newer row exists; a pin naming a legacy dir serves the legacy
+        // tree even when engines rows exist; a pin naming nothing falls
+        // through to the engines lane's newest. The superseded contract
+        // — the engines lane silently beating a live pin — is the
+        // 2026-09-26 incident this test pins closed.
         let tmp = tempfile::tempdir().expect("tmp");
         let dirs = BlazarDirs {
             config_dir: tmp.path().join("cfg"),
             data_dir: tmp.path().join("data"),
         };
-        let legacy = stage_server(&dirs, "v1.0.0");
-        std::fs::create_dir_all(bin_root(&dirs)).expect("root");
-        std::fs::write(pin_path(&dirs), "v1.0.0\n").expect("pin");
-        // Engines-lane install: nested tar-root shape, manifest the
-        // resolver cannot use (decode falls through to a directory
-        // search — the recursion is part of the contract).
-        let lane_dir = dirs.engines_dir().join("b5130/whisper-bin-ubuntu-x64");
-        std::fs::create_dir_all(&lane_dir).expect("lane");
-        std::fs::write(lane_dir.join("whisper-server"), b"stub").expect("bin");
-        let store = blazar_core::Store::open(&dirs).expect("store");
-        store
-            .upsert_engine(&blazar_core::store::EngineRow {
-                tag: "b5130".to_string(),
-                asset: "whisper-bin-ubuntu-x64.tar.gz".to_string(),
-                sha256: "unverified".to_string(),
-                installed_at: 1,
-                active: true,
-                manifest: "not-json".to_string(),
-                kind: blazar_core::engine_kind::EngineKind::Whisper,
-            })
-            .expect("row");
+        let (newer, older, legacy) = stage_two_lane_store(&dirs);
+        // (1) Pin names the OLDER engines row: it beats the newer row.
+        std::fs::write(pin_path(&dirs), "b5130\n").expect("pin");
         let (bin, dir) = server_bin(&dirs).expect("server");
-        assert_eq!(dir, lane_dir);
-        assert!(bin.starts_with(&lane_dir));
-        assert_ne!(dir, legacy);
-        assert!(!is_legacy_bin(&dirs, &bin));
+        assert_eq!(dir, older);
+        assert!(bin.starts_with(&older));
+        // (2) Pin names the legacy dir: it beats BOTH engines rows.
+        std::fs::write(pin_path(&dirs), "v1.0.0\n").expect("pin");
+        let (bin, dir) = server_bin(&dirs).expect("server");
+        assert_eq!(dir, legacy);
+        assert!(is_legacy_bin(&dirs, &bin));
+        // (3) Dangling pin: the engines lane's newest row wins.
+        std::fs::write(pin_path(&dirs), "b4999\n").expect("pin");
+        let (_bin, dir) = server_bin(&dirs).expect("server");
+        assert_eq!(dir, newer);
+    }
+
+    #[test]
+    fn unit__installed_tag__mirrors_server_bin_pick() {
+        // Verdicts must compare upstream against whatever server_bin is
+        // actually about to serve — pin first, then engines lane, then
+        // legacy newest. Also pins the tie-break: with no pin and no
+        // active row, the NEWEST whisper row wins (a max_by_key on the
+        // active flag alone used to return the oldest).
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let (_newer, _older, _legacy) = stage_two_lane_store(&dirs);
+        std::fs::write(pin_path(&dirs), "b5130\n").expect("pin");
+        assert_eq!(installed_tag(&dirs).as_deref(), Some("b5130"));
+        std::fs::write(pin_path(&dirs), "v1.0.0\n").expect("pin");
+        assert_eq!(installed_tag(&dirs).as_deref(), Some("v1.0.0"));
+        std::fs::write(pin_path(&dirs), "b4999\n").expect("pin");
+        assert_eq!(installed_tag(&dirs).as_deref(), Some("b5131"));
+        let _ = std::fs::remove_file(pin_path(&dirs));
+        assert_eq!(installed_tag(&dirs).as_deref(), Some("b5131"));
+    }
+
+    #[test]
+    fn unit__set_pin__accepts_engines_lane_tag_and_serves_it() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let (_newer, older, _legacy) = stage_two_lane_store(&dirs);
+        // No legacy dir carries b5130: only the engines row does. The
+        // pin must be accepted AND change the serving pick.
+        set_pin(&dirs, Some("b5130")).expect("pin engines-lane tag");
+        assert_eq!(pinned_tag(&dirs), Some("b5130".to_string()));
+        let (_bin, dir) = server_bin(&dirs).expect("server");
+        assert_eq!(dir, older);
+        set_pin(&dirs, None).expect("unpin");
+        assert_eq!(pinned_tag(&dirs), None);
+    }
+
+    /// Two whisper lanes fully staged: legacy `v1.0.0` dir plus engines
+    /// rows `b5131` (newer) and `b5130` (older), none active. Returns
+    /// (newer lane dir, older lane dir, legacy tag dir).
+    fn stage_two_lane_store(
+        dirs: &BlazarDirs,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let legacy = stage_server(dirs, "v1.0.0");
+        std::fs::create_dir_all(bin_root(dirs)).expect("root");
+        let newer = dirs.engines_dir().join("b5131/whisper-bin-ubuntu-x64");
+        let older = dirs.engines_dir().join("b5130/whisper-bin-ubuntu-x64");
+        std::fs::create_dir_all(&newer).expect("lane newer");
+        std::fs::create_dir_all(&older).expect("lane older");
+        std::fs::write(newer.join("whisper-server"), b"stub").expect("bin");
+        std::fs::write(older.join("whisper-server"), b"stub").expect("bin");
+        let store = blazar_core::Store::open(dirs).expect("store");
+        for (tag, installed_at) in [("b5131", 2), ("b5130", 1)] {
+            store
+                .upsert_engine(&blazar_core::store::EngineRow {
+                    tag: tag.to_string(),
+                    asset: "whisper-bin-ubuntu-x64.tar.gz".to_string(),
+                    sha256: "unverified".to_string(),
+                    installed_at,
+                    active: false,
+                    manifest: "not-json".to_string(),
+                    kind: blazar_core::engine_kind::EngineKind::Whisper,
+                })
+                .expect("row");
+        }
+        (newer, older, legacy)
     }
 
     #[test]

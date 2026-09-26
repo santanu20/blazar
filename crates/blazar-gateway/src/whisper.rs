@@ -362,6 +362,18 @@ struct AudioJobStore {
 }
 
 impl AudioJobs {
+    /// Jobs not yet terminal (queued or running) — the `/metrics`
+    /// activity gauge (audit MM9).
+    #[must_use]
+    pub fn active_count(&self) -> usize {
+        let store = self.inner.lock().expect("audio jobs lock");
+        store
+            .jobs
+            .values()
+            .filter(|j| matches!(j.state, AudioJobState::Queued | AudioJobState::Running))
+            .count()
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -738,6 +750,14 @@ pub async fn audio_transcriptions(
     // missing half — "lane not installed" when the server binary is the
     // gap, "no model pulled" when the server is fine but transcription
     // has nothing to load (both halves observed live in validation).
+    // The lane pays the same admission the remote branch just paid
+    // (scope on the whisper size name + rpm/tpm/daily + request charge):
+    // local compute is not a free lane on an authed gateway (audit MM1).
+    if let Err(resp) =
+        state.admit_or_respond(key_ext.as_ref(), model.as_deref().unwrap_or("whisper-1"))
+    {
+        return *resp;
+    }
     let available = whisper::list_models(&state.dirs);
     let requested = model.as_deref().or(Some("whisper-1"));
     let server = whisper::server_bin(&state.dirs);
@@ -816,7 +836,13 @@ pub async fn audio_translations(
         }
     }
 
-    // (2) Local lane, forced translation.
+    // (2) Local lane, forced translation. Same admission as the remote
+    // branch and every other gated lane (audit MM1).
+    if let Err(resp) =
+        state.admit_or_respond(key_ext.as_ref(), model.as_deref().unwrap_or("whisper-1"))
+    {
+        return *resp;
+    }
     let available = whisper::list_models(&state.dirs);
     let requested = model.as_deref().or(Some("whisper-1"));
     let server = whisper::server_bin(&state.dirs);
@@ -1170,5 +1196,29 @@ mod tests {
             jobs.payload(&first_terminal).is_none(),
             "oldest terminal job is the eviction victim"
         );
+    }
+
+    /// Audit MM9: `active_count` is the /metrics footprint of the local
+    /// audio lane — queued+running only; every terminal state (or
+    /// eviction) stops counting.
+    #[test]
+    fn unit__audio_jobs__active_count_tracks_live_only() {
+        let jobs = AudioJobs::new();
+        assert_eq!(jobs.active_count(), 0, "empty registry");
+        let a = jobs.reserve();
+        assert_eq!(jobs.active_count(), 1, "queued counts as active");
+        jobs.mark_running(&a);
+        assert_eq!(jobs.active_count(), 1, "running still one active");
+        let b = jobs.reserve();
+        jobs.mark_running(&b);
+        assert_eq!(jobs.active_count(), 2, "second live job counted");
+        jobs.finish(&a, 200, "application/json", Vec::new());
+        assert_eq!(jobs.active_count(), 1, "completed drops out");
+        jobs.fail(&b, "boom".into());
+        assert_eq!(jobs.active_count(), 0, "failed drops out");
+        // Cancelled path too.
+        let c = jobs.reserve();
+        jobs.cancel(&c);
+        assert_eq!(jobs.active_count(), 0, "cancelled drops out");
     }
 }

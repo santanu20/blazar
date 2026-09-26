@@ -713,6 +713,130 @@ async fn e2e__keys_scoped_rate_and_accounting() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn e2e__local_tts_charges_key_admission() {
+    use blazar_core::ApiKey;
+    // Audit MM1: the LOCAL piper lane must pass key admission BEFORE its
+    // not-installed teaching — the first request charges rpm, the second
+    // within the window exhausts it, and a wrongly-scoped key never
+    // reaches the lane at all.
+    let cfg = Config {
+        keys: vec![ApiKey {
+            name: "ci".into(),
+            key: "plm_tts".into(),
+            rpm: 1,
+            ..ApiKey::default()
+        }],
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let c = client();
+    let speech = serde_json::json!({
+        "model": "en_US-amy-medium",
+        "input": "hello from the local lane",
+    });
+    // 404 = tts_error not-installed teaching — admission PASSED (a
+    // bypassed lane would 404 twice without ever exhausting rpm).
+    let first = c
+        .post(format!("{}/v1/audio/speech", ts.base))
+        .bearer_auth("plm_tts")
+        .json(&speech)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 404, "teaching error, not a crash");
+    let second = c
+        .post(format!("{}/v1/audio/speech", ts.base))
+        .bearer_auth("plm_tts")
+        .json(&speech)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 429, "rpm=1 exhausted by the local lane");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__local_whisper_charges_key_admission() {
+    use blazar_core::ApiKey;
+    // Audit MM1: local whisper transcriptions admit through the key
+    // store like every other generation lane (501 teaching below proves
+    // the request reached the lane AFTER admission charged it).
+    let cfg = Config {
+        keys: vec![ApiKey {
+            name: "ci".into(),
+            key: "plm_whisper".into(),
+            rpm: 1,
+            ..ApiKey::default()
+        }],
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let c = client();
+    let boundary = "X-BLAZAR-AUDIT-MM1";
+    let multipart = format!(
+        "--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; \
+         filename=\"clip.wav\"\r\ncontent-type: audio/wav\r\n\r\nAAAA\r\n--{boundary}--\r\n"
+    );
+    let post_multipart = |key: &'static str| {
+        let c = c.clone();
+        let url = format!("{}/v1/audio/transcriptions", ts.base);
+        let body = multipart.clone();
+        async move {
+            c.post(url)
+                .bearer_auth(key)
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    // First: 501 teaching (no whisper engine/model in the test dirs) —
+    // admission already charged the request.
+    let first = post_multipart("plm_whisper").await;
+    assert_eq!(first.status(), 501, "half-missing teaching");
+    let second = post_multipart("plm_whisper").await;
+    assert_eq!(second.status(), 429, "rpm=1 exhausted by the local lane");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__models_capabilities_field_matches_mmproj() {
+    // Audit MM13: /v1/models rows carry a capabilities array (blazar-
+    // native shape mirroring /api/show) — [] for text-only rows.
+    let ts = start(Config::default()).await;
+    let c = client();
+    let listed: serde_json::Value = c
+        .get(format!("{}/v1/models", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let data = listed["data"].as_array().cloned().unwrap_or_default();
+    assert!(!data.is_empty(), "harness model m1 present");
+    for row in &data {
+        assert!(
+            row.get("capabilities")
+                .is_some_and(serde_json::Value::is_array),
+            "every row carries a capabilities array: {row}"
+        );
+    }
+    // The harness rows have no mmproj attached.
+    assert!(data
+        .iter()
+        .all(|r| r["capabilities"].as_array().is_some_and(Vec::is_empty)));
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn e2e__keys_concurrency_cap() {
     use blazar_core::ApiKey;
     // Held streaming response keeps the slot leased (GuardedBody Drop fires

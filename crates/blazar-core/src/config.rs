@@ -425,6 +425,101 @@ pub struct Config {
     /// transport ceiling only).
     #[serde(default = "default_child_header_timeout_secs")]
     pub child_header_timeout_secs: u64,
+    /// Same ceiling, scoped to the sdcpp (diffusion) lane. A diffusion
+    /// child sends its first response byte only after the ENTIRE frame
+    /// is computed — time-to-headers IS generation time, minutes at
+    /// native resolutions on offloaded hardware (a 1024px qwen-image
+    /// tour on a streaming-from-RAM posture blew the text-lane 120s
+    /// ceiling live and got evicted mid-generation). Video runs longer
+    /// still. Default sized for image lanes; raise it for long video
+    /// tours. 0 disables (blanket transport ceiling only).
+    #[serde(default = "default_sdcpp_child_header_timeout_secs")]
+    pub sdcpp_child_header_timeout_secs: u64,
+    /// Step-caching strategy for sd-server children (`--cache-mode`):
+    /// one of easycache | ucache | dbcache | taylorseer | cache-dit |
+    /// spectrum. Adaptive feature reuse across denoising steps — a
+    /// large speed lever on `DiT` renders with threshold-controlled
+    /// quality drift. None = exact per-step compute (unchanged output).
+    #[serde(default)]
+    pub sdcpp_cache_mode: Option<String>,
+    /// Flash-attention kernels for sd-server children (`--fa`): faster
+    /// attention, less VRAM. On by default — measured 25% faster renders
+    /// at statistically identical output (seeded A/B, pixel delta 0.46%
+    /// of range); the manifest gate degrades to a warning on engines
+    /// that lack the flag.
+    #[serde(default = "default_true")]
+    pub sdcpp_flash_attention: bool,
+    /// Tiled VAE decode for sd-server children (`--vae-tiling`): fits
+    /// larger-than-VRAM decodes at some speed cost. Off by default.
+    #[serde(default)]
+    pub sdcpp_vae_tiling: bool,
+    /// RPC worker endpoints for sd-server children (`--rpc-servers`,
+    /// comma-joined) — the diffusion-lane twin of llamacpp
+    /// `rpc_servers`. Empty = local devices only.
+    #[serde(default)]
+    pub sdcpp_rpc_servers: Vec<String>,
+    /// `SageAttention` kernels for sd-server children (`--sage-attn`):
+    /// native 8-bit attention, roughly 2x over legacy kernels — but it
+    /// hard-requires a patched GGML CUDA backend (CUDA 12+, SM80+) and
+    /// the child DIES AT LOAD on other builds (verified live: the Vulkan
+    /// backend refuses and the engine exits). Off by default; only
+    /// enable on a CUDA engine you know carries the patched backend.
+    #[serde(default)]
+    pub sdcpp_sage_attn: bool,
+    /// Cache tuning for sd-server children (`--cache-option`, upstream
+    /// key=value list, e.g. "threshold=0.25,reset=0"): refines
+    /// `sdcpp_cache_mode` (thresholds, warmup, window per cache
+    /// family). Unset = engine defaults for the active cache mode.
+    #[serde(default)]
+    pub sdcpp_cache_option: Option<String>,
+    /// Per-device VRAM budget for sd-server weight placement
+    /// (`--max-vram`, GiB): a single value ("8") or assignments
+    /// ("cuda0=8,cuda1=6") bounding auto-fit placement. Unset =
+    /// full-device budgets.
+    #[serde(default)]
+    pub sdcpp_max_vram: Option<String>,
+    /// Explicit parameter-backend placement for sd-server children
+    /// (`--params-backend`, e.g. "diffusion=disk,clip=cpu"): pins where
+    /// weights live and disables auto-fit shuffling. Unset = auto.
+    #[serde(default)]
+    pub sdcpp_params_backend: Option<String>,
+    /// Weight distribution across assigned devices for sd-server
+    /// children (`--split-mode`): "row" (matmul row split, CUDA only)
+    /// or "layer" (whole transformer blocks per device), or per-module
+    /// assignments ("diffusion=row,te=layer"). Unset = layer.
+    #[serde(default)]
+    pub sdcpp_split_mode: Option<String>,
+    /// `Tiny AutoEncoder` path for sd-server children (`--tae`): fast
+    /// low-quality VAE decode for previews and iteration. Unset = the
+    /// model's full VAE.
+    #[serde(default)]
+    pub sdcpp_tae: Option<String>,
+    /// Cross-request conditioning (prompt-embedding) cache depth for
+    /// sd-server children (`--conditioning-cache-size`): repeated or
+    /// shared-prefix prompts skip re-encoding. 0 disables. Unset =
+    /// engine default (4).
+    #[serde(default)]
+    pub sdcpp_conditioning_cache_size: Option<u64>,
+    /// Model-builder arguments for sd-server children (`--model-args`,
+    /// upstream key=value list, e.g. `qwen_image_2_1_prefix_cache=true`):
+    /// family-specific engine levers ahead of first-class knobs. Unset =
+    /// engine defaults.
+    #[serde(default)]
+    pub sdcpp_model_args: Option<String>,
+    /// Per-tensor quantization overrides for sd-server children
+    /// (`--tensor-type-rules`, regex=type list, e.g.
+    /// `model.=q6_k,vae.=f16`): quantizes matching weight groups
+    /// independently for tighter VRAM budgets. Unset = checkpoint types.
+    #[serde(default)]
+    pub sdcpp_tensor_type_rules: Option<String>,
+    /// Gateway-side wait budget for synchronous and streaming media
+    /// jobs (image/video generations polled to completion): after this
+    /// many seconds the gateway answers 504 while the engine child may
+    /// still be rendering. Long video tours should raise this. 0 means
+    /// no gateway cap (the client disconnect or job completion is the
+    /// bound). Async handles are never capped — only their holders poll.
+    #[serde(default = "default_media_job_wait_secs")]
+    pub media_job_wait_secs: u64,
     /// Sentinel enforce: hard violations (invalid tool args, unknown tool
     /// names, schema violations) become 422s on NON-STREAMING chat
     /// requests (streaming bytes are already on the wire — warn-only
@@ -433,8 +528,9 @@ pub struct Config {
     pub sentinel_enforce: bool,
     /// E4 audit log: append one JSON line per GENERATION request
     /// (trace id, key, model, status, latency, priority, queue depth)
-    /// to `<data>/log/audit.jsonl`. Off by default; rotates at 16 MiB.
-    #[serde(default)]
+    /// to `<data>/log/audit.jsonl`. On by default (one append per
+    /// request, rotates at 16 MiB); set `false` to disable the trail.
+    #[serde(default = "default_true")]
     pub audit_log: bool,
     /// TLS: PEM certificate chain path. Empty = plain HTTP. Must be set
     /// together with `tls_key` (both or neither — validated).
@@ -740,8 +836,10 @@ pub struct Config {
     #[serde(default)]
     pub tensor_preset: String,
     /// Redact obvious PII (emails, bearer secrets, IPv4 addresses) from
-    /// `why`/`watch` output. Opt-in; access logs never carry bodies.
-    #[serde(default)]
+    /// `why`/`watch` output. On by default — redaction costs nothing
+    /// and access logs never carry bodies anyway; set `false` for
+    /// verbatim values.
+    #[serde(default = "default_true")]
     pub pii_scrub: bool,
     /// Video-in lane: directory containing the ffmpeg binary (models
     /// with video input; "" = engine default discovery).
@@ -1909,8 +2007,23 @@ impl Default for Config {
             sentinel: true,
             sentinel_stall_secs: 30,
             child_header_timeout_secs: 120,
+            sdcpp_child_header_timeout_secs: 900,
+            sdcpp_cache_mode: None,
+            sdcpp_flash_attention: true,
+            sdcpp_vae_tiling: false,
+            sdcpp_rpc_servers: Vec::new(),
+            sdcpp_sage_attn: false,
+            sdcpp_cache_option: None,
+            sdcpp_max_vram: None,
+            sdcpp_params_backend: None,
+            sdcpp_split_mode: None,
+            sdcpp_tae: None,
+            sdcpp_conditioning_cache_size: None,
+            sdcpp_model_args: None,
+            sdcpp_tensor_type_rules: None,
+            media_job_wait_secs: 900,
             sentinel_enforce: false,
-            audit_log: false,
+            audit_log: true,
             tls_cert: String::new(),
             tls_key: String::new(),
             cors_origins: Vec::new(),
@@ -2015,7 +2128,7 @@ impl Default for Config {
             control_vectors_scaled: Vec::new(),
             control_vector_layer_range: String::new(),
             tensor_preset: String::new(),
-            pii_scrub: false,
+            pii_scrub: true,
             video_ffmpeg_dir: String::new(),
             video_fps: 0.0,
             video_timestamp_interval: 0.0,
@@ -2802,11 +2915,12 @@ impl Config {
         Ok(())
     }
 
-    /// Validation for the capacity/steering knobs added in the
-    /// beat-ollama wave: `cache_type` vocabulary, `ctx_extend` range,
-    /// expert counts, override-tensor shapes. Kept separate from `validate`
-    /// to stay under the line budget with the base checks.
-    fn validate_new_knobs(&self) -> CoreResult<()> {
+    /// Time-bound knobs share one shape of rule — 0 disables, else a
+    /// documented band — and one home, extracted from
+    /// `validate_new_knobs` to stay under its line budget. The diffusion
+    /// header ceiling gets a taller band than text lanes: its
+    /// time-to-headers IS full generation time.
+    fn validate_time_bounds(&self) -> CoreResult<()> {
         if self.sentinel
             && self.sentinel_stall_secs != 0
             && !(5..=600).contains(&self.sentinel_stall_secs)
@@ -2824,6 +2938,154 @@ impl Config {
                 self.child_header_timeout_secs
             )));
         }
+        if self.sdcpp_child_header_timeout_secs != 0
+            && !(5..=3600).contains(&self.sdcpp_child_header_timeout_secs)
+        {
+            return Err(CoreError::Config(format!(
+                "sdcpp_child_header_timeout_secs must be 0 (off) or 5..=3600, got {}",
+                self.sdcpp_child_header_timeout_secs
+            )));
+        }
+        self.validate_sdcpp_tuning()?;
+        if self.media_job_wait_secs != 0 && !(5..=86_400).contains(&self.media_job_wait_secs) {
+            return Err(CoreError::Config(format!(
+                "media_job_wait_secs must be 0 (no cap) or 5..=86400, got {}",
+                self.media_job_wait_secs
+            )));
+        }
+        Ok(())
+    }
+
+    /// sd-server tuning knobs share one home, extracted from
+    /// `validate_time_bounds` to stay under its line budget: cache
+    /// mode/option shapes, per-device VRAM budgets, weight-placement
+    /// vocabularies, and the conditioning-cache bound.
+    fn validate_sdcpp_tuning(&self) -> CoreResult<()> {
+        let sdcpp_cache_modes: &[&str] = &[
+            "easycache",
+            "ucache",
+            "dbcache",
+            "taylorseer",
+            "cache-dit",
+            "spectrum",
+        ];
+        if let Some(mode) = self.sdcpp_cache_mode.as_deref() {
+            if !sdcpp_cache_modes.contains(&mode) {
+                return Err(CoreError::Config(format!(
+                    "sdcpp_cache_mode must be one of {} (or unset), got {mode:?}",
+                    sdcpp_cache_modes.join(" | ")
+                )));
+            }
+        }
+        for endpoint in &self.sdcpp_rpc_servers {
+            if endpoint.is_empty() || !endpoint.contains(':') {
+                return Err(CoreError::Config(format!(
+                    "sdcpp_rpc_servers entries must be host:port, got {endpoint:?}"
+                )));
+            }
+        }
+        self.validate_sdcpp_kv_tokens()?;
+        if let Some(vram) = self.sdcpp_max_vram.as_deref() {
+            let bad = vram.split(',').find(|t| {
+                let t = t.trim();
+                let val = t.split('=').next_back().unwrap_or("");
+                t.is_empty()
+                    || t.contains(char::is_whitespace)
+                    || !val.chars().all(|c| c.is_ascii_digit() || c == '.')
+                    || val.parse::<f64>().map_or(true, |v| v <= 0.0)
+            });
+            if let Some(t) = bad {
+                return Err(CoreError::Config(format!(
+                    "sdcpp_max_vram must be GiB values or device=GiB assignments (e.g. \"8\" or \"cuda0=8,cuda1=6\"), got {t:?}"
+                )));
+            }
+        }
+        for (key, value, allowed) in [
+            (
+                "sdcpp_params_backend",
+                self.sdcpp_params_backend.as_deref(),
+                ["disk", "cpu"].as_slice(),
+            ),
+            (
+                "sdcpp_split_mode",
+                self.sdcpp_split_mode.as_deref(),
+                ["layer", "row"].as_slice(),
+            ),
+        ] {
+            let Some(value) = value else { continue };
+            let bad = value.split(',').find(|t| {
+                let t = t.trim();
+                match t.split_once('=') {
+                    Some((module, mode)) => module.is_empty() || !allowed.contains(&mode),
+                    None => !allowed.contains(&t),
+                }
+            });
+            if let Some(t) = bad {
+                return Err(CoreError::Config(format!(
+                    "{key} must be {} or module assignments (e.g. \"diffusion={}\"), got {t:?}",
+                    allowed.join("/"),
+                    allowed[0]
+                )));
+            }
+        }
+        if let Some(tae) = self.sdcpp_tae.as_deref() {
+            if tae.trim().is_empty() {
+                return Err(CoreError::Config(
+                    "sdcpp_tae must be a Tiny AutoEncoder model path, got \"\"".into(),
+                ));
+            }
+        }
+        if let Some(n) = self.sdcpp_conditioning_cache_size {
+            if n > 1024 {
+                return Err(CoreError::Config(format!(
+                    "sdcpp_conditioning_cache_size must be 0 (disable) ..= 1024, got {n}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Comma-separated key=value token lists (cache options, model
+    /// builder args, tensor-type rules) share one shape: non-empty
+    /// tokens, one `=` each, no whitespace.
+    fn validate_sdcpp_kv_tokens(&self) -> CoreResult<()> {
+        for (key, value, example) in [
+            (
+                "sdcpp_cache_option",
+                self.sdcpp_cache_option.as_deref(),
+                "threshold=0.25,reset=0",
+            ),
+            (
+                "sdcpp_model_args",
+                self.sdcpp_model_args.as_deref(),
+                "qwen_image_2_1_prefix_cache=true",
+            ),
+            (
+                "sdcpp_tensor_type_rules",
+                self.sdcpp_tensor_type_rules.as_deref(),
+                "model.=q6_k,vae.=f16",
+            ),
+        ] {
+            let Some(value) = value else { continue };
+            let bad = value.split(',').find(|t| {
+                let t = t.trim();
+                t.is_empty() || !t.contains('=') || t.contains(char::is_whitespace)
+            });
+            if let Some(t) = bad {
+                return Err(CoreError::Config(format!(
+                    "{key} must be comma-separated key=value tokens (e.g. \"{example}\"), got {t:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validation for the capacity/steering knobs added in the
+    /// beat-ollama wave: `cache_type` vocabulary, `ctx_extend` range,
+    /// expert counts, override-tensor shapes. Kept separate from `validate`
+    /// to stay under the line budget with the base checks.
+    fn validate_new_knobs(&self) -> CoreResult<()> {
+        self.validate_time_bounds()?;
         if self.raw_lane_max_tokens != 0 && !(256..=100_000).contains(&self.raw_lane_max_tokens) {
             return Err(CoreError::Config(format!(
                 "raw_lane_max_tokens must be 0 (off) or 256..=100000, got {}",
@@ -3377,6 +3639,14 @@ fn default_stall_secs() -> u64 {
 
 fn default_child_header_timeout_secs() -> u64 {
     120
+}
+
+fn default_sdcpp_child_header_timeout_secs() -> u64 {
+    900
+}
+
+fn default_media_job_wait_secs() -> u64 {
+    900
 }
 
 fn default_raw_lane_max_tokens() -> u64 {
@@ -4249,6 +4519,178 @@ default_ctx = 16384
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("idle_timeout_secs"));
+    }
+
+    #[test]
+    fn unit__validation__sdcpp_child_header_timeout_range_enforced() {
+        // Diffusion lanes need a much taller header ceiling than text
+        // (time to first header == full generation time), but the knob
+        // is still bounded: 0 disables, 5..=3600s is the sane band.
+        assert_eq!(Config::default().sdcpp_child_header_timeout_secs, 900);
+        for bad in [3u64, 4, 3601, 9999] {
+            let cfg = Config {
+                sdcpp_child_header_timeout_secs: bad,
+                ..Config::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("sdcpp_child_header_timeout_secs"),
+                "value {bad} should be rejected"
+            );
+        }
+        for good in [0u64, 5, 900, 3600] {
+            let cfg = Config {
+                sdcpp_child_header_timeout_secs: good,
+                ..Config::default()
+            };
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("value {good} should be accepted: {e}"));
+        }
+    }
+
+    #[test]
+    fn unit__defaults__measured_or_free_knobs_on_costly_knobs_off() {
+        // Every default here is a shipped verdict, not a placeholder:
+        // flash attention measured 25% faster at identical quality;
+        // pii scrub and the audit trail cost nothing and protect the
+        // operator; sage attention dies at load without patched CUDA
+        // SM80+ GGML, and step-caching trades measured detail for speed.
+        let cfg = Config::default();
+        assert!(cfg.sdcpp_flash_attention, "fa default flipped off?");
+        assert!(cfg.pii_scrub, "pii scrub default flipped off?");
+        assert!(cfg.audit_log, "audit log default flipped off?");
+        assert!(
+            !cfg.sdcpp_sage_attn,
+            "sage is fatal off-CUDA — must stay off"
+        );
+        assert_eq!(cfg.sdcpp_cache_mode, None, "cache mode must stay opt-in");
+    }
+
+    #[test]
+    fn unit__validation__sdcpp_tuning_knobs_enforced() {
+        // cache_mode is an enum-or-unset; rpc entries must look like
+        // host:port. Everything else is a launch-time concern.
+        let cfg = Config {
+            sdcpp_cache_mode: Some("turbo-cache".to_string()),
+            ..Config::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("sdcpp_cache_mode"), "{err}");
+        for good in [
+            "easycache",
+            "ucache",
+            "dbcache",
+            "taylorseer",
+            "cache-dit",
+            "spectrum",
+        ] {
+            let cfg = Config {
+                sdcpp_cache_mode: Some(good.to_string()),
+                ..Config::default()
+            };
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{good} should be accepted: {e}"));
+        }
+        let cfg = Config {
+            sdcpp_rpc_servers: vec!["no-port".to_string()],
+            ..Config::default()
+        };
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("sdcpp_rpc_servers"));
+        // New sd-server knob surface: bad shapes teach, good shapes pass.
+        for (field, bad) in [
+            ("sdcpp_cache_option", Some("threshold 0.25")),
+            ("sdcpp_cache_option", Some("threshold")),
+            ("sdcpp_max_vram", Some("abc")),
+            ("sdcpp_max_vram", Some("cuda0=0")),
+            ("sdcpp_params_backend", Some("gpu")),
+            ("sdcpp_params_backend", Some("diffusion=gpu")),
+            ("sdcpp_split_mode", Some("diagonal")),
+            ("sdcpp_tae", Some("")),
+            ("sdcpp_model_args", Some("prefix_cache true")),
+            ("sdcpp_model_args", Some("prefix_cache")),
+            ("sdcpp_tensor_type_rules", Some("model q6_k")),
+            ("sdcpp_tensor_type_rules", Some("q6_k")),
+        ] {
+            let mut cfg = Config::default();
+            match field {
+                "sdcpp_cache_option" => cfg.sdcpp_cache_option = bad.map(str::to_string),
+                "sdcpp_max_vram" => cfg.sdcpp_max_vram = bad.map(str::to_string),
+                "sdcpp_params_backend" => cfg.sdcpp_params_backend = bad.map(str::to_string),
+                "sdcpp_split_mode" => cfg.sdcpp_split_mode = bad.map(str::to_string),
+                "sdcpp_tae" => cfg.sdcpp_tae = bad.map(str::to_string),
+                "sdcpp_model_args" => cfg.sdcpp_model_args = bad.map(str::to_string),
+                "sdcpp_tensor_type_rules" => cfg.sdcpp_tensor_type_rules = bad.map(str::to_string),
+                _ => unreachable!(),
+            }
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains(field), "{field} should reject {bad:?}: {err}");
+        }
+        let cfg = Config {
+            sdcpp_conditioning_cache_size: Some(2000),
+            ..Config::default()
+        };
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("sdcpp_conditioning_cache_size"));
+        let cfg = Config {
+            sdcpp_cache_option: Some("threshold=0.25,reset=0".to_string()),
+            sdcpp_max_vram: Some("cuda0=8,cuda1=6".to_string()),
+            sdcpp_params_backend: Some("diffusion=disk".to_string()),
+            sdcpp_split_mode: Some("diffusion=row,te=layer".to_string()),
+            sdcpp_tae: Some("/models/tae.gguf".to_string()),
+            sdcpp_conditioning_cache_size: Some(0),
+            sdcpp_model_args: Some("qwen_image_2_1_prefix_cache=true".to_string()),
+            sdcpp_tensor_type_rules: Some("model.=q6_k,vae.=f16".to_string()),
+            ..Config::default()
+        };
+        cfg.validate()
+            .unwrap_or_else(|e| panic!("valid knob set rejected: {e}"));
+        let cfg = Config {
+            sdcpp_rpc_servers: vec![String::new()],
+            ..Config::default()
+        };
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("sdcpp_rpc_servers"));
+        let cfg = Config {
+            sdcpp_rpc_servers: vec!["10.0.0.2:50052".to_string()],
+            ..Config::default()
+        };
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn unit__validation__media_job_wait_secs_range_enforced() {
+        // 0 = no gateway cap (async handles never wait); the sane band
+        // tops out at a full day for marathon video tours.
+        assert_eq!(Config::default().media_job_wait_secs, 900);
+        for bad in [3u64, 4, 86_401, 999_999] {
+            let cfg = Config {
+                media_job_wait_secs: bad,
+                ..Config::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("media_job_wait_secs"),
+                "value {bad} should be rejected"
+            );
+        }
+        for good in [0u64, 5, 900, 86_400] {
+            let cfg = Config {
+                media_job_wait_secs: good,
+                ..Config::default()
+            };
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("value {good} should be accepted: {e}"));
+        }
     }
 
     #[test]

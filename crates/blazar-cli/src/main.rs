@@ -178,7 +178,7 @@ enum Cmd {
     },
     /// Interactive loop against a model, by kind: text chats (streams;
     /// /exit /clear /model /sysinfo /profile), diffusion sets generate
-    /// images or video, pulled piper voices speak text aloud; with an
+    /// images or video, pulled piper voices write WAV clips; with an
     /// inline PROMPT: single-shot, prints and exits
     Run {
         model: String,
@@ -340,10 +340,6 @@ enum Cmd {
         /// Playback speed (0.25..=4.0, 1.0 = native)
         #[arg(long, requires = "text")]
         speed: Option<f64>,
-        /// Write the WAV without local playback (for scripts; playing
-        /// requires a terminal and an audio player anyway)
-        #[arg(long, requires = "text")]
-        no_play: bool,
     },
     /// Engine management: llama.cpp releases, mistral.rs lane, source
     /// builds (`build cuda|cpu`), rollback + update channels
@@ -944,6 +940,19 @@ fn gen_http() -> reqwest::Client {
         .unwrap_or_default()
 }
 
+/// Sync image turns hold one request across the WHOLE render, which can
+/// outlast `gen_http`'s 10-minute ceiling on offloaded hardware. The
+/// bound stays generous-but-finite (unlike the gateway's loopback media
+/// client) because the CLI may talk to a remote daemon over a real
+/// network, where a vanished peer must not hang the turn forever.
+fn media_http() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(7_200))
+        .build()
+        .unwrap_or_default()
+}
+
 fn dirs() -> BlazarDirs {
     BlazarDirs::from_env()
 }
@@ -1198,6 +1207,223 @@ fn tokio_deadline(d: Duration) -> std::time::Instant {
     std::time::Instant::now() + d
 }
 
+async fn daemon_healthy(base: &str, http: &reqwest::Client) -> bool {
+    matches!(
+        http.get(format!("{base}/healthz")).send().await,
+        Ok(r) if r.status().is_success()
+    )
+}
+
+async fn wait_healthz(base: &str, http: &reqwest::Client, deadline: std::time::Instant) -> bool {
+    while std::time::Instant::now() < deadline {
+        if daemon_healthy(base, http).await {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    false
+}
+
+async fn wait_healthz_down(
+    base: &str,
+    http: &reqwest::Client,
+    deadline: std::time::Instant,
+) -> bool {
+    while std::time::Instant::now() < deadline {
+        if !daemon_healthy(base, http).await {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    false
+}
+
+/// Pid of the daemon named by `pidfile`, if present and parseable.
+fn pidfile_pid(pidfile: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(pidfile)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
+/// Wait for the daemon PROCESS named by `pidfile` to exit — not just
+/// its listener. `stop()` delivers a drain-and-exit signal: the daemon
+/// finishes in-flight work (an image generation can run for minutes)
+/// while still holding the daemon lock, and a successor spawn refuses
+/// to start until the owner is gone. The daemon removes its pidfile on
+/// clean exit (RAII); the pid-vanishes-from-the-process-table check
+/// covers the crash path.
+fn wait_daemon_exit(pidfile: &std::path::Path, deadline: std::time::Instant) -> bool {
+    let mut noted = false;
+    loop {
+        let exited =
+            pidfile_pid(pidfile).is_none_or(|pid| !blazar_runtime::process_alive_by_pid(pid));
+        if exited {
+            return true;
+        }
+        if !noted {
+            noted = true;
+            println!("waiting for the daemon to finish in-flight work (draining)…");
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// `systemctl is-active --quiet blazar` under a 3s cap: an unresponsive
+/// systemctl (hung D-Bus, NFS automount) must not stall the command that
+/// asked for the restart.
+async fn systemd_unit_is_active() -> bool {
+    let mut cmd = tokio::process::Command::new("systemctl");
+    cmd.args(["is-active", "--quiet", "blazar"]);
+    matches!(
+        tokio::time::timeout(Duration::from_secs(3), cmd.output()).await,
+        Ok(Ok(out)) if out.status.success()
+    )
+}
+
+async fn run_systemctl(args: &[&str]) -> bool {
+    let mut cmd = tokio::process::Command::new("systemctl");
+    cmd.args(args);
+    matches!(
+        tokio::time::timeout(Duration::from_secs(15), cmd.output()).await,
+        Ok(Ok(out)) if out.status.success()
+    )
+}
+
+/// `launchctl kickstart -k` cycles the agent in place (macOS lane).
+async fn launchd_kickstart() -> bool {
+    #[cfg(unix)]
+    {
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        let Some(uid) = uid else {
+            return false;
+        };
+        let system_target = uid == "0";
+        let user_target = format!("gui/{uid}/dev.blazar");
+        let target = if system_target {
+            "system/dev.blazar"
+        } else {
+            user_target.as_str()
+        };
+        let mut cmd = tokio::process::Command::new("launchctl");
+        cmd.args(["kickstart", "-k", target]);
+        matches!(
+            tokio::time::timeout(Duration::from_secs(15), cmd.output()).await,
+            Ok(Ok(out)) if out.status.success()
+        )
+    }
+    #[cfg(not(unix))]
+    false
+}
+
+/// Restart a running daemon so a just-landed change (binary swap,
+/// engine switch, tuning adoption) takes effect NOW instead of on the
+/// next manual stop. Silent no-op when no daemon is up — updates must
+/// not grow a daemon-start side effect. Returns true only when a fresh
+/// daemon is provably healthy again.
+///
+/// Boxed: this future drags in `stop`/`ensure_daemon` frames (~16 KB),
+/// and every command path that can auto-install an engine embeds it —
+/// inlining it tipped the `run` handler over clippy's future-size limit.
+fn restart_daemon() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
+    Box::pin(restart_daemon_impl())
+}
+
+async fn restart_daemon_impl() -> bool {
+    let Ok(cfg) = config() else {
+        return false;
+    };
+    let base = daemon_base(&cfg);
+    let Ok(http) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    else {
+        return false;
+    };
+    if !daemon_healthy(&base, &http).await {
+        return false;
+    }
+    let up_deadline = tokio_deadline(Duration::from_secs(30));
+    // Lane 1 — systemd. Gated on is-active: `restart` on an inactive
+    // unit would START it. A plain user without polkit rights falls
+    // through to the stop lane, which needs no privileges at all.
+    if systemd_unit_is_active().await
+        && run_systemctl(&["restart", "blazar", "--no-ask-password"]).await
+        && wait_healthz(&base, &http, up_deadline).await
+    {
+        println!("daemon restarted — the update is live");
+        return true;
+    }
+    // Lane 2 — launchd kickstart.
+    if launchd_kickstart().await && wait_healthz(&base, &http, up_deadline).await {
+        println!("daemon restarted — the update is live");
+        return true;
+    }
+    // Lane 3 — no manager (or no rights): stop must SUCCEED, the
+    // listener must go DOWN, and the draining process must fully EXIT
+    // before any start attempt — the successor spawn refuses to take
+    // the daemon lock while the old owner is still finishing in-flight
+    // work. A false "restarted" receipt here would be worse than an
+    // honest warning.
+    if stop().is_ok()
+        && wait_healthz_down(&base, &http, tokio_deadline(Duration::from_secs(10))).await
+    {
+        // The drain wait can outlast any reasonable inline poll (image
+        // generations run minutes) — run it OFF the async worker and
+        // keep this future small.
+        let pidfile = dirs().run_dir().join("blazar.pid");
+        let exited = tokio::task::spawn_blocking(move || {
+            wait_daemon_exit(&pidfile, tokio_deadline(Duration::from_secs(180)))
+        })
+        .await
+        .unwrap_or(false);
+        if !exited {
+            eprintln!(
+                "warning: the daemon is still finishing in-flight work; it \
+                 restarts itself once done (systemd Restart=always) or on the \
+                 next blazar command"
+            );
+            return false;
+        }
+        match ensure_daemon().await {
+            Ok(_) => {
+                println!("daemon restarted — the update is live");
+                return true;
+            }
+            Err(e) => {
+                eprintln!("warning: could not restart the daemon: {e:#}");
+                return false;
+            }
+        }
+    }
+    eprintln!(
+        "warning: the daemon still serves the previous state — restart it \
+         manually (`systemctl restart blazar`, or `blazar stop` + any command)"
+    );
+    false
+}
+
+/// Restart the daemon only when the ACTIVE engine actually changed under
+/// it: running children keep executing the old engine's binary until a
+/// restart sweeps them. Sibling installs (fork lanes, keep-CUDA guards,
+/// lazy whisper lanes) pass `new_active = None` and are a no-op, as is a
+/// re-activation of the same tag.
+async fn restart_daemon_if_active_changed(prior: Option<String>, new_active: Option<String>) {
+    if new_active.is_none() || prior == new_active {
+        return;
+    }
+    restart_daemon().await;
+}
+
 #[tokio::main]
 // Pure one-call-per-arm dispatch over 30+ commands; splitting arms into
 // helpers would add indirection without lowering complexity.
@@ -1281,17 +1507,20 @@ async fn run(cmd: Cmd) -> Result<()> {
             load,
             replicas,
             cache_reuse,
-        } => tune_full(
-            &resolve_model_cli(&model),
-            search,
-            ctx,
-            spec,
-            slots,
-            ngram,
-            load,
-            replicas,
-            cache_reuse,
-        ),
+        } => {
+            tune_full(
+                &resolve_model_cli(&model),
+                search,
+                ctx,
+                spec,
+                slots,
+                ngram,
+                load,
+                replicas,
+                cache_reuse,
+            )
+            .await
+        }
         Cmd::Engine { cmd } => engine_cmd(cmd).await,
         Cmd::Lora { cmd } => lora_cmd(cmd),
         Cmd::Search {
@@ -1351,7 +1580,6 @@ async fn run(cmd: Cmd) -> Result<()> {
             pin,
             out,
             speed,
-            no_play,
         } => {
             tts_cmd(
                 text,
@@ -1364,7 +1592,6 @@ async fn run(cmd: Cmd) -> Result<()> {
                 pin,
                 out,
                 speed,
-                no_play,
             )
             .await
         }
@@ -2335,7 +2562,10 @@ enum GpuTenantClass {
 
 /// Pure classification (testable): a live blazar descendant is owned;
 /// a non-descendant running a binary from the engines dir is an
-/// orphaned engine server; anything else is foreign.
+/// orphaned engine server — EXCEPT ggml-rpc-server, the one engines-dir
+/// binary blazar never execs (users run it by hand for `--rpc`
+/// offload; `rpc_servers` points at it), so a live one is a deliberate
+/// co-tenant, never a boot sweep target; anything else is foreign.
 fn classify_gpu_tenant(
     process_name: &str,
     engines_dir: &Path,
@@ -2343,10 +2573,13 @@ fn classify_gpu_tenant(
 ) -> GpuTenantClass {
     if is_descendant {
         GpuTenantClass::Owned
-    } else if Path::new(process_name).starts_with(engines_dir) {
-        GpuTenantClass::OrphanedEngine
-    } else {
+    } else if !Path::new(process_name).starts_with(engines_dir) {
         GpuTenantClass::Foreign
+    } else {
+        match Path::new(process_name).file_name().and_then(|n| n.to_str()) {
+            Some("ggml-rpc-server") => GpuTenantClass::Foreign,
+            _ => GpuTenantClass::OrphanedEngine,
+        }
     }
 }
 
@@ -6806,7 +7039,6 @@ async fn tts_cmd(
     pin: Option<String>,
     out: Option<PathBuf>,
     speed: Option<f64>,
-    no_play: bool,
 ) -> Result<()> {
     let d = dirs();
     if let Some(value) = pin {
@@ -6882,8 +7114,7 @@ async fn tts_cmd(
             "no text given — pass text to synthesize, or use --install/--pull/--list"
         ));
     };
-    let play = !no_play && std::io::IsTerminal::is_terminal(&std::io::stdout());
-    tts_speak(&d, &text, voice, out.as_deref(), speed, play).await
+    tts_speak(&d, &text, voice, out.as_deref(), speed).await
 }
 
 /// Catalog arm of `blazar tts --search <substr>`: the full
@@ -6929,7 +7160,6 @@ async fn tts_speak(
     voice: Option<&str>,
     out: Option<&Path>,
     speed: Option<f64>,
-    play: bool,
 ) -> Result<()> {
     let voice = if let Some(v) = voice {
         v.to_string()
@@ -6941,7 +7171,7 @@ async fn tts_speak(
     };
     let base = ensure_daemon().await?;
     let wav = speech_post(&base, &voice, text, speed).await?;
-    write_speech_out(&voice, &wav, out, play)
+    write_speech_out(&voice, &wav, out)
 }
 
 /// Compact timestamp for default output names (no chrono dep needed for
@@ -7023,8 +7253,12 @@ async fn whisper_cmd(
                     .and_then(|p| p.parent())
                     .and_then(|p| p.file_name())
                     .map_or_else(|| "?".into(), |t| t.to_string_lossy().into_owned());
-                let pin = if blazar_runtime::whisper::pinned_tag(&d).is_some()
-                    && blazar_runtime::whisper::is_legacy_bin(&d, &bin)
+                // The (pinned) marker follows the serving pick, whichever
+                // lane holds it: pinned==serving tag means the pin is
+                // live (installed_tag mirrors server_bin's resolution).
+                let pinned = blazar_runtime::whisper::pinned_tag(&d);
+                let pin = if pinned.is_some()
+                    && pinned == blazar_runtime::whisper::installed_tag(&d)
                 {
                     " (pinned)"
                 } else {
@@ -7443,6 +7677,19 @@ fn parse_gen_steps(v: &str) -> Option<u64> {
     v.parse::<u64>().ok().filter(|n| (1..=100).contains(n))
 }
 
+/// Generation seed — signed because upstream treats negatives as
+/// re-roll-per-request; a pinned non-negative seed reproduces exactly.
+fn parse_gen_seed(v: &str) -> Option<i64> {
+    v.parse::<i64>().ok()
+}
+
+/// Video frame counts: any positive count the engine can align (wan
+/// rounds DOWN to 4k+1); the cap keeps a fat-finger from asking for
+/// hour-scale renders the box cannot hold.
+fn parse_gen_frames(v: &str) -> Option<u64> {
+    v.parse::<u64>().ok().filter(|n| (1..=201).contains(n))
+}
+
 /// Video duration in seconds, capped where patience ends.
 fn parse_gen_duration(v: &str) -> Option<u64> {
     v.parse::<u64>().ok().filter(|n| (1..=60).contains(n))
@@ -7454,13 +7701,19 @@ fn parse_gen_speed(v: &str) -> Option<f64> {
 }
 
 /// POST one sync image request; returns the raw response so the caller
-/// can branch on status without re-sending.
+/// can branch on status without re-sending. `seed`/`negative_prompt`
+/// ride only when set: the body stays in the plain compat dialect when
+/// both are None (byte-identical legacy path) and switches to the
+/// full native dialect, which honors them, when either is present.
+#[allow(clippy::too_many_arguments)]
 async fn image_post(
     base: &str,
     model: &str,
     prompt: &str,
     size: Option<&str>,
     steps: Option<u64>,
+    seed: Option<i64>,
+    negative_prompt: Option<&str>,
 ) -> Result<reqwest::Response> {
     let mut body = serde_json::json!({"model": model, "prompt": prompt});
     if let Some(s) = size {
@@ -7469,7 +7722,13 @@ async fn image_post(
     if let Some(n) = steps {
         body["steps"] = serde_json::json!(n);
     }
-    let mut req = gen_http()
+    if let Some(s) = seed {
+        body["seed"] = serde_json::json!(s);
+    }
+    if let Some(n) = negative_prompt {
+        body["negative_prompt"] = serde_json::json!(n);
+    }
+    let mut req = media_http()
         .post(format!("{base}/v1/images/generations"))
         .json(&body);
     if let Some(b) = admin_bearer() {
@@ -7516,56 +7775,21 @@ fn write_gen_out(model: &str, bytes: &[u8], ext: &str) -> Result<String> {
     Ok(path)
 }
 
-/// Preview width: terminal columns when attached, else a stable 64 for
-/// piped runs (deterministic renders for scripts and tests).
-fn preview_width() -> u32 {
-    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-        return 64;
-    }
-    let (cols, _) = viuer::terminal_size();
-    if cols > 10 {
-        u32::from(cols - 2)
-    } else {
-        64
-    }
-}
-
-/// Inline image render right after the artifact lands on disk. viuer
-/// picks the best protocol the terminal offers (kitty/iTerm when
-/// present, halfblocks everywhere else), so this is one call on our
-/// side; a decode or render failure is one teaching line, never a
-/// failed turn — the file is already written.
-fn render_preview(bytes: &[u8]) {
-    let config = viuer::Config {
-        width: Some(preview_width()),
-        ..viuer::Config::default()
-    };
-    let outcome = image::load_from_memory(bytes)
-        .map_err(|e| e.to_string())
-        .and_then(|img| {
-            viuer::print(&img, &config)
-                .map(|_dims| ())
-                .map_err(|e| e.to_string())
-        });
-    if let Err(e) = outcome {
-        println!("(preview unavailable: {e})");
-    }
-}
-
 /// One image turn: sync request, PNG (or family format) to the working
-/// directory, then an inline preview when asked. Returns Ok even on
-/// server rejections — a bad prompt must not kill the loop; the error
-/// line teaches and the next turn waits.
+/// directory. Returns Ok even on server rejections — a bad prompt must
+/// not kill the loop; the error line teaches and the next turn waits.
+#[allow(clippy::too_many_arguments)]
 async fn image_turn(
     base: &str,
     model: &str,
     prompt: &str,
     size: Option<&str>,
     steps: Option<u64>,
-    preview: bool,
+    seed: Option<i64>,
+    negative_prompt: Option<&str>,
 ) {
     let started = std::time::Instant::now();
-    match image_post(base, model, prompt, size, steps).await {
+    match image_post(base, model, prompt, size, steps, seed, negative_prompt).await {
         Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
             Ok(v) => match image_payload(&v) {
                 Some((bytes, ext)) => match write_gen_out(model, &bytes, &ext) {
@@ -7575,9 +7799,6 @@ async fn image_turn(
                             humansize(i64::try_from(bytes.len()).unwrap_or(i64::MAX)),
                             started.elapsed().as_secs_f64()
                         );
-                        if preview {
-                            render_preview(&bytes);
-                        }
                     }
                     Err(e) => println!("error: {e}"),
                 },
@@ -7595,19 +7816,19 @@ async fn image_turn(
 
 /// Image loop for diffusion component sets and standalone checkpoints:
 /// every line is a prompt, every answer an image in the working
-/// directory (previewed inline when the terminal can render). Knobs
-/// override the server's family defaults; omitted knobs let the daemon
-/// size the request (the same defaults the HTTP API applies).
+/// directory. Knobs override the server's family defaults; omitted
+/// knobs let the daemon size the request (the same defaults the HTTP
+/// API applies).
 async fn image_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()> {
     if let Some(prompt) = inline {
-        let preview = std::io::IsTerminal::is_terminal(&std::io::stdout());
-        image_turn(base, model, prompt, None, None, preview).await;
+        image_turn(base, model, prompt, None, None, None, None).await;
         return Ok(());
     }
     let mut rl = rustyline::DefaultEditor::new()?;
     let mut size: Option<String> = None;
     let mut steps: Option<u64> = None;
-    let mut preview = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let mut seed: Option<i64> = None;
+    let mut negative: Option<String> = None;
     #[cfg(unix)]
     install_repl_sigint();
     println!("blazar image REPL — {model} (a prompt generates; /help; /exit)");
@@ -7619,10 +7840,13 @@ async fn image_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()>
         match line.as_str() {
             "/exit" | "/bye" => break,
             "/help" => {
-                println!("commands: /exit /bye /size <WxH> /steps <n> /preview on|off");
+                println!(
+                    "commands: /exit /bye /size <WxH> /steps <n> /seed <n> \
+                     /negative <text> (bare /negative clears)"
+                );
                 println!(
                     "input:   plain text prompts; a turn answers with an image file \
-                     in the working directory (rendered inline when /preview is on)"
+                     in the working directory"
                 );
             }
             _ if line.starts_with("/size ") => {
@@ -7643,22 +7867,43 @@ async fn image_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()>
                     None => println!("(usage: /steps 24 — 1..=100)"),
                 }
             }
-            _ if line.starts_with("/preview ") => match line["/preview ".len()..].trim() {
-                "on" | "true" => {
-                    preview = true;
-                    println!("(preview on — images render after writing)");
+            _ if line.starts_with("/seed ") => {
+                match parse_gen_seed(line["/seed ".len()..].trim()) {
+                    Some(s) => {
+                        seed = Some(s);
+                        println!("(seed {s})");
+                    }
+                    None => println!("(usage: /seed 42 — an integer; -1 re-rolls per turn)"),
                 }
-                "off" | "false" => {
-                    preview = false;
-                    println!("(preview off — files land silently)");
+            }
+            "/negative" => {
+                negative = None;
+                println!("(negative prompt cleared)");
+            }
+            _ if line.starts_with("/negative ") => {
+                let text = line["/negative ".len()..].trim().to_string();
+                if text.is_empty() {
+                    negative = None;
+                    println!("(negative prompt cleared)");
+                } else {
+                    println!("(negative: {text})");
+                    negative = Some(text);
                 }
-                _ => println!("(usage: /preview on|off)"),
-            },
+            }
             _ if line.starts_with('/') => {
                 println!("(unknown command — /help)");
             }
             _ => {
-                image_turn(base, model, &line, size.as_deref(), steps, preview).await;
+                image_turn(
+                    base,
+                    model,
+                    &line,
+                    size.as_deref(),
+                    steps,
+                    seed,
+                    negative.as_deref(),
+                )
+                .await;
             }
         }
     }
@@ -7669,12 +7914,18 @@ async fn image_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()>
 
 /// Submit one video job (`"async": true` — video turns run minutes, a
 /// sync POST would hold the socket hostage) and return its id.
+/// `frames`/`seed`/`negative_prompt` ride only when set (gateway
+/// canonicalizes `frames` onto the native `video_frames`).
+#[allow(clippy::too_many_arguments)]
 async fn video_submit(
     base: &str,
     model: &str,
     prompt: &str,
     size: Option<&str>,
     duration: Option<u64>,
+    frames: Option<u64>,
+    seed: Option<i64>,
+    negative_prompt: Option<&str>,
 ) -> Result<String> {
     let mut body = serde_json::json!({"model": model, "prompt": prompt, "async": true});
     if let Some(s) = size {
@@ -7682,6 +7933,15 @@ async fn video_submit(
     }
     if let Some(d) = duration {
         body["duration"] = serde_json::json!(d);
+    }
+    if let Some(f) = frames {
+        body["frames"] = serde_json::json!(f);
+    }
+    if let Some(s) = seed {
+        body["seed"] = serde_json::json!(s);
+    }
+    if let Some(n) = negative_prompt {
+        body["negative_prompt"] = serde_json::json!(n);
     }
     let mut req = gen_http()
         .post(format!("{base}/v1/videos/generations"))
@@ -7782,12 +8042,32 @@ async fn video_wait(base: &str, model: &str, job: &str) {
 /// polls it to completion, and writes the clip. Generation cannot be
 /// interrupted from the REPL — Ctrl-C at the prompt stays a nudge; a
 /// running job is daemon-owned and finishes server-side.
+// Knob-table REPL: one match arm per knob, mutating local state;
+// extracting the arms would trade a linear table for a state struct
+// without removing a line of real logic.
+#[allow(clippy::too_many_lines)]
 async fn video_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()> {
-    let run_turn = |prompt: String, size: Option<String>, duration: Option<u64>| {
+    let run_turn = |prompt: String,
+                    size: Option<String>,
+                    duration: Option<u64>,
+                    frames: Option<u64>,
+                    seed: Option<i64>,
+                    negative: Option<String>| {
         let base = base.to_string();
         let model = model.to_string();
         async move {
-            match video_submit(&base, &model, &prompt, size.as_deref(), duration).await {
+            match video_submit(
+                &base,
+                &model,
+                &prompt,
+                size.as_deref(),
+                duration,
+                frames,
+                seed,
+                negative.as_deref(),
+            )
+            .await
+            {
                 Ok(job) => {
                     println!("job {job}");
                     video_wait(&base, &model, &job).await;
@@ -7797,12 +8077,15 @@ async fn video_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()>
         }
     };
     if let Some(prompt) = inline {
-        run_turn(prompt.to_string(), None, None).await;
+        run_turn(prompt.to_string(), None, None, None, None, None).await;
         return Ok(());
     }
     let mut rl = rustyline::DefaultEditor::new()?;
     let mut size: Option<String> = None;
     let mut duration: Option<u64> = None;
+    let mut frames: Option<u64> = None;
+    let mut seed: Option<i64> = None;
+    let mut negative: Option<String> = None;
     #[cfg(unix)]
     install_repl_sigint();
     println!("blazar video REPL — {model} (a prompt renders a clip; /help; /exit)");
@@ -7814,7 +8097,10 @@ async fn video_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()>
         match line.as_str() {
             "/exit" | "/bye" => break,
             "/help" => {
-                println!("commands: /exit /bye /size <WxH> /duration <secs>");
+                println!(
+                    "commands: /exit /bye /size <WxH> /duration <secs> /frames <n> \
+                     /seed <n> /negative <text> (bare /negative clears)"
+                );
                 println!(
                     "input:   plain text prompts; turns run minutes and poll \
                      server-side jobs — check progress in another terminal with \
@@ -7839,11 +8125,51 @@ async fn video_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()>
                     None => println!("(usage: /duration 5 — 1..=60 seconds)"),
                 }
             }
+            _ if line.starts_with("/frames ") => {
+                match parse_gen_frames(line["/frames ".len()..].trim()) {
+                    Some(f) => {
+                        frames = Some(f);
+                        println!("(frames {f} — wan aligns down to 4k+1)");
+                    }
+                    None => println!("(usage: /frames 33 — 1..=201)"),
+                }
+            }
+            _ if line.starts_with("/seed ") => {
+                match parse_gen_seed(line["/seed ".len()..].trim()) {
+                    Some(s) => {
+                        seed = Some(s);
+                        println!("(seed {s})");
+                    }
+                    None => println!("(usage: /seed 42 — an integer; -1 re-rolls per turn)"),
+                }
+            }
+            "/negative" => {
+                negative = None;
+                println!("(negative prompt cleared)");
+            }
+            _ if line.starts_with("/negative ") => {
+                let text = line["/negative ".len()..].trim().to_string();
+                if text.is_empty() {
+                    negative = None;
+                    println!("(negative prompt cleared)");
+                } else {
+                    println!("(negative: {text})");
+                    negative = Some(text);
+                }
+            }
             _ if line.starts_with('/') => {
                 println!("(unknown command — /help)");
             }
             _ => {
-                run_turn(line.clone(), size.clone(), duration).await;
+                run_turn(
+                    line.clone(),
+                    size.clone(),
+                    duration,
+                    frames,
+                    seed,
+                    negative.clone(),
+                )
+                .await;
             }
         }
     }
@@ -7875,9 +8201,8 @@ async fn speech_post(base: &str, voice: &str, text: &str, speed: Option<f64>) ->
 }
 
 /// Write synthesized audio: `-` streams to stdout, anything else lands
-/// as a WAV under the given path (or a voice-stamped default); a file
-/// write can then hand the clip to local playback.
-fn write_speech_out(voice: &str, wav: &[u8], out: Option<&Path>, play: bool) -> Result<()> {
+/// as a WAV under the given path (or a voice-stamped default).
+fn write_speech_out(voice: &str, wav: &[u8], out: Option<&Path>) -> Result<()> {
     if out == Some(Path::new("-")) {
         use std::io::Write as _;
         std::io::stdout().write_all(wav)?;
@@ -7892,91 +8217,41 @@ fn write_speech_out(voice: &str, wav: &[u8], out: Option<&Path>, play: bool) -> 
             wav.len(),
             wav_duration_secs(wav)
         );
-        if play {
-            play_wav_detached(&path);
-        }
     }
     Ok(())
 }
 
-/// Player probe order: first name resolvable on PATH wins. Argument
-/// shapes differ per player (ffplay needs flags to exit when the clip
-/// ends), so the argv prefix is built per player.
-const WAV_PLAYERS: [&str; 4] = ["paplay", "aplay", "afplay", "ffplay"];
-
-fn player_argv(player: &str, path: &str) -> Vec<String> {
-    match player {
-        "ffplay" => vec![
-            "-autoexit".to_string(),
-            "-loglevel".to_string(),
-            "quiet".to_string(),
-            path.to_string(),
-        ],
-        _ => vec![path.to_string()],
-    }
-}
-
-fn player_on_path(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
-}
-
-/// Hand a written WAV to the first available system player on a
-/// detached thread — an 11 s clip must never block the REPL's next
-/// turn. No player on the box is a teaching line, not an error: the
-/// WAV is already safely on disk.
-fn play_wav_detached(path: &str) {
-    let Some(player) = WAV_PLAYERS.iter().find(|p| player_on_path(p)) else {
-        println!(
-            "(no audio player on PATH — install paplay or aplay to hear clips; the WAV is on disk)"
-        );
-        return;
-    };
-    let argv = player_argv(player, path);
-    std::thread::spawn(move || {
-        let _ = std::process::Command::new(&argv[0])
-            .args(&argv[1..])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    });
-}
-
 /// Speech loop over pulled piper voices: every line is spoken to a WAV
-/// in the working directory (and played aloud when a player exists).
-/// `/voice` switches among installed voices (pulling a new one stays
-/// with `blazar tts --pull <voice>`).
+/// in the working directory. `/voice` switches among installed voices
+/// (pulling a new one stays with `blazar tts --pull <voice>`).
 async fn tts_repl(base: &str, voice: &str, inline: Option<&str>) -> Result<()> {
-    let run_turn =
-        |voice: String, text: String, speed: Option<f64>, out: Option<PathBuf>, play: bool| {
-            let base = base.to_string();
-            async move {
-                let started = std::time::Instant::now();
-                match speech_post(&base, &voice, &text, speed).await {
-                    Ok(wav) => {
-                        if let Err(e) = write_speech_out(&voice, &wav, out.as_deref(), play) {
-                            println!("error: {e}");
-                        } else {
-                            println!("({:.1}s)", started.elapsed().as_secs_f64());
-                        }
+    let run_turn = |voice: String, text: String, speed: Option<f64>, out: Option<PathBuf>| {
+        let base = base.to_string();
+        async move {
+            let started = std::time::Instant::now();
+            match speech_post(&base, &voice, &text, speed).await {
+                Ok(wav) => {
+                    if let Err(e) = write_speech_out(&voice, &wav, out.as_deref()) {
+                        println!("error: {e}");
+                    } else {
+                        println!("({:.1}s)", started.elapsed().as_secs_f64());
                     }
-                    Err(e) => println!("error: {e}"),
                 }
+                Err(e) => println!("error: {e}"),
             }
-        };
+        }
+    };
     if let Some(text) = inline {
-        let play = std::io::IsTerminal::is_terminal(&std::io::stdout());
-        run_turn(voice.to_string(), text.to_string(), None, None, play).await;
+        run_turn(voice.to_string(), text.to_string(), None, None).await;
         return Ok(());
     }
     let mut rl = rustyline::DefaultEditor::new()?;
     let mut voice = voice.to_string();
     let mut speed: Option<f64> = None;
     let mut out: Option<PathBuf> = None;
-    let mut play = std::io::IsTerminal::is_terminal(&std::io::stdout());
     #[cfg(unix)]
     install_repl_sigint();
-    println!("blazar speech REPL — {voice} (a line is spoken aloud; /help; /exit)");
+    println!("blazar speech REPL — {voice} (a line writes a WAV; /help; /exit)");
     while let Some(line) = gen_line(&mut rl, "tts> ") {
         if line.is_empty() {
             continue;
@@ -7985,13 +8260,10 @@ async fn tts_repl(base: &str, voice: &str, inline: Option<&str>) -> Result<()> {
         match line.as_str() {
             "/exit" | "/bye" => break,
             "/help" => {
-                println!(
-                    "commands: /exit /bye /voice <name> /speed <0.1-4> /out <path> /play on|off"
-                );
+                println!("commands: /exit /bye /voice <name> /speed <0.1-4> /out <path>");
                 println!(
                     "input:   plain text; each line writes a WAV in the working \
-                     directory (and plays it when a player exists; voices: blazar \
-                     tts --list, new ones: blazar tts --pull)"
+                     directory (voices: blazar tts --list, new ones: blazar tts --pull)"
                 );
             }
             _ if line.starts_with("/voice ") => {
@@ -8012,17 +8284,6 @@ async fn tts_repl(base: &str, voice: &str, inline: Option<&str>) -> Result<()> {
                     None => println!("(usage: /speed 1.2 — 0.1..=4.0, 1.0 = native)"),
                 }
             }
-            _ if line.starts_with("/play ") => match line["/play ".len()..].trim() {
-                "on" | "true" => {
-                    play = true;
-                    println!("(play on — each turn plays after writing)");
-                }
-                "off" | "false" => {
-                    play = false;
-                    println!("(play off — WAVs are written silently)");
-                }
-                _ => println!("(usage: /play on|off)"),
-            },
             _ if line.starts_with("/out ") => {
                 let p = line["/out ".len()..].trim().to_string();
                 out = Some(PathBuf::from(p));
@@ -8035,7 +8296,7 @@ async fn tts_repl(base: &str, voice: &str, inline: Option<&str>) -> Result<()> {
                 println!("(unknown command — /help)");
             }
             _ => {
-                run_turn(voice.clone(), line.clone(), speed, out.clone(), play).await;
+                run_turn(voice.clone(), line.clone(), speed, out.clone()).await;
             }
         }
     }
@@ -8303,7 +8564,7 @@ fn bench(model: &str) -> Result<()> {
 // Lane switches mirroring the clap flags one-to-one; a flags struct would
 // just re-spell the same four booleans.
 #[allow(clippy::fn_params_excessive_bools)]
-fn tune_full(
+async fn tune_full(
     model: &str,
     search: bool,
     ctx: Option<u32>,
@@ -8326,6 +8587,9 @@ fn tune_full(
     manifest.anchor_server_path(&d.data_dir);
     let bench_bin = blazar_runtime::bench::find_bench_bin(&d)?;
     let mut cfg = config()?;
+    // Any adoption below flips this: the fn tail then restarts a running
+    // daemon so the adopted knobs are live instead of hinting at one.
+    let mut adopted_any = false;
     // Persist --spec BEFORE building the profile input so the compiled
     // argv (and its draft resolution) matches what the daemon will
     // serve on the next run — mirrors the --ngram lane's
@@ -8458,8 +8722,9 @@ fn tune_full(
             let mut cfg2 = config()?;
             cfg2.slots = best_np;
             blazar_core::persist_config(&d.config_file(), &cfg2.to_toml()?)?;
+            adopted_any = true;
             println!(
-                "adopted slots = {best_np} ({best_tps:.1} tok/s, +{:.0}% over runner-up) — restart the daemon to apply",
+                "adopted slots = {best_np} ({best_tps:.1} tok/s, +{:.0}% over runner-up)",
                 (best_tps / second - 1.0) * 100.0
             );
         } else {
@@ -8526,9 +8791,8 @@ fn tune_full(
             cfg2.ngram_size_m = bm;
             cfg2.ngram_min_hits = bh;
             blazar_core::persist_config(&d.config_file(), &cfg2.to_toml()?)?;
-            println!(
-                "adopted ngram_size_m = {bm}, ngram_min_hits = {bh} — restart the daemon to apply"
-            );
+            adopted_any = true;
+            println!("adopted ngram_size_m = {bm}, ngram_min_hits = {bh}");
         } else {
             println!("no clear winner (best {best_tps:.1} vs {second:.1}) — engine defaults stay");
         }
@@ -8570,8 +8834,9 @@ fn tune_full(
             println!("warmup off: {:>6.1}s", probe.no_warmup_secs);
             if probe.no_warmup_secs < probe.warmup_secs * 0.95 {
                 set_model_override(model, "warmup", "false")?;
+                adopted_any = true;
                 println!(
-                    "adopted model_overrides.{model}.warmup = false ({:.0}% faster to first token) — restart the daemon to apply",
+                    "adopted model_overrides.{model}.warmup = false ({:.0}% faster to first token)",
                     (1.0 - probe.no_warmup_secs / probe.warmup_secs) * 100.0
                 );
             } else {
@@ -8590,9 +8855,8 @@ fn tune_full(
             println!("2 children: {:>6.1} tok/s ({ratio:.2}x)", probe.r2_tps);
             if probe.r2_tps > probe.r1_tps * 1.3 {
                 set_model_override(model, "replicas", "2")?;
-                println!(
-                    "adopted model_overrides.{model}.replicas = 2 — restart the daemon to apply"
-                );
+                adopted_any = true;
+                println!("adopted model_overrides.{model}.replicas = 2");
             } else {
                 println!("keep replicas = 1 (2 children not >1.3x aggregate)");
             }
@@ -8627,14 +8891,17 @@ fn tune_full(
                 let mut cfg2 = config()?;
                 cfg2.cache_reuse = probe.best;
                 blazar_core::persist_config(&d.config_file(), &cfg2.to_toml()?)?;
-                println!(
-                    "adopted cache_reuse = {} — restart the daemon to apply",
-                    probe.best
-                );
+                adopted_any = true;
+                println!("adopted cache_reuse = {}", probe.best);
             } else {
                 println!("keep cache_reuse = 256 (no candidate >5% faster and >50 ms >5% faster)");
             }
         }
+    }
+    if adopted_any {
+        // The persisted knobs only reach a RUNNING daemon through a
+        // restart; a daemon that is down reads them at its next start.
+        restart_daemon().await;
     }
     Ok(())
 }
@@ -9404,8 +9671,12 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 }
             };
             let mgr = local_engine_manager(&d)?;
+            let prior = blazar_core::store::Store::open(&d)?
+                .active_engine()?
+                .map(|r| r.tag);
             let row = mgr.use_tag(&resolved_tag)?;
             println!("active engine: {}", row.tag);
+            restart_daemon_if_active_changed(prior, Some(row.tag.clone())).await;
         }
         EngineCmd::Prune => engine_prune(&d)?,
         EngineCmd::Rm { tag } => {
@@ -9414,8 +9685,12 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
         }
         EngineCmd::Rollback => {
             let mgr = local_engine_manager(&d)?;
+            let prior = blazar_core::store::Store::open(&d)?
+                .active_engine()?
+                .map(|r| r.tag);
             let row = mgr.rollback()?;
             println!("rolled back to: {}", row.tag);
+            restart_daemon_if_active_changed(prior, Some(row.tag.clone())).await;
         }
         EngineCmd::Build {
             backend,
@@ -9448,6 +9723,9 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
         }
         EngineCmd::Local { path } => {
             let mgr = local_engine_manager(&d)?;
+            let prior = blazar_core::store::Store::open(&d)?
+                .active_engine()?
+                .map(|r| r.tag);
             let row = mgr.register_local(&path, &config()?.engine_env)?;
             let m: blazar_runtime::Manifest = serde_json::from_str(&row.manifest)?;
             mgr.use_tag(&row.tag)?;
@@ -9457,6 +9735,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 m.devices.len(),
                 m.flags.len()
             );
+            restart_daemon_if_active_changed(prior, Some(row.tag.clone())).await;
         }
         EngineCmd::Install {
             kind,
@@ -9513,6 +9792,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
 /// (never silently) — llama-bench cannot drive a mistral.rs child.
 async fn engine_install_mistralrs(d: &BlazarDirs, tag: Option<String>) -> Result<()> {
     let mgr = local_engine_manager(d)?;
+    let prior_active = Store::open(d)?.active_engine()?.map(|r| r.tag);
     let wanted = tag.clone().unwrap_or_else(|| "latest".to_string());
     println!("installing mistral.rs {wanted} (prebuilt upstream binary)");
     let row = mgr.update_mistralrs(tag.as_deref()).await?;
@@ -9536,6 +9816,7 @@ async fn engine_install_mistralrs(d: &BlazarDirs, tag: Option<String>) -> Result
             humansize(freed)
         );
     }
+    restart_daemon_if_active_changed(prior_active, row.active.then(|| row.tag.clone())).await;
     Ok(())
 }
 
@@ -9604,6 +9885,7 @@ async fn engine_update_mistralrs(d: &BlazarDirs, tag: Option<String>, check: boo
 /// llama-bench cannot drive an sd-server child.
 async fn engine_install_sdcpp(d: &BlazarDirs, tag: Option<String>) -> Result<()> {
     let mgr = local_engine_manager(d)?;
+    let prior_active = Store::open(d)?.active_engine()?.map(|r| r.tag);
     let wanted = tag.clone().unwrap_or_else(|| "latest".to_string());
     println!("installing sd.cpp {wanted} (prebuilt upstream sd-server)");
     let row = mgr.update_sdcpp(tag.as_deref()).await?;
@@ -9626,6 +9908,7 @@ async fn engine_install_sdcpp(d: &BlazarDirs, tag: Option<String>) -> Result<()>
             humansize(freed)
         );
     }
+    restart_daemon_if_active_changed(prior_active, row.active.then(|| row.tag.clone())).await;
     Ok(())
 }
 
@@ -9828,6 +10111,7 @@ fn mistralrs_version_tuple(tag: &str) -> Option<(u64, u64, u64)> {
 /// so — llama-bench cannot drive an sglang child.
 async fn engine_install_sglang(d: &BlazarDirs, version: Option<String>) -> Result<()> {
     let mgr = local_engine_manager(d)?;
+    let prior_active = Store::open(d)?.active_engine()?.map(|r| r.tag);
     if let Some(v) = &version {
         println!("installing sglang {v} (pip venv lane — multi-GB download incl. torch)");
     } else {
@@ -9856,6 +10140,7 @@ async fn engine_install_sglang(d: &BlazarDirs, version: Option<String>) -> Resul
         );
     }
     println!("next: pull a safetensors model (e.g. blazar pull Qwen/Qwen2.5-0.5B-Instruct)");
+    restart_daemon_if_active_changed(prior_active, row.active.then(|| row.tag.clone())).await;
     Ok(())
 }
 
@@ -10210,6 +10495,7 @@ async fn engine_update(
             row.tag
         );
     }
+    restart_daemon_if_active_changed(active_tag, row.active.then(|| row.tag.clone())).await;
 
     Ok(())
 }
@@ -10326,6 +10612,11 @@ async fn engine_build(d: &BlazarDirs, a: BackendArg) -> Result<()> {
     let token = std::env::var("GH_TOKEN").ok();
     let gh = GhClient::new(token)?;
     let cfg = config()?;
+    // Prior active tag: the post-build restart hook needs to know
+    // whether THIS build actually dethroned the serving engine.
+    let prior_active = blazar_core::store::Store::open(d)?
+        .active_engine()?
+        .map(|r| r.tag);
     let resolved = resolve_build_label(&gh, cfg.update_channel, &a, &source).await?;
     if !fork && btag_number(&resolved).is_none() {
         return Err(anyhow!(
@@ -10421,6 +10712,7 @@ async fn engine_build(d: &BlazarDirs, a: BackendArg) -> Result<()> {
     // startup): mine binary-installed mainstream lanes, re-check fork
     // coverage, sweep retired curated lanes.
     refresh_after_lane_change(&mgr, &cfg).await;
+    restart_daemon_if_active_changed(prior_active, row.active.then(|| row.tag.clone())).await;
     Ok(())
 }
 
@@ -10572,6 +10864,9 @@ async fn engine_install_lane(d: &BlazarDirs, lane_id: &str, backend: Option<&str
         bus: EventBus::default(),
         asset_override: cfg.engine_asset.clone(),
     };
+    // First-of-its-kind fork lanes activate; additive siblings do not —
+    // the restart hook decides from the returned row, not the lane type.
+    let prior_active = Store::open(d)?.active_engine()?.map(|r| r.tag);
     let mut opts = BuildOpts::new(backend, &lane.ref_sha);
     opts.source = BuildSource::Fork {
         repo: lane.repo.clone(),
@@ -10595,6 +10890,7 @@ async fn engine_install_lane(d: &BlazarDirs, lane_id: &str, backend: Option<&str
         cfg.fork_retire_days
     );
     refresh_after_lane_change(&mgr, &cfg).await;
+    restart_daemon_if_active_changed(prior_active, row.active.then(|| row.tag.clone())).await;
     Ok(())
 }
 
@@ -10801,7 +11097,7 @@ fn engine_prune(d: &BlazarDirs) -> Result<()> {
 fn engine_prune_summary(d: &BlazarDirs) -> Result<String> {
     let store = Store::open(d)?;
     let mgr = local_engine_manager(d)?;
-    let freed = mgr.prune(&store)?;
+    let freed = mgr.prune(&store, None)?;
     // Row-less dirs are invisible to the table sweep above yet eat disk;
     // reclaim them in the same manual pass.
     let orphans = mgr.prune_orphan_dirs()?;
@@ -11735,6 +12031,12 @@ async fn upgrade(version: Option<String>, dry_run: bool) -> Result<()> {
     if summary.starts_with("upgrade failed") {
         return Err(anyhow!("upgrade failed"));
     }
+    // The binary swap only helps a running daemon once it re-execs;
+    // a no-op restart keeps `blazar upgrade` start-free when no daemon
+    // is up.
+    if !dry_run {
+        restart_daemon().await;
+    }
     Ok(())
 }
 
@@ -11997,6 +12299,15 @@ mod tests {
         assert_eq!(parse_gen_speed("4.0"), Some(4.0), "upper bound inclusive");
         assert!(parse_gen_speed("0.05").is_none(), "under the range");
         assert!(parse_gen_speed("fast").is_none(), "non-numeric");
+        // Seeds are signed: negatives re-roll per request upstream.
+        assert_eq!(parse_gen_seed("42"), Some(42));
+        assert_eq!(parse_gen_seed("-1"), Some(-1), "negative = re-roll");
+        assert!(parse_gen_seed("soon").is_none(), "non-numeric");
+        // Frames: 1..=201, wan aligns down to 4k+1 engine-side.
+        assert_eq!(parse_gen_frames("33"), Some(33));
+        assert!(parse_gen_frames("0").is_none(), "zero frames");
+        assert!(parse_gen_frames("202").is_none(), "past the cap");
+        assert!(parse_gen_frames("many").is_none(), "non-numeric");
     }
 
     #[test]
@@ -14021,6 +14332,28 @@ mod tests {
     }
 
     #[test]
+    fn unit__classify_gpu_tenant__user_run_rpc_server_is_foreign_never_swept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engines = tmp.path().join("engines");
+        let rpc = engines.join("b11147-cuda/llama-b11147/ggml-rpc-server");
+        // The boot sweep used to reap a user-run ggml-rpc-server as an
+        // "orphaned engine" (engines-dir exe, no blazar parent), killing
+        // the endpoint `rpc_servers` depends on at every daemon start.
+        // blazar never execs this binary — a live one is a deliberate
+        // co-tenant: advisory in doctor, never SIGTERMed.
+        assert!(matches!(
+            classify_gpu_tenant(rpc.to_str().unwrap(), &engines, false),
+            GpuTenantClass::Foreign
+        ));
+        // Under a live blazar descendant it is still Owned (not our
+        // business either way).
+        assert!(matches!(
+            classify_gpu_tenant(rpc.to_str().unwrap(), &engines, true),
+            GpuTenantClass::Owned
+        ));
+    }
+
+    #[test]
     fn unit__orphaned_gpu_tenants__selects_only_orphaned_engines() {
         let tmp = tempfile::tempdir().unwrap();
         let engines = tmp.path().join("engines");
@@ -14608,6 +14941,63 @@ mod tests {
             ps_rows_using_engine(&serde_json::json!({}), "any").is_empty(),
             "missing models key is not a refusal"
         );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__wait_daemon_exit__missing_or_unreadable_pidfile_counts_as_exited() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No pidfile at all: the daemon already exited (or never ran).
+        assert!(wait_daemon_exit(
+            tmp.path().join("blazar.pid").as_path(),
+            tokio_deadline(Duration::from_secs(1))
+        ));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__wait_daemon_exit__garbage_and_dead_pids_count_as_exited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("blazar.pid");
+        // Same "certainly does not exist" pid the runtime's own lock
+        // tests use; also covers the crash path (owner dead, file left).
+        std::fs::write(&pidfile, "4194303\n").unwrap();
+        assert!(wait_daemon_exit(
+            &pidfile,
+            tokio_deadline(Duration::from_secs(1))
+        ));
+        // Corrupt pidfile: unreadable owner, treat as exited so the
+        // successor can take over the stale lock.
+        std::fs::write(&pidfile, "not-a-pid\n").unwrap();
+        assert!(wait_daemon_exit(
+            &pidfile,
+            tokio_deadline(Duration::from_secs(1))
+        ));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    #[cfg(unix)]
+    fn unit__wait_daemon_exit__blocks_while_owner_alive_unblocks_on_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("blazar.pid");
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::fs::write(&pidfile, format!("{}\n", sleeper.id())).unwrap();
+        // Owner alive: a tight deadline must time out, not report exit.
+        assert!(!wait_daemon_exit(
+            &pidfile,
+            tokio_deadline(Duration::from_millis(150))
+        ));
+        // Owner exits: the wait observes it well within a second.
+        sleeper.kill().unwrap();
+        let _ = sleeper.wait();
+        assert!(wait_daemon_exit(
+            &pidfile,
+            tokio_deadline(Duration::from_secs(2))
+        ));
     }
 
     #[test]

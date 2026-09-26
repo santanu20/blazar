@@ -156,6 +156,12 @@ pub struct AppState {
     pub queue: Arc<PriorityQueue>,
     /// Loopback client for child traffic + metrics scrape.
     pub http: reqwest::Client,
+    /// Timeout-less client for media forwards: a sync image/video
+    /// request holds the connection for the WHOLE render — minutes,
+    /// past any total timeout. Liveness comes from the loopback
+    /// socket itself (a dead child closes it immediately) plus the
+    /// child header/evict lanes, not from a client deadline.
+    pub media_http: reqwest::Client,
     /// Cached per-socket clients for unix-transport children
     /// (`child_transport = "unix"`): reqwest pins one socket path per
     /// client, so each unix child gets its own entry here. Empty and
@@ -249,7 +255,45 @@ pub fn child_client(state: &AppState, ep: &blazar_core::profile::Endpoint) -> re
     }
 }
 
+/// Client for media forwards that hold one request open across the
+/// whole generation — the timeout-less media client on TCP, the
+/// (already deadline-free) per-socket pool on unix transport.
+pub fn media_child_client(
+    state: &AppState,
+    ep: &blazar_core::profile::Endpoint,
+) -> reqwest::Client {
+    match ep {
+        blazar_core::profile::Endpoint::Tcp { .. } => state.media_http.clone(),
+        blazar_core::profile::Endpoint::Unix { socket } => state.uds_http.get(socket),
+    }
+}
+
 impl AppState {
+    /// Key admission for the gated lanes that live outside the proxy
+    /// (images, videos, local whisper, local TTS): scope + rpm/tpm/daily
+    /// check, then the request charge — the exact bracket the text lanes
+    /// run inline. Local compute is not a free lane on an authed gateway
+    /// (audit MM1). No-op when no key context rode the request (open
+    /// gateway) or the key is unknown (the auth middleware already
+    /// rejected those before any handler ran).
+    pub fn admit_or_respond(
+        &self,
+        key_ext: Option<&axum::Extension<crate::keys::KeyCtx>>,
+        model: &str,
+    ) -> Result<(), Box<axum::response::Response>> {
+        let Some(axum::Extension(k)) = key_ext else {
+            return Ok(());
+        };
+        let Some(entry) = self.keys.entry(&k.name) else {
+            return Ok(());
+        };
+        self.keys
+            .check(&entry, model)
+            .map_err(|rej| Box::new(rej.to_response()))?;
+        self.keys.charge_request(&k.name);
+        Ok(())
+    }
+
     #[must_use]
     #[allow(clippy::duration_suboptimal_units)] // 10-minute ceiling mirrors long generations
     pub fn new(dirs: BlazarDirs, config: Config, sup: Arc<Supervisor>, bus: EventBus) -> Self {
@@ -257,6 +301,12 @@ impl AppState {
             .timeout(std::time::Duration::from_secs(10 * 60))
             .build()
             .expect("gateway http client");
+        // No total timeout on purpose (see the field doc); connect
+        // stays bounded so a wedged child endpoint fails to connect.
+        let media_http = crate::http_pool::tuned(reqwest::Client::builder())
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .build()
+            .expect("gateway media http client");
         let run_dir = dirs.run_dir();
         let sentinel = Sentinel::new(config.sentinel, config.sentinel_stall_secs, Some(&run_dir));
         // E4 audit: spawn the file writer when the knob is on; the
@@ -339,6 +389,7 @@ impl AppState {
             bus,
             queue: Arc::new(PriorityQueue::new()),
             http,
+            media_http,
             uds_http: blazar_runtime::uds::UdsClients::new(),
             evict_tx: tx,
             cache_bust: Arc::new(crate::cache_bust::CacheBustTracker::new()),

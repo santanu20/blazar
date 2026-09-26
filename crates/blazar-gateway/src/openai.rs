@@ -56,6 +56,15 @@ pub async fn models(State(state): State<Arc<AppState>>) -> Response {
                 "owned_by": "blazar",
                 "created": m.pulled_at,
                 "engine": engine,
+                // Blazar-native modality discovery (audit MM13): mirrors
+                // the /api/show "vision" convention rather than guessing
+                // an upstream /v1/models field shape (upstream documents
+                // the capability in prose only, not a fixed schema).
+                "capabilities": if m.mmproj_path.is_some() {
+                    json!(["vision"])
+                } else {
+                    json!([])
+                },
             })
         })
         .collect();
