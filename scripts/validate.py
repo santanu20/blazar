@@ -22,6 +22,7 @@ Usage:
   scripts/validate.py                 # full run (~10-15 min with model loads)
   BLAZAR_VALIDATE_FAST=1 scripts/validate.py   # skip long-wait phases
   scripts/validate.py --phase config --phase api # only these phases
+  scripts/validate.py --smoke         # fast pre-commit subset (~2-4 min)
   scripts/validate.py --self-test     # inject one failure, expect exit 1
 
 Honest boundaries (printed, not hidden): rpc_servers needs a second box;
@@ -6677,6 +6678,14 @@ def phase_parity() -> None:
 PHASE_FILTER: set | None = None  # set by main() when --phase= is used
 CRASHED: bool = False  # a phase raised; sandbox must be kept for post-mortem
 
+# --smoke preset: the fast pre-commit signal (~2-4 min, one 0.5B load).
+# Picks the phases that catch the common breakage classes — binary boots,
+# daemon spawns + serves chat, config surface, CLI surface, golden drift —
+# and deliberately excludes coverage-ledger phases (gates/coverage redden
+# when the rows they audit never ran) and the slow media/engine lanes.
+# An explicit --phase= always wins over the preset.
+SMOKE_PHASES = ("manifests", "baseline", "config", "api", "cli", "golds")
+
 
 def run_input(
     *args: str, input_text: str, timeout: int = 180
@@ -10414,6 +10423,9 @@ def main() -> int:
         UPDATE_GOLDENS = True
     phases_arg = [a for a in args if a.startswith("--phase=")]
     wanted = {a.split("=", 1)[1] for a in phases_arg} or None
+    if wanted is None and "--smoke" in args:
+        wanted = set(SMOKE_PHASES)
+        print(f"smoke preset: {', '.join(SMOKE_PHASES)}")
     PHASE_FILTER = wanted
     print(
         f"blazar validation harness — engine+model REAL, isolation via temp XDG, port {PORT}"
