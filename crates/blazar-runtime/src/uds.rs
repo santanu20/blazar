@@ -164,6 +164,8 @@ mod tests {
         assert_eq!(guard.len(), 2, "one entry per distinct socket path");
     }
 
+    // Binds a real AF_UNIX socket — the platform feature under test.
+    #[cfg(unix)]
     #[test]
     fn unit__sweep_stale__removes_dead_socket_keeps_live() {
         let tmp = tempfile::tempdir().unwrap();
