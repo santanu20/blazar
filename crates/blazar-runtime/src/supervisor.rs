@@ -583,6 +583,16 @@ pub struct CacheHint {
     rate_milli: std::sync::atomic::AtomicU32,
 }
 
+/// Per-model windowed rates (C1/G3): prompt-cache hit + speculative
+/// acceptance for ONE model, both `None` until that model's children
+/// have reported the relevant counters. Replicas of the same model
+/// share one entry — same weights, same KV economics.
+#[derive(Debug, Default)]
+pub struct ModelHints {
+    pub cache: CacheHint,
+    pub accept: CacheHint,
+}
+
 /// Auto-pick one GPU: most free VRAM among DISCRETE cards; integrated
 /// cards are considered only when no discrete card exists (their "free"
 /// is shared system RAM — bandwidth-starved for serving). Returns the
@@ -779,6 +789,59 @@ impl CacheHint {
     }
 }
 
+impl Supervisor {
+    /// Poller write side (C1): record one model's windowed rates. Either
+    /// may be `None` — that counter was absent this window (e.g. spec
+    /// acceptance on a dense child), which leaves the last measured
+    /// value untouched rather than zeroing it.
+    pub fn set_model_hints(&self, model: &str, cache: Option<f64>, accept: Option<f64>) {
+        let hints = self.model_hints.entry(model.to_string()).or_default();
+        if let Some(rate) = cache {
+            hints.cache.set(rate);
+        }
+        if let Some(rate) = accept {
+            hints.accept.set(rate);
+        }
+    }
+
+    /// Spawn read side (C1): the model's own measured prompt-cache hit
+    /// rate, falling back to the merged global when this model has no
+    /// measured window yet (identical steering on single-model boxes).
+    #[must_use]
+    pub fn cache_hint_for(&self, model: &str) -> Option<f64> {
+        self.model_hints
+            .get(model)
+            .and_then(|h| h.cache.get())
+            .or_else(|| self.cache_hint.get())
+    }
+
+    /// Speculative acceptance for one model (G3 per-model split);
+    /// `None` when that model has never reported spec counters.
+    #[must_use]
+    pub fn accept_hint_for(&self, model: &str) -> Option<f64> {
+        self.model_hints.get(model).and_then(|h| h.accept.get())
+    }
+
+    /// Labeled /metrics snapshot: `(model, cache, accept)` sorted by
+    /// model for a stable exposition.
+    #[must_use]
+    pub fn model_hint_snapshot(&self) -> Vec<(String, Option<f64>, Option<f64>)> {
+        let mut rows: Vec<(String, Option<f64>, Option<f64>)> = self
+            .model_hints
+            .iter()
+            .map(|e| {
+                (
+                    e.key().clone(),
+                    e.value().cache.get(),
+                    e.value().accept.get(),
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+}
+
 /// Row for `blazar ps` / `/api/ps`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PsRow {
@@ -845,6 +908,11 @@ pub struct Supervisor {
     /// spec-decoding child has reported counters — drives the
     /// `blazar_spec_accept_rate` gauge (G3).
     pub spec_accept: std::sync::Arc<CacheHint>,
+    /// Per-model split of the two hints above (C1): the gateway poller
+    /// writes windowed rates keyed by the engine-reported model name;
+    /// spawns read their own model's rate first and fall back to the
+    /// merged globals (single-model boxes steer identically).
+    model_hints: DashMap<String, ModelHints>,
     /// J2 self-healing: distinct models whose spawn ULTIMATELY failed
     /// since the last successful spawn. Cleared on every success; drives
     /// the crash-loop engine rollback (probe-gated, see
@@ -1053,6 +1121,7 @@ impl Supervisor {
             evictions: std::sync::atomic::AtomicU64::new(0),
             cache_hint: std::sync::Arc::new(CacheHint::default()),
             spec_accept: std::sync::Arc::new(CacheHint::default()),
+            model_hints: DashMap::new(),
             engine_failures: std::sync::Mutex::new(std::collections::HashSet::new()),
             capability_pins: std::sync::Mutex::new(std::collections::HashMap::new()),
             measured: std::sync::Mutex::new(MeasuredTick::default()),
@@ -2083,6 +2152,8 @@ impl Supervisor {
                     port: 0,
                 },
                 data_dir: &data_dir_str,
+                // Router child serves N models — the merged global hint is
+                // the only meaningful granularity here.
                 cache_hit_rate: self.cache_hint.get(),
                 resident_ram_mib: self
                     .instances
@@ -2953,7 +3024,7 @@ impl Supervisor {
                     port: 0,
                 },
                 data_dir: &data_dir_str,
-                cache_hit_rate: self.cache_hint.get(),
+                cache_hit_rate: self.cache_hint_for(name),
                 resident_ram_mib: self
                     .instances
                     .iter()
@@ -3193,7 +3264,7 @@ impl Supervisor {
                 spec_types: &manifest.spec_types,
                 endpoint: endpoint.clone(),
                 data_dir: &data_dir_str,
-                cache_hit_rate: self.cache_hint.get(),
+                cache_hit_rate: self.cache_hint_for(name),
                 resident_ram_mib: self
                     .instances
                     .iter()
@@ -7990,5 +8061,58 @@ mod routing_tests {
         let pre = hw_of(vec![gpu("dg", "NVIDIA A", 8_000, 7_000)]);
         let post = hw_of(Vec::new());
         assert!(settle_report(&pre, &post, Some("dg")).is_none());
+    }
+
+    #[test]
+    fn unit__model_hints__per_model_wins_and_global_fallback() {
+        let sup = routing_sup(1);
+        assert_eq!(sup.cache_hint_for("m"), None, "nothing measured anywhere");
+        sup.cache_hint.set(0.5);
+        assert_eq!(sup.cache_hint_for("m"), Some(0.5), "unseen model -> global");
+        sup.set_model_hints("m", Some(0.9), None);
+        assert_eq!(
+            sup.cache_hint_for("m"),
+            Some(0.9),
+            "measured model -> own hint"
+        );
+        assert_eq!(
+            sup.cache_hint_for("other"),
+            Some(0.5),
+            "other models keep the global fallback"
+        );
+        // An entry created by an accept-only write still falls back for
+        // cache (that model's cache was never measured).
+        sup.set_model_hints("spec-only", None, Some(0.4));
+        assert_eq!(sup.cache_hint_for("spec-only"), Some(0.5));
+        assert_eq!(sup.accept_hint_for("spec-only"), Some(0.4));
+        assert_eq!(
+            sup.accept_hint_for("m"),
+            None,
+            "accept never measured for m"
+        );
+    }
+
+    #[test]
+    fn unit__model_hints__snapshot_sorted_and_shaped() {
+        let sup = routing_sup(1);
+        sup.set_model_hints("zeta", Some(0.2), Some(0.8));
+        sup.set_model_hints("alpha", Some(0.7), None);
+        let rows = sup.model_hint_snapshot();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "alpha", "sorted by model name");
+        assert_eq!(rows[0].1, Some(0.7));
+        assert_eq!(rows[0].2, None);
+        assert_eq!(rows[1].0, "zeta");
+        assert_eq!(rows[1].2, Some(0.8));
+    }
+
+    #[test]
+    fn unit__model_hints__none_windows_keep_last_value() {
+        let sup = routing_sup(1);
+        sup.set_model_hints("m", Some(0.9), Some(0.6));
+        // Idle/dense window: both None — nothing may zero out.
+        sup.set_model_hints("m", None, None);
+        assert_eq!(sup.cache_hint_for("m"), Some(0.9));
+        assert_eq!(sup.accept_hint_for("m"), Some(0.6));
     }
 }

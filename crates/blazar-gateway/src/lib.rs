@@ -868,6 +868,15 @@ fn counter(text: &str, name: &str) -> Option<u64> {
         .next_back()
 }
 
+/// EWMA step shared by the merged-global and per-model hint windows
+/// (0.7 history / 0.3 new — the A16/G3 smoothing constant).
+fn hint_ewma(prev: Option<f64>, rate: f64) -> f64 {
+    match prev {
+        Some(e) => e * 0.7 + rate * 0.3,
+        None => rate,
+    }
+}
+
 /// Serve the gateway until `shutdown` resolves (SIGTERM/SIGINT), then
 /// drain: stop accepting, stop children, exit clean. TLS when
 /// `tls_cert`/`tls_key` are configured, plain HTTP otherwise.
@@ -939,12 +948,22 @@ pub async fn serve(
             let mut prev_spec: (u64, u64) = (0, 0); // (Σ accepted, Σ drafted)
             let mut ewma: Option<f64> = None;
             let mut ewma_spec: Option<f64> = None;
+            // C1 per-model split: same windowed rates keyed by the
+            // engine-reported model name, so the adaptive --cache-ram
+            // clamp steers per model instead of on the all-children blur.
+            // (prev counters, (cache ewma, accept ewma)) per model.
+            let mut per_prev: std::collections::HashMap<String, (u64, u64, u64, u64)> =
+                std::collections::HashMap::new();
+            let mut per_ewma: std::collections::HashMap<String, (Option<f64>, Option<f64>)> =
+                std::collections::HashMap::new();
             let mut interval = tokio::time::interval(std::time::Duration::from_mins(1));
             interval.tick().await; // immediate first tick: skip (empty)
             loop {
                 interval.tick().await;
                 let mut totals = (0u64, 0u64);
                 let mut spec_totals = (0u64, 0u64);
+                let mut by_model: std::collections::HashMap<String, (u64, u64, u64, u64)> =
+                    std::collections::HashMap::new();
                 for e in state.sup.live_http_endpoints() {
                     // Child Prometheus text: aggregate counters (the /slots
                     // per-slot stats are short-lived and unreliable — the
@@ -966,12 +985,17 @@ pub async fn serve(
                     let Ok(text) = resp.text().await else {
                         continue;
                     };
+                    // Replicas of one model share the entry — same
+                    // weights, same KV economics.
+                    let slot = by_model.entry(e.name.clone()).or_insert((0, 0, 0, 0));
                     if let (Some(c), Some(p)) = (
                         counter(&text, "llamacpp:prompt_tokens_cached_total"),
                         counter(&text, "llamacpp:prompt_tokens_total"),
                     ) {
                         totals.0 += c;
                         totals.1 += p;
+                        slot.0 += c;
+                        slot.1 += p;
                     }
                     // G3: spec-decoding acceptance (only present when a
                     // spec pair is live on that child).
@@ -981,6 +1005,8 @@ pub async fn serve(
                     ) {
                         spec_totals.0 += a;
                         spec_totals.1 += d;
+                        slot.2 += a;
+                        slot.3 += d;
                     }
                 }
                 let d_cache = totals.0.saturating_sub(prev.0);
@@ -992,10 +1018,7 @@ pub async fn serve(
                     // exact for any realistic window.
                     #[allow(clippy::cast_precision_loss)]
                     let rate = d_cache as f64 / denom as f64;
-                    ewma = Some(match ewma {
-                        Some(e) => e * 0.7 + rate * 0.3,
-                        None => rate,
-                    });
+                    ewma = Some(hint_ewma(ewma, rate));
                     if let Some(e) = ewma {
                         state.sup.cache_hint.set(e);
                     }
@@ -1006,13 +1029,39 @@ pub async fn serve(
                 if d_draft > 0 {
                     #[allow(clippy::cast_precision_loss)]
                     let rate = d_acc.min(d_draft) as f64 / d_draft as f64;
-                    ewma_spec = Some(match ewma_spec {
-                        Some(e) => e * 0.7 + rate * 0.3,
-                        None => rate,
-                    });
+                    ewma_spec = Some(hint_ewma(ewma_spec, rate));
                     if let Some(e) = ewma_spec {
                         state.sup.spec_accept.set(e);
                     }
+                }
+                // Per-model windows: identical math on per-model sums.
+                // A model absent this window keeps its last measured
+                // value (no zeroing on idle); counter resets (child
+                // swap) yield 0-deltas and skip, same as the global.
+                for (model, cur) in &by_model {
+                    let mp = per_prev.entry(model.clone()).or_insert((0, 0, 0, 0));
+                    let (d_cache, d_prompt) =
+                        (cur.0.saturating_sub(mp.0), cur.1.saturating_sub(mp.1));
+                    let (d_acc, d_draft) = (cur.2.saturating_sub(mp.2), cur.3.saturating_sub(mp.3));
+                    *mp = *cur;
+                    let (mut c_ewma, mut a_ewma) =
+                        per_ewma.get(model).copied().unwrap_or((None, None));
+                    let mut cache_rate = None;
+                    if d_cache + d_prompt > 0 {
+                        #[allow(clippy::cast_precision_loss)]
+                        let rate = d_cache as f64 / (d_cache + d_prompt) as f64;
+                        c_ewma = Some(hint_ewma(c_ewma, rate));
+                        cache_rate = c_ewma;
+                    }
+                    let mut accept_rate = None;
+                    if d_draft > 0 {
+                        #[allow(clippy::cast_precision_loss)]
+                        let rate = d_acc.min(d_draft) as f64 / d_draft as f64;
+                        a_ewma = Some(hint_ewma(a_ewma, rate));
+                        accept_rate = a_ewma;
+                    }
+                    per_ewma.insert(model.clone(), (c_ewma, a_ewma));
+                    state.sup.set_model_hints(model, cache_rate, accept_rate);
                 }
             }
         })

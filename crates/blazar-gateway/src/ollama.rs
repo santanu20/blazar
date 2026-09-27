@@ -3305,6 +3305,36 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         "blazar_spec_accept_rate",
         "Windowed speculative-decoding acceptance rate (accepted / drafted tokens)",
     );
+    // C1 per-model split: the same two rates keyed by the engine-reported
+    // model name (multi-model boxes steer --cache-ram and spec policy per
+    // model; the unlabeled merged lines above remain the box-wide truth).
+    let rows = state.sup.model_hint_snapshot();
+    if rows.iter().any(|(_, cache, _)| cache.is_some()) {
+        merged.push_str(
+            "# HELP blazar_prefix_cache_hit_rate_per_model Windowed prompt-cache hit rate per model\n# TYPE blazar_prefix_cache_hit_rate_per_model gauge\n",
+        );
+        for (model, cache, _) in &rows {
+            if let Some(rate) = cache {
+                let _ = writeln!(
+                    merged,
+                    "blazar_prefix_cache_hit_rate_per_model{{model=\"{model}\"}} {rate:.4}"
+                );
+            }
+        }
+    }
+    if rows.iter().any(|(_, _, accept)| accept.is_some()) {
+        merged.push_str(
+            "# HELP blazar_spec_accept_rate_per_model Windowed speculative-decoding acceptance rate per model\n# TYPE blazar_spec_accept_rate_per_model gauge\n",
+        );
+        for (model, _, accept) in &rows {
+            if let Some(rate) = accept {
+                let _ = writeln!(
+                    merged,
+                    "blazar_spec_accept_rate_per_model{{model=\"{model}\"}} {rate:.4}"
+                );
+            }
+        }
+    }
     engine_build_gauge(&state, &mut merged);
     (
         [(
