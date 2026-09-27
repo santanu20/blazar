@@ -118,6 +118,11 @@ const PRELOAD_BACKOFF: Duration = Duration::from_mins(5);
 /// F1: idle-to-RAM warm read granularity — large enough to amortize
 /// syscall overhead, small enough to yield between chunks on slow disks.
 const RAM_WARM_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+/// Whole-bank save-sweep budget: each per-slot save is individually
+/// bounded at 2 s, but an `-np 32` child must not hold daemon shutdown
+/// for a minute of worst-case timeouts — the sweep stops issuing saves
+/// once this budget is spent.
+const BANK_SAVE_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 /// F12: `keep_alive: -1` cap — 100 years, far enough to be forever in
 /// practice without risking `Instant` overflow arithmetic.
 const KEEP_ALIVE_FOREVER: Duration = Duration::from_hours(876_600);
@@ -4374,16 +4379,55 @@ drop them from rpc_servers in config.toml",
             .join(format!("_auto-{ctx}"))
     }
 
+    /// Bank filename for slot `id` of an instance: slot 0 keeps the
+    /// legacy `_auto-<ctx>` name (banks written before multi-slot saves
+    /// stay restorable); slots > 0 bank as `_auto-<ctx>-s<id>`.
+    fn bank_slot_file(&self, name: &str, ctx: u32, id: u32) -> std::path::PathBuf {
+        if id == 0 {
+            return self.bank_file(name, ctx);
+        }
+        self.bank_file(name, ctx)
+            .with_file_name(format!("_auto-{ctx}-s{id}"))
+    }
+
+    /// Parse a bank filename back to its slot id: `_auto-<ctx>` is slot
+    /// 0 (legacy), `_auto-<ctx>-s<N>` is slot N; anything else — other
+    /// ctx banks, identity manifests — is not part of this set.
+    fn bank_slot_of(file: &std::ffi::OsStr, ctx: u32) -> Option<u32> {
+        let name = file.to_str()?;
+        if name == format!("_auto-{ctx}") {
+            return Some(0);
+        }
+        name.strip_prefix(&format!("_auto-{ctx}-s"))
+            .and_then(|tail| tail.parse::<u32>().ok())
+    }
+
+    /// The child's decode-slot count from its own argv (`-np` /
+    /// `--parallel`), config fallback, floor 1 — the same walk
+    /// `slot_headroom` does per replica.
+    fn instance_slot_count(&self, inst: &Arc<Instance>) -> u32 {
+        inst.argv
+            .windows(2)
+            .find(|w| w[0] == "-np" || w[0] == "--parallel")
+            .and_then(|w| w[1].parse::<u32>().ok())
+            .unwrap_or(self.config.slots)
+            .max(1)
+    }
+
     /// Session-bank restore, IN-SPAWN and synchronous: warms the child's
-    /// slot-0 KV for conversation continuations (ctx-matched, per-key
-    /// bank files) BEFORE anything generates on the child. The previous
+    /// KV for conversation continuations (ctx-matched bank sets) BEFORE
+    /// anything generates on the child. Every `_auto-<ctx>` member is
+    /// restored into its own slot id — a `-np N` child wakes with ALL
+    /// banked conversations warm, not just slot 0's. The previous
     /// detached design posted the restore into live traffic after a
     /// busy-poll race — a request arriving inside the restore window
     /// wedged on the child's slot pipeline forever (observed ×4 live,
     /// including two benchmark requests). Runs inside the spawn path
     /// only; the trigger request and every later one find the bank
-    /// already applied. Bounded (5 s): a slow or dead endpoint continues
-    /// cold — the bank stays on disk for the next spawn.
+    /// already applied. Bounded (5 s per slot): a slow or dead endpoint
+    /// continues cold — the bank stays on disk for the next spawn.
+    /// A #20 identity mismatch SKIPS the set: injecting KV from a
+    /// different runtime shape is worse than a cold start.
     async fn bank_restore_sync(
         &self,
         key: &str,
@@ -4394,14 +4438,37 @@ drop them from rpc_servers in config.toml",
         if !self.config.session_bank {
             return;
         }
+        // The bank set of this shape: slot 0's legacy `_auto-<ctx>` plus
+        // every `_auto-<ctx>-s<id>` written by the multi-slot sweep
+        // (sorted so slot 0 — the hot path — restores first).
         let file = self.bank_file(key, ctx);
-        if !file.exists() {
+        let mut restores: Vec<(u32, String)> = Vec::new();
+        if file.exists() {
+            restores.push((0, format!("_auto-{ctx}")));
+        }
+        if let Some(dir) = file.parent() {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for entry in rd.flatten() {
+                    let name = entry.file_name();
+                    if let Some(id) = Self::bank_slot_of(&name, ctx) {
+                        if id != 0 {
+                            restores.push((id, name.to_string_lossy().into_owned()));
+                        }
+                    }
+                }
+            }
+        }
+        if restores.is_empty() {
             return;
         }
+        restores.sort_unstable();
         // Identity gate (config + weights + engine unchanged since the
         // bank was written): a stale bank restores garbage prefixes.
+        // Manifests are identical across the set (same live instance),
+        // so any member's manifest gates the whole set.
+        let gate_file = self.bank_slot_file(key, ctx, restores[0].0);
         let diffs = match (
-            blazar_core::session_identity::read_manifest(&file),
+            blazar_core::session_identity::read_manifest(&gate_file),
             blazar_core::session_identity::build(&self.dirs, &self.config, key),
         ) {
             (Some(saved), Some(mut cur)) => {
@@ -4423,14 +4490,30 @@ drop them from rpc_servers in config.toml",
         // binds .sock paths via --host); the dial helper picks the
         // client, the slot endpoints are unchanged.
         let (client, base) = child_dial(endpoint);
-        // Restore truth-check: HTTP 200 alone does not prove KV injection
-        // (upstream has a restored-then-empty re-prefill bug class). The
-        // response's `n_restored` is the injection count; the first
-        // request's cached-token counter (gateway A9) backstops the
-        // lookup-miss variant. Live-probed on b11070: restore of 31 saved
-        // tokens -> next same-prefix completion ran cache_n=23, prompt_n=1.
-        let url = format!("{base}/slots/0?action=restore&filename=_auto-{ctx}");
-        let mut body = serde_json::json!({ "filename": format!("_auto-{ctx}") });
+        for (id, filename) in restores {
+            self.bank_restore_one(&client, &base, key, auth, id, &filename)
+                .await;
+        }
+    }
+
+    /// One slot's restore POST with truth-check logging. HTTP 200 alone
+    /// does not prove KV injection (upstream has a restored-then-empty
+    /// re-prefill bug class): the response's `n_restored` is the
+    /// injection count, and the first request's cached-token counter
+    /// (gateway A9) backstops the lookup-miss variant. Live-probed on
+    /// b11070: restore of 31 saved tokens -> next same-prefix completion
+    /// ran cache_n=23, prompt_n=1.
+    async fn bank_restore_one(
+        &self,
+        client: &reqwest::Client,
+        base: &str,
+        key: &str,
+        auth: Option<&str>,
+        id: u32,
+        filename: &str,
+    ) {
+        let url = format!("{base}/slots/{id}?action=restore&filename={filename}");
+        let mut body = serde_json::json!({ "filename": filename });
         if self.config.router {
             body["model"] = serde_json::json!(key);
         }
@@ -4443,35 +4526,41 @@ drop them from rpc_servers in config.toml",
         }
         match req.send().await {
             Ok(resp) if resp.status().is_success() => {
-                let restored = resp
+                let tokens_back = resp
                     .json::<serde_json::Value>()
                     .await
                     .ok()
                     .as_ref()
                     .and_then(|v| slot_reported_tokens(v, "n_restored"));
-                match restored {
+                match tokens_back {
                     Some(0) => tracing::warn!(
                         target: "blazar::bank",
                         model = key,
                         "bank restore returned ok but restored 0 tokens — empty or incompatible checkpoint; continuing cold"
                     ),
-                    Some(n) => tracing::info!(
+                    Some(n) if id == 0 => tracing::info!(
                         target: "blazar::bank",
                         model = key,
-                        "restored banked session _auto-{ctx} ({n} tokens into slot KV)"
+                        "restored banked session {filename} ({n} tokens into slot KV)"
                     ),
-                    None => tracing::info!(
+                    Some(n) => tracing::debug!(
                         target: "blazar::bank",
                         model = key,
-                        "restored banked session _auto-{ctx} (no token count in response)"
+                        "restored banked slot {id} {filename} ({n} tokens into slot KV)"
                     ),
+                    None if id == 0 => tracing::info!(
+                        target: "blazar::bank",
+                        model = key,
+                        "restored banked session {filename} (no token count in response)"
+                    ),
+                    None => {}
                 }
             }
             Ok(resp) => {
                 tracing::warn!(
                     target: "blazar::bank",
                     model = key,
-                    "bank restore HTTP {} — continuing cold",
+                    "bank restore HTTP {} on slot {id} — continuing cold",
                     resp.status()
                 );
             }
@@ -4479,69 +4568,87 @@ drop them from rpc_servers in config.toml",
                 tracing::warn!(
                     target: "blazar::bank",
                     model = key,
-                    "bank restore failed: {e:#} — continuing cold"
+                    "bank restore failed on slot {id}: {e:#} — continuing cold"
                 );
             }
         }
     }
-    /// Best-effort `_auto-<ctx>` save before termination. Bounded (2s);
-    // failures cost a re-prefill, never the evict.
+    /// Best-effort `_auto-<ctx>` saves before termination: EVERY slot of
+    /// the child, not just slot 0 — with `-np N` the conversation lands
+    /// on a nondeterministic slot and a slot-0-only bank misses it (the
+    /// 2026-09-27 prod sweep caught exactly that). Each save is bounded
+    /// (2 s) and the sweep stops at `BANK_SAVE_TOTAL_BUDGET`; failures
+    /// cost a re-prefill, never the evict. A slot reporting `n_saved: 0`
+    /// held no cached prefix — its file is removed. The truth indicator
+    /// is the save response itself: the `/slots` listing's
+    /// `n_prompt_tokens_cache` reads 0 on idle slots even when a save
+    /// banks hundreds of tokens (live-probed on b11202).
     async fn bank_save(&self, inst: &Arc<Instance>) {
         if !self.config.session_bank || inst.in_flight.load(Ordering::SeqCst) > 0 {
             return;
         }
-        let file = self.bank_file(&inst.name, inst.profile_ctx);
-        let (client, base) = child_dial(&inst.endpoint);
-        let url = format!(
-            "{base}/slots/0?action=save&filename=_auto-{}",
-            inst.profile_ctx
-        );
-        let body = if self.config.router {
-            serde_json::json!({"filename": format!("_auto-{}", inst.profile_ctx), "model": inst.name})
-        } else {
-            serde_json::json!({"filename": format!("_auto-{}", inst.profile_ctx)})
-        };
-        let mut req = client
-            .post(&url)
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(2));
-        if let Some(secret) = &inst.auth {
-            req = req.bearer_auth(secret);
-        }
-        let mut saved = None;
-        let ok = match req.send().await {
-            Ok(resp) if resp.status().is_success() => {
-                saved = resp
-                    .json::<serde_json::Value>()
-                    .await
-                    .ok()
-                    .as_ref()
-                    .and_then(|v| slot_reported_tokens(v, "n_saved"));
-                true
-            }
-            _ => false,
-        };
-        if ok {
-            match saved {
-                Some(0) => tracing::warn!(
+        let slots = self.instance_slot_count(inst);
+        let t0 = std::time::Instant::now();
+        let mut banked_bytes = 0u64;
+        for id in 0..slots {
+            if t0.elapsed() > BANK_SAVE_TOTAL_BUDGET {
+                tracing::warn!(
                     target: "blazar::bank",
                     model = %inst.name,
-                    "bank save returned ok but wrote 0 tokens — the slot held no cached prefix to bank"
-                ),
-                Some(n) => tracing::debug!(
-                    target: "blazar::bank",
-                    model = %inst.name,
-                    "banked _auto-{} checkpoint: {n} tokens", inst.profile_ctx
-                ),
-                None => {}
+                    "bank sweep past budget — slots {id}..{slots} left unbanked"
+                );
+                break;
             }
-            // Hoard guard: a per-model bank over 512 MiB is storage
-            // abuse, not a cache — drop it and say so once.
-            if let Ok(md) = std::fs::metadata(&file) {
-                if md.len() > 512 * 1024 * 1024 {
-                    let _ = std::fs::remove_file(&file);
-                    tracing::warn!(target: "blazar::bank", model = %inst.name, "banked checkpoint > 512 MiB — dropped");
+            let filename = if id == 0 {
+                format!("_auto-{}", inst.profile_ctx)
+            } else {
+                format!("_auto-{}-s{id}", inst.profile_ctx)
+            };
+            let file = self.bank_slot_file(&inst.name, inst.profile_ctx, id);
+            let (client, base) = child_dial(&inst.endpoint);
+            let url = format!("{base}/slots/{id}?action=save&filename={filename}");
+            let body = if self.config.router {
+                serde_json::json!({"filename": filename, "model": inst.name})
+            } else {
+                serde_json::json!({"filename": filename})
+            };
+            let mut req = client
+                .post(&url)
+                .json(&body)
+                .timeout(std::time::Duration::from_secs(2));
+            if let Some(secret) = &inst.auth {
+                req = req.bearer_auth(secret);
+            }
+            let mut saved = None;
+            let ok = match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    saved = resp
+                        .json::<serde_json::Value>()
+                        .await
+                        .ok()
+                        .as_ref()
+                        .and_then(|v| slot_reported_tokens(v, "n_saved"));
+                    true
                 }
+                _ => false,
+            };
+            if !ok {
+                continue;
+            }
+            if saved == Some(0) {
+                // The slot held no cached prefix — drop the empty file.
+                let _ = std::fs::remove_file(&file);
+                continue;
+            }
+            if let Some(n) = saved {
+                tracing::debug!(
+                    target: "blazar::bank",
+                    model = %inst.name,
+                    "banked {filename} checkpoint: {n} tokens"
+                );
+            }
+            if let Ok(md) = std::fs::metadata(&file) {
+                banked_bytes += md.len();
             }
             // #20 identity manifest: stamp the shape so bank restores
             // can refuse stale KV (built from the LIVE instance ctx).
@@ -4557,13 +4664,21 @@ drop them from rpc_servers in config.toml",
                 }
             }
         }
+        // Hoard guard: a per-model bank set over 512 MiB is storage
+        // abuse, not a cache — drop the whole set and say so once.
+        if banked_bytes > 512 * 1024 * 1024 {
+            for id in 0..slots {
+                let _ = std::fs::remove_file(self.bank_slot_file(&inst.name, inst.profile_ctx, id));
+            }
+            tracing::warn!(
+                target: "blazar::bank",
+                model = %inst.name,
+                "banked set {} MiB across {slots} slots exceeds the 512 MiB cap — dropped",
+                banked_bytes / (1024 * 1024)
+            );
+        }
     }
 
-    /// Bank restore, choke point #2: after a fresh spawn reaches
-    /// readiness, a matching `_auto-<ctx>` is restored so the first
-    /// request rides warm KV. Warn-continue on any failure. A #20
-    /// identity mismatch SKIPS the restore — injecting KV from a
-    /// different runtime shape is worse than a cold start.
     /// Stop every instance (daemon shutdown). Bounded by grace per child.
     pub async fn shutdown_all(&self) -> Result<()> {
         let names: Vec<String> = self.instances.iter().map(|e| e.key().clone()).collect();
@@ -8738,5 +8853,35 @@ mod routing_tests {
         );
         let missing = Supervisor::repage_file(std::path::Path::new("/nonexistent/w.gguf"));
         assert!(missing.is_err());
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[test]
+    fn unit__bank_slot_of__legacy_suffixed_and_foreign() {
+        use std::ffi::OsStr;
+        // Legacy slot-0 name keeps its meaning: Some(0).
+        assert_eq!(
+            Supervisor::bank_slot_of(OsStr::new("_auto-16384"), 16384),
+            Some(0)
+        );
+        // Suffixed members map to their slot id.
+        assert_eq!(
+            Supervisor::bank_slot_of(OsStr::new("_auto-16384-s1"), 16384),
+            Some(1)
+        );
+        assert_eq!(
+            Supervisor::bank_slot_of(OsStr::new("_auto-16384-s17"), 16384),
+            Some(17)
+        );
+        // Different ctx, user checkpoints, manifests: not part of the set.
+        assert_eq!(
+            Supervisor::bank_slot_of(OsStr::new("_auto-8192-s1"), 16384),
+            None
+        );
+        assert_eq!(Supervisor::bank_slot_of(OsStr::new("conv1"), 16384), None);
+        assert_eq!(
+            Supervisor::bank_slot_of(OsStr::new("_auto-16384.identity.json"), 16384),
+            None
+        );
     }
 }

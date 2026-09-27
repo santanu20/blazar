@@ -1085,6 +1085,21 @@ async fn slots_action(
             }
         };
     let _ = std::fs::create_dir_all(&base);
+    // Action tape: integration tests assert which slot ids the gateway
+    // banked/restored by grepping this append-only log. Lives OUTSIDE the
+    // per-model dir so the /api/session listing never sees it.
+    let tape = base
+        .parent()
+        .map(|p| p.join("_stub_tape.log"))
+        .unwrap_or_else(|| base.join("_stub_tape.log"));
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(tape)
+        .and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, "{action} {id} {filename}")
+        });
     let path = base.join(&filename);
     match action.as_str() {
         "save" => {

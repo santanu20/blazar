@@ -220,3 +220,79 @@ async fn integration__session_identity__manifest_written_tamper_blocks_restore()
     assert!(!ckpt.exists());
     assert!(!blazar_core::session_identity::manifest_path(&ckpt).exists());
 }
+
+#[tokio::test]
+async fn integration__bank_multislot__saves_and_restores_every_slot() {
+    // -np 2 child: the conversation may land on any slot, so the
+    // shutdown bank must sweep EVERY slot, and the next spawn must
+    // restore each member into its own slot id (prod-sweep finding:
+    // slot-0-only banking left the sessions dir empty).
+    let cfg = blazar_core::Config {
+        slots: 2,
+        ..blazar_core::Config::default()
+    };
+    let ts = start(cfg).await;
+    let c = client();
+    let r = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({"model": "m1", "messages": [
+            {"role": "user", "content": "warm both slots"}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    // Shutdown: bank sweeps slot 0 AND slot 1.
+    ts.state.sup.shutdown_all().await.unwrap();
+    let bank_dir = ts
+        .dirs
+        .sessions_dir()
+        .join(blazar_core::profile::path_safe("m1"));
+    let entries: Vec<String> = std::fs::read_dir(&bank_dir)
+        .expect("sessions dir exists")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("_auto-") && !n.ends_with(".identity.json"))
+        .collect();
+    let base = entries
+        .iter()
+        .find(|n| !n.contains("-s"))
+        .expect("slot-0 checkpoint banked");
+    assert!(
+        entries.iter().any(|n| n == &format!("{base}-s1")),
+        "slot-1 checkpoint banked too, got {entries:?}"
+    );
+    let tape = std::fs::read_to_string(bank_dir.parent().unwrap().join("_stub_tape.log"))
+        .expect("stub action tape");
+    assert!(
+        tape.contains(&format!("save 0 {base}")),
+        "save hit slot 0: {tape}"
+    );
+    assert!(
+        tape.contains(&format!("save 1 {base}-s1")),
+        "save hit slot 1: {tape}"
+    );
+
+    // Respawn: every member restores into its own slot id.
+    let r = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({"model": "m1", "messages": [
+            {"role": "user", "content": "second conversation"}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let tape = std::fs::read_to_string(bank_dir.parent().unwrap().join("_stub_tape.log"))
+        .expect("stub action tape");
+    assert!(
+        tape.contains(&format!("restore 0 {base}")),
+        "restore hit slot 0: {tape}"
+    );
+    assert!(
+        tape.contains(&format!("restore 1 {base}-s1")),
+        "restore hit slot 1: {tape}"
+    );
+}
