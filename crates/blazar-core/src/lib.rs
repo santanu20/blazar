@@ -8,6 +8,7 @@ pub mod coreside;
 pub mod dirs;
 pub mod engine_kind;
 pub mod error;
+pub mod fs_safety;
 pub mod gguf;
 pub mod hardware;
 pub mod hfmeta;

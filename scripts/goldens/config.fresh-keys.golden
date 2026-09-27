@@ -8,6 +8,8 @@ cache_idle_slots
 cache_ram_mb
 cache_reuse
 cache_type
+cache_type_k
+cache_type_v
 check_tensors
 child_header_timeout_secs
 child_transport
@@ -34,6 +36,7 @@ engine_env
 engine_routing
 fork_retire_days
 host
+idle_ram_warm
 idle_sleep_secs
 idle_timeout_secs
 image_max_tokens
@@ -71,6 +74,7 @@ pii_scrub
 poll
 port
 predictive_preload
+preload
 prio
 prio_batch
 prompt_preflight
@@ -106,6 +110,8 @@ slot_prompt_similarity
 slots
 spawn_mem_guard
 spec
+spec_auto_manage
+spec_auto_ngram
 spec_autopull
 spec_cache
 spec_draft_backend_sampling
@@ -131,6 +137,7 @@ threads_batch
 threads_http
 tls_cert
 tls_key
+ubatch_auto
 ubatch_size
 update_channel
 video_ffmpeg_dir

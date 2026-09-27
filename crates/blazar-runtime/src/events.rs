@@ -53,6 +53,21 @@ pub enum BlazarEvent {
         model: String,
         slots: u32,
     },
+    /// B2 spec governor: sustained speculation overhead (queue
+    /// saturation or a collapsed draft-acceptance rate) parked
+    /// speculation for `model` — the child reshapes dense; a long quiet
+    /// streak restores it (`SpecGovernorRecovered`). The `reason` is
+    /// "saturation" or "acceptance".
+    SpecGovernorOff {
+        model: String,
+        reason: String,
+    },
+    /// B2 spec governor: the quiet streak was satisfied — speculation
+    /// is restored for `model` and the override cleared (the natural
+    /// overlay/config resolution resumes).
+    SpecGovernorRecovered {
+        model: String,
+    },
     ModelPulled {
         name: String,
         /// Post-download GGUF health check: set when the header did not

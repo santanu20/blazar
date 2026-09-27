@@ -852,6 +852,10 @@ pub fn build_input<'a>(
         hardware,
         config,
         overlay,
+        // Bench scores the overlay??config resolution exactly as the
+        // pre-input-threading compile did (no request/governor context
+        // exists on the CLI bench lane).
+        spec_mode: overlay.spec.as_deref().unwrap_or(config.spec.as_str()),
         loras,
         draft_path,
         // bench scores one argv in isolation; no co-residency planning

@@ -1,0 +1,133 @@
+{
+ "summary": {
+  "binary": "baseline-worktree-target/release/blazar",
+  "lane": "dense",
+  "spec_flags": [],
+  "np_flag": "8",
+  "metrics": {
+   "blazar_spec_saturation": "0"
+  }
+ },
+ "cells": [
+  {
+   "phase": "repetitive",
+   "i": 0,
+   "wall_s": 0.332,
+   "eval_count": 96,
+   "tok_s": 309.12,
+   "prompt_eval_count": 127,
+   "prompt_cached": 126,
+   "total_s_field": 0.315
+  },
+  {
+   "phase": "repetitive",
+   "i": 1,
+   "wall_s": 0.278,
+   "eval_count": 96,
+   "tok_s": 356.76,
+   "prompt_eval_count": 127,
+   "prompt_cached": 126,
+   "total_s_field": 0.272
+  },
+  {
+   "phase": "repetitive",
+   "i": 2,
+   "wall_s": 0.276,
+   "eval_count": 96,
+   "tok_s": 358.46,
+   "prompt_eval_count": 127,
+   "prompt_cached": 126,
+   "total_s_field": 0.271
+  },
+  {
+   "phase": "repetitive",
+   "i": 3,
+   "wall_s": 0.277,
+   "eval_count": 96,
+   "tok_s": 358.2,
+   "prompt_eval_count": 127,
+   "prompt_cached": 126,
+   "total_s_field": 0.271
+  },
+  {
+   "phase": "repetitive",
+   "i": 4,
+   "wall_s": 0.276,
+   "eval_count": 96,
+   "tok_s": 358.49,
+   "prompt_eval_count": 127,
+   "prompt_cached": 126,
+   "total_s_field": 0.271
+  },
+  {
+   "phase": "repetitive",
+   "i": 5,
+   "wall_s": 0.276,
+   "eval_count": 96,
+   "tok_s": 359.84,
+   "prompt_eval_count": 127,
+   "prompt_cached": 126,
+   "total_s_field": 0.27
+  },
+  {
+   "phase": "concurrent",
+   "i": 0,
+   "wall_s": 0.397,
+   "eval_count": 79,
+   "tok_s": 208.76,
+   "prompt_eval_count": 37,
+   "prompt_cached": 24,
+   "total_s_field": 0.387
+  },
+  {
+   "phase": "concurrent",
+   "i": 1,
+   "wall_s": 0.219,
+   "eval_count": 48,
+   "tok_s": 239.44,
+   "prompt_eval_count": 38,
+   "prompt_cached": 24,
+   "total_s_field": 0.21
+  },
+  {
+   "phase": "concurrent",
+   "i": 2,
+   "wall_s": 0.465,
+   "eval_count": 96,
+   "tok_s": 214.85,
+   "prompt_eval_count": 37,
+   "prompt_cached": null,
+   "total_s_field": 0.456
+  },
+  {
+   "phase": "concurrent",
+   "i": 3,
+   "wall_s": 0.228,
+   "eval_count": 50,
+   "tok_s": 236.6,
+   "prompt_eval_count": 39,
+   "prompt_cached": null,
+   "total_s_field": 0.22
+  },
+  {
+   "phase": "concurrent",
+   "i": 4,
+   "wall_s": 0.428,
+   "eval_count": 96,
+   "tok_s": 257.86,
+   "prompt_eval_count": 38,
+   "prompt_cached": 25,
+   "total_s_field": 0.38
+  },
+  {
+   "phase": "concurrent",
+   "i": 5,
+   "wall_s": 0.417,
+   "eval_count": 96,
+   "tok_s": 257.42,
+   "prompt_eval_count": 37,
+   "prompt_cached": 24,
+   "total_s_field": 0.38
+  }
+ ]
+}

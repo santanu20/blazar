@@ -59,6 +59,13 @@ pub struct ProfileInput<'a> {
     pub hardware: &'a Hardware,
     pub config: &'a Config,
     pub overlay: &'a ModelOverride,
+    /// Spec-decoding mode the SUPERVISOR resolved for this spawn — the
+    /// full tier order (per-request `options.spec` > model overlay >
+    /// governor override > config default) lives in one place upstream;
+    /// compile treats this as THE decision and never re-derives it from
+    /// overlay/config (re-deriving silently ignored the per-request and
+    /// governor tiers: `options.spec = "off"` compiled as config `auto`).
+    pub spec_mode: &'a str,
     /// (path, scale) pairs from the loras table.
     pub loras: &'a [(String, f64)],
     /// Local path of the pulled draft model when spec=auto resolved one.
@@ -386,37 +393,31 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         if let Some(f16) = kv_f16_bytes(input, rs.total_ctx).filter(|kv| *kv > 0) {
             // A PIN the f16 pool cannot host may still be hostable at
             // the quant the spawn will actually run: an explicit
-            // cache_type override, or the ladder demotion the same
-            // tight card triggers anyway. The refuse teaching names
-            // this exact lever — it must not be a dead end.
-            let pinned_quant = if tuning.kv_quant == Some(true) {
-                Some("q8_0")
+            // cache_type override (per-phase pair or legacy), or the
+            // ladder demotion the same tight card triggers anyway. The
+            // refuse teaching names this exact lever — it must not be a
+            // dead end.
+            let mut scratch: Vec<String> = Vec::new();
+            let pinned_pair: Option<(String, String)> = if tuning.kv_quant == Some(true) {
+                Some(("q8_0".to_string(), "q8_0".to_string()))
             } else {
-                let explicit = config.effective_cache_type(input.model_name);
-                if explicit.is_empty() {
-                    let mut scratch: Vec<String> = Vec::new();
+                let (k, v) = config.effective_cache_type_kv(input.model_name);
+                if k.is_empty() && v.is_empty() {
                     kv_quant_ladder(input, vram_bytes, rs.total_ctx, &mut scratch)
-                } else {
-                    match explicit {
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                } else if k == v {
+                    // Symmetric f16-class pin = force off (full-size math).
+                    match k.as_str() {
                         "f32" | "f16" | "bf16" => None,
-                        t => Some(match t {
-                            "q8_0" => "q8_0",
-                            "q4_0" => "q4_0",
-                            "q4_1" => "q4_1",
-                            "q5_0" => "q5_0",
-                            "q5_1" => "q5_1",
-                            _ => "f16",
-                        }),
+                        _ => Some((k, v)),
                     }
+                } else {
+                    Some((k, v))
                 }
             };
-            let kv = match pinned_quant {
-                Some("q8_0") => f16 / 2,
-                Some("q4_0") => f16 / 4,
-                Some("q4_1") => f16 * 9 / 20,
-                Some("q5_0") => f16 * 11 / 32,
-                Some("q5_1") => f16 * 3 / 8,
-                _ => f16,
+            let kv = match pinned_pair {
+                Some((k, v)) => scale_kv_pair(f16, &k, &v),
+                None => f16,
             };
             let mib = |b: u64| b / (1024 * 1024);
             let demand = input.model_bytes.saturating_add(kv);
@@ -550,27 +551,38 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
 
     // --- 6. KV cache quantization. Bench-adopted tuning wins, then an
     // explicit config/overlay type ("f16"-class = force off), then the
-    // capacity ladder: none -> q8_0 (KV/2) -> q4_0 (KV/4).
-    let kv_type: Option<String> = if let Some(on) = tuning.kv_quant {
-        on.then(|| "q8_0".to_string())
+    // capacity ladder: none -> q8_0 (KV/2) -> q8_0/q4_0 differential
+    // (3KV/8) -> q4_0 (KV/4). Per-phase `cache_type_k`/`cache_type_v`
+    // beat the legacy symmetric `cache_type` for their side; a lone set
+    // side mirrors (resolver contract, config.rs).
+    let (kv_k, kv_v): (Option<String>, Option<String>) = if let Some(on) = tuning.kv_quant {
+        let grade = on.then(|| "q8_0".to_string());
+        (grade.clone(), grade)
     } else {
-        let explicit = config.effective_cache_type(input.model_name);
-        if explicit.is_empty() {
-            kv_quant_ladder(input, vram_bytes, ctx, &mut warnings).map(str::to_string)
+        let (k, v) = config.effective_cache_type_kv(input.model_name);
+        if k.is_empty() && v.is_empty() {
+            match kv_quant_ladder(input, vram_bytes, ctx, &mut warnings) {
+                Some((k, v)) => (Some(k.to_string()), Some(v.to_string())),
+                None => (None, None),
+            }
         } else {
-            match explicit {
+            // Per-side f16-class handling: a symmetric f16-class pin keeps
+            // the historical force-off (no flags); anything else emits the
+            // literal grades so an explicit split stays a split.
+            let grade = |t: String| match t.as_str() {
                 "f32" | "f16" | "bf16" => None,
-                t => Some(t.to_string()),
+                _ => Some(t),
+            };
+            if k == v {
+                let g = grade(k);
+                (g.clone(), g)
+            } else {
+                (Some(k), Some(v))
             }
         }
     };
-    if let Some(t) = kv_type.clone() {
-        argv.extend([
-            "--cache-type-k".into(),
-            t.clone(),
-            "--cache-type-v".into(),
-            t,
-        ]);
+    if let (Some(k), Some(v)) = (kv_k.clone(), kv_v.clone()) {
+        argv.extend(["--cache-type-k".into(), k, "--cache-type-v".into(), v]);
     }
 
     // --- 7. cpu-moe when the model cannot fit VRAM but RAM can host it
@@ -751,7 +763,10 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     }
 
     // --- 11. speculative decoding
-    let spec_mode = overlay.spec.as_deref().unwrap_or(config.spec.as_str());
+    // The mode is the supervisor's resolved decision (see ProfileInput::
+    // spec_mode) — the tier order (per-request > overlay > governor >
+    // config) was applied upstream. The `mut` is the ngram rebind below.
+    let mut spec_mode = input.spec_mode;
     if spec_mode == "auto" {
         // Embedded MTP head wins over a catalog draft pair: it drafts from
         // the target's own trained weights (no separate model to pull) —
@@ -795,10 +810,29 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         } else {
             false
         };
+        let mut spec_engaged = embedded_mtp;
         if !embedded_mtp {
-            push_spec_args(input, &mut argv, &mut warnings);
+            spec_engaged = push_spec_args(input, &mut argv, &mut warnings);
         }
-    } else if is_ngram_spec(spec_mode) {
+        // Last resort inside auto: self-drafting n-gram lookup. Every
+        // drafter above needs weights the user must pull (or a card big
+        // enough to hold them); n-gram drafts from the context itself —
+        // zero extra VRAM, persisted via spec_cache, and manifest-gated
+        // so old engines keep the dense behavior. The user asked for
+        // speculation by setting spec = "auto"; give them the only lane
+        // that always fits.
+        if !spec_engaged && ngram_fallback_applies(input, config) {
+            warnings.push(format!(
+                "spec=auto: no usable draft pair for {} — n-gram lookup \
+                     speculation engaged (self-drafting, no extra VRAM; \
+                     warm across restarts via spec_cache); set spec = \"off\" \
+                     or spec_auto_ngram = false to disable",
+                input.model_name
+            ));
+            spec_mode = "ngram";
+        }
+    }
+    if is_ngram_spec(spec_mode) {
         // Self-drafting n-gram speculation: no draft model to pull; drafts
         // from the context's own n-grams ("ngram" is blazar shorthand for
         // the upstream "ngram-simple"; the typed variants map verbatim).
@@ -2058,13 +2092,12 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         .and_then(|g| kv_f16_bytes_meta(g, rs.total_ctx))
         .unwrap_or(0);
     let kv_est_bytes = kv_f16_bytes(input, ctx).map(|f16| {
-        let dense = match kv_type.as_deref() {
-            Some("q8_0") => f16 / 2,
-            Some("q4_0") => f16 / 4,
-            Some("q4_1") => f16 * 9 / 20,
-            Some("q5_0") => f16 * 11 / 32,
-            Some("q5_1") => f16 * 3 / 8,
-            _ => f16,
+        // Per-phase pair (rule 6): the estimate mirrors what the spawn
+        // emits — differential grades scale at the pair average.
+        let dense = match (kv_k.as_deref(), kv_v.as_deref()) {
+            (Some(k), Some(v)) if k != v => scale_kv_pair(f16, k, v),
+            (Some(t), _) | (_, Some(t)) => scale_kv_pair(f16, t, t),
+            (None, None) => f16,
         };
         dense + draft_kv
     });
@@ -4335,14 +4368,17 @@ fn resolve_ctx(
 /// Rule 6 ladder: KV cache quantization by capacity math, not stacked
 /// thresholds. Estimated f16 KV is `2*blocks*kv_heads*head_dim*ctx*2`
 /// bytes; `q8_0` halves it, `q4_0` quarters it. The cheapest grade that keeps
-/// weights+KV within 0.9x VRAM wins. Missing GGUF fields skip with a named
-/// warning — never guessed.
+/// weights+KV within 0.9x VRAM wins, with one differential rung between the
+/// symmetric `q8_0` and `q4_0` grades: K at `q8_0` + V at `q4_0` (3/8 of f16)
+/// — K precision dominates attention retrieval, V tolerates the heavier
+/// quant at better quality than symmetric `q4_0` (SnapKV/PyramidKV lineage).
+/// Missing GGUF fields skip with a named warning — never guessed.
 fn kv_quant_ladder(
     input: &ProfileInput<'_>,
     vram_bytes: u64,
     ctx: u32,
     warnings: &mut Vec<String>,
-) -> Option<&'static str> {
+) -> Option<(&'static str, &'static str)> {
     // The multimodal projector is GPU-resident too — capacity math that
     // ignores it OOMs at load on vision models (live incident).
     let mmproj_bytes = input
@@ -4362,15 +4398,50 @@ fn kv_quant_ladder(
     if resident.saturating_add(kv) <= budget {
         None
     } else if resident.saturating_add(kv / 2) <= budget {
-        Some("q8_0")
+        Some(("q8_0", "q8_0"))
+    } else if resident.saturating_add(kv * 3 / 8) <= budget {
+        warnings.push(
+            "KV differential quant engaged: K=q8_0 V=q4_0 (3/8 of f16 KV bytes) — K precision \
+             dominates retrieval quality, V carries the heavier quant; pin cache_type for a \
+             symmetric grade"
+                .into(),
+        );
+        Some(("q8_0", "q4_0"))
     } else {
         if resident.saturating_add(kv / 4) > budget {
             warnings.push(
                 "KV q4_0 engaged but weights+KV still exceed 90% VRAM; --fit will shrink ctx or the engine may OOM — consider a smaller quant".into(),
             );
         }
-        Some("q4_0")
+        Some(("q4_0", "q4_0"))
     }
+}
+
+/// Scale factor of one KV grade as a (numerator, denominator) rational —
+/// K and V each hold half the f16 KV bytes, so a pair scales f16 by the
+/// average of the two sides. Shared by the compiler verdict, the gateway
+/// ctx preflight, and the fit ladder so all three agree on one math.
+#[must_use]
+pub fn kv_grade_rational(grade: &str) -> (u64, u64) {
+    match grade {
+        "q8_0" => (1, 2),
+        "q4_0" => (1, 4),
+        "q4_1" => (9, 20),
+        "q5_0" => (11, 32),
+        "q5_1" => (3, 8),
+        // f32/f16/bf16 and anything unrecognized stay full-size: the
+        // callers' conservative-by-design contract.
+        _ => (1, 1),
+    }
+}
+
+/// f16 KV bytes scaled to a (K, V) grade pair — the shared per-phase math.
+#[must_use]
+pub fn scale_kv_pair(f16_bytes: u64, k: &str, v: &str) -> u64 {
+    let (nk, dk) = kv_grade_rational(k);
+    let (nv, dv) = kv_grade_rational(v);
+    // (nk/dk + nv/dv) / 2, in one integer expression.
+    f16_bytes.saturating_mul(nk * dv + nv * dk) / (2 * dk * dv)
 }
 
 /// f16 KV-cache bytes at `ctx` for this model, when the GGUF carries
@@ -4942,6 +5013,17 @@ fn is_ngram_spec(mode: &str) -> bool {
     )
 }
 
+/// Gate for the spec=auto n-gram fallback: the engine must advertise
+/// `ngram-simple` through `--spec-type` (old engines keep the dense
+/// behavior) and the user must not have opted out. Consulted only when
+/// no drafter engaged — embedded MTP, catalog pair, capacity are all
+/// checked first.
+fn ngram_fallback_applies(input: &ProfileInput<'_>, config: &Config) -> bool {
+    config.spec_auto_ngram
+        && input.supported_flags.contains("--spec-type")
+        && input.spec_types.iter().any(|t| t == "ngram-simple")
+}
+
 /// Manifest-gated passthrough for config knobs: emit `flag` + `values`
 /// only when the active engine advertises the flag; otherwise degrade
 /// to a teaching warning (an older engine still serves with its own
@@ -4967,8 +5049,15 @@ fn push_gated(
 
 /// Rule 11: spec=auto draft pairing, opportunistic by design — an
 /// unpulled or unsupported pair degrades to dense with a teaching
-/// warning; manifest-gated emission when the draft is live.
-fn push_spec_args(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings: &mut Vec<String>) {
+/// warning; manifest-gated emission when the draft is live. Returns
+/// true when a drafter engaged (argv carries spec flags), false when
+/// the spawn will run dense — the auto branch uses that to decide the
+/// n-gram fallback.
+fn push_spec_args(
+    input: &ProfileInput<'_>,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> bool {
     if let Some(pair) = crate::catalog::spec_pair_for(input.model_name) {
         if let Some(draft) = input.draft_path {
             // Self-draft guard: the draft row's registry name can
@@ -4981,7 +5070,7 @@ fn push_spec_args(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings: &m
                          file itself; running dense",
                     input.model_name
                 ));
-                return;
+                return false;
             }
             if !input.supported_flags.contains("--spec-type")
                 || !input
@@ -4996,7 +5085,7 @@ fn push_spec_args(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings: &m
                          engine {} lacks it; running dense — run: blazar engine update",
                     pair.spec_type, input.model_name, input.engine_tag
                 ));
-                return;
+                return false;
             }
             // Capacity gate: the draft rides the SAME card as the main
             // model, and the pre-spawn census's free MiB predates the
@@ -5031,7 +5120,7 @@ fn push_spec_args(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings: &m
                     input.model_bytes / (1024 * 1024),
                     card_free_bytes / (1024 * 1024)
                 ));
-                return;
+                return false;
             }
             argv.push("--spec-type".into());
             argv.push(pair.spec_type.clone());
@@ -5041,28 +5130,29 @@ fn push_spec_args(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings: &m
                 argv.push("--spec-draft-n-max".into());
                 argv.push("3".into());
             }
-        } else {
-            // Opportunistic auto: an unpulled catalog draft degrades
-            // to dense with a teaching warning — auto must never
-            // refuse a spawn (hard errors belong to the explicit
-            // typed modes, where the user asked for THAT drafter).
-            // (`--spec-draft-hf` auto-download exists in b10840+ but
-            // resolves to an empty path and the child exits fatally,
-            // verified live 2026-09-07 — revisit if upstream fixes
-            // draft-side HF resolution.)
-            warnings.push(format!(
-                "spec=auto: draft pair {} for {} is not pulled; running dense — run: \
-                     blazar pull {} to enable speculation",
-                pair.spec_type, input.model_name, pair.draft_repo
-            ));
+            return true;
         }
-    } else {
-        tracing::info!(
-            model = input.model_name,
-            "profile: spec=auto found no draft pair for {} in the catalog; running dense",
-            input.model_name
-        );
+        // Opportunistic auto: an unpulled catalog draft degrades
+        // to dense with a teaching warning — auto must never
+        // refuse a spawn (hard errors belong to the explicit
+        // typed modes, where the user asked for THAT drafter).
+        // (`--spec-draft-hf` auto-download exists in b10840+ but
+        // resolves to an empty path and the child exits fatally,
+        // verified live 2026-09-07 — revisit if upstream fixes
+        // draft-side HF resolution.)
+        warnings.push(format!(
+            "spec=auto: draft pair {} for {} is not pulled; running dense — run: \
+                     blazar pull {} to enable speculation",
+            pair.spec_type, input.model_name, pair.draft_repo
+        ));
+        return false;
     }
+    tracing::info!(
+        model = input.model_name,
+        "profile: spec=auto found no draft pair for {} in the catalog; no drafter engaged",
+        input.model_name
+    );
+    false
 }
 
 /// Router-preset INI generation. Upstream router mode (llama-server with
@@ -5581,6 +5671,7 @@ mod tests {
             hardware: hw,
             config: cfg,
             overlay: &DEFAULT_OVERLAY,
+            spec_mode: cfg.spec.as_str(),
             loras: &[],
             draft_path: None,
             draft_gguf: None,
@@ -5612,6 +5703,12 @@ mod tests {
     static DFLASH_SPEC_TYPES: LazyLock<Vec<String>> =
         LazyLock::new(|| vec!["draft-dflash".to_string()]);
 
+    static NGRAM_SPEC_TYPES: LazyLock<Vec<String>> =
+        LazyLock::new(|| vec!["ngram-simple".to_string()]);
+
+    static DRAFT_AND_NGRAM_SPEC_TYPES: LazyLock<Vec<String>> =
+        LazyLock::new(|| vec!["draft-simple".to_string(), "ngram-simple".to_string()]);
+
     /// Same as `input_with_spec` but with a controllable model name — the
     /// default "qwen3-8b" matches the catalog spec-pair prefix, which is
     /// wrong for tests that need the no-pair path.
@@ -5641,6 +5738,8 @@ mod tests {
         lazy_mode: None,
         loras: None,
         extra_args: None,
+        cache_type_k: None,
+        cache_type_v: None,
         cache_type: None,
         kv_unified: None,
         ctx_extend: None,
@@ -7438,6 +7537,107 @@ mod tests {
     }
 
     #[test]
+    fn unit__kv_differential__explicit_pair_emits_split_flags() {
+        // Differential pin: K keeps retrieval precision (q8_0) while V
+        // drops to q4_0 — the capacity win that motivated the knobs.
+        let cfg = Config {
+            cache_type_k: "q8_0".into(),
+            cache_type_v: "q4_0".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(24_000, 32_000, 8); // plenty of VRAM: no ladder interference
+        let g = meta();
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p.argv.windows(2).any(|w| w == ["--cache-type-k", "q8_0"]));
+        assert!(p.argv.windows(2).any(|w| w == ["--cache-type-v", "q4_0"]));
+    }
+
+    #[test]
+    fn unit__kv_differential__one_side_mirrors_when_other_unset() {
+        // cache_type_k alone, no legacy cache_type: the V side mirrors K
+        // rather than falling through to the ladder.
+        let cfg = Config {
+            cache_type_k: "q8_0".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let g = meta();
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p.argv.windows(2).any(|w| w == ["--cache-type-k", "q8_0"]));
+        assert!(p.argv.windows(2).any(|w| w == ["--cache-type-v", "q8_0"]));
+    }
+
+    #[test]
+    fn unit__kv_differential__ladder_differential_rung() {
+        // Geometry (live b10948 truth, see unified-KV pin above):
+        // 57344 B/ctx-token -> kv(131072) = 7168 MiB f16. On an 8400 MiB
+        // card (budget 7560) with a 4800 MiB resident model: q8_0
+        // symmetric (3584 MiB) overflows, the differential rung K=q8_0
+        // V=q4_0 (2688 MiB) fits — the ladder stops there, before q4_0
+        // symmetric. The ladder is tested directly: through compile() the
+        // slots auto-sizer scales ctx with VRAM, which would couple the
+        // rung under test to slot math instead of capacity math.
+        let cfg = Config {
+            default_ctx: 131_072,
+            ..Config::default()
+        };
+        let hw = gpu_hw(8_400, 13_674, 8);
+        let g = GgufMeta {
+            context_length: Some(131_072),
+            ..meta()
+        };
+        let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        inp.model_bytes = 4_800 * MIB;
+        let mut warnings = Vec::new();
+        let rung = kv_quant_ladder(&inp, Hardware::bytes(8_400), 131_072, &mut warnings);
+        assert_eq!(rung, Some(("q8_0", "q4_0")));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("differential quant engaged")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn unit__kv_differential__symmetric_f16_class_still_forces_off() {
+        // A k/v pair that lands on the same f16-class grade keeps the
+        // historical force-off: no flags, engine default.
+        let cfg = Config {
+            cache_type_k: "f16".into(),
+            cache_type_v: "f16".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(5_500, 32_000, 8); // ladder would engage if not pinned
+        let g = meta();
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(!p.argv.contains(&"--cache-type-k".to_string()));
+        assert!(!p.argv.contains(&"--cache-type-v".to_string()));
+    }
+
+    #[test]
+    fn unit__scale_kv_pair__differential_averages() {
+        // Shared math for both the emission and the fit verdicts: the
+        // byte scale is the rational average across the two sides;
+        // unknown grades scale 1:1 (fail-open to f16 bytes, never zero).
+        assert_eq!(scale_kv_pair(8_000, "q8_0", "q4_0"), 3_000);
+        assert_eq!(scale_kv_pair(8_000, "q8_0", "q8_0"), 4_000);
+        assert_eq!(scale_kv_pair(8_000, "weird", "bogus"), 8_000);
+    }
+
+    #[test]
     fn unit__ctx_extend__yarn_emitted_with_warning() {
         let cfg = Config {
             ctx_extend: 2.0,
@@ -7947,6 +8147,256 @@ mod tests {
     }
 
     #[test]
+    fn unit__spec_auto_ngram_fallback__no_pair_engages_ngram_simple() {
+        let cfg = Config {
+            spec: "auto".into(),
+            slots: 1, // purpose-scoped: spec lane, not slot sizing
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let inp = input_named_with_spec(
+            "no-pair-model-x",
+            &g,
+            &hw,
+            &cfg,
+            &ALL_FLAGS,
+            &NGRAM_SPEC_TYPES,
+        );
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-type" && w[1] == "ngram-simple"),
+            "fallback must engage n-gram lookup: {:?}",
+            p.argv
+        );
+        // Rule 14 rides the effective ngram mode: the lookup cache is
+        // persisted per instance key.
+        let lcache = format!(
+            "/tmp/blazar-test-data/speccache/{}.lcache",
+            path_safe("no-pair-model-x")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--lookup-cache-dynamic" && w[1] == lcache),
+            "persisted lookup cache must ride the fallback: {:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("n-gram lookup") && w.contains("spec_auto_ngram = false")),
+            "teaching warning with opt-out required: {:?}",
+            p.warnings
+        );
+        // No draft model is involved in the fallback lane.
+        assert!(!p.argv.contains(&"--spec-draft-model".to_string()));
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[test]
+    fn unit__spec_mode_input__resolved_off_beats_auto_config() {
+        // Live incident shape: the governor (or a per-request
+        // options.spec="off") resolved "off" while config.spec stayed
+        // "auto" — before the resolved mode was threaded into compile,
+        // the compiler re-derived "auto" from config and engaged the
+        // n-gram fallback anyway. The input's decision must win.
+        let cfg = Config {
+            spec: "auto".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let mut inp = input_named_with_spec(
+            "no-pair-model-x",
+            &g,
+            &hw,
+            &cfg,
+            &ALL_FLAGS,
+            &NGRAM_SPEC_TYPES,
+        );
+        inp.spec_mode = "off";
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.iter().any(|a| a.starts_with("--spec-type")
+                || a.starts_with("--lookup-cache")
+                || a.starts_with("--spec-draft")),
+            "resolved off must stay dense despite auto config: {:?}",
+            p.argv
+        );
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[test]
+    fn unit__spec_mode_input__resolved_ngram_beats_off_config() {
+        // The converse: an explicit per-request "ngram" must engage even
+        // against a dense global config — proving compile honors the
+        // resolved decision in BOTH directions (no config re-read).
+        let cfg = Config {
+            spec: "off".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let mut inp = input_named_with_spec(
+            "no-pair-model-x",
+            &g,
+            &hw,
+            &cfg,
+            &ALL_FLAGS,
+            &NGRAM_SPEC_TYPES,
+        );
+        inp.spec_mode = "ngram";
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-type" && w[1] == "ngram-simple"),
+            "resolved ngram must engage despite off config: {:?}",
+            p.argv
+        );
+    }
+
+    #[test]
+    fn unit__spec_auto_ngram_fallback__knob_off_stays_dense() {
+        let cfg = Config {
+            spec: "auto".into(),
+            spec_auto_ngram: false,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let inp = input_named_with_spec(
+            "no-pair-model-x",
+            &g,
+            &hw,
+            &cfg,
+            &ALL_FLAGS,
+            &NGRAM_SPEC_TYPES,
+        );
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.iter().any(|a| a == "--spec-type"),
+            "knob off must keep the historical dense behavior: {:?}",
+            p.argv
+        );
+        assert!(!p.argv.contains(&"--lookup-cache-dynamic".to_string()));
+        assert!(
+            !p.warnings.iter().any(|w| w.contains("n-gram lookup")),
+            "no fallback warning when opted out: {:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__spec_auto_ngram_fallback__engine_lacking_ngram_stays_dense() {
+        // Manifest gate: the engine advertises a draft pair type but not
+        // ngram-simple — the fallback must not push argv the child rejects.
+        let cfg = Config {
+            spec: "auto".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let inp = input_named_with_spec(
+            "no-pair-model-x",
+            &g,
+            &hw,
+            &cfg,
+            &ALL_FLAGS,
+            &EAGLE3_SPEC_TYPES,
+        );
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.iter().any(|a| a == "--spec-type"),
+            "old engines keep dense: {:?}",
+            p.argv
+        );
+        assert!(!p.argv.contains(&"--lookup-cache-dynamic".to_string()));
+    }
+
+    #[test]
+    fn unit__spec_auto_ngram_fallback__capacity_gate_falls_back() {
+        // The 8 GiB shape: the pair is pulled but the card cannot hold
+        // model + draft + KV floor — n-gram needs no weights, so the
+        // fallback engages after the capacity warning.
+        let cfg = Config {
+            spec: "auto".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(5_050, 8_000, 8);
+        let g = meta();
+        let mut inp = input_named_with_spec(
+            "qwen3-8b",
+            &g,
+            &hw,
+            &cfg,
+            &ALL_FLAGS,
+            &DRAFT_AND_NGRAM_SPEC_TYPES,
+        );
+        let draft = draft_file("auto-capacity-ngram");
+        inp.draft_path = Some(&draft);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("does not fit the picked card")),
+            "capacity warning still teaches: {:?}",
+            p.warnings
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-type" && w[1] == "ngram-simple"),
+            "fallback engages when the pair cannot fit: {:?}",
+            p.argv
+        );
+        assert!(
+            !p.argv.contains(&"--spec-draft-model".to_string()),
+            "no draft model in the fallback lane: {:?}",
+            p.argv
+        );
+    }
+
+    #[test]
+    fn unit__spec_auto_ngram_fallback__unpulled_pair_falls_back() {
+        let cfg = Config {
+            spec: "auto".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let inp = input_named_with_spec(
+            "qwen3-8b",
+            &g,
+            &hw,
+            &cfg,
+            &ALL_FLAGS,
+            &DRAFT_AND_NGRAM_SPEC_TYPES,
+        );
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("not pulled") && w.contains("blazar pull")),
+            "the pull teaching warning still fires: {:?}",
+            p.warnings
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-type" && w[1] == "ngram-simple"),
+            "unpulled pair falls back instead of running dense: {:?}",
+            p.argv
+        );
+    }
+
+    #[test]
     fn unit__cache_idle_slots__opt_out_only() {
         // Default (true, upstream default): nothing emitted. The knob
         // exists to disable.
@@ -8321,6 +8771,7 @@ mod tests {
             hardware: hw,
             config: cfg,
             overlay,
+            spec_mode: cfg.spec.as_str(),
             loras: &[],
             draft_path: None,
             draft_gguf: None,
@@ -11713,6 +12164,7 @@ mod tests {
             hardware: hw,
             config: cfg,
             overlay: &DEFAULT_OVERLAY,
+            spec_mode: cfg.spec.as_str(),
             loras: &[],
             draft_path: None,
             draft_gguf: None,

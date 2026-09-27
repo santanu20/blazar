@@ -57,7 +57,18 @@ pub fn build(dirs: &BlazarDirs, config: &Config, model: &str) -> Option<SessionI
         engine_sha: engine.sha256,
         model_sha,
         ctx: config.effective_ctx(model),
-        cache_type: config.effective_cache_type(model).to_string(),
+        // Symmetric grades record the legacy single value (old manifests
+        // verify unchanged); a differential K/V pair composes "k/v" — the
+        // string compare then refuses cross-quant restores in every
+        // old-vs-new direction without a schema change.
+        cache_type: {
+            let (k, v) = config.effective_cache_type_kv(model);
+            if k == v {
+                k
+            } else {
+                format!("{k}/{v}")
+            }
+        },
         kv_unified: config.effective_kv_unified(model),
         // F121: record the overlay-effective slot count, not the raw
         // global — a per-model `slots` override changes what actually
@@ -281,5 +292,59 @@ mod tests {
         assert_eq!(id.model_sha.as_deref(), Some("cafe"));
         assert_eq!(id.ctx, 4096);
         assert_eq!(id.blazar_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn integration__session_identity__differential_pair_composes_and_refuses_cross_quant() {
+        // A differential K/V pair composes "k/v" in the manifest: old
+        // manifests (single grade) verify unchanged, and the string
+        // compare refuses cross-quant restores in BOTH directions
+        // without a schema change.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dirs = BlazarDirs {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+        };
+        let store = Store::open(&dirs).expect("store");
+        store
+            .upsert_engine(&crate::store::EngineRow {
+                tag: "b4091".into(),
+                asset: "llama-server".into(),
+                sha256: "e3b0".into(),
+                installed_at: 1,
+                active: true,
+                manifest: "{}".into(),
+                kind: crate::engine_kind::EngineKind::default(),
+            })
+            .expect("engine");
+        let cfg = Config {
+            cache_type_k: "q8_0".into(),
+            cache_type_v: "q4_0".into(),
+            ..Config::default()
+        };
+        let id = build(&dirs, &cfg, "m1").expect("identity builds");
+        assert_eq!(id.cache_type, "q8_0/q4_0");
+
+        // Symmetric grade records the legacy single value.
+        let cfg_sym = Config {
+            cache_type: "q5_0".into(),
+            ..Config::default()
+        };
+        let id_sym = build(&dirs, &cfg_sym, "m1").expect("identity builds");
+        assert_eq!(id_sym.cache_type, "q5_0");
+
+        // Cross-quant restore is refused in both old-vs-new directions.
+        let mut saved = ident();
+        saved.cache_type = "q8_0".into();
+        let mut current = ident();
+        current.cache_type = "q8_0/q4_0".into();
+        let diffs = verify(&saved, &current);
+        assert!(diffs.iter().any(|d| d.contains("cache_type")), "{diffs:?}");
+        let diffs = verify(&current, &saved);
+        assert!(diffs.iter().any(|d| d.contains("cache_type")), "{diffs:?}");
+        // Same composed value on both sides restores cleanly.
+        let mut twin = ident();
+        twin.cache_type = "q8_0/q4_0".into();
+        assert!(verify(&current, &twin).is_empty());
     }
 }

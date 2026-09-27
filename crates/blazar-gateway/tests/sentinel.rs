@@ -835,3 +835,411 @@ async fn integration__sentinel__disabled_is_a_full_kill_switch() {
     assert_eq!(why["sentinel"], false);
     ts.state.sup.shutdown_all().await.unwrap();
 }
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__bestof__fanout_sums_usage_and_stamps_header() {
+    // slots > 1 so the saturation guard has free decode slots to spend
+    // on candidates (a slots=1 model can never afford a fan-out).
+    let cfg = Config {
+        slots: 4,
+        ..Config::default()
+    };
+    let ts = start(cfg, &[], false).await;
+    let c = client();
+    let ask = serde_json::json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{"role": "user", "content": "hello best-of world"}],
+    });
+    // Baseline: the same ask without the knob (single candidate).
+    let base: serde_json::Value = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&ask)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // Fan-out: two identical candidates -> winner + summed usage +
+    // transparency header proving both ran and were billed.
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "best_of": 2,
+            "messages": [{"role": "user", "content": "hello best-of world"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let hdr = resp
+        .headers()
+        .get("x-blazar-best-of")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(hdr.contains("asked=2"), "header: {hdr}");
+    assert!(hdr.contains("used=2"), "header: {hdr}");
+    let fan: serde_json::Value = resp.json().await.unwrap();
+    let single = base["eval_count"].as_i64().unwrap_or(0);
+    let doubled = fan["eval_count"].as_i64().unwrap_or(0);
+    assert_eq!(
+        doubled,
+        single.saturating_mul(2),
+        "usage must sum across candidates: single={single} fan={doubled:?} hdr={hdr} base={base} fan={fan}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__bestof__headroom_degrade_stamps_reason_header() {
+    // slots = 1: the child can never afford a second candidate, so the
+    // guard must collapse the fan-out to the normal single-send path —
+    // but the ask was heard, and the response must say why it shrank.
+    let cfg = Config {
+        slots: 1,
+        ..Config::default()
+    };
+    let ts = start(cfg, &[], false).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "best_of": 2,
+            "messages": [{"role": "user", "content": "hello starved world"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let hdr = resp
+        .headers()
+        .get("x-blazar-best-of")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        hdr.contains("asked=2 used=1 reason=headroom"),
+        "degrade must be client-visible: {hdr}"
+    );
+    // The response itself is a normal single send: full body, no
+    // doubled usage.
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["message"]["content"].is_string(), "{body}");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__bestof__stream_plus_bestof_is_rejected() {
+    let ts = start(Config::default(), &[], false).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": true,
+            "best_of": 2,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].to_string().contains("stream=false"),
+        "teaching error: {body}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__bestof__passthrough_chat_lane_teaches_instead_of_ignoring() {
+    let ts = start(Config::default(), &[], false).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "best_of": 2,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("/v1/responses"),
+        "teaching error names the working lanes: {body}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+#[tokio::test]
+async fn integration__startup_preload__listed_model_spawns_before_first_request() {
+    // F1: a config preload list spawns the model WITHOUT any client
+    // request — the daemon comes up warm. The stub engine serves as
+    // the child; readiness is awaited by preload_listed itself.
+    let cfg = Config {
+        preload: vec!["m1".into()],
+        ..Config::default()
+    };
+    let ts = start(cfg, &[], false).await;
+    // No HTTP request is made: the supervisor's own startup list must
+    // be the only spawn trigger.
+    ts.state.sup.preload_listed().await;
+    let rows = ts.state.sup.ps();
+    assert!(
+        rows.iter().any(|r| r.name.split('#').next() == Some("m1")),
+        "m1 must be resident from the preload list alone, ps = {rows:?}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+#[tokio::test]
+async fn integration__startup_preload__unknown_name_warns_and_lives_on() {
+    // Warn-not-fail contract: a bogus name teaches `blazar pull` and
+    // the supervisor stays empty but healthy.
+    let cfg = Config {
+        preload: vec!["no-such-model-x".into()],
+        ..Config::default()
+    };
+    let ts = start(cfg, &[], false).await;
+    ts.state.sup.preload_listed().await;
+    assert!(ts.state.sup.ps().is_empty());
+    // A later normal request still works end-to-end.
+    let c = client();
+    let r: serde_json::Value = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(r["choices"][0]["message"]["content"].is_string());
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__decode_rate__gauge_moves_after_a_completion() {
+    // A2: one non-stream completion must blend into the model's decode
+    // EWMA and surface as the per-model gauge line (the pure math and
+    // guards carry their own unit pins; this proves the wiring end to
+    // end through the ollama lane).
+    let ts = start(Config::default(), &[], false).await;
+    let c = client();
+    let ask = serde_json::json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{"role": "user", "content": "hello throughput world"}],
+    });
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&ask)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let metrics = c
+        .get(format!("{}/metrics", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("blazar_model_decode_tokens_per_second{model=\"m1\"}"),
+        "decode-rate gauge must carry the served model's label"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+// --- A3 cascade routing ------------------------------------------------
+
+/// Stage a second stub-backed model sharing m1's gguf (the stub child
+/// never reads it; the row is what routing resolves).
+fn stage_second_model(ts: &TestServer) {
+    let path = ts
+        .state
+        .with_store(|s| s.get_model("m1").ok().flatten().map(|r| r.path))
+        .flatten()
+        .expect("m1 staged by harness");
+    ts.state
+        .with_store(|s| {
+            s.upsert_model(&blazar_core::ModelRow {
+                name: "m2".into(),
+                repo: "o/m2".into(),
+                quant: "Q4_K_M".into(),
+                path,
+                bytes: 500_000_000,
+                sha256: None,
+                mmproj_path: None,
+                components: vec![],
+                shards: 1,
+                arch: Some("qwen3".into()),
+                params: Some(0.5),
+                ctx_train: Some(40_960),
+                pulled_at: 1,
+            })
+            .unwrap();
+        })
+        .expect("store available");
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__cascade__first_pass_serves_small_model() {
+    let ts = start(Config::default(), &[], false).await;
+    stage_second_model(&ts);
+    let c = client();
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "cascade": ["m1", "m2"],
+            "messages": [{"role": "user", "content": "hello cascade world"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let hdr = resp
+        .headers()
+        .get("x-blazar-cascade")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        hdr.contains("tried=m1,m2")
+            && hdr.contains("served=m1")
+            && hdr.contains("reason=first-pass"),
+        "header: {hdr}"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["message"]["content"].is_string(),
+        "winner body passes through: {body}"
+    );
+    let metrics = c
+        .get(format!("{}/metrics", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("blazar_cascade_runs_total"),
+        "cascade counters exported"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__cascade__unknown_first_candidate_escalates() {
+    let ts = start(Config::default(), &[], false).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "cascade": ["no-such-model", "m1"],
+            "messages": [{"role": "user", "content": "escalate me"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let hdr = resp
+        .headers()
+        .get("x-blazar-cascade")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        hdr.contains("served=m1") && hdr.contains("reason=escalated"),
+        "header: {hdr}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__cascade__header_pins_the_order() {
+    let ts = start(Config::default(), &[], false).await;
+    stage_second_model(&ts);
+    let c = client();
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .header("x-blazar-cascade", "m2, m1")
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "messages": [{"role": "user", "content": "header order"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let hdr = resp
+        .headers()
+        .get("x-blazar-cascade")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        hdr.contains("tried=m2,m1") && hdr.contains("served=m2"),
+        "header must pin the chain order: {hdr}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__cascade__stream_plus_cascade_is_rejected() {
+    let ts = start(Config::default(), &[], false).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": true,
+            "cascade": ["m1", "m2"],
+            "messages": [{"role": "user", "content": "no streaming cascades"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let msg = body["error"].as_str().unwrap_or_default();
+    assert!(msg.contains("stream=false"), "teaching error: {msg}");
+    ts.state.sup.shutdown_all().await.unwrap();
+}

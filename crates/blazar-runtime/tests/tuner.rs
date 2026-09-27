@@ -85,6 +85,7 @@ fn test_input<'a>(
         hardware: hw,
         config: cfg,
         overlay,
+        spec_mode: overlay.spec.as_deref().unwrap_or(cfg.spec.as_str()),
         loras: &[],
         draft_path: None,
         draft_gguf: None,

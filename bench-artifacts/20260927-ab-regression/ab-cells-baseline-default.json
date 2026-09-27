@@ -1,0 +1,133 @@
+{
+ "summary": {
+  "binary": "baseline-worktree-target/release/blazar",
+  "lane": "default",
+  "spec_flags": [],
+  "np_flag": "8",
+  "metrics": {
+   "blazar_spec_saturation": "0"
+  }
+ },
+ "cells": [
+  {
+   "phase": "repetitive",
+   "i": 0,
+   "wall_s": 0.326,
+   "eval_count": 96,
+   "tok_s": 311.34,
+   "prompt_eval_count": 127,
+   "prompt_cached": 126,
+   "total_s_field": 0.313
+  },
+  {
+   "phase": "repetitive",
+   "i": 1,
+   "wall_s": 0.278,
+   "eval_count": 96,
+   "tok_s": 355.76,
+   "prompt_eval_count": 127,
+   "prompt_cached": 126,
+   "total_s_field": 0.273
+  },
+  {
+   "phase": "repetitive",
+   "i": 2,
+   "wall_s": 0.278,
+   "eval_count": 96,
+   "tok_s": 356.55,
+   "prompt_eval_count": 127,
+   "prompt_cached": 126,
+   "total_s_field": 0.272
+  },
+  {
+   "phase": "repetitive",
+   "i": 3,
+   "wall_s": 0.276,
+   "eval_count": 96,
+   "tok_s": 358.58,
+   "prompt_eval_count": 127,
+   "prompt_cached": 126,
+   "total_s_field": 0.271
+  },
+  {
+   "phase": "repetitive",
+   "i": 4,
+   "wall_s": 0.273,
+   "eval_count": 96,
+   "tok_s": 363.15,
+   "prompt_eval_count": 127,
+   "prompt_cached": 126,
+   "total_s_field": 0.267
+  },
+  {
+   "phase": "repetitive",
+   "i": 5,
+   "wall_s": 0.269,
+   "eval_count": 96,
+   "tok_s": 368.06,
+   "prompt_eval_count": 127,
+   "prompt_cached": 126,
+   "total_s_field": 0.264
+  },
+  {
+   "phase": "concurrent",
+   "i": 0,
+   "wall_s": 0.323,
+   "eval_count": 71,
+   "tok_s": 231.78,
+   "prompt_eval_count": 37,
+   "prompt_cached": 24,
+   "total_s_field": 0.314
+  },
+  {
+   "phase": "concurrent",
+   "i": 1,
+   "wall_s": 0.207,
+   "eval_count": 48,
+   "tok_s": 252.27,
+   "prompt_eval_count": 38,
+   "prompt_cached": 24,
+   "total_s_field": 0.198
+  },
+  {
+   "phase": "concurrent",
+   "i": 2,
+   "wall_s": 0.458,
+   "eval_count": 96,
+   "tok_s": 217.61,
+   "prompt_eval_count": 37,
+   "prompt_cached": 36,
+   "total_s_field": 0.45
+  },
+  {
+   "phase": "concurrent",
+   "i": 3,
+   "wall_s": 0.333,
+   "eval_count": 73,
+   "tok_s": 230.18,
+   "prompt_eval_count": 39,
+   "prompt_cached": null,
+   "total_s_field": 0.326
+  },
+  {
+   "phase": "concurrent",
+   "i": 4,
+   "wall_s": 0.428,
+   "eval_count": 96,
+   "tok_s": 241.57,
+   "prompt_eval_count": 38,
+   "prompt_cached": 25,
+   "total_s_field": 0.404
+  },
+  {
+   "phase": "concurrent",
+   "i": 5,
+   "wall_s": 0.376,
+   "eval_count": 96,
+   "tok_s": 292.82,
+   "prompt_eval_count": 37,
+   "prompt_cached": 24,
+   "total_s_field": 0.334
+  }
+ ]
+}

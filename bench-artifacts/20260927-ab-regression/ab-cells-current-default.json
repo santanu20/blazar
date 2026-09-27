@@ -1,0 +1,139 @@
+{
+ "summary": {
+  "binary": "repo target/release/blazar",
+  "lane": "default",
+  "spec_flags": [
+   "--spec-type",
+   "--lookup-cache-dynamic",
+   "scratch XDG speccache dir/qwen2.5-0.5b-instruct-f829161bb633b3da.lcache"
+  ],
+  "np_flag": "8",
+  "metrics": {
+   "blazar_spec_saturation": "0",
+   "blazar_bestof_fanouts_total": "0",
+   "blazar_bestof_degraded_total": "0"
+  }
+ },
+ "cells": [
+  {
+   "phase": "repetitive",
+   "i": 0,
+   "wall_s": 0.181,
+   "eval_count": 96,
+   "tok_s": 592.78,
+   "prompt_eval_count": 127,
+   "prompt_cached": 126,
+   "total_s_field": 0.168
+  },
+  {
+   "phase": "repetitive",
+   "i": 1,
+   "wall_s": 0.158,
+   "eval_count": 96,
+   "tok_s": 646.57,
+   "prompt_eval_count": 127,
+   "prompt_cached": 126,
+   "total_s_field": 0.153
+  },
+  {
+   "phase": "repetitive",
+   "i": 2,
+   "wall_s": 0.142,
+   "eval_count": 96,
+   "tok_s": 722.14,
+   "prompt_eval_count": 127,
+   "prompt_cached": 126,
+   "total_s_field": 0.137
+  },
+  {
+   "phase": "repetitive",
+   "i": 3,
+   "wall_s": 0.142,
+   "eval_count": 96,
+   "tok_s": 724.61,
+   "prompt_eval_count": 127,
+   "prompt_cached": 126,
+   "total_s_field": 0.136
+  },
+  {
+   "phase": "repetitive",
+   "i": 4,
+   "wall_s": 0.142,
+   "eval_count": 96,
+   "tok_s": 722.08,
+   "prompt_eval_count": 127,
+   "prompt_cached": 126,
+   "total_s_field": 0.137
+  },
+  {
+   "phase": "repetitive",
+   "i": 5,
+   "wall_s": 0.142,
+   "eval_count": 96,
+   "tok_s": 727.82,
+   "prompt_eval_count": 127,
+   "prompt_cached": 126,
+   "total_s_field": 0.136
+  },
+  {
+   "phase": "concurrent",
+   "i": 0,
+   "wall_s": 0.297,
+   "eval_count": 57,
+   "tok_s": 203.72,
+   "prompt_eval_count": 37,
+   "prompt_cached": 36,
+   "total_s_field": 0.287
+  },
+  {
+   "phase": "concurrent",
+   "i": 1,
+   "wall_s": 0.212,
+   "eval_count": 48,
+   "tok_s": 246.01,
+   "prompt_eval_count": 38,
+   "prompt_cached": 24,
+   "total_s_field": 0.202
+  },
+  {
+   "phase": "concurrent",
+   "i": 2,
+   "wall_s": 0.461,
+   "eval_count": 96,
+   "tok_s": 216.65,
+   "prompt_eval_count": 37,
+   "prompt_cached": 36,
+   "total_s_field": 0.451
+  },
+  {
+   "phase": "concurrent",
+   "i": 3,
+   "wall_s": 0.257,
+   "eval_count": 54,
+   "tok_s": 225.09,
+   "prompt_eval_count": 39,
+   "prompt_cached": null,
+   "total_s_field": 0.247
+  },
+  {
+   "phase": "concurrent",
+   "i": 4,
+   "wall_s": 0.428,
+   "eval_count": 96,
+   "tok_s": 241.14,
+   "prompt_eval_count": 38,
+   "prompt_cached": 25,
+   "total_s_field": 0.404
+  },
+  {
+   "phase": "concurrent",
+   "i": 5,
+   "wall_s": 0.402,
+   "eval_count": 96,
+   "tok_s": 265.09,
+   "prompt_eval_count": 37,
+   "prompt_cached": 36,
+   "total_s_field": 0.367
+  }
+ ]
+}

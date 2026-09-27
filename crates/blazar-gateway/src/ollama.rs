@@ -26,7 +26,7 @@ use crate::state::AppState;
 use crate::translate as tr;
 use crate::TraceId;
 
-fn api_error(status: u16, message: &str) -> Response {
+pub(crate) fn api_error(status: u16, message: &str) -> Response {
     (
         StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
         axum::Json(json!({"error": message})),
@@ -700,7 +700,7 @@ fn event_kind(e: &blazar_runtime::BlazarEvent) -> &'static str {
     use blazar_runtime::BlazarEvent::{
         BenchmarkDone, EngineRemoved, EngineRolledBack, EngineUpdated, InstanceStateChanged,
         ModelPreloaded, ModelPulled, ModelRemoved, PullFailed, PullProgress, QueueDepth,
-        SlotsAutoAdopted, SlotsCtxAutoFit, SlotsReshaped,
+        SlotsAutoAdopted, SlotsCtxAutoFit, SlotsReshaped, SpecGovernorOff, SpecGovernorRecovered,
     };
     match e {
         EngineUpdated { .. } => "engine_updated",
@@ -710,6 +710,8 @@ fn event_kind(e: &blazar_runtime::BlazarEvent) -> &'static str {
         SlotsAutoAdopted { .. } => "slots_auto_adopted",
         SlotsCtxAutoFit { .. } => "slots_ctx_auto_fit",
         SlotsReshaped { .. } => "slots_reshaped",
+        SpecGovernorOff { .. } => "spec_governor_off",
+        SpecGovernorRecovered { .. } => "spec_governor_recovered",
         ModelPulled { .. } => "model_pulled",
         ModelRemoved { .. } => "model_removed",
         PullProgress { .. } => "pull_progress",
@@ -780,6 +782,21 @@ pub async fn chat(
         Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
     };
     let model_field = req["model"].as_str().unwrap_or_default().to_string();
+    // A3 cascade routing: a chain ask re-enters this handler per
+    // candidate (each pays its own admission against its resolved row)
+    // and serves the first answer that passes the judge; no chain ask
+    // falls through to the single-model path untouched.
+    if let Some(resp) = crate::cascade::run(
+        &state,
+        trace_ext.clone(),
+        key_ext.clone(),
+        headers.clone(),
+        &req,
+    )
+    .await
+    {
+        return resp;
+    }
     // Key admission resolved ONCE, before any lane decision (F11): the
     // remote branch below needs it too — previously `remote:<model>`
     // requests bypassed scope/rate/request-count entirely.
@@ -1051,6 +1068,20 @@ pub async fn chat(
         }
     }
 
+    // Best-of-N fan-out knob (blazar extension): validate before
+    // admission — garbage must never occupy queue slots. Non-streaming
+    // only: a winner cannot be judged before completion.
+    let best_of = match crate::bestof::resolve_best_of(&headers, req.get("best_of")) {
+        Ok(n) => n,
+        Err(msg) => return api_error(400, &msg),
+    };
+    if best_of.is_some() && req["stream"].as_bool().unwrap_or(true) {
+        return api_error(
+            400,
+            "best_of requires stream=false — a winner cannot be judged before completion",
+        );
+    }
+
     // WorkClass: raw-lane classification follows the LANE the request
     // will actually take — image requests fall back to the child lane
     // even under ollama_compat, so they keep their interactive class
@@ -1115,6 +1146,7 @@ pub async fn chat(
                 enforce,
                 sem_ctx,
                 OutputShape::Chat,
+                best_of,
             )
             .await;
             // keep_alive=0: evict right after this response (complaint #12),
@@ -1366,18 +1398,8 @@ fn semcache_hit_response(model: &str, cached: &Value, id: u64, sim: f32) -> Resp
 /// spawn will actually use (mirrors the compiler's kv ladder), so the
 /// preflight judges the buffer the child allocates — the 400's own
 /// teaching (`cache_type = "q8_0" halves KV`) must not be a dead end
-/// when the user applies it.
-fn scale_kv_by_cache_type(kv_bytes: u64, cache_type: Option<&str>) -> u64 {
-    match cache_type {
-        Some("q8_0") => kv_bytes / 2,
-        Some("q4_0") => kv_bytes / 4,
-        Some("q4_1") => kv_bytes * 9 / 20,
-        Some("q5_0") => kv_bytes * 11 / 32,
-        Some("q5_1") => kv_bytes * 3 / 8,
-        _ => kv_bytes,
-    }
-}
-
+/// when the user applies it. Per-phase pairs scale via
+/// `profile::scale_kv_pair` (K and V each hold half the f16 bytes).
 pub(crate) async fn apply_num_ctx(
     state: &Arc<AppState>,
     model: &str,
@@ -1402,20 +1424,27 @@ pub(crate) async fn apply_num_ctx(
                 let total_vram = state.sup.hardware.total_vram_mib();
                 if total_vram > 0 {
                     // KV must be judged at the quant the spawn will run.
-                    // An EXPLICIT config/overlay cache_type is sovereign
-                    // (single shot, mirroring the compiler's
-                    // explicit-beats-ladder doctrine); an unpinned one
-                    // LADDERS f16 -> q8_0 -> q4_0 exactly like the
+                    // An EXPLICIT config/overlay pair (per-phase k/v or
+                    // legacy symmetric) is sovereign (single shot,
+                    // mirroring the compiler's explicit-beats-ladder
+                    // doctrine); an unpinned one LADDERS
+                    // f16 -> q8_0 -> q8_0/q4_0 -> q4_0 exactly like the
                     // spawn compiler's kv_quant_ladder, so the preflight
                     // never refuses a pin the spawn itself would host
                     // (split-brain observed live: a 65536 vision pin
                     // refused at f16 math while the spawn laddered to
                     // q8_0 happily).
-                    let effective = state.config.effective_cache_type(model);
-                    let ladder: Vec<Option<&str>> = if effective.is_empty() {
-                        vec![None, Some("q8_0"), Some("q4_0")]
+                    let (eff_k, eff_v) = state.config.effective_cache_type_kv(model);
+                    let pair_set = !eff_k.is_empty() || !eff_v.is_empty();
+                    let ladder: Vec<Option<(String, String)>> = if pair_set {
+                        vec![Some((eff_k, eff_v))]
                     } else {
-                        vec![Some(effective)]
+                        vec![
+                            None,
+                            Some(("q8_0".to_string(), "q8_0".to_string())),
+                            Some(("q8_0".to_string(), "q4_0".to_string())),
+                            Some(("q4_0".to_string(), "q4_0".to_string())),
+                        ]
                     };
                     let kv_f16 = crate::preflight::kv_f16_mib(
                         &meta,
@@ -1423,8 +1452,11 @@ pub(crate) async fn apply_num_ctx(
                     ) * 1024
                         * 1024;
                     let mut refuse: Option<String> = None;
-                    for quant in ladder {
-                        let kv_bytes = scale_kv_by_cache_type(kv_f16, quant);
+                    for pair in ladder {
+                        let kv_bytes = match &pair {
+                            Some((k, v)) => blazar_core::profile::scale_kv_pair(kv_f16, k, v),
+                            None => kv_f16,
+                        };
                         match blazar_core::profile::unified_ctx_verdict(
                             u64::try_from(row.bytes.max(0)).unwrap_or(u64::MAX),
                             kv_bytes,
@@ -1530,6 +1562,7 @@ async fn proxy_core_chat(
     enforce: bool,
     sem: Option<semcache::SemCtx>,
     shape: OutputShape,
+    best_of: Option<u64>,
 ) -> Response {
     let base = child_base(&engine.endpoint);
     // Pre-render recipe lane: the gateway owns the prompt (chatml wrap
@@ -1573,70 +1606,91 @@ async fn proxy_core_chat(
         // We translate the non-stream response into ollama shape.
         let t0 = std::time::Instant::now();
         let ttft_secs;
-        let resp = match crate::proxy::child_send(
-            state,
-            engine,
-            req.body(openai_body.clone()).send(),
-        )
-        .await
-        {
-            Ok(r) => {
-                let s = t0.elapsed().as_secs_f64();
+        // Best-of-N: judge N candidates, return the winner as a normal
+        // child response (usage summed across candidates). Degrades to
+        // the single-send path below on saturation, oversize bodies, or
+        // a first-copy transport failure (that path's respawn retry
+        // then owns crash recovery); a guard degrade still stamps the
+        // reason header so the client sees the ask was heard.
+        let mut bestof_hdr: Option<String> = None;
+        let fan = match best_of.filter(|n| *n >= 2) {
+            Some(want) => crate::bestof::fan_out(state, engine, &url, &openai_body, want).await,
+            None => crate::bestof::FanOut::Skip,
+        };
+        if let crate::bestof::FanOut::Degraded(h) = &fan {
+            bestof_hdr = Some(h.clone());
+        }
+        let resp = match fan {
+            crate::bestof::FanOut::Ran(outcome) => {
+                let s = outcome.elapsed.as_secs_f64();
                 state.ttft.observe_secs(s);
                 ttft_secs = Some(s);
-                r
+                bestof_hdr = Some(outcome.hdr);
+                outcome.resp
             }
-            Err(e) => {
-                tracing::warn!(
+            _ => {
+                match crate::proxy::child_send(state, engine, req.body(openai_body.clone()).send())
+                    .await
+                {
+                    Ok(r) => {
+                        let s = t0.elapsed().as_secs_f64();
+                        state.ttft.observe_secs(s);
+                        ttft_secs = Some(s);
+                        r
+                    }
+                    Err(e) => {
+                        tracing::warn!(
                     model,
                     "nonstream upstream failed: {e} — respawning lane, retrying once in-band"
                 );
-                // Same crash-recovery contract as the proxy path:
-                // `child_send` already evicted a wedged child; the
-                // respawn reaps the dead ones. Exactly one in-band
-                // retry so single-shot clients don't eat the 502/504
-                // for a child they never got to talk to.
-                match crate::proxy::respawn_lane(state, &engine.key).await {
-                    Ok(fresh) => {
-                        let fresh_url = if ollama_compat {
-                            format!("{}/v1/completions", child_base(&fresh.endpoint))
-                        } else {
-                            format!("{}/v1/chat/completions", child_base(&fresh.endpoint))
-                        };
-                        let fresh_req = child_auth(
-                            crate::state::child_client(state, &fresh.endpoint)
-                                .post(&fresh_url)
-                                .header("content-type", "application/json"),
-                            &fresh,
-                        );
-                        match crate::proxy::child_send(
-                            state,
-                            &fresh,
-                            fresh_req.body(openai_body.clone()).send(),
-                        )
-                        .await
-                        {
-                            Ok(r) => {
-                                let s = t0.elapsed().as_secs_f64();
-                                state.ttft.observe_secs(s);
-                                ttft_secs = Some(s);
-                                r
-                            }
-                            Err(e2) => {
-                                return api_error(
+                        // Same crash-recovery contract as the proxy path:
+                        // `child_send` already evicted a wedged child; the
+                        // respawn reaps the dead ones. Exactly one in-band
+                        // retry so single-shot clients don't eat the 502/504
+                        // for a child they never got to talk to.
+                        match crate::proxy::respawn_lane(state, &engine.key).await {
+                            Ok(fresh) => {
+                                let fresh_url = if ollama_compat {
+                                    format!("{}/v1/completions", child_base(&fresh.endpoint))
+                                } else {
+                                    format!("{}/v1/chat/completions", child_base(&fresh.endpoint))
+                                };
+                                let fresh_req = child_auth(
+                                    crate::state::child_client(state, &fresh.endpoint)
+                                        .post(&fresh_url)
+                                        .header("content-type", "application/json"),
+                                    &fresh,
+                                );
+                                match crate::proxy::child_send(
+                                    state,
+                                    &fresh,
+                                    fresh_req.body(openai_body.clone()).send(),
+                                )
+                                .await
+                                {
+                                    Ok(r) => {
+                                        let s = t0.elapsed().as_secs_f64();
+                                        state.ttft.observe_secs(s);
+                                        ttft_secs = Some(s);
+                                        r
+                                    }
+                                    Err(e2) => {
+                                        return api_error(
                                         e2.status_u16(),
                                         &format!(
                                             "engine request failed: {e}; retry on respawned child: {e2}"
                                         ),
                                     );
+                                    }
+                                }
+                            }
+                            Err(re) => {
+                                return api_error(
+                                    e.status_u16(),
+                                    &format!("engine request failed: {e}; respawn: {re:#}"),
+                                );
                             }
                         }
-                    }
-                    Err(re) => {
-                        return api_error(
-                            e.status_u16(),
-                            &format!("engine request failed: {e}; respawn: {re:#}"),
-                        );
                     }
                 }
             }
@@ -1644,7 +1698,9 @@ async fn proxy_core_chat(
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
-            return api_error(status, &format!("engine error: {text}"));
+            let mut r = api_error(status, &format!("engine error: {text}"));
+            crate::bestof::stamp(&mut r, bestof_hdr.as_deref());
+            return r;
         }
         let openai: Value = match resp.json().await {
             Ok(v) => v,
@@ -1668,6 +1724,17 @@ async fn proxy_core_chat(
                 ttft_secs,
             ),
             None => state.obs.miss(),
+        }
+        // A2: blend this completion's decode rate into the model's EWMA
+        // (completion tokens over child-send wall time — t0 predates the
+        // fan/single send, so queue wait upstream of it stays excluded).
+        if let Some(n) = openai
+            .pointer("/usage/completion_tokens")
+            .and_then(Value::as_u64)
+        {
+            state
+                .sup
+                .note_model_throughput(model, n, t0.elapsed().as_secs_f64());
         }
         // Non-stream + enforce: judge before translation (streaming stays
         // warn-only — bytes are already on the wire).
@@ -1701,7 +1768,9 @@ async fn proxy_core_chat(
             drop(feed);
         }
         if let Some(msg) = child_error_body(&openai) {
-            return api_error(502, &format!("engine error: {msg}"));
+            let mut r = api_error(502, &format!("engine error: {msg}"));
+            crate::bestof::stamp(&mut r, bestof_hdr.as_deref());
+            return r;
         }
         let mut ollama = match shape {
             OutputShape::Chat => tr::openai_chat_to_ollama(model, &openai),
@@ -1740,9 +1809,12 @@ async fn proxy_core_chat(
             let mut resp = axum::Json(ollama).into_response();
             resp.headers_mut()
                 .insert(semcache::HDR_CACHE, HeaderValue::from_static("miss"));
+            crate::bestof::stamp(&mut resp, bestof_hdr.as_deref());
             return resp;
         }
-        return axum::Json(ollama).into_response();
+        let mut resp = axum::Json(ollama).into_response();
+        crate::bestof::stamp(&mut resp, bestof_hdr.as_deref());
+        return resp;
     }
     // Stream: child SSE -> ollama NDJSON with final counts. Force the
     // usage chunk so the final ollama line carries eval counts.
@@ -2633,6 +2705,19 @@ pub async fn generate(
             return *resp;
         }
     }
+    // Best-of-N fan-out knob (blazar extension): validate before
+    // admission — garbage must never occupy queue slots. Non-streaming
+    // only: a winner cannot be judged before completion.
+    let best_of = match crate::bestof::resolve_best_of(&headers, req.get("best_of")) {
+        Ok(n) => n,
+        Err(msg) => return api_error(400, &msg),
+    };
+    if best_of.is_some() && req["stream"].as_bool().unwrap_or(true) {
+        return api_error(
+            400,
+            "best_of requires stream=false — a winner cannot be judged before completion",
+        );
+    }
     let class = crate::queue::classify_work(
         req.get("tools").is_some_and(serde_json::Value::is_array),
         state.config.effective_prompt_recipe(&model) == crate::prompt_recipe::OLLAMA_COMPAT,
@@ -2683,6 +2768,7 @@ pub async fn generate(
                 enforce,
                 None, // semantic cache is chat-lane only (response-shape keyed)
                 OutputShape::Generate,
+                best_of,
             )
             .await;
             // keep_alive=0: evict right after this response (complaint
@@ -3304,6 +3390,105 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         state.sup.spec_accept.get(),
         "blazar_spec_accept_rate",
         "Windowed speculative-decoding acceptance rate (accepted / drafted tokens)",
+    );
+    // C1 per-model split: the same rates keyed by the engine-reported
+    // model name (multi-model boxes steer --cache-ram and spec policy per
+    // model; the unlabeled merged lines above remain the box-wide truth).
+    let rows = state.sup.model_hint_snapshot();
+    if rows.iter().any(|(_, cache, ..)| cache.is_some()) {
+        merged.push_str(
+            "# HELP blazar_prefix_cache_hit_rate_per_model Windowed prompt-cache hit rate per model\n# TYPE blazar_prefix_cache_hit_rate_per_model gauge\n",
+        );
+        for (model, cache, ..) in &rows {
+            if let Some(rate) = cache {
+                let _ = writeln!(
+                    merged,
+                    "blazar_prefix_cache_hit_rate_per_model{{model=\"{model}\"}} {rate:.4}"
+                );
+            }
+        }
+    }
+    if rows.iter().any(|(_, _, accept, _)| accept.is_some()) {
+        merged.push_str(
+            "# HELP blazar_spec_accept_rate_per_model Windowed speculative-decoding acceptance rate per model\n# TYPE blazar_spec_accept_rate_per_model gauge\n",
+        );
+        for (model, _, accept, _) in &rows {
+            if let Some(rate) = accept {
+                let _ = writeln!(
+                    merged,
+                    "blazar_spec_accept_rate_per_model{{model=\"{model}\"}} {rate:.4}"
+                );
+            }
+        }
+    }
+    // A2 per-model decode throughput (EWMA of completion tokens per
+    // wall-second). Feeds route_cost ordering for cascade/routing
+    // decisions; absent until the model has served a completion.
+    if rows.iter().any(|(.., decode)| decode.is_some()) {
+        merged.push_str(
+            "# HELP blazar_model_decode_tokens_per_second EWMA of completion tokens per wall-second per model\n# TYPE blazar_model_decode_tokens_per_second gauge\n",
+        );
+        for (model, .., decode) in &rows {
+            if let Some(rate) = decode {
+                let _ = writeln!(
+                    merged,
+                    "blazar_model_decode_tokens_per_second{{model=\"{model}\"}} {rate:.3}"
+                );
+            }
+        }
+    }
+    // B2 governor state: which models the spec governor is watching
+    // (streak building) or has parked dense (override active). Only
+    // present when spec_auto_manage is on and a model has state.
+    let gov = state.sup.spec_governor_snapshot();
+    if !gov.is_empty() {
+        merged.push_str(
+            "# HELP blazar_spec_governor Spec-governor state per model (watching = streak building, parked_off = speculation disabled by the governor)\n# TYPE blazar_spec_governor gauge\n",
+        );
+        for (model, parked) in &gov {
+            let state_label = if *parked { "parked_off" } else { "watching" };
+            let _ = writeln!(
+                merged,
+                "blazar_spec_governor{{model=\"{model}\",state=\"{state_label}\"}} 1"
+            );
+        }
+    }
+    // D1 ubatch governor: per-model shaped prefill micro-batch tier
+    // (`auto` = engine default). Only present when ubatch_auto is on
+    // and a model is shaped.
+    let ubatch = state.sup.ubatch_governor_snapshot();
+    if !ubatch.is_empty() {
+        merged.push_str(
+            "# HELP blazar_ubatch_governor Prefill micro-batch ceiling the ubatch governor shaped per model (auto = engine default)\n# TYPE blazar_ubatch_governor gauge\n",
+        );
+        for (model, tier) in &ubatch {
+            let tier_label = if *tier == 0 {
+                "auto"
+            } else {
+                &tier.to_string()
+            };
+            let _ = writeln!(
+                merged,
+                "blazar_ubatch_governor{{model=\"{model}\",tier=\"{tier_label}\"}} 1"
+            );
+        }
+    }
+    // E3 best-of-N fan-out totals: engaged fan-outs and how many were
+    // degraded to a smaller candidate count (saturation, slot
+    // headroom, oversize bodies).
+    let _ = writeln!(
+        merged,
+        "# HELP blazar_bestof_fanouts_total Best-of-N request fan-outs engaged\n# TYPE blazar_bestof_fanouts_total counter\nblazar_bestof_fanouts_total {}\n# HELP blazar_bestof_degraded_total Best-of-N fan-outs degraded below the asked candidate count\n# TYPE blazar_bestof_degraded_total counter\nblazar_bestof_degraded_total {}",
+        crate::bestof::FANOUT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+        crate::bestof::FANOUT_DEGRADED.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    // A3 cascade routing totals: chains run and chains that had to
+    // escalate past their first candidate.
+    let _ = writeln!(
+        merged,
+        "# HELP blazar_cascade_runs_total Cascade chains run\n# TYPE blazar_cascade_runs_total counter\nblazar_cascade_runs_total {}\n# HELP blazar_cascade_escalations_total Cascade chains served past their first candidate\n# TYPE blazar_cascade_escalations_total counter\nblazar_cascade_escalations_total {}",
+        crate::cascade::CASCADE_RUNS.load(std::sync::atomic::Ordering::Relaxed),
+        crate::cascade::CASCADE_ESCALATIONS.load(std::sync::atomic::Ordering::Relaxed),
     );
     engine_build_gauge(&state, &mut merged);
     (

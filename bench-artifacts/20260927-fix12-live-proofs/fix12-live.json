@@ -1,0 +1,15 @@
+{
+ "F1_status": 200,
+ "F1_header": "asked=2 used=1 reason=headroom",
+ "F1_degraded_total": "1",
+ "F2_bank_files": [
+  "_auto-16384",
+  "_auto-16384.identity.json"
+ ],
+ "F2_bank_log": [],
+ "F2_restore_log": [
+  "\u001b[2m2026-09-27T07:27:32.644544Z\u001b[0m \u001b[32m INFO\u001b[0m restored banked session _auto-16384 (372 tokens into slot KV) \u001b[3mmodel\u001b[0m\u001b[2m=\u001b[0m\"qwen2.5-0.5b-instruct\""
+ ],
+ "verdict_F1": true,
+ "verdict_F2": false
+}

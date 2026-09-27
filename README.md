@@ -20,7 +20,7 @@ It sits in front of local inference engines and gives applications one stable en
 ```text
 OpenAI SDK ───────┐
 Ollama clients ───┼──► blazar gateway ──► llama.cpp
-Anthropic SDK ────┘          │            mistral.rs
+Anthropic SDK ────┘           │            mistral.rs
                               │            SGLang
                               │            sd.cpp (images / video)
                               │

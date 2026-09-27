@@ -982,6 +982,7 @@ def media_family(
     activate_kinds: tuple[str, ...],
     stage_voices: bool = False,
     stage_whisper_models: bool = False,
+    gw_cfg: dict | None = None,
 ):
     """Context manager: sandboxed daemon ready for media requests.
 
@@ -1021,7 +1022,7 @@ def media_family(
             dst.parent.mkdir(parents=True, exist_ok=True)
             _hardlink_tree(src, dst)
         daemon = V.Daemon(sb)
-        daemon.start(cfg={"port": port})
+        daemon.start(cfg={"port": port, **(gw_cfg or {})})
         deadline = time.time() + 120
         healthy = False
         while time.time() < deadline:
@@ -1084,11 +1085,14 @@ def _media_child_stamps() -> dict:
     return {"child_pid": pid, "child_argv": read_proc_argv(pid)}
 
 
-def run_media_image_cell(eng: Engine, model_id: str, cfg: dict) -> dict:
+def run_media_image_cell(
+    eng: Engine, model_id: str, cfg: dict, gw_cfg: dict | None = None
+) -> dict:
     """Image lane: sync generations, steps axis at fixed size. Cold row
-    = spawn + first image (the user-felt wait); warm rows follow."""
+    = spawn + first image (the user-felt wait); warm rows follow.
+    `gw_cfg` pins gateway config knobs (config-knob A/B cells)."""
     rec: dict = {"lane": "image"}
-    with media_family(f"image-{eng.tag}", ("sdcpp",)) as fam:
+    with media_family(f"image-{eng.tag}", ("sdcpp",), gw_cfg=gw_cfg) as fam:
         sampler = Sampler(None)
         sampler.start()
         port = fam["port"]
@@ -2194,6 +2198,12 @@ def direct_argv(
             "--cache-type-v",
             extras["kv"],
         ]
+    if extras.get("pa") == "on":
+        # clean flash-attn pair: the baseline cell passes no flag (engine
+        # default), this cell pins it explicitly on — the kv q8_0 cell
+        # above cannot answer "does FA alone help" because it flips
+        # quantization and FA together
+        argv += ["--flash-attn", "on"]
     if extras.get("spec"):
         argv += ["--spec-type", extras["spec"]]
     if extras.get("mmproj") and mmproj is not None and mmproj.exists():
@@ -2526,6 +2536,18 @@ def run_blazar_cell(
                 rec["soak_rounds"] = n
                 rec["soak_gpu_drift_mib"] = round(sampler.gpu_peak_mib - gpu0, 1)
                 rec["soak_rss_drift_mib"] = round(sampler.rss_peak_mib - rss0, 1)
+            # golden-QC gate: one greedy (temp-0, seeded) generation per
+            # cell so every config knob carries an output fingerprint
+            # next to its speed deltas — a knob that is fast but changes
+            # tokens surfaces as drift vs the same-engine default cell.
+            try:
+                qc_text = greedy_completions(port, GREEDY_PROMPTS[0], model_name)
+                rec["qc_sha256"] = hashlib.sha256(qc_text.encode()).hexdigest()[:16]
+                rec["qc_head"] = qc_text.strip()[:60]
+            except Exception as qc_exc:
+                # diagnostic add-on: the speed metrics above stand; the
+                # failure is recorded, never swallowed
+                rec["qc_error"] = f"{type(qc_exc).__name__}: {qc_exc}"
         finally:
             rec["gpu_peak_mib"] = round(sampler.gpu_peak_mib, 1)
             rec["gpu_base_mib"] = round(sampler.gpu_base_mib, 1)
@@ -2542,6 +2564,104 @@ def run_blazar_cell(
                 )
             # teardown verify: the port must go dark, else the daemon
             # outlived its cell — record loudly, never silently
+            dark = False
+            if port is not None:
+                for _ in range(20):
+                    try:
+                        urllib.request.urlopen(
+                            f"http://127.0.0.1:{port}/healthz", timeout=1.0
+                        )
+                        time.sleep(0.5)
+                    except (urllib.error.URLError, OSError):
+                        dark = True
+                        break
+            rec["teardown_ok"] = dark
+            if not dark and port is not None:
+                rec["teardown_warn"] = f"sandbox daemon still on :{port} after stop()"
+    finally:
+        sampler.stop_evt.set()
+        sb.destroy()
+    return rec
+
+
+def run_conc_axis_cell(
+    eng: Engine,
+    model_name: str,
+    blazar_cfg: dict | None = None,
+    level: int = 8,
+    tg: int = 128,
+    rounds: int = 2,
+) -> dict:
+    """Concurrency-lane gateway cell for scheduler knobs.
+
+    adaptive_slots and poll are scheduler-tick behavior — a single
+    stream never queues, so their A/B must run under burst load. Boots
+    the sandboxed gateway with the knob under test, drives `level`
+    concurrent streams for `rounds` bursts via conc_suite, and records
+    system throughput + tail latency; the conc_default cell is the
+    control row (rendered by conc_axes_table).
+    """
+    # unique port per cell + module rebind (F139) — same hijack-proofing
+    # as run_blazar_cell
+    os.environ["BLAZAR_VALIDATE_PORT"] = str(free_port())
+    V = importlib.import_module("validate")
+    V.PORT = int(os.environ["BLAZAR_VALIDATE_PORT"])
+
+    rec: dict = {}
+    sb = V.Sandbox()
+    sampler = Sampler(None)
+    sampler.start()
+    try:
+        con = sqlite3.connect(Path(sb.data_home) / "blazar" / "blazar.db")
+        con.execute("UPDATE engines SET active = (tag = ?)", (eng.tag,))
+        con.commit()
+        con.close()
+        daemon = V.Daemon(sb)
+        port: int | None = None
+        try:
+            daemon.start(
+                cfg={"port": V.PORT, **(blazar_cfg or {})}, floor_model=model_name
+            )
+            port = V.PORT
+            deadline = time.time() + 600
+            healthy = False
+            while time.time() < deadline:
+                try:
+                    http_json(f"http://127.0.0.1:{port}/healthz", timeout=5.0)
+                    healthy = True
+                    break
+                except json.JSONDecodeError:
+                    # 2xx non-JSON healthz still means up
+                    healthy = True
+                    break
+                except (urllib.error.URLError, OSError):
+                    time.sleep(0.5)
+            if not healthy:
+                return {"error": "sandbox daemon failed to boot"}
+            # a failed suite must still carry teardown + daemon tail for
+            # diagnosis — record the error, never re-raise past the
+            # finally blocks (mirrors the cold-probe pattern above)
+            try:
+                rec.update(conc_suite(port, model_name, level, tg, rounds=rounds))
+            except Exception as suite_exc:
+                rec["error"] = f"conc suite failed: {suite_exc}"
+            # the engine child spawns on the first burst; capture the
+            # resolved argv once requests have actually flown
+            child_pid = find_sandbox_engine_pid()
+            if child_pid is not None:
+                rec["child_pid"] = child_pid
+                rec["child_argv"] = read_proc_argv(child_pid)
+                sampler.pid = child_pid
+        finally:
+            rec["gpu_peak_mib"] = round(sampler.gpu_peak_mib, 1)
+            rec["gpu_power_peak_w"] = round(sampler.gpu_power_peak_w, 1)
+            rec["rss_peak_mib"] = round(sampler.rss_peak_mib, 1)
+            daemon.stop()
+            dlog = Path(sb.data_dir) / "run" / "daemon.log"
+            if dlog.exists():
+                rec["daemon_log_tail"] = "\n".join(
+                    dlog.read_text(errors="replace").splitlines()[-12:]
+                )
             dark = False
             if port is not None:
                 for _ in range(20):
@@ -4105,7 +4225,7 @@ def _findings(records: list[dict]) -> list[str]:
             base_direct[r["tag"]] = r
     for r in records:
         par = r.get("params") or {}
-        axis = next((k for k in ("kv", "spec", "mmproj") if k in par), None)
+        axis = next((k for k in ("kv", "spec", "mmproj", "pa") if k in par), None)
         if r.get("provider") != "direct" or not axis or "decode_tps_p50" not in r:
             continue
         b = base_direct.get(r["tag"])
@@ -4566,6 +4686,12 @@ def main() -> int:
         "--skip-variants", action="store_true", help="skip kv/spec/mmproj/pa axis cells"
     )
     ap.add_argument(
+        "--qc-strict",
+        action="store_true",
+        help="exit 1 when a config knob drifts greedy output vs default "
+        "(outside the KNOWN_DRIFT allowlist); default is informational",
+    )
+    ap.add_argument(
         "--skip-media",
         action="store_true",
         help="skip the media lanes (image/video/gate/tts/whisper)",
@@ -4670,6 +4796,15 @@ def main() -> int:
             by_key.values(), key=lambda r: (r.get("provider", ""), r.get("tag", ""))
         )
         write_publication_report(recs, ad, out)
+        offenders = qc_drift_gate(recs)
+        if offenders:
+            log(f"qc drift gate: {len(offenders)} offender(s)")
+            for o in offenders:
+                log(f"  - {o}")
+            if args.qc_strict:
+                return 1
+        else:
+            log("qc drift gate: clean")
         return 0
 
     # battery-throttle guard: a discharging laptop caps dGPU clocks; the
@@ -4954,6 +5089,10 @@ def main() -> int:
                 else:
                     if "--cache-type-k" in flags and "--flash-attn" in flags:
                         cells.append({"ctx": 4096, "np": 1, "kv": "q8_0"})
+                    if eng.kind == "llamacpp" and "--flash-attn" in flags:
+                        # clean fa A/B: baseline cell = engine default (off),
+                        # this cell = --flash-attn on at identical ctx/np
+                        cells.append({"ctx": 4096, "np": 1, "pa": "on"})
                     if "--spec-type" in flags:
                         cells.append({"ctx": 4096, "np": 1, "spec": "ngram-simple"})
                     if own_mmproj is not None:
@@ -5064,6 +5203,80 @@ def main() -> int:
                     rec = {"error": f"blazar cell crashed: {exc}"}
                 emit(eng.tag, eng.kind, "blazar", params, key, rec)
 
+            # ---- gateway config-knob A/B cells: every CONFIG_AXES knob
+            # pinned on and off through the sandboxed gateway; the
+            # default-config cell at the top of this loop is the control
+            # row for every pair (rendered by config_axes_table).
+            if not args.skip_variants:
+                ax_flags = eng_flags.get(eng.tag, set())
+                for axis in config_axes_for(eng.kind, ax_flags):
+                    for cell_label, knobs in axis["cells"]:
+                        params = {"config": f"{axis['name']}_{cell_label}"}
+                        key = cell_key(eng.tag, "blazar", params, model.name)
+                        if key in done:
+                            log(
+                                f"[blazar {eng.tag} {params['config']}] "
+                                "resumed — skipping"
+                            )
+                            continue
+                        if not mem_guard(
+                            2048.0, f"pre-blazar {eng.tag} {params['config']}"
+                        ):
+                            emit(
+                                eng.tag,
+                                eng.kind,
+                                "blazar",
+                                params,
+                                key,
+                                {"error": "GPU memory floor exceeded before cell"},
+                            )
+                            continue
+                        log(
+                            f"[blazar {eng.tag}] (sandbox, gateway, {params['config']})"
+                        )
+                        try:
+                            rec = run_blazar_cell(
+                                eng,
+                                gw_model_name,
+                                cfg,
+                                f"sandboxed gateway cell, {axis['name']}={cell_label}",
+                                blazar_cfg=dict(knobs),
+                            )
+                        except Exception as exc:
+                            rec = {"error": f"blazar cell crashed: {exc}"}
+                        emit(eng.tag, eng.kind, "blazar", params, key, rec)
+
+            # ---- concurrency-lane scheduler axis (llamacpp lane): the
+            # knobs above are engine-argv knobs measured single-stream;
+            # adaptive_slots / poll live in the gateway scheduler tick
+            # and only express themselves under queued load — burst
+            # cells, control row conc_default.
+            if not args.skip_variants and eng.kind == "llamacpp":
+                for conc_label, conc_cfg in CONC_AXIS_CELLS:
+                    params = {"config": conc_label, "conc": 8}
+                    key = cell_key(eng.tag, "blazar", params, model.name)
+                    if key in done:
+                        log(f"[blazar {eng.tag} {conc_label}] resumed — skipping")
+                        continue
+                    if not mem_guard(2048.0, f"pre-blazar {eng.tag} {conc_label}"):
+                        emit(
+                            eng.tag,
+                            eng.kind,
+                            "blazar",
+                            params,
+                            key,
+                            {"error": "GPU memory floor exceeded before cell"},
+                        )
+                        continue
+                    log(f"[blazar {eng.tag}] (sandbox, conc lane, {conc_label})")
+                    try:
+                        rec = run_conc_axis_cell(
+                            eng, gw_model_name, blazar_cfg=conc_cfg or None
+                        )
+                    except Exception as exc:
+                        rec = {"error": f"conc cell crashed: {exc}"}
+                    emit(eng.tag, eng.kind, "blazar", params, key, rec)
+
         params = {"reference": True}
         key = cell_key("ollama-host", "ollama", params, model.name)
         if key in done:
@@ -5142,6 +5355,49 @@ def main() -> int:
                     )
                     try:
                         rec = run_media_image_cell(sdcpp_eng, image_model, media_cfg)
+                    except Exception as exc:
+                        rec = {"error": f"media image cell crashed: {exc}"}
+                    emit(
+                        sdcpp_eng.tag,
+                        "sdcpp",
+                        "media-image",
+                        params,
+                        key,
+                        rec,
+                        model_name_override=image_model,
+                    )
+
+                # ---- sdcpp gateway config-knob A/B: the default cell above
+                # is the control row; each knob pinned the non-default way
+                # (fa defaults on; vae-tiling and sage-attn default off).
+                # Runs even when the default cell resumed so each A/B cell
+                # owns its own done-check. A knob the engine build lacks
+                # support for errors its own cell only — the receipt
+                # records "does not work here" honestly.
+                for media_axis in (
+                    ("fa_off", {"sdcpp_flash_attention": False}),
+                    ("vae_tiling_on", {"sdcpp_vae_tiling": True}),
+                    ("sage_attn_on", {"sdcpp_sage_attn": True}),
+                ):
+                    cfg_name, gw_knobs = media_axis
+                    params = {
+                        "size": MEDIA_IMAGE_SIZE,
+                        "steps": list(MEDIA_IMAGE_STEPS),
+                        "runs": media_cfg["runs"],
+                        "config": cfg_name,
+                    }
+                    key = cell_key(sdcpp_eng.tag, "media-image", params, image_model)
+                    if key in done:
+                        log(f"[media image {cfg_name}] resumed — skipping")
+                        continue
+                    log(
+                        f"[media image] {image_model} {cfg_name} "
+                        f"{MEDIA_IMAGE_SIZE} steps={MEDIA_IMAGE_STEPS}"
+                    )
+                    try:
+                        rec = run_media_image_cell(
+                            sdcpp_eng, image_model, media_cfg, gw_cfg=gw_knobs
+                        )
                     except Exception as exc:
                         rec = {"error": f"media image cell crashed: {exc}"}
                     emit(
@@ -5706,6 +5962,15 @@ def main() -> int:
     write_speed_table(all_records, art / "summary.txt")
     log(f"summary -> {art / 'summary.txt'}")
     log(f"cells   -> {cells_path} ({len(records)} new, {len(all_records)} total)")
+    offenders = qc_drift_gate(all_records)
+    if offenders:
+        log(f"qc drift gate: {len(offenders)} offender(s)")
+        for o in offenders:
+            log(f"  - {o}")
+        if args.qc_strict:
+            return 1
+    else:
+        log("qc drift gate: clean")
     return 1 if failures else 0
 
 
@@ -6092,6 +6357,477 @@ def variant_table(recs: list[dict]) -> str:
         f"| {e} | {ax} | {v} | {pfmt(d)} | {pfmt(dd)} | {pfmt(pc)} | {pfmt(pd)} |"
         for e, ax, v, d, dd, pc, pd in rows
     ]
+    return "\n".join([head, sep, *body])
+
+
+# ---- gateway config-knob A/B axes --------------------------------------
+# Each axis is measured through the sandboxed gateway (provider=blazar)
+# by pinning the knob to a non-default value; the default-config cell
+# above each axis is the control row (config_axes_table renders deltas
+# against it). Sides that EQUAL the Default-impl value are omitted —
+# re-measuring the default would duplicate the control cell.
+#
+# Key schema notes (verified against blazar-core config.rs / profile.rs):
+# - Config is serde deny_unknown_fields: a key that is not a top-level
+#   Config field (or a [mistralrs]/[sglang] tuning-table field) makes the
+#   daemon REFUSE to boot — every key below is checked against the
+#   shipped structs. There is deliberately NO llamacpp `flash_attention`
+#   axis: llama-lane FA is not config-driven (production builds
+#   TuningOverrides with fa=None -> "--flash-attn auto"); the engine-level
+#   FA question is measured by the DIRECT provider `pa` pair instead.
+# - `gate` lists engine CLI flags that must appear in the engine binary's
+#   probed --help before the axis is emitted for that engine.
+# - Nested dicts serialize as TOML tables (validate.py write_config), so
+#   {"mistralrs": {...}} / {"sglang": {...}} reach the tuning structs.
+CONFIG_AXES: list[dict] = [
+    # ---- llamacpp lane (flat top-level knobs) ----
+    {
+        "name": "cont_batching",
+        "kinds": ("llamacpp",),
+        "gate": ("--no-cont-batching",),
+        "cells": [("off", {"cont_batching": False})],
+    },
+    {
+        "name": "fa",
+        "kinds": ("llamacpp",),
+        "gate": ("--flash-attn",),
+        # config-level FA override rides TuningOverrides.fa; None (default)
+        # keeps the profile's auto heuristic, so both explicit pins are
+        # non-default and form a clean gateway A/B pair
+        "cells": [
+            ("on", {"flash_attention": True}),
+            ("off", {"flash_attention": False}),
+        ],
+    },
+    {
+        "name": "kv_unified",
+        "kinds": ("llamacpp", "mistralrs", "sglang"),
+        "gate": (),
+        # None (auto) default: both explicit pins are non-default
+        "cells": [
+            ("on", {"kv_unified": True}),
+            ("off", {"kv_unified": False}),
+        ],
+    },
+    {
+        "name": "swa_full",
+        "kinds": ("llamacpp",),
+        "gate": ("--swa-full",),
+        "cells": [("on", {"swa_full": True})],
+    },
+    {
+        "name": "no_kv_offload",
+        "kinds": ("llamacpp",),
+        "gate": ("--no-kv-offload",),
+        "cells": [("on", {"no_kv_offload": True})],
+    },
+    {
+        "name": "cache_q8",
+        "kinds": ("llamacpp",),
+        "gate": ("--cache-type-k",),
+        # q8_0 V-cache requires FA upstream; with fa=auto the profile's
+        # heuristic picks it — if the engine still refuses, the cell
+        # records the error honestly
+        "cells": [("q8_0", {"cache_type": "q8_0"})],
+    },
+    {
+        "name": "ctx_checkpoints",
+        "kinds": ("llamacpp",),
+        "gate": ("--ctx-checkpoints",),
+        "cells": [("4", {"ctx_checkpoints": 4})],
+    },
+    {
+        "name": "spec",
+        # default spec = "auto" everywhere, so the experiment is OFF
+        "kinds": ("llamacpp", "mistralrs", "sglang"),
+        "gate": (),
+        "cells": [("off", {"spec": "off"})],
+    },
+    {
+        "name": "deterministic",
+        "kinds": ("llamacpp", "mistralrs", "sglang"),
+        "gate": (),
+        "cells": [("on", {"deterministic": True})],
+    },
+    {
+        "name": "mmproj_offload",
+        # default true; off pins the projector in VRAM (mmproj models)
+        "kinds": ("llamacpp",),
+        "gate": (),
+        "cells": [("off", {"mmproj_offload": False})],
+    },
+    {
+        # 0 = engine auto; pinned physical batch for prompt processing
+        "name": "batch",
+        "kinds": ("llamacpp",),
+        "gate": ("-b",),
+        "cells": [("512", {"batch_size": 512})],
+    },
+    {
+        # 0 = engine auto; pinned micro-batch ceiling for prefill
+        "name": "ubatch",
+        "kinds": ("llamacpp",),
+        "gate": ("-ub",),
+        "cells": [("512", {"ubatch_size": 512})],
+    },
+    {
+        "name": "threads_batch",
+        "kinds": ("llamacpp",),
+        "gate": ("--threads-batch",),
+        "cells": [("8", {"threads_batch": 8})],
+    },
+    {
+        # 0 = off; n-token chunk KV reuse window
+        "name": "cache_reuse",
+        "kinds": ("llamacpp",),
+        "gate": ("--cache-reuse",),
+        "cells": [("256", {"cache_reuse": 256})],
+    },
+    {
+        # 0 = off; per-slot unified-KV ctx override
+        "name": "kv_unified_per_slot",
+        "kinds": ("llamacpp",),
+        "gate": (),
+        "cells": [("4096", {"kv_unified_per_slot": 4096})],
+    },
+    # ---- mistralrs lane ([mistralrs] tuning table) ----
+    {
+        # top-level Config field (NOT inside [mistralrs] — that table is
+        # deny_unknown_fields and does not carry it)
+        "name": "pa_mem",
+        "kinds": ("mistralrs",),
+        "gate": ("--paged-attn",),
+        "cells": [
+            ("0.85", {"mistralrs_pa_memory_fraction": 0.85}),
+            ("0.55", {"mistralrs_pa_memory_fraction": 0.55}),
+        ],
+    },
+    {
+        "name": "mr_batch",
+        "kinds": ("mistralrs",),
+        "gate": ("--max-batch-size",),
+        "cells": [("64", {"mistralrs": {"max_batch_size": 64}})],
+    },
+    {
+        "name": "mr_prefix_cache",
+        "kinds": ("mistralrs",),
+        "gate": ("--prefix-cache-n",),
+        "cells": [("256", {"mistralrs": {"prefix_cache_n": 256}})],
+    },
+    {
+        "name": "mr_enc_cache",
+        "kinds": ("mistralrs",),
+        "gate": (),
+        "cells": [("512mb", {"mistralrs": {"encoder_cache_memory_mb": 512}})],
+    },
+    # ---- sglang lane ([sglang] tuning table) ----
+    {
+        "name": "mem_frac",
+        "kinds": ("sglang",),
+        "gate": (),
+        # None = VRAM-fraction heuristic; 0.90 pins it high
+        "cells": [("0.90", {"sglang": {"mem_fraction_static": 0.90}})],
+    },
+    {
+        "name": "hicache",
+        "kinds": ("sglang",),
+        "gate": (),
+        "cells": [("on", {"sglang": {"hicache_enable": True}})],
+    },
+    {
+        "name": "radix_session",
+        "kinds": ("sglang",),
+        "gate": (),
+        "cells": [("on", {"sglang": {"session_radix_cache": True}})],
+    },
+    {
+        "name": "chunked_prefill",
+        "kinds": ("sglang",),
+        "gate": (),
+        "cells": [("4096", {"sglang": {"chunked_prefill_size": 4096}})],
+    },
+    {
+        "name": "page",
+        "kinds": ("sglang",),
+        "gate": (),
+        "cells": [("64", {"sglang": {"page_size": 64}})],
+    },
+    {
+        "name": "memory_saver",
+        "kinds": ("sglang",),
+        "gate": (),
+        "cells": [("on", {"sglang": {"memory_saver": True}})],
+    },
+    {
+        "name": "torch_compile",
+        "kinds": ("sglang",),
+        "gate": (),
+        # decode speed vs compile-time boot cost (daemon_boot_s carries it)
+        "cells": [("on", {"sglang": {"torch_compile": True}})],
+    },
+]
+
+
+def config_axes_for(kind: str, flags: set[str]) -> list[dict]:
+    """Axes whose knob reaches `kind`'s engine lane AND whose gate flags
+    are all present in that engine binary's probed flag set."""
+    return [
+        ax
+        for ax in CONFIG_AXES
+        if kind in ax["kinds"] and all(f in flags for f in ax["gate"])
+    ]
+
+
+# Scheduler knobs for the concurrency lane: these tick inside the
+# gateway supervisor, not the engine argv — single-stream cells cannot
+# observe them (one stream never queues). Each entry pairs the cell
+# label with the gateway config it boots; conc_default is the control
+# row every delta in conc_axes_table is measured against.
+CONC_AXIS_CELLS: list[tuple[str, dict]] = [
+    ("conc_default", {}),
+    ("adaptive_slots_off", {"adaptive_slots": False}),
+    ("poll_50", {"poll": 50}),
+]
+
+
+def config_axes_table(recs: list[dict]) -> str:
+    """Gateway config-knob A/B deltas vs the same-engine default-config
+    cell. One unified view: every non-default gateway config (knob axes
+    on/off, legacy paged_attn_off, single-stream) against its control."""
+    base: dict[str, dict] = {}
+    for r in recs:
+        p = r.get("params", {})
+        if (
+            r.get("provider") == "blazar"
+            and p.get("config") == "default"
+            and "error" not in r
+            and r.get("decode_tps_p50")
+        ):
+            base[r["tag"]] = r
+    rows = []
+    for r in recs:
+        p = r.get("params", {})
+        name = p.get("config")
+        if (
+            r.get("provider") != "blazar"
+            or name in (None, "default")
+            or "error" in r
+            or not r.get("decode_tps_p50")
+        ):
+            continue
+        b = base.get(r["tag"])
+        d = r.get("decode_tps_p50") or 0.0
+        dd = (
+            (d - b["decode_tps_p50"]) / b["decode_tps_p50"] * 100.0
+            if b
+            else float("nan")
+        )
+        tt = r.get("ttft_ms_p50")
+        td = (
+            (tt - b["ttft_ms_p50"]) / b["ttft_ms_p50"] * 100.0
+            if b and tt and b.get("ttft_ms_p50")
+            else float("nan")
+        )
+        g = r.get("gpu_peak_mib")
+        gd = (
+            g - b["gpu_peak_mib"]
+            if b and g is not None and b.get("gpu_peak_mib")
+            else float("nan")
+        )
+        # golden-QC drift: greedy fingerprint vs the default cell's —
+        # ✓ same tokens, ⚠ drift (fast-but-changed-output knob), "-" when
+        # either side lacks a fingerprint (older receipts / qc_error)
+        q = r.get("qc_sha256")
+        qb = b.get("qc_sha256") if b else None
+        qout = "✓ same" if q and qb and q == qb else "⚠ drift" if q and qb else "-"
+        rows.append(
+            (
+                engine_label(r["tag"]),
+                name,
+                pfmt(d),
+                f"{dd:+.1f}%" if not math.isnan(dd) else "-",
+                pfmt(tt, 0),
+                f"{td:+.1f}%" if not math.isnan(td) else "-",
+                pfmt(g, 0),
+                f"{gd:+.0f}" if not math.isnan(gd) else "-",
+                qout,
+            )
+        )
+    if not rows:
+        return "_Not measured._"
+    head = (
+        "| Engine | config | decode t/s | decode Δ% | ttft p50 ms | "
+        "ttft Δ% | GPU peak MiB | GPU Δ | output vs default |"
+    )
+    sep = "|---|---|---:|---:|---:|---:|---:|---:|:-:|"
+    body = [
+        f"| {e} | {c} | {d} | {dp} | {t} | {tp} | {g} | {gp} | {q} |"
+        for e, c, d, dp, t, tp, g, gp, q in rows
+    ]
+    return "\n".join([head, sep, *body])
+
+
+def conc_axes_table(recs: list[dict]) -> str:
+    """Concurrency-lane scheduler A/B: burst cells (adaptive_slots,
+    poll) vs the same-engine conc_default control. These knobs tick in
+    the gateway scheduler, so this table — not the single-stream
+    config-knob table — is the honest read of scheduler policy."""
+    base: dict[str, dict] = {}
+    for r in recs:
+        p = r.get("params", {})
+        if (
+            r.get("provider") == "blazar"
+            and p.get("config") == "conc_default"
+            and "error" not in r
+            and r.get("sys_tps")
+        ):
+            base[r["tag"]] = r
+    rows = []
+    for r in recs:
+        p = r.get("params", {})
+        name = p.get("config")
+        if (
+            r.get("provider") != "blazar"
+            or "conc" not in p
+            or "error" in r
+            or not r.get("sys_tps")
+        ):
+            continue
+        b = base.get(r["tag"])
+        s = r["sys_tps"]
+        sd = (s - b["sys_tps"]) / b["sys_tps"] * 100.0 if b else float("nan")
+        # rounds > 1 gives the p99 across bursts; fall back to the
+        # single-round max for older/edge receipts
+        tt = r.get("conc_ttft_p99_ms") or r.get("ttft_max_ms")
+        tb = (b.get("conc_ttft_p99_ms") or b.get("ttft_max_ms")) if b else None
+        td = (tt - tb) / tb * 100.0 if b and tt and tb else float("nan")
+        g = r.get("gpu_peak_mib")
+        gd = (
+            g - b["gpu_peak_mib"]
+            if b and g is not None and b.get("gpu_peak_mib")
+            else float("nan")
+        )
+        rows.append(
+            (
+                engine_label(r["tag"]),
+                name,
+                pfmt(s),
+                f"{sd:+.1f}%" if not math.isnan(sd) else "-",
+                pfmt(tt, 0),
+                f"{td:+.1f}%" if not math.isnan(td) else "-",
+                pfmt(g, 0),
+                f"{gd:+.0f}" if not math.isnan(gd) else "-",
+                str(r.get("conc_errors", 0)),
+            )
+        )
+    if not rows:
+        return "_Not measured._"
+    head = (
+        "| Engine | config | sys tok/s | sys Δ% | ttft p99 ms | "
+        "ttft Δ% | GPU peak MiB | GPU Δ | errs |"
+    )
+    sep = "|---|---|---:|---:|---:|---:|---:|---:|---:|"
+    body = [
+        f"| {e} | {c} | {d} | {dp} | {t} | {tp} | {g} | {gp} | {q} |"
+        for e, c, d, dp, t, tp, g, gp, q in rows
+    ]
+    return "\n".join([head, sep, *body])
+
+
+# Axes whose greedy-output drift is a known property of the knob, not a
+# regression alarm: q8_0 KV quantizes the cache the tokens read from, and
+# flash-attention off swaps the attention kernel (different floating-point
+# reduction order) — in both the drift IS the knob, not a bug.
+KNOWN_DRIFT: set[str] = {"cache_q8", "fa_off"}
+
+
+def qc_drift_gate(recs: list[dict]) -> list[str]:
+    """Golden-QC gate: every non-default gateway config cell whose greedy
+    fingerprint differs from its same-engine default cell, excluding the
+    KNOWN_DRIFT allowlist. Empty list = clean; the caller decides
+    informational print vs hard fail (--qc-strict)."""
+    base: dict[str, dict] = {}
+    for r in recs:
+        p = r.get("params", {})
+        if (
+            r.get("provider") == "blazar"
+            and p.get("config") == "default"
+            and r.get("qc_sha256")
+        ):
+            base[r["tag"]] = r
+    offenders: list[str] = []
+    for r in recs:
+        p = r.get("params", {})
+        name = p.get("config")
+        if (
+            r.get("provider") != "blazar"
+            or name in (None, "default")
+            or "conc" in p  # burst cells carry no fingerprint by design
+            or "error" in r
+            or not r.get("qc_sha256")
+        ):
+            continue
+        b = base.get(r["tag"])
+        if not b or r["qc_sha256"] == b["qc_sha256"]:
+            continue
+        # axis names themselves contain underscores (cache_q8,
+        # cache_reuse, kv_unified...) — a first-underscore split would
+        # reduce all of them to "cache"/"kv" and break the allowlist,
+        # so match the longest allowlisted axis the label extends
+        if not any(name == a or str(name).startswith(f"{a}_") for a in KNOWN_DRIFT):
+            offenders.append(
+                f"{engine_label(r['tag'])} {name}: greedy output drifted vs "
+                f"default (head: {r.get('qc_head', '')!r})"
+            )
+    return offenders
+
+
+def media_axes_table(recs: list[dict]) -> str:
+    """sdcpp gateway config-knob A/B: non-default media-image cells vs
+    the same-engine default cell (median wall for a full generation;
+    negative Δ% = faster than the default profile)."""
+    base: dict[str, dict] = {}
+    for r in recs:
+        p = r.get("params", {})
+        if (
+            r.get("provider") == "media-image"
+            and "config" not in p
+            and "error" not in r
+            and r.get("total_s_median")
+        ):
+            base[r["tag"]] = r
+    rows = []
+    for r in recs:
+        p = r.get("params", {})
+        name = p.get("config")
+        if (
+            r.get("provider") != "media-image"
+            or name is None
+            or "error" in r
+            or not r.get("total_s_median")
+        ):
+            continue
+        b = base.get(r["tag"])
+        t = r.get("total_s_median") or 0.0
+        td = (
+            (t - b["total_s_median"]) / b["total_s_median"] * 100.0
+            if b
+            else float("nan")
+        )
+        rows.append(
+            (
+                engine_label(r["tag"]),
+                name,
+                pfmt(t),
+                f"{td:+.1f}%" if not math.isnan(td) else "-",
+                pfmt(r.get("cold_request_s"), 1),
+            )
+        )
+    if not rows:
+        return "_Not measured._"
+    head = "| Engine | config | median total s | Δ% vs default | cold request s |"
+    sep = "|---|---|---:|---:|---:|"
+    body = [f"| {e} | {c} | {t} | {dp} | {cr} |" for e, c, t, dp, cr in rows]
     return "\n".join([head, sep, *body])
 
 
@@ -7213,6 +7949,18 @@ def write_publication_report(
         campaign_scoped(variant_table(recs), "optimization axes", artifacts_dir.name)
     )
     L.append("")
+    L.append("### Gateway config knobs (on/off vs default profile)")
+    L.append("")
+    L.append(
+        campaign_scoped(config_axes_table(recs), "config knob A/B", artifacts_dir.name)
+    )
+    L.append("")
+    L.append("### Gateway scheduler knobs under concurrent load (C=8 bursts)")
+    L.append("")
+    L.append(
+        campaign_scoped(conc_axes_table(recs), "conc lane A/B", artifacts_dir.name)
+    )
+    L.append("")
     L.append("### Engine capability matrix")
     L.append("")
     L.append(
@@ -7244,6 +7992,10 @@ def write_publication_report(
     L.append("### Media lanes (image / video / TTS / whisper)")
     L.append("")
     L.append(campaign_scoped(media_table(recs), "media", artifacts_dir.name))
+    L.append("")
+    L.append(
+        campaign_scoped(media_axes_table(recs), "media config A/B", artifacts_dir.name)
+    )
     L.append("")
     L.append(
         "_Media cells run through the same sandboxed gateway as text lanes but do not assert "

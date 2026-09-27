@@ -320,6 +320,26 @@ pub async fn openai_proxy(
             }
         }
     }
+    // Best-of-N: this lane forwards byte-faithful (both stream and
+    // non-stream ride the passthrough proxy), so it cannot judge
+    // candidates. Fail loud with the working lanes instead of silently
+    // ignoring the knob — the buffered OpenAI lane is /v1/responses.
+    if uri.path().ends_with("/chat/completions") {
+        match crate::bestof::resolve_best_of(
+            &headers,
+            parsed_body.as_ref().and_then(|v| v.get("best_of")),
+        ) {
+            Err(msg) => return openai_error(400, &msg),
+            Ok(Some(_)) => {
+                return openai_error(
+                    400,
+                    "best_of is not available on /v1/chat/completions (byte-faithful \
+                     passthrough lane) — use /v1/responses, /api/chat, or /v1/messages",
+                )
+            }
+            Ok(None) => {}
+        }
+    }
     // Strict tool-def lint: catch broken definitions before the model
     // burns a turn (chat/responses lanes only). Prompt-fit preflight:
     // refuse what the engine would silently truncate. FIX8: the LIVE
@@ -749,6 +769,19 @@ pub async fn responses_api(
         .get("stream")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    // Best-of-N fan-out knob (blazar extension): header is the
+    // dialect-universal spelling, body field tolerated. Non-streaming
+    // only: a winner cannot be judged before completion.
+    let best_of = match crate::bestof::resolve_best_of(&headers, parsed.get("best_of")) {
+        Ok(n) => n,
+        Err(msg) => return openai_error(400, &msg),
+    };
+    if best_of.is_some() && stream {
+        return openai_error(
+            400,
+            "best_of requires stream=false — a winner cannot be judged before completion",
+        );
+    }
     let store = parsed
         .get("store")
         .and_then(serde_json::Value::as_bool)
@@ -889,55 +922,78 @@ pub async fn responses_api(
         &engine,
     )
     .body(new_body.clone());
-    let resp = match crate::proxy::child_send(&state, &engine, req.send()).await {
-        Ok(r) => {
-            state.ttft.observe_secs(t0.elapsed().as_secs_f64());
-            r
+    // Best-of-N: judge N candidates, return the winner as a normal child
+    // response (usage summed across candidates). Skip/Degraded (knob
+    // off, guard collapse, first-copy transport failure) takes the
+    // single-send path below with its respawn-retry contract intact; a
+    // guard degrade still stamps the reason header.
+    let mut bestof_hdr: Option<String> = None;
+    let fan = if let Some(want) = best_of.filter(|n| *n >= 2) {
+        crate::bestof::fan_out(&state, &engine, &url, &new_body, want).await
+    } else {
+        crate::bestof::FanOut::Skip
+    };
+    if let crate::bestof::FanOut::Degraded(h) = &fan {
+        bestof_hdr = Some(h.clone());
+    }
+    let resp = match fan {
+        crate::bestof::FanOut::Ran(outcome) => {
+            state.ttft.observe_secs(outcome.elapsed.as_secs_f64());
+            bestof_hdr = Some(outcome.hdr);
+            outcome.resp
         }
-        Err(e) => {
-            tracing::warn!(
-                model = %model_name,
-                "responses buffered upstream failed: {e} — respawning lane, retrying once in-band"
-            );
-            match crate::proxy::respawn_lane(&state, &engine.key).await {
-                Ok(fresh) => {
-                    let fresh_url =
-                        format!("{}/v1/responses", crate::proxy::child_base(&fresh.endpoint));
-                    let fresh_req = crate::proxy::child_auth(
-                        crate::state::child_client(&state, &fresh.endpoint)
-                            .post(&fresh_url)
-                            .header("content-type", "application/json"),
-                        &fresh,
-                    )
-                    .body(new_body.clone());
-                    match crate::proxy::child_send(&state, &fresh, fresh_req.send()).await {
-                        Ok(r) => {
-                            state.ttft.observe_secs(t0.elapsed().as_secs_f64());
-                            r
-                        }
-                        Err(e2) => {
-                            return openai_error(
-                                e2.status_u16(),
-                                &format!(
+        _ => match crate::proxy::child_send(&state, &engine, req.send()).await {
+            Ok(r) => {
+                state.ttft.observe_secs(t0.elapsed().as_secs_f64());
+                r
+            }
+            Err(e) => {
+                tracing::warn!(
+                    model = %model_name,
+                    "responses buffered upstream failed: {e} — respawning lane, retrying once in-band"
+                );
+                match crate::proxy::respawn_lane(&state, &engine.key).await {
+                    Ok(fresh) => {
+                        let fresh_url =
+                            format!("{}/v1/responses", crate::proxy::child_base(&fresh.endpoint));
+                        let fresh_req = crate::proxy::child_auth(
+                            crate::state::child_client(&state, &fresh.endpoint)
+                                .post(&fresh_url)
+                                .header("content-type", "application/json"),
+                            &fresh,
+                        )
+                        .body(new_body.clone());
+                        match crate::proxy::child_send(&state, &fresh, fresh_req.send()).await {
+                            Ok(r) => {
+                                state.ttft.observe_secs(t0.elapsed().as_secs_f64());
+                                r
+                            }
+                            Err(e2) => {
+                                return openai_error(
+                                    e2.status_u16(),
+                                    &format!(
                                     "engine request failed: {e}; retry on respawned child: {e2}"
                                 ),
-                            );
+                                );
+                            }
                         }
                     }
-                }
-                Err(re) => {
-                    return openai_error(
-                        e.status_u16(),
-                        &format!("engine request failed: {e}; respawn: {re:#}"),
-                    );
+                    Err(re) => {
+                        return openai_error(
+                            e.status_u16(),
+                            &format!("engine request failed: {e}; respawn: {re:#}"),
+                        );
+                    }
                 }
             }
-        }
+        },
     };
     let status = resp.status().as_u16();
     if !resp.status().is_success() {
         let text = resp.text().await.unwrap_or_default();
-        return openai_error(status, &format!("engine error: {text}"));
+        let mut r = openai_error(status, &format!("engine error: {text}"));
+        crate::bestof::stamp(&mut r, bestof_hdr.as_deref());
+        return r;
     }
     let mut out: serde_json::Value = match resp.json().await {
         Ok(v) => v,
@@ -964,6 +1020,13 @@ pub async fn responses_api(
     let usage = out.get("usage").cloned().unwrap_or(serde_json::Value::Null);
     let in_tok = usage["input_tokens"].as_u64();
     let out_tok = usage["output_tokens"].as_u64();
+    // A2: blend the completion's decode rate into the model's EWMA
+    // (t0 predates the fan/single send on this branch).
+    if let Some(n) = out_tok {
+        state
+            .sup
+            .note_model_throughput(&model_name, n, t0.elapsed().as_secs_f64());
+    }
     // FIX6: this buffered branch bypasses proxy_request's sniffer —
     // charge token budgets directly from the parsed usage.
     if let Some(Extension(k)) = key_ext.as_ref() {
@@ -996,6 +1059,11 @@ pub async fn responses_api(
     let mut builder = Response::builder().status(status);
     if load_ms > 100 {
         builder = builder.header("x-blazar-status", "loading");
+    }
+    if let Some(h) = &bestof_hdr {
+        if let Ok(v) = axum::http::HeaderValue::from_str(h) {
+            builder = builder.header(crate::bestof::HEADER, v);
+        }
     }
     builder
         .body(axum::body::Body::from(

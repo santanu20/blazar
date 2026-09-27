@@ -82,6 +82,53 @@ pub fn resolve_spec_mode(queued: Option<String>, overlay: Option<String>, config
     queued.or(overlay).unwrap_or_else(|| config.to_string())
 }
 
+/// Neutral decode rate (tok/s) assumed by [`route_cost`] when a model
+/// has no measured throughput yet: a small-model-ish floor that keeps
+/// cost ORDERING sane instead of making unmeasured models look
+/// infinitely slow (or infinitely fast).
+pub const NEUTRAL_DECODE_RATE: f64 = 50.0;
+
+/// Prefill processes tokens in parallel batches while decode is
+/// autoregressive; ~4x is the planning constant used to convert a
+/// decode-rate hint into a prefill-rate estimate.
+const PREFILL_SPEEDUP: f64 = 4.0;
+
+/// A2 joint routing/KV cost estimate in seconds (lower = better
+/// candidate): queued-wait + starved-slot penalty + uncached prefill +
+/// decode, blending the model's measured decode rate and prompt-cache
+/// hit with the live admission snapshot the caller took. Pure on
+/// purpose — callers snapshot `queue_depth`/`headroom` at decision
+/// time, never re-derived here, so the tiering is pinnable.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::similar_names,
+    reason = "token counts fit f64 exactly; queue_wait vs starved naming mirrors the concepts"
+)]
+#[must_use]
+pub fn route_cost(
+    rate: Option<f64>,
+    cache: Option<f64>,
+    queue_depth: u64,
+    headroom: u32,
+    prompt_tokens: u64,
+    expected_output: u64,
+) -> f64 {
+    let rate = rate.unwrap_or(NEUTRAL_DECODE_RATE).max(1.0);
+    // Each queued admission ahead of this one is ~half a decode second
+    // of expected wait on a local box; a starved slot pool (zero
+    // headroom under demand) adds a respawn-shaped penalty.
+    let queue_wait = f64::from(u32::try_from(queue_depth).unwrap_or(u32::MAX)) * 0.5;
+    let starved = if headroom == 0 && queue_depth > 0 {
+        1.0
+    } else {
+        0.0
+    };
+    let cached = cache.unwrap_or(0.0).clamp(0.0, 1.0);
+    let prefill = prompt_tokens as f64 * (1.0 - cached) / (rate * PREFILL_SPEEDUP);
+    let decode = expected_output as f64 / rate;
+    queue_wait + starved + prefill + decode
+}
+
 /// Instance key for the single router-mode child (never a model name:
 /// underscore prefix is invalid in HF repo names).
 pub const ROUTER_KEY: &str = "_router";
@@ -115,6 +162,14 @@ const PRELOAD_MIN_TRANSITIONS: u64 = 3;
 const TRANSITIONS_CAP: usize = 1024;
 /// LC1: cooldown after a failed speculative spawn of a model.
 const PRELOAD_BACKOFF: Duration = Duration::from_mins(5);
+/// F1: idle-to-RAM warm read granularity — large enough to amortize
+/// syscall overhead, small enough to yield between chunks on slow disks.
+const RAM_WARM_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+/// Whole-bank save-sweep budget: each per-slot save is individually
+/// bounded at 2 s, but an `-np 32` child must not hold daemon shutdown
+/// for a minute of worst-case timeouts — the sweep stops issuing saves
+/// once this budget is spent.
+const BANK_SAVE_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 /// F12: `keep_alive: -1` cap — 100 years, far enough to be forever in
 /// practice without risking `Instant` overflow arithmetic.
 const KEEP_ALIVE_FOREVER: Duration = Duration::from_hours(876_600);
@@ -132,6 +187,31 @@ const SLOTS_ADOPT_CAP: u32 = 8;
 /// scaling up must be eager (demand is now), scaling down must be lazy
 /// (the cost of waiting is only per-stream latency, never queueing).
 const SLOTS_DECAY_TICKS: u32 = 30;
+/// B2 spec governor: consecutive 60 s telemetry windows of collapse
+/// (queue saturation OR draft acceptance < [`SPEC_GOV_ACCEPT_FLOOR`])
+/// before speculation is parked for a model.
+const SPEC_GOV_OFF_STREAK: u32 = 2;
+/// B2 spec governor: consecutive quiet windows before a parked model
+/// regains speculation. Asymmetric hysteresis on purpose (same shape as
+/// the SLOTS_* pair): parking must be eager (live queues are bleeding
+/// now), restoring must be lazy (the cost of waiting is only missed
+/// speedups, never queueing).
+const SPEC_GOV_RECOVER_STREAK: u32 = 10;
+/// B2 spec governor: acceptance rate below this counts as collapsed
+/// (draft overhead is pure waste when almost nothing is accepted).
+const SPEC_GOV_ACCEPT_FLOOR: f64 = 0.15;
+/// D1 ubatch governor: consecutive saturated windows before prefill
+/// shaping escalates one tier.
+const UBATCH_GOV_SAT_STREAK: u32 = 2;
+/// D1 ubatch governor: consecutive quiet windows before an escalated
+/// model steps back down (asymmetric hysteresis, same shape as the
+/// `SPEC_GOV_*` pair: escalating relieves a live queue, de-escalating
+/// only frees a compute buffer nobody is waiting on).
+const UBATCH_GOV_RECOVER_STREAK: u32 = 10;
+/// D1 ubatch governor: escalation ladder for the micro-batch ceiling
+/// (`--ubatch-size`). Capped at 2048: the next rung would grow the
+/// compute buffer linearly and can OOM small cards mid-burst.
+const UBATCH_GOV_TIERS: [u32; 2] = [1024, 2048];
 
 /// Model name behind an instance key: `"qwen#2"` → `"qwen"`. Plain keys
 /// (no `#`) pass through unchanged, so `replicas = 1` stays
@@ -583,6 +663,40 @@ pub struct CacheHint {
     rate_milli: std::sync::atomic::AtomicU32,
 }
 
+/// Per-model decode throughput (A2): EWMA of observed completion tokens
+/// per wall-second, blended at gateway completion time. Unlike the
+/// windowed poller hints there is no global fallback — rates from
+/// different model sizes never mix.
+#[derive(Debug)]
+pub struct ThroughputHint {
+    rate_milli: std::sync::atomic::AtomicU32,
+}
+
+impl Default for ThroughputHint {
+    fn default() -> Self {
+        // MAX = "never measured": `get()` yields None until a completion
+        // has been observed (mirrors CacheHint).
+        Self {
+            rate_milli: std::sync::atomic::AtomicU32::new(u32::MAX),
+        }
+    }
+}
+
+/// Per-model windowed rates (C1/G3): prompt-cache hit + speculative
+/// acceptance for ONE model, both `None` until that model's children
+/// have reported the relevant counters. Replicas of the same model
+/// share one entry — same weights, same KV economics.
+#[derive(Debug, Default)]
+pub struct ModelHints {
+    pub cache: CacheHint,
+    pub accept: CacheHint,
+    pub decode: ThroughputHint,
+}
+
+/// One row of [`Supervisor::model_hint_snapshot`]: the model plus its
+/// windowed cache-hit, spec-acceptance, and decode-throughput hints.
+pub type ModelHintRow = (String, Option<f64>, Option<f64>, Option<f64>);
+
 /// Auto-pick one GPU: most free VRAM among DISCRETE cards; integrated
 /// cards are considered only when no discrete card exists (their "free"
 /// is shared system RAM — bandwidth-starved for serving). Returns the
@@ -779,6 +893,438 @@ impl CacheHint {
     }
 }
 
+impl ThroughputHint {
+    /// Record the blended decode rate (tokens per second).
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped to [0, 1e6] before the cast; a million tok/s exceeds any local engine"
+    )]
+    pub fn set(&self, tokens_per_s: f64) {
+        let clamped = tokens_per_s.clamp(0.0, 1_000_000.0);
+        let milli = (clamped * 1000.0).round();
+        let milli = u32::try_from(milli.min(f64::from(u32::MAX)) as u64).unwrap_or(0);
+        self.rate_milli.store(milli, Ordering::Relaxed);
+    }
+    /// Latest decode rate; `None` until a completion has been observed.
+    #[must_use]
+    pub fn get(&self) -> Option<f64> {
+        match self.rate_milli.load(Ordering::Relaxed) {
+            u32::MAX => None,
+            m => Some(f64::from(m) / 1000.0),
+        }
+    }
+}
+
+impl Supervisor {
+    /// Poller write side (C1): record one model's windowed rates. Either
+    /// may be `None` — that counter was absent this window (e.g. spec
+    /// acceptance on a dense child), which leaves the last measured
+    /// value untouched rather than zeroing it.
+    pub fn set_model_hints(&self, model: &str, cache: Option<f64>, accept: Option<f64>) {
+        let hints = self.model_hints.entry(model.to_string()).or_default();
+        if let Some(rate) = cache {
+            hints.cache.set(rate);
+        }
+        if let Some(rate) = accept {
+            hints.accept.set(rate);
+        }
+    }
+
+    /// Spawn read side (C1): the model's own measured prompt-cache hit
+    /// rate, falling back to the merged global when this model has no
+    /// measured window yet (identical steering on single-model boxes).
+    #[must_use]
+    pub fn cache_hint_for(&self, model: &str) -> Option<f64> {
+        self.model_hints
+            .get(model)
+            .and_then(|h| h.cache.get())
+            .or_else(|| self.cache_hint.get())
+    }
+
+    /// Speculative acceptance for one model (G3 per-model split);
+    /// `None` when that model has never reported spec counters.
+    #[must_use]
+    pub fn accept_hint_for(&self, model: &str) -> Option<f64> {
+        self.model_hints.get(model).and_then(|h| h.accept.get())
+    }
+
+    /// Gateway write side (A2): blend one observed completion into the
+    /// model's decode-rate EWMA (0.7 history / 0.3 sample — same shape
+    /// as the poller hints). Wall time is measured from child-send
+    /// start so admission-queue wait never pollutes the rate; zero-token
+    /// and non-finite observations are dropped, not recorded as zeroes.
+    pub fn note_model_throughput(&self, model: &str, eval_count: u64, wall_s: f64) {
+        if eval_count == 0 || !(wall_s.is_finite() && wall_s > 0.0) {
+            return;
+        }
+        #[allow(clippy::cast_precision_loss, reason = "token counts fit f64 exactly")]
+        let sample = eval_count as f64 / wall_s;
+        let prev = self
+            .model_hints
+            .get(model)
+            .and_then(|h| h.decode.get())
+            .map_or(sample, |prev| prev * 0.7 + sample * 0.3);
+        self.model_hints
+            .entry(model.to_string())
+            .or_default()
+            .decode
+            .set(prev);
+    }
+
+    /// A2 read side: the model's measured decode rate. Deliberately no
+    /// cross-model fallback — a 0.5b rate must never size a 9b estimate.
+    #[must_use]
+    pub fn decode_rate_for(&self, model: &str) -> Option<f64> {
+        self.model_hints.get(model).and_then(|h| h.decode.get())
+    }
+
+    /// Labeled /metrics snapshot: `(model, cache, accept, decode)` sorted
+    /// by model for a stable exposition.
+    #[must_use]
+    pub fn model_hint_snapshot(&self) -> Vec<ModelHintRow> {
+        let mut rows: Vec<ModelHintRow> = self
+            .model_hints
+            .iter()
+            .map(|e| {
+                (
+                    e.key().clone(),
+                    e.value().cache.get(),
+                    e.value().accept.get(),
+                    e.value().decode.get(),
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+
+    /// B2 spawn read side: the spec-mode default tier for one model —
+    /// the governor's parked override where present, else the config
+    /// default. Wired into `resolve_spec_mode` as the LAST tier, so a
+    /// per-request pin and an overlay pin always shadow the governor.
+    #[must_use]
+    pub fn governed_spec_default(&self, name: &str) -> String {
+        self.spec_override
+            .get(name)
+            .map_or_else(|| self.config.spec.clone(), |v| v.value().clone())
+    }
+
+    /// B2 spec governor: one 60 s telemetry window for `model`.
+    /// `accept` is that model's windowed draft-acceptance rate, `None`
+    /// when its child reported no spec counters (dense, or an engine
+    /// without the counters — then only saturation can fire). Called by
+    /// the gateway poller after `set_model_hints`. No-op unless
+    /// `spec_auto_manage` is on; the router child and user-pinned
+    /// models are exempt.
+    pub fn spec_governor_window(&self, model: &str, accept: Option<f64>) {
+        if !self.config.spec_auto_manage || model == ROUTER_KEY {
+            return;
+        }
+        let overlay = self.config.overlay_for(model);
+        if overlay.spec.is_some() || self.config.spec == "off" {
+            // A user pin (or a dense global config) shadows the governor
+            // permanently — clear any stale state so the gauge never
+            // reports a model it cannot act on.
+            self.spec_gov.remove(model);
+            self.spec_override.remove(model);
+            return;
+        }
+        let parked = self.spec_override.get(model).is_some();
+        let saturated = self.spec_model_saturated(model);
+        if !parked {
+            // Watching path: two collapse signals, either alone enough —
+            // queue saturation (speculation overhead is feeding the
+            // queue) or an acceptance floor breach (draft overhead is
+            // pure waste at these rates).
+            let accept_collapsed = accept.is_some_and(|a| a < SPEC_GOV_ACCEPT_FLOOR);
+            if !(saturated || accept_collapsed) {
+                self.spec_gov.remove(model);
+                return;
+            }
+            let fired = {
+                let mut s = self.spec_gov.entry(model.to_string()).or_default();
+                s.off_streak += 1;
+                s.off_streak >= SPEC_GOV_OFF_STREAK
+            };
+            if fired {
+                let reason = if saturated {
+                    "saturation"
+                } else {
+                    "acceptance"
+                };
+                self.spec_gov.remove(model);
+                self.spec_override.insert(model.to_string(), "off".into());
+                self.queue_spec_reshape(model);
+                tracing::warn!(
+                    model = %model,
+                    reason,
+                    "spec governor: speculation parked after a collapse streak — respawning dense (a long quiet streak restores it)"
+                );
+                self.bus.publish(BlazarEvent::SpecGovernorOff {
+                    model: model.to_string(),
+                    reason: reason.to_string(),
+                });
+            }
+            return;
+        }
+        // Parked path: restore only after a sustained fully-quiet streak
+        // (asymmetric hysteresis — see SPEC_GOV_RECOVER_STREAK). A dense
+        // child reports no spec counters; `None` acceptance counts as
+        // quiet on that axis.
+        let quiet = !saturated && accept.is_none_or(|a| a >= SPEC_GOV_ACCEPT_FLOOR);
+        if !quiet {
+            self.spec_gov.remove(model);
+            return;
+        }
+        let recovered = {
+            let mut s = self.spec_gov.entry(model.to_string()).or_default();
+            s.recover_streak += 1;
+            s.recover_streak >= SPEC_GOV_RECOVER_STREAK
+        };
+        if recovered {
+            self.spec_gov.remove(model);
+            self.spec_override.remove(model);
+            self.queue_spec_reshape(model);
+            tracing::info!(
+                model = %model,
+                "spec governor: quiet streak satisfied — speculation restored"
+            );
+            self.bus.publish(BlazarEvent::SpecGovernorRecovered {
+                model: model.to_string(),
+            });
+        }
+    }
+
+    /// Per-model saturation, derived entirely from supervisor state so
+    /// the gateway's global queue depth can never flip another model's
+    /// governor: admission pressure on this model (the same gauge the
+    /// adaptive-slot reaper reads) or a live replica over its slot
+    /// count. Mirrors the `adaptive_slots_tick` definition exactly.
+    fn spec_model_saturated(&self, model: &str) -> bool {
+        if self.slot_pressure.get(model).is_some_and(|v| *v > 0) {
+            return true;
+        }
+        for e in &self.instances {
+            if model_of_key(e.key()) != model {
+                continue;
+            }
+            let i = e.value();
+            if !matches!(*i.state.read().expect("state lock"), InstanceState::Ready) {
+                continue;
+            }
+            let resolved = i
+                .argv
+                .windows(2)
+                .find(|w| w[0] == "-np" || w[0] == "--parallel")
+                .and_then(|w| w[1].parse::<u32>().ok())
+                .unwrap_or(self.config.slots);
+            let effective = self
+                .adopted_slots
+                .get(model)
+                .map_or(resolved, |v| *v.value());
+            if effective > 0 && i.in_flight.load(Ordering::SeqCst) > i64::from(effective) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Free decode slots for `model` right now: the widest headroom
+    /// (effective slots − in-flight) across its Ready replicas. 0 when
+    /// every replica is full (or none is up). The best-of-N fan-out
+    /// guard reads this so extra candidates never queue behind live
+    /// traffic — same definition `spec_model_saturated` walks, exposed
+    /// as a number instead of a boolean.
+    #[must_use]
+    pub fn slot_headroom(&self, model: &str) -> u32 {
+        let mut best = 0u32;
+        for e in &self.instances {
+            if model_of_key(e.key()) != model {
+                continue;
+            }
+            let i = e.value();
+            if !matches!(*i.state.read().expect("state lock"), InstanceState::Ready) {
+                continue;
+            }
+            let resolved = i
+                .argv
+                .windows(2)
+                .find(|w| w[0] == "-np" || w[0] == "--parallel")
+                .and_then(|w| w[1].parse::<u32>().ok())
+                .unwrap_or(self.config.slots);
+            let effective = self
+                .adopted_slots
+                .get(model)
+                .map_or(resolved, |v| *v.value());
+            if effective == 0 {
+                continue;
+            }
+            let free = i64::from(effective) - i.in_flight.load(Ordering::SeqCst);
+            best = best.max(u32::try_from(free.max(0)).unwrap_or(0));
+        }
+        best
+    }
+
+    /// Queue a dense/spec restore respawn for every live replica of the
+    /// model via the existing reshape machinery (drain waits for
+    /// in-flight streams; the KV bank carries conversations across the
+    /// reshape). The queue is model-keyed, so a multi-replica model
+    /// reshapes one replica per drain cycle — replicas > 1 is opt-in
+    /// and rare on single-box deployments.
+    fn queue_spec_reshape(&self, model: &str) {
+        for e in &self.instances {
+            let key = e.key();
+            if model_of_key(key) == model {
+                self.reshape_queue.insert(model.to_string(), key.clone());
+            }
+        }
+    }
+
+    /// Labeled /metrics snapshot for the governor: `(model, parked)`
+    /// sorted by model. A model appears while it has streak state
+    /// (watching) or an active override (parked).
+    #[must_use]
+    pub fn spec_governor_snapshot(&self) -> Vec<(String, bool)> {
+        let mut parked: Vec<String> = self.spec_override.iter().map(|e| e.key().clone()).collect();
+        parked.sort();
+        let mut watching: Vec<String> = self
+            .spec_gov
+            .iter()
+            .map(|e| e.key().clone())
+            .filter(|m| !parked.contains(m))
+            .collect();
+        watching.sort();
+        let mut rows: Vec<(String, bool)> = watching
+            .into_iter()
+            .map(|m| (m, false))
+            .chain(parked.into_iter().map(|m| (m, true)))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+
+    /// D1 spawn read side: the shaped micro-batch tier for one model,
+    /// `None` when the engine default should stand. Injected into the
+    /// spawn's `TuningOverrides` ONLY where the user left everything
+    /// unset (no `--ubatch-size` pin, no tuning override), so a config
+    /// pin always shadows the governor.
+    #[must_use]
+    pub fn governed_ubatch(&self, name: &str) -> Option<u32> {
+        self.ubatch_override.get(name).map(|v| *v.value())
+    }
+
+    /// D1 ubatch governor: one 60 s telemetry window for `model`.
+    /// Saturated windows climb a two-rung ladder (`--ubatch-size` 1024
+    /// then 2048 — bigger prefill micro-batches drain a saturated queue
+    /// faster at the cost of a larger compute buffer); a sustained quiet
+    /// streak steps back down. Called by the gateway poller after
+    /// `spec_governor_window`. No-op unless `ubatch_auto` is on; the
+    /// router child and models with a config `ubatch_size` pin are
+    /// exempt. Reshapes ride the same drain-safe queue the spec
+    /// governor uses.
+    pub fn ubatch_governor_window(&self, model: &str) {
+        if !self.config.ubatch_auto || model == ROUTER_KEY {
+            return;
+        }
+        if self.config.ubatch_size != 0 {
+            // A user pin shadows the governor permanently — clear any
+            // stale state so the gauge never reports a model it cannot
+            // act on.
+            self.ubatch_gov.remove(model);
+            self.ubatch_override.remove(model);
+            return;
+        }
+        let current = self.governed_ubatch(model).unwrap_or(0);
+        let saturated = self.spec_model_saturated(model);
+        if saturated {
+            let fired = {
+                let mut s = self.ubatch_gov.entry(model.to_string()).or_default();
+                s.quiet_streak = 0;
+                s.sat_streak += 1;
+                s.sat_streak >= UBATCH_GOV_SAT_STREAK
+            };
+            if fired {
+                if let Some(&tier) = UBATCH_GOV_TIERS.iter().find(|&&t| t > current) {
+                    self.ubatch_gov.remove(model);
+                    self.ubatch_override.insert(model.to_string(), tier);
+                    self.queue_spec_reshape(model);
+                    tracing::warn!(
+                        model = %model,
+                        tier,
+                        "ubatch governor: saturation streak — reshaping with a larger prefill micro-batch ceiling"
+                    );
+                } else {
+                    // Already at the top rung: hold there, streak spent.
+                    self.ubatch_gov.remove(model);
+                }
+            }
+            return;
+        }
+        self.ubatch_gov
+            .entry(model.to_string())
+            .or_default()
+            .sat_streak = 0;
+        if current == 0 {
+            self.ubatch_gov.remove(model);
+            return;
+        }
+        let recovered = {
+            let mut s = self.ubatch_gov.entry(model.to_string()).or_default();
+            s.quiet_streak += 1;
+            s.quiet_streak >= UBATCH_GOV_RECOVER_STREAK
+        };
+        if recovered {
+            // Step DOWN one rung (2048 → 1024 → auto), never straight
+            // to auto: the model earned the escalation by real
+            // saturation, and a quiet window under a shaped child is
+            // exactly the state that produced it.
+            let lower = UBATCH_GOV_TIERS.iter().rev().find(|&&t| t < current);
+            self.ubatch_gov.remove(model);
+            match lower {
+                Some(&tier) => {
+                    self.ubatch_override.insert(model.to_string(), tier);
+                }
+                None => {
+                    self.ubatch_override.remove(model);
+                }
+            }
+            self.queue_spec_reshape(model);
+            tracing::info!(
+                model = %model,
+                "ubatch governor: quiet streak satisfied — stepping the prefill micro-batch ceiling down"
+            );
+        }
+    }
+
+    /// D1 gauge rows: per-model shaped tier (0 = engine default).
+    #[must_use]
+    pub fn ubatch_governor_snapshot(&self) -> Vec<(String, u32)> {
+        let mut rows: Vec<(String, u32)> = self
+            .ubatch_override
+            .iter()
+            .map(|e| (e.key().clone(), *e.value()))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+}
+
+/// B2 spec governor streak bookkeeping per model (which side of the
+/// state machine the streak belongs to depends on the override).
+#[derive(Debug, Default)]
+struct SpecGovState {
+    off_streak: u32,
+    recover_streak: u32,
+}
+
+/// D1 ubatch governor streak bookkeeping per model.
+#[derive(Debug, Default)]
+struct UbatchGovState {
+    sat_streak: u32,
+    quiet_streak: u32,
+}
+
 /// Row for `blazar ps` / `/api/ps`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PsRow {
@@ -845,6 +1391,23 @@ pub struct Supervisor {
     /// spec-decoding child has reported counters — drives the
     /// `blazar_spec_accept_rate` gauge (G3).
     pub spec_accept: std::sync::Arc<CacheHint>,
+    /// Per-model split of the two hints above (C1): the gateway poller
+    /// writes windowed rates keyed by the engine-reported model name;
+    /// spawns read their own model's rate first and fall back to the
+    /// merged globals (single-model boxes steer identically).
+    model_hints: DashMap<String, ModelHints>,
+    /// B2 spec governor: models whose speculation the governor parked
+    /// ("off"). Consumed as the default spec tier at spawn — per-request
+    /// and overlay pins always shadow it. Daemon-lifetime memory, like
+    /// `adopted_slots`.
+    spec_override: DashMap<String, String>,
+    /// D1 ubatch governor: per-model shaped tier (`--ubatch-size`
+    /// value). Absent = engine default (tier "auto").
+    ubatch_override: DashMap<String, u32>,
+    /// B2 spec governor: window streaks per model (park-side or
+    /// recover-side depending on the override above).
+    spec_gov: DashMap<String, SpecGovState>,
+    ubatch_gov: DashMap<String, UbatchGovState>,
     /// J2 self-healing: distinct models whose spawn ULTIMATELY failed
     /// since the last successful spawn. Cleared on every success; drives
     /// the crash-loop engine rollback (probe-gated, see
@@ -912,6 +1475,10 @@ pub struct Supervisor {
     last_requested: std::sync::Mutex<Option<String>>,
     /// Models whose speculative preload failed recently (LC1 backoff).
     preload_failures: DashMap<String, Instant>,
+    /// Weights files being re-paged into the OS cache right now (F1
+    /// single-flight: one warm per path, later requests are no-ops).
+    /// `Arc` so the detached warm task can retire its own guard.
+    ram_warming: Arc<DashMap<String, ()>>,
     /// Consecutive reaper ticks with concurrent in-flight load on a
     /// single-slot model (LC4 adaptive slots).
     busy_streak: DashMap<String, u32>,
@@ -1053,6 +1620,11 @@ impl Supervisor {
             evictions: std::sync::atomic::AtomicU64::new(0),
             cache_hint: std::sync::Arc::new(CacheHint::default()),
             spec_accept: std::sync::Arc::new(CacheHint::default()),
+            model_hints: DashMap::new(),
+            spec_override: DashMap::new(),
+            ubatch_override: DashMap::new(),
+            spec_gov: DashMap::new(),
+            ubatch_gov: DashMap::new(),
             engine_failures: std::sync::Mutex::new(std::collections::HashSet::new()),
             capability_pins: std::sync::Mutex::new(std::collections::HashMap::new()),
             measured: std::sync::Mutex::new(MeasuredTick::default()),
@@ -1081,6 +1653,7 @@ impl Supervisor {
             transitions: DashMap::new(),
             last_requested: std::sync::Mutex::new(None),
             preload_failures: DashMap::new(),
+            ram_warming: Arc::new(DashMap::new()),
             busy_streak: DashMap::new(),
             reshape_draining: DashMap::new(),
             idle_streak: DashMap::new(),
@@ -1468,14 +2041,7 @@ impl Supervisor {
         // that served it, so the next turn hits its warm cache.
         if let Some(pk) = prefix {
             if result.is_ok() {
-                if !self.prefix_affinity.contains_key(&pk.convo) {
-                    if self.prefix_affinity.len() >= PREFIX_AFFINITY_CAP {
-                        if let Some(oldest) = self.prefix_affinity.iter().next().map(|e| *e.key()) {
-                            self.prefix_affinity.remove(&oldest);
-                        }
-                    }
-                    self.prefix_affinity.insert(pk.convo, key.clone());
-                }
+                self.note_prefix_affinity(&pk, &key);
                 // F8: remember the sys class this replica has warm.
                 let mut ring = self.sys_rings.entry(key).or_default();
                 if ring.len() >= SYS_RING_CAP {
@@ -1575,6 +2141,24 @@ impl Supervisor {
     /// LC1: bump the (prev, current) transition count. Bounded table;
     /// overflow arbitrarily evicts one entry (a dropped edge just means
     /// a missed preload opportunity, never a wrong spawn).
+    /// Best-effort affinity record: pin this conversation to the replica
+    /// that served it so the next turn hits its warm KV cache. At cap an
+    /// arbitrary entry is evicted; the victim key is bound to an owned
+    /// value BEFORE `remove` because an if-let binding would keep the
+    /// iterator's shard read-lock alive through the body, and the write
+    /// to that same shard self-deadlocks (dashmap shards lock per-shard).
+    fn note_prefix_affinity(&self, pk: &PrefixKey, key: &str) {
+        if !self.prefix_affinity.contains_key(&pk.convo) {
+            if self.prefix_affinity.len() >= PREFIX_AFFINITY_CAP {
+                let oldest = self.prefix_affinity.iter().next().map(|e| *e.key());
+                if let Some(oldest) = oldest {
+                    self.prefix_affinity.remove(&oldest);
+                }
+            }
+            self.prefix_affinity.insert(pk.convo, key.to_string());
+        }
+    }
+
     fn note_transition(&self, name: &str) {
         let prev = {
             let mut last = self.last_requested.lock().unwrap();
@@ -1588,7 +2172,11 @@ impl Supervisor {
         }
         let edge = (prev, name.to_string());
         if !self.transitions.contains_key(&edge) && self.transitions.len() >= TRANSITIONS_CAP {
-            if let Some(k) = self.transitions.iter().next().map(|e| e.key().clone()) {
+            // Bind the victim BEFORE `remove`: an if-let binding keeps the
+            // iterator's shard read-lock alive through the body, and a
+            // write to the same shard self-deadlocks (dashmap shards).
+            let victim = self.transitions.iter().next().map(|e| e.key().clone());
+            if let Some(k) = victim {
                 self.transitions.remove(&k);
             }
         }
@@ -2056,6 +2644,7 @@ impl Supervisor {
             let spec_mode = resolve_spec_mode(None, overlay.spec.clone(), &self.config.spec);
             let draft_path = resolve_draft_path(&store, &m.name, &spec_mode);
             let input = ProfileInput {
+                spec_mode: &spec_mode,
                 engine_kind: self.engine.kind(),
                 sibling_devices: Vec::new(),
                 auto_tensor_split: None,
@@ -2083,6 +2672,8 @@ impl Supervisor {
                     port: 0,
                 },
                 data_dir: &data_dir_str,
+                // Router child serves N models — the merged global hint is
+                // the only meaningful granularity here.
                 cache_hit_rate: self.cache_hint.get(),
                 resident_ram_mib: self
                     .instances
@@ -2094,7 +2685,13 @@ impl Supervisor {
                 device_hint: None, // router preset: no per-GPU scoping
                 engine_census: self.hardware.gpus.clone(),
             };
-            match profile::compile(&input, &blazar_core::TuningOverrides::default()) {
+            match profile::compile(
+                &input,
+                &blazar_core::TuningOverrides {
+                    fa: self.config.flash_attention,
+                    ..Default::default()
+                },
+            ) {
                 Ok(p) => {
                     if global.is_empty() {
                         global.clone_from(&p.argv);
@@ -2752,10 +3349,14 @@ impl Supervisor {
         // live in profile::compile. A queued per-request spec
         // (`options.spec`) wins over overlay/config; consumed HERE,
         // before every loop in this fn, so retries never re-read it.
+        // B2: the governor fills the default tier ONLY where the user
+        // left it unset — per-request > overlay > governor > config.
+        // A pin anywhere permanently exempts the model (the governor
+        // itself refuses to act on pinned models).
         let spec_mode = resolve_spec_mode(
             self.pending_spec.remove(name).map(|(_, m)| m),
             overlay.spec.clone(),
-            &self.config.spec,
+            &self.governed_spec_default(name),
         );
         let mut draft_path = resolve_draft_path(&store, name, &spec_mode);
         if draft_path.is_none() && self.config.spec_autopull {
@@ -2917,6 +3518,17 @@ impl Supervisor {
                 ..Default::default()
             })
             .unwrap_or_default();
+        // Config-level FA override rides the same override path the
+        // pending ctx uses; None keeps the profile heuristic (auto).
+        tuning.fa = self.config.flash_attention;
+        // D1 ubatch governor fills in ONLY where the user left the
+        // micro-batch ceiling unset (no config `ubatch_size` pin — the
+        // governor itself refuses pinned models; nothing else sets
+        // tuning.ubatch at spawn). Same shadowing contract as the LC4
+        // adaptive-slots adoption above.
+        if tuning.ubatch.is_none() {
+            tuning.ubatch = self.governed_ubatch(name);
+        }
         // Candidate f16 KV over the FULL (unscoped) hardware: the split
         // decision compares weights+KV against the combined discrete
         // pool before single-card scoping exists. Sibling literal of the
@@ -2926,6 +3538,7 @@ impl Supervisor {
         let data_dir_str = self.dirs.data_dir.to_string_lossy().into_owned();
         let candidate_kv_mib = {
             let probe = ProfileInput {
+                spec_mode: spec_mode.as_str(),
                 engine_kind: engine.kind(),
                 sibling_devices: Vec::new(),
                 auto_tensor_split: None,
@@ -2953,7 +3566,7 @@ impl Supervisor {
                     port: 0,
                 },
                 data_dir: &data_dir_str,
-                cache_hit_rate: self.cache_hint.get(),
+                cache_hit_rate: self.cache_hint_for(name),
                 resident_ram_mib: self
                     .instances
                     .iter()
@@ -3158,6 +3771,7 @@ impl Supervisor {
                 auth_keyfile = Some(p);
             }
             let input = ProfileInput {
+                spec_mode: spec_mode.as_str(),
                 engine_kind: engine.kind(),
                 sibling_devices: sibling_devices.clone(),
                 auto_tensor_split: auto_split.clone(),
@@ -3193,7 +3807,7 @@ impl Supervisor {
                 spec_types: &manifest.spec_types,
                 endpoint: endpoint.clone(),
                 data_dir: &data_dir_str,
-                cache_hit_rate: self.cache_hint.get(),
+                cache_hit_rate: self.cache_hint_for(name),
                 resident_ram_mib: self
                     .instances
                     .iter()
@@ -4037,16 +4651,55 @@ drop them from rpc_servers in config.toml",
             .join(format!("_auto-{ctx}"))
     }
 
+    /// Bank filename for slot `id` of an instance: slot 0 keeps the
+    /// legacy `_auto-<ctx>` name (banks written before multi-slot saves
+    /// stay restorable); slots > 0 bank as `_auto-<ctx>-s<id>`.
+    fn bank_slot_file(&self, name: &str, ctx: u32, id: u32) -> std::path::PathBuf {
+        if id == 0 {
+            return self.bank_file(name, ctx);
+        }
+        self.bank_file(name, ctx)
+            .with_file_name(format!("_auto-{ctx}-s{id}"))
+    }
+
+    /// Parse a bank filename back to its slot id: `_auto-<ctx>` is slot
+    /// 0 (legacy), `_auto-<ctx>-s<N>` is slot N; anything else — other
+    /// ctx banks, identity manifests — is not part of this set.
+    fn bank_slot_of(file: &std::ffi::OsStr, ctx: u32) -> Option<u32> {
+        let name = file.to_str()?;
+        if name == format!("_auto-{ctx}") {
+            return Some(0);
+        }
+        name.strip_prefix(&format!("_auto-{ctx}-s"))
+            .and_then(|tail| tail.parse::<u32>().ok())
+    }
+
+    /// The child's decode-slot count from its own argv (`-np` /
+    /// `--parallel`), config fallback, floor 1 — the same walk
+    /// `slot_headroom` does per replica.
+    fn instance_slot_count(&self, inst: &Arc<Instance>) -> u32 {
+        inst.argv
+            .windows(2)
+            .find(|w| w[0] == "-np" || w[0] == "--parallel")
+            .and_then(|w| w[1].parse::<u32>().ok())
+            .unwrap_or(self.config.slots)
+            .max(1)
+    }
+
     /// Session-bank restore, IN-SPAWN and synchronous: warms the child's
-    /// slot-0 KV for conversation continuations (ctx-matched, per-key
-    /// bank files) BEFORE anything generates on the child. The previous
+    /// KV for conversation continuations (ctx-matched bank sets) BEFORE
+    /// anything generates on the child. Every `_auto-<ctx>` member is
+    /// restored into its own slot id — a `-np N` child wakes with ALL
+    /// banked conversations warm, not just slot 0's. The previous
     /// detached design posted the restore into live traffic after a
     /// busy-poll race — a request arriving inside the restore window
     /// wedged on the child's slot pipeline forever (observed ×4 live,
     /// including two benchmark requests). Runs inside the spawn path
     /// only; the trigger request and every later one find the bank
-    /// already applied. Bounded (5 s): a slow or dead endpoint continues
-    /// cold — the bank stays on disk for the next spawn.
+    /// already applied. Bounded (5 s per slot): a slow or dead endpoint
+    /// continues cold — the bank stays on disk for the next spawn.
+    /// A #20 identity mismatch SKIPS the set: injecting KV from a
+    /// different runtime shape is worse than a cold start.
     async fn bank_restore_sync(
         &self,
         key: &str,
@@ -4057,14 +4710,37 @@ drop them from rpc_servers in config.toml",
         if !self.config.session_bank {
             return;
         }
+        // The bank set of this shape: slot 0's legacy `_auto-<ctx>` plus
+        // every `_auto-<ctx>-s<id>` written by the multi-slot sweep
+        // (sorted so slot 0 — the hot path — restores first).
         let file = self.bank_file(key, ctx);
-        if !file.exists() {
+        let mut restores: Vec<(u32, String)> = Vec::new();
+        if file.exists() {
+            restores.push((0, format!("_auto-{ctx}")));
+        }
+        if let Some(dir) = file.parent() {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for entry in rd.flatten() {
+                    let name = entry.file_name();
+                    if let Some(id) = Self::bank_slot_of(&name, ctx) {
+                        if id != 0 {
+                            restores.push((id, name.to_string_lossy().into_owned()));
+                        }
+                    }
+                }
+            }
+        }
+        if restores.is_empty() {
             return;
         }
+        restores.sort_unstable();
         // Identity gate (config + weights + engine unchanged since the
         // bank was written): a stale bank restores garbage prefixes.
+        // Manifests are identical across the set (same live instance),
+        // so any member's manifest gates the whole set.
+        let gate_file = self.bank_slot_file(key, ctx, restores[0].0);
         let diffs = match (
-            blazar_core::session_identity::read_manifest(&file),
+            blazar_core::session_identity::read_manifest(&gate_file),
             blazar_core::session_identity::build(&self.dirs, &self.config, key),
         ) {
             (Some(saved), Some(mut cur)) => {
@@ -4086,14 +4762,30 @@ drop them from rpc_servers in config.toml",
         // binds .sock paths via --host); the dial helper picks the
         // client, the slot endpoints are unchanged.
         let (client, base) = child_dial(endpoint);
-        // Restore truth-check: HTTP 200 alone does not prove KV injection
-        // (upstream has a restored-then-empty re-prefill bug class). The
-        // response's `n_restored` is the injection count; the first
-        // request's cached-token counter (gateway A9) backstops the
-        // lookup-miss variant. Live-probed on b11070: restore of 31 saved
-        // tokens -> next same-prefix completion ran cache_n=23, prompt_n=1.
-        let url = format!("{base}/slots/0?action=restore&filename=_auto-{ctx}");
-        let mut body = serde_json::json!({ "filename": format!("_auto-{ctx}") });
+        for (id, filename) in restores {
+            self.bank_restore_one(&client, &base, key, auth, id, &filename)
+                .await;
+        }
+    }
+
+    /// One slot's restore POST with truth-check logging. HTTP 200 alone
+    /// does not prove KV injection (upstream has a restored-then-empty
+    /// re-prefill bug class): the response's `n_restored` is the
+    /// injection count, and the first request's cached-token counter
+    /// (gateway A9) backstops the lookup-miss variant. Live-probed on
+    /// b11070: restore of 31 saved tokens -> next same-prefix completion
+    /// ran `cache_n=23`, `prompt_n=1`.
+    async fn bank_restore_one(
+        &self,
+        client: &reqwest::Client,
+        base: &str,
+        key: &str,
+        auth: Option<&str>,
+        id: u32,
+        filename: &str,
+    ) {
+        let url = format!("{base}/slots/{id}?action=restore&filename={filename}");
+        let mut body = serde_json::json!({ "filename": filename });
         if self.config.router {
             body["model"] = serde_json::json!(key);
         }
@@ -4106,35 +4798,41 @@ drop them from rpc_servers in config.toml",
         }
         match req.send().await {
             Ok(resp) if resp.status().is_success() => {
-                let restored = resp
+                let tokens_back = resp
                     .json::<serde_json::Value>()
                     .await
                     .ok()
                     .as_ref()
                     .and_then(|v| slot_reported_tokens(v, "n_restored"));
-                match restored {
+                match tokens_back {
                     Some(0) => tracing::warn!(
                         target: "blazar::bank",
                         model = key,
                         "bank restore returned ok but restored 0 tokens — empty or incompatible checkpoint; continuing cold"
                     ),
-                    Some(n) => tracing::info!(
+                    Some(n) if id == 0 => tracing::info!(
                         target: "blazar::bank",
                         model = key,
-                        "restored banked session _auto-{ctx} ({n} tokens into slot KV)"
+                        "restored banked session {filename} ({n} tokens into slot KV)"
                     ),
-                    None => tracing::info!(
+                    Some(n) => tracing::debug!(
                         target: "blazar::bank",
                         model = key,
-                        "restored banked session _auto-{ctx} (no token count in response)"
+                        "restored banked slot {id} {filename} ({n} tokens into slot KV)"
                     ),
+                    None if id == 0 => tracing::info!(
+                        target: "blazar::bank",
+                        model = key,
+                        "restored banked session {filename} (no token count in response)"
+                    ),
+                    None => {}
                 }
             }
             Ok(resp) => {
                 tracing::warn!(
                     target: "blazar::bank",
                     model = key,
-                    "bank restore HTTP {} — continuing cold",
+                    "bank restore HTTP {} on slot {id} — continuing cold",
                     resp.status()
                 );
             }
@@ -4142,69 +4840,87 @@ drop them from rpc_servers in config.toml",
                 tracing::warn!(
                     target: "blazar::bank",
                     model = key,
-                    "bank restore failed: {e:#} — continuing cold"
+                    "bank restore failed on slot {id}: {e:#} — continuing cold"
                 );
             }
         }
     }
-    /// Best-effort `_auto-<ctx>` save before termination. Bounded (2s);
-    // failures cost a re-prefill, never the evict.
+    /// Best-effort `_auto-<ctx>` saves before termination: EVERY slot of
+    /// the child, not just slot 0 — with `-np N` the conversation lands
+    /// on a nondeterministic slot and a slot-0-only bank misses it (the
+    /// 2026-09-27 prod sweep caught exactly that). Each save is bounded
+    /// (2 s) and the sweep stops at `BANK_SAVE_TOTAL_BUDGET`; failures
+    /// cost a re-prefill, never the evict. A slot reporting `n_saved: 0`
+    /// held no cached prefix — its file is removed. The truth indicator
+    /// is the save response itself: the `/slots` listing's
+    /// `n_prompt_tokens_cache` reads 0 on idle slots even when a save
+    /// banks hundreds of tokens (live-probed on b11202).
     async fn bank_save(&self, inst: &Arc<Instance>) {
         if !self.config.session_bank || inst.in_flight.load(Ordering::SeqCst) > 0 {
             return;
         }
-        let file = self.bank_file(&inst.name, inst.profile_ctx);
-        let (client, base) = child_dial(&inst.endpoint);
-        let url = format!(
-            "{base}/slots/0?action=save&filename=_auto-{}",
-            inst.profile_ctx
-        );
-        let body = if self.config.router {
-            serde_json::json!({"filename": format!("_auto-{}", inst.profile_ctx), "model": inst.name})
-        } else {
-            serde_json::json!({"filename": format!("_auto-{}", inst.profile_ctx)})
-        };
-        let mut req = client
-            .post(&url)
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(2));
-        if let Some(secret) = &inst.auth {
-            req = req.bearer_auth(secret);
-        }
-        let mut saved = None;
-        let ok = match req.send().await {
-            Ok(resp) if resp.status().is_success() => {
-                saved = resp
-                    .json::<serde_json::Value>()
-                    .await
-                    .ok()
-                    .as_ref()
-                    .and_then(|v| slot_reported_tokens(v, "n_saved"));
-                true
-            }
-            _ => false,
-        };
-        if ok {
-            match saved {
-                Some(0) => tracing::warn!(
+        let slots = self.instance_slot_count(inst);
+        let t0 = std::time::Instant::now();
+        let mut banked_bytes = 0u64;
+        for id in 0..slots {
+            if t0.elapsed() > BANK_SAVE_TOTAL_BUDGET {
+                tracing::warn!(
                     target: "blazar::bank",
                     model = %inst.name,
-                    "bank save returned ok but wrote 0 tokens — the slot held no cached prefix to bank"
-                ),
-                Some(n) => tracing::debug!(
-                    target: "blazar::bank",
-                    model = %inst.name,
-                    "banked _auto-{} checkpoint: {n} tokens", inst.profile_ctx
-                ),
-                None => {}
+                    "bank sweep past budget — slots {id}..{slots} left unbanked"
+                );
+                break;
             }
-            // Hoard guard: a per-model bank over 512 MiB is storage
-            // abuse, not a cache — drop it and say so once.
-            if let Ok(md) = std::fs::metadata(&file) {
-                if md.len() > 512 * 1024 * 1024 {
-                    let _ = std::fs::remove_file(&file);
-                    tracing::warn!(target: "blazar::bank", model = %inst.name, "banked checkpoint > 512 MiB — dropped");
+            let filename = if id == 0 {
+                format!("_auto-{}", inst.profile_ctx)
+            } else {
+                format!("_auto-{}-s{id}", inst.profile_ctx)
+            };
+            let file = self.bank_slot_file(&inst.name, inst.profile_ctx, id);
+            let (client, base) = child_dial(&inst.endpoint);
+            let url = format!("{base}/slots/{id}?action=save&filename={filename}");
+            let body = if self.config.router {
+                serde_json::json!({"filename": filename, "model": inst.name})
+            } else {
+                serde_json::json!({"filename": filename})
+            };
+            let mut req = client
+                .post(&url)
+                .json(&body)
+                .timeout(std::time::Duration::from_secs(2));
+            if let Some(secret) = &inst.auth {
+                req = req.bearer_auth(secret);
+            }
+            let mut saved = None;
+            let ok = match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    saved = resp
+                        .json::<serde_json::Value>()
+                        .await
+                        .ok()
+                        .as_ref()
+                        .and_then(|v| slot_reported_tokens(v, "n_saved"));
+                    true
                 }
+                _ => false,
+            };
+            if !ok {
+                continue;
+            }
+            if saved == Some(0) {
+                // The slot held no cached prefix — drop the empty file.
+                let _ = std::fs::remove_file(&file);
+                continue;
+            }
+            if let Some(n) = saved {
+                tracing::debug!(
+                    target: "blazar::bank",
+                    model = %inst.name,
+                    "banked {filename} checkpoint: {n} tokens"
+                );
+            }
+            if let Ok(md) = std::fs::metadata(&file) {
+                banked_bytes += md.len();
             }
             // #20 identity manifest: stamp the shape so bank restores
             // can refuse stale KV (built from the LIVE instance ctx).
@@ -4220,13 +4936,21 @@ drop them from rpc_servers in config.toml",
                 }
             }
         }
+        // Hoard guard: a per-model bank set over 512 MiB is storage
+        // abuse, not a cache — drop the whole set and say so once.
+        if banked_bytes > 512 * 1024 * 1024 {
+            for id in 0..slots {
+                let _ = std::fs::remove_file(self.bank_slot_file(&inst.name, inst.profile_ctx, id));
+            }
+            tracing::warn!(
+                target: "blazar::bank",
+                model = %inst.name,
+                "banked set {} MiB across {slots} slots exceeds the 512 MiB cap — dropped",
+                banked_bytes / (1024 * 1024)
+            );
+        }
     }
 
-    /// Bank restore, choke point #2: after a fresh spawn reaches
-    /// readiness, a matching `_auto-<ctx>` is restored so the first
-    /// request rides warm KV. Warn-continue on any failure. A #20
-    /// identity mismatch SKIPS the restore — injecting KV from a
-    /// different runtime shape is worse than a cold start.
     /// Stop every instance (daemon shutdown). Bounded by grace per child.
     pub async fn shutdown_all(&self) -> Result<()> {
         let names: Vec<String> = self.instances.iter().map(|e| e.key().clone()).collect();
@@ -4252,6 +4976,30 @@ drop them from rpc_servers in config.toml",
         })
     }
 
+    /// F1 gate: the idle-to-RAM warm is pointless (and fights the
+    /// engine) under `direct-io`, which exists precisely to bypass the
+    /// page cache.
+    fn idle_ram_warm_enabled(config: &Config) -> bool {
+        config.idle_ram_warm && config.load_mode != "direct-io"
+    }
+
+    /// F1 primitive: sequentially read a file back into the OS page
+    /// cache. Returns the bytes re-paged. Plain buffered reads — the
+    /// kernel does the caching; the data itself is discarded.
+    fn repage_file(path: &std::path::Path) -> std::io::Result<u64> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)?;
+        let mut buf = vec![0u8; RAM_WARM_CHUNK_BYTES];
+        let mut total: u64 = 0;
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                return Ok(total);
+            }
+            total += n as u64;
+        }
+    }
+
     async fn reap_once(&self) {
         let now = Instant::now();
         // R3 session pins: drop expired windows first, then honor the
@@ -4262,7 +5010,7 @@ drop them from rpc_servers in config.toml",
         for expired in self.sessions.sweep(session_ttl) {
             tracing::debug!(target: "blazar::sessions", session = %expired, "session pin expired");
         }
-        let mut evictions: Vec<String> = Vec::new();
+        let mut evictions: Vec<(String, ModelRow)> = Vec::new();
         for entry in &self.instances {
             let inst = entry.value();
             if inst.in_flight.load(Ordering::SeqCst) > 0 {
@@ -4286,7 +5034,7 @@ drop them from rpc_servers in config.toml",
                 && !session_pinned
                 && !keep_alive
             {
-                evictions.push(inst.name.clone());
+                evictions.push((inst.name.clone(), inst.model.clone()));
             } else if idle >= Duration::from_secs(self.config.idle_sleep_secs)
                 && state == InstanceState::Ready
                 && self.hardware.has_gpu()
@@ -4302,10 +5050,15 @@ drop them from rpc_servers in config.toml",
                 });
             }
         }
-        for name in evictions {
+        for (name, row) in evictions {
             if let Err(e) = self.evict(&name).await {
                 tracing::error!(model = %name, "evict: {e:#}");
+                continue;
             }
+            // F1 RAM tier: refresh the evicted weights in the OS page
+            // cache so a re-spawn mmaps warm instead of faulting from
+            // storage. Best-effort, holds no VRAM.
+            self.warm_ram_after_evict(&name, &row);
         }
         // LC1/LC4 ride the 10s reaper tick.
         self.maybe_preload().await;
@@ -4534,6 +5287,83 @@ drop them from rpc_servers in config.toml",
                 tracing::warn!("predictive preload of {next} failed: {e:#}");
                 self.preload_failures.insert(next, Instant::now());
             }
+        }
+    }
+
+    /// F1 startup preload: spawn every model in `config.preload`, one at
+    /// a time, right after the listener binds. Warn-not-fail by
+    /// contract — an unknown name teaches `blazar pull`, a spawn that
+    /// cannot fit teaches the planner's verdict, and neither ever fails
+    /// the daemon. Idempotent: already-live models are skipped.
+    pub async fn preload_listed(&self) {
+        if self.config.preload.is_empty() {
+            return;
+        }
+        let names = self.config.preload.clone();
+        tracing::info!(count = names.len(), "startup preload list engaged");
+        for name in names {
+            if name == ROUTER_KEY
+                || self
+                    .instances
+                    .iter()
+                    .any(|i| model_of_key(i.key()) == name.as_str())
+            {
+                continue;
+            }
+            match self.spawn_instance(&name).await {
+                Ok(_) => {
+                    tracing::info!(model = %name, "startup preload: resident before first request");
+                }
+                Err(e) => tracing::warn!(
+                    model = %name,
+                    "startup preload failed: {e:#} — pull it first: blazar pull {name}"
+                ),
+            }
+        }
+    }
+
+    /// F1 idle-to-RAM tier: after the idle ladder evicts a child, the
+    /// kernel page cache usually still holds the weights — but under
+    /// memory pressure it may not. A sequential re-read refreshes the
+    /// RAM tier so the next spawn faults from memory, not storage.
+    /// Detached and single-flight per path; holds no VRAM.
+    fn warm_ram_after_evict(&self, model: &str, row: &ModelRow) {
+        if !Self::idle_ram_warm_enabled(&self.config) || model == ROUTER_KEY {
+            return;
+        }
+        let mut paths = vec![std::path::PathBuf::from(&row.path)];
+        if let Some(mmproj) = row.mmproj_path.as_deref() {
+            paths.push(std::path::PathBuf::from(mmproj));
+        }
+        for path in paths {
+            let key = path.display().to_string();
+            match self.ram_warming.entry(key.clone()) {
+                dashmap::mapref::entry::Entry::Occupied(_) => continue,
+                dashmap::mapref::entry::Entry::Vacant(slot) => {
+                    slot.insert(());
+                }
+            }
+            if !path.is_file() {
+                self.ram_warming.remove(&key);
+                continue;
+            }
+            let guard = Arc::clone(&self.ram_warming);
+            let model = model.to_string();
+            tokio::task::spawn_blocking(move || {
+                let started = std::time::Instant::now();
+                match Self::repage_file(&path) {
+                    Ok(bytes) => tracing::debug!(
+                        model = %model,
+                        bytes,
+                        ms = started.elapsed().as_millis(),
+                        "idle-to-RAM warm: weights re-paged into the OS cache"
+                    ),
+                    Err(e) => {
+                        tracing::debug!(model = %model, "idle-to-RAM warm skipped: {e}");
+                    }
+                }
+                guard.remove(&key);
+            });
         }
     }
 
@@ -7990,5 +8820,510 @@ mod routing_tests {
         let pre = hw_of(vec![gpu("dg", "NVIDIA A", 8_000, 7_000)]);
         let post = hw_of(Vec::new());
         assert!(settle_report(&pre, &post, Some("dg")).is_none());
+    }
+
+    #[test]
+    fn unit__model_hints__per_model_wins_and_global_fallback() {
+        let sup = routing_sup(1);
+        assert_eq!(sup.cache_hint_for("m"), None, "nothing measured anywhere");
+        sup.cache_hint.set(0.5);
+        assert_eq!(sup.cache_hint_for("m"), Some(0.5), "unseen model -> global");
+        sup.set_model_hints("m", Some(0.9), None);
+        assert_eq!(
+            sup.cache_hint_for("m"),
+            Some(0.9),
+            "measured model -> own hint"
+        );
+        assert_eq!(
+            sup.cache_hint_for("other"),
+            Some(0.5),
+            "other models keep the global fallback"
+        );
+        // An entry created by an accept-only write still falls back for
+        // cache (that model's cache was never measured).
+        sup.set_model_hints("spec-only", None, Some(0.4));
+        assert_eq!(sup.cache_hint_for("spec-only"), Some(0.5));
+        assert_eq!(sup.accept_hint_for("spec-only"), Some(0.4));
+        assert_eq!(
+            sup.accept_hint_for("m"),
+            None,
+            "accept never measured for m"
+        );
+    }
+
+    #[test]
+    fn unit__model_hints__snapshot_sorted_and_shaped() {
+        let sup = routing_sup(1);
+        sup.set_model_hints("zeta", Some(0.2), Some(0.8));
+        sup.set_model_hints("alpha", Some(0.7), None);
+        sup.note_model_throughput("zeta", 120, 0.5);
+        let rows = sup.model_hint_snapshot();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "alpha", "sorted by model name");
+        assert_eq!(rows[0].1, Some(0.7));
+        assert_eq!(rows[0].2, None);
+        assert_eq!(rows[0].3, None, "alpha never served a completion");
+        assert_eq!(rows[1].0, "zeta");
+        assert_eq!(rows[1].2, Some(0.8));
+        assert_eq!(rows[1].3, Some(240.0), "120 tokens over 0.5s");
+    }
+
+    #[test]
+    fn unit__model_hints__none_windows_keep_last_value() {
+        let sup = routing_sup(1);
+        sup.set_model_hints("m", Some(0.9), Some(0.6));
+        // Idle/dense window: both None — nothing may zero out.
+        sup.set_model_hints("m", None, None);
+        assert_eq!(sup.cache_hint_for("m"), Some(0.9));
+        assert_eq!(sup.accept_hint_for("m"), Some(0.6));
+    }
+
+    #[test]
+    fn unit__note_model_throughput__ewma_blends_and_guards() {
+        let sup = routing_sup(1);
+        // Degenerate observations are dropped, never recorded as zeroes.
+        sup.note_model_throughput("m", 0, 1.0);
+        sup.note_model_throughput("m", 10, 0.0);
+        sup.note_model_throughput("m", 10, f64::NAN);
+        assert_eq!(sup.decode_rate_for("m"), None, "no valid observation yet");
+        assert_eq!(
+            sup.decode_rate_for("unseen"),
+            None,
+            "decode never falls back across models"
+        );
+        // Seed: 100 tokens over 1s.
+        sup.note_model_throughput("m", 100, 1.0);
+        assert_eq!(sup.decode_rate_for("m"), Some(100.0));
+        // Blend: 200 tok/s sample -> 0.7*100 + 0.3*200 = 130.
+        sup.note_model_throughput("m", 200, 1.0);
+        assert_eq!(sup.decode_rate_for("m"), Some(130.0));
+    }
+
+    #[test]
+    fn unit__route_cost__taxonomy() {
+        // Neutral rate: unmeasured model, no pressure, 100 output tokens
+        // -> 100/50 = 2.0s exactly, prefill fully cached away.
+        let base = route_cost(None, Some(1.0), 0, 4, 1_000, 100);
+        assert!((base - 2.0).abs() < 1e-9, "got {base}");
+        // Queue depth adds half a second per queued admission.
+        let queued = route_cost(None, Some(1.0), 2, 4, 1_000, 100);
+        assert!((queued - base - 1.0).abs() < 1e-9, "got {queued}");
+        // Zero headroom under demand adds the starved-slot penalty.
+        let starved = route_cost(None, Some(1.0), 1, 0, 1_000, 100);
+        assert!((starved - base - 0.5 - 1.0).abs() < 1e-9, "got {starved}");
+        // Zero headroom alone (no demand) must NOT starve.
+        let idle_starve = route_cost(None, Some(1.0), 0, 0, 1_000, 100);
+        assert!((idle_starve - base).abs() < 1e-9, "got {idle_starve}");
+        // Uncached prefill bills prompt tokens at rate*4 per token.
+        let uncached = route_cost(Some(50.0), None, 0, 4, 1_000, 100);
+        assert!((uncached - 2.0 - 5.0).abs() < 1e-9, "got {uncached}");
+        // A faster model is strictly cheaper for the same ask.
+        let faster = route_cost(Some(100.0), None, 0, 4, 1_000, 100);
+        assert!(faster < uncached);
+        // Monotonic in expected output.
+        let longer = route_cost(Some(50.0), None, 0, 4, 1_000, 200);
+        assert!(longer > uncached);
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__spec_governor__saturation_streak_parks_and_queues() {
+        let mut sup = routing_sup(1);
+        sup.config.spec_auto_manage = true;
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 5);
+        Arc::get_mut(&mut inst).expect("sole owner").argv = vec![
+            "llama-server".into(),
+            "-np".into(),
+            "4".into(),
+            "--ctx-size".into(),
+            "65536".into(),
+        ];
+        sup.instances.insert("m".into(), inst);
+        // Window 1: streak builds, no action yet.
+        sup.spec_governor_window("m", None);
+        assert!(sup.spec_override.get("m").is_none());
+        assert_eq!(
+            sup.spec_governor_snapshot(),
+            vec![("m".to_string(), false)],
+            "watching after one bad window"
+        );
+        // Window 2: threshold — parked, reshape queued for the live key.
+        sup.spec_governor_window("m", None);
+        assert_eq!(
+            sup.spec_override.get("m").map(|v| v.value().clone()),
+            Some("off".to_string())
+        );
+        assert_eq!(
+            sup.reshape_queue.get("m").map(|v| v.value().clone()),
+            Some("m".to_string())
+        );
+        assert_eq!(sup.spec_governor_snapshot(), vec![("m".to_string(), true)]);
+        kill_all(&[ph]);
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__spec_governor__accept_collapse_parks_without_saturation() {
+        let mut sup = routing_sup(1);
+        sup.config.spec_auto_manage = true;
+        // No instances at all: nothing saturated — only the acceptance
+        // floor breach can fire (a spec child reporting 0.10).
+        sup.spec_governor_window("m", Some(0.10));
+        sup.spec_governor_window("m", Some(0.12));
+        assert_eq!(
+            sup.spec_override.get("m").map(|v| v.value().clone()),
+            Some("off".to_string())
+        );
+        // Healthy acceptance never builds a streak.
+        sup.spec_override.remove("m");
+        sup.spec_gov.remove("m");
+        for _ in 0..5 {
+            sup.spec_governor_window("m", Some(0.9));
+        }
+        assert!(sup.spec_override.get("m").is_none());
+        assert!(sup.spec_governor_snapshot().is_empty());
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__spec_governor__knob_off_is_inert() {
+        let sup = routing_sup(1); // spec_auto_manage defaults false
+        let (inst, ph) = fake_instance("m", InstanceState::Ready, 9);
+        sup.instances.insert("m".into(), inst);
+        for _ in 0..5 {
+            sup.spec_governor_window("m", Some(0.01));
+        }
+        assert!(sup.spec_override.get("m").is_none());
+        assert!(sup.spec_governor_snapshot().is_empty());
+        kill_all(&[ph]);
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__spec_governor__overlay_pin_and_config_off_exempt() {
+        // Overlay pin: a user policy statement — never governed.
+        let mut sup = routing_sup(1);
+        sup.config.spec_auto_manage = true;
+        sup.config.model_overrides.insert(
+            "m".into(),
+            ModelOverride {
+                spec: Some("ngram".into()),
+                ..Default::default()
+            },
+        );
+        let (inst, ph) = fake_instance("m", InstanceState::Ready, 9);
+        sup.instances.insert("m".into(), inst);
+        for _ in 0..3 {
+            sup.spec_governor_window("m", Some(0.01));
+        }
+        assert!(sup.spec_override.get("m").is_none());
+        kill_all(&[ph]);
+
+        // Global config already dense: nothing to manage.
+        let mut sup = routing_sup(1);
+        sup.config.spec_auto_manage = true;
+        sup.config.spec = "off".into();
+        let (inst, ph) = fake_instance("m", InstanceState::Ready, 9);
+        sup.instances.insert("m".into(), inst);
+        for _ in 0..3 {
+            sup.spec_governor_window("m", None);
+        }
+        assert!(sup.spec_override.get("m").is_none());
+        kill_all(&[ph]);
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__spec_governor__recovers_after_quiet_streak_and_resets_on_bad_window() {
+        let mut sup = routing_sup(1);
+        sup.config.spec_auto_manage = true;
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 0);
+        Arc::get_mut(&mut inst).expect("sole owner").argv = vec![
+            "llama-server".into(),
+            "-np".into(),
+            "4".into(),
+            "--ctx-size".into(),
+            "65536".into(),
+        ];
+        sup.instances.insert("m".into(), inst);
+        sup.spec_override.insert("m".into(), "off".into());
+
+        // Parked: one bad window (acceptance collapse) resets the
+        // recover streak; then quiet windows rebuild it from zero.
+        sup.spec_governor_window("m", Some(0.9)); // quiet: streak = 1
+        sup.spec_governor_window("m", Some(0.1)); // bad: reset
+        for _ in 0..(SPEC_GOV_RECOVER_STREAK - 1) {
+            sup.spec_governor_window("m", Some(0.9));
+        }
+        assert!(
+            sup.spec_override.get("m").is_some(),
+            "one window short of recovery"
+        );
+        sup.spec_governor_window("m", Some(0.9));
+        assert!(sup.spec_override.get("m").is_none());
+        assert_eq!(
+            sup.reshape_queue.get("m").map(|v| v.value().clone()),
+            Some("m".to_string()),
+            "recovery queues the restore reshape"
+        );
+        kill_all(&[ph]);
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[test]
+    fn unit__governed_spec_default__override_then_config() {
+        let sup = routing_sup(1);
+        assert_eq!(sup.governed_spec_default("m"), sup.config.spec);
+        sup.spec_override.insert("m".into(), "off".into());
+        assert_eq!(sup.governed_spec_default("m"), "off");
+        assert_eq!(sup.governed_spec_default("other"), sup.config.spec);
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[test]
+    fn unit__spec_governor_snapshot__sorted_and_labeled() {
+        let sup = routing_sup(1);
+        sup.spec_gov
+            .insert("zeta".to_string(), SpecGovState::default());
+        sup.spec_override
+            .insert("alpha".to_string(), "off".to_string());
+        // A model with both streak state and an override reports parked
+        // once (no duplicate rows).
+        sup.spec_gov
+            .insert("alpha".to_string(), SpecGovState::default());
+        assert_eq!(
+            sup.spec_governor_snapshot(),
+            vec![("alpha".to_string(), true), ("zeta".to_string(), false),]
+        );
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__ubatch_governor__saturation_streak_escalates_rung_by_rung() {
+        let mut sup = routing_sup(1);
+        sup.config.ubatch_auto = true;
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 5);
+        Arc::get_mut(&mut inst).expect("sole owner").argv = vec![
+            "llama-server".into(),
+            "-np".into(),
+            "4".into(),
+            "--ctx-size".into(),
+            "65536".into(),
+        ];
+        sup.instances.insert("m".into(), inst);
+        // Two saturated windows reach rung 1 (1024) and queue a reshape.
+        sup.ubatch_governor_window("m");
+        assert_eq!(sup.governed_ubatch("m"), None, "streak builds first");
+        sup.ubatch_governor_window("m");
+        assert_eq!(sup.governed_ubatch("m"), Some(1024));
+        assert_eq!(
+            sup.reshape_queue.get("m").map(|v| v.value().clone()),
+            Some("m".to_string())
+        );
+        assert_eq!(
+            sup.ubatch_governor_snapshot(),
+            vec![("m".to_string(), 1024)]
+        );
+        // Another streak reaches the top rung (2048)…
+        sup.ubatch_governor_window("m");
+        sup.ubatch_governor_window("m");
+        assert_eq!(sup.governed_ubatch("m"), Some(2048));
+        // …and a further streak holds there without looping.
+        sup.ubatch_governor_window("m");
+        sup.ubatch_governor_window("m");
+        assert_eq!(sup.governed_ubatch("m"), Some(2048));
+        kill_all(&[ph]);
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__ubatch_governor__knob_off_is_inert() {
+        let sup = routing_sup(1); // ubatch_auto defaults false
+        let (inst, ph) = fake_instance("m", InstanceState::Ready, 9);
+        sup.instances.insert("m".into(), inst);
+        for _ in 0..5 {
+            sup.ubatch_governor_window("m");
+        }
+        assert_eq!(sup.governed_ubatch("m"), None);
+        assert!(sup.ubatch_governor_snapshot().is_empty());
+        kill_all(&[ph]);
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__ubatch_governor__config_pin_is_exempt() {
+        let mut sup = routing_sup(1);
+        sup.config.ubatch_auto = true;
+        sup.config.ubatch_size = 512;
+        // A stale override from before the pin is cleared, never acted on.
+        sup.ubatch_override.insert("m".into(), 2048);
+        let (inst, ph) = fake_instance("m", InstanceState::Ready, 9);
+        sup.instances.insert("m".into(), inst);
+        for _ in 0..3 {
+            sup.ubatch_governor_window("m");
+        }
+        assert_eq!(sup.governed_ubatch("m"), None, "pin clears stale state");
+        assert!(sup.ubatch_governor_snapshot().is_empty());
+        kill_all(&[ph]);
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__ubatch_governor__quiet_streak_steps_down_one_rung() {
+        let mut sup = routing_sup(1);
+        sup.config.ubatch_auto = true;
+        sup.ubatch_override.insert("m".into(), 2048);
+        // A live (idle) instance so step-downs have something to reshape;
+        // load 0 keeps it unsaturated — every window is quiet.
+        let (inst, ph) = fake_instance("m", InstanceState::Ready, 0);
+        sup.instances.insert("m".into(), inst);
+        for _ in 0..(UBATCH_GOV_RECOVER_STREAK - 1) {
+            sup.ubatch_governor_window("m");
+        }
+        assert_eq!(
+            sup.governed_ubatch("m"),
+            Some(2048),
+            "9 quiet hold the tier"
+        );
+        sup.ubatch_governor_window("m");
+        assert_eq!(
+            sup.governed_ubatch("m"),
+            Some(1024),
+            "10th steps down one rung"
+        );
+        assert_eq!(
+            sup.reshape_queue.get("m").map(|v| v.value().clone()),
+            Some("m".to_string()),
+            "step-down queues the reshape"
+        );
+        // A second full streak returns to the engine default.
+        for _ in 0..UBATCH_GOV_RECOVER_STREAK {
+            sup.ubatch_governor_window("m");
+        }
+        assert_eq!(sup.governed_ubatch("m"), None);
+        assert!(sup.ubatch_governor_snapshot().is_empty());
+        kill_all(&[ph]);
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[test]
+    fn unit__ubatch_governor_snapshot__sorted() {
+        let sup = routing_sup(1);
+        sup.ubatch_override.insert("zeta".to_string(), 1024);
+        sup.ubatch_override.insert("alpha".to_string(), 2048);
+        assert_eq!(
+            sup.ubatch_governor_snapshot(),
+            vec![("alpha".to_string(), 2048), ("zeta".to_string(), 1024)]
+        );
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[test]
+    fn unit__prefix_affinity__eviction_does_not_deadlock() {
+        let sup = routing_sup(1);
+        // Fill to cap; every call past the cap walks the eviction path.
+        // Under the old if-let-held-Ref shape the cap-crossing call
+        // self-deadlocked on the dashmap shard and this test hung.
+        for convo in 0..PREFIX_AFFINITY_CAP as u64 {
+            sup.note_prefix_affinity(&PrefixKey { sys: 1, convo }, "m");
+        }
+        assert_eq!(sup.prefix_affinity.len(), PREFIX_AFFINITY_CAP);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            sup.note_prefix_affinity(
+                &PrefixKey {
+                    sys: 1,
+                    convo: PREFIX_AFFINITY_CAP as u64,
+                },
+                "m",
+            );
+            tx.send(()).expect("test channel alive");
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("eviction deadlocked: dashmap Ref held across remove");
+        handle.join().expect("affinity thread");
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[test]
+    fn unit__note_transition__cap_eviction_does_not_deadlock() {
+        let sup = routing_sup(1);
+        // Consecutive distinct names build one edge per pair; CAP calls
+        // fill the table and the next call crosses into eviction.
+        for i in 0..=TRANSITIONS_CAP {
+            sup.note_transition(&format!("m{i}"));
+        }
+        assert_eq!(sup.transitions.len(), TRANSITIONS_CAP);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            sup.note_transition("final-edge");
+            tx.send(()).expect("test channel alive");
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("eviction deadlocked: dashmap Ref held across remove");
+        handle.join().expect("transitions thread");
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[test]
+    fn unit__idle_ram_warm__gate_respects_knob_and_load_mode() {
+        let mut cfg = Config::default();
+        assert!(Supervisor::idle_ram_warm_enabled(&cfg)); // on by default
+        cfg.idle_ram_warm = false;
+        assert!(!Supervisor::idle_ram_warm_enabled(&cfg));
+        cfg.idle_ram_warm = true;
+        // direct-io exists to bypass the page cache — warming it would
+        // fight the configured policy.
+        cfg.load_mode = "direct-io".into();
+        assert!(!Supervisor::idle_ram_warm_enabled(&cfg));
+        cfg.load_mode = "mlock".into();
+        assert!(Supervisor::idle_ram_warm_enabled(&cfg));
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[test]
+    fn unit__repage_file__reads_whole_file_in_chunks() {
+        // 9 MiB + change: crosses the 4 MiB warm chunk boundary twice.
+        let payload: Vec<u8> = (0..9usize * 1024 * 1024 + 123)
+            .map(|i| u8::try_from(i % 251).expect("i % 251 < 256"))
+            .collect();
+        let tmp = tempfile::NamedTempFile::new().expect("temp file");
+        std::fs::write(tmp.path(), &payload).expect("write payload");
+        assert_eq!(
+            Supervisor::repage_file(tmp.path()).expect("repage ok"),
+            payload.len() as u64
+        );
+        let missing = Supervisor::repage_file(std::path::Path::new("/nonexistent/w.gguf"));
+        assert!(missing.is_err());
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[test]
+    fn unit__bank_slot_of__legacy_suffixed_and_foreign() {
+        use std::ffi::OsStr;
+        // Legacy slot-0 name keeps its meaning: Some(0).
+        assert_eq!(
+            Supervisor::bank_slot_of(OsStr::new("_auto-16384"), 16384),
+            Some(0)
+        );
+        // Suffixed members map to their slot id.
+        assert_eq!(
+            Supervisor::bank_slot_of(OsStr::new("_auto-16384-s1"), 16384),
+            Some(1)
+        );
+        assert_eq!(
+            Supervisor::bank_slot_of(OsStr::new("_auto-16384-s17"), 16384),
+            Some(17)
+        );
+        // Different ctx, user checkpoints, manifests: not part of the set.
+        assert_eq!(
+            Supervisor::bank_slot_of(OsStr::new("_auto-8192-s1"), 16384),
+            None
+        );
+        assert_eq!(Supervisor::bank_slot_of(OsStr::new("conv1"), 16384), None);
+        assert_eq!(
+            Supervisor::bank_slot_of(OsStr::new("_auto-16384.identity.json"), 16384),
+            None
+        );
     }
 }
