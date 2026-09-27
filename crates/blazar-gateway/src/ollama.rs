@@ -26,7 +26,7 @@ use crate::state::AppState;
 use crate::translate as tr;
 use crate::TraceId;
 
-fn api_error(status: u16, message: &str) -> Response {
+pub(crate) fn api_error(status: u16, message: &str) -> Response {
     (
         StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
         axum::Json(json!({"error": message})),
@@ -782,6 +782,21 @@ pub async fn chat(
         Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
     };
     let model_field = req["model"].as_str().unwrap_or_default().to_string();
+    // A3 cascade routing: a chain ask re-enters this handler per
+    // candidate (each pays its own admission against its resolved row)
+    // and serves the first answer that passes the judge; no chain ask
+    // falls through to the single-model path untouched.
+    if let Some(resp) = crate::cascade::run(
+        &state,
+        trace_ext.clone(),
+        key_ext.clone(),
+        headers.clone(),
+        &req,
+    )
+    .await
+    {
+        return resp;
+    }
     // Key admission resolved ONCE, before any lane decision (F11): the
     // remote branch below needs it too — previously `remote:<model>`
     // requests bypassed scope/rate/request-count entirely.
@@ -3446,6 +3461,14 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         "# HELP blazar_bestof_fanouts_total Best-of-N request fan-outs engaged\n# TYPE blazar_bestof_fanouts_total counter\nblazar_bestof_fanouts_total {}\n# HELP blazar_bestof_degraded_total Best-of-N fan-outs degraded below the asked candidate count\n# TYPE blazar_bestof_degraded_total counter\nblazar_bestof_degraded_total {}",
         crate::bestof::FANOUT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
         crate::bestof::FANOUT_DEGRADED.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    // A3 cascade routing totals: chains run and chains that had to
+    // escalate past their first candidate.
+    let _ = writeln!(
+        merged,
+        "# HELP blazar_cascade_runs_total Cascade chains run\n# TYPE blazar_cascade_runs_total counter\nblazar_cascade_runs_total {}\n# HELP blazar_cascade_escalations_total Cascade chains served past their first candidate\n# TYPE blazar_cascade_escalations_total counter\nblazar_cascade_escalations_total {}",
+        crate::cascade::CASCADE_RUNS.load(std::sync::atomic::Ordering::Relaxed),
+        crate::cascade::CASCADE_ESCALATIONS.load(std::sync::atomic::Ordering::Relaxed),
     );
     engine_build_gauge(&state, &mut merged);
     (

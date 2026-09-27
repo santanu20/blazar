@@ -1077,3 +1077,169 @@ async fn integration__decode_rate__gauge_moves_after_a_completion() {
     );
     ts.state.sup.shutdown_all().await.unwrap();
 }
+
+// --- A3 cascade routing ------------------------------------------------
+
+/// Stage a second stub-backed model sharing m1's gguf (the stub child
+/// never reads it; the row is what routing resolves).
+fn stage_second_model(ts: &TestServer) {
+    let path = ts
+        .state
+        .with_store(|s| s.get_model("m1").ok().flatten().map(|r| r.path))
+        .flatten()
+        .expect("m1 staged by harness");
+    ts.state
+        .with_store(|s| {
+            s.upsert_model(&blazar_core::ModelRow {
+                name: "m2".into(),
+                repo: "o/m2".into(),
+                quant: "Q4_K_M".into(),
+                path,
+                bytes: 500_000_000,
+                sha256: None,
+                mmproj_path: None,
+                components: vec![],
+                shards: 1,
+                arch: Some("qwen3".into()),
+                params: Some(0.5),
+                ctx_train: Some(40_960),
+                pulled_at: 1,
+            })
+            .unwrap();
+        })
+        .expect("store available");
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__cascade__first_pass_serves_small_model() {
+    let ts = start(Config::default(), &[], false).await;
+    stage_second_model(&ts);
+    let c = client();
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "cascade": ["m1", "m2"],
+            "messages": [{"role": "user", "content": "hello cascade world"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let hdr = resp
+        .headers()
+        .get("x-blazar-cascade")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        hdr.contains("tried=m1,m2")
+            && hdr.contains("served=m1")
+            && hdr.contains("reason=first-pass"),
+        "header: {hdr}"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["message"]["content"].is_string(),
+        "winner body passes through: {body}"
+    );
+    let metrics = c
+        .get(format!("{}/metrics", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("blazar_cascade_runs_total"),
+        "cascade counters exported"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__cascade__unknown_first_candidate_escalates() {
+    let ts = start(Config::default(), &[], false).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "cascade": ["no-such-model", "m1"],
+            "messages": [{"role": "user", "content": "escalate me"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let hdr = resp
+        .headers()
+        .get("x-blazar-cascade")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        hdr.contains("served=m1") && hdr.contains("reason=escalated"),
+        "header: {hdr}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__cascade__header_pins_the_order() {
+    let ts = start(Config::default(), &[], false).await;
+    stage_second_model(&ts);
+    let c = client();
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .header("x-blazar-cascade", "m2, m1")
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "messages": [{"role": "user", "content": "header order"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let hdr = resp
+        .headers()
+        .get("x-blazar-cascade")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        hdr.contains("tried=m2,m1") && hdr.contains("served=m2"),
+        "header must pin the chain order: {hdr}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__cascade__stream_plus_cascade_is_rejected() {
+    let ts = start(Config::default(), &[], false).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": true,
+            "cascade": ["m1", "m2"],
+            "messages": [{"role": "user", "content": "no streaming cascades"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let msg = body["error"].as_str().unwrap_or_default();
+    assert!(msg.contains("stream=false"), "teaching error: {msg}");
+    ts.state.sup.shutdown_all().await.unwrap();
+}

@@ -6,6 +6,7 @@ pub mod audit;
 pub mod batch;
 pub mod bestof;
 pub mod cache_bust;
+pub mod cascade;
 pub mod histogram;
 pub mod http_pool;
 pub mod images;
