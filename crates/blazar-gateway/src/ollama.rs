@@ -1710,6 +1710,17 @@ async fn proxy_core_chat(
             ),
             None => state.obs.miss(),
         }
+        // A2: blend this completion's decode rate into the model's EWMA
+        // (completion tokens over child-send wall time — t0 predates the
+        // fan/single send, so queue wait upstream of it stays excluded).
+        if let Some(n) = openai
+            .pointer("/usage/completion_tokens")
+            .and_then(Value::as_u64)
+        {
+            state
+                .sup
+                .note_model_throughput(model, n, t0.elapsed().as_secs_f64());
+        }
         // Non-stream + enforce: judge before translation (streaming stays
         // warn-only — bytes are already on the wire).
         if enforce {
@@ -3365,15 +3376,15 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         "blazar_spec_accept_rate",
         "Windowed speculative-decoding acceptance rate (accepted / drafted tokens)",
     );
-    // C1 per-model split: the same two rates keyed by the engine-reported
+    // C1 per-model split: the same rates keyed by the engine-reported
     // model name (multi-model boxes steer --cache-ram and spec policy per
     // model; the unlabeled merged lines above remain the box-wide truth).
     let rows = state.sup.model_hint_snapshot();
-    if rows.iter().any(|(_, cache, _)| cache.is_some()) {
+    if rows.iter().any(|(_, cache, ..)| cache.is_some()) {
         merged.push_str(
             "# HELP blazar_prefix_cache_hit_rate_per_model Windowed prompt-cache hit rate per model\n# TYPE blazar_prefix_cache_hit_rate_per_model gauge\n",
         );
-        for (model, cache, _) in &rows {
+        for (model, cache, ..) in &rows {
             if let Some(rate) = cache {
                 let _ = writeln!(
                     merged,
@@ -3382,15 +3393,31 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
             }
         }
     }
-    if rows.iter().any(|(_, _, accept)| accept.is_some()) {
+    if rows.iter().any(|(_, _, accept, _)| accept.is_some()) {
         merged.push_str(
             "# HELP blazar_spec_accept_rate_per_model Windowed speculative-decoding acceptance rate per model\n# TYPE blazar_spec_accept_rate_per_model gauge\n",
         );
-        for (model, _, accept) in &rows {
+        for (model, _, accept, _) in &rows {
             if let Some(rate) = accept {
                 let _ = writeln!(
                     merged,
                     "blazar_spec_accept_rate_per_model{{model=\"{model}\"}} {rate:.4}"
+                );
+            }
+        }
+    }
+    // A2 per-model decode throughput (EWMA of completion tokens per
+    // wall-second). Feeds route_cost ordering for cascade/routing
+    // decisions; absent until the model has served a completion.
+    if rows.iter().any(|(.., decode)| decode.is_some()) {
+        merged.push_str(
+            "# HELP blazar_model_decode_tokens_per_second EWMA of completion tokens per wall-second per model\n# TYPE blazar_model_decode_tokens_per_second gauge\n",
+        );
+        for (model, .., decode) in &rows {
+            if let Some(rate) = decode {
+                let _ = writeln!(
+                    merged,
+                    "blazar_model_decode_tokens_per_second{{model=\"{model}\"}} {rate:.3}"
                 );
             }
         }

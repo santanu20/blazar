@@ -1090,8 +1090,7 @@ async fn slots_action(
     // per-model dir so the /api/session listing never sees it.
     let tape = base
         .parent()
-        .map(|p| p.join("_stub_tape.log"))
-        .unwrap_or_else(|| base.join("_stub_tape.log"));
+        .map_or_else(|| base.join("_stub_tape.log"), |p| p.join("_stub_tape.log"));
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

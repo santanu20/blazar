@@ -1020,6 +1020,13 @@ pub async fn responses_api(
     let usage = out.get("usage").cloned().unwrap_or(serde_json::Value::Null);
     let in_tok = usage["input_tokens"].as_u64();
     let out_tok = usage["output_tokens"].as_u64();
+    // A2: blend the completion's decode rate into the model's EWMA
+    // (t0 predates the fan/single send on this branch).
+    if let Some(n) = out_tok {
+        state
+            .sup
+            .note_model_throughput(&model_name, n, t0.elapsed().as_secs_f64());
+    }
     // FIX6: this buffered branch bypasses proxy_request's sniffer —
     // charge token budgets directly from the parsed usage.
     if let Some(Extension(k)) = key_ext.as_ref() {

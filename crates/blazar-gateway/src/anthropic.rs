@@ -208,6 +208,9 @@ pub async fn messages(
     // transport failure) falls through to the single-send path below; a
     // guard degrade still stamps the reason header.
     let mut bestof_hdr: Option<String> = None;
+    // A2: wall anchor for the decode-throughput observation below —
+    // predates both the fan and the single send.
+    let t0 = std::time::Instant::now();
     let fan = if let Some(want) = best_of.filter(|n| *n >= 2) {
         crate::bestof::fan_out(
             &state,
@@ -258,6 +261,15 @@ pub async fn messages(
         return r;
     }
     let translated = translate_response(&openai, &model);
+    // A2: blend the completion's decode rate into the model's EWMA.
+    if let Some(n) = openai
+        .pointer("/usage/completion_tokens")
+        .and_then(Value::as_u64)
+    {
+        state
+            .sup
+            .note_model_throughput(&model, n, t0.elapsed().as_secs_f64());
+    }
     let mut resp = (StatusCode::OK, axum::Json(translated)).into_response();
     crate::bestof::stamp(&mut resp, bestof_hdr.as_deref());
     resp

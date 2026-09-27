@@ -1041,3 +1041,39 @@ async fn integration__startup_preload__unknown_name_warns_and_lives_on() {
     assert!(r["choices"][0]["message"]["content"].is_string());
     ts.state.sup.shutdown_all().await.unwrap();
 }
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__decode_rate__gauge_moves_after_a_completion() {
+    // A2: one non-stream completion must blend into the model's decode
+    // EWMA and surface as the per-model gauge line (the pure math and
+    // guards carry their own unit pins; this proves the wiring end to
+    // end through the ollama lane).
+    let ts = start(Config::default(), &[], false).await;
+    let c = client();
+    let ask = serde_json::json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{"role": "user", "content": "hello throughput world"}],
+    });
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&ask)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let metrics = c
+        .get(format!("{}/metrics", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("blazar_model_decode_tokens_per_second{model=\"m1\"}"),
+        "decode-rate gauge must carry the served model's label"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}

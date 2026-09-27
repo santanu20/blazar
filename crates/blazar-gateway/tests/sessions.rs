@@ -251,8 +251,8 @@ async fn integration__bank_multislot__saves_and_restores_every_slot() {
         .join(blazar_core::profile::path_safe("m1"));
     let entries: Vec<String> = std::fs::read_dir(&bank_dir)
         .expect("sessions dir exists")
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter_map(std::result::Result::ok)
+        .filter(|e| matches!(e.file_type(), Ok(t) if t.is_file()))
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.starts_with("_auto-") && !n.ends_with(".identity.json"))
         .collect();

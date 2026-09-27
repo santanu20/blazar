@@ -82,6 +82,53 @@ pub fn resolve_spec_mode(queued: Option<String>, overlay: Option<String>, config
     queued.or(overlay).unwrap_or_else(|| config.to_string())
 }
 
+/// Neutral decode rate (tok/s) assumed by [`route_cost`] when a model
+/// has no measured throughput yet: a small-model-ish floor that keeps
+/// cost ORDERING sane instead of making unmeasured models look
+/// infinitely slow (or infinitely fast).
+pub const NEUTRAL_DECODE_RATE: f64 = 50.0;
+
+/// Prefill processes tokens in parallel batches while decode is
+/// autoregressive; ~4x is the planning constant used to convert a
+/// decode-rate hint into a prefill-rate estimate.
+const PREFILL_SPEEDUP: f64 = 4.0;
+
+/// A2 joint routing/KV cost estimate in seconds (lower = better
+/// candidate): queued-wait + starved-slot penalty + uncached prefill +
+/// decode, blending the model's measured decode rate and prompt-cache
+/// hit with the live admission snapshot the caller took. Pure on
+/// purpose — callers snapshot `queue_depth`/`headroom` at decision
+/// time, never re-derived here, so the tiering is pinnable.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::similar_names,
+    reason = "token counts fit f64 exactly; queue_wait vs starved naming mirrors the concepts"
+)]
+#[must_use]
+pub fn route_cost(
+    rate: Option<f64>,
+    cache: Option<f64>,
+    queue_depth: u64,
+    headroom: u32,
+    prompt_tokens: u64,
+    expected_output: u64,
+) -> f64 {
+    let rate = rate.unwrap_or(NEUTRAL_DECODE_RATE).max(1.0);
+    // Each queued admission ahead of this one is ~half a decode second
+    // of expected wait on a local box; a starved slot pool (zero
+    // headroom under demand) adds a respawn-shaped penalty.
+    let queue_wait = f64::from(u32::try_from(queue_depth).unwrap_or(u32::MAX)) * 0.5;
+    let starved = if headroom == 0 && queue_depth > 0 {
+        1.0
+    } else {
+        0.0
+    };
+    let cached = cache.unwrap_or(0.0).clamp(0.0, 1.0);
+    let prefill = prompt_tokens as f64 * (1.0 - cached) / (rate * PREFILL_SPEEDUP);
+    let decode = expected_output as f64 / rate;
+    queue_wait + starved + prefill + decode
+}
+
 /// Instance key for the single router-mode child (never a model name:
 /// underscore prefix is invalid in HF repo names).
 pub const ROUTER_KEY: &str = "_router";
@@ -604,6 +651,25 @@ pub struct CacheHint {
     rate_milli: std::sync::atomic::AtomicU32,
 }
 
+/// Per-model decode throughput (A2): EWMA of observed completion tokens
+/// per wall-second, blended at gateway completion time. Unlike the
+/// windowed poller hints there is no global fallback — rates from
+/// different model sizes never mix.
+#[derive(Debug)]
+pub struct ThroughputHint {
+    rate_milli: std::sync::atomic::AtomicU32,
+}
+
+impl Default for ThroughputHint {
+    fn default() -> Self {
+        // MAX = "never measured": `get()` yields None until a completion
+        // has been observed (mirrors CacheHint).
+        Self {
+            rate_milli: std::sync::atomic::AtomicU32::new(u32::MAX),
+        }
+    }
+}
+
 /// Per-model windowed rates (C1/G3): prompt-cache hit + speculative
 /// acceptance for ONE model, both `None` until that model's children
 /// have reported the relevant counters. Replicas of the same model
@@ -612,7 +678,12 @@ pub struct CacheHint {
 pub struct ModelHints {
     pub cache: CacheHint,
     pub accept: CacheHint,
+    pub decode: ThroughputHint,
 }
+
+/// One row of [`Supervisor::model_hint_snapshot`]: the model plus its
+/// windowed cache-hit, spec-acceptance, and decode-throughput hints.
+pub type ModelHintRow = (String, Option<f64>, Option<f64>, Option<f64>);
 
 /// Auto-pick one GPU: most free VRAM among DISCRETE cards; integrated
 /// cards are considered only when no discrete card exists (their "free"
@@ -810,6 +881,29 @@ impl CacheHint {
     }
 }
 
+impl ThroughputHint {
+    /// Record the blended decode rate (tokens per second).
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped to [0, 1e6] before the cast; a million tok/s exceeds any local engine"
+    )]
+    pub fn set(&self, tokens_per_s: f64) {
+        let clamped = tokens_per_s.clamp(0.0, 1_000_000.0);
+        let milli = (clamped * 1000.0).round();
+        let milli = u32::try_from(milli.min(f64::from(u32::MAX)) as u64).unwrap_or(0);
+        self.rate_milli.store(milli, Ordering::Relaxed);
+    }
+    /// Latest decode rate; `None` until a completion has been observed.
+    #[must_use]
+    pub fn get(&self) -> Option<f64> {
+        match self.rate_milli.load(Ordering::Relaxed) {
+            u32::MAX => None,
+            m => Some(f64::from(m) / 1000.0),
+        }
+    }
+}
+
 impl Supervisor {
     /// Poller write side (C1): record one model's windowed rates. Either
     /// may be `None` — that counter was absent this window (e.g. spec
@@ -843,11 +937,41 @@ impl Supervisor {
         self.model_hints.get(model).and_then(|h| h.accept.get())
     }
 
-    /// Labeled /metrics snapshot: `(model, cache, accept)` sorted by
-    /// model for a stable exposition.
+    /// Gateway write side (A2): blend one observed completion into the
+    /// model's decode-rate EWMA (0.7 history / 0.3 sample — same shape
+    /// as the poller hints). Wall time is measured from child-send
+    /// start so admission-queue wait never pollutes the rate; zero-token
+    /// and non-finite observations are dropped, not recorded as zeroes.
+    pub fn note_model_throughput(&self, model: &str, eval_count: u64, wall_s: f64) {
+        if eval_count == 0 || !(wall_s.is_finite() && wall_s > 0.0) {
+            return;
+        }
+        #[allow(clippy::cast_precision_loss, reason = "token counts fit f64 exactly")]
+        let sample = eval_count as f64 / wall_s;
+        let prev = self
+            .model_hints
+            .get(model)
+            .and_then(|h| h.decode.get())
+            .map_or(sample, |prev| prev * 0.7 + sample * 0.3);
+        self.model_hints
+            .entry(model.to_string())
+            .or_default()
+            .decode
+            .set(prev);
+    }
+
+    /// A2 read side: the model's measured decode rate. Deliberately no
+    /// cross-model fallback — a 0.5b rate must never size a 9b estimate.
     #[must_use]
-    pub fn model_hint_snapshot(&self) -> Vec<(String, Option<f64>, Option<f64>)> {
-        let mut rows: Vec<(String, Option<f64>, Option<f64>)> = self
+    pub fn decode_rate_for(&self, model: &str) -> Option<f64> {
+        self.model_hints.get(model).and_then(|h| h.decode.get())
+    }
+
+    /// Labeled /metrics snapshot: `(model, cache, accept, decode)` sorted
+    /// by model for a stable exposition.
+    #[must_use]
+    pub fn model_hint_snapshot(&self) -> Vec<ModelHintRow> {
+        let mut rows: Vec<ModelHintRow> = self
             .model_hints
             .iter()
             .map(|e| {
@@ -855,6 +979,7 @@ impl Supervisor {
                     e.key().clone(),
                     e.value().cache.get(),
                     e.value().accept.get(),
+                    e.value().decode.get(),
                 )
             })
             .collect();
@@ -4502,7 +4627,7 @@ drop them from rpc_servers in config.toml",
     /// injection count, and the first request's cached-token counter
     /// (gateway A9) backstops the lookup-miss variant. Live-probed on
     /// b11070: restore of 31 saved tokens -> next same-prefix completion
-    /// ran cache_n=23, prompt_n=1.
+    /// ran `cache_n=23`, `prompt_n=1`.
     async fn bank_restore_one(
         &self,
         client: &reqwest::Client,
@@ -8584,13 +8709,16 @@ mod routing_tests {
         let sup = routing_sup(1);
         sup.set_model_hints("zeta", Some(0.2), Some(0.8));
         sup.set_model_hints("alpha", Some(0.7), None);
+        sup.note_model_throughput("zeta", 120, 0.5);
         let rows = sup.model_hint_snapshot();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].0, "alpha", "sorted by model name");
         assert_eq!(rows[0].1, Some(0.7));
         assert_eq!(rows[0].2, None);
+        assert_eq!(rows[0].3, None, "alpha never served a completion");
         assert_eq!(rows[1].0, "zeta");
         assert_eq!(rows[1].2, Some(0.8));
+        assert_eq!(rows[1].3, Some(240.0), "120 tokens over 0.5s");
     }
 
     #[test]
@@ -8601,6 +8729,53 @@ mod routing_tests {
         sup.set_model_hints("m", None, None);
         assert_eq!(sup.cache_hint_for("m"), Some(0.9));
         assert_eq!(sup.accept_hint_for("m"), Some(0.6));
+    }
+
+    #[test]
+    fn unit__note_model_throughput__ewma_blends_and_guards() {
+        let sup = routing_sup(1);
+        // Degenerate observations are dropped, never recorded as zeroes.
+        sup.note_model_throughput("m", 0, 1.0);
+        sup.note_model_throughput("m", 10, 0.0);
+        sup.note_model_throughput("m", 10, f64::NAN);
+        assert_eq!(sup.decode_rate_for("m"), None, "no valid observation yet");
+        assert_eq!(
+            sup.decode_rate_for("unseen"),
+            None,
+            "decode never falls back across models"
+        );
+        // Seed: 100 tokens over 1s.
+        sup.note_model_throughput("m", 100, 1.0);
+        assert_eq!(sup.decode_rate_for("m"), Some(100.0));
+        // Blend: 200 tok/s sample -> 0.7*100 + 0.3*200 = 130.
+        sup.note_model_throughput("m", 200, 1.0);
+        assert_eq!(sup.decode_rate_for("m"), Some(130.0));
+    }
+
+    #[test]
+    fn unit__route_cost__taxonomy() {
+        // Neutral rate: unmeasured model, no pressure, 100 output tokens
+        // -> 100/50 = 2.0s exactly, prefill fully cached away.
+        let base = route_cost(None, Some(1.0), 0, 4, 1_000, 100);
+        assert!((base - 2.0).abs() < 1e-9, "got {base}");
+        // Queue depth adds half a second per queued admission.
+        let queued = route_cost(None, Some(1.0), 2, 4, 1_000, 100);
+        assert!((queued - base - 1.0).abs() < 1e-9, "got {queued}");
+        // Zero headroom under demand adds the starved-slot penalty.
+        let starved = route_cost(None, Some(1.0), 1, 0, 1_000, 100);
+        assert!((starved - base - 0.5 - 1.0).abs() < 1e-9, "got {starved}");
+        // Zero headroom alone (no demand) must NOT starve.
+        let idle_starve = route_cost(None, Some(1.0), 0, 0, 1_000, 100);
+        assert!((idle_starve - base).abs() < 1e-9, "got {idle_starve}");
+        // Uncached prefill bills prompt tokens at rate*4 per token.
+        let uncached = route_cost(Some(50.0), None, 0, 4, 1_000, 100);
+        assert!((uncached - 2.0 - 5.0).abs() < 1e-9, "got {uncached}");
+        // A faster model is strictly cheaper for the same ask.
+        let faster = route_cost(Some(100.0), None, 0, 4, 1_000, 100);
+        assert!(faster < uncached);
+        // Monotonic in expected output.
+        let longer = route_cost(Some(50.0), None, 0, 4, 1_000, 200);
+        assert!(longer > uncached);
     }
 
     #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
