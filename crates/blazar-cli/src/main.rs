@@ -9263,6 +9263,34 @@ fn split_table_path(key: &str) -> Option<(Vec<&str>, &str)> {
     Some((parts, clean_seg(&key[a..b])))
 }
 
+/// Alternative splits for `model_overrides` keys whose MODEL NAME itself
+/// contains dots (`model_overrides.qwen3-1.7b.engine`). The straight split
+/// yields `[model_overrides, qwen3-1, 7b]` + `engine`, which nests one table
+/// too deep and the schema rejects (`unknown field 7b`). Each candidate
+/// merges the model name across a different run of segments (ascending, so
+/// the shortest name wins) and the caller lets `Config::from_toml` decide
+/// which split is the real one — no hardcoded field lists.
+///
+/// Returns `None` unless the key has at least three parts and targets
+/// `model_overrides`; the straight split stays authoritative everywhere
+/// else.
+fn merged_override_splits(key: &str) -> Option<Vec<(Vec<String>, String)>> {
+    let parts: Vec<&str> = key.split('.').collect();
+    if parts.len() < 3 || parts[0] != "model_overrides" {
+        return None;
+    }
+    let last = parts.len() - 1;
+    let candidates = (1..last)
+        .map(|j| {
+            let name = parts[1..=j].join(".");
+            let mut path = vec!["model_overrides".to_string(), name];
+            path.extend(parts[j + 1..last].iter().copied().map(String::from));
+            (path, parts[last].to_string())
+        })
+        .collect();
+    Some(candidates)
+}
+
 /// Normalize a TOML table header into comparable segments:
 /// `[model_overrides."qwen-7b".sglang]` becomes `model_overrides`,
 /// `qwen-7b`, `sglang`. Array-of-tables headers (`[[...]]`) are a
@@ -11870,12 +11898,23 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                 // Dotted keys read the pin from the file itself — the
                 // serialized config would dump whole tables instead.
                 let raw = std::fs::read_to_string(dirs().config_file())?;
-                match get_table_key(&raw, &tpath, leaf) {
+                // A dotted MODEL NAME (`model_overrides.qwen3-1.7b.engine`)
+                // splits into too many segments; retry with merged names.
+                let merged = merged_override_splits(&key);
+                let line = get_table_key(&raw, &tpath, leaf).or_else(|| {
+                    merged.as_ref()?.iter().find_map(|(segs, leaf)| {
+                        let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
+                        get_table_key(&raw, &segs, leaf)
+                    })
+                });
+                match line {
                     Some(line) => {
                         println!("{line}");
                         Ok(())
                     }
-                    None if known_config_key(&key) => {
+                    // The model name is user-chosen, so a merged override
+                    // key is always schema-shaped even when unset.
+                    None if known_config_key(&key) || merged.is_some() => {
                         println!("{key} = <not set>");
                         Ok(())
                     }
@@ -11919,7 +11958,7 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
             // `model_overrides.qwen.sglang.stream_interval`) target a table
             // leaf and take the surgical insert path; bare keys keep the
             // root-scope replace/insert flow.
-            let candidate = if let Some((tpath, leaf)) = split_table_path(&key) {
+            let mut candidate = if let Some((tpath, leaf)) = split_table_path(&key) {
                 set_table_key(&raw, &tpath, leaf, &stored)
             } else {
                 let mut out: Vec<String> = Vec::new();
@@ -11945,6 +11984,23 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                 }
                 out.join("\n") + "\n"
             };
+            // A dotted MODEL NAME (`model_overrides.qwen3-1.7b.engine`)
+            // makes the straight candidate nest one table too deep. Retry
+            // with merged model names — the schema is the oracle, the first
+            // candidate it accepts wins, and the final validation below
+            // still gates the winner before anything is persisted.
+            if Config::from_toml(&candidate).is_err() {
+                if let Some(candidates) = merged_override_splits(&key) {
+                    for (segs, leaf) in &candidates {
+                        let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
+                        let alt = set_table_key(&raw, &segs, leaf, &stored);
+                        if Config::from_toml(&alt).is_ok() {
+                            candidate = alt;
+                            break;
+                        }
+                    }
+                }
+            }
             // Validate BEFORE persisting: a bad value/unknown key must
             // never leave the file broken.
             Config::from_toml(&candidate).map_err(|e| anyhow!("rejected, file unchanged: {e}"))?;
@@ -11964,7 +12020,23 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
             }
             let raw = std::fs::read_to_string(&path)?;
             if let Some((tpath, leaf)) = split_table_path(&key) {
-                let (candidate, removed) = remove_table_key(&raw, &tpath, leaf);
+                // Dotted MODEL NAME keys may need the merged split before a
+                // pin is actually found (see `config set`).
+                let merged = merged_override_splits(&key);
+                let mut removed_pair = remove_table_key(&raw, &tpath, leaf);
+                if removed_pair.1.is_none() {
+                    if let Some(candidates) = &merged {
+                        for (segs, leaf) in candidates {
+                            let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
+                            let pair = remove_table_key(&raw, &segs, leaf);
+                            if pair.1.is_some() {
+                                removed_pair = pair;
+                                break;
+                            }
+                        }
+                    }
+                }
+                let (candidate, removed) = removed_pair;
                 return match removed {
                     Some(old) => {
                         Config::from_toml(&candidate)
@@ -11973,7 +12045,7 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                         println!("{key} unset (was: {old}) — not set by default");
                         Ok(())
                     }
-                    None if known_config_key(&key) => {
+                    None if known_config_key(&key) || merged.is_some() => {
                         println!("{key} is not pinned — already at the built-in default");
                         Ok(())
                     }
@@ -13344,6 +13416,94 @@ mod tests {
             "[model_overrides.\"qwen 7b\".sglang]"
         );
         assert_eq!(table_header(&["sglang"]), "[sglang]");
+    }
+
+    #[test]
+    fn unit__merged_override_splits__candidates_ascending() {
+        // A dotted model name yields one candidate per merge point,
+        // shortest name first; the schema picks the valid one downstream.
+        let cands = merged_override_splits("model_overrides.qwen3-1.7b.engine").unwrap();
+        assert_eq!(cands.len(), 2);
+        assert_eq!(
+            cands[0],
+            (
+                vec![
+                    "model_overrides".to_string(),
+                    "qwen3-1".to_string(),
+                    "7b".to_string()
+                ],
+                "engine".to_string()
+            )
+        );
+        assert_eq!(
+            cands[1],
+            (
+                vec!["model_overrides".to_string(), "qwen3-1.7b".to_string()],
+                "engine".to_string()
+            )
+        );
+        // Deeper leaves keep the tail path after the merged name.
+        let cands = merged_override_splits("model_overrides.qwen3-1.7b.freetoken.dtype").unwrap();
+        assert_eq!(cands.len(), 3);
+        assert_eq!(
+            cands[1],
+            (
+                vec![
+                    "model_overrides".to_string(),
+                    "qwen3-1.7b".to_string(),
+                    "freetoken".to_string()
+                ],
+                "dtype".to_string()
+            )
+        );
+        // Only model_overrides keys qualify, and only with a leaf beyond
+        // the name itself.
+        assert!(merged_override_splits("sglang.qwen3-1.7b").is_none());
+        assert!(merged_override_splits("model_overrides.m").is_none());
+        assert!(merged_override_splits("slots").is_none());
+    }
+
+    #[test]
+    fn unit__config_set__dotted_model_name_resolves_via_schema() {
+        let raw = "[sglang]\ngrammar_backend = \"xgrammar\"\n";
+        // The straight split nests one table too deep — pins the bug the
+        // merged retry exists to fix.
+        let straight = set_table_key(
+            raw,
+            &["model_overrides", "qwen3-1", "7b"],
+            "engine",
+            "\"freetoken-0.1.3\"",
+        );
+        assert!(
+            Config::from_toml(&straight).is_err(),
+            "straight split must keep failing until the schema accepts the merged name"
+        );
+        // The merged candidate quotes the dotted name into ONE header
+        // segment and validates.
+        let merged = set_table_key(
+            raw,
+            &["model_overrides", "qwen3-1.7b"],
+            "engine",
+            "\"freetoken-0.1.3\"",
+        );
+        Config::from_toml(&merged).expect("merged split must validate");
+        assert!(
+            merged.contains("[model_overrides.\"qwen3-1.7b\"]"),
+            "dotted model name must be a single quoted header segment"
+        );
+        // get/remove round-trip on the merged text.
+        assert_eq!(
+            get_table_key(&merged, &["model_overrides", "qwen3-1.7b"], "engine").as_deref(),
+            Some("engine = \"freetoken-0.1.3\"")
+        );
+        let (after, removed) =
+            remove_table_key(&merged, &["model_overrides", "qwen3-1.7b"], "engine");
+        assert!(removed.is_some());
+        assert!(
+            !after.contains("freetoken-0.1.3"),
+            "unset must drop the pin"
+        );
+        Config::from_toml(&after).expect("config stays valid after unset");
     }
 
     #[test]
