@@ -2685,7 +2685,13 @@ impl Supervisor {
                 device_hint: None, // router preset: no per-GPU scoping
                 engine_census: self.hardware.gpus.clone(),
             };
-            match profile::compile(&input, &blazar_core::TuningOverrides::default()) {
+            match profile::compile(
+                &input,
+                &blazar_core::TuningOverrides {
+                    fa: self.config.flash_attention,
+                    ..Default::default()
+                },
+            ) {
                 Ok(p) => {
                     if global.is_empty() {
                         global.clone_from(&p.argv);
@@ -3512,6 +3518,9 @@ impl Supervisor {
                 ..Default::default()
             })
             .unwrap_or_default();
+        // Config-level FA override rides the same override path the
+        // pending ctx uses; None keeps the profile heuristic (auto).
+        tuning.fa = self.config.flash_attention;
         // D1 ubatch governor fills in ONLY where the user left the
         // micro-batch ceiling unset (no config `ubatch_size` pin — the
         // governor itself refuses pinned models; nothing else sets
