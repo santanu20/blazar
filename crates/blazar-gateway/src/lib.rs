@@ -1067,6 +1067,9 @@ pub async fn serve(
                     // B2: the same window feeds the per-model spec
                     // governor (inert unless spec_auto_manage is on).
                     state.sup.spec_governor_window(model, accept_rate);
+                    // D1: and the prefill-shaping governor (inert
+                    // unless ubatch_auto is on).
+                    state.sup.ubatch_governor_window(model);
                 }
             }
         })

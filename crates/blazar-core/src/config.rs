@@ -106,6 +106,15 @@ pub struct Config {
     /// bench-backed on the boxes it ships to.
     #[serde(default)]
     pub spec_auto_manage: bool,
+    /// Adaptive prefill shaping: when a model stays saturated for two
+    /// consecutive 60 s windows, raise its micro-batch ceiling one tier
+    /// (1024 → 2048) at the next reshape so prefill chunks drain the
+    /// queue faster; a sustained quiet streak (10 windows) steps back
+    /// down. Only fills where `ubatch_size` is unset (a config pin
+    /// always wins). Default false; llamacpp lanes only (mistral.rs
+    /// riders use its own `max_prefill_chunk_tokens` knob).
+    #[serde(default)]
+    pub ubatch_auto: bool,
     /// On-demand tensor loading (`--lazy-mode`): "auto" (engine default:
     /// on-demand only for tensors > 4 GiB), "on" (all such tensors from
     /// disk via mmap — big-MoE RAM relief), "off" (fully resident).
@@ -2048,6 +2057,7 @@ impl Default for Config {
             spec_autopull: false,
             spec_auto_ngram: true,
             spec_auto_manage: false,
+            ubatch_auto: false,
             lazy_mode: "auto".to_string(),
             server_tools: None,
             server_tools_runtime: None,
@@ -3675,6 +3685,9 @@ impl Config {
         }
         if let Some(v) = env("BLAZAR_SPEC_AUTO_MANAGE") {
             cfg.spec_auto_manage = parse_bool("BLAZAR_SPEC_AUTO_MANAGE", &v)?;
+        }
+        if let Some(v) = env("BLAZAR_UBATCH_AUTO") {
+            cfg.ubatch_auto = parse_bool("BLAZAR_UBATCH_AUTO", &v)?;
         }
         if let Some(v) = env("BLAZAR_CTX_EXTEND") {
             cfg.ctx_extend = parse_f64("BLAZAR_CTX_EXTEND", &v)?;

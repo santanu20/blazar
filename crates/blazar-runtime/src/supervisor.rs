@@ -200,6 +200,18 @@ const SPEC_GOV_RECOVER_STREAK: u32 = 10;
 /// B2 spec governor: acceptance rate below this counts as collapsed
 /// (draft overhead is pure waste when almost nothing is accepted).
 const SPEC_GOV_ACCEPT_FLOOR: f64 = 0.15;
+/// D1 ubatch governor: consecutive saturated windows before prefill
+/// shaping escalates one tier.
+const UBATCH_GOV_SAT_STREAK: u32 = 2;
+/// D1 ubatch governor: consecutive quiet windows before an escalated
+/// model steps back down (asymmetric hysteresis, same shape as the
+/// `SPEC_GOV_*` pair: escalating relieves a live queue, de-escalating
+/// only frees a compute buffer nobody is waiting on).
+const UBATCH_GOV_RECOVER_STREAK: u32 = 10;
+/// D1 ubatch governor: escalation ladder for the micro-batch ceiling
+/// (`--ubatch-size`). Capped at 2048: the next rung would grow the
+/// compute buffer linearly and can OOM small cards mid-burst.
+const UBATCH_GOV_TIERS: [u32; 2] = [1024, 2048];
 
 /// Model name behind an instance key: `"qwen#2"` → `"qwen"`. Plain keys
 /// (no `#`) pass through unchanged, so `replicas = 1` stays
@@ -1191,6 +1203,111 @@ impl Supervisor {
         rows.sort_by(|a, b| a.0.cmp(&b.0));
         rows
     }
+
+    /// D1 spawn read side: the shaped micro-batch tier for one model,
+    /// `None` when the engine default should stand. Injected into the
+    /// spawn's `TuningOverrides` ONLY where the user left everything
+    /// unset (no `--ubatch-size` pin, no tuning override), so a config
+    /// pin always shadows the governor.
+    #[must_use]
+    pub fn governed_ubatch(&self, name: &str) -> Option<u32> {
+        self.ubatch_override.get(name).map(|v| *v.value())
+    }
+
+    /// D1 ubatch governor: one 60 s telemetry window for `model`.
+    /// Saturated windows climb a two-rung ladder (`--ubatch-size` 1024
+    /// then 2048 — bigger prefill micro-batches drain a saturated queue
+    /// faster at the cost of a larger compute buffer); a sustained quiet
+    /// streak steps back down. Called by the gateway poller after
+    /// `spec_governor_window`. No-op unless `ubatch_auto` is on; the
+    /// router child and models with a config `ubatch_size` pin are
+    /// exempt. Reshapes ride the same drain-safe queue the spec
+    /// governor uses.
+    pub fn ubatch_governor_window(&self, model: &str) {
+        if !self.config.ubatch_auto || model == ROUTER_KEY {
+            return;
+        }
+        if self.config.ubatch_size != 0 {
+            // A user pin shadows the governor permanently — clear any
+            // stale state so the gauge never reports a model it cannot
+            // act on.
+            self.ubatch_gov.remove(model);
+            self.ubatch_override.remove(model);
+            return;
+        }
+        let current = self.governed_ubatch(model).unwrap_or(0);
+        let saturated = self.spec_model_saturated(model);
+        if saturated {
+            let fired = {
+                let mut s = self.ubatch_gov.entry(model.to_string()).or_default();
+                s.quiet_streak = 0;
+                s.sat_streak += 1;
+                s.sat_streak >= UBATCH_GOV_SAT_STREAK
+            };
+            if fired {
+                if let Some(&tier) = UBATCH_GOV_TIERS.iter().find(|&&t| t > current) {
+                    self.ubatch_gov.remove(model);
+                    self.ubatch_override.insert(model.to_string(), tier);
+                    self.queue_spec_reshape(model);
+                    tracing::warn!(
+                        model = %model,
+                        tier,
+                        "ubatch governor: saturation streak — reshaping with a larger prefill micro-batch ceiling"
+                    );
+                } else {
+                    // Already at the top rung: hold there, streak spent.
+                    self.ubatch_gov.remove(model);
+                }
+            }
+            return;
+        }
+        self.ubatch_gov
+            .entry(model.to_string())
+            .or_default()
+            .sat_streak = 0;
+        if current == 0 {
+            self.ubatch_gov.remove(model);
+            return;
+        }
+        let recovered = {
+            let mut s = self.ubatch_gov.entry(model.to_string()).or_default();
+            s.quiet_streak += 1;
+            s.quiet_streak >= UBATCH_GOV_RECOVER_STREAK
+        };
+        if recovered {
+            // Step DOWN one rung (2048 → 1024 → auto), never straight
+            // to auto: the model earned the escalation by real
+            // saturation, and a quiet window under a shaped child is
+            // exactly the state that produced it.
+            let lower = UBATCH_GOV_TIERS.iter().rev().find(|&&t| t < current);
+            self.ubatch_gov.remove(model);
+            match lower {
+                Some(&tier) => {
+                    self.ubatch_override.insert(model.to_string(), tier);
+                }
+                None => {
+                    self.ubatch_override.remove(model);
+                }
+            }
+            self.queue_spec_reshape(model);
+            tracing::info!(
+                model = %model,
+                "ubatch governor: quiet streak satisfied — stepping the prefill micro-batch ceiling down"
+            );
+        }
+    }
+
+    /// D1 gauge rows: per-model shaped tier (0 = engine default).
+    #[must_use]
+    pub fn ubatch_governor_snapshot(&self) -> Vec<(String, u32)> {
+        let mut rows: Vec<(String, u32)> = self
+            .ubatch_override
+            .iter()
+            .map(|e| (e.key().clone(), *e.value()))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
 }
 
 /// B2 spec governor streak bookkeeping per model (which side of the
@@ -1199,6 +1316,13 @@ impl Supervisor {
 struct SpecGovState {
     off_streak: u32,
     recover_streak: u32,
+}
+
+/// D1 ubatch governor streak bookkeeping per model.
+#[derive(Debug, Default)]
+struct UbatchGovState {
+    sat_streak: u32,
+    quiet_streak: u32,
 }
 
 /// Row for `blazar ps` / `/api/ps`.
@@ -1277,9 +1401,13 @@ pub struct Supervisor {
     /// and overlay pins always shadow it. Daemon-lifetime memory, like
     /// `adopted_slots`.
     spec_override: DashMap<String, String>,
+    /// D1 ubatch governor: per-model shaped tier (`--ubatch-size`
+    /// value). Absent = engine default (tier "auto").
+    ubatch_override: DashMap<String, u32>,
     /// B2 spec governor: window streaks per model (park-side or
     /// recover-side depending on the override above).
     spec_gov: DashMap<String, SpecGovState>,
+    ubatch_gov: DashMap<String, UbatchGovState>,
     /// J2 self-healing: distinct models whose spawn ULTIMATELY failed
     /// since the last successful spawn. Cleared on every success; drives
     /// the crash-loop engine rollback (probe-gated, see
@@ -1494,7 +1622,9 @@ impl Supervisor {
             spec_accept: std::sync::Arc::new(CacheHint::default()),
             model_hints: DashMap::new(),
             spec_override: DashMap::new(),
+            ubatch_override: DashMap::new(),
             spec_gov: DashMap::new(),
+            ubatch_gov: DashMap::new(),
             engine_failures: std::sync::Mutex::new(std::collections::HashSet::new()),
             capability_pins: std::sync::Mutex::new(std::collections::HashMap::new()),
             measured: std::sync::Mutex::new(MeasuredTick::default()),
@@ -3382,6 +3512,14 @@ impl Supervisor {
                 ..Default::default()
             })
             .unwrap_or_default();
+        // D1 ubatch governor fills in ONLY where the user left the
+        // micro-batch ceiling unset (no config `ubatch_size` pin — the
+        // governor itself refuses pinned models; nothing else sets
+        // tuning.ubatch at spawn). Same shadowing contract as the LC4
+        // adaptive-slots adoption above.
+        if tuning.ubatch.is_none() {
+            tuning.ubatch = self.governed_ubatch(name);
+        }
         // Candidate f16 KV over the FULL (unscoped) hardware: the split
         // decision compares weights+KV against the combined discrete
         // pool before single-card scoping exists. Sibling literal of the
@@ -8947,6 +9085,126 @@ mod routing_tests {
         assert_eq!(
             sup.spec_governor_snapshot(),
             vec![("alpha".to_string(), true), ("zeta".to_string(), false),]
+        );
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__ubatch_governor__saturation_streak_escalates_rung_by_rung() {
+        let mut sup = routing_sup(1);
+        sup.config.ubatch_auto = true;
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 5);
+        Arc::get_mut(&mut inst).expect("sole owner").argv = vec![
+            "llama-server".into(),
+            "-np".into(),
+            "4".into(),
+            "--ctx-size".into(),
+            "65536".into(),
+        ];
+        sup.instances.insert("m".into(), inst);
+        // Two saturated windows reach rung 1 (1024) and queue a reshape.
+        sup.ubatch_governor_window("m");
+        assert_eq!(sup.governed_ubatch("m"), None, "streak builds first");
+        sup.ubatch_governor_window("m");
+        assert_eq!(sup.governed_ubatch("m"), Some(1024));
+        assert_eq!(
+            sup.reshape_queue.get("m").map(|v| v.value().clone()),
+            Some("m".to_string())
+        );
+        assert_eq!(
+            sup.ubatch_governor_snapshot(),
+            vec![("m".to_string(), 1024)]
+        );
+        // Another streak reaches the top rung (2048)…
+        sup.ubatch_governor_window("m");
+        sup.ubatch_governor_window("m");
+        assert_eq!(sup.governed_ubatch("m"), Some(2048));
+        // …and a further streak holds there without looping.
+        sup.ubatch_governor_window("m");
+        sup.ubatch_governor_window("m");
+        assert_eq!(sup.governed_ubatch("m"), Some(2048));
+        kill_all(&[ph]);
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__ubatch_governor__knob_off_is_inert() {
+        let sup = routing_sup(1); // ubatch_auto defaults false
+        let (inst, ph) = fake_instance("m", InstanceState::Ready, 9);
+        sup.instances.insert("m".into(), inst);
+        for _ in 0..5 {
+            sup.ubatch_governor_window("m");
+        }
+        assert_eq!(sup.governed_ubatch("m"), None);
+        assert!(sup.ubatch_governor_snapshot().is_empty());
+        kill_all(&[ph]);
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__ubatch_governor__config_pin_is_exempt() {
+        let mut sup = routing_sup(1);
+        sup.config.ubatch_auto = true;
+        sup.config.ubatch_size = 512;
+        // A stale override from before the pin is cleared, never acted on.
+        sup.ubatch_override.insert("m".into(), 2048);
+        let (inst, ph) = fake_instance("m", InstanceState::Ready, 9);
+        sup.instances.insert("m".into(), inst);
+        for _ in 0..3 {
+            sup.ubatch_governor_window("m");
+        }
+        assert_eq!(sup.governed_ubatch("m"), None, "pin clears stale state");
+        assert!(sup.ubatch_governor_snapshot().is_empty());
+        kill_all(&[ph]);
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__ubatch_governor__quiet_streak_steps_down_one_rung() {
+        let mut sup = routing_sup(1);
+        sup.config.ubatch_auto = true;
+        sup.ubatch_override.insert("m".into(), 2048);
+        // A live (idle) instance so step-downs have something to reshape;
+        // load 0 keeps it unsaturated — every window is quiet.
+        let (inst, ph) = fake_instance("m", InstanceState::Ready, 0);
+        sup.instances.insert("m".into(), inst);
+        for _ in 0..(UBATCH_GOV_RECOVER_STREAK - 1) {
+            sup.ubatch_governor_window("m");
+        }
+        assert_eq!(
+            sup.governed_ubatch("m"),
+            Some(2048),
+            "9 quiet hold the tier"
+        );
+        sup.ubatch_governor_window("m");
+        assert_eq!(
+            sup.governed_ubatch("m"),
+            Some(1024),
+            "10th steps down one rung"
+        );
+        assert_eq!(
+            sup.reshape_queue.get("m").map(|v| v.value().clone()),
+            Some("m".to_string()),
+            "step-down queues the reshape"
+        );
+        // A second full streak returns to the engine default.
+        for _ in 0..UBATCH_GOV_RECOVER_STREAK {
+            sup.ubatch_governor_window("m");
+        }
+        assert_eq!(sup.governed_ubatch("m"), None);
+        assert!(sup.ubatch_governor_snapshot().is_empty());
+        kill_all(&[ph]);
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[test]
+    fn unit__ubatch_governor_snapshot__sorted() {
+        let sup = routing_sup(1);
+        sup.ubatch_override.insert("zeta".to_string(), 1024);
+        sup.ubatch_override.insert("alpha".to_string(), 2048);
+        assert_eq!(
+            sup.ubatch_governor_snapshot(),
+            vec![("alpha".to_string(), 2048), ("zeta".to_string(), 1024)]
         );
     }
 

@@ -3453,6 +3453,26 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
             );
         }
     }
+    // D1 ubatch governor: per-model shaped prefill micro-batch tier
+    // (`auto` = engine default). Only present when ubatch_auto is on
+    // and a model is shaped.
+    let ubatch = state.sup.ubatch_governor_snapshot();
+    if !ubatch.is_empty() {
+        merged.push_str(
+            "# HELP blazar_ubatch_governor Prefill micro-batch ceiling the ubatch governor shaped per model (auto = engine default)\n# TYPE blazar_ubatch_governor gauge\n",
+        );
+        for (model, tier) in &ubatch {
+            let tier_label = if *tier == 0 {
+                "auto"
+            } else {
+                &tier.to_string()
+            };
+            let _ = writeln!(
+                merged,
+                "blazar_ubatch_governor{{model=\"{model}\",tier=\"{tier_label}\"}} 1"
+            );
+        }
+    }
     // E3 best-of-N fan-out totals: engaged fan-outs and how many were
     // degraded to a smaller candidate count (saturation, slot
     // headroom, oversize bodies).
