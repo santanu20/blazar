@@ -98,6 +98,14 @@ pub struct Config {
     /// behavior. Set false (or spec = "off") to stay dense.
     #[serde(default = "default_true")]
     pub spec_auto_ngram: bool,
+    /// Let the daemon park speculation for a model when it measurably
+    /// hurts: two consecutive 60 s windows of queue saturation or
+    /// draft-acceptance collapse (< 0.15) respawn the child dense; a
+    /// sustained quiet streak (10 windows) restores it. Per-model, and a
+    /// per-request/overlay spec pin always wins. Default false until
+    /// bench-backed on the boxes it ships to.
+    #[serde(default)]
+    pub spec_auto_manage: bool,
     /// On-demand tensor loading (`--lazy-mode`): "auto" (engine default:
     /// on-demand only for tensors > 4 GiB), "on" (all such tensors from
     /// disk via mmap — big-MoE RAM relief), "off" (fully resident).
@@ -2002,6 +2010,7 @@ impl Default for Config {
             spec: "auto".to_string(),
             spec_autopull: false,
             spec_auto_ngram: true,
+            spec_auto_manage: false,
             lazy_mode: "auto".to_string(),
             server_tools: None,
             server_tools_runtime: None,
@@ -3546,6 +3555,9 @@ impl Config {
         }
         if let Some(v) = env("BLAZAR_SPEC_AUTO_NGRAM") {
             cfg.spec_auto_ngram = parse_bool("BLAZAR_SPEC_AUTO_NGRAM", &v)?;
+        }
+        if let Some(v) = env("BLAZAR_SPEC_AUTO_MANAGE") {
+            cfg.spec_auto_manage = parse_bool("BLAZAR_SPEC_AUTO_MANAGE", &v)?;
         }
         if let Some(v) = env("BLAZAR_CTX_EXTEND") {
             cfg.ctx_extend = parse_f64("BLAZAR_CTX_EXTEND", &v)?;

@@ -1062,6 +1062,9 @@ pub async fn serve(
                     }
                     per_ewma.insert(model.clone(), (c_ewma, a_ewma));
                     state.sup.set_model_hints(model, cache_rate, accept_rate);
+                    // B2: the same window feeds the per-model spec
+                    // governor (inert unless spec_auto_manage is on).
+                    state.sup.spec_governor_window(model, accept_rate);
                 }
             }
         })

@@ -700,7 +700,7 @@ fn event_kind(e: &blazar_runtime::BlazarEvent) -> &'static str {
     use blazar_runtime::BlazarEvent::{
         BenchmarkDone, EngineRemoved, EngineRolledBack, EngineUpdated, InstanceStateChanged,
         ModelPreloaded, ModelPulled, ModelRemoved, PullFailed, PullProgress, QueueDepth,
-        SlotsAutoAdopted, SlotsCtxAutoFit, SlotsReshaped,
+        SlotsAutoAdopted, SlotsCtxAutoFit, SlotsReshaped, SpecGovernorOff, SpecGovernorRecovered,
     };
     match e {
         EngineUpdated { .. } => "engine_updated",
@@ -710,6 +710,8 @@ fn event_kind(e: &blazar_runtime::BlazarEvent) -> &'static str {
         SlotsAutoAdopted { .. } => "slots_auto_adopted",
         SlotsCtxAutoFit { .. } => "slots_ctx_auto_fit",
         SlotsReshaped { .. } => "slots_reshaped",
+        SpecGovernorOff { .. } => "spec_governor_off",
+        SpecGovernorRecovered { .. } => "spec_governor_recovered",
         ModelPulled { .. } => "model_pulled",
         ModelRemoved { .. } => "model_removed",
         PullProgress { .. } => "pull_progress",
@@ -3333,6 +3335,22 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
                     "blazar_spec_accept_rate_per_model{{model=\"{model}\"}} {rate:.4}"
                 );
             }
+        }
+    }
+    // B2 governor state: which models the spec governor is watching
+    // (streak building) or has parked dense (override active). Only
+    // present when spec_auto_manage is on and a model has state.
+    let gov = state.sup.spec_governor_snapshot();
+    if !gov.is_empty() {
+        merged.push_str(
+            "# HELP blazar_spec_governor Spec-governor state per model (watching = streak building, parked_off = speculation disabled by the governor)\n# TYPE blazar_spec_governor gauge\n",
+        );
+        for (model, parked) in &gov {
+            let state_label = if *parked { "parked_off" } else { "watching" };
+            let _ = writeln!(
+                merged,
+                "blazar_spec_governor{{model=\"{model}\",state=\"{state_label}\"}} 1"
+            );
         }
     }
     engine_build_gauge(&state, &mut merged);

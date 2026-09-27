@@ -132,6 +132,19 @@ const SLOTS_ADOPT_CAP: u32 = 8;
 /// scaling up must be eager (demand is now), scaling down must be lazy
 /// (the cost of waiting is only per-stream latency, never queueing).
 const SLOTS_DECAY_TICKS: u32 = 30;
+/// B2 spec governor: consecutive 60 s telemetry windows of collapse
+/// (queue saturation OR draft acceptance < [`SPEC_GOV_ACCEPT_FLOOR`])
+/// before speculation is parked for a model.
+const SPEC_GOV_OFF_STREAK: u32 = 2;
+/// B2 spec governor: consecutive quiet windows before a parked model
+/// regains speculation. Asymmetric hysteresis on purpose (same shape as
+/// the SLOTS_* pair): parking must be eager (live queues are bleeding
+/// now), restoring must be lazy (the cost of waiting is only missed
+/// speedups, never queueing).
+const SPEC_GOV_RECOVER_STREAK: u32 = 10;
+/// B2 spec governor: acceptance rate below this counts as collapsed
+/// (draft overhead is pure waste when almost nothing is accepted).
+const SPEC_GOV_ACCEPT_FLOOR: f64 = 0.15;
 
 /// Model name behind an instance key: `"qwen#2"` → `"qwen"`. Plain keys
 /// (no `#`) pass through unchanged, so `replicas = 1` stays
@@ -840,6 +853,183 @@ impl Supervisor {
         rows.sort_by(|a, b| a.0.cmp(&b.0));
         rows
     }
+
+    /// B2 spawn read side: the spec-mode default tier for one model —
+    /// the governor's parked override where present, else the config
+    /// default. Wired into `resolve_spec_mode` as the LAST tier, so a
+    /// per-request pin and an overlay pin always shadow the governor.
+    #[must_use]
+    pub fn governed_spec_default(&self, name: &str) -> String {
+        self.spec_override
+            .get(name)
+            .map_or_else(|| self.config.spec.clone(), |v| v.value().clone())
+    }
+
+    /// B2 spec governor: one 60 s telemetry window for `model`.
+    /// `accept` is that model's windowed draft-acceptance rate, `None`
+    /// when its child reported no spec counters (dense, or an engine
+    /// without the counters — then only saturation can fire). Called by
+    /// the gateway poller after `set_model_hints`. No-op unless
+    /// `spec_auto_manage` is on; the router child and user-pinned
+    /// models are exempt.
+    pub fn spec_governor_window(&self, model: &str, accept: Option<f64>) {
+        if !self.config.spec_auto_manage || model == ROUTER_KEY {
+            return;
+        }
+        let overlay = self.config.overlay_for(model);
+        if overlay.spec.is_some() || self.config.spec == "off" {
+            // A user pin (or a dense global config) shadows the governor
+            // permanently — clear any stale state so the gauge never
+            // reports a model it cannot act on.
+            self.spec_gov.remove(model);
+            self.spec_override.remove(model);
+            return;
+        }
+        let parked = self.spec_override.get(model).is_some();
+        let saturated = self.spec_model_saturated(model);
+        if !parked {
+            // Watching path: two collapse signals, either alone enough —
+            // queue saturation (speculation overhead is feeding the
+            // queue) or an acceptance floor breach (draft overhead is
+            // pure waste at these rates).
+            let accept_collapsed = accept.is_some_and(|a| a < SPEC_GOV_ACCEPT_FLOOR);
+            if !(saturated || accept_collapsed) {
+                self.spec_gov.remove(model);
+                return;
+            }
+            let fired = {
+                let mut s = self.spec_gov.entry(model.to_string()).or_default();
+                s.off_streak += 1;
+                s.off_streak >= SPEC_GOV_OFF_STREAK
+            };
+            if fired {
+                let reason = if saturated {
+                    "saturation"
+                } else {
+                    "acceptance"
+                };
+                self.spec_gov.remove(model);
+                self.spec_override.insert(model.to_string(), "off".into());
+                self.queue_spec_reshape(model);
+                tracing::warn!(
+                    model = %model,
+                    reason,
+                    "spec governor: speculation parked after a collapse streak — respawning dense (a long quiet streak restores it)"
+                );
+                self.bus.publish(BlazarEvent::SpecGovernorOff {
+                    model: model.to_string(),
+                    reason: reason.to_string(),
+                });
+            }
+            return;
+        }
+        // Parked path: restore only after a sustained fully-quiet streak
+        // (asymmetric hysteresis — see SPEC_GOV_RECOVER_STREAK). A dense
+        // child reports no spec counters; `None` acceptance counts as
+        // quiet on that axis.
+        let quiet = !saturated && accept.is_none_or(|a| a >= SPEC_GOV_ACCEPT_FLOOR);
+        if !quiet {
+            self.spec_gov.remove(model);
+            return;
+        }
+        let recovered = {
+            let mut s = self.spec_gov.entry(model.to_string()).or_default();
+            s.recover_streak += 1;
+            s.recover_streak >= SPEC_GOV_RECOVER_STREAK
+        };
+        if recovered {
+            self.spec_gov.remove(model);
+            self.spec_override.remove(model);
+            self.queue_spec_reshape(model);
+            tracing::info!(
+                model = %model,
+                "spec governor: quiet streak satisfied — speculation restored"
+            );
+            self.bus.publish(BlazarEvent::SpecGovernorRecovered {
+                model: model.to_string(),
+            });
+        }
+    }
+
+    /// Per-model saturation, derived entirely from supervisor state so
+    /// the gateway's global queue depth can never flip another model's
+    /// governor: admission pressure on this model (the same gauge the
+    /// adaptive-slot reaper reads) or a live replica over its slot
+    /// count. Mirrors the `adaptive_slots_tick` definition exactly.
+    fn spec_model_saturated(&self, model: &str) -> bool {
+        if self.slot_pressure.get(model).is_some_and(|v| *v > 0) {
+            return true;
+        }
+        for e in &self.instances {
+            if model_of_key(e.key()) != model {
+                continue;
+            }
+            let i = e.value();
+            if !matches!(*i.state.read().expect("state lock"), InstanceState::Ready) {
+                continue;
+            }
+            let resolved = i
+                .argv
+                .windows(2)
+                .find(|w| w[0] == "-np" || w[0] == "--parallel")
+                .and_then(|w| w[1].parse::<u32>().ok())
+                .unwrap_or(self.config.slots);
+            let effective = self
+                .adopted_slots
+                .get(model)
+                .map_or(resolved, |v| *v.value());
+            if effective > 0 && i.in_flight.load(Ordering::SeqCst) > i64::from(effective) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Queue a dense/spec restore respawn for every live replica of the
+    /// model via the existing reshape machinery (drain waits for
+    /// in-flight streams; the KV bank carries conversations across the
+    /// reshape). The queue is model-keyed, so a multi-replica model
+    /// reshapes one replica per drain cycle — replicas > 1 is opt-in
+    /// and rare on single-box deployments.
+    fn queue_spec_reshape(&self, model: &str) {
+        for e in &self.instances {
+            let key = e.key();
+            if model_of_key(key) == model {
+                self.reshape_queue.insert(model.to_string(), key.clone());
+            }
+        }
+    }
+
+    /// Labeled /metrics snapshot for the governor: `(model, parked)`
+    /// sorted by model. A model appears while it has streak state
+    /// (watching) or an active override (parked).
+    #[must_use]
+    pub fn spec_governor_snapshot(&self) -> Vec<(String, bool)> {
+        let mut parked: Vec<String> = self.spec_override.iter().map(|e| e.key().clone()).collect();
+        parked.sort();
+        let mut watching: Vec<String> = self
+            .spec_gov
+            .iter()
+            .map(|e| e.key().clone())
+            .filter(|m| !parked.contains(m))
+            .collect();
+        watching.sort();
+        let mut rows: Vec<(String, bool)> = watching
+            .into_iter()
+            .map(|m| (m, false))
+            .chain(parked.into_iter().map(|m| (m, true)))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+}
+
+/// B2 spec governor streak bookkeeping per model (which side of the
+/// state machine the streak belongs to depends on the override).
+#[derive(Debug, Default)]
+struct SpecGovState {
+    off_streak: u32,
+    recover_streak: u32,
 }
 
 /// Row for `blazar ps` / `/api/ps`.
@@ -913,6 +1103,14 @@ pub struct Supervisor {
     /// spawns read their own model's rate first and fall back to the
     /// merged globals (single-model boxes steer identically).
     model_hints: DashMap<String, ModelHints>,
+    /// B2 spec governor: models whose speculation the governor parked
+    /// ("off"). Consumed as the default spec tier at spawn — per-request
+    /// and overlay pins always shadow it. Daemon-lifetime memory, like
+    /// `adopted_slots`.
+    spec_override: DashMap<String, String>,
+    /// B2 spec governor: window streaks per model (park-side or
+    /// recover-side depending on the override above).
+    spec_gov: DashMap<String, SpecGovState>,
     /// J2 self-healing: distinct models whose spawn ULTIMATELY failed
     /// since the last successful spawn. Cleared on every success; drives
     /// the crash-loop engine rollback (probe-gated, see
@@ -1122,6 +1320,8 @@ impl Supervisor {
             cache_hint: std::sync::Arc::new(CacheHint::default()),
             spec_accept: std::sync::Arc::new(CacheHint::default()),
             model_hints: DashMap::new(),
+            spec_override: DashMap::new(),
+            spec_gov: DashMap::new(),
             engine_failures: std::sync::Mutex::new(std::collections::HashSet::new()),
             capability_pins: std::sync::Mutex::new(std::collections::HashMap::new()),
             measured: std::sync::Mutex::new(MeasuredTick::default()),
@@ -2823,10 +3023,14 @@ impl Supervisor {
         // live in profile::compile. A queued per-request spec
         // (`options.spec`) wins over overlay/config; consumed HERE,
         // before every loop in this fn, so retries never re-read it.
+        // B2: the governor fills the default tier ONLY where the user
+        // left it unset — per-request > overlay > governor > config.
+        // A pin anywhere permanently exempts the model (the governor
+        // itself refuses to act on pinned models).
         let spec_mode = resolve_spec_mode(
             self.pending_spec.remove(name).map(|(_, m)| m),
             overlay.spec.clone(),
-            &self.config.spec,
+            &self.governed_spec_default(name),
         );
         let mut draft_path = resolve_draft_path(&store, name, &spec_mode);
         if draft_path.is_none() && self.config.spec_autopull {
@@ -8114,5 +8318,177 @@ mod routing_tests {
         sup.set_model_hints("m", None, None);
         assert_eq!(sup.cache_hint_for("m"), Some(0.9));
         assert_eq!(sup.accept_hint_for("m"), Some(0.6));
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__spec_governor__saturation_streak_parks_and_queues() {
+        let mut sup = routing_sup(1);
+        sup.config.spec_auto_manage = true;
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 5);
+        Arc::get_mut(&mut inst).expect("sole owner").argv = vec![
+            "llama-server".into(),
+            "-np".into(),
+            "4".into(),
+            "--ctx-size".into(),
+            "65536".into(),
+        ];
+        sup.instances.insert("m".into(), inst);
+        // Window 1: streak builds, no action yet.
+        sup.spec_governor_window("m", None);
+        assert!(sup.spec_override.get("m").is_none());
+        assert_eq!(
+            sup.spec_governor_snapshot(),
+            vec![("m".to_string(), false)],
+            "watching after one bad window"
+        );
+        // Window 2: threshold — parked, reshape queued for the live key.
+        sup.spec_governor_window("m", None);
+        assert_eq!(
+            sup.spec_override.get("m").map(|v| v.value().clone()),
+            Some("off".to_string())
+        );
+        assert_eq!(
+            sup.reshape_queue.get("m").map(|v| v.value().clone()),
+            Some("m".to_string())
+        );
+        assert_eq!(sup.spec_governor_snapshot(), vec![("m".to_string(), true)]);
+        kill_all(&[ph]);
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__spec_governor__accept_collapse_parks_without_saturation() {
+        let mut sup = routing_sup(1);
+        sup.config.spec_auto_manage = true;
+        // No instances at all: nothing saturated — only the acceptance
+        // floor breach can fire (a spec child reporting 0.10).
+        sup.spec_governor_window("m", Some(0.10));
+        sup.spec_governor_window("m", Some(0.12));
+        assert_eq!(
+            sup.spec_override.get("m").map(|v| v.value().clone()),
+            Some("off".to_string())
+        );
+        // Healthy acceptance never builds a streak.
+        sup.spec_override.remove("m");
+        sup.spec_gov.remove("m");
+        for _ in 0..5 {
+            sup.spec_governor_window("m", Some(0.9));
+        }
+        assert!(sup.spec_override.get("m").is_none());
+        assert!(sup.spec_governor_snapshot().is_empty());
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__spec_governor__knob_off_is_inert() {
+        let sup = routing_sup(1); // spec_auto_manage defaults false
+        let (inst, ph) = fake_instance("m", InstanceState::Ready, 9);
+        sup.instances.insert("m".into(), inst);
+        for _ in 0..5 {
+            sup.spec_governor_window("m", Some(0.01));
+        }
+        assert!(sup.spec_override.get("m").is_none());
+        assert!(sup.spec_governor_snapshot().is_empty());
+        kill_all(&[ph]);
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__spec_governor__overlay_pin_and_config_off_exempt() {
+        // Overlay pin: a user policy statement — never governed.
+        let mut sup = routing_sup(1);
+        sup.config.spec_auto_manage = true;
+        sup.config.model_overrides.insert(
+            "m".into(),
+            ModelOverride {
+                spec: Some("ngram".into()),
+                ..Default::default()
+            },
+        );
+        let (inst, ph) = fake_instance("m", InstanceState::Ready, 9);
+        sup.instances.insert("m".into(), inst);
+        for _ in 0..3 {
+            sup.spec_governor_window("m", Some(0.01));
+        }
+        assert!(sup.spec_override.get("m").is_none());
+        kill_all(&[ph]);
+
+        // Global config already dense: nothing to manage.
+        let mut sup = routing_sup(1);
+        sup.config.spec_auto_manage = true;
+        sup.config.spec = "off".into();
+        let (inst, ph) = fake_instance("m", InstanceState::Ready, 9);
+        sup.instances.insert("m".into(), inst);
+        for _ in 0..3 {
+            sup.spec_governor_window("m", None);
+        }
+        assert!(sup.spec_override.get("m").is_none());
+        kill_all(&[ph]);
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__spec_governor__recovers_after_quiet_streak_and_resets_on_bad_window() {
+        let mut sup = routing_sup(1);
+        sup.config.spec_auto_manage = true;
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 0);
+        Arc::get_mut(&mut inst).expect("sole owner").argv = vec![
+            "llama-server".into(),
+            "-np".into(),
+            "4".into(),
+            "--ctx-size".into(),
+            "65536".into(),
+        ];
+        sup.instances.insert("m".into(), inst);
+        sup.spec_override.insert("m".into(), "off".into());
+
+        // Parked: one bad window (acceptance collapse) resets the
+        // recover streak; then quiet windows rebuild it from zero.
+        sup.spec_governor_window("m", Some(0.9)); // quiet: streak = 1
+        sup.spec_governor_window("m", Some(0.1)); // bad: reset
+        for _ in 0..(SPEC_GOV_RECOVER_STREAK - 1) {
+            sup.spec_governor_window("m", Some(0.9));
+        }
+        assert!(
+            sup.spec_override.get("m").is_some(),
+            "one window short of recovery"
+        );
+        sup.spec_governor_window("m", Some(0.9));
+        assert!(sup.spec_override.get("m").is_none());
+        assert_eq!(
+            sup.reshape_queue.get("m").map(|v| v.value().clone()),
+            Some("m".to_string()),
+            "recovery queues the restore reshape"
+        );
+        kill_all(&[ph]);
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[test]
+    fn unit__governed_spec_default__override_then_config() {
+        let sup = routing_sup(1);
+        assert_eq!(sup.governed_spec_default("m"), sup.config.spec);
+        sup.spec_override.insert("m".into(), "off".into());
+        assert_eq!(sup.governed_spec_default("m"), "off");
+        assert_eq!(sup.governed_spec_default("other"), sup.config.spec);
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[test]
+    fn unit__spec_governor_snapshot__sorted_and_labeled() {
+        let sup = routing_sup(1);
+        sup.spec_gov
+            .insert("zeta".to_string(), SpecGovState::default());
+        sup.spec_override
+            .insert("alpha".to_string(), "off".to_string());
+        // A model with both streak state and an override reports parked
+        // once (no duplicate rows).
+        sup.spec_gov
+            .insert("alpha".to_string(), SpecGovState::default());
+        assert_eq!(
+            sup.spec_governor_snapshot(),
+            vec![("alpha".to_string(), true), ("zeta".to_string(), false),]
+        );
     }
 }
