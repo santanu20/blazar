@@ -1385,7 +1385,6 @@ fn semcache_hit_response(model: &str, cached: &Value, id: u64, sim: f32) -> Resp
 /// teaching (`cache_type = "q8_0" halves KV`) must not be a dead end
 /// when the user applies it. Per-phase pairs scale via
 /// `profile::scale_kv_pair` (K and V each hold half the f16 bytes).
-
 pub(crate) async fn apply_num_ctx(
     state: &Arc<AppState>,
     model: &str,

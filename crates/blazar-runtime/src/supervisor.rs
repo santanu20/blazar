@@ -115,6 +115,9 @@ const PRELOAD_MIN_TRANSITIONS: u64 = 3;
 const TRANSITIONS_CAP: usize = 1024;
 /// LC1: cooldown after a failed speculative spawn of a model.
 const PRELOAD_BACKOFF: Duration = Duration::from_mins(5);
+/// F1: idle-to-RAM warm read granularity — large enough to amortize
+/// syscall overhead, small enough to yield between chunks on slow disks.
+const RAM_WARM_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// F12: `keep_alive: -1` cap — 100 years, far enough to be forever in
 /// practice without risking `Instant` overflow arithmetic.
 const KEEP_ALIVE_FOREVER: Duration = Duration::from_hours(876_600);
@@ -1214,6 +1217,10 @@ pub struct Supervisor {
     last_requested: std::sync::Mutex<Option<String>>,
     /// Models whose speculative preload failed recently (LC1 backoff).
     preload_failures: DashMap<String, Instant>,
+    /// Weights files being re-paged into the OS cache right now (F1
+    /// single-flight: one warm per path, later requests are no-ops).
+    /// `Arc` so the detached warm task can retire its own guard.
+    ram_warming: Arc<DashMap<String, ()>>,
     /// Consecutive reaper ticks with concurrent in-flight load on a
     /// single-slot model (LC4 adaptive slots).
     busy_streak: DashMap<String, u32>,
@@ -1386,6 +1393,7 @@ impl Supervisor {
             transitions: DashMap::new(),
             last_requested: std::sync::Mutex::new(None),
             preload_failures: DashMap::new(),
+            ram_warming: Arc::new(DashMap::new()),
             busy_streak: DashMap::new(),
             reshape_draining: DashMap::new(),
             idle_streak: DashMap::new(),
@@ -4581,6 +4589,30 @@ drop them from rpc_servers in config.toml",
         })
     }
 
+    /// F1 gate: the idle-to-RAM warm is pointless (and fights the
+    /// engine) under `direct-io`, which exists precisely to bypass the
+    /// page cache.
+    fn idle_ram_warm_enabled(config: &Config) -> bool {
+        config.idle_ram_warm && config.load_mode != "direct-io"
+    }
+
+    /// F1 primitive: sequentially read a file back into the OS page
+    /// cache. Returns the bytes re-paged. Plain buffered reads — the
+    /// kernel does the caching; the data itself is discarded.
+    fn repage_file(path: &std::path::Path) -> std::io::Result<u64> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)?;
+        let mut buf = vec![0u8; RAM_WARM_CHUNK_BYTES];
+        let mut total: u64 = 0;
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                return Ok(total);
+            }
+            total += n as u64;
+        }
+    }
+
     async fn reap_once(&self) {
         let now = Instant::now();
         // R3 session pins: drop expired windows first, then honor the
@@ -4591,7 +4623,7 @@ drop them from rpc_servers in config.toml",
         for expired in self.sessions.sweep(session_ttl) {
             tracing::debug!(target: "blazar::sessions", session = %expired, "session pin expired");
         }
-        let mut evictions: Vec<String> = Vec::new();
+        let mut evictions: Vec<(String, ModelRow)> = Vec::new();
         for entry in &self.instances {
             let inst = entry.value();
             if inst.in_flight.load(Ordering::SeqCst) > 0 {
@@ -4615,7 +4647,7 @@ drop them from rpc_servers in config.toml",
                 && !session_pinned
                 && !keep_alive
             {
-                evictions.push(inst.name.clone());
+                evictions.push((inst.name.clone(), inst.model.clone()));
             } else if idle >= Duration::from_secs(self.config.idle_sleep_secs)
                 && state == InstanceState::Ready
                 && self.hardware.has_gpu()
@@ -4631,10 +4663,15 @@ drop them from rpc_servers in config.toml",
                 });
             }
         }
-        for name in evictions {
+        for (name, row) in evictions {
             if let Err(e) = self.evict(&name).await {
                 tracing::error!(model = %name, "evict: {e:#}");
+                continue;
             }
+            // F1 RAM tier: refresh the evicted weights in the OS page
+            // cache so a re-spawn mmaps warm instead of faulting from
+            // storage. Best-effort, holds no VRAM.
+            self.warm_ram_after_evict(&name, &row);
         }
         // LC1/LC4 ride the 10s reaper tick.
         self.maybe_preload().await;
@@ -4863,6 +4900,83 @@ drop them from rpc_servers in config.toml",
                 tracing::warn!("predictive preload of {next} failed: {e:#}");
                 self.preload_failures.insert(next, Instant::now());
             }
+        }
+    }
+
+    /// F1 startup preload: spawn every model in `config.preload`, one at
+    /// a time, right after the listener binds. Warn-not-fail by
+    /// contract — an unknown name teaches `blazar pull`, a spawn that
+    /// cannot fit teaches the planner's verdict, and neither ever fails
+    /// the daemon. Idempotent: already-live models are skipped.
+    pub async fn preload_listed(&self) {
+        if self.config.preload.is_empty() {
+            return;
+        }
+        let names = self.config.preload.clone();
+        tracing::info!(count = names.len(), "startup preload list engaged");
+        for name in names {
+            if name == ROUTER_KEY
+                || self
+                    .instances
+                    .iter()
+                    .any(|i| model_of_key(i.key()) == name.as_str())
+            {
+                continue;
+            }
+            match self.spawn_instance(&name).await {
+                Ok(_) => {
+                    tracing::info!(model = %name, "startup preload: resident before first request");
+                }
+                Err(e) => tracing::warn!(
+                    model = %name,
+                    "startup preload failed: {e:#} — pull it first: blazar pull {name}"
+                ),
+            }
+        }
+    }
+
+    /// F1 idle-to-RAM tier: after the idle ladder evicts a child, the
+    /// kernel page cache usually still holds the weights — but under
+    /// memory pressure it may not. A sequential re-read refreshes the
+    /// RAM tier so the next spawn faults from memory, not storage.
+    /// Detached and single-flight per path; holds no VRAM.
+    fn warm_ram_after_evict(&self, model: &str, row: &ModelRow) {
+        if !Self::idle_ram_warm_enabled(&self.config) || model == ROUTER_KEY {
+            return;
+        }
+        let mut paths = vec![std::path::PathBuf::from(&row.path)];
+        if let Some(mmproj) = row.mmproj_path.as_deref() {
+            paths.push(std::path::PathBuf::from(mmproj));
+        }
+        for path in paths {
+            let key = path.display().to_string();
+            match self.ram_warming.entry(key.clone()) {
+                dashmap::mapref::entry::Entry::Occupied(_) => continue,
+                dashmap::mapref::entry::Entry::Vacant(slot) => {
+                    slot.insert(());
+                }
+            }
+            if !path.is_file() {
+                self.ram_warming.remove(&key);
+                continue;
+            }
+            let guard = Arc::clone(&self.ram_warming);
+            let model = model.to_string();
+            tokio::task::spawn_blocking(move || {
+                let started = std::time::Instant::now();
+                match Self::repage_file(&path) {
+                    Ok(bytes) => tracing::debug!(
+                        model = %model,
+                        bytes,
+                        ms = started.elapsed().as_millis(),
+                        "idle-to-RAM warm: weights re-paged into the OS cache"
+                    ),
+                    Err(e) => {
+                        tracing::debug!(model = %model, "idle-to-RAM warm skipped: {e}");
+                    }
+                }
+                guard.remove(&key);
+            });
         }
     }
 
@@ -8591,5 +8705,38 @@ mod routing_tests {
         rx.recv_timeout(std::time::Duration::from_secs(10))
             .expect("eviction deadlocked: dashmap Ref held across remove");
         handle.join().expect("transitions thread");
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[test]
+    fn unit__idle_ram_warm__gate_respects_knob_and_load_mode() {
+        let mut cfg = Config::default();
+        assert!(Supervisor::idle_ram_warm_enabled(&cfg)); // on by default
+        cfg.idle_ram_warm = false;
+        assert!(!Supervisor::idle_ram_warm_enabled(&cfg));
+        cfg.idle_ram_warm = true;
+        // direct-io exists to bypass the page cache — warming it would
+        // fight the configured policy.
+        cfg.load_mode = "direct-io".into();
+        assert!(!Supervisor::idle_ram_warm_enabled(&cfg));
+        cfg.load_mode = "mlock".into();
+        assert!(Supervisor::idle_ram_warm_enabled(&cfg));
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[test]
+    fn unit__repage_file__reads_whole_file_in_chunks() {
+        // 9 MiB + change: crosses the 4 MiB warm chunk boundary twice.
+        let payload: Vec<u8> = (0..9usize * 1024 * 1024 + 123)
+            .map(|i| u8::try_from(i % 251).expect("i % 251 < 256"))
+            .collect();
+        let tmp = tempfile::NamedTempFile::new().expect("temp file");
+        std::fs::write(tmp.path(), &payload).expect("write payload");
+        assert_eq!(
+            Supervisor::repage_file(tmp.path()).expect("repage ok"),
+            payload.len() as u64
+        );
+        let missing = Supervisor::repage_file(std::path::Path::new("/nonexistent/w.gguf"));
+        assert!(missing.is_err());
     }
 }

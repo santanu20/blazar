@@ -947,3 +947,56 @@ async fn integration__bestof__passthrough_chat_lane_teaches_instead_of_ignoring(
     );
     ts.state.sup.shutdown_all().await.unwrap();
 }
+
+#[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+#[tokio::test]
+async fn integration__startup_preload__listed_model_spawns_before_first_request() {
+    // F1: a config preload list spawns the model WITHOUT any client
+    // request — the daemon comes up warm. The stub engine serves as
+    // the child; readiness is awaited by preload_listed itself.
+    let cfg = Config {
+        preload: vec!["m1".into()],
+        ..Config::default()
+    };
+    let ts = start(cfg, &[], false).await;
+    // No HTTP request is made: the supervisor's own startup list must
+    // be the only spawn trigger.
+    ts.state.sup.preload_listed().await;
+    let rows = ts.state.sup.ps();
+    assert!(
+        rows.iter().any(|r| r.name.split('#').next() == Some("m1")),
+        "m1 must be resident from the preload list alone, ps = {rows:?}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+#[tokio::test]
+async fn integration__startup_preload__unknown_name_warns_and_lives_on() {
+    // Warn-not-fail contract: a bogus name teaches `blazar pull` and
+    // the supervisor stays empty but healthy.
+    let cfg = Config {
+        preload: vec!["no-such-model-x".into()],
+        ..Config::default()
+    };
+    let ts = start(cfg, &[], false).await;
+    ts.state.sup.preload_listed().await;
+    assert!(ts.state.sup.ps().is_empty());
+    // A later normal request still works end-to-end.
+    let c = client();
+    let r: serde_json::Value = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(r["choices"][0]["message"]["content"].is_string());
+    ts.state.sup.shutdown_all().await.unwrap();
+}

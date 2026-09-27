@@ -1102,6 +1102,12 @@ pub async fn serve(
         }
         tracing::info!("blazar listening on http://{addr} (OpenAI + ollama APIs)");
         tracing::info!("powered by upstream llama.cpp, mistral.rs and SGLang — unmodified engines");
+        // F1 startup preload: listed models spawn now, one at a time,
+        // while the listener already answers — healthz stays fast.
+        {
+            let sup = Arc::clone(&state.sup);
+            tokio::spawn(async move { sup.preload_listed().await });
+        }
         // TCP_NODELAY on every accepted socket: NDJSON/SSE streams are strings
         // of small writes, and with Nagle the first content packet waits for
         // the client's delayed ACK of the headers/role packet — a flat
@@ -1142,6 +1148,12 @@ pub async fn serve(
                 h
             };
             let _ = state.http_addr.set((h, sa.port()));
+        }
+        // F1 startup preload on the TLS branch too — same contract as
+        // the plain-HTTP branch above.
+        {
+            let sup = Arc::clone(&state.sup);
+            tokio::spawn(async move { sup.preload_listed().await });
         }
         let handle = axum_server::Handle::new();
         let h2 = handle.clone();

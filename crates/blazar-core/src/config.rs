@@ -837,6 +837,19 @@ pub struct Config {
     /// default — it deliberately spends RAM/VRAM ahead of demand.
     #[serde(default)]
     pub predictive_preload: bool,
+    /// Startup preload list (F1): models to spawn right after the
+    /// listener binds, one at a time, so the first user request rides
+    /// a warm child instead of a cold start. Unknown names warn (with
+    /// a `blazar pull` hint) and never fail the daemon.
+    #[serde(default)]
+    pub preload: Vec<String>,
+    /// Idle-to-RAM warm (F1): after the idle ladder evicts a model, a
+    /// background sequential re-read of its weights refreshes the OS
+    /// page cache — the RAM tier between VRAM and disk — so a re-spawn
+    /// mmaps warm pages instead of faulting from storage. Holds no
+    /// VRAM. Skipped under `load_mode = "direct-io"`. On by default.
+    #[serde(default = "default_true")]
+    pub idle_ram_warm: bool,
     /// Adaptive slots (LC4): when a single-slot model sustains
     /// concurrent load for ~60s, adopt slots+1 (in-memory, capped at 4;
     /// `tune --slots` remains the permanent path). On by default.
@@ -2165,6 +2178,8 @@ impl Default for Config {
             lookup_cache_static: None,
             lookup_cache_dynamic: None,
             predictive_preload: false,
+            preload: Vec::new(),
+            idle_ram_warm: true,
             adaptive_slots: true,
             no_host: false,
             op_offload: None,
@@ -3569,6 +3584,17 @@ impl Config {
         }
         if let Some(v) = env("BLAZAR_IDLE_TIMEOUT_SECS") {
             cfg.idle_timeout_secs = parse_u64("BLAZAR_IDLE_TIMEOUT_SECS", &v)?;
+        }
+        if let Some(v) = env("BLAZAR_PRELOAD") {
+            // Comma-separated model list: BLAZAR_PRELOAD=m1,m2:q4_0
+            cfg.preload = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        if let Some(v) = env("BLAZAR_IDLE_RAM_WARM") {
+            cfg.idle_ram_warm = parse_bool("BLAZAR_IDLE_RAM_WARM", &v)?;
         }
         if let Some(v) = env("BLAZAR_MAX_LOADED_MODELS") {
             cfg.max_loaded_models = parse_u32("BLAZAR_MAX_LOADED_MODELS", &v)?;
