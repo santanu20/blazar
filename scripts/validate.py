@@ -1910,6 +1910,62 @@ _K = [
         None,
         "mmproj selection policy option",
     ),
+    (
+        "cache_type_k",
+        False,
+        False,
+        "argv",
+        "G2",
+        "--cache-type-k q8_0 (set side wins over cache_type; lone side mirrors)",
+    ),
+    (
+        "cache_type_v",
+        False,
+        False,
+        "argv",
+        "G2",
+        "--cache-type-v q4_0 (q8_0 K + q4_0 V = 3/8 of f16 KV bytes)",
+    ),
+    (
+        "spec_auto_ngram",
+        False,
+        False,
+        "behavior",
+        None,
+        "ngram fallback gate (spec=auto, no usable pair); frontier wave 1",
+    ),
+    (
+        "spec_auto_manage",
+        False,
+        False,
+        "behavior",
+        None,
+        "per-model spec governor gate; frontier wave 2",
+    ),
+    (
+        "ubatch_auto",
+        False,
+        False,
+        "behavior",
+        None,
+        "adaptive ubatch governor gate; frontier wave 5",
+    ),
+    (
+        "preload",
+        False,
+        False,
+        "behavior",
+        None,
+        "startup preload list (flat names, warn-not-fail); frontier wave 4",
+    ),
+    (
+        "idle_ram_warm",
+        False,
+        False,
+        "behavior",
+        None,
+        "idle-to-RAM page-cache warm gate (skips direct-io); frontier wave 4",
+    ),
 ]
 
 TOPLEVEL_KNOBS = [
@@ -2053,6 +2109,8 @@ def argv_groups():
             ("main_gpu", 0, "--main-gpu 0"),
             ("split_mode", "layer", "--split-mode layer"),
             ("tensor_split", "3,1", "--tensor-split 3,1"),
+            ("cache_type_k", "q8_0", "--cache-type-k q8_0"),
+            ("cache_type_v", "q4_0", "--cache-type-v q4_0"),
             ("prio", 2, "child nice >= 1 via /proc/<pid>/stat"),
             ("prio_batch", 2, "same spawn (nice observable)"),
         ],
@@ -8831,6 +8889,16 @@ def _full_toplevel() -> dict:
         "raw_lane_max_tokens": 2048,
         "spec_autopull": False,
         "child_transport": "tcp",
+        # frontier-wave knobs: config.rs defaults, valid by construction
+        # (differential KV pair composes with the cache_type line above;
+        # governor defaults off; preload empty keeps the boot inert).
+        "cache_type_k": "q8_0",
+        "cache_type_v": "q4_0",
+        "spec_auto_ngram": True,
+        "spec_auto_manage": False,
+        "ubatch_auto": False,
+        "preload": [],
+        "idle_ram_warm": True,
         "child_auth": True,
         "engine_asset": "ubuntu-vulkan-x64",
         "spec": "off",
@@ -9172,6 +9240,42 @@ def phase_env_overrides() -> None:
             b.returncode != 0 and var in b.stderr,
             f"rc={b.returncode} stderr={b.stderr.strip()[:100]!r}",
         )
+
+
+def phase_frontier_knobs() -> None:
+    """Behavior-gate knobs from the frontier waves: real config set->get
+    round-trips through the isolated daemon CLI (the same knobs' env
+    fail-fast contracts are proven by phase env)."""
+    print("\n== phase frontier: wave-knob set->get round-trips ==")
+    cases = [
+        ("spec_auto_ngram", "false"),
+        ("spec_auto_manage", "true"),
+        ("ubatch_auto", "true"),
+        ("idle_ram_warm", "false"),
+    ]
+    for knob, val in cases:
+        cli("config", "set", knob, val)
+        p = cli("config", "get", knob)
+        echoed = val in p.stdout
+        cov(
+            knob,
+            "behavior: accepted + echoed",
+            f"set {knob} {val!r} -> {p.stdout.strip()[:48]!r}",
+            ok=p.returncode == 0 and echoed,
+        )
+        cli("config", "unset", knob)
+    # preload is a list knob: `config set` takes the JSON-array form
+    # (comma-splitting is the BLAZAR_PRELOAD env path, proven by the
+    # startup-preload integration pins); echo check per element.
+    cli("config", "set", "preload", '["m1","m2"]')
+    p = cli("config", "get", "preload")
+    cov(
+        "preload",
+        "behavior: accepted + echoed",
+        f"set preload [m1,m2] -> {p.stdout.strip()[:48]!r}",
+        ok=p.returncode == 0 and "m1" in p.stdout and "m2" in p.stdout,
+    )
+    cli("config", "unset", "preload")
 
 
 def phase_gates() -> None:
@@ -10520,6 +10624,7 @@ def main() -> int:
         ("knobs_argv", phase_knobs_argv),
         ("knobs_behavior", phase_knobs_behavior),
         ("env", phase_env_overrides),
+        ("frontier", phase_frontier_knobs),
         ("gates", phase_gates),
         ("golds", phase_golds),
         ("parity", phase_parity),

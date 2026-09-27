@@ -6735,9 +6735,10 @@ def conc_axes_table(recs: list[dict]) -> str:
 
 
 # Axes whose greedy-output drift is a known property of the knob, not a
-# regression alarm: q8_0 KV quantizes the cache the tokens read from, so
-# slightly different greedy completions are the quant talking, not a bug.
-KNOWN_DRIFT: set[str] = {"cache_q8"}
+# regression alarm: q8_0 KV quantizes the cache the tokens read from, and
+# flash-attention off swaps the attention kernel (different floating-point
+# reduction order) — in both the drift IS the knob, not a bug.
+KNOWN_DRIFT: set[str] = {"cache_q8", "fa_off"}
 
 
 def qc_drift_gate(recs: list[dict]) -> list[str]:
