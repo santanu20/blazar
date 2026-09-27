@@ -363,7 +363,7 @@ pub fn translate_request(v: &Value, stream: bool) -> Result<Value, String> {
         if !mapped.is_empty() {
             out["tools"] = json!(mapped);
             if let Some(choice) = obj.get("tool_choice") {
-                out["tool_choice"] = translate_tool_choice(choice);
+                out["tool_choice"] = translate_tool_choice(choice)?;
             }
         }
     }
@@ -396,17 +396,26 @@ pub fn translate_request(v: &Value, stream: bool) -> Result<Value, String> {
     Ok(out)
 }
 
-fn translate_tool_choice(choice: &Value) -> Value {
+fn translate_tool_choice(choice: &Value) -> Result<Value, String> {
     match choice.get("type").and_then(Value::as_str) {
-        Some("any") => json!("required"),
+        Some("any") => Ok(json!("required")),
+        // Forced-tool is the Anthropic mechanism for schema-bound output
+        // (the dialect has no response_format); the spec requires `name`
+        // here, so a nameless forcing is rejected at the boundary instead
+        // of forwarding a garbage empty function name to the child.
         Some("tool") => {
             let name = choice
                 .get("name")
                 .and_then(Value::as_str)
-                .unwrap_or_default();
-            json!({"type": "function", "function": {"name": name}})
+                .filter(|n| !n.is_empty())
+                .ok_or_else(|| {
+                    "tool_choice.type = \"tool\" requires a non-empty tool_choice.name naming \
+                     one of the request's tools"
+                        .to_string()
+                })?;
+            Ok(json!({"type": "function", "function": {"name": name}}))
         }
-        _ => json!("auto"),
+        _ => Ok(json!("auto")),
     }
 }
 
@@ -1178,6 +1187,55 @@ mod tests {
         assert_eq!(out["stop"], json!(["END"]));
         assert_eq!(out["stream"], true);
         assert_eq!(out["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn unit__translate_tool_choice__forced_tool_binds_named_function() {
+        // Forced-tool is the dialect's structured-output lane: the exact
+        // OpenAI forced-function shape the child enforces a schema with.
+        let out = translate_request(
+            &json!({
+                "model": "m1", "max_tokens": 64, "stream": false,
+                "messages": [{"role": "user", "content": "go"}],
+                "tools": [{"name": "extract", "input_schema": {"type": "object"}}],
+                "tool_choice": {"type": "tool", "name": "extract"}
+            }),
+            false,
+        )
+        .expect("ok");
+        assert_eq!(
+            out["tool_choice"],
+            json!({"type": "function", "function": {"name": "extract"}})
+        );
+    }
+
+    #[test]
+    fn unit__translate_tool_choice__forced_tool_without_name_fails_fast() {
+        let err = translate_request(
+            &json!({
+                "model": "m1", "max_tokens": 64, "stream": false,
+                "messages": [{"role": "user", "content": "go"}],
+                "tools": [{"name": "extract", "input_schema": {"type": "object"}}],
+                "tool_choice": {"type": "tool"}
+            }),
+            false,
+        )
+        .expect_err("nameless forcing must be rejected");
+        assert!(
+            err.contains("tool_choice.name"),
+            "error should name the missing field: {err}"
+        );
+        let empty = translate_request(
+            &json!({
+                "model": "m1", "max_tokens": 64, "stream": false,
+                "messages": [{"role": "user", "content": "go"}],
+                "tools": [{"name": "extract", "input_schema": {"type": "object"}}],
+                "tool_choice": {"type": "tool", "name": ""}
+            }),
+            false,
+        )
+        .expect_err("empty name must be rejected too");
+        assert!(empty.contains("tool_choice.name"), "err: {empty}");
     }
 
     #[test]
