@@ -89,6 +89,15 @@ pub struct Config {
     /// autopull off. Default false.
     #[serde(default)]
     pub spec_autopull: bool,
+    /// When spec = "auto" finds no usable drafter (no catalog pair, pair
+    /// not pulled, or the draft does not fit the card), fall back to
+    /// n-gram lookup speculation instead of running dense. Self-drafting:
+    /// no draft weights, no extra VRAM, and the persisted lookup cache
+    /// (`spec_cache`) makes it warm across restarts. Manifest-gated —
+    /// engines that do not advertise ngram-simple keep the dense
+    /// behavior. Set false (or spec = "off") to stay dense.
+    #[serde(default = "default_true")]
+    pub spec_auto_ngram: bool,
     /// On-demand tensor loading (`--lazy-mode`): "auto" (engine default:
     /// on-demand only for tensors > 4 GiB), "on" (all such tensors from
     /// disk via mmap — big-MoE RAM relief), "off" (fully resident).
@@ -1992,6 +2001,7 @@ impl Default for Config {
             sglang: SglangTuning::default(),
             spec: "auto".to_string(),
             spec_autopull: false,
+            spec_auto_ngram: true,
             lazy_mode: "auto".to_string(),
             server_tools: None,
             server_tools_runtime: None,
@@ -3533,6 +3543,9 @@ impl Config {
         }
         if let Some(v) = env("BLAZAR_SPEC_CACHE") {
             cfg.spec_cache = parse_bool("BLAZAR_SPEC_CACHE", &v)?;
+        }
+        if let Some(v) = env("BLAZAR_SPEC_AUTO_NGRAM") {
+            cfg.spec_auto_ngram = parse_bool("BLAZAR_SPEC_AUTO_NGRAM", &v)?;
         }
         if let Some(v) = env("BLAZAR_CTX_EXTEND") {
             cfg.ctx_extend = parse_f64("BLAZAR_CTX_EXTEND", &v)?;

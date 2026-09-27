@@ -751,7 +751,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     }
 
     // --- 11. speculative decoding
-    let spec_mode = overlay.spec.as_deref().unwrap_or(config.spec.as_str());
+    let mut spec_mode = overlay.spec.as_deref().unwrap_or(config.spec.as_str());
     if spec_mode == "auto" {
         // Embedded MTP head wins over a catalog draft pair: it drafts from
         // the target's own trained weights (no separate model to pull) —
@@ -795,10 +795,29 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         } else {
             false
         };
+        let mut spec_engaged = embedded_mtp;
         if !embedded_mtp {
-            push_spec_args(input, &mut argv, &mut warnings);
+            spec_engaged = push_spec_args(input, &mut argv, &mut warnings);
         }
-    } else if is_ngram_spec(spec_mode) {
+        // Last resort inside auto: self-drafting n-gram lookup. Every
+        // drafter above needs weights the user must pull (or a card big
+        // enough to hold them); n-gram drafts from the context itself —
+        // zero extra VRAM, persisted via spec_cache, and manifest-gated
+        // so old engines keep the dense behavior. The user asked for
+        // speculation by setting spec = "auto"; give them the only lane
+        // that always fits.
+        if !spec_engaged && ngram_fallback_applies(input, config) {
+            warnings.push(format!(
+                "spec=auto: no usable draft pair for {} — n-gram lookup \
+                     speculation engaged (self-drafting, no extra VRAM; \
+                     warm across restarts via spec_cache); set spec = \"off\" \
+                     or spec_auto_ngram = false to disable",
+                input.model_name
+            ));
+            spec_mode = "ngram";
+        }
+    }
+    if is_ngram_spec(spec_mode) {
         // Self-drafting n-gram speculation: no draft model to pull; drafts
         // from the context's own n-grams ("ngram" is blazar shorthand for
         // the upstream "ngram-simple"; the typed variants map verbatim).
@@ -4942,6 +4961,17 @@ fn is_ngram_spec(mode: &str) -> bool {
     )
 }
 
+/// Gate for the spec=auto n-gram fallback: the engine must advertise
+/// `ngram-simple` through `--spec-type` (old engines keep the dense
+/// behavior) and the user must not have opted out. Consulted only when
+/// no drafter engaged — embedded MTP, catalog pair, capacity are all
+/// checked first.
+fn ngram_fallback_applies(input: &ProfileInput<'_>, config: &Config) -> bool {
+    config.spec_auto_ngram
+        && input.supported_flags.contains("--spec-type")
+        && input.spec_types.iter().any(|t| t == "ngram-simple")
+}
+
 /// Manifest-gated passthrough for config knobs: emit `flag` + `values`
 /// only when the active engine advertises the flag; otherwise degrade
 /// to a teaching warning (an older engine still serves with its own
@@ -4967,8 +4997,15 @@ fn push_gated(
 
 /// Rule 11: spec=auto draft pairing, opportunistic by design — an
 /// unpulled or unsupported pair degrades to dense with a teaching
-/// warning; manifest-gated emission when the draft is live.
-fn push_spec_args(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings: &mut Vec<String>) {
+/// warning; manifest-gated emission when the draft is live. Returns
+/// true when a drafter engaged (argv carries spec flags), false when
+/// the spawn will run dense — the auto branch uses that to decide the
+/// n-gram fallback.
+fn push_spec_args(
+    input: &ProfileInput<'_>,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> bool {
     if let Some(pair) = crate::catalog::spec_pair_for(input.model_name) {
         if let Some(draft) = input.draft_path {
             // Self-draft guard: the draft row's registry name can
@@ -4981,7 +5018,7 @@ fn push_spec_args(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings: &m
                          file itself; running dense",
                     input.model_name
                 ));
-                return;
+                return false;
             }
             if !input.supported_flags.contains("--spec-type")
                 || !input
@@ -4996,7 +5033,7 @@ fn push_spec_args(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings: &m
                          engine {} lacks it; running dense — run: blazar engine update",
                     pair.spec_type, input.model_name, input.engine_tag
                 ));
-                return;
+                return false;
             }
             // Capacity gate: the draft rides the SAME card as the main
             // model, and the pre-spawn census's free MiB predates the
@@ -5031,7 +5068,7 @@ fn push_spec_args(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings: &m
                     input.model_bytes / (1024 * 1024),
                     card_free_bytes / (1024 * 1024)
                 ));
-                return;
+                return false;
             }
             argv.push("--spec-type".into());
             argv.push(pair.spec_type.clone());
@@ -5041,28 +5078,29 @@ fn push_spec_args(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings: &m
                 argv.push("--spec-draft-n-max".into());
                 argv.push("3".into());
             }
-        } else {
-            // Opportunistic auto: an unpulled catalog draft degrades
-            // to dense with a teaching warning — auto must never
-            // refuse a spawn (hard errors belong to the explicit
-            // typed modes, where the user asked for THAT drafter).
-            // (`--spec-draft-hf` auto-download exists in b10840+ but
-            // resolves to an empty path and the child exits fatally,
-            // verified live 2026-09-07 — revisit if upstream fixes
-            // draft-side HF resolution.)
-            warnings.push(format!(
-                "spec=auto: draft pair {} for {} is not pulled; running dense — run: \
-                     blazar pull {} to enable speculation",
-                pair.spec_type, input.model_name, pair.draft_repo
-            ));
+            return true;
         }
-    } else {
-        tracing::info!(
-            model = input.model_name,
-            "profile: spec=auto found no draft pair for {} in the catalog; running dense",
-            input.model_name
-        );
+        // Opportunistic auto: an unpulled catalog draft degrades
+        // to dense with a teaching warning — auto must never
+        // refuse a spawn (hard errors belong to the explicit
+        // typed modes, where the user asked for THAT drafter).
+        // (`--spec-draft-hf` auto-download exists in b10840+ but
+        // resolves to an empty path and the child exits fatally,
+        // verified live 2026-09-07 — revisit if upstream fixes
+        // draft-side HF resolution.)
+        warnings.push(format!(
+            "spec=auto: draft pair {} for {} is not pulled; running dense — run: \
+                     blazar pull {} to enable speculation",
+            pair.spec_type, input.model_name, pair.draft_repo
+        ));
+        return false;
     }
+    tracing::info!(
+        model = input.model_name,
+        "profile: spec=auto found no draft pair for {} in the catalog; no drafter engaged",
+        input.model_name
+    );
+    false
 }
 
 /// Router-preset INI generation. Upstream router mode (llama-server with
@@ -5611,6 +5649,12 @@ mod tests {
 
     static DFLASH_SPEC_TYPES: LazyLock<Vec<String>> =
         LazyLock::new(|| vec!["draft-dflash".to_string()]);
+
+    static NGRAM_SPEC_TYPES: LazyLock<Vec<String>> =
+        LazyLock::new(|| vec!["ngram-simple".to_string()]);
+
+    static DRAFT_AND_NGRAM_SPEC_TYPES: LazyLock<Vec<String>> =
+        LazyLock::new(|| vec!["draft-simple".to_string(), "ngram-simple".to_string()]);
 
     /// Same as `input_with_spec` but with a controllable model name — the
     /// default "qwen3-8b" matches the catalog spec-pair prefix, which is
@@ -7944,6 +7988,190 @@ mod tests {
             .argv
             .windows(2)
             .any(|w| w[0] == "--spec-draft-n-max" && w[1] == "3"));
+    }
+
+    #[test]
+    fn unit__spec_auto_ngram_fallback__no_pair_engages_ngram_simple() {
+        let cfg = Config {
+            spec: "auto".into(),
+            slots: 1, // purpose-scoped: spec lane, not slot sizing
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let inp = input_named_with_spec(
+            "no-pair-model-x",
+            &g,
+            &hw,
+            &cfg,
+            &ALL_FLAGS,
+            &NGRAM_SPEC_TYPES,
+        );
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-type" && w[1] == "ngram-simple"),
+            "fallback must engage n-gram lookup: {:?}",
+            p.argv
+        );
+        // Rule 14 rides the effective ngram mode: the lookup cache is
+        // persisted per instance key.
+        let lcache = format!(
+            "/tmp/blazar-test-data/speccache/{}.lcache",
+            path_safe("no-pair-model-x")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--lookup-cache-dynamic" && w[1] == lcache),
+            "persisted lookup cache must ride the fallback: {:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("n-gram lookup") && w.contains("spec_auto_ngram = false")),
+            "teaching warning with opt-out required: {:?}",
+            p.warnings
+        );
+        // No draft model is involved in the fallback lane.
+        assert!(!p.argv.contains(&"--spec-draft-model".to_string()));
+    }
+
+    #[test]
+    fn unit__spec_auto_ngram_fallback__knob_off_stays_dense() {
+        let cfg = Config {
+            spec: "auto".into(),
+            spec_auto_ngram: false,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let inp = input_named_with_spec(
+            "no-pair-model-x",
+            &g,
+            &hw,
+            &cfg,
+            &ALL_FLAGS,
+            &NGRAM_SPEC_TYPES,
+        );
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.iter().any(|a| a == "--spec-type"),
+            "knob off must keep the historical dense behavior: {:?}",
+            p.argv
+        );
+        assert!(!p.argv.contains(&"--lookup-cache-dynamic".to_string()));
+        assert!(
+            !p.warnings.iter().any(|w| w.contains("n-gram lookup")),
+            "no fallback warning when opted out: {:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__spec_auto_ngram_fallback__engine_lacking_ngram_stays_dense() {
+        // Manifest gate: the engine advertises a draft pair type but not
+        // ngram-simple — the fallback must not push argv the child rejects.
+        let cfg = Config {
+            spec: "auto".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let inp = input_named_with_spec(
+            "no-pair-model-x",
+            &g,
+            &hw,
+            &cfg,
+            &ALL_FLAGS,
+            &EAGLE3_SPEC_TYPES,
+        );
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.iter().any(|a| a == "--spec-type"),
+            "old engines keep dense: {:?}",
+            p.argv
+        );
+        assert!(!p.argv.contains(&"--lookup-cache-dynamic".to_string()));
+    }
+
+    #[test]
+    fn unit__spec_auto_ngram_fallback__capacity_gate_falls_back() {
+        // The 8 GiB shape: the pair is pulled but the card cannot hold
+        // model + draft + KV floor — n-gram needs no weights, so the
+        // fallback engages after the capacity warning.
+        let cfg = Config {
+            spec: "auto".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(5_050, 8_000, 8);
+        let g = meta();
+        let mut inp = input_named_with_spec(
+            "qwen3-8b",
+            &g,
+            &hw,
+            &cfg,
+            &ALL_FLAGS,
+            &DRAFT_AND_NGRAM_SPEC_TYPES,
+        );
+        let draft = draft_file("auto-capacity-ngram");
+        inp.draft_path = Some(&draft);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("does not fit the picked card")),
+            "capacity warning still teaches: {:?}",
+            p.warnings
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-type" && w[1] == "ngram-simple"),
+            "fallback engages when the pair cannot fit: {:?}",
+            p.argv
+        );
+        assert!(
+            !p.argv.contains(&"--spec-draft-model".to_string()),
+            "no draft model in the fallback lane: {:?}",
+            p.argv
+        );
+    }
+
+    #[test]
+    fn unit__spec_auto_ngram_fallback__unpulled_pair_falls_back() {
+        let cfg = Config {
+            spec: "auto".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let inp = input_named_with_spec(
+            "qwen3-8b",
+            &g,
+            &hw,
+            &cfg,
+            &ALL_FLAGS,
+            &DRAFT_AND_NGRAM_SPEC_TYPES,
+        );
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("not pulled") && w.contains("blazar pull")),
+            "the pull teaching warning still fires: {:?}",
+            p.warnings
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-type" && w[1] == "ngram-simple"),
+            "unpulled pair falls back instead of running dense: {:?}",
+            p.argv
+        );
     }
 
     #[test]
