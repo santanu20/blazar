@@ -7,3 +7,4 @@
 | 20260924-text-frontier | 20260924 | blazar,cold,conc,direct,features,greedy,greedy_gw,idle,ollama | 28 | 0.11.0 |
 | 20260926-sdcpp-lane | 20260926 | blazar,cold,conc,ctxcurve,direct,features,greedy,greedy_gw,idle,media,ollama,ppl,reshape,tools | 52 | 0.11.0 |
 | 20260927-spec-ngram-default | 20260927 | dense,ngram | 24 | 0.12.0 |
+| 20260927-spec-governor | 20260927 | governor | 1 | 0.12.0 |
