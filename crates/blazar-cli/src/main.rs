@@ -9320,6 +9320,29 @@ fn set_table_key(raw: &str, path: &[&str], leaf: &str, stored: &str) -> String {
 
 /// Read `path.leaf` from the config file (pins only — table knobs have no
 /// defaults in the serialized document). Returns the pinned line, if any.
+/// The full value span for a top-level key: `toml::to_string_pretty`
+/// spreads array values over continuation lines, so the key line may end
+/// at an unbalanced `[`. Walk forward until the bracket depth closes and
+/// return the joined span — `config get preload` must print the whole
+/// list, not a bare `preload = [`. (Config string arrays carry validated
+/// model names; bracket characters inside quoted scalars do not occur.)
+fn top_level_span(lines: &[&str], key: &str) -> Option<String> {
+    let start = lines
+        .iter()
+        .position(|l| key_before_eq(l).is_some_and(|k| k == key))?;
+    let brackets = |l: &str| (l.matches('[').count(), l.matches(']').count());
+    let (mut open, mut close) = brackets(lines[start]);
+    let mut end = start;
+    while open > close {
+        end += 1;
+        let line = lines.get(end)?;
+        let (opened, closed) = brackets(line);
+        open += opened;
+        close += closed;
+    }
+    Some(lines[start..=end].join("\n"))
+}
+
 fn get_table_key(raw: &str, path: &[&str], leaf: &str) -> Option<String> {
     let want: Vec<String> = path.iter().map(std::string::ToString::to_string).collect();
     let lines: Vec<&str> = raw.lines().collect();
@@ -11798,10 +11821,8 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                 }
             } else {
                 let raw = cfg.to_toml().map_err(|e| anyhow!("{e}"))?;
-                if let Some(line) = raw
-                    .lines()
-                    .find(|l| key_before_eq(l).is_some_and(|k| k == key))
-                {
+                let lines: Vec<&str> = raw.lines().collect();
+                if let Some(line) = top_level_span(&lines, &key) {
                     println!("{line}");
                     Ok(())
                 } else {
@@ -12885,6 +12906,41 @@ mod tests {
         assert!(out.contains("slots = 4"), "table body kept");
         // The candidate must still be schema-valid TOML.
         assert!(Config::from_toml(&out).is_ok());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__top_level_span__joins_multiline_array_and_stops_at_next_key() {
+        // `toml::to_string_pretty` layout: the key line opens the array,
+        // elements ride continuation lines. The span must join through the
+        // closing bracket and NOT swallow the next key.
+        let lines = [
+            "slots = 8",
+            "preload = [",
+            "    \"m1\",",
+            "    \"m2\",",
+            "]",
+            "session_bank = true",
+        ];
+        assert_eq!(
+            top_level_span(&lines, "preload").as_deref(),
+            Some("preload = [\n    \"m1\",\n    \"m2\",\n]")
+        );
+        // Plain scalar keys return their single line unchanged.
+        assert_eq!(
+            top_level_span(&lines, "slots").as_deref(),
+            Some("slots = 8")
+        );
+        assert_eq!(
+            top_level_span(&lines, "session_bank").as_deref(),
+            Some("session_bank = true")
+        );
+        // Unknown key -> None (the CLI turns that into its teaching error).
+        assert_eq!(top_level_span(&lines, "no_such_knob"), None);
+        // An unterminated array cannot be joined whole -> None (fail loud
+        // rather than print a truncated value).
+        let unterminated = ["preload = [", "    \"m1\","];
+        assert_eq!(top_level_span(&unterminated, "preload"), None);
     }
 
     #[test]
