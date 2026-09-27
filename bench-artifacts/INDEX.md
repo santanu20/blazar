@@ -9,3 +9,4 @@
 | 20260927-spec-ngram-default | 20260927 | dense,ngram | 24 | 0.12.0 |
 | 20260927-spec-governor | 20260927 | governor | 1 | 0.12.0 |
 | 20260927-best-of-n | 20260927 | bestof | 15 | 0.12.0 |
+| 20260927-kv-continuity | 20260927 | bank,restore,diffkv,preload,ramwarm | 5 | 0.12.0 |
