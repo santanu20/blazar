@@ -2734,6 +2734,154 @@ impl EngineManager {
             })
             .collect()
     }
+
+    /// Adopt legacy `whisper/bin/<tag>` trees into the engines lane:
+    /// move the dir under `engines/` and register it like any engine
+    /// install. The legacy lane predates the engines table, so its
+    /// installs carry no rows — resolution masked ghost rows and the
+    /// lane sat outside `engine prune`'s reach. Called at serve
+    /// preflight and before `engine prune` (the one place an
+    /// unregistered `engines/<tag>` dir — crash-window debris — is
+    /// exposed to deletion). Each tag adopts independently; on failure
+    /// the tree is restored to its legacy path and the rest still
+    /// adopt. After one clean pass this is a no-op. Returns the
+    /// adopted tags, newest first.
+    pub fn adopt_whisper_legacy_trees(&self) -> Vec<String> {
+        let engines_root = self.dirs.engines_dir();
+        let rows = Store::open(&self.dirs)
+            .and_then(|store| store.list_engines())
+            .unwrap_or_default();
+        let mut adopted = Vec::new();
+        for legacy_dir in crate::whisper::sorted_tag_dirs(&self.dirs) {
+            let Some(tag) = legacy_dir
+                .file_name()
+                .and_then(|t| t.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            // Already adopted: a whisper row for this tag whose anchored
+            // binary resolves (second boot after a first-pass adoption,
+            // or a tag the engines lane itself installed).
+            let already = rows.iter().any(|row| {
+                row.kind == EngineKind::Whisper
+                    && row.tag == tag
+                    && serde_json::from_str::<manifest::Manifest>(&row.manifest).is_ok_and(
+                        |mut m| {
+                            m.anchor_server_path(&self.dirs.data_dir);
+                            PathBuf::from(&m.server_path).is_file()
+                        },
+                    )
+            });
+            if already {
+                continue;
+            }
+            match self.adopt_whisper_tree(&legacy_dir, &tag, &engines_root) {
+                Ok(()) => adopted.push(tag),
+                Err(e) => {
+                    tracing::warn!(
+                        "whisper legacy tree {} not adopted (left serving from the legacy lane): {e}",
+                        legacy_dir.display()
+                    );
+                }
+            }
+        }
+        adopted
+    }
+
+    /// Move one legacy whisper tree into the engines lane and register
+    /// it. Ordering is zero-loss: probe before anything moves, retire
+    /// any stale target aside, rename, register, and on failure rescue
+    /// the tree back to its legacy path before restoring the aside.
+    fn adopt_whisper_tree(&self, legacy_dir: &Path, tag: &str, engines_root: &Path) -> Result<()> {
+        // Adoption can be the first engines-lane writer in a fresh
+        // store (live-validated: `engine prune` on a planted legacy
+        // tree, no engines dir yet) — the rename target must exist.
+        std::fs::create_dir_all(engines_root)
+            .with_context(|| format!("mkdir {}", engines_root.display()))?;
+        let target = engines_root.join(tag);
+        // Probe at the legacy path FIRST: a tree without a runnable
+        // whisper-server (corrupt extract, foreign content) must fail
+        // before anything moves.
+        let bin = find_engine_binary(legacy_dir, &["whisper-server", "whisper-server.exe"])?;
+        let label = bin
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .filter(|n| n.starts_with("whisper-bin"))
+            .unwrap_or("legacy");
+        let digest = legacy_tree_digest(&bin)?;
+        // A stale target dir (crash between rename and register, or a
+        // hand-dropped dir) retires aside so the rename lands on the
+        // final path; the aside stays recoverable until registration
+        // succeeds.
+        let aside = retire_engine_dir(&self.dirs.data_dir, &target)?;
+        if let Err(e) = std::fs::rename(legacy_dir, &target) {
+            restore_retired_engine(&self.dirs.data_dir, aside.as_deref(), &target);
+            return Err(anyhow!(
+                "move {} -> {}: {e}",
+                legacy_dir.display(),
+                target.display()
+            ));
+        }
+        match self.register_engine(target.as_path(), tag, label, &digest, EngineKind::Whisper) {
+            Ok(row) => {
+                discard_retired_engine(&self.dirs.data_dir, aside.as_deref());
+                tracing::info!(
+                    "adopted legacy whisper tree {tag} into the engines lane ({})",
+                    row.asset
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // Registration failed after the move: drop any row the
+                // failed attempt left behind (upsert is transactional,
+                // but never bet data placement on that), rescue the
+                // tree back to the legacy lane, then put the aside back.
+                if let Ok(store) = Store::open(&self.dirs) {
+                    if let Err(del) = store.delete_engine(tag) {
+                        tracing::warn!("cannot drop failed adoption row for {tag}: {del}");
+                    }
+                }
+                if let Err(back) = std::fs::rename(&target, legacy_dir) {
+                    // The tree cannot go home: it already sits at the
+                    // final path, so registration is the only way
+                    // forward — retry once before giving up.
+                    tracing::error!(
+                        "cannot restore {} -> {} ({back}) — retrying registration",
+                        target.display(),
+                        legacy_dir.display()
+                    );
+                    let row = self.register_engine(
+                        target.as_path(),
+                        tag,
+                        label,
+                        &digest,
+                        EngineKind::Whisper,
+                    )?;
+                    discard_retired_engine(&self.dirs.data_dir, aside.as_deref());
+                    tracing::info!(
+                        "adopted legacy whisper tree {tag} into the engines lane ({})",
+                        row.asset
+                    );
+                    return Ok(());
+                }
+                restore_retired_engine(&self.dirs.data_dir, aside.as_deref(), &target);
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Content digest of a legacy tree's server binary — the honest value
+/// an asset download would have carried (upstream ships none for
+/// already-extracted trees).
+fn legacy_tree_digest(bin: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut file = std::fs::File::open(bin).with_context(|| format!("open {}", bin.display()))?;
+    std::io::copy(&mut file, &mut hasher).with_context(|| format!("hash {}", bin.display()))?;
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 fn now_secs() -> i64 {

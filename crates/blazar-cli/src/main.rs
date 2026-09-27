@@ -3524,6 +3524,20 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
                     format!("{e} — run: blazar engine update"),
                 )),
             }
+            // Doctor is the discover-and-heal surface, so legacy whisper
+            // trees adopt here too. After a successful pass any ghost
+            // whisper row below is a genuinely dead tree (the adoption
+            // heals the masked-row shape by registering over it).
+            let adopted = mgr.adopt_whisper_legacy_trees();
+            if !adopted.is_empty() {
+                checks.push(Check::ok(
+                    "engine",
+                    format!(
+                        "adopted legacy whisper tree(s) {} into the engines lane",
+                        adopted.join(", ")
+                    ),
+                ));
+            }
             // Ghost rows: the db row outlived its engine dir (manual
             // deletion, disk cleanup). Spawn/verify cannot see these —
             // name them with the heal command instead of failing silently
@@ -3535,7 +3549,7 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
                     format!("blazar engine update --kind {kind}")
                 };
                 let whisper_note = if matches!(kind, EngineKind::Whisper) {
-                    " (audio transcription still serves from the legacy whisper tree)"
+                    " (audio transcription may still serve from a legacy whisper tree)"
                 } else {
                     ""
                 };
@@ -4129,7 +4143,7 @@ async fn doctor_whisper_currency(d: &BlazarDirs) -> Vec<Check> {
         return vec![Check::warn(
             "whisper lane",
             "not installed — optional: `blazar engine install --kind whisper` \
-             (legacy: `blazar whisper --install`) enables local \
+             (alias: `blazar whisper --install`) enables local \
              /v1/audio/transcriptions + /v1/audio/translations",
         )];
     }
@@ -4137,14 +4151,10 @@ async fn doctor_whisper_currency(d: &BlazarDirs) -> Vec<Check> {
     // subdir name leaked in here once and the warning could not clear
     // through any update (live: "running: whisper-bin-ubuntu-x64").
     let installed = blazar_runtime::whisper::installed_tag(d).unwrap_or_else(|| "?".into());
-    // Update hints name the lane that actually updates the serving
-    // binary: while an engines row backs the lane, the legacy
-    // `whisper --install` tree is never picked by server_bin.
-    let action = if blazar_runtime::whisper::engines_lane_installed(d) {
-        "blazar engine update --kind whisper"
-    } else {
-        "blazar whisper --install"
-    };
+    // `whisper --install` funnels into the engines lane since the
+    // legacy-tree redirect, so one update command covers both entry
+    // points — no lane fork needed.
+    let action = "blazar engine update --kind whisper";
     let token = std::env::var("GH_TOKEN")
         .or_else(|_| std::env::var("GITHUB_TOKEN"))
         .ok();
@@ -4178,8 +4188,8 @@ async fn doctor_whisper_currency(d: &BlazarDirs) -> Vec<Check> {
 
 /// Pinned-whisper currency verdict (pure): deliberate pin named as such —
 /// plain --install silently unpins, so updates point at the
-/// pin-preserving --tag form. `action` is the lane-aware update command
-/// for the unpinned verdict (pins are a legacy-tree concept).
+/// pin-preserving --tag form. `action` is the update command for the
+/// unpinned verdict (the pin file is lane-agnostic).
 fn whisper_pin_verdict(d: &BlazarDirs, installed: &str, latest: &str, action: &str) -> Check {
     match blazar_runtime::whisper::pinned_tag(d) {
         Some(pin) if pin == latest => {
@@ -4900,6 +4910,17 @@ async fn serve() -> Result<()> {
         let row = mgr.register_local(&p, &cfg.engine_env)?;
         mgr.use_tag(&row.tag)?;
         println!("BLAZAR_ENGINE_PATH: engine local active ({})", p.display());
+    }
+    // Adopt legacy whisper trees into the engines lane before the
+    // serving pick: resolution already prefers rows, so the pick is
+    // identical — but the tree gains prune/verify coverage and ghost
+    // rows heal instead of being masked by the legacy tree.
+    let adopted = local_engine_manager(&d)?.adopt_whisper_legacy_trees();
+    if !adopted.is_empty() {
+        println!(
+            "serve: adopted legacy whisper tree(s) {} into the engines lane",
+            adopted.join(", ")
+        );
     }
     // Self-heal the zero-active state (update interrupted before its
     // activation step): an installed serving engine must never sit
@@ -7274,7 +7295,7 @@ async fn whisper_cmd(
                 println!("server: {tag}{pin} ({})", bin.display());
             }
             None => println!(
-                "server: not installed (blazar engine install --kind whisper; legacy: blazar whisper --install)"
+                "server: not installed (blazar engine install --kind whisper, or blazar whisper --install)"
             ),
         }
         let installed = blazar_runtime::whisper::installed_tags(&d);
@@ -11127,12 +11148,17 @@ fn engine_prune(d: &BlazarDirs) -> Result<()> {
 fn engine_prune_summary(d: &BlazarDirs) -> Result<String> {
     let store = Store::open(d)?;
     let mgr = local_engine_manager(d)?;
+    // Adopt-before-prune: a legacy whisper tree that crashed between
+    // move and register is an unregistered engines/<tag> dir — exactly
+    // what prune_orphan_dirs below deletes. Adopting first closes that
+    // crash window; adopting any other leftover is a free heal.
+    let adopted = mgr.adopt_whisper_legacy_trees();
     let freed = mgr.prune(&store, None)?;
     // Row-less dirs are invisible to the table sweep above yet eat disk;
     // reclaim them in the same manual pass.
     let orphans = mgr.prune_orphan_dirs()?;
     let kept: Vec<String> = store.list_engines()?.into_iter().map(|e| e.tag).collect();
-    if freed.is_empty() && orphans.is_empty() {
+    if freed.is_empty() && orphans.is_empty() && adopted.is_empty() {
         return Ok(format!(
             "nothing to prune — {} engines kept: {}",
             kept.len(),
@@ -11140,6 +11166,12 @@ fn engine_prune_summary(d: &BlazarDirs) -> Result<String> {
         ));
     }
     let mut parts = Vec::new();
+    if !adopted.is_empty() {
+        parts.push(format!(
+            "adopted legacy whisper tree(s) {} into the engines lane",
+            adopted.join(", ")
+        ));
+    }
     if !freed.is_empty() {
         let removed: Vec<String> = freed
             .iter()

@@ -140,89 +140,12 @@ pub async fn channel_target(gh: &GhClient, channel: UpdateChannel) -> Result<Str
     Ok(release_for_channel(gh, channel).await?.tag_name)
 }
 
-/// Download + extract a whisper.cpp release. `Some(tag)` installs that
-/// release; `pin` decides whether it becomes the runtime pin (explicit
-/// `--tag` = pin, channel-resolution = no pin). `None` installs the
-/// newest release that ships this platform's server binary and returns
-/// to tracking the newest tag (clears any pin). Old tags are
-/// pruned to `KEEP_TAGS` (pinned always kept). Returns the installed tag.
-pub async fn install(
-    gh: &GhClient,
-    dirs: &BlazarDirs,
-    tag: Option<&str>,
-    pin: bool,
-) -> Result<String> {
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
-    let Some(asset_name) = asset_name(os, arch) else {
-        return Err(anyhow!(
-            "whisper.cpp releases ship no {os}/{arch} server binary \
-             (macOS: build from source — \
-             https://github.com/ggml-org/whisper.cpp/blob/master/docs/build.md)"
-        ));
-    };
-    // Asset-aware latest: an assetless newest tag (v1.9.4 shape) must
-    // fall through to the newest release that actually installs.
-    let release = match tag {
-        Some(t) => gh.release_by(WHISPER_REPO, Some(t)).await?,
-        None => release_for_channel(gh, UpdateChannel::Latest).await?,
-    };
-    let asset = release
-        .assets
-        .iter()
-        .find(|a| a.name == asset_name)
-        .ok_or_else(|| anyhow!("release {} has no asset {asset_name}", release.tag_name))?;
-    let bytes = gh.download_asset_bytes(asset).await?;
-    let dir = bin_root(dirs).join(&release.tag_name);
-    // F96: replace, don't merge — a re-install over an existing tag dir
-    // must not leave stale binaries from the old extract behind. A dir
-    // resolving outside the data root (symlinked bin root) cannot be
-    // replaced in place, so the install refuses instead of merging.
-    if dir.exists() {
-        match blazar_core::fs_safety::remove_dir_within(&dirs.data_dir, &dir) {
-            Ok(
-                blazar_core::fs_safety::GuardedRemoval::Removed
-                | blazar_core::fs_safety::GuardedRemoval::Absent,
-            ) => {}
-            Ok(blazar_core::fs_safety::GuardedRemoval::Escaped) => {
-                return Err(anyhow!(
-                    "whisper dir {} resolves outside the data root (symlinked \
-                     whisper bin dir?) — unhook the link, then retry",
-                    dir.display()
-                ));
-            }
-            Err(e) => return Err(anyhow!("replace {}: {e}", dir.display())),
-        }
-    }
-    std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
-    crate::engine::extract_archive(&bytes, &dir, &asset.name)?;
-    server_bin_in(&dir).ok_or_else(|| {
-        anyhow!(
-            "extracted {} but no whisper-server binary found under {}",
-            asset.name,
-            dir.display()
-        )
-    })?;
-    // Selection policy: pinned installs pin it; unpinned installs track newest.
-    match (tag, pin) {
-        (Some(_), true) => {
-            std::fs::write(pin_path(dirs), format!("{}\n", release.tag_name))
-                .with_context(|| format!("write pin {}", pin_path(dirs).display()))?;
-        }
-        (Some(_), false) => {}
-        (None, _) => {
-            let _ = std::fs::remove_file(pin_path(dirs));
-        }
-    }
-    prune(dirs)?;
-    Ok(release.tag_name)
-}
-
 /// Active whisper-server binary plus its directory (needed as
 /// `LD_LIBRARY_PATH` on Linux: the binary dlopens sibling libggml*.so).
 /// Resolution order: the engines-table lane (`blazar engine install
 /// --kind whisper`) first, then the legacy `data/whisper/bin` tree —
-/// both stay working installs.
+/// both stay working installs (the engines lane adopts legacy trees
+/// at serve preflight, doctor, and `engine prune`).
 #[must_use]
 pub fn server_bin(dirs: &BlazarDirs) -> Option<(PathBuf, PathBuf)> {
     // A pin is lane-agnostic (the user has ONE --pin flag and cannot be
@@ -397,8 +320,11 @@ fn tag_key(tag: &str) -> TagKey {
 
 /// Installed tag dirs, newest first: semver tags by (major, minor, patch)
 /// descending, then unparseable tags alphabetically descending (date
-/// shapes compare correctly as strings).
-fn sorted_tag_dirs(dirs: &BlazarDirs) -> Vec<PathBuf> {
+/// shapes compare correctly as strings). `pub(crate)`: the engines lane's
+/// legacy-tree adoption walks these same dirs, newest first, so the
+/// freshest tag registers first and per-kind retention keeps the right
+/// two when a legacy tree holds more.
+pub(crate) fn sorted_tag_dirs(dirs: &BlazarDirs) -> Vec<PathBuf> {
     let mut tags: Vec<(TagKey, String)> = std::fs::read_dir(bin_root(dirs))
         .into_iter()
         .flatten()
@@ -893,7 +819,6 @@ fn server_args(port: u16, model_path: &Path) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::engine::gh::GhAsset;
-    use sha2::Digest;
 
     fn release(tag: &str, prerelease: bool, assets: &[&str]) -> GhRelease {
         GhRelease {
@@ -1498,167 +1423,6 @@ mod tests {
         }
         prune(&dirs).expect("prune");
         let expected: Vec<String> = ["v1.10.0", "v1.9.0", "v1.8.0", "v1.7.0"]
-            .into_iter()
-            .take(crate::engine::KEEP_TAGS)
-            .map(String::from)
-            .collect();
-        assert_eq!(installed_tags(&dirs), expected);
-    }
-
-    /// Full wiremock cycle: `--tag` install pins, plain install unpins,
-    /// prune keeps the newest `KEEP_TAGS`.
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)] // one full install cycle, splitting hides the wire flow
-    async fn install__tag_pins_latest_unpins_prunes() {
-        async fn mount(
-            api: &wiremock::MockServer,
-            endpoint: &str,
-            tag: &str,
-            asset: &str,
-            bytes: &[u8],
-        ) {
-            mount_list(api, endpoint, tag, asset, bytes, false).await;
-        }
-
-        // `install(None)` resolves the channel through the paginated
-        // `repos/{repo}/releases` list endpoint (release_for_channel), so the
-        // latest-lane mock must serve an array, not the single-object
-        // `/releases/latest` shape.
-        async fn mount_list(
-            api: &wiremock::MockServer,
-            endpoint: &str,
-            tag: &str,
-            asset: &str,
-            bytes: &[u8],
-            as_array: bool,
-        ) {
-            use wiremock::matchers::{method, path};
-            let release = serde_json::json!({
-                "tag_name": tag,
-                "prerelease": false,
-                "assets": [{
-                    "name": asset,
-                    "digest": format!("sha256:{:x}", sha2::Sha256::digest(bytes)),
-                    "size": bytes.len(),
-                    "browser_download_url": format!("{}/download/{}/{}", api.uri(), tag, asset),
-                }]
-            });
-            let body = if as_array {
-                serde_json::json!([release])
-            } else {
-                release
-            };
-            wiremock::Mock::given(method("GET"))
-                .and(path(endpoint))
-                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
-                .mount(api)
-                .await;
-            wiremock::Mock::given(method("GET"))
-                .and(path(format!("/download/{tag}/{asset}")))
-                .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
-                .mount(api)
-                .await;
-        }
-
-        let Some(asset) = asset_name(std::env::consts::OS, std::env::consts::ARCH) else {
-            return; // platform without an upstream server binary
-        };
-        let tmp = tempfile::tempdir().expect("tmp");
-        let dirs = BlazarDirs {
-            config_dir: tmp.path().join("cfg"),
-            data_dir: tmp.path().join("data"),
-        };
-        let api = wiremock::MockServer::start().await;
-
-        let archive = |tag: &str| -> Vec<u8> {
-            use std::io::Write as _;
-            let root = format!("whisper-{tag}");
-            // Upstream ships zips to Windows and tar.gz everywhere else;
-            // the fixture mirrors the format the host lane downloads.
-            if cfg!(windows) {
-                let mut buf = std::io::Cursor::new(Vec::new());
-                let mut z = zip::ZipWriter::new(&mut buf);
-                let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
-                z.add_directory(root.clone(), opts).unwrap();
-                // The install lane probes the platform-specific binary name
-                // (server_bin_in), so the fixture must carry it too.
-                let bin = if cfg!(windows) {
-                    "whisper-server.exe"
-                } else {
-                    "whisper-server"
-                };
-                z.start_file(format!("{root}/{bin}"), opts).unwrap();
-                z.write_all(b"stub").unwrap();
-                z.finish().unwrap();
-                return buf.into_inner();
-            }
-            let mut tarbuf = Vec::new();
-            {
-                let mut builder = tar::Builder::new(&mut tarbuf);
-                let mut header = tar::Header::new_gnu();
-                header.set_size(0);
-                header.set_entry_type(tar::EntryType::Directory);
-                header.set_mode(0o755);
-                header.set_cksum();
-                builder
-                    .append_data(&mut header, &root, std::io::empty())
-                    .unwrap();
-                let mut header = tar::Header::new_gnu();
-                header.set_size(4);
-                header.set_entry_type(tar::EntryType::Regular);
-                header.set_mode(0o755);
-                header.set_cksum();
-                builder
-                    .append_data(&mut header, format!("{root}/whisper-server"), &b"stub"[..])
-                    .unwrap();
-                builder.finish().unwrap();
-            }
-            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-            gz.write_all(&tarbuf).unwrap();
-            gz.finish().unwrap()
-        };
-
-        let v181 = archive("v1.8.1");
-        mount(
-            &api,
-            "/repos/ggml-org/whisper.cpp/releases/tags/v1.8.1",
-            "v1.8.1",
-            asset,
-            &v181,
-        )
-        .await;
-        let v190 = archive("v1.9.0");
-        mount_list(
-            &api,
-            "/repos/ggml-org/whisper.cpp/releases",
-            "v1.9.0",
-            asset,
-            &v190,
-            true,
-        )
-        .await;
-
-        let gh = GhClient::with_base(&api.uri(), None).unwrap();
-
-        // Tag install: pins.
-        let tag = install(&gh, &dirs, Some("v1.8.1"), true)
-            .await
-            .expect("tag install");
-        assert_eq!(tag, "v1.8.1");
-        assert_eq!(pinned_tag(&dirs), Some("v1.8.1".into()));
-        assert!(server_bin(&dirs).is_some_and(|(_, d)| d.ends_with("v1.8.1")));
-
-        // Older staged dirs + a latest install: unpins, prunes to the
-        // KEEP_TAGS newest.
-        for t in ["v1.7.0", "v1.6.0", "v1.5.0"] {
-            stage_server(&dirs, t);
-        }
-        let tag = install(&gh, &dirs, None, false)
-            .await
-            .expect("latest install");
-        assert_eq!(tag, "v1.9.0");
-        assert_eq!(pinned_tag(&dirs), None);
-        let expected: Vec<String> = ["v1.9.0", "v1.8.1", "v1.7.0", "v1.6.0", "v1.5.0"]
             .into_iter()
             .take(crate::engine::KEEP_TAGS)
             .map(String::from)
