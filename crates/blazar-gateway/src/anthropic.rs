@@ -204,8 +204,9 @@ pub async fn messages(
     }
     // Best-of-N: judge N candidates on the translated child body, return
     // the winner as a normal child response (usage summed across
-    // candidates). `None` (knob off, degraded, first-copy transport
-    // failure) falls through to the single-send path below.
+    // candidates). Skip/Degraded (knob off, guard collapse, first-copy
+    // transport failure) falls through to the single-send path below; a
+    // guard degrade still stamps the reason header.
     let mut bestof_hdr: Option<String> = None;
     let fan = if let Some(want) = best_of.filter(|n| *n >= 2) {
         crate::bestof::fan_out(
@@ -217,14 +218,17 @@ pub async fn messages(
         )
         .await
     } else {
-        None
+        crate::bestof::FanOut::Skip
     };
+    if let crate::bestof::FanOut::Degraded(h) = &fan {
+        bestof_hdr = Some(h.clone());
+    }
     let resp = match fan {
-        Some(outcome) => {
+        crate::bestof::FanOut::Ran(outcome) => {
             bestof_hdr = Some(outcome.hdr);
             outcome.resp
         }
-        None => match send.send().await {
+        _ => match send.send().await {
             Ok(r) => r,
             Err(e) => return anthropic_error(502, "api_error", &format!("engine: {e}")),
         },

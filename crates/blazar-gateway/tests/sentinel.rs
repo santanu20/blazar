@@ -897,6 +897,47 @@ async fn integration__bestof__fanout_sums_usage_and_stamps_header() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn integration__bestof__headroom_degrade_stamps_reason_header() {
+    // slots = 1: the child can never afford a second candidate, so the
+    // guard must collapse the fan-out to the normal single-send path —
+    // but the ask was heard, and the response must say why it shrank.
+    let cfg = Config {
+        slots: 1,
+        ..Config::default()
+    };
+    let ts = start(cfg, &[], false).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "best_of": 2,
+            "messages": [{"role": "user", "content": "hello starved world"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let hdr = resp
+        .headers()
+        .get("x-blazar-best-of")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        hdr.contains("asked=2 used=1 reason=headroom"),
+        "degrade must be client-visible: {hdr}"
+    );
+    // The response itself is a normal single send: full body, no
+    // doubled usage.
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["message"]["content"].is_string(), "{body}");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn integration__bestof__stream_plus_bestof_is_rejected() {
     let ts = start(Config::default(), &[], false).await;
     let c = client();

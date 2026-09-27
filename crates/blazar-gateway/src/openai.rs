@@ -923,22 +923,26 @@ pub async fn responses_api(
     )
     .body(new_body.clone());
     // Best-of-N: judge N candidates, return the winner as a normal child
-    // response (usage summed across candidates). `None` (knob off,
-    // degraded, first-copy transport failure) takes the single-send path
-    // below with its respawn-retry contract intact.
+    // response (usage summed across candidates). Skip/Degraded (knob
+    // off, guard collapse, first-copy transport failure) takes the
+    // single-send path below with its respawn-retry contract intact; a
+    // guard degrade still stamps the reason header.
     let mut bestof_hdr: Option<String> = None;
     let fan = if let Some(want) = best_of.filter(|n| *n >= 2) {
         crate::bestof::fan_out(&state, &engine, &url, &new_body, want).await
     } else {
-        None
+        crate::bestof::FanOut::Skip
     };
+    if let crate::bestof::FanOut::Degraded(h) = &fan {
+        bestof_hdr = Some(h.clone());
+    }
     let resp = match fan {
-        Some(outcome) => {
+        crate::bestof::FanOut::Ran(outcome) => {
             state.ttft.observe_secs(outcome.elapsed.as_secs_f64());
             bestof_hdr = Some(outcome.hdr);
             outcome.resp
         }
-        None => match crate::proxy::child_send(&state, &engine, req.send()).await {
+        _ => match crate::proxy::child_send(&state, &engine, req.send()).await {
             Ok(r) => {
                 state.ttft.observe_secs(t0.elapsed().as_secs_f64());
                 r

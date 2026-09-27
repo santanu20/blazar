@@ -76,20 +76,43 @@ pub fn resolve_best_of(
         .map(|n| n.min(MAX_BEST_OF)))
 }
 
-/// Fan-out size after the saturation guard: any queued work collapses
-/// to 1 (candidates must never push real traffic back), otherwise the
-/// model's free decode slots bound the count.
-pub(crate) fn effective_n(state: &Arc<AppState>, model: &str, want: u64) -> u64 {
-    if state.queue.depth() > 0 {
-        FANOUT_DEGRADED.fetch_add(1, Ordering::Relaxed);
-        return 1;
+/// Pure decision core of the saturation guard: the fan-out size plus the
+/// degrade reason when it shrank. Reasons are stable header vocabulary:
+/// `queue` (real traffic is waiting — candidates must never push it
+/// back), `headroom` (the child has no free decode slot to judge on).
+/// A partial shrink that still runs (headroom >= 2) needs no reason —
+/// the ran header already reports `asked`/`used` truthfully.
+pub(crate) fn decide_n(queue_depth: u64, headroom: u64, want: u64) -> (u64, Option<&'static str>) {
+    if queue_depth > 0 {
+        return (1, Some("queue"));
     }
-    let headroom = u64::from(state.sup.slot_headroom(model));
     if headroom < want {
-        FANOUT_DEGRADED.fetch_add(1, Ordering::Relaxed);
-        return headroom.max(1);
+        let reason = (headroom < 2).then_some("headroom");
+        return (headroom.max(1), reason);
     }
-    want
+    (want, None)
+}
+
+/// Fan-out size after the saturation guard. See `decide_n` for the
+/// reason taxonomy; this wrapper counts the degrade and, on a
+/// headroom-starved idle child, records slot pressure so the adaptive
+/// slot adoption can reshape the child and give LATER fan-outs real
+/// headroom.
+pub(crate) fn effective_n(
+    state: &Arc<AppState>,
+    model: &str,
+    want: u64,
+) -> (u64, Option<&'static str>) {
+    let depth = u64::try_from(state.queue.depth()).unwrap_or(0);
+    let headroom = u64::from(state.sup.slot_headroom(model));
+    let (n, reason) = decide_n(depth, headroom, want);
+    if n < want {
+        FANOUT_DEGRADED.fetch_add(1, Ordering::Relaxed);
+    }
+    if reason == Some("headroom") {
+        state.sup.note_slot_pressure(model);
+    }
+    (n, reason)
 }
 
 /// The schema a candidate must satisfy, read off the TRANSLATED child
@@ -172,10 +195,24 @@ pub(crate) struct FanOutOutcome {
     pub hdr: String,
 }
 
-/// Run the fan-out and judge it. `None` = take the normal single-send
-/// path instead: knob absent, saturation- or size-degraded, or the
-/// first candidate failed on transport (the caller's existing
-/// respawn-retry contract then owns crash recovery — re-running the
+/// What `fan_out` decided, for the caller's path choice.
+pub(crate) enum FanOut {
+    /// Fan-out ran; the judged winner rides inside.
+    Ran(FanOutOutcome),
+    /// Take the normal single-send path; nothing to surface (knob off,
+    /// non-JSON body, or first-copy transport failure — the normal
+    /// path's respawn-retry contract owns crash recovery).
+    Skip,
+    /// The saturation guard or the body cap collapsed the fan-out to a
+    /// single send. Take the normal path unchanged, then stamp this
+    /// transparency header so the client sees the ask was heard and why
+    /// it shrank.
+    Degraded(String),
+}
+
+/// Run the fan-out and judge it. See `FanOut` for the outcomes — every
+/// non-`Ran` variant falls back to the caller's single-send path, whose
+/// respawn-retry contract then owns crash recovery (re-running the
 /// request once through that path beats failing a live lane because one
 /// of N speculative copies died).
 pub(crate) async fn fan_out(
@@ -184,10 +221,13 @@ pub(crate) async fn fan_out(
     url: &str,
     child_body: &[u8],
     want: u64,
-) -> Option<FanOutOutcome> {
-    let n = effective_n(state, &engine.name, want);
+) -> FanOut {
+    let (n, reason) = effective_n(state, &engine.name, want);
     if n < 2 {
-        return None;
+        return match reason {
+            Some(r) => FanOut::Degraded(format!("asked={want} used=1 reason={r}")),
+            None => FanOut::Skip,
+        };
     }
     if child_body.len() > MAX_FANOUT_BODY_BYTES {
         tracing::warn!(
@@ -197,9 +237,12 @@ pub(crate) async fn fan_out(
             child_body.len()
         );
         FANOUT_DEGRADED.fetch_add(1, Ordering::Relaxed);
-        return None;
+        return FanOut::Degraded(format!("asked={want} used=1 reason=body-cap"));
     }
-    let parsed: Value = serde_json::from_slice(child_body).ok()?;
+    let parsed: Value = match serde_json::from_slice(child_body) {
+        Ok(v) => v,
+        Err(_) => return FanOut::Skip,
+    };
     let schema = request_schema(&parsed);
     FANOUT_ACTIVE.fetch_add(1, Ordering::Relaxed);
     let t0 = std::time::Instant::now();
@@ -221,20 +264,22 @@ pub(crate) async fn fan_out(
             "candidate 0 failed transport ({}) — falling back to the single-send path",
             results[0].as_ref().unwrap_err()
         );
-        return None;
+        return FanOut::Skip;
     }
     // Buffer + parse the completed candidates; a candidate that fails
     // body-read is a lost candidate, not a failed request.
     let mut cands: Vec<(u16, Value, axum::body::Bytes)> = Vec::with_capacity(results.len());
     for r in results {
-        let resp = r.ok()?;
+        let Ok(resp) = r else { return FanOut::Skip };
         let status = resp.status().as_u16();
-        let bytes = resp.bytes().await.ok()?;
+        let Ok(bytes) = resp.bytes().await else {
+            return FanOut::Skip;
+        };
         let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         cands.push((status, value, bytes));
     }
     if cands.is_empty() {
-        return None;
+        return FanOut::Skip;
     }
     let used = u64::try_from(cands.len()).unwrap_or(u64::MAX);
     let judged: Vec<(u16, Value)> = cands.iter().map(|c| (c.0, c.1.clone())).collect();
@@ -256,19 +301,24 @@ pub(crate) async fn fan_out(
     } else {
         serde_json::to_vec(winner_val).map_or_else(|_| raw.clone(), axum::body::Bytes::from)
     };
-    let http_resp = axum::http::Response::builder()
+    let built = axum::http::Response::builder()
         .status(
             axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
         )
         .header("content-type", "application/json")
         .header(HEADER, &hdr)
         .body(body)
-        .ok()?;
-    Some(FanOutOutcome {
-        resp: reqwest::Response::from(http_resp),
-        elapsed: t0.elapsed(),
-        hdr,
-    })
+        .ok();
+    match built {
+        Some(http_resp) => FanOut::Ran(FanOutOutcome {
+            resp: reqwest::Response::from(http_resp),
+            elapsed: t0.elapsed(),
+            hdr,
+        }),
+        // The builder rejects only absurd header input; the judged winner
+        // is unusable, so the normal path re-sends once.
+        None => FanOut::Skip,
+    }
 }
 
 /// Stamp the transparency header onto a client-facing response (the
@@ -390,5 +440,20 @@ mod tests {
         assert_eq!(winner["usage"]["prompt_tokens"], json!(30));
         assert_eq!(winner["usage"]["completion_tokens"], json!(21));
         assert!(header.contains("asked=3 used=3"), "{header}");
+    }
+
+    #[test]
+    fn unit__decide_n__degrade_reason_taxonomy() {
+        // Queued real traffic always wins: candidates collapse to 1.
+        assert_eq!(decide_n(1, 8, 2), (1, Some("queue")));
+        // No free decode slot on an idle child: degrade with the reason
+        // the adaptive-slot growth path keys on.
+        assert_eq!(decide_n(0, 0, 2), (1, Some("headroom")));
+        assert_eq!(decide_n(0, 1, 2), (1, Some("headroom")));
+        // Partial shrink that still runs: header's asked/used already
+        // tells the truth — no extra reason.
+        assert_eq!(decide_n(0, 3, 4), (3, None));
+        // Full headroom: run the ask as-is.
+        assert_eq!(decide_n(0, 8, 2), (2, None));
     }
 }

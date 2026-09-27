@@ -1595,21 +1595,25 @@ async fn proxy_core_chat(
         // child response (usage summed across candidates). Degrades to
         // the single-send path below on saturation, oversize bodies, or
         // a first-copy transport failure (that path's respawn retry
-        // then owns crash recovery).
+        // then owns crash recovery); a guard degrade still stamps the
+        // reason header so the client sees the ask was heard.
         let mut bestof_hdr: Option<String> = None;
         let fan = match best_of.filter(|n| *n >= 2) {
             Some(want) => crate::bestof::fan_out(state, engine, &url, &openai_body, want).await,
-            None => None,
+            None => crate::bestof::FanOut::Skip,
         };
+        if let crate::bestof::FanOut::Degraded(h) = &fan {
+            bestof_hdr = Some(h.clone());
+        }
         let resp = match fan {
-            Some(outcome) => {
+            crate::bestof::FanOut::Ran(outcome) => {
                 let s = outcome.elapsed.as_secs_f64();
                 state.ttft.observe_secs(s);
                 ttft_secs = Some(s);
                 bestof_hdr = Some(outcome.hdr);
                 outcome.resp
             }
-            None => {
+            _ => {
                 match crate::proxy::child_send(state, engine, req.body(openai_body.clone()).send())
                     .await
                 {
