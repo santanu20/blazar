@@ -141,10 +141,18 @@ jobs:
           \`blazar engine update\` after install to fetch the official upstream
           build for your GPU.
           EOF
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "$GITHUB_REF_NAME" \
-            --notes-file notes.md \
-            --generate-notes
+          # Idempotent publish: a re-run (re-run-failed-jobs or a fresh run on
+          # the same tag) must not die on "a release with the same tag name
+          # already exists" — that stranded v0.12.0 with a published release
+          # and zero assets. If the object exists, clobber-upload into it.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file notes.md \
+              --generate-notes
+          fi
 
   # Real-OS validation of the just-published installers: download via the
   # GitHub API, sha256-verify, extract, PATH, service lane. Engine
