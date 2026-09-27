@@ -63,6 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     .map(String::from)
     .collect();
     let overlay = ModelOverride::default();
+    let default_cfg = Config::default();
     let input = ProfileInput {
         engine_kind: blazar_core::engine_kind::EngineKind::LlamaCpp,
         model_name: "qwen3.5-9b",
@@ -71,8 +72,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         model_bytes: std::fs::metadata(&model)?.len(),
         meta: ModelMeta::Gguf(&gguf),
         hardware: &hw,
-        config: &Config::default(),
+        config: &default_cfg,
         overlay: &overlay,
+        spec_mode: &default_cfg.spec,
         loras: &[],
         draft_path: None,
         draft_gguf: None,

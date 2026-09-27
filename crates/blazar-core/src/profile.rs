@@ -59,6 +59,13 @@ pub struct ProfileInput<'a> {
     pub hardware: &'a Hardware,
     pub config: &'a Config,
     pub overlay: &'a ModelOverride,
+    /// Spec-decoding mode the SUPERVISOR resolved for this spawn — the
+    /// full tier order (per-request `options.spec` > model overlay >
+    /// governor override > config default) lives in one place upstream;
+    /// compile treats this as THE decision and never re-derives it from
+    /// overlay/config (re-deriving silently ignored the per-request and
+    /// governor tiers: `options.spec = "off"` compiled as config `auto`).
+    pub spec_mode: &'a str,
     /// (path, scale) pairs from the loras table.
     pub loras: &'a [(String, f64)],
     /// Local path of the pulled draft model when spec=auto resolved one.
@@ -751,7 +758,10 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     }
 
     // --- 11. speculative decoding
-    let mut spec_mode = overlay.spec.as_deref().unwrap_or(config.spec.as_str());
+    // The mode is the supervisor's resolved decision (see ProfileInput::
+    // spec_mode) — the tier order (per-request > overlay > governor >
+    // config) was applied upstream. The `mut` is the ngram rebind below.
+    let mut spec_mode = input.spec_mode;
     if spec_mode == "auto" {
         // Embedded MTP head wins over a catalog draft pair: it drafts from
         // the target's own trained weights (no separate model to pull) —
@@ -5619,6 +5629,7 @@ mod tests {
             hardware: hw,
             config: cfg,
             overlay: &DEFAULT_OVERLAY,
+            spec_mode: cfg.spec.as_str(),
             loras: &[],
             draft_path: None,
             draft_gguf: None,
@@ -8039,6 +8050,72 @@ mod tests {
         assert!(!p.argv.contains(&"--spec-draft-model".to_string()));
     }
 
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[test]
+    fn unit__spec_mode_input__resolved_off_beats_auto_config() {
+        // Live incident shape: the governor (or a per-request
+        // options.spec="off") resolved "off" while config.spec stayed
+        // "auto" — before the resolved mode was threaded into compile,
+        // the compiler re-derived "auto" from config and engaged the
+        // n-gram fallback anyway. The input's decision must win.
+        let cfg = Config {
+            spec: "auto".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let mut inp = input_named_with_spec(
+            "no-pair-model-x",
+            &g,
+            &hw,
+            &cfg,
+            &ALL_FLAGS,
+            &NGRAM_SPEC_TYPES,
+        );
+        inp.spec_mode = "off";
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.iter().any(|a| a.starts_with("--spec-type")
+                || a.starts_with("--lookup-cache")
+                || a.starts_with("--spec-draft")),
+            "resolved off must stay dense despite auto config: {:?}",
+            p.argv
+        );
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[test]
+    fn unit__spec_mode_input__resolved_ngram_beats_off_config() {
+        // The converse: an explicit per-request "ngram" must engage even
+        // against a dense global config — proving compile honors the
+        // resolved decision in BOTH directions (no config re-read).
+        let cfg = Config {
+            spec: "off".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let mut inp = input_named_with_spec(
+            "no-pair-model-x",
+            &g,
+            &hw,
+            &cfg,
+            &ALL_FLAGS,
+            &NGRAM_SPEC_TYPES,
+        );
+        inp.spec_mode = "ngram";
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-type" && w[1] == "ngram-simple"),
+            "resolved ngram must engage despite off config: {:?}",
+            p.argv
+        );
+    }
+
     #[test]
     fn unit__spec_auto_ngram_fallback__knob_off_stays_dense() {
         let cfg = Config {
@@ -8549,6 +8626,7 @@ mod tests {
             hardware: hw,
             config: cfg,
             overlay,
+            spec_mode: cfg.spec.as_str(),
             loras: &[],
             draft_path: None,
             draft_gguf: None,
@@ -11941,6 +12019,7 @@ mod tests {
             hardware: hw,
             config: cfg,
             overlay: &DEFAULT_OVERLAY,
+            spec_mode: cfg.spec.as_str(),
             loras: &[],
             draft_path: None,
             draft_gguf: None,

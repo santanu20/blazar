@@ -2340,6 +2340,7 @@ impl Supervisor {
             let spec_mode = resolve_spec_mode(None, overlay.spec.clone(), &self.config.spec);
             let draft_path = resolve_draft_path(&store, &m.name, &spec_mode);
             let input = ProfileInput {
+                spec_mode: &spec_mode,
                 engine_kind: self.engine.kind(),
                 sibling_devices: Vec::new(),
                 auto_tensor_split: None,
@@ -3216,6 +3217,7 @@ impl Supervisor {
         let data_dir_str = self.dirs.data_dir.to_string_lossy().into_owned();
         let candidate_kv_mib = {
             let probe = ProfileInput {
+                spec_mode: spec_mode.as_str(),
                 engine_kind: engine.kind(),
                 sibling_devices: Vec::new(),
                 auto_tensor_split: None,
@@ -3448,6 +3450,7 @@ impl Supervisor {
                 auth_keyfile = Some(p);
             }
             let input = ProfileInput {
+                spec_mode: spec_mode.as_str(),
                 engine_kind: engine.kind(),
                 sibling_devices: sibling_devices.clone(),
                 auto_tensor_split: auto_split.clone(),
