@@ -3322,6 +3322,42 @@ mod verify_tests {
     }
 
     #[test]
+    // whisper-server has no --version flag — its probe is --help
+    // (verified b5130). Anchored rows verify like every other lane;
+    // manifest-less rows and ghost anchors stay unverifiable, which is
+    // what the adoption heals.
+    #[cfg(unix)]
+    fn unit__verify_engine_binary__whisper_help_probe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = fake_bin(tmp.path(), "whisper-server", "exit 0");
+        assert!(verify_engine_binary(
+            &EngineKind::Whisper,
+            tmp.path(),
+            Some(&manifest_for(&bin))
+        ));
+        assert!(!verify_engine_binary(
+            &EngineKind::Whisper,
+            tmp.path(),
+            None
+        ));
+        let ghost = serde_json::json!({
+            "tag": "b5130",
+            "build_number": 5130,
+            "version_raw": "t",
+            "devices": [],
+            "flags": [],
+            "spec_types": [],
+            "server_path": "engines/b5130/whisper-bin-ubuntu-x64/whisper-server",
+        })
+        .to_string();
+        assert!(!verify_engine_binary(
+            &EngineKind::Whisper,
+            tmp.path(),
+            Some(&ghost)
+        ));
+    }
+
+    #[test]
     fn unit__exec_version_probe__budget_bounds_the_decision_not_the_child() {
         let tmp = tempfile::tempdir().unwrap();
         let bin = fake_bin(tmp.path(), "slow-probe", "sleep 30; exit 0");
