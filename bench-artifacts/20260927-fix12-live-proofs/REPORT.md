@@ -1,7 +1,7 @@
 # Fix-1 + Fix-2 live proofs — 2026-09-27
 
 Branch `feature/frontier-roi` @ 86dbfa4 · binary v0.12.0 (release, `/usr/local/bin/blazar`)
-Scratch env: `/tmp/opencode/blazar-live-val2` (XDG-isolated, port 11499, engine b11202-cuda copy, no symlinks)
+Scratch env: `scratch XDG root` (XDG-isolated, port 11499, engine b11202-cuda copy, no symlinks)
 Model: `qwen2.5-0.5b-instruct` (flat name, 469 MiB)
 
 ## Fix-1 — best-of-N degrade is client-visible (commit b04927a)

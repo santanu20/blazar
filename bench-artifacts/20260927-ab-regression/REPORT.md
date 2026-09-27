@@ -8,7 +8,7 @@ performance?
 ## Design
 
 - Baseline binary: v0.12.0 tag (c0440ab) built in an isolated
-  `git worktree` at `/tmp/opencode/blazar-baseline` (shared tree untouched).
+  `git worktree` at `isolated git worktree (baseline v0.12.0 build)` (shared tree untouched).
 - Current binary: `target/release/blazar` @ 6657aa0 (all waves + Fix-1/Fix-2).
 - Same scratch XDG root (port 11499), same minimal config (host/port/slots=8 —
   keys valid on both binaries), same model `qwen2.5-0.5b-instruct`, temp 0,
@@ -63,5 +63,5 @@ or `spec = "off"`).
   twice (dense + default lanes are the same code path on v0.12.0):
   repetitive ±0.8%, concurrent ±4.6% on tok/s — the concurrent lane is
   inherently noisy, hence the pooled Mann-Whitney verdict over medians.
-- Driver: `/tmp/opencode/blazar-live-val2/bench_ab.py` (exact-argv daemon
+- Driver: `scratch XDG root/bench_ab.py` (exact-argv daemon
   stop; per-cell JSON in this directory).

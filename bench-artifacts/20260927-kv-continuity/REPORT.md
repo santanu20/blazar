@@ -1,7 +1,7 @@
 # KV continuity, differential quant, preload, RAM-warm — live receipts
 
 - Date: 2026-09-27 · Branch: `feature/frontier-roi` @ f525512 · Daemon: v0.12.0 (release build)
-- Rig: scratch XDG root (`/tmp/opencode/blazar-live-val2`, port 11499), engine b11202-cuda (copied, no symlinks), model `qwen2.5-0.5b-instruct` (q4_k_m, 468 MiB), 16c/13.7G RAM/7.8G VRAM.
+- Rig: scratch XDG root (`scratch XDG root`, port 11499), engine b11202-cuda (copied, no symlinks), model `qwen2.5-0.5b-instruct` (q4_k_m, 468 MiB), 16c/13.7G RAM/7.8G VRAM.
 - Driver: `bench_wave4.py` (phases B/C/C2) + manual micro-test (phase A; driver phases A kept racing spawn-settle — see NOTES).
 
 | # | Proof | Verdict | Evidence |
@@ -24,4 +24,4 @@ Phase B/C/C2 config: `slots = 8`, `cache_type_k = "q8_0"`, `cache_type_v = "q4_0
 - Children in `--sleep-idle-seconds` sleep wake-reload on the bank POST and return ok-but-empty saves; keep sleep-idle long when validating banking.
 - Config guard: `idle_timeout_secs must be >= idle_sleep_secs` (validated at startup — fast-fail confirmed live).
 - Flat model names in `preload` (no `:quant` tag); unknown names warn + daemon stays up (warn-not-fail contract observed live in driver v1).
-- Raw artifacts: `/tmp/opencode/blazar-live-val2/wave4-live.json`, `microA.log`, `microA2.log`, `daemon-wave4.log`.
+- Raw artifacts: `scratch XDG root/wave4-live.json`, `microA.log`, `microA2.log`, `daemon-wave4.log`.

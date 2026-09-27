@@ -1,11 +1,11 @@
 {
  "summary": {
-  "binary": "/home/santanu/Projects/blazar/target/release/blazar",
+  "binary": "repo target/release/blazar",
   "lane": "default",
   "spec_flags": [
    "--spec-type",
    "--lookup-cache-dynamic",
-   "/tmp/opencode/blazar-live-val2/xdg-data/blazar/speccache/qwen2.5-0.5b-instruct-f829161bb633b3da.lcache"
+   "scratch XDG speccache dir/qwen2.5-0.5b-instruct-f829161bb633b3da.lcache"
   ],
   "np_flag": "8",
   "metrics": {

@@ -1,6 +1,6 @@
 # Best-of-N fan-out — live receipt (2026-09-27)
 
-Harness: scratch XDG daemon (`/tmp/opencode/blazar-live-val2`, port 11499, config
+Harness: scratch XDG daemon (`scratch XDG root`, port 11499, config
 `slots = 8`), qwen2.5-0.5b-instruct:q4_k_m on CUDA (b11202), non-stream
 `/api/chat` with an ollama-dialect JSON-schema `format`, temp 0.9, num_predict 64,
 5 seeds per cell, driver `bench_bestof.py` (py-spy attached, workers healthy on

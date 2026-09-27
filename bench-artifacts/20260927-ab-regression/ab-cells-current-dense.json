@@ -1,6 +1,6 @@
 {
  "summary": {
-  "binary": "/home/santanu/Projects/blazar/target/release/blazar",
+  "binary": "repo target/release/blazar",
   "lane": "dense",
   "spec_flags": [],
   "np_flag": "8",

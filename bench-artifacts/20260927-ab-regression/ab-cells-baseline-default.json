@@ -1,6 +1,6 @@
 {
  "summary": {
-  "binary": "/tmp/opencode/blazar-baseline/target/release/blazar",
+  "binary": "baseline-worktree-target/release/blazar",
   "lane": "default",
   "spec_flags": [],
   "np_flag": "8",

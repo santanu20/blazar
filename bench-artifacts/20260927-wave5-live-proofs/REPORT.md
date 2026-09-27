@@ -1,7 +1,7 @@
 # Wave-5 live proofs — A2 cost telemetry, A3 cascade, D1 ubatch governor (2026-09-27)
 
 Branch `feature/frontier-roi` @ 61b76fa · binary v0.12.0 (`/usr/local/bin/blazar`)
-Scratch env: `/tmp/opencode/blazar-live-val2` (XDG-isolated, port 11499, slots=8, engine b11202-cuda copy)
+Scratch env: `scratch XDG root` (XDG-isolated, port 11499, slots=8, engine b11202-cuda copy)
 Model: `qwen2.5-0.5b-instruct` (0.5B) + `qwen3.5-9b` (cascade escalation target)
 
 ## A2 — per-model decode-rate hints + route cost (commit 4e9a669)
