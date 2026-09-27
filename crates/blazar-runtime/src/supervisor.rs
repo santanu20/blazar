@@ -1737,14 +1737,7 @@ impl Supervisor {
         // that served it, so the next turn hits its warm cache.
         if let Some(pk) = prefix {
             if result.is_ok() {
-                if !self.prefix_affinity.contains_key(&pk.convo) {
-                    if self.prefix_affinity.len() >= PREFIX_AFFINITY_CAP {
-                        if let Some(oldest) = self.prefix_affinity.iter().next().map(|e| *e.key()) {
-                            self.prefix_affinity.remove(&oldest);
-                        }
-                    }
-                    self.prefix_affinity.insert(pk.convo, key.clone());
-                }
+                self.note_prefix_affinity(&pk, &key);
                 // F8: remember the sys class this replica has warm.
                 let mut ring = self.sys_rings.entry(key).or_default();
                 if ring.len() >= SYS_RING_CAP {
@@ -1844,6 +1837,24 @@ impl Supervisor {
     /// LC1: bump the (prev, current) transition count. Bounded table;
     /// overflow arbitrarily evicts one entry (a dropped edge just means
     /// a missed preload opportunity, never a wrong spawn).
+    /// Best-effort affinity record: pin this conversation to the replica
+    /// that served it so the next turn hits its warm KV cache. At cap an
+    /// arbitrary entry is evicted; the victim key is bound to an owned
+    /// value BEFORE `remove` because an if-let binding would keep the
+    /// iterator's shard read-lock alive through the body, and the write
+    /// to that same shard self-deadlocks (dashmap shards lock per-shard).
+    fn note_prefix_affinity(&self, pk: &PrefixKey, key: &str) {
+        if !self.prefix_affinity.contains_key(&pk.convo) {
+            if self.prefix_affinity.len() >= PREFIX_AFFINITY_CAP {
+                let oldest = self.prefix_affinity.iter().next().map(|e| *e.key());
+                if let Some(oldest) = oldest {
+                    self.prefix_affinity.remove(&oldest);
+                }
+            }
+            self.prefix_affinity.insert(pk.convo, key.to_string());
+        }
+    }
+
     fn note_transition(&self, name: &str) {
         let prev = {
             let mut last = self.last_requested.lock().unwrap();
@@ -1857,7 +1868,11 @@ impl Supervisor {
         }
         let edge = (prev, name.to_string());
         if !self.transitions.contains_key(&edge) && self.transitions.len() >= TRANSITIONS_CAP {
-            if let Some(k) = self.transitions.iter().next().map(|e| e.key().clone()) {
+            // Bind the victim BEFORE `remove`: an if-let binding keeps the
+            // iterator's shard read-lock alive through the body, and a
+            // write to the same shard self-deadlocks (dashmap shards).
+            let victim = self.transitions.iter().next().map(|e| e.key().clone());
+            if let Some(k) = victim {
                 self.transitions.remove(&k);
             }
         }
@@ -8490,5 +8505,52 @@ mod routing_tests {
             sup.spec_governor_snapshot(),
             vec![("alpha".to_string(), true), ("zeta".to_string(), false),]
         );
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[test]
+    fn unit__prefix_affinity__eviction_does_not_deadlock() {
+        let sup = routing_sup(1);
+        // Fill to cap; every call past the cap walks the eviction path.
+        // Under the old if-let-held-Ref shape the cap-crossing call
+        // self-deadlocked on the dashmap shard and this test hung.
+        for convo in 0..PREFIX_AFFINITY_CAP as u64 {
+            sup.note_prefix_affinity(&PrefixKey { sys: 1, convo }, "m");
+        }
+        assert_eq!(sup.prefix_affinity.len(), PREFIX_AFFINITY_CAP);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            sup.note_prefix_affinity(
+                &PrefixKey {
+                    sys: 1,
+                    convo: PREFIX_AFFINITY_CAP as u64,
+                },
+                "m",
+            );
+            tx.send(()).expect("test channel alive");
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("eviction deadlocked: dashmap Ref held across remove");
+        handle.join().expect("affinity thread");
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[test]
+    fn unit__note_transition__cap_eviction_does_not_deadlock() {
+        let sup = routing_sup(1);
+        // Consecutive distinct names build one edge per pair; CAP calls
+        // fill the table and the next call crosses into eviction.
+        for i in 0..=TRANSITIONS_CAP {
+            sup.note_transition(&format!("m{i}"));
+        }
+        assert_eq!(sup.transitions.len(), TRANSITIONS_CAP);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            sup.note_transition("final-edge");
+            tx.send(()).expect("test channel alive");
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("eviction deadlocked: dashmap Ref held across remove");
+        handle.join().expect("transitions thread");
     }
 }
