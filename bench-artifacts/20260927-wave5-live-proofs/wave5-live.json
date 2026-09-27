@@ -1,0 +1,23 @@
+{
+ "A2_gauge_present": true,
+ "A2_gauge_values": [
+  "244.151",
+  "257.922"
+ ],
+ "A2_eval_counts": [
+  96,
+  96
+ ],
+ "A3_first_status": 200,
+ "A3_first_header": "tried=qwen2.5-0.5b-instruct,qwen3.5-9b served=qwen2.5-0.5b-instruct reason=first-pass",
+ "A3_first_served_first": true,
+ "A3_esc_status": 200,
+ "A3_esc_header": "tried=no-such-model-x,qwen3.5-9b served=qwen3.5-9b reason=escalated",
+ "A3_esc_escalated": true,
+ "A3_esc_answer_ok": true,
+ "A3_runs_gauge": true,
+ "A3_esc_gauge_val": "1",
+ "D1_gauge_tier": null,
+ "D1_argv_ubatch": null,
+ "D1_queue_nonzero_seen": true
+}

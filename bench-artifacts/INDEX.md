@@ -11,4 +11,5 @@
 | 20260927-best-of-n | 20260927 | bestof | 15 | 0.12.0 |
 | 20260927-kv-continuity | 20260927 | bank,restore,diffkv,preload,ramwarm | 5 | 0.12.0 |
 | 20260927-fix12-live-proofs | 20260927 | bestof-degrade,bank-multislot | 2 | 0.12.0 |
+| 20260927-wave5-live-proofs | 20260927 | a2-rate,a3-cascade,d1-ubatch,ab-dense | 3 | 0.12.0 |
 | 20260927-ab-regression | 20260927 | ab,dense,default,regression | 4 | 0.12.0 |
