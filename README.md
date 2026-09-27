@@ -175,7 +175,7 @@ blazar launch dsh
 
 ## Engines and model formats
 
-Blazar currently orchestrates four engine families:
+Blazar currently orchestrates five engine families:
 
 | Engine | Typical formats / role |
 |---|---|
@@ -183,6 +183,7 @@ Blazar currently orchestrates four engine families:
 | **mistral.rs** | GGUF and safetensors paths supported by the runtime |
 | **SGLang** | Safetensors; especially AWQ / GPTQ / FP8 on supported accelerators |
 | **sd.cpp** | Diffusion + video checkpoints via a prebuilt `sd-server` (CUDA on NVIDIA when upstream ships it, Vulkan on every GPU, CPU/Metal otherwise). Nine curated families — Qwen-Image-2.1, Qwen-Image (v1), FLUX.1, Z-Image, Chroma, FLUX.2-dev (component sets with flag-keyed VAE/text-encoder pulls), SDXL, SD 1.5 (single self-contained checkpoints) and Wan 2.1 T2V (video: DiT + `--vae` + `--t5xxl`) — plus async jobs, SSE progress, native-dialect translation and huggingface hub-cache reuse |
+| **whisper.cpp** | Audio transcription/translation (GGML whisper models) — a lazy media lane: the server spawns on demand for `/v1/audio/*`, never claims the serving-active slot, and lives in the engines store like every other lane (legacy `whisper/bin` trees self-adopt on first sight) |
 
 Routing is capability-driven rather than a blind global switch.
 
@@ -346,7 +347,7 @@ blazar whisper --install && blazar whisper --pull base
 blazar whisper file.wav
 ```
 
-Both voice lanes are fully managed: `--list` inventories what is installed, `--pin <tag>`/`--pin none` freezes (or frees) the exact binary version served — the pin is honored across both the engines lane and the legacy tree. Whisper can also transparently use a remote `whisper: [[remotes]]` entry when one is configured.
+Both voice lanes are fully managed: `--list` inventories what is installed, `--pin <tag>`/`--pin none` freezes (or frees) the exact binary version served — the pin is honored across both the engines lane and the legacy tree. The lane lives in the engines store like every other engine: legacy `whisper/bin` trees move-and-register into `engines/<tag>` automatically (first serve, `doctor`, or `engine prune`), and `blazar whisper --install` installs straight into the engines lane. Whisper can also transparently use a remote `whisper: [[remotes]]` entry when one is configured.
 
 ---
 
