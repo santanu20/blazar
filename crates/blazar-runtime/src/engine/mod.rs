@@ -3067,11 +3067,28 @@ fn exec_version_probe(bin: &Path, args: &[&str], budget: std::time::Duration) ->
 /// llamacpp falls back to a name walk for manifest-less rows; the venv
 /// lanes cannot (their layout is the install contract).
 #[must_use]
-pub fn verify_engine_binary(
+/// One engine lane's liveness probe: the binary, argv, and budget that
+/// together prove an install executes. Shared by the supervisor's
+/// post-update verify gate and doctor's engine-binary smoke row so the
+/// two can never disagree on what "healthy" means for a lane — native
+/// lanes answer `--version`, venv lanes read package metadata through
+/// their venv python (the shims' own `--version` is an argparse error),
+/// and whisper answers `--help` (it has no `--version` flag).
+pub struct SmokeProbe {
+    pub bin: PathBuf,
+    pub args: Vec<String>,
+    pub timeout: std::time::Duration,
+}
+
+/// Derive a lane's probe from its row manifest. `None` = nothing
+/// probeable behind the row (manifest-less legacy rows on lanes whose
+/// layout is the install contract, or a dangling anchor).
+#[must_use]
+pub fn smoke_probe(
     kind: &EngineKind,
     data_dir: &Path,
     manifest_json: Option<&str>,
-) -> bool {
+) -> Option<SmokeProbe> {
     let mut manifest: Option<crate::engine::manifest::Manifest> = manifest_json
         .and_then(|raw| serde_json::from_str::<crate::engine::manifest::Manifest>(raw).ok());
     // Relative rows resolve against the live data dir; legacy absolute
@@ -3084,48 +3101,74 @@ pub fn verify_engine_binary(
             let bin = manifest
                 .map(|m| PathBuf::from(m.server_path))
                 .or_else(|| find_server(&data_dir.join("engines")).ok());
-            bin.is_some_and(|b| {
-                exec_version_probe(&b, &["--version"], std::time::Duration::from_secs(5))
+            bin.map(|bin| SmokeProbe {
+                bin,
+                args: vec!["--version".into()],
+                timeout: std::time::Duration::from_secs(5),
             })
         }
-        EngineKind::Sglang => {
-            // server_path = <engines>/<tag>/sglang-server → the venv sits
-            // next to the shim (sglang_install layout contract).
-            let py = manifest
-                .map(|m| PathBuf::from(m.server_path))
-                .and_then(|shim| shim.parent().map(|d| d.join("venv/bin/python")));
-            py.is_some_and(|p| {
-                exec_version_probe(
-                    &p,
-                    &[
-                        "-c",
-                        "import importlib.metadata as m; print(m.version(\"sglang\"))",
-                    ],
-                    std::time::Duration::from_secs(15),
-                )
-            })
-        }
-        EngineKind::MistralRs => manifest
-            .map(|m| PathBuf::from(m.server_path))
-            .is_some_and(|b| {
-                exec_version_probe(&b, &["--version"], std::time::Duration::from_secs(15))
-            }),
-        // sd-server --version exits 0 with the banner (verified
-        // master-890) — the cheap liveness probe for the image lane.
-        EngineKind::SdCpp => manifest
-            .map(|m| PathBuf::from(m.server_path))
-            .is_some_and(|b| {
-                exec_version_probe(&b, &["--version"], std::time::Duration::from_secs(15))
-            }),
+        EngineKind::Sglang => venv_metadata_probe(manifest, "sglang"),
+        // mistral.rs and sd-server both answer --version with a
+        // banner and exit 0 (verified v0.9.4 / master-890).
+        EngineKind::MistralRs | EngineKind::SdCpp => native_version_probe(manifest),
         // whisper-server has no --version flag (unknown argument,
         // verified b5130) — its cheap liveness probe is --help, which
         // exits 0 with usage exactly like llama's.
-        EngineKind::Whisper => manifest
-            .map(|m| PathBuf::from(m.server_path))
-            .is_some_and(|b| {
-                exec_version_probe(&b, &["--help"], std::time::Duration::from_secs(15))
-            }),
+        EngineKind::Whisper => native_help_probe(manifest),
     }
+}
+
+/// `server_path` = `<engines>/<tag>/<name>-server` → the venv sits next
+/// to the shim (`sglang_install` layout contract);
+/// the venv python is the real liveness check — no torch import, just
+/// a metadata read.
+fn venv_metadata_probe(
+    manifest: Option<crate::engine::manifest::Manifest>,
+    package: &str,
+) -> Option<SmokeProbe> {
+    let py = manifest
+        .map(|m| PathBuf::from(m.server_path))
+        .and_then(|shim| shim.parent().map(|d| d.join("venv/bin/python")));
+    py.map(|bin| SmokeProbe {
+        bin,
+        args: vec![
+            "-c".into(),
+            format!("import importlib.metadata as m; print(m.version(\"{package}\"))"),
+        ],
+        timeout: std::time::Duration::from_secs(15),
+    })
+}
+
+fn native_version_probe(manifest: Option<crate::engine::manifest::Manifest>) -> Option<SmokeProbe> {
+    manifest
+        .map(|m| PathBuf::from(m.server_path))
+        .map(|bin| SmokeProbe {
+            bin,
+            args: vec!["--version".into()],
+            timeout: std::time::Duration::from_secs(15),
+        })
+}
+
+fn native_help_probe(manifest: Option<crate::engine::manifest::Manifest>) -> Option<SmokeProbe> {
+    manifest
+        .map(|m| PathBuf::from(m.server_path))
+        .map(|bin| SmokeProbe {
+            bin,
+            args: vec!["--help".into()],
+            timeout: std::time::Duration::from_secs(15),
+        })
+}
+
+#[must_use]
+pub fn verify_engine_binary(
+    kind: &EngineKind,
+    data_dir: &Path,
+    manifest_json: Option<&str>,
+) -> bool {
+    smoke_probe(kind, data_dir, manifest_json).is_some_and(|probe| {
+        let argv: Vec<&str> = probe.args.iter().map(String::as_str).collect();
+        exec_version_probe(&probe.bin, &argv, probe.timeout)
+    })
 }
 
 /// The rollback target for a newest-first engine list (the order

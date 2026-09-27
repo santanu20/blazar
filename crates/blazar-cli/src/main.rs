@@ -3241,14 +3241,31 @@ async fn doctor_remotes() -> Vec<Check> {
     out
 }
 
-/// Engine binary smoke: execute the active engine's server binary with
-/// `--version`. The manifest can say "installed" while the binary is
+/// Engine binary smoke: execute the active engine's lane-aware probe
+/// (`engine::smoke_probe`, the same spec the supervisor's verify gate
+/// uses). The manifest can say "installed" while the binary is
 /// corrupted or linked against a glibc the box no longer has — this is
-/// the row that catches it. Read-only probe: `--version` prints and
-/// exits without touching the GPU.
-fn engine_smoke_check(server_path: &str) -> Check {
-    match std::process::Command::new(server_path)
-        .arg("--version")
+/// the row that catches it. Native lanes print `--version`; venv lanes
+/// read package metadata through the venv python (their shim's own
+/// `--version` is an argparse error demanding --model-path); whisper
+/// answers `--help`. Read-only: prints and exits without touching the
+/// GPU.
+fn engine_smoke_check(
+    kind: Option<EngineKind>,
+    d: &BlazarDirs,
+    manifest_json: Option<&str>,
+) -> Check {
+    let Some(kind) = kind else {
+        return Check::warn("engine binary", "no active engine row to probe");
+    };
+    let Some(probe) = blazar_runtime::engine::smoke_probe(&kind, &d.data_dir, manifest_json) else {
+        return Check::warn(
+            "engine binary",
+            "no probeable binary behind the row — reinstall: blazar engine update",
+        );
+    };
+    match std::process::Command::new(&probe.bin)
+        .args(&probe.args)
         .output()
     {
         Ok(out) if out.status.success() => {
@@ -3272,7 +3289,10 @@ fn engine_smoke_check(server_path: &str) -> Check {
         ),
         Err(e) => Check::warn(
             "engine binary",
-            format!("cannot execute {server_path}: {e} — reinstall: blazar engine update"),
+            format!(
+                "cannot execute {}: {e} — reinstall: blazar engine update",
+                probe.bin.display()
+            ),
         ),
     }
 }
@@ -3513,7 +3533,17 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
                     } else {
                         checks.push(Check::ok("hardware", note));
                     }
-                    checks.push(engine_smoke_check(&m.server_path));
+                    // Kind-aware smoke: the active row carries the kind
+                    // the probe dispatch needs (venv lanes probe their
+                    // venv python, not the shim).
+                    let active_row = blazar_core::Store::open(d)
+                        .ok()
+                        .and_then(|s| s.active_engine().ok().flatten());
+                    checks.push(engine_smoke_check(
+                        active_row.as_ref().map(|r| r.kind.clone()),
+                        d,
+                        active_row.as_ref().map(|r| r.manifest.as_str()),
+                    ));
                 }
                 Ok(None) => checks.push(Check::fail(
                     "engine",
@@ -14765,11 +14795,31 @@ mod tests {
     #[test]
     fn unit__engine_smoke_check__executes_warns_and_misses() {
         let tmp = tempfile::tempdir().unwrap();
-        // Healthy: a script that prints a version banner.
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let manifest_for = |bin: &std::path::Path| {
+            serde_json::json!({
+                "tag": "t-test",
+                "build_number": 1,
+                "version_raw": "t",
+                "devices": [],
+                "flags": [],
+                "spec_types": [],
+                "server_path": bin.display().to_string(),
+            })
+            .to_string()
+        };
+        // Healthy native lane: a script that prints a version banner.
         let good = tmp.path().join("server-good");
         std::fs::write(&good, "#!/bin/sh\necho 'llama-server b10857'\n").unwrap();
         make_executable(&good);
-        let c = engine_smoke_check(good.to_str().unwrap());
+        let c = engine_smoke_check(
+            Some(EngineKind::LlamaCpp),
+            &dirs,
+            Some(&manifest_for(&good)),
+        );
         assert!(c.ok && !c.warn, "{}", c.detail);
         assert!(c.detail.contains("executes"), "{}", c.detail);
         assert!(c.detail.contains("b10857"), "{}", c.detail);
@@ -14777,13 +14827,71 @@ mod tests {
         let bad = tmp.path().join("server-bad");
         std::fs::write(&bad, "#!/bin/sh\nexit 3\n").unwrap();
         make_executable(&bad);
-        let c = engine_smoke_check(bad.to_str().unwrap());
+        let c = engine_smoke_check(Some(EngineKind::LlamaCpp), &dirs, Some(&manifest_for(&bad)));
         assert!(c.warn, "{}", c.detail);
         assert!(c.detail.contains("exited"), "{}", c.detail);
         // Missing path entirely.
-        let c = engine_smoke_check(tmp.path().join("nope").to_str().unwrap());
+        let c = engine_smoke_check(
+            Some(EngineKind::LlamaCpp),
+            &dirs,
+            Some(&manifest_for(&tmp.path().join("nope"))),
+        );
         assert!(c.warn, "{}", c.detail);
         assert!(c.detail.contains("cannot execute"), "{}", c.detail);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    // The live sglang false-warn regression: the shim's own --version
+    // is an argparse error (exit 2), so the smoke must probe the venv
+    // python's metadata read instead — a healthy venv lane reports ok,
+    // never "reinstall".
+    fn unit__engine_smoke_check__venv_lane_probes_python_not_the_shim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let lane = tmp.path().join("sglang-0.5.19");
+        std::fs::create_dir_all(lane.join("venv/bin")).unwrap();
+        let shim = lane.join("sglang-server");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\necho 'sglang serve: error: --model-path required' >&2; exit 2\n",
+        )
+        .unwrap();
+        make_executable(&shim);
+        std::fs::write(lane.join("venv/bin/python"), "#!/bin/sh\necho 0.5.19\n").unwrap();
+        make_executable(&lane.join("venv/bin/python"));
+        let manifest = serde_json::json!({
+            "tag": "sglang-0.5.19",
+            "build_number": 5019,
+            "version_raw": "t",
+            "devices": [],
+            "flags": [],
+            "spec_types": [],
+            "server_path": shim.display().to_string(),
+        })
+        .to_string();
+        let c = engine_smoke_check(Some(EngineKind::Sglang), &dirs, Some(&manifest));
+        assert!(c.ok && !c.warn, "{}", c.detail);
+        assert!(c.detail.contains("0.5.19"), "{}", c.detail);
+        // Whisper lane: --help answers 0 (there is no --version flag).
+        let whisper = tmp.path().join("whisper-server");
+        std::fs::write(&whisper, "#!/bin/sh\necho 'usage: whisper-server' \n").unwrap();
+        make_executable(&whisper);
+        let whisper_manifest = serde_json::json!({
+            "tag": "b5130",
+            "build_number": 5130,
+            "version_raw": "t",
+            "devices": [],
+            "flags": [],
+            "spec_types": [],
+            "server_path": whisper.display().to_string(),
+        })
+        .to_string();
+        let c = engine_smoke_check(Some(EngineKind::Whisper), &dirs, Some(&whisper_manifest));
+        assert!(c.ok && !c.warn, "{}", c.detail);
     }
 
     #[cfg(unix)]
