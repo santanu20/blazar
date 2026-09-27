@@ -1383,17 +1383,8 @@ fn semcache_hit_response(model: &str, cached: &Value, id: u64, sim: f32) -> Resp
 /// spawn will actually use (mirrors the compiler's kv ladder), so the
 /// preflight judges the buffer the child allocates — the 400's own
 /// teaching (`cache_type = "q8_0" halves KV`) must not be a dead end
-/// when the user applies it.
-fn scale_kv_by_cache_type(kv_bytes: u64, cache_type: Option<&str>) -> u64 {
-    match cache_type {
-        Some("q8_0") => kv_bytes / 2,
-        Some("q4_0") => kv_bytes / 4,
-        Some("q4_1") => kv_bytes * 9 / 20,
-        Some("q5_0") => kv_bytes * 11 / 32,
-        Some("q5_1") => kv_bytes * 3 / 8,
-        _ => kv_bytes,
-    }
-}
+/// when the user applies it. Per-phase pairs scale via
+/// `profile::scale_kv_pair` (K and V each hold half the f16 bytes).
 
 pub(crate) async fn apply_num_ctx(
     state: &Arc<AppState>,
@@ -1419,20 +1410,27 @@ pub(crate) async fn apply_num_ctx(
                 let total_vram = state.sup.hardware.total_vram_mib();
                 if total_vram > 0 {
                     // KV must be judged at the quant the spawn will run.
-                    // An EXPLICIT config/overlay cache_type is sovereign
-                    // (single shot, mirroring the compiler's
-                    // explicit-beats-ladder doctrine); an unpinned one
-                    // LADDERS f16 -> q8_0 -> q4_0 exactly like the
+                    // An EXPLICIT config/overlay pair (per-phase k/v or
+                    // legacy symmetric) is sovereign (single shot,
+                    // mirroring the compiler's explicit-beats-ladder
+                    // doctrine); an unpinned one LADDERS
+                    // f16 -> q8_0 -> q8_0/q4_0 -> q4_0 exactly like the
                     // spawn compiler's kv_quant_ladder, so the preflight
                     // never refuses a pin the spawn itself would host
                     // (split-brain observed live: a 65536 vision pin
                     // refused at f16 math while the spawn laddered to
                     // q8_0 happily).
-                    let effective = state.config.effective_cache_type(model);
-                    let ladder: Vec<Option<&str>> = if effective.is_empty() {
-                        vec![None, Some("q8_0"), Some("q4_0")]
+                    let (eff_k, eff_v) = state.config.effective_cache_type_kv(model);
+                    let pair_set = !eff_k.is_empty() || !eff_v.is_empty();
+                    let ladder: Vec<Option<(String, String)>> = if pair_set {
+                        vec![Some((eff_k, eff_v))]
                     } else {
-                        vec![Some(effective)]
+                        vec![
+                            None,
+                            Some(("q8_0".to_string(), "q8_0".to_string())),
+                            Some(("q8_0".to_string(), "q4_0".to_string())),
+                            Some(("q4_0".to_string(), "q4_0".to_string())),
+                        ]
                     };
                     let kv_f16 = crate::preflight::kv_f16_mib(
                         &meta,
@@ -1440,8 +1438,11 @@ pub(crate) async fn apply_num_ctx(
                     ) * 1024
                         * 1024;
                     let mut refuse: Option<String> = None;
-                    for quant in ladder {
-                        let kv_bytes = scale_kv_by_cache_type(kv_f16, quant);
+                    for pair in ladder {
+                        let kv_bytes = match &pair {
+                            Some((k, v)) => blazar_core::profile::scale_kv_pair(kv_f16, k, v),
+                            None => kv_f16,
+                        };
                         match blazar_core::profile::unified_ctx_verdict(
                             u64::try_from(row.bytes.max(0)).unwrap_or(u64::MAX),
                             kv_bytes,

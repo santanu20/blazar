@@ -185,6 +185,17 @@ pub struct Config {
     /// attention (always emitted when the engine supports it).
     #[serde(default)]
     pub cache_type: String,
+    /// Per-phase KV cache quantization, K side ("" = none set). When either
+    /// side is set it wins over [`Config::cache_type`] for that side; a set
+    /// side with the other (and `cache_type`) unset mirrors into both — same
+    /// vocabulary as `cache_type`. K precision dominates attention retrieval,
+    /// so a split like `q8_0` K + `q4_0` V recovers capacity at better
+    /// quality than symmetric `q4_0` (SnapKV/PyramidKV lineage).
+    #[serde(default)]
+    pub cache_type_k: String,
+    /// Per-phase KV cache quantization, V side — see `cache_type_k`.
+    #[serde(default)]
+    pub cache_type_v: String,
     /// Chat prompt recipe: `child` (default — the engine child renders
     /// its own chat template) or `ollama_compat` (the gateway renders the
     /// full prompt — chatml wrapping plus a JSON tool-call grammar
@@ -774,6 +785,13 @@ pub struct Config {
     /// serializes slots — useful only for debugging near-tie logits.
     #[serde(default)]
     pub cont_batching: Option<bool>,
+    /// Flash attention override for the GGML (llama-server) lane.
+    /// `true` forces `--flash-attn on`, `false` forces off; absent lets
+    /// the profile heuristic decide per model/arch (auto). Other lanes
+    /// keep their own switches (`sdcpp_flash_attention`, mistralrs
+    /// paged-attn defaults).
+    #[serde(default)]
+    pub flash_attention: Option<bool>,
     /// `SO_REUSEPORT` on the child listener (upstream default false). Lets
     /// a replacement child bind while the old one drains.
     #[serde(default)]
@@ -984,6 +1002,12 @@ pub struct ModelOverride {
     pub extra_args: Option<Vec<String>>,
     /// Per-model KV cache type ("" or None = inherit the global ladder).
     pub cache_type: Option<String>,
+    /// Per-model per-phase K cache type (None = inherit the global `cache_type_k`).
+    #[serde(default)]
+    pub cache_type_k: Option<String>,
+    /// Per-model per-phase V cache type (None = inherit the global `cache_type_v`).
+    #[serde(default)]
+    pub cache_type_v: Option<String>,
     /// Per-model chat prompt recipe (None = inherit global; see
     /// `Config::prompt_recipe`).
     pub prompt_recipe: Option<String>,
@@ -2050,6 +2074,8 @@ impl Default for Config {
             otlp_service: String::new(),
             remotes: Vec::new(),
             cache_type: String::new(),
+            cache_type_k: String::new(),
+            cache_type_v: String::new(),
             prompt_recipe: default_prompt_recipe(),
             decode_policy: default_decode_policy(),
             raw_lane_max_tokens: 2048,
@@ -2129,6 +2155,7 @@ impl Default for Config {
             server_timeout_secs: None,
             chat_template_kwargs: None,
             cont_batching: None,
+            flash_attention: None,
             reuse_port: false,
             lora_init_without_apply: false,
             warmup: true,
@@ -2497,6 +2524,36 @@ impl Config {
             return s;
         }
         self.cache_type.as_str()
+    }
+
+    /// Effective per-phase KV cache types (K, V) for a model. Each side:
+    /// explicit overlay beats explicit global; a set side whose counterpart
+    /// (and the legacy `cache_type`) is unset mirrors into both. Both unset
+    /// resolves to the legacy symmetric value ("" = auto ladder).
+    #[must_use]
+    pub fn effective_cache_type_kv(&self, model: &str) -> (String, String) {
+        let overlay = self.model_overrides.get(model);
+        let legacy = self.effective_cache_type(model);
+        let k = overlay
+            .and_then(|o| o.cache_type_k.as_deref())
+            .filter(|s| !s.is_empty())
+            .or_else(|| (!self.cache_type_k.is_empty()).then_some(self.cache_type_k.as_str()));
+        let v = overlay
+            .and_then(|o| o.cache_type_v.as_deref())
+            .filter(|s| !s.is_empty())
+            .or_else(|| (!self.cache_type_v.is_empty()).then_some(self.cache_type_v.as_str()));
+        match (k, v) {
+            (Some(k), Some(v)) => (k.to_string(), v.to_string()),
+            (Some(k), None) => {
+                let v = if legacy.is_empty() { k } else { legacy };
+                (k.to_string(), v.to_string())
+            }
+            (None, Some(v)) => {
+                let k = if legacy.is_empty() { v } else { legacy };
+                (k.to_string(), v.to_string())
+            }
+            (None, None) => (legacy.to_string(), legacy.to_string()),
+        }
     }
 
     /// Effective chat prompt recipe for a model; overlay wins over the
@@ -3103,6 +3160,46 @@ impl Config {
     /// beat-ollama wave: `cache_type` vocabulary, `ctx_extend` range,
     /// expert counts, override-tensor shapes. Kept separate from `validate`
     /// to stay under the line budget with the base checks.
+    /// Cache-type vocabulary for the legacy symmetric knob, the per-phase
+    /// k/v knobs, and their per-model overlay counterparts. Empty global
+    /// strings mean unset; overlay `None`/empty inherits.
+    fn validate_cache_type_vocab(&self) -> CoreResult<()> {
+        if !valid_cache_type(&self.cache_type) {
+            return Err(CoreError::Config(format!(
+                "cache_type must be one of {} (or empty for auto), got {:?}",
+                CACHE_TYPES.join(", "),
+                self.cache_type
+            )));
+        }
+        for (key, val) in [
+            ("cache_type_k", &self.cache_type_k),
+            ("cache_type_v", &self.cache_type_v),
+        ] {
+            if !valid_cache_type(val) {
+                return Err(CoreError::Config(format!(
+                    "{key} must be one of {} (or empty to unset), got {val:?}",
+                    CACHE_TYPES.join(", ")
+                )));
+            }
+        }
+        for (name, o) in &self.model_overrides {
+            for (key, val) in [
+                ("cache_type_k", &o.cache_type_k),
+                ("cache_type_v", &o.cache_type_v),
+            ] {
+                if let Some(t) = val {
+                    if !t.is_empty() && !valid_cache_type(t) {
+                        return Err(CoreError::Config(format!(
+                            "model_overrides.{name}.{key} must be one of {}, got {t:?}",
+                            CACHE_TYPES.join(", ")
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn validate_new_knobs(&self) -> CoreResult<()> {
         self.validate_time_bounds()?;
         if self.raw_lane_max_tokens != 0 && !(256..=100_000).contains(&self.raw_lane_max_tokens) {
@@ -3139,13 +3236,7 @@ impl Config {
                 }
             }
         }
-        if !valid_cache_type(&self.cache_type) {
-            return Err(CoreError::Config(format!(
-                "cache_type must be one of {} (or empty for auto), got {:?}",
-                CACHE_TYPES.join(", "),
-                self.cache_type
-            )));
-        }
+        self.validate_cache_type_vocab()?;
         if self.devices.iter().any(|d| d.trim().is_empty()) {
             return Err(CoreError::Config(
                 "devices entries must be non-empty device names (see `blazar doctor` for the list)"
@@ -3839,6 +3930,62 @@ mod tests {
     }
 
     #[test]
+    fn unit__effective_cache_type_kv__precedence_and_mirror() {
+        // Global K set + legacy grade set: V mirrors the legacy grade.
+        let mut cfg = Config {
+            cache_type: "q5_0".into(),
+            cache_type_k: "q8_0".into(),
+            ..Config::default()
+        };
+        let (k, v) = cfg.effective_cache_type_kv("m");
+        assert_eq!((k.as_str(), v.as_str()), ("q8_0", "q5_0"));
+
+        // Overlay side beats the global side; the unset counterpart
+        // still mirrors the legacy grade.
+        cfg.model_overrides.insert(
+            "m".into(),
+            ModelOverride {
+                cache_type_k: Some("q4_0".into()),
+                ..ModelOverride::default()
+            },
+        );
+        let (k, v) = cfg.effective_cache_type_kv("m");
+        assert_eq!((k.as_str(), v.as_str()), ("q4_0", "q5_0"));
+
+        // Nothing set anywhere: both sides resolve to the legacy value
+        // ("" = auto ladder downstream).
+        let plain = Config::default();
+        let (k, v) = plain.effective_cache_type_kv("any");
+        assert!(k.is_empty() && v.is_empty());
+    }
+
+    #[test]
+    fn unit__cache_type_kv__vocabulary_enforced() {
+        let cfg = Config {
+            cache_type_k: "q9_x".into(),
+            ..Config::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("cache_type_k must be one of"), "{msg}");
+
+        let mut cfg = Config::default();
+        cfg.model_overrides.insert(
+            "m".into(),
+            ModelOverride {
+                cache_type_v: Some("nope".into()),
+                ..ModelOverride::default()
+            },
+        );
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("model_overrides.m.cache_type_v must be one of"),
+            "{msg}"
+        );
+    }
+
+    #[test]
     fn unit__lookup_cache__validation_requires_existing_file() {
         let good = std::env::temp_dir().join("blazar-lc-test.bin");
         std::fs::write(&good, b"ggml").unwrap();
@@ -4442,6 +4589,13 @@ default_ctx = 16384
         )
         .unwrap();
         Config::from_toml("cont_batching = true\nsse_ping_interval = 30\n").unwrap();
+
+        // FA override parses at both extremes; absent stays auto (None).
+        let fa = Config::from_toml("flash_attention = false\n").unwrap();
+        assert_eq!(fa.flash_attention, Some(false));
+        let fa = Config::from_toml("flash_attention = true\n").unwrap();
+        assert_eq!(fa.flash_attention, Some(true));
+        assert_eq!(Config::default().flash_attention, None);
 
         // -1 (disable) is the floor for the SSE ping; 0-second server timeout
         // would kill every stream; the kwargs string must be a JSON object.

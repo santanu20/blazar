@@ -393,37 +393,31 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         if let Some(f16) = kv_f16_bytes(input, rs.total_ctx).filter(|kv| *kv > 0) {
             // A PIN the f16 pool cannot host may still be hostable at
             // the quant the spawn will actually run: an explicit
-            // cache_type override, or the ladder demotion the same
-            // tight card triggers anyway. The refuse teaching names
-            // this exact lever — it must not be a dead end.
-            let pinned_quant = if tuning.kv_quant == Some(true) {
-                Some("q8_0")
+            // cache_type override (per-phase pair or legacy), or the
+            // ladder demotion the same tight card triggers anyway. The
+            // refuse teaching names this exact lever — it must not be a
+            // dead end.
+            let mut scratch: Vec<String> = Vec::new();
+            let pinned_pair: Option<(String, String)> = if tuning.kv_quant == Some(true) {
+                Some(("q8_0".to_string(), "q8_0".to_string()))
             } else {
-                let explicit = config.effective_cache_type(input.model_name);
-                if explicit.is_empty() {
-                    let mut scratch: Vec<String> = Vec::new();
+                let (k, v) = config.effective_cache_type_kv(input.model_name);
+                if k.is_empty() && v.is_empty() {
                     kv_quant_ladder(input, vram_bytes, rs.total_ctx, &mut scratch)
-                } else {
-                    match explicit {
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                } else if k == v {
+                    // Symmetric f16-class pin = force off (full-size math).
+                    match k.as_str() {
                         "f32" | "f16" | "bf16" => None,
-                        t => Some(match t {
-                            "q8_0" => "q8_0",
-                            "q4_0" => "q4_0",
-                            "q4_1" => "q4_1",
-                            "q5_0" => "q5_0",
-                            "q5_1" => "q5_1",
-                            _ => "f16",
-                        }),
+                        _ => Some((k, v)),
                     }
+                } else {
+                    Some((k, v))
                 }
             };
-            let kv = match pinned_quant {
-                Some("q8_0") => f16 / 2,
-                Some("q4_0") => f16 / 4,
-                Some("q4_1") => f16 * 9 / 20,
-                Some("q5_0") => f16 * 11 / 32,
-                Some("q5_1") => f16 * 3 / 8,
-                _ => f16,
+            let kv = match pinned_pair {
+                Some((k, v)) => scale_kv_pair(f16, &k, &v),
+                None => f16,
             };
             let mib = |b: u64| b / (1024 * 1024);
             let demand = input.model_bytes.saturating_add(kv);
@@ -557,27 +551,38 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
 
     // --- 6. KV cache quantization. Bench-adopted tuning wins, then an
     // explicit config/overlay type ("f16"-class = force off), then the
-    // capacity ladder: none -> q8_0 (KV/2) -> q4_0 (KV/4).
-    let kv_type: Option<String> = if let Some(on) = tuning.kv_quant {
-        on.then(|| "q8_0".to_string())
+    // capacity ladder: none -> q8_0 (KV/2) -> q8_0/q4_0 differential
+    // (3KV/8) -> q4_0 (KV/4). Per-phase `cache_type_k`/`cache_type_v`
+    // beat the legacy symmetric `cache_type` for their side; a lone set
+    // side mirrors (resolver contract, config.rs).
+    let (kv_k, kv_v): (Option<String>, Option<String>) = if let Some(on) = tuning.kv_quant {
+        let grade = on.then(|| "q8_0".to_string());
+        (grade.clone(), grade)
     } else {
-        let explicit = config.effective_cache_type(input.model_name);
-        if explicit.is_empty() {
-            kv_quant_ladder(input, vram_bytes, ctx, &mut warnings).map(str::to_string)
+        let (k, v) = config.effective_cache_type_kv(input.model_name);
+        if k.is_empty() && v.is_empty() {
+            match kv_quant_ladder(input, vram_bytes, ctx, &mut warnings) {
+                Some((k, v)) => (Some(k.to_string()), Some(v.to_string())),
+                None => (None, None),
+            }
         } else {
-            match explicit {
+            // Per-side f16-class handling: a symmetric f16-class pin keeps
+            // the historical force-off (no flags); anything else emits the
+            // literal grades so an explicit split stays a split.
+            let grade = |t: String| match t.as_str() {
                 "f32" | "f16" | "bf16" => None,
-                t => Some(t.to_string()),
+                _ => Some(t),
+            };
+            if k == v {
+                let g = grade(k);
+                (g.clone(), g)
+            } else {
+                (Some(k), Some(v))
             }
         }
     };
-    if let Some(t) = kv_type.clone() {
-        argv.extend([
-            "--cache-type-k".into(),
-            t.clone(),
-            "--cache-type-v".into(),
-            t,
-        ]);
+    if let (Some(k), Some(v)) = (kv_k.clone(), kv_v.clone()) {
+        argv.extend(["--cache-type-k".into(), k, "--cache-type-v".into(), v]);
     }
 
     // --- 7. cpu-moe when the model cannot fit VRAM but RAM can host it
@@ -2087,13 +2092,12 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         .and_then(|g| kv_f16_bytes_meta(g, rs.total_ctx))
         .unwrap_or(0);
     let kv_est_bytes = kv_f16_bytes(input, ctx).map(|f16| {
-        let dense = match kv_type.as_deref() {
-            Some("q8_0") => f16 / 2,
-            Some("q4_0") => f16 / 4,
-            Some("q4_1") => f16 * 9 / 20,
-            Some("q5_0") => f16 * 11 / 32,
-            Some("q5_1") => f16 * 3 / 8,
-            _ => f16,
+        // Per-phase pair (rule 6): the estimate mirrors what the spawn
+        // emits — differential grades scale at the pair average.
+        let dense = match (kv_k.as_deref(), kv_v.as_deref()) {
+            (Some(k), Some(v)) if k != v => scale_kv_pair(f16, k, v),
+            (Some(t), _) | (_, Some(t)) => scale_kv_pair(f16, t, t),
+            (None, None) => f16,
         };
         dense + draft_kv
     });
@@ -4364,14 +4368,17 @@ fn resolve_ctx(
 /// Rule 6 ladder: KV cache quantization by capacity math, not stacked
 /// thresholds. Estimated f16 KV is `2*blocks*kv_heads*head_dim*ctx*2`
 /// bytes; `q8_0` halves it, `q4_0` quarters it. The cheapest grade that keeps
-/// weights+KV within 0.9x VRAM wins. Missing GGUF fields skip with a named
-/// warning — never guessed.
+/// weights+KV within 0.9x VRAM wins, with one differential rung between the
+/// symmetric `q8_0` and `q4_0` grades: K at `q8_0` + V at `q4_0` (3/8 of f16)
+/// — K precision dominates attention retrieval, V tolerates the heavier
+/// quant at better quality than symmetric `q4_0` (SnapKV/PyramidKV lineage).
+/// Missing GGUF fields skip with a named warning — never guessed.
 fn kv_quant_ladder(
     input: &ProfileInput<'_>,
     vram_bytes: u64,
     ctx: u32,
     warnings: &mut Vec<String>,
-) -> Option<&'static str> {
+) -> Option<(&'static str, &'static str)> {
     // The multimodal projector is GPU-resident too — capacity math that
     // ignores it OOMs at load on vision models (live incident).
     let mmproj_bytes = input
@@ -4391,15 +4398,50 @@ fn kv_quant_ladder(
     if resident.saturating_add(kv) <= budget {
         None
     } else if resident.saturating_add(kv / 2) <= budget {
-        Some("q8_0")
+        Some(("q8_0", "q8_0"))
+    } else if resident.saturating_add(kv * 3 / 8) <= budget {
+        warnings.push(
+            "KV differential quant engaged: K=q8_0 V=q4_0 (3/8 of f16 KV bytes) — K precision \
+             dominates retrieval quality, V carries the heavier quant; pin cache_type for a \
+             symmetric grade"
+                .into(),
+        );
+        Some(("q8_0", "q4_0"))
     } else {
         if resident.saturating_add(kv / 4) > budget {
             warnings.push(
                 "KV q4_0 engaged but weights+KV still exceed 90% VRAM; --fit will shrink ctx or the engine may OOM — consider a smaller quant".into(),
             );
         }
-        Some("q4_0")
+        Some(("q4_0", "q4_0"))
     }
+}
+
+/// Scale factor of one KV grade as a (numerator, denominator) rational —
+/// K and V each hold half the f16 KV bytes, so a pair scales f16 by the
+/// average of the two sides. Shared by the compiler verdict, the gateway
+/// ctx preflight, and the fit ladder so all three agree on one math.
+#[must_use]
+pub fn kv_grade_rational(grade: &str) -> (u64, u64) {
+    match grade {
+        "q8_0" => (1, 2),
+        "q4_0" => (1, 4),
+        "q4_1" => (9, 20),
+        "q5_0" => (11, 32),
+        "q5_1" => (3, 8),
+        // f32/f16/bf16 and anything unrecognized stay full-size: the
+        // callers' conservative-by-design contract.
+        _ => (1, 1),
+    }
+}
+
+/// f16 KV bytes scaled to a (K, V) grade pair — the shared per-phase math.
+#[must_use]
+pub fn scale_kv_pair(f16_bytes: u64, k: &str, v: &str) -> u64 {
+    let (nk, dk) = kv_grade_rational(k);
+    let (nv, dv) = kv_grade_rational(v);
+    // (nk/dk + nv/dv) / 2, in one integer expression.
+    f16_bytes.saturating_mul(nk * dv + nv * dk) / (2 * dk * dv)
 }
 
 /// f16 KV-cache bytes at `ctx` for this model, when the GGUF carries
@@ -5696,6 +5738,8 @@ mod tests {
         lazy_mode: None,
         loras: None,
         extra_args: None,
+        cache_type_k: None,
+        cache_type_v: None,
         cache_type: None,
         kv_unified: None,
         ctx_extend: None,
@@ -7490,6 +7534,107 @@ mod tests {
         )
         .unwrap();
         assert!(!p.argv.contains(&"--cache-type-k".to_string()));
+    }
+
+    #[test]
+    fn unit__kv_differential__explicit_pair_emits_split_flags() {
+        // Differential pin: K keeps retrieval precision (q8_0) while V
+        // drops to q4_0 — the capacity win that motivated the knobs.
+        let cfg = Config {
+            cache_type_k: "q8_0".into(),
+            cache_type_v: "q4_0".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(24_000, 32_000, 8); // plenty of VRAM: no ladder interference
+        let g = meta();
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p.argv.windows(2).any(|w| w == ["--cache-type-k", "q8_0"]));
+        assert!(p.argv.windows(2).any(|w| w == ["--cache-type-v", "q4_0"]));
+    }
+
+    #[test]
+    fn unit__kv_differential__one_side_mirrors_when_other_unset() {
+        // cache_type_k alone, no legacy cache_type: the V side mirrors K
+        // rather than falling through to the ladder.
+        let cfg = Config {
+            cache_type_k: "q8_0".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let g = meta();
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p.argv.windows(2).any(|w| w == ["--cache-type-k", "q8_0"]));
+        assert!(p.argv.windows(2).any(|w| w == ["--cache-type-v", "q8_0"]));
+    }
+
+    #[test]
+    fn unit__kv_differential__ladder_differential_rung() {
+        // Geometry (live b10948 truth, see unified-KV pin above):
+        // 57344 B/ctx-token -> kv(131072) = 7168 MiB f16. On an 8400 MiB
+        // card (budget 7560) with a 4800 MiB resident model: q8_0
+        // symmetric (3584 MiB) overflows, the differential rung K=q8_0
+        // V=q4_0 (2688 MiB) fits — the ladder stops there, before q4_0
+        // symmetric. The ladder is tested directly: through compile() the
+        // slots auto-sizer scales ctx with VRAM, which would couple the
+        // rung under test to slot math instead of capacity math.
+        let cfg = Config {
+            default_ctx: 131_072,
+            ..Config::default()
+        };
+        let hw = gpu_hw(8_400, 13_674, 8);
+        let g = GgufMeta {
+            context_length: Some(131_072),
+            ..meta()
+        };
+        let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        inp.model_bytes = 4_800 * MIB;
+        let mut warnings = Vec::new();
+        let rung = kv_quant_ladder(&inp, Hardware::bytes(8_400), 131_072, &mut warnings);
+        assert_eq!(rung, Some(("q8_0", "q4_0")));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("differential quant engaged")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn unit__kv_differential__symmetric_f16_class_still_forces_off() {
+        // A k/v pair that lands on the same f16-class grade keeps the
+        // historical force-off: no flags, engine default.
+        let cfg = Config {
+            cache_type_k: "f16".into(),
+            cache_type_v: "f16".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(5_500, 32_000, 8); // ladder would engage if not pinned
+        let g = meta();
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(!p.argv.contains(&"--cache-type-k".to_string()));
+        assert!(!p.argv.contains(&"--cache-type-v".to_string()));
+    }
+
+    #[test]
+    fn unit__scale_kv_pair__differential_averages() {
+        // Shared math for both the emission and the fit verdicts: the
+        // byte scale is the rational average across the two sides;
+        // unknown grades scale 1:1 (fail-open to f16 bytes, never zero).
+        assert_eq!(scale_kv_pair(8_000, "q8_0", "q4_0"), 3_000);
+        assert_eq!(scale_kv_pair(8_000, "q8_0", "q8_0"), 4_000);
+        assert_eq!(scale_kv_pair(8_000, "weird", "bogus"), 8_000);
     }
 
     #[test]
