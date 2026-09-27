@@ -985,6 +985,42 @@ impl Supervisor {
         false
     }
 
+    /// Free decode slots for `model` right now: the widest headroom
+    /// (effective slots − in-flight) across its Ready replicas. 0 when
+    /// every replica is full (or none is up). The best-of-N fan-out
+    /// guard reads this so extra candidates never queue behind live
+    /// traffic — same definition `spec_model_saturated` walks, exposed
+    /// as a number instead of a boolean.
+    #[must_use]
+    pub fn slot_headroom(&self, model: &str) -> u32 {
+        let mut best = 0u32;
+        for e in &self.instances {
+            if model_of_key(e.key()) != model {
+                continue;
+            }
+            let i = e.value();
+            if !matches!(*i.state.read().expect("state lock"), InstanceState::Ready) {
+                continue;
+            }
+            let resolved = i
+                .argv
+                .windows(2)
+                .find(|w| w[0] == "-np" || w[0] == "--parallel")
+                .and_then(|w| w[1].parse::<u32>().ok())
+                .unwrap_or(self.config.slots);
+            let effective = self
+                .adopted_slots
+                .get(model)
+                .map_or(resolved, |v| *v.value());
+            if effective == 0 {
+                continue;
+            }
+            let free = i64::from(effective) - i.in_flight.load(Ordering::SeqCst);
+            best = best.max(u32::try_from(free.max(0)).unwrap_or(0));
+        }
+        best
+    }
+
     /// Queue a dense/spec restore respawn for every live replica of the
     /// model via the existing reshape machinery (drain waits for
     /// in-flight streams; the KV bank carries conversations across the

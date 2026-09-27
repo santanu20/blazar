@@ -4,6 +4,7 @@
 pub mod anthropic;
 pub mod audit;
 pub mod batch;
+pub mod bestof;
 pub mod cache_bust;
 pub mod histogram;
 pub mod http_pool;

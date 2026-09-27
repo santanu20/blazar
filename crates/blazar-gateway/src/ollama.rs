@@ -1053,6 +1053,20 @@ pub async fn chat(
         }
     }
 
+    // Best-of-N fan-out knob (blazar extension): validate before
+    // admission — garbage must never occupy queue slots. Non-streaming
+    // only: a winner cannot be judged before completion.
+    let best_of = match crate::bestof::resolve_best_of(&headers, req.get("best_of")) {
+        Ok(n) => n,
+        Err(msg) => return api_error(400, &msg),
+    };
+    if best_of.is_some() && req["stream"].as_bool().unwrap_or(true) {
+        return api_error(
+            400,
+            "best_of requires stream=false — a winner cannot be judged before completion",
+        );
+    }
+
     // WorkClass: raw-lane classification follows the LANE the request
     // will actually take — image requests fall back to the child lane
     // even under ollama_compat, so they keep their interactive class
@@ -1117,6 +1131,7 @@ pub async fn chat(
                 enforce,
                 sem_ctx,
                 OutputShape::Chat,
+                best_of,
             )
             .await;
             // keep_alive=0: evict right after this response (complaint #12),
@@ -1532,6 +1547,7 @@ async fn proxy_core_chat(
     enforce: bool,
     sem: Option<semcache::SemCtx>,
     shape: OutputShape,
+    best_of: Option<u64>,
 ) -> Response {
     let base = child_base(&engine.endpoint);
     // Pre-render recipe lane: the gateway owns the prompt (chatml wrap
@@ -1575,70 +1591,87 @@ async fn proxy_core_chat(
         // We translate the non-stream response into ollama shape.
         let t0 = std::time::Instant::now();
         let ttft_secs;
-        let resp = match crate::proxy::child_send(
-            state,
-            engine,
-            req.body(openai_body.clone()).send(),
-        )
-        .await
-        {
-            Ok(r) => {
-                let s = t0.elapsed().as_secs_f64();
+        // Best-of-N: judge N candidates, return the winner as a normal
+        // child response (usage summed across candidates). Degrades to
+        // the single-send path below on saturation, oversize bodies, or
+        // a first-copy transport failure (that path's respawn retry
+        // then owns crash recovery).
+        let mut bestof_hdr: Option<String> = None;
+        let fan = match best_of.filter(|n| *n >= 2) {
+            Some(want) => crate::bestof::fan_out(state, engine, &url, &openai_body, want).await,
+            None => None,
+        };
+        let resp = match fan {
+            Some(outcome) => {
+                let s = outcome.elapsed.as_secs_f64();
                 state.ttft.observe_secs(s);
                 ttft_secs = Some(s);
-                r
+                bestof_hdr = Some(outcome.hdr);
+                outcome.resp
             }
-            Err(e) => {
-                tracing::warn!(
+            None => {
+                match crate::proxy::child_send(state, engine, req.body(openai_body.clone()).send())
+                    .await
+                {
+                    Ok(r) => {
+                        let s = t0.elapsed().as_secs_f64();
+                        state.ttft.observe_secs(s);
+                        ttft_secs = Some(s);
+                        r
+                    }
+                    Err(e) => {
+                        tracing::warn!(
                     model,
                     "nonstream upstream failed: {e} — respawning lane, retrying once in-band"
                 );
-                // Same crash-recovery contract as the proxy path:
-                // `child_send` already evicted a wedged child; the
-                // respawn reaps the dead ones. Exactly one in-band
-                // retry so single-shot clients don't eat the 502/504
-                // for a child they never got to talk to.
-                match crate::proxy::respawn_lane(state, &engine.key).await {
-                    Ok(fresh) => {
-                        let fresh_url = if ollama_compat {
-                            format!("{}/v1/completions", child_base(&fresh.endpoint))
-                        } else {
-                            format!("{}/v1/chat/completions", child_base(&fresh.endpoint))
-                        };
-                        let fresh_req = child_auth(
-                            crate::state::child_client(state, &fresh.endpoint)
-                                .post(&fresh_url)
-                                .header("content-type", "application/json"),
-                            &fresh,
-                        );
-                        match crate::proxy::child_send(
-                            state,
-                            &fresh,
-                            fresh_req.body(openai_body.clone()).send(),
-                        )
-                        .await
-                        {
-                            Ok(r) => {
-                                let s = t0.elapsed().as_secs_f64();
-                                state.ttft.observe_secs(s);
-                                ttft_secs = Some(s);
-                                r
-                            }
-                            Err(e2) => {
-                                return api_error(
+                        // Same crash-recovery contract as the proxy path:
+                        // `child_send` already evicted a wedged child; the
+                        // respawn reaps the dead ones. Exactly one in-band
+                        // retry so single-shot clients don't eat the 502/504
+                        // for a child they never got to talk to.
+                        match crate::proxy::respawn_lane(state, &engine.key).await {
+                            Ok(fresh) => {
+                                let fresh_url = if ollama_compat {
+                                    format!("{}/v1/completions", child_base(&fresh.endpoint))
+                                } else {
+                                    format!("{}/v1/chat/completions", child_base(&fresh.endpoint))
+                                };
+                                let fresh_req = child_auth(
+                                    crate::state::child_client(state, &fresh.endpoint)
+                                        .post(&fresh_url)
+                                        .header("content-type", "application/json"),
+                                    &fresh,
+                                );
+                                match crate::proxy::child_send(
+                                    state,
+                                    &fresh,
+                                    fresh_req.body(openai_body.clone()).send(),
+                                )
+                                .await
+                                {
+                                    Ok(r) => {
+                                        let s = t0.elapsed().as_secs_f64();
+                                        state.ttft.observe_secs(s);
+                                        ttft_secs = Some(s);
+                                        r
+                                    }
+                                    Err(e2) => {
+                                        return api_error(
                                         e2.status_u16(),
                                         &format!(
                                             "engine request failed: {e}; retry on respawned child: {e2}"
                                         ),
                                     );
+                                    }
+                                }
+                            }
+                            Err(re) => {
+                                return api_error(
+                                    e.status_u16(),
+                                    &format!("engine request failed: {e}; respawn: {re:#}"),
+                                );
                             }
                         }
-                    }
-                    Err(re) => {
-                        return api_error(
-                            e.status_u16(),
-                            &format!("engine request failed: {e}; respawn: {re:#}"),
-                        );
                     }
                 }
             }
@@ -1646,7 +1679,9 @@ async fn proxy_core_chat(
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
-            return api_error(status, &format!("engine error: {text}"));
+            let mut r = api_error(status, &format!("engine error: {text}"));
+            crate::bestof::stamp(&mut r, bestof_hdr.as_deref());
+            return r;
         }
         let openai: Value = match resp.json().await {
             Ok(v) => v,
@@ -1703,7 +1738,9 @@ async fn proxy_core_chat(
             drop(feed);
         }
         if let Some(msg) = child_error_body(&openai) {
-            return api_error(502, &format!("engine error: {msg}"));
+            let mut r = api_error(502, &format!("engine error: {msg}"));
+            crate::bestof::stamp(&mut r, bestof_hdr.as_deref());
+            return r;
         }
         let mut ollama = match shape {
             OutputShape::Chat => tr::openai_chat_to_ollama(model, &openai),
@@ -1742,9 +1779,12 @@ async fn proxy_core_chat(
             let mut resp = axum::Json(ollama).into_response();
             resp.headers_mut()
                 .insert(semcache::HDR_CACHE, HeaderValue::from_static("miss"));
+            crate::bestof::stamp(&mut resp, bestof_hdr.as_deref());
             return resp;
         }
-        return axum::Json(ollama).into_response();
+        let mut resp = axum::Json(ollama).into_response();
+        crate::bestof::stamp(&mut resp, bestof_hdr.as_deref());
+        return resp;
     }
     // Stream: child SSE -> ollama NDJSON with final counts. Force the
     // usage chunk so the final ollama line carries eval counts.
@@ -2635,6 +2675,19 @@ pub async fn generate(
             return *resp;
         }
     }
+    // Best-of-N fan-out knob (blazar extension): validate before
+    // admission — garbage must never occupy queue slots. Non-streaming
+    // only: a winner cannot be judged before completion.
+    let best_of = match crate::bestof::resolve_best_of(&headers, req.get("best_of")) {
+        Ok(n) => n,
+        Err(msg) => return api_error(400, &msg),
+    };
+    if best_of.is_some() && req["stream"].as_bool().unwrap_or(true) {
+        return api_error(
+            400,
+            "best_of requires stream=false — a winner cannot be judged before completion",
+        );
+    }
     let class = crate::queue::classify_work(
         req.get("tools").is_some_and(serde_json::Value::is_array),
         state.config.effective_prompt_recipe(&model) == crate::prompt_recipe::OLLAMA_COMPAT,
@@ -2685,6 +2738,7 @@ pub async fn generate(
                 enforce,
                 None, // semantic cache is chat-lane only (response-shape keyed)
                 OutputShape::Generate,
+                best_of,
             )
             .await;
             // keep_alive=0: evict right after this response (complaint
@@ -3353,6 +3407,15 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
             );
         }
     }
+    // E3 best-of-N fan-out totals: engaged fan-outs and how many were
+    // degraded to a smaller candidate count (saturation, slot
+    // headroom, oversize bodies).
+    let _ = writeln!(
+        merged,
+        "# HELP blazar_bestof_fanouts_total Best-of-N request fan-outs engaged\n# TYPE blazar_bestof_fanouts_total counter\nblazar_bestof_fanouts_total {}\n# HELP blazar_bestof_degraded_total Best-of-N fan-outs degraded below the asked candidate count\n# TYPE blazar_bestof_degraded_total counter\nblazar_bestof_degraded_total {}",
+        crate::bestof::FANOUT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+        crate::bestof::FANOUT_DEGRADED.load(std::sync::atomic::Ordering::Relaxed),
+    );
     engine_build_gauge(&state, &mut merged);
     (
         [(

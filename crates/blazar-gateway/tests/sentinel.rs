@@ -835,3 +835,115 @@ async fn integration__sentinel__disabled_is_a_full_kill_switch() {
     assert_eq!(why["sentinel"], false);
     ts.state.sup.shutdown_all().await.unwrap();
 }
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__bestof__fanout_sums_usage_and_stamps_header() {
+    // slots > 1 so the saturation guard has free decode slots to spend
+    // on candidates (a slots=1 model can never afford a fan-out).
+    let cfg = Config {
+        slots: 4,
+        ..Config::default()
+    };
+    let ts = start(cfg, &[], false).await;
+    let c = client();
+    let ask = serde_json::json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{"role": "user", "content": "hello best-of world"}],
+    });
+    // Baseline: the same ask without the knob (single candidate).
+    let base: serde_json::Value = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&ask)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // Fan-out: two identical candidates -> winner + summed usage +
+    // transparency header proving both ran and were billed.
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "best_of": 2,
+            "messages": [{"role": "user", "content": "hello best-of world"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let hdr = resp
+        .headers()
+        .get("x-blazar-best-of")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(hdr.contains("asked=2"), "header: {hdr}");
+    assert!(hdr.contains("used=2"), "header: {hdr}");
+    let fan: serde_json::Value = resp.json().await.unwrap();
+    let single = base["eval_count"].as_i64().unwrap_or(0);
+    let doubled = fan["eval_count"].as_i64().unwrap_or(0);
+    assert_eq!(
+        doubled,
+        single.saturating_mul(2),
+        "usage must sum across candidates: single={single} fan={doubled:?} hdr={hdr} base={base} fan={fan}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__bestof__stream_plus_bestof_is_rejected() {
+    let ts = start(Config::default(), &[], false).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": true,
+            "best_of": 2,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].to_string().contains("stream=false"),
+        "teaching error: {body}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__bestof__passthrough_chat_lane_teaches_instead_of_ignoring() {
+    let ts = start(Config::default(), &[], false).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "best_of": 2,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("/v1/responses"),
+        "teaching error names the working lanes: {body}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}

@@ -1306,6 +1306,13 @@ impl Sentinel {
         }
         Some(msg)
     }
+
+    /// Pure schema validity probe (no detection recording, no commit) —
+    /// the best-of-N judge scores candidates with the same predicate the
+    /// enforce path uses, without double-counting sentinel events.
+    pub(crate) fn schema_check(&self, schema: &Value, instance: &Value) -> Option<String> {
+        self.schema_violation(schema, instance)
+    }
 }
 
 /// Assemble the finalized record (shared by the async analyzer and the

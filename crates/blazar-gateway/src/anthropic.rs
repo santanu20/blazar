@@ -82,6 +82,20 @@ pub async fn messages(
         Ok(b) => b,
         Err(msg) => return anthropic_error(400, "invalid_request_error", &msg),
     };
+    // Best-of-N fan-out knob (blazar extension): header is the
+    // dialect-universal spelling, body field tolerated. Non-streaming
+    // only: a winner cannot be judged before completion.
+    let best_of = match crate::bestof::resolve_best_of(&headers, parsed.get("best_of")) {
+        Ok(n) => n,
+        Err(msg) => return anthropic_error(400, "invalid_request_error", &msg),
+    };
+    if best_of.is_some() && stream {
+        return anthropic_error(
+            400,
+            "invalid_request_error",
+            "best_of requires stream=false — a winner cannot be judged before completion",
+        );
+    }
     if let Some(key) = key_ext.as_ref().map(|axum::extract::Extension(k)| k) {
         state.keys.charge_request(&key.name);
     }
@@ -188,9 +202,32 @@ pub async fn messages(
             .body(Body::from_stream(events))
             .unwrap_or_else(|e| anthropic_error(500, "api_error", &format!("stream: {e}")));
     }
-    let resp = match send.send().await {
-        Ok(r) => r,
-        Err(e) => return anthropic_error(502, "api_error", &format!("engine: {e}")),
+    // Best-of-N: judge N candidates on the translated child body, return
+    // the winner as a normal child response (usage summed across
+    // candidates). `None` (knob off, degraded, first-copy transport
+    // failure) falls through to the single-send path below.
+    let mut bestof_hdr: Option<String> = None;
+    let fan = if let Some(want) = best_of.filter(|n| *n >= 2) {
+        crate::bestof::fan_out(
+            &state,
+            &engine,
+            &url,
+            &serde_json::to_vec(&openai_body).unwrap_or_default(),
+            want,
+        )
+        .await
+    } else {
+        None
+    };
+    let resp = match fan {
+        Some(outcome) => {
+            bestof_hdr = Some(outcome.hdr);
+            outcome.resp
+        }
+        None => match send.send().await {
+            Ok(r) => r,
+            Err(e) => return anthropic_error(502, "api_error", &format!("engine: {e}")),
+        },
     };
     let status = resp.status();
     let bytes = match resp.bytes().await {
@@ -212,10 +249,14 @@ pub async fn messages(
             .pointer("/error/message")
             .and_then(Value::as_str)
             .unwrap_or("engine error");
-        return anthropic_error(status.as_u16(), "api_error", msg);
+        let mut r = anthropic_error(status.as_u16(), "api_error", msg);
+        crate::bestof::stamp(&mut r, bestof_hdr.as_deref());
+        return r;
     }
     let translated = translate_response(&openai, &model);
-    (StatusCode::OK, axum::Json(translated)).into_response()
+    let mut resp = (StatusCode::OK, axum::Json(translated)).into_response();
+    crate::bestof::stamp(&mut resp, bestof_hdr.as_deref());
+    resp
 }
 
 /// POST `/v1/messages/count_tokens` — Anthropic counting over `/tokenize`.
