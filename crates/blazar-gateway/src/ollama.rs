@@ -2288,7 +2288,7 @@ pub async fn embeddings(
             let url = format!("{}/v1/embeddings", child_base(&engine.endpoint));
             // mistral.rs children register models as `default` (see proxy.rs).
             if let Some(stamp) = crate::proxy::child_model_stamp(&engine) {
-                crate::proxy::set_child_model(&mut openai_req, stamp);
+                crate::proxy::set_child_model(&mut openai_req, &stamp);
             }
             let resp = match crate::proxy::child_send(
                 &state,
@@ -2418,7 +2418,7 @@ pub async fn embed(
             let mut openai_req = json!({"model": model, "input": inputs});
             // mistral.rs children register models as `default` (see proxy.rs).
             if let Some(stamp) = crate::proxy::child_model_stamp(&engine) {
-                crate::proxy::set_child_model(&mut openai_req, stamp);
+                crate::proxy::set_child_model(&mut openai_req, &stamp);
             }
             let resp = match crate::proxy::child_send(
                 &state,
@@ -2541,7 +2541,7 @@ pub async fn rerank(
             // mistral.rs children register models as `default` (see
             // proxy.rs) — F28: rerank lane now rewrites like every other.
             if let Some(stamp) = crate::proxy::child_model_stamp(&engine) {
-                crate::proxy::set_child_model(&mut forward, stamp);
+                crate::proxy::set_child_model(&mut forward, &stamp);
             }
             let resp = match crate::proxy::child_send(
                 &state,
@@ -2746,7 +2746,7 @@ pub async fn generate(
     let model_name = row.name.clone();
     // mistral.rs children register models as `default` (see proxy.rs).
     if let Some(stamp) = crate::proxy::child_model_stamp(&engine) {
-        crate::proxy::set_child_model(&mut openai_req, stamp);
+        crate::proxy::set_child_model(&mut openai_req, &stamp);
     }
     let openai_bytes = serde_json::to_vec(&openai_req).unwrap_or_default();
     // ollama defaults stream=true on generate; the chat bus mirrors it.

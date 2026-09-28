@@ -39,6 +39,12 @@ const SGLANG_MIN_DISK_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 /// a legitimate one.
 const SGLANG_INSTALL_TIMEOUT_SECS: u64 = 1800;
 
+/// First import of the boot-critical chain can legitimately JIT-compile
+/// (`deep_ep`'s `init_jit` builds its extension at import when no prebuilt
+/// matches, torch import alone is tens of seconds) — the cap catches a
+/// wedged compile, not a slow one.
+const SGLANG_BOOT_SMOKE_TIMEOUT_SECS: u64 = 600;
+
 /// Free bytes under `path`'s filesystem (`df -B1`). Linux-only lane —
 /// see the OS gate in [`install_into`].
 fn disk_avail_bytes(path: &Path) -> Result<u64> {
@@ -87,7 +93,11 @@ where
 }
 
 /// (pip/uv progress visibility); stderr carries the real errors.
-async fn run_streaming(cmd: &mut tokio::process::Command, what: &str) -> Result<()> {
+async fn run_streaming(
+    cmd: &mut tokio::process::Command,
+    what: &str,
+    timeout_secs: u64,
+) -> Result<()> {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -110,7 +120,7 @@ async fn run_streaming(cmd: &mut tokio::process::Command, what: &str) -> Result<
         child.wait(),
     )
     .await
-    .with_context(|| format!("{what} exceeded {SGLANG_INSTALL_TIMEOUT_SECS}s"))?
+    .with_context(|| format!("{what} exceeded {timeout_secs}s"))?
     .with_context(|| format!("wait {what}"))?;
     if !status.success() {
         anyhow::bail!("{what} exited {status}");
@@ -131,6 +141,7 @@ fn uv_available() -> bool {
 /// Create the venv + install sglang + write the shim inside `dir`.
 /// `dir` must exist and be empty; on failure the caller removes `dir`
 /// (F88 discipline lives with the `EngineManager` entry point).
+#[allow(clippy::too_many_lines)] // linear lane build: preflight, venv, wheels, shim, boot-smoke
 pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
     if !cfg!(target_os = "linux") {
         anyhow::bail!(
@@ -165,6 +176,7 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
                 .arg("3.12")
                 .arg(&venv),
             "uv venv",
+            SGLANG_INSTALL_TIMEOUT_SECS,
         )
         .await?;
         run_streaming(
@@ -180,6 +192,7 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
                 .arg(format!("sglang=={version}"))
                 .arg("ninja"),
             "uv pip install sglang",
+            SGLANG_INSTALL_TIMEOUT_SECS,
         )
         .await?;
     } else {
@@ -189,6 +202,7 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
                 .arg("venv")
                 .arg(&venv),
             "python3 -m venv",
+            SGLANG_INSTALL_TIMEOUT_SECS,
         )
         .await?;
         run_streaming(
@@ -199,6 +213,7 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
                 .arg("--upgrade")
                 .arg("pip"),
             "pip self-upgrade",
+            SGLANG_INSTALL_TIMEOUT_SECS,
         )
         .await?;
         run_streaming(
@@ -209,6 +224,7 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
                 .arg(format!("sglang=={version}"))
                 .arg("ninja"),
             "pip install sglang",
+            SGLANG_INSTALL_TIMEOUT_SECS,
         )
         .await?;
     }
@@ -228,29 +244,77 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
     // user override in charge.
     let cache = dir.join("cache");
     let shim = dir.join("sglang-server");
+    let toolkit = bundled_cuda_toolkit_root(&venv);
+    if let Some(root) = &toolkit {
+        ensure_dev_toolkit_layout(root);
+    }
     let mut path_prefix = venv.join("bin").display().to_string();
-    if let Some(nvcc_dir) = bundled_nvcc_bin_dir(&venv) {
-        path_prefix = format!("{}:{}", nvcc_dir.display(), path_prefix);
+    let mut cuda_home_export = String::new();
+    if let Some(root) = &toolkit {
+        // Hard-set, not ${CUDA_HOME:-default}: the bundled toolkit is the
+        // only nvcc matching the venv's torch wheels; a system CUDA_HOME
+        // would poison JIT compiles with mismatched headers (the same
+        // reasoning as the PATH prefix below).
+        cuda_home_export = format!("export CUDA_HOME=\"{}\"\n", root.display());
+        path_prefix = format!("{}:{}", root.join("bin").display(), path_prefix);
     }
     let script = format!(
-        "#!/bin/sh\nexport PATH=\"{}:$PATH\"\nexport \
+        "#!/bin/sh\nexport PATH=\"{}:$PATH\"\n{}export \
          SGLANG_CACHE_DIR=\"${{SGLANG_CACHE_DIR:-{}}}\"\nexec \"{}\" -m \
          sglang.launch_server \"$@\"\n",
         path_prefix,
+        cuda_home_export,
         cache.display(),
         venv_python.display()
     );
     std::fs::create_dir_all(&cache).context("create engine cache dir")?;
     std::fs::write(&shim, script).context("write sglang-server shim")?;
     make_executable(&shim)?;
+
+    // Boot smoke: the `--version` probes (install register, doctor,
+    // supervisor rollback gate) exit before the deep imports, so a venv
+    // whose boot-critical import chain dies still installed and activated
+    // cleanly (live 2026-09-27: deep_ep's find_cuda_home assert + a rope
+    // JIT death both reached serve-time as 502s). Import the real entry
+    // chain here with the shim's exact env; failure bubbles out of
+    // install_into and F88 rolls the dir back — an unbootable venv must
+    // never become an activatable row.
+    let inherited_path = std::env::var("PATH").unwrap_or_default();
+    let mut smoke = tokio::process::Command::new(&venv_python);
+    smoke
+        .arg("-c")
+        .arg("import sglang.srt.entrypoints.engine")
+        .env("PATH", format!("{path_prefix}:{inherited_path}"));
+    if let Some(root) = &toolkit {
+        smoke.env("CUDA_HOME", root);
+    }
+    if std::env::var_os("SGLANG_CACHE_DIR").is_none() {
+        smoke.env("SGLANG_CACHE_DIR", &cache);
+    }
+    run_streaming(
+        &mut smoke,
+        "boot-smoke import sglang.srt.entrypoints.engine",
+        SGLANG_BOOT_SMOKE_TIMEOUT_SECS,
+    )
+    .await
+    .context("boot-smoke failed: the venv cannot import the sglang server entry chain — rerun manually to inspect: <engine>/venv/bin/python -c 'import sglang.srt.entrypoints.engine'")?;
     Ok(shim)
 }
 
-/// The venv's bundled nvcc bin dir when the sglang wheels pulled a
-/// `nvidia-cuda-nvcc` wheel
-/// (`lib/python3.X/site-packages/nvidia/cuda_nvcc/bin`), so the shim can
-/// self-host flashinfer's JIT toolchain.
-fn bundled_nvcc_bin_dir(venv: &Path) -> Option<PathBuf> {
+/// The venv's bundled CUDA toolkit ROOT when the sglang wheels pulled a
+/// compiler dist (`nvidia-cuda-nvcc`), so the shim can self-host the JIT
+/// toolchain: nvcc's bin on PATH plus `CUDA_HOME` for the consumers that
+/// demand it by name (`deep_ep`'s `find_cuda_home`, torch `cpp_extension`,
+/// flashinfer).
+///
+/// Two wheel generations, two layouts: CUDA 12-era dists land the
+/// toolkit at `nvidia/cuda_nvcc`, CUDA 13-era at `nvidia/cu13`. Probe
+/// both instead of hardcoding one — a torch float across reinstall
+/// generations silently moved the toolkit and dead-ended every JIT
+/// import while the compiler sat one directory over (live incident
+/// 2026-09-27: sglang-0.5.19 + torch 2.13 cu13 wheels, spawn 502s from
+/// `cuda_home is None` and a rope JIT death).
+fn bundled_cuda_toolkit_root(venv: &Path) -> Option<PathBuf> {
     let lib = std::fs::read_dir(venv.join("lib")).ok()?;
     let python_dir = lib
         .filter_map(std::result::Result::ok)
@@ -261,13 +325,91 @@ fn bundled_nvcc_bin_dir(venv: &Path) -> Option<PathBuf> {
                 .is_some_and(|n| n.starts_with("python"))
         })?
         .path();
-    let bin = python_dir
-        .join("site-packages")
-        .join("nvidia")
-        .join("cuda_nvcc")
-        .join("bin");
+    let nvidia = python_dir.join("site-packages").join("nvidia");
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(&nvidia)
+        .ok()?
+        .filter_map(std::result::Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                return false;
+            };
+            // cu13-style generation dirs (digits after "cu") and the
+            // legacy cuda_nvcc dir carry the compiler; everything else
+            // under nvidia/ is runtime libs without a bin/.
+            let generation = name.len() > 2
+                && name.starts_with("cu")
+                && name[2..].chars().all(|c| c.is_ascii_digit());
+            generation || name == "cuda_nvcc"
+        })
+        .collect();
+    // Deterministic order; a cu<N> generation wins over the legacy name
+    // if both somehow coexist — it matches the wheel set the venv was
+    // just resolved against.
+    candidates.sort_by(|a, b| {
+        let rank = |p: &Path| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            (!name.starts_with("cu"), name.to_string())
+        };
+        rank(a).cmp(&rank(b))
+    });
     let nvcc = if cfg!(windows) { "nvcc.exe" } else { "nvcc" };
-    bin.join(nvcc).is_file().then_some(bin)
+    candidates
+        .into_iter()
+        .find(|root| root.join("bin").join(nvcc).is_file())
+}
+
+/// Bridge the pip wheels' runtime layout to the developer layout sglang's
+/// JIT linker specs assume: `toolchain.py` links `-L$CUDA_HOME/lib64
+/// -lcudart`, but the cu13-generation wheels ship `lib/` with versioned
+/// sonames only (`libcudart.so.13`, no unversioned dev link) — ld dies
+/// with `cannot find -lcudart` right after nvcc compiles cleanly (live
+/// 2026-09-28: rope JIT on `sm_89`). Create the two entries a system dev
+/// toolkit carries: `lib64 -> lib` and `libcudart.so -> libcudart.so.N`.
+/// Best-effort with a warn: failure leaves the deterministic JIT link
+/// error visible at spawn instead of masking it here.
+fn ensure_dev_toolkit_layout(root: &Path) {
+    #[cfg(unix)]
+    {
+        let lib = root.join("lib");
+        if !lib.is_dir() {
+            return;
+        }
+        let lib64 = root.join("lib64");
+        if !lib64.exists() {
+            if let Err(e) = std::os::unix::fs::symlink("lib", &lib64) {
+                tracing::warn!(
+                    "cannot link {} -> lib in the bundled toolkit: {e}",
+                    lib64.display()
+                );
+            }
+        }
+        // Highest versioned soname wins if a wheel ever ships several.
+        let soname = std::fs::read_dir(&lib).ok().and_then(|entries| {
+            entries
+                .filter_map(std::result::Result::ok)
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| {
+                    n.starts_with("libcudart.so.")
+                        && n["libcudart.so.".len()..]
+                            .chars()
+                            .all(|c| c.is_ascii_digit())
+                })
+                .max()
+        });
+        if let Some(soname) = soname {
+            let dev_link = lib.join("libcudart.so");
+            if !dev_link.exists() {
+                if let Err(e) = std::os::unix::fs::symlink(&soname, &dev_link) {
+                    tracing::warn!(
+                        "cannot link libcudart.so -> {soname} in the bundled toolkit: {e}"
+                    );
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = root;
 }
 
 #[cfg_attr(not(unix), allow(clippy::unnecessary_wraps, unused_variables))] // chmod is unix-only
@@ -358,29 +500,82 @@ mod tests {
 
     #[test]
     #[allow(non_snake_case)]
-    fn unit__bundled_nvcc_bin_dir__detects_wheel_and_stays_silent_without() {
-        // Real sglang venv layout: the nvidia-cuda-nvcc wheel lands its
-        // compiler in lib/python3.X/site-packages/nvidia/cuda_nvcc/bin.
-        let venv = tempfile::tempdir().unwrap();
-        assert_eq!(bundled_nvcc_bin_dir(venv.path()), None);
-
-        let bin = venv
-            .path()
-            .join("lib")
-            .join("python3.12")
-            .join("site-packages")
-            .join("nvidia")
-            .join("cuda_nvcc")
-            .join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        // Dir alone (no nvcc binary) still yields None.
-        assert_eq!(bundled_nvcc_bin_dir(venv.path()), None);
-
-        // The wheel lands nvcc.exe on Windows, bare nvcc elsewhere —
-        // the probe checks the platform-correct name.
+    fn unit__bundled_cuda_toolkit_root__detects_both_wheel_generations_and_stays_silent_without() {
+        // The wheel lands nvcc.exe on Windows, bare nvcc elsewhere — the
+        // probe checks the platform-correct name.
         let nvcc = if cfg!(windows) { "nvcc.exe" } else { "nvcc" };
-        std::fs::write(bin.join(nvcc), "#!/bin/sh\n").unwrap();
-        let found = bundled_nvcc_bin_dir(venv.path()).expect("wheel nvcc detected");
-        assert!(found.ends_with("cuda_nvcc/bin"), "{found:?}");
+        let site_packages = |venv: &tempfile::TempDir, gen: &str| {
+            venv.path()
+                .join("lib")
+                .join("python3.12")
+                .join("site-packages")
+                .join("nvidia")
+                .join(gen)
+        };
+
+        let venv = tempfile::tempdir().unwrap();
+        assert_eq!(bundled_cuda_toolkit_root(venv.path()), None);
+
+        // CUDA 13-era layout: the nvidia-cuda-nvcc wheel moved the whole
+        // toolkit to nvidia/cu13 (bin + include + lib + nvvm) — a torch
+        // float across reinstall generations, not a layout blazar picks.
+        let cu13 = site_packages(&venv, "cu13");
+        std::fs::create_dir_all(cu13.join("bin")).unwrap();
+        // Dir alone (no nvcc binary) still yields None.
+        assert_eq!(bundled_cuda_toolkit_root(venv.path()), None);
+        std::fs::write(cu13.join("bin").join(nvcc), "#!/bin/sh\n").unwrap();
+        let found = bundled_cuda_toolkit_root(venv.path()).expect("cu13 toolkit detected");
+        assert!(found.ends_with("cu13"), "{found:?}");
+
+        // Legacy CUDA 12-era layout keeps working: nvidia/cuda_nvcc.
+        let legacy = tempfile::tempdir().unwrap();
+        let nvcc_dir = site_packages(&legacy, "cuda_nvcc").join("bin");
+        std::fs::create_dir_all(&nvcc_dir).unwrap();
+        std::fs::write(nvcc_dir.join(nvcc), "#!/bin/sh\n").unwrap();
+        let found = bundled_cuda_toolkit_root(legacy.path()).expect("legacy toolkit detected");
+        assert!(found.ends_with("cuda_nvcc"), "{found:?}");
+
+        // cu-prefixed dirs without digits (cuda_runtime et al) are runtime
+        // libs, never candidates: build the tree and prove the miss.
+        let libs = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(site_packages(&libs, "cuda_runtime").join("bin")).unwrap();
+        std::fs::write(
+            site_packages(&libs, "cuda_runtime").join("bin").join(nvcc),
+            "#!/bin/sh\n",
+        )
+        .unwrap();
+        assert_eq!(bundled_cuda_toolkit_root(libs.path()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__ensure_dev_toolkit_layout__bridges_runtime_wheels_to_dev_layout() {
+        // The cu13-generation wheels ship lib/libcudart.so.13 with no
+        // lib64 and no unversioned dev link — sglang's JIT linker specs
+        // (`-L$CUDA_HOME/lib64 -lcudart`) need both (live 2026-09-28:
+        // `ld: cannot find -lcudart` right after a clean nvcc compile).
+        let toolkit = tempfile::tempdir().unwrap();
+        let lib = toolkit.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join("libcudart.so.13"), b"so").unwrap();
+        std::fs::write(lib.join("libcudart_static.a"), b"ar").unwrap();
+
+        ensure_dev_toolkit_layout(toolkit.path());
+
+        let lib64 = std::fs::read_link(toolkit.path().join("lib64")).unwrap();
+        assert_eq!(lib64, std::path::Path::new("lib"));
+        let dev = std::fs::read_link(lib.join("libcudart.so")).unwrap();
+        assert_eq!(dev, std::path::Path::new("libcudart.so.13"));
+
+        // Idempotent: a second pass (reinstall over an existing tree)
+        // changes nothing and never errors.
+        ensure_dev_toolkit_layout(toolkit.path());
+
+        // Runtime-only root (no lib/) is a silent no-op, not a failure.
+        let bare = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(bare.path().join("bin")).unwrap();
+        ensure_dev_toolkit_layout(bare.path());
+        assert!(!bare.path().join("lib64").exists());
     }
 }

@@ -1059,7 +1059,10 @@ fn sglang_argv(
         "--port".to_string(),
         port.to_string(),
         "--served-model-name".to_string(),
-        model.name.clone(),
+        // sglang asserts on ':' (its LoRA model:adapter syntax) before
+        // the model loads; the gateway's request-body stamp derives
+        // from the same core sanitizer so the pair can never diverge.
+        blazar_core::engine_kind::sglang_child_model_name(&model.name),
     ];
     argv.extend(profile.argv.iter().cloned());
     argv

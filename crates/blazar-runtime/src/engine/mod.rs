@@ -2734,6 +2734,154 @@ impl EngineManager {
             })
             .collect()
     }
+
+    /// Adopt legacy `whisper/bin/<tag>` trees into the engines lane:
+    /// move the dir under `engines/` and register it like any engine
+    /// install. The legacy lane predates the engines table, so its
+    /// installs carry no rows — resolution masked ghost rows and the
+    /// lane sat outside `engine prune`'s reach. Called at serve
+    /// preflight and before `engine prune` (the one place an
+    /// unregistered `engines/<tag>` dir — crash-window debris — is
+    /// exposed to deletion). Each tag adopts independently; on failure
+    /// the tree is restored to its legacy path and the rest still
+    /// adopt. After one clean pass this is a no-op. Returns the
+    /// adopted tags, newest first.
+    pub fn adopt_whisper_legacy_trees(&self) -> Vec<String> {
+        let engines_root = self.dirs.engines_dir();
+        let rows = Store::open(&self.dirs)
+            .and_then(|store| store.list_engines())
+            .unwrap_or_default();
+        let mut adopted = Vec::new();
+        for legacy_dir in crate::whisper::sorted_tag_dirs(&self.dirs) {
+            let Some(tag) = legacy_dir
+                .file_name()
+                .and_then(|t| t.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            // Already adopted: a whisper row for this tag whose anchored
+            // binary resolves (second boot after a first-pass adoption,
+            // or a tag the engines lane itself installed).
+            let already = rows.iter().any(|row| {
+                row.kind == EngineKind::Whisper
+                    && row.tag == tag
+                    && serde_json::from_str::<manifest::Manifest>(&row.manifest).is_ok_and(
+                        |mut m| {
+                            m.anchor_server_path(&self.dirs.data_dir);
+                            PathBuf::from(&m.server_path).is_file()
+                        },
+                    )
+            });
+            if already {
+                continue;
+            }
+            match self.adopt_whisper_tree(&legacy_dir, &tag, &engines_root) {
+                Ok(()) => adopted.push(tag),
+                Err(e) => {
+                    tracing::warn!(
+                        "whisper legacy tree {} not adopted (left serving from the legacy lane): {e}",
+                        legacy_dir.display()
+                    );
+                }
+            }
+        }
+        adopted
+    }
+
+    /// Move one legacy whisper tree into the engines lane and register
+    /// it. Ordering is zero-loss: probe before anything moves, retire
+    /// any stale target aside, rename, register, and on failure rescue
+    /// the tree back to its legacy path before restoring the aside.
+    fn adopt_whisper_tree(&self, legacy_dir: &Path, tag: &str, engines_root: &Path) -> Result<()> {
+        // Adoption can be the first engines-lane writer in a fresh
+        // store (live-validated: `engine prune` on a planted legacy
+        // tree, no engines dir yet) — the rename target must exist.
+        std::fs::create_dir_all(engines_root)
+            .with_context(|| format!("mkdir {}", engines_root.display()))?;
+        let target = engines_root.join(tag);
+        // Probe at the legacy path FIRST: a tree without a runnable
+        // whisper-server (corrupt extract, foreign content) must fail
+        // before anything moves.
+        let bin = find_engine_binary(legacy_dir, &["whisper-server", "whisper-server.exe"])?;
+        let label = bin
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .filter(|n| n.starts_with("whisper-bin"))
+            .unwrap_or("legacy");
+        let digest = legacy_tree_digest(&bin)?;
+        // A stale target dir (crash between rename and register, or a
+        // hand-dropped dir) retires aside so the rename lands on the
+        // final path; the aside stays recoverable until registration
+        // succeeds.
+        let aside = retire_engine_dir(&self.dirs.data_dir, &target)?;
+        if let Err(e) = std::fs::rename(legacy_dir, &target) {
+            restore_retired_engine(&self.dirs.data_dir, aside.as_deref(), &target);
+            return Err(anyhow!(
+                "move {} -> {}: {e}",
+                legacy_dir.display(),
+                target.display()
+            ));
+        }
+        match self.register_engine(target.as_path(), tag, label, &digest, EngineKind::Whisper) {
+            Ok(row) => {
+                discard_retired_engine(&self.dirs.data_dir, aside.as_deref());
+                tracing::info!(
+                    "adopted legacy whisper tree {tag} into the engines lane ({})",
+                    row.asset
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // Registration failed after the move: drop any row the
+                // failed attempt left behind (upsert is transactional,
+                // but never bet data placement on that), rescue the
+                // tree back to the legacy lane, then put the aside back.
+                if let Ok(store) = Store::open(&self.dirs) {
+                    if let Err(del) = store.delete_engine(tag) {
+                        tracing::warn!("cannot drop failed adoption row for {tag}: {del}");
+                    }
+                }
+                if let Err(back) = std::fs::rename(&target, legacy_dir) {
+                    // The tree cannot go home: it already sits at the
+                    // final path, so registration is the only way
+                    // forward — retry once before giving up.
+                    tracing::error!(
+                        "cannot restore {} -> {} ({back}) — retrying registration",
+                        target.display(),
+                        legacy_dir.display()
+                    );
+                    let row = self.register_engine(
+                        target.as_path(),
+                        tag,
+                        label,
+                        &digest,
+                        EngineKind::Whisper,
+                    )?;
+                    discard_retired_engine(&self.dirs.data_dir, aside.as_deref());
+                    tracing::info!(
+                        "adopted legacy whisper tree {tag} into the engines lane ({})",
+                        row.asset
+                    );
+                    return Ok(());
+                }
+                restore_retired_engine(&self.dirs.data_dir, aside.as_deref(), &target);
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Content digest of a legacy tree's server binary — the honest value
+/// an asset download would have carried (upstream ships none for
+/// already-extracted trees).
+fn legacy_tree_digest(bin: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut file = std::fs::File::open(bin).with_context(|| format!("open {}", bin.display()))?;
+    std::io::copy(&mut file, &mut hasher).with_context(|| format!("hash {}", bin.display()))?;
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 fn now_secs() -> i64 {
@@ -2919,11 +3067,28 @@ fn exec_version_probe(bin: &Path, args: &[&str], budget: std::time::Duration) ->
 /// llamacpp falls back to a name walk for manifest-less rows; the venv
 /// lanes cannot (their layout is the install contract).
 #[must_use]
-pub fn verify_engine_binary(
+/// One engine lane's liveness probe: the binary, argv, and budget that
+/// together prove an install executes. Shared by the supervisor's
+/// post-update verify gate and doctor's engine-binary smoke row so the
+/// two can never disagree on what "healthy" means for a lane — native
+/// lanes answer `--version`, venv lanes read package metadata through
+/// their venv python (the shims' own `--version` is an argparse error),
+/// and whisper answers `--help` (it has no `--version` flag).
+pub struct SmokeProbe {
+    pub bin: PathBuf,
+    pub args: Vec<String>,
+    pub timeout: std::time::Duration,
+}
+
+/// Derive a lane's probe from its row manifest. `None` = nothing
+/// probeable behind the row (manifest-less legacy rows on lanes whose
+/// layout is the install contract, or a dangling anchor).
+#[must_use]
+pub fn smoke_probe(
     kind: &EngineKind,
     data_dir: &Path,
     manifest_json: Option<&str>,
-) -> bool {
+) -> Option<SmokeProbe> {
     let mut manifest: Option<crate::engine::manifest::Manifest> = manifest_json
         .and_then(|raw| serde_json::from_str::<crate::engine::manifest::Manifest>(raw).ok());
     // Relative rows resolve against the live data dir; legacy absolute
@@ -2936,48 +3101,74 @@ pub fn verify_engine_binary(
             let bin = manifest
                 .map(|m| PathBuf::from(m.server_path))
                 .or_else(|| find_server(&data_dir.join("engines")).ok());
-            bin.is_some_and(|b| {
-                exec_version_probe(&b, &["--version"], std::time::Duration::from_secs(5))
+            bin.map(|bin| SmokeProbe {
+                bin,
+                args: vec!["--version".into()],
+                timeout: std::time::Duration::from_secs(5),
             })
         }
-        EngineKind::Sglang => {
-            // server_path = <engines>/<tag>/sglang-server → the venv sits
-            // next to the shim (sglang_install layout contract).
-            let py = manifest
-                .map(|m| PathBuf::from(m.server_path))
-                .and_then(|shim| shim.parent().map(|d| d.join("venv/bin/python")));
-            py.is_some_and(|p| {
-                exec_version_probe(
-                    &p,
-                    &[
-                        "-c",
-                        "import importlib.metadata as m; print(m.version(\"sglang\"))",
-                    ],
-                    std::time::Duration::from_secs(15),
-                )
-            })
-        }
-        EngineKind::MistralRs => manifest
-            .map(|m| PathBuf::from(m.server_path))
-            .is_some_and(|b| {
-                exec_version_probe(&b, &["--version"], std::time::Duration::from_secs(15))
-            }),
-        // sd-server --version exits 0 with the banner (verified
-        // master-890) — the cheap liveness probe for the image lane.
-        EngineKind::SdCpp => manifest
-            .map(|m| PathBuf::from(m.server_path))
-            .is_some_and(|b| {
-                exec_version_probe(&b, &["--version"], std::time::Duration::from_secs(15))
-            }),
+        EngineKind::Sglang => venv_metadata_probe(manifest, "sglang"),
+        // mistral.rs and sd-server both answer --version with a
+        // banner and exit 0 (verified v0.9.4 / master-890).
+        EngineKind::MistralRs | EngineKind::SdCpp => native_version_probe(manifest),
         // whisper-server has no --version flag (unknown argument,
         // verified b5130) — its cheap liveness probe is --help, which
         // exits 0 with usage exactly like llama's.
-        EngineKind::Whisper => manifest
-            .map(|m| PathBuf::from(m.server_path))
-            .is_some_and(|b| {
-                exec_version_probe(&b, &["--help"], std::time::Duration::from_secs(15))
-            }),
+        EngineKind::Whisper => native_help_probe(manifest),
     }
+}
+
+/// `server_path` = `<engines>/<tag>/<name>-server` → the venv sits next
+/// to the shim (`sglang_install` layout contract);
+/// the venv python is the real liveness check — no torch import, just
+/// a metadata read.
+fn venv_metadata_probe(
+    manifest: Option<crate::engine::manifest::Manifest>,
+    package: &str,
+) -> Option<SmokeProbe> {
+    let py = manifest
+        .map(|m| PathBuf::from(m.server_path))
+        .and_then(|shim| shim.parent().map(|d| d.join("venv/bin/python")));
+    py.map(|bin| SmokeProbe {
+        bin,
+        args: vec![
+            "-c".into(),
+            format!("import importlib.metadata as m; print(m.version(\"{package}\"))"),
+        ],
+        timeout: std::time::Duration::from_secs(15),
+    })
+}
+
+fn native_version_probe(manifest: Option<crate::engine::manifest::Manifest>) -> Option<SmokeProbe> {
+    manifest
+        .map(|m| PathBuf::from(m.server_path))
+        .map(|bin| SmokeProbe {
+            bin,
+            args: vec!["--version".into()],
+            timeout: std::time::Duration::from_secs(15),
+        })
+}
+
+fn native_help_probe(manifest: Option<crate::engine::manifest::Manifest>) -> Option<SmokeProbe> {
+    manifest
+        .map(|m| PathBuf::from(m.server_path))
+        .map(|bin| SmokeProbe {
+            bin,
+            args: vec!["--help".into()],
+            timeout: std::time::Duration::from_secs(15),
+        })
+}
+
+#[must_use]
+pub fn verify_engine_binary(
+    kind: &EngineKind,
+    data_dir: &Path,
+    manifest_json: Option<&str>,
+) -> bool {
+    smoke_probe(kind, data_dir, manifest_json).is_some_and(|probe| {
+        let argv: Vec<&str> = probe.args.iter().map(String::as_str).collect();
+        exec_version_probe(&probe.bin, &argv, probe.timeout)
+    })
 }
 
 /// The rollback target for a newest-first engine list (the order
@@ -3170,6 +3361,42 @@ mod verify_tests {
             &EngineKind::MistralRs,
             tmp.path(),
             None
+        ));
+    }
+
+    #[test]
+    // whisper-server has no --version flag — its probe is --help
+    // (verified b5130). Anchored rows verify like every other lane;
+    // manifest-less rows and ghost anchors stay unverifiable, which is
+    // what the adoption heals.
+    #[cfg(unix)]
+    fn unit__verify_engine_binary__whisper_help_probe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = fake_bin(tmp.path(), "whisper-server", "exit 0");
+        assert!(verify_engine_binary(
+            &EngineKind::Whisper,
+            tmp.path(),
+            Some(&manifest_for(&bin))
+        ));
+        assert!(!verify_engine_binary(
+            &EngineKind::Whisper,
+            tmp.path(),
+            None
+        ));
+        let ghost = serde_json::json!({
+            "tag": "b5130",
+            "build_number": 5130,
+            "version_raw": "t",
+            "devices": [],
+            "flags": [],
+            "spec_types": [],
+            "server_path": "engines/b5130/whisper-bin-ubuntu-x64/whisper-server",
+        })
+        .to_string();
+        assert!(!verify_engine_binary(
+            &EngineKind::Whisper,
+            tmp.path(),
+            Some(&ghost)
         ));
     }
 

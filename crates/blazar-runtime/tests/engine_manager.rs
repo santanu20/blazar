@@ -1603,6 +1603,126 @@ async fn integration__lazy_whisper_lane_never_claims_serving_active() {
     );
 }
 
+/// A legacy `whisper/bin/<tag>` tree adopts into the engines lane: the
+/// dir moves, the row registers, and a ghost row (the live b5130
+/// incident shape: row survived while its dir was gone) heals onto the
+/// moved binary — without touching the serving throne.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn adopt__moves_tree_and_heals_ghost_row() {
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    {
+        let store = Store::open(&dirs).unwrap();
+        stage_mainstream_row(&store, &dirs, "b1-cuda", 2000, &["llama"]);
+        store.set_active_engine("b1-cuda").unwrap();
+        // Ghost whisper row: manifest points nowhere, dir does not exist.
+        store
+            .upsert_engine(&blazar_core::EngineRow {
+                tag: "b5130".into(),
+                asset: "cpu".into(),
+                sha256: "unverified".into(),
+                installed_at: 1000,
+                active: false,
+                manifest: serde_json::to_string(&Manifest::default()).unwrap(),
+                kind: blazar_core::engine_kind::EngineKind::Whisper,
+            })
+            .unwrap();
+    }
+    // The real tree sits in the legacy lane, masking the ghost.
+    let legacy = dirs
+        .data_dir
+        .join("whisper")
+        .join("bin")
+        .join("b5130")
+        .join("whisper-bin-ubuntu-x64");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::copy(stub_server_bin(), legacy.join("whisper-server")).expect("copy stub");
+
+    let adopted = mgr.adopt_whisper_legacy_trees();
+
+    assert_eq!(adopted, vec!["b5130".to_string()]);
+    assert!(!legacy.exists(), "legacy tree left its lane");
+    let moved = dirs
+        .engines_dir()
+        .join("b5130")
+        .join("whisper-bin-ubuntu-x64")
+        .join("whisper-server");
+    assert!(moved.is_file(), "tree lives in the engines lane now");
+    let store = Store::open(&dirs).unwrap();
+    let row = store
+        .list_engines()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.tag == "b5130")
+        .expect("row survived adoption");
+    let mut m: Manifest = serde_json::from_str(&row.manifest).unwrap();
+    m.anchor_server_path(&dirs.data_dir);
+    assert!(
+        Path::new(&m.server_path).is_file(),
+        "ghost healed: manifest anchors at the moved binary"
+    );
+    assert_eq!(
+        store.active_engine().unwrap().map(|r| r.tag),
+        Some("b1-cuda".to_string()),
+        "adoption never steals the serving throne"
+    );
+}
+
+/// Adoption is idempotent: the second pass finds no legacy trees and
+/// no missing rows, adopts nothing, and leaves the moved tree alone.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn adopt__idempotent_second_run_noop() {
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    let legacy = dirs.data_dir.join("whisper").join("bin").join("v2.0.0");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::copy(stub_server_bin(), legacy.join("whisper-server")).expect("copy stub");
+
+    let first = mgr.adopt_whisper_legacy_trees();
+    assert_eq!(first, vec!["v2.0.0".to_string()]);
+    let second = mgr.adopt_whisper_legacy_trees();
+    assert!(second.is_empty(), "nothing left to adopt");
+    assert!(
+        dirs.engines_dir()
+            .join("v2.0.0")
+            .join("whisper-server")
+            .is_file(),
+        "the adopted tree stays put"
+    );
+    assert!(!legacy.exists(), "no resurrection of the legacy lane");
+}
+
+/// A pin written against the legacy tree keeps selecting the same tag
+/// after adoption — through the engines-lane row the adoption created.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn adopt__pin_honored_after_adoption() {
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    let bin_root = dirs.data_dir.join("whisper").join("bin");
+    for t in ["v1.0.0", "v2.0.0"] {
+        let dir = bin_root.join(t);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(stub_server_bin(), dir.join("whisper-server")).expect("copy stub");
+    }
+    std::fs::write(bin_root.join("pin"), "v1.0.0\n").expect("pin");
+
+    let adopted = mgr.adopt_whisper_legacy_trees();
+    assert_eq!(adopted, vec!["v2.0.0".to_string(), "v1.0.0".to_string()]);
+
+    let (bin, _lib) = blazar_runtime::whisper::server_bin(&dirs).expect("serving pick");
+    assert!(
+        bin.starts_with(dirs.engines_dir().join("v1.0.0")),
+        "pin still selects v1.0.0, now via the engines lane ({})",
+        bin.display()
+    );
+}
+
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn integration__vulkan_never_dethrones_cuda_on_nvidia() {

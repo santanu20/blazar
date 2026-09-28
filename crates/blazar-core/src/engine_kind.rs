@@ -327,6 +327,19 @@ pub fn serving_lane_typed(
     }
 }
 
+/// The child-facing `--served-model-name` for an sglang spawn. sglang
+/// reserves `:` in served names for its LoRA `model:adapter` syntax
+/// and asserts at startup on any colon, so quant-tagged registry rows
+/// (`m:4bit`, `m:safetensors`) would kill the child before the model
+/// loads. The gateway's request-body stamp must byte-match what the
+/// argv registered (a mismatched body model 404s inside the child), so
+/// both derive from this one function. LlamaCpp accepts the raw row
+/// name and keeps it.
+#[must_use]
+pub fn sglang_child_model_name(row_name: &str) -> String {
+    row_name.replace(':', "--")
+}
+
 /// Borrowed lane view for [`advertising_lanes`]: (tag, routing class,
 /// mined GGUF arch set — `None` = nothing mined, advertises nothing).
 pub type LaneArchView<'a> = (
@@ -403,6 +416,22 @@ impl FromSql for EngineKind {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
+    fn unit__sglang_child_model_name__colon_sanitized_byte_stable() {
+        // The registry quant tag is the crash vector (sglang's LoRA
+        // `model:adapter` reservation); every colon maps to "--" so the
+        // argv registration and the gateway stamp stay byte-identical.
+        assert_eq!(
+            sglang_child_model_name("qwen3.5-9b-eoq-v3:safetensors"),
+            "qwen3.5-9b-eoq-v3--safetensors"
+        );
+        assert_eq!(sglang_child_model_name("m:4bit:tail"), "m--4bit--tail");
+        // Colon-free names pass through untouched.
+        assert_eq!(sglang_child_model_name("plain-name"), "plain-name");
+        assert_eq!(sglang_child_model_name(""), "");
+    }
 
     #[test]
     #[allow(non_snake_case)] // suite convention: unit__scenario__expected

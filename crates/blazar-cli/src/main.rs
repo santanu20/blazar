@@ -2772,6 +2772,24 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
     let Ok(engines) = store.list_engines() else {
         return out;
     };
+    // Forward-written rows (a kind only a newer blazar understands) are
+    // quarantined by the roster read, not fatal — surface them so the
+    // upgrade path stays visible instead of a silent roster gap.
+    let quarantined: Vec<String> = store
+        .unknown_kind_engine_rows()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(tag, kind)| format!("{tag} ({kind})"))
+        .collect();
+    if !quarantined.is_empty() {
+        out.push(Check::warn(
+            "inventory",
+            format!(
+                "rows with kinds unknown to this binary (upgrade to reclaim): {}",
+                quarantined.join(", ")
+            ),
+        ));
+    }
     for (kind, label) in [
         ("llamacpp", "inventory llamacpp"),
         ("mistralrs", "inventory mistralrs"),
@@ -3241,14 +3259,31 @@ async fn doctor_remotes() -> Vec<Check> {
     out
 }
 
-/// Engine binary smoke: execute the active engine's server binary with
-/// `--version`. The manifest can say "installed" while the binary is
+/// Engine binary smoke: execute the active engine's lane-aware probe
+/// (`engine::smoke_probe`, the same spec the supervisor's verify gate
+/// uses). The manifest can say "installed" while the binary is
 /// corrupted or linked against a glibc the box no longer has — this is
-/// the row that catches it. Read-only probe: `--version` prints and
-/// exits without touching the GPU.
-fn engine_smoke_check(server_path: &str) -> Check {
-    match std::process::Command::new(server_path)
-        .arg("--version")
+/// the row that catches it. Native lanes print `--version`; venv lanes
+/// read package metadata through the venv python (their shim's own
+/// `--version` is an argparse error demanding --model-path); whisper
+/// answers `--help`. Read-only: prints and exits without touching the
+/// GPU.
+fn engine_smoke_check(
+    kind: Option<EngineKind>,
+    d: &BlazarDirs,
+    manifest_json: Option<&str>,
+) -> Check {
+    let Some(kind) = kind else {
+        return Check::warn("engine binary", "no active engine row to probe");
+    };
+    let Some(probe) = blazar_runtime::engine::smoke_probe(&kind, &d.data_dir, manifest_json) else {
+        return Check::warn(
+            "engine binary",
+            "no probeable binary behind the row — reinstall: blazar engine update",
+        );
+    };
+    match std::process::Command::new(&probe.bin)
+        .args(&probe.args)
         .output()
     {
         Ok(out) if out.status.success() => {
@@ -3272,7 +3307,10 @@ fn engine_smoke_check(server_path: &str) -> Check {
         ),
         Err(e) => Check::warn(
             "engine binary",
-            format!("cannot execute {server_path}: {e} — reinstall: blazar engine update"),
+            format!(
+                "cannot execute {}: {e} — reinstall: blazar engine update",
+                probe.bin.display()
+            ),
         ),
     }
 }
@@ -3513,7 +3551,17 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
                     } else {
                         checks.push(Check::ok("hardware", note));
                     }
-                    checks.push(engine_smoke_check(&m.server_path));
+                    // Kind-aware smoke: the active row carries the kind
+                    // the probe dispatch needs (venv lanes probe their
+                    // venv python, not the shim).
+                    let active_row = blazar_core::Store::open(d)
+                        .ok()
+                        .and_then(|s| s.active_engine().ok().flatten());
+                    checks.push(engine_smoke_check(
+                        active_row.as_ref().map(|r| r.kind),
+                        d,
+                        active_row.as_ref().map(|r| r.manifest.as_str()),
+                    ));
                 }
                 Ok(None) => checks.push(Check::fail(
                     "engine",
@@ -3523,6 +3571,20 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
                     "engine",
                     format!("{e} — run: blazar engine update"),
                 )),
+            }
+            // Doctor is the discover-and-heal surface, so legacy whisper
+            // trees adopt here too. After a successful pass any ghost
+            // whisper row below is a genuinely dead tree (the adoption
+            // heals the masked-row shape by registering over it).
+            let adopted = mgr.adopt_whisper_legacy_trees();
+            if !adopted.is_empty() {
+                checks.push(Check::ok(
+                    "engine",
+                    format!(
+                        "adopted legacy whisper tree(s) {} into the engines lane",
+                        adopted.join(", ")
+                    ),
+                ));
             }
             // Ghost rows: the db row outlived its engine dir (manual
             // deletion, disk cleanup). Spawn/verify cannot see these —
@@ -3535,7 +3597,7 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
                     format!("blazar engine update --kind {kind}")
                 };
                 let whisper_note = if matches!(kind, EngineKind::Whisper) {
-                    " (audio transcription still serves from the legacy whisper tree)"
+                    " (audio transcription may still serve from a legacy whisper tree)"
                 } else {
                     ""
                 };
@@ -4129,7 +4191,7 @@ async fn doctor_whisper_currency(d: &BlazarDirs) -> Vec<Check> {
         return vec![Check::warn(
             "whisper lane",
             "not installed — optional: `blazar engine install --kind whisper` \
-             (legacy: `blazar whisper --install`) enables local \
+             (alias: `blazar whisper --install`) enables local \
              /v1/audio/transcriptions + /v1/audio/translations",
         )];
     }
@@ -4137,14 +4199,10 @@ async fn doctor_whisper_currency(d: &BlazarDirs) -> Vec<Check> {
     // subdir name leaked in here once and the warning could not clear
     // through any update (live: "running: whisper-bin-ubuntu-x64").
     let installed = blazar_runtime::whisper::installed_tag(d).unwrap_or_else(|| "?".into());
-    // Update hints name the lane that actually updates the serving
-    // binary: while an engines row backs the lane, the legacy
-    // `whisper --install` tree is never picked by server_bin.
-    let action = if blazar_runtime::whisper::engines_lane_installed(d) {
-        "blazar engine update --kind whisper"
-    } else {
-        "blazar whisper --install"
-    };
+    // `whisper --install` funnels into the engines lane since the
+    // legacy-tree redirect, so one update command covers both entry
+    // points — no lane fork needed.
+    let action = "blazar engine update --kind whisper";
     let token = std::env::var("GH_TOKEN")
         .or_else(|_| std::env::var("GITHUB_TOKEN"))
         .ok();
@@ -4178,8 +4236,8 @@ async fn doctor_whisper_currency(d: &BlazarDirs) -> Vec<Check> {
 
 /// Pinned-whisper currency verdict (pure): deliberate pin named as such —
 /// plain --install silently unpins, so updates point at the
-/// pin-preserving --tag form. `action` is the lane-aware update command
-/// for the unpinned verdict (pins are a legacy-tree concept).
+/// pin-preserving --tag form. `action` is the update command for the
+/// unpinned verdict (the pin file is lane-agnostic).
 fn whisper_pin_verdict(d: &BlazarDirs, installed: &str, latest: &str, action: &str) -> Check {
     match blazar_runtime::whisper::pinned_tag(d) {
         Some(pin) if pin == latest => {
@@ -4900,6 +4958,17 @@ async fn serve() -> Result<()> {
         let row = mgr.register_local(&p, &cfg.engine_env)?;
         mgr.use_tag(&row.tag)?;
         println!("BLAZAR_ENGINE_PATH: engine local active ({})", p.display());
+    }
+    // Adopt legacy whisper trees into the engines lane before the
+    // serving pick: resolution already prefers rows, so the pick is
+    // identical — but the tree gains prune/verify coverage and ghost
+    // rows heal instead of being masked by the legacy tree.
+    let adopted = local_engine_manager(&d)?.adopt_whisper_legacy_trees();
+    if !adopted.is_empty() {
+        println!(
+            "serve: adopted legacy whisper tree(s) {} into the engines lane",
+            adopted.join(", ")
+        );
     }
     // Self-heal the zero-active state (update interrupted before its
     // activation step): an installed serving engine must never sit
@@ -7274,7 +7343,7 @@ async fn whisper_cmd(
                 println!("server: {tag}{pin} ({})", bin.display());
             }
             None => println!(
-                "server: not installed (blazar engine install --kind whisper; legacy: blazar whisper --install)"
+                "server: not installed (blazar engine install --kind whisper, or blazar whisper --install)"
             ),
         }
         let installed = blazar_runtime::whisper::installed_tags(&d);
@@ -7308,9 +7377,20 @@ async fn whisper_cmd(
                 Some(blazar_runtime::whisper::channel_target(&gh, config()?.update_channel).await?)
             }
         };
-        let tag = blazar_runtime::whisper::install(&gh, &d, target.as_deref(), pinned).await?;
+        // Installs land in the engines lane (`engine install --kind
+        // whisper`): the legacy installer wrote data/whisper/bin trees
+        // the engines table never saw — masking ghost rows and sitting
+        // outside `engine prune`'s reach. Pin parity keeps the
+        // documented --tag contract: a tag install pins, a channel
+        // install returns to tracking the newest tag.
+        let mgr = local_engine_manager(&d)?;
+        let row = mgr.update_whisper(target.as_deref()).await?;
+        match tag.as_deref() {
+            Some(t) => blazar_runtime::whisper::set_pin(&d, Some(t))?,
+            None => blazar_runtime::whisper::set_pin(&d, None)?,
+        }
         let pin = if pinned { " (pinned)" } else { "" };
-        println!("whisper.cpp server installed{pin}: {tag}");
+        println!("whisper.cpp server installed{pin}: {}", row.tag);
         return Ok(());
     }
     if let Some(size) = pull {
@@ -9210,6 +9290,34 @@ fn split_table_path(key: &str) -> Option<(Vec<&str>, &str)> {
         .collect();
     let (a, b) = ranges[ranges.len() - 1];
     Some((parts, clean_seg(&key[a..b])))
+}
+
+/// Alternative splits for `model_overrides` keys whose MODEL NAME itself
+/// contains dots (`model_overrides.qwen3-1.7b.engine`). The straight split
+/// yields `[model_overrides, qwen3-1, 7b]` + `engine`, which nests one table
+/// too deep and the schema rejects (`unknown field 7b`). Each candidate
+/// merges the model name across a different run of segments (ascending, so
+/// the shortest name wins) and the caller lets `Config::from_toml` decide
+/// which split is the real one — no hardcoded field lists.
+///
+/// Returns `None` unless the key has at least three parts and targets
+/// `model_overrides`; the straight split stays authoritative everywhere
+/// else.
+fn merged_override_splits(key: &str) -> Option<Vec<(Vec<String>, String)>> {
+    let parts: Vec<&str> = key.split('.').collect();
+    if parts.len() < 3 || parts[0] != "model_overrides" {
+        return None;
+    }
+    let last = parts.len() - 1;
+    let candidates = (1..last)
+        .map(|j| {
+            let name = parts[1..=j].join(".");
+            let mut path = vec!["model_overrides".to_string(), name];
+            path.extend(parts[j + 1..last].iter().copied().map(String::from));
+            (path, parts[last].to_string())
+        })
+        .collect();
+    Some(candidates)
 }
 
 /// Normalize a TOML table header into comparable segments:
@@ -11127,12 +11235,17 @@ fn engine_prune(d: &BlazarDirs) -> Result<()> {
 fn engine_prune_summary(d: &BlazarDirs) -> Result<String> {
     let store = Store::open(d)?;
     let mgr = local_engine_manager(d)?;
+    // Adopt-before-prune: a legacy whisper tree that crashed between
+    // move and register is an unregistered engines/<tag> dir — exactly
+    // what prune_orphan_dirs below deletes. Adopting first closes that
+    // crash window; adopting any other leftover is a free heal.
+    let adopted = mgr.adopt_whisper_legacy_trees();
     let freed = mgr.prune(&store, None)?;
     // Row-less dirs are invisible to the table sweep above yet eat disk;
     // reclaim them in the same manual pass.
     let orphans = mgr.prune_orphan_dirs()?;
     let kept: Vec<String> = store.list_engines()?.into_iter().map(|e| e.tag).collect();
-    if freed.is_empty() && orphans.is_empty() {
+    if freed.is_empty() && orphans.is_empty() && adopted.is_empty() {
         return Ok(format!(
             "nothing to prune — {} engines kept: {}",
             kept.len(),
@@ -11140,6 +11253,12 @@ fn engine_prune_summary(d: &BlazarDirs) -> Result<String> {
         ));
     }
     let mut parts = Vec::new();
+    if !adopted.is_empty() {
+        parts.push(format!(
+            "adopted legacy whisper tree(s) {} into the engines lane",
+            adopted.join(", ")
+        ));
+    }
     if !freed.is_empty() {
         let removed: Vec<String> = freed
             .iter()
@@ -11808,12 +11927,23 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                 // Dotted keys read the pin from the file itself — the
                 // serialized config would dump whole tables instead.
                 let raw = std::fs::read_to_string(dirs().config_file())?;
-                match get_table_key(&raw, &tpath, leaf) {
+                // A dotted MODEL NAME (`model_overrides.qwen3-1.7b.engine`)
+                // splits into too many segments; retry with merged names.
+                let merged = merged_override_splits(&key);
+                let line = get_table_key(&raw, &tpath, leaf).or_else(|| {
+                    merged.as_ref()?.iter().find_map(|(segs, leaf)| {
+                        let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
+                        get_table_key(&raw, &segs, leaf)
+                    })
+                });
+                match line {
                     Some(line) => {
                         println!("{line}");
                         Ok(())
                     }
-                    None if known_config_key(&key) => {
+                    // The model name is user-chosen, so a merged override
+                    // key is always schema-shaped even when unset.
+                    None if known_config_key(&key) || merged.is_some() => {
                         println!("{key} = <not set>");
                         Ok(())
                     }
@@ -11857,7 +11987,7 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
             // `model_overrides.qwen.sglang.stream_interval`) target a table
             // leaf and take the surgical insert path; bare keys keep the
             // root-scope replace/insert flow.
-            let candidate = if let Some((tpath, leaf)) = split_table_path(&key) {
+            let mut candidate = if let Some((tpath, leaf)) = split_table_path(&key) {
                 set_table_key(&raw, &tpath, leaf, &stored)
             } else {
                 let mut out: Vec<String> = Vec::new();
@@ -11883,6 +12013,23 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                 }
                 out.join("\n") + "\n"
             };
+            // A dotted MODEL NAME (`model_overrides.qwen3-1.7b.engine`)
+            // makes the straight candidate nest one table too deep. Retry
+            // with merged model names — the schema is the oracle, the first
+            // candidate it accepts wins, and the final validation below
+            // still gates the winner before anything is persisted.
+            if Config::from_toml(&candidate).is_err() {
+                if let Some(candidates) = merged_override_splits(&key) {
+                    for (segs, leaf) in &candidates {
+                        let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
+                        let alt = set_table_key(&raw, &segs, leaf, &stored);
+                        if Config::from_toml(&alt).is_ok() {
+                            candidate = alt;
+                            break;
+                        }
+                    }
+                }
+            }
             // Validate BEFORE persisting: a bad value/unknown key must
             // never leave the file broken.
             Config::from_toml(&candidate).map_err(|e| anyhow!("rejected, file unchanged: {e}"))?;
@@ -11902,7 +12049,23 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
             }
             let raw = std::fs::read_to_string(&path)?;
             if let Some((tpath, leaf)) = split_table_path(&key) {
-                let (candidate, removed) = remove_table_key(&raw, &tpath, leaf);
+                // Dotted MODEL NAME keys may need the merged split before a
+                // pin is actually found (see `config set`).
+                let merged = merged_override_splits(&key);
+                let mut removed_pair = remove_table_key(&raw, &tpath, leaf);
+                if removed_pair.1.is_none() {
+                    if let Some(candidates) = &merged {
+                        for (segs, leaf) in candidates {
+                            let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
+                            let pair = remove_table_key(&raw, &segs, leaf);
+                            if pair.1.is_some() {
+                                removed_pair = pair;
+                                break;
+                            }
+                        }
+                    }
+                }
+                let (candidate, removed) = removed_pair;
                 return match removed {
                     Some(old) => {
                         Config::from_toml(&candidate)
@@ -11911,7 +12074,7 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                         println!("{key} unset (was: {old}) — not set by default");
                         Ok(())
                     }
-                    None if known_config_key(&key) => {
+                    None if known_config_key(&key) || merged.is_some() => {
                         println!("{key} is not pinned — already at the built-in default");
                         Ok(())
                     }
@@ -13282,6 +13445,91 @@ mod tests {
             "[model_overrides.\"qwen 7b\".sglang]"
         );
         assert_eq!(table_header(&["sglang"]), "[sglang]");
+    }
+
+    #[test]
+    fn unit__merged_override_splits__candidates_ascending() {
+        // A dotted model name yields one candidate per merge point,
+        // shortest name first; the schema picks the valid one downstream.
+        let cands = merged_override_splits("model_overrides.qwen3-1.7b.engine").unwrap();
+        assert_eq!(cands.len(), 2);
+        assert_eq!(
+            cands[0],
+            (
+                vec![
+                    "model_overrides".to_string(),
+                    "qwen3-1".to_string(),
+                    "7b".to_string()
+                ],
+                "engine".to_string()
+            )
+        );
+        assert_eq!(
+            cands[1],
+            (
+                vec!["model_overrides".to_string(), "qwen3-1.7b".to_string()],
+                "engine".to_string()
+            )
+        );
+        // Deeper leaves keep the tail path after the merged name.
+        let cands = merged_override_splits("model_overrides.qwen3-1.7b.sglang.dtype").unwrap();
+        assert_eq!(cands.len(), 3);
+        assert_eq!(
+            cands[1],
+            (
+                vec![
+                    "model_overrides".to_string(),
+                    "qwen3-1.7b".to_string(),
+                    "sglang".to_string()
+                ],
+                "dtype".to_string()
+            )
+        );
+        // Only model_overrides keys qualify, and only with a leaf beyond
+        // the name itself.
+        assert!(merged_override_splits("sglang.qwen3-1.7b").is_none());
+        assert!(merged_override_splits("model_overrides.m").is_none());
+        assert!(merged_override_splits("slots").is_none());
+    }
+
+    #[test]
+    fn unit__config_set__dotted_model_name_resolves_via_schema() {
+        let raw = "[sglang]\ngrammar_backend = \"xgrammar\"\n";
+        // The straight split nests one table too deep — pins the bug the
+        // merged retry exists to fix.
+        let straight = set_table_key(
+            raw,
+            &["model_overrides", "qwen3-1", "7b"],
+            "engine",
+            "\"sglang-0.5.19\"",
+        );
+        assert!(
+            Config::from_toml(&straight).is_err(),
+            "straight split must keep failing until the schema accepts the merged name"
+        );
+        // The merged candidate quotes the dotted name into ONE header
+        // segment and validates.
+        let merged = set_table_key(
+            raw,
+            &["model_overrides", "qwen3-1.7b"],
+            "engine",
+            "\"sglang-0.5.19\"",
+        );
+        Config::from_toml(&merged).expect("merged split must validate");
+        assert!(
+            merged.contains("[model_overrides.\"qwen3-1.7b\"]"),
+            "dotted model name must be a single quoted header segment"
+        );
+        // get/remove round-trip on the merged text.
+        assert_eq!(
+            get_table_key(&merged, &["model_overrides", "qwen3-1.7b"], "engine").as_deref(),
+            Some("engine = \"sglang-0.5.19\"")
+        );
+        let (after, removed) =
+            remove_table_key(&merged, &["model_overrides", "qwen3-1.7b"], "engine");
+        assert!(removed.is_some());
+        assert!(!after.contains("sglang-0.5.19"), "unset must drop the pin");
+        Config::from_toml(&after).expect("config stays valid after unset");
     }
 
     #[test]
@@ -14733,11 +14981,31 @@ mod tests {
     #[test]
     fn unit__engine_smoke_check__executes_warns_and_misses() {
         let tmp = tempfile::tempdir().unwrap();
-        // Healthy: a script that prints a version banner.
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let manifest_for = |bin: &std::path::Path| {
+            serde_json::json!({
+                "tag": "t-test",
+                "build_number": 1,
+                "version_raw": "t",
+                "devices": [],
+                "flags": [],
+                "spec_types": [],
+                "server_path": bin.display().to_string(),
+            })
+            .to_string()
+        };
+        // Healthy native lane: a script that prints a version banner.
         let good = tmp.path().join("server-good");
         std::fs::write(&good, "#!/bin/sh\necho 'llama-server b10857'\n").unwrap();
         make_executable(&good);
-        let c = engine_smoke_check(good.to_str().unwrap());
+        let c = engine_smoke_check(
+            Some(EngineKind::LlamaCpp),
+            &dirs,
+            Some(&manifest_for(&good)),
+        );
         assert!(c.ok && !c.warn, "{}", c.detail);
         assert!(c.detail.contains("executes"), "{}", c.detail);
         assert!(c.detail.contains("b10857"), "{}", c.detail);
@@ -14745,13 +15013,71 @@ mod tests {
         let bad = tmp.path().join("server-bad");
         std::fs::write(&bad, "#!/bin/sh\nexit 3\n").unwrap();
         make_executable(&bad);
-        let c = engine_smoke_check(bad.to_str().unwrap());
+        let c = engine_smoke_check(Some(EngineKind::LlamaCpp), &dirs, Some(&manifest_for(&bad)));
         assert!(c.warn, "{}", c.detail);
         assert!(c.detail.contains("exited"), "{}", c.detail);
         // Missing path entirely.
-        let c = engine_smoke_check(tmp.path().join("nope").to_str().unwrap());
+        let c = engine_smoke_check(
+            Some(EngineKind::LlamaCpp),
+            &dirs,
+            Some(&manifest_for(&tmp.path().join("nope"))),
+        );
         assert!(c.warn, "{}", c.detail);
         assert!(c.detail.contains("cannot execute"), "{}", c.detail);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    // The live sglang false-warn regression: the shim's own --version
+    // is an argparse error (exit 2), so the smoke must probe the venv
+    // python's metadata read instead — a healthy venv lane reports ok,
+    // never "reinstall".
+    fn unit__engine_smoke_check__venv_lane_probes_python_not_the_shim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let lane = tmp.path().join("sglang-0.5.19");
+        std::fs::create_dir_all(lane.join("venv/bin")).unwrap();
+        let shim = lane.join("sglang-server");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\necho 'sglang serve: error: --model-path required' >&2; exit 2\n",
+        )
+        .unwrap();
+        make_executable(&shim);
+        std::fs::write(lane.join("venv/bin/python"), "#!/bin/sh\necho 0.5.19\n").unwrap();
+        make_executable(&lane.join("venv/bin/python"));
+        let manifest = serde_json::json!({
+            "tag": "sglang-0.5.19",
+            "build_number": 5019,
+            "version_raw": "t",
+            "devices": [],
+            "flags": [],
+            "spec_types": [],
+            "server_path": shim.display().to_string(),
+        })
+        .to_string();
+        let c = engine_smoke_check(Some(EngineKind::Sglang), &dirs, Some(&manifest));
+        assert!(c.ok && !c.warn, "{}", c.detail);
+        assert!(c.detail.contains("0.5.19"), "{}", c.detail);
+        // Whisper lane: --help answers 0 (there is no --version flag).
+        let whisper = tmp.path().join("whisper-server");
+        std::fs::write(&whisper, "#!/bin/sh\necho 'usage: whisper-server' \n").unwrap();
+        make_executable(&whisper);
+        let whisper_manifest = serde_json::json!({
+            "tag": "b5130",
+            "build_number": 5130,
+            "version_raw": "t",
+            "devices": [],
+            "flags": [],
+            "spec_types": [],
+            "server_path": whisper.display().to_string(),
+        })
+        .to_string();
+        let c = engine_smoke_check(Some(EngineKind::Whisper), &dirs, Some(&whisper_manifest));
+        assert!(c.ok && !c.warn, "{}", c.detail);
     }
 
     #[cfg(unix)]

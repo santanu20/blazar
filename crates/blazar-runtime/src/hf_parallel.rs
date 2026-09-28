@@ -54,10 +54,14 @@ const SIDECAR_MIN_VERSION: u32 = 1;
 /// forced by every chunk completion). Bounded re-fetch cost after an
 /// unclean interrupt = one cadence window of bytes.
 const SIDECAR_SNAPSHOT_CADENCE: Duration = Duration::from_secs(1);
-/// Per-chunk attempts (1 initial + 2 retries) before the download aborts.
-const CHUNK_ATTEMPTS: u32 = 3;
-/// Exponential backoff table between chunk attempts (500ms -> 2s -> 8s);
-/// a larger Retry-After, when sent, is honored instead.
+/// Per-chunk attempts (1 initial + 5 retries) before the download aborts.
+/// CDN throttle bursts last minutes, not milliseconds: the budget spans
+/// ~100s of backoff so one rough window no longer kills a multi-GiB pull.
+const CHUNK_ATTEMPTS: u32 = 6;
+/// Backoff between chunk attempts: 500ms * 4^n (500ms -> 2s -> 8s -> …)
+/// capped at 30s. A seconds-form `Retry-After` on a failed response is
+/// honored instead, clamped to [1s, 120s] so a hostile or absurd header
+/// can neither busy-loop nor stall the pull.
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ChunkPlan {
@@ -652,6 +656,14 @@ async fn probe_range_total(
     Ok(Some(total))
 }
 
+/// Seconds-form `Retry-After` (digits only) clamped to [1s, 120s].
+/// HTTP-date form and garbage fall back to the backoff table.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let v = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let secs: u64 = v.trim().parse().ok()?;
+    Some(Duration::from_secs(secs.clamp(1, 120)))
+}
+
 #[allow(clippy::too_many_arguments)] // one param per wire concern; a bundle would hide the range contract
 async fn fetch_chunk(
     http: &reqwest::Client,
@@ -664,15 +676,18 @@ async fn fetch_chunk(
     chunk_progress: &AtomicU64,
 ) -> Result<()> {
     let mut last_err: Option<String> = None;
+    // Server-paced wait captured from a failed response's Retry-After;
+    // consumed by the next attempt, then the table rules again.
+    let mut retry_after: Option<Duration> = None;
     for attempt in 0..CHUNK_ATTEMPTS {
         if attempt > 0 {
-            // 500ms -> 2s -> 8s; attempts beyond the table hold at the cap.
-            let backoff = match attempt {
-                1 => Duration::from_millis(500),
-                2 => Duration::from_secs(2),
-                _ => Duration::from_secs(8),
-            };
-            tokio::time::sleep(backoff).await;
+            // 500ms * 4^(n-1) capped at 30s; a clamped Retry-After wins.
+            let tabled = Duration::from_millis(
+                500u64
+                    .saturating_mul(4u64.saturating_pow(attempt - 1))
+                    .min(30_000),
+            );
+            tokio::time::sleep(retry_after.take().unwrap_or(tabled)).await;
         }
         let mut req = http.get(url.clone());
         if let Some(t) = token {
@@ -692,6 +707,7 @@ async fn fetch_chunk(
         };
         // Gate: only a 206 carrying exactly this chunk's length is usable.
         if resp.status().as_u16() != 206 {
+            retry_after = parse_retry_after(resp.headers());
             last_err = Some(format!("status {} (expected 206)", resp.status()));
             continue;
         }
@@ -729,7 +745,9 @@ async fn fetch_chunk(
                     // partway through a chunk): consume it as a retryable
                     // attempt instead of propagating out of the loop —
                     // positional writes make re-fetching the range
-                    // overwrite-safe.
+                    // overwrite-safe. The response's Retry-After (429/503
+                    // bodies often fail this way) paces the next attempt.
+                    retry_after = parse_retry_after(resp.headers());
                     last_err = Some(format!("body: {e}"));
                     ok = false;
                     break;
@@ -1088,6 +1106,70 @@ mod tests {
             payload.len() as u64,
             "per-chunk ledger refunded in lockstep"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn integration__fetch_chunk__retry_after_header_paces_the_retry() {
+        // A throttled 503 carrying `retry-after: 1` must be retried — and
+        // the wait must honor the server's pace, not the backoff table.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let payload: Vec<u8> = (0u32..32 * 1024).map(|i| (i % 251) as u8).collect();
+        let full = payload.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut served = 0u32;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                served += 1;
+                let head = if served == 1 {
+                    "HTTP/1.1 503 Service Unavailable\r\nretry-after: 1\r\n\
+                     content-length: 0\r\nconnection: close\r\n\r\n"
+                        .to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\ncontent-length: {}\r\n\
+                         content-range: bytes 0-{}/{}\r\nconnection: close\r\n\r\n",
+                        full.len(),
+                        full.len() - 1,
+                        full.len()
+                    )
+                };
+                let _ = sock.write_all(head.as_bytes()).await;
+                if served > 1 {
+                    let _ = sock.write_all(&full).await;
+                }
+                let _ = sock.shutdown().await;
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("blazar-ra-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("m.gguf.part");
+        std::fs::write(&part, b"").unwrap();
+        let url: reqwest::Url = format!("http://{addr}/f.gguf").parse().unwrap();
+        let progress = AtomicU64::new(0);
+        let chunk_progress = AtomicU64::new(0);
+        let t0 = std::time::Instant::now();
+        fetch_chunk(
+            &http_client(),
+            None,
+            &url,
+            &part,
+            0,
+            payload.len() as u64,
+            &progress,
+            &chunk_progress,
+        )
+        .await
+        .expect("throttled 503 with Retry-After must be retried, not fatal");
+        assert!(
+            t0.elapsed() >= Duration::from_millis(900),
+            "server-paced backoff honored, took {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(std::fs::read(&part).unwrap(), payload);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
