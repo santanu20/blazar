@@ -2772,6 +2772,24 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
     let Ok(engines) = store.list_engines() else {
         return out;
     };
+    // Forward-written rows (a kind only a newer blazar understands) are
+    // quarantined by the roster read, not fatal — surface them so the
+    // upgrade path stays visible instead of a silent roster gap.
+    let quarantined: Vec<String> = store
+        .unknown_kind_engine_rows()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(tag, kind)| format!("{tag} ({kind})"))
+        .collect();
+    if !quarantined.is_empty() {
+        out.push(Check::warn(
+            "inventory",
+            format!(
+                "rows with kinds unknown to this binary (upgrade to reclaim): {}",
+                quarantined.join(", ")
+            ),
+        ));
+    }
     for (kind, label) in [
         ("llamacpp", "inventory llamacpp"),
         ("mistralrs", "inventory mistralrs"),

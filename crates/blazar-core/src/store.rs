@@ -1,6 +1,9 @@
+use std::str::FromStr;
+
 use rusqlite::{params, Connection};
 
 use crate::dirs::BlazarDirs;
+use crate::engine_kind::EngineKind;
 use crate::error::{CoreError, CoreResult};
 
 /// SQLite-backed persistent state (WAL mode). One DB file at
@@ -485,16 +488,20 @@ impl Store {
             "SELECT tag, asset, sha256, installed_at, active, manifest, kind FROM engines WHERE active = 1",
         )?;
         let mut rows = stmt.query([])?;
-        if let Some(r) = rows.next()? {
-            return Ok(Some(EngineRow {
-                tag: r.get(0)?,
-                asset: r.get(1)?,
-                sha256: r.get(2)?,
-                installed_at: r.get(3)?,
-                active: r.get::<_, i64>(4)? != 0,
-                manifest: r.get(5)?,
-                kind: r.get(6)?,
-            }));
+        while let Some(r) = rows.next()? {
+            match read_engine_row(r)? {
+                EngineRowRead::Known(row) => return Ok(Some(row)),
+                // An active row the binary cannot parse is treated as
+                // absent: heal_active_engine then claims the slot for
+                // the newest known serving lane instead of bricking
+                // boot. The row itself is never touched — a newer
+                // binary parses it again.
+                EngineRowRead::UnknownKind { tag, kind } => tracing::warn!(
+                    tag = %tag,
+                    kind = %kind,
+                    "active engine row kind unknown to this binary — treated as absent, healing picks a known lane"
+                ),
+            }
         }
         Ok(None)
     }
@@ -503,8 +510,37 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT tag, asset, sha256, installed_at, active, manifest, kind FROM engines ORDER BY installed_at DESC, rowid DESC",
         )?;
-        let rows = stmt.query_map([], engine_from_row)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        let mut rows = stmt.query([])?;
+        let mut engines = Vec::new();
+        while let Some(r) = rows.next()? {
+            match read_engine_row(r)? {
+                EngineRowRead::Known(row) => engines.push(row),
+                EngineRowRead::UnknownKind { tag, kind } => tracing::warn!(
+                    tag = %tag,
+                    kind = %kind,
+                    "engine row kind unknown to this binary — quarantined until upgrade"
+                ),
+            }
+        }
+        Ok(engines)
+    }
+
+    /// Roster rows whose kind this binary cannot parse, as `(tag, kind
+    /// text)` pairs, for surfaces that teach the upgrade path (doctor).
+    /// The rows stay untouched in the store and parse again under a
+    /// newer binary — quarantine is read-side only.
+    pub fn unknown_kind_engine_rows(&self) -> CoreResult<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tag, asset, sha256, installed_at, active, manifest, kind FROM engines ORDER BY installed_at DESC, rowid DESC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut quarantined = Vec::new();
+        while let Some(r) = rows.next()? {
+            if let EngineRowRead::UnknownKind { tag, kind } = read_engine_row(r)? {
+                quarantined.push((tag, kind));
+            }
+        }
+        Ok(quarantined)
     }
 
     pub fn delete_engine(&self, tag: &str) -> CoreResult<()> {
@@ -787,16 +823,35 @@ pub struct KeyUsageRow {
     pub tokens: i64,
 }
 
-fn engine_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<EngineRow> {
-    Ok(EngineRow {
-        tag: r.get(0)?,
+/// One roster row read leniently: a kind string this binary does not
+/// know (a lane shipped by a newer blazar) surfaces as
+/// [`EngineRowRead::UnknownKind`] instead of a hard SQL error, so one
+/// forward-written row cannot fail every roster read. Live incident
+/// 2026-09-27: an engines row written by a newer binary bricked serve
+/// boot at store-open and crash-looped the daemon 518 times.
+enum EngineRowRead {
+    Known(EngineRow),
+    UnknownKind { tag: String, kind: String },
+}
+
+fn read_engine_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<EngineRowRead> {
+    let tag: String = r.get(0)?;
+    let kind_text: String = r.get(6)?;
+    let Ok(kind) = EngineKind::from_str(&kind_text) else {
+        return Ok(EngineRowRead::UnknownKind {
+            tag,
+            kind: kind_text,
+        });
+    };
+    Ok(EngineRowRead::Known(EngineRow {
+        tag,
         asset: r.get(1)?,
         sha256: r.get(2)?,
         installed_at: r.get(3)?,
         active: r.get::<_, i64>(4)? != 0,
         manifest: r.get(5)?,
-        kind: r.get(6)?,
-    })
+        kind,
+    }))
 }
 
 fn model_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRow> {
@@ -1019,6 +1074,62 @@ mod tests {
             .unwrap();
         assert_eq!(s.heal_active_engine().unwrap(), None);
         assert!(s.active_engine().unwrap().is_none());
+    }
+
+    /// Forward-written row shape (2026-09-27 incident): a kind only a
+    /// newer blazar understands must quarantine the row, not fail the
+    /// roster read for every caller.
+    #[test]
+    fn unit__list_engines__unknown_kind_row_quarantined_not_fatal() {
+        let (_t, s) = tmp_store();
+        s.upsert_engine(&engine_row_of("b100", EngineKind::LlamaCpp, 10))
+            .unwrap();
+        s.conn()
+            .execute(
+                "INSERT INTO engines (tag, asset, sha256, installed_at, active, manifest, kind)
+                 VALUES ('warp-9', 'overlay', 'deadbeef', 20, 0, '{}', 'warpdrive')",
+                [],
+            )
+            .unwrap();
+        let tags: Vec<String> = s
+            .list_engines()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.tag)
+            .collect();
+        assert_eq!(tags, ["b100".to_string()]);
+        assert_eq!(
+            s.unknown_kind_engine_rows().unwrap(),
+            [("warp-9".to_string(), "warpdrive".to_string())]
+        );
+    }
+
+    /// The brick path itself: an unknown-kind row squatting on the
+    /// active flag reads as absent, healing reclaims the slot for a
+    /// known lane, and the forward row survives deactivated for the
+    /// newer binary to reclaim.
+    #[test]
+    fn unit__active_engine__unknown_kind_row_treated_absent_and_heals() {
+        let (_t, s) = tmp_store();
+        s.conn()
+            .execute(
+                "INSERT INTO engines (tag, asset, sha256, installed_at, active, manifest, kind)
+                 VALUES ('warp-9', 'overlay', 'deadbeef', 20, 1, '{}', 'warpdrive')",
+                [],
+            )
+            .unwrap();
+        s.upsert_engine(&engine_row_of("b100", EngineKind::LlamaCpp, 10))
+            .unwrap();
+        assert!(s.active_engine().unwrap().is_none());
+        assert_eq!(s.heal_active_engine().unwrap().as_deref(), Some("b100"));
+        assert_eq!(s.active_engine().unwrap().unwrap().tag, "b100");
+        let warp_active: i64 = s
+            .conn()
+            .query_row("SELECT active FROM engines WHERE tag = 'warp-9'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(warp_active, 0);
     }
 
     #[test]
