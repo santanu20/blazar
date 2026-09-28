@@ -1351,7 +1351,9 @@ pub(crate) fn child_model_stamp_predicted(
     lane.tag.as_ref()?;
     match lane.kind {
         EngineKind::MistralRs => Some("default".to_string()),
-        EngineKind::Sglang => Some(model_name.to_string()),
+        EngineKind::Sglang => Some(blazar_core::engine_kind::sglang_child_model_name(
+            model_name,
+        )),
         _ => None,
     }
 }
@@ -1366,17 +1368,21 @@ pub(crate) fn set_child_model(v: &mut serde_json::Value, stamp: &str) {
 /// mistral.rs derives /v1 model ids from the `-f` path (no --alias
 /// equivalent); Blazar spawns one model per child, so their stable
 /// `default` id is the unambiguous target. sglang parses `model:tail`
-/// as ITS lora-suffix convention, so the caller's quant tag
-/// (`m:4bit`) would request a phantom adapter — it must see the exact
-/// name `--served-model-name` registered (= the row name). llamacpp is
+/// as ITS lora-suffix convention AND asserts at startup that the
+/// registered `--served-model-name` carries no colon, so it must see
+/// the sanitized registration name (argv and this stamp derive from
+/// the same core `sglang_child_model_name`). llamacpp is
 /// indifferent (a single-model server answers any model string), so
 /// the caller's own spelling survives for response-echo fidelity on
-/// the raw passthrough lanes. `None` = no rewrite.
-pub(crate) fn child_model_stamp(engine: &EngineRef) -> Option<&str> {
+/// the raw passthrough lanes. `None` = no rewrite. Owned `String`
+/// because the sglang stamp is derived, not borrowed from the row.
+pub(crate) fn child_model_stamp(engine: &EngineRef) -> Option<String> {
     use blazar_core::engine_kind::EngineKind;
     match engine.kind {
-        EngineKind::MistralRs => Some("default"),
-        EngineKind::Sglang => Some(&engine.name),
+        EngineKind::MistralRs => Some("default".to_string()),
+        EngineKind::Sglang => Some(blazar_core::engine_kind::sglang_child_model_name(
+            &engine.name,
+        )),
         _ => None,
     }
 }
@@ -1403,7 +1409,7 @@ fn rewrite_child_model(
         return body;
     };
     let mut v = v.clone();
-    set_child_model(&mut v, stamp);
+    set_child_model(&mut v, &stamp);
     match serde_json::to_vec(&v) {
         Ok(bytes) => bytes.into(),
         Err(_) => body,
@@ -2473,16 +2479,37 @@ mod resolve_model_tests {
             },
             auth: None,
         };
+        let ref_named = |kind: EngineKind, name: &str| blazar_runtime::EngineRef {
+            name: name.to_string(),
+            key: name.to_string(),
+            kind,
+            endpoint: Endpoint::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: 1,
+            },
+            auth: None,
+        };
         // mistral.rs: stable per-child id, never the row name.
         assert_eq!(
             child_model_stamp(&ref_for(EngineKind::MistralRs)),
-            Some("default")
+            Some("default".to_string())
         );
-        // sglang: the exact --served-model-name — its `model:tail`
-        // parsing turns a forwarded quant tag into a phantom LoRA ask.
+        // sglang: the sanitized --served-model-name — its `model:tail`
+        // parsing turns a forwarded quant tag into a phantom LoRA ask,
+        // and its startup assert rejects any colon in the registration.
         assert_eq!(
             child_model_stamp(&ref_for(EngineKind::Sglang)),
-            Some("qwen2.5-0.5b-instruct-awq")
+            Some("qwen2.5-0.5b-instruct-awq".to_string())
+        );
+        // ...so a quant-tagged row name is mapped colon-free, and the
+        // stamp must stay byte-identical to what sglang_argv registers
+        // (both derive from sglang_child_model_name).
+        assert_eq!(
+            child_model_stamp(&ref_named(
+                EngineKind::Sglang,
+                "qwen3.5-9b-eoq-v3:safetensors"
+            )),
+            Some("qwen3.5-9b-eoq-v3--safetensors".to_string())
         );
         // llamacpp (and anything else): indifferent single-model server,
         // the caller's spelling survives for response-echo fidelity.
