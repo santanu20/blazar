@@ -7377,9 +7377,20 @@ async fn whisper_cmd(
                 Some(blazar_runtime::whisper::channel_target(&gh, config()?.update_channel).await?)
             }
         };
-        let tag = blazar_runtime::whisper::install(&gh, &d, target.as_deref(), pinned).await?;
+        // Installs land in the engines lane (`engine install --kind
+        // whisper`): the legacy installer wrote data/whisper/bin trees
+        // the engines table never saw — masking ghost rows and sitting
+        // outside `engine prune`'s reach. Pin parity keeps the
+        // documented --tag contract: a tag install pins, a channel
+        // install returns to tracking the newest tag.
+        let mgr = local_engine_manager(&d)?;
+        let row = mgr.update_whisper(target.as_deref()).await?;
+        match tag.as_deref() {
+            Some(t) => blazar_runtime::whisper::set_pin(&d, Some(t))?,
+            None => blazar_runtime::whisper::set_pin(&d, None)?,
+        }
         let pin = if pinned { " (pinned)" } else { "" };
-        println!("whisper.cpp server installed{pin}: {tag}");
+        println!("whisper.cpp server installed{pin}: {}", row.tag);
         return Ok(());
     }
     if let Some(size) = pull {
@@ -13461,7 +13472,7 @@ mod tests {
             )
         );
         // Deeper leaves keep the tail path after the merged name.
-        let cands = merged_override_splits("model_overrides.qwen3-1.7b.freetoken.dtype").unwrap();
+        let cands = merged_override_splits("model_overrides.qwen3-1.7b.sglang.dtype").unwrap();
         assert_eq!(cands.len(), 3);
         assert_eq!(
             cands[1],
@@ -13469,7 +13480,7 @@ mod tests {
                 vec![
                     "model_overrides".to_string(),
                     "qwen3-1.7b".to_string(),
-                    "freetoken".to_string()
+                    "sglang".to_string()
                 ],
                 "dtype".to_string()
             )
@@ -13490,7 +13501,7 @@ mod tests {
             raw,
             &["model_overrides", "qwen3-1", "7b"],
             "engine",
-            "\"freetoken-0.1.3\"",
+            "\"sglang-0.5.19\"",
         );
         assert!(
             Config::from_toml(&straight).is_err(),
@@ -13502,7 +13513,7 @@ mod tests {
             raw,
             &["model_overrides", "qwen3-1.7b"],
             "engine",
-            "\"freetoken-0.1.3\"",
+            "\"sglang-0.5.19\"",
         );
         Config::from_toml(&merged).expect("merged split must validate");
         assert!(
@@ -13512,15 +13523,12 @@ mod tests {
         // get/remove round-trip on the merged text.
         assert_eq!(
             get_table_key(&merged, &["model_overrides", "qwen3-1.7b"], "engine").as_deref(),
-            Some("engine = \"freetoken-0.1.3\"")
+            Some("engine = \"sglang-0.5.19\"")
         );
         let (after, removed) =
             remove_table_key(&merged, &["model_overrides", "qwen3-1.7b"], "engine");
         assert!(removed.is_some());
-        assert!(
-            !after.contains("freetoken-0.1.3"),
-            "unset must drop the pin"
-        );
+        assert!(!after.contains("sglang-0.5.19"), "unset must drop the pin");
         Config::from_toml(&after).expect("config stays valid after unset");
     }
 
