@@ -111,6 +111,31 @@ fn fake_release(tag: &str, payload: &[u8], digest_mangle: Option<fn(String) -> S
     base
 }
 
+/// Dry-run e2es never touch a daemon, but the CLI still parses config
+/// at startup — without an isolated XDG root the developer's real
+/// config (which may carry sections this binary does not know) fails
+/// the parse before the upgrade flow under test even starts.
+fn hermetic_config_env() -> std::collections::HashMap<String, String> {
+    let root = tempfile::tempdir().unwrap();
+    let cfg_root = root.path().join("cfg");
+    let data_root = root.path().join("data");
+    std::fs::create_dir_all(cfg_root.join("blazar")).unwrap();
+    std::fs::create_dir_all(&data_root).unwrap();
+    std::fs::write(
+        cfg_root.join("blazar/config.toml"),
+        "host = \"127.0.0.1\"\nport = 1\n",
+    )
+    .unwrap();
+    root.keep();
+    [
+        ("XDG_CONFIG_HOME", cfg_root.to_string_lossy().into_owned()),
+        ("XDG_DATA_HOME", data_root.to_string_lossy().into_owned()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect()
+}
+
 #[test]
 fn e2e__upgrade_dry_run_resolves_and_verifies() {
     let base = fake_release("v0.1.1", b"FAKE-BLAZAR-v0.1.1\n", None);
@@ -118,6 +143,7 @@ fn e2e__upgrade_dry_run_resolves_and_verifies() {
         .unwrap()
         .env("BLAZAR_INSTALL_BASE_URL", &base)
         .env("BLAZAR_REPO", "test/blazar")
+        .envs(hermetic_config_env())
         .args(["upgrade", "--dry-run"])
         .assert()
         .success()
@@ -135,6 +161,7 @@ fn e2e__upgrade_tampered_digest_rejected() {
         .unwrap()
         .env("BLAZAR_INSTALL_BASE_URL", &base)
         .env("BLAZAR_REPO", "test/blazar")
+        .envs(hermetic_config_env())
         .args(["upgrade", "--dry-run"])
         .assert()
         .failure()

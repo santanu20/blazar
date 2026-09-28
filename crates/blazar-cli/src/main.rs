@@ -3558,7 +3558,7 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
                         .ok()
                         .and_then(|s| s.active_engine().ok().flatten());
                     checks.push(engine_smoke_check(
-                        active_row.as_ref().map(|r| r.kind.clone()),
+                        active_row.as_ref().map(|r| r.kind),
                         d,
                         active_row.as_ref().map(|r| r.manifest.as_str()),
                     ));
