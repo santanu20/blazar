@@ -93,7 +93,11 @@ where
 }
 
 /// (pip/uv progress visibility); stderr carries the real errors.
-async fn run_streaming(cmd: &mut tokio::process::Command, what: &str) -> Result<()> {
+async fn run_streaming(
+    cmd: &mut tokio::process::Command,
+    what: &str,
+    timeout_secs: u64,
+) -> Result<()> {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -116,7 +120,7 @@ async fn run_streaming(cmd: &mut tokio::process::Command, what: &str) -> Result<
         child.wait(),
     )
     .await
-    .with_context(|| format!("{what} exceeded {SGLANG_INSTALL_TIMEOUT_SECS}s"))?
+    .with_context(|| format!("{what} exceeded {timeout_secs}s"))?
     .with_context(|| format!("wait {what}"))?;
     if !status.success() {
         anyhow::bail!("{what} exited {status}");
@@ -172,6 +176,7 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
                 .arg("3.12")
                 .arg(&venv),
             "uv venv",
+            SGLANG_INSTALL_TIMEOUT_SECS,
         )
         .await?;
         run_streaming(
@@ -187,6 +192,7 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
                 .arg(format!("sglang=={version}"))
                 .arg("ninja"),
             "uv pip install sglang",
+            SGLANG_INSTALL_TIMEOUT_SECS,
         )
         .await?;
     } else {
@@ -196,6 +202,7 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
                 .arg("venv")
                 .arg(&venv),
             "python3 -m venv",
+            SGLANG_INSTALL_TIMEOUT_SECS,
         )
         .await?;
         run_streaming(
@@ -206,6 +213,7 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
                 .arg("--upgrade")
                 .arg("pip"),
             "pip self-upgrade",
+            SGLANG_INSTALL_TIMEOUT_SECS,
         )
         .await?;
         run_streaming(
@@ -216,6 +224,7 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
                 .arg(format!("sglang=={version}"))
                 .arg("ninja"),
             "pip install sglang",
+            SGLANG_INSTALL_TIMEOUT_SECS,
         )
         .await?;
     }
