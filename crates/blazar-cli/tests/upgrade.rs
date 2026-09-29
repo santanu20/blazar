@@ -126,7 +126,9 @@ fn hermetic_config_env() -> std::collections::HashMap<String, String> {
         "host = \"127.0.0.1\"\nport = 1\n",
     )
     .unwrap();
-    root.keep();
+    // Keep the tempdirs alive for the child process; the test asserts
+    // against their files after the run.
+    let _keep = root.keep();
     [
         ("XDG_CONFIG_HOME", cfg_root.to_string_lossy().into_owned()),
         ("XDG_DATA_HOME", data_root.to_string_lossy().into_owned()),

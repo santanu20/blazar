@@ -328,12 +328,12 @@ pub fn serving_lane_typed(
 }
 
 /// The child-facing `--served-model-name` for an sglang spawn. sglang
-/// reserves `:` in served names for its LoRA `model:adapter` syntax
+/// reserves `:` in served names for its `LoRA` `model:adapter` syntax
 /// and asserts at startup on any colon, so quant-tagged registry rows
 /// (`m:4bit`, `m:safetensors`) would kill the child before the model
 /// loads. The gateway's request-body stamp must byte-match what the
 /// argv registered (a mismatched body model 404s inside the child), so
-/// both derive from this one function. LlamaCpp accepts the raw row
+/// both derive from this one function. `LlamaCpp` accepts the raw row
 /// name and keeps it.
 #[must_use]
 pub fn sglang_child_model_name(row_name: &str) -> String {

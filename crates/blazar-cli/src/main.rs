@@ -2267,6 +2267,7 @@ async fn doctor(flat: bool, json: bool) -> Result<()> {
     checks.extend(doctor_store(&d));
     checks.extend(doctor_models(&d));
     checks.extend(doctor_model_types(&d));
+    checks.extend(doctor_sglang_fit(&d));
     checks.extend(doctor_sentinel(&d));
     checks.extend(doctor_runtime(&d));
     checks.extend(doctor_exposure(&d));
@@ -3023,6 +3024,103 @@ fn doctor_runtime(d: &BlazarDirs) -> Vec<Check> {
     out
 }
 
+/// Extract the advertised long-flag set from an engine row's manifest
+/// JSON. Doctor only needs the flag names, so decoding through
+/// `serde_json::Value` avoids coupling this display path to the full
+/// `Manifest` schema (and its version skew).
+fn manifest_flag_set(manifest_json: &str) -> std::collections::BTreeSet<String> {
+    serde_json::from_str::<serde_json::Value>(manifest_json)
+        .ok()
+        .and_then(|v| {
+            let flags = v.get("flags")?;
+            serde_json::from_value::<std::collections::BTreeSet<String>>(flags.clone()).ok()
+        })
+        .unwrap_or_default()
+}
+
+/// One-line fit preview of a compiled sglang profile: the argv knobs the
+/// ladder derived for this model on this box, today.
+fn sglang_fit_detail(name: &str, p: &blazar_core::profile::Profile) -> String {
+    let flag_value = |flag: &str| {
+        p.argv
+            .windows(2)
+            .find(|w| w[0] == flag)
+            .map(|w| w[1].as_str())
+    };
+    let graph = flag_value("--cuda-graph-max-bs").unwrap_or("engine default");
+    let kv = flag_value("--kv-cache-dtype").unwrap_or("auto");
+    let mut detail = format!(
+        "{name}: ctx {}, gpu {}, kv {kv}, cuda-graph <= {graph}",
+        p.ctx, p.gpu
+    );
+    if let Some(gb) = flag_value("--cpu-offload-gb") {
+        detail.push_str(", cpu-offload ");
+        detail.push_str(gb);
+        detail.push_str(" GiB");
+    }
+    detail
+}
+
+/// SGLANG FIT section: preview the fit ladder for every safetensors
+/// model against the installed sglang engine by running the REAL
+/// profile compile (single source of truth — the numbers here are the
+/// numbers a spawn would use, never a re-derivation).
+fn doctor_sglang_fit(d: &BlazarDirs) -> Vec<Check> {
+    let mut out = Vec::new();
+    let Ok(store) = Store::open(d) else {
+        return out;
+    };
+    let engines = store.list_engines().unwrap_or_default();
+    let Some(engine) = engines
+        .iter()
+        .filter(|e| e.kind == EngineKind::Sglang)
+        .max_by_key(|e| e.active)
+    else {
+        return out; // no sglang lane installed: nothing to preview
+    };
+    let Ok(cfg) = config() else {
+        return out; // config failure is reported by the config check
+    };
+    let hw = blazar_runtime::probe_hardware(None);
+    let flags = manifest_flag_set(&engine.manifest);
+    let data_dir = d.data_dir.to_string_lossy();
+    for m in store.list_models().unwrap_or_default() {
+        let path = std::path::Path::new(&m.path);
+        if !path.is_dir() || m.has_component_set() {
+            continue; // sglang serves HF safetensors dirs; split rows ride their GGUF set
+        }
+        let Ok(hf) = blazar_core::read_hf_config(path) else {
+            continue; // rows without a readable config.json are flagged by doctor_models
+        };
+        let overlay = cfg.overlay_for(&m.name);
+        let input = blazar_runtime::bench::build_input(
+            &m.name,
+            &m.path,
+            u64::try_from(m.bytes.max(0)).unwrap_or(u64::MAX),
+            blazar_core::ModelMeta::Hf(&hf),
+            &hw,
+            &cfg,
+            &overlay,
+            &[],
+            None,
+            &engine.tag,
+            &flags,
+            &[],
+            blazar_core::Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 0,
+            },
+            &data_dir,
+            EngineKind::Sglang,
+        );
+        match blazar_core::profile::compile(&input, &blazar_core::TuningOverrides::default()) {
+            Ok(p) => out.push(Check::ok("sglang fit", sglang_fit_detail(&m.name, &p))),
+            Err(e) => out.push(Check::warn("sglang fit", format!("{}: {e}", m.name))),
+        }
+    }
+    out
+}
+
 /// MODELS section addition: on-disk type mix via the same label helper
 /// the list table uses.
 fn doctor_model_types(d: &BlazarDirs) -> Vec<Check> {
@@ -3061,6 +3159,43 @@ fn doctor_model_types(d: &BlazarDirs) -> Vec<Check> {
 #[cfg(test)]
 mod doctor_tests {
     use super::*;
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__doctor__manifest_flag_set_extracts_and_degrades() {
+        let js = r#"{"tag":"sglang-0.5.19","flags":["--a","--b"],"spec_types":[]}"#;
+        let set = manifest_flag_set(js);
+        assert_eq!(set.len(), 2, "exactly the two advertised flags: {set:?}");
+        assert!(set.contains("--a") && set.contains("--b"));
+        assert!(manifest_flag_set("not json at all").is_empty());
+        assert!(manifest_flag_set(r#"{"tag":"x","no_flags":true}"#).is_empty());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__doctor__sglang_fit_detail_reports_derived_knobs() {
+        let p = blazar_core::profile::Profile {
+            argv: vec![
+                "--model-path".into(),
+                "m.d".into(),
+                "--cuda-graph-max-bs".into(),
+                "27".into(),
+                "--kv-cache-dtype".into(),
+                "fp8_e5m2".into(),
+                "--cpu-offload-gb".into(),
+                "2".into(),
+            ],
+            ctx: 16384,
+            gpu: "full",
+            ..Default::default()
+        };
+        let detail = sglang_fit_detail("qwen3-1.7b", &p);
+        assert!(detail.contains("qwen3-1.7b"));
+        assert!(detail.contains("ctx 16384"));
+        assert!(detail.contains("cuda-graph <= 27"));
+        assert!(detail.contains("kv fp8_e5m2"));
+        assert!(detail.contains("cpu-offload 2 GiB"));
+    }
 
     #[test]
     #[allow(non_snake_case)]
@@ -8721,6 +8856,7 @@ async fn tune_full(
             port: 0,
         },
         &data_dir,
+        blazar_core::engine_kind::EngineKind::LlamaCpp,
     );
     let store2 = Store::open(&d)?;
     let tuner = blazar_runtime::Tuner {
@@ -8854,6 +8990,7 @@ async fn tune_full(
                 port: 0,
             },
             &data_dir,
+            blazar_core::engine_kind::EngineKind::LlamaCpp,
         );
         let base = blazar_core::profile::compile(&input2, &blazar_core::TuningOverrides::default())
             .map_err(|e| anyhow!("profile: {e}"))?;
@@ -8909,6 +9046,7 @@ async fn tune_full(
                 port: 0,
             },
             &data_dir,
+            blazar_core::engine_kind::EngineKind::LlamaCpp,
         );
         let base = blazar_core::profile::compile(&input3, &blazar_core::TuningOverrides::default())
             .map_err(|e| anyhow!("profile: {e}"))?;

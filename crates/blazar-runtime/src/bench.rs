@@ -825,6 +825,9 @@ fn now_secs() -> i64 {
 
 /// Convenience: build a `ProfileInput` from stored state (used by CLI and
 /// supervisor). `draft_path` resolution stays with the caller.
+/// `engine_kind` picks the compile lane the profile is scored against —
+/// the CLI bench tune paths pass `LlamaCpp`, doctor's fit preview passes
+/// the engine lane it previews.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn build_input<'a>(
@@ -842,6 +845,7 @@ pub fn build_input<'a>(
     spec_types: &'a [String],
     endpoint: Endpoint,
     data_dir: &'a str,
+    engine_kind: blazar_core::engine_kind::EngineKind,
 ) -> ProfileInput<'a> {
     ProfileInput {
         model_name,
@@ -868,7 +872,7 @@ pub fn build_input<'a>(
         spec_types,
         // llama-bench scoring is llama-server-only (the mistral.rs lane
         // prints a gate skip instead of benching).
-        engine_kind: blazar_core::engine_kind::EngineKind::LlamaCpp,
+        engine_kind,
         sibling_devices: Vec::new(),
         auto_tensor_split: None,
         endpoint,

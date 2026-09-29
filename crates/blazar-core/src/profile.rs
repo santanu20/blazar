@@ -4288,26 +4288,37 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
 /// Captured-graph memory slope: MiB of CUDA-graph pool per captured batch
 /// size, per GiB of weights. Calibrated from a live receipt — the bs-256
 /// capture pool measured +334 MiB beside 3.9 GiB weights (sglang 0.5.19,
-/// RTX 4070 8 GiB, bench-artifacts/20260928-sglang-safetensors, cg_bs_256
+/// RTX 4070 8 GiB, bench-artifacts/20260928-sglang-safetensors, `cg_bs_256`
 /// cell). First-order: the pool tracks activations, which track model size.
 const SGLANG_GRAPH_MIB_PER_GIB_WEIGHTS: f64 = 0.335;
+
+/// Per-capture-size graph-pool cost for this model, in MiB (first-order
+/// slope from the bench receipt above; floored so zero-byte fixtures
+/// stay sane instead of dividing by zero).
+#[allow(clippy::cast_precision_loss)]
+fn sglang_graph_per_size_mib(weights: u64) -> f64 {
+    let weights_gib = weights as f64 / (1024.0 * 1024.0 * 1024.0);
+    (weights_gib * SGLANG_GRAPH_MIB_PER_GIB_WEIGHTS).max(0.1)
+}
 
 /// Memory-bound ceiling for the cuda-graph capture list: spend at most
 /// half the post-weights/KV headroom on captured graphs, never below the
 /// historical flat floor of 4, never above the upstream default of 256.
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn sglang_graph_bs_ceiling(headroom_bytes: u64, weights: u64) -> u32 {
     let headroom_mib = f64::from(u32::try_from(headroom_bytes / (1024 * 1024)).unwrap_or(u32::MAX));
-    let weights_gib = weights as f64 / (1024.0 * 1024.0 * 1024.0);
-    let per_size_mib = (weights_gib * SGLANG_GRAPH_MIB_PER_GIB_WEIGHTS).max(0.1);
-    ((headroom_mib * 0.5) / per_size_mib).clamp(4.0, 256.0) as u32
+    ((headroom_mib * 0.5) / sglang_graph_per_size_mib(weights)).clamp(4.0, 256.0) as u32
 }
 
 /// Tight-fit tail knobs for ladder Tiers B/C. The cuda-graph capture list
 /// follows actual concurrency instead of a flat cap: auto slots (0) get
-/// the memory-bound ceiling, explicit slots get min(slots, ceiling), and
+/// the memory-bound ceiling, explicit slots get `min(slots, ceiling)`, and
 /// the floor of 4 keeps every input at least where the old flat cap put
-/// it. Explicit tuning pins (cuda_graph_max_bs / cuda_graph_bs) still win
+/// it. Explicit tuning pins (`cuda_graph_max_bs` / `cuda_graph_bs`) still win
 /// outright. Chunked prefill stays 2048 (the 8192 default's activation
 /// peaks are the Tier B/C hazard).
 fn sglang_tight_fit_knobs(
@@ -4328,6 +4339,16 @@ fn sglang_tight_fit_knobs(
         } else {
             slots.min(ceiling)
         };
+        if flags.contains("--cuda-graph-max-bs") {
+            // Same derivation the doctor "sglang fit" check surfaces;
+            // fire it only where the flag actually lands in argv.
+            #[allow(clippy::cast_possible_truncation)]
+            let headroom_mib = u32::try_from(headroom_bytes / (1024 * 1024)).unwrap_or(u32::MAX);
+            warnings.push(format!(
+                "fit ladder: cuda-graph capture list <= {bs} (headroom {headroom_mib} MiB after weights+KV; {:.2} MiB per graph size at this model size)",
+                sglang_graph_per_size_mib(weights)
+            ));
+        }
         push_tuned(
             argv,
             flags,
@@ -12286,6 +12307,11 @@ mod tests {
             .argv
             .windows(2)
             .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "27"));
+        // the derivation warning the doctor check surfaces verbatim
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.contains("cuda-graph capture list <= 27")));
         assert!(p
             .argv
             .windows(2)
@@ -12378,6 +12404,11 @@ mod tests {
             .argv
             .windows(2)
             .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "65"));
+        // the derivation warning the doctor check surfaces verbatim
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.contains("cuda-graph capture list <= 65")));
     }
 
     #[test]
