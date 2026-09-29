@@ -1,0 +1,35 @@
+engine | kind | provider | params | ttft_ms_p50 | ttft_ms_p99 | itl_p50_ms | itl_p99_ms | decode_tps | prefill_tps_cold | prefill_tps_cached | load_s | gpu_peak_mib | gpu_power_peak_w | rss_peak_mib | tokens_source
+--------------------------------------------------------------------------------------------------------------------------------------------
+inventory | inventory | inventory | {} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+sglang-0.5.19 | sglang | blazar | {'config': 'default'} | 33 | 33 | 14.79 | 15.44 | 67.62 | 7471.1 | 10985.4 | - | 6470 | 55.1 | 0 | chunks
+sglang-0.5.19 | sglang | blazar | {'config': 'single-stream'} | 33 | 33 | 14.75 | 15.47 | 67.65 | 6300.3 | 11048.7 | - | 6340 | 55.1 | 0 | chunks
+sglang-0.5.19 | sglang | blazar | {'config': 'kv_unified_on'} | 33 | 33 | 14.78 | 15.76 | 67.62 | 6315.2 | 11080.0 | - | 6450 | 55.6 | 0 | chunks
+sglang-0.5.19 | sglang | blazar | {'config': 'kv_unified_off'} | 33 | 33 | 14.79 | 15.43 | 67.64 | 7322.9 | 10927.9 | - | 6490 | 55.6 | 0 | chunks
+sglang-0.5.19 | sglang | blazar | {'config': 'spec_off'} | 33 | 33 | 14.8 | 15.45 | 67.63 | 6507.5 | 10897.4 | - | 6482 | 56.0 | 0 | chunks
+sglang-0.5.19 | sglang | blazar | {'config': 'deterministic_on'} | 59 | 62 | 25.26 | 26.72 | 39.51 | 4788.8 | 6273.0 | - | 6742 | 55.4 | 0 | chunks
+sglang-0.5.19 | sglang | blazar | {'config': 'mem_frac_0.90'} | - | - | - | - | - | - | - | - | 7800 | 55.3 | 0 | -
+sglang-0.5.19 | sglang | blazar | {'config': 'hicache_on'} | - | - | - | - | - | - | - | - | 6490 | 55.4 | 0 | -
+sglang-0.5.19 | sglang | blazar | {'config': 'radix_session_on'} | 33 | 34 | 14.79 | 15.38 | 67.66 | 7395.2 | 11005.0 | - | 6484 | 55.1 | 0 | chunks
+sglang-0.5.19 | sglang | blazar | {'config': 'chunked_prefill_4096'} | 33 | 33 | 14.79 | 15.42 | 67.63 | 6342.4 | 10988.9 | - | 6738 | 55.9 | 0 | chunks
+sglang-0.5.19 | sglang | blazar | {'config': 'page_64'} | 33 | 34 | 14.78 | 15.62 | 67.6 | 7125.1 | 10669.5 | - | 6490 | 55.5 | 0 | chunks
+sglang-0.5.19 | sglang | blazar | {'config': 'memory_saver_on'} | - | - | - | - | - | - | - | - | 19 | 8.2 | 0 | -
+sglang-0.5.19 | sglang | blazar | {'config': 'torch_compile_on'} | 32 | 33 | 14.57 | 15.2 | 68.73 | 6973.2 | 11274.0 | - | 7070 | 55.0 | 0 | chunks
+ollama-host | ollama | ollama | {'reference': True} | 33 | 39 | 6.42 | 7.12 | 157.47 | 3705.1 | 60940.3 | - | 2320 | 54.9 | 0 | engine_counters
+ollama-host | ollama | cold-ollama | {'cold': True} | - | - | - | - | - | - | - | - | 3218 | 20.1 | 0 | -
+piper | piper | media-tts | {'chars': 840, 'formats': ['wav', 'pcm'], 'runs': 3} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+piper | piper | media-tts-conc | {'chars': 400, 'format': 'pcm', 'streams': 4} | - | - | - | - | - | - | - | - | 16 | - | 0 | -
+sglang-0.5.19 | sglang | idle-blazar | {'idle': True} | - | - | - | - | - | - | - | - | 6490 | - | 0 | -
+ollama-host | ollama | idle-ollama | {'idle': True} | - | - | - | - | - | - | - | - | 2322 | - | 0 | -
+sglang-0.5.19 | sglang | ctxcurve-blazar | {'ctx': 2048} | 33 | 34 | 14.8 | 15.36 | 67.65 | 7182.3 | 10907.4 | - | 4792 | - | 0 | chunks
+sglang-0.5.19 | sglang | ctxcurve-blazar | {'ctx': 8192} | 33 | 33 | 14.81 | 15.47 | 67.61 | 6341.9 | 11111.5 | - | 5490 | - | 0 | chunks
+sglang-0.5.19 | sglang | ctxcurve-blazar | {'ctx': 16384} | 33 | 33 | 14.8 | 15.44 | 67.63 | 7557.6 | 11140.6 | - | 6470 | - | 0 | chunks
+ollama-host | ollama | ctxcurve-ollama | {'ctx': 2048} | 43 | - | - | - | 156.47 | - | - | 2.55 | 1588 | - | 0 | -
+ollama-host | ollama | ctxcurve-ollama | {'ctx': 8192} | 40 | - | - | - | 156.31 | - | - | 2.95 | 2322 | - | 0 | -
+ollama-host | ollama | ctxcurve-ollama | {'ctx': 16384} | 42 | - | - | - | 157.39 | - | - | 2.03 | 3234 | - | 0 | -
+sglang-0.5.19 | sglang | conc-blazar | {'conc': 4, 'rounds': 3} | - | - | - | 16.38 | - | - | - | - | 6470 | - | 0 | -
+ollama-host | ollama | conc-ollama | {'conc': 4, 'rounds': 3} | - | - | - | 7.86 | - | - | - | - | 2322 | - | 0 | -
+sglang-0.5.19 | sglang | ppl | {'ppl': 2048} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+sglang-0.5.19 | sglang | reshape | {'reshape': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+sglang-0.5.19 | sglang | tools | {'tools': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+ollama-host | ollama | tools-ollama | {'tools': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+sglang-0.5.19 | sglang | features | {'features': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -

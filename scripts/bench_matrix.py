@@ -64,6 +64,7 @@ import re
 import shutil
 import signal
 import socket
+import struct
 import sqlite3
 import statistics
 import subprocess
@@ -93,6 +94,12 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 
 HARNESS_VERSION = 2
+# A cell whose key carries this many error rows stops retrying on resume:
+# deterministic engine-reality crashes (identical signature every attempt)
+# burn spawn+crash cycles forever otherwise. The error receipt stays in
+# cells.jsonl and renders in the report's failure section. Re-arm retries
+# by bumping HARNESS_VERSION or pruning the stale error rows.
+MAX_CELL_ATTEMPTS = 3
 ARTIFACTS_ROOT = Path.home() / ".cache" / "blazar-bench-matrix"
 
 # Default sweep (C1: fixed, CLI-tunable, no config matrix).
@@ -271,6 +278,14 @@ def log(msg: str = "") -> None:
 # cell bookkeeping
 
 
+def model_bytes_on_disk(p: Path) -> int:
+    # A safetensors pull is a directory: its inode size is 4 KiB, the real
+    # footprint is the shard sum (same measure the default-pick sort uses).
+    if p.is_dir():
+        return sum(f.stat().st_size for f in p.glob("*"))
+    return p.stat().st_size
+
+
 def cell_key(tag: str, provider: str, params: dict, model: str) -> str:
     blob = json.dumps([tag, provider, params, model, HARNESS_VERSION], sort_keys=True)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
@@ -280,14 +295,19 @@ def load_done(path: Path) -> set[str]:
     if not path.exists():
         return set()
     done = set()
+    attempts: dict[str, int] = {}
     for line in path.read_text().splitlines():
         try:
             rec = json.loads(line)
         except json.JSONDecodeError:
             continue
-        # errored cells retry on resume — only successes count as done
         if "error" not in rec:
             done.add(rec["key"])
+        else:
+            attempts[rec["key"]] = attempts.get(rec["key"], 0) + 1
+    # successes count as done; error rows retry on resume until the key
+    # reaches MAX_CELL_ATTEMPTS (engine-reality crash, receipt preserved).
+    done |= {k for k, n in attempts.items() if n >= MAX_CELL_ATTEMPTS}
     return done
 
 
@@ -324,12 +344,43 @@ class Engine:
 
 # Kinds load_engines deliberately drops, with the reason the coverage
 # table prints — the artifact must answer "was every engine benched?"
-ENGINE_EXCLUSIONS = {
-    "sglang": (
-        "needs an HF safetensors model; this box serves GGUF only and "
-        "8 GiB VRAM cannot host sglang beside the media children"
-    )
-}
+# The sglang reason is STORE-DRIVEN: the lane is swept whenever a text
+# safetensors checkpoint exists, and excluded only when it does not.
+def has_text_safetensors_model(data_dir: Path) -> bool:
+    """True when the store carries an HF-format TEXT checkpoint the
+    sglang lane can serve. Model rows for GGUF files and diffusion
+    component sets are files; a safetensors pull is a DIRECTORY row —
+    the dir itself is the discriminator (media components never form
+    dir rows; the components column keeps them out of text picks)."""
+    db = data_dir / "blazar.db"
+    if not db.exists():
+        return False
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        for (p,) in con.execute("SELECT path FROM models"):
+            if not p:
+                continue
+            path = Path(p)
+            if not path.is_absolute():
+                path = data_dir / path
+            if path.is_dir():
+                return True
+        return False
+    finally:
+        con.close()
+
+
+def engine_exclusion_reasons(data_dir: Path) -> dict[str, str]:
+    """Kind -> honest "why it is not swept" line for the coverage
+    table. Empty when every discovered kind has a bench lane."""
+    if has_text_safetensors_model(data_dir):
+        return {}
+    return {
+        "sglang": (
+            "no DB-registered HF safetensors text model on this box — "
+            "sglang cells need one (pull a safetensors checkpoint)"
+        )
+    }
 
 
 # Tool-call quality lane: single-turn scenarios scored deterministically
@@ -453,11 +504,18 @@ def load_engines(data_dir: Path) -> list[Engine]:
         if kind == "whisper":
             out.append(Engine(tag, kind, edir, None, None, None))
             continue
+        if kind == "sglang":
+            # venv lane: the gateway spawns the python child through the
+            # engine manager; the harness needs the tag for activation
+            # + stamps only (same contract as the media lanes, text-
+            # side). Swept exactly when a servable safetensors model
+            # exists; otherwise excluded with the store-driven reason.
+            if has_text_safetensors_model(data_dir):
+                out.append(Engine(tag, kind, edir, None, None, None))
+            continue
         if kind not in ("llamacpp", "mistralrs"):
-            # Text-bench lanes only. sglang text cells run through the
-            # same gateway provider once a safetensors model fits the
-            # card; on this 8 GiB box they cannot coexist with the media
-            # children, so the kind stays discovered-but-not-swept.
+            # Unknown future kind: no bench lane in this harness; the
+            # inventory table prints the generic fallback reason.
             continue
         if kind == "mistralrs":
             server = edir / "mistralrs"
@@ -627,8 +685,59 @@ def mem_guard(floor_mib: float, what: str) -> bool:
     return True
 
 
+def ollama_release_loaded(port: int = OLLAMA_PORT) -> int:
+    """keep_alive=0 every model ollama currently holds (GET /api/ps).
+
+    Ollama keeps the last reference model resident for its keep_alive
+    window (default ~5min) after that provider's cells finish; on a
+    single-card box that residency starves later GPU-floor-gated lanes
+    (greedy parity) even though blazar's own children tore down cleanly.
+    Returns how many models were asked to unload."""
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/ps", timeout=5
+        ) as resp:
+            loaded = (json.loads(resp.read() or b"{}").get("models")) or []
+    except Exception:
+        return 0
+    n = 0
+    for entry in loaded:
+        name = entry.get("name") or entry.get("model")
+        if not name:
+            continue
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/generate",
+            data=json.dumps({"model": name, "keep_alive": 0}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=60).read()
+            n += 1
+        except Exception:
+            pass
+    return n
+
+
 # ---------------------------------------------------------------------------
 # cold-start parity plumbing (page cache + GPU idle + privileged service)
+
+
+def cold_cache_files(mfile: Path | None, mmfile: Path | None) -> list[Path]:
+    """Files whose page cache a cold probe must drop. A safetensors
+    model is a DIRECTORY row — fadvise on the dir inode drops only
+    dirent metadata while every shard stays cached, handing the probe
+    a memory-warm load disguised as cold; expand dirs to their shard
+    files so GGUF files and HF dirs get identical coldness."""
+    out: list[Path] = []
+    if mfile is not None:
+        if mfile.is_dir():
+            out.extend(sorted(mfile.glob("*.safetensors")))
+        else:
+            out.append(mfile)
+    if mmfile is not None:
+        out.append(mmfile)
+    return out
 
 
 def fadvise_dontneed(paths) -> int:
@@ -1003,10 +1112,15 @@ def media_family(
     daemon = None
     try:
         con = sqlite3.connect(Path(sb.data_home) / "blazar" / "blazar.db")
-        marks = ",".join("?" * len(activate_kinds)) or "NULL"
+        # exactly ONE active row: the first kind is the family's serving
+        # lane (the daemon boots model serving on it); extra kinds ride
+        # along installed-but-inactive — e.g. the whisper audio lane
+        # routes by endpoint, never by the active flag. Pinning the audio
+        # lane active instead makes the daemon teaching-refuse to boot
+        # ("audio lane cannot back model serving", live 2026-09-28).
         con.execute(
-            f"UPDATE engines SET active = (kind IN ({marks}))",
-            activate_kinds,
+            "UPDATE engines SET active = (kind = ?)",
+            (activate_kinds[0],),
         )
         con.commit()
         con.close()
@@ -1500,7 +1614,8 @@ def run_media_whisper_cell(eng: Engine, cfg: dict) -> dict:
     provably comes from the piper voice under test."""
     rec: dict = {"lane": "whisper"}
     # whisper alone cannot boot the daemon (audio lane is not a serving
-    # engine by design) — sdcpp rides along as the serving row, lazily idle
+    # engine by design) — sdcpp is the pinned serving row (lazily idle);
+    # whisper rides installed-but-inactive, transcription routes by endpoint
     with media_family(
         f"whisper-{eng.tag}",
         ("sdcpp", "whisper"),
@@ -2133,6 +2248,102 @@ def teardown_proc(proc: subprocess.Popen, sampler: Sampler) -> dict:
     return {"teardown_ok": ok}
 
 
+# mistral.rs refuses vision GGUFs at load without their ORIGINAL HF
+# tokenizer id. The blazar serving lane derives it from the GGUF's own
+# `general.basename`/`general.size_label` metadata (gguf.rs
+# hf_base_model_id) — NOT the pull repo (a mirror repo like
+# lmstudio-community/...-GGUF does not satisfy the child's config fetch,
+# live-proven 2026-09-28). This reader mirrors that derivation exactly.
+_GGUF_HF_ID_CACHE: dict[str, str | None] = {}
+
+
+def gguf_hf_base_model_id(gguf_path: Path) -> str | None:
+    """`general.basename` + `general.size_label` -> `org/repo[-size]`.
+
+    Walks only the metadata KV section (mmap; tensors are never touched).
+    Returns None on any structural gap — mirroring the product, an
+    underivable file simply keeps the child's own teaching error.
+    """
+    key = str(gguf_path)
+    if key in _GGUF_HF_ID_CACHE:
+        return _GGUF_HF_ID_CACHE[key]
+    out: str | None = None
+    try:
+        import mmap
+
+        with (
+            open(gguf_path, "rb") as fh,
+            mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as buf,
+        ):
+            out = _gguf_metadata_kv(buf).get("hf_base_model_id") or None
+    except (OSError, ValueError, struct.error):
+        out = None
+    _GGUF_HF_ID_CACHE[str(gguf_path)] = out
+    return out
+
+
+def _gguf_metadata_kv(buf) -> dict:
+    """Parse the GGUF v2/v3 header; returns {'basename':…, 'size_label':…,
+    'hf_base_model_id':…} for the `general.*` keys this harness needs."""
+    pos = 0
+
+    def take(n: int) -> bytes:
+        nonlocal pos
+        end = pos + n
+        if end > len(buf):
+            raise ValueError("gguf metadata truncated")
+        out = bytes(buf[pos:end])
+        pos = end
+        return out
+
+    def u32() -> int:
+        return struct.unpack("<I", take(4))[0]
+
+    def u64() -> int:
+        return struct.unpack("<Q", take(8))[0]
+
+    def rstring() -> str:
+        return take(u64()).decode("utf-8", "replace")
+
+    def skip_value(vtype: int) -> None:
+        fixed = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+        if vtype == 8:
+            rstring()
+        elif vtype == 9:
+            elem, count = u32(), u64()
+            for _ in range(count):
+                skip_value(elem)
+        else:
+            take(fixed[vtype])
+
+    if take(4) != b"GGUF":
+        raise ValueError("not a GGUF file")
+    version = u32()
+    if version not in (2, 3):
+        raise ValueError(f"unsupported GGUF version {version}")
+    u64()  # tensor_count — metadata only here
+    kvs: dict[str, str] = {}
+    for _ in range(u64()):
+        key = rstring()
+        vtype = u32()
+        if vtype == 8:
+            value = rstring()
+            if key in ("general.basename", "general.size_label"):
+                kvs[key] = value
+        else:
+            skip_value(vtype)
+    base = kvs.get("general.basename", "").strip()
+    if "_" in base:
+        org, repo = base.split("_", 1)
+        if org and repo:
+            ident = f"{org}/{repo}"
+            size = kvs.get("general.size_label", "").strip()
+            if size and not ident.endswith(size):
+                ident = f"{ident}-{size}"
+            kvs["hf_base_model_id"] = ident
+    return kvs
+
+
 def direct_argv(
     eng: Engine,
     model: Path,
@@ -2165,10 +2376,31 @@ def direct_argv(
         ]
         if extras.get("pa") == "off":
             argv += ["--paged-attn", "off"]
-        if staged is not None and mmproj is not None and mmproj.exists():
-            # staged view holds only this model's projector — pass it
-            # explicitly so discovery cannot pick anything else
-            argv += ["--mmproj", str(staged.parent / mmproj.name)]
+        else:
+            # mistral.rs PA pool = utilization fraction/MB of TOTAL VRAM
+            # with weights loaded INSIDE it (v0.9.4 --help: "GPU memory
+            # utilization"). Stock 0.90 leaves zero KV blocks for a vision
+            # GGUF on an 8 GiB card ("Num GPU blocks is 0", live
+            # 2026-09-28) — the blazar serving lane sizes this from KV
+            # geometry instead. Mirror it with the absolute form: the
+            # whole idle GPU minus a small host reserve becomes the pool.
+            rows_ = _gpu_query("memory.free")
+            if rows_ and rows_[0][0] > 0:
+                argv += ["--pa-memory-mb", str(int(rows_[0][0]) - 384)]
+        # Vision GGUFs carry multimodal metadata, so mistral.rs demands
+        # the ORIGINAL HF tokenizer id at load ("multimodal GGUF requires
+        # its original `config.json` … pass `--tok-model-id`"). The id is
+        # mined from the GGUF's own general.* metadata — mirroring the
+        # blazar serving lane (gguf.rs hf_base_model_id → engine_impl.rs),
+        # whose gateway v0.9.4 cells pass exactly this way. The pull-repo
+        # column does NOT answer it (a mirror repo like lmstudio-community
+        # lacks the original config the child fetches — live-proven
+        # 2026-09-28: rc=1 persisted until the derived id replaced it).
+        if mmproj is not None and mmproj.exists():
+            argv += ["--mmproj", str(mmproj)]
+            hf_id = gguf_hf_base_model_id(staged or model)
+            if hf_id:
+                argv += ["--tok-model-id", hf_id]
         return argv
     argv = [
         str(eng.server),
@@ -2472,7 +2704,9 @@ def run_blazar_cell(
             #     a cold engine is the user-felt number and was
             #     previously discarded into the wall time.
             mfile, mmfile = sandbox_model_files(sb, model_name)
-            rec["cold_fadvise_files"] = fadvise_dontneed([mfile, mmfile])
+            rec["cold_fadvise_files"] = fadvise_dontneed(
+                cold_cache_files(mfile, mmfile)
+            )
             if not wait_gpu_idle(max_mib=512.0, timeout_s=30.0):
                 rec["cold_gpu_busy_mib"] = round(gpu_used_mib(), 0)
             t_cold0 = time.perf_counter()
@@ -3746,20 +3980,28 @@ def build_local_corpus(dest: Path, cap_bytes: int = 1_500_000) -> bool:
     return True
 
 
-def run_perplexity(eng: Engine, model: Path, corpus: Path, cfg: dict) -> dict:
-    if eng.perplexity is None:
+def run_perplexity(
+    eng: Engine, model: Path, corpus: Path, cfg: dict, tool: Path | None = None
+) -> dict:
+    # `tool` borrows another engine's llama-perplexity (mistral.rs/sglang
+    # engine dirs ship none): ppl measures the checkpoint, not the
+    # runtime, so a borrowed-tool number is an honest model-level
+    # measurement — the record stamps the provenance.
+    ppl_bin = tool if tool is not None else eng.perplexity
+    if ppl_bin is None:
         return {"error": "engine ships no llama-perplexity (mistral.rs: unsupported)"}
     # F5: pinned identical args across engines; recorded in the artifact.
     # -f data file is REQUIRED by llama-perplexity (0 tokens => exit 1,
     # proven live on b10809); ctx 2048 demands >= 4096 corpus tokens.
     argv = [
-        str(eng.perplexity),
+        str(ppl_bin),
         "-m",
         str(model.resolve()),
         "-f",
-        # llama-perplexity runs with cwd=eng.dir: a repo-relative corpus
-        # path is unresolvable there (same class as the mistral.rs
-        # staging bug) — always hand the child an absolute path
+        # llama-perplexity runs with the TOOL's engine dir as cwd: a
+        # repo-relative corpus path is unresolvable there (same class as
+        # the mistral.rs staging bug) — always hand the child an absolute
+        # path
         str(corpus.resolve()),
         "--ctx-size",
         str(PPL_CTX),
@@ -3771,7 +4013,7 @@ def run_perplexity(eng: Engine, model: Path, corpus: Path, cfg: dict) -> dict:
     t0 = time.time()
     p = subprocess.run(
         argv,
-        cwd=str(eng.dir),
+        cwd=str(ppl_bin.parent if tool is not None else eng.dir),
         capture_output=True,
         text=True,
         timeout=cfg["timeout"],
@@ -3792,6 +4034,7 @@ def run_perplexity(eng: Engine, model: Path, corpus: Path, cfg: dict) -> dict:
     return {
         "perplexity": float(vals[-1]),
         "ppl_error": float(m[-1][1]) if m[-1][1] else None,
+        "ppl_tool": "own" if tool is None else f"borrowed:{ppl_bin.parent.name}",
         "argv": argv,
         "wall_s": round(time.time() - t0, 1),
     }
@@ -4278,7 +4521,9 @@ def write_markdown_report(
     md: list[str] = []
     md.append("# Blazar benchmark matrix\n")
     md.append(f"- **date**: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    md.append(f"- **model**: `{model.name}` ({model.stat().st_size // (1 << 20)} MiB)")
+    md.append(
+        f"- **model**: `{model.name}` ({model_bytes_on_disk(model) // (1 << 20)} MiB)"
+    )
     md.append(f"- **gpu**: {gpu_name()}")
     # honesty: the report reflects the FULL resumed campaign — list every
     # engine represented in cells, not just this invocation's --engines
@@ -4837,6 +5082,7 @@ def main() -> int:
         log(f"no blazar.db under {data_dir} — nothing servable")
         return 2
     rows: list[tuple[Path, str, str | None]] = []
+    st_rows: list[tuple[Path, str, str | None]] = []
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
         # Component-set pulls (VAE/text-encoder GGUF bundles) are diffusion
@@ -4846,6 +5092,9 @@ def main() -> int:
         # Live incident 2026-09-26: the size-sorted default picked the 5.9G
         # qwen-image Q6_K over the 5.6G text 9B by a 300 MiB margin and fed
         # a diffusion GGUF to every text lane (all cells failed at load).
+        # A DIRECTORY row is an HF safetensors pull — the sglang lane's
+        # model class; it joins its own pool (st_rows) so the GGUF default
+        # pick below stays byte-identical for GGUF boxes.
         for path, name, mmproj, components in con.execute(
             "SELECT path, name, mmproj_path, components FROM models"
         ):
@@ -4857,17 +5106,23 @@ def main() -> int:
                 or (components is not None and components.strip() not in ("", "[]"))
             ):
                 continue
-            rows.append((p, name, mmproj))
+            if p.is_dir():
+                st_rows.append((p, name, None))
+            else:
+                rows.append((p, name, mmproj))
     finally:
         con.close()
-    if not rows:
-        log("no DB-registered .gguf models with existing files")
+    if not rows and not st_rows:
+        log("no DB-registered benchable models (gguf files or safetensors dirs)")
         return 2
     rows.sort(key=lambda r: r[0].stat().st_size, reverse=True)
+    st_rows.sort(
+        key=lambda r: sum(f.stat().st_size for f in r[0].glob("*")), reverse=True
+    )
     if args.model:
         hits = [
             r
-            for r in rows
+            for r in (rows + st_rows)
             if args.model.lower() in r[0].name.lower()
             or args.model.lower() in r[1].lower()
         ]
@@ -4880,6 +5135,10 @@ def main() -> int:
         want = args.model.lower()
         hits.sort(key=lambda r: r[1].lower() != want)
         rows = hits
+    elif not rows:
+        # GGUF-less box: the largest safetensors checkpoint is the honest
+        # default (sglang lane) instead of aborting with no model.
+        rows = st_rows
     model, gw_model_name, own_mmproj_s = rows[0]
     model_name = gw_model_name
     # mmproj ownership is a per-model DB column, NOT dir proximity —
@@ -4888,11 +5147,26 @@ def main() -> int:
     own_mmproj: Path | None = Path(own_mmproj_s) if own_mmproj_s else None
 
     engines = load_engines(data_dir)
+    # Full inventory, pre-filter: the perplexity lane BORROWS its tool
+    # across the filter — a sglang-only campaign still borrows
+    # llama-perplexity from any installed llamacpp engine dir.
+    engine_inventory = engines
     if args.engines:
         engines = [e for e in engines if e.tag in args.engines]
     # text-capable kinds only — sdcpp/whisper rows exist for the media
-    # lanes and must never be fed to the model-serving speed lanes
-    text_engines = [e for e in engines if e.kind in ("llamacpp", "mistralrs", "sglang")]
+    # lanes and must never be fed to the model-serving speed lanes.
+    # Format-aware: a GGUF-file sweep excludes sglang (HF-checkpoint
+    # lane) and a safetensors-dir sweep excludes the GGUF-native
+    # binaries — the pinned sandbox daemon would only teach-refuse,
+    # filling the matrix with expected-failure rows instead of a clean
+    # skip + exclusion reason in the inventory stamp.
+    model_is_dir = model.is_dir()
+    text_engines = [
+        e
+        for e in engines
+        if e.kind in ("llamacpp", "mistralrs", "sglang")
+        and (e.kind == "sglang") == model_is_dir
+    ]
     if not engines:
         log("no benchable engines discovered")
         return 2
@@ -4917,7 +5191,7 @@ def main() -> int:
         "ngl": args.ngl,
         "timeout": args.timeout,
     }
-    log(f"model: {model.name} ({model.stat().st_size // (1 << 20)} MiB)")
+    log(f"model: {model.name} ({model_bytes_on_disk(model) // (1 << 20)} MiB)")
     log(f"engines: {', '.join(f'{e.tag}({e.kind})' for e in engines)}")
     log(f"providers: {', '.join(args.providers)}  artifacts: {art}")
 
@@ -4995,6 +5269,10 @@ def main() -> int:
         elif "error" in rec:
             failures += 1
             log(f"  CELL FAILED: {rec['error']}")
+        elif "note" in rec:
+            # structured skip (format/tool boundary): not a failure, no
+            # metrics — log the reason instead of fake zeros
+            log(f"  note: {rec['note']}")
         elif "conc_level" in rec:
             sys_tps = rec.get("sys_tps")
             if sys_tps is None and rec.get("total_tokens") and rec.get("conc_wall_s"):
@@ -5054,15 +5332,26 @@ def main() -> int:
             finally:
                 con.close()
         benchable = {e.tag for e in engines}
+        excl_reasons = engine_exclusion_reasons(data_dir)
         inv_engines = [
             {"tag": tag, "kind": kind or "llamacpp"}
             for tag, kind in store_rows
             if tag in benchable
         ]
-        excluded = {
-            tag: ENGINE_EXCLUSIONS.get(
+
+        def _exclusion_reason(kind: str | None) -> str:
+            if kind == "sglang" and "sglang" not in excl_reasons:
+                return (
+                    "model-format sweep: this campaign sweeps a GGUF "
+                    "file; sglang serves HF safetensors checkpoints "
+                    "(rerun with --model <safetensors-row>)"
+                )
+            return excl_reasons.get(
                 kind or "llamacpp", f"kind '{kind}' has no bench lane in this harness"
             )
+
+        excluded = {
+            tag: _exclusion_reason(kind)
             for tag, kind in store_rows
             if tag not in benchable
         }
@@ -5078,6 +5367,11 @@ def main() -> int:
     # ---- direct provider sweep (ctx x np + variant axes)
     if "direct" in args.providers:
         for eng in text_engines:
+            if eng.server is None:
+                # gateway-routed lane (sglang venv): the direct provider
+                # spawns engine binaries it owns; this engine's cells
+                # are blazar-provider-only by construction
+                continue
             cells: list[dict] = [
                 {"ctx": ctx, "np": np_} for ctx in ctx_sweep for np_ in DIRECT_NP_SWEEP
             ]
@@ -5675,7 +5969,7 @@ def main() -> int:
 
     # ---- quality: perplexity parity (llama.cpp engines)
     if not args.skip_ppl:
-        corpus_needed = any(e.kind == "llamacpp" for e in engines)
+        corpus_needed = bool(text_engines)
         corpus: Path | None = Path(args.corpus) if args.corpus else None
         if corpus_needed and corpus is None:
             corpus = art / "corpus.txt"
@@ -5684,20 +5978,48 @@ def main() -> int:
                 if not build_local_corpus(corpus):
                     log("local corpus build failed — aborting (exit 2)")
                     return 2
+        # llama-perplexity ships only inside llama.cpp-family engine dirs;
+        # other kinds BORROW the binary from any llamacpp engine present —
+        # ppl is a model-level metric (it measures the checkpoint, not the
+        # runtime), so a borrowed-tool cell is an honest measurement, and
+        # the record stamps which engine dir the tool came from.
+        ppl_owner = next(
+            (e for e in engine_inventory if e.perplexity is not None), None
+        )
         for eng in text_engines:
             params = {"ppl": PPL_CTX}
             key = cell_key(eng.tag, "ppl", params, model.name)
             if key in done:
                 continue
             log(f"[perplexity {eng.tag}]")
-            if eng.kind != "llamacpp":
+            if eng.perplexity is None and ppl_owner is None:
                 emit(
                     eng.tag,
                     eng.kind,
                     "ppl",
                     params,
                     key,
-                    {"error": "llama-perplexity is llama-server-family only"},
+                    {"error": "no llama-perplexity binary on this box"},
+                )
+                continue
+            # llama-perplexity loads GGUF files only — an HF safetensors
+            # campaign model is a format boundary for the tool (it exits
+            # 'failed to load model' on the directory). Honest note row,
+            # no error: the cell is structurally unmeasurable, not failed.
+            if model.is_dir():
+                emit(
+                    eng.tag,
+                    eng.kind,
+                    "ppl",
+                    params,
+                    key,
+                    {
+                        "note": (
+                            "skipped: llama-perplexity loads GGUF files only; "
+                            f"{model.name} is an HF safetensors directory — "
+                            "model-format boundary, not an engine failure"
+                        )
+                    },
                 )
                 continue
             assert corpus is not None  # corpus_needed fetched or aborted above
@@ -5712,7 +6034,13 @@ def main() -> int:
                 )
                 continue
             try:
-                rec = run_perplexity(eng, model, corpus, cfg)
+                rec = run_perplexity(
+                    eng,
+                    model,
+                    corpus,
+                    cfg,
+                    tool=None if eng.perplexity is not None else ppl_owner.perplexity,
+                )
             except Exception as exc:
                 rec = {"error": f"ppl cell crashed: {exc}"}
             emit(eng.tag, eng.kind, "ppl", params, key, rec)
@@ -5822,6 +6150,13 @@ def main() -> int:
         if ref_eng is not None:
             ref_tag = ref_eng.tag
             log(f"[greedy reference from {ref_eng.tag}]")
+            if "ollama" in args.providers:
+                released = ollama_release_loaded()
+                if released:
+                    log(
+                        f"  ollama keep_alive=0 on {released} model(s) "
+                        "before greedy spawn"
+                    )
             if not mem_guard(2048.0, f"pre-greedy-reference {ref_eng.tag}"):
                 # F140: other lanes error+skip on a failed floor wait —
                 # proceeding anyway produces swap-thrashed reference
@@ -5841,6 +6176,12 @@ def main() -> int:
                 )
         else:
             for eng in text_engines:
+                if eng.server is None:
+                    # greedy parity spawns the engine binary directly;
+                    # gateway-routed lanes have no direct reference by
+                    # construction (the blazar-vs-ollama provider pair
+                    # is their parity surface instead)
+                    continue
                 params = {"greedy": True}
                 key = cell_key(eng.tag, "greedy", params, model.name)
                 if key in done:
@@ -5945,6 +6286,14 @@ def main() -> int:
                 ref_tag = r["vs"]
                 break
     md_path = art / "benchmark.md"
+    # Campaign-exit hygiene: ollama's keep_alive outlives the last ollama
+    # cell and squats on the GPU into the next campaign's cold lanes (the
+    # pre-greedy release alone misses the tail cells). Drain it here so a
+    # resumed/follow-up run starts on an actually-idle card.
+    if "ollama" in args.providers:
+        released = ollama_release_loaded()
+        if released:
+            log(f"ollama: released {released} resident model(s) at campaign exit")
     write_markdown_report(
         md_path,
         all_records,
@@ -8035,6 +8384,40 @@ def write_publication_report(
         L.append("")
         for i, f in enumerate(carried_findings, 1):
             L.append(f"{i}. {f}")
+        L.append("")
+    # engine-reality receipts: error cells are excluded from every metric
+    # table by construction, but hiding them from the published report
+    # would misrepresent coverage — every failed cell is listed with its
+    # config and error signature (full daemon log tail in cells.jsonl).
+    failed_rows = [r for r in recs if "error" in r and r.get("provider") != "inventory"]
+    if failed_rows:
+        L.append("## Failed cells (engine-reality receipts)")
+        L.append("")
+        L.append(
+            "_These knobs crashed the engine child on this test bed; the "
+            "crash signature is the receipt. Raw logs: `cells.jsonl` "
+            "(`daemon_log_tail` field)._"
+        )
+        L.append("")
+        L.append("| Engine | lane | config | failure |")
+        L.append("|---|---|---|---|")
+        for r in failed_rows:
+            cfg = (
+                r.get("params", {}).get("config")
+                or r.get("params", {}).get("ppl")
+                or ""
+            )
+            L.append(
+                f"| {r.get('tag', '?')} | {r.get('provider', '?')} | {cfg} "
+                f"| {str(r['error'])[:100]} |"
+            )
+        L.append("")
+    note_rows = [r for r in recs if "note" in r and "error" not in r]
+    if note_rows:
+        L.append("## Structured skips (tool/format boundaries)")
+        L.append("")
+        for r in note_rows:
+            L.append(f"- {r.get('tag', '?')} ({r.get('provider', '?')}): {r['note']}")
         L.append("")
     L.append("")
     L.append("## Caveats")

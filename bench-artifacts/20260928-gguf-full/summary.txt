@@ -1,0 +1,86 @@
+engine | kind | provider | params | ttft_ms_p50 | ttft_ms_p99 | itl_p50_ms | itl_p99_ms | decode_tps | prefill_tps_cold | prefill_tps_cached | load_s | gpu_peak_mib | gpu_power_peak_w | rss_peak_mib | tokens_source
+--------------------------------------------------------------------------------------------------------------------------------------------
+inventory | inventory | inventory | {} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+b11202-cuda | llamacpp | direct | {'ctx': 4096, 'np': 1} | 127 | 132 | 23.98 | 32.33 | 41.24 | 1265.4 | 7373.7 | 9.55 | 5270 | 55.5 | 4408 | chunks
+b11202-cuda | llamacpp | direct | {'ctx': 4096, 'np': 4} | 123 | 125 | 23.98 | 25.0 | 41.64 | 1309.9 | 7467.2 | 4.53 | 5410 | 56.0 | 5672 | chunks
+b11202-cuda | llamacpp | direct | {'ctx': 16384, 'np': 1} | 123 | 125 | 24.03 | 25.3 | 41.58 | 1308.9 | 7439.5 | 2.51 | 5666 | 55.9 | 5715 | chunks
+b11202-cuda | llamacpp | direct | {'ctx': 16384, 'np': 4} | 122 | 123 | 24.13 | 25.16 | 41.39 | 1340.8 | 7303.2 | 2.51 | 5804 | 56.7 | 5718 | chunks
+b11202-cuda | llamacpp | direct | {'ctx': 4096, 'kv': 'q8_0', 'np': 1} | 119 | 121 | 24.32 | 25.91 | 41.05 | 1389.3 | 7737.8 | 2.51 | 5210 | 56.4 | 5719 | chunks
+b11202-cuda | llamacpp | direct | {'ctx': 4096, 'np': 1, 'pa': 'on'} | 124 | 124 | 24.08 | 25.15 | 41.48 | 1316.2 | 7490.3 | 2.53 | 5270 | 56.8 | 5716 | chunks
+b11202-cuda | llamacpp | direct | {'ctx': 4096, 'np': 1, 'spec': 'ngram-simple'} | 122 | 125 | 24.34 | 25.27 | 41.02 | 1334.6 | 7380.1 | 2.51 | 5270 | 55.8 | 5719 | chunks
+b11202-cuda | llamacpp | direct | {'ctx': 4096, 'mmproj': True, 'np': 1} | 123 | 124 | 24.11 | 25.59 | 41.41 | 1309.8 | 7456.5 | 3.01 | 6394 | 55.9 | 5721 | chunks
+v0.9.4 | mistralrs | direct | {'ctx': 4096, 'np': 1} | 127 | 141 | 46.85 | 54.24 | 21.26 | 273.8 | 323.5 | 11.04 | 7042 | 45.2 | 6692 | chunks
+v0.9.4 | mistralrs | direct | {'ctx': 4096, 'np': 4} | 168 | 191 | 47.22 | 55.52 | 21.06 | 255.5 | 297.9 | 7.51 | 7042 | 44.1 | 7842 | chunks
+v0.9.4 | mistralrs | direct | {'ctx': 16384, 'np': 1} | 151 | 185 | 46.26 | 55.07 | 21.54 | 281.3 | 345.2 | 8.51 | 7042 | 44.9 | 7952 | chunks
+v0.9.4 | mistralrs | direct | {'ctx': 16384, 'np': 4} | 145 | 219 | 46.98 | 55.85 | 21.09 | 273.3 | 312.5 | 6.01 | 7042 | 44.0 | 7962 | chunks
+v0.9.4 | mistralrs | direct | {'ctx': 4096, 'np': 1, 'pa': 'off'} | 154 | 214 | 54.92 | 64.15 | 18.22 | 204.2 | 236.1 | 11.03 | 6882 | 33.7 | 4867 | chunks
+b11202-cuda | llamacpp | blazar | {'config': 'default'} | 124 | 174 | 24.29 | 25.58 | 41.13 | 1302.3 | 7212.0 | - | 5458 | 55.6 | 2202 | chunks
+b11202-cuda | llamacpp | blazar | {'config': 'single-stream'} | 125 | 127 | 24.14 | 25.2 | 41.56 | 1313.0 | 7239.3 | - | 5666 | 55.2 | 2104 | chunks
+b11202-cuda | llamacpp | blazar | {'config': 'cont_batching_off'} | 125 | 177 | 24.34 | 25.51 | 41.02 | 1307.7 | 7191.5 | - | 5458 | 55.9 | 2103 | chunks
+b11202-cuda | llamacpp | blazar | {'config': 'fa_on'} | 124 | 131 | 24.35 | 25.34 | 41.05 | 1318.9 | 7293.1 | - | 5458 | 55.1 | 2101 | chunks
+b11202-cuda | llamacpp | blazar | {'config': 'fa_off'} | 160 | 351 | 24.46 | 25.7 | 40.75 | 1158.8 | 7434.7 | - | 5696 | 56.4 | 2345 | chunks
+b11202-cuda | llamacpp | blazar | {'config': 'kv_unified_on'} | 122 | 127 | 24.37 | 25.42 | 41.0 | 1371.7 | 7327.4 | - | 5458 | 55.6 | 2152 | chunks
+b11202-cuda | llamacpp | blazar | {'config': 'kv_unified_off'} | 123 | 126 | 24.31 | 25.56 | 40.99 | 1353.3 | 7293.5 | - | 5458 | 56.9 | 2196 | chunks
+b11202-cuda | llamacpp | blazar | {'config': 'swa_full_on'} | 123 | 125 | 24.05 | 25.1 | 41.61 | 1316.6 | 7460.8 | - | 5458 | 56.1 | 2102 | chunks
+b11202-cuda | llamacpp | blazar | {'config': 'no_kv_offload_on'} | 150 | 205 | 53.75 | 59.6 | 18.54 | 931.3 | 5074.5 | - | 5106 | 52.1 | 2465 | chunks
+b11202-cuda | llamacpp | blazar | {'config': 'cache_q8_q8_0'} | 124 | 125 | 24.57 | 25.54 | 40.64 | 1312.3 | 7580.5 | - | 5338 | 55.5 | 2084 | chunks
+b11202-cuda | llamacpp | blazar | {'config': 'ctx_checkpoints_4'} | 121 | 125 | 24.35 | 25.51 | 41.02 | 1317.7 | 7538.2 | - | 5477 | 55.5 | 2102 | chunks
+b11202-cuda | llamacpp | blazar | {'config': 'spec_off'} | 119 | 132 | 24.02 | 25.2 | 41.55 | 1308.3 | 7349.5 | - | 5452 | 55.2 | 2102 | chunks
+b11202-cuda | llamacpp | blazar | {'config': 'deterministic_on'} | 123 | 124 | 24.33 | 25.38 | 41.05 | 1312.0 | 7424.7 | - | 5666 | 57.1 | 2105 | chunks
+b11202-cuda | llamacpp | blazar | {'config': 'mmproj_offload_off'} | 124 | 124 | 24.05 | 25.41 | 41.57 | 1313.7 | 7229.0 | - | 5458 | 56.6 | 2102 | chunks
+b11202-cuda | llamacpp | blazar | {'config': 'threads_batch_8'} | 126 | 174 | 24.34 | 25.48 | 40.99 | 1310.9 | 7246.5 | - | 5458 | 55.7 | 2203 | chunks
+b11202-cuda | llamacpp | blazar | {'config': 'cache_reuse_256'} | 125 | 175 | 24.38 | 25.61 | 40.98 | 1287.3 | 7243.0 | - | 5458 | 55.7 | 2202 | chunks
+b11202-cuda | llamacpp | blazar | {'config': 'kv_unified_per_slot_4096'} | 123 | 124 | 24.37 | 25.67 | 40.97 | 1330.7 | 7549.6 | - | 5458 | 55.3 | 2102 | chunks
+b11202-cuda | llamacpp | blazar | {'conc': 8, 'config': 'conc_default'} | - | - | - | 79.24 | - | - | - | - | 5464 | 55.7 | 0 | -
+b11202-cuda | llamacpp | blazar | {'conc': 8, 'config': 'adaptive_slots_off'} | - | - | - | 61.9 | - | - | - | - | 5466 | 55.1 | 0 | -
+b11202-cuda | llamacpp | blazar | {'conc': 8, 'config': 'poll_50'} | - | - | - | 30.33 | - | - | - | - | 5464 | 55.6 | 0 | -
+v0.9.4 | mistralrs | blazar | {'config': 'default'} | 122 | 124 | 24.33 | 25.71 | 41.1 | 1379.9 | 7160.5 | - | 5458 | 56.8 | 2101 | chunks
+v0.9.4 | mistralrs | blazar | {'config': 'paged_attn_off'} | 119 | 125 | 24.05 | 25.3 | 41.56 | 1370.2 | 7447.0 | - | 5458 | 55.7 | 2102 | chunks
+v0.9.4 | mistralrs | blazar | {'config': 'single-stream'} | 122 | 123 | 24.15 | 25.38 | 41.47 | 1403.8 | 7654.8 | - | 5666 | 55.7 | 2105 | chunks
+v0.9.4 | mistralrs | blazar | {'config': 'kv_unified_on'} | 124 | 125 | 24.32 | 25.55 | 41.05 | 1367.1 | 7414.7 | - | 5464 | 55.5 | 2129 | chunks
+v0.9.4 | mistralrs | blazar | {'config': 'kv_unified_off'} | 120 | 125 | 24.31 | 25.54 | 41.07 | 1312.5 | 7397.5 | - | 5465 | 56.8 | 2196 | chunks
+v0.9.4 | mistralrs | blazar | {'config': 'spec_off'} | 123 | 124 | 24.1 | 25.46 | 41.43 | 1325.0 | 7317.3 | - | 5458 | 56.5 | 2102 | chunks
+v0.9.4 | mistralrs | blazar | {'config': 'deterministic_on'} | 118 | 122 | 24.35 | 25.32 | 41.03 | 1313.0 | 7244.9 | - | 5666 | 56.4 | 2104 | chunks
+v0.9.4 | mistralrs | blazar | {'config': 'pa_mem_0.85'} | 122 | 124 | 24.3 | 25.45 | 41.06 | 1326.4 | 7667.6 | - | 5458 | 56.6 | 2101 | chunks
+v0.9.4 | mistralrs | blazar | {'config': 'pa_mem_0.55'} | 121 | 122 | 24.36 | 25.31 | 41.04 | 1316.9 | 7371.5 | - | 5458 | 55.7 | 2101 | chunks
+v0.9.4 | mistralrs | blazar | {'config': 'mr_batch_64'} | 123 | 126 | 24.13 | 25.19 | 41.56 | 1366.6 | 7352.9 | - | 5464 | 55.9 | 2102 | chunks
+v0.9.4 | mistralrs | blazar | {'config': 'mr_prefix_cache_256'} | 121 | 174 | 24.4 | 25.6 | 40.97 | 1314.6 | 7358.3 | - | 5464 | 55.9 | 2202 | chunks
+v0.9.4 | mistralrs | blazar | {'config': 'mr_enc_cache_512mb'} | 121 | 123 | 24.36 | 25.67 | 41.0 | 1369.8 | 7396.1 | - | 5464 | 57.1 | 2101 | chunks
+ollama-host | ollama | ollama | {'reference': True} | 126 | 132 | 24.88 | 74.97 | 40.57 | 1409.3 | 7372.4 | - | 6570 | 55.4 | 0 | engine_counters
+ollama-host | ollama | cold-ollama | {'cold': True} | - | - | - | - | - | - | - | - | 6568 | 25.2 | 0 | -
+master-920-2f88688 | sdcpp | media-image | {'runs': 3, 'size': '512x512', 'steps': [4]} | - | - | - | - | - | - | - | - | 6119 | - | 0 | -
+master-920-2f88688 | sdcpp | media-image | {'config': 'fa_off', 'runs': 3, 'size': '512x512', 'steps': [4]} | - | - | - | - | - | - | - | - | 5932 | - | 0 | -
+master-920-2f88688 | sdcpp | media-image | {'config': 'vae_tiling_on', 'runs': 3, 'size': '512x512', 'steps': [4]} | - | - | - | - | - | - | - | - | 5893 | - | 0 | -
+master-920-2f88688 | sdcpp | media-image | {'config': 'sage_attn_on', 'runs': 3, 'size': '512x512', 'steps': [4]} | - | - | - | - | - | - | - | - | 6119 | - | 0 | -
+master-920-2f88688 | sdcpp | media-video | {'frames': [5, 13, 33], 'gate': {'duration': 60, 'size': '512x512', 'steps': 8}, 'runs': 3, 'size': '320x320', 'steps': 8} | - | - | - | - | - | - | - | - | 4643 | - | 0 | -
+piper | piper | media-tts | {'chars': 840, 'formats': ['wav', 'pcm'], 'runs': 3} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+piper | piper | media-tts-conc | {'chars': 400, 'format': 'pcm', 'streams': 4} | - | - | - | - | - | - | - | - | 16 | - | 0 | -
+b5130 | whisper | media-whisper | {'input': 'piper-wav', 'runs': 3} | - | - | - | - | - | - | - | - | 16 | - | 0 | -
+b11202-cuda | llamacpp | idle-blazar | {'idle': True} | - | - | - | - | - | - | - | - | 5450 | - | 0 | -
+v0.9.4 | mistralrs | idle-blazar | {'idle': True} | - | - | - | - | - | - | - | - | 5583 | - | 0 | -
+ollama-host | ollama | idle-ollama | {'idle': True} | - | - | - | - | - | - | - | - | 6564 | - | 0 | -
+b11202-cuda | llamacpp | ctxcurve-blazar | {'ctx': 2048} | 125 | 182 | 24.09 | 25.51 | 41.5 | 1324.2 | 7176.7 | - | 5646 | - | 0 | chunks
+b11202-cuda | llamacpp | ctxcurve-blazar | {'ctx': 8192} | 122 | 329 | 24.11 | 25.23 | 41.37 | 1376.5 | 7358.1 | - | 5402 | - | 0 | chunks
+b11202-cuda | llamacpp | ctxcurve-blazar | {'ctx': 16384} | 122 | 317 | 24.35 | 25.39 | 41.01 | 1330.1 | 7410.0 | - | 5660 | - | 0 | chunks
+v0.9.4 | mistralrs | ctxcurve-blazar | {'ctx': 2048} | 123 | 176 | 24.35 | 25.43 | 41.03 | 1369.2 | 7304.5 | - | 5777 | - | 0 | chunks
+v0.9.4 | mistralrs | ctxcurve-blazar | {'ctx': 8192} | 122 | 323 | 24.31 | 25.71 | 40.98 | 1334.5 | 7442.1 | - | 5415 | - | 0 | chunks
+v0.9.4 | mistralrs | ctxcurve-blazar | {'ctx': 16384} | 120 | 308 | 23.98 | 24.74 | 41.68 | 1322.2 | 7395.3 | - | 5673 | - | 0 | chunks
+ollama-host | ollama | ctxcurve-ollama | {'ctx': 2048} | 135 | - | - | - | 40.47 | - | - | 6.14 | 6368 | - | 0 | -
+ollama-host | ollama | ctxcurve-ollama | {'ctx': 8192} | 128 | - | - | - | 40.51 | - | - | 5.55 | 6566 | - | 0 | -
+ollama-host | ollama | ctxcurve-ollama | {'ctx': 16384} | 130 | - | - | - | 40.55 | - | - | 5.31 | 6830 | - | 0 | -
+b11202-cuda | llamacpp | conc-direct | {'conc': 4} | - | - | - | 41.39 | - | - | - | 8.03 | 0 | - | 0 | -
+b11202-cuda | llamacpp | conc-blazar | {'conc': 4, 'rounds': 3} | - | - | - | 81.32 | - | - | - | - | 5464 | - | 0 | -
+v0.9.4 | mistralrs | conc-blazar | {'conc': 4, 'rounds': 3} | - | - | - | 32.78 | - | - | - | - | 5497 | - | 0 | -
+ollama-host | ollama | conc-ollama | {'conc': 4, 'rounds': 3} | - | - | - | 74.69 | - | - | - | - | 6576 | - | 0 | -
+b11202-cuda | llamacpp | ppl | {'ppl': 2048} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+b11202-cuda | llamacpp | reshape | {'reshape': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+v0.9.4 | mistralrs | reshape | {'reshape': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+b11202-cuda | llamacpp | tools | {'tools': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+v0.9.4 | mistralrs | tools | {'tools': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+ollama-host | ollama | tools-ollama | {'tools': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+b11202-cuda | llamacpp | features | {'features': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+v0.9.4 | mistralrs | features | {'features': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+b11202-cuda | llamacpp | greedy | {'greedy': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+v0.9.4 | mistralrs | greedy | {'greedy': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+b11202-cuda | llamacpp | greedy_gw | {'greedy_gw': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+v0.9.4 | mistralrs | ppl | {'ppl': 2048} | - | - | - | - | - | - | - | - | 0 | - | 0 | -

@@ -12,6 +12,7 @@ Exits nonzero on any regression.
 
 import importlib.util
 import json
+import struct
 import sys
 import tempfile
 from pathlib import Path
@@ -276,10 +277,18 @@ reshape_ok = rec(
     requests_failed=0,
     timeline_samples=150,
 )
-reshape_no = rec("reshape", {"reshape": True}, tag="v0.9.3",
-                 reshape_observed=False, slots_from=2, slots_to=None,
-                 requests_before=210, requests_after=0, requests_failed=0,
-                 timeline_samples=150)
+reshape_no = rec(
+    "reshape",
+    {"reshape": True},
+    tag="v0.9.3",
+    reshape_observed=False,
+    slots_from=2,
+    slots_to=None,
+    requests_before=210,
+    requests_after=0,
+    requests_failed=0,
+    timeline_samples=150,
+)
 rtab = bm.reshape_table([reshape_ok, reshape_no])
 assert "| Runtime | reshape | slots |" in rtab and "1→8" in rtab and "142" in rtab, rtab
 assert "11800→940" in rtab and "39→91" in rtab and "| 0 |" in rtab, rtab
@@ -287,13 +296,13 @@ assert "NO" in rtab, "unobserved reshape must render NO"
 assert bm.reshape_table([]) == "_Not measured._"
 out_r = bm.text_findings([reshape_ok])
 backed_r = [b for b, _ in out_r if b]
-assert any("Adaptive reshape" in b and "1->8" in b and "0 dropped" in b for b in backed_r), (
-    backed_r
-)
+assert any(
+    "Adaptive reshape" in b and "1->8" in b and "0 dropped" in b for b in backed_r
+), backed_r
 sparse_r = bm.text_findings([])
-assert any(c and "reshape under sustained concurrency" in c for b, c in sparse_r if not b), (
-    "reshape carried text missing"
-)
+assert any(
+    c and "reshape under sustained concurrency" in c for b, c in sparse_r if not b
+), "reshape carried text missing"
 print("reshape_table + F13: transition row, NO case, empty marker, carried OK")
 
 
@@ -396,5 +405,138 @@ _row = json.dumps({"argv": [f"{_home}/.local/share/blazar/engines/b1/srv"]})
 _san = bm.portable_path(_row)
 assert f"{_home}" not in _san and "~/.local/share/blazar" in _san, _san
 assert bm.portable_path("no paths here") == "no paths here"
+
+# --- sglang lane inclusion: dynamic, store-driven (no hardcoded box
+# state). A safetensors DIR row flips the lane benchable; GGUF-only
+# stores exclude it with the honest reason text.
+import sqlite3 as _sq
+
+
+def _mini_store(td, model_rows, engine_rows):
+    con = _sq.connect(Path(td) / "blazar.db")
+    con.execute("CREATE TABLE engines (tag TEXT, kind TEXT)")
+    con.execute(
+        "CREATE TABLE models (path TEXT, name TEXT, mmproj_path TEXT, components TEXT)"
+    )
+    con.executemany("INSERT INTO engines VALUES (?,?)", engine_rows)
+    con.executemany("INSERT INTO models VALUES (?,?,?,?)", model_rows)
+    con.commit()
+    con.close()
+
+
+with tempfile.TemporaryDirectory() as td:
+    st_dir = Path(td) / "qwen3-1.7b.d"
+    st_dir.mkdir()
+    (st_dir / "model-00001-of-00001.safetensors").write_bytes(b"x" * 16)
+    gguf = Path(td) / "text.gguf"
+    gguf.write_bytes(b"g" * 32)
+    _mini_store(
+        td,
+        [(str(st_dir), "qwen3-1.7b", None, None), (str(gguf), "text9b", None, None)],
+        [("sglang-0.5.19", "sglang"), ("b11202-cuda", "llamacpp")],
+    )
+    (Path(td) / "engines" / "sglang-0.5.19").mkdir(parents=True)
+    (Path(td) / "engines" / "b11202-cuda").mkdir(parents=True)
+    data = Path(td)
+    assert bm.has_text_safetensors_model(data), "dir row must qualify"
+    assert bm.engine_exclusion_reasons(data) == {}, "no exclusion with a dir row"
+    engs = bm.load_engines(data)
+    tags = {e.tag: e.kind for e in engs}
+    assert tags.get("sglang-0.5.19") == "sglang", tags
+    sg = next(e for e in engs if e.kind == "sglang")
+    assert sg.server is None and sg.bench is None, "gateway-routed contract"
+    print("sglang inclusion: dir row -> benchable gateway-routed Engine OK")
+
+with tempfile.TemporaryDirectory() as td:
+    gguf = Path(td) / "text.gguf"
+    gguf.write_bytes(b"g" * 32)
+    _mini_store(td, [(str(gguf), "text9b", None, None)], [("sglang-0.5.19", "sglang")])
+    (Path(td) / "engines" / "sglang-0.5.19").mkdir(parents=True)
+    data = Path(td)
+    assert not bm.has_text_safetensors_model(data), "gguf-only store must not qualify"
+    reasons = bm.engine_exclusion_reasons(data)
+    assert "sglang" in reasons and "safetensors" in reasons["sglang"], reasons
+    assert all(e.kind != "sglang" for e in bm.load_engines(data)), "must be dropped"
+    print("sglang exclusion: gguf-only store -> dropped with reason OK")
+
+# relative model path (product stores relative spellings)
+with tempfile.TemporaryDirectory() as td:
+    (Path(td) / "models" / "m.d").mkdir(parents=True)
+    _mini_store(td, [("models/m.d", "m", None, None)], [])
+    assert bm.has_text_safetensors_model(Path(td)), "relative dir row must resolve"
+    print("sglang inclusion: relative dir row resolves OK")
+
+# cold-cache file set: HF dirs expand to shard files (fadvise on a dir
+# inode would leave every shard cached), GGUF files pass through
+with tempfile.TemporaryDirectory() as td:
+    d = Path(td) / "m.d"
+    d.mkdir()
+    (d / "a.safetensors").write_bytes(b"a")
+    (d / "b.safetensors").write_bytes(b"b")
+    (d / "config.json").write_bytes(b"c")
+    mm = Path(td) / "proj.gguf"
+    assert bm.cold_cache_files(d, mm) == [d / "a.safetensors", d / "b.safetensors", mm]
+    f = Path(td) / "m.gguf"
+    assert bm.cold_cache_files(f, None) == [f]
+    assert bm.cold_cache_files(None, None) == []
+    print("cold_cache_files: dir->shards, file passthrough, empty OK")
+
+
+# GGUF hf-base-id derivation: mirror of the product's gguf.rs
+# hf_base_model_id — general.basename + general.size_label -> org/repo.
+# Synthetic GGUF v2 header (magic, version, tensor_count, kv_count, kvs).
+def _synthetic_gguf(kvs: list[tuple[str, str]]) -> bytes:
+    out = bytearray(b"GGUF")
+    out += struct.pack("<I", 2)
+    out += struct.pack("<Q", 0)  # tensor count
+    out += struct.pack("<Q", len(kvs))
+    for key, value in kvs:
+        kb, vb = key.encode(), value.encode()
+        out += struct.pack("<Q", len(kb)) + kb
+        out += struct.pack("<I", 8)  # string value type
+        out += struct.pack("<Q", len(vb)) + vb
+    return bytes(out)
+
+
+with tempfile.TemporaryDirectory() as td:
+    g = Path(td) / "m.gguf"
+    g.write_bytes(
+        _synthetic_gguf(
+            [
+                ("general.architecture", "qwen35"),
+                ("general.basename", "Qwen_Qwen3.5-9B"),
+                ("general.size_label", "9B"),
+            ]
+        )
+    )
+    assert bm.gguf_hf_base_model_id(g) == "Qwen/Qwen3.5-9B", "size label already suffix"
+    g3 = Path(td) / "m3.gguf"
+    g3.write_bytes(_synthetic_gguf([("general.basename", "nosplit")]))
+    assert bm.gguf_hf_base_model_id(g3) is None, "no org/repo split -> None"
+    g4 = Path(td) / "m4.gguf"
+    g4.write_bytes(b"not-gguf")
+    assert bm.gguf_hf_base_model_id(g4) is None, "bad magic -> None"
+    print("gguf_hf_base_model_id: derive, unsplittable, bad-magic OK")
+
+# load_done attempts cap: a key with MAX_CELL_ATTEMPTS error rows becomes
+# done (engine-reality crash stops retrying); fewer errors keep retrying;
+# ok rows are done regardless.
+with tempfile.TemporaryDirectory() as td:
+    cp = Path(td) / "cells.jsonl"
+    rows = [
+        {"key": "crashed", "error": "sigkill"},
+        {"key": "crashed", "error": "sigkill"},
+        {"key": "flaky", "error": "once"},
+        {"key": "good", "ttft_ms_p50": 5},
+    ]
+    cp.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    d1 = bm.load_done(cp)
+    assert "good" in d1, "ok row is done"
+    assert "flaky" not in d1, "1 error row still retries"
+    assert "crashed" not in d1, "2 error rows still retry (cap is 3)"
+    cp.open("a").write(json.dumps({"key": "crashed", "error": "sigkill"}) + "\n")
+    d2 = bm.load_done(cp)
+    assert "crashed" in d2, "3 identical error rows cap the cell"
+    print("load_done attempts cap: ok/1-err/2-err/3-err OK")
 
 print("ALL FIXTURE CHECKS GREEN")

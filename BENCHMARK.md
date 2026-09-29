@@ -1,27 +1,27 @@
 # Blazar inference benchmark
 
-_Rendered 20260926-sdcpp-lane; blazar 0.11.0; power state of gateway rows: ac._
+_Rendered 20260928-gguf-full; blazar 0.13.0; power state of gateway rows: ac._
 
 ## Executive summary
 
-b11193-cuda: gateway 41.5 vs direct 41.4 t/s (+0.2%); b11193-cuda prompt-cache prefill 7305 vs 1302 t/s cold; b11193-cuda sweep C=4: C4: 70.3 t/s system (2x8192) | v0.9.4 sweep C=4: C4: 70.4 t/s system (2x8192); gateway cold boot 0.52 s; cold TTFT 4827 ms vs ollama 4242 ms (0.9x); idle wake 3056 ms (sleep) vs ollama 4934 ms (full reload).
+v0.9.4: gateway 41.0 vs direct 21.5 t/s (+90.3%); v0.9.4 prompt-cache prefill 7396 vs 1370 t/s cold; b11202-cuda sweep C=4: C4: 67.5 t/s system (2x8192) | v0.9.4 sweep C=4: C4: 67.4 t/s system (2x8192); gateway cold boot 0.52 s; cold TTFT 4430 ms vs ollama 5446 ms (1.2x); idle wake 4615 ms (sleep) vs ollama 5958 ms (full reload).
 
 ## Measured in this campaign
 
-- blazar: 5 cell(s)
+- blazar: 32 cell(s)
 - cold-ollama: 1 cell(s)
 - conc-blazar: 2 cell(s)
 - conc-direct: 1 cell(s)
 - conc-ollama: 1 cell(s)
 - ctxcurve-blazar: 6 cell(s)
 - ctxcurve-ollama: 3 cell(s)
-- direct: 12 cell(s)
+- direct: 13 cell(s)
 - features: 2 cell(s)
 - greedy: 2 cell(s)
 - greedy_gw: 1 cell(s)
 - idle-blazar: 2 cell(s)
 - idle-ollama: 1 cell(s)
-- media-image: 1 cell(s)
+- media-image: 4 cell(s)
 - media-tts: 1 cell(s)
 - media-tts-conc: 1 cell(s)
 - media-video: 1 cell(s)
@@ -36,11 +36,11 @@ b11193-cuda: gateway 41.5 vs direct 41.4 t/s (+0.2%); b11193-cuda prompt-cache p
 
 | Engine | Kind | Lane | ok cells | err cells | Status |
 |---|---|---|---:|---:|---|
-| v0.9.4 | mistralrs | text (direct + gateway) | 11 | 7 | benchmarked |
-| master-919-19bbbca | sdcpp | media | 2 | 0 | benchmarked |
+| v0.9.4 | mistralrs | text (direct + gateway) | 27 | 0 | benchmarked |
 | b5130 | whisper | media | 1 | 0 | benchmarked |
-| b11193-cuda | llamacpp | text (direct + gateway) | 21 | 0 | benchmarked |
-| sglang-0.5.19 | — | — | 0 | 0 | excluded: needs an HF safetensors model; this box serves GGUF only and 8 GiB VRAM cannot host sglang beside the media children |
+| b11202-cuda | llamacpp | text (direct + gateway) | 40 | 0 | benchmarked |
+| master-920-2f88688 | sdcpp | media | 5 | 0 | benchmarked |
+| sglang-0.5.19 | sglang | — | 0 | 0 | no cells in this campaign |
 
 ## Test bed
 
@@ -51,7 +51,7 @@ b11193-cuda: gateway 41.5 vs direct 41.4 t/s (+0.2%); b11193-cuda prompt-cache p
 | Integrated GPU | Intel Graphics (RPL-S), Vulkan device |
 | RAM | 16 GiB (13.3 GiB usable) |
 | OS | Linux Mint 22.3, kernel 7.0.0-31-generic |
-| Runtimes compared | blazar 0.11.0 gateway - b11193-cuda - inventory - master-919-19bbbca - ollama-host - piper (gateway TTS lane) - v0.9.4 - whisper.cpp b5130 |
+| Runtimes compared | blazar 0.13.0 gateway - b11202-cuda - inventory - master-920-2f88688 - ollama-host - piper (gateway TTS lane) - v0.9.4 - whisper.cpp b5130 |
 | Model | Qwen3.5-9B-Q4_K_M.gguf, en_US-amy-medium, ggml-base, qwen-image-2.1-uncensored, wan_2.1_comfyui_repackaged |
 
 ## Methodology
@@ -88,22 +88,50 @@ b11193-cuda: gateway 41.5 vs direct 41.4 t/s (+0.2%); b11193-cuda prompt-cache p
 
 | Runtime | slots x ctx | decode t/s | TTFT p50 ms | TTFT p99 ms | ITL p50 ms | ITL p99 ms | prefill cold t/s | prefill cached t/s | GPU peak MiB | GPU power W |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| blazar gateway - b11193-cuda | 2x8192 | 41.4 | 121.6 | 125.8 | 24.1 | 25.3 | 1319.0 | 7328.5 | 5452 | 55.4 |
-| blazar gateway - b11193-cuda (single-stream) | 1x16384 | 41.5 | 122.9 | 125.4 | 24.1 | 25.2 | 1302.0 | 7304.5 | 5666 | 55.8 |
-| blazar gateway - v0.9.4 | 2x8192 | 41.4 | 124.9 | 125.8 | 24.1 | 25.3 | 1327.5 | 7166.5 | 5458 | 55.8 |
-| blazar gateway - v0.9.4 (paged_attn_off) | 2x8192 | 41.5 | 123.6 | 126.5 | 24.1 | 25.0 | 1322.9 | 7136.9 | 5458 | 56.3 |
-| blazar gateway - v0.9.4 (single-stream) | 1x16384 | 41.5 | 123.2 | 126.3 | 24.1 | 25.4 | 1329.3 | 7240.1 | 5672 | 55.3 |
-| direct engine - b11193-cuda | 1x16384 | 41.4 | 122.3 | 125.6 | 24.2 | 25.1 | 1366.8 | 7344.0 | 5666 | 56.7 |
-| ollama 0.33.3 - qwen3.5:9b | service | 40.5 | 125.4 | 126.7 | 24.9 | 75.0 | 1442.4 | 7701.3 | 6566 | 55.2 |
+| blazar gateway - b11202-cuda | 2x8192 | 41.1 | 124.2 | 174.3 | 24.3 | 25.6 | 1302.3 | 7212.0 | 5458 | 55.6 |
+| blazar gateway - b11202-cuda (single-stream) | 1x16384 | 41.6 | 125.0 | 126.5 | 24.1 | 25.2 | 1313.0 | 7239.3 | 5666 | 55.2 |
+| blazar gateway - b11202-cuda (cont_batching_off) | 2x8192 | 41.0 | 124.7 | 176.6 | 24.3 | 25.5 | 1307.7 | 7191.5 | 5458 | 55.9 |
+| blazar gateway - b11202-cuda (fa_on) | 2x8192 | 41.0 | 124.4 | 131.1 | 24.4 | 25.3 | 1318.9 | 7293.1 | 5458 | 55.1 |
+| blazar gateway - b11202-cuda (fa_off) | 2x8192 | 40.7 | 160.3 | 351.2 | 24.5 | 25.7 | 1158.8 | 7434.7 | 5696 | 56.4 |
+| blazar gateway - b11202-cuda (kv_unified_on) | 2x8192 | 41.0 | 121.6 | 127.0 | 24.4 | 25.4 | 1371.7 | 7327.4 | 5458 | 55.6 |
+| blazar gateway - b11202-cuda (kv_unified_off) | 2x8192 | 41.0 | 123.2 | 126.0 | 24.3 | 25.6 | 1353.3 | 7293.5 | 5458 | 56.9 |
+| blazar gateway - b11202-cuda (swa_full_on) | 2x8192 | 41.6 | 122.6 | 125.1 | 24.1 | 25.1 | 1316.6 | 7460.8 | 5458 | 56.1 |
+| blazar gateway - b11202-cuda (no_kv_offload_on) | 2x8192 | 18.5 | 149.8 | 205.0 | 53.8 | 59.6 | 931.3 | 5074.5 | 5106 | 52.1 |
+| blazar gateway - b11202-cuda (cache_q8_q8_0) | 2x8192 | 40.6 | 124.1 | 124.7 | 24.6 | 25.5 | 1312.3 | 7580.5 | 5338 | 55.5 |
+| blazar gateway - b11202-cuda (ctx_checkpoints_4) | 2x8192 | 41.0 | 120.9 | 124.8 | 24.3 | 25.5 | 1317.7 | 7538.2 | 5477 | 55.5 |
+| blazar gateway - b11202-cuda (spec_off) | 2x8192 | 41.6 | 119.2 | 131.7 | 24.0 | 25.2 | 1308.3 | 7349.5 | 5452 | 55.2 |
+| blazar gateway - b11202-cuda (deterministic_on) | 1x16384 | 41.1 | 122.8 | 123.6 | 24.3 | 25.4 | 1312.0 | 7424.7 | 5666 | 57.1 |
+| blazar gateway - b11202-cuda (mmproj_offload_off) | 2x8192 | 41.6 | 123.6 | 124.4 | 24.0 | 25.4 | 1313.7 | 7229.0 | 5458 | 56.6 |
+| blazar gateway - b11202-cuda (threads_batch_8) | 2x8192 | 41.0 | 125.7 | 173.8 | 24.3 | 25.5 | 1310.9 | 7246.5 | 5458 | 55.7 |
+| blazar gateway - b11202-cuda (cache_reuse_256) | 2x8192 | 41.0 | 124.8 | 174.7 | 24.4 | 25.6 | 1287.3 | 7243.0 | 5458 | 55.7 |
+| blazar gateway - b11202-cuda (kv_unified_per_slot_4096) | 2x8192 | 41.0 | 123.2 | 123.7 | 24.4 | 25.7 | 1330.7 | 7549.6 | 5458 | 55.3 |
+| blazar gateway - b11202-cuda (conc_default) | 2x8192 | - | - | - | - | 79.2 | - | - | 5464 | 55.7 |
+| blazar gateway - b11202-cuda (adaptive_slots_off) | 2x8192 | - | - | - | - | 61.9 | - | - | 5466 | 55.1 |
+| blazar gateway - b11202-cuda (poll_50) | 2x8192 | - | - | - | - | 30.3 | - | - | 5464 | 55.6 |
+| blazar gateway - v0.9.4 | 2x8192 | 41.1 | 122.2 | 124.4 | 24.3 | 25.7 | 1379.9 | 7160.5 | 5458 | 56.8 |
+| blazar gateway - v0.9.4 (paged_attn_off) | 2x8192 | 41.6 | 119.2 | 124.7 | 24.1 | 25.3 | 1370.2 | 7447.0 | 5458 | 55.7 |
+| blazar gateway - v0.9.4 (single-stream) | 1x16384 | 41.5 | 122.3 | 123.4 | 24.1 | 25.4 | 1403.8 | 7654.8 | 5666 | 55.7 |
+| blazar gateway - v0.9.4 (kv_unified_on) | 2x8192 | 41.1 | 124.0 | 125.2 | 24.3 | 25.6 | 1367.1 | 7414.7 | 5464 | 55.5 |
+| blazar gateway - v0.9.4 (kv_unified_off) | 2x8192 | 41.1 | 120.3 | 125.1 | 24.3 | 25.5 | 1312.5 | 7397.5 | 5465 | 56.8 |
+| blazar gateway - v0.9.4 (spec_off) | 2x8192 | 41.4 | 122.9 | 123.6 | 24.1 | 25.5 | 1325.0 | 7317.3 | 5458 | 56.5 |
+| blazar gateway - v0.9.4 (deterministic_on) | 1x16384 | 41.0 | 118.1 | 121.7 | 24.3 | 25.3 | 1313.0 | 7244.9 | 5666 | 56.4 |
+| blazar gateway - v0.9.4 (pa_mem_0.85) | 2x8192 | 41.1 | 122.2 | 124.5 | 24.3 | 25.5 | 1326.4 | 7667.6 | 5458 | 56.6 |
+| blazar gateway - v0.9.4 (pa_mem_0.55) | 2x8192 | 41.0 | 121.2 | 122.3 | 24.4 | 25.3 | 1316.9 | 7371.5 | 5458 | 55.7 |
+| blazar gateway - v0.9.4 (mr_batch_64) | 2x8192 | 41.6 | 122.6 | 125.6 | 24.1 | 25.2 | 1366.6 | 7352.9 | 5464 | 55.9 |
+| blazar gateway - v0.9.4 (mr_prefix_cache_256) | 2x8192 | 41.0 | 121.4 | 173.7 | 24.4 | 25.6 | 1314.6 | 7358.3 | 5464 | 55.9 |
+| blazar gateway - v0.9.4 (mr_enc_cache_512mb) | 2x8192 | 41.0 | 121.2 | 123.4 | 24.4 | 25.7 | 1369.8 | 7396.1 | 5464 | 57.1 |
+| direct engine - b11202-cuda | 1x16384 | 41.6 | 122.9 | 124.5 | 24.0 | 25.3 | 1308.9 | 7439.5 | 5666 | 55.9 |
+| direct engine - v0.9.4 | 1x16384 | 21.5 | 150.9 | 184.8 | 46.3 | 55.1 | 281.3 | 345.2 | 7042 | 44.9 |
+| ollama 0.33.3 - qwen3.5:9b | service | 40.6 | 125.8 | 132.3 | 24.9 | 75.0 | 1409.3 | 7372.4 | 6570 | 55.4 |
 
 ### Concurrency (4 parallel streams x 128 tokens)
 
 | Runtime | slots | ok streams | rounds | system t/s | sum-stream t/s | wall s | TTFT max ms | TTFT p99 ms | ITL p99 ms |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| direct engine - b11193-cuda | 4 | 4/4 | 1 | 112.8 | 118.1 | 4.54 | 244 | - | 36.0 |
-| blazar gateway - b11193-cuda | 2x8192 | 12/4 | 3 | 70.3 | 447.5 | 21.83 | 4075 | 4055 | 28.5 |
-| blazar gateway - v0.9.4 | 2x8192 | 12/4 | 3 | 70.4 | 447.8 | 21.82 | 4075 | 4054 | 28.4 |
-| ollama - qwen3.5:9b | service | 12/4 | 3 | 34.3 | 489.7 | 44.82 | 15676 | 15317 | 74.3 |
+| direct engine - b11202-cuda | 4 | 4/4 | 1 | 110.6 | 116.7 | 4.63 | 276 | - | 41.4 |
+| blazar gateway - b11202-cuda | 2x8192 | 12/4 | 3 | 67.5 | 433.1 | 22.75 | 4205 | 4204 | 81.3 |
+| blazar gateway - v0.9.4 | 2x8192 | 12/4 | 3 | 67.4 | 434.3 | 22.79 | 4216 | 4213 | 32.8 |
+| ollama - qwen3.5:9b | service | 12/4 | 3 | 33.4 | 486.9 | 45.98 | 16572 | 16213 | 74.7 |
 
 _sum-stream >> system t/s means streams serialize on one slot; roughly equal means genuinely parallel._
 
@@ -111,37 +139,37 @@ _sum-stream >> system t/s means streams serialize on one slot; roughly equal mea
 
 | Runtime | C | ok streams | system t/s | sum-stream t/s | eff vs C=1 | TTFT p99 ms | ITL p99 ms |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| blazar gateway - b11193-cuda | 4 | 12 | 70.3 | 447.5 | - | 4055 | 28.5 |
-| blazar gateway - v0.9.4 | 4 | 12 | 70.4 | 447.8 | - | 4054 | 28.4 |
-| direct engine - b11193-cuda | 4 | 4 | 112.8 | 118.1 | - | - | 36.0 |
-| ollama - qwen3.5:9b | 4 | 12 | 34.3 | 489.7 | - | 15317 | 74.3 |
+| blazar gateway - b11202-cuda | 4 | 12 | 67.5 | 433.1 | - | 4204 | 81.3 |
+| blazar gateway - v0.9.4 | 4 | 12 | 67.4 | 434.3 | - | 4213 | 32.8 |
+| direct engine - b11202-cuda | 4 | 4 | 110.6 | 116.7 | - | - | 41.4 |
+| ollama - qwen3.5:9b | 4 | 12 | 33.4 | 486.9 | - | 16213 | 74.7 |
 
-- blazar gateway - b11193-cuda: 1 level(s) measured - insufficient levels for a saturation verdict.
+- blazar gateway - b11202-cuda: 1 level(s) measured - insufficient levels for a saturation verdict.
 - blazar gateway - v0.9.4: 1 level(s) measured - insufficient levels for a saturation verdict.
-- direct engine - b11193-cuda: 1 level(s) measured - insufficient levels for a saturation verdict.
+- direct engine - b11202-cuda: 1 level(s) measured - insufficient levels for a saturation verdict.
 - ollama - qwen3.5:9b: 1 level(s) measured - insufficient levels for a saturation verdict.
 
 ### Adaptive reshape under sustained load (no-lag proof)
 
 | Runtime | reshape | slots | time to reshape s | req before/after | TTFT p50 before→after ms | sys t/s before→after | failed |
 |---|---|---|---:|---:|---:|---:|---:|
-| blazar gateway - b11193-cuda | NO | -→- | - | 118/0 | 16177→- | 36→- | 0 |
-| blazar gateway - v0.9.4 | NO | -→- | - | 118/0 | 15993→- | 36→- | 0 |
+| blazar gateway - b11202-cuda | NO | -→- | - | 116/0 | 16327→- | 35→- | 0 |
+| blazar gateway - v0.9.4 | NO | -→- | - | 116/0 | 16333→- | 35→- | 0 |
 
 ### Perplexity
 
 | Engine | perplexity (ctx 2048, offline ASCII corpus) |
 |---|---:|
-| b11193-cuda | 17.35 ± 0.92 |
-| v0.9.4 | not applicable (tool is llama.cpp-family) |
+| b11202-cuda | 17.35 ± 0.92 |
+| v0.9.4 | 17.35 ± 0.92 |
 
 ### Greedy parity and gateway transparency (20 prompts, 256 tokens)
 
 | Comparison | exact / total | ratio mean | ratio min |
 |---|---:|---:|---:|
-| b11193-cuda vs same-engine reference (direct) | 20/20 | 1.000 | 1.000 |
-| v0.9.4 vs same-engine reference (direct) | None/None | - | - |
-| b11193-cuda through blazar gateway vs direct | 19/20 | 0.951 | 0.017 |
+| b11202-cuda vs same-engine reference (direct) | 20/20 | 1.000 | 1.000 |
+| v0.9.4 vs same-engine reference (direct) | 0/20 | 0.514 | 0.000 |
+| b11202-cuda through blazar gateway vs direct | 16/20 | 0.940 | 0.017 |
 
 _Exact-match divergence across GPU backends is expected float nondeterminism (batch shape and backend kernels), not translation drift; bit-parity across runs requires single-slot decoding (blazar `deterministic = true` pins it)._
 
@@ -149,22 +177,64 @@ _Exact-match divergence across GPU backends is expected float nondeterminism (ba
 
 | Runtime | scenarios | well-formed | selection | args valid | control FP | TTFT p50 ms |
 |---|---:|---:|---:|---:|---|---:|
-| blazar gateway - b11193-cuda | 6 | 4/6 | 4/5 | 4/5 | no | 115 |
-| blazar gateway - v0.9.4 | 6 | 4/6 | 4/5 | 4/5 | no | 114 |
-| ollama - qwen3.5:9b | 6 | 4/6 | 4/5 | 4/5 | no | 288 |
+| blazar gateway - b11202-cuda | 6 | 4/6 | 4/5 | 4/5 | no | 114 |
+| blazar gateway - v0.9.4 | 6 | 4/6 | 4/5 | 4/5 | no | 113 |
+| ollama - qwen3.5:9b | 6 | 4/6 | 4/5 | 4/5 | no | 283 |
 
 
 ### Optimization axes (ctx 4096, single stream)
 
 | Engine | axis | setting | decode t/s | delta vs dense | prefill cold t/s | delta |
 |---|---|---|---:|---:|---:|---:|
-| b11193-cuda | kv | q8_0 | 41.0 | -0.5 | 1363.0 | 56.1 |
-| b11193-cuda | spec | ngram-simple | 41.0 | -0.5 | 1327.2 | 20.3 |
-| b11193-cuda | mmproj | True | 41.7 | 0.2 | 1345.7 | 38.8 |
+| b11202-cuda | kv | q8_0 | 41.0 | -0.2 | 1389.3 | 123.8 |
+| b11202-cuda | pa | on | 41.5 | 0.2 | 1316.2 | 50.8 |
+| b11202-cuda | spec | ngram-simple | 41.0 | -0.2 | 1334.6 | 69.2 |
+| b11202-cuda | mmproj | True | 41.4 | 0.2 | 1309.8 | 44.4 |
+| v0.9.4 | pa | off | 18.2 | -3.0 | 204.2 | -69.6 |
+
+### Gateway config knobs (on/off vs default profile)
+
+| Engine | config | decode t/s | decode Δ% | ttft p50 ms | ttft Δ% | GPU peak MiB | GPU Δ | output vs default |
+|---|---|---:|---:|---:|---:|---:|---:|:-:|
+| b11202-cuda | single-stream | 41.6 | +1.0% | 125 | +0.6% | 5666 | +208 | ✓ same |
+| b11202-cuda | cont_batching_off | 41.0 | -0.3% | 125 | +0.4% | 5458 | +0 | ✓ same |
+| b11202-cuda | fa_on | 41.0 | -0.2% | 124 | +0.2% | 5458 | +0 | ✓ same |
+| b11202-cuda | fa_off | 40.7 | -0.9% | 160 | +29.1% | 5696 | +238 | ✓ same |
+| b11202-cuda | kv_unified_on | 41.0 | -0.3% | 122 | -2.1% | 5458 | +0 | ✓ same |
+| b11202-cuda | kv_unified_off | 41.0 | -0.3% | 123 | -0.8% | 5458 | +0 | ✓ same |
+| b11202-cuda | swa_full_on | 41.6 | +1.1% | 123 | -1.3% | 5458 | +0 | ✓ same |
+| b11202-cuda | no_kv_offload_on | 18.5 | -54.9% | 150 | +20.6% | 5106 | -352 | ✓ same |
+| b11202-cuda | cache_q8_q8_0 | 40.6 | -1.2% | 124 | -0.1% | 5338 | -120 | ✓ same |
+| b11202-cuda | ctx_checkpoints_4 | 41.0 | -0.3% | 121 | -2.6% | 5477 | +19 | ✓ same |
+| b11202-cuda | spec_off | 41.6 | +1.0% | 119 | -4.0% | 5452 | -6 | ✓ same |
+| b11202-cuda | deterministic_on | 41.1 | -0.2% | 123 | -1.1% | 5666 | +208 | ✓ same |
+| b11202-cuda | mmproj_offload_off | 41.6 | +1.1% | 124 | -0.5% | 5458 | +0 | ✓ same |
+| b11202-cuda | threads_batch_8 | 41.0 | -0.3% | 126 | +1.2% | 5458 | +0 | ✓ same |
+| b11202-cuda | cache_reuse_256 | 41.0 | -0.4% | 125 | +0.5% | 5458 | +0 | ✓ same |
+| b11202-cuda | kv_unified_per_slot_4096 | 41.0 | -0.4% | 123 | -0.8% | 5458 | +0 | ✓ same |
+| v0.9.4 | paged_attn_off | 41.6 | +1.1% | 119 | -2.5% | 5458 | +0 | ✓ same |
+| v0.9.4 | single-stream | 41.5 | +0.9% | 122 | +0.1% | 5666 | +208 | ✓ same |
+| v0.9.4 | kv_unified_on | 41.1 | -0.1% | 124 | +1.5% | 5464 | +6 | ✓ same |
+| v0.9.4 | kv_unified_off | 41.1 | -0.1% | 120 | -1.5% | 5465 | +7 | ✓ same |
+| v0.9.4 | spec_off | 41.4 | +0.8% | 123 | +0.6% | 5458 | +0 | ✓ same |
+| v0.9.4 | deterministic_on | 41.0 | -0.2% | 118 | -3.3% | 5666 | +208 | ✓ same |
+| v0.9.4 | pa_mem_0.85 | 41.1 | -0.1% | 122 | -0.0% | 5458 | +0 | ✓ same |
+| v0.9.4 | pa_mem_0.55 | 41.0 | -0.2% | 121 | -0.8% | 5458 | +0 | ✓ same |
+| v0.9.4 | mr_batch_64 | 41.6 | +1.1% | 123 | +0.3% | 5464 | +6 | ✓ same |
+| v0.9.4 | mr_prefix_cache_256 | 41.0 | -0.3% | 121 | -0.6% | 5464 | +6 | ✓ same |
+| v0.9.4 | mr_enc_cache_512mb | 41.0 | -0.3% | 121 | -0.8% | 5464 | +6 | ✓ same |
+
+### Gateway scheduler knobs under concurrent load (C=8 bursts)
+
+| Engine | config | sys tok/s | sys Δ% | ttft p99 ms | ttft Δ% | GPU peak MiB | GPU Δ | errs |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| b11202-cuda | conc_default | 58.6 | +0.0% | 16238 | +0.0% | 5464 | +0 | 0 |
+| b11202-cuda | adaptive_slots_off | 58.9 | +0.5% | 16537 | +1.8% | 5466 | +2 | 0 |
+| b11202-cuda | poll_50 | 58.7 | +0.1% | 16600 | +2.2% | 5464 | +0 | 0 |
 
 ### Engine capability matrix
 
-| Capability | b11193-cuda | v0.9.4 |
+| Capability | b11202-cuda | v0.9.4 |
 |---|---:|---:|
 | anthropic-api | no | yes |
 | ctx-override | yes | yes |
@@ -187,13 +257,41 @@ _Exact-match divergence across GPU backends is expected float nondeterminism (ba
 
 | Runtime | daemon boot s | first request (cold engine load) s | cold TTFT ms | engine load s | RSS peak MiB |
 |---|---:|---:|---:|---:|---:|
-| blazar gateway - b11193-cuda | 0.54 | 4.94 | 4781 | - | 1983 |
-| blazar gateway - b11193-cuda | 0.52 | 4.90 | 4827 | - | 1987 |
-| blazar gateway - v0.9.4 | 0.52 | 4.57 | 4425 | - | 1984 |
-| blazar gateway - v0.9.4 | 0.52 | 4.56 | 4409 | - | 1984 |
-| blazar gateway - v0.9.4 | 0.52 | 4.54 | 4467 | - | 1987 |
-| direct engine - b11193-cuda | - | - | - | 2.51 | 5714 |
-| ollama - qwen3.5:9b | - | 4.32 | 4242 | 4.14 | - |
+| blazar gateway - b11202-cuda | 0.53 | 5.08 | 4929 | - | 2202 |
+| blazar gateway - b11202-cuda | 0.52 | 4.95 | 4872 | - | 2104 |
+| blazar gateway - b11202-cuda | 0.52 | 4.79 | 4702 | - | 2103 |
+| blazar gateway - b11202-cuda | 0.52 | 4.79 | 4639 | - | 2101 |
+| blazar gateway - b11202-cuda | 0.52 | 4.88 | 4719 | - | 2345 |
+| blazar gateway - b11202-cuda | 0.52 | 4.87 | 4697 | - | 2152 |
+| blazar gateway - b11202-cuda | 0.52 | 4.93 | 4783 | - | 2196 |
+| blazar gateway - b11202-cuda | 0.52 | 4.91 | 4766 | - | 2102 |
+| blazar gateway - b11202-cuda | 0.52 | 5.54 | 5310 | - | 2465 |
+| blazar gateway - b11202-cuda | 0.52 | 4.95 | 4794 | - | 2084 |
+| blazar gateway - b11202-cuda | 0.52 | 4.49 | 4342 | - | 2102 |
+| blazar gateway - b11202-cuda | 0.52 | 4.64 | 4493 | - | 2102 |
+| blazar gateway - b11202-cuda | 0.52 | 4.80 | 4727 | - | 2105 |
+| blazar gateway - b11202-cuda | 0.51 | 4.86 | 4714 | - | 2102 |
+| blazar gateway - b11202-cuda | 0.52 | 4.83 | 4675 | - | 2203 |
+| blazar gateway - b11202-cuda | 0.52 | 4.83 | 4680 | - | 2202 |
+| blazar gateway - b11202-cuda | 0.52 | 4.82 | 4676 | - | 2102 |
+| blazar gateway - b11202-cuda | - | - | - | - | 0 |
+| blazar gateway - b11202-cuda | - | - | - | - | 0 |
+| blazar gateway - b11202-cuda | - | - | - | - | 0 |
+| blazar gateway - v0.9.4 | 0.52 | 4.63 | 4480 | - | 2101 |
+| blazar gateway - v0.9.4 | 0.52 | 4.62 | 4461 | - | 2102 |
+| blazar gateway - v0.9.4 | 0.52 | 4.60 | 4524 | - | 2105 |
+| blazar gateway - v0.9.4 | 0.52 | 4.58 | 4422 | - | 2129 |
+| blazar gateway - v0.9.4 | 0.52 | 4.62 | 4439 | - | 2196 |
+| blazar gateway - v0.9.4 | 0.52 | 4.68 | 4500 | - | 2102 |
+| blazar gateway - v0.9.4 | 0.52 | 4.68 | 4581 | - | 2104 |
+| blazar gateway - v0.9.4 | 0.52 | 4.64 | 4483 | - | 2101 |
+| blazar gateway - v0.9.4 | 0.53 | 4.64 | 4492 | - | 2101 |
+| blazar gateway - v0.9.4 | 0.52 | 4.58 | 4433 | - | 2102 |
+| blazar gateway - v0.9.4 | 0.52 | 4.59 | 4439 | - | 2202 |
+| blazar gateway - v0.9.4 | 0.52 | 4.58 | 4430 | - | 2101 |
+| direct engine - b11202-cuda | - | - | - | 2.51 | 5715 |
+| direct engine - v0.9.4 | - | - | - | 8.51 | 7952 |
+| ollama - qwen3.5:9b | - | 5.54 | 5446 | 5.32 | - |
 
 _Every cold probe runs page-cache-dropped and GPU-idle-asserted on both runtimes; ollama rows without --ollama-service-restart leave the daemon warm (note in the artifact)._
 
@@ -201,9 +299,9 @@ _Every cold probe runs page-cache-dropped and GPU-idle-asserted on both runtimes
 
 | Runtime | idle policy | policy observed | wake TTFT ms | reload s | note |
 |---|---|---|---:|---:|---|
-| blazar - b11193-cuda | sleep at 15s (weights stay RAM-resident) | yes | 3056 | - |  |
-| blazar - v0.9.4 | sleep at 15s (weights stay RAM-resident) | yes | 2972 | - |  |
-| ollama - qwen3.5:9b | keep_alive 20s -> full unload | yes | 4934 | 4.81 |  |
+| blazar - b11202-cuda | sleep at 15s (weights stay RAM-resident) | yes | 4615 | - |  |
+| blazar - v0.9.4 | sleep at 15s (weights stay RAM-resident) | yes | 3727 | - |  |
+| ollama - qwen3.5:9b | keep_alive 20s -> full unload | yes | 5958 | 5.83 |  |
 
 _blazar sleeps with weights in RAM (wake = resume); ollama unloads at keep_alive expiry (wake = full disk reload). Policies differ by design — the table measures each runtime's own idle path after the policy verifiably fired._
 
@@ -211,44 +309,56 @@ _blazar sleeps with weights in RAM (wake = resume); ollama unloads at keep_alive
 
 | Runtime | ctx | decode t/s | TTFT p50 ms |
 |---|---:|---:|---:|
-| blazar - b11193-cuda | 2048 | 41.7 | 110 |
-| blazar - b11193-cuda | 8192 | 41.7 | 110 |
-| blazar - b11193-cuda | 16384 | 41.8 | 108 |
-| blazar - v0.9.4 | 2048 | 41.7 | 110 |
-| blazar - v0.9.4 | 8192 | 41.7 | 108 |
-| blazar - v0.9.4 | 16384 | 41.8 | 113 |
-| ollama - qwen3.5:9b | 2048 | 40.9 | 111 |
-| ollama - qwen3.5:9b | 8192 | 40.8 | 118 |
-| ollama - qwen3.5:9b | 16384 | 40.9 | 110 |
+| blazar - b11202-cuda | 2048 | 41.5 | 125 |
+| blazar - b11202-cuda | 8192 | 41.4 | 122 |
+| blazar - b11202-cuda | 16384 | 41.0 | 122 |
+| blazar - v0.9.4 | 2048 | 41.0 | 123 |
+| blazar - v0.9.4 | 8192 | 41.0 | 122 |
+| blazar - v0.9.4 | 16384 | 41.7 | 120 |
+| ollama - qwen3.5:9b | 2048 | 40.5 | 135 |
+| ollama - qwen3.5:9b | 8192 | 40.5 | 128 |
+| ollama - qwen3.5:9b | 16384 | 40.6 | 130 |
 
 ### Media lanes (image / video / TTS / whisper)
 
 | Lane | cold s | median s | min s | max s | ground truth | gate reject s | TTFB speedup |
 |---|---:|---:|---:|---:|---|---:|---:|
-| image - qwen-image-2.1-uncensored (512x512, steps=[4]) | 58.79 | 50.13 | 49.58 | 52.94 | 512x512 PNG, entropy 7.3 bits, contrast 68.5 |  |  |
-| video - wan_2.1_comfyui_repackaged (320x320, steps=8) | 41.23 | 11.07 | 11.07 | 11.08 | 5f: mux==reported==aligned | 0.001 |  |
-| video - wan_2.1_comfyui_repackaged (320x320, steps=8) | - | 22.10 | 22.10 | 22.10 | 13f: mux==reported==aligned |  |  |
-| video - wan_2.1_comfyui_repackaged (320x320, steps=8) | - | 52.16 | 52.15 | 52.17 | 33f: mux==reported==aligned |  |  |
-| tts - en_US-amy-medium (840 chars, wav+pcm) | - | 1.93 | - | 3.17 | RTF wav 0.032 / pcm 0.052 (60s audio) |  | 4.03x |
-| tts-conc - en_US-amy-medium (400 chars x4 pcm) | - | 4.50 | 4.58 | - | efficiency 3.91 of 4 streams |  | 1481ms max TTFB |
-| whisper - ggml-base (transcribes piper wav) | 2.16 | 1.90 | - | - | RTF 0.062 |  |  |
+| image - qwen-image-2.1-uncensored (512x512, steps=[4]) | 60.42 | 47.34 | 46.88 | 49.25 | 512x512 PNG, entropy 7.1 bits, contrast 67.5 |  |  |
+| image - qwen-image-2.1-uncensored (512x512, steps=[4]) | 63.31 | 52.21 | 52.16 | 52.30 | 512x512 PNG, entropy 7.4 bits, contrast 67.1 |  |  |
+| image - qwen-image-2.1-uncensored (512x512, steps=[4]) | 56.76 | 46.59 | 46.49 | 46.60 | 512x512 PNG, entropy 7.2 bits, contrast 63.1 |  |  |
+| image - qwen-image-2.1-uncensored (512x512, steps=[4]) | 57.62 | 45.59 | 45.39 | 45.61 | 512x512 PNG, entropy 7.2 bits, contrast 75.3 |  |  |
+| video - wan_2.1_comfyui_repackaged (320x320, steps=8) | 38.24 | 11.08 | 11.08 | 11.08 | 5f: mux==reported==aligned | 0.001 |  |
+| video - wan_2.1_comfyui_repackaged (320x320, steps=8) | - | 22.11 | 22.09 | 22.14 | 13f: mux==reported==aligned |  |  |
+| video - wan_2.1_comfyui_repackaged (320x320, steps=8) | - | 52.17 | 52.17 | 52.19 | 33f: mux==reported==aligned |  |  |
+| tts - en_US-amy-medium (840 chars, wav+pcm) | - | 2.05 | - | 3.55 | RTF wav 0.034 / pcm 0.059 (60s audio) |  | 3.99x |
+| tts-conc - en_US-amy-medium (400 chars x4 pcm) | - | 4.95 | 5.09 | - | efficiency 3.74 of 4 streams |  | 1768ms max TTFB |
+| whisper - ggml-base (transcribes piper wav) | 2.39 | 2.10 | - | - | RTF 0.069 |  |  |
+
+| Engine | config | median total s | Δ% vs default | cold request s |
+|---|---|---:|---:|---:|
+| master-920-2f88688 | fa_off | 52.2 | +10.3% | 63.3 |
+| master-920-2f88688 | vae_tiling_on | 46.6 | -1.6% | 56.8 |
+| master-920-2f88688 | sage_attn_on | 45.6 | -3.7% | 57.6 |
 
 _Media cells run through the same sandboxed gateway as text lanes but do not assert GPU-idle: a warm engine child is the normal serving shape, so each row stamps gpu_busy_mib / ram_avail_mib / loadavg instead. 3 runs (not 5) — media variance is dominated by the model, not the scheduler. Video frame counts are read from the EBML container (lacing-aware), never from an API field; the VRAM gate probe times how fast an over-budget request is rejected with a teaching error._
 
 ## Findings (this campaign)
 
-1. **Gateway overhead vs direct spawn: within measurement noise.** b11193-cuda decode 41.5 t/s through the gateway vs 41.4 t/s direct (+0.2%), greedy parity through the gateway 19/20 exact.
+1. **Gateway overhead vs direct spawn: within measurement noise.** b11202-cuda decode 41.1 t/s through the gateway vs 41.6 t/s direct (-1.3%), greedy parity through the gateway 16/20 exact.
 2. **Capacity-aware slot auto-sizing observed in argv.** Distinct engine shapes this campaign: 1x16384, 2x8192 - slots follow the live hardware census, each row's child_argv carries the receipt.
-3. **Concurrency scaling per engine.** b11193-cuda (C=4): peak 70.3 t/s at C=4; v0.9.4 (C=4): peak 70.4 t/s at C=4; serialization behavior per level in the frontier table below.
-4. **Prompt cache pays 5.6x on prefill** (7276 cached vs 1307 t/s cold).
-5. **Speculative n-gram decoding is a net loss for this model** (decode 41.0 t/s, -0.5 vs dense baseline) - measured, not assumed.
-6. **KV quantization (q8_0) is decode-neutral** (decode 41.0 t/s vs 41.5 dense).
-7. **Tool-call quality (single-turn, temp 0).** b11193-cuda: selection 4/5, args 4/5 (control clean); v0.9.4: selection 4/5, args 4/5 (control clean); ollama: selection 4/5, args 4/5 (control clean); per-scenario detail in cells.jsonl.
-8. **Adaptive reshape lands under sustained load.** b11193-cuda: no reshape observed in the lane window; v0.9.4: no reshape observed in the lane window (graceful-drain: adoption waits for in-flight streams, never kills one).
-9. **Image quality stamps (PIL, luma domain): entropy 7.30 bits, rms contrast 68.5, 29348 unique colors @256x256** on qwen-image-2.1-uncensored - perceptual baseline for cross-run comparisons; audit PNG saved beside the cells.
-10. **Video VRAM gate rejects an over-budget request in 1 ms** with the full estimate math and override levers in the error body - instead of an opaque child abort minutes later.
-11. **Streamed PCM cuts time-to-first-audio 4.03x vs buffered WAV** (piper lane, first audio 0.48s vs 1.93s full synthesis) - total wall time is slightly higher (per-chunk synthesis), the win is interactivity.
-12. **4 parallel PCM streams through one gateway: perfectly parallel** (efficiency 3.91 = sum of per-stream totals / 4.58s wall, max TTFB 1481 ms, NON-uniform stream outputs - flagged) - the scalability receipt for the TTS lane.
+3. **Concurrency scaling per engine.** b11202-cuda (C=4): peak 67.5 t/s at C=4; v0.9.4 (C=4): peak 67.4 t/s at C=4; serialization behavior per level in the frontier table below.
+4. **Prompt cache pays 5.8x on prefill** (7374 cached vs 1265 t/s cold).
+5. **Speculative n-gram decoding is a net loss for this model** (decode 41.0 t/s, -0.2 vs dense baseline) - measured, not assumed.
+6. **KV quantization (q8_0) is decode-neutral** (decode 41.0 t/s vs 41.2 dense).
+7. **Tool-call quality (single-turn, temp 0).** b11202-cuda: selection 4/5, args 4/5 (control clean); v0.9.4: selection 4/5, args 4/5 (control clean); ollama: selection 4/5, args 4/5 (control clean); per-scenario detail in cells.jsonl.
+8. **Adaptive reshape lands under sustained load.** b11202-cuda: no reshape observed in the lane window; v0.9.4: no reshape observed in the lane window (graceful-drain: adoption waits for in-flight streams, never kills one).
+9. **Image quality stamps (PIL, luma domain): entropy 7.14 bits, rms contrast 67.5, 27748 unique colors @256x256** on qwen-image-2.1-uncensored - perceptual baseline for cross-run comparisons; audit PNG saved beside the cells.
+10. **Image quality stamps (PIL, luma domain): entropy 7.39 bits, rms contrast 67.1, 33142 unique colors @256x256** on qwen-image-2.1-uncensored - perceptual baseline for cross-run comparisons; audit PNG saved beside the cells.
+11. **Image quality stamps (PIL, luma domain): entropy 7.15 bits, rms contrast 63.1, 27511 unique colors @256x256** on qwen-image-2.1-uncensored - perceptual baseline for cross-run comparisons; audit PNG saved beside the cells.
+12. **Image quality stamps (PIL, luma domain): entropy 7.22 bits, rms contrast 75.3, 29751 unique colors @256x256** on qwen-image-2.1-uncensored - perceptual baseline for cross-run comparisons; audit PNG saved beside the cells.
+13. **Video VRAM gate rejects an over-budget request in 1 ms** with the full estimate math and override levers in the error body - instead of an opaque child abort minutes later.
+14. **Streamed PCM cuts time-to-first-audio 3.99x vs buffered WAV** (piper lane, first audio 0.51s vs 2.05s full synthesis) - total wall time is slightly higher (per-chunk synthesis), the win is interactivity.
+15. **4 parallel PCM streams through one gateway: perfectly parallel** (efficiency 3.74 = sum of per-stream totals / 5.09s wall, max TTFB 1768 ms, NON-uniform stream outputs - flagged) - the scalability receipt for the TTS lane.
 
 ## Carried-over findings (no receipt in this campaign)
 
@@ -271,4 +381,4 @@ python3 scripts/bench_matrix.py --blazar-bin target/release/blazar --md BENCHMAR
 python3 scripts/bench_matrix.py --render-only --artifacts-dir <dir> --md BENCHMARK.md
 ```
 
-_Raw per-cell records (argv, per-run lists, daemon logs): `bench-artifacts/20260926-sdcpp-lane/cells.jsonl`._
+_Raw per-cell records (argv, per-run lists, daemon logs): `bench-artifacts/20260928-gguf-full/cells.jsonl`._

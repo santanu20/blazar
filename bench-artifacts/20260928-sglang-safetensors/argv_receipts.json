@@ -1,0 +1,56 @@
+{
+  "default": {
+    "cfg": {},
+    "child_cmdlines": [
+      "/home/santanu/.local/share/blazar/engines/sglang-0.5.19/venv/bin/python -m sglang.launch_server --model-path /home/santanu/.local/share/blazar/models/qwen3-1.7b.d --host 127.0.0.1 --port 46461 --served-model-name qwen3-1.7b --context-length 16384 --kv-cache-dtype fp8_e5m2 --cpu-offload-gb 5 --cuda-graph-max-bs 4 --chunked-prefill-size 2048 --mem-fraction-static 0.643 --attention-backend triton --sampling-backend pytorch --enable-cache-report --api-key plm_0d3fb3224a09a2b66655d35b6c053d3d9e4476aad8b2c6f5"
+    ],
+    "server_args_lines": [],
+    "warn_lines": []
+  },
+  "kv_unified_on": {
+    "cfg": {
+      "kv_unified": true
+    },
+    "child_cmdlines": [
+      "/home/santanu/.local/share/blazar/engines/sglang-0.5.19/venv/bin/python -m sglang.launch_server --model-path /home/santanu/.local/share/blazar/models/qwen3-1.7b.d --host 127.0.0.1 --port 33097 --served-model-name qwen3-1.7b --context-length 16384 --mem-fraction-static 0.729 --attention-backend triton --sampling-backend pytorch --enable-cache-report --api-key plm_80106fc9313019e4c7a5554c6f6aef2053c504bb31d2ccaa"
+    ],
+    "server_args_lines": [],
+    "warn_lines": []
+  },
+  "radix_session_on": {
+    "cfg": {
+      "sglang": {
+        "session_radix_cache": true
+      }
+    },
+    "child_cmdlines": [
+      "/home/santanu/.local/share/blazar/engines/sglang-0.5.19/venv/bin/python -m sglang.launch_server --model-path /home/santanu/.local/share/blazar/models/qwen3-1.7b.d --host 127.0.0.1 --port 36151 --served-model-name qwen3-1.7b --context-length 16384 --mem-fraction-static 0.729 --attention-backend triton --sampling-backend pytorch --enable-session-radix-cache --enable-cache-report --api-key plm_a7d8ce74a7875049489894e627a49e18b0802d09acacf1c1"
+    ],
+    "server_args_lines": [],
+    "warn_lines": []
+  },
+  "chunked_prefill_4096": {
+    "cfg": {
+      "sglang": {
+        "chunked_prefill_size": 4096
+      }
+    },
+    "child_cmdlines": [
+      "/home/santanu/.local/share/blazar/engines/sglang-0.5.19/venv/bin/python -m sglang.launch_server --model-path /home/santanu/.local/share/blazar/models/qwen3-1.7b.d --host 127.0.0.1 --port 38641 --served-model-name qwen3-1.7b --context-length 16384 --mem-fraction-static 0.729 --attention-backend triton --sampling-backend pytorch --chunked-prefill-size 4096 --enable-cache-report --api-key plm_89778e8d734fa742528c72d8af802e98f831f40ae9989248"
+    ],
+    "server_args_lines": [],
+    "warn_lines": []
+  },
+  "page_64": {
+    "cfg": {
+      "sglang": {
+        "page_size": 64
+      }
+    },
+    "child_cmdlines": [
+      "/home/santanu/.local/share/blazar/engines/sglang-0.5.19/venv/bin/python -m sglang.launch_server --model-path /home/santanu/.local/share/blazar/models/qwen3-1.7b.d --host 127.0.0.1 --port 34143 --served-model-name qwen3-1.7b --context-length 16384 --mem-fraction-static 0.729 --attention-backend triton --sampling-backend pytorch --page-size 64 --enable-cache-report --api-key plm_646b39fe5b6b0fed76f217faa51b97a11f90d86cc7bd60c0"
+    ],
+    "server_args_lines": [],
+    "warn_lines": []
+  }
+}
