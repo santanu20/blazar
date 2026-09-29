@@ -33,3 +33,7 @@ sglang-0.5.19 | sglang | reshape | {'reshape': True} | - | - | - | - | - | - | -
 sglang-0.5.19 | sglang | tools | {'tools': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
 ollama-host | ollama | tools-ollama | {'tools': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
 sglang-0.5.19 | sglang | features | {'features': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+sglang-0.5.19 | sglang | blazar | {'config': 'kv_dtype_bf16'} | 33 | 34 | 14.74 | 15.48 | 67.71 | 7216.5 | 10941.7 | - | 6416 | 55.3 | 0 | chunks
+sglang-0.5.19 | sglang | blazar | {'config': 'kv_dtype_e4m3'} | 33 | 34 | 14.84 | 15.6 | 67.39 | 6344.3 | 10978.3 | - | 6474 | 55.1 | 0 | chunks
+sglang-0.5.19 | sglang | blazar | {'config': 'cg_bs_16'} | 33 | 34 | 14.81 | 15.33 | 67.64 | 7301.1 | 10972.5 | - | 6470 | 55.6 | 0 | chunks
+sglang-0.5.19 | sglang | blazar | {'config': 'cg_bs_256'} | 33 | 33 | 14.82 | 15.49 | 67.62 | 7229.4 | 10967.7 | - | 6804 | 55.2 | 0 | chunks

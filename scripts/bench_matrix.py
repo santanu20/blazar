@@ -4298,6 +4298,34 @@ def run_greedy_gateway_cell(
 # features lane
 
 
+def manifest_flags(data_dir: Path, tag: str) -> set[str]:
+    """Long-flag set from an engine's installed manifest (product
+    `--help` probe output, stored in the engines table at install time).
+
+    Gateway-routed lanes (sglang, media kinds) have no server binary on
+    the harness path to introspect, but the product already probed the
+    real binary — the manifest is the honest flag source for gating
+    variant axes on actual child capability."""
+    try:
+        con = sqlite3.connect(f"file:{data_dir / 'blazar.db'}?mode=ro", uri=True)
+        try:
+            row = con.execute(
+                "SELECT manifest FROM engines WHERE tag = ?", (tag,)
+            ).fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return set()
+    if not row or not row[0]:
+        return set()
+    try:
+        mani = json.loads(row[0])
+    except json.JSONDecodeError:
+        return set()
+    flags = mani.get("flags") or []
+    return {f for f in flags if isinstance(f, str) and f.startswith("--")}
+
+
 def cli_flags(binary: Path | None, sub: list[str]) -> set[str]:
     if binary is None:
         return set()
@@ -5263,9 +5291,10 @@ def main() -> int:
     eng_flags: dict[str, set[str]] = {}
     for eng in engines:
         if eng.server is None:
-            # media kinds (sdcpp/whisper): no introspectable server
-            # binary on the harness path — the gateway owns the spawn
-            eng_flags[eng.tag] = set()
+            # gateway-routed lanes (sglang, media kinds): no
+            # introspectable server binary on the harness path — gate
+            # axes on the product's probed manifest flags instead
+            eng_flags[eng.tag] = manifest_flags(data_dir, eng.tag)
         elif eng.kind == "mistralrs":
             eng_flags[eng.tag] = cli_flags(eng.server, ["serve", "--help"])
         else:
@@ -6954,6 +6983,31 @@ CONFIG_AXES: list[dict] = [
         "gate": (),
         # decode speed vs compile-time boot cost (daemon_boot_s carries it)
         "cells": [("on", {"sglang": {"torch_compile": True}})],
+    },
+    {
+        # default = auto heuristic (fp8_e5m2 on this box); bf16 pins the
+        # full-width 2-byte KV (quality ceiling, doubles KV bytes — may
+        # tighten the fit at long ctx), e4m3 swaps the fp8 variant
+        "name": "kv_dtype",
+        "kinds": ("sglang",),
+        "gate": ("--kv-cache-dtype",),
+        "cells": [
+            ("bf16", {"sglang": {"kv_cache_dtype": "bf16"}}),
+            ("e4m3", {"sglang": {"kv_cache_dtype": "fp8_e4m3"}}),
+        ],
+    },
+    {
+        # default = product auto-cap (4 on tight cards); 16 is a modest
+        # bump, 256 is the sglang upstream default — on 8 GiB the 256
+        # capture is expected to OOM, which receipts exactly why the
+        # auto-cap exists
+        "name": "cg_bs",
+        "kinds": ("sglang",),
+        "gate": ("--cuda-graph-max-bs",),
+        "cells": [
+            ("16", {"sglang": {"cuda_graph_max_bs": 16}}),
+            ("256", {"sglang": {"cuda_graph_max_bs": 256}}),
+        ],
     },
 ]
 

@@ -539,6 +539,7 @@ with tempfile.TemporaryDirectory() as td:
     assert "crashed" in d2, "3 identical error rows cap the cell"
     print("load_done attempts cap: ok/1-err/2-err/3-err OK")
 
+# manifest_flags: gateway-routed engines gate variant axes on the
 # product's probed manifest flags — json parse keeps only long flags,
 # missing manifest / missing db degrade to the empty set
 with tempfile.TemporaryDirectory() as td:
@@ -551,7 +552,11 @@ with tempfile.TemporaryDirectory() as td:
     con.execute("INSERT INTO engines VALUES ('gone','sglang',NULL)")
     con.commit()
     con.close()
+    got = bm.manifest_flags(Path(td), "sglang-0.5.19")
     assert got == {"--kv-cache-dtype", "--cuda-graph-max-bs"}, got
+    assert bm.manifest_flags(Path(td), "gone") == set()
+    assert bm.manifest_flags(Path(td) / "nope", "x") == set()
+    print("manifest_flags: json/none/missing-db OK")
 
 # build_local_corpus: selection must flow through git so gitignored
 # notes (agent memory / scratch reports carrying operator credentials)

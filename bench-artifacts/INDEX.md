@@ -14,4 +14,4 @@
 | 20260927-spec-ngram-default | 20260927 | dense,ngram | 24 | 0.12.0 |
 | 20260927-wave5-live-proofs | 20260927 | a2-rate,a3-cascade,d1-ubatch,ab-dense | 3 | 0.12.0 |
 | 20260928-gguf-full | 20260928 | blazar,cold,conc,ctxcurve,direct,features,greedy,greedy_gw,idle,media,ollama,ppl,reshape,tools | 83 | 0.13.0 |
-| 20260928-sglang-safetensors | 20260928 | blazar,cold,conc,ctxcurve,features,idle,media,ollama,ppl,reshape,tools | 32 | 0.13.0 |
+| 20260928-sglang-safetensors | 20260928 | blazar,cold,conc,ctxcurve,features,idle,media,ollama,ppl,reshape,tools | 36 | 0.13.0 |

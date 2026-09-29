@@ -1,6 +1,6 @@
 # Blazar benchmark matrix
 
-- **date**: 2026-09-29 08:57:19
+- **date**: 2026-09-29 10:34:21
 - **model**: `qwen3-1.7b.d` (3890 MiB)
 - **gpu**: NVIDIA GeForce RTX 4070 Laptop GPU / driver 595.91.07
 - **engines**: inventory, ollama-host, piper, sglang-0.5.19
@@ -29,6 +29,10 @@
 | ollama-host | ollama | ctxcurve-ollama | ctx=2048 | 43 | - | - | - | 156.5 | - | - | - |
 | ollama-host | ollama | ctxcurve-ollama | ctx=8192 | 40 | - | - | - | 156.3 | - | - | - |
 | ollama-host | ollama | ctxcurve-ollama | ctx=16384 | 42 | - | - | - | 157.4 | - | - | - |
+| sglang-0.5.19 | sglang | blazar | config=kv_dtype_bf16 | 33 | 34 | 15 | 15 | 67.7 | 7216.5 | 10941.7 | chunks |
+| sglang-0.5.19 | sglang | blazar | config=kv_dtype_e4m3 | 33 | 34 | 15 | 16 | 67.4 | 6344.3 | 10978.3 | chunks |
+| sglang-0.5.19 | sglang | blazar | config=cg_bs_16 | 33 | 34 | 15 | 15 | 67.6 | 7301.1 | 10972.5 | chunks |
+| sglang-0.5.19 | sglang | blazar | config=cg_bs_256 | 33 | 33 | 15 | 15 | 67.6 | 7229.4 | 10967.7 | chunks |
 
 ## Resources & cold start
 
@@ -51,6 +55,10 @@
 | ollama-host | ctxcurve-ollama | ctx=2048 | 2.55 | - | - | 1588 | - | - | ok |
 | ollama-host | ctxcurve-ollama | ctx=8192 | 2.95 | - | - | 2322 | - | - | ok |
 | ollama-host | ctxcurve-ollama | ctx=16384 | 2.03 | - | - | 3234 | - | - | ok |
+| sglang-0.5.19 | blazar | config=kv_dtype_bf16 | - | 0.55 | 34.3 | 6416 | 55.3 | - | ok |
+| sglang-0.5.19 | blazar | config=kv_dtype_e4m3 | - | 0.52 | 33.97 | 6474 | 55.1 | - | ok |
+| sglang-0.5.19 | blazar | config=cg_bs_16 | - | 0.53 | 31.28 | 6470 | 55.6 | - | ok |
+| sglang-0.5.19 | blazar | config=cg_bs_256 | - | 0.52 | 33.26 | 6804 | 55.2 | - | ok |
 
 ## Concurrency (parallel streams)
 

@@ -4,11 +4,11 @@ _Rendered 20260928-sglang-safetensors; blazar 0.13.0; power state of gateway row
 
 ## Executive summary
 
-sglang-0.5.19 prompt-cache prefill 11274 vs 6973 t/s cold; sglang-0.5.19 sweep C=4: C4: 254.0 t/s system (engine-scheduled); gateway cold boot 0.52 s; cold TTFT 99313 ms vs ollama 8206 ms (0.1x); idle wake 140 ms (sleep) vs ollama 2317 ms (full reload).
+sglang-0.5.19 prompt-cache prefill 10968 vs 7229 t/s cold; sglang-0.5.19 sweep C=4: C4: 254.0 t/s system (engine-scheduled); gateway cold boot 0.52 s; cold TTFT 33222 ms vs ollama 8206 ms (0.2x); idle wake 140 ms (sleep) vs ollama 2317 ms (full reload).
 
 ## Measured in this campaign
 
-- blazar: 13 cell(s)
+- blazar: 17 cell(s)
 - cold-ollama: 1 cell(s)
 - conc-blazar: 1 cell(s)
 - conc-ollama: 1 cell(s)
@@ -29,7 +29,7 @@ sglang-0.5.19 prompt-cache prefill 11274 vs 6973 t/s cold; sglang-0.5.19 sweep C
 
 | Engine | Kind | Lane | ok cells | err cells | Status |
 |---|---|---|---:|---:|---|
-| sglang-0.5.19 | sglang | — | 19 | 3 | benchmarked |
+| sglang-0.5.19 | sglang | — | 23 | 3 | benchmarked |
 | b11202-cuda | — | — | 0 | 0 | excluded: kind 'llamacpp' has no bench lane in this harness |
 | b5130 | — | — | 0 | 0 | excluded: kind 'whisper' has no bench lane in this harness |
 | master-920-2f88688 | — | — | 0 | 0 | excluded: kind 'sdcpp' has no bench lane in this harness |
@@ -91,6 +91,10 @@ sglang-0.5.19 prompt-cache prefill 11274 vs 6973 t/s cold; sglang-0.5.19 sweep C
 | blazar gateway - sglang-0.5.19 (chunked_prefill_4096) | engine-scheduled | 67.6 | 33.0 | 33.5 | 14.8 | 15.4 | 6342.4 | 10988.9 | 6738 | 55.9 |
 | blazar gateway - sglang-0.5.19 (page_64) | engine-scheduled | 67.6 | 33.0 | 33.5 | 14.8 | 15.6 | 7125.1 | 10669.5 | 6490 | 55.5 |
 | blazar gateway - sglang-0.5.19 (torch_compile_on) | engine-scheduled | 68.7 | 32.5 | 32.7 | 14.6 | 15.2 | 6973.2 | 11274.0 | 7070 | 55.0 |
+| blazar gateway - sglang-0.5.19 (kv_dtype_bf16) | engine-scheduled | 67.7 | 33.3 | 33.6 | 14.7 | 15.5 | 7216.5 | 10941.7 | 6416 | 55.3 |
+| blazar gateway - sglang-0.5.19 (kv_dtype_e4m3) | engine-scheduled | 67.4 | 33.1 | 33.8 | 14.8 | 15.6 | 6344.3 | 10978.3 | 6474 | 55.1 |
+| blazar gateway - sglang-0.5.19 (cg_bs_16) | engine-scheduled | 67.6 | 33.2 | 34.1 | 14.8 | 15.3 | 7301.1 | 10972.5 | 6470 | 55.6 |
+| blazar gateway - sglang-0.5.19 (cg_bs_256) | engine-scheduled | 67.6 | 32.8 | 33.1 | 14.8 | 15.5 | 7229.4 | 10967.7 | 6804 | 55.2 |
 | ollama 0.33.3 - qwen3:1.7b | service | 157.5 | 33.0 | 39.3 | 6.4 | 7.1 | 3705.1 | 60940.3 | 2320 | 54.9 |
 
 ### Concurrency (4 parallel streams x 128 tokens)
@@ -155,6 +159,10 @@ _Not measured in this campaign (20260928-sglang-safetensors); optimization axes 
 | sglang-0.5.19 | chunked_prefill_4096 | 67.6 | +0.0% | 33 | +1.4% | 6738 | +268 | ✓ same |
 | sglang-0.5.19 | page_64 | 67.6 | -0.0% | 33 | +1.6% | 6490 | +20 | ✓ same |
 | sglang-0.5.19 | torch_compile_on | 68.7 | +1.6% | 32 | -0.0% | 7070 | +600 | ✓ same |
+| sglang-0.5.19 | kv_dtype_bf16 | 67.7 | +0.1% | 33 | +2.4% | 6416 | -54 | ✓ same |
+| sglang-0.5.19 | kv_dtype_e4m3 | 67.4 | -0.3% | 33 | +2.0% | 6474 | +4 | ⚠ drift |
+| sglang-0.5.19 | cg_bs_16 | 67.6 | +0.0% | 33 | +2.1% | 6470 | +0 | ✓ same |
+| sglang-0.5.19 | cg_bs_256 | 67.6 | +0.0% | 33 | +1.1% | 6804 | +334 | ✓ same |
 
 ### Gateway scheduler knobs under concurrent load (C=8 bursts)
 
@@ -195,6 +203,10 @@ _Not measured in this campaign (20260928-sglang-safetensors); conc lane A/B lane
 | blazar gateway - sglang-0.5.19 | 0.53 | 37.30 | 37261 | - | 0 |
 | blazar gateway - sglang-0.5.19 | 0.53 | 32.17 | 32139 | - | 0 |
 | blazar gateway - sglang-0.5.19 | 0.52 | 99.36 | 99313 | - | 0 |
+| blazar gateway - sglang-0.5.19 | 0.55 | 34.30 | 34260 | - | 0 |
+| blazar gateway - sglang-0.5.19 | 0.52 | 33.97 | 33928 | - | 0 |
+| blazar gateway - sglang-0.5.19 | 0.53 | 31.28 | 31236 | - | 0 |
+| blazar gateway - sglang-0.5.19 | 0.52 | 33.26 | 33222 | - | 0 |
 | ollama - qwen3:1.7b | - | 8.21 | 8206 | 2.04 | - |
 
 _Every cold probe runs page-cache-dropped and GPU-idle-asserted on both runtimes; ollama rows without --ollama-service-restart leave the daemon warm (note in the artifact)._
