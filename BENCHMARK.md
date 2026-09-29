@@ -4,7 +4,13 @@ _Rendered 20260928-gguf-full; blazar 0.13.0; power state of gateway rows: ac._
 
 ## Executive summary
 
-v0.9.4: gateway 41.0 vs direct 21.5 t/s (+90.3%); v0.9.4 prompt-cache prefill 7396 vs 1370 t/s cold; b11202-cuda sweep C=4: C4: 67.5 t/s system (2x8192) | v0.9.4 sweep C=4: C4: 67.4 t/s system (2x8192); gateway cold boot 0.52 s; cold TTFT 4430 ms vs ollama 5446 ms (1.2x); idle wake 4615 ms (sleep) vs ollama 5958 ms (full reload).
+- v0.9.4: gateway 41.0 vs direct 21.5 t/s (+90.3%)
+- v0.9.4 prompt-cache prefill 7396 vs 1370 t/s cold
+- b11202-cuda sweep C=4: C4: 67.5 t/s system (2x8192)
+- v0.9.4 sweep C=4: C4: 67.4 t/s system (2x8192)
+- gateway cold boot 0.52 s
+- cold TTFT 4430 ms vs ollama 5446 ms (1.2x)
+- idle wake 4615 ms (sleep) vs ollama 5958 ms (full reload)
 
 ## Measured in this campaign
 
@@ -128,9 +134,9 @@ v0.9.4: gateway 41.0 vs direct 21.5 t/s (+90.3%); v0.9.4 prompt-cache prefill 73
 
 | Runtime | slots | ok streams | rounds | system t/s | sum-stream t/s | wall s | TTFT max ms | TTFT p99 ms | ITL p99 ms |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| direct engine - b11202-cuda | 4 | 4/4 | 1 | 110.6 | 116.7 | 4.63 | 276 | - | 41.4 |
 | blazar gateway - b11202-cuda | 2x8192 | 12/4 | 3 | 67.5 | 433.1 | 22.75 | 4205 | 4204 | 81.3 |
 | blazar gateway - v0.9.4 | 2x8192 | 12/4 | 3 | 67.4 | 434.3 | 22.79 | 4216 | 4213 | 32.8 |
+| direct engine - b11202-cuda | 4 | 4/4 | 1 | 110.6 | 116.7 | 4.63 | 276 | - | 41.4 |
 | ollama - qwen3.5:9b | service | 12/4 | 3 | 33.4 | 486.9 | 45.98 | 16572 | 16213 | 74.7 |
 
 _sum-stream >> system t/s means streams serialize on one slot; roughly equal means genuinely parallel._
@@ -180,7 +186,6 @@ _Exact-match divergence across GPU backends is expected float nondeterminism (ba
 | blazar gateway - b11202-cuda | 6 | 4/6 | 4/5 | 4/5 | no | 114 |
 | blazar gateway - v0.9.4 | 6 | 4/6 | 4/5 | 4/5 | no | 113 |
 | ollama - qwen3.5:9b | 6 | 4/6 | 4/5 | 4/5 | no | 283 |
-
 
 ### Optimization axes (ctx 4096, single stream)
 
@@ -327,11 +332,11 @@ _blazar sleeps with weights in RAM (wake = resume); ollama unloads at keep_alive
 | image - qwen-image-2.1-uncensored (512x512, steps=[4]) | 63.31 | 52.21 | 52.16 | 52.30 | 512x512 PNG, entropy 7.4 bits, contrast 67.1 |  |  |
 | image - qwen-image-2.1-uncensored (512x512, steps=[4]) | 56.76 | 46.59 | 46.49 | 46.60 | 512x512 PNG, entropy 7.2 bits, contrast 63.1 |  |  |
 | image - qwen-image-2.1-uncensored (512x512, steps=[4]) | 57.62 | 45.59 | 45.39 | 45.61 | 512x512 PNG, entropy 7.2 bits, contrast 75.3 |  |  |
+| tts - en_US-amy-medium (840 chars, wav+pcm) | - | 2.05 | - | 3.55 | RTF wav 0.034 / pcm 0.059 (60s audio) |  | 3.99x |
+| tts-conc - en_US-amy-medium (400 chars x4 pcm) | - | 4.95 | 5.09 | - | efficiency 3.74 of 4 streams |  | 1768ms max TTFB |
 | video - wan_2.1_comfyui_repackaged (320x320, steps=8) | 38.24 | 11.08 | 11.08 | 11.08 | 5f: mux==reported==aligned | 0.001 |  |
 | video - wan_2.1_comfyui_repackaged (320x320, steps=8) | - | 22.11 | 22.09 | 22.14 | 13f: mux==reported==aligned |  |  |
 | video - wan_2.1_comfyui_repackaged (320x320, steps=8) | - | 52.17 | 52.17 | 52.19 | 33f: mux==reported==aligned |  |  |
-| tts - en_US-amy-medium (840 chars, wav+pcm) | - | 2.05 | - | 3.55 | RTF wav 0.034 / pcm 0.059 (60s audio) |  | 3.99x |
-| tts-conc - en_US-amy-medium (400 chars x4 pcm) | - | 4.95 | 5.09 | - | efficiency 3.74 of 4 streams |  | 1768ms max TTFB |
 | whisper - ggml-base (transcribes piper wav) | 2.39 | 2.10 | - | - | RTF 0.069 |  |  |
 
 | Engine | config | median total s | Δ% vs default | cold request s |
@@ -347,7 +352,7 @@ _Media cells run through the same sandboxed gateway as text lanes but do not ass
 1. **Gateway overhead vs direct spawn: within measurement noise.** b11202-cuda decode 41.1 t/s through the gateway vs 41.6 t/s direct (-1.3%), greedy parity through the gateway 16/20 exact.
 2. **Capacity-aware slot auto-sizing observed in argv.** Distinct engine shapes this campaign: 1x16384, 2x8192 - slots follow the live hardware census, each row's child_argv carries the receipt.
 3. **Concurrency scaling per engine.** b11202-cuda (C=4): peak 67.5 t/s at C=4; v0.9.4 (C=4): peak 67.4 t/s at C=4; serialization behavior per level in the frontier table below.
-4. **Prompt cache pays 5.8x on prefill** (7374 cached vs 1265 t/s cold).
+4. **Prompt cache pays 5.5x on prefill** (7212 cached vs 1302 t/s cold).
 5. **Speculative n-gram decoding is a net loss for this model** (decode 41.0 t/s, -0.2 vs dense baseline) - measured, not assumed.
 6. **KV quantization (q8_0) is decode-neutral** (decode 41.0 t/s vs 41.2 dense).
 7. **Tool-call quality (single-turn, temp 0).** b11202-cuda: selection 4/5, args 4/5 (control clean); v0.9.4: selection 4/5, args 4/5 (control clean); ollama: selection 4/5, args 4/5 (control clean); per-scenario detail in cells.jsonl.
@@ -356,16 +361,15 @@ _Media cells run through the same sandboxed gateway as text lanes but do not ass
 10. **Image quality stamps (PIL, luma domain): entropy 7.39 bits, rms contrast 67.1, 33142 unique colors @256x256** on qwen-image-2.1-uncensored - perceptual baseline for cross-run comparisons; audit PNG saved beside the cells.
 11. **Image quality stamps (PIL, luma domain): entropy 7.15 bits, rms contrast 63.1, 27511 unique colors @256x256** on qwen-image-2.1-uncensored - perceptual baseline for cross-run comparisons; audit PNG saved beside the cells.
 12. **Image quality stamps (PIL, luma domain): entropy 7.22 bits, rms contrast 75.3, 29751 unique colors @256x256** on qwen-image-2.1-uncensored - perceptual baseline for cross-run comparisons; audit PNG saved beside the cells.
-13. **Video VRAM gate rejects an over-budget request in 1 ms** with the full estimate math and override levers in the error body - instead of an opaque child abort minutes later.
-14. **Streamed PCM cuts time-to-first-audio 3.99x vs buffered WAV** (piper lane, first audio 0.51s vs 2.05s full synthesis) - total wall time is slightly higher (per-chunk synthesis), the win is interactivity.
-15. **4 parallel PCM streams through one gateway: perfectly parallel** (efficiency 3.74 = sum of per-stream totals / 5.09s wall, max TTFB 1768 ms, NON-uniform stream outputs - flagged) - the scalability receipt for the TTS lane.
+13. **Streamed PCM cuts time-to-first-audio 3.99x vs buffered WAV** (piper lane, first audio 0.51s vs 2.05s full synthesis) - total wall time is slightly higher (per-chunk synthesis), the win is interactivity.
+14. **4 parallel PCM streams through one gateway: perfectly parallel** (efficiency 3.74 = sum of per-stream totals / 5.09s wall, max TTFB 1768 ms, NON-uniform stream outputs - flagged) - the scalability receipt for the TTS lane.
+15. **Video VRAM gate rejects an over-budget request in 1 ms** with the full estimate math and override levers in the error body - instead of an opaque child abort minutes later.
 
 ## Carried-over findings (no receipt in this campaign)
 
 _Established in earlier campaigns whose receipts live in their bench-artifacts/ directories; this campaign did not measure these lanes._
 
 1. **mistral.rs 0.9.3 with default paged attention cannot fit this model on an 8 GiB card** (upstream sizes KV as a fraction of total VRAM); blazar's profile auto-disables paged attention on tight cards and the model then serves correctly.
-
 
 ## Caveats
 
@@ -377,7 +381,7 @@ _Established in earlier campaigns whose receipts live in their bench-artifacts/ 
 ## Reproduce
 
 ```bash
-python3 scripts/bench_matrix.py --blazar-bin target/release/blazar --md BENCHMARK.md
+python3 scripts/bench_matrix.py --model qwen3.5-9b --artifacts-dir bench-artifacts/20260928-gguf-full --md BENCHMARK.md
 python3 scripts/bench_matrix.py --render-only --artifacts-dir <dir> --md BENCHMARK.md
 ```
 

@@ -4,7 +4,11 @@ _Rendered 20260928-sglang-safetensors; blazar 0.13.0; power state of gateway row
 
 ## Executive summary
 
-sglang-0.5.19 prompt-cache prefill 10968 vs 7229 t/s cold; sglang-0.5.19 sweep C=4: C4: 254.0 t/s system (engine-scheduled); gateway cold boot 0.52 s; cold TTFT 33222 ms vs ollama 8206 ms (0.2x); idle wake 140 ms (sleep) vs ollama 2317 ms (full reload).
+- sglang-0.5.19 prompt-cache prefill 10968 vs 7229 t/s cold
+- sglang-0.5.19 sweep C=4: C4: 254.0 t/s system (engine-scheduled)
+- gateway cold boot 0.52 s
+- cold TTFT 33222 ms vs ollama 8206 ms (0.2x)
+- idle wake 140 ms (sleep) vs ollama 2317 ms (full reload)
 
 ## Measured in this campaign
 
@@ -141,7 +145,6 @@ _Exact-match divergence across GPU backends is expected float nondeterminism (ba
 | blazar gateway - sglang-0.5.19 | 6 | 0/6 | 0/5 | 0/5 | no | 35 |
 | ollama - qwen3.5:9b | 6 | 4/6 | 4/5 | 4/5 | no | 285 |
 
-
 ### Optimization axes (ctx 4096, single stream)
 
 _Not measured in this campaign (20260928-sglang-safetensors); optimization axes lane not run._
@@ -275,7 +278,6 @@ _These knobs crashed the engine child on this test bed; the crash signature is t
 
 - sglang-0.5.19 (ppl): skipped: llama-perplexity loads GGUF files only; qwen3-1.7b.d is an HF safetensors directory — model-format boundary, not an engine failure
 
-
 ## Caveats
 
 - ollama prefill numbers come from engine counters that exclude the chat template, so they read slightly high against the 512-token lanes.
@@ -286,7 +288,7 @@ _These knobs crashed the engine child on this test bed; the crash signature is t
 ## Reproduce
 
 ```bash
-python3 scripts/bench_matrix.py --blazar-bin target/release/blazar --md BENCHMARK.md
+python3 scripts/bench_matrix.py --model qwen3-1.7b --engines sglang-0.5.19 --artifacts-dir bench-artifacts/20260928-sglang-safetensors --md bench-artifacts/20260928-sglang-safetensors/BENCHMARK.md
 python3 scripts/bench_matrix.py --render-only --artifacts-dir <dir> --md BENCHMARK.md
 ```
 

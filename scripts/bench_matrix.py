@@ -5109,7 +5109,9 @@ def main() -> int:
         recs = sorted(
             by_key.values(), key=lambda r: (r.get("provider", ""), r.get("tag", ""))
         )
-        write_publication_report(recs, ad, out)
+        cmd_file = ad / "campaign_cmd.txt"
+        argv_rec = cmd_file.read_text().strip() if cmd_file.exists() else None
+        write_publication_report(recs, ad, out, argv_rec)
         offenders = qc_drift_gate(recs)
         if offenders:
             log(f"qc drift gate: {len(offenders)} offender(s)")
@@ -6364,6 +6366,9 @@ def main() -> int:
         released = ollama_release_loaded()
         if released:
             log(f"ollama: released {released} resident model(s) at campaign exit")
+    # persist the real campaign invocation so later --render-only passes
+    # can stamp it into the publication report's Reproduce section
+    (art / "campaign_cmd.txt").write_text(argv_summary + "\n")
     write_markdown_report(
         md_path,
         all_records,
@@ -6376,7 +6381,7 @@ def main() -> int:
     )
     log(f"report  -> {md_path}")
     if args.md:
-        write_publication_report(all_records, art, Path(args.md))
+        write_publication_report(all_records, art, Path(args.md), argv_summary)
         log(f"report -> {args.md}")
     write_speed_table(all_records, art / "summary.txt")
     log(f"summary -> {art / 'summary.txt'}")
@@ -7423,7 +7428,8 @@ def ctxcurve_table(recs: list[dict]) -> str:
     return "\n".join([head, sep, *body])
 
 
-def executive_summary(recs: list[dict]) -> str:
+def executive_summary(recs: list[dict]) -> list[str]:
+    """Headline facts as discrete bullet items (one fact per line)."""
     gw = {
         r["tag"]: r for r in recs if r.get("provider") == "blazar" and "error" not in r
     }
@@ -7466,7 +7472,6 @@ def executive_summary(recs: list[dict]) -> str:
         by_tag: dict[str, list[dict]] = {}
         for r in conc:
             by_tag.setdefault(r.get("tag") or "?", []).append(r)
-        sweep_bits = []
         for tag in sorted(by_tag):
             rows_ = sorted(by_tag[tag], key=lambda r: r["conc_level"])
             levels = "/".join(str(r["conc_level"]) for r in rows_)
@@ -7475,8 +7480,7 @@ def executive_summary(recs: list[dict]) -> str:
                 f" ({child_shape(r) or 'engine-scheduled'})"
                 for r in rows_
             )
-            sweep_bits.append(f"{engine_label(tag)} sweep C={levels}: {ladder}")
-        parts.append(" | ".join(sweep_bits))
+            parts.append(f"{engine_label(tag)} sweep C={levels}: {ladder}")
     boot = next(
         (r.get("daemon_boot_s") for r in gw.values() if r.get("daemon_boot_s")), None
     )
@@ -7523,7 +7527,7 @@ def executive_summary(recs: list[dict]) -> str:
             f"{pfmt(idle_o['idle_wake_ttft_ms'], 0)} ms (full reload)"
         )
     if parts:
-        return "; ".join(parts) + "."
+        return parts
     # Media-only campaigns have no text rows to rank — say that instead
     # of a bare "no complete rows" that reads like a failed campaign.
     media = [
@@ -7532,11 +7536,11 @@ def executive_summary(recs: list[dict]) -> str:
         if (r.get("provider") or "").startswith("media-") and "error" not in r
     ]
     if media:
-        return (
+        return [
             f"_No complete text rows — {len(media)} media measurement(s) "
             "in the sections below._"
-        )
-    return "_No complete rows._"
+        ]
+    return ["_No complete rows._"]
 
 
 def media_table(recs: list[dict]) -> str:
@@ -8274,7 +8278,10 @@ def update_campaign_index(
 
 
 def write_publication_report(
-    recs: list[dict], artifacts_dir: Path, out_path: Path
+    recs: list[dict],
+    artifacts_dir: Path,
+    out_path: Path,
+    argv_summary: str | None = None,
 ) -> None:
     versions = {
         r.get("blazar_version", "").strip().removeprefix("blazar ")
@@ -8299,7 +8306,7 @@ def write_publication_report(
     L.append("")
     L.append("## Executive summary")
     L.append("")
-    L.append(executive_summary(recs))
+    L += [f"- {p}" for p in executive_summary(recs)]
     L.append("")
     lane_counts: dict[str, int] = {}
     for r in recs:
@@ -8531,9 +8538,13 @@ def write_publication_report(
     L.append("## Reproduce")
     L.append("")
     L.append("```bash")
-    L.append(
-        "python3 scripts/bench_matrix.py --blazar-bin target/release/blazar --md BENCHMARK.md"
-    )
+    if argv_summary:
+        # the command that actually produced this campaign's cells
+        L.append(f"python3 scripts/bench_matrix.py {argv_summary}")
+    else:
+        L.append(
+            "python3 scripts/bench_matrix.py --blazar-bin target/release/blazar --md BENCHMARK.md"
+        )
     L.append(
         "python3 scripts/bench_matrix.py --render-only --artifacts-dir <dir> --md BENCHMARK.md"
     )
@@ -8546,7 +8557,14 @@ def write_publication_report(
     L.append("")
 
     update_campaign_index(artifacts_dir, recs, blazar_ver)
-    out_path.write_text("\n".join(L))
+    # collapse accidental blank-line runs (section builders each append
+    # their own trailing blank; adjacent builders double them)
+    collapsed: list[str] = []
+    for ln in L:
+        if ln == "" and collapsed and collapsed[-1] == "":
+            continue
+        collapsed.append(ln)
+    out_path.write_text("\n".join(collapsed))
     print(f"report -> {out_path} ({len(recs)} last-wins records)")
 
 

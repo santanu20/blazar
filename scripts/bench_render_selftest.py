@@ -357,8 +357,13 @@ with tempfile.TemporaryDirectory() as td:
     adir = Path(td) / "synthetic"
     adir.mkdir()
     (adir / "cells.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+    (adir / "campaign_cmd.txt").write_text(
+        "--model qwen3-1.7b --engines sglang-0.5.19\n"
+    )
     outp = Path(td) / "REPORT.md"
-    bm.write_publication_report(recs, adir, outp)
+    bm.write_publication_report(
+        recs, adir, outp, "--model qwen3-1.7b --engines sglang-0.5.19"
+    )
     md = outp.read_text()
     assert "## Findings (this campaign)" in md
     assert "Carried-over findings" not in md, (
@@ -368,6 +373,15 @@ with tempfile.TemporaryDirectory() as td:
     assert (
         md.count("_Not measured in this campaign") >= 3
     )  # ppl/coldstart/idle etc unmeasured
+    # exec summary must be a bullet list, one fact per line
+    es = md.split("## Executive summary", 1)[1].split("##", 1)[0]
+    es_lines = [l for l in es.splitlines() if l.strip()]
+    assert es_lines and all(l.startswith("- ") for l in es_lines), es_lines
+    # Reproduce must carry the actual campaign invocation, not a generic one
+    rep = md.split("## Reproduce", 1)[1].split("```bash", 1)[1].split("```", 1)[0]
+    assert "--model qwen3-1.7b --engines sglang-0.5.19" in rep, rep
+    # no accidental double-blank runs anywhere in the render
+    assert "\n\n\n" not in md, "double blank-line run in render"
     print(
         f"write_publication_report: synthetic full render OK ({md.count(chr(10))} lines)"
     )
