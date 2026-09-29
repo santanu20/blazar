@@ -3946,17 +3946,57 @@ def run_ollama_cell(cfg: dict, args_model: str | None = None) -> dict:
 # quality lane
 
 
-def build_local_corpus(dest: Path, cap_bytes: int = 1_500_000) -> bool:
+def build_local_corpus(
+    dest: Path, cap_bytes: int = 1_500_000, repo: Path | None = None
+) -> bool:
     """Deterministic offline ppl corpus: sorted repo text files, capped.
     Parity only needs the SAME text for every engine; a fixed local
-    source removes the network flake entirely (R5)."""
-    repo = Path(__file__).resolve().parent.parent
+    source removes the network flake entirely (R5).
+
+    Selection goes through `git ls-files --exclude-standard` so gitignored
+    content (agent memory notes, scratch validation reports) can never
+    enter a bench artifact — a plain rglob() walk once ingested untracked
+    notes carrying operator credentials into corpus.txt (caught 2026-09-29;
+    the artifacts are gitignored and local-only, so nothing escaped the
+    box). Agent-instruction files and tracked files whose text matches a
+    credential pattern are excluded as a second guard."""
+    root = repo if repo is not None else Path(__file__).resolve().parent.parent
+    try:
+        listed = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ],
+            capture_output=True,
+            check=True,
+            timeout=60,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        # No git / unusable repo: refuse rather than walk the tree unfiltered.
+        return False
+    agent_files = {"MEMORY.md", "AGENTS.md", "CLAUDE.md"}
+    credential = re.compile(
+        r"ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}"
+        r"|AKIA[0-9A-Z]{16}|hf_[A-Za-z0-9]{20,}|xox[baprs]-"
+        r"|-----BEGIN [A-Z ]*PRIVATE KEY|plm_[A-Za-z0-9]{20,}"
+    )
+    candidates = [
+        root / name for name in listed.decode(errors="replace").split("\0") if name
+    ]
     parts: list[str] = []
     taken = 0
     files = sorted(
         p
-        for p in repo.rglob("*")
-        if p.suffix in {".rs", ".toml", ".md", ".py"}
+        for p in candidates
+        if p.is_file()
+        and p.suffix in {".rs", ".toml", ".md", ".py"}
+        and p.name not in agent_files
         and "target" not in p.parts
         and p.stat().st_size < 200_000
     )
@@ -3964,16 +4004,17 @@ def build_local_corpus(dest: Path, cap_bytes: int = 1_500_000) -> bool:
         if taken >= cap_bytes:
             break
         try:
-            # ASCII-only: a repo corpus can carry codepoints that abort
-            # some tokenizers ("invalid codepoint" SIGABRT, proven live
-            # on b10809 + qwen3.5) — parity needs identical text, not
-            # exotic glyphs
-            parts.append(
-                p.read_text(errors="replace").encode("ascii", "ignore").decode()
-            )
-            taken += p.stat().st_size
+            text = p.read_text(errors="replace")
         except OSError:
             continue
+        if credential.search(text):
+            continue
+        # ASCII-only: a repo corpus can carry codepoints that abort
+        # some tokenizers ("invalid codepoint" SIGABRT, proven live
+        # on b10809 + qwen3.5) — parity needs identical text, not
+        # exotic glyphs
+        parts.append(text.encode("ascii", "ignore").decode())
+        taken += p.stat().st_size
     if taken < 64_000:  # < ~16k tokens: ctx 2048 needs 2x ctx tokens
         return False
     dest.write_text("\n".join(parts))

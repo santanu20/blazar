@@ -539,4 +539,58 @@ with tempfile.TemporaryDirectory() as td:
     assert "crashed" in d2, "3 identical error rows cap the cell"
     print("load_done attempts cap: ok/1-err/2-err/3-err OK")
 
+# product's probed manifest flags — json parse keeps only long flags,
+# missing manifest / missing db degrade to the empty set
+with tempfile.TemporaryDirectory() as td:
+    con = _sq.connect(Path(td) / "blazar.db")
+    con.execute("CREATE TABLE engines (tag TEXT, kind TEXT, manifest TEXT)")
+    mani = json.dumps(
+        {"flags": ["--kv-cache-dtype", "--cuda-graph-max-bs", "short", 7]}
+    )
+    con.execute("INSERT INTO engines VALUES ('sglang-0.5.19','sglang',?)", (mani,))
+    con.execute("INSERT INTO engines VALUES ('gone','sglang',NULL)")
+    con.commit()
+    con.close()
+    assert got == {"--kv-cache-dtype", "--cuda-graph-max-bs"}, got
+
+# build_local_corpus: selection must flow through git so gitignored
+# notes (agent memory / scratch reports carrying operator credentials)
+# and credential-pattern files stay out of bench artifacts; no git at
+# all -> fail closed
+import subprocess as sp
+import unittest.mock as _mock
+
+with tempfile.TemporaryDirectory() as td:
+    repo = Path(td) / "r"
+    (repo / "docs").mkdir(parents=True)
+    (repo / "docs" / "a.md").write_text("alpha beta gamma " * 5000)
+    (repo / "MEMORY.md").write_text("agent memory " * 200)
+    (repo / "AGENTS.md").write_text("agent instructions " * 200)
+    (repo / "secret.md").write_text("token ghp_" + "a" * 30 + " filler " * 2000)
+    (repo / ".gitignore").write_text("MEMORY.md\n")
+    sp.run(["git", "init", "-q", str(repo)], check=True)
+    sp.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "add",
+            "docs/a.md",
+            "AGENTS.md",
+            "secret.md",
+            ".gitignore",
+        ],
+        check=True,
+    )
+    dest = Path(td) / "corpus.txt"
+    assert bm.build_local_corpus(dest, repo=repo), "fixture corpus must build"
+    text = dest.read_text()
+    assert "alpha beta gamma" in text, "tracked text must be included"
+    assert "agent memory" not in text, "gitignored MEMORY.md must be excluded"
+    assert "agent instructions" not in text, "AGENTS.md must be excluded by name"
+    assert "ghp_" not in text, "credential-pattern file must be excluded"
+    with _mock.patch.object(bm.subprocess, "run", side_effect=OSError("no git")):
+        assert not bm.build_local_corpus(dest), "git failure must fail closed"
+    print("build_local_corpus: gitignore/denylist/credential-guard OK")
+
 print("ALL FIXTURE CHECKS GREEN")
