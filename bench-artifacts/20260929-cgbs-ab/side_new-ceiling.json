@@ -1,0 +1,28 @@
+{
+  "side": "new-ceiling",
+  "binary": "/home/santanu/Projects/blazar/target/release/blazar",
+  "argv_cap": 5,
+  "rounds": [
+    {
+      "streams": 8,
+      "wall_s": 2.01,
+      "tokens": 1024,
+      "system_tps": 509.5,
+      "errors": []
+    },
+    {
+      "streams": 12,
+      "wall_s": 2.11,
+      "tokens": 1536,
+      "system_tps": 729.0,
+      "errors": []
+    },
+    {
+      "streams": 16,
+      "wall_s": 2.07,
+      "tokens": 2048,
+      "system_tps": 987.9,
+      "errors": []
+    }
+  ]
+}
