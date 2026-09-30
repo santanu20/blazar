@@ -15,8 +15,8 @@ Campaign: sglang-lora-nimble · Box: RTX 4070 Laptop 8188 MiB, 13674 MiB RAM, sg
 
 ## 2. Spawn preflight (`resolve_lora_lane`, crates/blazar-runtime/src/supervisor.rs)
 
-- Missing-on-disk row (sqlite-inserted, path `/tmp/opencode/gone-lora-dir`) → request `qwen3-1.7b+gone-lora-dir` → HTTP 404:
-  `lora /tmp/opencode/gone-lora-dir (row #4) attached to "qwen3-1.7b" is missing on disk — re-download the adapter or blazar lora rm 4 the row`
+- Missing-on-disk row (sqlite-inserted, path `/tmp/gone-lora-dir`) → request `qwen3-1.7b+gone-lora-dir` → HTTP 404:
+  `lora /tmp/gone-lora-dir (row #4) attached to "qwen3-1.7b" is missing on disk — re-download the adapter or blazar lora rm 4 the row`
 - Pre-fix behavior (row #1 era): nonexistent path was accepted at `lora add` with rc=0 — garbage row reached spawn. Root cause fixed at the door; spawn check is the second gate.
 
 ## 3. Live child argv proof (/proc/<pid>/cmdline, sglang 0.5.20)
@@ -25,7 +25,7 @@ Campaign: sglang-lora-nimble · Box: RTX 4070 Laptop 8188 MiB, 13674 MiB RAM, sg
   `python -m sglang.launch_server --model-path .../qwen3-1.7b.d --host 127.0.0.1 --port 37679 --served-model-name qwen3-1.7b --context-length 16384 --enable-lora --lora-paths eternis-anonymizer-qwen3-1=.../eternis-anonymizer-qwen3-1.7b ...`
 - Variant mode (request `qwen3.5-9b-bf16+bespoke-nimble-9b`):
   `python -m sglang.launch_server --model-path .../qwen3.5-9b-bf16.d --host 127.0.0.1 --port 40167 --served-model-name qwen3.5-9b-bf16 --context-length 16384 --enable-lora --lora-paths bespoke-nimble-9b=.../bespoke-nimble-9b ...`
-- Raw captures: /tmp/opencode/nimble_argv_576739.txt (dense), nimble_argv_594144.txt + nimble_argv_594425.txt (variant).
+- Raw captures: /tmp/nimble_argv_576739.txt (dense), nimble_argv_594144.txt + nimble_argv_594425.txt (variant).
 
 ## 4. Variant serve proof (workload-class: PEFT adapter on exact-base)
 
@@ -38,7 +38,7 @@ Campaign: sglang-lora-nimble · Box: RTX 4070 Laptop 8188 MiB, 13674 MiB RAM, sg
 - Adapter: `bespokelabs/Bespoke-Nimble-9b` PEFT dir (r16 alpha32, targets include GDN in_proj_qkv/in_proj_z/in_proj_b/in_proj_a/out_proj + classic qwen modules), 173 MiB safetensors.
 - Result: sglang crashed at layer weight-init (`MergedColumnParallelLinear.create_weights` under offloader wrap_modules) on both crash-loop attempts; gateway surfaced 502 `engine crashed` with full traceback, supervisor gave up cleanly, no hang, no slot leak (`blazar ps`: no models loaded).
 - Verdict: LoRA wiring correct end-to-end (argv above proves emission for this exact spawn); failure is 18 GiB BF16 vs 8 GiB VRAM + ~5 GiB free RAM. Nimble class on 8 GB cards requires a quantized Qwen3.5-9B base (no official FP8/AWQ ships from Qwen today) or a bigger GPU.
-- Typed-decision serving pattern (schema enum + logit_bias + logprobs) independently proven on qwen3-1.7b via gateway: receipts /tmp/opencode/nimble_pattern_receipts.json (json_schema strict enum answer + top_logprobs passthrough; logit_bias ±100 → forced token stream, warm 0.1 s).
+- Typed-decision serving pattern (schema enum + logit_bias + logprobs) independently proven on qwen3-1.7b via gateway: receipts /tmp/nimble_pattern_receipts.json (json_schema strict enum answer + top_logprobs passthrough; logit_bias ±100 → forced token stream, warm 0.1 s).
 
 ## 6. Guards re-run after all edits
 
