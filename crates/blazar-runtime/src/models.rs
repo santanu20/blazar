@@ -168,6 +168,61 @@ pub struct ReconcileReport {
     /// (file/dir, reason) for candidates that looked like models but
     /// were refused — surfaced as boot warnings, never fatal.
     pub skipped: Vec<(String, String)>,
+    /// (model, what drifted) for dir rows re-measured against disk: a
+    /// row adopted mid-download froze a partial size (the idempotent
+    /// second boot skips owned dirs), so boot re-checks every dir row.
+    /// Only planning-relevant fields refresh — never sha256, quant
+    /// label, mmproj linkage, or `pulled_at`.
+    pub healed: Vec<(String, String)>,
+}
+
+/// Re-measure one safetensors dir row against disk. Heals only when the
+/// dir is a COMPLETE, readable model (weights present AND config parses)
+/// — a re-download in flight must not zero out good row fields. Returns
+/// the drift description when the row was rewritten.
+fn heal_dir_row(store: &Store, row: &ModelRow) -> Option<String> {
+    let dir = Path::new(&row.path);
+    if !dir.is_dir() {
+        return None;
+    }
+    let weights = blazar_core::hfmeta::root_safetensors(dir);
+    if weights.is_empty() {
+        return None;
+    }
+    let Ok(meta) = blazar_core::hfmeta::read_hf_config(dir) else {
+        return None;
+    };
+    let measured: u64 = weights
+        .iter()
+        .filter_map(|w| std::fs::metadata(w).ok())
+        .map(|m| m.len())
+        .sum();
+    let shards: i64 = i64::try_from(weights.len()).unwrap_or(i64::MAX);
+    let bytes = i64::try_from(measured).unwrap_or(i64::MAX);
+    let ctx_train = meta.ctx_train.and_then(|c| i64::try_from(c).ok());
+    let arch = (!meta.architecture.is_empty()).then(|| meta.architecture.clone());
+    let drifted_bytes = row.bytes != bytes;
+    let drifted_shards = row.shards != shards;
+    let drifted_ctx = ctx_train.is_some() && row.ctx_train != ctx_train;
+    let drifted_arch = arch.is_some() && row.arch != arch;
+    if !(drifted_bytes || drifted_shards || drifted_ctx || drifted_arch) {
+        return None;
+    }
+    let mut healed = row.clone();
+    let old_bytes = row.bytes;
+    healed.bytes = bytes;
+    healed.shards = shards;
+    if drifted_ctx {
+        healed.ctx_train = ctx_train;
+    }
+    if drifted_arch {
+        healed.arch = arch;
+    }
+    healed.params = Some(crate::hf::est_params(measured, &row.quant));
+    store.upsert_model(&healed).ok()?;
+    Some(format!(
+        "re-measured {old_bytes} -> {bytes} bytes, {shards} shards"
+    ))
 }
 
 /// Adopt store-external model files living in the models dir: GGUFs (and
@@ -186,6 +241,7 @@ pub fn reconcile_models(dirs: &BlazarDirs, store: &Store) -> ReconcileReport {
         adopted: Vec::new(),
         relinked: Vec::new(),
         skipped: Vec::new(),
+        healed: Vec::new(),
     };
     let models_dir = dirs.models_dir();
     let Ok(entries) = std::fs::read_dir(&models_dir) else {
@@ -247,7 +303,7 @@ pub fn reconcile_models(dirs: &BlazarDirs, store: &Store) -> ReconcileReport {
         if !dir.join("config.json").exists() {
             continue; // not an HF model dir — never ours to judge
         }
-        if !root_safetensors(&dir).is_empty() || looks_pulled {
+        if !blazar_core::hfmeta::root_safetensors(&dir).is_empty() || looks_pulled {
             adopt_dir(&models_dir, store, name, &owned, &mut report);
         }
     }
@@ -313,6 +369,17 @@ pub fn reconcile_models(dirs: &BlazarDirs, store: &Store) -> ReconcileReport {
             }
         }
     }
+
+    // Dir-row heal: bytes frozen at adoption (mid-download boot) or
+    // shards added since keep display AND spawn planning wrong forever.
+    // One idempotent upsert per drifted row; failures are silent
+    // pass-overs (next boot retries) — heal is an accuracy upgrade,
+    // never a boot blocker.
+    for row in store.list_models().unwrap_or_default() {
+        if let Some(drift) = heal_dir_row(store, &row) {
+            report.healed.push((row.name.clone(), drift));
+        }
+    }
     report
 }
 
@@ -343,25 +410,6 @@ fn ownership_set(store: &Store) -> (HashSet<PathBuf>, HashSet<(u64, u64)>) {
         }
     }
     (owned, owned_inodes)
-}
-
-/// Root-level `.safetensors` weights of an HF model dir (the pull lane's
-/// selection rule: shards live at the root, config.json is mandatory).
-fn root_safetensors(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut files: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.is_file()
-                && p.file_name()
-                    .is_some_and(|f| f.to_string_lossy().to_lowercase().ends_with(".safetensors"))
-        })
-        .collect();
-    files.sort();
-    files
 }
 
 /// Shared adoption working state: what the store already owns (paths +
@@ -542,7 +590,7 @@ fn adopt_dir(
     report: &mut ReconcileReport,
 ) {
     let dir = models_dir.join(dir_name);
-    let weights = root_safetensors(&dir);
+    let weights = blazar_core::hfmeta::root_safetensors(&dir);
     let model_name = dir_name.strip_suffix(".d").unwrap_or(dir_name);
     if weights.is_empty() {
         report.skipped.push((
@@ -1176,6 +1224,84 @@ mod tests {
         let r2 = reconcile_models(&dirs, &store);
         assert!(r2.adopted.is_empty(), "{:?}", r2.adopted);
         assert!(r2.skipped.is_empty(), "{:?}", r2.skipped);
+        assert!(r2.healed.is_empty(), "no drift, no heal: {:?}", r2.healed);
+    }
+
+    #[test]
+    fn unit__reconcile__dir_row_frozen_mid_download_healed_next_boot() {
+        // Real-world shape from the 09-30 BF16 snapshot: a daemon boot
+        // mid-download adopted the dir at its partial size and every
+        // later boot skipped it as owned. The heal pass re-measures.
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir().join("qwen3.5-9b-bf16.d");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("config.json"),
+            br#"{"architectures":["Qwen3_5ForConditionalGeneration"],"text_config":{"max_position_embeddings":4096}}"#,
+        )
+        .unwrap();
+        std::fs::write(d.join("model-00001-of-00002.safetensors"), b"aaaa").unwrap();
+        let store = Store::open(&dirs).unwrap();
+        let _ = reconcile_models(&dirs, &store);
+        let stale = store.get_model("qwen3.5-9b-bf16").unwrap().unwrap();
+        assert_eq!(stale.bytes, 4, "frozen partial size");
+        assert_eq!(stale.ctx_train, Some(4096));
+
+        // Download completes: second shard lands, first grows, and the
+        // finished config carries the true training ctx.
+        std::fs::write(d.join("model-00001-of-00002.safetensors"), b"aaaaaaaaaa").unwrap();
+        std::fs::write(d.join("model-00002-of-00002.safetensors"), b"bbbb").unwrap();
+        std::fs::write(
+            d.join("config.json"),
+            br#"{"architectures":["Qwen3_5ForConditionalGeneration"],"text_config":{"max_position_embeddings":262144}}"#,
+        )
+        .unwrap();
+
+        let r2 = reconcile_models(&dirs, &store);
+        assert_eq!(r2.healed.len(), 1, "{:?}", r2.healed);
+        assert_eq!(r2.healed[0].0, "qwen3.5-9b-bf16");
+        assert!(r2.healed[0].1.contains("14"), "{:?}", r2.healed);
+        let healed = store.get_model("qwen3.5-9b-bf16").unwrap().unwrap();
+        assert_eq!(healed.bytes, 14, "re-measured to disk truth");
+        assert_eq!(healed.shards, 2);
+        assert_eq!(healed.ctx_train, Some(262_144));
+        assert!(
+            healed.repo.starts_with("adopted:"),
+            "ownership dialect kept"
+        );
+
+        // Third boot: silent again — heal is a one-shot correction.
+        let r3 = reconcile_models(&dirs, &store);
+        assert!(r3.healed.is_empty(), "{:?}", r3.healed);
+    }
+
+    #[test]
+    fn unit__reconcile__dir_row_config_unreadable_keeps_old_row() {
+        // A re-download in flight may leave config.json momentarily
+        // unreadable: heal must fail-open and keep the existing row
+        // rather than planning on a partial dir.
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir().join("guard.d");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("config.json"),
+            br#"{"architectures":["Qwen2ForCausalLM"],"max_position_embeddings":8192}"#,
+        )
+        .unwrap();
+        std::fs::write(d.join("model.safetensors"), b"aaaa").unwrap();
+        let store = Store::open(&dirs).unwrap();
+        let _ = reconcile_models(&dirs, &store);
+        assert_eq!(store.get_model("guard").unwrap().unwrap().bytes, 4);
+
+        std::fs::write(d.join("model-00002.safetensors"), b"bb").unwrap();
+        std::fs::write(d.join("config.json"), b"{ truncated").unwrap(); // mid-replace
+        let r2 = reconcile_models(&dirs, &store);
+        assert!(r2.healed.is_empty(), "{:?}", r2.healed);
+        assert_eq!(
+            store.get_model("guard").unwrap().unwrap().bytes,
+            4,
+            "stale-but-honest beats zeroed"
+        );
     }
 
     #[test]

@@ -327,6 +327,10 @@ blazar lora list
 blazar mmproj ...
 ```
 
+Adapter format follows the model's engine lane. GGUF checkpoint files (`.gguf`/`.bin`) attach to models served by llama.cpp/mistral.rs; PEFT LoRA dirs (the `adapter_config.json` + `adapter_model.safetensors` layout that Hugging Face trains) attach to safetensors-dir models served by sglang, which loads them at runtime — no merge step, one base in VRAM, many adapters. `blazar lora add` refuses mismatches at the door (unknown model, missing path, GGUF file on a safetensors model, PEFT dir on a GGUF model) with the correction spelled out; the supervisor refuses adapters that vanished from disk at spawn time instead of letting the child crash-loop.
+
+Requesting `model+adapter` spawns a dedicated child running only that adapter, so the adapted and base models coexist as separate instances. The suffix addresses the adapter by its full file/dir name (dotted names like `anonymizer-1.7b` work whole) or by the stem shorthand (the name truncated at its last dot). On the sglang lane, adapter scale is fixed by the training (PEFT alpha/rank) and the scale argument is ignored. Typed-decision adapters — LoRA-tuned classifiers such as Bespoke-Nimble-9B that answer schema-constrained choice lists — pair naturally with the gateway's `response_format`/`json_schema`, `logit_bias`, and `logprobs` passthrough: constrain to the candidate tokens, read the single-token answer plus its probability.
+
 ### Images, video, and speech
 
 `blazar run` is multimodal by model kind: text models open a streaming chat loop, diffusion sets generate images or video, and pulled piper voices write WAV clips — with an inline `PROMPT` every lane runs single-shot and exits. The same media lanes are served over HTTP on the routes listed above.

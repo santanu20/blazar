@@ -539,6 +539,12 @@ pub enum SupervisionError {
     CircuitOpen(String),
     #[error("all slots busy: capacity reached and nothing idle to evict")]
     AllSlotsBusy,
+    /// The incoming admission floor exceeds every candidate card even on
+    /// an empty box — no eviction or queue wait can ever change the
+    /// verdict, so the caller must refuse fast with numbers instead of
+    /// parking the request behind the bounded `all_slots_busy` queue.
+    #[error("{0}")]
+    ModelTooLarge(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -1908,6 +1914,51 @@ impl Supervisor {
     /// each fit "the summed VRAM" while colliding on one physical card.
     /// Tensor splits and unknown placements carry no card id, so the
     /// legacy aggregate belt still applies whenever they are resident.
+    /// Candidate cards for an incoming spawn's per-card admission: manual
+    /// `devices` pins scope it exactly; otherwise every discrete card
+    /// (integrated shared-RAM cards only when nothing discrete exists).
+    /// Shared by the busy check and the physical-fit check so the two can
+    /// never disagree about which cards were judged. Owned strings: the
+    /// manual-pin branch must materialize its own list (spawn path only,
+    /// a card or two — the clone is nothing).
+    fn admission_candidates(&self, name: &str) -> Vec<String> {
+        let manual = self.config.effective_devices(name).to_vec();
+        if !manual.is_empty() {
+            return manual;
+        }
+        let discrete: Vec<String> = self
+            .hardware
+            .gpus
+            .iter()
+            .filter(|g| !g.is_integrated())
+            .map(|g| g.name.clone())
+            .collect();
+        if discrete.is_empty() {
+            self.hardware.gpus.iter().map(|g| g.name.clone()).collect()
+        } else {
+            discrete
+        }
+    }
+
+    /// Physical-fit verdict for an incoming floor: `Some(best)` when the
+    /// floor exceeds EVERY known candidate card on an EMPTY box — waiting
+    /// or evicting can never change that, so the caller refuses with the
+    /// numbers instead of queueing a request that can only time out.
+    /// `None` = some card could hold it empty (busy is then a resident
+    /// problem, honestly queueable), or a card is unjudgeable (fail open;
+    /// the spawn-time probe owns that refuse).
+    fn largest_card_budget(&self, name: &str, incoming_bytes: u64) -> Option<u64> {
+        let mut best: Option<u64> = None;
+        for card in self.admission_candidates(name) {
+            let budget = self.device_budget_bytes(&card)?;
+            if incoming_bytes <= budget {
+                return None;
+            }
+            best = Some(best.map_or(budget, |b| b.max(budget)));
+        }
+        best
+    }
+
     fn admission_blocked(&self, name: &str, incoming_bytes: u64) -> bool {
         if self
             .instance_cap()
@@ -1918,23 +1969,7 @@ impl Supervisor {
         if !self.bytes_admission_active() || self.instances.is_empty() {
             return false;
         }
-        let manual = self.config.effective_devices(name).to_vec();
-        let candidates: Vec<&str> = if manual.is_empty() {
-            let discrete: Vec<&str> = self
-                .hardware
-                .gpus
-                .iter()
-                .filter(|g| !g.is_integrated())
-                .map(|g| g.name.as_str())
-                .collect();
-            if discrete.is_empty() {
-                self.hardware.gpus.iter().map(|g| g.name.as_str()).collect()
-            } else {
-                discrete
-            }
-        } else {
-            manual.iter().map(String::as_str).collect()
-        };
+        let candidates = self.admission_candidates(name);
         if candidates.is_empty() {
             return self.resident_bytes().saturating_add(incoming_bytes) > self.vram_budget_bytes();
         }
@@ -3267,44 +3302,92 @@ impl Supervisor {
             })
     }
 
+    /// Effective weights bytes for planning. Dir rows re-measure from
+    /// disk: a row adopted mid-download froze a partial size and
+    /// reconcile only heals at boot, while engine updates and manual
+    /// copies can change a dir between boots. Measurement is an accuracy
+    /// upgrade, never a refusal — unreadable/empty dirs fall back to the
+    /// stored row bytes. File rows (GGUF, mmproj) pass through as-is.
+    fn measured_model_bytes(model: &ModelRow) -> u64 {
+        let row_bytes = u64::try_from(model.bytes.max(0)).unwrap_or(u64::MAX);
+        let path = std::path::Path::new(&model.path);
+        if !path.is_dir() {
+            return row_bytes;
+        }
+        match blazar_core::hfmeta::root_safetensors_bytes(path) {
+            Some(measured) if measured != row_bytes => {
+                tracing::warn!(
+                    model = %model.name,
+                    row_bytes,
+                    measured,
+                    "dir row bytes drifted from disk — planning on measured bytes \
+                     (reconcile rewrites the row at next boot)"
+                );
+                measured
+            }
+            _ => row_bytes,
+        }
+    }
+
     /// Adapter set for a spawn: dense lanes load every attached row
     /// (`blazar lora add` = always-on, the pre-variant semantics); an
     /// on-demand `model+adapter` lane loads ONLY the named row so the
     /// adapted child coexists with the dense one as a separate instance.
-    /// The stem names the adapter FILE (path stem given to
-    /// `blazar lora add`); unknown or duplicated stems are teaching
-    /// errors, never silent drops.
+    /// The suffix names the adapter by FILE NAME (a dotted name like
+    /// `anonymizer-1.7b` addresses the whole name) or by STEM
+    /// shorthand (`anonymizer-1`); unknown or duplicated
+    /// suffixes are teaching errors, never silent drops. A resolved row
+    /// whose adapter vanished from disk is likewise refused here —
+    /// passing it downstream would surface as an engine-side load
+    /// failure (child crash-loop), not a repairable message.
     fn resolve_lora_lane(
-        rows: Vec<blazar_core::LoraRow>,
+        rows: &[blazar_core::LoraRow],
         name: &str,
         stem: Option<&str>,
     ) -> Result<Vec<(String, f64)>, SupervisionError> {
-        let Some(stem) = stem else {
-            return Ok(rows.into_iter().map(|l| (l.path, l.scale)).collect());
+        let resolved: Vec<&blazar_core::LoraRow> = match stem {
+            None => rows.iter().collect(),
+            Some(stem) => {
+                let matches: Vec<&blazar_core::LoraRow> = rows
+                    .iter()
+                    .filter(|l| {
+                        let p = std::path::Path::new(&l.path);
+                        p.file_name().is_some_and(|s| s == stem)
+                            || p.file_stem().is_some_and(|s| s == stem)
+                    })
+                    .collect();
+                match matches.as_slice() {
+                    [only] => vec![*only],
+                    [] => {
+                        return Err(SupervisionError::ModelNotFound(format!(
+                            "no lora {stem:?} attached to {name:?}: attach it with \
+                             `blazar lora add {name} <adapter-file>` then request \
+                             `{name}+{stem}` (attached rows: `blazar lora list`)"
+                        )))
+                    }
+                    many => {
+                        let ids: Vec<i64> = many.iter().map(|l| l.id).collect();
+                        return Err(SupervisionError::ModelNotFound(format!(
+                            "lora {stem:?} on {name:?} is ambiguous (rows {ids:?}) — \
+                             `blazar lora rm <id>` the duplicates"
+                        )));
+                    }
+                }
+            }
         };
-        let matches: Vec<&blazar_core::LoraRow> = rows
-            .iter()
-            .filter(|l| {
-                std::path::Path::new(&l.path)
-                    .file_stem()
-                    .is_some_and(|s| s == stem)
-            })
-            .collect();
-        match matches.as_slice() {
-            [only] => Ok(vec![(only.path.clone(), only.scale)]),
-            [] => Err(SupervisionError::ModelNotFound(format!(
-                "no lora {stem:?} attached to {name:?}: attach it with \
-                 `blazar lora add {name} <adapter-file>` then request \
-                 `{name}+{stem}` (attached rows: `blazar lora list`)"
-            ))),
-            many => {
-                let ids: Vec<i64> = many.iter().map(|l| l.id).collect();
-                Err(SupervisionError::ModelNotFound(format!(
-                    "lora {stem:?} on {name:?} is ambiguous (rows {ids:?}) — \
-                     `blazar lora rm <id>` the duplicates"
-                )))
+        for l in &resolved {
+            if !std::path::Path::new(&l.path).exists() {
+                return Err(SupervisionError::ModelNotFound(format!(
+                    "lora {} (row #{}) attached to {name:?} is missing on disk — \
+                     re-download the adapter or `blazar lora rm {}` the row",
+                    l.path, l.id, l.id
+                )));
             }
         }
+        Ok(resolved
+            .into_iter()
+            .map(|l| (l.path.clone(), l.scale))
+            .collect())
     }
 
     // Full child lifecycle in one pass: argv build, spawn, settle, health
@@ -3385,7 +3468,7 @@ impl Supervisor {
             ))
         })?;
         let loras = Self::resolve_lora_lane(
-            store
+            &store
                 .list_loras(Some(name))
                 .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?,
             name,
@@ -3476,7 +3559,26 @@ impl Supervisor {
                         .await
                         .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
                 }
-                BlockedAction::Refuse => return Err(SupervisionError::AllSlotsBusy),
+                BlockedAction::Refuse => {
+                    // Split the old conflation: an incoming floor larger
+                    // than every card is physically unschedulable — no
+                    // queue wait can ever change it, so refuse fast with
+                    // numbers. Genuinely-evictable pressure keeps the
+                    // queueable AllSlotsBusy.
+                    if let Some(best) = self.largest_card_budget(name, incoming_bytes) {
+                        #[allow(clippy::cast_precision_loss)] // display-only GiB rounding
+                        let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+                        return Err(SupervisionError::ModelTooLarge(format!(
+                            "{name}: admission floor {:.1} GiB exceeds every GPU budget \
+                             (largest card {:.1} GiB) even with the box empty — waiting for \
+                             a slot can never change this. Use a smaller quant (`blazar fit`), \
+                             lower the ctx/slots, or serve on a larger card",
+                            gib(incoming_bytes),
+                            gib(best)
+                        )));
+                    }
+                    return Err(SupervisionError::AllSlotsBusy);
+                }
             }
         }
 
@@ -3501,7 +3603,9 @@ impl Supervisor {
         }
 
         let manifest = engine.capabilities();
-        let model_bytes = u64::try_from(model.bytes.max(0)).unwrap_or(u64::MAX);
+        // Belt over the stored row: dir rows re-measure so a frozen
+        // mid-download size never feeds the fit ladder or the J3 warn.
+        let model_bytes = Self::measured_model_bytes(&model);
         // One fresh hardware probe serves both spawn-time decisions: the
         // J3 VRAM preflight and the LC2 auto GPU pick. The boot-time
         // snapshot can be stale (other engines came and went).
@@ -3593,7 +3697,7 @@ impl Supervisor {
                 model_name: name,
                 instance_key: key,
                 model_path: &model.path,
-                model_bytes: u64::try_from(model.bytes.max(0)).unwrap_or(u64::MAX),
+                model_bytes,
                 meta: meta_box.borrow_meta(),
                 hardware: fresh.as_ref().unwrap_or(&self.hardware),
                 config: &self.config,
@@ -3828,7 +3932,7 @@ impl Supervisor {
                 // must match the dir created for THIS instance key.
                 instance_key: key,
                 model_path: &model.path,
-                model_bytes: u64::try_from(model.bytes.max(0)).unwrap_or(u64::MAX),
+                model_bytes,
                 meta: meta_box.borrow_meta(),
                 // Scoped (picked card) > fresh census > boot snapshot:
                 // single-GPU boxes previously planned against the
@@ -7679,6 +7783,43 @@ mod routing_tests {
 
     #[tokio::test]
     #[allow(non_snake_case)]
+    async fn unit__largest_card_budget__impossible_vs_busy_vs_fail_open() {
+        let mib = |m: u64| m * 1024 * 1024;
+        let (mut sup, _root) = dual_gpu_sup();
+        // Both cards are 8188 MiB: a 9000 MiB floor cannot fit either one
+        // even on an empty box — physically unschedulable, must surface as
+        // the largest budget so the refusal can teach the numbers.
+        assert_eq!(
+            sup.largest_card_budget("other", mib(9_000)),
+            Some(mib(8_188))
+        );
+        // 3000 MiB fits an empty card: any blocking is residents in the
+        // way — honestly queueable, never a physical refusal.
+        assert_eq!(sup.largest_card_budget("other", mib(3_000)), None);
+        // Exactly-budget edge: fits (<=), not impossible.
+        assert_eq!(sup.largest_card_budget("other", mib(8_188)), None);
+        // Manual pin to a card the census cannot judge: fail open — the
+        // spawn-time probe owns that refuse, never a false "too large".
+        sup.config.devices = vec!["CUDA9".to_string()];
+        assert_eq!(sup.largest_card_budget("other", mib(9_000)), None);
+        // Reachability of the refusal arm: with a resident on one card,
+        // the 9000 MiB floor is admission-blocked AND physically
+        // impossible — the Refuse arm must classify it ModelTooLarge.
+        sup.config.devices = Vec::new();
+        let (big0, _p0) = placed_gpu_instance(
+            "big0",
+            mib(100).cast_signed(),
+            6_000,
+            "GPU0",
+            "NVIDIA GeForce RTX 4070",
+        );
+        sup.instances.insert("big0".to_string(), big0);
+        assert!(sup.admission_blocked("other", mib(9_000)));
+        assert!(sup.largest_card_budget("other", mib(9_000)).is_some());
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
     async fn unit__reservation_fits_device__reservation_replaces_incoming_not_adds() {
         let mib = |m: u64| m * 1024 * 1024;
         let (sup, _root) = dual_gpu_sup();
@@ -8020,33 +8161,50 @@ mod routing_tests {
     #[test]
     fn unit__resolve_lora_lane__dense_variant_and_teaching() {
         use blazar_core::LoraRow;
-        let row = |id: i64, path: &str, scale: f64| LoraRow {
+        // Rows must point at REAL paths: admission refuses adapters that
+        // vanished from disk, so string-only fixtures would trip that
+        // check instead of the stem-matching contract under test.
+        let root = std::env::temp_dir().join(format!(
+            "blazar-lora-lane-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(root.join("rsmma.gguf"), b"adapter").unwrap();
+        std::fs::write(root.join("x.gguf"), b"adapter").unwrap();
+        std::fs::write(root.join("a/rsmma.gguf"), b"adapter").unwrap();
+        std::fs::write(root.join("b/rsmma.gguf"), b"adapter").unwrap();
+        let p = |rel: &str| root.join(rel).display().to_string();
+        let row = |id: i64, path: String, scale: f64| LoraRow {
             id,
             model_name: "m".into(),
-            path: path.into(),
+            path,
             scale,
         };
-        let rows = vec![
-            row(1, "/adapters/rsmma.gguf", 1.0),
-            row(2, "/tmp/x.gguf", 0.5),
-        ];
+        let rows = vec![row(1, p("rsmma.gguf"), 1.0), row(2, p("x.gguf"), 0.5)];
         // Dense lane: every attached row, always-on semantics preserved.
-        let dense = Supervisor::resolve_lora_lane(rows.clone(), "m", None).unwrap();
+        let dense = Supervisor::resolve_lora_lane(&rows, "m", None).unwrap();
         assert_eq!(dense.len(), 2);
-        assert_eq!(dense[1], ("/tmp/x.gguf".to_string(), 0.5));
+        assert_eq!(dense[1], (p("x.gguf"), 0.5));
         // Variant lane: ONLY the named stem, with its own scale.
-        let variant = Supervisor::resolve_lora_lane(rows.clone(), "m", Some("rsmma")).unwrap();
-        assert_eq!(variant, vec![("/adapters/rsmma.gguf".to_string(), 1.0)]);
+        let variant = Supervisor::resolve_lora_lane(&rows, "m", Some("rsmma")).unwrap();
+        assert_eq!(variant, vec![(p("rsmma.gguf"), 1.0)]);
         // Unknown stem: teaching error names the model and the command.
-        let err = Supervisor::resolve_lora_lane(rows.clone(), "m", Some("nope")).unwrap_err();
+        let err = Supervisor::resolve_lora_lane(&[], "m", Some("nope")).unwrap_err();
         let SupervisionError::ModelNotFound(msg) = &err else {
             panic!("unknown stem must be ModelNotFound, got {err:?}");
         };
         assert!(msg.contains("blazar lora add"), "{msg}");
         assert!(msg.contains("m+nope"), "{msg}");
         // Duplicate stems: ambiguity teaching with row ids.
-        let dup = vec![row(3, "/a/rsmma.gguf", 1.0), row(4, "/b/rsmma.gguf", 1.0)];
-        let err = Supervisor::resolve_lora_lane(dup, "m", Some("rsmma")).unwrap_err();
+        let dup = vec![
+            row(3, p("a/rsmma.gguf"), 1.0),
+            row(4, p("b/rsmma.gguf"), 1.0),
+        ];
+        let err = Supervisor::resolve_lora_lane(&dup, "m", Some("rsmma")).unwrap_err();
         let SupervisionError::ModelNotFound(msg) = &err else {
             panic!("duplicate stems must be ModelNotFound, got {err:?}");
         };
@@ -8054,6 +8212,136 @@ mod routing_tests {
             msg.contains("ambiguous") && msg.contains('3') && msg.contains('4'),
             "{msg}"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn unit__resolve_lora_lane__missing_disk_refused_dense_and_variant() {
+        use blazar_core::LoraRow;
+        let root = std::env::temp_dir().join(format!(
+            "blazar-lora-missing-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let present = root.join("here.gguf");
+        std::fs::write(&present, b"adapter").unwrap();
+        let gone = root.join("gone.gguf"); // never written: vanished adapter
+        let row = |id: i64, path: String| LoraRow {
+            id,
+            model_name: "m".into(),
+            path,
+            scale: 1.0,
+        };
+        // Dense arm: one missing row sinks the whole admission with the
+        // row id and the repair command — never a silent partial load.
+        let dense = vec![
+            row(7, present.display().to_string()),
+            row(8, gone.display().to_string()),
+        ];
+        let err = Supervisor::resolve_lora_lane(&dense, "m", None).unwrap_err();
+        let SupervisionError::ModelNotFound(msg) = &err else {
+            panic!("dense missing disk must be ModelNotFound, got {err:?}");
+        };
+        assert!(
+            msg.contains("missing on disk")
+                && msg.contains("#8")
+                && msg.contains("blazar lora rm 8"),
+            "{msg}"
+        );
+        // Variant arm: same refusal for the named-stem path.
+        let variant = vec![row(9, gone.display().to_string())];
+        let err = Supervisor::resolve_lora_lane(&variant, "m", Some("gone")).unwrap_err();
+        let SupervisionError::ModelNotFound(msg) = &err else {
+            panic!("variant missing disk must be ModelNotFound, got {err:?}");
+        };
+        assert!(
+            msg.contains("missing on disk")
+                && msg.contains("#9")
+                && msg.contains("blazar lora rm 9"),
+            "{msg}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn unit__resolve_lora_lane__dotted_full_name_matches() {
+        use blazar_core::LoraRow;
+        let root = std::env::temp_dir().join(format!(
+            "blazar-lora-dotted-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        // PEFT adapter dirs keep their full dotted name (base-version
+        // suffixes like `-1.7b`): the whole name addresses the row, the
+        // file_stem shorthand (truncated at the last dot) still does.
+        let dir = root.join("anonymizer-qwen3-1.7b");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rows = vec![LoraRow {
+            id: 11,
+            model_name: "m".into(),
+            path: dir.display().to_string(),
+            scale: 0.5,
+        }];
+        let full = Supervisor::resolve_lora_lane(&rows, "m", Some("anonymizer-qwen3-1.7b"))
+            .expect("dotted full dir name must resolve");
+        assert_eq!(full, vec![(dir.display().to_string(), 0.5)]);
+        let stem = Supervisor::resolve_lora_lane(&rows, "m", Some("anonymizer-qwen3-1"))
+            .expect("stem shorthand must keep working");
+        assert_eq!(stem, full);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn unit__measured_model_bytes__dir_measured_file_passthrough() {
+        use blazar_core::ModelRow;
+        let root = std::env::temp_dir().join(format!(
+            "blazar-measured-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("config.json"), "{}").unwrap();
+        std::fs::write(root.join("w-00001.safetensors"), vec![0u8; 4096]).unwrap();
+        std::fs::write(root.join("w-00002.safetensors"), vec![0u8; 1024]).unwrap();
+        let row = |name: &str, path: String, bytes: i64| ModelRow {
+            name: name.into(),
+            repo: String::new(),
+            quant: String::new(),
+            path,
+            bytes,
+            sha256: None,
+            mmproj_path: None,
+            components: vec![],
+            shards: 0,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+        };
+        // Dir row with a stale frozen size: planning sees the disk truth.
+        let dir_row = row("stale.d", root.display().to_string(), 1024);
+        assert_eq!(Supervisor::measured_model_bytes(&dir_row), 5120);
+        // Dir row already honest: unchanged (no drift path taken).
+        let fresh_row = row("fresh.d", root.display().to_string(), 5120);
+        assert_eq!(Supervisor::measured_model_bytes(&fresh_row), 5120);
+        // File row (GGUF lane): passthrough, never stat-walked.
+        let file_row = row("m.gguf", root.join("m.gguf").display().to_string(), 777);
+        assert_eq!(Supervisor::measured_model_bytes(&file_row), 777);
+        // Dir that lost its weights (re-download in flight): fail-open
+        // to the row bytes rather than planning on zero.
+        let empty = root.join("empty.d");
+        std::fs::create_dir_all(&empty).unwrap();
+        let empty_row = row("empty.d", empty.display().to_string(), 2048);
+        assert_eq!(Supervisor::measured_model_bytes(&empty_row), 2048);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]

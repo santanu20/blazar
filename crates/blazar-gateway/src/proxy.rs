@@ -463,6 +463,10 @@ pub fn supervision_error(e: &SupervisionError) -> Response {
             &format!("circuit open for {m}: engine keeps crashing; run `blazar ps --reset`"),
         ),
         SupervisionError::AllSlotsBusy => openai_error(503, "all slots busy"),
+        // Physically unschedulable load: teaching refusal with numbers,
+        // served immediately — queueing this could only burn the caller's
+        // two-minute admission budget for a verdict known at entry.
+        SupervisionError::ModelTooLarge(m) => openai_error(503, m),
         SupervisionError::EngineCrashed(m) => openai_error(502, &format!("engine crashed: {m}")),
         SupervisionError::Internal(e) => openai_error(500, &format!("{e:#}")),
     }

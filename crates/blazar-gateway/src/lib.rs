@@ -1266,6 +1266,29 @@ mod tests {
             "teaching remedy must survive the mapping"
         );
     }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__supervision_error__model_too_large_maps_to_503_teaching() {
+        use crate::proxy::supervision_error;
+        use blazar_runtime::SupervisionError;
+        let resp = supervision_error(&SupervisionError::ModelTooLarge(
+            "qwen: admission floor 17.2 GiB exceeds every GPU budget (largest card 7.6 GiB) \
+             even with the box empty — waiting for a slot can never change this. Use a smaller \
+             quant (`blazar fit`), lower the ctx/slots, or serve on a larger card"
+                .to_string(),
+        ));
+        assert_eq!(resp.status(), 503);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let msg = v["error"]["message"].as_str().expect("message");
+        assert!(
+            msg.contains("can never change this") && msg.contains("blazar fit"),
+            "physical-refusal teaching must survive the mapping: {msg}"
+        );
+    }
 }
 
 #[cfg(test)]

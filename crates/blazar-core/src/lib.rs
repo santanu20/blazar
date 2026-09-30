@@ -25,6 +25,8 @@ pub use dirs::BlazarDirs;
 pub use error::{CoreError, CoreResult};
 pub use gguf::{is_gguf_container, read_metadata_file, GgufMeta, GgufValue};
 pub use hardware::{GpuInfo, Hardware};
-pub use hfmeta::{read_hf_config, HfMeta, KvGeom, ModelMeta};
+pub use hfmeta::{
+    read_hf_config, root_safetensors, root_safetensors_bytes, HfMeta, KvGeom, ModelMeta,
+};
 pub use profile::{compile as compile_profile, Endpoint, Profile, ProfileInput, TuningOverrides};
 pub use store::{EngineRow, KeyUsageRow, LoraRow, ModelRow, ProfileRow, Store};
