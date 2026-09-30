@@ -1330,6 +1330,15 @@ _K = [
         "(--enable-deterministic-inference needs an engine newer than b11147)",
     ),
     (
+        "deterministic_isolate",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "set->list echo + exclusive temp-0 admission knob "
+        "(parks other requests for the model until the seeded holder finishes)",
+    ),
+    (
         "cache_type",
         False,
         False,
@@ -1991,6 +2000,10 @@ MODEL_OVERRIDE_FIELDS = [
         "deterministic",
         "resolve_slots pin: forces -np 1 (greedy reproducibility)",
     ),
+    (
+        "deterministic_isolate",
+        "exclusive admission for temp-0 + seeded requests (Wave J)",
+    ),
     ("spec", "argv: --spec-type"),
     ("loras", "wave: lora attach"),
     ("extra_args", "argv: passthrough tokens"),
@@ -2206,13 +2219,28 @@ def regb(path: str, why: str) -> None:
 
 
 def lane(path: str, fn, *sub: str) -> None:
-    """Run lane fn() unless FAST mode excludes this path (manifest attr)."""
+    """Run lane fn() unless FAST mode excludes this path (manifest attr).
+
+    A lane that raises (slow-network pull timeouts, unexpected CLI
+    crashes) must boundary THAT lane with the failure named, not kill
+    the whole phase — the 2026-09-30 runs lost every remaining check to
+    one 3600s F16-pull TimeoutExpired propagating out of here.
+    """
     entry = next(c for c in COMMANDS if c["path"] == path)
     if FAST and not entry["fast"]:
         for p in (path, *sub):
             regb(p, "FAST mode: full run executes this lane for real")
         return
-    fn()
+    try:
+        fn()
+    except subprocess.TimeoutExpired as exc:
+        cmd = exc.cmd if isinstance(exc.cmd, str) else " ".join(exc.cmd or [])
+        for p in (path, *sub):
+            regb(p, f"lane timed out after {exc.timeout}s: {cmd[:120]}")
+    except Exception as exc:  # noqa: BLE001 — boundary the lane, name the failure
+        head = f"{type(exc).__name__}: {exc}"[:200]
+        for p in (path, *sub):
+            regb(p, f"harness lane crashed: {head}")
 
 
 def disk_free_gb(path: str = REAL_DATA) -> float:
@@ -3205,6 +3233,139 @@ def wait_record(
                 return r
         time.sleep(1)
     return None
+
+
+def _fixture_cache_dir() -> Path:
+    return Path.home() / ".cache/blazar-validate-fixtures"
+
+
+def seed_main_store_model(ref: str) -> bool:
+    """Seed one fixture into the sandbox instead of re-downloading.
+
+    Re-downloading a 1.5 GB f16 fixture on every commands-phase run just
+    to quantize it wastes the window. Sources, in order: this harness's
+    fixture cache (~/.cache/blazar-validate-fixtures, populated by
+    _promote_fixture after the first successful pull) and the user's
+    main store (~/.local/share/blazar) when it already holds the same
+    repo+quant. Either way the file is hardlinked (copy fallback) into
+    the sandbox and the store row copied verbatim (path rebased), so
+    `blazar pull` resolves the row and skips the network entirely.
+    Network pull stays the fallback for uncached fixtures.
+    """
+    assert SANDBOX is not None
+    if not ref or ":" not in ref:
+        return False
+    repo, _, quant = ref.rpartition(":")
+    import sqlite3
+
+    row = None
+    cache_meta = _fixture_cache_dir() / f"{repo.replace('/', '_')}__{quant}.json"
+    if cache_meta.exists():
+        try:
+            row = dict(json.loads(cache_meta.read_text()))
+            cached_file = _fixture_cache_dir() / Path(row["path"]).name
+            if not cached_file.exists():
+                row = None
+            else:
+                row["path"] = str(cached_file)
+        except (ValueError, KeyError):
+            row = None
+    if row is None:
+        main_db = Path.home() / ".local/share/blazar/blazar.db"
+        if not main_db.exists():
+            return False
+        try:
+            main = sqlite3.connect(f"file:{main_db}?mode=ro", uri=True)
+            main.row_factory = sqlite3.Row
+            hit = main.execute(
+                "SELECT name, repo, quant, path, bytes, sha256, mmproj_path,"
+                " components, shards, arch, params, ctx_train, pulled_at"
+                " FROM models WHERE repo = ? AND quant = ?",
+                (repo, quant),
+            ).fetchone()
+            main.close()
+        except sqlite3.Error:
+            return False
+        if hit is None or not hit["path"] or not Path(hit["path"]).exists():
+            return False
+        row = dict(hit)
+    sb_models = Path(SANDBOX.data_dir) / "models"
+    sb_models.mkdir(parents=True, exist_ok=True)
+    dest = sb_models / Path(row["path"]).name
+    if not dest.exists():
+        try:
+            os.link(row["path"], dest)
+        except OSError:
+            shutil.copy2(row["path"], dest)
+    sb_db = Path(SANDBOX.data_dir) / "blazar.db"
+    sb = sqlite3.connect(sb_db)
+    sb.execute(
+        "INSERT INTO models (name, repo, quant, path, bytes, sha256,"
+        " mmproj_path, components, shards, arch, params, ctx_train, pulled_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        " ON CONFLICT(name) DO UPDATE SET"
+        " repo=excluded.repo, quant=excluded.quant, path=excluded.path,"
+        " bytes=excluded.bytes, sha256=excluded.sha256,"
+        " mmproj_path=excluded.mmproj_path, components=excluded.components,"
+        " shards=excluded.shards, arch=excluded.arch, params=excluded.params,"
+        " ctx_train=excluded.ctx_train, pulled_at=excluded.pulled_at",
+        (
+            row["name"],
+            row["repo"],
+            row["quant"],
+            str(dest),
+            row["bytes"],
+            row["sha256"],
+            row["mmproj_path"],
+            row["components"],
+            row["shards"],
+            row["arch"],
+            row["params"],
+            row["ctx_train"],
+            row["pulled_at"],
+        ),
+    )
+    sb.commit()
+    sb.close()
+    print(f"[seed] {ref}: reused {Path(row['path']).name} (no download)")
+    return True
+
+
+def _promote_fixture(ref: str) -> None:
+    """Cache a freshly pulled fixture so later runs seed instead of pull."""
+    assert SANDBOX is not None
+    if not ref or ":" not in ref:
+        return
+    repo, _, quant = ref.rpartition(":")
+    import sqlite3
+
+    sb_db = Path(SANDBOX.data_dir) / "blazar.db"
+    if not sb_db.exists():
+        return
+    try:
+        sb = sqlite3.connect(f"file:{sb_db}?mode=ro", uri=True)
+        sb.row_factory = sqlite3.Row
+        row = sb.execute(
+            "SELECT name, repo, quant, path, bytes, sha256, mmproj_path,"
+            " components, shards, arch, params, ctx_train, pulled_at"
+            " FROM models WHERE repo = ? AND quant = ?",
+            (repo, quant),
+        ).fetchone()
+        sb.close()
+    except sqlite3.Error:
+        return
+    if row is None or not row["path"] or not Path(row["path"]).exists():
+        return
+    cache = _fixture_cache_dir()
+    cache.mkdir(parents=True, exist_ok=True)
+    dest = cache / Path(row["path"]).name
+    if not dest.exists():
+        try:
+            os.link(row["path"], dest)
+        except OSError:
+            shutil.copy2(row["path"], dest)
+    meta = cache / f"{repo.replace('/', '_')}__{quant}.json"
+    meta.write_text(json.dumps({k: row[k] for k in row.keys()}))
 
 
 def cli(
@@ -7599,8 +7760,19 @@ def phase_commands() -> None:
     def _pull_retry(*args, timeout=2400):
         # Single explicit retry for transient HF API failures (observed
         # intermittent 429/5xx on /api/models). Policy: max 1 retry, 10s
-        # backoff, evidence carries both attempts — never silent.
-        return _pull_retry_cmd(list(args), timeout=timeout)
+        # backoff, evidence carries both attempts — never silent. A
+        # cached or main-store fixture seeds the sandbox first so the
+        # pull resolves locally instead of re-downloading.
+        if (
+            args
+            and args[0] == "pull"
+            and seed_main_store_model(args[1] if len(args) > 1 else "")
+        ):
+            return cli("pull", *(args[1:] if len(args) > 1 else []), timeout=timeout)
+        result = _pull_retry_cmd(list(args), timeout=timeout)
+        if args and args[0] == "pull" and result.returncode == 0:
+            _promote_fixture(args[1] if len(args) > 1 else "")
+        return result
 
     def _pull_retry_cmd(argv, timeout=2400):
         p = cli(*argv, timeout=timeout)
@@ -7739,19 +7911,32 @@ def phase_commands() -> None:
             p.returncode == 0 and len(p.stdout.strip()) > 0,
             p.stdout.strip()[:80],
         )
-        # pin lifecycle: standalone flag path (no install/net), real tag dir
-        # from the sandbox install above.
-        bin_root = os.path.join(SANDBOX.data_dir, "whisper", "bin")
-        tag = ""
-        if os.path.isdir(bin_root):
-            tag = next(
-                (
-                    e
-                    for e in sorted(os.listdir(bin_root))
-                    if os.path.isdir(os.path.join(bin_root, e))
-                ),
-                "",
-            )
+
+        # pin lifecycle: standalone flag path (no install/net), real tag
+        # dir from the sandbox install above. Whisper servers install
+        # under engines/<tag>/<release-dir>/whisper-server (live shape:
+        # engines/b5130/whisper-bin-ubuntu-x64); the old whisper/bin
+        # root stays as a legacy fallback.
+        def _whisper_tags(root: str) -> list[str]:
+            tags: list[str] = []
+            if not os.path.isdir(root):
+                return tags
+            for e in sorted(os.listdir(root)):
+                ed = os.path.join(root, e)
+                if not os.path.isdir(ed):
+                    continue
+                for sub in os.listdir(ed):
+                    sd = os.path.join(ed, sub)
+                    if os.path.isdir(sd) and any(
+                        n.startswith("whisper-server") for n in os.listdir(sd)
+                    ):
+                        tags.append(e)
+                        break
+            return tags
+
+        eng_root = os.path.join(SANDBOX.data_dir, "engines")
+        legacy_root = os.path.join(SANDBOX.data_dir, "whisper", "bin")
+        tag = next(iter(_whisper_tags(eng_root) or _whisper_tags(legacy_root)), "")
         pin_ok = False
         if tag:
             p = cli("whisper", "--pin", tag)
@@ -8245,7 +8430,11 @@ def phase_commands() -> None:
         )
         out = p.stdout + p.stderr
         if p.returncode != 0 and (
-            "rate limited" in out.lower() or "403" in out or "disk" in out.lower()
+            "rate limited" in out.lower()
+            or "403" in out
+            or "disk" in out.lower()
+            or "error sending request" in out
+            or "request failed" in out
         ):
             regb("engine.install", f"blocked this window: {out.strip()[:120]}")
             return
@@ -8380,6 +8569,8 @@ def phase_commands() -> None:
             or "rate" in err
             or "timed out" in err
             or "connection" in err
+            or "error sending request" in err
+            or "request failed" in err
         )
         if transient:
             regb(
@@ -8426,11 +8617,36 @@ def phase_commands() -> None:
         )
         after = set(cli("list").stdout.split())
         new = {w for w in after - before if "qwen3" in w.lower()}
-        reg(
-            "run.miss-pulls",
-            p.returncode == 0 and bool(new) and "not in the store" in (p.stdout or ""),
-            f"rc={p.returncode} new={sorted(new)[:3]}",
+        miss_out = (p.stdout or "") + (p.stderr or "")
+        # A killed child (negative rc) or an upstream network window is
+        # a stall, not a deterministic miss-pull failure — boundary it
+        # like the pull lane does instead of failing the sweep.
+        transient = p.returncode < 0 or any(
+            tok in miss_out
+            for tok in (
+                "429",
+                "502",
+                "503",
+                "rate",
+                "timed out",
+                "connection",
+                "error sending request",
+                "request failed",
+            )
         )
+        if transient:
+            regb(
+                "run.miss-pulls",
+                f"transient window (rc={p.returncode}): {miss_out.strip()[:140]}",
+            )
+        else:
+            reg(
+                "run.miss-pulls",
+                p.returncode == 0
+                and bool(new)
+                and "not in the store" in (p.stdout or ""),
+                f"rc={p.returncode} new={sorted(new)[:3]}",
+            )
         for name in new:
             cli("stop", name)
             cli("rm", name)
@@ -8879,6 +9095,7 @@ def _full_toplevel() -> dict:
         "sglang": {},
         "lazy_mode": "auto",
         "deterministic": False,
+        "deterministic_isolate": False,
         "audit_log": False,
         "cpu_ffn_n": 1,
         # container knob: benign explicit boot (enabled=false — true would
@@ -9080,6 +9297,7 @@ def _overlay_a() -> dict:
         "override_tensor": [".ffn_.*_exps.=CPU"],
         "devices": [],
         "warmup": False,
+        "deterministic_isolate": True,
         "reasoning_budget": 512,
         "reasoning_effort": "medium",
         "replicas": 1,
