@@ -2521,7 +2521,23 @@ class Daemon:
         # page-cache drift can shave tens of MiB off MemAvailable
         # seconds after an identical boot succeeded — one 20 s retry,
         # then abort (explicit policy, never silent looping).
+        # BLAZAR_VALIDATE_MEM_FLOOR_MIB lowers the floor for an explicit
+        # debug window (e.g. a desktop-heavy box proving a MECHANISM,
+        # not recording t/s) — the in-product spawn mem-guard still
+        # aborts if the box truly cannot host the child.
         need = int(model_bytes_mib(floor_model) * 1.25) + 1024
+        floor_env = os.environ.get("BLAZAR_VALIDATE_MEM_FLOOR_MIB")
+        if floor_env is not None:
+            try:
+                need = max(int(floor_env), 1536)
+            except ValueError as e:
+                raise RuntimeError(
+                    f"BLAZAR_VALIDATE_MEM_FLOOR_MIB={floor_env!r} is not an integer"
+                ) from e
+            print(
+                f"validate: mem floor overridden via "
+                f"BLAZAR_VALIDATE_MEM_FLOOR_MIB -> {need} MiB"
+            )
         for attempt in range(2):
             if mem_available_mib() >= max(MEM_FLOOR_MIB, need):
                 break

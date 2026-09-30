@@ -165,6 +165,127 @@ print(
     "conc_frontier: table rows OK, plateau/insufficient/gaining verdicts OK, eff 95% OK"
 )
 
+# --- F6e: 'ok streams' must decompose as 'ok of rounds x conc', never '12/4'
+conc_cell = rec(
+    "conc-blazar",
+    {"conc": 4, "rounds": 3},
+    conc_level=4,
+    conc_ok=12,
+    conc_rounds=3,
+    sys_tps=67.5,
+    sum_stream_tps=433.1,
+    conc_wall_s=22.8,
+    ttft_max_ms=4205,
+    conc_ttft_p99_ms=4204,
+    itl_p99_ms=81.3,
+)
+ctab = bm.conc_table([conc_cell])
+assert "12 of 3x4" in ctab and "12/4" not in ctab, ctab
+ftab, _ = bm.conc_frontier([conc_cell])
+assert "12 of 3x4" in ftab, ftab
+print("conc ok-streams: '12 of 3x4' decomposition in table + frontier OK")
+
+# --- F6a: ollama reference row must carry the not-comparable caveat
+ollama_speed = rec(
+    "ollama",
+    {},
+    tag="ollama-host",
+    ollama_model="qwen3.5:9b",
+    decode_tps_p50=40.6,
+    reference_note=(
+        "reference serves 'qwen3.5:9b' (matrix model differs - t/s NOT comparable)"
+    ),
+)
+stab = bm.speed_table([ollama_speed])
+assert "NOT comparable" in stab and "matrix model differs" in stab, stab
+stab_clean = bm.speed_table(
+    [rec("ollama", {}, tag="ollama-host", ollama_model="same", decode_tps_p50=40.0)]
+)
+assert "NOT comparable" not in stab_clean, stab_clean
+print("speed_table: reference_note caveat rendered when present, absent otherwise OK")
+
+# --- F6b: cold-start table drops cells with no cold fields and labels configs
+cold_ok = rec(
+    "blazar",
+    {},
+    daemon_boot_s=0.4,
+    cold_first_request_s=3.9,
+    cold_ttft_ms=2900.0,
+    load_s=3.5,
+    rss_peak_mib=6400.0,
+)
+cold_cfg = rec(
+    "blazar",
+    {"config": "pa_off"},
+    daemon_boot_s=0.4,
+    cold_ttft_ms=2950.0,
+    load_s=3.6,
+    rss_peak_mib=6400.0,
+)
+cold_none = rec(
+    "blazar",
+    {"conc": 8, "config": "conc_default"},
+    rss_peak_mib=0.0,
+)
+cold_tab = bm.coldstart_table([cold_ok, cold_cfg, cold_none])
+assert "first request (cold engine load)" in cold_tab
+assert "(pa_off)" in cold_tab, "config variants must be labeled, not anonymous dups"
+blazar_rows = [ln for ln in cold_tab.splitlines() if "blazar gateway" in ln]
+assert len(blazar_rows) == 2, cold_tab
+print("coldstart_table: cold-field filter + config labeling OK")
+
+# --- F6d: ppl provenance column (own vs borrowed tool)
+ppl_own = rec("ppl", {}, perplexity=17.35, ppl_err=0.92, ppl_tool="own")
+ppl_borrowed = rec(
+    "ppl",
+    {},
+    tag="v0.9.4",
+    kind="mistralrs",
+    perplexity=17.35,
+    ppl_err=0.92,
+    ppl_tool="borrowed:llama-b11202",
+)
+ptab = bm.ppl_table([ppl_own, ppl_borrowed])
+assert "| ppl tool |" in ptab and "borrowed (llama-b11202)" in ptab, ptab
+assert ptab.count("| own |") == 1, ptab
+print("ppl_table: tool provenance column OK")
+
+# --- F3 forensics: reshape table surfaces the daemon tail, ANSI-stripped
+reshape_tail = rec(
+    "reshape",
+    {"reshape": True},
+    reshape_observed=False,
+    slots_from=2,
+    slots_to=None,
+    requests_before=116,
+    requests_after=0,
+    requests_failed=0,
+    daemon_tail=[
+        "2026-09-28T18:10:40Z \x1b[32mINFO\x1b[0m supervisor: slot pressure 2/2 sustained",
+        "2026-09-28T18:10:41Z \x1b[32mINFO\x1b[0m evict: terminating child and releasing the slot",
+    ],
+)
+rtail = bm.reshape_table([reshape_tail])
+assert "<details>" in rtail and "slot pressure 2/2" in rtail, rtail
+assert "\x1b" not in rtail, "ANSI escapes must not leak into the markdown"
+print("reshape_table: daemon tail details block, ANSI-stripped OK")
+
+# --- F3 forensics: a poller that never saw the slot shape renders a
+# detection VOID, not a product "NO" (20260928-gguf-full: 150/150 samples
+# read None against a guessed /api/ps schema)
+reshape_void = rec(
+    "reshape",
+    {"reshape": True},
+    reshape_observed=False,
+    slots_from=None,
+    slots_to=None,
+    detection_error="api/ps never reported a slots reading for the model",
+    daemon_tail=[],
+)
+rvoid = bm.reshape_table([reshape_void])
+assert "NO (detection void)" in rvoid, rvoid
+print("reshape_table: detection void distinguished from a true NO OK")
+
 # --- text_findings: full backing fixture
 gw = rec(
     "blazar",
@@ -198,6 +319,92 @@ greedy = rec("greedy", {}, exact_matches=20, prompts=20, ratio_mean=1.0, ratio_m
 greedy_gw = rec(
     "greedy_gw", {}, exact_matches=20, prompts=20, ratio_mean=1.0, ratio_min=1.0
 )
+greedy_ollama = rec(
+    "greedy_ollama",
+    {},
+    exact_matches=9,
+    prompts=20,
+    ratio_mean=0.812,
+    ratio_min=0.514,
+    ollama_model="qwen3.5:9b",
+)
+
+# --- E3: ollama greedy reference renders its run-to-run determinism row
+gollama_tab = bm.greedy_table(
+    [
+        rec("greedy", {}, exact_matches=20, prompts=20, ratio_mean=1.0, ratio_min=1.0),
+        greedy_ollama,
+    ]
+)
+assert "run-to-run, temp 0" in gollama_tab, gollama_tab
+assert "qwen3.5:9b" in gollama_tab and "9/20" in gollama_tab, gollama_tab
+assert "0.812" in gollama_tab and "0.514" in gollama_tab, gollama_tab
+print("greedy_table: ollama run-to-run reference row OK")
+
+
+# --- E4: media image rows aggregate identical configs (median+n) and
+# label the A/B knob so default/fa_off/vae_tiling/sage rows are distinct
+def media_img_rec(cfg, med, lo=None, hi=None, cold=60.0):
+    return rec(
+        "media-image",
+        {
+            "size": "512x512",
+            "steps": [4],
+            "runs": 3,
+            **({"config": cfg} if cfg else {}),
+        },
+        tag="master-920-2f88688",
+        model="qwen-image-2.1",
+        dims_seen=[512, 512],
+        total_s_median=med,
+        total_s_min=lo if lo is not None else med - 0.4,
+        total_s_max=hi if hi is not None else med + 0.4,
+        cold_request_s=cold,
+    )
+
+
+mtab = bm.media_table(
+    [
+        media_img_rec(None, 47.0),
+        media_img_rec(None, 49.0),
+        media_img_rec("fa_off", 52.2),
+    ]
+)
+assert mtab.count("| image -") == 2, mtab
+assert "(n=2)" in mtab and "48" in mtab, mtab
+assert "[fa_off]" in mtab, mtab
+print("media_table: identical-config aggregation (median+n) + knob labels OK")
+
+# --- E4/G1: a knob the profiler skipped renders inert, not a fake Δ%
+axes = bm.media_axes_table(
+    [
+        rec(
+            "media-image",
+            {"size": "512x512", "steps": [4], "runs": 3},
+            tag="master-920-2f88688",
+            total_s_median=47.3,
+            total_s_min=46.9,
+            total_s_max=49.2,
+            cold_request_s=60.4,
+        ),
+        rec(
+            "media-image",
+            {"size": "512x512", "steps": [4], "runs": 3, "config": "sage_attn_on"},
+            tag="master-920-2f88688",
+            total_s_median=45.6,
+            total_s_min=45.4,
+            total_s_max=45.6,
+            cold_request_s=57.6,
+            note="config knob inert on this box: profiler skipped sage_attn "
+            "(SageAttention requires a CUDA device) — measures the default "
+            "posture",
+        ),
+    ]
+)
+assert "| inert |" in axes, axes
+assert "profiler skipped sage_attn" in axes, axes
+assert "-3.6%" not in axes, "inert row must not imply a sage effect"
+print("media_axes_table: inert-knob row + note OK")
 mistral = rec(
     "blazar",
     {"ctx": 8192, "np": 1},
@@ -290,8 +497,8 @@ reshape_no = rec(
     timeline_samples=150,
 )
 rtab = bm.reshape_table([reshape_ok, reshape_no])
-assert "| Runtime | reshape | slots |" in rtab and "1→8" in rtab and "142" in rtab, rtab
-assert "11800→940" in rtab and "39→91" in rtab and "| 0 |" in rtab, rtab
+assert "| Runtime | reshape | slots |" in rtab and "1->8" in rtab and "142" in rtab, rtab
+assert "11800->940" in rtab and "39->91" in rtab and "| 0 |" in rtab, rtab
 assert "NO" in rtab, "unobserved reshape must render NO"
 assert bm.reshape_table([]) == "_Not measured._"
 out_r = bm.text_findings([reshape_ok])
@@ -316,6 +523,7 @@ recs = [
     kv_var,
     greedy,
     greedy_gw,
+    greedy_ollama,
     *conc,
     mistral,
     tools_ok,
@@ -611,5 +819,15 @@ with tempfile.TemporaryDirectory() as td:
     with _mock.patch.object(bm.subprocess, "run", side_effect=OSError("no git")):
         assert not bm.build_local_corpus(dest), "git failure must fail closed"
     print("build_local_corpus: gitignore/denylist/credential-guard OK")
+
+# demote_headings: appended-campaign chapters nest under their wrapper;
+# headings inside fenced code blocks must NOT be shifted.
+_demoted = bm.demote_headings(
+    "# Title\n\ntext\n\n## Section\n\n```bash\n# not a heading\n```\n"
+)
+assert _demoted.startswith("## Title"), "top heading must gain one level"
+assert "\n### Section" in _demoted, "section headings must gain one level"
+assert "# not a heading" in _demoted, "fence content must stay untouched"
+print("demote_headings: heading shift + fence immunity OK")
 
 print("ALL FIXTURE CHECKS GREEN")

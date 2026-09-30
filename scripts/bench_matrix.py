@@ -93,7 +93,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 
-HARNESS_VERSION = 2
+HARNESS_VERSION = 4
 # A cell whose key carries this many error rows stops retrying on resume:
 # deterministic engine-reality crashes (identical signature every attempt)
 # burn spawn+crash cycles forever otherwise. The error receipt stays in
@@ -1297,6 +1297,25 @@ def run_media_image_cell(
                         medians[qk] = round(statistics.median(vals), 3)
                 if medians:
                     rec["quality_medians"] = medians
+            if gw_cfg:
+                # knob-inert detection: the profiler loudly skips flags the
+                # active device cannot honor (live 2026-09-29: sdcpp on this
+                # box is Vulkan, so sage_attn is skipped — the A/B row then
+                # measures the default posture twice and its Δ% is noise).
+                # Without this stamp the row masquerades as a sage effect.
+                dlog = Path(fam["sb"].data_dir) / "run" / "daemon.log"
+                if dlog.exists():
+                    skipped = re.findall(
+                        r"profile: (\S+) skipped: ([^\x1b\n]+)",
+                        dlog.read_text(errors="replace"),
+                    )
+                    if skipped:
+                        knob, reason = skipped[0]
+                        rec["note"] = (
+                            f"config knob inert on this box: profiler skipped "
+                            f"{knob} ({reason.strip()[:120]}) - this row measures "
+                            "the default posture; treat delta% as run-to-run noise"
+                        )
         finally:
             rec["gpu_peak_mib"] = round(sampler.gpu_peak_mib, 1)
             rec["rss_peak_mib"] = round(sampler.rss_peak_mib, 1)
@@ -2596,6 +2615,7 @@ def find_sandbox_engine_pid() -> int | None:
     trusts. Only our sandbox tree can carry it."""
     if not os.path.isdir("/proc"):
         return None
+    markers = KIND_CMDLINE_MARKERS
     for pid_s in os.listdir("/proc"):
         if not pid_s.isdigit():
             continue
@@ -2604,7 +2624,7 @@ def find_sandbox_engine_pid() -> int | None:
                 cmdline = fh.read()
         except OSError:
             continue
-        if not (b"llama-server" in cmdline or b"mistralrs" in cmdline):
+        if not any(m in cmdline for m in markers):
             continue
         try:
             with open(f"/proc/{pid_s}/environ", "rb") as fh:
@@ -2622,6 +2642,81 @@ def read_proc_argv(pid: int) -> list[str]:
             return [a.decode("utf-8", "replace") for a in fh.read().split(b"\0") if a]
     except OSError:
         return []
+
+
+# The sqlite active-flag flip routes NOTHING under engine_routing
+# mode = "auto" (routing is format-driven): the 20260928-gguf-full
+# campaign's entire mistral.rs gateway lane silently measured
+# llama-server b11202 that way. Two guards close that class for good:
+# (1) with_engine_pin() — model_overrides.<model>.engine = tag, the
+#     load-bearing selector that wins over BOTH routing modes;
+# (2) capture_child_argv() — prove the spawned child's binary kind
+#     matches the cell's engine, else fail the cell LOUD with the
+#     child argv (never publish a cross-engine number). The /proc scan
+#     and this assert cover every engine kind: basename binaries via
+#     CHILD_BINARIES, wrapper-launched python engines via
+#     CHILD_ARGV_ELEMENTS (see KIND_CMDLINE_MARKERS below).
+CHILD_BINARIES: dict[str, tuple[str, ...]] = {
+    "llamacpp": ("llama-server",),
+    "mistralrs": ("mistralrs",),
+    "sdcpp": ("sd-server",),
+    "whisper": ("whisper-server",),
+}
+
+
+# Kinds whose child process is not named by CHILD_BINARIES: sglang's
+# server_path is a POSIX sh wrapper, so the real child process is the
+# interpreter running the module — matched as an exact argv element
+# (never a substring, to avoid path false-positives).
+CHILD_ARGV_ELEMENTS: dict[str, tuple[str, ...]] = {
+    "sglang": ("sglang.launch_server",),
+}
+
+# Everything the /proc pid scan accepts as an engine child (raw bytes,
+# matched as substrings of the NUL-joined cmdline). Derived from the
+# basename markers plus the wrapper-launched module markers above.
+KIND_CMDLINE_MARKERS: tuple[bytes, ...] = tuple(
+    [n.encode() for names in CHILD_BINARIES.values() for n in names]
+    + [n.encode() for names in CHILD_ARGV_ELEMENTS.values() for n in names]
+)
+
+
+def with_engine_pin(cfg: dict, model: str, eng: Engine) -> dict:
+    """Merge the per-cell engine pin into a daemon.start cfg dict."""
+    ov = cfg.setdefault("model_overrides", {}).setdefault(model, {})
+    ov["engine"] = eng.tag
+    return cfg
+
+
+def capture_child_argv(
+    rec: dict, eng: Engine, sampler: "Sampler | None" = None
+) -> None:
+    """Resolve the spawned engine child: pid + argv + engine-kind assert."""
+    child_pid = find_sandbox_engine_pid()
+    if child_pid is None:
+        rec["child_pid_note"] = (
+            "engine child not found in /proc — either the spawn genuinely "
+            "failed, or the child uses a process shape this harness "
+            "version does not scan for (see KIND_CMDLINE_MARKERS)"
+        )
+        return
+    rec["child_pid"] = child_pid
+    rec["child_argv"] = read_proc_argv(child_pid)
+    if sampler is not None:
+        sampler.pid = child_pid
+    if not rec["child_argv"]:
+        return
+    bin_base = Path(rec["child_argv"][0]).name
+    names = CHILD_BINARIES.get(eng.kind, ())
+    modules = CHILD_ARGV_ELEMENTS.get(eng.kind, ())
+    matched = any(bin_base.startswith(n) for n in names) or any(
+        a in modules for a in rec["child_argv"][1:]
+    )
+    if not matched:
+        rec["error"] = (
+            f"engine mismatch: cell names {eng.kind} ({eng.tag}) but "
+            f"child binary is {bin_base!r} — routing ignored the cell engine"
+        )
 
 
 def run_blazar_cell(
@@ -2669,7 +2764,10 @@ def run_blazar_cell(
             # (healthz timeout, liveness guard) used to leak a live
             # daemon whose sandbox got destroyed under it (2026-09-10).
             daemon.start(
-                cfg={"port": V.PORT, **(blazar_cfg or {})}, floor_model=model_name
+                cfg=with_engine_pin(
+                    {"port": V.PORT, **(blazar_cfg or {})}, model_name, eng
+                ),
+                floor_model=model_name,
             )
             port = V.PORT
             deadline = time.time() + 600
@@ -2731,15 +2829,9 @@ def run_blazar_cell(
                 rec["error"] = f"cold probe failed: {cold_exc}"
                 rec["cold_first_request_s"] = round(time.perf_counter() - t_cold0, 2)
                 return rec
-            child_pid = find_sandbox_engine_pid()
-            if child_pid is not None:
-                rec["child_pid"] = child_pid
-                rec["child_argv"] = read_proc_argv(child_pid)
-                sampler.pid = child_pid  # RSS tracking from here on
-            else:
-                rec["child_pid_note"] = (
-                    "engine child not found in /proc (spawn failed?)"
-                )
+            capture_child_argv(rec, eng, sampler)
+            if rec.get("error"):
+                return rec
             rec.update(
                 median_run_suite(port, model_name, cfg["runs"], cfg["pp"], cfg["tg"])
             )
@@ -2854,7 +2946,10 @@ def run_conc_axis_cell(
         port: int | None = None
         try:
             daemon.start(
-                cfg={"port": V.PORT, **(blazar_cfg or {})}, floor_model=model_name
+                cfg=with_engine_pin(
+                    {"port": V.PORT, **(blazar_cfg or {})}, model_name, eng
+                ),
+                floor_model=model_name,
             )
             port = V.PORT
             deadline = time.time() + 600
@@ -2880,12 +2975,10 @@ def run_conc_axis_cell(
             except Exception as suite_exc:
                 rec["error"] = f"conc suite failed: {suite_exc}"
             # the engine child spawns on the first burst; capture the
-            # resolved argv once requests have actually flown
-            child_pid = find_sandbox_engine_pid()
-            if child_pid is not None:
-                rec["child_pid"] = child_pid
-                rec["child_argv"] = read_proc_argv(child_pid)
-                sampler.pid = child_pid
+            # resolved argv once requests have actually flowed
+            capture_child_argv(rec, eng, sampler)
+            if rec.get("error"):
+                return rec
         finally:
             rec["gpu_peak_mib"] = round(sampler.gpu_peak_mib, 1)
             rec["gpu_power_peak_w"] = round(sampler.gpu_power_peak_w, 1)
@@ -3046,19 +3139,6 @@ def _args_parse(args_str: str):
         return False
 
 
-def _child_np(pid: int) -> int | None:
-    """Current -np of a spawned engine child, from /proc."""
-    try:
-        with contextlib.suppress(Exception):
-            cmd = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
-            for i, tok in enumerate(cmd):
-                if tok == b"-np" and i + 1 < len(cmd):
-                    return int(cmd[i + 1])
-    except Exception:
-        pass
-    return None
-
-
 def run_reshape_cell(eng: Engine, body_model: str, duration_s: float = 300.0) -> dict:
     """Sustained-concurrency reshape lane: hold C=8 streams long enough for
     the 6-tick adoption streak + graceful drain, and prove the child actually
@@ -3076,7 +3156,9 @@ def run_reshape_cell(eng: Engine, body_model: str, duration_s: float = 300.0) ->
     finally:
         con.close()
     daemon = V.Daemon(sb)
-    daemon.start({"port": port}, floor_model=body_model)
+    daemon.start(
+        with_engine_pin({"port": port}, body_model, eng), floor_model=body_model
+    )
     stop_at = time.monotonic() + 600.0
     base = f"http://127.0.0.1:{port}"
     while time.monotonic() < stop_at:
@@ -3108,21 +3190,29 @@ def run_reshape_cell(eng: Engine, body_model: str, duration_s: float = 300.0) ->
                 results.append(rec)
 
     def poller() -> None:
+        # Shape detection reads the gateway's own /api/ps schema:
+        # {"models": [{"name", "blazar_slots", "blazar_in_flight", ...}]}.
+        # The pre-2026-09-29 poller guessed a "pid" field that never
+        # existed, so every sample read None and a real reshape could
+        # not have been observed (20260928-gguf-full: 150/150 void).
         while time.monotonic() < deadline:
-            np_now, inflight = None, None
+            slots_now, inflight = None, None
             with contextlib.suppress(Exception):
                 with urllib.request.urlopen(f"{base}/api/ps", timeout=2) as resp:
                     ps = json.loads(resp.read())
-                    # gateway /api/ps shape: {"instances": [ {...row with pid} ]}
-                    procs = ps.get("instances") or ps.get("models") or []
-                    if procs and procs[0].get("pid"):
-                        np_now = _child_np(int(procs[0]["pid"]))
-                inflight = ps.get("in_flight") or ps.get("inflight")
+                    for row in ps.get("models") or []:
+                        name = str(row.get("name") or "")
+                        # Rows keep the `+lora` variant marker; match the
+                        # lane's model by prefix.
+                        if name.startswith(body_model):
+                            slots_now = row.get("blazar_slots")
+                            inflight = row.get("blazar_in_flight")
+                            break
             with lock:
                 timeline.append(
                     {
                         "t_rel": time.monotonic() - started,
-                        "np": np_now,
+                        "slots": slots_now,
                         "in_flight": inflight,
                     }
                 )
@@ -3134,6 +3224,17 @@ def run_reshape_cell(eng: Engine, body_model: str, duration_s: float = 300.0) ->
         t.start()
     for t in threads:
         t.join()
+    # engine-identity guard: a reshape claim about engine X is void if
+    # the child actually served on format-routed engine Y
+    probe: dict = {}
+    capture_child_argv(probe, eng)
+    if probe.get("error"):
+        daemon.stop()
+        sb.destroy()
+        return {
+            "error": probe["error"],
+            "child_argv": probe.get("child_argv"),
+        }
 
     def _pctl(vals: list[float], q: float) -> float | None:
         if not vals:
@@ -3153,11 +3254,11 @@ def run_reshape_cell(eng: Engine, body_model: str, duration_s: float = 300.0) ->
             )
         }
 
-    nps = [t["np"] for t in timeline if t["np"]]
+    nps = [t["slots"] for t in timeline if t["slots"]]
     reshape_at = None
     first_np = nps[0] if nps else None
     for t in timeline:
-        if t["np"] and first_np and t["np"] > first_np:
+        if t["slots"] and first_np and t["slots"] > first_np:
             reshape_at = t["t_rel"]
             break
     before = [r for r in results if reshape_at is None or r["t_rel"] < reshape_at]
@@ -3186,6 +3287,14 @@ def run_reshape_cell(eng: Engine, body_model: str, duration_s: float = 300.0) ->
         if after
         else None,
         "timeline_samples": len(timeline),
+        # Fail-loud forensics: a "no reshape" verdict is only meaningful
+        # when the poller actually saw the slot shape at least once.
+        "detection_error": (
+            "api/ps never reported a slots reading for the model — "
+            "reshape verdict is a measurement void, not a product result"
+        )
+        if not nps
+        else None,
         "requests_failed": failed[0],
         "fail_tally_top": [
             {"status": k[0], "body": k[1], "n": v}
@@ -3194,6 +3303,11 @@ def run_reshape_cell(eng: Engine, body_model: str, duration_s: float = 300.0) ->
         if fail_tally
         else [],
         "wall_s": round(window, 1),
+        # Engine-identity forensics from the guard probe above: the
+        # success path must carry the child argv too (error cells
+        # already do), or a clean run leaves no routing evidence.
+        "child_pid": probe.get("child_pid"),
+        "child_argv": probe.get("child_argv"),
     }
     daemon.stop()
     with contextlib.suppress(Exception):
@@ -3222,7 +3336,10 @@ def run_tools_cell(eng: Engine, model_name: str) -> dict:
         con.close()
         daemon = V.Daemon(sb)
         try:
-            daemon.start(cfg={"port": V.PORT}, floor_model=model_name)
+            daemon.start(
+                cfg=with_engine_pin({"port": V.PORT}, model_name, eng),
+                floor_model=model_name,
+            )
             deadline = time.time() + 600
             healthy = False
             while time.time() < deadline:
@@ -3262,6 +3379,9 @@ def run_tools_cell(eng: Engine, model_name: str) -> dict:
             ttfts = sorted(
                 s["ttft_ms"] for s in per_scenario if s.get("ttft_ms") is not None
             )
+            capture_child_argv(rec, eng)
+            if rec.get("error"):
+                return rec
             rec.update(
                 {
                     "tools_scenarios": len(per_scenario),
@@ -3326,7 +3446,10 @@ def run_blazar_conc_cell(
         try:
             # same ownership fix as run_blazar_cell: start() must be
             # covered by the finally that calls daemon.stop()
-            daemon.start(floor_model=model_name)
+            daemon.start(
+                cfg=with_engine_pin({"port": V.PORT}, model_name, eng),
+                floor_model=model_name,
+            )
             port = V.PORT
             deadline = time.time() + 600
             healthy = False
@@ -3354,10 +3477,9 @@ def run_blazar_conc_cell(
             )
             # resolved engine argv (auto-slots np/ctx visibility — the
             # speed cells' headline forensics, now recorded for conc too)
-            child_pid = find_sandbox_engine_pid()
-            if child_pid is not None:
-                rec["child_pid"] = child_pid
-                rec["child_argv"] = read_proc_argv(child_pid)
+            capture_child_argv(rec, eng)
+            if rec.get("error"):
+                return rec
             rec.update(conc_suite(port, model_name, level, cfg["tg"], rounds=rounds))
         finally:
             rec["gpu_peak_mib"] = round(sampler.gpu_peak_mib, 1)
@@ -3390,17 +3512,33 @@ def run_blazar_conc_cell(
 # and wakes cheap; ollama's keep_alive expiry unloads and pays a reload)
 
 
-def run_blazar_idle_cell(eng: Engine, model_name: str, cfg: dict) -> dict:
-    """Warm the model, let the reaper ladder sleep it (idle_sleep_secs),
-    then measure the wake TTFT — blazar's structural idle advantage."""
+def run_blazar_idle_cell(
+    eng: Engine, model_name: str, cfg: dict, policy: str = "sleep"
+) -> dict:
+    """Warm the model, let the reaper ladder run its idle policy, then
+    measure the wake TTFT — blazar's structural idle advantage. Two
+    policies: `sleep` (child self-sleeps, weights stay RAM-resident,
+    wake = in-child CUDA resume) and `evict` (reaper evicts the
+    instance, wake = full respawn incl. mmap + KV-bank prefix
+    restore) — the A/B answers which ladder rung wakes faster."""
     os.environ["BLAZAR_VALIDATE_PORT"] = str(free_port())
     V = importlib.import_module("validate")
     V.PORT = int(os.environ["BLAZAR_VALIDATE_PORT"])
 
-    idle_sleep = 15
-    rec: dict[str, Any] = {
-        "idle_policy": f"sleep at {idle_sleep}s (weights stay RAM-resident)",
-    }
+    if policy == "evict":
+        # Evict-ladder A/B: the child still self-sleeps at `idle_sleep`
+        # (VRAM drops then), but the measurement target is the reaper's
+        # eviction at `idle_timeout` — the wake probe pays a FULL
+        # respawn, not an in-child resume.
+        idle_sleep, idle_timeout = 30, 45
+        rec: dict[str, Any] = {
+            "idle_policy": "evict at 45s (full respawn + KV-bank restore)",
+        }
+    else:
+        idle_sleep = 15
+        rec: dict[str, Any] = {
+            "idle_policy": f"sleep at {idle_sleep}s (weights stay RAM-resident)",
+        }
     sb = V.Sandbox()
     sampler = Sampler(None)
     sampler.start()
@@ -3412,8 +3550,14 @@ def run_blazar_idle_cell(eng: Engine, model_name: str, cfg: dict) -> dict:
         daemon = V.Daemon(sb)
         port: int | None = None
         try:
+            base_cfg: dict[str, Any] = {
+                "port": V.PORT,
+                "idle_sleep_secs": idle_sleep,
+            }
+            if policy == "evict":
+                base_cfg["idle_timeout_secs"] = idle_timeout
             daemon.start(
-                cfg={"port": V.PORT, "idle_sleep_secs": idle_sleep},
+                cfg=with_engine_pin(base_cfg, model_name, eng),
                 floor_model=model_name,
             )
             port = V.PORT
@@ -3441,36 +3585,77 @@ def run_blazar_idle_cell(eng: Engine, model_name: str, cfg: dict) -> dict:
                 },
                 timeout=600.0,
             )
+            capture_child_argv(rec, eng)
+            if rec.get("error"):
+                return rec
             loaded_gpu_mib = gpu_used_mib()
-            # sleep detect: /api/ps blazar_state flips to Sleeping (the
-            # child sleeps itself; weights stay RAM, VRAM released);
-            # VRAM drop as fallback signal. Timeout must cover the idle
-            # window + the 10s reaper tick + margin.
-            slept = False
-            deadline = time.time() + idle_sleep + 10 + 60
-            while time.time() < deadline:
-                try:
-                    ps = http_json(f"http://127.0.0.1:{port}/api/ps", timeout=5.0)
-                    states = [
-                        str(r.get("blazar_state", "")).lower()
-                        for r in ps.get("models", [])
-                    ]
-                    if any("sleep" in s for s in states):
+            if policy == "evict":
+                # evict detect: at idle_timeout the reaper unloads the
+                # instance — the model row VANISHES from /api/ps (the
+                # VRAM drop at idle_sleep only proves the child
+                # self-slept, not eviction). Deadline covers the
+                # timeout window + the 10s reaper tick + margin.
+                model_base = model_name.split(":")[0]
+                slept = False
+                deadline = time.time() + idle_timeout + 10 + 120
+                while time.time() < deadline:
+                    try:
+                        ps = http_json(f"http://127.0.0.1:{port}/api/ps", timeout=5.0)
+                        rows = ps.get("models", [])
+                        if not any(
+                            str(r.get("name", "")).startswith(model_base) for r in rows
+                        ):
+                            slept = True
+                            rec["sleep_detect"] = "evicted"
+                            break
+                    except (
+                        urllib.error.URLError,
+                        OSError,
+                        json.JSONDecodeError,
+                    ):
+                        pass
+                    time.sleep(1.0)
+                rec["slept"] = slept
+                if not slept:
+                    rec["idle_note"] = (
+                        "model was never evicted within "
+                        f"{idle_timeout + 10 + 120}s — wake TTFT below is "
+                        "sleep-path, not respawn"
+                    )
+            else:
+                # sleep detect: /api/ps blazar_state flips to Sleeping
+                # (the child sleeps itself; weights stay RAM, VRAM
+                # released); VRAM drop as fallback signal. Timeout must
+                # cover the idle window + the 10s reaper tick + margin.
+                slept = False
+                deadline = time.time() + idle_sleep + 10 + 60
+                while time.time() < deadline:
+                    try:
+                        ps = http_json(f"http://127.0.0.1:{port}/api/ps", timeout=5.0)
+                        states = [
+                            str(r.get("blazar_state", "")).lower()
+                            for r in ps.get("models", [])
+                        ]
+                        if any("sleep" in s for s in states):
+                            slept = True
+                            break
+                    except (
+                        urllib.error.URLError,
+                        OSError,
+                        json.JSONDecodeError,
+                    ):
+                        pass
+                    if gpu_used_mib() < loaded_gpu_mib - 512:
                         slept = True
+                        rec["sleep_detect"] = "vram_drop"
                         break
-                except (urllib.error.URLError, OSError, json.JSONDecodeError):
-                    pass
-                if gpu_used_mib() < loaded_gpu_mib - 512:
-                    slept = True
-                    rec["sleep_detect"] = "vram_drop"
-                    break
-                time.sleep(1.0)
-            rec["slept"] = slept
-            if not slept:
-                rec["idle_note"] = (
-                    "model never reached Sleeping within "
-                    f"{idle_sleep + 10 + 60}s — wake TTFT below is warm-path"
-                )
+                    time.sleep(1.0)
+                rec["slept"] = slept
+                if not slept:
+                    rec["idle_note"] = (
+                        "model never reached Sleeping within "
+                        f"{idle_sleep + 10 + 60}s — wake TTFT below is warm-path"
+                    )
             rec["gpu_at_sleep_mib"] = round(gpu_used_mib(), 1)
             m = openai_stream_timed(
                 port,
@@ -3614,10 +3799,14 @@ def run_blazar_ctx_cell(eng: Engine, model_name: str, ctx: int, cfg: dict) -> di
         port: int | None = None
         try:
             daemon.start(
-                cfg={
-                    "port": V.PORT,
-                    "model_overrides": {model_name: {"ctx": ctx}},
-                },
+                cfg=with_engine_pin(
+                    {
+                        "port": V.PORT,
+                        "model_overrides": {model_name: {"ctx": ctx}},
+                    },
+                    model_name,
+                    eng,
+                ),
                 floor_model=model_name,
             )
             port = V.PORT
@@ -3637,9 +3826,9 @@ def run_blazar_ctx_cell(eng: Engine, model_name: str, ctx: int, cfg: dict) -> di
                 return {"error": f"sandbox daemon failed to boot at ctx {ctx}"}
             assert port is not None
             rec.update(median_run_suite(port, model_name, 3, cfg["pp"], cfg["tg"]))
-            child_pid = find_sandbox_engine_pid()
-            if child_pid is not None:
-                rec["child_argv"] = read_proc_argv(child_pid)
+            capture_child_argv(rec, eng)
+            if rec.get("error"):
+                return rec
             rec["gpu_peak_mib"] = round(sampler.gpu_peak_mib, 1)
         finally:
             daemon.stop()
@@ -3937,7 +4126,7 @@ def run_ollama_cell(cfg: dict, args_model: str | None = None) -> dict:
     # name it loudly when it differs or the t/s columns mislead
     if args_model and args_model.lower() not in pick.lower():
         out["reference_note"] = (
-            f"reference serves '{pick}' (matrix model differs — t/s NOT comparable)"
+            f"reference serves '{pick}' (matrix model differs - t/s NOT comparable)"
         )
     return out
 
@@ -4238,7 +4427,10 @@ def run_greedy_gateway_cell(
         port: int | None = None
         try:
             # same ownership fix as the speed/conc cells
-            daemon.start(floor_model=model_name)
+            daemon.start(
+                cfg=with_engine_pin({"port": V.PORT}, model_name, eng),
+                floor_model=model_name,
+            )
             port = V.PORT
             deadline = time.time() + 600
             healthy = False
@@ -4264,6 +4456,9 @@ def run_greedy_gateway_cell(
                 },
                 timeout=600.0,
             )
+            capture_child_argv(rec, eng)
+            if rec.get("error"):
+                return rec
             gots = [greedy_completions(port, p, model_name) for p in GREEDY_PROMPTS]
             rec = _greedy_stats(gots, reference)
         finally:
@@ -4291,6 +4486,31 @@ def run_greedy_gateway_cell(
                 )
     finally:
         sb.destroy()
+    return rec
+
+
+def run_greedy_ollama_cell(args_model: str | None) -> dict:
+    """Ollama reference determinism — the competitor number the
+    "llamacpp 20/20 deterministic" differentiator claim never had.
+    Same 20 temp-0 prompts, run TWICE against the ollama host; exact
+    matches between the passes = run-to-run determinism. Ollama has no
+    direct mode in this harness, so self-repeat is the honest
+    comparable for the same-engine reference the blazar lanes use."""
+    try:
+        tags = http_json(f"http://127.0.0.1:{OLLAMA_PORT}/api/tags", timeout=5.0)
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        return {"error": f"ollama host not reachable: {exc}"}
+    models = [str(m.get("name", "")) for m in tags.get("models", [])]
+    pick = pick_ollama_model(models, args_model)
+    if pick is None:
+        return {
+            "error": "no same-family ollama model for greedy reference",
+            "ollama_models": models,
+        }
+    pass_one = [greedy_completions(OLLAMA_PORT, p, pick) for p in GREEDY_PROMPTS]
+    pass_two = [greedy_completions(OLLAMA_PORT, p, pick) for p in GREEDY_PROMPTS]
+    rec = _greedy_stats(pass_two, pass_one)
+    rec["ollama_model"] = pick
     return rec
 
 
@@ -4427,7 +4647,7 @@ def _speed_row(r: dict) -> str:
     if shape:
         pa += f" child: {shape}"
     if r.get("reference_note"):
-        pa += f" ⚠ serves '{r['ollama_model']}' — t/s NOT comparable"
+        pa += f" NOTE: serves '{r['ollama_model']}' - t/s NOT comparable"
     return "| {t} | {k} | {p} | {pa} | {a} | {ap} | {i} | {ip} | {d} | {pc} | {pk} | {s} |".format(
         t=r.get("tag", "-"),
         k=r.get("kind", "-"),
@@ -4613,7 +4833,7 @@ def write_markdown_report(
     unstamped = sum(1 for r in blazar_owned if not r.get("blazar_version"))
     if len(stamps) > 1 or (stamps and stamps != [blazar_version]):
         md.append(
-            f"- ⚠ **mixed provenance**: blazar-owned rows were measured by "
+            f"- **mixed provenance**: blazar-owned rows were measured by "
             f"{', '.join(f'`{s}`' for s in stamps)}; this invocation used "
             f"`{blazar_version}`. Per-row `blazar_version` in cells.jsonl."
         )
@@ -4722,10 +4942,19 @@ def write_markdown_report(
         )
         md.append("")
 
+    # reshape lane: the sustained-load no-lag proof - the campaign report
+    # must surface it, not only the full publication render
+    if any(r.get("provider") == "reshape" for r in records):
+        md.append("## Adaptive reshape under sustained load\n")
+        md.append(
+            campaign_scoped(reshape_table(records), "adaptive reshape", "this campaign")
+        )
+        md.append("")
+
     ppl = [r for r in records if r.get("provider") == "ppl"]
     if ppl:
         md.append("## Quality — perplexity (identical pinned args)\n")
-        md.append("| engine | perplexity | ± err | wall (s) | note |")
+        md.append("| engine | perplexity | +/- err | wall (s) | note |")
         md.append("|---|---|---|---|---|")
         for r in ppl:
             note = r.get("error", "lower = better text fit")
@@ -5066,6 +5295,18 @@ def main() -> int:
             "an existing campaign's cells.jsonl (--artifacts-dir or latest)"
         ),
     )
+    ap.add_argument(
+        "--append-campaign",
+        action="append",
+        metavar="DIR",
+        default=None,
+        help=(
+            "with --render-only: append another campaign's full report as a "
+            "nested chapter (headings demoted one level) after the main "
+            "publication — for lanes the main campaign could not measure, "
+            "e.g. the safetensors-only sglang engine next to a GGUF sweep"
+        ),
+    )
     args = ap.parse_args()
 
     # --media-only: one flag instead of the eight a media-focused session
@@ -5100,18 +5341,16 @@ def main() -> int:
             )
             return 2
         out = Path(args.md) if args.md else Path("BENCHMARK.md")
-        recs = []
-        by_key: dict[str, dict] = {}
-        for line in (ad / "cells.jsonl").read_text().splitlines():
-            if line.strip():
-                r = json.loads(line)
-                by_key[r["key"]] = r
-        recs = sorted(
-            by_key.values(), key=lambda r: (r.get("provider", ""), r.get("tag", ""))
-        )
-        cmd_file = ad / "campaign_cmd.txt"
-        argv_rec = cmd_file.read_text().strip() if cmd_file.exists() else None
+        recs, argv_rec = load_campaign_cells(ad)
         write_publication_report(recs, ad, out, argv_rec)
+        for extra_dir in args.append_campaign or []:
+            appended = append_campaign_chapter(Path(extra_dir).expanduser(), out)
+            if appended:
+                # Informational only: an appended chapter's drift receipts
+                # belong to its own campaign and never fail this render.
+                offenders = qc_drift_gate(load_campaign_cells(appended)[0])
+                for o in offenders:
+                    log(f"  - (appended {appended.name}) {o}")
         offenders = qc_drift_gate(recs)
         if offenders:
             log(f"qc drift gate: {len(offenders)} offender(s)")
@@ -5359,7 +5598,7 @@ def main() -> int:
         elif "perplexity" in rec:
             log(
                 f"  ok: ppl {rec.get('perplexity', 0):.4f} "
-                f"± {rec.get('ppl_error') or 0:.4f} "
+                f"+/- {rec.get('ppl_error') or 0:.4f} "
                 f"wall {rec.get('wall_s') or 0:.1f}s"
             )
         elif "exact_matches" in rec:
@@ -5918,6 +6157,30 @@ def main() -> int:
                 except Exception as exc:
                     rec = {"error": f"idle cell crashed: {exc}"}
                 emit(eng.tag, eng.kind, "idle-blazar", params, key, rec)
+                if eng.kind != "llamacpp":
+                    # evict-ladder A/B is a llamacpp-lane mechanism (the
+                    # sleep/wake flag ladder only exists there)
+                    continue
+                params_ev = {"idle": True, "policy": "evict"}
+                key_ev = cell_key(eng.tag, "idle-blazar", params_ev, model.name)
+                if key_ev in done:
+                    continue
+                log(f"[idle-wake blazar {eng.tag} evict-ladder]")
+                if not mem_guard(2048.0, f"pre-idle-evict {eng.tag}"):
+                    emit(
+                        eng.tag,
+                        eng.kind,
+                        "idle-blazar",
+                        params_ev,
+                        key_ev,
+                        {"error": "GPU memory floor exceeded before cell"},
+                    )
+                    continue
+                try:
+                    rec = run_blazar_idle_cell(eng, gw_model_name, cfg, policy="evict")
+                except Exception as exc:
+                    rec = {"error": f"idle evict cell crashed: {exc}"}
+                emit(eng.tag, eng.kind, "idle-blazar", params_ev, key_ev, rec)
         if "ollama" in args.providers:
             params = {"idle": True}
             key = cell_key("ollama-host", "idle-ollama", params, model.name)
@@ -6088,7 +6351,7 @@ def main() -> int:
                     {
                         "note": (
                             "skipped: llama-perplexity loads GGUF files only; "
-                            f"{model.name} is an HF safetensors directory — "
+                            f"{model.name} is an HF safetensors directory - "
                             "model-format boundary, not an engine failure"
                         )
                     },
@@ -6124,6 +6387,29 @@ def main() -> int:
             key = cell_key(eng.tag, "reshape", {"reshape": True}, model.name)
             if key in done:
                 log(f"[resumed] reshape {eng.tag}")
+                continue
+            # Adaptive reshape is a llamacpp-lane mechanism: the child
+            # shapes concurrency via -np and the supervisor re-spends
+            # the total-ctx budget across slots. mistral.rs and sglang
+            # children carry no slot shape in argv, so a 300s cell can
+            # only end as a detection void (20260928/20260929
+            # receipts) — record the boundary instead of burning the
+            # lane.
+            if eng.kind != "llamacpp":
+                emit(
+                    eng.tag,
+                    eng.kind,
+                    "reshape",
+                    {"reshape": True},
+                    key,
+                    {
+                        "note": (
+                            "skipped: adaptive reshape is a llamacpp-lane "
+                            "mechanism; this engine's child exposes no slot "
+                            "shape (-np) to observe or adopt"
+                        )
+                    },
+                )
                 continue
             if not mem_guard(2048.0, f"pre-reshape {eng.tag}"):
                 emit(
@@ -6284,6 +6570,20 @@ def main() -> int:
                 except Exception as exc:
                     rec = {"error": f"greedy gw cell crashed: {exc}"}
                 emit(eng.tag, eng.kind, "greedy_gw", params, key, rec)
+        # ollama reference determinism — independent of the llamacpp
+        # direct reference above (self-repeat needs no reference spawn)
+        if "ollama" in args.providers:
+            params = {"greedy_ollama": True}
+            key = cell_key("ollama-host", "greedy_ollama", params, model.name)
+            if key in done:
+                log("[greedy ollama reference] resumed — skipping")
+            else:
+                log("[greedy ollama reference (run-to-run determinism)]")
+                try:
+                    rec = run_greedy_ollama_cell(args.model or model_name)
+                except Exception as exc:
+                    rec = {"error": f"ollama greedy cell crashed: {exc}"}
+                emit("ollama-host", "ollama", "greedy_ollama", params, key, rec)
 
     # ---- features matrix (persisted as cells so resumed campaigns
     # render the complete matrix)
@@ -6449,10 +6749,10 @@ METHODOLOGY = [
     "Tool calls: 6 single-turn scenarios (3-tool set: weather/calculate/flights), temperature 0, max 192 tokens (call JSON must complete); scored on well-formed calls, correct function selection, valid JSON arguments with required keys, and a no-tool control for false positives; stream deltas accumulated per OpenAI spec.",
     "Gateway transparency: a second greedy lane through the blazar gateway with identical sampling; any divergence vs the direct lane isolates translation overhead.",
     "Perplexity: llama-perplexity on an offline ASCII corpus, ctx 2048.",
-    "Cold-start parity: the model file's page cache is dropped (posix_fadvise DONTNEED) and the GPU asserted idle (<512 MiB) before every cold probe on every runtime — a cold load is disk-cold, not memory-warm.",
+    "Cold-start parity: the model file's page cache is dropped (posix_fadvise DONTNEED) and the GPU asserted idle (<512 MiB) before every cold probe on every runtime - a cold load is disk-cold, not memory-warm.",
     "Cold TTFT = first-token latency of the cold probe itself (max_tokens 4, aligned num_ctx 16384 on both runtimes).",
     "ollama daemon boot is only measured with --ollama-service-restart (systemd restart, sudo password via BENCH_SUDO_PASSWORD env, stdin-only); without it the daemon stays warm and the row says so.",
-    "Idle-wake: blazar's reaper sleeps the child at idle_sleep_secs (weights stay RAM-resident, VRAM released) — wake TTFT is a sleep-wake; ollama's keep_alive expiry fully unloads — wake TTFT is a disk reload. The policy column names the semantic; both measured after the policy is observed via /api/ps.",
+    "Idle-wake: blazar's reaper sleeps the child at idle_sleep_secs (weights stay RAM-resident, VRAM released) - wake TTFT is a sleep-wake; ollama's keep_alive expiry fully unloads - wake TTFT is a disk reload. The policy column names the semantic; both measured after the policy is observed via /api/ps.",
     "Long-context curve: per-ctx cells (blazar model_overrides ctx / ollama num_ctx) x 3-run decode suites; each ollama point evicts first so the runner respawns at that ctx.",
     "Sustained concurrency: sequential bursts of the parallel-stream lane (default 3 rounds); TTFT p99 aggregates every stream of every round.",
     "Every blazar row records the spawned engine's argv (slots/context shown in tables) and stamps blazar version, wall clock, 5-min load average, and AC/battery power state; GPU cells refuse to run on battery.",
@@ -6472,6 +6772,20 @@ def pfmt(x, nd=1, unit=""):
     if x is None or (isinstance(x, float) and math.isnan(x)):
         return "-"
     return f"{x:.{nd}f}{unit}"
+
+
+def ascii_note(s: str | None) -> str:
+    """Publication guard: stored campaign notes predate the pure-ASCII
+    output policy; render their text viewer-safe regardless."""
+    if not s:
+        return s or ""
+    return (
+        s.replace("\u2014", "-")
+        .replace("\u0394%", "delta%")
+        .replace("\u0394", "delta")
+        .replace("\u2192", "->")
+        .replace("\u00b1", "+/-")
+    )
 
 
 def child_shape(rec: dict) -> str:
@@ -6534,9 +6848,14 @@ def speed_table(recs: list[dict]) -> str:
             )
     for r in recs:
         if r.get("provider") == "ollama" and "error" not in r:
+            ollama_name = f"ollama 0.33.3 - {r.get('ollama_model', 'same model')}"
+            if r.get("reference_note"):
+                # the reference serves a different model - without this the
+                # t/s columns read as a fair comparison (F6a)
+                ollama_name += " (t/s NOT comparable - matrix model differs)"
             rows.append(
                 (
-                    f"ollama 0.33.3 - {r.get('ollama_model', 'same model')}",
+                    ollama_name,
                     "service",
                     r.get("decode_tps_p50"),
                     r.get("ttft_ms_p50"),
@@ -6567,6 +6886,16 @@ def speed_row_name(rec: dict, base: str) -> str:
     # not render as unlabeled near-duplicate rows
     cfg = rec.get("params", {}).get("config")
     return f"{base} ({cfg})" if cfg and cfg != "default" else base
+
+
+def ok_streams_cell(ok: Any, den: Any, rounds: Any) -> str:
+    # "12/4" read as a failure rate; it is 12 ok streams across 3 rounds x 4
+    # concurrent - render the decomposition so the fraction cannot mislead (F6e)
+    if ok is None:
+        return "-"
+    if isinstance(den, (int, float)) and isinstance(rounds, (int, float)):
+        return f"{ok} of {rounds:.0f}x{den:.0f}"
+    return str(ok)
 
 
 def conc_table(recs: list[dict]) -> str:
@@ -6609,7 +6938,7 @@ def conc_table(recs: list[dict]) -> str:
     )
     sep = "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"
     body = [
-        f"| {n} | {s} | {ok}/{den} | {pfmt(rd, 0)} | {pfmt(sys)} | {pfmt(sm)} | {pfmt(w, 2)} |"
+        f"| {n} | {s} | {ok_streams_cell(ok, den, rd)} | {pfmt(rd, 0)} | {pfmt(sys)} | {pfmt(sm)} | {pfmt(w, 2)} |"
         f" {pfmt(tm, 0)} | {pfmt(tp, 0)} | {pfmt(i9, 1)} |"
         for n, s, ok, den, rd, sys, sm, w, tm, tp, i9 in rows
     ]
@@ -6623,7 +6952,7 @@ def ppl_table(recs: list[dict]) -> str:
             continue
         v, e = r.get("perplexity"), r.get("ppl_error")
         cell = (
-            f"{pfmt(v, 2)} ± {pfmt(e, 2)}"
+            f"{pfmt(v, 2)} +/- {pfmt(e, 2)}"
             if v is not None
             else (
                 f"failed ({str(e)[:50]})"
@@ -6631,12 +6960,22 @@ def ppl_table(recs: list[dict]) -> str:
                 else "not applicable (tool is llama.cpp-family)"
             )
         )
-        rows.append((engine_label(r["tag"]), cell))
+        tool = r.get("ppl_tool")
+        if tool in (None, "own"):
+            provenance = "own"
+        elif isinstance(tool, str) and tool.startswith("borrowed:"):
+            # e.g. mistral.rs row scored with the b11202 llama-perplexity
+            # binary - the reader must know the number is not from the
+            # engine's own toolchain (F6d)
+            provenance = f"borrowed ({tool.split(':', 1)[1]})"
+        else:
+            provenance = "unstamped (pre-stamping campaign)"
+        rows.append((engine_label(r["tag"]), cell, provenance))
     if not rows:
         return "_Not measured._"
-    head = "| Engine | perplexity (ctx 2048, offline ASCII corpus) |"
-    sep = "|---|---:|"
-    body = [f"| {n} | {c} |" for n, c in rows]
+    head = "| Engine | perplexity (ctx 2048, offline ASCII corpus) | ppl tool |"
+    sep = "|---|---:|---|"
+    body = [f"| {n} | {c} | {p} |" for n, c, p in rows]
     return "\n".join([head, sep, *body])
 
 
@@ -6645,13 +6984,25 @@ def reshape_table(recs: list[dict]) -> str:
     if not rows:
         return "_Not measured._"
     out = [
-        "| Runtime | reshape | slots | time to reshape s | req before/after | TTFT p50 before→after ms | sys t/s before→after | failed |",
+        "| Runtime | reshape | slots | time to reshape s | req before/after | TTFT p50 before->after ms | sys t/s before->after | failed |",
         "|---|---|---|---:|---:|---:|---:|---:|",
     ]
     for r in sorted(rows, key=lambda r: r.get("tag") or ""):
         name = f"blazar gateway - {engine_label(r.get('tag', ''))}"
-        reshaped = "yes" if r.get("reshape_observed") else "NO"
-        slots = f"{r.get('slots_from') or '-'}→{r.get('slots_to') or '-'}"
+        if r.get("note"):
+            # Structured lane boundary (e.g. slot-less engine kinds):
+            # one n/a row carrying the recorded reason, not a fake NO.
+            out.append(f"| {name} | n/a | {ascii_note(r['note'])} | - | - | - | - | - |")
+            continue
+        if r.get("reshape_observed"):
+            reshaped = "yes"
+        elif r.get("detection_error"):
+            # The poller never saw the slot shape: this "NO" says nothing
+            # about the product, only about the measurement.
+            reshaped = "NO (detection void)"
+        else:
+            reshaped = "NO"
+        slots = f"{r.get('slots_from') or '-'}->{r.get('slots_to') or '-'}"
         ttr = r.get("time_to_reshape_s")
         ttft_b, ttft_a = r.get("ttft_p50_before_ms"), r.get("ttft_p50_after_ms")
         stps_b, stps_a = r.get("sys_tps_before"), r.get("sys_tps_after")
@@ -6664,8 +7015,30 @@ def reshape_table(recs: list[dict]) -> str:
         out.append(
             f"| {name} | {reshaped} | {slots} | {fmt(ttr)} "
             f"| {r.get('requests_before', 0)}/{r.get('requests_after', 0)} "
-            f"| {fmt(ttft_b)}→{fmt(ttft_a)} | {fmt(stps_b)}→{fmt(stps_a)} "
+            f"| {fmt(ttft_b)}->{fmt(ttft_a)} | {fmt(stps_b)}->{fmt(stps_a)} "
             f"| {r.get('requests_failed', 0)} |"
+        )
+    # F3 forensics: a "NO" in the reshape column is unactionable without the
+    # supervisor log - surface the slot/reshape lines from the daemon tail
+    # (kept in the cell as daemon_tail) so the reader can see WHY the
+    # adoption never landed
+    for r in sorted(rows, key=lambda r: r.get("tag") or ""):
+        tail = r.get("daemon_tail") or r.get("daemon_log_tail") or []
+        if isinstance(tail, str):
+            tail = tail.splitlines()
+        if not tail:
+            continue
+        focus = [
+            re.sub(r"\x1b\[[0-9;]*m", "", ln).rstrip()
+            for ln in tail
+            if "slot" in ln.lower() or "reshape" in ln.lower() or "adopt" in ln.lower()
+        ]
+        excerpt = (focus or [re.sub(r"\x1b\[[0-9;]*m", "", ln) for ln in tail])[-12:]
+        tail_text = "\n".join(excerpt)
+        label = engine_label(r.get("tag", ""))
+        out.append(
+            f"\n<details><summary>daemon tail (slots/reshape) - {label}</summary>\n\n"
+            f"```\n{tail_text}\n```\n\n</details>"
         )
     return "\n".join(out)
 
@@ -6720,6 +7093,17 @@ def greedy_table(recs: list[dict]) -> str:
             rows.append(
                 (
                     f"{engine_label(r['tag'])} through blazar gateway vs direct",
+                    r.get("exact_matches"),
+                    r.get("prompts"),
+                    r.get("ratio_mean"),
+                    r.get("ratio_min"),
+                )
+            )
+    for r in recs:
+        if r.get("provider") == "greedy_ollama" and "error" not in r:
+            rows.append(
+                (
+                    f"ollama ({r.get('ollama_model', 'reference')}) run-to-run, temp 0",
                     r.get("exact_matches"),
                     r.get("prompts"),
                     r.get("ratio_mean"),
@@ -7088,7 +7472,7 @@ def config_axes_table(recs: list[dict]) -> str:
         # either side lacks a fingerprint (older receipts / qc_error)
         q = r.get("qc_sha256")
         qb = b.get("qc_sha256") if b else None
-        qout = "✓ same" if q and qb and q == qb else "⚠ drift" if q and qb else "-"
+        qout = "same" if q and qb and q == qb else "DRIFT" if q and qb else "-"
         rows.append(
             (
                 engine_label(r["tag"]),
@@ -7105,8 +7489,8 @@ def config_axes_table(recs: list[dict]) -> str:
     if not rows:
         return "_Not measured._"
     head = (
-        "| Engine | config | decode t/s | decode Δ% | ttft p50 ms | "
-        "ttft Δ% | GPU peak MiB | GPU Δ | output vs default |"
+        "| Engine | config | decode t/s | decode delta% | ttft p50 ms | "
+        "ttft delta% | GPU peak MiB | GPU delta | output vs default |"
     )
     sep = "|---|---|---:|---:|---:|---:|---:|---:|:-:|"
     body = [
@@ -7172,8 +7556,8 @@ def conc_axes_table(recs: list[dict]) -> str:
     if not rows:
         return "_Not measured._"
     head = (
-        "| Engine | config | sys tok/s | sys Δ% | ttft p99 ms | "
-        "ttft Δ% | GPU peak MiB | GPU Δ | errs |"
+        "| Engine | config | sys tok/s | sys delta% | ttft p99 ms | "
+        "ttft delta% | GPU peak MiB | GPU delta | errs |"
     )
     sep = "|---|---|---:|---:|---:|---:|---:|---:|---:|"
     body = [
@@ -7246,6 +7630,7 @@ def media_axes_table(recs: list[dict]) -> str:
         ):
             base[r["tag"]] = r
     rows = []
+    notes = []
     for r in recs:
         p = r.get("params", {})
         name = p.get("config")
@@ -7258,26 +7643,36 @@ def media_axes_table(recs: list[dict]) -> str:
             continue
         b = base.get(r["tag"])
         t = r.get("total_s_median") or 0.0
-        td = (
-            (t - b["total_s_median"]) / b["total_s_median"] * 100.0
-            if b
-            else float("nan")
-        )
+        if r.get("note"):
+            # knob detected inert (profiler skip) — a Δ% against the
+            # default would be noise dressed up as a config effect
+            notes.append(ascii_note(f"{engine_label(r['tag'])} {name}: {r['note']}"))
+            dp = "inert"
+        else:
+            td = (
+                (t - b["total_s_median"]) / b["total_s_median"] * 100.0
+                if b
+                else float("nan")
+            )
+            dp = f"{td:+.1f}%" if not math.isnan(td) else "-"
         rows.append(
             (
                 engine_label(r["tag"]),
                 name,
                 pfmt(t),
-                f"{td:+.1f}%" if not math.isnan(td) else "-",
+                dp,
                 pfmt(r.get("cold_request_s"), 1),
             )
         )
     if not rows:
         return "_Not measured._"
-    head = "| Engine | config | median total s | Δ% vs default | cold request s |"
+    head = "| Engine | config | median total s | delta% vs default | cold request s |"
     sep = "|---|---|---:|---:|---:|"
     body = [f"| {e} | {c} | {t} | {dp} | {cr} |" for e, c, t, dp, cr in rows]
-    return "\n".join([head, sep, *body])
+    out = "\n".join([head, sep, *body])
+    for note in notes:
+        out += f"\n\n> {note}"
+    return out
 
 
 def features_table(recs: list[dict]) -> str:
@@ -7303,9 +7698,17 @@ def features_table(recs: list[dict]) -> str:
 
 
 def coldstart_table(recs: list[dict]) -> str:
+    def has_cold_data(r: dict) -> bool:
+        # conc-scheduler cells share provider 'blazar' but measure no cold
+        # start - without this filter they render as dash-only rows (F6b)
+        return any(
+            r.get(k) is not None
+            for k in ("daemon_boot_s", "cold_first_request_s", "cold_ttft_ms", "load_s")
+        )
+
     rows = [
         (
-            f"blazar gateway - {engine_label(r['tag'])}",
+            speed_row_name(r, f"blazar gateway - {engine_label(r['tag'])}"),
             r.get("daemon_boot_s"),
             r.get("cold_first_request_s"),
             r.get("cold_ttft_ms"),
@@ -7313,7 +7716,7 @@ def coldstart_table(recs: list[dict]) -> str:
             r.get("rss_peak_mib"),
         )
         for r in recs
-        if r.get("provider") == "blazar" and "error" not in r
+        if r.get("provider") == "blazar" and "error" not in r and has_cold_data(r)
     ]
     rows += [
         (
@@ -7394,7 +7797,22 @@ def idle_wake_table(recs: list[dict]) -> str:
         body.append(
             f"| {n} | {pol} | {seen_s} | {pfmt(ttft, 0)} | {pfmt(rel, 2)} | {note or ''} |"
         )
-    return "\n".join([head, sep, *body])
+    # Composition receipt (probe, qwen3.5-9b Q4_K_M, 8GiB card): warm
+    # steady-state ~0.1 s, wake from --sleep-idle-seconds ~2.9 s on a
+    # minimal prompt (~3.6 s at lane prompts) — the wake cost is the
+    # upstream child restoring its CUDA context and re-uploading
+    # weights; the gateway adds ~0. Upstream exposes a single
+    # full-release sleep level, so the honest floor on this hardware
+    # class sits there: tune idle_sleep_secs to sleep less often, or
+    # accept the ~1.3x-faster-than-reload tradeoff.
+    cap = (
+        "\n\nWake cost is the upstream engine child restoring its CUDA"
+        " context and re-uploading weights (single-level sleep; warm"
+        " steady-state is ~0.1 s). Raise `idle_sleep_secs` to sleep less"
+        " often, or lower it toward the evict ladder when wake latency"
+        " matters less than VRAM residency."
+    )
+    return "\n".join([head, sep, *body]) + cap
 
 
 def ctxcurve_table(recs: list[dict]) -> str:
@@ -7481,6 +7899,102 @@ def executive_summary(recs: list[dict]) -> list[str]:
                 for r in rows_
             )
             parts.append(f"{engine_label(tag)} sweep C={levels}: {ladder}")
+    # inter-token latency tail: the smoothness differentiator vs ollama
+    itl = next((r.get("itl_p99_ms") for r in gw.values() if r.get("itl_p99_ms")), None)
+    oitl = next(
+        (
+            r.get("itl_p99_ms")
+            for r in recs
+            if r.get("provider") == "ollama"
+            and "error" not in r
+            and r.get("itl_p99_ms")
+        ),
+        None,
+    )
+    if itl and oitl:
+        parts.append(
+            f"ITL p99 {pfmt(itl, 2)} ms vs ollama {pfmt(oitl, 2)} ms "
+            f"({oitl / itl:.1f}x tighter)"
+        )
+    # tool-call latency parity at equal quality
+    tb = next(
+        (
+            r
+            for r in recs
+            if r.get("provider") == "tools"
+            and "error" not in r
+            and r.get("tools_ttft_p50_ms")
+        ),
+        None,
+    )
+    to = next(
+        (
+            r
+            for r in recs
+            if r.get("provider") == "tools-ollama"
+            and "error" not in r
+            and r.get("tools_ttft_p50_ms")
+        ),
+        None,
+    )
+    if tb and to:
+        parts.append(
+            f"tool-call TTFT p50 {pfmt(tb['tools_ttft_p50_ms'], 0)} ms vs ollama "
+            f"{pfmt(to['tools_ttft_p50_ms'], 0)} ms "
+            f"({to['tools_ttft_p50_ms'] / tb['tools_ttft_p50_ms']:.1f}x)"
+        )
+    # adaptive reshape: the only row that matters is the one under load
+    rs = next(
+        (
+            r
+            for r in recs
+            if r.get("provider") == "reshape"
+            and "error" not in r
+            and r.get("reshape_observed")
+        ),
+        None,
+    )
+    if rs:
+        failed = rs.get("requests_failed")
+        tail = f", {failed} failed" if failed else ", zero failed requests"
+        parts.append(
+            f"adaptive reshape under sustained load: slots "
+            f"{rs.get('slots_from')}->{rs.get('slots_to')}, "
+            f"{pfmt(rs.get('sys_tps_before'))}->{pfmt(rs.get('sys_tps_after'))} t/s "
+            f"while serving{tail}"
+        )
+    # greedy determinism: direct baseline vs gateway transparency
+    gd = next(
+        (
+            r
+            for r in recs
+            if r.get("provider") == "greedy"
+            and "error" not in r
+            and r.get("exact_matches") is not None
+        ),
+        None,
+    )
+    gwg = next(
+        (
+            r
+            for r in recs
+            if r.get("provider") == "greedy_gw"
+            and "error" not in r
+            and r.get("exact_matches") is not None
+        ),
+        None,
+    )
+    if gwg and gwg.get("prompts"):
+        direct_note = (
+            f"direct {gd['exact_matches']}/{gd['prompts']} exact, "
+            if gd and gd.get("prompts")
+            else ""
+        )
+        parts.append(
+            f"greedy determinism: {direct_note}gateway transparency "
+            f"{gwg['exact_matches']}/{gwg['prompts']} exact at temp 0 "
+            "(divergence = multi-slot batching numerics, not translation drift)"
+        )
     boot = next(
         (r.get("daemon_boot_s") for r in gw.values() if r.get("daemon_boot_s")), None
     )
@@ -7507,6 +8021,19 @@ def executive_summary(recs: list[dict]) -> list[str]:
             and "error" not in r
             and r.get("slept")
             and r.get("idle_wake_ttft_ms")
+            and str(r.get("idle_policy", "")).startswith("sleep")
+        ),
+        None,
+    )
+    idle_ev = next(
+        (
+            r
+            for r in recs
+            if r.get("provider") == "idle-blazar"
+            and "error" not in r
+            and r.get("slept")
+            and r.get("idle_wake_ttft_ms")
+            and str(r.get("idle_policy", "")).startswith("evict")
         ),
         None,
     )
@@ -7526,6 +8053,11 @@ def executive_summary(recs: list[dict]) -> list[str]:
             f"idle wake {pfmt(idle_p['idle_wake_ttft_ms'], 0)} ms (sleep) vs ollama "
             f"{pfmt(idle_o['idle_wake_ttft_ms'], 0)} ms (full reload)"
         )
+        if idle_ev:
+            parts.append(
+                f"evict-ladder wake {pfmt(idle_ev['idle_wake_ttft_ms'], 0)} ms "
+                "(full respawn still beats ollama's reload)"
+            )
     if parts:
         return parts
     # Media-only campaigns have no text rows to rank — say that instead
@@ -7544,37 +8076,79 @@ def executive_summary(recs: list[dict]) -> list[str]:
 
 
 def media_table(recs: list[dict]) -> str:
-    """One row per measured media lane point; blank cells where a lane has no value."""
-    rows = []
-    for r in recs:
-        prov = r.get("provider") or ""
-        if not prov.startswith("media-") or "error" in r:
-            continue
-        model = r.get("model") or ""
-        if prov == "media-image":
+    """One row per measured media lane point; blank cells where a lane has no value.
+
+    Media-image cells with identical (engine, model, size, steps, config)
+    aggregate into ONE row (median of medians, min-of-mins / max-of-maxes,
+    n=count) — re-run campaigns otherwise render as visually identical
+    duplicate rows (F6c). The config knob joins the label so the A/B rows
+    (default / fa_off / vae_tiling_on / sage_attn_on) are distinguishable.
+    """
+
+    def image_rows() -> list[tuple]:
+        groups: dict[tuple, list[dict]] = {}
+        order: list[tuple] = []
+        for r in recs:
+            if r.get("provider") != "media-image" or "error" in r:
+                continue
             p = r.get("params") or {}
-            gt = "x".join(str(d) for d in (r.get("dims_seen") or ["?"])) + " PNG"
-            qm = r.get("quality_medians") or {}
+            gk = (
+                r.get("tag"),
+                r.get("model") or "",
+                str(p.get("size")),
+                tuple(p.get("steps") or []),
+                p.get("config"),
+            )
+            if gk not in groups:
+                groups[gk] = []
+                order.append(gk)
+            groups[gk].append(r)
+        out = []
+        for gk in order:
+            rs = groups[gk]
+            r0 = rs[0]
+            tag, model, size, steps, cfg_name = gk
+            gt = "x".join(str(d) for d in (r0.get("dims_seen") or ["?"])) + " PNG"
+            qm = r0.get("quality_medians") or {}
             if qm:
                 gt += (
                     f", entropy {pfmt(qm.get('entropy_bits'), 1)} bits, "
                     f"contrast {pfmt(qm.get('rms_contrast'), 1)}"
                 )
-            elif r.get("quality_note"):
-                gt += f" ({r['quality_note']})"
-            rows.append(
+            elif r0.get("quality_note"):
+                gt += f" ({r0['quality_note']})"
+            meds = [r.get("total_s_median") for r in rs if r.get("total_s_median")]
+            mins = [r.get("total_s_min") for r in rs if r.get("total_s_min")]
+            maxs = [r.get("total_s_max") for r in rs if r.get("total_s_max")]
+            colds = [r.get("cold_request_s") for r in rs if r.get("cold_request_s")]
+            label = f"image - {model} ({size}, steps={list(steps)})"
+            if cfg_name:
+                label += f" [{cfg_name}]"
+            if len(rs) > 1:
+                label += f" (n={len(rs)})"
+            out.append(
                 (
-                    f"image - {model} ({p.get('size')}, steps={p.get('steps')})",
-                    r.get("cold_request_s"),
-                    r.get("total_s_median"),
-                    r.get("total_s_min"),
-                    r.get("total_s_max"),
+                    label,
+                    statistics.median(colds) if colds else None,
+                    statistics.median(meds) if meds else None,
+                    min(mins) if mins else None,
+                    max(maxs) if maxs else None,
                     gt,
                     "",
                     "",
                 )
             )
-        elif prov == "media-video":
+        return out
+
+    rows: list[tuple] = image_rows()
+    for r in recs:
+        prov = r.get("provider") or ""
+        if not prov.startswith("media-") or "error" in r:
+            continue
+        if prov == "media-image":
+            continue
+        model = r.get("model") or ""
+        if prov == "media-video":
             p = r.get("params") or {}
             for pt in r.get("per_frames") or []:
                 runs = pt.get("runs") or []
@@ -8010,7 +8584,12 @@ def text_findings(recs: list[dict]) -> list[tuple[str | None, str]]:
                         f"{label}: reshaped but {r.get('requests_failed')} request(s) dropped"
                     )
             else:
-                bits.append(f"{label}: no reshape observed in the lane window")
+                if r.get("detection_error"):
+                    bits.append(
+                        f"{label}: reshape verdict VOID - {r['detection_error']}"
+                    )
+                else:
+                    bits.append(f"{label}: no reshape observed in the lane window")
         backed = (
             "**Adaptive reshape lands under sustained load.** "
             + "; ".join(bits)
@@ -8161,6 +8740,7 @@ def conc_frontier(recs: list[dict]) -> tuple[str, list[str]]:
                     eff,
                     r.get("conc_ttft_p99_ms"),
                     r.get("itl_p99_ms"),
+                    r,
                 )
             )
         lvls = [r.get("conc_level") for r in g if r.get("conc_level")]
@@ -8195,9 +8775,9 @@ def conc_frontier(recs: list[dict]) -> tuple[str, list[str]]:
     )
     sep = "|---|---:|---:|---:|---:|---:|---:|---:|"
     body = [
-        f"| {n} | {pfmt(lvl, 0)} | {pfmt(ok, 0)} | {pfmt(s_)} | {pfmt(sm)} |"
+        f"| {n} | {pfmt(lvl, 0)} | {ok_streams_cell(ok, lvl, r.get('conc_rounds'))} | {pfmt(s_)} | {pfmt(sm)} |"
         f" {pfmt(e * 100, 0) + '%' if e is not None else '-'} | {pfmt(t9, 0)} | {pfmt(i9, 1)} |"
-        for n, lvl, ok, s_, sm, e, t9, i9 in rows
+        for n, lvl, ok, s_, sm, e, t9, i9, r in rows
     ]
     return "\n".join([head, sep, *body]), verdicts
 
@@ -8240,11 +8820,11 @@ def engine_coverage(recs: list[dict]) -> list[str]:
         else:
             status = "no cells in this campaign"
         out.append(
-            f"| {tag} | {kind} | {lane_of.get(kind, '—')} "
+            f"| {tag} | {kind} | {lane_of.get(kind, '-')} "
             f"| {c['ok']} | {c['err']} | {status} |"
         )
     for tag, reason in sorted(inv.get("excluded", {}).items()):
-        out.append(f"| {tag} | — | — | 0 | 0 | excluded: {reason} |")
+        out.append(f"| {tag} | - | - | 0 | 0 | excluded: {reason} |")
     return out
 
 
@@ -8275,6 +8855,83 @@ def update_campaign_index(
     body.append(row)
     index.write_text("\n".join(header + sorted(body)) + "\n")
     print(f"campaign index -> {index} ({len(body)} campaign(s))")
+
+
+def load_campaign_cells(ad: Path) -> tuple[list[dict], str | None]:
+    """Last-wins record set for a campaign dir, plus its stamped argv."""
+    by_key: dict[str, dict] = {}
+    for line in (ad / "cells.jsonl").read_text().splitlines():
+        if line.strip():
+            r = json.loads(line)
+            by_key[r["key"]] = r
+    recs = sorted(
+        by_key.values(), key=lambda r: (r.get("provider", ""), r.get("tag", ""))
+    )
+    cmd_file = ad / "campaign_cmd.txt"
+    argv_rec = cmd_file.read_text().strip() if cmd_file.exists() else None
+    return recs, argv_rec
+
+
+def demote_headings(md: str) -> str:
+    """Shift every ATX heading one level deeper (# -> ##)."""
+    out = []
+    in_fence = False
+    for ln in md.splitlines():
+        if ln.lstrip().startswith("```"):
+            in_fence = not in_fence
+        if not in_fence and ln.startswith("#"):
+            out.append("#" + ln)
+        else:
+            out.append(ln)
+    return "\n".join(out)
+
+
+def append_campaign_chapter(ad: Path, out_path: Path) -> Path | None:
+    """Append a second campaign's report as a nested chapter.
+
+    Used for lanes the main campaign structurally cannot measure — the
+    safetensors-only sglang engine next to a GGUF flagship sweep. The
+    chapter reuses the full publication renderer with headings demoted
+    one level, wrapped in a scope caveat: a different model and format
+    were measured, so t/s must not be compared across chapters.
+    """
+    if not (ad / "cells.jsonl").exists():
+        log(f"append-campaign: no cells.jsonl under {ad}; skipped")
+        return None
+    recs, argv_rec = load_campaign_cells(ad)
+    # Primary lane model = most frequent model among the campaign's
+    # gateway speed cells; media/voice side-models must not leak into
+    # the chapter caveat.
+    counts: dict[str, int] = {}
+    for r in recs:
+        if r.get("provider") == "blazar" and r.get("model"):
+            m = r["model"].removesuffix(".d")
+            counts[m] = counts.get(m, 0) + 1
+    model = max(counts.items(), key=lambda kv: kv[1])[0] if counts else "unknown"
+    tmp = out_path.parent / f".{out_path.name}.append-{ad.name}.md"
+    write_publication_report(recs, ad, tmp, argv_rec)
+    chapter = demote_headings(tmp.read_text())
+    tmp.unlink()
+    # Drop the demoted duplicate title line ("## Blazar inference
+    # benchmark") — the chapter header already names the campaign; the
+    # byline rendered right below it keeps the version/power context.
+    lines = chapter.splitlines()
+    if lines and lines[0].startswith("## "):
+        lines = lines[1:]
+    chapter = "\n".join(lines).lstrip("\n")
+    caveat = (
+        f"\n\n# Appended campaign: {ad.name}\n\n"
+        f"_Different lane than the main publication: model {model}"
+        " and format differ, so absolute t/s is NOT comparable across"
+        " chapters; comparisons inside this chapter use its own reference"
+        " rows._\n"
+    )
+    with out_path.open("a", encoding="utf-8") as fh:
+        fh.write(caveat)
+        fh.write(chapter)
+        fh.write("\n")
+    log(f"appended campaign chapter: {ad.name} -> {out_path}")
+    return ad
 
 
 def write_publication_report(
@@ -8431,7 +9088,7 @@ def write_publication_report(
     L.append(campaign_scoped(idle_wake_table(recs), "idle wake", artifacts_dir.name))
     L.append("")
     L.append(
-        "_blazar sleeps with weights in RAM (wake = resume); ollama unloads at keep_alive expiry (wake = full disk reload). Policies differ by design — the table measures each runtime's own idle path after the policy verifiably fired._"
+        "_blazar sleeps with weights in RAM (wake = resume); ollama unloads at keep_alive expiry (wake = full disk reload). Policies differ by design - the table measures each runtime's own idle path after the policy verifiably fired._"
     )
     L.append("")
     L.append("### Long-context degradation curve")
@@ -8451,7 +9108,7 @@ def write_publication_report(
     L.append(
         "_Media cells run through the same sandboxed gateway as text lanes but do not assert "
         "GPU-idle: a warm engine child is the normal serving shape, so each row stamps "
-        "gpu_busy_mib / ram_avail_mib / loadavg instead. 3 runs (not 5) — media variance is "
+        "gpu_busy_mib / ram_avail_mib / loadavg instead. 3 runs (not 5); media variance is "
         "dominated by the model, not the scheduler. Video frame counts are read from the EBML "
         "container (lacing-aware), never from an API field; the VRAM gate probe times how fast "
         "an over-budget request is rejected with a teaching error._"
@@ -8519,7 +9176,9 @@ def write_publication_report(
         L.append("## Structured skips (tool/format boundaries)")
         L.append("")
         for r in note_rows:
-            L.append(f"- {r.get('tag', '?')} ({r.get('provider', '?')}): {r['note']}")
+            L.append(
+                f"- {r.get('tag', '?')} ({r.get('provider', '?')}): {ascii_note(r['note'])}"
+            )
         L.append("")
     L.append("")
     L.append("## Caveats")
@@ -8546,7 +9205,8 @@ def write_publication_report(
             "python3 scripts/bench_matrix.py --blazar-bin target/release/blazar --md BENCHMARK.md"
         )
     L.append(
-        "python3 scripts/bench_matrix.py --render-only --artifacts-dir <dir> --md BENCHMARK.md"
+        "python3 scripts/bench_matrix.py --render-only --artifacts-dir <dir> "
+        "[--append-campaign <sibling-campaign-dir>] --md BENCHMARK.md"
     )
     L.append("```")
     L.append("")
