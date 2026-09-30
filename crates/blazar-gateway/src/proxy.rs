@@ -1548,15 +1548,22 @@ fn route_name(path_query: &str) -> &'static str {
 
 /// Holds in-flight accounting until dropped. The gateway wraps every
 /// streamed response body in one, so a 30-minute generation still counts
-/// as in-flight (the reaper never evicts under load).
+/// as in-flight (the reaper never evicts under load). `exclusive` marks a
+/// deterministic-isolation holder: its `Drop` releases the per-model
+/// exclusivity claim AFTER ending accounting, so woken waiters see a
+/// fully quiescent model.
 pub struct InFlightGuard {
     state: Arc<AppState>,
     model: String,
+    exclusive: bool,
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.state.sup.end_request(&self.model);
+        if self.exclusive {
+            self.state.sup.release_exclusive(&self.model);
+        }
         self.state.queue.signal_free();
     }
 }
@@ -1622,6 +1629,7 @@ pub async fn admission_gate_slo(
     deadline_ms: Option<u64>,
     body_len: usize,
     wfq: Option<(&str, u32)>,
+    exclusive: bool,
 ) -> Result<InFlightGuard, Box<Response>> {
     let max_inflight: i64 = state.sup.slot_cap(model);
     // Predictive early-reject (#28): an explicit deadline that measured
@@ -1652,12 +1660,11 @@ pub async fn admission_gate_slo(
         }
     }
     loop {
-        let busy = state
-            .sup
-            .ps()
-            .into_iter()
-            .find(|p| p.name == model)
-            .map_or(0, |p| p.in_flight);
+        // Canonical load read: live replicas + requests admitted during
+        // the cold-spawn window (a ps() row cannot express the latter —
+        // the instance does not exist yet, and the gate must still see
+        // the request it just admitted).
+        let busy = state.sup.request_load(model);
         // Reserved capacity (MT4): the last ceil(N/4) slots belong to
         // interactive/tool work. RawLong may not take one while any
         // non-raw waiter is queued for this model (borrowing keeps the
@@ -1670,7 +1677,18 @@ pub async fn admission_gate_slo(
                 crate::queue::raw_ceiling(max_inflight, state.queue.has_non_raw_waiter(model))
             }
         };
-        if busy < ceiling {
+        // Deterministic isolation (F4): a temp-0 seeded request takes
+        // the child ALONE. Wait for quiescence (zero load AND no other
+        // holder), then hold exclusivity until the guard drops; the
+        // claim is never granted mid-reshape (the drain owns that
+        // window) and the wait is bounded by the same 2-minute
+        // admission timeout as every other park.
+        if exclusive {
+            if busy == 0 && !state.sup.is_reshaping(model) && state.sup.try_acquire_exclusive(model)
+            {
+                return Ok(begin_accounting_exclusive(state, model));
+            }
+        } else if busy < ceiling && !state.sup.exclusive_active(model) {
             // A reshape is draining this model: hold new admissions so
             // in-flight can only fall and the respawn lands this window.
             // Parks ride the same queue/pressure machinery as a full
@@ -1695,12 +1713,14 @@ pub async fn admission_gate_slo(
             }
             return Ok(begin_accounting(state, model));
         }
-        // The REAL same-model park: this request waits for a slot on the
-        // admission queue. Bracket the wait with the slot-pressure gauge
-        // so the adaptive reshaper sees currently-parked demand every
-        // reaper tick (the ensure-path AllSlotsBusy arm only covers
-        // multi-model spawn contention — live-proven 2026-09-12: 12
-        // streams on one loaded model queued here for 37s with the
+        // The REAL same-model park: this request waits on the admission
+        // queue for a slot (full ceiling), for the exclusive holder to
+        // finish (isolation active), or for quiescence (an exclusive
+        // candidate itself). Bracket the wait with the slot-pressure
+        // gauge so the adaptive reshaper sees currently-parked demand
+        // every reaper tick (the ensure-path AllSlotsBusy arm only
+        // covers multi-model spawn contention — live-proven 2026-09-12:
+        // 12 streams on one loaded model queued here for 37s with the
         // gauge reading zero the whole time).
         state.sup.note_slot_pressure(model);
         let waited = state
@@ -1720,6 +1740,84 @@ pub async fn admission_gate_slo(
     }
 }
 
+/// Deterministic-isolation predicate (F4): the model carries the knob AND
+/// the request signals reproducibility intent — `temperature <= 0` with
+/// an explicit `seed` (a seedless greedy call has nothing to reproduce).
+/// Surfaces without sampling options (embeddings, rerank) pass `None`s
+/// and never qualify.
+#[must_use]
+pub fn exclusive_intent(
+    state: &Arc<AppState>,
+    model: &str,
+    temperature: Option<f64>,
+    seed: Option<i64>,
+) -> bool {
+    state.sup.deterministic_isolate(model)
+        && temperature.is_some_and(|t| t <= 0.0)
+        && seed.is_some()
+}
+
+/// [`exclusive_intent`] over a raw OpenAI-shaped body (top-level
+/// `temperature`/`seed`). The knob check runs first so the JSON parse
+/// only happens on models that actually enabled isolation.
+#[must_use]
+pub fn exclusive_intent_bytes(state: &Arc<AppState>, model: &str, body: &[u8]) -> bool {
+    if !state.sup.deterministic_isolate(model) {
+        return false;
+    }
+    let v: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    exclusive_intent(
+        state,
+        model,
+        v.get("temperature").and_then(serde_json::Value::as_f64),
+        v.get("seed").and_then(serde_json::Value::as_i64),
+    )
+}
+
+/// Ollama-compat admission: the same SLO gate as the `OpenAI` surface, with
+/// the refusal translated to the ollama error shape. The compat routes
+/// used to admit straight through `begin_accounting`, which live probing
+/// (2026-09-29) showed defeats the adaptive reshaper twice over: requests
+/// stream past the slot ceiling so in-flight never drains (an adopted
+/// reshape parks forever), and the parked-waiter gauge that sizes the
+/// adoption step is never fed.
+pub async fn admission_gate_ollama(
+    state: &Arc<AppState>,
+    model: &str,
+    priority: Priority,
+    class: crate::queue::WorkClass,
+    body_len: usize,
+    exclusive: bool,
+) -> Result<InFlightGuard, Box<Response>> {
+    match admission_gate_slo(
+        state, model, priority, class, None, body_len, None, exclusive,
+    )
+    .await
+    {
+        Ok(guard) => Ok(guard),
+        Err(boxed) => {
+            let status = boxed.status().as_u16();
+            let msg = axum::body::to_bytes(boxed.into_body(), 64 * 1024)
+                .await
+                .ok()
+                .and_then(|bytes| {
+                    serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .ok()
+                        .and_then(|v| {
+                            v.pointer("/error/message")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string)
+                        })
+                })
+                .unwrap_or_else(|| "admission queue timeout".to_string());
+            Err(Box::new(crate::ollama::api_error(status, &msg)))
+        }
+    }
+}
+
 /// Begin accounting and return the guard; the response path holds it for
 /// the body's lifetime.
 #[must_use]
@@ -1728,6 +1826,22 @@ pub fn begin_accounting(state: &Arc<AppState>, model: &str) -> InFlightGuard {
     InFlightGuard {
         state: state.clone(),
         model: model.to_string(),
+        exclusive: false,
+    }
+}
+
+/// Begin accounting as a deterministic-isolation holder: exclusivity was
+/// acquired by the gate (quiescent child verified there); the guard's
+/// `Drop` returns it. Same in-flight accounting as [`begin_accounting`]
+/// — an exclusive request must be visible to `request_load` so a second
+/// exclusive candidate keeps parking.
+#[must_use]
+fn begin_accounting_exclusive(state: &Arc<AppState>, model: &str) -> InFlightGuard {
+    state.sup.begin_request(model);
+    InFlightGuard {
+        state: state.clone(),
+        model: model.to_string(),
+        exclusive: true,
     }
 }
 

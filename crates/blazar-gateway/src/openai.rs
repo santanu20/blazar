@@ -16,8 +16,8 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
 use crate::proxy::{
-    admission_gate_slo, affinity_hash_bytes, ensure_with_admission, openai_error, path_and_query,
-    proxy_request,
+    admission_gate_slo, affinity_hash_bytes, ensure_with_admission, exclusive_intent_bytes,
+    openai_error, path_and_query, proxy_request,
 };
 use crate::queue::Priority;
 use crate::state::AppState;
@@ -470,6 +470,7 @@ pub async fn openai_proxy(
         deadline_ms,
         body.len(),
         wfq_of(key_ext.as_ref()),
+        exclusive_intent_bytes(&state, &model_name, &body),
     )
     .await
     {
@@ -693,6 +694,7 @@ pub async fn scoped_proxy(
         deadline_ms,
         body.len(),
         wfq_of(key_ext.as_ref()),
+        exclusive_intent_bytes(&state, &model_name, &body),
     )
     .await
     {
@@ -865,6 +867,7 @@ pub async fn responses_api(
         None,
         0,
         wfq_of(key_ext.as_ref()),
+        false, // embeddings carry no sampling: exclusivity never applies
     )
     .await
     {
@@ -1194,6 +1197,7 @@ pub async fn lora_adapters(
         None,
         0,
         None,
+        false, // adapters admin op: exclusivity never applies
     )
     .await;
     match guard {

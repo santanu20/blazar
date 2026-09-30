@@ -6166,6 +6166,8 @@ async fn ps(reset: bool, json: bool) -> Result<()> {
                     "engine": m["blazar_engine"].as_str(),
                     "state": m["blazar_state"].as_str(),
                     "ctx": m["blazar_ctx"].as_i64().unwrap_or(0),
+                    "slots": m["blazar_slots"].as_i64(),
+                    "slots_configured": m["blazar_slots_configured"].as_i64(),
                     "gpu": m["blazar_gpu"].as_str().unwrap_or("-"),
                     "device": m["blazar_device"].as_str(),
                     "cache_hit": m["blazar_cache_hit"].as_f64(),
@@ -6191,8 +6193,8 @@ async fn ps(reset: bool, json: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<24} {:<9} {:>7} {:>6} {:<20} {:>4} {:>10}  ENDPOINT",
-        "NAME", "STATE", "CTX", "GPU", "SPEC", "HIT", "IN_FLIGHT"
+        "{:<24} {:<9} {:>7} {:>5} {:>6} {:<20} {:>4} {:>10}  ENDPOINT",
+        "NAME", "STATE", "CTX", "SLOTS", "GPU", "SPEC", "HIT", "IN_FLIGHT"
     );
     for m in models {
         let display = match m["blazar_replica"].as_i64() {
@@ -6200,11 +6202,23 @@ async fn ps(reset: bool, json: bool) -> Result<()> {
             None => m["name"].as_str().unwrap_or("?").to_string(),
         };
         let (gpu, spec, hit) = ps_row_cells(&m);
+        // Child's own `-np` first; when the argv carries no slot flag
+        // (mistral.rs lane) fall back to the configured ceiling, marked
+        // `~` so "measured child shape" and "admission ceiling" stay
+        // distinguishable at a glance.
+        let slots = match m["blazar_slots"].as_i64() {
+            Some(n) => n.to_string(),
+            None => match m["blazar_slots_configured"].as_i64() {
+                Some(n) => format!("~{n}"),
+                None => "-".to_string(),
+            },
+        };
         println!(
-            "{:<24} {:<9} {:>7} {:>6} {:<20} {:>4} {:>10}  {}",
+            "{:<24} {:<9} {:>7} {:>5} {:>6} {:<20} {:>4} {:>10}  {}",
             display,
             m["blazar_state"].as_str().unwrap_or("?"),
             m["blazar_ctx"].as_i64().unwrap_or(0),
+            slots,
             gpu,
             spec,
             hit,

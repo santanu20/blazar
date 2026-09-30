@@ -157,6 +157,9 @@ pub async fn messages(
         key_ext
             .as_ref()
             .map(|axum::extract::Extension(k)| (k.name.as_str(), k.weight)),
+        // Anthropic bodies carry temperature but no seed — nothing to
+        // reproduce, exclusivity never applies on this surface.
+        false,
     )
     .await
     {

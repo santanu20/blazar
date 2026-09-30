@@ -94,6 +94,19 @@ pub async fn watch(State(state): State<Arc<AppState>>) -> Response {
 /// Minimal percent-decoding for hand-parsed query values (F19: model
 /// names like `Qwen3%2F0.6` must round-trip; `+` is left alone since
 /// path-shaped values never use the form-encoding space convention).
+/// Deterministic-isolation intent for an ollama-shaped request body
+/// (F4): `options.temperature <= 0` with `options.seed` present on a
+/// model that enabled `deterministic_isolate`. `req` is the already
+/// parsed JSON every ollama handler holds before admission.
+fn isolate_call(state: &std::sync::Arc<crate::state::AppState>, model: &str, req: &Value) -> bool {
+    crate::proxy::exclusive_intent(
+        state,
+        model,
+        req.pointer("/options/temperature").and_then(Value::as_f64),
+        req.pointer("/options/seed").and_then(Value::as_i64),
+    )
+}
+
 fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -410,6 +423,8 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
                 "blazar_engine": p.engine,
                 "blazar_state": p.state,
                 "blazar_ctx": p.ctx,
+                "blazar_slots": p.slots,
+                "blazar_slots_configured": p.slots_configured,
                 "blazar_gpu": p.gpu,
                 "blazar_device": p.device,
                 "blazar_device_id": p.device_id,
@@ -1092,6 +1107,24 @@ pub async fn chat(
         state.config.effective_prompt_recipe(&model_field) == crate::prompt_recipe::OLLAMA_COMPAT
             && !crate::prompt_recipe::has_images(&req),
     );
+    // Request-level admission BEFORE the ensure path (same contract as
+    // the OpenAI surface): ceiling check, fair queue, reshape-drain park.
+    // Keyed on the resolved row name so ps()/is_reshaping lookups match.
+    // Greedy+seeded calls on isolate-enabled models take the child
+    // exclusively (F4).
+    let guard = match crate::proxy::admission_gate_ollama(
+        &state,
+        &row.name,
+        priority,
+        class,
+        body.len(),
+        isolate_call(&state, &row.name, &req),
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(boxed) => return *boxed,
+    };
     let (engine, load_ms) = match ensure_with_admission(
         &state,
         &model_field,
@@ -1123,13 +1156,12 @@ pub async fn chat(
     let openai_bytes = serde_json::to_vec(&openai_req).unwrap_or_default();
     let state2 = state.clone();
     let engine2 = engine.clone();
-    let accounting_name = engine.name.clone();
 
     // F29: accounting rides the response BODY (begin at admission,
     // release when the body drains or the client aborts) — not the
     // handler future, which resolves at headers-ready for streams and
-    // can be dropped mid-flight on client disconnects.
-    let guard = crate::proxy::begin_accounting(&state, &accounting_name);
+    // can be dropped mid-flight on client disconnects. The guard began
+    // at the admission gate above.
     let mut out = crate::proxy::hold_body(
         guard,
         (async move {
@@ -2212,6 +2244,7 @@ async fn proxy_core_chat(
 }
 
 /// POST /api/embeddings (legacy ollama shape).
+#[allow(clippy::too_many_lines)] // one cohesive translation path (gate + ensure + late-chunk fork)
 pub async fn embeddings(
     State(state): State<Arc<AppState>>,
     key_ext: Option<Extension<crate::keys::KeyCtx>>,
@@ -2247,6 +2280,22 @@ pub async fn embeddings(
             state.keys.charge_request(&k.name);
         }
     }
+    // Request-level admission (chat parity): embeddings are cheap but
+    // still occupy child slots — park at the ceiling instead of piling
+    // onto the engine's internal queue.
+    let guard = match crate::proxy::admission_gate_ollama(
+        &state,
+        &row.name,
+        Priority::Normal,
+        crate::queue::WorkClass::Interactive,
+        body.len(),
+        false, // no sampling on this surface: exclusivity never applies
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(boxed) => return *boxed,
+    };
     let (engine, _) = match ensure_with_admission(
         &state,
         &model,
@@ -2263,7 +2312,7 @@ pub async fn embeddings(
         Err(resp) => return *resp,
     };
     crate::proxy::hold_body(
-        crate::proxy::begin_accounting(&state, &engine.name),
+        guard,
         (async {
             // R1 late chunking: gateway-terminated embed for opted-in models.
             if state.config.effective_late_chunking(&engine.name) {
@@ -2366,6 +2415,22 @@ pub async fn embed(
             state.keys.charge_request(&k.name);
         }
     }
+    // Request-level admission (chat parity): embeddings are cheap but
+    // still occupy child slots — park at the ceiling instead of piling
+    // onto the engine's internal queue.
+    let guard = match crate::proxy::admission_gate_ollama(
+        &state,
+        &row.name,
+        Priority::Normal,
+        crate::queue::WorkClass::Interactive,
+        body.len(),
+        false, // no sampling on this surface: exclusivity never applies
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(boxed) => return *boxed,
+    };
     let (engine, _) = match ensure_with_admission(
         &state,
         &model,
@@ -2382,7 +2447,7 @@ pub async fn embed(
         Err(resp) => return *resp,
     };
     crate::proxy::hold_body(
-        crate::proxy::begin_accounting(&state, &engine.name),
+        guard,
         (async {
             // R1 late chunking: embed the joined document once (per-token
             // matrix from the pooling=none child), mean-pool per chunk span.
@@ -2469,6 +2534,7 @@ fn rerank_doc_text(doc: &Value) -> Value {
     }
 }
 
+#[allow(clippy::too_many_lines)] // one cohesive translation path (gate + ensure + forward fork)
 pub async fn rerank(
     State(state): State<Arc<AppState>>,
     key_ext: Option<Extension<crate::keys::KeyCtx>>,
@@ -2518,6 +2584,22 @@ pub async fn rerank(
             state.keys.charge_request(&k.name);
         }
     }
+    // Request-level admission (chat parity): embeddings are cheap but
+    // still occupy child slots — park at the ceiling instead of piling
+    // onto the engine's internal queue.
+    let guard = match crate::proxy::admission_gate_ollama(
+        &state,
+        &row.name,
+        Priority::Normal,
+        crate::queue::WorkClass::Interactive,
+        body.len(),
+        false, // no sampling on this surface: exclusivity never applies
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(boxed) => return *boxed,
+    };
     let (engine, _) = match ensure_with_admission(
         &state,
         &model,
@@ -2535,7 +2617,7 @@ pub async fn rerank(
     };
     let mut forward = forward;
     crate::proxy::hold_body(
-        crate::proxy::begin_accounting(&state, &engine.name),
+        guard,
         (async {
             let url = format!("{}/v1/rerank", child_base(&engine.endpoint));
             // mistral.rs children register models as `default` (see
@@ -2722,6 +2804,22 @@ pub async fn generate(
         req.get("tools").is_some_and(serde_json::Value::is_array),
         state.config.effective_prompt_recipe(&model) == crate::prompt_recipe::OLLAMA_COMPAT,
     );
+    // Request-level admission before the ensure path, identical to the
+    // /api/chat contract above (resolved-name keying, fair queue, park
+    // while an adopted reshape drains, greedy+seeded exclusivity).
+    let guard = match crate::proxy::admission_gate_ollama(
+        &state,
+        &row.name,
+        priority,
+        class,
+        body.len(),
+        isolate_call(&state, &row.name, &req),
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(boxed) => return *boxed,
+    };
     let (engine, load_ms) = match ensure_with_admission(
         &state,
         &model,
@@ -2753,7 +2851,7 @@ pub async fn generate(
     let stream = req["stream"].as_bool().unwrap_or(true);
     let state_ej = state.clone();
     let mut out = crate::proxy::hold_body(
-        crate::proxy::begin_accounting(&state, &engine.name),
+        guard,
         (async move {
             let enforce =
                 state_ej.config.sentinel && sentinel::enforce_enabled(&state_ej.config, &headers);

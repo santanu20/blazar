@@ -2886,7 +2886,6 @@ async fn e2e__tool_wins_admission_over_earlier_queued_interactive() {
                     "function": {"name": "t", "parameters": {"type": "object"}}
                 }]);
             }
-            let began = std::time::Instant::now();
             let r = client()
                 .post(format!("{base}/api/chat"))
                 .json(&body)
@@ -2894,24 +2893,87 @@ async fn e2e__tool_wins_admission_over_earlier_queued_interactive() {
                 .await
                 .unwrap();
             assert_eq!(r.status(), 200);
-            began
+            // Non-stream: the gateway buffers the full translated body,
+            // so send() resolving = the request COMPLETED. The pre-send
+            // instant this closure used to return only measured spawn
+            // order, which made the ordering asserts below vacuous.
+            std::time::Instant::now()
         }
     };
     // A: plain chat, admitted immediately, holds the slot ~6 s.
     let a = tokio::spawn(chat(false));
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     // C: plain chat (Interactive) — queues FIRST.
-    let cc = tokio::spawn(chat(false));
+    let c = tokio::spawn(chat(false));
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     // B: chat with tools (Tool class) — queues SECOND.
     let b = tokio::spawn(chat(true));
-    let (ra, rb, rc) = tokio::join!(a, cc, b);
-    let (ra, rb, rc) = (ra.unwrap(), rb.unwrap(), rc.unwrap());
+    let (ra, rc, rb) = tokio::join!(a, c, b);
+    let (done_a, done_c, done_b) = (ra.unwrap(), rc.unwrap(), rb.unwrap());
     assert!(
-        rb < rc,
+        done_b < done_c,
         "tool request must admit before earlier-queued interactive"
     );
-    assert!(ra < rb);
+    assert!(done_a < done_b);
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__deterministic_isolate__parks_normal_request_until_exclusive_finishes() {
+    // F4 contract, wired end to end: with deterministic_isolate on, a
+    // temp-0 seeded request is granted EXCLUSIVE admission — a normal
+    // request for the same model parks until the exclusive one finishes,
+    // even though a free slot exists (slots = 2 here so the plain
+    // ceiling would happily admit both concurrently — only the
+    // exclusive gate can produce the observed serialization).
+    let mut cfg = Config::default();
+    cfg.model_overrides.insert(
+        "m1".into(),
+        blazar_core::ModelOverride {
+            slots: Some(2),
+            deterministic_isolate: Some(true),
+            ..Default::default()
+        },
+    );
+    let ts = start_with(cfg, vec![("STUB_DELAY_MS".into(), "6000".into())]).await;
+    let chat = |temperature: Option<f64>, seed: Option<i64>| {
+        let base = ts.base.clone();
+        async move {
+            let mut body = serde_json::json!({
+                "model": "m1", "stream": false,
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+            if let Some(t) = temperature {
+                body["options"]["temperature"] = serde_json::json!(t);
+            }
+            if let Some(s) = seed {
+                body["options"]["seed"] = serde_json::json!(s);
+            }
+            let r = client()
+                .post(format!("{base}/api/chat"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200);
+            // Non-stream: gateway buffers the full body, so send()
+            // resolving = the request COMPLETED (post-send instant).
+            std::time::Instant::now()
+        }
+    };
+    // A: temp-0 + seeded -> exclusive lane, holds it ~6 s.
+    let a = tokio::spawn(chat(Some(0.0), Some(42)));
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    // B: normal sampling request — would co-run on the second slot
+    // without the exclusive gate; must park behind A instead.
+    let b = tokio::spawn(chat(None, None));
+    let (ra, rb) = tokio::join!(a, b);
+    let (done_a, done_b) = (ra.unwrap(), rb.unwrap());
+    assert!(
+        done_b.duration_since(done_a) >= std::time::Duration::from_millis(3_000),
+        "normal request must complete well after the exclusive holder (gate off would co-run both at ~6 s)"
+    );
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
