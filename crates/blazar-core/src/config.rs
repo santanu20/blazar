@@ -26,6 +26,24 @@ impl std::fmt::Display for UpdateChannel {
     }
 }
 
+/// TOML deep-merge of user keys over the serialized defaults: nested
+/// tables merge recursively (a user overlay table augments, not
+/// replaces, a defaults table); scalars and arrays replace wholesale
+/// (TOML has no partial-array semantics). Used by
+/// [`Config::deserialize_with_defaults`].
+fn merge_user_over_defaults(base: &mut toml::Table, user: &toml::Table) {
+    for (key, value) in user {
+        match (base.get_mut(key), value) {
+            (Some(toml::Value::Table(base_sub)), toml::Value::Table(user_sub)) => {
+                merge_user_over_defaults(base_sub, user_sub);
+            }
+            _ => {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
 /// Tunables exposed in config.toml. One file, one surface: every Blazar
 /// knob lives here or in a per-model overlay; the documented `BLAZAR_*`
 /// env vars override file values. Secrets (`HF_TOKEN` / `GH_TOKEN`) are env-only
@@ -188,6 +206,17 @@ pub struct Config {
     /// of batching (~2.5x system throughput left on the table).
     #[serde(default)]
     pub deterministic: bool,
+    /// Per-request deterministic isolation (complements `deterministic`):
+    /// when `true`, a greedy request (temperature <= 0) that carries an
+    /// explicit `seed` is admitted EXCLUSIVELY — the gateway parks every
+    /// other request for that model until it finishes, so the child
+    /// serves it with a single-shape batch. Keeps multi-slot throughput
+    /// for ordinary traffic while giving reproducibility-critical calls
+    /// slots=1-class isolation without respawning the child. Default
+    /// `false`; a request without a seed never triggers it (no seed, no
+    /// reproducibility intent).
+    #[serde(default)]
+    pub deterministic_isolate: bool,
     /// KV cache quantization: "" = auto ladder (`q8_0` when KV+weights near
     /// VRAM, `q4_0` when still tight), or an explicit type: f32, f16, bf16,
     /// `q8_0`, `q4_0`, `q4_1`, `iq4_nl`, `q5_0`, `q5_1`. Quantized V requires flash
@@ -1015,6 +1044,11 @@ pub struct ModelOverride {
     /// `deterministic`). `true` forces slots = 1 for this model.
     #[serde(default)]
     pub deterministic: Option<bool>,
+    /// Per-model deterministic isolation (None = inherit the global
+    /// `deterministic_isolate`): temp-0 + seeded requests take the
+    /// child exclusively instead of pinning the spawn shape.
+    #[serde(default)]
+    pub deterministic_isolate: Option<bool>,
     pub spec: Option<String>,
     /// Per-model on-demand tensor loading (None = inherit `lazy_mode`).
     pub lazy_mode: Option<String>,
@@ -2069,6 +2103,7 @@ impl Default for Config {
             cache_ram_mb: DEFAULT_CACHE_RAM_MB,
             slots: default_slots(),
             deterministic: false,
+            deterministic_isolate: false,
             slot_prompt_similarity: 0.0,
             sentinel: true,
             sentinel_stall_secs: 30,
@@ -2305,7 +2340,7 @@ impl Config {
         let probe: toml::Table =
             toml::from_str(raw).map_err(|e| CoreError::Config(format!("parse: {e}")))?;
         let migrating = probe.contains_key("api_keys");
-        let raw = if migrating {
+        let user_table = if migrating {
             let legacy = probe
                 .get("api_keys")
                 .and_then(|v| v.as_array())
@@ -2313,8 +2348,7 @@ impl Config {
                 .unwrap_or_default();
             let mut table = probe.clone();
             table.remove("api_keys");
-            let mut cfg: Config = toml::from_str(&toml::to_string(&table).unwrap_or_default())
-                .map_err(|e| CoreError::Config(format!("parse: {e}")))?;
+            let mut cfg = Self::deserialize_with_defaults(&table)?;
             cfg.keys = legacy
                 .iter()
                 .enumerate()
@@ -2333,16 +2367,40 @@ impl Config {
             );
             return cfg.validate().map(|()| cfg);
         } else {
-            raw.to_string()
+            // Removed knobs strip IN MEMORY (same contract as the
+            // api_keys migration above): an old config line must never
+            // lock the whole daemon out with an unknown-field error
+            // after an upgrade — while genuinely-unknown keys (typos)
+            // still fail loud.
+            let stripped = Self::strip_removed_knobs(raw)?;
+            toml::from_str(&stripped).map_err(|e| CoreError::Config(format!("parse: {e}")))?
         };
-        // Removed knobs strip IN MEMORY (same contract as the api_keys
-        // migration above): an old config line must never lock the whole
-        // daemon out with an unknown-field error after an upgrade —
-        // while genuinely-unknown keys (typos) still fail loud.
-        let stripped = Self::strip_removed_knobs(&raw)?;
-        let cfg: Config =
-            toml::from_str(&stripped).map_err(|e| CoreError::Config(format!("parse: {e}")))?;
+        let cfg = Self::deserialize_with_defaults(&user_table)?;
         cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Deserialize a user table onto the documented defaults: keys the
+    /// user wrote win; keys they omitted inherit `Config::default()` —
+    /// never a serde zero-value. The struct carries field-level plain
+    /// `#[serde(default)]` (needed so `deny_unknown_fields` tolerates
+    /// partial files), but a plain field default silently overrides the
+    /// container-level `#[serde(default)]` with `false`/`0`/`None` —
+    /// live receipt 2026-09-29: a minimal `port = N` sandbox config ran
+    /// the whole daemon with `adaptive_slots` silently OFF (reshape
+    /// campaign, zero adoptions under 8-stream load). Merging over the
+    /// serialized default restores the documented semantics for every
+    /// omitted key at once and stays correct as fields are added.
+    fn deserialize_with_defaults(user: &toml::Table) -> CoreResult<Self> {
+        let mut base = toml::Value::try_from(Config::default())
+            .map_err(|e| CoreError::Config(format!("serialize defaults: {e}")))?;
+        let base_table = base
+            .as_table_mut()
+            .ok_or_else(|| CoreError::Config("defaults must serialize to a table".into()))?;
+        merge_user_over_defaults(base_table, user);
+        let cfg: Config = base
+            .try_into()
+            .map_err(|e| CoreError::Config(format!("parse: {e}")))?;
         Ok(cfg)
     }
 
@@ -3861,6 +3919,21 @@ fn valid_override_tensor(s: &str) -> bool {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    /// Live receipt 2026-09-29: a minimal config.toml (the validate
+    /// sandbox writes exactly `port = N` + a model override) ran the
+    /// daemon with the adaptive reshaper dead for the whole reshape
+    /// campaign — no adoption under 8-stream load for 300s. This pin is
+    /// the contract: omitting a key must inherit the DOCUMENTED default
+    /// (`Config::default()`), never a serde zero-value.
+    #[test]
+    fn unit__from_toml__minimal_config_inherits_documented_defaults() {
+        let cfg = Config::from_toml("port = 1234").expect("minimal config parses");
+        assert_eq!(cfg.port, 1234);
+        assert!(cfg.adaptive_slots, "adaptive_slots must default ON");
+        assert!(cfg.warmup);
+        assert_eq!(cfg.raw_lane_max_tokens, 2048);
+    }
 
     #[test]
     fn unit__child_transport__unix_validates_and_garbage_rejects() {

@@ -447,7 +447,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
                         mib(demand)
                     ));
                 }
-            } else if demand > vram_bytes {
+            } else if demand > vram_bytes && !kv_pool_relocatable(input) {
                 let per_ctx = kv / u64::from(rs.total_ctx);
                 let fit =
                     (vram_bytes / 100 * 85).saturating_sub(input.model_bytes) / per_ctx.max(1);
@@ -477,6 +477,17 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
                         mib(vram_bytes)
                     ));
                 }
+            } else if demand > vram_bytes {
+                // Relocatable posture: the engine moves the over-subscribed
+                // pool slice to host instead of dying at context creation —
+                // keep the auto-fit ctx (host relocation, not an OOM bet).
+                tracing::info!(
+                    model = input.model_name,
+                    "profile: unified KV pool {} MiB exceeds the {} MiB VRAM — engine \
+                     relocates the overflow to host (--no-kv-offload available, not disabled)",
+                    mib(demand),
+                    mib(vram_bytes)
+                );
             }
         }
     }
@@ -581,8 +592,27 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             }
         }
     };
-    if let (Some(k), Some(v)) = (kv_k.clone(), kv_v.clone()) {
-        argv.extend(["--cache-type-k".into(), k, "--cache-type-v".into(), v]);
+    // FA-off reconciliation: upstream refuses a quantized V cache without
+    // flash-attn ("quantized V cache requires flash_attn to be enabled" —
+    // the engine exits during load otherwise; receipt: 20260929-flagship-gguf
+    // fa_off cold cell). K quants are FA-independent, so the K side survives.
+    let kv_v = match kv_v {
+        Some(v) if fa == "off" => {
+            warnings.push(format!(
+                "flash-attn off: quantized V cache ({v}) requires FA upstream — \
+                 V cache falls back to f16, K quantization kept"
+            ));
+            None
+        }
+        v => v,
+    };
+    if let Some(k) = kv_k.clone() {
+        argv.push("--cache-type-k".into());
+        argv.push(k);
+    }
+    if let Some(v) = kv_v.clone() {
+        argv.push("--cache-type-v".into());
+        argv.push(v);
     }
 
     // --- 7. cpu-moe when the model cannot fit VRAM but RAM can host it
@@ -2544,6 +2574,29 @@ fn compile_mistralrs(
             "--max-batch-size",
             &[n.to_string()],
         );
+        // Multimodal fit advisory (receipt: 20260929 flagship mr_batch_64 —
+        // mistral.rs sizes its multimodal device-map activation reservation
+        // from the batch and refused to load a 9B vision model at batch 64
+        // on an 8 GiB card: "cannot fit ... within 7094 MB of usable
+        // capacity"). Advisory only: the reservation formula belongs to
+        // upstream's auto device map, so warn and let a doomed load fail
+        // loudly with the engine's own diagnostics instead of guessing a
+        // clamp.
+        let mmproj = input
+            .mmproj_path
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map_or(0, |m| m.len());
+        let resident = input.model_bytes.saturating_add(mmproj);
+        let vram_bytes = capacity_bytes(input.hardware);
+        if input.mmproj_path.is_some() && vram_bytes > 0 && resident > vram_bytes * 75 / 100 {
+            warnings.push(format!(
+                "mistralrs.max_batch_size = {n} with a multimodal projector and weights+\
+                 projector at {}% of VRAM: mistral.rs scales its device-map activation \
+                 reservation with the batch and may refuse to load ('cannot fit ... within \
+                 N MB'); a refused load fails loudly with the engine's own diagnostics",
+                resident * 100 / vram_bytes
+            ));
+        }
     }
     if let Some(n) = tun.max_prefill_chunk_tokens {
         push_gated(
@@ -3301,6 +3354,32 @@ const SGLANG_VRAM_USABLE_PCT: u64 = 92;
 const SGLANG_MEM_FRACTION_MIN: f32 = 0.20;
 const SGLANG_MEM_FRACTION_MAX: f32 = 0.90;
 
+/// Non-static VRAM an sglang child needs on top of its weights+KV pool:
+/// activations, CUDA graph capture workspace, and the CUDA context
+/// itself. Receipts: `mem_fraction_static = 0.90` on an 8 GiB card
+/// (RTX 4070 Laptop, `Qwen3-1.7B` bf16) left 0.8 GiB and `PyTorch` hit
+/// `num_active_captures_ > 0 INTERNAL ASSERT` (`CUDACachingAllocator`)
+/// during prefill-graph capture — sglang then `kill_process_tree`s
+/// itself and the gateway surfaces an opaque 502; the ladder-derived
+/// 0.68 (≈2.7 GiB left) served green, and the bench-calibrated tight-fit
+/// fixture boots green at 2.0 GiB left on a 12 GiB card. The pool share
+/// scales with VRAM, this reserve does not, so it is expressed in MiB
+/// and only bites small cards (8 GiB → ceiling 0.75; 24 GiB → 0.90, the
+/// band max).
+const SGLANG_ACTIVATION_RESERVE_MIB: u64 = 2_000;
+
+/// Host RAM sglang itself refuses to touch for the hierarchical KV tier
+/// (`HICACHE_HOST_MEMORY_RESERVE_BYTES = 10 GiB`,
+/// `srt/mem_cache/pool_host/base.py` in 0.5.19): the host tier must fit
+/// in `MemAvailable − 10 GiB` at pool-init time.
+const SGLANG_HICACHE_HOST_RESERVE_MIB: u64 = 10_240;
+
+/// Host RAM the sglang child itself occupies before the hierarchical KV
+/// tier is sized: interpreter + torch import + weights staged through
+/// host memory on this lane (composition probe 2026-09-29; the 1.7B
+/// bf16 checkpoint staged ~3.3 GiB through host before device load).
+const SGLANG_HOST_ENGINE_FOOTPRINT_MIB: u64 = 4_096;
+
 /// Flags `SglangEngine::build_argv` owns. An `extra_args` entry naming
 /// one of these is a hand-written attempt to fight the connection
 /// quintet, the VRAM ladder, or the loras lane — hard error with the
@@ -3739,17 +3818,45 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
 
                 // mem-fraction-static: the anti-OOM heart. Derived from
                 // what actually stays device-side (weights minus the
-                // EMITTED offload — pin or ladder-derived — plus KV);
-                // explicit fraction pins win outright.
+                // EMITTED offload — pin or ladder-derived — plus KV).
+                // An explicit pin still passes governance: it may tighten
+                // or widen the derived fit, but never past the
+                // activation+graph reserve (SGLANG_ACTIVATION_RESERVE_MIB
+                // receipts) or the hard band — an over-budget pin is a
+                // mid-boot crash (capture assert → kill_process_tree →
+                // opaque 502), never a usable configuration.
                 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
                 let gpu_static =
                     weights.saturating_sub((f64::from(offload_total_gb) * 1e9).round() as u64);
                 let static_demand = gpu_static.saturating_add(kv_est_bytes.unwrap_or(0));
-                let frac = tun.mem_fraction_static.unwrap_or_else(|| {
+                let ceiling = if vram > 0 {
+                    let reserve_vram =
+                        vram.saturating_sub(Hardware::bytes(SGLANG_ACTIVATION_RESERVE_MIB));
+                    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+                    let frac = (reserve_vram as f64 / vram as f64) as f32;
+                    frac.clamp(SGLANG_MEM_FRACTION_MIN, SGLANG_MEM_FRACTION_MAX)
+                } else {
+                    SGLANG_MEM_FRACTION_MAX
+                };
+                let frac = if let Some(pin) = tun.mem_fraction_static {
+                    let governed = pin.clamp(SGLANG_MEM_FRACTION_MIN, ceiling);
+                    if (governed - pin).abs() > f32::EPSILON {
+                        warnings.push(format!(
+                            "sglang.mem_fraction_static {pin:.3} clamped to \
+                             {governed:.3}: the pin must leave \
+                             {SGLANG_ACTIVATION_RESERVE_MIB} MiB of VRAM for \
+                             activations and CUDA-graph capture (receipt: \
+                             0.90 on an 8 GiB card crashed in graph capture; \
+                             sglang then SIGKILLs itself and the gateway \
+                             surfaces a 502)"
+                        ));
+                    }
+                    governed
+                } else {
                     #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
                     let raw = (static_demand as f64 / vram.max(1) as f64) as f32;
-                    raw.clamp(SGLANG_MEM_FRACTION_MIN, SGLANG_MEM_FRACTION_MAX)
-                });
+                    raw.clamp(SGLANG_MEM_FRACTION_MIN, ceiling)
+                };
                 if vram > 0 {
                     push_tuned(
                         &mut argv,
@@ -3782,6 +3889,49 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
 
     // --- HiCache (KV tiering to host RAM), opt-in.
     if tun.hicache_enable == Some(true) {
+        // Structural viability BEFORE any flag leaves the profile:
+        // sglang 0.5.19 sizes its host tier against
+        // `MemAvailable - 10 GiB` (HICACHE_HOST_MEMORY_RESERVE_BYTES,
+        // srt/mem_cache/pool_host/base.py) and aborts boot mid-init when
+        // the tier does not fit — on a 16 GiB-RAM box (≈5.8 GiB available
+        // after torch+weights staging) that budget is NEGATIVE and every
+        // tier size fails (receipt: "Requesting 4.59 GB but only have
+        // -4.22 GB free", then kill_process_tree SIGKILL → opaque 502).
+        // Convert the guaranteed crash into a teaching refusal here; on
+        // RAM classes where the tier CAN fit, the flag passes through
+        // untouched.
+        let total_ram_mib = input.hardware.total_ram_mib;
+        let budget_mib = total_ram_mib
+            .saturating_sub(SGLANG_HICACHE_HOST_RESERVE_MIB + SGLANG_HOST_ENGINE_FOOTPRINT_MIB);
+        if let Some(size_gib) = tun.hicache_size {
+            #[allow(clippy::cast_precision_loss)]
+            let fits = (size_gib * 1024.0) <= budget_mib as f64;
+            if !fits {
+                return Err(format!(
+                    "sglang.hicache_size {size_gib} GiB cannot fit this host: sglang sizes \
+                     the hierarchical tier against MemAvailable minus a fixed \
+                     {} GiB reserve and the engine's own ~{} GiB host footprint, \
+                     leaving {budget_mib} MiB of headroom on this box's \
+                     {total_ram_mib} MiB RAM. Reduce the tier or disable \
+                     sglang.hicache_enable",
+                    SGLANG_HICACHE_HOST_RESERVE_MIB / 1024,
+                    SGLANG_HOST_ENGINE_FOOTPRINT_MIB / 1024,
+                ));
+            }
+        } else if budget_mib < 1024 {
+            return Err(format!(
+                "sglang.hicache_enable cannot work on this host: sglang sizes the \
+                 hierarchical tier against MemAvailable minus a fixed {} GiB \
+                 reserve plus the engine's own ~{} GiB host footprint, leaving \
+                 only {budget_mib} MiB of headroom on this box's {total_ram_mib} \
+                 MiB RAM — every tier size fails at boot (upstream aborts \
+                 scheduler init). HiCache needs a RAM class with at least ~{} \
+                 GiB of headroom; disable sglang.hicache_enable",
+                SGLANG_HICACHE_HOST_RESERVE_MIB / 1024,
+                SGLANG_HOST_ENGINE_FOOTPRINT_MIB / 1024,
+                (SGLANG_HICACHE_HOST_RESERVE_MIB + SGLANG_HOST_ENGINE_FOOTPRINT_MIB + 1024) / 1024,
+            ));
+        }
         push_tuned(
             &mut argv,
             input.supported_flags,
@@ -4529,15 +4679,25 @@ pub fn estimate_kv_f16(input: &ProfileInput<'_>, ctx: Option<u32>) -> Option<u64
     kv_f16_bytes(input, ctx)
 }
 
-/// VRAM the KV cache will actually occupy at spawn. Device truth
-/// (live-verified b10948): the KV cache allocates DEVICE-side on BOTH
-/// lanes — `--kv-unified` shares one buffer across sequences but never
-/// moves it to system RAM — so the charge is the full f16 estimate
-/// either way. Lane-independent by design: unified spawns must not be
-/// read as 2-4x cheaper than they really are, or co-residency planning
-/// downgrades/evicts on phantom headroom.
+/// VRAM the KV cache will actually occupy at spawn. Posture-aware
+/// (two live receipts): engines that ship `--no-kv-offload` keep
+/// host relocation available, and an over-subscribed unified pool
+/// relocates to system RAM instead of hogging VRAM (b11202, 20260928
+/// campaign: a `4x16384` spawn held only +208 MiB over `2x8192` while
+/// scoring +64% t/s) — those spawns charge the unified VRAM floor.
+/// Engines without the flag (b10948-era) allocate device-side on both
+/// lanes and keep the full f16 charge. The floor deliberately does not
+/// scale with ctx: the engine's pinned device slice is roughly
+/// constant, and charging geometry would re-block the concurrency the
+/// relocation posture exists to buy. Open question (`slots_probe`
+/// receipt owed): opportunistic VRAM growth above the floor under
+/// light load is unmeasured; supervisor admission belts
+/// (`settled_mib` actual-footprint checks) remain the backstop.
 #[must_use]
 pub fn estimate_kv_vram_charge(input: &ProfileInput<'_>, ctx: Option<u32>) -> Option<u64> {
+    if kv_pool_relocatable(input) {
+        return Some(KV_UNIFIED_VRAM_FLOOR_BYTES);
+    }
     estimate_kv_f16(input, ctx)
 }
 
@@ -4921,6 +5081,15 @@ fn auto_slots_capacity(input: &ProfileInput<'_>, base_ctx: u32, vram_bytes: u64)
         let per_slot_bytes = kv_per_slot + u64::from(base_ctx) * UNIFIED_COMPUTE_PER_TOKEN_BYTES;
         let headroom = vram_bytes.saturating_sub(resident);
         clamp_to_cap(headroom / per_slot_bytes)
+    } else if kv_pool_relocatable(input) {
+        // Posture truth (b11202 receipt): with engine KV host-relocation
+        // available, an over-subscribed pool moves to host RAM instead of
+        // OOMing — VRAM keeps weights + the standing floor slice, and the
+        // host budget (ram_slots) is the binding cap. Letting the f16
+        // VRAM term veto here under-provisions 2x on tight cards (gateway
+        // conc measured 67.5 t/s at the VRAM-vetoed shape vs 110.6 at the
+        // host-budget shape, same model, same card).
+        u32::MAX
     } else {
         // Device truth: the KV pool is VRAM-resident on BOTH lanes, so
         // slot capacity pays the same 85% envelope everywhere.
@@ -5044,6 +5213,21 @@ fn resolve_gpu_offload(
 /// gpu-offload resolver so the two can never disagree.
 fn kv_unified_emitted(input: &ProfileInput<'_>) -> bool {
     kv_unified_for(input.config, input.model_name, input.supported_flags)
+}
+
+/// True when the emitted spawn keeps the engine's KV host-relocation
+/// available: the engine ships `--no-kv-offload` (its manifest flag set
+/// owns offload semantics), the config does not disable offload, and the
+/// spawn rides the unified lane. Measured on b11202 (20260928 bench
+/// campaign): an over-subscribed unified KV pool relocates to host RAM
+/// instead of OOM — a `4x16384` direct spawn held only +208 MiB VRAM
+/// over the 2x8192 shape while beating it +64% t/s. Engines that lack
+/// the flag (b10948-era) keep the full device-side VRAM charge — the
+/// b10948 live receipt still binds for them.
+fn kv_pool_relocatable(input: &ProfileInput<'_>) -> bool {
+    input.supported_flags.contains("--no-kv-offload")
+        && !input.config.no_kv_offload
+        && kv_unified_emitted(input)
 }
 
 /// Same decision as [`kv_unified_emitted`], callable outside profile
@@ -5814,6 +5998,7 @@ mod tests {
         replicas: None,
         pin: None,
         chat_template: None,
+        deterministic_isolate: None,
         chat_template_file: None,
         sampler_defaults: None,
         spm_infill: None,
@@ -7166,8 +7351,9 @@ mod tests {
 
     #[test]
     fn unit__unified_kv_pool_fit__shrinks_ctx_to_cache_ram_budget() {
-        // Device truth (live b10948): the KV pool is VRAM-resident on
-        // BOTH lanes, so an autofit ctx whose pool overflows the card
+        // Device truth (live b10948): on engines WITHOUT KV host-offload
+        // (no --no-kv-offload in the manifest) the KV pool is VRAM-resident
+        // on BOTH lanes, so an autofit ctx whose pool overflows the card
         // must shrink against the 85% VRAM envelope — at the quant the
         // spawn will actually run. Geometry head_dim 64 -> 57344
         // B/ctx-token: kv(131072) = 7168 MiB f16; the tight 6000 MiB
@@ -7183,7 +7369,12 @@ mod tests {
             context_length: Some(131_072),
             ..meta()
         };
-        let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        // Legacy-engine fixture: strip the offload flag so the pool is
+        // device-bound and the shrink path fires (b11202-class engines
+        // relocate the overflow instead — see the relocatable-pins test).
+        let mut legacy = full_flags();
+        legacy.remove("--no-kv-offload");
+        let mut inp = input(&g, &hw, &cfg, &legacy);
         inp.model_bytes = 4_800 * MIB;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert!(p.argv.windows(2).any(|w| w == ["--ctx-size", "21760"]));
@@ -7527,6 +7718,47 @@ mod tests {
             .windows(2)
             .any(|w| w[0] == "--cache-type-v" && w[1] == "q8_0"));
         assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+    }
+
+    #[test]
+    fn unit__kv_quant__fa_off_drops_v_side_keeps_k() {
+        // Same ladder-engaging geometry as q8_when_halving_fits, but FA is
+        // pinned off: upstream refuses a quantized V cache without
+        // flash-attn (engine exits during load), so the profile must drop
+        // ONLY the V side to its f16 default and keep the FA-independent
+        // K quant, with a loud warning (receipt: 20260929 flagship fa_off).
+        let cfg = Config {
+            slots: 1,           // purpose-scoped: ladder grades, not slot sizing
+            spec: "off".into(), // purpose-scoped: not the auto spec lane
+            ..Config::default()
+        };
+        let hw = gpu_hw(6_100, 32_000, 8);
+        let g = meta();
+        let t = TuningOverrides {
+            fa: Some(false),
+            ..Default::default()
+        };
+        let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &t).unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--flash-attn" && w[1] == "off"));
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--cache-type-k" && w[1] == "q8_0"));
+        assert!(
+            !p.argv.contains(&"--cache-type-v".to_string()),
+            "{:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("quantized V cache") && w.contains("f16")),
+            "{:?}",
+            p.warnings
+        );
     }
 
     #[test]
@@ -8661,6 +8893,83 @@ mod tests {
     }
 
     #[test]
+    fn unit__auto_slots__relocatable_pool_binds_by_host_budget() {
+        // b11202 posture receipt (20260928 bench): with the engine's KV
+        // host-relocation available (manifest --no-kv-offload, config not
+        // disabling it, unified lane), an over-subscribed pool relocates
+        // to host instead of OOMing — the f16 VRAM term must not veto
+        // slots the host budget proves safe. Box geometry: 8 GiB card,
+        // 5366 MiB weights, kv/slot @8192 = 448 MiB, train 262144.
+        let g = GgufMeta {
+            context_length: Some(262_144),
+            ..meta()
+        };
+        let hw = gpu_hw(8_192, 15_900, 8);
+        let cfg = Config {
+            default_ctx: 8_192,
+            cache_ram_mb: 4_608,
+            ..Config::default()
+        };
+        // cap 8, train 32, ram 4608/448 = 10, vram NON-binding -> np 8
+        // at the full 8x8192 total (old device-side math vetoed at 3).
+        let mut inp = ProfileInput {
+            model_bytes: 5_366 * MIB,
+            ..input(&g, &hw, &cfg, &ALL_FLAGS).clone()
+        };
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p.argv.windows(2).any(|w| w == ["-np", "8"]), "{:?}", p.argv);
+        assert!(
+            p.argv.windows(2).any(|w| w == ["--ctx-size", "65536"]),
+            "{:?}",
+            p.argv
+        );
+        // The over-VRAM pool relocated — ctx must NOT shrink and no
+        // shrink warning may fire.
+        assert!(!p.warnings.iter().any(|w| w.contains("unified KV pool fit")));
+
+        // Config disabling offload restores the device-side veto: vram
+        // headroom (0.85*8192 - 5366)/448 = 3 -> np 3.
+        let cfg_guard = Config {
+            default_ctx: 8_192,
+            cache_ram_mb: 4_608,
+            no_kv_offload: true,
+            ..Config::default()
+        };
+        inp.config = &cfg_guard;
+        let p2 = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p2.argv.windows(2).any(|w| w == ["-np", "3"]),
+            "{:?}",
+            p2.argv
+        );
+        assert!(p2.argv.contains(&"--no-kv-offload".to_string()));
+
+        // Engine without the offload flag (b10948-class): same veto.
+        inp.config = &cfg;
+        let mut legacy = full_flags();
+        legacy.remove("--no-kv-offload");
+        inp.supported_flags = &legacy;
+        let p3 = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p3.argv.windows(2).any(|w| w == ["-np", "3"]),
+            "{:?}",
+            p3.argv
+        );
+
+        // Classic (non-unified) lane: the shared-pool relocation credit
+        // does not apply — full f16 VRAM charge.
+        let mut classic = full_flags();
+        classic.remove("--kv-unified");
+        inp.supported_flags = &classic;
+        let p4 = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p4.argv.windows(2).any(|w| w == ["-np", "3"]),
+            "{:?}",
+            p4.argv
+        );
+    }
+
+    #[test]
     fn unit__deterministic__pins_slots_one_llama_lane() {
         let g = meta();
         let hw = gpu_hw(24_000, 64_000, 8); // auto would pick np 2 (train cap)
@@ -9484,9 +9793,14 @@ mod tests {
 
         // CUDA-class census with the same projector: the classic 85%
         // axis gates it — 5000 weights + 2x448 KV do not fit 5900 MiB
-        // at the share, and no shallower re-spend pays either.
+        // at the share, and no shallower re-spend pays either. Legacy
+        // flag set: b11202-class engines relocate the overflow pool to
+        // host (see relocatable-pins), so the device-bound classic axis
+        // is verified on the engine class it still governs.
         let hw = gpu_hw(5_900, 64_000, 8);
-        let mut inp2 = input(&g, &hw, &cfg, &ALL_FLAGS);
+        let mut legacy = full_flags();
+        legacy.remove("--no-kv-offload");
+        let mut inp2 = input(&g, &hw, &cfg, &legacy);
         inp2.mmproj_path = Some(mmproj.to_str().unwrap());
         let p2 = compile(&inp2, &TuningOverrides::default()).unwrap();
         assert!(p2.argv.windows(2).any(|w| w == ["-np", "1"]));
@@ -9495,7 +9809,7 @@ mod tests {
         // Vulkan-class census WITHOUT a projector: classic axis only —
         // same single-slot truth, no conservative-cap warning.
         let p3 = compile(
-            &input(&g, &vulkan_hw, &cfg, &ALL_FLAGS),
+            &input(&g, &vulkan_hw, &cfg, &legacy),
             &TuningOverrides::default(),
         )
         .unwrap();
@@ -9758,18 +10072,31 @@ mod tests {
 
     #[test]
     fn unit__estimate_kv_vram_charge__floor_vs_full() {
-        // Device truth: the KV pool is VRAM-resident on BOTH lanes
-        // (live-verified b10948 — `CUDA0 KV buffer` with --kv-unified),
-        // so the charge is the full f16 estimate regardless of the
-        // unified flag. Geometry: 57344 B/token x 16384 = 896 MiB.
+        // Posture-aware truth, two receipts. Geometry: 57344 B/token
+        // x 16384 = 896 MiB full-charge. (a) Relocatable posture
+        // (engine ships --no-kv-offload, config leaves offload on,
+        // unified lane): b11202 device truth — the pool spills to host
+        // RAM, so device occupancy is the 512 MiB unified floor
+        // (4x16384 held only +208 MiB over 2x8192 while +64% t/s).
+        // (b) Legacy engine without --no-kv-offload: the b10948
+        // device-side receipt still binds — full f16 charge. (c) No
+        // unified lane at all: full f16 charge either way.
         let hw = gpu_hw(24_000, 64_000, 8);
         let g = meta();
         let cfg = Config::default();
         let unified = input(&g, &hw, &cfg, &ALL_FLAGS);
         assert_eq!(
             estimate_kv_vram_charge(&unified, Some(16_384)).map(|b| b / (1024 * 1024)),
+            Some(512),
+            "relocatable pool charges the unified VRAM floor, not geometry"
+        );
+        let mut legacy_flags = full_flags();
+        legacy_flags.remove("--no-kv-offload");
+        let legacy = input(&g, &hw, &cfg, &legacy_flags);
+        assert_eq!(
+            estimate_kv_vram_charge(&legacy, Some(16_384)).map(|b| b / (1024 * 1024)),
             Some(896),
-            "unified path charges the full device-backed pool"
+            "engine without --no-kv-offload keeps the full device charge (b10948)"
         );
         let mut classic_flags = full_flags();
         classic_flags.remove("--kv-unified");
@@ -9801,6 +10128,48 @@ mod tests {
         let p2 = compile(&comfy, &TuningOverrides::default()).unwrap();
         assert!(!p2.argv.iter().any(|a| a == "--paged-attn"));
         assert!(!p2.warnings.iter().any(|w| w.contains("paged-attn")));
+    }
+
+    #[test]
+    fn unit__mistralrs_batch__multimodal_tight_card_advisory() {
+        // Receipt (20260929 flagship mr_batch_64): mistral.rs sizes its
+        // multimodal device-map activation reservation from max_batch_size
+        // and refuses to load a 9B vision model at batch 64 on an 8 GiB
+        // card. The reservation formula belongs to upstream, so the profile
+        // warns instead of clamping; the refused load stays loud.
+        let g = meta();
+        let mut flags = BTreeSet::new();
+        flags.insert("--max-batch-size".to_string());
+        let cfg = Config {
+            mistralrs: MistralrsTuning {
+                max_batch_size: Some(64),
+                ..full_mistralrs_tuning()
+            },
+            ..Config::default()
+        };
+        let hw = gpu_hw(6_500, 32_000, 8); // weights 5366 MiB > 75% of 6500
+        let mut vl = input(&g, &hw, &cfg, &flags);
+        vl.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        vl.mmproj_path = Some("Cargo.toml");
+        let p = compile(&vl, &TuningOverrides::default()).unwrap();
+        assert!(p.argv.windows(2).any(|w| w == ["--max-batch-size", "64"]));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("device-map activation reservation")),
+            "{:?}",
+            p.warnings
+        );
+
+        // Text-only spawn (no projector): different reservation shape, no
+        // advisory.
+        let mut text = input(&g, &hw, &cfg, &flags);
+        text.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        let p2 = compile(&text, &TuningOverrides::default()).unwrap();
+        assert!(!p2
+            .warnings
+            .iter()
+            .any(|w| w.contains("device-map activation reservation")));
     }
 
     #[test]
@@ -12761,6 +13130,134 @@ mod tests {
         assert!(p
             .argv
             .contains(&"--enable-deterministic-inference".to_string()));
+    }
+
+    #[test]
+    fn unit__sglang__mem_fraction_pin_governed_by_activation_reserve() {
+        // Receipt: 0.90 pinned on an 8 GiB card crashed in CUDA-graph
+        // capture (PyTorch allocator assert → sglang kill_process_tree →
+        // opaque 502). The pin must clamp to the activation-reserve
+        // ceiling with a loud warning, while a big card keeps the pin
+        // and an under-band pin clamps up.
+        let cfg = Config::default();
+        let hf = hf_meta();
+
+        // 8 GiB card: ceiling = (8000 - 2000) / 8000 = 0.750.
+        let hw = gpu_hw(8_000, 15_900, 8);
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                mem_fraction_static: Some(0.90),
+                ..SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 3_300 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.750"));
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.contains("clamped to") && w.contains("graph capture")));
+
+        // 24 GiB card: ceiling 0.917 hits the band max first — a 0.90
+        // pin is legitimate and must pass through untouched.
+        let hw_big = gpu_hw(24_000, 64_000, 8);
+        let mut inp_big = sglang_input(&hf, &hw_big, &cfg, 3_300 * MIB);
+        inp_big.overlay = &overlay;
+        let p_big = compile(&inp_big, &TuningOverrides::default()).unwrap();
+        assert!(p_big
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.900"));
+        assert!(!p_big
+            .warnings
+            .iter()
+            .any(|w| w.contains("mem_fraction_static")));
+
+        // Under-band pin clamps up with the same warning surface.
+        let overlay_low = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                mem_fraction_static: Some(0.10),
+                ..SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp_low = sglang_input(&hf, &hw_big, &cfg, 3_300 * MIB);
+        inp_low.overlay = &overlay_low;
+        let p_low = compile(&inp_low, &TuningOverrides::default()).unwrap();
+        assert!(p_low
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.200"));
+    }
+
+    #[test]
+    fn unit__sglang__hicache_host_viability_gate() {
+        // Receipt: hicache on a 16 GiB-RAM box aborts scheduler init
+        // ("Requesting 4.59 GB but only have -4.22 GB free") because
+        // sglang sizes the tier against MemAvailable - 10 GiB. The
+        // profile refuses before spawn on RAM classes where every tier
+        // size fails; on viable hosts a fitting --hicache-size passes
+        // through and an oversized one is refused with the math.
+        let cfg = Config::default();
+        let hf = hf_meta();
+
+        // 13.5 GiB RAM (the receipt box reports 13.7 GiB usable):
+        // budget = 13500 - 10240 - 4096 < 0 → refuse.
+        let hw_small = gpu_hw(8_000, 13_500, 8);
+        let overlay_on = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                hicache_enable: Some(true),
+                ..SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw_small, &cfg, 3_300 * MIB);
+        inp.overlay = &overlay_on;
+        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+        assert!(err.contains("hicache"), "{err}");
+        assert!(err.contains("reserve"), "{err}");
+
+        // 64 GiB RAM: budget = 49,664 MiB. A 40 GiB tier fits and passes
+        // through; a 60 GiB tier is refused with the sizing math.
+        let hw_big = gpu_hw(24_000, 64_000, 8);
+        let overlay_fit = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                hicache_enable: Some(true),
+                hicache_size: Some(40.0),
+                ..SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp_fit = sglang_input(&hf, &hw_big, &cfg, 3_300 * MIB);
+        inp_fit.overlay = &overlay_fit;
+        let p = compile(&inp_fit, &TuningOverrides::default()).unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--hicache-size" && w[1] == "40"));
+
+        let overlay_huge = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                hicache_enable: Some(true),
+                hicache_size: Some(60.0),
+                ..SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp_huge = sglang_input(&hf, &hw_big, &cfg, 3_300 * MIB);
+        inp_huge.overlay = &overlay_huge;
+        let err = compile(&inp_huge, &TuningOverrides::default()).unwrap_err();
+        assert!(err.contains("cannot fit"), "{err}");
     }
 
     #[test]
