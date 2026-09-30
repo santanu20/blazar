@@ -666,7 +666,7 @@ Group=${SVC_GROUP}
 WorkingDirectory=${SVC_DATA_DIR}
 ${SG_LINE}
 ${MH_LINE}
-# Tag the journal stream so `journalctl -t blazar` keeps matching after
+# Tag the journal stream so 'journalctl -t blazar' keeps matching after
 # a journal rotation strands the original stream fd. The daemon's
 # durable log is run/daemon.log (owned + rotated by the daemon itself);
 # journald is the secondary sink.
@@ -687,7 +687,43 @@ RestartPreventExitStatus=3
 WantedBy=multi-user.target
 EOF
 )
-        printf '%s\n' "$UNIT" | $SUDO tee "$UNIT_PATH" >/dev/null || error "writing $UNIT_PATH failed"
+        # Write to a user-owned temp file, VALIDATE it, then atomically
+        # rename into place. Two corruption classes killed here:
+        # (a) junk fed into a `... | sudo tee` pipe mid-write (a shell
+        #     wrapper interleaving journal text into the stream leaves a
+        #     half-unit that systemd happily loads with hundreds of
+        #     "Missing =" lines), and
+        # (b) a truncated unit picked up by systemd's inotify reload
+        #     during a non-atomic write.
+        # The parse gate is deliberately simple shell — every non-blank,
+        # non-comment line must be a [Section] header or Key=Value —
+        # exactly the shape journal/shell spew violates. Validation
+        # failure aborts WITHOUT touching the existing unit.
+        UNIT_TMP=$(mktemp) || error "mktemp for unit staging failed"
+        printf '%s\n' "$UNIT" > "$UNIT_TMP" || { rm -f "$UNIT_TMP"; error "writing staged unit failed"; }
+        unit_bad=0
+        unit_lineno=0
+        while IFS= read -r unit_line || [ -n "$unit_line" ]; do
+            unit_lineno=$((unit_lineno + 1))
+            case "$unit_line" in
+                ''|'#'*|';'*) continue ;;
+                '['*']') continue ;;
+                [A-Za-z]*=*) continue ;;
+                *)
+                    unit_bad=$((unit_bad + 1))
+                    echo "  unit validation: line $unit_lineno is not Key=Value: $(printf '%s' "$unit_line" | cut -c1-60)" >&2
+                    ;;
+            esac
+        done < "$UNIT_TMP"
+        if [ "$unit_bad" -ne 0 ]; then
+            rm -f "$UNIT_TMP"
+            error "generated unit failed validation ($unit_bad bad line(s)) — existing $UNIT_PATH left untouched"
+        fi
+        STAGED="${UNIT_PATH}.new.$$"
+        $SUDO cp "$UNIT_TMP" "$STAGED" || { rm -f "$UNIT_TMP"; error "staging $STAGED failed"; }
+        $SUDO chmod 0644 "$STAGED" || { rm -f "$UNIT_TMP"; $SUDO rm -f "$STAGED"; error "chmod on staged unit failed"; }
+        $SUDO mv -f "$STAGED" "$UNIT_PATH" || { rm -f "$UNIT_TMP"; $SUDO rm -f "$STAGED"; error "installing $UNIT_PATH failed"; }
+        rm -f "$UNIT_TMP"
         $SUDO "$SYSTEMCTL" daemon-reload || error "systemctl daemon-reload failed"
         # Upgrade-in-place: restart an already-active unit (like ollama).
         # Fresh install: enable WITHOUT --now — starting the unit before
