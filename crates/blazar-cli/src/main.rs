@@ -10398,13 +10398,13 @@ async fn engine_install_sglang(d: &BlazarDirs, version: Option<String>) -> Resul
 }
 
 /// `engine update --kind sglang [version]` — explicit version installs
-/// directly; bare call is a warn-only `PyPI` currency check (the flag
-/// contract is pinned to the version this Blazar build was verified
-/// against, so newer releases opt in per-version, never auto-install).
+/// directly; bare call resolves the `PyPI` latest and installs it, the
+/// same lane semantics as mistralrs/sd.cpp/whisper. `--check` stays a
+/// dry-run currency report. The flag-contract pin
+/// (`SGLANG_DEFAULT_VERSION`) anchors fresh `engine install` and the
+/// pre-install warning; unknown flags on newer sglang are skipped with
+/// profile warnings.
 async fn engine_update_sglang(d: &BlazarDirs, version: Option<String>, check: bool) -> Result<()> {
-    // The no-version path is report-only by design (probe PyPI + print);
-    // --check extends that to the pinned-version case so a dry-run never
-    // reaches the venv install.
     if version.is_some() && !check {
         return engine_install_sglang(d, version).await;
     }
@@ -10438,22 +10438,30 @@ async fn engine_update_sglang(d: &BlazarDirs, version: Option<String>, check: bo
         }
     };
     let pinned = blazar_runtime::engine::sglang_install::SGLANG_DEFAULT_VERSION;
-    if check {
-        println!("dry-run: nothing installed, nothing written");
-    }
+    let flag_contract_note = format!(
+        "note: this Blazar build verifies the sglang flag contract on {pinned} — \
+         newer versions run with unknown flags skipped (profile warnings)"
+    );
     match (
         blazar_runtime::engine::sglang_install::version_tuple(&installed),
         blazar_runtime::engine::sglang_install::version_tuple(&latest),
     ) {
         (Some(a), Some(b)) if b > a => {
-            println!("sglang {installed} installed; {latest} is available on PyPI.");
-            println!(
-                "note: this Blazar build verifies the sglang flag contract on {pinned} — \
-                 newer versions run with unknown flags skipped (profile warnings); opt in with:"
-            );
-            println!("  blazar engine update --kind sglang {latest}");
+            if check {
+                println!("dry-run: sglang {installed} installed; {latest} is available on PyPI.");
+                println!("{flag_contract_note}");
+            } else {
+                println!("sglang {installed} installed; updating to {latest} from PyPI.");
+                println!("{flag_contract_note}");
+                engine_install_sglang(d, Some(latest)).await?;
+            }
         }
-        _ => println!("sglang {installed} is current (PyPI latest: {latest})."),
+        _ => {
+            if check {
+                println!("dry-run: nothing installed, nothing written");
+            }
+            println!("sglang {installed} is current (PyPI latest: {latest}).");
+        }
     }
     Ok(())
 }
