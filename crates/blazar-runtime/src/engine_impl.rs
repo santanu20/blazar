@@ -1068,6 +1068,61 @@ fn sglang_argv(
     argv
 }
 
+/// Locate the venv's bundled pip CUDA libraries (`nvidia/<pkg>/lib`) for
+/// an sglang engine install.
+///
+/// The engine layout contract puts the interpreter at
+/// `<engine-dir>/venv/bin/python` while `server_path` may point at either
+/// the generated `sglang-server` shell wrapper sitting NEXT to the venv
+/// or the interpreter itself — so the venv is found by the layout probe
+/// (nearest ancestor owning `venv/bin/python`), never by loose `bin/` +
+/// `lib/` matching, which happily mis-roots on host dirs like `~/.local`.
+///
+/// Why this matters: sglang helper processes (`--enable-memory-saver`)
+/// exec a python that links `libcudart` directly; without the venv's
+/// nvidia lib dirs on the linker path they die with exit 127 (receipt:
+/// "Rank 0 scheduler died during initialization", 2026-09-29). Returning
+/// the dirs here lets the spawn put them on `LD_LIBRARY_PATH`, which
+/// every descendant inherits.
+///
+/// No-op for non-venv layouts (native engine dirs, out-of-tree bins):
+/// the probe finds no venv and the list comes back empty.
+fn sglang_venv_nvidia_lib_dirs(server_path: &str) -> Vec<std::path::PathBuf> {
+    let path = std::path::Path::new(server_path);
+    let venv_root = path
+        .ancestors()
+        .find(|a| a.join("venv").join("bin").join("python").is_file())
+        .map(|a| a.join("venv"));
+    let Some(venv_root) = venv_root else {
+        return Vec::new();
+    };
+    let mut dirs = Vec::new();
+    let Some(lib) = std::fs::read_dir(venv_root.join("lib")).ok() else {
+        return dirs;
+    };
+    for py in lib.flatten() {
+        // lib/python3.12/site-packages/nvidia/<pkg>/lib
+        let nvidia_dir = py.path().join("site-packages").join("nvidia");
+        let Some(packages) = nvidia_dir.read_dir().ok().map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.path())
+                .collect::<Vec<_>>()
+        }) else {
+            continue;
+        };
+        for pkg in packages {
+            let lib_dir = pkg.join("lib");
+            if lib_dir.is_dir() {
+                dirs.push(lib_dir);
+            }
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
 #[async_trait]
 impl Engine for SglangEngine {
     fn kind(&self) -> blazar_core::engine_kind::EngineKind {
@@ -1094,8 +1149,38 @@ impl Engine for SglangEngine {
                  child_transport = \"tcp\" in the blazar config"
             ));
         }
+        // Provision the venv's pip CUDA libs onto the linker path before
+        // spawning: sglang helper processes link libcudart directly (see
+        // `sglang_venv_nvidia_lib_dirs`) and there is no ambient
+        // LD_LIBRARY_PATH carrying the venv layout. An explicit user
+        // `[engine_env]` LD_LIBRARY_PATH keeps its entries — ours prepend
+        // so the venv that owns the binary wins for its own libs.
+        let mut env: Vec<(String, String)> = self.child_env.clone();
+        let cuda_dirs = sglang_venv_nvidia_lib_dirs(&self.manifest.server_path);
+        if !cuda_dirs.is_empty() {
+            const LD_LIB: &str = "LD_LIBRARY_PATH";
+            let user_val = env
+                .iter()
+                .find(|(k, _)| k == LD_LIB)
+                .map(|(_, v)| v.clone())
+                .or_else(|| std::env::var(LD_LIB).ok())
+                .unwrap_or_default();
+            let ours: Vec<String> = cuda_dirs
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            let mut entries = ours;
+            for part in user_val.split(':') {
+                if !part.is_empty() && !entries.iter().any(|e| e == part) {
+                    entries.push(part.to_string());
+                }
+            }
+            let merged = entries.join(":");
+            env.retain(|(k, _)| k != LD_LIB);
+            env.push((LD_LIB.to_string(), merged));
+        }
         // No --rpc preflight: sglang has no rpc-worker flag surface.
-        spawn_child(&self.manifest.server_path, argv, endpoint, &self.child_env)
+        spawn_child(&self.manifest.server_path, argv, endpoint, &env)
     }
 
     async fn health_check(&self, endpoint: &Endpoint, timeout: std::time::Duration) -> Result<()> {
@@ -1179,6 +1264,55 @@ mod tests {
         assert_eq!(child_cwd("sd-server"), None);
         // "./sd-server" has an empty parent — same inherit rule.
         assert_eq!(child_cwd("./sd-server"), None);
+    }
+
+    #[test]
+    fn unit__sglang_venv_nvidia_lib_dirs__discovers_pip_cuda_layout() {
+        // Receipt: the sglang memory-saver helper execs a python that
+        // links libcudart directly and died with exit 127 ("cannot open
+        // shared object file") until the spawn put the venv's
+        // nvidia/<pkg>/lib dirs on LD_LIBRARY_PATH.
+        let tmp = std::env::temp_dir().join(format!("blazar-venv-test-{}", std::process::id()));
+        // Engine-install layout: the sglang-server shell wrapper sits
+        // NEXT TO the venv. This is the shape the live repro exposed —
+        // probing the wrapper with a loose bin/+lib/ ancestor rule found
+        // nothing and the memory-saver child kept dying at exit 127.
+        let engine_dir = tmp.join("sglang-0.5.19");
+        let wrapper = engine_dir.join("sglang-server");
+        let venv = engine_dir.join("venv");
+        let nvidia = venv
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages")
+            .join("nvidia");
+        let cu13 = nvidia.join("cu13").join("lib");
+        let cudnn = nvidia.join("cudnn").join("lib");
+        let plain = nvidia.join("nccl"); // package without a lib/ child
+        std::fs::create_dir_all(&cu13).unwrap();
+        std::fs::create_dir_all(&cudnn).unwrap();
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(cu13.join("libcudart.so.13"), b"").unwrap();
+        std::fs::create_dir_all(venv.join("bin")).unwrap();
+        std::fs::write(venv.join("bin").join("python"), b"").unwrap();
+        std::fs::create_dir_all(&wrapper).unwrap();
+
+        let dirs = sglang_venv_nvidia_lib_dirs(wrapper.to_str().unwrap());
+        assert_eq!(
+            dirs,
+            vec![cu13.clone(), cudnn.clone()],
+            "lib-bearing nvidia packages are discovered, sorted; lib-less ones skipped"
+        );
+
+        // The interpreter path itself resolves to the same dirs.
+        let python = venv.join("bin").join("python");
+        assert_eq!(
+            sglang_venv_nvidia_lib_dirs(python.to_str().unwrap()),
+            vec![cu13, cudnn]
+        );
+
+        // Non-venv binaries (native engine layout) find nothing.
+        assert!(sglang_venv_nvidia_lib_dirs("/opt/blazar/engines/b1/llama-server").is_empty());
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     fn rpc_argv(value: &str) -> Vec<String> {

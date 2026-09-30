@@ -1325,6 +1325,15 @@ struct UbatchGovState {
     quiet_streak: u32,
 }
 
+/// Slot shape parsed from an engine child's argv (`-np` / `--parallel`).
+/// One parse shared by the adaptive tick, `slot_cap`, and the `ps` rows —
+/// the child's own flag is the source of truth for the live shape.
+fn argv_np(argv: &[String]) -> Option<u32> {
+    argv.windows(2)
+        .find(|w| w[0] == "-np" || w[0] == "--parallel")
+        .and_then(|w| w[1].parse::<u32>().ok())
+}
+
 /// Row for `blazar ps` / `/api/ps`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PsRow {
@@ -1340,6 +1349,20 @@ pub struct PsRow {
     pub idle_secs: u64,
     pub in_flight: i64,
     pub ctx: u32,
+    /// Slot shape of the spawned child, parsed from its own argv
+    /// (`-np`/`--parallel`) — the same source of truth the adaptive
+    /// tick reads. `None` when the argv carries no slot flag (router
+    /// fronts, fabricated rows); observers (`ps`, the bench reshape
+    /// lane) treat it as unknown rather than guessing.
+    pub slots: Option<u32>,
+    /// Admission ceiling the gates actually enforce for this model
+    /// (`slot_cap`: adopted shape > child `-np` > `config.slots` > 4).
+    /// Complements `slots`: mid-reshape they intentionally differ
+    /// (adopted raised, child not yet respawned), and slot-less
+    /// engines (mistral.rs argv has no `-np`) still surface the
+    /// configured ceiling here. `None` for the router front, which no
+    /// per-model gate caps.
+    pub slots_configured: Option<u32>,
     /// Offload label ("full" | "cpu" | "partial" | "auto") — surfaces
     /// silent CPU fallback, ollama's most-common complaint.
     pub gpu: String,
@@ -1451,7 +1474,7 @@ pub struct Supervisor {
     /// Requests mid-`ensure_routed` (entry-incremented, Drop-decremented
     /// guard). The detached bank-restore defers while this is > 0: the
     /// triggering request is otherwise invisible to an in-flight poll
-    /// (`begin_request` fires only after the instance exists).
+    /// (`begin_request` counts prenatally until the instance exists).
     /// One-shot ctx override for the NEXT spawn of a model (per-request
     /// `options.num_ctx` — complaint #13). Consumed on use.
     pending_ctx: DashMap<String, u32>,
@@ -1507,6 +1530,28 @@ pub struct Supervisor {
     /// is the only reachable saturation indicator; live-proven
     /// 2026-09-12 when a 6-stream load left `in_flight` pinned at slots).
     slot_pressure: DashMap<String, u32>,
+    /// When [`Self::note_slot_pressure`] last fired per model, paired
+    /// with the max gauge level latched since the last consumption: the
+    /// demand latch keeps an admission-capped child reading as saturated
+    /// across the gauge's sub-second dips, and the latched max sizes the
+    /// adoption step to the PEAK demand of the streak window instead of
+    /// whatever level the 10s tick happened to sample (see the
+    /// saturation predicate in [`Self::adaptive_slots_tick`]).
+    slot_pressure_seen: DashMap<String, (std::time::Instant, u32)>,
+    /// In-flight requests admitted while the instance did not exist yet
+    /// (the cold-spawn window). `begin_request` counts here when the
+    /// map lookup misses; the spawn registration folds the total onto
+    /// the live instance so ps()/drain logic see one counter from then
+    /// on. Without it the admission gate under-counts exactly during
+    /// spawn — every early request's begin was a silent no-op and the
+    /// next arrivals over-admitted onto the busy child (live-repro'd by
+    /// `e2e__tool_wins_admission_over_earlier_queued_interactive`,
+    /// 2026-09-29). Base-model keyed (replica suffixes canonicalized).
+    prenatal_load: DashMap<String, i64>,
+    /// Deterministic isolation holders (F4): base-model keys whose
+    /// exclusive temp-0+seeded request is mid-flight. Every other
+    /// admission for that model parks until the holder's guard drops.
+    exclusive_holders: DashMap<String, ()>,
     /// Per-device VRAM reservation ledger: census card id → bytes held
     /// by spawns between placement and instance insert (the settle-lag
     /// window). A std Mutex is correct here — taken only for short map
@@ -1660,6 +1705,9 @@ impl Supervisor {
             adopted_slots: DashMap::new(),
             reshape_queue: DashMap::new(),
             slot_pressure: DashMap::new(),
+            slot_pressure_seen: DashMap::new(),
+            exclusive_holders: DashMap::new(),
+            prenatal_load: DashMap::new(),
             device_reservations: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -4034,6 +4082,12 @@ impl Supervisor {
                         pid.to_string(),
                     );
                     self.instances.insert(key.to_string(), inst);
+                    // Registration fold: requests the admission gate
+                    // counted prenatally (this instance did not exist
+                    // when they began) move onto the live counter here,
+                    // so ps()/drain/reshape readers see one source of
+                    // truth from this point on.
+                    self.fold_prenatal_load(key);
                     // The instance now counts as a resident on its card —
                     // convert the reservation into that resident and stop
                     // double-charging the ledger.
@@ -5405,12 +5459,7 @@ drop them from rpc_servers in config.toml",
             // Live shape from the child's own argv (source of truth);
             // fabricated test instances without argv fall back to the
             // config value, preserving the pre-generalization semantics.
-            let resolved = i
-                .argv
-                .windows(2)
-                .find(|w| w[0] == "-np" || w[0] == "--parallel")
-                .and_then(|w| w[1].parse::<u32>().ok())
-                .unwrap_or(self.config.slots);
+            let resolved = argv_np(&i.argv).unwrap_or(self.config.slots);
             let effective = self
                 .adopted_slots
                 .get(&model)
@@ -5433,7 +5482,29 @@ drop them from rpc_servers in config.toml",
                 effective,
                 "adaptive tick probe"
             );
-            let saturated = pressure > 0 || (effective > 0 && in_flight > i64::from(effective));
+            // The gauge oscillates at request granularity: a parked
+            // waiter is released (gauge--), re-checks, is admitted, and
+            // the freed worker's next request parks again (gauge++) —
+            // the level dips below 1 for sub-second windows between
+            // completions, and a 10s tick sampling those dips resets
+            // the streak (live receipt 2026-09-29: sustained 8-stream
+            // load sampled 4,0,4,1,4,0,3,1 — max 2 consecutive
+            // saturated ticks, adoption never fired). With admission
+            // gating, in_flight pins AT the ceiling (never above), so a
+            // capacity-pinned child only reads as saturated while the
+            // demand is attested recently: pressure seen within the
+            // last two tick windows keeps the streak alive across the
+            // dips; a full child with NO recent queue stays quiet. The
+            // paired latched max sizes the adoption step to the window
+            // PEAK (dip samples must not shrink the step).
+            let (demand_recent, latched_max) =
+                self.slot_pressure_seen.get(&model).map_or((false, 0), |e| {
+                    let (seen, max) = *e.value();
+                    (seen.elapsed() < self.reaper_interval.saturating_mul(2), max)
+                });
+            let saturated = pressure > 0
+                || (effective > 0 && in_flight > i64::from(effective))
+                || (effective > 0 && in_flight >= i64::from(effective) && demand_recent);
             if saturated {
                 // Saturation cancels any pending decay count.
                 self.idle_streak.remove(&key);
@@ -5446,13 +5517,16 @@ drop them from rpc_servers in config.toml",
                 };
                 if hit_threshold {
                     let from = effective;
-                    // Demand-sized step: parked-waiter count is the
-                    // demand signal (C=8 on 1 slot parks 7), so one
-                    // adoption can reach the demanded shape instead of
-                    // climbing +1 per 60s streak. Fit-safe: the spawn
+                    // Demand-sized step off the WINDOW PEAK: the latch
+                    // carries the max gauge level seen since the last
+                    // adoption (every park climbs through each level, so
+                    // the peak is always attested), and the live gauge
+                    // covers a stale-latch edge — one adoption reaches
+                    // the demanded shape instead of climbing +1 per 60s
+                    // streak off dip samples. Fit-safe: the spawn
                     // re-spends the same total-ctx budget across slots
                     // and the profile walk caps what the card hosts.
-                    let step = pressure.max(1);
+                    let step = latched_max.max(pressure).max(1);
                     let to = (from + step).min(SLOTS_ADOPT_CAP);
                     self.busy_streak.remove(&key);
                     if to > from {
@@ -5461,6 +5535,9 @@ drop them from rpc_servers in config.toml",
                         // once live streams finish (in-flight = 0), so
                         // the reshape never kills an active stream.
                         self.reshape_queue.insert(model.clone(), key.clone());
+                        // Consume the latch: the next window must attest
+                        // its own peak, not inherit this one's.
+                        self.slot_pressure_seen.remove(&model);
                         tracing::info!(model = %model, from, to, "adaptive slots adopted");
                         self.bus
                             .publish(BlazarEvent::SlotsAutoAdopted { model, from, to });
@@ -5499,6 +5576,9 @@ drop them from rpc_servers in config.toml",
             } else {
                 self.busy_streak.remove(&key);
                 self.idle_streak.remove(&key);
+                // Quiet tick: the demand latch has gone stale — drop it
+                // so the map never outlives the model's last real queue.
+                self.slot_pressure_seen.remove(&model);
             }
         }
     }
@@ -5598,7 +5678,28 @@ drop them from rpc_servers in config.toml",
     /// needs the LEVEL (how many are waiting right now), which only a
     /// gauge carries across ticks.
     pub fn note_slot_pressure(&self, model: &str) {
-        *self.slot_pressure.entry(model.to_string()).or_insert(0) += 1;
+        let level = {
+            let mut e = self.slot_pressure.entry(model.to_string()).or_insert(0);
+            *e.value_mut() += 1;
+            *e.value()
+        };
+        // Latch the WINDOW MAX alongside the timestamp: the gauge
+        // oscillates at request granularity (a parked waiter is released,
+        // admitted, and the freed worker's next request re-parks), so the
+        // 10s tick samples whatever slice it lands in — live receipt
+        // 2026-09-29 sized adoptions +1..+3 off dip samples while the
+        // window peak was 4 and the demanded shape needed one streak.
+        // Every park climbs the gauge through each level, so the peak is
+        // always observed by a note.
+        self.slot_pressure_seen
+            .entry(model.to_string())
+            .and_modify(|(seen, max)| {
+                *seen = std::time::Instant::now();
+                if level > *max {
+                    *max = level;
+                }
+            })
+            .or_insert((std::time::Instant::now(), level));
     }
 
     /// The leaving half of the admission-pressure gauge: the queued
@@ -5634,12 +5735,7 @@ drop them from rpc_servers in config.toml",
             if model_of_key(e.key()) != model {
                 return None;
             }
-            e.value()
-                .argv
-                .windows(2)
-                .find(|w| w[0] == "-np" || w[0] == "--parallel")
-                .and_then(|w| w[1].parse::<u32>().ok())
-                .map(i64::from)
+            argv_np(&e.value().argv).map(i64::from)
         });
         argv_cap
             .or_else(|| {
@@ -5653,31 +5749,152 @@ drop them from rpc_servers in config.toml",
             .unwrap_or(4)
     }
 
+    /// Effective `deterministic_isolate` for a model (per-model override
+    /// wins, else the global knob). The gateway consults this before
+    /// deciding whether a temp-0 + seeded request takes the child
+    /// exclusively.
+    #[must_use]
+    pub fn deterministic_isolate(&self, model: &str) -> bool {
+        self.config
+            .overlay_for(model_of_key(model))
+            .deterministic_isolate
+            .unwrap_or(self.config.deterministic_isolate)
+    }
+
+    /// True while an exclusive deterministic request is mid-flight for
+    /// the model — every other admission parks until the holder's guard
+    /// drops.
+    #[must_use]
+    pub fn exclusive_active(&self, model: &str) -> bool {
+        self.exclusive_holders.contains_key(model_of_key(model))
+    }
+
+    /// Atomically claim deterministic exclusivity: succeeds only when no
+    /// holder exists AND the canonical load (live replicas + prenatal)
+    /// is zero, so the holder truly starts on a quiescent child. The
+    /// entry-vs-load ordering leaves a microscopic window where a
+    /// concurrently-admitting request can slip in between the load read
+    /// and the insert — both are admission-granularity events with no
+    /// await between them; the guarantee is "alone from admission
+    /// onward", which is the reproducibility contract that matters.
+    pub fn try_acquire_exclusive(&self, model: &str) -> bool {
+        let base = model_of_key(model);
+        match self.exclusive_holders.entry(base.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => false,
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                if self.request_load(base) > 0 {
+                    return false;
+                }
+                v.insert(());
+                true
+            }
+        }
+    }
+
+    /// Release the exclusive claim; called from the admission guard's
+    /// `Drop` AFTER `end_request`, so waiters woken by the subsequent
+    /// `signal_free` observe a fully clean model state.
+    pub fn release_exclusive(&self, model: &str) {
+        self.exclusive_holders.remove(model_of_key(model));
+    }
+
     /// Request accounting: gateway brackets proxied calls with these.
     pub fn begin_request(&self, name: &str) {
         if let Some(i) = self.instances.get(name) {
             i.in_flight.fetch_add(1, Ordering::SeqCst);
             *i.last_used.write().expect("idle lock") = Instant::now();
+            return;
         }
+        // Cold-spawn window: the instance is not registered yet, but the
+        // request is real and the admission gate must see it. Count
+        // prenatally; the spawn registration folds this onto the live
+        // counter (see the fold in `spawn_instance_forced`).
+        let base = model_of_key(name).to_string();
+        *self.prenatal_load.entry(base).or_insert(0) += 1;
     }
 
     pub fn end_request(&self, name: &str) {
-        if let Some(i) = self.instances.get(name) {
-            // F1 companion: a request that began on a PREVIOUS generation
-            // of this name can end after a respawn replaced the map entry;
-            // never let the shared counter go negative (a negative value
-            // would read as permanently-busy in ps/admission).
-            let mut cur = i.in_flight.load(Ordering::SeqCst);
-            while cur > 0 {
-                match i
-                    .in_flight
-                    .compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst)
-                {
-                    Ok(_) => break,
-                    Err(now) => cur = now,
+        // Prenatal bracket: a request that began during the spawn window
+        // ends either prenatally (spawn still running, entry still > 0)
+        // or — after the registration fold moved its count onto the
+        // instance — on the instance counter (prenatal reads zero then;
+        // fall through). Base-keyed, matching `begin_request`.
+        let base = model_of_key(name).to_string();
+        if let Some(mut e) = self.prenatal_load.get_mut(&base) {
+            if *e > 0 {
+                *e -= 1;
+                return;
+            }
+        }
+        // Replica lanes: the guard may spell a base name while the load
+        // landed on a `model#N` replica. Decrement a holder that still
+        // has load (exact key first, then any replica) — the SUM is what
+        // admission and drain logic read, so keeping the sum right is
+        // the contract; the exact key remains the no-load fallback so
+        // `last_used` still refreshes on over-end.
+        let victim = self
+            .instances
+            .get(name)
+            .filter(|i| i.in_flight.load(Ordering::SeqCst) > 0)
+            .map(|i| i.clone())
+            .or_else(|| {
+                self.instances.iter().find_map(|e| {
+                    (model_of_key(e.key()) == base
+                        && e.value().in_flight.load(Ordering::SeqCst) > 0)
+                        .then(|| e.value().clone())
+                })
+            })
+            .or_else(|| self.instances.get(name).map(|i| i.clone()));
+        let Some(i) = victim else {
+            return;
+        };
+        // F1 companion: a request that began on a PREVIOUS generation
+        // of this name can end after a respawn replaced the map entry;
+        // never let the shared counter go negative (a negative value
+        // would read as permanently-busy in ps/admission).
+        let mut cur = i.in_flight.load(Ordering::SeqCst);
+        while cur > 0 {
+            match i
+                .in_flight
+                .compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break,
+                Err(now) => cur = now,
+            }
+        }
+        *i.last_used.write().expect("idle lock") = Instant::now();
+    }
+
+    /// True in-flight request load for `model` (base or replica spelling):
+    /// every live replica's counter plus requests admitted during the
+    /// cold-spawn window that no instance has absorbed yet. The
+    /// admission gates read this — a `ps()` row cannot express load for
+    /// a model whose instance does not exist yet.
+    #[must_use]
+    pub fn request_load(&self, model: &str) -> i64 {
+        let base = model_of_key(model);
+        let live: i64 = self
+            .instances
+            .iter()
+            .filter(|e| model_of_key(e.key()) == base)
+            .map(|e| e.value().in_flight.load(Ordering::SeqCst))
+            .sum();
+        let prenatal = self.prenatal_load.get(base).map_or(0, |v| *v);
+        live + prenatal
+    }
+
+    /// Spawn registration: absorb the prenatal load for `key`'s base
+    /// model onto the just-inserted instance, exactly once. After the
+    /// fold, prenatally-begun requests end on the instance counter
+    /// (`end_request` falls through when the prenatal entry is empty).
+    fn fold_prenatal_load(&self, key: &str) {
+        let base = model_of_key(key);
+        if let Some((_, p)) = self.prenatal_load.remove(base) {
+            if p > 0 {
+                if let Some(i) = self.instances.get(key) {
+                    i.in_flight.fetch_add(p, Ordering::SeqCst);
                 }
             }
-            *i.last_used.write().expect("idle lock") = Instant::now();
         }
     }
 
@@ -5705,6 +5922,12 @@ drop them from rpc_servers in config.toml",
                     idle_secs: i.last_used.read().expect("idle lock").elapsed().as_secs(),
                     in_flight: i.in_flight.load(Ordering::SeqCst),
                     ctx: i.profile_ctx,
+                    slots: argv_np(&i.argv),
+                    slots_configured: if i.name == ROUTER_KEY {
+                        None
+                    } else {
+                        Some(u32::try_from(self.slot_cap(&i.name)).unwrap_or(u32::MAX))
+                    },
                     gpu: i.gpu.clone(),
                     device: i.device.clone(),
                     device_id: i.device_id.clone(),
@@ -6832,7 +7055,7 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__ps_row__carries_instance_device() {
         let (sup, _root) = gpu_sup();
-        let (mut inst, _pid) = gpu_instance("dev-model", 1000, 0);
+        let (mut inst, pid) = gpu_instance("dev-model", 1000, 0);
         // Auto-pick records the card; ps() must surface it so `full@card`
         // renders in the CLI GPU column.
         if let Some(i) = Arc::get_mut(&mut inst) {
@@ -6846,6 +7069,105 @@ mod routing_tests {
         // The serving engine tag rides every row — the `engine rm`
         // live-children guard keys off it.
         assert_eq!(rows[0].engine, "test-engine");
+        kill_all(&[pid]);
+    }
+
+    /// F3 observability: the ps row must carry the child's OWN slot shape
+    /// (argv `-np`), not the adopted ceiling — observers watching a
+    /// reshape (bench lane, `blazar ps`) need the shape the child is
+    /// actually serving with. The 20260928-gguf-full reshape verdict was
+    /// void precisely because no shape was observable anywhere.
+    /// `slots_configured` is the complementary truth: the ceiling the
+    /// admission gate enforces (adopted shape wins), so mid-reshape the
+    /// row reads child 2 / configured 8, and slot-less engines
+    /// (mistral.rs argv has no `-np`) still surface a ceiling.
+    #[tokio::test]
+    async fn unit__ps_row__carries_child_slot_shape() {
+        let sup = routing_sup(1);
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 2);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "2".into()];
+        sup.instances.insert("m".into(), inst);
+        // Adoption raises the ceiling, but the child still runs -np 2
+        // until the reshape respawns it — the row must say 2.
+        sup.adopted_slots.insert("m".to_string(), 8);
+        let rows = sup.ps();
+        assert_eq!(rows[0].slots, Some(2));
+        assert_eq!(
+            rows[0].slots_configured,
+            Some(8),
+            "configured = adopted ceiling the gate enforces"
+        );
+        kill_all(&[ph]);
+
+        // Slot-less lane (mistral.rs shape: no -np in argv): child truth
+        // stays None, but the gate still caps at slot_cap's fallback
+        // (no adoption, config.slots 0/auto -> 4).
+        let (inst2, ph2) = fake_instance("m2", InstanceState::Ready, 0);
+        sup.instances.insert("m2".into(), inst2);
+        let slotless = sup
+            .ps()
+            .into_iter()
+            .find(|r| r.name == "m2")
+            .expect("m2 row");
+        assert_eq!(slotless.slots, None);
+        assert_eq!(slotless.slots_configured, Some(4));
+        kill_all(&[ph2]);
+    }
+
+    /// F4 deterministic isolation lifecycle: the claim is granted only
+    /// on a quiescent model (zero canonical load, no holder), blocks a
+    /// second claim while held, and is re-grantable after release. The
+    /// `deterministic_isolate` resolution must honor per-model override
+    /// over the global knob.
+    #[tokio::test]
+    async fn unit__exclusive_isolation__claim_requires_quiescence_and_serializes() {
+        let sup = routing_sup(1);
+        let mut config = blazar_core::config::Config {
+            deterministic_isolate: true,
+            ..blazar_core::config::Config::default()
+        };
+        config.model_overrides.insert(
+            "pinned-off".into(),
+            blazar_core::config::ModelOverride {
+                deterministic_isolate: Some(false),
+                ..Default::default()
+            },
+        );
+        let sup = {
+            let mut s = sup;
+            s.config = config;
+            s
+        };
+        assert!(sup.deterministic_isolate("m"));
+        assert!(
+            !sup.deterministic_isolate("pinned-off"),
+            "per-model override wins over the global knob"
+        );
+
+        // Load on the model blocks the claim (canonical request_load,
+        // prenatal included): in_flight 1 via a live instance.
+        let (inst, ph) = fake_instance("m", InstanceState::Ready, 1);
+        sup.instances.insert("m".into(), inst);
+        assert!(!sup.try_acquire_exclusive("m"));
+        assert!(!sup.exclusive_active("m"));
+        // Drain to quiescence: the claim succeeds, holds, and blocks.
+        let i = sup.instances.get("m").expect("inserted");
+        i.in_flight.fetch_sub(1, Ordering::SeqCst);
+        assert!(sup.try_acquire_exclusive("m"));
+        assert!(sup.exclusive_active("m"));
+        assert!(
+            !sup.try_acquire_exclusive("m#2"),
+            "replica-keyed claim canonicalizes to the same holder"
+        );
+        sup.release_exclusive("m");
+        assert!(!sup.exclusive_active("m"));
+        assert!(
+            sup.try_acquire_exclusive("m#2"),
+            "re-grantable after release"
+        );
+        sup.release_exclusive("m");
+        kill_all(&[ph]);
     }
 
     /// Audit MM5 regression: media-job polls bracket via
@@ -6883,9 +7205,71 @@ mod routing_tests {
         sup.end_request("m");
         assert_eq!(i.in_flight.load(Ordering::SeqCst), 0, "end clamps at zero");
 
-        // Unknown names are a silent no-op (instance already gone).
+        // Unknown names: prenatal bracket, balanced and self-cleaning
+        // (the instance never appears; the entries above expire with
+        // their matching ends).
         sup.begin_request("ghost");
         sup.end_request("ghost");
+    }
+
+    /// Cold-spawn admission window (2026-09-29): requests the gate
+    /// admits BEFORE the instance exists must still count — the gate's
+    /// busy read is `request_load`, so a lost begin here let the next
+    /// arrivals over-admit onto the busy child. The registration fold
+    /// then moves the prenatal total onto the live counter exactly
+    /// once, and post-fold ends decrement the instance.
+    #[tokio::test]
+    async fn unit__request_load__prenatal_counts_survive_cold_spawn_window() {
+        let (sup, _root) = gpu_sup();
+        // Gate admits two requests while the spawn is still running:
+        // no instance yet, both land prenatally (replica spelling
+        // canonicalizes to the base model).
+        sup.begin_request("m");
+        sup.begin_request("m#1");
+        assert_eq!(sup.request_load("m"), 2, "prenatal load is gate-visible");
+        assert_eq!(
+            sup.request_load("m#1"),
+            2,
+            "replica spelling reads the same load"
+        );
+
+        // Registration: the fold moves the prenatal total onto the live
+        // instance; request_load is unchanged (no double count, no loss).
+        let (inst, pid) = gpu_instance("m", 1000, 0);
+        sup.instances.insert("m".to_string(), inst);
+        sup.fold_prenatal_load("m");
+        assert!(
+            sup.prenatal_load.get("m").is_none(),
+            "fold consumed the entry"
+        );
+        assert_eq!(sup.request_load("m"), 2, "fold is lossless");
+        assert_eq!(
+            sup.instances
+                .get("m")
+                .map_or(0, |i| i.in_flight.load(Ordering::SeqCst)),
+            2,
+            "ps()/drain readers see the folded counter"
+        );
+
+        // A prenatally-begun request ends AFTER the fold: prenatal is
+        // empty, so the end lands on the instance counter.
+        sup.end_request("m");
+        assert_eq!(
+            sup.request_load("m"),
+            1,
+            "post-fold end decrements instance"
+        );
+
+        // A request ending while the spawn is STILL running (client
+        // aborted mid-spawn): pure prenatal decrement, instance clean.
+        sup.begin_request("cold");
+        sup.end_request("cold");
+        assert_eq!(
+            sup.request_load("cold"),
+            0,
+            "aborted spawn request uncounted"
+        );
+        kill_all(&[pid]);
     }
 
     #[tokio::test]
@@ -8393,6 +8777,125 @@ mod routing_tests {
             sup.reshape_queue.get("m").map(|v| v.value().clone()),
             Some("m".to_string())
         );
+        kill_all(&[ph]);
+    }
+
+    /// Live receipt 2026-09-29 (reshape campaign + controlled repro):
+    /// under sustained gated 8-stream load the pressure gauge oscillates
+    /// at request granularity — sampled across 10s ticks it read
+    /// 4,0,4,1,4,0,3,1 — and every dipped tick reset the streak, so a
+    /// child pinned at `in_flight` == `slots` NEVER reached 6 consecutive
+    /// saturated ticks. The demand latch keeps a capacity-pinned child
+    /// saturated while pressure was noted within two tick windows, and
+    /// the latched max sizes the adoption step to the window PEAK — a
+    /// dip caught at the adoption tick must not shrink the step.
+    #[tokio::test]
+    async fn unit__adaptive_slots__gauge_dip_does_not_reset_streak() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        sup.config.slots = 0;
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 4);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "4".into()];
+        sup.instances.insert("m".into(), inst);
+        // Even ticks: four waiters park (each park climbs the gauge, so
+        // the latch records the peak 4). Odd ticks: completions drain
+        // the gauge for a sub-second window before the freed workers'
+        // next requests re-park — the 10s sampler catches the dip.
+        for i in 0..(SLOTS_STREAK_TICKS - 1) as usize {
+            if i % 2 == 0 {
+                for _ in 0..4 {
+                    sup.note_slot_pressure("m");
+                }
+            } else {
+                for _ in 0..4 {
+                    sup.note_slot_pressure_release("m");
+                }
+            }
+            sup.adaptive_slots_tick();
+        }
+        // Adoption tick catches a dip: only 3 waiters are parked at the
+        // sample; the window peak was 4.
+        for _ in 0..4 {
+            sup.note_slot_pressure_release("m");
+        }
+        for _ in 0..3 {
+            sup.note_slot_pressure("m");
+        }
+        sup.adaptive_slots_tick();
+        assert_eq!(
+            sup.adopted_slots.get("m").map(|v| *v),
+            Some(8),
+            "streak must survive gauge dips; step sizes off the window PEAK (4 + 4, cap 8)"
+        );
+        kill_all(&[ph]);
+    }
+
+    /// The latch is CONSUMED at adoption: the window after an adoption
+    /// must attest its own peak. A fresh 1-waiter episode steps +1 off
+    /// the new gauge — inheriting the prior window's max would
+    /// overshoot demand on every staggered streak.
+    #[tokio::test]
+    async fn unit__adaptive_slots__latch_consumed_on_adoption() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        sup.config.slots = 0;
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 2);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "2".into()];
+        sup.instances.insert("m".to_string(), inst);
+        // First window: three waiters park -> adoption 2 + 3 = 5, the
+        // latch (max 3) is consumed with it.
+        for _ in 0..3 {
+            sup.note_slot_pressure("m");
+        }
+        for _ in 0..SLOTS_STREAK_TICKS {
+            sup.adaptive_slots_tick();
+        }
+        assert_eq!(sup.adopted_slots.get("m").map(|v| *v), Some(5));
+        // The reshape respawn landed: the parked waiters were admitted
+        // onto the new child (gauge drains), drain done, fresh np-5
+        // instance in place.
+        sup.reshape_queue.remove("m");
+        for _ in 0..3 {
+            sup.note_slot_pressure_release("m");
+        }
+        sup.adopted_slots.insert("m".to_string(), 5);
+        let (mut inst5, ph5) = fake_instance("m", InstanceState::Ready, 5);
+        Arc::get_mut(&mut inst5).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "5".into()];
+        sup.instances.insert("m".to_string(), inst5);
+        // Second window: ONE waiter parks. A stale latch (3) would
+        // adopt 5 + 3 = 8; the consumed latch sizes 5 + 1 = 6.
+        sup.note_slot_pressure("m");
+        for _ in 0..SLOTS_STREAK_TICKS {
+            sup.adaptive_slots_tick();
+        }
+        assert_eq!(
+            sup.adopted_slots.get("m").map(|v| *v),
+            Some(6),
+            "post-adoption window must attest its own peak, not inherit the consumed max"
+        );
+        kill_all(&[ph, ph5]);
+    }
+
+    /// The latch's boundary: a child at full occupancy with NO queued
+    /// demand is healthy concurrency, not saturation — it must never
+    /// adopt (the demand attestation is what separates the two).
+    #[tokio::test]
+    async fn unit__adaptive_slots__full_but_unqueued_stays_quiet() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        sup.config.slots = 0;
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 4);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "4".into()];
+        sup.instances.insert("m".into(), inst);
+        for _ in 0..(SLOTS_STREAK_TICKS * 3) {
+            sup.adaptive_slots_tick();
+        }
+        assert!(sup.adopted_slots.get("m").is_none());
+        assert!(sup.reshape_queue.is_empty());
         kill_all(&[ph]);
     }
 
