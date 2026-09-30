@@ -1257,6 +1257,12 @@ pub struct SglangTuning {
     pub hicache_ratio: Option<f64>,
     /// `--hicache-size` (host KV cache size in GB).
     pub hicache_size: Option<f64>,
+    /// `--is-embedding`: run this `CausalLM` as an embedding model
+    /// (decoder pooling, normalized). sglang treats this as a dedicated
+    /// posture — that child serves `/v1/embeddings` and refuses
+    /// generation — so it belongs on an embedding-specific model entry,
+    /// not the main chat lane.
+    pub is_embedding: Option<bool>,
     /// `--enable-metrics` (Prometheus /metrics).
     pub metrics: Option<bool>,
     /// `--skip-server-warmup` (faster cold start; first request pays it).

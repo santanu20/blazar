@@ -9521,7 +9521,7 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
                     "chunked_prefill_size = 8192    max_prefill_tokens = 16384    stream_interval = 1",
                     "random_seed = 0    cuda_graph_max_bs = 8    cuda_graph_bs = [1, 2, 4]",
                     "cuda_graph_backend_prefill = \"breakable\"    # full|breakable|tc_piecewise|disabled — disabled unsticks laptop prefill capture",
-                    "max_total_tokens = 4096    hicache_enable = false    hicache_ratio = 2.0    hicache_size = 0",
+                    "max_total_tokens = 4096    hicache_enable = false    hicache_ratio = 2.0    hicache_size = 0    is_embedding = false",
                     "metrics = false    skip_warmup = false    torch_compile = false",
                     "tokenizer_mode = \"auto\"    tokenizer_backend = \"huggingface\"",
                     "tokenizer_worker_num = 1    detokenizer_worker_num = 1",

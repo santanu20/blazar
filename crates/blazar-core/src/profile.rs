@@ -3920,6 +3920,22 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
     }
 
     // --- HiCache (KV tiering to host RAM), opt-in.
+    if tun.is_embedding == Some(true) {
+        // Dedicated embedding posture: upstream runs the CausalLM as an
+        // embedder — decoder pooling, normalized vectors, `/v1/embeddings`
+        // served while generation is refused on this child (without the
+        // flag the mirror image holds: embeddings raise "Please add
+        // `--is-embedding`"). That exclusivity is why this knob belongs
+        // on an embedding-specific model entry, never the main chat lane.
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "sglang.is_embedding",
+            "--is-embedding",
+            "",
+            &mut warnings,
+        );
+    }
     if tun.hicache_enable == Some(true) {
         // Structural viability BEFORE any flag leaves the profile:
         // sglang 0.5.19 sizes its host tier against
@@ -12614,6 +12630,7 @@ mod tests {
             "--enable-hierarchical-cache",
             "--hicache-ratio",
             "--hicache-size",
+            "--is-embedding",
         ]
         .iter()
         .map(|f| (*f).to_string())
@@ -13347,6 +13364,46 @@ mod tests {
         inp_huge.overlay = &overlay_huge;
         let err = compile(&inp_huge, &TuningOverrides::default()).unwrap_err();
         assert!(err.contains("cannot fit"), "{err}");
+    }
+
+    #[test]
+    fn unit__sglang__is_embedding_dedicated_spawn_knob() {
+        // Dedicated embedding posture (upstream `--is-embedding`: the
+        // CausalLM pools decoder states and serves `/v1/embeddings`,
+        // refusing generation on that child). Emits when the engine
+        // carries the flag; a legacy engine without it warns and skips —
+        // the knob never breaks the spawn.
+        let cfg = Config::default();
+        let hf = hf_meta();
+        let hw = gpu_hw(8_000, 15_900, 8);
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                is_embedding: Some(true),
+                ..SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+
+        let mut inp = sglang_input(&hf, &hw, &cfg, 3_300 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p.argv.contains(&"--is-embedding".to_string()));
+
+        // Legacy flag surface: warn-skip, argv clean.
+        let legacy_flags: std::collections::BTreeSet<String> = SGLANG_FLAGS
+            .iter()
+            .filter(|f| f.as_str() != "--is-embedding")
+            .cloned()
+            .collect();
+        inp.supported_flags = &legacy_flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.contains(&"--is-embedding".to_string()));
+        assert!(
+            p.warnings.iter().any(|w| w.contains("sglang.is_embedding")),
+            "{:?}",
+            p.warnings
+        );
     }
 
     #[test]

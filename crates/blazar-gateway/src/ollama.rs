@@ -2414,6 +2414,20 @@ pub async fn embeddings(
             if !resp.status().is_success() {
                 let status = resp.status().as_u16();
                 let text = resp.text().await.unwrap_or_default();
+                // sglang refuses embeddings on generative spawns with a
+                // server-side hint; the client also needs the blazar
+                // knob that produces a dedicated embedding spawn.
+                let text = if text.contains("is-embedding") {
+                    format!(
+                        "{text} — blazar: the sglang lane serves embeddings via a \
+                         dedicated spawn; set model_overrides.<model>.sglang.is_embedding \
+                         = true on an embedding-specific entry (that child no longer \
+                         generates). The llamacpp lane co-serves chat and embeddings \
+                         on one child."
+                    )
+                } else {
+                    text
+                };
                 return api_error(status, &text);
             }
             let openai: Value = match resp.json().await {
@@ -2560,6 +2574,18 @@ pub async fn embed(
             if !resp.status().is_success() {
                 let status = resp.status().as_u16();
                 let text = resp.text().await.unwrap_or_default();
+                // Same sglang embedding-posture teaching as /api/embeddings.
+                let text = if text.contains("is-embedding") {
+                    format!(
+                        "{text} — blazar: the sglang lane serves embeddings via a \
+                         dedicated spawn; set model_overrides.<model>.sglang.is_embedding \
+                         = true on an embedding-specific entry (that child no longer \
+                         generates). The llamacpp lane co-serves chat and embeddings \
+                         on one child."
+                    )
+                } else {
+                    text
+                };
                 return api_error(status, &text);
             }
             let openai: Value = match resp.json().await {
