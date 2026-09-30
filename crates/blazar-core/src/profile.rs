@@ -3612,8 +3612,23 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
     // --- speculative pair: sglang rows resolve `spec = "eagle3"`-class
     // drafts as safetensors dirs; the manifest carries no spec_types for
     // sglang (no --spec-type flag upstream), so the pair gates on flags.
+    // A GGUF file is never a valid EAGLE draft here: sglang's loader
+    // treats unknown-path drafts as HF repo ids and dies in
+    // download_weights_from_hf — the shared spec catalog pairs a text
+    // model with a small GGUF (fine for llama.cpp's EAGLE lane), so the
+    // format gate must live at the engine boundary (2026-09-30 receipt:
+    // qwen3-1.7b + pulled Qwen3-0.6B-f16.gguf -> EAGLE3 draft -> 502).
     if let Some(draft) = input.draft_path {
-        if input.supported_flags.contains("--speculative-algorithm")
+        if draft
+            .rsplit_once('.')
+            .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("gguf"))
+        {
+            warnings.push(format!(
+                "spec draft {draft} is a GGUF file; sglang EAGLE drafts must be \
+                 HF safetensors dirs — spawning dense (pull the draft as a \
+                 safetensors row to enable the pair)"
+            ));
+        } else if input.supported_flags.contains("--speculative-algorithm")
             && input
                 .supported_flags
                 .contains("--speculative-draft-model-path")
@@ -3978,10 +3993,12 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
             &mut warnings,
         );
         // Static portability rationale, not a per-instance health fact:
-        // journal only (once per spawn), never the per-session REPL
-        // [profile] surface — there the line is noise the user cannot act
-        // on whenever the local toolchain cannot host flashinfer anyway.
-        tracing::info!(
+        // debug-level everywhere (visible when diagnosing with
+        // RUST_LOG=debug) — at info it fired three times before the
+        // `doctor` table during the config-parse compile pass, and per
+        // spawn in the journal, without anything to act on whenever the
+        // local toolchain cannot host flashinfer anyway.
+        tracing::debug!(
             model = input.model_name,
             "sglang: attention defaults to triton for portability (flashinfer JIT requires a \
              matching nvcc; the sglang venv bundles one on the child PATH); override with \
@@ -13002,7 +13019,10 @@ mod tests {
         let hw = gpu_hw(12_000, 32_000, 8);
         let hf = hf_meta();
         let overlay = sglang_ctx_overlay();
-        let draft = draft_file("sglang-eagle3");
+        // EAGLE drafts for sglang are HF safetensors DIRS (the `.d`
+        // store-row shape), never GGUF files — the GGUF shape is the
+        // rejected lane covered by the pin below.
+        let draft = format!("/tmp/blazar-draft-sglang-eagle3-{}.d", std::process::id());
         let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
         inp.overlay = &overlay;
         inp.draft_path = Some(&draft);
@@ -13015,6 +13035,30 @@ mod tests {
             .argv
             .windows(2)
             .any(|w| w[0] == "--speculative-draft-model-path" && w[1] == draft));
+    }
+
+    #[test]
+    fn unit__sglang__gguf_draft_refused_dense_spawn() {
+        // 2026-09-30 receipt: spec-auto paired qwen3-1.7b with the
+        // freshly pulled Qwen3-0.6B-f16.gguf; sglang's loader treats the
+        // unknown-path draft as an HF repo id and the spawn dies in
+        // download_weights_from_hf -> 502. A GGUF draft must be dropped
+        // with a teaching warning instead.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let overlay = sglang_ctx_overlay();
+        let draft = draft_file("sglang-gguf-reject");
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        inp.draft_path = Some(&draft);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.iter().any(|a| a == "--speculative-algorithm"));
+        assert!(!p.argv.iter().any(|a| a == "--speculative-draft-model-path"));
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.contains("GGUF file") && w.contains("safetensors dirs")));
     }
 
     #[test]

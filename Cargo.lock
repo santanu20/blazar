@@ -307,6 +307,7 @@ dependencies = [
  "blazar-runtime",
  "clap",
  "clap_complete",
+ "console",
  "dirs",
  "flate2",
  "futures",

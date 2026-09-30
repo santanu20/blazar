@@ -4,7 +4,7 @@
 //! outbound traffic is user-initiated engine/model downloads. Powered by
 //! upstream llama.cpp, mistral.rs and `SGLang` — unmodified.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -2302,12 +2302,7 @@ async fn doctor(flat: bool, json: bool) -> Result<()> {
             "ST"
         );
         for c in &checks {
-            println!(
-                "{:<26} {} {}",
-                c.name,
-                colored_status(format!("{:<5}", c.status_word())),
-                c.detail
-            );
+            print_check_row(26, 2, c.name, c.status_word(), &c.detail);
         }
     } else {
         for group in GROUPS {
@@ -2320,12 +2315,7 @@ async fn doctor(flat: bool, json: bool) -> Result<()> {
             }
             println!("{}", bold_heading(group));
             for c in &rows {
-                println!(
-                    "  {:<24} {} {}",
-                    c.name,
-                    colored_status(format!("{:<5}", c.status_word())),
-                    c.detail
-                );
+                print_check_row(24, 2, c.name, c.status_word(), &c.detail);
             }
             let ok_n = rows.iter().filter(|c| c.ok && !c.warn).count();
             let warn_n = rows.iter().filter(|c| c.warn).count();
@@ -2347,6 +2337,79 @@ async fn doctor(flat: bool, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Terminal width for table wrapping: the live window size when stdout
+/// is a tty, the COLUMNS env var when a caller pins it, else 100 for
+/// pipes and non-tty sinks (the historical hard-coded behavior).
+/// `console` (already compiled in via indicatif) reports the size on
+/// Windows too, without raw ioctl calls this crate forbids.
+fn terminal_width() -> usize {
+    if let Some((_rows, cols)) = console::Term::stdout().size_checked() {
+        if cols >= 40 {
+            return cols as usize;
+        }
+    }
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|w| *w >= 40)
+        .unwrap_or(100)
+}
+
+/// One doctor row with width-aware wrapping: the detail column owns
+/// the space right of the status token, and continuation lines stay
+/// in that column instead of hard-wrapping to column 0 where they
+/// collide with the check names. Unbreakable tokens (long paths) are
+/// hard-broken at the usable width so no line ever overflows.
+fn print_check_row(name_col: usize, indent: usize, name: &str, status: &str, detail: &str) {
+    let pad = " ".repeat(indent);
+    let detail_col = indent + name_col + 1 + 5 + 1;
+    let usable = terminal_width().saturating_sub(detail_col).max(16);
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for token in detail.split_whitespace() {
+        // Hard-break tokens wider than the column (paths without
+        // spaces) so a single long token cannot force an overflow.
+        let mut tok = token;
+        while tok.chars().count() > usable {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            let mut chars = tok.chars();
+            let taken: String = chars.by_ref().take(usable).collect();
+            lines.push(taken);
+            tok = chars.as_str();
+        }
+        if tok.is_empty() {
+            continue;
+        }
+        if current.is_empty() {
+            current.push_str(tok);
+        } else if current.chars().count() + 1 + tok.chars().count() <= usable {
+            current.push(' ');
+            current.push_str(tok);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(tok);
+        }
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+
+    let head = format!(
+        "{pad}{:<name_col$} {} ",
+        name,
+        colored_status(format!("{status:<5}")),
+        name_col = name_col
+    );
+    println!("{}{}", head, lines[0]);
+    let cont = " ".repeat(detail_col);
+    for line in &lines[1..] {
+        println!("{cont}{line}");
+    }
 }
 
 /// Final doctor line: failing checks announce themselves, warnings get
@@ -2931,6 +2994,87 @@ fn doctor_chunking(cfg: &blazar_core::Config) -> Vec<Check> {
     )]
 }
 
+/// Pure unit-file parser for the doctor tripwire: every non-blank,
+/// non-comment line must be a `Key=Value` assignment or a `[Section]`
+/// header. Anything else (journal text, shell output pasted into the
+/// unit) is returned with its 1-based line number.
+/// Unit-file integrity: a corrupted blazar.service (journal text pasted
+/// into the unit, heredoc/eval accidents) still STARTS — systemd ignores
+/// the junk lines — while silently mis-parsing directives and spamming
+/// "Missing =" into the journal. Doctor catches that class before it
+/// becomes a mystery restart loop.
+fn unit_file_guard() -> Vec<Check> {
+    let fragment = std::process::Command::new("systemctl")
+        .args(["show", "blazar", "--property=FragmentPath"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .find_map(|l| l.strip_prefix("FragmentPath="))
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "/etc/systemd/system/blazar.service".to_string());
+    match std::fs::read_to_string(&fragment) {
+        Ok(unit) => {
+            let issues = unit_file_issues(&unit);
+            if issues.is_empty() {
+                vec![Check::ok(
+                    "systemd unit",
+                    format!("{} parses clean ({} lines)", fragment, unit.lines().count()),
+                )]
+            } else {
+                let head: Vec<String> = issues.iter().take(3).cloned().collect();
+                vec![Check::warn(
+                    "systemd unit",
+                    format!(
+                        "{} has {} unparsable line(s) — journal text or shell output pasted \
+                         into the unit; systemd is ignoring them. First: {} — restore with \
+                         `sudo scripts/install.sh` (unit generation) after backing the file up",
+                        fragment,
+                        issues.len(),
+                        head.join("; ")
+                    ),
+                )]
+            }
+        }
+        Err(_) => vec![Check::warn(
+            "systemd unit",
+            format!("{fragment} not readable — daemon may be user-launched"),
+        )],
+    }
+}
+
+fn unit_file_issues(text: &str) -> Vec<String> {
+    let mut issues = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let is_section = line.starts_with('[') && line.ends_with(']');
+        let is_assignment = !line.starts_with('[')
+            && line.split_once('=').is_some_and(|(k, _)| {
+                let k = k.trim();
+                !k.is_empty()
+                    && k.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+                    && k.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            });
+        if !is_section && !is_assignment {
+            issues.push(format!(
+                "line {}: {}",
+                i + 1,
+                line.chars().take(60).collect::<String>()
+            ));
+        }
+    }
+    issues
+}
+
 /// RUNTIME section: daemon uptime/restarts, tempdir hygiene, bench
 /// baseline.
 fn doctor_runtime(d: &BlazarDirs) -> Vec<Check> {
@@ -2973,6 +3117,7 @@ fn doctor_runtime(d: &BlazarDirs) -> Vec<Check> {
             ));
         }
     }
+    out.extend(unit_file_guard());
     // Tempdir hygiene: fixture/probe dirs blazar creates under /tmp;
     // test runs used to leak them by the hundred.
     let stale = ["blazar-census-*", "blazar-engine-test-*", "blazar-res-*"]
@@ -3016,7 +3161,9 @@ fn doctor_runtime(d: &BlazarDirs) -> Vec<Check> {
             )),
             _ => out.push(Check::warn(
                 "bench baseline",
-                "no bench history — `blazar bench <model>` sets the engine-gate baseline"
+                "no bench history — `blazar tune <model> --search` records the \
+                 argmax baseline the engine-gate anchors on (plain `blazar bench` \
+                 measures without recording)"
                     .to_string(),
             )),
         }
@@ -8791,9 +8938,30 @@ async fn tune_full(
     let row = store
         .get_model(model)?
         .ok_or_else(|| no_such_model(model))?;
+    // The bench lane drives llama-bench, so the engine row must be a
+    // llamacpp lane — the ACTIVE row may be any kind (a store flipped
+    // by an sglang session would otherwise compile llamacpp argv
+    // against a sglang manifest and die on the first flag). Prefer the
+    // active engine when it IS llamacpp; otherwise the first installed
+    // llamacpp lane, loudly.
     let engine_row = store
         .active_engine()?
-        .ok_or_else(|| anyhow!("no engine installed; run: blazar engine update"))?;
+        .filter(|e| e.kind == blazar_core::engine_kind::EngineKind::LlamaCpp)
+        .or_else(|| {
+            let picked = store
+                .list_engines()
+                .ok()?
+                .into_iter()
+                .find(|e| e.kind == blazar_core::engine_kind::EngineKind::LlamaCpp)?;
+            println!(
+                "note: active engine is not the llama-bench lane; benching on {tag}",
+                tag = picked.tag
+            );
+            Some(picked)
+        })
+        .ok_or_else(|| {
+            anyhow!("no llamacpp engine installed; `blazar bench` drives llama-bench — run: blazar engine update")
+        })?;
     let mut manifest: blazar_runtime::Manifest = serde_json::from_str(&engine_row.manifest)?;
     manifest.anchor_server_path(&d.data_dir);
     let bench_bin = blazar_runtime::bench::find_bench_bin(&d)?;
@@ -8856,19 +9024,36 @@ async fn tune_full(
         let (profile, mut winning, rows) = tuner.tune_search(&store2, &input)?;
         // F6: record the winner so `engine update` can gate future
         // activations against a measured baseline (regression guard).
-        if let Some(w) = rows
+        // Fail loud on both silent-loss paths: a swallowed insert error
+        // and a missing tg128 row both leave the engine gate anchorless
+        // with no hint why.
+        let tg_row = rows
             .iter()
-            .filter(|r| r.test == "tg128")
-            .max_by(|a, b| a.ts.total_cmp(&b.ts))
-        {
-            let _ = store2.record_bench(
+            .filter(|r| r.test_name() == "tg128")
+            .max_by(|a, b| a.ts.total_cmp(&b.ts));
+        if let Some(w) = tg_row {
+            if let Err(e) = store2.record_bench(
                 &engine_row.tag,
                 model,
                 w.ts,
                 rows.iter()
-                    .find(|r| r.test == "pp512" && r.n_threads == w.n_threads)
+                    .find(|r| r.test_name() == "pp512" && r.n_threads == w.n_threads)
                     .map_or(0.0, |r| r.ts),
                 i64::from(profile.ctx),
+            ) {
+                eprintln!("warning: bench history not recorded (engine gate left anchorless): {e}");
+            }
+        } else {
+            eprintln!(
+                "warning: no tg128 row among {} measured rows — bench history not \
+                 recorded (engine gate left anchorless); tests seen: {}",
+                rows.len(),
+                rows.iter()
+                    .map(blazar_runtime::bench::BenchRow::test_name)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
         if let Some(n) = ctx {
@@ -9693,7 +9878,7 @@ fn quick_tg(d: &BlazarDirs, _row: &blazar_core::EngineRow, model_path: &str) -> 
     let rows = tuner.bench_default(std::path::Path::new(model_path))?;
     let tg = rows
         .iter()
-        .filter(|r| r.test == "tg128")
+        .filter(|r| r.test_name() == "tg128")
         .map(|r| r.ts)
         .fold(0.0_f64, f64::max);
     if tg > 0.0 {
@@ -9738,7 +9923,9 @@ fn engine_regression_gate(
                 row_tag = row.tag,
             );
         }
-        let _ = store.record_bench(&row.tag, &model, new_tg, 0.0, 0);
+        if let Err(e) = store.record_bench(&row.tag, &model, new_tg, 0.0, 0) {
+            eprintln!("warning: engine-gate bench row not recorded: {e}");
+        }
     }
     Ok(())
 }
@@ -11507,12 +11694,62 @@ fn local_engine_manager(d: &BlazarDirs) -> Result<EngineManager> {
     })
 }
 
+/// `blazar lora add` admission: refuse garbage rows at the door instead
+/// of at spawn time. A stored-but-missing adapter crashes the child's
+/// boot; a lane-mismatched one (GGUF file on the sglang engine, PEFT dir
+/// on llamacpp) is refused engine-side with a cryptic loader error. The
+/// lane split mirrors how the supervisor routes: a model row whose path
+/// is a directory serves on sglang (HF safetensors lane), a single
+/// checkpoint file serves on llamacpp/mistralrs (GGUF lane). File
+/// EXTENSION on the file lane is not policed — that is the store's
+/// historical contract, the engine remains the authority there.
+fn validate_lora_attach(
+    model: &str,
+    row: Option<&blazar_core::store::ModelRow>,
+    path: &Path,
+) -> Result<()> {
+    let Some(row) = row else {
+        bail!(
+            "no such model: {model} — attach adapters to a pulled model \
+             (`blazar list`, `blazar pull`)"
+        );
+    };
+    if !path.exists() {
+        bail!(
+            "adapter path not found: {} — LoRA rows must point at a real \
+             adapter (GGUF file or PEFT dir) so the engine can load it",
+            path.display()
+        );
+    }
+    if Path::new(&row.path).is_dir() {
+        // sglang lane: runtime LoRA wants a PEFT adapter dir.
+        if !path.is_dir() || !path.join("adapter_config.json").exists() {
+            bail!(
+                "model {model} serves from a safetensors dir (sglang engine): \
+                 attach a PEFT LoRA dir (one containing adapter_config.json) — \
+                 .gguf/.bin adapter files serve on the llamacpp engine"
+            );
+        }
+    } else if path.is_dir() {
+        // llamacpp/mistralrs lanes: single-file adapters only.
+        bail!(
+            "model {model} serves from a single checkpoint file \
+             (llamacpp/mistralrs engine): attach a .gguf/.bin adapter file, \
+             not a directory — PEFT adapter dirs serve on the sglang engine \
+             (`blazar engine install --kind sglang`)"
+        );
+    }
+    Ok(())
+}
+
 fn lora_cmd(cmd: LoraCmd) -> Result<()> {
     let d = dirs();
     let store = Store::open(&d)?;
     match cmd {
         LoraCmd::Add { model, path, scale } => {
             let model = resolve_model_cli(&model);
+            let row = store.get_model(&model)?;
+            validate_lora_attach(&model, row.as_ref(), &path)?;
             let id = store.add_lora(&model, &path.display().to_string(), scale)?;
             println!("lora #{id} attached to {model} (scale {scale})");
         }
@@ -12377,6 +12614,96 @@ mod tests {
         let (ms, seq) = b.split_once('-').expect("millis-seq format");
         assert!(ms.len() >= 13, "millisecond epoch prefix: {ms}");
         assert!(!seq.is_empty() && seq.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    /// Minimal model row for lora-attach admission tests: only `path`
+    /// steers the lane split (dir = sglang, file = llamacpp/mistralrs);
+    /// every other field is inert filler.
+    fn fixture_model_row(path: String) -> blazar_core::store::ModelRow {
+        blazar_core::store::ModelRow {
+            name: "m".into(),
+            repo: "org/m".into(),
+            quant: "Q4_K_M".into(),
+            path,
+            bytes: 1,
+            sha256: None,
+            mmproj_path: None,
+            components: Vec::new(),
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+        }
+    }
+
+    #[test]
+    fn unit__validate_lora_attach__rejects_unknown_model_and_missing_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Unknown model: teaching names the model and the pull command.
+        let adapter = tmp.path().join("adapter.gguf");
+        std::fs::write(&adapter, b"adapter").unwrap();
+        let err = validate_lora_attach("ghost", None, &adapter).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no such model: ghost") && msg.contains("blazar pull"), "{msg}");
+        // Known model but adapter path absent on disk: refuse at the door,
+        // not at child boot.
+        let model_row = fixture_model_row(tmp.path().join("m.gguf").display().to_string());
+        let err = validate_lora_attach(
+            "m",
+            Some(&model_row),
+            &tmp.path().join("vanished.gguf"),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not found") && msg.contains("vanished.gguf"), "{msg}");
+    }
+
+    #[test]
+    fn unit__validate_lora_attach__lane_mismatch_teaches_the_other_engine() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Dir-lane model (sglang, safetensors dir) + GGUF file adapter:
+        // refuse with the PEFT-dir teaching, mirroring compile_sglang.
+        let dir_lane = fixture_model_row(tmp.path().join("model.d").display().to_string());
+        std::fs::create_dir_all(tmp.path().join("model.d")).unwrap();
+        let gguf = tmp.path().join("adapter.gguf");
+        std::fs::write(&gguf, b"adapter").unwrap();
+        let err = validate_lora_attach("m", Some(&dir_lane), &gguf).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("adapter_config.json") && msg.contains("llamacpp"),
+            "{msg}"
+        );
+        // File-lane model (llamacpp/mistralrs checkpoint) + PEFT dir
+        // adapter: refuse with the sglang teaching.
+        let file_lane = fixture_model_row(tmp.path().join("m.gguf").display().to_string());
+        let peft = tmp.path().join("peft-adapter");
+        std::fs::create_dir_all(&peft).unwrap();
+        std::fs::write(peft.join("adapter_config.json"), b"{}").unwrap();
+        let err = validate_lora_attach("m", Some(&file_lane), &peft).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("sglang") && msg.contains(".gguf"), "{msg}");
+    }
+
+    #[test]
+    fn unit__validate_lora_attach__matching_lane_adapters_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Keep-pin: valid GGUF file on the file lane still attaches.
+        let gguf = tmp.path().join("m.gguf");
+        std::fs::write(&gguf, b"checkpoint").unwrap();
+        let file_lane = fixture_model_row(gguf.display().to_string());
+        let adapter = tmp.path().join("adapter.gguf");
+        std::fs::write(&adapter, b"adapter").unwrap();
+        validate_lora_attach("m", Some(&file_lane), &adapter).unwrap();
+        // Keep-pin: valid PEFT dir on the dir lane still attaches.
+        let model_dir = tmp.path().join("model.d");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let dir_lane = fixture_model_row(model_dir.display().to_string());
+        let peft = tmp.path().join("peft-adapter");
+        std::fs::create_dir_all(&peft).unwrap();
+        std::fs::write(peft.join("adapter_config.json"), b"{}").unwrap();
+        std::fs::write(peft.join("adapter_model.safetensors"), b"weights").unwrap();
+        validate_lora_attach("m", Some(&dir_lane), &peft).unwrap();
     }
 
     #[test]

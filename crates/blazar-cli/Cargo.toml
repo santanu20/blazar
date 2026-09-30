@@ -28,6 +28,9 @@ reqwest = { workspace = true }
 dirs = { workspace = true }
 rustyline = { workspace = true }
 indicatif = { workspace = true }
+# width-aware doctor tables; already compiled in via indicatif, this
+# only makes the terminal-size API a direct dependency
+console = "0.15"
 futures = { workspace = true }
 tracing = { workspace = true }
 toml = { workspace = true }
