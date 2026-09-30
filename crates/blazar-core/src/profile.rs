@@ -4062,7 +4062,21 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
     };
     tun_str("--attention-backend", &tun.attention_backend, &mut warnings);
     tun_str("--tool-call-parser", &tun.tool_call_parser, &mut warnings);
-    tun_str("--reasoning-parser", &tun.reasoning_parser, &mut warnings);
+    // Reasoning split defaults to `auto` (detect from the chat template),
+    // mirroring llama-server's own `--reasoning-format auto` default.
+    // Without it a thinking template streams literal `<think>` blocks
+    // inside `content` and the thinking/answer split the gateway promises
+    // never happens (live receipt 2026-09-30: qwen3-1.7b, think=true,
+    // reasoning rode inline). An explicit pin wins; engines without the
+    // flag are warned about only when the USER pinned a parser — the
+    // default itself stays silent on legacy surfaces.
+    let reasoning_parser = tun.reasoning_parser.clone().or_else(|| {
+        input
+            .supported_flags
+            .contains(&"--reasoning-parser".to_string())
+            .then(|| "auto".to_string())
+    });
+    tun_str("--reasoning-parser", &reasoning_parser, &mut warnings);
     tun_str("--tokenizer-path", &tun.tokenizer_path, &mut warnings);
     tun_str("--dtype", &tun.dtype, &mut warnings);
     tun_str("--quantization", &tun.quantization, &mut warnings);
@@ -13364,6 +13378,70 @@ mod tests {
         inp_huge.overlay = &overlay_huge;
         let err = compile(&inp_huge, &TuningOverrides::default()).unwrap_err();
         assert!(err.contains("cannot fit"), "{err}");
+    }
+
+    #[test]
+    fn unit__sglang__reasoning_parser_defaults_to_auto_template_detection() {
+        // Thinking templates must split thoughts out of `content` for the
+        // gateway's thinking/answer contract; sglang only does that when
+        // a reasoning parser is configured, so unset means `auto`
+        // (upstream detects from the chat template — the same posture as
+        // llama-server's `--reasoning-format auto` default). An explicit
+        // pin replaces the default; a legacy engine without the flag is
+        // left untouched.
+        let cfg = Config::default();
+        let hf = hf_meta();
+        let hw = gpu_hw(8_000, 15_900, 8);
+        let base_overlay = DEFAULT_OVERLAY.clone();
+        let mut inp = sglang_input(&hf, &hw, &cfg, 3_300 * MIB);
+        inp.overlay = &base_overlay;
+
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        let auto = p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--reasoning-parser" && w[1] == "auto");
+        assert!(
+            auto,
+            "default must emit --reasoning-parser auto: {:?}",
+            p.argv
+        );
+
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                reasoning_parser: Some("qwen3".into()),
+                ..SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        let pinned = p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--reasoning-parser" && w[1] == "qwen3");
+        let auto_count = p
+            .argv
+            .windows(2)
+            .filter(|w| w[0] == "--reasoning-parser" && w[1] == "auto")
+            .count();
+        assert!(pinned, "explicit pin must win: {:?}", p.argv);
+        assert_eq!(auto_count, 0, "default auto must not duplicate the pin");
+
+        let legacy_flags: std::collections::BTreeSet<String> = SGLANG_FLAGS
+            .iter()
+            .filter(|f| f.as_str() != "--reasoning-parser")
+            .cloned()
+            .collect();
+        inp.overlay = &base_overlay;
+        inp.supported_flags = &legacy_flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.iter().any(|a| a == "--reasoning-parser"),
+            "engine without the flag must not receive it: {:?}",
+            p.argv
+        );
     }
 
     #[test]
