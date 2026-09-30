@@ -6063,6 +6063,7 @@ mod tests {
         pin: None,
         chat_template: None,
         deterministic_isolate: None,
+        warm_on_pull: None,
         chat_template_file: None,
         sampler_defaults: None,
         spm_infill: None,

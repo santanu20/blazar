@@ -5376,6 +5376,113 @@ drop them from rpc_servers in config.toml",
         }
     }
 
+    /// Pure policy core for [`Self::on_ac_power`] over `(online, status)`
+    /// pairs so the battery gate is unit-testable without sysfs. Any
+    /// adapter reporting `online=1` or any battery reporting a plugged
+    /// state counts as AC; only a discharging battery with no AC source
+    /// counts as battery; no readable evidence stays unknown.
+    fn ac_power_from_pairs(pairs: &[(Option<String>, Option<String>)]) -> Option<bool> {
+        let mut saw_battery = false;
+        let mut saw_ac = false;
+        for (online, status) in pairs {
+            if online.as_deref().is_some_and(|v| v.trim() == "1") {
+                saw_ac = true;
+            }
+            match status.as_deref().map(str::trim) {
+                Some("Discharging") => saw_battery = true,
+                Some("Charging" | "Full" | "Not charging") => saw_ac = true,
+                _ => {}
+            }
+        }
+        if saw_ac {
+            Some(true)
+        } else if saw_battery {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// AC-power detection for intent-time warming. `None` (unknown,
+    /// non-Linux, or unreadable class) fails OPEN — a server without a
+    /// battery must never be gate-locked out of warm-on-pull.
+    #[cfg(target_os = "linux")]
+    fn on_ac_power() -> Option<bool> {
+        let dir = std::fs::read_dir("/sys/class/power_supply").ok()?;
+        let mut pairs = Vec::new();
+        for entry in dir.flatten() {
+            let p = entry.path();
+            let online = std::fs::read_to_string(p.join("online")).ok();
+            let status = std::fs::read_to_string(p.join("status")).ok();
+            if online.is_some() || status.is_some() {
+                pairs.push((online, status));
+            }
+        }
+        Self::ac_power_from_pairs(&pairs)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn on_ac_power() -> Option<bool> {
+        None
+    }
+
+    /// Effective `warm_on_pull` for a model (per-model override wins,
+    /// else the global knob). Off by default: background residency is
+    /// an explicit opt-in, never a surprise VRAM claim.
+    #[must_use]
+    pub fn warm_on_pull_enabled(&self, model: &str) -> bool {
+        self.config
+            .overlay_for(model_of_key(model))
+            .warm_on_pull
+            .unwrap_or(self.config.warm_on_pull)
+    }
+
+    /// Wave L pre-spawn: fire when a pull completes so the first
+    /// request finds a warm engine instead of paying the cold boot.
+    /// Same contract as [`Self::preload_listed`] — idempotent,
+    /// warn-not-fail — plus the battery gate (a laptop on battery
+    /// keeps its power; first request cold-starts normally).
+    pub async fn warm_on_pull_if_enabled(&self, model: &str) {
+        let base = model_of_key(model);
+        if base == ROUTER_KEY || !self.warm_on_pull_enabled(model) {
+            return;
+        }
+        if self.loading.contains_key(base)
+            || self.instances.iter().any(|i| model_of_key(i.key()) == base)
+        {
+            return;
+        }
+        if Self::on_ac_power() == Some(false) {
+            tracing::info!(model = %base,
+                "warm_on_pull skipped: running on battery — first request cold-starts normally");
+            return;
+        }
+        match self.spawn_instance(base).await {
+            Ok(_) => tracing::info!(model = %base, "warm_on_pull: resident before first request"),
+            Err(e) => tracing::warn!(model = %base,
+                "warm_on_pull spawn failed: {e:#} — first request will cold-start"),
+        }
+    }
+
+    /// One bus subscription drives warming for every future pull.
+    /// Lagged batches are skipped (the next pull re-fires the event);
+    /// a closed bus means daemon shutdown.
+    pub async fn listen_warm_on_pull(self: &Arc<Self>) {
+        let mut rx = self.bus.subscribe();
+        loop {
+            match rx.recv().await {
+                Ok(BlazarEvent::ModelPulled { name, .. }) => {
+                    self.warm_on_pull_if_enabled(&name).await;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(skipped = n, "warm_on_pull listener lagged");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    }
+
     /// F1 idle-to-RAM tier: after the idle ladder evicts a child, the
     /// kernel page cache usually still holds the weights — but under
     /// memory pressure it may not. A sequential re-read refreshes the
@@ -7167,6 +7274,105 @@ mod routing_tests {
             "re-grantable after release"
         );
         sup.release_exclusive("m");
+        kill_all(&[ph]);
+    }
+
+    /// Wave L `warm_on_pull`: knob resolution (per-model override wins
+    /// over the global) and the battery-gate policy core over
+    /// (online, status) pairs.
+    #[test]
+    fn unit__warm_on_pull__knob_resolution_and_battery_policy() {
+        let mut sup = routing_sup(1);
+        assert!(!sup.warm_on_pull_enabled("m"), "off by default");
+        let mut config = Config {
+            warm_on_pull: true,
+            ..Config::default()
+        };
+        config.model_overrides.insert(
+            "off-model".into(),
+            ModelOverride {
+                warm_on_pull: Some(false),
+                ..Default::default()
+            },
+        );
+        sup.config = config;
+        assert!(sup.warm_on_pull_enabled("m"), "global on");
+        assert!(
+            sup.warm_on_pull_enabled("other"),
+            "unset model inherits global"
+        );
+        assert!(!sup.warm_on_pull_enabled("off-model"), "override wins");
+        assert!(
+            !sup.warm_on_pull_enabled("off-model#2"),
+            "replica keys canonicalize to the override"
+        );
+
+        let ac = Some("1".to_string());
+        let off = Some("0".to_string());
+        let discharging = Some("Discharging".to_string());
+        let full = Some("Full".to_string());
+
+        assert_eq!(
+            Supervisor::ac_power_from_pairs(&[(off.clone(), discharging.clone())]),
+            Some(false),
+            "discharging battery with adapter offline = battery"
+        );
+        assert_eq!(
+            Supervisor::ac_power_from_pairs(&[(ac.clone(), None)]),
+            Some(true),
+            "adapter online = AC"
+        );
+        assert_eq!(
+            Supervisor::ac_power_from_pairs(&[(off, full)]),
+            Some(true),
+            "full battery counts as plugged"
+        );
+        assert_eq!(
+            Supervisor::ac_power_from_pairs(&[(ac.clone(), Some("Charging".to_string()))]),
+            Some(true),
+            "charging battery is plugged"
+        );
+        assert_eq!(
+            Supervisor::ac_power_from_pairs(&[(ac, discharging)]),
+            Some(true),
+            "adapter wins over a discharging battery"
+        );
+        assert_eq!(
+            Supervisor::ac_power_from_pairs(&[(Some("0".to_string()), None)]),
+            None,
+            "adapter offline with no battery evidence = unknown, fail-open"
+        );
+        assert_eq!(Supervisor::ac_power_from_pairs(&[]), None);
+    }
+
+    /// Wave L `warm_on_pull`: a pull event for an already-live model must
+    /// not attempt a second spawn (idempotence), and a spawn that fails
+    /// must stay warn-not-fail — no panic, no half-instance.
+    #[tokio::test]
+    async fn unit__warm_on_pull__idempotent_and_warn_not_fail() {
+        let mut sup = routing_sup(1);
+        let config = Config {
+            warm_on_pull: true,
+            ..Config::default()
+        };
+        sup.config = config;
+        let (inst, ph) = fake_instance("m", InstanceState::Ready, 0);
+        sup.instances.insert("m".to_string(), inst);
+
+        sup.warm_on_pull_if_enabled("m").await;
+        assert_eq!(sup.instances.iter().count(), 1, "no duplicate instance");
+        assert!(sup.loading.is_empty(), "no loading entry for a live model");
+
+        sup.instances.remove("m");
+        // routing_sup's fake manifest registers spawns fine, so drive
+        // the failure arm with a model the (fresh /tmp) store has never
+        // seen: spawn must refuse, warn, and leave nothing behind.
+        sup.warm_on_pull_if_enabled("no-such-model").await;
+        assert_eq!(
+            sup.instances.iter().count(),
+            0,
+            "unknown-model spawn refuses and leaves nothing behind"
+        );
         kill_all(&[ph]);
     }
 

@@ -881,6 +881,13 @@ pub struct Config {
     /// a `blazar pull` hint) and never fail the daemon.
     #[serde(default)]
     pub preload: Vec<String>,
+    /// Warm-on-pull (Wave L): when a model finishes pulling, spawn it in
+    /// the background right away so the first request rides a warm child
+    /// instead of a cold start. Off by default — it spends RAM/VRAM at
+    /// intent time rather than request time. Gated on AC power where
+    /// detectable and on the standard spawn admission belts.
+    #[serde(default)]
+    pub warm_on_pull: bool,
     /// Idle-to-RAM warm (F1): after the idle ladder evicts a model, a
     /// background sequential re-read of its weights refreshes the OS
     /// page cache — the RAM tier between VRAM and disk — so a re-spawn
@@ -1090,6 +1097,10 @@ pub struct ModelOverride {
     /// Per-model warmup override (None = inherit global).
     #[serde(default)]
     pub warmup: Option<bool>,
+    /// Per-model warm-on-pull override (None = inherit global): spawn
+    /// this model in the background as soon as its pull completes.
+    #[serde(default)]
+    pub warm_on_pull: Option<bool>,
     /// Per-model thinking token budget (None = inherit global).
     #[serde(default)]
     pub reasoning_budget: Option<i64>,
@@ -2230,6 +2241,7 @@ impl Default for Config {
             lookup_cache_dynamic: None,
             predictive_preload: false,
             preload: Vec::new(),
+            warm_on_pull: false,
             idle_ram_warm: true,
             adaptive_slots: true,
             no_host: false,

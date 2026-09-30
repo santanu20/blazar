@@ -1116,6 +1116,27 @@ fn daemon_base(cfg: &Config) -> String {
     format!("http://{}:{}", cfg.host, cfg.port)
 }
 
+/// Fire-and-forget warm ping after a fresh local pull: the daemon
+/// applies its warm_on_pull policy (knob, AC power, admission belts).
+/// Absent daemon = nothing to warm — skip without noise.
+async fn notify_daemon_warm(model: &str) {
+    let Ok(cfg) = config() else {
+        return;
+    };
+    let base = daemon_base(&cfg);
+    let Ok(http) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    else {
+        return;
+    };
+    let _ = http
+        .post(format!("{base}/api/warm"))
+        .json(&serde_json::json!({ "model": model }))
+        .send()
+        .await;
+}
+
 /// systemctl lanes tried, in order, to hand the daemon its own scope.
 /// The user unit needs no privileges; the system unit may (hence the
 /// no-ask-password flag — failure stays fast and non-interactive).
@@ -5572,6 +5593,12 @@ async fn pull(target: &str, force: bool, verify: bool) -> Result<()> {
             row.shards,
             row.path
         );
+        // The pull ran in THIS process, so the daemon's warm_on_pull
+        // listener never saw it (its ModelPulled event fired on the
+        // CLI's own bus). Ping the daemon's warm endpoint so the
+        // intent-time pre-spawn policy still applies; no daemon
+        // running = nothing to warm, skip silently.
+        notify_daemon_warm(&row.name).await;
     }
     // A model with no serving lane is half-installed: offer the
     // missing engine now (no-op when a lane already serves it).
@@ -9506,7 +9533,9 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
         ));
         out.push("#".into());
         out.push(format!("# [model_overrides.\"{model}\"]"));
-        out.push(knob("replicas = 1    slots = 0    deterministic = false"));
+        out.push(knob(
+            "replicas = 1    slots = 0    deterministic = false    warm_on_pull = false",
+        ));
         out.push(knob("cache_type = \"\""));
     } else {
         let (table, families) = match kind {

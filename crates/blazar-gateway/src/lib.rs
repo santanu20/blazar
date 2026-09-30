@@ -349,6 +349,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/rerank", post(ollama::rerank))
         .route("/api/generate", post(ollama::generate))
         .route("/api/evict", post(ollama::evict))
+        .route("/api/warm", post(ollama::warm))
         .route(
             "/api/session",
             post(ollama::session).get(ollama::session_list),
@@ -823,7 +824,7 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
             "ollama": ["/api/chat", "/api/generate", "/api/tags", "/api/ps", "/api/show",
                        "/api/embeddings", "/api/embed", "/api/rerank", "/api/pull",
                        "/api/delete", "/api/events", "/api/version"],
-            "blazar": ["/api/evict", "/api/session", "/api/sessions", "/api/why",
+            "blazar": ["/api/evict", "/api/warm", "/api/session", "/api/sessions", "/api/why",
                         "/api/watch", "/api/keys", "/api/keys/rotate",
                         "/.well-known/blazar", "/metrics", "/healthz", "/health"],
         },
@@ -1112,6 +1113,13 @@ pub async fn serve(
             let sup = Arc::clone(&state.sup);
             tokio::spawn(async move { sup.preload_listed().await });
         }
+        // Wave L warm-on-pull: one bus subscription turns every future
+        // pull completion into an opt-in background spawn (gated on AC
+        // power; the knob itself is off by default).
+        {
+            let sup = Arc::clone(&state.sup);
+            tokio::spawn(async move { sup.listen_warm_on_pull().await });
+        }
         // TCP_NODELAY on every accepted socket: NDJSON/SSE streams are strings
         // of small writes, and with Nagle the first content packet waits for
         // the client's delayed ACK of the headers/role packet — a flat
@@ -1158,6 +1166,11 @@ pub async fn serve(
         {
             let sup = Arc::clone(&state.sup);
             tokio::spawn(async move { sup.preload_listed().await });
+        }
+        // Wave L warm-on-pull on the TLS branch too.
+        {
+            let sup = Arc::clone(&state.sup);
+            tokio::spawn(async move { sup.listen_warm_on_pull().await });
         }
         let handle = axum_server::Handle::new();
         let h2 = handle.clone();
