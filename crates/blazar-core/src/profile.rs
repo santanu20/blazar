@@ -790,6 +790,23 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
                 input.engine_tag
             ));
         }
+    } else if input.supported_flags.contains("--embeddings") {
+        // Embed-any-model parity (2026-09-30 receipt): llama-server
+        // b11202+ serves /v1/embeddings AND generation on the SAME
+        // child with `--embeddings` — the --help "restrict to
+        // embedding" wording overstates the limit — so generative
+        // checkpoints get the endpoint too (ollama embeds any model;
+        // /api/embed previously relayed the upstream 501 "does not
+        // support embeddings"). Causal instruct models carry no
+        // pooling head ("pooling type 'none' is not OAI compatible"),
+        // so `--pooling last` makes the endpoint accept them. BERT-
+        // class rows never reach this arm: GGUF {arch}.pooling_type
+        // routes them through the native-pooling branch above.
+        argv.push("--embeddings".into());
+        if input.supported_flags.contains("--pooling") {
+            argv.push("--pooling".into());
+            argv.push("last".into());
+        }
     }
 
     // --- 11. speculative decoding
@@ -6065,6 +6082,34 @@ mod tests {
             .argv
             .windows(2)
             .any(|w| w[0] == "--pooling" && w[1] == "mean"));
+    }
+
+    #[test]
+    fn unit__generative_models__gain_embeddings_parity_arm() {
+        // No pooling_type in GGUF metadata (generative checkpoint) ->
+        // the parity arm emits --embeddings + --pooling last so /api/embed
+        // serves instead of relaying the upstream 501 (receipt: chat and
+        // /v1/embeddings co-served on one b11202 child, 2026-09-30).
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta(); // pooling_type: None by default
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p
+            .argv
+            .windows(3)
+            .any(|w| w[0] == "--embeddings" && w[1] == "--pooling" && w[2] == "last"));
+        // legacy engine without the flag: arm stays off, no warning noise
+        let legacy: BTreeSet<String> = ALL_FLAGS
+            .iter()
+            .filter(|f| **f != "--embeddings")
+            .cloned()
+            .collect();
+        let p2 = compile(&input(&g, &hw, &cfg, &legacy), &TuningOverrides::default()).unwrap();
+        assert!(!p2.argv.iter().any(|a| a == "--embeddings"));
     }
 
     #[test]

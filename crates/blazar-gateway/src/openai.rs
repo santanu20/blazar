@@ -240,6 +240,56 @@ fn inject_reasoning_effort_kwarg(body: &mut serde_json::Value) -> bool {
     true
 }
 
+/// Think-default-off parity on the `OpenAI` chat lane: templates that
+/// render thinking when the toggle is absent (qwen3 dialects) get the
+/// explicit OFF kwargs injected — both family keys, matching the
+/// translate layer's dual-key rule, so llama-server and sglang
+/// children both honor it. Explicit caller kwargs always win; an
+/// explicit `reasoning_effort` means the caller is steering reasoning
+/// deliberately and the default stays out of the way. Fail-open when
+/// the row or template cannot be read.
+fn inject_default_think_off(state: &AppState, body: &mut serde_json::Value) -> bool {
+    let Some(model) = body.get("model").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let row = state
+        .with_store(|s| crate::proxy::resolve_model(s, model).ok())
+        .flatten();
+    inject_default_think_off_row(row.as_ref(), body)
+}
+
+/// Row-resolved core of the think-default-off bridge (unit-testable
+/// without an `AppState`).
+fn inject_default_think_off_row(
+    row: Option<&blazar_core::ModelRow>,
+    body: &mut serde_json::Value,
+) -> bool {
+    let Some(row) = row else {
+        return false;
+    };
+    if body.get("reasoning_effort").is_some() {
+        return false;
+    }
+    if !crate::ollama::template_supports_thinking_cached(row) {
+        return false;
+    }
+    if let Some(map) = body
+        .get_mut("chat_template_kwargs")
+        .and_then(|v| v.as_object_mut())
+    {
+        let mut changed = false;
+        for key in ["thinking", "enable_thinking"] {
+            if !map.contains_key(key) {
+                map.insert(key.to_string(), serde_json::Value::Bool(false));
+                changed = true;
+            }
+        }
+        return changed;
+    }
+    body["chat_template_kwargs"] = json!({"thinking": false, "enable_thinking": false});
+    true
+}
+
 /// All POST /v1/* traffic: one handler, one proxy path, zero body
 /// rewriting. `X-Blazar-Priority` orders admission under load.
 #[allow(clippy::too_many_lines)] // one cohesive admission + forwarding path
@@ -315,7 +365,12 @@ pub async fn openai_proxy(
     let mut body = body;
     if uri.path().ends_with("/chat/completions") {
         if let Some(v) = parsed_body.as_mut() {
-            if inject_reasoning_effort_kwarg(v) {
+            let mut rewritten = inject_reasoning_effort_kwarg(v);
+            // Think-default-off parity (chat lane): a thinking-capable
+            // template with no caller toggle renders reasoning ON and
+            // eats the token budget before the answer.
+            rewritten |= inject_default_think_off(&state, v);
+            if rewritten {
                 body = Bytes::from(serde_json::to_vec(v).unwrap_or_default());
             }
         }
@@ -1313,6 +1368,57 @@ mod tests {
             adapters_target(&[], Some("only-pulled")),
             Some("only-pulled")
         );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__inject_default_think_off__hf_dir_template_gates_the_bridge() {
+        // HF-layout model dir: tokenizer_config.json carries the chat
+        // template (the sglang evidence class — GGUF-only detection used
+        // to fail open here and qwen templates thought by default).
+        let dir = std::env::temp_dir().join(format!("blazar-think-hf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"chat_template": "{%- if enable_thinking -%}<think>"}"#,
+        )
+        .unwrap();
+        let row = blazar_core::ModelRow {
+            name: "m".into(),
+            repo: "registry.ollama.ai/library/m".into(),
+            quant: "BF16".into(),
+            path: dir.to_string_lossy().to_string(),
+            bytes: 1,
+            sha256: None,
+            mmproj_path: None,
+            components: vec![],
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+        };
+        let mut v = json!({"model": "m", "messages": []});
+        assert!(inject_default_think_off_row(Some(&row), &mut v));
+        assert_eq!(v["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(v["chat_template_kwargs"]["thinking"], false);
+        // Explicit caller kwargs win — no key is forced over them.
+        let mut explicit = json!({
+            "model": "m",
+            "chat_template_kwargs": {"enable_thinking": true}
+        });
+        assert!(inject_default_think_off_row(Some(&row), &mut explicit));
+        assert_eq!(explicit["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(explicit["chat_template_kwargs"]["thinking"], false);
+        // An explicit reasoning_effort means deliberate steering: no
+        // default injection at all.
+        let mut effort = json!({"model": "m", "reasoning_effort": "low"});
+        assert!(!inject_default_think_off_row(Some(&row), &mut effort));
+        // No row (unresolvable model): fail-open, body untouched.
+        let mut none = json!({"model": "m", "messages": []});
+        assert!(!inject_default_think_off_row(None, &mut none));
+        assert!(none.get("chat_template_kwargs").is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

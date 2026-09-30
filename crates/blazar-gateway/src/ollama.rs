@@ -548,31 +548,20 @@ fn pull_stream_names(target: &str) -> Vec<String> {
 /// POST /api/pull — NDJSON progress straight from the event bus; a
 /// duplicate pull errors and closes the stream (ollama semantics).
 #[allow(clippy::similar_names)] // pull_request vs target distinguish intent
-pub async fn pull(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
-    let req: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
-    };
-    let target = req["model"]
-        .as_str()
-        .or(req["name"].as_str())
-        .unwrap_or_default()
-        .to_string();
-    if target.is_empty() {
-        return api_error(400, "missing field: model");
-    }
-
-    let dirs = state.dirs.clone();
-    let bus = state.bus.clone();
-    let rx2 = bus.subscribe();
-    let stream_names = pull_stream_names(&target);
-    let events = tokio_stream::wrappers::BroadcastStream::new(rx2);
-    // Emit-then-STOP: the terminal line (success/error) must reach the
-    // client AND the stream must end right after it. `take_while` drops
-    // the item that trips the predicate (silencing bogus-repo failures
-    // into empty 200s); a bare filter_map never ends the body. The
-    // unfold state machine gives both guarantees.
-    let stream = futures::stream::unfold(
+/// The /api/pull NDJSON body as a stream: emit-then-STOP semantics.
+/// The terminal line (success/error) must reach the client AND the
+/// stream must end right after it. `take_while` drops the item that
+/// trips the predicate (silencing bogus-repo failures into empty
+/// 200s); a bare `filter_map` never ends the body. The unfold state
+/// machine gives both guarantees — including the bus-closed arm: when
+/// every sender drops (a daemon shutdown mid-pull), the body ends with
+/// a terminal error frame instead of a silent EOF (live receipt:
+/// 2026-09-30 /api/pull ended cleanly at 31% during a restart window).
+fn pull_ndjson_stream(
+    events: tokio_stream::wrappers::BroadcastStream<blazar_runtime::BlazarEvent>,
+    stream_names: Vec<String>,
+) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
+    futures::stream::unfold(
         (events, false, stream_names),
         |(mut events, done, names)| async move {
             if done {
@@ -594,11 +583,42 @@ pub async fn pull(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
                     }
                     // Broadcast lag yields Err: skip it, keep streaming.
                     Some(Err(_)) => {}
-                    None => return None,
+                    None => {
+                        let line = format!(
+                            "{}\n",
+                            json!({"error": "event bus closed before terminal status — the daemon shut down mid-pull; retry the pull (resume keeps completed chunks)"})
+                        );
+                        return Some((
+                            Ok::<_, std::io::Error>(Bytes::from(line)),
+                            (events, true, names),
+                        ));
+                    }
                 }
             }
         },
-    );
+    )
+}
+
+pub async fn pull(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let req: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
+    };
+    let target = req["model"]
+        .as_str()
+        .or(req["name"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    if target.is_empty() {
+        return api_error(400, "missing field: model");
+    }
+
+    let dirs = state.dirs.clone();
+    let bus = state.bus.clone();
+    let rx2 = bus.subscribe();
+    let stream_names = pull_stream_names(&target);
+    let events = tokio_stream::wrappers::BroadcastStream::new(rx2);
+    let stream = pull_ndjson_stream(events, stream_names);
 
     // Drive the pull on a task; stream events until ModelPulled/PullFailed.
     let pull_request = target.clone();
@@ -1337,27 +1357,64 @@ static TEMPLATE_SUPPORT_CACHE: std::sync::OnceLock<
     dashmap::DashMap<String, (u64, std::time::SystemTime, bool)>,
 > = std::sync::OnceLock::new();
 
-fn template_supports_thinking_cached(row: &blazar_core::ModelRow) -> bool {
+pub(crate) fn template_supports_thinking_cached(row: &blazar_core::ModelRow) -> bool {
     let cache = TEMPLATE_SUPPORT_CACHE.get_or_init(dashmap::DashMap::new);
-    let Ok(meta) = std::fs::metadata(&row.path) else {
+    // HF-layout lanes (sglang safetensors dirs) carry the chat template
+    // in tokenizer_config.json; GGUF rows keep the metadata read. The
+    // cache keys on the probe file that actually backs the template so
+    // both layouts stay honest under the same stat guard.
+    let is_dir = std::fs::metadata(&row.path).is_ok_and(|m| m.is_dir());
+    let probe: std::path::PathBuf = if is_dir {
+        std::path::Path::new(&row.path).join("tokenizer_config.json")
+    } else {
+        std::path::PathBuf::from(&row.path)
+    };
+    let key = probe.to_string_lossy().to_string();
+    let Ok(meta) = std::fs::metadata(&probe) else {
         return false; // fail-open, same as an unreadable file below
     };
     let Some(mtime) = meta.modified().ok() else {
         return false;
     };
-    if let Some(entry) = cache.get(&row.path) {
+    if let Some(entry) = cache.get(&key) {
         let (len, seen_mtime, supports) = *entry;
         if len == meta.len() && seen_mtime == mtime {
             return supports;
         }
     }
-    let template = blazar_core::read_metadata_file(std::path::Path::new(&row.path))
-        .ok()
-        .and_then(|gguf| gguf.chat_template)
-        .unwrap_or_default();
+    let template = if is_dir {
+        hf_chat_template(&probe)
+    } else {
+        blazar_core::read_metadata_file(std::path::Path::new(&row.path))
+            .ok()
+            .and_then(|gguf| gguf.chat_template)
+            .unwrap_or_default()
+    };
     let supports = template_supports_thinking(&template);
-    cache.insert(row.path.clone(), (meta.len(), mtime, supports));
+    cache.insert(key, (meta.len(), mtime, supports));
     supports
+}
+
+/// Chat template text out of an HF `tokenizer_config.json`: the field is
+/// either a single Jinja string or a list of named variants — both are
+/// marker-scanned so think gating sees the same evidence class the
+/// engine's renderer uses.
+fn hf_chat_template(path: &std::path::Path) -> String {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return String::new();
+    };
+    match val.get("chat_template") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|it| it.get("template").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
 }
 
 fn refuse_unsupported_think(row: &blazar_core::ModelRow, req: &Value) -> Option<Response> {
@@ -3606,6 +3663,31 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
 mod tests {
     use super::*;
     use blazar_runtime::BlazarEvent;
+
+    #[tokio::test]
+    async fn unit__pull_ndjson__bus_closed_emits_terminal_error_frame() {
+        // O1 contract: a daemon shutdown mid-pull (every bus sender
+        // dropped) must end the NDJSON body with a terminal error
+        // frame, never a silent EOF at a partial percent (receipt:
+        // 2026-09-30 /api/pull ended cleanly at 31%).
+        let (tx, rx) = tokio::sync::broadcast::channel::<BlazarEvent>(16);
+        let events = tokio_stream::wrappers::BroadcastStream::new(rx);
+        drop(tx); // simulate the daemon going away
+        let mut stream = Box::pin(pull_ndjson_stream(events, vec!["m".into()]));
+        let frame = stream.next().await;
+        let body = frame.expect("bus close must yield a terminal frame, not silence");
+        let bytes = body.expect("infallible io");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("event bus closed before terminal status"),
+            "terminal frame must name the shutdown, got: {text}"
+        );
+        assert!(text.starts_with('{') && text.contains("\"error\""));
+        assert!(
+            stream.next().await.is_none(),
+            "stream ends after the terminal frame"
+        );
+    }
 
     /// Minimal GGUF with `general.architecture` + optional
     /// `tokenizer.chat_template` — just enough header for

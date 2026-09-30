@@ -3948,14 +3948,8 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
     // active engine is not llamacpp.)
     match active_kind {
         Some(EngineKind::Sglang) => {
-            let active = active_tag.as_deref().unwrap_or("?");
-            checks.push(Check::ok(
-                "engine currency",
-                format!(
-                    "{active} (sglang pip lane, version pinned at install) — update with: \
-                     blazar engine update --kind sglang [version]"
-                ),
-            ));
+            let active = active_tag.unwrap_or_else(|| "?".into());
+            checks.push(live_sglang_currency(&active).await);
             return checks;
         }
         Some(EngineKind::MistralRs) => {
@@ -4233,6 +4227,40 @@ async fn live_engine_currency(active: &str, asset: &str) -> Check {
 /// warn-only probe of the mistral.rs release list under the shared
 /// bounded-retry policy, mirroring the llama.cpp live lane — the
 /// daemon's daily survey does not track this repo.
+/// sglang pip lane: `PyPI` is the upstream truth, so doctor probes it live
+/// (same bounded, warn-only shape as the mistral.rs row) instead of just
+/// teaching the refresh command — an available minor reads as a warn with
+/// the exact update command.
+async fn live_sglang_currency(active: &str) -> Check {
+    let installed_version = active.trim_start_matches("sglang-");
+    match blazar_runtime::engine::sglang_install::pypi_latest_sglang().await {
+        Ok(latest) => {
+            let (inst, want) = (
+                blazar_runtime::engine::sglang_install::version_tuple(installed_version),
+                blazar_runtime::engine::sglang_install::version_tuple(&latest),
+            );
+            if inst >= want {
+                Check::ok(
+                    "engine currency",
+                    format!("up to date ({active}, sglang pip lane)"),
+                )
+            } else {
+                Check::warn(
+                    "engine currency",
+                    format!(
+                        "{latest} available on PyPI (active: {active}) — run: \
+                         blazar engine update --kind sglang {latest}"
+                    ),
+                )
+            }
+        }
+        Err(e) => Check::warn(
+            "engine currency",
+            format!("{active} (sglang pip lane) — PyPI check failed ({e:#}); offline?"),
+        ),
+    }
+}
+
 async fn live_mistralrs_currency(active: &str) -> Check {
     let token = std::env::var("GH_TOKEN")
         .or_else(|_| std::env::var("GITHUB_TOKEN"))
@@ -12645,18 +12673,20 @@ mod tests {
         std::fs::write(&adapter, b"adapter").unwrap();
         let err = validate_lora_attach("ghost", None, &adapter).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("no such model: ghost") && msg.contains("blazar pull"), "{msg}");
+        assert!(
+            msg.contains("no such model: ghost") && msg.contains("blazar pull"),
+            "{msg}"
+        );
         // Known model but adapter path absent on disk: refuse at the door,
         // not at child boot.
         let model_row = fixture_model_row(tmp.path().join("m.gguf").display().to_string());
-        let err = validate_lora_attach(
-            "m",
-            Some(&model_row),
-            &tmp.path().join("vanished.gguf"),
-        )
-        .unwrap_err();
+        let err = validate_lora_attach("m", Some(&model_row), &tmp.path().join("vanished.gguf"))
+            .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("not found") && msg.contains("vanished.gguf"), "{msg}");
+        assert!(
+            msg.contains("not found") && msg.contains("vanished.gguf"),
+            "{msg}"
+        );
     }
 
     #[test]
