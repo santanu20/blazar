@@ -11,6 +11,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::build::parse_version_pair;
+use super::net_probe::{self, Attempt};
 
 pub const LLAMA_CPP_REPO: &str = "ggml-org/llama.cpp";
 
@@ -108,6 +109,20 @@ pub fn llama_arch_source_url(tag: &str) -> String {
     format!("https://raw.githubusercontent.com/{LLAMA_CPP_REPO}/{tag}/src/llama-arch.cpp")
 }
 
+/// Authenticated GET builder for probe-retry closures, which cannot
+/// borrow `self` (each re-issue needs a fresh owned request); mirrors
+/// `GhClient::auth`.
+fn authed(
+    http: &reqwest::Client,
+    token: Option<&str>,
+    url: reqwest::Url,
+) -> reqwest::RequestBuilder {
+    match token {
+        Some(t) => http.get(url).bearer_auth(t),
+        None => http.get(url),
+    }
+}
+
 impl GhClient {
     pub fn new(token: Option<String>) -> Result<Self> {
         // BLAZAR_GH_BASE: mirrors/tests override the GitHub API base for
@@ -155,56 +170,106 @@ impl GhClient {
         self.list_releases_repo(LLAMA_CPP_REPO).await
     }
 
-    /// `list_releases` for an arbitrary repo (whisper.cpp, blazar self, ...).
     pub async fn list_releases_repo(&self, repo: &str) -> Result<Vec<GhRelease>> {
         let url = self
             .base
             .join(&format!("repos/{repo}/releases?per_page=30"))
             .unwrap();
-        let resp = self
-            .auth(self.http.get(url.clone()))
-            .send()
-            .await
-            .context("GitHub releases request failed")?;
-        match resp.status() {
-            reqwest::StatusCode::OK => {}
-            reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS => {
-                return Err(anyhow!(
-                    "GitHub API rate limited ({}). Set GH_TOKEN for 5000 req/hr",
-                    resp.status()
-                ));
+        let http = self.http.clone();
+        let token = self.token.clone();
+        net_probe::retry_probe(move || {
+            let rb = authed(&http, token.as_deref(), url.clone());
+            async move {
+                let sent = tokio::time::timeout(net_probe::PROBE_ATTEMPT_CAP, rb.send()).await;
+                let resp = match sent {
+                    Ok(Ok(resp)) => resp,
+                    Ok(Err(e)) => {
+                        return Attempt::Retry(anyhow!("GitHub releases request failed: {e}"))
+                    }
+                    Err(_) => {
+                        return Attempt::Retry(anyhow!(
+                            "GitHub releases request exceeded {}s",
+                            net_probe::PROBE_ATTEMPT_CAP.as_secs()
+                        ))
+                    }
+                };
+                match resp.status() {
+                    reqwest::StatusCode::OK => {}
+                    reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                        return Attempt::Done(Err(anyhow!(
+                            "GitHub API rate limited ({}). Set GH_TOKEN for 5000 req/hr",
+                            resp.status()
+                        )));
+                    }
+                    other if other.is_server_error() => {
+                        return Attempt::Retry(anyhow!("GitHub releases API {other}"));
+                    }
+                    other => {
+                        return Attempt::Done(Err(anyhow!("GitHub releases API {other}")));
+                    }
+                }
+                match resp.json::<Vec<GhRelease>>().await {
+                    Ok(releases) => Attempt::Done(Ok(releases)),
+                    // A connection reset mid-body truncates the 200 —
+                    // decode failures are transport-class, worth one
+                    // more attempt.
+                    Err(e) => Attempt::Retry(anyhow!("decode releases JSON: {e}")),
+                }
             }
-            other => return Err(anyhow!("GitHub releases API {other}")),
-        }
-        let releases: Vec<GhRelease> = resp.json().await.context("decode releases JSON")?;
-        Ok(releases)
+        })
+        .await
     }
 
-    /// Single release for an arbitrary repo: `releases/latest` or
-    /// `releases/tags/{version}`. Used by `blazar upgrade` (self-update).
     pub async fn release_by(&self, repo: &str, version: Option<&str>) -> Result<GhRelease> {
         let path = match version {
             Some(v) => format!("repos/{repo}/releases/tags/{v}"),
             None => format!("repos/{repo}/releases/latest"),
         };
         let url = self.base.join(&path).unwrap();
-        let resp = self
-            .auth(self.http.get(url))
-            .send()
-            .await
-            .context("GitHub release request failed")?;
-        match resp.status() {
-            reqwest::StatusCode::OK => {}
-            reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS => {
-                return Err(anyhow!(
-                    "GitHub API rate limited ({}). Set GH_TOKEN",
-                    resp.status()
-                ));
+        let http = self.http.clone();
+        let token = self.token.clone();
+        net_probe::retry_probe(move || {
+            let rb = authed(&http, token.as_deref(), url.clone());
+            let path = path.clone();
+            async move {
+                let sent = tokio::time::timeout(net_probe::PROBE_ATTEMPT_CAP, rb.send()).await;
+                let resp = match sent {
+                    Ok(Ok(resp)) => resp,
+                    Ok(Err(e)) => {
+                        return Attempt::Retry(anyhow!("GitHub release request failed: {e}"))
+                    }
+                    Err(_) => {
+                        return Attempt::Retry(anyhow!(
+                            "GitHub release request exceeded {}s",
+                            net_probe::PROBE_ATTEMPT_CAP.as_secs()
+                        ))
+                    }
+                };
+                match resp.status() {
+                    reqwest::StatusCode::OK => {}
+                    reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                        return Attempt::Done(Err(anyhow!(
+                            "GitHub API rate limited ({}). Set GH_TOKEN",
+                            resp.status()
+                        )));
+                    }
+                    other if other.is_server_error() => {
+                        return Attempt::Retry(anyhow!("GitHub release API {other} for {path}"));
+                    }
+                    other => {
+                        return Attempt::Done(Err(anyhow!(
+                            "GitHub release API {other} for {path}"
+                        )));
+                    }
+                }
+                match resp.json::<GhRelease>().await {
+                    Ok(release) => Attempt::Done(Ok(release)),
+                    // Mid-body reset truncates the 200 — retry-worthy.
+                    Err(e) => Attempt::Retry(anyhow!("decode release JSON: {e}")),
+                }
             }
-            other => return Err(anyhow!("GitHub release API {other} for {path}")),
-        }
-        let release: GhRelease = resp.json().await.context("decode release JSON")?;
-        Ok(release)
+        })
+        .await
     }
 
     /// Newest `bNNNNN` release by build number.
@@ -285,29 +350,62 @@ impl GhClient {
         self.release_by_tag_repo(LLAMA_CPP_REPO, tag).await
     }
 
-    /// `release_by_tag` for an arbitrary repo (mistral.rs engine lane).
     pub async fn release_by_tag_repo(&self, repo: &str, tag: &str) -> Result<GhRelease> {
         let url = self
             .base
             .join(&format!("repos/{repo}/releases/tags/{tag}"))
             .unwrap();
-        let resp = self
-            .auth(self.http.get(url.clone()))
-            .send()
-            .await
-            .context("GitHub release-by-tag request failed")?;
-        match resp.status() {
-            reqwest::StatusCode::OK => Ok(resp.json().await.context("decode release")?),
-            reqwest::StatusCode::NOT_FOUND => Err(anyhow!("{repo} release {tag} not found")),
-            other => Err(anyhow!("GitHub API {other} for {repo} tag {tag}")),
-        }
+        let http = self.http.clone();
+        let token = self.token.clone();
+        let repo = repo.to_string();
+        let tag = tag.to_string();
+        net_probe::retry_probe(move || {
+            let rb = authed(&http, token.as_deref(), url.clone());
+            let (repo, tag) = (repo.clone(), tag.clone());
+            async move {
+                let sent = tokio::time::timeout(net_probe::PROBE_ATTEMPT_CAP, rb.send()).await;
+                let resp = match sent {
+                    Ok(Ok(resp)) => resp,
+                    Ok(Err(e)) => {
+                        return Attempt::Retry(anyhow!("GitHub release-by-tag request failed: {e}"))
+                    }
+                    Err(_) => {
+                        return Attempt::Retry(anyhow!(
+                            "GitHub release-by-tag request exceeded {}s",
+                            net_probe::PROBE_ATTEMPT_CAP.as_secs()
+                        ))
+                    }
+                };
+                match resp.status() {
+                    reqwest::StatusCode::OK => {}
+                    reqwest::StatusCode::NOT_FOUND => {
+                        return Attempt::Done(Err(anyhow!("{repo} release {tag} not found")));
+                    }
+                    reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                        return Attempt::Done(Err(anyhow!(
+                            "GitHub API rate limited ({}). Set GH_TOKEN for 5000 req/hr",
+                            resp.status()
+                        )));
+                    }
+                    other if other.is_server_error() => {
+                        return Attempt::Retry(anyhow!("GitHub API {other} for {repo} tag {tag}"));
+                    }
+                    other => {
+                        return Attempt::Done(Err(anyhow!(
+                            "GitHub API {other} for {repo} tag {tag}"
+                        )));
+                    }
+                }
+                match resp.json::<GhRelease>().await {
+                    Ok(release) => Attempt::Done(Ok(release)),
+                    // Mid-body reset truncates the 200 — retry-worthy.
+                    Err(e) => Attempt::Retry(anyhow!("decode release: {e}")),
+                }
+            }
+        })
+        .await
     }
 
-    /// Resolve a commit ref (short SHA, full SHA, branch, or tag) to the
-    /// full 40-char commit SHA via the commits API. The git fetch
-    /// protocol only accepts full object names as want-refs, so
-    /// fork-lane pins given in abbreviated form must go through here
-    /// before `git fetch` is attempted.
     pub async fn resolve_commit(&self, repo: &str, git_ref: &str) -> Result<String> {
         #[derive(serde::Deserialize)]
         struct CommitLookup {
@@ -317,34 +415,68 @@ impl GhClient {
             .base
             .join(&format!("repos/{repo}/commits/{git_ref}"))
             .unwrap();
-        let resp = self
-            .auth(self.http.get(url.clone()))
-            .send()
-            .await
-            .context("GitHub commit-lookup request failed")?;
-        match resp.status() {
-            reqwest::StatusCode::OK => {}
-            reqwest::StatusCode::NOT_FOUND => {
-                return Err(anyhow!("{repo} commit {git_ref} not found"));
+        let http = self.http.clone();
+        let token = self.token.clone();
+        let repo = repo.to_string();
+        let git_ref = git_ref.to_string();
+        net_probe::retry_probe(move || {
+            let rb = authed(&http, token.as_deref(), url.clone());
+            let (repo, git_ref) = (repo.clone(), git_ref.clone());
+            async move {
+                let sent = tokio::time::timeout(net_probe::PROBE_ATTEMPT_CAP, rb.send()).await;
+                let resp = match sent {
+                    Ok(Ok(resp)) => resp,
+                    Ok(Err(e)) => {
+                        return Attempt::Retry(anyhow!("GitHub commit-lookup request failed: {e}"))
+                    }
+                    Err(_) => {
+                        return Attempt::Retry(anyhow!(
+                            "GitHub commit-lookup request exceeded {}s",
+                            net_probe::PROBE_ATTEMPT_CAP.as_secs()
+                        ))
+                    }
+                };
+                match resp.status() {
+                    reqwest::StatusCode::OK => {}
+                    reqwest::StatusCode::NOT_FOUND => {
+                        return Attempt::Done(Err(anyhow!("{repo} commit {git_ref} not found")));
+                    }
+                    reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                        return Attempt::Done(Err(anyhow!(
+                            "GitHub API rate limited ({}). Set GH_TOKEN for 5000 req/hr",
+                            resp.status()
+                        )));
+                    }
+                    other if other.is_server_error() => {
+                        return Attempt::Retry(anyhow!(
+                            "GitHub API {other} for {repo} commit {git_ref}"
+                        ));
+                    }
+                    other => {
+                        return Attempt::Done(Err(anyhow!(
+                            "GitHub API {other} for {repo} commit {git_ref}"
+                        )));
+                    }
+                }
+                let commit: CommitLookup = match resp.json().await {
+                    Ok(commit) => commit,
+                    // Mid-body reset truncates the 200 — retry-worthy.
+                    Err(e) => return Attempt::Retry(anyhow!("decode commit-lookup response: {e}")),
+                };
+                Attempt::Done(
+                    if commit.sha.len() != 40 || !commit.sha.chars().all(|c| c.is_ascii_hexdigit())
+                    {
+                        Err(anyhow!(
+                            "{repo} commit lookup for {git_ref} returned a non-SHA answer ({})",
+                            commit.sha
+                        ))
+                    } else {
+                        Ok(commit.sha)
+                    },
+                )
             }
-            reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS => {
-                return Err(anyhow!(
-                    "GitHub API rate limited ({}). Set GH_TOKEN for 5000 req/hr",
-                    resp.status()
-                ));
-            }
-            other => {
-                return Err(anyhow!("GitHub API {other} for {repo} commit {git_ref}"));
-            }
-        }
-        let commit: CommitLookup = resp.json().await.context("decode commit-lookup response")?;
-        if commit.sha.len() != 40 || !commit.sha.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(anyhow!(
-                "{repo} commit lookup for {git_ref} returned a non-SHA answer ({})",
-                commit.sha
-            ));
-        }
-        Ok(commit.sha)
+        })
+        .await
     }
 
     /// Fetch the raw `src/llama-arch.cpp` at an upstream llama.cpp tag
@@ -1358,6 +1490,57 @@ mod tests {
         assert!(!same_build("b10816", "b10817"));
         assert!(same_build("local", "local"));
         assert!(!same_build("local", "b10816"));
+    }
+
+    #[tokio::test]
+    async fn integration__list_releases_repo__5xx_transients_retry_to_success() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // Transient 500s mounted first with a 2-hit cap, healthy answer
+        // second: wiremock matches mounts in mount order, so the first
+        // two connections "drop" and the third serves — the same shape
+        // as an ISP resetting the first connections of a probe.
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"tag_name": "b1"}
+            ])))
+            .mount(&server)
+            .await;
+        let gh = GhClient::with_base(&server.uri(), None).unwrap();
+        let releases = gh.list_releases_repo(LLAMA_CPP_REPO).await.unwrap();
+        assert_eq!(releases[0].tag_name, "b1");
+        // Both transient 500s were consumed before the 200 — the retry
+        // policy did the recovering, not luck.
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn integration__list_releases_repo__rate_limit_fails_fast_without_retry() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let gh = GhClient::with_base(&server.uri(), None).unwrap();
+        let err = gh
+            .list_releases_repo(LLAMA_CPP_REPO)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "GitHub API rate limited (403 Forbidden). Set GH_TOKEN for 5000 req/hr"
+        );
+        // Re-issuing past a 403 is what the rate limit asks us not to do.
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[test]

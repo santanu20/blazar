@@ -1776,7 +1776,7 @@ fn bold_heading(text: &str) -> String {
 }
 
 /// `blazar doctor` — local-state diagnostics: config, store, engine
-/// manifest, hardware probe, plus 4s-capped upstream currency probes
+/// manifest, hardware probe, plus bounded-retry upstream currency probes
 /// (engine/whisper/app). Warn-only — never installs or starts anything
 /// (the engine row executes the engine binary with `--version`, nothing
 /// more).
@@ -3785,7 +3785,7 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
     // verdict went stale the moment `engine update`/`use`/`rollback`
     // flipped the store between daily ticks. Marker missing or >48h
     // old (daemon never surveyed / long offline): probe upstream live,
-    // same 4s-capped warn-only shape as the whisper/app currency rows.
+    // same bounded-retry warn-only shape as the whisper/app currency rows.
     // The daily survey tracks llama.cpp only — a mistral.rs-active box
     // gets its own live mistral.rs check instead.
     if active_kind == Some(EngineKind::MistralRs) {
@@ -4049,13 +4049,9 @@ async fn live_engine_currency(active: &str, asset: &str) -> Check {
         return Check::warn("engine currency", "cannot build GitHub client");
     };
     let channel = config().map(|c| c.update_channel).unwrap_or_default();
-    let fetched = tokio::time::timeout(
-        std::time::Duration::from_secs(4),
-        gh.channel_b_release(channel),
-    )
-    .await;
+    let fetched = gh.channel_b_release(channel).await;
     match fetched {
-        Ok(Ok(rel)) => {
+        Ok(rel) => {
             // b-tags compare by build number: lane suffixes (-cuda/-cpu)
             // are the SAME build — string equality would nag a current
             // source-built engine forever.
@@ -4079,17 +4075,17 @@ async fn live_engine_currency(active: &str, asset: &str) -> Check {
                 )
             }
         }
-        Ok(Err(e)) => Check::warn(
+        Err(e) => Check::warn(
             "engine currency",
             format!("check failed ({e:#}) — offline? set GH_TOKEN if rate limited"),
         ),
-        Err(_) => Check::warn("engine currency", "GitHub check timed out after 4s"),
     }
 }
 
-/// mistral.rs engine currency (mistral.rs engine active): live 4s-capped
-/// warn-only probe of the mistral.rs release list, mirroring the llama.cpp
-/// live lane — the daemon's daily survey does not track this repo.
+/// mistral.rs engine currency (mistral.rs engine active): live
+/// warn-only probe of the mistral.rs release list under the shared
+/// bounded-retry policy, mirroring the llama.cpp live lane — the
+/// daemon's daily survey does not track this repo.
 async fn live_mistralrs_currency(active: &str) -> Check {
     let token = std::env::var("GH_TOKEN")
         .or_else(|_| std::env::var("GITHUB_TOKEN"))
@@ -4097,13 +4093,9 @@ async fn live_mistralrs_currency(active: &str) -> Check {
     let Ok(gh) = GhClient::new(token) else {
         return Check::warn("engine currency", "cannot build GitHub client");
     };
-    let fetched = tokio::time::timeout(
-        std::time::Duration::from_secs(4),
-        gh.latest_mistralrs_release(),
-    )
-    .await;
+    let fetched = gh.latest_mistralrs_release().await;
     match fetched {
-        Ok(Ok(rel)) => {
+        Ok(rel) => {
             if rel.tag_name == active {
                 Check::ok(
                     "engine currency",
@@ -4121,11 +4113,10 @@ async fn live_mistralrs_currency(active: &str) -> Check {
                 )
             }
         }
-        Ok(Err(e)) => Check::warn(
+        Err(e) => Check::warn(
             "engine currency",
             format!("check failed ({e:#}) — offline? set GH_TOKEN if rate limited"),
         ),
-        Err(_) => Check::warn("engine currency", "GitHub check timed out after 4s"),
     }
 }
 
@@ -4289,25 +4280,17 @@ async fn doctor_app_currency() -> Vec<Check> {
         return vec![Check::warn("app currency", "cannot build GitHub client")];
     };
     let channel = config().map(|c| c.update_channel).unwrap_or_default();
-    let fetched = tokio::time::timeout(
-        std::time::Duration::from_secs(4),
-        gh.channel_repo_release(&repo, channel),
-    )
-    .await;
+    let fetched = gh.channel_repo_release(&repo, channel).await;
     match fetched {
-        Ok(Ok(rel)) => vec![version_currency_verdict(
+        Ok(rel) => vec![version_currency_verdict(
             "app currency",
             env!("CARGO_PKG_VERSION"),
             &rel.tag_name,
             "blazar upgrade",
         )],
-        Ok(Err(e)) => vec![Check::warn(
+        Err(e) => vec![Check::warn(
             "app currency",
             format!("check failed ({e:#}) — offline? set GH_TOKEN if rate limited"),
-        )],
-        Err(_) => vec![Check::warn(
-            "app currency",
-            "GitHub check timed out after 4s",
         )],
     }
 }
@@ -4351,20 +4334,12 @@ async fn doctor_whisper_currency(d: &BlazarDirs) -> Vec<Check> {
     // Asset-aware: whisper.cpp tags assetless v-releases (v1.9.4) while
     // the b-tags carry the binaries — currency must never advertise a
     // tag the install lane cannot install.
-    let fetched = tokio::time::timeout(
-        std::time::Duration::from_secs(4),
-        blazar_runtime::whisper::channel_target(&gh, channel),
-    )
-    .await;
+    let fetched = blazar_runtime::whisper::channel_target(&gh, channel).await;
     match fetched {
-        Ok(Ok(latest)) => vec![whisper_pin_verdict(d, &installed, &latest, action)],
-        Ok(Err(e)) => vec![Check::warn(
+        Ok(latest) => vec![whisper_pin_verdict(d, &installed, &latest, action)],
+        Err(e) => vec![Check::warn(
             "whisper currency",
             format!("check failed ({e:#}) — offline? set GH_TOKEN if rate limited"),
-        )],
-        Err(_) => vec![Check::warn(
-            "whisper currency",
-            "GitHub check timed out after 4s",
         )],
     }
 }
@@ -10127,21 +10102,17 @@ async fn engine_update_mistralrs(d: &BlazarDirs, tag: Option<String>, check: boo
     let target = if let Some(t) = tag {
         t
     } else {
-        // Currency probe: live 4s-capped latest-tag resolve (same cap
-        // as `blazar doctor`'s mistral.rs row; the daemon's daily
-        // survey tracks llama.cpp only).
+        // Currency probe: live latest-tag resolve under the shared
+        // bounded-retry policy (same policy as `blazar doctor`'s
+        // mistral.rs row; the daemon's daily survey tracks llama.cpp
+        // only).
         let mgr = local_engine_manager(d)?;
-        let fetched = tokio::time::timeout(
-            std::time::Duration::from_secs(4),
-            mgr.gh.latest_mistralrs_release(),
-        )
-        .await;
+        let fetched = mgr.gh.latest_mistralrs_release().await;
         match fetched {
-            Ok(Ok(rel)) => rel.tag_name,
-            Ok(Err(e)) => anyhow::bail!(
+            Ok(rel) => rel.tag_name,
+            Err(e) => anyhow::bail!(
                 "cannot check mistral.rs releases: {e:#} — offline? set GH_TOKEN if rate limited"
             ),
-            Err(_) => anyhow::bail!("mistral.rs release check timed out after 4s"),
         }
     };
     let newer = matches!(
@@ -10218,21 +10189,17 @@ async fn engine_update_sdcpp(d: &BlazarDirs, tag: Option<String>, check: bool) -
     let target = if let Some(t) = tag {
         t
     } else {
-        // Currency probe: live 4s-capped latest-tag resolve (same cap
-        // as the mistral.rs row; sd.cpp releases are frequent — often
-        // several per day around new-model support).
+        // Currency probe: live latest-tag resolve under the shared
+        // bounded-retry policy (same policy as the mistral.rs row;
+        // sd.cpp releases are frequent — often several per day around
+        // new-model support).
         let mgr = local_engine_manager(d)?;
-        let fetched = tokio::time::timeout(
-            std::time::Duration::from_secs(4),
-            mgr.gh.latest_sdcpp_release(),
-        )
-        .await;
+        let fetched = mgr.gh.latest_sdcpp_release().await;
         match fetched {
-            Ok(Ok(rel)) => rel.tag_name,
-            Ok(Err(e)) => anyhow::bail!(
+            Ok(rel) => rel.tag_name,
+            Err(e) => anyhow::bail!(
                 "cannot check sd.cpp releases: {e:#} — offline? set GH_TOKEN if rate limited"
             ),
-            Err(_) => anyhow::bail!("sd.cpp release check timed out after 4s"),
         }
     };
     let newer = matches!(
@@ -10306,20 +10273,16 @@ async fn engine_update_whisper(d: &BlazarDirs, tag: Option<String>, check: bool)
     let target = if let Some(t) = tag {
         t
     } else {
-        // Currency probe: live 4s-capped latest-tag resolve (same cap as
-        // the mistral.rs/sd.cpp rows).
+        // Currency probe: live latest-tag resolve under the shared
+        // bounded-retry policy (same policy as the mistral.rs/sd.cpp
+        // rows).
         let mgr = local_engine_manager(d)?;
-        let fetched = tokio::time::timeout(
-            std::time::Duration::from_secs(4),
-            mgr.gh.latest_whisper_release(),
-        )
-        .await;
+        let fetched = mgr.gh.latest_whisper_release().await;
         match fetched {
-            Ok(Ok(rel)) => rel.tag_name,
-            Ok(Err(e)) => anyhow::bail!(
+            Ok(rel) => rel.tag_name,
+            Err(e) => anyhow::bail!(
                 "cannot check whisper.cpp releases: {e:#} — offline? set GH_TOKEN if rate limited"
             ),
-            Err(_) => anyhow::bail!("whisper.cpp release check timed out after 4s"),
         }
     };
     let newer = matches!(
@@ -10467,11 +10430,7 @@ async fn engine_update_sglang(d: &BlazarDirs, version: Option<String>, check: bo
             "no sglang engine installed — `blazar engine install --kind sglang` first"
         ));
     };
-    let latest = match blazar_runtime::engine::sglang_install::pypi_latest_sglang(
-        std::time::Duration::from_secs(10),
-    )
-    .await
-    {
+    let latest = match blazar_runtime::engine::sglang_install::pypi_latest_sglang().await {
         Ok(v) => v,
         Err(e) => {
             println!("sglang {installed} installed; cannot check PyPI right now: {e:#}");
@@ -11206,12 +11165,8 @@ async fn upstream_update_hint(dirs: &BlazarDirs) {
     let Ok(cfg) = Config::load(dirs) else { return };
     let token = std::env::var("GH_TOKEN").ok();
     let Ok(gh) = GhClient::new(token) else { return };
-    let latest = tokio::time::timeout(
-        std::time::Duration::from_secs(4),
-        gh.channel_b_release(cfg.update_channel),
-    )
-    .await;
-    if let Ok(Ok(rel)) = latest {
+    let latest = gh.channel_b_release(cfg.update_channel).await;
+    if let Ok(rel) = latest {
         if same_build(&active.tag, &rel.tag_name) {
             println!(
                 "engine up to date: {} (channel: {})",
@@ -11282,18 +11237,14 @@ fn spawn_engine_check_task(
             };
             // Fresh config every tick: switching channels in config.toml
             // takes effect on the next check without a daemon restart.
-            // Budget covers the full stable-channel resolve chain
-            // (latest -> v-tag -> nightly-tag.txt -> concrete b-tag).
-            let latest = tokio::time::timeout(
-                std::time::Duration::from_secs(15),
-                gh.channel_b_release(cfg.update_channel),
-            )
-            .await;
-            let Ok(Ok(rel)) = latest else {
+            // Bounded-retry budget covers the full stable-channel
+            // resolve chain (latest -> v-tag -> nightly-tag.txt ->
+            // concrete b-tag) with room to re-issue dropped connections.
+            let latest = gh.channel_b_release(cfg.update_channel).await;
+            let Ok(rel) = latest else {
                 let reason = match latest.as_ref() {
-                    Ok(Err(e)) => format!("{e:#}"),
-                    Err(_) => "timed out after 15s".to_string(),
-                    Ok(Ok(_)) => unreachable!("guarded by the let-else"),
+                    Err(e) => format!("{e:#}"),
+                    Ok(_) => unreachable!("guarded by the let-else"),
                 };
                 tracing::warn!(
                     target: "blazar::engine",

@@ -7,6 +7,7 @@ pub mod build;
 pub mod capability_registry;
 pub mod gh;
 pub mod manifest;
+pub(crate) mod net_probe;
 pub mod sglang_install;
 
 use std::path::{Path, PathBuf};

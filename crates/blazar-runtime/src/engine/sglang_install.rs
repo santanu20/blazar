@@ -19,8 +19,10 @@
 //! macOS are not supported upstream, so this lane refuses there with a
 //! teaching error instead of installing an engine that cannot spawn.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
+
+use super::net_probe::Attempt;
 
 /// Version Blazar installs when the user names none. Pinned, not
 /// "latest": the profile compiler's flag surface and the fit ladder are
@@ -444,10 +446,7 @@ pub fn version_tuple(v: &str) -> Option<(u64, u64, u64)> {
     Some((maj, min, patch))
 }
 
-/// Latest `sglang` version on `PyPI` (`/pypi/sglang/json` endpoint).
-/// Currency checks only — never a gate; failures surface as errors the CLI
-/// turns into a "cannot check" note, not a failed update.
-pub async fn pypi_latest_sglang(timeout: std::time::Duration) -> Result<String> {
+pub async fn pypi_latest_sglang() -> Result<String> {
     #[derive(serde::Deserialize)]
     struct PypiInfo {
         version: String,
@@ -456,22 +455,39 @@ pub async fn pypi_latest_sglang(timeout: std::time::Duration) -> Result<String> 
     struct PypiResp {
         info: PypiInfo,
     }
+    // The client-level timeout is the per-attempt cap: each retry issues
+    // a fresh request on a clone of this client.
     let http = reqwest::Client::builder()
-        .timeout(timeout)
+        .timeout(crate::engine::net_probe::PROBE_ATTEMPT_CAP)
         .user_agent(concat!("blazar/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("pypi http client")?;
-    let resp: PypiResp = http
-        .get("https://pypi.org/pypi/sglang/json")
-        .send()
-        .await
-        .context("pypi sglang query")?
-        .error_for_status()
-        .context("pypi sglang status")?
-        .json()
-        .await
-        .context("pypi sglang json")?;
-    Ok(resp.info.version)
+    crate::engine::net_probe::retry_probe(move || {
+        let http = http.clone();
+        async move {
+            let resp = match http.get("https://pypi.org/pypi/sglang/json").send().await {
+                Ok(resp) => resp,
+                Err(e) => return Attempt::Retry(anyhow!("pypi sglang query: {e}")),
+            };
+            match resp.status() {
+                reqwest::StatusCode::OK => {}
+                other if other.is_server_error() => {
+                    return Attempt::Retry(anyhow!("pypi sglang status {other}"));
+                }
+                other => {
+                    return Attempt::Done(Err(anyhow!("pypi sglang status {other}")));
+                }
+            }
+            match resp.json::<PypiResp>().await {
+                Ok(resp) => Attempt::Done(Ok(resp.info.version)),
+                // A connection reset mid-body truncates the 200 —
+                // decode failures are transport-class, worth one more
+                // attempt.
+                Err(e) => Attempt::Retry(anyhow!("pypi sglang json: {e}")),
+            }
+        }
+    })
+    .await
 }
 
 #[cfg(test)]

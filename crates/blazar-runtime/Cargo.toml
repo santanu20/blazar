@@ -39,6 +39,8 @@ getrandom = { workspace = true }
 tempfile = "3"
 
 [dev-dependencies]
+# test-util: start_paused clocks for the bounded-retry unit tests
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 wiremock = "0.6"
 # integration tests break the store on purpose (row-delete failure pin)
