@@ -1,0 +1,22 @@
+engine | kind | provider | params | ttft_ms_p50 | ttft_ms_p99 | itl_p50_ms | itl_p99_ms | decode_tps | prefill_tps_cold | prefill_tps_cached | load_s | gpu_peak_mib | gpu_power_peak_w | rss_peak_mib | tokens_source
+--------------------------------------------------------------------------------------------------------------------------------------------
+inventory | inventory | inventory | {} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+b11202-cuda | llamacpp | blazar | {'config': 'default'} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+b11202-cuda | llamacpp | blazar | {'config': 'single-stream'} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+v0.9.4 | mistralrs | blazar | {'config': 'default'} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+v0.9.4 | mistralrs | blazar | {'config': 'single-stream'} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+ollama-host | ollama | ollama | {'reference': True} | 108 | 116 | 24.57 | 73.97 | 41.06 | 1351.7 | 8186.5 | - | 6569 | 55.7 | 0 | engine_counters
+ollama-host | ollama | cold-ollama | {'cold': True} | - | - | - | - | - | - | - | - | 5553 | 20.7 | 0 | -
+b11202-cuda | llamacpp | conc-blazar | {'conc': 4, 'rounds': 3} | - | - | - | 79.17 | - | - | - | - | 6157 | - | 0 | -
+v0.9.4 | mistralrs | conc-blazar | {'conc': 4, 'rounds': 3} | - | - | - | 53.95 | - | - | - | - | 6499 | - | 0 | -
+v0.9.4 | mistralrs | reshape | {'reshape': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+b11202-cuda | llamacpp | blazar | {'config': 'default'} | 108 | 117 | 24.29 | 25.15 | 41.16 | 1392.4 | 8119.5 | - | 6151 | 56.1 | 2140 | chunks
+b11202-cuda | llamacpp | blazar | {'config': 'single-stream'} | 108 | 111 | 24.03 | 25.02 | 41.63 | 1362.1 | 8330.2 | - | 5665 | 55.5 | 2105 | chunks
+v0.9.4 | mistralrs | blazar | {'config': 'default'} | 120 | 153 | 45.75 | 56.67 | 21.67 | 275.4 | 266.2 | - | 6947 | 44.3 | 6584 | chunks
+v0.9.4 | mistralrs | blazar | {'config': 'single-stream'} | 122 | 134 | 45.94 | 55.65 | 21.55 | 261.0 | 269.0 | - | 6947 | 44.3 | 6650 | chunks
+ollama-host | ollama | ollama | {'reference': True} | 110 | 111 | 24.49 | 73.72 | 41.18 | 1430.3 | 8498.6 | - | 6569 | 55.4 | 0 | engine_counters
+ollama-host | ollama | cold-ollama | {'cold': True} | - | - | - | - | - | - | - | - | 5553 | 21.6 | 0 | -
+b11202-cuda | llamacpp | conc-blazar | {'conc': 4, 'rounds': 3} | - | - | - | 76.49 | - | - | - | - | 6147 | - | 0 | -
+v0.9.4 | mistralrs | conc-blazar | {'conc': 4, 'rounds': 3} | - | - | - | 79.46 | - | - | - | - | 6499 | - | 0 | -
+b11202-cuda | llamacpp | reshape | {'reshape': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -
+v0.9.4 | mistralrs | reshape | {'reshape': True} | - | - | - | - | - | - | - | - | 0 | - | 0 | -

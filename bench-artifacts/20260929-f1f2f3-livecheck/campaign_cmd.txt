@@ -1,0 +1,1 @@
+--artifacts-dir bench-artifacts/20260929-f1f2f3-livecheck --engines b11202-cuda v0.9.4 --providers blazar --skip-ppl --skip-greedy --skip-tools --skip-features --skip-idle --skip-ctxcurve --skip-media --skip-variants --md bench-artifacts/20260929-f1f2f3-livecheck/benchmark.md
