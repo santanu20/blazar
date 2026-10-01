@@ -76,3 +76,66 @@ Root cause: `admission_blocked` returned one bool for two worlds — "residents 
 Fix (root cause, at the classifier): `SupervisionError::ModelTooLarge(String)` variant + `largest_card_budget(name, incoming)` classifier (Some(best) only when floor exceeds EVERY known candidate card empty; None on any unjudgeable card = fail open) wired into the admission `Refuse` arm; `admission_candidates` extraction shared with `admission_blocked` so the two can never disagree. Gateway maps it 503 immediately (no queue). The post-reservation `Refuse` arm deliberately keeps `AllSlotsBusy`: a card fit at admission, only a concurrent reservation holds it (genuinely temporary).
 
 Live receipt: qwen3-1.7b held in-flight (long stream), then `qwen3.5-9b-bf16+bespoke-nimble-9b` → **0.073 s** 503: `admission floor 19.2 GiB exceeds every GPU budget (largest card 8.0 GiB) even with the box empty — waiting for a slot can never change this. Use a smaller quant (blazar fit), lower the ctx/slots, or serve on a larger card`. Hold stream completed untouched (finish_reason length). Tests: unit__largest_card_budget__impossible_vs_busy_vs_fail_open (impossible/busy/exact-edge/fail-open/arm-reachability), unit__supervision_error__model_too_large_maps_to_503_teaching; full blazar-runtime+blazar-gateway 1056/1056 PASS.
+
+## 8. Parallelism-aware planner (auto TP for SGLang, 2026-10-01)
+
+Planner root cause: fit ladder and admission judged unsharded weights, so multi-GPU boxes either crashed at NCCL spawn (unpinned oversize) or refused loads that TP could serve.
+
+| Proof | Result |
+|---|---|
+| `plan_auto_tp` pure fn | [8188,8188]MiB: 12000MiB→Some(2), 8000→None, 17500→None; [8188]→None; [16000,4000] 17000→None (bottleneck); 3×8188 20000→Some(3) |
+| Emission, unpinned | 12GiB model, 2×8GiB → Tier A full, `--tp-size 2` + NCCL teaching warning, mem-fraction 0.756, no offload |
+| Emission, manual wins | tp_size=2 pin + auto=3 → only `--tp-size 2`, no auto warning |
+| Ladder per-rank honesty | 18GiB model, 2×8GiB → per-rank 9GiB > 7.2GiB budget → Tier C `--cpu-offload-gb 3` + per-rank host share, not a blind Tier A |
+| Admission spanning bypass | dual-GPU fixture, 6000MiB resident: spanning=false + 9000MiB → blocked; spanning=true + 9000 → admitted (15000≤16376 summed pool); spanning=true + 12000 → blocked (18000>16376) |
+| Refusal teaching | impossible + spanning → combined-pool numbers `even sharded across N cards (X GiB per rank)` |
+| Old-engine contract | base 0.5.19 flag fixture unchanged: tp_size pin on old engine still warn-skips (fixture split: base = old surface, extended = new surface with --tp-size) |
+
+Honest boundary: this box is single-GPU — the live daemon takes the planner-None path everywhere (regression below proves byte-same behavior); TP correctness is proven by the unit fixtures and emission tests above, not by a live multi-GPU spawn. Suite: 1594/1594 across 4 crates, clippy clean.
+
+Live single-GPU regression after deploy: dense `qwen3-1.7b` serve ok (44.7 s cold, real reply); `qwen3.5-9b-bf16+bespoke-nimble-9b` → byte-same pre/post-deploy guard refusal (MemAvailable teaching; spawn_mem_guard fires ahead of admission when on). The ModelTooLarge 503 mapping and text are pinned byte-exact by unit__supervision_error__model_too_large_maps_to_503_teaching; single card means no sharding note appears (correct: planner None, spanning false). healthz ok.
+
+## 9. GPU rank pinning + mistral.rs layer-spanning (2026-10-01)
+
+- Engine trait `spawn(argv, endpoint, spawn_env)`: per-spawn env applied AFTER `engine_env`, same-key override logged (never silent); all four engine impls + router/per-instance call sites updated; router passes empty (single-process by construction).
+- Env merge proof on a REAL child (`/bin/sh printenv`, unit__spawn_child_env__spawn_env_overrides_engine_env_last_wins): spawn-time value wins the shared key, engine-only key survives, override visible in logs.
+- Pin contract (unit__spanning_env_from_probe__atomic_pci_pair_or_fail_open): ranks 2 + 2 probed NVIDIA cards -> exactly [CUDA_DEVICE_ORDER=PCI_BUS_ID, CUDA_VISIBLE_DEVICES=0,1]; prefix for manual tp < card count; probe short / non-spanning / single rank -> EMPTY env (fail-open). Indices derive from a FRESH nvidia-smi probe (PCI order) at spawn time, never the mixed llamacpp census (enumeration-order mismatch hazard).
+- mistral.rs spanning (unit__plan_mistralrs_sum_span__summed_pool_not_bottleneck): 17 GiB on 16+4 GiB pair -> Some(2) (uneven layer split legal; sglang TP refuses the same load per-rank 8.5>4); fits-one-card / over-sum / single-card -> None. Ground truth: `mistralrs serve --help` — `-n --device-layers` "Omit for automatic device mapping"; no --tp-size exists on mistral.rs 0.9.4.
+- Admission/wiring: mistralrs arm rides the existing spanning bypass (summed pool) + spanning-aware ModelTooLarge; `wants_pick` now gated on !spanning (single-card scoping would mis-scope every sharded estimate, incl. manual tp and mistral.rs).
+- Single-GPU live boundary: this box probes 1 NVIDIA card, so spanning_spawn_env and both arms stay inert by construction; regression below proves byte-identical behavior. Multi-GPU correctness is pinned by the unit fixtures above (no multi-GPU box available).
+- Suite after the change: 1597/1597 PASS (4-crate nextest; 1 slow + 9 leaky pre-existing); clippy 0 warnings.
+
+## 10. 20261001 — Federation v1: peer presence + bare-name fallback (LIVE, two real daemons)
+
+Design: local store-only resolution was the seam. Fallback lives at the openai_proxy lane only (after split_remote, before body rewrites): local miss (pure `not found`, ambiguous stays local) -> peers_serving() (60s TTL presence cache of peer /v1/models, live-filter, least-in-flight, config-order stable) -> forward_with_health with `peer:model` (inherits STRIP_REQUEST: caller `authorization` never forwarded; remote.key becomes bearer). /v1/models merges peer ids (owned_by blazar-remote, snapshot semantics). Kill switch: `remote_fallback = false` (default true, meaningful only with remotes).
+
+Box: primary :11435 (systemd) + sandbox peer fed2 :11436 (XDG_CONFIG_HOME/XDG_DATA_HOME isolated store+config; engine rows sqlite-copied; engines dir symlinked to primary binaries; GGUF reflink-copied, adopted as fedtest-0.6b).
+
+| Proof | Request to PRIMARY | Result |
+|---|---|---|
+| P1 explicit prefix | `fed2:fedtest-0.6b` | 3s, real completion ("**OK**") from peer child |
+| P2 bare fallback | `fedtest-0.6b` (no local row) | 0s warm, real completion "peer-ok" routed to fed2 |
+| P3 models merge | GET /v1/models | lists `fedtest-0.6b:q4_0` (owned_by blazar-remote) |
+| P4 peer down | bare request after kill -TERM fed2 | 0s `remote "fed2" unreachable` — fast-fail, no hang; presence stale-within-TTL routes to forward which fails honestly (explicit-route contract); after TTL expiry/no claim -> existing local 404 teaching |
+| P5 local regression | `qwen3-1.7b` | 40s cold spawn, reply ok — local lane untouched |
+
+Sandbox gotchas receipted: `ln -sfn` nests when target dir exists (rm first); nohup daemons die on tool timeout (use setsid); env-isolated daemons unfindable by pkill -f (match /proc/N/environ or ss port); registry pull stalled twice (reflink copy instead — pull-dialect filename with quant tail required); config.toml `remotes = []` inline means sed-replace not append (TOML duplicate key = boot fail).
+
+State after test: fed2 killed, primary config restored (remotes empty, backup /tmp/opencode/config.toml.bak-fed), sandbox removed, primary healthz ok. Tests: gateway+core+runtime suites green, clippy 0. Not committed (shared index).
+
+## 11. 20261001 — HW-agnostic pinning (Vulkan) + federation breadth
+
+**Vulkan pinning contracts (ground-truth experiments, real sd-server vulkan build):** E1 plain run lists `0 = Intel(R) Graphics (RPL-S) / 1 = NVIDIA RTX 4070` (llvmpipe auto-excluded by ggml). E2 `GGML_VK_VISIBLE_DEVICES=0` → only Intel, still labeled `Vulkan0`. E3 `GGML_VK_VISIBLE_DEVICES=1` → only NVIDIA, RELABELED `Vulkan0` — the env FILTERS AND RENUMBERS child ids. E4 `CUDA_VISIBLE_DEVICES=0` on a vulkan child changes nothing — CUDA env does not touch Vulkan enumeration.
+
+**New pure core:** `spanning_env_from_census(ranks, probed_nvidia, census_names, lane_allows_vk, argv_device_free)` — Vulkan priority for llamacpp spans whose census names parse as `Vulkan<N>` (strict subset → `GGML_VK_VISIBLE_DEVICES=<ids>`; identity set → no emission), else the existing CUDA/ROCm PCI pair, else empty fail-open. `parse_vk_id` strict token parse. Census provenance = the llamacpp child's own `--list-devices` ids, so no vendor lists. Emission requires device-id-free argv (`--tensor-split` ratios/`--tp-size` only) — the renumber hazard is void; comment at the emission site audits any future device-id argv. Unit: unit__spanning_env_from_census__vulkan_priority_cuda_fallback_fail_open (subset / identity no-op / CUDA names skip / malformed fail-open / count-short fail-open / non-llamacpp skip / argv-ids → CUDA pair keeps its shipped probe-count contract).
+
+**Federation breadth:** shared `try_fallback_forward` + `FallbackLane::{OpenAi, OllamaChat}` — one miss-detection path (pure not-found, ambiguity stays local), `peers_serving_with_refresh` adds one throttled forced re-probe per remote (≤1/10s, `PeerPresence.last_forced`, pure gate `force_refresh_due` unit-tested) so a peer that gains a model inside the 60s TTL is found. Hooks: OpenAI lane (chat/completions/embeddings/images via the proxy hook), ollama `/api/chat` (translated remote round-trip, token budgets ride like the explicit lane), `/v1/images/generations` (byte forward, peer gate owns caps). `/api/generate` stays local-only — it refuses remote prefixes by design (F14); fallback honors the same contract.
+
+**Live proofs (primary :11435 + sandbox peer fed2 :11436, real daemons, real children):**
+- P6 `/api/chat` bare `fedtest-0.6b` → peer reply `peer-ok` through the ollama translator ✓
+- P7 `/v1/embeddings` bare → real 1024-dim vector from peer ✓
+- P8 peer renamed its model + restarted; primary presence cache TTL-fresh with the OLD listing; bare `fedrenamed-0.6b` → discovered via throttled re-probe → `refresh-ok` ✓ (without the fix: local 404 for up to 60s)
+- Regression: local qwen3-1.7b serve ok (after freeing the shared GPU), 9B+nimble guard teaching byte-same, `/api/generate` bare peer name → local 404 by contract ✓
+- Contention finding (honest, not a regression): a peer on the SAME box spawns children the primary cannot evict (separate ledgers) — a marginal-fit spawn crashed at sglang prefill cuda-graph capture with 4.4GB held by the peer's 0.6b child. Production peers belong on separate boxes; documented here as the one-GPU-box caveat.
+
+**Suite:** 1453/1453 (core+runtime+gateway) + supervisor VK tests, clippy 0. Config restored (remotes = []), sandbox removed, single daemon on :11435.
