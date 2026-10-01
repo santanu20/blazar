@@ -183,7 +183,55 @@ ollama cloud stats (their telemetry product, not a local-server concern),
 DeepSeek/roadmap model-support items (engine-level, arrive via
 `engine update`), `--cache-disk` itself (not yet upstream).
 
-## 9. Sources (selection)
+## 9. Round-3 sweep — sdcpp + mistral.rs + whisper lanes (2026-10-02)
+
+The three lanes never individually audited. Sources: leejet/stable-diffusion.cpp
++ EricLBuehler/mistral.rs + ggml-org/whisper.cpp top open issues (GitHub API,
+2026-10-02) and community search (reddit/dev.to/arXiv on whisper streaming).
+
+### stable-diffusion.cpp
+
+| Complaint | Verdict (evidence) |
+|---|---|
+| #2081 sd-server accepts requests during startup window, spins CPU, never responds | FIXED-BY-ARCH: children are ready-gated (TCP health probe + boot-smoke) before the gateway routes to them |
+| #1988 sd-server needs API-key support | FIXED-BETTER: gateway scoped keys (model scope + budgets) + supervisor-minted child auth (`engine_impl.rs:1043`) |
+| #2022/#2073 Vulkan iGPU census reports "available 0.00 MB", model load fails | GOVERNED: `probe.rs:235-241` treats a zero-memory census as empty and falls back to nvidia-smi; `images.rs` submit gate is fail-open where VRAM is unmeasurable, teaching-400 + `vram_overcommit` lever where measurable |
+| #2015 `--offload-to-cpu` pins past GTT budget, kills device | GOVERNED: offload is a posture choice with fit math (`profile.rs:3218-3237`), not a blind default; `--vae-tiling` and `--diffusion-fa` are gated knobs (`profile.rs:3005,3111`, `config.rs:532`) |
+| #1971 please ship non-AVX-512 CPU builds | RESOLVED upstream: current releases ship one baseline `bin-win-cpu-x64.zip`; our CPU pattern excludes cuda/rocm/vulkan and picks it — no host-CPU detection needed |
+| "./"-walk symlink loops under a service daemon cwd | FIXED: `child_cwd` anchor seats every child in its engine install dir (`engine_impl.rs:332-343`) — blazar hit and fixed this class independently |
+| #2078/#2003/#1990 artifact/black-frame/Metal-tensor bugs, LTX/MiniMax/Wan video regressions | UPSTREAM kernels — arrive via engine updates |
+
+### mistral.rs
+
+| Complaint | Verdict |
+|---|---|
+| #2421 projector auto-discovery binds the directory's only mmproj to ANY model, crashes text-only GGUFs | FIXED-BETTER: blazar projector policy default `lazy` = text-only spawn, mmproj attached on demand (`config.rs:780-870`, incl. `mmproj_offload`/`mmproj_auto`/`mmproj_device`) |
+| #2419 macOS CPU available memory reported as 0 MB | COVERED-LOUD: our spawn-time guard reads sysinfo `MemAvailable` with a hard floor and fails with a named error (never silent starvation); the 0-MB bug itself was mistral.rs's own reading |
+| #2343 concurrent throughput does not scale above serial (H100, v0.9.0) | UPSTREAM PagedAttention bug; blazar admission bounds the queue, reshape observability tracked |
+| #2460/#2435/#2411 ISQ deadlocks, GCC-13 CUDA link errors, malformed wheels | MITIGATED-BY-ARCH: pinned engine versions + boot-smoke gate reject bad builds at install time |
+| #2441/#2427 tojson abort, tool-call tags leaking into reasoning content | UPSTREAM parser bugs |
+
+### whisper.cpp
+
+| Complaint | Verdict |
+|---|---|
+| Streaming ASR quality: "simplistic streaming mode, disjoint 30s-padded segments, unsuitable for deployment" (arXiv); "feels laggy for live apps" (dev.to) | **GAP (feature candidate F6):** blazar exposes batch `/v1/audio/transcriptions` only — a chunked streaming endpoint with rolling partial hypotheses is the one true lane gap. Sizable; upstream segment semantics limit ceiling quality |
+| #4075 Metal 10x slowdown with non-default `audio_ctx` | IMMUNE: blazar never sets `audio_ctx` (defaults) |
+| #4018 non-ASCII `-m` model path aborts (0xC0000409) on MSVC Windows | WATCHLIST (W1): non-ASCII Windows homes would crash the whisper child; mitigation when implemented = Windows short-path (8.3) normalization of child argv |
+| #4041-4043 Go-binding CString leaks | N/A: blazar spawns binaries, no bindings |
+| #4090/#4059 unvalidated GGUF header fields → OOB read/write | COVERED (class): pull-layer checksum/provenance invariants |
+| #4026 no macOS binaries in releases | TAUGHT: `whisper_asset_patterns` returns an explicit build-from-source instruction for macOS (`gh.rs:1204-1213`) |
+
+### Round-3 additions to the fix list
+
+- **F6 (feature candidate).** Streaming transcription endpoint: chunked audio
+  ingestion + rolling partial results on `/v1/audio/transcriptions` (SSE),
+  wrapping the lane's segment semantics. Large; propose as its own wave.
+- **W1 (watchlist).** Non-ASCII Windows model-path abort (whisper #4018):
+  normalize child argv to 8.3 short paths on Windows when implementing;
+  low frequency, cheap guard when touched.
+
+## 10. Sources (selection)
 
 - GitHub Search API top-reacted open issues: ollama/ollama,
   sgl-project/sglang, ggml-org/llama.cpp (2026-10-02 snapshots).
