@@ -1525,8 +1525,9 @@ async fn e2e__audio_capabilities__empty_install_reports_gaps_without_booting() {
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
-/// Job routes: unknown id 404s with the gateway-owned lifetime truth;
-/// a hostile id (path/meta characters) 400s before any lookup.
+/// Job routes: unknown id 404s with the durable-ledger lifetime truth;
+/// a hostile id (path/meta characters) 400s before any lookup. The
+/// unified `/v1/jobs` plane teaches the same contract on its own routes.
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn e2e__audio_jobs__unknown_404_and_invalid_id_400() {
@@ -1541,15 +1542,309 @@ async fn e2e__audio_jobs__unknown_404_and_invalid_id_400() {
     let r: serde_json::Value = resp.json().await.unwrap();
     let msg = r["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        msg.contains("die with the gateway process"),
+        msg.contains("durable records live at /v1/jobs"),
         "lifetime truth in the 404: {r}"
     );
+    // Unified plane: empty ledger lists cleanly, unknown ids 404.
+    let resp = c
+        .get(format!("{}/v1/jobs?kind=audio&limit=5", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let list: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(list["object"], "blazar.job.list", "list shape: {list}");
+    let resp = c
+        .get(format!("{}/v1/jobs/job-does-not-exist", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
     let resp = c
         .post(format!("{}/v1/audio/jobs/..%2Fetc/cancel", ts.base))
         .send()
         .await
         .unwrap();
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Request lifecycle (v0.15): a tracked generation gets a card (model
+/// stamped from the body sniff, request-id header echoed), lands in the
+/// terminal ring after the body drains, and the stop routes teach their
+/// lifetime contract on unknown ids. A hostile id 400s before any lookup.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__requests__card_lifecycle_and_stop_contracts() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let request_id = resp
+        .headers()
+        .get("x-blazar-request-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("tracked lane stamps x-blazar-request-id")
+        .to_string();
+    // Drain the body so the card reaches its terminal state.
+    let _body: serde_json::Value = resp.json().await.unwrap();
+
+    let list: serde_json::Value = c
+        .get(format!("{}/v1/requests?state=done&model=m1", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list["object"], "blazar.request.list", "list shape: {list}");
+    let card = list["data"]
+        .as_array()
+        .and_then(|d| d.iter().find(|c| c["id"].as_str() == Some(&request_id)))
+        .unwrap_or_else(|| panic!("card {request_id} in terminal list: {list}"));
+    assert_eq!(card["state"], "done");
+    assert_eq!(card["model"], "m1");
+    assert_eq!(card["status"], 200);
+
+    let got: serde_json::Value = c
+        .get(format!("{}/v1/requests/{request_id}", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(got["id"], *card["id"].as_str().unwrap());
+    // Terminal card: no live stop URLs anymore.
+    assert!(got.get("cancel_url").is_none());
+
+    // Unknown id teaches the lifetime; traversal 400s.
+    let resp = c
+        .post(format!("{}/v1/requests/req_nope/cancel", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let resp = c
+        .post(format!("{}/v1/requests/..%2Fetc/interrupt", ts.base))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 400, "encoded traversal is an invalid id");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Capacity endpoint: shape contract only (device count depends on the
+/// host — CI boxes may have no nvidia-smi; the endpoint must answer with
+/// an honest empty census + note, never error).
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__capacity__shape_contract() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let resp = c
+        .get(format!("{}/api/capacity", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["object"], "blazar.capacity", "shape: {v}");
+    assert!(v["devices"].is_array());
+    assert!(v["residents"].is_array());
+    assert!(v["external"].is_array());
+    assert!(
+        !v["notes"].as_array().unwrap().is_empty(),
+        "honesty notes present: {v}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__explain__card_provenance_and_unknown_404() {
+    let ts = start(Config::default()).await;
+    let c = client();
+
+    // Known model (the harness seeds m1 as a GGUF row with the stub
+    // engine active): the card must name its sources, not just values.
+    let resp = c
+        .get(format!("{}/api/explain/m1", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["object"], "blazar.explain", "shape: {v}");
+    assert_eq!(v["model"]["name"], "m1");
+    assert_eq!(v["model"]["format"], "gguf");
+    // This harness store seeds models but NO engine rows — the card must
+    // say so honestly (teaching reason), never fabricate a lane.
+    assert_eq!(v["engine"]["source"], "error", "no engine rows: {v}");
+    assert!(
+        v["engine"]["reason"]
+            .as_str()
+            .is_some_and(|s| s.contains("no engine installed")),
+        "teaching reason for the engineless store: {v}"
+    );
+    let ctx = &v["context"];
+    assert!(
+        ctx["requested_source"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("config default_ctx = ")),
+        "no overlay on m1 — requested ctx must cite the config default: {ctx}"
+    );
+    assert!(
+        ctx["effective_source"]
+            .as_str()
+            .is_some_and(|s| s.contains("not resident")),
+        "m1 is not spawned in the harness — effective ctx must say so: {ctx}"
+    );
+    assert!(
+        v["speculation"]["mode"].as_str().is_some(),
+        "spec mode always resolves (static tier): {v}"
+    );
+    assert!(
+        v["cache"]["kv_k"].is_string(),
+        "kv grade or auto ladder: {v}"
+    );
+    assert!(v["residents"].as_array().is_some_and(|r| r.is_empty()));
+
+    // Tag-form alias (`name:quant`, the display shape /api/tags emits)
+    // resolves through the canonical ladder — regression pin for the
+    // explain 404 on colon forms.
+    let resp = c
+        .get(format!("{}/api/explain/m1:bf16", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "tag form must resolve: ");
+    let card = resp.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(card["model"]["name"].as_str(), Some("m1"));
+
+    // Unknown model: teaching 404, never a half-empty card.
+    let resp = c
+        .get(format!("{}/api/explain/nope", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("not found") || text.contains("unknown model"),
+        "teaching 404: {text}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__model_doctor__job_cert_and_stored_caps() {
+    let ts = start(Config::default()).await;
+    let c = client();
+
+    // Unknown model: teaching 404 BEFORE any job row exists.
+    let resp = c
+        .post(format!("{}/api/model-doctor", ts.base))
+        .json(&serde_json::json!({"model": "nope"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("not found") || text.contains("unknown model"),
+        "teaching 404: {text}"
+    );
+
+    // Known model: a durable doctor job is created and runs the probes
+    // through the real gateway path (stub engines — verdicts are theirs,
+    // the CONTRACT here is the shape: every cap classified, terminal
+    // state reached, cert queryable after).
+    let resp = c
+        .post(format!("{}/api/model-doctor", ts.base))
+        .json(&serde_json::json!({"model": "m1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "accepted: body checked next");
+    let started: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(started["object"], "blazar.doctor");
+    let id = started["id"].as_str().expect("job id").to_string();
+    assert!(started["poll_url"]
+        .as_str()
+        .is_some_and(|u| u.contains(&id)));
+
+    let cert;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let resp = c
+            .get(format!("{}/v1/jobs/{id}", ts.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let job: serde_json::Value = resp.json().await.unwrap();
+        match job["status"].as_str().unwrap_or("") {
+            "completed" => {
+                cert = job["result"].clone();
+                break;
+            }
+            "failed" | "cancelled" => panic!("doctor job ended {job}"),
+            _ => {}
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "doctor job did not finish in 60s: {job}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert_eq!(cert["object"], "blazar.model-doctor", "cert shape: {cert}");
+    assert_eq!(cert["model"], "m1");
+    let caps = cert["caps"].as_object().expect("caps map");
+    for name in [
+        "chat",
+        "stream",
+        "json",
+        "tools",
+        "embeddings",
+        "vision",
+        "think",
+    ] {
+        let v = caps
+            .get(name)
+            .unwrap_or_else(|| panic!("cap {name} present: {cert}"));
+        let status = v["status"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{name} status"));
+        assert!(
+            ["PASS", "FAIL", "N/A"].contains(&status),
+            "{name} classified honestly, got {status}"
+        );
+        assert!(
+            v["receipt"].as_str().is_some_and(|r| !r.is_empty()),
+            "{name} carries a receipt"
+        );
+    }
+
+    // The certificate is queryable by model after the run.
+    let resp = c
+        .get(format!("{}/api/model-doctor/m1", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let stored: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(stored["object"], "blazar.model-doctor");
+    assert!(stored["caps"].is_object());
     ts.state.sup.shutdown_all().await.unwrap();
 }
 

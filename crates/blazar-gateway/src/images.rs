@@ -663,6 +663,22 @@ async fn deliver_native(
     let Some(job_id) = submitted.get("id").and_then(serde_json::Value::as_str) else {
         return openai_error(502, "engine accepted the job but returned no id");
     };
+    // Durable ledger: every native submission gets a row (async handles,
+    // sync awaits and SSE relays alike) so `/v1/jobs` shows the full
+    // render history and a completed result survives a restart. The
+    // child accepted the job, so it lands straight in running.
+    state.jobs.record_created(
+        &state,
+        job_id,
+        if video { "video" } else { "image" },
+        parsed.get("model").and_then(serde_json::Value::as_str),
+        serde_json::json!({
+            "engine": engine.name,
+            "native_path": native_path,
+            "load_ms": load_ms,
+        }),
+    );
+    state.jobs.record_running(&state, job_id);
     match mode {
         DeliveryMode::AsyncNative => async_handle_response(submitted, load_ms),
         DeliveryMode::StreamNative => stream_native_job(state, engine, job_id.to_string()),
@@ -964,6 +980,43 @@ async fn cancel_child_job(state: &AppState, engine: &blazar_runtime::EngineRef, 
     .await;
 }
 
+/// Poll the live children for a job, first owner wins. Shared by the
+/// lane's own `jobs_get` and the unified `/v1/jobs/{id}` read plane;
+/// every poll keeps its MM5 activity bracket so an actively-polled job
+/// holds its child warm exactly as before.
+pub(crate) async fn poll_live_child(
+    state: &AppState,
+    model: Option<&str>,
+    job_id: &str,
+) -> Option<serde_json::Value> {
+    for engine in live_sdcpp_children(state, model) {
+        state.sup.begin_request(&engine.name);
+        let polled = poll_child_job(state, &engine, job_id).await;
+        state.sup.end_request(&engine.name);
+        if let Ok(Some(job)) = polled {
+            return Some(job);
+        }
+        // Not this child's job, or the child flapped mid-poll: either
+        // way, try the siblings.
+    }
+    None
+}
+
+/// Locate the owning child and fire a cancel at it — the unified
+/// `/v1/jobs/{id}/cancel` path, which has no `?model=` hint and relies
+/// on the engine name recorded at submit time.
+pub(crate) async fn cancel_child_best_effort(state: &AppState, engine: Option<&str>, job_id: &str) {
+    for child in live_sdcpp_children(state, engine) {
+        if poll_child_job(state, &child, job_id)
+            .await
+            .is_ok_and(|found| found.is_some())
+        {
+            cancel_child_job(state, &child, job_id).await;
+            return;
+        }
+    }
+}
+
 /// Map a completed native job to the `OpenAI` images shape the sync
 /// generations contract promises: `{created, data: [{b64_json}...],
 /// output_format}`.
@@ -1022,6 +1075,7 @@ async fn await_native_job(
             // answer nobody will read (best-effort; upstream reset
             // probe 2026-09-22).
             cancel_child_job(state, engine, job_id).await;
+            state.jobs.record_cancelled(state, job_id);
             return Err(Box::new(openai_error(
                 504,
                 &format!(
@@ -1037,10 +1091,16 @@ async fn await_native_job(
                 transport_fails = 0;
                 let status = job.get("status").and_then(serde_json::Value::as_str);
                 if matches!(status, Some("completed" | "failed" | "cancelled")) {
+                    crate::jobs::mirror_child_terminal(state, job_id, &job);
                     return Ok(job);
                 }
             }
             Ok(None) => {
+                state.jobs.record_failed(
+                    state,
+                    job_id,
+                    "job vanished from the engine child mid-generation",
+                );
                 return Err(Box::new(openai_error(
                     502,
                     "job vanished from the engine child mid-generation",
@@ -1050,6 +1110,9 @@ async fn await_native_job(
                 transport_fails += 1;
                 if transport_fails >= JOB_POLL_TRANSPORT_RETRIES {
                     state.sup.reap_dead_children().await;
+                    state
+                        .jobs
+                        .record_failed(state, job_id, "engine child died mid-generation");
                     return Err(Box::new(openai_error(
                         502,
                         "engine child died mid-generation",
@@ -1085,6 +1148,7 @@ fn stream_native_job(
                 // gone at budget expiry, so stop the render instead of
                 // burning the GPU to completion (best-effort cancel).
                 cancel_child_job(&state, &engine, &job_id).await;
+                state.jobs.record_cancelled(&state, &job_id);
                 let msg = format!(
                     "generation did not finish within {budget_secs}s — raise \
                      media_job_wait_secs or use \"async\": true"
@@ -1104,6 +1168,11 @@ fn stream_native_job(
                     job
                 }
                 Ok(None) => {
+                    state.jobs.record_failed(
+                        &state,
+                        &job_id,
+                        "job vanished from the engine child mid-generation",
+                    );
                     let frame = format!(
                         "event: error\ndata: {}\n\n",
                         serde_json::json!({
@@ -1117,6 +1186,11 @@ fn stream_native_job(
                 Err(()) => {
                     transport_fails += 1;
                     if transport_fails >= JOB_POLL_TRANSPORT_RETRIES {
+                        state.jobs.record_failed(
+                            &state,
+                            &job_id,
+                            "engine child died mid-generation",
+                        );
                         let frame = format!(
                             "event: error\ndata: {}\n\n",
                             serde_json::json!({
@@ -1205,7 +1279,8 @@ fn async_handle_response(submitted: serde_json::Value, load_ms: u128) -> Respons
 }
 
 /// GET /v1/images/jobs/{id}?model=NAME — poll a native job on the
-/// LIVE child. Never spawns; jobs die with their child.
+/// LIVE child first (never spawns); the durable ledger answers when the
+/// child is gone, so completed results survive eviction and restarts.
 pub async fn jobs_get(
     State(state): State<Arc<AppState>>,
     Path(job_id): Path<String>,
@@ -1217,37 +1292,49 @@ pub async fn jobs_get(
     {
         return openai_error(400, "invalid job id");
     }
-    let children = live_sdcpp_children(&state, params.model.as_deref());
-    if children.is_empty() {
+    let children_empty = live_sdcpp_children(&state, params.model.as_deref()).is_empty();
+    if children_empty {
         return openai_error(
             404,
             "no live diffusion child serves jobs — POST /v1/images/generations boots one",
         );
     }
-    for engine in &children {
-        // Every client poll counts as activity (audit MM5): async jobs
-        // have no gateway-side bracket, so an actively-polled job keeps
-        // its child warm; once the client stops polling, normal idle
-        // eviction applies (the documented die-with-child contract).
-        state.sup.begin_request(&engine.name);
-        let polled = poll_child_job(&state, engine, &job_id).await;
-        state.sup.end_request(&engine.name);
-        if let Ok(Some(job)) = polled {
-            return Response::builder()
-                .status(200)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(serde_json::to_vec(&job).unwrap_or_default()))
-                .unwrap_or_else(|e| {
-                    openai_error(500, &format!("response build: {e}")).into_response()
-                });
+    if let Some(job) = poll_live_child(&state, params.model.as_deref(), &job_id).await {
+        crate::jobs::mirror_child_terminal(&state, &job_id, &job);
+        return Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&job).unwrap_or_default()))
+            .unwrap_or_else(|e| {
+                openai_error(500, &format!("response build: {e}")).into_response()
+            });
+    }
+    // No live child owns the job: the ledger is the afterlife. A
+    // non-terminal row means the child died mid-render — close it
+    // honestly instead of leaving a forever-running zombie row.
+    let row = state
+        .with_store(|s| s.get_job(&job_id).ok().flatten())
+        .flatten();
+    if let Some(row) = row {
+        if matches!(row.state.as_str(), "queued" | "running") {
+            state.jobs.record_failed(
+                &state,
+                &job_id,
+                "job's engine child is gone (eviction, crash or restart) — \
+                 resubmit the generation",
+            );
         }
-        // Not this child's job, or the child flapped mid-poll: either
-        // way, try the siblings.
+        let fresh = state
+            .with_store(|s| s.get_job(&job_id).ok().flatten())
+            .flatten();
+        if let Some(fresh) = fresh {
+            return axum::Json(crate::jobs::row_payload(&fresh)).into_response();
+        }
     }
     openai_error(
         404,
         "job not found on any live diffusion child — jobs die with their engine child \
-         (eviction, crash or restart); submit a new generation",
+         (eviction, crash or restart); completed results live on at /v1/jobs/{id}",
     )
 }
 
@@ -1284,12 +1371,31 @@ pub async fn jobs_cancel(
         }
     }
     let Some((job, engine)) = last_known else {
+        // No live child owns it: the durable ledger decides. A terminal
+        // row answers as-is; an in-flight row belongs to a dead child,
+        // so the cancel intent is satisfied by closing it.
+        let row = state
+            .with_store(|s| s.get_job(&job_id).ok().flatten())
+            .flatten();
+        if let Some(row) = row {
+            if matches!(row.state.as_str(), "queued" | "running") {
+                state.jobs.record_cancelled(&state, &job_id);
+            }
+            let fresh = state
+                .with_store(|s| s.get_job(&job_id).ok().flatten())
+                .flatten();
+            if let Some(fresh) = fresh {
+                return axum::Json(crate::jobs::row_payload(&fresh)).into_response();
+            }
+        }
         return openai_error(
             404,
-            "job not found on any live diffusion child — jobs die with their engine child",
+            "job not found on any live diffusion child — jobs die with their engine child; \
+             completed records live on at /v1/jobs/{id}",
         );
     };
     if job.get("completed").and_then(serde_json::Value::as_bool) == Some(true) {
+        crate::jobs::mirror_child_terminal(&state, &job_id, &job);
         return Response::builder()
             .status(200)
             .header(header::CONTENT_TYPE, "application/json")
@@ -1334,11 +1440,16 @@ pub async fn jobs_cancel(
         }
     }
     match poll_child_job(&state, &engine, &job_id).await {
-        Ok(Some(verdict)) => Response::builder()
-            .status(200)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_vec(&verdict).unwrap_or_default()))
-            .unwrap_or_else(|e| openai_error(500, &format!("response build: {e}")).into_response()),
+        Ok(Some(verdict)) => {
+            crate::jobs::mirror_child_terminal(&state, &job_id, &verdict);
+            Response::builder()
+                .status(200)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&verdict).unwrap_or_default()))
+                .unwrap_or_else(|e| {
+                    openai_error(500, &format!("response build: {e}")).into_response()
+                })
+        }
         _ => openai_error(
             502,
             "cancel was sent but the engine child did not confirm job state afterwards",

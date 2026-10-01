@@ -1022,7 +1022,18 @@ pub async fn chat(
         .is_some_and(|s| !s.is_empty())
         || req.get("format").is_some_and(|v| !v.is_null());
     let mut sem_ctx: Option<semcache::SemCtx> = None;
-    if !req["stream"].as_bool().unwrap_or(true) && !constrained {
+    // Tool-result gate: requests carrying role=tool messages bypass the
+    // cache in both directions (lookup above, store below) — tool outputs
+    // are not in the serving fingerprint, so a prompt-similarity hit could
+    // serve an answer computed against different tool results.
+    let tool_gate = semcache::has_tool_result_messages(&req);
+    if tool_gate {
+        state
+            .sem
+            .tool_bypasses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if !req["stream"].as_bool().unwrap_or(true) && !constrained && !tool_gate {
         let sc = &state.config.semantic_cache;
         match semcache::directive(
             sc.enabled,
@@ -3432,13 +3443,17 @@ fn cache_metrics(state: &AppState, merged: &mut String) {
     );
     let _ = write!(
         merged,
-        "# HELP blazar_semantic_cache_hits_total Responses served from the semantic cache (x-blazar-cache)\n# TYPE blazar_semantic_cache_hits_total counter\nblazar_semantic_cache_hits_total {}\n# HELP blazar_semantic_cache_misses_total Cache-eligible requests that missed (and were stored)\n# TYPE blazar_semantic_cache_misses_total counter\nblazar_semantic_cache_misses_total {}\n# HELP blazar_semantic_cache_stores_total Responses filed into the semantic cache\n# TYPE blazar_semantic_cache_stores_total counter\nblazar_semantic_cache_stores_total {}\n# HELP blazar_semantic_cache_embed_failures_total Embed-model failures that bypassed the cache (request still served live)\n# TYPE blazar_semantic_cache_embed_failures_total counter\nblazar_semantic_cache_embed_failures_total {}\n# HELP blazar_semantic_cache_entries Live (non-expired) semantic cache entries\n# TYPE blazar_semantic_cache_entries gauge\nblazar_semantic_cache_entries {}\n",
+        "# HELP blazar_semantic_cache_hits_total Responses served from the semantic cache (x-blazar-cache)\n# TYPE blazar_semantic_cache_hits_total counter\nblazar_semantic_cache_hits_total {}\n# HELP blazar_semantic_cache_misses_total Cache-eligible requests that missed (and were stored)\n# TYPE blazar_semantic_cache_misses_total counter\nblazar_semantic_cache_misses_total {}\n# HELP blazar_semantic_cache_stores_total Responses filed into the semantic cache\n# TYPE blazar_semantic_cache_stores_total counter\nblazar_semantic_cache_stores_total {}\n# HELP blazar_semantic_cache_embed_failures_total Embed-model failures that bypassed the cache (request still served live)\n# TYPE blazar_semantic_cache_embed_failures_total counter\nblazar_semantic_cache_embed_failures_total {}\n# HELP blazar_semantic_cache_tool_bypasses_total Tool-result requests that skipped lookup+store (fingerprint does not cover tool outputs)\n# TYPE blazar_semantic_cache_tool_bypasses_total counter\nblazar_semantic_cache_tool_bypasses_total {}\n# HELP blazar_semantic_cache_entries Live (non-expired) semantic cache entries\n# TYPE blazar_semantic_cache_entries gauge\nblazar_semantic_cache_entries {}\n",
         state.sem.hits.load(std::sync::atomic::Ordering::Relaxed),
         state.sem.misses.load(std::sync::atomic::Ordering::Relaxed),
         state.sem.stores.load(std::sync::atomic::Ordering::Relaxed),
         state
             .sem
             .embed_failures
+            .load(std::sync::atomic::Ordering::Relaxed),
+        state
+            .sem
+            .tool_bypasses
             .load(std::sync::atomic::Ordering::Relaxed),
         state.semcache.live_len(),
     );
@@ -3537,6 +3552,29 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         merged,
         "# HELP blazar_audio_jobs_active Local audio transcription jobs (queued+running)\n# TYPE blazar_audio_jobs_active gauge\nblazar_audio_jobs_active {}\n",
         state.audio_jobs.active_count()
+    );
+    // Durable ledger view: non-terminal rows across ALL lanes (audio,
+    // image, video) — after a restart this drops to zero via the boot
+    // sweep, which is exactly the signal an operator wants.
+    let durable_jobs_active = state
+        .with_store(|s| {
+            s.list_jobs(Some("queued"), None, 1000)
+                .unwrap_or_default()
+                .len()
+                + s.list_jobs(Some("running"), None, 1000)
+                    .unwrap_or_default()
+                    .len()
+        })
+        .unwrap_or(0);
+    let _ = write!(
+        merged,
+        "# HELP blazar_jobs_active Durable job rows not yet terminal (all lanes)\n# TYPE blazar_jobs_active gauge\nblazar_jobs_active {}\n",
+        durable_jobs_active
+    );
+    let _ = write!(
+        merged,
+        "# HELP blazar_requests_inflight Tracked generation requests in flight (this boot)\n# TYPE blazar_requests_inflight gauge\nblazar_requests_inflight {}\n",
+        state.requests.inflight_count()
     );
     let _ = write!(
         merged,

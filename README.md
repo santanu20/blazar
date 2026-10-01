@@ -554,13 +554,18 @@ Every advanced capability is on by default unless noted, and each has full docum
 | **KV-cache quantization** | Automatic K/V grade ladder with context autofit — VRAM headroom and longer contexts without manual tuning | [`docs/7.SETUP.md`](docs/7.SETUP.md#memory-kv--context) |
 | **Flash attention** | Enabled automatically where the engine build supports it | [`docs/7.SETUP.md`](docs/7.SETUP.md) |
 | **Multi-GPU sharding** | Automatic tensor parallelism with rank pinning; explicit pins always win | [`docs/7.SETUP.md`](docs/7.SETUP.md#multi-gpu-sharding--admission) |
+| **Durable job ledger** | Async image/video/audio/batch jobs and stored responses survive restarts — records, events, and completed artifacts persist in SQLite | [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md) |
+| **Request lifecycle** | Live request cards with cancel and interrupt: `GET /v1/requests`, `POST /v1/requests/{id}/cancel` — agents can stop a runaway generation | [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md) |
+| **Effective-config explanation** | `blazar explain <model>` shows the resolved engine lane, effective context (and where the value came from), slots, speculation, and cache posture | [Diagnostics and observability](#diagnostics-and-observability) |
+| **Model doctor** | `blazar model-doctor <model>` runs bounded capability probes (chat, streaming, JSON schema, tools, embeddings) and files a certificate used for routing honesty | [Diagnostics and observability](#diagnostics-and-observability) |
+| **Capacity observability** | `GET /api/capacity` reports per-GPU VRAM, utilization, and which resident model holds what — one JSON object, no log scraping | [Diagnostics and observability](#diagnostics-and-observability) |
 | **Admission and queueing** | Bounded concurrency under saturation — parks or refuses requests rather than destabilizing latency | [`docs/7.SETUP.md`](docs/7.SETUP.md#multi-gpu-sharding--admission) |
 | **Federation** | Peer Blazar gateways behind one endpoint: explicit remote routing, least-busy selection, and fallback | [`docs/7.SETUP.md`](docs/7.SETUP.md#federation-peers-behind-one-gateway) |
 | **Warm starts and session bank** | Session checkpoints survive unload and restart; conversation-prefix routing keeps hot KV where the next request needs it | [Sessions, cache, and warm starts](#sessions-cache-and-warm-starts) |
 | **Request deduplication** | Identical concurrent requests collapse into one computation (`singleflight`) | [`docs/6.BUSINESS_RULES.md`](docs/6.BUSINESS_RULES.md) |
 | **Structured output** | Schema- and grammar-constrained generation across API dialects | [`docs/7.SETUP.md`](docs/7.SETUP.md#structured-output-across-dialects) |
-| **Tool calling** | Native tool-call translation across the OpenAI-, Ollama-, and Anthropic-compatible surfaces | [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md) |
-| **Reasoning budget** | Per-model and per-request thinking-budget control for reasoning models | [`docs/7.SETUP.md`](docs/7.SETUP.md#reasoning--thinking) |
+| **Tool calling** | Native tool-call translation across the OpenAI-, Ollama-, and Anthropic-compatible surfaces | [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md#tool-calling) |
+| **Reasoning budget** | Per-model and per-request thinking-budget control for reasoning models | [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md#reasoning-budget) |
 | **Best-of-N and cascade** | Per-request quality and cost ladders (above) | [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md) |
 | **Multimodal projector placement** | Vision projectors are detected and offloaded automatically so image understanding does not crowd the text hot path | [`docs/7.SETUP.md`](docs/7.SETUP.md) |
 | **Load modes** | `mlock`/`mmap` posture per model — resident serving or fast swap, chosen by the planner | [`docs/7.SETUP.md`](docs/7.SETUP.md) |

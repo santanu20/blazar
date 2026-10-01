@@ -206,6 +206,17 @@ pub struct AppState {
     /// spawned tasks polled at /v1/audio/jobs/{id}. Bounded registry;
     /// jobs die with the gateway process.
     pub audio_jobs: crate::whisper::AudioJobs,
+    /// Durable job ledger (SQLite write-through behind every async lane:
+    /// audio tasks, image/video child jobs) plus the unified
+    /// `/v1/jobs` read/cancel/events plane. Owns artifact spillover on
+    /// disk; holds no locks and no tasks — the lanes stay authoritative
+    /// for live state, this outlives them.
+    pub jobs: std::sync::Arc<crate::jobs::JobRuntime>,
+    /// Request lifecycle cards (v0.15): in-flight generation tracking +
+    /// programmatic cancel/interrupt via `/v1/requests`. Pure memory —
+    /// cards live and die with the process by design (durable history is
+    /// the job ledger's role, not this one).
+    pub requests: std::sync::Arc<crate::requests::RequestRuntime>,
     /// Single-flight for identical NON-STREAM requests (model + body
     /// hash): concurrent duplicates wait for the leader, then ride the
     /// leader's warm prefix instead of double-prefilling. Bounded. The
@@ -388,6 +399,10 @@ impl AppState {
                 }
             });
         }
+        // Job ledger owns `<data>/jobs` artifact spillover; constructed
+        // before the struct literal because `dirs` moves into it.
+        let jobs = std::sync::Arc::new(crate::jobs::JobRuntime::new(&dirs.data_dir));
+        let requests = std::sync::Arc::new(crate::requests::RequestRuntime::new());
         Self {
             dirs,
             config,
@@ -410,6 +425,8 @@ impl AppState {
             responses: std::sync::Mutex::new(crate::responses::ResponsesRegistry::new()),
             whisper,
             audio_jobs: crate::whisper::AudioJobs::new(),
+            jobs,
+            requests,
             http_addr: std::sync::OnceLock::new(),
             remote_health: std::sync::Arc::default(),
             remote_affinity: std::sync::Arc::default(),
@@ -434,6 +451,48 @@ impl AppState {
             *guard = blazar_core::Store::open(&self.dirs).ok();
         }
         guard.as_ref().map(f)
+    }
+
+    /// Memory-first stored-response lookup with SQLite fallback (restart
+    /// durability for `previous_response_id` chaining). Lock order is a
+    /// fixed law: responses mutex → store mutex, never reversed — the
+    /// store mutex is only ever taken while already inside a responses
+    /// guard (here and in `store_response`), so no cycle can form.
+    pub fn stored_response(&self, id: &str) -> Option<crate::responses::StoredResponse> {
+        let mut reg = self.responses.lock().expect("responses registry");
+        if let Some(s) = reg.get(id) {
+            return Some(s.clone());
+        }
+        self.with_store(|s| reg.promote_from_store(s, id)).flatten()
+    }
+
+    /// Persisted put: hot LRU always, then SQLite write-through + prune
+    /// (same 24h TTL / cap as memory). Store failures log loud — durable
+    /// chain degradation must be visible — but never fail the request:
+    /// memory stays authoritative for the live process, the ledger is
+    /// the restart path. Lock order: responses → store (see
+    /// `stored_response`).
+    pub fn store_response(&self, id: String, r: crate::responses::StoredResponse) {
+        let mut reg = self.responses.lock().expect("responses registry");
+        reg.put(id.clone(), r.clone());
+        let durable = self.with_store(|s| {
+            s.put_response(&crate::responses::ResponsesRegistry::to_row(&id, &r))
+                .and_then(|()| {
+                    s.prune_responses(
+                        crate::responses::RESPONSES_TTL_SECS,
+                        crate::responses::RESPONSES_CAP,
+                    )
+                })
+        });
+        match durable {
+            Some(Ok(())) => {}
+            Some(Err(e)) => tracing::warn!(
+                "responses: durable write failed: {e:#} — {id} is memory-only until the next successful put"
+            ),
+            None => tracing::warn!(
+                "responses: store unavailable — {id} is memory-only (will not survive a restart)"
+            ),
+        }
     }
 }
 

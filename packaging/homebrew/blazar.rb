@@ -8,6 +8,7 @@ class Blazar < Formula
   desc "Multi-engine local inference server: OpenAI, ollama and Anthropic APIs"
   homepage "https://github.com/santanu20/blazar"
   version "VERSION"
+  license "MIT OR Apache-2.0"
 
   on_macos do
     if Hardware::CPU.intel?

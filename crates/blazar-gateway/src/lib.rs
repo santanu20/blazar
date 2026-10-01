@@ -6,10 +6,16 @@ pub mod audit;
 pub mod batch;
 pub mod bestof;
 pub mod cache_bust;
+pub mod capacity;
 pub mod cascade;
+pub mod explain;
 pub mod histogram;
 pub mod http_pool;
 pub mod images;
+pub mod jobs;
+pub mod model_doctor;
+pub mod requests;
+
 pub mod keys;
 pub mod latechunk;
 pub mod ollama;
@@ -291,6 +297,25 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v1/audio/jobs/{id}/cancel",
             post(whisper::audio_jobs_cancel),
         )
+        // Unified durable job plane: every async lane (audio tasks,
+        // image/video child jobs) writes through to the SQLite ledger;
+        // these routes read/cancel across all of them and survive
+        // restarts. Creation stays on the native async surfaces.
+        .route("/v1/jobs", get(jobs::jobs_list))
+        .route("/v1/jobs/{id}", get(jobs::jobs_get))
+        .route("/v1/jobs/{id}/cancel", post(jobs::jobs_cancel))
+        .route("/v1/jobs/{id}/events", get(jobs::jobs_events))
+        .route("/v1/jobs/{id}/artifact", get(jobs::jobs_artifact))
+        // Request lifecycle (v0.15): in-flight generation cards +
+        // programmatic cancel/interrupt. Cards are per-boot memory;
+        // the durable history plane is /v1/jobs above.
+        .route("/v1/requests", get(requests::requests_list))
+        .route("/v1/requests/{id}", get(requests::requests_get))
+        .route("/v1/requests/{id}/cancel", post(requests::requests_cancel))
+        .route(
+            "/v1/requests/{id}/interrupt",
+            post(requests::requests_interrupt),
+        )
         .route("/v1/audio/capabilities", get(whisper::audio_capabilities))
         .route("/v1/images/generations", post(images::generations))
         .route("/v1/images/edits", post(images::edits))
@@ -342,6 +367,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/show", post(ollama::show))
         .route("/api/delete", post(ollama::delete))
         .route("/api/ps", get(ollama::ps))
+        // Per-GPU capacity: device census + per-resident VRAM
+        // attribution joined from the supervisor's live rows.
+        .route("/api/capacity", get(capacity::capacity))
+        .route("/api/explain/{model}", get(explain::explain))
+        // Per-model capability certificate: bounded probes through the
+        // real gateway path, stored as a doctor job + model_caps row.
+        .route("/api/model-doctor", post(model_doctor::run))
+        .route("/api/model-doctor/{model}", get(model_doctor::cert))
         .route("/api/pull", post(ollama::pull))
         .route("/api/chat", post(ollama::chat))
         .route("/api/embeddings", post(ollama::embeddings))
@@ -389,6 +422,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             sessions::pin_mw,
+        ))
+        // Request lifecycle (v0.15): tracked generation lanes get a card
+        // stamped `x-blazar-request-id` and become cancelable by id from
+        // a second connection. Inside auth (key identity is on the
+        // request extensions) and inside the body limit (the model sniff
+        // is bounded under it). Non-tracked paths: verbatim passthrough.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            requests::lifecycle,
         ))
         // Hardening: 50 MiB request ceiling (audio uploads fit; nothing
         // legit is larger locally).
@@ -817,11 +859,16 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
                        "/v1/images/capabilities",
                        "/v1/videos/generations", "/v1/videos/jobs/{id}",
                        "/v1/videos/jobs/{id}/cancel", "/v1/videos/capabilities",
-                       "/v1/audio/transcriptions", "/v1/audio/translations",
-                       "/v1/audio/speech", "/v1/audio/jobs/{id}",
-                       "/v1/audio/jobs/{id}/cancel", "/v1/audio/capabilities",
-                       "/audio/transcriptions", "/audio/translations"],
-            "ollama": ["/api/chat", "/api/generate", "/api/tags", "/api/ps", "/api/show",
+                        "/v1/audio/transcriptions", "/v1/audio/translations",
+                        "/v1/audio/speech", "/v1/audio/jobs/{id}",
+                        "/v1/audio/jobs/{id}/cancel", "/v1/audio/capabilities",
+                        "/v1/jobs", "/v1/jobs/{id}", "/v1/jobs/{id}/cancel",
+                        "/v1/jobs/{id}/events", "/v1/jobs/{id}/artifact",
+                        "/v1/requests", "/v1/requests/{id}",
+                        "/v1/requests/{id}/cancel", "/v1/requests/{id}/interrupt",
+                        "/audio/transcriptions", "/audio/translations"],
+            "ollama": ["/api/chat", "/api/generate", "/api/tags", "/api/ps", "/api/capacity", "/api/explain/{model}", "/api/show",
+                       "/api/model-doctor", "/api/model-doctor/{model}",
                        "/api/embeddings", "/api/embed", "/api/rerank", "/api/pull",
                        "/api/delete", "/api/events", "/api/version"],
             "blazar": ["/api/evict", "/api/warm", "/api/session", "/api/sessions", "/api/why",
@@ -913,6 +960,14 @@ pub async fn serve(
     shutdown: std::pin::Pin<Box<dyn futures::Future<Output = ()> + Send>>,
 ) -> anyhow::Result<()> {
     let app = router(state.clone());
+    // Durable jobs boot hygiene, detached: sweep latency is not boot
+    // latency. Abandons in-flight rows from a previous gateway process
+    // (grace-window protected) and prunes terminal rows older than 7
+    // days — the ledger must not grow unbounded.
+    {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move { state.jobs.boot_sweep(&state) });
+    }
     let addr = format!("{host}:{port}");
     // Prompt-cache hit-rate + spec-accept poller (A16/G3): every 60 s,
     // sum the children's Prometheus counters, compute the window delta
