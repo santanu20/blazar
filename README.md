@@ -493,6 +493,8 @@ Automatic routing is available through the routing policy; the default configura
 
 For GGUF architectures that are not yet covered by the mainstream llama.cpp lane, Blazar can manage curated **capability lanes** built from immutable fork commits and route only the affected models there.
 
+Peering multiple Blazar gateways into one routing fabric is covered in [`docs/7.SETUP.md`](docs/7.SETUP.md) under **Federation: peers behind one gateway**.
+
 ---
 
 ## Resource-aware scheduling
@@ -527,21 +529,11 @@ blazar coreside
 
 Use this to reason about which models can remain resident together within the machine's available capacity.
 
-### Automatic tensor parallelism
-
-When weights plus KV exceed the best single card but fit the discrete cards per-rank, the SGLang lane plans the spawn across them (`--tp-size N`) and the fit ladder judges per-rank demand against the bottleneck card. The same planner awareness extends admission: a load that only makes sense sharded is judged against the combined GPU pool instead of the largest single card, and refusals say so (`even sharded across N cards (X GiB per rank)`). Manual pins (`tp_size`, `dp_size`, `pp_size`, `ep_size`, tensor split, device lists) always win — auto-sharding only fires when parallelism is unpinned. The llama.cpp lane has its own auto tensor-split for the same case, and the mistral.rs lane spans by layer mapping: it admits a load that exceeds the best single card yet fits the cards combined and lets the engine distribute layers itself (`--device-layers` omitted), which permits uneven splits a per-rank planner would refuse.
-
-On all-NVIDIA boxes every sharded spawn is pinned: the child receives `CUDA_DEVICE_ORDER=PCI_BUS_ID` plus `CUDA_VISIBLE_DEVICES` naming the first N cards in PCI bus order, so ranks and cards stay aligned on mixed-memory pairs. Any doubt — non-NVIDIA or mixed-vendor census, probe short of ranks — leaves the child env untouched and the engine's own device mapping in charge.
-
 ### Admission and queueing
 
-When a model is saturated, Blazar can park requests behind bounded admission rather than allowing uncontrolled concurrency to inflate latency and destabilize the workload. Loads that no amount of waiting can fix — the admission floor exceeds every GPU budget even with the box empty — are refused immediately with the numbers and the levers (`blazar fit`, smaller ctx/slots, a larger card) instead of timing out in a queue.
+When a model is saturated, Blazar can park requests behind bounded admission rather than allowing uncontrolled concurrency to inflate latency and destabilize the workload.
 
-### Federation: peers behind one gateway
-
-`[[remotes]]` names other OpenAI-compatible servers (another blazar box, vLLM, an MLX server — anything speaking `/v1/*`). Requests for `<remote-name>:<model>` always route there explicitly. On top of that, with `remote_fallback = true` (default), a **bare** model name the local store does not know routes to whichever peer lists it: the gateway keeps a 60-second TTL cache of each peer's `/v1/models` listing, prefers the least-busy live peer, and never sends your caller credentials along — the peer's configured key rides instead, exactly as with explicit prefix routing. Locally-ambiguous names stay local (that is a naming problem), and a model no peer serves gets the ordinary local 404 teaching. Peer listings also merge into `GET /v1/models` (snapshot of the cache; the first fallback warms it). Set `remote_fallback = false` to roll the whole feature back to pure-prefix routing.
-
-Fallback covers the OpenAI surfaces (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/images/generations`), and the Ollama-compatible `/api/chat` (the request is translated to the peer and the reply back into ollama shape). `/api/generate` stays local-only: it refuses remote prefixes explicitly, so fallback honors the same contract. When a peer starts serving a model inside the TTL window, the first miss for that name triggers one throttled re-probe per peer (at most one every 10 seconds), so new peer models are found without per-request probe traffic.
+See [`docs/7.SETUP.md`](docs/7.SETUP.md) for the admission levers and the multi-GPU sharding rules (automatic tensor parallelism, rank pinning, manual pins).
 
 ### Adaptive capacity
 
