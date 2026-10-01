@@ -14,12 +14,18 @@ use crate::error::{CoreError, CoreResult};
 /// - models:   pulled GGUFs (plain files, no blob store)
 /// - profiles: per-(model, engine) launch argv + benchmark results
 /// - loras:    `LoRA` adapters per model
+/// - jobs / job_events: durable background-job spine (v8) — every async
+///   surface (audio, image, video) records its job here so records,
+///   events, and terminal results survive gateway restarts
+/// - responses: durable Responses-API registry (v8) — `previous_response_id`
+///   chaining survives restarts
+/// - model_caps: per-(model, engine) capability certificates (v8)
 #[derive(Debug)]
 pub struct Store {
     conn: Connection,
 }
 
-const SCHEMA_VERSION: i32 = 7;
+const SCHEMA_VERSION: i32 = 8;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -82,6 +88,44 @@ CREATE TABLE IF NOT EXISTS bench_history (
     prompt_tps REAL,                 -- HTTP lane: prompt t/s (usage)
     images_per_sec REAL,             -- HTTP image lane: images/s
     detail TEXT                      -- HTTP lane: probe params JSON
+);
+CREATE TABLE IF NOT EXISTS jobs (
+    id            TEXT PRIMARY KEY,
+    kind          TEXT NOT NULL,      -- audio | image | video | batch
+    model         TEXT,               -- serving model, when one is named
+    state         TEXT NOT NULL,      -- queued | running | completed | failed | cancelled | abandoned
+    request_json  TEXT NOT NULL DEFAULT '{}', -- kind-specific submit descriptor
+    result_json   TEXT,               -- terminal payload (small, inline)
+    error         TEXT,
+    artifact_path TEXT,               -- larger result/input file, relative to data_dir
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
+CREATE INDEX IF NOT EXISTS idx_jobs_updated ON jobs(updated_at);
+CREATE TABLE IF NOT EXISTS job_events (
+    seq       INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id    TEXT NOT NULL,
+    ts        INTEGER NOT NULL,
+    kind      TEXT NOT NULL,          -- created | started | completed | failed | cancelled | abandoned
+    data_json TEXT                    -- optional event detail
+);
+CREATE INDEX IF NOT EXISTS idx_job_events_job ON job_events(job_id, seq);
+CREATE TABLE IF NOT EXISTS responses (
+    id            TEXT PRIMARY KEY,   -- resp_... client-chainable id
+    model         TEXT NOT NULL,
+    input_json    TEXT NOT NULL,
+    output_json   TEXT NOT NULL,
+    input_tokens  INTEGER,
+    output_tokens INTEGER,
+    ts            INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS model_caps (
+    model      TEXT NOT NULL,
+    engine_tag TEXT NOT NULL,
+    tested_at  INTEGER NOT NULL,
+    caps_json  TEXT NOT NULL,
+    PRIMARY KEY (model, engine_tag)
 );
 ";
 
@@ -270,6 +314,51 @@ pub struct LoraRow {
     pub scale: f64,
 }
 
+/// One durable background job (audio/image/video async work). `state` is
+/// the persistence-level truth; the gateway keeps live handles alongside.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct JobRow {
+    pub id: String,
+    pub kind: String,
+    pub model: Option<String>,
+    pub state: String,
+    pub request_json: String,
+    pub result_json: Option<String>,
+    pub error: Option<String>,
+    pub artifact_path: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// One append-only job history event (the "story" behind a job).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct JobEventRow {
+    pub seq: i64,
+    pub job_id: String,
+    pub ts: i64,
+    pub kind: String,
+    pub data_json: Option<String>,
+}
+
+/// Persisted Responses-API entry: enough to reconstruct a
+/// `previous_response_id` chain after a restart.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StoredResponseRow {
+    pub id: String,
+    pub model: String,
+    pub input_json: String,
+    pub output_json: String,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub ts: i64,
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0))
+}
+
 impl Store {
     /// Open (creating directories and file as needed) and migrate.
     pub fn open(dirs: &BlazarDirs) -> CoreResult<Self> {
@@ -387,6 +476,309 @@ impl Store {
                 .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         Ok(())
+    }
+
+    // ---- durable jobs (v8) -------------------------------------------
+
+    /// Insert a job row plus its `created` event in one transaction — a
+    /// crash between the two must never leave an event-less job.
+    pub fn insert_job(&self, job: &JobRow) -> CoreResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO jobs (id, kind, model, state, request_json, result_json, error, artifact_path, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                job.id,
+                job.kind,
+                job.model,
+                job.state,
+                job.request_json,
+                job.result_json,
+                job.error,
+                job.artifact_path,
+                job.created_at,
+                job.updated_at
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO job_events (job_id, ts, kind) VALUES (?1, ?2, 'created')",
+            params![job.id, job.created_at],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Transition a job's state (and terminal payload/error). Returns
+    /// `false` when no such job row exists — callers decide whether that
+    /// is a 404 or an in-memory-only straggler.
+    pub fn set_job_state(
+        &self,
+        id: &str,
+        state: &str,
+        result_json: Option<&str>,
+        error: Option<&str>,
+    ) -> CoreResult<bool> {
+        let n = self.conn.execute(
+            "UPDATE jobs SET state = ?2, result_json = COALESCE(?3, result_json), error = ?4, updated_at = ?5 WHERE id = ?1",
+            params![id, state, result_json, error, unix_now()],
+        )?;
+        Ok(n == 1)
+    }
+
+    pub fn append_job_event(
+        &self,
+        job_id: &str,
+        kind: &str,
+        data_json: Option<&str>,
+    ) -> CoreResult<()> {
+        self.conn.execute(
+            "INSERT INTO job_events (job_id, ts, kind, data_json) VALUES (?1, ?2, ?3, ?4)",
+            params![job_id, unix_now(), kind, data_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_job(&self, id: &str) -> CoreResult<Option<JobRow>> {
+        self.conn
+            .query_row(
+                "SELECT id, kind, model, state, request_json, result_json, error, artifact_path, created_at, updated_at FROM jobs WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(JobRow {
+                        id: r.get(0)?,
+                        kind: r.get(1)?,
+                        model: r.get(2)?,
+                        state: r.get(3)?,
+                        request_json: r.get(4)?,
+                        result_json: r.get(5)?,
+                        error: r.get(6)?,
+                        artifact_path: r.get(7)?,
+                        created_at: r.get(8)?,
+                        updated_at: r.get(9)?,
+                    })
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other.into()),
+            })
+    }
+
+    /// Newest-first job listing. `state`/`kind` filter, `limit` clamped
+    /// to 1..=1000 (the admin plane, not a firehose).
+    pub fn list_jobs(
+        &self,
+        state: Option<&str>,
+        kind: Option<&str>,
+        limit: u64,
+    ) -> CoreResult<Vec<JobRow>> {
+        let limit = limit.clamp(1, 1000);
+        let mut sql = String::from(
+            "SELECT id, kind, model, state, request_json, result_json, error, artifact_path, created_at, updated_at FROM jobs",
+        );
+        let mut conds: Vec<&str> = Vec::new();
+        // Owned SQL values: filter strings are pattern-scoped borrows, so the
+        // bind vec must own its data to outlive the if-let arms.
+        let mut binds: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(s) = state {
+            conds.push("state = ?");
+            binds.push(rusqlite::types::Value::Text(s.to_string()));
+        }
+        if let Some(k) = kind {
+            conds.push("kind = ?");
+            binds.push(rusqlite::types::Value::Text(k.to_string()));
+        }
+        if !conds.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conds.join(" AND "));
+        }
+        sql.push_str(" ORDER BY updated_at DESC, id LIMIT ?");
+        let limit_i = limit as i64;
+        binds.push(rusqlite::types::Value::Integer(limit_i));
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds), |r| {
+            Ok(JobRow {
+                id: r.get(0)?,
+                kind: r.get(1)?,
+                model: r.get(2)?,
+                state: r.get(3)?,
+                request_json: r.get(4)?,
+                result_json: r.get(5)?,
+                error: r.get(6)?,
+                artifact_path: r.get(7)?,
+                created_at: r.get(8)?,
+                updated_at: r.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Job events, oldest-first (the story reads in order).
+    pub fn job_events(&self, job_id: &str, limit: u64) -> CoreResult<Vec<JobEventRow>> {
+        let limit = limit.clamp(1, 1000);
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, job_id, ts, kind, data_json FROM (
+                SELECT * FROM job_events WHERE job_id = ?1 ORDER BY seq DESC LIMIT ?2
+            ) ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map(params![job_id, limit], |r| {
+            Ok(JobEventRow {
+                seq: r.get(0)?,
+                job_id: r.get(1)?,
+                ts: r.get(2)?,
+                kind: r.get(3)?,
+                data_json: r.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Boot-time honesty sweep: every job still `queued`/`running` whose
+    /// row predates `grace_secs` ago belonged to a dead gateway — mark it
+    /// `abandoned` with a teaching error and an event. The grace window
+    /// keeps a concurrently-live second daemon from reaping the other's
+    /// fresh work. Returns the swept ids (for the boot log).
+    pub fn boot_sweep_jobs(&self, grace_secs: i64) -> CoreResult<Vec<String>> {
+        let cutoff = unix_now() - grace_secs.max(0);
+        let swept: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM jobs WHERE state IN ('queued','running') AND updated_at < ?1",
+            )?;
+            let rows = stmt.query_map(params![cutoff], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let now = unix_now();
+        for id in &swept {
+            self.conn.execute(
+                "UPDATE jobs SET state = 'abandoned', error = 'gateway restarted while the job was in flight — resubmit to rerun; completed artifacts were kept', updated_at = ?2 WHERE id = ?1",
+                params![id, now],
+            )?;
+            self.conn.execute(
+                "INSERT INTO job_events (job_id, ts, kind, data_json) VALUES (?1, ?2, 'abandoned', ?3)",
+                params![id, now, r#"{"reason":"gateway_restart"}"#],
+            )?;
+        }
+        Ok(swept)
+    }
+
+    /// Bounded retention: terminal jobs older than `older_than_secs`
+    /// (and their events) are deleted. Called at boot — the table must
+    /// not grow forever.
+    pub fn prune_jobs(&self, older_than_secs: i64) -> CoreResult<u64> {
+        let cutoff = unix_now() - older_than_secs.max(0);
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM job_events WHERE job_id IN (
+                SELECT id FROM jobs WHERE state IN ('completed','failed','cancelled','abandoned') AND updated_at < ?1
+            )",
+            params![cutoff],
+        )?;
+        let n = tx.execute(
+            "DELETE FROM jobs WHERE state IN ('completed','failed','cancelled','abandoned') AND updated_at < ?1",
+            params![cutoff],
+        )?;
+        tx.commit()?;
+        Ok(u64::try_from(n).unwrap_or(0))
+    }
+
+    // ---- durable responses (v8) --------------------------------------
+
+    pub fn put_response(&self, r: &StoredResponseRow) -> CoreResult<()> {
+        self.conn.execute(
+            "INSERT INTO responses (id, model, input_json, output_json, input_tokens, output_tokens, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+               model = excluded.model, input_json = excluded.input_json,
+               output_json = excluded.output_json, input_tokens = excluded.input_tokens,
+               output_tokens = excluded.output_tokens, ts = excluded.ts",
+            params![
+                r.id,
+                r.model,
+                r.input_json,
+                r.output_json,
+                r.input_tokens,
+                r.output_tokens,
+                r.ts
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_response(&self, id: &str) -> CoreResult<Option<StoredResponseRow>> {
+        self.conn
+            .query_row(
+                "SELECT id, model, input_json, output_json, input_tokens, output_tokens, ts FROM responses WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(StoredResponseRow {
+                        id: r.get(0)?,
+                        model: r.get(1)?,
+                        input_json: r.get(2)?,
+                        output_json: r.get(3)?,
+                        input_tokens: r.get(4)?,
+                        output_tokens: r.get(5)?,
+                        ts: r.get(6)?,
+                    })
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other.into()),
+            })
+    }
+
+    /// Mirror of the in-memory registry contract: entries older than
+    /// `ttl_secs` die; past `cap` rows the oldest die. Keeps SQLite the
+    /// same shape the RAM registry always had.
+    pub fn prune_responses(&self, ttl_secs: u64, cap: usize) -> CoreResult<()> {
+        let now = unix_now();
+        let ttl = i64::try_from(ttl_secs).unwrap_or(i64::MAX);
+        self.conn.execute(
+            "DELETE FROM responses WHERE ts < ?1",
+            params![now.saturating_sub(ttl)],
+        )?;
+        let excess: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM responses", [], |r| r.get::<_, i64>(0))?
+            - i64::try_from(cap).unwrap_or(i64::MAX);
+        if excess > 0 {
+            self.conn.execute(
+                "DELETE FROM responses WHERE id IN (
+                    SELECT id FROM responses ORDER BY ts ASC LIMIT ?1
+                )",
+                params![excess],
+            )?;
+        }
+        Ok(())
+    }
+
+    // ---- model capability certificates (v8) ---------------------------
+
+    pub fn put_model_caps(&self, model: &str, engine_tag: &str, caps_json: &str) -> CoreResult<()> {
+        self.conn.execute(
+            "INSERT INTO model_caps (model, engine_tag, tested_at, caps_json)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(model, engine_tag) DO UPDATE SET
+               tested_at = excluded.tested_at, caps_json = excluded.caps_json",
+            params![model, engine_tag, unix_now(), caps_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_model_caps(&self, model: &str) -> CoreResult<Option<(String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT engine_tag, caps_json FROM model_caps WHERE model = ?1",
+                params![model],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other.into()),
+            })
     }
 
     pub fn conn(&self) -> &Connection {
@@ -903,9 +1295,191 @@ mod tests {
         let (_t, s) = tmp_store();
         let n: i64 = s
             .conn()
-            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('engines','models','profiles','loras')", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('engines','models','profiles','loras','jobs','job_events','responses','model_caps')", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n, 4);
+        assert_eq!(n, 8);
+    }
+
+    fn job_row(id: &str, kind: &str, state: &str, updated_at: i64) -> JobRow {
+        JobRow {
+            id: id.into(),
+            kind: kind.into(),
+            model: Some("qwen3-8b".into()),
+            state: state.into(),
+            request_json: "{}".into(),
+            result_json: None,
+            error: None,
+            artifact_path: None,
+            created_at: updated_at,
+            updated_at,
+        }
+    }
+
+    #[test]
+    fn unit__jobs__lifecycle_rows_and_events() {
+        let (_t, s) = tmp_store();
+        s.insert_job(&job_row("job_1", "audio", "queued", 1000))
+            .unwrap();
+        // insert_job stamps the 'created' event itself — the story starts with one row.
+        let events = s.job_events("job_1", 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "created");
+
+        assert!(s.set_job_state("job_1", "running", None, None).unwrap());
+        s.append_job_event("job_1", "progress", Some(r#"{"pct":50}"#))
+            .unwrap();
+        assert!(s
+            .set_job_state("job_1", "completed", Some(r#"{"text":"hi"}"#), None)
+            .unwrap());
+        // Unknown id: the contract returns false, not an error.
+        assert!(!s.set_job_state("job_9", "completed", None, None).unwrap());
+
+        let row = s.get_job("job_1").unwrap().unwrap();
+        assert_eq!(row.state, "completed");
+        assert_eq!(row.result_json.as_deref(), Some(r#"{"text":"hi"}"#));
+        let events = s.job_events("job_1", 10).unwrap();
+        assert_eq!(
+            events.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
+            vec!["created", "progress"]
+        );
+
+        // Listing filters: state and kind both apply, newest-updated first.
+        // job_1's transitions stamped real-clock updated_at, so job_2 must
+        // sit strictly in the future to be the newest deterministically.
+        s.insert_job(&job_row("job_2", "image", "completed", unix_now() + 10))
+            .unwrap();
+        let listed = s.list_jobs(Some("completed"), None, 10).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, "job_2");
+        let listed = s.list_jobs(None, Some("image"), 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "job_2");
+        let listed = s.list_jobs(None, None, 1).unwrap();
+        assert_eq!(listed.len(), 1);
+    }
+
+    #[test]
+    fn unit__jobs__boot_sweep_abandons_inflight_with_grace() {
+        let (_t, s) = tmp_store();
+        let now = unix_now();
+        // Stale in-flight row: last touched an hour ago — must be reaped.
+        s.insert_job(&job_row("old", "audio", "running", now - 3600))
+            .unwrap();
+        // Fresh in-flight row: last touched now — a live concurrent daemon
+        // must never be reaped by a second gateway's boot sweep.
+        s.insert_job(&job_row("fresh", "audio", "running", now))
+            .unwrap();
+        // Terminal row: sweep does not touch it even when ancient.
+        s.insert_job(&job_row("done", "audio", "completed", now - 3600))
+            .unwrap();
+
+        let swept = s.boot_sweep_jobs(5).unwrap();
+        assert_eq!(swept, vec!["old".to_string()]);
+
+        let old = s.get_job("old").unwrap().unwrap();
+        assert_eq!(old.state, "abandoned");
+        assert!(old.error.as_deref().unwrap().contains("resubmit"));
+        let fresh = s.get_job("fresh").unwrap().unwrap();
+        assert_eq!(fresh.state, "running");
+        let done = s.get_job("done").unwrap().unwrap();
+        assert_eq!(done.state, "completed");
+        // The abandonment is part of the story.
+        let events = s.job_events("old", 10).unwrap();
+        assert!(events.iter().any(|e| e.kind == "abandoned"));
+    }
+
+    #[test]
+    fn unit__jobs__prune_removes_terminal_and_events() {
+        let (_t, s) = tmp_store();
+        let now = unix_now();
+        s.insert_job(&job_row("ancient", "video", "completed", now - 30 * 86400))
+            .unwrap();
+        s.insert_job(&job_row("recent", "video", "completed", now))
+            .unwrap();
+        s.insert_job(&job_row(
+            "old_inflight",
+            "video",
+            "running",
+            now - 30 * 86400,
+        ))
+        .unwrap();
+
+        let n = s.prune_jobs(7 * 86400).unwrap();
+        assert_eq!(n, 1);
+        assert!(s.get_job("ancient").unwrap().is_none());
+        // Events die with their job — no orphans.
+        assert!(s.job_events("ancient", 10).unwrap().is_empty());
+        // Recent terminal and old-but-in-flight both survive (the sweep owns in-flight).
+        assert!(s.get_job("recent").unwrap().is_some());
+        assert!(s.get_job("old_inflight").unwrap().is_some());
+    }
+
+    #[test]
+    fn unit__responses__put_get_prune_ttl_cap() {
+        let (_t, s) = tmp_store();
+        let row = |id: &str, ts: i64| StoredResponseRow {
+            id: id.into(),
+            model: "qwen3-8b".into(),
+            input_json: "[]".into(),
+            output_json: "[]".into(),
+            input_tokens: Some(1),
+            output_tokens: Some(2),
+            ts,
+        };
+        let now = unix_now();
+        s.put_response(&row("r_old_ttl", now - 7200)).unwrap();
+        s.put_response(&row("r_a", now)).unwrap();
+        s.put_response(&row("r_b", now)).unwrap();
+        s.put_response(&row("r_c", now)).unwrap();
+        s.put_response(&row("r_d", now)).unwrap();
+
+        let got = s.get_response("r_a").unwrap().unwrap();
+        assert_eq!(got.model, "qwen3-8b");
+        assert!(s.get_response("missing").unwrap().is_none());
+        // Upsert on conflict: same id re-put updates, not errors.
+        s.put_response(&row("r_a", now + 1)).unwrap();
+        assert_eq!(s.get_response("r_a").unwrap().unwrap().ts, now + 1);
+
+        // TTL death + cap trim in one prune: expired row goes, then the
+        // oldest of the survivors until 3 rows remain.
+        s.prune_responses(3600, 3).unwrap();
+        assert!(s.get_response("r_old_ttl").unwrap().is_none());
+        assert!(s.get_response("r_a").unwrap().is_some());
+        assert!(s.get_response("r_d").unwrap().is_some());
+        let n: i64 = s
+            .conn()
+            .query_row("SELECT COUNT(*) FROM responses", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn unit__store_schema_upgrades__v7_to_v8() {
+        // Simulate a v7 database: the four v8 tables absent, user_version 7.
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        {
+            let s = Store::open(&dirs).unwrap();
+            s.conn()
+                .execute_batch(
+                    "DROP TABLE jobs; DROP TABLE job_events; DROP TABLE responses; DROP TABLE model_caps; PRAGMA user_version = 7;",
+                )
+                .unwrap();
+        }
+        // Reopen: migrate() must recreate the v8 tables and stamp version 8.
+        let s = Store::open(&dirs).unwrap();
+        let v: i32 = s
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        // And the recreated tables are functional, not decorative.
+        s.insert_job(&job_row("upgrade_probe", "audio", "queued", 1000))
+            .unwrap();
+        assert!(s.get_job("upgrade_probe").unwrap().is_some());
     }
 
     #[test]
