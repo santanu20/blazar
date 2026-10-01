@@ -118,26 +118,38 @@ fn judge_chat(code: u16, body: &[u8]) -> Verdict {
     pass(format!("200, {} chars", content.len()))
 }
 
-/// stream probe: 200, event-stream content type, at least one data frame.
+/// stream probe: 200 plus streaming evidence in EITHER wire dialect the
+/// gateway emits. The ollama lane streams `application/x-ndjson` (one JSON
+/// object per line); OpenAI-style surfaces stream `text/event-stream` with
+/// `data:` frames. A buffered `application/json` body is NOT streaming.
 fn judge_stream(code: u16, content_type: Option<&str>, body: &[u8]) -> Verdict {
     if code != 200 {
         return fail(format!("HTTP {code}: {}", excerpt(body, 160)));
     }
-    let is_sse = content_type.is_some_and(|ct| ct.contains("text/event-stream"));
-    if !is_sse {
-        return fail(format!(
-            "200 but content type is {} (expected text/event-stream)",
-            content_type.unwrap_or("(none)")
-        ));
+    let ct = content_type.unwrap_or("(none)");
+    if ct.contains("text/event-stream") {
+        let frames = body
+            .split(|b| *b == b'\n')
+            .filter(|l| l.starts_with(b"data:"))
+            .count();
+        return if frames == 0 {
+            fail("event-stream carried no data frames".to_string())
+        } else {
+            pass(format!("200, {frames} SSE frames"))
+        };
     }
-    let frames = body
-        .split(|b| *b == b'\n')
-        .filter(|l| l.starts_with(b"data:"))
-        .count();
-    if frames == 0 {
-        return fail("event-stream carried no data frames".to_string());
+    if ct.contains("x-ndjson") || ct.contains("json-lines") || ct.contains("jsonl") {
+        let frames = body
+            .split(|b| *b == b'\n')
+            .filter(|l| l.iter().any(|b| !b.is_ascii_whitespace()))
+            .count();
+        return if frames == 0 {
+            fail("ndjson stream carried no frames".to_string())
+        } else {
+            pass(format!("200, {frames} NDJSON frames"))
+        };
     }
-    pass(format!("200, {frames} SSE frames"))
+    fail(format!("200 but content type is {ct} (expected a streaming dialect)"))
 }
 
 /// structured-output probe: 200 and a JSON body whose .response parses as
@@ -630,15 +642,22 @@ mod tests {
     }
 
     #[test]
-    fn unit__judge_stream__sse_required_with_frames() {
-        let body = b"data: {\"a\":1}\n\ndata: [DONE]\n\n";
+    fn unit__judge_stream__both_dialects_pass_buffered_fails() {
+        // SSE dialect (OpenAI-style surfaces)
+        let sse = b"data: {\"a\":1}\n\ndata: [DONE]\n\n";
         assert_eq!(
-            judge_stream(200, Some("text/event-stream"), body).status,
+            judge_stream(200, Some("text/event-stream"), sse).status,
             "PASS"
         );
-        // wrong content type is a contract break, not a pass
+        // NDJSON dialect (the ollama lane the probes actually traverse)
+        let ndjson = b"{\"message\":\"hi\"}\n{\"done\":true}\n";
         assert_eq!(
-            judge_stream(200, Some("application/json"), body).status,
+            judge_stream(200, Some("application/x-ndjson"), ndjson).status,
+            "PASS"
+        );
+        // a buffered JSON body is not streaming, whatever the frames look like
+        assert_eq!(
+            judge_stream(200, Some("application/json"), sse).status,
             "FAIL"
         );
         // no data frames
