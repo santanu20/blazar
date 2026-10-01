@@ -4,6 +4,17 @@ All notable changes to Blazar are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
+## [0.15.1] - 2026-10-02
+
+Patch release — defects found by live validation of 0.15.0, fixed on main.
+
+### Fixed
+
+- **Model doctor: streaming probe now accepts both stream dialects.** The judge required `text/event-stream`, but the Ollama lane streams `application/x-ndjson`, so every real stream probe on that lane FAILed against a working stream. Both dialects pass; a buffered `application/json` response still fails.
+- **Durable jobs: zombie `running` rows can no longer outlive the grace window.** A job whose gateway died less than 5 s before the next boot fell outside the one-time boot sweep and stayed `running` forever. The sweep now takes an absolute cutoff and a delayed second pass reaps any row last updated before this daemon started — live work in the current process is never touched.
+- **`scripts/compat/compat_check.sh`: summary line printed a literal `s`** instead of the pass count (printf format-string bug).
+- **Workspace `cargo fmt` + `clippy -D warnings` clean** across all new 0.15.0 surfaces (the 0.15.0 tag was cut before CI enforced this on the new code).
+
 ## [0.15.0] - 2026-10-02
 
 Theme: **the reliability layer** — local AI that behaves like infrastructure.
