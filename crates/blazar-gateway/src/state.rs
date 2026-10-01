@@ -212,6 +212,11 @@ pub struct AppState {
     /// disk; holds no locks and no tasks — the lanes stay authoritative
     /// for live state, this outlives them.
     pub jobs: std::sync::Arc<crate::jobs::JobRuntime>,
+    /// Request lifecycle cards (v0.15): in-flight generation tracking +
+    /// programmatic cancel/interrupt via `/v1/requests`. Pure memory —
+    /// cards live and die with the process by design (durable history is
+    /// the job ledger's role, not this one).
+    pub requests: std::sync::Arc<crate::requests::RequestRuntime>,
     /// Single-flight for identical NON-STREAM requests (model + body
     /// hash): concurrent duplicates wait for the leader, then ride the
     /// leader's warm prefix instead of double-prefilling. Bounded. The
@@ -397,6 +402,7 @@ impl AppState {
         // Job ledger owns `<data>/jobs` artifact spillover; constructed
         // before the struct literal because `dirs` moves into it.
         let jobs = std::sync::Arc::new(crate::jobs::JobRuntime::new(&dirs.data_dir));
+        let requests = std::sync::Arc::new(crate::requests::RequestRuntime::new());
         Self {
             dirs,
             config,
@@ -420,6 +426,7 @@ impl AppState {
             whisper,
             audio_jobs: crate::whisper::AudioJobs::new(),
             jobs,
+            requests,
             http_addr: std::sync::OnceLock::new(),
             remote_health: std::sync::Arc::default(),
             remote_affinity: std::sync::Arc::default(),

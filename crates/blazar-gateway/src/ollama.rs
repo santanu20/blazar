@@ -3558,6 +3558,11 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     );
     let _ = write!(
         merged,
+        "# HELP blazar_requests_inflight Tracked generation requests in flight (this boot)\n# TYPE blazar_requests_inflight gauge\nblazar_requests_inflight {}\n",
+        state.requests.inflight_count()
+    );
+    let _ = write!(
+        merged,
         "# HELP blazar_evictions_total Total instance evictions\n# TYPE blazar_evictions_total counter\nblazar_evictions_total {}\n",
         state.sup.evictions.load(std::sync::atomic::Ordering::Relaxed)
     );

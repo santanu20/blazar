@@ -1565,6 +1565,79 @@ async fn e2e__audio_jobs__unknown_404_and_invalid_id_400() {
         .send()
         .await
         .unwrap();
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Request lifecycle (v0.15): a tracked generation gets a card (model
+/// stamped from the body sniff, request-id header echoed), lands in the
+/// terminal ring after the body drains, and the stop routes teach their
+/// lifetime contract on unknown ids. A hostile id 400s before any lookup.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__requests__card_lifecycle_and_stop_contracts() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let request_id = resp
+        .headers()
+        .get("x-blazar-request-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("tracked lane stamps x-blazar-request-id")
+        .to_string();
+    // Drain the body so the card reaches its terminal state.
+    let _body: serde_json::Value = resp.json().await.unwrap();
+
+    let list: serde_json::Value = c
+        .get(format!("{}/v1/requests?state=done&model=m1", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list["object"], "blazar.request.list", "list shape: {list}");
+    let card = list["data"]
+        .as_array()
+        .and_then(|d| d.iter().find(|c| c["id"].as_str() == Some(&request_id)))
+        .unwrap_or_else(|| panic!("card {request_id} in terminal list: {list}"));
+    assert_eq!(card["state"], "done");
+    assert_eq!(card["model"], "m1");
+    assert_eq!(card["status"], 200);
+
+    let got: serde_json::Value = c
+        .get(format!("{}/v1/requests/{request_id}", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(got["id"], *card["id"].as_str().unwrap());
+    // Terminal card: no live stop URLs anymore.
+    assert!(got.get("cancel_url").is_none());
+
+    // Unknown id teaches the lifetime; traversal 400s.
+    let resp = c
+        .post(format!("{}/v1/requests/req_nope/cancel", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let resp = c
+        .post(format!("{}/v1/requests/..%2Fetc/interrupt", ts.base))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 400, "encoded traversal is an invalid id");
     ts.state.sup.shutdown_all().await.unwrap();
 }

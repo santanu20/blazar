@@ -11,6 +11,7 @@ pub mod histogram;
 pub mod http_pool;
 pub mod images;
 pub mod jobs;
+pub mod requests;
 
 pub mod keys;
 pub mod latechunk;
@@ -302,6 +303,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/jobs/{id}/cancel", post(jobs::jobs_cancel))
         .route("/v1/jobs/{id}/events", get(jobs::jobs_events))
         .route("/v1/jobs/{id}/artifact", get(jobs::jobs_artifact))
+        // Request lifecycle (v0.15): in-flight generation cards +
+        // programmatic cancel/interrupt. Cards are per-boot memory;
+        // the durable history plane is /v1/jobs above.
+        .route("/v1/requests", get(requests::requests_list))
+        .route("/v1/requests/{id}", get(requests::requests_get))
+        .route("/v1/requests/{id}/cancel", post(requests::requests_cancel))
+        .route(
+            "/v1/requests/{id}/interrupt",
+            post(requests::requests_interrupt),
+        )
         .route("/v1/audio/capabilities", get(whisper::audio_capabilities))
         .route("/v1/images/generations", post(images::generations))
         .route("/v1/images/edits", post(images::edits))
@@ -400,6 +411,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             sessions::pin_mw,
+        ))
+        // Request lifecycle (v0.15): tracked generation lanes get a card
+        // stamped `x-blazar-request-id` and become cancelable by id from
+        // a second connection. Inside auth (key identity is on the
+        // request extensions) and inside the body limit (the model sniff
+        // is bounded under it). Non-tracked paths: verbatim passthrough.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            requests::lifecycle,
         ))
         // Hardening: 50 MiB request ceiling (audio uploads fit; nothing
         // legit is larger locally).
@@ -833,6 +853,8 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
                         "/v1/audio/jobs/{id}/cancel", "/v1/audio/capabilities",
                         "/v1/jobs", "/v1/jobs/{id}", "/v1/jobs/{id}/cancel",
                         "/v1/jobs/{id}/events", "/v1/jobs/{id}/artifact",
+                        "/v1/requests", "/v1/requests/{id}",
+                        "/v1/requests/{id}/cancel", "/v1/requests/{id}/interrupt",
                         "/audio/transcriptions", "/audio/translations"],
             "ollama": ["/api/chat", "/api/generate", "/api/tags", "/api/ps", "/api/show",
                        "/api/embeddings", "/api/embed", "/api/rerank", "/api/pull",
