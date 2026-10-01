@@ -7,9 +7,14 @@
 #   curl --proto '=https' --tlsv1.2 -fsSL <raw-url-of-this-file> | sh
 #
 # From a checkout: builds fresh with cargo first (zero-arg runs never
-# install a stale target/release), then installs system-wide. Missing
-# compile toolchain (cc/rust)? scripts/bootstrap.sh --minimal provisions
-# it automatically — announce-then-act, never silently.
+# install a stale target/release), then installs system-wide. A COMPILE
+# failure is fatal — the release binary must never mask a broken tree.
+# Only ENVIRONMENT failures (missing toolchain, failed bootstrap) fall
+# back to the release channel, loudly. Missing compile toolchain
+# (cc/rust)? scripts/bootstrap.sh --minimal provisions it automatically
+# — announce-then-act, never silently. Force the release channel from a
+# checkout by setting BLAZAR_REPO (or BLAZAR_INSTALL_BASE_URL): the
+# auto-build lane is then skipped entirely.
 #
 # Verifies the asset sha256 from the GitHub release API (the same source
 # of truth as `blazar engine update`) before installing anything.
@@ -63,8 +68,46 @@ set -eu
 REPO="${BLAZAR_REPO:-}"
 API_BASE="${BLAZAR_INSTALL_BASE_URL:-https://api.github.com/repos/${REPO}}"
 
-status() { echo ">>> $*" >&2; }
-error() { echo "ERROR: $*" >&2; exit 1; }
+# Which artifact actually got installed — every lane sets this before
+# install_system runs, and the final summary prints it. A checkout dev
+# whose build silently fell back to the release binary debugs ghosts;
+# the tail line makes the channel impossible to miss.
+INSTALL_ORIGIN="release"
+INSTALL_ORIGIN_NOTE=
+
+# ---- presentation ------------------------------------------------------------
+# Color + glyphs on a tty; plain ASCII through pipes and CI logs. Message
+# TEXT is identical either way — only the wrapper changes, so greps (tests,
+# doctors, journals) keep matching. WARN-prefixed statuses auto-yellow.
+if [ -t 2 ]; then
+    C_BOLD='' C_DIM='' C_GREEN='' C_YELLOW='' C_RED='' C_OFF=''
+    STEP='▸' RULE='────────────────────────────────────'
+else
+    C_BOLD='' C_DIM='' C_GREEN='' C_YELLOW='' C_RED='' C_OFF=''
+    STEP='*' RULE='------------------------------------'
+fi
+
+status() {
+    case "$*" in
+        WARN:*) printf '  %s%s %s%s\n' "$C_YELLOW" "$STEP" "$*" "$C_OFF" >&2 ;;
+        *)     printf '  %s%s %s%s\n' "$C_DIM" "$STEP" "$*" "$C_OFF" >&2 ;;
+    esac
+}
+
+hdr() {
+    printf '\n%s%s %s %s%s\n' "$C_BOLD" "──" "$*" "$RULE" "$C_OFF" >&2
+}
+
+say() {
+    printf '  %s%s%s\n' "$C_GREEN" "$*" "$C_OFF" >&2
+}
+
+error() {
+    printf '  %s%sERROR:%s %s%s%s\n' "$C_BOLD" "$C_RED" "$C_OFF" "$C_RED" "$*" "$C_OFF" >&2
+    exit 1
+}
+
+printf '%s\n' "${C_BOLD}  blazar installer${C_OFF}" >&2
 
 # TLS pinning only when talking to GitHub (test/mirror bases may be http).
 SECURE=
@@ -352,8 +395,8 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --uninstall) UNINSTALL=1 ;;
         --build) FORCE_BUILD=1 ;;
-        --from) shift; [ $# -gt 0 ] || error "--from needs a binary path"; FROM_BIN=$1 ;;
-        --from=*) FROM_BIN=${1#--from=} ;;
+        --from) shift; [ $# -gt 0 ] || error "--from needs a binary path"; FROM_BIN=$1; FROM_FLAG=1 ;;
+        --from=*) FROM_BIN=${1#--from=}; FROM_FLAG=1 ;;
         *) error "unknown option: $1 (supported: --build, --from <binary>, --uninstall)" ;;
     esac
     shift
@@ -436,6 +479,7 @@ build_from_checkout() {
     # to the release channel.
     as_user sh -c 'command -v cargo >/dev/null 2>&1' || return 1
     CK=$(find_checkout) || return 1
+    hdr "build"
     status "building from source: cargo build --release -p blazar-cli (in ${CK})"
     # Always build in the invoking user's environment: a root-run build
     # leaves root-owned artifacts in the user's target/ and breaks every
@@ -450,18 +494,24 @@ build_from_checkout() {
 
 # Zero-argument auto mode: a checkout present -> compile FRESH (never a
 # stale target/release), then install system-wide. Checkout-less runs
-# (curl | sh) fall through to the release channel. A missing toolchain
-# is bootstrapped first (announce-then-act); every failure falls back to
-# the release channel LOUD — never silently.
+# (curl | sh) fall through to the release channel. Failure fatality is
+# split by CAUSE: a missing/failed toolchain is an ENVIRONMENT problem
+# with a known-good remedy (the release channel, loudly); a compile
+# failure is a CODE problem — installing the release binary then would
+# hand the dev a binary that never contained their change while the
+# generic success tail buries the one admission line. So: code fails ->
+# stop, teach the escape (BLAZAR_REPO skips this lane).
 if [ -z "$FROM_BIN" ] && [ "$FORCE_BUILD" = 0 ] &&
    [ -z "${BLAZAR_REPO:-}" ] && [ -z "${BLAZAR_INSTALL_BASE_URL:-}" ]; then
     if find_checkout >/dev/null 2>&1; then
         if ! ensure_toolchain; then
             status "auto: toolchain unavailable (bootstrap failed or BLAZAR_AUTO_BOOTSTRAP=0) — falling back to the release channel"
+            INSTALL_ORIGIN_NOTE=" (source build skipped: toolchain unavailable)"
         elif FROM_BIN=$(build_from_checkout); then
             status "auto: installing the fresh build system-wide (binary + service)"
+            INSTALL_ORIGIN="source build (checkout)"
         else
-            status "auto: source build failed — falling back to the release channel (errors above)"
+            error "auto: source build failed — your tree does not compile; refusing to mask it with the release binary. Fix the errors above, or force the release channel with BLAZAR_REPO=<owner/name> (or run outside a checkout)"
         fi
     fi
 fi
@@ -471,7 +521,13 @@ if [ -n "$FROM_BIN" ]; then
     [ -f "$FROM_BIN" ] || error "--from: no such file: $FROM_BIN"
     [ -x "$FROM_BIN" ] || error "--from: not executable: $FROM_BIN"
     "$FROM_BIN" --version >/dev/null 2>&1 || error "--from: binary does not run: $FROM_BIN"
-    status "Bootstrap install from $FROM_BIN (skipping release download)"
+    # The auto-build lane also lands here with FROM_BIN set — only the
+    # EXPLICIT --from flag means "bootstrap from this file"; the auto
+    # lane has already named its own origin.
+    if [ "${FROM_FLAG:-0}" = 1 ]; then
+        INSTALL_ORIGIN="local binary ($FROM_BIN)"
+        status "Bootstrap install from $FROM_BIN (skipping release download)"
+    fi
 fi
 
 # --build: force the source path (audited/offline installs; never touches
@@ -483,6 +539,7 @@ if [ "$FORCE_BUILD" = 1 ] && [ -z "${FROM_BIN:-}" ]; then
         error "--build: no compile toolchain and bootstrap failed — install Rust (https://rustup.rs) + a C compiler, or set BLAZAR_BOOTSTRAP=<path to scripts/bootstrap.sh>"
     FROM_BIN=$(build_from_checkout) ||
         error "--build: source build failed (cargo output above)"
+    INSTALL_ORIGIN="source build (--build)"
     status "--build: source path forced (no release channel contact)"
 fi
 
@@ -586,6 +643,7 @@ poll_healthz() {
 # fights it for the port.
 install_system() {
     # install_system <binary>
+    hdr "install"
     BIN_DIR="${BLAZAR_SYSTEM_BIN_DIR:-/usr/local/bin}"
     $SUDO mkdir -p "$BIN_DIR" || error "cannot create ${BIN_DIR} (need sudo?)"
     # Replace a possibly-running binary without ETXTBSY: temp file + rename
@@ -746,7 +804,11 @@ EOF
         status "no service manager found — binary installed at ${BIN_DIR}/blazar; start it manually: blazar serve"
     fi
     VER=$("$BIN_DIR/blazar" --version 2>/dev/null || echo "(version check failed)")
-    status "Installed blazar ${VER} system-wide (${BIN_DIR}/blazar${SERVICE_DESC:-})"
+    # `blazar --version` prints "blazar <semver>" — strip the name so the
+    # summary does not read "Installed blazar blazar 0.14.0".
+    VER=${VER#blazar }
+    say "Installed blazar ${VER} system-wide (${BIN_DIR}/blazar${SERVICE_DESC:-})"
+    say "installed artifact: ${INSTALL_ORIGIN}${INSTALL_ORIGIN_NOTE}"
     # The stale-copy race: a leftover user-path copy gets resurrected by
     # services with their own PATH. Remove it as part of every install.
     # -ef (same inode, symlinks followed) works where `readlink -f` does
@@ -790,12 +852,14 @@ EOF
     # The bootstrap lane is llamacpp-only (zero-touch default: any GGUF,
     # fastest cold start). The other engines are one command away — say
     # so, every install, so the choice is discoverable without docs.
+    hdr "engines"
+    menu() { printf '      %-42s %s\n' "$1" "$2" >&2; }
     status "other engines, one command each:"
-    status "  blazar engine install --kind sglang     # SGLang: safetensors lane, best quality + batching (Linux + NVIDIA, ~6 GiB)"
-    status "  blazar engine install --kind mistralrs  # mistral.rs: GGUF + safetensors (~0.8 GiB)"
-    status "  blazar engine install --kind sdcpp      # sd.cpp: diffusion + video checkpoints — Qwen-Image/FLUX/Z-Image/Chroma/SDXL/SD1.5/Wan 2.1 T2V (any GPU via Vulkan, ~0.04-0.3 GiB)"
-    status "  blazar engine install --kind whisper    # whisper: audio transcription + translation (CPU, ~10 MiB; ggml models)"
-    status "  blazar engine list                      # what is installed; blazar engine use <tag> switches the serving engine"
+    menu "blazar engine install --kind sglang"    "SGLang: safetensors lane, best quality + batching (Linux + NVIDIA, ~6 GiB)"
+    menu "blazar engine install --kind mistralrs" "mistral.rs: GGUF + safetensors (~0.8 GiB)"
+    menu "blazar engine install --kind sdcpp"     "sd.cpp: diffusion + video checkpoints — Qwen-Image/FLUX/Z-Image/Chroma/SDXL/SD1.5/Wan 2.1 T2V (any GPU via Vulkan, ~0.04-0.3 GiB)"
+    menu "blazar engine install --kind whisper"   "whisper: audio transcription + translation (CPU, ~10 MiB; ggml models)"
+    menu "blazar engine list"                     "what is installed; blazar engine use <tag> switches the serving engine"
     # Fresh-install start, deferred until the engine exists (see the
     # enable block above). Started even when bootstrap failed: a running
     # crash-looping unit still answers `systemctl status` diagnostics
@@ -812,21 +876,24 @@ EOF
             status "WARN: model pull failed — run: blazar pull ${BLAZAR_INSTALL_MODEL}"
         fi
     fi
+    hdr "ready"
     status "system ready — next steps:"
+    menu() { printf '      %-32s %s\n' "$1" "$2" >&2; }
     if [ -n "${BLAZAR_INSTALL_MODEL:-}" ]; then
-        status "  blazar run ${BLAZAR_INSTALL_MODEL}   # chat REPL (model pulled above)"
+        menu "blazar run ${BLAZAR_INSTALL_MODEL}" "chat REPL (model pulled above)"
     else
-        status "  blazar pull <model>    # e.g. blazar pull Qwen3-0.6B (find one: blazar search qwen3)"
+        menu "blazar pull <model>" "e.g. blazar pull Qwen3-0.6B (find one: blazar search qwen3)"
     fi
-    status "  blazar doctor          # health check with per-row hints"
-    status "engines: llamacpp serves by default; the menu above installs SGLang or mistral.rs"
-    status "All inference is upstream llama.cpp, mistral.rs and SGLang — the engine authors did the hard parts."
+    menu "blazar doctor" "health check with per-row hints"
+    say "engines: llamacpp serves by default; the menu above installs SGLang or mistral.rs"
+    say "All inference is upstream llama.cpp, mistral.rs and SGLang — the engine authors did the hard parts."
 }
 
 
 # GPU preflight runs before every install_system lane (bootstrap --from,
 # auto-build, release download): the engine bootstrap inside picks its
 # asset by driver presence, so the driver must be provisioned first.
+hdr "gpu preflight"
 gpu_preflight
 
 # Bootstrap/--from/auto-build channels install directly.
@@ -866,6 +933,7 @@ case "$OS" in
 esac
 
 STATUS_OS_ARCH="${STATUS_OS} ${RUST_ARCH} (${LIBC})"
+hdr "release"
 status "Looking for release ${BLAZAR_VERSION:-latest} for ${STATUS_OS_ARCH}..."
 
 # Latest-or-pinned release metadata from the GitHub API.
@@ -909,6 +977,7 @@ EXPECT=${EXPECT#sha256:}
 ASSET_URL=$(printf '%s' "$RELEASE_JSON" | tr ',' '\n' | grep -o '"browser_download_url": *"[^"]*"' |
     sed -e 's/.*"browser_download_url": *"\([^"]*\)".*/\1/' | grep -F "/$ASSET" | head -1)
 ASSET_URL=${ASSET_URL:-${API_BASE}/releases/download/${TAG}/${ASSET}}
+INSTALL_ORIGIN="release ${TAG}${INSTALL_ORIGIN_NOTE}"
 status "Downloading ${ASSET} (${TAG})..."
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT

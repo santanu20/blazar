@@ -148,3 +148,37 @@ Box: RTX 4070 Laptop (discrete) + Intel RPL-S iGPU (integrated) + llvmpipe (soft
 - Live child argv: `--device Vulkan1` — the supervisor pinned the discrete card and did not reference the integrated one. Daemon log: `auto GPU pick: most free VRAM ... device=Vulkan1 free_mib=7792`; `spawn settle: card=Vulkan1 measured_mib=4257 predicted_mib=7577 used_pct=56` (measured-vs-predicted belt works on Vulkan devices).
 - Boundary (unchanged, honest): spanning across 2 GPUs needs 2 DISCRETE cards — this box's second GPU is integrated and correctly invisible to spanning; no software can add a discrete CUDA device, so auto-TP/mistralrs-spanning spawn stays unit-fixture-proven. The `GGML_VK_VISIBLE_DEVICES` strict-subset emission (iGPU-exclusion case) also stays unit-proven: this box has exactly 2 Vulkan devices, so the identity set correctly emits nothing.
 - Teardown: sandbox dir removed, port free, no engine children, GPU idle (16 MiB).
+
+## 13. 20261001 — install.sh cause-split fatality (compile failure never release-masked)
+
+Root cause: auto-mode fallback keyed on MODE (auto vs --build) instead of failure CAUSE — a broken
+checkout compiled to nothing and the installer still succeeded with the release binary, generic
+success tail burying the one admission line (dev debugs a binary that never shipped their change).
+
+Change (scripts/install.sh):
+- Compile failure in auto mode -> FATAL error(), nothing installed, message teaches the escape:
+  BLAZAR_REPO=<owner/name> (or running outside a checkout) forces the release channel.
+- Toolchain/bootstrap failure (environment) -> unchanged loud release fallback.
+- Every lane records INSTALL_ORIGIN (source build (checkout) / source build (--build) /
+  local binary (<path>) / release <tag> [+ skipped-note]) and install_system's summary now
+  prints "installed artifact: <origin>" — channel visible at the tail, success AND fallback.
+
+Proofs (tests/install_e2e.sh, real cargo invoked, hermetic fake release API):
+- NEW case 11: broken fake checkout, no API base -> rc!=0, no binary, no unit; error contains
+  "does not compile" + BLAZAR_REPO escape; "Looking for release" ABSENT (release channel never
+  contacted after code failure).
+- NEW case 12: --from lane prints "installed artifact: local binary".
+- Case 1 extended: release lane prints "installed artifact: release <tag>".
+- Suite: 56/56 PASS (51 pre-existing untouched + 5 new/extended). shellcheck -S warning clean
+  on both files.
+- Coverage boundary: the toolchain-unavailable -> release-fallback arm is unchanged byte-for-byte
+  and untested hermetically (any hermetic API base disables the auto lane by design); pre-existing
+  gap, not touched by this change.
+
+## 13. Installer cause-split + presentation (2026-10-01)
+
+- scripts/install.sh: compile failure in the auto lane is now FATAL (broken checkout never silently ships the release binary; escape hatches printed). Toolchain-unavailable keeps the loud release fallback. Every lane records its artifact origin and the summary prints `installed artifact: <origin>`.
+- Presentation: tty-gated colors + section rules + step glyphs; identical text when piped (all e2e greps stable).
+- tests/install_e2e.sh: 58/58 pass — broken-checkout fatal + release-never-contacted, good-checkout origin label, --from origin, release-lane origin. Hermetic rustup + fake workspace fixes documented in-file.
+- Demo runs against a local fake release API (canonical /releases/download/<tag>/<asset> path construction verified; sha256-mismatch guard verified rendering fatal).
+- Noted observation (no action): the engine-bootstrap child prints its own ANSI logging lines outside the installer's step formatting; acceptable child output.

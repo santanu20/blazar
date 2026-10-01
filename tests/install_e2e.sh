@@ -185,6 +185,9 @@ else
     bad "empty memory knob did not omit MemoryHigh (rc=$RC)"
 fi
 echo "$OUT" | grep -q "sha256 verified" && ok "digest verified message" || bad "no 'sha256 verified' in output"
+echo "$OUT" | grep -q "installed artifact: release ${TAG}" &&
+    ok "summary names the artifact origin (release)" ||
+    bad "summary does not name the release artifact origin"
 # --- 2. tampered digest ------------------------------------------------------
 # Flip the leading hex char to one guaranteed different from the real one:
 # the tarball is built on the test host, so its digest is host-dependent and
@@ -580,6 +583,100 @@ OWN=$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(f"{s.st_uid}:{s.s
 [ "$OWN" = "$(id -u):$(id -g)" ] &&
     ok "data dir owned by invoking user after install" ||
     bad "data dir ownership wrong after install: '${OWN:-missing}'"
+
+# --- 11. auto mode: compile failure is FATAL, never release-masked -------------
+# A checkout whose code does not compile must abort the install: the
+# release binary would otherwise mask a broken tree (the dev debugs a
+# binary that never contained their change). Broken fake checkout +
+# NO BLAZAR_INSTALL_BASE_URL/BLAZAR_REPO -> the auto-build lane fires;
+# cargo fails; install.sh must error, teach the BLAZAR_REPO escape, and
+# never contact the release API ("Looking for release" absent proves it).
+BROKEN_CK="$TMP/brokenck"
+mkdir -p "$BROKEN_CK/crates/blazar-cli/src"
+printf '[workspace]\nmembers = ["crates/blazar-cli"]\nresolver = "2"\n' > "$BROKEN_CK/Cargo.toml"
+cat > "$BROKEN_CK/crates/blazar-cli/Cargo.toml" <<'EOF'
+[package]
+name = "blazar-cli"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "blazar"
+path = "src/main.rs"
+EOF
+printf 'fn main() { this is not rust }\n' > "$BROKEN_CK/crates/blazar-cli/src/main.rs"
+rm -rf "$SYSTEM_BIN" "$UNIT_OUT"
+AUTO_ENV="HOME=$TMP/home BLAZAR_SUDO=$TMP/fakesudo BLAZAR_SYSTEMCTL=$TMP/fakesystemctl BLAZAR_SYSTEM_BIN_DIR=$SYSTEM_BIN BLAZAR_UNIT_PATH=$UNIT_OUT BLAZAR_SERVICE_DATA_DIR=$TMP/home/.local/share/blazar BLAZAR_INSTALL_ENGINE=0 BLAZAR_AUTO_DRIVER=0 BLAZAR_AUTO_BOOTSTRAP=0 BLAZAR_CHECKOUT=$BROKEN_CK"
+# The installer builds as the temp-HOME user; rustup's proxy needs the
+# REAL toolchain homes to resolve a cargo at all (hermetic HOME alone
+# yields "no default toolchain configured" instead of a compile verdict).
+# Explicit real-home defaults first; an exporting environment overrides
+# (env applies the last occurrence of a repeated assignment).
+AUTO_ENV="$AUTO_ENV RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo"
+case "${RUSTUP_HOME:-}" in /*) AUTO_ENV="$AUTO_ENV RUSTUP_HOME=$RUSTUP_HOME" ;; esac
+case "${CARGO_HOME:-}" in /*) AUTO_ENV="$AUTO_ENV CARGO_HOME=$CARGO_HOME" ;; esac
+OUT=$(env $AUTO_ENV sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
+if [ "$RC" != 0 ] && [ ! -e "$SYSTEM_BIN/blazar" ] && [ ! -e "$UNIT_OUT" ]; then
+    ok "auto: compile failure fatal, nothing installed"
+else
+    bad "auto: compile failure not fatal (rc=$RC)"
+fi
+echo "$OUT" | grep -q "does not compile" &&
+    ok "auto: error names the cause (tree does not compile)" ||
+    bad "auto: error does not name the cause"
+echo "$OUT" | grep -q "BLAZAR_REPO" &&
+    ok "auto: error teaches the release-channel escape (BLAZAR_REPO)" ||
+    bad "auto: error missing the BLAZAR_REPO escape"
+if echo "$OUT" | grep -q "Looking for release"; then
+    bad "auto: release channel contacted despite fatal build failure"
+else
+    ok "auto: release channel never contacted after build failure"
+fi
+
+# --- 12. --from lane names its artifact origin --------------------------------
+rm -rf "$SYSTEM_BIN" "$UNIT_OUT" "${TMP:?}/home"
+mkdir -p "$TMP/home"
+OUT=$(env $INSTALL_ENV sh "$INSTALL_SH" --from "$STAGE/blazar" 2>&1) && RC=0 || RC=$?
+if [ "$RC" = 0 ] && [ -x "$SYSTEM_BIN/blazar" ] &&
+   echo "$OUT" | grep -q "installed artifact: local binary"; then
+    ok "--from: installed and summary names the local-binary origin"
+else
+    bad "--from: origin line missing or install failed (rc=$RC)"
+fi
+
+# --- 13. auto mode: successful checkout build names the source origin ----------
+# A minimal WORKING checkout (real cargo compile, seconds, no deps): the
+# auto lane must install the fresh build and label it "source build
+# (checkout)" — not the --from voice ("Bootstrap install from") and not
+# the release artifact line.
+GOOD_CK="$TMP/goodck"
+mkdir -p "$GOOD_CK/crates/blazar-cli/src"
+printf '[workspace]\nmembers = ["crates/blazar-cli"]\nresolver = "2"\n' > "$GOOD_CK/Cargo.toml"
+cat > "$GOOD_CK/crates/blazar-cli/Cargo.toml" <<'EOF'
+[package]
+name = "blazar-cli"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "blazar"
+path = "src/main.rs"
+EOF
+printf 'fn main() { println!("blazar 0.0.0-test"); }\n' > "$GOOD_CK/crates/blazar-cli/src/main.rs"
+rm -rf "$SYSTEM_BIN" "$UNIT_OUT" "${TMP:?}/home"
+mkdir -p "$TMP/home"
+OUT=$(env $AUTO_ENV BLAZAR_CHECKOUT="$GOOD_CK" sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
+if [ "$RC" = 0 ] && [ -x "$SYSTEM_BIN/blazar" ] &&
+   echo "$OUT" | grep -q "installed artifact: source build (checkout)"; then
+    ok "auto: successful build installed and labeled source build (checkout)"
+else
+    bad "auto: source-build origin line missing or install failed (rc=$RC)"; echo "$OUT" | sed 's/^/    /'
+fi
+if echo "$OUT" | grep -q "Bootstrap install from"; then
+    bad "auto: success path uses the --from bootstrap voice"
+else
+    ok "auto: success path keeps the auto-build voice"
+fi
 
 echo "install e2e: $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]
