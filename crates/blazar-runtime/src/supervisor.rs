@@ -3977,7 +3977,12 @@ impl Supervisor {
                 mmproj_path: model.mmproj_path.as_deref(),
                 components: &component_args(&model.components),
                 // KV-estimate probe: policy-neutral (mirror the spawn's
-                // own key-derived force below for estimate honesty)
+                // own key-derived force below for estimate honesty).
+                // Device-neutral too: this probe ladders KV without the
+                // CUDA symmetric-pair rule the spawn applies once a
+                // device is picked — the estimate errs toward MORE KV
+                // bytes (mixed 3/8 vs the spawn's q4_0 1/4), so capacity
+                // decisions stay conservative in that narrow window.
                 mmproj_force: key.ends_with("@vision"),
                 engine_tag: &manifest.tag,
                 supported_flags: &manifest.flags,

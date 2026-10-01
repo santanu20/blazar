@@ -764,9 +764,13 @@ relocatable/verified engine store.
   explicit `load_mode` always wins; low-`RLIMIT_MEMLOCK` boxes degrade
   to a benign upstream warning + plain mmap), and `cache_reuse`
   defaults to 0 — the engine's native slot prompt-cache already covers
-  identical prefixes (16x on re-ask, measured) while `--cache-reuse`
-  cost ~0.6s on every cold load; opt back in for cross-slot prefix
-  sharing. Measured free within noise and left unchanged: `--metrics`,
+  identical and extended prefixes (99.5% of tokens skipped on re-ask,
+  measured), and the engine force-disables `--cache-reuse` at load on
+  hybrid-linear archs (interleaved-rope KV cannot shift), so the flag
+  only engages on full-attention models; opt back in there for
+  within-child mid-prompt prefix sharing. (An earlier "~0.6s per cold
+  load" figure was n=3 fadvise-cold sweep noise — unreproducible on
+  the current stack, measured delta ~0.) Measured free within noise and left unchanged: `--metrics`,
   `--jinja` (quality path), `-b/-ub` at llama defaults, threads 8/16/24,
   KV q8_0, ctx 4096 vs 16384 warm.
 

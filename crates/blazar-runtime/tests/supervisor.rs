@@ -181,8 +181,10 @@ async fn integration__ensure_ready__health_and_argv_flags() {
             "missing {flag} in {argv:?}"
         );
     }
-    // cache-reuse defaults OFF (elim sweep 2026-09-12: native slot cache
-    // covers identical prefixes; --cache-reuse cost ~0.6s cold).
+    // cache-reuse defaults OFF (native slot cache covers identical and
+    // extended prefixes; the engine force-disables it at load on
+    // hybrid-linear archs, so it only engages on full-attention models
+    // — the retired "~0.6s cold" claim was sweep noise, unreproducible).
     assert!(
         !argv.contains(&"--cache-reuse".to_string()),
         "cache-reuse must not ride the default argv: {argv:?}"

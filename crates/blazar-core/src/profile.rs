@@ -410,8 +410,14 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             } else {
                 let (k, v) = config.effective_cache_type_kv(input.model_name);
                 if k.is_empty() && v.is_empty() {
-                    kv_quant_ladder(input, vram_bytes, rs.total_ctx, &mut scratch)
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                    kv_quant_ladder(
+                        input,
+                        vram_bytes,
+                        rs.total_ctx,
+                        tuning.fa == Some(false),
+                        &mut scratch,
+                    )
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
                 } else if k == v {
                     // Symmetric f16-class pin = force off (full-size math).
                     match k.as_str() {
@@ -555,11 +561,20 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // --- 5. prefix-cache chunk reuse. Upstream disables cache_reuse
     // whenever a multimodal projector is attached ("cache_reuse is not
     // supported by multimodal") — emitting it on VL spawns is dead argv
-    // that misleads profile readers, so skip and say why.
+    // that misleads profile readers, so skip and say why. Same for
+    // hybrid-linear archs: their interleaved-rope KV cannot shift
+    // (llama_memory_can_shift is false), so the engine zeroes the knob
+    // at load with its own warning — dead argv there too.
     if config.cache_reuse > 0 {
         if input.mmproj_path.is_some() {
             warnings.push(
                 "cache_reuse skipped: upstream disables it with a multimodal projector attached (mmproj); prefix reuse is unavailable on VL spawns".into(),
+            );
+        } else if matches!(input.meta, ModelMeta::Gguf(g)
+            if g.attention_class() == crate::gguf::AttentionClass::HybridLinear)
+        {
+            warnings.push(
+                "cache_reuse skipped: upstream disables it at load on hybrid-linear archs (interleaved-rope KV cannot shift) — it only engages on full-attention models; the native slot prompt-cache still covers identical and extended prefixes".into(),
             );
         } else {
             argv.push("--cache-reuse".into());
@@ -579,7 +594,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     } else {
         let (k, v) = config.effective_cache_type_kv(input.model_name);
         if k.is_empty() && v.is_empty() {
-            match kv_quant_ladder(input, vram_bytes, ctx, &mut warnings) {
+            match kv_quant_ladder(input, vram_bytes, ctx, fa == "off", &mut warnings) {
                 Some((k, v)) => (Some(k.to_string()), Some(v.to_string())),
                 None => (None, None),
             }
@@ -3113,9 +3128,7 @@ fn push_sdcpp_tuning(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings:
         // it only when the auto-picked device is CUDA-class; an explicit
         // extra_args --sage-attn stays the escape hatch for user-owned
         // --backend postures.
-        let cuda_device = input
-            .device_hint
-            .is_some_and(|d| d.to_ascii_uppercase().starts_with("CUDA"));
+        let cuda_device = cuda_class_device(input);
         if cuda_device {
             push_gated(input, argv, warnings, "sage_attn", "--sage-attn", &[]);
         } else {
@@ -4727,10 +4740,30 @@ fn resolve_ctx(
 /// — K precision dominates attention retrieval, V tolerates the heavier
 /// quant at better quality than symmetric `q4_0` (SnapKV/PyramidKV lineage).
 /// Missing GGUF fields skip with a named warning — never guessed.
+/// True when the spawn's device hint resolves to a CUDA-class GPU
+/// (e.g. "CUDA0"); `None` or other backends (Vulkan/Metal/CPU) are false.
+fn cuda_class_device(input: &ProfileInput<'_>) -> bool {
+    input
+        .device_hint
+        .is_some_and(|d| d.to_ascii_uppercase().starts_with("CUDA"))
+}
+
+/// True when the ENGINE BUILD is CUDA-class. Flash-attention kernel
+/// coverage is a property of the engine binary, not the picked device,
+/// so the llamacpp KV ladder keys on this. Mirror of the runtime's
+/// `engine::is_cuda_engine` tag convention (`bNNNN-cuda` overlays and
+/// `engine build cuda` source builds); builds whose tag escapes the
+/// convention read false here and simply keep the mixed KV lane
+/// (status-quo behavior, never worse).
+fn cuda_class_engine(engine_tag: &str) -> bool {
+    engine_tag.ends_with("-cuda")
+}
+
 fn kv_quant_ladder(
     input: &ProfileInput<'_>,
     vram_bytes: u64,
     ctx: u32,
+    fa_off: bool,
     warnings: &mut Vec<String>,
 ) -> Option<(&'static str, &'static str)> {
     // The multimodal projector is GPU-resident too — capacity math that
@@ -4754,13 +4787,34 @@ fn kv_quant_ladder(
     } else if resident.saturating_add(kv / 2) <= budget {
         Some(("q8_0", "q8_0"))
     } else if resident.saturating_add(kv * 3 / 8) <= budget {
-        warnings.push(
-            "KV differential quant engaged: K=q8_0 V=q4_0 (3/8 of f16 KV bytes) — K precision \
-             dominates retrieval quality, V carries the heavier quant; pin cache_type for a \
-             symmetric grade"
-                .into(),
-        );
-        Some(("q8_0", "q4_0"))
+        // Stock upstream engine builds compile flash-attention kernels
+        // only for SYMMETRIC K/V quant pairs (GGML_CUDA_FA_QUANT defaults):
+        // a mixed pair rides an f16-conversion path around every attention
+        // op — measured ~4% decode t/s loss on a CUDA device (b11293,
+        // qwen3.5-9b: 38.1 vs 39.8 tok/s) and the engine logs it "slow".
+        // FA-off spawns never touch those kernels, and non-CUDA backends
+        // dequantize mixed pairs natively, so only the CUDA+FA lane falls
+        // to symmetric q4_0 (native kernel, KV/4 bytes). Explicit
+        // cache_type_k/v pins bypass this ladder entirely.
+        if !fa_off && cuda_class_engine(input.engine_tag) {
+            warnings.push(
+                "KV differential quant skipped on this CUDA engine build: stock engine builds \
+                 ship flash-attention kernels only for symmetric K/V pairs — q8_0/q4_0 \
+                 dequantizes to f16 around every attention op (measured ~4% decode loss; \
+                 the engine logs it as slow); using q4_0/q4_0 instead (native kernel, \
+                 KV/4 bytes). Pin cache_type_k/v to force the mixed grade"
+                    .into(),
+            );
+            Some(("q4_0", "q4_0"))
+        } else {
+            warnings.push(
+                "KV differential quant engaged: K=q8_0 V=q4_0 (3/8 of f16 KV bytes) — K precision \
+                 dominates retrieval quality, V carries the heavier quant; pin cache_type for a \
+                 symmetric grade"
+                    .into(),
+            );
+            Some(("q8_0", "q4_0"))
+        }
     } else {
         if resident.saturating_add(kv / 4) > budget {
             warnings.push(
@@ -6278,7 +6332,9 @@ mod tests {
             .any(|w| w[0] == "--gpu-layers" && w[1] == "999"));
         assert_eq!(p.gpu, "full");
         // Rule 5: cache-reuse defaults OFF (native slot cache covers
-        // identical prefixes; --cache-reuse measured +0.6s cold)
+        // identical/extended prefixes; engine force-disables it at load
+        // on hybrid-linear archs, so it only engages on full-attention
+        // models — the retired "~0.6s cold" claim was sweep noise)
         assert!(!p.argv.contains(&"--cache-reuse".to_string()));
         // Rule 6: KV at the scaled total = 2*28*8*64*32768*2 = 938MB;
         // +5GB < 0.9*12GB -> NO kv quant
@@ -6488,6 +6544,36 @@ mod tests {
             "skip must warn: {:?}",
             p.warnings
         );
+    }
+
+    #[test]
+    fn unit__rule5__cache_reuse_skipped_on_hybrid_linear_arch() {
+        // Upstream zeroes cache_reuse at load on hybrid-linear archs
+        // (interleaved-rope KV cannot shift): the flag must not ride the
+        // argv there, and the skip must be said aloud.
+        let hw = gpu_hw(24_000, 64_000, 8);
+        let cfg = Config {
+            cache_reuse: 256,
+            ..Config::default()
+        };
+        let m = GgufMeta {
+            architecture: "qwen35".into(),
+            ..meta()
+        };
+        let i = input(&m, &hw, &cfg, &ALL_FLAGS);
+        let p = compile(&i, &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.contains(&"--cache-reuse".to_string()));
+        assert!(
+            p.warnings.iter().any(|w| w.contains("hybrid-linear")),
+            "skip must warn: {:?}",
+            p.warnings
+        );
+        // Control: a full-attention arch with the same knob DOES get the
+        // flag — the gate is arch-scoped, not a blanket suppression.
+        let m_full = meta();
+        let i_full = input(&m_full, &hw, &cfg, &ALL_FLAGS);
+        let p_full = compile(&i_full, &TuningOverrides::default()).unwrap();
+        assert!(p_full.argv.contains(&"--cache-reuse".to_string()));
     }
 
     #[test]
@@ -8063,7 +8149,7 @@ mod tests {
         let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
         inp.model_bytes = 4_800 * MIB;
         let mut warnings = Vec::new();
-        let rung = kv_quant_ladder(&inp, Hardware::bytes(8_400), 131_072, &mut warnings);
+        let rung = kv_quant_ladder(&inp, Hardware::bytes(8_400), 131_072, false, &mut warnings);
         assert_eq!(rung, Some(("q8_0", "q4_0")));
         assert!(
             warnings
@@ -8071,6 +8157,43 @@ mod tests {
                 .any(|w| w.contains("differential quant engaged")),
             "{warnings:?}"
         );
+    }
+
+    #[test]
+    fn unit__kv_differential__cuda_fa_lane_falls_to_symmetric_q4() {
+        // Same capacity window as the mixed-lane test, but the engine
+        // build is CUDA-class (tag ends -cuda) and FA stays on: stock
+        // engine builds have no flash-attention kernel for mixed pairs,
+        // so the ladder must fall to symmetric q4_0 (native kernel) and
+        // say why.
+        // Same numbers as the fixture above — the ONLY axis that moves
+        // is the engine build class (tag ends -cuda) and FA.
+        let cfg = Config {
+            default_ctx: 131_072,
+            ..Config::default()
+        };
+        let hw = gpu_hw(8_400, 13_674, 8);
+        let g = GgufMeta {
+            context_length: Some(131_072),
+            ..meta()
+        };
+        let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        inp.model_bytes = 4_800 * MIB;
+        inp.engine_tag = "b-test-cuda";
+        let mut warnings = Vec::new();
+        let rung = kv_quant_ladder(&inp, Hardware::bytes(8_400), 131_072, false, &mut warnings);
+        assert_eq!(rung, Some(("q4_0", "q4_0")));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("differential quant skipped")),
+            "{warnings:?}"
+        );
+        // FA-off spawns never touch the FA kernels: the mixed lane is
+        // safe there even on a CUDA build (native dequant paths).
+        let mut warnings2 = Vec::new();
+        let rung2 = kv_quant_ladder(&inp, Hardware::bytes(8_400), 131_072, true, &mut warnings2);
+        assert_eq!(rung2, Some(("q8_0", "q4_0")));
     }
 
     #[test]

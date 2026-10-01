@@ -1547,12 +1547,16 @@ pub(crate) async fn apply_num_ctx(
                     // legacy symmetric) is sovereign (single shot,
                     // mirroring the compiler's explicit-beats-ladder
                     // doctrine); an unpinned one LADDERS
-                    // f16 -> q8_0 -> q8_0/q4_0 -> q4_0 exactly like the
-                    // spawn compiler's kv_quant_ladder, so the preflight
-                    // never refuses a pin the spawn itself would host
-                    // (split-brain observed live: a 65536 vision pin
-                    // refused at f16 math while the spawn laddered to
-                    // q8_0 happily).
+                    // f16 -> q8_0 -> q8_0/q4_0 -> q4_0 like the spawn
+                    // compiler's kv_quant_ladder (which additionally
+                    // skips the mixed rung on CUDA+FA spawns — no
+                    // symmetric-pair flash-attention kernel in stock
+                    // builds; the mixed rung here stays feasibility-
+                    // equivalent: anything it fits, the smaller q4_0
+                    // rung fits too), so the preflight never refuses a
+                    // pin the spawn itself would host (split-brain
+                    // observed live: a 65536 vision pin refused at f16
+                    // math while the spawn laddered to q8_0 happily).
                     let (eff_k, eff_v) = state.config.effective_cache_type_kv(model);
                     let pair_set = !eff_k.is_empty() || !eff_v.is_empty();
                     let ladder: Vec<Option<(String, String)>> = if pair_set {

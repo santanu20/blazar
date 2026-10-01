@@ -159,9 +159,16 @@ pub struct Config {
     pub mcp_servers_json: Option<String>,
     /// Min chunk size for KV-shift prefix reuse; 0 disables. Default 0:
     /// the engine's native slot prompt-cache already covers identical
-    /// prefixes (16x on re-ask, measured) at zero cost, while the
-    /// `--cache-reuse` path measured ~0.6s SLOWER cold loads (elim
-    /// sweep 2026-09-12). Opt back in for within-child prefix reuse:
+    /// and extended prefixes (99.5% of tokens skipped on re-ask,
+    /// measured) at zero cost, and the engine force-disables
+    /// `--cache-reuse` at load on hybrid-linear archs (qwen35/
+    /// qwen3next/qwen4exp: interleaved-rope KV cannot shift — upstream
+    /// warns `cache_reuse is not supported by this context`), so the
+    /// flag only ever engages on full-attention archs. An earlier
+    /// "~0.6s slower cold loads" note (elim sweep 2026-09-12, n=3
+    /// fadvise-cold) is retired: not reproducible on the current stack
+    /// (measured delta ~0 where the flag engages at all). Opt in for
+    /// within-child mid-prompt prefix reuse on full-attention models:
     /// `--cache-reuse N` reuses KV chunks from that child's own slot
     /// cache (per-process; never cross-replica — each replica is a
     /// separate llama-server with its own cache).
