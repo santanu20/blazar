@@ -908,7 +908,7 @@ fn main() {
     };
     blazar_core::telemetry::init_tracing(0, log_level.as_deref(), log_file.as_deref());
     if let Err(e) = run(cli.cmd) {
-        eprintln!("blazar: {e:#}");
+        eprintln!("{} {e:#}", ansi("1;31", "blazar:"));
         std::process::exit(1);
     }
 }
@@ -1285,7 +1285,7 @@ fn wait_daemon_exit(pidfile: &std::path::Path, deadline: std::time::Instant) -> 
         }
         if !noted {
             noted = true;
-            println!("waiting for the daemon to finish in-flight work (draining)…");
+            println!("{}", dim_line("waiting for the daemon to finish in-flight work (draining)…"));
         }
         if std::time::Instant::now() >= deadline {
             return false;
@@ -1384,12 +1384,12 @@ async fn restart_daemon_impl() -> bool {
         && run_systemctl(&["restart", "blazar", "--no-ask-password"]).await
         && wait_healthz(&base, &http, up_deadline).await
     {
-        println!("daemon restarted — the update is live");
+        println!("{}", ok_line("daemon restarted — the update is live"));
         return true;
     }
     // Lane 2 — launchd kickstart.
     if launchd_kickstart().await && wait_healthz(&base, &http, up_deadline).await {
-        println!("daemon restarted — the update is live");
+        println!("{}", ok_line("daemon restarted — the update is live"));
         return true;
     }
     // Lane 3 — no manager (or no rights): stop must SUCCEED, the
@@ -1420,11 +1420,11 @@ async fn restart_daemon_impl() -> bool {
         }
         match ensure_daemon().await {
             Ok(_) => {
-                println!("daemon restarted — the update is live");
+                println!("{}", ok_line("daemon restarted — the update is live"));
                 return true;
             }
             Err(e) => {
-                eprintln!("warning: could not restart the daemon: {e:#}");
+                eprintln!("{}", warn_line(&format!("warning: could not restart the daemon: {e:#}")));
                 return false;
             }
         }
@@ -1794,6 +1794,37 @@ fn bold_heading(text: &str) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// Terminal-only ANSI accent helpers shared by command output: every one
+/// returns the text untouched when piped or `NO_COLOR` (see
+/// [`cli_colors`]), so scripts and test greps always see plain ASCII.
+fn ansi(code: &str, text: &str) -> String {
+    if cli_colors() {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+/// Success confirmations (green): "pulled …", "attached …", "installed …".
+fn ok_line(text: &str) -> String {
+    ansi("32", text)
+}
+
+/// Cautions the user can act on (yellow).
+fn warn_line(text: &str) -> String {
+    ansi("33", text)
+}
+
+/// Failures (red) — message text itself stays byte-identical.
+fn err_line(text: &str) -> String {
+    ansi("31", text)
+}
+
+/// Secondary detail: hints, menu footers, provenance notes (dim).
+fn dim_line(text: &str) -> String {
+    ansi("2", text)
 }
 
 /// `blazar doctor` — local-state diagnostics: config, store, engine
@@ -2192,7 +2223,7 @@ async fn install_offer_kinds(
     let mut failures = Vec::new();
     for kind in kinds {
         if let Err(e) = install_missing_kind(d, *kind).await {
-            eprintln!("engine install failed: {e:#}");
+            eprintln!("{}", err_line(&format!("engine install failed: {e:#}")));
             eprintln!(
                 "your model is safe in the store — retry with: {}",
                 engine_install_command(*kind)
@@ -2203,7 +2234,7 @@ async fn install_offer_kinds(
     match lane_state_for(d, row) {
         LaneState::Served => {
             if failures.is_empty() {
-                eprintln!("engine ready — this model now has a serving lane");
+                eprintln!("{}", ok_line("engine ready — this model now has a serving lane"));
             } else {
                 eprintln!(
                     "engine ready — this model now has a serving lane (skipped: {})",
@@ -2354,7 +2385,7 @@ async fn doctor(flat: bool, json: bool) -> Result<()> {
     println!("{}", doctor_footer(&checks));
     if fails == 0 {
         for step in doctor_next_steps(&checks) {
-            println!("next: {step}");
+            println!("{}", dim_line(&format!("next: {step}")));
         }
     }
     Ok(())
@@ -5259,7 +5290,7 @@ async fn serve() -> Result<()> {
         );
     }
     for (what, why) in &reconcile.skipped {
-        println!("warning: preflight skipped {what}: {why}");
+        println!("{}", warn_line(&format!("warning: preflight skipped {what}: {why}")));
     }
     // Boot preflight (2/2): reap engine servers orphaned by a dead
     // supervisor so their VRAM is free for this run.
@@ -5494,7 +5525,7 @@ async fn serve() -> Result<()> {
         }
     }
     served?;
-    println!("blazar stopped cleanly");
+    println!("{}", ok_line("blazar stopped cleanly"));
     Ok(())
 }
 
@@ -5523,7 +5554,7 @@ fn stop() -> Result<()> {
                 .context("taskkill /F")?;
         }
     }
-    println!("signalled daemon pid {pid}");
+    println!("{}", ok_line(&format!("signalled daemon pid {pid}")));
     Ok(())
 }
 
@@ -5656,13 +5687,13 @@ async fn pull_model(target: &str, force: bool) -> Result<(blazar_core::store::Mo
             warning: Some(w), ..
         } = ev
         {
-            println!("warning: {w}");
+            println!("{}", warn_line(&format!("warning: {w}")));
         }
     }
     // Structural GGUF lint (H4): warn-only, explains degraded sizing.
     if let Ok(m) = blazar_core::read_metadata_file(std::path::Path::new(&row.path)) {
         for w in m.lint() {
-            println!("warning: {w}");
+            println!("{}", warn_line(&format!("warning: {w}")));
         }
     }
     Ok((row, already_present))
@@ -5700,7 +5731,7 @@ fn install_model_file(path: &std::path::Path, dest: &std::path::Path, copy: bool
         if std::fs::hard_link(path, dest).is_err() {
             std::os::unix::fs::symlink(path, dest)
                 .with_context(|| format!("symlink {}", dest.display()))?;
-            println!("note: used symlink (hardlink blocked); if the source store deletes the blob, re-import");
+            println!("{}", dim_line("note: used symlink (hardlink blocked); if the source store deletes the blob, re-import"));
         }
     }
     Ok(())
@@ -5733,7 +5764,7 @@ fn mmproj_cmd(model: &str, path: &std::path::Path) -> Result<()> {
     install_model_file(path, &dest, false)?;
     row.mmproj_path = Some(dest.display().to_string());
     store.upsert_model(&row)?;
-    println!("mmproj attached: {} → {model}", dest.display());
+    println!("{}", ok_line(&format!("mmproj attached: {} → {model}", dest.display())));
     Ok(())
 }
 
@@ -5750,7 +5781,7 @@ fn import(
         .map_err(|e| anyhow!("not a readable GGUF ({}): {e}", path.display()))?;
     // Structural GGUF lint (H4): warn-only, explains degraded sizing.
     for w in meta.lint() {
-        println!("warning: {w}");
+        println!("{}", warn_line(&format!("warning: {w}")));
     }
     let file_name = path
         .file_name()
@@ -5835,7 +5866,7 @@ fn import(
         meta.context_length,
         dest.display()
     );
-    println!("zero extra disk used (link, not copy)");
+    println!("{}", ok_line("zero extra disk used (link, not copy)"));
     Ok(())
 }
 
@@ -5914,7 +5945,7 @@ fn render_list_table(header: [&str; 9], rows: &[[String; 9]]) -> String {
     );
 
     let mut out = String::new();
-    for cells in &table {
+    for (i, cells) in table.iter().enumerate() {
         // Trimmed line end: the last column is uncapped, so padding
         // would only leave trailing blanks on copied output.
         let mut line = format!(
@@ -5938,6 +5969,14 @@ fn render_list_table(header: [&str; 9], rows: &[[String; 9]]) -> String {
             cat_w = cat_w
         );
         line.truncate(line.trim_end().len());
+        // Header row carries the same terminal-only bold the search and
+        // engine tables use; widths were computed from the plain text, so
+        // the escape codes can never skew a column.
+        let line = if i == 0 && cli_colors() {
+            format!("\x1b[1m{line}\x1b[0m")
+        } else {
+            line
+        };
         out.push_str(&line);
         out.push('\n');
     }
@@ -6261,7 +6300,7 @@ fn show(model: &str, json: bool) -> Result<()> {
     if let Some(m) = &meta {
         // Structural GGUF lint (H4): warn-only, explains degraded sizing.
         for w in m.lint() {
-            println!("warning: {w}");
+            println!("{}", warn_line(&format!("warning: {w}")));
         }
     }
     if let Some((tag, p)) = profile {
@@ -6326,7 +6365,7 @@ async fn ps(reset: bool, json: bool) -> Result<()> {
             .await?
             .json()
             .await?;
-        println!("circuits reset");
+        println!("{}", ok_line("circuits reset"));
         return Ok(());
     }
     if !json {
@@ -6628,7 +6667,7 @@ async fn watch() -> Result<()> {
 fn cp_cmd(source: &str, destination: &str) -> Result<()> {
     let d = dirs();
     blazar_runtime::models::copy_model(&d, source, destination)?;
-    println!("copied {source} -> {destination} (hardlink, no bytes duplicated)");
+    println!("{}", ok_line(&format!("copied {source} -> {destination} (hardlink, no bytes duplicated)")));
     Ok(())
 }
 
@@ -6641,7 +6680,7 @@ fn rm_multi(models: &[String]) -> Result<()> {
             eprintln!("rm {m}: {e:#}");
             failed.push(m.clone());
         } else {
-            println!("removed {m}");
+            println!("{}", ok_line(&format!("removed {m}")));
         }
     }
     if failed.is_empty() {
@@ -6963,7 +7002,7 @@ async fn keys_cmd(action: Option<KeysAction>) -> Result<()> {
                     out["error"]["message"].as_str().unwrap_or("rm failed")
                 ));
             }
-            println!("removed key {name}");
+            println!("{}", ok_line(&format!("removed key {name}")));
             Ok(())
         }
     }
@@ -7168,7 +7207,7 @@ async fn launch_cmd(command: Vec<String>, warm: Option<String>, key: Option<Stri
     };
     let base = ensure_daemon().await?;
     if let Some(model) = &warm {
-        println!("pre-warming {model} ...");
+        println!("{}", dim_line(&format!("pre-warming {model} ...")));
         let resp = cli_http()
             .post(format!("{base}/v1/chat/completions"))
             .json(&serde_json::json!({
@@ -7211,7 +7250,7 @@ async fn launch_cmd(command: Vec<String>, warm: Option<String>, key: Option<Stri
         cmd.env("OPENAI_API_KEY", &secret);
         cmd.env("ANTHROPIC_API_KEY", &secret);
     }
-    println!("launching {program} against {base}");
+    println!("{}", dim_line(&format!("launching {program} against {base}")));
     let status = cmd
         .status()
         .map_err(|e| anyhow!("exec {program:?}: {e} — is it on PATH?"))?;
@@ -7280,7 +7319,7 @@ fn migrate_cmd() -> Result<()> {
     let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let cfg = blazar_core::Config::from_toml(&raw)?;
     if !blazar_core::Config::raw_has_legacy_keys(&raw) {
-        println!("config already canonical — nothing to migrate");
+        println!("{}", ok_line("config already canonical — nothing to migrate"));
         return Ok(());
     }
     let ts = std::time::SystemTime::now()
@@ -7835,7 +7874,7 @@ async fn stop_cmd(model: Option<String>) -> Result<()> {
         .send()
         .await?;
     if resp.status().is_success() {
-        println!("unloaded {model}");
+        println!("{}", ok_line(&format!("unloaded {model}")));
         Ok(())
     } else {
         let text = resp.text().await.unwrap_or_default();
@@ -8230,7 +8269,7 @@ async fn image_turn(
         },
         Ok(resp) => {
             let msg = resp.text().await.unwrap_or_default();
-            println!("error: {}", msg.trim());
+            println!("{}", err_line(&format!("error: {}", msg.trim())));
         }
         Err(e) => println!("error: {e}"),
     }
@@ -8401,17 +8440,17 @@ async fn video_wait(base: &str, model: &str, job: &str) {
             Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
                 Ok(v) => v,
                 Err(e) => {
-                    println!("error: unreadable job status: {e}");
+                    println!("{}", err_line(&format!("error: unreadable job status: {e}")));
                     return;
                 }
             },
             Ok(r) => {
                 let msg = r.text().await.unwrap_or_default();
-                println!("error: {}", msg.trim());
+                println!("{}", err_line(&format!("error: {}", msg.trim())));
                 return;
             }
             Err(e) => {
-                println!("error: {e}");
+                println!("{}", err_line(&format!("error: {e}")));
                 return;
             }
         };
@@ -8451,7 +8490,7 @@ async fn video_wait(base: &str, model: &str, job: &str) {
                     .get("error")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("daemon logs explain (journalctl -u blazar)");
-                println!("error: {status} — {why}");
+                println!("{}", err_line(&format!("error: {status} — {why}")));
                 return;
             }
             _ => {}
@@ -8654,7 +8693,7 @@ async fn tts_repl(base: &str, voice: &str, inline: Option<&str>) -> Result<()> {
             match speech_post(&base, &voice, &text, speed).await {
                 Ok(wav) => {
                     if let Err(e) = write_speech_out(&voice, &wav, out.as_deref()) {
-                        println!("error: {e}");
+                        println!("{}", err_line(&format!("error: {e}")));
                     } else {
                         println!("({:.1}s)", started.elapsed().as_secs_f64());
                     }
@@ -9105,7 +9144,7 @@ async fn tune_full(
                     .map_or(0.0, |r| r.ts),
                 i64::from(profile.ctx),
             ) {
-                eprintln!("warning: bench history not recorded (engine gate left anchorless): {e}");
+                eprintln!("{}", warn_line(&format!("warning: bench history not recorded (engine gate left anchorless): {e}")));
             }
         } else {
             eprintln!(
@@ -9129,7 +9168,7 @@ async fn tune_full(
             );
             println!("  argv: {}", fixed.argv.join(" "));
         } else {
-            println!("tuned {} — {} configs measured, winner:", model, rows.len());
+            println!("{}", ok_line(&format!("tuned {} — {} configs measured, winner:", model, rows.len())));
             println!("  argv: {}", profile.argv.join(" "));
             println!("  ctx:   {}", profile.ctx);
         }
@@ -9254,7 +9293,7 @@ async fn tune_full(
             cfg2.ngram_min_hits = bh;
             blazar_core::persist_config(&d.config_file(), &cfg2.to_toml()?)?;
             adopted_any = true;
-            println!("adopted ngram_size_m = {bm}, ngram_min_hits = {bh}");
+            println!("{}", ok_line(&format!("adopted ngram_size_m = {bm}, ngram_min_hits = {bh}")));
         } else {
             println!("no clear winner (best {best_tps:.1} vs {second:.1}) — engine defaults stay");
         }
@@ -9319,7 +9358,7 @@ async fn tune_full(
             if probe.r2_tps > probe.r1_tps * 1.3 {
                 set_model_override(model, "replicas", "2")?;
                 adopted_any = true;
-                println!("adopted model_overrides.{model}.replicas = 2");
+                println!("{}", ok_line(&format!("adopted model_overrides.{model}.replicas = 2")));
             } else {
                 println!("keep replicas = 1 (2 children not >1.3x aggregate)");
             }
@@ -9355,7 +9394,7 @@ async fn tune_full(
                 cfg2.cache_reuse = probe.best;
                 blazar_core::persist_config(&d.config_file(), &cfg2.to_toml()?)?;
                 adopted_any = true;
-                println!("adopted cache_reuse = {}", probe.best);
+                println!("{}", ok_line(&format!("adopted cache_reuse = {}", probe.best)));
             } else {
                 println!("keep cache_reuse = 256 (no candidate >5% faster and >50 ms >5% faster)");
             }
@@ -9940,7 +9979,7 @@ fn quick_tg(d: &BlazarDirs, _row: &blazar_core::EngineRow, model_path: &str) -> 
     let tuner = blazar_runtime::bench::Tuner { dirs: d, bench_bin };
     // llama-bench loads the full model before its first row appears —
     // say so or the probe reads as a silent multi-second hang.
-    println!("probing decode (tg128; loads the model first, ~30-60s)...");
+    println!("{}", dim_line("probing decode (tg128; loads the model first, ~30-60s)..."));
     let rows = tuner.bench_default(std::path::Path::new(model_path))?;
     let tg = rows
         .iter()
@@ -9990,7 +10029,7 @@ fn engine_regression_gate(
             );
         }
         if let Err(e) = store.record_bench(&row.tag, &model, new_tg, 0.0, 0) {
-            eprintln!("warning: engine-gate bench row not recorded: {e}");
+            eprintln!("{}", warn_line(&format!("warning: engine-gate bench row not recorded: {e}")));
         }
     }
     Ok(())
@@ -10312,7 +10351,7 @@ async fn engine_install_mistralrs(d: &BlazarDirs, tag: Option<String>) -> Result
     let mgr = local_engine_manager(d)?;
     let prior_active = Store::open(d)?.active_engine()?.map(|r| r.tag);
     let wanted = tag.clone().unwrap_or_else(|| "latest".to_string());
-    println!("installing mistral.rs {wanted} (prebuilt upstream binary)");
+    println!("{}", dim_line(&format!("installing mistral.rs {wanted} (prebuilt upstream binary)")));
     let row = mgr.update_mistralrs(tag.as_deref()).await?;
     let m: blazar_runtime::Manifest = serde_json::from_str(&row.manifest)?;
     println!(
@@ -10321,7 +10360,7 @@ async fn engine_install_mistralrs(d: &BlazarDirs, tag: Option<String>) -> Result
         m.flags.len(),
         m.build_number
     );
-    println!("note: decode-regression gate is llama-server-only — skipped for mistral.rs engines");
+    println!("{}", dim_line("note: decode-regression gate is llama-server-only — skipped for mistral.rs engines"));
     // Same one-build-per-lane contract as the llamacpp/sglang lanes:
     // superseded mistral.rs dirs free their space on a successful
     // install/activate.
@@ -10376,7 +10415,7 @@ async fn engine_update_mistralrs(d: &BlazarDirs, tag: Option<String>, check: boo
         (Some(a), Some(b)) if b > a
     );
     if check {
-        println!("dry-run: nothing installed, nothing written");
+        println!("{}", dim_line("dry-run: nothing installed, nothing written"));
         if newer {
             println!("would update mistral.rs {installed} -> {target}");
             println!("  blazar engine update --kind mistralrs {target}");
@@ -10401,7 +10440,7 @@ async fn engine_install_sdcpp(d: &BlazarDirs, tag: Option<String>) -> Result<()>
     let mgr = local_engine_manager(d)?;
     let prior_active = Store::open(d)?.active_engine()?.map(|r| r.tag);
     let wanted = tag.clone().unwrap_or_else(|| "latest".to_string());
-    println!("installing sd.cpp {wanted} (prebuilt upstream sd-server)");
+    println!("{}", dim_line(&format!("installing sd.cpp {wanted} (prebuilt upstream sd-server)")));
     let row = mgr.update_sdcpp(tag.as_deref()).await?;
     let m: blazar_runtime::Manifest = serde_json::from_str(&row.manifest)?;
     println!(
@@ -10410,7 +10449,7 @@ async fn engine_install_sdcpp(d: &BlazarDirs, tag: Option<String>) -> Result<()>
         m.flags.len(),
         m.build_number
     );
-    println!("note: decode-regression gate is llama-server-only — skipped for sd.cpp engines");
+    println!("{}", dim_line("note: decode-regression gate is llama-server-only — skipped for sd.cpp engines"));
     // Same one-build-per-lane contract as the other engine lanes:
     // superseded sd.cpp dirs free their space on a successful install.
     for (tag, bytes) in mgr.prune_siblings(EngineKind::SdCpp.as_str(), &row.tag)? {
@@ -10463,7 +10502,7 @@ async fn engine_update_sdcpp(d: &BlazarDirs, tag: Option<String>, check: bool) -
         (Some(a), Some(b)) if b > a
     );
     if check {
-        println!("dry-run: nothing installed, nothing written");
+        println!("{}", dim_line("dry-run: nothing installed, nothing written"));
         if newer {
             println!("would update sd.cpp {installed} -> {target}");
             println!("  blazar engine update --kind sdcpp {target}");
@@ -10487,7 +10526,7 @@ async fn engine_update_sdcpp(d: &BlazarDirs, tag: Option<String>, check: bool) -
 async fn engine_install_whisper(d: &BlazarDirs, tag: Option<String>) -> Result<()> {
     let mgr = local_engine_manager(d)?;
     let wanted = tag.clone().unwrap_or_else(|| "latest".to_string());
-    println!("installing whisper.cpp {wanted} (prebuilt upstream whisper-server)");
+    println!("{}", dim_line(&format!("installing whisper.cpp {wanted} (prebuilt upstream whisper-server)")));
     let row = mgr.update_whisper(tag.as_deref()).await?;
     let m: blazar_runtime::Manifest = serde_json::from_str(&row.manifest)?;
     println!(
@@ -10496,7 +10535,7 @@ async fn engine_install_whisper(d: &BlazarDirs, tag: Option<String>) -> Result<(
         m.flags.len(),
         m.build_number
     );
-    println!("note: decode-regression gate is llama-server-only — skipped for whisper engines");
+    println!("{}", dim_line("note: decode-regression gate is llama-server-only — skipped for whisper engines"));
     // Same one-build-per-lane contract as the other engine lanes.
     for (tag, bytes) in mgr.prune_siblings(EngineKind::Whisper.as_str(), &row.tag)? {
         // fs sizes fit i64
@@ -10546,7 +10585,7 @@ async fn engine_update_whisper(d: &BlazarDirs, tag: Option<String>, check: bool)
         (Some(a), Some(b)) if b > a
     );
     if check {
-        println!("dry-run: nothing installed, nothing written");
+        println!("{}", dim_line("dry-run: nothing installed, nothing written"));
         if newer {
             println!("would update whisper.cpp {installed} -> {target}");
             println!("  blazar engine update --kind whisper {target}");
@@ -10619,9 +10658,9 @@ async fn engine_install_sglang(d: &BlazarDirs, version: Option<String>) -> Resul
     let mgr = local_engine_manager(d)?;
     let prior_active = Store::open(d)?.active_engine()?.map(|r| r.tag);
     if let Some(v) = &version {
-        println!("installing sglang {v} (pip venv lane — multi-GB download incl. torch)");
+        println!("{}", dim_line(&format!("installing sglang {v} (pip venv lane — multi-GB download incl. torch)")));
     } else {
-        println!("installing sglang (pip venv lane — multi-GB download incl. torch)");
+        println!("{}", dim_line("installing sglang (pip venv lane — multi-GB download incl. torch)"));
     }
     let row = mgr.install_sglang(version.as_deref()).await?;
     let m: blazar_runtime::Manifest = serde_json::from_str(&row.manifest)?;
@@ -10631,7 +10670,7 @@ async fn engine_install_sglang(d: &BlazarDirs, version: Option<String>) -> Resul
         m.flags.len(),
         m.build_number
     );
-    println!("note: decode-regression gate is llama-server-only — skipped for sglang engines");
+    println!("{}", dim_line("note: decode-regression gate is llama-server-only — skipped for sglang engines"));
     // Same one-build-per-lane contract as the llama-server update: the
     // superseded sglang venvs (multi-GB each) are freed on a successful
     // install/activate.
@@ -10645,7 +10684,7 @@ async fn engine_install_sglang(d: &BlazarDirs, version: Option<String>) -> Resul
             humansize(freed)
         );
     }
-    println!("next: pull a safetensors model (e.g. blazar pull Qwen/Qwen2.5-0.5B-Instruct)");
+    println!("{}", dim_line("next: pull a safetensors model (e.g. blazar pull Qwen/Qwen2.5-0.5B-Instruct)"));
     restart_daemon_if_active_changed(prior_active, row.active.then(|| row.tag.clone())).await;
     Ok(())
 }
@@ -10701,7 +10740,7 @@ async fn engine_update_sglang(d: &BlazarDirs, version: Option<String>, check: bo
     ) {
         (Some(a), Some(b)) if b > a => {
             if check {
-                println!("dry-run: sglang {installed} installed; {latest} is available on PyPI.");
+                println!("{}", dim_line(&format!("dry-run: sglang {installed} installed; {latest} is available on PyPI.")));
                 println!("{flag_contract_note}");
             } else {
                 println!("sglang {installed} installed; updating to {latest} from PyPI.");
@@ -10711,7 +10750,7 @@ async fn engine_update_sglang(d: &BlazarDirs, version: Option<String>, check: bo
         }
         _ => {
             if check {
-                println!("dry-run: nothing installed, nothing written");
+                println!("{}", dim_line("dry-run: nothing installed, nothing written"));
             }
             println!("sglang {installed} is current (PyPI latest: {latest}).");
         }
@@ -10909,7 +10948,7 @@ async fn engine_update(
             },
             (None, _) => println!("no NVIDIA driver detected — standard asset lane applies"),
         }
-        println!("dry-run: nothing installed, nothing written (drop --check to update)");
+        println!("{}", dim_line("dry-run: nothing installed, nothing written (drop --check to update)"));
         return Ok(());
     }
     let row = match resolved {
@@ -11256,7 +11295,7 @@ async fn engine_offers(arch: Option<&str>, json: bool) -> Result<()> {
              BLAZAR_CAPABILITY_REGISTRY = \"\") — unset the knob to use the default registry"
         ));
     };
-    println!("querying capability registry {url}");
+    println!("{}", dim_line(&format!("querying capability registry {url}")));
     let lanes = reg::fetch(reg::http(), &url).await?;
     let selected: Vec<&reg::RegistryLane> = match arch {
         Some(a) => reg::offers_for_arch(&lanes, a),
@@ -11320,7 +11359,7 @@ async fn engine_install_lane(d: &BlazarDirs, lane_id: &str, backend: Option<&str
     let url = reg::resolve_registry_url(cfg.capability_registry_url.as_deref()).ok_or_else(
         || anyhow!("capability registry is disabled — unset capability_registry_url / BLAZAR_CAPABILITY_REGISTRY"),
     )?;
-    println!("querying capability registry {url}");
+    println!("{}", dim_line(&format!("querying capability registry {url}")));
     let lanes = reg::fetch(reg::http(), &url).await?;
     let lane = lanes.iter().find(|l| l.id == lane_id).ok_or_else(|| {
         anyhow!("no registry lane {lane_id:?} — `blazar engine offers` lists the catalog")
@@ -11817,23 +11856,34 @@ fn lora_cmd(cmd: LoraCmd) -> Result<()> {
             let row = store.get_model(&model)?;
             validate_lora_attach(&model, row.as_ref(), &path)?;
             let id = store.add_lora(&model, &path.display().to_string(), scale)?;
-            println!("lora #{id} attached to {model} (scale {scale})");
+            println!("{}", ok_line(&format!("lora #{id} attached to {model} (scale {scale})")));
         }
         LoraCmd::Rm { id } => {
             if store.delete_lora(id)? {
-                println!("lora #{id} removed");
+                println!("{}", ok_line(&format!("lora #{id} removed")));
             } else {
                 return Err(anyhow!("no lora #{id}"));
             }
         }
         LoraCmd::List { model } => {
             let model = model.map(|m| resolve_model_cli(&m));
-            for l in store.list_loras(model.as_deref())? {
-                println!(
-                    "#{:<4} {:<24} scale {:<6} {}",
-                    l.id, l.model_name, l.scale, l.path
-                );
+            let rows = store.list_loras(model.as_deref())?;
+            if rows.is_empty() {
+                println!("{}", dim_line("no loras attached (see: blazar lora add <model> <adapter>)"));
+                return Ok(());
             }
+            let table: Vec<Vec<String>> = rows
+                .iter()
+                .map(|l| {
+                    vec![
+                        format!("#{}", l.id),
+                        l.model_name.clone(),
+                        l.scale.to_string(),
+                        l.path.clone(),
+                    ]
+                })
+                .collect();
+            println!("{}", render_table(&["ID", "MODEL", "SCALE", "PATH"], &table, &[]));
         }
     }
     Ok(())

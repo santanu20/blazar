@@ -182,3 +182,17 @@ Proofs (tests/install_e2e.sh, real cargo invoked, hermetic fake release API):
 - tests/install_e2e.sh: 58/58 pass — broken-checkout fatal + release-never-contacted, good-checkout origin label, --from origin, release-lane origin. Hermetic rustup + fake workspace fixes documented in-file.
 - Demo runs against a local fake release API (canonical /releases/download/<tag>/<asset> path construction verified; sha256-mismatch guard verified rendering fatal).
 - Noted observation (no action): the engine-bootstrap child prints its own ANSI logging lines outside the installer's step formatting; acceptable child output.
+
+## 14. CLI user-facing output pass (2026-10-01)
+
+Scope: 414 println/eprintln sites audited, ~25 command fns in blazar-cli.
+
+- Reused existing pattern language (cli_colors gate, render_table, colored_status); no new UI module.
+- New tty-gated helpers: ansi/ok_line/warn_line/err_line/dim_line (state semantics only: green success, yellow warning, red error, dim notes/steps).
+- Error renderer: bold-red `blazar:` prefix, message stays plain.
+- `lora list` now a real table (ID/MODEL/SCALE/PATH) with empty-state teaching line.
+- `list` header bold on tty; render_list_table column math untouched.
+- 57 sweep conversions (prefix + exact-sentence classified), done via deterministic transform + manual repair.
+- Contract kept: message TEXT never changed; piped/NO_COLOR output byte-identical (spacing unchanged); unit test 16039 (list header) and validate.py positional parses unaffected.
+- Suite: blazar-cli 149/149; full 4-crate 1604/1604; clippy --all-targets 0 warnings.
+- Deliberately plain: teach blocks, config list (TOML copy-fidelity), config get (script-friendly), multi-line macros.
