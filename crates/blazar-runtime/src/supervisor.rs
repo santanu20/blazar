@@ -5527,7 +5527,10 @@ drop them from rpc_servers in config.toml",
 
     #[cfg(not(target_os = "linux"))]
     fn on_ac_power() -> Option<bool> {
-        None
+        // Empty pairs = no evidence = unknown; identical to the old
+        // bare None, but keeps the policy helper referenced on every
+        // platform so lib-only builds never see it dead.
+        Self::ac_power_from_pairs(&[])
     }
 
     /// Effective `warm_on_pull` for a model (per-model override wins,
