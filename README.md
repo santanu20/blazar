@@ -559,8 +559,8 @@ Every advanced capability is on by default unless noted, and each has full docum
 | **Warm starts and session bank** | Session checkpoints survive unload and restart; conversation-prefix routing keeps hot KV where the next request needs it | [Sessions, cache, and warm starts](#sessions-cache-and-warm-starts) |
 | **Request deduplication** | Identical concurrent requests collapse into one computation (`singleflight`) | [`docs/6.BUSINESS_RULES.md`](docs/6.BUSINESS_RULES.md) |
 | **Structured output** | Schema- and grammar-constrained generation across API dialects | [`docs/7.SETUP.md`](docs/7.SETUP.md#structured-output-across-dialects) |
-| **Tool calling** | Native tool-call translation across the OpenAI-, Ollama-, and Anthropic-compatible surfaces | [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md) |
-| **Reasoning budget** | Per-model and per-request thinking-budget control for reasoning models | [`docs/7.SETUP.md`](docs/7.SETUP.md#reasoning--thinking) |
+| **Tool calling** | Native tool-call translation across the OpenAI-, Ollama-, and Anthropic-compatible surfaces | [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md#tool-calling) |
+| **Reasoning budget** | Per-model and per-request thinking-budget control for reasoning models | [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md#reasoning-budget) |
 | **Best-of-N and cascade** | Per-request quality and cost ladders (above) | [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md) |
 | **Multimodal projector placement** | Vision projectors are detected and offloaded automatically so image understanding does not crowd the text hot path | [`docs/7.SETUP.md`](docs/7.SETUP.md) |
 | **Load modes** | `mlock`/`mmap` posture per model — resident serving or fast swap, chosen by the planner | [`docs/7.SETUP.md`](docs/7.SETUP.md) |
