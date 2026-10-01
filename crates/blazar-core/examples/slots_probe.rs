@@ -8,18 +8,10 @@ use blazar_core::{
 };
 use std::collections::BTreeSet;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args().skip(1);
-    let (Some(model), Some(mmproj)) = (args.next(), args.next()) else {
-        eprintln!(
-            "usage: cargo run --example slots_probe -p blazar-core -- \
-             <model.gguf> <mmproj.gguf>"
-        );
-        std::process::exit(2);
-    };
-    let gguf = read_metadata_file(std::path::Path::new(&model))?;
-    println!("train ctx = {:?}", gguf.context_length);
-    let hw = Hardware {
+/// Hardcoded laptop census (vulkan iGPU + RTX 4070) so the probe runs
+/// without a live hardware query.
+fn laptop_dual_gpu() -> Hardware {
+    Hardware {
         physical_cores: 16,
         total_ram_mib: 13_675,
         gpus: vec![
@@ -36,8 +28,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 free_mib: 7_790,
             },
         ],
-    };
-    let flags: BTreeSet<String> = [
+    }
+}
+
+/// The llamacpp flag surface this probe compiles against.
+fn llamacpp_probe_flags() -> BTreeSet<String> {
+    [
         "--ctx-size",
         "--threads",
         "--gpu-layers",
@@ -61,7 +57,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ]
     .into_iter()
     .map(String::from)
-    .collect();
+    .collect()
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args().skip(1);
+    let (Some(model), Some(mmproj)) = (args.next(), args.next()) else {
+        eprintln!(
+            "usage: cargo run --example slots_probe -p blazar-core -- \
+             <model.gguf> <mmproj.gguf>"
+        );
+        std::process::exit(2);
+    };
+    let gguf = read_metadata_file(std::path::Path::new(&model))?;
+    println!("train ctx = {:?}", gguf.context_length);
+    let hw = laptop_dual_gpu();
+    let flags = llamacpp_probe_flags();
     let overlay = ModelOverride::default();
     let default_cfg = Config::default();
     let input = ProfileInput {
@@ -95,6 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine_census: hw.gpus.clone(),
         sibling_devices: Vec::new(),
         auto_tensor_split: None,
+        auto_tp_size: None,
     };
     let p = compile(&input, &TuningOverrides::default())?;
     println!(

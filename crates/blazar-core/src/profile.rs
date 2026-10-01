@@ -146,6 +146,13 @@ pub struct ProfileInput<'a> {
     /// (`tensor_split` / `devices` / non-default `main_gpu`) is unset.
     /// `None` = no auto split planned.
     pub auto_tensor_split: Option<String>,
+    /// Supervisor-planned sglang tensor-parallel rank count: weights+KV
+    /// exceed the best single card's capacity but fit the discrete cards
+    /// per-rank (`ceil(need / ranks) <= smallest card`). Emitted as
+    /// `--tp-size` only when the manual `sglang.tp_size` pin is unset;
+    /// the fit ladder plans per-rank whenever this (or the manual pin)
+    /// is > 1. `None` = single-rank spawn.
+    pub auto_tp_size: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -3693,14 +3700,63 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
     let gpu_label: &'static str;
     let kv_est_bytes: Option<u64>;
     if input.hardware.has_gpu() {
-        let vram = capacity_bytes(input.hardware);
-        let budget = vram
-            .saturating_mul(SGLANG_VRAM_USABLE_PCT)
-            .saturating_div(100)
-            .saturating_sub(SGLANG_RUNTIME_FLOOR_BYTES);
-        let weights = input.model_bytes;
-        let kv16 = kv_bytes_at(2);
-        let kv8 = kv_bytes_at(1);
+        // Tensor-parallel sharding: the manual `tp_size` pin wins over
+        // the supervisor's auto plan; > 1 divides weights AND KV across
+        // ranks, and the capacity anchor becomes the SMALLEST discrete
+        // card (the bottleneck rank), never the summed pool — planning
+        // 2x8 GiB as 16 GiB is how NCCL dies at spawn. Zero discrete
+        // cards under a shard pin falls back to single-rank math (the
+        // census warning below already flags the impossible pin).
+        let shard: u32 = tun
+            .tp_size
+            .filter(|n| *n > 1)
+            .or(input.auto_tp_size.filter(|n| *n > 1))
+            .unwrap_or(1);
+        let (vram, budget) = if shard > 1 {
+            let per_card: Vec<u64> = input
+                .hardware
+                .gpus
+                .iter()
+                .filter(|g| !g.is_integrated())
+                .map(|g| {
+                    if g.free_mib > 0 {
+                        Hardware::bytes(g.free_mib)
+                    } else {
+                        Hardware::bytes(g.total_mib)
+                    }
+                })
+                .collect();
+            let min_card = per_card.iter().copied().min().unwrap_or(0);
+            if min_card == 0 {
+                let summed = capacity_bytes(input.hardware);
+                (
+                    summed,
+                    summed
+                        .saturating_mul(SGLANG_VRAM_USABLE_PCT)
+                        .saturating_div(100)
+                        .saturating_sub(SGLANG_RUNTIME_FLOOR_BYTES),
+                )
+            } else {
+                (
+                    min_card,
+                    min_card
+                        .saturating_mul(SGLANG_VRAM_USABLE_PCT)
+                        .saturating_div(100)
+                        .saturating_sub(SGLANG_RUNTIME_FLOOR_BYTES),
+                )
+            }
+        } else {
+            let vram = capacity_bytes(input.hardware);
+            (vram, {
+                vram.saturating_mul(SGLANG_VRAM_USABLE_PCT)
+                    .saturating_div(100)
+                    .saturating_sub(SGLANG_RUNTIME_FLOOR_BYTES)
+            })
+        };
+        let ceil_div = |n: u64, d: u32| n.saturating_add(u64::from(d) - 1) / u64::from(d);
+        let weights = ceil_div(input.model_bytes, shard);
+        let kv16 = kv_bytes_at(2).map(|b| ceil_div(b, shard));
+        let kv8 = kv_bytes_at(1).map(|b| ceil_div(b, shard));
         // An explicit cpu_offload_gb pin is honored in EVERY tier (the
         // user asked for offload; the ladder only derives it when
         // unpinned) and feeds the mem-fraction below.
@@ -3772,11 +3828,14 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
                     // Tier C: offload the weights overflow to host RAM.
                     let overflow = weights.saturating_add(kv8_v).saturating_sub(budget);
                     let offload_gb = ceil_gb(overflow);
+                    // Per-rank share of the host offload budget: every TP
+                    // rank offloads independently into the same host RAM.
                     let host_budget = input
                         .hardware
                         .total_ram_mib
                         .saturating_mul(4)
-                        .saturating_div(10);
+                        .saturating_div(10)
+                        .saturating_div(u64::from(shard));
                     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
                     let offload_bytes = (f64::from(offload_gb) * 1e9).round() as u64;
                     if offload_gb > 0.0 && offload_bytes <= Hardware::bytes(host_budget) {
@@ -4439,6 +4498,28 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
              only makes sense multi-GPU",
             input.hardware.gpus.len()
         ));
+    }
+    // Auto tensor-parallelism: the supervisor planned TP ranks (weights+KV
+    // over the best single card, per-rank within the smallest). The manual
+    // `tp_size` pin always wins (user-orchestrated sharding); emission is
+    // last-resort, mirroring the llamacpp auto tensor-split posture.
+    if tun.tp_size.is_none_or(|n| n <= 1) {
+        if let Some(tp) = input.auto_tp_size.filter(|n| *n > 1) {
+            push_tuned(
+                &mut argv,
+                input.supported_flags,
+                "auto_tp_size",
+                "--tp-size",
+                &tp.to_string(),
+                &mut warnings,
+            );
+            warnings.push(format!(
+                "auto tensor-parallelism: weights+KV exceed the best single card but \
+                 fit {tp} discrete cards per-rank (manual parallel pins unset); ranks \
+                 bind over every visible GPU via NCCL — inter-card bandwidth is the \
+                 price of capacity. Pin models.<name>.sglang.tp_size to override"
+            ));
+        }
     }
 
     // --- lora capacity knobs (adapters themselves ride the loras lane)
@@ -5999,6 +6080,7 @@ mod tests {
             engine_census: hw.gpus.clone(),
             sibling_devices: Vec::new(),
             auto_tensor_split: None,
+            auto_tp_size: None,
         }
     }
 
@@ -9253,6 +9335,7 @@ mod tests {
             engine_census: hw.gpus.clone(),
             sibling_devices: Vec::new(),
             auto_tensor_split: None,
+            auto_tp_size: None,
         }
     }
 
@@ -12707,6 +12790,7 @@ mod tests {
             engine_census: hw.gpus.clone(),
             sibling_devices: Vec::new(),
             auto_tensor_split: None,
+            auto_tp_size: None,
         }
     }
 
@@ -12783,6 +12867,128 @@ mod tests {
             .argv
             .windows(2)
             .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.821"));
+    }
+
+    /// Dual-discrete-card hardware (the 2x RTX 4070-class shape) for the
+    /// auto tensor-parallelism tests: sharding plans judge the bottleneck
+    /// rank, never the summed pool.
+    fn dual_gpu_hw() -> Hardware {
+        Hardware {
+            physical_cores: 8,
+            total_ram_mib: 16_000,
+            gpus: vec![
+                GpuInfo {
+                    name: "GPU0".into(),
+                    description: "NVIDIA CUDA".into(),
+                    total_mib: 8_188,
+                    free_mib: 8_188,
+                },
+                GpuInfo {
+                    name: "GPU1".into(),
+                    description: "NVIDIA CUDA".into(),
+                    total_mib: 8_188,
+                    free_mib: 8_188,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn unit__sglang__auto_tp_emits_and_ladder_plans_per_rank() {
+        let cfg = Config::default();
+        let hw = dual_gpu_hw();
+        let hf = hf_meta();
+        let overlay = sglang_ctx_overlay();
+        let flags = sglang_flags_extended();
+        let mut inp = sglang_input(&hf, &hw, &cfg, 12_000 * MIB);
+        inp.overlay = &overlay;
+        inp.supported_flags = &flags;
+        inp.auto_tp_size = Some(2);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        // 12 GiB weights / 2 ranks = 6 GiB per rank + 469,762,048 B
+        // per-rank f16 KV <= the 6,825,139,240 B per-card budget:
+        // Tier A holds per-rank where the summed pool would have said D.
+        assert_eq!(p.gpu, "full");
+        assert_eq!(p.kv_est_bytes, Some(469_762_048));
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--tp-size" && w[1] == "2"));
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.contains("auto tensor-parallelism")));
+        // Per-rank demand against the bottleneck card's RAW VRAM
+        // (8,585,740,288 B), activation reserve clamps 0.7875 -> 0.756.
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.756"));
+        assert!(!p.argv.iter().any(|a| a == "--cpu-offload-gb"));
+    }
+
+    #[test]
+    fn unit__sglang__auto_tp_manual_pin_wins() {
+        let cfg = Config::default();
+        let hw = dual_gpu_hw();
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            sglang: Some(crate::config::SglangTuning {
+                tp_size: Some(2),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..sglang_ctx_overlay()
+        };
+        let flags = sglang_flags_extended();
+        let mut inp = sglang_input(&hf, &hw, &cfg, 12_000 * MIB);
+        inp.overlay = &overlay;
+        inp.supported_flags = &flags;
+        // A stale auto plan must not double-emit or override the pin.
+        inp.auto_tp_size = Some(3);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        let tp_flags: Vec<String> = p
+            .argv
+            .windows(2)
+            .filter(|w| w[0] == "--tp-size")
+            .map(|w| w[1].clone())
+            .collect();
+        assert_eq!(tp_flags, vec!["2"], "manual pin wins, emitted once");
+        // The ladder sharded by the MANUAL rank count (2), not the stale
+        // auto plan (3): per-rank KV is the /2 share.
+        assert_eq!(p.kv_est_bytes, Some(469_762_048));
+        assert!(!p
+            .warnings
+            .iter()
+            .any(|w| w.contains("auto tensor-parallelism")));
+    }
+
+    #[test]
+    fn unit__sglang__auto_tp_per_rank_overflow_offloads() {
+        let cfg = Config::default();
+        let hw = dual_gpu_hw();
+        let hf = hf_meta();
+        let overlay = sglang_ctx_overlay();
+        let flags = sglang_flags_extended();
+        let mut inp = sglang_input(&hf, &hw, &cfg, 18_000 * MIB);
+        inp.overlay = &overlay;
+        inp.supported_flags = &flags;
+        inp.auto_tp_size = Some(2);
+        // 9 GiB per rank vs 6.36 GiB per-card budget: sharding alone
+        // cannot hold it — per-rank overflow (2.85 GB with fp8 KV)
+        // lands in Tier C against the PER-RANK host share
+        // (16000*4/10/2 = 3200 MiB), so the spawn is honest "partial",
+        // never a blind NCCL death.
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert_eq!(p.gpu, "partial");
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--tp-size" && w[1] == "2"));
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "3"));
+        assert!(p.warnings.iter().any(|w| w.contains("Tier C")));
     }
 
     #[test]

@@ -75,6 +75,7 @@ fn test_input<'a>(
         engine_kind: blazar_core::engine_kind::EngineKind::default(),
         sibling_devices: Vec::new(),
         auto_tensor_split: None,
+        auto_tp_size: None,
         mmproj_path: None,
         components: &[],
         model_name: "qwen3-8b",

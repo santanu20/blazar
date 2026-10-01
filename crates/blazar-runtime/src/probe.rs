@@ -243,8 +243,9 @@ pub fn probe_hardware(manifest: Option<&Manifest>) -> Hardware {
 }
 
 /// Best-effort `nvidia-smi` device census. None/skip on any failure —
-/// never a guessed entry.
-fn nvidia_smi_gpus() -> Vec<GpuInfo> {
+/// never a guessed entry. Rows come back in PCI bus order, the contract
+/// `spanning_spawn_env` pairs with `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
+pub(crate) fn nvidia_smi_gpus() -> Vec<GpuInfo> {
     // F85: best-effort census — a hung nvidia-smi yields an empty list,
     // never a wedged caller.
     let Some(out) = probe_output(

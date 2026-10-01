@@ -623,6 +623,12 @@ pub struct Config {
     /// `<remote>:<model>` route there instead of loading locally.
     #[serde(default)]
     pub remotes: Vec<Remote>,
+    /// Federation fallback: when a requested model is absent from the
+    /// local store but a `[[remotes]]` peer lists it (`/v1/models`
+    /// presence), the request routes there instead of 404ing. Kill
+    /// switch for pure-prefix routing; inert with no remotes.
+    #[serde(default = "default_remote_fallback")]
+    pub remote_fallback: bool,
     /// Extra env for engine children + probes (e.g. `GGML_BACKEND_PATH` for
     /// a local CUDA build).
     #[serde(default)]
@@ -1359,6 +1365,16 @@ impl SglangTuning {
         override_.cloned().unwrap_or_else(|| global.clone())
     }
 
+    /// True when ANY parallel size (tp/dp/pp/ep) is pinned above 1 —
+    /// the user is orchestrating sharding themselves, so the
+    /// supervisor's auto tensor-parallel plan must stand down.
+    #[must_use]
+    pub fn parallel_pinned(&self) -> bool {
+        [self.tp_size, self.dp_size, self.pp_size, self.ep_size]
+            .iter()
+            .any(|v| v.is_some_and(|n| n > 1))
+    }
+
     fn validate(&self, where_: &str) -> Result<(), CoreError> {
         self.validate_scalar_ranges(where_)?;
         self.validate_choice_fields(where_)?;
@@ -1840,6 +1856,12 @@ pub struct Remote {
     pub key: String,
 }
 
+/// Federation fallback defaults ON: with remotes configured, a bare
+/// model name absent locally but present on a peer routes there.
+fn default_remote_fallback() -> bool {
+    true
+}
+
 /// One virtual API key: bearer identity + optional model scope and
 /// rate/token budgets. 0-valued budgets are unlimited; an empty `models`
 /// list means every model (admin semantics — such keys also manage the
@@ -2098,6 +2120,7 @@ impl Default for Config {
             capability_registry_url: None,
             fork_retire_days: default_fork_retire_days(),
             semantic_cache: SemanticCacheConfig::default(),
+            remote_fallback: default_remote_fallback(),
             devices: Vec::new(),
             engine_check_secs: default_engine_check_secs(),
             mistralrs_pa_memory_fraction: None,

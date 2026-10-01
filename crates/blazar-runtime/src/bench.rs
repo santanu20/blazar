@@ -875,6 +875,7 @@ pub fn build_input<'a>(
         engine_kind,
         sibling_devices: Vec::new(),
         auto_tensor_split: None,
+        auto_tp_size: None,
         endpoint,
         data_dir,
         cache_hit_rate: None, // CLI bench: static clamp, no live hint

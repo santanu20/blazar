@@ -106,8 +106,16 @@ pub trait Engine: Send + Sync {
     ) -> Vec<String>;
 
     /// Spawn a child for the compiled argv. Implementations own process
-    /// group setup and log piping.
-    async fn spawn(&self, argv: &[String], endpoint: &Endpoint) -> Result<ChildHandle>;
+    /// group setup and log piping. `spawn_env` is per-spawn env applied
+    /// AFTER `engine_env` (same key = spawn wins, logged): the supervisor
+    /// uses it to pin sharded children to specific GPUs; every ordinary
+    /// spawn passes an empty slice and gets a byte-identical child env.
+    async fn spawn(
+        &self,
+        argv: &[String],
+        endpoint: &Endpoint,
+        spawn_env: &[(String, String)],
+    ) -> Result<ChildHandle>;
 
     /// Poll the child's /health until {"status":"ok"} or timeout.
     async fn health_check(&self, endpoint: &Endpoint, timeout: std::time::Duration) -> Result<()>;
@@ -175,7 +183,12 @@ impl Engine for LlamaCppEngine {
         profile.argv.clone()
     }
 
-    async fn spawn(&self, argv: &[String], endpoint: &Endpoint) -> Result<ChildHandle> {
+    async fn spawn(
+        &self,
+        argv: &[String],
+        endpoint: &Endpoint,
+        spawn_env: &[(String, String)],
+    ) -> Result<ChildHandle> {
         // Preflight --rpc: upstream llama-server connects RPC backends
         // EAGERLY at argv-parse and SIGABRTs on a dead endpoint
         // (ggml-rpc.cpp rpc_dispatcher::start), which crash-loops the
@@ -192,7 +205,7 @@ impl Engine for LlamaCppEngine {
                 dead.join(", ")
             ));
         }
-        spawn_child(&self.manifest.server_path, argv, endpoint, &self.child_env)
+        spawn_child(&self.manifest.server_path, argv, endpoint, &self.child_env, spawn_env)
     }
 
     async fn enumerate_devices(&self) -> Result<Option<Vec<crate::engine::manifest::DeviceDesc>>> {
@@ -326,12 +339,15 @@ fn child_cwd(server_path: &str) -> Option<std::path::PathBuf> {
 
 /// Shared child-process mechanics for every engine kind: null stdin,
 /// piped stdio into tracing + the log tail, kill-on-drop, own process
-/// group (§5 H19: acquired = released by construction).
+/// group (§5 H19: acquired = released by construction). `spawn_env`
+/// applies AFTER `child_env` — a same-key override is logged, never a
+/// silent clobber.
 fn spawn_child(
     server_path: &str,
     argv: &[String],
     endpoint: &Endpoint,
     child_env: &[(String, String)],
+    spawn_env: &[(String, String)],
 ) -> Result<ChildHandle> {
     let mut cmd = std::process::Command::new(server_path);
     cmd.args(argv)
@@ -355,6 +371,12 @@ fn spawn_child(
         crate::probe::parent_death_tie(&mut cmd);
     }
     for (k, v) in child_env {
+        cmd.env(k, v);
+    }
+    for (k, v) in spawn_env {
+        if child_env.iter().any(|(ck, _)| ck == k) {
+            tracing::warn!("spawn env {k} overrides the engine_env value for this child");
+        }
         cmd.env(k, v);
     }
     let mut cmd = tokio::process::Command::from(cmd);
@@ -784,14 +806,19 @@ impl Engine for MistralRsEngine {
         mistralrs_argv(&staged, profile, endpoint, &self.manifest.flags)
     }
 
-    async fn spawn(&self, argv: &[String], endpoint: &Endpoint) -> Result<ChildHandle> {
+    async fn spawn(
+        &self,
+        argv: &[String],
+        endpoint: &Endpoint,
+        spawn_env: &[(String, String)],
+    ) -> Result<ChildHandle> {
         if matches!(endpoint, Endpoint::Unix { .. }) {
             return Err(anyhow!(
                 "mistralrs engines have no unix-socket transport; set \
                  child_transport = \"tcp\" in the blazar config"
             ));
         }
-        spawn_child(&self.manifest.server_path, argv, endpoint, &self.child_env)
+        spawn_child(&self.manifest.server_path, argv, endpoint, &self.child_env, spawn_env)
     }
 
     async fn health_check(&self, endpoint: &Endpoint, timeout: std::time::Duration) -> Result<()> {
@@ -909,14 +936,19 @@ impl Engine for SdCppEngine {
         profile.argv.clone()
     }
 
-    async fn spawn(&self, argv: &[String], endpoint: &Endpoint) -> Result<ChildHandle> {
+    async fn spawn(
+        &self,
+        argv: &[String],
+        endpoint: &Endpoint,
+        spawn_env: &[(String, String)],
+    ) -> Result<ChildHandle> {
         if matches!(endpoint, Endpoint::Unix { .. }) {
             return Err(anyhow!(
                 "sdcpp engines have no unix-socket transport; set \
                  child_transport = \"tcp\" in the blazar config"
             ));
         }
-        spawn_child(&self.manifest.server_path, argv, endpoint, &self.child_env)
+        spawn_child(&self.manifest.server_path, argv, endpoint, &self.child_env, spawn_env)
     }
 
     async fn enumerate_devices(&self) -> Result<Option<Vec<crate::engine::manifest::DeviceDesc>>> {
@@ -1142,7 +1174,12 @@ impl Engine for SglangEngine {
         sglang_argv(model, profile, endpoint)
     }
 
-    async fn spawn(&self, argv: &[String], endpoint: &Endpoint) -> Result<ChildHandle> {
+    async fn spawn(
+        &self,
+        argv: &[String],
+        endpoint: &Endpoint,
+        spawn_env: &[(String, String)],
+    ) -> Result<ChildHandle> {
         if matches!(endpoint, Endpoint::Unix { .. }) {
             return Err(anyhow!(
                 "sglang engines have no unix-socket transport; set \
@@ -1180,7 +1217,9 @@ impl Engine for SglangEngine {
             env.push((LD_LIB.to_string(), merged));
         }
         // No --rpc preflight: sglang has no rpc-worker flag surface.
-        spawn_child(&self.manifest.server_path, argv, endpoint, &env)
+        // spawn_env applies last: a pinned CUDA_VISIBLE_DEVICES pair
+        // survives the LD_LIBRARY_PATH surgery above.
+        spawn_child(&self.manifest.server_path, argv, endpoint, &env, spawn_env)
     }
 
     async fn health_check(&self, endpoint: &Endpoint, timeout: std::time::Duration) -> Result<()> {
@@ -1264,6 +1303,44 @@ mod tests {
         assert_eq!(child_cwd("sd-server"), None);
         // "./sd-server" has an empty parent — same inherit rule.
         assert_eq!(child_cwd("./sd-server"), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__spawn_child_env__spawn_env_overrides_engine_env_last_wins() {
+        // Real child, real env merge: the spawn-time value must reach
+        // the process for a shared key while engine_env-only keys
+        // survive untouched — the supervisor's GPU pinning rides on
+        // exactly this ordering (H5: overrides are visible in logs,
+        // never a silent clobber).
+        let child_env = vec![
+            ("BZ_TEST_SHARED".to_string(), "engine".to_string()),
+            ("BZ_TEST_ENGINE_ONLY".to_string(), "kept".to_string()),
+        ];
+        let spawn_env = vec![("BZ_TEST_SHARED".to_string(), "spawn".to_string())];
+        let argv = vec![
+            "-c".to_string(),
+            "printenv BZ_TEST_SHARED; printenv BZ_TEST_ENGINE_ONLY".to_string(),
+        ];
+        let endpoint = Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port: 0,
+        };
+        let mut child = spawn_child("/bin/sh", &argv, &endpoint, &child_env, &spawn_env)
+            .expect("spawn /bin/sh");
+        // printenv lines land in the piped stdout -> log tail; give the
+        // pipes a moment, then read the joined tail before reaping.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let tail = child.tail_joined();
+        let _ = child.kill().await;
+        let _ = child.reap().await;
+        assert!(tail.contains("spawn"), "override lost in tail: {tail}");
+        assert!(tail.contains("kept"), "engine-only key lost in tail: {tail}");
+        assert!(
+            !tail.lines().any(|l| l == "engine"),
+            "spawn value must win the shared key: {tail}"
+        );
     }
 
     #[test]
@@ -1463,7 +1540,7 @@ mod tests {
             port: 0,
         };
         let err = engine
-            .spawn(&argv, &endpoint)
+            .spawn(&argv, &endpoint, &[])
             .await
             .expect_err("dead rpc endpoint must refuse the spawn");
         let msg = format!("{err:#}");
@@ -1581,6 +1658,7 @@ mod tests {
                 &Endpoint::Unix {
                     socket: "/run/blazar/sdcpp.sock".into(),
                 },
+                &[],
             )
             .await
             .expect_err("unix endpoint must be rejected");

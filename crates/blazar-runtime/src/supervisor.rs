@@ -790,6 +790,148 @@ fn plan_auto_tensor_split(
     )
 }
 
+/// Demand-shard plan for the sglang lane: tensor-parallel rank count the
+/// supervisor may emit when weights+KV exceed every single card but fit
+/// the cards per-rank. Input is the per-card capacity list the caller
+/// judged relevant (admission feeds census budgets — an empty-box
+/// verdict; the spawn plan feeds MEASURED free — a right-now verdict).
+/// Returns the rank count (all cards) only when the per-rank share fits
+/// the SMALLEST card: NCCL shards evenly, so the bottleneck rank decides.
+pub(crate) fn plan_auto_tp(cards: &[u64], need_bytes: u64) -> Option<u32> {
+    if cards.len() < 2 {
+        return None; // sharding needs at least two cards
+    }
+    let best = cards.iter().copied().max()?;
+    if need_bytes <= best {
+        return None; // fits one card whole: single-rank placement wins
+    }
+    let ranks = u32::try_from(cards.len()).ok()?;
+    let per_rank = need_bytes.div_ceil(u64::from(ranks));
+    let bottleneck = cards.iter().copied().min()?;
+    (per_rank <= bottleneck).then_some(ranks)
+}
+
+/// Per-spawn child env for SHARDING spawns. Strategy, in order:
+///
+/// 1. Vulkan pinning — llamacpp-lane spans whose census names all parse
+///    as `Vulkan<N>` (the llamacpp build enumerates GPUs via Vulkan):
+///    emit `GGML_VK_VISIBLE_DEVICES` naming the plan's cards. The env
+///    FILTERS AND RENUMBERS the child's device ids (verified against
+///    ggml: child `GGML_VK_VISIBLE_DEVICES=1` shows the survivor
+///    relabeled `Vulkan0`), so it is only safe while the spawn argv is
+///    device-id-free — auto-spanning argv is ratio-only
+///    (`--tensor-split` ratios, `--tp-size`), which the caller asserts
+///    via `argv_device_free`. An identity index set emits nothing (the
+///    unfiltered child already sees exactly those cards).
+/// 2. CUDA/ROCm pinning — the atomic `CUDA_DEVICE_ORDER=PCI_BUS_ID` +
+///    `CUDA_VISIBLE_DEVICES` pair over a fresh nvidia-smi probe (HIP
+///    honors the same vars).
+/// 3. Any doubt — non-spanning spawn, unparseable census, probe short
+///    of ranks, argv carrying device ids — yields an EMPTY env:
+///    fail-open to the engine's own self-sorting rather than pinning
+///    ranks to guessed indices.
+fn spanning_spawn_env(
+    ranks: Option<u32>,
+    census_names: &[String],
+    lane_allows_vk: bool,
+    argv_device_free: bool,
+) -> Vec<(String, String)> {
+    let probed = crate::probe::nvidia_smi_gpus().len();
+    spanning_env_from_census(ranks, probed, census_names, lane_allows_vk, argv_device_free)
+}
+
+/// Strict `Vulkan<N>` census-name parse: the token before the colon is
+/// the child's own backend id (llamacpp `--list-devices` output), so no
+/// vendor lists are needed to know the index space.
+fn parse_vk_id(census_name: &str) -> Option<u32> {
+    let id = census_name.split(':').next()?.trim();
+    let digits = id.strip_prefix("Vulkan")?;
+    digits.parse().ok()
+}
+
+/// Pure core of [`spanning_spawn_env`] — decided only by the planned
+/// rank count, the probed NVIDIA card count, the census names, and the
+/// lane/argv gates, so the pin contract is unit-testable on any box.
+fn spanning_env_from_census(
+    ranks: Option<u32>,
+    probed_nvidia: usize,
+    census_names: &[String],
+    lane_allows_vk: bool,
+    argv_device_free: bool,
+) -> Vec<(String, String)> {
+    let Some(n) = ranks.filter(|n| *n >= 2) else {
+        return Vec::new();
+    };
+    // Vulkan census wins for llamacpp spans: those children enumerate
+    // via Vulkan, and CUDA env vars provably do not touch that
+    // enumeration — the CUDA pair would silently pin nothing.
+    if lane_allows_vk && argv_device_free {
+        let vk_ids: Option<Vec<u32>> = census_names.iter().map(|nm| parse_vk_id(nm)).collect();
+        if let Some(ids) = vk_ids {
+            if ids.len() == n as usize {
+                if ids.iter().copied().eq(0..n) {
+                    // Identity: the unfiltered child sees exactly the
+                    // plan's cards — no env needed.
+                    tracing::info!(ranks = n, "spanning spawn: Vulkan census is the full plan (no pin needed)");
+                    return Vec::new();
+                }
+                tracing::info!(
+                    ranks = n,
+                    devices = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(","),
+                    "spanning spawn pinned to Vulkan cards (census indices)"
+                );
+                return vec![(
+                    "GGML_VK_VISIBLE_DEVICES".to_string(),
+                    ids.iter().map(u32::to_string).collect::<Vec<_>>().join(","),
+                )];
+            }
+        }
+    }
+    spanning_env_from_probe(Some(n), probed_nvidia)
+}
+
+/// Pure CUDA-pair core — decided only by the planned rank count and the
+/// probed NVIDIA card count, so the pin contract is unit-testable on
+/// any box.
+fn spanning_env_from_probe(ranks: Option<u32>, probed_nvidia: usize) -> Vec<(String, String)> {
+    let Some(n) = ranks.filter(|n| *n >= 2) else {
+        return Vec::new();
+    };
+    if probed_nvidia < n as usize {
+        tracing::warn!(
+            ranks = n,
+            probed = probed_nvidia,
+            "spanning spawn left unpinned: nvidia-smi census short of ranks \
+             (non-NVIDIA or mixed cards keep the engine's self-sorting)"
+        );
+        return Vec::new();
+    }
+    let indices: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+    tracing::info!(ranks = n, "spanning spawn pinned to NVIDIA cards in PCI bus order");
+    vec![
+        ("CUDA_DEVICE_ORDER".to_string(), "PCI_BUS_ID".to_string()),
+        ("CUDA_VISIBLE_DEVICES".to_string(), indices.join(",")),
+    ]
+}
+
+/// Demand-shard plan for the mistral.rs lane: unlike sglang's even TP
+/// ([`plan_auto_tp`]), mistral.rs distributes MODEL LAYERS across cards
+/// itself when `--device-layers` is omitted, and an uneven split is
+/// legal — a 12 GiB model on 16 GiB + 4 GiB cards serves (9 + 3 layers
+/// or any mix). The spanning criterion is therefore the SUMMED pool:
+/// fire only when the load exceeds the best single card yet fits the
+/// cards combined. Rank count is cosmetic here (nothing is emitted);
+/// it only feeds admission's summed-pool judgment and env pinning.
+pub(crate) fn plan_mistralrs_sum_span(cards: &[u64], need_bytes: u64) -> Option<u32> {
+    if cards.len() < 2 {
+        return None;
+    }
+    let best = cards.iter().copied().max()?;
+    let sum: u64 = cards.iter().sum();
+    let ranks = u32::try_from(cards.len()).ok()?;
+    (need_bytes > best && need_bytes <= sum).then_some(ranks)
+}
+
 /// Post-spawn settle report (#28a): compare the picked card's free VRAM
 /// before spawn vs after the child came healthy, returning
 /// (card name, measured take in MiB, card-used percentage). `device`
@@ -1959,7 +2101,11 @@ impl Supervisor {
         best
     }
 
-    fn admission_blocked(&self, name: &str, incoming_bytes: u64) -> bool {
+    /// `spanning` = the spawn will SHARD across cards (sglang manual
+    /// `tp_size > 1`, a plannable auto TP, or an llamacpp tensor split):
+    /// per-card fit is then the wrong question (no single card ever holds
+    /// the whole floor), so only the aggregate belt may block it.
+    fn admission_blocked(&self, name: &str, incoming_bytes: u64, spanning: bool) -> bool {
         if self
             .instance_cap()
             .is_some_and(|cap| self.instances.len() >= cap)
@@ -1968,6 +2114,13 @@ impl Supervisor {
         }
         if !self.bytes_admission_active() || self.instances.is_empty() {
             return false;
+        }
+        if spanning {
+            // Sharded spawn: judge the summed pool only — mirroring the
+            // candidates-empty formula (per-card admission would refuse
+            // a load the shard plan can actually place).
+            return self.resident_bytes().saturating_add(incoming_bytes)
+                > self.vram_budget_bytes();
         }
         let candidates = self.admission_candidates(name);
         if candidates.is_empty() {
@@ -2731,6 +2884,7 @@ impl Supervisor {
                 engine_kind: self.engine.kind(),
                 sibling_devices: Vec::new(),
                 auto_tensor_split: None,
+                auto_tp_size: None,
                 model_name: &m.name,
                 instance_key: &m.name,
                 model_path: &m.path,
@@ -2888,7 +3042,9 @@ impl Supervisor {
                 argv.extend(a.argv.iter().cloned());
             }
             self.remap_device_argv(&mut argv, ROUTER_KEY).await;
-            let mut child = self.engine.spawn(&argv, &endpoint).await.map_err(|e| {
+            // Router spawn is single-process by construction: no
+            // sharding, no pinning — empty per-spawn env.
+            let mut child = self.engine.spawn(&argv, &endpoint, &[]).await.map_err(|e| {
                 if let Some(p) = &auth_keyfile {
                     let _ = std::fs::remove_file(p);
                 }
@@ -3544,8 +3700,91 @@ impl Supervisor {
                 mmproj_bytes,
             )
         };
+        // Parallelism-spanning preflight: will this spawn SHARD across
+        // cards instead of landing on one? Per-card admission (and the
+        // ModelTooLarge per-card verdict) is then the wrong question —
+        // the summed pool is the honest denominator. Covers manual
+        // sglang `tp_size`, manual llamacpp tensor-split / multi-device
+        // pins, and the AUTO plans (sglang TP over census budgets,
+        // mirroring largest_card_budget's empty-box discipline).
+        let sglang_lane = engine.kind() == blazar_core::engine_kind::EngineKind::Sglang;
+        let tun_probe = self
+            .config
+            .overlay_for(name)
+            .sglang
+            .clone()
+            .unwrap_or_else(|| self.config.sglang.clone());
+        let manual_tp = if sglang_lane {
+            tun_probe.tp_size.filter(|n| *n > 1)
+        } else {
+            None
+        };
+        let manual_split_spanning = !sglang_lane
+            && (!self.config.tensor_split.is_empty()
+                || self.config.effective_devices(name).len() > 1);
+        let parallel_pins_unset = self.config.tensor_split.is_empty()
+            && self.config.effective_devices(name).is_empty()
+            && self.config.main_gpu == blazar_core::Config::default().main_gpu
+            && !tun_probe.parallel_pinned();
+        let census_budgets: Vec<u64> = self
+            .hardware
+            .gpus
+            .iter()
+            .filter(|g| !g.is_integrated())
+            .filter_map(|g| self.device_budget_bytes(&g.name))
+            .collect();
+        let census_names: Vec<String> = self
+            .hardware
+            .gpus
+            .iter()
+            .filter(|g| !g.is_integrated())
+            .map(|g| g.name.clone())
+            .collect();
+        let spanning_ranks: Option<u32> = manual_tp
+            .or_else(|| {
+                (parallel_pins_unset
+                    && ((sglang_lane && census_budgets.len() >= 2)
+                        || (!sglang_lane
+                            && engine.kind() == blazar_core::engine_kind::EngineKind::LlamaCpp
+                            && census_budgets.len() >= 2)))
+                    .then(|| {
+                        // Empty-box verdict: census budgets, not measured
+                        // free — matches largest_card_budget's discipline.
+                        plan_auto_tp(&census_budgets, incoming_bytes)
+                    })
+                    .flatten()
+            })
+            .or_else(|| manual_split_spanning.then(|| {
+                u32::try_from(census_budgets.len().max(2)).unwrap_or(2)
+            }))
+            .or_else(|| {
+                // mistral.rs spans by LAYER mapping, not equal shards:
+                // with --device-layers omitted the engine distributes
+                // layers itself (verified: `mistralrs serve --help`,
+                // "Omit for automatic device mapping"), and an uneven
+                // split is legal — so the summed pool is the criterion.
+                (!sglang_lane
+                    && engine.kind() == blazar_core::engine_kind::EngineKind::MistralRs
+                    && census_budgets.len() >= 2)
+                    .then(|| plan_mistralrs_sum_span(&census_budgets, incoming_bytes))
+                    .flatten()
+            });
+        let spanning = spanning_ranks.is_some();
+        // Per-spawn child env for SHARDING spawns only. Every
+        // non-spanning spawn gets an empty env — child env
+        // byte-identical to before this existed. Computed once per
+        // spawn call (fresh probe), not per retry attempt. The Vulkan
+        // path is llamacpp-only (its census names come from the
+        // llamacpp child's own enumeration) and requires a
+        // device-id-free argv: `--tensor-split` ratios and `--tp-size`
+        // carry no ids, but explicit device pins / main-gpu indices
+        // would be invalidated by the env's renumbering.
+        let lane_allows_vk = engine.kind() == blazar_core::engine_kind::EngineKind::LlamaCpp;
+        let argv_device_free = self.config.effective_devices(name).is_empty()
+            && self.config.main_gpu == blazar_core::Config::default().main_gpu;
+        let spawn_env = spanning_spawn_env(spanning_ranks, &census_names, lane_allows_vk, argv_device_free);
         loop {
-            if !self.admission_blocked(name, incoming_bytes) {
+            if !self.admission_blocked(name, incoming_bytes, spanning) {
                 break;
             }
             match self.blocked_action(key, captive) {
@@ -3564,17 +3803,42 @@ impl Supervisor {
                     // than every card is physically unschedulable — no
                     // queue wait can ever change it, so refuse fast with
                     // numbers. Genuinely-evictable pressure keeps the
-                    // queueable AllSlotsBusy.
-                    if let Some(best) = self.largest_card_budget(name, incoming_bytes) {
-                        #[allow(clippy::cast_precision_loss)] // display-only GiB rounding
-                        let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+                    // queueable AllSlotsBusy. A SHARDING spawn judges the
+                    // summed pool instead: refuse fast only when even the
+                    // combined cards cannot hold it empty.
+                    #[allow(clippy::cast_precision_loss)] // display-only GiB rounding
+                    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+                    let impossible = if spanning {
+                        let combined: Option<u64> = self
+                            .admission_candidates(name)
+                            .iter()
+                            .map(|c| self.device_budget_bytes(c))
+                            .try_fold(0u64, |acc, b| b.map(|v| acc.saturating_add(v)))
+                            .filter(|sum| *sum > 0);
+                        combined.filter(|sum| incoming_bytes > *sum)
+                    } else {
+                        self.largest_card_budget(name, incoming_bytes)
+                    };
+                    if let Some(cap) = impossible {
+                        let per_rank_note = spanning_ranks.map(|n| {
+                            #[allow(clippy::cast_precision_loss)]
+                            let per_rank = gib(incoming_bytes / u64::from(n));
+                            format!(
+                                " even sharded across {n} cards ({per_rank:.1} GiB per rank)"
+                            )
+                        });
                         return Err(SupervisionError::ModelTooLarge(format!(
-                            "{name}: admission floor {:.1} GiB exceeds every GPU budget \
-                             (largest card {:.1} GiB) even with the box empty — waiting for \
-                             a slot can never change this. Use a smaller quant (`blazar fit`), \
-                             lower the ctx/slots, or serve on a larger card",
+                            "{name}: admission floor {:.1} GiB exceeds {}{} \
+                             even with the box empty — waiting for a slot can never change \
+                             this. Use a smaller quant (`blazar fit`), lower the ctx/slots, \
+                             or serve on a larger card",
                             gib(incoming_bytes),
-                            gib(best)
+                            if spanning {
+                                format!("every GPU budget combined ({:.1} GiB)", gib(cap))
+                            } else {
+                                format!("every GPU budget (largest card {:.1} GiB)", gib(cap))
+                            },
+                            per_rank_note.unwrap_or_default(),
                         )));
                     }
                     return Err(SupervisionError::AllSlotsBusy);
@@ -3653,6 +3917,10 @@ impl Supervisor {
         let mut picked_display: Option<String> = None;
         let mut sibling_devices: Vec<String> = Vec::new();
         let mut auto_split: Option<String> = None;
+        // sglang twin of the tensor-split plan: TP rank count, planned
+        // against MEASURED free (right-now verdict; the admission
+        // preflight used census budgets for its empty-box bypass).
+        let mut auto_tp: Option<u32> = None;
         // sdcpp placement token (`--backend` module target, e.g.
         // `Vulkan1`): deliberately NOT `picked_device` — that drives the
         // census-keyed ledger id, and the engine's token vocabulary is a
@@ -3694,6 +3962,7 @@ impl Supervisor {
                 engine_kind: engine.kind(),
                 sibling_devices: Vec::new(),
                 auto_tensor_split: None,
+                auto_tp_size: None,
                 model_name: name,
                 instance_key: key,
                 model_path: &model.path,
@@ -3751,7 +4020,36 @@ impl Supervisor {
                 auto_split = Some(ratios);
             }
         }
-        if wants_pick && auto_split.is_none() {
+        // Auto tensor-parallelism (sglang): same last-resort posture —
+        // every manual parallel pin unset, and the MEASURED pool says
+        // weights+KV fit only when sharded across the discrete cards.
+        // The profile ladder then plans per-rank and emits --tp-size.
+        if sglang_lane
+            && parallel_pins_unset
+            && self.hardware.has_gpu()
+            && auto_split.is_none()
+        {
+            let hw = fresh.as_ref().unwrap_or(&self.hardware);
+            let free_bytes: Vec<u64> = hw
+                .gpus
+                .iter()
+                .filter(|g| !g.is_integrated())
+                .map(|g| blazar_core::Hardware::bytes(g.free_mib))
+                .collect();
+            let need_bytes = model_bytes.saturating_add(candidate_kv_mib * 1024 * 1024);
+            if let Some(tp) = plan_auto_tp(&free_bytes, need_bytes) {
+                tracing::info!(
+                    model = name,
+                    ranks = tp,
+                    "auto tensor-parallelism: weights+KV exceed the best single card but fit {} discrete cards per-rank (manual parallel pins unset; ranks bind over every visible GPU via NCCL)",
+                    tp
+                );
+                auto_tp = Some(tp);
+            }
+        }
+        // Spanning spawns cover every card by construction — a single
+        // -card pick would scope every downstream estimate wrongly.
+        if wants_pick && !spanning {
             let hw = fresh.as_ref().unwrap_or(&self.hardware);
             if let Some((idx, skipped_integrated)) = pick_gpu(&hw.gpus) {
                 let best = &hw.gpus[idx];
@@ -3830,7 +4128,7 @@ impl Supervisor {
                 (hw.gpus.len() == 1).then(|| hw.gpus[0].display_name().to_string())
             })
             .or_else(|| {
-                (auto_split.is_some()).then(|| {
+                (auto_split.is_some() || auto_tp.is_some()).then(|| {
                     let hw = fresh.as_ref().unwrap_or(&self.hardware);
                     hw.gpus
                         .iter()
@@ -3927,6 +4225,7 @@ impl Supervisor {
                 engine_kind: engine.kind(),
                 sibling_devices: sibling_devices.clone(),
                 auto_tensor_split: auto_split.clone(),
+                auto_tp_size: auto_tp,
                 model_name: name,
                 // Per-replica paths: the argv's sessions/speccache dirs
                 // must match the dir created for THIS instance key.
@@ -4007,7 +4306,7 @@ impl Supervisor {
             }
             self.remap_device_argv(&mut argv, name).await;
             argv_dialed_rpc |= argv.iter().any(|flag| flag == "--rpc");
-            let mut child = engine.spawn(&argv, &endpoint).await.map_err(|e| {
+            let mut child = engine.spawn(&argv, &endpoint, &spawn_env).await.map_err(|e| {
                 if let Some(p) = &auth_keyfile {
                     let _ = std::fs::remove_file(p);
                 }
@@ -6676,7 +6975,12 @@ mod routing_tests {
         ) -> Vec<String> {
             vec![]
         }
-        async fn spawn(&self, _argv: &[String], endpoint: &Endpoint) -> Result<ChildHandle> {
+        async fn spawn(
+            &self,
+            _argv: &[String],
+            endpoint: &Endpoint,
+            _spawn_env: &[(String, String)],
+        ) -> Result<ChildHandle> {
             // Real sleeper child: the drain/reshape tests run the full
             // evict -> respawn path, and every other routing test never
             // reaches spawn.
@@ -7618,7 +7922,7 @@ mod routing_tests {
         sup.instances.insert("big".to_string(), big);
         let floor = blazar_core::profile::admission_floor_bytes(500 * 1024 * 1024, 0);
         assert!(
-            sup.admission_blocked("other", floor),
+            sup.admission_blocked("other", floor, false),
             "precondition: the small model does not fit alongside big"
         );
         assert_eq!(
@@ -7643,11 +7947,11 @@ mod routing_tests {
         let (sup, _root) = gpu_sup();
         let floor = blazar_core::profile::admission_floor_bytes(8_000 * 1024 * 1024, 0);
         // Empty GPU box: any single model admits (J3 owns honest refusal).
-        assert!(!sup.admission_blocked("big", floor));
+        assert!(!sup.admission_blocked("big", floor, false));
         // Occupied and over budget: blocked.
         let (big, _pid) = gpu_instance("big", 5_800 * 1024 * 1024, 6_000);
         sup.instances.insert("big".to_string(), big);
-        assert!(sup.admission_blocked("other", floor));
+        assert!(sup.admission_blocked("other", floor, false));
         // Occupied but within budget: not blocked. The tiny floor
         // carries the fixed KV (512 MiB) + spawn overhead (700 MiB)
         // charge, so "fits" means weights + 1212 MiB under headroom.
@@ -7657,7 +7961,7 @@ mod routing_tests {
             (50 + 512 + 700) * 1024 * 1024,
             "floor arithmetic this test relies on"
         );
-        assert!(!sup.admission_blocked("other", tiny_floor));
+        assert!(!sup.admission_blocked("other", tiny_floor, false));
     }
 
     /// Two-card fake box whose descriptions differ from the census ids —
@@ -7768,7 +8072,7 @@ mod routing_tests {
         sup.instances.insert("big0".to_string(), big0);
         // One card loaded: a 5000 MiB floor still fits the EMPTY card —
         // per-device and the old aggregate pool agree here.
-        assert!(!sup.admission_blocked("other", mib(5_000)));
+        assert!(!sup.admission_blocked("other", mib(5_000), false));
         let (big1, _p1) = placed_gpu_instance(
             "big1",
             mib(100).cast_signed(),
@@ -7781,7 +8085,7 @@ mod routing_tests {
         // even though the summed pool (12_000 resident + 3000 floor <=
         // 16_376) still says room — the exact one-card collision the
         // aggregate admission used to wave through.
-        assert!(sup.admission_blocked("other", mib(3_000)));
+        assert!(sup.admission_blocked("other", mib(3_000), false));
     }
 
     #[tokio::test]
@@ -7817,8 +8121,208 @@ mod routing_tests {
             "NVIDIA GeForce RTX 4070",
         );
         sup.instances.insert("big0".to_string(), big0);
-        assert!(sup.admission_blocked("other", mib(9_000)));
+        assert!(sup.admission_blocked("other", mib(9_000), false));
         assert!(sup.largest_card_budget("other", mib(9_000)).is_some());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__plan_auto_tp__plannable_bottleneck_and_refusals() {
+        let mib = |m: u64| m * 1024 * 1024;
+        let card = mib(8_188);
+        // Over the best card, per-rank within the bottleneck: shard 2.
+        assert_eq!(plan_auto_tp(&[card, card], mib(12_000)), Some(2));
+        // Fits one card whole: single-rank placement wins.
+        assert_eq!(plan_auto_tp(&[card, card], mib(8_000)), None);
+        // Per-rank share crosses the bottleneck card: unplannable.
+        assert_eq!(plan_auto_tp(&[card, card], mib(17_500)), None);
+        // One card is not a shard pool.
+        assert_eq!(plan_auto_tp(&[card], mib(9_000)), None);
+        // The SMALLEST card decides (NCCL shards evenly): 17 GiB over a
+        // 16+4 GiB pair is per-rank 8.5 GiB — over the 4 GiB rank.
+        assert_eq!(
+            plan_auto_tp(&[mib(16_000), mib(4_000)], mib(17_000)),
+            None
+        );
+        // Three cards, per-rank fits: full-pool ranks.
+        assert_eq!(plan_auto_tp(&[card, card, card], mib(20_000)), Some(3));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__plan_mistralrs_sum_span__summed_pool_not_bottleneck() {
+        let mib = |m: u64| m * 1024 * 1024;
+        let card = mib(8_188);
+        // Over the best card, within the summed pool: span (uneven layer
+        // split is legal — 12 GiB on 16+4 distributes 9+3 or any mix).
+        assert_eq!(
+            plan_mistralrs_sum_span(&[mib(16_000), mib(4_000)], mib(17_000)),
+            Some(2)
+        );
+        // Same load as sglang's refusal table: TP would need per-rank
+        // 8.5 GiB on a 4 GiB rank, layer mapping just distributes.
+        assert_eq!(plan_mistralrs_sum_span(&[card, card], mib(12_000)), Some(2));
+        // Fits one card whole: no spanning.
+        assert_eq!(plan_mistralrs_sum_span(&[card, card], mib(8_000)), None);
+        // Over the summed pool: honestly unplannable.
+        assert_eq!(plan_mistralrs_sum_span(&[card, card], mib(17_500)), None);
+        // One card is not a span pool.
+        assert_eq!(plan_mistralrs_sum_span(&[card], mib(9_000)), None);
+        // Three cards sum: ranks follow the pool.
+        assert_eq!(
+            plan_mistralrs_sum_span(&[card, card, card], mib(20_000)),
+            Some(3)
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__spanning_env_from_probe__atomic_pci_pair_or_fail_open() {
+        // Two planned ranks, two probed NVIDIA cards: the pair is atomic
+        // and the indices follow the probe's PCI order contract.
+        let env = spanning_env_from_probe(Some(2), 2);
+        assert_eq!(
+            env,
+            vec![
+                ("CUDA_DEVICE_ORDER".to_string(), "PCI_BUS_ID".to_string()),
+                ("CUDA_VISIBLE_DEVICES".to_string(), "0,1".to_string()),
+            ]
+        );
+        // Manual tp pinned below the card count pins a prefix.
+        assert_eq!(
+            spanning_env_from_probe(Some(2), 5),
+            vec![
+                ("CUDA_DEVICE_ORDER".to_string(), "PCI_BUS_ID".to_string()),
+                ("CUDA_VISIBLE_DEVICES".to_string(), "0,1".to_string()),
+            ]
+        );
+        assert_eq!(
+            spanning_env_from_probe(Some(3), 3),
+            vec![
+                ("CUDA_DEVICE_ORDER".to_string(), "PCI_BUS_ID".to_string()),
+                ("CUDA_VISIBLE_DEVICES".to_string(), "0,1,2".to_string()),
+            ]
+        );
+        // Probe short of ranks (mixed vendor / off-box probe): fail open.
+        assert!(spanning_env_from_probe(Some(2), 1).is_empty());
+        // Non-spanning, single rank, absent plan: never pinned.
+        assert!(spanning_env_from_probe(None, 4).is_empty());
+        assert!(spanning_env_from_probe(Some(1), 4).is_empty());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__spanning_env_from_census__vulkan_priority_cuda_fallback_fail_open() {
+        let names = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<String>>();
+        // iGPU at Vulkan0 excluded by the census + two discrete Vulkan
+        // cards at 1,2: strict-subset pin (the renumber hazard is void
+        // because auto-spanning argv is ratio-only).
+        let env = spanning_env_from_census(
+            Some(2),
+            0,
+            &names(&["Vulkan1: AMD Radeon", "Vulkan2: Intel Arc"]),
+            true,
+            true,
+        );
+        assert_eq!(
+            env,
+            vec![("GGML_VK_VISIBLE_DEVICES".to_string(), "1,2".to_string())]
+        );
+        // Identity census: the unfiltered child already sees exactly the
+        // plan's cards — no emission.
+        assert!(spanning_env_from_census(
+            Some(2),
+            0,
+            &names(&["Vulkan0: AMD Radeon", "Vulkan1: Intel Arc"]),
+            true,
+            true,
+        )
+        .is_empty());
+        // CUDA census names never parse as Vulkan: the CUDA pair path
+        // takes over (probed count decides).
+        assert_eq!(
+            spanning_env_from_census(
+                Some(2),
+                2,
+                &names(&["CUDA0: NVIDIA A", "CUDA1: NVIDIA B"]),
+                true,
+                true,
+            ),
+            vec![
+                ("CUDA_DEVICE_ORDER".to_string(), "PCI_BUS_ID".to_string()),
+                ("CUDA_VISIBLE_DEVICES".to_string(), "0,1".to_string()),
+            ]
+        );
+        // Malformed Vulkan tokens fail open to the CUDA path, and with
+        // no NVIDIA probe either, the env stays empty.
+        assert!(spanning_env_from_census(
+            Some(2),
+            0,
+            &names(&["Vulkan: odd build", "Vulkan2: Intel Arc"]),
+            true,
+            true,
+        )
+        .is_empty());
+        // Census count short of ranks: never guess partial pins.
+        assert!(spanning_env_from_census(
+            Some(3),
+            0,
+            &names(&["Vulkan1: A", "Vulkan2: B"]),
+            true,
+            true,
+        )
+        .is_empty());
+        // Non-llamacpp lane (sglang/mistral.rs children have no Vulkan
+        // backend): Vulkan census is ignored, CUDA pair or nothing.
+        assert!(spanning_env_from_census(
+            Some(2),
+            0,
+            &names(&["Vulkan1: A", "Vulkan2: B"]),
+            false,
+            true,
+        )
+        .is_empty());
+        // Argv carries device ids (manual devices / main-gpu pin): the
+        // VK renumber would invalidate them — the Vulkan path stays
+        // off. The CUDA pair keeps its shipped probe-count contract
+        // (remap_device_argv reconciles its --device entries).
+        assert_eq!(
+            spanning_env_from_census(
+                Some(2),
+                2,
+                &names(&["Vulkan1: A", "Vulkan2: B"]),
+                true,
+                false,
+            ),
+            vec![
+                ("CUDA_DEVICE_ORDER".to_string(), "PCI_BUS_ID".to_string()),
+                ("CUDA_VISIBLE_DEVICES".to_string(), "0,1".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__admission_blocked__spanning_bypass_judges_the_summed_pool() {
+        let mib = |m: u64| m * 1024 * 1024;
+        let (sup, _root) = dual_gpu_sup();
+        let (big0, _p0) = placed_gpu_instance(
+            "big0",
+            mib(100).cast_signed(),
+            6_000,
+            "GPU0",
+            "NVIDIA GeForce RTX 4070",
+        );
+        sup.instances.insert("big0".to_string(), big0);
+        // Single-rank: a 9000 MiB floor fits neither card next to the
+        // resident — blocked (per-card question, as before).
+        assert!(sup.admission_blocked("other", mib(9_000), false));
+        // Sharding spawn: per-card fit is the wrong question; the summed
+        // pool (6000 resident + 9000 incoming = 15000 <= 16376) holds.
+        assert!(!sup.admission_blocked("other", mib(9_000), true));
+        // ...but the aggregate belt still catches a floor that crosses
+        // the summed pool even with the resident evicted later.
+        assert!(sup.admission_blocked("other", mib(12_000), true));
     }
 
     #[tokio::test]
@@ -7880,17 +8384,17 @@ mod routing_tests {
         sup.instances.insert("b".to_string(), b);
         // GPU0 6000+3000 over; GPU1 5000+3000 = 8000 <= 8188 → fits; the
         // only fitting card is GPU1.
-        assert!(!sup.admission_blocked("other", mib(3_000)));
+        assert!(!sup.admission_blocked("other", mib(3_000), false));
         // A concurrent spawn holds GPU1's remaining headroom for its
         // pick→insert window (the settling child is not yet a counted
         // resident): 5000 + 200 reserved + 3000 floor > 8188 → the next
         // admission must see the collision the resident sum alone misses.
         let r = sup.reserve_device("GPU1", mib(200));
-        assert!(sup.admission_blocked("other", mib(3_000)));
+        assert!(sup.admission_blocked("other", mib(3_000), false));
         // Releasing the reservation reopens the card — Drop is the only
         // release path, so the guard's lifetime IS the spawn window.
         drop(r);
-        assert!(!sup.admission_blocked("other", mib(3_000)));
+        assert!(!sup.admission_blocked("other", mib(3_000), false));
     }
 
     #[tokio::test]
