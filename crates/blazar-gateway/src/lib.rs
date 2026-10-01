@@ -12,6 +12,7 @@ pub mod http_pool;
 pub mod images;
 pub mod jobs;
 pub mod requests;
+pub mod capacity;
 
 pub mod keys;
 pub mod latechunk;
@@ -364,6 +365,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/show", post(ollama::show))
         .route("/api/delete", post(ollama::delete))
         .route("/api/ps", get(ollama::ps))
+        // Per-GPU capacity: device census + per-resident VRAM
+        // attribution joined from the supervisor's live rows.
+        .route("/api/capacity", get(capacity::capacity))
         .route("/api/pull", post(ollama::pull))
         .route("/api/chat", post(ollama::chat))
         .route("/api/embeddings", post(ollama::embeddings))
@@ -856,7 +860,7 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
                         "/v1/requests", "/v1/requests/{id}",
                         "/v1/requests/{id}/cancel", "/v1/requests/{id}/interrupt",
                         "/audio/transcriptions", "/audio/translations"],
-            "ollama": ["/api/chat", "/api/generate", "/api/tags", "/api/ps", "/api/show",
+            "ollama": ["/api/chat", "/api/generate", "/api/tags", "/api/ps", "/api/capacity", "/api/show",
                        "/api/embeddings", "/api/embed", "/api/rerank", "/api/pull",
                        "/api/delete", "/api/events", "/api/version"],
             "blazar": ["/api/evict", "/api/warm", "/api/session", "/api/sessions", "/api/why",

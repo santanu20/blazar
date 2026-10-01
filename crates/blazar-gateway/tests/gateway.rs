@@ -1642,6 +1642,32 @@ async fn e2e__requests__card_lifecycle_and_stop_contracts() {
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
+/// Capacity endpoint: shape contract only (device count depends on the
+/// host — CI boxes may have no nvidia-smi; the endpoint must answer with
+/// an honest empty census + note, never error).
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__capacity__shape_contract() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let resp = c
+        .get(format!("{}/api/capacity", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["object"], "blazar.capacity", "shape: {v}");
+    assert!(v["devices"].is_array());
+    assert!(v["residents"].is_array());
+    assert!(v["external"].is_array());
+    assert!(
+        !v["notes"].as_array().unwrap().is_empty(),
+        "honesty notes present: {v}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn e2e__infill_control_tokenize_proxied() {
