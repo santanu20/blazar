@@ -4,8 +4,8 @@
 //! uncapped path stays byte-identical — pacing only exists when asked
 //! for via `download_speed_limit_mb`.
 
-use std::sync::Mutex;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 /// One second of full-rate bytes: the burst allowance. Small enough
 /// that a cap holds on interactive links, large enough that per-read
@@ -21,6 +21,14 @@ struct BucketState {
 /// after each successful read of `bytes` (read-then-sleep: data has
 /// landed, the pause throttles the NEXT request window, and transport
 /// buffers absorb it instead of erroring).
+///
+/// The bucket guard is held ACROSS the deficit sleep, so parallel
+/// download workers serialize at the bucket: deficits carry as shared
+/// negative debt, and each waiter's elapsed-time refill pays down that
+/// debt (capped at one burst) before its own bytes are charged. Sleeping
+/// outside the lock instead let every concurrent worker refill to a
+/// fresh burst and run the pull at roughly `cap × active workers` — the
+/// aggregate cap is the whole point, so the lock has to own the wait.
 pub struct Throttle {
     rate_bytes_per_sec: f64,
     state: Mutex<BucketState>,
@@ -31,7 +39,9 @@ pub struct Throttle {
 ///
 /// * refill `tokens` for the elapsed time (capped at one full burst),
 /// * spend `bytes` from the bucket,
-/// * any deficit divides by the rate into a wait.
+/// * a deficit carries over as negative tokens and divides by the rate
+///   into a wait — the debt is shared, so concurrent waiters cannot
+///   ride each other's wait windows.
 #[must_use]
 pub fn bucket_delay(
     tokens: f64,
@@ -47,10 +57,14 @@ pub fn bucket_delay(
     if remaining >= 0.0 {
         (remaining, Duration::ZERO)
     } else {
-        // Pay the deficit, then wait it out. Tokens land at exactly 0
-        // (not negative): the wait window itself is not credited back.
+        // Carry the deficit as NEGATIVE tokens: the next acquirer must
+        // wait out its share of the same debt. Clamping to 0 instead let
+        // a sleeping worker's wait window regenerate a fresh allowance
+        // for the next worker while the sleeper's own bytes still flowed
+        // at wake-up — every window carried two reads and the aggregate
+        // rate ran at cap x (1 + freeloaders).
         let wait = (-remaining) / rate_bytes_per_sec;
-        (0.0, Duration::from_secs_f64(wait))
+        (remaining, Duration::from_secs_f64(wait))
     }
 }
 
@@ -72,20 +86,19 @@ impl Throttle {
         }))
     }
 
-    /// Paced sleep for a read of `bytes` (no-op cost when uncontended).
+    /// Paced sleep for a read of `bytes`. Holds the bucket guard across
+    /// the sleep (see the struct docs for why); uncontended cost is one
+    /// lock round-trip.
     pub async fn acquire(&self, bytes: u64) {
-        let wait = {
-            let mut st = match self.state.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            let elapsed = st.updated.elapsed();
-            let (tokens, wait) =
-                bucket_delay(st.tokens, elapsed, bytes as f64, self.rate_bytes_per_sec);
-            st.tokens = tokens;
-            st.updated = std::time::Instant::now();
-            wait
-        };
+        let mut st = self.state.lock().await;
+        let elapsed = st.updated.elapsed();
+        let (tokens, wait) =
+            bucket_delay(st.tokens, elapsed, bytes as f64, self.rate_bytes_per_sec);
+        // Stamp BEFORE sleeping: the wait window is what earns the spent
+        // tokens back for the next waiter, so elapsed-time refill in the
+        // next acquire lands on the deficit just paid.
+        st.tokens = tokens;
+        st.updated = std::time::Instant::now();
         if !wait.is_zero() {
             tokio::time::sleep(wait).await;
         }
@@ -155,6 +168,39 @@ mod tests {
             t0.elapsed() >= Duration::from_millis(400),
             "third read paced, took {:?}",
             t0.elapsed()
+        );
+    }
+
+    // Regression pin for the parallel-lane defect the live e2e caught:
+    // when each worker slept its deficit OUTSIDE the lock, the bucket
+    // refilled to a fresh burst for every waiter and a capped pull ran
+    // at roughly cap x active workers. Holding the guard across the
+    // sleep, N workers each charging B bytes must take at least
+    // (N x B - burst) / rate of wall clock.
+    #[tokio::test]
+    async fn unit__acquire__concurrent_reads_enforce_the_aggregate_cap() {
+        const WORKERS: u64 = 8;
+        const BYTES_EACH: u64 = 250_000;
+        let rate = 1_000_000.0; // 1 MB/s, burst = 1 MB
+        let t = Throttle::shared(rate).expect("valid rate");
+        let start = std::time::Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..WORKERS {
+            let t = std::sync::Arc::clone(&t);
+            handles.push(tokio::spawn(async move {
+                t.acquire(BYTES_EACH).await;
+            }));
+        }
+        for h in handles {
+            h.await.expect("worker finished");
+        }
+        let total = f64::from(WORKERS as u32) * BYTES_EACH as f64;
+        let floor_secs = ((total - rate * BURST_SECS) / rate).max(0.0);
+        assert!(
+            start.elapsed() >= Duration::from_secs_f64(floor_secs * 0.8),
+            "aggregate paced: floor {:?}, took {:?}",
+            Duration::from_secs_f64(floor_secs),
+            start.elapsed()
         );
     }
 }
