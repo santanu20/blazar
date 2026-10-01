@@ -15,6 +15,7 @@ import json
 import struct
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 if not Path("scripts/bench_matrix.py").exists():
@@ -204,8 +205,8 @@ stab_clean = bm.speed_table(
 assert "NOT comparable" not in stab_clean, stab_clean
 print("speed_table: reference_note caveat rendered when present, absent otherwise OK")
 
-# --- watt efficiency: tok/s per W column, value or '-' when unmeasured
-assert "tok/s per W" in stab_clean, stab_clean
+# --- watt efficiency: net tok/s per W column, value or '-' when unmeasured
+assert "tok/s per W (net)" in stab_clean, stab_clean
 watted = bm.speed_table(
     [
         rec(
@@ -214,7 +215,7 @@ watted = bm.speed_table(
             tag="ollama-host",
             ollama_model="same",
             decode_tps_p50=40.0,
-            decode_tps_per_w=0.312,
+            decode_tps_per_w_net=0.312,
         )
     ]
 )
@@ -226,7 +227,77 @@ assert wattless_row.split("|")[4].strip() == "-", (
 )
 hdr_cells = stab_clean.splitlines()[0].split("|")
 assert len(hdr_cells) == len(wattless_row.split("|")), stab_clean
-print("speed_table: tok/s per W column (value rendered, '-' unmeasured) OK")
+print("speed_table: net tok/s per W column (value rendered, '-' unmeasured) OK")
+
+# --- ctxcurve table: same net column, header/row cell-count alignment
+ctx_tab = bm.ctxcurve_table(
+    [
+        {
+            "provider": "ctxcurve-blazar",
+            "tag": "b11147-cuda",
+            "ctx": 4096,
+            "decode_tps_p50": 30.0,
+            "decode_tps_per_w_net": 0.2,
+            "ttft_ms_p50": 120.0,
+        }
+    ]
+)
+assert "tok/s per W (net)" in ctx_tab and "0.200" in ctx_tab, ctx_tab
+assert len(ctx_tab.splitlines()[0].split("|")) == len(
+    ctx_tab.splitlines()[2].split("|")
+), ctx_tab
+print("ctxcurve_table: net tok/s per W column + alignment OK")
+
+# --- RAPL accounting: subdomain filtering + counter-wrap deltas
+with tempfile.TemporaryDirectory() as td:
+    rapl_root = Path(td)
+    for name, modulus in (
+        ("intel-rapl:0", "1000"),
+        ("intel-rapl:1", "2000"),
+        ("intel-rapl:0:0", None),
+    ):
+        dom = rapl_root / name
+        dom.mkdir()
+        (dom / "energy_uj").write_text("0")
+        if modulus is not None:
+            (dom / "max_energy_range_uj").write_text(modulus)
+    saved_rapl = bm._RAPL_SYSFS
+    bm._RAPL_SYSFS = rapl_root
+    try:
+        domains = bm._rapl_domains()
+        assert len(domains) == 2, "subdomain (core) counters must not double-count"
+        s = bm.Sampler(None)
+        s._rapl = domains
+        s._rapl_tick()
+        (rapl_root / "intel-rapl:0" / "energy_uj").write_text("400")
+        (rapl_root / "intel-rapl:1" / "energy_uj").write_text("1500")
+        s._rapl_tick()
+        assert abs(s._cpu_j - 0.0019) < 1e-9, s._cpu_j
+        # wrap: 1500 -> 10 across the 2000 uJ modulus = +510 uJ, not -1490
+        (rapl_root / "intel-rapl:1" / "energy_uj").write_text("10")
+        s._rapl_tick()
+        assert abs(s._cpu_j - (0.0019 + 510e-6)) < 1e-9, s._cpu_j
+    finally:
+        bm._RAPL_SYSFS = saved_rapl
+print("Sampler RAPL: subdomain filter + wrap-correct deltas OK")
+
+# --- finalize_power net math: sum of (avg - idle) per measured domain
+s = bm.Sampler(None)
+s._power_samples = [200.0] * 10
+s._t_first_power = time.monotonic() - 10.0
+s.gpu_power_peak_w = 590.0
+s._cpu_j = 1500.0
+s._t_first_cpu = time.monotonic() - 10.0
+s.gpu_idle_w = 50.0
+s.cpu_idle_w = 100.0
+power_rec = {"decode_tps_p50": 50.0}
+bm.finalize_power(power_rec, s)
+# gpu avg 200 W, cpu avg ~150 W -> net = 150 + 50 = ~200 -> 50/200 = 0.25
+assert power_rec["gpu_power_avg_w"] == 200.0, power_rec
+assert abs(power_rec["cpu_power_avg_w"] - 150.0) < 1.0, power_rec
+assert power_rec["gpu_power_idle_w"] == 50.0 and power_rec["cpu_power_idle_w"] == 100.0
+assert 0.24 < power_rec["decode_tps_per_w_net"] < 0.26, power_rec
+print("finalize_power: cross-domain net efficiency math OK")
 
 # --- F6b: cold-start table drops cells with no cold fields and labels configs
 cold_ok = rec(

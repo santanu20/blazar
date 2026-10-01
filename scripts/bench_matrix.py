@@ -12,9 +12,12 @@ through the sandboxed gateway, measuring:
              server provides it (chunks only as fallback)
    resources  peak RSS, peak GPU memory, peak GPU power, load time
               (spawn->healthy), teardown-verified VRAM return
-   efficiency decode tok/s per watt (suite-window gross: time-integrated
-              GPU power.draw avg + energy J from the same sampler; '-'
-              where no power meter exists)
+    efficiency decode tok/s per watt, NET of the pre-generation idle
+               baseline and summed over the measured domains — GPU
+               power.draw (nvidia-smi) + CPU package (RAPL sysfs, where
+               readable) — so rows compare across hosts with different
+               idle draw; gross avg W + energy J recorded alongside;
+               '-' where no power meter exists
   serving    greedy-parity text quality vs the SAME-engine direct
              reference (backend numerics) AND gateway-transparency
              parity (blazar path vs direct path, same engine),
@@ -616,8 +619,45 @@ def _gpu_query(fields: str) -> list[list[float]]:
         return []
 
 
+# CPU-package power comes from the RAPL sysfs counters (Intel + AMD both
+# expose them via the intel-rapl powercap driver). energy_uj is a wrapping
+# cumulative counter (wrap modulus = max_energy_range_uj; Intel counters
+# wrap every ~4 kJ, i.e. ~20 s at 200 W), so watts are derived from wrapped
+# per-domain deltas. The files are frequently root-only (mode 0400) —
+# unreadable simply means CPU power is unmeasured, same contract as a box
+# without nvidia-smi. Overridable so tests can point it at a fake sysfs.
+_RAPL_SYSFS = Path("/sys/class/powercap")
+IDLE_BASELINE_S = 2.0
+
+
+def _rapl_domains() -> list[tuple[Path, int]]:
+    """Top-level RAPL package domains as (energy_uj path, wrap modulus uJ).
+
+    Subdomains (intel-rapl:0:0 core/uncore, dram) are folded into their
+    parent package counter — summing them separately would double-count.
+    """
+    domains = []
+    for d in sorted(_RAPL_SYSFS.glob("intel-rapl:[0-9]*")):
+        if d.name.count(":") != 1:
+            continue
+        energy = d / "energy_uj"
+        try:
+            if not energy.is_file():
+                continue
+            modulus_f = d / "max_energy_range_uj"
+            modulus = (
+                int(modulus_f.read_text().strip()) if modulus_f.is_file() else 1 << 32
+            )
+            with energy.open():
+                pass  # probe: PermissionError -> domain unusable on this host
+            domains.append((energy, modulus))
+        except (OSError, ValueError):
+            continue
+    return domains
+
+
 class Sampler(threading.Thread):
-    """Peak RSS + GPU memory + GPU power sampler.
+    """Peak RSS + GPU memory + power sampler (nvidia-smi + RAPL sysfs).
 
     pid may be None (global GPU-only sampling — used when the serving
     process is not our child, e.g. the ollama host service or the
@@ -641,6 +681,15 @@ class Sampler(threading.Thread):
         self._power_samples: list[float] = []
         self._power_lock = threading.Lock()
         self._t_first_power: float | None = None
+        # RAPL CPU-package accounting: wrapped per-domain deltas
+        # accumulate into _cpu_j from the first successful read
+        self._rapl: list[tuple[Path, int]] = _rapl_domains()
+        self._rapl_prev: dict[Path, int] = {}
+        self._cpu_j: float = 0.0
+        self._t_first_cpu: float | None = None
+        # pre-generation idle baselines (set by snap_idle, None = unsnapped)
+        self.gpu_idle_w: float | None = None
+        self.cpu_idle_w: float | None = None
         self._tick = 0
 
     def _rss(self) -> float:
@@ -664,6 +713,7 @@ class Sampler(threading.Thread):
         while not self.stop_evt.is_set():
             self.rss_peak_mib = max(self.rss_peak_mib, self._rss())
             if self._tick % 3 == 0:
+                self._rapl_tick()
                 snap = self._gpu()
                 if snap is not None:
                     g, w = snap
@@ -677,6 +727,21 @@ class Sampler(threading.Thread):
                     self.gpu_power_peak_w = max(self.gpu_power_peak_w, w)
             self._tick += 1
             self.stop_evt.wait(self.interval)
+
+    def _rapl_tick(self) -> None:
+        """Accumulate wrapped RAPL counter deltas into _cpu_j (J)."""
+        for energy, modulus in self._rapl:
+            try:
+                cur = int(energy.read_text().strip())
+            except (OSError, ValueError):
+                continue
+            with self._power_lock:
+                if self._t_first_cpu is None:
+                    self._t_first_cpu = time.monotonic()
+                prev = self._rapl_prev.get(energy)
+                if prev is not None:
+                    self._cpu_j += ((cur - prev) % modulus) / 1e6
+                self._rapl_prev[energy] = cur
 
     def power_stats(self) -> tuple[float, float]:
         """(avg W, energy J) over the sampled window; (0.0, 0.0) unmeasured.
@@ -692,24 +757,77 @@ class Sampler(threading.Thread):
         avg_w = sum(samples) / len(samples)
         return avg_w, avg_w * (time.monotonic() - t0)
 
+    def cpu_power_stats(self) -> float:
+        """Mean CPU-package W since the first RAPL read; 0.0 unmeasured."""
+        with self._power_lock:
+            joules, t0 = self._cpu_j, self._t_first_cpu
+        if t0 is None or joules <= 0.0:
+            return 0.0
+        window = time.monotonic() - t0
+        return joules / window if window > 0.0 else 0.0
+
+    def snap_idle(self, seconds: float = IDLE_BASELINE_S) -> None:
+        """Record the pre-generation idle baseline (GPU draw + CPU package W).
+
+        Cell drivers call this right before their first timed generation.
+        Direct engine children are loaded by then; gateway/ollama children
+        that spawn on first request sit at unloaded idle — the baseline is
+        'watts just before generation starts', either way. The gross suite
+        window still contains these idle seconds, so net power derived from
+        it errs slightly conservative (net <= true net).
+        """
+        t_end = time.monotonic() + seconds
+        with self._power_lock:
+            cpu_j0 = self._cpu_j
+        gpu_ws: list[float] = []
+        while time.monotonic() < t_end:
+            snap = self._gpu()
+            if snap is not None:
+                gpu_ws.append(snap[1])
+            self._rapl_tick()
+            self.stop_evt.wait(0.4)
+        with self._power_lock:
+            cpu_delta_j = self._cpu_j - cpu_j0
+        if gpu_ws:
+            self.gpu_idle_w = round(sum(gpu_ws) / len(gpu_ws), 1)
+        if cpu_delta_j > 0.0 and seconds > 0.0:
+            self.cpu_idle_w = round(cpu_delta_j / seconds, 1)
+
 
 def finalize_power(rec: dict, sampler: Sampler) -> None:
     """Fold sampler power telemetry into a cell record.
 
-    avg W + energy J + decode_tps_per_w are suite-window gross figures —
-    the window spans engine load as well as generation, so tok/s per W is
-    a per-cell efficiency grade, not a steady-state claim. Unmeasured
-    power (no NVIDIA GPU / no nvidia-smi) leaves the fields absent; the
-    report renders them as '-'.
+    gpu_power_avg_w / gpu_energy_j / cpu_power_avg_w are suite-window
+    gross figures — the window spans engine load as well as generation.
+    decode_tps_per_w_net divides decode t/s by the NET power above the
+    pre-generation idle baseline (Sampler.snap_idle), summed across the
+    measured domains (GPU via nvidia-smi, CPU package via RAPL sysfs):
+    net removes each host's idle draw, so rows compare fairly across
+    machines; GPU-only hosts report net-GPU, CPU-only (headless AMD /
+    no nvidia-smi) report net-CPU-package. Unmeasured domains
+    contribute nothing; nothing measured at all leaves the derived
+    fields absent — the report renders them as '-'.
     """
     rec["gpu_power_peak_w"] = round(sampler.gpu_power_peak_w, 1)
     avg_w, energy_j = sampler.power_stats()
     if avg_w > 0.0:
         rec["gpu_power_avg_w"] = round(avg_w, 1)
         rec["gpu_energy_j"] = round(energy_j, 0)
-        decode_tps = rec.get("decode_tps_p50")
-        if decode_tps:
-            rec["decode_tps_per_w"] = round(decode_tps / avg_w, 3)
+    cpu_w = sampler.cpu_power_stats()
+    if cpu_w > 0.0:
+        rec["cpu_power_avg_w"] = round(cpu_w, 1)
+    if sampler.gpu_idle_w is not None:
+        rec["gpu_power_idle_w"] = sampler.gpu_idle_w
+    if sampler.cpu_idle_w is not None:
+        rec["cpu_power_idle_w"] = sampler.cpu_idle_w
+    net_w = 0.0
+    if avg_w > 0.0 and sampler.gpu_idle_w:
+        net_w += max(avg_w - sampler.gpu_idle_w, 0.0)
+    if cpu_w > 0.0 and sampler.cpu_idle_w:
+        net_w += max(cpu_w - sampler.cpu_idle_w, 0.0)
+    decode_tps = rec.get("decode_tps_p50")
+    if decode_tps and net_w > 0.0:
+        rec["decode_tps_per_w_net"] = round(decode_tps / net_w, 3)
 
 
 def gpu_used_mib() -> float:
@@ -2578,6 +2696,7 @@ def run_direct_cell(
                 rec["error"] += f"; last output: {tail}"
             return rec
         rec["load_s"] = round(time.perf_counter() - t_load0, 2)
+        sampler.snap_idle()
         # mistral.rs children register the served model as "default";
         # the blazar gateway rewrites at the proxy — we do it here.
         body_model = "default" if eng.kind == "mistralrs" else model_name
@@ -2852,6 +2971,7 @@ def run_blazar_cell(
             )
             if not wait_gpu_idle(max_mib=512.0, timeout_s=30.0):
                 rec["cold_gpu_busy_mib"] = round(gpu_used_mib(), 0)
+            sampler.snap_idle()
             t_cold0 = time.perf_counter()
             try:
                 coldm = openai_stream_timed(
@@ -3012,6 +3132,7 @@ def run_conc_axis_cell(
                     time.sleep(0.5)
             if not healthy:
                 return {"error": "sandbox daemon failed to boot"}
+            sampler.snap_idle()
             # a failed suite must still carry teardown + daemon tail for
             # diagnosis — record the error, never re-raise past the
             # finally blocks (mirrors the cold-probe pattern above)
@@ -4095,6 +4216,7 @@ def run_ollama_cold_cell(
         if not ollama_evict(pick):
             rec["cold_gpu_busy_mib"] = round(gpu_used_mib(), 0)
         rec["cold_fadvise_files"] = fadvise_dontneed(ollama_blob_paths())
+        sampler.snap_idle()
         # num_ctx 16384 = the blazar gateway cell's resolved ctx for the
         # matrix model — identical KV allocation on both runtimes
         m = ollama_stream_timed(
@@ -4151,6 +4273,7 @@ def run_ollama_cell(cfg: dict, args_model: str | None = None) -> dict:
     sampler = Sampler(None)  # global GPU/power: the service is not our child
     gpu_busy = warm_cell_gpu_guard("ollama cell")
     sampler.start()
+    sampler.snap_idle()
     try:
         out = {
             "ollama_model": pick,
@@ -5165,7 +5288,10 @@ def write_speed_table(records: list[dict], path: Path) -> None:
         "gpu_peak_mib",
         "gpu_power_peak_w",
         "gpu_power_avg_w",
-        "decode_tps_per_w",
+        "gpu_power_idle_w",
+        "cpu_power_avg_w",
+        "cpu_power_idle_w",
+        "decode_tps_per_w_net",
         "rss_peak_mib",
         "tokens_source",
     ]
@@ -5194,7 +5320,10 @@ def write_speed_table(records: list[dict], path: Path) -> None:
                     fmt(round(r.get("gpu_peak_mib", 0))),
                     fmt(r.get("gpu_power_peak_w")),
                     fmt(r.get("gpu_power_avg_w")),
-                    fmt(r.get("decode_tps_per_w")),
+                    fmt(r.get("gpu_power_idle_w")),
+                    fmt(r.get("cpu_power_avg_w")),
+                    fmt(r.get("cpu_power_idle_w")),
+                    fmt(r.get("decode_tps_per_w_net")),
                     fmt(round(r.get("rss_peak_mib", 0))),
                     r.get("tokens_source", "-"),
                 ]
@@ -6865,7 +6994,7 @@ def speed_table(recs: list[dict]) -> str:
                     speed_row_name(r, f"blazar gateway - {engine_label(r['tag'])}"),
                     child_shape(r) or "engine-scheduled",
                     r.get("decode_tps_p50"),
-                    r.get("decode_tps_per_w"),
+                    r.get("decode_tps_per_w_net"),
                     r.get("ttft_ms_p50"),
                     r.get("ttft_ms_p99"),
                     r.get("itl_p50_ms"),
@@ -6888,7 +7017,7 @@ def speed_table(recs: list[dict]) -> str:
                     f"direct engine - {engine_label(r['tag'])}",
                     "1x16384",
                     r.get("decode_tps_p50"),
-                    r.get("decode_tps_per_w"),
+                    r.get("decode_tps_per_w_net"),
                     r.get("ttft_ms_p50"),
                     r.get("ttft_ms_p99"),
                     r.get("itl_p50_ms"),
@@ -6911,7 +7040,7 @@ def speed_table(recs: list[dict]) -> str:
                     ollama_name,
                     "service",
                     r.get("decode_tps_p50"),
-                    r.get("decode_tps_per_w"),
+                    r.get("decode_tps_per_w_net"),
                     r.get("ttft_ms_p50"),
                     r.get("ttft_ms_p99"),
                     r.get("itl_p50_ms"),
@@ -6923,9 +7052,9 @@ def speed_table(recs: list[dict]) -> str:
                 )
             )
     head = (
-        "| Runtime | slots x ctx | decode t/s | tok/s per W | TTFT p50 ms | TTFT p99 ms |"
-        " ITL p50 ms | ITL p99 ms | prefill cold t/s | prefill cached t/s | GPU peak MiB |"
-        " GPU power W |"
+        "| Runtime | slots x ctx | decode t/s | tok/s per W (net) | TTFT p50 ms |"
+        " TTFT p99 ms | ITL p50 ms | ITL p99 ms | prefill cold t/s |"
+        " prefill cached t/s | GPU peak MiB | GPU power W |"
     )
     sep = "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     body = [
@@ -7882,7 +8011,7 @@ def ctxcurve_table(recs: list[dict]) -> str:
                     f"blazar - {engine_label(r['tag'])}",
                     r.get("ctx"),
                     r.get("decode_tps_p50"),
-                    r.get("decode_tps_per_w"),
+                    r.get("decode_tps_per_w_net"),
                     r.get("ttft_ms_p50"),
                 )
             )
@@ -7892,16 +8021,19 @@ def ctxcurve_table(recs: list[dict]) -> str:
                     f"ollama - {r.get('ollama_model', 'reference')}",
                     r.get("ctx"),
                     r.get("decode_tps_p50"),
-                    r.get("decode_tps_per_w"),
+                    r.get("decode_tps_per_w_net"),
                     r.get("ttft_ms_p50"),
                 )
             )
     if not rows:
         return "_Not measured._"
     rows.sort(key=lambda x: (x[0], x[1] or 0))
-    head = "| Runtime | ctx | decode t/s | TTFT p50 ms |"
-    sep = "|---|---:|---:|---:|"
-    body = [f"| {n} | {pfmt(c, 0)} | {pfmt(d)} | {pfmt(t, 0)} |" for n, c, d, t in rows]
+    head = "| Runtime | ctx | decode t/s | tok/s per W (net) | TTFT p50 ms |"
+    sep = "|---|---:|---:|---:|---:|"
+    body = [
+        f"| {n} | {pfmt(c, 0)} | {pfmt(d)} | {pfmt(e, 3)} | {pfmt(t, 0)} |"
+        for n, c, d, e, t in rows
+    ]
     return "\n".join([head, sep, *body])
 
 
