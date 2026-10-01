@@ -80,12 +80,18 @@ pub fn cold_ctx_note() -> &'static str {
 pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<String>) -> Response {
     // Store resolution first: unknown models fail with teaching, never a
     // half-empty card that looks authoritative.
-    let resolved = state.with_store(|s| s.resolve_model_name(&model));
-    let Some(resolved) = resolved else {
-        return crate::error_response(
-            404,
-            "store unavailable — start the daemon with a writable data dir",
-        );
+    // Canonical gateway ladder (exact → colon-swap → colonless strip →
+    // prefix → suggestion) so the `name:quant` display form /api/tags emits
+    // resolves here exactly like it does on /api/chat.
+    let resolved = match state.with_store(|s| crate::proxy::resolve_model(s, &model)) {
+        Some(Ok(row)) => row.name,
+        Some(Err(teach)) => return crate::error_response(404, &teach),
+        None => {
+            return crate::error_response(
+                404,
+                "store unavailable — start the daemon with a writable data dir",
+            )
+        }
     };
     let Some(Some(row)) = state.with_store(|s| s.get_model(&resolved).ok().flatten()) else {
         return crate::error_response(

@@ -273,24 +273,14 @@ pub async fn run(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     if model.is_empty() {
         return crate::error_response(400, "missing \"model\"");
     }
-    // Resolve through the store FIRST: unknown names 404 before any job
-    // row exists, and the static caps need the row anyway.
-    let row = match state
-        .with_store(|s| {
-            let resolved = s.resolve_model_name(&model);
-            s.get_model(&resolved).ok().flatten()
-        })
-        .flatten()
-    {
-        Some(r) => r,
-        None => {
-            return crate::error_response(
-                404,
-                &format!(
-                    "unknown model: {model} — `blazar ls` lists the store, `blazar pull` adds one"
-                ),
-            )
-        }
+    // Resolve through the canonical gateway ladder FIRST: unknown names 404
+    // before any job row exists, and the static caps need the row anyway.
+    // Same resolver as /api/chat so `name:quant` display forms resolve
+    // identically here.
+    let row = match state.with_store(|s| crate::proxy::resolve_model(s, &model)) {
+        Some(Ok(r)) => r,
+        Some(Err(teach)) => return crate::error_response(404, &teach),
+        None => return crate::error_response(500, "store unavailable"),
     };
 
     // Static caps never spawn a child: vision is a pulled-mmproj fact,
@@ -347,7 +337,9 @@ pub async fn cert(
 ) -> Response {
     let record = state
         .with_store(|s| {
-            let resolved = s.resolve_model_name(&model);
+            // Canonical ladder so `name:quant` display forms resolve the
+            // same way here as on /api/chat.
+            let resolved = crate::proxy::resolve_model(s, &model).ok()?.name;
             s.get_model_caps(&resolved).ok().flatten()
         })
         .flatten();

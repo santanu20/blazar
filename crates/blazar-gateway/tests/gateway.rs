@@ -1718,6 +1718,18 @@ async fn e2e__explain__card_provenance_and_unknown_404() {
     );
     assert!(v["residents"].as_array().is_some_and(|r| r.is_empty()));
 
+    // Tag-form alias (`name:quant`, the display shape /api/tags emits)
+    // resolves through the canonical ladder — regression pin for the
+    // explain 404 on colon forms.
+    let resp = c
+        .get(format!("{}/api/explain/m1:bf16", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "tag form must resolve: ");
+    let card = resp.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(card["model"]["name"].as_str(), Some("m1"));
+
     // Unknown model: teaching 404, never a half-empty card.
     let resp = c
         .get(format!("{}/api/explain/nope", ts.base))
@@ -1726,7 +1738,10 @@ async fn e2e__explain__card_provenance_and_unknown_404() {
         .unwrap();
     assert_eq!(resp.status(), 404);
     let text = resp.text().await.unwrap();
-    assert!(text.contains("unknown model"), "teaching 404: {text}");
+    assert!(
+        text.contains("not found") || text.contains("unknown model"),
+        "teaching 404: {text}"
+    );
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
@@ -1745,7 +1760,10 @@ async fn e2e__model_doctor__job_cert_and_stored_caps() {
         .unwrap();
     assert_eq!(resp.status(), 404);
     let text = resp.text().await.unwrap();
-    assert!(text.contains("unknown model"), "teaching 404: {text}");
+    assert!(
+        text.contains("not found") || text.contains("unknown model"),
+        "teaching 404: {text}"
+    );
 
     // Known model: a durable doctor job is created and runs the probes
     // through the real gateway path (stub engines — verdicts are theirs,
