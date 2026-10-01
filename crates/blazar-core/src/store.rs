@@ -1452,7 +1452,7 @@ mod tests {
         assert_eq!(n, 1);
         assert!(s.get_job("ancient").unwrap().is_none());
         // Events die with their job — no orphans.
-        assert!(s.job_events("ancient", 10).unwrap().is_empty());
+        assert_eq!(s.job_events("ancient", 10).unwrap(), Vec::new());
         // Recent terminal and old-but-in-flight both survive (the sweep owns in-flight).
         assert!(s.get_job("recent").unwrap().is_some());
         assert!(s.get_job("old_inflight").unwrap().is_some());
