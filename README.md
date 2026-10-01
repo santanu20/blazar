@@ -1,57 +1,241 @@
-# blazar
+# Blazar
 
-> **One local inference gateway for OpenAI, Ollama, and Anthropic clients — with multiple engines, VRAM-aware scheduling, model management, and operator-grade diagnostics in one Rust binary.**
+> **A local AI gateway and runtime orchestrator for heterogeneous inference workloads — OpenAI, Ollama, and Anthropic compatible, with multi-engine routing, VRAM-aware scheduling, model management, multimodal serving, and operator-grade diagnostics in one Rust binary.**
 
 [![CI](https://github.com/santanu20/blazar/actions/workflows/ci.yml/badge.svg)](https://github.com/santanu20/blazar/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/santanu20/blazar)](https://github.com/santanu20/blazar/releases)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
 
-**Current release: `0.13.0`**
+**Current release: `0.14.0`**
+
+---
+
+## Table of contents
+
+- [What is Blazar?](#what-is-blazar)
+- [Why use Blazar?](#why-use-blazar)
+- [Benchmark snapshot](#benchmark-snapshot)
+- [Where does it fit?](#where-does-it-fit)
+- [How it works](#how-it-works)
+- [60-second quickstart](#60-second-quickstart)
+- [Use your existing clients](#use-your-existing-clients)
+- [Model management](#model-management)
+- [Multi-engine serving](#multi-engine-serving)
+- [Resource-aware scheduling](#resource-aware-scheduling)
+- [Advanced request orchestration](#advanced-request-orchestration)
+- [Multimodal workloads](#multimodal-workloads)
+- [Sessions, cache, and warm starts](#sessions-cache-and-warm-starts)
+- [Diagnostics and observability](#diagnostics-and-observability)
+- [Safe engine lifecycle](#safe-engine-lifecycle)
+- [Security and network behavior](#security-and-network-behavior)
+- [Configuration](#configuration)
+- [Common commands](#common-commands)
+- [Installation](#installation)
+- [Reproducing benchmarks](#reproducing-benchmarks)
+- [Architecture and engineering](#architecture-and-engineering)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+- [Credits](#credits)
+- [License](#license)
 
 ---
 
 ## What is Blazar?
 
-Blazar is a **local inference gateway and runtime orchestrator**.
+Blazar is a **local AI gateway and runtime orchestrator**.
 
-It sits in front of local inference engines and gives applications one stable endpoint while Blazar handles model discovery, engine selection, process lifecycle, memory fit, concurrency, sessions, diagnostics, and verified engine updates.
+Applications talk to one gateway. Blazar manages the model store, selects or pins an appropriate inference engine, fits workloads to available resources, controls concurrency and lifecycle, and exposes operational diagnostics.
 
 ```text
-OpenAI SDK ───────┐
-Ollama clients ───┼──► blazar gateway ──► llama.cpp
-Anthropic SDK ────┘           │            mistral.rs
-                              │            SGLang
-                              │            sd.cpp (images / video)
+                           Applications
+      ┌───────────────────────┬────────────────────────┐
+      │                       │                        │
+  OpenAI SDK            Ollama clients         Anthropic SDK
+      │                       │                        │
+      └───────────────────────┴────────────────────────┘
                               │
-                              ├── model store
-                              ├── VRAM / KV fit
-                              ├── routing + scheduling
-                              ├── sessions + cache visibility
-                              └── diagnostics + engine lifecycle
+                              ▼
+                    ┌───────────────────┐
+                    │      BLAZAR       │
+                    │───────────────────│
+                    │ API gateway       │
+                    │ Routing           │
+                    │ Admission/queue   │
+                    │ Model store       │
+                    │ VRAM/KV fit       │
+                    │ Sessions/cache    │
+                    │ Diagnostics       │
+                    │ Engine lifecycle  │
+                    └─────────┬─────────┘
+                              │
+        ┌─────────────────────┼─────────────────────────┐
+        │                     │                         │
+   llama.cpp            mistral.rs                  SGLang
+        │                     │                         │
+        └────────────── Text / Embeddings ─────────────┘
+                              │
+                 ┌────────────┼─────────────┐
+                 │            │             │
+              sd.cpp       whisper.cpp     piper
+               Images       Speech         TTS
+               Video        to text
 ```
+
+The underlying engines still perform inference. **Blazar is the control plane around those engines.**
 
 ### The core idea
 
 **Bring your client. Bring your model. Blazar handles the serving stack.**
 
-You get one local port, three API dialects, multiple engine backends, and one operational surface.
+### At a glance
+
+| Capability | Blazar provides |
+|---|---|
+| **One gateway** | OpenAI-, Ollama-, and Anthropic-compatible APIs |
+| **Multiple runtimes** | llama.cpp, mistral.rs, SGLang, stable-diffusion.cpp, whisper.cpp, and piper |
+| **Resource control** | VRAM/KV fit, slots, admission, co-residency, and lifecycle management |
+| **Model operations** | Pull, import, inspect, pin, tune, snapshot, and restore |
+| **Production controls** | API keys, TLS, CORS, audit logging, metrics, traces, and diagnostics |
+| **Multimodal** | Text, embeddings, image, video, speech-to-text, and TTS |
 
 ---
 
-## Why use it?
+## Why use Blazar?
 
-| Problem | Blazar's approach |
+Blazar is useful when local inference has outgrown the "run one server for one model" workflow.
+
+| Need | Blazar's approach |
 |---|---|
-| Multiple clients speak different APIs | One gateway supports **OpenAI + Ollama + Anthropic** APIs |
-| Different model families need different runtimes | Capability-driven **engine routing** across llama.cpp, mistral.rs, SGLang, and sd.cpp (diffusion/video) |
-| GPU memory is easy to oversubscribe | `blazar fit`, capacity-aware profiles, KV-cache controls, and model co-residency planning |
-| Engine upgrades can break working installs | Verified, side-by-side engine installs with **rollback and regression gates** |
-| Model stores become opaque and tool-specific | Local model files remain ordinary **GGUF / safetensors** files |
-| Failures are hard to diagnose | `blazar doctor`, `blazar why`, `blazar watch`, trace IDs, metrics, and explicit teaching errors |
-| Local deployments become operationally messy | One binary, one documented config, system service support, snapshots, and self-update |
+| Multiple applications use different APIs | One gateway supports **OpenAI, Ollama, and Anthropic** compatible surfaces. |
+| Different models need different runtimes | Capability-aware lanes across **llama.cpp, mistral.rs, SGLang, stable-diffusion.cpp, whisper.cpp, and piper**. |
+| GPU memory and context are difficult to manage | Fit planning, KV-aware sizing, slots, admission control, and co-residency planning. |
+| Models and engines become operationally messy | One CLI, model store, engine store, configuration surface, and lifecycle manager. |
+| Engine updates can introduce regressions | Verified side-by-side installs, probing, regression gates, explicit activation, and rollback. |
+| Failures are hard to diagnose | `doctor`, `why`, `watch`, metrics, trace IDs, and actionable errors. |
+| AI CLIs need repeated environment setup | `blazar launch` prepares the local API environment and ensures the daemon is available. |
+| Local deployments need controls | API keys, TLS, CORS, audit logging, PII scrubbing, OTLP, and explicit remote routing. |
 
-Blazar is intentionally an **orchestrator** rather than a reimplementation of model inference. The engines still do the heavy inference work.
+### What Blazar is not
+
+Blazar does **not** replace the inference engines, train models, or require a hosted service. It gives applications a stable local control surface while the selected runtime performs the actual model execution.
+
+---
+
+## Benchmark snapshot
+
+Blazar is designed to add a **control and orchestration plane around inference engines without becoming the performance bottleneck**.
+
+The repository includes reproducible benchmark campaigns covering raw engine overhead, concurrency, latency, cache behavior, cold starts, idle wake, tool calls, scheduling, model lifecycle, and media workloads.
+
+### Published benchmark snapshot
+
+The latest committed flagship campaign was recorded on **September 29, 2026**. It used an NVIDIA RTX 4070 Laptop GPU (8 GiB), Intel Core i7-14650HX, 16 GiB RAM, and Linux Mint 22.3. The campaign receipt is published in [`BENCHMARK.md`](BENCHMARK.md) and [`bench-artifacts/`](bench-artifacts/).
+
+> **Important:** these are measured results from a specific model, engine build, hardware configuration, workload, and software version. They are evidence of observed behavior, not universal performance guarantees. This campaign ran against Blazar `0.13.0`; the current release is `0.14.0`.
+
+### What the benchmark shows
+
+| Workload | Blazar | Reference | Interpretation |
+|---|---:|---:|---|
+| Single-stream decode behind gateway | **40.6 t/s** | **41.5 t/s** direct engine | ~**2%** measured gateway overhead in this configuration |
+| Concurrent system throughput, C=4 | **104.8 t/s** | **33.6 t/s** Ollama reference lane | ~**3.1×** the measured system throughput in this campaign |
+| Concurrent TTFT p99, C=4 | **554 ms** | **15.9 s** Ollama reference lane | Lower measured tail latency |
+| Tool-call TTFT p50 | **117 ms** | **284 ms** Ollama reference lane | ~**2.4×** lower measured time to first tool-call response |
+| Idle wake | **3.63 s** | **6.21 s** Ollama reference lane | Faster measured wake |
+| Adaptive serving under sustained load | **49 → 63 t/s** | — | ~**28%** throughput gain; **0 failed requests** |
+
+### Why these numbers matter
+
+The benchmark illustrates two distinct benefits of Blazar.
+
+**Low overhead on the fast path.** A direct llama.cpp run measured 41.5 tokens/s while the same engine behind the Blazar gateway measured 40.6 tokens/s. In that configuration, the gateway overhead was approximately 2% for decode throughput.
+
+**More control as workloads become difficult.** The larger value of an orchestration layer appears under concurrency, model lifecycle changes, and sustained load. Blazar can schedule requests, manage slots, control model residency, adapt capacity, and expose the resulting behavior to the operator instead of leaving every decision to an individual engine process.
+
+### Benchmark philosophy
+
+Blazar benchmarks more than raw tokens/s because a local inference platform is an operational system, not just a decoder. Campaigns measure:
+
+- single-stream decode and prefill;
+- concurrency and saturation behavior;
+- gateway overhead versus the direct engine;
+- TTFT and inter-token latency;
+- cold starts and idle wake;
+- prompt-cache reuse;
+- tool-call and structured-output behavior;
+- adaptive scheduling;
+- model and engine lifecycle;
+- image, video, TTS, and Whisper workloads.
+
+Every campaign records the model, engine build, hardware, configuration, workload, and measurement methodology.
+
+For the complete methodology, full result tables, and raw campaign receipts, see [`BENCHMARK.md`](BENCHMARK.md).
+
+---
+
+## Where does it fit?
+
+### Local development
+
+Keep application code pointed at one endpoint while swapping models or engine lanes underneath it.
+
+### Personal AI workstation
+
+Run several models on one machine while keeping VRAM, slots, model residency, and idle eviction under one policy.
+
+### Agent and CLI systems
+
+Use `blazar launch <command>` so local tools can use the same gateway and configuration instead of maintaining separate endpoint setup.
+
+### Homelab and internal services
+
+Start with loopback-only access, then add authentication, TLS, CORS, metrics, and audit controls when the gateway needs to serve more than one process or host.
+
+### Multimodal local AI
+
+Manage text, embeddings, image generation, video generation, transcription, and offline TTS through the same operational model.
+
+### Heterogeneous hardware
+
+Use capability-aware engine selection, multi-GPU placement, or supported RPC offload where one local machine is not the whole serving topology.
+
+---
+
+## How it works
+
+A typical request path is:
+
+```text
+Client request
+    │
+    ▼
+API dialect / route
+    │
+    ▼
+Model + capability resolution
+    │
+    ▼
+Admission + queueing
+    │
+    ▼
+VRAM / KV / slot fit
+    │
+    ▼
+Engine selection or explicit override
+    │
+    ▼
+Managed engine child
+    │
+    ▼
+Response + telemetry + trace
+```
+
+The practical workflow is:
+
+```text
+fit → pull/import → serve → run → observe → tune
+```
 
 ---
 
@@ -61,39 +245,37 @@ Blazar is intentionally an **orchestrator** rather than a reimplementation of mo
 
 #### Linux / macOS
 
-For the current `0.13.0` release:
-
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/santanu20/blazar/v0.13.0/scripts/install.sh \
+  https://raw.githubusercontent.com/santanu20/blazar/v0.14.0/scripts/install.sh \
   | BLAZAR_REPO=santanu20/blazar sh
 ```
 
 #### Windows PowerShell
 
 ```powershell
-irm https://raw.githubusercontent.com/santanu20/blazar/v0.13.0/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/santanu20/blazar/v0.14.0/scripts/install.ps1 | iex
 ```
 
-The release binary does **not** bundle an inference engine. Install/update the engine separately:
+The Blazar binary and inference engines are separate artifacts. The installer can bootstrap the default engine; you can also manage the engine explicitly:
 
 ```sh
 blazar engine update
 ```
 
-The installer can also bootstrap the engine on supported Unix installs; `blazar engine update` is the explicit, cross-platform control point.
+To skip engine bootstrap during installation, set `BLAZAR_INSTALL_ENGINE=0` in the installer environment.
 
 ### 2. Pull a model
 
 ```sh
-# Ollama registry shortname
+# Registry shortname
 blazar pull qwen3-0.6b
 
 # Hugging Face GGUF
 blazar pull ggml-org/Qwen3-8B-GGUF:Q4_K_M
 ```
 
-GGUF can also be imported without copying the file:
+Or register an existing local GGUF:
 
 ```sh
 blazar import /path/to/model.gguf --name mymodel
@@ -105,17 +287,19 @@ blazar import /path/to/model.gguf --name mymodel
 blazar serve
 ```
 
-Blazar listens on `127.0.0.1:11435` by default.
+Default listener:
+
+```text
+http://127.0.0.1:11435
+```
 
 ### 4. Run a model
-
-In another shell:
 
 ```sh
 blazar run qwen3-0.6b
 ```
 
-Or call it directly through the OpenAI-compatible API:
+Or call the OpenAI-compatible API:
 
 ```sh
 curl http://127.0.0.1:11435/v1/chat/completions \
@@ -128,111 +312,40 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 
 ---
 
-## Existing Ollama clients can move over incrementally
+## Use your existing clients
 
-Blazar is designed to coexist with Ollama while you test it.
+Blazar is designed to be introduced **without rewriting application code**.
 
-Point an existing Ollama client at Blazar:
+### OpenAI-compatible clients
 
-```sh
-export OLLAMA_HOST=http://127.0.0.1:11435
-```
-
-OpenAI clients can use:
+Base URL:
 
 ```text
 http://127.0.0.1:11435/v1
 ```
-
-Anthropic-compatible clients use:
-
-```text
-http://127.0.0.1:11435
-```
-
-When you are ready for a full port-level replacement, configure Blazar for `11434`, stop Ollama, and keep the clients unchanged.
-
-### Models stay portable
-
-Blazar keeps model weights as ordinary local files rather than requiring an opaque runtime-specific blob store.
-
-```text
-~/.local/share/blazar/models/
-```
-
-Existing GGUF files can be registered with `blazar import`; imports use hardlinks by default, so registration does not duplicate the model data.
-
-### Launch agent CLIs preconfigured
-
-`blazar launch` wraps any AI CLI: it exports the OpenAI/Anthropic/Ollama base-URL environment for the local daemon, ensures the daemon is up, then execs the command unchanged.
-
-```sh
-blazar launch claude    # or any tool that reads ANTHROPIC_BASE_URL / OPENAI_BASE_URL / OLLAMA_HOST
-blazar launch dsh
-```
-
----
-
-## Engines and model formats
-
-Blazar currently orchestrates five engine families:
-
-| Engine | Typical formats / role |
-|---|---|
-| **llama.cpp** | GGUF; default mainstream lane for quantized GGUF serving |
-| **mistral.rs** | GGUF and safetensors paths supported by the runtime |
-| **SGLang** | Safetensors; especially AWQ / GPTQ / FP8 on supported accelerators |
-| **sd.cpp** | Diffusion + video checkpoints via a prebuilt `sd-server` (CUDA on NVIDIA when upstream ships it, Vulkan on every GPU, CPU/Metal otherwise). Nine curated families — Qwen-Image-2.1, Qwen-Image (v1), FLUX.1, Z-Image, Chroma, FLUX.2-dev (component sets with flag-keyed VAE/text-encoder pulls), SDXL, SD 1.5 (single self-contained checkpoints) and Wan 2.1 T2V (video: DiT + `--vae` + `--t5xxl`) — plus async jobs, SSE progress, native-dialect translation and huggingface hub-cache reuse |
-| **whisper.cpp** | Audio transcription/translation (GGML whisper models) — a lazy media lane: the server spawns on demand for `/v1/audio/*`, never claims the serving-active slot, and lives in the engines store like every other lane (legacy `whisper/bin` trees self-adopt on first sight) |
-
-Routing is capability-driven rather than a blind global switch.
-
-Typical policy:
-
-- **GGUF** → llama.cpp, with mistral.rs available as an alternate lane.
-- **Quantized safetensors (AWQ/GPTQ/FP8)** → SGLang.
-- **Plain safetensors** → SGLang or mistral.rs according to routing policy.
-- **Diffusion component sets** → sd.cpp (`blazar engine install --kind sdcpp`); the domain gate is bidirectional — text engines never receive component rows and sd.cpp never receives text models. Pulling a known diffusion family (`Qwen-Image-2.1-GGUF`, FLUX.1 GGUF repos) fetches the full flag-keyed component set (e.g. `--vae` + `--t5xxl` + `--clip_l` for FLUX.1) as one model, re-using byte-exact files already on disk; generation rides `POST /v1/images/generations` (and `/v1/images/edits` when the family ships a vision encoder), with opt-in `"async": true`/`"stream": true` job modes (`GET /v1/images/jobs/{id}`, `POST /v1/images/jobs/{id}/cancel`, `GET /v1/images/capabilities`) and rich native fields (cache engines, LoRA, guidance) shallow-translated automatically. Component pulls reuse byte-exact files from the local huggingface hub cache (hardlinked, `rm`-safe). Video families (Wan 2.1 T2V) serve `POST /v1/videos/generations` with the same job modes at `/v1/videos/jobs/*` — the gateway refuses a video family on the images route and vice versa.
-- `engine_routing.mode = "manual"` pins a single active engine when you explicitly want that behavior.
-- A per-model engine override wins over automatic routing.
-- The ENGINE column in `blazar list` is the routing lane, not a capability guarantee; a `†` cell (plus a footer line, or the `engine_arch_gap` field in `--json`) marks a GGUF architecture the routed llama.cpp build provably cannot load — spawn fails with teaching unless a covering fork lane is installed.
-- When an installed lane (e.g. a fork build) advertises an architecture the picked lane provably lacks, all three listings (`list`, `/api/tags`, `/v1/models`) show that lane — the same one the spawn-time capability rescue lands on — so previews never advertise a lane that would crash first.
-- Multi-node offload: per-model `rpc_servers` overrides spawn text engines with `--rpc gpu:node...` against your own `ggml-rpc-server` workers; a user-run RPC server is treated as a foreign co-tenant (reported by `doctor`, never swept by the orphan cleaner).
-
-For model fit and engine choice:
-
-```sh
-blazar fit <model-or-repo>
-blazar list
-blazar show <model>
-blazar ps
-```
-
----
-
-## One gateway, three API dialects
-
-### OpenAI-compatible
 
 Common surfaces include:
 
 ```text
 /v1/chat/completions
 /v1/completions
+/v1/responses
 /v1/embeddings
 /v1/rerank
-/v1/responses
 /v1/batches
 /v1/files
-/v1/audio/transcriptions
-/v1/audio/translations
-/v1/audio/speech
-/v1/images/generations
-/v1/images/edits
-/v1/videos/generations
+/v1/audio/*
+/v1/images/*
+/v1/videos/*
 ```
 
-### Ollama-compatible
+### Ollama-compatible clients
+
+```sh
+export OLLAMA_HOST=http://127.0.0.1:11435
+```
+
+Common compatibility routes include:
 
 ```text
 /api/chat
@@ -240,45 +353,296 @@ Common surfaces include:
 /api/tags
 /api/ps
 /api/pull
+/api/embeddings
+/api/embed
+/api/rerank
 ```
 
-### Anthropic-compatible
+You can use Blazar alongside an existing Ollama installation, then later configure Blazar for `11434` when you want a port-level replacement.
+
+### Anthropic-compatible clients
+
+Base URL:
+
+```text
+http://127.0.0.1:11435
+```
+
+Primary route:
 
 ```text
 /v1/messages
 ```
 
-### Blazar-native control plane
+### AI CLIs and agents
 
-```text
-/api/evict
-/api/session
-/api/keys
-/api/why
-/api/watch
-/.well-known/blazar
+```sh
+blazar launch <command>
 ```
 
-See the complete route, payload, error, and configuration reference in [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md).
+Blazar prepares the relevant OpenAI / Anthropic / Ollama base-URL environment and executes the command.
 
 ---
 
-## The features that matter in production
+## Model management
 
-### VRAM-aware serving
+Blazar keeps model assets as ordinary local files instead of requiring an opaque runtime-specific blob store.
 
-Blazar profiles a model against the available hardware before spawning it. `blazar fit` can preview fit and quant alternatives before you download a large model.
+Default model area:
 
-KV-cache policy can trade memory against capacity using supported cache types such as `f16`, `q8_0`, and `q4_0`.
+```text
+~/.local/share/blazar/models/
+```
+
+Common workflows:
 
 ```sh
-blazar fit qwen3-0.6b
+blazar pull <target>
+blazar import <file> --name <name>
+blazar list
+blazar show <model>
+blazar ps
+blazar fit <target>
+```
+
+For existing GGUF files, import uses hardlinks by default, avoiding an unnecessary second copy of the model data.
+
+---
+
+## Multi-engine serving
+
+Blazar currently manages these runtime lanes:
+
+| Engine | Role | Typical workloads |
+|---|---|---|
+| **llama.cpp** | Mainstream local text serving | GGUF and quantized local models |
+| **mistral.rs** | Alternative text runtime | Supported GGUF and safetensors models |
+| **SGLang** | Safetensors-oriented serving | AWQ, GPTQ, FP8 and supported safetensors models |
+| **stable-diffusion.cpp** | Media generation | Diffusion images and video |
+| **whisper.cpp** | Speech recognition | Transcription and translation |
+| **piper** | Offline speech synthesis | Local TTS voices |
+
+### Capability-aware routing
+
+Blazar can route according to model format and engine capability rather than forcing every model through one runtime.
+
+Typical lanes are:
+
+```text
+GGUF                      → llama.cpp / mistral.rs
+Quantized safetensors     → SGLang
+Plain safetensors         → SGLang / mistral.rs
+Diffusion component sets  → stable-diffusion.cpp
+Audio transcription       → whisper.cpp
+Offline TTS               → piper
+```
+
+Automatic routing is available through the routing policy; the default configuration preserves the single-active-engine behavior, while explicit per-model engine pins remain available when you need deterministic placement.
+
+For GGUF architectures that are not yet covered by the mainstream llama.cpp lane, Blazar can manage curated **capability lanes** built from immutable fork commits and route only the affected models there.
+
+---
+
+## Resource-aware scheduling
+
+Blazar treats **memory, concurrency, and model residency as scheduling problems** rather than leaving all decisions to the underlying engine.
+
+### Fit before download
+
+```sh
+blazar fit <model-or-repo>
+```
+
+Preview model fit, context limits, and quantization options before committing to a large download.
+
+### VRAM and KV awareness
+
+The serving planner can account for:
+
+- model weights;
+- context length;
+- KV-cache posture and quantization;
+- slot count and parallelism;
+- host-memory spill where supported;
+- multi-model co-residency;
+- device placement and multi-GPU configuration.
+
+### Co-residency planning
+
+```sh
 blazar coreside
 ```
 
-### Engine lifecycle without blind replacement
+Use this to reason about which models can remain resident together within the machine's available capacity.
 
-Engines are installed side-by-side, verified, probed, and switched explicitly. Updates are regression-gated and can roll back when a measured decode regression crosses the configured threshold.
+### Admission and queueing
+
+When a model is saturated, Blazar can park requests behind bounded admission rather than allowing uncontrolled concurrency to inflate latency and destabilize the workload.
+
+### Adaptive capacity
+
+Supported lanes can reshape slot capacity from sustained workload telemetry while still respecting explicit configuration pins.
+
+---
+
+## Advanced request orchestration
+
+Blazar can make decisions **per request**, not only per model.
+
+### Best-of-N
+
+For supported non-streaming request paths, `best_of` can generate multiple candidate answers and select among them using deterministic criteria such as schema validity and clean completion.
+
+### Cascade routing
+
+For supported Ollama-compatible requests, `cascade` can try a smaller or cheaper candidate first and escalate only when the result does not satisfy the decision ladder.
+
+These features are useful for agentic systems that want to trade extra candidate computation for better answer quality or a lower average serving cost.
+
+See [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md) for exact endpoint support and constraints.
+
+---
+
+## Multimodal workloads
+
+Blazar extends the same gateway and lifecycle model beyond text.
+
+### Text and embeddings
+
+```text
+/v1/chat/completions
+/v1/responses
+/v1/embeddings
+/v1/rerank
+```
+
+### Image generation
+
+```text
+POST /v1/images/generations
+POST /v1/images/edits
+```
+
+### Video generation
+
+```text
+POST /v1/videos/generations
+```
+
+Image and video model families are explicitly separated so a video workload is not sent to an image-only route.
+
+### Speech-to-text
+
+```text
+POST /v1/audio/transcriptions
+POST /v1/audio/translations
+```
+
+CLI:
+
+```sh
+blazar whisper --install
+blazar whisper --pull base
+blazar whisper file.wav
+```
+
+### Text-to-speech
+
+```text
+POST /v1/audio/speech
+```
+
+CLI:
+
+```sh
+blazar tts --install
+blazar tts --pull en_US-amy-medium
+blazar tts "hello" --out hello.wav
+```
+
+Long-running media operations can use gateway-owned asynchronous job handles where supported by the route.
+
+---
+
+## Sessions, cache, and warm starts
+
+Local AI workloads often repeat the same context. Blazar makes that behavior visible and manageable.
+
+### Sessions
+
+```sh
+blazar session save <model>
+blazar session restore <model>
+```
+
+Session checkpoints can preserve conversational state across model unloads and daemon restarts where the selected engine supports it.
+
+### Prefix-cache visibility
+
+Blazar exposes cache-hit information and diagnostics for common cache-busting patterns. This helps distinguish a genuinely expensive generation from a workload that keeps invalidating its own prompt prefix.
+
+### Semantic cache
+
+An optional semantic cache can reuse compatible responses for sufficiently similar requests. It is opt-in rather than silently changing request behavior.
+
+### Preload and warm-on-pull
+
+Blazar can optionally preload configured models and can warm a freshly pulled model so the next real request can avoid the full cold-start path.
+
+---
+
+## Diagnostics and observability
+
+A central design goal is to answer **"what happened?"** rather than merely returning an error code.
+
+### Health and environment
+
+```sh
+blazar doctor
+```
+
+Checks cover areas such as system/GPU state, engines, models, runtime, channels, and service-manager integration, with corrective hints where available.
+
+### Explain request behavior
+
+```sh
+blazar why
+```
+
+Inspect routing, queueing, model state, cache behavior, and sentinel findings using request trace information.
+
+### Live diagnostics
+
+```sh
+blazar watch
+```
+
+Useful for observing a live workload.
+
+### Metrics
+
+```text
+GET /metrics
+```
+
+Metrics include request behavior, model decode telemetry, cache activity, routing, and advanced scheduling/orchestration signals.
+
+### Audit and telemetry
+
+Blazar can provide:
+
+- audit JSONL records;
+- PII scrubbing for diagnostic output;
+- OTLP traces and metrics;
+- trace IDs linking gateway activity to individual requests.
+
+External telemetry is configurable and not required for normal local operation.
+
+---
+
+## Safe engine lifecycle
+
+Inference engines evolve quickly. Blazar treats them as **managed, versioned dependencies** rather than replacing one binary in place.
 
 ```sh
 blazar engine update
@@ -287,100 +651,144 @@ blazar engine use <tag>
 blazar engine rollback
 ```
 
-### Sessions and cache-aware workflows
+The engine lifecycle supports:
 
-Session checkpoints can survive model unloads and daemon restarts. The gateway also exposes cache-hit information and detects common prefix-cache busting patterns.
+- SHA-256 verification;
+- capability probing;
+- side-by-side installations;
+- explicit activation;
+- regression gates;
+- rollback;
+- capability-lane management.
 
-```sh
-blazar session save <model>
-blazar session restore <model>
-blazar why
-```
-
-### Diagnostics instead of guesswork
-
-```sh
-blazar doctor
-blazar why
-blazar watch
-blazar ps
-```
-
-The diagnostic surfaces expose trace IDs, routing decisions, model state, context/slot information, engine failures, and sentinel detections with actionable fix hints.
-
-### Speculative decoding
-
-Blazar can select and expose compatible draft candidates for speculative decoding, while retaining explicit per-request controls.
-
-```sh
-blazar drafts <model>
-blazar run <model> --no-draft
-```
-
-### LoRA and vision support
-
-Blazar supports managed LoRA adapters, per-request adapter variants, and vision projectors for compatible models.
-
-```sh
-blazar lora add <model> /path/to/adapter.gguf
-blazar lora list
-blazar mmproj ...
-```
-
-Adapter format follows the model's engine lane. GGUF checkpoint files (`.gguf`/`.bin`) attach to models served by llama.cpp/mistral.rs; PEFT LoRA dirs (the `adapter_config.json` + `adapter_model.safetensors` layout that Hugging Face trains) attach to safetensors-dir models served by sglang, which loads them at runtime — no merge step, one base in VRAM, many adapters. `blazar lora add` refuses mismatches at the door (unknown model, missing path, GGUF file on a safetensors model, PEFT dir on a GGUF model) with the correction spelled out; the supervisor refuses adapters that vanished from disk at spawn time instead of letting the child crash-loop.
-
-Requesting `model+adapter` spawns a dedicated child running only that adapter, so the adapted and base models coexist as separate instances. The suffix addresses the adapter by its full file/dir name (dotted names like `anonymizer-1.7b` work whole) or by the stem shorthand (the name truncated at its last dot). On the sglang lane, adapter scale is fixed by the training (PEFT alpha/rank) and the scale argument is ignored. Typed-decision adapters — LoRA-tuned classifiers such as Bespoke-Nimble-9B that answer schema-constrained choice lists — pair naturally with the gateway's `response_format`/`json_schema`, `logit_bias`, and `logprobs` passthrough: constrain to the candidate tokens, read the single-token answer plus its probability.
-
-### Images, video, and speech
-
-`blazar run` is multimodal by model kind: text models open a streaming chat loop, diffusion sets generate images or video, and pulled piper voices write WAV clips — with an inline `PROMPT` every lane runs single-shot and exits. The same media lanes are served over HTTP on the routes listed above.
-
-```sh
-# image generation (sd.cpp lane)
-blazar pull Qwen-Image-2.1-GGUF
-blazar run qwen-image-2.1
-
-# text-to-video (Wan 2.1 via sd.cpp)
-blazar pull Comfy-Org/Wan_2.1_ComfyUI_repackaged
-blazar run wan_2.1_comfyui_repackaged
-
-# speech: install the lanes, pull assets, generate
-blazar tts --install && blazar tts --pull en_US-amy-medium
-blazar tts "hello" --out hello.wav
-blazar whisper --install && blazar whisper --pull base
-blazar whisper file.wav
-```
-
-Both voice lanes are fully managed: `--list` inventories what is installed, `--pin <tag>`/`--pin none` freezes (or frees) the exact binary version served — the pin is honored across both the engines lane and the legacy tree. The lane lives in the engines store like every other engine: legacy `whisper/bin` trees move-and-register into `engines/<tag>` automatically (first serve, `doctor`, or `engine prune`), and `blazar whisper --install` installs straight into the engines lane. Whisper can also transparently use a remote `whisper: [[remotes]]` entry when one is configured.
+This lets you experiment with newer engines without making an existing working installation disposable.
 
 ---
 
-## Capability lanes for architectures not in mainstream llama.cpp yet
+## Security and network behavior
 
-When a GGUF architecture is not available in the mainstream engine, Blazar can build a **capability lane** from an immutable llama.cpp fork commit, record the provenance, and route only the models that need it.
+Blazar is designed for **local-first, operator-controlled deployment**.
 
-```sh
-blazar engine offers
-blazar engine install --lane <id> --backend cuda
+Default gateway endpoint:
+
+```text
+127.0.0.1:11435
 ```
 
-Capability lanes are a bridge, not the normal path: mainstream engines take precedence for architectures they already support, and curated lanes can be retired automatically once upstream support arrives.
+Security and deployment controls include:
 
-For untrusted third-party forks, treat the lane as executable code running with your privileges and review the provenance before installing it.
+- optional API keys with model, rate, token, and concurrency scopes;
+- TLS using configured PEM certificate/key pairs;
+- explicit CORS policy;
+- PII scrubbing in diagnostic surfaces;
+- audit logging;
+- opt-in OTLP export;
+- explicit remote routing rather than mandatory cloud connectivity.
+
+Example key management:
+
+```sh
+blazar keys add <name>
+blazar keys list
+blazar keys rotate <name>
+```
+
+Downloaded engines, third-party capability forks, installers, and model weights should be handled according to your own host and supply-chain security requirements.
 
 ---
 
-## Installation details
+## Configuration
 
-### Supported release targets
+Configuration lives at:
 
-Current release assets cover:
+```text
+~/.config/blazar/config.toml
+```
 
-- **Linux:** x86_64, aarch64, armv7; GNU builds plus static musl fallback where needed.
-- **macOS:** Intel and Apple Silicon.
-- **Windows:** x64 and ARM64, with an emulated x64 fallback when a native ARM64 asset is unavailable.
+Prefer the CLI for routine changes:
 
-Package-manager integrations are also maintained in the repository for **Homebrew, Scoop, and Winget**.
+```sh
+blazar config defaults
+blazar config list
+blazar config get <key>
+blazar config set <key> <value>
+blazar config unset <key>
+```
+
+Major configuration areas include:
+
+| Area | Examples |
+|---|---|
+| Serving | `host`, `port`, `default_ctx`, `slots`, `max_loaded_models` |
+| Memory / quality | `cache_type`, `cache_type_k`, `cache_type_v`, `kv_unified`, `ctx_extend` |
+| Scheduling | `singleflight`, `adaptive_slots`, admission and priority controls |
+| Speculation | `spec`, draft selection, n-gram lookup settings |
+| Routing | `engine_routing`, per-model engine overrides, replicas |
+| Access | `keys`, TLS, CORS, remotes |
+| Observability | `audit_log`, `pii_scrub`, `otlp_endpoint`, `otlp_service` |
+| Model behavior | `chat_template`, sampler defaults, LoRA, projector, warmup |
+| Media | diffusion tuning, RPC, audio-lane timeouts |
+
+The authoritative live defaults are available from the binary itself:
+
+```sh
+blazar config defaults
+```
+
+Authentication is optional. A default local deployment does not require a gateway API key unless you configure keys.
+
+---
+
+## Common commands
+
+| Task | Command |
+|---|---|
+| Start gateway | `blazar serve` |
+| Run a model | `blazar run <model>` |
+| Launch an AI CLI | `blazar launch <command>` |
+| Pull a model | `blazar pull <target>` |
+| Import local GGUF | `blazar import <file> --name <name>` |
+| Inspect models | `blazar list` / `blazar show <model>` |
+| Inspect running models | `blazar ps` |
+| Stop a model | `blazar stop <model>` |
+| Check hardware/configuration | `blazar doctor` |
+| Explain request behavior | `blazar why` |
+| Live diagnostics | `blazar watch` |
+| Preview fit | `blazar fit <target>` |
+| Plan co-residency | `blazar coreside` |
+| Manage engines | `blazar engine update`; `list`; `use`; `rollback`; `install`; `build`; `prune` |
+| Manage sessions | `blazar session save`; `restore` |
+| Manage LoRA | `blazar lora add`; `rm`; `list` |
+| Manage projectors | `blazar mmproj ...` |
+| Tune a model | `blazar tune <model>` |
+| Inspect draft candidates | `blazar drafts <model>` |
+| Benchmark | `blazar bench <model>` |
+| Manage API keys | `blazar keys list`; `add`; `rm`; `rotate` |
+| Transcribe audio | `blazar whisper <file>` |
+| Generate speech | `blazar tts "<text>"` |
+| Search models | `blazar search ...` |
+| Back up state | `blazar snapshot` |
+| Self-update | `blazar upgrade` |
+
+Complete CLI surface:
+
+```sh
+blazar --help
+```
+
+---
+
+## Installation
+
+### Release binaries
+
+Current release targets include:
+
+- Linux: x86_64, aarch64, armv7;
+- macOS: Intel and Apple Silicon;
+- Windows: x64 and ARM64.
+
+Engine capability and accelerator support depend on the selected runtime and platform.
 
 ### Build from source
 
@@ -388,7 +796,7 @@ Package-manager integrations are also maintained in the repository for **Homebre
 cargo install --path crates/blazar-cli
 ```
 
-Or run the repository installer from a checkout:
+Or from a checkout:
 
 ```sh
 sh scripts/install.sh --build
@@ -401,161 +809,81 @@ irm https://raw.githubusercontent.com/santanu20/blazar/main/scripts/install.ps1 
 .\install.ps1 -Build
 ```
 
-### Update Blazar itself
+### Package-manager integrations
 
-```sh
-blazar upgrade
-```
-
-Use `--dry-run` to preview an upgrade or `--version` to pin a release.
+Repository integrations are maintained for [Homebrew](packaging/homebrew), [Scoop](packaging/scoop), and [Winget](packaging/winget).
 
 ---
 
-## Configuration
+## Reproducing benchmarks
 
-Blazar uses a documented TOML configuration file:
+Blazar includes a reproducible benchmark harness for performance, quality, and orchestration experiments.
 
-```text
-~/.config/blazar/config.toml
-```
-
-Common configuration areas include:
-
-| Area | Examples |
-|---|---|
-| Serving | `host`, `port`, `default_ctx`, `slots`, `max_loaded_models` |
-| Memory / quality | `cache_type`, `kv_unified`, `cache_ram_mb`, `ctx_extend` |
-| Scheduling | `singleflight`, `prompt_preflight`, priority / queue controls |
-| Speculation | `spec`, draft behavior |
-| Routing | `engine_routing`, per-model engine overrides, replicas |
-| Access | `[[keys]]`, TLS, CORS |
-| Observability | `audit_log`, `pii_scrub`, `otlp_endpoint`, `otlp_service` |
-| Model behavior | `chat_template`, samplers, LoRA, mmproj, warmup |
-| Media lanes | `sdcpp_flash_attention`, `sdcpp_vae_tiling`, `sdcpp_rpc_servers`, `media_job_wait_secs`, `whisper_idle_secs` |
-
-Inspect or change settings through the CLI instead of hand-editing whenever practical:
-
-```sh
-blazar config defaults
-blazar config list
-blazar config get <key>
-blazar config set <key> <value>
-```
-
-Auth is optional: adding at least one `[[keys]]` entry activates gateway authentication. Without keys, the local gateway is open.
-
----
-
-## Security and network behavior
-
-Blazar is designed for local-first operation:
-
-- The gateway binds to `127.0.0.1` by default.
-- There is no account requirement and registry push/login commands are intentionally refused.
-- Release and engine downloads are SHA-256 verified against release metadata.
-- Engine installs are isolated side-by-side rather than replacing a working engine in place.
-- Model pulls are resumable and support verification against recorded digests where a content digest is available.
-- OTLP observability export is **opt-in** via configuration; it is not a mandatory telemetry service.
-- Explicit remote routing can be configured when an operator chooses to use it.
-
-Treat the installer, downloaded engines, third-party forks, and model files according to your own supply-chain and host-security requirements.
-
----
-
-## Performance
-
-Blazar ships a reproducible benchmark harness; [`BENCHMARK.md`](BENCHMARK.md) holds the methodology and the latest campaign results. Measured lanes: single-stream speed, concurrency sweep (per-level system throughput, efficiency vs C=1, saturation verdicts), greedy parity against the raw engine, perplexity, long-context TTFT curve, tool-call selection/schema quality, adaptive slot reshape under sustained load, cold start, idle wake, and media (image/video/TTS/whisper).
-
-Every campaign writes its receipts to `bench-artifacts/` (see `bench-artifacts/INDEX.md` for the campaign ledger), and the report's engine-coverage table accounts for every installed engine as measured or excluded-with-reason.
-
-Run a benchmark with:
+Run:
 
 ```sh
 blazar bench <model>
 ```
 
-or use the repository harness:
+Or use the repository harness:
 
 ```sh
 python3 scripts/bench_matrix.py --blazar-bin target/release/blazar --md BENCHMARK.md
 ```
 
-**Important:** published benchmark tables are version- and hardware-specific. Do not read historical campaign numbers as guarantees for the current release or for different GPUs.
+The benchmark system covers areas such as:
+
+- single-stream decode;
+- concurrency and saturation;
+- greedy parity;
+- perplexity;
+- long-context TTFT;
+- tool-call and schema quality;
+- slot adaptation;
+- cold start / idle wake;
+- image, video, TTS, and Whisper lanes.
+
+Published numbers are **version-, model-, campaign-, and hardware-specific**. Use them for engineering comparison, not as universal performance guarantees.
+
+See [`BENCHMARK.md`](BENCHMARK.md) and [`bench-artifacts/`](bench-artifacts).
 
 ---
 
-## Quality and engineering discipline
+## Architecture and engineering
 
-The repository is a Rust workspace with four primary crates:
+The repository is a Rust workspace with explicit boundaries:
 
 ```text
-blazar-core       domain logic, config, store, catalog, GGUF parsing, profiles, hardware
-blazar-runtime    downloads, engines, supervisor, lifecycle, benchmarks, quantization
-blazar-gateway    HTTP APIs, scheduling, translation, sessions, cache, sentinel, audio lanes
-blazar-cli        the `blazar` executable and interactive CLI
+crates/
+├── blazar-core       config, model catalog, GGUF metadata, profiles,
+│                     hardware, storage, domain logic
+├── blazar-runtime    downloads, engines, supervisor, lifecycle,
+│                     benchmarking, quantization, upgrades
+├── blazar-gateway    HTTP APIs, translation, scheduling, sessions,
+│                     cache, media, observability
+└── blazar-cli        the `blazar` executable and interactive CLI
 ```
 
-The project enforces `unsafe_code = deny` at the workspace level and uses Clippy with warnings treated as failures in the CI configuration.
-
-The test surface includes unit/integration coverage for the gateway, lifecycle/supervisor behavior, engine installation, compatibility paths, installer flows, and related network stubs.
-
----
-
-## Common commands
-
-| Task | Command |
-|---|---|
-| Start server | `blazar serve` |
-| Chat | `blazar run <model>` |
-| Generate an image / video / voice clip | `blazar run <diffusion-or-voice-model>` |
-| Launch an agent CLI against the daemon | `blazar launch <command>` |
-| Unload one model now | `blazar stop <model>` |
-| Pull model | `blazar pull <target>` |
-| Import local GGUF | `blazar import <file> --name <name>` |
-| Derive another quantization | `blazar quantize <model> ...` |
-| Attach a vision projector | `blazar mmproj <model> <file>` |
-| Alias / copy a model | `blazar cp` / `blazar create` |
-| Inspect models | `blazar list` / `blazar show <model>` |
-| Inspect running models | `blazar ps` |
-| Check hardware / configuration | `blazar doctor` |
-| Explain a request | `blazar why` |
-| Live diagnostics | `blazar watch` |
-| Preview VRAM fit | `blazar fit <target>` |
-| Co-residency plan | `blazar coreside` |
-| Benchmark | `blazar bench <model>` |
-| Tune | `blazar tune <model>` |
-| Draft-model candidates | `blazar drafts <model>` |
-| Manage engines | `blazar engine update|list|use|rollback|build|local|offers|prune` |
-| Transcribe audio | `blazar whisper <file>` |
-| Text-to-speech | `blazar tts "<text>"` |
-| Manage API keys | `blazar keys list|add|rm|rotate` |
-| Save / restore sessions | `blazar session save|restore ...` |
-| Manage LoRA | `blazar lora add|rm|list ...` |
-| Search Hugging Face | `blazar search ...` |
-| Backup state | `blazar snapshot` |
-| Shell completions | `blazar completions bash|zsh|fish|powershell` |
-| Self-update | `blazar upgrade` |
-
-Run `blazar --help` for the command tree and `docs/4.API_SPEC.md` for the full reference.
+The workspace denies unsafe Rust by default (`unsafe_code = "deny"`), and CI runs Clippy with warnings treated as failures along with formatting, tests, installer checks, and related validation.
 
 ---
 
 ## Documentation
 
-The README is the product entry point. The detailed documentation is split by job:
+The README is the **product entry point**. Detailed operational and implementation material is split into dedicated documents.
 
 | Document | Purpose |
 |---|---|
-| [`docs/1.SYSTEM_OVERVIEW.md`](docs/1.SYSTEM_OVERVIEW.md) | Product shape, users, workflows, architecture overview |
-| [`docs/2.ARCHITECTURE.md`](docs/2.ARCHITECTURE.md) | Internal architecture, lifecycle, queue, supervisor, failure modes |
-| [`docs/3.DATA_MODEL.md`](docs/3.DATA_MODEL.md) | SQLite schema, indexes, invariants |
-| [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md) | HTTP routes, payloads, errors, CLI surface |
-| [`docs/6.BUSINESS_RULES.md`](docs/6.BUSINESS_RULES.md) | Limits, validation, routing, eviction, operational rules |
-| [`docs/7.SETUP.md`](docs/7.SETUP.md) | Build, install, deploy, environment variables, configuration |
+| [`docs/1.SYSTEM_OVERVIEW.md`](docs/1.SYSTEM_OVERVIEW.md) | Product shape and system overview |
+| [`docs/2.ARCHITECTURE.md`](docs/2.ARCHITECTURE.md) | Internal architecture and lifecycle |
+| [`docs/3.DATA_MODEL.md`](docs/3.DATA_MODEL.md) | SQLite schema and invariants |
+| [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md) | Complete HTTP and CLI reference |
+| [`docs/6.BUSINESS_RULES.md`](docs/6.BUSINESS_RULES.md) | Routing, admission, validation, eviction, and operational rules |
+| [`docs/7.SETUP.md`](docs/7.SETUP.md) | Installation, deployment, environment, and configuration |
 | [`docs/8.DO_NOT_BREAK.md`](docs/8.DO_NOT_BREAK.md) | Maintainer invariants and compatibility rules |
-| [`docs/9.USAGE.md`](docs/9.USAGE.md) | End-user workflows, troubleshooting, FAQ |
-| [`docs/10.SCIENTIFIC.md`](docs/10.SCIENTIFIC.md) | VRAM/KV math, GGUF parsing, routing evidence |
-| [`BENCHMARK.md`](BENCHMARK.md) | Benchmark methodology and historical results |
+| [`docs/9.USAGE.md`](docs/9.USAGE.md) | End-user workflows and troubleshooting |
+| [`docs/10.SCIENTIFIC.md`](docs/10.SCIENTIFIC.md) | VRAM/KV math, GGUF parsing, and numerical methods |
+| [`BENCHMARK.md`](BENCHMARK.md) | Benchmark methodology and results |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release history |
 
 ---
@@ -584,26 +912,28 @@ The README is the product entry point. The detailed documentation is split by jo
 
 ## Contributing
 
-Blazar is structured as a Rust workspace with explicit boundaries between domain logic, runtime/orchestration, gateway behavior, and CLI concerns.
+Before submitting changes:
 
-Before submitting changes, run the repository's normal checks and inspect the contributor invariants in [`docs/8.DO_NOT_BREAK.md`](docs/8.DO_NOT_BREAK.md).
+1. Read [`docs/8.DO_NOT_BREAK.md`](docs/8.DO_NOT_BREAK.md).
+2. For architectural changes, read [`docs/2.ARCHITECTURE.md`](docs/2.ARCHITECTURE.md) and [`docs/6.BUSINESS_RULES.md`](docs/6.BUSINESS_RULES.md).
+3. Run the repository's standard formatting, Clippy, test, and installer checks.
 
-For architectural changes, start with [`docs/2.ARCHITECTURE.md`](docs/2.ARCHITECTURE.md) and [`docs/6.BUSINESS_RULES.md`](docs/6.BUSINESS_RULES.md).
+The CI workflow is the practical source of truth for required automated checks.
 
 ---
 
-## Credit
+## Credits
 
-Blazar is an orchestration layer built on upstream inference projects including:
+Blazar is an orchestration layer built on upstream open-source projects including:
 
 - [llama.cpp](https://github.com/ggml-org/llama.cpp)
 - [mistral.rs](https://github.com/EricLBuehler/mistral.rs)
 - [SGLang](https://github.com/sgl-project/sglang)
-- [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) — the sd.cpp image/video lane
-- [whisper.cpp](https://github.com/ggml-org/whisper.cpp) — the transcription lane
-- [piper](https://github.com/rhasspy/piper) — the offline TTS lane
+- [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)
+- [whisper.cpp](https://github.com/ggml-org/whisper.cpp)
+- [piper](https://github.com/rhasspy/piper)
 
-Those projects provide the underlying inference engines. Model weights remain the property and responsibility of their publishers.
+Those projects provide the underlying inference runtimes. Model weights remain subject to the licenses and distribution terms of their publishers.
 
 ---
 
