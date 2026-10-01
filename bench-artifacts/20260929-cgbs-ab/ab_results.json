@@ -1,7 +1,7 @@
 [
   {
     "side": "old-flat4",
-    "binary": "/tmp/opencode/blazar.pre-cgbs.bak",
+    "binary": "/tmp/blazar.pre-cgbs.bak",
     "argv_cap": 4,
     "rounds": [
       {
@@ -29,7 +29,7 @@
   },
   {
     "side": "new-ceiling",
-    "binary": "/home/santanu/Projects/blazar/target/release/blazar",
+    "binary": "target/release/blazar",
     "argv_cap": 5,
     "rounds": [
       {
