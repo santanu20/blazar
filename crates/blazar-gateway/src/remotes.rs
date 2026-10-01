@@ -544,6 +544,17 @@ async fn fetch_capacity(state: &AppState, remote: &Remote) -> Option<PeerCapacit
     parse_capacity(&v)
 }
 
+/// Fetch one remote's capacity and cache it. Observability surfaces
+/// (`/api/ps`) call this alongside their presence probe so a fresh
+/// gateway shows capacity signals without waiting for routing traffic;
+/// routing paths get the same effect via `refresh_presence`.
+pub(crate) async fn refresh_capacity_cache(state: &AppState, remote: &Remote) {
+    let hkey = health_key(remote);
+    if let Some(c) = fetch_capacity(state, remote).await {
+        insert_capacity(&state.remote_capacity, &hkey, c);
+    }
+}
+
 /// Store a fetched capacity snapshot (bounded, arbitrary eviction).
 /// Takes the map directly so the bound is unit-pinnable without an
 /// `AppState` (same shape as `bind_remote`).

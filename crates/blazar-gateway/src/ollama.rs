@@ -455,7 +455,17 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
             .iter()
             .map(|r| {
                 let s = &state_for_probe;
-                async move { (r, crate::remotes::probe(s, r).await) }
+                async move {
+                    // Presence probe and capacity-cache refresh ride
+                    // together (max(3s, 3s) wall): `ps` populates the
+                    // capacity signals a fresh gateway would otherwise
+                    // only gain from routing traffic.
+                    let (probe, ()) = tokio::join!(
+                        crate::remotes::probe(s, r),
+                        crate::remotes::refresh_capacity_cache(s, r)
+                    );
+                    (r, probe)
+                }
             })
             .collect();
         let mut out = Vec::new();
