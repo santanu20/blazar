@@ -179,15 +179,17 @@ fn e2e__upgrade_replaces_a_copy_of_the_binary_atomically() {
     // Run the upgrade from a COPY so the cargo artifact is never touched.
     let tmp = tempfile::tempdir().unwrap();
     let exe_copy = tmp.path().join("blazar");
-    std::fs::copy(env!("CARGO_BIN_EXE_blazar"), &exe_copy).unwrap();
+    let status = with_staged_spawn(|| {
+        std::fs::copy(env!("CARGO_BIN_EXE_blazar"), &exe_copy).unwrap();
 
-    let status = std::process::Command::new(&exe_copy)
-        .env("BLAZAR_INSTALL_BASE_URL", &base)
-        .env("BLAZAR_REPO", "test/blazar")
-        .envs(&iso.env)
-        .arg("upgrade")
-        .status()
-        .unwrap();
+        std::process::Command::new(&exe_copy)
+            .env("BLAZAR_INSTALL_BASE_URL", &base)
+            .env("BLAZAR_REPO", "test/blazar")
+            .envs(&iso.env)
+            .arg("upgrade")
+            .status()
+            .unwrap()
+    });
     assert!(status.success(), "upgrade on a copy must succeed");
 
     let on_disk = std::fs::read(&exe_copy).unwrap();
@@ -291,6 +293,22 @@ struct HermeticEnv {
     _root: tempfile::TempDir,
 }
 
+/// Serialize binary staging (`fs::copy`) and child spawn across the e2e tests.
+///
+/// The tests run as threads of one process: a fork done for `Command::spawn`
+/// while a sibling thread is still inside `fs::copy` inherits its `O_WRONLY`
+/// fd on the exec target, and the kernel denies the exec with `ETXTBSY`
+/// before `CLOEXEC` fds are torn down. Holding this lock across copy+spawn
+/// closes that window without sleeps or retries.
+static STAGE_SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn with_staged_spawn<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = STAGE_SPAWN_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    f()
+}
+
 /// Copy of the cargo binary for self-replacing runs — `upgrade` swaps
 /// its own executable, which must never be the shared cargo artifact.
 fn binary_copy() -> std::path::PathBuf {
@@ -306,18 +324,20 @@ fn e2e__upgrade_with_running_daemon_systemd_lane_restarts_it() {
     let payload = b"FAKE-BLAZAR-v0.1.3-RESTART\n";
     let base = fake_release("v0.1.3", payload, None);
     let iso = hermetic_daemon_env(true);
-    let exe = binary_copy();
+    with_staged_spawn(|| {
+        let exe = binary_copy();
 
-    Command::new(&exe)
-        .env("BLAZAR_INSTALL_BASE_URL", &base)
-        .env("BLAZAR_REPO", "test/blazar")
-        .envs(&iso.env)
-        .args(["upgrade"])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains(
-            "daemon restarted — the update is live",
-        ));
+        Command::new(&exe)
+            .env("BLAZAR_INSTALL_BASE_URL", &base)
+            .env("BLAZAR_REPO", "test/blazar")
+            .envs(&iso.env)
+            .args(["upgrade"])
+            .assert()
+            .success()
+            .stdout(predicates::str::contains(
+                "daemon restarted — the update is live",
+            ));
+    });
 
     let log = std::fs::read_to_string(&iso.shim_log).unwrap();
     assert!(
@@ -335,15 +355,17 @@ fn e2e__upgrade_restart_no_lane_available_warns_without_false_receipt() {
     let payload = b"FAKE-BLAZAR-v0.1.4-NOLANE\n";
     let base = fake_release("v0.1.4", payload, None);
     let iso = hermetic_daemon_env(false);
-    let exe = binary_copy();
+    with_staged_spawn(|| {
+        let exe = binary_copy();
 
-    Command::new(&exe)
-        .env("BLAZAR_INSTALL_BASE_URL", &base)
-        .env("BLAZAR_REPO", "test/blazar")
-        .envs(&iso.env)
-        .args(["upgrade"])
-        .assert()
-        .success() // the upgrade itself succeeded; the restart is a warning
-        .stdout(predicates::str::contains("daemon restarted").not())
-        .stderr(predicates::str::contains("warning:"));
+        Command::new(&exe)
+            .env("BLAZAR_INSTALL_BASE_URL", &base)
+            .env("BLAZAR_REPO", "test/blazar")
+            .envs(&iso.env)
+            .args(["upgrade"])
+            .assert()
+            .success() // the upgrade itself succeeded; the restart is a warning
+            .stdout(predicates::str::contains("daemon restarted").not())
+            .stderr(predicates::str::contains("warning:"));
+    });
 }
