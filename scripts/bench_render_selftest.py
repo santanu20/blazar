@@ -583,8 +583,8 @@ with tempfile.TemporaryDirectory() as td:
     )  # ppl/coldstart/idle etc unmeasured
     # exec summary must be a bullet list, one fact per line
     es = md.split("## Executive summary", 1)[1].split("##", 1)[0]
-    es_lines = [l for l in es.splitlines() if l.strip()]
-    assert es_lines and all(l.startswith("- ") for l in es_lines), es_lines
+    es_lines = [ln for ln in es.splitlines() if ln.strip()]
+    assert es_lines and all(ln.startswith("- ") for ln in es_lines), es_lines
     # Reproduce must carry the actual campaign invocation, not a generic one
     rep = md.split("## Reproduce", 1)[1].split("```bash", 1)[1].split("```", 1)[0]
     assert "--model qwen3-1.7b --engines sglang-0.5.19" in rep, rep
@@ -631,7 +631,7 @@ assert bm.portable_path("no paths here") == "no paths here"
 # --- sglang lane inclusion: dynamic, store-driven (no hardcoded box
 # state). A safetensors DIR row flips the lane benchable; GGUF-only
 # stores exclude it with the honest reason text.
-import sqlite3 as _sq
+import sqlite3 as _sq  # noqa: E402 (test-scoped, next to its fixture)
 
 
 def _mini_store(td, model_rows, engine_rows):
@@ -784,8 +784,8 @@ with tempfile.TemporaryDirectory() as td:
 # notes (agent memory / scratch reports carrying operator credentials)
 # and credential-pattern files stay out of bench artifacts; no git at
 # all -> fail closed
-import subprocess as sp
-import unittest.mock as _mock
+import subprocess as sp  # noqa: E402 (test-scoped)
+import unittest.mock as _mock  # noqa: E402 (test-scoped)
 
 with tempfile.TemporaryDirectory() as td:
     repo = Path(td) / "r"

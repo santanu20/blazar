@@ -2237,7 +2237,7 @@ def lane(path: str, fn, *sub: str) -> None:
         cmd = exc.cmd if isinstance(exc.cmd, str) else " ".join(exc.cmd or [])
         for p in (path, *sub):
             regb(p, f"lane timed out after {exc.timeout}s: {cmd[:120]}")
-    except Exception as exc:  # noqa: BLE001 — boundary the lane, name the failure
+    except Exception as exc:
         head = f"{type(exc).__name__}: {exc}"[:200]
         for p in (path, *sub):
             regb(p, f"harness lane crashed: {head}")
@@ -3365,7 +3365,7 @@ def _promote_fixture(ref: str) -> None:
         except OSError:
             shutil.copy2(row["path"], dest)
     meta = cache / f"{repo.replace('/', '_')}__{quant}.json"
-    meta.write_text(json.dumps({k: row[k] for k in row.keys()}))
+    meta.write_text(json.dumps({k: row[k] for k in row}))
 
 
 def cli(

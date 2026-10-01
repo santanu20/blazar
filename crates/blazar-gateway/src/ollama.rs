@@ -3020,10 +3020,10 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
 
 /// POST /api/warm {"model": name} — blazar-internal: intent-time warm
 /// notification for pulls that ran OUTSIDE the daemon. `blazar pull`
-/// performs the download in the CLI process (its ModelPulled event
+/// performs the download in the CLI process (its `ModelPulled` event
 /// fires on a bus the daemon cannot see), so the CLI pings this
 /// endpoint after a fresh pull and the daemon applies the same
-/// warm_on_pull policy it applies to its own bus events: knob + AC
+/// `warm_on_pull` policy it applies to its own bus events: knob + AC
 /// power + spawn admission belts, warn-not-fail.
 pub async fn warm(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let v: Value = match serde_json::from_slice(&body) {

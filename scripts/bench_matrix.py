@@ -64,9 +64,9 @@ import re
 import shutil
 import signal
 import socket
-import struct
 import sqlite3
 import statistics
+import struct
 import subprocess
 import sys
 import threading
@@ -2688,9 +2688,7 @@ def with_engine_pin(cfg: dict, model: str, eng: Engine) -> dict:
     return cfg
 
 
-def capture_child_argv(
-    rec: dict, eng: Engine, sampler: "Sampler | None" = None
-) -> None:
+def capture_child_argv(rec: dict, eng: Engine, sampler: Sampler | None = None) -> None:
     """Resolve the spawned engine child: pid + argv + engine-kind assert."""
     child_pid = find_sandbox_engine_pid()
     if child_pid is None:
@@ -3197,17 +3195,19 @@ def run_reshape_cell(eng: Engine, body_model: str, duration_s: float = 300.0) ->
         # not have been observed (20260928-gguf-full: 150/150 void).
         while time.monotonic() < deadline:
             slots_now, inflight = None, None
-            with contextlib.suppress(Exception):
-                with urllib.request.urlopen(f"{base}/api/ps", timeout=2) as resp:
-                    ps = json.loads(resp.read())
-                    for row in ps.get("models") or []:
-                        name = str(row.get("name") or "")
-                        # Rows keep the `+lora` variant marker; match the
-                        # lane's model by prefix.
-                        if name.startswith(body_model):
-                            slots_now = row.get("blazar_slots")
-                            inflight = row.get("blazar_in_flight")
-                            break
+            with (
+                contextlib.suppress(Exception),
+                urllib.request.urlopen(f"{base}/api/ps", timeout=2) as resp,
+            ):
+                ps = json.loads(resp.read())
+                for row in ps.get("models") or []:
+                    name = str(row.get("name") or "")
+                    # Rows keep the `+lora` variant marker; match the
+                    # lane's model by prefix.
+                    if name.startswith(body_model):
+                        slots_now = row.get("blazar_slots")
+                        inflight = row.get("blazar_in_flight")
+                        break
             with lock:
                 timeline.append(
                     {
@@ -6992,7 +6992,9 @@ def reshape_table(recs: list[dict]) -> str:
         if r.get("note"):
             # Structured lane boundary (e.g. slot-less engine kinds):
             # one n/a row carrying the recorded reason, not a fake NO.
-            out.append(f"| {name} | n/a | {ascii_note(r['note'])} | - | - | - | - | - |")
+            out.append(
+                f"| {name} | n/a | {ascii_note(r['note'])} | - | - | - | - | - |"
+            )
             continue
         if r.get("reshape_observed"):
             reshaped = "yes"
@@ -8107,7 +8109,7 @@ def media_table(recs: list[dict]) -> str:
         for gk in order:
             rs = groups[gk]
             r0 = rs[0]
-            tag, model, size, steps, cfg_name = gk
+            _tag, model, size, steps, cfg_name = gk
             gt = "x".join(str(d) for d in (r0.get("dims_seen") or ["?"])) + " PNG"
             qm = r0.get("quality_medians") or {}
             if qm:
