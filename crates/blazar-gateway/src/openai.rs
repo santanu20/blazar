@@ -613,36 +613,32 @@ pub async fn openai_proxy(
 }
 
 /// `GET /v1/responses/{id}` — retrieve a stored (chained) response:
-/// `OpenAI` retrieval surface over the gateway registry. Expired or
-/// streamed (never stored) ids 404 with the same teaching message as
+/// `OpenAI` retrieval surface over the gateway registry (memory-first,
+/// SQLite ledger fallback — stored responses survive restarts). Expired
+/// or streamed (never stored) ids 404 with the same teaching message as
 /// the chaining path.
 pub async fn responses_get(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    let found = state
-        .responses
-        .lock()
-        .expect("responses registry")
-        .get(&id)
-        .map(|s| {
-            serde_json::json!({
-                "id": id,
-                "model": s.model,
-                "input": s.input_items,
-                "output": s.output_items,
-                "usage": {
-                    "input_tokens": s.input_tokens,
-                    "output_tokens": s.output_tokens,
-                },
-                "stored_at": s.ts,
-            })
-        });
+    let found = state.stored_response(&id).map(|s| {
+        serde_json::json!({
+            "id": id,
+            "model": s.model,
+            "input": s.input_items,
+            "output": s.output_items,
+            "usage": {
+                "input_tokens": s.input_tokens,
+                "output_tokens": s.output_tokens,
+            },
+            "stored_at": s.ts,
+        })
+    });
     match found {
         Some(v) => (StatusCode::OK, axum::Json(v)).into_response(),
         None => openai_error(
             404,
-            "response not found — expired (24h / 256-entry LRU), evicted, streamed, or store:false",
+            "response not found — expired (24h TTL), pruned (ledger cap), streamed, or store:false",
         ),
     }
 }
@@ -912,24 +908,21 @@ pub async fn responses_api(
 
     // Chaining: resolve the stored prefix, rebuild `input`, drop the
     // field (upstream rejects unknown fields less gracefully than we
-    // reject stale ids).
+    // reject stale ids). The lookup is memory-first with the SQLite
+    // ledger as restart fallback — a chain survives a gateway restart.
     let mut inherited_model = None;
     if let Some(pid) = previous {
-        let found = {
-            let mut reg = state.responses.lock().expect("responses registry");
-            reg.get(&pid).map(|s| {
-                (
-                    crate::responses::ResponsesRegistry::chain_input(s, &parsed["input"]),
-                    s.model.clone(),
-                )
-            })
-        };
+        let found = state.stored_response(&pid).map(|s| {
+            (
+                crate::responses::ResponsesRegistry::chain_input(&s, &parsed["input"]),
+                s.model.clone(),
+            )
+        });
         let Some((chained, prev_model)) = found else {
             return openai_error(
                 404,
                 &format!(
-                    "previous_response_id {pid:?} not found — expired (24h / 256-entry LRU), \
-                     evicted, or the response streamed (streamed responses are not stored)"
+                    "previous_response_id {pid:?} not found — expired (24h TTL), pruned (ledger cap), or the response streamed (streamed responses are not stored)"
                 ),
             );
         };
@@ -1164,7 +1157,7 @@ pub async fn responses_api(
     if let Some(obj) = out.as_object_mut() {
         obj.insert("id".into(), serde_json::json!(id));
     }
-    state.responses.lock().expect("responses registry").put(
+    state.store_response(
         id,
         crate::responses::StoredResponse {
             model: model_name.clone(),

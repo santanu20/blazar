@@ -445,6 +445,48 @@ impl AppState {
         }
         guard.as_ref().map(f)
     }
+
+    /// Memory-first stored-response lookup with SQLite fallback (restart
+    /// durability for `previous_response_id` chaining). Lock order is a
+    /// fixed law: responses mutex → store mutex, never reversed — the
+    /// store mutex is only ever taken while already inside a responses
+    /// guard (here and in `store_response`), so no cycle can form.
+    pub fn stored_response(&self, id: &str) -> Option<crate::responses::StoredResponse> {
+        let mut reg = self.responses.lock().expect("responses registry");
+        if let Some(s) = reg.get(id) {
+            return Some(s.clone());
+        }
+        self.with_store(|s| reg.promote_from_store(s, id)).flatten()
+    }
+
+    /// Persisted put: hot LRU always, then SQLite write-through + prune
+    /// (same 24h TTL / cap as memory). Store failures log loud — durable
+    /// chain degradation must be visible — but never fail the request:
+    /// memory stays authoritative for the live process, the ledger is
+    /// the restart path. Lock order: responses → store (see
+    /// `stored_response`).
+    pub fn store_response(&self, id: String, r: crate::responses::StoredResponse) {
+        let mut reg = self.responses.lock().expect("responses registry");
+        reg.put(id.clone(), r.clone());
+        let durable = self.with_store(|s| {
+            s.put_response(&crate::responses::ResponsesRegistry::to_row(&id, &r))
+                .and_then(|()| {
+                    s.prune_responses(
+                        crate::responses::RESPONSES_TTL_SECS,
+                        crate::responses::RESPONSES_CAP,
+                    )
+                })
+        });
+        match durable {
+            Some(Ok(())) => {}
+            Some(Err(e)) => tracing::warn!(
+                "responses: durable write failed: {e:#} — {id} is memory-only until the next successful put"
+            ),
+            None => tracing::warn!(
+                "responses: store unavailable — {id} is memory-only (will not survive a restart)"
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
