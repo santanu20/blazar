@@ -1022,7 +1022,18 @@ pub async fn chat(
         .is_some_and(|s| !s.is_empty())
         || req.get("format").is_some_and(|v| !v.is_null());
     let mut sem_ctx: Option<semcache::SemCtx> = None;
-    if !req["stream"].as_bool().unwrap_or(true) && !constrained {
+    // Tool-result gate: requests carrying role=tool messages bypass the
+    // cache in both directions (lookup above, store below) — tool outputs
+    // are not in the serving fingerprint, so a prompt-similarity hit could
+    // serve an answer computed against different tool results.
+    let tool_gate = semcache::has_tool_result_messages(&req);
+    if tool_gate {
+        state
+            .sem
+            .tool_bypasses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if !req["stream"].as_bool().unwrap_or(true) && !constrained && !tool_gate {
         let sc = &state.config.semantic_cache;
         match semcache::directive(
             sc.enabled,
@@ -3432,13 +3443,17 @@ fn cache_metrics(state: &AppState, merged: &mut String) {
     );
     let _ = write!(
         merged,
-        "# HELP blazar_semantic_cache_hits_total Responses served from the semantic cache (x-blazar-cache)\n# TYPE blazar_semantic_cache_hits_total counter\nblazar_semantic_cache_hits_total {}\n# HELP blazar_semantic_cache_misses_total Cache-eligible requests that missed (and were stored)\n# TYPE blazar_semantic_cache_misses_total counter\nblazar_semantic_cache_misses_total {}\n# HELP blazar_semantic_cache_stores_total Responses filed into the semantic cache\n# TYPE blazar_semantic_cache_stores_total counter\nblazar_semantic_cache_stores_total {}\n# HELP blazar_semantic_cache_embed_failures_total Embed-model failures that bypassed the cache (request still served live)\n# TYPE blazar_semantic_cache_embed_failures_total counter\nblazar_semantic_cache_embed_failures_total {}\n# HELP blazar_semantic_cache_entries Live (non-expired) semantic cache entries\n# TYPE blazar_semantic_cache_entries gauge\nblazar_semantic_cache_entries {}\n",
+        "# HELP blazar_semantic_cache_hits_total Responses served from the semantic cache (x-blazar-cache)\n# TYPE blazar_semantic_cache_hits_total counter\nblazar_semantic_cache_hits_total {}\n# HELP blazar_semantic_cache_misses_total Cache-eligible requests that missed (and were stored)\n# TYPE blazar_semantic_cache_misses_total counter\nblazar_semantic_cache_misses_total {}\n# HELP blazar_semantic_cache_stores_total Responses filed into the semantic cache\n# TYPE blazar_semantic_cache_stores_total counter\nblazar_semantic_cache_stores_total {}\n# HELP blazar_semantic_cache_embed_failures_total Embed-model failures that bypassed the cache (request still served live)\n# TYPE blazar_semantic_cache_embed_failures_total counter\nblazar_semantic_cache_embed_failures_total {}\n# HELP blazar_semantic_cache_tool_bypasses_total Tool-result requests that skipped lookup+store (fingerprint does not cover tool outputs)\n# TYPE blazar_semantic_cache_tool_bypasses_total counter\nblazar_semantic_cache_tool_bypasses_total {}\n# HELP blazar_semantic_cache_entries Live (non-expired) semantic cache entries\n# TYPE blazar_semantic_cache_entries gauge\nblazar_semantic_cache_entries {}\n",
         state.sem.hits.load(std::sync::atomic::Ordering::Relaxed),
         state.sem.misses.load(std::sync::atomic::Ordering::Relaxed),
         state.sem.stores.load(std::sync::atomic::Ordering::Relaxed),
         state
             .sem
             .embed_failures
+            .load(std::sync::atomic::Ordering::Relaxed),
+        state
+            .sem
+            .tool_bypasses
             .load(std::sync::atomic::Ordering::Relaxed),
         state.semcache.live_len(),
     );

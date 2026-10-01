@@ -26,6 +26,26 @@ pub struct SemMetrics {
     pub misses: AtomicU64,
     pub stores: AtomicU64,
     pub embed_failures: AtomicU64,
+    /// Requests carrying tool-result messages that bypassed the cache in
+    /// BOTH directions (no lookup, no store) — see
+    /// [`has_tool_result_messages`].
+    pub tool_bypasses: AtomicU64,
+}
+
+/// True when any message in the request is a tool RESULT (`role == "tool"`).
+/// Such requests bypass the semantic cache entirely: tool outputs are not
+/// part of [`serving_fingerprint`], so a cosine match on the rendered prompt
+/// alone could serve an answer computed against DIFFERENT tool results.
+/// Cache-off is the honest default; clients that want caching for
+/// tool-carrying conversations can cache the tool-free turns.
+#[must_use]
+pub fn has_tool_result_messages(req: &Value) -> bool {
+    req.get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|msgs| {
+            msgs.iter()
+                .any(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+        })
 }
 
 struct Entry {
@@ -567,6 +587,40 @@ mod tests {
         let mut other_text = base.clone();
         other_text["messages"] = serde_json::json!([{"role": "user", "content": "other"}]);
         assert_eq!(fp, serving_fingerprint("m1", &other_text));
+    }
+
+    #[test]
+    fn unit__has_tool_result_messages__gate_scopes_to_tool_role_only() {
+        // Plain and assistant/tool-CALL conversations: no gate.
+        let base = serde_json::json!({
+            "model": "m1",
+            "messages": [
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": "checking",
+                 "tool_calls": [{"function": {"name": "get_weather"}}]}
+            ]
+        });
+        assert!(!has_tool_result_messages(&base));
+        // Adding the tool RESULT flips the gate — this is the message kind
+        // whose content the fingerprint cannot see.
+        let mut tool_result = base.clone();
+        tool_result["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"role": "tool", "content": "22C sunny"}));
+        assert!(has_tool_result_messages(&tool_result));
+        // Tool results elsewhere in history still gate (agentic chains).
+        let chain = serde_json::json!({
+            "messages": [
+                {"role": "tool", "content": "old output"},
+                {"role": "user", "content": "summarize"}
+            ]
+        });
+        assert!(has_tool_result_messages(&chain));
+        // Degenerate shapes: no messages array / non-array -> no gate, not
+        // a panic.
+        assert!(!has_tool_result_messages(&serde_json::json!({"model": "m1"})));
+        assert!(!has_tool_result_messages(&serde_json::json!({"messages": "hi"})));
     }
 
     #[test]
