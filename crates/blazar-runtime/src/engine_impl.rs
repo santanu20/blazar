@@ -205,7 +205,13 @@ impl Engine for LlamaCppEngine {
                 dead.join(", ")
             ));
         }
-        spawn_child(&self.manifest.server_path, argv, endpoint, &self.child_env, spawn_env)
+        spawn_child(
+            &self.manifest.server_path,
+            argv,
+            endpoint,
+            &self.child_env,
+            spawn_env,
+        )
     }
 
     async fn enumerate_devices(&self) -> Result<Option<Vec<crate::engine::manifest::DeviceDesc>>> {
@@ -818,7 +824,13 @@ impl Engine for MistralRsEngine {
                  child_transport = \"tcp\" in the blazar config"
             ));
         }
-        spawn_child(&self.manifest.server_path, argv, endpoint, &self.child_env, spawn_env)
+        spawn_child(
+            &self.manifest.server_path,
+            argv,
+            endpoint,
+            &self.child_env,
+            spawn_env,
+        )
     }
 
     async fn health_check(&self, endpoint: &Endpoint, timeout: std::time::Duration) -> Result<()> {
@@ -948,7 +960,13 @@ impl Engine for SdCppEngine {
                  child_transport = \"tcp\" in the blazar config"
             ));
         }
-        spawn_child(&self.manifest.server_path, argv, endpoint, &self.child_env, spawn_env)
+        spawn_child(
+            &self.manifest.server_path,
+            argv,
+            endpoint,
+            &self.child_env,
+            spawn_env,
+        )
     }
 
     async fn enumerate_devices(&self) -> Result<Option<Vec<crate::engine::manifest::DeviceDesc>>> {
@@ -1336,7 +1354,10 @@ mod tests {
         let _ = child.kill().await;
         let _ = child.reap().await;
         assert!(tail.contains("spawn"), "override lost in tail: {tail}");
-        assert!(tail.contains("kept"), "engine-only key lost in tail: {tail}");
+        assert!(
+            tail.contains("kept"),
+            "engine-only key lost in tail: {tail}"
+        );
         assert!(
             !tail.lines().any(|l| l == "engine"),
             "spawn value must win the shared key: {tail}"

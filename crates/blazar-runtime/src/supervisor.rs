@@ -837,7 +837,13 @@ fn spanning_spawn_env(
     argv_device_free: bool,
 ) -> Vec<(String, String)> {
     let probed = crate::probe::nvidia_smi_gpus().len();
-    spanning_env_from_census(ranks, probed, census_names, lane_allows_vk, argv_device_free)
+    spanning_env_from_census(
+        ranks,
+        probed,
+        census_names,
+        lane_allows_vk,
+        argv_device_free,
+    )
 }
 
 /// Strict `Vulkan<N>` census-name parse: the token before the colon is
@@ -872,7 +878,10 @@ fn spanning_env_from_census(
                 if ids.iter().copied().eq(0..n) {
                     // Identity: the unfiltered child sees exactly the
                     // plan's cards — no env needed.
-                    tracing::info!(ranks = n, "spanning spawn: Vulkan census is the full plan (no pin needed)");
+                    tracing::info!(
+                        ranks = n,
+                        "spanning spawn: Vulkan census is the full plan (no pin needed)"
+                    );
                     return Vec::new();
                 }
                 tracing::info!(
@@ -907,7 +916,10 @@ fn spanning_env_from_probe(ranks: Option<u32>, probed_nvidia: usize) -> Vec<(Str
         return Vec::new();
     }
     let indices: Vec<String> = (0..n).map(|i| i.to_string()).collect();
-    tracing::info!(ranks = n, "spanning spawn pinned to NVIDIA cards in PCI bus order");
+    tracing::info!(
+        ranks = n,
+        "spanning spawn pinned to NVIDIA cards in PCI bus order"
+    );
     vec![
         ("CUDA_DEVICE_ORDER".to_string(), "PCI_BUS_ID".to_string()),
         ("CUDA_VISIBLE_DEVICES".to_string(), indices.join(",")),
@@ -2119,8 +2131,7 @@ impl Supervisor {
             // Sharded spawn: judge the summed pool only — mirroring the
             // candidates-empty formula (per-card admission would refuse
             // a load the shard plan can actually place).
-            return self.resident_bytes().saturating_add(incoming_bytes)
-                > self.vram_budget_bytes();
+            return self.resident_bytes().saturating_add(incoming_bytes) > self.vram_budget_bytes();
         }
         let candidates = self.admission_candidates(name);
         if candidates.is_empty() {
@@ -3044,12 +3055,16 @@ impl Supervisor {
             self.remap_device_argv(&mut argv, ROUTER_KEY).await;
             // Router spawn is single-process by construction: no
             // sharding, no pinning — empty per-spawn env.
-            let mut child = self.engine.spawn(&argv, &endpoint, &[]).await.map_err(|e| {
-                if let Some(p) = &auth_keyfile {
-                    let _ = std::fs::remove_file(p);
-                }
-                SupervisionError::Internal(anyhow!("{e}"))
-            })?;
+            let mut child = self
+                .engine
+                .spawn(&argv, &endpoint, &[])
+                .await
+                .map_err(|e| {
+                    if let Some(p) = &auth_keyfile {
+                        let _ = std::fs::remove_file(p);
+                    }
+                    SupervisionError::Internal(anyhow!("{e}"))
+                })?;
             if let Ok(Some(status)) = child.try_status() {
                 tracing::warn!(
                     router = ROUTER_KEY,
@@ -3754,9 +3769,10 @@ impl Supervisor {
                     })
                     .flatten()
             })
-            .or_else(|| manual_split_spanning.then(|| {
-                u32::try_from(census_budgets.len().max(2)).unwrap_or(2)
-            }))
+            .or_else(|| {
+                manual_split_spanning
+                    .then(|| u32::try_from(census_budgets.len().max(2)).unwrap_or(2))
+            })
             .or_else(|| {
                 // mistral.rs spans by LAYER mapping, not equal shards:
                 // with --device-layers omitted the engine distributes
@@ -3782,7 +3798,12 @@ impl Supervisor {
         let lane_allows_vk = engine.kind() == blazar_core::engine_kind::EngineKind::LlamaCpp;
         let argv_device_free = self.config.effective_devices(name).is_empty()
             && self.config.main_gpu == blazar_core::Config::default().main_gpu;
-        let spawn_env = spanning_spawn_env(spanning_ranks, &census_names, lane_allows_vk, argv_device_free);
+        let spawn_env = spanning_spawn_env(
+            spanning_ranks,
+            &census_names,
+            lane_allows_vk,
+            argv_device_free,
+        );
         loop {
             if !self.admission_blocked(name, incoming_bytes, spanning) {
                 break;
@@ -3823,9 +3844,7 @@ impl Supervisor {
                         let per_rank_note = spanning_ranks.map(|n| {
                             #[allow(clippy::cast_precision_loss)]
                             let per_rank = gib(incoming_bytes / u64::from(n));
-                            format!(
-                                " even sharded across {n} cards ({per_rank:.1} GiB per rank)"
-                            )
+                            format!(" even sharded across {n} cards ({per_rank:.1} GiB per rank)")
                         });
                         return Err(SupervisionError::ModelTooLarge(format!(
                             "{name}: admission floor {:.1} GiB exceeds {}{} \
@@ -4029,11 +4048,7 @@ impl Supervisor {
         // every manual parallel pin unset, and the MEASURED pool says
         // weights+KV fit only when sharded across the discrete cards.
         // The profile ladder then plans per-rank and emits --tp-size.
-        if sglang_lane
-            && parallel_pins_unset
-            && self.hardware.has_gpu()
-            && auto_split.is_none()
-        {
+        if sglang_lane && parallel_pins_unset && self.hardware.has_gpu() && auto_split.is_none() {
             let hw = fresh.as_ref().unwrap_or(&self.hardware);
             let free_bytes: Vec<u64> = hw
                 .gpus
@@ -4311,12 +4326,15 @@ impl Supervisor {
             }
             self.remap_device_argv(&mut argv, name).await;
             argv_dialed_rpc |= argv.iter().any(|flag| flag == "--rpc");
-            let mut child = engine.spawn(&argv, &endpoint, &spawn_env).await.map_err(|e| {
-                if let Some(p) = &auth_keyfile {
-                    let _ = std::fs::remove_file(p);
-                }
-                SupervisionError::Internal(anyhow!("{e}"))
-            })?;
+            let mut child = engine
+                .spawn(&argv, &endpoint, &spawn_env)
+                .await
+                .map_err(|e| {
+                    if let Some(p) = &auth_keyfile {
+                        let _ = std::fs::remove_file(p);
+                    }
+                    SupervisionError::Internal(anyhow!("{e}"))
+                })?;
 
             // Child died instantly (port race)? Retry with a fresh port.
             if let Ok(Some(status)) = child.try_status() {
@@ -8145,10 +8163,7 @@ mod routing_tests {
         assert_eq!(plan_auto_tp(&[card], mib(9_000)), None);
         // The SMALLEST card decides (NCCL shards evenly): 17 GiB over a
         // 16+4 GiB pair is per-rank 8.5 GiB — over the 4 GiB rank.
-        assert_eq!(
-            plan_auto_tp(&[mib(16_000), mib(4_000)], mib(17_000)),
-            None
-        );
+        assert_eq!(plan_auto_tp(&[mib(16_000), mib(4_000)], mib(17_000)), None);
         // Three cards, per-rank fits: full-pool ranks.
         assert_eq!(plan_auto_tp(&[card, card, card], mib(20_000)), Some(3));
     }
