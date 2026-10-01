@@ -76,5 +76,5 @@ else
     fail=$((fail+1)); printf 'FAIL  lifecycle: no request card visible after traffic\n'
 fi
 
-echo "== result: %s pass, %s fail ==" "$pass" "$fail" | tr -d '%'
+printf '== result: %s pass, %s fail ==\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
