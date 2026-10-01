@@ -118,8 +118,9 @@ In-repo inline ledger references (keep using when touching these surfaces):
 #1 logprobs passthrough (openai.rs), #4 no blob storage, #6 real repo names,
 #7 CVE-class path safety (hf.rs), #10 load-wait transparency (proxy.rs),
 #12 keep_alive, #13 num_ctx honored (ollama.rs), #14 compat preview,
-#15 hub search (hf.rs). A canonical numbered list doc does not exist in-tree;
-   this file now serves as the mapping.
+#15 hub search (hf.rs), #16 delete accepts the name /api/tags itself renders
+(gateway ollama.rs delete → shared `proxy::resolve_model` ladder; found by the
+F1 live-validation rig, pin `e2e__ollama_delete_accepts_the_tags_rendered_name`).
 
 ## 7. Round-2 sweep (2026-10-02, deeper complaint tiers)
 
@@ -151,7 +152,15 @@ Actionable items, all others verified fixed:
   progress bars name the cap; validation rejects negative/NaN. Receipts:
   `integration__download_speed_limit__paces_the_classic_lane` (2.5 s measured
   deficit at 1000 B/s cap), 6 throttle unit tests, config env/validation test,
-  workspace 1657/1657.
+  workspace 1657/1657. **Enforcement hardening after live e2e** (81b156d): the
+  first cut let parallel chunk workers sleep concurrently and under-enforced
+  the cap ~4x; the bucket lock is now held across the deficit sleep
+  (tokio Mutex) with deficit carried as negative tokens. Pin
+  `unit__acquire__concurrent_reads_enforce_the_aggregate_cap` (8 workers x
+  250 KB @ 1 MB/s = 1.011 s). Live receipt: 45.9 MB registry pull at
+  `BLAZAR_DOWNLOAD_SPEED_LIMIT_MB=1.0` measured 0.945 MB/s (46 s pacing +
+  ~2.5 s manifest/TLS/store overhead). The same rig surfaced the
+  `/api/delete` name-resolution gap, fixed in 31f5f8b — see ledger #16.
 - **F2. Release-artifact license gate** (ollama #3185 parity). Extend the
   github-release pre-release checks: assert LICENSE-MIT/LICENSE-APACHE (+
   NOTICE if added) exist inside every published archive; fail the release if
