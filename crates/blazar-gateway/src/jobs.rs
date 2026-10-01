@@ -39,6 +39,10 @@ const TERMINAL_PRUNE_SECS: i64 = 7 * 24 * 3600;
 /// writer); the window only guards the stop→start handoff race where the
 /// old process wrote seconds before the new one booted.
 const BOOT_GRACE_SECS: i64 = 5;
+/// Headroom past the grace window before the late cut-off pass runs —
+/// wide enough that clock wobble between daemons cannot leak a live
+/// row under the daemon-start cutoff.
+const GRACE_MARGIN_SECS: i64 = 10;
 
 pub struct JobRuntime {
     /// Artifact root (`<data>/jobs/<id>/…`), owned so recordings never
@@ -64,10 +68,22 @@ impl JobRuntime {
     /// Boot hygiene: abandon stale in-flight rows, prune ancient terminal
     /// ones. Runs detached from `serve()` — sweep latency is not boot
     /// latency, and the store may still be settling on first open.
+    ///
+    /// Two passes: the immediate one spares rows updated within the grace
+    /// window (a concurrent live daemon's fresh work — shared-data-dir two
+    /// daemons are unsupported but not reaped silently); a delayed pass at
+    /// `grace + margin` cuts at THIS daemon's start time, catching rows
+    /// whose last update fell inside the grace window (killed moments
+    /// before boot) which the first pass deliberately spared. Anything
+    /// this daemon wrote has updated_at >= its start, so live work —
+    /// including a doctor mid-probe silent for its whole 300 s cold-load
+    /// allowance — is never reaped.
     pub fn boot_sweep(&self, state: &Arc<AppState>) {
+        let boot_unix = blazar_core::store::unix_now();
         let swept = state
             .with_store(|s| {
-                let abandoned = s.boot_sweep_jobs(BOOT_GRACE_SECS).unwrap_or_default();
+                let cutoff = blazar_core::store::unix_now() - BOOT_GRACE_SECS;
+                let abandoned = s.sweep_jobs_updated_before(cutoff).unwrap_or_default();
                 let pruned = s.prune_jobs(TERMINAL_PRUNE_SECS).unwrap_or(0);
                 (abandoned, pruned)
             })
@@ -86,6 +102,26 @@ impl JobRuntime {
                 "boot sweep: pruned terminal job rows older than 7 days"
             );
         }
+        let st = Arc::clone(state);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(
+                (BOOT_GRACE_SECS + GRACE_MARGIN_SECS) as u64,
+            ))
+            .await;
+            let late = st
+                .with_store(|s| {
+                    s.sweep_jobs_updated_before(boot_unix - 1)
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            if !late.is_empty() {
+                tracing::info!(
+                    target: "blazar::jobs",
+                    abandoned = late.len(),
+                    "late sweep: in-flight rows last touched before this gateway started marked abandoned"
+                );
+            }
+        });
     }
 
     /// Insert the job row at submit time. `request_json` must carry
