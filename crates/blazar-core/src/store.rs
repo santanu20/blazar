@@ -14,12 +14,12 @@ use crate::error::{CoreError, CoreResult};
 /// - models:   pulled GGUFs (plain files, no blob store)
 /// - profiles: per-(model, engine) launch argv + benchmark results
 /// - loras:    `LoRA` adapters per model
-/// - jobs / job_events: durable background-job spine (v8) — every async
+/// - jobs / `job_events`: durable background-job spine (v8) — every async
 ///   surface (audio, image, video) records its job here so records,
 ///   events, and terminal results survive gateway restarts
 /// - responses: durable Responses-API registry (v8) — `previous_response_id`
 ///   chaining survives restarts
-/// - model_caps: per-(model, engine) capability certificates (v8)
+/// - `model_caps`: per-(model, engine) capability certificates (v8)
 #[derive(Debug)]
 pub struct Store {
     conn: Connection,
@@ -353,6 +353,7 @@ pub struct StoredResponseRow {
     pub ts: i64,
 }
 
+#[must_use]
 pub fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -610,7 +611,9 @@ impl Store {
             sql.push_str(&conds.join(" AND "));
         }
         sql.push_str(" ORDER BY updated_at DESC, id LIMIT ?");
-        let limit_i = limit as i64;
+        // limit is clamped to 1..=1000 by the caller; try_from keeps the
+        // cast total instead of `as` truncation.
+        let limit_i = i64::try_from(limit).unwrap_or(1000);
         binds.push(rusqlite::types::Value::Integer(limit_i));
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(binds), |r| {
