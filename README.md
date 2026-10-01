@@ -1,6 +1,10 @@
+<div align="center">
+
 # Blazar
 
-> **A local AI gateway and runtime orchestrator for heterogeneous inference workloads — OpenAI, Ollama, and Anthropic compatible, with multi-engine routing, VRAM-aware scheduling, model management, multimodal serving, and operator-grade diagnostics in one Rust binary.**
+**The control plane for local AI inference.**
+
+OpenAI · Ollama · Anthropic compatible &nbsp;·&nbsp; Multi-engine &nbsp;·&nbsp; VRAM-aware &nbsp;·&nbsp; Multimodal
 
 [![CI](https://github.com/santanu20/blazar/actions/workflows/ci.yml/badge.svg)](https://github.com/santanu20/blazar/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/santanu20/blazar)](https://github.com/santanu20/blazar/releases)
@@ -9,12 +13,28 @@
 
 **Current release: `0.14.0`**
 
+</div>
+
+> **Blazar is a local AI gateway and runtime orchestrator for heterogeneous inference workloads.** It gives applications one stable endpoint while managing models, engines, VRAM/KV fit, concurrency, lifecycle, diagnostics, and multimodal workloads in one Rust binary.
+
+<div align="center">
+
+![Blazar in action](docs/assets/blazar-demo.svg)
+
+*Live CLI session: model serving, resource decisions, and request diagnostics in one place.*
+
+**[Get started in 60 seconds](#60-second-quickstart)** &nbsp;·&nbsp; **[See benchmark evidence](#benchmark-snapshot)** &nbsp;·&nbsp; **[Read the API reference](docs/4.API_SPEC.md)**
+
+</div>
+
 ---
 
 ## Table of contents
 
 - [What is Blazar?](#what-is-blazar)
 - [Why use Blazar?](#why-use-blazar)
+- [Who should use Blazar?](#who-should-use-blazar)
+- [Blazar vs. common approaches](#blazar-vs-common-approaches)
 - [Benchmark snapshot](#benchmark-snapshot)
 - [Where does it fit?](#where-does-it-fit)
 - [How it works](#how-it-works)
@@ -120,11 +140,35 @@ Blazar is useful when local inference has outgrown the "run one server for one m
 
 Blazar does **not** replace the inference engines, train models, or require a hosted service. It gives applications a stable local control surface while the selected runtime performs the actual model execution.
 
+## Who should use Blazar?
+
+Blazar is a strong fit when you:
+
+- run AI models locally on CPU and/or one or more GPUs;
+- need OpenAI, Ollama, or Anthropic compatibility without maintaining separate gateways;
+- run multiple models, formats, or inference runtimes on the same machine;
+- care about VRAM, KV-cache capacity, concurrency, model residency, and cold starts;
+- want controlled engine upgrades, verification, rollback, and capability-aware routing;
+- are building agents, developer tools, internal AI services, or multimodal pipelines.
+
+Blazar is intentionally **not** necessary for every deployment. If you only need one model, one runtime, and one local process with no orchestration requirements, a direct engine server may be simpler.
+
+## Blazar vs. common approaches
+
+Blazar occupies the **orchestration layer between applications and inference runtimes**. The comparison below is about architectural role, not a universal ranking.
+
+| Approach | Best when | What Blazar adds |
+|---|---|---|
+| **Direct engine server** | One runtime, one model, minimal control plane | Gateway compatibility, model operations, admission, routing, lifecycle, diagnostics |
+| **Ollama** | Simple local model management and Ollama-compatible clients | Multiple engine families, explicit routing, deeper resource planning, lifecycle controls, operational diagnostics |
+| **SGLang / vLLM-style runtime** | High-throughput serving centered on one runtime family | A higher-level local control plane across heterogeneous runtimes and workload types |
+| **Custom scripts / multiple daemons** | Highly bespoke infrastructure | One API surface, one configuration model, one model/engine store, and one operator workflow |
+
 ---
 
 ## Benchmark snapshot
 
-Blazar is designed to add a **control and orchestration plane around inference engines without becoming the performance bottleneck**.
+Blazar is designed to add a **control and orchestration plane around inference engines without becoming the performance bottleneck** — and the published campaign below measures that claim directly.
 
 The repository includes reproducible benchmark campaigns covering raw engine overhead, concurrency, latency, cache behavior, cold starts, idle wake, tool calls, scheduling, model lifecycle, and media workloads.
 
@@ -134,16 +178,24 @@ The latest committed flagship campaign was recorded on **September 29, 2026**. I
 
 > **Important:** these are measured results from a specific model, engine build, hardware configuration, workload, and software version. They are evidence of observed behavior, not universal performance guarantees. This campaign ran against Blazar `0.13.0`; the current release is `0.14.0`.
 
+### Headline evidence
+
+| Proof point | Published result |
+|---|---:|
+| **Gateway overhead** | **~2%** decode-throughput difference vs the same direct engine configuration |
+| **Concurrent throughput** | **104.8 t/s** at C=4 in the published Blazar gateway campaign |
+| **Adaptive serving** | **49 → 63 t/s** with **0 failed requests** during sustained-load reshape |
+
 ### What the benchmark shows
 
 | Workload | Blazar | Reference | Interpretation |
 |---|---:|---:|---|
 | Single-stream decode behind gateway | **40.6 t/s** | **41.5 t/s** direct engine | ~**2%** measured gateway overhead in this configuration |
-| Concurrent system throughput, C=4 | **104.8 t/s** | **33.6 t/s** Ollama reference lane | ~**3.1×** the measured system throughput in this campaign |
+| Concurrent system throughput, C=4 | **104.8 t/s** | **33.6 t/s** Ollama reference lane | **~3.1×** measured system throughput |
 | Concurrent TTFT p99, C=4 | **554 ms** | **15.9 s** Ollama reference lane | Lower measured tail latency |
-| Tool-call TTFT p50 | **117 ms** | **284 ms** Ollama reference lane | ~**2.4×** lower measured time to first tool-call response |
+| Tool-call TTFT p50 | **117 ms** | **284 ms** Ollama reference lane | **~2.4×** lower measured TTFT |
 | Idle wake | **3.63 s** | **6.21 s** Ollama reference lane | Faster measured wake |
-| Adaptive serving under sustained load | **49 → 63 t/s** | — | ~**28%** throughput gain; **0 failed requests** |
+| Adaptive serving under sustained load | **49 → 63 t/s** | — | **~28%** gain; **0 failed requests** |
 
 ### Why these numbers matter
 
@@ -768,14 +820,14 @@ Authentication is optional. A default local deployment does not require a gatewa
 | Live diagnostics | `blazar watch` |
 | Preview fit | `blazar fit <target>` |
 | Plan co-residency | `blazar coreside` |
-| Manage engines | `blazar engine update`; `list`; `use`; `rollback`; `install`; `build`; `prune` |
-| Manage sessions | `blazar session save`; `restore` |
-| Manage LoRA | `blazar lora add`; `rm`; `list` |
+| Manage engines | `blazar engine update`, `blazar engine list`, `blazar engine use`, `blazar engine rollback`, `blazar engine install`, `blazar engine build`, `blazar engine prune` |
+| Manage sessions | `blazar session save`, `blazar session restore` |
+| Manage LoRA | `blazar lora add`, `blazar lora rm`, `blazar lora list` |
 | Manage projectors | `blazar mmproj ...` |
 | Tune a model | `blazar tune <model>` |
 | Inspect draft candidates | `blazar drafts <model>` |
 | Benchmark | `blazar bench <model>` |
-| Manage API keys | `blazar keys list`; `add`; `rm`; `rotate` |
+| Manage API keys | `blazar keys list`, `blazar keys add`, `blazar keys rm`, `blazar keys rotate` |
 | Transcribe audio | `blazar whisper <file>` |
 | Generate speech | `blazar tts "<text>"` |
 | Search models | `blazar search ...` |
@@ -894,6 +946,7 @@ The README is the **product entry point**. Detailed operational and implementati
 | [`docs/7.SETUP.md`](docs/7.SETUP.md) | Installation, deployment, environment, and configuration |
 | [`docs/8.DO_NOT_BREAK.md`](docs/8.DO_NOT_BREAK.md) | Maintainer invariants and compatibility rules |
 | [`docs/9.USAGE.md`](docs/9.USAGE.md) | End-user workflows and troubleshooting |
+| [`docs/assets/blazar-demo.svg`](docs/assets/blazar-demo.svg) | Captured CLI demo |
 | [`docs/10.SCIENTIFIC.md`](docs/10.SCIENTIFIC.md) | VRAM/KV math, GGUF parsing, and numerical methods |
 | [`BENCHMARK.md`](BENCHMARK.md) | Benchmark methodology and results |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release history |
