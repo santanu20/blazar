@@ -1245,8 +1245,11 @@ pub(crate) fn routed_kind_for(
     state: &Arc<AppState>,
     model: &str,
 ) -> Option<blazar_core::engine_kind::EngineKind> {
+    // Ladder-resolve: gate callers feed the raw request name, and the
+    // tags-rendered alias must pick the model's real lane (falling to
+    // the global kind on a resolvable miss silently mis-gates).
     let row = state
-        .with_store(|s| s.get_model(model).ok().flatten())
+        .with_store(|s| resolve_model(s, model).ok())
         .flatten()?;
     resolve_serving(state, model, &row.path)
         .map(|lane| lane.kind)
@@ -1264,7 +1267,15 @@ pub(crate) fn resolve_serving(
     model_path: &str,
 ) -> Option<LaneResolution> {
     use blazar_core::engine_kind::{self, EngineKind};
-    let overlay = state.config.overlay_for(model_name);
+    // Names arriving from the header-extension gates may be the
+    // tags-rendered alias (`m1:q4_k_m`) rather than the store key —
+    // canonicalize through the shared ladder so overlays, arch probes,
+    // and quant signals key on the same name the spawn will use.
+    let canonical = state
+        .with_store(|s| resolve_model(s, model_name).ok().map(|r| r.name))
+        .flatten()
+        .unwrap_or_else(|| model_name.to_string());
+    let overlay = state.config.overlay_for(&canonical);
     state
         .with_store(|s| {
             let rows = s.list_engines().unwrap_or_default();
@@ -1284,7 +1295,7 @@ pub(crate) fn resolve_serving(
             // routing can never disagree. Never fires under a user pin
             // (the spawn rescue has the same gate) or when the picked
             // lane's arch set is unknown (honest unknown).
-            let model_row = s.get_model(model_name).ok().flatten();
+            let model_row = s.get_model(&canonical).ok().flatten();
             let arch = model_row.as_ref().and_then(|r| r.arch.clone());
             let rescue_preview = |tag: &str, kind: EngineKind| -> Option<String> {
                 blazar_runtime::predicted_rescue_lane(
@@ -1303,7 +1314,7 @@ pub(crate) fn resolve_serving(
                     .as_ref()
                     .is_some_and(blazar_core::ModelRow::has_component_set),
                 std::path::Path::new(model_path).is_dir(),
-                blazar_core::store::quantized_safetensors_signal(model_name, "", model_path),
+                blazar_core::store::quantized_safetensors_signal(&canonical, "", model_path),
                 global,
                 &installed,
             );

@@ -279,6 +279,52 @@ async fn e2e__ollama_delete_accepts_the_tags_rendered_name() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn e2e__num_ctx_header_resolves_the_tags_rendered_name() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    // X-Blazar-Num-Ctx (and X-Blazar-Spec) feed the RAW body model into
+    // apply_num_ctx/apply_spec; the tags-rendered alias must behave like
+    // the exact name. The raw-key probe this replaces silently skipped
+    // the KV preflight AND queued a phantom ctx under the display alias.
+    // An absurd ctx makes resolution observable: the preflight refuses
+    // loudly through the resolver instead of no-op'ing.
+    let chat = |model: &str| {
+        serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+    };
+    for model in ["m1", "m1:q4_k_m"] {
+        let resp = c
+            .post(format!("{}/v1/chat/completions", ts.base))
+            .header("x-blazar-num-ctx", "999999999999")
+            .json(&chat(model))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "model {model:?}: preflight must fire");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let msg = body.to_string();
+        assert!(
+            msg.contains("cannot fit the GPU"),
+            "model {model:?}: KV refuse teaching, got {msg}"
+        );
+    }
+    // Unknown names fail fast from the header path with the ladder's
+    // teaching instead of queueing a phantom ctx.
+    let resp = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .header("x-blazar-num-ctx", "8192")
+        .json(&chat("no-such-model"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn e2e__openai_chat_nonstream_and_stream() {
     let ts = start(Config::default()).await;
     let c = client();

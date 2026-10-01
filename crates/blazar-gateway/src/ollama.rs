@@ -1543,6 +1543,17 @@ pub(crate) async fn apply_num_ctx(
     if want <= 0 {
         return Err(Box::new(api_error(400, "options.num_ctx must be positive")));
     }
+    // The OpenAI path feeds the raw body name (X-Blazar-Num-Ctx); ride
+    // the shared ladder so the tags-rendered alias (`m1:q4_k_m`) gets
+    // the same recycle + ctx queue as the exact name, instead of
+    // silently skipping the preflight and queueing a phantom ctx under
+    // the display alias. Unknown names fail fast with the ladder's
+    // teaching message — the serving path would 404 identically.
+    let model = match state.with_store(|s| crate::proxy::resolve_model(s, model)) {
+        Some(Ok(row)) => row.name,
+        Some(Err(msg)) => return Err(Box::new(api_error(404, &msg))),
+        None => return Err(Box::new(api_error(500, "store unavailable"))),
+    };
     // ctx preflight (I5): refuse a num_ctx no spawn could host, BEFORE
     // the evict below can take a healthy instance down. One placement
     // model for both lanes (device truth): the KV pool is device-backed
@@ -1552,7 +1563,7 @@ pub(crate) async fn apply_num_ctx(
     // the engine's own fit juggling at spawn.
     {
         let row = state
-            .with_store(|s| s.get_model(model).ok().flatten())
+            .with_store(|s| s.get_model(&model).ok().flatten())
             .flatten();
         if let Some(row) = row {
             if let Ok(meta) = blazar_core::read_metadata_file(std::path::Path::new(&row.path)) {
@@ -1573,7 +1584,7 @@ pub(crate) async fn apply_num_ctx(
                     // pin the spawn itself would host (split-brain
                     // observed live: a 65536 vision pin refused at f16
                     // math while the spawn laddered to q8_0 happily).
-                    let (eff_k, eff_v) = state.config.effective_cache_type_kv(model);
+                    let (eff_k, eff_v) = state.config.effective_cache_type_kv(&model);
                     let pair_set = !eff_k.is_empty() || !eff_v.is_empty();
                     let ladder: Vec<Option<(String, String)>> = if pair_set {
                         vec![Some((eff_k, eff_v))]
@@ -1624,15 +1635,15 @@ pub(crate) async fn apply_num_ctx(
     let running = state.sup.ps().into_iter().find(|p| p.name == model);
     if let Some(p) = running {
         if i64::from(p.ctx) < want && p.in_flight == 0 {
-            let _ = state.sup.evict_model(model).await;
+            let _ = state.sup.evict_model(&model).await;
             state
                 .sup
-                .set_next_ctx(model, u32::try_from(want).unwrap_or(u32::MAX));
+                .set_next_ctx(&model, u32::try_from(want).unwrap_or(u32::MAX));
         }
     } else {
         state
             .sup
-            .set_next_ctx(model, u32::try_from(want).unwrap_or(u32::MAX));
+            .set_next_ctx(&model, u32::try_from(want).unwrap_or(u32::MAX));
     }
     Ok(())
 }
@@ -1660,13 +1671,22 @@ pub(crate) async fn apply_spec(
             ),
         )));
     }
+    // Same ladder rule as `apply_num_ctx`: resolve so the spec-queue key
+    // matches the instance key (the OpenAI header path feeds the raw
+    // body name) and unknown names fail fast instead of queuing a
+    // phantom spec under the display alias.
+    let model = match state.with_store(|s| crate::proxy::resolve_model(s, model)) {
+        Some(Ok(row)) => row.name,
+        Some(Err(msg)) => return Err(Box::new(api_error(404, &msg))),
+        None => return Err(Box::new(api_error(500, "store unavailable"))),
+    };
     if let Some(p) = state.sup.ps().into_iter().find(|p| p.name == model) {
         if p.spec_mode != want && p.in_flight == 0 {
-            let _ = state.sup.evict_model(model).await;
-            state.sup.set_next_spec(model, want);
+            let _ = state.sup.evict_model(&model).await;
+            state.sup.set_next_spec(&model, want);
         }
     } else {
-        state.sup.set_next_spec(model, want);
+        state.sup.set_next_spec(&model, want);
     }
     Ok(())
 }
@@ -3062,7 +3082,7 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
             Err(e) => api_error(502, &format!("router unload: {e}")),
         };
     }
-    match state.sup.evict_model(model).await {
+    match state.sup.evict_model(&model).await {
         Ok(()) => axum::Json(json!({"status": "ok"})).into_response(),
         Err(e) => api_error(404, &e.to_string()),
     }
