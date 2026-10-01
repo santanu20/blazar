@@ -24,6 +24,14 @@
 //! `/v1/audio/jobs/{id}/cancel` aborts the wait. Jobs die with the
 //! gateway process, the same lifetime truth the image lane attaches to
 //! its children.
+//!
+//! Streaming (F6): upstream has no partial-transcription surface (the
+//! server is mutex-serialized batch), so `"stream": "true"` implements
+//! progressive decode gateway-side — WAV PCM inputs split into
+//! frame-aligned windows decoded sequentially on the same lazy child,
+//! one SSE `chunk.completed` per window and a final
+//! `transcript.completed`. Zero throughput cost: the child serializes
+//! requests anyway, the windows are the same total decode.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,6 +42,7 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::Extension;
 use blazar_runtime::whisper;
+use futures::StreamExt as _;
 
 use crate::proxy::openai_error;
 use crate::remotes::split_remote;
@@ -215,6 +224,83 @@ fn forwarded_fields(parts: &[Part], force_translate: bool) -> Vec<(String, Strin
     out
 }
 
+/// Rebuilt fields for the streaming lane: the whitelist minus the knobs
+/// that would crop or shift a WINDOW instead of the file (a client's
+/// `duration`/`offset_t`/`no_timestamps` mean the whole recording, and
+/// timestamps are the payload of every streaming event), with
+/// `response_format=verbose_json` forced — segments and per-chunk
+/// durations are what the SSE events are built from.
+fn forwarded_fields_stream(parts: &[Part], force_translate: bool) -> Vec<(String, String)> {
+    const WINDOW_SHAPING: &[&str] = &["response_format", "no_timestamps", "duration", "offset_t"];
+    forwarded_fields(parts, force_translate)
+        .into_iter()
+        .filter(|(k, _)| !WINDOW_SHAPING.contains(&k.as_str()))
+        .chain([("response_format".to_string(), "verbose_json".to_string())])
+        .collect()
+}
+
+/// One wire-encoded SSE frame. `serde_json`'s Display is single-line
+/// JSON, so the data field never breaks early.
+fn sse_frame(event: &str, data: &serde_json::Value) -> Vec<u8> {
+    format!("event: {event}\ndata: {data}\n\n").into_bytes()
+}
+
+/// Shift a decoded chunk's segment timestamps onto the source
+/// recording's timeline (`start`/`end` are chunk-relative seconds in
+/// upstream's `verbose_json`). Non-numeric or missing fields pass through
+/// untouched — the event carries what the decoder reported.
+fn rebase_segments(segments: &mut serde_json::Value, offset_ms: u64) {
+    let Some(list) = segments.as_array_mut() else {
+        return;
+    };
+    let shift = offset_ms as f64 / 1000.0;
+    for seg in list.iter_mut() {
+        for key in ["start", "end"] {
+            if let Some(v) = seg.get_mut(key).and_then(|v| v.as_f64()) {
+                seg[key] = serde_json::json!(v + shift);
+            }
+        }
+    }
+}
+
+/// One `/inference` POST against an already-ensured child: rebuilds
+/// the multipart from the caller's field set and returns the raw
+/// upstream triple. Shared by the sync forward, the async job task,
+/// and the streaming lane (one call per progressive window).
+async fn inference_post(
+    state: &Arc<AppState>,
+    port: u16,
+    file_bytes: &[u8],
+    filename: &str,
+    mime: &str,
+    fields: &[(String, String)],
+) -> Result<(StatusCode, String, Bytes), (u16, String)> {
+    let mut form = reqwest::multipart::Form::new().part(
+        "file",
+        reqwest::multipart::Part::bytes(file_bytes.to_vec())
+            .file_name(filename.to_string())
+            .mime_str(mime)
+            .unwrap_or_else(|_| reqwest::multipart::Part::bytes(file_bytes.to_vec())),
+    );
+    for (key, v) in fields {
+        form = form.text(key.clone(), v.clone());
+    }
+    let url = format!("http://127.0.0.1:{port}/inference");
+    let resp = match state.http.post(&url).multipart(form).send().await {
+        Ok(r) => r,
+        Err(e) => return Err((502, format!("whisper inference: {e:#}"))),
+    };
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let ct = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let bytes = resp.bytes().await.unwrap_or_default();
+    Ok((status, ct, bytes))
+}
+
 /// Local lane transport: ensure the lazy child (hot model swap on size
 /// change), forward the multipart fields whisper-server understands,
 /// and return the raw upstream triple. Shared by the sync path and the
@@ -250,30 +336,16 @@ async fn forward_local_raw(
         .content_type
         .clone()
         .unwrap_or_else(|| "application/octet-stream".to_string());
-    let mut form = reqwest::multipart::Form::new().part(
-        "file",
-        reqwest::multipart::Part::bytes(file.data.clone())
-            .file_name(file.filename.clone().unwrap_or_else(|| "audio".to_string()))
-            .mime_str(&mime)
-            .unwrap_or_else(|_| reqwest::multipart::Part::bytes(file.data.clone())),
-    );
-    for (key, v) in forwarded_fields(parts, force_translate) {
-        form = form.text(key, v);
-    }
-    let url = format!("http://127.0.0.1:{port}/inference");
-    let resp = match state.http.post(&url).multipart(form).send().await {
-        Ok(r) => r,
-        Err(e) => return Err((502, format!("whisper inference: {e:#}"))),
-    };
-    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let ct = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
-        .to_string();
-    let bytes = resp.bytes().await.unwrap_or_default();
-    Ok((status, ct, bytes))
+    let fields = forwarded_fields(parts, force_translate);
+    inference_post(
+        state,
+        port,
+        &file.data,
+        file.filename.as_deref().unwrap_or("audio"),
+        &mime,
+        &fields,
+    )
+    .await
 }
 
 /// Sync local lane: same contract as before the async split — the raw
@@ -535,6 +607,202 @@ fn wants_async(parts: &[Part]) -> bool {
     })
 }
 
+/// The `stream` knob (F6): same multipart-field convention as `async`.
+/// Progressive SSE transcription on the local lane only — remotes keep
+/// whatever contract they have upstream.
+fn wants_stream(parts: &[Part]) -> bool {
+    field(parts, "stream").is_some_and(|v| {
+        let v = v.trim();
+        v.eq_ignore_ascii_case("true") || v == "1"
+    })
+}
+
+/// `stream=true` (F6): progressive transcription over SSE. WAV PCM
+/// inputs split into `whisper_stream_chunk_ms` windows (frame-aligned,
+/// lossless — see `whisper::split_wav`) decoded sequentially on the
+/// same lazy child, so text surfaces every window instead of only when
+/// the whole file finishes. Upstream is mutex-serialized batch (no
+/// streaming surface exists to relay), so sequential windows cost zero
+/// throughput versus one monolithic decode. Events: `chunk.completed`
+/// per window (source-relative timestamps), one final
+/// `transcript.completed`, `error` for mid-stream failures (once the
+/// event stream is open, failures stop being HTTP status codes — every
+/// major SSE API behaves the same), and `: keep-alive` comments during
+/// long window decodes so proxies do not reap an idle connection.
+/// Non-WAV inputs decode once and stream as a single final event: the
+/// client contract stays uniform, and the format limitation is named
+/// in the capabilities payload.
+#[allow(clippy::too_many_arguments)]
+async fn forward_local_stream(
+    state: &Arc<AppState>,
+    parts: &[Part],
+    file: &Part,
+    size: &str,
+    bin: &std::path::Path,
+    lib_dir: &std::path::Path,
+    force_translate: bool,
+) -> Response {
+    let Some(model_path) = whisper::model_file(&state.dirs, size) else {
+        return openai_error(500, &format!("whisper model ggml-{size}.bin vanished"));
+    };
+    let filename = file.filename.clone().unwrap_or_else(|| "audio".to_string());
+    let fields = forwarded_fields_stream(parts, force_translate);
+    // Emission plan before the stream opens: WAV splits become windows;
+    // anything else is one window carrying the original bytes and mime.
+    let windows: Vec<(Vec<u8>, u64, String)> =
+        match whisper::split_wav(&file.data, state.config.whisper_stream_chunk_ms) {
+            Some(split) => split
+                .into_iter()
+                .map(|c| (c.bytes, c.offset_ms, "audio/wav".to_string()))
+                .collect(),
+            None => vec![(
+                file.data.clone(),
+                0,
+                file.content_type
+                    .clone()
+                    .unwrap_or_else(|| "application/octet-stream".to_string()),
+            )],
+        };
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+    let task_state = Arc::clone(state);
+    let bin = bin.to_path_buf();
+    let lib_dir = lib_dir.to_path_buf();
+    let size = size.to_string();
+    tokio::spawn(async move {
+        // Cold child boot can take its whole ready timeout — that failure
+        // and every later one surface as `error` events, never silence.
+        let port = match task_state
+            .whisper
+            .ensure(
+                &size,
+                &model_path,
+                &bin,
+                &lib_dir,
+                std::time::Duration::from_mins(2),
+            )
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                let frame = sse_frame(
+                    "error",
+                    &serde_json::json!({"message": format!("whisper-server: {e:#}")}),
+                );
+                let _ = tx.send(frame).await;
+                return;
+            }
+        };
+        let mut all_segments: Vec<serde_json::Value> = Vec::new();
+        let mut texts: Vec<String> = Vec::new();
+        let mut duration_ms = 0u64;
+        let mut language = serde_json::Value::Null;
+        for (i, (bytes, offset_ms, mime)) in windows.iter().enumerate() {
+            let attempt = inference_post(&task_state, port, bytes, &filename, mime, &fields);
+            tokio::pin!(attempt);
+            let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(15));
+            keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let triple = loop {
+                tokio::select! {
+                    _ = keepalive.tick() => {
+                        let _ = tx.send(b": keep-alive\n\n".to_vec()).await;
+                    }
+                    r = &mut attempt => break r,
+                }
+            };
+            let (status, _ct, body) = match triple {
+                Ok(t) => t,
+                Err((code, msg)) => {
+                    let frame = sse_frame(
+                        "error",
+                        &serde_json::json!({"message": msg, "status": code, "chunk": i}),
+                    );
+                    let _ = tx.send(frame).await;
+                    return;
+                }
+            };
+            if !status.is_success() {
+                let frame = sse_frame(
+                    "error",
+                    &serde_json::json!({
+                        "message": format!("whisper inference: HTTP {status}"),
+                        "status": status.as_u16(),
+                        "chunk": i,
+                        "body": String::from_utf8_lossy(&body),
+                    }),
+                );
+                let _ = tx.send(frame).await;
+                return;
+            }
+            let mut v: serde_json::Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    let frame = sse_frame(
+                        "error",
+                        &serde_json::json!({
+                            "message": format!("unparseable verbose_json from child: {e}"),
+                            "chunk": i,
+                        }),
+                    );
+                    let _ = tx.send(frame).await;
+                    return;
+                }
+            };
+            if let Some(lang) = v.get("language").filter(|l| !l.is_null()) {
+                language = lang.clone();
+            }
+            let text = v
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let mut segments = v
+                .get_mut("segments")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]));
+            rebase_segments(&mut segments, *offset_ms);
+            if let Some(chunk_secs) = v.get("duration").and_then(serde_json::Value::as_f64) {
+                duration_ms = offset_ms + (chunk_secs * 1000.0) as u64;
+            }
+            let frame = sse_frame(
+                "chunk.completed",
+                &serde_json::json!({
+                    "index": i,
+                    "offset_ms": offset_ms,
+                    "text": text,
+                    "segments": segments,
+                }),
+            );
+            all_segments.extend(segments.as_array().cloned().unwrap_or_default());
+            texts.push(text);
+            if tx.send(frame).await.is_err() {
+                return; // client hung up: stop decoding, discard the rest
+            }
+        }
+        let final_event = sse_frame(
+            "transcript.completed",
+            &serde_json::json!({
+                "duration_ms": duration_ms,
+                "language": language,
+                "text": texts.concat(),
+                "segments": all_segments,
+                "chunks": windows.len(),
+            }),
+        );
+        let _ = tx.send(final_event).await;
+    });
+    let body = axum::body::Body::from_stream(
+        tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok::<_, std::convert::Infallible>),
+    );
+    Response::builder()
+        .status(200)
+        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+        .header(axum::http::header::CACHE_CONTROL, "no-cache")
+        // nginx and friends buffer proxied SSE unless told not to.
+        .header("x-accel-buffering", "no")
+        .body(body)
+        .unwrap_or_else(|_| openai_error(500, "response build").into_response())
+}
+
 /// Submit an async job: reserve the handle, spawn the forward task,
 /// answer with the gateway-owned job envelope (same shape vocabulary as
 /// the images lane's `async` handles). No awaits — the spawned task owns
@@ -740,6 +1008,16 @@ pub async fn audio_capabilities(State(state): State<Arc<AppState>>) -> Response 
             "/v1/audio/jobs/{id}/cancel"
         ],
         "async": { "field": "async", "values": ["true", "1"], "local_lane_only": true },
+        "stream": {
+            "field": "stream",
+            "values": ["true", "1"],
+            "local_lane_only": true,
+            "chunk_ms": state.config.whisper_stream_chunk_ms,
+            "events": ["chunk.completed", "transcript.completed", "error"],
+            "progressive": "wav pcm splits at frame boundaries; other formats decode as one \
+             final event",
+            "content_type": "text/event-stream",
+        },
         "idle_timeout_secs": state.config.whisper_idle_secs,
     });
     Response::builder()
@@ -822,7 +1100,20 @@ pub async fn audio_transcriptions(
     let size = server
         .as_ref()
         .and_then(|_| whisper::resolve_model(requested, &available));
+    // Request-shape errors precede lane availability: a contradictory
+    // stream+async body is 400 even when no engine is installed.
+    if wants_stream(&parts) && wants_async(&parts) {
+        return openai_error(
+            400,
+            "stream and async are mutually exclusive: stream returns progressive SSE \
+             events, async returns a pollable job handle — pick one",
+        );
+    }
     if let (Some((bin, lib_dir)), Some(size)) = (&server, size) {
+        let stream = wants_stream(&parts);
+        if stream {
+            return forward_local_stream(&state, &parts, file, &size, bin, lib_dir, false).await;
+        }
         if wants_async(&parts) {
             let file_part = file.clone();
             return submit_async(&state, parts, file_part, size.clone(), bin, lib_dir, false);
@@ -907,7 +1198,20 @@ pub async fn audio_translations(
     let size = server
         .as_ref()
         .and_then(|_| whisper::resolve_model(requested, &available));
+    // Request-shape errors precede lane availability: a contradictory
+    // stream+async body is 400 even when no engine is installed.
+    if wants_stream(&parts) && wants_async(&parts) {
+        return openai_error(
+            400,
+            "stream and async are mutually exclusive: stream returns progressive SSE \
+             events, async returns a pollable job handle — pick one",
+        );
+    }
     if let (Some((bin, lib_dir)), Some(size)) = (&server, size) {
+        let stream = wants_stream(&parts);
+        if stream {
+            return forward_local_stream(&state, &parts, file, &size, bin, lib_dir, true).await;
+        }
         if wants_async(&parts) {
             let file_part = file.clone();
             return submit_async(&state, parts, file_part, size.clone(), bin, lib_dir, true);
@@ -1278,5 +1582,98 @@ mod tests {
         let c = jobs.reserve();
         jobs.cancel(&c);
         assert_eq!(jobs.active_count(), 0, "cancelled drops out");
+    }
+
+    #[test]
+    fn unit__wants_stream__accepts_true_and_1_rejects_rest() {
+        let mk = |v: &str| mixed_body("XbOuNdArY", &[("stream", v.as_bytes())], ("a.wav", b"RIFF"));
+        for yes in ["true", "TRUE", "1", " true "] {
+            let (b, ct) = mk(yes);
+            let parts = parse_multipart(&b, &ct).expect("parses");
+            assert!(wants_stream(&parts), "{yes:?} must request streaming");
+        }
+        for no in ["false", "0", "yes", ""] {
+            let (b, ct) = mk(no);
+            let parts = parse_multipart(&b, &ct).expect("parses");
+            assert!(!wants_stream(&parts), "{no:?} must stay non-streaming");
+        }
+        // Absent field = the batch default every existing client gets.
+        let (b, ct) = mixed_body("XbOuNdArY", &[], ("a.wav", b"RIFF"));
+        let parts = parse_multipart(&b, &ct).expect("parses");
+        assert!(!wants_stream(&parts), "absent field must not stream");
+    }
+
+    #[test]
+    fn unit__forwarded_fields_stream__forces_verbose_json_and_drops_decode_shifting_fields() {
+        // The progressive lane decodes each window at its own offset, so
+        // client response_format and window-shaping fields (duration,
+        // offset_t, no_timestamps) must be dropped and verbose_json forced;
+        // language and other verified knobs still ride.
+        let (b, ct) = mixed_body(
+            "XbOuNdArY",
+            &[
+                ("response_format", b"srt"),
+                ("no_timestamps", b"true"),
+                ("duration", b"5"),
+                ("offset_t", b"1"),
+                ("language", b"en"),
+                ("beam_size", b"2"),
+            ],
+            ("a.wav", b"RIFF"),
+        );
+        let parts = parse_multipart(&b, &ct).expect("parses");
+        let fields = forwarded_fields_stream(&parts, false);
+        let get = |k: &str| fields.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("response_format"), Some("verbose_json"), "forced");
+        assert_eq!(get("language"), Some("en"), "verified knob kept");
+        assert_eq!(get("beam_size"), Some("2"), "verified knob kept");
+        assert_eq!(get("translate"), Some("false"), "default injected");
+        assert!(
+            fields
+                .iter()
+                .all(|(n, _)| n != "no_timestamps" && n != "duration" && n != "offset_t"),
+            "window-shaping fields dropped: {fields:?}"
+        );
+        let n = fields
+            .iter()
+            .filter(|(name, _)| name == "response_format")
+            .count();
+        assert_eq!(n, 1, "no duplicate response_format: {fields:?}");
+    }
+
+    #[test]
+    fn unit__sse_frame__wire_format() {
+        let mut v = serde_json::json!({"a": 1});
+        let frame = sse_frame("chunk.completed", &v);
+        assert_eq!(
+            String::from_utf8_lossy(&frame),
+            "event: chunk.completed\ndata: {\"a\":1}\n\n"
+        );
+        // Event names with dots and empty payloads both stay well-formed.
+        v = serde_json::json!({});
+        let frame = sse_frame("transcript.completed", &v);
+        assert_eq!(
+            String::from_utf8_lossy(&frame),
+            "event: transcript.completed\ndata: {}\n\n"
+        );
+    }
+
+    #[test]
+    fn unit__rebase_segments__adds_offset_to_start_and_end() {
+        // Production hands the extracted `segments` array, not the doc.
+        let mut segments = serde_json::json!([
+            {"id": 0, "start": 0.0, "end": 1.5, "text": "a"},
+            {"id": 1, "start": 1.5, "end": 3.0, "text": "b"},
+            {"id": 2, "start": "not-a-number", "end": null, "text": "c"}
+        ]);
+        rebase_segments(&mut segments, 6000);
+        let segs = segments.as_array().expect("segments");
+        assert_eq!(segs[0]["start"].as_f64(), Some(6.0));
+        assert_eq!(segs[0]["end"].as_f64(), Some(7.5));
+        assert_eq!(segs[1]["start"].as_f64(), Some(7.5));
+        assert_eq!(segs[1]["end"].as_f64(), Some(9.0));
+        // Non-numeric times pass through untouched rather than panicking.
+        assert_eq!(segs[2]["start"].as_str(), Some("not-a-number"));
+        assert!(segs[2]["end"].is_null());
     }
 }

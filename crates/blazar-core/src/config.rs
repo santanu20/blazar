@@ -411,6 +411,15 @@ pub struct Config {
     /// the child alive until daemon teardown (the pre-reaper behavior).
     #[serde(default = "default_whisper_idle_secs")]
     pub whisper_idle_secs: u64,
+    /// Audio lane streaming (F6): target window per progressive decode
+    /// chunk when `stream=true` rides a transcription. The gateway splits
+    /// WAV PCM payloads into slices of this length (frame-aligned) and
+    /// emits one SSE `chunk.completed` event per decoded slice, so long
+    /// recordings surface text every few seconds instead of only at the
+    /// end. Non-WAV inputs stream as a single final event (upstream has
+    /// no streaming surface to relay). Range 1_000..=120_000 ms.
+    #[serde(default = "default_whisper_stream_chunk_ms")]
+    pub whisper_stream_chunk_ms: u64,
     /// Capability-lane registry URL (curated fork lanes for GGUF
     /// architectures mainline llama.cpp can't load yet). `None` = the
     /// default registry; `Some("")` disables registry lookups entirely
@@ -1936,6 +1945,10 @@ fn default_whisper_idle_secs() -> u64 {
     900
 }
 
+fn default_whisper_stream_chunk_ms() -> u64 {
+    30_000
+}
+
 fn default_fork_retire_days() -> u64 {
     7
 }
@@ -2132,6 +2145,7 @@ impl Default for Config {
             late_chunking_max_tokens: default_late_chunking_max_tokens(),
             session_keep_secs: default_session_keep_secs(),
             whisper_idle_secs: default_whisper_idle_secs(),
+            whisper_stream_chunk_ms: default_whisper_stream_chunk_ms(),
             capability_registry_url: None,
             fork_retire_days: default_fork_retire_days(),
             semantic_cache: SemanticCacheConfig::default(),
@@ -2898,6 +2912,13 @@ impl Config {
             return Err(CoreError::Config(format!(
                 "download_speed_limit_mb must be a finite number >= 0 (0 = unlimited), got {}",
                 self.download_speed_limit_mb
+            )));
+        }
+        if !(1_000..=120_000).contains(&self.whisper_stream_chunk_ms) {
+            return Err(CoreError::Config(format!(
+                "whisper_stream_chunk_ms must be 1000..=120000 (milliseconds per progressive \
+                 decode window), got {}",
+                self.whisper_stream_chunk_ms
             )));
         }
         match self.child_transport.as_str() {
@@ -3740,6 +3761,9 @@ impl Config {
         }
         if let Some(v) = env("BLAZAR_DOWNLOAD_SPEED_LIMIT_MB") {
             cfg.download_speed_limit_mb = parse_f64("BLAZAR_DOWNLOAD_SPEED_LIMIT_MB", &v)?;
+        }
+        if let Some(v) = env("BLAZAR_WHISPER_STREAM_CHUNK_MS") {
+            cfg.whisper_stream_chunk_ms = parse_u64("BLAZAR_WHISPER_STREAM_CHUNK_MS", &v)?;
         }
         if let Some(v) = env("BLAZAR_SPEC") {
             cfg.spec = v;

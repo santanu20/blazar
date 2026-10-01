@@ -898,6 +898,66 @@ async fn e2e__local_whisper_charges_key_admission() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn e2e__whisper_stream_and_async_are_mutually_exclusive() {
+    // F6: `stream` + `async` on one body is a request-shape error — it
+    // must 400 before lane availability is even considered.
+    let ts = start(Config::default()).await;
+    let c = client();
+    let boundary = "X-BLAZAR-F6-MM";
+    let multipart = format!(
+        "--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; \
+         filename=\"clip.wav\"\r\ncontent-type: audio/wav\r\n\r\nAAAA\r\n\
+         --{boundary}\r\ncontent-disposition: form-data; name=\"stream\"\r\n\r\ntrue\r\n\
+         --{boundary}\r\ncontent-disposition: form-data; name=\"async\"\r\n\r\ntrue\r\n\
+         --{boundary}--\r\n"
+    );
+    let resp = c
+        .post(format!("{}/v1/audio/transcriptions", ts.base))
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(multipart)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("mutually exclusive"), "body: {body}");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__whisper_stream_without_engine_keeps_teaching() {
+    // F6: stream on a rig with no whisper engine falls through to the
+    // lane-absent 501 teaching — the streaming branch never bypasses
+    // the teaching ladder.
+    let ts = start(Config::default()).await;
+    let c = client();
+    let boundary = "X-BLAZAR-F6-ST";
+    let multipart = format!(
+        "--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; \
+         filename=\"clip.wav\"\r\ncontent-type: audio/wav\r\n\r\nAAAA\r\n\
+         --{boundary}\r\ncontent-disposition: form-data; name=\"stream\"\r\n\r\ntrue\r\n\
+         --{boundary}--\r\n"
+    );
+    let resp = c
+        .post(format!("{}/v1/audio/transcriptions", ts.base))
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(multipart)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 501);
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn e2e__models_capabilities_field_matches_mmproj() {
     // Audit MM13: /v1/models rows carry a capabilities array (blazar-
     // native shape mirroring /api/show) — [] for text-only rows.

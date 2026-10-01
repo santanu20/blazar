@@ -215,7 +215,7 @@ The three lanes never individually audited. Sources: leejet/stable-diffusion.cpp
 
 | Complaint | Verdict |
 |---|---|
-| Streaming ASR quality: "simplistic streaming mode, disjoint 30s-padded segments, unsuitable for deployment" (arXiv); "feels laggy for live apps" (dev.to) | **GAP (feature candidate F6):** blazar exposes batch `/v1/audio/transcriptions` only — a chunked streaming endpoint with rolling partial hypotheses is the one true lane gap. Sizable; upstream segment semantics limit ceiling quality |
+| Streaming ASR quality: "simplistic streaming mode, disjoint 30s-padded segments, unsuitable for deployment" (arXiv); "feels laggy for live apps" (dev.to) | **DONE (F6, 2026-10-02):** `stream=true` SSE now ships on the transcription endpoints — progressive chunk decode + rebased rolling segments (see fix list F6) |
 | #4075 Metal 10x slowdown with non-default `audio_ctx` | IMMUNE: blazar never sets `audio_ctx` (defaults) |
 | #4018 non-ASCII `-m` model path aborts (0xC0000409) on MSVC Windows | WATCHLIST (W1): non-ASCII Windows homes would crash the whisper child; mitigation when implemented = Windows short-path (8.3) normalization of child argv |
 | #4041-4043 Go-binding CString leaks | N/A: blazar spawns binaries, no bindings |
@@ -224,12 +224,18 @@ The three lanes never individually audited. Sources: leejet/stable-diffusion.cpp
 
 ### Round-3 additions to the fix list
 
-- **F6 (feature candidate).** Streaming transcription endpoint: chunked audio
-  ingestion + rolling partial results on `/v1/audio/transcriptions` (SSE),
-  wrapping the lane's segment semantics. Large; propose as its own wave.
-- **W1 (watchlist).** Non-ASCII Windows model-path abort (whisper #4018):
-  normalize child argv to 8.3 short paths on Windows when implementing;
-  low frequency, cheap guard when touched.
+- **F6 — DONE 2026-10-02: streaming transcriptions shipped.** `stream=true` on
+  `/v1/audio/transcriptions` + `/translations` returns SSE: WAV split at PCM
+  frame boundaries into `whisper_stream_chunk_ms` windows (default 30 s,
+  1-120 s), each transcribed in order on the same lazy child;
+  `chunk.completed` events carry rebased segments while later audio still
+  decodes, `transcript.completed` closes with the merged transcript. Gate:
+  `stream` + `async` = 400; window-shaping fields dropped; hangup stops at the
+  next chunk boundary. Live receipt: 66 s jfk-concat WAV, 6 s windows, 11
+  chunks + final on the rig daemon.
+- **W1 — DONE 2026-10-02.** 8.3 short-path argv guard on Windows
+  (best-effort `GetShortPathNameW`, identity off-Windows) before the whisper
+  child sees a non-ASCII model path (whisper.cpp #4018 abort class).
 
 ## 10. Sources (selection)
 
