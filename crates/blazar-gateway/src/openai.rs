@@ -68,6 +68,46 @@ pub async fn models(State(state): State<Arc<AppState>>) -> Response {
             })
         })
         .collect();
+    // Federation presence merge: peer listings ride along when the
+    // fallback is armed. SNAPSHOT semantics — whatever the presence
+    // cache holds right now (a peer not yet probed shows nothing until
+    // the first fallback request warms it; listing must never block on
+    // a network probe).
+    let mut data = data;
+    if crate::remotes::fallback_enabled(&state.config) {
+        // (owner, id) pairs from the presence cache in ONE lock pass;
+        // an id two peers both list appears twice — each row names its
+        // owner, clients disambiguate by picking one.
+        let peer_rows = state
+            .remote_presence
+            .lock()
+            .ok()
+            .map(|m| {
+                m.iter()
+                    .flat_map(|(k, p)| {
+                        let owner = k.split('|').next().unwrap_or("remote");
+                        p.entries.iter().map(move |id| (owner.to_string(), id.clone()))
+                    })
+                    .collect::<Vec<(String, String)>>()
+            })
+            .unwrap_or_default();
+        let seen: std::collections::HashSet<String> = data
+            .iter()
+            .filter_map(|v| v["id"].as_str().map(str::to_string))
+            .collect();
+        for (owner, id) in peer_rows {
+            if seen.contains(&id) {
+                continue;
+            }
+            data.push(json!({
+                "id": id,
+                "object": "model",
+                "owned_by": "blazar-remote",
+                "engine": owner,
+                "capabilities": [],
+            }));
+        }
+    }
     axum::Json(json!({"object": "list", "data": data})).into_response()
 }
 
@@ -357,6 +397,26 @@ pub async fn openai_proxy(
             body,
         )
         .await;
+    }
+    // Federation fallback: a bare name the local store does not know
+    // routes to a peer that lists it (presence-cached, TTL-bound, with
+    // one throttled re-probe when no cached catalog claims it).
+    // Ambiguous local matches stay LOCAL — that is a naming problem,
+    // not a routing one; the 404 below keeps its teaching text when no
+    // peer serves the model either. Billing already ran above.
+    if let Some(resp) = crate::remotes::try_fallback_forward(
+        &state,
+        &model,
+        crate::remotes::FallbackLane::OpenAi {
+            method: &method,
+            path: &path_and_query(&uri),
+            headers: &headers,
+            body: body.clone(),
+        },
+    )
+    .await
+    {
+        return resp;
     }
     // Reasoning-effort bridge (chat lane only — /completions and
     // /responses are unverified child surfaces for the kwarg): rewrite

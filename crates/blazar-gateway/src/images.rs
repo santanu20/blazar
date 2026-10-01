@@ -565,6 +565,31 @@ pub async fn generations(
     let row = state
         .with_store(|s| resolve_model(s, &model).ok())
         .flatten();
+    // Federation fallback: a diffusion model no local row owns serves
+    // from a live peer that lists it — byte-forward the generation
+    // request, the peer's own gate owns capability checks. Local-only
+    // teaching below stays untouched when no peer claims it.
+    if row.is_none() {
+        let mut fwd_headers = axum::http::HeaderMap::new();
+        fwd_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        if let Some(resp) = crate::remotes::try_fallback_forward(
+            &state,
+            &model,
+            crate::remotes::FallbackLane::OpenAi {
+                method: &axum::http::Method::POST,
+                path: "/v1/images/generations",
+                headers: &fwd_headers,
+                body: body.clone(),
+            },
+        )
+        .await
+        {
+            return resp;
+        }
+    }
     match images_gate(row.as_ref(), Surface::ImgGen) {
         ImagesGate::Serve => {}
         ImagesGate::Reject(msg) => return openai_error(400, &msg),

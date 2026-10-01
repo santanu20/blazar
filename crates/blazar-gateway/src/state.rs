@@ -227,6 +227,12 @@ pub struct AppState {
     /// `health_key` of the remote that last served it. Sticky while that
     /// remote stays live; bounded (one entry per distinct prefix).
     pub remote_affinity: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, String>>>,
+    /// Federation presence (per-remote `/v1/models` listings, TTL-bound
+    /// in `remotes::refresh_presence`): backs bare-name fallback routing
+    /// and the `/v1/models` peer merge. Keyed by the same `health_key`.
+    pub remote_presence: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, crate::remotes::PeerPresence>>,
+    >,
     /// E4 audit: line sender (`None` = audit off; no request-path tax
     /// when disabled). Dropped-line counter is shared with the writer.
     pub audit_tx: Option<tokio::sync::mpsc::Sender<crate::audit::AuditLine>>,
@@ -407,6 +413,7 @@ impl AppState {
             http_addr: std::sync::OnceLock::new(),
             remote_health: std::sync::Arc::default(),
             remote_affinity: std::sync::Arc::default(),
+            remote_presence: std::sync::Arc::default(),
             audit_tx,
             audit_dropped,
             store: std::sync::Mutex::new(store),

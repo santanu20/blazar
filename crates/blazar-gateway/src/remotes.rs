@@ -377,6 +377,297 @@ pub async fn probe(state: &AppState, remote: &Remote) -> (bool, String) {
     }
 }
 
+/// How long a peer's `/v1/models` listing stays trusted before the
+/// next fallback miss re-probes it.
+const REMOTE_PRESENCE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A peer that just gained a model inside the TTL window would be
+/// invisible until the cache lapses; one forced re-probe per remote
+/// per this window closes that gap without per-request GET hammering
+/// on genuinely unknown model names.
+const REMOTE_PRESENCE_FORCE_THROTTLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Cached `/v1/models` listing for one remote (federation presence).
+#[derive(Debug, Clone)]
+pub struct PeerPresence {
+    pub entries: Vec<String>,
+    pub fetched: std::time::Instant,
+    pub last_forced: Option<std::time::Instant>,
+}
+
+impl PeerPresence {
+    fn fresh(&self) -> bool {
+        self.fetched.elapsed() < REMOTE_PRESENCE_TTL
+    }
+}
+
+/// Pure gate for the forced re-probe: due when never forced or the
+/// last forced probe is past the throttle window.
+fn force_refresh_due(presence: Option<&PeerPresence>) -> bool {
+    presence.is_none_or(|p| {
+        p.last_forced
+            .is_none_or(|t| t.elapsed() >= REMOTE_PRESENCE_FORCE_THROTTLE)
+    })
+}
+
+/// Federation is armed: at least one remote configured and the
+/// `remote_fallback` kill switch is on. One definition shared by the
+/// request hook and the `/v1/models` merge — flipping the config flag
+/// rolls the whole feature back to pure-prefix routing.
+#[must_use]
+pub fn fallback_enabled(cfg: &Config) -> bool {
+    !cfg.remotes.is_empty() && cfg.remote_fallback
+}
+
+/// Does the peer catalog id `id` satisfy the locally-requested
+/// `requested` name? Peer ids carry a quant tag (`qwen3:q4`), the
+/// caller may request bare names or a `+adapter` variant — compare
+/// exact, then each side's name-part (before `:`), then the
+/// lora-stripped base on both sides. Pure.
+fn peer_id_matches(id: &str, requested: &str) -> bool {
+    if id == requested {
+        return true;
+    }
+    let id_name = id.split(':').next().unwrap_or(id);
+    let (req_base, _) = blazar_core::catalog::split_lora_suffix(requested);
+    let req_name = req_base.split(':').next().unwrap_or(req_base);
+    id_name == req_name || id == req_name
+}
+
+/// One GET `/v1/models` against a remote, parsed to model ids. Probe
+/// failures return `None` — an unreachable or unparseable peer is
+/// simply not a fallback candidate, never a request error.
+async fn fetch_presence(state: &AppState, remote: &Remote) -> Option<Vec<String>> {
+    let url = format!("{}/v1/models", remote.url.trim_end_matches('/'));
+    let mut req = state.http.get(&url);
+    if !remote.key.is_empty() {
+        req = req.bearer_auth(&remote.key);
+    }
+    let entries = match req
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+            Ok(v) => v["data"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|m| m["id"].as_str().map(str::to_string))
+                        .collect::<Vec<String>>()
+                })
+                .unwrap_or_default(),
+            Err(_) => return None,
+        },
+        Ok(_) => return None,
+        Err(e) => {
+            tracing::warn!(target: "blazar::remotes", remote = %remote.name, "presence probe failed: {e:#}");
+            return None;
+        }
+    };
+    Some(entries)
+}
+
+/// Fetch (or reuse within TTL) one remote's model listing. Natural
+/// refreshes preserve the forced-probe throttle state.
+async fn refresh_presence(state: &AppState, remote: &Remote) -> Option<Vec<String>> {
+    let hkey = health_key(remote);
+    if let Some(p) = state.remote_presence.lock().ok()?.get(&hkey) {
+        if p.fresh() {
+            return Some(p.entries.clone());
+        }
+    }
+    let entries = fetch_presence(state, remote).await?;
+    if let Ok(mut m) = state.remote_presence.lock() {
+        let last_forced = m.get(&hkey).and_then(|p| p.last_forced);
+        m.insert(
+            hkey,
+            PeerPresence {
+                entries: entries.clone(),
+                fetched: std::time::Instant::now(),
+                last_forced,
+            },
+        );
+    }
+    Some(entries)
+}
+
+/// Forced presence re-probe (bypasses the TTL cache), throttled per
+/// remote to [`REMOTE_PRESENCE_FORCE_THROTTLE`]. Returns the cached
+/// view when the throttle window has not elapsed.
+async fn force_refresh_presence(state: &AppState, remote: &Remote) -> Option<Vec<String>> {
+    let hkey = health_key(remote);
+    let due = state
+        .remote_presence
+        .lock()
+        .ok()
+        .and_then(|m| force_refresh_due(m.get(&hkey)).then_some(()))
+        .is_some();
+    if !due {
+        return state
+            .remote_presence
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&hkey).map(|p| p.entries.clone()));
+    }
+    let entries = fetch_presence(state, remote).await?;
+    if let Ok(mut m) = state.remote_presence.lock() {
+        m.insert(
+            hkey,
+            PeerPresence {
+                entries: entries.clone(),
+                fetched: std::time::Instant::now(),
+                last_forced: Some(std::time::Instant::now()),
+            },
+        );
+    }
+    Some(entries)
+}
+
+/// Remotes whose cached-or-fresh catalog lists `model`, live-filtered
+/// (circuit-open peers skip) and ordered least-in-flight first, config
+/// order as the stable tiebreak. First entry is the fallback target.
+pub async fn peers_serving<'a>(state: &'a AppState, model: &str) -> Vec<&'a Remote> {
+    let mut candidates: Vec<(&Remote, u32)> = Vec::new();
+    for remote in &state.config.remotes {
+        // Circuit-open peers are excluded by the same health map the
+        // explicit-prefix lane uses — fallback never routes into a
+        // remote the breaker already marked down.
+        let live = state
+            .remote_health
+            .lock()
+            .ok()
+            .and_then(|m| {
+                m.get(&health_key(remote)).map(|h| {
+                    h.down_until.is_none_or(|t| std::time::Instant::now() >= t)
+                })
+            })
+            .unwrap_or(true);
+        if !live {
+            continue;
+        }
+        if let Some(entries) = refresh_presence(state, remote).await {
+            if entries.iter().any(|id| peer_id_matches(id, model)) {
+                let in_flight = state
+                    .remote_health
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(&health_key(remote)).map(|h| h.in_flight))
+                    .unwrap_or(0);
+                candidates.push((remote, in_flight));
+            }
+        }
+    }
+    candidates.sort_by_key(|(_, f)| *f);
+    candidates.into_iter().map(|(r, _)| r).collect()
+}
+
+/// [`peers_serving`] plus one throttled forced re-probe per remote when
+/// NO cached catalog claims the model: a peer that started serving the
+/// model inside the presence TTL is still found (the first fallback
+/// miss for that model pays the probe, unknown-name traffic never
+/// hammers peers).
+pub async fn peers_serving_with_refresh<'a>(state: &'a AppState, model: &str) -> Vec<&'a Remote> {
+    let cached = peers_serving(state, model).await;
+    if !cached.is_empty() {
+        return cached;
+    }
+    let mut candidates: Vec<(&Remote, u32)> = Vec::new();
+    for remote in &state.config.remotes {
+        let live = state
+            .remote_health
+            .lock()
+            .ok()
+            .and_then(|m| {
+                m.get(&health_key(remote)).map(|h| {
+                    h.down_until.is_none_or(|t| std::time::Instant::now() >= t)
+                })
+            })
+            .unwrap_or(true);
+        if !live {
+            continue;
+        }
+        if let Some(entries) = force_refresh_presence(state, remote).await {
+            if entries.iter().any(|id| peer_id_matches(id, model)) {
+                let in_flight = state
+                    .remote_health
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(&health_key(remote)).map(|h| h.in_flight))
+                    .unwrap_or(0);
+                candidates.push((remote, in_flight));
+            }
+        }
+    }
+    candidates.sort_by_key(|(_, f)| *f);
+    candidates.into_iter().map(|(r, _)| r).collect()
+}
+
+/// Lane selection for [`try_fallback_forward`] — every lane hook shares
+/// the same miss-detection and peer pick; only the forward call shape
+/// differs per surface.
+pub enum FallbackLane<'a> {
+    /// OpenAI-shape byte forward (`/v1/*` surfaces): method, path with
+    /// query, headers, and the caller-original body ride
+    /// [`forward_with_health`].
+    OpenAi {
+        method: &'a axum::http::Method,
+        path: &'a str,
+        headers: &'a axum::http::HeaderMap,
+        body: axum::body::Bytes,
+    },
+    /// Ollama `/api/chat`: the parsed ollama request (plus its prefix
+    /// affinity hint) rides [`ollama_chat_remote`], which owns the
+    /// ollama-to-OpenAI translation and the response shaping.
+    OllamaChat {
+        req: &'a serde_json::Value,
+        prefix: Option<blazar_runtime::PrefixKey>,
+    },
+}
+
+/// Federation fallback, one shared path for every lane hook: a bare
+/// model name the local store does not own (PURE not-found — an
+/// ambiguous local match stays local, that is a naming problem) routes
+/// to the least-busy live peer whose catalog lists it. Returns `None`
+/// when federation is off, the model resolves locally, or no peer
+/// claims it — the caller's existing local error path stays untouched.
+/// Key admission (scope + request count) runs at the call site before
+/// this, exactly like explicit-prefix routing.
+pub async fn try_fallback_forward(
+    state: &AppState,
+    model: &str,
+    lane: FallbackLane<'_>,
+) -> Option<axum::response::Response> {
+    if !fallback_enabled(&state.config) {
+        return None;
+    }
+    let local_miss = state
+        .with_store(|s| crate::proxy::resolve_model(s, model).err())
+        .flatten()
+        .is_some_and(|e| e.contains("not found") && !e.contains("ambiguous"));
+    if !local_miss {
+        return None;
+    }
+    let peers = peers_serving_with_refresh(state, model).await;
+    let peer = peers.first()?;
+    tracing::info!(target: "blazar::remotes", peer = %peer.name, model = %model, "fallback: routing bare model to peer");
+    let prefixed = format!("{}:{}", peer.name, model);
+    match lane {
+        FallbackLane::OpenAi {
+            method,
+            path,
+            headers,
+            body,
+        } => Some(forward_with_health(state, &prefixed, method, path, headers, body).await),
+        FallbackLane::OllamaChat { req, prefix } => {
+            let (remote, remote_model, _lease, akey) =
+                select_remote(state, &prefixed, prefix.as_ref()).ok()?;
+            let resp = ollama_chat_remote(state, remote, remote_model, req).await;
+            Some(tag_remote_result(state, remote, akey, resp))
+        }
+    }
+}
+
 /// `/api/chat` against a remote: ollama body -> `OpenAI` -> remote ->
 /// ollama shape back (non-stream JSON; stream = SSE->NDJSON with the
 /// same translate helpers the local path uses).
@@ -682,5 +973,81 @@ mod tests {
             "affinity table stays bounded: {}",
             map.lock().unwrap().len()
         );
+    }
+
+    #[test]
+    fn unit__peer_id_matches__exact_name_part_and_lora_stripped() {
+        // Exact id match.
+        assert!(peer_id_matches("qwen3:q4", "qwen3:q4"));
+        // Bare request matches the peer id's quant-tagged name-part.
+        assert!(peer_id_matches("qwen3:q4_0", "qwen3"));
+        // Request with a quant tag matches a bare peer id.
+        assert!(peer_id_matches("qwen3", "qwen3:q4_0"));
+        // +adapter variant resolves to the peer's base name-part.
+        assert!(peer_id_matches("qwen3:q4", "qwen3+my-lora"));
+        assert!(peer_id_matches("qwen3:q4", "qwen3:q4+my-lora"));
+        // Different model: no match in any form.
+        assert!(!peer_id_matches("qwen3:q4", "qwen8"));
+        assert!(!peer_id_matches("qwen3:q4", "qwen3-x"));
+        // A colon-bearing id's name-part must not match a DIFFERENT
+        // request's name-part.
+        assert!(!peer_id_matches("qwen3:q4", "qwen8:q4"));
+    }
+
+    #[test]
+    fn unit__peer_presence__ttl_window_boundary() {
+        let fresh = PeerPresence {
+            entries: vec!["m".into()],
+            fetched: std::time::Instant::now(),
+            last_forced: None,
+        };
+        assert!(fresh.fresh(), "just-fetched presence is fresh");
+        let stale = PeerPresence {
+            entries: vec!["m".into()],
+            fetched: std::time::Instant::now()
+                .checked_sub(REMOTE_PRESENCE_TTL + std::time::Duration::from_secs(1))
+                .unwrap_or(std::time::Instant::now()),
+            last_forced: None,
+        };
+        assert!(!stale.fresh(), "presence past the TTL must re-probe");
+    }
+
+    #[test]
+    fn unit__force_refresh_due__throttled_per_remote() {
+        // No presence yet: the first forced probe is due.
+        assert!(force_refresh_due(None));
+        // Never forced: due.
+        assert!(force_refresh_due(Some(&PeerPresence {
+            entries: vec![],
+            fetched: std::time::Instant::now(),
+            last_forced: None,
+        })));
+        // Forced just now: throttled.
+        assert!(!force_refresh_due(Some(&PeerPresence {
+            entries: vec![],
+            fetched: std::time::Instant::now(),
+            last_forced: Some(std::time::Instant::now()),
+        })));
+        // Forced past the throttle window: due again.
+        assert!(force_refresh_due(Some(&PeerPresence {
+            entries: vec![],
+            fetched: std::time::Instant::now(),
+            last_forced: std::time::Instant::now()
+                .checked_sub(REMOTE_PRESENCE_FORCE_THROTTLE + std::time::Duration::from_secs(1)),
+        })));
+    }
+
+    #[test]
+    fn unit__fallback_enabled__gate_requires_remotes_and_flag() {
+        let mut cfg = blazar_core::Config::default();
+        assert!(!fallback_enabled(&cfg), "no remotes -> inert");
+        cfg.remotes = vec![Remote {
+            name: "peer".into(),
+            url: "http://127.0.0.1:1".into(),
+            key: String::new(),
+        }];
+        assert!(fallback_enabled(&cfg), "armed by default with a remote");
+        cfg.remote_fallback = false;
+        assert!(!fallback_enabled(&cfg), "kill switch rolls the feature back");
     }
 }

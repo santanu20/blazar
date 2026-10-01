@@ -881,7 +881,37 @@ pub async fn chat(
     }
     let row = match state.with_store(|s| resolve_model(s, &model_field)) {
         Some(Ok(r)) => r,
-        Some(Err(e)) => return api_error(404, &e),
+        Some(Err(e)) => {
+            // Federation fallback on the ollama lane too: a bare name
+            // no local row owns routes to a live peer that lists it
+            // (ollama shape preserved by the remote chat translator).
+            // Pure not-found only — the ambiguous/local-teaching 404
+            // below is untouched when no peer claims it.
+            if let Some(mut out) = crate::remotes::try_fallback_forward(
+                &state,
+                &model_field,
+                crate::remotes::FallbackLane::OllamaChat {
+                    req: &req,
+                    prefix: crate::proxy::affinity_hash(&req),
+                },
+            )
+            .await
+            {
+                // Token budgets ride the remote NDJSON exactly like the
+                // explicit-prefix lane above.
+                if let Some((name, _entry)) =
+                    key_entry.filter(|(_, e)| e.tpm > 0 || e.daily_tokens > 0)
+                {
+                    out = crate::keys::charge_outgoing(
+                        out,
+                        &name,
+                        std::sync::Arc::clone(&state.keys),
+                    );
+                }
+                return out;
+            }
+            return api_error(404, &e);
+        }
         None => return api_error(500, "store unavailable"),
     };
 
