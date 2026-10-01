@@ -554,6 +554,11 @@ Every advanced capability is on by default unless noted, and each has full docum
 | **KV-cache quantization** | Automatic K/V grade ladder with context autofit — VRAM headroom and longer contexts without manual tuning | [`docs/7.SETUP.md`](docs/7.SETUP.md#memory-kv--context) |
 | **Flash attention** | Enabled automatically where the engine build supports it | [`docs/7.SETUP.md`](docs/7.SETUP.md) |
 | **Multi-GPU sharding** | Automatic tensor parallelism with rank pinning; explicit pins always win | [`docs/7.SETUP.md`](docs/7.SETUP.md#multi-gpu-sharding--admission) |
+| **Durable job ledger** | Async image/video/audio/batch jobs and stored responses survive restarts — records, events, and completed artifacts persist in SQLite | [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md) |
+| **Request lifecycle** | Live request cards with cancel and interrupt: `GET /v1/requests`, `POST /v1/requests/{id}/cancel` — agents can stop a runaway generation | [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md) |
+| **Effective-config explanation** | `blazar explain <model>` shows the resolved engine lane, effective context (and where the value came from), slots, speculation, and cache posture | [Diagnostics and observability](#diagnostics-and-observability) |
+| **Model doctor** | `blazar model-doctor <model>` runs bounded capability probes (chat, streaming, JSON schema, tools, embeddings) and files a certificate used for routing honesty | [Diagnostics and observability](#diagnostics-and-observability) |
+| **Capacity observability** | `GET /api/capacity` reports per-GPU VRAM, utilization, and which resident model holds what — one JSON object, no log scraping | [Diagnostics and observability](#diagnostics-and-observability) |
 | **Admission and queueing** | Bounded concurrency under saturation — parks or refuses requests rather than destabilizing latency | [`docs/7.SETUP.md`](docs/7.SETUP.md#multi-gpu-sharding--admission) |
 | **Federation** | Peer Blazar gateways behind one endpoint: explicit remote routing, least-busy selection, and fallback | [`docs/7.SETUP.md`](docs/7.SETUP.md#federation-peers-behind-one-gateway) |
 | **Warm starts and session bank** | Session checkpoints survive unload and restart; conversation-prefix routing keeps hot KV where the next request needs it | [Sessions, cache, and warm starts](#sessions-cache-and-warm-starts) |

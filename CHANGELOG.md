@@ -4,6 +4,33 @@ All notable changes to Blazar are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
+## [0.15.0] - 2026-10-02
+
+Theme: **the reliability layer** — local AI that behaves like infrastructure.
+Jobs, requests, responses, and capability certificates survive restarts;
+every effective config value states where it came from; generation can be
+observed and stopped from another connection; the GPU tells the truth about
+itself. No new inference engines; depth over breadth.
+
+### Added
+
+- **Durable job runtime — the unified `/v1/jobs` plane.** Async audio, image, and video jobs now write through to a SQLite ledger (store schema v8: `jobs`, `job_events`, `responses`, `model_caps`). `GET /v1/jobs` (filters `state`/`kind`/`limit`), `GET /v1/jobs/{id}`, `POST /v1/jobs/{id}/cancel`, `GET /v1/jobs/{id}/events` (per-probe / per-transition audit trail), `GET /v1/jobs/{id}/artifact` (input files ≤ 64 MiB and oversized results served from disk; results ≤ 1 MiB inline). Restart honesty instead of restart theater: a boot sweep marks rows that were in-flight when the gateway died as `abandoned` with a teaching error ("resubmit to rerun; completed artifacts were kept") after a 5 s grace window, terminal jobs prune after 7 days, and job state transitions are one-way (a cancelled row can never be resurrected by a late racer). The legacy `/v1/audio/jobs/{id}` and `/v1/images|videos/jobs/{id}` surfaces keep working and now read through the same ledger — their 404s point at `/v1/jobs`. Live receipt: audio job submitted, daemon restarted mid-lifecycle, `GET /v1/jobs/{id}` returns the completed record from SQLite (previously: "jobs die with the gateway process").
+- **Durable Responses — `previous_response_id` survives restarts.** The Responses registry keeps its hot 256-entry/24 h LRU but writes through to the same SQLite ledger; a chaining request that misses memory promotes the row from disk (TTL re-checked, expired rows are misses, not stale serves) and re-warms the LRU. Live receipt: response stored → daemon restarted → chain resolved instead of the teaching 404.
+- **Request lifecycle API — `/v1/requests`.** Every generation route (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/responses`, `/v1/messages`, `/api/chat`, `/api/generate`) now registers a live request card: `{id, trace_id, model, engine, state, tokens_generated, queue_time, compute_time, partial (bounded 64 KiB), status}`. `POST /v1/requests/{id}/cancel` and `/v1/interrupt` stop a running generation from ANOTHER connection (interrupt keeps the partial output and ends the stream with a clean dialect terminal frame; cancel discards) — the primitives IDE agents need against runaway reasoning. Responses carry `x-blazar-request-id`. Cards are API-key-scoped when keys are enabled; terminal cards live in a bounded 256-entry per-boot ring; client disconnects are detected (drop-guard marks `disconnected`) — the card plane tells the truth the client already knows. `blazar_requests_inflight` gauge in `/metrics`.
+- **Per-GPU capacity observability — `GET /api/capacity`.** Live nvidia-smi census (per-device total/free VRAM, utilization) joined with the supervisor's resident table and `--query-compute-apps`: each Blazar child reports its held VRAM, foreign compute processes are listed as `external` with a note, CPU-only hosts get an honest census-empty note instead of fabricated zeros. Weights/KV/compute splits stay inside engine children and are labeled as not-estimated rather than guessed.
+- **`blazar explain` + `GET /api/explain/{model}` — the effective-config card with provenance.** One command answers "why is Blazar doing this?": model facts, engine lane and the routing reason that fired, requested vs effective context WITH ITS SOURCE (live child argv when resident, `model_overrides.<m>.ctx` / config default otherwise, honest "config estimate — the spawn-time planner may shrink it" when cold), slots (live vs sized-at-spawn), speculation mode + draft, KV cache types, semantic-cache scope, admission counters, and the full resident list with warnings. Every value either names its source or prints `unknown` — never a blank that looks authoritative. Resolves `name:quant` display forms through the same canonical ladder as `/api/chat`.
+- **Model doctor — `blazar model-doctor <model>` + `POST /api/model-doctor`.** A capability certificate built from REAL probes through the full gateway path (admission → translate → child → sentinel): chat (implicitly load/tokenize/template/generate), streaming SSE, strict JSON schema, tool-call elicitation (a prose answer is a FAIL, not a PASS), embeddings (a teaching refusal from the lane is an honest N/A), plus static vision (mmproj pulled?) and think (template carries a thinking block?) caps. Probes are bounded (300 s cold-load first probe, 120 s others, 10 min overall → remaining marked FAIL-timeout, partial cert still stored), run as a durable `/v1/jobs` job (cancel between probes honored), and the certificate lands in the store (`GET /api/model-doctor/{model}`) for routing decisions. Suite receipts: stub engines produce honest FAIL verdicts with receipts, real qwen3-1.7b run produces a full PASS certificate.
+- **Semantic-cache tool-result gate.** Requests carrying `role=tool` messages bypass the semantic cache in BOTH directions: tool outputs are not part of the serving fingerprint, so a prompt-similarity hit could serve an answer computed against different tool results. Tool-free turns of the same conversation still cache. New `blazar_semantic_cache_tool_bypasses_total` counter in `/metrics`.
+- **Client-compat matrix runner (`scripts/compat/`)** — wire-shape fixtures for the OpenAI SDK, Codex-style Responses chaining, Anthropic SDK, ollama CLI, and Continue/Cline tool-call shapes, asserting response contracts against a live daemon; plus GitHub issue templates (bug / workload / feature) so demand data lands in the repo instead of staying anecdotal.
+
+### Fixed
+
+- **`/api/explain` and `/api/model-doctor` model resolution.** Both used the raw colon-swap resolver, so the `name:quant` display form `/api/tags` emits 404ed while `/api/chat` resolved it fine; both now use the canonical ladder (exact → colon-swap → colonless strip → unique prefix → Levenshtein-3 suggestion) and surface its teaching errors, with store-unavailable as a distinct 500.
+
+### Migration notes
+
+- Store schema v7 → v8 (additive; `jobs`/`job_events`/`responses`/`model_caps` created on first boot, old tables untouched).
+
 ## [0.14.0] - 2026-09-30
 
 ### Added
