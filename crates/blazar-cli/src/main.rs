@@ -1117,7 +1117,7 @@ fn daemon_base(cfg: &Config) -> String {
 }
 
 /// Fire-and-forget warm ping after a fresh local pull: the daemon
-/// applies its warm_on_pull policy (knob, AC power, admission belts).
+/// applies its `warm_on_pull` policy (knob, AC power, admission belts).
 /// Absent daemon = nothing to warm — skip without noise.
 async fn notify_daemon_warm(model: &str) {
     let Ok(cfg) = config() else {
@@ -2913,8 +2913,19 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
             .collect();
         out.push(Check::ok(label, entries.join(" | ")));
     }
-    // Retention: per-kind count vs KEEP_TAGS (local + active protected
-    // on top; prune runs on the next install).
+    out.extend(doctor_engine_retention(d, &engines));
+    out
+}
+
+/// Retention tail of the ENGINES section: per-kind count vs `KEEP_TAGS`
+/// (local + active protected on top; prune runs on the next install),
+/// plus row-less dirs invisible to those counts (interrupted installs,
+/// pre-rollback upgrades — advisory, `blazar engine prune` reclaims).
+fn doctor_engine_retention(
+    d: &BlazarDirs,
+    engines: &[blazar_core::store::EngineRow],
+) -> Vec<Check> {
+    let mut out = Vec::new();
     let keep = blazar_runtime::engine::KEEP_TAGS;
     let mut over: Vec<String> = Vec::new();
     for kind in ["llamacpp", "mistralrs", "sglang", "sdcpp", "whisper"] {
@@ -2923,11 +2934,9 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
             over.push(format!("{kind}: {n} > {keep}"));
         }
     }
-    // Row-less dirs: invisible to the counts above yet still on disk
-    // (interrupted installs, pre-rollback upgrades). Advisory only —
-    // `blazar engine prune` reclaims them. Each dir is size-annotated
-    // so the reclaim teaching says how much is at stake; sorted for a
-    // deterministic listing (read_dir order is filesystem whim).
+    // Row-less dirs: each size-annotated so the reclaim teaching says
+    // how much is at stake; sorted for a deterministic listing
+    // (read_dir order is filesystem whim).
     let tags: std::collections::HashSet<&str> = engines.iter().map(|e| e.tag.as_str()).collect();
     let orphaned: Vec<String> = std::fs::read_dir(d.engines_dir())
         .map(|rd| {
