@@ -222,7 +222,10 @@ impl GhClient {
 
     pub async fn release_by(&self, repo: &str, version: Option<&str>) -> Result<GhRelease> {
         match version {
-            None => self.release_by_path(&format!("repos/{repo}/releases/latest")).await,
+            None => {
+                self.release_by_path(&format!("repos/{repo}/releases/latest"))
+                    .await
+            }
             Some(v) => {
                 // A bare semver pin ("0.14.0") names the v-prefixed tag
                 // this project publishes (release workflow tags "v*").
@@ -1513,7 +1516,8 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/repos/test/releases/tags/v9.9.9"))
+        Mock::given(method("GET"))
+            .and(path("/repos/test/releases/tags/v9.9.9"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "tag_name": "v9.9.9", "assets": []
             })))
@@ -1532,11 +1536,13 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/repos/test/releases/tags/v1.2.3"))
+        Mock::given(method("GET"))
+            .and(path("/repos/test/releases/tags/v1.2.3"))
             .respond_with(ResponseTemplate::new(404))
             .mount(&server)
             .await;
-        Mock::given(method("GET")).and(path("/repos/test/releases/tags/1.2.3"))
+        Mock::given(method("GET"))
+            .and(path("/repos/test/releases/tags/1.2.3"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "tag_name": "1.2.3", "assets": []
             })))
