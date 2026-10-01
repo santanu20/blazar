@@ -233,6 +233,52 @@ async fn e2e__healthz_version_tags_models() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn e2e__ollama_delete_accepts_the_tags_rendered_name() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    // GET /api/tags renders `name:quant`; a client deleting by that exact
+    // string must succeed. The raw store-key probe this replaces 404'd on
+    // the tags-displayed name (store key is the bare `m1`).
+    let status = c
+        .post(format!("{}/api/delete", ts.base))
+        .json(&serde_json::json!({"model": "m1:q4_k_m"}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 200);
+    // Row and file are gone; the untouched sibling stays.
+    let t: serde_json::Value = c
+        .get(format!("{}/api/tags", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let names: Vec<&str> = t["models"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|m| m["name"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(!names.contains(&"m1:q4_k_m"), "deleted row gone: {names:?}");
+    assert!(names.contains(&"m2:q4_k_m"), "sibling untouched: {names:?}");
+    // Already-deleted (by any colon form) and unknown names still teach
+    // 404 through the resolver, which carries the suggestion ladder.
+    for probe in ["m1:q4_k_m", "m1", "m1:latest", "no-such-model"] {
+        let status = c
+            .post(format!("{}/api/delete", ts.base))
+            .json(&serde_json::json!({"model": probe}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 404, "probe {probe:?}");
+    }
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn e2e__openai_chat_nonstream_and_stream() {
     let ts = start(Config::default()).await;
     let c = client();

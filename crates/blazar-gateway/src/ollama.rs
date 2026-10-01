@@ -352,33 +352,36 @@ pub async fn delete(State(state): State<Arc<AppState>>, body: Bytes) -> Response
         .as_str()
         .or(req["name"].as_str())
         .unwrap_or_default();
+    // Resolve through the shared ladder (exact → colon-swap → bare stem
+    // → unique prefix → suggestion) so a client can delete by the very
+    // `name:quant` string GET /api/tags rendered — a raw store-key probe
+    // here 404'd on the tags-displayed name. Same rule the CLI's
+    // `blazar rm` applies before removing.
+    let row = match state.with_store(|s| crate::proxy::resolve_model(s, name)) {
+        Some(Ok(row)) => row,
+        Some(Err(msg)) => return api_error(404, &msg),
+        None => return api_error(500, "store unavailable"),
+    };
+    let key = row.name;
     // F22: classify from typed state, not error-string substrings — an
     // unrelated io error whose text contains "running" must not 409.
-    if blazar_runtime::instance_running(&state.dirs, name) {
+    if blazar_runtime::instance_running(&state.dirs, &key) {
         return api_error(
             409,
             &format!(
-                "model {name} is currently running; stop it first (`blazar stop {name}` or wait for eviction)"
+                "model {key} is currently running; stop it first (`blazar stop {key}` or wait for eviction)"
             ),
         );
     }
-    // unwrap_or(false): store unavailable != model-missing — never
-    // fabricate a 404; remove_model below surfaces the real failure.
-    if state
-        .with_store(|s| s.get_model(name).ok().flatten().is_none())
-        .unwrap_or(false)
-    {
-        return api_error(404, &format!("no such model: {name}"));
-    }
-    match blazar_runtime::remove_model(&state.dirs, name) {
+    match blazar_runtime::remove_model(&state.dirs, &key) {
         Ok(()) => StatusCode::OK.into_response(),
         // State may shift between pre-checks and removal (race) —
         // classify from live state again, never from the message text.
         Err(e) => {
-            if blazar_runtime::instance_running(&state.dirs, name) {
+            if blazar_runtime::instance_running(&state.dirs, &key) {
                 api_error(409, &format!("{e:#}"))
             } else if state
-                .with_store(|s| s.get_model(name).ok().flatten().is_none())
+                .with_store(|s| s.get_model(&key).ok().flatten().is_none())
                 .unwrap_or(false)
             {
                 api_error(404, &format!("{e:#}"))
