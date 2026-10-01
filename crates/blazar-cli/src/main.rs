@@ -12814,8 +12814,15 @@ async fn upgrade(version: Option<String>, dry_run: bool) -> Result<()> {
         .ok();
     let client = blazar_runtime::GhClient::with_base(&base, token).map_err(|e| anyhow!("{e}"))?;
     let channel = config()?.update_channel;
-    let summary =
-        blazar_runtime::upgrade::run(&client, &repo, version.as_deref(), channel, dry_run).await;
+    let summary = blazar_runtime::upgrade::run(
+        &client,
+        &repo,
+        version.as_deref(),
+        channel,
+        dry_run,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await;
     println!("{summary}");
     if summary.starts_with("upgrade failed") {
         return Err(anyhow!("upgrade failed"));

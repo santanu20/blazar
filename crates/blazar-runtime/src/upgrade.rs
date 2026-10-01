@@ -13,6 +13,32 @@ use blazar_core::config::UpdateChannel;
 
 use crate::engine::gh::{GhAsset, GhClient};
 
+/// "v1.2.3"/"1.2.3" -> (1,2,3); anything else -> None (exotic tags never
+/// produce a false downgrade claim).
+fn semver_triple(tag: &str) -> Option<(u64, u64, u64)> {
+    let t = tag.strip_prefix('v').unwrap_or(tag);
+    let mut parts = t.split('.');
+    let triple = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    parts.next().is_none().then_some(triple)
+}
+
+/// "" when the target is not older than `current`; otherwise a downgrade
+/// callout so a typo'd pin never silently rolls the binary back.
+fn downgrade_note(tag: &str, current: &str) -> String {
+    let older = semver_triple(tag)
+        .zip(semver_triple(current))
+        .is_some_and(|(target, running)| target < running);
+    if older {
+        format!(" — downgrade from {current} (rollback path)")
+    } else {
+        String::new()
+    }
+}
+
 /// Resolve + verify + replace in one call. Returns the human summary.
 ///
 /// `dry_run` resolves and downloads (verifying the digest) but replaces
@@ -23,8 +49,9 @@ pub async fn run(
     version: Option<&str>,
     channel: UpdateChannel,
     dry_run: bool,
+    current: &str,
 ) -> String {
-    match run_inner(client, repo, version, channel, dry_run).await {
+    match run_inner(client, repo, version, channel, dry_run, current).await {
         Ok(summary) => summary,
         Err(e) => format!("upgrade failed: {e:#}"),
     }
@@ -36,23 +63,27 @@ async fn run_inner(
     version: Option<&str>,
     channel: UpdateChannel,
     dry_run: bool,
+    current: &str,
 ) -> Result<String> {
     let plan = resolve(client, repo, version, channel).await?;
     let bytes = client.download_asset_bytes(&plan.asset).await?;
     let binary = extract_binary(&plan.asset.name, &bytes)?;
+    let note = downgrade_note(&plan.tag, current);
     if dry_run {
         return Ok(format!(
-            "dry-run ok: {} -> asset {} verified ({} bytes extracted); rerun without --dry-run to install",
+            "dry-run ok: {} -> asset {} verified ({} bytes extracted){}; rerun without --dry-run to install",
             plan.tag,
             plan.asset.name,
-            binary.len()
+            binary.len(),
+            note
         ));
     }
     let exe = replace_current_exe(&binary)?;
     Ok(format!(
-        "upgraded to {} ({}); daemon note: the CLI restarts a running daemon onto the new binary",
+        "upgraded to {} ({}){}; daemon note: the CLI restarts a running daemon onto the new binary",
         plan.tag,
-        exe.display()
+        exe.display(),
+        note
     ))
 }
 
@@ -171,5 +202,35 @@ pub fn replace_current_exe(binary: &[u8]) -> Result<std::path::PathBuf> {
             staged.display(),
             exe.display()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{downgrade_note, semver_triple};
+
+    #[test]
+    fn unit__semver_triple__v_prefixed_bare_and_rejected_shapes() {
+        assert_eq!(semver_triple("v0.14.0"), Some((0, 14, 0)));
+        assert_eq!(semver_triple("0.14.0"), Some((0, 14, 0)));
+        assert_eq!(semver_triple("v1.2.3"), Some((1, 2, 3)));
+        // Exotic tags must never yield a false downgrade claim.
+        assert_eq!(semver_triple("b10941"), None);
+        assert_eq!(semver_triple("latest"), None);
+        assert_eq!(semver_triple("v1.2.3-rc.1"), None);
+        assert_eq!(semver_triple(""), None);
+    }
+
+    #[test]
+    fn unit__downgrade_note__older_target_flags_rollback_only() {
+        assert_eq!(
+            downgrade_note("v0.13.0", "0.14.0"),
+            " — downgrade from 0.14.0 (rollback path)"
+        );
+        // Newer, equal, and unparseable targets stay silent.
+        assert_eq!(downgrade_note("v0.15.0", "0.14.0"), "");
+        assert_eq!(downgrade_note("v0.14.0", "0.14.0"), "");
+        assert_eq!(downgrade_note("b10941", "0.14.0"), "");
+        assert_eq!(downgrade_note("v0.13.0", "b10941"), "");
     }
 }

@@ -221,16 +221,32 @@ impl GhClient {
     }
 
     pub async fn release_by(&self, repo: &str, version: Option<&str>) -> Result<GhRelease> {
-        let path = match version {
-            Some(v) => format!("repos/{repo}/releases/tags/{v}"),
-            None => format!("repos/{repo}/releases/latest"),
-        };
-        let url = self.base.join(&path).unwrap();
+        match version {
+            None => self.release_by_path(&format!("repos/{repo}/releases/latest")).await,
+            Some(v) => {
+                // A bare semver pin ("0.14.0") names the v-prefixed tag
+                // this project publishes (release workflow tags "v*").
+                // Try the normalized form first, the verbatim one second
+                // so bare-tag mirrors keep resolving.
+                if v.starts_with(|c: char| c.is_ascii_digit()) {
+                    let normalized = format!("repos/{repo}/releases/tags/v{v}");
+                    if let Ok(release) = self.release_by_path(&normalized).await {
+                        return Ok(release);
+                    }
+                }
+                self.release_by_path(&format!("repos/{repo}/releases/tags/{v}"))
+                    .await
+            }
+        }
+    }
+
+    async fn release_by_path(&self, path: &str) -> Result<GhRelease> {
+        let url = self.base.join(path).unwrap();
         let http = self.http.clone();
         let token = self.token.clone();
         net_probe::retry_probe(move || {
             let rb = authed(&http, token.as_deref(), url.clone());
-            let path = path.clone();
+            let path = path.to_string();
             async move {
                 let sent = tokio::time::timeout(net_probe::PROBE_ATTEMPT_CAP, rb.send()).await;
                 let resp = match sent {
@@ -1490,6 +1506,45 @@ mod tests {
         assert!(!same_build("b10816", "b10817"));
         assert!(same_build("local", "local"));
         assert!(!same_build("local", "b10816"));
+    }
+
+    #[tokio::test]
+    async fn integration__release_by__bare_semver_pin_normalizes_to_v_tag() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/repos/test/releases/tags/v9.9.9"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tag_name": "v9.9.9", "assets": []
+            })))
+            .mount(&server)
+            .await;
+        let gh = GhClient::with_base(&server.uri(), None).unwrap();
+        let rel = gh.release_by("test", Some("9.9.9")).await.unwrap();
+        assert_eq!(rel.tag_name, "v9.9.9");
+        // The normalized v-tag resolved on the first request — no
+        // verbatim fallback attempt was made.
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn integration__release_by__bare_tag_serves_when_v_tag_absent() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/repos/test/releases/tags/v1.2.3"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET")).and(path("/repos/test/releases/tags/1.2.3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tag_name": "1.2.3", "assets": []
+            })))
+            .mount(&server)
+            .await;
+        let gh = GhClient::with_base(&server.uri(), None).unwrap();
+        let rel = gh.release_by("test", Some("1.2.3")).await.unwrap();
+        assert_eq!(rel.tag_name, "1.2.3");
     }
 
     #[tokio::test]

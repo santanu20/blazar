@@ -196,3 +196,13 @@ Scope: 414 println/eprintln sites audited, ~25 command fns in blazar-cli.
 - Contract kept: message TEXT never changed; piped/NO_COLOR output byte-identical (spacing unchanged); unit test 16039 (list header) and validate.py positional parses unaffected.
 - Suite: blazar-cli 149/149; full 4-crate 1604/1604; clippy --all-targets 0 warnings.
 - Deliberately plain: teach blocks, config list (TOML copy-fidelity), config get (script-friendly), multi-line macros.
+
+## 15. Release-tag audit + 3 fixes (2026-10-01)
+
+Audit verdict: professional core (stable-only latest lane, digest enforcement with fatal mismatch, hostile-tag quoting, numeric b-tag sort, GH_TOKEN teaching, rate-limit fail-fast). Three gaps closed:
+
+- Bare semver pins normalize: `BLAZAR_VERSION=0.9.9` tries `tags/v0.9.9` first, falls back verbatim; `blazar upgrade --version 0.9.9` same (gh.rs release_by refactored onto release_by_path; wiremock: v9.9.9 resolves with exactly 1 request; bare-tag fallback path 404->200).
+- 404 teaching: pinned-tag misses now say 'release X not found ... tags are v-prefixed; list them: <url>' with the HTTP code on other failures (was one generic network message). e2e cases 14+15 pin both (bare pin installs v0.9.9; unknown tag refuses with remedy, never blames the network).
+- Downgrade note: `blazar upgrade` to an older semver target appends ' - downgrade from <current> (rollback path)' in dry-run and install summaries; pure semver_triple rejects pre-release/engine tags. CLI e2e asserts the note; unit tables cover shapes.
+
+Suite: install e2e 60/60, runtime scoped 4/4, cli upgrade 5/5, full 4-crate 1608/1608; shellcheck clean on both scripts.

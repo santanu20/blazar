@@ -27,7 +27,8 @@
 #                     kept: ~/.local/share/blazar, ~/.config/blazar)
 #
 # Environment overrides:
-#   BLAZAR_VERSION            pin a release tag (e.g. v0.3.0)
+#   BLAZAR_VERSION            pin a release tag (e.g. v0.3.0; a bare
+#                              0.3.0 auto-normalizes to v0.3.0)
 #   BLAZAR_REPO               GitHub owner/name hosting releases (unset:
 #                              derived from the enclosing checkout's git
 #                              origin when available)
@@ -121,6 +122,20 @@ fetch() {
             -H "Authorization: Bearer ${GITHUB_TOKEN}" "$@"
     else
         curl --fail --silent --show-error --location $SECURE "$@"
+    fi
+}
+
+# HTTP status code of a GET (no --fail — a failed lookup wants the code,
+# not the body). Same TLS + auth treatment as fetch. 000 = curl itself
+# failed (DNS, TLS, timeout) — the caller's network-lane message.
+fetch_code() {
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        curl --silent --show-error --location $SECURE \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -o /dev/null -w '%{http_code}' "$@"
+    else
+        curl --silent --show-error --location $SECURE \
+            -o /dev/null -w '%{http_code}' "$@"
     fi
 }
 
@@ -936,14 +951,33 @@ STATUS_OS_ARCH="${STATUS_OS} ${RUST_ARCH} (${LIBC})"
 hdr "release"
 status "Looking for release ${BLAZAR_VERSION:-latest} for ${STATUS_OS_ARCH}..."
 
-# Latest-or-pinned release metadata from the GitHub API.
+# Latest-or-pinned release metadata from the GitHub API. A bare semver
+# pin ("0.14.0") names the v-prefixed tag this project publishes (the
+# release workflow tags "v*"): try the normalized form first, verbatim
+# second so bare-tag mirrors keep resolving.
 if [ -n "${BLAZAR_VERSION:-}" ]; then
-    RELEASE_PATH="releases/tags/${BLAZAR_VERSION}"
+    case "$BLAZAR_VERSION" in
+        [0-9]*) RELEASE_PATH="releases/tags/v${BLAZAR_VERSION}" ;;
+        *) RELEASE_PATH="releases/tags/${BLAZAR_VERSION}" ;;
+    esac
 else
     RELEASE_PATH="releases/latest"
 fi
-RELEASE_JSON=$(fetch "${API_BASE}/${RELEASE_PATH}") ||
-    error "failed to look up release ${BLAZAR_VERSION:-latest} in ${API_BASE} (BLAZAR_REPO set? network up?)"
+RELEASE_JSON=$(fetch "${API_BASE}/${RELEASE_PATH}") || RELEASE_JSON=
+if [ -z "$RELEASE_JSON" ] && [ -n "${BLAZAR_VERSION:-}" ] &&
+   [ "$RELEASE_PATH" != "releases/tags/${BLAZAR_VERSION}" ]; then
+    RELEASE_PATH="releases/tags/${BLAZAR_VERSION}"
+    RELEASE_JSON=$(fetch "${API_BASE}/${RELEASE_PATH}") || RELEASE_JSON=
+fi
+if [ -z "$RELEASE_JSON" ]; then
+    # Distinguish "no such tag" (a typo'd pin) from a network/API problem:
+    # the remedies differ, and the wrong one sends users hunting ghosts.
+    CODE=$(fetch_code "${API_BASE}/${RELEASE_PATH}") || CODE=000
+    case "$CODE" in
+        404) error "release ${BLAZAR_VERSION} not found (no ${RELEASE_PATH} in ${API_BASE}) — tags are v-prefixed (e.g. v0.14.0); list them: ${API_BASE}/releases — or unset BLAZAR_VERSION for the latest stable" ;;
+        *) error "failed to look up release ${BLAZAR_VERSION:-latest} in ${API_BASE} (BLAZAR_REPO set? network up? HTTP ${CODE})" ;;
+    esac
+fi
 
 TAG=$(printf '%s' "$RELEASE_JSON" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
 [ -n "$TAG" ] || error "could not parse tag_name from the release API response"

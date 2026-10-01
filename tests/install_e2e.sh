@@ -111,6 +111,16 @@ class H(http.server.BaseHTTPRequestHandler):
                 self._send(open(meta, 'rb').read(), 'application/json')
             else:
                 self.send_error(404)
+        elif self.path.startswith('/releases/tags/'):
+            # Pinned-tag lookups (BLAZAR_VERSION): one JSON per tag.
+            name = self.path[len('/releases/tags/'):]
+            if '/' in name or '..' in name:
+                self.send_error(404); return
+            meta = os.path.join(srv_dir, 'tag-' + name + '.json')
+            if os.path.exists(meta):
+                self._send(open(meta, 'rb').read(), 'application/json')
+            else:
+                self.send_error(404)
         elif self.path.startswith('/repos/ggml-org/llama.cpp/releases'):
             # Engine lane (BLAZAR_GH_BASE points GhClient here): the
             # releases list is all latest_b_release needs.
@@ -676,6 +686,38 @@ if echo "$OUT" | grep -q "Bootstrap install from"; then
     bad "auto: success path uses the --from bootstrap voice"
 else
     ok "auto: success path keeps the auto-build voice"
+fi
+
+# --- 14. pinned bare semver normalizes to the v-tag -------------------------
+# BLAZAR_VERSION=0.9.9 must resolve the v0.9.9 tag (this project tags
+# "v*") — the pin without the v is the natural user spelling.
+PIN_TAG=v0.9.9
+PIN_ASSET="blazar-${PIN_TAG}-${TARGET}.tar.gz"
+tar -czf "$SRV/$PIN_ASSET" -C "$STAGE" .
+PIN_SHA=$(sha256sum "$SRV/$PIN_ASSET" | cut -d ' ' -f1)
+printf '{"tag_name":"%s","assets":[{"name":"%s","digest":"sha256:%s","browser_download_url":"%s/download/%s"}]}' \
+    "$PIN_TAG" "$PIN_ASSET" "$PIN_SHA" "$BASE" "$PIN_ASSET" > "$SRV/tag-${PIN_TAG}.json"
+rm -rf "$SYSTEM_BIN" "$UNIT_OUT" "${TMP:?}/home"
+mkdir -p "$TMP/home"
+OUT=$(env $INSTALL_ENV BLAZAR_VERSION=0.9.9 sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
+if [ "$RC" = 0 ] && [ -x "$SYSTEM_BIN/blazar" ] &&
+   echo "$OUT" | grep -q "installed artifact: release ${PIN_TAG}"; then
+    ok "bare semver pin resolved the v-tag and labeled it"
+else
+    bad "bare semver pin failed (rc=$RC)"; echo "$OUT" | sed 's/^/    /'
+fi
+
+# --- 15. unknown pinned tag teaches 'not found', not 'network down' ---------
+rm -rf "$SYSTEM_BIN" "$UNIT_OUT" "${TMP:?}/home"
+mkdir -p "$TMP/home"
+OUT=$(env $INSTALL_ENV BLAZAR_VERSION=nosuchtag sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
+if [ "$RC" != 0 ] && [ ! -e "$SYSTEM_BIN/blazar" ] &&
+   echo "$OUT" | grep -q "not found" &&
+   echo "$OUT" | grep -q "list them" &&
+   ! echo "$OUT" | grep -q "network up"; then
+    ok "unknown pinned tag: 404 teaching with tag-listing remedy"
+else
+    bad "unknown pinned tag taught the wrong remedy (rc=$RC)"; echo "$OUT" | sed 's/^/    /'
 fi
 
 echo "install e2e: $PASS passed, $FAIL failed"

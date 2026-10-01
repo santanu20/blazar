@@ -336,7 +336,11 @@ fn e2e__upgrade_with_running_daemon_systemd_lane_restarts_it() {
             .success()
             .stdout(predicates::str::contains(
                 "daemon restarted — the update is live",
-            ));
+            ))
+            // The fake serves v0.1.3, older than the running binary —
+            // the summary must name the downgrade instead of rolling
+            // back silently.
+            .stdout(predicates::str::contains("downgrade from"));
     });
 
     let log = std::fs::read_to_string(&iso.shim_log).unwrap();
