@@ -204,6 +204,30 @@ stab_clean = bm.speed_table(
 assert "NOT comparable" not in stab_clean, stab_clean
 print("speed_table: reference_note caveat rendered when present, absent otherwise OK")
 
+# --- watt efficiency: tok/s per W column, value or '-' when unmeasured
+assert "tok/s per W" in stab_clean, stab_clean
+watted = bm.speed_table(
+    [
+        rec(
+            "ollama",
+            {},
+            tag="ollama-host",
+            ollama_model="same",
+            decode_tps_p50=40.0,
+            decode_tps_per_w=0.312,
+        )
+    ]
+)
+assert "0.312" in watted, watted
+wattless_row = next(ln for ln in stab_clean.splitlines() if ln.startswith("| ollama "))
+assert wattless_row.split("|")[4].strip() == "-", (
+    stab_clean,
+    "unmeasured power must render '-' in the tok/s-per-W column, not a number",
+)
+hdr_cells = stab_clean.splitlines()[0].split("|")
+assert len(hdr_cells) == len(wattless_row.split("|")), stab_clean
+print("speed_table: tok/s per W column (value rendered, '-' unmeasured) OK")
+
 # --- F6b: cold-start table drops cells with no cold fields and labels configs
 cold_ok = rec(
     "blazar",
@@ -497,7 +521,9 @@ reshape_no = rec(
     timeline_samples=150,
 )
 rtab = bm.reshape_table([reshape_ok, reshape_no])
-assert "| Runtime | reshape | slots |" in rtab and "1->8" in rtab and "142" in rtab, rtab
+assert "| Runtime | reshape | slots |" in rtab and "1->8" in rtab and "142" in rtab, (
+    rtab
+)
 assert "11800->940" in rtab and "39->91" in rtab and "| 0 |" in rtab, rtab
 assert "NO" in rtab, "unobserved reshape must render NO"
 assert bm.reshape_table([]) == "_Not measured._"

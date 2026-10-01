@@ -10,8 +10,11 @@ through the sandboxed gateway, measuring:
              TRUE prefill t/s (prompt tokens / first-token time) with
              cache-hit variants, token counts from `usage` where the
              server provides it (chunks only as fallback)
-  resources  peak RSS, peak GPU memory, peak GPU power, load time
-             (spawn->healthy), teardown-verified VRAM return
+   resources  peak RSS, peak GPU memory, peak GPU power, load time
+              (spawn->healthy), teardown-verified VRAM return
+   efficiency decode tok/s per watt (suite-window gross: time-integrated
+              GPU power.draw avg + energy J from the same sampler; '-'
+              where no power meter exists)
   serving    greedy-parity text quality vs the SAME-engine direct
              reference (backend numerics) AND gateway-transparency
              parity (blazar path vs direct path, same engine),
@@ -633,6 +636,11 @@ class Sampler(threading.Thread):
         self.gpu_base_mib = -1.0
         self.gpu_power_peak_w = 0.0
         self.gpu_power_base_w = -1.0
+        # power.draw samples for time-integrated efficiency (tok/s per W):
+        # appended on the sampler thread, snapshotted from the bench thread
+        self._power_samples: list[float] = []
+        self._power_lock = threading.Lock()
+        self._t_first_power: float | None = None
         self._tick = 0
 
     def _rss(self) -> float:
@@ -645,24 +653,63 @@ class Sampler(threading.Thread):
         except OSError:
             return 0.0
 
-    def _gpu(self) -> tuple[float, float]:
+    def _gpu(self) -> tuple[float, float] | None:
         rows = _gpu_query("memory.used,power.draw")
         if not rows:
-            return 0.0, 0.0
+            # no NVIDIA GPU / no nvidia-smi: unmeasured, not zero
+            return None
         return max(r[0] for r in rows), max(r[1] for r in rows)
 
     def run(self) -> None:
         while not self.stop_evt.is_set():
             self.rss_peak_mib = max(self.rss_peak_mib, self._rss())
             if self._tick % 3 == 0:
-                g, w = self._gpu()
-                if self.gpu_base_mib < 0:
-                    self.gpu_base_mib = g
-                    self.gpu_power_base_w = w
-                self.gpu_peak_mib = max(self.gpu_peak_mib, g)
-                self.gpu_power_peak_w = max(self.gpu_power_peak_w, w)
+                snap = self._gpu()
+                if snap is not None:
+                    g, w = snap
+                    with self._power_lock:
+                        if self._t_first_power is None:
+                            self._t_first_power = time.monotonic()
+                            self.gpu_base_mib = g
+                            self.gpu_power_base_w = w
+                        self._power_samples.append(w)
+                    self.gpu_peak_mib = max(self.gpu_peak_mib, g)
+                    self.gpu_power_peak_w = max(self.gpu_power_peak_w, w)
             self._tick += 1
             self.stop_evt.wait(self.interval)
+
+    def power_stats(self) -> tuple[float, float]:
+        """(avg W, energy J) over the sampled window; (0.0, 0.0) unmeasured.
+
+        Window = first successful power sample -> this call, so energy is a
+        right-censored integral of the cell's sampled life (~1.2 s cadence).
+        """
+        with self._power_lock:
+            samples = list(self._power_samples)
+            t0 = self._t_first_power
+        if not samples:
+            return 0.0, 0.0
+        avg_w = sum(samples) / len(samples)
+        return avg_w, avg_w * (time.monotonic() - t0)
+
+
+def finalize_power(rec: dict, sampler: Sampler) -> None:
+    """Fold sampler power telemetry into a cell record.
+
+    avg W + energy J + decode_tps_per_w are suite-window gross figures —
+    the window spans engine load as well as generation, so tok/s per W is
+    a per-cell efficiency grade, not a steady-state claim. Unmeasured
+    power (no NVIDIA GPU / no nvidia-smi) leaves the fields absent; the
+    report renders them as '-'.
+    """
+    rec["gpu_power_peak_w"] = round(sampler.gpu_power_peak_w, 1)
+    avg_w, energy_j = sampler.power_stats()
+    if avg_w > 0.0:
+        rec["gpu_power_avg_w"] = round(avg_w, 1)
+        rec["gpu_energy_j"] = round(energy_j, 0)
+        decode_tps = rec.get("decode_tps_p50")
+        if decode_tps:
+            rec["decode_tps_per_w"] = round(decode_tps / avg_w, 3)
 
 
 def gpu_used_mib() -> float:
@@ -2540,7 +2587,7 @@ def run_direct_cell(
         rec["rss_peak_mib"] = round(sampler.rss_peak_mib, 1)
         rec["gpu_peak_mib"] = round(sampler.gpu_peak_mib, 1)
         rec["gpu_base_mib"] = round(sampler.gpu_base_mib, 1)
-        rec["gpu_power_peak_w"] = round(sampler.gpu_power_peak_w, 1)
+        finalize_power(rec, sampler)
     finally:
         rec.update(teardown_proc(proc, sampler))
     return rec
@@ -2875,7 +2922,7 @@ def run_blazar_cell(
         finally:
             rec["gpu_peak_mib"] = round(sampler.gpu_peak_mib, 1)
             rec["gpu_base_mib"] = round(sampler.gpu_base_mib, 1)
-            rec["gpu_power_peak_w"] = round(sampler.gpu_power_peak_w, 1)
+            finalize_power(rec, sampler)
             rec["rss_peak_mib"] = round(sampler.rss_peak_mib, 1)
             daemon.stop()
             # forensic tail: the sandbox is destroyed below — keep the
@@ -2979,7 +3026,7 @@ def run_conc_axis_cell(
                 return rec
         finally:
             rec["gpu_peak_mib"] = round(sampler.gpu_peak_mib, 1)
-            rec["gpu_power_peak_w"] = round(sampler.gpu_power_peak_w, 1)
+            finalize_power(rec, sampler)
             rec["rss_peak_mib"] = round(sampler.rss_peak_mib, 1)
             daemon.stop()
             dlog = Path(sb.data_dir) / "run" / "daemon.log"
@@ -4070,7 +4117,7 @@ def run_ollama_cold_cell(
         rec["ollama_cold_prompt_tokens"] = m.get("prompt_tokens")
         rec["gpu_peak_mib"] = round(sampler.gpu_peak_mib, 1)
         rec["gpu_base_mib"] = round(sampler.gpu_base_mib, 1)
-        rec["gpu_power_peak_w"] = round(sampler.gpu_power_peak_w, 1)
+        finalize_power(rec, sampler)
     finally:
         sampler.stop_evt.set()
         sampler.join(timeout=2.0)
@@ -4113,8 +4160,8 @@ def run_ollama_cell(cfg: dict, args_model: str | None = None) -> dict:
             ),
             "gpu_peak_mib": round(sampler.gpu_peak_mib, 1),
             "gpu_base_mib": round(sampler.gpu_base_mib, 1),
-            "gpu_power_peak_w": round(sampler.gpu_power_peak_w, 1),
         }
+        finalize_power(out, sampler)
     finally:
         sampler.stop_evt.set()
         sampler.join(timeout=2.0)
@@ -5117,6 +5164,8 @@ def write_speed_table(records: list[dict], path: Path) -> None:
         "load_s",
         "gpu_peak_mib",
         "gpu_power_peak_w",
+        "gpu_power_avg_w",
+        "decode_tps_per_w",
         "rss_peak_mib",
         "tokens_source",
     ]
@@ -5144,6 +5193,8 @@ def write_speed_table(records: list[dict], path: Path) -> None:
                     fmt(r.get("load_s")),
                     fmt(round(r.get("gpu_peak_mib", 0))),
                     fmt(r.get("gpu_power_peak_w")),
+                    fmt(r.get("gpu_power_avg_w")),
+                    fmt(r.get("decode_tps_per_w")),
                     fmt(round(r.get("rss_peak_mib", 0))),
                     r.get("tokens_source", "-"),
                 ]
@@ -6814,6 +6865,7 @@ def speed_table(recs: list[dict]) -> str:
                     speed_row_name(r, f"blazar gateway - {engine_label(r['tag'])}"),
                     child_shape(r) or "engine-scheduled",
                     r.get("decode_tps_p50"),
+                    r.get("decode_tps_per_w"),
                     r.get("ttft_ms_p50"),
                     r.get("ttft_ms_p99"),
                     r.get("itl_p50_ms"),
@@ -6836,6 +6888,7 @@ def speed_table(recs: list[dict]) -> str:
                     f"direct engine - {engine_label(r['tag'])}",
                     "1x16384",
                     r.get("decode_tps_p50"),
+                    r.get("decode_tps_per_w"),
                     r.get("ttft_ms_p50"),
                     r.get("ttft_ms_p99"),
                     r.get("itl_p50_ms"),
@@ -6858,6 +6911,7 @@ def speed_table(recs: list[dict]) -> str:
                     ollama_name,
                     "service",
                     r.get("decode_tps_p50"),
+                    r.get("decode_tps_per_w"),
                     r.get("ttft_ms_p50"),
                     r.get("ttft_ms_p99"),
                     r.get("itl_p50_ms"),
@@ -6869,14 +6923,15 @@ def speed_table(recs: list[dict]) -> str:
                 )
             )
     head = (
-        "| Runtime | slots x ctx | decode t/s | TTFT p50 ms | TTFT p99 ms | ITL p50 ms |"
-        " ITL p99 ms | prefill cold t/s | prefill cached t/s | GPU peak MiB | GPU power W |"
+        "| Runtime | slots x ctx | decode t/s | tok/s per W | TTFT p50 ms | TTFT p99 ms |"
+        " ITL p50 ms | ITL p99 ms | prefill cold t/s | prefill cached t/s | GPU peak MiB |"
+        " GPU power W |"
     )
-    sep = "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+    sep = "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     body = [
-        f"| {n} | {s} | {pfmt(d)} | {pfmt(t5)} | {pfmt(t9)} | {pfmt(i5)} | {pfmt(i9)} |"
-        f" {pfmt(pc)} | {pfmt(pk)} | {pfmt(g, 0)} | {pfmt(pw)} |"
-        for n, s, d, t5, t9, i5, i9, pc, pk, g, pw in rows
+        f"| {n} | {s} | {pfmt(d)} | {pfmt(e, 3)} | {pfmt(t5)} | {pfmt(t9)} | {pfmt(i5)} |"
+        f" {pfmt(i9)} | {pfmt(pc)} | {pfmt(pk)} | {pfmt(g, 0)} | {pfmt(pw)} |"
+        for n, s, d, e, t5, t9, i5, i9, pc, pk, g, pw in rows
     ]
     return "\n".join([head, sep, *body])
 
@@ -7827,6 +7882,7 @@ def ctxcurve_table(recs: list[dict]) -> str:
                     f"blazar - {engine_label(r['tag'])}",
                     r.get("ctx"),
                     r.get("decode_tps_p50"),
+                    r.get("decode_tps_per_w"),
                     r.get("ttft_ms_p50"),
                 )
             )
@@ -7836,6 +7892,7 @@ def ctxcurve_table(recs: list[dict]) -> str:
                     f"ollama - {r.get('ollama_model', 'reference')}",
                     r.get("ctx"),
                     r.get("decode_tps_p50"),
+                    r.get("decode_tps_per_w"),
                     r.get("ttft_ms_p50"),
                 )
             )
