@@ -19,9 +19,7 @@ OpenAI · Ollama · Anthropic compatible &nbsp;·&nbsp; Multi-engine &nbsp;·&nb
 
 <div align="center">
 
-![Blazar in action](docs/assets/blazar-demo.svg)
-
-*Live CLI session: model serving, resource decisions, and request diagnostics in one place.*
+<img src="docs/assets/blazar-logo.png" width="280" alt="Blazar logo">
 
 **[Get started in 60 seconds](#60-second-quickstart)** &nbsp;·&nbsp; **[See benchmark evidence](#benchmark-snapshot)** &nbsp;·&nbsp; **[Read the API reference](docs/4.API_SPEC.md)**
 
@@ -44,6 +42,7 @@ OpenAI · Ollama · Anthropic compatible &nbsp;·&nbsp; Multi-engine &nbsp;·&nb
 - [Multi-engine serving](#multi-engine-serving)
 - [Resource-aware scheduling](#resource-aware-scheduling)
 - [Advanced request orchestration](#advanced-request-orchestration)
+- [Advanced feature index](#advanced-feature-index)
 - [Multimodal workloads](#multimodal-workloads)
 - [Sessions, cache, and warm starts](#sessions-cache-and-warm-starts)
 - [Diagnostics and observability](#diagnostics-and-observability)
@@ -114,6 +113,7 @@ The underlying engines still perform inference. **Blazar is the control plane ar
 |---|---|
 | **One gateway** | OpenAI-, Ollama-, and Anthropic-compatible APIs |
 | **Multiple runtimes** | llama.cpp, mistral.rs, SGLang, stable-diffusion.cpp, whisper.cpp, and piper |
+| **Measured auto-tuning** | Speculative decoding, KV-cache quantization, and flash attention selected per hardware by benchmarked rules, not guesswork |
 | **Resource control** | VRAM/KV fit, slots, admission, co-residency, and lifecycle management |
 | **Model operations** | Pull, import, inspect, pin, tune, snapshot, and restore |
 | **Production controls** | API keys, TLS, CORS, audit logging, metrics, traces, and diagnostics |
@@ -130,6 +130,8 @@ Blazar is useful when local inference has outgrown the "run one server for one m
 | Multiple applications use different APIs | One gateway supports **OpenAI, Ollama, and Anthropic** compatible surfaces. |
 | Different models need different runtimes | Capability-aware lanes across **llama.cpp, mistral.rs, SGLang, stable-diffusion.cpp, whisper.cpp, and piper**. |
 | GPU memory and context are difficult to manage | Fit planning, KV-aware sizing, slots, admission control, and co-residency planning. |
+| Local serving leaves speed and efficiency behind | Auto-tuned posture — speculative decoding, KV quantization ladder, flash attention — chosen per hardware from measured rules, with built-in tok/s-per-watt benchmarking to prove the result. |
+| Restarts and reloads cost minutes | Session checkpoints restore conversational state, and warm-on-pull avoids the first-request cold path. |
 | Models and engines become operationally messy | One CLI, model store, engine store, configuration surface, and lifecycle manager. |
 | Engine updates can introduce regressions | Verified side-by-side installs, probing, regression gates, explicit activation, and rollback. |
 | Failures are hard to diagnose | `doctor`, `why`, `watch`, metrics, trace IDs, and actionable errors. |
@@ -228,29 +230,12 @@ For the complete methodology, full result tables, and raw campaign receipts, see
 
 ## Where does it fit?
 
-### Local development
-
-Keep application code pointed at one endpoint while swapping models or engine lanes underneath it.
-
-### Personal AI workstation
-
-Run several models on one machine while keeping VRAM, slots, model residency, and idle eviction under one policy.
-
-### Agent and CLI systems
-
-Use `blazar launch <command>` so local tools can use the same gateway and configuration instead of maintaining separate endpoint setup.
-
-### Homelab and internal services
-
-Start with loopback-only access, then add authentication, TLS, CORS, metrics, and audit controls when the gateway needs to serve more than one process or host.
-
-### Multimodal local AI
-
-Manage text, embeddings, image generation, video generation, transcription, and offline TTS through the same operational model.
-
-### Heterogeneous hardware
-
-Use capability-aware engine selection, multi-GPU placement, or supported RPC offload where one local machine is not the whole serving topology.
+- **Local development** — keep application code pointed at one endpoint while models and engine lanes swap underneath.
+- **Personal AI workstation** — several models on one machine, with VRAM, slots, residency, and idle eviction under one policy.
+- **Agents and CLI tools** — `blazar launch <command>` gives every local tool the same gateway and configuration.
+- **Homelab and internal services** — start loopback-only; add authentication, TLS, CORS, metrics, and audit as you grow.
+- **Multimodal local AI** — text, embeddings, image, video, transcription, and TTS through the same operational model.
+- **Heterogeneous hardware** — capability-aware engine selection, multi-GPU placement, and supported RPC offload.
 
 ---
 
@@ -556,6 +541,30 @@ For supported Ollama-compatible requests, `cascade` can try a smaller or cheaper
 These features are useful for agentic systems that want to trade extra candidate computation for better answer quality or a lower average serving cost.
 
 See [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md) for exact endpoint support and constraints.
+
+---
+
+## Advanced feature index
+
+Every advanced capability is on by default unless noted, and each has full documentation one link away.
+
+| Feature | What it gives you | Details |
+|---|---|---|
+| **Speculative decoding** | Automatic n-gram self-speculation with a persistent lookup cache; optional draft models for faster lanes | [`docs/7.SETUP.md`](docs/7.SETUP.md#speculative-decoding) |
+| **KV-cache quantization** | Automatic K/V grade ladder with context autofit — VRAM headroom and longer contexts without manual tuning | [`docs/7.SETUP.md`](docs/7.SETUP.md#memory-kv--context) |
+| **Flash attention** | Enabled automatically where the engine build supports it | [`docs/7.SETUP.md`](docs/7.SETUP.md) |
+| **Multi-GPU sharding** | Automatic tensor parallelism with rank pinning; explicit pins always win | [`docs/7.SETUP.md`](docs/7.SETUP.md#multi-gpu-sharding--admission) |
+| **Admission and queueing** | Bounded concurrency under saturation — parks or refuses requests rather than destabilizing latency | [`docs/7.SETUP.md`](docs/7.SETUP.md#multi-gpu-sharding--admission) |
+| **Federation** | Peer Blazar gateways behind one endpoint: explicit remote routing, least-busy selection, and fallback | [`docs/7.SETUP.md`](docs/7.SETUP.md#federation-peers-behind-one-gateway) |
+| **Warm starts and session bank** | Session checkpoints survive unload and restart; conversation-prefix routing keeps hot KV where the next request needs it | [Sessions, cache, and warm starts](#sessions-cache-and-warm-starts) |
+| **Request deduplication** | Identical concurrent requests collapse into one computation (`singleflight`) | [`docs/6.BUSINESS_RULES.md`](docs/6.BUSINESS_RULES.md) |
+| **Structured output** | Schema- and grammar-constrained generation across API dialects | [`docs/7.SETUP.md`](docs/7.SETUP.md#structured-output-across-dialects) |
+| **Tool calling** | Native tool-call translation across the OpenAI-, Ollama-, and Anthropic-compatible surfaces | [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md) |
+| **Reasoning budget** | Per-model and per-request thinking-budget control for reasoning models | [`docs/7.SETUP.md`](docs/7.SETUP.md#reasoning--thinking) |
+| **Best-of-N and cascade** | Per-request quality and cost ladders (above) | [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md) |
+| **Multimodal projector placement** | Vision projectors are detected and offloaded automatically so image understanding does not crowd the text hot path | [`docs/7.SETUP.md`](docs/7.SETUP.md) |
+| **Load modes** | `mlock`/`mmap` posture per model — resident serving or fast swap, chosen by the planner | [`docs/7.SETUP.md`](docs/7.SETUP.md) |
+| **Idle lifecycle** | Idle sleep, eviction, and watchdog monitoring keep unused capacity cheap | [Safe engine lifecycle](#safe-engine-lifecycle) |
 
 ---
 
@@ -938,6 +947,7 @@ The README is the **product entry point**. Detailed operational and implementati
 | [`docs/7.SETUP.md`](docs/7.SETUP.md) | Installation, deployment, environment, and configuration |
 | [`docs/8.DO_NOT_BREAK.md`](docs/8.DO_NOT_BREAK.md) | Maintainer invariants and compatibility rules |
 | [`docs/9.USAGE.md`](docs/9.USAGE.md) | End-user workflows and troubleshooting |
+| [`docs/assets/blazar-logo.png`](docs/assets/blazar-logo.png) | Project logo |
 | [`docs/assets/blazar-demo.svg`](docs/assets/blazar-demo.svg) | Captured CLI demo |
 | [`docs/10.SCIENTIFIC.md`](docs/10.SCIENTIFIC.md) | VRAM/KV math, GGUF parsing, and numerical methods |
 | [`BENCHMARK.md`](BENCHMARK.md) | Benchmark methodology and results |
