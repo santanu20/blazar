@@ -461,6 +461,16 @@ enum Cmd {
         #[arg(long, conflicts_with = "trace")]
         watch: bool,
     },
+    /// Explain the effective configuration for a model: engine lane,
+    /// context provenance, slots, speculation, caches — every value
+    /// names its source
+    Explain {
+        /// Model to explain (store name; aliases resolve daemon-side)
+        model: String,
+        /// Emit the raw daemon card as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Live tail of sentinel detections as they happen (Ctrl-C to stop)
     Watch,
 }
@@ -787,7 +797,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "completions",
         ],
     ),
-    ("Observability", &["why", "watch"]),
+    ("Observability", &["why", "explain", "watch"]),
     (
         "Refused by design (local-only)",
         &["push", "signin", "login", "signout", "logout"],
@@ -1663,6 +1673,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                 .await
             }
         }
+        Cmd::Explain { model, json } => explain(&model, json).await,
         Cmd::Watch => watch().await,
     }
 }
@@ -6596,6 +6607,194 @@ async fn why(
         print_record(r);
     }
     Ok(())
+}
+
+/// `blazar explain <model>` — the effective-config card from the live
+/// daemon (`GET /api/explain/{model}`). Daemon-required like `why`/`ps`:
+/// half the card (effective ctx, live slots, spawn receipts) only exists
+/// in a running daemon, and a stale offline estimate would be exactly the
+/// confusion explain exists to kill.
+async fn explain(model: &str, json: bool) -> Result<()> {
+    let base = ensure_daemon().await?;
+    let url = format!("{base}/api/explain/{}", encode_path_segment(model));
+    let resp = cli_http()
+        .get(&url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("daemon: {text}"));
+    }
+    let v: serde_json::Value = resp.json().await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        print!("{}", render_explain_card(&v));
+    }
+    Ok(())
+}
+
+/// Percent-encode ONE path segment: model names may contain `:` or `/`
+/// (HF-style `owner/repo:Q4` shapes) that would otherwise split the
+/// route. Alphanumeric plus `-_.~` stay literal (RFC 3986 unreserved).
+fn encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Render the daemon's explain card as the scannable text block. Pure —
+/// unit-testable without a daemon. Unknowns print as `unknown` with the
+/// daemon's own source/limitation lines; nothing is invented here.
+fn render_explain_card(v: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let line = |s: &mut String, k: &str, val: String| {
+        let _ = writeln!(s, "  {k:<14}{val}");
+    };
+    let or_unknown =
+        |x: &serde_json::Value| x.as_str().map_or_else(|| "unknown".into(), str::to_string);
+
+    let m = &v["model"];
+    let _ = writeln!(s, "MODEL");
+    line(&mut s, "name", or_unknown(&m["name"]));
+    line(
+        &mut s,
+        "size",
+        format!(
+            "{}  quant={}  arch={}  format={}",
+            m["bytes"]
+                .as_i64()
+                .map(humansize)
+                .unwrap_or_else(|| "unknown".into()),
+            or_unknown(&m["quant"]),
+            or_unknown(&m["arch"]),
+            or_unknown(&m["format"]),
+        ),
+    );
+
+    let e = &v["engine"];
+    let _ = writeln!(s, "\nENGINE");
+    line(
+        &mut s,
+        "lane",
+        format!("{} ({})", or_unknown(&e["tag"]), or_unknown(&e["kind"])),
+    );
+    line(&mut s, "source", or_unknown(&e["source"]));
+    line(&mut s, "reason", or_unknown(&e["reason"]));
+
+    let c = &v["context"];
+    let _ = writeln!(s, "\nCONTEXT");
+    line(
+        &mut s,
+        "requested",
+        format!(
+            "{}  ({})",
+            c["requested"]
+                .as_u64()
+                .map_or_else(|| "unknown".into(), |n| n.to_string()),
+            or_unknown(&c["requested_source"]),
+        ),
+    );
+    line(
+        &mut s,
+        "effective",
+        format!(
+            "{}  ({})",
+            c["effective"]
+                .as_u64()
+                .map_or_else(|| "unknown".into(), |n| n.to_string()),
+            or_unknown(&c["effective_source"]),
+        ),
+    );
+    line(&mut s, "limitation", or_unknown(&c["limitation"]));
+
+    let sl = &v["slots"];
+    let _ = writeln!(s, "\nSLOTS");
+    line(
+        &mut s,
+        "live",
+        sl["live"]
+            .as_u64()
+            .map_or_else(|| "not resident".into(), |n| n.to_string()),
+    );
+    line(
+        &mut s,
+        "in_flight",
+        sl["live_in_flight"].as_i64().unwrap_or(0).to_string(),
+    );
+    line(
+        &mut s,
+        "adaptive",
+        sl["adaptive_slots"]
+            .as_bool()
+            .map_or_else(|| "unknown".into(), |b| b.to_string()),
+    );
+
+    let sp = &v["speculation"];
+    let _ = writeln!(s, "\nSPECULATION");
+    line(&mut s, "mode", or_unknown(&sp["mode"]));
+    line(
+        &mut s,
+        "draft",
+        sp["draft_model"]
+            .as_str()
+            .map_or_else(|| "none".into(), str::to_string),
+    );
+    line(&mut s, "source", or_unknown(&sp["source"]));
+
+    let ca = &v["cache"];
+    let sem = &ca["semantic_cache"];
+    let _ = writeln!(s, "\nCACHE");
+    line(
+        &mut s,
+        "kv",
+        format!("{}/{}", or_unknown(&ca["kv_k"]), or_unknown(&ca["kv_v"])),
+    );
+    line(
+        &mut s,
+        "semantic",
+        format!(
+            "{}{}",
+            if sem["enabled"].as_bool().unwrap_or(false) {
+                "on"
+            } else {
+                "off"
+            },
+            sem["model"]
+                .as_str()
+                .map(|n| format!(" (model: {n})"))
+                .unwrap_or_default(),
+        ),
+    );
+
+    if let Some(res) = v["residents"].as_array().filter(|r| !r.is_empty()) {
+        let _ = writeln!(s, "\nRESIDENTS");
+        for r in res {
+            let _ = writeln!(
+                s,
+                "  {}  state={} slots={} ctx={} in_flight={}",
+                or_unknown(&r["engine"]),
+                or_unknown(&r["state"]),
+                r["slots"]
+                    .as_u64()
+                    .map_or_else(|| "?".into(), |n| n.to_string()),
+                r["ctx"]
+                    .as_u64()
+                    .map_or_else(|| "?".into(), |n| n.to_string()),
+                r["in_flight"].as_i64().unwrap_or(0),
+            );
+        }
+    }
+    s
 }
 
 /// One compact observation line + detection/retry lines (why + watch).
@@ -12870,6 +13069,79 @@ mod tests {
         let (ms, seq) = b.split_once('-').expect("millis-seq format");
         assert!(ms.len() >= 13, "millisecond epoch prefix: {ms}");
         assert!(!seq.is_empty() && seq.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn unit__encode_path_segment__percent_encodes_non_unreserved() {
+        assert_eq!(encode_path_segment("qwen3-8b"), "qwen3-8b");
+        assert_eq!(encode_path_segment("a/b:c d"), "a%2Fb%3Ac%20d");
+        // Colon is the repo's alias separator — it MUST be encoded or the
+        // /api/explain route would split names like "qwen3:8b" mid-segment.
+        assert_eq!(encode_path_segment("qwen3:8b"), "qwen3%3A8b");
+    }
+
+    #[test]
+    fn unit__render_explain_card__sections_sources_and_unknown_honesty() {
+        let card = serde_json::json!({
+            "model": {"name": "qwen3-8b", "bytes": 8_000_000_000i64, "quant": "q4_k_m",
+                      "arch": "qwen3", "format": "gguf"},
+            "engine": {"tag": "cuda-lane", "kind": "llamacpp", "source": "auto",
+                       "reason": "GGUF + supported architecture"},
+            "context": {"requested": 65536, "requested_source": "model_overrides.qwen3-8b.ctx",
+                        "effective": 32768, "effective_source": "live child argv",
+                        "limitation": "shrunk to fit the VRAM/KV budget"},
+            "slots": {"live": 4, "live_in_flight": 2, "adaptive_slots": true},
+            "speculation": {"mode": "ngram", "draft_model": null, "source": "config"},
+            "cache": {"kv_k": "q8_0", "kv_v": "auto ladder",
+                      "semantic_cache": {"enabled": true, "model": "all-minilm"}},
+            "residents": [{"engine": "llamacpp", "state": "ready", "slots": 4,
+                           "ctx": 32768, "in_flight": 2}],
+        });
+        let out = render_explain_card(&card);
+        for header in [
+            "MODEL",
+            "ENGINE",
+            "CONTEXT",
+            "SLOTS",
+            "SPECULATION",
+            "CACHE",
+            "RESIDENTS",
+        ] {
+            assert!(
+                out.starts_with(&format!("{header}\n")) || out.contains(&format!("\n{header}\n")),
+                "missing {header} section:\n{out}"
+            );
+        }
+        assert!(out.contains("qwen3-8b"));
+        assert!(out.contains("model_overrides.qwen3-8b.ctx"));
+        assert!(out.contains("live child argv"));
+        assert!(out.contains("shrunk to fit the VRAM/KV budget"));
+        assert!(out.contains("32768"));
+        assert!(out.contains("q8_0/auto ladder"));
+        assert!(out.contains("on (model: all-minilm)"));
+        assert!(out.contains("state=ready slots=4 ctx=32768 in_flight=2"));
+    }
+
+    #[test]
+    fn unit__render_explain_card__unknowns_print_as_unknown_not_blank() {
+        // Cold model: no lane resolved, nothing resident — the card must
+        // say unknown/not resident/none, never invent values.
+        let out = render_explain_card(&serde_json::json!({
+            "model": {"name": "m"},
+            "engine": {"source": "error",
+                       "reason": "no engine installed — blazar engine install --kind <kind>"},
+            "context": {"requested": 4096, "requested_source": "config default_ctx = 4096"},
+        }));
+        assert!(out.contains("MODEL"));
+        assert!(out.contains("unknown"));
+        assert!(out.contains("no engine installed"));
+        assert!(out.contains("not resident"));
+        assert!(out.contains("none"));
+        assert!(out.contains("off"));
+        assert!(
+            !out.contains("RESIDENTS"),
+            "empty residents must not render a section"
+        );
     }
 
     /// Minimal model row for lora-attach admission tests: only `path`

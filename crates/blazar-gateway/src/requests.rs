@@ -39,7 +39,7 @@ use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
-use futures::stream::{StreamExt, unfold};
+use futures::stream::{unfold, StreamExt};
 use tokio::sync::watch;
 
 use crate::keys::KeyCtx;
@@ -203,10 +203,7 @@ impl RequestCard {
         }
         let finished = self.finished_ms.load(Ordering::Acquire);
         if started > 0 && finished >= started {
-            obj.insert(
-                "compute_time_ms".into(),
-                (finished - started).into(),
-            );
+            obj.insert("compute_time_ms".into(), (finished - started).into());
             obj.insert("finished_at".into(), (finished / 1000).into());
         }
         let status = self.status.load(Ordering::Acquire);
@@ -296,10 +293,14 @@ impl RequestRuntime {
         if entry.card.is_terminal() {
             return StopOutcome::AlreadyFinished(self.card_payload(&entry.card));
         }
-        entry
-            .card
-            .stop
-            .store(if interrupt { STOP_INTERRUPT } else { STOP_CANCEL }, Ordering::Release);
+        entry.card.stop.store(
+            if interrupt {
+                STOP_INTERRUPT
+            } else {
+                STOP_CANCEL
+            },
+            Ordering::Release,
+        );
         let _ = entry.tx.send(true);
         StopOutcome::Live(self.card_payload(&entry.card))
     }
@@ -325,9 +326,7 @@ impl RequestRuntime {
 
     fn terminal_payload(&self, id: &str) -> Option<serde_json::Value> {
         let ring = self.terminal.lock().expect("terminal ring lock");
-        ring.iter()
-            .find(|c| c.id == id)
-            .map(|c| c.payload(false))
+        ring.iter().find(|c| c.id == id).map(|c| c.payload(false))
     }
 
     /// Listing: live cards (oldest first) + terminal ring (newest first).
@@ -373,26 +372,24 @@ impl RequestRuntime {
 fn matches_key(card: &RequestCard, filter: Option<&str>) -> bool {
     match filter {
         None => true,
-        Some(want) => {
-            card.key
-                .lock()
-                .expect("card key lock")
-                .as_deref()
-                .is_some_and(|k| k == want)
-        }
+        Some(want) => card
+            .key
+            .lock()
+            .expect("card key lock")
+            .as_deref()
+            .is_some_and(|k| k == want),
     }
 }
 
 fn matches_model(card: &RequestCard, filter: Option<&str>) -> bool {
     match filter {
         None => true,
-        Some(want) => {
-            card.model
-                .lock()
-                .expect("card model lock")
-                .as_deref()
-                .is_some_and(|m| m == want)
-        }
+        Some(want) => card
+            .model
+            .lock()
+            .expect("card model lock")
+            .as_deref()
+            .is_some_and(|m| m == want),
     }
 }
 
@@ -574,7 +571,9 @@ impl Drop for Fin {
         // early = the client went away.
         if !self.card.is_terminal() {
             self.card.state.store(STATE_DISCONNECTED, Ordering::Release);
-            self.card.finished_ms.store(now_unix_ms(), Ordering::Release);
+            self.card
+                .finished_ms
+                .store(now_unix_ms(), Ordering::Release);
         }
         self.state.requests.retire(&self.card);
     }

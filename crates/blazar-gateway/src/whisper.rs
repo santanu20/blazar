@@ -564,7 +564,9 @@ fn submit_async(
             "translate": force_translate,
         }),
     );
-    state.jobs.record_input_artifact(&id, file.filename.as_deref(), &file.data);
+    state
+        .jobs
+        .record_input_artifact(&id, file.filename.as_deref(), &file.data);
     let task_id = id.clone();
     let task_state = Arc::clone(state);
     let bin = bin.to_path_buf();
@@ -702,10 +704,7 @@ pub async fn audio_jobs_cancel(
             .flatten();
         match fresh {
             Some(fresh) => axum::Json(crate::jobs::row_payload(&fresh)).into_response(),
-            None => openai_error(
-                404,
-                "job not found — durable records live at /v1/jobs/{id}",
-            ),
+            None => openai_error(404, "job not found — durable records live at /v1/jobs/{id}"),
         }
     } else {
         openai_error(

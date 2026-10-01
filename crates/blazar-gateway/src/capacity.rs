@@ -114,10 +114,7 @@ fn parse_compute_apps(text: &str) -> Vec<(u32, u64)> {
         .filter_map(|ln| {
             let mut parts = ln.split(',').map(str::trim);
             let pid: u32 = parts.next()?.parse().ok()?;
-            let mib: u64 = parts
-                .next()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
+            let mib: u64 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
             Some((pid, mib))
         })
         .collect()

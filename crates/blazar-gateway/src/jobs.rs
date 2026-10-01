@@ -112,10 +112,7 @@ impl JobRuntime {
             created_at: now,
             updated_at: now,
         };
-        if let Some(err) = state
-            .with_store(|s| s.insert_job(&row).err())
-            .flatten()
-        {
+        if let Some(err) = state.with_store(|s| s.insert_job(&row).err()).flatten() {
             tracing::warn!(target: "blazar::jobs", job = %id, %err, "job ledger insert failed — live lane continues, record not durable");
         }
     }
@@ -150,8 +147,9 @@ impl JobRuntime {
     /// `AudioJobs::payload` serves); larger ones become artifact files
     /// with a stub envelope so the row stays small.
     pub fn record_completed(&self, state: &AppState, id: &str, body: &[u8], content_type: &str) {
-        let inline = serde_json::from_slice::<serde_json::Value>(body)
-            .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(body).into_owned()));
+        let inline = serde_json::from_slice::<serde_json::Value>(body).unwrap_or_else(|_| {
+            serde_json::Value::String(String::from_utf8_lossy(body).into_owned())
+        });
         let serialized = serde_json::to_string(&inline).unwrap_or_default();
         let (result_json, artifact_path) = if serialized.len() <= INLINE_RESULT_CAP_BYTES {
             (serialized, None)
@@ -182,7 +180,14 @@ impl JobRuntime {
                 }
             }
         };
-        self.transition(state, id, "completed", Some(&result_json), None, "completed");
+        self.transition(
+            state,
+            id,
+            "completed",
+            Some(&result_json),
+            None,
+            "completed",
+        );
         // Spillover lands in the dedicated column: `set_job_state` only
         // touches state/result/error.
         if let Some(path) = artifact_path.as_deref() {
@@ -225,8 +230,12 @@ impl JobRuntime {
             Some(true) => {}
             // Unknown row (lane created it before this release, or the
             // insert failed loudly earlier) — the live answer still wins.
-            Some(false) => tracing::debug!(target: "blazar::jobs", job = %id, to, "job row absent; transition not recorded"),
-            None => tracing::warn!(target: "blazar::jobs", job = %id, to, "job ledger unavailable; transition not recorded"),
+            Some(false) => {
+                tracing::debug!(target: "blazar::jobs", job = %id, to, "job row absent; transition not recorded")
+            }
+            None => {
+                tracing::warn!(target: "blazar::jobs", job = %id, to, "job ledger unavailable; transition not recorded")
+            }
         }
     }
 }
@@ -284,18 +293,11 @@ fn not_found(id: &str) -> Response {
 
 /// GET /v1/jobs?state=&kind=&limit= — the durable ledger, newest first.
 #[allow(clippy::unused_async)] // axum's Handler trait requires async fns
-pub async fn jobs_list(
-    State(state): State<Arc<AppState>>,
-    Query(q): Query<ListQuery>,
-) -> Response {
+pub async fn jobs_list(State(state): State<Arc<AppState>>, Query(q): Query<ListQuery>) -> Response {
     let rows = state
         .with_store(|s| {
-            s.list_jobs(
-                q.state.as_deref(),
-                q.kind.as_deref(),
-                q.limit.unwrap_or(50),
-            )
-            .unwrap_or_default()
+            s.list_jobs(q.state.as_deref(), q.kind.as_deref(), q.limit.unwrap_or(50))
+                .unwrap_or_default()
         })
         .unwrap_or_default();
     let data: Vec<serde_json::Value> = rows.iter().map(row_payload).collect();
@@ -310,10 +312,7 @@ pub async fn jobs_list(
 /// GET /v1/jobs/{id} — terminal rows answer from the ledger; live ones
 /// dispatch to their lane for fresh state (audio registry, live child
 /// poll for image/video), mirroring whatever terminal state comes back.
-pub async fn jobs_get(
-    State(state): State<Arc<AppState>>,
-    Path(job_id): Path<String>,
-) -> Response {
+pub async fn jobs_get(State(state): State<Arc<AppState>>, Path(job_id): Path<String>) -> Response {
     if !job_id
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -379,7 +378,9 @@ pub(crate) fn mirror_child_terminal(state: &AppState, id: &str, child_job: &serd
     match status {
         "completed" => {
             let body = serde_json::to_vec(child_job).unwrap_or_default();
-            state.jobs.record_completed(state, id, &body, "application/json");
+            state
+                .jobs
+                .record_completed(state, id, &body, "application/json");
         }
         "failed" => {
             let msg = child_job
@@ -425,7 +426,11 @@ pub async fn jobs_cancel(
                 .request_json
                 .parse::<serde_json::Value>()
                 .ok()
-                .and_then(|r| r.get("engine").and_then(serde_json::Value::as_str).map(str::to_string));
+                .and_then(|r| {
+                    r.get("engine")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                });
             crate::images::cancel_child_best_effort(&state, engine.as_deref(), &job_id).await;
             state.jobs.record_cancelled(&state, &job_id);
         }
@@ -524,7 +529,7 @@ pub async fn jobs_artifact(
     let content_type = row
         .result_json
         .as_deref()
-.and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok())
+        .and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok())
         .and_then(|r| {
             r.get("content_type")
                 .and_then(serde_json::Value::as_str)
@@ -585,7 +590,10 @@ mod tests {
         r.artifact_path = Some("/tmp/x".into());
         let p = row_payload(&r);
         assert_eq!(p["result"]["done"], serde_json::json!(true));
-        assert_eq!(p["artifact"]["url"], serde_json::json!("/v1/jobs/j2/artifact"));
+        assert_eq!(
+            p["artifact"]["url"],
+            serde_json::json!("/v1/jobs/j2/artifact")
+        );
     }
 
     #[test]
@@ -601,7 +609,11 @@ mod tests {
         rt.record_input_artifact("safe_1", Some("talk.wav"), b"tiny");
         let written = tmp.path().join("jobs").join("safe_1").join("input.wav");
         assert!(written.is_file());
-        rt.record_input_artifact("safe_2", Some("big.bin"), &vec![0u8; INPUT_ARTIFACT_CAP_BYTES + 1]);
+        rt.record_input_artifact(
+            "safe_2",
+            Some("big.bin"),
+            &vec![0u8; INPUT_ARTIFACT_CAP_BYTES + 1],
+        );
         assert!(!tmp.path().join("jobs").join("safe_2").exists());
     }
 }

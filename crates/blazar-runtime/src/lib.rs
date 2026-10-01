@@ -49,6 +49,7 @@ pub use hf::{parse_pull_target, registry_name, PullOutcome, PullTarget, Puller};
 pub use models::{instance_running, remove_model};
 pub use probe::probe_hardware;
 pub use supervisor::{
-    resolve_draft_path, EngineRef, PrefixKey, PsRow, SupervisionError, Supervisor, ROUTER_KEY,
+    resolve_draft_path, resolve_spec_mode, EngineRef, PrefixKey, PsRow, SupervisionError,
+    Supervisor, ROUTER_KEY,
 };
 pub use verify::{verify_model, VerifyReport};

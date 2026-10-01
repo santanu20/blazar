@@ -1005,11 +1005,7 @@ pub(crate) async fn poll_live_child(
 /// Locate the owning child and fire a cancel at it — the unified
 /// `/v1/jobs/{id}/cancel` path, which has no `?model=` hint and relies
 /// on the engine name recorded at submit time.
-pub(crate) async fn cancel_child_best_effort(
-    state: &AppState,
-    engine: Option<&str>,
-    job_id: &str,
-) {
+pub(crate) async fn cancel_child_best_effort(state: &AppState, engine: Option<&str>, job_id: &str) {
     for child in live_sdcpp_children(state, engine) {
         if poll_child_job(state, &child, job_id)
             .await
@@ -1296,8 +1292,7 @@ pub async fn jobs_get(
     {
         return openai_error(400, "invalid job id");
     }
-    let children_empty =
-        live_sdcpp_children(&state, params.model.as_deref()).is_empty();
+    let children_empty = live_sdcpp_children(&state, params.model.as_deref()).is_empty();
     if children_empty {
         return openai_error(
             404,

@@ -1670,6 +1670,68 @@ async fn e2e__capacity__shape_contract() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn e2e__explain__card_provenance_and_unknown_404() {
+    let ts = start(Config::default()).await;
+    let c = client();
+
+    // Known model (the harness seeds m1 as a GGUF row with the stub
+    // engine active): the card must name its sources, not just values.
+    let resp = c
+        .get(format!("{}/api/explain/m1", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["object"], "blazar.explain", "shape: {v}");
+    assert_eq!(v["model"]["name"], "m1");
+    assert_eq!(v["model"]["format"], "gguf");
+    // This harness store seeds models but NO engine rows — the card must
+    // say so honestly (teaching reason), never fabricate a lane.
+    assert_eq!(v["engine"]["source"], "error", "no engine rows: {v}");
+    assert!(
+        v["engine"]["reason"]
+            .as_str()
+            .is_some_and(|s| s.contains("no engine installed")),
+        "teaching reason for the engineless store: {v}"
+    );
+    let ctx = &v["context"];
+    assert!(
+        ctx["requested_source"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("config default_ctx = ")),
+        "no overlay on m1 — requested ctx must cite the config default: {ctx}"
+    );
+    assert!(
+        ctx["effective_source"]
+            .as_str()
+            .is_some_and(|s| s.contains("not resident")),
+        "m1 is not spawned in the harness — effective ctx must say so: {ctx}"
+    );
+    assert!(
+        v["speculation"]["mode"].as_str().is_some(),
+        "spec mode always resolves (static tier): {v}"
+    );
+    assert!(
+        v["cache"]["kv_k"].is_string(),
+        "kv grade or auto ladder: {v}"
+    );
+    assert!(v["residents"].as_array().is_some_and(|r| r.is_empty()));
+
+    // Unknown model: teaching 404, never a half-empty card.
+    let resp = c
+        .get(format!("{}/api/explain/nope", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("unknown model"), "teaching 404: {text}");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn e2e__infill_control_tokenize_proxied() {
     let ts = start(Config::default()).await;
     let c = client();
