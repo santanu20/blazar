@@ -6548,7 +6548,9 @@ drop them from rpc_servers in config.toml",
     async fn autopull_draft(&self, name: &str, spec_mode: &str) -> Option<String> {
         let pair = blazar_core::pair_for_spec_mode(name, spec_mode)?;
         let client = match crate::hf::HfClient::new(std::env::var("HF_TOKEN").ok()) {
-            Ok(c) => c.with_download_connections(self.config.download_connections),
+            Ok(c) => c
+                .with_download_connections(self.config.download_connections)
+                .with_download_speed_limit(self.config.download_speed_limit_mb),
             Err(e) => {
                 tracing::warn!(model = name, "spec_autopull skipped (hf client): {e:#}");
                 return None;

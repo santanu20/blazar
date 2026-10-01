@@ -623,11 +623,13 @@ pub async fn pull(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     // Drive the pull on a task; stream events until ModelPulled/PullFailed.
     let pull_request = target.clone();
     let dl_conns = state.config.download_connections;
+    let dl_limit = state.config.download_speed_limit_mb;
     tokio::spawn(async move {
         let token = std::env::var("HF_TOKEN").ok();
-        let client = match blazar_runtime::hf::HfClient::new(token)
-            .map(|c| c.with_download_connections(dl_conns))
-        {
+        let client = match blazar_runtime::hf::HfClient::new(token).map(|c| {
+            c.with_download_connections(dl_conns)
+                .with_download_speed_limit(dl_limit)
+        }) {
             Ok(c) => c,
             Err(e) => {
                 bus.publish(blazar_runtime::BlazarEvent::PullFailed {

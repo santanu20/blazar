@@ -216,6 +216,7 @@ pub(crate) async fn try_parallel(
     plan: &FilePlan,
     dest: &Path,
     connections: u32,
+    throttle: Option<std::sync::Arc<crate::throttle::Throttle>>,
     on_progress: &mut impl FnMut(u64, u64),
 ) -> Result<Option<u64>> {
     if connections < 2 {
@@ -271,6 +272,7 @@ pub(crate) async fn try_parallel(
         &cp,
         ledger,
         connections,
+        throttle,
         on_progress,
     )
     .await?;
@@ -302,6 +304,7 @@ async fn execute_chunks(
     cp: &ChunkPlan,
     ledger: ResumeLedger,
     connections: u32,
+    throttle: Option<std::sync::Arc<crate::throttle::Throttle>>,
     on_progress: &mut impl FnMut(u64, u64),
 ) -> Result<()> {
     let done_set: std::collections::BTreeSet<u64> = ledger.done.iter().copied().collect();
@@ -359,6 +362,7 @@ async fn execute_chunks(
         let abort = abort.clone();
         let pending = pending.clone();
         let chunk_counters = chunk_counters.clone();
+        let throttle = throttle.clone();
         handles.push(tokio::spawn(async move {
             loop {
                 if abort.load(Ordering::Relaxed) {
@@ -379,6 +383,7 @@ async fn execute_chunks(
                     &part,
                     pc.start,
                     pc.len,
+                    throttle.as_ref(),
                     &progress,
                     chunk_progress,
                 )
@@ -672,6 +677,7 @@ async fn fetch_chunk(
     part: &Path,
     start: u64,
     len: u64,
+    throttle: Option<&std::sync::Arc<crate::throttle::Throttle>>,
     progress: &AtomicU64,
     chunk_progress: &AtomicU64,
 ) -> Result<()> {
@@ -732,6 +738,12 @@ async fn fetch_chunk(
                         written += piece.len() as u64;
                         progress.fetch_add(piece.len() as u64, Ordering::Relaxed);
                         chunk_progress.fetch_add(piece.len() as u64, Ordering::Relaxed);
+                        // Read-then-sleep: data has landed and been
+                        // recorded; the pause paces the next window and
+                        // transport buffering absorbs it.
+                        if let Some(t) = throttle {
+                            t.acquire(piece.len() as u64).await;
+                        }
                     }
                     Err(e) => {
                         last_err = Some(format!("write: {e}"));
@@ -1028,6 +1040,7 @@ mod tests {
                 &part,
                 start,
                 len,
+                None,
                 &progress,
                 &chunk_progress,
             )
@@ -1090,6 +1103,7 @@ mod tests {
             &part,
             0,
             payload.len() as u64,
+            None,
             &progress,
             &chunk_progress,
         )
@@ -1159,6 +1173,7 @@ mod tests {
             &part,
             0,
             payload.len() as u64,
+            None,
             &progress,
             &chunk_progress,
         )
@@ -1197,7 +1212,7 @@ mod tests {
             sha256: None,
         };
         let mut prog = |_, _| {};
-        let out = try_parallel(&http_client(), None, &url, &plan, &dest, 4, &mut prog)
+        let out = try_parallel(&http_client(), None, &url, &plan, &dest, 4, None, &mut prog)
             .await
             .unwrap();
         assert_eq!(out, Some(payload_len));
@@ -1227,7 +1242,7 @@ mod tests {
             sha256: None,
         };
         let mut prog = |_, _| {};
-        let out = try_parallel(&http_client(), None, &url, &plan, &dest, 4, &mut prog)
+        let out = try_parallel(&http_client(), None, &url, &plan, &dest, 4, None, &mut prog)
             .await
             .unwrap();
         assert_eq!(out, None, "short classic partial belongs to classic lane");
@@ -1264,7 +1279,7 @@ mod tests {
             sha256: None,
         };
         let mut prog = |_, _| {};
-        let out = try_parallel(&http_client(), None, &url, &plan, &dest, 8, &mut prog)
+        let out = try_parallel(&http_client(), None, &url, &plan, &dest, 8, None, &mut prog)
             .await
             .unwrap();
         assert_eq!(out, None);
@@ -1285,7 +1300,7 @@ mod tests {
             sha256: None,
         };
         let mut prog = |_, _| {};
-        let out = try_parallel(&http_client(), None, &url, &plan, &dest, 1, &mut prog)
+        let out = try_parallel(&http_client(), None, &url, &plan, &dest, 1, None, &mut prog)
             .await
             .unwrap();
         assert_eq!(out, None);
@@ -1330,7 +1345,7 @@ mod tests {
             sha256: None,
         };
         let mut prog = |_, _| {};
-        let out = try_parallel(&http_client(), None, &url, &plan, &dest, 4, &mut prog)
+        let out = try_parallel(&http_client(), None, &url, &plan, &dest, 4, None, &mut prog)
             .await
             .unwrap();
         assert_eq!(out, Some(payload.len() as u64));
@@ -1439,7 +1454,7 @@ mod tests {
             sha256: None,
         };
         let mut prog = |_, _| {};
-        let out = try_parallel(&http_client(), None, &url, &plan, &dest, 4, &mut prog)
+        let out = try_parallel(&http_client(), None, &url, &plan, &dest, 4, None, &mut prog)
             .await
             .unwrap();
         assert_eq!(out, Some(payload_len));
@@ -1511,7 +1526,7 @@ mod tests {
             sha256: None,
         };
         let mut prog = |_, _| {};
-        let err = try_parallel(&http_client(), None, &url, &plan, &dest, 4, &mut prog)
+        let err = try_parallel(&http_client(), None, &url, &plan, &dest, 4, None, &mut prog)
             .await
             .unwrap_err();
         assert!(
@@ -1575,6 +1590,7 @@ mod tests {
             &cp,
             ResumeLedger::default(),
             4,
+            None,
             &mut on_progress,
         ));
         tokio::select! {

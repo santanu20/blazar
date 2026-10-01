@@ -144,11 +144,14 @@ Windows/CVEs. Code-verified outcomes:
 
 Actionable items, all others verified fixed:
 
-- **F1. Pull download speed cap** (ollama #2006, 104 upvotes). New
-  `download_speed_limit_mb` config (0 = unlimited) + token-bucket pacing in
-  `hf_parallel.rs` chunk reads; validation, docs row, pin tests (paced vs
-  unlimited timing assert via local listener). Removes bandwidth contention
-  for users pulling on shared links.
+- **F1. Pull download speed cap** (ollama #2006, 104 upvotes). **DONE
+  2026-10-02**: `download_speed_limit_mb` config + `BLAZAR_DOWNLOAD_SPEED_LIMIT_MB`
+  env; shared token bucket (1 s burst, `runtime/throttle.rs`) pacing model
+  pulls, registry pulls, TTS/whisper voices, and engine-binary assets;
+  progress bars name the cap; validation rejects negative/NaN. Receipts:
+  `integration__download_speed_limit__paces_the_classic_lane` (2.5 s measured
+  deficit at 1000 B/s cap), 6 throttle unit tests, config env/validation test,
+  workspace 1657/1657.
 - **F2. Release-artifact license gate** (ollama #3185 parity). Extend the
   github-release pre-release checks: assert LICENSE-MIT/LICENSE-APACHE (+
   NOTICE if added) exist inside every published archive; fail the release if
