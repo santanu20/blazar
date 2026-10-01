@@ -75,7 +75,7 @@ impl JobRuntime {
     /// `grace + margin` cuts at THIS daemon's start time, catching rows
     /// whose last update fell inside the grace window (killed moments
     /// before boot) which the first pass deliberately spared. Anything
-    /// this daemon wrote has updated_at >= its start, so live work —
+    /// this daemon wrote has `updated_at` >= its start, so live work —
     /// including a doctor mid-probe silent for its whole 300 s cold-load
     /// allowance — is never reaped.
     pub fn boot_sweep(&self, state: &Arc<AppState>) {
@@ -133,7 +133,7 @@ impl JobRuntime {
         id: &str,
         kind: &str,
         model: Option<&str>,
-        request_json: serde_json::Value,
+        request_json: &serde_json::Value,
     ) {
         let now = blazar_core::store::unix_now();
         let row = JobRow {
@@ -169,7 +169,7 @@ impl JobRuntime {
             .map_or(String::new(), |e| format!(".{e}"));
         let dir = self.jobs_dir.join(sanitize_id(id));
         let path = dir.join(format!("input{ext}"));
-        if let Err(err) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, data)) {
+        if let Err(err) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, data)) {
             tracing::warn!(target: "blazar::jobs", job = %id, %err, "input artifact write failed — job continues without it");
         }
     }
@@ -192,7 +192,7 @@ impl JobRuntime {
         } else {
             let dir = self.jobs_dir.join(sanitize_id(id));
             let path = dir.join("result");
-            match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, body)) {
+            match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, body)) {
                 Ok(()) => (
                     serde_json::to_string(&serde_json::json!({
                         "artifact": true,
@@ -247,7 +247,8 @@ impl JobRuntime {
     /// Append a progress event without a state transition — doctor probe
     /// verdicts today, lane milestones later. The row must already exist;
     /// a missing row is a debug-level note (the lane stays authoritative).
-    pub fn record_event(&self, state: &AppState, id: &str, kind: &str, data: serde_json::Value) {
+    #[allow(clippy::unused_self)] // ledger writers go through AppState; method form keeps the JobRuntime namespace
+    pub fn record_event(&self, state: &AppState, id: &str, kind: &str, data: &serde_json::Value) {
         let data = serde_json::to_string(&data).ok();
         let outcome = state.with_store(|s| s.append_job_event(id, kind, data.as_deref()));
         match outcome {
@@ -261,6 +262,7 @@ impl JobRuntime {
         }
     }
 
+    #[allow(clippy::unused_self)] // ledger writers go through AppState; method form keeps the JobRuntime namespace
     fn transition(
         &self,
         state: &AppState,
@@ -284,10 +286,10 @@ impl JobRuntime {
             // Unknown row (lane created it before this release, or the
             // insert failed loudly earlier) — the live answer still wins.
             Some(false) => {
-                tracing::debug!(target: "blazar::jobs", job = %id, to, "job row absent; transition not recorded")
+                tracing::debug!(target: "blazar::jobs", job = %id, to, "job row absent; transition not recorded");
             }
             None => {
-                tracing::warn!(target: "blazar::jobs", job = %id, to, "job ledger unavailable; transition not recorded")
+                tracing::warn!(target: "blazar::jobs", job = %id, to, "job ledger unavailable; transition not recorded");
             }
         }
     }
@@ -305,6 +307,7 @@ fn sanitize_id(id: &str) -> String {
 /// lane-native shapes: `id`, `status`, `created_at` keep their existing
 /// vocabulary; `kind`, `updated_at`, `result`, `error`, `artifact` are the
 /// durable extras.
+#[must_use]
 pub fn row_payload(row: &JobRow) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "id": row.id,
@@ -397,18 +400,17 @@ pub async fn jobs_get(State(state): State<Arc<AppState>>, Path(job_id): Path<Str
         // Image/video: the owning child is the only live truth. A poll
         // that finds a terminal state mirrors it into the ledger; a child
         // that is gone closes the row honestly instead of 404-ing.
-        "image" | "video" => match crate::images::poll_live_child(&state, None, &job_id).await {
-            Some(child_job) => {
+        "image" | "video" => {
+            if let Some(child_job) = crate::images::poll_live_child(&state, None, &job_id).await {
                 mirror_child_terminal(&state, &job_id, &child_job);
                 let mut payload = child_job;
                 if let Some(obj) = payload.as_object_mut() {
                     obj.insert("kind".into(), serde_json::json!(row.kind));
                 }
                 axum::Json(payload).into_response()
-            }
-            None => {
+            } else {
                 let msg = "job's engine child is gone (eviction, crash or restart) — \
-                           resubmit the generation";
+                       resubmit the generation";
                 state.jobs.record_failed(&state, &job_id, msg);
                 let closed = state
                     .with_store(|s| s.get_job(&job_id).ok().flatten())
@@ -418,7 +420,7 @@ pub async fn jobs_get(State(state): State<Arc<AppState>>, Path(job_id): Path<Str
                     None => not_found(&job_id),
                 }
             }
-        },
+        }
         other => crate::proxy::openai_error(
             500,
             &format!("job {job_id} has unknown kind {other:?} — ledger corruption?"),

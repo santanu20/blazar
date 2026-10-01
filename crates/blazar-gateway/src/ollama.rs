@@ -3568,8 +3568,7 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         .unwrap_or(0);
     let _ = write!(
         merged,
-        "# HELP blazar_jobs_active Durable job rows not yet terminal (all lanes)\n# TYPE blazar_jobs_active gauge\nblazar_jobs_active {}\n",
-        durable_jobs_active
+        "# HELP blazar_jobs_active Durable job rows not yet terminal (all lanes)\n# TYPE blazar_jobs_active gauge\nblazar_jobs_active {durable_jobs_active}\n"
     );
     let _ = write!(
         merged,

@@ -1158,8 +1158,8 @@ pub async fn responses_api(
         obj.insert("id".into(), serde_json::json!(id));
     }
     state.store_response(
-        id,
-        crate::responses::StoredResponse {
+        &id,
+        &crate::responses::StoredResponse {
             model: model_name.clone(),
             input_items,
             output_items,

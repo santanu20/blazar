@@ -6671,7 +6671,7 @@ async fn model_doctor_cmd(model: &str, json: bool) -> Result<()> {
     };
     // Probe budget on the daemon is 10 minutes overall; poll past it so
     // the CLI is never the side that gives up first.
-    let deadline = std::time::Instant::now() + Duration::from_secs(660);
+    let deadline = std::time::Instant::now() + Duration::from_mins(11);
     loop {
         let resp = cli_http()
             .get(format!("{base}/v1/jobs/{id}"))
@@ -6767,7 +6767,10 @@ fn encode_path_segment(s: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(b as char);
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "%{b:02X}");
+            }
         }
     }
     out
@@ -6776,6 +6779,7 @@ fn encode_path_segment(s: &str) -> String {
 /// Render the daemon's explain card as the scannable text block. Pure —
 /// unit-testable without a daemon. Unknowns print as `unknown` with the
 /// daemon's own source/limitation lines; nothing is invented here.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)] // renderer mirrors the card's sections one-to-one; short locals are the JSON field handles
 fn render_explain_card(v: &serde_json::Value) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
@@ -6795,8 +6799,7 @@ fn render_explain_card(v: &serde_json::Value) -> String {
             "{}  quant={}  arch={}  format={}",
             m["bytes"]
                 .as_i64()
-                .map(humansize)
-                .unwrap_or_else(|| "unknown".into()),
+                .map_or_else(|| "unknown".into(), humansize),
             or_unknown(&m["quant"]),
             or_unknown(&m["arch"]),
             or_unknown(&m["format"]),
@@ -13272,7 +13275,7 @@ mod tests {
         let out = render_doctor_cert(&serde_json::json!({
             "model": "qwen3-1.7b",
             "engine_tag": "llamacpp-cuda",
-            "tested_at": 1790000000i64,
+            "tested_at": 1_790_000_000_i64,
             "caps": {
                 "chat": {"status": "PASS", "receipt": "200, assistant content (in 812ms)"},
                 "tools": {"status": "FAIL", "receipt": long_receipt},

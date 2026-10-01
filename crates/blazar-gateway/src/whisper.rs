@@ -558,7 +558,7 @@ fn submit_async(
         &id,
         "audio",
         field(&parts, "model").as_deref(),
-        serde_json::json!({
+        &serde_json::json!({
             "size": size,
             "filename": file.filename,
             "translate": force_translate,

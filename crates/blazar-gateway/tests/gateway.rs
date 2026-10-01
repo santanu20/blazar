@@ -1560,7 +1560,7 @@ async fn e2e__audio_jobs__unknown_404_and_invalid_id_400() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
-    let resp = c
+    let _resp = c
         .post(format!("{}/v1/audio/jobs/..%2Fetc/cancel", ts.base))
         .send()
         .await
@@ -1716,7 +1716,9 @@ async fn e2e__explain__card_provenance_and_unknown_404() {
         v["cache"]["kv_k"].is_string(),
         "kv grade or auto ladder: {v}"
     );
-    assert!(v["residents"].as_array().is_some_and(|r| r.is_empty()));
+    assert!(v["residents"]
+        .as_array()
+        .is_some_and(std::vec::Vec::is_empty));
 
     // Tag-form alias (`name:quant`, the display shape /api/tags emits)
     // resolves through the canonical ladder — regression pin for the

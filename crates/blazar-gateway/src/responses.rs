@@ -105,20 +105,25 @@ impl ResponsesRegistry {
     /// re-checked before use (a response may have aged past the window
     /// while the gateway was down — expired means miss, not stale hit).
     /// A found row is promoted into the hot LRU so subsequent hits are
-    /// memory-speed. Corrupt JSON degrades to `Null` (chain_input treats
+    /// memory-speed. Corrupt JSON degrades to `Null` (`chain_input` treats
     /// it as empty) rather than poisoning the conversation.
     pub fn promote_from_store(&mut self, store: &Store, id: &str) -> Option<StoredResponse> {
         let row = store.get_response(id).ok()??;
-        if unix_now().saturating_sub(row.ts.max(0) as u64) > RESPONSES_TTL_SECS {
+        let ts = u64::try_from(row.ts.max(0)).unwrap_or(0);
+        if unix_now().saturating_sub(ts) > RESPONSES_TTL_SECS {
             return None;
         }
         let sr = StoredResponse {
             model: row.model,
             input_items: serde_json::from_str(&row.input_json).unwrap_or(Value::Null),
             output_items: serde_json::from_str(&row.output_json).unwrap_or(Value::Null),
-            input_tokens: row.input_tokens.map(|v| v as u64),
-            output_tokens: row.output_tokens.map(|v| v as u64),
-            ts: row.ts.max(0) as u64,
+            input_tokens: row
+                .input_tokens
+                .map(|v| u64::try_from(v).unwrap_or(u64::MAX)),
+            output_tokens: row
+                .output_tokens
+                .map(|v| u64::try_from(v).unwrap_or(u64::MAX)),
+            ts,
         };
         let out = sr.clone();
         self.put(id.to_string(), sr);
@@ -277,9 +282,13 @@ mod tests {
             model: row.model,
             input_items: serde_json::from_str(&row.input_json).unwrap(),
             output_items: serde_json::from_str(&row.output_json).unwrap(),
-            input_tokens: row.input_tokens.map(|v| v as u64),
-            output_tokens: row.output_tokens.map(|v| v as u64),
-            ts: row.ts.max(0) as u64,
+            input_tokens: row
+                .input_tokens
+                .map(|v| u64::try_from(v).unwrap_or(u64::MAX)),
+            output_tokens: row
+                .output_tokens
+                .map(|v| u64::try_from(v).unwrap_or(u64::MAX)),
+            ts: u64::try_from(row.ts.max(0)).unwrap_or(0),
         };
         assert_eq!(back.model, sr.model);
         assert_eq!(back.input_items, sr.input_items);

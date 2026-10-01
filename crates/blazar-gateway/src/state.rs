@@ -313,6 +313,7 @@ impl AppState {
 
     #[must_use]
     #[allow(clippy::duration_suboptimal_units)] // 10-minute ceiling mirrors long generations
+    #[allow(clippy::too_many_lines)] // constructor: field-by-field wiring, splitting would not reduce it
     pub fn new(dirs: BlazarDirs, config: Config, sup: Arc<Supervisor>, bus: EventBus) -> Self {
         let http = crate::http_pool::tuned(reqwest::Client::builder())
             .timeout(std::time::Duration::from_secs(10 * 60))
@@ -472,11 +473,11 @@ impl AppState {
     /// memory stays authoritative for the live process, the ledger is
     /// the restart path. Lock order: responses → store (see
     /// `stored_response`).
-    pub fn store_response(&self, id: String, r: crate::responses::StoredResponse) {
+    pub fn store_response(&self, id: &str, r: &crate::responses::StoredResponse) {
         let mut reg = self.responses.lock().expect("responses registry");
-        reg.put(id.clone(), r.clone());
+        reg.put(id.to_string(), r.clone());
         let durable = self.with_store(|s| {
-            s.put_response(&crate::responses::ResponsesRegistry::to_row(&id, &r))
+            s.put_response(&crate::responses::ResponsesRegistry::to_row(id, r))
                 .and_then(|()| {
                     s.prune_responses(
                         crate::responses::RESPONSES_TTL_SECS,

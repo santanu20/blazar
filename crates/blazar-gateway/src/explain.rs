@@ -77,6 +77,13 @@ pub fn cold_ctx_note() -> &'static str {
 }
 
 /// `GET /api/explain/{model}` — the effective-config card.
+/// Store lookup for the routing lane: (global tag, lane resolution).
+type LaneLookup = (
+    Option<String>,
+    Result<Option<(String, blazar_core::engine_kind::EngineKind)>, String>,
+);
+
+#[allow(clippy::too_many_lines)] // the card IS one document: model facts, lane, context, slots, speculation, cache, residents
 pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<String>) -> Response {
     // Store resolution first: unknown models fail with teaching, never a
     // half-empty card that looks authoritative.
@@ -111,10 +118,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
     // string is derived from the INPUTS (facts), not from inside
     // serving_lane. The global tag rides along so the no-lane case can
     // still name the engine that WOULD serve (mirrors routed_engine_lane).
-    let lane: Option<(
-        Option<String>,
-        Result<Option<(String, blazar_core::engine_kind::EngineKind)>, String>,
-    )> = state.with_store(|s| {
+    let lane: Option<LaneLookup> = state.with_store(|s| {
         let engine_rows = s.list_engines().unwrap_or_default();
         let global = engine_rows
             .iter()
@@ -265,10 +269,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
         Some((m, d)) => (m.clone(), d.clone(), "live child".to_string()),
         None => (
             static_mode.clone().into(),
-            static_draft
-                .clone()
-                .map(Value::String)
-                .unwrap_or(Value::Null),
+            static_draft.clone().map_or(Value::Null, Value::String),
             if overlay.spec.is_some() {
                 format!("model_overrides.{resolved}.spec")
             } else {
@@ -334,6 +335,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
 
 #[cfg(test)]
 mod tests {
+    #![allow(non_snake_case)]
     use super::*;
 
     #[test]
