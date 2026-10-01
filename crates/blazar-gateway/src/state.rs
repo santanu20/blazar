@@ -244,6 +244,13 @@ pub struct AppState {
     pub remote_presence: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, crate::remotes::PeerPresence>>,
     >,
+    /// v0.16 federation: per-peer `/api/capacity` snapshots, refreshed
+    /// alongside presence (same TTL window). Absent entry = non-Blazar
+    /// peer or not yet probed — capacity-aware routing degrades to the
+    /// load/circuit signals above, never errors.
+    pub remote_capacity: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, crate::remotes::PeerCapacity>>,
+    >,
     /// E4 audit: line sender (`None` = audit off; no request-path tax
     /// when disabled). Dropped-line counter is shared with the writer.
     pub audit_tx: Option<tokio::sync::mpsc::Sender<crate::audit::AuditLine>>,
@@ -431,6 +438,7 @@ impl AppState {
             remote_health: std::sync::Arc::default(),
             remote_affinity: std::sync::Arc::default(),
             remote_presence: std::sync::Arc::default(),
+            remote_capacity: std::sync::Arc::default(),
             audit_tx,
             audit_dropped,
             store: std::sync::Mutex::new(store),

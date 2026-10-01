@@ -919,8 +919,9 @@ fn counter(text: &str, name: &str) -> Option<u64> {
 }
 
 /// EWMA step shared by the merged-global and per-model hint windows
-/// (0.7 history / 0.3 new — the A16/G3 smoothing constant).
-fn hint_ewma(prev: Option<f64>, rate: f64) -> f64 {
+/// (0.7 history / 0.3 new — the A16/G3 smoothing constant). Also the
+/// remote time-to-head hint (v0.16 federation) — one constant, one bias.
+pub(crate) fn hint_ewma(prev: Option<f64>, rate: f64) -> f64 {
     match prev {
         Some(e) => e * 0.7 + rate * 0.3,
         None => rate,
