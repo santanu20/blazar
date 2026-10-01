@@ -67,8 +67,6 @@ Live proofs (gateway :11435, daemon 663606, sglang 0.5.20):
 
 Pre-fix behavior for the same 9B request (receipt §5): stale 3.1 GiB row + KvGeom None → fit ladder skipped → blind spawn → sglang `create_weights` crash-loop → 502s. The whole chain is closed: honest sizes, real geometry, teaching refusals.
 
-Not committed — shared worktree, co-actor holds index.
-
 ## 7b. AllSlotsBusy conflation fix (same day, follow-up)
 
 Root cause: `admission_blocked` returned one bool for two worlds — "residents in the way" (evictable, queue correct) and "incoming floor > every card even empty" (physically unschedulable). The latter surfaced as a 120 s `all_slots_busy` queue timeout on an idle-capable verdict known at entry.
@@ -139,3 +137,14 @@ State after test: fed2 killed, primary config restored (remotes empty, backup he
 - Contention finding (honest, not a regression): a peer on the SAME box spawns children the primary cannot evict (separate ledgers) — a marginal-fit spawn crashed at sglang prefill cuda-graph capture with 4.4GB held by the peer's 0.6b child. Production peers belong on separate boxes; documented here as the one-GPU-box caveat.
 
 **Suite:** 1453/1453 (core+runtime+gateway) + supervisor VK tests, clippy 0. Config restored (remotes = []), sandbox removed, single daemon on :11435.
+
+## 12. Vulkan prebuilt lane end-to-end (2026-10-01, hw-agnostic validation)
+
+Box: RTX 4070 Laptop (discrete) + Intel RPL-S iGPU (integrated) + llvmpipe (software, ggml-excluded).
+
+- Install: sandbox daemon (XDG dirs, port 11437), config pin `engine_asset = "ubuntu-vulkan-x64"` (label-exact override, teaching error on miss — engine/mod.rs pick()) → `blazar engine update` → channel b11320 → downloaded llama-b11320-bin-ubuntu-vulkan-x64.tar.gz (30 MiB), probe: 2 devices, 328 flags. This is the exact automatic path any Linux AMD/Intel user gets (asset matrix: rocm→vulkan→cpu / sycl→vulkan→cpu / vulkan-arm64→cpu).
+- Census ground truth (`--list-devices`): `Vulkan0: Intel(R) Graphics (RPL-S) (10256 MiB, 5350 free)` + `Vulkan1: NVIDIA RTX 4070 (8188 MiB, 7792 free)`. Intel matches the integrated pattern (`intel(r) graphics`, hardware.rs) → excluded from capacity/spanning math BY DESIGN; llvmpipe never enumerated by ggml.
+- Serve: qwen3-0.6b GGUF adopted at boot, cold spawn 10 s, reply `vulkan-ok`.
+- Live child argv: `--device Vulkan1` — the supervisor pinned the discrete card and did not reference the integrated one. Daemon log: `auto GPU pick: most free VRAM ... device=Vulkan1 free_mib=7792`; `spawn settle: card=Vulkan1 measured_mib=4257 predicted_mib=7577 used_pct=56` (measured-vs-predicted belt works on Vulkan devices).
+- Boundary (unchanged, honest): spanning across 2 GPUs needs 2 DISCRETE cards — this box's second GPU is integrated and correctly invisible to spanning; no software can add a discrete CUDA device, so auto-TP/mistralrs-spanning spawn stays unit-fixture-proven. The `GGML_VK_VISIBLE_DEVICES` strict-subset emission (iGPU-exclusion case) also stays unit-proven: this box has exactly 2 Vulkan devices, so the identity set correctly emits nothing.
+- Teardown: sandbox dir removed, port free, no engine children, GPU idle (16 MiB).
