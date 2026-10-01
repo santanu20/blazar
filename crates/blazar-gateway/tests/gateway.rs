@@ -1732,6 +1732,106 @@ async fn e2e__explain__card_provenance_and_unknown_404() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn e2e__model_doctor__job_cert_and_stored_caps() {
+    let ts = start(Config::default()).await;
+    let c = client();
+
+    // Unknown model: teaching 404 BEFORE any job row exists.
+    let resp = c
+        .post(format!("{}/api/model-doctor", ts.base))
+        .json(&serde_json::json!({"model": "nope"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("unknown model"), "teaching 404: {text}");
+
+    // Known model: a durable doctor job is created and runs the probes
+    // through the real gateway path (stub engines — verdicts are theirs,
+    // the CONTRACT here is the shape: every cap classified, terminal
+    // state reached, cert queryable after).
+    let resp = c
+        .post(format!("{}/api/model-doctor", ts.base))
+        .json(&serde_json::json!({"model": "m1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "accepted: body checked next");
+    let started: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(started["object"], "blazar.doctor");
+    let id = started["id"].as_str().expect("job id").to_string();
+    assert!(started["poll_url"]
+        .as_str()
+        .is_some_and(|u| u.contains(&id)));
+
+    let cert;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let resp = c
+            .get(format!("{}/v1/jobs/{id}", ts.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let job: serde_json::Value = resp.json().await.unwrap();
+        match job["status"].as_str().unwrap_or("") {
+            "completed" => {
+                cert = job["result"].clone();
+                break;
+            }
+            "failed" | "cancelled" => panic!("doctor job ended {job}"),
+            _ => {}
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "doctor job did not finish in 60s: {job}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert_eq!(cert["object"], "blazar.model-doctor", "cert shape: {cert}");
+    assert_eq!(cert["model"], "m1");
+    let caps = cert["caps"].as_object().expect("caps map");
+    for name in [
+        "chat",
+        "stream",
+        "json",
+        "tools",
+        "embeddings",
+        "vision",
+        "think",
+    ] {
+        let v = caps
+            .get(name)
+            .unwrap_or_else(|| panic!("cap {name} present: {cert}"));
+        let status = v["status"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{name} status"));
+        assert!(
+            ["PASS", "FAIL", "N/A"].contains(&status),
+            "{name} classified honestly, got {status}"
+        );
+        assert!(
+            v["receipt"].as_str().is_some_and(|r| !r.is_empty()),
+            "{name} carries a receipt"
+        );
+    }
+
+    // The certificate is queryable by model after the run.
+    let resp = c
+        .get(format!("{}/api/model-doctor/m1", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let stored: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(stored["object"], "blazar.model-doctor");
+    assert!(stored["caps"].is_object());
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn e2e__infill_control_tokenize_proxied() {
     let ts = start(Config::default()).await;
     let c = client();

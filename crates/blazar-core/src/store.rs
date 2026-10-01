@@ -518,8 +518,13 @@ impl Store {
         result_json: Option<&str>,
         error: Option<&str>,
     ) -> CoreResult<bool> {
+        // One-way close: only a still-open row (queued/running) may flip
+        // state. First terminal state wins — a cancelled row can never be
+        // silently resurrected to completed by a late racer (e.g. a
+        // doctor/audio task that outlived its cancel).
         let n = self.conn.execute(
-            "UPDATE jobs SET state = ?2, result_json = COALESCE(?3, result_json), error = ?4, updated_at = ?5 WHERE id = ?1",
+            "UPDATE jobs SET state = ?2, result_json = COALESCE(?3, result_json), error = ?4, updated_at = ?5 \
+             WHERE id = ?1 AND state IN ('queued','running')",
             params![id, state, result_json, error, unix_now()],
         )?;
         Ok(n == 1)

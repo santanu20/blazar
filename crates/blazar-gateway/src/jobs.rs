@@ -208,6 +208,23 @@ impl JobRuntime {
         self.transition(state, id, "cancelled", None, None, "cancelled");
     }
 
+    /// Append a progress event without a state transition — doctor probe
+    /// verdicts today, lane milestones later. The row must already exist;
+    /// a missing row is a debug-level note (the lane stays authoritative).
+    pub fn record_event(&self, state: &AppState, id: &str, kind: &str, data: serde_json::Value) {
+        let data = serde_json::to_string(&data).ok();
+        let outcome = state.with_store(|s| s.append_job_event(id, kind, data.as_deref()));
+        match outcome {
+            Some(Ok(())) => {}
+            Some(Err(err)) => {
+                tracing::warn!(target: "blazar::jobs", job = %id, %err, "job event append failed");
+            }
+            None => {
+                tracing::warn!(target: "blazar::jobs", job = %id, "job ledger unavailable; event not recorded");
+            }
+        }
+    }
+
     fn transition(
         &self,
         state: &AppState,
@@ -337,6 +354,10 @@ pub async fn jobs_get(State(state): State<Arc<AppState>>, Path(job_id): Path<Str
             }
             axum::Json(row_payload(&row)).into_response()
         }
+        // Doctor: a gateway-owned probe task writes its progress through
+        // this ledger itself — the row IS the live truth (events carry
+        // per-probe verdicts as they land).
+        "doctor" => axum::Json(row_payload(&row)).into_response(),
         // Image/video: the owning child is the only live truth. A poll
         // that finds a terminal state mirrors it into the ledger; a child
         // that is gone closes the row honestly instead of 404-ing.
@@ -419,6 +440,11 @@ pub async fn jobs_cancel(
     match row.kind.as_str() {
         "audio" => {
             let _ = state.audio_jobs.cancel(&job_id);
+            state.jobs.record_cancelled(&state, &job_id);
+        }
+        // Doctor probes check the row between probes and stop once it is
+        // terminal; the one-way close guarantees this flip is final.
+        "doctor" => {
             state.jobs.record_cancelled(&state, &job_id);
         }
         "image" | "video" => {

@@ -439,6 +439,17 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Run per-model capability probes (chat/stream/JSON/tools/embeds)
+    /// through the real gateway path and store a certificate; the cert
+    /// is what routing trust builds on. Runs as a durable job — poll
+    /// output is live.
+    ModelDoctor {
+        /// Model name as the store knows it (`blazar ls`)
+        model: String,
+        /// Print the raw certificate JSON instead of the table
+        #[arg(long)]
+        json: bool,
+    },
     /// Ask why a request misbehaved: sentinel detections for a trace id
     /// (or the most recent observations) with fix hints
     Why {
@@ -797,7 +808,10 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "completions",
         ],
     ),
-    ("Observability", &["why", "explain", "watch"]),
+    (
+        "Observability",
+        &["why", "explain", "model-doctor", "watch"],
+    ),
     (
         "Refused by design (local-only)",
         &["push", "signin", "login", "signout", "logout"],
@@ -1652,6 +1666,7 @@ async fn run(cmd: Cmd) -> Result<()> {
         Cmd::Logout => cloud_refusal("logout", ""),
         Cmd::Session { cmd } => session_cmd(cmd).await,
         Cmd::Doctor { flat, json } => doctor(flat, json).await,
+        Cmd::ModelDoctor { model, json } => model_doctor_cmd(&model, json).await,
         Cmd::Why {
             trace,
             watch: live,
@@ -6633,6 +6648,113 @@ async fn explain(model: &str, json: bool) -> Result<()> {
         print!("{}", render_explain_card(&v));
     }
     Ok(())
+}
+
+/// `blazar model-doctor <model>`: POST the probe run, then poll the
+/// durable job plane until the certificate lands (or the run fails).
+/// The daemon owns all timing; the CLI is a progressful waiter.
+async fn model_doctor_cmd(model: &str, json: bool) -> Result<()> {
+    let base = ensure_daemon().await?;
+    let resp = cli_http()
+        .post(format!("{base}/api/model-doctor"))
+        .json(&serde_json::json!({ "model": model }))
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("daemon: {text}"));
+    }
+    let started: serde_json::Value = resp.json().await?;
+    let Some(id) = started["id"].as_str().map(str::to_string) else {
+        return Err(anyhow!("daemon reply carried no job id: {started}"));
+    };
+    // Probe budget on the daemon is 10 minutes overall; poll past it so
+    // the CLI is never the side that gives up first.
+    let deadline = std::time::Instant::now() + Duration::from_secs(660);
+    loop {
+        let resp = cli_http()
+            .get(format!("{base}/v1/jobs/{id}"))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("daemon: {text}"));
+        }
+        let job: serde_json::Value = resp.json().await?;
+        match job["status"].as_str().unwrap_or("") {
+            "completed" => {
+                let cert = job["result"].clone();
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&cert)?);
+                } else {
+                    print!("{}", render_doctor_cert(&cert));
+                }
+                return Ok(());
+            }
+            "failed" => {
+                return Err(anyhow!(
+                    "model doctor job {id} failed: {}",
+                    job["error"].as_str().unwrap_or("(no error recorded)")
+                ));
+            }
+            "cancelled" => return Err(anyhow!("model doctor job {id} was cancelled")),
+            _ => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "model doctor job {id} did not finish within the polling budget"
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Render the capability certificate as a table. Pure; unknown fields
+/// (e.g. engine unresolved on a cold run) print as `unknown`.
+fn render_doctor_cert(cert: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let or_unknown =
+        |x: &serde_json::Value| x.as_str().map_or_else(|| "unknown".into(), str::to_string);
+    let _ = writeln!(s, "MODEL     {}", or_unknown(&cert["model"]));
+    let _ = writeln!(s, "ENGINE    {}", or_unknown(&cert["engine_tag"]));
+    let _ = writeln!(s, "TESTED    {}", or_unknown(&cert["tested_at"]));
+    let mut rows: Vec<(String, String, String)> = cert["caps"]
+        .as_object()
+        .map(|caps| {
+            caps.iter()
+                .map(|(name, v)| {
+                    let status = v["status"].as_str().unwrap_or("N/A");
+                    let mut receipt = v["receipt"].as_str().unwrap_or("").to_string();
+                    if receipt.chars().count() > 64 {
+                        receipt = format!("{}…", receipt.chars().take(64).collect::<String>());
+                    }
+                    (name.clone(), status.to_string(), receipt)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let _ = writeln!(s);
+    if rows.is_empty() {
+        let _ = writeln!(s, "  (no capabilities recorded)");
+    } else {
+        let _ = writeln!(
+            s,
+            "{}",
+            render_table(
+                &["CAPABILITY", "STATUS", "RECEIPT"],
+                &rows
+                    .iter()
+                    .map(|r| vec![r.0.clone(), r.1.clone(), r.2.clone()])
+                    .collect::<Vec<_>>(),
+                &[1],
+            )
+        );
+    }
+    s
 }
 
 /// Percent-encode ONE path segment: model names may contain `:` or `/`
@@ -13142,6 +13264,41 @@ mod tests {
             !out.contains("RESIDENTS"),
             "empty residents must not render a section"
         );
+    }
+
+    #[test]
+    fn unit__render_doctor_cert__table_statuses_and_receipt_truncation() {
+        let long_receipt = "x".repeat(80);
+        let out = render_doctor_cert(&serde_json::json!({
+            "model": "qwen3-1.7b",
+            "engine_tag": "llamacpp-cuda",
+            "tested_at": 1790000000i64,
+            "caps": {
+                "chat": {"status": "PASS", "receipt": "200, assistant content (in 812ms)"},
+                "tools": {"status": "FAIL", "receipt": long_receipt},
+                "vision": {"status": "N/A", "receipt": "no mmproj pulled"}
+            }
+        }));
+        assert!(out.contains("MODEL     qwen3-1.7b"));
+        assert!(out.contains("ENGINE    llamacpp-cuda"));
+        assert!(out.contains("CAPABILITY"));
+        assert!(out.contains("chat"));
+        assert!(out.contains("PASS"));
+        assert!(out.contains("FAIL"));
+        assert!(out.contains("N/A"));
+        // 80-char receipt clamps to 64 + ellipsis, not a wall of x.
+        assert!(out.matches('x').count() <= 64 + 1); // rows sorted: receipt column only
+        assert!(out.contains('…'));
+    }
+
+    #[test]
+    fn unit__render_doctor_cert__empty_and_unknown_fallbacks() {
+        let out = render_doctor_cert(&serde_json::json!({
+            "model": "m",
+            "engine_tag": serde_json::Value::Null
+        }));
+        assert!(out.contains("unknown"));
+        assert!(out.contains("(no capabilities recorded)"));
     }
 
     /// Minimal model row for lora-attach admission tests: only `path`
