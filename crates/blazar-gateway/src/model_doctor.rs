@@ -149,7 +149,9 @@ fn judge_stream(code: u16, content_type: Option<&str>, body: &[u8]) -> Verdict {
             pass(format!("200, {frames} NDJSON frames"))
         };
     }
-    fail(format!("200 but content type is {ct} (expected a streaming dialect)"))
+    fail(format!(
+        "200 but content type is {ct} (expected a streaming dialect)"
+    ))
 }
 
 /// structured-output probe: 200 and a JSON body whose .response parses as
