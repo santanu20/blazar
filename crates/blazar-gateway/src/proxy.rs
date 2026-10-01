@@ -411,13 +411,13 @@ pub fn affinity_hash(req: &serde_json::Value) -> Option<PrefixKey> {
         let system = messages
             .iter()
             .find(|m| role_is(m, "system"))
-            .map(&content)
+            .map(content)
             .unwrap_or_default();
         let user = messages
             .iter()
             .find(|m| role_is(m, "user"))
             .or_else(|| messages.first())
-            .map(&content)?;
+            .map(content)?;
         head(&system, &mut hs, 256);
         head(&system, &mut hc, 1024);
         head(&user, &mut hc, 1024);

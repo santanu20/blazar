@@ -898,7 +898,7 @@ mod tests {
     fn unit__parse__plain_text_no_calls() {
         let (c, calls) = parse_completion("The answer is 42.");
         assert_eq!(c, "The answer is 42.");
-        assert!(calls.is_empty());
+        assert_eq!(calls.len(), 0);
     }
 
     #[test]
@@ -913,7 +913,7 @@ mod tests {
     #[allow(non_snake_case)]
     fn unit__parse__unterminated_tag_is_trailing_content() {
         let (c, calls) = parse_completion("ok<tool_call>\n{\"name\": \"x\"");
-        assert!(calls.is_empty());
+        assert_eq!(calls.len(), 0);
         assert!(c.contains("<tool_call>"));
     }
 

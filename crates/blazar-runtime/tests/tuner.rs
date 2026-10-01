@@ -184,7 +184,7 @@ fn integration__tune_search__adopts_argmax_and_persists() {
     let store = Store::open(&dirs).unwrap();
     let (profile, winning, rows) = tuner.tune_search(&store, &inp).unwrap();
 
-    assert!(!rows.is_empty());
+    assert_ne!(rows, [] as [blazar_runtime::BenchRow; 0]);
     assert!(winning.kv_quant.unwrap(), "stub rewards q8_0 by +50 t/s");
     assert_eq!(winning.threads.unwrap(), 8);
     assert_eq!(winning.fa, Some(true), "stub rewards fa-on by +15 t/s");
@@ -217,5 +217,5 @@ fn integration__tune_search__adopts_argmax_and_persists() {
     let payload: serde_json::Value =
         serde_json::from_str(stored.benchmark_json.as_deref().unwrap()).unwrap();
     assert!(payload["score"].as_f64().unwrap() > 0.0);
-    assert!(!stored.args_hash.is_empty());
+    assert_ne!(stored.args_hash, "");
 }

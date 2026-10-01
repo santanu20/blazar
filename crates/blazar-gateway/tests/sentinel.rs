@@ -477,7 +477,7 @@ async fn integration__why__flagged_filter_limit_and_code_reach() {
         .await
         .unwrap();
     let arr = by_code["records"].as_array().unwrap();
-    assert!(!arr.is_empty());
+    assert_ne!(arr.len(), 0);
     assert!(arr.iter().all(|r| {
         r["detections"]
             .as_array()
@@ -492,7 +492,7 @@ async fn integration__why__flagged_filter_limit_and_code_reach() {
         .json()
         .await
         .unwrap();
-    assert!(none["records"].as_array().unwrap().is_empty());
+    assert_eq!(none["records"].as_array().unwrap().len(), 0);
     ts.state.sup.shutdown_all().await.unwrap();
 }
 

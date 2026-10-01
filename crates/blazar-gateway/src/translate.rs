@@ -1188,7 +1188,7 @@ mod tests {
             &mut out,
             &json!({"dry_sequence_breakers": ["\\n", ":", "\""]}),
         );
-        assert!(unknown.is_empty());
+        assert_eq!(unknown.len(), 0);
         assert_eq!(
             out["dry_sequence_breakers"].as_array().map(Vec::len),
             Some(3)
@@ -1344,8 +1344,8 @@ mod tests {
         // appends, and the empty delta after them flushes ONE complete
         // ollama-dialect call (index inside function, parsed arguments).
         let mut acc = ToolCallAccum::default();
-        assert!(openai_chunk_to_ollama(&mut acc, "m", &c2).is_empty());
-        assert!(openai_chunk_to_ollama(&mut acc, "m", &c2b).is_empty());
+        assert_eq!(openai_chunk_to_ollama(&mut acc, "m", &c2).len(), 0);
+        assert_eq!(openai_chunk_to_ollama(&mut acc, "m", &c2b).len(), 0);
         let o2 = openai_chunk_to_ollama(&mut acc, "m", &c3);
         assert_eq!(o2.len(), 1);
         let call = &o2[0]["message"]["tool_calls"][0];
@@ -1359,7 +1359,10 @@ mod tests {
         let o4 = openai_chunk_to_ollama(&mut ToolCallAccum::default(), "m", &c4);
         assert_eq!(o4.len(), 1);
         assert_eq!(o4[0]["message"]["thinking"], "hmm");
-        assert!(openai_chunk_to_ollama(&mut ToolCallAccum::default(), "m", &c3).is_empty());
+        assert_eq!(
+            openai_chunk_to_ollama(&mut ToolCallAccum::default(), "m", &c3).len(),
+            0
+        );
     }
 
     #[test]
@@ -1394,7 +1397,7 @@ mod tests {
         assert_eq!(used, 29);
         // Event split mid-payload: nothing consumed.
         let (ev, done, used) = parse_sse("data: {\"a\":");
-        assert!(ev.is_empty());
+        assert_eq!(ev.len(), 0);
         assert!(!done);
         assert_eq!(used, 0);
         // First line complete, second partial.
@@ -1735,7 +1738,7 @@ mod tests {
         assert_eq!(lines2.len(), 1);
         assert_eq!(lines2[0]["thinking"], "hm");
         let empty = json!({"choices": [{"delta": {"content": ""}}]});
-        assert!(openai_chunk_to_generate("m", &empty).is_empty());
+        assert_eq!(openai_chunk_to_generate("m", &empty).len(), 0);
         // Final line: counts + done_reason + measured durations.
         let usage = json!({"prompt_tokens": 10, "completion_tokens": 2});
         let fin = ollama_generate_final_chunk("m", Some(&usage), Some("length"), Some(1), Some(2));

@@ -11553,7 +11553,7 @@ mod tests {
         inp.engine_kind = crate::engine_kind::EngineKind::MistralRs;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert_eq!(p.argv, vec!["-np".to_string(), "1".to_string()]);
-        assert!(p.warnings.is_empty());
+        assert_eq!(p.warnings.len(), 0);
         assert_eq!(p.kv_est_bytes, None);
         // Default config (slots=0) also emits nothing on this dialect —
         // blazar's llama-lane auto sizing has no mistral.rs equivalent

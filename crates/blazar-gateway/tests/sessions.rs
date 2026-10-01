@@ -75,12 +75,10 @@ async fn integration__pin_mw__absent_header_no_pin() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
-    assert!(ts
-        .state
-        .sup
-        .sessions
-        .list(Duration::from_secs(15 * 60))
-        .is_empty());
+    assert_eq!(
+        ts.state.sup.sessions.list(Duration::from_secs(15 * 60)),
+        [] as [blazar_runtime::sessionreg::SessionInfo; 0]
+    );
 }
 
 #[tokio::test]
@@ -118,12 +116,10 @@ async fn integration__session_close__releases_pin_idempotently() {
         .unwrap();
     assert_eq!(r["status"], "ok");
     assert_eq!(r["released"], true);
-    assert!(ts
-        .state
-        .sup
-        .sessions
-        .list(Duration::from_secs(15 * 60))
-        .is_empty());
+    assert_eq!(
+        ts.state.sup.sessions.list(Duration::from_secs(15 * 60)),
+        [] as [blazar_runtime::sessionreg::SessionInfo; 0]
+    );
 
     // Idempotent second close.
     let r: serde_json::Value = c
@@ -181,7 +177,7 @@ async fn integration__session_identity__manifest_written_tamper_blocks_restore()
     assert!(ckpt.exists(), "checkpoint file exists");
     let id = blazar_core::session_identity::read_manifest(&ckpt)
         .expect("identity manifest written and parses");
-    assert!(!id.blazar_version.is_empty());
+    assert_ne!(id.blazar_version, "");
 
     // Clean restore: shape matches -> passes the gate.
     let r = c

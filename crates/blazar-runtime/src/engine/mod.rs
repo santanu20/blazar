@@ -3675,7 +3675,7 @@ mod verify_tests {
                 !mgr.dirs.engines_dir().join("fresh-cuda").exists(),
                 "F88: no orphan dir from a failed fresh install"
             );
-            assert!(aside_leftovers(&mgr).is_empty());
+            assert_eq!(aside_leftovers(&mgr).len(), 0);
         }
     }
 

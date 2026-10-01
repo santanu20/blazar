@@ -656,6 +656,6 @@ mod tests {
         let m = vec![vec![2.0f64, 0.0], vec![0.0, 2.0]];
         let v = mean_pool(&m);
         assert!((v[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
-        assert!(mean_pool(&[]).is_empty());
+        assert_eq!(mean_pool(&[]).len(), 0);
     }
 }

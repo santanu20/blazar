@@ -461,9 +461,10 @@ mod tests {
             advertising_lanes("x-arch", Some("main-old"), &lanes),
             vec!["fork-new", "fork-old"]
         );
-        assert!(advertising_lanes("other-arch", None, &lanes).is_empty());
-        assert!(
-            advertising_lanes("x-arch", None, &[("m", LaneClass::Mainstream, None)]).is_empty()
+        assert_eq!(advertising_lanes("other-arch", None, &lanes).len(), 0);
+        assert_eq!(
+            advertising_lanes("x-arch", None, &[("m", LaneClass::Mainstream, None)]).len(),
+            0
         );
     }
 

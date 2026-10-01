@@ -7443,7 +7443,7 @@ mod routing_tests {
         ];
         let (out, w) = Supervisor::map_devices(&argv("Vulkan1"), &frozen, &live);
         assert!(out.contains(&"Vulkan1".to_string()));
-        assert!(w.is_empty());
+        assert_eq!(w.len(), 0);
         // (b) same hardware re-enumerated under a new name: rewritten.
         let live2 = vec![dev("Vulkan0", "NVIDIA GeForce RTX 4070 Laptop GPU", 8188)];
         let (out, w) = Supervisor::map_devices(&argv("Vulkan1"), &frozen, &live2);
@@ -8224,10 +8224,10 @@ mod routing_tests {
             ]
         );
         // Probe short of ranks (mixed vendor / off-box probe): fail open.
-        assert!(spanning_env_from_probe(Some(2), 1).is_empty());
+        assert_eq!(spanning_env_from_probe(Some(2), 1).len(), 0);
         // Non-spanning, single rank, absent plan: never pinned.
-        assert!(spanning_env_from_probe(None, 4).is_empty());
-        assert!(spanning_env_from_probe(Some(1), 4).is_empty());
+        assert_eq!(spanning_env_from_probe(None, 4).len(), 0);
+        assert_eq!(spanning_env_from_probe(Some(1), 4).len(), 0);
     }
 
     #[test]
@@ -8250,14 +8250,17 @@ mod routing_tests {
         );
         // Identity census: the unfiltered child already sees exactly the
         // plan's cards — no emission.
-        assert!(spanning_env_from_census(
-            Some(2),
-            0,
-            &names(&["Vulkan0: AMD Radeon", "Vulkan1: Intel Arc"]),
-            true,
-            true,
-        )
-        .is_empty());
+        assert_eq!(
+            spanning_env_from_census(
+                Some(2),
+                0,
+                &names(&["Vulkan0: AMD Radeon", "Vulkan1: Intel Arc"]),
+                true,
+                true,
+            )
+            .len(),
+            0
+        );
         // CUDA census names never parse as Vulkan: the CUDA pair path
         // takes over (probed count decides).
         assert_eq!(
@@ -8275,33 +8278,42 @@ mod routing_tests {
         );
         // Malformed Vulkan tokens fail open to the CUDA path, and with
         // no NVIDIA probe either, the env stays empty.
-        assert!(spanning_env_from_census(
-            Some(2),
-            0,
-            &names(&["Vulkan: odd build", "Vulkan2: Intel Arc"]),
-            true,
-            true,
-        )
-        .is_empty());
+        assert_eq!(
+            spanning_env_from_census(
+                Some(2),
+                0,
+                &names(&["Vulkan: odd build", "Vulkan2: Intel Arc"]),
+                true,
+                true,
+            )
+            .len(),
+            0
+        );
         // Census count short of ranks: never guess partial pins.
-        assert!(spanning_env_from_census(
-            Some(3),
-            0,
-            &names(&["Vulkan1: A", "Vulkan2: B"]),
-            true,
-            true,
-        )
-        .is_empty());
+        assert_eq!(
+            spanning_env_from_census(
+                Some(3),
+                0,
+                &names(&["Vulkan1: A", "Vulkan2: B"]),
+                true,
+                true,
+            )
+            .len(),
+            0
+        );
         // Non-llamacpp lane (sglang/mistral.rs children have no Vulkan
         // backend): Vulkan census is ignored, CUDA pair or nothing.
-        assert!(spanning_env_from_census(
-            Some(2),
-            0,
-            &names(&["Vulkan1: A", "Vulkan2: B"]),
-            false,
-            true,
-        )
-        .is_empty());
+        assert_eq!(
+            spanning_env_from_census(
+                Some(2),
+                0,
+                &names(&["Vulkan1: A", "Vulkan2: B"]),
+                false,
+                true,
+            )
+            .len(),
+            0
+        );
         // Argv carries device ids (manual devices / main-gpu pin): the
         // VK renumber would invalidate them — the Vulkan path stays
         // off. The CUDA pair keeps its shipped probe-count contract
@@ -9474,7 +9486,7 @@ mod routing_tests {
         for _ in 0..(SLOTS_STREAK_TICKS * 2) {
             sup.adaptive_slots_tick();
         }
-        assert!(sup.adopted_slots.is_empty());
+        assert_eq!(sup.adopted_slots.len(), 0);
         kill_all(&[ph]);
     }
 
@@ -9916,7 +9928,7 @@ mod routing_tests {
             sup.adaptive_slots_tick();
         }
         assert!(sup.adopted_slots.get("m").is_none());
-        assert!(sup.reshape_queue.is_empty());
+        assert_eq!(sup.reshape_queue.len(), 0);
         kill_all(&[ph]);
     }
 
@@ -9935,7 +9947,7 @@ mod routing_tests {
             sup.adaptive_slots_tick();
         }
         assert!(sup.adopted_slots.get("m").is_none());
-        assert!(sup.reshape_queue.is_empty());
+        assert_eq!(sup.reshape_queue.len(), 0);
         kill_all(&[ph]);
     }
 
@@ -9951,7 +9963,7 @@ mod routing_tests {
         for _ in 0..(SLOTS_STREAK_TICKS * 2) {
             sup.adaptive_slots_tick();
         }
-        assert!(sup.adopted_slots.is_empty());
+        assert_eq!(sup.adopted_slots.len(), 0);
         kill_all(&[ph]);
     }
 
@@ -10505,7 +10517,7 @@ mod routing_tests {
             sup.spec_governor_window("m", Some(0.9));
         }
         assert!(sup.spec_override.get("m").is_none());
-        assert!(sup.spec_governor_snapshot().is_empty());
+        assert_eq!(sup.spec_governor_snapshot().len(), 0);
     }
 
     #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
@@ -10518,7 +10530,7 @@ mod routing_tests {
             sup.spec_governor_window("m", Some(0.01));
         }
         assert!(sup.spec_override.get("m").is_none());
-        assert!(sup.spec_governor_snapshot().is_empty());
+        assert_eq!(sup.spec_governor_snapshot().len(), 0);
         kill_all(&[ph]);
     }
 
@@ -10669,7 +10681,7 @@ mod routing_tests {
             sup.ubatch_governor_window("m");
         }
         assert_eq!(sup.governed_ubatch("m"), None);
-        assert!(sup.ubatch_governor_snapshot().is_empty());
+        assert_eq!(sup.ubatch_governor_snapshot().len(), 0);
         kill_all(&[ph]);
     }
 
@@ -10687,7 +10699,7 @@ mod routing_tests {
             sup.ubatch_governor_window("m");
         }
         assert_eq!(sup.governed_ubatch("m"), None, "pin clears stale state");
-        assert!(sup.ubatch_governor_snapshot().is_empty());
+        assert_eq!(sup.ubatch_governor_snapshot().len(), 0);
         kill_all(&[ph]);
     }
 
@@ -10725,7 +10737,7 @@ mod routing_tests {
             sup.ubatch_governor_window("m");
         }
         assert_eq!(sup.governed_ubatch("m"), None);
-        assert!(sup.ubatch_governor_snapshot().is_empty());
+        assert_eq!(sup.ubatch_governor_snapshot().len(), 0);
         kill_all(&[ph]);
     }
 

@@ -323,7 +323,7 @@ mod tests {
         let offers = offers_for_arch(&lanes, "qwen35");
         assert_eq!(offers.len(), 1);
         assert_eq!(offers[0].id, "qwen35-fork");
-        assert!(offers_for_arch(&lanes, "nope").is_empty());
+        assert_eq!(offers_for_arch(&lanes, "nope").len(), 0);
     }
 
     #[test]

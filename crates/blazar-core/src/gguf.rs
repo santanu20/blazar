@@ -1202,7 +1202,7 @@ mod tests {
             embedding_length: Some(4096),
             ..GgufMeta::default()
         };
-        assert!(meta.lint().is_empty());
+        assert_eq!(meta.lint().len(), 0);
     }
 
     #[test]

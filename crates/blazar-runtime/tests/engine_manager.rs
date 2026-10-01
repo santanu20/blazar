@@ -323,11 +323,10 @@ async fn integration__sha_mismatch__fail_fast_no_engine_dir() {
         !dirs.engines_dir().join("b100").exists(),
         "no engine dir left behind"
     );
-    assert!(Store::open(&dirs)
-        .unwrap()
-        .list_engines()
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        Store::open(&dirs).unwrap().list_engines().unwrap(),
+        [] as [blazar_core::EngineRow; 0]
+    );
 }
 
 #[tokio::test]
@@ -1459,7 +1458,10 @@ async fn integration__orphan_engine_dirs__swept_while_referenced_survive() {
         "plain file untouched"
     );
     // Idempotent: a second sweep finds nothing.
-    assert!(mgr.prune_orphan_dirs().unwrap().is_empty());
+    assert_eq!(
+        mgr.prune_orphan_dirs().unwrap(),
+        [] as [(std::string::String, u64); 0]
+    );
 }
 
 /// The automatic debris sweep converges interrupted-install state: stale

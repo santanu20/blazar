@@ -1409,7 +1409,10 @@ mod tests {
         );
 
         // Non-venv binaries (native engine layout) find nothing.
-        assert!(sglang_venv_nvidia_lib_dirs("/opt/blazar/engines/b1/llama-server").is_empty());
+        assert_eq!(
+            sglang_venv_nvidia_lib_dirs("/opt/blazar/engines/b1/llama-server").len(),
+            0
+        );
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 
@@ -1457,7 +1460,7 @@ mod tests {
             "-np".to_string(),
             "1".to_string(),
         ];
-        assert!(probe_rpc_endpoints(&argv).await.is_empty());
+        assert_eq!(probe_rpc_endpoints(&argv).await.len(), 0);
     }
 
     #[tokio::test]
@@ -1467,7 +1470,7 @@ mod tests {
             .unwrap();
         let port = listener.local_addr().unwrap().port();
         let argv = rpc_argv(&format!("127.0.0.1:{port}"));
-        assert!(probe_rpc_endpoints(&argv).await.is_empty());
+        assert_eq!(probe_rpc_endpoints(&argv).await.len(), 0);
     }
 
     #[tokio::test]

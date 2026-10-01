@@ -857,7 +857,7 @@ mod tests {
             .expect("v1 sidecar is loadable");
         assert_eq!(sc.version, 1);
         assert_eq!(sc.done, vec![0, 2]);
-        assert!(sc.partial.is_empty());
+        assert_eq!(sc.partial.len(), 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -927,7 +927,7 @@ mod tests {
                     {
                         Some("bytes=0-0") => {
                             if fail_probe
-                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                                .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                                     if v > 0 {
                                         Some(v - 1)
                                     } else {
@@ -1521,8 +1521,8 @@ mod tests {
         let sc_path = sidecar_path(&part);
         assert!(sc_path.exists(), "ledger must be seeded at engagement");
         let sc = load_sidecar(&part).unwrap().expect("seeded ledger loads");
-        assert!(sc.done.is_empty());
-        assert!(sc.partial.is_empty());
+        assert_eq!(sc.done.len(), 0);
+        assert_eq!(sc.partial.len(), 0);
         assert_eq!(sc.total, payload_len, "preallocated .part reflected");
         std::fs::remove_dir_all(&dir).unwrap();
     }

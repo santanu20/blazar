@@ -190,7 +190,7 @@ mod tests {
             reg.touch("agent1", "qwen");
             let p = reg.pins("qwen", Duration::ZERO);
             assert!(!p.live && p.count == 0);
-            assert!(reg.list(Duration::ZERO).is_empty());
+            assert_eq!(reg.list(Duration::ZERO).len(), 0);
             assert_eq!(reg.live_len(Duration::ZERO), 0);
         }
 
@@ -231,7 +231,7 @@ mod tests {
             reg.touch("a", "m");
             let expired = reg.sweep(Duration::ZERO);
             assert_eq!(expired, vec!["a".to_string()]);
-            assert!(reg.list(Duration::from_secs(15 * 60)).is_empty());
+            assert_eq!(reg.list(Duration::from_secs(15 * 60)).len(), 0);
         }
 
         #[test]

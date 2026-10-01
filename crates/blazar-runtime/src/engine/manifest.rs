@@ -1190,7 +1190,7 @@ mod tests {
     #[test]
     fn unit__parse_devices__none_case() {
         let d = parse_devices("Available devices:\n  (none)\n");
-        assert!(d.is_empty());
+        assert_eq!(d.len(), 0);
     }
 
     #[test]
@@ -1387,7 +1387,7 @@ options:
         assert_eq!(m.repo, None);
         assert_eq!(m.ref_pin, None);
         assert_eq!(m.base_ref, None);
-        assert!(m.architectures.is_empty());
+        assert_eq!(m.architectures.len(), 0);
         assert!(!m.advertises_arch("llama"));
         assert_eq!(m.provenance_label(), "");
     }
@@ -1471,8 +1471,8 @@ options:
         assert!(m.flags.contains("--context-length"), "{:?}", m.flags);
         assert!(m.flags.contains("--mem-fraction-static"), "{:?}", m.flags);
         assert!(m.flags.contains("--kv-cache-dtype"), "{:?}", m.flags);
-        assert!(m.devices.is_empty());
-        assert!(m.spec_types.is_empty());
+        assert_eq!(m.devices.len(), 0);
+        assert_eq!(m.spec_types.len(), 0);
         assert_eq!(m.server_path, shim);
     }
 
@@ -1526,7 +1526,7 @@ mod live_census_tests {
     #[test]
     fn unit__run_list_devices__missing_binary_is_empty_not_panic() {
         let devices = run_list_devices(std::path::Path::new("/nonexistent/blazar-census-probe"));
-        assert!(devices.is_empty());
+        assert_eq!(devices.len(), 0);
     }
 
     #[cfg(unix)]

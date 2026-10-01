@@ -119,7 +119,7 @@ async fn integration__build_cpu__installs_probes_activates() {
 
     assert_eq!(row.tag, "b4242-cpu");
     assert_eq!(row.asset, "built-cpu");
-    assert!(!row.sha256.is_empty());
+    assert_ne!(row.sha256, "");
     let store = Store::open(&dirs).unwrap();
     assert_eq!(store.active_engine().unwrap().unwrap().tag, "b4242-cpu");
     // Tarball layout: engines/<tag>/llama-<tag>/llama-server.

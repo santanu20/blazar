@@ -1189,7 +1189,7 @@ mod tests {
         assert!((for_m[0].scale - 0.8).abs() < f64::EPSILON);
         assert_eq!(s.list_loras(None).unwrap().len(), 2);
         assert!(s.delete_lora(id).unwrap());
-        assert!(s.list_loras(Some("m")).unwrap().is_empty());
+        assert_eq!(s.list_loras(Some("m")).unwrap().len(), 0);
     }
 
     /// The quantized-safetensors routing signal: pull-convention dir
@@ -1326,7 +1326,7 @@ mod tests {
         );
         let old = s.get_model("old-m").unwrap().unwrap();
         assert_eq!(old.bytes, 7);
-        assert!(old.components.is_empty());
+        assert_eq!(old.components.len(), 0);
         assert!(!old.has_component_set());
         // And the new field roundtrips through the migrated table.
         s.upsert_model(&ModelRow {
@@ -1409,7 +1409,7 @@ mod tests {
         );
         assert!(qwen.serves_image_edits());
         let text = s.get_model("text-m").unwrap().unwrap();
-        assert!(text.components.is_empty());
+        assert_eq!(text.components.len(), 0);
         let mut cols = s.conn().prepare("PRAGMA table_info(models)").unwrap();
         let mut rows = cols.query([]).unwrap();
         while let Some(r) = rows.next().unwrap() {

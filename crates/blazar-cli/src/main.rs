@@ -3344,8 +3344,8 @@ mod doctor_tests {
         let set = manifest_flag_set(js);
         assert_eq!(set.len(), 2, "exactly the two advertised flags: {set:?}");
         assert!(set.contains("--a") && set.contains("--b"));
-        assert!(manifest_flag_set("not json at all").is_empty());
-        assert!(manifest_flag_set(r#"{"tag":"x","no_flags":true}"#).is_empty());
+        assert_eq!(manifest_flag_set("not json at all").len(), 0);
+        assert_eq!(manifest_flag_set(r#"{"tag":"x","no_flags":true}"#).len(), 0);
     }
 
     #[test]
@@ -12002,7 +12002,7 @@ async fn search(query: &str, format: &str, quant: Option<&str>, json: bool) -> R
             r.gguf
                 .as_ref()
                 .and_then(|g| g.context_length)
-                .map_or_else(|| "-".to_string(), &human_ctx),
+                .map_or_else(|| "-".to_string(), human_ctx),
             collapse_tokens(&entry_quants(&r)),
         ]);
     }
@@ -13324,7 +13324,7 @@ mod tests {
         // Non-quant tokens stay query text — underscored model ids included.
         let (q, f) = split_quant_query("qwen_image_2.1 gguf awq int4");
         assert_eq!(q, "qwen_image_2.1 gguf awq int4");
-        assert!(f.is_empty());
+        assert_eq!(f.len(), 0);
         // An all-quant query degrades to a filtered popular browse.
         let (q, f) = split_quant_query("q4");
         assert_eq!(q, "");
@@ -14458,7 +14458,7 @@ mod tests {
         assert_eq!(spec.base, "qwen3.5-9b");
         assert_eq!(spec.ctx, Some(32768));
         assert_eq!(spec.loras, vec!["/tmp/a.gguf"]);
-        assert!(spec.unsupported.is_empty());
+        assert_eq!(spec.unsupported.len(), 0);
     }
 
     #[test]
@@ -14825,10 +14825,13 @@ mod tests {
         let l = vec!["Vulkan0".to_string()];
         assert_eq!(device_drift(&f, &l), vec!["Vulkan1".to_string()]);
         // child sees a superset: nothing flagged
-        assert!(device_drift(&f, &f).is_empty());
-        assert!(device_drift(&f, &["Vulkan0".into(), "Vulkan1".into(), "CUDA0".into()]).is_empty());
+        assert_eq!(device_drift(&f, &f).len(), 0);
+        assert_eq!(
+            device_drift(&f, &["Vulkan0".into(), "Vulkan1".into(), "CUDA0".into()]).len(),
+            0
+        );
         // both empty (CPU-only): healthy
-        assert!(device_drift(&[], &[]).is_empty());
+        assert_eq!(device_drift(&[], &[]).len(), 0);
     }
 
     #[test]
@@ -14924,7 +14927,7 @@ mod tests {
 
     #[test]
     fn unit__doctor_config_pins__silent_on_current_defaults() {
-        assert!(doctor_config_pins(&blazar_core::Config::default()).is_empty());
+        assert_eq!(doctor_config_pins(&blazar_core::Config::default()).len(), 0);
     }
 
     #[test]
@@ -15715,16 +15718,22 @@ mod tests {
         assert!(rows[0].detail.contains("PCI 10de"));
         assert!(rows[0].detail.contains("engine update"));
         // Drivered NVIDIA box: silent (cuda_opportunity_rows owns it).
-        assert!(gpu_driver_rows(&["10de".to_string()], Vendor::Nvidia, true).is_empty());
+        assert_eq!(
+            gpu_driver_rows(&["10de".to_string()], Vendor::Nvidia, true).len(),
+            0
+        );
         // Driverless AMD/Intel without a Vulkan ICD: the ICD row.
         let rows = gpu_driver_rows(&["1002".to_string()], Vendor::Other, false);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "vulkan driver");
         assert!(rows[0].detail.contains("mesa-vulkan-drivers"));
         // ICDs present: nothing to say.
-        assert!(gpu_driver_rows(&["8086".to_string()], Vendor::Intel, true).is_empty());
+        assert_eq!(
+            gpu_driver_rows(&["8086".to_string()], Vendor::Intel, true).len(),
+            0
+        );
         // No GPU hardware: never a row.
-        assert!(gpu_driver_rows(&[], Vendor::Other, false).is_empty());
+        assert_eq!(gpu_driver_rows(&[], Vendor::Other, false).len(), 0);
         // Hybrid box (Intel iGPU + NVIDIA) with only the NVIDIA driver
         // present: no vulkan row for the iGPU when ICDs exist.
         assert!(gpu_driver_rows(
@@ -15833,7 +15842,7 @@ mod tests {
         });
         let users = ps_rows_using_engine(&ps, "fork-acme_llama.cpp-7a3c74eb-cuda");
         assert_eq!(users, vec!["amd.instella".to_string()]);
-        assert!(ps_rows_using_engine(&ps, "absent-engine").is_empty());
+        assert_eq!(ps_rows_using_engine(&ps, "absent-engine").len(), 0);
         assert!(
             ps_rows_using_engine(&serde_json::json!({}), "any").is_empty(),
             "missing models key is not a refusal"

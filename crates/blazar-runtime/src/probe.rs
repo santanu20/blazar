@@ -500,7 +500,7 @@ mod tests {
         // nvidia-smi fallback (environment-dependent) — portability means
         // asserting the sysinfo-only merge at the composition point.
         let cpu_only = hardware_with(Vec::new());
-        assert!(cpu_only.gpus.is_empty());
+        assert_eq!(cpu_only.gpus.len(), 0);
     }
 
     #[test]
@@ -554,7 +554,7 @@ mod tests {
         assert!(gpus[0].description.contains("NVIDIA"));
         assert!(!gpus[0].is_integrated(), "nvidia entries read discrete");
         // Garbage lines skip; partial lines skip — never a guessed entry.
-        assert!(parse_nvidia_csv("nope\n\nRTX, only-two\n").is_empty());
+        assert_eq!(parse_nvidia_csv("nope\n\nRTX, only-two\n").len(), 0);
     }
 
     #[test]
@@ -571,7 +571,7 @@ mod tests {
         let s = parse_gpu_tenants("42, ollama, 972 MiB\n");
         assert_eq!(s[0].used_mib, 972, "unit suffix tolerated");
         // Non-numeric pid / empty name / short lines skip silently.
-        assert!(parse_gpu_tenants("NotFound, , \nnope\n").is_empty());
+        assert_eq!(parse_gpu_tenants("NotFound, , \nnope\n").len(), 0);
     }
 
     #[test]

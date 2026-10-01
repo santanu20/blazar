@@ -1928,7 +1928,7 @@ mod tests {
         let failed =
             serde_json::json!({"created": 1i64, "status": "failed", "error": {"message": "x"}});
         let out = native_job_to_openai(&failed);
-        assert!(out["data"].as_array().unwrap().is_empty());
+        assert_eq!(out["data"].as_array().unwrap().len(), 0);
     }
 
     #[test]

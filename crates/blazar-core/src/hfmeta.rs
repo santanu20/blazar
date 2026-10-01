@@ -322,7 +322,7 @@ mod tests {
     #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__root_safetensors__listing_and_bytes_sum() {
         let dir = write_dir(&[]);
-        assert!(root_safetensors(dir.path()).is_empty());
+        assert_eq!(root_safetensors(dir.path()).len(), 0);
         assert_eq!(root_safetensors_bytes(dir.path()), None);
         fs::write(dir.path().join("model-00001-of-00002.safetensors"), "aaaa").unwrap();
         fs::write(dir.path().join("model-00002-of-00002.safetensors"), "aa").unwrap();

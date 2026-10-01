@@ -3182,7 +3182,10 @@ mod tests {
         assert!(got.contains(&snap_a.join("vae").join("ae.safetensors")));
         assert!(got.contains(&snap_b.join("vae").join("ae.safetensors")));
         // Unknown repo → no candidates, no error.
-        assert!(hf_hub_candidates_at(tmp.path(), "org/never-pulled", "x.bin").is_empty());
+        assert_eq!(
+            hf_hub_candidates_at(tmp.path(), "org/never-pulled", "x.bin").len(),
+            0
+        );
         // Backslashes in a Windows-style repo slug normalize to the same
         // hub dir naming as forward slashes.
         assert_eq!(
@@ -3503,15 +3506,15 @@ mod tests {
             24_000_000_000,
             32_768,
         );
-        assert!(rows.is_empty());
+        assert_eq!(rows.len(), 0);
     }
 
     #[test]
     fn unit__search_entry__tags_and_siblings_default_when_hub_omits() {
         let e: SearchEntry = serde_json::from_str(r#"{"id":"o/m"}"#).unwrap();
         assert_eq!(e.id, "o/m");
-        assert!(e.tags.is_empty());
-        assert!(e.siblings.is_empty());
+        assert_eq!(e.tags.len(), 0);
+        assert_eq!(e.siblings.len(), 0);
         assert!(e.gguf.is_none());
     }
 
@@ -3663,7 +3666,7 @@ mod tests {
 
     #[test]
     fn unit__quant_tokens__no_gguf_files_is_empty() {
-        assert!(quant_tokens(["README.md", "config.json"]).is_empty());
+        assert_eq!(quant_tokens(["README.md", "config.json"]).len(), 0);
     }
 
     #[test]
@@ -4729,11 +4732,7 @@ mod tests {
             dirs.models_dir().read_dir().unwrap().count() == 0,
             "no partial left behind"
         );
-        assert!(Store::open(&dirs)
-            .unwrap()
-            .list_models()
-            .unwrap()
-            .is_empty());
+        assert_eq!(Store::open(&dirs).unwrap().list_models().unwrap().len(), 0);
     }
 
     #[tokio::test]

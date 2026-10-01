@@ -968,7 +968,7 @@ mod tests {
         let (b, ct) = body("XbOuNdArY", &[("file", "a.wav", b"")]);
         let parts = parse_multipart(&b, &ct).expect("parses");
         assert_eq!(parts.len(), 1);
-        assert!(parts[0].data.is_empty());
+        assert_eq!(parts[0].data.len(), 0);
     }
 
     #[test]

@@ -239,7 +239,7 @@ mod tests {
         saved.model_sha = Some("same".into());
         let mut current = ident();
         current.model_sha = Some("same".into());
-        assert!(verify(&saved, &current).is_empty());
+        assert_eq!(verify(&saved, &current).len(), 0);
         current.model_sha = Some("other".into());
         assert!(verify(&saved, &current)
             .iter()
@@ -345,6 +345,6 @@ mod tests {
         // Same composed value on both sides restores cleanly.
         let mut twin = ident();
         twin.cache_type = "q8_0/q4_0".into();
-        assert!(verify(&current, &twin).is_empty());
+        assert_eq!(verify(&current, &twin).len(), 0);
     }
 }

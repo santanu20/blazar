@@ -4013,7 +4013,7 @@ mod tests {
 
     #[test]
     fn unit__retired_pins__default_config_has_none() {
-        assert!(Config::default().retired_default_pins().is_empty());
+        assert_eq!(Config::default().retired_default_pins().len(), 0);
     }
 
     #[test]
@@ -4064,13 +4064,16 @@ mod tests {
             "{pins:?}"
         );
         // Current-default values never fire, explicit or not.
-        assert!(Config {
-            cache_reuse: 0,
-            spec: "auto".into(),
-            ..Config::default()
-        }
-        .retired_default_pins()
-        .is_empty());
+        assert_eq!(
+            Config {
+                cache_reuse: 0,
+                spec: "auto".into(),
+                ..Config::default()
+            }
+            .retired_default_pins()
+            .len(),
+            0
+        );
     }
 
     #[test]
@@ -5214,7 +5217,7 @@ default_ctx = 16384
             "default ctx_extend not zero"
         );
         assert_eq!(c.cpu_moe_n, 0);
-        assert!(c.override_tensor.is_empty());
+        assert_eq!(c.override_tensor.len(), 0);
         assert!(!c.agent);
         assert!(c.sessions);
         assert!(c.validate().is_ok());
