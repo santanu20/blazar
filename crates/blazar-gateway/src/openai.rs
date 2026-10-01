@@ -86,7 +86,9 @@ pub async fn models(State(state): State<Arc<AppState>>) -> Response {
                 m.iter()
                     .flat_map(|(k, p)| {
                         let owner = k.split('|').next().unwrap_or("remote");
-                        p.entries.iter().map(move |id| (owner.to_string(), id.clone()))
+                        p.entries
+                            .iter()
+                            .map(move |id| (owner.to_string(), id.clone()))
                     })
                     .collect::<Vec<(String, String)>>()
             })

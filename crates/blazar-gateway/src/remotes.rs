@@ -443,11 +443,7 @@ async fn fetch_presence(state: &AppState, remote: &Remote) -> Option<Vec<String>
     if !remote.key.is_empty() {
         req = req.bearer_auth(&remote.key);
     }
-    let entries = match req
-        .timeout(std::time::Duration::from_secs(3))
-        .send()
-        .await
-    {
+    let entries = match req.timeout(std::time::Duration::from_secs(3)).send().await {
         Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
             Ok(v) => v["data"]
                 .as_array()
@@ -538,9 +534,8 @@ pub async fn peers_serving<'a>(state: &'a AppState, model: &str) -> Vec<&'a Remo
             .lock()
             .ok()
             .and_then(|m| {
-                m.get(&health_key(remote)).map(|h| {
-                    h.down_until.is_none_or(|t| std::time::Instant::now() >= t)
-                })
+                m.get(&health_key(remote))
+                    .map(|h| h.down_until.is_none_or(|t| std::time::Instant::now() >= t))
             })
             .unwrap_or(true);
         if !live {
@@ -579,9 +574,8 @@ pub async fn peers_serving_with_refresh<'a>(state: &'a AppState, model: &str) ->
             .lock()
             .ok()
             .and_then(|m| {
-                m.get(&health_key(remote)).map(|h| {
-                    h.down_until.is_none_or(|t| std::time::Instant::now() >= t)
-                })
+                m.get(&health_key(remote))
+                    .map(|h| h.down_until.is_none_or(|t| std::time::Instant::now() >= t))
             })
             .unwrap_or(true);
         if !live {
@@ -1048,6 +1042,9 @@ mod tests {
         }];
         assert!(fallback_enabled(&cfg), "armed by default with a remote");
         cfg.remote_fallback = false;
-        assert!(!fallback_enabled(&cfg), "kill switch rolls the feature back");
+        assert!(
+            !fallback_enabled(&cfg),
+            "kill switch rolls the feature back"
+        );
     }
 }

@@ -121,7 +121,7 @@ Box: primary :11435 (systemd) + sandbox peer fed2 :11436 (XDG_CONFIG_HOME/XDG_DA
 
 Sandbox gotchas receipted: `ln -sfn` nests when target dir exists (rm first); nohup daemons die on tool timeout (use setsid); env-isolated daemons unfindable by pkill -f (match /proc/N/environ or ss port); registry pull stalled twice (reflink copy instead — pull-dialect filename with quant tail required); config.toml `remotes = []` inline means sed-replace not append (TOML duplicate key = boot fail).
 
-State after test: fed2 killed, primary config restored (remotes empty, backup /tmp/opencode/config.toml.bak-fed), sandbox removed, primary healthz ok. Tests: gateway+core+runtime suites green, clippy 0. Not committed (shared index).
+State after test: fed2 killed, primary config restored (remotes empty, backup held outside the repo), sandbox removed, primary healthz ok. Tests: gateway+core+runtime suites green, clippy 0. Not committed (shared index).
 
 ## 11. 20261001 — HW-agnostic pinning (Vulkan) + federation breadth
 
