@@ -2901,8 +2901,40 @@ async fn e2e__tool_wins_admission_over_earlier_queued_interactive() {
         }
     };
     // A: plain chat, admitted immediately, holds the slot ~6 s.
+    // Deterministic hold: wait until the daemon CONFIRMS m1 is in
+    // flight before queueing the waiters. A fixed stagger let slow
+    // runners (Windows CI receipt: run 36806193764) queue C before A
+    // reached the gate — C then admitted first and the scenario under
+    // test flipped (tool could no longer jump the earlier-queued
+    // interactive because it was not queued behind a held slot).
     let a = tokio::spawn(chat(false));
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let inflight = match client().get(format!("{}/api/ps", ts.base)).send().await {
+            Ok(r) if r.status().is_success() => r
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| {
+                    v["models"].as_array().map(|rows| {
+                        rows.iter()
+                            .filter(|r| r["model"].as_str() == Some("m1"))
+                            .filter_map(|r| r["blazar_in_flight"].as_i64())
+                            .sum::<i64>()
+                    })
+                })
+                .unwrap_or(0),
+            _ => 0,
+        };
+        if inflight >= 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "A never reached the admission gate"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     // C: plain chat (Interactive) — queues FIRST.
     let c = tokio::spawn(chat(false));
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
