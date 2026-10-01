@@ -455,12 +455,28 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
             .iter()
             .map(|r| {
                 let s = &state_for_probe;
-                async move { (r.name.clone(), crate::remotes::probe(s, r).await) }
+                async move { (r, crate::remotes::probe(s, r).await) }
             })
             .collect();
         let mut out = Vec::new();
-        for (name, (ok, note)) in futures::future::join_all(futs).await {
-            out.push(json!({"name": name, "ok": ok, "note": note}));
+        for (r, (ok, note)) in futures::future::join_all(futs).await {
+            let mut entry = json!({"name": r.name, "ok": ok, "note": note});
+            // v0.16: cached capacity summary per remote. The field is
+            // ABSENT when there is no snapshot (non-Blazar peer, or not
+            // yet fetched) — absence is the degrade signal, matching
+            // the parse_capacity contract.
+            if let Some(c) = crate::remotes::cached_capacity(&state, r) {
+                let free: u64 = c.devices.iter().map(|d| d.free_vram_bytes).sum();
+                let total: u64 = c.devices.iter().map(|d| d.total_vram_bytes).sum();
+                entry["capacity"] = json!({
+                    "devices": c.devices.len(),
+                    "total_vram_bytes": total,
+                    "free_vram_bytes": free,
+                    "residents": c.residents.len(),
+                    "age_secs": c.fetched.elapsed().as_secs(),
+                });
+            }
+            out.push(entry);
         }
         out
     };
