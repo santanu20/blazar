@@ -1525,8 +1525,9 @@ async fn e2e__audio_capabilities__empty_install_reports_gaps_without_booting() {
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
-/// Job routes: unknown id 404s with the gateway-owned lifetime truth;
-/// a hostile id (path/meta characters) 400s before any lookup.
+/// Job routes: unknown id 404s with the durable-ledger lifetime truth;
+/// a hostile id (path/meta characters) 400s before any lookup. The
+/// unified `/v1/jobs` plane teaches the same contract on its own routes.
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn e2e__audio_jobs__unknown_404_and_invalid_id_400() {
@@ -1541,9 +1542,24 @@ async fn e2e__audio_jobs__unknown_404_and_invalid_id_400() {
     let r: serde_json::Value = resp.json().await.unwrap();
     let msg = r["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        msg.contains("die with the gateway process"),
+        msg.contains("durable records live at /v1/jobs"),
         "lifetime truth in the 404: {r}"
     );
+    // Unified plane: empty ledger lists cleanly, unknown ids 404.
+    let resp = c
+        .get(format!("{}/v1/jobs?kind=audio&limit=5", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let list: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(list["object"], "blazar.job.list", "list shape: {list}");
+    let resp = c
+        .get(format!("{}/v1/jobs/job-does-not-exist", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
     let resp = c
         .post(format!("{}/v1/audio/jobs/..%2Fetc/cancel", ts.base))
         .send()

@@ -455,7 +455,7 @@ impl AudioJobs {
     /// Cancel a queued/running job: abort its task, mark Cancelled.
     /// `None` = unknown id; `Some(false)` = already terminal (idempotent
     /// poll-friendly no-op).
-    fn cancel(&self, id: &str) -> Option<bool> {
+    pub(crate) fn cancel(&self, id: &str) -> Option<bool> {
         let handle = {
             let mut store = self.inner.lock().expect("audio jobs lock");
             let entry = store.jobs.get_mut(id)?;
@@ -476,7 +476,7 @@ impl AudioJobs {
     /// Poll payload for `/v1/audio/jobs/{id}`: status plus the upstream
     /// triple on completion (body parsed as JSON when possible, raw
     /// text otherwise — transcription bodies are JSON in practice).
-    fn payload(&self, id: &str) -> Option<serde_json::Value> {
+    pub(crate) fn payload(&self, id: &str) -> Option<serde_json::Value> {
         let store = self.inner.lock().expect("audio jobs lock");
         let entry = store.jobs.get(id)?;
         let mut payload = serde_json::json!({
@@ -549,12 +549,29 @@ fn submit_async(
     force_translate: bool,
 ) -> Response {
     let id = state.audio_jobs.reserve();
+    // Durable ledger write-through: the row outlives the gateway, the
+    // input artifact makes a resubmit after an abandon possible without
+    // re-uploading (bounded — oversized uploads skip the copy, the row
+    // still lands).
+    state.jobs.record_created(
+        state,
+        &id,
+        "audio",
+        field(&parts, "model").as_deref(),
+        serde_json::json!({
+            "size": size,
+            "filename": file.filename,
+            "translate": force_translate,
+        }),
+    );
+    state.jobs.record_input_artifact(&id, file.filename.as_deref(), &file.data);
     let task_id = id.clone();
     let task_state = Arc::clone(state);
     let bin = bin.to_path_buf();
     let lib_dir = lib_dir.to_path_buf();
     let task = tokio::spawn(async move {
         task_state.audio_jobs.mark_running(&task_id);
+        task_state.jobs.record_running(&task_state, &task_id);
         match forward_local_raw(
             &task_state,
             &parts,
@@ -570,8 +587,14 @@ fn submit_async(
                 task_state
                     .audio_jobs
                     .finish(&task_id, status.as_u16(), &ct, bytes.to_vec());
+                task_state
+                    .jobs
+                    .record_completed(&task_state, &task_id, &bytes, &ct);
             }
-            Err((_code, msg)) => task_state.audio_jobs.fail(&task_id, msg),
+            Err((_code, msg)) => {
+                task_state.audio_jobs.fail(&task_id, msg.clone());
+                task_state.jobs.record_failed(&task_state, &task_id, &msg);
+            }
         }
     });
     state.audio_jobs.set_handle(&id, task);
@@ -595,7 +618,10 @@ fn submit_async(
         .unwrap_or_else(|_| openai_error(500, "response build").into_response())
 }
 
-/// GET /v1/audio/jobs/{id} — poll a gateway-owned async audio job.
+/// GET /v1/audio/jobs/{id} — poll a gateway-owned async audio job. The
+/// live registry answers while this gateway lives; the durable ledger
+/// answers after a restart (completed results and honest failures —
+/// in-flight work cannot resume and is swept to `abandoned` at boot).
 #[allow(clippy::unused_async)] // axum's Handler trait requires async fns
 pub async fn audio_jobs_get(
     State(state): State<Arc<AppState>>,
@@ -607,19 +633,28 @@ pub async fn audio_jobs_get(
     {
         return openai_error(400, "invalid job id");
     }
-    match state.audio_jobs.payload(&job_id) {
-        Some(payload) => Response::builder()
+    if let Some(payload) = state.audio_jobs.payload(&job_id) {
+        return Response::builder()
             .status(200)
             .header(axum::http::header::CONTENT_TYPE, "application/json")
             .body(axum::body::Body::from(
                 serde_json::to_vec(&payload).unwrap_or_default(),
             ))
-            .unwrap_or_else(|_| openai_error(500, "response build").into_response()),
-        None => openai_error(
-            404,
-            "job not found — audio jobs are gateway-owned and die with the gateway process",
-        ),
+            .unwrap_or_else(|_| openai_error(500, "response build").into_response());
     }
+    // Live registry miss (evicted cap slot or a restarted gateway): the
+    // ledger is the afterlife.
+    if let Some(row) = state
+        .with_store(|s| s.get_job(&job_id).ok().flatten())
+        .flatten()
+    {
+        return axum::Json(crate::jobs::row_payload(&row)).into_response();
+    }
+    openai_error(
+        404,
+        "job not found — live audio handles are capped and gateway-owned; durable records \
+         live at /v1/jobs/{id} (completed results survive restarts)",
+    )
 }
 
 /// POST /v1/audio/jobs/{id}/cancel — abort a queued/running job. The
@@ -641,19 +676,43 @@ pub async fn audio_jobs_cancel(
     // cancel() performs the abort side effect (a terminal/unknown job is
     // a no-op); either way the answer is the job's current state — 200
     // with the payload, 404 when no such job exists.
-    let _ = state.audio_jobs.cancel(&job_id);
-    match state.audio_jobs.payload(&job_id) {
-        Some(payload) => Response::builder()
+    if state.audio_jobs.cancel(&job_id) == Some(true) {
+        state.jobs.record_cancelled(&state, &job_id);
+    }
+    if let Some(payload) = state.audio_jobs.payload(&job_id) {
+        Response::builder()
             .status(200)
             .header(axum::http::header::CONTENT_TYPE, "application/json")
             .body(axum::body::Body::from(
                 serde_json::to_vec(&payload).unwrap_or_default(),
             ))
-            .unwrap_or_else(|_| openai_error(500, "response build").into_response()),
-        None => openai_error(
+            .unwrap_or_else(|_| openai_error(500, "response build").into_response())
+    } else if let Some(row) = state
+        .with_store(|s| s.get_job(&job_id).ok().flatten())
+        .flatten()
+    {
+        // Registry miss but a ledger row exists (restarted gateway or an
+        // evicted cap slot): close an in-flight row — its task died with
+        // the old process — and answer from the row.
+        if matches!(row.state.as_str(), "queued" | "running") {
+            state.jobs.record_cancelled(&state, &job_id);
+        }
+        let fresh = state
+            .with_store(|s| s.get_job(&job_id).ok().flatten())
+            .flatten();
+        match fresh {
+            Some(fresh) => axum::Json(crate::jobs::row_payload(&fresh)).into_response(),
+            None => openai_error(
+                404,
+                "job not found — durable records live at /v1/jobs/{id}",
+            ),
+        }
+    } else {
+        openai_error(
             404,
-            "job not found — audio jobs are gateway-owned and die with the gateway process",
-        ),
+            "job not found — live audio handles are capped and gateway-owned; durable records \
+             live at /v1/jobs/{id}",
+        )
     }
 }
 

@@ -3538,6 +3538,24 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         "# HELP blazar_audio_jobs_active Local audio transcription jobs (queued+running)\n# TYPE blazar_audio_jobs_active gauge\nblazar_audio_jobs_active {}\n",
         state.audio_jobs.active_count()
     );
+    // Durable ledger view: non-terminal rows across ALL lanes (audio,
+    // image, video) — after a restart this drops to zero via the boot
+    // sweep, which is exactly the signal an operator wants.
+    let durable_jobs_active = state
+        .with_store(|s| {
+            s.list_jobs(Some("queued"), None, 1000)
+                .unwrap_or_default()
+                .len()
+                + s.list_jobs(Some("running"), None, 1000)
+                    .unwrap_or_default()
+                    .len()
+        })
+        .unwrap_or(0);
+    let _ = write!(
+        merged,
+        "# HELP blazar_jobs_active Durable job rows not yet terminal (all lanes)\n# TYPE blazar_jobs_active gauge\nblazar_jobs_active {}\n",
+        durable_jobs_active
+    );
     let _ = write!(
         merged,
         "# HELP blazar_evictions_total Total instance evictions\n# TYPE blazar_evictions_total counter\nblazar_evictions_total {}\n",

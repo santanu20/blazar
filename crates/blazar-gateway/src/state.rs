@@ -206,6 +206,12 @@ pub struct AppState {
     /// spawned tasks polled at /v1/audio/jobs/{id}. Bounded registry;
     /// jobs die with the gateway process.
     pub audio_jobs: crate::whisper::AudioJobs,
+    /// Durable job ledger (SQLite write-through behind every async lane:
+    /// audio tasks, image/video child jobs) plus the unified
+    /// `/v1/jobs` read/cancel/events plane. Owns artifact spillover on
+    /// disk; holds no locks and no tasks — the lanes stay authoritative
+    /// for live state, this outlives them.
+    pub jobs: std::sync::Arc<crate::jobs::JobRuntime>,
     /// Single-flight for identical NON-STREAM requests (model + body
     /// hash): concurrent duplicates wait for the leader, then ride the
     /// leader's warm prefix instead of double-prefilling. Bounded. The
@@ -388,6 +394,9 @@ impl AppState {
                 }
             });
         }
+        // Job ledger owns `<data>/jobs` artifact spillover; constructed
+        // before the struct literal because `dirs` moves into it.
+        let jobs = std::sync::Arc::new(crate::jobs::JobRuntime::new(&dirs.data_dir));
         Self {
             dirs,
             config,
@@ -410,6 +419,7 @@ impl AppState {
             responses: std::sync::Mutex::new(crate::responses::ResponsesRegistry::new()),
             whisper,
             audio_jobs: crate::whisper::AudioJobs::new(),
+            jobs,
             http_addr: std::sync::OnceLock::new(),
             remote_health: std::sync::Arc::default(),
             remote_affinity: std::sync::Arc::default(),

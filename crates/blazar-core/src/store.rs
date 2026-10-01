@@ -353,7 +353,7 @@ pub struct StoredResponseRow {
     pub ts: i64,
 }
 
-fn unix_now() -> i64 {
+pub fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0))
@@ -521,6 +521,17 @@ impl Store {
         let n = self.conn.execute(
             "UPDATE jobs SET state = ?2, result_json = COALESCE(?3, result_json), error = ?4, updated_at = ?5 WHERE id = ?1",
             params![id, state, result_json, error, unix_now()],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Attach a spilled-result artifact path to a job row (results too
+    /// large for the inline column). Separate from `set_job_state` so a
+    /// transition never needs to know about disk spillover.
+    pub fn set_job_artifact(&self, id: &str, artifact_path: &str) -> CoreResult<bool> {
+        let n = self.conn.execute(
+            "UPDATE jobs SET artifact_path = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, artifact_path, unix_now()],
         )?;
         Ok(n == 1)
     }
