@@ -4,6 +4,26 @@ All notable changes to Blazar are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
+## [Unreleased]
+
+Theme: **capacity-aware federation** — peers selected by measurement, not
+guesswork.
+
+### Added
+- Peer capacity signals: Blazar remotes now answer a cached
+  `GET /api/capacity` snapshot (devices, residents, queue depth) fetched
+  alongside presence — capacity never blocks presence, non-Blazar peers
+  degrade silently to plain remotes.
+- Time-to-first-token EWMA per remote (`RemoteHealth.ttft_ewma_ms`),
+  fed from real forwards (ok requests only, measured to response head).
+- Tiered peer ranking everywhere a non-sticky pick happens:
+  warm (model resident, capacity known) > unknown-capacity > catalog-cold,
+  then estimated queue wait (leases + peer `in_flight` over slots, times
+  the TTFT EWMA or a 750ms neutral default), then most free VRAM.
+  Sticky conversation affinity and the failure circuit are unchanged.
+- `/api/ps` remotes carry the cached `capacity` summary (absent field =
+  no snapshot).
+
 ## [0.15.0] - 2026-10-02
 
 Theme: **the reliability layer** — local AI that behaves like infrastructure.
