@@ -210,6 +210,7 @@ mod tests {
     use super::{downgrade_note, semver_triple};
 
     #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__semver_triple__v_prefixed_bare_and_rejected_shapes() {
         assert_eq!(semver_triple("v0.14.0"), Some((0, 14, 0)));
         assert_eq!(semver_triple("0.14.0"), Some((0, 14, 0)));
@@ -222,6 +223,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__downgrade_note__older_target_flags_rollback_only() {
         assert_eq!(
             downgrade_note("v0.13.0", "0.14.0"),
