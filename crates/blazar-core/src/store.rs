@@ -651,17 +651,22 @@ impl Store {
     }
 
     /// Boot-time honesty sweep: every job still `queued`/`running` whose
-    /// row predates `grace_secs` ago belonged to a dead gateway — mark it
-    /// `abandoned` with a teaching error and an event. The grace window
+    /// `updated_at` predates `cutoff_unix` belonged to a dead gateway —
+    /// mark it `abandoned` with a teaching error and an event. Two callers,
+    /// two cutoffs: at boot the cutoff is `now - grace` (the grace window
     /// keeps a concurrently-live second daemon from reaping the other's
-    /// fresh work. Returns the swept ids (for the boot log).
-    pub fn boot_sweep_jobs(&self, grace_secs: i64) -> CoreResult<Vec<String>> {
-        let cutoff = unix_now() - grace_secs.max(0);
+    /// fresh work), and a delayed second pass cuts at this daemon's start
+    /// time — catching rows whose last update fell inside the grace window
+    /// (killed less than `grace` before boot) which the first pass
+    /// deliberately spared. This daemon's own jobs always have
+    /// `updated_at >= its start`, so live work is never reaped.
+    /// Returns the swept ids (for the boot log).
+    pub fn sweep_jobs_updated_before(&self, cutoff_unix: i64) -> CoreResult<Vec<String>> {
         let swept: Vec<String> = {
             let mut stmt = self.conn.prepare(
                 "SELECT id FROM jobs WHERE state IN ('queued','running') AND updated_at < ?1",
             )?;
-            let rows = stmt.query_map(params![cutoff], |r| r.get::<_, String>(0))?;
+            let rows = stmt.query_map(params![cutoff_unix], |r| r.get::<_, String>(0))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         let now = unix_now();
@@ -1389,7 +1394,7 @@ mod tests {
         s.insert_job(&job_row("done", "audio", "completed", now - 3600))
             .unwrap();
 
-        let swept = s.boot_sweep_jobs(5).unwrap();
+        let swept = s.sweep_jobs_updated_before(unix_now() - 5).unwrap();
         assert_eq!(swept, vec!["old".to_string()]);
 
         let old = s.get_job("old").unwrap().unwrap();
@@ -1402,6 +1407,26 @@ mod tests {
         // The abandonment is part of the story.
         let events = s.job_events("old", 10).unwrap();
         assert!(events.iter().any(|e| e.kind == "abandoned"));
+    }
+
+    #[test]
+    fn unit__jobs__late_sweep_reaps_grace_window_survivors_only() {
+        let (_t, s) = tmp_store();
+        let now = unix_now();
+        // Killed moments before boot: survived the grace pass (updated_at
+        // inside the window), but predates the daemon — the late pass
+        // with the daemon-start cutoff must reap it.
+        s.insert_job(&job_row("zombie", "doctor", "running", now - 3))
+            .unwrap();
+        // This daemon's own live work: updated after boot — never reaped,
+        // even when a long probe keeps the row silent for minutes.
+        s.insert_job(&job_row("live", "doctor", "running", now + 30))
+            .unwrap();
+
+        let swept = s.sweep_jobs_updated_before(now).unwrap();
+        assert_eq!(swept, vec!["zombie".to_string()]);
+        assert_eq!(s.get_job("zombie").unwrap().unwrap().state, "abandoned");
+        assert_eq!(s.get_job("live").unwrap().unwrap().state, "running");
     }
 
     #[test]
