@@ -405,6 +405,31 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Disk-space intelligence: what Blazar stores, where it lives, and
+    /// what can be reclaimed (orphans, stale partials, unused models)
+    Storage {
+        /// One JSON object for the whole report; suppresses the tables
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reclaim disk: dry-run by default, `--yes` executes
+    Prune {
+        /// Remove orphan files + stale .part downloads
+        #[arg(long)]
+        orphans: bool,
+        /// Remove models not used within --since-days (residents excluded)
+        #[arg(long)]
+        unused: bool,
+        /// Idle window for --unused (default 30 days)
+        #[arg(long, default_value_t = 30)]
+        since_days: u64,
+        /// Execute (default is a dry-run preview)
+        #[arg(long)]
+        yes: bool,
+        /// One JSON object per reclaimed item
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect and edit config.toml knobs (set / get / unset / defaults)
     #[command(after_help = CONFIG_EXAMPLES)]
     Config {
@@ -833,6 +858,8 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "mmproj",
             "search",
             "fit",
+            "storage",
+            "prune",
             "lora",
             "warm",
             "replicate",
@@ -1633,6 +1660,14 @@ async fn run(cmd: Cmd) -> Result<()> {
             json,
         } => search(&query.join(" "), &format, quant.as_deref(), json).await,
         Cmd::Fit { target, json } => fit(&target, json).await,
+        Cmd::Storage { json } => storage_cmd(json).await,
+        Cmd::Prune {
+            orphans,
+            unused,
+            since_days,
+            yes,
+            json,
+        } => prune_cmd(orphans, unused, since_days, yes, json).await,
         Cmd::Config { cmd } => config_cmd(cmd),
         Cmd::Upgrade { version, dry_run } => upgrade(version, dry_run).await,
         Cmd::Cp {
@@ -6020,6 +6055,13 @@ fn import(
                 .as_secs(),
         )
         .unwrap_or(i64::MAX),
+        last_used_at: i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        )
+        .unwrap_or(i64::MAX),
     };
     let store = Store::open(&d)?;
     store.upsert_model(&row)?;
@@ -7825,6 +7867,13 @@ fn quantize_cmd(
         params: Some(blazar_runtime::hf::est_params(out_bytes, qtype)),
         ctx_train: meta.context_length.and_then(|c| i64::try_from(c).ok()),
         pulled_at: i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        )
+        .unwrap_or(0),
+        last_used_at: i64::try_from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -13216,6 +13265,7 @@ fn collapse_tokens(tokens: &[String]) -> String {
 }
 
 async fn fit(target: &str, json: bool) -> Result<()> {
+    use blazar_runtime::storage;
     let parsed = blazar_runtime::parse_pull_target(target)?;
     let token = std::env::var("HF_TOKEN").ok();
     let client = blazar_runtime::hf::HfClient::new(token)?;
@@ -13233,14 +13283,22 @@ async fn fit(target: &str, json: bool) -> Result<()> {
     };
     let vram_bytes = blazar_core::Hardware::bytes(vram);
     let rows = blazar_runtime::hf::fit_rows(&info.siblings, vram_bytes, cfg.default_ctx);
+    let models_path = dirs().models_dir();
+    let disk_free = storage::disk_free_bytes(&models_path);
     if json {
         // One object per row (JSONL contract). vram_bytes and repo ride on
         // every row like doctor's group field — `fits_vram` is meaningless
-        // without the machine context that produced it.
+        // without the machine context that produced it. Disk context rides
+        // the same way: a row that fits VRAM can still fail the pull gate.
         for r in &rows {
             let mut v = serde_json::to_value(r).map_err(|e| anyhow!("serialize fit row: {e}"))?;
             v["repo"] = serde_json::json!(parsed.repo);
             v["vram_bytes"] = serde_json::json!(vram_bytes);
+            v["disk_free_bytes"] = serde_json::json!(disk_free);
+            v["disk_fits"] = serde_json::json!(storage::disk_verdict(
+                u64::try_from(r.bytes).unwrap_or(0) + storage::REQUIRED_SLACK_BYTES,
+                disk_free,
+            ));
             println!("{v}");
         }
         return Ok(());
@@ -13265,12 +13323,346 @@ async fn fit(target: &str, json: bool) -> Result<()> {
             r.file
         );
     }
+    // Disk section: the largest variant is the honest preview of what a
+    // pull of this repo could ask for; the pull gate re-checks the exact
+    // selection at submit time.
+    if let Some(biggest) = rows
+        .iter()
+        .map(|r| u64::try_from(r.bytes).unwrap_or(0))
+        .max()
+    {
+        println!("\nDISK");
+        println!(
+            "  largest variant:  {}",
+            humansize(i64::try_from(biggest).unwrap_or(i64::MAX))
+        );
+        println!(
+            "  + slack:          {}",
+            humansize(i64::try_from(blazar_runtime::storage::REQUIRED_SLACK_BYTES).unwrap_or(0))
+        );
+        match disk_free {
+            Some(free) => {
+                println!(
+                    "  available:        {}",
+                    humansize(i64::try_from(free).unwrap_or(i64::MAX))
+                );
+                println!(
+                    "  verdict:          {}",
+                    storage::disk_verdict(biggest + storage::REQUIRED_SLACK_BYTES, disk_free)
+                );
+            }
+            None => println!("  available:        unknown ({})", models_path.display()),
+        }
+    }
     if rows.first().is_some_and(|r| r.quant == "safetensors") {
         println!(
             "\n# safetensors lane: serves via sglang/mistralrs (`blazar engine install --kind sglang`) — llamacpp cannot load it; SIZE is the full shard set and KV is arch-dependent, measured at serve"
         );
     } else if rows.is_empty() {
         println!("\n# no sized GGUF or safetensors weights in this repo — nothing to preview");
+    }
+    Ok(())
+}
+
+/// Resident model names from a live daemon, so `prune --unused` and the
+/// storage report never propose deleting a model a child is serving.
+/// Daemon-down degrades to an empty list with a warning — pruning still
+/// works offline, just without the resident guard.
+async fn resident_models() -> (Vec<String>, bool) {
+    let base = match config() {
+        Ok(cfg) => daemon_base(&cfg),
+        Err(_) => return (Vec::new(), false),
+    };
+    let probe = cli_http()
+        .get(format!("{base}/api/ps"))
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await;
+    match probe {
+        Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+            Ok(v) => {
+                let names = v["models"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|m| {
+                                m.get("model")
+                                    .or_else(|| m.get("name"))
+                                    .and_then(|n| n.as_str())
+                                    .map(str::to_string)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (names, true)
+            }
+            Err(_) => (Vec::new(), true),
+        },
+        _ => (Vec::new(), false),
+    }
+}
+
+/// `blazar storage` — the disk-side counterpart of `fit`: what Blazar
+/// stores, where it lives, and what can be reclaimed.
+async fn storage_cmd(json: bool) -> Result<()> {
+    let d = dirs();
+    let rows = Store::open(&d)
+        .ok()
+        .and_then(|s| s.list_models().ok())
+        .unwrap_or_default();
+    let (residents, daemon_up) = resident_models().await;
+    use blazar_runtime::storage;
+    let models_bytes = storage::du(&d.models_dir());
+    let engines_bytes = storage::du(&d.engines_dir());
+    let sessions_bytes = storage::du(&d.sessions_dir());
+    let speccache_bytes = storage::du(&d.speccache_dir());
+    let voices_bytes = storage::du(&d.voices_dir());
+    let run_bytes = storage::du(&d.run_dir());
+    let free = storage::disk_free_bytes(&d.models_dir());
+    let total = storage::disk_total_bytes(&d.models_dir());
+    let orphans = storage::orphan_scan(&d.models_dir(), &rows);
+    let orphan_bytes: u64 = orphans.orphan_files.iter().map(|(_, b)| b).sum();
+    let partial_bytes: u64 = orphans.stale_partials.iter().map(|(_, b)| b).sum();
+    let twin_bytes: u64 = orphans.twins.iter().map(|(_, b)| b).sum();
+    let now = blazar_core::store::unix_now();
+    let unused = storage::unused_rows(&rows, 30 * 86_400, &residents, now);
+    let unused_bytes: u64 = unused
+        .iter()
+        .map(|r| u64::try_from(r.bytes).unwrap_or(0))
+        .sum();
+    let hs = |b: u64| humansize(i64::try_from(b).unwrap_or(i64::MAX));
+    if json {
+        let v = serde_json::json!({
+            "object": "blazar.storage",
+            "models": { "count": rows.len(), "bytes": models_bytes },
+            "engines": { "bytes": engines_bytes },
+            "sessions": { "bytes": sessions_bytes },
+            "caches": {
+                "speccache_bytes": speccache_bytes,
+                "voices_bytes": voices_bytes,
+                "run_bytes": run_bytes,
+            },
+            "disk": {
+                "free_bytes": free,
+                "total_bytes": total,
+                "path": d.models_dir(),
+            },
+            "reclaim": {
+                "orphan_files": orphans.orphan_files.len(),
+                "orphan_bytes": orphan_bytes,
+                "stale_partial_bytes": partial_bytes,
+                "twin_bytes": twin_bytes,
+                "unused": unused
+                    .iter()
+                    .map(|r| serde_json::json!({
+                        "name": r.name, "bytes": r.bytes, "last_used_at": r.last_used_at,
+                    }))
+                    .collect::<Vec<_>>(),
+            },
+            "daemon_up": daemon_up,
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    println!(
+        "STORAGE  ({})",
+        d.models_dir().parent().map_or_else(
+            || d.models_dir().display().to_string(),
+            |p| p.display().to_string()
+        )
+    );
+    println!(
+        "  models:      {}  ({} models)",
+        hs(models_bytes),
+        rows.len()
+    );
+    println!("  engines:     {}", hs(engines_bytes));
+    println!("  sessions:    {}", hs(sessions_bytes));
+    println!(
+        "  caches:      speccache {} + voices {} + run {}",
+        hs(speccache_bytes),
+        hs(voices_bytes),
+        hs(run_bytes)
+    );
+    println!("\nDISK");
+    match (free, total) {
+        (Some(f), Some(t)) => println!("  available:   {} of {}", hs(f), hs(t)),
+        _ => println!("  available:   unknown ({})", d.models_dir().display()),
+    }
+    println!("\nRECLAIM CANDIDATES");
+    println!(
+        "  orphan files:     {} files, {}",
+        orphans.orphan_files.len(),
+        hs(orphan_bytes)
+    );
+    println!(
+        "  stale partials:   {} files, {}",
+        orphans.stale_partials.len(),
+        hs(partial_bytes)
+    );
+    println!(
+        "  hardlink twins:   {} files, {} (report-only — same inode as owned files)",
+        orphans.twins.len(),
+        hs(twin_bytes)
+    );
+    println!(
+        "  unused models:    {} models, {} (idle > 30 days{})",
+        unused.len(),
+        hs(unused_bytes),
+        if daemon_up {
+            String::new()
+        } else {
+            ", daemon down — residents not checked".to_string()
+        }
+    );
+    for r in &unused {
+        println!(
+            "    - {} ({})",
+            r.name,
+            hs(u64::try_from(r.bytes).unwrap_or(0))
+        );
+    }
+    println!("\n  → `blazar prune --orphans --unused --yes` reclaims orphans + partials + unused");
+    if orphans.twins.is_empty()
+        && orphans.orphan_files.is_empty()
+        && orphans.stale_partials.is_empty()
+        && unused.is_empty()
+    {
+        println!("  none — nothing to reclaim");
+    }
+    // Engine-managed caches outside the data dir are reported, never
+    // touched: deleting them is the engine's business, not ours.
+    let sglang_cache = std::env::var_os("HOME").map(|h| {
+        let mut p = std::path::PathBuf::from(h);
+        p.push(".cache");
+        p.push("sglang");
+        p
+    });
+    if let Some(p) = sglang_cache.filter(|p| p.is_dir()) {
+        println!(
+            "\nOUT-OF-TREE\n  {}: {} (engine-managed; reported, never deleted by blazar)",
+            p.display(),
+            hs(storage::du(&p))
+        );
+    }
+    Ok(())
+}
+
+/// `blazar prune` — reclaim disk. Dry-run by default; `--yes` executes.
+/// Twins are never deleted (they ARE owned files, just hardlinked).
+async fn prune_cmd(
+    orphans: bool,
+    unused: bool,
+    since_days: u64,
+    yes: bool,
+    json: bool,
+) -> Result<()> {
+    let d = dirs();
+    let rows = Store::open(&d)
+        .ok()
+        .and_then(|s| s.list_models().ok())
+        .unwrap_or_default();
+    let (residents, daemon_up) = resident_models().await;
+    if !daemon_up {
+        eprintln!("warning: daemon not reachable — resident models are not guarded; a model mid-serve could be deleted");
+    }
+    use blazar_runtime::storage;
+    let scan = storage::orphan_scan(&d.models_dir(), &rows);
+    let now = blazar_core::store::unix_now();
+    let unused_rows_sel = if unused {
+        storage::unused_rows(&rows, since_days * 86_400, &residents, now)
+    } else {
+        Vec::new()
+    };
+    let orphans_sel: Vec<&(std::path::PathBuf, u64)> = if orphans {
+        scan.orphan_files
+            .iter()
+            .chain(scan.stale_partials.iter())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !orphans && !unused {
+        // Bare `blazar prune` = preview everything it could do.
+        println!(
+            "prune preview — {} orphan/partial file(s), {} unused model(s) (idle > {since_days} days)",
+            scan.orphan_files.len() + scan.stale_partials.len(),
+            storage::unused_rows(&rows, since_days * 86_400, &residents, now).len()
+        );
+        println!("pass --orphans and/or --unused (plus --yes to execute); hardlink twins are report-only");
+        return Ok(());
+    }
+    let hs = |b: u64| humansize(i64::try_from(b).unwrap_or(i64::MAX));
+    if !yes {
+        let mut total = 0u64;
+        for (p, b) in &orphans_sel {
+            println!("would delete {} ({})", p.display(), hs(*b));
+            total += *b;
+        }
+        for r in &unused_rows_sel {
+            println!(
+                "would remove model {} ({})",
+                r.name,
+                hs(u64::try_from(r.bytes).unwrap_or(0))
+            );
+            total += u64::try_from(r.bytes).unwrap_or(0);
+        }
+        println!("dry run — {total} bytes reclaimable; pass --yes to execute");
+        return Ok(());
+    }
+    let mut reclaimed = 0u64;
+    let mut failures = 0u64;
+    for (p, b) in &orphans_sel {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"action": "unlink", "path": p, "bytes": b, "ok": true})
+            );
+        }
+        match std::fs::remove_file(p) {
+            Ok(()) => {
+                reclaimed += *b;
+                if !json {
+                    println!("{}", ok_line(&format!("deleted {}", p.display())));
+                }
+            }
+            Err(e) => {
+                failures += 1;
+                if !json {
+                    eprintln!("rm {}: {e}", p.display());
+                }
+            }
+        }
+    }
+    for r in &unused_rows_sel {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"action": "remove_model", "model": r.name, "bytes": r.bytes, "ok": true})
+            );
+        }
+        match blazar_runtime::models::remove_model(&d, &r.name) {
+            Ok(()) => {
+                reclaimed += u64::try_from(r.bytes).unwrap_or(0);
+                if !json {
+                    println!("{}", ok_line(&format!("removed {}", r.name)));
+                }
+            }
+            Err(e) => {
+                failures += 1;
+                if !json {
+                    eprintln!("rm {}: {e:#}", r.name);
+                }
+            }
+        }
+    }
+    if failures > 0 {
+        return Err(anyhow!(
+            "prune finished with {failures} failure(s) — {reclaimed} bytes reclaimed anyway"
+        ));
+    }
+    if !json {
+        println!("reclaimed {}", hs(reclaimed));
     }
     Ok(())
 }
@@ -13856,6 +14248,7 @@ mod tests {
             params: None,
             ctx_train: None,
             pulled_at: 0,
+            last_used_at: 0,
         }
     }
 
@@ -14044,6 +14437,7 @@ mod tests {
             params: None,
             ctx_train: None,
             pulled_at: 0,
+            last_used_at: 0,
         };
         // Text rows (no component set) stay on the chat REPL.
         assert!(matches!(run_lane(&base()), RunLane::Text));
@@ -14226,6 +14620,7 @@ mod tests {
             params: None,
             ctx_train: None,
             pulled_at: 0,
+            last_used_at: 0,
         }
     }
 
@@ -16122,6 +16517,7 @@ mod tests {
             params: None,
             ctx_train: None,
             pulled_at: 0,
+            last_used_at: 0,
         }
     }
 
@@ -17231,6 +17627,7 @@ mod tests {
             params: None,
             ctx_train: None,
             pulled_at: 0,
+            last_used_at: 0,
         }
     }
 

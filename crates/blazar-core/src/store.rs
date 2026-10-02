@@ -25,7 +25,7 @@ pub struct Store {
     conn: Connection,
 }
 
-const SCHEMA_VERSION: i32 = 8;
+const SCHEMA_VERSION: i32 = 9;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS models (
     arch       TEXT,
     params     REAL,
     ctx_train  INTEGER,
-    pulled_at  INTEGER NOT NULL
+    pulled_at  INTEGER NOT NULL,
+    last_used_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS profiles (
     model_name     TEXT NOT NULL,
@@ -209,6 +210,11 @@ pub struct ModelRow {
     #[serde(default)]
     pub ctx_train: Option<i64>,
     pub pulled_at: i64,
+    /// Last time this model went resident (spawn admission). Stays fresh
+    /// while loaded by definition; ages out only when nothing re-spawns it.
+    /// Backfilled from `pulled_at` at v9 migration.
+    #[serde(default)]
+    pub last_used_at: i64,
 }
 
 /// One diffusion component: the sd-server flag it rides and the local
@@ -448,6 +454,21 @@ impl Store {
                     self.conn
                         .execute(&format!("ALTER TABLE models DROP COLUMN {col}"), [])?;
                 }
+            }
+            // v8→v9: models gained `last_used_at` (disk intelligence:
+            // `blazar prune --unused` ages models out by spawn activity).
+            // Fresh databases get it from SCHEMA_SQL; v8 databases take the
+            // ALTER plus a backfill from `pulled_at` so an existing model
+            // is never instantly "unused" the day this ships.
+            if !model_cols.contains(&"last_used_at".to_string()) {
+                self.conn.execute(
+                    "ALTER TABLE models ADD COLUMN last_used_at INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+                self.conn.execute(
+                    "UPDATE models SET last_used_at = pulled_at WHERE last_used_at = 0",
+                    [],
+                )?;
             }
             // v6→v7: bench_history grew HTTP-lane columns (kind + probe
             // metrics). Fresh databases get them from SCHEMA_SQL; v6
@@ -977,15 +998,16 @@ impl Store {
         }
         self.conn.execute(
             "INSERT INTO models (name, repo, quant, path, bytes, sha256, mmproj_path, components,
-                                 shards, arch, params, ctx_train, pulled_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+                                 shards, arch, params, ctx_train, pulled_at, last_used_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
              ON CONFLICT(name) DO UPDATE SET
                repo = excluded.repo, quant = excluded.quant, path = excluded.path,
                bytes = excluded.bytes, sha256 = excluded.sha256,
                mmproj_path = excluded.mmproj_path, components = excluded.components,
                shards = excluded.shards,
                arch = excluded.arch, params = excluded.params,
-               ctx_train = excluded.ctx_train, pulled_at = excluded.pulled_at",
+               ctx_train = excluded.ctx_train, pulled_at = excluded.pulled_at,
+               last_used_at = excluded.last_used_at",
             params![
                 m.name,
                 m.repo,
@@ -1000,7 +1022,8 @@ impl Store {
                 m.arch,
                 m.params,
                 m.ctx_train,
-                m.pulled_at
+                m.pulled_at,
+                m.last_used_at
             ],
         )?;
         Ok(())
@@ -1009,7 +1032,7 @@ impl Store {
     pub fn get_model(&self, name: &str) -> CoreResult<Option<ModelRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT name, repo, quant, path, bytes, sha256, mmproj_path, components, shards, arch,
-                    params, ctx_train, pulled_at
+                    params, ctx_train, pulled_at, last_used_at
              FROM models WHERE name = ?1",
         )?;
         let mut rows = stmt.query(params![name])?;
@@ -1022,11 +1045,22 @@ impl Store {
     pub fn list_models(&self) -> CoreResult<Vec<ModelRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT name, repo, quant, path, bytes, sha256, mmproj_path, components, shards, arch,
-                    params, ctx_train, pulled_at
+                    params, ctx_train, pulled_at, last_used_at
              FROM models ORDER BY name",
         )?;
         let rows = stmt.query_map([], model_from_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Stamp `last_used_at = now` for a model going resident (spawn
+    /// admission touch). Returns whether a row was updated — false is a
+    /// caller-side curiosity (name vanished mid-flight), not an error.
+    pub fn touch_model_used(&self, name: &str) -> CoreResult<bool> {
+        let n = self.conn.execute(
+            "UPDATE models SET last_used_at = ?2 WHERE name = ?1",
+            params![name, unix_now()],
+        )?;
+        Ok(n > 0)
     }
 
     /// Map a user-supplied model name onto a store row for ollama
@@ -1295,6 +1329,7 @@ fn model_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRow> {
         params: r.get(10)?,
         ctx_train: r.get(11)?,
         pulled_at: r.get(12)?,
+        last_used_at: r.get(13)?,
     })
 }
 
@@ -1580,6 +1615,7 @@ mod tests {
             params: None,
             ctx_train: None,
             pulled_at: 0,
+            last_used_at: 0,
         }
     }
 
@@ -1767,6 +1803,7 @@ mod tests {
             params: Some(0.6),
             ctx_train: Some(32_768),
             pulled_at: 42,
+            last_used_at: 42,
         };
         s.upsert_model(&m).unwrap();
         let got = s.get_model("qwen3-0.6b").unwrap().unwrap();
@@ -1829,6 +1866,7 @@ mod tests {
             params: None,
             ctx_train: None,
             pulled_at: 0,
+            last_used_at: 0,
         };
         // The live incident rows: awq/gptq/fp8 dirs quantize true.
         assert!(row(
@@ -1882,6 +1920,7 @@ mod tests {
                 params: None,
                 ctx_train: None,
                 pulled_at: 1,
+                last_used_at: 1,
             })
             .unwrap();
         }
@@ -1964,6 +2003,7 @@ mod tests {
             params: None,
             ctx_train: None,
             pulled_at: 2,
+            last_used_at: 2,
         })
         .unwrap();
         let set = s.get_model("qwen-image-2.1").unwrap().unwrap();

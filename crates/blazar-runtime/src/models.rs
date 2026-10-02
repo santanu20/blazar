@@ -520,6 +520,7 @@ fn adopt_gguf(
         params: Some(crate::hf::est_params(bytes, &quant)),
         ctx_train: meta.context_length.and_then(|c| i64::try_from(c).ok()),
         pulled_at: now_secs(),
+        last_used_at: now_secs(),
     };
     match store.upsert_model(&row) {
         Ok(()) => report.adopted.push(AdoptedModel {
@@ -645,6 +646,7 @@ fn adopt_dir(
         params: Some(crate::hf::est_params(bytes, &quant)),
         ctx_train: meta.ctx_train.and_then(|c| i64::try_from(c).ok()),
         pulled_at: now_secs(),
+        last_used_at: now_secs(),
     };
     match store.upsert_model(&row) {
         Ok(()) => report.adopted.push(AdoptedModel {
@@ -805,6 +807,7 @@ pub fn copy_model(dirs: &BlazarDirs, src: &str, dst: &str) -> Result<()> {
         params: row.params,
         ctx_train: row.ctx_train,
         pulled_at: row.pulled_at,
+        last_used_at: row.last_used_at,
     })?;
     Ok(())
 }
@@ -861,6 +864,7 @@ mod tests {
                 params: None,
                 ctx_train: None,
                 pulled_at: 1,
+                last_used_at: 1,
             })
             .unwrap();
 
@@ -908,6 +912,7 @@ mod tests {
             params: None,
             ctx_train: None,
             pulled_at: 1,
+            last_used_at: 1,
         };
         store
             .upsert_model(&row("m", &d.join("dit.gguf").display().to_string()))
@@ -931,6 +936,7 @@ mod tests {
                 params: None,
                 ctx_train: None,
                 pulled_at: 1,
+                last_used_at: 1,
             })
             .unwrap();
 
@@ -972,6 +978,7 @@ mod tests {
                 params: None,
                 ctx_train: None,
                 pulled_at: 1,
+                last_used_at: 1,
             })
             .unwrap();
 
@@ -1003,6 +1010,7 @@ mod tests {
                     params: None,
                     ctx_train: None,
                     pulled_at: 1,
+                    last_used_at: 1,
                 })
                 .unwrap();
         }
@@ -1032,6 +1040,7 @@ mod tests {
             params: None,
             ctx_train: None,
             pulled_at: 1,
+            last_used_at: 1,
         })
         .unwrap();
         let err = copy_model(&dirs, "m", "m-alias").unwrap_err();
@@ -1073,6 +1082,7 @@ mod tests {
             params: None,
             ctx_train: None,
             pulled_at: 1,
+            last_used_at: 1,
         })
         .unwrap();
         copy_model(&dirs, "m", "m-alias").unwrap();
@@ -1135,6 +1145,7 @@ mod tests {
             params: None,
             ctx_train: None,
             pulled_at: 1,
+            last_used_at: 1,
         }
     }
 

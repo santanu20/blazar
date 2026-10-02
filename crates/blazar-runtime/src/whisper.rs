@@ -582,7 +582,7 @@ pub fn split_wav(data: &[u8], chunk_ms: u64) -> Option<Vec<WavChunk>> {
         return None;
     }
     let align = block_align as usize;
-    let target = ((byte_rate as u64) * chunk_ms / 1000)
+    let target = (u64::from(byte_rate) * chunk_ms / 1000)
         .next_multiple_of(align as u64)
         .max(align as u64) as usize;
     let audio = &data[data_start..data_start + data_len];
@@ -604,13 +604,17 @@ pub fn split_wav(data: &[u8], chunk_ms: u64) -> Option<Vec<WavChunk>> {
         let mut bytes = prefix.to_vec();
         let piece = end - off;
         // Patch the two size fields so each rebuild is self-consistent.
+        // RIFF size fields are u32; chunk bytes are bounded by the
+        // 120 s window cap, so the narrowing is structurally safe.
+        #[allow(clippy::cast_possible_truncation)]
         let riff_size = (prefix.len() + piece - 8) as u32;
         bytes[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        #[allow(clippy::cast_possible_truncation)]
         bytes[data_start - 4..data_start].copy_from_slice(&(piece as u32).to_le_bytes());
         bytes.extend_from_slice(&audio[off..end]);
         out.push(WavChunk {
             bytes,
-            offset_ms: off as u64 * 1000 / byte_rate as u64,
+            offset_ms: off as u64 * 1000 / u64::from(byte_rate),
         });
         off = end;
     }
@@ -623,6 +627,9 @@ pub fn split_wav(data: &[u8], chunk_ms: u64) -> Option<Vec<WavChunk>> {
 /// its ASCII 8.3 short form first. Best-effort by design: volumes with
 /// 8dot3 naming disabled (or a conversion failure) keep the original
 /// path — the guard never introduces a failure mode of its own.
+// The one platform-gated unsafe use in the crate: Win32 FFI has no safe
+// wrapper, and CI carries `-D unsafe-code` for everything else.
+#[cfg_attr(windows, allow(unsafe_code))]
 #[must_use]
 pub fn argv_model_path(model_path: &Path) -> PathBuf {
     #[cfg(windows)]
@@ -641,6 +648,8 @@ pub fn argv_model_path(model_path: &Path) -> PathBuf {
         };
         if len > 0 {
             let mut out = vec![0u16; len as usize];
+            // SAFETY: `out` was sized from the probe's return value and
+            // `wide` is still the NUL-terminated input from above.
             let written = unsafe {
                 windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
                     wide.as_ptr(),
@@ -956,6 +965,7 @@ fn server_args(port: u16, model_path: &Path) -> Vec<String> {
 
 #[cfg(test)]
 #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+#[allow(clippy::cast_possible_truncation)] // WAV fixtures are tiny
 mod tests {
     use super::*;
     use crate::engine::gh::GhAsset;
@@ -1101,7 +1111,7 @@ mod tests {
         let chunks = split_wav(&src, 999).expect("splits");
         assert!(chunks.len() >= 2);
         for w in chunks.windows(2) {
-            let consumed = ((w[1].offset_ms as u128 * 40_000) / 1000) as usize;
+            let consumed = (u128::from(w[1].offset_ms) * 40_000 / 1000) as usize;
             assert_eq!(
                 consumed % 4,
                 0,

@@ -209,6 +209,7 @@ enum WorkerMsg {
 /// when the caller should fall back to the classic single-stream lane
 /// (no Range support, tiny file, `connections < 2`, or a legacy `.part`
 /// without a sidecar that only the classic lane can tail-resume).
+#[allow(clippy::too_many_arguments)] // one param per wire concern; a bundle would hide the range contract
 pub(crate) async fn try_parallel(
     http: &reqwest::Client,
     token: Option<&str>,

@@ -244,8 +244,9 @@ pub fn note_remote_result(state: &AppState, remote: &Remote, ok: bool) {
 
 /// Fold one observed time-to-response-head (ms) into the remote's EWMA.
 /// Ok requests only — failures measure the wrong thing (connect timeouts
-/// would inflate decode cost). Takes the map directly (bind_remote
-/// precedent) so it stays unit-pinnable without an AppState.
+/// would inflate decode cost). Takes the map directly (`bind_remote`
+/// precedent) so it stays unit-pinnable without an `AppState`.
+#[allow(clippy::implicit_hasher)] // one concrete hasher app-wide, bind_remote precedent
 pub fn note_remote_latency(
     map: &std::sync::Mutex<std::collections::HashMap<String, RemoteHealth>>,
     remote: &Remote,
@@ -489,8 +490,12 @@ fn parse_capacity(v: &serde_json::Value) -> Option<PeerCapacity> {
         .filter_map(|d| {
             Some(PeerDevice {
                 name: d.get("name").and_then(|n| n.as_str())?.to_string(),
-                total_vram_bytes: d.get("total_vram_bytes").and_then(|n| n.as_u64())?,
-                free_vram_bytes: d.get("free_vram_bytes").and_then(|n| n.as_u64())?,
+                total_vram_bytes: d
+                    .get("total_vram_bytes")
+                    .and_then(serde_json::Value::as_u64)?,
+                free_vram_bytes: d
+                    .get("free_vram_bytes")
+                    .and_then(serde_json::Value::as_u64)?,
             })
         })
         .collect();
@@ -505,13 +510,13 @@ fn parse_capacity(v: &serde_json::Value) -> Option<PeerCapacity> {
                 state: r.get("state").and_then(|n| n.as_str())?.to_string(),
                 slots: r
                     .get("slots")
-                    .and_then(|n| n.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                     .and_then(|n| u32::try_from(n).ok()),
                 slots_configured: r
                     .get("slots_configured")
-                    .and_then(|n| n.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                     .and_then(|n| u32::try_from(n).ok()),
-                in_flight: r.get("in_flight").and_then(|n| n.as_i64())?,
+                in_flight: r.get("in_flight").and_then(serde_json::Value::as_i64)?,
             })
         })
         .collect();
@@ -615,6 +620,13 @@ pub struct PeerScore {
 /// leases on it, divided by its slot count, times the EWMA (or the
 /// neutral default before the first success).
 #[must_use]
+// wave counts (< 2^52 by construction) and ceiling results are exact in f64;
+// the ranking math reads clearest in float waves x ttft
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)] // in_flight clamped >= 0; wave counts exact in f64
 pub fn score_peer(model: &str, h: &RemoteHealth, cap: Option<&PeerCapacity>) -> PeerScore {
     let ttft_ms = h.ttft_ewma_ms.unwrap_or(REMOTE_TTFT_DEFAULT_MS).max(1.0);
     let (tier, slots, peer_in_flight, free_vram) = match cap {
@@ -628,12 +640,7 @@ pub fn score_peer(model: &str, h: &RemoteHealth, cap: Option<&PeerCapacity>) -> 
                 .unwrap_or(0);
             match c.residents.iter().find(|r| r.model == model) {
                 Some(r) => {
-                    let slots = r
-                        .slots_configured
-                        .or(r.slots)
-                        .map(u64::from)
-                        .unwrap_or(1)
-                        .max(1);
+                    let slots = u64::from(r.slots_configured.or(r.slots).unwrap_or(1)).max(1);
                     let busy = r.in_flight.max(0) as u64;
                     (REMOTE_TIER_WARM, slots, busy, free)
                 }
@@ -641,7 +648,7 @@ pub fn score_peer(model: &str, h: &RemoteHealth, cap: Option<&PeerCapacity>) -> 
             }
         }
     };
-    let queue = h.in_flight as u64 + peer_in_flight;
+    let queue = u64::from(h.in_flight) + peer_in_flight;
     let waves = queue.div_ceil(slots);
     PeerScore {
         tier,
@@ -1307,7 +1314,7 @@ mod tests {
         let v = serde_json::json!({
             "object": "blazar.capacity",
             "devices": [
-                {"id": "cuda:0", "name": "RTX 4070", "total_vram_bytes": 8589934592u64, "free_vram_bytes": 2147483648u64},
+                {"id": "cuda:0", "name": "RTX 4070", "total_vram_bytes": 8_589_934_592u64, "free_vram_bytes": 2_147_483_648u64},
                 // Malformed row (missing free) drops, never panics.
                 {"id": "cuda:1", "name": "half-there", "total_vram_bytes": 1u64}
             ],
@@ -1482,8 +1489,10 @@ mod tests {
     fn unit__score_peer__queue_wait_math_and_ttft_sources() {
         // slots=2, peer in_flight=3, our leases=2 -> queue 5 -> 3 slot
         // waves -> wait = 3 x ttft.
-        let mut h = RemoteHealth::default();
-        h.in_flight = 2;
+        let mut h = RemoteHealth {
+            in_flight: 2,
+            ..Default::default()
+        };
         let cap = cap_with(vec![resident_row("m", Some(2), Some(2), 3)], 0);
         let s = score_peer("m", &h, Some(&cap));
         assert_eq!(s.est_wait_ms, 3 * 750, "default ttft fills in before EWMA");

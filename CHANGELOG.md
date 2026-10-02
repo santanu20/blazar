@@ -6,6 +6,10 @@ tracked here.
 
 ## [Unreleased]
 ### Added
+- Disk intelligence. `blazar fit` gains a DISK section (largest variant + 64 MiB slack vs available, verdict FIT/TIGHT/NO) and per-row `disk_fits`/`disk_free_bytes` in JSONL mode; pulls are gated at submit time with a teaching error that names the numbers and points at `blazar storage` / `blazar prune`.
+- `blazar storage` — the disk-side counterpart of `fit`: models/engines/sessions/cache footprints, disk headroom, and reclaim candidates (orphan files, stale `.part` downloads, hardlink twins, unused models), plus report-only out-of-tree engine caches.
+- `blazar prune [--orphans] [--unused] [--since-days N] [--yes]` — dry-run by default; `--orphans` deletes unowned files and stale partials, `--unused` removes models idle beyond the window (residents are fetched from a live daemon and never proposed; twins are report-only).
+- Model usage tracking (schema v9): `models.last_used_at`, backfilled from `pulled_at` on upgrade and stamped on cold spawns (residents are fresh by definition — the hot path never pays the write).
 - `POST /api/warm` gained `"wait": true` — synchronous warm through admission with a resident-state report (default stays the detached pull-notify contract). CLI: `blazar warm <model>`.
 - `POST /api/replicate` + `blazar replicate <model> [--peers a,b] [--timeout-secs N]` — remote replication: concurrent warm fan-out to peers with verbatim per-peer outcomes; Blazar peers only (non-Blazar peers are named as such).
 - `GET /api/route/{model}` + `blazar route <model>` — cross-node scheduling explainer: local residency, per-peer tier / wait estimate / free VRAM / breaker state, and the decision the gateway would take.

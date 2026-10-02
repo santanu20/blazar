@@ -249,6 +249,7 @@ fn sse_frame(event: &str, data: &serde_json::Value) -> Vec<u8> {
 /// recording's timeline (`start`/`end` are chunk-relative seconds in
 /// upstream's `verbose_json`). Non-numeric or missing fields pass through
 /// untouched — the event carries what the decoder reported.
+#[allow(clippy::cast_precision_loss)] // ms → s float for JSON segment times
 fn rebase_segments(segments: &mut serde_json::Value, offset_ms: u64) {
     let Some(list) = segments.as_array_mut() else {
         return;
@@ -633,6 +634,10 @@ fn wants_stream(parts: &[Part]) -> bool {
 /// client contract stays uniform, and the format limitation is named
 /// in the capabilities payload.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)] // one streaming transcription relay: parse, rebased SSE, usage
+#[allow(clippy::unused_async)] // axum handler shape; body streams via the response
+#[allow(clippy::cast_possible_truncation)] // duration seconds → ms for segment math
+#[allow(clippy::cast_sign_loss)] // negative durations are invalid input; clamp-by-cast is acceptable
 async fn forward_local_stream(
     state: &Arc<AppState>,
     parts: &[Part],
@@ -761,7 +766,7 @@ async fn forward_local_stream(
                 .unwrap_or_else(|| serde_json::json!([]));
             rebase_segments(&mut segments, *offset_ms);
             if let Some(chunk_secs) = v.get("duration").and_then(serde_json::Value::as_f64) {
-                duration_ms = offset_ms + (chunk_secs * 1000.0) as u64;
+                duration_ms = offset_ms.saturating_add((chunk_secs * 1000.0) as u64);
             }
             let frame = sse_frame(
                 "chunk.completed",

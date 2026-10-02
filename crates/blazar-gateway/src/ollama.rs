@@ -3108,7 +3108,7 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
             Err(e) => api_error(502, &format!("router unload: {e}")),
         };
     }
-    match state.sup.evict_model(&model).await {
+    match state.sup.evict_model(model).await {
         Ok(()) => axum::Json(json!({"status": "ok"})).into_response(),
         Err(e) => api_error(404, &e.to_string()),
     }
@@ -3592,8 +3592,7 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         .unwrap_or(0);
     let _ = write!(
         merged,
-        "# HELP blazar_jobs_active Durable job rows not yet terminal (all lanes)\n# TYPE blazar_jobs_active gauge\nblazar_jobs_active {}\n",
-        durable_jobs_active
+        "# HELP blazar_jobs_active Durable job rows not yet terminal (all lanes)\n# TYPE blazar_jobs_active gauge\nblazar_jobs_active {durable_jobs_active}\n"
     );
     let _ = write!(
         merged,
@@ -3876,6 +3875,7 @@ mod tests {
             params: None,
             ctx_train: Some(40960),
             pulled_at: 0,
+            last_used_at: 0,
         }
     }
 

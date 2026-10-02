@@ -114,7 +114,7 @@ The underlying engines still perform inference. **Blazar is the control plane ar
 | **One gateway** | OpenAI-, Ollama-, and Anthropic-compatible APIs |
 | **Multiple runtimes** | llama.cpp, mistral.rs, SGLang, stable-diffusion.cpp, whisper.cpp, and piper |
 | **Measured auto-tuning** | Speculative decoding, KV-cache quantization, and flash attention selected per hardware by benchmarked rules, not guesswork |
-| **Resource control** | VRAM/KV fit, slots, admission, co-residency, and lifecycle management |
+| **Resource control** | VRAM/KV fit, slots, admission, co-residency, lifecycle management, and disk intelligence (`blazar fit` disk verdict, pull-time disk gate, `blazar storage` / `blazar prune` reclaim) |
 | **Model operations** | Pull, import, inspect, pin, tune, snapshot, and restore |
 | **Production controls** | API keys, TLS, CORS, audit logging, metrics, traces, and diagnostics |
 | **Multimodal** | Text, embeddings, image, video, speech-to-text, and TTS |

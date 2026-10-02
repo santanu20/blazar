@@ -121,6 +121,7 @@ fn parse_compute_apps(text: &str) -> Vec<(u32, u64)> {
 }
 
 /// GET /api/capacity — device census + per-resident VRAM attribution.
+#[allow(clippy::too_many_lines)] // census + join + honest notes: one response body assembled in reading order
 pub async fn capacity(State(state): State<Arc<AppState>>) -> Response {
     // Two nvidia-smi spawns (~30-60 ms each) + pipe polling: blocking
     // work, off the async runtime threads.
@@ -149,8 +150,8 @@ pub async fn capacity(State(state): State<Arc<AppState>>) -> Response {
     .unwrap_or((None, None));
 
     let mut notes = Vec::new();
-    let devices: Vec<serde_json::Value> = match devices_raw.as_deref() {
-        Some(text) => parse_devices(text)
+    let devices: Vec<serde_json::Value> = if let Some(text) = devices_raw.as_deref() {
+        parse_devices(text)
             .into_iter()
             .map(|d| {
                 serde_json::json!({
@@ -162,19 +163,18 @@ pub async fn capacity(State(state): State<Arc<AppState>>) -> Response {
                     "utilization_percent": d.util_pct,
                 })
             })
-            .collect(),
-        None => {
-            notes.push(
-                "no nvidia-smi census on this box — non-NVIDIA GPU boxes report an empty \
-                 device list (residents below still come from the supervisor)",
-            );
-            Vec::new()
-        }
+            .collect()
+    } else {
+        notes.push(
+            "no nvidia-smi census on this box — non-NVIDIA GPU boxes report an empty \
+             device list (residents below still come from the supervisor)",
+        );
+        Vec::new()
     };
 
     // Supervisor rows are the resident truth; compute-apps attributes VRAM.
     let ps_rows = state.sup.ps();
-    let apps = apps_raw.as_deref().map(|t| parse_compute_apps(t));
+    let apps = apps_raw.as_deref().map(parse_compute_apps);
     let mut external: Vec<serde_json::Value> = Vec::new();
     let residents: Vec<serde_json::Value> = ps_rows
         .iter()
@@ -240,6 +240,7 @@ pub async fn capacity(State(state): State<Arc<AppState>>) -> Response {
 
 #[cfg(test)]
 mod tests {
+    #![allow(non_snake_case)]
     use super::*;
 
     #[test]

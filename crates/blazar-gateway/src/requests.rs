@@ -88,7 +88,7 @@ fn state_name(s: u8) -> &'static str {
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 fn boot_nanos() -> u128 {
@@ -242,11 +242,16 @@ struct LiveEntry {
     tx: watch::Sender<bool>,
 }
 
+#[derive(Default)]
 pub struct RequestRuntime {
     inflight: DashMap<String, LiveEntry>,
     terminal: Mutex<VecDeque<Arc<RequestCard>>>,
     seq: AtomicU64,
     boot_nanos: u128,
+}
+
+fn card_payload(card: &RequestCard) -> serde_json::Value {
+    card.payload(!card.is_terminal())
 }
 
 impl RequestRuntime {
@@ -291,7 +296,7 @@ impl RequestRuntime {
                 .map_or(StopOutcome::NotFound, StopOutcome::AlreadyFinished);
         };
         if entry.card.is_terminal() {
-            return StopOutcome::AlreadyFinished(self.card_payload(&entry.card));
+            return StopOutcome::AlreadyFinished(card_payload(&entry.card));
         }
         entry.card.stop.store(
             if interrupt {
@@ -302,7 +307,7 @@ impl RequestRuntime {
             Ordering::Release,
         );
         let _ = entry.tx.send(true);
-        StopOutcome::Live(self.card_payload(&entry.card))
+        StopOutcome::Live(card_payload(&entry.card))
     }
 
     /// Retire a card the holder has already flipped terminal: remove the
@@ -318,10 +323,6 @@ impl RequestRuntime {
             }
             ring.push_back(Arc::clone(card));
         }
-    }
-
-    fn card_payload(&self, card: &RequestCard) -> serde_json::Value {
-        card.payload(!card.is_terminal())
     }
 
     fn terminal_payload(&self, id: &str) -> Option<serde_json::Value> {
@@ -356,7 +357,7 @@ impl RequestRuntime {
 
     fn get(&self, id: &str) -> Option<serde_json::Value> {
         if let Some(entry) = self.inflight.get(id) {
-            return Some(self.card_payload(&entry.card));
+            return Some(card_payload(&entry.card));
         }
         self.terminal_payload(id)
     }
@@ -368,7 +369,6 @@ impl RequestRuntime {
 
 /// Terminal ring filing works on shared handles, so the card carries its
 /// own one-shot `retired` latch (see [`RequestRuntime::retire`]).
-
 fn matches_key(card: &RequestCard, filter: Option<&str>) -> bool {
     match filter {
         None => true,
@@ -416,6 +416,7 @@ const LIFECYCLE_PATHS: [&str; 7] = [
 /// The request lifecycle middleware. Mounted inside auth (key identity is
 /// on the request extensions) and inside the global body limit. Non-tracked
 /// paths are a verbatim `next.run` passthrough.
+#[allow(clippy::too_many_lines)] // single middleware pass: register -> guard -> forward -> stamp -> wrap, in request order
 pub async fn lifecycle(
     State(state): State<Arc<AppState>>,
     req: Request<Body>,
@@ -657,22 +658,25 @@ struct WrapSt {
 }
 
 /// Extract the token total from a buffered JSON response tail. Handles
-/// the OpenAI shape (`usage.total_tokens` / `prompt+completion_tokens`)
+/// the `OpenAI` shape (`usage.total_tokens` / `prompt+completion_tokens`)
 /// and the Anthropic shape (`usage.input_tokens + output_tokens`).
 fn sniff_tokens(body: &[u8]) -> Option<u64> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let usage = v.get("usage")?;
-    if let Some(t) = usage.get("total_tokens").and_then(|t| t.as_u64()) {
+    if let Some(t) = usage
+        .get("total_tokens")
+        .and_then(serde_json::Value::as_u64)
+    {
         return Some(t);
     }
     let prompt = usage
         .get("prompt_tokens")
         .or_else(|| usage.get("input_tokens"))
-        .and_then(|t| t.as_u64());
+        .and_then(serde_json::Value::as_u64);
     let completion = usage
         .get("completion_tokens")
         .or_else(|| usage.get("output_tokens"))
-        .and_then(|t| t.as_u64());
+        .and_then(serde_json::Value::as_u64);
     match (prompt, completion) {
         (Some(p), Some(c)) => Some(p + c),
         (None, Some(c)) => Some(c),
@@ -741,7 +745,7 @@ pub async fn requests_cancel(
     key: Option<axum::Extension<KeyCtx>>,
     Path(id): Path<String>,
 ) -> Response {
-    request_stop(state, key, &id, false).await
+    request_stop(&state, key.as_ref(), &id, false)
 }
 
 /// POST /v1/requests/{id}/interrupt — stop the generation, keep the
@@ -751,12 +755,12 @@ pub async fn requests_interrupt(
     key: Option<axum::Extension<KeyCtx>>,
     Path(id): Path<String>,
 ) -> Response {
-    request_stop(state, key, &id, true).await
+    request_stop(&state, key.as_ref(), &id, true)
 }
 
-async fn request_stop(
-    state: Arc<AppState>,
-    key: Option<axum::Extension<KeyCtx>>,
+fn request_stop(
+    state: &Arc<AppState>,
+    key: Option<&axum::Extension<crate::keys::KeyCtx>>,
     id: &str,
     interrupt: bool,
 ) -> Response {
@@ -766,7 +770,7 @@ async fn request_stop(
     // Key scoping BEFORE mutating: another key's card is indistinguishable
     // from a missing one (no existence leak).
     match state.requests.get(id) {
-        Some(card) if visible(&state, &card, key.as_ref().map(|e| &e.0)) => {}
+        Some(card) if visible(state, &card, key.map(|e| &e.0)) => {}
         _ => {
             return crate::error_response(
                 404,
@@ -824,6 +828,7 @@ fn parse_filters(q: Option<&str>) -> (Option<String>, Option<String>) {
 
 #[cfg(test)]
 mod tests {
+    #![allow(non_snake_case)]
     use super::*;
 
     fn card_with(state: u8, key: Option<&str>, model: Option<&str>) -> RequestCard {

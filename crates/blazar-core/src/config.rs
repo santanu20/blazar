@@ -417,7 +417,7 @@ pub struct Config {
     /// emits one SSE `chunk.completed` event per decoded slice, so long
     /// recordings surface text every few seconds instead of only at the
     /// end. Non-WAV inputs stream as a single final event (upstream has
-    /// no streaming surface to relay). Range 1_000..=120_000 ms.
+    /// no streaming surface to relay). Range `1_000..=120_000` ms.
     #[serde(default = "default_whisper_stream_chunk_ms")]
     pub whisper_stream_chunk_ms: u64,
     /// Capability-lane registry URL (curated fork lanes for GGUF

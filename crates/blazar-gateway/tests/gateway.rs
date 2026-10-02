@@ -109,6 +109,7 @@ async fn start_with(config: Config, child_env: Vec<(String, String)>) -> TestSer
             params: Some(0.5),
             ctx_train: Some(40_960),
             pulled_at: 1,
+            last_used_at: 1,
         })
         .unwrap();
     // Second model for router-mode tests (unused by single-model tests).
@@ -129,6 +130,7 @@ async fn start_with(config: Config, child_env: Vec<(String, String)>) -> TestSer
             params: Some(0.5),
             ctx_train: Some(40_960),
             pulled_at: 1,
+            last_used_at: 1,
         })
         .unwrap();
 
@@ -320,6 +322,100 @@ async fn e2e__num_ctx_header_resolves_the_tags_rendered_name() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__n_choices_engine_ignoring_n_gets_a_teaching_502() {
+    // Default stub returns ONE choice no matter what was asked: the
+    // gateway must detect "lane ignored n" and refuse loudly instead of
+    // letting a silent 1-of-N answer through.
+    let ts = start(Config::default()).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "messages": [{"role": "user", "content": "pick one"}],
+            "n": 3,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let msg = body.to_string();
+    assert!(
+        msg.contains("asked n=3 choices") && msg.contains("engine returned 1"),
+        "under-count teaching must name both numbers, got {msg}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__n_choices_honored_passes_through_with_all_choices() {
+    std::env::set_var("STUB_CHOICE_COUNT", "3");
+    let ts = start(Config::default()).await;
+    let c = client();
+    let r: serde_json::Value = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "messages": [{"role": "user", "content": "variants"}],
+            "n": 3,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let choices = r["choices"].as_array().expect("choices array");
+    assert_eq!(choices.len(), 3, "all three choices must arrive");
+    let indexes: Vec<i64> = choices.iter().map(|ch| ch["index"].as_i64().unwrap()).collect();
+    assert_eq!(indexes, vec![0, 1, 2]);
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__n_choices_out_of_range_fails_fast_unbilled() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "messages": [{"role": "user", "content": "too many"}],
+            "n": 9,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let msg = body.to_string();
+    assert!(
+        msg.contains("n must be an integer in 2..=8") || msg.contains("1..=8"),
+        "range teaching must name the cap, got {msg}"
+    );
+    // Strictness: a float or string n is a contract violation, not a
+    // silent default-to-1.
+    for bad in [serde_json::json!(2.0), serde_json::json!("2")] {
+        let resp = c
+            .post(format!("{}/v1/chat/completions", ts.base))
+            .json(&serde_json::json!({
+                "model": "m1",
+                "messages": [{"role": "user", "content": "strict"}],
+                "n": bad,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "n={bad} must be rejected");
+    }
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
@@ -3367,6 +3463,7 @@ async fn e2e__llamacpp_only_gates__routed_lane_beats_active_row() {
             params: None,
             ctx_train: None,
             pulled_at: 1,
+            last_used_at: 1,
         })
         .unwrap();
     });

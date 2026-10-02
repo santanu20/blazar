@@ -89,11 +89,15 @@ impl Throttle {
     /// Paced sleep for a read of `bytes`. Holds the bucket guard across
     /// the sleep (see the struct docs for why); uncontended cost is one
     /// lock round-trip.
+    // refill + deficit + sleep accounting read best as one audited block
+    #[allow(clippy::too_many_lines)]
     pub async fn acquire(&self, bytes: u64) {
         let mut st = self.state.lock().await;
         let elapsed = st.updated.elapsed();
-        let (tokens, wait) =
-            bucket_delay(st.tokens, elapsed, bytes as f64, self.rate_bytes_per_sec);
+        // byte counts are bounded far below 2^52; f64 is the bucket unit
+        #[allow(clippy::cast_precision_loss)]
+        let requested = bytes as f64;
+        let (tokens, wait) = bucket_delay(st.tokens, elapsed, requested, self.rate_bytes_per_sec);
         // Stamp BEFORE sleeping: the wait window is what earns the spent
         // tokens back for the next waiter, so elapsed-time refill in the
         // next acquire lands on the deficit just paid.
@@ -107,6 +111,7 @@ impl Throttle {
 
 #[cfg(test)]
 #[allow(non_snake_case)]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)] // tiny consts
 mod tests {
     use super::*;
 

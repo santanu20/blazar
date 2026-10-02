@@ -394,6 +394,7 @@ impl Puller {
         std::fs::create_dir_all(&models_dir)?;
 
         let total_bytes = model_layer.size + projector.map_or(0, |p| p.size);
+        crate::storage::gate_disk(&self.dirs, total_bytes, &format!("{name} (registry lane)"))?;
         let bar = indicatif::ProgressBar::new(total_bytes);
         bar.set_style(
             indicatif::ProgressStyle::default_bar()
@@ -657,6 +658,13 @@ fn registry_model_row(
         params: Some(est_params(model_plan.bytes, quant)),
         ctx_train: ctx_train.and_then(|c| i64::try_from(c).ok()),
         pulled_at: i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| anyhow!("clock before epoch: {e}"))?
+                .as_secs(),
+        )
+        .unwrap_or(i64::MAX),
+        last_used_at: i64::try_from(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|e| anyhow!("clock before epoch: {e}"))?
@@ -1001,6 +1009,7 @@ mod tests {
             params: None,
             ctx_train: None,
             pulled_at: 0,
+            last_used_at: 0,
         };
         blazar_core::store::Store::open(&dirs)
             .unwrap()

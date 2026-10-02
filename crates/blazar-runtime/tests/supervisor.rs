@@ -54,6 +54,7 @@ fn setup(models: &[(&str, u64)]) -> (tempfile::TempDir, BlazarDirs) {
                 params: None,
                 ctx_train: Some(40_960),
                 pulled_at: 1,
+                last_used_at: 1,
             })
             .unwrap();
     }

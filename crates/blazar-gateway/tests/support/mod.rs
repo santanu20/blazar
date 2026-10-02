@@ -120,6 +120,7 @@ pub async fn start(config: Config) -> TestServer {
             params: Some(0.5),
             ctx_train: Some(40_960),
             pulled_at: 1,
+            last_used_at: 1,
         })
         .unwrap();
     // Production always has an active engine row (engine-manager); the

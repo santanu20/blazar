@@ -75,7 +75,7 @@ impl JobRuntime {
     /// `grace + margin` cuts at THIS daemon's start time, catching rows
     /// whose last update fell inside the grace window (killed moments
     /// before boot) which the first pass deliberately spared. Anything
-    /// this daemon wrote has updated_at >= its start, so live work —
+    /// this daemon wrote has `updated_at` >= its start, so live work —
     /// including a doctor mid-probe silent for its whole 300 s cold-load
     /// allowance — is never reaped.
     pub fn boot_sweep(&self, state: &Arc<AppState>) {
@@ -127,6 +127,7 @@ impl JobRuntime {
     /// Insert the job row at submit time. `request_json` must carry
     /// everything a cancel needs to redispatch (engine name for
     /// child-owned lanes) and everything a resubmit needs to teach.
+    #[allow(clippy::needless_pass_by_value)] // stored verbatim into the ledger row
     pub fn record_created(
         &self,
         state: &AppState,
@@ -169,7 +170,7 @@ impl JobRuntime {
             .map_or(String::new(), |e| format!(".{e}"));
         let dir = self.jobs_dir.join(sanitize_id(id));
         let path = dir.join(format!("input{ext}"));
-        if let Err(err) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, data)) {
+        if let Err(err) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, data)) {
             tracing::warn!(target: "blazar::jobs", job = %id, %err, "input artifact write failed — job continues without it");
         }
     }
@@ -192,7 +193,7 @@ impl JobRuntime {
         } else {
             let dir = self.jobs_dir.join(sanitize_id(id));
             let path = dir.join("result");
-            match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, body)) {
+            match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, body)) {
                 Ok(()) => (
                     serde_json::to_string(&serde_json::json!({
                         "artifact": true,
@@ -247,7 +248,14 @@ impl JobRuntime {
     /// Append a progress event without a state transition — doctor probe
     /// verdicts today, lane milestones later. The row must already exist;
     /// a missing row is a debug-level note (the lane stays authoritative).
-    pub fn record_event(&self, state: &AppState, id: &str, kind: &str, data: serde_json::Value) {
+    #[allow(clippy::needless_pass_by_value)] // serialized into the event row
+    pub fn record_event(
+        &self,
+        state: &AppState,
+        id: &str,
+        kind: &str,
+        data: serde_json::Value,
+    ) {
         let data = serde_json::to_string(&data).ok();
         let outcome = state.with_store(|s| s.append_job_event(id, kind, data.as_deref()));
         match outcome {
@@ -261,6 +269,7 @@ impl JobRuntime {
         }
     }
 
+    #[allow(clippy::unused_self)] // sibling record_* methods take &self; symmetry reads better
     fn transition(
         &self,
         state: &AppState,
@@ -284,10 +293,10 @@ impl JobRuntime {
             // Unknown row (lane created it before this release, or the
             // insert failed loudly earlier) — the live answer still wins.
             Some(false) => {
-                tracing::debug!(target: "blazar::jobs", job = %id, to, "job row absent; transition not recorded")
+                tracing::debug!(target: "blazar::jobs", job = %id, to, "job row absent; transition not recorded");
             }
             None => {
-                tracing::warn!(target: "blazar::jobs", job = %id, to, "job ledger unavailable; transition not recorded")
+                tracing::warn!(target: "blazar::jobs", job = %id, to, "job ledger unavailable; transition not recorded");
             }
         }
     }
@@ -305,6 +314,7 @@ fn sanitize_id(id: &str) -> String {
 /// lane-native shapes: `id`, `status`, `created_at` keep their existing
 /// vocabulary; `kind`, `updated_at`, `result`, `error`, `artifact` are the
 /// durable extras.
+#[must_use]
 pub fn row_payload(row: &JobRow) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "id": row.id,
@@ -365,6 +375,7 @@ pub async fn jobs_list(State(state): State<Arc<AppState>>, Query(q): Query<ListQ
 /// GET /v1/jobs/{id} — terminal rows answer from the ledger; live ones
 /// dispatch to their lane for fresh state (audio registry, live child
 /// poll for image/video), mirroring whatever terminal state comes back.
+#[allow(clippy::single_match_else)] // two response-shaped arms read clearer than if-let-else across 20 lines
 pub async fn jobs_get(State(state): State<Arc<AppState>>, Path(job_id): Path<String>) -> Response {
     if !job_id
         .chars()

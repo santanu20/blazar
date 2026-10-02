@@ -296,6 +296,12 @@ pub async fn ensure_with_admission(
             }
             msg => Box::new(openai_error(500, msg)),
         })?;
+    // Usage tracking for `blazar prune --unused`: stamp last_used_at on
+    // cold spawns only — a resident row is fresh by definition, so the
+    // hot path never pays the write.
+    if !state.sup.ps().iter().any(|r| r.name == row.name) {
+        let _ = state.with_store(|s| s.touch_model_used(&row.name));
+    }
     // Domain mirror of images::images_gate: a diffusion component set on a
     // text/embedding surface must teach the images lane up front. Spawning
     // sd-server for it would "succeed" and then 404 every chat-shaped
@@ -2507,6 +2513,7 @@ mod resolve_model_tests {
             params: None,
             ctx_train: None,
             pulled_at: 0,
+            last_used_at: 0,
         }
     }
 
