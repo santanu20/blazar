@@ -259,6 +259,18 @@ pub fn quantized_safetensors_signal(name: &str, repo: &str, path: &str) -> bool 
     })
 }
 
+/// MLX-format signal: the pull convention carries the marker in the
+/// repo (`mlx-community/...`) or name/path token. Callers gate on the
+/// row being a directory (the safetensors class) exactly as they do
+/// for `safetensors` — a GGUF file from an mlx repo is a GGUF row.
+pub fn mlx_signal(name: &str, repo: &str, path: &str) -> bool {
+    [name, repo, path].iter().any(|s| {
+        s.to_ascii_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|tok| tok == "mlx")
+    })
+}
+
 impl ModelRow {
     /// True for quantized safetensors checkpoints (AWQ/GPTQ/FP8). The
     /// `quant` column is UNRELIABLE for this (an AWQ dir pulls with
@@ -270,6 +282,16 @@ impl ModelRow {
     #[must_use]
     pub fn is_quantized_safetensors(&self) -> bool {
         quantized_safetensors_signal(&self.name, &self.repo, &self.path)
+    }
+
+    /// True for MLX-format community dirs. The token marker (repo
+    /// `mlx-community/...`, or an `mlx` name/path token) plus the
+    /// caller's dir gate is the discriminator — MLX dirs are
+    /// quantized-safetensors-shaped, so routing consults this BEFORE
+    /// [`Self::is_quantized_safetensors`].
+    #[must_use]
+    pub fn is_mlx(&self) -> bool {
+        mlx_signal(&self.name, &self.repo, &self.path)
     }
 
     /// Local path for a component flag, if the set carries it.

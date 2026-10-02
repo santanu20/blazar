@@ -1987,6 +1987,9 @@ pub struct WarmPeg {
     pub sglang: Option<bool>,
     /// llamacpp override (its peg is detached and near-free).
     pub llamacpp: Option<bool>,
+    /// mlx override (same JIT class as sglang: the warm peg absorbs
+    /// the python cold-boot — set false to publish Ready on /health).
+    pub mlx: Option<bool>,
 }
 
 impl Default for WarmPeg {
@@ -1995,6 +1998,7 @@ impl Default for WarmPeg {
             default: true,
             sglang: None,
             llamacpp: None,
+            mlx: None,
         }
     }
 }
@@ -2008,6 +2012,7 @@ impl WarmPeg {
         match kind {
             EngineKind::Sglang => self.sglang.unwrap_or(self.default),
             EngineKind::LlamaCpp => self.llamacpp.unwrap_or(self.default),
+            EngineKind::Mlx => self.mlx.unwrap_or(self.default),
             // No peg lane exists for these servers: readiness publishes
             // when the health probe flips (mistralrs), /v1/models first
             // answers (sdcpp), or the lazy child first boots (whisper —

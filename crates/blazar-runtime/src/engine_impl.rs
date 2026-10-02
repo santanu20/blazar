@@ -1118,26 +1118,28 @@ fn sglang_argv(
     argv
 }
 
-/// Locate the venv's bundled pip CUDA libraries (`nvidia/<pkg>/lib`) for
-/// an sglang engine install.
+/// Locate the venv's bundled pip CUDA libraries (`nvidia/<pkg>/lib`) for a
+/// venv-layout engine install (sglang, mlx).
 ///
 /// The engine layout contract puts the interpreter at
 /// `<engine-dir>/venv/bin/python` while `server_path` may point at either
-/// the generated `sglang-server` shell wrapper sitting NEXT to the venv
+/// the generated `<lane>-server` shell wrapper sitting NEXT TO the venv
 /// or the interpreter itself — so the venv is found by the layout probe
 /// (nearest ancestor owning `venv/bin/python`), never by loose `bin/` +
 /// `lib/` matching, which happily mis-roots on host dirs like `~/.local`.
 ///
-/// Why this matters: sglang helper processes (`--enable-memory-saver`)
-/// exec a python that links `libcudart` directly; without the venv's
-/// nvidia lib dirs on the linker path they die with exit 127 (receipt:
-/// "Rank 0 scheduler died during initialization", 2026-09-29). Returning
-/// the dirs here lets the spawn put them on `LD_LIBRARY_PATH`, which
-/// every descendant inherits.
+/// Why this matters: venv-lane helper processes (sglang schedulers,
+/// mlx's `libmlxcuda` extension) link pip-provided CUDA libraries
+/// directly; without the venv's nvidia lib dirs on the linker path they
+/// die with exit 127 (sglang receipt: "Rank 0 scheduler died during
+/// initialization", 2026-09-29; mlx-cuda wheels carry the identical
+/// nvidia-cublas/nvrtc/cudnn layout, so the same class applies).
+/// Returning the dirs here lets the spawn put them on `LD_LIBRARY_PATH`,
+/// which every descendant inherits.
 ///
 /// No-op for non-venv layouts (native engine dirs, out-of-tree bins):
 /// the probe finds no venv and the list comes back empty.
-fn sglang_venv_nvidia_lib_dirs(server_path: &str) -> Vec<std::path::PathBuf> {
+fn venv_nvidia_lib_dirs(server_path: &str) -> Vec<std::path::PathBuf> {
     let path = std::path::Path::new(server_path);
     let venv_root = path
         .ancestors()
@@ -1206,12 +1208,12 @@ impl Engine for SglangEngine {
         }
         // Provision the venv's pip CUDA libs onto the linker path before
         // spawning: sglang helper processes link libcudart directly (see
-        // `sglang_venv_nvidia_lib_dirs`) and there is no ambient
+        // `venv_nvidia_lib_dirs`) and there is no ambient
         // LD_LIBRARY_PATH carrying the venv layout. An explicit user
         // `[engine_env]` LD_LIBRARY_PATH keeps its entries — ours prepend
         // so the venv that owns the binary wins for its own libs.
         let mut env: Vec<(String, String)> = self.child_env.clone();
-        let cuda_dirs = sglang_venv_nvidia_lib_dirs(&self.manifest.server_path);
+        let cuda_dirs = venv_nvidia_lib_dirs(&self.manifest.server_path);
         if !cuda_dirs.is_empty() {
             const LD_LIB: &str = "LD_LIBRARY_PATH";
             let user_val = env
@@ -1271,6 +1273,182 @@ impl Engine for SglangEngine {
             // (generate-probe default), so a 150ms hammer queues ~7
             // probes/second against a booting scheduler and self-congests
             // the exact responses the poll is waiting for.
+            poll = std::cmp::min(poll.mul_f64(1.6), std::time::Duration::from_secs(1));
+        }
+    }
+}
+
+/// mlx-lm engine: the `mlx-server` venv shim execs
+/// `python -m mlx_lm.server`, an OpenAI-compatible HTTP server that
+/// serves MLX-quant directories (mlx-community layout: safetensors +
+/// `config.json` with an `mlx` quantization block). On Linux/NVIDIA the
+/// venv carries `mlx-cuda` (CUDA backend wheels); on Apple Silicon the
+/// plain `mlx` build — same lane, platform-chosen backend.
+pub struct MlxEngine {
+    pub manifest: crate::engine::manifest::Manifest,
+    /// HTTP client for health polls (children are loopback).
+    http: reqwest::Client,
+    /// Extra env injected into children (config `engine_env`).
+    pub child_env: Vec<(String, String)>,
+}
+
+impl MlxEngine {
+    #[must_use]
+    pub fn new(manifest: crate::engine::manifest::Manifest) -> Self {
+        Self::with_env(manifest, Vec::new())
+    }
+
+    /// `env` pairs apply to every spawned child (config `engine_env`).
+    #[must_use]
+    pub fn with_env(
+        manifest: crate::engine::manifest::Manifest,
+        env: Vec<(String, String)>,
+    ) -> Self {
+        // Same 5s budget class as sglang: mlx_lm.server is a plain
+        // python HTTP server whose /v1/models probe is cheap, but the
+        // interpreter itself is torch-class slow to import — a 2s
+        // timeout risks eating the first (or only) successful response
+        // during boot.
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("health client");
+        Self {
+            manifest,
+            http,
+            child_env: env,
+        }
+    }
+}
+
+/// mlx connection trio + compiled profile. The profile argv is already
+/// `mlx_lm.server` grammar; this prepends what the supervisor owns:
+/// model dir, loopback bind, port. The per-child auth secret (when the
+/// installed mlx-lm build supports `--api-key` — probed at install) is
+/// appended by the supervisor's child-auth mint, same as the other
+/// lanes: one choke point, not engine business.
+fn mlx_argv(
+    model: &blazar_core::ModelRow,
+    profile: &Profile,
+    endpoint: &Endpoint,
+) -> Vec<String> {
+    let port = match endpoint {
+        Endpoint::Tcp { port, .. } => *port,
+        // Supervisor rejects unix endpoints for mlx engines before
+        // argv assembly; a placeholder here cannot produce a valid child.
+        Endpoint::Unix { .. } => 0,
+    };
+    let mut argv = vec![
+        "--model".to_string(),
+        model.path.clone(),
+        // Forced loopback: the child is never the public face — the
+        // gateway is (binding revision 3), and unlike sglang the mlx-lm
+        // server has no built-in API key on every build, so the bind is
+        // the load-bearing isolation.
+        "--host".to_string(),
+        "127.0.0.1".to_string(),
+        "--port".to_string(),
+        port.to_string(),
+    ];
+    argv.extend(profile.argv.iter().cloned());
+    argv
+}
+
+#[async_trait]
+impl Engine for MlxEngine {
+    fn kind(&self) -> blazar_core::engine_kind::EngineKind {
+        blazar_core::engine_kind::EngineKind::Mlx
+    }
+
+    fn capabilities(&self) -> &crate::engine::manifest::Manifest {
+        &self.manifest
+    }
+
+    fn build_argv(
+        &self,
+        model: &blazar_core::ModelRow,
+        profile: &Profile,
+        endpoint: &Endpoint,
+    ) -> Vec<String> {
+        mlx_argv(model, profile, endpoint)
+    }
+
+    async fn spawn(
+        &self,
+        argv: &[String],
+        endpoint: &Endpoint,
+        spawn_env: &[(String, String)],
+    ) -> Result<ChildHandle> {
+        if matches!(endpoint, Endpoint::Unix { .. }) {
+            return Err(anyhow!(
+                "mlx engines have no unix-socket transport; set \
+                 child_transport = \"tcp\" in the blazar config"
+            ));
+        }
+        // Same venv CUDA-lib surgery as sglang: on Linux the mlx-cuda
+        // backend links the venv's pip nvidia libs (cublas/nvrtc/cudnn)
+        // directly, and no ambient LD_LIBRARY_PATH carries the venv
+        // layout. User [engine_env] entries survive — ours prepend so
+        // the venv that owns the shim wins for its own libs. On Apple
+        // Silicon the probe finds no nvidia dirs and this is a no-op.
+        let mut env: Vec<(String, String)> = self.child_env.clone();
+        let cuda_dirs = venv_nvidia_lib_dirs(&self.manifest.server_path);
+        if !cuda_dirs.is_empty() {
+            const LD_LIB: &str = "LD_LIBRARY_PATH";
+            let user_val = env
+                .iter()
+                .find(|(k, _)| k == LD_LIB)
+                .map(|(_, v)| v.clone())
+                .or_else(|| std::env::var(LD_LIB).ok())
+                .unwrap_or_default();
+            let ours: Vec<String> = cuda_dirs
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            let mut entries = ours;
+            for part in user_val.split(':') {
+                if !part.is_empty() && !entries.iter().any(|e| e == part) {
+                    entries.push(part.to_string());
+                }
+            }
+            let merged = entries.join(":");
+            env.retain(|(k, _)| k != LD_LIB);
+            env.push((LD_LIB.to_string(), merged));
+        }
+        // spawn_env applies last: a pinned CUDA_VISIBLE_DEVICES pair
+        // survives the LD_LIBRARY_PATH surgery above.
+        spawn_child(&self.manifest.server_path, argv, endpoint, &env, spawn_env)
+    }
+
+    async fn health_check(&self, endpoint: &Endpoint, timeout: std::time::Duration) -> Result<()> {
+        let Endpoint::Tcp { host, port } = endpoint else {
+            return Err(anyhow!("mlx engines require a TCP endpoint"));
+        };
+        let url = format!("http://{host}:{port}");
+        let deadline = tokio::time::Instant::now() + timeout;
+        let started = std::time::Instant::now();
+        // Health = HTTP 200 on /v1/models: mlx_lm.server speaks the
+        // OpenAI surface and answers model listings once weights are
+        // loaded; there is no dedicated /health route (verified against
+        // the mlx-lm server implementation at lane bring-up). Unlike
+        // sglang's generate-probe /health this costs the child nothing,
+        // but the 1s poll cap stays: the python import chain makes the
+        // boot window long and hammering serves nothing.
+        let mut poll = std::time::Duration::from_millis(25);
+        loop {
+            if let Ok(resp) = self.http.get(format!("{url}/v1/models")).send().await {
+                if resp.status().is_success() {
+                    tracing::debug!("mlx healthy at {url} after {:?}", started.elapsed());
+                    return Ok(());
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "mlx at {url} did not turn healthy (HTTP 200 on /v1/models) \
+                     within {timeout:?} (model_load_timeout)"
+                ));
+            }
+            tokio::time::sleep(poll).await;
             poll = std::cmp::min(poll.mul_f64(1.6), std::time::Duration::from_secs(1));
         }
     }
@@ -1365,7 +1543,7 @@ mod tests {
     }
 
     #[test]
-    fn unit__sglang_venv_nvidia_lib_dirs__discovers_pip_cuda_layout() {
+    fn unit__venv_nvidia_lib_dirs__discovers_pip_cuda_layout() {
         // Receipt: the sglang memory-saver helper execs a python that
         // links libcudart directly and died with exit 127 ("cannot open
         // shared object file") until the spawn put the venv's
@@ -1394,7 +1572,7 @@ mod tests {
         std::fs::write(venv.join("bin").join("python"), b"").unwrap();
         std::fs::create_dir_all(&wrapper).unwrap();
 
-        let dirs = sglang_venv_nvidia_lib_dirs(wrapper.to_str().unwrap());
+        let dirs = venv_nvidia_lib_dirs(wrapper.to_str().unwrap());
         assert_eq!(
             dirs,
             vec![cu13.clone(), cudnn.clone()],
@@ -1404,13 +1582,13 @@ mod tests {
         // The interpreter path itself resolves to the same dirs.
         let python = venv.join("bin").join("python");
         assert_eq!(
-            sglang_venv_nvidia_lib_dirs(python.to_str().unwrap()),
+            venv_nvidia_lib_dirs(python.to_str().unwrap()),
             vec![cu13, cudnn]
         );
 
         // Non-venv binaries (native engine layout) find nothing.
         assert_eq!(
-            sglang_venv_nvidia_lib_dirs("/opt/blazar/engines/b1/llama-server").len(),
+            venv_nvidia_lib_dirs("/opt/blazar/engines/b1/llama-server").len(),
             0
         );
         std::fs::remove_dir_all(&tmp).unwrap();

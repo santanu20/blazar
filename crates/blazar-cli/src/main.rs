@@ -2017,6 +2017,7 @@ fn routed_engine_lane(
         diffusion,
         safetensors,
         quantized,
+        safetensors && blazar_core::store::mlx_signal(name, "", path),
         *g_kind,
         &installed,
     ) {
@@ -2201,6 +2202,9 @@ fn engine_offer_line(kind: blazar_core::engine_kind::EngineKind) -> String {
         EngineKind::Sglang => {
             "sglang (~6 GiB, Linux + NVIDIA) — best quality + batching for safetensors".to_string()
         }
+        EngineKind::Mlx => {
+            "mlx (~3 GiB, CUDA linux + Apple Silicon) — MLX quant dirs (mlx-community)".to_string()
+        }
         EngineKind::MistralRs => {
             "mistral.rs (~0.8 GiB, any platform) — fastest cold boot, GGUF + safetensors"
                 .to_string()
@@ -2224,6 +2228,7 @@ async fn install_missing_kind(
     use blazar_core::engine_kind::EngineKind;
     match kind {
         EngineKind::Sglang => engine_install_sglang(d, None).await,
+        EngineKind::Mlx => engine_install_mlx(d, None).await,
         EngineKind::MistralRs => engine_install_mistralrs(d, None).await,
         EngineKind::SdCpp => engine_install_sdcpp(d, None).await,
         EngineKind::Whisper => engine_install_whisper(d, None).await,
@@ -2276,6 +2281,7 @@ fn lane_state_for(d: &BlazarDirs, row: &blazar_core::store::ModelRow) -> LaneSta
                 row.has_component_set(),
                 safetensors,
                 row.is_quantized_safetensors(),
+                row.is_mlx() && safetensors,
                 active.kind,
                 &installed,
             ) {
@@ -4171,6 +4177,11 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
             checks.push(live_sglang_currency(&active).await);
             return checks;
         }
+        Some(EngineKind::Mlx) => {
+            let active = active_tag.unwrap_or_else(|| "?".into());
+            checks.push(live_mlx_currency(&active).await);
+            return checks;
+        }
         Some(EngineKind::SdCpp) => {
             let active = active_tag.as_deref().unwrap_or("?");
             checks.push(live_sdcpp_currency(active).await);
@@ -4463,6 +4474,35 @@ async fn live_sglang_currency(active: &str) -> Check {
     }
 }
 
+async fn live_mlx_currency(active: &str) -> Check {
+    let installed_version = active.trim_start_matches("mlx-");
+    match blazar_runtime::engine::mlx_install::pypi_latest_mlx_lm().await {
+        Ok(latest) => {
+            let (inst, want) = (
+                blazar_runtime::engine::mlx_install::version_tuple(installed_version),
+                blazar_runtime::engine::mlx_install::version_tuple(&latest),
+            );
+            if inst >= want {
+                Check::ok(
+                    "engine currency",
+                    format!("up to date ({active}, mlx-lm pip lane)"),
+                )
+            } else {
+                Check::warn(
+                    "engine currency",
+                    format!(
+                        "{latest} available on PyPI (active: {active}) — run:                          blazar engine update --kind mlx {latest}"
+                    ),
+                )
+            }
+        }
+        Err(e) => Check::warn(
+            "engine currency",
+            format!("{active} (mlx-lm pip lane) — PyPI check failed ({e:#}); offline?"),
+        ),
+    }
+}
+
 async fn live_mistralrs_currency(active: &str) -> Check {
     let token = std::env::var("GH_TOKEN")
         .or_else(|_| std::env::var("GITHUB_TOKEN"))
@@ -4567,6 +4607,7 @@ async fn doctor_lane_currency(d: &BlazarDirs, active_kind: Option<EngineKind>) -
         }
         match kind {
             EngineKind::Sglang => out.push(live_sglang_currency(&row.tag).await),
+            EngineKind::Mlx => out.push(live_mlx_currency(&row.tag).await),
             EngineKind::MistralRs => out.push(live_mistralrs_currency(&row.tag).await),
             EngineKind::SdCpp => out.push(live_sdcpp_currency(&row.tag).await),
             _ => out.push(live_engine_currency(&row.tag, &row.asset).await),
@@ -5630,6 +5671,9 @@ async fn serve() -> Result<()> {
         )),
         blazar_core::engine_kind::EngineKind::Sglang => {
             Arc::new(blazar_runtime::SglangEngine::with_env(manifest, engine_env))
+        }
+        blazar_core::engine_kind::EngineKind::Mlx => {
+            Arc::new(blazar_runtime::MlxEngine::with_env(manifest, engine_env))
         }
         blazar_core::engine_kind::EngineKind::LlamaCpp => {
             Arc::new(LlamaCppEngine::with_env(manifest, engine_env))
@@ -10321,6 +10365,7 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
         EngineKind::LlamaCpp => "llama-server",
         EngineKind::MistralRs => "mistral.rs",
         EngineKind::Sglang => "sglang",
+        EngineKind::Mlx => "mlx-lm",
         EngineKind::SdCpp => "sd-server",
         EngineKind::Whisper => "whisper-server",
     };
@@ -10349,8 +10394,8 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
         ));
         out.push(knob("cache_type = \"\""));
     } else {
-        let (table, families) = match kind {
-            EngineKind::Sglang => (
+        let table_families = match kind {
+            EngineKind::Sglang => Some((
                 "sglang",
                 vec![
                     "attention_backend = \"triton\"    sampling_backend = \"pytorch\"",
@@ -10374,8 +10419,8 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
                     "tp_size = 1    dp_size = 1    pp_size = 1    ep_size = 1",
                     "max_lora_rank = 16    lora_backend = \"\"",
                 ],
-            ),
-            EngineKind::MistralRs => (
+            )),
+            EngineKind::MistralRs => Some((
                 "mistralrs",
                 vec![
                     "max_batch_size = 1    max_prefill_chunk_tokens = 512",
@@ -10386,23 +10431,37 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
                     "encoder_cache_memory_mb = 512    max_num_images = 1    max_image_length = 1024",
                     "disable_metrics = false    disable_access_log = false    device_layers = \"0:10;1:20\"",
                 ],
-            ),
+            )),
             EngineKind::LlamaCpp => unreachable!("llamacpp handled above"),
             // Image lane: sd-server tuning rides request parameters
             // (steps/cfg/sampler/seed per call), not config knobs —
             // no model-scoped families yet. New knobs get a line here.
-            EngineKind::SdCpp => ("sdcpp", vec![]),
+            EngineKind::SdCpp => Some(("sdcpp", vec![])),
             // Audio lane: whisper-server rides per-request fields
             // (language/temperature/prompt/beam_size on the multipart
             // call), not config knobs — same discipline as the image
             // lane.
-            EngineKind::Whisper => ("whisper", vec![]),
+            EngineKind::Whisper => Some(("whisper", vec![])),
+            // MLX lane has no config table yet — extra flags ride the
+            // generic model_overrides.argv passthrough, so no table
+            // header is advertised here (a hinted-but-unsettable table
+            // would be a lie).
+            EngineKind::Mlx => None,
         };
-        out.push(format!("# [model_overrides.\"{model}\".{table}]"));
-        out.extend(families.into_iter().map(knob));
-        out.push(format!(
-            "# (also global [{table}] table — model rows override it wholesale)"
-        ));
+        if let Some((table, families)) = table_families {
+            out.push(format!("# [model_overrides.\"{model}\".{table}]"));
+            out.extend(families.into_iter().map(knob));
+            out.push(format!(
+                "# (also global [{table}] table — model rows override it wholesale)"
+            ));
+        } else {
+            // No lane table: point at the generic argv passthrough
+            // instead of advertising a table `config set` would reject.
+            out.push(format!(
+                "# extra mlx-lm flags: [model_overrides.\"{model}\"] argv = [\"--flag\"]"
+            ));
+            out.push("# (generic engine passthrough — no [mlx] table exists yet)".into());
+        }
     }
     out.push(
         "# generic per-model rows (any engine): replicas / slots / deterministic / cache_type / ctx"
@@ -10830,6 +10889,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 match engine_kind {
                     EngineKind::LlamaCpp => engine_update(&d, tag, no_gate, check).await?,
                     EngineKind::Sglang => engine_update_sglang(&d, tag, check).await?,
+                    EngineKind::Mlx => engine_update_mlx(&d, tag, check).await?,
                     EngineKind::MistralRs => engine_update_mistralrs(&d, tag, check).await?,
                     EngineKind::SdCpp => engine_update_sdcpp(&d, tag, check).await?,
                     EngineKind::Whisper => engine_update_whisper(&d, tag, check).await?,
@@ -11096,6 +11156,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                      llama.cpp         GGUF files — blazar engine update (prebuilt) or blazar engine build cuda (source)\n  \
                      --kind mistralrs  HF safetensors dirs — prebuilt mistral.rs server\n  \
                      --kind sglang     HF safetensors dirs — pip venv (Linux + CUDA/ROCm)\n  \
+                     --kind mlx        MLX quant dirs (mlx-community) — pip venv (CUDA linux + Apple Silicon)\n  \
                      --kind sdcpp      diffusion GGUF component sets — prebuilt sd-server (Vulkan/CPU/Metal)\n  \
                      --kind whisper    audio transcription/translation — prebuilt whisper-server (CPU)\n  \
                      capability lane   blazar engine offers + install --lane <id> (fork builds)"
@@ -11107,13 +11168,14 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             match engine_kind {
                 EngineKind::MistralRs => engine_install_mistralrs(&d, tag).await?,
                 EngineKind::Sglang => engine_install_sglang(&d, tag).await?,
+                EngineKind::Mlx => engine_install_mlx(&d, tag).await?,
                 EngineKind::SdCpp => engine_install_sdcpp(&d, tag).await?,
                 EngineKind::Whisper => engine_install_whisper(&d, tag).await?,
                 EngineKind::LlamaCpp => {
                     return Err(anyhow!(
                         "llama.cpp engines install via `blazar engine update` / `blazar \
                          engine build` — `engine install --kind` serves mistralrs, sglang, \
-                         sdcpp and whisper"
+                         mlx, sdcpp and whisper"
                     ));
                 }
             }
@@ -11518,6 +11580,123 @@ async fn engine_install_sglang(d: &BlazarDirs, version: Option<String>) -> Resul
     Ok(())
 }
 
+async fn engine_install_mlx(d: &BlazarDirs, version: Option<String>) -> Result<()> {
+    let mgr = local_engine_manager(d)?;
+    let prior_active = Store::open(d)?.active_engine()?.map(|r| r.tag);
+    if let Some(v) = &version {
+        println!(
+            "{}",
+            dim_line(&format!(
+                "installing mlx-lm {v} (pip venv lane — multi-GB download incl. CUDA wheels)"
+            ))
+        );
+    } else {
+        println!(
+            "{}",
+            dim_line("installing mlx-lm (pip venv lane — multi-GB download incl. CUDA wheels)")
+        );
+    }
+    let row = mgr.install_mlx(version.as_deref()).await?;
+    let m: blazar_runtime::Manifest = serde_json::from_str(&row.manifest)?;
+    println!(
+        "engine {} active ({} flags probed, build {})",
+        row.tag,
+        m.flags.len(),
+        m.build_number
+    );
+    println!(
+        "{}",
+        dim_line("note: decode-regression gate is llama-server-only — skipped for mlx engines")
+    );
+    // Same one-build-per-lane contract: superseded mlx venvs (multi-GB
+    // each) are freed on a successful install/activate.
+    for (tag, bytes) in mgr.prune_siblings(EngineKind::Mlx.as_str(), &row.tag)? {
+        // fs sizes fit i64
+        #[allow(clippy::cast_possible_wrap)]
+        let freed = bytes as i64;
+        println!(
+            "removed superseded engine {} (freed {})",
+            tag,
+            humansize(freed)
+        );
+    }
+    println!(
+        "{}",
+        dim_line(
+            "next: pull an MLX model (e.g. blazar pull mlx-community/Qwen2.5-0.5B-Instruct-4bit)"
+        )
+    );
+    restart_daemon_if_active_changed(prior_active, row.active.then(|| row.tag.clone())).await;
+    Ok(())
+}
+
+/// `engine update --kind mlx [version]` — explicit version installs
+/// directly; bare call resolves the PyPI latest and installs it, the
+/// same lane semantics as sglang. `--check` stays a dry-run currency
+/// report. The version pin (`MLX_LM_DEFAULT_VERSION`) anchors fresh
+/// `engine install`; unknown flags on newer mlx-lm are skipped with
+/// profile warnings.
+async fn engine_update_mlx(d: &BlazarDirs, version: Option<String>, check: bool) -> Result<()> {
+    if version.is_some() && !check {
+        return engine_install_mlx(d, version).await;
+    }
+    if check {
+        if let Some(v) = &version {
+            println!("--check ignores the version pin (drop --check to install mlx-lm {v})");
+        }
+    }
+    let store = Store::open(d)?;
+    let installed = store
+        .list_engines()?
+        .into_iter()
+        .filter(|e| e.kind == EngineKind::Mlx)
+        .max_by_key(|e| {
+            blazar_runtime::engine::mlx_install::version_tuple(e.tag.trim_start_matches("mlx-"))
+                .unwrap_or((0, 0, 0))
+        })
+        .map(|e| e.tag.trim_start_matches("mlx-").to_string());
+    let Some(installed) = installed else {
+        return Err(anyhow!(
+            "no mlx engine installed — `blazar engine install --kind mlx` first"
+        ));
+    };
+    let latest = match blazar_runtime::engine::mlx_install::pypi_latest_mlx_lm().await {
+        Ok(v) => v,
+        Err(e) => {
+            println!("mlx-lm {installed} installed; cannot check PyPI right now: {e:#}");
+            return Ok(());
+        }
+    };
+    match (
+        blazar_runtime::engine::mlx_install::version_tuple(&installed),
+        blazar_runtime::engine::mlx_install::version_tuple(&latest),
+    ) {
+        (Some(a), Some(b)) if b > a => {
+            if check {
+                println!(
+                    "{}",
+                    dim_line(&format!(
+                        "dry-run: mlx-lm {installed} installed; {latest} is available on PyPI."
+                    ))
+                );
+            } else {
+                println!("mlx-lm {installed} installed; updating to {latest} from PyPI.");
+                engine_install_mlx(d, Some(latest)).await?;
+            }
+        }
+        _ => {
+            if check {
+                println!(
+                    "{}",
+                    dim_line("dry-run: nothing installed, nothing written")
+                );
+            }
+            println!("mlx-lm {installed} is current (PyPI latest: {latest}).");
+        }
+    }
+    Ok(())
+}
+
 /// `engine update --kind sglang [version]` — explicit version installs
 /// directly; bare call resolves the `PyPI` latest and installs it, the
 /// same lane semantics as mistralrs/sd.cpp/whisper. `--check` stays a
@@ -11691,6 +11870,7 @@ fn installed_engine_kinds(rows: &[blazar_core::EngineRow]) -> Vec<EngineKind> {
         EngineKind::LlamaCpp,
         EngineKind::MistralRs,
         EngineKind::Sglang,
+        EngineKind::Mlx,
         EngineKind::SdCpp,
         EngineKind::Whisper,
     ]
@@ -11759,6 +11939,7 @@ async fn engine_update_all(d: &BlazarDirs, no_gate: bool, check: bool) -> Result
         let result = match kind {
             EngineKind::LlamaCpp => engine_update(d, None, no_gate, check).await,
             EngineKind::Sglang => engine_update_sglang(d, None, check).await,
+            EngineKind::Mlx => engine_update_mlx(d, None, check).await,
             EngineKind::MistralRs => engine_update_mistralrs(d, None, check).await,
             EngineKind::SdCpp => engine_update_sdcpp(d, None, check).await,
             EngineKind::Whisper => engine_update_whisper(d, None, check).await,
@@ -13056,7 +13237,7 @@ async fn search(query: &str, format: &str, quant: Option<&str>, json: bool) -> R
     );
     match format.as_str() {
         "any" | "all" => println!(
-            "\n# pull: blazar pull <REPO>[:quant] (GGUF → llamacpp) or blazar pull <REPO> (safetensors/AWQ/GPTQ/FP8 → sglang/mistralrs)\n# MLX repos are Apple-silicon-only — pull the same model's GGUF or safetensors repo instead"
+            "\n# pull: blazar pull <REPO>[:quant] (GGUF → llamacpp) or blazar pull <REPO> (safetensors/AWQ/GPTQ/FP8 → sglang/mistralrs)\n# MLX quant dirs serve via the mlx lane (`blazar engine install --kind mlx`)"
         ),
         "gguf" => println!(
             "\n# pull one: blazar pull <REPO>[:quant]   (size = all quants in repo; QUANTS lists the choices)"
@@ -13065,10 +13246,10 @@ async fn search(query: &str, format: &str, quant: Option<&str>, json: bool) -> R
             "\n# pull one: blazar pull <REPO>   (safetensors serve via the sglang/mistralrs lane — `blazar engine install --kind sglang`)"
         ),
         "mlx" => println!(
-            "\n# MLX is Apple-silicon native; Blazar serves GGUF + safetensors — search the same model's GGUF repo or convert"
+            "\n# MLX dirs serve via the mlx lane — `blazar engine install --kind mlx` (CUDA linux + Apple Silicon)"
         ),
         _ => println!(
-            "\n# pull one: blazar pull <REPO>   (GGUF/safetensors serve; MLX needs conversion)"
+            "\n# pull one: blazar pull <REPO>   (GGUF/safetensors/MLX dirs serve via their lanes)"
         ),
     }
     Ok(())
@@ -14506,6 +14687,7 @@ mod tests {
             row("sglang-0.5.20", EngineKind::Sglang),
             row("b11338-cuda", EngineKind::LlamaCpp),
             row("sglang-0.5.19", EngineKind::Sglang),
+            row("mlx-0.32.0", EngineKind::Mlx),
             row("b5130", EngineKind::Whisper),
         ];
         let kinds = installed_engine_kinds(&rows);
@@ -14514,6 +14696,7 @@ mod tests {
             [
                 EngineKind::LlamaCpp,
                 EngineKind::Sglang,
+                EngineKind::Mlx,
                 EngineKind::Whisper
             ]
         ));

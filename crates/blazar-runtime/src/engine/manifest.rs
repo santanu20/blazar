@@ -472,7 +472,88 @@ pub fn probe_kind(
         blazar_core::engine_kind::EngineKind::Sglang => probe_sglang(server_path, tag),
         blazar_core::engine_kind::EngineKind::SdCpp => probe_sdcpp(server_path, tag),
         blazar_core::engine_kind::EngineKind::Whisper => probe_whisper(server_path, tag),
+        blazar_core::engine_kind::EngineKind::Mlx => probe_mlx(server_path, tag),
     }
+}
+
+/// Probe an mlx-lm venv lane. Same shape as sglang (the lane it
+/// mirrors): importlib.metadata version read through the venv python,
+/// display serial from the install tag, argparse `--help` flags via
+/// the shim — the mlx import chain is torch-class cold, hence the
+/// 120s budget. Zero parsed flags = upstream format change = probe
+/// failure, not a silently degraded manifest.
+fn probe_mlx(server_path: &Path, tag: &str) -> Result<Manifest> {
+    let server = server_path
+        .to_str()
+        .ok_or_else(|| anyhow!("non-UTF-8 engine path {}", server_path.display()))?;
+    let venv_python = server_path
+        .parent()
+        .ok_or_else(|| anyhow!("engine path {server} has no parent dir"))?
+        .join("venv")
+        .join("bin")
+        .join("python");
+
+    let version_out = crate::probe::probe_output(
+        Command::new(&venv_python)
+            .arg("-c")
+            .arg("import importlib.metadata as m; print(m.version('mlx_lm'))"),
+        30,
+    )
+    .with_context(|| {
+        format!(
+            "run {} -c importlib.metadata (mlx venv broken?)",
+            venv_python.display()
+        )
+    })?;
+    if !version_out.status.success() {
+        return Err(anyhow!(
+            "mlx-lm version probe exited {}: {}",
+            version_out.status,
+            String::from_utf8_lossy(&version_out.stderr)
+        ));
+    }
+    let version_raw = format!(
+        "mlx-lm {}",
+        String::from_utf8_lossy(&version_out.stdout).trim()
+    );
+
+    // Display-only serial from the install tag (mlx-0.26.5 ->
+    // 0000026005), same convention as the sglang/mistralrs lanes.
+    let tag_serial = tag
+        .strip_prefix("mlx-")
+        .and_then(|rest| rest.split(['-', '+']).next())
+        .and_then(|v| {
+            let mut it = v.split('.');
+            let maj = it.next()?.parse::<u64>().ok()?;
+            let min = it.next().unwrap_or("0").parse::<u64>().ok()?;
+            let patch = it.next().unwrap_or("0").parse::<u64>().ok()?;
+            Some(maj * 1_000_000 + min * 1_000 + patch)
+        })
+        .unwrap_or(0);
+
+    let help_out = crate::probe::probe_output(Command::new(server).arg("--help"), 120)
+        .with_context(|| {
+            format!("run {server} --help (mlx import chain can take a minute cold)")
+        })?;
+    let help = String::from_utf8_lossy(&help_out.stdout).to_string();
+    let (flags, _) = parse_help(&help);
+    if flags.is_empty() {
+        return Err(anyhow!(
+            "mlx-lm --help parsed to zero flags (output format changed upstream?): {}",
+            help.lines().take(3).collect::<Vec<_>>().join(" | ")
+        ));
+    }
+
+    Ok(Manifest {
+        tag: tag.to_string(),
+        build_number: tag_serial,
+        version_raw,
+        devices: Vec::new(),
+        flags,
+        spec_types: Vec::new(),
+        server_path: server.to_string(),
+        ..Default::default()
+    })
 }
 
 /// Probe a mistralrs binary. Divergences from llama-server (verified

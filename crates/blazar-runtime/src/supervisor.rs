@@ -3362,6 +3362,9 @@ impl Supervisor {
                 EngineKind::Sglang => {
                     Arc::new(crate::engine_impl::SglangEngine::with_env(manifest, env))
                 }
+                EngineKind::Mlx => {
+                    Arc::new(crate::engine_impl::MlxEngine::with_env(manifest, env))
+                }
                 EngineKind::LlamaCpp => {
                     Arc::new(crate::engine_impl::LlamaCppEngine::with_env(manifest, env))
                 }
@@ -3452,6 +3455,7 @@ impl Supervisor {
             model.has_component_set(),
             safetensors,
             model.is_quantized_safetensors(),
+            safetensors && model.is_mlx(),
             self.engine.kind(),
             &installed,
         )?

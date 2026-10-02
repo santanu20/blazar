@@ -9,6 +9,7 @@ pub mod gh;
 pub mod manifest;
 pub(crate) mod net_probe;
 pub mod sglang_install;
+pub mod mlx_install;
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1488,6 +1489,40 @@ impl EngineManager {
         .await
     }
 
+    /// Install the mlx lane (mlx-lm venv). Platform/backend gating lives
+    /// in `mlx_install::install_into` (macOS Metal / Linux CUDA), this
+    /// wrapper only owns the tag, the dual-pin asset label and the
+    /// rollback envelope — same discipline as the sglang lane.
+    pub async fn install_mlx(&self, version: Option<&str>) -> Result<EngineRow> {
+        let version = version.unwrap_or(mlx_install::MLX_LM_DEFAULT_VERSION);
+        // Reject malformed pins early: the tag IS the version string that
+        // probe_mlx's semver parse and pip both consume.
+        if version.is_empty() || !version.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            anyhow::bail!("mlx version must be dotted digits (e.g. 0.32.0), got {version:?}");
+        }
+        let tag = format!("mlx-{version}");
+        // The label names BOTH pins (mlx-lm + the CUDA backend extra on
+        // Linux): a backend float under a verified mlx-lm pin must be
+        // visible in the store row, not implied.
+        #[cfg(target_os = "linux")]
+        let asset_label = format!("pip:mlx-lm=={version}+{}", mlx_install::MLX_CUDA_PIN);
+        #[cfg(not(target_os = "linux"))]
+        let asset_label = format!("pip:mlx-lm=={version}");
+        self.install_with_rollback(
+            &tag,
+            &asset_label,
+            "unverified",
+            EngineKind::Mlx,
+            |dir| async move {
+                std::fs::create_dir_all(&dir)?;
+                mlx_install::install_into(&dir, version)
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await
+    }
+
     /// Resolve and install a mistralrs release: explicit `vX.Y.Z` tag or
     /// latest. Asset choice derives from the live driver CUDA version +
     /// compute cap (never a hardcoded compatibility matrix); a fresh
@@ -1823,6 +1858,8 @@ impl EngineManager {
             // The install lane writes the shim; anything else is a
             // hand-copied dir, and the shim name is the contract.
             EngineKind::Sglang => find_engine_binary(dir, &["sglang-server"]),
+            // Same venv-shim contract as sglang (the lane it mirrors).
+            EngineKind::Mlx => find_engine_binary(dir, &["mlx-server"]),
             EngineKind::SdCpp => find_engine_binary(dir, &["sd-server", "sd-server.exe"]),
             EngineKind::Whisper => {
                 find_engine_binary(dir, &["whisper-server", "whisper-server.exe"])
@@ -1861,6 +1898,12 @@ impl EngineManager {
             }
             EngineKind::Sglang => {
                 tracing::debug!(target: "blazar::engine", "registered sglang {tag} ({asset_label})");
+            }
+            // venv lane like sglang: devices follow the pip backend
+            // (mlx-cuda on Linux/NVIDIA, mlx on Apple Silicon) — an
+            // unusable backend fails at spawn, loudly.
+            EngineKind::Mlx => {
+                tracing::debug!(target: "blazar::engine", "registered mlx {tag} ({asset_label})");
             }
             // sd.cpp CAN enumerate devices (Vulkan0/CUDA0/CPU rows, no
             // MiB numbers), so the llama GPU-count crosscheck does not
@@ -3130,6 +3173,7 @@ pub fn smoke_probe(
             })
         }
         EngineKind::Sglang => venv_metadata_probe(manifest, "sglang"),
+        EngineKind::Mlx => venv_metadata_probe(manifest, "mlx_lm"),
         // mistral.rs and sd-server both answer --version with a
         // banner and exit 0 (verified v0.9.4 / master-890).
         EngineKind::MistralRs | EngineKind::SdCpp => native_version_probe(manifest),

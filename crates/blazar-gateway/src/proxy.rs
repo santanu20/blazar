@@ -1457,6 +1457,11 @@ pub(crate) fn resolve_serving(
                     .is_some_and(blazar_core::ModelRow::has_component_set),
                 std::path::Path::new(model_path).is_dir(),
                 blazar_core::store::quantized_safetensors_signal(&canonical, "", model_path),
+                // MLX marker + dir gate = the same discriminator the
+                // supervisor threads; keeps the router and this
+                // rescue-path verdict on one axis.
+                model_row.as_ref().is_some_and(blazar_core::ModelRow::is_mlx)
+                    && std::path::Path::new(model_path).is_dir(),
                 global,
                 &installed,
             );

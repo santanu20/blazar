@@ -49,7 +49,7 @@ const SGLANG_BOOT_SMOKE_TIMEOUT_SECS: u64 = 600;
 
 /// Free bytes under `path`'s filesystem (`df -B1`). Linux-only lane —
 /// see the OS gate in [`install_into`].
-fn disk_avail_bytes(path: &Path) -> Result<u64> {
+pub(crate) fn disk_avail_bytes(path: &Path) -> Result<u64> {
     let out = std::process::Command::new("df")
         .arg("-B1")
         .arg("--output=avail")
@@ -95,7 +95,7 @@ where
 }
 
 /// (pip/uv progress visibility); stderr carries the real errors.
-async fn run_streaming(
+pub(crate) async fn run_streaming(
     cmd: &mut tokio::process::Command,
     what: &str,
     timeout_secs: u64,
@@ -131,7 +131,7 @@ async fn run_streaming(
 }
 
 /// Is `uv` on PATH? (Fast venv + pip; plain python3 is the fallback.)
-fn uv_available() -> bool {
+pub(crate) fn uv_available() -> bool {
     std::process::Command::new("uv")
         .arg("--version")
         .stdout(std::process::Stdio::null())
@@ -415,7 +415,7 @@ fn ensure_dev_toolkit_layout(root: &Path) {
 }
 
 #[cfg_attr(not(unix), allow(clippy::unnecessary_wraps, unused_variables))] // chmod is unix-only
-fn make_executable(path: &Path) -> Result<()> {
+pub(crate) fn make_executable(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

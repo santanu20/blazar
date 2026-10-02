@@ -1,57 +1,96 @@
-# MLX engine lane — engineering spec (F8, staged)
+# MLX lane (F8) — implemented design
 
-Status: spec only. Implementation is intentionally staged until Mac hardware
-is available for live validation — shipping a macOS-only lane blind from a
-Linux box would violate the project's live-validation rule and risk a dead
-feature. Tracked as the round-4 audit's F8 (docs/research/
-2026-10-02-competitor-pain-points-audit.md section 10).
+Status: **implemented on `feat/next-wave`** (2026-10-02). The original spec
+staged this lane behind Mac hardware; MLX now ships an official CUDA backend,
+so the lane ships for Linux+NVIDIA too and was live-validated on the dev box.
 
-## Why
+## What the lane is
 
-Ollama ships an MLX engine as its Apple-Silicon headline (their release notes
-claim state-of-the-art Mac performance for recent models). Blazar's Mac story
-today is llama.cpp Metal + mistral.rs Metal — solid, but not the MLX ceiling
-for some model classes. Mac users are a large slice of the local-LLM
-audience; an MLX lane is the last major platform lane we do not cover.
+`EngineKind::Mlx` — a pip-venv lane wrapping `mlx_lm.server` (Apple's official
+OpenAI-compatible server), identical in shape to the sglang lane:
 
-## Lane shape (mirrors the sglang venv lane)
+- **Linux + NVIDIA:** `mlx-lm==0.32.0` + `mlx[cuda12]==0.32.2` (dual pin).
+- **Apple Silicon:** `mlx-lm` only (plain `mlx` resolves on Darwin).
+- **CPU-only Linux / other platforms:** install refuses with teaching (the
+  CUDA wheels are the point; CPU-only Linux gains nothing over llamacpp).
 
-- Runtime: `mlx-lm` (Python) exposes an OpenAI-compatible server
-  (`mlx_lm.server`) on a localhost port. The lane spawns it as a supervised
-  child exactly like the sglang lane: venv install, pinned package version,
-  loopback bind, gateway-minted child bearer auth, health + boot-smoke gate.
-- Install/update: PyPI-driven (`pip install mlx-lm==<pin>`), not GitHub
-  release assets. The engine manager grows a pip-package lane kind whose
-  "tag" is the mlx-lm version; doctor currency compares against PyPI
-  (reuse `live_sglang_currency`'s PyPI probe shape).
-- Platform gate: `cfg(target_os = "macos")` in the runtime; on Linux the
-  install path refuses with a teaching error naming the constraint and the
-  lanes that DO run on Linux. No silent absence.
-- Posture: Apple Silicon unified memory means RAM is the VRAM pool. The fit
-  math reuses the CPU/RAM posture path with the Mac memory-pressure signal
-  (and the existing `MemAvailable` hard floor) instead of a discrete-GPU
-  census. `blazar explain` and `/api/capacity` must name the unified-memory
-  arithmetic.
+### Why `mlx[cuda12]` and not the `mlx-cuda` wheel
 
-## Surfaces (integration contract at implementation time)
+The standalone `mlx-cuda` PyPI wheel (0.30.0) was the pre-0.32 distribution.
+Since mlx-lm 0.32, CUDA rides the **standard `mlx` package as extras**
+(`mlx[cuda12]`, `mlx[cuda13]`, `mlx[cpu]`) — that is what mlx-lm's own
+dependency metadata resolves. `cuda12` (not `cuda13`) is pinned for the
+broadest driver base (>= 525) and one tested surface. The dual version pins
+are visible in the store row's asset label:
+`pip:mlx-lm==0.32.0+mlx[cuda12]==0.32.2`.
 
-Runtime lane module + `EngineKind::Mlx` + engine manager install/update/use/
-prune + doctor currency row + posture fit + `/api/ps` device fields
-(`blazar_device`: "mlx") + SETUP honesty row + USAGE engine row + CHANGELOG +
-API surface unchanged (OpenAI-compat passthrough) + tests (unit-pinnable
-parts: platform gate, version compare, posture math) + live validation.
+## Install / update / doctor
 
-## Validation plan (requires Mac hardware)
+- `blazar engine install --kind mlx` — venv (uv when present) + shim
+  `mlx-server` (`python -m mlx_lm.server`) + boot-smoke
+  (`import mlx_lm.server`) inside the same rollback discipline as sglang
+  (install_with_rollback): an unbootable venv never becomes an activatable
+  row. Disk preflight requires 4 GiB free; installs stream pip output.
+- `blazar engine update --kind mlx [version]` + `--all` walk (venv lanes are
+  adjacent in the fixed walk order: llamacpp, mistralrs, sglang, mlx, sdcpp,
+  whisper).
+- `blazar doctor` shows a PyPI currency row for the lane (`mlx-lm pip lane`).
+- `lane_max_n(Mlx) = 8` (plane default — unprobed, never under-promised).
 
-1. Install lane on Apple Silicon; boot-smoke gate passes; child on loopback.
-2. Chat completion 200 with correct `system_fingerprint`; TTFT/TPOT recorded.
-3. Fit governance: a model larger than unified memory produces the teaching
-   refusal with the arithmetic named, never an OOM crash.
-4. Doctor currency row live against PyPI; `engine update --kind mlx` walk.
-5. Restart durability + teardown leak checks per the lifecycle contract.
+## Serving
 
-## Non-goals
+- Spawn: `mlx-server --model <dir> --host 127.0.0.1 --port <p>` + generic
+  `model_overrides.argv` passthrough. Loopback bind is load-bearing
+  isolation (not every mlx-lm build ships `--api-key`); the supervisor's
+  child-auth mint appends the secret when the installed build supports it
+  (flag surface is probed into the manifest at install).
+- Health: poll `GET /v1/models` until 200 — mlx_lm.server has no dedicated
+  `/health` route; the OpenAI surface answers once weights are loaded.
+- Warm peg: same JIT class as sglang (python import chain is torch-class
+  slow; `[warm_peg] mlx` overrides, default on).
+- TCP transport only (like sglang); Linux venv gets the same
+  `LD_LIBRARY_PATH` nvidia-lib surgery so the `libmlxcuda` extension finds
+  the pip-provided CUDA libs.
+- Posture: rides the sglang-proven non-GGUF path (VRAM ledger via probe);
+  no context-length flags exist on mlx_lm.server, so no KV preflight
+  applies.
 
-- No MLX on Linux (framework is Apple-only; the gate says so loudly).
-- No custom kernels or framework forks — we wrap upstream `mlx-lm` releases,
-  same posture as every other lane.
+## Model routing (two-sided, never silent)
+
+- Detection: `ModelRow::is_mlx()` — a strict `mlx` token in the row's
+  name/repo/path **and** the path being a directory (MLX dirs are
+  quantized-safetensors-shaped; the token + dir gate is the discriminator,
+  consulted before `is_quantized_safetensors()`).
+- `route_format(mlx = true)` routes to the Mlx lane **before** the
+  quantized-safetensors arm — an installed sglang must never shadow an MLX
+  dir, and only mlx-lm can decode those quants.
+- Absent lane: `LaneError::MlxUnserved` teaching at serve time —
+  `blazar engine install --kind mlx`; pulls still succeed (files are
+  lane-agnostic) and the search/pull hints name the install command.
+- Pull: mlx-community dirs ride the existing safetensors-dir machinery
+  (sharded safetensors + index.json + config.json, which carries the
+  quantization block that makes the dir MLX).
+
+## Config
+
+No `[mlx]` table exists yet — extra flags ride the generic
+`[model_overrides.<name>] argv` passthrough. The knob-hint block says so
+explicitly rather than advertising an unsettable table. A real table lands
+if/when mlx-lm knobs need first-class pins.
+
+## Honest positioning
+
+Native CUDA lanes (llamacpp) remain faster for models available as
+GGUF/safetensors. The mlx lane's value: the **mlx-only quant ecosystem**
+(mlx-community repos) becomes servable, on both CUDA Linux and Apple
+Silicon, under one gateway (keys, admission, metrics, n-choices plane
+rules).
+
+## Validation plan (executed)
+
+Live no-mock on the dev box (Linux + NVIDIA): real venv install with CUDA
+wheels, shim `--help` probe receipt, pull
+`mlx-community/Qwen2.5-0.5B-Instruct-4bit`, chat 200 through the gateway,
+`blazar bench` vs the same-size GGUF on llamacpp (receipt names both quant
+formats), full workspace suite, hygiene gate, deploy ritual
+(stop → copy → md5 verify → start).

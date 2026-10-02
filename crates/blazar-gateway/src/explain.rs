@@ -113,6 +113,9 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
     let safetensors = std::path::Path::new(&row.path).is_dir();
     let diffusion = row.has_component_set();
     let quantized = blazar_core::store::quantized_safetensors_signal(&resolved, "", &row.path);
+    // MLX dirs are safetensors-shaped; the token marker plus the dir
+    // gate is the discriminator the router uses.
+    let mlx = row.is_mlx() && safetensors;
 
     // Lane + kind via the same decision the CLI/router make. The reason
     // string is derived from the INPUTS (facts), not from inside
@@ -145,6 +148,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
             diffusion,
             safetensors,
             quantized,
+            mlx,
             g_kind,
             &installed,
         );
