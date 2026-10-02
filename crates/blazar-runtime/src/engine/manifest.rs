@@ -123,6 +123,12 @@ pub struct LaneProvenance {
     /// `llama-arch.cpp` (`LLM_ARCH_NAMES`). A CANDIDATE filter, not a
     /// guarantee: the runtime load verifies.
     pub architectures: BTreeSet<String>,
+    /// Newest upstream llama.cpp release build number known at fork-build
+    /// time. A mainstream lane can only graduate (supersede) this fork
+    /// when its own build is NEWER than this floor — a lane at or below
+    /// it predates the pin and cannot contain the fork's changes.
+    /// `None` = unknown (offline build): legacy supersede behavior.
+    pub floor_release: Option<u64>,
 }
 
 /// Everything Blazar knows about one installed engine build.
@@ -161,6 +167,12 @@ pub struct Manifest {
     /// provenance only).
     #[serde(default)]
     pub base_ref: Option<String>,
+    /// Newest upstream llama.cpp release build number at fork-build
+    /// time (v2.2): mainstream lanes with `build_number <= floor` can
+    /// never supersede this fork — they predate its commit pin. `None`
+    /// = unstamped/legacy lane: arch coverage alone decides.
+    #[serde(default)]
+    pub floor_release: Option<u64>,
     /// Architecture names this build advertises (v2) — mined from the
     /// source tree at build time. Empty = unknown/unverified: such a
     /// lane is never picked by architecture-based re-routing.
@@ -265,6 +277,7 @@ impl Manifest {
         self.ref_pin.clone_from(&prov.ref_pin);
         self.base_ref.clone_from(&prov.base_ref);
         self.architectures.clone_from(&prov.architectures);
+        self.floor_release = prov.floor_release;
     }
 
     /// Short provenance label for tables and teaching strings, e.g.
@@ -454,6 +467,7 @@ pub fn probe(server_path: &Path, tag: &str) -> Result<Manifest> {
         trust: TrustTier::default(),
         superseded_by: None,
         superseded_at_epoch: None,
+        floor_release: None,
     })
 }
 
@@ -1491,12 +1505,14 @@ options:
             ref_pin: Some("7c81a9f0123456789abcdef0123456789abcdef01".into()),
             base_ref: Some("b10980".into()),
             architectures: BTreeSet::from(["qwen35".into(), "llama".into()]),
+            floor_release: Some(11_349),
         });
         let json = serde_json::to_string(&m).unwrap();
         let back: Manifest = serde_json::from_str(&json).unwrap();
         assert_eq!(back, m);
         assert!(back.advertises_arch("qwen35"));
         assert!(!back.advertises_arch("qwen3"));
+        assert_eq!(back.floor_release, Some(11_349));
         assert_eq!(
             back.provenance_label(),
             "fork acme/llama.cpp@7c81a9f0 (base b10980)"

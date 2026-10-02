@@ -871,6 +871,7 @@ async fn integration__register_engine_provenanced_bakes_source_and_architectures
             "qwen35".to_string(),
             "qwen35_moe".to_string(),
         ]),
+        floor_release: None,
     };
     let tag = "fork-acme_llama.cpp-7c81a9f0-cpu";
     let (dir, _guard) = stub_engine_dir("prov");
@@ -928,6 +929,7 @@ async fn integration__fork_lane_registration_never_dethrones_active_engine() {
         ref_pin: Some("7c81a9f0".repeat(5)),
         base_ref: None,
         architectures: BTreeSet::from(["spark9".to_string()]),
+        floor_release: None,
     };
     let tag = "fork-acme_llama.cpp-7c81a9f0-cpu";
     let (dir, _guard) = stub_engine_dir("additive");

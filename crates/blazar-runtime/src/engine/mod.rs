@@ -2362,6 +2362,15 @@ impl EngineManager {
     /// coverage keeps the fork active — partial mainstream support is
     /// exactly the self-correcting case (unknown-arch rescue re-pins
     /// the fork for the archs mainline still rejects).
+    /// Supersede recency rule: a mainstream lane may graduate (supersede)
+    /// a fork only when its build number EXCEEDS the fork's stamped
+    /// floor — the newest upstream release that existed when the fork
+    /// was built. `None` floor (offline build, legacy row) keeps the
+    /// plain arch-coverage behavior.
+    fn supersede_recency_allows(graduator_build: u64, floor: Option<u64>) -> bool {
+        floor.is_none_or(|f| graduator_build > f)
+    }
+
     fn mark_superseded_lanes(store: &Store) -> Result<()> {
         let rows = store.list_engines()?; // newest first
         let mut decoded: Vec<(EngineRow, Manifest)> = rows
@@ -2376,16 +2385,35 @@ impl EngineManager {
         // installed_at DESC): upstream + local llamacpp lanes that
         // advertise architectures. Owned (tag, arch set) pairs so the
         // fork rows below can be mutated while mainstream stays alive.
-        let mainstream: Vec<(String, std::collections::BTreeSet<String>)> = decoded
+        let mainstream: Vec<(String, std::collections::BTreeSet<String>, u64)> = decoded
             .iter()
             .filter(|(row, manifest)| {
                 row.kind == EngineKind::LlamaCpp
                     && manifest.source != manifest::EngineSource::Fork
                     && !manifest.architectures.is_empty()
             })
-            .map(|(row, manifest)| (row.tag.clone(), manifest.architectures.clone()))
+            .map(|(row, manifest)| {
+                (
+                    row.tag.clone(),
+                    manifest.architectures.clone(),
+                    manifest.build_number,
+                )
+            })
             .collect();
-        let covers = |arch: &str| mainstream.iter().any(|(_, archs)| archs.contains(arch));
+        // Supersede floor: a mainstream lane graduates a fork only when
+        // it is NEWER than the newest upstream release that existed at
+        // fork-build time. Endpoint-only forks register no new
+        // architectures (identical 153-entry sets), so arch coverage
+        // alone would let an OLDER mainstream instantly retire a lane
+        // built from a strictly newer commit — the a4cb4c6-vs-b11349
+        // false supersede. Unstamped floors (offline builds, legacy
+        // rows) keep the plain arch-coverage rule.
+        let recency_allows = Self::supersede_recency_allows;
+        let covers = |arch: &str, floor: Option<u64>| {
+            mainstream
+                .iter()
+                .any(|(_, archs, build)| archs.contains(arch) && recency_allows(*build, floor))
+        };
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs().cast_signed());
@@ -2393,15 +2421,17 @@ impl EngineManager {
             if !is_fork_lane(row) || manifest.architectures.is_empty() {
                 continue;
             }
-            if !manifest.architectures.iter().all(|arch| covers(arch)) {
+            let floor = manifest.floor_release;
+            if !manifest.architectures.iter().all(|arch| covers(arch, floor)) {
                 continue;
             }
             // Graduation target: the newest mainstream lane covering
             // any of the fork's archs (mainstream is newest-first).
             let Some(newest_coverer) = mainstream
                 .iter()
-                .find(|(_, archs)| manifest.architectures.iter().any(|a| archs.contains(a)))
-                .map(|(tag, _)| tag.clone())
+                .filter(|(_, _, build)| recency_allows(*build, floor))
+                .find(|(_, archs, _)| manifest.architectures.iter().any(|a| archs.contains(a)))
+                .map(|(tag, _, _)| tag.clone())
             else {
                 continue;
             };
@@ -4017,5 +4047,25 @@ mod debris_tests {
             dir_recent(&tmp.path().join("nope"), hour),
             "missing dir reads as recent (protected)"
         );
+    }
+}
+
+
+#[cfg(test)]
+mod supersede_floor_tests {
+    use super::EngineManager;
+
+    #[test]
+    #[allow(non_snakeCase)]
+    fn unit__supersede_recency__older_mainstream_cannot_graduate_a_newer_fork() {
+        let allows = EngineManager::supersede_recency_allows;
+        // The a4cb4c6 false-supersede shape: fork pinned when the newest
+        // release was b11349 — that same release (and anything older)
+        // must not graduate it; the first release PAST the floor may.
+        assert!(!allows(11_349, Some(11_349)));
+        assert!(!allows(11_344, Some(11_349)));
+        assert!(allows(11_350, Some(11_349)));
+        // Unstamped floor (offline build / legacy row): legacy rule.
+        assert!(allows(1, None));
     }
 }

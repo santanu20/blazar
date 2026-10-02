@@ -20,6 +20,7 @@ use blazar_core::engine_kind::EngineKind;
 use blazar_core::store::EngineRow;
 use blazar_core::BlazarDirs;
 
+use super::gh;
 use super::gh::LLAMA_CPP_REPO;
 use super::manifest::{EngineSource, LaneProvenance};
 use super::{
@@ -643,6 +644,7 @@ fn lane_identity(
                 ref_pin: full_sha.map(str::to_string),
                 base_ref: None,
                 architectures,
+                floor_release: None,
             },
         ),
         BuildSource::Fork {
@@ -659,6 +661,7 @@ fn lane_identity(
                     .or_else(|| Some(ref_sha.clone())),
                 base_ref: base_ref.clone(),
                 architectures,
+                floor_release: None,
             },
         ),
     }
@@ -768,13 +771,27 @@ impl EngineManager {
             // capability currency the supervisor's unknown-arch re-route
             // consumes — and pin the lane's identity from it.
             let architectures = super::arch_miner::mine_architectures(&src);
-            let (engine_tag, provenance) = lane_identity(
+            let (engine_tag, mut provenance) = lane_identity(
                 &opts.source,
                 &tag,
                 full_sha.as_deref(),
                 architectures,
                 opts.backend,
             );
+            // Stamp the supersede floor for forks: the newest upstream
+            // release known RIGHT NOW predates the pin, so no mainstream
+            // lane at or below it may later graduate this fork. Best
+            // effort — an offline build leaves it unstamped and the
+            // legacy arch-coverage rule applies.
+            if provenance.source == EngineSource::Fork {
+                provenance.floor_release =
+                    self.gh.list_releases().await.ok().and_then(|releases| {
+                        releases
+                            .iter()
+                            .filter_map(|r| gh::btag_number(&r.tag_name))
+                            .max()
+                    });
+            }
             (on_line)(&format!(
                 "lane {engine_tag}: source advertises {} architectures",
                 provenance.architectures.len()
