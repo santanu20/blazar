@@ -1701,11 +1701,11 @@ mod tests {
             vec!["r1", "r2"],
             "conversation listing is chronological"
         );
-        assert!(s.list_conversation("missing").unwrap().is_empty());
+        assert!(s.list_conversation("missing").unwrap().is_empty(), "missing conversation lists nothing");
 
         let deleted = s.delete_conversation("conv-a").unwrap();
         assert_eq!(deleted, 2);
-        assert!(s.list_conversation("conv-a").unwrap().is_empty());
+        assert!(s.list_conversation("conv-a").unwrap().is_empty(), "deleted conversation lists nothing");
         // Other conversations untouched.
         assert_eq!(s.list_conversation("conv-b").unwrap().len(), 1);
     }
