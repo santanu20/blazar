@@ -1822,6 +1822,136 @@ async fn e2e__capacity__shape_contract() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn e2e__warm__loads_model_and_route_agrees() {
+    let ts = start(Config::default()).await;
+    let c = client();
+
+    // Warm the seeded model: the admission path spawns the stub child,
+    // then the response reports the live resident state.
+    let resp = c
+        .post(format!("{}/api/warm", ts.base))
+        .json(&serde_json::json!({ "model": "m1", "wait": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "warm must load m1");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["object"], "blazar.warm", "shape: {v}");
+    assert_eq!(v["model"], "m1");
+    assert!(v["lane"].as_str().is_some(), "lane named: {v}");
+    assert!(
+        v["resident"]["state"].as_str().is_some(),
+        "resident row after ensure: {v}"
+    );
+    assert!(
+        v["note"].as_str().is_some_and(|n| n.contains("idle TTL")),
+        "residency honesty note: {v}"
+    );
+
+    // The scheduling explainer must now agree the model is local and
+    // resident — the decision a chat request would take.
+    let resp = c
+        .get(format!("{}/api/route/m1", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let r: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(r["object"], "blazar.route", "shape: {r}");
+    assert_eq!(r["decision"]["target"], "local", "local model: {r}");
+    assert!(
+        r["local"]["resident"]["state"].as_str().is_some(),
+        "resident after warm: {r}"
+    );
+    assert!(r["peers"].as_array().is_some_and(|p| p.is_empty()));
+
+    // Unknown model: a 200 decision of "none" with the teaching reason —
+    // absence is a valid answer from an explainer, never a fake target.
+    let resp = c
+        .get(format!("{}/api/route/nope", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let r: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(r["decision"]["target"], "none", "unknown everywhere: {r}");
+    assert!(
+        r["decision"]["reason"]
+            .as_str()
+            .is_some_and(|s| s.contains("no peer lists it")),
+        "teaching reason: {r}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__replicate__teaches_without_remotes_and_bad_bodies() {
+    let ts = start(Config::default()).await;
+    let c = client();
+
+    let resp = c
+        .post(format!("{}/api/replicate", ts.base))
+        .json(&serde_json::json!({ "model": "m1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "no remotes configured");
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("no remotes configured"),
+        "teaching 400: {text}"
+    );
+
+    let resp = c
+        .post(format!("{}/api/replicate", ts.base))
+        .json(&serde_json::json!({ "peers": ["a"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "missing model is a 400");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__warm__notify_mode_keeps_pull_contract() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/api/warm", ts.base))
+        .json(&serde_json::json!({ "model": "m1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "notify mode answers immediately");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["status"], "ok", "pull-notify contract: {v}");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__warm__unknown_model_teaches_404() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/api/warm", ts.base))
+        .json(&serde_json::json!({ "model": "definitely-not-here", "wait": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("unknown model") || text.contains("not found"),
+        "teaching 404: {text}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn e2e__explain__card_provenance_and_unknown_404() {
     let ts = start(Config::default()).await;
     let c = client();

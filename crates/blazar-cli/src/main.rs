@@ -450,6 +450,35 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Load a model now so the next request is warm (synchronous —
+    /// reports the resident child state when the load completes)
+    Warm {
+        /// Model name as the store knows it (`blazar ls`)
+        model: String,
+    },
+    /// Warm a model on peer gateways (remote replication): fan a warm
+    /// out to the named peers — or every configured remote — and report
+    /// each peer's outcome
+    Replicate {
+        /// Model name as the store knows it (`blazar ls`)
+        model: String,
+        /// Comma-separated peer names (default: every configured remote)
+        #[arg(long, value_delimiter = ',')]
+        peers: Option<Vec<String>>,
+        /// Per-peer timeout in seconds (default 300, max 900)
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+    },
+    /// Show where a request for this model would be served — local
+    /// residency vs per-peer tier, wait estimate and free VRAM — and
+    /// the decision the gateway would take
+    Route {
+        /// Model name (any form the gateway resolves)
+        model: String,
+        /// Print the raw decision JSON instead of the card
+        #[arg(long)]
+        json: bool,
+    },
     /// Ask why a request misbehaved: sentinel detections for a trace id
     /// (or the most recent observations) with fix hints
     Why {
@@ -793,8 +822,20 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
     (
         "Model Management",
         &[
-            "pull", "import", "cp", "create", "rm", "list", "show", "quantize", "mmproj", "search",
-            "fit", "lora",
+            "pull",
+            "import",
+            "cp",
+            "create",
+            "rm",
+            "list",
+            "show",
+            "quantize",
+            "mmproj",
+            "search",
+            "fit",
+            "lora",
+            "warm",
+            "replicate",
         ],
     ),
     (
@@ -818,7 +859,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Observability",
-        &["why", "explain", "model-doctor", "watch"],
+        &["why", "explain", "model-doctor", "route", "watch"],
     ),
     (
         "Refused by design (local-only)",
@@ -1675,6 +1716,13 @@ async fn run(cmd: Cmd) -> Result<()> {
         Cmd::Session { cmd } => session_cmd(cmd).await,
         Cmd::Doctor { flat, json } => doctor(flat, json).await,
         Cmd::ModelDoctor { model, json } => model_doctor_cmd(&model, json).await,
+        Cmd::Warm { model } => warm_cmd(&model).await,
+        Cmd::Replicate {
+            model,
+            peers,
+            timeout_secs,
+        } => replicate_cmd(&model, peers.as_deref(), timeout_secs).await,
+        Cmd::Route { model, json } => route_cmd(&model, json).await,
         Cmd::Why {
             trace,
             watch: live,
@@ -6723,6 +6771,190 @@ async fn explain(model: &str, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&v)?);
     } else {
         print!("{}", render_explain_card(&v));
+    }
+    Ok(())
+}
+
+/// `blazar warm <model>`: synchronous warm through the gateway's
+/// admission path; prints the resident child state once loaded.
+async fn warm_cmd(model: &str) -> Result<()> {
+    let base = ensure_daemon().await?;
+    let resp = cli_http()
+        .post(format!("{base}/api/warm"))
+        .timeout(std::time::Duration::from_secs(600))
+        .json(&serde_json::json!({ "model": model, "wait": true }))
+        .send()
+        .await?;
+    let text = resp.text().await?;
+    let v: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("daemon: {text}"))?;
+    let r = &v["resident"];
+    println!(
+        "model     {}\nlane      {}\nengine    {}\nstate     {}\nctx       {}\nslots     {}\nload      {} ms",
+        v["model"].as_str().unwrap_or("unknown"),
+        v["lane"].as_str().unwrap_or("unknown"),
+        v["engine"].as_str().unwrap_or("unknown"),
+        r["state"].as_str().unwrap_or("unknown"),
+        r["ctx"].as_u64().map(|c| c.to_string()).unwrap_or_else(|| "unknown".into()),
+        match r["slots"].as_u64() {
+            Some(s) => s.to_string(),
+            None => r["slots_configured"].as_u64().map(|s| s.to_string()).unwrap_or_else(|| "unknown".into()),
+        },
+        v["load_ms"].as_u64().unwrap_or(0),
+    );
+    if let Some(note) = v["note"].as_str() {
+        println!("note      {note}");
+    }
+    Ok(())
+}
+
+/// `blazar replicate <model> --peers a,b`: fan a warm out to peers and
+/// report every outcome verbatim.
+async fn replicate_cmd(
+    model: &str,
+    peers: Option<&[String]>,
+    timeout_secs: Option<u64>,
+) -> Result<()> {
+    let base = ensure_daemon().await?;
+    let mut body = serde_json::json!({ "model": model, "wait": true });
+    if let Some(names) = peers {
+        body["peers"] = serde_json::json!(names);
+    }
+    if let Some(secs) = timeout_secs {
+        body["timeout_secs"] = serde_json::json!(secs);
+    }
+    let per_peer = timeout_secs.unwrap_or(300);
+    let resp = cli_http()
+        .post(format!("{base}/api/replicate"))
+        .timeout(std::time::Duration::from_secs(per_peer + 30))
+        .json(&body)
+        .send()
+        .await?;
+    let ok = resp.status().is_success();
+    let text = resp.text().await?;
+    if !ok {
+        anyhow::bail!("daemon: {text}");
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("daemon: {text}"))?;
+    println!(
+        "replicated {} of {} peer(s) for {}",
+        v["warmed"].as_u64().unwrap_or(0),
+        v["of"].as_u64().unwrap_or(0),
+        v["model"].as_str().unwrap_or(model),
+    );
+    let rows: Vec<Vec<String>> = v["results"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|r| {
+                    let detail = if r["ok"].as_bool().unwrap_or(false) {
+                        format!(
+                            "{} ({} ms)",
+                            r["state"].as_str().unwrap_or("warm"),
+                            r["load_ms"].as_u64().unwrap_or(0)
+                        )
+                    } else if let Some(note) = r["note"].as_str() {
+                        note.to_string()
+                    } else {
+                        r["error"].as_str().unwrap_or("unknown failure").to_string()
+                    };
+                    vec![
+                        r["peer"].as_str().unwrap_or("?").to_string(),
+                        r["url"].as_str().unwrap_or("?").to_string(),
+                        if r["ok"].as_bool().unwrap_or(false) {
+                            "ok"
+                        } else {
+                            "FAIL"
+                        }
+                        .to_string(),
+                        detail,
+                    ]
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !rows.is_empty() {
+        println!();
+        render_table(&["PEER", "URL", "RESULT", "DETAIL"], &rows, &[2]);
+    }
+    Ok(())
+}
+
+/// `blazar route <model>`: the scheduling decision the gateway would
+/// take for this model, with the signals behind it.
+async fn route_cmd(model: &str, json: bool) -> Result<()> {
+    let base = ensure_daemon().await?;
+    let resp = cli_http()
+        .get(format!("{base}/api/route/{}", encode_path_segment(model)))
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await?;
+    let ok = resp.status().is_success();
+    let text = resp.text().await?;
+    if !ok {
+        anyhow::bail!("daemon: {text}");
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("daemon: {text}"))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    println!("model     {}", v["model"].as_str().unwrap_or("unknown"));
+    println!(
+        "decision  {}",
+        v["decision"]["target"].as_str().unwrap_or("unknown")
+    );
+    println!(
+        "reason    {}",
+        v["decision"]["reason"].as_str().unwrap_or("unknown")
+    );
+    let resident = &v["local"]["resident"];
+    if resident.is_object() {
+        println!(
+            "local     resident, state {} ({} slots, in_flight {})",
+            resident["state"].as_str().unwrap_or("unknown"),
+            resident["slots"].as_u64().unwrap_or(0),
+            resident["in_flight"].as_u64().unwrap_or(0),
+        );
+    } else {
+        println!("local     not resident");
+    }
+    let rows: Vec<Vec<String>> = v["peers"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|p| {
+                    vec![
+                        p["name"].as_str().unwrap_or("?").to_string(),
+                        p["tier"].as_str().unwrap_or("?").to_string(),
+                        format!("{} ms", p["est_wait_ms"].as_u64().unwrap_or(0)),
+                        humansize(p["free_vram_bytes"].as_i64().unwrap_or(0)),
+                        if p["serves_model"].as_bool().unwrap_or(false) {
+                            "yes"
+                        } else {
+                            "no"
+                        }
+                        .to_string(),
+                        if p["marked_down"].as_bool().unwrap_or(false) {
+                            "down"
+                        } else {
+                            "-"
+                        }
+                        .to_string(),
+                    ]
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !rows.is_empty() {
+        println!();
+        render_table(
+            &["PEER", "TIER", "EST WAIT", "FREE VRAM", "SERVES", "BREAKER"],
+            &rows,
+            &[2, 3],
+        );
     }
     Ok(())
 }

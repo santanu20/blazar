@@ -9,6 +9,7 @@ pub mod cache_bust;
 pub mod capacity;
 pub mod cascade;
 pub mod explain;
+pub mod federation;
 pub mod histogram;
 pub mod http_pool;
 pub mod images;
@@ -370,6 +371,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Per-GPU capacity: device census + per-resident VRAM
         // attribution joined from the supervisor's live rows.
         .route("/api/capacity", get(capacity::capacity))
+        .route("/api/replicate", post(federation::replicate))
+        .route("/api/route/{model}", get(federation::route))
         .route("/api/explain/{model}", get(explain::explain))
         // Per-model capability certificate: bounded probes through the
         // real gateway path, stored as a doctor job + model_caps row.
@@ -382,7 +385,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/rerank", post(ollama::rerank))
         .route("/api/generate", post(ollama::generate))
         .route("/api/evict", post(ollama::evict))
-        .route("/api/warm", post(ollama::warm))
+        .route("/api/warm", post(federation::warm))
         .route(
             "/api/session",
             post(ollama::session).get(ollama::session_list),
@@ -868,6 +871,7 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
                         "/v1/requests/{id}/cancel", "/v1/requests/{id}/interrupt",
                         "/audio/transcriptions", "/audio/translations"],
             "ollama": ["/api/chat", "/api/generate", "/api/tags", "/api/ps", "/api/capacity", "/api/explain/{model}", "/api/show",
+                       "/api/replicate", "/api/route/{model}",
                        "/api/model-doctor", "/api/model-doctor/{model}",
                        "/api/embeddings", "/api/embed", "/api/rerank", "/api/pull",
                        "/api/delete", "/api/events", "/api/version"],

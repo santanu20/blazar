@@ -40,7 +40,7 @@ pub struct RemoteHealth {
     pub ttft_ewma_ms: Option<f64>,
 }
 
-fn health_key(remote: &Remote) -> String {
+pub(crate) fn health_key(remote: &Remote) -> String {
     format!("{}|{}", remote.name, remote.url)
 }
 
@@ -601,9 +601,9 @@ const REMOTE_TIER_COLD: u8 = 2;
 /// hand-written comparator to get wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PeerScore {
-    tier: u8,
-    est_wait_ms: u64,
-    free_vram: std::cmp::Reverse<u64>,
+    pub(crate) tier: u8,
+    pub(crate) est_wait_ms: u64,
+    pub(crate) free_vram: std::cmp::Reverse<u64>,
 }
 
 /// Score one peer for serving `model`. Pure over its signal snapshots
@@ -886,7 +886,7 @@ pub enum FallbackLane<'a> {
 /// Rank already-filtered peers by capacity score. Health and capacity
 /// snapshots are cloned before any comparison (R4: no lock held during
 /// scoring); the stable sort preserves config order as tiebreak.
-fn rank_peers_by_capacity<'a>(
+pub(crate) fn rank_peers_by_capacity<'a>(
     state: &'a AppState,
     model: &str,
     peers: &[&'a Remote],
@@ -1414,12 +1414,21 @@ mod tests {
         };
         note_remote_latency(&map, &r, 1000.0);
         assert_eq!(
-            map.lock().unwrap().get(&health_key(&r)).unwrap().ttft_ewma_ms,
+            map.lock()
+                .unwrap()
+                .get(&health_key(&r))
+                .unwrap()
+                .ttft_ewma_ms,
             Some(1000.0),
             "first observation seeds the EWMA"
         );
         note_remote_latency(&map, &r, 500.0);
-        let e = map.lock().unwrap().get(&health_key(&r)).unwrap().ttft_ewma_ms;
+        let e = map
+            .lock()
+            .unwrap()
+            .get(&health_key(&r))
+            .unwrap()
+            .ttft_ewma_ms;
         assert!((e.unwrap() - (0.7 * 1000.0 + 0.3 * 500.0)).abs() < 1e-9);
     }
 
@@ -1435,7 +1444,12 @@ mod tests {
         }
     }
 
-    fn resident_row(model: &str, slots: Option<u32>, configured: Option<u32>, in_flight: i64) -> PeerResident {
+    fn resident_row(
+        model: &str,
+        slots: Option<u32>,
+        configured: Option<u32>,
+        in_flight: i64,
+    ) -> PeerResident {
         PeerResident {
             model: model.into(),
             engine: "llamacpp".into(),
@@ -1452,10 +1466,7 @@ mod tests {
         // A warm peer buried in queue work still outranks an idle cold
         // peer and an unknown-capacity peer: the cold peer's real cost
         // is a model load nobody measured from here.
-        let warm_busy = cap_with(
-            vec![resident_row("m", Some(4), Some(4), 64)],
-            1_000_000_000,
-        );
+        let warm_busy = cap_with(vec![resident_row("m", Some(4), Some(4), 64)], 1_000_000_000);
         let cold_idle = cap_with(vec![], 20_000_000_000);
         let s_warm = score_peer("m", &idle, Some(&warm_busy));
         let s_cold = score_peer("m", &idle, Some(&cold_idle));

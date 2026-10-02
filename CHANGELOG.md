@@ -5,6 +5,10 @@ Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
 ## [Unreleased]
+### Added
+- `POST /api/warm` gained `"wait": true` — synchronous warm through admission with a resident-state report (default stays the detached pull-notify contract). CLI: `blazar warm <model>`.
+- `POST /api/replicate` + `blazar replicate <model> [--peers a,b] [--timeout-secs N]` — remote replication: concurrent warm fan-out to peers with verbatim per-peer outcomes; Blazar peers only (non-Blazar peers are named as such).
+- `GET /api/route/{model}` + `blazar route <model>` — cross-node scheduling explainer: local residency, per-peer tier / wait estimate / free VRAM / breaker state, and the decision the gateway would take.
 
 Theme: **capacity-aware federation** — peers selected by measurement, not
 guesswork.
