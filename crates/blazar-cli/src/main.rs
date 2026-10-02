@@ -4468,13 +4468,13 @@ async fn live_sdcpp_currency(active: &str) -> Check {
 }
 
 /// Per-lane engine currency for NON-active installed lanes. The active
-/// lane's row comes from the reconcile/live path in doctor_engine; every
+/// lane's row comes from the reconcile/live path in `doctor_engine`; every
 /// other installed lane gets the same live warn-only upstream probe, so
 /// a stale lane cannot hide behind an all-green doctor (observed live:
-/// sglang 0.5.20 installed, 0.5.21 on PyPI, no row said a word). One
+/// sglang 0.5.20 installed, 0.5.21 on `PyPI`, no row said a word). One
 /// row per KIND, judged on the kind's newest install — retained
 /// rollback rows must not nag. Whisper is covered by
-/// doctor_whisper_currency regardless of which lane is active.
+/// `doctor_whisper_currency` regardless of which lane is active.
 async fn doctor_lane_currency(d: &BlazarDirs, active_kind: Option<EngineKind>) -> Vec<Check> {
     let mut out = Vec::new();
     let Ok(store) = Store::open(d) else {
@@ -6795,10 +6795,10 @@ async fn warm_cmd(model: &str) -> Result<()> {
         v["lane"].as_str().unwrap_or("unknown"),
         v["engine"].as_str().unwrap_or("unknown"),
         r["state"].as_str().unwrap_or("unknown"),
-        r["ctx"].as_u64().map(|c| c.to_string()).unwrap_or_else(|| "unknown".into()),
+        r["ctx"].as_u64().map_or_else(|| "unknown".into(), |c| c.to_string()),
         match r["slots"].as_u64() {
             Some(s) => s.to_string(),
-            None => r["slots_configured"].as_u64().map(|s| s.to_string()).unwrap_or_else(|| "unknown".into()),
+            None => r["slots_configured"].as_u64().map_or_else(|| "unknown".into(), |s| s.to_string()),
         },
         v["load_ms"].as_u64().unwrap_or(0),
     );
@@ -11722,6 +11722,12 @@ async fn engine_update_all(d: &BlazarDirs, no_gate: bool, check: bool) -> Result
     Ok(())
 }
 
+/// `blazar engine update [tag]` — update the active lane, or every
+/// installed lane with `--all` (fixed walk order, failures named in the
+/// summary while the walk continues).
+// One dispatcher per lane kind plus the --all walk; each arm is a flat
+// call into its lane's update fn and shares the same summary/report shape.
+#[allow(clippy::too_many_lines)]
 async fn engine_update(
     d: &BlazarDirs,
     tag: Option<String>,

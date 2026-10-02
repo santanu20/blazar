@@ -1863,7 +1863,7 @@ async fn e2e__warm__loads_model_and_route_agrees() {
         r["local"]["resident"]["state"].as_str().is_some(),
         "resident after warm: {r}"
     );
-    assert!(r["peers"].as_array().is_some_and(|p| p.is_empty()));
+    assert!(r["peers"].as_array().is_some_and(std::vec::Vec::is_empty));
 
     // Unknown model: a 200 decision of "none" with the teaching reason —
     // absence is a valid answer from an explainer, never a fake target.

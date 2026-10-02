@@ -158,7 +158,7 @@ pub async fn warm(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     // tag-form alias (`qwen3-1.7b:bf16`) must resolve like chat does.
     let resolved = state
         .with_store(|s| resolve_model(s, model))
-        .and_then(|r| r.ok());
+        .and_then(std::result::Result::ok);
     let Some(row) = resolved else {
         return api_error(
             StatusCode::NOT_FOUND.as_u16(),
@@ -334,6 +334,9 @@ pub async fn replicate(State(state): State<Arc<AppState>>, body: Bytes) -> Respo
 /// request for this model would take, with every signal behind it.
 /// Read-only; forces a presence refresh only when the model is not
 /// local (the fallback path would pay that probe anyway).
+// One linear decision tree (local → peers → none) with inline JSON
+// assembly per branch; splitting it would hide the decision order it exists to show.
+#[allow(clippy::too_many_lines)]
 pub async fn route(State(state): State<Arc<AppState>>, Path(model): Path<String>) -> Response {
     let model = model.trim().to_string();
     if model.is_empty() {
@@ -341,7 +344,7 @@ pub async fn route(State(state): State<Arc<AppState>>, Path(model): Path<String>
     }
     let local_row = state
         .with_store(|s| resolve_model(s, &model))
-        .and_then(|r| r.ok());
+        .and_then(std::result::Result::ok);
     // Snapshot the cached peer signals once (R4: clones before any
     // comparison, no lock held during scoring).
     let healths = state
@@ -451,6 +454,8 @@ pub async fn route(State(state): State<Arc<AppState>>, Path(model): Path<String>
 
 #[cfg(test)]
 mod tests {
+    #![allow(non_snake_case)]
+
     use super::*;
 
     fn remote(name: &str) -> Remote {
@@ -474,9 +479,9 @@ mod tests {
     fn unit__clamp_timeout__default_and_bounds() {
         assert_eq!(clamp_timeout(None), Duration::from_secs(300));
         assert_eq!(clamp_timeout(Some(1)), Duration::from_secs(1));
-        assert_eq!(clamp_timeout(Some(900)), Duration::from_secs(900));
+        assert_eq!(clamp_timeout(Some(900)), Duration::from_mins(15));
         assert_eq!(clamp_timeout(Some(0)), Duration::from_secs(1));
-        assert_eq!(clamp_timeout(Some(9_999)), Duration::from_secs(900));
+        assert_eq!(clamp_timeout(Some(9_999)), Duration::from_mins(15));
     }
 
     #[test]
