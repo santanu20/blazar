@@ -264,6 +264,13 @@ Round-4 net: two new actionable items — **F7** (`n` choices) and **F8** (MLX
 roadmap row). Everything else verified fixed, better, or immune by
 architecture.
 
+Round-4 close-out (same day): **F7 DONE** — strict `n` validation (1..=8,
+fail-fast before admission), passthrough, non-stream count-verify with
+teaching 502, per-key charge ×n on llamacpp lanes (live-probed accounting
+quirk); e2e + unit pinned; live receipts on the production daemon.
+**F8 delivered as spec** — docs/research/mlx-lane-spec.md (implementation
+staged until Mac hardware is available for live validation).
+
 ## 11. Sources (selection)
 
 - GitHub Search API top-reacted open issues: ollama/ollama,

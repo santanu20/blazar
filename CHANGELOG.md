@@ -33,6 +33,9 @@ guesswork.
   no snapshot).
 
 ## [0.15.0] - 2026-10-02
+- feat(gateway): OpenAI `n` choices — strict 1..=8 validation (400 before admission), passthrough, non-stream count-verify (teaching 502 when a lane ignores `n`), per-key token charge multiplied by `n` on llamacpp lanes
+- fix(cli+runtime): `engine update --check` verdict uses the CUDA asset walk-back target (channel release without a driver-runnable ubuntu-cuda asset no longer prints a phantom 'update available')
+- fix(runtime+core): orphan scan shard-sibling reconstruction missed the `-` separator (every sharded GGUF shard 2+ read as orphan — prune bait); fresh-DB `last_used_at` backfill now applies in upsert (was migration-only); disk-verdict and unused-rows test constants corrected
 
 Theme: **the reliability layer** — local AI that behaves like infrastructure.
 Jobs, requests, responses, and capability certificates survive restarts;
