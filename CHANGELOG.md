@@ -4,25 +4,21 @@ All notable changes to Blazar are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
+## [0.18.0] - 2026-10-02
+
+### Added
+- **Disk intelligence** — `blazar fit` shows required vs available disk (model + 64 MiB slack) with FIT/TIGHT/NO verdict; pulls refuse to start without enough disk (teaching error points at `blazar storage` / `blazar prune`); `blazar storage` reports models/engines/sessions/caches + reclaim candidates (orphan files, stale partials, hardlink twins, unused >30d); `blazar prune --orphans/--unused` reclaims (dry-run by default, `--yes` executes); model usage tracking (schema v9 `last_used_at`, stamped on cold spawn, backfilled from `pulled_at`).
+- **`blazar connect`** — one-command client integration for Codex, Claude Code, Continue, Cline, Open WebUI: detects install, prints the plan (default), `--write` applies with backup + automatic rollback when the test request fails.
+- **Responses depth** — `background: true` mode (requires `store: true`, non-stream) returns 202 and runs durably as a job (poll `GET /v1/responses/{id}`); named `conversation` threads group responses (inherited through `previous_response_id`) with `GET`/`DELETE /v1/conversations/{id}`; cloud-builtin tool types (`web_search`, `file_search`, `computer_use`, `code_interpreter`, `image_generation`, `mcp`, `tool_search`...) get a teaching 400 explaining the local-gateway contract (schema v10: `conversation`, `body_json`, conversation index).
+
 ## [0.17.0] - 2026-10-02
 
 Theme: **federation completion** — the control plane gets verbs: warm,
 replicate, route.
 
 ### Added
-<<<<<<< HEAD
 
-=======
-- Disk intelligence. `blazar fit` gains a DISK section (largest variant + 64 MiB slack vs available, verdict FIT/TIGHT/NO) and per-row `disk_fits`/`disk_free_bytes` in JSONL mode; pulls are gated at submit time with a teaching error that names the numbers and points at `blazar storage` / `blazar prune`.
-- `blazar storage` — the disk-side counterpart of `fit`: models/engines/sessions/cache footprints, disk headroom, and reclaim candidates (orphan files, stale `.part` downloads, hardlink twins, unused models), plus report-only out-of-tree engine caches.
-- `blazar prune [--orphans] [--unused] [--since-days N] [--yes]` — dry-run by default; `--orphans` deletes unowned files and stale partials, `--unused` removes models idle beyond the window (residents are fetched from a live daemon and never proposed; twins are report-only).
-- Model usage tracking (schema v9): `models.last_used_at`, backfilled from `pulled_at` on upgrade and stamped on cold spawns (residents are fresh by definition — the hot path never pays the write).
-- `blazar connect <client>` — one-command integration: detects the install, prints the exact config change, and with `--write` applies it (backup first, rolled back if the dialect-correct test request fails). Clients: `codex` (config.toml provider, `wire_api = "responses"`), `claude` (settings.json env merge), `continue` (config.yaml; snippet-only when hand-tuned), `cline` / `openwebui` (printed instructions — their config lives in a UI / startup env).
->>>>>>> feat/v0.16-federation
 - `POST /api/warm` gained `"wait": true` — synchronous warm through admission with a resident-state report (default stays the detached pull-notify contract). CLI: `blazar warm <model>`.
-- Responses background mode: `POST /v1/responses` with `"background": true` (requires `store: true`, non-streaming) returns `202 {status: queued}` immediately and runs the roundtrip as a durable job — poll `GET /v1/responses/{id}` (`in_progress` → the verbatim stored body) or watch the `responses`-kind job at `/v1/jobs/{id}`; cancellable through the job plane.
-- Conversations (schema v10): name a thread with `"conversation": "..."` on `POST /v1/responses`; chained responses inherit the name from their `previous_response_id`. `GET /v1/conversations/{id}` lists the thread chronologically, `DELETE` clears it.
-- Cloud-builtin tool types (`web_search`, `file_search`, `computer_use`, `code_interpreter`, `image_generation`, `mcp`, `tool_search`, …) in a Responses request now fail fast with a teaching 400 naming the local substitute (list your tools as `{"type": "function"}` entries; client-side MCP discovery should materialize its tools as function definitions) instead of silently forwarding an unsatisfiable request.
 - `POST /api/replicate` + `blazar replicate <model> [--peers a,b] [--timeout-secs N]` — remote replication: concurrent warm fan-out to peers with verbatim per-peer outcomes; Blazar peers only (non-Blazar peers are named as such).
 - `GET /api/route/{model}` + `blazar route <model>` — cross-node scheduling explainer: local residency, per-peer tier / wait estimate / free VRAM / breaker state, and the decision the gateway would take.
 
