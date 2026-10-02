@@ -44,7 +44,10 @@ use crate::events::{BlazarEvent, EventBus, InstanceState};
 /// site keeps its own per-request `.timeout()` as the bounding clock.
 fn local_http() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
+    CLIENT.get_or_init(|| {
+        blazar_core::tls::ensure_tls_provider();
+        reqwest::Client::new()
+    })
 }
 
 /// Cold-lane child dialing (warm-peg probes, session-bank save/restore):
@@ -7274,10 +7277,24 @@ mod routing_tests {
                 ..Default::default()
             },
         );
+        // nextest runs every test as its own process, so a fixed /tmp path
+        // would be shared by a hundred parallel processes; per-pid dirs keep
+        // each test's store isolated, and the wipe clears stale state a
+        // crashed earlier run may have left behind.
+        let cfg_dir = std::path::PathBuf::from(format!(
+            "/tmp/blazar-routing-test-cfg-{}",
+            std::process::id()
+        ));
+        let data_dir = std::path::PathBuf::from(format!(
+            "/tmp/blazar-routing-test-data-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&cfg_dir);
+        let _ = std::fs::remove_dir_all(&data_dir);
         Supervisor::new(
             BlazarDirs {
-                config_dir: std::path::PathBuf::from("/tmp/blazar-routing-test-cfg"),
-                data_dir: std::path::PathBuf::from("/tmp/blazar-routing-test-data"),
+                config_dir: cfg_dir,
+                data_dir,
             },
             config,
             EventBus::default(),
