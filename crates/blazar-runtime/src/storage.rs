@@ -196,12 +196,16 @@ pub fn orphan_scan(models_dir: &Path, rows: &[ModelRow]) -> OrphanReport {
             }
         }
         // GGUF shard sets: the row names shard 1; own the siblings.
+        // `shard_first_suffix` carries the leading dash, so the stripped
+        // prefix needs it re-added — the convention is
+        // `stem-0000N-of-0000M.gguf`, and a missing dash would orphan
+        // every shard past the first (prune bait).
         if let Some(name) = row_path.file_name().and_then(|n| n.to_str()) {
             if let Some(set_len) = shard_set_len(name) {
                 let stem = name.trim_end_matches(".gguf");
                 let prefix = stem.strip_suffix(shard_first_suffix(stem)).unwrap_or(stem);
                 for idx in 1..=set_len {
-                    let sibling = format!("{prefix}{idx:05}-of-{set_len:05}.gguf");
+                    let sibling = format!("{prefix}-{idx:05}-of-{set_len:05}.gguf");
                     owned.insert(row_path.with_file_name(sibling));
                 }
             }
@@ -340,7 +344,8 @@ mod tests {
     #[test]
     fn unit__disk_verdict__fit_tight_no_unknown() {
         assert_eq!(disk_verdict(100, Some(10_000)), "FIT");
-        assert_eq!(disk_verdict(100, Some(1_000)), "TIGHT");
+        // TIGHT band: fits, but would leave under 10% of the disk free.
+        assert_eq!(disk_verdict(950, Some(1_000)), "TIGHT");
         assert_eq!(disk_verdict(100, Some(99)), "NO");
         assert_eq!(disk_verdict(100, None), "UNKNOWN");
     }
@@ -423,7 +428,9 @@ mod tests {
 
     #[test]
     fn unit__unused_rows__age_and_resident_filters() {
-        let now = 10_000i64;
+        // `now` placed so the cutoff lands between `old` (t=1, aged out)
+        // and `fresh` (t=9_999, still inside the window).
+        let now = 30 * 86_400 + 5_000;
         let rows = vec![
             row("/a.gguf", "old", 1),
             row("/b.gguf", "fresh", 9_999),

@@ -996,6 +996,15 @@ impl Store {
                 m.name
             )));
         }
+        // `last_used_at = 0` means "never went resident"; a freshly
+        // pulled model starts aged at its pull stamp so it is never
+        // instantly "unused" (same semantics the v8→v9 migration
+        // backfills for pre-existing rows).
+        let last_used_at = if m.last_used_at == 0 {
+            m.pulled_at
+        } else {
+            m.last_used_at
+        };
         self.conn.execute(
             "INSERT INTO models (name, repo, quant, path, bytes, sha256, mmproj_path, components,
                                  shards, arch, params, ctx_train, pulled_at, last_used_at)
@@ -1023,7 +1032,7 @@ impl Store {
                 m.params,
                 m.ctx_train,
                 m.pulled_at,
-                m.last_used_at
+                last_used_at
             ],
         )?;
         Ok(())
