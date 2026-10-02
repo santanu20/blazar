@@ -8905,9 +8905,230 @@ fn repl_local_command(
     Some(false)
 }
 
+/// Pure half of the REPL lane suffix: which engine the model routes to,
+/// resolved exactly the way `blazar list`'s ENGINE column does (config
+/// policy + per-model pin + installed engines), so the banner can never
+/// advertise a lane the table disagrees with. When nothing installed
+/// serves the model the routing lesson is carried verbatim; an unpulled
+/// model is left to the daemon's send-time teacher (same contract as
+/// the REPL's not-found handling).
+fn repl_lane_suffix_for(
+    cfg: &blazar_core::Config,
+    engine_rows: &[blazar_core::EngineRow],
+    global: Option<&(String, blazar_core::engine_kind::EngineKind)>,
+    row: Option<&blazar_core::store::ModelRow>,
+) -> String {
+    let Some(row) = row else {
+        return "(not pulled — engine lane resolves on first send)".to_string();
+    };
+    match routed_engine_lane(
+        cfg,
+        global,
+        engine_rows,
+        &row.name,
+        &row.repo,
+        row.arch.as_deref(),
+        row.has_component_set(),
+        &row.path,
+    ) {
+        Ok(tag) => {
+            let kind = engine_rows
+                .iter()
+                .find(|r| r.tag == tag)
+                .map_or("engine", |r| r.kind.as_str());
+            format!("via {kind} ({tag})")
+        }
+        Err(teach) => format!("(engine lane: {teach})"),
+    }
+}
+
+/// Store-backed wrapper the live REPL banner and `/model` switches use.
+fn repl_lane_suffix(model: &str) -> Result<String> {
+    let d = dirs();
+    let store = Store::open(&d)?;
+    let cfg = blazar_core::Config::load(&d).unwrap_or_default();
+    let engine_rows = store.list_engines()?;
+    let global = engine_rows
+        .iter()
+        .find(|r| r.active)
+        .map(|r| (r.tag.clone(), r.kind));
+    let row = store.get_model(model)?;
+    Ok(repl_lane_suffix_for(
+        &cfg,
+        &engine_rows,
+        global.as_ref(),
+        row.as_ref(),
+    ))
+}
+
+/// Decision-model carrier architectures: the System One family
+/// (laya, julia-1, lev, openjev, kev) rides GGUFs converted as
+/// ModernBert + decision metadata. Embedding-readers, not generators —
+/// the chat loop could only relay the child's "does not support logits
+/// computation" error.
+fn repl_is_decision_model(model: &str) -> Result<bool> {
+    let d = dirs();
+    if !d.db_file().is_file() {
+        return Ok(false);
+    }
+    let store = Store::open(&d)?;
+    Ok(store
+        .get_model(model)?
+        .and_then(|row| row.arch)
+        .is_some_and(|arch| arch == "modern-bert"))
+}
+
+/// Split a REPL question line into (question, yes-criterion,
+/// no-criterion). `text :: yes means X :: no means Y` overrides the
+/// plain `yes`/`no` labels; extra `::` segments fold into the question
+/// so punctuation like times never breaks parsing.
+fn parse_systemone_question(line: &str) -> (String, String, String) {
+    let parts: Vec<&str> = line.split("::").map(str::trim).collect();
+    match parts.len() {
+        0..=1 => (line.trim().to_string(), "yes".to_string(), "no".to_string()),
+        // Extra segments fold into the LAST criterion, keeping the
+        // question intact — punctuation like "::" never breaks parsing.
+        2 => (parts[0].to_string(), parts[1].to_string(), "no".to_string()),
+        _ => (
+            parts[0].to_string(),
+            parts[1].to_string(),
+            parts[2..].join(" :: "),
+        ),
+    }
+}
+
+/// System One REPL for decision models: `/state <text>` pins the state,
+/// every plain line asks one typed choice question about it.
+async fn run_repl_systemone(base: &str, model: &str) -> Result<()> {
+    use rustyline::error::ReadlineError;
+    let mut rl = rustyline::DefaultEditor::new()?;
+    let mut state: Option<String> = None;
+    println!("blazar System One REPL — {model} (decision model) — /help for commands");
+    let client = reqwest::Client::new();
+    loop {
+        let line = match rl.readline("?> ") {
+            Ok(l) => l,
+            Err(ReadlineError::Interrupted) => {
+                println!("^C (use /exit or Ctrl+D to quit)");
+                continue;
+            }
+            Err(_) => break,
+        };
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+        rl.add_history_entry(&line).ok();
+        if line == "/exit" || line == "/quit" {
+            break;
+        }
+        if line == "/help" {
+            println!(
+                "  /state <text>   set the state the questions are about
+                   (append \\ to continue on more lines, end with . )
+  <question>      ask one choice question; answer prints as
+                   choice + probabilities + confidence
+  question syntax: text :: yes-criterion :: no-criterion
+  /exit           quit"
+            );
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("/state ") {
+            let mut block = rest.trim().to_string();
+            if block.ends_with('\\') {
+                block.pop();
+                loop {
+                    let cont = match rl.readline("... ") {
+                        Ok(l) => l,
+                        Err(_) => break,
+                    };
+                    if cont.trim() == "." {
+                        break;
+                    }
+                    block.push(' ');
+                    block.push_str(&cont);
+                }
+            }
+            if block.is_empty() {
+                println!("  (state cleared)");
+                state = None;
+            } else {
+                state = Some(block);
+                println!("  (state set)");
+            }
+            continue;
+        }
+        let Some(state_text) = state.as_deref() else {
+            println!("  set the state first: /state <text>");
+            continue;
+        };
+        let (question, yes, no) = parse_systemone_question(&line);
+        let body = serde_json::json!({
+            "model": model,
+            "state": state_text,
+            "questions": {
+                "q1": {
+                    "type": "choice",
+                    "instructions": question,
+                    "criteria": { "yes": yes, "no": no },
+                }
+            }
+        });
+        let resp = client
+            .post(format!("{base}/v1/systemone"))
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(120))
+            .send()
+            .await?;
+        let status = resp.status();
+        let payload: serde_json::Value = resp.json().await?;
+        if !status.is_success() {
+            let msg = payload
+                .pointer("/error/message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("request failed");
+            println!("  error ({status}): {msg}");
+            if status.as_u16() == 501 {
+                println!("  this model is not a decision model — System One REPL is for laya/julia/lev/openjev/kev-class models");
+                break;
+            }
+            continue;
+        }
+        let Some(answer) = payload.pointer("/answers/q1").cloned() else {
+            println!("  unexpected response shape: {payload}");
+            continue;
+        };
+        let choice = answer.get("choice").and_then(|v| v.as_str()).unwrap_or("?");
+        let confidence = answer
+            .get("confidence")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let probs: Vec<String> = answer
+            .get("probabilities")
+            .and_then(|v| v.as_object())
+            .map(|m| {
+                let mut v: Vec<String> = m
+                    .iter()
+                    .map(|(k, p)| format!("{k} {:.2}", p.as_f64().unwrap_or(0.0)))
+                    .collect();
+                v.sort();
+                v
+            })
+            .unwrap_or_default();
+        println!(
+            "  => {choice}  ({})  confidence {confidence:.2}",
+            probs.join(" / ")
+        );
+    }
+    Ok(())
+}
+
 async fn run_repl(model: &str, no_draft: bool) -> Result<()> {
     use rustyline::error::ReadlineError;
     let base = ensure_daemon().await?;
+    if repl_is_decision_model(&model)? {
+        return run_repl_systemone(&base, &model).await;
+    }
     let mut rl = rustyline::DefaultEditor::new()?;
     let mut model = model.to_string();
     // Conversation memory: user AND assistant turns, so follow-ups can
@@ -18648,5 +18869,27 @@ mod tests {
             doctor_footer(&[ok(), warn(), fail()]),
             "1 failing check(s) — fix the fail rows above"
         );
+    }
+}
+
+#[cfg(test)]
+mod systemone_repl_tests {
+    use super::parse_systemone_question;
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__parse_systemone_question__suffix_overrides_and_folds_extras() {
+        let (q, y, n) = parse_systemone_question("ship it?");
+        assert_eq!(
+            (q.as_str(), y.as_str(), n.as_str()),
+            ("ship it?", "yes", "no")
+        );
+        let (q, y, n) = parse_systemone_question("ship 2x :: speed doubles :: latency grows");
+        assert_eq!(q, "ship 2x");
+        assert_eq!(y, "speed doubles");
+        assert_eq!(n, "latency grows");
+        let (q, y, n) = parse_systemone_question("a :: b :: c :: d");
+        assert_eq!(y, "b");
+        assert_eq!(n, "c :: d");
     }
 }
