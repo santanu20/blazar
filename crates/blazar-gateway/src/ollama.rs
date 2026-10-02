@@ -3108,7 +3108,7 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
             Err(e) => api_error(502, &format!("router unload: {e}")),
         };
     }
-    match state.sup.evict_model(&model).await {
+    match state.sup.evict_model(model).await {
         Ok(()) => axum::Json(json!({"status": "ok"})).into_response(),
         Err(e) => api_error(404, &e.to_string()),
     }
