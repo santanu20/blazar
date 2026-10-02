@@ -694,11 +694,11 @@ async fn forward_once(
             req = req.header(name, value);
         }
     }
-    let send = req
-        .body(reqwest::Body::wrap_stream(futures::stream::once(
-            async move { Ok::<_, std::io::Error>(body) },
-        )))
-        .send();
+    // Complete-body send, never a chunked stream: children with simple
+    // HTTP handlers (mlx_lm.server's http.server class) reject chunked
+    // request bodies outright. `Body::from(bytes)` declares the exact
+    // Content-Length; full-stream engines accept it identically.
+    let send = req.body(reqwest::Body::from(body)).send();
     child_send(state, engine, send).await
 }
 
@@ -1460,7 +1460,9 @@ pub(crate) fn resolve_serving(
                 // MLX marker + dir gate = the same discriminator the
                 // supervisor threads; keeps the router and this
                 // rescue-path verdict on one axis.
-                model_row.as_ref().is_some_and(blazar_core::ModelRow::is_mlx)
+                model_row
+                    .as_ref()
+                    .is_some_and(blazar_core::ModelRow::is_mlx)
                     && std::path::Path::new(model_path).is_dir(),
                 global,
                 &installed,
