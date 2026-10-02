@@ -395,10 +395,12 @@ pub async fn jobs_get(State(state): State<Arc<AppState>>, Path(job_id): Path<Str
             }
             axum::Json(row_payload(&row)).into_response()
         }
-        // Doctor: a gateway-owned probe task writes its progress through
-        // this ledger itself — the row IS the live truth (events carry
-        // per-probe verdicts as they land).
-        "doctor" => axum::Json(row_payload(&row)).into_response(),
+        // Doctor and background responses: gateway-owned tasks write
+        // their progress through this ledger itself — the row IS the live
+        // truth (doctor events carry per-probe verdicts; a background
+        // response flips queued→running→completed on the same row the
+        // client polls).
+        "doctor" | "responses" => axum::Json(row_payload(&row)).into_response(),
         // Image/video: the owning child is the only live truth. A poll
         // that finds a terminal state mirrors it into the ledger; a child
         // that is gone closes the row honestly instead of 404-ing.
@@ -484,8 +486,10 @@ pub async fn jobs_cancel(
             state.jobs.record_cancelled(&state, &job_id);
         }
         // Doctor probes check the row between probes and stop once it is
-        // terminal; the one-way close guarantees this flip is final.
-        "doctor" => {
+        // terminal; background responses simply stop being polled (any late
+        // completion cannot resurrect the row — the one-way close guarantees
+        // this flip is final).
+        "doctor" | "responses" => {
             state.jobs.record_cancelled(&state, &job_id);
         }
         "image" | "video" => {

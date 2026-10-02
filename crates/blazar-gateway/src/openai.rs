@@ -619,15 +619,167 @@ pub async fn openai_proxy(
     .await
 }
 
+/// Tool types that need a cloud-side catalog or sandbox this local
+/// gateway cannot honor. Named here so the request fails fast with the
+/// fix in the message instead of drifting downstream into a child 500.
+const CLOUD_BUILTIN_TOOL_TYPES: &[&str] = &[
+    "web_search",
+    "web_search_preview",
+    "file_search",
+    "computer_use",
+    "computer_use_preview",
+    "code_interpreter",
+    "image_generation",
+    "mcp",
+    "tool_search",
+];
+
+/// Teaching gate for cloud builtin tool entries: a local gateway has no
+/// tool catalog to search and no cloud sandbox to drive. `None` = the
+/// request's tools (if any) are all locally servable `function` entries.
+pub(crate) fn cloud_tool_gate(parsed: &serde_json::Value) -> Option<String> {
+    let tools = parsed.get("tools")?.as_array()?;
+    for t in tools {
+        let Some(ty) = t.get("type").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if CLOUD_BUILTIN_TOOL_TYPES.contains(&ty) {
+            return Some(format!(
+                "tool type {ty:?} is a cloud-side mechanism a local gateway cannot honor — list the tools you control as {{\"type\":\"function\"}} entries (client-side MCP discovery should materialize its tools as function definitions on the next turn)"
+            ));
+        }
+    }
+    None
+}
+
+/// `GET /v1/conversations/{id}` — list the stored responses grouped
+/// under one conversation handle (ledger-backed, survives restarts).
+pub async fn conversations_get(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if id.is_empty() || id.len() > 128 {
+        return openai_error(400, "invalid conversation id");
+    }
+    let rows = state
+        .with_store(|s| s.list_conversation(&id).ok())
+        .flatten()
+        .unwrap_or_default();
+    if rows.is_empty() {
+        return openai_error(
+            404,
+            "conversation not found — conversations exist once a stored response names one (pass \"conversation\": \"...\" on POST /v1/responses)",
+        );
+    }
+    let responses: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id,
+                "model": r.model,
+                "status": "completed",
+                "created_at": r.ts,
+            })
+        })
+        .collect();
+    let count = responses.len();
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "object": "conversation",
+            "id": id,
+            "count": count,
+            "responses": responses,
+        })),
+    )
+        .into_response()
+}
+
+/// `DELETE /v1/conversations/{id}` — prune every response in the
+/// conversation (the in-memory registry re-populates on demand from
+/// remaining ledger rows; here there are none, so chains into this
+/// conversation now 404 with the standard teaching message).
+pub async fn conversations_delete(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if id.is_empty() || id.len() > 128 {
+        return openai_error(400, "invalid conversation id");
+    }
+    match state.with_store(|s| s.delete_conversation(&id)) {
+        Some(Ok(n)) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "object": "conversation",
+                "id": id,
+                "deleted": n,
+            })),
+        )
+            .into_response(),
+        Some(Err(e)) => openai_error(500, &format!("conversation delete failed: {e}")),
+        None => openai_error(503, "store unavailable — the conversation list lives in the ledger; retry shortly"),
+    }
+}
+
 /// `GET /v1/responses/{id}` — retrieve a stored (chained) response:
 /// `OpenAI` retrieval surface over the gateway registry (memory-first,
 /// SQLite ledger fallback — stored responses survive restarts). Expired
 /// or streamed (never stored) ids 404 with the same teaching message as
-/// the chaining path.
+/// the chaining path. v10 rows carry the exact completed body
+/// (`body_json`) — returned verbatim; background-mode ids still running
+/// answer through the job plane's state machine instead.
 pub async fn responses_get(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
+    // Exact-body fidelity first (background always, foreground since v10).
+    let row = state.with_store(|s| s.get_response(&id).ok().flatten()).flatten();
+    if let Some(r) = &row {
+        if let Some(bj) = &r.body_json {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(bj) {
+                return (StatusCode::OK, axum::Json(v)).into_response();
+            }
+        }
+    }
+    // Background lifecycle: no stored body yet — the job row says where
+    // the run is (same id namespace by construction).
+    if row.is_none() {
+        if let Some(job) = state.with_store(|s| s.get_job(&id).ok().flatten()).flatten() {
+            return match job.state.as_str() {
+                "queued" | "running" => (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "id": id,
+                        "object": "response",
+                        "status": "in_progress",
+                        "background": true,
+                    })),
+                )
+                    .into_response(),
+                "failed" => (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "id": id,
+                        "object": "response",
+                        "status": "failed",
+                        "background": true,
+                        "error": job.error,
+                    })),
+                )
+                    .into_response(),
+                _ => (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "id": id,
+                        "object": "response",
+                        "status": job.state,
+                        "background": true,
+                    })),
+                )
+                    .into_response(),
+            };
+        }
+    }
     let found = state.stored_response(&id).map(|s| {
         serde_json::json!({
             "id": id,
@@ -908,6 +1060,28 @@ pub async fn responses_api(
         .get("store")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
+    // v0.18 depth: background mode (polled, job-backed), conversation
+    // grouping, and the cloud-tool honesty gate.
+    let background = parsed
+        .get("background")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if background && (stream || !store) {
+        return openai_error(
+            400,
+            "background requires store=true and stream=false — a background response is polled via GET /v1/responses/{id}, never streamed",
+        );
+    }
+    if let Some(msg) = cloud_tool_gate(&parsed) {
+        return openai_error(400, &msg);
+    }
+    let conversation_named = parsed
+        .get("conversation")
+        .and_then(|c| c.as_str())
+        .map(str::to_string);
+    // The child never sees the conversation handle (unknown fields are
+    // how stale upstreams 500): strip it the same way the chain id is
+    // stripped, after inheritance is resolved below.
     let previous = parsed
         .get("previous_response_id")
         .and_then(|p| p.as_str())
@@ -918,14 +1092,16 @@ pub async fn responses_api(
     // reject stale ids). The lookup is memory-first with the SQLite
     // ledger as restart fallback — a chain survives a gateway restart.
     let mut inherited_model = None;
+    let mut inherited_conversation = None;
     if let Some(pid) = previous {
         let found = state.stored_response(&pid).map(|s| {
             (
                 crate::responses::ResponsesRegistry::chain_input(&s, &parsed["input"]),
                 s.model.clone(),
+                s.conversation.clone(),
             )
         });
-        let Some((chained, prev_model)) = found else {
+        let Some((chained, prev_model, prev_conversation)) = found else {
             return openai_error(
                 404,
                 &format!(
@@ -935,10 +1111,15 @@ pub async fn responses_api(
         };
         parsed["input"] = chained;
         inherited_model = Some(prev_model);
+        inherited_conversation = Some(prev_conversation);
         parsed
             .as_object_mut()
             .map(|o| o.remove("previous_response_id"));
     }
+    // Conversation: named > inherited-from-chain > none. A chained turn
+    // without its own handle stays in the thread it replies to.
+    let conversation = conversation_named.or(inherited_conversation).unwrap_or_default();
+    parsed.as_object_mut().map(|o| o.remove("conversation"));
     // Model: explicit > inherited-from-chain > named-400 (every OpenAI
     // route's contract on a missing model).
     let model = parsed
@@ -1025,11 +1206,28 @@ pub async fn responses_api(
         return r;
     }
 
-    // Non-stream + store: buffered forward, store, re-id, return. Same
-    // crash-recovery contract as every other child lane: bounded send
-    // (child_send owns the header-timeout evict), then exactly one
-    // in-band retry on a respawned child so single-shot clients don't
-    // eat a 502/504 for a child that died mid-request.
+/// Buffered (non-stream, stored) responses roundtrip shared by the
+/// foreground call and background mode: forward to the child (best-of-N
+/// or single send with the respawn-retry contract), observe, store under
+/// OUR id, rewrite the body id, and hand back the finished value. The
+/// admission guard stays with the caller — background holds it for the
+/// whole run, the foreground drops it after this returns.
+#[allow(clippy::too_many_lines)]
+async fn buffered_response_roundtrip(
+    state: &Arc<AppState>,
+    engine: &blazar_runtime::EngineRef,
+    model_name: &str,
+    new_body: &[u8],
+    best_of: Option<u64>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
+    trace_ext: Option<Extension<TraceId>>,
+    id: &str,
+    conversation: &str,
+    input_items: serde_json::Value,
+) -> Result<(serde_json::Value, Option<String>, u16), Response> {
+    fn fail(status: u16, msg: &str) -> Result<(serde_json::Value, Option<String>, u16), Response> {
+        Err(openai_error(status, msg))
+    }
     let t0 = std::time::Instant::now();
     let url = format!(
         "{}/v1/responses",
@@ -1041,7 +1239,7 @@ pub async fn responses_api(
             .header("content-type", "application/json"),
         &engine,
     )
-    .body(new_body.clone());
+    .body(new_body.to_vec());
     // Best-of-N: judge N candidates, return the winner as a normal child
     // response (usage summed across candidates). Skip/Degraded (knob
     // off, guard collapse, first-copy transport failure) takes the
@@ -1082,14 +1280,14 @@ pub async fn responses_api(
                                 .header("content-type", "application/json"),
                             &fresh,
                         )
-                        .body(new_body.clone());
+                        .body(new_body.to_vec());
                         match crate::proxy::child_send(&state, &fresh, fresh_req.send()).await {
                             Ok(r) => {
                                 state.ttft.observe_secs(t0.elapsed().as_secs_f64());
                                 r
                             }
                             Err(e2) => {
-                                return openai_error(
+                                return fail(
                                     e2.status_u16(),
                                     &format!(
                                     "engine request failed: {e}; retry on respawned child: {e2}"
@@ -1099,7 +1297,7 @@ pub async fn responses_api(
                         }
                     }
                     Err(re) => {
-                        return openai_error(
+                        return fail(
                             e.status_u16(),
                             &format!("engine request failed: {e}; respawn: {re:#}"),
                         );
@@ -1113,11 +1311,11 @@ pub async fn responses_api(
         let text = resp.text().await.unwrap_or_default();
         let mut r = openai_error(status, &format!("engine error: {text}"));
         crate::bestof::stamp(&mut r, bestof_hdr.as_deref());
-        return r;
+        return Err(r);
     }
     let mut out: serde_json::Value = match resp.json().await {
         Ok(v) => v,
-        Err(e) => return openai_error(502, &format!("bad engine response: {e}")),
+        Err(e) => return fail(502, &format!("bad engine response: {e}")),
     };
     // Sentinel observation: the buffered branch bypasses proxy_request,
     // so the feed is driven here (same as the ollama translate path).
@@ -1135,8 +1333,9 @@ pub async fn responses_api(
         drop(feed); // Drop fires End: analyzer finalizes off the path
     }
     // Store under OUR id and rewrite the body's id so the client chains
-    // through the gateway (the engine's own id carries no storage).
-    let id = crate::responses::new_response_id();
+    // through the gateway (the engine's own id carries no storage). The id
+    // comes from the caller so background mode's job row and stored response
+    // share it — polling the 202'd id serves this body once completed.
     let usage = out.get("usage").cloned().unwrap_or(serde_json::Value::Null);
     let in_tok = usage["input_tokens"].as_u64();
     let out_tok = usage["output_tokens"].as_u64();
@@ -1153,10 +1352,6 @@ pub async fn responses_api(
         let total = in_tok.unwrap_or(0).saturating_add(out_tok.unwrap_or(0));
         state.keys.charge_tokens(&k.name, total);
     }
-    let input_items = parsed
-        .get("input")
-        .cloned()
-        .unwrap_or(serde_json::Value::Array(vec![]));
     let output_items = out
         .get("output")
         .cloned()
@@ -1167,14 +1362,126 @@ pub async fn responses_api(
     state.store_response(
         &id,
         &crate::responses::StoredResponse {
-            model: model_name.clone(),
+            model: model_name.to_string(),
             input_items,
             output_items,
             input_tokens: in_tok,
             output_tokens: out_tok,
             ts: crate::responses::unix_now(),
+            conversation: conversation.to_string(),
+            body_json: serde_json::to_string(&out).ok(),
         },
     );
+    Ok((out, bestof_hdr, status))
+
+}
+
+    // Non-stream + store: buffered forward, store, re-id, return. Same
+    // crash-recovery contract as every other child lane: bounded send
+    // (child_send owns the header-timeout evict), then exactly one
+    // in-band retry on a respawned child so single-shot clients don't
+    // eat a 502/504 for a child that died mid-request.
+    let id = crate::responses::new_response_id();
+    let input_items = parsed
+        .get("input")
+        .cloned()
+        .unwrap_or(serde_json::Value::Array(vec![]));
+    let input_items_bg = input_items.clone();
+    let input_items_fg = input_items;
+    // Background mode: same buffered roundtrip, polled instead of held.
+    // The response id doubles as the job id — one namespace, both planes
+    // (/v1/jobs/{id} shows the run, /v1/responses/{id} shows the result).
+    if background {
+        let id = crate::responses::new_response_id();
+        state.jobs.record_created(
+            &state,
+            &id,
+            "responses",
+            Some(model_name.as_str()),
+            serde_json::json!({
+                "model": model_name,
+                "conversation": conversation,
+                "background": true,
+            }),
+        );
+        let st = Arc::clone(&state);
+        let eng = engine.clone();
+        let model_owned = model_name.clone();
+        let body_owned = new_body.clone();
+        let keys = key_ext.clone();
+        let trace = trace_ext.clone();
+        let rid = id.clone();
+        let conv = conversation.clone();
+        tokio::spawn(async move {
+            st.jobs.record_running(&st, &rid);
+            match buffered_response_roundtrip(
+                &st,
+                &eng,
+                &model_owned,
+                &body_owned,
+                best_of,
+                keys,
+                trace,
+                &rid,
+                &conv,
+                input_items_bg,
+            )
+            .await
+            {
+                Ok((out, _, _)) => {
+                    let bytes = serde_json::to_vec(&out).unwrap_or_default();
+                    st.jobs.record_completed(&st, &rid, &bytes, "application/json");
+                }
+                Err(resp) => {
+                    let status = resp.status().as_u16();
+                    let msg = match axum::body::to_bytes(
+                        resp.into_body(),
+                        64 * 1024,
+                    )
+                    .await
+                    {
+                        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+                        Err(_) => format!("background response failed (HTTP {status})"),
+                    };
+                    st.jobs.record_failed(&st, &rid, &msg);
+                }
+            }
+        });
+        drop(guard);
+        let queued = serde_json::json!({
+            "id": id,
+            "object": "response",
+            "status": "queued",
+            "model": model_name,
+            "conversation": conversation,
+            "created_at": crate::responses::unix_now(),
+            "background": true,
+        });
+        return (
+            StatusCode::ACCEPTED,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            serde_json::to_vec(&queued).unwrap_or_default(),
+        )
+            .into_response();
+    }
+
+    let (out, bestof_hdr, status) = match buffered_response_roundtrip(
+        &state,
+        &engine,
+        &model_name,
+        &new_body,
+        best_of,
+        key_ext.clone(),
+        trace_ext.clone(),
+        &id,
+        &conversation,
+        input_items_fg,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     drop(guard);
     let mut builder = Response::builder().status(status);
     if load_ms > 100 {
@@ -1524,5 +1831,39 @@ mod tests {
         assert!(!inject_reasoning_effort_kwarg(&mut empty));
         let mut absent = json!({"model": "m1"});
         assert!(!inject_reasoning_effort_kwarg(&mut absent));
+    }
+
+    #[test]
+    fn unit__cloud_tool_gate__cloud_builtins_teach_local_functions_pass() {
+        let pass = serde_json::json!({
+            "model": "m",
+            "tools": [{"type": "function", "function": {"name": "get_weather"}}]
+        });
+        assert!(cloud_tool_gate(&pass).is_none());
+
+        for t in ["web_search", "mcp", "tool_search", "file_search", "computer_use"] {
+            let body = serde_json::json!({
+                "model": "m",
+                "tools": [{"type": t}]
+            });
+            let msg = cloud_tool_gate(&body)
+                .unwrap_or_else(|| panic!("cloud tool {t} must be gated"));
+            assert!(
+                msg.contains(t),
+                "teaching message names the rejected type: {msg}"
+            );
+            assert!(
+                msg.contains("function"),
+                "teaching message points at the function-tool alternative: {msg}"
+            );
+        }
+
+        // tools that are not an array, or entries without a type, pass through:
+        // translation/validation downstream handles those shapes.
+        assert!(cloud_tool_gate(&serde_json::json!({"tools": "nope"})).is_none());
+        assert!(
+            cloud_tool_gate(&serde_json::json!({"tools": [{"function": {"name": "x"}}]}))
+                .is_none()
+        );
     }
 }

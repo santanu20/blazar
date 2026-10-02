@@ -1347,6 +1347,159 @@ async fn e2e__responses_chaining_and_store() {
     assert_eq!(gone.status(), 404);
     ts.state.sup.shutdown_all().await.unwrap();
 }
+#[tokio::test]
+async fn e2e__responses__background_conversations_and_cloud_tools() {
+    let ts = start(Config::default()).await;
+    let c = client();
+
+    // Background mode: 202 + queued, then polls to the completed body.
+    let queued = c
+        .post(format!("{}/v1/responses", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "input": "in the background",
+            "store": true,
+            "background": true,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(queued.status(), 202);
+    let q: serde_json::Value = queued.json().await.unwrap();
+    assert_eq!(q["status"], "queued");
+    assert_eq!(q["background"], true);
+    let bg_id = q["id"].as_str().unwrap().to_string();
+
+    // The job plane carries the same id (kind=responses).
+    let job: serde_json::Value = c
+        .get(format!("{}/v1/jobs/{}", ts.base, bg_id))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(job["kind"], "responses");
+
+    // Poll until terminal (stub completes immediately; bound anyway).
+    let mut final_body = serde_json::Value::Null;
+    for _ in 0..100 {
+        let r: serde_json::Value = c
+            .get(format!("{}/v1/responses/{}", ts.base, bg_id))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        match r["status"].as_str() {
+            Some("queued") | Some("in_progress") => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            _ => {
+                final_body = r;
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        final_body["status"], "completed",
+        "background response completes: {final_body}"
+    );
+    assert_eq!(final_body["id"].as_str().unwrap(), bg_id);
+    // Body tier, not just the job tier: the verbatim stored body must be
+    // served under the SAME id the 202 returned (guards against a shadowed
+    // re-mint storing it under an unreachable id).
+    assert!(
+        final_body.get("output").is_some(),
+        "polled body is the stored engine body: {final_body}"
+    );
+
+    // Background + stream is a contract error, not a surprise.
+    let bad = c
+        .post(format!("{}/v1/responses", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1", "input": "x", "store": true,
+            "background": true, "stream": true,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    let b: serde_json::Value = bad.json().await.unwrap();
+    assert!(b["error"]["message"].as_str().unwrap().contains("background"));
+
+    // Cloud builtin tools teach, never silently pretend.
+    let cloud = c
+        .post(format!("{}/v1/responses", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1", "input": "x",
+            "tools": [{"type": "web_search"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cloud.status(), 400);
+    let b: serde_json::Value = cloud.json().await.unwrap();
+    assert!(
+        b["error"]["message"].as_str().unwrap().contains("web_search"),
+        "{}", b
+    );
+
+    // Conversations: two stored responses in conv-e2e, the second via
+    // previous_response_id inheriting the conversation.
+    let c1: serde_json::Value = c
+        .post(format!("{}/v1/responses", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1", "input": "first", "store": true,
+            "conversation": "conv-e2e",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let first_id = c1["id"].as_str().unwrap().to_string();
+    let _c2: serde_json::Value = c
+        .post(format!("{}/v1/responses", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1", "input": "second", "store": true,
+            "previous_response_id": first_id,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let conv: serde_json::Value = c
+        .get(format!("{}/v1/conversations/conv-e2e", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(conv["count"], 2, "both responses stamped/inherited: {conv}");
+    assert_eq!(conv["object"], "conversation");
+
+    let del: serde_json::Value = c
+        .delete(format!("{}/v1/conversations/conv-e2e", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(del["deleted"], 2);
+
+    let gone = c
+        .get(format!("{}/v1/conversations/conv-e2e", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gone.status(), 404);
+}
 
 #[tokio::test]
 #[allow(non_snake_case)]

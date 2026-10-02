@@ -25,7 +25,7 @@ pub struct Store {
     conn: Connection,
 }
 
-const SCHEMA_VERSION: i32 = 9;
+const SCHEMA_VERSION: i32 = 10;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -119,7 +119,9 @@ CREATE TABLE IF NOT EXISTS responses (
     output_json   TEXT NOT NULL,
     input_tokens  INTEGER,
     output_tokens INTEGER,
-    ts            INTEGER NOT NULL
+    ts            INTEGER NOT NULL,
+    conversation  TEXT NOT NULL DEFAULT '',  -- v10: grouping key for /v1/conversations
+    body_json     TEXT                            -- v10: exact completed body (background mode fidelity)
 );
 CREATE TABLE IF NOT EXISTS model_caps (
     model      TEXT NOT NULL,
@@ -357,6 +359,13 @@ pub struct StoredResponseRow {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub ts: i64,
+    /// v10: grouping key set when the request carried `conversation`
+    /// (or inherited it through a `previous_response_id` chain).
+    pub conversation: String,
+    /// v10: the exact completed body JSON when the gateway kept it
+    /// (background mode always; foreground when cheap). `None` on
+    /// pre-v10 rows — GET reconstructs the shape instead.
+    pub body_json: Option<String>,
 }
 
 #[must_use]
@@ -455,6 +464,29 @@ impl Store {
                         .execute(&format!("ALTER TABLE models DROP COLUMN {col}"), [])?;
                 }
             }
+            // v9→v10: responses grew `conversation` (listing handle for
+            // /v1/conversations) and `body_json` (the exact completed body,
+            // so background-mode polls return what the foreground call would
+            // have received). Both nullable-or-default — no backfill owed:
+            // pre-v10 rows keep the reconstructed-shape GET contract.
+            let resp_cols = self.table_columns("responses")?;
+            if !resp_cols.contains(&"conversation".to_string()) {
+                self.conn.execute(
+                    "ALTER TABLE responses ADD COLUMN conversation TEXT NOT NULL DEFAULT ''",
+                    [],
+                )?;
+            }
+            if !resp_cols.contains(&"body_json".to_string()) {
+                self.conn
+                    .execute("ALTER TABLE responses ADD COLUMN body_json TEXT", [])?;
+            }
+            // Index lives here, not in SCHEMA_SQL: on an upgrade database
+            // SCHEMA_SQL runs before these ALTERs and the index references
+            // the not-yet-added column (caught by the v9→v10 upgrade pin).
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_responses_conversation ON responses(conversation, ts)",
+                [],
+            )?;
             // v8→v9: models gained `last_used_at` (disk intelligence:
             // `blazar prune --unused` ages models out by spawn activity).
             // Fresh databases get it from SCHEMA_SQL; v8 databases take the
@@ -731,12 +763,13 @@ impl Store {
 
     pub fn put_response(&self, r: &StoredResponseRow) -> CoreResult<()> {
         self.conn.execute(
-            "INSERT INTO responses (id, model, input_json, output_json, input_tokens, output_tokens, ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO responses (id, model, input_json, output_json, input_tokens, output_tokens, ts, conversation, body_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(id) DO UPDATE SET
                model = excluded.model, input_json = excluded.input_json,
                output_json = excluded.output_json, input_tokens = excluded.input_tokens,
-               output_tokens = excluded.output_tokens, ts = excluded.ts",
+               output_tokens = excluded.output_tokens, ts = excluded.ts,
+               conversation = excluded.conversation, body_json = excluded.body_json",
             params![
                 r.id,
                 r.model,
@@ -744,7 +777,9 @@ impl Store {
                 r.output_json,
                 r.input_tokens,
                 r.output_tokens,
-                r.ts
+                r.ts,
+                r.conversation,
+                r.body_json
             ],
         )?;
         Ok(())
@@ -753,7 +788,7 @@ impl Store {
     pub fn get_response(&self, id: &str) -> CoreResult<Option<StoredResponseRow>> {
         self.conn
             .query_row(
-                "SELECT id, model, input_json, output_json, input_tokens, output_tokens, ts FROM responses WHERE id = ?1",
+                "SELECT id, model, input_json, output_json, input_tokens, output_tokens, ts, conversation, body_json FROM responses WHERE id = ?1",
                 params![id],
                 |r| {
                     Ok(StoredResponseRow {
@@ -764,6 +799,8 @@ impl Store {
                         input_tokens: r.get(4)?,
                         output_tokens: r.get(5)?,
                         ts: r.get(6)?,
+                        conversation: r.get(7)?,
+                        body_json: r.get(8)?,
                     })
                 },
             )
@@ -772,6 +809,43 @@ impl Store {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(other.into()),
             })
+    }
+
+    /// Every stored response grouped under `conversation`, oldest first —
+    /// the listing behind `GET /v1/conversations/{id}`.
+    pub fn list_conversation(&self, conversation: &str) -> CoreResult<Vec<StoredResponseRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, model, input_json, output_json, input_tokens, output_tokens, ts, conversation, body_json
+             FROM responses WHERE conversation = ?1 ORDER BY ts ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![conversation], |r| {
+            Ok(StoredResponseRow {
+                id: r.get(0)?,
+                model: r.get(1)?,
+                input_json: r.get(2)?,
+                output_json: r.get(3)?,
+                input_tokens: r.get(4)?,
+                output_tokens: r.get(5)?,
+                ts: r.get(6)?,
+                conversation: r.get(7)?,
+                body_json: r.get(8)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Prune every response in `conversation` (DELETE endpoint). Returns
+    /// the number of rows removed so the API can say what it did.
+    pub fn delete_conversation(&self, conversation: &str) -> CoreResult<u64> {
+        let n = self.conn.execute(
+            "DELETE FROM responses WHERE conversation = ?1",
+            params![conversation],
+        )?;
+        Ok(u64::try_from(n).unwrap_or(0))
     }
 
     /// Mirror of the in-memory registry contract: entries older than
@@ -1513,6 +1587,8 @@ mod tests {
             input_tokens: Some(1),
             output_tokens: Some(2),
             ts,
+            conversation: String::new(),
+            body_json: None,
         };
         let now = unix_now();
         s.put_response(&row("r_old_ttl", now - 7200)).unwrap();
@@ -1568,6 +1644,70 @@ mod tests {
         s.insert_job(&job_row("upgrade_probe", "audio", "queued", 1000))
             .unwrap();
         assert!(s.get_job("upgrade_probe").unwrap().is_some());
+    }
+
+    #[test]
+    fn unit__store_schema_upgrades__v9_to_v10() {
+        // Simulate a v9 database: responses without the conversation/body_json
+        // columns, user_version 9.
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        {
+            let s = Store::open(&dirs).unwrap();
+            s.conn()
+                .execute_batch(
+                    "DROP TABLE responses; CREATE TABLE responses (id TEXT PRIMARY KEY, model TEXT NOT NULL, input_json TEXT NOT NULL, output_json TEXT NOT NULL, input_tokens INTEGER, output_tokens INTEGER, ts INTEGER NOT NULL); INSERT INTO responses (id, model, input_json, output_json, input_tokens, output_tokens, ts) VALUES ('legacy', 'm', '[]', '[]', 1, 2, 100); PRAGMA user_version = 9;",
+                )
+                .unwrap();
+        }
+        // Reopen: migrate() adds the columns, keeps legacy rows, stamps v10.
+        let s = Store::open(&dirs).unwrap();
+        let v: i32 = s
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let legacy = s.get_response("legacy").unwrap().unwrap();
+        assert_eq!(legacy.model, "m");
+        assert_eq!(legacy.conversation, "");
+        assert!(legacy.body_json.is_none());
+    }
+
+    #[test]
+    fn unit__conversations__stamp_list_delete() {
+        let (_t, s) = tmp_store();
+        let row = |id: &str, conv: &str, ts: i64| StoredResponseRow {
+            id: id.into(),
+            model: "m".into(),
+            input_json: "[]".into(),
+            output_json: "[]".into(),
+            input_tokens: None,
+            output_tokens: None,
+            ts,
+            conversation: conv.into(),
+            body_json: None,
+        };
+        // Same conversation, distinct timestamps; ordering must be ts ASC.
+        s.put_response(&row("r2", "conv-a", 200)).unwrap();
+        s.put_response(&row("r1", "conv-a", 100)).unwrap();
+        s.put_response(&row("other", "conv-b", 150)).unwrap();
+
+        let listed = s.list_conversation("conv-a").unwrap();
+        assert_eq!(
+            listed.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["r1", "r2"],
+            "conversation listing is chronological"
+        );
+        assert!(s.list_conversation("missing").unwrap().is_empty());
+
+        let deleted = s.delete_conversation("conv-a").unwrap();
+        assert_eq!(deleted, 2);
+        assert!(s.list_conversation("conv-a").unwrap().is_empty());
+        // Other conversations untouched.
+        assert_eq!(s.list_conversation("conv-b").unwrap().len(), 1);
     }
 
     #[test]
