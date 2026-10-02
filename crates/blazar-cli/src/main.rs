@@ -405,6 +405,25 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Point a client at this Blazar daemon: detect the install, print the
+    /// exact config change, optionally write it (backup + rollback), then
+    /// fire a test request. Bare `blazar connect` lists every known client
+    Connect {
+        /// Client id: codex, claude, continue, cline, openwebui (bare
+        /// `blazar connect` lists every known client)
+        #[arg(default_value_t = String::new())]
+        client: String,
+        /// Model the test request should use (default: first local model)
+        #[arg(long)]
+        model: Option<String>,
+        /// Write the config change (default: print only); backs up first,
+        /// rolls back if the test request fails
+        #[arg(long)]
+        write: bool,
+        /// One JSON object instead of the human report
+        #[arg(long)]
+        json: bool,
+    },
     /// Disk-space intelligence: what Blazar stores, where it lives, and
     /// what can be reclaimed (orphans, stale partials, unused models)
     Storage {
@@ -892,7 +911,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
         "Refused by design (local-only)",
         &["push", "signin", "login", "signout", "logout"],
     ),
-    ("General", &["help"]),
+    ("General", &["connect", "help"]),
 ];
 
 /// Render the top-level help with commands grouped by category. clap has
@@ -1661,6 +1680,12 @@ async fn run(cmd: Cmd) -> Result<()> {
         } => search(&query.join(" "), &format, quant.as_deref(), json).await,
         Cmd::Fit { target, json } => fit(&target, json).await,
         Cmd::Storage { json } => storage_cmd(json).await,
+        Cmd::Connect {
+            client,
+            model,
+            write,
+            json,
+        } => connect_cmd(&client, model, write, json).await,
         Cmd::Prune {
             orphans,
             unused,
@@ -13681,6 +13706,439 @@ async fn prune_cmd(
     Ok(())
 }
 
+// --- blazar connect ---------------------------------------------------------
+//
+// One command per client: detect the install, show the exact configuration
+// change Blazar needs, optionally write it (backup first, roll back if the
+// live test request fails). Config shapes verified against each client's
+// current docs (2026-10): Codex user-level config.toml [model_providers.<id>]
+// with wire_api = "responses"; Claude Code ~/.claude/settings.json env block;
+// Continue config.yaml (config.json is the deprecated shape); Cline and
+// Open WebUI are configured through their own UI/env, so they get printed
+// instructions instead of a written file.
+
+const CONNECT_CLIENTS: &[&str] = &["codex", "claude", "continue", "cline", "openwebui"];
+
+/// What `connect` will do for one client.
+#[derive(Debug, Clone, PartialEq)]
+enum ConnectAction {
+    /// File absent — --write would create it with this content
+    Create(String),
+    /// File exists — --write would merge into it (JSON only; backup first)
+    Merge,
+    /// Writing would risk breaking a hand-tuned config — snippet only
+    Snippet,
+    /// The client has no writable config (UI or env vars at startup)
+    Instructions,
+}
+
+#[derive(Debug)]
+struct ConnectPlan {
+    client: &'static str,
+    display: &'static str,
+    installed: bool,
+    config_path: std::path::PathBuf,
+    action: ConnectAction,
+    /// Human instructions when action is Snippet/Instructions
+    detail: String,
+}
+
+fn codex_provider_block(base: &str) -> String {
+    format!(
+        "[model_providers.blazar]\nname = \"Blazar\"\nbase_url = \"{base}/v1\"\nenv_key = \"BLAZAR_API_KEY\"\nwire_api = \"responses\"\n"
+    )
+}
+
+fn codex_full_config(base: &str, model: &str) -> String {
+    format!(
+        "{}\nmodel_provider = \"blazar\"\nmodel = \"{model}\"\n",
+        codex_provider_block(base)
+    )
+}
+
+fn claude_settings_merge(existing: &serde_json::Value, base: &str) -> serde_json::Value {
+    let mut v = existing.clone();
+    if !v.is_object() {
+        v = serde_json::json!({});
+    }
+    let obj = v.as_object_mut().expect("just made an object");
+    let env = obj
+        .entry("env".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(e) = env.as_object_mut() {
+        e.insert("ANTHROPIC_BASE_URL".to_string(), serde_json::json!(base));
+        // Claude Code refuses to start against a custom base without some
+        // token present; Blazar ignores it entirely when keys are disabled.
+        e.entry("ANTHROPIC_AUTH_TOKEN".to_string())
+            .or_insert_with(|| serde_json::json!("blazar-local"));
+    }
+    v
+}
+
+fn continue_model_block(base: &str, model: &str) -> String {
+    format!(
+        "name: Blazar local assistant\nversion: 0.0.1\nschema: v1\nmodels:\n  - name: {model}\n    provider: openai\n    model: {model}\n    apiBase: {base}/v1\n    roles:\n      - chat\n"
+    )
+}
+
+fn connect_plan(
+    client: &str,
+    home: &std::path::Path,
+    base: &str,
+    model: &str,
+) -> Result<ConnectPlan> {
+    let read = |rel: &[&str]| {
+        let mut p = home.to_path_buf();
+        for part in rel {
+            p.push(part);
+        }
+        std::fs::read_to_string(&p).ok()
+    };
+    let exists = |rel: &[&str]| {
+        let mut p = home.to_path_buf();
+        for part in rel {
+            p.push(part);
+        }
+        p.exists()
+    };
+    let path = |rel: &[&str]| {
+        let mut p = home.to_path_buf();
+        for part in rel {
+            p.push(part);
+        }
+        p
+    };
+    match client {
+        "codex" => {
+            let dir = exists(&[".codex"]);
+            let cfg = read(&[".codex", "config.toml"]);
+            let action = if cfg.is_none() {
+                ConnectAction::Create(codex_full_config(base, model))
+            } else if cfg.as_deref().is_some_and(|c| c.contains("model_providers.blazar"))
+                || cfg.as_deref().is_some_and(|c| c.contains("model_provider ="))
+            {
+                ConnectAction::Snippet
+            } else {
+                // A config without provider selection can gain the table by
+                // append, but hand-tuned TOML deserves eyes first.
+                ConnectAction::Snippet
+            };
+            Ok(ConnectPlan {
+                client: "codex",
+                display: "Codex CLI",
+                installed: dir,
+                config_path: path(&[".codex", "config.toml"]),
+                action,
+                detail: format!(
+                    "add to ~/.codex/config.toml (then `model_provider = \"blazar\"` and `model = \"{model}\"` at the top level):\n{}",
+                    codex_provider_block(base)
+                ),
+            })
+        }
+        "claude" => {
+            let dir = exists(&[".claude"]);
+            let cfg = read(&[".claude", "settings.json"]);
+            let action = if cfg.is_none() {
+                ConnectAction::Create(
+                    serde_json::to_string_pretty(&claude_settings_merge(&serde_json::json!({}), base))
+                        .expect("serializing a plain object cannot fail")
+                        + "\n",
+                )
+            } else {
+                ConnectAction::Merge
+            };
+            Ok(ConnectPlan {
+                client: "claude",
+                display: "Claude Code",
+                installed: dir,
+                config_path: path(&[".claude", "settings.json"]),
+                action,
+                detail: format!(
+                    "merge into ~/.claude/settings.json:\n{}",
+                    serde_json::to_string_pretty(&claude_settings_merge(&serde_json::json!({}), base))
+                        .expect("serializing a plain object cannot fail")
+                ),
+            })
+        }
+        "continue" => {
+            let dir = exists(&[".continue"]);
+            let cfg = read(&[".continue", "config.yaml"]).or(read(&[".continue", "config.json"]));
+            let action = if cfg.is_none() {
+                ConnectAction::Create(continue_model_block(base, model))
+            } else {
+                // YAML has no safe mechanical merge; existing configs are
+                // usually hand-tuned (rules, context providers).
+                ConnectAction::Snippet
+            };
+            Ok(ConnectPlan {
+                client: "continue",
+                display: "Continue",
+                installed: dir,
+                config_path: path(&[".continue", "config.yaml"]),
+                action,
+                detail: format!(
+                    "merge into ~/.continue/config.yaml (config.json is the deprecated shape):\n{}",
+                    continue_model_block(base, model)
+                ),
+            })
+        }
+        "cline" => Ok(ConnectPlan {
+            client: "cline",
+            display: "Cline (VS Code)",
+            installed: exists(&[".vscode"]) || exists(&[".config", "Code"]),
+            config_path: path(&[".config", "Code", "User", "settings.json"]),
+            action: ConnectAction::Instructions,
+            detail: format!(
+                "Cline stores its API config inside the VS Code UI, not a file Blazar can safely edit:\n  1. open Cline settings → API Provider → OpenAI Compatible\n  2. base URL: {base}/v1\n  3. model: {model}\n  4. any API key value (ignored when Blazar keys are off)"
+            ),
+        }),
+        "openwebui" => {
+            let installed = exists(&[".config", "open-webui"])
+                || std::process::Command::new("docker")
+                    .arg("--version")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok();
+            Ok(ConnectPlan {
+                client: "openwebui",
+                display: "Open WebUI",
+                installed,
+                config_path: path(&[".config", "open-webui"]),
+                action: ConnectAction::Instructions,
+                detail: format!(
+                    "Open WebUI reads its backend URLs from the environment at startup:\n  OPENAI_API_BASE_URL={base}/v1\n  OLLAMA_API_BASE_URL={base}\n(restart the container/process after setting them)"
+                ),
+            })
+        }
+        other => Err(anyhow!(
+            "unknown client '{other}' — supported: {} (bare `blazar connect` lists them)",
+            CONNECT_CLIENTS.join(", ")
+        )),
+    }
+}
+
+/// Dialect-correct smoke request against the daemon, proving the exact
+/// endpoint shape the client will use.
+async fn connect_test_request(client: &str, base: &str, model: &str) -> Result<bool> {
+    let http = crate::cli_http();
+    let (url, body) = match client {
+        "codex" => (
+            format!("{base}/v1/responses"),
+            serde_json::json!({"model": model, "input": "Reply with the single word: ok", "store": false}),
+        ),
+        "claude" => (
+            format!("{base}/v1/messages"),
+            serde_json::json!({"model": model, "max_tokens": 8, "messages": [{"role": "user", "content": "Reply with the single word: ok"}]}),
+        ),
+        "cline" | "continue" => (
+            format!("{base}/v1/chat/completions"),
+            serde_json::json!({"model": model, "max_tokens": 8, "messages": [{"role": "user", "content": "Reply with the single word: ok"}]}),
+        ),
+        "openwebui" => (
+            format!("{base}/api/chat"),
+            serde_json::json!({"model": model, "stream": false, "messages": [{"role": "user", "content": "Reply with the single word: ok"}]}),
+        ),
+        _ => return Err(anyhow::anyhow!("unreachable: validated earlier")),
+    };
+    let resp = http
+        .post(&url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await;
+    Ok(matches!(resp, Ok(r) if r.status().is_success()))
+}
+
+async fn default_test_model(explicit: Option<String>) -> Result<String> {
+    if let Some(m) = explicit {
+        return Ok(m);
+    }
+    let cfg = config()?;
+    let base = daemon_base(&cfg);
+    let tags = match crate::cli_http()
+        .get(format!("{base}/api/tags"))
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.ok(),
+        _ => None,
+    };
+    let name = tags
+        .as_ref()
+        .and_then(|v| v["models"].as_array())
+        .and_then(|a| a.first())
+        .and_then(|m| {
+            m["model"]
+                .as_str()
+                .or_else(|| m["name"].as_str())
+                .map(str::to_string)
+        });
+    name.ok_or_else(|| {
+        anyhow!("no local model to test with — pass --model, or `blazar pull` one first")
+    })
+}
+
+async fn connect_cmd(client: &str, model: Option<String>, write: bool, json: bool) -> Result<()> {
+    if client.is_empty() {
+        let rows: Vec<Vec<String>> = CONNECT_CLIENTS
+            .iter()
+            .map(|c| {
+                vec![
+                    (*c).to_string(),
+                    match *c {
+                        "codex" => "~/.codex/config.toml",
+                        "claude" => "~/.claude/settings.json",
+                        "continue" => "~/.continue/config.yaml",
+                        "cline" => "VS Code UI",
+                        "openwebui" => "env at startup",
+                        _ => "?",
+                    }
+                    .to_string(),
+                ]
+            })
+            .collect();
+        println!("known clients (blazar connect <client>):");
+        print!("{}", render_table(&["CLIENT", "CONFIG"], &rows, &[]));
+        return Ok(());
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| anyhow!("cannot resolve the user home directory"))?;
+    let cfg = config()?;
+    let base = daemon_base(&cfg);
+    let model = default_test_model(model).await?;
+    let plan = connect_plan(client, &home, &base, &model)?;
+
+    let action_label = match &plan.action {
+        ConnectAction::Create(_) => "create",
+        ConnectAction::Merge => "merge (backup first)",
+        ConnectAction::Snippet => "snippet (manual merge)",
+        ConnectAction::Instructions => "instructions",
+    };
+    let mut wrote: Option<std::path::PathBuf> = None;
+    let mut backup: Option<std::path::PathBuf> = None;
+
+    if write {
+        match &plan.action {
+            ConnectAction::Create(content) => {
+                if let Some(parent) = plan.config_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&plan.config_path, content)?;
+                wrote = Some(plan.config_path.clone());
+            }
+            ConnectAction::Merge => {
+                let existing =
+                    std::fs::read_to_string(&plan.config_path).unwrap_or_else(|_| "{}".to_string());
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&existing).unwrap_or(serde_json::json!({}));
+                let bak = plan.config_path.with_extension("json.blazar-bak");
+                std::fs::write(&bak, &existing)?;
+                backup = Some(bak);
+                let merged = claude_settings_merge(&parsed, &base);
+                std::fs::write(
+                    &plan.config_path,
+                    serde_json::to_string_pretty(&merged)
+                        .expect("serializing a plain object cannot fail")
+                        + "\n",
+                )?;
+                wrote = Some(plan.config_path.clone());
+            }
+            _ => {}
+        }
+    }
+
+    // The test request proves the client's exact dialect works against this
+    // daemon; a failure after a write rolls the file back.
+    let daemon_up = crate::cli_http()
+        .get(format!("{base}/api/version"))
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+    let (test_ok, test_note) = if daemon_up {
+        (
+            connect_test_request(client, &base, &model).await?,
+            String::new(),
+        )
+    } else {
+        (
+            false,
+            "skipped — daemon not reachable (blazar serve)".to_string(),
+        )
+    };
+
+    let mut rolled_back = false;
+    if wrote.is_some() && !test_ok && daemon_up {
+        if let (Some(bak), Some(_)) = (&backup, &wrote) {
+            std::fs::copy(bak, &plan.config_path)?;
+            rolled_back = true;
+        } else if let Some(p) = &wrote {
+            std::fs::remove_file(p)?;
+            rolled_back = true;
+        }
+    }
+
+    if json {
+        let v = serde_json::json!({
+            "object": "blazar.connect",
+            "client": plan.client,
+            "display": plan.display,
+            "installed": plan.installed,
+            "config_path": plan.config_path,
+            "action": action_label,
+            "wrote": wrote.is_some(),
+            "rolled_back": rolled_back,
+            "test": if daemon_up { serde_json::json!({"ok": test_ok, "model": model}) } else { serde_json::json!({"ok": false, "skipped": true}) },
+            "detail": plan.detail,
+        });
+        println!("{v:#}");
+        return Ok(());
+    }
+
+    println!("client:      {} ({})", plan.display, plan.client);
+    println!("installed:   {}", yes_no(plan.installed));
+    println!("config:      {}", plan.config_path.display());
+    println!("action:      {action_label}");
+    if write && wrote.is_some() {
+        if rolled_back {
+            println!(
+                "{}",
+                warn_line("written, then ROLLED BACK — the test request failed")
+            );
+        } else if daemon_up && test_ok {
+            println!("{}", ok_line("written + test request PASS"));
+        } else {
+            println!("written (test {test_note})");
+        }
+    } else if !write {
+        println!("dry run — pass --write to apply");
+    }
+    if matches!(
+        plan.action,
+        ConnectAction::Snippet | ConnectAction::Instructions
+    ) || !write
+    {
+        println!();
+        for line in plan.detail.lines() {
+            println!("  {line}");
+        }
+    }
+    Ok(())
+}
+
+fn yes_no(b: bool) -> &'static str {
+    if b {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
 #[allow(clippy::too_many_lines)] // command dispatch: one arm per config subcommand
 fn config_cmd(cmd: ConfigCmd) -> Result<()> {
     match cmd {
@@ -14242,6 +14700,92 @@ mod tests {
         }));
         assert!(out.contains("unknown"));
         assert!(out.contains("(no capabilities recorded)"));
+    }
+
+    #[test]
+    fn unit__connect_builders__codex_and_continue_shapes() {
+        let toml = codex_provider_block("http://localhost:11435");
+        assert!(toml.contains("[model_providers.blazar]"));
+        assert!(toml.contains("base_url = \"http://localhost:11435/v1\""));
+        assert!(toml.contains("wire_api = \"responses\""));
+        let full = codex_full_config("http://localhost:11435", "qwen3-0.6b");
+        assert!(full.contains("model_provider = \"blazar\""));
+        assert!(full.contains("model = \"qwen3-0.6b\""));
+        let yaml = continue_model_block("http://localhost:11435", "qwen3-0.6b");
+        assert!(yaml.contains("provider: openai"));
+        assert!(yaml.contains("apiBase: http://localhost:11435/v1"));
+        assert!(yaml.contains("roles:"));
+    }
+
+    #[test]
+    fn unit__claude_settings_merge__preserves_and_defaults() {
+        let existing = serde_json::json!({
+            "permissions": {"allow": ["Bash"]},
+            "env": {"ANTHROPIC_LOG": "debug"}
+        });
+        let merged = claude_settings_merge(&existing, "http://localhost:11435");
+        assert_eq!(merged["permissions"]["allow"][0], "Bash");
+        assert_eq!(merged["env"]["ANTHROPIC_LOG"], "debug");
+        assert_eq!(
+            merged["env"]["ANTHROPIC_BASE_URL"],
+            "http://localhost:11435"
+        );
+        assert_eq!(merged["env"]["ANTHROPIC_AUTH_TOKEN"], "blazar-local");
+        // An explicit token is never overwritten.
+        let custom = claude_settings_merge(
+            &serde_json::json!({"env": {"ANTHROPIC_AUTH_TOKEN": "sk-real"}}),
+            "http://localhost:11435",
+        );
+        assert_eq!(custom["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-real");
+        // A non-object file degrades to a fresh object rather than failing.
+        let fresh = claude_settings_merge(&serde_json::json!("junk"), "http://x");
+        assert_eq!(fresh["env"]["ANTHROPIC_BASE_URL"], "http://x");
+    }
+
+    #[test]
+    fn unit__connect_plan__actions_and_unknown_client() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let base = "http://localhost:11435";
+        // codex: absent config → Create with the full TOML.
+        let plan = connect_plan("codex", home.path(), base, "m1").expect("plan");
+        assert_eq!(plan.client, "codex");
+        assert!(!plan.installed);
+        assert!(matches!(plan.action, ConnectAction::Create(_)));
+        // codex: existing config with a provider already pinned → Snippet.
+        std::fs::create_dir_all(home.path().join(".codex")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".codex/config.toml"),
+            "model_provider = \"openai\"\n",
+        )
+        .expect("write");
+        let plan = connect_plan("codex", home.path(), base, "m1").expect("plan");
+        assert!(plan.installed);
+        assert_eq!(plan.action, ConnectAction::Snippet);
+        // claude: existing settings.json → Merge; detail stays a JSON snippet.
+        std::fs::create_dir_all(home.path().join(".claude")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".claude/settings.json"),
+            "{\"model\": \"sonnet\"}\n",
+        )
+        .expect("write");
+        let plan = connect_plan("claude", home.path(), base, "m1").expect("plan");
+        assert_eq!(plan.action, ConnectAction::Merge);
+        // continue: hand-tuned YAML → Snippet, never a blind merge.
+        std::fs::create_dir_all(home.path().join(".continue")).expect("mkdir");
+        std::fs::write(home.path().join(".continue/config.yaml"), "name: mine\n").expect("write");
+        let plan = connect_plan("continue", home.path(), base, "m1").expect("plan");
+        assert_eq!(plan.action, ConnectAction::Snippet);
+        // cline/openwebui are instructions-only.
+        let plan = connect_plan("cline", home.path(), base, "m1").expect("plan");
+        assert_eq!(plan.action, ConnectAction::Instructions);
+        let plan = connect_plan("openwebui", home.path(), base, "m1").expect("plan");
+        assert_eq!(plan.action, ConnectAction::Instructions);
+        // Unknown client teaches the list.
+        let err = connect_plan("vscode", home.path(), base, "m1").expect_err("teaches");
+        assert!(err.to_string().contains("unknown client 'vscode'"));
+        assert!(err
+            .to_string()
+            .contains("codex, claude, continue, cline, openwebui"));
     }
 
     /// Minimal model row for lora-attach admission tests: only `path`

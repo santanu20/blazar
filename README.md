@@ -353,6 +353,11 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 
 Blazar is designed to be introduced **without rewriting application code**.
 
+One-command integration: `blazar connect codex` (also `claude`, `continue`,
+`cline`, `openwebui`) detects the install, prints the exact config change,
+and with `--write` applies it — backing up first and rolling back if the
+test request against the live daemon fails.
+
 ### OpenAI-compatible clients
 
 Base URL:
