@@ -1461,6 +1461,97 @@ pub async fn jobs_cancel(
 /// cache/LoRA menu. Read-only: boots nothing; no live child teaches
 /// instead. `?model=` narrows to that family's child — on a multi-family
 /// box the first live child is otherwise an arbitrary pick (audit MM3).
+/// POST /v1/images/upscale — standalone ESRGAN upscale over HTTP
+/// (upstream PR2026, sd-server master-929+). Sync, no diffusion model
+/// load, no job machinery: upscaler weights come from the engine's
+/// `--hires-upscalers-dir`. Serves from a live diffusion child; pass
+/// `?model=NAME` to boot one on demand.
+pub async fn upscale(
+    State(state): State<Arc<AppState>>,
+    key_ext: Option<axum::Extension<crate::keys::KeyCtx>>,
+    Query(params): Query<JobQuery>,
+    body: Bytes,
+) -> Response {
+    let parsed: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return openai_error(400, &format!("invalid JSON: {e}")),
+    };
+    if parsed
+        .get("image")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return openai_error(
+            400,
+            "\"image\" is required (base64 or data-URL of the image to upscale)",
+        );
+    }
+    // Admission rides a synthetic model label: no model row is loaded,
+    // but rate/key gates must still see the request.
+    if let Err(resp) = state.admit_or_respond(key_ext.as_ref(), "upscale") {
+        return *resp;
+    }
+    // Route gate: the standalone endpoint shipped in master-929; on an
+    // older engine the child would answer a confusing 404 — teach
+    // instead. Unparseable/missing manifests forward (the child speaks).
+    let too_old = state
+        .with_store(|s| {
+            s.list_engines()
+                .ok()
+                .and_then(|rows| {
+                    rows.into_iter()
+                        .find(|r| r.kind == blazar_core::engine_kind::EngineKind::SdCpp && r.active)
+                        .and_then(|r| {
+                            serde_json::from_str::<blazar_runtime::Manifest>(&r.manifest).ok()
+                        })
+                })
+                .is_some_and(|m| m.build_number < 929)
+        })
+        .unwrap_or(false);
+    if too_old {
+        return openai_error(
+            400,
+            "upscale needs sd-server build \u{2265} 929 (standalone /sdcpp/v1/upscale shipped in \
+             master-929) \u{2014} run: blazar engine update",
+        );
+    }
+    let children = live_sdcpp_children(&state, params.model.as_deref());
+    let (engine, load_ms) = if let Some(engine) = children.first() {
+        (engine.clone(), 0)
+    } else if let Some(model) = params.model.as_deref() {
+        match ensure_with_admission(
+            &state,
+            model,
+            Priority::Normal,
+            WorkClass::Interactive,
+            None,
+            false, // no mmproj lane
+            true,  // component sets are the diffusion lane's cargo
+            false,
+        )
+        .await
+        {
+            Ok(ok) => ok,
+            Err(resp) => return *resp,
+        }
+    } else {
+        return openai_error(
+            400,
+            "no live diffusion child \u{2014} POST /v1/images/generations boots one, or pass \
+             ?model=NAME to boot a family's child (the upscaler itself needs no model load)",
+        );
+    };
+    forward_images(
+        &state,
+        &engine,
+        "/sdcpp/v1/upscale",
+        Some("application/json"),
+        &body,
+        load_ms,
+    )
+    .await
+}
+
 pub async fn capabilities(
     State(state): State<Arc<AppState>>,
     Query(params): Query<JobQuery>,

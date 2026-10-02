@@ -325,6 +325,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/audio/capabilities", get(whisper::audio_capabilities))
         .route("/v1/images/generations", post(images::generations))
         .route("/v1/images/edits", post(images::edits))
+        .route("/v1/images/upscale", post(images::upscale))
         .route("/v1/images/jobs/{id}", get(images::jobs_get))
         .route("/v1/images/jobs/{id}/cancel", post(images::jobs_cancel))
         .route("/v1/images/capabilities", get(images::capabilities))

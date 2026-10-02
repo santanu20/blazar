@@ -19,8 +19,11 @@ use blazar_core::BlazarDirs;
 /// Verified live 2026-09-07: release ships `whisper-bin-*` assets and no
 /// macOS server binary (only an xcframework library zip).
 pub const WHISPER_REPO: &str = "ggml-org/whisper.cpp";
-/// Verified live 2026-09-07: anonymous-accessible, legacy `ggml-*.bin`
-/// files (the ggml-org/whisper-* repos 401 anonymously).
+/// Hugging Face model repo hosting the legacy `ggml-*.bin` files. This HF
+/// repo did NOT move with the 2026 GitHub org migration — the engine source
+/// lives at ggml-org/whisper.cpp on GitHub, but on HF the ggml-org/whisper*
+/// repos 401 anonymously (verified live 2026-10-03: ggerganov serves the
+/// ggml-*.bin files, ggml-org/whisper.cpp does not exist on HF).
 pub const WHISPER_MODEL_REPO: &str = "ggerganov/whisper.cpp";
 
 /// Deterministic default-model preference when the request does not name
@@ -48,6 +51,14 @@ pub fn models_dir(dirs: &BlazarDirs) -> PathBuf {
 /// Absent (or a plain `--install`) means "track the newest tag".
 fn pin_path(dirs: &BlazarDirs) -> PathBuf {
     bin_root(dirs).join("pin")
+}
+
+/// Pin-file location from the bare data dir — engine-removal
+/// reconciliation (`engine rm` of a pinned tag) runs from the removal
+/// site, which owns the data dir but not a full BlazarDirs.
+#[must_use]
+pub fn pin_path_in(data_dir: &Path) -> PathBuf {
+    data_dir.join("whisper").join("bin").join("pin")
 }
 
 /// Pinned tag from `bin/pin`, trimmed. `None` when unset, empty, or when
@@ -383,6 +394,11 @@ pub fn set_pin(dirs: &BlazarDirs, tag: Option<&str>) -> Result<()> {
                     known.join(", ")
                 );
             }
+            // The pin dir exists on legacy-lane installs but not on a
+            // fresh engines-lane install — mkdir before the write so
+            // `whisper --pin` never fails on a missing parent.
+            std::fs::create_dir_all(bin_root(dirs))
+                .with_context(|| format!("mkdir {}", bin_root(dirs).display()))?;
             std::fs::write(pin_path(dirs), format!("{t}\n"))
                 .with_context(|| format!("write pin {}", pin_path(dirs).display()))?;
         }
@@ -488,7 +504,7 @@ pub fn list_models(dirs: &BlazarDirs) -> Vec<String> {
     out
 }
 
-/// One ggml model in the upstream index (`ggerganov/whisper.cpp`),
+/// One ggml model in the upstream index (`ggml-org/whisper.cpp`,
 /// with its on-disk byte size — the searchable remote catalog behind
 /// `whisper --search`.
 #[derive(Debug, Clone)]
@@ -788,6 +804,7 @@ impl WhisperRuntime {
         bin: &Path,
         lib_dir: &Path,
         ready_timeout: std::time::Duration,
+        vad_model: Option<&Path>,
     ) -> Result<u16> {
         let mut slot = self.child.lock().await;
         if let Some(live) = slot.as_mut() {
@@ -831,7 +848,7 @@ impl WhisperRuntime {
         let port = ephemeral_port()?;
         let mut std_cmd = std::process::Command::new(bin);
         std_cmd
-            .args(server_args(port, model_path))
+            .args(server_args(port, model_path, vad_model))
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         #[cfg(unix)]
@@ -950,17 +967,25 @@ fn ephemeral_port() -> Result<u16> {
 }
 
 /// Child argv: loopback bind is a security invariant (upstream has no
-/// auth flag — see `WhisperRuntime` doc); pinned by unit test.
-fn server_args(port: u16, model_path: &Path) -> Vec<String> {
+/// auth flag — see `WhisperRuntime` doc); pinned by unit test. VAD
+/// (PR4083 era) is argv-level: `--vad --vad-model <ggml>` skips
+/// silence/noise segments before decode. None = upstream default.
+fn server_args(port: u16, model_path: &Path, vad_model: Option<&Path>) -> Vec<String> {
     let model_arg = argv_model_path(model_path);
-    vec![
-        "--host".into(),
-        "127.0.0.1".into(),
-        "--port".into(),
+    let mut args = vec![
+        "--host".to_string(),
+        "127.0.0.1".to_string(),
+        "--port".to_string(),
         port.to_string(),
-        "--model".into(),
+        "--model".to_string(),
         model_arg.display().to_string(),
-    ]
+    ];
+    if let Some(vad) = vad_model {
+        args.push("--vad".into());
+        args.push("--vad-model".into());
+        args.push(vad.display().to_string());
+    }
+    args
 }
 
 #[cfg(test)]
@@ -1041,7 +1066,7 @@ mod tests {
 
     #[test]
     fn unit__server_args__loopback_bind_is_pinned() {
-        let args = server_args(49199, Path::new("/data/whisper/models/ggml-base.bin"));
+        let args = server_args(49199, Path::new("/data/whisper/models/ggml-base.bin"), None);
         assert_eq!(
             args,
             vec![
@@ -1053,6 +1078,21 @@ mod tests {
                 "/data/whisper/models/ggml-base.bin".to_string(),
             ],
             "whisper-server has no auth flag upstream; loopback bind is the isolation boundary — never widen to 0.0.0.0"
+        );
+    }
+
+    #[test]
+    fn unit__server_args__vad_appends_after_model() {
+        let args = server_args(
+            49199,
+            Path::new("/data/whisper/models/ggml-base.bin"),
+            Some(Path::new("/engines/b5130/silero-vad-v5.ggml")),
+        );
+        let tail: Vec<&str> = args[6..].iter().map(String::as_str).collect();
+        assert_eq!(
+            tail,
+            vec!["--vad", "--vad-model", "/engines/b5130/silero-vad-v5.ggml"],
+            "VAD rides argv as --vad --vad-model after the base args; absent model = no VAD flags"
         );
     }
 

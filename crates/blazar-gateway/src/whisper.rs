@@ -302,6 +302,41 @@ async fn inference_post(
     Ok((status, ct, bytes))
 }
 
+/// Resolve the configured `whisper_vad_model` to a spawn-ready path:
+/// a bare name is looked up beside the whisper-server binary (the
+/// engine dir ships `silero-vad ggml` files there), anything else is
+/// taken as a user-owned path. A configured model that cannot be
+/// resolved is a teaching error — VAD is an explicit user intent, and
+/// silently booting without it would hide the miss.
+fn resolve_vad_model(
+    state: &AppState,
+    bin: &std::path::Path,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let Some(name) = state.config.whisper_vad_model.as_deref() else {
+        return Ok(None);
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let candidate = if name.contains(std::path::is_separator) {
+        std::path::PathBuf::from(name)
+    } else {
+        bin.parent()
+            .map_or_else(|| std::path::PathBuf::from(name), |dir| dir.join(name))
+    };
+    if candidate.is_file() {
+        Ok(Some(candidate))
+    } else {
+        Err(format!(
+            "whisper_vad_model '{name}' not found (looked at {}) — place the \
+             Silero VAD ggml in the whisper engine dir or give an absolute path; \
+             unset the knob to boot without VAD",
+            candidate.display()
+        ))
+    }
+}
+
 /// Local lane transport: ensure the lazy child (hot model swap on size
 /// change), forward the multipart fields whisper-server understands,
 /// and return the raw upstream triple. Shared by the sync path and the
@@ -319,6 +354,10 @@ async fn forward_local_raw(
     let Some(model_path) = whisper::model_file(&state.dirs, size) else {
         return Err((500, format!("whisper model ggml-{size}.bin vanished")));
     };
+    let vad_model = match resolve_vad_model(state, bin) {
+        Ok(v) => v,
+        Err(msg) => return Err((400, msg)),
+    };
     let port = match state
         .whisper
         .ensure(
@@ -327,6 +366,7 @@ async fn forward_local_raw(
             bin,
             lib_dir,
             std::time::Duration::from_mins(2),
+            vad_model.as_deref(),
         )
         .await
     {
@@ -676,6 +716,14 @@ async fn forward_local_stream(
     tokio::spawn(async move {
         // Cold child boot can take its whole ready timeout — that failure
         // and every later one surface as `error` events, never silence.
+        let vad_model = match resolve_vad_model(&task_state, &bin) {
+            Ok(v) => v,
+            Err(msg) => {
+                let frame = sse_frame("error", &serde_json::json!({"message": msg}));
+                let _ = tx.send(frame).await;
+                return;
+            }
+        };
         let port = match task_state
             .whisper
             .ensure(
@@ -684,6 +732,7 @@ async fn forward_local_stream(
                 &bin,
                 &lib_dir,
                 std::time::Duration::from_mins(2),
+                vad_model.as_deref(),
             )
             .await
         {
