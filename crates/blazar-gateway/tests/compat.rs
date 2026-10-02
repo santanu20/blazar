@@ -445,6 +445,7 @@ async fn client__well_known__capability_discovery() {
         "/props",
         "/v1/stream",
         "/v1/chat/completions/input_tokens",
+        "/v1/systemone",
     ] {
         assert!(openai_eps.contains(&path), "census missing {path}");
     }

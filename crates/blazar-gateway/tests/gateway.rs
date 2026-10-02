@@ -425,6 +425,63 @@ async fn e2e__n_choices_out_of_range_fails_fast_unbilled() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn e2e__systemone_is_llamacpp_only_and_teaches_on_other_lanes() {
+    // TypeSafe System One is a llama-server child surface; with a non-llamacpp
+    // lane active the gate must teach (naming the kind), and with llamacpp
+    // active the gate stays silent (any later error must not carry the
+    // teaching) — mirrors the /props gate pin.
+    let ts = start(Config::default()).await;
+    let c = client();
+    let body = serde_json::json!({
+        "state": "The build is green and tests pass.",
+        "questions": { "ship": { "type": "choice", "instructions": "Decide.",
+            "criteria": { "yes": "Ship it.", "no": "Hold." } } }
+    });
+
+    let r = c
+        .post(format!("{}/v1/systemone", ts.base))
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let text = r.text().await.unwrap();
+    assert!(
+        !text.contains("llama-server-only"),
+        "llamacpp must pass the gate: {text}"
+    );
+
+    ts.state
+        .with_store(|s| {
+            s.upsert_engine(&blazar_core::EngineRow {
+                tag: "sglang-t".into(),
+                asset: "stub".into(),
+                sha256: "flip".into(),
+                installed_at: 2,
+                active: true,
+                manifest: "{}".into(),
+                kind: blazar_core::engine_kind::EngineKind::Sglang,
+            })
+            .unwrap();
+            s.set_active_engine("sglang-t").unwrap();
+        })
+        .unwrap();
+    let r = c
+        .post(format!("{}/v1/systemone", ts.base))
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let v: serde_json::Value = r.json().await.unwrap();
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("llama-server-only") && msg.contains("sglang"),
+        "sglang systemone teaching: {msg}"
+    );
+}
+
 async fn e2e__n_choices_lane_ceiling_teaches_before_the_engine_can() {
     // The plane-wide range admits n=3, but the llamacpp lane (the stub)
     // serves at most 2. The gateway must 400 in its own voice before

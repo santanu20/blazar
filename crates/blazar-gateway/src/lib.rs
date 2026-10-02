@@ -345,6 +345,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(openai::openai_proxy),
         )
         .route("/v1/responses/input_tokens", post(openai::openai_proxy))
+        .route("/v1/systemone", post(openai::openai_proxy))
         .route("/responses/input_tokens", post(openai::openai_proxy))
         .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
         .route("/tokenize", post(openai::openai_proxy))
@@ -857,6 +858,7 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
                        "/v1/responses", "/v1/responses/{id}", "/v1/conversations/{id}",
                        "/v1/responses/input_tokens",
                        "/v1/messages", "/v1/messages/count_tokens", "/v1/models",
+                       "/v1/systemone",
                        "/v1/adapters", "/v1/batches", "/v1/batches/{id}",
                        "/v1/batches/{id}/cancel", "/v1/files", "/v1/files/{id}",
                        "/v1/files/{id}/content", "/v1/streams/lookup", "/v1/stream",

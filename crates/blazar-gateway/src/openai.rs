@@ -849,6 +849,7 @@ const LLAMACPP_ONLY_PATHS: &[&str] = &[
     "/infill",
     "/v1/chat/completions/control",
     "/v1/chat/completions/input_tokens",
+    "/v1/systemone",
     "/v1/responses/input_tokens",
     "/responses/input_tokens",
     "/v1/rerank",
