@@ -498,6 +498,6 @@ mod tests {
         let empty = filter_remotes(&remotes, Some(&[])).expect_err("empty list teaches");
         assert!(empty.contains("peers list is empty"), "{empty}");
         let none_cfg = filter_remotes(&[], None).expect("no remotes selects nothing");
-        assert!(none_cfg.is_empty());
+        assert!(none_cfg.is_empty(), "no remotes must select nothing");
     }
 }
