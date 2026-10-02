@@ -373,8 +373,8 @@ mod tests {
         // branches honestly: gate on a path that cannot resolve to a mount.
         let gated = gate_disk(&dd, u64::MAX, "probe-model");
         // On Linux tmpfs IS a mount with finite space, so this must refuse.
-        if gated.is_err() {
-            let msg = gated.unwrap_err().to_string();
+        if let Err(e) = gated {
+            let msg = e.to_string();
             assert!(msg.contains("not enough disk"), "{msg}");
             assert!(msg.contains("blazar prune"), "{msg}");
         }

@@ -530,6 +530,7 @@ fn stub_knob_text(state: &AppState, messages: &[ChatMessage]) -> String {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn chat_completions(
     State(state): State<AppState>,
     axum::Json(req): axum::Json<ChatRequest>,

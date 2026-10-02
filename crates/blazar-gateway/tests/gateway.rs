@@ -1381,6 +1381,8 @@ async fn e2e__responses_chaining_and_store() {
     ts.state.sup.shutdown_all().await.unwrap();
 }
 #[tokio::test]
+#[allow(non_snake_case)]
+#[allow(clippy::too_many_lines)]
 async fn e2e__responses__background_conversations_and_cloud_tools() {
     let ts = start(Config::default()).await;
     let c = client();
@@ -1425,14 +1427,11 @@ async fn e2e__responses__background_conversations_and_cloud_tools() {
             .json()
             .await
             .unwrap();
-        match r["status"].as_str() {
-            Some("queued") | Some("in_progress") => {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await
-            }
-            _ => {
-                final_body = r;
-                break;
-            }
+        if matches!(r["status"].as_str(), Some("queued" | "in_progress")) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        } else {
+            final_body = r;
+            break;
         }
     }
     assert_eq!(
@@ -2006,7 +2005,7 @@ async fn e2e__audio_jobs__unknown_404_and_invalid_id_400() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
-    let _resp = c
+    let resp = c
         .post(format!("{}/v1/audio/jobs/..%2Fetc/cancel", ts.base))
         .send()
         .await

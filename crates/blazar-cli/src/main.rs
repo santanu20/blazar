@@ -13781,6 +13781,7 @@ fn continue_model_block(base: &str, model: &str) -> String {
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn connect_plan(
     client: &str,
     home: &std::path::Path,
@@ -13980,6 +13981,7 @@ async fn default_test_model(explicit: Option<String>) -> Result<String> {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 async fn connect_cmd(client: &str, model: Option<String>, write: bool, json: bool) -> Result<()> {
     if client.is_empty() {
         let rows: Vec<Vec<String>> = CONNECT_CLIENTS
@@ -14018,7 +14020,7 @@ async fn connect_cmd(client: &str, model: Option<String>, write: bool, json: boo
         ConnectAction::Snippet => "snippet (manual merge)",
         ConnectAction::Instructions => "instructions",
     };
-    let mut wrote: Option<std::path::PathBuf> = None;
+    let mut wrote_path: Option<std::path::PathBuf> = None;
     let mut backup: Option<std::path::PathBuf> = None;
 
     if write {
@@ -14028,7 +14030,7 @@ async fn connect_cmd(client: &str, model: Option<String>, write: bool, json: boo
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::write(&plan.config_path, content)?;
-                wrote = Some(plan.config_path.clone());
+                wrote_path = Some(plan.config_path.clone());
             }
             ConnectAction::Merge => {
                 let existing =
@@ -14045,7 +14047,7 @@ async fn connect_cmd(client: &str, model: Option<String>, write: bool, json: boo
                         .expect("serializing a plain object cannot fail")
                         + "\n",
                 )?;
-                wrote = Some(plan.config_path.clone());
+                wrote_path = Some(plan.config_path.clone());
             }
             _ => {}
         }
@@ -14058,8 +14060,7 @@ async fn connect_cmd(client: &str, model: Option<String>, write: bool, json: boo
         .timeout(std::time::Duration::from_secs(2))
         .send()
         .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
+        .is_ok_and(|r| r.status().is_success());
     let (test_ok, test_note) = if daemon_up {
         (
             connect_test_request(client, &base, &model).await?,
@@ -14073,11 +14074,11 @@ async fn connect_cmd(client: &str, model: Option<String>, write: bool, json: boo
     };
 
     let mut rolled_back = false;
-    if wrote.is_some() && !test_ok && daemon_up {
-        if let (Some(bak), Some(_)) = (&backup, &wrote) {
+    if wrote_path.is_some() && !test_ok && daemon_up {
+        if let (Some(bak), Some(_)) = (&backup, &wrote_path) {
             std::fs::copy(bak, &plan.config_path)?;
             rolled_back = true;
-        } else if let Some(p) = &wrote {
+        } else if let Some(p) = &wrote_path {
             std::fs::remove_file(p)?;
             rolled_back = true;
         }
@@ -14091,7 +14092,7 @@ async fn connect_cmd(client: &str, model: Option<String>, write: bool, json: boo
             "installed": plan.installed,
             "config_path": plan.config_path,
             "action": action_label,
-            "wrote": wrote.is_some(),
+            "wrote": wrote_path.is_some(),
             "rolled_back": rolled_back,
             "test": if daemon_up { serde_json::json!({"ok": test_ok, "model": model}) } else { serde_json::json!({"ok": false, "skipped": true}) },
             "detail": plan.detail,
@@ -14104,7 +14105,7 @@ async fn connect_cmd(client: &str, model: Option<String>, write: bool, json: boo
     println!("installed:   {}", yes_no(plan.installed));
     println!("config:      {}", plan.config_path.display());
     println!("action:      {action_label}");
-    if write && wrote.is_some() {
+    if write && wrote_path.is_some() {
         if rolled_back {
             println!(
                 "{}",

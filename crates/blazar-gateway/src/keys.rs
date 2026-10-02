@@ -650,7 +650,7 @@ pub fn sniff_usage(tail: &[u8]) -> u64 {
 }
 
 /// (prompt, completion) split of the usage tail — each side uses the
-/// first dialect that appears (OpenAI, Responses, ollama NDJSON).
+/// first dialect that appears (`OpenAI`, Responses, ollama NDJSON).
 /// Pure; unit-pinned alongside `scaled_total`.
 #[must_use]
 pub fn sniff_usage_parts(tail: &[u8]) -> (Option<u64>, Option<u64>) {
