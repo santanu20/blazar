@@ -1025,6 +1025,21 @@ fn main() {
     } else {
         None
     };
+    // Interactive commands keep the styled UX readable: runtime/core INFO
+    // lines carry RFC3339 timestamps that stomp progress bars mid-download.
+    // Only the no-explicit-choice TTY case demotes them — a config-file
+    // log_level, RUST_LOG, or the serve path (journal + daemon.log) all
+    // keep the full INFO stream.
+    let log_level = match log_level {
+        Some(explicit) => Some(explicit),
+        None if !matches!(cli.cmd, Cmd::Serve)
+            && std::env::var_os("RUST_LOG").is_none()
+            && std::io::IsTerminal::is_terminal(&mut std::io::stderr()) =>
+        {
+            Some("blazar_runtime=warn,blazar_core=warn".to_string())
+        }
+        None => None,
+    };
     blazar_core::telemetry::init_tracing(0, log_level.as_deref(), log_file.as_deref());
     if let Err(e) = run(cli.cmd) {
         eprintln!("{} {e:#}", ansi("1;31", "blazar:"));
@@ -1909,6 +1924,17 @@ impl Check {
             detail: detail.into(),
         }
     }
+    /// Rename a check: the shared live currency probes are constructed
+    /// under a generic name and tagged per-kind by their listing caller.
+    fn retag(mut self, name: &'static str) -> Self {
+        self.name = name;
+        self
+    }
+    /// Rewrite the detail (the listing caller prefixes inventory context).
+    fn map_detail(mut self, f: impl FnOnce(String) -> String) -> Self {
+        self.detail = f(self.detail);
+        self
+    }
     fn status_word(&self) -> &'static str {
         if !self.ok {
             "fail"
@@ -2462,13 +2488,11 @@ async fn doctor(flat: bool, json: bool) -> Result<()> {
     }
 
     checks.extend(doctor_engine(&d).await);
-    // Non-active installed lanes get the same live upstream probe — the
-    // active-lane rows above only cover one kind.
     let active_kind = blazar_core::Store::open(&d)
         .ok()
         .and_then(|s| s.active_engine().ok().flatten())
         .map(|r| r.kind);
-    checks.extend(doctor_lane_currency(&d, active_kind).await);
+    checks.extend(doctor_engine_versions(&d, active_kind).await);
     checks.extend(doctor_gpu(&d).await);
     checks.extend(doctor_engines(&d));
     checks.extend(doctor_routing(&d));
@@ -2710,12 +2734,21 @@ fn doctor_group(name: &str) -> &'static str {
         "hardware" | "gpu driver" | "gpu vram" | "gpu fit" | "gpu arch match" => "GPU",
         "engine"
         | "engine binary"
-        | "engine currency"
+        | "engine backend"
+        | "engine devices"
         | "cuda channel"
         | "cuda toolchain"
         | "inventory llamacpp"
         | "inventory mistralrs"
         | "inventory sglang"
+        | "inventory sdcpp"
+        | "inventory whisper"
+        | "inventory mlx"
+        | "versions llamacpp"
+        | "versions mistralrs"
+        | "versions sglang"
+        | "versions sdcpp"
+        | "versions mlx"
         | "engine retention"
         | "whisper lane"
         | "whisper currency"
@@ -3078,6 +3111,7 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
         ("sglang", "inventory sglang"),
         ("sdcpp", "inventory sdcpp"),
         ("whisper", "inventory whisper"),
+        ("mlx", "inventory mlx"),
     ] {
         let rows: Vec<&blazar_core::store::EngineRow> =
             engines.iter().filter(|e| e.kind.as_str() == kind).collect();
@@ -3595,6 +3629,12 @@ mod doctor_tests {
     fn unit__doctor_group__known_names_map_and_order_is_stable() {
         assert_eq!(doctor_group("engine"), "ENGINES");
         assert_eq!(doctor_group("inventory sglang"), "ENGINES");
+        assert_eq!(doctor_group("inventory mlx"), "ENGINES");
+        assert_eq!(doctor_group("inventory whisper"), "ENGINES");
+        assert_eq!(doctor_group("versions llamacpp"), "ENGINES");
+        assert_eq!(doctor_group("versions mlx"), "ENGINES");
+        assert_eq!(doctor_group("engine backend"), "ENGINES");
+        assert_eq!(doctor_group("engine devices"), "ENGINES");
         assert_eq!(doctor_group("gpu fit"), "GPU");
         assert_eq!(doctor_group("hardware"), "GPU");
         assert_eq!(doctor_group("model types"), "MODELS");
@@ -3606,6 +3646,33 @@ mod doctor_tests {
         assert_eq!(
             GROUPS,
             ["SYSTEM", "GPU", "ENGINES", "MODELS", "CHANNELS", "RUNTIME"]
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__versions_extras__older_count_and_active_mark_compose() {
+        let row = |active: bool| blazar_core::store::EngineRow {
+            tag: "b1".into(),
+            asset: "asset".into(),
+            sha256: "x".into(),
+            installed_at: 1,
+            active,
+            manifest: "{}".into(),
+            kind: blazar_core::engine_kind::EngineKind::LlamaCpp,
+        };
+        // Single non-active row: no inventory context to add.
+        assert_eq!(versions_extras(&row(false), 1), "");
+        // Retained rollback rows + the active mark, space-joined.
+        assert_eq!(versions_extras(&row(true), 3), "(+2 older) [active]");
+        assert_eq!(versions_extras(&row(false), 2), "(+1 older)");
+        assert_eq!(versions_extras(&row(true), 1), "[active]");
+        // The listing prefix rides in front of the currency detail only
+        // when there is something to say.
+        assert_eq!(with_extras("", "up to date (b1)"), "up to date (b1)");
+        assert_eq!(
+            with_extras("(+1 older) [active]", "up to date (b1)"),
+            "(+1 older) [active] — up to date (b1)"
         );
     }
 
@@ -4154,56 +4221,11 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
             icd,
         ));
     }
-    // Engine currency: prefer reconciling the daemon's last upstream
-    // survey against the CURRENT active engine — the marker's own
-    // verdict went stale the moment `engine update`/`use`/`rollback`
-    // flipped the store between daily ticks. Marker missing or >48h
-    // old (daemon never surveyed / long offline): probe upstream live,
-    // same bounded-retry warn-only shape as the whisper/app currency rows.
-    // The daily survey tracks llama.cpp only — a mistral.rs-active box
-    // gets its own live mistral.rs check instead.
-    if active_kind == Some(EngineKind::MistralRs) {
-        if let Some(active) = active_tag.as_deref() {
-            checks.push(live_mistralrs_currency(active).await);
-        }
-        return checks;
-    }
-    // Non-llamacpp active lanes have no b-tag channel to survey against:
-    // teach the lane's own refresh command instead of keying the llama.cpp
-    // channel checks (currency, CUDA-asset hint) on a foreign tag/asset.
-    // (validate.py's llamacpp channel survey skips the same way when the
-    // active engine is not llamacpp.)
-    match active_kind {
-        Some(EngineKind::Sglang) => {
-            let active = active_tag.unwrap_or_else(|| "?".into());
-            checks.push(live_sglang_currency(&active).await);
-            return checks;
-        }
-        Some(EngineKind::Mlx) => {
-            let active = active_tag.unwrap_or_else(|| "?".into());
-            checks.push(live_mlx_currency(&active).await);
-            return checks;
-        }
-        Some(EngineKind::SdCpp) => {
-            let active = active_tag.as_deref().unwrap_or("?");
-            checks.push(live_sdcpp_currency(active).await);
-            return checks;
-        }
-        Some(EngineKind::Whisper) => {
-            let active = active_tag.as_deref().unwrap_or("?");
-            checks.push(Check::ok(
-                "engine currency",
-                format!(
-                    "{active} (whisper prebuilt lane, lazy audio serving) — update with: \
-                     blazar engine update --kind whisper"
-                ),
-            ));
-            return checks;
-        }
-        _ => {}
-    }
-    let mut currency: Option<Check> = None;
-    let mut marker_usable = false;
+    // Enumeration drift from the daemon's reconcile marker: install-time
+    // probe names the serving child can no longer see (spawns auto-remap,
+    // but the user should know the probe view is stale). The marker's
+    // currency verdict moved to `doctor_engine_versions` — only the
+    // device census is consumed here.
     // A marker is only trustworthy for the CURRENT channel: one written by a
     // pre-channel daemon (no "channel" key) or under a different channel
     // reports the other channel's target — reconciling it after a switch
@@ -4211,22 +4233,15 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
     let cfg_channel = blazar_core::Config::load(d)
         .map(|c| c.update_channel)
         .unwrap_or_default();
-    // Lane-aware update hint: the active engine's asset decides which
-    // command can actually refresh it (source builds vs prebuilt lanes).
-    let active_asset = active_engine_asset(d, active_tag.as_deref());
     if let Ok(raw) = std::fs::read_to_string(d.run_dir().join("engine-check.json")) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |n| n.as_secs());
-            marker_usable = now.saturating_sub(v["checked_at"].as_u64().unwrap_or(0)) <= 2 * 86_400
+            let marker_usable = now.saturating_sub(v["checked_at"].as_u64().unwrap_or(0))
+                <= 2 * 86_400
                 && marker_channel_matches(&v, cfg_channel);
             if marker_usable {
-                currency = currency_verdict(active_tag.as_deref(), &v, now, &active_asset);
-                // Enumeration drift: install-time probe names the serving
-                // child can no longer see (the daemon's spawn context is
-                // the authority — spawns auto-remap, but the user should
-                // know the probe view is stale).
                 if let Some(live) = census_names(&v) {
                     let drift = device_drift(&frozen_gpu_names, &live);
                     if !drift.is_empty() {
@@ -4244,27 +4259,16 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
             }
         }
     }
-    if currency.is_none() && !marker_usable {
-        if let Some(active) = active_tag.as_deref() {
-            if active == blazar_runtime::LOCAL_TAG {
-                currency = Some(Check::ok(
-                    "engine currency",
-                    "local build — upstream currency not tracked",
-                ));
-            } else {
-                currency = Some(live_engine_currency(active, &active_asset).await);
-            }
-        }
-    }
-    if let Some(c) = currency {
-        checks.push(c);
-    }
     // CUDA-channel hint: an NVIDIA box serving the Vulkan asset is
     // leaving the measured ~4% Vulkan delta on the table. The channel
     // is zero-touch (upstream official CUDA assets, probed
-    // automatically at every `engine update`) — this row only tells
-    // the user the lane exists and where its assets come from.
-    if std::env::consts::OS == "linux"
+    // automatically at every `engine update`) — this row only tells the
+    // user the lane exists and where its assets come from. Keyed on the
+    // llama.cpp lane's tag/asset: non-llamacpp actives have no b-tag
+    // channel to key on (their kinds' rows live in
+    // `doctor_engine_versions`).
+    if (active_kind.is_none() || matches!(active_kind, Some(EngineKind::LlamaCpp)))
+        && std::env::consts::OS == "linux"
         && std::env::consts::ARCH == "x86_64"
         && blazar_runtime::engine::system_vendor_hint()
             == blazar_runtime::engine::manifest::Vendor::Nvidia
@@ -4568,16 +4572,17 @@ async fn live_sdcpp_currency(active: &str) -> Check {
         ),
     }
 }
-
-/// Per-lane engine currency for NON-active installed lanes. The active
-/// lane's row comes from the reconcile/live path in `doctor_engine`; every
-/// other installed lane gets the same live warn-only upstream probe, so
-/// a stale lane cannot hide behind an all-green doctor (observed live:
-/// sglang 0.5.20 installed, 0.5.21 on `PyPI`, no row said a word). One
-/// row per KIND, judged on the kind's newest install — retained
-/// rollback rows must not nag. Whisper is covered by
-/// `doctor_whisper_currency` regardless of which lane is active.
-async fn doctor_lane_currency(d: &BlazarDirs, active_kind: Option<EngineKind>) -> Vec<Check> {
+/// Per-kind engine versions listing (whisper excepted — it has its own
+/// dedicated currency check). One `versions {kind}` row per kind shows
+/// the installed state (newest tag, `+N older` retained rows, `[active]`
+/// mark), reconciles it against the lane's live upstream, and always
+/// carries the exact install/update command. Not-installed kinds still
+/// resolve the latest version so the row teaches how to bring the lane
+/// in. Replaces the old scattered probes: the active lane's reconcile
+/// tail in `doctor_engine` and the non-active `doctor_lane_currency`
+/// sweep, which between them never showed a kind the active lane
+/// belonged to another kind of.
+async fn doctor_engine_versions(d: &BlazarDirs, active_kind: Option<EngineKind>) -> Vec<Check> {
     let mut out = Vec::new();
     let Ok(store) = Store::open(d) else {
         return out;
@@ -4590,32 +4595,147 @@ async fn doctor_lane_currency(d: &BlazarDirs, active_kind: Option<EngineKind>) -
         EngineKind::MistralRs,
         EngineKind::Sglang,
         EngineKind::SdCpp,
+        EngineKind::Mlx,
     ] {
-        if active_kind == Some(kind) {
-            continue;
-        }
-        // The kind's newest install is what an update would act on.
-        let Some(row) = engines
-            .iter()
-            .filter(|e| e.kind == kind)
-            .max_by_key(|e| e.installed_at)
-        else {
+        let name = match kind {
+            EngineKind::LlamaCpp => "versions llamacpp",
+            EngineKind::MistralRs => "versions mistralrs",
+            EngineKind::Sglang => "versions sglang",
+            EngineKind::SdCpp => "versions sdcpp",
+            EngineKind::Mlx => "versions mlx",
+            EngineKind::Whisper => "versions whisper",
+        };
+        // Rows arrive newest-first (installed_at DESC): the kind's newest
+        // install is what an update would act on, retained rollback rows
+        // only add the `+N older` context.
+        let rows: Vec<&blazar_core::store::EngineRow> =
+            engines.iter().filter(|e| e.kind == kind).collect();
+        let Some(newest) = rows.first().copied() else {
+            // Not installed: still resolve the lane's latest version so
+            // the row names a concrete target next to the install command.
+            let install = engine_install_command(kind);
+            let latest = latest_engine_tag(kind).await;
+            let detail = match latest {
+                Some(tag) => format!("none installed — latest {tag} — run: {install}"),
+                None => format!(
+                    "none installed — latest unknown (probe failed; offline? set GH_TOKEN \
+                     if rate limited) — run: {install}"
+                ),
+            };
+            out.push(Check::warn(name, detail));
             continue;
         };
-        if row.tag == blazar_runtime::LOCAL_TAG {
-            // Source builds are not upstream-tracked (same policy as the
-            // active-lane path).
+        // Judged row: the active engine when this kind is active (the
+        // daemon's reconcile marker describes that lane), else the
+        // newest install.
+        let judged = if active_kind == Some(kind) {
+            rows.iter().copied().find(|e| e.active).unwrap_or(newest)
+        } else {
+            newest
+        };
+        let extras = versions_extras(newest, rows.len());
+        if judged.tag == blazar_runtime::LOCAL_TAG {
+            out.push(Check::ok(
+                name,
+                with_extras(&extras, "local build — upstream currency not tracked"),
+            ));
             continue;
         }
-        match kind {
-            EngineKind::Sglang => out.push(live_sglang_currency(&row.tag).await),
-            EngineKind::Mlx => out.push(live_mlx_currency(&row.tag).await),
-            EngineKind::MistralRs => out.push(live_mistralrs_currency(&row.tag).await),
-            EngineKind::SdCpp => out.push(live_sdcpp_currency(&row.tag).await),
-            _ => out.push(live_engine_currency(&row.tag, &row.asset).await),
-        }
+        let check = match kind {
+            EngineKind::Sglang => live_sglang_currency(&judged.tag).await,
+            EngineKind::Mlx => live_mlx_currency(&judged.tag).await,
+            EngineKind::MistralRs => live_mistralrs_currency(&judged.tag).await,
+            EngineKind::SdCpp => live_sdcpp_currency(&judged.tag).await,
+            _ => {
+                // Active llama.cpp lane: prefer reconciling the daemon's
+                // last upstream survey (marker fresh + channel-matched);
+                // anything else falls back to the live probe.
+                marker_currency_verdict(d, &judged.tag, &judged.asset)
+                    .unwrap_or(live_engine_currency(&judged.tag, &judged.asset).await)
+            }
+        };
+        out.push(
+            check
+                .retag(name)
+                .map_detail(|detail| with_extras(&extras, &detail)),
+        );
     }
     out
+}
+
+/// Inventory context for a kind's newest install: `+N older` when the
+/// kind retains rollback rows, `[active]` when the newest row is the
+/// active engine. Empty when the newest row already tells the whole
+/// story (single, non-active).
+fn versions_extras(newest: &blazar_core::store::EngineRow, count: usize) -> String {
+    let mut parts = Vec::new();
+    if count > 1 {
+        parts.push(format!("(+{} older)", count - 1));
+    }
+    if newest.active {
+        parts.push("[active]".to_string());
+    }
+    parts.join(" ")
+}
+
+/// Prefix a currency detail with the inventory extras, or pass it
+/// through untouched when there is nothing to add.
+fn with_extras(extras: &str, detail: &str) -> String {
+    if extras.is_empty() {
+        detail.to_string()
+    } else {
+        format!("{extras} — {detail}")
+    }
+}
+
+/// The lane's newest upstream release tag: PyPI for the pip lanes
+/// (sglang, mlx), the configured b-build channel for llama.cpp, newest
+/// release for the GitHub lanes. `None` on probe failure — callers
+/// degrade to "latest unknown" with the command intact.
+async fn latest_engine_tag(kind: EngineKind) -> Option<String> {
+    match kind {
+        EngineKind::Sglang => blazar_runtime::engine::sglang_install::pypi_latest_sglang()
+            .await
+            .ok(),
+        EngineKind::Mlx => blazar_runtime::engine::mlx_install::pypi_latest_mlx_lm()
+            .await
+            .ok(),
+        EngineKind::LlamaCpp | EngineKind::MistralRs | EngineKind::SdCpp | EngineKind::Whisper => {
+            let token = std::env::var("GH_TOKEN")
+                .or_else(|_| std::env::var("GITHUB_TOKEN"))
+                .ok();
+            let gh = GhClient::new(token).ok()?;
+            let channel = config().map(|c| c.update_channel).unwrap_or_default();
+            let fetched = match kind {
+                EngineKind::LlamaCpp => gh.channel_b_release(channel).await,
+                EngineKind::MistralRs => gh.latest_mistralrs_release().await,
+                EngineKind::SdCpp => gh.latest_sdcpp_release().await,
+                _ => gh.latest_whisper_release().await,
+            };
+            fetched.ok().map(|rel| rel.tag_name)
+        }
+    }
+}
+
+/// Reconcile verdict for the active llama.cpp lane from the daemon's
+/// engine-check marker: fresh (<48h) and channel-matched markers carry
+/// the last upstream survey; anything else returns `None` so the caller
+/// falls back to the live probe.
+fn marker_currency_verdict(d: &BlazarDirs, tag: &str, asset: &str) -> Option<Check> {
+    let raw = std::fs::read_to_string(d.run_dir().join("engine-check.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |n| n.as_secs());
+    let cfg_channel = blazar_core::Config::load(d)
+        .map(|c| c.update_channel)
+        .unwrap_or_default();
+    let fresh = now.saturating_sub(v["checked_at"].as_u64().unwrap_or(0)) <= 2 * 86_400
+        && marker_channel_matches(&v, cfg_channel);
+    if !fresh {
+        return None;
+    }
+    currency_verdict(Some(tag), &v, now, asset)
 }
 
 /// CUDA-opportunity + toolchain-readiness rows for doctor. Pure: GPU
@@ -10816,16 +10936,25 @@ fn gate_baseline(store: &Store) -> Result<Option<(String, f64, String)>> {
 }
 
 /// Single-shot tg128 on a specific engine's llama-bench.
-fn quick_tg(d: &BlazarDirs, _row: &blazar_core::EngineRow, model_path: &str) -> Result<f64> {
+fn quick_tg(
+    d: &BlazarDirs,
+    _row: &blazar_core::EngineRow,
+    model_path: &str,
+    which: &str,
+) -> Result<f64> {
     // F129: go through the shared exe-aware discovery instead of
     // hand-building a unix-only path.
     let bench_bin = blazar_runtime::bench::find_bench_bin(d)?;
     let tuner = blazar_runtime::bench::Tuner { dirs: d, bench_bin };
     // llama-bench loads the full model before its first row appears —
     // say so or the probe reads as a silent multi-second hang.
+    // Label which engine is under probe: the gate runs this twice (baseline,
+    // then candidate) and two identical lines read like a stutter.
     println!(
         "{}",
-        dim_line("probing decode (tg128; loads the model first, ~30-60s)...")
+        dim_line(&format!(
+            "probing decode on {which} (tg128; loads the model first, ~30-60s)..."
+        ))
     );
     let rows = tuner.bench_default(std::path::Path::new(model_path))?;
     let tg = rows
@@ -10859,8 +10988,8 @@ fn engine_regression_gate(
             .into_iter()
             .find(|e| e.tag == prev_tag)
             .ok_or_else(|| anyhow!("gate: baseline engine {prev_tag} pruned"))?;
-        let prev_tg = quick_tg(d, &prev_row, &mrow.path)?;
-        let new_tg = quick_tg(d, row, &mrow.path)?;
+        let prev_tg = quick_tg(d, &prev_row, &mrow.path, "current engine")?;
+        let new_tg = quick_tg(d, row, &mrow.path, &format!("candidate {}", row.tag))?;
         println!(
             "gate: {model} tg128 (default cfg) {prev_tg:.1} -> {new_tg:.1} t/s ({prev_tag} -> {})",
             row.tag
@@ -12115,6 +12244,21 @@ async fn engine_update(
             dim_line("dry-run: nothing installed, nothing written (drop --check to update)")
         );
         return Ok(());
+    }
+    // Styled heads-up: the equivalent runtime INFO line is demoted on TTY
+    // (it stomps progress bars), so the CLI owns the interactive version.
+    match resolved.as_ref() {
+        Some(rel) => println!(
+            "{}",
+            dim_line(&format!(
+                "installing upstream engine {} — runtime companion downloads show their own progress bar",
+                rel.tag_name
+            ))
+        ),
+        None => println!(
+            "{}",
+            dim_line("installing upstream engine — runtime companion downloads show their own progress bar")
+        ),
     }
     let row = match resolved {
         Some(rel) => mgr.update_resolved(rel, tag.is_some()).await?,

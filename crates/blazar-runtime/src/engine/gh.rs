@@ -783,14 +783,21 @@ impl GhClient {
         } else {
             None
         };
-        let bar = indicatif::ProgressBar::new_spinner();
+        // Sized bar, not a spinner: the spinner template renders none of the
+        // set_length/set_position calls below, so a GitHub-CDN parallel
+        // download showed one dead line for minutes (live case: 566 MiB
+        // companion tarball, ~3 min of apparent freeze).
+        let bar = indicatif::ProgressBar::new(size);
+        bar.set_style(
+            indicatif::ProgressStyle::with_template("{msg} {bar:30} {bytes}/{total_bytes} ({eta})")
+                .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar()),
+        );
         bar.set_message(format!(
             "engine {} (parallel){}",
             asset.name,
             self.cap_suffix()
         ));
-        let mut progress = |done: u64, total: u64| {
-            bar.set_length(total);
+        let mut progress = |done: u64, _total: u64| {
             bar.set_position(done);
         };
         let Some(got) = crate::hf_parallel::try_parallel(
