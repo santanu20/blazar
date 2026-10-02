@@ -458,6 +458,9 @@ async fn e2e__n_choices_lane_ceiling_teaches_before_the_engine_can() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn e2e__openai_chat_nonstream_and_stream() {
+    // Pin the local-lane framing contract: the gateway must forward an exact
+    // Content-Length, never chunked (mlx_lm.server class children 411 on it).
+    std::env::set_var("STUB_REJECT_CHUNKED", "1");
     let ts = start(Config::default()).await;
     let c = client();
     let body = serde_json::json!({

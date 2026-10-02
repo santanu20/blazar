@@ -533,8 +533,24 @@ fn stub_knob_text(state: &AppState, messages: &[ChatMessage]) -> String {
 #[allow(clippy::too_many_lines)]
 async fn chat_completions(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     axum::Json(req): axum::Json<ChatRequest>,
 ) -> axum::response::Response {
+    // Framing contract: real engines with simple HTTP handlers
+    // (mlx_lm.server's http.server class) reject chunked request
+    // bodies with 411. The stub asserts the same so gateway
+    // regressions to chunked forwarding fail here, not in the field.
+    // Framing contract assert, opt-in: the local child lane must send exact
+    // Content-Length (mlx_lm.server's python http.server rejects chunked), but
+    // the remote lane legitimately streams client bodies chunked — tests that
+    // exercise the stub as a remote leave STUB_REJECT_CHUNKED unset.
+    if std::env::var("STUB_REJECT_CHUNKED").is_ok()
+        && headers
+            .get("transfer-encoding")
+            .is_some_and(|v| v.as_bytes().windows(7).any(|w| w == b"chunked"))
+    {
+        return axum::http::StatusCode::LENGTH_REQUIRED.into_response();
+    }
     let req_text: String = request_text(&req);
     let delay_ms: u64 = std::env::var("STUB_DELAY_MS")
         .ok()
