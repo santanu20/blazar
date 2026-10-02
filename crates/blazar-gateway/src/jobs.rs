@@ -249,13 +249,7 @@ impl JobRuntime {
     /// verdicts today, lane milestones later. The row must already exist;
     /// a missing row is a debug-level note (the lane stays authoritative).
     #[allow(clippy::needless_pass_by_value)] // serialized into the event row
-    pub fn record_event(
-        &self,
-        state: &AppState,
-        id: &str,
-        kind: &str,
-        data: serde_json::Value,
-    ) {
+    pub fn record_event(&self, state: &AppState, id: &str, kind: &str, data: serde_json::Value) {
         let data = serde_json::to_string(&data).ok();
         let outcome = state.with_store(|s| s.append_job_event(id, kind, data.as_deref()));
         match outcome {

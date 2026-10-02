@@ -374,7 +374,10 @@ async fn e2e__n_choices_honored_passes_through_with_all_choices() {
         .unwrap();
     let choices = r["choices"].as_array().expect("choices array");
     assert_eq!(choices.len(), 3, "all three choices must arrive");
-    let indexes: Vec<i64> = choices.iter().map(|ch| ch["index"].as_i64().unwrap()).collect();
+    let indexes: Vec<i64> = choices
+        .iter()
+        .map(|ch| ch["index"].as_i64().unwrap())
+        .collect();
     assert_eq!(indexes, vec![0, 1, 2]);
     ts.state.sup.shutdown_all().await.unwrap();
 }
@@ -1813,6 +1816,7 @@ async fn e2e__audio_jobs__unknown_404_and_invalid_id_400() {
         .send()
         .await
         .unwrap();
+    assert_eq!(resp.status(), 400);
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
@@ -1959,7 +1963,7 @@ async fn e2e__warm__loads_model_and_route_agrees() {
         r["local"]["resident"]["state"].as_str().is_some(),
         "resident after warm: {r}"
     );
-    assert!(r["peers"].as_array().is_some_and(|p| p.is_empty()));
+    assert!(r["peers"].as_array().is_some_and(std::vec::Vec::is_empty));
 
     // Unknown model: a 200 decision of "none" with the teaching reason —
     // absence is a valid answer from an explainer, never a fake target.
@@ -2094,7 +2098,9 @@ async fn e2e__explain__card_provenance_and_unknown_404() {
         v["cache"]["kv_k"].is_string(),
         "kv grade or auto ladder: {v}"
     );
-    assert!(v["residents"].as_array().is_some_and(|r| r.is_empty()));
+    assert!(v["residents"]
+        .as_array()
+        .is_some_and(std::vec::Vec::is_empty));
 
     // Tag-form alias (`name:quant`, the display shape /api/tags emits)
     // resolves through the canonical ladder — regression pin for the

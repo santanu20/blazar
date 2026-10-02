@@ -619,8 +619,12 @@ mod tests {
         assert!(has_tool_result_messages(&chain));
         // Degenerate shapes: no messages array / non-array -> no gate, not
         // a panic.
-        assert!(!has_tool_result_messages(&serde_json::json!({"model": "m1"})));
-        assert!(!has_tool_result_messages(&serde_json::json!({"messages": "hi"})));
+        assert!(!has_tool_result_messages(
+            &serde_json::json!({"model": "m1"})
+        ));
+        assert!(!has_tool_result_messages(
+            &serde_json::json!({"messages": "hi"})
+        ));
     }
 
     #[test]

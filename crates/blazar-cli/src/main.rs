@@ -4503,13 +4503,13 @@ async fn live_sdcpp_currency(active: &str) -> Check {
 }
 
 /// Per-lane engine currency for NON-active installed lanes. The active
-/// lane's row comes from the reconcile/live path in doctor_engine; every
+/// lane's row comes from the reconcile/live path in `doctor_engine`; every
 /// other installed lane gets the same live warn-only upstream probe, so
 /// a stale lane cannot hide behind an all-green doctor (observed live:
-/// sglang 0.5.20 installed, 0.5.21 on PyPI, no row said a word). One
+/// sglang 0.5.20 installed, 0.5.21 on `PyPI`, no row said a word). One
 /// row per KIND, judged on the kind's newest install — retained
 /// rollback rows must not nag. Whisper is covered by
-/// doctor_whisper_currency regardless of which lane is active.
+/// `doctor_whisper_currency` regardless of which lane is active.
 async fn doctor_lane_currency(d: &BlazarDirs, active_kind: Option<EngineKind>) -> Vec<Check> {
     let mut out = Vec::new();
     let Ok(store) = Store::open(d) else {
@@ -6837,10 +6837,10 @@ async fn warm_cmd(model: &str) -> Result<()> {
         v["lane"].as_str().unwrap_or("unknown"),
         v["engine"].as_str().unwrap_or("unknown"),
         r["state"].as_str().unwrap_or("unknown"),
-        r["ctx"].as_u64().map(|c| c.to_string()).unwrap_or_else(|| "unknown".into()),
+        r["ctx"].as_u64().map_or_else(|| "unknown".into(), |c| c.to_string()),
         match r["slots"].as_u64() {
             Some(s) => s.to_string(),
-            None => r["slots_configured"].as_u64().map(|s| s.to_string()).unwrap_or_else(|| "unknown".into()),
+            None => r["slots_configured"].as_u64().map_or_else(|| "unknown".into(), |s| s.to_string()),
         },
         v["load_ms"].as_u64().unwrap_or(0),
     );
@@ -7022,7 +7022,7 @@ async fn model_doctor_cmd(model: &str, json: bool) -> Result<()> {
     };
     // Probe budget on the daemon is 10 minutes overall; poll past it so
     // the CLI is never the side that gives up first.
-    let deadline = std::time::Instant::now() + Duration::from_secs(660);
+    let deadline = std::time::Instant::now() + Duration::from_mins(11);
     loop {
         let resp = cli_http()
             .get(format!("{base}/v1/jobs/{id}"))
@@ -7118,7 +7118,10 @@ fn encode_path_segment(s: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(b as char);
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "%{b:02X}");
+            }
         }
     }
     out
@@ -7127,6 +7130,7 @@ fn encode_path_segment(s: &str) -> String {
 /// Render the daemon's explain card as the scannable text block. Pure —
 /// unit-testable without a daemon. Unknowns print as `unknown` with the
 /// daemon's own source/limitation lines; nothing is invented here.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)] // renderer mirrors the card's sections one-to-one; short locals are the JSON field handles
 fn render_explain_card(v: &serde_json::Value) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
@@ -7146,8 +7150,7 @@ fn render_explain_card(v: &serde_json::Value) -> String {
             "{}  quant={}  arch={}  format={}",
             m["bytes"]
                 .as_i64()
-                .map(humansize)
-                .unwrap_or_else(|| "unknown".into()),
+                .map_or_else(|| "unknown".into(), humansize),
             or_unknown(&m["quant"]),
             or_unknown(&m["arch"]),
             or_unknown(&m["format"]),
@@ -11768,6 +11771,12 @@ async fn engine_update_all(d: &BlazarDirs, no_gate: bool, check: bool) -> Result
     Ok(())
 }
 
+/// `blazar engine update [tag]` — update the active lane, or every
+/// installed lane with `--all` (fixed walk order, failures named in the
+/// summary while the walk continues).
+// One dispatcher per lane kind plus the --all walk; each arm is a flat
+// call into its lane's update fn and shares the same summary/report shape.
+#[allow(clippy::too_many_lines)]
 async fn engine_update(
     d: &BlazarDirs,
     tag: Option<String>,
@@ -13296,7 +13305,7 @@ async fn fit(target: &str, json: bool) -> Result<()> {
             v["vram_bytes"] = serde_json::json!(vram_bytes);
             v["disk_free_bytes"] = serde_json::json!(disk_free);
             v["disk_fits"] = serde_json::json!(storage::disk_verdict(
-                u64::try_from(r.bytes).unwrap_or(0) + storage::REQUIRED_SLACK_BYTES,
+                r.bytes + storage::REQUIRED_SLACK_BYTES,
                 disk_free,
             ));
             println!("{v}");
@@ -13326,11 +13335,7 @@ async fn fit(target: &str, json: bool) -> Result<()> {
     // Disk section: the largest variant is the honest preview of what a
     // pull of this repo could ask for; the pull gate re-checks the exact
     // selection at submit time.
-    if let Some(biggest) = rows
-        .iter()
-        .map(|r| u64::try_from(r.bytes).unwrap_or(0))
-        .max()
-    {
+    if let Some(biggest) = rows.iter().map(|r| r.bytes).max() {
         println!("\nDISK");
         println!(
             "  largest variant:  {}",
@@ -13404,14 +13409,18 @@ async fn resident_models() -> (Vec<String>, bool) {
 
 /// `blazar storage` — the disk-side counterpart of `fit`: what Blazar
 /// stores, where it lives, and what can be reclaimed.
+// One report walked top-to-bottom (stores -> disk -> reclaim -> external);
+// splitting it hides the report order it exists to show.
+#[allow(clippy::too_many_lines)]
 async fn storage_cmd(json: bool) -> Result<()> {
+    use blazar_runtime::storage;
+
     let d = dirs();
     let rows = Store::open(&d)
         .ok()
         .and_then(|s| s.list_models().ok())
         .unwrap_or_default();
     let (residents, daemon_up) = resident_models().await;
-    use blazar_runtime::storage;
     let models_bytes = storage::du(&d.models_dir());
     let engines_bytes = storage::du(&d.engines_dir());
     let sessions_bytes = storage::du(&d.sessions_dir());
@@ -13550,6 +13559,10 @@ async fn storage_cmd(json: bool) -> Result<()> {
 
 /// `blazar prune` — reclaim disk. Dry-run by default; `--yes` executes.
 /// Twins are never deleted (they ARE owned files, just hardlinked).
+// Flags mirror the CLI surface one-to-one; a struct would just move them.
+#[allow(clippy::fn_params_excessive_bools)]
+// Preview + execute share one walk so the dry-run IS the plan of record.
+#[allow(clippy::too_many_lines)]
 async fn prune_cmd(
     orphans: bool,
     unused: bool,
@@ -13557,6 +13570,8 @@ async fn prune_cmd(
     yes: bool,
     json: bool,
 ) -> Result<()> {
+    use blazar_runtime::storage;
+
     let d = dirs();
     let rows = Store::open(&d)
         .ok()
@@ -13566,7 +13581,6 @@ async fn prune_cmd(
     if !daemon_up {
         eprintln!("warning: daemon not reachable — resident models are not guarded; a model mid-serve could be deleted");
     }
-    use blazar_runtime::storage;
     let scan = storage::orphan_scan(&d.models_dir(), &rows);
     let now = blazar_core::store::unix_now();
     let unused_rows_sel = if unused {
@@ -14201,7 +14215,7 @@ mod tests {
         let out = render_doctor_cert(&serde_json::json!({
             "model": "qwen3-1.7b",
             "engine_tag": "llamacpp-cuda",
-            "tested_at": 1790000000i64,
+            "tested_at": 1_790_000_000_i64,
             "caps": {
                 "chat": {"status": "PASS", "receipt": "200, assistant content (in 812ms)"},
                 "tools": {"status": "FAIL", "receipt": long_receipt},

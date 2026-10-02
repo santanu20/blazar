@@ -1,13 +1,13 @@
 //! POST /api/model-doctor — per-model capability certificate.
 //!
 //! Every probe runs through the REAL gateway path (admission queue,
-//! dialect translation, child_send, sentinel) by invoking the ollama
+//! dialect translation, `child_send`, `sentinel`) by invoking the ollama
 //! handlers directly as functions. Auth is a middleware concern, so an
 //! in-daemon call carries no key — the run is operator-initiated. No
 //! self-HTTP loop: that would re-enter the body limit and lifecycle
 //! middleware with a fake client disconnect semantics.
 //!
-//! The run itself is a JobRuntime job (kind `doctor`): durable row,
+//! The run itself is a `JobRuntime` job (kind `doctor`): durable row,
 //! per-probe events, polling and cancel come free from the /v1/jobs
 //! plane. The finished certificate is also upserted into `model_caps`
 //! where routing surfaces can read it without scraping job history.
@@ -149,7 +149,9 @@ fn judge_stream(code: u16, content_type: Option<&str>, body: &[u8]) -> Verdict {
             pass(format!("200, {frames} NDJSON frames"))
         };
     }
-    fail(format!("200 but content type is {ct} (expected a streaming dialect)"))
+    fail(format!(
+        "200 but content type is {ct} (expected a streaming dialect)"
+    ))
 }
 
 /// structured-output probe: 200 and a JSON body whose .response parses as
@@ -373,6 +375,9 @@ pub async fn cert(
     .into_response()
 }
 
+// Sequential probe ladder with per-probe cancel checks and deadlines:
+// splitting it hides the order it exists to show.
+#[allow(clippy::too_many_lines)]
 async fn run_probes(
     state: Arc<AppState>,
     id: String,
@@ -587,26 +592,23 @@ async fn run_probes(
 
     // Engine tag: prefer the LIVE resident (proof the probes exercised a
     // real child); a model that never became resident gets an honest tag.
-    let engine_tag = state
-        .sup
-        .ps()
-        .iter()
-        .find(|r| r.name == model)
-        .map(|r| r.engine.clone())
-        .unwrap_or_else(|| "unresolved (never resident this run)".to_string());
+    let engine_tag = state.sup.ps().iter().find(|r| r.name == model).map_or_else(
+        || "unresolved (never resident this run)".to_string(),
+        |r| r.engine.clone(),
+    );
 
     let cert = json!({
         "object": "blazar.model-doctor",
         "model": model,
         "engine_tag": engine_tag,
         "tested_at": blazar_core::store::unix_now(),
-        "total_ms": started.elapsed().as_millis() as u64,
+        "total_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "caps": Value::Object(caps),
     });
     if let Some(err) = state
         .with_store(|s| {
             s.put_model_caps(
-                &cert["model"].as_str().unwrap_or_default(),
+                cert["model"].as_str().unwrap_or_default(),
                 &engine_tag,
                 &cert.to_string(),
             )

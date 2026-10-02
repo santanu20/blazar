@@ -5254,7 +5254,7 @@ default_ctx = 16384
         std::env::set_var("BLAZAR_DOWNLOAD_SPEED_LIMIT_MB", "12.5");
         let merged = Config::default().with_env_overrides().unwrap();
         std::env::remove_var("BLAZAR_DOWNLOAD_SPEED_LIMIT_MB");
-        assert_eq!(merged.download_speed_limit_mb, 12.5);
+        assert!((merged.download_speed_limit_mb - 12.5).abs() < f64::EPSILON);
         assert!(merged.validate().is_ok(), "12.5 MB/s is a legal cap");
 
         std::env::set_var("BLAZAR_DOWNLOAD_SPEED_LIMIT_MB", "-3");
