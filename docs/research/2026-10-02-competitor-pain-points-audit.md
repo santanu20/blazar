@@ -118,8 +118,9 @@ In-repo inline ledger references (keep using when touching these surfaces):
 #1 logprobs passthrough (openai.rs), #4 no blob storage, #6 real repo names,
 #7 CVE-class path safety (hf.rs), #10 load-wait transparency (proxy.rs),
 #12 keep_alive, #13 num_ctx honored (ollama.rs), #14 compat preview,
-#15 hub search (hf.rs). A canonical numbered list doc does not exist in-tree;
-   this file now serves as the mapping.
+#15 hub search (hf.rs), #16 delete accepts the name /api/tags itself renders
+(gateway ollama.rs delete → shared `proxy::resolve_model` ladder; found by the
+F1 live-validation rig, pin `e2e__ollama_delete_accepts_the_tags_rendered_name`).
 
 ## 7. Round-2 sweep (2026-10-02, deeper complaint tiers)
 
@@ -144,11 +145,22 @@ Windows/CVEs. Code-verified outcomes:
 
 Actionable items, all others verified fixed:
 
-- **F1. Pull download speed cap** (ollama #2006, 104 upvotes). New
-  `download_speed_limit_mb` config (0 = unlimited) + token-bucket pacing in
-  `hf_parallel.rs` chunk reads; validation, docs row, pin tests (paced vs
-  unlimited timing assert via local listener). Removes bandwidth contention
-  for users pulling on shared links.
+- **F1. Pull download speed cap** (ollama #2006, 104 upvotes). **DONE
+  2026-10-02**: `download_speed_limit_mb` config + `BLAZAR_DOWNLOAD_SPEED_LIMIT_MB`
+  env; shared token bucket (1 s burst, `runtime/throttle.rs`) pacing model
+  pulls, registry pulls, TTS/whisper voices, and engine-binary assets;
+  progress bars name the cap; validation rejects negative/NaN. Receipts:
+  `integration__download_speed_limit__paces_the_classic_lane` (2.5 s measured
+  deficit at 1000 B/s cap), 6 throttle unit tests, config env/validation test,
+  workspace 1657/1657. **Enforcement hardening after live e2e** (81b156d): the
+  first cut let parallel chunk workers sleep concurrently and under-enforced
+  the cap ~4x; the bucket lock is now held across the deficit sleep
+  (tokio Mutex) with deficit carried as negative tokens. Pin
+  `unit__acquire__concurrent_reads_enforce_the_aggregate_cap` (8 workers x
+  250 KB @ 1 MB/s = 1.011 s). Live receipt: 45.9 MB registry pull at
+  `BLAZAR_DOWNLOAD_SPEED_LIMIT_MB=1.0` measured 0.945 MB/s (46 s pacing +
+  ~2.5 s manifest/TLS/store overhead). The same rig surfaced the
+  `/api/delete` name-resolution gap, fixed in 31f5f8b — see ledger #16.
 - **F2. Release-artifact license gate** (ollama #3185 parity). Extend the
   github-release pre-release checks: assert LICENSE-MIT/LICENSE-APACHE (+
   NOTICE if added) exist inside every published archive; fail the release if
@@ -171,7 +183,61 @@ ollama cloud stats (their telemetry product, not a local-server concern),
 DeepSeek/roadmap model-support items (engine-level, arrive via
 `engine update`), `--cache-disk` itself (not yet upstream).
 
-## 9. Sources (selection)
+## 9. Round-3 sweep — sdcpp + mistral.rs + whisper lanes (2026-10-02)
+
+The three lanes never individually audited. Sources: leejet/stable-diffusion.cpp
++ EricLBuehler/mistral.rs + ggml-org/whisper.cpp top open issues (GitHub API,
+2026-10-02) and community search (reddit/dev.to/arXiv on whisper streaming).
+
+### stable-diffusion.cpp
+
+| Complaint | Verdict (evidence) |
+|---|---|
+| #2081 sd-server accepts requests during startup window, spins CPU, never responds | FIXED-BY-ARCH: children are ready-gated (TCP health probe + boot-smoke) before the gateway routes to them |
+| #1988 sd-server needs API-key support | FIXED-BETTER: gateway scoped keys (model scope + budgets) + supervisor-minted child auth (`engine_impl.rs:1043`) |
+| #2022/#2073 Vulkan iGPU census reports "available 0.00 MB", model load fails | GOVERNED: `probe.rs:235-241` treats a zero-memory census as empty and falls back to nvidia-smi; `images.rs` submit gate is fail-open where VRAM is unmeasurable, teaching-400 + `vram_overcommit` lever where measurable |
+| #2015 `--offload-to-cpu` pins past GTT budget, kills device | GOVERNED: offload is a posture choice with fit math (`profile.rs:3218-3237`), not a blind default; `--vae-tiling` and `--diffusion-fa` are gated knobs (`profile.rs:3005,3111`, `config.rs:532`) |
+| #1971 please ship non-AVX-512 CPU builds | RESOLVED upstream: current releases ship one baseline `bin-win-cpu-x64.zip`; our CPU pattern excludes cuda/rocm/vulkan and picks it — no host-CPU detection needed |
+| "./"-walk symlink loops under a service daemon cwd | FIXED: `child_cwd` anchor seats every child in its engine install dir (`engine_impl.rs:332-343`) — blazar hit and fixed this class independently |
+| #2078/#2003/#1990 artifact/black-frame/Metal-tensor bugs, LTX/MiniMax/Wan video regressions | UPSTREAM kernels — arrive via engine updates |
+
+### mistral.rs
+
+| Complaint | Verdict |
+|---|---|
+| #2421 projector auto-discovery binds the directory's only mmproj to ANY model, crashes text-only GGUFs | FIXED-BETTER: blazar projector policy default `lazy` = text-only spawn, mmproj attached on demand (`config.rs:780-870`, incl. `mmproj_offload`/`mmproj_auto`/`mmproj_device`) |
+| #2419 macOS CPU available memory reported as 0 MB | COVERED-LOUD: our spawn-time guard reads sysinfo `MemAvailable` with a hard floor and fails with a named error (never silent starvation); the 0-MB bug itself was mistral.rs's own reading |
+| #2343 concurrent throughput does not scale above serial (H100, v0.9.0) | UPSTREAM PagedAttention bug; blazar admission bounds the queue, reshape observability tracked |
+| #2460/#2435/#2411 ISQ deadlocks, GCC-13 CUDA link errors, malformed wheels | MITIGATED-BY-ARCH: pinned engine versions + boot-smoke gate reject bad builds at install time |
+| #2441/#2427 tojson abort, tool-call tags leaking into reasoning content | UPSTREAM parser bugs |
+
+### whisper.cpp
+
+| Complaint | Verdict |
+|---|---|
+| Streaming ASR quality: "simplistic streaming mode, disjoint 30s-padded segments, unsuitable for deployment" (arXiv); "feels laggy for live apps" (dev.to) | **DONE (F6, 2026-10-02):** `stream=true` SSE now ships on the transcription endpoints — progressive chunk decode + rebased rolling segments (see fix list F6) |
+| #4075 Metal 10x slowdown with non-default `audio_ctx` | IMMUNE: blazar never sets `audio_ctx` (defaults) |
+| #4018 non-ASCII `-m` model path aborts (0xC0000409) on MSVC Windows | WATCHLIST (W1): non-ASCII Windows homes would crash the whisper child; mitigation when implemented = Windows short-path (8.3) normalization of child argv |
+| #4041-4043 Go-binding CString leaks | N/A: blazar spawns binaries, no bindings |
+| #4090/#4059 unvalidated GGUF header fields → OOB read/write | COVERED (class): pull-layer checksum/provenance invariants |
+| #4026 no macOS binaries in releases | TAUGHT: `whisper_asset_patterns` returns an explicit build-from-source instruction for macOS (`gh.rs:1204-1213`) |
+
+### Round-3 additions to the fix list
+
+- **F6 — DONE 2026-10-02: streaming transcriptions shipped.** `stream=true` on
+  `/v1/audio/transcriptions` + `/translations` returns SSE: WAV split at PCM
+  frame boundaries into `whisper_stream_chunk_ms` windows (default 30 s,
+  1-120 s), each transcribed in order on the same lazy child;
+  `chunk.completed` events carry rebased segments while later audio still
+  decodes, `transcript.completed` closes with the merged transcript. Gate:
+  `stream` + `async` = 400; window-shaping fields dropped; hangup stops at the
+  next chunk boundary. Live receipt: 66 s jfk-concat WAV, 6 s windows, 11
+  chunks + final on the rig daemon.
+- **W1 — DONE 2026-10-02.** 8.3 short-path argv guard on Windows
+  (best-effort `GetShortPathNameW`, identity off-Windows) before the whisper
+  child sees a non-ASCII model path (whisper.cpp #4018 abort class).
+
+## 10. Sources (selection)
 
 - GitHub Search API top-reacted open issues: ollama/ollama,
   sgl-project/sglang, ggml-org/llama.cpp (2026-10-02 snapshots).

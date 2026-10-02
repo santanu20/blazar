@@ -38,6 +38,16 @@ getrandom = { workspace = true }
 # tempdir (engine/build.rs) — not test-only.
 tempfile = "3"
 
+[target.'cfg(windows)'.dependencies]
+# W1: 8.3 short-path conversion for the whisper `-m` argv (upstream
+# aborts on non-ASCII paths, whisper.cpp #4018). Same version the
+# workspace graph already carries transitively — no new code enters
+# the build beyond the one linker symbol used here.
+windows-sys = { version = "0.61", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+] }
+
 [dev-dependencies]
 # test-util: start_paused clocks for the bounded-retry unit tests
 tokio = { workspace = true, features = ["test-util"] }

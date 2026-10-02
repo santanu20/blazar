@@ -14,6 +14,26 @@ Patch release — defects found by live validation of 0.15.0, fixed on main.
 - **Durable jobs: zombie `running` rows can no longer outlive the grace window.** A job whose gateway died less than 5 s before the next boot fell outside the one-time boot sweep and stayed `running` forever. The sweep now takes an absolute cutoff and a delayed second pass reaps any row last updated before this daemon started — live work in the current process is never touched.
 - **`scripts/compat/compat_check.sh`: summary line printed a literal `s`** instead of the pass count (printf format-string bug).
 - **Workspace `cargo fmt` + `clippy -D warnings` clean** across all new 0.15.0 surfaces (the 0.15.0 tag was cut before CI enforced this on the new code).
+=======
+## [0.16.0] - 2026-10-02
+
+Theme: **capacity-aware federation** — peers selected by measurement, not
+guesswork.
+
+### Added
+- Peer capacity signals: Blazar remotes now answer a cached
+  `GET /api/capacity` snapshot (devices, residents, queue depth) fetched
+  alongside presence — capacity never blocks presence, non-Blazar peers
+  degrade silently to plain remotes.
+- Time-to-first-token EWMA per remote (`RemoteHealth.ttft_ewma_ms`),
+  fed from real forwards (ok requests only, measured to response head).
+- Tiered peer ranking everywhere a non-sticky pick happens:
+  warm (model resident, capacity known) > unknown-capacity > catalog-cold,
+  then estimated queue wait (leases + peer `in_flight` over slots, times
+  the TTFT EWMA or a 750ms neutral default), then most free VRAM.
+  Sticky conversation affinity and the failure circuit are unchanged.
+- `/api/ps` remotes carry the cached `capacity` summary (absent field =
+  no snapshot).
 
 ## [0.15.0] - 2026-10-02
 
@@ -33,6 +53,9 @@ itself. No new inference engines; depth over breadth.
 - **Model doctor — `blazar model-doctor <model>` + `POST /api/model-doctor`.** A capability certificate built from REAL probes through the full gateway path (admission → translate → child → sentinel): chat (implicitly load/tokenize/template/generate), streaming SSE, strict JSON schema, tool-call elicitation (a prose answer is a FAIL, not a PASS), embeddings (a teaching refusal from the lane is an honest N/A), plus static vision (mmproj pulled?) and think (template carries a thinking block?) caps. Probes are bounded (300 s cold-load first probe, 120 s others, 10 min overall → remaining marked FAIL-timeout, partial cert still stored), run as a durable `/v1/jobs` job (cancel between probes honored), and the certificate lands in the store (`GET /api/model-doctor/{model}`) for routing decisions. Suite receipts: stub engines produce honest FAIL verdicts with receipts, real qwen3-1.7b run produces a full PASS certificate.
 - **Semantic-cache tool-result gate.** Requests carrying `role=tool` messages bypass the semantic cache in BOTH directions: tool outputs are not part of the serving fingerprint, so a prompt-similarity hit could serve an answer computed against different tool results. Tool-free turns of the same conversation still cache. New `blazar_semantic_cache_tool_bypasses_total` counter in `/metrics`.
 - **Client-compat matrix runner (`scripts/compat/`)** — wire-shape fixtures for the OpenAI SDK, Codex-style Responses chaining, Anthropic SDK, ollama CLI, and Continue/Cline tool-call shapes, asserting response contracts against a live daemon; plus GitHub issue templates (bug / workload / feature) so demand data lands in the repo instead of staying anecdotal.
+- **Download speed cap — `download_speed_limit_mb` (0 = unlimited).** One knob throttles every pull lane: model pulls (parallel chunk and classic streams), ollama-registry pulls, TTS/whisper voice fetches, and engine-binary asset downloads. A shared token bucket (1 s burst allowance) paces reads after write/hash accounting, progress bars name the active cap (`pull x (cap 12 MB/s)`), and the registry lane inherits the HF lane's cap so no path bypasses the contract. Env: `BLAZAR_DOWNLOAD_SPEED_LIMIT_MB`. Negative/NaN values fail config validation with a teaching error. Ollama parity: complaint #2006 (104 upvotes).
+- **Whisper streaming transcriptions — `stream=true` on `/v1/audio/transcriptions` + `/translations`.** Progressive SSE decoding: the uploaded WAV is split at PCM frame boundaries into `whisper_stream_chunk_ms` windows (default 30 s, 1-120 s) and transcribed in order on the same lazy child; `chunk.completed` events carry rebased segments while later audio is still decoding, `transcript.completed` closes with the merged transcript. `stream` + `async` on one body is a 400 request-shape error; window-shaping fields that would corrupt per-chunk decode are dropped; client hangup stops at the next chunk boundary. Upstream whisper.cpp has no streaming surface (batch /inference only) — the community's headline ask. Audit F6.
+- **Windows: whisper model paths pass through a short-path (8.3) guard** before reaching the child argv — upstream aborts (0xC0000409) on non-ASCII model paths; best-effort `GetShortPathNameW`, identity off-Windows. Audit W1.
 
 ### Fixed
 

@@ -5695,7 +5695,8 @@ async fn pull_model(target: &str, force: bool) -> Result<(blazar_core::store::Mo
     let token = std::env::var("HF_TOKEN").ok();
     let cfg = config()?;
     let client = blazar_runtime::hf::HfClient::new(token)?
-        .with_download_connections(cfg.download_connections);
+        .with_download_connections(cfg.download_connections)
+        .with_download_speed_limit(cfg.download_speed_limit_mb);
     let bus = EventBus::default();
     let mut events = bus.subscribe();
     let puller = blazar_runtime::Puller {
@@ -7894,7 +7895,8 @@ async fn tts_cmd(
     if let Some(voice) = pull {
         let token = std::env::var("HF_TOKEN").ok();
         let hf = blazar_runtime::hf::HfClient::new(token)?
-            .with_download_connections(config()?.download_connections);
+            .with_download_connections(config()?.download_connections)
+            .with_download_speed_limit(config()?.download_speed_limit_mb);
         let dest = blazar_runtime::piper::pull_voice(&hf, &d, &voice, |done, total| {
             use std::io::Write as _;
             let pct = (done * 100).checked_div(total).unwrap_or(0);
@@ -7923,7 +7925,8 @@ async fn tts_cmd(
 async fn tts_search(d: &BlazarDirs, query: &str) -> Result<()> {
     let token = std::env::var("HF_TOKEN").ok();
     let hf = blazar_runtime::hf::HfClient::new(token)?
-        .with_download_connections(config()?.download_connections);
+        .with_download_connections(config()?.download_connections)
+        .with_download_speed_limit(config()?.download_speed_limit_mb);
     let voices = blazar_runtime::piper::search_voices(&hf, query).await?;
     if voices.is_empty() {
         return Err(anyhow!(
@@ -8120,7 +8123,8 @@ async fn whisper_cmd(
     if let Some(size) = pull {
         let token = std::env::var("HF_TOKEN").ok();
         let hf = blazar_runtime::hf::HfClient::new(token)?
-            .with_download_connections(config()?.download_connections);
+            .with_download_connections(config()?.download_connections)
+            .with_download_speed_limit(config()?.download_speed_limit_mb);
         let dest = blazar_runtime::whisper::pull(&hf, &d, &size, |done, total| {
             use std::io::Write as _;
             let pct = (done * 100).checked_div(total).unwrap_or(0);
@@ -8188,7 +8192,8 @@ async fn whisper_cmd(
 async fn whisper_search(d: &BlazarDirs, query: &str) -> Result<()> {
     let token = std::env::var("HF_TOKEN").ok();
     let hf = blazar_runtime::hf::HfClient::new(token)?
-        .with_download_connections(config()?.download_connections);
+        .with_download_connections(config()?.download_connections)
+        .with_download_speed_limit(config()?.download_speed_limit_mb);
     let needle = query.to_lowercase();
     let rows: Vec<Vec<String>> = blazar_runtime::whisper::remote_models(&hf)
         .await?
@@ -11292,8 +11297,8 @@ async fn engine_update(
     check: bool,
 ) -> Result<()> {
     let token = std::env::var("GH_TOKEN").ok();
-    let gh = GhClient::new(token)?;
     let cfg = config()?;
+    let gh = GhClient::new(token)?.with_download_speed_limit(cfg.download_speed_limit_mb);
     // Explicit --tag bypasses the configured channel (power-user
     // override); otherwise the channel resolves the target. The
     // resolved release is passed through to the manager so the
@@ -11601,8 +11606,8 @@ async fn engine_build(d: &BlazarDirs, a: BackendArg) -> Result<()> {
     // Resolve the source label: for upstream, exactly like Update; for
     // forks it is the pinned SHA.
     let token = std::env::var("GH_TOKEN").ok();
-    let gh = GhClient::new(token)?;
     let cfg = config()?;
+    let gh = GhClient::new(token)?.with_download_speed_limit(cfg.download_speed_limit_mb);
     // Prior active tag: the post-build restart hook needs to know
     // whether THIS build actually dethroned the serving engine.
     let prior_active = blazar_core::store::Store::open(d)?
@@ -11854,7 +11859,8 @@ async fn engine_install_lane(d: &BlazarDirs, lane_id: &str, backend: Option<&str
         sha8,
         backend.as_str()
     );
-    let gh = GhClient::new(std::env::var("GH_TOKEN").ok())?;
+    let gh = GhClient::new(std::env::var("GH_TOKEN").ok())?
+        .with_download_speed_limit(cfg.download_speed_limit_mb);
     let mgr = EngineManager {
         dirs: d.clone(),
         gh,
@@ -12238,7 +12244,10 @@ async fn refuse_if_engine_in_use(d: &BlazarDirs, tag: &str) -> Result<()> {
 
 fn local_engine_manager(d: &BlazarDirs) -> Result<EngineManager> {
     let token = std::env::var("GH_TOKEN").ok();
-    let gh = GhClient::new(token)?;
+    // Engine-asset downloads honor the same speed cap as model pulls
+    // (config file or BLAZAR_DOWNLOAD_SPEED_LIMIT_MB; 0 = unlimited).
+    let limit = config()?.download_speed_limit_mb;
+    let gh = GhClient::new(token)?.with_download_speed_limit(limit);
     Ok(EngineManager {
         dirs: d.clone(),
         gh,

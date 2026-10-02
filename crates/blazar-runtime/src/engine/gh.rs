@@ -79,6 +79,11 @@ pub struct GhClient {
     http: reqwest::Client,
     base: reqwest::Url,
     token: Option<String>,
+    /// Total download speed cap in MB/s for engine asset downloads
+    /// (`0` = unlimited). Same knob class as the model-pull lane's
+    /// `download_speed_limit_mb`, so one config caps every byte the
+    /// daemon fetches.
+    download_speed_limit_mb: f64,
 }
 
 #[must_use]
@@ -155,7 +160,26 @@ impl GhClient {
             http,
             base: reqwest::Url::parse(base)?,
             token,
+            download_speed_limit_mb: 0.0,
         })
+    }
+
+    /// Builder: total download speed cap in MB/s (0 = unlimited),
+    /// shared across the classic stream and every parallel chunk
+    /// worker of an asset download.
+    #[must_use]
+    pub fn with_download_speed_limit(mut self, limit_mb: f64) -> Self {
+        self.download_speed_limit_mb = limit_mb;
+        self
+    }
+
+    /// Progress-bar suffix naming the active cap, empty when uncapped.
+    fn cap_suffix(&self) -> String {
+        if self.download_speed_limit_mb > 0.0 {
+            format!(" (cap {} MB/s)", self.download_speed_limit_mb)
+        } else {
+            String::new()
+        }
     }
 
     fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -627,6 +651,16 @@ impl GhClient {
     ) -> Result<u64> {
         let url = reqwest::Url::parse(&asset.browser_download_url)
             .with_context(|| format!("asset url {:?}", asset.name))?;
+        // Same rate knob class as the model-pull lane: one shared token
+        // bucket across the parallel and classic paths so the cap holds
+        // whichever lane actually serves the download.
+        let throttle = crate::throttle::Throttle::shared(self.download_speed_limit_mb * 1e6);
+        if throttle.is_some() {
+            tracing::info!(
+                limit_mb = self.download_speed_limit_mb,
+                "engine asset download speed-capped"
+            );
+        }
         // Parallel byte-range lane first (the model-pull machinery):
         // engages only for size-known assets big enough to pay for chunk
         // setup and hosts that prove Range support on a strict-206 probe.
@@ -637,7 +671,7 @@ impl GhClient {
             .filter(|s| *s >= crate::hf_parallel::MIN_PARALLEL_BYTES)
         {
             if let Some(n) = self
-                .download_asset_file_parallel(asset, &url, dest, size)
+                .download_asset_file_parallel(asset, &url, dest, size, throttle.as_ref())
                 .await?
             {
                 return Ok(n);
@@ -678,7 +712,7 @@ impl GhClient {
             }
             None => indicatif::ProgressBar::new_spinner(),
         };
-        bar.set_message(format!("engine {}", asset.name));
+        bar.set_message(format!("engine {}{}", asset.name, self.cap_suffix()));
         let mut file =
             std::fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
         let mut hasher = Sha256::new();
@@ -696,6 +730,9 @@ impl GhClient {
                     }
                     hasher.update(&chunk);
                     total += chunk.len() as u64;
+                    if let Some(t) = throttle.as_ref() {
+                        t.acquire(chunk.len() as u64).await;
+                    }
                     bar.inc(chunk.len() as u64);
                 }
                 Ok(None) => break,
@@ -728,6 +765,7 @@ impl GhClient {
         url: &reqwest::Url,
         dest: &std::path::Path,
         size: u64,
+        throttle: Option<&std::sync::Arc<crate::throttle::Throttle>>,
     ) -> Result<Option<u64>> {
         let plan = crate::hf::FilePlan {
             filename: asset.name.clone(),
@@ -746,7 +784,11 @@ impl GhClient {
             None
         };
         let bar = indicatif::ProgressBar::new_spinner();
-        bar.set_message(format!("engine {} (parallel)", asset.name));
+        bar.set_message(format!(
+            "engine {} (parallel){}",
+            asset.name,
+            self.cap_suffix()
+        ));
         let mut progress = |done: u64, total: u64| {
             bar.set_length(total);
             bar.set_position(done);
@@ -758,6 +800,7 @@ impl GhClient {
             &plan,
             dest,
             ASSET_DOWNLOAD_CONNECTIONS,
+            throttle.cloned(),
             &mut progress,
         )
         .await?

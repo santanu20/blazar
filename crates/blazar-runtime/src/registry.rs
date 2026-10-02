@@ -288,6 +288,8 @@ impl Puller {
         let token = std::env::var("BLAZAR_REGISTRY_TOKEN")
             .ok()
             .filter(|t| !t.trim().is_empty());
+        // Inherit the configured download speed cap: the registry lane
+        // must obey the same bandwidth contract as the HF lane.
         let client = HfClient::with_bases(
             &registry_base,
             &registry_base,
@@ -301,7 +303,8 @@ impl Puller {
                     .trim_end_matches('/')
                     .to_string()])
                 .collect(),
-        )?;
+        )?
+        .with_download_speed_limit(self.client.download_speed_limit_mb);
 
         let plan = resolve_registry_plan(&client, &target, &name).await?;
         let RegistryPlan {

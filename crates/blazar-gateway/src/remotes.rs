@@ -25,14 +25,19 @@ const REMOTE_MARK_DOWN_FAILS: u32 = 3;
 /// How long a marked-down remote is skipped before a half-open probe.
 const REMOTE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Circuit + load state for one remote pool member (C2/C3).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// Circuit + load state for one remote pool member (C2/C3), plus the
+/// v0.16 capacity-aware scheduling hints.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct RemoteHealth {
     pub consec_failures: u32,
     /// `Some(t)` = marked down until `t` (requests skip it, then one
     /// half-open probe passes through).
     pub down_until: Option<std::time::Instant>,
     pub in_flight: u32,
+    /// EWMA of observed time-to-response-head in milliseconds (ok
+    /// requests only). `None` until the first success — the scheduler
+    /// then falls back to a neutral default rather than guessing.
+    pub ttft_ewma_ms: Option<f64>,
 }
 
 fn health_key(remote: &Remote) -> String {
@@ -125,6 +130,13 @@ pub fn select_remote<'a>(
         ));
     };
     let now = std::time::Instant::now();
+    // R4: capacity snapshots are plain clones taken before the health
+    // lock — the scorer never nests locks.
+    let caps: std::collections::HashMap<String, PeerCapacity> = state
+        .remote_capacity
+        .lock()
+        .expect("remote_capacity lock poisoned")
+        .clone();
     let mut map = state
         .remote_health
         .lock()
@@ -180,9 +192,12 @@ pub fn select_remote<'a>(
             .find(|(r, _)| health_key(r) == *want)
             .map(|(r, _)| *r)
     });
+    // No sticky hit: capacity-aware ranking (warm tier beats catalog,
+    // queue wait beats idle-cold, then most free VRAM). `rest` is what
+    // the peer actually serves, so the resident lookup keys on it.
     let remote = chosen.unwrap_or_else(|| {
         live.iter()
-            .min_by_key(|(_, h)| h.in_flight)
+            .min_by_key(|(r, h)| score_peer(rest, h, caps.get(&health_key(r))))
             .map(|(r, _)| *r)
             .expect("live pool non-empty")
     });
@@ -225,6 +240,20 @@ pub fn note_remote_result(state: &AppState, remote: &Remote, ok: bool) {
             fails = h.consec_failures
         );
     }
+}
+
+/// Fold one observed time-to-response-head (ms) into the remote's EWMA.
+/// Ok requests only — failures measure the wrong thing (connect timeouts
+/// would inflate decode cost). Takes the map directly (bind_remote
+/// precedent) so it stays unit-pinnable without an AppState.
+pub fn note_remote_latency(
+    map: &std::sync::Mutex<std::collections::HashMap<String, RemoteHealth>>,
+    remote: &Remote,
+    ms: f64,
+) {
+    let mut m = map.lock().expect("remote_health lock poisoned");
+    let h = m.entry(health_key(remote)).or_default();
+    h.ttft_ewma_ms = Some(crate::hint_ewma(h.ttft_ewma_ms, ms));
 }
 
 /// Result bookkeeping shared by every remote lane: circuit note, C4
@@ -271,6 +300,11 @@ pub async fn forward_with_health(
         Ok(x) => x,
         Err(resp) => return resp,
     };
+    // Time-to-response-head: forward_openai returns when the upstream
+    // HEADERS are ready, so this is the queue+prefill signal the
+    // capacity-aware scheduler wants (buffered dialects blend completion
+    // time — an acceptable smear for a hint, documented not filtered).
+    let t0 = std::time::Instant::now();
     let resp = forward_openai(
         state,
         remote,
@@ -281,6 +315,10 @@ pub async fn forward_with_health(
         body,
     )
     .await;
+    let head_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    if resp.status().as_u16() < 500 {
+        note_remote_latency(&state.remote_health, remote, head_ms);
+    }
     tag_remote_result(state, remote, akey, resp)
 }
 
@@ -401,6 +439,220 @@ impl PeerPresence {
     }
 }
 
+/// One GPU as a Blazar peer reports it (`GET /api/capacity`). Only the
+/// scheduling-relevant fields are kept; names are display sugar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerDevice {
+    pub name: String,
+    pub total_vram_bytes: u64,
+    pub free_vram_bytes: u64,
+}
+
+/// One resident model on a Blazar peer: the queue-depth signal the
+/// gateway cannot see from outside (`in_flight` there, not ours).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerResident {
+    pub model: String,
+    pub engine: String,
+    pub state: String,
+    pub slots: Option<u32>,
+    pub slots_configured: Option<u32>,
+    pub in_flight: i64,
+}
+
+/// Cached `GET /api/capacity` for one remote (v0.16 federation). A
+/// non-Blazar remote simply never populates this — absence is the
+/// degrade signal, never an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerCapacity {
+    pub fetched: std::time::Instant,
+    pub devices: Vec<PeerDevice>,
+    pub residents: Vec<PeerResident>,
+}
+
+/// Bound on the per-peer capacity cache: one entry per configured
+/// remote; arbitrary eviction keeps it bounded under config churn.
+const REMOTE_CAPACITY_CAP: usize = 64;
+
+/// Parse a peer's `/api/capacity` body. Pure so the shape contract is
+/// unit-pinned without a live peer; malformed rows drop, a body that
+/// is not the Blazar shape yields `None` (silent-absent for
+/// non-Blazar remotes).
+fn parse_capacity(v: &serde_json::Value) -> Option<PeerCapacity> {
+    if v.get("object").and_then(|o| o.as_str()) != Some("blazar.capacity") {
+        return None;
+    }
+    let devices: Vec<PeerDevice> = v
+        .get("devices")?
+        .as_array()?
+        .iter()
+        .filter_map(|d| {
+            Some(PeerDevice {
+                name: d.get("name").and_then(|n| n.as_str())?.to_string(),
+                total_vram_bytes: d.get("total_vram_bytes").and_then(|n| n.as_u64())?,
+                free_vram_bytes: d.get("free_vram_bytes").and_then(|n| n.as_u64())?,
+            })
+        })
+        .collect();
+    let residents: Vec<PeerResident> = v
+        .get("residents")?
+        .as_array()?
+        .iter()
+        .filter_map(|r| {
+            Some(PeerResident {
+                model: r.get("model").and_then(|n| n.as_str())?.to_string(),
+                engine: r.get("engine").and_then(|n| n.as_str())?.to_string(),
+                state: r.get("state").and_then(|n| n.as_str())?.to_string(),
+                slots: r
+                    .get("slots")
+                    .and_then(|n| n.as_u64())
+                    .and_then(|n| u32::try_from(n).ok()),
+                slots_configured: r
+                    .get("slots_configured")
+                    .and_then(|n| n.as_u64())
+                    .and_then(|n| u32::try_from(n).ok()),
+                in_flight: r.get("in_flight").and_then(|n| n.as_i64())?,
+            })
+        })
+        .collect();
+    Some(PeerCapacity {
+        fetched: std::time::Instant::now(),
+        devices,
+        residents,
+    })
+}
+
+/// One `GET /api/capacity` against a remote. Any failure (non-Blazar
+/// peer, timeout, 5xx, unparseable body) is `None` — the peer stays a
+/// plain OpenAI-shaped remote with no capacity signals.
+async fn fetch_capacity(state: &AppState, remote: &Remote) -> Option<PeerCapacity> {
+    let url = format!("{}/api/capacity", remote.url.trim_end_matches('/'));
+    let mut req = state.http.get(&url);
+    if !remote.key.is_empty() {
+        req = req.bearer_auth(&remote.key);
+    }
+    let v = req
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
+    parse_capacity(&v)
+}
+
+/// Fetch one remote's capacity and cache it. Observability surfaces
+/// (`/api/ps`) call this alongside their presence probe so a fresh
+/// gateway shows capacity signals without waiting for routing traffic;
+/// routing paths get the same effect via `refresh_presence`.
+pub(crate) async fn refresh_capacity_cache(state: &AppState, remote: &Remote) {
+    let hkey = health_key(remote);
+    if let Some(c) = fetch_capacity(state, remote).await {
+        insert_capacity(&state.remote_capacity, &hkey, c);
+    }
+}
+
+/// Store a fetched capacity snapshot (bounded, arbitrary eviction).
+/// Takes the map directly so the bound is unit-pinnable without an
+/// `AppState` (same shape as `bind_remote`).
+fn insert_capacity(
+    map: &std::sync::Mutex<std::collections::HashMap<String, PeerCapacity>>,
+    hkey: &str,
+    cap: PeerCapacity,
+) {
+    let mut m = map.lock().expect("remote_capacity lock poisoned");
+    if m.len() >= REMOTE_CAPACITY_CAP && !m.contains_key(hkey) {
+        if let Some(evict) = m.keys().next().cloned() {
+            m.remove(&evict);
+        }
+    }
+    m.insert(hkey.to_string(), cap);
+}
+
+/// Latest cached capacity for a remote (display/read path; freshness
+/// is owned by the presence refresh lane that populates it).
+pub fn cached_capacity(state: &AppState, remote: &Remote) -> Option<PeerCapacity> {
+    state
+        .remote_capacity
+        .lock()
+        .ok()?
+        .get(&health_key(remote))
+        .cloned()
+}
+
+/// Neutral time-to-head guess (ms) before the first success teaches a
+/// real EWMA. Deliberately modest: it only orders peers we know nothing
+/// about, and capacity signals dominate the tier long before it matters.
+const REMOTE_TTFT_DEFAULT_MS: f64 = 750.0;
+
+/// Scheduling tier: warm peers always outrank catalog-cold peers, which
+/// outrank unknown-capacity peers — a warm peer's queue wait is measured
+/// while a cold peer's real cost is the model load we cannot see from
+/// here. Numbers, not stringly tiers, so `Ord` derives.
+const REMOTE_TIER_WARM: u8 = 0;
+const REMOTE_TIER_UNKNOWN: u8 = 1;
+const REMOTE_TIER_COLD: u8 = 2;
+
+/// Capacity-aware peer ranking (v0.16). Field order IS the priority:
+/// tier, then estimated wait, then most free VRAM. Derived `Ord` — no
+/// hand-written comparator to get wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PeerScore {
+    tier: u8,
+    est_wait_ms: u64,
+    free_vram: std::cmp::Reverse<u64>,
+}
+
+/// Score one peer for serving `model`. Pure over its signal snapshots
+/// so every ordering rule is unit-pinnable without a live peer.
+///
+/// Estimated wait = queue depth x observed time-to-head: the peer's own
+/// `in_flight` for the model (from its capacity residents — R2: the
+/// gateway-side lease alone misses the peer's local load) plus our
+/// leases on it, divided by its slot count, times the EWMA (or the
+/// neutral default before the first success).
+#[must_use]
+// wave counts (< 2^52 by construction) and ceiling results are exact in f64;
+// the ranking math reads clearest in float waves x ttft
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+pub fn score_peer(model: &str, h: &RemoteHealth, cap: Option<&PeerCapacity>) -> PeerScore {
+    let ttft_ms = h.ttft_ewma_ms.unwrap_or(REMOTE_TTFT_DEFAULT_MS).max(1.0);
+    let (tier, slots, peer_in_flight, free_vram) = match cap {
+        None => (REMOTE_TIER_UNKNOWN, 1u64, 0u64, 0u64),
+        Some(c) => {
+            let free = c
+                .devices
+                .iter()
+                .map(|d| d.free_vram_bytes)
+                .max()
+                .unwrap_or(0);
+            match c.residents.iter().find(|r| r.model == model) {
+                Some(r) => {
+                    let slots = r
+                        .slots_configured
+                        .or(r.slots)
+                        .map(u64::from)
+                        .unwrap_or(1)
+                        .max(1);
+                    let busy = r.in_flight.max(0) as u64;
+                    (REMOTE_TIER_WARM, slots, busy, free)
+                }
+                None => (REMOTE_TIER_COLD, 1, 0, free),
+            }
+        }
+    };
+    let queue = h.in_flight as u64 + peer_in_flight;
+    let waves = queue.div_ceil(slots);
+    PeerScore {
+        tier,
+        est_wait_ms: (waves as f64 * ttft_ms).ceil() as u64,
+        free_vram: std::cmp::Reverse(free_vram),
+    }
+}
+
 /// Pure gate for the forced re-probe: due when never forced or the
 /// last forced probe is past the throttle window.
 fn force_refresh_due(presence: Option<&PeerPresence>) -> bool {
@@ -473,7 +725,15 @@ async fn refresh_presence(state: &AppState, remote: &Remote) -> Option<Vec<Strin
             return Some(p.entries.clone());
         }
     }
-    let entries = fetch_presence(state, remote).await?;
+    // Presence + capacity ride together: a slow-but-alive peer pays
+    // max(3s, 3s) wall, never the sum (F15). Capacity failure alone
+    // never fails presence — a non-Blazar peer stays routable.
+    let (entries, capacity) =
+        tokio::join!(fetch_presence(state, remote), fetch_capacity(state, remote));
+    if let Some(c) = capacity {
+        insert_capacity(&state.remote_capacity, &hkey, c);
+    }
+    let entries = entries?;
     if let Ok(mut m) = state.remote_presence.lock() {
         let last_forced = m.get(&hkey).and_then(|p| p.last_forced);
         m.insert(
@@ -506,7 +766,14 @@ async fn force_refresh_presence(state: &AppState, remote: &Remote) -> Option<Vec
             .ok()
             .and_then(|m| m.get(&hkey).map(|p| p.entries.clone()));
     }
-    let entries = fetch_presence(state, remote).await?;
+    // Same joined refresh as the natural path: the forced probe is the
+    // one that runs on a request, so concurrency matters most here.
+    let (entries, capacity) =
+        tokio::join!(fetch_presence(state, remote), fetch_capacity(state, remote));
+    if let Some(c) = capacity {
+        insert_capacity(&state.remote_capacity, &hkey, c);
+    }
+    let entries = entries?;
     if let Ok(mut m) = state.remote_presence.lock() {
         m.insert(
             hkey,
@@ -619,14 +886,41 @@ pub enum FallbackLane<'a> {
     },
 }
 
+/// Rank already-filtered peers by capacity score. Health and capacity
+/// snapshots are cloned before any comparison (R4: no lock held during
+/// scoring); the stable sort preserves config order as tiebreak.
+fn rank_peers_by_capacity<'a>(
+    state: &'a AppState,
+    model: &str,
+    peers: &[&'a Remote],
+) -> Vec<&'a Remote> {
+    let caps = state
+        .remote_capacity
+        .lock()
+        .expect("remote_capacity lock poisoned")
+        .clone();
+    let healths = state
+        .remote_health
+        .lock()
+        .expect("remote_health lock poisoned")
+        .clone();
+    let mut ranked = peers.to_vec();
+    ranked.sort_by_key(|r| {
+        let h = healths.get(&health_key(r)).copied().unwrap_or_default();
+        score_peer(model, &h, caps.get(&health_key(r)))
+    });
+    ranked
+}
+
 /// Federation fallback, one shared path for every lane hook: a bare
 /// model name the local store does not own (PURE not-found — an
 /// ambiguous local match stays local, that is a naming problem) routes
-/// to the least-busy live peer whose catalog lists it. Returns `None`
-/// when federation is off, the model resolves locally, or no peer
-/// claims it — the caller's existing local error path stays untouched.
-/// Key admission (scope + request count) runs at the call site before
-/// this, exactly like explicit-prefix routing.
+/// to the best-ranked live peer whose catalog lists it (capacity-aware
+/// since v0.16). Returns `None` when federation is off, the model
+/// resolves locally, or no peer claims it — the caller's existing
+/// local error path stays untouched. Key admission (scope + request
+/// count) runs at the call site before this, exactly like
+/// explicit-prefix routing.
 pub async fn try_fallback_forward(
     state: &AppState,
     model: &str,
@@ -643,7 +937,12 @@ pub async fn try_fallback_forward(
         return None;
     }
     let peers = peers_serving_with_refresh(state, model).await;
-    let peer = peers.first()?;
+    // Capacity-aware pick among serving peers: warm/queue/VRAM ranking
+    // (v0.16) replaces blind `first()`; stable sort keeps config order
+    // as the tiebreak, and capacity-less peers degrade to neutral tier.
+    let peer = rank_peers_by_capacity(state, model, &peers)
+        .into_iter()
+        .next()?;
     tracing::info!(target: "blazar::remotes", peer = %peer.name, model = %model, "fallback: routing bare model to peer");
     let prefixed = format!("{}:{}", peer.name, model);
     match lane {
@@ -1007,6 +1306,65 @@ mod tests {
     }
 
     #[test]
+    fn unit__parse_capacity__blazar_shape_devices_and_residents() {
+        let v = serde_json::json!({
+            "object": "blazar.capacity",
+            "devices": [
+                {"id": "cuda:0", "name": "RTX 4070", "total_vram_bytes": 8589934592u64, "free_vram_bytes": 2147483648u64},
+                // Malformed row (missing free) drops, never panics.
+                {"id": "cuda:1", "name": "half-there", "total_vram_bytes": 1u64}
+            ],
+            "residents": [
+                {"model": "qwen3-8b", "engine": "llamacpp", "state": "ready",
+                 "slots": 2, "slots_configured": 4, "in_flight": 3, "pid": 123},
+                // String slots (non-Blazar drift) drops the row.
+                {"model": "bad", "engine": "x", "state": "ready", "in_flight": "many"}
+            ],
+            "external": [], "notes": []
+        });
+        let c = parse_capacity(&v).expect("blazar shape parses");
+        assert_eq!(c.devices.len(), 1);
+        assert_eq!(c.devices[0].free_vram_bytes, 2_147_483_648);
+        assert_eq!(c.residents.len(), 1);
+        assert_eq!(c.residents[0].model, "qwen3-8b");
+        assert_eq!(c.residents[0].slots, Some(2));
+        assert_eq!(c.residents[0].slots_configured, Some(4));
+        assert_eq!(c.residents[0].in_flight, 3);
+    }
+
+    #[test]
+    fn unit__parse_capacity__foreign_body_is_none_not_error() {
+        // A vLLM-style /v1/models body or HTML error page: absent, not
+        // an error — the peer stays a plain remote.
+        assert!(parse_capacity(&serde_json::json!({"data": [{"id": "m"}]})).is_none());
+        assert!(parse_capacity(&serde_json::json!({"object": "other"})).is_none());
+        // Missing arrays entirely: no capacity contract.
+        assert!(parse_capacity(&serde_json::json!({"object": "blazar.capacity"})).is_none());
+    }
+
+    #[test]
+    fn unit__insert_capacity__bounded_with_arbitrary_eviction() {
+        let map: std::sync::Mutex<std::collections::HashMap<String, PeerCapacity>> =
+            std::sync::Mutex::new(std::collections::HashMap::new());
+        let cap = || PeerCapacity {
+            fetched: std::time::Instant::now(),
+            devices: vec![],
+            residents: vec![],
+        };
+        for i in 0..REMOTE_CAPACITY_CAP {
+            insert_capacity(&map, &format!("r{i}"), cap());
+        }
+        assert_eq!(map.lock().unwrap().len(), REMOTE_CAPACITY_CAP);
+        // Existing keys still refresh at cap.
+        insert_capacity(&map, "r0", cap());
+        assert_eq!(map.lock().unwrap().len(), REMOTE_CAPACITY_CAP);
+        // One new peer beyond the cap evicts some earlier entry.
+        insert_capacity(&map, "r-new", cap());
+        assert_eq!(map.lock().unwrap().len(), REMOTE_CAPACITY_CAP);
+        assert!(map.lock().unwrap().contains_key("r-new"));
+    }
+
+    #[test]
     fn unit__force_refresh_due__throttled_per_remote() {
         // No presence yet: the first forced probe is due.
         assert!(force_refresh_due(None));
@@ -1045,6 +1403,110 @@ mod tests {
         assert!(
             !fallback_enabled(&cfg),
             "kill switch rolls the feature back"
+        );
+    }
+
+    #[test]
+    fn unit__note_remote_latency__ewma_converges_toward_new_observations() {
+        let map: std::sync::Mutex<std::collections::HashMap<String, RemoteHealth>> =
+            std::sync::Mutex::new(std::collections::HashMap::new());
+        let r = Remote {
+            name: "peer".into(),
+            url: "http://127.0.0.1:1".into(),
+            key: String::new(),
+        };
+        note_remote_latency(&map, &r, 1000.0);
+        assert_eq!(
+            map.lock()
+                .unwrap()
+                .get(&health_key(&r))
+                .unwrap()
+                .ttft_ewma_ms,
+            Some(1000.0),
+            "first observation seeds the EWMA"
+        );
+        note_remote_latency(&map, &r, 500.0);
+        let e = map
+            .lock()
+            .unwrap()
+            .get(&health_key(&r))
+            .unwrap()
+            .ttft_ewma_ms;
+        assert!((e.unwrap() - (0.7 * 1000.0 + 0.3 * 500.0)).abs() < 1e-9);
+    }
+
+    fn cap_with(residents: Vec<PeerResident>, free: u64) -> PeerCapacity {
+        PeerCapacity {
+            fetched: std::time::Instant::now(),
+            devices: vec![PeerDevice {
+                name: "gpu".into(),
+                total_vram_bytes: free * 2,
+                free_vram_bytes: free,
+            }],
+            residents,
+        }
+    }
+
+    fn resident_row(
+        model: &str,
+        slots: Option<u32>,
+        configured: Option<u32>,
+        in_flight: i64,
+    ) -> PeerResident {
+        PeerResident {
+            model: model.into(),
+            engine: "llamacpp".into(),
+            state: "ready".into(),
+            slots,
+            slots_configured: configured,
+            in_flight,
+        }
+    }
+
+    #[test]
+    fn unit__score_peer__tier_dominates_wait_numbers() {
+        let idle = RemoteHealth::default();
+        // A warm peer buried in queue work still outranks an idle cold
+        // peer and an unknown-capacity peer: the cold peer's real cost
+        // is a model load nobody measured from here.
+        let warm_busy = cap_with(vec![resident_row("m", Some(4), Some(4), 64)], 1_000_000_000);
+        let cold_idle = cap_with(vec![], 20_000_000_000);
+        let s_warm = score_peer("m", &idle, Some(&warm_busy));
+        let s_cold = score_peer("m", &idle, Some(&cold_idle));
+        let s_unknown = score_peer("m", &idle, None);
+        assert!(s_warm < s_cold, "warm beats cold regardless of wait");
+        assert!(
+            s_unknown < s_cold,
+            "unknown-capacity outranks known-cold: unknown may be warm, cold needs a load"
+        );
+    }
+
+    #[test]
+    fn unit__score_peer__queue_wait_math_and_ttft_sources() {
+        // slots=2, peer in_flight=3, our leases=2 -> queue 5 -> 3 slot
+        // waves -> wait = 3 x ttft.
+        let mut h = RemoteHealth::default();
+        h.in_flight = 2;
+        let cap = cap_with(vec![resident_row("m", Some(2), Some(2), 3)], 0);
+        let s = score_peer("m", &h, Some(&cap));
+        assert_eq!(s.est_wait_ms, 3 * 750, "default ttft fills in before EWMA");
+        h.ttft_ewma_ms = Some(100.0);
+        let s = score_peer("m", &h, Some(&cap));
+        assert_eq!(s.est_wait_ms, 300, "observed EWMA drives the estimate");
+        // No resident row: cold tier, lease-only queue — two leases at
+        // slots=1 are two waves of the observed ttft.
+        let s_cold = score_peer("m", &h, Some(&cap_with(vec![], 0)));
+        assert_eq!(s_cold.est_wait_ms, 200);
+    }
+
+    #[test]
+    fn unit__score_peer__free_vram_breaks_wait_ties() {
+        let h = RemoteHealth::default();
+        let small = cap_with(vec![], 1_000_000_000);
+        let big = cap_with(vec![], 9_000_000_000);
+        assert!(
+            score_peer("m", &h, Some(&big)) < score_peer("m", &h, Some(&small)),
+            "equal cold waits rank by most free VRAM"
         );
     }
 }

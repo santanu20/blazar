@@ -297,7 +297,7 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "blazar-cli"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "blazar-core"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "dirs",
  "iai-callgrind",
@@ -345,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "blazar-gateway"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "blazar-runtime"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -406,6 +406,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
  "wiremock",
  "zip",
 ]

@@ -233,6 +233,98 @@ async fn e2e__healthz_version_tags_models() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn e2e__ollama_delete_accepts_the_tags_rendered_name() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    // GET /api/tags renders `name:quant`; a client deleting by that exact
+    // string must succeed. The raw store-key probe this replaces 404'd on
+    // the tags-displayed name (store key is the bare `m1`).
+    let status = c
+        .post(format!("{}/api/delete", ts.base))
+        .json(&serde_json::json!({"model": "m1:q4_k_m"}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 200);
+    // Row and file are gone; the untouched sibling stays.
+    let t: serde_json::Value = c
+        .get(format!("{}/api/tags", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let names: Vec<&str> = t["models"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|m| m["name"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(!names.contains(&"m1:q4_k_m"), "deleted row gone: {names:?}");
+    assert!(names.contains(&"m2:q4_k_m"), "sibling untouched: {names:?}");
+    // Already-deleted (by any colon form) and unknown names still teach
+    // 404 through the resolver, which carries the suggestion ladder.
+    for probe in ["m1:q4_k_m", "m1", "m1:latest", "no-such-model"] {
+        let status = c
+            .post(format!("{}/api/delete", ts.base))
+            .json(&serde_json::json!({"model": probe}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 404, "probe {probe:?}");
+    }
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__num_ctx_header_resolves_the_tags_rendered_name() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    // X-Blazar-Num-Ctx (and X-Blazar-Spec) feed the RAW body model into
+    // apply_num_ctx/apply_spec; the tags-rendered alias must behave like
+    // the exact name. The raw-key probe this replaces silently skipped
+    // the KV preflight AND queued a phantom ctx under the display alias.
+    // An absurd ctx makes resolution observable: the preflight refuses
+    // loudly through the resolver instead of no-op'ing.
+    let chat = |model: &str| {
+        serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+    };
+    for model in ["m1", "m1:q4_k_m"] {
+        let resp = c
+            .post(format!("{}/v1/chat/completions", ts.base))
+            .header("x-blazar-num-ctx", "999999999999")
+            .json(&chat(model))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "model {model:?}: preflight must fire");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let msg = body.to_string();
+        assert!(
+            msg.contains("cannot fit the GPU"),
+            "model {model:?}: KV refuse teaching, got {msg}"
+        );
+    }
+    // Unknown names fail fast from the header path with the ladder's
+    // teaching instead of queueing a phantom ctx.
+    let resp = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .header("x-blazar-num-ctx", "8192")
+        .json(&chat("no-such-model"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn e2e__openai_chat_nonstream_and_stream() {
     let ts = start(Config::default()).await;
     let c = client();
@@ -801,6 +893,66 @@ async fn e2e__local_whisper_charges_key_admission() {
     assert_eq!(first.status(), 501, "half-missing teaching");
     let second = post_multipart("plm_whisper").await;
     assert_eq!(second.status(), 429, "rpm=1 exhausted by the local lane");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__whisper_stream_and_async_are_mutually_exclusive() {
+    // F6: `stream` + `async` on one body is a request-shape error — it
+    // must 400 before lane availability is even considered.
+    let ts = start(Config::default()).await;
+    let c = client();
+    let boundary = "X-BLAZAR-F6-MM";
+    let multipart = format!(
+        "--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; \
+         filename=\"clip.wav\"\r\ncontent-type: audio/wav\r\n\r\nAAAA\r\n\
+         --{boundary}\r\ncontent-disposition: form-data; name=\"stream\"\r\n\r\ntrue\r\n\
+         --{boundary}\r\ncontent-disposition: form-data; name=\"async\"\r\n\r\ntrue\r\n\
+         --{boundary}--\r\n"
+    );
+    let resp = c
+        .post(format!("{}/v1/audio/transcriptions", ts.base))
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(multipart)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("mutually exclusive"), "body: {body}");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__whisper_stream_without_engine_keeps_teaching() {
+    // F6: stream on a rig with no whisper engine falls through to the
+    // lane-absent 501 teaching — the streaming branch never bypasses
+    // the teaching ladder.
+    let ts = start(Config::default()).await;
+    let c = client();
+    let boundary = "X-BLAZAR-F6-ST";
+    let multipart = format!(
+        "--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; \
+         filename=\"clip.wav\"\r\ncontent-type: audio/wav\r\n\r\nAAAA\r\n\
+         --{boundary}\r\ncontent-disposition: form-data; name=\"stream\"\r\n\r\ntrue\r\n\
+         --{boundary}--\r\n"
+    );
+    let resp = c
+        .post(format!("{}/v1/audio/transcriptions", ts.base))
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(multipart)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 501);
     ts.state.sup.shutdown_all().await.unwrap();
 }
 

@@ -352,33 +352,36 @@ pub async fn delete(State(state): State<Arc<AppState>>, body: Bytes) -> Response
         .as_str()
         .or(req["name"].as_str())
         .unwrap_or_default();
+    // Resolve through the shared ladder (exact → colon-swap → bare stem
+    // → unique prefix → suggestion) so a client can delete by the very
+    // `name:quant` string GET /api/tags rendered — a raw store-key probe
+    // here 404'd on the tags-displayed name. Same rule the CLI's
+    // `blazar rm` applies before removing.
+    let row = match state.with_store(|s| crate::proxy::resolve_model(s, name)) {
+        Some(Ok(row)) => row,
+        Some(Err(msg)) => return api_error(404, &msg),
+        None => return api_error(500, "store unavailable"),
+    };
+    let key = row.name;
     // F22: classify from typed state, not error-string substrings — an
     // unrelated io error whose text contains "running" must not 409.
-    if blazar_runtime::instance_running(&state.dirs, name) {
+    if blazar_runtime::instance_running(&state.dirs, &key) {
         return api_error(
             409,
             &format!(
-                "model {name} is currently running; stop it first (`blazar stop {name}` or wait for eviction)"
+                "model {key} is currently running; stop it first (`blazar stop {key}` or wait for eviction)"
             ),
         );
     }
-    // unwrap_or(false): store unavailable != model-missing — never
-    // fabricate a 404; remove_model below surfaces the real failure.
-    if state
-        .with_store(|s| s.get_model(name).ok().flatten().is_none())
-        .unwrap_or(false)
-    {
-        return api_error(404, &format!("no such model: {name}"));
-    }
-    match blazar_runtime::remove_model(&state.dirs, name) {
+    match blazar_runtime::remove_model(&state.dirs, &key) {
         Ok(()) => StatusCode::OK.into_response(),
         // State may shift between pre-checks and removal (race) —
         // classify from live state again, never from the message text.
         Err(e) => {
-            if blazar_runtime::instance_running(&state.dirs, name) {
+            if blazar_runtime::instance_running(&state.dirs, &key) {
                 api_error(409, &format!("{e:#}"))
             } else if state
-                .with_store(|s| s.get_model(name).ok().flatten().is_none())
+                .with_store(|s| s.get_model(&key).ok().flatten().is_none())
                 .unwrap_or(false)
             {
                 api_error(404, &format!("{e:#}"))
@@ -452,12 +455,38 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
             .iter()
             .map(|r| {
                 let s = &state_for_probe;
-                async move { (r.name.clone(), crate::remotes::probe(s, r).await) }
+                async move {
+                    // Presence probe and capacity-cache refresh ride
+                    // together (max(3s, 3s) wall): `ps` populates the
+                    // capacity signals a fresh gateway would otherwise
+                    // only gain from routing traffic.
+                    let (probe, ()) = tokio::join!(
+                        crate::remotes::probe(s, r),
+                        crate::remotes::refresh_capacity_cache(s, r)
+                    );
+                    (r, probe)
+                }
             })
             .collect();
         let mut out = Vec::new();
-        for (name, (ok, note)) in futures::future::join_all(futs).await {
-            out.push(json!({"name": name, "ok": ok, "note": note}));
+        for (r, (ok, note)) in futures::future::join_all(futs).await {
+            let mut entry = json!({"name": r.name, "ok": ok, "note": note});
+            // v0.16: cached capacity summary per remote. The field is
+            // ABSENT when there is no snapshot (non-Blazar peer, or not
+            // yet fetched) — absence is the degrade signal, matching
+            // the parse_capacity contract.
+            if let Some(c) = crate::remotes::cached_capacity(&state, r) {
+                let free: u64 = c.devices.iter().map(|d| d.free_vram_bytes).sum();
+                let total: u64 = c.devices.iter().map(|d| d.total_vram_bytes).sum();
+                entry["capacity"] = json!({
+                    "devices": c.devices.len(),
+                    "total_vram_bytes": total,
+                    "free_vram_bytes": free,
+                    "residents": c.residents.len(),
+                    "age_secs": c.fetched.elapsed().as_secs(),
+                });
+            }
+            out.push(entry);
         }
         out
     };
@@ -623,11 +652,13 @@ pub async fn pull(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     // Drive the pull on a task; stream events until ModelPulled/PullFailed.
     let pull_request = target.clone();
     let dl_conns = state.config.download_connections;
+    let dl_limit = state.config.download_speed_limit_mb;
     tokio::spawn(async move {
         let token = std::env::var("HF_TOKEN").ok();
-        let client = match blazar_runtime::hf::HfClient::new(token)
-            .map(|c| c.with_download_connections(dl_conns))
-        {
+        let client = match blazar_runtime::hf::HfClient::new(token).map(|c| {
+            c.with_download_connections(dl_conns)
+                .with_download_speed_limit(dl_limit)
+        }) {
             Ok(c) => c,
             Err(e) => {
                 bus.publish(blazar_runtime::BlazarEvent::PullFailed {
@@ -1538,6 +1569,17 @@ pub(crate) async fn apply_num_ctx(
     if want <= 0 {
         return Err(Box::new(api_error(400, "options.num_ctx must be positive")));
     }
+    // The OpenAI path feeds the raw body name (X-Blazar-Num-Ctx); ride
+    // the shared ladder so the tags-rendered alias (`m1:q4_k_m`) gets
+    // the same recycle + ctx queue as the exact name, instead of
+    // silently skipping the preflight and queueing a phantom ctx under
+    // the display alias. Unknown names fail fast with the ladder's
+    // teaching message — the serving path would 404 identically.
+    let model = match state.with_store(|s| crate::proxy::resolve_model(s, model)) {
+        Some(Ok(row)) => row.name,
+        Some(Err(msg)) => return Err(Box::new(api_error(404, &msg))),
+        None => return Err(Box::new(api_error(500, "store unavailable"))),
+    };
     // ctx preflight (I5): refuse a num_ctx no spawn could host, BEFORE
     // the evict below can take a healthy instance down. One placement
     // model for both lanes (device truth): the KV pool is device-backed
@@ -1547,7 +1589,7 @@ pub(crate) async fn apply_num_ctx(
     // the engine's own fit juggling at spawn.
     {
         let row = state
-            .with_store(|s| s.get_model(model).ok().flatten())
+            .with_store(|s| s.get_model(&model).ok().flatten())
             .flatten();
         if let Some(row) = row {
             if let Ok(meta) = blazar_core::read_metadata_file(std::path::Path::new(&row.path)) {
@@ -1568,7 +1610,7 @@ pub(crate) async fn apply_num_ctx(
                     // pin the spawn itself would host (split-brain
                     // observed live: a 65536 vision pin refused at f16
                     // math while the spawn laddered to q8_0 happily).
-                    let (eff_k, eff_v) = state.config.effective_cache_type_kv(model);
+                    let (eff_k, eff_v) = state.config.effective_cache_type_kv(&model);
                     let pair_set = !eff_k.is_empty() || !eff_v.is_empty();
                     let ladder: Vec<Option<(String, String)>> = if pair_set {
                         vec![Some((eff_k, eff_v))]
@@ -1619,15 +1661,15 @@ pub(crate) async fn apply_num_ctx(
     let running = state.sup.ps().into_iter().find(|p| p.name == model);
     if let Some(p) = running {
         if i64::from(p.ctx) < want && p.in_flight == 0 {
-            let _ = state.sup.evict_model(model).await;
+            let _ = state.sup.evict_model(&model).await;
             state
                 .sup
-                .set_next_ctx(model, u32::try_from(want).unwrap_or(u32::MAX));
+                .set_next_ctx(&model, u32::try_from(want).unwrap_or(u32::MAX));
         }
     } else {
         state
             .sup
-            .set_next_ctx(model, u32::try_from(want).unwrap_or(u32::MAX));
+            .set_next_ctx(&model, u32::try_from(want).unwrap_or(u32::MAX));
     }
     Ok(())
 }
@@ -1655,13 +1697,22 @@ pub(crate) async fn apply_spec(
             ),
         )));
     }
+    // Same ladder rule as `apply_num_ctx`: resolve so the spec-queue key
+    // matches the instance key (the OpenAI header path feeds the raw
+    // body name) and unknown names fail fast instead of queuing a
+    // phantom spec under the display alias.
+    let model = match state.with_store(|s| crate::proxy::resolve_model(s, model)) {
+        Some(Ok(row)) => row.name,
+        Some(Err(msg)) => return Err(Box::new(api_error(404, &msg))),
+        None => return Err(Box::new(api_error(500, "store unavailable"))),
+    };
     if let Some(p) = state.sup.ps().into_iter().find(|p| p.name == model) {
         if p.spec_mode != want && p.in_flight == 0 {
-            let _ = state.sup.evict_model(model).await;
-            state.sup.set_next_spec(model, want);
+            let _ = state.sup.evict_model(&model).await;
+            state.sup.set_next_spec(&model, want);
         }
     } else {
-        state.sup.set_next_spec(model, want);
+        state.sup.set_next_spec(&model, want);
     }
     Ok(())
 }
@@ -3057,7 +3108,7 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
             Err(e) => api_error(502, &format!("router unload: {e}")),
         };
     }
-    match state.sup.evict_model(model).await {
+    match state.sup.evict_model(&model).await {
         Ok(()) => axum::Json(json!({"status": "ok"})).into_response(),
         Err(e) => api_error(404, &e.to_string()),
     }

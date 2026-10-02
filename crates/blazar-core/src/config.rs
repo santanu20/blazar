@@ -90,6 +90,13 @@ pub struct Config {
     /// (>= 32 MiB). 1 = classic single-stream resume lane. Servers that
     /// reject Range get the single-stream lane regardless.
     pub download_connections: u32,
+    /// Total download speed cap in MB/s (decimal megabytes), shared
+    /// across every connection of a pull — a ceiling on the WHOLE
+    /// download, not per connection. 0 = unlimited (default). Low caps
+    /// keep a model pull from saturating a shared link (the ollama
+    /// "no way to rate-limit downloads" complaint); read timeouts are
+    /// idle-gap based, so slow-but-flowing capped pulls never abort.
+    pub download_speed_limit_mb: f64,
     /// "auto" (default: opportunistic — embedded MTP head used when the
     /// GGUF carries one, catalog draft pair used when pulled, dense with a
     /// teaching warning otherwise) | "off" | "mtp" | "eagle3" | "dflash" |
@@ -404,6 +411,15 @@ pub struct Config {
     /// the child alive until daemon teardown (the pre-reaper behavior).
     #[serde(default = "default_whisper_idle_secs")]
     pub whisper_idle_secs: u64,
+    /// Audio lane streaming (F6): target window per progressive decode
+    /// chunk when `stream=true` rides a transcription. The gateway splits
+    /// WAV PCM payloads into slices of this length (frame-aligned) and
+    /// emits one SSE `chunk.completed` event per decoded slice, so long
+    /// recordings surface text every few seconds instead of only at the
+    /// end. Non-WAV inputs stream as a single final event (upstream has
+    /// no streaming surface to relay). Range `1_000..=120_000` ms.
+    #[serde(default = "default_whisper_stream_chunk_ms")]
+    pub whisper_stream_chunk_ms: u64,
     /// Capability-lane registry URL (curated fork lanes for GGUF
     /// architectures mainline llama.cpp can't load yet). `None` = the
     /// default registry; `Some("")` disables registry lookups entirely
@@ -1929,6 +1945,10 @@ fn default_whisper_idle_secs() -> u64 {
     900
 }
 
+fn default_whisper_stream_chunk_ms() -> u64 {
+    30_000
+}
+
 fn default_fork_retire_days() -> u64 {
     7
 }
@@ -2120,10 +2140,12 @@ impl Default for Config {
             update_channel: UpdateChannel::default(),
             engine_asset: "auto".to_string(),
             download_connections: 8,
+            download_speed_limit_mb: 0.0,
             router_max_models: 0,
             late_chunking_max_tokens: default_late_chunking_max_tokens(),
             session_keep_secs: default_session_keep_secs(),
             whisper_idle_secs: default_whisper_idle_secs(),
+            whisper_stream_chunk_ms: default_whisper_stream_chunk_ms(),
             capability_registry_url: None,
             fork_retire_days: default_fork_retire_days(),
             semantic_cache: SemanticCacheConfig::default(),
@@ -2884,6 +2906,19 @@ impl Config {
             return Err(CoreError::Config(format!(
                 "download_connections must be within 1..=32 (1 = single-stream resume), got {}",
                 self.download_connections
+            )));
+        }
+        if !self.download_speed_limit_mb.is_finite() || self.download_speed_limit_mb < 0.0 {
+            return Err(CoreError::Config(format!(
+                "download_speed_limit_mb must be a finite number >= 0 (0 = unlimited), got {}",
+                self.download_speed_limit_mb
+            )));
+        }
+        if !(1_000..=120_000).contains(&self.whisper_stream_chunk_ms) {
+            return Err(CoreError::Config(format!(
+                "whisper_stream_chunk_ms must be 1000..=120000 (milliseconds per progressive \
+                 decode window), got {}",
+                self.whisper_stream_chunk_ms
             )));
         }
         match self.child_transport.as_str() {
@@ -3723,6 +3758,12 @@ impl Config {
         }
         if let Some(v) = env("BLAZAR_DOWNLOAD_CONNECTIONS") {
             cfg.download_connections = parse_u32("BLAZAR_DOWNLOAD_CONNECTIONS", &v)?;
+        }
+        if let Some(v) = env("BLAZAR_DOWNLOAD_SPEED_LIMIT_MB") {
+            cfg.download_speed_limit_mb = parse_f64("BLAZAR_DOWNLOAD_SPEED_LIMIT_MB", &v)?;
+        }
+        if let Some(v) = env("BLAZAR_WHISPER_STREAM_CHUNK_MS") {
+            cfg.whisper_stream_chunk_ms = parse_u64("BLAZAR_WHISPER_STREAM_CHUNK_MS", &v)?;
         }
         if let Some(v) = env("BLAZAR_SPEC") {
             cfg.spec = v;
@@ -5204,6 +5245,34 @@ default_ctx = 16384
             msg.contains("BLAZAR_PORT") && msg.contains("not-a-port"),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn unit__download_speed_limit__env_override_and_validation() {
+        // Scoped env mutation: serial test, restored unconditionally.
+        let _g = env_lock();
+        std::env::set_var("BLAZAR_DOWNLOAD_SPEED_LIMIT_MB", "12.5");
+        let merged = Config::default().with_env_overrides().unwrap();
+        std::env::remove_var("BLAZAR_DOWNLOAD_SPEED_LIMIT_MB");
+        assert!((merged.download_speed_limit_mb - 12.5).abs() < f64::EPSILON);
+        assert!(merged.validate().is_ok(), "12.5 MB/s is a legal cap");
+
+        std::env::set_var("BLAZAR_DOWNLOAD_SPEED_LIMIT_MB", "-3");
+        let msg = Config::default()
+            .with_env_overrides()
+            .unwrap_err()
+            .to_string();
+        std::env::remove_var("BLAZAR_DOWNLOAD_SPEED_LIMIT_MB");
+        assert!(
+            msg.contains("download_speed_limit_mb") && msg.contains("unlimited"),
+            "teaching error names the knob and the 0-means-unlimited escape: {msg}"
+        );
+
+        let nan = Config {
+            download_speed_limit_mb: f64::NAN,
+            ..Config::default()
+        };
+        assert!(nan.validate().is_err(), "NaN cap must fail validation");
     }
 
     #[test]

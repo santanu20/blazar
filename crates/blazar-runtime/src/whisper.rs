@@ -523,6 +523,149 @@ pub fn model_file(dirs: &BlazarDirs, size: &str) -> Option<PathBuf> {
     f.is_file().then_some(f)
 }
 
+/// One lossless slice of a WAV byte stream for progressive decode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WavChunk {
+    /// Standalone WAV rebuild (original header chunks + this slice's
+    /// audio), ready to post at a decoder as-is.
+    pub bytes: Vec<u8>,
+    /// Where this slice starts in the source audio, milliseconds.
+    pub offset_ms: u64,
+}
+
+/// Ceiling on rebuilt slices held for one streaming request: a huge
+/// input with a small `whisper_stream_chunk_ms` grows the window instead
+/// of the slice count, keeping the gateway's per-request memory flat.
+const MAX_STREAM_CHUNKS: usize = 512;
+
+/// Split a RIFF/WAVE stream into `chunk_ms`-sized rebuilds for
+/// progressive transcription (F6). Lossless for the audio payload:
+/// every subchunk before `data` (the `fmt ` block included) is copied
+/// verbatim into each rebuild and only the `RIFF`/`data` size fields are
+/// repatched, so each slice is a standalone WAV a decoder accepts
+/// unchanged. Splits fall on `block_align` multiples — no frame is ever
+/// cut. Returns None when the input is not a WAV, lacks a usable
+/// `fmt `/`data` pair, or already fits one window (callers stream the
+/// original bytes as a single chunk then). Subchunks trailing `data`
+/// (rare LIST/INFO tails) are dropped: decoders stop at `data` and the
+/// audio bytes are identical.
+#[must_use]
+pub fn split_wav(data: &[u8], chunk_ms: u64) -> Option<Vec<WavChunk>> {
+    if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
+        return None;
+    }
+    // Walk subchunks: id(4) + LE size(4) + payload, word-aligned.
+    let mut pos = 12usize;
+    let mut data_start = None;
+    let mut byte_rate = 0u32;
+    let mut block_align = 0u16;
+    while pos + 8 <= data.len() {
+        let id = &data[pos..pos + 4];
+        // Streamed writers occasionally leave a stale `data` size; trust
+        // the bytes actually present, never the header beyond them.
+        let size = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().ok()?) as usize;
+        let payload = pos + 8;
+        let size = size.min(data.len().saturating_sub(payload));
+        if id == b"fmt " && size >= 16 {
+            // fmt payload: format(0..2) channels(2..4) sample_rate(4..8)
+            // byte_rate(8..12) block_align(12..14) bits(14..16).
+            byte_rate = u32::from_le_bytes(data[payload + 8..payload + 12].try_into().ok()?);
+            block_align = u16::from_le_bytes(data[payload + 12..payload + 14].try_into().ok()?);
+        } else if id == b"data" {
+            data_start = Some((payload, size));
+            break;
+        }
+        pos = payload + size + (size & 1);
+    }
+    let (data_start, data_len) = data_start?;
+    if byte_rate == 0 || block_align == 0 || data_len == 0 {
+        return None;
+    }
+    let align = block_align as usize;
+    let target = (u64::from(byte_rate) * chunk_ms / 1000)
+        .next_multiple_of(align as u64)
+        .max(align as u64) as usize;
+    let audio = &data[data_start..data_start + data_len];
+    if audio.len() <= target {
+        return None;
+    }
+    let mut step = target;
+    if audio.len().div_ceil(step) > MAX_STREAM_CHUNKS {
+        step = audio
+            .len()
+            .div_ceil(MAX_STREAM_CHUNKS)
+            .next_multiple_of(align);
+    }
+    let prefix = &data[..data_start];
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off < audio.len() {
+        let end = (off + step).min(audio.len());
+        let mut bytes = prefix.to_vec();
+        let piece = end - off;
+        // Patch the two size fields so each rebuild is self-consistent.
+        // RIFF size fields are u32; chunk bytes are bounded by the
+        // 120 s window cap, so the narrowing is structurally safe.
+        #[allow(clippy::cast_possible_truncation)]
+        let riff_size = (prefix.len() + piece - 8) as u32;
+        bytes[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        #[allow(clippy::cast_possible_truncation)]
+        bytes[data_start - 4..data_start].copy_from_slice(&(piece as u32).to_le_bytes());
+        bytes.extend_from_slice(&audio[off..end]);
+        out.push(WavChunk {
+            bytes,
+            offset_ms: off as u64 * 1000 / u64::from(byte_rate),
+        });
+        off = end;
+    }
+    Some(out)
+}
+
+/// The `-m` argv value for whisper-server. On Windows, upstream aborts
+/// (0xC0000409, whisper.cpp #4018) when the model path carries non-ASCII
+/// bytes and the MSVC wide-argv handling trips, so the path converts to
+/// its ASCII 8.3 short form first. Best-effort by design: volumes with
+/// 8dot3 naming disabled (or a conversion failure) keep the original
+/// path — the guard never introduces a failure mode of its own.
+#[must_use]
+pub fn argv_model_path(model_path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        use std::os::windows::ffi::OsStringExt as _;
+        let wide: Vec<u16> = model_path.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: `wide` is NUL-terminated and `out` is sized from the
+        // probe's own return; both point at plain owned buffers.
+        let len = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
+                wide.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if len > 0 {
+            let mut out = vec![0u16; len as usize];
+            let written = unsafe {
+                windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
+                    wide.as_ptr(),
+                    out.as_mut_ptr(),
+                    len,
+                )
+            };
+            if written > 0 {
+                return PathBuf::from(std::ffi::OsString::from_wide(&out[..written as usize]));
+            }
+        }
+        tracing::warn!(
+            model = %model_path.display(),
+            "no 8.3 short path available; passing the original (non-ASCII paths may abort upstream)"
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = model_path;
+    PathBuf::from(model_path)
+}
+
 /// Map the request's `model` field to a pulled size. `whisper-1` /
 /// `whisper-1-latest` / absent → preference order; `whisper-<size>`,
 /// `ggml-<size>` (the HF file naming) or a bare size → exact match;
@@ -804,18 +947,20 @@ fn ephemeral_port() -> Result<u16> {
 /// Child argv: loopback bind is a security invariant (upstream has no
 /// auth flag — see `WhisperRuntime` doc); pinned by unit test.
 fn server_args(port: u16, model_path: &Path) -> Vec<String> {
+    let model_arg = argv_model_path(model_path);
     vec![
         "--host".into(),
         "127.0.0.1".into(),
         "--port".into(),
         port.to_string(),
         "--model".into(),
-        model_path.display().to_string(),
+        model_arg.display().to_string(),
     ]
 }
 
 #[cfg(test)]
 #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+#[allow(clippy::cast_possible_truncation)] // WAV fixtures are tiny
 mod tests {
     use super::*;
     use crate::engine::gh::GhAsset;
@@ -904,6 +1049,141 @@ mod tests {
             ],
             "whisper-server has no auth flag upstream; loopback bind is the isolation boundary — never widen to 0.0.0.0"
         );
+    }
+
+    /// Canonical 44-byte PCM WAV: mono, `byte_rate` bytes per second,
+    /// `block_align` bytes per frame — the minimum a decoder needs.
+    fn wav(bytes_of_audio: usize, byte_rate: u32, block_align: u16) -> Vec<u8> {
+        let mut w = b"RIFF----WAVE".to_vec();
+        let mut f = Vec::new();
+        f.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        f.extend_from_slice(&(block_align / 2).to_le_bytes()); // channels (2 bytes/sample)
+        f.extend_from_slice(&16_000u32.to_le_bytes()); // sample rate
+        f.extend_from_slice(&byte_rate.to_le_bytes());
+        f.extend_from_slice(&block_align.to_le_bytes());
+        f.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        w.extend_from_slice(b"fmt ");
+        w.extend_from_slice(&(f.len() as u32).to_le_bytes());
+        w.extend_from_slice(&f);
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&(bytes_of_audio as u32).to_le_bytes());
+        w.extend(std::iter::repeat_n(0xABu8, bytes_of_audio));
+        let riff = (w.len() as u32 - 8).to_le_bytes();
+        w[4..8].copy_from_slice(&riff);
+        w
+    }
+
+    #[test]
+    fn unit__split_wav__even_split_rebuilds_valid_headers_and_offsets() {
+        // 3 seconds at 32_000 B/s split into 1 s windows: 3 chunks,
+        // each a self-consistent WAV, offsets 0/1000/2000 ms.
+        let src = wav(96_000, 32_000, 2);
+        let chunks = split_wav(&src, 1_000).expect("splits");
+        assert_eq!(chunks.len(), 3);
+        for (i, c) in chunks.iter().enumerate() {
+            assert_eq!(c.offset_ms, (i as u64) * 1000, "chunk {i} offset");
+            assert_eq!(&c.bytes[0..4], b"RIFF");
+            assert_eq!(&c.bytes[8..12], b"WAVE");
+            let riff = u32::from_le_bytes(c.bytes[4..8].try_into().unwrap());
+            assert_eq!(riff as usize, c.bytes.len() - 8, "chunk {i} RIFF size");
+            let dsize = u32::from_le_bytes(c.bytes[40..44].try_into().unwrap());
+            assert_eq!(dsize as usize, c.bytes.len() - 44, "chunk {i} data size");
+            assert_eq!(&c.bytes[c.bytes.len() - 2..], &[0xAB, 0xAB]);
+        }
+        // Audio payload survives byte-for-byte across the concatenation.
+        let joined: Vec<u8> = chunks
+            .iter()
+            .flat_map(|c| c.bytes[44..].iter().copied())
+            .collect();
+        assert_eq!(joined, src[44..]);
+    }
+
+    #[test]
+    fn unit__split_wav__frames_never_cut() {
+        // 4-byte frames, window math that does not divide evenly: every
+        // interior boundary must sit on a frame multiple.
+        let src = wav(100_004, 40_000, 4);
+        let chunks = split_wav(&src, 999).expect("splits");
+        assert!(chunks.len() >= 2);
+        for w in chunks.windows(2) {
+            let consumed = (u128::from(w[1].offset_ms) * 40_000 / 1000) as usize;
+            assert_eq!(
+                consumed % 4,
+                0,
+                "interior boundary must be frame-aligned: {}",
+                w[1].offset_ms
+            );
+        }
+    }
+
+    #[test]
+    fn unit__split_wav__non_wav_short_or_single_window_none() {
+        assert!(split_wav(b"ID3\x04\x00taggery", 1_000).is_none());
+        assert!(split_wav(b"RIFF small", 1_000).is_none());
+        // Fits one window: streaming keeps the original bytes instead.
+        let src = wav(4_000, 32_000, 2);
+        assert!(split_wav(&src, 1_000).is_none());
+        // Zero-byte data chunk is not a stream.
+        assert!(split_wav(&wav(0, 32_000, 2), 1_000).is_none());
+    }
+
+    #[test]
+    fn unit__split_wav__chunk_count_capped_by_growing_the_window() {
+        // ~5 MB at 32 B/ms would need thousands of 1 s windows; the cap
+        // grows the step so the count stays bounded.
+        let src = wav(5_000_000, 32_000, 2);
+        let chunks = split_wav(&src, 1_000).expect("splits");
+        assert!(
+            chunks.len() <= super::MAX_STREAM_CHUNKS,
+            "cap honored: {}",
+            chunks.len()
+        );
+        // Payload still lossless at the grown window.
+        let joined: Vec<u8> = chunks
+            .iter()
+            .flat_map(|c| c.bytes[44..].iter().copied())
+            .collect();
+        assert_eq!(joined, src[44..]);
+    }
+
+    #[test]
+    fn unit__split_wav__extra_subchunks_before_data_ride_every_rebuild() {
+        // A LIST chunk (odd-sized, so the word-alignment walk is
+        // exercised) BETWEEN fmt and the data header must reach every
+        // slice — byte 36 is right after the 24-byte fmt chunk.
+        let mut src = wav(96_000, 32_000, 2);
+        let list_payload = b"INFOx".to_vec(); // odd length
+        let mut list = b"LIST".to_vec();
+        list.extend_from_slice(&(list_payload.len() as u32).to_le_bytes());
+        list.extend_from_slice(&list_payload);
+        list.push(0); // pad byte
+        let mut out = src[..36].to_vec();
+        out.extend_from_slice(&list);
+        out.extend_from_slice(&src[36..]);
+        let riff = (out.len() as u32 - 8).to_le_bytes();
+        out[4..8].copy_from_slice(&riff);
+        src = out;
+
+        let chunks = split_wav(&src, 1_000).expect("splits");
+        assert_eq!(chunks.len(), 3);
+        for (i, c) in chunks.iter().enumerate() {
+            assert!(
+                c.bytes.windows(4).any(|w| w == b"LIST"),
+                "chunk {i} carries the LIST subchunk"
+            );
+        }
+        // The data-size patch lands on the moved field, not a stale 40.
+        let dsize_at = 44 + list.len() - 4;
+        let dsize = u32::from_le_bytes(chunks[0].bytes[dsize_at..dsize_at + 4].try_into().unwrap());
+        assert_eq!(dsize as usize, chunks[0].bytes.len() - dsize_at - 4);
+    }
+
+    #[test]
+    fn unit__argv_model_path__identity_off_windows() {
+        // On non-Windows the guard must be a pure identity — the
+        // W1 conversion only exists on the MSVC argv surface.
+        let p = Path::new("/data/models/ggml-base.bin");
+        assert_eq!(argv_model_path(p), PathBuf::from(p));
     }
 
     #[test]

@@ -688,6 +688,9 @@ pub struct HfClient {
     /// Parallel byte-range connections for large downloads (see
     /// `hf_parallel`). 1 = classic single-stream lane.
     pub(crate) download_connections: u32,
+    /// Total download speed cap in MB/s shared across every connection
+    /// of one file (`0` = unlimited). See `throttle`.
+    pub(crate) download_speed_limit_mb: f64,
     /// Test-only extra redirect-allowed hosts (wiremock).
     extra_hosts: Vec<String>,
 }
@@ -702,6 +705,25 @@ impl HfClient {
     pub fn with_download_connections(mut self, connections: u32) -> Self {
         self.download_connections = connections;
         self
+    }
+
+    /// Builder: total download speed cap in MB/s (0 = unlimited).
+    /// Applies to the classic single-stream lane and to every parallel
+    /// chunk worker — one shared bucket per file, so the cap holds the
+    /// WHOLE download, not each connection.
+    #[must_use]
+    pub fn with_download_speed_limit(mut self, limit_mb: f64) -> Self {
+        self.download_speed_limit_mb = limit_mb;
+        self
+    }
+
+    /// Progress-bar suffix naming the active cap, empty when uncapped.
+    fn cap_suffix(&self) -> String {
+        if self.download_speed_limit_mb > 0.0 {
+            format!(" (cap {} MB/s)", self.download_speed_limit_mb)
+        } else {
+            String::new()
+        }
     }
 
     #[allow(clippy::needless_pass_by_value)] // Vec is stored
@@ -742,6 +764,7 @@ impl HfClient {
             dl_base: reqwest::Url::parse(dl_base)?,
             token,
             download_connections: 8,
+            download_speed_limit_mb: 0.0,
             extra_hosts,
         })
     }
@@ -822,6 +845,8 @@ impl HfClient {
     /// verify, atomic rename. The URL arrives prebuilt by the caller (HF
     /// resolve path, ollama-registry blob path, ...), so this client's
     /// redirect allowlist and token policy apply uniformly.
+    // args mirror the pull plan one-to-one; grouping would just relocate names
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // resume+verify+rename is one audited flow
     pub(crate) async fn download_to(
         &self,
         url: reqwest::Url,
@@ -833,6 +858,16 @@ impl HfClient {
         // size (from pull metadata) can pay for it and the server proves
         // Range support on a probe; every other shape falls through to
         // the classic lane below.
+        // One shared bucket per file: the cap holds the WHOLE download
+        // (classic lane and every parallel chunk worker draw from it).
+        let throttle = crate::throttle::Throttle::shared(self.download_speed_limit_mb * 1e6);
+        if throttle.is_some() {
+            tracing::info!(
+                filename = %plan.filename,
+                limit_mb = %self.download_speed_limit_mb,
+                "download speed-capped"
+            );
+        }
         if self.download_connections > 1
             && (plan.bytes == 0 || plan.bytes >= crate::hf_parallel::MIN_PARALLEL_BYTES)
         {
@@ -844,6 +879,7 @@ impl HfClient {
                 plan,
                 dest,
                 self.download_connections,
+                throttle.clone(),
                 &mut on_progress,
             )
             .await?
@@ -917,6 +953,9 @@ impl HfClient {
             file.write_all(&chunk).await?;
             hasher.update(&chunk);
             downloaded += chunk.len() as u64;
+            if let Some(t) = throttle.as_ref() {
+                t.acquire(chunk.len() as u64).await;
+            }
             on_progress(downloaded, total);
         }
         file.flush().await?;
@@ -2030,7 +2069,10 @@ impl Puller {
                 .template("{msg} {bar:30} {bytes}/{total_bytes} ({eta})")
                 .expect("valid template"),
         );
-        bar.set_message(format!("pull {name} (safetensors)"));
+        bar.set_message(format!(
+            "pull {name} (safetensors){}",
+            self.client.cap_suffix()
+        ));
         let mut last_publish = 0u64;
         let mut progress = |downloaded: u64, total: u64| {
             bar.set_position(downloaded);
@@ -2157,7 +2199,11 @@ impl Puller {
                 .template("{msg} {bar:30} {bytes}/{total_bytes} ({eta})")
                 .expect("valid template"),
         );
-        bar.set_message(format!("pull {name}:{}", selected.quant));
+        bar.set_message(format!(
+            "pull {name}:{},{}",
+            selected.quant,
+            self.client.cap_suffix()
+        ));
 
         let mut last_publish = 0u64;
         let mut progress = |downloaded: u64, total: u64| {
@@ -2308,7 +2354,7 @@ impl Puller {
                 .template("{msg} {bar:30} {bytes}/{total_bytes} ({eta})")
                 .expect("valid template"),
         );
-        bar.set_message(format!("pull {name}"));
+        bar.set_message(format!("pull {name}{}", self.client.cap_suffix()));
         let mut done = 0u64;
         // required=true: without the checkpoint there is no model.
         let dest = self
@@ -2469,7 +2515,10 @@ impl Puller {
                 .template("{msg} {bar:30} {bytes}/{total_bytes} ({eta})")
                 .expect("valid template"),
         );
-        bar.set_message(format!("pull {name}: components"));
+        bar.set_message(format!(
+            "pull {name}: components{}",
+            self.client.cap_suffix()
+        ));
 
         let mut done: u64 = 0;
         let mut components: Vec<(String, String)> = Vec::new();
@@ -2686,7 +2735,11 @@ impl Puller {
                     .template("{msg} {bar:30} {bytes}/{total_bytes} ({eta})")
                     .expect("valid template"),
             );
-            bar.set_message(format!("pull {name}:{}", selected.quant));
+            bar.set_message(format!(
+                "pull {name}:{},{}",
+                selected.quant,
+                self.client.cap_suffix()
+            ));
             let mut last_publish = 0u64;
             let mut progress = |downloaded: u64, total: u64| {
                 bar.set_position(downloaded);
@@ -3010,6 +3063,7 @@ fn reuse_on_disk(
 
 #[cfg(test)]
 #[allow(non_snake_case)]
+#[allow(clippy::cast_possible_truncation)] // byte counts are test-sized
 mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
@@ -4839,6 +4893,81 @@ mod tests {
         assert!(
             !dirs.models_dir().join("r.gguf.part").exists(),
             "no partial left"
+        );
+    }
+
+    #[tokio::test]
+    async fn integration__download_speed_limit__paces_the_classic_lane() {
+        // A 3.5 KiB body at a 1000 B/s cap: the 1 s burst absorbs the
+        // first 1000 bytes, the remaining 2500 owe 2.5 s. The capped
+        // download must take at least ~2.2 s (CI jitter margin) while
+        // the identical uncapped download finishes fast and the file
+        // lands byte-identical either way.
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        dirs.ensure().unwrap();
+        let full = vec![0x5Au8; 3500];
+        let sha = payload(&full);
+
+        let dl = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/o/r/resolve/main/r.gguf"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(full.clone()))
+            .mount(&dl)
+            .await;
+
+        let make_client = |limit: f64| {
+            HfClient::with_bases(&dl.uri(), &dl.uri(), None, vec![host_of(&dl.uri())])
+                .unwrap()
+                .with_download_speed_limit(limit)
+        };
+        let url = |server: &MockServer| -> reqwest::Url {
+            format!("{}/o/r/resolve/main/r.gguf", server.uri())
+                .parse()
+                .unwrap()
+        };
+        let plan = FilePlan {
+            filename: "r.gguf".into(),
+            bytes: full.len() as u64,
+            sha256: Some(sha),
+        };
+
+        // Control: uncapped finishes well inside the paced floor.
+        let control_dest = dirs.models_dir().join("control.gguf");
+        let control_plan = FilePlan {
+            filename: "control.gguf".into(),
+            ..plan.clone()
+        };
+        let t0 = std::time::Instant::now();
+        let n = make_client(0.0)
+            .download_to(url(&dl), &control_plan, &control_dest, &mut |_, _| {})
+            .await
+            .unwrap();
+        let control_elapsed = t0.elapsed();
+        assert_eq!(n as usize, full.len());
+        assert_eq!(std::fs::read(&control_dest).unwrap(), full);
+
+        // Capped at 0.001 MB/s = 1000 B/s.
+        let dest = dirs.models_dir().join("r.gguf");
+        let t0 = std::time::Instant::now();
+        let n = make_client(0.001)
+            .download_to(url(&dl), &plan, &dest, &mut |_, _| {})
+            .await
+            .unwrap();
+        let paced_elapsed = t0.elapsed();
+        assert_eq!(n as usize, full.len(), "cap paces, never truncates");
+        assert_eq!(std::fs::read(&dest).unwrap(), full);
+
+        assert!(
+            paced_elapsed.as_millis() >= 2_200,
+            "capped pull must sleep the deficit, took {paced_elapsed:?}"
+        );
+        assert!(
+            control_elapsed.as_millis() < 2_200,
+            "uncapped control must stay fast, took {control_elapsed:?}"
         );
     }
 
